@@ -317,3 +317,49 @@ fn a_restored_members_own_position_does_not_rise_over_its_own_rows_held_as_state
     );
     assert_eq!(d.version_vector().unwrap().get(d.node_id()), position);
 }
+
+/// The backup's vector names two origins at different positions: D holds B far ahead
+/// and C behind. D takes `items` by a scoped page from B, and the page carries C's row,
+/// above D's position of C and below D's position of B. The restore must judge each entry
+/// against its own origin's position: it marks C's row and nothing of B's, D claims the
+/// backup's vector, and D's pulls bring C's write below the row.
+#[test]
+fn a_restore_judges_each_entry_against_its_own_origins_position() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = Engine::open(&dir.path().join("b.redb")).unwrap();
+    let c = Engine::open(&dir.path().join("c.redb")).unwrap();
+    let d_path = member_dir(&dir, "d");
+    let d = Engine::open(&d_path).unwrap();
+    let t = (kimmy_storage::physical_now_ms() / 1000 + 3_600) * 1000;
+    let orders = c.create_collection("shop", "orders").unwrap();
+    let items = c.create_collection("shop", "items").unwrap();
+    c.insert(&orders, doc! { "_id": 0i64 }).unwrap();
+    pull_all(&b, &c);
+    pull_all(&d, &c);
+    // B far ahead, and D holds B there.
+    let b_orders = b.get_collection("shop", "orders").unwrap();
+    b.advance_clock_past(&Stamp::new(Hlc::new(t + 500, 0), b.node_id()));
+    b.insert(&b_orders, doc! { "_id": 900i64 }).unwrap();
+    pull_all(&d, &b);
+    // C writes once at t+50 and never again, then `items` at t+100; B takes both.
+    c.advance_clock_past(&Stamp::new(Hlc::new(t + 50, 0), c.node_id()));
+    c.insert(&orders, doc! { "_id": 1i64, "once": true }).unwrap();
+    c.advance_clock_past(&Stamp::new(Hlc::new(t + 100, 0), c.node_id()));
+    c.insert(&items, doc! { "_id": 101i64 }).unwrap();
+    pull_all(&b, &c);
+    // D takes `items` from B by a scoped page: C's row at t+100, held.
+    scoped(&d, &b, items.id);
+    let servable = d.version_vector().unwrap();
+    assert!(servable.get(c.node_id()) < Hlc::new(t + 50, 0), "D holds C behind its write");
+    assert!(servable.get(b.node_id()) >= Hlc::new(t + 500, 0), "D holds B far ahead");
+    assert_eq!(d.held_marks().unwrap(), 1, "the page's row is held");
+
+    let d = backed_up_and_restored(d, &d_path);
+    assert_eq!(d.held_marks().unwrap(), 1, "the restore marked other than C's row");
+    assert_eq!(d.version_vector().unwrap(), servable, "the restored member claims more");
+    pull_all(&d, &b);
+    pull_all(&d, &c);
+    assert!(holds(&d, "orders", 1), "the restored D lacks C's write below the held row");
+    assert!(holds(&d, "orders", 900) && holds(&d, "items", 101));
+    assert_eq!(d.held_marks().unwrap(), 0);
+}
