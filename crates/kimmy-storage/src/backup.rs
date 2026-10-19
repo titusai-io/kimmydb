@@ -29,9 +29,8 @@
 //! into this one with no records, and nothing about restoring changes for it.
 //! **The rows by stamp travel only beside a record**: a store that holds no
 //! record writes neither tag, so its backup restores on an older build. A row
-//! whose record is gone (a rewind removes a record and leaves its rows, and a
-//! retention pass stopped between chunks can leave some until the next pass)
-//! vouches for nothing.
+//! whose record is gone (a retention pass stopped between chunks can leave some
+//! until the next pass) vouches for nothing.
 //!
 //! Index entries are derivable
 //! from documents, so omitting them would make backups smaller — and would make
