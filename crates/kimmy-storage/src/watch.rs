@@ -1094,7 +1094,7 @@ pub struct OplogWindow {
     /// one was kept, withheld, or passed over (ADR-194). `None` for a window
     /// that filled or reached the end.
     pub passed_through: Option<Stamp>,
-    /// The idempotency records the window ships (B5, records travel with
+    /// The idempotency records the window ships (ADR-240, records travel with
     /// coverage): every record with a row inside the coverage the window grants
     /// the requester, and every record with a row this node's own servable
     /// vector does not reach (`idempotency::records_for_coverage`), read in the

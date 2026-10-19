@@ -49,7 +49,7 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // Retention's scans, which serve no client.
     "gc::Engine::collect_oplog",
     "gc::Engine::collect_tombstones_within",
-    // Retention's read of the idempotency records' rows below its cutoff (B5).
+    // Retention's read of the idempotency records' rows below its cutoff (ADR-240).
     "idempotency::Engine::collect_idempotency_records",
     // A replay page's records of its collections (B2 of the B5 build review),
     // which serves no client.
@@ -496,7 +496,7 @@ const WRITES: &[&str] = &[
     // with no usable index, the whole collection (`modify::scan_until`).
     "modify_where",
     "find_and_modify",
-    // The same, keyed (B5): the same bodies, in the same transactions.
+    // The same, keyed (ADR-240): the same bodies, in the same transactions.
     "modify_where_keyed",
     "find_and_modify_keyed",
 ];

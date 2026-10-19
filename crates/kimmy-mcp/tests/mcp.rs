@@ -1839,7 +1839,7 @@ async fn a_vector_search_whose_filter_expr_cannot_be_evaluated_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Idempotency keys (B5): the argument behaves as the REST header does
+// Idempotency keys (ADR-240): the argument behaves as the REST header does
 // ---------------------------------------------------------------------------
 
 const KEY: &str = "6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90";

@@ -1,4 +1,4 @@
-//! Idempotency records (B5): a keyed write remembered in its own transaction.
+//! Idempotency records (ADR-240): a keyed write remembered in its own transaction.
 //!
 //! A client may send `Idempotency-Key` with a document write. The member that
 //! applies it keeps a **record** of it in the write's own redb transaction, so
@@ -891,7 +891,7 @@ fn store_is_a_no_op(
 }
 
 /// A record on the wire: its key, the stamp of the entry that carries it, and
-/// its bytes as stored (B5, "How a record travels").
+/// its bytes as stored (ADR-240, "How a record travels").
 ///
 /// The `records` of a frame (`Entries`, `ReplayEntries`, `Push`) and of a
 /// snapshot page are lists of these. The record's bytes are opaque to the
@@ -947,7 +947,7 @@ pub fn lenient_records<'de, D: serde::Deserializer<'de>>(
 }
 
 /// The records a peer window ships, read in the window's own read transaction
-/// (B5, records travel with coverage). For each origin `o`, with `floor[o]` what
+/// (ADR-240, records travel with coverage). For each origin `o`, with `floor[o]` what
 /// the requester holds of it:
 ///
 /// - **F3 first**: every record with a row of `o` above both `floor[o]` and
@@ -1294,7 +1294,7 @@ pub(crate) struct Delta {
     pub stopped_at: Option<Stamp>,
 }
 
-/// One page's **records delta** (B5, "Snapshots carry records"): the records the
+/// One page's **records delta** (ADR-240, "Snapshots carry records"): the records the
 /// change log names above `base`, of a collection `standing` names, each once,
 /// read in the page's own read transaction, so a page never holds a document
 /// whose record changed after its collection's records phase without the
@@ -1615,7 +1615,7 @@ impl Engine {
     }
 
     /// Store a snapshot or converge page's records in the page's transaction
-    /// (B5, "Snapshots carry records"): each through
+    /// (ADR-240, "Snapshots carry records"): each through
     /// [`Self::store_record_noting`] with no carrying stamp (rows at its merged
     /// `first` and `last`, and a row of this node's change log), whether or not
     /// its collection stands here: a record outlives a drop of its collection

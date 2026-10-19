@@ -1792,7 +1792,7 @@ impl TelemetryGuard {
             decimal128_id_present
         );
         // Keyed requests by outcome, one instrument per label value, and the
-        // records keyed writes leave (B5). Each outcome reads the slot of its
+        // records keyed writes leave (ADR-240). Each outcome reads the slot of its
         // own `KeyedOutcome`, written beside its name.
         use kimmy_api::idempotency::KeyedOutcome;
         observe!(
@@ -3219,7 +3219,7 @@ mod tests {
     fn each_idempotency_instrument_reads_the_slot_of_its_own_label() {
         // The six outcome instruments of `kimmy_idempotency_requests_total` and
         // the five of `kimmy_idempotency_records_received_total` each read one
-        // slot of an array by an index written beside the name (B5). A wrong
+        // slot of an array by an index written beside the name (ADR-240). A wrong
         // index would publish one label's count under another's name and pass
         // the coverage test, which reads names only.
         let source = include_str!("logging.rs");

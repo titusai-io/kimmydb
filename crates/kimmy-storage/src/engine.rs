@@ -276,7 +276,7 @@ pub struct Engine {
     expiry_cursors: parking_lot::Mutex<std::collections::HashMap<(u64, u32), ExpiryCursor>>,
     /// The drop purger's queue, wake and counters (ADR-189).
     pub(crate) purges: crate::purge::Purges,
-    /// Idempotency keys in process (B5): the in-flight set, the window, the
+    /// Idempotency keys in process (ADR-240): the in-flight set, the window, the
     /// retention count.
     pub(crate) idempotency: crate::idempotency::IdempotencyState,
 }
@@ -1003,7 +1003,7 @@ impl WriteTxn<'_> {
     }
 
     /// Abort, for a keyed write answered from the idempotency record it found
-    /// under the writer (B5), and return only once that record is durable.
+    /// under the writer (ADR-240), and return only once that record is durable.
     ///
     /// Under `coalesced` a commit is visible before it is durable: the record a
     /// replay found may belong to a commit whose flush has not run, and a
@@ -1423,7 +1423,7 @@ impl Engine {
             // The violations table, with the others so a read never meets it
             // missing (ADR-200).
             let _ = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
-            // The idempotency records and their rows by stamp (B5), created as
+            // The idempotency records and their rows by stamp (ADR-240), created as
             // the tables above were, with no schema bump: an older build never
             // opens them, and ignores them.
             let _ = txn.open_table(tables::IDEMPOTENCY)?;
@@ -3637,7 +3637,7 @@ impl Engine {
     /// that resumed from the oplog tail alone would mint the next change below one
     /// already standing.
     ///
-    /// And the highest stamp an idempotency record carries (B5, the last key of
+    /// And the highest stamp an idempotency record carries (ADR-240, the last key of
     /// `IDEMPOTENCY_BY_STAMP`): a record a page stored was folded into the clock
     /// while the process ran, and a resume of its request must write above its
     /// `first` after a restart too. And the records' change log's last key and
@@ -5322,7 +5322,7 @@ impl Engine {
                 }
                 // The collection's idempotency records stay: a record outlives a
                 // drop of its collection for its window, and retention alone
-                // removes it (B5).
+                // removes it (ADR-240).
                 // The ranges are exhausted: the digest row of a collection
                 // that is gone goes with this commit (a row of zeros and the
                 // highest stamps of a life that has ended).

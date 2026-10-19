@@ -1,4 +1,4 @@
-//! Idempotency records across members (B5, "Replication and the cross-member
+//! Idempotency records across members (ADR-240, "Replication and the cross-member
 //! retry"): what a window carries, what a receiver stores and when, what a
 //! snapshot and a converge page carry, between engines in one process through
 //! the storage halves of the real paths (`entries_for_peer_*`, the apply of a
@@ -459,7 +459,7 @@ fn a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry() {
 
 /// A frame's records are stored in the transaction that raises the receiver's
 /// coverage, **whether or not an entry of their collection is taken** and
-/// whether or not the collection stands here (B5, records travel with
+/// whether or not the collection stands here (ADR-240, records travel with
 /// coverage): here the only entry is left above the vector the sender
 /// advertised, and a second record names a collection this member has never
 /// heard of. Both are stored, and counted by the way they came; the same frame

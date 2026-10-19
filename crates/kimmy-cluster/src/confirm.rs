@@ -44,7 +44,7 @@ pub const MAX_CONFIRM_BACKOFF: Duration = Duration::from_secs(60);
 pub const REDIAL_GUARD: Duration = Duration::from_secs(1);
 
 /// Why a push sent nothing when the idempotency records its sender cannot
-/// vouch for by its oplog do not fit one frame (B5): the window would carry no
+/// vouch for by its oplog do not fit one frame (ADR-240): the window would carry no
 /// entries and grant nothing.
 const RECORDS_OVERFILL_UNREACHED: &str = "the idempotency records this node cannot vouch for by \
      its oplog do not fit one frame; anti-entropy will carry the change once this node pulls \
@@ -822,7 +822,7 @@ impl Confirmer {
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
             versions: mine.clone(),
-            // The records the window ships, read with it (B5).
+            // The records the window ships, read with it (ADR-240).
             records: crate::transport::records_to_send(engine, window.records),
         };
         if let Err(e) = write_frame(&mut stream, &push).await {

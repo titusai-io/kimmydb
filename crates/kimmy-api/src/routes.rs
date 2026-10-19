@@ -66,7 +66,7 @@ pub fn router_with_limits(
         // operator who never touches the setting sees no change (ADR-099).
         .layer(axum::extract::DefaultBodyLimit::max(limits.max_body_bytes))
         // Which routes take `Idempotency-Key`, and whether its value is one
-        // (B5). Here, over the merged table, rather than inside `routes()`
+        // (ADR-240). Here, over the merged table, rather than inside `routes()`
         // beside the query-string guard, so that `/mcp`, merged above, refuses
         // the header too: an MCP client keys a tool call by its argument, and a
         // header on the transport would otherwise be read as nothing. Inside
@@ -304,7 +304,7 @@ pub const QUERY_STRING_ROUTES: [(&str, &str); 7] = [
 ];
 
 /// The routes that take `Idempotency-Key`, as `(method, route template)`, each
-/// template exactly the literal it is registered with above (B5): the document
+/// template exactly the literal it is registered with above (ADR-240): the document
 /// writes. The MCP write tools take the key as their argument `idempotency_key`
 /// instead, and `/mcp` itself is refused the header like any route not listed.
 ///
@@ -334,7 +334,7 @@ pub fn takes_idempotency_key(method: &str, route: &str) -> bool {
     IDEMPOTENT_ROUTES.iter().any(|(m, r)| *m == method && *r == route)
 }
 
-/// Refuse `Idempotency-Key` where it is not taken (B5). Two refusals, each a
+/// Refuse `Idempotency-Key` where it is not taken (ADR-240). Two refusals, each a
 /// `400 bad_request` that names the header, in this order:
 ///
 /// 1. on a route outside [`IDEMPOTENT_ROUTES`], `/mcp` included: this route

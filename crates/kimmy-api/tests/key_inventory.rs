@@ -177,7 +177,7 @@ const TABLES: &[Table] = &[
     Table {
         name: "idempotency_by_stamp",
         class: Unchanged,
-        why: "stamp -> collection id and scope hash (B5); no key bytes",
+        why: "stamp -> collection id and scope hash (ADR-240); no key bytes",
     },
     Table {
         name: "idempotency_changes",
@@ -310,7 +310,7 @@ const CALL_SITES: &[Site] = &[
         "kimmy-storage/src/docs.rs",
         "unless_tombstone_gone",
         Use::Stored,
-        "a keyed delete's replay reads its tombstone's row (B5)",
+        "a keyed delete's replay reads its tombstone's row (ADR-240)",
     ),
     site(
         "kimmy-storage/src/modify.rs",

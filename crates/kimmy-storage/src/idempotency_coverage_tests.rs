@@ -1,4 +1,4 @@
-//! Records travel with coverage (B5, finding G1 and its siblings): schedules
+//! Records travel with coverage (ADR-240, finding G1 and its siblings): schedules
 //! through the storage halves of the real paths, with the listener's serve
 //! verdict (ADR-224) applied before every window and a whole-database snapshot
 //! taken where the real loop would take one. Each ends on a member that holds a

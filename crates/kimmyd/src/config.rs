@@ -974,7 +974,7 @@ pub struct ClusterConfig {
     /// decimal id exists.
     pub decimal128: Option<bool>,
     /// Whether this member takes `Idempotency-Key` on a document write, and the
-    /// MCP argument `idempotency_key` (B5): the operator's declaration that
+    /// MCP argument `idempotency_key` (ADR-240): the operator's declaration that
     /// every member runs 0.52 or later, so records travel with every keyed
     /// write, and that no member will run an older release again. A member of
     /// an older release relays a keyed write without its record, and a member
@@ -2753,7 +2753,7 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
         assert!(err.contains("decimal128_ids"), "unhelpful error: {err}");
     }
 
-    /// `cluster.idempotency_keys` (B5): unset reads `true` alone and `false` in a
+    /// `cluster.idempotency_keys` (ADR-240): unset reads `true` alone and `false` in a
     /// cluster, a value set wins either way, and a typo is refused by name. The
     /// same `deny_unknown_fields` is why a 0.51 binary refuses a config that names
     /// the key at all: a rollback effect, documented, not tested here.

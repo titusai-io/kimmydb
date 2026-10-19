@@ -75,9 +75,9 @@ pub struct RewindOutcome {
     /// Oplog entries discarded because they described the undone future.
     pub oplog_discarded: usize,
     /// Idempotency records of requests whose every write the rewind discarded
-    /// (B5).
+    /// (ADR-240).
     pub records_removed: usize,
-    /// Idempotency records the rewind cut part-way and reopened (B5): a
+    /// Idempotency records the rewind cut part-way and reopened (ADR-240): a
     /// filtered write's to resume, any other kind's but a bulk insert's to
     /// replay.
     pub records_reopened: usize,
@@ -442,7 +442,7 @@ impl Engine {
             if !discarded.is_empty() {
                 record_rewind(&txn, until, &discarded)?;
             }
-            // The idempotency records of the undone future go with it (B5): a
+            // The idempotency records of the undone future go with it (ADR-240): a
             // record of a write the rewind discarded would replay an answer for
             // a write that no longer exists, and a client would take it as
             // applied. One the rewind cuts part-way is reopened, a bulk

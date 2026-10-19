@@ -1,4 +1,4 @@
-//! The idempotency model test (B5, design "Tests > Model test"): three or four engines
+//! The idempotency model test (ADR-240, design "Tests > Model test"): three or four engines
 //! run random, seeded schedules of keyed writes, retries, crashes, pulls, snapshots,
 //! outages, drops, restores and retention, and invariants I1 to I7 are asserted after
 //! every step and at quiescence.

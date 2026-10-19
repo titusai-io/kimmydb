@@ -254,7 +254,7 @@ async fn an_inbound_contact_serves_the_whole_replay() {
     assert!(replay_counters().get(true, ReplayResult::Served) >= served + 3, "pages were served");
 }
 
-/// A replay brings back the records of the keyed writes it brings back (B5): a
+/// A replay brings back the records of the keyed writes it brings back (ADR-240): a
 /// member restored from a backup that lacks its own keyed writes takes them
 /// from C with their records, so a retry on it is answered from the record its
 /// own first application wrote rather than applied a second time.

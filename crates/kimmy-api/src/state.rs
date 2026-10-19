@@ -125,7 +125,7 @@ pub struct AppState {
     /// for `kimmy_ttl_collections`: without clustering there is no block to say
     /// it (ADR-201). Unset reads as on.
     pub(crate) expiry_off: std::sync::OnceLock<bool>,
-    /// Whether this member may take an `Idempotency-Key` now (B5): the
+    /// Whether this member may take an `Idempotency-Key` now (ADR-240): the
     /// operator's switch and the live-peer net, as `kimmy-cluster`'s
     /// [`kimmy_cluster::IdempotencyGate`] answers it. Set before anything
     /// serves, like `local_login`; unset reads as open, which is what a node
@@ -275,7 +275,7 @@ impl AppState {
             // The durable marker that a `Decimal128` id exists here (ADR-238):
             // one point read of the metadata table.
             decimal128_id_present: self.engine.decimal128_id_present()?,
-            // The records a keyed write leaves (B5): the table's length and
+            // The records a keyed write leaves (ADR-240): the table's length and
             // the engine's counters, read at the scrape.
             idempotency: self.idempotency_reading()?,
             // Read here rather than set by the dispatcher (ADR-187): live
@@ -378,7 +378,7 @@ impl AppState {
         self.local_login.get().copied().unwrap_or_default()
     }
 
-    /// Install the gate on `Idempotency-Key` (B5): the predicate of
+    /// Install the gate on `Idempotency-Key` (ADR-240): the predicate of
     /// [`kimmy_cluster::IdempotencyGate`], built from `cluster.idempotency_keys`
     /// and handed the live member set once the cluster is up. Called once,
     /// before anything serves; a second call is ignored.
@@ -400,7 +400,7 @@ impl AppState {
         self.engine.set_idempotency_window(secs);
     }
 
-    /// How long this member remembers a key, in seconds (B5): one window with
+    /// How long this member remembers a key, in seconds (ADR-240): one window with
     /// the write's own history, so a key is remembered as long as its write is
     /// kept and replicated by pull. The engine's, so what `GET /v1/version`
     /// publishes is the window the lookup applies.
@@ -408,7 +408,7 @@ impl AppState {
         self.engine.idempotency_window_secs()
     }
 
-    /// The name a principal's idempotency keys are scoped to (B5): the key its
+    /// The name a principal's idempotency keys are scoped to (ADR-240): the key its
     /// request budget is kept under, `local:<user>` or `oidc:<issuer>:<sub>`.
     /// Users replicate cluster-wide, so a caller has the same scope on every
     /// member, and one principal cannot reach another's records.
@@ -417,7 +417,7 @@ impl AppState {
         principal_key(principal, issuer.as_deref())
     }
 
-    /// The engine's idempotency records, read at the scrape (B5): how many this
+    /// The engine's idempotency records, read at the scrape (ADR-240): how many this
     /// member holds (the table's own count, O(1)), how many retention removed,
     /// the records taken from peers by way (`RECORDS_RECEIVED_VIA` order) and
     /// those a peer sent that this build could not decode.

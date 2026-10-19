@@ -181,11 +181,11 @@ pub struct ModifyManyOutcome {
     pub stamp: Option<Stamp>,
     /// Matches a keyed request left because their stored stamp is at or above
     /// its record's `first`: changed after the request's first write, by an
-    /// attempt of it on another member or by another write (B5). Counted here
+    /// attempt of it on another member or by another write (ADR-240). Counted here
     /// and not in `matched`. Always 0 for an unkeyed request.
     pub skipped: u64,
     /// Whether this keyed request resumed an earlier attempt that had stopped
-    /// (B5). The counts are then cumulative over every attempt.
+    /// (ADR-240). The counts are then cumulative over every attempt.
     pub resumed: bool,
 }
 
@@ -222,7 +222,7 @@ enum Lookahead {
     Unknown,
 }
 
-/// A keyed filtered write's hold on its record, across its chunks (B5).
+/// A keyed filtered write's hold on its record, across its chunks (ADR-240).
 struct KeyedRun<'k> {
     keyed: &'k KeyedWrite,
     /// Whether this request holds the key's in-flight place (a multi request
@@ -269,7 +269,7 @@ impl Engine {
             .map(crate::idempotency::unkeyed)
     }
 
-    /// [`Engine::modify_where`] under an idempotency key (B5, see
+    /// [`Engine::modify_where`] under an idempotency key (ADR-240, see
     /// [`crate::idempotency`]).
     ///
     /// The first chunk looks the record up under its writer: a `done` record
@@ -518,7 +518,7 @@ impl Engine {
             }
         };
 
-        // The stamp rule (B5): while the key's record stands, a match whose
+        // The stamp rule (ADR-240): while the key's record stands, a match whose
         // stored stamp is at or above its merged `first` changed after the
         // request's first write, by an attempt of this request somewhere or by
         // another write, and is left as it is.
@@ -643,7 +643,7 @@ impl Engine {
         }
     }
 
-    /// A keyed chunk's record, under its writer (B5). The first chunk looks it
+    /// A keyed chunk's record, under its writer (ADR-240). The first chunk looks it
     /// up: a `done` one comes back to be replayed; an `applying` one is
     /// resumed, which moves `after` to its cursor when this member is its
     /// origin (from the beginning otherwise: a cursor from another member
@@ -686,7 +686,7 @@ impl Engine {
         Ok(None)
     }
 
-    /// The commit of a record alone, `done` (B5): a keyed request's end found
+    /// The commit of a record alone, `done` (ADR-240): a keyed request's end found
     /// by a chunk that wrote nothing, with its record standing. Its `last` is
     /// the standing record's ([`Self::done_alone_last`]), so the commit has no
     /// entry of its own; at that equal `last`, `done` beats the `applying` it
@@ -809,7 +809,7 @@ impl Engine {
         self.find_and_modify_inner(coll, candidates, spec, None).map(crate::idempotency::unkeyed)
     }
 
-    /// [`Engine::find_and_modify`] under an idempotency key (B5). The record
+    /// [`Engine::find_and_modify`] under an idempotency key (ADR-240). The record
     /// keeps the flags, the upserted `_id` as the stored body holds it, and
     /// the `returned` image, the one the caller answers with. An upsert's seed
     /// without `_id` is given the key's derived one for position 0.
@@ -845,7 +845,7 @@ impl Engine {
                 }
             }
         }
-        // The record of what this attempt wrote, in its transaction (B5).
+        // The record of what this attempt wrote, in its transaction (ADR-240).
         let recorded =
             |outcome: &ModifyOutcome, first: Stamp| -> Option<(KeyedWrite, IdempotencyRecord)> {
                 let (keyed, returned) = keyed?;

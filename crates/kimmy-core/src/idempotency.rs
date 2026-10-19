@@ -1,4 +1,4 @@
-//! Idempotency keys (B5): the key a client sends, the scope it is remembered
+//! Idempotency keys (ADR-240): the key a client sends, the scope it is remembered
 //! under, the request's fingerprint, and the `_id` a keyed insert derives.
 //!
 //! No I/O, like the rest of this crate: the API reads the header and hashes the

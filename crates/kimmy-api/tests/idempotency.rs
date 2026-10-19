@@ -1,4 +1,4 @@
-//! `Idempotency-Key` at the HTTP edge (B5): which routes take it and which
+//! `Idempotency-Key` at the HTTP edge (ADR-240): which routes take it and which
 //! refuse it, what a malformed key draws, the gate (the operator's switch and the
 //! live-peer net), and the body path a keyed request is read through.
 //!

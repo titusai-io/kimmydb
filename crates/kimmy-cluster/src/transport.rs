@@ -87,7 +87,7 @@ pub(crate) enum Fits {
 }
 
 /// How many leading entries fit inside [`ENTRY_BUDGET`], with **every record**
-/// the window ships (B5, records travel with coverage):
+/// the window ships (ADR-240, records travel with coverage):
 ///
 /// - the first `unanchored` records, those the sender cannot vouch for by its
 ///   oplog, are counted first, since a window carries them whatever else it
@@ -168,7 +168,7 @@ pub(crate) fn how_many_fit(
     Fits::All
 }
 
-/// The records a replay page carries (B5, records travel with coverage): those
+/// The records a replay page carries (ADR-240, records travel with coverage): those
 /// the page's own advance vouches for, a row of the requester's origin in
 /// `(from, through]`, and every one its sender cannot vouch for by its oplog
 /// (the first `unanchored`, `records_for_coverage`'s F3), whatever the page
@@ -419,7 +419,7 @@ fn record_key(record: &kimmy_storage::CarriedRecord) -> RecordKey {
 /// `window_records` and `unanchored` the window's own records (F2 and F3), and
 /// `cursor` where an earlier page of records alone at `from` left off.
 ///
-/// **The records** (B5): the F3 records, those with a row of the requester's
+/// **The records** (ADR-240): the F3 records, those with a row of the requester's
 /// origin inside the page ([`records_of_replay`]), and B2's, every live record
 /// of the page's collections whose request spans it, carried at its `first`
 /// (`Engine::records_for_replay_page`). Each once, at the lowest carrying stamp
@@ -1365,11 +1365,11 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::UnparseablePartialFilter { .. }
         | E::Stale { .. }
         | E::CollectionPurging { .. } => false,
-        // A keyed client request's answer (B5), never an apply's, and about
+        // A keyed client request's answer (ADR-240), never an apply's, and about
         // the request, not this node's storage.
         E::IdempotencyKeyReused | E::IdempotencyKeyInFlight => false,
         // A snapshot page's row no page can carry: about the row, never an
-        // apply's (B5).
+        // apply's (ADR-240).
         E::SnapshotRowTooLarge { .. } => false,
     }
 }
@@ -1834,7 +1834,7 @@ where
                 // requester ask again; see `Message::BatchTooLarge` for why serving
                 // fewer entries unasked would be a silent gap rather than a kindness.
                 // The records count: a window whose records push it over the
-                // frame is answered the same way (B5).
+                // frame is answered the same way (ADR-240).
                 let mut unanchored = window.unanchored;
                 let mut records = records_to_send(engine, window.records);
                 // The records the peer stored ahead of this window's first entry, in
@@ -2693,7 +2693,7 @@ pub(crate) fn replay_apply(
             )
             .map_err(|e| ProtocolError::Local(format!("writing the catching-up marker: {e}")))?;
         // With the records the page carried: an entry this member lost and reads
-        // back keeps its record too (B5).
+        // back keeps its record too (ADR-240).
         let outcome = kimmy_storage::blocking(|| {
             engine.apply_batch_carrying(&lost, records, kimmy_storage::RecordsVia::Replay)
         })
@@ -2710,7 +2710,7 @@ pub(crate) fn replay_apply(
     if lost.is_empty() && !records.is_empty() {
         // The records of a page with no lost entries are stored all the same: a
         // page of records alone (m1) carries what a later page's entries need,
-        // and a record held already writes nothing (B5).
+        // and a record held already writes nothing (ADR-240).
         let outcome = kimmy_storage::blocking(|| {
             engine.apply_batch_carrying(&[], records, kimmy_storage::RecordsVia::Replay)
         })
@@ -5434,7 +5434,7 @@ impl PeerStalls {
     /// plans, and the size gate on top), however much the collection has grown by then
     /// (repair design section 2.6).
     ///
-    /// **Rows, not pages** (B5, the build review's m6): a page is cut by its byte budget
+    /// **Rows, not pages** (ADR-240, the build review's m6): a page is cut by its byte budget
     /// (`kimmy_storage::SNAPSHOT_PAGE_BYTES`) as well as at `SNAPSHOT_PAGE` rows, so a page
     /// of large documents carries fewer, and a records phase sends pages with no row at
     /// all; counted in pages, either would end the repair before it had walked the
@@ -7216,7 +7216,7 @@ mod tests {
         io::Error::from_raw_os_error(24)
     }
 
-    /// A frame counts every record its window ships (B5, records travel with
+    /// A frame counts every record its window ships (ADR-240, records travel with
     /// coverage): a record whose row lies at or before an entry counts with the
     /// first such entry, so the window is cut where an entry and those records
     /// no longer fit; a record whose row is past every entry, which rides with
@@ -11056,7 +11056,7 @@ mod tests {
         assert_eq!(n(&a), 11, "the retry replays");
     }
 
-    /// The v0.51.0 stall (B5, P2): 600 documents of 130 KiB, whose first page
+    /// The v0.51.0 stall (ADR-240, P2): 600 documents of 130 KiB, whose first page
     /// was 68 MB, over a frame, so the listener refused it and the pull failed
     /// for good. Pages are cut by bytes now (`SNAPSHOT_PAGE_BYTES`), and the
     /// whole-database, scoped and converge pulls complete. A document no page can

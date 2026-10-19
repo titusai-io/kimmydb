@@ -1,4 +1,4 @@
-//! Idempotency records (B5): the codec, the merge, the keyed write paths, a
+//! Idempotency records (ADR-240): the codec, the merge, the keyed write paths, a
 //! record across a drop, the coalesced replay barrier, the multi-chunk record and
 //! resume, retention, the purge and the sweep (which leave records), backups, a
 //! rewind, and what replication will read and store. The storage, crash and

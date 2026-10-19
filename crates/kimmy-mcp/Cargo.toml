@@ -35,7 +35,7 @@ tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
 bson.workspace = true
-# `store_peer_record_for_test`: a record only replication brings (B5, KR).
+# `store_peer_record_for_test`: a record only replication brings (ADR-240, KR).
 kimmy-storage = { workspace = true, features = ["test-hooks"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

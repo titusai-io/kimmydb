@@ -267,7 +267,7 @@ pub struct SnapshotCursor {
     /// Encoded document key, in the legacy (schema-4) form on the wire (module
     /// docs); the next page starts strictly after it.
     pub after_key: Vec<u8>,
-    /// Where the collection's **records phase** stands (B5, "Snapshots carry
+    /// Where the collection's **records phase** stands (ADR-240, "Snapshots carry
     /// records"): `Some` while the sender is sending `collection`'s idempotency
     /// records, ahead of its documents, `after_key` then empty. The bytes are the
     /// last scope hash sent, or empty to begin with the collection's first record.
@@ -284,7 +284,7 @@ pub struct SnapshotCursor {
         deserialize_with = "lenient_records_at"
     )]
     pub records: Option<Vec<u8>>,
-    /// The base of the next page's **records delta** (B5, "Snapshots carry
+    /// The base of the next page's **records delta** (ADR-240, "Snapshots carry
     /// records"): where the sender's change log of idempotency records
     /// (`IDEMPOTENCY_CHANGES`) stood when the page that cut this cursor read its
     /// documents, a key of it and the log's epoch ([`RecordsBase`]). The next page
@@ -311,7 +311,7 @@ pub struct SnapshotCursor {
     pub records_base: Option<RecordsBase>,
 }
 
-/// Where a sender's change log of idempotency records stood (B5): a key of it
+/// Where a sender's change log of idempotency records stood (ADR-240): a key of it
 /// and its epoch, the base of a snapshot page's records delta
 /// ([`SnapshotCursor::records_base`]).
 ///
@@ -640,7 +640,7 @@ pub struct SnapshotApplied {
     /// the base was cut, by a keyed write or by an open over restored records,
     /// and only the first names every record since. Nothing was applied, the
     /// page is not counted, and `progress` now asks for the cursor's collection
-    /// again from its records phase (B5, the build review's m4, guard ii).
+    /// again from its records phase (ADR-240, the build review's m4, guard ii).
     pub records_restarted: bool,
 }
 
@@ -771,7 +771,7 @@ pub struct SnapshotPage {
     /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone_horizon: Option<Hlc>,
-    /// The idempotency records of the page's collection (B5, "Snapshots carry
+    /// The idempotency records of the page's collection (ADR-240, "Snapshots carry
     /// records"), sent **before** its documents: pages of up to
     /// [`crate::idempotency::RECORD_PAGE`] of them, within what the page has left
     /// of [`SNAPSHOT_PAGE_BYTES`] after its delta, open each collection's part of
@@ -797,7 +797,7 @@ pub struct SnapshotPage {
     )]
     pub records: Vec<crate::idempotency::CarriedRecord>,
     /// The epoch of the sender's change log of idempotency records as this
-    /// page's transaction read it (B5, the build review's m4): on every page,
+    /// page's transaction read it (ADR-240, the build review's m4): on every page,
     /// the last included, from a sender whose log has begun; absent from one
     /// whose log has held nothing.
     ///
@@ -999,7 +999,7 @@ impl SnapshotProgress {
     }
 }
 
-/// The requester's guard on the zero records base (B5, the build review's m4,
+/// The requester's guard on the zero records base (ADR-240, the build review's m4,
 /// guard ii): the cursor `page` was asked with carried the zero base, and the
 /// page names an epoch of its sender's change log
 /// ([`SnapshotPage::records_epoch`]), so the log began after the base was cut.
@@ -1216,7 +1216,7 @@ impl Engine {
     /// One page's rows: a collection's idempotency records, then documents and
     /// tombstones, resuming after `cursor` (its key in the stored form).
     ///
-    /// **Collection by collection, in id order**, each in two phases (B5):
+    /// **Collection by collection, in id order**, each in two phases (ADR-240):
     /// first its records, up to [`crate::idempotency::RECORD_PAGE`] a page, then
     /// its rows of `docs` in key order, which is `(collection, id)`, up to
     /// [`SNAPSHOT_PAGE`] a page, live documents and tombstones together. A page
@@ -1231,7 +1231,7 @@ impl Engine {
     /// for the drop purger (ADR-189), or residue an older collector orphaned, a
     /// life that has ended, which a receiver must never be handed.
     ///
-    /// **The records delta** (B5, "Snapshots carry records"), first, in the same
+    /// **The records delta** (ADR-240, "Snapshots carry records"), first, in the same
     /// transaction: when the cursor carries a `records_base`, every record (of
     /// the scoped collection, for a scoped snapshot; of a dropped collection too,
     /// since a key outlives a drop of its collection for its window) the change
@@ -1293,7 +1293,7 @@ impl Engine {
         };
         // The ids whose records the walk sends: every collection that stands, and
         // every one dropped and not created again, whose idempotency keys outlive
-        // the drop for their window (B5): a member rebuilt by snapshot answers a
+        // the drop for their window (ADR-240): a member rebuilt by snapshot answers a
         // retry of such a key as the members that saw the drop do. Their
         // documents are not sent: only a collection that stands has rows on a
         // page. The drops are bounded by `tombstone_retention_secs`.
@@ -1820,7 +1820,7 @@ impl Engine {
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut failed = None;
-        // The page's idempotency records ride its documents' transaction (B5).
+        // The page's idempotency records ride its documents' transaction (ADR-240).
         let via = match progress.scope {
             None => crate::idempotency::RecordsVia::Snapshot,
             Some(_) => crate::idempotency::RecordsVia::Repair,
@@ -2051,7 +2051,7 @@ impl Engine {
     ) -> Result<SnapshotApplied> {
         debug_assert!(progress.scope.is_some(), "a Converge pull is always scoped");
         // Neither answer applies the page's documents; both keep its records
-        // (B5), which outlive a drop of their collection for their window.
+        // (ADR-240), which outlive a drop of their collection for their window.
         let via = crate::idempotency::RecordsVia::Repair;
         if page.dropped.is_some() {
             self.store_page_records_alone(&page.records, via)?;
@@ -2080,7 +2080,7 @@ impl Engine {
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::ConvergePage);
             let txn = self.begin_write(WriterHolder::Repair)?;
             // The collection's records, ahead of its rows, in the page's
-            // transaction (B5): a converge repair (ADR-237) ships them for the
+            // transaction (ADR-240): a converge repair (ADR-237) ships them for the
             // whole window, the cost the design accepts, so that a member it
             // repairs also replays the keys of the writes it was given.
             let records_stored = self.store_page_records(&txn, &page.records)?;

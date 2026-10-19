@@ -806,7 +806,7 @@ fn operations_with_the_idempotency_header() -> BTreeSet<(String, String)> {
 }
 
 /// The routes the server opens to `Idempotency-Key` are exactly the operations
-/// the specification gives the header (B5), and each of them documents what a
+/// the specification gives the header (ADR-240), and each of them documents what a
 /// key can draw: the replay marker on its `200`, and `idempotency_key_reused`
 /// on its `422`.
 ///
@@ -1470,7 +1470,7 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         kimmy_vector::local_embeddings_available(),
         "local-embeddings is advertised exactly when this build has it; served {served:?}"
     );
-    // A lone node whose gate nobody closed takes keys, so it lists them (B5),
+    // A lone node whose gate nobody closed takes keys, so it lists them (ADR-240),
     // and says how long it remembers one.
     assert!(served.contains(&"idempotency-keys"), "served {served:?}");
     assert_eq!(advertised["idempotencyWindowSecs"], 86_400);

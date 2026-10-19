@@ -65,7 +65,7 @@ const WALKS: [&str; 25] = [
     // range's fallback, the whole collection walked in the write transaction.
     ".modify_where(",
     ".find_and_modify(",
-    // Their keyed twins (B5), the same walk with the request's record beside it.
+    // Their keyed twins (ADR-240), the same walk with the request's record beside it.
     ".modify_where_keyed(",
     ".find_and_modify_keyed(",
     // A peer's window: as long as whatever its entries carry, an index build

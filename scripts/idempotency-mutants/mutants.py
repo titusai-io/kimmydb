@@ -361,7 +361,7 @@ ROWS = [
             ("crates/kimmy-storage/src/docs.rs",
              """        let stamp = entry.stamp;
         // In the write's own transaction: the record survives exactly what the
-        // write survives (B5).
+        // write survives (ADR-240).
         if let Some(keyed) = keyed {
             let outcome = RecordOutcome::Insert { stamp };
             let record = IdempotencyRecord::written(keyed, stamp, self.node_id(), outcome);

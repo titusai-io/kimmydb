@@ -372,7 +372,7 @@ pub enum Message {
         exhausted: bool,
         #[serde(default)]
         passed_through: Option<kimmy_core::Stamp>,
-        /// The idempotency records the shipped entries carry (B5, "How a
+        /// The idempotency records the shipped entries carry (ADR-240, "How a
         /// record travels"): `{collection, scope hash, carrying stamp, record
         /// bytes}`, read in the read transaction that read the window and only
         /// for the stamps shipped. The bytes are opaque here and pass through.
@@ -447,7 +447,7 @@ pub enum Message {
         /// cut short before it reached the requester's entries therefore still
         /// makes progress at every contact.
         scanned_to: Hlc,
-        /// The idempotency records the shipped entries carry (B5, "How a
+        /// The idempotency records the shipped entries carry (ADR-240, "How a
         /// record travels"): `{collection, scope hash, carrying stamp, record
         /// bytes}`, read in the read transaction that read the window and only
         /// for the stamps shipped. The bytes are opaque here and pass through.
@@ -641,7 +641,7 @@ pub enum Message {
         scanned_to: Hlc,
         exhausted: bool,
         versions: VersionVector,
-        /// The idempotency records the shipped entries carry (B5, "How a
+        /// The idempotency records the shipped entries carry (ADR-240, "How a
         /// record travels"): `{collection, scope hash, carrying stamp, record
         /// bytes}`, read in the read transaction that read the window and only
         /// for the stamps shipped. The bytes are opaque here and pass through.
@@ -1124,7 +1124,7 @@ mod tests {
                     after_key: vec![1, 2],
                     records: None,
                     // A records delta's base: a key of the sender's change
-                    // log and its epoch (B5).
+                    // log and its epoch (ADR-240).
                     records_base: Some(kimmy_storage::RecordsBase {
                         key: kimmy_core::Stamp::new(Hlc::new(77, 1), NodeId::from_bytes([3; 16])),
                         epoch: Some(i64::MIN + 5),

@@ -1,4 +1,4 @@
-//! Idempotency keys across members over real TCP sockets (B5, "Replication and
+//! Idempotency keys across members over real TCP sockets (ADR-240, "Replication and
 //! the cross-member retry", tests C1 to C9). Each member is an engine serving
 //! the real replication listener; a keyed request is the engine's keyed write,
 //! which is what the API's keyed routes call once the gate lets the key in.

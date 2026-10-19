@@ -4355,7 +4355,7 @@ async fn lab_hook_a_lost_insert_is_repaired_by_either_half() {
     eprintln!("lost insert repaired: count-half rounds {count_half}, young rows created {young}");
 }
 
-/// The `Idempotency-Key` gate on a live cluster (B5). A sets
+/// The `Idempotency-Key` gate on a live cluster (ADR-240). A sets
 /// `cluster.idempotency_keys`; B keeps the clustered default, `false`. B refuses a
 /// keyed write `400`, naming the switch, counts it `gated`, and does not list
 /// `idempotency-keys`; A takes a key once it has heard B say it carries records
@@ -4572,7 +4572,7 @@ async fn a_decimal128_id_is_created_where_declared_and_applied_everywhere() {
 }
 
 // ---------------------------------------------------------------------------
-// Idempotency keys across members (B5, design section "Cluster")
+// Idempotency keys across members (ADR-240, design section "Cluster")
 // ---------------------------------------------------------------------------
 //
 // C1 to C9 over real processes and real HTTP, every member with

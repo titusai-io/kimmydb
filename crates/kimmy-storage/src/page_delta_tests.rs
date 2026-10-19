@@ -1,4 +1,4 @@
-//! The records delta on every snapshot, scoped and converge page (B5, "Snapshots
+//! The records delta on every snapshot, scoped and converge page (ADR-240, "Snapshots
 //! carry records"), read from the sender's change log of idempotency records.
 //!
 //! The residual this closes: a keyed write on the sender after its collection's
@@ -2128,7 +2128,7 @@ fn walked_in_order(first: &'static str, second: &'static str) -> (&'static str, 
     if id(first) < id(second) { (first, second) } else { (second, first) }
 }
 
-/// A key outlives a drop of its collection for its window (B5): a snapshot of a
+/// A key outlives a drop of its collection for its window (ADR-240): a snapshot of a
 /// sender that dropped a collection and did not create it again still carries
 /// its records, whole-database and scoped, and none of its documents.
 #[test]
