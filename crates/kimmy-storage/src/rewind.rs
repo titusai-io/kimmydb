@@ -865,35 +865,29 @@ mod tests {
     #[test]
     fn a_rewind_that_discards_nothing_changes_neither_vector() {
         // Two kinds of coverage the oplog does not name: a completed snapshot's
-        // grant (the sender's index creation stamps no document), and an entry
-        // processed without an append (a write that loses last-writer-wins,
-        // ADR-054). Rebuilt from the oplog, the rewind lost both.
+        // grant (the sender's own write was overwritten by another origin, so the
+        // page carries no entry of the sender's), and an entry processed without
+        // an append (a write that loses last-writer-wins, ADR-054). Rebuilt from
+        // the oplog, the rewind lost both.
         let base = base();
         let ((a, _da), (b, _db), (c, _dc)) = (engine(), engine(), engine());
         at(&a, base, 10);
         let orders = a.create_collection("shop", "orders").unwrap();
         at(&a, base, 20);
-        a.insert(&orders, doc! { "_id": 1, "k": 1 }).unwrap();
-        at(&a, base, 30);
-        a.create_index(
-            "shop",
-            "orders",
-            vec![IndexField { path: "k".into(), descending: false }],
-            false,
-            None,
-        )
-        .unwrap();
+        a.insert(&orders, doc! { "_id": 1 }).unwrap();
+        pull(&c, &a);
+        at(&c, base, 25);
+        let theirs = c.get_collection("shop", "orders").unwrap();
+        c.replace(&theirs, &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
+        pull(&a, &c);
         whole(&b, &a);
-        whole(&c, &a);
         let granted = b.version_vector().unwrap().get(a.node_id());
-        let held = crate::docs::record_stamp(
-            &b,
-            &b.get_collection("shop", "orders").unwrap(),
-            &DocId::Int64(1),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(granted > held.hlc, "the grant must name a stamp no document carries");
+        let entries =
+            b.read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background).unwrap();
+        assert!(
+            granted > Hlc::ZERO && entries.iter().all(|entry| entry.stamp.node != a.node_id()),
+            "the grant must name a stamp of a's that no entry here carries: {entries:?}"
+        );
 
         at(&c, base, 100);
         c.insert(&c.get_collection("shop", "orders").unwrap(), doc! { "_id": 5 }).unwrap();

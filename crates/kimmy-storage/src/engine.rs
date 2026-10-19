@@ -3515,8 +3515,8 @@ impl Engine {
     /// lowers both vectors to it (ADR-243), so neither the tail nor a vector names what
     /// it discarded, nor the tombstones it minted for documents created after the
     /// target. A member whose clock led its wall clock would otherwise resume below
-    /// them: its next write stamped inside the discarded range, which a change-stream
-    /// token check reads as discarded, and below its own tombstones (CL1).
+    /// them (CL1): its next writes stamped inside the discarded range, where a stamp
+    /// can be the very stamp of a discarded entry, and below its own tombstones.
     fn resume_hlc(db: &Database) -> Result<Hlc> {
         let tail = Self::last_oplog_hlc(db)?;
         let named = [tables::OPLOG_VERSIONS, tables::OPLOG_WITNESSED]
