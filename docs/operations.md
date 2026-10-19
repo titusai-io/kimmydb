@@ -2447,11 +2447,11 @@ wrong, since its vector already covers what it claims.
   document the member holds nothing for, and does not write it because its stamp
   is not above both members' tombstone horizons (a restore sets the restored
   member's to the restore's time, so there no such document is written). On a
-  member that was not restored, the repair may write a recent one back by itself;
-  what it cannot write, it leaves with this line. A
-  count finding on the same collection (`divergence confirmed; planned a repair
-  from this peer`) plans the count half's replay, which brings a lost insert
-  back while the origin still retains its entry.
+  member that was not restored, the repair may write a recent one back by
+  itself; what it cannot write, it leaves with this line. A count finding on the
+  same collection (`divergence confirmed; planned a repair from this peer`) plans
+  the count half's replay, which brings a lost insert back while the origin
+  still retains its entry.
 - Compare each collection across every member: its document count
   (`POST /v1/db/{db}/coll/{coll}/count`, read with no writes to the collection
   meanwhile) and the cut digest (`kimmy_sync_digest_divergent_collections` above
@@ -2477,11 +2477,13 @@ document it lacks. The member that wrote a lost document always holds it.
    not clean: wipe a member only if every id that differs is present on both
    members and that member holds the older stamp on every one of them. A
    document the member lacks is an id present on one member only, so the rule
-   forbids the wipe, and the operator rule for rows the repair leaves applies:
-   a write lost this way is one the lacking member never held, so re-insert it
-   through that member. The re-insert is a new write, above every member's
-   vector, so it reaches every member, the affected ones included, whatever each
-   one claims.
+   forbids the wipe, and the operator rule for
+   [rows the repair leaves](#the-cut-digest) applies: if the member that lacks
+   the id never held it, which is what a write lost this way is, re-insert it
+   through that member, as a clean member holds it; if it deleted the id on
+   purpose, delete it on the others. The re-insert is a new write, above every
+   member's vector, so it reaches every member, the affected ones included,
+   whatever each one claims.
 2. **A member the rule allows you to wipe**, or the restored member restored
    again from the original backup with 0.52.0 or later (which the same rule
    governs, since it discards what the member took after that backup), catches
