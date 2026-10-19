@@ -482,6 +482,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 horizon: false,
                 scanned_to: from,
                 records: Vec::new(),
+                replay_records: None,
             },
         )
         .await
@@ -501,6 +502,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 horizon: false,
                 scanned_to: at(1),
                 records: Vec::new(),
+                replay_records: None,
             },
         ),
         (
@@ -512,6 +514,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 horizon: false,
                 scanned_to: at(4),
                 records: Vec::new(),
+                replay_records: None,
             },
         ),
         (
@@ -523,6 +526,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 horizon: false,
                 scanned_to: at(9),
                 records: Vec::new(),
+                replay_records: None,
             },
         ),
         (
@@ -534,6 +538,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 horizon: false,
                 scanned_to: at(9),
                 records: Vec::new(),
+                replay_records: None,
             },
         ),
         (
@@ -548,6 +553,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 horizon: false,
                 scanned_to: at(9),
                 records: Vec::new(),
+                replay_records: None,
             },
         ),
         (
@@ -561,6 +567,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 horizon: false,
                 scanned_to: at(MAX_BATCH as u64 + 9),
                 records: Vec::new(),
+                replay_records: None,
             },
         ),
     ];
@@ -594,12 +601,13 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
                 horizon: false,
                 scanned_to: from,
                 records: Vec::new(),
+                replay_records: None,
             },
         )
         .await
         .unwrap();
         match read_frame(&mut stream).await.unwrap() {
-            Message::ReplayAck { next_from, done, stalled } => {
+            Message::ReplayAck { next_from, done, stalled, .. } => {
                 assert_eq!((next_from, done, stalled), (from, false, None));
             }
             other => panic!("{other:?}"),
@@ -614,6 +622,7 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
                 horizon: false,
                 scanned_to: from,
                 records: Vec::new(),
+                replay_records: None,
             },
         )
         .await
@@ -646,6 +655,7 @@ async fn a_horizon_page_is_recorded_and_answers_nothing() {
                 horizon: true,
                 scanned_to: from,
                 records: Vec::new(),
+                replay_records: None,
             },
         )
         .await
@@ -772,12 +782,19 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
             horizon: false,
             scanned_to: Hlc::new(3, 1),
             records: Vec::new(),
+            replay_records: None,
         },
-        Message::ReplayAck { next_from: Hlc::new(4, 0), done: false, stalled: None },
+        Message::ReplayAck {
+            next_from: Hlc::new(4, 0),
+            done: false,
+            stalled: None,
+            replay_records: None,
+        },
         Message::ReplayAck {
             next_from: Hlc::new(4, 0),
             done: false,
             stalled: Some(ReplayStall::PurgePending),
+            replay_records: None,
         },
     ];
     for frame in frames {
@@ -802,6 +819,7 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
         facts_gen: None,
         echo: None,
         replay_from: Some(Hlc::new(9, 0)),
+        replay_records: None,
     };
     let doc = bson::serialize_to_document(&with_ask).unwrap();
     assert!(matches!(bson::deserialize_from_document::<Before>(doc), Ok(Before::Vectors { .. })));
@@ -813,6 +831,7 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
         facts_gen: None,
         echo: None,
         replay_from: None,
+        replay_records: None,
     };
     let doc = bson::serialize_to_document(&without).unwrap();
     assert!(!doc.get_document("Vectors").unwrap().contains_key("replay_from"));
@@ -834,6 +853,7 @@ fn frames_page() -> Message {
         horizon: false,
         scanned_to: Hlc::ZERO,
         records: Vec::new(),
+        replay_records: None,
     }
 }
 
@@ -853,7 +873,12 @@ async fn an_ack_that_does_not_advance_ends_the_replay_for_the_contact() {
             // A constant ack: the position it was asked from, never moving.
             write_frame(
                 &mut theirs,
-                &Message::ReplayAck { next_from: from, done: false, stalled: None },
+                &Message::ReplayAck {
+                    next_from: from,
+                    done: false,
+                    stalled: None,
+                    replay_records: None,
+                },
             )
             .await
             .unwrap();
@@ -862,8 +887,9 @@ async fn an_ack_that_does_not_advance_ends_the_replay_for_the_contact() {
     });
     // The dialer holds the whole tail; the peer (A) is the origin it serves.
     let theirs_vector = kimmy_core::VersionVector::default();
-    let served =
-        serve_replay(&f.c, &mut ours, addr(), f.a.node_id(), &theirs_vector, from).await.unwrap();
+    let served = serve_replay(&f.c, &mut ours, addr(), f.a.node_id(), &theirs_vector, from, None)
+        .await
+        .unwrap();
     drop(ours);
     assert_eq!(served, ReplayServed::InStep);
     assert_eq!(scripted.await.unwrap(), 1, "one page, then it stopped: it does not trust the ack");
@@ -889,6 +915,7 @@ async fn a_missing_ack_ends_the_contact_without_failing_it() {
         f.a.node_id(),
         &kimmy_core::VersionVector::default(),
         Hlc::new(1, 0),
+        None,
     )
     .await
     .unwrap();
@@ -934,7 +961,8 @@ fn the_replay_is_served_while_the_holders_writer_is_held() {
                     let asked = ask_versions(&mut ours).await.expect("the ask");
                     let theirs = kimmy_core::VersionVector::default();
                     let served =
-                        serve_replay(&f.c, &mut ours, addr(), f.a.node_id(), &theirs, asked).await;
+                        serve_replay(&f.c, &mut ours, addr(), f.a.node_id(), &theirs, asked, None)
+                            .await;
                     drop(ours);
                     served
                 };
@@ -1048,12 +1076,13 @@ async fn the_ack_names_the_cursor_the_page_reached() {
                 horizon: false,
                 scanned_to: at(2),
                 records: Vec::new(),
+                replay_records: None,
             },
         )
         .await
         .unwrap();
         match read_frame(&mut stream).await.unwrap() {
-            Message::ReplayAck { next_from, done, stalled } => {
+            Message::ReplayAck { next_from, done, stalled, .. } => {
                 assert_eq!(next_from, at(2), "the ack names the last entry applied");
                 assert!(!done && stalled.is_none());
             }
@@ -1178,6 +1207,7 @@ async fn a_stop_during_the_serve_ends_the_contact_as_a_stop() {
         f.a.node_id(),
         &kimmy_core::VersionVector::new(),
         from,
+        None,
     )
     .await;
     drop(ours);
@@ -1205,6 +1235,7 @@ async fn a_malformed_replay_from_decodes_as_absent_through_the_real_decoder() {
         facts_gen: None,
         echo: None,
         replay_from: Some(Hlc::new(9, 0)),
+        replay_records: None,
     })
     .unwrap();
     for bad in [
@@ -1418,6 +1449,7 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
                     horizon: false,
                     scanned_to,
                     records: Vec::new(),
+                    replay_records: None,
                 },
             )
             .await
@@ -2162,7 +2194,7 @@ async fn a_cursor_then_a_change(
         f.round().await.unwrap();
         TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
         let at = f.catch_up.replay_from(c);
-        assert!(inbound_records(c, f.a.node_id(), at).is_some(), "premise: a cursor");
+        assert_eq!(f.catch_up.replay_records(c).map(|r| r.at), Some(at), "premise: a cursor");
     }
     plant_large_change(&f, bytes);
     let seen = Seen::default();
@@ -2305,7 +2337,7 @@ async fn a_page_filled_by_what_changed_since_the_cursor_keeps_its_key_and_is_cou
     f.round().await.unwrap();
     TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
     let c = f.c.node_id();
-    assert!(inbound_records(c, f.a.node_id(), f.catch_up.replay_from(c)).is_some(), "premise");
+    assert!(f.catch_up.replay_records(c).is_some(), "premise: the member holds a cursor");
     // Twelve changes of about 600 bytes each: more than the delta's 4 KiB.
     let from = f.a.own_position_at_open();
     let orders = f.c.get_collection("shop", "orders").unwrap();
@@ -2374,4 +2406,141 @@ async fn a_page_filled_by_what_changed_since_the_cursor_keeps_its_key_and_is_cou
         assert!(f.a.idempotency_record(aorders.id, scope).unwrap().is_some(), "every record");
     }
     assert_eq!(f.orders(), 2 + 5, "every lost write is back");
+}
+
+/// The inbound replay's records cursor is held by the member replayed to, and
+/// nowhere else: a member restored again (here, the records it stored from the
+/// pages removed, as a store restored from the same backup holds none of them,
+/// and its replay armed again, as a start arms it) asks from the same position
+/// with no cursor, and its peer starts that position's records over. Kept by the
+/// peer, the cursor would pass those records as sent, and the member would take
+/// its lost keyed writes back without them.
+#[tokio::test]
+async fn an_inbound_records_cursor_does_not_outlive_a_second_restore_of_the_member() {
+    let f = fixture_of(5, 0, 0, true);
+    let planted = plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(2)));
+    let floor = f.a.own_position_at_open();
+    // Contact 1: two pages of records alone, stored and acknowledged.
+    f.round().await.unwrap();
+    assert!(!f.catch_up.replay_answered(f.c.node_id()), "premise: more pages are owed");
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    let keyed: Vec<_> = (2..2 + f.lost).map(lost_scope).collect();
+    assert!(
+        keyed.iter().chain(&planted).any(|s| f
+            .a
+            .idempotency_record(orders.id, s)
+            .unwrap()
+            .is_some()),
+        "premise: records crossed on contact 1"
+    );
+    assert_eq!(f.orders(), 2, "premise: no lost write is back yet");
+    // Restored again from the same backup: none of those records, and armed again.
+    for s in keyed.iter().chain(&planted) {
+        let _ = f.a.remove_idempotency_record_for_test(orders.id, s).unwrap();
+    }
+    f.catch_up.arm_replay(floor, None).unwrap();
+    assert_eq!(f.a.own_position_at_open(), floor, "premise: the same replay position");
+    let mut contacts = 0;
+    while !f.catch_up.replay_answered(f.c.node_id()) {
+        contacts += 1;
+        assert!(contacts <= 12, "the replay is not answered after twelve contacts");
+        f.round().await.unwrap();
+    }
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
+    assert_eq!(f.orders(), 2 + 5, "every lost write is back");
+    let missing_keyed =
+        keyed.iter().filter(|s| f.a.idempotency_record(orders.id, s).unwrap().is_none()).count();
+    let missing_planted =
+        planted.iter().filter(|s| f.a.idempotency_record(orders.id, s).unwrap().is_none()).count();
+    assert_eq!(
+        (missing_keyed, missing_planted),
+        (0, 0),
+        "after the second restore every lost keyed write and every spanning record is back"
+    );
+}
+
+/// The same with a keyed `$inc`, whose retry shows what a cursor that outlived
+/// the second restore would cost: the `$inc` taken back without its record, and
+/// applied a second time.
+#[tokio::test]
+async fn a_second_restore_during_an_inbound_records_cursor_does_not_apply_a_keyed_inc_twice() {
+    let writer_dir = tempfile::tempdir().unwrap();
+    let writer = Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap();
+    let orders = writer.create_collection("shop", "orders").unwrap();
+    for i in 0..2i64 {
+        writer.insert(&orders, bson::doc! { "_id": i, "n": 0i64 }).unwrap();
+    }
+    let mut backup = Vec::new();
+    writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    std::thread::sleep(Duration::from_millis(15));
+    let k = lost_key(1);
+    let kimmy_storage::Keyed::Fresh(out) = writer
+        .modify_where_keyed(&orders, &kimmy_storage::Candidates::Scan, &IncN, None, &k)
+        .unwrap()
+    else {
+        panic!("a fresh key")
+    };
+    assert_eq!(out.modified, 2);
+    let c_dir = tempfile::tempdir().unwrap();
+    let c = Engine::open(&c_dir.path().join("kimmy.redb")).unwrap();
+    pull_all(&c, &writer);
+    let corders = c.get_collection("shop", "orders").unwrap();
+    assert!(c.idempotency_record(corders.id, &k.scope).unwrap().is_some(), "premise: C holds it");
+    let a_dir = tempfile::tempdir().unwrap();
+    let path = a_dir.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+    let a = Engine::open(&path).unwrap();
+    assert_eq!(a.node_id(), writer.node_id());
+    a.create_collection("shop", "startup").unwrap();
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+    let floor = a.own_position_at_open();
+    catch_up.arm_replay(floor, None).unwrap();
+    let members = Members::default();
+    members.set_catch_up(Arc::clone(&catch_up));
+    let f = Fixture {
+        a,
+        c,
+        catch_up,
+        members,
+        lost: 0,
+        _dirs: vec![writer_dir, c_dir, a_dir, marker_dir],
+    };
+    let planted = plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(2)));
+    f.round().await.unwrap();
+    assert!(!f.catch_up.replay_answered(f.c.node_id()), "premise: more pages are owed");
+    let aorders = f.a.get_collection("shop", "orders").unwrap();
+    assert!(
+        f.a.idempotency_record(aorders.id, &k.scope).unwrap().is_some(),
+        "premise: the $inc's record crossed on contact 1"
+    );
+    assert_eq!((n_of(&f.a, 0), n_of(&f.a, 1)), (0, 0), "premise: no effect is back yet");
+    // Restored again from the same backup.
+    let _ = f.a.remove_idempotency_record_for_test(aorders.id, &k.scope).unwrap();
+    for s in &planted {
+        let _ = f.a.remove_idempotency_record_for_test(aorders.id, s).unwrap();
+    }
+    f.catch_up.arm_replay(floor, None).unwrap();
+    let mut contacts = 0;
+    while !f.catch_up.replay_answered(f.c.node_id()) {
+        contacts += 1;
+        assert!(contacts <= 12, "the replay is not answered after twelve contacts");
+        f.round().await.unwrap();
+    }
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
+    let effects = (n_of(&f.a, 0), n_of(&f.a, 1));
+    let record = f.a.idempotency_record(aorders.id, &k.scope).unwrap();
+    let retry =
+        f.a.modify_where_keyed(&aorders, &kimmy_storage::Candidates::Scan, &IncN, None, &k)
+            .unwrap();
+    let after = (n_of(&f.a, 0), n_of(&f.a, 1));
+    assert!(
+        record.is_some() && after == effects,
+        "the restored member holds the $inc's effect {effects:?} with record {record:?}; the \
+         retry answered {retry:?} and the documents are now {after:?}"
+    );
 }

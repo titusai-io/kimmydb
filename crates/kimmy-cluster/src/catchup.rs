@@ -827,6 +827,10 @@ impl CatchUp {
         replay.recorded_owed = loaded;
         replay.loss_reported.clear();
         replay.progress.clear();
+        // A records cursor names records the store held when it was stored: arming
+        // again (a start, a store restored again) starts every position's records
+        // over.
+        replay.records.clear();
         Ok(())
     }
 

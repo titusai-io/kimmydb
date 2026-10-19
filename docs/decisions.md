@@ -28761,8 +28761,12 @@ with it, and not be offered while any member could carry the write without it.
      shape of a snapshot cursor's `records_base`. The next page at the position carries no entry past the cursor's
      end, sends nothing of the cursor's set at or before its key that the log does not name as changed since its
      base, sends every record the log does name, and so goes on until what is left fits with the entries; a cursor
-     of another epoch starts the position's records over. The inbound way keeps the cursor of the last page a peer
-     acknowledged, across contacts, in memory; the outbound way keeps the one of the last page it stored. **A frame
+     of another epoch starts the position's records over. **The cursor is held by the member replayed to, on both
+     ways**, in memory: the cursor of the last page of records alone it stored, which it sends back with every ask
+     (outbound) or echoes in its ack and hands back at its next contact's `Vectors` (inbound). The serving member
+     goes on only from a cursor so echoed and keeps none of its own, so a restart of the member replayed to (a
+     restore again from the same backup, which asks from the same position) loses the cursor, and the position's
+     records start over. **A frame
      or page that cannot carry even that** (one record, or the F3 records, larger than a frame; a pull that cannot
      take a partial window, or whose window would not end past where it began) is logged at `WARN` and counted in
      `kimmy_idempotency_records_unfit_total{path}`. **A record the change log names as changed since a cursor's base
@@ -28805,7 +28809,10 @@ with it, and not be offered while any member could carry the write without it.
      A 0.51 sender ignores it and answers the window as a pull, which is safe: 0.51 holds no records, and keyed
      writes are taken only while every live member says it carries records. **`AskEntries` and `Entries` gain an
      optional, leniently read `replay_records`**, the records cursor above, which an older build ignores and an
-     older sender never sends.
+     older sender never sends; **so do `ReplayEntries`** (the cursor the page leaves), **`ReplayAck`** (the cursor
+     the member replayed to holds after storing the page, echoed) **and `Vectors`** (with `replay_from`, the cursor
+     it holds for that position), each skipped when none. A 0.51 member ignores them on either side: as a sender
+     it keeps no cursor, and as a receiver it holds no records.
    - **Snapshots carry records.** Per collection, a records phase in pages of up to 512 goes ahead of its documents; a
      page ends at the boundary into a collection with records and never holds one collection's records after another's
      documents; `SnapshotPage` gains `records` and `SnapshotCursor` a records position, which an older receiver drops,

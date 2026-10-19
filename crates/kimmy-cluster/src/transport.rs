@@ -696,31 +696,6 @@ fn cut_replay_page_from(
     }
 }
 
-/// Where each peer's inbound replay served by this member stands in records,
-/// across contacts (m1): the records cursor of the last page of records alone a
-/// peer acknowledged, keyed by this member and the peer, so a replay whose
-/// records at one position take more than a contact's pages goes on where it was.
-/// In memory: a restart starts the position's records over.
-static INBOUND_RECORDS: std::sync::Mutex<BTreeMap<(NodeId, NodeId), kimmy_storage::ReplayRecords>> =
-    std::sync::Mutex::new(BTreeMap::new());
-
-fn inbound_records(me: NodeId, peer: NodeId, at: Hlc) -> Option<kimmy_storage::ReplayRecords> {
-    INBOUND_RECORDS
-        .lock()
-        .ok()
-        .and_then(|held| held.get(&(me, peer)).cloned())
-        .filter(|cursor| cursor.at == at)
-}
-
-fn set_inbound_records(me: NodeId, peer: NodeId, cursor: Option<kimmy_storage::ReplayRecords>) {
-    if let Ok(mut held) = INBOUND_RECORDS.lock() {
-        match cursor {
-            Some(cursor) => held.insert((me, peer), cursor),
-            None => held.remove(&(me, peer)),
-        };
-    }
-}
-
 /// The `KIMMY_TEST`-style switch that makes the listed members send every frame
 /// and page **without** records, as a release before 0.52 does (C9 of the B5
 /// design): the in-process mixed-version test strips one member's sender.
@@ -1502,6 +1477,12 @@ where
                 replay_cursor = catch_up
                     .filter(|c| c.replay_armed() && !c.replay_answered(peer))
                     .map(|c| c.replay_from(peer));
+                // And where it stands in records at that position: the cursor of the
+                // last page of records alone this member stored from the peer, held
+                // here alone, so a restart of this member loses it.
+                let replay_records = catch_up
+                    .filter(|_| replay_cursor.is_some())
+                    .and_then(|c| c.replay_records(peer));
                 write_frame(
                     &mut stream,
                     &Message::Vectors {
@@ -1511,11 +1492,20 @@ where
                         facts_gen,
                         echo,
                         replay_from: replay_cursor,
+                        replay_records,
                     },
                 )
                 .await?;
             }
-            Message::ReplayEntries { from, entries, exhausted, horizon, scanned_to, records } => {
+            Message::ReplayEntries {
+                from,
+                entries,
+                exhausted,
+                horizon,
+                scanned_to,
+                records,
+                replay_records,
+            } => {
                 let counters = replay_counters();
                 let refuse = |why: &str| {
                     counters.bump(Via::Inbound, ReplayResult::Refused);
@@ -1532,7 +1522,12 @@ where
                     replay_cursor = None;
                     write_frame(
                         &mut stream,
-                        &Message::ReplayAck { next_from: cursor, done: true, stalled: None },
+                        &Message::ReplayAck {
+                            next_from: cursor,
+                            done: true,
+                            stalled: None,
+                            replay_records: None,
+                        },
                     )
                     .await?;
                     continue;
@@ -1559,7 +1554,12 @@ where
                     }
                     write_frame(
                         &mut stream,
-                        &Message::ReplayAck { next_from: cursor, done: false, stalled: None },
+                        &Message::ReplayAck {
+                            next_from: cursor,
+                            done: false,
+                            stalled: None,
+                            replay_records: None,
+                        },
                     )
                     .await?;
                     continue;
@@ -1592,17 +1592,43 @@ where
                     exhausted,
                     Via::Inbound,
                 )?;
+                // A page of records alone, stored: this member keeps its cursor, and
+                // echoes it, so the peer goes on after it. Any other page ends the
+                // position's records.
+                if !matches!(page, ReplayPage::Stalled(_)) {
+                    let alone = replay_records.filter(|records| {
+                        records.at == from
+                            && matches!(page, ReplayPage::Empty { next } if next == from)
+                    });
+                    catch_up.set_replay_records(peer, alone);
+                }
+                let held = |at: kimmy_core::Hlc| {
+                    catch_up.replay_records(peer).filter(|records| records.at == at)
+                };
                 let ack = match page {
-                    ReplayPage::Stalled(stall) => {
-                        Message::ReplayAck { next_from: cursor, done: false, stalled: Some(stall) }
-                    }
+                    ReplayPage::Stalled(stall) => Message::ReplayAck {
+                        next_from: cursor,
+                        done: false,
+                        stalled: Some(stall),
+                        replay_records: held(cursor),
+                    },
                     ReplayPage::Done { next } => {
                         replay_cursor = None;
-                        Message::ReplayAck { next_from: next, done: true, stalled: None }
+                        Message::ReplayAck {
+                            next_from: next,
+                            done: true,
+                            stalled: None,
+                            replay_records: None,
+                        }
                     }
                     ReplayPage::Advanced { next } | ReplayPage::Empty { next } => {
                         replay_cursor = Some(next);
-                        Message::ReplayAck { next_from: next, done: false, stalled: None }
+                        Message::ReplayAck {
+                            next_from: next,
+                            done: false,
+                            stalled: None,
+                            replay_records: held(next),
+                        }
                     }
                 };
                 write_frame(&mut stream, &ack).await?;
@@ -2772,6 +2798,7 @@ async fn serve_replay<S>(
     their_node: kimmy_core::NodeId,
     theirs: &VersionVector,
     asked: kimmy_core::Hlc,
+    asked_records: Option<kimmy_storage::ReplayRecords>,
 ) -> Result<ReplayServed, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2782,7 +2809,7 @@ where
     let mut sent_pages = 0usize;
     // Where the replay stands in records at `from` (m1): as the last page of
     // records alone the peer acknowledged left it, on this contact or an earlier.
-    let mut records_cursor = inbound_records(engine.node_id(), their_node, from);
+    let mut records_cursor = asked_records.filter(|records| records.at == from);
     loop {
         if sent_pages >= replay_max_pages() || started.elapsed() >= replay_serve_time() {
             return Ok(ReplayServed::InStep);
@@ -2875,6 +2902,7 @@ where
                 horizon,
                 scanned_to: after,
                 records,
+                replay_records: records_cut.clone(),
             },
         )
         .await?;
@@ -2894,31 +2922,30 @@ where
             }
         };
         match ack {
-            Message::ReplayAck { next_from, done, stalled } => {
+            Message::ReplayAck { next_from, done, stalled, replay_records } => {
                 info!(%peer, entries = count, exhausted, done, "served a page of a peer's replay");
                 if done || stalled.is_some() || horizon || exhausted {
                     return Ok(ReplayServed::InStep);
                 }
                 // A page that could not carry what it must (said and counted where it
-                // was cut): the replay stays where it is, its cursor with it, and the
-                // contact goes on with the ordinary round.
+                // was cut): the replay stays where it is, and the contact goes on with
+                // the ordinary round.
                 if page_unfit {
-                    // The cursor the page left: the one it came with, or none where
-                    // its position's records started over.
-                    set_inbound_records(engine.node_id(), their_node, records_cut);
                     return Ok(ReplayServed::InStep);
                 }
-                // A page of records alone the peer stored, at the position it asks
-                // from still: the next page there goes on after its cursor, on this
-                // contact or the next.
-                if let Some(cut) = records_cut
-                    && next_from == from
-                {
-                    set_inbound_records(engine.node_id(), their_node, Some(cut.clone()));
-                    records_cursor = Some(cut);
+                // A page of records alone, at the position the peer asks from still:
+                // the next page there goes on after the cursor the peer echoes, the
+                // one it keeps having stored the page. This member keeps none, so a
+                // restart of the peer (a restore again, perhaps) loses it, and the
+                // position's records start over. A peer that echoes none ends the
+                // contact here.
+                if records_cut.is_some() && next_from == from {
+                    records_cursor = replay_records.filter(|records| records.at == from);
+                    if records_cursor.is_none() {
+                        return Ok(ReplayServed::InStep);
+                    }
                     continue;
                 }
-                set_inbound_records(engine.node_id(), their_node, None);
                 records_cursor = None;
                 // The ack is a check, not the cursor: a peer that does not advance
                 // past what was sent, or past where the last page began, ends it.
@@ -2978,8 +3005,16 @@ where
     let mut their_facts = None;
     let mut asked_replay = None;
     let (theirs, their_witnessed) = match frame {
-        Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
-            asked_replay = replay_from;
+        Message::Vectors {
+            servable,
+            witnessed,
+            facts,
+            facts_gen,
+            echo,
+            replay_from,
+            replay_records,
+        } => {
+            asked_replay = replay_from.map(|from| (from, replay_records));
             if undecodable {
                 stalls.facts_undecodable.push(their_node);
             }
@@ -3026,7 +3061,7 @@ where
     // never costs the round: when it ends the ordinary round goes on, unless an ack
     // did not come and the stream may still hold it, which ends the round quietly.
     if let Some(asked) = asked_replay
-        && serve_replay(engine, stream, peer, their_node, &theirs, asked).await?
+        && serve_replay(engine, stream, peer, their_node, &theirs, asked.0, asked.1).await?
             == ReplayServed::OutOfStep
     {
         return Ok(SyncOutcome::default());
@@ -8211,6 +8246,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let peer = tokio::spawn(fake_peer(theirs, answer));
         let mut stalls = PeerStalls::new();
@@ -8443,6 +8479,7 @@ mod tests {
             facts_gen: Some(8),
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let far = tokio::spawn(peer(theirs, answer, Some(sent)));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -8466,6 +8503,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let far = tokio::spawn(peer(theirs, bare, None));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -8498,6 +8536,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // Asked for entries, it hangs up: the round fails here.
@@ -8556,6 +8595,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8676,6 +8716,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8751,6 +8792,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8828,6 +8870,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8924,6 +8967,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9115,6 +9159,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9291,6 +9336,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9401,6 +9447,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // A round that fails before a page lands: the peer goes away.
@@ -9653,6 +9700,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -11364,6 +11412,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         write_frame(&mut stream, &answer).await.unwrap();
         match read_frame(&mut stream).await.unwrap() {
@@ -11542,6 +11591,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11582,6 +11632,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11657,6 +11708,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11762,6 +11814,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             let _ = read_frame(&mut stream).await;
@@ -12163,6 +12216,7 @@ mod tests {
                     facts_gen: None,
                     echo: None,
                     replay_from: None,
+                    replay_records: None,
                 };
                 write_frame(&mut peer_end, &vectors).await.unwrap();
                 let Ok(Message::AskDivergence { digest, definitions, .. }) =
@@ -13253,6 +13307,7 @@ mod partial_windows_never_skip {
                     facts_gen: None,
                     echo: None,
                     replay_from: None,
+                    replay_records: None,
                 };
                 write_frame(&mut peer_end, &vectors).await.unwrap();
                 let Ok(Message::AskDivergence { digest, .. }) = read_frame(&mut peer_end).await
@@ -13320,6 +13375,7 @@ mod partial_windows_never_skip {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &vectors).await.unwrap();
             if !window.is_empty() {

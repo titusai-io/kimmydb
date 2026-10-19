@@ -260,6 +260,19 @@ pub enum Message {
             deserialize_with = "lenient_hlc"
         )]
         replay_from: Option<Hlc>,
+        /// With `replay_from`: where this member's replay stands in records at
+        /// that position, the records cursor of the last page of records alone it
+        /// stored from the requester (`ReplayEntries::replay_records`), so the
+        /// requester's serve goes on after it. The cursor is held by the member
+        /// replayed to and nowhere else: a restart loses it, and the serve starts
+        /// the position's records over. Optional and read leniently; absent from
+        /// an older answerer, which an older requester ignores.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_replay_records"
+        )]
+        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// "Send me everything at or after this point."
     ///
@@ -434,6 +447,17 @@ pub enum Message {
             deserialize_with = "kimmy_storage::lenient_records"
         )]
         records: Vec<kimmy_storage::CarriedRecord>,
+        /// On a page of records alone: the records cursor the next page at the
+        /// same position goes on after, which the member replayed to keeps once it
+        /// has stored the page and echoes in its `ReplayAck` (and in its next
+        /// `Vectors`); the sender goes on only from an echoed cursor. Optional and
+        /// read leniently: an older receiver ignores it.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_replay_records"
+        )]
+        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// The answer to [`Message::ReplayEntries`]: where the replay stands now.
     /// `next_from` is the position it asks from next; `done` that the sender has
@@ -445,6 +469,17 @@ pub enum Message {
         done: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stalled: Option<ReplayStall>,
+        /// The records cursor this member holds for the replay at `next_from`
+        /// after storing the page: the page's own (`ReplayEntries::
+        /// replay_records`), echoed, or none. The sender goes on with the next
+        /// page of records alone only from an echoed cursor. Optional and read
+        /// leniently: an older sender ignores it.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_replay_records"
+        )]
+        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// "Send me current state instead of history."
     ///
@@ -1038,6 +1073,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             },
             Message::Entries {
                 entries: Vec::new(),
@@ -1318,7 +1354,7 @@ mod tests {
             exhausted: false,
             passed_through: None,
             records: Vec::new(),
-            replay_records: Some(cursor),
+            replay_records: Some(cursor.clone()),
         };
         let sent = body_of(&page, "Entries").await;
         assert_eq!(read_back("Entries", sent.clone()).await, page, "it round-trips");
@@ -1329,6 +1365,57 @@ mod tests {
             panic!("not Entries")
         };
         assert!(none.is_none(), "an answer from before the field carries no cursor");
+
+        // The inbound way's cursor, held by the member replayed to: on the page,
+        // echoed in the ack, and handed back at the next contact's `Vectors`.
+        let ack = Message::ReplayAck {
+            next_from: Hlc::new(7, 1),
+            done: false,
+            stalled: None,
+            replay_records: Some(cursor.clone()),
+        };
+        let sent = body_of(&ack, "ReplayAck").await;
+        assert_eq!(read_back("ReplayAck", sent.clone()).await, ack, "it round-trips");
+        let mut before = sent;
+        before.remove("replay_records");
+        let Message::ReplayAck { replay_records: none, .. } = read_back("ReplayAck", before).await
+        else {
+            panic!("not ReplayAck")
+        };
+        assert!(none.is_none(), "an ack from before the field echoes no cursor");
+        let page = Message::ReplayEntries {
+            from: Hlc::new(7, 1),
+            entries: Vec::new(),
+            exhausted: false,
+            horizon: false,
+            scanned_to: Hlc::new(7, 1),
+            records: Vec::new(),
+            replay_records: Some(cursor.clone()),
+        };
+        let sent = body_of(&page, "ReplayEntries").await;
+        assert_eq!(read_back("ReplayEntries", sent).await, page, "it round-trips");
+        let plain = Message::ReplayEntries {
+            from: Hlc::new(7, 1),
+            entries: Vec::new(),
+            exhausted: false,
+            horizon: false,
+            scanned_to: Hlc::new(7, 1),
+            records: Vec::new(),
+            replay_records: None,
+        };
+        let sent = body_of(&plain, "ReplayEntries").await;
+        assert!(!sent.contains_key("replay_records"), "none is not written: {sent}");
+        let vectors = Message::Vectors {
+            servable: VersionVector::new(),
+            witnessed: VersionVector::new(),
+            facts: None,
+            facts_gen: None,
+            echo: None,
+            replay_from: Some(Hlc::new(7, 1)),
+            replay_records: Some(cursor),
+        };
+        let sent = body_of(&vectors, "Vectors").await;
+        assert_eq!(read_back("Vectors", sent).await, vectors, "it round-trips");
     }
 
     /// The same boundary for `AskEntries::partial` and `Entries::
@@ -1564,6 +1651,7 @@ mod tests {
             horizon: false,
             scanned_to: at.hlc,
             records: records.clone(),
+            replay_records: None,
         };
         let sent = body_of(&message, "ReplayEntries").await;
         assert!(sent.contains_key("records"), "carried: {sent}");
@@ -2024,6 +2112,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             },
         ] {
             let mut written = Vec::new();
@@ -2098,6 +2187,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         write_frame(&mut wire, &full).await.unwrap();
         assert_eq!(read_frame(&mut wire.as_slice()).await.unwrap(), full);
@@ -2111,6 +2201,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             },
         )
         .await
