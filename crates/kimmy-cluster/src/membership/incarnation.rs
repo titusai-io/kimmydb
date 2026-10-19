@@ -74,9 +74,14 @@ impl IncarnationFile {
         self.write();
     }
 
+    /// The write and its two fsyncs run through [`kimmy_storage::blocking`]:
+    /// both callers are on the runtime (the start in `spawn_cluster`, a renewal
+    /// in the membership loop), whose worker this tells to move its other tasks
+    /// elsewhere while it waits on the disk.
     fn write(&self) {
         let path = &self.path;
-        if let Err(e) = crate::catchup::write_atomic(path, &format!("{}\n", self.current)) {
+        let text = format!("{}\n", self.current);
+        if let Err(e) = kimmy_storage::blocking(|| crate::catchup::write_atomic(path, &text)) {
             warn!(
                 error = %e,
                 path = %path.display(),
@@ -90,7 +95,7 @@ impl IncarnationFile {
 
 /// What the file says, `None` when it is missing, unreadable or not a number.
 fn read(path: &Path) -> Option<u64> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match kimmy_storage::blocking(|| std::fs::read_to_string(path)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
