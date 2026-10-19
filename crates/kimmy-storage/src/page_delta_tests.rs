@@ -1898,3 +1898,28 @@ fn a_member_rebuilt_by_snapshot_after_a_drop_replays_a_retry_of_the_old_key() {
     let retry = x.insert_keyed(&again, doc! { "_id": 1i64 }, &k).unwrap();
     assert!(matches!(retry, Keyed::Replayed(_)), "the old key replays: {retry:?}");
 }
+
+/// A retention pass inside the record window, run while a pull is part-way from
+/// a sender whose change log has begun, keeps the log's rows the next page's
+/// delta reads: that page is answered by the delta (not refused as a zero base),
+/// and a pass that trimmed the whole log would leave it without the record.
+#[test]
+fn a_retention_pass_during_a_pull_from_a_begun_log_keeps_the_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y, target);
+    begun(&y);
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    assert!(progress.after().unwrap().records_base.unwrap().epoch.is_some(), "premise: an epoch");
+    let k = key(7);
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    y.collect_garbage(crate::RetentionPolicy::new(86_400, 86_400)).unwrap();
+    let (_, refused) = take_noting(&x, &y, &mut progress);
+    assert!(!refused, "premise: answered by the delta, not refused");
+    finish(&x, &y, &mut progress);
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&x, &cx, target), 11, "premise: the page brought the effect");
+    retry_must_replay(&x, &cx, &k, target);
+}

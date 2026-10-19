@@ -268,6 +268,64 @@ pub(crate) fn records_alone_window(
     Some((end, kept))
 }
 
+/// What a window whose first entry cannot cross with the records riding at or
+/// below it, even as a partial window of records alone, sends instead: those
+/// records **ahead of the entry**, with the F3 records, in an answer of records
+/// alone that carries no entry and covers nothing, its `scanned_to` naming the
+/// entry. The requester stores them and asks again in the same contact, naming
+/// that entry (`AskEntries::records_ahead_of`), and the window then leaves them
+/// out, so the entry crosses with what it holds already. A record stored before
+/// its effect arrives is a record held early, which is safe: a retry here replays
+/// the first answer of a write that happened.
+///
+/// `None` when nothing beyond the F3 records rides at or below the first entry,
+/// or when those records do not fit one frame together: what is left is an
+/// entry, or a record, larger than a frame by itself.
+pub(crate) fn records_ahead(
+    entries: &[OplogEntry],
+    records: &[kimmy_storage::CarriedRecord],
+    unanchored: usize,
+) -> Option<(Hlc, Vec<kimmy_storage::CarriedRecord>)> {
+    let first = entries.first()?.stamp;
+    let unanchored = unanchored.min(records.len());
+    let ahead: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter(|(i, record)| *i < unanchored || record.carrying.is_some_and(|at| at <= first))
+        .map(|(_, record)| record.clone())
+        .collect();
+    if ahead.len() == unanchored {
+        return None;
+    }
+    let bytes: usize = ahead.iter().map(record_bytes).sum::<Option<usize>>()?;
+    (bytes <= entry_budget()).then_some((first.hlc, ahead))
+}
+
+/// The records of a window the requester said it holds, sent ahead of the
+/// window's first entry in this contact (`AskEntries::records_ahead_of`): every
+/// record but the F3 ones riding at or below that entry. Applied only when the
+/// window's first entry is at the stamp named, so a window that changed between
+/// the two asks leaves nothing out it did not send ahead.
+fn leave_out_records_ahead(
+    entries: &[OplogEntry],
+    records: &mut Vec<kimmy_storage::CarriedRecord>,
+    unanchored: &mut usize,
+    ahead_of: Option<Hlc>,
+) {
+    let Some(first) = entries.first().map(|entry| entry.stamp).filter(|s| Some(s.hlc) == ahead_of)
+    else {
+        return;
+    };
+    let keep = *unanchored;
+    let mut i = 0usize;
+    records.retain(|record| {
+        let kept = i < keep || record.carrying.is_none_or(|at| at > first);
+        i += 1;
+        kept
+    });
+    *unanchored = keep.min(records.len());
+}
+
 /// Records a sender could not fit into any frame or replay page that must carry
 /// them, by path, since start (`kimmy_idempotency_records_unfit_total{path}`):
 /// each is a frame or a page that carried nothing, or was refused, where it
@@ -693,31 +751,6 @@ fn cut_replay_page_from(
                 unfit: false,
             })
         }
-    }
-}
-
-/// Where each peer's inbound replay served by this member stands in records,
-/// across contacts (m1): the records cursor of the last page of records alone a
-/// peer acknowledged, keyed by this member and the peer, so a replay whose
-/// records at one position take more than a contact's pages goes on where it was.
-/// In memory: a restart starts the position's records over.
-static INBOUND_RECORDS: std::sync::Mutex<BTreeMap<(NodeId, NodeId), kimmy_storage::ReplayRecords>> =
-    std::sync::Mutex::new(BTreeMap::new());
-
-fn inbound_records(me: NodeId, peer: NodeId, at: Hlc) -> Option<kimmy_storage::ReplayRecords> {
-    INBOUND_RECORDS
-        .lock()
-        .ok()
-        .and_then(|held| held.get(&(me, peer)).cloned())
-        .filter(|cursor| cursor.at == at)
-}
-
-fn set_inbound_records(me: NodeId, peer: NodeId, cursor: Option<kimmy_storage::ReplayRecords>) {
-    if let Ok(mut held) = INBOUND_RECORDS.lock() {
-        match cursor {
-            Some(cursor) => held.insert((me, peer), cursor),
-            None => held.remove(&(me, peer)),
-        };
     }
 }
 
@@ -1502,6 +1535,12 @@ where
                 replay_cursor = catch_up
                     .filter(|c| c.replay_armed() && !c.replay_answered(peer))
                     .map(|c| c.replay_from(peer));
+                // And where it stands in records at that position: the cursor of the
+                // last page of records alone this member stored from the peer, held
+                // here alone, so a restart of this member loses it.
+                let replay_records = catch_up
+                    .filter(|_| replay_cursor.is_some())
+                    .and_then(|c| c.replay_records(peer));
                 write_frame(
                     &mut stream,
                     &Message::Vectors {
@@ -1511,11 +1550,20 @@ where
                         facts_gen,
                         echo,
                         replay_from: replay_cursor,
+                        replay_records,
                     },
                 )
                 .await?;
             }
-            Message::ReplayEntries { from, entries, exhausted, horizon, scanned_to, records } => {
+            Message::ReplayEntries {
+                from,
+                entries,
+                exhausted,
+                horizon,
+                scanned_to,
+                records,
+                replay_records,
+            } => {
                 let counters = replay_counters();
                 let refuse = |why: &str| {
                     counters.bump(Via::Inbound, ReplayResult::Refused);
@@ -1532,7 +1580,12 @@ where
                     replay_cursor = None;
                     write_frame(
                         &mut stream,
-                        &Message::ReplayAck { next_from: cursor, done: true, stalled: None },
+                        &Message::ReplayAck {
+                            next_from: cursor,
+                            done: true,
+                            stalled: None,
+                            replay_records: None,
+                        },
                     )
                     .await?;
                     continue;
@@ -1559,7 +1612,12 @@ where
                     }
                     write_frame(
                         &mut stream,
-                        &Message::ReplayAck { next_from: cursor, done: false, stalled: None },
+                        &Message::ReplayAck {
+                            next_from: cursor,
+                            done: false,
+                            stalled: None,
+                            replay_records: None,
+                        },
                     )
                     .await?;
                     continue;
@@ -1592,17 +1650,43 @@ where
                     exhausted,
                     Via::Inbound,
                 )?;
+                // A page of records alone, stored: this member keeps its cursor, and
+                // echoes it, so the peer goes on after it. Any other page ends the
+                // position's records.
+                if !matches!(page, ReplayPage::Stalled(_)) {
+                    let alone = replay_records.filter(|records| {
+                        records.at == from
+                            && matches!(page, ReplayPage::Empty { next } if next == from)
+                    });
+                    catch_up.set_replay_records(peer, alone);
+                }
+                let held = |at: kimmy_core::Hlc| {
+                    catch_up.replay_records(peer).filter(|records| records.at == at)
+                };
                 let ack = match page {
-                    ReplayPage::Stalled(stall) => {
-                        Message::ReplayAck { next_from: cursor, done: false, stalled: Some(stall) }
-                    }
+                    ReplayPage::Stalled(stall) => Message::ReplayAck {
+                        next_from: cursor,
+                        done: false,
+                        stalled: Some(stall),
+                        replay_records: held(cursor),
+                    },
                     ReplayPage::Done { next } => {
                         replay_cursor = None;
-                        Message::ReplayAck { next_from: next, done: true, stalled: None }
+                        Message::ReplayAck {
+                            next_from: next,
+                            done: true,
+                            stalled: None,
+                            replay_records: None,
+                        }
                     }
                     ReplayPage::Advanced { next } | ReplayPage::Empty { next } => {
                         replay_cursor = Some(next);
-                        Message::ReplayAck { next_from: next, done: false, stalled: None }
+                        Message::ReplayAck {
+                            next_from: next,
+                            done: false,
+                            stalled: None,
+                            replay_records: held(next),
+                        }
                     }
                 };
                 write_frame(&mut stream, &ack).await?;
@@ -1612,7 +1696,16 @@ where
                     engine.witnessed_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
                 write_frame(&mut stream, &Message::Witnessed(witnessed)).await?;
             }
-            Message::AskEntries { from, limit, held, marked, partial, replay, replay_records } => {
+            Message::AskEntries {
+                from,
+                limit,
+                held,
+                marked,
+                partial,
+                replay,
+                replay_records,
+                records_ahead_of,
+            } => {
                 // Tell a peer below the horizon rather than serving it what is
                 // left: it would apply that, advance its version vector, and
                 // never learn what had been collected. Judged per origin when
@@ -1733,8 +1826,16 @@ where
                 // fewer entries unasked would be a silent gap rather than a kindness.
                 // The records count: a window whose records push it over the
                 // frame is answered the same way (B5).
-                let unanchored = window.unanchored;
-                let records = records_to_send(engine, window.records);
+                let mut unanchored = window.unanchored;
+                let mut records = records_to_send(engine, window.records);
+                // The records the peer stored ahead of this window's first entry, in
+                // this contact: left out, so the entry crosses.
+                leave_out_records_ahead(
+                    &window.entries,
+                    &mut records,
+                    &mut unanchored,
+                    records_ahead_of,
+                );
                 match how_many_fit(&window.entries, &records, unanchored) {
                     Fits::All => {
                         write_frame(
@@ -1791,10 +1892,39 @@ where
                                 .await?
                             }
                             None => {
+                                // Else the records riding at or below the first entry,
+                                // the one at its own stamp included, ahead of it: an
+                                // answer of records alone that covers nothing, its
+                                // `scanned_to` naming the entry, which the peer asks
+                                // again for in this contact without them.
+                                if let Some((ahead_of, records)) =
+                                    records_ahead(&window.entries, &records, unanchored)
+                                {
+                                    info!(
+                                        records = records.len(),
+                                        ?ahead_of,
+                                        "the idempotency records riding a peer's first entry do \
+                                         not fit one frame with it; they go ahead of it, alone, \
+                                         and the entry follows without them"
+                                    );
+                                    write_frame(
+                                        &mut stream,
+                                        &Message::Entries {
+                                            entries: Vec::new(),
+                                            scanned_to: ahead_of,
+                                            exhausted: false,
+                                            passed_through: None,
+                                            records,
+                                            replay_records: None,
+                                        },
+                                    )
+                                    .await?;
+                                    continue;
+                                }
                                 // Not even that: one entry, or a record, larger than
-                                // a frame, or a requester that cannot take a partial
-                                // window. Named to the peer as one entry that cannot
-                                // replicate, and counted here when records ride it.
+                                // a frame by itself. Named to the peer as one entry
+                                // that cannot replicate, and counted here when records
+                                // ride it.
                                 if records.len() > unanchored {
                                     records_unfit().bump(UnfitPath::Pull);
                                     warn!(
@@ -2380,6 +2510,7 @@ where
                 partial: false,
                 replay: true,
                 replay_records: replay_records.clone(),
+                records_ahead_of: None,
             },
         )
         .await?;
@@ -2772,6 +2903,7 @@ async fn serve_replay<S>(
     their_node: kimmy_core::NodeId,
     theirs: &VersionVector,
     asked: kimmy_core::Hlc,
+    asked_records: Option<kimmy_storage::ReplayRecords>,
 ) -> Result<ReplayServed, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2782,7 +2914,7 @@ where
     let mut sent_pages = 0usize;
     // Where the replay stands in records at `from` (m1): as the last page of
     // records alone the peer acknowledged left it, on this contact or an earlier.
-    let mut records_cursor = inbound_records(engine.node_id(), their_node, from);
+    let mut records_cursor = asked_records.filter(|records| records.at == from);
     loop {
         if sent_pages >= replay_max_pages() || started.elapsed() >= replay_serve_time() {
             return Ok(ReplayServed::InStep);
@@ -2875,6 +3007,7 @@ where
                 horizon,
                 scanned_to: after,
                 records,
+                replay_records: records_cut.clone(),
             },
         )
         .await?;
@@ -2894,31 +3027,30 @@ where
             }
         };
         match ack {
-            Message::ReplayAck { next_from, done, stalled } => {
+            Message::ReplayAck { next_from, done, stalled, replay_records } => {
                 info!(%peer, entries = count, exhausted, done, "served a page of a peer's replay");
                 if done || stalled.is_some() || horizon || exhausted {
                     return Ok(ReplayServed::InStep);
                 }
                 // A page that could not carry what it must (said and counted where it
-                // was cut): the replay stays where it is, its cursor with it, and the
-                // contact goes on with the ordinary round.
+                // was cut): the replay stays where it is, and the contact goes on with
+                // the ordinary round.
                 if page_unfit {
-                    // The cursor the page left: the one it came with, or none where
-                    // its position's records started over.
-                    set_inbound_records(engine.node_id(), their_node, records_cut);
                     return Ok(ReplayServed::InStep);
                 }
-                // A page of records alone the peer stored, at the position it asks
-                // from still: the next page there goes on after its cursor, on this
-                // contact or the next.
-                if let Some(cut) = records_cut
-                    && next_from == from
-                {
-                    set_inbound_records(engine.node_id(), their_node, Some(cut.clone()));
-                    records_cursor = Some(cut);
+                // A page of records alone, at the position the peer asks from still:
+                // the next page there goes on after the cursor the peer echoes, the
+                // one it keeps having stored the page. This member keeps none, so a
+                // restart of the peer (a restore again, perhaps) loses it, and the
+                // position's records start over. A peer that echoes none ends the
+                // contact here.
+                if records_cut.is_some() && next_from == from {
+                    records_cursor = replay_records.filter(|records| records.at == from);
+                    if records_cursor.is_none() {
+                        return Ok(ReplayServed::InStep);
+                    }
                     continue;
                 }
-                set_inbound_records(engine.node_id(), their_node, None);
                 records_cursor = None;
                 // The ack is a check, not the cursor: a peer that does not advance
                 // past what was sent, or past where the last page began, ends it.
@@ -2978,8 +3110,16 @@ where
     let mut their_facts = None;
     let mut asked_replay = None;
     let (theirs, their_witnessed) = match frame {
-        Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
-            asked_replay = replay_from;
+        Message::Vectors {
+            servable,
+            witnessed,
+            facts,
+            facts_gen,
+            echo,
+            replay_from,
+            replay_records,
+        } => {
+            asked_replay = replay_from.map(|from| (from, replay_records));
             if undecodable {
                 stalls.facts_undecodable.push(their_node);
             }
@@ -3026,7 +3166,7 @@ where
     // never costs the round: when it ends the ordinary round goes on, unless an ack
     // did not come and the stream may still hold it, which ends the round quietly.
     if let Some(asked) = asked_replay
-        && serve_replay(engine, stream, peer, their_node, &theirs, asked).await?
+        && serve_replay(engine, stream, peer, their_node, &theirs, asked.0, asked.1).await?
             == ReplayServed::OutOfStep
     {
         return Ok(SyncOutcome::default());
@@ -3227,12 +3367,60 @@ where
                     partial: asked_partial,
                     replay: false,
                     replay_records: None,
+                    records_ahead_of: None,
                 },
             )
             .await?;
             read_frame(stream).await?
         }
     };
+
+    // Records sent ahead of their entry: an answer of records alone that covers
+    // nothing (no entry, no partial end, not the tail) names in `scanned_to` the
+    // first entry of the window, which cannot cross with the records riding at or
+    // below it. They are stored now, ahead of the effect, and the window is asked
+    // again in this contact naming that entry, which the peer then sends without
+    // them. Once a round.
+    let mut records_ahead_of = None;
+    if let Message::Entries {
+        entries,
+        scanned_to,
+        exhausted: false,
+        passed_through: None,
+        records,
+        ..
+    } = &answer
+        && entries.is_empty()
+        && !records.is_empty()
+    {
+        let ahead_of = *scanned_to;
+        kimmy_storage::blocking(|| {
+            engine.apply_batch_carrying(&[], records, kimmy_storage::RecordsVia::Pull)
+        })
+        .map_err(|e| from_storage(e, ProtocolError::Malformed))?;
+        debug!(
+            %peer,
+            ?ahead_of,
+            records = records.len(),
+            "stored the idempotency records a peer sent ahead of an entry; asking for the entry"
+        );
+        records_ahead_of = Some(ahead_of);
+        write_frame(
+            stream,
+            &Message::AskEntries {
+                from,
+                limit,
+                held: held.clone(),
+                marked: marked.clone(),
+                partial: asked_partial,
+                replay: false,
+                replay_records: None,
+                records_ahead_of,
+            },
+        )
+        .await?;
+        answer = read_frame(stream).await?;
+    }
 
     if let Message::BatchTooLarge { fits } = answer {
         if fits == 0 {
@@ -3253,6 +3441,7 @@ where
             partial: asked_partial,
             replay: false,
             replay_records: None,
+            records_ahead_of,
         };
         write_frame(stream, &retry).await?;
         answer = read_frame(stream).await?;
@@ -8211,6 +8400,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let peer = tokio::spawn(fake_peer(theirs, answer));
         let mut stalls = PeerStalls::new();
@@ -8443,6 +8633,7 @@ mod tests {
             facts_gen: Some(8),
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let far = tokio::spawn(peer(theirs, answer, Some(sent)));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -8466,6 +8657,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let far = tokio::spawn(peer(theirs, bare, None));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -8498,6 +8690,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // Asked for entries, it hangs up: the round fails here.
@@ -8556,6 +8749,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8676,6 +8870,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8751,6 +8946,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8828,6 +9024,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8924,6 +9121,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9115,6 +9313,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9291,6 +9490,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9401,6 +9601,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // A round that fails before a page lands: the peer goes away.
@@ -9653,6 +9854,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -10658,6 +10860,7 @@ mod tests {
                 partial: false,
                 replay: false,
                 replay_records: None,
+                records_ahead_of: None,
             };
             write_frame(&mut ours, &ask).await.unwrap();
             read_frame(&mut ours).await
@@ -11364,6 +11567,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         write_frame(&mut stream, &answer).await.unwrap();
         match read_frame(&mut stream).await.unwrap() {
@@ -11542,6 +11746,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11582,6 +11787,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11657,6 +11863,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11762,6 +11969,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             let _ = read_frame(&mut stream).await;
@@ -12163,6 +12371,7 @@ mod tests {
                     facts_gen: None,
                     echo: None,
                     replay_from: None,
+                    replay_records: None,
                 };
                 write_frame(&mut peer_end, &vectors).await.unwrap();
                 let Ok(Message::AskDivergence { digest, definitions, .. }) =
@@ -13253,6 +13462,7 @@ mod partial_windows_never_skip {
                     facts_gen: None,
                     echo: None,
                     replay_from: None,
+                    replay_records: None,
                 };
                 write_frame(&mut peer_end, &vectors).await.unwrap();
                 let Ok(Message::AskDivergence { digest, .. }) = read_frame(&mut peer_end).await
@@ -13320,6 +13530,7 @@ mod partial_windows_never_skip {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &vectors).await.unwrap();
             if !window.is_empty() {
