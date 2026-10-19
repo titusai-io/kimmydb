@@ -514,8 +514,8 @@ ROWS = [
         "doc": "`resume_hlc` without the records' high water",
         "patches": [
             ("crates/kimmy-storage/src/engine.rs",
-             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?))\n",
-             "            .max(crate::idempotency::changes_high_water_at_open(db)?))\n"),
+             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?)\n",
+             "            .max(crate::idempotency::changes_high_water_at_open(db)?)\n"),
         ],
         "suites": MODEL,
     },
@@ -842,8 +842,8 @@ ROWS = [
         "doc": "`resume_hlc` without the change log's high water (its keys are minted stamps)",
         "patches": [
             ("crates/kimmy-storage/src/engine.rs",
-             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?))\n",
-             "            .max(Self::records_high_water(db)?))\n"),
+             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?)\n",
+             "            .max(Self::records_high_water(db)?)\n"),
         ],
         "suites": MODEL,
         "timeout": 600,

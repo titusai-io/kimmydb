@@ -156,26 +156,13 @@
 //! violation and D3 the stamp rule's contract; KR is refused by the `contested` flag, and
 //! the rows `row_d2_*`, `row_d3_*` and `row_kr_*` hold the engine to it.
 //!
-//! **Finding RW1** (2026-10-18, open, outside B5's code): a rewind after a retention
-//! pass leaves the cluster diverged for good. `Engine::rewind_to` replaces both version
-//! vectors with the oplog's greatest stamp per origin, and retention has removed entries
-//! the vectors covered, the member's own among them: its claim on its own origin falls
-//! below its own collected writes (a drop, in the minimised schedule), so no peer is ever
-//! behind it there, none is refused as `Collected`, and none takes the snapshot that would
-//! carry them. `row_rw1_*` reproduces it and is ignored until it is fixed; the generated
-//! schedules take rewinds (and fail on it now and then), and `IDEM_NO_REWIND=1` leaves them
-//! out for a diagnostic run.
-//!
-//! **Finding BR1** (2026-10-18, open, outside B5's code, on main too; builder S's fix):
-//! a backup carries no `OPLOG_HELD`, and a restored store's open counts the rows a page
-//! left as held state as covered. Its witnessed vector claims an origin past writes it
-//! never took, its pulls start past them, and their records never reach it (first seen
-//! on the Home track as a member holding an effect bare at quiescence). The model checks
-//! it where it happens: a restore never claims more of another origin than its backup
-//! held. `generated_schedules_short` counts a schedule whose first failure is BR1 as the
-//! known defect until the fix lands; the long run lists it, for the classify script.
-//! `IDEM_NO_BR1=1` counts it instead, and the relay class it leads to in that schedule,
-//! for a diagnostic run past it (never a gate; removed with the fix).
+//! **Findings RW1 and BR1** (2026-10-18, outside B5's code, fixed on main by #209 and
+//! #211): a rewind after a retention pass lowered the version vectors below the writes
+//! retention had collected, and a restore counted the rows a page left as held state as
+//! covered. Either left a member's coverage past writes it never took, and their records
+//! never reached it. `row_rw1_*` reproduces the first, and the restore check (a restore
+//! never claims more of another origin than its backup held) sees the second where it
+//! happens; both now hold, and every generated schedule takes rewinds and restores.
 //!
 //! **Reproducers**, both run (not ignored) and pass since their fixes landed:
 //! `finding_g1_*` (G1 as first reported: its pull serves the window without the sender's
@@ -713,9 +700,6 @@ pub(crate) struct Outcome {
     pub rewound_reopened: usize,
     /// Records removed with their rows left (orphan rows).
     pub orphaned: usize,
-    /// Restores that claimed coverage their backup did not hold, counted under
-    /// `IDEM_NO_BR1=1` (finding BR1).
-    pub br1: usize,
     /// Replay pages whose cursor's delta met a changed record too large for it.
     pub delta_too_large: usize,
     /// Records cursors dropped for that, the position's records read again from a fresh
@@ -749,17 +733,6 @@ fn trace() -> bool {
 /// landed; `IDEM_LENIENT=1` counts it instead, for a tree without that fix.
 fn strict() -> bool {
     !std::env::var("IDEM_LENIENT").is_ok_and(|v| v == "1")
-}
-
-/// `IDEM_NO_BR1=1`: finding BR1 at a restore is counted, and the relay class after it
-/// counted rather than failed in that schedule (a diagnostic run only, past BR1).
-fn no_br1() -> bool {
-    std::env::var("IDEM_NO_BR1").is_ok_and(|v| v == "1")
-}
-
-/// `IDEM_NO_REWIND=1`: generated schedules take no rewind (a diagnostic run only).
-fn no_rewind() -> bool {
-    std::env::var("IDEM_NO_REWIND").is_ok_and(|v| v == "1")
 }
 
 /// Whether S1 fails a generated run as well: `IDEM_STRICT=1`. Counted by default, since
@@ -2653,9 +2626,9 @@ impl World {
         self.open(m)?;
         self.note(format!("{} restored from its backup", LETTERS[m]));
         // Coverage after a restore: never more of an origin than the store held when
-        // the backup was taken. Finding BR1 (open, outside B5's code): a restore counts
-        // the rows a scoped page left as held state as covered, so the member's pulls
-        // start past writes it never took, their records with them.
+        // the backup was taken. Finding BR1 (fixed by #211): a restore counted the rows a
+        // page left as held state as covered, so the member's pulls started past writes
+        // it never took, their records with them.
         // Its own origin aside: what a member wrote itself is in position, and the
         // replay of its own origin reads back what it lost.
         let now = self.e(m).witnessed_vector().map_err(|e| err("witnessed_vector", e))?;
@@ -2663,23 +2636,14 @@ impl World {
             let then = backup.witnessed.get(origin);
             if origin != node && at > then {
                 let s = format!(
-                    "BR1: {}'s restore claims {}'s origin through {}, past the {} its backup held",
+                    "{}'s restore claims {}'s origin through {}, past the {} its backup held \
+                     (BR1)",
                     LETTERS[m],
                     self.label(origin),
                     self.hlc(at),
                     self.hlc(then)
                 );
-                if no_br1() {
-                    // The diagnostic run: counted, and the relay class it leads to (an
-                    // effect held without its record, here and wherever it is relayed)
-                    // counted from here on rather than failed, so the run goes on to
-                    // see everything else.
-                    self.out.br1 += 1;
-                    self.strict = false;
-                    self.note(format!("{s} (IDEM_NO_BR1: counted)"));
-                } else {
-                    self.fail(Inv::I2, s);
-                }
+                self.fail(Inv::I2, s);
             }
         }
         // The algebra's sets are the backup's: what the store held then.
@@ -3411,9 +3375,8 @@ impl World {
     /// holds request `r` (its effect, under any origin and in any life) holds a live
     /// record under `r`'s key, unless `r`'s memory ended or a rewind left its writes bare
     /// by design. The relay class where it happens, not only at quiescence: a member
-    /// whose coverage passed an effect's entry without its record (finding BR1: a
-    /// restore that counts a scoped page's rows as covered) holds it bare from the step
-    /// that brings it.
+    /// whose coverage passed an effect's entry without its record (as finding BR1's
+    /// restore did, before #211) holds it bare from the step that brings it.
     fn check_effects(&mut self) -> Res<()> {
         let mut bare = Vec::new();
         for m in 0..self.n() {
@@ -4809,10 +4772,7 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
                 // A rewind to a moment a little back: what it discards comes back from
                 // the peers that hold it. Not the home on the home track, as a restore.
                 let m = plan.member();
-                // `IDEM_NO_REWIND=1`: a restart instead, for a diagnostic run past finding
-                // RW1 (a rewind after a retention pass lowers the member's version vector
-                // below what retention collected; see the module docs). Never a gate.
-                if (track == Track::Home && m == plan.home) || no_rewind() {
+                if track == Track::Home && m == plan.home {
                     Op { step: Step::Restart { m }, t: 0 }
                 } else {
                     let back = plan.rng.below(60) as i64;
@@ -5002,7 +4962,6 @@ struct Sweep {
     rewound_removed: usize,
     rewound_reopened: usize,
     orphaned: usize,
-    br1: usize,
     delta_too_large: usize,
     cursor_dropped: usize,
     replay_unfit: usize,
@@ -5073,7 +5032,6 @@ fn sweep_listing(
                         t.rewound_removed += out.rewound_removed;
                         t.rewound_reopened += out.rewound_reopened;
                         t.orphaned += out.orphaned;
-                        t.br1 += out.br1;
                         t.delta_too_large += out.delta_too_large;
                         t.cursor_dropped += out.cursor_dropped;
                         t.replay_unfit += out.replay_unfit;
@@ -5118,8 +5076,7 @@ fn sweep_listing(
          records cursors started over, {} records offered past their window (m2); {} \
          rewinds ({} records removed, {} reopened), {} records orphaned; {} replay deltas \
          too large for their page ({} cursors dropped, their position read again), {} replay \
-         pages unfit; {} restores past their backup's coverage (BR1, counted under \
-         IDEM_NO_BR1); in {:.1?}",
+         pages unfit; in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -5149,7 +5106,6 @@ fn sweep_listing(
         totals.delta_too_large,
         totals.cursor_dropped,
         totals.replay_unfit,
-        totals.br1,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
@@ -5172,17 +5128,7 @@ const LEN: usize = 30;
 fn generated_schedules_short() {
     let start = env_u64("IDEM_SEED_START", 0);
     let count = env_u64("IDEM_CI_SEEDS", 16);
-    let (_, failed) = sweep_listing(start..start + count, LEN, threads().min(4), true);
-    // Finding BR1 (open; builder S's fix off main): a schedule whose first failure is
-    // a restore claiming coverage its backup did not hold is the known engine defect, not
-    // a regression of this branch, and is counted here rather than failing CI. Removed
-    // when the fix lands. Every other failure fails the run.
-    let (known, others): (Vec<String>, Vec<String>) =
-        failed.into_iter().partition(|line| line.contains("] BR1: "));
-    if !known.is_empty() {
-        eprintln!("{} schedules met finding BR1 (known, open):\n{}", known.len(), known.join("\n"));
-    }
-    assert!(others.is_empty(), "{} schedules failed:\n{}", others.len(), others.join("\n"));
+    sweep(start..start + count, LEN, threads().min(4));
 }
 
 /// The long run, for a gate of record: `IDEM_SEEDS` seeds (default 1000) from
@@ -6207,14 +6153,12 @@ fn row_d3_a_resume_after_a_drop_leaves_what_is_at_or_above_its_merged_first() {
     );
 }
 
-/// Finding RW1, minimised from the long run's seed 1000688: B drops `items`; B's
-/// retention pass collects its own drop entry; B rewinds to a moment after it (nothing
-/// discarded), and its version vectors are rebuilt from the oplog, below the drop. A,
-/// which never heard of the drop, inserts into `items`; at quiescence A and C hold the
-/// documents and B holds no `items`: no peer is behind B where the drop is, so none takes
-/// it. Ignored until the rewind keeps what retention collected in its vectors.
+/// Finding RW1 (fixed by #209), minimised from the long run's seed 1000688: B drops
+/// `items`; B's retention pass collects its own drop entry; B rewinds to a moment after
+/// it (nothing discarded). A, which never heard of the drop, inserts into `items`. The
+/// rewind keeps B's vectors at what retention collected, so A takes the drop and every
+/// member ends with the same `items`.
 #[test]
-#[ignore = "finding RW1: a rewind after retention lowers the version vector below collected writes"]
 fn row_rw1_a_rewind_after_retention_keeps_the_members_collected_writes() {
     row(
         "rw1",
