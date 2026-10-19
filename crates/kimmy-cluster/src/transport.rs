@@ -1845,8 +1845,10 @@ where
                     // records and no records position (C9 of the B5 design).
                     Ok(mut page) if strips_records(engine.node_id()) => {
                         page.records.clear();
+                        page.records_epoch = None;
                         if let Some(next) = page.next.as_mut() {
                             next.records = None;
+                            next.records_base = None;
                         }
                         page
                     }
