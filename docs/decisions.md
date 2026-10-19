@@ -28581,6 +28581,9 @@ in bash, one per clause.
 > configuration key or snapshot format changes; a snapshot's `meta.json` gains one field, `graph`, which 0.51 ignores.
 > Not a rollback boundary.
 
+> **Extended by [ADR-245](#adr-245--hnsw-graphs-are-built-and-saved-on-builder-threads-and-no-search-waits-for-one).**
+> The rebuild every graph takes once after the upgrade (item 5) runs on a builder thread, and no search waits for it.
+
 **The case.** `hnsw_rs` 0.3.4, the library the graph was built with, stored the reverse edge it adds for a new point at
 the new point's top layer instead of the layer the edge was found on, so a point drawn above layer 0 could be left with
 no edge into it at layer 0, and no search returns such a point at any `k`. Measured with every point checked: 0.75% to
@@ -28801,3 +28804,83 @@ rejoining member that resumes failure detection unchanged. `kimmyd/tests/cluster
 one restarted twice after its peers declared it down, once after it renewed in its run (frozen until declared down, then
 resumed) and twice at once, with no rejoin in any run, its file one above the last each time and the renewal recorded.
 Mutation rows in bash, one per clause.
+
+---
+
+## ADR-245 — HNSW graphs are built and saved on builder threads, and no search waits for one
+
+> **Extends [ADR-241](#adr-241--the-hnsw-graph-is-built-by-hnsw_rs-035-and-linked-at-layer-0-a-snapshots-dump-is-checked-before-the-library-reads-it-and-a-filtered-walk-widens-with-its-filter)**
+> **and amends [ADR-103](#adr-103--hnsw-graphs-are-built-off-the-lock-and-live-under-a-budget)** (where a build runs,
+> and what a search of a collection without a graph is answered by). Adds one configuration key,
+> `vector.index_cache.build_concurrency`, which 0.51 refuses, and two gauges. No format, wire, schema or snapshot
+> change. Not a rollback boundary; remove the key before rolling back.
+
+**The case.** A search that found no usable graph built it, in the request: the O(n) count, the build, the linking and
+the save ran on that request's blocking thread, and every other search of the collection arriving meanwhile waited for
+the same build. `server.request_timeout_secs` cannot end a thread that does not yield, so those searches waited the
+whole build: measured with 384 dimensions, 9 s and a 4 s save at 10,000 vectors, and 4.4 to 12 minutes and up to two
+minutes' save at 100,000. ADR-241 rebuilds every vector graph once after the upgrade, so after a roll every searched
+collection's next search would wait that long, on every member.
+
+**Decision.**
+
+1. **Builds run on builder threads.** A search that finds no usable graph queues a build and is answered at once. The
+   queue holds one build per collection, carrying the forget epoch read when it was asked for, so a drop, a reconfigure
+   or a recreate since fences it as it fences a build under way. At most `vector.index_cache.build_concurrency` builder
+   threads run (default 1; at least 1): a build is CPU and memory bound (a 100,000 × 384 graph peaks at about 1.3 GiB
+   with its records), and the first start of 0.52.0 asks for every searched collection's at once. A builder runs the
+   count that decides whether the collection is worth a graph, the build, the linking and the save, then installs under
+   the collection's build lock and the epoch fence, logging `INFO` when the graph replaces one served meanwhile. A builder
+   exits when the queue is empty, and the next search that queues a build starts one. A build that panics costs that
+   build and not the builder: it is caught, logged at `ERROR`, the queue's counts stay true, and the collection is
+   scanned until a later search asks again.
+2. **What a search is answered by meanwhile.** A graph of the collection and shape from before a write is served while
+   its rebuild runs, as before (bounded recall on new data, never a wrong answer). A snapshot found behind, which
+   includes every snapshot 0.51 or earlier saved (ADR-241), is installed behind and served until its rebuild lands. A
+   snapshot a previous process saved is installed unjudged and served at once; a builder counts the collection and
+   compares its moves of chunk ids, and either re-stamps it fresh at the generation the count began at or rebuilds it.
+   The snapshot load itself stays in the search, off the async worker: under a second at 100,000 vectors. Only a
+   collection with no graph at all is answered by an **exact scan** of every vector (`Access::Building`).
+3. **The exact scan while a graph is built** takes a turn first: at most two scans of one collection at once
+   (`EXACT_SCANS_PER_COLLECTION`), a fixed number, since each scan is all CPU and storage reads (135 ms at 10,000 × 384
+   and 1.4 s at 100,000, release) and the build needs the rest of the cores. A search waits for a turn only until its
+   request's deadline, and the scan reads its deadline every 256 vectors (`vector_search_until`); past it the search
+   answers as a request that ran out of time does, `503` `timeout`, with the configured timeout in the message. Scans
+   of other collections are not counted against it.
+4. **Two gauges.** `kimmy_vector_graphs_stale` counts the graphs served while they are rebuilt: installed behind, or
+   unjudged. After a roll it rises with the collections searched and falls to 0 as the rebuilds land, so it is what an
+   operator watches before rolling on. `kimmy_vector_graph_unreached_sample` is the highest sampled score (ADR-241 item
+   3) among the resident graphs this process built. Both are bridged to OTLP (`kimmy.vector.graphs.stale`,
+   `kimmy.vector.graph.unreached_sample`).
+5. **Tests wait with `settle`**, which blocks until no build is queued or running. It is compiled only for
+   `kimmy-vector`'s tests and under its `test-hooks` feature, which only a dev-dependency turns on; a test reads the
+   source and every manifest to hold that true.
+
+**Measured** (macOS, a debug build of the API on a two-worker runtime; `v2-starve.log`): with 4 and with 8 collections of
+20,000 vectors rebuilding at once at a build concurrency of 4 and 8, with and without eight CPU-burning threads beside
+them, the p99 of `/readyz` stayed at or under 0.9 ms, of a find at or under 3.3 ms and of an insert at or under
+18.4 ms during the builds, against 0.6 to 0.9, 1.7 to 2.1 and 9.0 to 16.0 ms before them; no request failed. Each
+collection's first search was answered by its scan in 0.4 to 0.8 s, and the searches after it until its graph landed
+at a median of 0.21 to 0.25 s (p99 0.25 to 0.48 s); every graph was installed within 10 to 13 s. At the default concurrency of 1, 8 collections took 71 s to install, and 557 searches in that time were answered
+by scan, median 206 ms, p99 224 ms.
+
+**Rollback.** A 0.51 member reads nothing new on disk. It refuses a configuration that names
+`vector.index_cache.build_concurrency`, so the key is removed before rolling back; `docs/operations.md` says so beside
+the key and in the 0.52.0 section.
+
+**Alternatives rejected.** Building in the request under the request's deadline: a build cannot be resumed, so a
+search that gives up wastes it and the next one starts again. A task on the async runtime: a build holds a core for
+minutes. Answering `503` while a graph is built: an exact scan answers correctly, within the deadline at every size
+measured. Unbounded concurrent scans: at 100,000 × 384 each is 1.4 s of a core, and a burst of searches would take
+the cores the build needs. A setting for the scan count: no measurement asks for another value.
+
+**Tests.** `kimmy-vector`: a build of one collection parked while a search of it and of another is answered at once, by
+scan; two searches of an unbuilt collection make one build; a search mid-rebuild is served the previous graph; a
+build that panics costs that build and not the builder; at most two scans of one collection at once, a third waiting
+only to its deadline and taking a turn given back; an exact scan stops at a passed deadline and answers exactly without
+one; the stale gauge counts a snapshot adopted unjudged until a builder judges it; every cache test that expects a graph
+on a first access settles first. `kimmy-api`: the first search of a collection is answered by scan and the next by the
+graph built behind it; `settle` is in no build that ships; the walks a search makes while a graph is built run under
+`blocking`. `kimmyd`: the configuration key's default, its refusal of 0, and the cluster stop test polling the cache
+gauge until it holds a graph for three reads running. [Every mutation row with the test that kills
+it](adr-245-mutation-rows.md).
