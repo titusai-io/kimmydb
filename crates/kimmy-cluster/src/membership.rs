@@ -135,9 +135,10 @@ impl Identity for Member {
         if self.incarnation != adversary.incarnation {
             return self.incarnation > adversary.incarnation;
         }
-        // Two different nodes claiming one address — a replacement that reused
-        // it, most likely. Both start at incarnation 0, so without a tiebreak
-        // neither displaces the other and the address stalls on the dead one.
+        // Two different nodes claiming one address at one incarnation — a
+        // replacement that reused it, most likely, since a node with a fresh
+        // data directory starts at 0 (ADR-242). Without a tiebreak neither
+        // displaces the other and the address stalls on the dead one.
         // Comparing node ids is arbitrary but *agreed*: every node reaches the
         // same answer, which is what matters.
         self.node > adversary.node
