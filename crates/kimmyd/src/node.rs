@@ -2690,6 +2690,12 @@ async fn spawn_cluster(
 
         let live = live.clone().expect("made above when membership is on");
         let (tx, feed) = kimmy_cluster::SeedFeed::channel();
+        // One above the incarnation the last process here reached, recorded
+        // before the task can send anything, so the peers take this member's
+        // first identity at once instead of answering it until it has renewed
+        // past the one they hold (ADR-242).
+        let incarnation =
+            kimmy_cluster::membership::IncarnationFile::begin(&config.storage.data_dir);
         // The same secret the replication handshake uses: membership is
         // authenticated too, so an unauthenticated node cannot join the member
         // set that webhook ownership is computed over (ADR-053).
@@ -2700,6 +2706,7 @@ async fn spawn_cluster(
                 socket,
                 advertised(local),
                 engine.node_id(),
+                incarnation,
                 secret.clone(),
                 live.clone(),
                 feed,
