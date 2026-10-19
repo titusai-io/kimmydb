@@ -1020,8 +1020,15 @@ impl HnswIndex {
     /// ([`may_hold`]): only a key that can hold an admitted document's chunk,
     /// its run's or its 0.50 id, so a filtered search reads what it reads
     /// unfiltered scaled by the filter, not every candidate of the widened
-    /// walk. Filtering happens after the graph walk, so the search is widened
-    /// to compensate.
+    /// walk.
+    ///
+    /// **A filtered search returns as many hits as the admitted documents can
+    /// give, up to `k`** (ADR-241). Filtering happens after the walk, so the
+    /// walk is widened by how much of the collection the filter admits
+    /// ([`filtered_width`]); a walk that still comes back short is widened
+    /// once more, and a second short walk gives way to reading the admitted
+    /// documents' chunks by key, which is exact. With a fixed width a filter
+    /// admitting 1% of 100,000 documents returned four hits of ten.
     pub fn search(
         &self,
         engine: &Engine,
@@ -1030,7 +1037,56 @@ impl HnswIndex {
         options: &SearchOptions,
         allowed: Option<&HashSet<DocId>>,
     ) -> Result<Vec<Hit>> {
-        let keys = self.search_keys(query, walk_width(options.k, allowed.is_some()))?;
+        self.search_capped(engine, shadow, query, options, allowed, FILTERED_WIDTH_CAP)
+    }
+
+    /// [`Self::search`] with the widest filtered walk as a parameter, so a test
+    /// can reach the keyed join on a collection small enough to build.
+    fn search_capped(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        query: &[f32],
+        options: &SearchOptions,
+        allowed: Option<&HashSet<DocId>>,
+        cap: usize,
+    ) -> Result<Vec<Hit>> {
+        let Some(allowed) = allowed else {
+            return self.walk(engine, shadow, query, options, None, walk_width(options.k, false));
+        };
+        // As many as the admitted documents can give: the per-document cap
+        // bounds each document's share.
+        let wanted = options.k.min(allowed.len().saturating_mul(options.per_document.max(1)));
+        let cap = cap.max(walk_width(options.k, true));
+        let first = filtered_width(options.k, self.keys.len(), allowed.len()).min(cap);
+        let hits = self.walk(engine, shadow, query, options, Some(allowed), first)?;
+        if hits.len() >= wanted {
+            return Ok(hits);
+        }
+        let wider = first.saturating_mul(FILTERED_RETRY_FACTOR).min(cap);
+        if wider > first {
+            let hits = self.walk(engine, shadow, query, options, Some(allowed), wider)?;
+            if hits.len() >= wanted {
+                return Ok(hits);
+            }
+        }
+        #[cfg(test)]
+        KEYED_FALLBACKS.with(|n| n.set(n.get() + 1));
+        let ids: Vec<DocId> = allowed.iter().cloned().collect();
+        crate::search::vector_search_among(engine, shadow, query, options, &ids)
+    }
+
+    /// One walk of `width` candidates, admitted and ranked.
+    fn walk(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        query: &[f32],
+        options: &SearchOptions,
+        allowed: Option<&HashSet<DocId>>,
+        width: usize,
+    ) -> Result<Vec<Hit>> {
+        let keys = self.search_keys(query, width)?;
         let old_forms = allowed.map(old_forms).unwrap_or_default();
 
         let mut hits = Vec::with_capacity(keys.len());
@@ -1057,6 +1113,35 @@ impl HnswIndex {
         }
         Ok(crate::search::rank_hits(hits, options))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many filtered searches on this thread gave way to the keyed join.
+    pub(crate) static KEYED_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The widest walk a filtered search makes before reading the admitted
+/// documents by key. Measured at 100,000 × 384, a walk of 8,000 candidates
+/// costs about 50 ms, and a search reaches it only when the filter admits at
+/// most one document in 400, where the keyed join it gives way to reads at
+/// most 2,500 documents per million in the collection.
+const FILTERED_WIDTH_CAP: usize = 8_000;
+
+/// How much wider than the admitted share a filtered walk looks: a walk of
+/// `2 × k × chunks / admitted` candidates expects `2k` admitted ones.
+const FILTERED_MARGIN: usize = 2;
+
+/// How much wider the one retry of a short filtered walk looks.
+const FILTERED_RETRY_FACTOR: usize = 4;
+
+/// The first walk of a search whose filter admits `admitted` documents of a
+/// graph of `chunks` chunks: wide enough to expect `FILTERED_MARGIN × k`
+/// admitted candidates, and never narrower than an unadapted filtered walk
+/// ([`walk_width`]), which is what a filter admitting most of the collection
+/// still gets.
+fn filtered_width(k: usize, chunks: usize, admitted: usize) -> usize {
+    (FILTERED_MARGIN * k).saturating_mul(chunks).div_ceil(admitted.max(1)).max(walk_width(k, true))
 }
 
 /// How many candidates [`HnswIndex::search`] asks the graph walk for, for `k`
@@ -1840,6 +1925,126 @@ mod tests {
         assert!(hits.len() <= options.k, "no more than k: {}", hits.len());
         for hit in &hits {
             assert!(allowed.contains(&hit.id), "{:?} was filtered out", hit.id);
+        }
+    }
+
+    /// The admitted documents spread evenly over `setup_bulk`'s `count`, and
+    /// how many filtered searches of `k` of them come back short, with how many
+    /// gave way to the keyed join.
+    fn filtered_rows(
+        index: &HnswIndex,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        count: usize,
+        dim: usize,
+        admitted: usize,
+        queries: u64,
+    ) -> (usize, usize, f64) {
+        let step = count / admitted;
+        let allowed: HashSet<DocId> =
+            (0..admitted).map(|i| DocId::Int64((i * step) as i64)).collect();
+        let ids: Vec<DocId> = allowed.iter().cloned().collect();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let fallbacks = KEYED_FALLBACKS.with(|n| n.get());
+        let (mut short, mut recall) = (0, 0.0);
+        for q in 0..queries {
+            let query = pseudo_random(90_000 + q, dim);
+            let hits = index.search(engine, shadow, &query, &options, Some(&allowed)).unwrap();
+            assert!(hits.iter().all(|h| allowed.contains(&h.id)), "a hit outside the filter");
+            if hits.len() < options.k {
+                short += 1;
+            }
+            let exact: HashSet<DocId> =
+                crate::search::vector_search_among(engine, shadow, &query, &options, &ids)
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect();
+            recall +=
+                hits.iter().filter(|h| exact.contains(&h.id)).count() as f64 / exact.len() as f64;
+        }
+        (short, KEYED_FALLBACKS.with(|n| n.get()) - fallbacks, recall / queries as f64)
+    }
+
+    /// A filtered search returns `k` hits when `k` documents are admitted, at
+    /// low selectivity too, and the graph answers it (ADR-241). At a fixed
+    /// width of 320 candidates a filter admitting 1% of a collection expects
+    /// three admitted among them, and returned four hits of ten at 100,000
+    /// documents; the precondition shows this fixture is short the same way.
+    #[test]
+    fn a_filtered_search_returns_k_at_low_selectivity() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+
+        let allowed: HashSet<DocId> = (0..50).map(|i| DocId::Int64(i * 100)).collect();
+        let fixed = index
+            .walk(&engine, &shadow, &pseudo_random(90_000, DIM), &options, Some(&allowed), 320)
+            .unwrap();
+        assert!(fixed.len() < 10, "the precondition: a fixed walk is short here ({})", fixed.len());
+
+        for (percent, admitted) in [(1, 50), (2, 100), (3, 150)] {
+            let (short, fallbacks, recall) =
+                filtered_rows(&index, &engine, &shadow, COUNT, DIM, admitted, 10);
+            assert_eq!(short, 0, "{percent}% admitted: searches that came back short");
+            assert_eq!(fallbacks, 0, "{percent}% admitted: the graph should answer it");
+            assert!(recall >= 0.9, "{percent}% admitted: recall {recall:.3}");
+        }
+    }
+
+    /// A filtered walk that is short at its widest gives way to the keyed
+    /// join, which is exact, so the search is never short while `k`
+    /// documents are admitted. A cap no wider than the unadapted walk makes
+    /// the fallback reachable on a collection small enough to build.
+    #[test]
+    fn a_filtered_walk_short_at_its_widest_reads_the_admitted_documents() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let allowed: HashSet<DocId> = (0..50).map(|i| DocId::Int64(i * 100)).collect();
+        let ids: Vec<DocId> = allowed.iter().cloned().collect();
+        let query = pseudo_random(90_000, DIM);
+        let before = KEYED_FALLBACKS.with(|n| n.get());
+        let hits =
+            index.search_capped(&engine, &shadow, &query, &options, Some(&allowed), 0).unwrap();
+        assert_eq!(KEYED_FALLBACKS.with(|n| n.get()) - before, 1, "the keyed join answered");
+        let exact =
+            crate::search::vector_search_among(&engine, &shadow, &query, &options, &ids).unwrap();
+        let ids_of = |hits: &[Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids_of(&hits), ids_of(&exact), "exactly the keyed join's answer");
+        assert_eq!(hits.len(), 10);
+    }
+
+    /// [`a_filtered_search_returns_k_at_low_selectivity`] at the size the
+    /// defect was measured at: 1%, 2% and 3% of 100,000 documents admitted.
+    /// 16 dimensions, so that the build is a minute in release rather than
+    /// ten; the selectivity, not the width, is what decides whether a fixed
+    /// walk comes back short.
+    ///
+    /// ```bash
+    /// cargo test -p kimmy-vector --release --lib -- --ignored --exact \
+    ///     index::tests::a_filtered_search_returns_k_at_100k_documents
+    /// ```
+    #[test]
+    #[ignore = "a 100,000-vector build; CI runs this in release"]
+    fn a_filtered_search_returns_k_at_100k_documents() {
+        const COUNT: usize = 100_000;
+        const DIM: usize = 16;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        for (percent, admitted) in [(1, 1_000), (2, 2_000), (3, 3_000)] {
+            let (short, fallbacks, recall) =
+                filtered_rows(&index, &engine, &shadow, COUNT, DIM, admitted, 20);
+            println!(
+                "{percent}% admitted ({admitted} of {COUNT}): short {short}/20, keyed \
+                 fallbacks {fallbacks}, recall {recall:.3}"
+            );
+            assert_eq!(short, 0, "{percent}% admitted: searches that came back short");
+            assert_eq!(fallbacks, 0, "{percent}% admitted: the graph should answer it");
         }
     }
 
