@@ -45,10 +45,16 @@
 //! short one (cut at two entries); write unkeyed; take a scoped or converge pull of a
 //! collection, optionally followed by a restart; reset a member (a fresh store, then a
 //! whole-database snapshot), with writes on the sender between its pages; take a member
-//! down and up; restart or crash a member; back a member up and restore it, which then
-//! replays its own origin from its peers (ADR-212, as the transport does); drop or create
-//! `items` or `orders` (a drop of `orders` on another member also between two commits);
-//! and a retention pass with a moved clock. "Between two commits" is the
+//! down and up; restart or crash a member; back a member up and restore it (from its
+//! latest backup or an earlier one, and the sender of a page or a snapshot between two
+//! of its pages, m4), which then replays its own origin from its peers (ADR-212, each page
+//! cut as the transport's `cut_replay_page` cuts it, in a frame of a few units: B2's
+//! records, and records alone under a records cursor, m1), with steps between the
+//! replay's pages; rewind a member (`restore --until`, offline), which replays its own
+//! origin the same way; leave orphan rows by stamp (records past their window removed, as
+//! a retention pass stopped between chunks leaves them); drop or create `items` or
+//! `orders` (a drop of `orders` on another member also between two commits); and a
+//! retention pass with a moved clock. "Between two commits" is the
 //! engine's own commit point (`barrier_hooks::Point::Released`, after every commit,
 //! durable by then), so it is between any two commits whatever the code under test makes
 //! them.
@@ -107,7 +113,21 @@
 //! - **Life**: a member that holds K's live `done` record replays it (a delete by id
 //!   while its document's row is at or above the delete, or the row is gone and the
 //!   collection's drop or floor is at or above it), and no replay answers from a record
-//!   past its window.
+//!   past its window. A rewind leaves no record of a request whose every write it
+//!   discarded, reopens one it cut part-way only as a filter's (`applying`, no cursor;
+//!   any other kind goes, and its standing writes are bare by design, Y's m3), and leaves
+//!   no row by stamp naming a record it removed (G).
+//! - **Contested** (the KR ruling): the test keeps, per member and key, the requests
+//!   merged into its live record (a local commit adds its own; a stored record adds its
+//!   sender's; an absent record has none), so the merge algebra `a.contested ||
+//!   b.contested || a.fingerprint != b.fingerprint` is the set's size: a live record is
+//!   contested exactly when its set holds two or more. A lookup refuses (422) exactly
+//!   where the record before the call is contested or another request's, and writes
+//!   nothing; a request whose record turns contested at a commit point writes no later
+//!   chunk and answers `partially_applied`.
+//! - **Carried**: every record a frame or a page carries stands on its sender as carried
+//!   and rides at or above its `first`: an orphan row ships nothing, and a row below a
+//!   record's `first` (an earlier record's under the key) vouches for nothing of it.
 //!
 //! **Findings the model classifies**, each counted in every run's summary line:
 //! - **Relay** (the G1 analysis's G1b, G2, G2b, G3, T2, G5): an effect or an entry of K
@@ -130,7 +150,8 @@
 //! Under the life rule the extended model found D2 (a retry after a drop doubled a
 //! counter a later write carried over), D3 (a resume across a drop left the later life's
 //! counters) and KR (a reused key's merged records). Ruling A makes D2 a Life and I1
-//! violation and D3 the stamp rule's contract; KR is refused by the `contested` flag.
+//! violation and D3 the stamp rule's contract; KR is refused by the `contested` flag, and
+//! the rows `row_d2_*`, `row_d3_*` and `row_kr_*` hold the engine to it.
 //!
 //! **Reproducers**, both run (not ignored) and pass since their fixes landed:
 //! `finding_g1_*` (G1 as first reported: its pull serves the window without the sender's
