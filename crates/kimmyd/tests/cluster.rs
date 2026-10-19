@@ -537,12 +537,22 @@ async fn three_nodes(client: &reqwest::Client) -> (Node, Node, Node) {
 /// the node exits with it in use, and the three start again on new ports:
 /// a few attempts, each answered as soon as a node exits.
 async fn three_nodes_with(client: &reqwest::Client, storage: &str) -> (Node, Node, Node) {
+    three_nodes_at(client, storage, 1).await
+}
+
+/// [`three_nodes_with`], every member at `sync_interval_secs`.
+async fn three_nodes_at(
+    client: &reqwest::Client,
+    storage: &str,
+    sync_interval_secs: u64,
+) -> (Node, Node, Node) {
     const ATTEMPTS: usize = 5;
     for _ in 0..ATTEMPTS {
         let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
-        let a = Node::spawn_with("node-a", pa, &[pb], storage);
-        let b = Node::spawn_with("node-b", pb, &[pa], storage);
-        let c = Node::spawn_with("node-c", pc, &[pa], storage);
+        let interval = sync_interval_secs;
+        let a = Node::spawn_with_interval("node-a", pa, &[pb], storage, interval);
+        let b = Node::spawn_with_interval("node-b", pb, &[pa], storage, interval);
+        let c = Node::spawn_with_interval("node-c", pc, &[pa], storage, interval);
         let mut collided = false;
         for node in [&a, &b, &c] {
             match node.try_ready(client).await {
@@ -4561,6 +4571,110 @@ async fn retaken(client: &reqwest::Client, nodes: [&Node; 3], node: &Node) {
     eventually("every member to see both others live", || all_report(client, nodes.to_vec(), 2))
         .await;
     tokio::time::sleep(Duration::from_secs(8)).await;
+}
+
+/// The live peers `url`'s member holds no facts block from
+/// (`kimmy_ownership_peers{state="unknown"}`), `None` when it does not answer.
+async fn unheard_at(client: &reqwest::Client, url: &str) -> Option<u64> {
+    let body = client.get(url).send().await.ok()?.text().await.ok()?;
+    body.lines()
+        .find_map(|line| line.strip_prefix(r#"kimmy_ownership_peers{state="unknown"} "#))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The longest stretch over which `samples` (when, value) read above 0: from the
+/// first sample above 0 to the first one after it that is not.
+fn longest_unheard(samples: &[(std::time::Instant, Option<u64>)]) -> Duration {
+    let (mut longest, mut since) = (Duration::ZERO, None);
+    for (at, value) in samples {
+        match (value, since) {
+            (Some(1..), None) => since = Some(*at),
+            (Some(0), Some(from)) => {
+                longest = longest.max(at.duration_since(from));
+                since = None;
+            }
+            _ => {}
+        }
+    }
+    if let (Some(from), Some((last, _))) = (since, samples.last()) {
+        longest = longest.max(last.duration_since(from));
+    }
+    longest
+}
+
+/// Sample `url`'s unheard peers every 10 ms until `stop`.
+async fn sample_unheard(
+    client: reqwest::Client,
+    url: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<(std::time::Instant, Option<u64>)> {
+    let mut samples = Vec::new();
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        samples.push((std::time::Instant::now(), unheard_at(&client, &url).await));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    samples
+}
+
+/// A restart's peer window is about one contact (ADR-247). Each peer drops the
+/// restarted member's last block when it sees it renamed (ADR-242) and exchanges
+/// blocks with it at once, so at a 5 s sync interval a peer holds it live and
+/// unheard for well under a second, not until its next tick (up to 5 s); and the
+/// member, which exchanges with each peer it sees come up, holds none unheard
+/// for long either. B is restarted three times with SIGTERM; A's and C's
+/// `kimmy_ownership_peers{state="unknown"}` are sampled every 10 ms from before
+/// the stop until 7 s after B is ready, and B's from its first ready answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_restarted_member_and_its_peers_hear_each_other_within_about_one_contact() {
+    const SYNC_SECS: u64 = 5;
+    const BOUND: Duration = Duration::from_secs(1);
+    let client = reqwest::Client::new();
+    let (a, mut b, c) = three_nodes_at(&client, "", SYNC_SECS).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let every_block_held = || async {
+        for node in [&a, &b, &c] {
+            if unheard_at(&client, &node.url("/metrics")).await != Some(0) {
+                return false;
+            }
+        }
+        true
+    };
+    eventually("every member to hold both others' blocks", every_block_held).await;
+
+    for restart in 1..=3 {
+        let before = recorded_incarnation(&b);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peers = [&a, &c].map(|peer| {
+            let url = peer.url("/metrics");
+            tokio::spawn(sample_unheard(client.clone(), url, std::sync::Arc::clone(&stop)))
+        });
+        b.restart_with(&[]);
+        b.wait_ready(&client).await;
+        let own = tokio::spawn(sample_unheard(
+            client.clone(),
+            b.url("/metrics"),
+            std::sync::Arc::clone(&stop),
+        ));
+        tokio::time::sleep(Duration::from_secs(SYNC_SECS + 2)).await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(recorded_incarnation(&b), before + 1, "premise: B started anew, renamed");
+        let [sampled_a, sampled_c] = peers;
+        for (name, sampled) in [("A", sampled_a), ("C", sampled_c), ("B", own)] {
+            let samples = sampled.await.unwrap();
+            let longest = longest_unheard(&samples);
+            eprintln!(
+                "restart {restart}: {name} held a live member unheard for {longest:?} at most"
+            );
+            assert!(
+                longest < BOUND,
+                "restart {restart}: {name} held a live member unheard for {longest:?}, about one \
+                 contact expected, not a sync interval"
+            );
+            assert!(samples.iter().any(|(_, v)| *v == Some(0)), "{name} answered");
+        }
+        assert!(all_report(&client, vec![&a, &b, &c], 2).await, "restart {restart}: all live");
+    }
 }
 
 /// A restarted member's first identity is one above the incarnation its last

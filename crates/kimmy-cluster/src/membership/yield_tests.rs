@@ -418,6 +418,7 @@ fn a_dropped_slot_refuses_a_block_decoded_before_it() {
         timers: Vec::new(),
         members: members.clone(),
         rejoined: false,
+        at: Instant::now(),
     };
     collector.notify(Notification::Defunct);
     assert!(!hear(&members, 1, block(1), Some(2), before_defunct));
@@ -483,6 +484,7 @@ fn the_drop_floors_are_pruned() {
         timers: Vec::new(),
         members: members.clone(),
         rejoined: false,
+        at: Instant::now(),
     };
     collector.notify(Notification::Defunct);
     assert!(hear(&members, 1, block(1), Some(3), crate::facts::next_decoded_seq()));
@@ -511,6 +513,7 @@ fn own_defunct_and_rejoin_clear_the_read_map_and_the_peer_blocks() {
             timers: Vec::new(),
             members: rig.members.clone(),
             rejoined: false,
+            at: Instant::now(),
         };
         let identity = Member::identified(a(7900), n(9), 0);
         if rejoin {
@@ -651,6 +654,7 @@ fn no_yield_transition_moves_the_address_generations() {
         timers: Vec::new(),
         members: rig.members.clone(),
         rejoined: false,
+        at: Instant::now(),
     };
     collector.notify(Notification::Defunct);
     assert_eq!(rig.members.generation(&addr), Some(before), "nothing moved it");

@@ -1209,7 +1209,7 @@ where
 }
 
 /// Answer an inbound handshake: prove ourselves, then demand proof.
-async fn accept_handshake<S>(
+pub(crate) async fn accept_handshake<S>(
     engine: &Engine,
     stream: &mut S,
     secret: &str,
