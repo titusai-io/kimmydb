@@ -2253,7 +2253,11 @@ async fn a_changed_record_larger_than_a_page_stalls_counted(outbound: bool) {
         assert!(contact.is_ok(), "the contact is no failure: {contact:?}");
     }
     assert!(records_unfit().get(UnfitPath::Replay) > unfit, "counted");
-    assert!(said(&log, tracing::Level::WARN, UNFIT) >= 1, "said");
+    let warned = said(&log, tracing::Level::WARN, UNFIT);
+    assert!(
+        (1..=3).contains(&warned),
+        "said once a contact at most, the contact going no further: {warned}"
+    );
     assert!(!f.catch_up.replay_answered(c), "the replay stays owed");
     assert_eq!(f.catch_up.replay_from(c), at, "at its position");
     let orders = f.a.get_collection("shop", "orders").unwrap();
