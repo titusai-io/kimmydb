@@ -104,6 +104,15 @@ tokio::task_local! {
     /// When the request this task serves must be answered by: set by
     /// [`enforce_timeout`] for the handler it wraps.
     static REQUEST_DEADLINE: std::time::Instant;
+    /// The deadline's length, `server.request_timeout_secs`: for an answer
+    /// that names it, given by a handler that saw the deadline pass itself.
+    static REQUEST_TIMEOUT: Duration;
+}
+
+/// The configured deadline of the request this task serves, or `None`
+/// outside a request with a deadline.
+pub fn request_timeout() -> Option<Duration> {
+    REQUEST_TIMEOUT.try_with(|timeout| *timeout).ok()
 }
 
 /// How long the request this task serves has left before [`enforce_timeout`]
@@ -117,6 +126,18 @@ pub fn request_time_left() -> Option<Duration> {
     REQUEST_DEADLINE
         .try_with(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
         .ok()
+}
+
+/// Run `handler` as [`enforce_timeout`] runs one: under a request deadline of
+/// `deadline` and a configured timeout of `timeout`. For tests of a handler's
+/// own reading of its deadline.
+#[cfg(test)]
+pub(crate) async fn as_a_request<F: std::future::Future>(
+    deadline: std::time::Instant,
+    timeout: Duration,
+    handler: F,
+) -> F::Output {
+    REQUEST_DEADLINE.scope(deadline, REQUEST_TIMEOUT.scope(timeout, handler)).await
 }
 
 /// Abandon a request that is still pending at the deadline.
@@ -140,7 +161,10 @@ pub async fn enforce_timeout(
     let deadline = std::time::Instant::now() + limits.request_timeout;
     let handler = REQUEST_DEADLINE.scope(
         deadline,
-        kimmy_storage::with_write_wait_budget(limits.request_timeout, next.run(request)),
+        REQUEST_TIMEOUT.scope(
+            limits.request_timeout,
+            kimmy_storage::with_write_wait_budget(limits.request_timeout, next.run(request)),
+        ),
     );
     match tokio::time::timeout(limits.request_timeout, handler).await {
         Ok(response) => response,
