@@ -7081,16 +7081,14 @@ mod tests {
             record: vec![1; 120],
         };
         let one = bson::serialize_to_vec(&record(0)).unwrap().len();
-        let records: Vec<_> = (0..(ENTRY_BUDGET / one) as u64).map(record).collect();
-        // All of them the kind a window carries whatever else it carries: they fit
-        // whole, or not at all. The most that fit, by halving.
-        let fits = |n: usize| matches!(how_many_fit(&[], &records[..n], n), Fits::All);
-        let (mut lo, mut hi) = (0usize, records.len());
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            if fits(mid) { lo = mid } else { hi = mid - 1 }
-        }
+        // As many as the fit counts within the budget, each with its framing, and
+        // one more: all of them the kind a window carries whatever else it
+        // carries, so they fit whole or not at all.
+        let lo = ENTRY_BUDGET / (one + ELEMENT_FRAMING);
+        let records: Vec<_> = (0..=lo as u64).map(record).collect();
         assert!(lo > 200_000, "premise: a frame of small records ({lo})");
+        assert!(matches!(how_many_fit(&[], &records[..lo], lo), Fits::All), "the most that fit");
+        assert!(matches!(how_many_fit(&[], &records, lo + 1), Fits::Nothing), "and no more");
         let message = Message::Entries {
             entries: Vec::new(),
             scanned_to: Hlc::ZERO,
