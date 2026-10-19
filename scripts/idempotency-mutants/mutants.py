@@ -33,6 +33,11 @@ API_UNHEARD = ("kimmy-api", "--test idempotency", "a_live_peer_not_heard_from_is
 API_OLDER = ("kimmy-api", "--test idempotency", "an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard", "no")
 API_DECIMAL = ("kimmy-api", "--test api", "the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one", "no")
 CLUSTER_WINDOW = ("kimmyd", "--test cluster", "a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400", "yes")
+LEASE_UNIT = ("kimmy-cluster", "--lib", "idempotency::tests::a_peer_not_heard_from_is_unheard_within_its_lease_and_refuses_after_it", "no")
+DECIMAL_LEASE_UNIT = ("kimmy-cluster", "--lib", "decimal128::tests::a_peer_not_heard_from_refuses_after_its_lease_and_an_undecodable_one_at_once", "no")
+UNDECODABLE_UNIT = ("kimmy-cluster", "--lib", "idempotency::tests::a_peer_whose_block_does_not_decode_refuses_at_once", "no")
+CLOCK_UNIT = ("kimmy-cluster", "--lib", "facts::tests::a_rename_or_a_rejoin_starts_the_unheard_clock_again", "no")
+API_LEASE = ("kimmy-api", "--test idempotency", "a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400", "no")
 
 GATE_SPLIT = [
     {
@@ -41,8 +46,8 @@ GATE_SPLIT = [
         "doc": "Collapse in the net: a live peer with no block held counts as one that says no (400)",
         "patches": [
             ("crates/kimmy-cluster/src/facts.rs",
-             "        .filter(|node| view.blocks.get(node).is_some_and(|held| !has(&held.facts)))\n",
-             "        .filter(|node| view.blocks.get(node).is_none_or(|held| !has(&held.facts)))\n"),
+             "            None => view.undecodable.contains(node) || view.unheard_beyond_lease(node, now),\n",
+             "            None => true,\n"),
         ],
         "suites": [GATE_UNIT, CLUSTER_WINDOW],
         "kills": ["idempotency::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides",
@@ -160,19 +165,19 @@ GATE_SPLIT = [
         "doc": "Precedence swapped: a peer not heard from decides over one whose block says no",
         "patches": [
             ("crates/kimmy-cluster/src/facts.rs",
-             "        let refused = refusing_peers(view, has);\n"
+             "        let refused = refusing_peers(view, now, has);\n"
              "        if !refused.is_empty() {\n"
              "            return Self::Refused(refused);\n"
              "        }\n"
-             "        let unheard = unheard_peers(view);\n"
+             "        let unheard = unheard_peers(view, now);\n"
              "        if !unheard.is_empty() {\n"
              "            return Self::Unheard(unheard);\n"
              "        }\n",
-             "        let unheard = unheard_peers(view);\n"
+             "        let unheard = unheard_peers(view, now);\n"
              "        if !unheard.is_empty() {\n"
              "            return Self::Unheard(unheard);\n"
              "        }\n"
-             "        let refused = refusing_peers(view, has);\n"
+             "        let refused = refusing_peers(view, now, has);\n"
              "        if !refused.is_empty() {\n"
              "            return Self::Refused(refused);\n"
              "        }\n"),
@@ -189,8 +194,11 @@ GATE_SPLIT = [
         "doc": "A live peer not heard from passes the net (fails open)",
         "patches": [
             ("crates/kimmy-cluster/src/facts.rs",
-             "    view.live.iter().filter(|node| !view.blocks.contains_key(node)).copied().collect()\n",
-             "    view.live.iter().filter(|_| false).copied().collect()\n"),
+             "            !view.blocks.contains_key(node)\n"
+             "                && !view.undecodable.contains(node)\n"
+             "                && !view.unheard_beyond_lease(node, now)\n",
+             "            let _ = (node, now);\n"
+             "            false\n"),
         ],
         "suites": [GATE_UNIT, API_UNHEARD],
         "kills": ["idempotency::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides",
@@ -220,6 +228,85 @@ GATE_SPLIT = [
         ],
         "suites": [API_UNHEARD],
         "kills": ["a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken"],
+    },
+    {
+        "name": "gs-lease-never-expires",
+        "group": "gate-split",
+        "doc": "A peer not heard from is never past its lease: the gate answers 503 for as long as it stays unheard",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "            .is_some_and(|since| now.saturating_duration_since(*since) > self.lease)\n",
+             "            .is_some_and(|since| {\n"
+             "                let _ = (since, now);\n"
+             "                false\n"
+             "            })\n"),
+        ],
+        "suites": [LEASE_UNIT, DECIMAL_LEASE_UNIT, API_LEASE],
+        "kills": ["idempotency::tests::a_peer_not_heard_from_is_unheard_within_its_lease_and_refuses_after_it",
+                  "decimal128::tests::a_peer_not_heard_from_refuses_after_its_lease_and_an_undecodable_one_at_once",
+                  "a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400"],
+    },
+    {
+        "name": "gs-past-the-lease-passes",
+        "group": "gate-split",
+        "doc": "A peer past its lease is no longer counted by the gate at all (fails open)",
+        "patches": [
+            ("crates/kimmy-cluster/src/facts.rs",
+             "            None => view.undecodable.contains(node) || view.unheard_beyond_lease(node, now),\n",
+             "            None => view.undecodable.contains(node),\n"),
+        ],
+        "suites": [LEASE_UNIT, API_LEASE],
+        "kills": ["idempotency::tests::a_peer_not_heard_from_is_unheard_within_its_lease_and_refuses_after_it",
+                  "a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400"],
+    },
+    {
+        "name": "gs-undecodable-counted-as-unheard",
+        "group": "gate-split",
+        "doc": "A block that does not decode counts as no block: 503 within the lease instead of 400 at once",
+        "patches": [
+            ("crates/kimmy-cluster/src/facts.rs",
+             "            None => view.undecodable.contains(node) || view.unheard_beyond_lease(node, now),\n",
+             "            None => view.unheard_beyond_lease(node, now),\n"),
+            ("crates/kimmy-cluster/src/facts.rs",
+             "            !view.blocks.contains_key(node)\n"
+             "                && !view.undecodable.contains(node)\n"
+             "                && !view.unheard_beyond_lease(node, now)\n",
+             "            !view.blocks.contains_key(node) && !view.unheard_beyond_lease(node, now)\n"),
+        ],
+        "suites": [UNDECODABLE_UNIT, DECIMAL_LEASE_UNIT, API_LEASE],
+        "kills": ["idempotency::tests::a_peer_whose_block_does_not_decode_refuses_at_once",
+                  "decimal128::tests::a_peer_not_heard_from_refuses_after_its_lease_and_an_undecodable_one_at_once",
+                  "a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400"],
+    },
+    {
+        "name": "gs-rename-keeps-the-clock",
+        "group": "gate-split",
+        "doc": "A SWIM rename drops the block and leaves the unheard clock where it was",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        self.drop_peer(&mut table, node);\n"
+             "        if let Some(since) = self.0.up_since.lock().get_mut(&node) {\n"
+             "            *since = Instant::now();\n"
+             "        }\n",
+             "        self.drop_peer(&mut table, node);\n"),
+        ],
+        "suites": [CLOCK_UNIT],
+        "kills": ["facts::tests::a_rename_or_a_rejoin_starts_the_unheard_clock_again"],
+    },
+    {
+        "name": "gs-rejoin-keeps-the-clock",
+        "group": "gate-split",
+        "doc": "This member's own rejoin drops every block and leaves the unheard clocks where they were",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        let now = Instant::now();\n"
+             "        for since in self.0.up_since.lock().values_mut() {\n"
+             "            *since = now;\n"
+             "        }\n",
+             ""),
+        ],
+        "suites": [CLOCK_UNIT],
+        "kills": ["facts::tests::a_rename_or_a_rejoin_starts_the_unheard_clock_again"],
     },
 ]
 
@@ -758,8 +845,8 @@ ROWS = [
         "doc": "The live-peer net never blocks",
         "patches": [
             ("crates/kimmy-cluster/src/idempotency.rs",
-             "        match crate::facts::idempotency_records_net(&members.view()) {\n",
-             "        match { let _ = members; PeerNet::Open } {\n"),
+             "        match crate::facts::idempotency_records_net(&members.view(), now) {\n",
+             "        match { let _ = (members, now); PeerNet::Open } {\n"),
         ],
         "suites": [
             ("kimmy-cluster", "--test idempotency", "c9_a_live_member_that_does_not_carry_records_closes_the_gate", "no"),

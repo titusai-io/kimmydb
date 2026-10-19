@@ -5186,6 +5186,11 @@ async fn lab_hook_c9_a_live_member_that_does_not_carry_records_closes_the_gate()
     b.signal("CONT");
     eventually("B to pull it from C", || async { n_of(&client, &b, &t[1], 1).await == Some(1) })
         .await;
+    // B may have rejoined after its pause, dropping A's block while A is stopped: A
+    // is then not heard from, and past B's lease it counts as a member that does not
+    // carry records, until SWIM declares it down. As the other tests do, the retry
+    // waits for B to take keys.
+    eventually("B to take keys with A stopped", || takes_keys(&client, &b)).await;
     let retry = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
     assert_eq!(retry.status, 200, "{}", retry.text);
     assert!(retry.replayed, "answered from the record C relayed: {retry:?}");
