@@ -20,7 +20,9 @@ members = [
 # Its own root with its own lockfile. `cargo fuzz` builds it with a sanitizer
 # on nightly, and a workspace member would drag `libfuzzer-sys` -- and its C++
 # runtime -- into every `cargo build` here.
-exclude = ["fuzz"]
+# `vendor/hnsw_rs` is a patched dependency, not a member: its own tests and
+# dev-dependencies (HDF5 among them) stay out of every build here (ADR-241).
+exclude = ["fuzz", "vendor/hnsw_rs"]
 
 [workspace.package]
 version = "0.51.0"
@@ -272,3 +274,11 @@ debug = true
 # CI tested was.
 [profile.dist]
 inherits = "release"
+
+# hnsw_rs 0.3.5 from crates.io plus one additive function, `add_layer0_edges`,
+# which the build uses to link every point the graph's layer 0 leaves without
+# an edge into it (ADR-241). The pristine source and the patch are separate
+# commits; `vendor/hnsw_rs/README.kimmydb.md` says how to re-vendor, and
+# `scripts/check-vendored-hnsw.sh` holds the tree to the published crate.
+[patch.crates-io]
+hnsw_rs = { path = "vendor/hnsw_rs" }

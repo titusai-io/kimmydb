@@ -2460,9 +2460,25 @@ A rewind that discarded nothing (the command reports `0 oplog entries
 discarded`) undid no writes, so this rule does not apply to it: the member
 rejoins its cluster as any restored member does. A rewind keeps what the member
 covers at or below the target, lowers it to the target above it, and lowers it
-further only below a document it put back to an earlier value, so that the
-member asks its peers again for writes of that document it had judged
-([ADR-243](decisions.md)).
+further only below a document it put back to an earlier value or removed, so
+that the member asks its peers again for writes of that document it had judged
+([ADR-243](decisions.md), [ADR-246](decisions.md)). A document the member's
+oplog says was created after the target is removed and leaves no tombstone, so a
+write of it at or below the target that another member keeps comes back to the
+members that removed it.
+
+**When `storage.tombstone_retention_secs` exceeds
+`storage.oplog_retention_secs`, reset a member that was out of touch with a
+rewound member for longer than the oplog window**, rather than just bringing it
+back: stop it, wipe its data directory and let it catch up from its peers, as
+[a damaged store](#a-damaged-store) is reseeded. Such a member can hold a
+document from before a delete that only the rewound members applied and then
+replaced with a write after the target; the rewind removes that write and leaves
+no tombstone, so the member would write the deleted document back. It is the
+reset ADR-085 recommends for a member that trailed by more than the tombstone
+window, applied at the oplog window ([ADR-246](decisions.md)). With the two
+windows equal, the default, such a member trailed by more than the tombstone
+window as well.
 
 **A member rewound by 0.51 or earlier that has rejoined its cluster.** That
 rewind lowered the member's version vectors below writes retention had
@@ -2487,6 +2503,41 @@ since, as affected. Either remedy closes it:
   holds. A collection's drop made again by hand also removes the documents
   written into it after the original drop, which the original drop keeps: copy
   them out first and write them back after the drop.
+
+**Such a member can also delete writes its peers keep.** A rewind by 0.51 or
+earlier left, for each document it removed, a tombstone under the member's own
+node id, stamped after the rewind's target at about the time the rewind ran.
+Once the member has written anything again, a page from it carries those
+tombstones to its peers: each deletes there a write of that document at or
+below the target that the member had judged against the write the rewind
+discarded, and the peer passes the delete on as an entry under the member's id
+([ADR-246](decisions.md)).
+
+- While no peer holds such a delete, restoring the member again from the same
+  backup with this release, as the first remedy above does, removes the
+  tombstones: this release's rewind removes those documents without one. If the
+  member has written anything since its 0.51 rewind while in contact with its
+  peers, take the next case.
+- Once a peer holds one, the write is deleted on every member that took the
+  delete, and restoring the member again does not bring it back: the member
+  takes the delete back from its peers. To put the writes back:
+  1. **Name the documents**: those with a tombstone under the rewound member's
+     own node id, stamped after the rewind's target at about the time the 0.51
+     rewind ran. They are among the documents present when the member's backup
+     from before the rewind is restored with this release into a scratch data
+     directory without `--until`, and absent when it is restored with the same
+     `--until`; use that backup to name them only.
+  2. **Take each one's value from a member that was not rewound, as it stood
+     before the delete reached that member**: from a backup of it taken before
+     then, or from its live store while it has not taken the delete.
+  3. **Never take a value from the rewound member's own backup from before the
+     rewind.** It holds the write the rewind undid; inserted, that write is
+     stamped now and replaces the document on every member.
+  4. **Insert each value through any member.** The insert is stamped now and
+     replaces the delete everywhere.
+
+  If no member that was not rewound holds a copy of a document, its value cannot
+  be recovered from the cluster.
 
 ### The identity comes back with it
 
@@ -3336,6 +3387,49 @@ fingerprint and ignores it.
   upgrade itself.
 - **A member rolled back to 0.42.0** keeps the fingerprints on the records it
   holds, ignores them, and writes its own records without one.
+
+### Vector indexes in 0.52.0: every graph rebuilds once
+
+0.52.0 builds HNSW graphs with `hnsw_rs` 0.3.5 instead of 0.3.4, whose graphs
+left 0.5% to 5% of a collection of 500 vectors or more where no search could
+reach it, and links every point the library's insertion still leaves without
+an edge into it ([ADR-241](decisions.md)). A snapshot (`<data_dir>/hnsw/`)
+says in its `meta.json` which build made its graph (`"graph": 2`); one that
+does not say, saved by 0.51.x or earlier, is served once and rebuilt, **once
+per vector collection on each member**:
+
+- **What you see.** At the first search of each vector collection after the
+  member starts, one `INFO`: `adopting an HNSW snapshot a build before 0.52.0
+  made as behind`. That search is answered from the old graph at once. The
+  next search of the collection rebuilds it and saves a marked snapshot.
+  Nothing at startup.
+- **What it costs.** One build per collection. Measured with 384-dimensional
+  vectors, one build at a time on a loaded 18-core workstation: **9 s to build
+  and 4 s to save at 10,000 vectors** (peak process memory 200 MiB), and **4.4
+  to 12 minutes to build and half a minute to two minutes to save at
+  100,000** (1.3 to 1.5 GiB), the upper figures on uniformly random vectors.
+  Linking adds under a second at 100,000 vectors of realistic data. The next
+  restart loads the snapshot in under a second.
+- **What a search sees meanwhile.** The search that rebuilds waits for the
+  build and the save, and so does every other search of that collection that
+  arrives during them; all of them then answer from the new graph.
+  `server.request_timeout_secs` does not cut that wait short. A collection with
+  fewer than 500 vectors (the exact scan) and a search whose filter admits at
+  most 1,000 documents (read by key) never use the graph and do not wait, and
+  searches of other collections are not delayed; nor are reads and writes,
+  measured with eight collections building at once on a two-worker runtime.
+- **Taking the cost before traffic.** After each member starts, two vector
+  searches of each collection of 500 vectors or more, sent to that member,
+  rebuild its graph; roll on when the second has answered.
+- **A torn snapshot no longer takes a node down.** Before 0.52.0 a snapshot
+  data file cut short made the library end the process at that collection's
+  first search, on every restart; a snapshot's files are now checked before
+  the library reads them, and refused and rebuilt instead. A save now syncs
+  its files before the rename that publishes them.
+- **Rolling back to 0.51.x** needs nothing and rebuilds nothing: the format
+  is unchanged, and a 0.51 member loads and serves the graphs 0.52.0 saved,
+  ignoring the field that marks them. A graph 0.51 rebuilds and saves loses
+  the mark, and a member rolled forward again serves it once and rebuilds it.
 
 ### Vector chunk ids in 0.51.0
 
