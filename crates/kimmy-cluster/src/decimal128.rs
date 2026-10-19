@@ -13,6 +13,13 @@
 //!    which is the hazard the operator's procedure covers: the net only
 //!    catches what this member can see.
 //!
+//! The net's two causes are told apart ([`crate::PeerNet`]): a held block that
+//! says the peer cannot hold one is [`Decimal128Closed::Peers`], which the API
+//! answers `400`, and lasts a roll; a live peer not heard from yet, with no
+//! held block saying no, is [`Decimal128Closed::Unheard`], answered `503` with
+//! `retry: wait` and a `Retry-After` of one sync interval, since its block
+//! arrives at the next contact.
+//!
 //! With clustering off there are no peers, and the key alone decides (its
 //! default is `true` there). With clustering on and `cluster.membership` off,
 //! this member exchanges no blocks with its peers and cannot see what they
@@ -23,6 +30,7 @@ use std::time::Duration;
 
 use kimmy_core::Decimal128Closed;
 
+use crate::facts::PeerNet;
 use crate::membership::Members;
 
 /// How often a peer that cannot hold a `Decimal128` id is named again in the
@@ -75,11 +83,15 @@ impl Decimal128Gate {
                  peer can hold one",
             ));
         };
-        let blockers = members.decimal128_blockers();
-        if blockers.is_empty() {
-            Ok(())
-        } else {
-            Err(Decimal128Closed::Peers(blockers.iter().map(ToString::to_string).collect()))
+        let names =
+            |peers: Vec<kimmy_core::NodeId>| peers.iter().map(ToString::to_string).collect();
+        match crate::facts::decimal128_net(&members.view()) {
+            PeerNet::Open => Ok(()),
+            PeerNet::Refused(peers) => Err(Decimal128Closed::Peers(names(peers))),
+            PeerNet::Unheard(peers) => Err(Decimal128Closed::Unheard {
+                peers: names(peers),
+                retry_after_secs: members.unheard_retry_after_secs(),
+            }),
         }
     }
 
@@ -138,8 +150,14 @@ mod tests {
         assert_eq!(gate.check(), Ok(()), "a member alone holds only what it can hold");
 
         members.insert_for_test(addr(2), node(2));
-        // Live and not yet heard from: fails closed.
-        assert_eq!(gate.check(), Err(Decimal128Closed::Peers(vec![node(2).to_string()])));
+        // Live and not yet heard from: fails closed, and transient.
+        assert_eq!(
+            gate.check(),
+            Err(Decimal128Closed::Unheard {
+                peers: vec![node(2).to_string()],
+                retry_after_secs: members.unheard_retry_after_secs(),
+            })
+        );
         // An older build: its block says nothing of the capability.
         members.record_peer_facts_for_test(node(2), can(None), Duration::ZERO);
         assert_eq!(gate.check(), Err(Decimal128Closed::Peers(vec![node(2).to_string()])));
@@ -152,6 +170,54 @@ mod tests {
         members.insert_for_test(addr(3), node(3));
         members.record_peer_facts_for_test(node(3), can(None), Duration::ZERO);
         assert_eq!(gate.check(), Err(Decimal128Closed::Peers(vec![node(3).to_string()])));
+    }
+
+    /// The two causes apart: a peer not heard from is `Unheard`, transient, with
+    /// one sync interval to wait; a held block that says no is `Peers` and
+    /// carries none; and with both at once the block that says no decides, naming
+    /// only its member.
+    #[test]
+    fn a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides() {
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(3), 2);
+        let gate = gate_over(&members);
+        members.insert_for_test(addr(2), node(2));
+        let closed = gate.check().unwrap_err();
+        assert_eq!(
+            closed,
+            Decimal128Closed::Unheard { peers: vec![node(2).to_string()], retry_after_secs: 3 }
+        );
+        assert_eq!(closed.retry_after_secs(), Some(3), "one sync interval");
+
+        // A second live peer whose block says no: it decides, whoever is unheard.
+        members.insert_for_test(addr(3), node(3));
+        members.record_peer_facts_for_test(node(3), can(None), Duration::ZERO);
+        let closed = gate.check().unwrap_err();
+        assert_eq!(closed, Decimal128Closed::Peers(vec![node(3).to_string()]));
+        assert_eq!(closed.retry_after_secs(), None, "lasts until it is upgraded");
+
+        // It upgrades: only the unheard peer is left, and the refusal is transient again.
+        members.record_peer_facts_for_test(node(3), can(Some(true)), Duration::ZERO);
+        assert!(matches!(gate.check(), Err(Decimal128Closed::Unheard { .. })));
+        members.record_peer_facts_for_test(node(2), can(Some(true)), Duration::ZERO);
+        assert_eq!(gate.check(), Ok(()));
+    }
+
+    /// A block dropped on a rename or a rejoin leaves the peer live and unheard:
+    /// `Unheard` again, not a refusal that lasts.
+    #[test]
+    fn a_block_dropped_while_the_peer_stays_live_is_unheard_again() {
+        let members = Members::default();
+        let gate = gate_over(&members);
+        members.insert_for_test(addr(2), node(2));
+        members.record_peer_facts_for_test(node(2), can(Some(true)), Duration::ZERO);
+        assert_eq!(gate.check(), Ok(()));
+        members.forget_peer_for_test(node(2));
+        assert!(
+            matches!(gate.check(), Err(Decimal128Closed::Unheard { ref peers, .. }) if peers == &[node(2).to_string()]),
+            "{:?}",
+            gate.check()
+        );
     }
 
     #[test]

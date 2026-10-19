@@ -256,7 +256,8 @@ fn target_of(uri: &axum::http::Uri) -> &str {
 ///
 /// Without the header this is exactly [`JsonBody`]: the same extractor, the
 /// same refusals, and the same body. With it, the gate is asked first: a member
-/// that does not take keys now refuses with `400` naming the cause, after
+/// that does not take keys now refuses naming the cause (`400`, or `503
+/// peer_unheard` while a live member is not heard from yet), after
 /// authentication (the handler's `Auth` runs before this) and before a byte of
 /// the body is read. Then the body is read as bytes through
 /// axum's `Bytes` extractor, hashed into the fingerprint, and then parsed, and
@@ -343,11 +344,18 @@ impl FromRequestParts<SharedState> for KeyedNoBody {
 }
 
 /// Refuse a well-formed key while this member does not take keys (the gate:
-/// the operator's switch and the live-peer net), with `400 bad_request` and the
-/// gate's own words, which name the switch or the live member; counted as
+/// the operator's switch and the live-peer net), with the gate's own words,
+/// which name the switch or the live member; counted as
 /// `kimmy_idempotency_requests_total{outcome="gated"}`. Asked after
 /// authentication, since the refusal can name a member of the cluster, and
 /// before anything is read, looked up or written.
+///
+/// `503 peer_unheard`, `retry: wait`, with the gate's `Retry-After`, when the
+/// only cause is a live member not heard from yet
+/// ([`IdempotencyClosed::Unheard`]), which ends by itself within about a sync
+/// interval: the same request with the same key is then taken. `400
+/// bad_request` for every cause that lasts (the switch, a member that says it
+/// does not carry records, membership off).
 fn refuse_unless_open(
     state: &AppState,
     message: impl FnOnce(&IdempotencyClosed) -> String,
@@ -356,14 +364,20 @@ fn refuse_unless_open(
         Ok(()) => Ok(()),
         Err(closed) => {
             state.metrics.record_idempotency(KeyedOutcome::Gated);
-            Err(ApiError::bad_request(message(&closed)))
+            let text = message(&closed);
+            Err(match closed.retry_after_secs() {
+                Some(secs) => ApiError::peer_unheard(text, secs),
+                None => ApiError::bad_request(text),
+            })
         }
     }
 }
 
 /// The MCP write tools' key: `None` without the argument, the key and the
 /// call's fingerprint with a well-formed one on a member whose gate is open,
-/// and the `400` the header would draw otherwise. The argument is checked
+/// and the refusal the header would draw otherwise: a `400`, or the `503
+/// peer_unheard` whose envelope carries `retry: wait` and `retry_after_secs`
+/// where REST sends `Retry-After`. The argument is checked
 /// before the gate, as the header is, so a malformed key is named whatever the
 /// member's state.
 pub fn tool_key(
@@ -436,8 +450,9 @@ pub enum KeyedOutcome {
     Reused,
     /// `409 idempotency_key_in_flight`.
     InFlight,
-    /// `400` by the gate: the switch is off here, or a live member does not
-    /// carry records.
+    /// Refused by the gate: `400` while the switch is off here or a live
+    /// member says it does not carry records, `503 peer_unheard` while a live
+    /// member has not been heard from yet.
     Gated,
 }
 

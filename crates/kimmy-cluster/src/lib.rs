@@ -42,9 +42,9 @@ pub use confirm::{
 pub use decimal128::{DECIMAL128_WARN_INTERVAL, Decimal128Gate};
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource, names_another_member};
 pub use facts::{
-    CatchUpReason, ClassState, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState,
-    PerClass, StallCause, TtlHeld, Yielding, decimal128_blockers, facts_undecodable_total,
-    idempotency_records_blockers,
+    CatchUpReason, ClassState, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerNet,
+    PeerState, PerClass, StallCause, TtlHeld, Yielding, decimal128_blockers, decimal128_net,
+    facts_undecodable_total, idempotency_records_net, refusing_peers, unheard_peers,
 };
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use idempotency::{IdempotencyClosed, IdempotencyGate, IdempotencyPredicate};

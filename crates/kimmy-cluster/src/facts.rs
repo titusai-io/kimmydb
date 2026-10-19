@@ -225,8 +225,8 @@ pub struct Facts {
     /// statement about the whole cluster, this is the binary's about itself.
     /// Absent from an older sender, and anything but a bool reads as `None`,
     /// which is *cannot*: a locally created decimal id or bound is refused
-    /// while any live peer reads anything but `Some(true)`
-    /// ([`decimal128_blockers`]).
+    /// while any live peer reads anything but `Some(true)`, or has not been
+    /// heard from ([`decimal128_net`]).
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_bool")]
     pub decimal128: Option<bool>,
     /// The vector chunk-id format this member writes ([`kimmy_core::CHUNK_ID_FORMAT`],
@@ -245,44 +245,124 @@ pub struct Facts {
     /// the binary's about itself. Absent from an older sender, which relays a
     /// keyed write without its record, and anything but a bool reads as
     /// `None`, which is *does not carry*: this member takes no
-    /// `Idempotency-Key` while any live peer reads anything but `Some(true)`
-    /// ([`idempotency_records_blockers`]).
+    /// `Idempotency-Key` while any live peer reads anything but `Some(true)`,
+    /// or has not been heard from ([`idempotency_records_net`]).
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_bool")]
     pub idempotency_records: Option<bool>,
 }
 
-/// The live peers that do not advertise [`Facts::decimal128`] as `Some(true)`,
-/// in node-id order (ADR-238): a peer whose block says otherwise or says nothing
-/// of it (a build older than 0.51), and **a live peer this member holds no block
-/// from yet, which fails closed**. A member SWIM does not list live is not asked:
-/// one that is down, and one migrating its store, which binds no socket until
-/// its migration is done. That is why the net is a net and not a check, and why
-/// the operator's declaration comes first.
-pub fn decimal128_blockers(view: &crate::membership::PeerView) -> Vec<NodeId> {
+/// How the live peers stand on a capability each one states in its own block:
+/// the live-peer net of the `Decimal128` gate (ADR-238) and of the
+/// idempotency-key gate (ADR-240 item 7), with its two reasons to stay closed
+/// kept apart, because a client must act on them differently.
+///
+/// A member SWIM does not list live is not asked: one that is down, and one
+/// migrating its store, which binds no socket until it has. That is why the net
+/// is a net and not a check, and why the operator's declaration comes first.
+/// SWIM's live set never holds the member that keeps it, so this member is
+/// never one of its own peers here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerNet {
+    /// Every live peer's held block says it has the capability.
+    Open,
+    /// **A held block says no**: these live peers (node-id order) sent a block
+    /// that says otherwise or says nothing of the capability, a build older than
+    /// the one that added it. It lasts until that member is upgraded, which is a
+    /// whole roll or longer, so the refusal is final for the request.
+    Refused(Vec<NodeId>),
+    /// **Not heard yet**: no held block says no, and these live peers (node-id
+    /// order) have no block held here. A peer that came up a moment ago and has
+    /// not been contacted yet, or whose block this member dropped on a SWIM
+    /// rename or rejoin; it is heard at the next contact, about a sync interval
+    /// later, so the refusal is transient. Fails closed: such a peer may be of
+    /// an older build.
+    Unheard(Vec<NodeId>),
+}
+
+impl PeerNet {
+    /// The net over `view` for the capability `has` reads from a block.
+    ///
+    /// **Precedence: a held block that says no decides.** A peer known to lack
+    /// the capability closes the gate for a roll or longer whatever the other
+    /// peers are, so it is named first; only when none says no does a peer not
+    /// heard from yet make the refusal a transient one.
+    pub fn of(view: &crate::membership::PeerView, has: impl Fn(&Facts) -> bool) -> Self {
+        let refused = refusing_peers(view, has);
+        if !refused.is_empty() {
+            return Self::Refused(refused);
+        }
+        let unheard = unheard_peers(view);
+        if !unheard.is_empty() {
+            return Self::Unheard(unheard);
+        }
+        Self::Open
+    }
+
+    /// The peers it names: those that refuse, or those not heard from.
+    pub fn peers(&self) -> &[NodeId] {
+        match self {
+            Self::Open => &[],
+            Self::Refused(peers) | Self::Unheard(peers) => peers,
+        }
+    }
+}
+
+/// The live peers this member holds no block from, in node-id order: not heard
+/// from yet since they came up, or dropped on a SWIM rename or rejoin (ADR-201).
+/// What a block would say is not known for them.
+pub fn unheard_peers(view: &crate::membership::PeerView) -> Vec<NodeId> {
+    view.live.iter().filter(|node| !view.blocks.contains_key(node)).copied().collect()
+}
+
+/// The live peers whose held block does not say `has`, in node-id order: a block
+/// that says otherwise, or says nothing of it. A live peer with no block held is
+/// not one of them ([`unheard_peers`]).
+pub fn refusing_peers(
+    view: &crate::membership::PeerView,
+    has: impl Fn(&Facts) -> bool,
+) -> Vec<NodeId> {
     view.live
         .iter()
-        .filter(|node| {
-            !view.blocks.get(node).is_some_and(|held| held.facts.decimal128 == Some(true))
-        })
+        .filter(|node| view.blocks.get(node).is_some_and(|held| !has(&held.facts)))
         .copied()
         .collect()
 }
 
-/// The live peers that do not advertise [`Facts::idempotency_records`] as
-/// `Some(true)`, in node-id order: a peer whose block says otherwise or says
-/// nothing of it (a build older than 0.52, which relays a keyed write without
-/// its record), and **a live peer this member holds no block from yet, which
-/// fails closed**. A member SWIM does not list live is not asked, as for
-/// [`decimal128_blockers`]: one that is down cannot be seen, which is why the
-/// operator's switch comes first and this is a net, not a check.
-pub fn idempotency_records_blockers(view: &crate::membership::PeerView) -> Vec<NodeId> {
-    view.live
-        .iter()
-        .filter(|node| {
-            !view.blocks.get(node).is_some_and(|held| held.facts.idempotency_records == Some(true))
-        })
-        .copied()
-        .collect()
+/// Whether a block says it can hold a `Decimal128` id and bound (ADR-238):
+/// `Some(true)`, and nothing else.
+pub fn says_decimal128(facts: &Facts) -> bool {
+    facts.decimal128 == Some(true)
+}
+
+/// Whether a block says it carries idempotency records (ADR-240): `Some(true)`,
+/// and nothing else.
+pub fn says_idempotency_records(facts: &Facts) -> bool {
+    facts.idempotency_records == Some(true)
+}
+
+/// The `Decimal128` gate's live-peer net (ADR-238): [`PeerNet::of`] over
+/// [`Facts::decimal128`].
+pub fn decimal128_net(view: &crate::membership::PeerView) -> PeerNet {
+    PeerNet::of(view, says_decimal128)
+}
+
+/// The idempotency-key gate's live-peer net (ADR-240 item 7): [`PeerNet::of`]
+/// over [`Facts::idempotency_records`]. A build older than 0.52 relays a keyed
+/// write without its record, which is what the net keeps keys away from.
+pub fn idempotency_records_net(view: &crate::membership::PeerView) -> PeerNet {
+    PeerNet::of(view, says_idempotency_records)
+}
+
+/// Every live peer that keeps the `Decimal128` gate closed, in node-id order: a
+/// held block that says no **and** a live peer not heard from, whichever the
+/// gate names. What the WARN that a decimal `_id` exists here reads
+/// (`Members::decimal128_warn_due`), which names an unheard peer only once it
+/// has been unheard for more than a lease.
+pub fn decimal128_blockers(view: &crate::membership::PeerView) -> Vec<NodeId> {
+    let mut blockers = refusing_peers(view, says_decimal128);
+    blockers.extend(unheard_peers(view));
+    blockers.sort_unstable();
+    blockers
 }
 
 /// One value per class of owned work.
@@ -963,6 +1043,43 @@ mod tests {
 
     fn held(collection: u64) -> TtlHeld {
         TtlHeld { collection: CollectionId(collection), digest: vec![7; 8] }
+    }
+
+    /// The net's two causes are separate sets: a live peer with no block held is
+    /// unheard and never refusing, a held block that does not say the capability
+    /// is refusing and never unheard, and a peer that is not live is neither. The
+    /// net names the refusers whenever there are any, the unheard otherwise.
+    #[test]
+    fn the_net_tells_a_peer_not_heard_from_apart_from_one_that_says_no() {
+        let members = cluster(&[2, 3, 4]);
+        // 2 says it carries records and can hold a decimal; 3 is an older build
+        // (its block says neither); 4 has sent nothing.
+        let both = Facts { decimal128: Some(true), idempotency_records: Some(true), ..block() };
+        members.record_peer_facts_for_test(node(2), both, Duration::ZERO);
+        members.record_peer_facts_for_test(node(3), block(), Duration::ZERO);
+        // A block from a member that is not live is neither.
+        members.record_peer_facts_for_test(node(9), block(), Duration::ZERO);
+        let view = members.view();
+        assert_eq!(unheard_peers(&view), vec![node(4)]);
+        assert_eq!(refusing_peers(&view, says_idempotency_records), vec![node(3)]);
+        assert_eq!(refusing_peers(&view, says_decimal128), vec![node(3)]);
+        assert_eq!(idempotency_records_net(&view), PeerNet::Refused(vec![node(3)]), "no decides");
+        assert_eq!(decimal128_net(&view), PeerNet::Refused(vec![node(3)]));
+        assert_eq!(decimal128_blockers(&view), vec![node(3), node(4)], "the WARN reads both");
+
+        // 3 upgrades: 4 alone is left, unheard.
+        let carries = Facts { idempotency_records: Some(true), ..block() };
+        members.record_peer_facts_for_test(node(3), carries, Duration::ZERO);
+        let view = members.view();
+        assert_eq!(idempotency_records_net(&view), PeerNet::Unheard(vec![node(4)]));
+        assert_eq!(idempotency_records_net(&view).peers(), &[node(4)]);
+        assert_eq!(decimal128_net(&view), PeerNet::Refused(vec![node(3)]), "per capability");
+
+        // 4 is heard: open for records.
+        let carries = Facts { idempotency_records: Some(true), ..block() };
+        members.record_peer_facts_for_test(node(4), carries, Duration::ZERO);
+        assert_eq!(idempotency_records_net(&members.view()), PeerNet::Open);
+        assert!(PeerNet::Open.peers().is_empty());
     }
 
     fn block() -> Facts {
