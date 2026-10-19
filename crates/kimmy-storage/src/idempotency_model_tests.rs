@@ -171,6 +171,8 @@
 //! it where it happens: a restore never claims more of another origin than its backup
 //! held. `generated_schedules_short` counts a schedule whose first failure is BR1 as the
 //! known defect until the fix lands; the long run lists it, for the classify script.
+//! `IDEM_NO_BR1=1` counts it instead, and the relay class it leads to in that schedule,
+//! for a diagnostic run past it (never a gate; removed with the fix).
 //!
 //! **Reproducers**, both run (not ignored) and pass since their fixes landed:
 //! `finding_g1_*` (G1 as first reported: its pull serves the window without the sender's
@@ -703,6 +705,9 @@ pub(crate) struct Outcome {
     pub rewound_reopened: usize,
     /// Records removed with their rows left (orphan rows).
     pub orphaned: usize,
+    /// Restores that claimed coverage their backup did not hold, counted under
+    /// `IDEM_NO_BR1=1` (finding BR1).
+    pub br1: usize,
     /// Replay pages whose cursor's delta met a changed record too large for it.
     pub delta_too_large: usize,
     /// Records cursors dropped for that, the position's records read again from a fresh
@@ -736,6 +741,12 @@ fn trace() -> bool {
 /// landed; `IDEM_LENIENT=1` counts it instead, for a tree without that fix.
 fn strict() -> bool {
     !std::env::var("IDEM_LENIENT").is_ok_and(|v| v == "1")
+}
+
+/// `IDEM_NO_BR1=1`: finding BR1 at a restore is counted, and the relay class after it
+/// counted rather than failed in that schedule (a diagnostic run only, past BR1).
+fn no_br1() -> bool {
+    std::env::var("IDEM_NO_BR1").is_ok_and(|v| v == "1")
 }
 
 /// `IDEM_NO_REWIND=1`: generated schedules take no rewind (a diagnostic run only).
@@ -2608,7 +2619,17 @@ impl World {
                     self.hlc(at),
                     self.hlc(then)
                 );
-                self.fail(Inv::I2, s);
+                if no_br1() {
+                    // The diagnostic run: counted, and the relay class it leads to (an
+                    // effect held without its record, here and wherever it is relayed)
+                    // counted from here on rather than failed, so the run goes on to
+                    // see everything else.
+                    self.out.br1 += 1;
+                    self.strict = false;
+                    self.note(format!("{s} (IDEM_NO_BR1: counted)"));
+                } else {
+                    self.fail(Inv::I2, s);
+                }
             }
         }
         // The algebra's sets are the backup's: what the store held then.
@@ -4910,6 +4931,7 @@ struct Sweep {
     rewound_removed: usize,
     rewound_reopened: usize,
     orphaned: usize,
+    br1: usize,
     delta_too_large: usize,
     cursor_dropped: usize,
     replay_unfit: usize,
@@ -4980,6 +5002,7 @@ fn sweep_listing(
                         t.rewound_removed += out.rewound_removed;
                         t.rewound_reopened += out.rewound_reopened;
                         t.orphaned += out.orphaned;
+                        t.br1 += out.br1;
                         t.delta_too_large += out.delta_too_large;
                         t.cursor_dropped += out.cursor_dropped;
                         t.replay_unfit += out.replay_unfit;
@@ -5024,7 +5047,8 @@ fn sweep_listing(
          records cursors started over, {} records offered past their window (m2); {} \
          rewinds ({} records removed, {} reopened), {} records orphaned; {} replay deltas \
          too large for their page ({} cursors dropped, their position read again), {} replay \
-         pages unfit; in {:.1?}",
+         pages unfit; {} restores past their backup's coverage (BR1, counted under \
+         IDEM_NO_BR1); in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -5054,6 +5078,7 @@ fn sweep_listing(
         totals.delta_too_large,
         totals.cursor_dropped,
         totals.replay_unfit,
+        totals.br1,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
