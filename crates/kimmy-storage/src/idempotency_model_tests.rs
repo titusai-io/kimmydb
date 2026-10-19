@@ -5053,7 +5053,8 @@ impl Gen {
     ///   counter on one member, then another under its key on a member without its
     ///   record, which pulls the first between its first two chunks: the record turns
     ///   contested there and the request stops partially applied.
-    /// - **Records alone** (two fifths of the seeds): a frame of two or three units, a
+    /// - **Records alone** (half the seeds): a frame of one to three units (one, most often: a
+    ///   page whose unvouched records alone fill it is unfit), a
     ///   member and its first peer backed up at the start, and the member restored two
     ///   thirds in; in half of them its first peer is restored between the replay's first
     ///   two pages (a cursor of another epoch), and in a third of them the cursor's delta
@@ -5119,7 +5120,7 @@ impl Gen {
             ops.splice(at..at, block);
         }
         if self.rng.chance(50) {
-            bias.frame = self.rng.pick(&[1, 1, 2, 3]);
+            bias.frame = self.rng.pick(&[1, 1, 1, 2, 3]);
             let m = self.rng.below(self.n as u64) as u8;
             let m = if self.track == Track::Home && m == self.home { (m + 1) % self.n } else { m };
             let peer = (0..self.n).find(|o| *o != m).expect("two members");
