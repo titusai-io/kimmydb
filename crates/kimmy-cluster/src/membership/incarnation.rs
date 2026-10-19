@@ -193,6 +193,20 @@ mod tests {
         assert_eq!(IncarnationFile::begin(dir.path()).current(), TOO_LARGE, "the last value taken");
     }
 
+    /// A file that is there but cannot be read (here a directory stands at its
+    /// path, which no write can replace either) starts at 0 and never refuses
+    /// the start.
+    #[test]
+    fn a_file_that_cannot_be_read_starts_at_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(FILE)).unwrap();
+        let mut file = IncarnationFile::begin(dir.path());
+        assert_eq!(file.current(), 0);
+        file.record(1);
+        assert_eq!(file.current(), 1, "the member goes on with the renewed identity");
+        assert!(dir.path().join(FILE).is_dir(), "nothing was written over it");
+    }
+
     #[test]
     fn a_directory_that_cannot_take_the_file_still_starts() {
         let dir = tempfile::tempdir().unwrap();
