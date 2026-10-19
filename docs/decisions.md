@@ -29467,25 +29467,26 @@ beside the loop*: needs the loop's `PeerStalls`. *Carry the block over SWIM*: a 
 (postcard is not self-describing, ADR-242's alternatives), and a block can outgrow a datagram. *No debounce*: a flapping
 member would cost a contact per flap, and a restart after a down declaration two.
 
-**Tests.** `membership::tests`: one ask per member per interval, each member on its own, from its own last ask; an
-ask the interval holds owes one trailing ask only after a drop, one pending, started at the address the member is live
-at then and not at all if it is not live. `exchange::tests`: an exchange leaves each side holding the other's block and
-the asker the answerer's echo of its own; one with a member not serving fails at the dial and records nothing; one
-with a member that completes the handshake and never answers ends at its bound; the driver runs what is asked, runs an
-ask made before it started, carries the block as it is at each ask, holds the next ask for the interval after a failed
-exchange, starts a trailing ask when it is due, and ends when its guard is dropped. The simulation rows above.
-`kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync interval, one restarted three
-times with SIGTERM; every member's `kimmy_ownership_peers{state="unknown"}` is sampled every 10 ms and no run above 0
-lasts a second. Mutation rows in bash, each failing a test with only that change: no ask on `Up`; none on `Rename`; no
-exchange at all (the simulation and the real-process test); the ask before the rename's drop; no debounce; the
-debounce keyed for every member at once; no ask at the own rejoin; the rejoin's asks before its clear; the interval
-inclusive; the driver not started; the answer's block not recorded; the request without a block; the answer's echo not
-noted; `AskVersions` without the witnessed flag; the driver dropping its asks; no trailing ask; a trailing ask owed
-with no drop; more than one pending; one due at once; a drop, or a clear, not marked; one started for a member not
-live; the driver's timer never starting one; the driver not aborted with its guard; a failed exchange clearing the
-member's last ask; the block read once for every ask; no bound on the frame pair; asks made before the driver starts
-dropped; a trailing ask that starts nothing clearing the drop it owed. One more is argued unobservable (not
-equivalent) rather than run: recording the answer at a sequence taken when it is recorded instead of when it decoded.
-The two are taken in one poll with no await between them, so they can differ only by a decode or a drop another thread
-makes in the same synchronous stretch, which no test can place there; in that stretch the mutant would keep a block
-decoded before a drop, which the floor exists to refuse. The simulation pins the ask after the drop, not this choice.
+**Tests.** `membership::tests`: one ask per member per interval, each member on its own, from its own last ask; an ask
+the interval holds owes one trailing ask only after a drop, one pending, started at the address the member is live at
+then and not at all if it is not live; one due while the member is down keeps the drop it owed. `exchange::tests`: an
+exchange leaves each side holding the other's block and the asker the answerer's echo of its own; one with a member not
+serving fails at the dial and records nothing; one with a member that completes the handshake and never answers ends at
+its bound; the driver runs what is asked, runs an ask made before it started, carries the block as it is at each ask,
+holds the next ask for the interval after a failed exchange, starts a trailing ask when it is due, and ends when its
+guard is dropped. The simulation rows above. `kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync
+interval, one restarted three times with SIGTERM; every member's `kimmy_ownership_peers{state="unknown"}` is sampled
+every 10 ms and no run above 0 lasts a second. Mutation rows in bash, each failing a test with only that change: no ask
+on `Up`; none on `Rename`; no exchange at all (the simulation and the real-process test); the ask before the rename's
+drop; no debounce; the debounce keyed for every member at once; no ask at the own rejoin; the rejoin's asks before its
+clear; the interval inclusive; the driver not started; the answer's block not recorded; the request without a block; the
+answer's echo not noted; `AskVersions` without the witnessed flag; the driver dropping its asks; no trailing ask; a
+trailing ask owed with no drop; more than one pending; one due at once; a drop, or a clear, not marked; one started for
+a member not live; the driver's timer never starting one; the driver not aborted with its guard; a failed exchange
+clearing the member's last ask; the block read once for every ask; no bound on the frame pair; asks made before the
+driver starts dropped; a trailing ask that starts nothing clearing the drop it owed. One more is argued unobservable
+(not equivalent) rather than run: recording the answer at a sequence taken when it is recorded instead of when it
+decoded. The two are taken in one poll with no await between them, so they can differ only by a decode or a drop another
+thread makes in the same synchronous stretch, which no test can place there; in that stretch the mutant would keep a
+block decoded before a drop, which the floor exists to refuse. The simulation pins the ask after the drop, not this
+choice.
