@@ -1592,7 +1592,7 @@ impl Engine {
         };
 
         // Records with no log of this node over them (a restore, an identity
-        // reset) begin the log, with a new epoch, before any page is cut (m4).
+        // reset) begin the log, with a new epoch, before any page is cut.
         crate::idempotency::begin_log_over_held_records(&engine)?;
 
         // A drop a restart interrupted is announced here and finished by the

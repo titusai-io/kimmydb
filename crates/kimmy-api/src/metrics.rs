@@ -555,7 +555,7 @@ pub struct MetricsSnapshot {
     pub idempotency_records_received: [u64; RECORDS_RECEIVED_VIA.len()],
     pub idempotency_records_undecodable: u64,
     /// Records that fit no frame or replay page that must carry them, by
-    /// `kimmy_cluster::UnfitPath` (m1 of the B5 build review).
+    /// `kimmy_cluster::UnfitPath` (ADR-240, records too many for a frame).
     pub idempotency_records_unfit: [u64; 3],
     pub idempotency_records_collected: u64,
     /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
@@ -5161,7 +5161,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_storage::DEFINITION_RESULTS.len()
                 // Keyed requests by outcome, peer replays, the records held, the
                 // records received by way, undecodable and collected (ADR-240), and
-                // those that fit no frame, by path (m1).
+                // those that fit no frame, by path.
                 + crate::idempotency::KeyedOutcome::ALL.len()
                 + 1
                 + 1

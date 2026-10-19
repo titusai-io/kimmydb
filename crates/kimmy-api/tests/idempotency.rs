@@ -809,7 +809,7 @@ async fn the_version_publishes_the_window() {
     assert_eq!(version.body["idempotencyWindowSecs"], 3_600);
 }
 
-/// Every series B5 adds is on the page from the start, at zero, the ones the
+/// Every series idempotency keys add is on the page from the start, at zero, the ones the
 /// storage half feeds included: a series that appears only once something
 /// happens is one a dashboard cannot be built on.
 #[tokio::test]
@@ -1169,7 +1169,7 @@ async fn a_different_request_under_a_remembered_key_is_refused_and_writes_nothin
 /// The record a peer would send for another request under `key` (another
 /// fingerprint, stamped just below this member's, from another member), stored
 /// here as replication stores it: the two meet in the merge, and the record
-/// turns contested (KR). Returns the record as stored.
+/// turns contested. Returns the record as stored.
 fn contest(engine: &Engine, key: &str) -> kimmy_storage::IdempotencyRecord {
     let orders = engine.get_collection("shop", "orders").unwrap();
     let scope = kimmy_core::IdempotencyKey::from_raw(key).unwrap().scope_hash("local:root");
@@ -1192,7 +1192,7 @@ fn contest(engine: &Engine, key: &str) -> kimmy_storage::IdempotencyRecord {
     stored
 }
 
-/// KR at the edge: a key two members accepted for two requests, whose records
+/// A contested key at the edge: a key two members accepted for two requests, whose records
 /// met here in a merge, is refused for every retry, `422
 /// idempotency_key_reused`, `retry: no`, writing nothing and never replayed,
 /// though the merged record carries this request's own fingerprint and first

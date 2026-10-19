@@ -213,12 +213,12 @@ fn record_bytes(record: &kimmy_storage::CarriedRecord) -> Option<usize> {
 }
 
 /// What a window none of whose entries fits with the records riding it carries
-/// instead (m1 of the build review): its F3 records and the riders that fit, in
+/// instead (ADR-240): its F3 records and the riders that fit, in
 /// carrying order, as a **partial window of records alone** that ends just
 /// before the first rider left out, or before its first entry when every rider
 /// at or before that entry fits. Every record with a row the shorter coverage
 /// reaches is among them, since a record is carried at the lowest of its rows
-/// the window found (B1).
+/// the window found.
 ///
 /// `None` when not even the F3 records fit, when no rider does, or when that end
 /// is not past `floor`, the successor of where the request's scan began: such a
@@ -420,12 +420,12 @@ fn record_key(record: &kimmy_storage::CarriedRecord) -> RecordKey {
 /// `cursor` where an earlier page of records alone at `from` left off.
 ///
 /// **The records** (ADR-240): the F3 records, those with a row of the requester's
-/// origin inside the page ([`records_of_replay`]), and B2's, every live record
-/// of the page's collections whose request spans it, carried at its `first`
+/// origin inside the page ([`records_of_replay`]), and the spanning records,
+/// every live record of the page's collections whose request spans it, carried at its `first`
 /// (`Engine::records_for_replay_page`). Each once, at the lowest carrying stamp
-/// among them (B1).
+/// among them.
 ///
-/// **The cut** (m1): all of it when it fits a frame; else the leading entries
+/// **The cut**: all of it when it fits a frame; else the leading entries
 /// that fit with the records riding them; else, when no entry fits with the
 /// records riding the first, a **page of records alone**: the F3 records and,
 /// in key order, as many of the rest as fit, the position unchanged and a records
@@ -764,8 +764,8 @@ fn cut_replay_page_from(
 }
 
 /// The `KIMMY_TEST`-style switch that makes the listed members send every frame
-/// and page **without** records, as a release before 0.52 does (C9 of the B5
-/// design): the in-process mixed-version test strips one member's sender.
+/// and page **without** records, as a release before 0.52 does: the
+/// in-process mixed-version test strips one member's sender.
 /// Process-wide, keyed by the serving member's node id, so two tests in one
 /// process do not share it.
 static TEST_STRIP_RECORDS: std::sync::RwLock<Vec<kimmy_core::NodeId>> =
@@ -1795,8 +1795,8 @@ where
 
                 // A page of the peer's replay of its own origin (ADR-212), which this
                 // side cuts to the frame itself, with the records the page's
-                // collections need (B2) and, when they do not fit with its first
-                // entry, as a page of records alone (m1). A member a test has made
+                // collections need and, when they do not fit with its first
+                // entry, as a page of records alone. A member a test has made
                 // an older release ignores the ask, as 0.51 does.
                 if replay && !strips_records(engine.node_id()) {
                     let cut = cut_replay_page(
@@ -1861,7 +1861,7 @@ where
                         .await?
                     }
                     Fits::Only(0) => {
-                        // No entry fits with the records riding the first (m1): a
+                        // No entry fits with the records riding the first: a
                         // partial window of records alone, ending before the first
                         // rider left out, when the peer can take one and it ends past
                         // where the peer's scan began. Its coverage reaches only the
@@ -1981,7 +1981,7 @@ where
                 // (ADR-152); resumed from wherever the requester says.
                 let page = match engine.snapshot_page(after, collection) {
                     // A member a test has made an older release sends no
-                    // records and no records position (C9 of the B5 design).
+                    // records and no records position, as 0.51 does.
                     Ok(mut page) if strips_records(engine.node_id()) => {
                         page.records.clear();
                         page.records_epoch = None;
@@ -2504,7 +2504,7 @@ where
     }
     let mut limit = MAX_BATCH;
     // Where the replay stands in records at `from`, as the last page of records
-    // alone stored here said (m1).
+    // alone stored here said.
     let mut replay_records = catch_up.replay_records(their_node);
     loop {
         // Everything of every other origin is "held", so the peer's walk passes
@@ -2709,7 +2709,7 @@ pub(crate) fn replay_apply(
     }
     if lost.is_empty() && !records.is_empty() {
         // The records of a page with no lost entries are stored all the same: a
-        // page of records alone (m1) carries what a later page's entries need,
+        // page of records alone carries what a later page's entries need,
         // and a record held already writes nothing (ADR-240).
         let outcome = kimmy_storage::blocking(|| {
             engine.apply_batch_carrying(&[], records, kimmy_storage::RecordsVia::Replay)
@@ -2923,7 +2923,7 @@ where
     let counters = replay_counters();
     let mut from = asked;
     let mut sent_pages = 0usize;
-    // Where the replay stands in records at `from` (m1): as the last page of
+    // Where the replay stands in records at `from`: as the last page of
     // records alone the peer acknowledged left it, on this contact or an earlier.
     let mut records_cursor = asked_records.filter(|records| records.at == from);
     loop {
@@ -2984,8 +2984,8 @@ where
                     .filter(|entry| entry.stamp.node == their_node && entry.stamp.hlc > from)
                     .collect();
                 // This side sizes the page: the peer cannot negotiate a limit. With
-                // the records the page's collections need (B2), and as a page of
-                // records alone when they do not fit with its first entry (m1).
+                // the records the page's collections need, and as a page of
+                // records alone when they do not fit with its first entry.
                 let cut = cut_replay_page(
                     engine,
                     &peer,
@@ -5434,7 +5434,7 @@ impl PeerStalls {
     /// plans, and the size gate on top), however much the collection has grown by then
     /// (repair design section 2.6).
     ///
-    /// **Rows, not pages** (ADR-240, the build review's m6): a page is cut by its byte budget
+    /// **Rows, not pages** (ADR-240): a page is cut by its byte budget
     /// (`kimmy_storage::SNAPSHOT_PAGE_BYTES`) as well as at `SNAPSHOT_PAGE` rows, so a page
     /// of large documents carries fewer, and a records phase sends pages with no row at
     /// all; counted in pages, either would end the repair before it had walked the
@@ -10659,7 +10659,7 @@ mod tests {
         panic!("the repair did not end in 16 rounds");
     }
 
-    /// The build review's m6, with the byte budget: a collection of 140 documents of
+    /// A Converge repair counts rows, with the byte budget: a collection of 140 documents of
     /// about 1 MiB, which pages hold about 63 of each, converges whole. Counted in
     /// pages, the bound the planner gives it (140 / 512 + 2 = 2 pages) ended the
     /// repair after about 126; counted in rows it carried, it walks all 140.
@@ -10673,7 +10673,7 @@ mod tests {
         assert_eq!(stale_left(&b, docs), 0, "every document repaired");
     }
 
-    /// The build review's m6: a Converge repair's records phase sends pages with no
+    /// A Converge repair's records phase sends pages with no
     /// row, and they spend none of its bound. 1,030 stale documents, each with two
     /// keyed writes' records (2,060 records, four pages of them): counted in pages
     /// the bound (4) was spent on records and no document was repaired; counted in
@@ -10964,7 +10964,7 @@ mod tests {
         tokio::join!(serving, pulling)
     }
 
-    /// The requester's guard on the zero records base (m4, guard ii), through the
+    /// The requester's guard on the zero records base after a restore, through the
     /// listener and `pull_snapshot`: the sender held no records when the pull
     /// began, so the first page carried the zero base; it is then restored from a
     /// backup that holds a keyed `$inc` on a document of the next page, whose open

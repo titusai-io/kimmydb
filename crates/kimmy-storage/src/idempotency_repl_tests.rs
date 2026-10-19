@@ -855,11 +855,11 @@ fn a_window_ships_a_record_at_its_own_row_not_at_one_an_earlier_record_left() {
     assert_eq!(shipped[0].carrying, Some(now.first), "at its own row, not the earlier one's");
 }
 
-/// A record found again at a lower row is carried there (B1 of the build
-/// review), but only at a row of its own: a row another record under its key
-/// left below its `first` lowers nothing. Here that row is planted at an origin
-/// that sorts after the record's own, so F2 reads it after the record was
-/// shipped at its own row.
+/// A record found again at a lower row is carried there (a window ships a
+/// record at its lowest row), but only at a row of its own: a row another
+/// record under its key left below its `first` lowers nothing. Here that row is
+/// planted at an origin that sorts after the record's own, so F2 reads it after
+/// the record was shipped at its own row.
 #[test]
 fn a_row_below_the_records_first_found_later_does_not_lower_its_carrying_row() {
     let a = member();
@@ -971,7 +971,7 @@ fn a_batch_that_ends_early_leaves_the_records_past_its_end() {
     assert_eq!(b.engine.idempotency_record(again.id, &k.scope).unwrap(), Some(earlier));
 }
 
-// -- D2, D3 and KR across members (ruling A, the `contested` flag) -------------------------------
+// -- A drop, a resume across a drop and a contested key across members -------------------------
 
 /// `$inc` of every counter from 0 to `n`, on `coll` at `on`, one chunk a pair.
 fn counters_on(on: &Engine, coll: &CollectionMeta, n: i64) {
@@ -1003,12 +1003,13 @@ fn restart(m: Member) -> Member {
     Member { engine: Arc::new(Engine::open(&path).unwrap()), _dir }
 }
 
-/// D2 under ruling A. A applies an `$inc` of every counter and B takes it with its
-/// record; A drops `orders`; B, before it hears of the drop, writes counter 0
-/// (unkeyed) on top of its version, which carries the `$inc`, stamped after the
-/// drop. B then takes the drop, which keeps that write (ADR-236). A retry on B
-/// replays the record: the request never lands twice on counter 0. Under the life
-/// rule the record was history there, and the retry incremented counter 0 again.
+/// A retry after a drop, records outliving it. A applies an `$inc` of every
+/// counter and B takes it with its record; A drops `orders`; B, before it hears
+/// of the drop, writes counter 0 (unkeyed) on top of its version, which carries
+/// the `$inc`, stamped after the drop. B then takes the drop, which keeps that
+/// write (ADR-236). A retry on B replays the record: the request never lands
+/// twice on counter 0. Under the life rule the record was history there, and
+/// the retry incremented counter 0 again.
 #[test]
 fn d2_a_retry_after_a_drop_replays_and_never_doubles() {
     let (a, b, ca, cb) = pair();
@@ -1033,7 +1034,7 @@ fn d2_a_retry_after_a_drop_replays_and_never_doubles() {
     assert_eq!(n_of(&b.engine, &life, 0), 1, "the $inc landed once on counter 0");
 }
 
-/// D3 under ruling A, the stamp rule's contract across a drop. A applies an
+/// A resume across a drop, records outliving it: the stamp rule's contract. A applies an
 /// `$inc` of every counter; B drops `orders` and creates it again with fresh
 /// counters; C, before it hears of either, applies the same request, stamped
 /// after the drop, and stops after its first chunk. C takes A's effect and
@@ -1081,7 +1082,7 @@ fn d3_a_resume_after_a_drop_leaves_what_is_at_or_above_its_merged_first() {
     assert!(out.skipped >= 3, "the new life's counters, left and counted: {out:?}");
 }
 
-/// KR: r0 and r1 are two `$inc`s of every counter under one key (two
+/// A contested key: r0 and r1 are two `$inc`s of every counter under one key (two
 /// fingerprints). C applies r0; A, without r0's record, applies r1 and stops
 /// after its first chunk; A then takes r0's effect and record from C, and the
 /// two records merge contested. A retry of r1 on A is refused (422), and nothing

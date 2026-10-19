@@ -19,7 +19,7 @@ path = "src/main.rs"
 # it, up to 17% of throughput at 64 concurrent clients (docs/operations.md).
 storage-cache-metrics = ["kimmy-api/storage-cache-metrics"]
 # The lab's loss of one replicated entry (`KIMMY_TEST_DROP_APPLY`): a Dockerfile build argument.
-# Also the B5 cluster tests' member that behaves as a release before 0.52
+# Also the idempotency cluster tests' member that behaves as a release before 0.52
 # (`KIMMY_TEST_STRIP_RECORDS`) and a keyed `multi` request held between two chunks
 # (`KIMMY_TEST_HOLD_BETWEEN_CHUNKS`, through the storage crate's `test-hooks`).
 # Never in a release artifact (`strings kimmyd | grep -c` of each name reads 0).

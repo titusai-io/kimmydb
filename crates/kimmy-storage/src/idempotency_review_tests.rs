@@ -1,6 +1,5 @@
-//! The tests the B5 build review's M1 found missing: each kills a mutant that
-//! survived every branch suite (`docs/adr-240-mutation-rows.md`, "M1 of the
-//! build review"). Retention of every record and of the change log, the change
+//! Tests that each kill a mutant which survived every branch suite
+//! (`docs/adr-240-mutation-rows.md`). Retention of every record and of the change log, the change
 //! log across a pull's pages, and a records-only page cut inside a records phase.
 //! The fifth, a replay page's F3 records, is in
 //! `kimmy-cluster/src/transport/replay_tests.rs`.
@@ -118,14 +117,15 @@ fn three_pages(y: &Engine, target: i64) -> CollectionMeta {
     cy
 }
 
-/// X07 and X05 (N3) of the build review's M1. After every record has passed its
-/// window, one retention pass leaves the three tables empty, the change log
-/// keeping only where it began: local single- and multi-commit records, a merged
-/// record whose `first` and `last` are of two origins, a frame-stored record with
-/// a carrying row of a third origin, a page-stored one, an undecodable one (a
-/// newer format) with one row, a delete, a `find_and_modify`, and an orphan row.
-/// Retention reading only the first origin with rows leaves the others' records;
-/// a change log never trimmed keeps its rows.
+/// Retention reads every origin's records and trims the change log. After every
+/// record has passed its window, one retention pass leaves the three tables
+/// empty, the change log keeping only where it began: local single- and
+/// multi-commit records, a merged record whose `first` and `last` are of two
+/// origins, a frame-stored record with a carrying row of a third origin, a
+/// page-stored one, an undecodable one (a newer format) with one row, a delete,
+/// a `find_and_modify`, and an orphan row. Retention reading only the first
+/// origin with rows leaves the others' records; a change log never trimmed
+/// keeps its rows.
 #[test]
 fn everything_expires_and_nothing_is_left() {
     let dir = tempfile::tempdir().unwrap();
@@ -210,7 +210,7 @@ fn everything_expires_and_nothing_is_left() {
     assert_eq!((records, rows, log), (0, 0, 1), "only the log's beginning stays");
 }
 
-/// The change log's trim (X05 of the build review's M1): a pass drops the log's
+/// The change log's trim: a pass drops the log's
 /// rows older than the record window and keeps the newer ones and where the log
 /// began, so a page base cut before the pass still reads what changed since.
 #[test]
@@ -244,7 +244,7 @@ fn retention_trims_the_change_log_below_the_window_and_keeps_its_beginning() {
     assert!(kept.1.is_some_and(|high| high >= later.hlc), "the newer row stays: {kept:?}");
 }
 
-/// N1 of the build review's M1. A retention pass inside the record window, run
+/// A retention pass inside the record window, run
 /// while a pull is part-way, keeps the change-log rows the next page's delta
 /// reads: a pass that trimmed the whole log would leave the next page with an
 /// empty delta, and the page would bring the effect without its record.
@@ -271,7 +271,7 @@ fn a_retention_pass_during_a_pull_keeps_the_log_the_next_page_reads() {
     retry_must_replay(&x, &cx, &k, target);
 }
 
-/// M13a of the build review's M1. A records-only page cut while the cursor stands
+/// A records-only page cut while the cursor stands
 /// inside a collection's records phase keeps that position: the rest of the phase
 /// still comes. Dropping it skipped the rest of the collection's records, and its
 /// documents came without them.

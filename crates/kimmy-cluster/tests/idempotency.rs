@@ -350,7 +350,7 @@ impl ModifySpec for IncAll {
     }
 }
 
-/// The stamp rule on a fresh attempt (Chris's ruling on S departure 1): a keyed
+/// The stamp rule on a fresh attempt (Chris's ruling, 2026-10-17): a keyed
 /// multi-chunk `$inc` on A, two documents a chunk, races two unrelated writers
 /// between its first and second chunk, one on B (pulled into A before the next
 /// chunk) and one on A itself. Each document they wrote is left alone and

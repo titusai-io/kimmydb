@@ -360,7 +360,7 @@ pub struct IdempotencyRecord {
     pub origin: NodeId,
     pub state: RecordState,
     pub outcome: RecordOutcome,
-    /// **Two requests met under the key** (KR): two members accepted it for
+    /// **Two requests met under the key** (contested): two members accepted it for
     /// requests with two fingerprints, and their records merged. Every retry of
     /// either is refused ([`StorageError::IdempotencyKeyReused`]), for the
     /// record's window. Set by [`Self::merge`], beside `first` and never by the
@@ -1147,8 +1147,8 @@ fn log_change(
 /// "a log that has held nothing") on its next page, and answer a zero base cut
 /// by an earlier store with "nothing changed": a sender restored once from a
 /// backup with records serves a page with the zero base, is restored again from
-/// another, and the next page brings that backup's effect without its record
-/// (m4). Begun here, a base this node cuts names the epoch, and a base cut before
+/// another, and the next page brings that backup's effect without its record.
+/// Begun here, a base this node cuts names the epoch, and a base cut before
 /// the next restore is of another epoch, which restarts its collection from its
 /// records phase. A zero base cut by a sender that held no records, answered
 /// after it was restored with some, is the requester's to refuse
@@ -1490,7 +1490,7 @@ impl RecordsVia {
 /// A frame's records, decoded once for the batch that applies its entries, and
 /// each stored at most once: in the run that takes the first entry of its
 /// collection **at or after the record's row** (`carrying`), or else in the
-/// batch's last transaction, the one that raises the witnessed vector (B5,
+/// batch's last transaction, the one that raises the witnessed vector (ADR-240,
 /// records travel with coverage).
 ///
 /// Not in the run of an entry before the row: a record is stored with the
@@ -1524,7 +1524,7 @@ impl FrameRecords {
     /// `at`: its row is at or before the entry (a record with no row rides with
     /// any). One whose row is past the entry waits for an entry at or after it,
     /// or for the batch's last transaction. With a window carrying each record
-    /// at the lowest of its own rows it found (B1), riding by that row stores it
+    /// at the lowest of its own rows it found, riding by that row stores it
     /// no later than the run that takes the effect there; an effect below it
     /// lies in coverage the receiver held already, for which it holds a version
     /// of the record (INV-C).
@@ -1804,7 +1804,7 @@ impl Engine {
     /// ([`Self::store_record`]: merged with the live record, its rows written,
     /// its stamps witnessed), in a transaction of its own. For a test outside
     /// this crate that needs what only replication brings, such as a record
-    /// two members met in (KR). Returns the record as stored.
+    /// two members met in (a contested record). Returns the record as stored.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn store_peer_record_for_test(
         &self,

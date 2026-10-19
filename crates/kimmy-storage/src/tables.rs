@@ -299,7 +299,7 @@ pub const VECTOR_VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("snapshot_progress");
 
-/// `(collection id, scope hash) -> the idempotency record` (B5,
+/// `(collection id, scope hash) -> the idempotency record` (ADR-240,
 /// `crate::idempotency`): a keyed write's record, written in the write's own
 /// transaction, so it survives exactly what the write survives.
 ///

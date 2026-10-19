@@ -51,7 +51,7 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "gc::Engine::collect_tombstones_within",
     // Retention's read of the idempotency records' rows below its cutoff (ADR-240).
     "idempotency::Engine::collect_idempotency_records",
-    // A replay page's records of its collections (B2 of the B5 build review),
+    // A replay page's records of its collections (the spanning records),
     // which serves no client.
     "idempotency_replay::Engine::replay_records_in",
     // The read ahead of a drop purge chunk, which serves no client: the stop is

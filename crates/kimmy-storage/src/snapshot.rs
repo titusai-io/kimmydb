@@ -640,7 +640,7 @@ pub struct SnapshotApplied {
     /// the base was cut, by a keyed write or by an open over restored records,
     /// and only the first names every record since. Nothing was applied, the
     /// page is not counted, and `progress` now asks for the cursor's collection
-    /// again from its records phase (ADR-240, the build review's m4, guard ii).
+    /// again from its records phase (ADR-240, a zero base after a restore).
     pub records_restarted: bool,
 }
 
@@ -797,7 +797,7 @@ pub struct SnapshotPage {
     )]
     pub records: Vec<crate::idempotency::CarriedRecord>,
     /// The epoch of the sender's change log of idempotency records as this
-    /// page's transaction read it (ADR-240, the build review's m4): on every page,
+    /// page's transaction read it (ADR-240, restores during a pull): on every page,
     /// the last included, from a sender whose log has begun; absent from one
     /// whose log has held nothing.
     ///
@@ -999,8 +999,8 @@ impl SnapshotProgress {
     }
 }
 
-/// The requester's guard on the zero records base (ADR-240, the build review's m4,
-/// guard ii): the cursor `page` was asked with carried the zero base, and the
+/// The requester's guard on the zero records base (ADR-240, a zero base after a
+/// restore): the cursor `page` was asked with carried the zero base, and the
 /// page names an epoch of its sender's change log
 /// ([`SnapshotPage::records_epoch`]), so the log began after the base was cut.
 /// Begun by a keyed write, it names every record changed since, and the page is

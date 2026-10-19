@@ -339,7 +339,7 @@ mod tests {
 
     /// A block dropped while the peer stays live (its SWIM rename, or this
     /// member's own rejoin) makes the refusal `Unheard` again, never `Peers`:
-    /// what the restart window after a roll's restart was (B5's gate window).
+    /// what the restart window after a roll's restart was (the gate window).
     #[test]
     fn a_block_dropped_on_a_rename_or_a_rejoin_is_unheard_again() {
         let members = Members::default();
