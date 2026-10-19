@@ -228,11 +228,9 @@ const REPLAY_FRAME: usize = 4;
 /// transport's frame): a few records, so a delta that does not reach the log's end
 /// moves the cursor's base (m1).
 const REPLAY_DELTA_BYTES: usize = 800;
-/// Whether a replay page whose cursor's delta meets a changed record too large for it
-/// drops the cursor and goes on at its position with a fresh base (Y2's revision, the
-/// wedge alternative), rather than staying with it (Y2 as merged). See
-/// `World::delta_too_large`.
-const Y2_DROPS_THE_CURSOR: bool = false;
+/// A restore of this member, between two pages of a replay, restores the member that
+/// served the page just applied (its change log begins again, with another epoch).
+const SENDER: u8 = u8::MAX;
 
 // -- Schedules ------------------------------------------------------------------------------
 
@@ -513,7 +511,11 @@ impl std::fmt::Display for Op {
             Step::Big { m } => write!(f, "{}.big", l(*m)),
             Step::Backup { m } => write!(f, "{}.backup", l(*m)),
             Step::Restore { m, nth, inner } => {
-                write!(f, "{}.restore", l(*m))?;
+                if *m == SENDER {
+                    write!(f, "the replay page's sender.restore")?;
+                } else {
+                    write!(f, "{}.restore", l(*m))?;
+                }
                 if *nth > 0 {
                     write!(f, " from the backup {nth} before the latest")?;
                 }
@@ -691,8 +693,13 @@ pub(crate) struct Outcome {
     pub orphaned: usize,
     /// Replay pages whose cursor's delta met a changed record too large for it.
     pub delta_too_large: usize,
-    /// Records cursors dropped for that (the Y2 hook, [`Y2_DROPS_THE_CURSOR`]).
+    /// Records cursors dropped for that, the position's records read again from a fresh
+    /// base (Y2).
     pub cursor_dropped: usize,
+    /// Replay pages that could not carry what they must (the model's whole-frame
+    /// refusal: F3 records more than a frame, or a page of records alone that sends
+    /// nothing new): the replay stays at its position for the contact.
+    pub replay_unfit: usize,
 }
 
 type Res<T> = std::result::Result<T, String>;
@@ -856,9 +863,6 @@ struct ReplayCut {
     scanned_to: Hlc,
     exhausted: bool,
     replay_records: Option<crate::ReplayRecords>,
-    /// The page carried nothing and dropped its cursor: the next page goes on at the
-    /// same position with a fresh base (the Y2 hook, [`Y2_DROPS_THE_CURSOR`]).
-    restart_position: bool,
 }
 
 /// How much of a page fits a frame (`transport::Fits`).
@@ -2588,7 +2592,7 @@ impl World {
             if usize::from(*j) > pages {
                 for op in ops {
                     self.note(format!("after the replay: {op}"));
-                    self.apply_between_replay_pages(op, m)?;
+                    self.apply_between_replay_pages(op, m, None)?;
                 }
             }
         }
@@ -2734,7 +2738,25 @@ impl World {
 
     /// A step run between two pages of `m`'s replay: never one that closes, sends to or
     /// pulls into the member replaying (it is marked restored until it has caught up).
-    fn apply_between_replay_pages(&mut self, op: &Op, m: usize) -> Res<()> {
+    fn apply_between_replay_pages(&mut self, op: &Op, m: usize, sender: Option<usize>) -> Res<()> {
+        // A restore of [`SENDER`]: of the member that served the page just applied.
+        let resolved;
+        let op = match (&op.step, sender) {
+            (Step::Restore { m: SENDER, nth, inner }, Some(sender)) => {
+                if self.sched.track == Track::Home && sender == self.sched.home as usize {
+                    self.note("skipped between replay pages: the sender is the home");
+                    return Ok(());
+                }
+                let step = Step::Restore { m: sender as u8, nth: *nth, inner: inner.clone() };
+                resolved = Op { step, t: op.t };
+                &resolved
+            }
+            (Step::Restore { m: SENDER, .. }, None) => {
+                self.note("skipped after the replay: no page's sender to restore");
+                return Ok(());
+            }
+            _ => op,
+        };
         let skip = match &op.step {
             Step::Send { m: at, .. } | Step::Touch { m: at, .. } => *at as usize == m,
             Step::Pull { to, .. } | Step::PullShort { to, .. } | Step::Page { to, .. } => {
@@ -2872,14 +2894,9 @@ impl World {
             for (j, ops) in inner {
                 if usize::from(*j) == *pages {
                     for op in ops {
-                        self.apply_between_replay_pages(op, m)?;
+                        self.apply_between_replay_pages(op, m, Some(peer))?;
                     }
                 }
-            }
-            if cut.restart_position {
-                // The cursor dropped (the Y2 hook): the position again, a fresh base.
-                cursor = None;
-                continue;
             }
             if let Some(next) = cut.replay_records {
                 // A page of records alone: the position stays, the cursor goes on.
@@ -2894,37 +2911,6 @@ impl World {
             from = after;
         }
         Err("a replay that never ended".into())
-    }
-
-    /// A replay page at a records cursor whose delta meets a changed record too large for
-    /// it (the transport's `SnapshotRowTooLarge` arm of `cut_replay_page`).
-    ///
-    /// **Today (Y2 as merged)**: the page carries nothing, counted as unfit, and the
-    /// replay stays at its position with its cursor for this contact: `None`, as every
-    /// page that cannot carry what it must.
-    ///
-    /// **The hook for Y2's revision** (the wedge alternative, not landed): drop the
-    /// cursor and go on at the same position with a fresh base, as a first page there
-    /// cuts one. Set [`Y2_DROPS_THE_CURSOR`] when it lands, so the model follows the
-    /// transport.
-    fn delta_too_large(
-        &mut self,
-        from: Hlc,
-        cursor: Option<crate::ReplayRecords>,
-    ) -> Option<ReplayCut> {
-        let _ = cursor;
-        if !Y2_DROPS_THE_CURSOR {
-            return None;
-        }
-        self.out.cursor_dropped += 1;
-        Some(ReplayCut {
-            entries: Vec::new(),
-            records: Vec::new(),
-            scanned_to: from,
-            exhausted: false,
-            replay_records: None,
-            restart_position: true,
-        })
     }
 
     /// One page of a replay as the transport cuts it (`transport::cut_replay_page`), with
@@ -2947,7 +2933,7 @@ impl World {
         let key =
             |r: &crate::idempotency::CarriedRecord| -> RecordKey { (r.collection.0, r.scope.0) };
         let budget = self.replay_frame;
-        let cursor = cursor.filter(|cursor| cursor.at == from);
+        let mut cursor = cursor.filter(|cursor| cursor.at == from);
         let mut entries = window.entries;
         let mut scanned_to = window.scanned_to;
         let mut exhausted = window.exhausted && window.passed_through.is_none();
@@ -2972,10 +2958,23 @@ impl World {
         ) {
             Ok(read) => read,
             // A record the change log names as changed since the cursor's base, larger
-            // than the delta's half of a page (P2's refusal).
+            // than the delta's half of a page (P2's refusal): as Y2's transport, the
+            // cursor is dropped and the position's records are read again from a fresh
+            // base, which carries the record as an ordinary one on a page of records
+            // alone, what earlier pages at the position sent with it.
             Err(StorageError::SnapshotRowTooLarge { .. }) => {
                 self.out.delta_too_large += 1;
-                return Ok(self.delta_too_large(from, cursor));
+                self.out.cursor_dropped += 1;
+                cursor = None;
+                self.e(peer)
+                    .replay_page_records(
+                        &collections,
+                        from,
+                        through,
+                        None,
+                        self.sched.bias.delta_bytes,
+                    )
+                    .map_err(|e| err("replay_page_records", e))?
             }
             Err(e) => return Err(err("replay_page_records", e)),
         };
@@ -3035,7 +3034,7 @@ impl World {
             let mut records = lead;
             records.extend(rest.into_values().filter(|record| changed.contains(&key(record))));
             if records.len() > budget {
-                return Ok(None);
+                return Ok(self.unfit());
             }
             let next = crate::ReplayRecords { base: read.base, ..cursor };
             return Ok(Some(ReplayCut {
@@ -3044,7 +3043,6 @@ impl World {
                 scanned_to: from,
                 exhausted: false,
                 replay_records: Some(next),
-                restart_position: false,
             }));
         }
         let unanchored = lead.len();
@@ -3057,7 +3055,6 @@ impl World {
                 scanned_to,
                 exhausted,
                 replay_records: None,
-                restart_position: false,
             })),
             Fit::Only(n) if n > 0 => {
                 entries.truncate(n);
@@ -3076,16 +3073,15 @@ impl World {
                     scanned_to: end.hlc,
                     exhausted: false,
                     replay_records: None,
-                    restart_position: false,
                 }))
             }
             _ => {
                 if unanchored > budget || all.len() == unanchored {
-                    return Ok(None);
+                    return Ok(self.unfit());
                 }
                 let sent = budget.min(all.len());
                 if sent <= unanchored {
-                    return Ok(None);
+                    return Ok(self.unfit());
                 }
                 all.truncate(sent);
                 let last = &all[sent - 1];
@@ -3094,7 +3090,7 @@ impl World {
                         .as_ref()
                         .is_some_and(|cursor| cursor.passed(last.collection, &last.scope))
                 {
-                    return Ok(None);
+                    return Ok(self.unfit());
                 }
                 let next = match cursor {
                     Some(cursor) if read.resumed => crate::ReplayRecords {
@@ -3118,10 +3114,15 @@ impl World {
                     scanned_to: from,
                     exhausted: false,
                     replay_records: Some(next),
-                    restart_position: false,
                 }))
             }
         }
+    }
+    /// A replay page that cannot carry what it must (the transport's `unfit`): counted,
+    /// and the replay stays at its position for the contact.
+    fn unfit(&mut self) -> Option<ReplayCut> {
+        self.out.replay_unfit += 1;
+        None
     }
 
     /// An unkeyed write on `m`, on top of what `m` holds: the version keeps its key
@@ -4025,7 +4026,7 @@ pub(crate) fn run_with(
     all_strict: Option<bool>,
     retry_catching_up: bool,
 ) -> Outcome {
-    run_framed(sched, all_strict, retry_catching_up, REPLAY_FRAME)
+    run_framed(sched, all_strict, retry_catching_up, sched.bias.frame)
 }
 
 /// [`run_with`], with the model's replay frame of `frame` units.
@@ -4666,7 +4667,7 @@ impl Gen {
             ops.splice(at..at, [first, second]);
         }
         if self.rng.chance(50) {
-            bias.frame = self.rng.pick(&[1, 2, 2, 3]);
+            bias.frame = self.rng.pick(&[1, 1, 2, 3]);
             let m = self.rng.below(self.n as u64) as u8;
             let m = if self.track == Track::Home && m == self.home { (m + 1) % self.n } else { m };
             let peer = (0..self.n).find(|o| *o != m).expect("two members");
@@ -4674,14 +4675,14 @@ impl Gen {
             let at = (ops.len() * 2 / 3).max(2);
             match self.rng.below(10) {
                 // The sender restored between two replay pages: a cursor of another epoch.
-                0..=3 if !(self.track == Track::Home && peer == self.home) => {
+                0..=4 => {
                     let again =
-                        Op { step: Step::Restore { m: peer, nth: 0, inner: Vec::new() }, t: 0 };
+                        Op { step: Step::Restore { m: SENDER, nth: 0, inner: Vec::new() }, t: 0 };
                     inner.push((1 + self.rng.below(2) as u8, vec![again]));
                 }
                 // A keyed write on the sender between two replay pages, with a delta too
                 // small for the record it changes.
-                4..=6 => {
+                5..=7 => {
                     bias.delta_bytes = 100;
                     let r = self.new_request();
                     let at_peer =
@@ -4699,10 +4700,30 @@ impl Gen {
                 }
                 _ => {}
             }
-            let restore = Op { step: Step::Restore { m, nth: 0, inner }, t: 0 };
-            ops.insert(at, restore);
-            ops.insert(0, Op { step: Step::Backup { m: peer }, t: 0 });
-            ops.insert(0, Op { step: Step::Backup { m }, t: 0 });
+            // Every member backed up (the page's sender restored between two replay
+            // pages may be any of them), then keyed writes on `m` of `items` (records of
+            // one collection, which ride its replay's first page together) and on a
+            // peer, `m`'s writes pulled by its first peer, and `m` restored: it lost
+            // them, and its replay reads them back.
+            let t = time_at(ops, at);
+            let mut block: Vec<Op> =
+                (0..self.n).map(|o| Op { step: Step::Backup { m: o }, t: 0 }).collect();
+            for (i, kind) in [Kind::Insert { id: None }, Kind::Bulk, Kind::Insert { id: None }]
+                .into_iter()
+                .enumerate()
+            {
+                let r = self.requests.len() as u8;
+                self.requests.push(Request { key: r + 1, kind });
+                self.open.push(r);
+                let on = if i == 2 { peer } else { m };
+                block.push(Op {
+                    step: Step::Send { r, m: on, crash: None, inner: Vec::new() },
+                    t: t + i as u32,
+                });
+            }
+            block.push(Op { step: Step::Pull { to: peer, from: m }, t: 0 });
+            block.push(Op { step: Step::Restore { m, nth: 0, inner }, t: 0 });
+            ops.splice(at..at, block);
         }
         bias
     }
@@ -4748,6 +4769,7 @@ struct Sweep {
     orphaned: usize,
     delta_too_large: usize,
     cursor_dropped: usize,
+    replay_unfit: usize,
 }
 
 /// Run each seed of `seeds` on both tracks, `threads` at a time; panic with the first
@@ -4804,6 +4826,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.orphaned += out.orphaned;
                         t.delta_too_large += out.delta_too_large;
                         t.cursor_dropped += out.cursor_dropped;
+                        t.replay_unfit += out.replay_unfit;
                     }
                     // `IDEM_LIST=1`: each counted finding's schedule, by seed and track.
                     if std::env::var("IDEM_LIST").is_ok_and(|v| v == "1")
@@ -4844,7 +4867,8 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
          refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
          records cursors started over, {} records offered past their window (m2); {} \
          rewinds ({} records removed, {} reopened), {} records orphaned; {} replay deltas \
-         too large for their page ({} cursors dropped); in {:.1?}",
+         too large for their page ({} cursors dropped, their position read again), {} replay \
+         pages unfit; in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -4873,6 +4897,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.orphaned,
         totals.delta_too_large,
         totals.cursor_dropped,
+        totals.replay_unfit,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
@@ -4924,7 +4949,11 @@ fn assert_coverage(totals: &Sweep, seeds: u64) {
         ("snapshot pages refused at the zero records base (m4)", totals.records_restarts),
         ("replay pages of records alone (m1)", totals.records_alone),
         ("records cursors started over (m1, another epoch)", totals.cursor_restarts),
-        ("replay deltas too large for their page (Y2)", totals.delta_too_large),
+        (
+            "replay deltas too large, the cursor dropped and the position read again (Y2)",
+            totals.cursor_dropped,
+        ),
+        ("replay pages unfit, the whole-frame refusal", totals.replay_unfit),
         ("records offered past their window (m2)", totals.past_window_offered),
         ("rewinds", totals.rewinds),
         ("records orphaned", totals.orphaned),
