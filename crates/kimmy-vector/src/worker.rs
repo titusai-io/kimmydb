@@ -2396,6 +2396,17 @@ impl EmbeddingWorker {
                 detail: format!("expected {expected} vectors, got {}", vectors.len()),
             });
         }
+        // A vector no distance can be computed against would make every graph
+        // search of the collection fail (ADR-241): the provider's answer is
+        // unusable, as a wrong count is.
+        if let Some(at) = vectors.iter().position(|v| !crate::search::searchable(v)) {
+            return Err(VectorError::MalformedResponse {
+                provider: config.provider.name(),
+                detail: format!(
+                    "vector {at} has no finite squared length (a component past about 1.8e19)"
+                ),
+            });
+        }
         // Encoded before the scope opens: the scope holds the engine's one
         // writer, and every other writer on the node waits behind it. Each
         // record carries the fingerprint of the configuration its inputs were
@@ -3216,6 +3227,8 @@ impl VectorError {
             VectorError::Storage(_) | VectorError::Core(_) | VectorError::Snapshot(_) => {
                 Fault::Local
             }
+            // A search's own deadline; the worker never searches under one.
+            VectorError::DeadlineExceeded => Fault::Local,
             // The node's own lookups were busy: its state, not the provider's, and
             // it says nothing of whether a peer could do the work either.
             VectorError::ResolverBusy { .. } => Fault::Config,
@@ -5915,6 +5928,47 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             "fake"
         }
+    }
+
+    /// A provider that answers every call, with one vector too large to
+    /// score: finite, and its square is not (ADR-241).
+    struct AnswersTooLarge {
+        inner: Arc<FakeProvider>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for AnswersTooLarge {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let mut vectors = self.inner.embed(texts).await?;
+            if let Some(last) = vectors.last_mut() {
+                last[0] = 3e38;
+            }
+            Ok(vectors)
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// A provider's vector whose squared length is not a finite 32-bit float
+    /// is an unusable answer, refused as a wrong count is: nothing of the
+    /// batch is stored, and the batch stays stale for a later scan to send
+    /// again, so no graph is built over a vector every search would fail on.
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_vector_too_large_to_score_stores_nothing_of_its_batch() {
+        let (engine, mut worker, [(a, _), _], _dir) = two_collections().await;
+        let inner = FakeProvider::new(4);
+        worker.set_provider(a.id.0, Arc::new(AnswersTooLarge { inner: Arc::clone(&inner) }));
+        let mut pending = Pending::default();
+        let ids = gathered(&engine, &worker, &mut pending, &a, 0..3);
+        flushed(&mut worker, &mut pending).await;
+        assert_eq!(inner.calls(), 1, "the provider answered the batch");
+        assert_eq!(embedded_ids(&engine, &a, &ids), 0, "and nothing of the batch was stored");
     }
 
     /// An answered call ends the failures even when the collection still has

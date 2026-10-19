@@ -1,0 +1,48 @@
+--- a/src/hnsw.rs
++++ b/src/hnsw.rs
+@@ -1289,6 +1289,45 @@
+         &self.layer_indexed_points
+     }
+ 
++    /// kimmydb: add each `(from, to)` pair of data ids as an edge from `from`
++    /// to `to` in layer 0, keeping `from`'s neighbour list sorted by distance.
++    ///
++    /// For linking, after a build, a point the graph left with no edge into it
++    /// at layer 0: the reverse update of an insertion pushes the new point into
++    /// each neighbour's list and pops the farthest when the list is over its
++    /// cap, so a point every neighbour already holds closer points for is left
++    /// where no search can reach it. The edge is added past the cap, never by
++    /// displacing another, so no point loses an edge into it. A pair naming an
++    /// unknown id, a point and itself, or an edge already present is skipped.
++    /// Returns how many edges were added.
++    pub fn add_layer0_edges(&self, edges: &[(DataId, DataId)]) -> usize {
++        let layers = self.layer_indexed_points.points_by_layer.read();
++        let mut by_id = HashMap::<DataId, Arc<Point<T>>>::new();
++        for layer in layers.iter() {
++            for point in layer {
++                by_id.insert(point.get_origin_id(), Arc::clone(point));
++            }
++        }
++        let mut added = 0;
++        for &(from, to) in edges {
++            if from == to {
++                continue;
++            }
++            let (Some(from), Some(to)) = (by_id.get(&from), by_id.get(&to)) else {
++                continue;
++            };
++            let distance = self.dist_f.eval(from.get_v(), to.get_v());
++            let mut neighbours = from.neighbours.write();
++            if neighbours[0].iter().any(|n| n.point_ref.p_id == to.p_id) {
++                continue;
++            }
++            neighbours[0].push(Arc::new(PointWithOrder::new(to, distance)));
++            neighbours[0].sort_unstable();
++            added += 1;
++        }
++        added
++    }
++
+     // This is best explained in : Navarro. Searching in metric spaces by spatial approximation.
+     /// simplest searh neighbours
+     // The binary heaps here is with negative distance sorted.

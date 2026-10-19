@@ -3190,6 +3190,49 @@ fingerprint and ignores it.
 - **A member rolled back to 0.42.0** keeps the fingerprints on the records it
   holds, ignores them, and writes its own records without one.
 
+### Vector indexes in 0.52.0: every graph rebuilds once
+
+0.52.0 builds HNSW graphs with `hnsw_rs` 0.3.5 instead of 0.3.4, whose graphs
+left 0.5% to 5% of a collection of 500 vectors or more where no search could
+reach it, and links every point the library's insertion still leaves without
+an edge into it ([ADR-241](decisions.md)). A snapshot (`<data_dir>/hnsw/`)
+says in its `meta.json` which build made its graph (`"graph": 2`); one that
+does not say, saved by 0.51.x or earlier, is served once and rebuilt, **once
+per vector collection on each member**:
+
+- **What you see.** At the first search of each vector collection after the
+  member starts, one `INFO`: `adopting an HNSW snapshot a build before 0.52.0
+  made as behind`. That search is answered from the old graph at once. The
+  next search of the collection rebuilds it and saves a marked snapshot.
+  Nothing at startup.
+- **What it costs.** One build per collection. Measured with 384-dimensional
+  vectors, one build at a time on a loaded 18-core workstation: **9 s to build
+  and 4 s to save at 10,000 vectors** (peak process memory 200 MiB), and **4.4
+  to 12 minutes to build and half a minute to two minutes to save at
+  100,000** (1.3 to 1.5 GiB), the upper figures on uniformly random vectors.
+  Linking adds under a second at 100,000 vectors of realistic data. The next
+  restart loads the snapshot in under a second.
+- **What a search sees meanwhile.** The search that rebuilds waits for the
+  build and the save, and so does every other search of that collection that
+  arrives during them; all of them then answer from the new graph.
+  `server.request_timeout_secs` does not cut that wait short. A collection with
+  fewer than 500 vectors (the exact scan) and a search whose filter admits at
+  most 1,000 documents (read by key) never use the graph and do not wait, and
+  searches of other collections are not delayed; nor are reads and writes,
+  measured with eight collections building at once on a two-worker runtime.
+- **Taking the cost before traffic.** After each member starts, two vector
+  searches of each collection of 500 vectors or more, sent to that member,
+  rebuild its graph; roll on when the second has answered.
+- **A torn snapshot no longer takes a node down.** Before 0.52.0 a snapshot
+  data file cut short made the library end the process at that collection's
+  first search, on every restart; a snapshot's files are now checked before
+  the library reads them, and refused and rebuilt instead. A save now syncs
+  its files before the rename that publishes them.
+- **Rolling back to 0.51.x** needs nothing and rebuilds nothing: the format
+  is unchanged, and a 0.51 member loads and serves the graphs 0.52.0 saved,
+  ignoring the field that marks them. A graph 0.51 rebuilds and saves loses
+  the mark, and a member rolled forward again serves it once and rebuilds it.
+
 ### Vector chunk ids in 0.51.0
 
 Until 0.51.0 a vector chunk was stored under its source `_id`'s display text,
