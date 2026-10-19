@@ -286,6 +286,12 @@ fn estimate_bytes(keys: &[String], dim: usize) -> usize {
     keys.len() * per_node + key_bytes
 }
 
+/// fsync a file or a directory: what [`HnswIndex::save`] writes, and the
+/// directory entries that name it.
+fn sync(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
 /// Put `items` in the order build `attempt` inserts them (ADR-241).
 ///
 /// **The order is the draw.** `hnsw_rs` 0.3.5 gives each point the next level
@@ -652,7 +658,14 @@ impl HnswIndex {
     /// Atomic by staging: the dump lands in a `.build` sibling that replaces
     /// the real directory only once every file is on disk. A crash mid-save
     /// leaves the previous snapshot (or none), never a torn one — and the
-    /// loader treats anything unreadable as absent anyway.
+    /// loader refuses anything unreadable anyway ([`crate::dump::check`]).
+    ///
+    /// **On disk means synced** (ADR-241). The files, then the staging
+    /// directory, are fsynced before the rename, and the parent after it.
+    /// Without that a rename can reach the disk before the data it names: a
+    /// crash then leaves the new name over files cut short, which `hnsw_rs`
+    /// answered by ending the process at the collection's first search, on
+    /// every restart, until the dump check refused them.
     pub fn save(&self, dir: &std::path::Path) -> Result<()> {
         use hnsw_rs::api::AnnT;
 
@@ -680,9 +693,20 @@ impl HnswIndex {
             serde_json::to_vec(&meta).map_err(|e| VectorError::Snapshot(e.to_string()))?,
         )
         .map_err(io)?;
+        for file in [
+            format!("{}.hnsw.graph", crate::dump::BASENAME),
+            format!("{}.hnsw.data", crate::dump::BASENAME),
+            "meta.json".to_string(),
+        ] {
+            sync(&staging.join(file)).map_err(io)?;
+        }
+        sync(&staging).map_err(io)?;
 
         let _ = std::fs::remove_dir_all(dir);
         std::fs::rename(&staging, dir).map_err(io)?;
+        if let Some(parent) = dir.parent() {
+            sync(parent).map_err(io)?;
+        }
         debug!(vectors = self.keys.len(), ?dir, "saved HNSW snapshot");
         Ok(())
     }
