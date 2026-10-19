@@ -2390,9 +2390,12 @@ A rewind that discarded nothing (the command reports `0 oplog entries
 discarded`) undid no writes, so this rule does not apply to it: the member
 rejoins its cluster as any restored member does. A rewind keeps what the member
 covers at or below the target, lowers it to the target above it, and lowers it
-further only below a document it put back to an earlier value, so that the
-member asks its peers again for writes of that document it had judged
-([ADR-243](decisions.md)).
+further only below a document it put back to an earlier value or removed, so
+that the member asks its peers again for writes of that document it had judged
+([ADR-243](decisions.md), [ADR-246](decisions.md)). A document the member's
+oplog says was created after the target is removed and leaves no tombstone, so a
+write of it at or below the target that another member keeps comes back to the
+members that removed it.
 
 **A member rewound by 0.51 or earlier that has rejoined its cluster.** That
 rewind lowered the member's version vectors below writes retention had
@@ -2417,6 +2420,16 @@ since, as affected. Either remedy closes it:
   holds. A collection's drop made again by hand also removes the documents
   written into it after the original drop, which the original drop keeps: copy
   them out first and write them back after the drop.
+
+**Such a member can also delete writes its peers keep.** A rewind by 0.51 or
+earlier left, for each document it removed, a tombstone stamped at the rewind's
+clock. Once the member has written anything again, a page from it carries those
+tombstones to its peers, and each deletes there a write of that document at or
+below the target which the member had judged against the write the rewind
+discarded ([ADR-246](decisions.md)). Nothing tells such a tombstone from a
+delete's. Restore the member again from the same backup with this release, as
+the first remedy above does: the rewind removes those documents without a
+tombstone.
 
 ### The identity comes back with it
 
