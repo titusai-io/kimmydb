@@ -239,7 +239,7 @@ Creating a document whose `_id` is a `Decimal128`, by any route, is refused
 and every live member can hold one
 ([Operations](operations.md#clusterdecimal128-and-the-marker)); so is creating
 an index whose `partialFilterExpression` holds a `Decimal128`. While the only
-cause is a live member this member has not heard from yet, within a lease of
+cause is a live member this member has not heard from yet, within the unheard lease of
 its coming up, being renamed or this member rejoining, the refusal is `503
 peer_unheard`, `retry: wait`, with `Retry-After` of one sync interval instead,
 and the same request sent again once it is heard is taken
@@ -670,7 +670,7 @@ request. An MCP call is fingerprinted over the tool and its arguments without
 | Case | Answer |
 |---|---|
 | The member does not take keys now (see [The gate](#the-gate)) | `400 bad_request` naming the header and the cause. Nothing is looked up or written |
-| The member does not take keys **yet**: a live member has not been heard from, within a lease of its coming up, being renamed or this member rejoining, and no live member refuses | `503 peer_unheard`, `retry: wait`, `Retry-After` of one sync interval, naming the member. Nothing is looked up or written; sent again here with the same key once it has been heard, it is answered as any keyed request is |
+| The member does not take keys **yet**: a live member has not been heard from, within the unheard lease of its coming up, being renamed or this member rejoining, and no live member refuses | `503 peer_unheard`, `retry: wait`, `Retry-After` of one sync interval, naming the member. Nothing is looked up or written; sent again here with the same key once it has been heard, it is answered as any keyed request is |
 | No record of the key | Processed as without a key. If it wrote anything, the record is written with it. No marker |
 | A record, the same request | The first answer: `200` and the body the first attempt returned, with `Idempotency-Replayed: ?1`. Nothing is written. Under `coalesced` it is answered once the record's commit is durable |
 | A record, a different request | `422 idempotency_key_reused`, `retry: no`. Nothing is written |
@@ -813,12 +813,15 @@ it, naming the header and the cause, in one of two ways:
   does not say it carries records. A member does not say so when its facts
   block says otherwise or nothing of it (a member of an earlier release), when
   its last block did not decode, or when no block of it has arrived for more
-  than a lease since it came up, was renamed by SWIM or this member rejoined:
-  the time after which membership logs that the peer is unheard. The lease is
-  `ceil(peers / cluster.fanout) + 2` sync intervals.
+  than the unheard lease since it came up, was renamed by SWIM or this member
+  rejoined: the time after which membership logs that the peer is unheard. The
+  unheard lease is the longer of `ceil(peers / cluster.fanout) + 2` sync
+  intervals and the time SWIM takes to declare a silent member down plus one
+  sync interval, SWIM's time to declare a silent member down being foca's suspect-to-down time (4.8 s) plus two probe periods (1 s each) per live peer, so a member that stops answering is declared down,
+  and leaves the live set, before its lease runs out.
 - **`503 peer_unheard`, `retry: wait`, `Retry-After` of one sync interval** (in
   whole seconds, at least 1), when the only cause is a live member this member
-  has not heard from yet, within that lease: one that came up a moment ago, or
+  has not heard from yet, within the unheard lease: one that came up a moment ago, or
   whose block this member dropped when SWIM renamed it or this member rejoined.
   Every restart of a member in a roll opens such a window, on the restarted
   member and often on its peers, of a few seconds after it answers `/readyz`.
@@ -1707,7 +1710,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 
 | Status | `error` | `retry` | Cause |
 |---|---|---|---|
-| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; an `Idempotency-Key` on a route that does not take one, a malformed one, or one while the member does not take keys (its switch is off, or a live member does not say it carries records: an earlier release, a block that does not decode, or no block for more than a lease), naming the header and the cause ([Idempotency keys](#idempotency-keys)); a `Decimal128` `_id` or partial-filter bound while `cluster.decimal128` is off or a live member does not say it can hold one, the same three ways; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it; **a key `$unwind`'s document form, `$lookup`, or `$replaceRoot` does not define, or a document whose `$unwind` path crosses an array** ([ADR-129](decisions.md), [ADR-130](decisions.md)) |
+| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; an `Idempotency-Key` on a route that does not take one, a malformed one, or one while the member does not take keys (its switch is off, or a live member does not say it carries records: an earlier release, a block that does not decode, or no block for more than the unheard lease), naming the header and the cause ([Idempotency keys](#idempotency-keys)); a `Decimal128` `_id` or partial-filter bound while `cluster.decimal128` is off or a live member does not say it can hold one, the same three ways; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it; **a key `$unwind`'s document form, `$lookup`, or `$replaceRoot` does not define, or a document whose `$unwind` path crosses an array** ([ADR-129](decisions.md), [ADR-130](decisions.md)) |
 | 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, a field the route does not define, or an explicit `null` on a declared *optional* field that does not accept one; the message names it ([ADR-121](decisions.md), [ADR-128](decisions.md)). A `null` sent for a *required* field is refused too, but by that field's own type — see [The JSON boundary](#the-json-boundary) — and is not always this status. **Not** a pipeline stage operand's unknown key, which is untyped JSON at this layer and is refused `400` once `kimmy-query` parses it (ADR-129) |
 | 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | no | Denied by RBAC |
@@ -1731,7 +1734,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent or carries an [`Idempotency-Key`](#idempotency-keys), which makes sending it again with the same key safe on the member that took it: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
 | 500 | `partially_applied` | verify | A request that commits in more than one transaction — a `multi: true` update or delete, a database drop — failed after its first commit. **What landed stands and replicates**, and `applied` says how much; `cause` says why the rest did not. Read back, or resend a request built to skip what is done: see [a request that was partly applied](#a-request-that-was-partly-applied). Never resend it blindly |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
-| 503 | `peer_unheard` | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet, within a lease (`ceil(peers / cluster.fanout) + 2` sync intervals) of its coming up, being renamed or this member rejoining, as every restart in a roll causes. Past the lease with no block, or with a block that does not decode, the member counts as one that does not say it has the capability, and the answer is `400 bad_request`. Nothing was looked up or written. Carries `Retry-After`, one sync interval in whole seconds; the same request sent again here then (with the same key, if it had one) is taken. Not elsewhere: a keyed retry stays on the member that may hold its record ([The gate](#the-gate)) |
+| 503 | `peer_unheard` | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet, within the unheard lease (the longer of `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to declare a silent member down plus one sync interval) of its coming up, being renamed or this member rejoining, as every restart in a roll causes. Past the unheard lease with no block, or with a block that does not decode, the member counts as one that does not say it has the capability, and the answer is `400 bad_request`. Nothing was looked up or written. Carries `Retry-After`, one sync interval in whole seconds; the same request sent again here then (with the same key, if it had one) is taken. Not elsewhere: a keyed retry stays on the member that may hold its record ([The gate](#the-gate)) |
 | 503 | `starting` | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member ([ADR-198](decisions.md)) |
 | 503 | `catching_up` | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member ([ADR-202](decisions.md)) |
 | 503 | `node_stopping` | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member ([ADR-192](decisions.md)) |

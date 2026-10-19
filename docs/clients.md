@@ -184,8 +184,9 @@ where it stopped instead of applying again. What a client must do to rely on it:
   heard from a live member whether it carries records: one that came up, or
   that it saw rejoin, a moment ago, which every restart of a member in a roll
   causes. It wrote nothing and looked nothing up. It lasts until that member is
-  heard, about a sync interval, and at most a lease (`ceil(peers /
-  cluster.fanout) + 2` sync intervals), after which the member that is still not
+  heard, about a sync interval, and at most the unheard lease (the longer of
+  `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to
+  declare a silent member down plus one sync interval), after which the member that is still not
   heard from is answered with the `400` below. **Honour `Retry-After` and send the same request again,
   with the same key, to the same member**: that is the keyed retry the rules
   above describe, and it is answered with the first application or its replay.
@@ -196,7 +197,7 @@ where it stopped instead of applying again. What a client must do to rely on it:
 - **A `400` naming `Idempotency-Key` and the cluster** (the member does not take
   keys now: its `cluster.idempotency_keys` is off, or a live member does not say
   it carries records: a member of an earlier release during a roll, one whose
-  block does not decode, or one not heard from for more than a lease) wrote
+  block does not decode, or one not heard from for more than the unheard lease) wrote
   nothing and looked nothing up, and lasts until the operator, the roll or that
   member changes it. A
   record written before the member stopped taking keys stays for its window,

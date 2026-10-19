@@ -5342,6 +5342,67 @@ async fn a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_4
     }
 }
 
+/// A frozen peer is declared down before its unheard lease can turn the `503` into a `400`
+/// (the lease's floor: SWIM's suspect-to-down time plus one sync interval). At a 1 s sync
+/// interval the lease alone is 3 s, shorter than SWIM takes. B is stopped until A and C
+/// declare it down, A is then stopped, and B is resumed: B rejoins, which drops every
+/// block it held, so A is live and not heard from at B. From then on B is sent a keyed
+/// insert again and again: every answer is `503 peer_unheard` until B takes the key, and
+/// never `400` while A is live; B takes it once SWIM has declared A down.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out() {
+    const PATH: &str = "/v1/db/shop/coll/orders/docs";
+    const BODY: &str = r#"{"v":"frozen-peer"}"#;
+    const KEY: &str = "frozen-peer-is-declared-down-first";
+    let client = reqwest::Client::new();
+    let (a, b, c, t) = keyed_cluster(&client, "", serde_json::json!([])).await;
+
+    let a_id = a.node_id(&client).await;
+    let rejoins = |node: &Node| node.log().matches("rejoined the cluster").count();
+    let before = rejoins(&b);
+    b.signal("STOP");
+    eventually("A and C to declare B down", || all_report(&client, vec![&a, &c], 1)).await;
+    a.signal("STOP");
+    let frozen = std::time::Instant::now();
+    b.signal("CONT");
+    eventually("B to rejoin", || async { rejoins(&b) > before }).await;
+    let rejoined = frozen.elapsed();
+
+    let deadline = std::time::Instant::now() + patience();
+    let mut waited = 0;
+    let taken = loop {
+        assert!(std::time::Instant::now() < deadline, "B never took the key");
+        let answer = gate_send(&client, &b, &t[1], PATH, BODY, Some(KEY)).await;
+        match answer.status {
+            200 => break answer,
+            503 => {
+                assert_eq!(answer.body["error"], "peer_unheard", "{}", answer.text);
+                assert_eq!(answer.retry_after.as_deref(), Some("1"), "{}", answer.text);
+                waited += 1;
+            }
+            other => panic!(
+                "B answered {other} {:?} after A froze ({rejoined:?} at B's rejoin), with {:?} \
+                 peers live at B, naming A: {}: {}",
+                frozen.elapsed(),
+                b.members_gauge(&client).await,
+                answer.text.contains(&a_id.to_string()),
+                answer.text
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(!taken.replayed, "{}", taken.text);
+    assert!(waited > 0, "B rejoined and met the window: it answered 503 first");
+    assert_eq!(b.members_gauge(&client).await, Some(1), "B took the key once A was declared down");
+    eprintln!(
+        "frozen peer: rejoined {rejoined:?} after A froze; {waited} answers 503 peer_unheard, \
+         then 200 at {:?} with A down",
+        frozen.elapsed()
+    );
+    a.signal("CONT");
+}
+
 /// The stamp rule on a fresh attempt (Chris's ruling on the design's departure 1): a keyed
 /// `multi` `$inc` on A, two documents a chunk, held between its first and second chunk
 /// (`KIMMY_TEST_HOLD_BETWEEN_CHUNKS`). Meanwhile B writes document 5, which A pulls, and a

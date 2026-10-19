@@ -38,6 +38,8 @@ DECIMAL_LEASE_UNIT = ("kimmy-cluster", "--lib", "decimal128::tests::a_peer_not_h
 UNDECODABLE_UNIT = ("kimmy-cluster", "--lib", "idempotency::tests::a_peer_whose_block_does_not_decode_refuses_at_once", "no")
 CLOCK_UNIT = ("kimmy-cluster", "--lib", "facts::tests::a_rename_or_a_rejoin_starts_the_unheard_clock_again", "no")
 API_LEASE = ("kimmy-api", "--test idempotency", "a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400", "no")
+FLOOR_UNIT = ("kimmy-cluster", "--lib", "facts::tests::the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down", "no")
+FROZEN_CLUSTER = ("kimmyd", "--test cluster", "a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out", "yes")
 
 GATE_SPLIT = [
     {
@@ -235,7 +237,7 @@ GATE_SPLIT = [
         "doc": "A peer not heard from is never past its lease: the gate answers 503 for as long as it stays unheard",
         "patches": [
             ("crates/kimmy-cluster/src/membership.rs",
-             "            .is_some_and(|since| now.saturating_duration_since(*since) > self.lease)\n",
+             "            .is_some_and(|since| now.saturating_duration_since(*since) > self.unheard_lease)\n",
              "            .is_some_and(|since| {\n"
              "                let _ = (since, now);\n"
              "                false\n"
@@ -307,6 +309,46 @@ GATE_SPLIT = [
         ],
         "suites": [CLOCK_UNIT],
         "kills": ["facts::tests::a_rename_or_a_rejoin_starts_the_unheard_clock_again"],
+    },
+    {
+        "name": "gs-unheard-lease-without-floor",
+        "group": "gate-split",
+        "doc": "The unheard lease is the lease alone, without SWIM's floor",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        self.lease().max(floor)\n",
+             "        let _ = floor;\n"
+             "        self.lease()\n"),
+        ],
+        "suites": [FLOOR_UNIT, FROZEN_CLUSTER],
+        "kills": ["facts::tests::the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down",
+                  "a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out"],
+    },
+    {
+        "name": "gs-floor-without-detection",
+        "group": "gate-split",
+        "doc": "The floor is SWIM's suspect-to-down time alone, without the probe periods it takes to suspect",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        timers.suspect_to_down_after + timers.probe_period * (2 * peers)\n",
+             "        let _ = (timers.probe_period, peers);\n"
+             "        timers.suspect_to_down_after\n"),
+        ],
+        "suites": [FLOOR_UNIT, FROZEN_CLUSTER],
+        "kills": ["facts::tests::the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down",
+                  "a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out"],
+    },
+    {
+        "name": "gs-floor-not-configured",
+        "group": "gate-split",
+        "doc": "The running membership never gives the member set foca's timers: no floor",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "    members.configure_swim(&config);\n",
+             "    let _ = &config;\n"),
+        ],
+        "suites": [FROZEN_CLUSTER],
+        "kills": ["a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out"],
     },
 ]
 

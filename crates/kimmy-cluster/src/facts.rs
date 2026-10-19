@@ -1114,8 +1114,8 @@ mod tests {
         let members = cluster(&[2]);
         let view = members.view();
         let start = *view.unheard_since.get(&node(2)).expect("its clock started when it came up");
-        let lease = view.lease;
-        assert_eq!(lease, members.lease(), "the WARN's lease");
+        let lease = view.unheard_lease;
+        assert_eq!(lease, members.unheard_lease(), "the WARN's lease");
         let within = start + lease;
         let after = start + lease + Duration::from_millis(1);
         assert_eq!(idempotency_records_net(&view, within), PeerNet::Unheard(vec![node(2)]));
@@ -1127,6 +1127,46 @@ mod tests {
         assert_eq!(idempotency_records_net(&members.view(), after), PeerNet::Open);
     }
 
+    /// The unheard lease is floored at the time SWIM can take to declare a silent
+    /// peer down, plus one sync interval, from foca's own configuration: at 1 s
+    /// with two peers the lease is 3 s, and the floor (two probe periods per peer
+    /// and the suspect-to-down time) is what bounds "not heard".
+    #[test]
+    fn the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down() {
+        let members = cluster(&[2]);
+        members.configure_lease(Duration::from_secs(1), 3);
+        members.insert_for_test(addr(3), node(3));
+        assert_eq!(members.lease(), Duration::from_secs(3), "two peers at fanout 3");
+        assert_eq!(members.unheard_lease(), members.lease(), "no SWIM configured: no floor");
+        let swim = crate::membership::swim_config();
+        members.configure_swim(&swim);
+        let down = swim.suspect_to_down_after + swim.probe_period * 4;
+        assert_eq!(members.swim_down_within(), down, "two probe periods per peer, then the timer");
+        let floor = down + Duration::from_secs(1);
+        assert!(floor > members.lease(), "premise: SWIM takes longer than the lease: {floor:?}");
+        assert_eq!(members.unheard_lease(), floor);
+        let view = members.view();
+        assert_eq!(view.unheard_lease, floor, "the view carries it");
+        let since = view.unheard_since[&node(2)];
+        assert_eq!(
+            idempotency_records_net(&view, since + members.lease() + Duration::from_millis(1)),
+            PeerNet::Unheard(vec![node(2), node(3)]),
+            "past the lease, within the floor: still not heard from"
+        );
+        assert_eq!(
+            idempotency_records_net(&view, since + floor + Duration::from_millis(1)),
+            PeerNet::Refused(vec![node(2), node(3)]),
+            "past the floor: refused"
+        );
+        // A wide interval's lease is above the floor and stands.
+        members.configure_lease(Duration::from_secs(10), 3);
+        assert_eq!(
+            members.unheard_lease(),
+            Duration::from_secs(30),
+            "three intervals beat the floor"
+        );
+    }
+
     /// A rename and this member's own rejoin drop a block and start the peer's
     /// clock again: a peer up for longer than a lease is unheard again, not a
     /// refuser, after either.
@@ -1135,7 +1175,7 @@ mod tests {
         let members = cluster(&[2]);
         let carries = Facts { idempotency_records: Some(true), ..block() };
         members.record_peer_facts_for_test(node(2), carries.clone(), Duration::ZERO);
-        let long_up = members.lease() + Duration::from_secs(1);
+        let long_up = members.unheard_lease() + Duration::from_secs(1);
         members.backdate_unheard_for_test(node(2), long_up);
         let now = Instant::now();
         assert_eq!(idempotency_records_net(&members.view(), now), PeerNet::Open);
