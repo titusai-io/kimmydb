@@ -864,7 +864,7 @@ async fn start_and_serve(
             .context("writing the replay floor")?;
     }
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
-    // An idempotency key is remembered for the oplog's window (ADR-240, Decision Q3):
+    // An idempotency key is remembered for the oplog's window (ADR-240):
     // the lookup treats a record past it as absent, at the cutoff the retention
     // pass collects it at, so the two read one setting.
     engine.set_idempotency_window(config.storage.oplog_retention_secs);

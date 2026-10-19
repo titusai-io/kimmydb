@@ -5338,8 +5338,8 @@ fn sweep_listing(
          sides of one, {} with one call's writes on both sides; {} I8 checks, {} counters \
          left at or above a merged first, {} home runs without exact I5; the contested \
          algebra: {} records contested, {} lookups refused, {} requests stopped between chunks; {} snapshot pages \
-         refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
-         records cursors started over, {} records offered past their window (m2); {} \
+         refused at the zero records base, {} replay pages of records alone, {} \
+         records cursors started over, {} records offered past their window; {} \
          member rewinds ({} of one member alone, {} widened to every member, {} not taken \
          on the home track; {} records removed, {} reopened), {} records orphaned; {} replay deltas \
          too large for their page ({} cursors dropped, their position read again), {} replay \

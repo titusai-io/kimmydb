@@ -4572,7 +4572,7 @@ async fn a_decimal128_id_is_created_where_declared_and_applied_everywhere() {
 }
 
 // ---------------------------------------------------------------------------
-// Idempotency keys across members (ADR-240, design section "Cluster")
+// Idempotency keys across members (ADR-240)
 // ---------------------------------------------------------------------------
 //
 // C1 to C9 over real processes and real HTTP, every member with

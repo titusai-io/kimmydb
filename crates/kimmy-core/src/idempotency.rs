@@ -59,7 +59,7 @@ const DERIVED_ID_TAG: &[u8] = b"kimmydb/idempotency/id/v1";
 /// value: the API's `400` names the header and quotes this.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
-    /// Empty, or not quoted: a bare token is not a String (Decision Q5).
+    /// Empty, or not quoted: a bare token is not a String.
     #[error("the value must be a quoted string, such as \"6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90\"")]
     NotAString,
     /// The opening quote is never closed.
@@ -273,7 +273,7 @@ fn name_based_v8(digest: &[u8; 32]) -> [u8; 16] {
 }
 
 /// A keyed insert's derived `_id`, as the stored body carries it: the UUID's
-/// canonical 36-character lowercase string (Decision Q1). A path segment that
+/// canonical 36-character lowercase string. A path segment that
 /// is neither 24 hex characters nor an integer reads as a string, so every
 /// by-id route addresses it.
 pub fn derived_id(
@@ -338,7 +338,7 @@ mod tests {
         let refused = |v: &str| IdempotencyKey::parse_header_value(v).unwrap_err();
         assert_eq!(refused(""), KeyError::NotAString);
         assert_eq!(refused("   "), KeyError::NotAString);
-        // A bare token is not a String (Decision Q5).
+        // A bare token is not a String.
         assert_eq!(refused("0123456789abcdef0"), KeyError::NotAString);
         assert_eq!(refused("\"\""), KeyError::Length { found: 0 });
         assert_eq!(refused("\"0123456789abcdef"), KeyError::Unterminated);

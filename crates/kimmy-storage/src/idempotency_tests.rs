@@ -1896,7 +1896,7 @@ fn a_record_stays_when_a_row_between_its_first_and_last_expires() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
-/// The records step runs whatever the oplog step found (the manager's guard):
+/// The records step runs whatever the oplog step found:
 /// here the oplog step removes nothing, every entry being inside its window,
 /// and a record a peer sent with an older `last` still goes; and on a store
 /// with no oplog at all, where the oplog step ends at once.

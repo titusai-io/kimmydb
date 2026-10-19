@@ -1276,7 +1276,7 @@ fn a_zero_base_answered_after_a_restore_with_records_is_refused_and_restarts_the
     retry_must_replay(&x, &cx, &k, target);
 }
 
-/// The cost of guard (ii) on an ordinary pull: the sender holds no records when
+/// The cost of the zero-base guard on an ordinary pull: the sender holds no records when
 /// the pull begins, and its first keyed write lands mid-pull. Its log begins
 /// with that write and names it, so the page answering the zero base would have
 /// been right, but the receiver cannot tell it from a restore and refuses it:

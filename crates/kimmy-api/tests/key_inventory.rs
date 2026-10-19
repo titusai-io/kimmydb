@@ -167,7 +167,7 @@ const TABLES: &[Table] = &[
     Table {
         name: "idempotency",
         class: Unchanged,
-        why: "(collection id, scope hash) -> record (B5): stamps, counts, a find_and_modify's \
+        why: "(collection id, scope hash) -> record (ADR-240): stamps, counts, a find_and_modify's \
               document as stored; a multi request's cursor is a stored DOCS key, written in the \
               schema-5 form from the start (no build before schema 5 has the table), read back \
               only by the member it names as origin, and only a saving: a resume writes nothing \
@@ -182,7 +182,7 @@ const TABLES: &[Table] = &[
     Table {
         name: "idempotency_changes",
         class: Unchanged,
-        why: "the node-local change log of idempotency records (B5): a minted stamp -> \
+        why: "the node-local change log of idempotency records (ADR-240): a minted stamp -> \
               collection id and scope hash, and where the log begins; no key bytes",
     },
     Table {

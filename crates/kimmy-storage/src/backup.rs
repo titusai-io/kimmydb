@@ -25,7 +25,7 @@
 //! and 13, so a restored member keeps the records of the writes it holds, those
 //! it took by snapshot included: without them a retry there would apply on top
 //! of a write the backup brought back. That is a backup rollback boundary
-//! (Decision Q4): a build before 0.52 refuses a backup that holds either tag, as
+//! (ADR-240): a build before 0.52 refuses a backup that holds either tag, as
 //! it refuses every tag it does not know. A backup an older build wrote restores
 //! into this one with no records, and nothing about restoring changes for it.
 //! **The rows by stamp travel only beside a record**: a store that holds no
