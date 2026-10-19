@@ -2018,6 +2018,108 @@ fn a_records_only_page_reserves_the_large_key_of_the_cursor_it_carries() {
     assert_eq!(x.idempotency_records().unwrap(), 6, "every record");
 }
 
+/// Removes every match that has `gone`.
+struct Del;
+
+impl ModifySpec for Del {
+    fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
+        Ok(doc.contains_key("gone"))
+    }
+    fn compare(&self, _: &Document, _: &Document) -> Ordering {
+        Ordering::Equal
+    }
+    fn apply(&self, _: &Document) -> std::result::Result<Option<Document>, String> {
+        Ok(None)
+    }
+    fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+        None
+    }
+}
+
+/// The receiver's refusal of a page asked with the zero base holds for a page
+/// that carries tombstones and no document: the sender held no records at the
+/// first page, and is restored from a backup holding a keyed delete-many whose
+/// tombstones fill the next page. That page carries the delete's effects and no
+/// document; it is refused like a page of documents, and the restart's records
+/// phase carries the delete's record.
+#[test]
+fn a_zero_base_page_of_tombstones_only_after_a_restore_is_refused_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let y0 = open(&dir, "y0");
+    let cy = y0.create_collection("shop", "orders").unwrap();
+    let page = SNAPSHOT_PAGE as i64;
+    let docs = (1..=3 * page).map(|i| {
+        if i > page && i <= 2 * page {
+            doc! { "_id": i, "gone": true }
+        } else {
+            doc! { "_id": i }
+        }
+    });
+    y0.insert_many(&cy, docs.collect()).unwrap();
+    let b0 = backup_of(&y0);
+    let k = key(9);
+    fresh(y0.modify_where_keyed(&cy, &Candidates::Scan, &Del, None, &k).unwrap());
+    let b2 = backup_of(&y0);
+    drop(y0);
+    let y1 = restored(&dir, "y1", &b0);
+    let x = open(&dir, "x");
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    let (first, _) = take_noting(&x, &y1, &mut progress);
+    assert_eq!(first.documents.len(), SNAPSHOT_PAGE, "premise: the first page's documents");
+    assert_eq!(progress.after().unwrap().records_base.unwrap().epoch, None, "premise: zero base");
+    drop(y1);
+    let y2 = restored(&dir, "y2", &b2);
+    let (answer, refused) = take_noting(&x, &y2, &mut progress);
+    assert!(
+        answer.documents.is_empty() && answer.deleted_documents.len() == SNAPSHOT_PAGE,
+        "premise: a page of tombstones only ({} documents, {} tombstones)",
+        answer.documents.len(),
+        answer.deleted_documents.len()
+    );
+    assert!(answer.records_epoch.is_some(), "premise: the restored log's epoch");
+    assert!(refused, "refused like a page of documents");
+    finish_noting(&x, &y2, &mut progress);
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert!(x.idempotency_record(cx.id, &k.scope).unwrap().is_some(), "the delete's record");
+}
+
+/// A converge pull counts the rows its pages carried for its bound, tombstones
+/// with documents: a collection of 512 documents and 512 tombstones, both held
+/// stale by the receiver, comes to 1,024 rows.
+#[test]
+fn a_converge_pull_counts_its_tombstones_with_its_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, c) = (open(&dir, "y"), open(&dir, "c"));
+    let cy = y.create_collection("shop", "orders").unwrap();
+    let page = SNAPSHOT_PAGE as i64;
+    let docs = (1..=2 * page).map(|i| {
+        if i > page {
+            doc! { "_id": i, "gone": true }
+        } else {
+            doc! { "_id": i, "n": 0i64 }
+        }
+    });
+    y.insert_many(&cy, docs.collect()).unwrap();
+    pull(&c, &y);
+    // Every document rewritten and every other deleted, after C pulled them.
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, None, &key(4)).unwrap());
+    y.modify_where(&cy, &Candidates::Scan, &Del, None).unwrap();
+    let cc = c.get_collection("shop", "orders").unwrap();
+    let mut converge = SnapshotProgress::of_collection_converging(cc.id, Default::default());
+    let pages = finish(&c, &y, &mut converge);
+    let (documents, tombstones): (usize, usize) = pages
+        .iter()
+        .map(|p| (p.documents.len(), p.deleted_documents.len()))
+        .fold((0, 0), |(d, t), (pd, pt)| (d + pd, t + pt));
+    assert_eq!((documents, tombstones), (512, 512), "premise: the pages' rows");
+    assert_eq!(converge.rows(), 1024, "documents and tombstones, every one counted");
+    // And a whole-database pull counts none: the bound is a converge pull's.
+    let z = open(&dir, "z");
+    let mut whole = SnapshotProgress::whole_database();
+    finish(&z, &y, &mut whole);
+    assert_eq!(whole.rows(), 0);
+}
+
 // -- The records of a collection dropped and not created again -----------------------------
 
 /// Two collection names whose ids put the first before the second in the walk.
