@@ -814,7 +814,9 @@ The graph is built by `hnsw_rs` 0.3.5, kimmydb's copy of it with one function
 added ([ADR-241](decisions.md)). After the inserts the build reads layer 0 and
 links every point the library's insertion left with no edge into it, or
 outside the entry point's component, from its nearest linked points: such a
-point is one no search returns. Then it asks a sample of 128 stored vectors
+point is one no search returns. A component whose searches return only one
+another, so that no search offers it a linked point, is bridged both ways to
+the nearest linked points found by reading them all. Then it asks a sample of 128 stored vectors
 to find themselves, and warns when 8 or more do not. A build is retried, in
 another insertion order, only if the linking leaves a point cut off, which no
 measured build has. Each attempt's order is a shuffle of the chunk keys seeded
@@ -946,7 +948,7 @@ The exact path is the oracle for everything approximate:
 | Invariant | How |
 |---|---|
 | The graph finds what a scan finds | Recall measured, not assumed: ≥ 90% at k=10, and the nearest neighbour agrees with an exact scan exactly |
-| No stored vector is out of every search's reach | Every vector of eight builds at 400 × 16 finds itself, and the graph's layer 0 leaves none without an edge into it or outside the entry point's component; the same of three builds at 1,000 × 384 in release; a build links what its insertion cut off (300 copies of one vector, two thirds cut off before) |
+| No stored vector is out of every search's reach | Every vector of eight builds at 400 × 16 finds itself, and the graph's layer 0 leaves none without an edge into it or outside the entry point's component; the same of three builds at 1,000 × 384 in release; a build links what its insertion cut off (300 copies of one vector, two thirds cut off before); a component the entry point does not reach is linked, judged from the entry point the library dumps, and one no search's candidates reach is bridged |
 | A filtered search returns `k` | 1%, 2% and 3% of a collection admitted return `k` through the graph, at 5,000 documents and, in release, 100,000; a first walk short of `k` is retried wider and answers `k`; a filter that refuses what is nearest the query is retried at the width its first walk's own admitted share asks for; a walk short at its widest gives way to the keyed join's exact answer, which stops at the request's deadline |
 | A snapshot cannot take the node down | 39 spoilings of a snapshot's two files are refused before the library reads them, a vector too large to square among them; the three the library answers by ending the process are run in child processes, which the library alone ends and the cache survives, rebuilding |
 | Dispatch does not change results | `the_approximate_path_agrees_with_the_exact_one` asserts both paths return the same nearest neighbour with a **byte-identical score** |

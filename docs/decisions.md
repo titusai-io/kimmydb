@@ -28613,12 +28613,16 @@ ten.
    build; none lost in any graph up to 1,000 vectors of either kind; 0.02% of the low-dimensional data hard to find at
    100,000 (found at four times the effort but for two); the uniform data keeps reachable points a search at the build
    check's effort misses (0.9% to 1.1% at 10,000, 10.8% at 100,000), which is recall, not loss. The linking costs under a
-   second at 100,000 low-dimensional vectors and 18 s at 100,000 uniform ones. A cut-off point whose 16 nearest are all
-   cut off gets no edge, so a component of more than 16 points out of the entry point's reach whose searches return only
-   one another stays cut off, and the build is retried as item 3 says. That was seen only at toy parameters (four
-   connections, construction effort 8, two tight clusters inserted one after the other: 20 of 80 points); at the
-   build's parameters and in its shuffled order, two to fifty tight clusters of 100 to 2,000 vectors of 384 dimensions
-   left nothing out of reach.
+   second at 100,000 low-dimensional vectors and 18 s at 100,000 uniform ones. **A component no search's candidates
+   reach is bridged** (`bridges`): a cut-off point whose 16 nearest are all cut off themselves gets no edge from them,
+   which a component of more than 16 points out of the entry point's reach, whose searches return only one another,
+   leaves. In the same round, one point of each such component, chosen so that the rest of the component is reachable
+   from it (a cut-off point no other cut-off point has an edge into, first), is joined both ways to its two nearest
+   linked points, found by reading every linked point's vector: one pass over the vectors per component, and nothing
+   when no point was stranded. Seen at toy parameters (four connections, construction effort 8, two tight clusters
+   inserted one after the other: the second cluster's 40 of 80 points, every one stranded), where the bridge leaves
+   none cut off; at the build's parameters and in its shuffled order, two to fifty tight clusters of 100 to 2,000
+   vectors of 384 dimensions stranded nothing. A point still cut off after the rounds is the structural retry of item 3.
 3. **Each build attempt inserts in its own order** (`insertion_order`): a Fisher–Yates shuffle of the walk's order (chunk
    keys in key order) driven by SplitMix64 seeded with the attempt number, the first attempt included. A collection's
    graph is a function of its records and the attempt, reproducible on every member and across restarts, and different
@@ -28689,7 +28693,8 @@ links every point its insertion cut off (300 copies of one vector, 203 cut off b
 attempt builds one graph and each retry another; a build left cut off (the linking skipped) is retried in each attempt's
 order and returns the last; a high sampled score with nothing cut off is not retried; the linking reaches a component
 the entry point does not (two clusters whose top level holds seven points of different reach, judged from the entry
-point the library dumps); the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 39 spoilings
+point the library dumps); the linking bridges a component no search's candidates reach (40 of 80 points stranded, none
+left cut off, and edges both into and out of the component); the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 39 spoilings
 (a rank equal to its layer's size, and a vector too large to square, among them) and four shapes; a snapshot of each process-ending kind refused, rebuilt and survived, each case in a child process whose
 raw-library twin must exit or abort as the case says; a 0.51 snapshot served once and rebuilt; what built a loaded graph
 read from its snapshot; a filtered search returning `k` at 1%, 2% and 3% admitted with no fallback, a first walk short
@@ -28697,6 +28702,8 @@ of `k` retried wider and answering `k`, a retry widened by what the first walk s
 query of 5,000 refused, so that four times the first width admits none), a forced fallback equal to the keyed join, the
 keyed join stopping at a passed deadline, and the same rows at 100,000 documents in release; a provider's vector too
 large to square stores nothing of its batch. `kimmy-api`: a chunk and a query vector too large to square are refused
-with `400`, and a search past its deadline answers as a timeout. The reachability distribution measurement
+with `400`; a provider's query vector too large to square, and one missing from its answer, answer `502`
+`provider_error`; and a search past its deadline answers as a timeout. [Every mutation row with the test that kills
+it](adr-241-mutation-rows.md). The reachability distribution measurement
 counts every point, the points cut off and the points found at four times the effort, on either fixture
 (`KIMMY_REACH_LATENT`), and the library audit is re-runnable on a library upgrade.
