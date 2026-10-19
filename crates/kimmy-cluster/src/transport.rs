@@ -268,6 +268,64 @@ pub(crate) fn records_alone_window(
     Some((end, kept))
 }
 
+/// What a window whose first entry cannot cross with the records riding at or
+/// below it, even as a partial window of records alone, sends instead: those
+/// records **ahead of the entry**, with the F3 records, in an answer of records
+/// alone that carries no entry and covers nothing, its `scanned_to` naming the
+/// entry. The requester stores them and asks again in the same contact, naming
+/// that entry (`AskEntries::records_ahead_of`), and the window then leaves them
+/// out, so the entry crosses with what it holds already. A record stored before
+/// its effect arrives is a record held early, which is safe: a retry here replays
+/// the first answer of a write that happened.
+///
+/// `None` when nothing beyond the F3 records rides at or below the first entry,
+/// or when those records do not fit one frame together: what is left is an
+/// entry, or a record, larger than a frame by itself.
+pub(crate) fn records_ahead(
+    entries: &[OplogEntry],
+    records: &[kimmy_storage::CarriedRecord],
+    unanchored: usize,
+) -> Option<(Hlc, Vec<kimmy_storage::CarriedRecord>)> {
+    let first = entries.first()?.stamp;
+    let unanchored = unanchored.min(records.len());
+    let ahead: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter(|(i, record)| *i < unanchored || record.carrying.is_some_and(|at| at <= first))
+        .map(|(_, record)| record.clone())
+        .collect();
+    if ahead.len() == unanchored {
+        return None;
+    }
+    let bytes: usize = ahead.iter().map(record_bytes).sum::<Option<usize>>()?;
+    (bytes <= entry_budget()).then_some((first.hlc, ahead))
+}
+
+/// The records of a window the requester said it holds, sent ahead of the
+/// window's first entry in this contact (`AskEntries::records_ahead_of`): every
+/// record but the F3 ones riding at or below that entry. Applied only when the
+/// window's first entry is at the stamp named, so a window that changed between
+/// the two asks leaves nothing out it did not send ahead.
+fn leave_out_records_ahead(
+    entries: &[OplogEntry],
+    records: &mut Vec<kimmy_storage::CarriedRecord>,
+    unanchored: &mut usize,
+    ahead_of: Option<Hlc>,
+) {
+    let Some(first) = entries.first().map(|entry| entry.stamp).filter(|s| Some(s.hlc) == ahead_of)
+    else {
+        return;
+    };
+    let keep = *unanchored;
+    let mut i = 0usize;
+    records.retain(|record| {
+        let kept = i < keep || record.carrying.is_none_or(|at| at > first);
+        i += 1;
+        kept
+    });
+    *unanchored = keep.min(records.len());
+}
+
 /// Records a sender could not fit into any frame or replay page that must carry
 /// them, by path, since start (`kimmy_idempotency_records_unfit_total{path}`):
 /// each is a frame or a page that carried nothing, or was refused, where it
@@ -1638,7 +1696,16 @@ where
                     engine.witnessed_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
                 write_frame(&mut stream, &Message::Witnessed(witnessed)).await?;
             }
-            Message::AskEntries { from, limit, held, marked, partial, replay, replay_records } => {
+            Message::AskEntries {
+                from,
+                limit,
+                held,
+                marked,
+                partial,
+                replay,
+                replay_records,
+                records_ahead_of,
+            } => {
                 // Tell a peer below the horizon rather than serving it what is
                 // left: it would apply that, advance its version vector, and
                 // never learn what had been collected. Judged per origin when
@@ -1759,8 +1826,16 @@ where
                 // fewer entries unasked would be a silent gap rather than a kindness.
                 // The records count: a window whose records push it over the
                 // frame is answered the same way (B5).
-                let unanchored = window.unanchored;
-                let records = records_to_send(engine, window.records);
+                let mut unanchored = window.unanchored;
+                let mut records = records_to_send(engine, window.records);
+                // The records the peer stored ahead of this window's first entry, in
+                // this contact: left out, so the entry crosses.
+                leave_out_records_ahead(
+                    &window.entries,
+                    &mut records,
+                    &mut unanchored,
+                    records_ahead_of,
+                );
                 match how_many_fit(&window.entries, &records, unanchored) {
                     Fits::All => {
                         write_frame(
@@ -1817,10 +1892,39 @@ where
                                 .await?
                             }
                             None => {
+                                // Else the records riding at or below the first entry,
+                                // the one at its own stamp included, ahead of it: an
+                                // answer of records alone that covers nothing, its
+                                // `scanned_to` naming the entry, which the peer asks
+                                // again for in this contact without them.
+                                if let Some((ahead_of, records)) =
+                                    records_ahead(&window.entries, &records, unanchored)
+                                {
+                                    info!(
+                                        records = records.len(),
+                                        ?ahead_of,
+                                        "the idempotency records riding a peer's first entry do \
+                                         not fit one frame with it; they go ahead of it, alone, \
+                                         and the entry follows without them"
+                                    );
+                                    write_frame(
+                                        &mut stream,
+                                        &Message::Entries {
+                                            entries: Vec::new(),
+                                            scanned_to: ahead_of,
+                                            exhausted: false,
+                                            passed_through: None,
+                                            records,
+                                            replay_records: None,
+                                        },
+                                    )
+                                    .await?;
+                                    continue;
+                                }
                                 // Not even that: one entry, or a record, larger than
-                                // a frame, or a requester that cannot take a partial
-                                // window. Named to the peer as one entry that cannot
-                                // replicate, and counted here when records ride it.
+                                // a frame by itself. Named to the peer as one entry
+                                // that cannot replicate, and counted here when records
+                                // ride it.
                                 if records.len() > unanchored {
                                     records_unfit().bump(UnfitPath::Pull);
                                     warn!(
@@ -2406,6 +2510,7 @@ where
                 partial: false,
                 replay: true,
                 replay_records: replay_records.clone(),
+                records_ahead_of: None,
             },
         )
         .await?;
@@ -3262,12 +3367,60 @@ where
                     partial: asked_partial,
                     replay: false,
                     replay_records: None,
+                    records_ahead_of: None,
                 },
             )
             .await?;
             read_frame(stream).await?
         }
     };
+
+    // Records sent ahead of their entry: an answer of records alone that covers
+    // nothing (no entry, no partial end, not the tail) names in `scanned_to` the
+    // first entry of the window, which cannot cross with the records riding at or
+    // below it. They are stored now, ahead of the effect, and the window is asked
+    // again in this contact naming that entry, which the peer then sends without
+    // them. Once a round.
+    let mut records_ahead_of = None;
+    if let Message::Entries {
+        entries,
+        scanned_to,
+        exhausted: false,
+        passed_through: None,
+        records,
+        ..
+    } = &answer
+        && entries.is_empty()
+        && !records.is_empty()
+    {
+        let ahead_of = *scanned_to;
+        kimmy_storage::blocking(|| {
+            engine.apply_batch_carrying(&[], records, kimmy_storage::RecordsVia::Pull)
+        })
+        .map_err(|e| from_storage(e, ProtocolError::Malformed))?;
+        debug!(
+            %peer,
+            ?ahead_of,
+            records = records.len(),
+            "stored the idempotency records a peer sent ahead of an entry; asking for the entry"
+        );
+        records_ahead_of = Some(ahead_of);
+        write_frame(
+            stream,
+            &Message::AskEntries {
+                from,
+                limit,
+                held: held.clone(),
+                marked: marked.clone(),
+                partial: asked_partial,
+                replay: false,
+                replay_records: None,
+                records_ahead_of,
+            },
+        )
+        .await?;
+        answer = read_frame(stream).await?;
+    }
 
     if let Message::BatchTooLarge { fits } = answer {
         if fits == 0 {
@@ -3288,6 +3441,7 @@ where
             partial: asked_partial,
             replay: false,
             replay_records: None,
+            records_ahead_of,
         };
         write_frame(stream, &retry).await?;
         answer = read_frame(stream).await?;
@@ -10706,6 +10860,7 @@ mod tests {
                 partial: false,
                 replay: false,
                 replay_records: None,
+                records_ahead_of: None,
             };
             write_frame(&mut ours, &ask).await.unwrap();
             read_frame(&mut ours).await

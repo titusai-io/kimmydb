@@ -328,6 +328,18 @@ pub enum Message {
             deserialize_with = "lenient_replay_records"
         )]
         replay_records: Option<kimmy_storage::ReplayRecords>,
+        /// The requester stored, in this contact, the records the sender sent
+        /// ahead of the entry at this stamp (an answer of records alone, with no
+        /// entry and nothing covered, whose `scanned_to` named it): when that
+        /// entry is the window's first, the sender leaves out every record riding
+        /// at or below it, which the requester holds, so the entry crosses. Optional
+        /// and read leniently; a sender that predates it never sends records ahead.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_hlc"
+        )]
+        records_ahead_of: Option<Hlc>,
     },
     /// The answer, in stamp order, and where the window it came from ended.
     ///
@@ -1042,6 +1054,7 @@ mod tests {
                 partial: false,
                 replay: false,
                 replay_records: None,
+                records_ahead_of: None,
             },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
@@ -1051,6 +1064,7 @@ mod tests {
                 partial: false,
                 replay: false,
                 replay_records: None,
+                records_ahead_of: None,
             },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
@@ -1064,6 +1078,7 @@ mod tests {
                 partial: false,
                 replay: false,
                 replay_records: None,
+                records_ahead_of: None,
             },
             Message::Versions(populated_vector()),
             Message::Vectors {
@@ -1195,6 +1210,7 @@ mod tests {
                 partial: false,
                 replay: false,
                 replay_records: None,
+                records_ahead_of: None,
             },
         )
         .await
@@ -1214,7 +1230,8 @@ mod tests {
                 marked: Vec::new(),
                 partial: false,
                 replay: false,
-                replay_records: None
+                replay_records: None,
+                records_ahead_of: None
             }
         );
     }
@@ -1242,7 +1259,8 @@ mod tests {
                 marked: Vec::new(),
                 partial: false,
                 replay: false,
-                replay_records: None
+                replay_records: None,
+                records_ahead_of: None
             },
             "a request without the field must read as one that did not send it"
         );
@@ -1264,7 +1282,8 @@ mod tests {
                 marked: Vec::new(),
                 partial: false,
                 replay: false,
-                replay_records: None
+                replay_records: None,
+                records_ahead_of: None
             },
             "a field this build does not know must not fail the frame"
         );
@@ -1317,6 +1336,7 @@ mod tests {
             partial: false,
             replay: false,
             replay_records: None,
+            records_ahead_of: None,
         };
         let sent = body_of(&plain, "AskEntries").await;
         assert!(!sent.contains_key("replay") && !sent.contains_key("replay_records"), "{sent}");
@@ -1328,6 +1348,7 @@ mod tests {
             partial: false,
             replay: true,
             replay_records: Some(cursor.clone()),
+            records_ahead_of: None,
         };
         let sent = body_of(&ask, "AskEntries").await;
         assert_eq!(sent.get_bool("replay").ok(), Some(true), "{sent}");
@@ -1465,6 +1486,7 @@ mod tests {
             partial: true,
             replay: false,
             replay_records: None,
+            records_ahead_of: None,
         };
         let sent = body_of(&ask, "AskEntries").await;
         assert_eq!(
@@ -1488,7 +1510,8 @@ mod tests {
                 marked: Vec::new(),
                 partial: false,
                 replay: false,
-                replay_records: None
+                replay_records: None,
+                records_ahead_of: None
             },
             "a request from before the field asks for a whole window"
         );
@@ -1817,6 +1840,7 @@ mod tests {
             partial: false,
             replay: false,
             replay_records: None,
+            records_ahead_of: None,
         };
         let mut written = Vec::new();
         write_frame(&mut written, &request).await.unwrap();
@@ -1850,7 +1874,8 @@ mod tests {
                 marked: Vec::new(),
                 partial: false,
                 replay: false,
-                replay_records: None
+                replay_records: None,
+                records_ahead_of: None
             },
             "a request without the field must read as one naming no spans"
         );

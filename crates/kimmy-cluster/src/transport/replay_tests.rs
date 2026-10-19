@@ -2694,3 +2694,103 @@ async fn a_truncated_inbound_replay_page_keeps_its_last_entrys_record() {
 async fn a_truncated_outbound_replay_page_keeps_its_last_entrys_record() {
     a_truncated_replay_page_keeps_its_last_entrys_record(true).await;
 }
+
+/// A pulled window's first entry and the record riding at that entry's own stamp
+/// (a keyed `find_and_modify`, whose record holds the document it returned)
+/// together overfill a frame, though each alone fits. No partial window of
+/// records alone can carry the record, which rides at the entry and not below
+/// it: the record goes ahead of the entry, with nothing covered, and the window
+/// asked again naming that entry leaves it out, so the entry crosses.
+#[test]
+fn an_entry_and_its_own_record_that_overfill_a_frame_send_the_record_ahead() {
+    let node = NodeId::from_bytes([3; 16]);
+    let at = Stamp::new(Hlc::new(100, 0), node);
+    let entry = OplogEntry {
+        stamp: at,
+        kind: OpKind::Update,
+        collection: kimmy_core::CollectionId(1),
+        doc_id: Some(kimmy_core::DocId::Int64(1)),
+        body: Some(
+            bson::serialize_to_vec(&bson::doc! { "_id": 1i64, "pad": "e".repeat(5_000) }).unwrap(),
+        ),
+    };
+    let record = kimmy_storage::IdempotencyRecord {
+        fingerprint: kimmy_core::Fingerprint([3; 32]),
+        first: at,
+        last: at,
+        origin: node,
+        state: kimmy_storage::RecordState::Done,
+        contested: false,
+        outcome: kimmy_storage::RecordOutcome::FindAndModify {
+            matched: true,
+            modified: true,
+            removed: false,
+            upserted_id: None,
+            stamp: Some(at),
+            document: Some(bson::doc! { "_id": 1i64, "pad": "e".repeat(5_000) }),
+        },
+    };
+    let carried = kimmy_storage::CarriedRecord {
+        collection: kimmy_core::CollectionId(1),
+        scope: kimmy_core::ScopeHash([3; 32]),
+        carrying: Some(at),
+        record: record.encode(),
+    };
+    let _budget = EntryBudget::set(8 * 1024);
+    assert!(record_bytes(&carried).unwrap() < 8 * 1024, "premise: the record alone fits");
+    let entries = [entry];
+    let records = [carried.clone()];
+    assert!(matches!(how_many_fit(&entries, &records, 0), Fits::Only(0)), "premise");
+    assert!(records_alone_window(&entries, &records, 0, Hlc::new(1, 0)).is_none(), "premise");
+    let (ahead_of, ahead) = records_ahead(&entries, &records, 0).expect("the record goes ahead");
+    assert_eq!((ahead_of, ahead), (at.hlc, vec![carried.clone()]));
+    // Asked again naming the entry: the record is left out, and the entry fits.
+    let (mut records, mut unanchored) = (vec![carried], 0);
+    leave_out_records_ahead(&entries, &mut records, &mut unanchored, Some(at.hlc));
+    assert!(records.is_empty());
+    assert!(matches!(how_many_fit(&entries, &records, unanchored), Fits::All));
+}
+
+/// The same over the real serve and pull: a keyed `find_and_modify` on S whose
+/// entry and record each hold a document of about 5 KiB, under an 8 KiB frame.
+/// M's pull takes the record ahead and then the entry, in one contact, and a
+/// retry on M is answered from the record.
+#[tokio::test]
+async fn a_pull_takes_a_find_and_modifys_record_ahead_of_its_entry_in_one_contact() {
+    let s_dir = tempfile::tempdir().unwrap();
+    let s = Engine::open(&s_dir.path().join("kimmy.redb")).unwrap();
+    let orders = s.create_collection("shop", "orders").unwrap();
+    s.insert(&orders, bson::doc! { "_id": 1i64, "n": 0i64, "pad": "x".repeat(5_000) }).unwrap();
+    let m_dir = tempfile::tempdir().unwrap();
+    let m = Engine::open(&m_dir.path().join("kimmy.redb")).unwrap();
+    pull_all(&m, &s);
+    let k = lost_key(9);
+    let kimmy_storage::Keyed::Fresh(_) = s
+        .find_and_modify_keyed(
+            &orders,
+            &kimmy_storage::Candidates::Scan,
+            &IncN,
+            &k,
+            kimmy_storage::ReturnedImage::After,
+        )
+        .unwrap()
+    else {
+        panic!("a fresh key")
+    };
+    let _budget = EntryBudget::set(8 * 1024);
+    pull_round(&m, &s).await.expect("one contact takes the record and then the entry");
+    let morders = m.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&m, 1), 1, "the entry crossed");
+    assert!(m.idempotency_record(morders.id, &k.scope).unwrap().is_some(), "with its record");
+    let retry = m
+        .find_and_modify_keyed(
+            &morders,
+            &kimmy_storage::Candidates::Scan,
+            &IncN,
+            &k,
+            kimmy_storage::ReturnedImage::After,
+        )
+        .unwrap();
+    assert!(matches!(retry, kimmy_storage::Keyed::Replayed(_)), "{retry:?}");
+    assert_eq!(n_of(&m, 1), 1, "applied once");
+}
