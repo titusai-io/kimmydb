@@ -2101,6 +2101,7 @@ fn plant_large_change(f: &Fixture, bytes: usize) {
         last: at,
         origin: node,
         state: kimmy_storage::RecordState::Done,
+        contested: false,
         outcome: kimmy_storage::RecordOutcome::FindAndModify {
             matched: true,
             modified: true,
@@ -2270,6 +2271,7 @@ async fn a_page_filled_by_what_changed_since_the_cursor_keeps_its_key_and_is_cou
             last: at,
             origin: node,
             state: kimmy_storage::RecordState::Done,
+            contested: false,
             outcome: kimmy_storage::RecordOutcome::FindAndModify {
                 matched: true,
                 modified: true,
