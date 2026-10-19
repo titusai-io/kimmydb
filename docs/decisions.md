@@ -1443,6 +1443,10 @@ neither is worth guessing.
 > pass stayed diverged. A rewind lowers each vector to its target, and further only below a document it restores, in
 > its own transaction (`Engine::lower_vectors_in`).
 
+> **Amended by [ADR-246](#adr-246--a-rewind-removes-a-document-created-after-its-target-without-a-tombstone).** A document created after the
+> target is removed and leaves no tombstone: a tombstone outranked a write of it at or below the target that another
+> member keeps. A document deleted at the target keeps its delete's own tombstone, as before.
+
 **Decision.** `kimmyd restore --from <backup> --until <ms>` restores a backup and
 then rewinds document state to that instant using the oplog the backup carries.
 It refuses — having written nothing — when the target predates the oplog
@@ -16586,6 +16590,12 @@ phase.
 > also carries, under the member's own origin, the newest tombstone it minted, and a start resumes its clock past
 > every stamp a record names.
 
+> **Amended by [ADR-246](#adr-246--a-rewind-removes-a-document-created-after-its-target-without-a-tombstone).** A rewind removes a document
+> created after its target without a tombstone and mints none, so a peer sending back an entry the rewind discarded
+> is held again here, at a new place in the arrival order. A token naming such an entry is `410` whether or not the
+> member holds it again, which is what this decision's "a peer sending the entry back does not change that" now rests
+> on.
+
 > **Corrects [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud)'s**
 > "resume tokens that are portable across nodes", which `docs/clients.md`, the
 > Rust and Python clients and `openapi.yaml` repeated as "a reconnect may land
@@ -28859,6 +28869,13 @@ Mutation rows in bash, one per clause.
 > and [ADR-173](#adr-173--a-resume-token-carries-its-issuing-members-delivered-vector-and-resumes-on-any-member).**
 > Not a rollback boundary: no format, table, key or schema changes, and `I_EPOCH` is unchanged.
 
+> **Amended by [ADR-246](#adr-246--a-rewind-removes-a-document-created-after-its-target-without-a-tombstone).** A document the rewind
+> removes leaves no tombstone, and a removal bounds the vectors as a restore does, with `F` no higher than the
+> oplog horizon. The rewind mints no tombstone, so its record names only what it discarded, and the
+> clock still resumes past it; the mutation rows on the minted tombstones go with them. Lowering only the origins the
+> rewind discarded an entry of is no longer equivalent: a removed document's judged write can be of an origin
+> nothing was discarded from.
+
 **The case.** B drops `items`. B's retention pass collects B's own drop entry before A or C has taken it (they are
 past the oplog window and within the tombstone window). B is rewound (`kimmyd restore --until`) to a moment after the
 pass, discarding nothing. A, which never heard of the drop, writes into `items`. Without the rewind, A's next pull
@@ -28975,9 +28992,8 @@ peer is told `Collected`), `a_rewind_of_a_restored_store_after_retention_keeps_t
 (a snapshot's grant and a write that lost last-writer-wins),
 `a_rewind_that_restores_a_document_bounds_the_vectors_by_it_and_by_what_it_keeps`,
 `a_rewind_that_fails_while_lowering_the_vectors_writes_nothing`,
-`a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded_and_minted`,
-`a_start_after_a_rewind_resumes_past_a_peers_discarded_stamp` and
-`a_start_resumes_past_a_tombstone_minted_for_a_peers_insert`. The convergence model gains a retention step (the
+`a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded` and
+`a_start_after_a_rewind_resumes_past_a_peers_discarded_stamp`. The convergence model gains a retention step (the
 oplog window passed, the tombstones kept) and a rewind step, taken by named rows only, and its ghost forgets a write a
 rewind undid that no other member witnessed. Its rows, on every route: the case above with a control without the
 rewind; a restored document and a loser it judged (one member rewound, and every member); a restored document and a
@@ -29099,3 +29115,131 @@ Mutations, in bash, each failing a test with only that change:
 One more is argued equivalent rather than run: marking in a second transaction after the records commit behaves the same
 in every test and differs only on a crash between the two commits, which is why the marks are written in the records'
 transaction.
+
+---
+
+## ADR-246 — A rewind removes a document created after its target without a tombstone
+
+> **Amends [ADR-044](#adr-044--point-in-time-restore-rewinds-from-post-images-and-refuses-what-it-cannot-reconstruct)
+> and [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-further-only-below-a-document-it-restores).**
+> Not a rollback boundary: no format, table, key or schema changes.
+
+**The case.** C inserts `orders/1` at t150. B takes an insert of the same `_id` stamped t300 first, its own or A's,
+so C's insert loses last-writer-wins on B and is witnessed without an append (ADR-054). B is rewound to t200. B's
+oplog holds no entry of the document at or below the target and its earliest entry after it is an insert, so the
+rewind removes the document (ADR-044's table). It left a tombstone stamped at the rewind's clock, above every stamp B
+had seen, and that tombstone outranks C's t150 write, which is at or below the target and is to be kept:
+- B never took C's write again. A re-served entry, a page's row and a converge row all lose to the newer tombstone,
+  so the cluster stayed diverged, whether B alone was rewound or every member was (A and B remove the document, C
+  keeps its own). It did before ADR-243 as well.
+- Once the rewound member writes anything again, its servable vector covers the tombstone's stamp, and a page that
+  carries the tombstone is no longer refused by the coverage check (ADR-163). A converge page (ADR-237), a scoped page
+  or a whole-database page then deletes C's write on the member that takes it, which appends the delete and passes it
+  on by entries. In the convergence model every member ended without the document on the pages route.
+
+**Decision.** A document the rewind removes leaves no row: no tombstone takes its place. A document deleted at the
+target keeps its delete's own tombstone, at its own stamp, as before. And a removal bounds both vectors as a restored
+document does (ADR-243), with `F` at the oplog horizon:
+
+`after[X] = min(V[X], until)`, and also at most `max(F, kept[X], collected[X])` when the rewind restores or removes a
+document,
+
+where `F` is the lowest stamp among the entries the rewind restored, and no higher than the oplog horizon when it
+removes one.
+
+**Why no tombstone.** The member's oplog holds no entry of the document at or below the target. It has no evidence
+the document existed then, and none that it did not: a write of it at or below the target that it judged against
+the discarded insert, or that a whole-database grant covered, is held elsewhere. No row loses to every write, so the
+rewound members' states merge to the newest write at or below the target that any member keeps, which is ADR-044's
+"it did not exist yet — remove it" taken literally. A tombstone needs a stamp, and none serves:
+- one above the target outranks the kept write;
+- one at or below it outranks every kept write below it, and a stamp of the past under a real origin can be another
+  write's own stamp, whose entry a receiver that still holds it would have overwritten (an oplog entry's key is its
+  stamp);
+- one below every write outranks nothing, travels to every member as a bare tombstone (ADR-228) and is collected at
+  the next pass.
+
+**Why the floor, and why at the horizon.** A removed document holds nothing, so a write of it at or below the target
+that the member judged can be of any origin. Bounded at the horizon, the member asks again by entries for every write
+of every origin above the horizon and above what it keeps, and takes the judged write onto the row it no longer holds.
+No lower: below the horizon the member's retention may have collected a delete and its tombstone, while a peer whose
+own pass has not run still serves the insert before it, which the member would take onto the empty row and the count
+repair would then spread to every member
+(`a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected`). At the horizon it is ADR-243's
+bound, so invariant I, witnessed at least servable, ADR-160, the coverage of what retention collected, and ADR-243's
+argument that a re-fetch brings back no insert whose delete this member collected, all hold as given there
+(`row_a_rewind_that_removes_a_document_brings_back_no_deleted_one`). Beside a restored entry below the horizon, a late
+arrival, the floor is that entry, as for a restore alone: a write judged above it is asked for again
+(`row_a_removal_beside_a_restored_entry_below_the_horizon_floors_at_that_entry`), and there the bound's `collected`
+term is what keeps the member's collected entries covered
+(`row_a_removal_beside_a_late_restored_entry_keeps_the_members_collected_drop`). The clock is unchanged: no tombstone
+is minted, the record names what the rewind discarded, and a start resumes past it (ADR-243).
+
+**Residuals, accepted.**
+- **A judged write below a kept entry of its origin, or at or below the horizon.** Invariant I keeps the member's
+  coverage of that origin at the kept entry, and the floor at the horizon, above the judged write. One at or below the
+  horizon arrived late (ADR-243's late arrival), or arrived on time and lost before the retention pass that collected
+  past it, which takes a target within the reordering delay of the horizon
+  (`a_removal_leaves_an_on_time_judged_write_at_or_below_the_horizon_to_the_repair`). No pull sends it again. The
+  divergence check repairs it: the count half
+  replays the collection onto the row the member no longer holds, and a young converge row (ADR-237) or a page does the
+  same. The convergence model's `row_a_rewind_that_removes_a_document_below_a_kept_entry_of_the_judged_origin`
+  converges on the repaired and pages routes, and the cluster harness's
+  `a_rewound_cluster_keeps_a_write_judged_against_an_insert_the_rewind_removes` is the case on real processes, every
+  member rewound to one target and healed by the check's repair.
+- **A delete only the rewound members applied, each replacing its tombstone by a write after the target, is
+  forgotten,** and a member that missed it writes back the document it holds from before the delete; that member missed
+  the delete for longer than the oplog window, which with `tombstone_retention_secs` equal to `oplog_retention_secs`
+  (the default) is past the tombstone window the operations guide bounds a partition by, ADR-085's stale rejoiner.
+  With `tombstone_retention_secs` above `oplog_retention_secs`, a member that lagged between the two windows is
+  within the tolerated partition, so the operations guide has the operator reset (wipe and resync) a member that was
+  out of touch with a rewound member for longer than the oplog window: ADR-085's remedy for a stale member, applied
+  at the oplog window. Pinned by `residual_a_rewind_forgets_a_delete_only_the_rewound_member_applied`.
+
+**A token naming a discarded entry stays `410`.** ADR-173 refused a token whose entry a rewind discarded while the
+member did not hold the entry, and a peer sending it back did not change that because the rewind's tombstone
+outranked it. With no tombstone the entry is held again, at a new place in the arrival order, after entries the
+client was never sent, so a stream resumed from it would skip them. The token check now refuses such a token
+whether or not the member holds the entry again. That is also what the change-stream guide already says (a token
+naming an entry a rewind discarded is `410`), and it covers an entry of a document the rewind put back to an earlier
+value, which a peer could already send back.
+
+**Rollback.** No format change. A 0.51 binary opens a store this build rewound: the removed documents are absent, the
+vectors keep every invariant 0.51 relies on, and the rewind's record keeps its layout. **A store rewound by 0.51 or
+earlier keeps the tombstones that rewind minted**, under the member's own node id and stamped after the rewind's
+target, at about the time it ran. Nothing tells them from a delete's, so nothing removes them at open. Once that
+member has written again, a page from it carries them to its peers, and a peer that takes one deletes the kept write
+there and passes the delete on as an entry under the member's id. Restoring the member again from the same backup
+with this release removes the tombstones only while no peer holds such a delete. Once one does, the restored member
+takes the delete back by entries, and the write stays deleted on every member that took it. Each document is then to
+be inserted again, through any member, with its value taken from a member that was not rewound, as it stood before
+the delete reached that member (a backup of it from before then, or its live store while it has not taken the
+delete); never from the
+rewound member's own backup from before the rewind, which holds the write the rewind undid. With no such copy, the
+value cannot be recovered from the cluster (the operations guide).
+
+**Tests.** `rewind.rs`: `a_document_created_after_the_target_is_removed` (no record, the count, the index),
+`a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged`,
+`a_rewind_that_removes_a_document_after_retention_keeps_the_coverage_of_what_retention_collected` and
+`a_rewind_that_restores_one_document_and_removes_another_is_bounded_by_the_removal`; ADR-243's
+`a_rewind_lowers_every_origin_it_discarded_to_the_target_and_no_lower` now discards by restoring, and
+`a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded` checks that the removed documents leave no record.
+The convergence model, on every route and by pure entries too: a removal and a judged write (B alone rewound, every
+member, and every member with C's write lost on C too), the same followed by a write of a rewound member, a removal
+over a deleted document, a document deleted at the target, a removed row that was itself a tombstone, a judged write
+above a non-zero horizon, and a removal beside a restored entry below the horizon. On the repaired and pages routes,
+which the divergence check's repairs close: a removal after a retention pass (pure entries do not close that case
+without a rewind either), the same beside a late restored entry, and a judged write below a kept entry (the first
+residual); a judged write at or below the horizon, which pure entries leave to the repair, is pinned so.
+`a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected` runs one member's retention pass
+ahead of the others'. The residual of a forgotten delete is pinned by its exact shape. The cluster harness as above.
+Mutation rows, in bash, each failing a test with only its own change: the removal leaving a tombstone at the rewind's
+clock; leaving one at the target; no bound when the rewind only removes; the bound under a removal taken from a
+restored entry when there is one; the removed row deleted without its count; the removed row left in its index; the
+bound only on origins whose coverage passes the target; the bound applied when the rewind neither restores nor
+removes; a discarded entry's token refused only while the member does not hold the entry again
+(`a_rewound_entry_a_peer_sends_back_stays_refused`); the removal's floor at zero, below the horizon; the row of a
+document deleted at the target removed; only a removed live row bounding the vectors; the removal's floor at the
+horizon even beside a lower restored entry; and the bound without what retention collected, killed beside a late
+restored entry, with a removal or without (for a removal alone it changes nothing: the floor at the horizon is at or
+above every collected stamp).
