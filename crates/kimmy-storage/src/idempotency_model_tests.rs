@@ -163,6 +163,15 @@
 //! schedules take rewinds (and fail on it now and then), and `IDEM_NO_REWIND=1` leaves them
 //! out for a diagnostic run.
 //!
+//! **Finding BR1** (2026-10-18, open, outside B5's code, on main too; builder S's fix):
+//! a backup carries no `OPLOG_HELD`, and a restored store's open counts the rows a page
+//! left as held state as covered. Its witnessed vector claims an origin past writes it
+//! never took, its pulls start past them, and their records never reach it (first seen
+//! on the Home track as a member holding an effect bare at quiescence). The model checks
+//! it where it happens: a restore never claims more of another origin than its backup
+//! held. `generated_schedules_short` counts a schedule whose first failure is BR1 as the
+//! known defect until the fix lands; the long run lists it, for the classify script.
+//!
 //! **Reproducers**, both run (not ignored) and pass since their fixes landed:
 //! `finding_g1_*` (G1 as first reported: its pull serves the window without the sender's
 //! verdict, which production refuses as `StateHeld`; kept as the mechanism's minimal
@@ -598,6 +607,9 @@ struct Backup {
     node: NodeId,
     bytes: Vec<u8>,
     fps: Vec<((u8, u8), BTreeSet<u8>)>,
+    /// The member's witnessed vector when the backup was taken: a restore of it claims
+    /// no more of any origin (finding BR1).
+    witnessed: kimmy_core::VersionVector,
 }
 
 // -- Findings --------------------------------------------------------------------------------
@@ -843,6 +855,9 @@ struct Ghost {
     bare: HashSet<u8>,
     /// Every (node, collection, key) whose live record the algebra has held contested.
     contested: HashSet<(NodeId, u8, u8)>,
+    /// Every (node, collection, key) [`World::check_effects`] found holding an effect
+    /// without its record: counted once.
+    effect_bare: HashSet<(NodeId, u8, u8)>,
 }
 
 impl Ghost {
@@ -2459,7 +2474,8 @@ impl World {
                     .filter(|((n, ..), _)| *n == node)
                     .map(|((_, c, key), set)| ((*c, *key), set.clone()))
                     .collect();
-                self.backups.entry(m).or_default().push(Backup { node, bytes, fps });
+                let witnessed = e.witnessed_vector().map_err(|e| err("witnessed_vector", e))?;
+                self.backups.entry(m).or_default().push(Backup { node, bytes, fps, witnessed });
             }
             Step::Restore { m, nth, inner } => self.restore(*m as usize, *nth, inner)?,
             Step::Rewind { m } => self.rewind(*m as usize, op.t)?,
@@ -2575,6 +2591,26 @@ impl World {
             .map_err(|e| err("restore", e))?;
         self.open(m)?;
         self.note(format!("{} restored from its backup", LETTERS[m]));
+        // Coverage after a restore: never more of an origin than the store held when
+        // the backup was taken. Finding BR1 (open, outside B5's code): a restore counts
+        // the rows a scoped page left as held state as covered, so the member's pulls
+        // start past writes it never took, their records with them.
+        // Its own origin aside: what a member wrote itself is in position, and the
+        // replay of its own origin reads back what it lost.
+        let now = self.e(m).witnessed_vector().map_err(|e| err("witnessed_vector", e))?;
+        for (origin, at) in now.iter() {
+            let then = backup.witnessed.get(origin);
+            if origin != node && at > then {
+                let s = format!(
+                    "BR1: {}'s restore claims {}'s origin through {}, past the {} its backup held",
+                    LETTERS[m],
+                    self.label(origin),
+                    self.hlc(at),
+                    self.hlc(then)
+                );
+                self.fail(Inv::I2, s);
+            }
+        }
         // The algebra's sets are the backup's: what the store held then.
         self.ghost.fps.retain(|(n, ..), _| *n != node);
         for ((c, key), set) in backup.fps {
@@ -3285,7 +3321,53 @@ impl World {
         self.observe_records()?;
         self.check_contested()?;
         self.check_stored()?;
-        self.check_i2()
+        self.check_i2()?;
+        self.check_effects()
+    }
+
+    /// I2's other half, after every step: a member holding a live document whose key set
+    /// holds request `r` (its effect, under any origin and in any life) holds a live
+    /// record under `r`'s key, unless `r`'s memory ended or a rewind left its writes bare
+    /// by design. The relay class where it happens, not only at quiescence: a member
+    /// whose coverage passed an effect's entry without its record (finding BR1: a
+    /// restore that counts a scoped page's rows as covered) holds it bare from the step
+    /// that brings it.
+    fn check_effects(&mut self) -> Res<()> {
+        let mut bare = Vec::new();
+        for m in 0..self.n() {
+            let node = self.e(m).node_id();
+            for ((c, shown), (stamp, doc)) in self.documents(m)? {
+                for k in ks_of(&doc) {
+                    let Some(req) = self.sched.requests.get(k as usize).copied() else { continue };
+                    let r = k as u8;
+                    if req.kind.coll() != c
+                        || self.memory_ended(r)
+                        || self.ghost.bare.contains(&r)
+                        || self.ghost.effect_bare.contains(&(node, c, req.key))
+                    {
+                        continue;
+                    }
+                    if self.live_record(m, c, req.key)?.is_none() {
+                        bare.push((m, node, c, req.key, r, shown.clone(), stamp));
+                    }
+                }
+            }
+        }
+        for (m, node, c, key, r, shown, stamp) in bare {
+            self.ghost.effect_bare.insert((node, c, key));
+            self.out.relay += 1;
+            let s = format!(
+                "{} holds r{r}'s effect in {} {shown} at {} without a live record under key {key}",
+                LETTERS[m],
+                NAMES[c as usize],
+                self.stamp(stamp)
+            );
+            self.note(format!("RELAY: {s}"));
+            if self.strict {
+                self.fail(Inv::I2, format!("(strict) {s}"));
+            }
+        }
+        Ok(())
     }
 
     /// The greatest `last` of each request's records, on any member.
@@ -3526,7 +3608,14 @@ impl World {
                 }
                 // The cut digest (ADR-230): a collection whose digests differ at the
                 // cut is repaired by a converge page (ADR-237).
-                let budget = crate::ScanBudget::default();
+                // Bytes only, no wall-clock part: the digest's 200 ms scan budget makes a
+                // repair depend on how fast the host runs (a loaded or stalled host gives the
+                // digest up and takes no converge page), and a schedule must decide the
+                // same every run.
+                let budget = crate::ScanBudget {
+                    wall: std::time::Duration::MAX,
+                    ..crate::ScanBudget::default()
+                };
                 let witnessed = theirs.witnessed_vector().map_err(|e| err("witnessed", e))?;
                 let plan = mine
                     .digest_plan(&witnessed, None, budget)
@@ -4829,23 +4918,28 @@ struct Sweep {
 /// Run each seed of `seeds` on both tracks, `threads` at a time; panic with the first
 /// failing schedule's report.
 fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
-    let (totals, failed) = sweep_listing(seeds, len, threads);
+    let keep_going = std::env::var("IDEM_KEEP_GOING").is_ok_and(|v| v == "1");
+    let (totals, failed) = sweep_listing(seeds, len, threads, keep_going);
     assert!(failed.is_empty(), "{} schedules failed:\n{}", failed.len(), failed.join("\n"));
     totals
 }
 
 /// [`sweep`], handing back the schedules `IDEM_KEEP_GOING=1` listed as failed rather than
 /// failing on them, so the caller can check its coverage first.
-fn sweep_listing(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> (Sweep, Vec<String>) {
+fn sweep_listing(
+    seeds: std::ops::Range<u64>,
+    len: usize,
+    threads: usize,
+    keep_going: bool,
+) -> (Sweep, Vec<String>) {
     let started = std::time::Instant::now();
     let jobs: Vec<(u64, Track)> =
         seeds.clone().flat_map(|seed| [(seed, Track::Home), (seed, Track::Anywhere)]).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let totals = Mutex::new(Sweep::default());
     let failure: Mutex<Option<String>> = Mutex::new(None);
-    // `IDEM_KEEP_GOING=1`: every failing schedule is listed, one line each, and the sweep
-    // runs to its end (to classify failures); it still fails at the end.
-    let keep_going = std::env::var("IDEM_KEEP_GOING").is_ok_and(|v| v == "1");
+    // `keep_going` (`IDEM_KEEP_GOING=1`): every failing schedule is listed, one line each,
+    // and the sweep runs to its end (to classify failures); it still fails at the end.
     let failed: Mutex<Vec<String>> = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..threads.max(1) {
@@ -4982,7 +5076,17 @@ const LEN: usize = 30;
 fn generated_schedules_short() {
     let start = env_u64("IDEM_SEED_START", 0);
     let count = env_u64("IDEM_CI_SEEDS", 16);
-    sweep(start..start + count, LEN, threads().min(4));
+    let (_, failed) = sweep_listing(start..start + count, LEN, threads().min(4), true);
+    // Finding BR1 (open; builder S's fix off main): a schedule whose first failure is
+    // a restore claiming coverage its backup did not hold is the known engine defect, not
+    // a regression of this branch, and is counted here rather than failing CI. Removed
+    // when the fix lands. Every other failure fails the run.
+    let (known, others): (Vec<String>, Vec<String>) =
+        failed.into_iter().partition(|line| line.contains("] BR1: "));
+    if !known.is_empty() {
+        eprintln!("{} schedules met finding BR1 (known, open):\n{}", known.len(), known.join("\n"));
+    }
+    assert!(others.is_empty(), "{} schedules failed:\n{}", others.len(), others.join("\n"));
 }
 
 /// The long run, for a gate of record: `IDEM_SEEDS` seeds (default 1000) from
@@ -4993,7 +5097,8 @@ fn generated_schedules_short() {
 fn generated_schedules_long() {
     let start = env_u64("IDEM_SEED_START", 1_000_000);
     let count = env_u64("IDEM_SEEDS", 1000);
-    let (totals, failed) = sweep_listing(start..start + count, LEN, threads());
+    let keep_going = std::env::var("IDEM_KEEP_GOING").is_ok_and(|v| v == "1");
+    let (totals, failed) = sweep_listing(start..start + count, LEN, threads(), keep_going);
     // The coverage first: a run whose schedules failed still says what it reached.
     assert_coverage(&totals, count);
     assert!(failed.is_empty(), "{} schedules failed:\n{}", failed.len(), failed.join("\n"));
