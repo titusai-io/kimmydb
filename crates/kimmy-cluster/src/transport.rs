@@ -45,11 +45,12 @@ use crate::repair_ledger::{
     Confirmed, End, Judged, Key as LedgerKey, LedgerKind, MayPlan, RepairLedger, Transient, Verdict,
 };
 
-/// How much of a frame the entries themselves may occupy.
+/// How much of a frame the entries and records themselves may occupy, each with
+/// its element's framing in the message's array ([`ELEMENT_FRAMING`]).
 ///
-/// The rest is the `Entries` envelope and BSON's per-element overhead in an array,
-/// both small; a mebibyte of slack is far more than either needs and costs one
-/// entry's worth of throughput in the rare case this matters at all.
+/// The rest is the `Entries` envelope, small; a mebibyte of slack is far more than
+/// it needs and costs one entry's worth of throughput in the rare case this
+/// matters at all.
 const ENTRY_BUDGET: usize = MAX_FRAME - (1024 * 1024);
 
 #[cfg(test)]
@@ -67,6 +68,13 @@ pub(crate) fn entry_budget() -> usize {
     }
     ENTRY_BUDGET
 }
+
+/// What an entry or a record costs a frame beyond its own encoding: its
+/// element's framing in the message's array, a type byte and its index as a C
+/// string. Not a measure: a bound, at least 9 bytes at a million elements. A
+/// frame of a few hundred thousand small records would otherwise pass the
+/// [`ENTRY_BUDGET`]'s slack by this alone.
+const ELEMENT_FRAMING: usize = 16;
 
 /// Whether a batch fits in one frame, and how much of it does if not.
 pub(crate) enum Fits {
@@ -90,7 +98,8 @@ pub(crate) enum Fits {
 ///   it; a record whose row is past every entry counts at the window's end, and
 ///   when it does not fit there the window is cut before its last entry.
 ///
-/// Sizes each entry and record once and takes a running total, rather than
+/// Each entry and record counts its own encoding and its element's framing
+/// ([`ELEMENT_FRAMING`]). Sizes each once and takes a running total, rather than
 /// serializing the whole batch to find out it is too big and then doing it
 /// again for a smaller one. The common case is a single pass that says `All`.
 pub(crate) fn how_many_fit(
@@ -103,7 +112,7 @@ pub(crate) fn how_many_fit(
     let mut total = 0usize;
     for record in &records[..unanchored] {
         match bson::serialize_to_vec(record) {
-            Ok(bytes) => total += bytes.len(),
+            Ok(bytes) => total += bytes.len() + ELEMENT_FRAMING,
             Err(_) => return Fits::Nothing,
         }
     }
@@ -114,7 +123,7 @@ pub(crate) fn how_many_fit(
     let mut at_end = 0usize;
     for record in &records[unanchored..] {
         let size = match bson::serialize_to_vec(record) {
-            Ok(bytes) => bytes.len(),
+            Ok(bytes) => bytes.len() + ELEMENT_FRAMING,
             // As an entry that does not encode: the frame would not either, so
             // nothing from the entry its row belongs with on is offered.
             Err(_) => {
@@ -134,7 +143,7 @@ pub(crate) fn how_many_fit(
     let mut next = 0usize;
     for (i, entry) in entries.iter().enumerate() {
         let mut size = match bson::serialize_to_vec(entry) {
-            Ok(bytes) => bytes.len(),
+            Ok(bytes) => bytes.len() + ELEMENT_FRAMING,
             // Unencodable here means unencodable in the batch too, so stopping short
             // hands the caller the prefix that can be sent and lets the real error
             // surface where it is reported properly.
@@ -200,7 +209,7 @@ pub(crate) fn stamp_before(stamp: kimmy_core::Stamp) -> kimmy_core::Stamp {
 /// The bytes a record costs a frame, as [`how_many_fit`] counts it; `None` for
 /// one that does not encode.
 fn record_bytes(record: &kimmy_storage::CarriedRecord) -> Option<usize> {
-    bson::serialize_to_vec(record).ok().map(|bytes| bytes.len())
+    bson::serialize_to_vec(record).ok().map(|bytes| bytes.len() + ELEMENT_FRAMING)
 }
 
 /// What a window none of whose entries fits with the records riding it carries
@@ -1975,8 +1984,10 @@ where
                     // records and no records position (C9 of the B5 design).
                     Ok(mut page) if strips_records(engine.node_id()) => {
                         page.records.clear();
+                        page.records_epoch = None;
                         if let Some(next) = page.next.as_mut() {
                             next.records = None;
+                            next.records_base = None;
                         }
                         page
                     }
@@ -7245,6 +7256,41 @@ mod tests {
         assert!(matches!(how_many_fit(&entries, &[record(30, big)], 1), Fits::Only(1)));
     }
 
+    /// A frame of many small records: each counts its element's framing in the
+    /// message's array, so the most records `how_many_fit` lets a window carry
+    /// make a frame `write_frame` takes. Counted by their own encodings alone,
+    /// about 260,000 records of 250 bytes passed the frame by some 2 MB of framing.
+    #[tokio::test]
+    async fn the_most_small_records_a_frame_is_let_carry_cross_in_one() {
+        use kimmy_core::{CollectionId, Hlc, NodeId, ScopeHash, Stamp};
+        let record = |i: u64| kimmy_storage::CarriedRecord {
+            collection: CollectionId(u64::MAX - i),
+            scope: ScopeHash([7; 32]),
+            carrying: Some(Stamp::new(Hlc::new(i, 0), NodeId::from_bytes([1; 16]))),
+            record: vec![1; 120],
+        };
+        let one = bson::serialize_to_vec(&record(0)).unwrap().len();
+        // As many as the fit counts within the budget, each with its framing, and
+        // one more: all of them the kind a window carries whatever else it
+        // carries, so they fit whole or not at all.
+        let lo = ENTRY_BUDGET / (one + ELEMENT_FRAMING);
+        let records: Vec<_> = (0..=lo as u64).map(record).collect();
+        assert!(lo > 200_000, "premise: a frame of small records ({lo})");
+        assert!(matches!(how_many_fit(&[], &records[..lo], lo), Fits::All), "the most that fit");
+        assert!(matches!(how_many_fit(&[], &records, lo + 1), Fits::Nothing), "and no more");
+        let message = Message::Entries {
+            entries: Vec::new(),
+            scanned_to: Hlc::ZERO,
+            exhausted: false,
+            passed_through: None,
+            records: records[..lo].to_vec(),
+            replay_records: None,
+        };
+        let mut written = Vec::new();
+        let sent = write_frame(&mut written, &message).await;
+        assert!(sent.is_ok(), "{lo} records the fit let ride: {sent:?}");
+    }
+
     /// The keys on a snapshot page and in the cut digest's uncovered lists are converted
     /// between the stored and the legacy (schema-4) form at the engine's wire API and
     /// nowhere else (Decimal128 design 7.1, review v2.3-delta M2): `snapshot_page`,
@@ -11065,6 +11111,38 @@ mod tests {
                 panic!("expected a Fault naming the document, got {:?}", other.map(|p| p.complete))
             }
         }
+    }
+
+    /// The same through the listener with binary `_id`s of 4 KiB, which cross as
+    /// arrays of integers, about ten bytes a byte: 512 documents of 110,000 bytes
+    /// were counted within a page and crossed at 78.9 MB, so the listener could
+    /// not write the page and the pull failed with no fault. Counted at the size
+    /// they cross in, the pages are cut to fit and the pull completes.
+    #[tokio::test]
+    async fn snapshot_pages_of_large_binary_ids_cross_within_a_frame() {
+        use kimmy_storage::SnapshotPolicy::All;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "bin").unwrap();
+        let pad = "x".repeat(110_000);
+        for chunk in 0..8u32 {
+            let docs = (0..64u32)
+                .map(|i| {
+                    let mut bytes = vec![0u8; 4096];
+                    bytes[..4].copy_from_slice(&(chunk * 64 + i).to_be_bytes());
+                    let id = bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes };
+                    bson::doc! { "_id": bson::Bson::Binary(id), "pad": pad.clone() }
+                })
+                .collect();
+            b.insert_many(&coll, docs).unwrap();
+        }
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let (served, pulled) = pull_through(&a, &b, Some(coll.id), All).await;
+        assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+        assert!(pulled.is_ok_and(|p| p.complete), "the pull completes");
+        let held = a.get_collection("shop", "bin").unwrap();
+        assert_eq!(a.count(&held, kimmy_storage::WalkScope::Request).unwrap(), 512);
     }
 
     /// A pushed window this node cannot apply is answered with a `Fault`

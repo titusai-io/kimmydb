@@ -296,9 +296,11 @@ fn a_records_only_page_inside_a_records_phase_keeps_the_phase() {
         }
         assert!(!progress.is_complete());
     }
-    // A delta too large for one page, so the next page is records-only.
+    // A delta too large for one page, so the next page is records-only: room for
+    // two records and the cursor the page carries.
     let one = y.idempotency_record(c2.id, &key_of(1_000).scope).unwrap().unwrap().encode().len();
-    y.set_record_delta_budget_for_test(Some((2 * (one + 96), idempotency::RECORD_DELTA_ROWS)));
+    let room = 2 * (one + 96) + crate::snapshot::cursor_reserve(0);
+    y.set_record_delta_budget_for_test(Some((room, idempotency::RECORD_DELTA_ROWS)));
     for i in 0..5u64 {
         fresh(y.insert_keyed(&c1, doc! { "_id": 100 + i as i64 }, &key_of(i)).unwrap());
     }
