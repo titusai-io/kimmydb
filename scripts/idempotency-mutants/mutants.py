@@ -4,7 +4,7 @@ source, applied once to a `git archive` export, run against its suites under a t
 and reverted by copying the pristine file back. A row whose text does not occur exactly
 once fails `check` and is never run.
 
-    mutants.py list [group]            names of the rows (group: design, fix-e, lives, delta, elsewhere, all)
+    mutants.py list [group]            names of the rows (group: design, fix-e, lives, delta, elsewhere, fixes, all)
     mutants.py check <tree>            every row applies to <tree>, exactly once
     mutants.py apply <name> <tree>     patch <tree> in place
     mutants.py files <name>            the files a row touches
@@ -124,7 +124,7 @@ ROWS = [
         };
         self.witness(&merged.first);
         self.witness(&merged.last);
-        if live.as_ref() == Some(&merged)
+        if stored.as_ref() == Some(&merged)
 """,
              """            None => record.clone(),
         };
@@ -132,7 +132,7 @@ ROWS = [
             self.witness(&merged.first);
             self.witness(&merged.last);
         }
-        if live.as_ref() == Some(&merged)
+        if stored.as_ref() == Some(&merged)
 """),
         ],
         "suites": MODEL,
@@ -154,12 +154,12 @@ ROWS = [
         "doc": "A receiver keeps the record it holds: records merged by first arrival",
         "patches": [
             ("crates/kimmy-storage/src/idempotency.rs",
-             """        let merged = match &live {
+             """        let merged = match live {
             Some(live) => live.merge(record),
             None => record.clone(),
         };
         self.witness(&merged.first);""",
-             """        let merged = match &live {
+             """        let merged = match live {
             Some(live) => live.clone(),
             None => record.clone(),
         };
@@ -173,8 +173,8 @@ ROWS = [
         "doc": "The merge keeps the winning record's `first`",
         "patches": [
             ("crates/kimmy-storage/src/idempotency.rs",
-             "        Self { first, ..winner.clone() }\n",
-             "        let _ = first;\n        winner.clone()\n"),
+             "        Self { first, contested, ..winner.clone() }\n",
+             "        let _ = first;\n        Self { contested, ..winner.clone() }\n"),
         ],
         "suites": MODEL,
     },
@@ -245,17 +245,8 @@ ROWS = [
         ],
         "suites": MODEL,
     },
-    {
-        "name": "life-rule-off",
-        "group": "design",
-        "doc": "No record is ever history: the life rule off",
-        "patches": [
-            ("crates/kimmy-storage/src/idempotency.rs",
-             "        self.is_history(memo, standing, collection, record.last)\n",
-             "        let _ = (memo, standing, collection, record);\n        Ok(false)\n"),
-        ],
-        "suites": MODEL,
-    },
+    # life-rule-off: retired with the life rule (ruling A): no record is history now,
+    # by design; G's A1 plants the life rule back at the lookup, its inverse.
     {
         "name": "records-at-shipped-stamps-only",
         "group": "fix-e",
@@ -360,23 +351,8 @@ ROWS = [
         "doc": "A replay page carries only the records whose carrying stamp is one of its entries (records_of)",
         "patches": [
             ("crates/kimmy-cluster/src/transport.rs",
-             """                    through.max(window.scanned_to),
-                    records_to_send(engine, window.records),
-                    window.unanchored,
-                );
-""",
-             """                    through.max(window.scanned_to),
-                    {
-                        let shipped: std::collections::HashSet<kimmy_core::Stamp> =
-                            entries.iter().map(|entry| entry.stamp).collect();
-                        records_to_send(engine, window.records)
-                            .into_iter()
-                            .filter(|r| r.carrying.is_some_and(|at| shipped.contains(&at)))
-                            .collect()
-                    },
-                    0,
-                );
-"""),
+             '    let unanchored = lead.len();\n    let mut all = lead;\n    all.extend(rest.into_values());\n',
+             '    let shipped: HashSet<kimmy_core::Stamp> = entries.iter().map(|entry| entry.stamp).collect();\n    let mut all: Vec<_> = lead\n        .into_iter()\n        .chain(rest.into_values())\n        .filter(|record| record.carrying.is_some_and(|at| shipped.contains(&at)))\n        .collect();\n    let unanchored = 0;\n'),
         ],
         "suites": [("kimmy-cluster", "--lib", "replay_tests", "no")],
     },
@@ -396,25 +372,16 @@ ROWS = [
         ],
         "suites": [("kimmy-storage", "--lib", "idempotency_tests::f3", "no")],
     },
-    {
-        "name": "purge-removes-every-record-under-the-id",
-        "group": "lives",
-        "doc": "The drop purger removes every record under the collection's id, a later life's too (P1 reverted)",
-        "patches": [
-            ("crates/kimmy-storage/src/idempotency.rs",
-             "                    Ok(Some(record)) => dropped.is_none_or(|at| record.last.hlc <= at.hlc),\n",
-             "                    Ok(Some(_)) => true,\n"),
-        ],
-        "suites": MODEL,
-    },
+    # purge-removes-every-record-under-the-id: retired with P1's purge of records (ruling
+    # A): a drop's purge leaves every record; G's A2 plants a purge that removes them.
     {
         "name": "ships-a-record-at-an-earlier-lifes-row",
         "group": "lives",
-        "doc": "A sender ships a record at a row below its first, one an earlier life under its key left",
+        "doc": "A sender ships a record at a row below its first, one an earlier record under its key (past its window, overwritten) left",
         "patches": [
             ("crates/kimmy-storage/src/idempotency.rs",
-             "            && carrying < standing.first\n",
-             "            && carrying < standing.first\n            && carrying.hlc == Hlc::MAX\n"),
+             "        if first.is_some_and(|first| carrying < first) {\n            return Ok(());\n        }\n",
+             ""),
         ],
         "suites": MODEL,
     },
@@ -458,8 +425,8 @@ ROWS = [
         "doc": "P's M02: delta only on the completing page (non-final pages carry none, base frozen at the first page's)",
         "patches": [
             ('crates/kimmy-storage/src/snapshot.rs',
-             '        let (records, documents, mut deleted_documents, next) = self.snapshot_rows(after, scope)?;',
-             '        let (records, documents, mut deleted_documents, next) = {\n            let whole = self.snapshot_rows(after.clone(), scope)?;\n            if whole.3.is_some() {\n                let frozen = after.as_ref().and_then(|a| a.records_base);\n                let stripped = after.clone().map(|c| SnapshotCursor { records_base: None, ..c });\n                let mut part = self.snapshot_rows(stripped, scope)?;\n                part.3 = part.3.map(|c| SnapshotCursor { records_base: frozen.or(c.records_base), ..c });\n                part\n            } else {\n                whole\n            }\n        };'),
+             '        let (records, documents, mut deleted_documents, next) = self.snapshot_rows(\n            after,\n            scope,\n            self.snapshot_rows_room(fixed),\n            first,\n            &mut records_epoch,\n        )?;\n',
+             '        let room = self.snapshot_rows_room(fixed);\n        let (records, documents, mut deleted_documents, next) = {\n            let whole = self.snapshot_rows(after.clone(), scope, room, first, &mut records_epoch)?;\n            if whole.3.is_some() {\n                let frozen = after.as_ref().and_then(|a| a.records_base);\n                let stripped = after.clone().map(|c| SnapshotCursor { records_base: None, ..c });\n                let mut part = self.snapshot_rows(stripped, scope, room, first, &mut records_epoch)?;\n                part.3 = part.3.map(|c| SnapshotCursor { records_base: frozen.or(c.records_base), ..c });\n                part\n            } else {\n                whole\n            }\n        };\n'),
         ],
         "suites": MODEL_ONLY,
         "timeout": 600,
@@ -598,6 +565,69 @@ ROWS = [
         ],
     },
 ]
+
+# The fix branches (Y, P2, G) and ruling A, as the model sees them: each row's killer
+# is a model row or the generated sweep, run against the model alone.
+FIXES = [
+    ("contested-without-the-fingerprints", "A merge of two fingerprints is not contested (KR's fingerprint half)",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "        let contested = self.contested || other.contested || self.fingerprint != other.fingerprint;\n",
+     "        let contested = self.contested || other.contested;\n"),
+    ("contested-from-the-winner", "A merged record is contested only when its winner is (the flag in the tie-break)",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "        let contested = self.contested || other.contested || self.fingerprint != other.fingerprint;\n",
+     "        let contested = winner.contested;\n"),
+    ("lookup-ignores-contested", "The lookup replays or resumes a contested record of its own fingerprint",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "        self.witness(&record.last);\n        if record.contested || record.fingerprint != keyed.fingerprint {\n",
+     "        self.witness(&record.last);\n        if record.fingerprint != keyed.fingerprint {\n"),
+    ("later-chunk-ignores-contested", "A later chunk writes on a record that turned contested since the chunk before",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "            self.witness(&record.last);\n            if record.contested || record.fingerprint != keyed.fingerprint {\n",
+     "            self.witness(&record.last);\n            if record.fingerprint != keyed.fingerprint {\n"),
+    ("past-window-record-stored", "A receiver stores a record past its window (m2), merged into a new request's",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "        if self.record_is_past_window(record) {\n            return Ok((None, false));\n        }\n",
+     ""),
+    ("zero-base-guard-off", "A page asked with the zero records base is applied though its sender's log began since (m4, guard ii)",
+     "crates/kimmy-storage/src/snapshot.rs",
+     "    (zero && page.records_epoch.is_some()).then(|| SnapshotCursor {\n",
+     "    (zero && page.records_epoch.is_some() && base.key.hlc != Hlc::ZERO).then(|| SnapshotCursor {\n"),
+    ("no-log-begun-over-restored-records", "An open over records with no log of this node begins none (m4, guard i)",
+     "crates/kimmy-storage/src/engine.rs",
+     "        crate::idempotency::begin_log_over_held_records(&engine)?;\n",
+     ""),
+    ("replay-page-records-off", "A replay page carries no record of its collections (B2 off, in storage)",
+     "crates/kimmy-storage/src/idempotency_replay.rs",
+     "                if record.last.hlc <= from\n",
+     "                if record.last.hlc <= Hlc::MAX\n"),
+    ("replay-records-carried-at-last", "B2's records carried at their last, not their first",
+     "crates/kimmy-storage/src/idempotency_replay.rs",
+     "                    carrying: Some(record.first),\n",
+     "                    carrying: Some(record.last),\n"),
+    ("replay-cursor-epoch-unguarded", "A replay's records cursor of another epoch of the sender's log is honoured (m1)",
+     "crates/kimmy-storage/src/idempotency_replay.rs",
+     "                Some(epoch) => begun.is_some_and(|begun| begun.epoch == epoch),\n",
+     "                Some(_) => begun.is_some(),\n"),
+    ("replay-cursor-passes-changed", "A replay's records cursor passes a record the log names as changed since its base (m1)",
+     "crates/kimmy-storage/src/idempotency_replay.rs",
+     "                && cursor.passed(record.collection, &record.scope)\n                && !changed.contains(&(record.collection.0, record.scope.0));\n",
+     "                && cursor.passed(record.collection, &record.scope);\n"),
+    ("rewind-leaves-the-rows", "A rewind removes the records of what it discards and leaves their rows by stamp (G)",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "        if let Some(from) = from {\n            remove_rows_naming(txn, from, &named)?;\n        }\n",
+     "        let _ = (from, &named);\n"),
+    ("rewind-reopens-a-bulk", "A rewind reopens a cut bulk insert's record as it reopens a filter's (Y's m3)",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "            if record.first.hlc > until || (cut && !resumes) {\n",
+     "            if record.first.hlc > until {\n"),
+    ("rewind-keeps-the-cursor", "A rewind reopens a filter's record with its cursor (a resume skips what it undid)",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "                    m.cursor = None;\n",
+     "                    let _ = m;\n"),
+]
+for name, doc, path, old, new in FIXES:
+    ROWS.append({"name": name, "group": "fixes", "doc": doc, "patches": [(path, old, new)], "suites": MODEL_ONLY})
 
 
 def row(name):

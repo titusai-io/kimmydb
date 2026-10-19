@@ -29039,12 +29039,17 @@ the construction against RFC 9562 B.2's published vector. **The model test** (`k
 `idempotency_model_tests.rs`): three or four engines run seeded schedules of keyed writes and retries on any member,
 crashes before and after any commit and failed fsyncs, pulls (short ones cut inside a window), scoped and converge
 pages, whole-database snapshots with writes between their pages, outages, restarts, backups and restores with
-the own-origin replay, drops and re-creations, unkeyed writes and retention with a moved clock, with steps run between
-any two commits of a request; it asserts I1 to I7 (never on its own effect, the record with the effect, once per
+the own-origin replay (its pages cut as the transport cuts them, in a frame of a few units: B2's records, and records
+alone under a records cursor), with steps between the replay's pages and the sender itself restored between a
+snapshot's pages (m4), rewinds (`restore --until`), orphan rows by stamp, drops and re-creations, unkeyed writes and
+retention with a moved clock, with steps run between any two commits of a request; it asserts I1 to I7 (never on its own effect, the record with the effect, once per
 member, convergence, exact on one member, never over, no replacement across requests), I8 (an `$inc` completes
 with every counter older than its merged `first` applied, never on another request's `first`) and Life (a member
 holding a live `done` record replays it, across a drop too, and nothing replays past the window) after every step and
-at quiescence. `generated_schedules_short` runs in CI;
+at quiescence, and the contested algebra: each member's live record is contested exactly when the requests merged
+into it, as the test tracks them, are two or more; a lookup refuses exactly where the record is contested or another
+request's; and a request whose record turns contested between two of its chunks commits no more and answers
+`partially_applied`. Every record a frame or page carries stands on its sender and rides at or above its `first`. `generated_schedules_short` runs in CI;
 `generated_schedules_long` is ignored, a gate of record, `IDEM_SEEDS` seeds `IDEM_THREADS` at a time. Named rows write
 out the G1 analysis's breaks and the shapes the mutants need; `row_f1_a_window_cut_inside_a_commit` is the one that
 makes F1 load-bearing: a keyed `$inc` of two counters in one commit, a short pull by B that ends at the commit's first
