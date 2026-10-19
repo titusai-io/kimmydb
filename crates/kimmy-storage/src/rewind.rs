@@ -219,7 +219,7 @@ impl Engine {
         // bounded by it as well (`Engine::lower_vectors_in`).
         let mut restored_floor: Option<Hlc> = None;
         // Whether the rewind removed a document it holds no entry of at or below
-        // the target: the vectors are then bounded by what it keeps and collected.
+        // the target: the vectors are then bounded by the horizon as well.
         let mut removed_any = false;
         let schema = Engine::schema_for_record(self.db())?;
         let txn = self.begin_write(WriterHolder::Rewind)?;
@@ -400,9 +400,15 @@ impl Engine {
         // in a transaction of their own, a failure between the two would leave them
         // so. To the target, and below it only as far as a restored or removed
         // document asks, and never below what retention collected (ADR-243). A
-        // removed document asks for everything: any write of it at or below the
-        // target the member judged is to come back (ADR-246).
-        let floor = if removed_any { Some(Hlc::ZERO) } else { restored_floor };
+        // removed document asks for every write of it above the horizon the member
+        // may have judged, and no lower: below the horizon a re-fetch can bring
+        // back an insert whose delete and tombstone retention collected here, from
+        // a peer whose own pass has not run yet (ADR-246).
+        let floor = if removed_any {
+            Some(restored_floor.map_or(horizon, |floor| floor.min(horizon)))
+        } else {
+            restored_floor
+        };
         Engine::lower_vectors_in(&txn, schema, until, floor)?;
         txn.commit()?;
 

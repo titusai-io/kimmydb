@@ -2120,6 +2120,27 @@ fn row_on(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Expect, 
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// [`row`] held to pure entries as well: every route, the entries route without the
+/// divergence check's repairs included, converges and ends as `expect`. For a row whose
+/// case the entries themselves must close, where a repair that heals it would hide the
+/// defect the row is for.
+fn row_strict(name: &str, variants: &[(&str, Vec<Op>)], expect: Expect) {
+    let mut failed = Vec::new();
+    for (variant, ops) in variants {
+        let mut outcomes = check_routes(ops, &[Route::Entries, Route::Pages]);
+        for outcome in &mut outcomes {
+            expected_end(ops, outcome, expect);
+        }
+        if outcomes
+            .iter()
+            .any(|o| o.failures.iter().any(|f| f.category != Category::DocsAfterAgeOut))
+        {
+            failed.push(format!("--- {name} / {variant}\n{}", render(ops, &outcomes)));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// A schedule fails when the entries route as the loop runs it (with its repairs) or
 /// the pages route fails; pure entries that the repair loop then converges are not a
 /// failure of the route, only a note.
@@ -3166,7 +3187,8 @@ fn a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_
 /// document at or below the target t200, so the rewind removes it. C's t150 write is at or below
 /// the target and is kept, so every member ends holding it: whether B alone is rewound, or every
 /// member is (A and B remove the document, C keeps its own), or every member is after A's t300
-/// insert reached C as well (C puts its own t150 entry back).
+/// insert reached C as well (C puts its own t150 entry back). By pure entries too: B and A ask
+/// again for C's write (ADR-246).
 #[test]
 fn row_a_rewind_that_removes_a_document_keeps_a_judged_write_at_or_below_the_target() {
     let alone = parse(
@@ -3183,9 +3205,8 @@ fn row_a_rewind_that_removes_a_document_keeps_a_judged_write_at_or_below_the_tar
          A.write(orders/1)@300; B<-A entries; C<-A entries; B<-C entries; A<-C entries; \
          A.rewind@200; B.rewind@200; C.rewind@200",
     );
-    row(
+    row_strict(
         "a removal and a judged write",
-        &[],
         &[
             ("B alone rewound past its own insert", alone),
             ("every member rewound", every),
@@ -3205,9 +3226,8 @@ fn row_a_rewind_that_removes_a_document_deletes_no_kept_write_once_the_member_wr
     let every = "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
                  A.write(orders/1)@300; B<-A entries; B<-C entries; A.rewind@200; B.rewind@200; \
                  C.rewind@200";
-    row(
+    row_strict(
         "a removal, a judged write, and a later write",
-        &[],
         &[
             ("B alone rewound, then B writes", parse(&format!("{alone}; B.write(orders/2)@400"))),
             (
@@ -3236,11 +3256,87 @@ fn row_a_rewind_that_removes_a_document_brings_back_no_deleted_one() {
          A<-C entries; B.delete(orders/1)@130; A<-B entries; A.write(orders/3)@140; \
          B<-A entries; B.write(orders/1)@300; B.retention@1135; B.rewind@200",
     );
-    row(
+    row_strict(
         "a removal over a deleted document",
-        &[],
         &[("A holds the delete", ops)],
         &[(ORDERS, Some(&[3]))],
+    );
+}
+
+/// A document deleted at the target keeps its delete's own tombstone. A and C miss B's t130
+/// delete of `orders/1`; B inserts it again at t300 and is rewound to t200. The delete's entry
+/// is at or below the target, so the rewind puts the document back to it, a tombstone at the
+/// delete's stamp, which A and C take by entries over C's t120 copy. Removed instead, the
+/// delete would be forgotten, and C's copy would come back to every member.
+#[test]
+fn row_a_rewind_keeps_the_tombstone_of_a_document_deleted_at_the_target() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@120; B<-C entries; \
+         A<-C entries; B.delete(orders/1)@130; A.write(orders/3)@140; B<-A entries; \
+         B.write(orders/1)@300; B.rewind@200",
+    );
+    row_strict(
+        "a document deleted at the target",
+        &[("B alone rewound", ops)],
+        &[(ORDERS, Some(&[3]))],
+    );
+}
+
+/// A removed row that is itself a tombstone bounds the vectors as a live one does. B inserts
+/// `orders/1` at t300 and deletes it at t310, both after the target; C's t150 insert, judged
+/// against B's, reaches B in between. The rewind removes B's tombstone row, and B asks C again
+/// for its write by entries.
+#[test]
+fn row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         B.write(orders/1)@300; B<-C entries; A<-C entries; B.delete(orders/1)@310; B.rewind@200",
+    );
+    row_strict("a removed tombstone row", &[("B alone rewound", ops)], &[(ORDERS, Some(&[1]))]);
+}
+
+/// A removal asks again for nothing at or below the oplog horizon (ADR-246). C's t110 insert of
+/// `orders/1` loses on B to B's t120 write and is witnessed only, so B appends no entry of C's.
+/// B deletes the document at t130, every member applies the delete, and B's retention pass
+/// collects the delete's entry and its tombstone (a one-second tombstone window here); C's
+/// pass has not run. B inserts `orders/7` at t300 and is rewound to t200, which removes it.
+/// Bounded below the horizon, B's coverage of C would fall to zero and B would take C's t110
+/// insert back from C's oplog, and the count repair would spread it to every member.
+#[test]
+fn a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected() {
+    let base = base();
+    let mut cluster = Cluster::new(base);
+    cluster
+        .run(&parse(
+            "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@110; \
+             B.write(orders/1)@120; B<-C entries; B.delete(orders/1)@130; B.write(orders/3)@140; \
+             C<-B entries; A<-B entries; A<-C entries; C<-A entries",
+        ))
+        .expect("the schedule runs");
+    let collect = |cluster: &Cluster, m: u8| {
+        cluster
+            .e(m as usize)
+            .collect_garbage_at(base + 1135, RetentionPolicy::new(1, 1))
+            .expect("a retention pass");
+    };
+    let holds = |cluster: &Cluster, m: u8| {
+        let e = cluster.e(m as usize);
+        let coll = e.get_collection(DB, NAMES[ORDERS as usize]).unwrap();
+        crate::docs::record_stamp(e, &coll, &DocId::Int64(1)).unwrap().is_some()
+            && e.get(&coll, &DocId::Int64(1)).unwrap().is_some()
+    };
+    collect(&cluster, B);
+    assert!([A, B, C].iter().all(|m| !holds(&cluster, *m)), "premise: every member deleted it");
+    cluster.run(&parse("B.write(orders/7)@300; B.rewind@200")).expect("the rewind runs");
+    cluster.run(&parse("B<-C entries")).expect("B pulls C before C's pass");
+    assert!(!holds(&cluster, B), "B takes back nothing at or below its horizon");
+    collect(&cluster, A);
+    collect(&cluster, C);
+    let settled = settle(&mut cluster, Route::Repaired);
+    assert!(
+        [A, B, C].iter().all(|m| !holds(&cluster, *m)),
+        "no member holds the deleted document: {:?}",
+        settled.failures.iter().map(|f| (f.category, f.detail.clone())).collect::<Vec<_>>()
     );
 }
 

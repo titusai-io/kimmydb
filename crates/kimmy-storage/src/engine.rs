@@ -2640,9 +2640,11 @@ impl Engine {
     /// asks again for what it may have judged above the floor, never claims less
     /// than an entry it keeps, and never less than what retention collected, even
     /// when the restored entry arrived after a retention pass with a stamp below
-    /// it. `floor` is the lowest stamp among the entries the rewind restored, or
-    /// zero when it removed a document: a removed document holds nothing, so any
-    /// write of it at or below the target may be one it judged (ADR-246).
+    /// it. `floor` is the lowest stamp among the entries the rewind restored, and
+    /// no higher than the oplog horizon when it removed a document: a removed
+    /// document holds nothing, so any write of it above the horizon may be one it
+    /// judged, and a re-fetch below the horizon could bring back an insert whose
+    /// delete retention collected (ADR-246).
     ///
     /// Each vector's entry for origin `X` becomes `min(V[X], until)`, and also at
     /// most `max(floor, kept[X], collected[X])` when a document was restored or
