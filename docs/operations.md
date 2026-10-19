@@ -2409,13 +2409,91 @@ dropped indexes, the **servable** version vector, the user store, the node
 id, and the holes a snapshot left ([a member that took a snapshot](#a-member-that-took-a-snapshot-and-what-it-will-not-serve), which are `META` rows).
 
 **Not everything the node holds.** Three tables are deliberately left out
-because each is node-local and re-derived when the database is opened: the
-witnessed vector, the per-origin retention record, and the record of which oplog
+because each is node-local and re-derived: the witnessed vector and the
+per-origin retention record by the first open, and the record of which oplog
 entries this node appended as state rather than as history
-([ADR-160](decisions.md)). The consequence of the last one is worth knowing when
-restoring: **a node restored from a backup taken while a snapshot was running
-begins that snapshot again** rather than resuming it, and until it completes the
-restored node may advertise coverage of snapshot documents it holds as state.
+([ADR-160](decisions.md)) by the restore itself. Every oplog entry above the
+backup's version vector for its origin is one the node held as state (a snapshot
+page's row, a scoped repair's, a digest repair's), and the restore marks each of
+them again ([ADR-244](decisions.md)); the `restored a backup` line says how many
+(`held`). So the restored node claims the backup's version vector and no more,
+and takes the history around those entries again from its peers, by entries or,
+past their horizon, by a snapshot. **A snapshot the node was part-way through
+when the backup was taken is not resumed**: its progress is node-local as well,
+and the pages it had applied are held like any other.
+
+#### A member restored by 0.51 or earlier
+
+A restore by 0.51.x or any earlier release did not mark those entries. The
+restored store's first open, which `kimmyd restore` itself makes, raised both
+version vectors over them and recorded the result as verified, so no later start
+checks it again. Such a member claims each origin up to the newest entry it held
+as state, and its pulls start there: an origin's write below that point which
+the member did not already hold never reaches it by sync. A document written once
+and not touched again is missing for good. Upgrading does not lower the vector.
+
+**The gap spreads.** A member that took that origin's entries from the restored
+member while it claimed them claims the same coverage and lacks the same
+documents, and so does any member that later catches up from one of those first,
+by entries or by a whole-database snapshot: a member wiped and re-synced, or
+restored again, included. A backup taken of any affected member shows nothing
+wrong, since its vector already covers what it claims.
+
+**How to tell. Check every member, not only the restored one:**
+
+- On each member, the `WARN` `a divergence repair left rows it will not write`
+  for a collection (`left`, and the ids in `first_ids`; with
+  `cluster.divergence_repair` on, the default): the digest repair found a
+  document the member holds nothing for, and does not write it because its stamp
+  is not above both members' tombstone horizons (a restore sets the restored
+  member's to the restore's time, so there no such document is written). On a
+  member that was not restored, the repair may write a recent one back by
+  itself; what it cannot write, it leaves with this line. A count finding on the
+  same collection (`divergence confirmed; planned a repair from this peer`) plans
+  the count half's replay, which brings a lost insert back while the origin
+  still retains its entry.
+- Compare each collection across every member: its document count
+  (`POST /v1/db/{db}/coll/{coll}/count`, read with no writes to the collection
+  meanwhile) and the cut digest (`kimmy_sync_digest_divergent_collections` above
+  0 and the `WARN` `a confirmed digest divergence; a document repair is planned`,
+  which names the peer and the collection). Then compare `(id, stamp)` as
+  [What to do with a digest finding](#the-cut-digest) says, to name the ids.
+- For the member that was restored, and for it only, the backup it was restored
+  from proves the over-claim. `scripts/backup-held-rows.py` counts the oplog
+  entries above the backup's version vector, by origin. It is not in the server
+  image: take it from the repository at the release's tag. It needs Python 3 and
+  nothing else, reads the file and nothing else, and runs wherever a copy of the
+  backup is: `python3 -I backup-held-rows.py <copy of the backup>`. A total above
+  0 proves that restore claimed history it did not take, for the origins listed.
+  **A total of 0 clears that one restore and no member**: it says nothing about
+  a member that synced from an affected one, or about a backup of an affected
+  member.
+
+**What to do.** Call a member *clean* when none of the checks above finds a
+document it lacks. The member that wrote a lost document always holds it.
+
+1. **Apply the wipe rule first**, step 3 of
+   [What to do with a digest finding](#the-cut-digest), to every member that is
+   not clean: wipe a member only if every id that differs is present on both
+   members and that member holds the older stamp on every one of them. A
+   document the member lacks is an id present on one member only, so the rule
+   forbids the wipe, and the operator rule for
+   [rows the repair leaves](#the-cut-digest) applies: if the member that lacks
+   the id never held it, which is what a write lost this way is, re-insert it
+   through that member, as a clean member holds it; if it deleted the id on
+   purpose, delete it on the others. The re-insert is a new write, above every
+   member's vector, so it reaches every member, the affected ones included,
+   whatever each one claims.
+2. **A member the rule allows you to wipe**, or the restored member restored
+   again from the original backup with 0.52.0 or later (which the same rule
+   governs, since it discards what the member took after that backup), catches
+   up from whichever peer it reaches first, and an affected peer hands it the
+   gap again. So make every member it can reach clean: stop every member that is
+   not clean, start the wiped or restored member, and wait until its
+   catching-up marker has cleared, which it does only once it holds what the
+   running members hold. Bring several back one at a time the same way. Start
+   the other members again only after that.
+3. If no member is clean, wipe none: use step 1 on every member.
 
 Restoring an older backup onto a newer build is supported while the format
 version matches; a backup from a *newer* build is refused by name rather than
