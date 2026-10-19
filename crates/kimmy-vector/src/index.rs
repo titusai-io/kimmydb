@@ -427,17 +427,28 @@ where
             }
         }
         let mut edges = Vec::with_capacity(cut.len() * LINK_EDGES);
+        // Edges given so far, by the point they leave: of a cut-off point's
+        // candidates, the least given win, nearest first among equals. Many
+        // copies of one vector all find the same few linked candidates, and
+        // would otherwise hang every edge on one of them.
+        let mut given: std::collections::HashMap<usize, usize> = Default::default();
         for &point in &cut {
             let Some(vector) = vectors[point].as_deref() else { continue };
-            edges.extend(
-                graph
-                    .search(vector, LINK_CANDIDATES, LINK_EF)
-                    .iter()
-                    .map(|n| n.d_id)
-                    .filter(|&from| from != point && !lost.contains(&from))
-                    .take(LINK_EDGES)
-                    .map(|from| (from, point)),
-            );
+            let mut candidates: Vec<(usize, usize)> = graph
+                .search(vector, LINK_CANDIDATES, LINK_EF)
+                .iter()
+                .map(|n| n.d_id)
+                .filter(|&from| from != point && !lost.contains(&from))
+                .enumerate()
+                .map(|(rank, from)| {
+                    (given.get(&from).copied().unwrap_or(0) * LINK_CANDIDATES + rank, from)
+                })
+                .collect();
+            candidates.sort_unstable();
+            for &(_, from) in candidates.iter().take(LINK_EDGES) {
+                *given.entry(from).or_default() += 1;
+                edges.push((from, point));
+            }
         }
         let linked = graph.add_layer0_edges(&edges);
         if linked == 0 {
