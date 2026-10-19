@@ -633,6 +633,13 @@ pub(crate) struct Outcome {
 
 type Res<T> = std::result::Result<T, String>;
 
+/// A member's live records under the keys a frame carries, read before it is offered:
+/// by (collection, key).
+type LiveBefore = Vec<((u8, u8), Option<IdempotencyRecord>)>;
+
+/// Every record a member stores, by (collection id, scope).
+type StoredRecords = BTreeMap<(u64, [u8; 32]), IdempotencyRecord>;
+
 fn err(what: &str, e: impl std::fmt::Display) -> String {
     format!("{what}: {e}")
 }
@@ -1173,7 +1180,7 @@ impl World {
         &self,
         m: usize,
         records: &[crate::idempotency::CarriedRecord],
-    ) -> Res<Vec<((u8, u8), Option<IdempotencyRecord>)>> {
+    ) -> Res<LiveBefore> {
         let mut out = Vec::new();
         for carried in records {
             let Some((c, key)) = key_of(carried) else { continue };
@@ -1190,12 +1197,7 @@ impl World {
     /// held one alive (the union of the two sets), or in its place. A store that changes
     /// nothing changes no set: the record was held already, or the sender's set is in it
     /// (a contested record stays contested, whatever more merges in).
-    fn fps_carried(
-        &mut self,
-        sender: NodeId,
-        to: usize,
-        before: Vec<((u8, u8), Option<IdempotencyRecord>)>,
-    ) -> Res<()> {
+    fn fps_carried(&mut self, sender: NodeId, to: usize, before: LiveBefore) -> Res<()> {
         let node = self.e(to).node_id();
         for ((c, key), was) in before {
             let now = self.live_record(to, c, key)?;
@@ -2511,10 +2513,7 @@ impl World {
 
     /// Every record `m` stores, by (collection id, scope), as it stands, and the rows by
     /// stamp that name no record (orphans).
-    fn stored_records(
-        &self,
-        m: usize,
-    ) -> Res<(BTreeMap<(u64, [u8; 32]), IdempotencyRecord>, BTreeSet<Vec<u8>>)> {
+    fn stored_records(&self, m: usize) -> Res<(StoredRecords, BTreeSet<Vec<u8>>)> {
         use redb::{ReadableDatabase, ReadableTable};
         let e = self.e(m);
         let txn = e.db().begin_read().map_err(|e| err("begin_read", e))?;
