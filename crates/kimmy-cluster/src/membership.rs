@@ -413,7 +413,8 @@ impl Members {
 
     /// The live peers that do not advertise `Facts.decimal128 = Some(true)`, a
     /// peer not heard from yet included: what holds back a locally created
-    /// `Decimal128` id or bound (ADR-238). One load of the view, no lock.
+    /// `Decimal128` id or bound (ADR-238), either way. One load of the view, no
+    /// lock. The gate itself tells the two apart ([`crate::decimal128_net`]).
     pub fn decimal128_blockers(&self) -> Vec<NodeId> {
         crate::facts::decimal128_blockers(&self.view())
     }
@@ -524,14 +525,31 @@ impl Members {
     /// not reach every peer, and a fixed lease would expire facts that are still
     /// being refreshed (ADR-201).
     pub fn lease(&self) -> Duration {
-        let (interval, fanout) = *self.0.lease_shape.read();
+        let (_, fanout) = *self.0.lease_shape.read();
         // Unconfigured (a member set nothing has told its intervals): the
         // defaults, so a lease is never zero and never divides by zero.
-        let interval =
-            if interval.is_zero() { crate::peers::DEFAULT_SYNC_INTERVAL } else { interval };
+        let interval = self.sync_interval();
         let fanout = fanout.max(1);
         let peers = self.0.live.read().len();
         interval * (peers.div_ceil(fanout) as u32 + 2)
+    }
+
+    /// The sync interval blocks are exchanged at, as configured, or the default
+    /// on a member set nothing has told its intervals.
+    pub fn sync_interval(&self) -> Duration {
+        let (interval, _) = *self.0.lease_shape.read();
+        if interval.is_zero() { crate::peers::DEFAULT_SYNC_INTERVAL } else { interval }
+    }
+
+    /// The `Retry-After` a gate refusing for a live peer not heard from yet
+    /// carries ([`crate::PeerNet::Unheard`]): one sync interval, in whole seconds
+    /// rounded up and at least 1. A peer's block arrives with the next replication
+    /// contact either way, and one round makes one with each peer the fanout
+    /// reaches.
+    pub fn unheard_retry_after_secs(&self) -> u64 {
+        let interval = self.sync_interval();
+        let whole = interval.as_secs() + u64::from(interval.subsec_nanos() > 0);
+        whole.max(1)
     }
 
     /// This member's block to send, with its generation, or `None` with no
@@ -842,6 +860,18 @@ impl Members {
     /// Remove a member without a running SWIM task. See [`Self::insert_for_test`].
     pub fn remove_for_test(&self, addr: &SocketAddr) {
         self.remove(addr);
+    }
+
+    /// Drop `node`'s block and leave it live, as SWIM's `Rename` of a peer does
+    /// (a later incarnation of it). See [`Self::insert_for_test`].
+    pub fn forget_peer_for_test(&self, node: NodeId) {
+        self.forget_peer(node);
+    }
+
+    /// Drop every peer's block and leave the live set as it was, as this member's
+    /// own `Rejoin` or `Defunct` does. See [`Self::insert_for_test`].
+    pub fn rejoin_for_test(&self) {
+        self.clear_for_own_defunct();
     }
 
     /// Move `addr`'s generation on, as SWIM bringing it up and declaring it down

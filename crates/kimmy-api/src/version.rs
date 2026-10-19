@@ -203,6 +203,26 @@ mod tests {
         assert!(super::capabilities(&state).contains(&"idempotency-keys"), "read live");
     }
 
+    /// Closed for any cause is not listed: a live member that says it does not
+    /// carry records, and one not heard from yet, whose refusal is a transient
+    /// `503`, as much as the switch.
+    #[test]
+    fn idempotency_keys_is_not_listed_while_a_member_is_unheard_or_says_no() {
+        use kimmy_cluster::IdempotencyClosed;
+        for closed in [
+            IdempotencyClosed::Peers(vec!["peer-c".into()]),
+            IdempotencyClosed::Unheard { peers: vec!["peer-c".into()], retry_after_secs: 1 },
+            IdempotencyClosed::Unseen("membership is off"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = crate::state::tests::a_state(&dir);
+            let answer = closed.clone();
+            state.set_idempotency_gate(std::sync::Arc::new(move || Err(answer.clone())));
+            let listed = super::capabilities(&state);
+            assert!(!listed.contains(&"idempotency-keys"), "{closed:?}: {listed:?}");
+        }
+    }
+
     /// The window is this node's `storage.oplog_retention_secs`, its default
     /// until the daemon says otherwise.
     #[test]

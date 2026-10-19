@@ -205,7 +205,11 @@ same key is answered with its first result, which carries
 again. A call is the same when the tool and its other arguments are, every
 document's fields in the order sent. The argument is refused where the header
 would be: malformed, reused for a different call, or while this member does not
-take keys. `/mcp` itself refuses the header: a tool call is keyed by its
+take keys. While the only reason it does not is a live member not heard from yet
+(after a restart or a rejoin, for about a sync interval), the refusal is the
+error whose `data` carries `"error": "peer_unheard"`, `"retry": "wait"` and
+`retry_after_secs`: wait that long and send the same call again with the same
+key. `/mcp` itself refuses the header: a tool call is keyed by its
 argument. A keyed `update` or `delete` with `multi: true` that runs past one
 chunk (1,000 documents by default) never touches a document written after its
 first write, by anyone, and counts those matches in `skipped`; `resumed: true`

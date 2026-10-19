@@ -116,6 +116,13 @@ pub enum ErrorCode {
     /// this member (B5). Nothing was written; once it ends, the same request
     /// is answered from its record.
     IdempotencyKeyInFlight,
+    /// A gate that reads every live member's facts block (ADR-201) is closed
+    /// only because a live member has not been heard from yet: it came up, or
+    /// this member saw it rejoin, a moment ago, and its block arrives at the
+    /// next contact. The idempotency-key gate (B5) and the `Decimal128` gate
+    /// (ADR-238). Nothing was looked up or written; the same request, sent
+    /// again after `Retry-After`, is taken once it has been heard.
+    PeerUnheard,
 }
 
 /// What a client may do about a failure.
@@ -204,7 +211,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 28] = [
+    pub const ALL: [ErrorCode; 29] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -233,6 +240,7 @@ impl ErrorCode {
         Self::ResolverBusy,
         Self::IdempotencyKeyReused,
         Self::IdempotencyKeyInFlight,
+        Self::PeerUnheard,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -266,6 +274,7 @@ impl ErrorCode {
             Self::ResolverBusy => "resolver_busy",
             Self::IdempotencyKeyReused => "idempotency_key_reused",
             Self::IdempotencyKeyInFlight => "idempotency_key_in_flight",
+            Self::PeerUnheard => "peer_unheard",
         }
     }
 
@@ -333,6 +342,12 @@ impl ErrorCode {
             // `elsewhere`: another member that has not received the record
             // would apply the request a second time (B5, guarantee 3).
             Self::IdempotencyKeyInFlight => Retry::Wait,
+            // The peer's block arrives with its next contact, about a sync
+            // interval away, and the gate opens here then. Not `elsewhere`: a
+            // keyed retry must stay on the member that may hold its record
+            // (B5, guarantee 3), and every member that restarted or saw a
+            // rejoin is in the same window.
+            Self::PeerUnheard => Retry::Wait,
             // It may already have happened, and replicates if it did: read
             // before resending, which neither waiting nor moving replaces.
             Self::OutcomeUnknown => Retry::Verify,
@@ -400,7 +415,14 @@ impl ErrorCode {
             | Self::Stale
             // Expected, bounded and explained by the response itself; the
             // drop purger's own log lines are the operator's record.
-            | Self::CollectionPurging => None,
+            | Self::CollectionPurging
+            // Expected after every restart and rejoin, bounded by a sync
+            // interval and explained by the response itself. A peer that stays
+            // unheard is the operator's to see, and membership already warns
+            // of one once it has been unheard for more than a lease;
+            // `kimmy_idempotency_requests_total{outcome="gated"}` counts the
+            // keyed ones.
+            | Self::PeerUnheard => None,
 
             // Reserved and unbuilt, by default. The reference says this will
             // be refused, the caller asked for it anyway, and there is no
@@ -862,6 +884,17 @@ impl ApiError {
         }
     }
 
+    /// `503 peer_unheard`, `retry: wait` (see [`ErrorCode::PeerUnheard`]): a
+    /// gate closed only because a live member has not been heard from yet.
+    /// `Retry-After` is the gate's own figure, one sync interval in whole
+    /// seconds, never 0; `message` is the gate's words, which name the member.
+    pub fn peer_unheard(message: impl Into<String>, retry_after_secs: u64) -> Self {
+        Self {
+            retry_after_secs: Some(retry_after_secs.max(1)),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::PeerUnheard, message)
+        }
+    }
+
     /// A request this node did not complete, because it is stopping: a write
     /// it did not begin (ADR-192), or a walk that ended at the drain's
     /// deadline. Nothing was written. `503 node_stopping`, and `elsewhere`: the node is
@@ -1041,9 +1074,15 @@ impl From<CoreError> for ApiError {
             // A creation this member will not persist yet (ADR-238): the
             // request names a `Decimal128` id or partial-filter bound, and
             // the answer names `cluster.decimal128` and any peer that holds
-            // it back. The caller's to act on, so 400, never a retry hint:
-            // repeating it changes nothing until the operator acts.
-            CoreError::Decimal128Gated { .. } => ApiError::bad_request(e.to_string()),
+            // it back. A live peer not heard from yet, with no held block
+            // saying no, ends by itself within a sync interval: `503
+            // peer_unheard`, with the gate's `Retry-After`. Every other cause
+            // lasts until the operator or the roll acts, so 400, never a retry
+            // hint: repeating it changes nothing until then.
+            CoreError::Decimal128Gated { closed, .. } => match closed.retry_after_secs() {
+                Some(secs) => ApiError::peer_unheard(e.to_string(), secs),
+                None => ApiError::bad_request(e.to_string()),
+            },
             CoreError::ResumeTokenExpired => {
                 ApiError::new(StatusCode::GONE, ErrorCode::ResumeTokenExpired, e.to_string())
             }
@@ -1203,7 +1242,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 28] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 29] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1219,6 +1258,9 @@ mod tests {
             (RateLimited, None),
             (Stale, None),
             (CollectionPurging, None),
+            // A peer not heard from yet: bounded, explained, and warned of by
+            // membership once it lasts a lease.
+            (PeerUnheard, None),
             // Refused on purpose, with no operator action to take. The
             // default only: `vectors.rs` raises its own source above this.
             (NotImplemented, Some(LogLevel::Info)),
@@ -1694,5 +1736,46 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"], "idempotency_key_in_flight");
         assert_eq!(body["retry"], "wait");
+    }
+
+    /// A gated `Decimal128` creation as a client meets it: `503 peer_unheard`,
+    /// `retry: wait` and the gate's `Retry-After` while a live member is only not
+    /// heard from yet, and `400 bad_request`, `retry: no` and no `Retry-After`
+    /// for every cause that lasts.
+    #[tokio::test]
+    async fn a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise() {
+        use kimmy_core::{Decimal128Closed, Decimal128Use};
+        let gated = |closed| CoreError::Decimal128Gated { what: Decimal128Use::Id, closed };
+        let unheard =
+            Decimal128Closed::Unheard { peers: vec!["peer-c".into()], retry_after_secs: 4 };
+        let response = ApiError::from(gated(unheard)).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER).map(|v| v.to_str().unwrap()),
+            Some("4"),
+            "the gate's own wait"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((&body["error"], &body["retry"]), (&json!("peer_unheard"), &json!("wait")));
+        assert!(body["message"].as_str().unwrap().contains("peer-c"), "{body}");
+
+        for lasting in [
+            Decimal128Closed::Undeclared,
+            Decimal128Closed::Peers(vec!["peer-c".into()]),
+            Decimal128Closed::Unseen("membership is off"),
+        ] {
+            let response = ApiError::from(gated(lasting.clone())).into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{lasting:?}");
+            assert!(response.headers().get(axum::http::header::RETRY_AFTER).is_none());
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!((&body["error"], &body["retry"]), (&json!("bad_request"), &json!("no")));
+        }
+        assert_eq!(
+            ApiError::peer_unheard("x", 0).retry_after_secs,
+            Some(1),
+            "never a Retry-After of 0"
+        );
     }
 }

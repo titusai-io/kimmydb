@@ -82,12 +82,12 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | Row | What it plants | Result | Killed by | Notes |
 |---|---|---|---|---|
 | G1 | switch ignored | killed | `the_switch_decides_first_and_is_named` |  |
-| G2 | net removed | killed | `a_peer_that_is_not_live_is_not_asked`, `the_net_refuses_with_an_older_or_unknown_live_peer_and_accepts_without`, `the_predicate_answers_as_the_gate_does_and_reads_it_live` |  |
-| G3 | unheard live peer passes | killed | `the_net_refuses_with_an_older_or_unknown_live_peer_and_accepts_without`, `the_predicate_answers_as_the_gate_does_and_reads_it_live` |  |
+| G2 | net removed | killed | `a_peer_that_is_not_live_is_not_asked`, `the_net_refuses_with_an_older_or_unknown_live_peer_and_accepts_without`, `the_predicate_answers_as_the_gate_does_and_reads_it_live` | to re-point: the gate split moved the net into `facts::idempotency_records_net`, as M's `live-peer-net-removed` now patches it |
+| G3 | unheard live peer passes | killed | `the_net_refuses_with_an_older_or_unknown_live_peer_and_accepts_without`, `the_predicate_answers_as_the_gate_does_and_reads_it_live` | to re-point: the unheard set is now `facts::unheard_peers`, which GS's `gs-unheard-passes` patches |
 | G4 | membership off passes | killed | `without_a_membership_view_the_net_fails_closed` |  |
 | G5 | facts field not advertised | killed | `the_block_says_this_build_carries_idempotency_records` |  |
 | G6 | facts field not lenient | killed | `this_build_reads_idempotency_records_leniently_and_an_older_block_as_not_carrying` |  |
-| G7 | guard does not ask the gate | killed | `an_older_or_unheard_live_peer_refuses_naming_it_until_it_carries_records`, `with_the_switch_off_a_key_is_refused_naming_the_switch` | re-pointed: the gate moved from the route guard into the keyed extractor, after authentication (phase E); the same text as E:A4, run with F's wider suite |
+| G7 | guard does not ask the gate | killed | `an_older_or_unheard_live_peer_refuses_naming_it_until_it_carries_records`, `with_the_switch_off_a_key_is_refused_naming_the_switch` | re-pointed: the gate moved from the route guard into the keyed extractor, after authentication (phase E); the same text as E:A4, run with F's wider suite. The gate split replaced the first test with `an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard` and `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |
 | G8 | MCP argument not gated | killed | `the_argument_is_gated_as_the_header_is` | re-pointed: `tool_key` asks the gate through `refuse_unless_open` |
 | G9 | capability ignores the gate | killed | `idempotency_keys_is_listed_only_while_the_gate_is_open` |  |
 | G10 | clustered default is true | killed | `check_config_prints_the_idempotency_keys_in_effect`, `idempotency_keys_defaults_by_clustering_and_parses` |  |
@@ -341,7 +341,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | resume-hlc-without-the-change-log | `resume_hlc` without the change log's high water (its keys are minted stamps) | killed | `the_clock_resumes_above_the_change_logs_keys_after_a_restart` |  |
 | header-guard-not-over-mcp | The header guard lets `/mcp` through | killed | `every_other_route_refuses_the_header_by_name` |  |
 | operator-switch-ungated | `cluster.idempotency_keys` ignored | killed | `with_the_switch_off_a_key_is_refused_naming_the_switch` |  |
-| live-peer-net-removed | The live-peer net never blocks | killed | `c9_a_live_member_that_does_not_carry_records_closes_the_gate` |  |
+| live-peer-net-removed | The live-peer net never blocks | killed | `c9_a_live_member_that_does_not_carry_records_closes_the_gate` | re-pointed by the gate split at `match crate::facts::idempotency_records_net(…)`, and killed there again (GS below) |
 
 **39 rows: 39 killed, 0 equivalent, 0 superseded, 0 run once elsewhere, 0 survived.**
 
@@ -381,6 +381,29 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 
 **27 rows: 27 killed, 0 equivalent, 0 superseded, 0 survived.**
 
+## The gate split (GS)
+
+13 rows, the `gate-split` group of `scripts/idempotency-mutants/mutants.py`, with M's `live-peer-net-removed` re-pointed at the net's new call, on a `git archive 5369a2ba` export of `idempotency-gw` with its own target directory and a 1,500 s timeout per suite: the two gates' split of a live member not heard from yet (`503 peer_unheard`, `Retry-After` of one sync interval) from one whose block says no (`400`). Each row names the tests that must fail, and counts as killed only when every one of them ran and failed in its log; every suite passed on the unmutated export first, with every named test run.
+
+| Row | What it plants | Result | Killed by | Notes |
+|---|---|---|---|---|
+| gs-unheard-counted-as-refusing | A live peer with no block held counts as one whose block says no | killed | `a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides` (idempotency), `a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400` | the cluster test over real processes: a restarted member answered `400` in its window |
+| gs-idempotency-gate-unheard-as-peers | The idempotency gate reports an unheard peer as one that says no | killed | `a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides` (idempotency), `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |  |
+| gs-decimal128-gate-unheard-as-peers | The `Decimal128` gate reports an unheard peer as one that cannot | killed | `a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides` (decimal128), `the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one` |  |
+| gs-keyed-edge-unheard-as-400 | The keyed edge answers the gate's transient refusal `400` | killed | `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |  |
+| gs-decimal128-edge-unheard-as-400 | The API answers a `Decimal128` refusal for an unheard peer `400` | killed | `a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise`, `the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one` |  |
+| gs-retry-after-dropped | `peer_unheard` carries no `Retry-After` | killed | `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken`, `the_argument_is_gated_as_the_header_is` | REST's header and MCP's `retry_after_secs` |
+| gs-retry-after-zero-allowed | `peer_unheard`'s `Retry-After` may be 0 | killed | `a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise` |  |
+| gs-wait-not-rounded-up | The wait truncates a fractional sync interval | killed | `the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second` |  |
+| gs-wait-may-be-zero | The membership's wait loses its floor of one second | equivalent | | `sync_interval` is never zero (an unconfigured or zero interval reads as the default), so the interval rounded up is at least 1 already; `ApiError::peer_unheard`'s own floor is the one `gs-retry-after-zero-allowed` kills |
+| gs-precedence-swapped | A peer not heard from decides over one whose block says no | killed | `a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides` (idempotency and decimal128), `an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard`, `the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one` |  |
+| gs-unheard-passes | A live peer not heard from passes the net (fails open) | killed | `a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides` (idempotency), `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |  |
+| gs-capability-listed-while-unheard | `idempotency-keys` listed while an unheard peer closes the gate | killed | `idempotency_keys_is_not_listed_while_a_member_is_unheard_or_says_no`, `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |  |
+| gs-retry-class-no | `peer_unheard`'s retry class is `no` | killed | `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |  |
+| live-peer-net-removed (re-pointed) | The live-peer net never blocks | killed | `c9_a_live_member_that_does_not_carry_records_closes_the_gate` | M's row; counted there |
+
+**13 rows: 12 killed, 1 equivalent, 0 superseded, 0 survived.**
+
 ## Totals
 
 | Piece | Rows | Killed | Equivalent | Superseded | Run once elsewhere | Survived |
@@ -394,6 +417,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | The page records delta (P) | 20 | 20 | 0 | 0 | 0 | 0 |
 | The model's mutants (M) | 39 | 39 | 0 | 0 | 0 | 0 |
 | The build review's fixes (Y) | 27 | 27 | 0 | 0 | 0 | 0 |
-| **All** | **292** | **277** | **4** | **3** | **8** | **0** |
+| The gate split (GS) | 13 | 12 | 1 | 0 | 0 | 0 |
+| **All** | **305** | **289** | **5** | **3** | **8** | **0** |
 
-Of the 250 rows killed before the build review, 238 were killed by their piece's own suites (3 of them by a hang, with the tests that failed before it), 4 by the wider suites and 8 by the five tests added on `idempotency-h`: `a_resume_logs_at_info_and_a_replay_below_it`, `a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done` and `a_record_stays_when_a_row_between_its_first_and_last_expires` in `idempotency_tests.rs`, `a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses` and `a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry` in `idempotency_repl_tests.rs`. The four equivalent rows are B3 and M13 of S, O5 of F and G11 of G.
+Of the 250 rows killed before the build review, 238 were killed by their piece's own suites (3 of them by a hang, with the tests that failed before it), 4 by the wider suites and 8 by the five tests added on `idempotency-h`: `a_resume_logs_at_info_and_a_replay_below_it`, `a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done` and `a_record_stays_when_a_row_between_its_first_and_last_expires` in `idempotency_tests.rs`, `a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses` and `a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry` in `idempotency_repl_tests.rs`. The five equivalent rows are B3 and M13 of S, O5 of F, G11 of G and `gs-wait-may-be-zero` of GS.

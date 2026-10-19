@@ -173,9 +173,11 @@ info:
     again. The operations that take it list the `Idempotency-Key` parameter;
     **every other operation refuses it with `400`**, rather than ignoring it,
     and so does a member while it does not take keys (the operator's switch
-    `cluster.idempotency_keys` is off, or a live member does not carry
-    records), which then does not list `idempotency-keys` among its
-    capabilities. A key is remembered for `idempotencyWindowSecs`
+    `cluster.idempotency_keys` is off, or a live member says it does not
+    carry records), which then does not list `idempotency-keys` among its
+    capabilities; while the only cause is a live member not heard from yet,
+    the refusal is `503 peer_unheard` with `Retry-After`, and the same
+    request with the same key is taken once it has been heard. A key is remembered for `idempotencyWindowSecs`
     (`GET /v1/version`) and is scoped to the principal and the collection.
     What a retry on another member does, and what a resumed multi-document
     request answers, is in `docs/http-api.md` ("Idempotency keys").
@@ -1535,6 +1537,7 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/PeerUnheard" }
 
   /v1/db/{db}/coll/{coll}/bulk:
     parameters:
@@ -1600,6 +1603,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/PeerUnheard" }
 
   /v1/db/{db}/coll/{coll}/find:
     parameters:
@@ -1881,6 +1885,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/ConflictOrKeyInFlight" }
         "500": { $ref: "#/components/responses/PartiallyApplied" }
+        "503": { $ref: "#/components/responses/PeerUnheard" }
 
   /v1/db/{db}/coll/{coll}/find_and_modify:
     parameters:
@@ -1987,6 +1992,7 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/PeerUnheard" }
 
   /v1/db/{db}/coll/{coll}/delete:
     parameters:
@@ -2092,6 +2098,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/ConflictOrKeyInFlight" }
         "500": { $ref: "#/components/responses/PartiallyApplied" }
+        "503": { $ref: "#/components/responses/PeerUnheard" }
 
   /v1/db/{db}/coll/{coll}/docs/{id}:
     parameters:
@@ -2196,6 +2203,7 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/PeerUnheard" }
     delete:
       tags: [documents]
       operationId: deleteDocument
@@ -2238,6 +2246,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/PeerUnheard" }
 
   /v1/db/{db}/coll/{coll}/violations:
     parameters:
@@ -2423,6 +2432,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/PeerUnheard" }
 
   /v1/db/{db}/coll/{coll}/indexes/{name}:
     parameters:
@@ -3128,11 +3138,13 @@ components:
           `multi: true` request with the key still running here, or another
           retry of it being answered here, is `409 idempotency_key_in_flight`.
         - Refused `400` while this member does not take keys
-          (`cluster.idempotency_keys` is off here, or a live member does not
-          carry records), after authentication, so a request with no token is
-          `401` first, and before authorization, so a principal without the
-          write grant gets this `400` before `403`; and on `update` and
-          `delete` with `explain: true`.
+          (`cluster.idempotency_keys` is off here, or a live member says it
+          does not carry records), and `503 peer_unheard` with `Retry-After`
+          while the only cause is a live member not heard from yet (see
+          `PeerUnheard`); both after authentication, so a request with no
+          token is `401` first, and before authorization, so a principal
+          without the write grant gets the refusal before `403`; and `400` on
+          `update` and `delete` with `explain: true`.
         - Remembered for `idempotencyWindowSecs` (`GET /v1/version`) after the
           write's last commit. A retry on a member that has not yet received
           the write is applied there a second time, without the marker: retry
@@ -3165,8 +3177,9 @@ components:
         does not take an Idempotency-Key") or a malformed one, both before
         authentication; or, after authentication, one while this member does
         not take keys, the message naming the header and the cause:
-        `cluster.idempotency_keys`, or the live member that does not carry
-        records (ADR-240).
+        `cluster.idempotency_keys`, or the live member that says it does not
+        carry records (ADR-240); a live member not heard from yet is the
+        `503` `PeerUnheard` instead.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -3227,6 +3240,28 @@ components:
         Retry-After:
           schema: { type: integer }
           description: Seconds to wait before sending it again; 1.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PeerUnheard:
+      description: |
+        `peer_unheard`, `retry: wait`: a gate that reads every live member's
+        facts block is closed only because a live member has not been heard
+        from yet. It came up a moment ago, or this member saw it rejoin or
+        dropped its block on a SWIM rename, as every restart in a roll does,
+        and its block arrives at the next contact. The idempotency-key gate
+        (ADR-240), for a request carrying `Idempotency-Key`, and the
+        `Decimal128` gate (ADR-238), for a creation of a `Decimal128` `_id` or
+        of a partial index with a `Decimal128` bound. Nothing was looked up or
+        written. Send the same request again, to the same member, after
+        `Retry-After` (with the same key, if it had one): it is then answered
+        as it would have been. A live member whose block says it lacks the
+        capability decides over one not heard from, and the answer is then
+        the `400`.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before sending it again; one sync interval, at least 1.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -3400,6 +3435,7 @@ components:
         | `resolver_busy` | 503 | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered. Nothing was done. Carries `Retry-After`. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
         | `idempotency_key_reused` | 422 | no | The request's `Idempotency-Key` is remembered on this member for a different request (another body, path, query or method) from this principal on this collection, or two members accepted it for two different requests and their records have met (a contested record, refused for every retry of either). Nothing was written. Use a new key for a new request |
         | `idempotency_key_in_flight` | 409 | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member, or another retry of it is being answered there. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record |
+        | `peer_unheard` | 503 | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet (it came up, or rejoined, a moment ago). Nothing was looked up or written. Carries `Retry-After`, one sync interval; the same request sent again here then, with the same key if it had one, is taken |
         | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
       enum:
         - bad_request
@@ -3430,6 +3466,7 @@ components:
         - resolver_busy
         - idempotency_key_reused
         - idempotency_key_in_flight
+        - peer_unheard
 
     Capability:
       type: string
@@ -3461,7 +3498,7 @@ components:
         | `find-and-modify` | `POST .../find_and_modify` |
         | `conditional-writes` | `if_stamp` on every single-document write, `stamps` on `find`, `ETag` on a read by id, and the `stale` error code (ADR-084) |
         | `hybrid-search` | `POST .../hybrid_search` |
-        | `idempotency-keys` | `Idempotency-Key` on the document writes, the `Idempotency-Replayed` marker, and the codes `idempotency_key_reused` and `idempotency_key_in_flight`. Listed only while this member takes the header: its `cluster.idempotency_keys` is set and every live member carries records. A client that read it and then meets the gate's `400` has met a roll, a rollback or a change of the switch in between |
+        | `idempotency-keys` | `Idempotency-Key` on the document writes, the `Idempotency-Replayed` marker, and the codes `idempotency_key_reused` and `idempotency_key_in_flight`. Listed only while this member takes the header: its `cluster.idempotency_keys` is set and every live member carries records, and not while one has not been heard from yet. A client that read it and then meets the gate's `400` has met a roll, a rollback or a change of the switch in between; one that meets its `503 peer_unheard` has met a restart or a rejoin, and waits `Retry-After` |
         | `local-embeddings` | This build can embed in-process; a `local` provider will be accepted |
         | `partial-indexes` | `partialFilterExpression` on index creation |
         | `token-refresh` | `POST /v1/auth/refresh`, so an active client never re-sends credentials |
