@@ -629,7 +629,8 @@ fn a_keyed_replace_replays_over_a_stale_if_stamp() {
 
 /// A keyed delete is replayed while its own tombstone stands; once retention
 /// has collected the tombstone the retry runs afresh, and deletes a document a
-/// peer brought back under it.
+/// peer brought back under it: a version older than the request's first write
+/// makes the record absent.
 #[test]
 fn a_keyed_delete_replays_only_while_its_tombstone_stands() {
     let (engine, coll, _dir, _path) = open();
@@ -958,13 +959,16 @@ fn a_record_past_its_window_is_absent() {
     assert_eq!(count(&engine, &coll), 1);
 }
 
-/// A peer's record past its window is not stored (the build review's m2), past
-/// the window being the one test of a record's life. Here a key reused after its
-/// window holds the new request's live record, and a peer that has not yet run
-/// retention ships the old request's: merged, it lowered the live record's
-/// `first` to the old request's, so a resume left every match changed since, and
-/// with another body it marked the new request contested. Nothing is written for
-/// it, a row included.
+/// A peer's record past its window is not stored, past the window being the one
+/// test of a record's life, when the live record here is another request's or
+/// there is none. Here a key reused after its window holds the new request's
+/// live record, and a peer that has not yet run retention ships the old
+/// request's, with another body: merged, it would lower the live record's
+/// `first` to the old request's, so a resume would leave every match changed
+/// since, and mark the new request contested. Nothing is written for it, a row
+/// included; nor for a past-window record under a key with no record here. (One
+/// of the live record's own request, the same fingerprint, is merged: the
+/// replication tests' `a_past_window_record_of_the_live_records_own_request_merges`.)
 #[test]
 fn a_peer_record_past_its_window_is_not_stored() {
     let (engine, coll, _dir, _path) = open();
@@ -974,7 +978,10 @@ fn a_peer_record_past_its_window_is_not_stored() {
     let live = record(&engine, &coll, &k).unwrap();
     let rows_before = rows(&engine);
     let now = crate::physical_now_ms();
-    for fingerprint in [k.fingerprint, reused(&k).fingerprint] {
+    let elsewhere = keyed(32);
+    for (scope, fingerprint) in
+        [(k.scope, reused(&k).fingerprint), (elsewhere.scope, elsewhere.fingerprint)]
+    {
         let old = IdempotencyRecord {
             fingerprint,
             first: stamp(now - 2 * DAY_MS, 0, 0x77),
@@ -986,12 +993,13 @@ fn a_peer_record_past_its_window_is_not_stored() {
         };
         let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
         let (stored, wrote) =
-            engine.store_record_noting(&txn, coll.id, &k.scope, &old, Some(old.last)).unwrap();
+            engine.store_record_noting(&txn, coll.id, &scope, &old, Some(old.last)).unwrap();
         assert_eq!((stored, wrote), (None, false));
         txn.commit().unwrap();
     }
     assert_eq!(record(&engine, &coll, &k), Some(live), "its first and flag as they were");
-    assert_eq!(rows(&engine), rows_before, "no row for it");
+    assert_eq!(engine.idempotency_record(coll.id, &elsewhere.scope).unwrap(), None);
+    assert_eq!(rows(&engine), rows_before, "no row for either");
     replayed(engine.insert_keyed(&coll, doc! { "v": 1 }, &k).unwrap());
 }
 
