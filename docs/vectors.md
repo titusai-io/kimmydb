@@ -368,7 +368,14 @@ changes or its configuration does.
 Requires `write` on the collection — this is derived data about a document you
 can already write, not an administrative act. The document must exist (there is
 no HLC to attach otherwise, so a missing one is `404`), and every vector must
-match the configured `dim` or the request is `400`.
+match the configured `dim` or the request is `400`. So is a vector whose
+squared length is not a finite 32-bit float (a component of 2^64, about
+1.8e19, or more, or squares summing past `f32::MAX`): the exact scan scores it
+0, and the graph's distance between two vectors with a component of 2^64 or
+more is NaN, on which the library panics at a search for such a vector
+itself. A query vector is held to the same test,
+and a provider's answer holding one is refused as unusable
+([ADR-241](decisions.md)).
 
 ---
 
@@ -593,10 +600,24 @@ What happens next depends on how many documents the filter admitted:
   collection, and the answer is exact whichever path the collection would
   otherwise take.
 - **More than 1,000**: the search runs as it would without a filter, exact
-  scan or graph walk, and discards hits outside the set. The graph is asked for
-  eight times the candidates when a filter is present so that discarding still
-  leaves `k`; an unselective filter discards little, which is what makes this
-  the right direction for it.
+  scan or graph walk, and discards hits outside the set. On the graph the walk
+  is widened by the share of the collection the filter admits — about
+  `2 × k × chunks / admitted` candidates, never fewer than eight times the
+  unfiltered walk and at most 8,000 — so that discarding still leaves `k`; a
+  walk that comes back short is retried once, widened by the share of its own
+  candidates the filter admitted (at least four times the first width, and the
+  widest when it admitted none), and a second short one gives way to reading
+  the admitted documents by key, so the search returns `k` whenever `k`
+  admitted documents have vectors ([ADR-241](decisions.md)). Measured at
+  100,000 documents of 384 dimensions, with 1% to 10% of them admitted: `k` of
+  `k`, recall 1.000 against the exact filtered answer, 9 to 33 ms. An
+  unselective filter discards little, which is what makes this the right
+  direction for it — unless it refuses what is nearest the query: with the
+  fifth of 100,000 documents nearest the query refused and the rest admitted,
+  even the widest walk comes back short, and the search reads the 80,000
+  admitted documents by key, exactly, in about 2.5 s. Reading by key stops at
+  the request's deadline and answers `503` `timeout`, as a request that ran
+  out of time does.
 
 The boundary is a count rather than a fraction of the collection because the
 first direction's cost does not depend on the collection: a thousand
@@ -792,6 +813,19 @@ than starting a duplicate. Before this the build held the lock, and a rebuild
 of one collection was a stall for vector and hybrid search on every collection
 the node serves.
 
+The graph is built by `hnsw_rs` 0.3.5, kimmydb's copy of it with one function
+added ([ADR-241](decisions.md)). After the inserts the build reads layer 0 and
+links every point the library's insertion left with no edge into it, or
+outside the entry point's component, from its nearest linked points: such a
+point is one no search returns. A component whose searches return only one
+another, so that no search offers it a linked point, is bridged both ways to
+the nearest linked points found by reading them all. Then it asks a sample of 128 stored vectors
+to find themselves, and warns when 8 or more do not. A build is retried, in
+another insertion order, only if the linking leaves a point cut off, which no
+measured build has. Each attempt's order is a shuffle of the chunk keys seeded
+by the attempt, so a collection's graph is the same on every member and every
+run.
+
 `hnsw_rs` can insert in parallel, and it was measured — 3–4× faster on a
 ten-core host, saturating at four threads, with recall and reachability
 unchanged — and not adopted: four threads is every core of a small host, and
@@ -917,6 +951,9 @@ The exact path is the oracle for everything approximate:
 | Invariant | How |
 |---|---|
 | The graph finds what a scan finds | Recall measured, not assumed: ≥ 90% at k=10, and the nearest neighbour agrees with an exact scan exactly |
+| No stored vector is out of every search's reach | Every vector of eight builds at 400 × 16 finds itself, and the graph's layer 0 leaves none without an edge into it or outside the entry point's component; the same of three builds at 1,000 × 384 in release; a build links what its insertion cut off (300 copies of one vector, two thirds cut off before); a component the entry point does not reach is linked, judged from the entry point the library dumps, and one no search's candidates reach is bridged |
+| A filtered search returns `k` | 1%, 2% and 3% of a collection admitted return `k` through the graph, at 5,000 documents and, in release, 100,000; a first walk short of `k` is retried wider and answers `k`; a filter that refuses what is nearest the query is retried at the width its first walk's own admitted share asks for; a walk short at its widest gives way to the keyed join's exact answer, which stops at the request's deadline |
+| A snapshot cannot take the node down | 39 spoilings of a snapshot's two files are refused before the library reads them, a vector too large to square among them; the three the library answers by ending the process are run in child processes, which the library alone ends and the cache survives, rebuilding |
 | Dispatch does not change results | `the_approximate_path_agrees_with_the_exact_one` asserts both paths return the same nearest neighbour with a **byte-identical score** |
 | A rebuild stalls no other collection | A build of one collection is parked and a search on another is asserted served meanwhile; two searches on an unbuilt collection produce exactly one build; a search arriving mid-rebuild is served the previous graph |
 | The budget evicts least recently searched first, and never refuses | Three graphs under a budget for two: the untouched one goes, and comes back rebuilt on its next search; a graph larger than the whole budget still loads; a rebuild is charged once; `0` evicts nothing |
