@@ -816,8 +816,8 @@ collection at once, a fixed number rather than a setting, since each scan of
 build needs the rest; a search awaits a turn, holding no thread, and the scan
 reads, only until the request's deadline, and answers `503` `timeout` past it.
 A graph a previous process saved is served at once and judged by a builder,
-which counts the collection and either re-stamps it at the generation it was
-adopted at or rebuilds it. A builder lets go of the store before it saves, so
+which counts the collection and either re-stamps it at the generation the
+process started at, before any write it made, or rebuilds it. A builder lets go of the store before it saves, so
 the node's stop never waits for a save. Before 0.52.0
 the build ran in the search that asked for it, which waited for it, and so did
 every other search of that collection, past the request's timeout; before

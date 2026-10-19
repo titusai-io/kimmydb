@@ -29124,8 +29124,9 @@ collection's next search would wait that long, on every member.
 
 1. **Builds run on builder threads.** A search that finds no usable graph queues a build and is answered at once. The
    queue holds one build per collection, carrying the forget epoch read when it was asked for, so a drop, a reconfigure
-   or a recreate since fences it as it fences a build under way; a reconfiguration fences a queued build even with
-   nothing resident, since one asked for before it is of the old shape. At most `vector.index_cache.build_concurrency`
+   or a recreate since fences it as it fences a build under way. The queue records each build's shape, and a
+   reconfiguration fences a queued build of another shape even with nothing resident, since one asked for before it is
+   of the old shape; a re-delivered configuration finds a queued build of the shape in force, and leaves it alone. At most `vector.index_cache.build_concurrency`
    builder threads run (default 1; at least 1): a build is CPU and memory bound (a 100,000 × 384 graph peaks at about
    1.3 GiB with its records), and the first start of 0.52.0 asks for every searched collection's at once. A builder runs
    the count that decides whether the collection is worth a graph, the build and the linking, then the save, then
@@ -29133,7 +29134,8 @@ collection's next search would wait that long, on every member.
    search that queues a build starts one. A build that panics costs that build and not the builder: it is caught,
    logged at `ERROR`, the queue's counts stay true, and the collection is scanned until a later search asks again.
    **A builder keeps nothing from the node's stop.** Its walks, the count, the build's reads, the linking and the
-   bridge's pass among them, are background walks, which the stop ends at once. A queued build holds the store weakly,
+   bridge's pass among them, are background walks, which the stop ends at once; the linking looks at the stop between
+   its searches every 4,096 cut-off points, as the bridge's pass does every 4,096 vectors. A queued build holds the store weakly,
    and a builder holds it only for the count and the build and lets go before the save, which needs none: a save of
    100,000 vectors takes up to two minutes, and a stop that lands in one finds the store free to close. No save starts
    once the stop has begun; one the exit cuts short leaves its staging directory, never a half snapshot (ADR-241 item
@@ -29142,10 +29144,11 @@ collection's next search would wait that long, on every member.
    its rebuild runs, as before (bounded recall on new data, never a wrong answer). A snapshot found behind, which
    includes every snapshot 0.51 or earlier saved (ADR-241), is installed behind and served until its rebuild lands. A
    snapshot a previous process saved is installed unjudged and served at once; a builder counts the collection and
-   compares its moves of chunk ids, and either re-stamps it at the generation it was adopted at or rebuilds it. The
-   adoption's generation, not the builder's: a write this process makes in between that keeps the count and the keys,
-   an edit of a document into as many chunks, is one the count cannot see, and stamped at the adoption the graph is
-   behind and rebuilt once the window passes, rather than fresh until some later write.
+   compares its moves of chunk ids, and either re-stamps it at the generation the process started at or rebuilds it.
+   The process's start, not the builder's generation or the adoption's: a snapshot a previous process saved predates
+   every write this process has made, and a write that keeps the count and the keys, an edit of a document into as many
+   chunks, made before the first search or between the adoption and the judgement, is one the count cannot see; stamped
+   at the start the graph is behind it and rebuilt once the window passes, rather than fresh until some later write.
    The snapshot load itself stays in the search, off the async worker: under a second at 100,000 vectors. Only a
    collection with no graph at all is answered by an **exact scan** of every vector (`Access::Building`).
 3. **The exact scan while a graph is built** takes a turn first: at most two scans of one collection at once
@@ -29194,8 +29197,10 @@ the cores the build needs. A setting for the scan count: no measurement asks for
 scan; two searches of an unbuilt collection make one build; a search mid-rebuild is served the previous graph; a
 build that panics costs that build and not the builder; a stop during a save finds the store free, a build queued
 behind it holding none, and the save finishes whole; a stop during the bridge's pass ends the build at its next look,
-bridging nothing more; a write between adopting a snapshot and judging it leaves the graph behind and rebuilt; a drop
-while a build is queued, and a reconfiguration with nothing resident, fence it; at most two scans of one collection at
+bridging nothing more, and one during a linking round ends it at its next look; a write between adopting a snapshot and
+judging it, and one before the first search after a restart, leave the graph behind and rebuilt; a drop while a build is
+queued, and a reconfiguration of another shape with nothing resident, fence it, and a re-delivered configuration of the
+shape in force keeps it; at most two scans of one collection at
 once, a third waiting only to its deadline and taking a turn given back; a scan holds its turn while it reads; an exact
 scan stops at a passed deadline, having read no more than the rows between two looks, and answers exactly without one;
 the stale gauge counts a snapshot adopted unjudged until a builder judges it, and the pending gauge counts the builds it
