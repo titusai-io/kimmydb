@@ -2544,3 +2544,153 @@ async fn a_second_restore_during_an_inbound_records_cursor_does_not_apply_a_keye
          retry answered {retry:?} and the documents are now {after:?}"
     );
 }
+
+/// A's lost entries as C holds them, of A's origin above the replay's start, and
+/// how far C's walk to them reached.
+fn lost_entries_on_c(f: &Fixture) -> (Vec<OplogEntry>, Hlc) {
+    let from = f.a.own_position_at_open();
+    let window =
+        f.c.entries_for_peer(from, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
+    let entries = window
+        .entries
+        .into_iter()
+        .filter(|entry| entry.stamp.node == f.a.node_id() && entry.stamp.hlc > from)
+        .collect();
+    (entries, window.scanned_to)
+}
+
+/// A record of `orders` on C from `first` to `last`, as stored there.
+fn plant_record_on_c(
+    f: &Fixture,
+    n: u8,
+    first: Stamp,
+    last: Stamp,
+) -> kimmy_storage::CarriedRecord {
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let record = kimmy_storage::IdempotencyRecord {
+        fingerprint: kimmy_core::Fingerprint([n; 32]),
+        first,
+        last,
+        origin: first.node,
+        state: kimmy_storage::RecordState::Done,
+        contested: false,
+        outcome: kimmy_storage::RecordOutcome::Insert { stamp: last },
+    };
+    let carried = kimmy_storage::CarriedRecord {
+        collection: orders.id,
+        scope: kimmy_core::ScopeHash([n; 32]),
+        carrying: Some(first),
+        record: record.encode(),
+    };
+    f.c.apply_batch_carrying(&[], std::slice::from_ref(&carried), kimmy_storage::RecordsVia::Pull)
+        .unwrap();
+    carried
+}
+
+/// A record a replay page carries twice, by the window (F3, or a row of the
+/// requester's origin inside the page) and by B2 at its `first`, is carried at
+/// the lower of the two stamps: carried at the higher, a page that stops between
+/// the two would store the effect there without its record.
+#[test]
+fn a_record_a_replay_page_carries_twice_is_carried_at_the_lower_of_its_stamps() {
+    let f = fixture(5, 0);
+    let from = f.a.own_position_at_open();
+    let node = f.a.node_id();
+    let first = |k: u16| Stamp::new(Hlc::new(from.wall_ms + 1, k), node);
+    let row = |k: u16| Stamp::new(Hlc::new(from.wall_ms + 3, k), node);
+    // One the window sends by F3, one by a row of A's origin inside the page.
+    let mut f3 = plant_record_on_c(&f, 0x71, first(1), row(1));
+    let mut own = plant_record_on_c(&f, 0x72, first(2), row(2));
+    f3.carrying = Some(row(1));
+    own.carrying = Some(row(2));
+    let (entries, scanned_to) = lost_entries_on_c(&f);
+    assert!(!entries.is_empty(), "premise: lost entries");
+    let cut = cut_replay_page(
+        &f.c,
+        &"a test",
+        node,
+        from,
+        entries,
+        vec![f3, own],
+        1,
+        scanned_to,
+        false,
+        None,
+    )
+    .unwrap();
+    let carried = |n: u8| {
+        cut.records.iter().find(|r| r.scope == kimmy_core::ScopeHash([n; 32])).map(|r| r.carrying)
+    };
+    assert_eq!(carried(0x71), Some(Some(first(1))), "the F3 record at its first");
+    assert_eq!(carried(0x72), Some(Some(first(2))), "the window's other record at its first");
+}
+
+/// The strict-advance guard: a page of records alone under a cursor of this
+/// position whose records in key order all lie outside the cursor's set and at
+/// or before its key (here a cursor of another collection's set, keyed past every
+/// record) cannot move the key past it, and sent, it would be sent again for
+/// ever. Such a page carries nothing and is counted, never sent.
+#[test]
+fn a_page_of_records_alone_that_cannot_move_its_cursors_key_is_not_sent() {
+    let f = fixture(5, 0);
+    plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    let from = f.a.own_position_at_open();
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let base = f.c.replay_page_records(&[orders.id], from, Hlc::MAX, None, 1 << 20).unwrap().base;
+    let cursor = kimmy_storage::ReplayRecords {
+        at: from,
+        through: Hlc::MAX,
+        collections: vec![kimmy_core::CollectionId(1)],
+        collection: kimmy_core::CollectionId(u64::MAX),
+        scope: kimmy_core::ScopeHash([0xff; 32]),
+        base,
+    };
+    let (entries, scanned_to) = lost_entries_on_c(&f);
+    let unfit = records_unfit().get(UnfitPath::Replay);
+    let cut = cut_replay_page(
+        &f.c,
+        &"a test",
+        f.a.node_id(),
+        from,
+        entries,
+        Vec::new(),
+        0,
+        scanned_to,
+        false,
+        Some(cursor.clone()),
+    )
+    .unwrap();
+    assert!(cut.unfit && cut.records.is_empty() && cut.entries.is_empty(), "nothing sent: {cut:?}");
+    assert!(records_unfit().get(UnfitPath::Replay) > unfit, "counted");
+    if let Some(went) = &cut.replay_records {
+        assert_eq!(went, &cursor, "the cursor stays as it came");
+    }
+}
+
+/// A replay page the sender truncates to fit its frame keeps every record riding
+/// its kept entries, the one riding its last entry included: the next page
+/// starts after that entry, so B2's rule (`last` above the page's start) never
+/// selects that record again. Ten keyed inserts of about a kilobyte each under
+/// an 8 KiB frame, so every page is cut.
+async fn a_truncated_replay_page_keeps_its_last_entrys_record(outbound: bool) {
+    let f = fixture_of(10, 1_000, 0, true);
+    let _budget = EntryBudget::set(8 * 1024);
+    f.replay_through(outbound).await;
+    assert_eq!(f.orders(), 2 + 10, "every lost write is back");
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    let missing: Vec<i64> = (2..12)
+        .filter(|i| f.a.idempotency_record(orders.id, &lost_scope(*i)).unwrap().is_none())
+        .collect();
+    assert!(missing.is_empty(), "lost keyed inserts back without their records: {missing:?}");
+}
+
+#[tokio::test]
+async fn a_truncated_inbound_replay_page_keeps_its_last_entrys_record() {
+    a_truncated_replay_page_keeps_its_last_entrys_record(false).await;
+}
+
+#[tokio::test]
+async fn a_truncated_outbound_replay_page_keeps_its_last_entrys_record() {
+    a_truncated_replay_page_keeps_its_last_entrys_record(true).await;
+}

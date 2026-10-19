@@ -484,6 +484,17 @@ mod tests {
         assert_eq!(rest, want);
     }
 
+    /// B2's rule is `first` at or below the page's end: a record that begins
+    /// exactly there is the page's, since its effect can be the page's last entry,
+    /// at that HLC, on the origin replayed.
+    #[test]
+    fn a_record_that_begins_at_the_pages_end_is_carried() {
+        let (engine, a, _b, _dir) = open();
+        plant(&engine, &a, 7, at(20), at(25));
+        let page = engine.records_for_replay_page(&[a.id], at(10).hlc, at(20).hlc).unwrap();
+        assert_eq!(keys(&page), vec![(a.id.0, 7)], "a record that begins at the end");
+    }
+
     /// A delta larger than its budget stops, and the base moves to where it did.
     #[test]
     fn a_records_cursors_delta_stops_at_its_budget_and_moves_the_base() {
