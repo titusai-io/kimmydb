@@ -653,27 +653,29 @@ impl Members {
 
     /// Start every trailing ask due by `now` whose member is still live, at the
     /// address it is live at (ADR-247), and answer when the next one is due. A
-    /// trailing ask counts as an ask at its due instant.
+    /// trailing ask counts as an ask at its due instant, started or not; **one that
+    /// starts nothing (its member is down) keeps the drop it owed**, so the ask
+    /// that member's next `Up` makes within the interval owes a trailing one.
     pub(crate) fn exchange_due_at(&self, now: Instant) -> Option<Instant> {
-        let due: Vec<NodeId> = {
+        // Read before the ask record is locked: `live` is never taken inside it.
+        let live = self.entries();
+        let due: Vec<(SocketAddr, NodeId)> = {
             let mut asked = self.0.exchanges.asked.lock();
             asked
                 .iter_mut()
                 .filter(|(_, last)| last.trailing && last.at <= now)
-                .map(|(node, last)| {
+                .filter_map(|(node, last)| {
                     last.trailing = false;
+                    let (addr, _) = live.iter().find(|(_, live)| live == node)?;
                     last.dropped = false;
-                    *node
+                    Some((*addr, *node))
                 })
                 .collect()
         };
         if !due.is_empty() {
-            let live = self.entries();
             let sink = Arc::clone(&self.0.exchanges.sink.read());
-            for node in due {
-                if let Some((addr, _)) = live.iter().find(|(_, live)| *live == node) {
-                    sink(*addr, node);
-                }
+            for (addr, node) in due {
+                sink(addr, node);
             }
         }
         self.next_trailing_exchange()
@@ -1607,6 +1609,39 @@ mod tests {
         assert!(!members.exchange_at(addr(7902), node(2), at(100)));
         assert_eq!(members.exchange_due_at(at(5_000)), None);
         assert_eq!(started.lock().len(), 3, "the member is not live");
+    }
+
+    /// A member down when its trailing ask is due, and up again within the next
+    /// interval: the trailing ask started nothing, so the drop it owed is still
+    /// owed, and the up's ask, held by the interval, owes a trailing one (ADR-247).
+    #[test]
+    fn a_trailing_ask_due_while_the_member_is_down_leaves_the_next_drop_owed() {
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(5), 3);
+        let started = Arc::new(Mutex::new(Vec::new()));
+        members.set_exchange_sink_for_test({
+            let started = Arc::clone(&started);
+            Arc::new(move |addr, node| started.lock().push((addr, node)))
+        });
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        members.insert_for_test(addr(7901), node(1));
+        assert!(members.exchange_at(addr(7901), node(1), at(0)));
+        // Down and up (a restart within the interval): owed, trailing at 5 s.
+        members.remove_for_test(&addr(7901));
+        members.insert_for_test(addr(7901), node(1));
+        assert!(!members.exchange_at(addr(7901), node(1), at(1_000)));
+        assert_eq!(members.next_trailing_exchange(), Some(at(5_000)), "premise: owed");
+        // Down again before it is due; due while down: nothing starts.
+        members.remove_for_test(&addr(7901));
+        assert_eq!(members.exchange_due_at(at(5_000)), None);
+        assert_eq!(started.lock().len(), 1, "premise: not started, the member is down");
+        // Up again within the interval of the due instant: its block is gone.
+        members.insert_for_test(addr(7901), node(1));
+        assert!(!members.exchange_at(addr(7901), node(1), at(6_000)), "held by the interval");
+        assert_eq!(members.next_trailing_exchange(), Some(at(10_000)), "and owes a trailing ask");
+        assert_eq!(members.exchange_due_at(at(10_000)), None);
+        assert_eq!(started.lock().len(), 2, "started at the end of the interval");
     }
 
     #[test]

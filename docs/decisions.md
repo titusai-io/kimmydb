@@ -29397,8 +29397,9 @@ shapes, a peer's window was at most 0.04–0.13 s and the restarted member's 0.
    that flaps, or does not answer, costs one exchange an interval. **An ask the interval holds is not lost when it is
    owed**: if the member's block, or every block, was dropped since the last ask (a rename, a down, this member's own
    rejoin), it schedules one trailing ask for the end of the interval, at most one pending per member, which the driver
-   starts then if the member is still live, at the address it is live at; it counts as an ask at that instant. An ask
-   with no drop since the last one (the `MemberUp` beside a `Rename`) owes none.
+   starts then if the member is still live, at the address it is live at; it counts as an ask at that instant, and one
+   that starts nothing (the member is down) keeps the drop it owed, so the member's next `Up` within the interval owes
+   another. An ask with no drop since the last one (the `MemberUp` beside a `Rename`) owes none.
 3. **The exchange** is the opening frame pair of a sync round and nothing after it: dial (TLS and the shared-secret
    handshake, with the test refusals), `AskVersions { witnessed: true }` with this member's block, its generation and
    its echo of the peer's block as held now, then the peer's `Vectors`, whose block is recorded ordered by its decode
@@ -29407,8 +29408,9 @@ shapes, a peer's window was at most 0.04–0.13 s and the restarted member's 0.
    asks for on its `Vectors` stays owed to its next round), no `PeerHealth` change, no catching-up judgement, no lag
    vector. Bounded by the dial's timeouts and 10 s more for the frame pair.
 4. **Where it runs.** A driver task the replication loop spawns beside itself, and aborts when it ends; each exchange
-   is a task of its own whose panic the driver logs. The driver's timer starts each trailing ask when it is due. The ask queue exists from the member set's creation, so an `Up`
-   the membership task sees before the loop starts (the daemon starts membership first) is queued. The driver reads
+   is a task of its own whose panic the driver logs. The driver's timer starts each trailing ask when it is due. The
+   ask queue exists from the member set's creation, so an `Up` the membership task sees before the loop starts (the
+   daemon starts membership first) is queued. The driver reads
    this member's block at each ask, so an exchange takes no storage step and an abort can end it anywhere.
 5. **A failed exchange** is one `DEBUG` line and still counts as the member's last ask; the next sync contact carries
    the blocks.
@@ -29428,7 +29430,7 @@ frames carry both blocks and both echoes, which is all the window waits for.
 that carry their blocks to it as well, but only once each has learned the new identity by gossip, and an older peer
 during a roll never asks. Its own asks close its own window at once. In a renewal walk (ADR-242), where each step is a
 rejoin, the seed's `Up` asks first and a later step's clear can drop what that exchange brought; that step's ask is
-held by the interval and owed, so it starts at the interval's end (item 2), no later than the next sync contact would
+held by the interval and owed, so it starts at the interval's end (item 2), about when the next sync contact would
 have come. A peer it still holds live that has gone costs one failed dial in a task of its own.
 
 **Invariant.** Every `Up` or `Rename` of a member that a member sees, and every live peer at its own `Rejoin`, starts an
@@ -29471,7 +29473,8 @@ at then and not at all if it is not live. `exchange::tests`: an exchange leaves 
 the asker the answerer's echo of its own; one with a member not serving fails at the dial and records nothing; one
 with a member that completes the handshake and never answers ends at its bound; the driver runs what is asked, runs an
 ask made before it started, carries the block as it is at each ask, holds the next ask for the interval after a failed
-exchange, starts a trailing ask when it is due, and ends when its guard is dropped. The simulation rows above. `kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync interval, one restarted three
+exchange, starts a trailing ask when it is due, and ends when its guard is dropped. The simulation rows above.
+`kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync interval, one restarted three
 times with SIGTERM; every member's `kimmy_ownership_peers{state="unknown"}` is sampled every 10 ms and no run above 0
 lasts a second. Mutation rows in bash, each failing a test with only that change: no ask on `Up`; none on `Rename`; no
 exchange at all (the simulation and the real-process test); the ask before the rename's drop; no debounce; the
@@ -29481,7 +29484,8 @@ noted; `AskVersions` without the witnessed flag; the driver dropping its asks; n
 with no drop; more than one pending; one due at once; a drop, or a clear, not marked; one started for a member not
 live; the driver's timer never starting one; the driver not aborted with its guard; a failed exchange clearing the
 member's last ask; the block read once for every ask; no bound on the frame pair; asks made before the driver starts
-dropped. One more is argued equivalent rather than run: recording the answer at a sequence taken when it is recorded
-instead of when it decoded. The two are taken in one poll with no await between them, so they can differ only by a
-decode or a drop another thread makes in the same synchronous stretch, which no test can place there; the ordering rule
-itself is pinned by the simulation, whose exchanges record inside the ask.
+dropped; a trailing ask that starts nothing clearing the drop it owed. One more is argued unobservable (not
+equivalent) rather than run: recording the answer at a sequence taken when it is recorded instead of when it decoded.
+The two are taken in one poll with no await between them, so they can differ only by a decode or a drop another thread
+makes in the same synchronous stretch, which no test can place there; in that stretch the mutant would keep a block
+decoded before a drop, which the floor exists to refuse. The simulation pins the ask after the drop, not this choice.
