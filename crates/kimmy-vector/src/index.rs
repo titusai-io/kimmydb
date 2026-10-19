@@ -2601,20 +2601,56 @@ mod tests {
         }
     }
 
+    /// The origin id of `graph`'s entry point, as the library itself dumps
+    /// it: the graph file ends with it (`usize` origin id, `u8` layer, `i32`
+    /// rank).
+    fn library_entry_point(graph: &Hnsw<'static, f32, DistCosine>) -> usize {
+        use hnsw_rs::api::AnnT;
+        let dir = tempfile::tempdir().unwrap();
+        graph.file_dump(dir.path(), crate::dump::BASENAME).unwrap();
+        let file = dir.path().join(format!("{}.hnsw.graph", crate::dump::BASENAME));
+        let bytes = std::fs::read(file).unwrap();
+        let at = bytes.len() - 13;
+        usize::from_ne_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    /// Per point, whether `graph`'s layer-0 edges leave it unreached from
+    /// `root`.
+    fn unreached_from(graph: &Hnsw<'static, f32, DistCosine>, root: usize) -> Vec<bool> {
+        let n = graph.get_nb_point();
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for point in graph.get_point_indexation() {
+            edges[point.get_origin_id()] =
+                point.get_neighborhood_id()[0].iter().map(|e| e.d_id).collect();
+        }
+        let mut reached = vec![false; n];
+        reached[root] = true;
+        let mut stack = vec![root];
+        while let Some(at) = stack.pop() {
+            for &to in &edges[at] {
+                if !std::mem::replace(&mut reached[to], true) {
+                    stack.push(to);
+                }
+            }
+        }
+        reached.iter().map(|reached| !reached).collect()
+    }
+
     /// The linking reaches a component the entry point does not, as well as
-    /// points with no edge into them (ADR-241). Two clusters at opposite
-    /// ends, built with two connections a point and a narrow search, leave
-    /// one cluster's points linked to each other and to nothing the entry
-    /// point reaches: points with an edge into them that no search from the
-    /// entry point can walk to. Measured by search as well as by structure,
-    /// so that a wrong root or a wrong candidate leaves vectors that cannot
-    /// find themselves.
+    /// points with no edge into them, judged from the entry point the library
+    /// itself dumps (ADR-241). Two tight clusters at opposite ends, inserted
+    /// one after the other with four connections a point and a construction
+    /// effort of 8, leave half the second cluster with edges into it and out
+    /// of the entry point's reach, half with no edge into it, and seven points
+    /// at the top level whose reaches differ. So a wrong root, a cut-off point
+    /// left out, or an edge from a cut-off candidate leaves a point cut off,
+    /// or links in more than one round.
     #[test]
     fn the_linking_reaches_a_component_the_entry_point_does_not() {
         const DIM: usize = 8;
         let mut vectors = Vec::new();
-        for (base, side) in [(1u64, 1.0f32), (1_000, -1.0)] {
-            for i in 0..60 {
+        for (base, side) in [(70_001u64, 1.0f32), (71_000, -1.0)] {
+            for i in 0..40 {
                 let mut v = pseudo_random(base + i, DIM);
                 v.iter_mut().for_each(|x| *x *= 0.05);
                 v[0] += side;
@@ -2630,18 +2666,37 @@ mod tests {
                 .filter(|&i| !graph.search(&vectors[i], 32, 800).iter().any(|n| n.d_id == i))
                 .count()
         };
+        let entry = library_entry_point(&graph);
+        let top = graph.get_max_level_observed();
+        let tops: Vec<usize> = graph
+            .get_point_indexation()
+            .into_iter()
+            .filter(|point| point.get_point_id().0 == top)
+            .map(|point| point.get_origin_id())
+            .collect();
+        assert!(
+            tops.iter()
+                .any(|&other| unreached_from(&graph, other) != unreached_from(&graph, entry)),
+            "the precondition: a top-level point other than the entry point reaches other points"
+        );
         let before = Layer0::read(&graph);
+        assert_eq!(before.outside, unreached_from(&graph, entry), "reach from the entry point");
         let islands =
             (0..vectors.len()).filter(|&i| before.outside[i] && !before.no_edge_in[i]).count();
         assert!(islands > 0, "the precondition: points with an edge into them that are cut off");
         assert!(lost(&graph) > 0, "the precondition: vectors that cannot find themselves");
+        let cut = before.cut_off().len();
 
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         let (linked, left) = link_cut_off(&graph, &engine).unwrap();
-        assert!(linked > 0);
         assert_eq!(left, 0, "points still cut off");
-        assert!(Layer0::read(&graph).cut_off().is_empty());
+        assert_eq!(linked, LINK_EDGES * cut, "one round: two edges from linked points into each");
+        assert_eq!(library_entry_point(&graph), entry, "the linking moves no entry point");
+        assert!(
+            unreached_from(&graph, entry).iter().all(|unreached| !unreached),
+            "points the entry point does not reach after the linking"
+        );
         assert_eq!(lost(&graph), 0, "vectors that cannot find themselves after the linking");
     }
 
