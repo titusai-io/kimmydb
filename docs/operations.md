@@ -2435,14 +2435,21 @@ since, as affected. Either remedy closes it:
   them out first and write them back after the drop.
 
 **Such a member can also delete writes its peers keep.** A rewind by 0.51 or
-earlier left, for each document it removed, a tombstone stamped at the rewind's
-clock. Once the member has written anything again, a page from it carries those
-tombstones to its peers, and each deletes there a write of that document at or
-below the target which the member had judged against the write the rewind
-discarded ([ADR-246](decisions.md)). Nothing tells such a tombstone from a
-delete's. Restore the member again from the same backup with this release, as
-the first remedy above does: the rewind removes those documents without a
-tombstone.
+earlier left, for each document it removed, a tombstone under the member's own
+node id, stamped after the rewind's target at about the time the rewind ran.
+Once the member has written anything again, a page from it carries those
+tombstones to its peers: each deletes there a write of that document at or
+below the target that the member had judged against the write the rewind
+discarded, and the peer passes the delete on as an entry under the member's id
+([ADR-246](decisions.md)).
+
+- While no peer holds such a delete, restoring the member again from the same
+  backup with this release, as the first remedy above does, removes the
+  tombstones: this release's rewind removes those documents without one.
+- Once a peer holds one, the write is deleted on every member that took the
+  delete, and restoring the member again does not bring it back: the member
+  takes the delete back from its peers. Insert those documents again from a
+  backup taken before the 0.51 rewind, through any member.
 
 ### The identity comes back with it
 

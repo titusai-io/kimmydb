@@ -511,7 +511,7 @@ resolver. Something untestable in place tends to stay untested.
 | Fold only the member's own origin of the rewinds' records | `a_start_after_a_rewind_resumes_past_a_peers_discarded_stamp` |
 | Leave a tombstone at the rewind's clock for a removed document (0.51) | `a_document_created_after_the_target_is_removed`, `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged`, `row_a_rewind_that_removes_a_document_keeps_a_judged_write_at_or_below_the_target`, `row_a_rewind_that_removes_a_document_deletes_no_kept_write_once_the_member_writes_again` |
 | Leave a tombstone at the target for a removed document | `a_document_created_after_the_target_is_removed`, `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged` |
-| No bound when the rewind only removes | `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged` |
+| No bound when the rewind only removes | `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged`, `row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write` |
 | The bound under a removal taken from a restored entry when there is one | `a_rewind_that_restores_one_document_and_removes_another_is_bounded_by_the_removal` |
 | The bound under a removal without what retention collected | `a_rewind_that_removes_a_document_after_retention_keeps_the_coverage_of_what_retention_collected` |
 | Delete the removed row without its count | `a_document_created_after_the_target_is_removed` |
@@ -519,6 +519,9 @@ resolver. Something untestable in place tends to stay untested.
 | Bound only the origins whose coverage passes the target | `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged` |
 | Bound the vectors when the rewind neither restores nor removes | `a_rewind_that_discards_nothing_changes_neither_vector` |
 | Refuse a discarded entry's token only while the member does not hold the entry again | `a_rewound_entry_a_peer_sends_back_stays_refused` |
+| Floor a removal at zero, below the oplog horizon | `a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected` |
+| Remove the row of a document deleted at the target | `row_a_rewind_keeps_the_tombstone_of_a_document_deleted_at_the_target` |
+| Bound the vectors only for a removed live row | `row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write` |
 
 **The first one escaped on the first run**, and it is the most important refusal
 in the feature: without it a rewind leaves an unrecoverable document at its
