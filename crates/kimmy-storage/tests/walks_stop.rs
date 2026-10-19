@@ -264,6 +264,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("revc_break_tests::rows_of", "test code reading a store of a few dozen rows it wrote itself"),
     (
+        "idempotency_model_tests::World::stored_records",
+        "test code reading the records and rows by stamp of a model member's store, a few dozen rows",
+    ),
+    (
         "migrate_v5_tests::assert_i_docs",
         "test code reading a store of a few hundred rows it wrote itself",
     ),
