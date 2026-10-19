@@ -330,7 +330,8 @@ here: a stamp a window covers is never served again, so a record vouched for at
 one is stored then or never. **A batch that ends at an entry stores no record
 whose row is at or past that entry; the window serves those again.** A record
 is stored whether or not a drop of its collection came after it, since a record
-outlives a drop for its window; one already past its window is not stored. Two records of one key
+outlives a drop for its window; one already past its window is not stored, unless the
+live record here is of the same request (the same fingerprint), which it merges into. Two records of one key
 merge as a join ([Time & Conflicts](time-and-conflicts.md#idempotency-records-merge-as-a-join)),
 and the receiver's clock moves past both of the record's stamps. A store that
 changes nothing writes nothing, and a frame of records held already costs no
