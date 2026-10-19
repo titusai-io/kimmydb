@@ -1396,8 +1396,8 @@ mod tests {
         ));
     }
 
-    /// A healthy graph at a realistic embedding width is not treated as broken,
-    /// and is healthy: no more than 0.5% of it is out of reach.
+    /// A graph at a realistic embedding width loses nothing, and is not
+    /// treated as broken.
     ///
     /// The threshold this guards was once sized against a 400-vector,
     /// 16-dimensional fixture, and at 384 dimensions a fixed search budget
@@ -1409,15 +1409,15 @@ mod tests {
     /// `hnsw_rs` 0.3.4** (ADR-241). Measured with every point checked, at this
     /// size and width:
     ///
-    /// | library | draws | truly orphaned | sampled score |
+    /// | library | draws | truly orphaned | cut off at layer 0 |
     /// |---|---|---|---|
-    /// | 0.3.4 | 12 | 0.8%–2.1%, and 34.6% in one | 0–2, and more |
-    /// | 0.3.5 | 52 | 0–0.2% | 0–1 |
+    /// | 0.3.4 | 12 | 0.8%–2.1%, and 34.6% in one | up to 800 |
+    /// | 0.3.5 | 52 | 0–0.2% | up to 2 |
+    /// | 0.3.5, linked | 24 | none | none |
     ///
     /// A build is a function of its records and its attempt, so the three
-    /// draws here are the same three graphs on every run (0.3.5: 2, 0 and 0
-    /// points out of reach), and the bound is an assertion about the library,
-    /// not a bet on a draw: 0.3.4's best of twelve left 8 out of reach.
+    /// draws here are the same three graphs on every run, and the assertions
+    /// are about the library and the linking, not bets on a draw.
     ///
     /// **Ignored, and run by its own CI job in release.** A 384-dimensional
     /// graph costs 146 seconds to build in a debug profile against 21 in
@@ -1431,8 +1431,6 @@ mod tests {
         const COUNT: usize = 1_000;
         const DIM: usize = 384;
         const DRAWS: usize = 3;
-        /// Out of reach in one draw, at most: 0.5%.
-        const MOST_OUT_OF_REACH: usize = COUNT / 200;
 
         let (engine, shadow, _dir) = setup(COUNT, DIM);
         let vectors = vectors_by_key(&engine, &shadow);
@@ -1445,19 +1443,24 @@ mod tests {
                 reach.unreachable <= reach.missed,
                 "a confirmed loss is a subset of the misses it was found among"
             );
+            assert_eq!(
+                cut_off(&index),
+                (0, 0),
+                "draw {draw}: points with no layer-0 edge into them, and points outside the \
+                 entry point's component"
+            );
             // Every point, not the sample: the ground truth the score is
             // judged against.
             let orphaned = truly_orphaned(&index, &vectors);
-            assert!(
-                orphaned <= MOST_OUT_OF_REACH,
-                "draw {draw}: {orphaned} of {COUNT} {DIM}-dimensional vectors cannot find \
-                 themselves; hnsw_rs 0.3.5 leaves at most 2 here and 0.3.4 at least 8"
+            assert_eq!(
+                orphaned, 0,
+                "draw {draw}: {DIM}-dimensional vectors of {COUNT} that cannot find themselves"
             );
             assert!(
                 reach.unreachable < REACHABILITY_MAX_UNREACHABLE,
-                "draw {draw}: a healthy {DIM}-dimensional graph of {COUNT} vectors ({orphaned} \
-                 truly orphaned) scored {} unreachable of {} sampled ({} missed at ordinary \
-                 effort) and would be discarded and rebuilt",
+                "draw {draw}: a healthy {DIM}-dimensional graph of {COUNT} vectors scored {} \
+                 unreachable of {} sampled ({} missed at ordinary effort) and would be \
+                 discarded and rebuilt",
                 reach.unreachable,
                 reach.sampled,
                 reach.missed,
