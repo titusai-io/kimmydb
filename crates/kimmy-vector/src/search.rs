@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use kimmy_core::{DocId, Metric, VectorRecord, similarity};
 use kimmy_storage::{CollectionMeta, Engine};
 
-use crate::error::Result;
+use crate::error::{Result, VectorError};
 
 /// One search result.
 #[derive(Clone, Debug, PartialEq)]
@@ -83,6 +83,16 @@ pub fn vector_search(
     Ok(top.into_hits())
 }
 
+/// Whether `vector` can be scored without overflowing: its squared length,
+/// summed in 32-bit floats as the graph's distances are, is finite. A NaN or
+/// an infinity fails, and so does a finite component large enough that its
+/// square, or the sum, overflows (3e38 is finite and its square is not): the
+/// cosine distance of such a vector is NaN, which the graph's distance
+/// asserts against, so every search that met it would panic (ADR-241).
+pub fn searchable(vector: &[f32]) -> bool {
+    vector.iter().map(|x| x * x).sum::<f32>().is_finite()
+}
+
 /// Whether a filter's admitted set lets `record` into a search: `None` is no
 /// filter and admits everything.
 ///
@@ -114,8 +124,33 @@ pub fn vector_search_among(
     options: &SearchOptions,
     sources: &[DocId],
 ) -> Result<Vec<Hit>> {
+    vector_search_among_until(engine, shadow, query, options, sources, None)
+}
+
+/// How many documents the keyed join reads between looks at its deadline:
+/// about 3 ms of reads at 384 dimensions.
+const KEYED_DEADLINE_STRIDE: usize = 64;
+
+/// [`vector_search_among`], stopped at `deadline` with
+/// [`VectorError::DeadlineExceeded`] (ADR-241). Its cost is the admitted set,
+/// about 30 to 45 µs a document at 384 dimensions, and a graph search falls
+/// back to it whatever the set's size, so it looks at the request's deadline
+/// itself: the request's timeout cannot end a thread that does not yield.
+pub fn vector_search_among_until(
+    engine: &Engine,
+    shadow: &CollectionMeta,
+    query: &[f32],
+    options: &SearchOptions,
+    sources: &[DocId],
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<Hit>> {
     let mut top = TopK::new(options);
-    for source in sources {
+    for (read, source) in sources.iter().enumerate() {
+        if read % KEYED_DEADLINE_STRIDE == KEYED_DEADLINE_STRIDE - 1
+            && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(VectorError::DeadlineExceeded);
+        }
         engine.for_each_vector_of(shadow, source, |record: VectorRecord| {
             if record.vector.len() != query.len() {
                 return Ok(true);

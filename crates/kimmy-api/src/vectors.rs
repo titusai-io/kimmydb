@@ -652,6 +652,16 @@ pub async fn put_document_vectors(
                 config.dim
             )));
         }
+        // A component too large to square in a 32-bit float (above about
+        // 1.8e19, or one that parsed to infinity) makes every distance to the
+        // vector NaN, and the graph's distance asserts against that (ADR-241).
+        if !kimmy_vector::search::searchable(&chunk.vector) {
+            return Err(ApiError::bad_request(format!(
+                "chunk {} has a vector too large to score: its squared length is not a finite \
+                 32-bit float",
+                chunk.chunk
+            )));
+        }
     }
 
     let mut numbers: Vec<u32> = body.iter().map(|c| c.chunk).collect();
@@ -1011,13 +1021,27 @@ fn knn_joined(
     options: &SearchOptions,
     allowed: Option<(&Allowed, Join)>,
 ) -> Result<Vec<Hit>, ApiError> {
+    // The keyed join a filtered graph search can give way to costs its
+    // admitted set, whatever the set's size, so it reads the request's
+    // deadline itself (ADR-241): the timeout cannot end a thread that does
+    // not yield.
+    let deadline = crate::limits::request_time_left().map(|left| std::time::Instant::now() + left);
     if let Some((allowed, Join::Keyed)) = allowed {
-        return search::vector_search_among(&state.engine, shadow, query, options, &allowed.ids)
-            .map_err(vector_error);
+        return search::vector_search_among_until(
+            &state.engine,
+            shadow,
+            query,
+            options,
+            &allowed.ids,
+            deadline,
+        )
+        .map_err(vector_error);
     }
     let set = allowed.map(|(a, _)| &a.set);
     match state.vectors.access(&state.engine, shadow, config.metric, config.dim) {
-        Access::Approximate(index) => index.search(&state.engine, shadow, query, options, set),
+        Access::Approximate(index) => kimmy_storage::blocking(|| {
+            index.search_until(&state.engine, shadow, query, options, set, deadline)
+        }),
         // Every stored vector scored: a walk, off the async worker (ADR-199).
         Access::Exact => kimmy_storage::blocking(|| {
             search::vector_search(&state.engine, shadow, query, options, set)
@@ -1183,6 +1207,12 @@ async fn resolve_query_vector(
                 config.dim
             )));
         }
+        if !kimmy_vector::search::searchable(vector) {
+            return Err(ApiError::bad_request(
+                "query vector is too large to score: its squared length is not a finite 32-bit \
+                 float",
+            ));
+        }
         return Ok(vector.clone());
     }
 
@@ -1207,7 +1237,7 @@ async fn resolve_query_vector(
         None => text.clone(),
     };
     let mut vectors = provider.embed(std::slice::from_ref(&text)).await.map_err(vector_error)?;
-    vectors.pop().ok_or_else(|| {
+    let vector = vectors.pop().ok_or_else(|| {
         // The upstream's fault like every other `provider_error` — a
         // well-formed answer with the vector missing from it — so it takes
         // that code's level unchanged, and no override belongs here.
@@ -1216,7 +1246,16 @@ async fn resolve_query_vector(
             ErrorCode::ProviderError,
             "the embedding provider returned no vector for the query",
         )
-    })
+    })?;
+    // The same upstream fault: a vector no distance can be computed against.
+    if !kimmy_vector::search::searchable(&vector) {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            ErrorCode::ProviderError,
+            "the embedding provider returned a query vector with no finite squared length",
+        ));
+    }
+    Ok(vector)
 }
 
 /// The documents a `filter` admitted, in the two shapes the join needs.
@@ -1411,6 +1450,11 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         V::Snapshot(_) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Snapshot, e.to_string())
         }
+        // The answer a request that ran out of time gets: the search saw the
+        // deadline pass itself, where the timeout layer would have.
+        V::DeadlineExceeded => ApiError::timeout(
+            crate::limits::request_timeout().unwrap_or(crate::limits::DEFAULT_REQUEST_TIMEOUT),
+        ),
     }
 }
 

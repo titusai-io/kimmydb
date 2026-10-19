@@ -28671,8 +28671,8 @@ reasons beside the insert loop.
 0.3.4 on essentially every run); at 1,000 × 384 in release, three draws with nothing lost and nothing cut off; a build
 links every point its insertion cut off (300 copies of one vector, 203 cut off before; a 96-dimensional fixture); an
 attempt builds one graph and each retry another; a build left cut off (the linking skipped) is retried in each attempt's
-order and returns the last; a high sampled score with nothing cut off is not retried; the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 36 spoilings
-and three shapes; a snapshot of each process-ending kind refused, rebuilt and survived, each case in a child process whose
+order and returns the last; a high sampled score with nothing cut off is not retried; the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 38 spoilings
+and four shapes; a snapshot of each process-ending kind refused, rebuilt and survived, each case in a child process whose
 raw-library twin must exit or abort as the case says; a 0.51 snapshot served once and rebuilt; what built a loaded graph
 read from its snapshot; a filtered search returning `k` at 1%, 2% and 3% admitted with no fallback, a forced fallback
 equal to the keyed join, and the same rows at 100,000 documents in release. The reachability distribution measurement

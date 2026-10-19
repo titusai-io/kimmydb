@@ -189,9 +189,14 @@ pub(crate) fn check(dir: &Path, expect: &Expect<'_>) -> Result<(), String> {
                 ));
             }
             data.exact(&mut vector, "a vector")?;
-            // A search computes distances from these, by the same `Ord`.
-            if vector.as_chunks::<4>().0.iter().any(|b| !f32::from_ne_bytes(*b).is_finite()) {
-                return Err(format!("point {origin}'s vector is not finite"));
+            // A search computes distances from these. `is_finite` alone does
+            // not protect it: a finite component whose square overflows (3e38)
+            // makes the cosine distance NaN, which the library's distance
+            // asserts against on every search that meets it.
+            let components: Vec<f32> =
+                vector.as_chunks::<4>().0.iter().map(|b| f32::from_ne_bytes(*b)).collect();
+            if !crate::search::searchable(&components) {
+                return Err(format!("point {origin}'s vector has no finite squared length"));
             }
             loaded += 1;
         }
@@ -414,6 +419,29 @@ mod tests {
             + usize::from_ne_bytes(graph[47 + distance..55 + distance].try_into().unwrap())
     }
 
+    /// How many points each layer of a graph file holds, read through its
+    /// points the way the loader reads them.
+    fn layer_sizes(graph: &[u8]) -> Vec<usize> {
+        let word = |at: usize| usize::from_ne_bytes(graph[at..at + 8].try_into().unwrap());
+        let mut at = description_len(graph);
+        let layers = graph[at] as usize;
+        at += 1;
+        let mut sizes = Vec::new();
+        for _ in 0..layers {
+            let count = word(at + 4);
+            at += 12;
+            sizes.push(count);
+            for _ in 0..count {
+                at += 4 + 8 + 1 + 4;
+                for _ in 0..LAYERS {
+                    let neighbours = word(at);
+                    at += 8 + neighbours * (8 + 1 + 4 + 4);
+                }
+            }
+        }
+        sizes
+    }
+
     /// Where the first point of layer 0 starts in the graph file.
     fn first_point(graph: &[u8]) -> usize {
         description_len(graph) + 1 + 4 + 8
@@ -548,6 +576,27 @@ mod tests {
                 },
                 "a neighbour is point",
             ),
+            // The boundaries: a rank equal to its layer's size is one past
+            // its end.
+            (
+                "neighbour rank at its layer's size",
+                |g, _| {
+                    let at = first_point(g) + 25 + 9;
+                    let size = layer_sizes(g)[0];
+                    put(g, at, &(size as i32).to_ne_bytes());
+                },
+                "a neighbour is point",
+            ),
+            (
+                "entry rank at its layer's size",
+                |g, _| {
+                    let layer = g[g.len() - 5] as usize;
+                    let size = layer_sizes(g)[layer];
+                    let at = g.len() - 4;
+                    put(g, at, &(size as i32).to_ne_bytes());
+                },
+                "the entry point",
+            ),
             (
                 "NaN distance",
                 |g, _| {
@@ -598,7 +647,16 @@ mod tests {
                 |_, d| put(d, 24, &(1u64 << 62).to_ne_bytes()),
                 "bytes, not 16",
             ),
-            ("vector not finite", |_, d| put(d, 32, &f32::INFINITY.to_ne_bytes()), "not finite"),
+            (
+                "vector not finite",
+                |_, d| put(d, 32, &f32::INFINITY.to_ne_bytes()),
+                "no finite squared length",
+            ),
+            (
+                "vector too large to square",
+                |_, d| put(d, 32, &3e38f32.to_ne_bytes()),
+                "no finite squared length",
+            ),
             (
                 "data cut short",
                 |_, d| {

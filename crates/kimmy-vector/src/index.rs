@@ -1087,10 +1087,15 @@ impl HnswIndex {
     /// **A filtered search returns as many hits as the admitted documents can
     /// give, up to `k`** (ADR-241). Filtering happens after the walk, so the
     /// walk is widened by how much of the collection the filter admits
-    /// ([`filtered_width`]); a walk that still comes back short is widened
-    /// once more, and a second short walk gives way to reading the admitted
-    /// documents' chunks by key, which is exact. With a fixed width a filter
-    /// admitting 1% of 100,000 documents returned four hits of ten.
+    /// ([`filtered_width`]). A walk that still comes back short is retried
+    /// once, widened by the share of its own candidates the filter admitted
+    /// ([`retry_width`]): a filter that tracks the vectors, and admits much
+    /// of the collection but little near the query, is widened by what the
+    /// walk saw rather than by the collection's ratio. A second short walk
+    /// gives way to reading the admitted documents' chunks by key, which is
+    /// exact and stops at `deadline` ([`VectorError::DeadlineExceeded`]).
+    /// With a fixed width a filter admitting 1% of 100,000 documents
+    /// returned four hits of ten.
     pub fn search(
         &self,
         engine: &Engine,
@@ -1099,48 +1104,81 @@ impl HnswIndex {
         options: &SearchOptions,
         allowed: Option<&HashSet<DocId>>,
     ) -> Result<Vec<Hit>> {
-        self.search_capped(engine, shadow, query, options, allowed, FILTERED_WIDTH_CAP)
+        self.search_until(engine, shadow, query, options, allowed, None)
     }
 
-    /// [`Self::search`] with the widest filtered walk as a parameter, so a test
-    /// can reach the keyed join on a collection small enough to build.
-    fn search_capped(
+    /// [`Self::search`], with the request's deadline for the keyed join a
+    /// filtered search can give way to.
+    pub fn search_until(
         &self,
         engine: &Engine,
         shadow: &CollectionMeta,
         query: &[f32],
         options: &SearchOptions,
         allowed: Option<&HashSet<DocId>>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<Hit>> {
+        let first = allowed
+            .map(|allowed| filtered_width(options.k, self.keys.len(), allowed.len()))
+            .unwrap_or_default();
+        self.search_with(
+            engine,
+            shadow,
+            query,
+            options,
+            allowed,
+            first,
+            FILTERED_WIDTH_CAP,
+            deadline,
+        )
+    }
+
+    /// [`Self::search_until`] with the first filtered walk's width and the
+    /// widest as parameters, so a test can make a first walk short, and reach
+    /// the keyed join, on a collection small enough to build.
+    #[allow(clippy::too_many_arguments)]
+    fn search_with(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        query: &[f32],
+        options: &SearchOptions,
+        allowed: Option<&HashSet<DocId>>,
+        first: usize,
         cap: usize,
+        deadline: Option<std::time::Instant>,
     ) -> Result<Vec<Hit>> {
         let Some(allowed) = allowed else {
-            return self.walk(engine, shadow, query, options, None, walk_width(options.k, false));
+            let walked =
+                self.walk(engine, shadow, query, options, None, walk_width(options.k, false))?;
+            return Ok(walked.hits);
         };
         // As many as the admitted documents can give: the per-document cap
         // bounds each document's share.
         let wanted = options.k.min(allowed.len().saturating_mul(options.per_document.max(1)));
         let cap = cap.max(walk_width(options.k, true));
-        let first = filtered_width(options.k, self.keys.len(), allowed.len()).min(cap);
-        let hits = self.walk(engine, shadow, query, options, Some(allowed), first)?;
-        if hits.len() >= wanted {
-            return Ok(hits);
+        let first = first.clamp(walk_width(options.k, true), cap);
+        let walked = self.walk(engine, shadow, query, options, Some(allowed), first)?;
+        if walked.hits.len() >= wanted {
+            return Ok(walked.hits);
         }
-        let wider = first.saturating_mul(FILTERED_RETRY_FACTOR).min(cap);
         #[cfg(test)]
         FILTERED_RETRIES.with(|n| n.set(n.get() + 1));
+        let wider = retry_width(options.k, first, &walked, cap);
         if wider > first {
-            let hits = self.walk(engine, shadow, query, options, Some(allowed), wider)?;
-            if hits.len() >= wanted {
-                return Ok(hits);
+            let walked = self.walk(engine, shadow, query, options, Some(allowed), wider)?;
+            if walked.hits.len() >= wanted {
+                return Ok(walked.hits);
             }
         }
         #[cfg(test)]
         KEYED_FALLBACKS.with(|n| n.set(n.get() + 1));
         let ids: Vec<DocId> = allowed.iter().cloned().collect();
-        crate::search::vector_search_among(engine, shadow, query, options, &ids)
+        crate::search::vector_search_among_until(engine, shadow, query, options, &ids, deadline)
     }
 
-    /// One walk of `width` candidates, admitted and ranked.
+    /// One walk of `width` candidates, admitted and ranked, with how many of
+    /// its candidates the filter admitted.
     fn walk(
         &self,
         engine: &Engine,
@@ -1149,8 +1187,9 @@ impl HnswIndex {
         options: &SearchOptions,
         allowed: Option<&HashSet<DocId>>,
         width: usize,
-    ) -> Result<Vec<Hit>> {
+    ) -> Result<Walked> {
         let keys = self.search_keys(query, width)?;
+        let candidates = keys.len();
         let old_forms = allowed.map(old_forms).unwrap_or_default();
 
         let mut hits = Vec::with_capacity(keys.len());
@@ -1175,8 +1214,31 @@ impl HnswIndex {
                 text: record.text,
             });
         }
-        Ok(crate::search::rank_hits(hits, options))
+        let admitted = hits.len();
+        Ok(Walked { hits: crate::search::rank_hits(hits, options), admitted, candidates })
     }
+}
+
+/// What one walk found: its ranked hits, and how many of its candidates the
+/// filter admitted, of how many it walked.
+struct Walked {
+    hits: Vec<Hit>,
+    admitted: usize,
+    candidates: usize,
+}
+
+/// The width of the one retry of a short filtered walk of `first`
+/// candidates: wide enough to expect `FILTERED_MARGIN × k` admitted ones at
+/// the share of its candidates the first walk found admitted, the whole cap
+/// when it found none, and never less than [`FILTERED_RETRY_FACTOR`] times
+/// the first. The collection's ratio is a guess when the filter tracks the
+/// vectors; what the walk saw near the query is not.
+fn retry_width(k: usize, first: usize, walked: &Walked, cap: usize) -> usize {
+    let observed = match walked.admitted {
+        0 => cap,
+        admitted => (FILTERED_MARGIN * k).saturating_mul(walked.candidates).div_ceil(admitted),
+    };
+    observed.max(first.saturating_mul(FILTERED_RETRY_FACTOR)).min(cap)
 }
 
 #[cfg(test)]
@@ -1189,9 +1251,12 @@ thread_local! {
 
 /// The widest walk a filtered search makes before reading the admitted
 /// documents by key. Measured at 100,000 × 384, a walk of 8,000 candidates
-/// costs about 50 ms, and a search reaches it only when the filter admits at
-/// most one document in 400, where the keyed join it gives way to reads at
-/// most 2,500 documents per million in the collection.
+/// costs about 50 ms. A filter independent of the vectors reaches it only
+/// when it admits at most one document in 400; one that tracks the vectors
+/// (it admits most of the collection, and little near the query) can reach
+/// it at any selectivity, and then the keyed join reads every admitted
+/// document, about 30 to 45 µs each at 384 dimensions, up to the request's
+/// deadline.
 const FILTERED_WIDTH_CAP: usize = 8_000;
 
 /// How much wider than the admitted share a filtered walk looks: a walk of
@@ -2062,7 +2127,8 @@ mod tests {
         let allowed: HashSet<DocId> = (0..50).map(|i| DocId::Int64(i * 100)).collect();
         let fixed = index
             .walk(&engine, &shadow, &pseudo_random(90_000, DIM), &options, Some(&allowed), 320)
-            .unwrap();
+            .unwrap()
+            .hits;
         assert!(fixed.len() < 10, "the precondition: a fixed walk is short here ({})", fixed.len());
 
         for (percent, admitted) in [(1, 50), (2, 100), (3, 150)] {
@@ -2090,14 +2156,115 @@ mod tests {
         let ids: Vec<DocId> = allowed.iter().cloned().collect();
         let query = pseudo_random(90_000, DIM);
         let before = KEYED_FALLBACKS.with(|n| n.get());
-        let hits =
-            index.search_capped(&engine, &shadow, &query, &options, Some(&allowed), 0).unwrap();
+        let hits = index
+            .search_with(&engine, &shadow, &query, &options, Some(&allowed), 0, 0, None)
+            .unwrap();
         assert_eq!(KEYED_FALLBACKS.with(|n| n.get()) - before, 1, "the keyed join answered");
         let exact =
             crate::search::vector_search_among(&engine, &shadow, &query, &options, &ids).unwrap();
         let ids_of = |hits: &[Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids_of(&hits), ids_of(&exact), "exactly the keyed join's answer");
         assert_eq!(hits.len(), 10);
+    }
+
+    /// A first walk that comes back with some admitted hits but fewer than
+    /// `k` is retried, widened by the share of its own candidates the filter
+    /// admitted, and the retry answers with `k`: the search never answers
+    /// short, and does not give way to the keyed join when a wider walk is
+    /// enough. The first walk is held to the unadapted 320 candidates, and the
+    /// admitted set is chosen so that it holds between half of `k` and `k − 1`
+    /// admitted hits, which accepting a walk of half the hits wanted would
+    /// pass.
+    #[test]
+    fn a_first_walk_short_of_k_is_retried_wider_and_answers_k() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        // The first admitted set, spread evenly, whose 320-candidate walk holds
+        // 5 to 9 admitted hits: the same one on every run.
+        let (allowed, short) = (60..=200)
+            .step_by(5)
+            .find_map(|admitted: usize| {
+                let step = COUNT / admitted;
+                let allowed: HashSet<DocId> =
+                    (0..admitted).map(|i| DocId::Int64((i * step) as i64)).collect();
+                let hits = index
+                    .walk(&engine, &shadow, &query, &options, Some(&allowed), 320)
+                    .unwrap()
+                    .hits
+                    .len();
+                (5..10).contains(&hits).then_some((allowed, hits))
+            })
+            .expect("no admitted set leaves the first walk between half of k and k - 1");
+        let (retries, fallbacks) =
+            (FILTERED_RETRIES.with(|n| n.get()), KEYED_FALLBACKS.with(|n| n.get()));
+        let hits = index
+            .search_with(&engine, &shadow, &query, &options, Some(&allowed), 320, 8_000, None)
+            .unwrap();
+        assert_eq!(hits.len(), 10, "a first walk of {short} hits was answered short");
+        assert!(hits.iter().all(|h| allowed.contains(&h.id)));
+        assert_eq!(FILTERED_RETRIES.with(|n| n.get()) - retries, 1, "the short walk was retried");
+        assert_eq!(KEYED_FALLBACKS.with(|n| n.get()) - fallbacks, 0, "the retry should answer it");
+    }
+
+    /// The keyed join a filtered search gives way to stops at the request's
+    /// deadline with [`VectorError::DeadlineExceeded`]: its cost is the
+    /// admitted set, and a filter that tracks the vectors reaches it at any
+    /// selectivity.
+    #[test]
+    fn the_keyed_join_stops_at_its_deadline() {
+        const COUNT: usize = 2_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let allowed: HashSet<DocId> = (0..COUNT as i64).map(DocId::Int64).collect();
+        let ids: Vec<DocId> = allowed.iter().cloned().collect();
+        let query = pseudo_random(90_000, DIM);
+        let passed = std::time::Instant::now();
+        assert!(matches!(
+            crate::search::vector_search_among_until(
+                &engine,
+                &shadow,
+                &query,
+                &options,
+                &ids,
+                Some(passed)
+            ),
+            Err(VectorError::DeadlineExceeded)
+        ));
+        // Through the graph search, a filter that tracks the vectors: it
+        // admits every document but the 400 nearest the query, so a walk of
+        // the floor's 320 candidates finds none admitted, and at a cap no
+        // wider the search gives way to the join, which the passed deadline
+        // ends.
+        let nearest: HashSet<DocId> = crate::search::vector_search(
+            &engine,
+            &shadow,
+            &query,
+            &SearchOptions { k: 400, ..options },
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+        let far: HashSet<DocId> = allowed.difference(&nearest).cloned().collect();
+        let walked = index.walk(&engine, &shadow, &query, &options, Some(&far), 320).unwrap();
+        assert_eq!(walked.admitted, 0, "the precondition: the walk finds none admitted");
+        let late =
+            index.search_with(&engine, &shadow, &query, &options, Some(&far), 0, 0, Some(passed));
+        assert!(matches!(late, Err(VectorError::DeadlineExceeded)), "{:?}", late.map(|h| h.len()));
+        // With no deadline, the same search is the join's exact answer.
+        let exact: Vec<DocId> = far.iter().cloned().collect();
+        let answer = index.search_with(&engine, &shadow, &query, &options, Some(&far), 0, 0, None);
+        let want =
+            crate::search::vector_search_among(&engine, &shadow, &query, &options, &exact).unwrap();
+        let ids_of = |hits: &[Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids_of(&answer.unwrap()), ids_of(&want));
     }
 
     /// [`a_filtered_search_returns_k_at_low_selectivity`] at the size the
@@ -2384,6 +2551,50 @@ mod tests {
             );
             assert!(reach.linked >= before, "{name}: {before} cut off, {} edges", reach.linked);
         }
+    }
+
+    /// The linking reaches a component the entry point does not, as well as
+    /// points with no edge into them (ADR-241). Two clusters at opposite
+    /// ends, built with two connections a point and a narrow search, leave
+    /// one cluster's points linked to each other and to nothing the entry
+    /// point reaches: points with an edge into them that no search from the
+    /// entry point can walk to. Measured by search as well as by structure,
+    /// so that a wrong root or a wrong candidate leaves vectors that cannot
+    /// find themselves.
+    #[test]
+    fn the_linking_reaches_a_component_the_entry_point_does_not() {
+        const DIM: usize = 8;
+        let mut vectors = Vec::new();
+        for (base, side) in [(1u64, 1.0f32), (1_000, -1.0)] {
+            for i in 0..60 {
+                let mut v = pseudo_random(base + i, DIM);
+                v.iter_mut().for_each(|x| *x *= 0.05);
+                v[0] += side;
+                vectors.push(v);
+            }
+        }
+        let graph = Hnsw::<f32, DistCosine>::new(4, vectors.len(), MAX_LAYERS, 8, DistCosine {});
+        for (i, v) in vectors.iter().enumerate() {
+            graph.insert((v.as_slice(), i));
+        }
+        let lost = |graph: &Hnsw<'static, f32, DistCosine>| {
+            (0..vectors.len())
+                .filter(|&i| !graph.search(&vectors[i], 32, 800).iter().any(|n| n.d_id == i))
+                .count()
+        };
+        let before = Layer0::read(&graph);
+        let islands =
+            (0..vectors.len()).filter(|&i| before.outside[i] && !before.no_edge_in[i]).count();
+        assert!(islands > 0, "the precondition: points with an edge into them that are cut off");
+        assert!(lost(&graph) > 0, "the precondition: vectors that cannot find themselves");
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let (linked, left) = link_cut_off(&graph, &engine).unwrap();
+        assert!(linked > 0);
+        assert_eq!(left, 0, "points still cut off");
+        assert!(Layer0::read(&graph).cut_off().is_empty());
+        assert_eq!(lost(&graph), 0, "vectors that cannot find themselves after the linking");
     }
 
     // -----------------------------------------------------------------------

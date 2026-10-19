@@ -2396,6 +2396,17 @@ impl EmbeddingWorker {
                 detail: format!("expected {expected} vectors, got {}", vectors.len()),
             });
         }
+        // A vector no distance can be computed against would make every graph
+        // search of the collection fail (ADR-241): the provider's answer is
+        // unusable, as a wrong count is.
+        if let Some(at) = vectors.iter().position(|v| !crate::search::searchable(v)) {
+            return Err(VectorError::MalformedResponse {
+                provider: config.provider.name(),
+                detail: format!(
+                    "vector {at} has no finite squared length (a component past about 1.8e19)"
+                ),
+            });
+        }
         // Encoded before the scope opens: the scope holds the engine's one
         // writer, and every other writer on the node waits behind it. Each
         // record carries the fingerprint of the configuration its inputs were
@@ -3216,6 +3227,8 @@ impl VectorError {
             VectorError::Storage(_) | VectorError::Core(_) | VectorError::Snapshot(_) => {
                 Fault::Local
             }
+            // A search's own deadline; the worker never searches under one.
+            VectorError::DeadlineExceeded => Fault::Local,
             // The node's own lookups were busy: its state, not the provider's, and
             // it says nothing of whether a peer could do the work either.
             VectorError::ResolverBusy { .. } => Fault::Config,
