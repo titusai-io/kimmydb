@@ -273,10 +273,10 @@ mod tests {
     }
 
     /// The net's two causes apart. A live peer not heard from is `Unheard`,
-    /// transient, waiting one sync interval (whole seconds, rounded up, at least
-    /// 1) and saying so; a held block that says no is `Peers`, which carries no
-    /// wait; and with both at once the block that says no decides, naming only
-    /// its member.
+    /// transient, waiting one sync interval (whole seconds, rounded up, never
+    /// below one) and saying so; a held block that says no is `Peers`, which
+    /// carries no wait; and with both at once the block that says no decides,
+    /// naming only its member.
     #[test]
     fn a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides() {
         let members = Members::default();
