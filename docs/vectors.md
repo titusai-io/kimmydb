@@ -801,17 +801,28 @@ back for the reachability probe. Earlier it materialised every record whole
 and held the lot until the probe had run, which made a rebuild's peak the
 graph plus the entire shadow collection, every staleness window under writes.
 
-It runs **off the cache lock**. The lock every collection's entry lives in is
-taken to look and to install, and the build itself — 4.3 s at 4,000 vectors
-of 384 dimensions, minutes at tens of thousands ([Benchmarks](benchmarks.md))
-— runs under a per-collection lock, on a thread the async runtime has been
-told about, as a storage commit's fsync does. So a rebuild delays searches on
-that one collection, and only those with nothing older to serve: a second
-search arriving mid-build takes the graph that already exists, under the
-staleness rule above, or, when there is none, waits for that one build rather
-than starting a duplicate. Before this the build held the lock, and a rebuild
-of one collection was a stall for vector and hybrid search on every collection
-the node serves.
+It runs **off the request** ([ADR-245](decisions.md)). A search that finds no
+usable graph queues a build and is answered at once; the build — 4.3 s at
+4,000 vectors of 384 dimensions, minutes at tens of thousands
+([Benchmarks](benchmarks.md)) — the count that decides whether the collection
+is worth one, and the save run on builder threads, at most
+`vector.index_cache.build_concurrency` at once (one by default), one build per
+collection, under a per-collection lock. The lock every collection's entry
+lives in is taken only to look and to install. Meanwhile a search is answered
+by the graph the collection already has, under the staleness rule above, and
+only with none at all by an **exact scan**: at most two scans of one
+collection at once, a fixed number rather than a setting, since each scan of
+100,000 vectors of 384 dimensions takes about 1.4 s of a core and the
+build needs the rest; a search awaits a turn, holding no thread, and the scan
+reads, only until the request's deadline, and answers `503` `timeout` past it.
+A graph a previous process saved is served at once and judged by a builder,
+which counts the collection and either re-stamps it at the generation the
+process started at, before any write it made, or rebuilds it. A builder lets go of the store before it saves, so
+the node's stop never waits for a save. Before 0.52.0
+the build ran in the search that asked for it, which waited for it, and so did
+every other search of that collection, past the request's timeout; before
+that, the build held the cache lock, and a rebuild of one collection stalled
+vector and hybrid search on every collection the node serves.
 
 The graph is built by `hnsw_rs` 0.3.5, kimmydb's copy of it with one function
 added ([ADR-241](decisions.md)). After the inserts the build reads layer 0 and
@@ -955,7 +966,7 @@ The exact path is the oracle for everything approximate:
 | A filtered search returns `k` | 1%, 2% and 3% of a collection admitted return `k` through the graph, at 5,000 documents and, in release, 100,000; a first walk short of `k` is retried wider and answers `k`; a filter that refuses what is nearest the query is retried at the width its first walk's own admitted share asks for; a walk short at its widest gives way to the keyed join's exact answer, which stops at the request's deadline |
 | A snapshot cannot take the node down | 39 spoilings of a snapshot's two files are refused before the library reads them, a vector too large to square among them; the three the library answers by ending the process are run in child processes, which the library alone ends and the cache survives, rebuilding |
 | Dispatch does not change results | `the_approximate_path_agrees_with_the_exact_one` asserts both paths return the same nearest neighbour with a **byte-identical score** |
-| A rebuild stalls no other collection | A build of one collection is parked and a search on another is asserted served meanwhile; two searches on an unbuilt collection produce exactly one build; a search arriving mid-rebuild is served the previous graph |
+| No search waits for a build | A build of one collection is parked and a search of it, and of another, is answered at once, by exact scan; two searches on an unbuilt collection produce exactly one build; a search arriving mid-rebuild is served the previous graph; at most two exact scans of one collection run at once, a third waiting only to its deadline; a scan holds its turn while it reads and stops at its deadline; a build that panics costs that build, not the builder; a stop during a save finds the store free, and one during the bridge's pass ends the build; a write between adopting a snapshot and judging it is not lost; a drop or a reconfiguration fences a queued build; the API's first search of a collection is answered by scan and the next by the graph built behind it, and searches waiting for a turn hold no thread |
 | The budget evicts least recently searched first, and never refuses | Three graphs under a budget for two: the untouched one goes, and comes back rebuilt on its next search; a graph larger than the whole budget still loads; a rebuild is charged once; `0` evicts nothing |
 | Dropping the data drops the graph | A collection drop, a database drop and a drop arriving by replication each leave the cache without the graph and the snapshot directory gone; a drop re-delivered after the name was created again leaves the live graph alone |
 | A snapshot cannot outlive the collection it describes | A collection dropped and recreated under the same name derives the same id and the same snapshot path; the graph records the incarnation it was built for and is refused when that does not match, and a sweep — at startup, and whenever the change-feed consumer falls behind — removes snapshots for collections the node no longer holds and any a previous collection of the same name left behind; the startup sweep also removes the staging directories of builds a previous process did not finish |

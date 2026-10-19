@@ -59,9 +59,46 @@ pub fn vector_search(
     options: &SearchOptions,
     allowed: Option<&HashSet<DocId>>,
 ) -> Result<Vec<Hit>> {
+    vector_search_until(engine, shadow, query, options, allowed, None)
+}
+
+/// How many vectors an exact scan reads between looks at its deadline.
+const DEADLINE_STRIDE: usize = 256;
+
+#[cfg(test)]
+thread_local! {
+    /// Rows the exact scans on this thread have read.
+    pub(crate) static SCAN_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`vector_search`], stopped at `deadline` with
+/// [`VectorError::DeadlineExceeded`] (ADR-245). For the scan that answers a
+/// search of a collection whose graph is being built: it holds a thread for
+/// as long as it reads, and the request's own timeout cannot end a thread
+/// that does not yield, so the scan looks at the deadline itself, every
+/// [`DEADLINE_STRIDE`] vectors.
+pub fn vector_search_until(
+    engine: &Engine,
+    shadow: &CollectionMeta,
+    query: &[f32],
+    options: &SearchOptions,
+    allowed: Option<&HashSet<DocId>>,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<Hit>> {
     let mut top = TopK::new(options);
+    let mut read = 0usize;
+    let mut late = false;
 
     engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |_, record| {
+        read += 1;
+        #[cfg(test)]
+        SCAN_ROWS.with(|n| n.set(n.get() + 1));
+        if read.is_multiple_of(DEADLINE_STRIDE)
+            && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            late = true;
+            return Ok(false);
+        }
         // A dimension mismatch means this vector was written under a different
         // model. Scoring it would produce a meaningless number rather than an
         // error, so it is skipped.
@@ -80,6 +117,9 @@ pub fn vector_search(
         Ok(true)
     })?;
 
+    if late {
+        return Err(VectorError::DeadlineExceeded);
+    }
     Ok(top.into_hits())
 }
 
