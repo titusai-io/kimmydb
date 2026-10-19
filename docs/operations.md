@@ -2440,10 +2440,10 @@ from it misses the document too. Upgrading does not lower the vector.
   the restore claimed history it did not take, for the origins it lists; 0 means
   it did not.
 - On the restored member, the `WARN` `a divergence repair left rows it will not
-  write` for a collection, naming ids it holds nothing for (with
+  write` for a collection (`left`, and the ids in `first_ids`; with
   `cluster.divergence_repair` on, the default): the digest repair found a
-  document the member lacks, and does not write it because its stamp is older
-  than the restore. A count finding on the same collection (`divergence
+  document the member holds nothing for, and does not write it because its stamp
+  is older than the restore. A count finding on the same collection (`divergence
   confirmed; planned a repair from this peer`) plans the count half's replay,
   which brings a lost insert back while the origin still retains its entry; a
   lost write the counts do not show is not brought back.
