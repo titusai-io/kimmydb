@@ -2124,7 +2124,7 @@ fn row_on(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Expect, 
 /// divergence check's repairs included, converges and ends as `expect`. For a row whose
 /// case the entries themselves must close, where a repair that heals it would hide the
 /// defect the row is for.
-fn row_strict(name: &str, variants: &[(&str, Vec<Op>)], expect: Expect) {
+fn row_strict_each(name: &str, variants: &[(&str, Vec<Op>)], expect: Expect) {
     let mut failed = Vec::new();
     for (variant, ops) in variants {
         let mut outcomes = check_routes(ops, &[Route::Entries, Route::Pages]);
@@ -3205,7 +3205,7 @@ fn row_a_rewind_that_removes_a_document_keeps_a_judged_write_at_or_below_the_tar
          A.write(orders/1)@300; B<-A entries; C<-A entries; B<-C entries; A<-C entries; \
          A.rewind@200; B.rewind@200; C.rewind@200",
     );
-    row_strict(
+    row_strict_each(
         "a removal and a judged write",
         &[
             ("B alone rewound past its own insert", alone),
@@ -3226,7 +3226,7 @@ fn row_a_rewind_that_removes_a_document_deletes_no_kept_write_once_the_member_wr
     let every = "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
                  A.write(orders/1)@300; B<-A entries; B<-C entries; A.rewind@200; B.rewind@200; \
                  C.rewind@200";
-    row_strict(
+    row_strict_each(
         "a removal, a judged write, and a later write",
         &[
             ("B alone rewound, then B writes", parse(&format!("{alone}; B.write(orders/2)@400"))),
@@ -3256,7 +3256,7 @@ fn row_a_rewind_that_removes_a_document_brings_back_no_deleted_one() {
          A<-C entries; B.delete(orders/1)@130; A<-B entries; A.write(orders/3)@140; \
          B<-A entries; B.write(orders/1)@300; B.retention@1135; B.rewind@200",
     );
-    row_strict(
+    row_strict_each(
         "a removal over a deleted document",
         &[("A holds the delete", ops)],
         &[(ORDERS, Some(&[3]))],
@@ -3275,7 +3275,7 @@ fn row_a_rewind_keeps_the_tombstone_of_a_document_deleted_at_the_target() {
          A<-C entries; B.delete(orders/1)@130; A.write(orders/3)@140; B<-A entries; \
          B.write(orders/1)@300; B.rewind@200",
     );
-    row_strict(
+    row_strict_each(
         "a document deleted at the target",
         &[("B alone rewound", ops)],
         &[(ORDERS, Some(&[3]))],
@@ -3292,7 +3292,11 @@ fn row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write() 
         "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
          B.write(orders/1)@300; B<-C entries; A<-C entries; B.delete(orders/1)@310; B.rewind@200",
     );
-    row_strict("a removed tombstone row", &[("B alone rewound", ops)], &[(ORDERS, Some(&[1]))]);
+    row_strict_each(
+        "a removed tombstone row",
+        &[("B alone rewound", ops)],
+        &[(ORDERS, Some(&[1]))],
+    );
 }
 
 /// A removal asks again for nothing at or below the oplog horizon (ADR-246). C's t110 insert of

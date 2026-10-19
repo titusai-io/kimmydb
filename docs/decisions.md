@@ -28938,7 +28938,7 @@ inserted again from a backup taken before the 0.51 rewind, through any member (t
 `a_rewind_that_restores_one_document_and_removes_another_is_bounded_by_the_removal`; ADR-243's
 `a_rewind_lowers_every_origin_it_discarded_to_the_target_and_no_lower` now discards by restoring, and
 `a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded` checks that the removed documents leave no record.
-The convergence model, on every route and by pure entries too (`row_strict`): a removal and a judged write (B alone
+The convergence model, on every route and by pure entries too: a removal and a judged write (B alone
 rewound, every member, and every member with C's write lost on C too), the same followed by a write of a rewound
 member, a removal over a deleted document, a document deleted at the target, and a removed row that was itself a
 tombstone. On the repaired and pages routes, which the divergence check's repairs close: a removal after a retention
