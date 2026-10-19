@@ -756,11 +756,12 @@ while that document stands.
 
 **A drop of the collection does not end it.** A key outlives a drop of its
 collection for its window, as MongoDB's retryable writes outlive a drop of
-theirs: a retry after the collection was dropped, created again or not, is
-answered with its first answer and writes nothing to the new collection, and
-another request under the key is `422 idempotency_key_reused` until the window
-ends. A database drop is the same. The window is the only thing that forgets a
-key.
+theirs: a retry after the collection was dropped and created again is answered
+with its first answer and writes nothing to the new collection, and another
+request under the key is `422 idempotency_key_reused` until the window ends;
+until the name is created again, the route answers `404` as for any missing
+collection. A database drop is the same. The window is the only thing that
+forgets a key.
 
 ### A retry on another member
 
@@ -816,7 +817,10 @@ the gate opens again.
 ### What is not guaranteed
 
 - Nothing after the key's window ends. A drop of the collection does not end
-  it: a key outlives a drop of its collection for its window.
+  it: a key outlives a drop of its collection for its window. A keyed request
+  past one chunk retried over more than the window, counted from its first
+  attempt, may apply that attempt's chunks again: finish or abandon a key
+  within the window.
 - Nothing on a member of an earlier release, which ignores the header.
 - Nothing across collections or principals: a key is scoped to both.
 - Nothing for schema changes, vectors, webhooks or administration, which refuse

@@ -186,9 +186,12 @@ where it stopped instead of applying again. What a client must do to rely on it:
   it once the member takes them again; until then the rules above apply. A
   `400` naming the key's syntax or the route is the client's to fix.
 - A key is remembered for `idempotencyWindowSecs` (`GET /v1/version`), 24 hours
-  by default. A retry later than that is a new request. A drop of the
-  collection does not end it: a retry after the collection was dropped, and
-  created again or not, replays its first answer and writes nothing.
+  by default. A retry later than that is a new request. A keyed request past
+  one chunk retried over more than the window, counted from its first attempt,
+  may apply that attempt's chunks again: finish or abandon a key within the
+  window. A drop of the collection does not end it: a retry after the collection was dropped and
+  created again replays its first answer and writes nothing; until the name is
+  created again, the route answers `404` as for any missing collection.
 
 ---
 

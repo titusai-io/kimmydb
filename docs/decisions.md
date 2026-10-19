@@ -28671,10 +28671,11 @@ with it, and not be offered while any member could carry the write without it.
    not stored (merged into the live record of a new request under the key, it would lower that record's `first` to
    the old request's, and mark it contested). An absent record is overwritten by the next store, never merged with.
    **Nothing else ends a record**: a drop of its collection, a database drop, the drop purger and a late drop's sweep
-   (ADR-231) remove no record, and a record of a dropped life is stored and served as any other. So a retry after a
-   drop, the name created again or not, replays its first answer and writes nothing to the new life, and another
+   (ADR-231) remove no record, and a record of a dropped life is stored and served as any other. So a retry after the
+   collection was dropped and created again replays its first answer and writes nothing to the new life, and another
    request under the key is `422` for the window, as MongoDB's retryable-write records in `config.transactions`
-   outlive a drop of their collection. A resume of an `applying` record across a drop writes nothing in the new life:
+   outlive a drop of their collection; until the name is created again, the route answers `404` as for any missing
+   collection. A resume of an `applying` record across a drop writes nothing in the new life:
    every document of it is stamped above the drop, so at or above the record's `first`, and the stamp rule counts it
    in `skipped`. **A keyed delete by id replays while its own tombstone stands**, or a later version over it (the
    document's row carries a stamp at or above the delete's), **or while the row is gone with a drop at or above the
@@ -28695,15 +28696,19 @@ with it, and not be offered while any member could carry the write without it.
    its last. **The end is found by a lookahead** (`modify.rs`): a keyed chunk that wrote and filled its match budget
    looks, under its writer and in its own transaction, past its last match for one more match the request could
    write, passing over those the stamp rule leaves. Finding the end instead, it writes `done` in its own record, with
-   its own entries, so a member that takes this chunk's entries takes the request's end with them. An end found so is
-   final: a document that arrives later, written here or anywhere, is stamped above the request's `first` (minted after
-   every stamp this member has witnessed, the request's own among them, or by a member that witnessed them), so the
-   stamp rule never makes it writable. **The hold:** the lookahead stops at the first writable match, so where the
-   request goes on it adds one match to the chunk's hold on the writer; only over a tail of left matches does the hold
-   reach about twice the chunk's match budget, the budget plus up to one budget of left matches. **The residual:**
-   when the lookahead's budget runs out before a writable match or the end, the next chunk goes on; if that chunk finds
-   the end having written nothing, one record-only commit marks the record `done` and **keeps the standing `last`**,
-   minting no stamp, so at that equal `last` `done` beats the `applying` it replaces wherever the two meet. A member
+   its own entries, so a member that takes this chunk's entries takes the request's end with them. An end found so
+   ends the request, and never at the cost of a double: a document written later here, or by a member that witnessed
+   the request's entries, is stamped above the request's `first` (minted after every stamp that member has witnessed),
+   so the stamp rule leaves it; one stamped below `first` by a member that had not seen the request can still
+   replicate in after the end and match, and the request never writes it, which is under-application, never a double.
+   **The hold:** the lookahead stops at the first writable match, so where the request goes on it adds one match to
+   the chunk's hold on the writer; only over a tail of left matches does the hold reach about twice the chunk's match
+   budget, the budget plus up to one budget of left matches. **The residual:** when the lookahead cannot tell its
+   chunk ends the request, a later chunk goes on: its budget runs out before a writable match or the end, or the
+   writable match it finds is one no later chunk writes (the spec leaves it unchanged, ADR-208, or another writer
+   rewrites it between the two chunks, so the stamp rule leaves it). If a later chunk finds the end having written
+   nothing, one record-only commit marks the record `done` and **keeps the standing `last`**, minting no stamp, so at
+   that equal `last` `done` beats the `applying` it replaces wherever the two meet. A member
    that pulled the last writing chunk and not that commit then resumes a retry (`resumed: true`, its counts cumulative,
    every match left by the stamp rule) where it would replay: nothing is written twice. While the request runs, its
    `(collection, scope)` is in an in-process set, entered before the first chunk waits for the writer and left by an
@@ -28924,7 +28929,7 @@ with it, and not be offered while any member could carry the write without it.
    once its block is seen, which stops new keyed writes and not that relay.
 
 8. **What it reports.** Two codes: `idempotency_key_reused` (`422`, `no`) and `idempotency_key_in_flight` (`409`,
-   `wait`, `Retry-After: 1`), logged at `INFO` through `request failed`. Six series, bridged to OTLP:
+   `wait`, `Retry-After: 1`), logged at `INFO` through `request failed`. Seven series, bridged to OTLP:
    `kimmy_idempotency_requests_total{outcome}` (`applied`, `replayed`, `resumed`, `reused`, `in_flight`, `gated`),
    which counts a keyed request only when it ends in a write's answer or in one of the key's own refusals (a keyed
    `403`, `404`, `partially_applied` or `outcome_unknown` counts under none, and a fresh keyed request that changed
