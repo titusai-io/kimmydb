@@ -419,6 +419,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
          within the page's records budget",
     ),
     ("idempotency_tests::rows", "test code reading a store of a few thousand rows it wrote itself"),
+    ("idempotency_tests::log_rows", "test code reading a change log of a few rows it wrote itself"),
     (
         "page_delta_tests::log_rows",
         "test code reading a store of a few thousand rows it wrote itself",

@@ -143,8 +143,9 @@ where it stopped instead of applying again. What a client must do to rely on it:
 - **Branch on the capability `idempotency-keys`**, per node, from
   `GET /v1/version`. A member that does not list it refuses the header with
   `400` (a cluster during a roll, or before its operator has set
-  `cluster.idempotency_keys`), and a member of an earlier release ignores it.
-  Without the capability, the rules above apply.
+  `cluster.idempotency_keys`), or for a few seconds with a `503` that says to
+  wait (below), and a member of an earlier release ignores it. Without the
+  capability, the rules above apply.
 - **Send the retry byte for byte as the first attempt**, with the same key.
   The same key with a different body, path or query is
   `422 idempotency_key_reused`; a new request needs a new key. So is every
@@ -179,16 +180,36 @@ where it stopped instead of applying again. What a client must do to rely on it:
   record of its end.
   To have every current match written, send it without the key, if the update
   is idempotent ([HTTP API](http-api.md#a-keyed-write-past-one-chunk)).
+- **A `503 peer_unheard` with `retry: wait`** means the member has not yet
+  heard from a live member whether it carries records: one that came up, or
+  that it saw rejoin, a moment ago, which every restart of a member in a roll
+  causes. It wrote nothing and looked nothing up. It lasts until that member is
+  heard, about a sync interval, and at most a lease (`ceil(peers /
+  cluster.fanout) + 2` sync intervals), after which the member that is still not
+  heard from is answered with the `400` below. **Honour `Retry-After` and send the same request again,
+  with the same key, to the same member**: that is the keyed retry the rules
+  above describe, and it is answered with the first application or its replay.
+  Not elsewhere, for the reason a keyed retry stays on its member. It is the
+  `wait` class, so a client acting on the class handles it by that class. On
+  MCP the same refusal is the tool error whose `data`
+  carries `"error": "peer_unheard"`, `"retry": "wait"` and `retry_after_secs`.
 - **A `400` naming `Idempotency-Key` and the cluster** (the member does not take
-  keys now: its `cluster.idempotency_keys` is off, or a live member does not
-  carry records) wrote nothing and looked nothing up. A record written before
-  the member stopped taking keys stays for its window, and the retry replays from
-  it once the member takes them again; until then the rules above apply. A
-  `400` naming the key's syntax or the route is the client's to fix.
+  keys now: its `cluster.idempotency_keys` is off, or a live member does not say
+  it carries records: a member of an earlier release during a roll, one whose
+  block does not decode, or one not heard from for more than a lease) wrote
+  nothing and looked nothing up, and lasts until the operator, the roll or that
+  member changes it. A
+  record written before the member stopped taking keys stays for its window,
+  and the retry replays from it once the member takes them again; until then
+  the rules above apply. A `400` naming the key's syntax or the route is the
+  client's to fix.
 - A key is remembered for `idempotencyWindowSecs` (`GET /v1/version`), 24 hours
-  by default. A retry later than that is a new request. A drop of the
-  collection does not end it: a retry after the collection was dropped, and
-  created again or not, replays its first answer and writes nothing.
+  by default. A retry later than that is a new request. A keyed request past
+  one chunk retried over more than the window, counted from its first attempt,
+  may apply that attempt's chunks again: finish or abandon a key within the
+  window. A drop of the collection does not end it: a retry after the collection was dropped and
+  created again replays its first answer and writes nothing; until the name is
+  created again, the route answers `404` as for any missing collection.
 
 ---
 

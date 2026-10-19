@@ -1177,8 +1177,8 @@ fn a_member_rebuilt_by_snapshot_after_a_drop_replays_the_old_key() {
 /// A converge page whose first page is of a life this member has not buried (the
 /// sender dropped the collection and made it again, and this member still holds
 /// the life before) applies none of its documents, and stores its records: they
-/// outlive the drop. Here the record is put on the page by hand, as P2's sender
-/// will.
+/// outlive the drop. Here the record is put on the page by hand, as a sender's
+/// records phase over its dropped collections puts it.
 #[test]
 fn a_converge_page_of_a_life_this_member_has_not_buried_keeps_its_records() {
     let (a, b, ca, cb) = pair();
@@ -1204,7 +1204,8 @@ fn a_converge_page_of_a_life_this_member_has_not_buried_keeps_its_records() {
 
 /// A converge page from a sender that dropped the collection applies none of its
 /// documents, and stores its records: they outlive the drop. Here the record is
-/// put on the page by hand, as P2's sender will.
+/// put on the page by hand, as a sender's records phase over its dropped
+/// collections puts it.
 #[test]
 fn a_converge_page_from_a_sender_that_dropped_keeps_its_records() {
     let (a, b, ca, cb) = pair();
@@ -1220,4 +1221,168 @@ fn a_converge_page_from_a_sender_that_dropped_keeps_its_records() {
     assert!(applied.sender_dropped);
     assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), Some(record));
     assert_eq!(b.engine.idempotency_records_received()[4], 1, "by repair");
+}
+
+// -- A rewind between two attempts that merged ----------------------------------------------
+
+/// Three members: A and B each apply one attempt of a keyed single-document
+/// request, from the same starting version, B before it holds A's record; R
+/// takes A's, then B's, so it holds the merged record (`first` A's stamp,
+/// `last` B's) and B's version of the document. Returns the members, R's
+/// collection and A's stamp, the rewind's target.
+fn two_attempts_merged_on_r(
+    write: impl Fn(&Engine, &CollectionMeta),
+    k: &KeyedWrite,
+) -> (Member, Member, Member, CollectionMeta, Hlc) {
+    let (a, b, r) = (member(), member(), member());
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1i64, "n": 0i64 }).unwrap();
+    pull(&b.engine, &a.engine);
+    pull(&r.engine, &a.engine);
+    let (cb, cr) = (
+        b.engine.get_collection("shop", "orders").unwrap(),
+        r.engine.get_collection("shop", "orders").unwrap(),
+    );
+    tick();
+    write(&a.engine, &ca);
+    let first = a.engine.idempotency_record(ca.id, &k.scope).unwrap().unwrap().first;
+    tick();
+    write(&b.engine, &cb);
+    pull(&r.engine, &a.engine);
+    pull(&r.engine, &b.engine);
+    let merged = r.engine.idempotency_record(cr.id, &k.scope).unwrap().unwrap();
+    assert!(merged.first == first && merged.last.hlc > first.hlc, "premise: merged {merged:?}");
+    (a, b, r, cr, first.hlc)
+}
+
+/// A rewind between two attempts of a keyed `find_and_modify` that merged
+/// reopens the record it cuts, and a retry replays: the document is back at the
+/// first attempt's version, which holds its `$inc`, and a fresh retry would
+/// increment on top of it, at a stamp above the rewind that wins everywhere.
+#[test]
+fn a_rewind_between_two_attempts_of_a_find_and_modify_replays_the_retry() {
+    let k = keyed(90);
+    let fam = |e: &Engine, c: &CollectionMeta| {
+        let out = e
+            .find_and_modify_keyed(
+                c,
+                &Candidates::Scan,
+                &Inc,
+                &k,
+                crate::idempotency::ReturnedImage::After,
+            )
+            .unwrap();
+        fresh(out);
+    };
+    let (_a, _b, r, cr, until) = two_attempts_merged_on_r(fam, &k);
+    assert_eq!(n_of(&r.engine, &cr, 1), 1, "premise: one $inc, as last-writer-wins keeps it");
+    let out = r.engine.rewind_to(until).unwrap();
+    assert_eq!((out.records_removed, out.records_reopened), (0, 1), "{out:?}");
+    assert_eq!(n_of(&r.engine, &cr, 1), 1, "premise: the first attempt's version, its $inc in it");
+    let record = r.engine.idempotency_record(cr.id, &k.scope).unwrap().unwrap();
+    assert_eq!(record.state, RecordState::Applying);
+    replayed(
+        r.engine
+            .find_and_modify_keyed(
+                &cr,
+                &Candidates::Scan,
+                &Inc,
+                &k,
+                crate::idempotency::ReturnedImage::After,
+            )
+            .unwrap(),
+    );
+    assert_eq!(n_of(&r.engine, &cr, 1), 1, "the request landed once");
+}
+
+/// The same for a keyed insert: the retry replays its first answer, not
+/// `409 duplicate_key` on the first attempt's document the rewind kept.
+#[test]
+fn a_rewind_between_two_attempts_of_an_insert_replays_the_retry() {
+    let k = keyed(91);
+    let insert = |e: &Engine, c: &CollectionMeta| {
+        fresh(e.insert_keyed(c, doc! { "_id": 5i64, "v": 1 }, &k).unwrap());
+    };
+    let (_a, _b, r, cr, until) = two_attempts_merged_on_r(insert, &k);
+    let out = r.engine.rewind_to(until).unwrap();
+    assert_eq!((out.records_removed, out.records_reopened), (0, 1), "{out:?}");
+    assert!(r.engine.get(&cr, &DocId::Int64(5)).unwrap().is_some(), "premise: the first attempt's");
+    replayed(r.engine.insert_keyed(&cr, doc! { "_id": 5i64, "v": 1 }, &k).unwrap());
+    assert_eq!(count(&r.engine, &cr), 2);
+}
+
+/// The same for a keyed delete by id: the retry replays `{"deleted": 1}`, not a
+/// fresh `{"deleted": 0}` against the first attempt's tombstone, which the
+/// rewind kept below the merged record's winning delete.
+#[test]
+fn a_rewind_between_two_attempts_of_a_delete_by_id_replays_the_retry() {
+    let k = keyed(92);
+    let delete = |e: &Engine, c: &CollectionMeta| {
+        let deleted = fresh(e.delete_keyed(c, &DocId::Int64(1), None, &k).unwrap());
+        assert!(deleted.is_some(), "premise: each attempt deleted the document");
+    };
+    let (_a, _b, r, cr, until) = two_attempts_merged_on_r(delete, &k);
+    let out = r.engine.rewind_to(until).unwrap();
+    assert_eq!((out.records_removed, out.records_reopened), (0, 1), "{out:?}");
+    assert!(r.engine.get(&cr, &DocId::Int64(1)).unwrap().is_none(), "premise: still deleted");
+    let replay = replayed(r.engine.delete_keyed(&cr, &DocId::Int64(1), None, &k).unwrap());
+    assert!(
+        matches!(replay.outcome, RecordOutcome::Delete { stamp: Some(_), .. }),
+        "the first answer, a document deleted: {replay:?}"
+    );
+}
+
+// -- A past-window record of the same request -----------------------------------------------
+
+/// Two attempts of one keyed `$inc` of every counter, on two members that have
+/// not met: A's first chunk (counters 1 and 2), then B's (counters 0 and 1, B
+/// holding a counter 0 of its own), each stopped after it. B pulls A once A's
+/// record is past its window on B's clock while A, its retention not yet run,
+/// still serves the entries. Returns the counters after B's resume.
+fn a_resume_after_the_first_attempts_window(past_the_window: bool) -> Vec<i64> {
+    let (a, b, ca, cb) = pair();
+    for i in 1..=4i64 {
+        a.engine.insert(&ca, doc! { "_id": i, "n": 0i64 }).unwrap();
+    }
+    pull(&b.engine, &a.engine);
+    b.engine.insert(&cb, doc! { "_id": 0i64, "n": 0i64 }).unwrap();
+    let k = keyed(93);
+    tick();
+    a.engine.set_multi_chunk_docs(2);
+    stop_after_the_first_chunk(&a.engine);
+    a.engine.modify_where_keyed(&ca, &Candidates::Scan, &Inc, None, &k).unwrap_err();
+    let a_last = a.engine.idempotency_record(ca.id, &k.scope).unwrap().unwrap().last;
+    let a = restart(a);
+    tick();
+    b.engine.set_multi_chunk_docs(2);
+    stop_after_the_first_chunk(&b.engine);
+    b.engine.modify_where_keyed(&cb, &Candidates::Scan, &Inc, None, &k).unwrap_err();
+    let b = restart(b);
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.set_idempotency_window(60);
+    if past_the_window {
+        b.engine.set_idempotency_clock_for_test(Some(a_last.hlc.wall_ms + 60_001));
+    }
+    pull(&b.engine, &a.engine);
+    let held = b.engine.idempotency_record(cb.id, &k.scope).unwrap().unwrap();
+    let a_first = a.engine.idempotency_record(ca.id, &k.scope).unwrap().unwrap().first;
+    assert_eq!(held.first, a_first, "A's record merged into B's own: the earlier first");
+    b.engine.set_multi_chunk_docs(2);
+    let out = b.engine.modify_where_keyed(&cb, &Candidates::Scan, &Inc, None, &k).unwrap();
+    assert!(matches!(out, Keyed::Fresh(_)), "a resume: {out:?}");
+    (0..=4i64).map(|i| n_of(&b.engine, &cb, i)).collect()
+}
+
+/// A record past its window whose request is the live record's here (the same
+/// fingerprint) is merged, not refused: B's resume leaves what A's attempt
+/// wrote, which B took from A's entries, and every counter is incremented once.
+#[test]
+fn a_past_window_record_of_the_live_records_own_request_merges() {
+    assert_eq!(a_resume_after_the_first_attempts_window(true), vec![1, 1, 1, 1, 1]);
+}
+
+/// The control, inside the window: the same.
+#[test]
+fn a_record_of_the_live_records_own_request_inside_its_window_merges() {
+    assert_eq!(a_resume_after_the_first_attempts_window(false), vec![1, 1, 1, 1, 1]);
 }

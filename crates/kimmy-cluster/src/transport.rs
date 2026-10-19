@@ -45,11 +45,12 @@ use crate::repair_ledger::{
     Confirmed, End, Judged, Key as LedgerKey, LedgerKind, MayPlan, RepairLedger, Transient, Verdict,
 };
 
-/// How much of a frame the entries themselves may occupy.
+/// How much of a frame the entries and records themselves may occupy, each with
+/// its element's framing in the message's array ([`ELEMENT_FRAMING`]).
 ///
-/// The rest is the `Entries` envelope and BSON's per-element overhead in an array,
-/// both small; a mebibyte of slack is far more than either needs and costs one
-/// entry's worth of throughput in the rare case this matters at all.
+/// The rest is the `Entries` envelope, small; a mebibyte of slack is far more than
+/// it needs and costs one entry's worth of throughput in the rare case this
+/// matters at all.
 const ENTRY_BUDGET: usize = MAX_FRAME - (1024 * 1024);
 
 #[cfg(test)]
@@ -67,6 +68,13 @@ pub(crate) fn entry_budget() -> usize {
     }
     ENTRY_BUDGET
 }
+
+/// What an entry or a record costs a frame beyond its own encoding: its
+/// element's framing in the message's array, a type byte and its index as a C
+/// string. Not a measure: a bound, at least 9 bytes at a million elements. A
+/// frame of a few hundred thousand small records would otherwise pass the
+/// [`ENTRY_BUDGET`]'s slack by this alone.
+const ELEMENT_FRAMING: usize = 16;
 
 /// Whether a batch fits in one frame, and how much of it does if not.
 pub(crate) enum Fits {
@@ -90,7 +98,8 @@ pub(crate) enum Fits {
 ///   it; a record whose row is past every entry counts at the window's end, and
 ///   when it does not fit there the window is cut before its last entry.
 ///
-/// Sizes each entry and record once and takes a running total, rather than
+/// Each entry and record counts its own encoding and its element's framing
+/// ([`ELEMENT_FRAMING`]). Sizes each once and takes a running total, rather than
 /// serializing the whole batch to find out it is too big and then doing it
 /// again for a smaller one. The common case is a single pass that says `All`.
 pub(crate) fn how_many_fit(
@@ -103,7 +112,7 @@ pub(crate) fn how_many_fit(
     let mut total = 0usize;
     for record in &records[..unanchored] {
         match bson::serialize_to_vec(record) {
-            Ok(bytes) => total += bytes.len(),
+            Ok(bytes) => total += bytes.len() + ELEMENT_FRAMING,
             Err(_) => return Fits::Nothing,
         }
     }
@@ -114,7 +123,7 @@ pub(crate) fn how_many_fit(
     let mut at_end = 0usize;
     for record in &records[unanchored..] {
         let size = match bson::serialize_to_vec(record) {
-            Ok(bytes) => bytes.len(),
+            Ok(bytes) => bytes.len() + ELEMENT_FRAMING,
             // As an entry that does not encode: the frame would not either, so
             // nothing from the entry its row belongs with on is offered.
             Err(_) => {
@@ -134,7 +143,7 @@ pub(crate) fn how_many_fit(
     let mut next = 0usize;
     for (i, entry) in entries.iter().enumerate() {
         let mut size = match bson::serialize_to_vec(entry) {
-            Ok(bytes) => bytes.len(),
+            Ok(bytes) => bytes.len() + ELEMENT_FRAMING,
             // Unencodable here means unencodable in the batch too, so stopping short
             // hands the caller the prefix that can be sent and lets the real error
             // surface where it is reported properly.
@@ -200,7 +209,7 @@ pub(crate) fn stamp_before(stamp: kimmy_core::Stamp) -> kimmy_core::Stamp {
 /// The bytes a record costs a frame, as [`how_many_fit`] counts it; `None` for
 /// one that does not encode.
 fn record_bytes(record: &kimmy_storage::CarriedRecord) -> Option<usize> {
-    bson::serialize_to_vec(record).ok().map(|bytes| bytes.len())
+    bson::serialize_to_vec(record).ok().map(|bytes| bytes.len() + ELEMENT_FRAMING)
 }
 
 /// What a window none of whose entries fits with the records riding it carries
@@ -266,6 +275,64 @@ pub(crate) fn records_alone_window(
         .map(|(_, record)| record.clone())
         .collect();
     Some((end, kept))
+}
+
+/// What a window whose first entry cannot cross with the records riding at or
+/// below it, even as a partial window of records alone, sends instead: those
+/// records **ahead of the entry**, with the F3 records, in an answer of records
+/// alone that carries no entry and covers nothing, its `scanned_to` naming the
+/// entry. The requester stores them and asks again in the same contact, naming
+/// that entry (`AskEntries::records_ahead_of`), and the window then leaves them
+/// out, so the entry crosses with what it holds already. A record stored before
+/// its effect arrives is a record held early, which is safe: a retry here replays
+/// the first answer of a write that happened.
+///
+/// `None` when nothing beyond the F3 records rides at or below the first entry,
+/// or when those records do not fit one frame together: what is left is an
+/// entry, or a record, larger than a frame by itself.
+pub(crate) fn records_ahead(
+    entries: &[OplogEntry],
+    records: &[kimmy_storage::CarriedRecord],
+    unanchored: usize,
+) -> Option<(Hlc, Vec<kimmy_storage::CarriedRecord>)> {
+    let first = entries.first()?.stamp;
+    let unanchored = unanchored.min(records.len());
+    let ahead: Vec<_> = records
+        .iter()
+        .enumerate()
+        .filter(|(i, record)| *i < unanchored || record.carrying.is_some_and(|at| at <= first))
+        .map(|(_, record)| record.clone())
+        .collect();
+    if ahead.len() == unanchored {
+        return None;
+    }
+    let bytes: usize = ahead.iter().map(record_bytes).sum::<Option<usize>>()?;
+    (bytes <= entry_budget()).then_some((first.hlc, ahead))
+}
+
+/// The records of a window the requester said it holds, sent ahead of the
+/// window's first entry in this contact (`AskEntries::records_ahead_of`): every
+/// record but the F3 ones riding at or below that entry. Applied only when the
+/// window's first entry is at the stamp named, so a window that changed between
+/// the two asks leaves nothing out it did not send ahead.
+fn leave_out_records_ahead(
+    entries: &[OplogEntry],
+    records: &mut Vec<kimmy_storage::CarriedRecord>,
+    unanchored: &mut usize,
+    ahead_of: Option<Hlc>,
+) {
+    let Some(first) = entries.first().map(|entry| entry.stamp).filter(|s| Some(s.hlc) == ahead_of)
+    else {
+        return;
+    };
+    let keep = *unanchored;
+    let mut i = 0usize;
+    records.retain(|record| {
+        let kept = i < keep || record.carrying.is_none_or(|at| at > first);
+        i += 1;
+        kept
+    });
+    *unanchored = keep.min(records.len());
 }
 
 /// Records a sender could not fit into any frame or replay page that must carry
@@ -476,7 +543,7 @@ fn cut_replay_page_from(
     }) {
         Ok(read) => read,
         // A record the change log names as changed since the cursor's base that
-        // is larger than the delta's half of a page (P2's refusal): the delta
+        // is larger than the delta's half of a page (refused by name): the delta
         // cannot carry it. The position's records start over, from a base above
         // the change: the record is then no change to that base, and goes as an
         // ordinary record on a page of records alone, which holds a record up to
@@ -693,31 +760,6 @@ fn cut_replay_page_from(
                 unfit: false,
             })
         }
-    }
-}
-
-/// Where each peer's inbound replay served by this member stands in records,
-/// across contacts (m1): the records cursor of the last page of records alone a
-/// peer acknowledged, keyed by this member and the peer, so a replay whose
-/// records at one position take more than a contact's pages goes on where it was.
-/// In memory: a restart starts the position's records over.
-static INBOUND_RECORDS: std::sync::Mutex<BTreeMap<(NodeId, NodeId), kimmy_storage::ReplayRecords>> =
-    std::sync::Mutex::new(BTreeMap::new());
-
-fn inbound_records(me: NodeId, peer: NodeId, at: Hlc) -> Option<kimmy_storage::ReplayRecords> {
-    INBOUND_RECORDS
-        .lock()
-        .ok()
-        .and_then(|held| held.get(&(me, peer)).cloned())
-        .filter(|cursor| cursor.at == at)
-}
-
-fn set_inbound_records(me: NodeId, peer: NodeId, cursor: Option<kimmy_storage::ReplayRecords>) {
-    if let Ok(mut held) = INBOUND_RECORDS.lock() {
-        match cursor {
-            Some(cursor) => held.insert((me, peer), cursor),
-            None => held.remove(&(me, peer)),
-        };
     }
 }
 
@@ -1502,6 +1544,12 @@ where
                 replay_cursor = catch_up
                     .filter(|c| c.replay_armed() && !c.replay_answered(peer))
                     .map(|c| c.replay_from(peer));
+                // And where it stands in records at that position: the cursor of the
+                // last page of records alone this member stored from the peer, held
+                // here alone, so a restart of this member loses it.
+                let replay_records = catch_up
+                    .filter(|_| replay_cursor.is_some())
+                    .and_then(|c| c.replay_records(peer));
                 write_frame(
                     &mut stream,
                     &Message::Vectors {
@@ -1511,11 +1559,20 @@ where
                         facts_gen,
                         echo,
                         replay_from: replay_cursor,
+                        replay_records,
                     },
                 )
                 .await?;
             }
-            Message::ReplayEntries { from, entries, exhausted, horizon, scanned_to, records } => {
+            Message::ReplayEntries {
+                from,
+                entries,
+                exhausted,
+                horizon,
+                scanned_to,
+                records,
+                replay_records,
+            } => {
                 let counters = replay_counters();
                 let refuse = |why: &str| {
                     counters.bump(Via::Inbound, ReplayResult::Refused);
@@ -1532,7 +1589,12 @@ where
                     replay_cursor = None;
                     write_frame(
                         &mut stream,
-                        &Message::ReplayAck { next_from: cursor, done: true, stalled: None },
+                        &Message::ReplayAck {
+                            next_from: cursor,
+                            done: true,
+                            stalled: None,
+                            replay_records: None,
+                        },
                     )
                     .await?;
                     continue;
@@ -1559,7 +1621,12 @@ where
                     }
                     write_frame(
                         &mut stream,
-                        &Message::ReplayAck { next_from: cursor, done: false, stalled: None },
+                        &Message::ReplayAck {
+                            next_from: cursor,
+                            done: false,
+                            stalled: None,
+                            replay_records: None,
+                        },
                     )
                     .await?;
                     continue;
@@ -1592,17 +1659,43 @@ where
                     exhausted,
                     Via::Inbound,
                 )?;
+                // A page of records alone, stored: this member keeps its cursor, and
+                // echoes it, so the peer goes on after it. Any other page ends the
+                // position's records.
+                if !matches!(page, ReplayPage::Stalled(_)) {
+                    let alone = replay_records.filter(|records| {
+                        records.at == from
+                            && matches!(page, ReplayPage::Empty { next } if next == from)
+                    });
+                    catch_up.set_replay_records(peer, alone);
+                }
+                let held = |at: kimmy_core::Hlc| {
+                    catch_up.replay_records(peer).filter(|records| records.at == at)
+                };
                 let ack = match page {
-                    ReplayPage::Stalled(stall) => {
-                        Message::ReplayAck { next_from: cursor, done: false, stalled: Some(stall) }
-                    }
+                    ReplayPage::Stalled(stall) => Message::ReplayAck {
+                        next_from: cursor,
+                        done: false,
+                        stalled: Some(stall),
+                        replay_records: held(cursor),
+                    },
                     ReplayPage::Done { next } => {
                         replay_cursor = None;
-                        Message::ReplayAck { next_from: next, done: true, stalled: None }
+                        Message::ReplayAck {
+                            next_from: next,
+                            done: true,
+                            stalled: None,
+                            replay_records: None,
+                        }
                     }
                     ReplayPage::Advanced { next } | ReplayPage::Empty { next } => {
                         replay_cursor = Some(next);
-                        Message::ReplayAck { next_from: next, done: false, stalled: None }
+                        Message::ReplayAck {
+                            next_from: next,
+                            done: false,
+                            stalled: None,
+                            replay_records: held(next),
+                        }
                     }
                 };
                 write_frame(&mut stream, &ack).await?;
@@ -1612,7 +1705,16 @@ where
                     engine.witnessed_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
                 write_frame(&mut stream, &Message::Witnessed(witnessed)).await?;
             }
-            Message::AskEntries { from, limit, held, marked, partial, replay, replay_records } => {
+            Message::AskEntries {
+                from,
+                limit,
+                held,
+                marked,
+                partial,
+                replay,
+                replay_records,
+                records_ahead_of,
+            } => {
                 // Tell a peer below the horizon rather than serving it what is
                 // left: it would apply that, advance its version vector, and
                 // never learn what had been collected. Judged per origin when
@@ -1733,8 +1835,16 @@ where
                 // fewer entries unasked would be a silent gap rather than a kindness.
                 // The records count: a window whose records push it over the
                 // frame is answered the same way (B5).
-                let unanchored = window.unanchored;
-                let records = records_to_send(engine, window.records);
+                let mut unanchored = window.unanchored;
+                let mut records = records_to_send(engine, window.records);
+                // The records the peer stored ahead of this window's first entry, in
+                // this contact: left out, so the entry crosses.
+                leave_out_records_ahead(
+                    &window.entries,
+                    &mut records,
+                    &mut unanchored,
+                    records_ahead_of,
+                );
                 match how_many_fit(&window.entries, &records, unanchored) {
                     Fits::All => {
                         write_frame(
@@ -1791,10 +1901,39 @@ where
                                 .await?
                             }
                             None => {
+                                // Else the records riding at or below the first entry,
+                                // the one at its own stamp included, ahead of it: an
+                                // answer of records alone that covers nothing, its
+                                // `scanned_to` naming the entry, which the peer asks
+                                // again for in this contact without them.
+                                if let Some((ahead_of, records)) =
+                                    records_ahead(&window.entries, &records, unanchored)
+                                {
+                                    info!(
+                                        records = records.len(),
+                                        ?ahead_of,
+                                        "the idempotency records riding a peer's first entry do \
+                                         not fit one frame with it; they go ahead of it, alone, \
+                                         and the entry follows without them"
+                                    );
+                                    write_frame(
+                                        &mut stream,
+                                        &Message::Entries {
+                                            entries: Vec::new(),
+                                            scanned_to: ahead_of,
+                                            exhausted: false,
+                                            passed_through: None,
+                                            records,
+                                            replay_records: None,
+                                        },
+                                    )
+                                    .await?;
+                                    continue;
+                                }
                                 // Not even that: one entry, or a record, larger than
-                                // a frame, or a requester that cannot take a partial
-                                // window. Named to the peer as one entry that cannot
-                                // replicate, and counted here when records ride it.
+                                // a frame by itself. Named to the peer as one entry
+                                // that cannot replicate, and counted here when records
+                                // ride it.
                                 if records.len() > unanchored {
                                     records_unfit().bump(UnfitPath::Pull);
                                     warn!(
@@ -1845,8 +1984,10 @@ where
                     // records and no records position (C9 of the B5 design).
                     Ok(mut page) if strips_records(engine.node_id()) => {
                         page.records.clear();
+                        page.records_epoch = None;
                         if let Some(next) = page.next.as_mut() {
                             next.records = None;
+                            next.records_base = None;
                         }
                         page
                     }
@@ -2380,6 +2521,7 @@ where
                 partial: false,
                 replay: true,
                 replay_records: replay_records.clone(),
+                records_ahead_of: None,
             },
         )
         .await?;
@@ -2772,6 +2914,7 @@ async fn serve_replay<S>(
     their_node: kimmy_core::NodeId,
     theirs: &VersionVector,
     asked: kimmy_core::Hlc,
+    asked_records: Option<kimmy_storage::ReplayRecords>,
 ) -> Result<ReplayServed, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2782,7 +2925,7 @@ where
     let mut sent_pages = 0usize;
     // Where the replay stands in records at `from` (m1): as the last page of
     // records alone the peer acknowledged left it, on this contact or an earlier.
-    let mut records_cursor = inbound_records(engine.node_id(), their_node, from);
+    let mut records_cursor = asked_records.filter(|records| records.at == from);
     loop {
         if sent_pages >= replay_max_pages() || started.elapsed() >= replay_serve_time() {
             return Ok(ReplayServed::InStep);
@@ -2875,6 +3018,7 @@ where
                 horizon,
                 scanned_to: after,
                 records,
+                replay_records: records_cut.clone(),
             },
         )
         .await?;
@@ -2894,31 +3038,30 @@ where
             }
         };
         match ack {
-            Message::ReplayAck { next_from, done, stalled } => {
+            Message::ReplayAck { next_from, done, stalled, replay_records } => {
                 info!(%peer, entries = count, exhausted, done, "served a page of a peer's replay");
                 if done || stalled.is_some() || horizon || exhausted {
                     return Ok(ReplayServed::InStep);
                 }
                 // A page that could not carry what it must (said and counted where it
-                // was cut): the replay stays where it is, its cursor with it, and the
-                // contact goes on with the ordinary round.
+                // was cut): the replay stays where it is, and the contact goes on with
+                // the ordinary round.
                 if page_unfit {
-                    // The cursor the page left: the one it came with, or none where
-                    // its position's records started over.
-                    set_inbound_records(engine.node_id(), their_node, records_cut);
                     return Ok(ReplayServed::InStep);
                 }
-                // A page of records alone the peer stored, at the position it asks
-                // from still: the next page there goes on after its cursor, on this
-                // contact or the next.
-                if let Some(cut) = records_cut
-                    && next_from == from
-                {
-                    set_inbound_records(engine.node_id(), their_node, Some(cut.clone()));
-                    records_cursor = Some(cut);
+                // A page of records alone, at the position the peer asks from still:
+                // the next page there goes on after the cursor the peer echoes, the
+                // one it keeps having stored the page. This member keeps none, so a
+                // restart of the peer (a restore again, perhaps) loses it, and the
+                // position's records start over. A peer that echoes none ends the
+                // contact here.
+                if records_cut.is_some() && next_from == from {
+                    records_cursor = replay_records.filter(|records| records.at == from);
+                    if records_cursor.is_none() {
+                        return Ok(ReplayServed::InStep);
+                    }
                     continue;
                 }
-                set_inbound_records(engine.node_id(), their_node, None);
                 records_cursor = None;
                 // The ack is a check, not the cursor: a peer that does not advance
                 // past what was sent, or past where the last page began, ends it.
@@ -2978,8 +3121,16 @@ where
     let mut their_facts = None;
     let mut asked_replay = None;
     let (theirs, their_witnessed) = match frame {
-        Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
-            asked_replay = replay_from;
+        Message::Vectors {
+            servable,
+            witnessed,
+            facts,
+            facts_gen,
+            echo,
+            replay_from,
+            replay_records,
+        } => {
+            asked_replay = replay_from.map(|from| (from, replay_records));
             if undecodable {
                 stalls.facts_undecodable.push(their_node);
             }
@@ -3026,7 +3177,7 @@ where
     // never costs the round: when it ends the ordinary round goes on, unless an ack
     // did not come and the stream may still hold it, which ends the round quietly.
     if let Some(asked) = asked_replay
-        && serve_replay(engine, stream, peer, their_node, &theirs, asked).await?
+        && serve_replay(engine, stream, peer, their_node, &theirs, asked.0, asked.1).await?
             == ReplayServed::OutOfStep
     {
         return Ok(SyncOutcome::default());
@@ -3227,12 +3378,60 @@ where
                     partial: asked_partial,
                     replay: false,
                     replay_records: None,
+                    records_ahead_of: None,
                 },
             )
             .await?;
             read_frame(stream).await?
         }
     };
+
+    // Records sent ahead of their entry: an answer of records alone that covers
+    // nothing (no entry, no partial end, not the tail) names in `scanned_to` the
+    // first entry of the window, which cannot cross with the records riding at or
+    // below it. They are stored now, ahead of the effect, and the window is asked
+    // again in this contact naming that entry, which the peer then sends without
+    // them. Once a round.
+    let mut records_ahead_of = None;
+    if let Message::Entries {
+        entries,
+        scanned_to,
+        exhausted: false,
+        passed_through: None,
+        records,
+        ..
+    } = &answer
+        && entries.is_empty()
+        && !records.is_empty()
+    {
+        let ahead_of = *scanned_to;
+        kimmy_storage::blocking(|| {
+            engine.apply_batch_carrying(&[], records, kimmy_storage::RecordsVia::Pull)
+        })
+        .map_err(|e| from_storage(e, ProtocolError::Malformed))?;
+        debug!(
+            %peer,
+            ?ahead_of,
+            records = records.len(),
+            "stored the idempotency records a peer sent ahead of an entry; asking for the entry"
+        );
+        records_ahead_of = Some(ahead_of);
+        write_frame(
+            stream,
+            &Message::AskEntries {
+                from,
+                limit,
+                held: held.clone(),
+                marked: marked.clone(),
+                partial: asked_partial,
+                replay: false,
+                replay_records: None,
+                records_ahead_of,
+            },
+        )
+        .await?;
+        answer = read_frame(stream).await?;
+    }
 
     if let Message::BatchTooLarge { fits } = answer {
         if fits == 0 {
@@ -3253,6 +3452,7 @@ where
             partial: asked_partial,
             replay: false,
             replay_records: None,
+            records_ahead_of,
         };
         write_frame(stream, &retry).await?;
         answer = read_frame(stream).await?;
@@ -7056,6 +7256,41 @@ mod tests {
         assert!(matches!(how_many_fit(&entries, &[record(30, big)], 1), Fits::Only(1)));
     }
 
+    /// A frame of many small records: each counts its element's framing in the
+    /// message's array, so the most records `how_many_fit` lets a window carry
+    /// make a frame `write_frame` takes. Counted by their own encodings alone,
+    /// about 260,000 records of 250 bytes passed the frame by some 2 MB of framing.
+    #[tokio::test]
+    async fn the_most_small_records_a_frame_is_let_carry_cross_in_one() {
+        use kimmy_core::{CollectionId, Hlc, NodeId, ScopeHash, Stamp};
+        let record = |i: u64| kimmy_storage::CarriedRecord {
+            collection: CollectionId(u64::MAX - i),
+            scope: ScopeHash([7; 32]),
+            carrying: Some(Stamp::new(Hlc::new(i, 0), NodeId::from_bytes([1; 16]))),
+            record: vec![1; 120],
+        };
+        let one = bson::serialize_to_vec(&record(0)).unwrap().len();
+        // As many as the fit counts within the budget, each with its framing, and
+        // one more: all of them the kind a window carries whatever else it
+        // carries, so they fit whole or not at all.
+        let lo = ENTRY_BUDGET / (one + ELEMENT_FRAMING);
+        let records: Vec<_> = (0..=lo as u64).map(record).collect();
+        assert!(lo > 200_000, "premise: a frame of small records ({lo})");
+        assert!(matches!(how_many_fit(&[], &records[..lo], lo), Fits::All), "the most that fit");
+        assert!(matches!(how_many_fit(&[], &records, lo + 1), Fits::Nothing), "and no more");
+        let message = Message::Entries {
+            entries: Vec::new(),
+            scanned_to: Hlc::ZERO,
+            exhausted: false,
+            passed_through: None,
+            records: records[..lo].to_vec(),
+            replay_records: None,
+        };
+        let mut written = Vec::new();
+        let sent = write_frame(&mut written, &message).await;
+        assert!(sent.is_ok(), "{lo} records the fit let ride: {sent:?}");
+    }
+
     /// The keys on a snapshot page and in the cut digest's uncovered lists are converted
     /// between the stored and the legacy (schema-4) form at the engine's wire API and
     /// nowhere else (Decimal128 design 7.1, review v2.3-delta M2): `snapshot_page`,
@@ -8211,6 +8446,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let peer = tokio::spawn(fake_peer(theirs, answer));
         let mut stalls = PeerStalls::new();
@@ -8443,6 +8679,7 @@ mod tests {
             facts_gen: Some(8),
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let far = tokio::spawn(peer(theirs, answer, Some(sent)));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -8466,6 +8703,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         let far = tokio::spawn(peer(theirs, bare, None));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -8498,6 +8736,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // Asked for entries, it hangs up: the round fails here.
@@ -8556,6 +8795,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8676,6 +8916,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8751,6 +8992,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8828,6 +9070,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -8924,6 +9167,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9115,6 +9359,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9291,6 +9536,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -9401,6 +9647,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // A round that fails before a page lands: the peer goes away.
@@ -9653,6 +9900,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -10658,6 +10906,7 @@ mod tests {
                 partial: false,
                 replay: false,
                 replay_records: None,
+                records_ahead_of: None,
             };
             write_frame(&mut ours, &ask).await.unwrap();
             read_frame(&mut ours).await
@@ -10862,6 +11111,38 @@ mod tests {
                 panic!("expected a Fault naming the document, got {:?}", other.map(|p| p.complete))
             }
         }
+    }
+
+    /// The same through the listener with binary `_id`s of 4 KiB, which cross as
+    /// arrays of integers, about ten bytes a byte: 512 documents of 110,000 bytes
+    /// were counted within a page and crossed at 78.9 MB, so the listener could
+    /// not write the page and the pull failed with no fault. Counted at the size
+    /// they cross in, the pages are cut to fit and the pull completes.
+    #[tokio::test]
+    async fn snapshot_pages_of_large_binary_ids_cross_within_a_frame() {
+        use kimmy_storage::SnapshotPolicy::All;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "bin").unwrap();
+        let pad = "x".repeat(110_000);
+        for chunk in 0..8u32 {
+            let docs = (0..64u32)
+                .map(|i| {
+                    let mut bytes = vec![0u8; 4096];
+                    bytes[..4].copy_from_slice(&(chunk * 64 + i).to_be_bytes());
+                    let id = bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes };
+                    bson::doc! { "_id": bson::Bson::Binary(id), "pad": pad.clone() }
+                })
+                .collect();
+            b.insert_many(&coll, docs).unwrap();
+        }
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let (served, pulled) = pull_through(&a, &b, Some(coll.id), All).await;
+        assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+        assert!(pulled.is_ok_and(|p| p.complete), "the pull completes");
+        let held = a.get_collection("shop", "bin").unwrap();
+        assert_eq!(a.count(&held, kimmy_storage::WalkScope::Request).unwrap(), 512);
     }
 
     /// A pushed window this node cannot apply is answered with a `Fault`
@@ -11364,6 +11645,7 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
+            replay_records: None,
         };
         write_frame(&mut stream, &answer).await.unwrap();
         match read_frame(&mut stream).await.unwrap() {
@@ -11542,6 +11824,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11582,6 +11865,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11657,6 +11941,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -11762,6 +12047,7 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             let _ = read_frame(&mut stream).await;
@@ -12163,6 +12449,7 @@ mod tests {
                     facts_gen: None,
                     echo: None,
                     replay_from: None,
+                    replay_records: None,
                 };
                 write_frame(&mut peer_end, &vectors).await.unwrap();
                 let Ok(Message::AskDivergence { digest, definitions, .. }) =
@@ -13253,6 +13540,7 @@ mod partial_windows_never_skip {
                     facts_gen: None,
                     echo: None,
                     replay_from: None,
+                    replay_records: None,
                 };
                 write_frame(&mut peer_end, &vectors).await.unwrap();
                 let Ok(Message::AskDivergence { digest, .. }) = read_frame(&mut peer_end).await
@@ -13320,6 +13608,7 @@ mod partial_windows_never_skip {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
+                replay_records: None,
             };
             write_frame(&mut peer_end, &vectors).await.unwrap();
             if !window.is_empty() {

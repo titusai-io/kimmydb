@@ -853,7 +853,20 @@ fn the_routes_that_take_an_idempotency_key_are_the_ones_the_specification_gives_
             reused["description"].as_str().is_some_and(|d| d.contains("idempotency_key_reused")),
             "{method} {template}: its 422 does not document idempotency_key_reused"
         );
+        let unheard = resolve(spec, &operation["responses"]["503"]);
+        assert!(
+            unheard["description"].as_str().is_some_and(|d| d.contains("peer_unheard"))
+                && unheard["headers"].get("Retry-After").is_some(),
+            "{method} {template}: its 503 does not document peer_unheard and its Retry-After"
+        );
     }
+    // The other gate that answers `peer_unheard`: an index with a `Decimal128` bound.
+    let create_index = &spec["paths"]["/v1/db/{db}/coll/{coll}/indexes"]["post"]["responses"];
+    let unheard = resolve(spec, &create_index["503"]);
+    assert!(
+        unheard["description"].as_str().is_some_and(|d| d.contains("peer_unheard")),
+        "POST …/indexes: its 503 does not document peer_unheard"
+    );
     // A request with the key still running here is a `multi: true` update or
     // delete, the two that commit in chunks; and either, single-document with
     // an `if_stamp` the document has moved past, is `409 stale`, so the one

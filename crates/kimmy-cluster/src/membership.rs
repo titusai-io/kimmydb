@@ -184,7 +184,10 @@ struct MembersInner {
     /// When the live set last changed: a yield becomes effective only after it has
     /// held still for a lease (ADR-213, C9).
     live_changed: Mutex<Option<Instant>>,
-    /// When each live peer came up, for the unheard-peer warning.
+    /// When each live peer's block was last not held for a reason of its own
+    /// time: it came up, SWIM renamed it, or this member rejoined. The clock of
+    /// the unheard-peer warning and of the gates' lease on a peer not heard
+    /// from ([`PeerView::unheard_beyond_lease`]).
     up_since: Mutex<BTreeMap<NodeId, Instant>>,
     /// The sync interval and the fanout the lease is derived from.
     lease_shape: RwLock<(Duration, usize)>,
@@ -208,6 +211,10 @@ struct PeerTable {
     dropped: BTreeMap<NodeId, (u64, Instant)>,
     /// The decode sequence at this member's own `Defunct` or `Rejoin`.
     floor: u64,
+    /// The peers whose last block did not decode, and when, while no block of
+    /// theirs is held since: heard from, and unable to vouch for anything. Cleared
+    /// with the slot, and by a block that decodes.
+    undecodable: BTreeMap<NodeId, Instant>,
 }
 
 /// One held block, as the evaluator sees it.
@@ -229,9 +236,25 @@ pub struct PeerView {
     pub lease: Duration,
     pub live: BTreeSet<NodeId>,
     pub blocks: BTreeMap<NodeId, ViewBlock>,
+    /// When each live peer's block was last not held for a reason of its own
+    /// time: it came up, SWIM renamed it, or this member rejoined.
+    pub unheard_since: BTreeMap<NodeId, Instant>,
+    /// The peers whose last block did not decode, with no block held since.
+    pub undecodable: BTreeSet<NodeId>,
 }
 
 impl PeerView {
+    /// Whether `node` has gone more than a lease without a block since it came
+    /// up, was renamed or this member rejoined: what the unheard-peer WARN names,
+    /// and what the gates count as a peer that does not say it has a capability.
+    /// Within the lease it is only not heard from yet. Whether a block is held is
+    /// the caller's to ask.
+    pub fn unheard_beyond_lease(&self, node: &NodeId, now: Instant) -> bool {
+        self.unheard_since
+            .get(node)
+            .is_some_and(|since| now.saturating_duration_since(*since) > self.lease)
+    }
+
     /// The block held from `node`, if it is live, and whether it is within its lease.
     pub fn live_block(&self, node: &NodeId, now: Instant) -> Option<(&ViewBlock, bool)> {
         if !self.live.contains(node) {
@@ -313,7 +336,14 @@ impl Members {
             })
             .collect();
         let version = self.0.view_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let view = PeerView { version, lease: self.lease(), live: self.node_ids(), blocks };
+        let live = self.node_ids();
+        let unheard_since = {
+            let up = self.0.up_since.lock();
+            up.iter().filter(|(node, _)| live.contains(node)).map(|(n, at)| (*n, *at)).collect()
+        };
+        let undecodable = table.undecodable.keys().copied().collect();
+        let view =
+            PeerView { version, lease: self.lease(), live, blocks, unheard_since, undecodable };
         self.0.view.store(Arc::new(view));
     }
 
@@ -353,6 +383,7 @@ impl Members {
     /// decode looks exactly like an older one that sends none. Answers whether it
     /// said it now.
     pub(crate) fn note_undecodable(&self, peer: NodeId, now: Instant) -> bool {
+        self.mark_undecodable(peer, now);
         let mut said = self.0.undecodable_said.lock();
         let due = said
             .get(&peer)
@@ -368,21 +399,26 @@ impl Members {
         due
     }
 
+    /// Record that `peer`'s last block did not decode: the gates count it at once
+    /// as a peer that does not say it has their capability, until a block of its
+    /// decodes or its slot is dropped.
+    fn mark_undecodable(&self, peer: NodeId, now: Instant) {
+        let mut table = self.0.peer_facts.write();
+        table.undecodable.insert(peer, now);
+        self.publish(&table);
+    }
+
     /// The live peers that have sent no block for more than a lease, since they
-    /// came up. Such a peer is not a candidate for webhooks or embeddings here, so
-    /// this member also owns that share (ADR-213).
+    /// came up, were renamed or this member rejoined. Such a peer is not a
+    /// candidate for webhooks or embeddings here, so this member also owns that
+    /// share (ADR-213). The gates read the same clock from the same view
+    /// ([`PeerView::unheard_beyond_lease`]).
     pub fn unheard_beyond_lease(&self, now: Instant) -> Vec<NodeId> {
-        let lease = self.lease();
-        let table = self.0.peer_facts.read();
-        let up = self.0.up_since.lock();
-        self.node_ids()
-            .into_iter()
-            .filter(|node| {
-                !table.held.contains_key(node)
-                    && up
-                        .get(node)
-                        .is_some_and(|since| now.saturating_duration_since(*since) > lease)
-            })
+        let view = self.view();
+        view.live
+            .iter()
+            .filter(|node| !view.blocks.contains_key(node) && view.unheard_beyond_lease(node, now))
+            .copied()
             .collect()
     }
 
@@ -413,7 +449,8 @@ impl Members {
 
     /// The live peers that do not advertise `Facts.decimal128 = Some(true)`, a
     /// peer not heard from yet included: what holds back a locally created
-    /// `Decimal128` id or bound (ADR-238). One load of the view, no lock.
+    /// `Decimal128` id or bound (ADR-238), either way. One load of the view, no
+    /// lock. The gate itself tells the two apart ([`crate::decimal128_net`]).
     pub fn decimal128_blockers(&self) -> Vec<NodeId> {
         crate::facts::decimal128_blockers(&self.view())
     }
@@ -427,26 +464,16 @@ impl Members {
     /// blocks again is named at once.
     ///
     /// **A live peer this member has not heard from is named only once it has
-    /// been unheard for more than a lease**, as the unheard-peer WARN does: it
-    /// blocks the gate at once (failing closed), but a peer that came up a
-    /// moment ago and has not been contacted yet is not one that cannot hold a
-    /// decimal, and saying so at every start would teach an operator to skip
-    /// the line.
+    /// been unheard for more than a lease**, as the unheard-peer WARN does, on the
+    /// same clock: within the lease it holds the gate back as a peer not heard
+    /// from yet, and after it the gate counts it as one that cannot hold a
+    /// decimal, as this WARN does. A peer whose block does not decode is named at
+    /// once.
     pub fn decimal128_warn_due(&self, now: Instant) -> Vec<NodeId> {
-        let lease = self.lease();
         let view = self.view();
-        let blockers: Vec<NodeId> = {
-            let up = self.0.up_since.lock();
-            crate::facts::decimal128_blockers(&view)
-                .into_iter()
-                .filter(|node| {
-                    view.blocks.contains_key(node)
-                        || up
-                            .get(node)
-                            .is_none_or(|since| now.saturating_duration_since(*since) > lease)
-                })
-                .collect()
-        };
+        // The peers the gate counts as unable at `now`: a held block that says
+        // no, a block that did not decode, or no block for more than a lease.
+        let blockers = crate::facts::refusing_peers(&view, now, crate::facts::says_decimal128);
         let mut said = self.0.decimal128_said.lock();
         said.retain(|node, _| blockers.contains(node));
         blockers
@@ -480,15 +507,21 @@ impl Members {
     /// was dropped, so a block decoded before cannot come back (ADR-213).
     fn drop_peer(&self, table: &mut PeerTable, node: NodeId) {
         table.held.remove(&node);
+        table.undecodable.remove(&node);
         table.dropped.insert(node, (last_decoded_seq(), Instant::now()));
         if let Some(local) = self.0.local.get() {
             local.forget(node);
         }
     }
 
+    /// A SWIM rename: the peer's block is dropped and it stays live, so its
+    /// unheard clock starts again now.
     fn forget_peer(&self, node: NodeId) {
         let mut table = self.0.peer_facts.write();
         self.drop_peer(&mut table, node);
+        if let Some(since) = self.0.up_since.lock().get_mut(&node) {
+            *since = Instant::now();
+        }
         self.publish(&table);
     }
 
@@ -499,7 +532,14 @@ impl Members {
     pub(crate) fn clear_for_own_defunct(&self) {
         let mut table = self.0.peer_facts.write();
         table.held.clear();
+        table.undecodable.clear();
         table.floor = last_decoded_seq();
+        // Every peer's block was dropped now, for a reason of this member's own:
+        // each is not heard from yet, and its unheard clock starts again.
+        let now = Instant::now();
+        for since in self.0.up_since.lock().values_mut() {
+            *since = now;
+        }
         if let Some(local) = self.0.local.get() {
             local.clear_echoes();
         }
@@ -524,14 +564,31 @@ impl Members {
     /// not reach every peer, and a fixed lease would expire facts that are still
     /// being refreshed (ADR-201).
     pub fn lease(&self) -> Duration {
-        let (interval, fanout) = *self.0.lease_shape.read();
+        let (_, fanout) = *self.0.lease_shape.read();
         // Unconfigured (a member set nothing has told its intervals): the
         // defaults, so a lease is never zero and never divides by zero.
-        let interval =
-            if interval.is_zero() { crate::peers::DEFAULT_SYNC_INTERVAL } else { interval };
+        let interval = self.sync_interval();
         let fanout = fanout.max(1);
         let peers = self.0.live.read().len();
         interval * (peers.div_ceil(fanout) as u32 + 2)
+    }
+
+    /// The sync interval blocks are exchanged at, as configured, or the default
+    /// on a member set nothing has told its intervals.
+    pub fn sync_interval(&self) -> Duration {
+        let (interval, _) = *self.0.lease_shape.read();
+        if interval.is_zero() { crate::peers::DEFAULT_SYNC_INTERVAL } else { interval }
+    }
+
+    /// The `Retry-After` a gate refusing for a live peer not heard from yet
+    /// carries ([`crate::PeerNet::Unheard`]): one sync interval, in whole seconds
+    /// rounded up and at least 1. A peer's block arrives with the next replication
+    /// contact either way, and one round makes one with each peer the fanout
+    /// reaches.
+    pub fn unheard_retry_after_secs(&self) -> u64 {
+        let interval = self.sync_interval();
+        let whole = interval.as_secs() + u64::from(interval.subsec_nanos() > 0);
+        whole.max(1)
     }
 
     /// This member's block to send, with its generation, or `None` with no
@@ -642,6 +699,7 @@ impl Members {
             restarted = !same_boot;
         }
         table.held.insert(node, PeerFacts { facts, received: now, generation, decoded_seq });
+        table.undecodable.remove(&node);
         if let Some(local) = self.0.local.get() {
             // A new boot id is a new process: what the old one echoed of our
             // block says nothing of it.
@@ -659,7 +717,10 @@ impl Members {
         // A drop floor is needed only until the slot holds a later block (which
         // already refuses anything decoded earlier), and while its peer might
         // still be heard from.
-        let PeerTable { held, dropped, floor } = &mut *table;
+        table.undecodable.retain(|peer, at| {
+            live.contains(peer) || now.saturating_duration_since(*at) < lease * 10
+        });
+        let PeerTable { held, dropped, floor, .. } = &mut *table;
         dropped.retain(|peer, (seq, at)| {
             *seq > *floor
                 && !held.get(peer).is_some_and(|h| h.decoded_seq > *seq)
@@ -842,6 +903,35 @@ impl Members {
     /// Remove a member without a running SWIM task. See [`Self::insert_for_test`].
     pub fn remove_for_test(&self, addr: &SocketAddr) {
         self.remove(addr);
+    }
+
+    /// Drop `node`'s block and leave it live, as SWIM's `Rename` of a peer does
+    /// (a later incarnation of it). See [`Self::insert_for_test`].
+    pub fn forget_peer_for_test(&self, node: NodeId) {
+        self.forget_peer(node);
+    }
+
+    /// Drop every peer's block and leave the live set as it was, as this member's
+    /// own `Rejoin` or `Defunct` does. See [`Self::insert_for_test`].
+    pub fn rejoin_for_test(&self) {
+        self.clear_for_own_defunct();
+    }
+
+    /// Move `node`'s unheard clock `age` into the past, as if it had come up, or
+    /// been renamed, that long ago: a test of what a lease's end does, without a
+    /// sleep. See [`Self::insert_for_test`].
+    pub fn backdate_unheard_for_test(&self, node: NodeId, age: Duration) {
+        let table = self.0.peer_facts.write();
+        if let Some(since) = self.0.up_since.lock().get_mut(&node) {
+            *since = Instant::now().checked_sub(age).unwrap_or(*since);
+        }
+        self.publish(&table);
+    }
+
+    /// Record that a block `node` sent did not decode, as a contact does. See
+    /// [`Self::insert_for_test`].
+    pub fn note_undecodable_for_test(&self, node: NodeId) {
+        self.note_undecodable(node, Instant::now());
     }
 
     /// Move `addr`'s generation on, as SWIM bringing it up and declaring it down

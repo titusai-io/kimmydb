@@ -132,6 +132,7 @@ impl Rig {
             lease: Duration::from_secs(15),
             live: self.peers.keys().copied().collect(),
             blocks: BTreeMap::new(),
+            ..PeerView::default()
         };
         for (n, peer) in &self.peers {
             if let Some(facts) = &peer.facts {

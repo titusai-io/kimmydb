@@ -1995,8 +1995,27 @@ async fn the_argument_is_gated_as_the_header_is() {
     *state.lock().unwrap() = Err(IdempotencyClosed::Peers(vec!["peer-node-0002".into()]));
     let (tool, arguments) = keyed_calls().remove(0);
     let body = server.call(&root, tool, with_key(arguments.clone(), KEY)).await;
-    let (_, message) = refusal(&body);
+    let (code, message) = refusal(&body);
+    assert_eq!(code, "bad_request", "a member that says no: {body}");
+    assert_eq!(body["error"]["data"]["retry"], "no", "{body}");
     assert!(message.contains("peer-node-0002"), "names the member: {message}");
+
+    // A live member not heard from yet: the transient refusal, as the header's
+    // `503`, with the wait REST sends as `Retry-After` in the envelope.
+    *state.lock().unwrap() = Err(IdempotencyClosed::Unheard {
+        peers: vec!["peer-node-0003".into()],
+        retry_after_secs: 2,
+    });
+    for (tool, arguments) in keyed_calls() {
+        let body = server.call(&root, tool, with_key(arguments, KEY)).await;
+        let (code, message) = refusal(&body);
+        assert_eq!(code, "peer_unheard", "{tool}: {body}");
+        let data = &body["error"]["data"];
+        assert_eq!(data["retry"], "wait", "{tool}: {body}");
+        assert_eq!(data["retry_after_secs"], 2, "{tool}: {body}");
+        assert!(message.starts_with("idempotency_key: "), "{tool}: names the argument: {message}");
+        assert!(message.contains("peer-node-0003") && message.contains("same key"), "{message}");
+    }
 
     *state.lock().unwrap() = Ok(());
     server.call_ok(&root, tool, with_key(arguments, KEY)).await;

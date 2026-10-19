@@ -21,6 +21,14 @@
 //!    the operator's procedure covers: the net only catches what this member
 //!    can see.
 //!
+//! The net's two causes are told apart ([`crate::PeerNet`]), since a client
+//! acts on them differently: a held block that says the peer does not carry
+//! records ([`IdempotencyClosed::Peers`], `400`) lasts a roll, while a live peer
+//! not heard from yet, with no held block saying no
+//! ([`IdempotencyClosed::Unheard`], `503`, `retry: wait`, `Retry-After` of one
+//! sync interval), is heard at its next contact: after any restart, and after
+//! a SWIM rename or rejoin drops the block.
+//!
 //! With clustering off there are no peers, and the switch alone decides (its
 //! default is `true` there). With clustering on and `cluster.membership` off,
 //! this member exchanges no blocks with its peers and cannot see whether they
@@ -31,7 +39,9 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
+use crate::facts::PeerNet;
 use crate::membership::Members;
 
 /// The question the API asks before it takes an `Idempotency-Key`: is this
@@ -41,19 +51,44 @@ pub type IdempotencyPredicate = Arc<dyn Fn() -> Result<(), IdempotencyClosed> + 
 
 /// Why the gate is closed. Its `Display` is the refusal a client reads: it names
 /// the header and the cause, the switch when it is off and otherwise the live
-/// member that does not carry records.
+/// member that does not carry records, or that has not been heard from yet.
+///
+/// Every cause but one lasts until the operator or the roll changes something,
+/// and the API answers it `400`. [`Self::Unheard`] ends by itself, within about
+/// a sync interval, and is answered `503` with `retry: wait` and the
+/// `Retry-After` it carries ([`Self::retry_after_secs`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IdempotencyClosed {
     /// `cluster.idempotency_keys` is false: the operator has not declared that
     /// every member runs 0.52.
     Undeclared,
-    /// The switch is set, and these live peers (node ids, sorted) do not
-    /// advertise that they carry records: an older release, or a peer this
-    /// member has not heard from yet.
+    /// The switch is set, and these live peers (node ids, sorted) do not say
+    /// they carry records: a held block says otherwise or nothing of it (a build
+    /// older than 0.52), their last block did not decode, or no block of theirs
+    /// has been held for more than a lease since they came up, were renamed or
+    /// this member rejoined. It lasts until they change.
     Peers(Vec<String>),
     /// The switch is set, and this member cannot see what its peers say about
     /// themselves, for the reason given.
     Unseen(&'static str),
+    /// The switch is set and no live peer refuses, but these live peers (node
+    /// ids, sorted) have not been heard from yet, within a lease of coming up,
+    /// being renamed or this member's rejoin. **Transient**: a block arrives
+    /// with the next contact, about `retry_after_secs` (one sync interval)
+    /// later, and once the lease has run with none the peer counts among
+    /// [`Self::Peers`].
+    Unheard { peers: Vec<String>, retry_after_secs: u64 },
+}
+
+impl IdempotencyClosed {
+    /// The seconds to wait before sending the request again, for the one cause
+    /// that ends by itself ([`Self::Unheard`]); `None` for a refusal that lasts.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Unheard { retry_after_secs, .. } => Some(*retry_after_secs),
+            Self::Undeclared | Self::Peers(_) | Self::Unseen(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for IdempotencyClosed {
@@ -71,14 +106,23 @@ impl fmt::Display for IdempotencyClosed {
             Self::Peers(peers) => write!(
                 f,
                 "{WHAT} while a live member does not carry idempotency records: \
-                 cluster.idempotency_keys is set, but the live member(s) {} do not say they do \
-                 (a build older than 0.52, or a member not yet heard from); it is taken again \
-                 once every live member does",
+                 cluster.idempotency_keys is set, but the live member(s) {} do not say they do (a \
+                 build older than 0.52, a block this member cannot read, or no block for longer \
+                 than a lease); it is taken again once every live member does",
                 peers.join(", ")
             ),
             Self::Unseen(why) => {
                 write!(f, "{WHAT}: cluster.idempotency_keys is set, but {why}")
             }
+            Self::Unheard { peers, .. } => write!(
+                f,
+                "{WHAT} yet: cluster.idempotency_keys is set, but this member has not yet heard \
+                 from the live member(s) {} whether they carry idempotency records (a member \
+                 that came up or rejoined a moment ago). This is transient: nothing was looked \
+                 up or written; send the same request again, with the same key, after \
+                 Retry-After",
+                peers.join(", ")
+            ),
         }
     }
 }
@@ -111,6 +155,12 @@ impl IdempotencyGate {
     /// asked first, so a refusal names it whenever it is off, whatever the
     /// peers say.
     pub fn check(&self) -> Result<(), IdempotencyClosed> {
+        self.check_at(Instant::now())
+    }
+
+    /// [`Self::check`] as of `now`, which decides whether a live peer not heard
+    /// from is still within its lease.
+    pub fn check_at(&self, now: Instant) -> Result<(), IdempotencyClosed> {
         if !self.switch {
             return Err(IdempotencyClosed::Undeclared);
         }
@@ -129,11 +179,15 @@ impl IdempotencyGate {
                  peer carries idempotency records",
             ));
         };
-        let blockers = crate::facts::idempotency_records_blockers(&members.view());
-        if blockers.is_empty() {
-            Ok(())
-        } else {
-            Err(IdempotencyClosed::Peers(blockers.iter().map(ToString::to_string).collect()))
+        let names =
+            |peers: Vec<kimmy_core::NodeId>| peers.iter().map(ToString::to_string).collect();
+        match crate::facts::idempotency_records_net(&members.view(), now) {
+            PeerNet::Open => Ok(()),
+            PeerNet::Refused(peers) => Err(IdempotencyClosed::Peers(names(peers))),
+            PeerNet::Unheard(peers) => Err(IdempotencyClosed::Unheard {
+                peers: names(peers),
+                retry_after_secs: members.unheard_retry_after_secs(),
+            }),
         }
     }
 
@@ -198,8 +252,14 @@ mod tests {
         assert_eq!(gate.check(), Ok(()), "a member alone relays nothing without records");
 
         members.insert_for_test(addr(2), node(2));
-        // Live and not yet heard from: fails closed.
-        assert_eq!(gate.check(), Err(IdempotencyClosed::Peers(vec![node(2).to_string()])));
+        // Live and not yet heard from: fails closed, and transient.
+        assert_eq!(
+            gate.check(),
+            Err(IdempotencyClosed::Unheard {
+                peers: vec![node(2).to_string()],
+                retry_after_secs: members.unheard_retry_after_secs(),
+            })
+        );
         // An older build: its block says nothing of records.
         members.record_peer_facts_for_test(node(2), carries(None), Duration::ZERO);
         assert_eq!(gate.check(), Err(IdempotencyClosed::Peers(vec![node(2).to_string()])));
@@ -221,6 +281,128 @@ mod tests {
         assert!(text.contains(&node(3).to_string()), "names the member: {text}");
         assert!(!text.contains(&node(2).to_string()), "and only that one: {text}");
         assert!(text.contains("Idempotency-Key"), "names the header: {text}");
+    }
+
+    /// The net's two causes apart. A live peer not heard from is `Unheard`,
+    /// transient, waiting one sync interval (whole seconds, rounded up, never
+    /// below one) and saying so; a held block that says no is `Peers`, which
+    /// carries no wait; and with both at once the block that says no decides,
+    /// naming only its member.
+    #[test]
+    fn a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides() {
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(2), 3);
+        let gate = gate_over(&members);
+        members.insert_for_test(addr(2), node(2));
+        let closed = gate.check().unwrap_err();
+        assert_eq!(
+            closed,
+            IdempotencyClosed::Unheard { peers: vec![node(2).to_string()], retry_after_secs: 2 }
+        );
+        assert_eq!(closed.retry_after_secs(), Some(2), "one sync interval");
+        let text = closed.to_string();
+        for said in ["Idempotency-Key", "not yet heard", "transient", "same key", "Retry-After"] {
+            assert!(text.contains(said), "says {said:?}: {text}");
+        }
+        assert!(text.contains(&node(2).to_string()), "names the member: {text}");
+
+        // A second live peer whose block says no: it decides, whoever is unheard.
+        members.insert_for_test(addr(3), node(3));
+        members.record_peer_facts_for_test(node(3), carries(None), Duration::ZERO);
+        let closed = gate.check().unwrap_err();
+        assert_eq!(closed, IdempotencyClosed::Peers(vec![node(3).to_string()]));
+        assert_eq!(closed.retry_after_secs(), None, "lasts until it is upgraded");
+        let text = closed.to_string();
+        assert!(!text.contains("heard") && !text.contains("transient"), "{text}");
+
+        // It upgrades: only the unheard peer is left, and the refusal is transient.
+        members.record_peer_facts_for_test(node(3), carries(Some(true)), Duration::ZERO);
+        assert!(matches!(gate.check(), Err(IdempotencyClosed::Unheard { .. })));
+        members.record_peer_facts_for_test(node(2), carries(Some(true)), Duration::ZERO);
+        assert_eq!(gate.check(), Ok(()));
+    }
+
+    /// The wait is one sync interval in whole seconds, rounded up, and never 0;
+    /// a member set nothing configured waits the default interval.
+    #[test]
+    fn the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second() {
+        let members = Members::default();
+        assert_eq!(
+            members.unheard_retry_after_secs(),
+            crate::peers::DEFAULT_SYNC_INTERVAL.as_secs(),
+            "unconfigured: the default"
+        );
+        for (interval, secs) in [(1_000, 1), (1_500, 2), (5_000, 5), (200, 1)] {
+            members.configure_lease(Duration::from_millis(interval), 3);
+            assert_eq!(members.unheard_retry_after_secs(), secs, "{interval} ms");
+        }
+    }
+
+    /// A block dropped while the peer stays live (its SWIM rename, or this
+    /// member's own rejoin) makes the refusal `Unheard` again, never `Peers`:
+    /// what the restart window after a roll's restart was (B5's gate window).
+    #[test]
+    fn a_block_dropped_on_a_rename_or_a_rejoin_is_unheard_again() {
+        let members = Members::default();
+        let gate = gate_over(&members);
+        members.insert_for_test(addr(2), node(2));
+        members.insert_for_test(addr(3), node(3));
+        for peer in [node(2), node(3)] {
+            members.record_peer_facts_for_test(peer, carries(Some(true)), Duration::ZERO);
+        }
+        assert_eq!(gate.check(), Ok(()));
+
+        members.forget_peer_for_test(node(2));
+        let unheard = |peers: Vec<NodeId>| {
+            Err(IdempotencyClosed::Unheard {
+                peers: peers.iter().map(ToString::to_string).collect(),
+                retry_after_secs: members.unheard_retry_after_secs(),
+            })
+        };
+        assert_eq!(gate.check(), unheard(vec![node(2)]), "a rename");
+        members.record_peer_facts_for_test(node(2), carries(Some(true)), Duration::ZERO);
+        assert_eq!(gate.check(), Ok(()), "heard again");
+
+        members.rejoin_for_test();
+        assert_eq!(gate.check(), unheard(vec![node(2), node(3)]), "this member's rejoin");
+    }
+
+    /// "Not heard" lasts a lease, the unheard-peer WARN's, on its clock: within
+    /// it the refusal is the transient `Unheard`; once it has run with no block
+    /// the peer counts as one that does not carry records, `Peers`, which carries
+    /// no wait. Never a `503` for longer than the lease.
+    #[test]
+    fn a_peer_not_heard_from_is_unheard_within_its_lease_and_refuses_after_it() {
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(2), 3);
+        let gate = gate_over(&members);
+        members.insert_for_test(addr(2), node(2));
+        let view = members.view();
+        let since = view.unheard_since[&node(2)];
+        let within = since + view.lease;
+        assert!(matches!(gate.check_at(within), Err(IdempotencyClosed::Unheard { .. })));
+        let after = within + Duration::from_millis(1);
+        let closed = gate.check_at(after).unwrap_err();
+        assert_eq!(closed, IdempotencyClosed::Peers(vec![node(2).to_string()]));
+        assert_eq!(closed.retry_after_secs(), None, "no Retry-After past the lease");
+        assert_eq!(members.unheard_beyond_lease(after), vec![node(2)], "as the WARN names it");
+        // Heard: its block decides.
+        members.record_peer_facts_for_test(node(2), carries(Some(true)), Duration::ZERO);
+        assert_eq!(gate.check_at(after), Ok(()));
+    }
+
+    /// A block that does not decode was heard and cannot vouch for records: the
+    /// refusal is `Peers` at once, inside the lease.
+    #[test]
+    fn a_peer_whose_block_does_not_decode_refuses_at_once() {
+        let members = Members::default();
+        let gate = gate_over(&members);
+        members.insert_for_test(addr(2), node(2));
+        assert!(matches!(gate.check(), Err(IdempotencyClosed::Unheard { .. })));
+        members.note_undecodable_for_test(node(2));
+        assert_eq!(gate.check(), Err(IdempotencyClosed::Peers(vec![node(2).to_string()])));
+        members.record_peer_facts_for_test(node(2), carries(Some(true)), Duration::ZERO);
+        assert_eq!(gate.check(), Ok(()), "a block that decodes decides");
     }
 
     #[test]
