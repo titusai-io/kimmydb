@@ -711,6 +711,8 @@ pub(crate) struct Outcome {
     /// second shape; a single-member rewind there is the forbidden procedure).
     pub rewinds_alone: usize,
     pub rewinds_widened: usize,
+    /// Rewinds not taken: on the home track, widened, they would rewind the home.
+    pub rewinds_skipped: usize,
     /// Writes a member rewound alone undid (`Step::RewindAlone`) that came back to it.
     pub undone_returned: usize,
     pub rewound_removed: usize,
@@ -2786,6 +2788,13 @@ impl World {
             }
             return Ok(());
         }
+        if self.sched.track == Track::Home {
+            // Every member rewound would undo `$inc`s the home answered, which the home
+            // track's exact count does not allow for (as it never restores the home).
+            self.out.rewinds_skipped += 1;
+            self.note(format!("{}'s rewind would widen to the home: not taken", LETTERS[m]));
+            return Ok(());
+        }
         self.out.rewinds_widened += 1;
         self.note(format!(
             "{}'s rewind to t{t} discards entries a peer holds ({}): every member is rewound",
@@ -2861,7 +2870,9 @@ impl World {
         let mut befores = Vec::new();
         for m in 0..n {
             let before = self.stored_records(m)?;
-            match self.e(m).rewind_to(until) {
+            // Bound first: the engine's handle must be let go before a refusal reopens it.
+            let rewound = self.e(m).rewind_to(until);
+            match rewound {
                 Ok(outcome) => befores.push((before, outcome)),
                 Err(e) => {
                     self.note(format!(
@@ -4995,6 +5006,9 @@ impl Gen {
     ///   thirds in; in half of them its first peer is restored between the replay's first
     ///   two pages (a cursor of another epoch), and in a third of them the cursor's delta
     ///   takes a hundred bytes (a changed record too large for it).
+    /// - **A rewind of a shared write** (a quarter of the `Anywhere` seeds): a keyed write
+    ///   on a member, a peer's pull of it, and a rewind of the member to just before it,
+    ///   which the documented procedure widens to every member.
     fn bias(&mut self, ops: &mut Vec<Op>) -> Bias {
         let mut bias = Bias::default();
         let len = ops.len();
@@ -5034,6 +5048,23 @@ impl Gen {
                 t: t + 5,
             };
             ops.splice(at..at, [first, second]);
+        }
+        if self.track == Track::Anywhere && self.rng.chance(25) && len > 8 {
+            // A rewind whose undone write a peer took: the procedure rewinds every member
+            // (the second shape; the first, a write no peer holds, the generator's own
+            // rewinds reach often).
+            let at = len / 3 + self.rng.below(len as u64 / 3) as usize;
+            let (peer, m) = self.pair();
+            let r = self.requests.len() as u8;
+            self.requests.push(Request { key: r + 1, kind: Kind::Insert { id: None } });
+            self.open.push(r);
+            let t = time_at(ops, at);
+            let block = [
+                Op { step: Step::Send { r, m, crash: None, inner: Vec::new() }, t: t + 1 },
+                Op { step: Step::Pull { to: peer, from: m }, t: 0 },
+                Op { step: Step::Rewind { m }, t },
+            ];
+            ops.splice(at..at, block);
         }
         if self.rng.chance(50) {
             bias.frame = self.rng.pick(&[1, 1, 2, 3]);
