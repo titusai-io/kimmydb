@@ -265,33 +265,39 @@ pub struct Facts {
 pub enum PeerNet {
     /// Every live peer's held block says it has the capability.
     Open,
-    /// **A held block says no**: these live peers (node-id order) sent a block
-    /// that says otherwise or says nothing of the capability, a build older than
-    /// the one that added it. It lasts until that member is upgraded, which is a
-    /// whole roll or longer, so the refusal is final for the request.
+    /// **A peer does not say it has the capability** (node-id order): its held
+    /// block says otherwise or says nothing of it (a build older than the one
+    /// that added it), its last block did not decode, or no block of it has been
+    /// held for more than a lease since it came up, was renamed or this member
+    /// rejoined, the time after which membership's unheard-peer WARN names it.
+    /// It lasts until that member changes, so the refusal is final for the
+    /// request.
     Refused(Vec<NodeId>),
-    /// **Not heard yet**: no held block says no, and these live peers (node-id
-    /// order) have no block held here. A peer that came up a moment ago and has
-    /// not been contacted yet, or whose block this member dropped on a SWIM
-    /// rename or rejoin; it is heard at the next contact, about a sync interval
-    /// later, so the refusal is transient. Fails closed: such a peer may be of
-    /// an older build.
+    /// **Not heard yet**: no peer refuses, and these live peers (node-id order)
+    /// have no block held here, within a lease of coming up, being renamed or
+    /// this member's rejoin. Each is heard at its next contact, about a sync
+    /// interval later, so the refusal is transient. Fails closed: such a peer
+    /// may be of an older build.
     Unheard(Vec<NodeId>),
 }
 
 impl PeerNet {
-    /// The net over `view` for the capability `has` reads from a block.
+    /// The net over `view` at `now` for the capability `has` reads from a block.
     ///
-    /// **Precedence: a held block that says no decides.** A peer known to lack
-    /// the capability closes the gate for a roll or longer whatever the other
-    /// peers are, so it is named first; only when none says no does a peer not
-    /// heard from yet make the refusal a transient one.
-    pub fn of(view: &crate::membership::PeerView, has: impl Fn(&Facts) -> bool) -> Self {
-        let refused = refusing_peers(view, has);
+    /// **Precedence: a peer that refuses decides.** A peer known not to say the
+    /// capability closes the gate until it changes, whatever the other peers are,
+    /// so it is named first; only when none refuses does a peer not heard from
+    /// yet make the refusal a transient one.
+    pub fn at(
+        view: &crate::membership::PeerView,
+        now: Instant,
+        has: impl Fn(&Facts) -> bool,
+    ) -> Self {
+        let refused = refusing_peers(view, now, has);
         if !refused.is_empty() {
             return Self::Refused(refused);
         }
-        let unheard = unheard_peers(view);
+        let unheard = unheard_peers(view, now);
         if !unheard.is_empty() {
             return Self::Unheard(unheard);
         }
@@ -307,23 +313,38 @@ impl PeerNet {
     }
 }
 
-/// The live peers this member holds no block from, in node-id order: not heard
-/// from yet since they came up, or dropped on a SWIM rename or rejoin (ADR-201).
-/// What a block would say is not known for them.
-pub fn unheard_peers(view: &crate::membership::PeerView) -> Vec<NodeId> {
-    view.live.iter().filter(|node| !view.blocks.contains_key(node)).copied().collect()
+/// The live peers not heard from yet at `now`, in node-id order: no block held,
+/// no undecodable block since the slot was last dropped, and within a lease of
+/// coming up, being renamed or this member's rejoin (ADR-201). What a block
+/// would say is not known for them yet.
+pub fn unheard_peers(view: &crate::membership::PeerView, now: Instant) -> Vec<NodeId> {
+    view.live
+        .iter()
+        .filter(|node| {
+            !view.blocks.contains_key(node)
+                && !view.undecodable.contains(node)
+                && !view.unheard_beyond_lease(node, now)
+        })
+        .copied()
+        .collect()
 }
 
-/// The live peers whose held block does not say `has`, in node-id order: a block
-/// that says otherwise, or says nothing of it. A live peer with no block held is
-/// not one of them ([`unheard_peers`]).
+/// The live peers that do not say `has` at `now`, in node-id order: a held block
+/// that says otherwise or says nothing of it; with no block held, a last block
+/// that did not decode; and with neither, no block for more than a lease
+/// ([`crate::membership::PeerView::unheard_beyond_lease`]). A held block decides
+/// whatever came before it.
 pub fn refusing_peers(
     view: &crate::membership::PeerView,
+    now: Instant,
     has: impl Fn(&Facts) -> bool,
 ) -> Vec<NodeId> {
     view.live
         .iter()
-        .filter(|node| view.blocks.get(node).is_some_and(|held| !has(&held.facts)))
+        .filter(|node| match view.blocks.get(node) {
+            Some(held) => !has(&held.facts),
+            None => view.undecodable.contains(node) || view.unheard_beyond_lease(node, now),
+        })
         .copied()
         .collect()
 }
@@ -340,29 +361,30 @@ pub fn says_idempotency_records(facts: &Facts) -> bool {
     facts.idempotency_records == Some(true)
 }
 
-/// The `Decimal128` gate's live-peer net (ADR-238): [`PeerNet::of`] over
-/// [`Facts::decimal128`].
-pub fn decimal128_net(view: &crate::membership::PeerView) -> PeerNet {
-    PeerNet::of(view, says_decimal128)
+/// The `Decimal128` gate's live-peer net at `now` (ADR-238): [`PeerNet::at`]
+/// over [`Facts::decimal128`].
+pub fn decimal128_net(view: &crate::membership::PeerView, now: Instant) -> PeerNet {
+    PeerNet::at(view, now, says_decimal128)
 }
 
-/// The idempotency-key gate's live-peer net (ADR-240 item 7): [`PeerNet::of`]
-/// over [`Facts::idempotency_records`]. A build older than 0.52 relays a keyed
-/// write without its record, which is what the net keeps keys away from.
-pub fn idempotency_records_net(view: &crate::membership::PeerView) -> PeerNet {
-    PeerNet::of(view, says_idempotency_records)
+/// The idempotency-key gate's live-peer net at `now` (ADR-240 item 7):
+/// [`PeerNet::at`] over [`Facts::idempotency_records`]. A build older than 0.52
+/// relays a keyed write without its record, which is what the net keeps keys
+/// away from.
+pub fn idempotency_records_net(view: &crate::membership::PeerView, now: Instant) -> PeerNet {
+    PeerNet::at(view, now, says_idempotency_records)
 }
 
-/// Every live peer that keeps the `Decimal128` gate closed, in node-id order: a
-/// held block that says no **and** a live peer not heard from, whichever the
-/// gate names. What the WARN that a decimal `_id` exists here reads
-/// (`Members::decimal128_warn_due`), which names an unheard peer only once it
-/// has been unheard for more than a lease.
+/// Every live peer that keeps the `Decimal128` gate closed, for either reason, in
+/// node-id order: every live peer whose held block does not say it can hold one.
+/// What decides whether the WARN that a decimal `_id` exists here reads the
+/// store's marker (`Members::decimal128_warnings`).
 pub fn decimal128_blockers(view: &crate::membership::PeerView) -> Vec<NodeId> {
-    let mut blockers = refusing_peers(view, says_decimal128);
-    blockers.extend(unheard_peers(view));
-    blockers.sort_unstable();
-    blockers
+    view.live
+        .iter()
+        .filter(|node| !view.blocks.get(node).is_some_and(|held| says_decimal128(&held.facts)))
+        .copied()
+        .collect()
 }
 
 /// One value per class of owned work.
@@ -1046,12 +1068,14 @@ mod tests {
     }
 
     /// The net's two causes are separate sets: a live peer with no block held is
-    /// unheard and never refusing, a held block that does not say the capability
-    /// is refusing and never unheard, and a peer that is not live is neither. The
-    /// net names the refusers whenever there are any, the unheard otherwise.
+    /// unheard and never refusing within its lease, a held block that does not
+    /// say the capability is refusing and never unheard, and a peer that is not
+    /// live is neither. The net names the refusers whenever there are any, the
+    /// unheard otherwise.
     #[test]
     fn the_net_tells_a_peer_not_heard_from_apart_from_one_that_says_no() {
         let members = cluster(&[2, 3, 4]);
+        let now = Instant::now();
         // 2 says it carries records and can hold a decimal; 3 is an older build
         // (its block says neither); 4 has sent nothing.
         let both = Facts { decimal128: Some(true), idempotency_records: Some(true), ..block() };
@@ -1060,26 +1084,109 @@ mod tests {
         // A block from a member that is not live is neither.
         members.record_peer_facts_for_test(node(9), block(), Duration::ZERO);
         let view = members.view();
-        assert_eq!(unheard_peers(&view), vec![node(4)]);
-        assert_eq!(refusing_peers(&view, says_idempotency_records), vec![node(3)]);
-        assert_eq!(refusing_peers(&view, says_decimal128), vec![node(3)]);
-        assert_eq!(idempotency_records_net(&view), PeerNet::Refused(vec![node(3)]), "no decides");
-        assert_eq!(decimal128_net(&view), PeerNet::Refused(vec![node(3)]));
+        assert_eq!(unheard_peers(&view, now), vec![node(4)]);
+        assert_eq!(refusing_peers(&view, now, says_idempotency_records), vec![node(3)]);
+        assert_eq!(refusing_peers(&view, now, says_decimal128), vec![node(3)]);
+        assert_eq!(idempotency_records_net(&view, now), PeerNet::Refused(vec![node(3)]));
+        assert_eq!(decimal128_net(&view, now), PeerNet::Refused(vec![node(3)]));
         assert_eq!(decimal128_blockers(&view), vec![node(3), node(4)], "the WARN reads both");
 
         // 3 upgrades: 4 alone is left, unheard.
         let carries = Facts { idempotency_records: Some(true), ..block() };
         members.record_peer_facts_for_test(node(3), carries, Duration::ZERO);
         let view = members.view();
-        assert_eq!(idempotency_records_net(&view), PeerNet::Unheard(vec![node(4)]));
-        assert_eq!(idempotency_records_net(&view).peers(), &[node(4)]);
-        assert_eq!(decimal128_net(&view), PeerNet::Refused(vec![node(3)]), "per capability");
+        assert_eq!(idempotency_records_net(&view, now), PeerNet::Unheard(vec![node(4)]));
+        assert_eq!(idempotency_records_net(&view, now).peers(), &[node(4)]);
+        assert_eq!(decimal128_net(&view, now), PeerNet::Refused(vec![node(3)]), "per capability");
 
         // 4 is heard: open for records.
         let carries = Facts { idempotency_records: Some(true), ..block() };
         members.record_peer_facts_for_test(node(4), carries, Duration::ZERO);
-        assert_eq!(idempotency_records_net(&members.view()), PeerNet::Open);
+        assert_eq!(idempotency_records_net(&members.view(), now), PeerNet::Open);
         assert!(PeerNet::Open.peers().is_empty());
+    }
+
+    /// "Not heard" is bounded by the lease the unheard-peer WARN uses, on its
+    /// clock: within it the peer is unheard, after it the peer refuses, as the
+    /// WARN names it; the moment it is heard its block decides.
+    #[test]
+    fn a_peer_not_heard_from_refuses_once_its_lease_has_run() {
+        let members = cluster(&[2]);
+        let view = members.view();
+        let start = *view.unheard_since.get(&node(2)).expect("its clock started when it came up");
+        let lease = view.lease;
+        assert_eq!(lease, members.lease(), "the WARN's lease");
+        let within = start + lease;
+        let after = start + lease + Duration::from_millis(1);
+        assert_eq!(idempotency_records_net(&view, within), PeerNet::Unheard(vec![node(2)]));
+        assert!(members.unheard_beyond_lease(within).is_empty(), "and the WARN names nobody");
+        assert_eq!(idempotency_records_net(&view, after), PeerNet::Refused(vec![node(2)]));
+        assert_eq!(members.unheard_beyond_lease(after), vec![node(2)], "the WARN names it then");
+        let carries = Facts { idempotency_records: Some(true), ..block() };
+        members.record_peer_facts_for_test(node(2), carries, Duration::ZERO);
+        assert_eq!(idempotency_records_net(&members.view(), after), PeerNet::Open);
+    }
+
+    /// A rename and this member's own rejoin drop a block and start the peer's
+    /// clock again: a peer up for longer than a lease is unheard again, not a
+    /// refuser, after either.
+    #[test]
+    fn a_rename_or_a_rejoin_starts_the_unheard_clock_again() {
+        let members = cluster(&[2]);
+        let carries = Facts { idempotency_records: Some(true), ..block() };
+        members.record_peer_facts_for_test(node(2), carries.clone(), Duration::ZERO);
+        let long_up = members.lease() + Duration::from_secs(1);
+        members.backdate_unheard_for_test(node(2), long_up);
+        let now = Instant::now();
+        assert_eq!(idempotency_records_net(&members.view(), now), PeerNet::Open);
+
+        members.forget_peer_for_test(node(2));
+        assert_eq!(
+            idempotency_records_net(&members.view(), Instant::now()),
+            PeerNet::Unheard(vec![node(2)]),
+            "a rename"
+        );
+        members.record_peer_facts_for_test(node(2), carries, Duration::ZERO);
+        members.backdate_unheard_for_test(node(2), long_up);
+        members.rejoin_for_test();
+        assert_eq!(
+            idempotency_records_net(&members.view(), Instant::now()),
+            PeerNet::Unheard(vec![node(2)]),
+            "this member's rejoin"
+        );
+    }
+
+    /// A block that does not decode was heard and cannot vouch: the peer refuses
+    /// at once, within its lease; a block that decodes then decides, and a drop
+    /// of the slot forgets it.
+    #[test]
+    fn a_block_that_does_not_decode_refuses_at_once() {
+        let members = cluster(&[2]);
+        members.note_undecodable_for_test(node(2));
+        let now = Instant::now();
+        let view = members.view();
+        assert!(!view.unheard_beyond_lease(&node(2), now), "within its lease");
+        assert_eq!(idempotency_records_net(&view, now), PeerNet::Refused(vec![node(2)]));
+        assert_eq!(decimal128_net(&view, now), PeerNet::Refused(vec![node(2)]));
+        assert!(unheard_peers(&view, now).is_empty());
+
+        let carries = Facts { idempotency_records: Some(true), ..block() };
+        members.record_peer_facts_for_test(node(2), carries, Duration::ZERO);
+        assert_eq!(idempotency_records_net(&members.view(), now), PeerNet::Open, "a block decides");
+        assert!(members.view().undecodable.is_empty(), "and clears the mark");
+
+        members.note_undecodable_for_test(node(2));
+        assert_eq!(
+            idempotency_records_net(&members.view(), now),
+            PeerNet::Open,
+            "a held block wins"
+        );
+        members.forget_peer_for_test(node(2));
+        assert_eq!(
+            idempotency_records_net(&members.view(), Instant::now()),
+            PeerNet::Unheard(vec![node(2)]),
+            "a rename forgets the mark with the block"
+        );
     }
 
     fn block() -> Facts {

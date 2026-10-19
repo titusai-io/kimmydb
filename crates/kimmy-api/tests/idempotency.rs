@@ -617,6 +617,43 @@ async fn a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_tak
     assert!(node.capabilities().await.contains(&"idempotency-keys".to_string()));
 }
 
+/// "Not heard" is bounded by the lease the unheard-peer WARN uses: a live peer
+/// with no block for longer than it is answered as one that does not carry
+/// records, `400 bad_request`, `retry: no`, no `Retry-After`, naming it; and a
+/// peer whose block does not decode is that `400` at once.
+#[tokio::test]
+async fn a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400() {
+    let node = node().await;
+    let members = clustered_gate(&node);
+    let (addr, id) = peer(2);
+    members.insert_for_test(addr, id);
+    let insert =
+        || node.send("POST", "/v1/db/shop/coll/orders/docs", Req::key(KEY).json(&json!({})));
+    assert_eq!(insert().await.status, 503, "within its lease");
+
+    members.backdate_unheard_for_test(id, members.lease() + Duration::from_secs(1));
+    let refused = |answer: &Answer, what: &str| {
+        assert_eq!(answer.status, 400, "{what}: {}", answer.text);
+        assert_eq!(answer.body["error"], "bad_request", "{what}: {}", answer.text);
+        assert_eq!(answer.body["retry"], "no", "{what}: {}", answer.text);
+        assert!(answer.headers.get("retry-after").is_none(), "{what}: no Retry-After");
+        let message = answer.body["message"].as_str().unwrap();
+        assert!(message.contains(&id.to_string()), "{what}: names it: {message}");
+    };
+    refused(&insert().await, "past its lease");
+
+    let (addr, id) = peer(3);
+    members.forget_peer_for_test(peer(2).1);
+    members.record_peer_facts_for_test(peer(2).1, carries(Some(true)), Duration::ZERO);
+    members.insert_for_test(addr, id);
+    assert_eq!(insert().await.status, 503, "a new peer, within its lease");
+    members.note_undecodable_for_test(id);
+    let answer = insert().await;
+    assert_eq!(answer.status, 400, "a block that does not decode: {}", answer.text);
+    assert!(answer.body["message"].as_str().unwrap().contains(&id.to_string()));
+    assert!(!node.capabilities().await.contains(&"idempotency-keys".to_string()));
+}
+
 /// The body a keyed request is read through refuses exactly what `JsonBody`
 /// refuses, with the same status and the same envelope: a content type that is
 /// not JSON (`415`), JSON that does not parse (`400`) and JSON of the wrong

@@ -206,7 +206,7 @@ again. A call is the same when the tool and its other arguments are, every
 document's fields in the order sent. The argument is refused where the header
 would be: malformed, reused for a different call, or while this member does not
 take keys. While the only reason it does not is a live member not heard from yet
-(after a restart or a rejoin, for about a sync interval), the refusal is the
+(after a restart or a rejoin, for about a sync interval and at most a lease), the refusal is the
 error whose `data` carries `"error": "peer_unheard"`, `"retry": "wait"` and
 `retry_after_secs`: wait that long and send the same call again with the same
 key. `/mcp` itself refuses the header: a tool call is keyed by its

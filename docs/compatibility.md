@@ -85,7 +85,7 @@ on one of these must change; none of them changes a route's shape.
 with `400` on every route that does not take it, where earlier releases ignored it, and
 on every route that does while the member does not take keys (in a cluster, until the
 operator sets `cluster.idempotency_keys`), and with `503 peer_unheard` while the only
-cause is a live member not heard from yet. A tightened refusal, made on purpose: a
+cause is a live member not heard from yet, within a lease. A tightened refusal, made on purpose: a
 client that sent the header to a route that ignored it believed it was protected and
 was not, which is worse than being told no (the reasoning of ADR-121 and ADR-124). A
 client or proxy that stamps the header on every request must stop, or send it only to
@@ -238,7 +238,8 @@ is set, which the operator declares once every member runs 0.52 and as a change 
 own, and every live member says it carries records. During the roll the members of 0.52
 refuse the header with `400` and do not list `idempotency-keys`; a client branches on the
 capability per node. A live member not heard from yet, after any restart or rejoin, is
-the transient `503 peer_unheard` (`retry: wait`, `Retry-After`) instead, a new code that
+the transient `503 peer_unheard` (`retry: wait`, `Retry-After`) instead, for at most a
+lease, a new code that
 a client reads by its retry class; the 0.51 `Decimal128` gate's refusal of such a case
 changes from `400` to the same `503`. **Rolling any member back after the switch is set reopens the gap**,
 and 0.51 refuses a configuration that names the key. The store keeps schema 5; the three
