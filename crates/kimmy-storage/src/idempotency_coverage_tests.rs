@@ -1,11 +1,12 @@
-//! Records travel with coverage (ADR-240, finding G1 and its siblings): schedules
+//! Records travel with coverage (ADR-240): schedules
 //! through the storage halves of the real paths, with the listener's serve
 //! verdict (ADR-224) applied before every window and a whole-database snapshot
 //! taken where the real loop would take one. Each ends on a member that holds a
 //! keyed request's effect, where a retry must be answered from the record and
-//! leave the counter as it is. They come from the independent analysis of G1
-//! (`g1rev_tests.rs`), which ran each against the code before the fix (every one
-//! but the first failed there) and against a prototype of it.
+//! leave the counter as it is. They come from an independent analysis of how an
+//! effect could be relayed without its record, which ran each against the code
+//! before the fix (every one but the first failed there) and against a prototype
+//! of it.
 
 use std::cmp::Ordering;
 
@@ -132,11 +133,11 @@ fn retry_must_replay(m: &Engine, cm: &CollectionMeta, k: &KeyedWrite, id: i64, s
     );
 }
 
-/// G1 exactly as reported, but through the real verdict: X took the database by
-/// snapshot, so it refuses M's window (`StateHeld`, ADR-224) and M takes a snapshot
-/// of X, whose records phase carries the record. It passed before the fix too: the
-/// reported route is closed in production by ADR-224, and the reproducer that
-/// reported it served a window without the verdict.
+/// A relay after a snapshot, through the real verdict: X took the database by
+/// snapshot, so it refuses M's window (`StateHeld`, ADR-224) and M takes a
+/// snapshot of X, whose records phase carries the record. It passed before the
+/// fix too: the reported route is closed in production by ADR-224, and the
+/// reproducer that reported it served a window without the verdict.
 #[test]
 fn g1_as_reported_is_refused_by_the_state_held_verdict() {
     let dir = tempfile::tempdir().unwrap();
@@ -158,11 +159,12 @@ fn g1_as_reported_is_refused_by_the_state_held_verdict() {
     retry_must_replay(&m, &cm, &k, 1, true);
 }
 
-/// G2, frames only, three members, no snapshot or repair: X writes the document
-/// at about the time Y's keyed `$inc` lands, so the `$inc`'s entry loses on X
-/// (stored, not appended); Y then writes on top of its own `$inc`, which wins on X.
-/// X's oplog holds the later version and not the `$inc`; M pulls X, takes the
-/// later version, and its coverage of Y passes the `$inc`, so Y never serves it.
+/// A losing entry relayed, frames only, three members, no snapshot or repair: X
+/// writes the document at about the time Y's keyed `$inc` lands, so the
+/// `$inc`'s entry loses on X (stored, not appended); Y then writes on top of
+/// its own `$inc`, which wins on X. X's oplog holds the later version and not
+/// the `$inc`; M pulls X, takes the later version, and its coverage of Y passes
+/// the `$inc`, so Y never serves it.
 #[test]
 fn g2_a_loser_relay_drops_the_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -192,7 +194,7 @@ fn g2_a_loser_relay_drops_the_record() {
     retry_must_replay(&m, &cm, &k, 1, true);
 }
 
-/// G2b: the same with nothing written on top. One keyed update-many writes two
+/// The same with nothing written on top. One keyed update-many writes two
 /// documents in one transaction; its record rides the first entry. X's own write
 /// to the first document beats that entry on X, and the second entry wins there,
 /// so X relays the request's own effect without its record.
@@ -223,7 +225,7 @@ fn g2b_a_multi_document_write_whose_first_entry_lost_is_relayed_bare() {
     retry_must_replay(&m, &cm, &k, 2, false);
 }
 
-/// G1b, the snapshot route that the verdict does not refuse: Y's keyed `$inc` and
+/// The snapshot route that the verdict does not refuse: Y's keyed `$inc` and
 /// the write on top land while X's snapshot of Y is in flight, after its first page
 /// (whose vector is the grant) and before the collection's records phase. X stores
 /// the record from the page and holds the later version above the grant; it then
@@ -268,12 +270,13 @@ fn g1b_a_write_during_a_snapshot_is_relayed_bare_by_its_receiver() {
     retry_must_replay(&m, &cm, &k, 1, true);
 }
 
-/// T2, the transient class: the effect reaches M under another origin while the
-/// relay cannot vouch for the record's stamp. Y's keyed `$inc` loses on X to X's
-/// own write; Z took the `$inc` and wrote on top of it; that version wins on X. X
-/// appended nothing of Y's past the insert, so its window does not take M's
-/// coverage of Y past the `$inc`: M holds Z's version, which holds the `$inc`, and
-/// no record, until it pulls Y or Z. With Y and Z down, a retry on M doubles.
+/// A cross-origin relay, the transient class: the effect reaches M under
+/// another origin while the relay cannot vouch for the record's stamp. Y's
+/// keyed `$inc` loses on X to X's own write; Z took the `$inc` and wrote on top
+/// of it; that version wins on X. X appended nothing of Y's past the insert, so
+/// its window does not take M's coverage of Y past the `$inc`: M holds Z's
+/// version, which holds the `$inc`, and no record, until it pulls Y or Z. With
+/// Y and Z down, a retry on M doubles.
 #[test]
 fn t2_a_cross_origin_relay_leaves_the_effect_bare_while_its_origin_is_down() {
     let dir = tempfile::tempdir().unwrap();
@@ -306,7 +309,7 @@ fn t2_a_cross_origin_relay_leaves_the_effect_bare_while_its_origin_is_down() {
     retry_must_replay(&m, &cm, &k, 1, true);
 }
 
-/// G3, a coverage-only window: M's coverage of Y passes the `$inc` in a window that
+/// A coverage-only window: M's coverage of Y passes the `$inc` in a window that
 /// carries no entry of its collection (X lost the `$inc` to its own write, which M
 /// already holds, and then appended a later write of Y's to another collection).
 /// Nothing of the request's effect reaches M then, but Y never serves M the `$inc`
@@ -514,12 +517,12 @@ fn pull_stopping_at(to: &Engine, from: &Engine, stop: Stamp) -> SyncOutcome {
 
 /// B's keyed `$inc` (r_b), then the retry on A, which lacks B's record (r_a,
 /// later). X holds both, merged, with rows at r_b and r_a. M pulls X, and its
-/// batch stops between the two rows. A window carries a record at the **lowest**
-/// row it finds (B1 of the build review): carried at r_a, as it was when A sorts
-/// first and its row was found first, the stopped batch stores no record whose
-/// row is at or past the stop, though its coverage passes r_b and it took r_b's
-/// effect; B, the only member M then reaches, ships nothing, since M covers its
-/// rows, and a retry on M applies again.
+/// batch stops between the two rows. A window carries a record at the
+/// **lowest** row it finds: carried at r_a, as it was when A sorts first and
+/// its row was found first, the stopped batch stores no record whose row is at
+/// or past the stop, though its coverage passes r_b and it took r_b's effect;
+/// B, the only member M then reaches, ships nothing, since M covers its rows,
+/// and a retry on M applies again.
 #[test]
 fn a_stopped_batch_covers_a_row_whose_record_rode_a_later_one() {
     a_stopped_batch(true);
@@ -645,7 +648,7 @@ fn a_run_committed_before_the_carried_row_holds_the_effect_bare() {
     retry_must_replay(&m, &cm, &k, 1, true);
 }
 
-// -- A sender that purged a drop (the build review's D1, ruling A) ----------------------------
+// -- A sender that purged a drop, records outliving it ---------------------------------------
 
 /// One window of at most `limit` entries, through the verdict, as `pull` serves it.
 fn pull_limited(to: &Engine, from: &Engine, limit: usize) {
@@ -673,13 +676,13 @@ fn pull_limited(to: &Engine, from: &Engine, limit: usize) {
     .unwrap();
 }
 
-/// D1 of the build review, the D2 class. A sender that has applied a collection's
-/// drop and run its purge still serves the dropped life's entries from its oplog.
-/// A member behind the drop takes the keyed `$inc`'s entry, and under ruling A the
-/// record with it, since the purge leaves records: a retry there replays. Before,
-/// the purge had removed the record, the entry came bare, and the retry applied on
-/// top of its own effect, a version stamped after the drop that the next life
-/// keeps (ADR-236).
+/// A purged sender relays a dropped life. A sender that has applied a
+/// collection's drop and run its purge still serves the dropped life's entries
+/// from its oplog. A member behind the drop takes the keyed `$inc`'s entry,
+/// and, records outliving a drop, the record with it, since the purge leaves
+/// records: a retry there replays. Before, the purge had removed the record,
+/// the entry came bare, and the retry applied on top of its own effect, a
+/// version stamped after the drop that the next life keeps (ADR-236).
 #[test]
 fn d1_a_purged_senders_old_life_entry_reaches_a_member_behind_the_drop_with_its_record() {
     let dir = tempfile::tempdir().unwrap();

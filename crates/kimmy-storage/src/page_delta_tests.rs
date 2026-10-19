@@ -4,10 +4,10 @@
 //! The residual this closes: a keyed write on the sender after its collection's
 //! records phase and before the page that holds its document. Without the delta
 //! that page brings the effect without the record, and a retry on the receiver
-//! applies the request a second time. R1, R1b and R1c are the G1 review's
-//! reproductions of it (scoped, a retry before the pull's end, whole-database);
-//! R2 is a record the sender stores below its own witnessed vector, by the replay
-//! path, which only a log of changes, and not a vector of stamps, sees.
+//! applies the request a second time. R1, R1b and R1c reproduce it (scoped, a
+//! retry before the pull's end, whole-database); R2 is a record the sender
+//! stores below its own witnessed vector, by the replay path, which only a log
+//! of changes, and not a vector of stamps, sees.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -817,12 +817,12 @@ fn a_store_without_keys_pages_as_before() {
 
 // -- A record stored below the sender's witnessed vector -----------------------------------
 
-/// R2 (the G1 review's section 10): a record the sender stores during the pull
-/// below its own witnessed vector, as a replay page or a frame requested before a
-/// concurrent pull raised that vector does. Origin Q's later entry raised Y's
-/// coverage of Q before the first page; Q's earlier entry, which carries a keyed
-/// request's effect and record, is applied on Y after it, by the path a replay
-/// page takes. The store is logged like any other, so the next page carries it.
+/// R2: a record the sender stores during the pull below its own witnessed
+/// vector, as a replay page or a frame requested before a concurrent pull
+/// raised that vector does. Origin Q's later entry raised Y's coverage of Q
+/// before the first page; Q's earlier entry, which carries a keyed request's
+/// effect and record, is applied on Y after it, by the path a replay page
+/// takes. The store is logged like any other, so the next page carries it.
 #[test]
 fn r2_a_record_stored_below_the_senders_witnessed_vector_still_rides_the_next_page() {
     let dir = tempfile::tempdir().unwrap();
@@ -957,8 +957,8 @@ fn a_base_of_another_epoch_restarts_its_collection_from_its_records() {
 /// The zero base, which a log that had held nothing cuts, is answered by the
 /// sender with every change the log holds since, whatever its epoch: no restart
 /// on the sender. The receiver refuses that page all the same, since the page
-/// names an epoch the base was not cut under (guard ii of the review's m4), and
-/// the restart it asks for brings the record: a retry replays.
+/// names an epoch the base was not cut under (the guard on a zero base after a
+/// restore), and the restart it asks for brings the record: a retry replays.
 #[test]
 fn the_zero_base_is_sent_every_change_the_log_holds() {
     let dir = tempfile::tempdir().unwrap();
@@ -1034,14 +1034,14 @@ fn a_restore_or_an_identity_reset_begins_the_log_again_and_restarts_older_bases(
     assert!(renewed.is_some() && renewed != epoch(&before), "the log began again: {renewed:?}");
 }
 
-/// The clock-behind restore (the G1 review, 10.7's follow-up): the sender is
-/// restored from a backup older than the receiver's base, onto a host whose
-/// clock is behind it, so the keyed change it then takes is logged **below** that
-/// base; later, its clock past the base, it logs another above it. Read by key
-/// values alone the base looks current (between where the log begins and its
-/// high water), and the change below it would be missed: the receiver would take
-/// its effect without its record. The epoch tells the base is of another log, and
-/// the cursor's collection restarts from its records.
+/// The clock-behind restore: the sender is restored from a backup older than
+/// the receiver's base, onto a host whose clock is behind it, so the keyed
+/// change it then takes is logged **below** that base; later, its clock past
+/// the base, it logs another above it. Read by key values alone the base looks
+/// current (between where the log begins and its high water), and the change
+/// below it would be missed: the receiver would take its effect without its
+/// record. The epoch tells the base is of another log, and the cursor's
+/// collection restarts from its records.
 #[test]
 fn a_base_from_before_a_restore_onto_a_clock_behind_restarts_its_collection() {
     let dir = tempfile::tempdir().unwrap();
@@ -1086,7 +1086,7 @@ fn a_base_from_before_a_restore_onto_a_clock_behind_restarts_its_collection() {
     retry_must_replay(&x, &cx, &k, target);
 }
 
-// -- Two restores during one pull (the B5 build review's m4) -------------------------------
+// -- Two restores during one pull --------------------------------------------------------
 
 /// Where `engine`'s change log begins, and its epoch, as it stands.
 fn log_begin(engine: &Engine) -> Option<crate::idempotency::LogBegin> {
@@ -1154,13 +1154,13 @@ fn an_open_over_records_and_no_log_begins_the_log_with_a_new_epoch() {
     assert_ne!(again.epoch, begun.epoch, "a new epoch after an identity reset");
 }
 
-/// The review's two-restore schedule (m4, `d1`): a sender restored from a
-/// backup that holds records serves the first page; it is restored again, from
-/// a backup that also holds a keyed `$inc` on a document of a later page, and
-/// the pull goes on. The first restore's open began the log with an epoch, so
-/// the first page's base names it; the second's began another, so the next page
-/// restarts the collection from its records phase, which carries the `$inc`'s
-/// record, and a retry on the receiver replays.
+/// The two-restore schedule: a sender restored from a backup that holds records
+/// serves the first page; it is restored again, from a backup that also holds a
+/// keyed `$inc` on a document of a later page, and the pull goes on. The first
+/// restore's open began the log with an epoch, so the first page's base names
+/// it; the second's began another, so the next page restarts the collection
+/// from its records phase, which carries the `$inc`'s record, and a retry on
+/// the receiver replays.
 #[test]
 fn a_pull_across_two_restores_of_a_sender_with_records_takes_every_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -1645,7 +1645,7 @@ fn pages_of_large_rows_stay_within_a_frame_at_the_real_budget() {
     assert_eq!(count(&m, &cm), 70);
 }
 
-// -- The build review's d3 and d4 (m5): pages within a frame at the real budget -------------
+// -- Pages within a frame at the real budget ------------------------------------------------
 
 /// The frame a page must fit: `SNAPSHOT_PAGE_BYTES` and the 1 MiB it leaves.
 const FRAME: usize = crate::SNAPSHOT_PAGE_BYTES + 1024 * 1024;
@@ -1691,10 +1691,10 @@ impl ModifySpec for Touch {
     }
 }
 
-/// D3 (the review's m5, "separately confirmed"): a records phase of 512
-/// `find_and_modify` records, each holding a 140 KiB before image, was one page of
-/// 73,629,363 bytes, over a frame. It spans pages now, each within a frame, and
-/// every record arrives: a retry of any key replays.
+/// A records phase of 512 `find_and_modify` records, each holding a 140 KiB
+/// before image, was one page of 73,629,363 bytes, over a frame. It spans pages
+/// now, each within a frame, and every record arrives: a retry of any key
+/// replays.
 #[test]
 fn d3_a_records_phase_of_find_and_modify_records_stays_within_a_frame() {
     let dir = tempfile::tempdir().unwrap();
@@ -1722,12 +1722,12 @@ fn d3_a_records_phase_of_find_and_modify_records_stays_within_a_frame() {
     assert!(matches!(again, Keyed::Replayed(_)), "a retry replays: {again:?}");
 }
 
-/// D4 (the review's m5): a page whose documents alone fit a frame (512 of 66 KiB,
-/// 33 MiB) and a delta of 32 `find_and_modify` records of 1,000 KiB documents that
-/// land between pages, 32 MiB, within the delta's old budget of its own, made a
-/// page of 67,478,180 bytes, and the pull stalled on it. The delta, the records
-/// phase and the documents share one budget now: that page stays within a frame,
-/// and the pull completes with every record.
+/// A page whose documents alone fit a frame (512 of 66 KiB, 33 MiB) and a delta
+/// of 32 `find_and_modify` records of 1,000 KiB documents that land between
+/// pages, 32 MiB, within the delta's old budget of its own, made a page of
+/// 67,478,180 bytes, and the pull stalled on it. The delta, the records phase
+/// and the documents share one budget now: that page stays within a frame, and
+/// the pull completes with every record.
 #[test]
 fn d4_a_whole_delta_and_a_page_of_documents_stay_within_a_frame() {
     let dir = tempfile::tempdir().unwrap();
@@ -2184,9 +2184,9 @@ fn a_pages_delta_carries_a_record_of_a_dropped_collection() {
     );
 }
 
-/// End to end, with the receiver half (ruling A): a member rebuilt by
-/// snapshot after a drop, the collection not created again, replays a retry of
-/// the old key once the name is created again.
+/// End to end, with the receiver half (records outlive a drop): a member
+/// rebuilt by snapshot after a drop, the collection not created again, replays
+/// a retry of the old key once the name is created again.
 #[test]
 fn a_member_rebuilt_by_snapshot_after_a_drop_replays_a_retry_of_the_old_key() {
     let dir = tempfile::tempdir().unwrap();
