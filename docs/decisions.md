@@ -14453,6 +14453,12 @@ the waiter's own row does not carry it.
 
 ## ADR-160 — The open-time raise is confined to the entries this node appended in position
 
+> **Amended by [ADR-244](#adr-244--a-restore-re-derives-the-held-marks-from-the-backups-own-vector).** "The backup format" below still holds that
+> `OPLOG_HELD` is not in a backup, but its consequence no longer does: a restore
+> re-derives the marks from the backup's own vector, so a restored node does not
+> count the entries its source held as state. The residual accepted there was a
+> write lost for good, not a narrow window, and its fix needs no backup tag.
+
 > **Amended by [ADR-166](#adr-166--three-claims-the-code-does-not-support).**
 
 > **Overturned in part by [ADR-169](#adr-169--an-entry-held-as-state-is-released-when-it-arrives-in-a-contiguous-window).** "An append of that key
@@ -15180,6 +15186,11 @@ must, when the guard is widened to refuse every removal.
 ---
 
 ## ADR-166 — Three claims the code does not support
+
+> **Amended by [ADR-244](#adr-244--a-restore-re-derives-the-held-marks-from-the-backups-own-vector).** The corrected ADR-160 paragraph below says the
+> restore residual reaches any node that has ever taken a snapshot from a busy
+> peer, and keeps the trade. The trade is withdrawn: a restore re-derives the held
+> marks, with no backup tag.
 
 **Decision.** Three statements in ADR-160, ADR-161 and ADR-162, and two
 comments in `snapshot.rs`, are corrected against what the code does. No
@@ -28766,6 +28777,12 @@ vectors carry holds:
   shrunk and the vectors above the target: ADR-044's failure, entered by another door.
 - **Not touched:** `OPLOG_COLLECTED` and the horizon, and the `state_held` rows (ADR-224). A hole above the target
   can cost a peer one extra `StateHeld` snapshot, never a silent gap.
+- **With a restore's marks** ([ADR-244](#adr-244--a-restore-re-derives-the-held-marks-from-the-backups-own-vector)).
+  `kimmyd restore --until` restores, opens and then rewinds. The restore marks every restored entry stamped above the
+  backup's vector for its origin as held, so the open raises nothing over it. The rewind removes every entry above its
+  target with its mark, and its lowering never raises and leaves held entries out of `kept[X]`, so it claims none of
+  the held entries it keeps. The two compose, and invariant I holds after both
+  (`restore_page_state.rs`: `a_restore_until_does_not_claim_a_row_held_as_state`).
 
 **What a re-fetch can bring back.** Lowering to `max(F, kept[X], collected[X])` asks peers again for entries above
 it. None of them is an insert whose later delete's tombstone this member has collected, under the operator rule
@@ -28825,20 +28842,124 @@ peer is told `Collected`), `a_rewind_of_a_restored_store_after_retention_keeps_t
 oplog window passed, the tombstones kept) and a rewind step, taken by named rows only, and its ghost forgets a write a
 rewind undid that no other member witnessed. Its rows, on every route: the case above with a control without the
 rewind; a restored document and a loser it judged (one member rewound, and every member); a restored document and a
-grant; a loser above the target; a restored entry that arrived after a retention pass below what it collected; and
-a re-fetch after a rewind that meets a held tombstone, or is not asked for once the delete's entry is collected. `a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_document_repair`
+grant; a document put back to a delete; an entry held as state, never counted as kept; a loser above the target; a
+restored entry that arrived after a retention pass below what it collected; and a re-fetch after a rewind that meets
+a held tombstone, or is not asked for once the delete's entry is collected. `a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_document_repair`
 pins the repair's case, and the cluster harness's
 `a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_write` runs it through real processes and the
 real repair. Mutation rows, in bash, each failing a test with only its own change: the servable vector not lowered;
 the witnessed vector not lowered; each vector rebuilt from the oplog as 0.51 did; the witnessed vector set to the
 lowered servable one; the verified record not written; no bound under a restored document; the bound without
-`kept[X]`; the bound without `collected[X]`; the lowering in a second transaction; the start not folding the records; the start folding only the
+`kept[X]`; the bound without `collected[X]`; the bound leaving out a document put back to a delete; held entries
+counted as kept; the lowering in a second transaction; the start not folding the records; the start folding only the
 member's own origin; the minted tombstones not recorded; the minted tombstone recorded only when an own entry was
 discarded. **Equivalent: lowering only the origins the rewind discarded an entry of.** An origin whose coverage
 reaches past the target with nothing of it discarded covers there only writes this member never appended: an entry
 never shipped (ADR-029), a definition refused as a rival, which is judged the same again, or a write superseded or
 judged against a write of a document the rewind restores, which the bound under `F` lowers anyway, or removes, whose
 tombstone outranks it.
+
+---
+
+## ADR-244 — A restore re-derives the held marks from the backup's own vector
+
+> **Amends [ADR-160](#adr-160--the-open-time-raise-is-confined-to-the-entries-this-node-appended-in-position)
+> and [ADR-166](#adr-166--three-claims-the-code-does-not-support).** Not a rollback boundary: no backup tag,
+> format, table, key, schema or wire change, and `I_EPOCH` is unchanged.
+
+**The case.** B inserts `orders/1`, then `items/101`. D, which took B's earlier writes by entries, takes `items` by a
+scoped page, so the row of `items/101` is held as state (ADR-160) and grants D no coverage of B. D is backed up and
+restored. A backup does not carry `OPLOG_HELD`, so the restored store had no marks. Its first open, which
+`kimmyd restore` itself makes to read the replay floor, walked the oplog, found the page's row unmarked above the
+vector, raised both vectors over it, and recorded the vector verified. D's pulls then started past `orders/1` and
+never took it. A document written once and not touched again never reached D, though D's witnessed vector covered B's
+servable one and its catching-up marker cleared by dominance. A member that pulled B's origin from D lost it too. A
+backup taken part-way through a whole-database snapshot lost the later pages' documents the same way: the pull's
+progress is node-local and not in a backup, so the restored member never resumes it. Reproduced on 0.51.0; every build
+since ADR-160 behaves the same.
+
+**What the divergence check did with it.** Both halves see a lost insert: the live counts differ, and so do the cut
+digests. The digest repair (ADR-237) leaves it as `left`: the restored member holds nothing for the id, and the row is
+not young, because a restore resets the tombstone horizon to the open's start time. The count half's replay (ADR-148)
+brings it back while the origin keeps the entry. The digest repair heals a lost update of a document the member held.
+A lost insert whose count difference another difference in the same collection cancels stays lost, and until a repair
+runs, the member serves reads without the document and passes the gap on to members that pull from it.
+
+**Decision.** `restore_with` marks every restored oplog entry stamped above the restored `OPLOG_VERSIONS` entry for its
+origin, in its own write transaction, after the records. The first open then raises nothing, both vectors are the
+backup's servable vector, and the member takes the history around those entries again. It takes it by entries from its
+position, which releases each mark as its entry arrives in a contiguous window (ADR-169), or by a snapshot from a peer
+whose horizon it is past. The `restored a backup` line says how many it marked (`held`).
+
+**Why it is exact.** A backup is read in one read transaction of an open member. That member's open established
+invariant I (ADR-173's addendum of 2026-09-26) and every writer keeps it, so every entry above its servable vector for
+its origin was marked held there. The marks the restore derives are therefore exactly the source's marks that withheld
+a raise. A mark the source kept on an entry at or below its vector, one no grant or window had released yet, withheld
+nothing and is not carried. The member's own origin follows the same rule: a write of its own that it holds only as
+state does not raise its own position, so the start's replay of its own origin (`own_position_at_open`) still begins
+below it.
+
+**With a rewind.** `kimmyd restore --until` restores, opens and then rewinds. The rewind removes every entry above its
+target together with its mark, and whatever it does to the vectors must not raise them over a held entry, which ADR-160
+requires of it as of every writer. The marks the restore derived then stand on exactly the held entries the rewind kept,
+and invariant I holds after it.
+
+**The residual ADR-160 accepted is withdrawn.** ADR-160 left `OPLOG_HELD` out of the backup and accepted that "a
+restored node counts every entry and raises over the held ones", because carrying the table needed a backup tag that
+an older build's restore refuses. ADR-166 widened the residual to every member that has ever taken a snapshot from a
+busy sender, and kept the trade. The trade rested on the tag. Deriving the marks needs none.
+
+**Cost.** One pass over the restored oplog's keys inside the restore's transaction; no value is decoded. A backup from
+a build older than invariant I could hold an entry above its vector that its source held in position. That entry is
+marked, so the restored member asks for the history again instead of claiming it, which is the conservative direction.
+
+**Rollback.** The format does not move. A backup written by this build restores on 0.51 as before, and a 0.51 restore
+still raises over what the backup's source held as state. A store this build restored, opened by 0.51, keeps its marks,
+because 0.51 reads `OPLOG_HELD`. A member restored by 0.51 or earlier keeps the vector its open raised, since the raise
+was recorded as verified, and upgrading does not lower it. `operations.md` says how to tell whether a member is in that
+state and what to do about it.
+
+**Alternatives.**
+- *Carry `OPLOG_HELD` under a new tag.* 0.51's restore would refuse a backup of any member holding marks, which is a
+  rollback boundary, and a 0.51 backup restored by this build would still carry no marks, so this change would be
+  needed anyway.
+- *Carry the marks as `META` rows*, as ADR-224 carries its holes. 0.51 would copy them and not read them, but they
+  would still need deriving for older backups, and they add nothing to that.
+- *Record the vector verified at the restore*, to skip the first open's walk. A separate optimisation, not taken.
+- *Make every open mark instead of raise.* That would remove ADR-054's repair of a stale vector from every store, which
+  is wider than the restore needs.
+
+**Tests.** `kimmy-storage`, in `tests/restore_page_state.rs`:
+- a restored member takes the write a scoped page jumped over, at fixed stamps and on the real clock, the second with a
+  document written once and never again while B writes on after the restore;
+- its two vectors are the backup's servable vector;
+- a member pulling from it takes what the page jumped over;
+- a member restored part-way through a whole-database snapshot takes the later pages by entries, and holds nothing as
+  state at the end;
+- `restore --until` over a held row does not claim it;
+- the member's own position does not rise over a write of its own held as state.
+
+- a backup whose vector names two origins at different positions: the restore marks the lower origin's held row and
+  nothing of the higher origin's, and the member takes the lower origin's write below the row.
+
+In `backup::tests`: the restored marks are exactly the entries above the backup's vector, a stale mark on a covered
+entry is not carried, and a backup of a member that holds nothing as state restores no mark. The invariant model test
+in `verified::tests` asserts, after every restore it runs, that both vectors are the backup's servable vector.
+
+Mutations, in bash, each failing a test with only that change:
+- the marking removed;
+- `>=` in place of `>`;
+- `<` in place of `>`;
+- the comparison made against an empty vector;
+- one threshold for every origin, the vector's lowest position (it marks the entries of origins held further ahead);
+- one threshold for every origin, the vector's highest position (it leaves the held rows of origins held further
+  behind unmarked);
+- origins the vector does not name skipped (it leaves a row of an origin the member holds nothing of in position
+  unmarked).
+
+One more is argued equivalent rather than run: marking in a second transaction after the records commit behaves the same
+in every test and differs only on a crash between the two commits, which is why the marks are written in the records'
+transaction.
 
 ---
 

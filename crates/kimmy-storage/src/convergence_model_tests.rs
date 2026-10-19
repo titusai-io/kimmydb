@@ -3003,6 +3003,63 @@ fn row_a_rewind_after_retention_keeps_the_members_collected_drop() {
     );
 }
 
+/// Every route, pure entries included (no repair loop), converges and ends as `expect`.
+fn row_strict(name: &str, ops: &[Op], expect: Expect) {
+    let mut outcomes = check_routes(ops, &[Route::Entries, Route::Pages]);
+    let mut bad = Vec::new();
+    for outcome in &mut outcomes {
+        expected_end(ops, outcome, expect);
+        let failures: Vec<String> = outcome
+            .failures
+            .iter()
+            .filter(|f| f.category != Category::DocsAfterAgeOut)
+            .map(|f| format!("{:?}: {}", f.category, f.detail))
+            .collect();
+        if !failures.is_empty() {
+            bad.push(format!("{:?}: {failures:?}\n{}", outcome.route, outcome.report));
+        }
+    }
+    assert!(bad.is_empty(), "{name}:\n{}", bad.join("\n"));
+}
+
+/// The bound counts a document put back to a delete (ADR-243). B deletes `orders/1` at t120;
+/// C's t150 write of it loses on B to B's own t300 write. The rewind to t200 puts the document
+/// back to B's t120 delete, and B's coverage of C comes down to that restored entry, so B asks
+/// for C's write again and takes it over the restored tombstone. Every route, pure entries
+/// included.
+#[test]
+fn row_a_rewind_that_restores_a_document_to_a_delete_asks_again_for_a_loser_it_judged() {
+    let ops = parse(
+        "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+         B.delete(orders/1)@120; C.write(orders/1)@150; B.write(orders/1)@300; B<-C entries; \
+         A<-C entries; B.rewind@200",
+    );
+    row_strict("a document put back to a delete", &ops, &[(ORDERS, Some(&[1]))]);
+}
+
+/// The bound never counts an entry held as state as kept (ADR-243, ADR-160). C's t150 write of
+/// `orders/1` loses on B to B's own t300 write; C's t160 and t170 rows reach B by a scoped page
+/// and are held above B's coverage of C. The rewind puts `orders/1` back to A's t110 entry;
+/// counted as kept, the held rows would keep B's coverage of C over the t150 write, and B would
+/// never ask for it again. Every route, pure entries included.
+#[test]
+fn row_a_rewind_never_counts_an_entry_held_as_state_as_kept() {
+    let pre = "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+               C.write(orders/1)@150; B.write(orders/1)@300; B<-C entries; C.write(orders/2)@160; \
+               C.write(orders/3)@170; B<-C scoped(orders); A<-C entries";
+    let mut cluster = Cluster::new(base());
+    cluster.run(&parse(pre)).expect("the schedule runs");
+    assert!(
+        cluster.e(B as usize).held_marks().expect("marks") > 0,
+        "premise: B holds C's later rows as state"
+    );
+    row_strict(
+        "an entry held as state",
+        &parse(&format!("{pre}; B.rewind@200")),
+        &[(ORDERS, Some(&[1, 2, 3]))],
+    );
+}
+
 /// A rewind that restores a document to an entry that arrived after a retention pass, stamped
 /// below what the pass collected. B drops `items` at t170; A's t190 write is B's newest entry,
 /// so B's retention pass collects B's own drop and keeps A's write. C, cut off until then,

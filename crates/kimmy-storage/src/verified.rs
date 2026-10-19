@@ -13,8 +13,9 @@
 //! The record is its own table, [`tables::VECTOR_VERIFIED`], and not a key in
 //! `META`, because a backup copies `META` and lists its tables by hand: no
 //! build's backup carries a table it does not list, so a restore -- which
-//! omits `OPLOG_HELD` and so can leave I broken -- never carries the record,
-//! whichever build restores it.
+//! does not carry `OPLOG_HELD`, and before ADR-244 left I broken, as an older
+//! build's restore still does -- never carries the record, whichever build
+//! restores it.
 
 use redb::{ReadTransaction, ReadableDatabase, WriteTransaction};
 
@@ -811,6 +812,7 @@ mod tests {
                     }
                 }
                 Op::Restore => {
+                    let servable = self.engine().version_vector().unwrap();
                     let mut backup = Vec::new();
                     self.engine().backup_to(&mut backup, crate::WalkScope::Request).unwrap();
                     self.close();
@@ -820,6 +822,11 @@ mod tests {
                     self.dirs.push(dir);
                     assert_eq!(record_of(&self.path), None, "a restore carries no record");
                     self.open();
+                    // The restore re-derives the held marks, so its open raises
+                    // nothing: the member claims the backup's servable vector, for
+                    // both vectors, and not an entry it held as state (ADR-244).
+                    assert_eq!(self.engine().version_vector().unwrap(), servable);
+                    assert_eq!(self.engine().witnessed_vector().unwrap(), servable);
                 }
                 Op::StaleSchema => {
                     self.close();

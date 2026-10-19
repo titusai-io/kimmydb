@@ -4813,14 +4813,17 @@ async fn a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_wri
         }
     })
     .await;
+    eprintln!("every member holds C's write {} ms after the start", started.elapsed().as_millis());
+    // A repair is counted when its pull ends, which can be after the page that wrote the row.
     let series = "kimmy_sync_digest_repairs_total{outcome=\"applied\"}";
-    let by_a = a.gauge(&client, series).await.unwrap_or(0);
-    let by_b = b.gauge(&client, series).await.unwrap_or(0);
-    eprintln!(
-        "repaired after {} ms: digest repairs applied A={by_a} B={by_b}",
-        started.elapsed().as_millis()
-    );
-    assert!(by_a + by_b >= 1, "the document repair took C's row");
+    eventually("the document repair to count what it applied", || {
+        let (client, a, b) = (&client, &a, &b);
+        async move {
+            a.gauge(client, series).await.unwrap_or(0) + b.gauge(client, series).await.unwrap_or(0)
+                >= 1
+        }
+    })
+    .await;
 }
 
 /// Every member of a cluster rewound to one target (`kimmyd restore --until`, the documented

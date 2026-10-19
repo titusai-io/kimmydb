@@ -90,6 +90,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "backup::restore_with",
+        "`kimmyd restore`, which writes a new store offline before any node opens it: the held marks are derived from the oplog it just wrote (ADR-244)",
+    ),
+    (
         "database_tombstone::Engine::record_database_tombstone_in",
         "the dropped-collection registry, one row per drop, read once when a database's tombstone is raised (ADR-236)",
     ),
