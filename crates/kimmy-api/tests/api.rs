@@ -6419,6 +6419,53 @@ async fn searching_a_collection_with_no_vectors_says_so() {
     assert!(message.contains("/vectors"), "the message must say how to fix it: {message}");
 }
 
+/// A vector whose squared length overflows a 32-bit float is refused where
+/// it enters, as a client's chunk and as a query (ADR-241): a component of
+/// 3e38 is finite, and its square is not, so every distance to the vector is
+/// NaN and every graph search that met it would panic. (A component past
+/// `f32::MAX` is already refused by the body's parse, as out of range.)
+#[tokio::test]
+async fn a_vector_too_large_to_score_is_refused_as_a_chunk_and_as_a_query() {
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    server
+        .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": "a", "text": "a" }))
+        .await;
+    for vector in [json!([3e38, 0.0, 0.0]), json!([2e19, 2e19, 0.0])] {
+        let stored = server
+            .put(
+                "/v1/db/shop/coll/docs/docs/a/vectors",
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": "a" }]),
+            )
+            .await;
+        assert_eq!(stored.status, 400, "{vector}: {:?}", stored.body);
+        assert_eq!(stored.body["error"], "bad_request");
+        assert!(
+            stored.body["message"].as_str().unwrap_or_default().contains("too large to score"),
+            "{:?}",
+            stored.body
+        );
+    }
+    let stored = server
+        .put(
+            "/v1/db/shop/coll/docs/docs/a/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "a" }]),
+        )
+        .await;
+    assert_eq!(stored.status, 200, "the control: {:?}", stored.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [3e38, 0.0, 0.0] }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+}
+
 /// The check behind `no_vectors` stops at the first vector it finds rather
 /// than counting them (ADR-153's addendum), and a deleted vector is not one:
 /// a collection whose every vector row is a tombstone answers exactly as one

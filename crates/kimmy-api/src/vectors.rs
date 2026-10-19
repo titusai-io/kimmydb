@@ -1466,6 +1466,17 @@ mod tests {
 
     use super::*;
 
+    /// A search that saw the request's deadline pass answers as a request
+    /// that ran out of time does: `503`, `timeout`.
+    #[test]
+    fn a_search_past_its_deadline_answers_as_a_timeout() {
+        let e = vector_error(kimmy_vector::VectorError::DeadlineExceeded);
+        let timeout = ApiError::timeout(crate::limits::DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(e.status, timeout.status);
+        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.code, timeout.code);
+    }
+
     fn live_state(dir: &tempfile::TempDir) -> SharedState {
         live_state_with(dir, kimmy_vector::ProviderPolicy::default())
     }
