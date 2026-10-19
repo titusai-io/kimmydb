@@ -5732,3 +5732,85 @@ async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_dead_peers
     let took = x_and_m_alone_together(&client, &x, &m).await;
     assert!(took < Duration::from_secs(30), "X and M took {took:?}");
 }
+
+// ---------------------------------------------------------------------------
+// A restarted member is taken at once (ADR-242)
+// ---------------------------------------------------------------------------
+
+/// How many times this run of `node` rejoined the cluster.
+fn rejoins(node: &Node) -> usize {
+    node.log().matches("rejoined the cluster").count()
+}
+
+/// The incarnation `node`'s data directory records.
+fn recorded_incarnation(node: &Node) -> u64 {
+    let path = node.dir.path().join("data").join(kimmy_cluster::membership::incarnation::FILE);
+    std::fs::read_to_string(&path).unwrap().trim().parse().unwrap()
+}
+
+/// `node` is ready, every member sees both others live, and the members have
+/// had longer than SWIM's suspicion time (4.8 s) since: a suspicion a peer held
+/// of the member's last identity has run out by then.
+async fn retaken(client: &reqwest::Client, nodes: [&Node; 3], node: &Node) {
+    node.wait_ready(client).await;
+    eventually("every member to see both others live", || all_report(client, nodes.to_vec(), 2))
+        .await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+}
+
+/// A restarted member's first identity is one above the incarnation its last
+/// run recorded, so its peers take it at once: no rejoin at any start, whether
+/// they had declared it down, still held it live, or it had renewed in its last
+/// run. Before ADR-242 every start was at incarnation 0 and renewed one step at
+/// a time past the identity its peers held, each step dropping the blocks it
+/// held, and the walk grew by one at every restart they noticed: the starts
+/// after a stop the peers declared down took 1, 2 and 3 rejoins here.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_restarted_member_is_taken_by_its_peers_at_once() {
+    let client = reqwest::Client::new();
+    let (a, mut b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let mut last = recorded_incarnation(&b);
+    assert_eq!(last, 0, "a first start records 0");
+
+    let declared_down = || async {
+        a.members_gauge(&client).await == Some(1) && c.members_gauge(&client).await == Some(1)
+    };
+    for cycle in 1..=2 {
+        b.signal("TERM");
+        b.wait_exit(Duration::from_secs(60));
+        eventually("A and C to declare B down", declared_down).await;
+        b.restart_with(&[]);
+        retaken(&client, [&a, &b, &c], &b).await;
+        assert_eq!(rejoins(&b), 0, "start {cycle} after B was declared down rejoined");
+        assert_eq!(recorded_incarnation(&b), last + 1, "one above the last");
+        last += 1;
+    }
+
+    // Renewed in its run: frozen until its peers declare it down, then resumed.
+    b.signal("STOP");
+    eventually("A and C to declare the frozen B down", declared_down).await;
+    b.signal("CONT");
+    eventually("B to be live again", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    assert!(rejoins(&b) >= 1, "premise: B renewed in its run");
+    let renewed = recorded_incarnation(&b);
+    assert!(renewed > last, "the renewal is recorded: {renewed} after {last}");
+    b.signal("TERM");
+    b.wait_exit(Duration::from_secs(60));
+    eventually("A and C to declare B down", declared_down).await;
+    b.restart_with(&[]);
+    retaken(&client, [&a, &b, &c], &b).await;
+    assert_eq!(rejoins(&b), 0, "the start after a renewal rejoined");
+    last = renewed + 1;
+    assert_eq!(recorded_incarnation(&b), last);
+
+    // Restarted at once: its peers may still hold it live, or suspect it.
+    for cycle in 1..=2 {
+        b.restart_with(&[]);
+        retaken(&client, [&a, &b, &c], &b).await;
+        assert_eq!(rejoins(&b), 0, "quick restart {cycle} rejoined");
+        assert_eq!(recorded_incarnation(&b), last + 1);
+        last += 1;
+    }
+}
