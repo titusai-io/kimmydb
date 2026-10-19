@@ -215,12 +215,12 @@ impl Engine {
 
         // Everything is decided. Now write.
         let mut outcome = RewindOutcome::default();
-        // The newest tombstone stamp this rewind mints, for the record: no oplog
-        // entry and no vector names it, and a start resumes the clock past it.
-        let mut minted: Option<Stamp> = None;
         // The lowest stamp among the entries the rewind restores: the vectors are
         // bounded by it as well (`Engine::lower_vectors_in`).
         let mut restored_floor: Option<Hlc> = None;
+        // Whether the rewind removed a document it holds no entry of at or below
+        // the target: the vectors are then bounded by the horizon as well.
+        let mut removed_any = false;
         let schema = Engine::schema_for_record(self.db())?;
         let txn = self.begin_write(WriterHolder::Rewind)?;
         {
@@ -278,24 +278,31 @@ impl Engine {
                             )));
                         }
                     },
-                    // Deleted at the target, or not yet created: both end as a
-                    // tombstone, which is what a delete leaves anyway.
-                    _ => {
-                        let stamp = match restore_to.as_ref() {
-                            Some(entry) => entry.stamp,
-                            None => {
-                                let stamp = self.next_stamp();
-                                minted = minted.max(Some(stamp));
-                                stamp
-                            }
-                        };
+                    // Deleted at the target: the delete's own tombstone, at its own
+                    // stamp, at or below the target.
+                    Some(entry) => {
                         crate::live_count::put_record(
                             &txn,
                             &mut docs,
                             collection_id,
                             &key,
-                            &codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(stamp)),
+                            &codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(
+                                entry.stamp,
+                            )),
                         )?;
+                        outcome.removed += 1;
+                        None
+                    }
+                    // Not yet created, as far as this member's oplog says: the row
+                    // goes, and no tombstone takes its place. The member can have
+                    // judged a write of the document at or below the target against
+                    // the insert it discards, a write it never appended; a tombstone
+                    // would outrank that write wherever it is kept, and any stamp
+                    // one could carry either does that or is another write's
+                    // (ADR-246).
+                    None => {
+                        crate::live_count::remove_record(&txn, &mut docs, collection_id, &key)?;
+                        removed_any = true;
                         outcome.removed += 1;
                         None
                     }
@@ -371,14 +378,6 @@ impl Engine {
                     _ => {}
                 }
             }
-            // The tombstones it minted go in the record under this member's own
-            // origin: they are above everything it discarded, and a start resumes
-            // the clock past the record (`Engine::resume_hlc`). No entry of
-            // this member's stands between them and what it discarded, so a token
-            // check reads the record exactly as before.
-            if let Some(stamp) = minted {
-                discarded.observe(stamp);
-            }
             // In the same transaction as the removal: a change stream may have
             // delivered what was just discarded, and a token naming it has to
             // be told from one naming an entry this member never held (ADR-173).
@@ -399,10 +398,18 @@ impl Engine {
         // down to it, in this transaction: left high, this node would claim history
         // it no longer holds, and no peer would ever send that range again; lowered
         // in a transaction of their own, a failure between the two would leave them
-        // so. To the target, and below it only as far as a restored document asks:
-        // a vector lowered further loses coverage of what retention collected, this
-        // member's own drops among them (ADR-243).
-        Engine::lower_vectors_in(&txn, schema, until, restored_floor)?;
+        // so. To the target, and below it only as far as a restored or removed
+        // document asks, and never below what retention collected (ADR-243). A
+        // removed document asks for every write of it above the horizon the member
+        // may have judged, and no lower: below the horizon a re-fetch can bring
+        // back an insert whose delete and tombstone retention collected here, from
+        // a peer whose own pass has not run yet (ADR-246).
+        let floor = if removed_any {
+            Some(restored_floor.map_or(horizon, |floor| floor.min(horizon)))
+        } else {
+            restored_floor
+        };
+        Engine::lower_vectors_in(&txn, schema, until, floor)?;
         txn.commit()?;
 
         info!(
@@ -427,10 +434,7 @@ impl Engine {
     }
 }
 
-/// One rewind: its target, and per origin the newest stamp it discarded. Under this
-/// member's own origin, no lower than the newest tombstone it minted for a document
-/// created after the target, which is above everything it discarded and stamps no
-/// entry.
+/// One rewind: its target, and per origin the newest stamp it discarded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Rewound {
     pub until: Hlc,
@@ -601,15 +605,43 @@ mod tests {
     #[test]
     fn a_document_created_after_the_target_is_removed() {
         let (engine, _dir) = engine();
-        let coll = engine.create_collection("shop", "orders").unwrap();
-        engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+        engine.create_collection("shop", "orders").unwrap();
+        engine
+            .create_index(
+                "shop",
+                "orders",
+                vec![IndexField { path: "sku".into(), descending: false }],
+                false,
+                None,
+            )
+            .unwrap();
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        engine.insert(&coll, doc! { "_id": 1, "sku": "KEPT" }).unwrap();
         let target = latest(&engine);
-        engine.insert(&coll, doc! { "_id": 2 }).unwrap();
+        engine.insert(&coll, doc! { "_id": 2, "sku": "LATER" }).unwrap();
 
         let outcome = engine.rewind_to(target).unwrap();
         assert_eq!(outcome.removed, 1);
         assert!(engine.get(&coll, &DocId::Int64(2)).unwrap().is_none(), "it did not exist then");
         assert!(engine.get(&coll, &DocId::Int64(1)).unwrap().is_some(), "this one did");
+        // No tombstone takes its place: one would outrank a write of the document at
+        // or below the target that a peer keeps (ADR-246).
+        assert_eq!(
+            crate::docs::record_stamp(&engine, &coll, &DocId::Int64(2)).unwrap(),
+            None,
+            "the removed document leaves no record"
+        );
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(1), "the count follows it");
+        crate::live_count::test_support::assert_counts_exact(&engine, "a removal");
+        let index = coll.indexes.first().expect("an index");
+        let key = |v: &str| {
+            let low = kimmy_core::keyenc::encode(&bson::Bson::String(v.into())).unwrap();
+            let mut high = low.clone();
+            high.push(0xff);
+            engine.index_candidates(&coll, index.id, &low, &high).unwrap()
+        };
+        assert!(key("LATER").is_empty(), "the removed document leaves the index");
+        assert!(!key("KEPT").is_empty(), "the kept one stays in it");
     }
 
     #[test]
@@ -835,22 +867,32 @@ mod tests {
 
     #[test]
     fn a_rewind_lowers_every_origin_it_discarded_to_the_target_and_no_lower() {
+        // Both origins write document 5 after the target, which is the stamp of C's
+        // insert of it: the rewind discards both writes and puts the document back
+        // to that insert, so the bound under the restored entry is the target itself.
         let base = base();
         let ((b, _db), (c, _dc)) = (engine(), engine());
         at(&b, base, 50);
         let orders = b.create_collection("shop", "orders").unwrap();
         pull(&c, &b);
-        at(&b, base, 100);
-        b.insert(&orders, doc! { "_id": 1 }).unwrap();
-        at(&c, base, 300);
-        c.insert(&c.get_collection("shop", "orders").unwrap(), doc! { "_id": 9 }).unwrap();
+        let theirs = c.get_collection("shop", "orders").unwrap();
+        at(&c, base, 150);
+        c.insert(&theirs, doc! { "_id": 5, "v": "c" }).unwrap();
+        let until = c.version_vector().unwrap().get(c.node_id());
         pull(&b, &c);
-        at(&b, base, 400);
-        b.insert(&orders, doc! { "_id": 2 }).unwrap();
+        at(&b, base, 300);
+        b.replace(&orders, &DocId::Int64(5), doc! { "_id": 5, "v": "b" }, false).unwrap();
+        pull(&c, &b);
+        at(&c, base, 400);
+        c.replace(&theirs, &DocId::Int64(5), doc! { "_id": 5, "v": "c2" }, false).unwrap();
+        pull(&b, &c);
 
-        let until = Hlc::new(base + 200, 0);
         let outcome = b.rewind_to(until).unwrap();
-        assert_eq!(outcome.oplog_discarded, 2, "c's write and b's own second write");
+        assert_eq!(
+            (outcome.oplog_discarded, outcome.reverted),
+            (2, 1),
+            "b's write and c's second write, and the document put back"
+        );
         for (vector, name) in [
             (b.version_vector().unwrap(), "servable"),
             (b.witnessed_vector().unwrap(), "witnessed"),
@@ -935,17 +977,17 @@ mod tests {
     }
 
     #[test]
-    fn a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded_and_minted() {
+    fn a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded() {
         // The clock after a rewind. A member whose clock led its wall clock (a
         // fast peer's clock reached it) rewinds past two of its own inserts: it
-        // discards them and mints a tombstone for each document. Neither the
-        // oplog's tail nor a vector names any of those stamps afterwards, so a
-        // start resumed below them: its next write was stamped inside the range
-        // the rewind's record says it discarded, and below its own tombstones.
+        // discards them and removes both documents. Neither the oplog's tail nor a
+        // vector names those stamps afterwards, so a start resumed below them: its
+        // next write was stamped inside the range the rewind's record says it
+        // discarded.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         let ahead = crate::engine::physical_now_ms() + 60 * 60 * 1000;
-        let (discarded, minted) = {
+        let discarded = {
             let engine = Engine::open(&path).unwrap();
             let coll = engine.create_collection("shop", "orders").unwrap();
             engine.insert(&coll, doc! { "_id": 1 }).unwrap();
@@ -956,16 +998,15 @@ mod tests {
             let discarded = latest(&engine);
             let outcome = engine.rewind_to(target).unwrap();
             assert_eq!((outcome.oplog_discarded, outcome.removed), (2, 2));
-            let minted = [2, 3]
-                .map(|id| {
-                    crate::docs::record_stamp(&engine, &coll, &DocId::Int64(id)).unwrap().unwrap()
-                })
-                .into_iter()
-                .max()
-                .unwrap();
-            assert!(minted.hlc > discarded, "the tombstones are minted above what was discarded");
+            for id in [2, 3] {
+                assert_eq!(
+                    crate::docs::record_stamp(&engine, &coll, &DocId::Int64(id)).unwrap(),
+                    None,
+                    "a removed document leaves no record, so no stamp of the rewind's own"
+                );
+            }
             engine.close().unwrap();
-            (discarded, minted)
+            discarded
         };
 
         let engine = Engine::open(&path).unwrap();
@@ -976,7 +1017,6 @@ mod tests {
             next.hlc > discarded,
             "the next write must be stamped above what the rewind discarded"
         );
-        assert!(next > minted, "and above the tombstones the rewind minted");
         assert!(
             !engine.rewinds().unwrap().iter().any(|rewind| rewind.discarded(&next)),
             "so a token naming it is not read as naming a discarded entry"
@@ -1025,33 +1065,151 @@ mod tests {
     }
 
     #[test]
-    fn a_start_resumes_past_a_tombstone_minted_for_a_peers_insert() {
-        // The rewind removes a document a peer created, discarding none of this
-        // member's own entries, and mints the tombstone under its own origin.
+    fn a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged() {
+        // C's t150 insert of document 1 reaches B after B's own t300 insert of it,
+        // loses last-writer-wins and is witnessed without an append. B's oplog holds
+        // no entry of the document at or below t200, so the rewind removes it: with no
+        // tombstone, which would outrank C's write, and with each vector bounded by
+        // what it keeps and collected, so B asks C again by entries and takes the
+        // write (ADR-246). Nothing of C's origin, nor of A's, was discarded.
         let base = base();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        let (c, _dc) = engine();
-        let minted = {
-            let b = Engine::open(&path).unwrap();
-            at(&b, base, 10);
-            let orders = b.create_collection("shop", "orders").unwrap();
-            pull(&c, &b);
-            at(&c, base, 300);
-            c.insert(&c.get_collection("shop", "orders").unwrap(), doc! { "_id": 9 }).unwrap();
-            pull(&b, &c);
-            let out = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
-            assert_eq!((out.oplog_discarded, out.removed), (1, 1));
-            let minted = crate::docs::record_stamp(&b, &orders, &DocId::Int64(9)).unwrap().unwrap();
-            assert_eq!(minted.node, b.node_id());
-            b.close().unwrap();
-            minted
-        };
-        let b = Engine::open(&path).unwrap();
-        let orders = b.get_collection("shop", "orders").unwrap();
-        b.insert(&orders, doc! { "_id": 10 }).unwrap();
-        let next = crate::docs::record_stamp(&b, &orders, &DocId::Int64(10)).unwrap().unwrap();
-        assert!(next > minted, "the next write above the minted tombstone: {next:?} vs {minted:?}");
+        let ((a, _da), (b, _db), (c, _dc)) = (engine(), engine(), engine());
+        at(&a, base, 100);
+        a.create_collection("shop", "orders").unwrap();
+        pull(&b, &a);
+        pull(&c, &a);
+        let (mine, theirs) = (
+            b.get_collection("shop", "orders").unwrap(),
+            c.get_collection("shop", "orders").unwrap(),
+        );
+        at(&c, base, 150);
+        c.insert(&theirs, doc! { "_id": 1, "v": "c" }).unwrap();
+        let judged = crate::docs::record_stamp(&c, &theirs, &DocId::Int64(1)).unwrap().unwrap();
+        at(&b, base, 300);
+        b.insert(&mine, doc! { "_id": 1, "v": "b" }).unwrap();
+        pull(&b, &c);
+        assert!(
+            b.witnessed_vector().unwrap().get(c.node_id()) >= judged.hlc,
+            "premise: B witnessed C's write"
+        );
+        assert_eq!(
+            b.get(&mine, &DocId::Int64(1)).unwrap().unwrap().get_str("v").unwrap(),
+            "b",
+            "premise: C's write lost on B"
+        );
+        let created = a.version_vector().unwrap().get(a.node_id());
+
+        let outcome = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
+        assert_eq!((outcome.removed, outcome.oplog_discarded), (1, 1));
+        assert_eq!(
+            crate::docs::record_stamp(&b, &mine, &DocId::Int64(1)).unwrap(),
+            None,
+            "no tombstone takes the document's place"
+        );
+        for (vector, name) in [
+            (b.version_vector().unwrap(), "servable"),
+            (b.witnessed_vector().unwrap(), "witnessed"),
+        ] {
+            assert_eq!(vector.get(c.node_id()), Hlc::ZERO, "{name}: C's origin keeps nothing here");
+            assert_eq!(vector.get(b.node_id()), Hlc::ZERO, "{name}: B's own insert was discarded");
+            assert_eq!(vector.get(a.node_id()), created, "{name}: A's at the entry it keeps");
+        }
+        pull(&b, &c);
+        assert_eq!(
+            crate::docs::record_stamp(&b, &mine, &DocId::Int64(1)).unwrap(),
+            Some(judged),
+            "B takes C's write again"
+        );
+    }
+
+    #[test]
+    fn a_rewind_that_removes_a_document_after_retention_keeps_the_coverage_of_what_retention_collected()
+     {
+        // Retention collects every entry of B's own origin; B then inserts a document
+        // after the target, which the rewind removes. Bounded by what it keeps alone,
+        // B's own origin would leave its coverage below what retention collected, and
+        // a peer lacking a collected entry would no longer be told so (ADR-243).
+        let base = base();
+        let ((b, _db), (c, _dc), (fresh, _df)) = (engine(), engine(), engine());
+        at(&b, base, 100);
+        let orders = b.create_collection("shop", "orders").unwrap();
+        at(&b, base, 110);
+        b.insert(&orders, doc! { "_id": 1 }).unwrap();
+        pull(&c, &b);
+        at(&c, base, 190);
+        c.insert(&c.get_collection("shop", "orders").unwrap(), doc! { "_id": 2 }).unwrap();
+        pull(&b, &c);
+        b.collect_garbage_at(base + 1730, crate::RetentionPolicy::new(1, 24 * 60 * 60)).unwrap();
+        let own = b.node_id();
+        let collected = b.oplog_collected().unwrap().get(own);
+        assert!(
+            collected > Hlc::ZERO
+                && b.read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry.stamp.node != own),
+            "the fixture must collect every entry of the member's own origin"
+        );
+        at(&b, base, 1760);
+        b.insert(&orders, doc! { "_id": 7 }).unwrap();
+
+        let outcome = b.rewind_to(Hlc::new(base + 1757, 0)).unwrap();
+        assert_eq!((outcome.removed, outcome.oplog_discarded), (1, 1));
+        for (vector, name) in [
+            (b.version_vector().unwrap(), "servable"),
+            (b.witnessed_vector().unwrap(), "witnessed"),
+        ] {
+            assert_eq!(
+                vector.get(own),
+                collected,
+                "{name}: no lower than what retention collected"
+            );
+        }
+        assert_eq!(
+            b.serve_verdict(&fresh.witnessed_vector().unwrap()).unwrap(),
+            crate::ServeVerdict::Collected,
+            "a peer that lacks what retention collected is told so"
+        );
+    }
+
+    #[test]
+    fn a_rewind_that_restores_one_document_and_removes_another_is_bounded_by_the_removal() {
+        // C inserts document 2 at t105, below A's t110 insert of document 1. B
+        // updates document 1 at t300 and inserts document 2 at t310 before C's
+        // insert reaches it, which then loses. The rewind to t200 puts document 1
+        // back to t110 and removes document 2: bounded by the restored entry alone,
+        // B's coverage of C would stay at t105 and C's write would never come again.
+        let base = base();
+        let ((a, _da), (b, _db), (c, _dc)) = (engine(), engine(), engine());
+        at(&a, base, 100);
+        let orders = a.create_collection("shop", "orders").unwrap();
+        pull(&b, &a);
+        pull(&c, &a);
+        let (mine, theirs) = (
+            b.get_collection("shop", "orders").unwrap(),
+            c.get_collection("shop", "orders").unwrap(),
+        );
+        at(&c, base, 105);
+        c.insert(&theirs, doc! { "_id": 2, "v": "c" }).unwrap();
+        let judged = crate::docs::record_stamp(&c, &theirs, &DocId::Int64(2)).unwrap().unwrap();
+        at(&a, base, 110);
+        a.insert(&orders, doc! { "_id": 1 }).unwrap();
+        pull(&b, &a);
+        at(&b, base, 300);
+        b.replace(&mine, &DocId::Int64(1), doc! { "_id": 1, "v": "b" }, false).unwrap();
+        at(&b, base, 310);
+        b.insert(&mine, doc! { "_id": 2, "v": "b" }).unwrap();
+        pull(&b, &c);
+        assert!(b.witnessed_vector().unwrap().get(c.node_id()) >= judged.hlc, "premise");
+
+        let outcome = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
+        assert_eq!((outcome.reverted, outcome.removed, outcome.oplog_discarded), (1, 1, 2));
+        pull(&b, &c);
+        assert_eq!(
+            crate::docs::record_stamp(&b, &mine, &DocId::Int64(2)).unwrap(),
+            Some(judged),
+            "B takes C's write of the removed document again"
+        );
     }
 
     #[test]
@@ -1121,7 +1279,9 @@ mod tests {
 
         let outcome = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
         assert_eq!(outcome.oplog_discarded, 1);
-        assert_eq!(b.version_vector().unwrap().get(c.node_id()), Hlc::new(base + 200, 0));
+        // The rewind removes c's insert, so c's coverage comes down to what the
+        // rewind keeps of it: nothing (ADR-246).
+        assert_eq!(b.version_vector().unwrap().get(c.node_id()), Hlc::ZERO);
     }
 
     #[test]
