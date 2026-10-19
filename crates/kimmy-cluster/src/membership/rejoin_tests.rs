@@ -5,7 +5,9 @@
 //! buffer, as the kernel's do, and its timers wait with it; a dead member takes
 //! nothing; a cut link drops what crosses it. Every two seconds each member
 //! announces itself to its seeds as the daemon's discovery offers them, through
-//! [`super::announce_targets`].
+//! [`super::announce_targets`]. A member can also be restarted: a new process,
+//! whose identity starts one above the incarnation its data directory recorded
+//! (ADR-242), as the daemon's does.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, VecDeque};
@@ -16,6 +18,7 @@ use foca::{Config, Foca, Notification, PostcardCodec, Runtime, Timer};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
+use super::incarnation::first_after;
 use super::{Member, Swim};
 use kimmy_core::NodeId;
 
@@ -35,6 +38,9 @@ struct Out {
     timers: Vec<(Timer<Member>, Duration)>,
     rejoined: bool,
     down: Vec<SocketAddr>,
+    renamed: Vec<SocketAddr>,
+    /// The renewed incarnation the daemon's step recorded.
+    recorded: Option<u64>,
 }
 
 impl Runtime<Member> for Out {
@@ -42,6 +48,7 @@ impl Runtime<Member> for Out {
         match notification {
             Notification::Rejoin(_) => self.rejoined = true,
             Notification::MemberDown(member) => self.down.push(member.addr),
+            Notification::Rename(_, new) => self.renamed.push(new.addr),
             _ => {}
         }
     }
@@ -56,7 +63,9 @@ impl Runtime<Member> for Out {
 /// The daemon's step after every input, as built.
 fn daemon(swim: &mut Swim, out: &mut Out) {
     let rejoined = out.rejoined;
-    super::after_input(swim, rejoined, &mut *out);
+    let mut recorded = None;
+    super::after_input(swim, rejoined, &mut *out, |renewed| recorded = Some(renewed));
+    out.recorded = recorded;
 }
 
 /// foca alone, without that step.
@@ -90,6 +99,16 @@ struct Node {
     rejoins: Vec<(Via, u64)>,
     /// Every member this node declared down, and when.
     downs: Vec<(SocketAddr, u64)>,
+    /// Every member this node saw renew its identity, and when.
+    renames: Vec<(SocketAddr, u64)>,
+    /// Which process of this member is running: a timer an earlier one asked
+    /// for is not delivered to a later one.
+    epoch: u64,
+    /// What its data directory's incarnation file says, `None` with no file.
+    kept: Option<u64>,
+    /// Whether a recorded renewal reaches the file (`false`: a write that
+    /// failed, or a crash before it).
+    keeps: bool,
 }
 
 /// The simulated network: nodes, a clock in milliseconds, and the timers each
@@ -99,7 +118,9 @@ struct Net {
     now: u64,
     /// `(fire at, sequence, node, timer's slot in `pending`)`.
     timers: BinaryHeap<Reverse<(u64, u64, usize, usize)>>,
-    pending: Vec<Timer<Member>>,
+    /// Each timer, with the epoch of the process that asked for it.
+    pending: Vec<(Timer<Member>, u64)>,
+    config: Config,
     seq: u64,
     next_discovery: u64,
     /// Directed links that drop what crosses them.
@@ -111,12 +132,14 @@ impl Net {
     /// `n` members; member `i` is seeded with `seeds[i]`.
     fn new(seeds: &[&[usize]], after_input: fn(&mut Swim, &mut Out)) -> Net {
         let config = Config::new_lan(std::num::NonZeroU32::new(16).unwrap());
-        let nodes = seeds
+        let nodes: Vec<Node> = seeds
             .iter()
             .enumerate()
             .map(|(i, seeds)| {
                 let addr: SocketAddr = format!("127.0.0.1:{}", 7900 + i).parse().unwrap();
-                let identity = Member::identified(addr, NodeId::from_bytes([i as u8 + 1; 16]));
+                let first = first_after(None);
+                let identity =
+                    Member::identified(addr, NodeId::from_bytes([i as u8 + 1; 16]), first);
                 let rng = StdRng::seed_from_u64(i as u64);
                 Node {
                     swim: Foca::new(identity, config.clone(), rng, PostcardCodec),
@@ -127,6 +150,10 @@ impl Net {
                     due: Vec::new(),
                     rejoins: Vec::new(),
                     downs: Vec::new(),
+                    renames: Vec::new(),
+                    epoch: 0,
+                    kept: Some(first),
+                    keeps: true,
                 }
             })
             .collect();
@@ -135,6 +162,7 @@ impl Net {
             now: 0,
             timers: BinaryHeap::new(),
             pending: Vec::new(),
+            config,
             seq: 0,
             next_discovery: 0,
             cut: BTreeSet::new(),
@@ -161,8 +189,15 @@ impl Net {
         }
         let now = self.now;
         self.nodes[node].downs.extend(out.down.iter().map(|addr| (*addr, now)));
+        self.nodes[node].renames.extend(out.renamed.iter().map(|addr| (*addr, now)));
+        if let Some(renewed) = out.recorded
+            && self.nodes[node].keeps
+        {
+            self.nodes[node].kept = Some(renewed);
+        }
+        let epoch = self.nodes[node].epoch;
         for (event, after) in out.timers {
-            self.pending.push(event);
+            self.pending.push((event, epoch));
             self.seq += 1;
             let at = self.now + after.as_millis() as u64;
             self.timers.push(Reverse((at, self.seq, node, self.pending.len() - 1)));
@@ -210,7 +245,10 @@ impl Net {
             self.now = next;
             if timer == Some(next) {
                 let Reverse((_, _, node, slot)) = self.timers.pop().unwrap();
-                let event = self.pending[slot].clone();
+                let (event, epoch) = self.pending[slot].clone();
+                if epoch != self.nodes[node].epoch {
+                    continue;
+                }
                 match self.nodes[node].life {
                     Life::Running => self.input(node, Via::Other, |swim, out| {
                         let _ = swim.handle_timer(event, out);
@@ -251,6 +289,24 @@ impl Net {
 
     fn kill(&mut self, node: usize) {
         self.nodes[node].life = Life::Dead;
+    }
+
+    /// Start a new process of `node`: a fresh SWIM instance that knows nothing,
+    /// as a restarted daemon's does, whose identity is one above what the data
+    /// directory recorded, recorded in turn before it starts
+    /// ([`super::IncarnationFile::begin`]). What the dead one buffered, and its
+    /// timers, are gone with it.
+    fn restart(&mut self, node: usize) {
+        let n = &mut self.nodes[node];
+        let first = first_after(n.kept);
+        n.kept = Some(first);
+        let identity = Member::identified(n.addr, n.swim.identity().node, first);
+        n.epoch += 1;
+        let rng = StdRng::seed_from_u64(node as u64 + 1000 * n.epoch);
+        n.swim = Foca::new(identity, self.config.clone(), rng, PostcardCodec);
+        n.life = Life::Running;
+        n.buffered.clear();
+        n.due.clear();
     }
 
     /// Resume a frozen node: the timers that came due fire, and the datagrams
@@ -482,4 +538,132 @@ fn foca_alone_leaves_a_member_that_rejoined_silent() {
             net.live_at(member)
         );
     }
+}
+
+// Restarts (ADR-242): A, B and C, each seeded with the other two, and B
+// restarted.
+const A: usize = 0;
+const B: usize = 1;
+const C: usize = 2;
+
+fn trio() -> Net {
+    Net::new(&[&[B, C], &[A, C], &[A, B]], daemon)
+}
+
+/// Kill `node`, leave it dead for `down_ms`, start it again, and give it 12 s
+/// (a probe, its round trip, the suspicion time and two discovery intervals):
+/// answers its rejoins since the start and the renames of it its peers saw.
+/// Every member sees every other live by then.
+fn restart_once(net: &mut Net, node: usize, down_ms: u64) -> (usize, usize) {
+    net.kill(node);
+    net.run_for(down_ms);
+    let since = net.now;
+    net.restart(node);
+    net.run_for(12_000);
+    let rejoins = net.nodes[node].rejoins.iter().filter(|(_, at)| *at >= since).count();
+    let addr = net.nodes[node].addr;
+    let renames = (0..net.nodes.len())
+        .filter(|peer| *peer != node)
+        .map(|peer| {
+            net.nodes[peer].renames.iter().filter(|(of, at)| *of == addr && *at >= since).count()
+        })
+        .sum();
+    for member in 0..net.nodes.len() {
+        assert_eq!(
+            net.live_at(member).len(),
+            net.nodes.len() - 1,
+            "member {member} sees every other live 12 s after {node}'s start"
+        );
+    }
+    (rejoins, renames)
+}
+
+fn incarnation(net: &Net, node: usize) -> u64 {
+    net.nodes[node].swim.identity().incarnation
+}
+
+/// Freeze `node` until its peers declare it down, then resume it: it renews in
+/// its process. Answers the incarnation it renewed to.
+fn renew_in_process(net: &mut Net, node: usize) -> u64 {
+    let before = incarnation(net, node);
+    net.freeze(node);
+    net.run_for(15_000);
+    assert!(
+        (0..net.nodes.len())
+            .all(|peer| peer == node || !net.live_at(peer).contains(&net.nodes[node].addr)),
+        "premise: its peers declared {node} down"
+    );
+    net.resume(node);
+    net.run_for(15_000);
+    let renewed = incarnation(net, node);
+    assert_eq!(renewed, before + 1, "premise: {node} renewed once in its process");
+    renewed
+}
+
+/// Every restart is taken by the peers at once, however long the member was
+/// dead: no rejoin, one rename on each peer, one incarnation more. Dead for no
+/// time its peers keep it live; for 1.5 s and 3 s they suspect the identity
+/// they hold (which, before ADR-242, the restarted member walked back to and
+/// could not refute, and was declared down 4.8 s into its run); for 10 s they
+/// declare it down. Before ADR-242 every start was at incarnation 0 and the
+/// rejoins of those three were 1, 2, 3, … up to 20, one more per restart.
+#[test]
+fn a_restarted_member_is_taken_at_once_however_long_it_was_down() {
+    for down in [0, 1_500, 3_000, 10_000] {
+        let mut net = trio();
+        for restart in 1..=25 {
+            let before = incarnation(&net, B);
+            let (rejoins, renames) = restart_once(&mut net, B, down);
+            assert_eq!(rejoins, 0, "dead {down} ms, restart {restart}: B rejoined {rejoins} times");
+            assert_eq!(renames, 2, "dead {down} ms, restart {restart}: each peer renamed B once");
+            assert_eq!(incarnation(&net, B), before + 1, "dead {down} ms, restart {restart}");
+            assert_eq!(net.nodes[B].kept, Some(before + 1), "recorded before it was sent");
+        }
+    }
+}
+
+/// A renewal in a process is recorded before anything carries it, so the next
+/// start is above it as well.
+#[test]
+fn a_renewal_in_a_process_is_recorded_for_the_next_start() {
+    let mut net = trio();
+    let renewed = renew_in_process(&mut net, B);
+    assert_eq!(net.nodes[B].kept, Some(renewed), "the renewal is recorded");
+    let (rejoins, renames) = restart_once(&mut net, B, 10_000);
+    assert_eq!((rejoins, renames), (0, 2), "the next start is taken at once");
+    assert_eq!(incarnation(&net, B), renewed + 1);
+}
+
+/// A renewal whose record was lost (its write failed, or the process died
+/// before it) costs the next start one renewal, no more, and the start after
+/// that none.
+#[test]
+fn a_renewal_whose_record_was_lost_costs_the_next_start_one_step() {
+    let mut net = trio();
+    net.nodes[B].keeps = false;
+    let renewed = renew_in_process(&mut net, B);
+    assert_eq!(net.nodes[B].kept, Some(renewed - 1), "premise: the renewal was not recorded");
+    net.nodes[B].keeps = true;
+    let (rejoins, _) = restart_once(&mut net, B, 10_000);
+    assert_eq!(rejoins, 1, "one step up past the identity its peers hold");
+    let (rejoins, renames) = restart_once(&mut net, B, 10_000);
+    assert_eq!((rejoins, renames), (0, 2), "and the next start none");
+}
+
+/// A start with nothing recorded (the first start of this build on a data
+/// directory an older one ran, a wiped one, a restore into a new one) starts at
+/// 0, as every start did before ADR-242, and walks once past what its peers
+/// hold. Every renewal of the walk is recorded, so the next start is one step.
+#[test]
+fn a_start_with_nothing_recorded_walks_once_and_the_next_is_taken_at_once() {
+    let mut net = trio();
+    for restart in 1..=20 {
+        net.nodes[B].kept = None;
+        let (rejoins, _) = restart_once(&mut net, B, 10_000);
+        assert_eq!(rejoins, restart, "with nothing recorded, restart {restart} walks");
+    }
+    assert_eq!(net.nodes[B].kept, Some(20), "the walk is recorded");
+    let (rejoins, renames) = restart_once(&mut net, B, 10_000);
+    assert_eq!((rejoins, renames), (0, 2));
+    assert_eq!(incarnation(&net, B), 21);
 }

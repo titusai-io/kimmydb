@@ -42,6 +42,7 @@ use crate::facts::{
     next_decoded_seq,
 };
 use crate::protocol;
+pub use incarnation::IncarnationFile;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -72,6 +73,10 @@ const UNKNOWN_NODE: NodeId = NodeId::from_bytes([0u8; 16]);
 /// The incarnation is what lets a node that was wrongly declared down rejoin
 /// under the same address. Without it, `Identity::renew` has nothing to change
 /// and a node evicted by a transient network fault could never come back.
+/// **It outlives the process** ([`IncarnationFile`], ADR-242): a start takes one
+/// above the last its data directory recorded, so a restarted member displaces
+/// whatever identity of it a peer holds in one step, instead of renewing one
+/// step at a time up to it.
 ///
 /// The **node id travels here** so that everything downstream can key on the
 /// node rather than on where it happens to be listening. It is gossiped for
@@ -85,9 +90,10 @@ pub struct Member {
 }
 
 impl Member {
-    /// This node's own identity.
-    pub fn identified(addr: SocketAddr, node: NodeId) -> Self {
-        Self { addr, incarnation: 0, node }
+    /// This node's own identity, at `incarnation`
+    /// ([`IncarnationFile::current`] for a process's first).
+    pub fn identified(addr: SocketAddr, node: NodeId, incarnation: u64) -> Self {
+        Self { addr, incarnation, node }
     }
 
     /// A discovered address whose node is not known yet.
@@ -886,8 +892,22 @@ pub(crate) type Swim = Foca<Member, PostcardCodec, rand::rngs::StdRng, NoCustomB
 /// state judged again; this call can go once foca does it itself on that path.
 ///
 /// `rejoined` is whether the input's handling notified `Rejoin`.
-pub(crate) fn after_input(swim: &mut Swim, rejoined: bool, runtime: impl Runtime<Member>) {
-    if rejoined && let Err(e) = swim.apply_many(std::iter::empty(), false, runtime) {
+///
+/// **The renewed incarnation is recorded first** (`record`, which is
+/// [`IncarnationFile::record`] in the daemon): every datagram the input queued
+/// is sent after this returns, so the identity is on disk before any datagram
+/// carries it, and the next start is above it (ADR-242).
+pub(crate) fn after_input(
+    swim: &mut Swim,
+    rejoined: bool,
+    runtime: impl Runtime<Member>,
+    record: impl FnOnce(u64),
+) {
+    if !rejoined {
+        return;
+    }
+    record(swim.identity().incarnation);
+    if let Err(e) = swim.apply_many(std::iter::empty(), false, runtime) {
         warn!(error = %e, "membership could not resume after rejoining the cluster");
     }
 }
@@ -993,17 +1013,21 @@ impl foca::Runtime<Member> for Collector {
 /// `local` is this node's cluster address, and must be the address peers can
 /// reach — a bind of `0.0.0.0` would otherwise announce an unroutable identity.
 /// `node` is this node's durable id, which travels with the identity so peers
-/// can name it independently of where it is listening.
+/// can name it independently of where it is listening. `incarnation` is where
+/// its incarnation is kept between processes, already holding this process's
+/// first ([`IncarnationFile::begin`], ADR-242).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     socket: UdpSocket,
     local: SocketAddr,
     node: NodeId,
+    mut incarnation: IncarnationFile,
     secret: String,
     members: Members,
     seeds: SeedFeed,
     shutdown: kimmy_task::Shutdown,
 ) {
-    let identity = Member::identified(local, node);
+    let identity = Member::identified(local, node, incarnation.current());
     let config =
         Config::new_lan(std::num::NonZeroU32::new(CLUSTER_SIZE_HINT).expect("non-zero literal"));
 
@@ -1129,7 +1153,7 @@ pub async fn run(
             debug!(error = %e, "membership input rejected");
         }
         let rejoined = std::mem::take(&mut collector.rejoined);
-        after_input(&mut foca, rejoined, &mut collector);
+        after_input(&mut foca, rejoined, &mut collector, |renewed| incarnation.record(renewed));
 
         // Dispatch what foca asked for. Datagrams are best-effort by design —
         // SWIM assumes loss and probes again — so a send failure is logged at
@@ -1192,6 +1216,8 @@ impl SeedFeed {
     }
 }
 
+pub mod incarnation;
+
 #[cfg(test)]
 mod yield_tests;
 
@@ -1222,7 +1248,7 @@ mod tests {
             yielding: crate::facts::Yielding { ttl: true, ..Default::default() },
             ..Facts::default()
         }));
-        let old = Member::identified(addr(7900), node(1));
+        let old = Member::identified(addr(7900), node(1), 0);
         let new = old.renew().unwrap();
         members.insert_for_test(addr(7900), node(1));
         members.record_peer_facts_for_test(
@@ -1254,7 +1280,7 @@ mod tests {
     fn a_renewed_identity_displaces_the_one_it_replaces() {
         // Without this a node wrongly declared down could never rejoin: it
         // would keep offering an identity the cluster has already buried.
-        let original = Member::identified(addr(7900), node(1));
+        let original = Member::identified(addr(7900), node(1), 0);
         let renewed = original.renew().expect("renewal must be possible");
 
         assert_eq!(renewed.addr, original.addr, "an address does not change on rejoin");
@@ -1267,7 +1293,7 @@ mod tests {
     fn identity_is_addressed_by_socket_not_by_incarnation() {
         // foca keeps memory bound by *nodes*, not by identities, which only
         // works if every incarnation reports the same address.
-        let member = Member::identified(addr(7900), node(1));
+        let member = Member::identified(addr(7900), node(1), 0);
         assert_eq!(member.addr(), addr(7900));
         assert_eq!(member.renew().unwrap().addr(), addr(7900));
     }
@@ -1281,7 +1307,7 @@ mod tests {
         // *higher* incarnation distinguishes having the branch from not.
         let mut placeholder = Member::announcing(addr(7900));
         placeholder.incarnation = 5;
-        let real = Member::identified(addr(7900), node(7));
+        let real = Member::identified(addr(7900), node(7), 0);
 
         assert!(real.win_addr_conflict(&placeholder), "a real identity must always displace one");
         assert!(!placeholder.win_addr_conflict(&real));
@@ -1293,7 +1319,7 @@ mod tests {
         // answers. If the placeholder could win, a peer would be remembered as
         // the address it was found at and never as itself.
         let placeholder = Member::announcing(addr(7900));
-        let real = Member::identified(addr(7900), node(7));
+        let real = Member::identified(addr(7900), node(7), 0);
 
         assert!(real.win_addr_conflict(&placeholder), "the real identity must win");
         assert!(!placeholder.win_addr_conflict(&real), "and the placeholder must not");
@@ -1305,8 +1331,8 @@ mod tests {
         // without a tiebreak neither displaces the other and the address stalls
         // on whichever was seen first. The rule is arbitrary but must be
         // *agreed* — exactly one of the two comparisons may be true.
-        let a = Member::identified(addr(7900), node(1));
-        let b = Member::identified(addr(7900), node(2));
+        let a = Member::identified(addr(7900), node(1), 0);
+        let b = Member::identified(addr(7900), node(2), 0);
 
         assert_ne!(
             a.win_addr_conflict(&b),

@@ -512,7 +512,7 @@ fn own_defunct_and_rejoin_clear_the_read_map_and_the_peer_blocks() {
             members: rig.members.clone(),
             rejoined: false,
         };
-        let identity = Member::identified(a(7900), n(9));
+        let identity = Member::identified(a(7900), n(9), 0);
         if rejoin {
             collector.notify(Notification::Rejoin(&identity));
         } else {
