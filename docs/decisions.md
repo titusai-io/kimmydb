@@ -28840,6 +28840,8 @@ never shipped (ADR-029), a definition refused as a rival, which is judged the sa
 judged against a write of a document the rewind restores, which the bound under `F` lowers anyway, or removes, whose
 tombstone outranks it.
 
+---
+
 ## ADR-246 — A rewind removes a document created after its target without a tombstone
 
 > **Amends [ADR-044](#adr-044--point-in-time-restore-rewinds-from-post-images-and-refuses-what-it-cannot-reconstruct)
@@ -28943,11 +28945,12 @@ tombstone. On the repaired and pages routes, which the divergence check's repair
 pass (pure entries do not close that case without a rewind either) and a judged write below a kept entry (the first
 residual). `a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected` runs one member's
 retention pass ahead of the others'. The residual of a forgotten delete is pinned by its exact shape. The
-cluster harness as above. Mutation rows, in bash, each failing a test with only its own change: the removal leaving
-a tombstone at the rewind's clock; leaving one at the target; no bound when the rewind only removes; the bound under a
-removal taken from a restored entry when there is one; the removed row deleted without its count; the removed row left in its index; the bound only on origins whose coverage passes the
-target; the bound applied when the rewind neither restores nor removes; a discarded entry's token refused only while
-the member does not hold the entry again (`a_rewound_entry_a_peer_sends_back_stays_refused`); the removal's floor at
-zero, below the horizon; the row of a document deleted at the target removed; only a removed live row bounding the
-vectors. **Equivalent under a removal: the bound without what retention collected**, since the floor at the horizon
-is at or above every collected stamp; ADR-243's row on a late restored entry kills it for a restore.
+cluster harness as above. Mutation rows, in bash, each failing a test with only its own change: the removal leaving a
+tombstone at the rewind's clock; leaving one at the target; no bound when the rewind only removes; the bound under a
+removal taken from a restored entry when there is one; the removed row deleted without its count; the removed row left
+in its index; the bound only on origins whose coverage passes the target; the bound applied when the rewind neither
+restores nor removes; a discarded entry's token refused only while the member does not hold the entry again
+(`a_rewound_entry_a_peer_sends_back_stays_refused`); the removal's floor at zero, below the horizon; the row of a
+document deleted at the target removed; only a removed live row bounding the vectors. **Equivalent under a removal:
+the bound without what retention collected**, since the floor at the horizon is at or above every collected stamp;
+ADR-243's row on a late restored entry kills it for a restore.
