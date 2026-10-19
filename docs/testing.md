@@ -513,7 +513,6 @@ resolver. Something untestable in place tends to stay untested.
 | Leave a tombstone at the target for a removed document | `a_document_created_after_the_target_is_removed`, `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged` |
 | No bound when the rewind only removes | `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged`, `row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write` |
 | The bound under a removal taken from a restored entry when there is one | `a_rewind_that_restores_one_document_and_removes_another_is_bounded_by_the_removal` |
-| The bound under a removal without what retention collected | `a_rewind_that_removes_a_document_after_retention_keeps_the_coverage_of_what_retention_collected` |
 | Delete the removed row without its count | `a_document_created_after_the_target_is_removed` |
 | Leave the removed row in its index | `a_document_created_after_the_target_is_removed` |
 | Bound only the origins whose coverage passes the target | `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged` |
