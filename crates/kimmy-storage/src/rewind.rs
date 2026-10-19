@@ -16,7 +16,16 @@
 //! - **gone**, if its earliest entry after `T` is an `Insert` — it did not exist
 //!   yet; or
 //! - **unrecoverable**, otherwise: the document existed at `T` with a value
-//!   whose last write has already been collected.
+//!   this member's oplog does not hold, collected, or held only as a snapshot
+//!   page's state.
+//!
+//! Only entries of the collection's **standing life** count, on either side of
+//! `T`. A collection's id is derived from its name, so a drop and a re-creation
+//! leave one id, and the purge removes the dropped life's documents but not its
+//! entries. An entry at or below the collection's tombstone or its standing
+//! life's incarnation floor is of a life a drop ended, which the apply path
+//! turns away (`Engine::is_history`), and the rewind never puts it back
+//! (ADR-248).
 //!
 //! The third case is refused rather than guessed, and the documents are named.
 //! A rewind that silently substituted a later value would produce a database
@@ -34,7 +43,8 @@
 //! documents, and purged documents are not in the oplog either — only the fact
 //! of the drop is. Any schema change after the target is refused for the same
 //! reason: the rewind would produce a collection whose contents it cannot
-//! reconstruct.
+//! reconstruct. A drop counts whether the oplog holds its entry or this member
+//! holds it only as a tombstone or a floor, as a snapshot page leaves it.
 //!
 //! # Nothing is written until everything is known
 //!
@@ -108,8 +118,42 @@ impl Engine {
         let mut schema_changes: Vec<OpKind> = Vec::new();
         let mut discardable = 0usize;
 
+        // Each collection standing here, keyed by the id the oplog refers to:
+        // its incarnation floor judges the history below, and index maintenance
+        // needs its definitions.
+        let mut collections: HashMap<u64, crate::CollectionMeta> = HashMap::new();
+        for db_meta in self.list_databases()? {
+            for meta in self.list_collections(&db_meta.name)? {
+                collections.insert(meta.id.0, meta);
+            }
+        }
+        // A drop this member knows of only by its tombstone or by a floor, one a
+        // snapshot page carried, is a schema change as much as one whose entry
+        // the oplog holds, and a drop after the target is refused however it
+        // arrived. Strictly after: a drop at the target is part of the state
+        // at the target (ADR-248).
+        let floors_after = collections
+            .values()
+            .any(|meta| meta.incarnation_floor.is_some_and(|floor| floor > until));
+        if floors_after {
+            schema_changes.push(OpKind::DropCollection);
+        }
+        // Whether an entry is of a life a drop ended: the apply path's own
+        // rule, the collection's tombstone and its standing life's floor
+        // (`Engine::is_history`), so the rewind puts back only what an entry
+        // arriving here would be applied as (ADR-248).
+        let mut memo = crate::sync::Memo::default();
+
         {
             let txn = self.db().begin_read()?;
+            let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            for row in dropped.iter()? {
+                let (_, raw) = row?;
+                if codec::decode_oplog_key(raw.value())?.hlc > until {
+                    schema_changes.push(OpKind::DropCollection);
+                    break;
+                }
+            }
             let oplog = txn.open_table(tables::OPLOG)?;
             for entry in oplog.iter()? {
                 let (_, value) = entry?;
@@ -139,6 +183,19 @@ impl Engine {
                 let Some(id) = entry.doc_id.clone() else {
                     continue;
                 };
+                // An entry of a life a drop ended is no part of the document's
+                // history in the life standing here, on either side of the
+                // target: its collection id is derived from the name, so it is
+                // the same in every life, and the purge removes a life's
+                // documents but not its entries.
+                if self.is_history(
+                    &mut memo,
+                    collections.get(&entry.collection.0),
+                    entry.collection,
+                    entry.stamp,
+                )? {
+                    continue;
+                }
                 let Ok(key) = crate::docs::doc_key(&id) else {
                     continue;
                 };
@@ -205,9 +262,11 @@ impl Engine {
                 .collect();
             let more = total.saturating_sub(named.len());
             return Err(StorageError::Database(format!(
-                "cannot rewind: {total} document(s) changed after the target but their earlier \
-                 value has already been collected from the oplog, so it exists nowhere. \
-                 Nothing was modified. Affected: {}{}",
+                "cannot rewind: {total} document(s) changed after the target, and the value each \
+                 had at the target is not in this member's oplog: retention has collected it, or \
+                 this member holds the document only as a snapshot page's state, or its entries \
+                 at or below the target are of a life a drop has ended. Nothing was modified. \
+                 Affected: {}{}",
                 named.join(", "),
                 if more > 0 { format!(" and {more} more") } else { String::new() }
             )));
@@ -224,14 +283,6 @@ impl Engine {
         let schema = Engine::schema_for_record(self.db())?;
         let txn = self.begin_write(WriterHolder::Rewind)?;
         {
-            // Index maintenance needs each collection's index definitions,
-            // keyed by the id the oplog refers to.
-            let mut collections: HashMap<u64, crate::CollectionMeta> = HashMap::new();
-            for db_meta in self.list_databases()? {
-                for meta in self.list_collections(&db_meta.name)? {
-                    collections.insert(meta.id.0, meta);
-                }
-            }
             let mut docs = txn.open_table(tables::DOCS)?;
 
             for ((collection_id, key), restore_to) in plan {
@@ -1334,6 +1385,251 @@ mod tests {
                 "{name}: A's coverage is its kept entry"
             );
         }
+    }
+
+    /// `items/100` written at t120, `items` dropped at t260 and created again at t330,
+    /// `items/100` written again at t386; `ended` writes the ended life's history of the
+    /// document between the first write and the drop. Returns the base.
+    fn a_life_ended_and_begun_again(
+        e: &Engine,
+        ended: impl Fn(&Engine, &crate::CollectionMeta, u64),
+    ) -> u64 {
+        let base = base();
+        let items = e.create_collection("shop", "items").unwrap();
+        at(&e, base, 120);
+        e.insert(&items, doc! { "_id": 100i64, "v": "old life" }).unwrap();
+        ended(&e, &items, base);
+        at(&e, base, 260);
+        e.drop_collection("shop", "items").unwrap();
+        e.finish_purges_now().unwrap();
+        at(&e, base, 330);
+        let items = e.create_collection("shop", "items").unwrap();
+        at(&e, base, 386);
+        e.insert(&items, doc! { "_id": 100i64, "v": "new life" }).unwrap();
+        base
+    }
+
+    #[test]
+    fn a_rewind_does_not_put_back_a_version_of_a_life_a_drop_ended() {
+        // The latest entry of the document at or below t352 is its t120 insert, of the
+        // life the drop at t260 ended. In the life standing at t352 the document did not
+        // exist: it is removed, with no record (ADR-246, ADR-248).
+        let (e, _dir) = engine();
+        let base = a_life_ended_and_begun_again(&e, |_, _, _| {});
+        let outcome = e.rewind_to(Hlc::new(base + 352, 0)).unwrap();
+        assert_eq!((outcome.reverted, outcome.removed, outcome.oplog_discarded), (0, 1, 1));
+        let items = e.get_collection("shop", "items").unwrap();
+        assert_eq!(e.get(&items, &DocId::Int64(100)).unwrap(), None, "the ended life's version");
+        assert_eq!(crate::docs::record_stamp(&e, &items, &DocId::Int64(100)).unwrap(), None);
+        crate::live_count::test_support::assert_counts_exact(&e, "a removal over an ended life");
+    }
+
+    #[test]
+    fn a_rewind_does_not_put_back_the_delete_of_a_life_a_drop_ended() {
+        // The ended life's last entry of the document is a delete: put back, it left a
+        // tombstone of the ended life in the standing one.
+        let (e, _dir) = engine();
+        let base = a_life_ended_and_begun_again(&e, |e, items, base| {
+            at(e, base, 200);
+            e.delete(items, &DocId::Int64(100)).unwrap();
+        });
+        let outcome = e.rewind_to(Hlc::new(base + 352, 0)).unwrap();
+        assert_eq!((outcome.reverted, outcome.removed), (0, 1));
+        let items = e.get_collection("shop", "items").unwrap();
+        assert_eq!(
+            crate::docs::record_stamp(&e, &items, &DocId::Int64(100)).unwrap(),
+            None,
+            "no tombstone of the ended life's delete"
+        );
+    }
+
+    #[test]
+    fn a_rewind_puts_back_the_standing_lifes_version_over_an_ended_lifes() {
+        let base = base();
+        let (e, _dir) = engine();
+        let items = e.create_collection("shop", "items").unwrap();
+        at(&e, base, 120);
+        e.insert(&items, doc! { "_id": 100i64, "v": "old life" }).unwrap();
+        at(&e, base, 260);
+        e.drop_collection("shop", "items").unwrap();
+        e.finish_purges_now().unwrap();
+        at(&e, base, 330);
+        let items = e.create_collection("shop", "items").unwrap();
+        at(&e, base, 340);
+        e.insert(&items, doc! { "_id": 100i64, "v": "standing" }).unwrap();
+        at(&e, base, 386);
+        e.replace(&items, &DocId::Int64(100), doc! { "_id": 100i64, "v": "later" }, false).unwrap();
+        let outcome = e.rewind_to(Hlc::new(base + 352, 0)).unwrap();
+        assert_eq!((outcome.reverted, outcome.removed), (1, 0));
+        let held = e.get(&items, &DocId::Int64(100)).unwrap().expect("the standing life's");
+        assert_eq!(held.get_str("v").unwrap(), "standing");
+    }
+
+    #[test]
+    fn an_entry_in_the_drops_own_millisecond_is_of_the_life_it_ended() {
+        // C's write of `items/1` and B's drop share one `Hlc`; a tie is the drop's
+        // (ADR-236), so C's t260 entry is of the life the drop ended.
+        let base = base();
+        let ((b, _db), (c, _dc)) = (engine(), engine());
+        at(&b, base, 100);
+        b.create_collection("shop", "items").unwrap();
+        pull(&c, &b);
+        at(&c, base, 260);
+        let theirs = c.get_collection("shop", "items").unwrap();
+        c.insert(&theirs, doc! { "_id": 1i64 }).unwrap();
+        at(&b, base, 260);
+        b.drop_collection("shop", "items").unwrap();
+        let written = crate::docs::record_stamp(&c, &theirs, &DocId::Int64(1)).unwrap().unwrap();
+        let dropped = b.collection_dropped_at(theirs.id).unwrap().unwrap();
+        assert_eq!(written.hlc, dropped.hlc, "premise: the write and the drop tie on the Hlc");
+        pull(&c, &b);
+        c.finish_purges_now().unwrap();
+        at(&c, base, 330);
+        let items = c.create_collection("shop", "items").unwrap();
+        at(&c, base, 386);
+        c.insert(&items, doc! { "_id": 1i64, "v": "new life" }).unwrap();
+        let outcome = c.rewind_to(Hlc::new(base + 352, 0)).unwrap();
+        assert_eq!((outcome.reverted, outcome.removed), (0, 1));
+        assert_eq!(crate::docs::record_stamp(&c, &items, &DocId::Int64(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_write_after_a_drop_and_before_the_re_creation_is_of_the_standing_life() {
+        // A, which never heard of B's drop at t260, writes `items/2` at t290. B creates
+        // `items` again at t330 and takes A's write, stamped above the floor: it is of
+        // the standing life though it predates the creation (ADR-236), so the rewind
+        // puts it back. Judged by `created`, it would be refused.
+        let base = base();
+        let ((a, _da), (b, _db)) = (engine(), engine());
+        at(&b, base, 100);
+        b.create_collection("shop", "items").unwrap();
+        pull(&a, &b);
+        at(&b, base, 260);
+        b.drop_collection("shop", "items").unwrap();
+        b.finish_purges_now().unwrap();
+        at(&a, base, 290);
+        let theirs = a.get_collection("shop", "items").unwrap();
+        a.insert(&theirs, doc! { "_id": 2i64, "v": "t290" }).unwrap();
+        at(&b, base, 330);
+        let items = b.create_collection("shop", "items").unwrap();
+        pull(&b, &a);
+        at(&a, base, 386);
+        a.replace(&theirs, &DocId::Int64(2), doc! { "_id": 2i64, "v": "t386" }, false).unwrap();
+        pull(&b, &a);
+        assert_eq!(
+            b.get(&items, &DocId::Int64(2)).unwrap().unwrap().get_str("v").unwrap(),
+            "t386",
+            "premise: B holds A's writes in the standing life"
+        );
+        let outcome = b.rewind_to(Hlc::new(base + 352, 0)).unwrap();
+        assert_eq!((outcome.reverted, outcome.removed), (1, 0));
+        assert_eq!(b.get(&items, &DocId::Int64(2)).unwrap().unwrap().get_str("v").unwrap(), "t290");
+    }
+
+    /// C takes B's t120 insert and t200 replacement of `items/1` by entries, and B's
+    /// drop at t260 by a whole-database page, which leaves a tombstone and no entry.
+    fn a_drop_carried_by_a_page() -> (Engine, Engine, u64, Vec<tempfile::TempDir>) {
+        let base = base();
+        let ((b, db), (c, dc)) = (engine(), engine());
+        at(&b, base, 100);
+        let items = b.create_collection("shop", "items").unwrap();
+        pull(&c, &b);
+        at(&b, base, 120);
+        b.insert(&items, doc! { "_id": 1i64, "v": "a" }).unwrap();
+        at(&b, base, 200);
+        b.replace(&items, &DocId::Int64(1), doc! { "_id": 1i64, "v": "b" }, false).unwrap();
+        pull(&c, &b);
+        at(&b, base, 260);
+        b.drop_collection("shop", "items").unwrap();
+        b.finish_purges_now().unwrap();
+        whole(&c, &b);
+        c.finish_purges_now().unwrap();
+        let id = kimmy_core::CollectionId::derive("shop", "items");
+        assert!(c.collection_dropped_at(id).unwrap().is_some(), "premise: the tombstone");
+        assert!(
+            c.read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.kind != OpKind::DropCollection),
+            "premise: no drop entry"
+        );
+        (b, c, base, vec![db, dc])
+    }
+
+    /// The rows the store holds under `items`' id, live or not.
+    fn rows_under_items(e: &Engine) -> usize {
+        let id = kimmy_core::CollectionId::derive("shop", "items").0;
+        let txn = e.db().begin_read().unwrap();
+        let docs = txn.open_table(tables::DOCS).unwrap();
+        docs.range((id, &[][..])..=(id, &[0xffu8; 64][..])).unwrap().count()
+    }
+
+    #[test]
+    fn a_rewind_past_a_drop_a_snapshot_page_carried_is_refused_without_writing() {
+        // A drop after the target is a schema change after it however it arrived. Taken
+        // by a page, it left no entry, and the rewind went ahead: it put the t120 version
+        // back as a row under the id of a collection that no longer exists (ADR-248).
+        let (_b, c, base, _dirs) = a_drop_carried_by_a_page();
+        let entries = c.oplog_entries().unwrap();
+        let err = c.rewind_to(Hlc::new(base + 150, 0)).unwrap_err().to_string();
+        assert!(err.contains("schema change") && err.contains("DropCollection"), "{err}");
+        assert_eq!(c.oplog_entries().unwrap(), entries, "no entry was discarded");
+        assert_eq!(rows_under_items(&c), 0, "no row was written");
+    }
+
+    #[test]
+    fn a_rewind_to_the_drop_itself_is_not_refused() {
+        // A drop at the target is part of the state at the target.
+        let (_b, c, _base, _dirs) = a_drop_carried_by_a_page();
+        let id = kimmy_core::CollectionId::derive("shop", "items");
+        let dropped = c.collection_dropped_at(id).unwrap().unwrap();
+        c.rewind_to(dropped.hlc).expect("a drop at the target is not after it");
+        assert_eq!(rows_under_items(&c), 0);
+    }
+
+    #[test]
+    fn a_rewind_past_a_drop_named_only_by_a_floor_is_refused() {
+        // A life created after a drop carries the drop as its floor; tombstone retention
+        // can collect the tombstone and leave the floor, which still says the drop
+        // happened.
+        let base = base();
+        let (e, _dir) = engine();
+        at(&e, base, 100);
+        e.create_collection("shop", "items").unwrap();
+        at(&e, base, 260);
+        e.drop_collection("shop", "items").unwrap();
+        e.finish_purges_now().unwrap();
+        at(&e, base, 330);
+        let items = e.create_collection("shop", "items").unwrap();
+        assert!(items.incarnation_floor.is_some_and(|floor| floor > Hlc::new(base + 150, 0)));
+        // The tombstone collected, as tombstone retention does.
+        let txn = e.db().begin_write().unwrap();
+        txn.open_table(tables::COLLECTIONS_DROPPED).unwrap().remove(items.id.0).unwrap();
+        txn.commit().unwrap();
+        // Every entry after the target collected as well, so no entry names the drop.
+        let txn = e.db().begin_write().unwrap();
+        {
+            let mut oplog = txn.open_table(tables::OPLOG).unwrap();
+            let after: Vec<Vec<u8>> = oplog
+                .iter()
+                .unwrap()
+                .map(|row| row.unwrap())
+                .filter(|(_, value)| {
+                    codec::decode_oplog_entry(value.value()).unwrap().stamp.hlc
+                        > Hlc::new(base + 150, 0)
+                })
+                .map(|(key, _)| key.value().to_vec())
+                .collect();
+            for key in after {
+                oplog.remove(key.as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        let err = e.rewind_to(Hlc::new(base + 150, 0)).unwrap_err().to_string();
+        assert!(err.contains("schema change") && err.contains("DropCollection"), "{err}");
+        // A floor at the target is a drop at the target, which is part of the state there.
+        let floor = items.incarnation_floor.unwrap();
+        e.rewind_to(floor).expect("a floor at the target is not after it");
     }
 
     #[test]
