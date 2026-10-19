@@ -204,6 +204,11 @@ jobs:
       - name: Native build dependencies
         if: needs.changes.outputs.docs_only != 'true'
         run: ./scripts/check-native-deps.sh
+      # The vendored hnsw_rs is the published crate plus one patch, byte for
+      # byte (ADR-241): a drift in it would be a library nobody reviewed.
+      - name: Vendored hnsw_rs matches its published crate
+        if: needs.changes.outputs.docs_only != 'true'
+        run: ./scripts/check-vendored-hnsw.sh
 
   test:
     name: test
