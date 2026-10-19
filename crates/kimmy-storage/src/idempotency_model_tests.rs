@@ -50,8 +50,9 @@
 //! of its pages, m4), which then replays its own origin from its peers (ADR-212, each page
 //! cut as the transport's `cut_replay_page` cuts it, in a frame of a few units: B2's
 //! records, and records alone under a records cursor, m1), with steps between the
-//! replay's pages; rewind a member (`restore --until`, offline), which replays its own
-//! origin the same way; leave orphan rows by stamp (records past their window removed, as
+//! replay's pages; rewind a member (`restore --until`, offline), as the documented
+//! procedure has it (alone when no peer holds a write the rewind undoes, else every
+//! member to the same target), each then replaying its own origin the same way; leave orphan rows by stamp (records past their window removed, as
 //! a retention pass stopped between chunks leaves them); drop or create `items` or
 //! `orders` (a drop of `orders` on another member also between two commits); and a
 //! retention pass with a moved clock. "Between two commits" is the
@@ -398,9 +399,16 @@ pub(crate) enum Step {
         nth: u8,
         inner: Vec<(u8, Vec<Op>)>,
     },
-    /// Rewind `m` to `t` (`kimmyd restore --until`, offline: the store is reopened), then
-    /// replay its own origin from every member that is up, as after a restore.
+    /// Rewind `m` to `t` (`kimmyd restore --until`, offline: the store is reopened), as
+    /// the documented procedure has it: alone when no peer holds a write it undoes, else
+    /// every member to the same target; then each replays its own origin, as after a
+    /// restore.
     Rewind {
+        m: u8,
+    },
+    /// The forbidden procedure, in one named row only: `m` rewound alone although a peer
+    /// holds a write it undoes, then rejoining the cluster.
+    RewindAlone {
         m: u8,
     },
     /// Leave the rows by stamp of every record `m` holds past its window and remove the
@@ -524,6 +532,7 @@ impl std::fmt::Display for Op {
                 show_inner(f, inner)
             }
             Step::Rewind { m } => write!(f, "{}.rewind to {t}", l(*m)),
+            Step::RewindAlone { m } => write!(f, "{}.rewind alone to {t} (forbidden)", l(*m)),
             Step::Orphan { m } => write!(f, "{}.orphan rows", l(*m)),
             Step::Restart { m } => write!(f, "{}.restart", l(*m)),
             Step::Crash { m } => write!(f, "{}.crash", l(*m)),
@@ -694,8 +703,16 @@ pub(crate) struct Outcome {
     /// Of them, those merged into a live record of the same request, lowering its
     /// `first` (m2 as G narrowed it).
     pub past_window_merged: usize,
-    /// Rewinds taken, and the records they removed and reopened.
+    /// Rewinds taken (each member rewound counts), and the records they removed and
+    /// reopened.
     pub rewinds: usize,
+    /// Generated rewinds of one member that no peer held a write of (the procedure's
+    /// first shape), and those widened to every member because a peer held one (its
+    /// second shape; a single-member rewind there is the forbidden procedure).
+    pub rewinds_alone: usize,
+    pub rewinds_widened: usize,
+    /// Writes a member rewound alone undid (`Step::RewindAlone`) that came back to it.
+    pub undone_returned: usize,
     pub rewound_removed: usize,
     pub rewound_reopened: usize,
     /// Records removed with their rows left (orphan rows).
@@ -719,6 +736,9 @@ type LiveBefore = Vec<((u8, u8), Option<IdempotencyRecord>)>;
 
 /// Every record a member stores, by (collection id, scope).
 type StoredRecords = BTreeMap<(u64, [u8; 32]), IdempotencyRecord>;
+
+/// A member's records, and its rows by stamp that name none.
+type RecordsAndOrphans = (StoredRecords, BTreeSet<Vec<u8>>);
 
 fn err(what: &str, e: impl std::fmt::Display) -> String {
     format!("{what}: {e}")
@@ -1114,6 +1134,11 @@ struct World {
     /// The page room every member opens with ([`Bias::page_room`], until the first step
     /// ends).
     page_room: Option<usize>,
+    /// A rewind `rewind_to` made, for its checks.
+    pending_rewind: Option<(RecordsAndOrphans, crate::rewind::RewindOutcome)>,
+    /// The writes a member rewound alone undid that a peer held (`Step::RewindAlone`, the
+    /// forbidden procedure): (member, stamp, collection, document).
+    undone: Vec<(usize, Stamp, u8, DocId)>,
     step: String,
 }
 
@@ -1158,6 +1183,8 @@ impl World {
             retry_catching_up: false,
             replay_frame: sched_frame,
             page_room: sched_room,
+            pending_rewind: None,
+            undone: Vec::new(),
             backups: HashMap::new(),
             step: "setup".into(),
         };
@@ -2513,6 +2540,7 @@ impl World {
             }
             Step::Restore { m, nth, inner } => self.restore(*m as usize, *nth, inner)?,
             Step::Rewind { m } => self.rewind(*m as usize, op.t)?,
+            Step::RewindAlone { m } => self.rewind_alone(*m as usize, op.t)?,
             Step::Orphan { m } => self.orphan(*m as usize)?,
             Step::Big { m } => {
                 let m = *m as usize;
@@ -2744,18 +2772,156 @@ impl World {
     /// (a filter's with no cursor), and it leaves no row by stamp naming a record it
     /// removed (G).
     fn rewind(&mut self, m: usize, t: u32) -> Res<()> {
-        // The first stamp minted in millisecond `t` is kept, the rest of it discarded: a
-        // batch of that millisecond is cut part-way (`--until` is a millisecond).
-        let until = Hlc::new(self.base + u64::from(t), 1);
-        let (before, orphans_before) = self.stored_records(m)?;
+        // The documented procedure (operations, "Point-in-time restore"): a rewound
+        // database never rejoins a cluster that still holds the writes it undid. A member
+        // is rewound alone only when no peer holds any entry it discards; otherwise every
+        // member is rewound to the same target.
+        let until = Self::until(self.base, t);
+        let shared = self.discards_shared(m, until)?;
+        if shared.is_empty() {
+            self.out.rewinds_alone += 1;
+            if self.rewind_to(m, until, t)? {
+                self.rewound(m, until, t)?;
+                self.replay_from_peers(m, &[])?;
+            }
+            return Ok(());
+        }
+        self.out.rewinds_widened += 1;
+        self.note(format!(
+            "{}'s rewind to t{t} discards entries a peer holds ({}): every member is rewound",
+            LETTERS[m],
+            shared.iter().map(|(s, ..)| self.stamp(*s)).collect::<Vec<_>>().join(" ")
+        ));
+        self.rewind_every_member(until, t)
+    }
+
+    /// The forbidden procedure, for the row that shows it: `m` rewound alone although a
+    /// peer holds what it discards, then rejoining (`Step::RewindAlone`).
+    fn rewind_alone(&mut self, m: usize, t: u32) -> Res<()> {
+        let until = Self::until(self.base, t);
+        let shared = self.discards_shared(m, until)?;
+        if self.rewind_to(m, until, t)? {
+            self.undone.extend(shared.into_iter().map(|(stamp, c, id)| (m, stamp, c, id)));
+            self.rewound(m, until, t)?;
+            self.replay_from_peers(m, &[])?;
+        }
+        Ok(())
+    }
+
+    /// The first stamp minted in millisecond `t` is kept, the rest of it discarded: a
+    /// batch of that millisecond is cut part-way (`--until` is a millisecond).
+    fn until(base: u64, t: u32) -> Hlc {
+        Hlc::new(base + u64::from(t), 1)
+    }
+
+    /// The entries a rewind of `m` to `until` discards that a peer holds: in its oplog,
+    /// or as the document's row at that stamp (a page's state).
+    fn discards_shared(&self, m: usize, until: Hlc) -> Res<Vec<(Stamp, u8, DocId)>> {
+        let discarded: Vec<kimmy_core::OplogEntry> = self
+            .e(m)
+            .read_oplog_from(until, 100_000, WalkScope::Request)
+            .map_err(|e| err("read_oplog_from", e))?
+            .into_iter()
+            .filter(|entry| entry.stamp.hlc > until)
+            .collect();
+        let mut shared = Vec::new();
+        for entry in &discarded {
+            let Some(c) = (0..NAMES.len() as u8).find(|c| coll_id(*c) == entry.collection) else {
+                continue;
+            };
+            let Some(id) = entry.doc_id.clone() else { continue };
+            let held = (0..self.n()).filter(|peer| *peer != m).any(|peer| {
+                let e = self.e(peer);
+                e.has_oplog_entry(&entry.stamp).unwrap_or(false)
+                    || stored(&e, c, &id).is_some_and(|(at, _)| at == entry.stamp)
+            });
+            if held {
+                shared.push((entry.stamp, c, id));
+            }
+        }
+        Ok(shared)
+    }
+
+    /// Every member rewound to `until`, as the procedure asks of a rewind whose undone
+    /// writes a peer holds: all or none (a member that refuses leaves every store as it
+    /// was), then each one's checks, then their replays.
+    fn rewind_every_member(&mut self, until: Hlc, t: u32) -> Res<()> {
+        let n = self.n();
+        // Each store as it stands, closed, so a refusal puts every one back.
+        let mut saved = Vec::new();
+        for m in 0..n {
+            let arc = self.members[m].engine.take().expect("open");
+            let engine = Arc::into_inner(arc).ok_or("the engine is held elsewhere")?;
+            engine.close().map_err(|e| format!("close: {e:?}"))?;
+            let copy = self.members[m].path.with_extension("before-rewind");
+            std::fs::copy(&self.members[m].path, &copy).map_err(|e| err("copy", e))?;
+            saved.push(copy);
+            self.open(m)?;
+        }
+        let mut befores = Vec::new();
+        for m in 0..n {
+            let before = self.stored_records(m)?;
+            match self.e(m).rewind_to(until) {
+                Ok(outcome) => befores.push((before, outcome)),
+                Err(e) => {
+                    self.note(format!(
+                        "{} refuses the rewind to t{t} ({e}): no member is rewound",
+                        LETTERS[m]
+                    ));
+                    for (m, copy) in saved.iter().enumerate() {
+                        let arc = self.members[m].engine.take().expect("open");
+                        drop(Arc::into_inner(arc).ok_or("the engine is held elsewhere")?);
+                        std::fs::copy(copy, &self.members[m].path).map_err(|e| err("copy", e))?;
+                        self.open(m)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        for (m, (before, outcome)) in befores.into_iter().enumerate() {
+            self.reopen(m, true)?;
+            self.check_rewound(m, until, t, before, outcome)?;
+        }
+        for m in 0..n {
+            self.replay_from_peers(m, &[])?;
+        }
+        Ok(())
+    }
+
+    /// Rewind `m` alone; whether it was (a refusal writes nothing).
+    fn rewind_to(&mut self, m: usize, until: Hlc, t: u32) -> Res<bool> {
+        let before = self.stored_records(m)?;
         let outcome = match self.e(m).rewind_to(until) {
             Ok(outcome) => outcome,
             Err(e) => {
                 self.note(format!("{} rewind to t{t} refused: {e}", LETTERS[m]));
-                return Ok(());
+                return Ok(false);
             }
         };
         self.reopen(m, true)?;
+        self.pending_rewind = Some((before, outcome));
+        Ok(true)
+    }
+
+    /// The checks of a rewind `rewind_to` made.
+    fn rewound(&mut self, m: usize, until: Hlc, t: u32) -> Res<()> {
+        let (before, outcome) = self.pending_rewind.take().expect("a rewind made");
+        self.check_rewound(m, until, t, before, outcome)
+    }
+
+    /// Right after a rewind of `m`, before any replay: no record of a request whose every
+    /// write it discarded stands, a record it cut part-way goes as a bulk's and stands
+    /// reopened as any other kind's, and it leaves no row by stamp naming a record it
+    /// removed. Then the ghost forgets what the member no longer holds.
+    fn check_rewound(
+        &mut self,
+        m: usize,
+        until: Hlc,
+        t: u32,
+        before: RecordsAndOrphans,
+        outcome: crate::rewind::RewindOutcome,
+    ) -> Res<()> {
+        let (before, orphans_before) = before;
         self.out.rewinds += 1;
         self.out.rewound_removed += outcome.records_removed;
         self.out.rewound_reopened += outcome.records_reopened;
@@ -2820,8 +2986,7 @@ impl World {
             );
         }
         self.fps_expire(m)?;
-        self.after_losing_history(m)?;
-        self.replay_from_peers(m, &[])
+        self.after_losing_history(m)
     }
 
     /// Orphan rows on `m`: every record past its window is removed and its rows by stamp
@@ -3338,6 +3503,7 @@ impl World {
             | Step::Create { m, .. }
             | Step::Restore { m, .. }
             | Step::Rewind { m }
+            | Step::RewindAlone { m }
             | Step::Orphan { m }
             | Step::Retention { m } => *m as usize == running,
             Step::Page { to, restart, .. } => *restart && *to as usize == running,
@@ -3760,6 +3926,14 @@ impl World {
 
     /// I4 and I5 once the cluster is quiet.
     fn check_settled(&mut self) -> Res<()> {
+        // The forbidden procedure's undone writes: anti-entropy puts them back on the
+        // member that rejoined (the write, or a later version of its document).
+        for (m, stamp, c, id) in self.undone.clone() {
+            let e = self.e(m);
+            let back = e.has_oplog_entry(&stamp).map_err(|e| err("has_oplog_entry", e))?
+                || stored(&e, c, &id).is_some_and(|(at, _)| at >= stamp);
+            self.out.undone_returned += usize::from(back);
+        }
         // Identical documents.
         let docs: Vec<_> = (0..self.n()).map(|m| self.documents(m)).collect::<Res<_>>()?;
         for m in 1..self.n() {
@@ -4959,6 +5133,8 @@ struct Sweep {
     cursor_restarts: usize,
     past_window_offered: usize,
     rewinds: usize,
+    rewinds_alone: usize,
+    rewinds_widened: usize,
     rewound_removed: usize,
     rewound_reopened: usize,
     orphaned: usize,
@@ -5029,6 +5205,8 @@ fn sweep_listing(
                         t.cursor_restarts += out.cursor_restarts;
                         t.past_window_offered += out.past_window_offered;
                         t.rewinds += out.rewinds;
+                        t.rewinds_alone += out.rewinds_alone;
+                        t.rewinds_widened += out.rewinds_widened;
                         t.rewound_removed += out.rewound_removed;
                         t.rewound_reopened += out.rewound_reopened;
                         t.orphaned += out.orphaned;
@@ -5074,7 +5252,8 @@ fn sweep_listing(
          algebra: {} records contested, {} lookups refused, {} requests stopped between chunks; {} snapshot pages \
          refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
          records cursors started over, {} records offered past their window (m2); {} \
-         rewinds ({} records removed, {} reopened), {} records orphaned; {} replay deltas \
+         member rewinds ({} of one member alone, {} widened to every member; {} records \
+         removed, {} reopened), {} records orphaned; {} replay deltas \
          too large for their page ({} cursors dropped, their position read again), {} replay \
          pages unfit; in {:.1?}",
         totals.schedules,
@@ -5100,6 +5279,8 @@ fn sweep_listing(
         totals.cursor_restarts,
         totals.past_window_offered,
         totals.rewinds,
+        totals.rewinds_alone,
+        totals.rewinds_widened,
         totals.rewound_removed,
         totals.rewound_reopened,
         totals.orphaned,
@@ -5164,7 +5345,8 @@ fn assert_coverage(totals: &Sweep, seeds: u64) {
         ),
         ("replay pages unfit, the whole-frame refusal", totals.replay_unfit),
         ("records offered past their window (m2)", totals.past_window_offered),
-        ("rewinds", totals.rewinds),
+        ("rewinds of one member, no peer holding a write it undoes", totals.rewinds_alone),
+        ("rewinds widened to every member", totals.rewinds_widened),
         ("records orphaned", totals.orphaned),
     ];
     let short: Vec<String> =
@@ -6151,6 +6333,50 @@ fn row_d3_a_resume_after_a_drop_leaves_what_is_at_or_above_its_merged_first() {
         ],
         |out| out.left_by_first == 3,
     );
+}
+
+/// Outside the procedure (operations, "Point-in-time restore": a rewound database must
+/// not rejoin a cluster that still holds the undone writes): C upserts `items/101` with
+/// a key at 210 and A takes it; C is rewound alone to 206 all the same, then rejoins: it
+/// writes at 240, B takes C's origin past 210 by a short pull, a converge page brings A's
+/// kept version back to C, and C writes the document again on top. The undone write comes
+/// back, as the documentation says. No idempotency guarantee is asserted: after such a
+/// rejoin a request's record need not come back with its undone write (in the long run's
+/// seed 1000180, a member ended holding a request's effect without its record).
+#[test]
+fn row_a_rewound_member_that_rejoins_a_cluster_holding_the_undone_write_is_outside_the_procedure() {
+    let sched = Schedule {
+        track: Track::Anywhere,
+        home: 0,
+        members: 3,
+        requests: vec![req(1, Kind::Replace { at: Target::Client(1) })],
+        ops: vec![
+            ask(0, C, 210),
+            pull(A, C),
+            Op { step: Step::RewindAlone { m: C }, t: 206 },
+            touch(C, ITEMS, 2, 240),
+            Op { step: Step::PullShort { to: B, from: C }, t: 0 },
+            Op {
+                step: Step::Page {
+                    to: C,
+                    from: A,
+                    c: ITEMS,
+                    converge: true,
+                    restart: true,
+                    inner: Vec::new(),
+                },
+                t: 0,
+            },
+            touch(C, ITEMS, 1, 376),
+        ],
+        bias: Bias::default(),
+    };
+    let out = run_framed(&sched, Some(false), false, REPLAY_FRAME);
+    let shown = render(None, &sched, &out);
+    if trace() {
+        eprintln!("row forbidden-rewind:\n{shown}");
+    }
+    assert!(out.undone_returned >= 1, "the undone write did not come back:\n{shown}");
 }
 
 /// Finding RW1 (fixed by #209), minimised from the long run's seed 1000688: B drops
