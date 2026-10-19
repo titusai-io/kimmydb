@@ -2754,9 +2754,17 @@ impl World {
             let cut = was.last.hlc > until;
             let filter = matches!(was.outcome, crate::idempotency::RecordOutcome::Modify(_));
             if cut && !filter && was.first.hlc <= until {
+                // Every request merged into the record (a contested one holds two or
+                // more): the writes of each that stand are bare.
                 let r = was.fingerprint.0[0].wrapping_sub(1);
-                self.ghost.bare.insert(r);
-                self.note(format!("r{r}'s record removed by the rewind, its prefix bare"));
+                let mut merged = BTreeSet::from([r]);
+                if let Some(c) = (0..NAMES.len() as u8).find(|c| coll_id(*c).0 == key.0) {
+                    merged.extend(self.fps(m, c, key.1[0]));
+                }
+                for q in &merged {
+                    self.ghost.bare.insert(*q);
+                }
+                self.note(format!("{merged:?}'s record removed by the rewind, what stands bare"));
             }
             let fine = if was.first.hlc > until || (cut && !filter) {
                 now.is_none()
@@ -4839,14 +4847,14 @@ impl Gen {
             let at = (ops.len() * 2 / 3).max(2);
             match self.rng.below(10) {
                 // The sender restored between two replay pages: a cursor of another epoch.
-                0..=4 => {
+                0..=3 => {
                     let again =
                         Op { step: Step::Restore { m: SENDER, nth: 0, inner: Vec::new() }, t: 0 };
                     inner.push((1 + self.rng.below(2) as u8, vec![again]));
                 }
                 // A keyed write on the sender between two replay pages, with a delta too
                 // small for the record it changes.
-                5..=7 => {
+                4..=8 => {
                     bias.delta_bytes = 100;
                     let r = self.new_request();
                     let at_peer =
