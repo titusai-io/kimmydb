@@ -4822,3 +4822,187 @@ async fn a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_wri
     );
     assert!(by_a + by_b >= 1, "the document repair took C's row");
 }
+
+/// Every member of a cluster rewound to one target (`kimmyd restore --until`, the documented
+/// procedure), where the rewind removes a document that two members judged a write at or below
+/// the target against. C, cut off, inserts `orders/1` and then `orders/2`; A inserts `orders/1`
+/// after the target, and B takes A's insert. When C rejoins, A and B judge C's insert of
+/// `orders/1` against A's and neither appends it; C takes A's. The rewind removes `orders/1` on
+/// A and B, whose oplogs hold no entry of it at or below the target, and leaves no tombstone;
+/// C puts its own insert back. A and B keep C's insert of `orders/2`, so their coverage of C
+/// stays above the judged write (ADR-246), and the divergence check's repair brings it back.
+/// Every member ends with C's write, and a write on A and on B afterwards deletes it nowhere.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_rewound_cluster_keeps_a_write_judged_against_an_insert_the_rewind_removes() {
+    let client = reqwest::Client::new();
+    let (mut a, mut b, mut c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    let res = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{:?}", res.text().await);
+    let insert = |node: &Node, token: &str, id: i64, v: &str| {
+        let (client, url, token, v) = (
+            client.clone(),
+            node.url("/v1/db/shop/coll/orders/docs"),
+            token.to_string(),
+            v.to_string(),
+        );
+        async move {
+            let res = client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "_id": id, "v": v }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200, "{:?}", res.text().await);
+        }
+    };
+
+    // The collection reaches every member before C is cut off.
+    insert(&a, &token, 0, "seed").await;
+    for node in [&b, &c] {
+        let t = node.login(&client).await;
+        eventually("orders/0 to reach every member", || {
+            let (client, node, t) = (&client, node, &t);
+            async move { doc_v(client, node, t, 0).await.is_some() }
+        })
+        .await;
+    }
+
+    // C is cut off: it dials nobody, and nobody dials it.
+    let addr = |n: &Node| format!("127.0.0.1:{}", n.cluster);
+    c.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &format!("{},{}", addr(&a), addr(&b)))]);
+    a.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &addr(&c))]);
+    b.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &addr(&c))]);
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    let (token, c_token) = (a.login(&client).await, c.login(&client).await);
+    insert(&c, &c_token, 1, "c").await;
+    insert(&c, &c_token, 2, "c").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let until_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as u64;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    insert(&a, &token, 1, "a-later").await;
+    let b_token = b.login(&client).await;
+    eventually("A's insert to reach B", || {
+        let (client, b, t) = (&client, &b, &b_token);
+        async move { doc_v(client, b, t, 1).await.as_deref() == Some("\"a-later\"") }
+    })
+    .await;
+
+    // C rejoins: A and B take its writes, and its insert of orders/1 loses to A's.
+    for node in [&mut a, &mut b, &mut c] {
+        node.restart_with(&[]);
+    }
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    for node in [&a, &b] {
+        let t = node.login(&client).await;
+        eventually("C's orders/2 to reach A and B", || {
+            let (client, node, t) = (&client, node, &t);
+            async move { doc_v(client, node, t, 2).await.is_some() }
+        })
+        .await;
+        assert_eq!(doc_v(&client, node, &t, 1).await.as_deref(), Some("\"a-later\""));
+    }
+    let c_token = c.login(&client).await;
+    eventually("A's insert to reach C", || {
+        let (client, c, t) = (&client, &c, &c_token);
+        async move { doc_v(client, c, t, 1).await.as_deref() == Some("\"a-later\"") }
+    })
+    .await;
+
+    // Every member backed up, stopped, restored to the moment between C's writes and A's
+    // insert, and started again.
+    let mut backups = Vec::new();
+    for node in [&a, &b, &c] {
+        let t = node.login(&client).await;
+        let backup = client.get(node.url("/v1/admin/backup")).bearer_auth(&t).send().await.unwrap();
+        assert_eq!(backup.status(), 200);
+        let path = node.dir.path().join("backup.bin");
+        std::fs::write(&path, backup.bytes().await.unwrap()).unwrap();
+        backups.push(path);
+    }
+    for node in [&a, &b, &c] {
+        node.signal("TERM");
+        node.wait_exit(Duration::from_secs(60));
+    }
+    for (node, backup) in [&a, &b, &c].into_iter().zip(&backups) {
+        std::fs::remove_dir_all(node.dir.path().join("data")).unwrap();
+        let restored = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
+            .arg("--config")
+            .arg(node.dir.path().join("kimmy.toml"))
+            .arg("restore")
+            .arg("--from")
+            .arg(backup)
+            .arg("--until")
+            .arg(until_ms.to_string())
+            .env("KIMMY_ROOT_PASSWORD", ROOT_PASSWORD)
+            .output()
+            .expect("running kimmyd restore --until");
+        assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
+        eprintln!(
+            "{}: {}",
+            node.name,
+            String::from_utf8_lossy(&restored.stderr)
+                .lines()
+                .find(|l| l.starts_with("rewound"))
+                .unwrap_or("")
+        );
+        for file in [kimmy_cluster::catchup::FILE, "kimmy.replay-floor"] {
+            let _ = std::fs::remove_file(node.dir.path().join("data").join(file));
+        }
+    }
+    for node in [&mut a, &mut b, &mut c] {
+        node.restart_with(&[]);
+    }
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    let tokens = [a.login(&client).await, b.login(&client).await, c.login(&client).await];
+    let nodes = [&a, &b, &c];
+    eprintln!("after the rewind: orders/1 {:?}", doc_vs(&client, &nodes, &tokens, 1).await);
+    eventually("every member to hold C's write of orders/1", || {
+        let (client, nodes, tokens) = (&client, &nodes, &tokens);
+        async move {
+            doc_vs(client, nodes, tokens, 1).await.iter().all(|v| v.as_deref() == Some("\"c\""))
+        }
+    })
+    .await;
+
+    // A and B write again, another document each: their coverage of their own origin
+    // moves on, and nothing the removal left behind may delete C's write anywhere.
+    insert(&a, &tokens[0], 3, "a").await;
+    insert(&b, &tokens[1], 4, "b").await;
+    eventually("orders/3 and orders/4 to reach every member", || {
+        let (client, nodes, tokens) = (&client, &nodes, &tokens);
+        async move {
+            doc_vs(client, nodes, tokens, 3).await.iter().all(Option::is_some)
+                && doc_vs(client, nodes, tokens, 4).await.iter().all(Option::is_some)
+        }
+    })
+    .await;
+    assert_eq!(
+        doc_vs(&client, &nodes, &tokens, 1).await,
+        vec![Some("\"c\"".to_string()); 3],
+        "every member still holds C's write"
+    );
+    eprintln!(
+        "repairs applied A={:?} B={:?} C={:?}",
+        a.gauge(&client, "kimmy_sync_digest_repairs_total{outcome=\"applied\"}").await,
+        b.gauge(&client, "kimmy_sync_digest_repairs_total{outcome=\"applied\"}").await,
+        c.gauge(&client, "kimmy_sync_digest_repairs_total{outcome=\"applied\"}").await,
+    );
+}

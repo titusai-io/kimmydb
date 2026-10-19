@@ -3160,6 +3160,177 @@ fn a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_
     assert_eq!(pull(&cluster), 0, "a second repair writes nothing: no loop");
 }
 
+/// The insert a rewind removes was judged against a write at or below the target. C inserts
+/// `orders/1` at t150; B takes an insert of it stamped t300 first (its own, or A's), and C's
+/// loses last-writer-wins there, witnessed without an append. B's oplog holds no entry of the
+/// document at or below the target t200, so the rewind removes it. C's t150 write is at or below
+/// the target and is kept, so every member ends holding it: whether B alone is rewound, or every
+/// member is (A and B remove the document, C keeps its own), or every member is after A's t300
+/// insert reached C as well (C puts its own t150 entry back).
+#[test]
+fn row_a_rewind_that_removes_a_document_keeps_a_judged_write_at_or_below_the_target() {
+    let alone = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         B.write(orders/1)@300; B<-C entries; A<-C entries; B.rewind@200",
+    );
+    let every = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         A.write(orders/1)@300; B<-A entries; B<-C entries; A.rewind@200; B.rewind@200; \
+         C.rewind@200",
+    );
+    let every_c_lost = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         A.write(orders/1)@300; B<-A entries; C<-A entries; B<-C entries; A<-C entries; \
+         A.rewind@200; B.rewind@200; C.rewind@200",
+    );
+    row(
+        "a removal and a judged write",
+        &[],
+        &[
+            ("B alone rewound past its own insert", alone),
+            ("every member rewound", every),
+            ("every member rewound, C's write lost on C too", every_c_lost),
+        ],
+        &[(ORDERS, Some(&[1]))],
+    );
+}
+
+/// The same schedules, and then a rewound member writes again. Whatever the removal leaves on
+/// a rewound member must not delete C's kept t150 write on the members that hold it, once that
+/// member's coverage moves past it.
+#[test]
+fn row_a_rewind_that_removes_a_document_deletes_no_kept_write_once_the_member_writes_again() {
+    let alone = "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+                 B.write(orders/1)@300; B<-C entries; A<-C entries; B.rewind@200";
+    let every = "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+                 A.write(orders/1)@300; B<-A entries; B<-C entries; A.rewind@200; B.rewind@200; \
+                 C.rewind@200";
+    row(
+        "a removal, a judged write, and a later write",
+        &[],
+        &[
+            ("B alone rewound, then B writes", parse(&format!("{alone}; B.write(orders/2)@400"))),
+            (
+                "every member rewound, then B writes",
+                parse(&format!("{every}; B.write(orders/2)@400")),
+            ),
+            (
+                "every member rewound, then A writes",
+                parse(&format!("{every}; A.write(orders/2)@400")),
+            ),
+        ],
+        &[(ORDERS, Some(&[1, 2]))],
+    );
+}
+
+/// A removal does not bring back a document a delete at or below the target removed. C inserts
+/// `orders/1` at t120 and B deletes it at t130; A takes the delete, C does not. B inserts it
+/// again at t300, over its tombstone, and a retention pass collects every entry of B's at or
+/// below t135. The rewind to t200 finds no entry of the document at or below the target and
+/// removes it; the document was deleted at the target, so no member ends holding it, C's stale
+/// t120 copy included.
+#[test]
+fn row_a_rewind_that_removes_a_document_brings_back_no_deleted_one() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@120; B<-C entries; \
+         A<-C entries; B.delete(orders/1)@130; A<-B entries; A.write(orders/3)@140; \
+         B<-A entries; B.write(orders/1)@300; B.retention@1135; B.rewind@200",
+    );
+    row(
+        "a removal over a deleted document",
+        &[],
+        &[("A holds the delete", ops)],
+        &[(ORDERS, Some(&[3]))],
+    );
+}
+
+/// A removal after a retention pass keeps what retention collected covered (ADR-243): the
+/// case of `row_a_rewind_after_retention_keeps_the_members_collected_drop`, with an insert of
+/// B's after the target that the rewind removes. Bounded by what it keeps alone, B's own
+/// origin, every entry of which retention collected, would fall below its collected drop.
+#[test]
+fn row_a_rewind_that_removes_a_document_after_retention_keeps_the_members_collected_drop() {
+    let ops = vec![
+        create(A, ORDERS, 100),
+        create(A, ITEMS, 110),
+        write(A, ORDERS, 1, 120),
+        pull(B, A),
+        pull(C, A),
+        drop_coll(B, ITEMS, 170),
+        write(C, ORDERS, 0, 190),
+        pull(B, C),
+        retention(B, 1730),
+        write(B, ORDERS, 7, 1760),
+        rewind(B, 1757),
+        write(A, ITEMS, 5, 1800),
+        write(A, ITEMS, 6, 1801),
+    ];
+    row(
+        "a removal after retention",
+        &[],
+        &[("B's insert after the target removed", ops)],
+        &[(ORDERS, Some(&[0, 1])), (ITEMS, Some(&[5, 6]))],
+    );
+}
+
+/// A judged write below a kept entry of its origin (accepted, ADR-246). C writes `orders/1` at
+/// t150, which loses on B to B's own t300 insert, and `orders/2` at t180, which B appends. The
+/// rewind removes `orders/1`, but invariant I keeps B's coverage of C at the t180 entry it
+/// keeps, above the judged write, so pure entries never send it again. The divergence check's
+/// count half does: B holds one document fewer than its peers, and the replay from the
+/// collection's creation brings C's write to a row B no longer holds.
+#[test]
+fn row_a_rewind_that_removes_a_document_below_a_kept_entry_of_the_judged_origin() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         C.write(orders/2)@180; B.write(orders/1)@300; B<-C entries; A<-C entries; B.rewind@200",
+    );
+    row(
+        "a removal and a judged write below a kept entry",
+        &[],
+        &[("B alone rewound", ops)],
+        &[(ORDERS, Some(&[1, 2]))],
+    );
+}
+
+/// The residual of a removal (accepted as ADR-085's stale-rejoiner class, ADR-246), pinned by
+/// its exact shape so that a change in it shows. C inserts `orders/1` at t120 and B deletes it
+/// at t130; neither A nor C takes the delete before B's retention pass collects its entry. B
+/// inserts the document again at t300, over its tombstone, and is rewound to t200: its oplog
+/// holds no entry of the document at or below the target, so the rewind removes it, and the
+/// delete, which only B applied and whose tombstone B replaced, is forgotten. A and C, which
+/// missed the delete for longer than B's oplog window, hold the document from before it, and
+/// it comes back to every member on the repaired and the pages routes.
+#[test]
+fn residual_a_rewind_forgets_a_delete_only_the_rewound_member_applied() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@120; \
+         B<-C entries; A<-C entries; B.delete(orders/1)@130; A.write(orders/3)@140; \
+         B<-A entries; B.write(orders/1)@300; B.retention@1135; B.rewind@200",
+    );
+    for outcome in check_routes(&ops, &[Route::Entries, Route::Pages]) {
+        if outcome.route == Route::Entries {
+            continue;
+        }
+        let found: Vec<(Category, String)> =
+            outcome.failures.iter().map(|f| (f.category, f.detail.clone())).collect();
+        let expected: Vec<(Category, String)> = ["A", "B", "C"]
+            .into_iter()
+            .map(|m| {
+                (
+                    Category::LostDelete,
+                    format!("{m} holds orders/1 at t120.1C, which a delete at t130.1B removed"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found, expected,
+            "{:?}: the residual's exact shape\n{}",
+            outcome.route, outcome.report
+        );
+    }
+}
+
 /// ADR-236's residual 1, accepted as by design (ruled 2026-10-15), pinned by its exact shape
 /// so that a change in it shows. A drops the database while holding `items`, and buries it with
 /// an entry of its own stamp (t130.2A). B drops the database later, never having held `items`,

@@ -2628,23 +2628,25 @@ impl Engine {
     /// collected entry was told so, and no page of this member's could vouch for
     /// its own collected drop.
     ///
-    /// **The exception is a document the rewind put back to an earlier entry.**
-    /// The member can cover a write of that document it never appended, judged
-    /// against a write the rewind discarded: one that lost last-writer-wins to it,
-    /// or one a snapshot's grant covers while the page carried the later write.
-    /// The document now holds an older entry, and the coverage would keep every
-    /// peer from sending the judged write again. So when `restored_floor`, the
-    /// lowest stamp among the entries the rewind restored, is given, each entry is
-    /// also bounded by `max(restored_floor, kept, collected)`, `kept` being the
-    /// newest entry of that origin the rewind keeps that is not held and
-    /// `collected` the newest entry of it retention removed: the member asks again
-    /// for what it may have judged above the floor, never claims less than an entry
-    /// it keeps, and never less than what retention collected, even when the
-    /// restored entry arrived after a retention pass with a stamp below it.
+    /// **The exception is a document the rewind put back to an earlier entry, or
+    /// removed.** The member can cover a write of that document it never appended,
+    /// judged against a write the rewind discarded: one that lost last-writer-wins
+    /// to it, or one a snapshot's grant covers while the page carried the later
+    /// write. The document now holds an older entry, or nothing, and the coverage
+    /// would keep every peer from sending the judged write again. So when `floor`
+    /// is given, each entry is also bounded by `max(floor, kept, collected)`,
+    /// `kept` being the newest entry of that origin the rewind keeps that is not
+    /// held and `collected` the newest entry of it retention removed: the member
+    /// asks again for what it may have judged above the floor, never claims less
+    /// than an entry it keeps, and never less than what retention collected, even
+    /// when the restored entry arrived after a retention pass with a stamp below
+    /// it. `floor` is the lowest stamp among the entries the rewind restored, or
+    /// zero when it removed a document: a removed document holds nothing, so any
+    /// write of it at or below the target may be one it judged (ADR-246).
     ///
     /// Each vector's entry for origin `X` becomes `min(V[X], until)`, and also at
-    /// most `max(restored_floor, kept[X], collected[X])` when a document was
-    /// restored. That keeps every invariant the vectors carry. Every kept entry is
+    /// most `max(floor, kept[X], collected[X])` when a document was restored or
+    /// removed. That keeps every invariant the vectors carry. Every kept entry is
     /// at or below `until`, at or below `kept[X]`, and was at or below the servable
     /// vector or held, so invariant I holds. Both vectors take the same bounds, so
     /// witnessed stays at least servable. Nothing is raised, so no held entry is
@@ -2655,7 +2657,7 @@ impl Engine {
         txn: &redb::WriteTransaction,
         schema: u8,
         until: Hlc,
-        restored_floor: Option<Hlc>,
+        floor: Option<Hlc>,
     ) -> Result<usize> {
         #[cfg(test)]
         if crate::rewind::test_support::fails_the_lowering() {
@@ -2703,7 +2705,7 @@ impl Engine {
                 let node = decode_node(node.value())?;
                 let before = decode_hlc(hlc.value())?;
                 let mut after = before.min(until);
-                if let Some(floor) = restored_floor {
+                if let Some(floor) = floor {
                     after = after.min(floor.max(kept.get(node)).max(collected.get(node)));
                 }
                 if after < before {
@@ -2720,7 +2722,7 @@ impl Engine {
         // writer keeps it), and the lowering keeps it, as above. So the rewind
         // records it, as a walk at open would, and the next open skips the walk.
         crate::verified::write(txn, schema, &walk)?;
-        info!(lowered, %until, ?restored_floor, "lowered the version vectors to the rewind's target");
+        info!(lowered, %until, ?floor, "lowered the version vectors to the rewind's target");
         Ok(lowered)
     }
 
@@ -3560,10 +3562,9 @@ impl Engine {
     ///
     /// **And the rewinds' records.** A rewind removes every entry above its target and
     /// lowers both vectors to it (ADR-243), so neither the tail nor a vector names what
-    /// it discarded, nor the tombstones it minted for documents created after the
-    /// target. A member whose clock led its wall clock would otherwise resume below
-    /// them: its next writes stamped inside the discarded range, where a stamp
-    /// can be the very stamp of a discarded entry, and below its own tombstones.
+    /// it discarded. A member whose clock led its wall clock would otherwise resume
+    /// below it: its next writes stamped inside the discarded range, where a stamp
+    /// can be the very stamp of a discarded entry.
     fn resume_hlc(db: &Database) -> Result<Hlc> {
         let tail = Self::last_oplog_hlc(db)?;
         let named = [tables::OPLOG_VERSIONS, tables::OPLOG_WITNESSED]
