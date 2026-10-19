@@ -28611,8 +28611,10 @@ second close about 5 s into the run when the late `Down` lands.
 4. **A file that cannot help starts at 0, and the member walks once.** A missing file (the first start of this build on
    a data directory an older one ran, a wiped directory, a restore into a new one), one that cannot be read, one that
    does not hold a number, and one that holds 2^63 or more (a `WARN` for the last three) start at 0, which is what every
-   start did before; each renewal of that walk is recorded, so the next start is one step. A write that fails is said in
-   a `WARN` and the member goes on; it costs the next start at most the renewals it lost, one step each.
+   start did before; after a stop shorter than SWIM's down time (about 6.5 s) it may renew once more about 5 s into its
+   run, when its peers declare down the suspected identity it walked back to, which it cannot refute. Each renewal of
+   the walk is recorded, so the next start is one step. A write that fails is said in a `WARN` and the member goes on;
+   it costs the next start at most the renewals it lost, one step each.
 5. **No clock.** The value counts this member's starts and renewals, so a clock that steps back changes nothing.
 
 **Invariant.** The recorded value is at least the incarnation of every identity any process of this data directory
@@ -28647,7 +28649,8 @@ peers hold (about its number of starts since the upgrade, plus its renewals and 
 a few milliseconds a step, as 0.51 does at every start (a thousand restarts since the upgrade is a walk of a few
 seconds); from then on it walks as 0.51 does. Rolled forward again, it finds the file below what its peers hold (0.51
 did not update it) and walks once more, by the starts it made on 0.51, then takes one step. The first start of this
-build walks once for the same reason: the file is not there yet.
+build walks once for the same reason: the file is not there yet. Each of these walks may renew once more about 5 s into
+the run after a stop shorter than SWIM's down time, as item 4 says.
 
 **Tests.** `membership::incarnation`: the first start's 0, each start one above the last, a renewal recorded and the
 start after it above it, a file that is not a number, or holds 2^63 or more, started at 0 and rewritten, a directory
