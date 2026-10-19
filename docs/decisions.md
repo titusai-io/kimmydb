@@ -29126,9 +29126,11 @@ the peer held from the old process, so the peer holds the member live with no bl
 every live peer's block stays closed (the `Decimal128` net of ADR-238; ownership counts the member as no candidate,
 ADR-213), until the next contact between the two. That was up to a sync interval later: measured on three
 release-build members at the default 5 s interval, 20 restarts per shape (SIGTERM and SIGKILL, idle and under write
-load, 0 and 10 s down), a peer's window had a median of 3.2–4.7 s and a maximum of 5.0 s, and 0.15–0.7 s at a 1 s
-interval. The restarted member's own window had a 6.2 s tail under load after 10 s down: its first tick drained one
-peer for its whole budget while the other waited for the next.
+load, 0 and 10 s down), with `kimmy_ownership_peers{state="unknown"}` sampled every 10 ms, a peer's window had a median
+of 3.3–4.8 s when idle and 0.1–1.1 s under write load (whose rounds come more often), and a maximum of 5.3 s; at a 1 s
+interval, medians of 0.1–0.7 s. The restarted member's own window had a 3.7 s tail under load after 10 s down: its
+first tick drained one peer for its whole budget while the other waited for the next. With the exchange, on the same
+shapes, a peer's window was at most 0.04–0.13 s and the restarted member's 0.
 
 **Decision.**
 
@@ -29137,7 +29139,11 @@ peer for its whole budget while the other waited for the next.
    peer block (ADR-213), once for each peer it holds live.
 2. **At most one per member per sync interval**, counted from the last ask for that member whatever became of it. A
    restart after the peer declared the member down is a `Rename` and a `MemberUp` in one input, and asks once; a member
-   that flaps, or does not answer, costs one exchange an interval; the sync tick stays the fallback.
+   that flaps, or does not answer, costs one exchange an interval. **An ask the interval holds is not lost when it is
+   owed**: if the member's block, or every block, was dropped since the last ask (a rename, a down, this member's own
+   rejoin), it schedules one trailing ask for the end of the interval, at most one pending per member, which the driver
+   starts then if the member is still live, at the address it is live at; it counts as an ask at that instant. An ask
+   with no drop since the last one (the `MemberUp` beside a `Rename`) owes none.
 3. **The exchange** is the opening frame pair of a sync round and nothing after it: dial (TLS and the shared-secret
    handshake, with the test refusals), `AskVersions { witnessed: true }` with this member's block, its generation and
    its echo of the peer's block as held now, then the peer's `Vectors`, whose block is recorded ordered by its decode
@@ -29146,10 +29152,11 @@ peer for its whole budget while the other waited for the next.
    asks for on its `Vectors` stays owed to its next round), no `PeerHealth` change, no catching-up judgement, no lag
    vector. Bounded by the dial's timeouts and 10 s more for the frame pair.
 4. **Where it runs.** A driver task the replication loop spawns beside itself, and aborts when it ends; each exchange
-   is a task of its own whose panic the driver logs. The ask queue exists from the member set's creation, so an `Up`
+   is a task of its own whose panic the driver logs. The driver's timer starts each trailing ask when it is due. The ask queue exists from the member set's creation, so an `Up`
    the membership task sees before the loop starts (the daemon starts membership first) is queued. The driver reads
-   this member's block, so an exchange takes no storage step and an abort can end it anywhere.
-5. **A failed exchange** is one `DEBUG` line; the next sync contact carries the blocks.
+   this member's block at each ask, so an exchange takes no storage step and an abort can end it anywhere.
+5. **A failed exchange** is one `DEBUG` line and still counts as the member's last ask; the next sync contact carries
+   the blocks.
 
 **Why after the change.** The drop a rename makes records the decode sequence it happened at, and a block decoded
 before it is refused (ADR-213). An exchange asked after the drop reads its answer after it and keeps it. Asked before,
@@ -29158,24 +29165,31 @@ the next contact. The same holds for a rejoin's clear.
 
 **Why the opening frames, beside the loop, and not a round in it.** A tick is one arm of the loop's `select!`, and a
 tick that drains runs for up to an interval with nothing else polled: an ask that arrived during it would wait for it,
-which is the 6.2 s case. A round needs the loop's `PeerStalls` (snapshot resume, the set-aside, the repair ledger), so it
+which is the 3.7 s tail. A round needs the loop's `PeerStalls` (snapshot resume, the set-aside, the repair ledger), so it
 cannot run beside it, and a failed round goes through the back-off, which would lengthen the window it is for. The two
 frames carry both blocks and both echoes, which is all the window waits for.
 
 **Why the rejoining member asks too.** Its rejoin cleared every block it held. Its peers' renames of it ask exchanges
 that carry their blocks to it as well, but only once each has learned the new identity by gossip, and an older peer
-during a roll never asks. Its own asks close its own window at once. A peer it still holds live that has gone costs one
-failed dial in a task of its own.
+during a roll never asks. Its own asks close its own window at once. In a renewal walk (ADR-242), where each step is a
+rejoin, the seed's `Up` asks first and a later step's clear can drop what that exchange brought; that step's ask is
+held by the interval and owed, so it starts at the interval's end (item 2), no later than the next sync contact would
+have come. A peer it still holds live that has gone costs one failed dial in a task of its own.
 
 **Invariant.** Every `Up` or `Rename` of a member that a member sees, and every live peer at its own `Rejoin`, starts an
-exchange with that member unless one was started with it within the last sync interval; at most one is started per
-member per interval; and an exchange that is answered leaves its starter holding the answer's block, unless a later
-change of the same input dropped it. Model rows: the deterministic SWIM simulation (`membership::rejoin_tests`), whose
-member sets take every notification through the production handling and run each exchange inside the ask: after every
-input, each exchange it started that was answered left the starter holding the block it brought. Restarts dead for 0,
-1.5, 3 and 10 s, ten each: each peer starts exactly one exchange with the member and the member one with each peer, all
-answered, and every member holds every other's current block with no tick run; a second rename within the interval
-starts none and a later one starts one; a rejoin starts one with every live peer, in the input that rejoined.
+exchange with that member at once unless one was started with it within the last sync interval, and then, if the
+member's block was dropped since that one, at the interval's end; at most one is started per member per interval; and
+an exchange that is answered leaves its starter holding the answer's block, unless a later change of the same input
+dropped it. Model rows: the deterministic SWIM simulation (`membership::rejoin_tests`), whose member sets take every
+notification through the production handling, run each exchange inside the ask (or, for a member set so, at the end of
+the input that asked it, as the daemon's queued ones are answered) and start each trailing ask when it is due: after
+every input, each exchange it started that was answered left the starter holding the block it brought. Restarts dead
+for 0, 1.5, 3 and 10 s, ten each: each peer starts exactly one exchange with the member and the member one with each
+peer, all answered, and every member holds every other's current block with no tick run; a second rename within the
+interval starts none at once and one at the interval's end, and a rename after that one's interval starts one at once;
+a rejoin starts one with every live peer, in the input that rejoined; renewal walks of one to four steps, against peers
+that ask none and against peers on this build, with exchanges answered inside the ask and at the end of the input, end
+with every block held.
 
 **Interactions.** The catching-up marker is judged on full rounds only, so an exchange reaches no member for it; a
 marked member's block (`catching_up`) simply arrives sooner. An exchange's echo confirms a yield exactly as a round's
@@ -29184,7 +29198,8 @@ the same peer are two connections, as serving and dialling already were, and the
 sequence.
 
 **Cost.** One dial and one frame pair per member per `Up`, `Rename` or rejoin, at most one per member per interval: a
-restart costs each peer one exchange and the restarted member one per peer.
+restart costs each peer one exchange and the restarted member one per peer, and a second restart within the interval
+one more each, at its end.
 
 **Rollback.** Nothing is stored and no frame is new. An older build asks no exchanges: its own window after a start is
 up to a sync interval, as before, and a peer on this build still exchanges with it at once on seeing it renamed or up.
@@ -29195,13 +29210,23 @@ beside the loop*: needs the loop's `PeerStalls`. *Carry the block over SWIM*: a 
 (postcard is not self-describing, ADR-242's alternatives), and a block can outgrow a datagram. *No debounce*: a flapping
 member would cost a contact per flap, and a restart after a down declaration two.
 
-**Tests.** `membership::tests`: one ask per member per interval, each member on its own, from its own last ask.
-`exchange::tests`: an exchange leaves each side holding the other's block and the asker the answerer's echo of its
-own; one with a member not serving fails at the dial and records nothing; the driver runs what is asked. The simulation
-rows above. `kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync interval, one restarted three
+**Tests.** `membership::tests`: one ask per member per interval, each member on its own, from its own last ask; an
+ask the interval holds owes one trailing ask only after a drop, one pending, started at the address the member is live
+at then and not at all if it is not live. `exchange::tests`: an exchange leaves each side holding the other's block and
+the asker the answerer's echo of its own; one with a member not serving fails at the dial and records nothing; one
+with a member that completes the handshake and never answers ends at its bound; the driver runs what is asked, runs an
+ask made before it started, carries the block as it is at each ask, holds the next ask for the interval after a failed
+exchange, starts a trailing ask when it is due, and ends when its guard is dropped. The simulation rows above. `kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync interval, one restarted three
 times with SIGTERM; every member's `kimmy_ownership_peers{state="unknown"}` is sampled every 10 ms and no run above 0
 lasts a second. Mutation rows in bash, each failing a test with only that change: no ask on `Up`; none on `Rename`; no
 exchange at all (the simulation and the real-process test); the ask before the rename's drop; no debounce; the
 debounce keyed for every member at once; no ask at the own rejoin; the rejoin's asks before its clear; the interval
 inclusive; the driver not started; the answer's block not recorded; the request without a block; the answer's echo not
-noted; `AskVersions` without the witnessed flag; the driver dropping its asks.
+noted; `AskVersions` without the witnessed flag; the driver dropping its asks; no trailing ask; a trailing ask owed
+with no drop; more than one pending; one due at once; a drop, or a clear, not marked; one started for a member not
+live; the driver's timer never starting one; the driver not aborted with its guard; a failed exchange clearing the
+member's last ask; the block read once for every ask; no bound on the frame pair; asks made before the driver starts
+dropped. One more is argued equivalent rather than run: recording the answer at a sequence taken when it is recorded
+instead of when it decoded. The two are taken in one poll with no await between them, so they can differ only by a
+decode or a drop another thread makes in the same synchronous stretch, which no test can place there; the ordering rule
+itself is pinned by the simulation, whose exchanges record inside the ask.
