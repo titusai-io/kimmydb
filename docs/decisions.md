@@ -28658,7 +28658,9 @@ ten.
    leaves. In the same round, one point of each weakly connected component of cut-off points (one no other cut-off point
    has an edge into, when the component has one) is joined both ways to its two nearest linked points, found by reading
    every linked point's vector. What of the component that point does not reach is linked by the next round's search, or
-   bridged again, within the four rounds. The cost is one pass over the vectors per round, scoring each against one
+   bridged again. That is measured, not guaranteed: in 75 graphs, at toy parameters and the build's, every one was left
+   with no point cut off within two rounds of the four, and none reached the retry; a component still cut off after
+   the four rounds goes to the structural retry of item 3. The cost is one pass over the vectors per round, scoring each against one
    point per component, which looks at the node's stop every 4,096 vectors; nothing when no point was stranded. Seen at
    toy parameters (four connections, construction effort 8, two tight clusters inserted one after the other: the second
    cluster's 40 of 80 points, every one stranded), where the bridge leaves none cut off; at the build's parameters and
@@ -28686,10 +28688,12 @@ ten.
    connection count, distance and element type, every point once, every neighbour and entry rank inside its layer, no
    NaN distance, every vector's squared length a finite 32-bit float, nothing after the end. A finite component is not
    enough: 3e38 is finite and its square is not, and two components of 1.31e19 square to finite numbers that sum past
-   `f32::MAX`. The exact scan scores such a vector 0, and the library's cosine distance between two such vectors is NaN,
-   on which an assertion in it panics: a search for the vector itself, and a build whose self-check or linking searched
-   for it, panicked, and a snapshot holding one loaded and then panicked at such a search. Other searches went through,
-   since the distance from such a vector to an ordinary one is finite. A client's vectors, a query vector and a
+   `f32::MAX`. The exact scan, which sums the squares in 32-bit floats, scores either kind 0. The library's cosine
+   distance multiplies in 32-bit floats and sums in 64-bit, so it is NaN, on which an assertion in it panics, only
+   between two vectors with a component of 2^64 (about 1.8e19) or more: a search for such a vector itself, and a build
+   whose self-check or linking searched for it, panicked, and a snapshot holding one loaded and then panicked at such a
+   search. Other searches went through, since the distance from such a vector to an ordinary one is finite, and at
+   1.31e19 only the exact scan failed. A client's vectors, a query vector and a
    provider's answer are held to the same test where they enter (`search::searchable`). Refused is a
    rebuild, as every unusable snapshot already was. The audit is a test that hands 39 spoiled dumps to the raw loader in
    child processes and prints what each does (two exit, three abort, the rest panic, return an error, or load).

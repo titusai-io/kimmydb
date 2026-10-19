@@ -1,6 +1,6 @@
 # ADR-241: the mutation rows, and the test that kills each
 
-This is the table [ADR-241](decisions.md) refers to. Each row is a change to the source that must make a test fail: it was applied to the post-format text of a `git archive 6d4ff597` export, the named tests were run by exact name under an 1,800 s timeout and each had to run, and the change was reset. A row recorded as *equivalent* cannot be killed, and says why. **35 rows: 34 killed, one equivalent (O19).** Rows M are the change's own, and the rows O and R were added later. M1 builds against hnsw_rs 0.3.4 carrying the same added function, so that it compiles.
+This is the table [ADR-241](decisions.md) refers to. Each row is a change to the source that must make a test fail: it was applied to the post-format text of a `git archive 6d4ff597` export, the named tests were run by exact name under an 1,800 s timeout and each had to run, and the change was reset. A row recorded as *equivalent* cannot be killed, and says why. **36 rows: 34 killed, two equivalent (O19, R10).** Rows M are the change's own, and the rows O and R were added later. M1 builds against hnsw_rs 0.3.4 carrying the same added function, so that it compiles.
 
 ## The library, the linking and the build's retry
 
@@ -17,6 +17,7 @@ This is the table [ADR-241](decisions.md) refers to. Each row is a change to the
 | O20 | the bridge enters a component and does not leave it | killed | `the_linking_bridges_a_component_no_search_reaches` |
 | R4 | the bridge joins one nearest linked point each way, not two | killed | `a_bridge_joins_one_point_per_component_to_its_two_nearest_linked_points` |
 | R9 | the bridge's pass never looks at the node's stop | killed | `a_bridge_joins_one_point_per_component_to_its_two_nearest_linked_points` |
+| R10 | the bridge prefers no point to head its component (the first in id order) | equivalent | the preference only spares rounds: a head with an edge into it from its component reaches less of it, and the next round links or bridges the rest, so the graph ends with nothing cut off either way |
 
 ## The dump check and the graph mark
 

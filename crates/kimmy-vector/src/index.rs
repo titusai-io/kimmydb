@@ -499,8 +499,10 @@ where
 /// one that no other cut-off point has an edge into when the component has
 /// one, is joined both ways to its [`LINK_EDGES`] nearest linked points,
 /// found by reading every linked point. Whatever of the component that point
-/// does not reach is linked by the next round's search, or bridged again,
-/// within [`LINK_ROUNDS`]. The cost is one pass over the graph's vectors,
+/// does not reach is linked by the next round's search, or bridged again: in
+/// every graph measured within two of the [`LINK_ROUNDS`], and a component
+/// left after them is the build's structural retry. The cost is one pass over
+/// the graph's vectors,
 /// scoring each against one point per component, which looks at the node's
 /// stop as it goes; and nothing when no point was stranded.
 fn bridges<D>(
@@ -541,7 +543,9 @@ where
         }
     }
     // One head per component: its first point no other cut-off point has an
-    // edge into, from which the walk reaches furthest, else its first point.
+    // edge into, when it has one, else its first point. The preference only
+    // spares rounds: a head with an edge into it from the component reaches
+    // less of it, and the next round links or bridges the rest.
     let mut head_of: std::collections::BTreeMap<usize, usize> = Default::default();
     for &point in &cut {
         let component = root(&mut parent, point);

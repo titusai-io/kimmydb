@@ -369,10 +369,11 @@ Requires `write` on the collection — this is derived data about a document you
 can already write, not an administrative act. The document must exist (there is
 no HLC to attach otherwise, so a missing one is `404`), and every vector must
 match the configured `dim` or the request is `400`. So is a vector whose
-squared length is not a finite 32-bit float (a component of about 1.8e19 or
-more, or squares summing past `f32::MAX`): the exact scan scores it 0, and the
-graph's distance between two such vectors is NaN, on which the library panics
-at a search for the vector itself. A query vector is held to the same test,
+squared length is not a finite 32-bit float (a component of 2^64, about
+1.8e19, or more, or squares summing past `f32::MAX`): the exact scan scores it
+0, and the graph's distance between two vectors with a component of 2^64 or
+more is NaN, on which the library panics at a search for such a vector
+itself. A query vector is held to the same test,
 and a provider's answer holding one is refused as unusable
 ([ADR-241](decisions.md)).
 

@@ -6423,9 +6423,10 @@ async fn searching_a_collection_with_no_vectors_says_so() {
 /// it enters, as a client's chunk and as a query (ADR-241): a component of
 /// 3e38 is finite and its square is not, and two components of 1.31e19 each
 /// square to a finite number and sum past `f32::MAX`. The exact scan scores
-/// such a vector 0, and the graph's distance between two of them is NaN, on
-/// which the library panics. Two components of 1.3e19 sum below it, and are
-/// stored. (A component past `f32::MAX` is already refused by the body's
+/// either vector 0; the graph's distance between two vectors with a component
+/// of 2^64 or more is NaN, on which the library panics, and at 1.31e19 it is
+/// finite, since the library sums in 64-bit floats. Two components of 1.3e19
+/// sum below `f32::MAX`, and are stored. (A component past `f32::MAX` is already refused by the body's
 /// parse, as out of range.)
 #[tokio::test]
 async fn a_vector_too_large_to_score_is_refused_as_a_chunk_and_as_a_query() {

@@ -190,10 +190,11 @@ pub(crate) fn check(dir: &Path, expect: &Expect<'_>) -> Result<(), String> {
             }
             data.exact(&mut vector, "a vector")?;
             // A search computes distances from these. `is_finite` alone does
-            // not protect it: a finite component whose square overflows (3e38)
-            // makes the cosine distance between two such vectors NaN, which the
-            // library's distance asserts against when a search for one meets
-            // the other or itself.
+            // not protect it: a finite component of 2^64 or more, whose square
+            // overflows (3e38), makes the cosine distance between two vectors
+            // holding one NaN, which the library's distance asserts against
+            // when a search for one meets the other or itself; the exact scan
+            // scores any vector whose squares sum past `f32::MAX` 0.
             let components: Vec<f32> =
                 vector.as_chunks::<4>().0.iter().map(|b| f32::from_ne_bytes(*b)).collect();
             if !crate::search::searchable(&components) {
