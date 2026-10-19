@@ -28826,14 +28826,16 @@ peer is told `Collected`), `a_rewind_of_a_restored_store_after_retention_keeps_t
 oplog window passed, the tombstones kept) and a rewind step, taken by named rows only, and its ghost forgets a write a
 rewind undid that no other member witnessed. Its rows, on every route: the case above with a control without the
 rewind; a restored document and a loser it judged (one member rewound, and every member); a restored document and a
-grant; a loser above the target; a restored entry that arrived after a retention pass below what it collected; and
-a re-fetch after a rewind that meets a held tombstone, or is not asked for once the delete's entry is collected. `a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_document_repair`
+grant; a document put back to a delete; an entry held as state, never counted as kept; a loser above the target; a
+restored entry that arrived after a retention pass below what it collected; and a re-fetch after a rewind that meets
+a held tombstone, or is not asked for once the delete's entry is collected. `a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_document_repair`
 pins the repair's case, and the cluster harness's
 `a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_write` runs it through real processes and the
 real repair. Mutation rows, in bash, each failing a test with only its own change: the servable vector not lowered;
 the witnessed vector not lowered; each vector rebuilt from the oplog as 0.51 did; the witnessed vector set to the
 lowered servable one; the verified record not written; no bound under a restored document; the bound without
-`kept[X]`; the bound without `collected[X]`; the lowering in a second transaction; the start not folding the records; the start folding only the
+`kept[X]`; the bound without `collected[X]`; the bound leaving out a document put back to a delete; held entries
+counted as kept; the lowering in a second transaction; the start not folding the records; the start folding only the
 member's own origin; the minted tombstones not recorded; the minted tombstone recorded only when an own entry was
 discarded. **Equivalent: lowering only the origins the rewind discarded an entry of.** An origin whose coverage
 reaches past the target with nothing of it discarded covers there only writes this member never appended: an entry

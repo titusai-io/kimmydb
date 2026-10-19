@@ -507,6 +507,8 @@ resolver. Something untestable in place tends to stay untested.
 | No bound under a document the rewind restores | `a_rewind_that_restores_a_document_bounds_the_vectors_by_it_and_by_what_it_keeps`, `row_a_rewind_that_restores_a_document_asks_again_for_a_loser_it_judged`, `row_a_rewind_that_restores_a_document_asks_again_for_a_granted_write` |
 | The bound under a restored document without the entries it keeps (below invariant I) | `a_rewind_that_restores_a_document_bounds_the_vectors_by_it_and_by_what_it_keeps` |
 | The bound under a restored document without what retention collected | `row_a_rewind_that_restores_a_late_entry_keeps_the_coverage_of_what_retention_collected` |
+| The bound leaves out a document put back to a delete | `row_a_rewind_that_restores_a_document_to_a_delete_asks_again_for_a_loser_it_judged` |
+| The entries the bound keeps include those held as state | `row_a_rewind_never_counts_an_entry_held_as_state_as_kept` |
 | Lower the vectors in a second transaction after the rewind's | `a_rewind_that_fails_while_lowering_the_vectors_writes_nothing` |
 | Fold only the member's own origin of the rewinds' records | `a_start_after_a_rewind_resumes_past_a_peers_discarded_stamp` |
 | Record the minted tombstone only when the rewind discarded an entry of the member's own | `a_start_resumes_past_a_tombstone_minted_for_a_peers_insert` |
