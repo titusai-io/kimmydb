@@ -28725,7 +28725,7 @@ with it, and not be offered while any member could carry the write without it.
    `outcome_unknown` if that flush fails, as the first attempt's commit would: without the barrier a duplicate could be
    told `200` for a write the next flush then fails to make durable.
 
-3. **A record lives its window, and outlives a drop of its collection** (Chris, 2026-10-18, D2 option A). A record
+3. **A record lives its window, and outlives a drop of its collection** (Chris, 2026-10-18). A record
    is judged by its `last`: it is absent once `last` is past the window, at the cutoff the retention pass collects
    at, so no record is replayed past the window that removes it, and a record a peer sends that is already past it is
    not stored unless the live record here is of the same request, the same fingerprint (merged into the live record
@@ -28811,7 +28811,7 @@ with it, and not be offered while any member could carry the write without it.
      vector reaches (F3): a row a page or a lost entry left, which no window of the sender would otherwise ever vouch
      for. A replay page carries its own advance and the F3 records, and **every live record of the collections its
      entries name whose `last` is above the page's start and whose `first` is at or below its end, carried at its
-     `first`** (B2 of the build review, `Engine::records_for_replay_page`): a request whose attempts all ended on
+     `first`** (the spanning records, `Engine::records_for_replay_page`): a request whose attempts all ended on
      other members merges into a record with no row of the restored member's origin, and without them the replay
      handed that member its own effects bare. Carried at `first`, such a record rides with the first entry of its
      collection the member takes, so a page that stops between an effect and `last` stores it. **A sender ships a record at a row of its own. A
@@ -28822,7 +28822,7 @@ with it, and not be offered while any member could carry the write without it.
      fit counts every record, the F3 records first, each other with the first entry at or after its row; **when the F3
      records alone overfill a frame, the window carries no entries and grants nothing** (`Fits::Nothing`) until the
      sender has pulled their entries, and the sender logs it at `WARN`. **When no entry fits with the records riding
-     the first** (m1 of the build review), a pull is answered with a partial window of records alone: the F3 records
+     the first**, a pull is answered with a partial window of records alone: the F3 records
      and, in carrying order, the riders that fit, ending just before the first left out (or before the first entry),
      so it grants coverage only below the rows of what it carries and the next window carries the rest; a push sends
      nothing and leaves the change to anti-entropy; a replay page carries records alone, in key order, at the same
@@ -28867,7 +28867,7 @@ with it, and not be offered while any member could carry the write without it.
      `last`, `done` over `applying` at an equal one, and at an equal `last` and state the record whose bytes (but for
      `first` and the contested bit) are greater, so the merge is commutative as well as associative and idempotent,
      and every member picks the same record. **`contested`** is set when either side is or when the two fingerprints
-     differ (KR): a local store never merges two fingerprints, since its lookup refuses another one before anything is
+     differ: a local store never merges two fingerprints, since its lookup refuses another one before anything is
      written, so two meet only in a peer's merge, and the flag says the requests merged into the record are two or
      more. A function of the union, computed beside `first` after the winner is picked and never part of the
      tie-break, it keeps the join's three properties. A contested record is refused at every keyed lookup, before a
@@ -28881,7 +28881,8 @@ with it, and not be offered while any member could carry the write without it.
      scope, `carrying`, record bytes). It may carry records that ride no shipped entry, and `carrying` names the
      sender's row. An older receiver ignores it. **`AskEntries` gains `replay`**, a `bool` read as `false` when
      absent and not written when false: the outbound replay (the restored member asking a peer, `replay_own_origin`)
-     sets it, and the sender cuts its answer as a replay page, sized to the frame by the sender, with B2's records.
+     sets it, and the sender cuts its answer as a replay page, sized to the frame by the sender, with the spanning
+     records.
      A 0.51 sender ignores it and answers the window as a pull, which is safe: 0.51 holds no records, and keyed
      writes are taken only while every live member says it carries records. **`AskEntries` and `Entries` gain an
      optional, leniently read `replay_records`**, the records cursor above, which an older build ignores and an
@@ -28910,7 +28911,7 @@ with it, and not be offered while any member could carry the write without it.
      records for the whole window ahead of what may be a handful of documents, which is accepted, since a bound on the
      page's stamps would miss a record whose rows lie below them. The walk visits, for its records only, every
      collection the sender dropped and has not created again while its tombstone stands, and the delta carries a record
-     whatever its collection's state: a key outlives a drop of its collection for its window (D2, option A), so a member
+     whatever its collection's state: a key outlives a drop of its collection for its window (item 3), so a member
      rebuilt by snapshot answers a retry of it as the members that saw the drop do. **One byte budget per page:**
      `SNAPSHOT_PAGE_BYTES`, 63 MiB (`MAX_FRAME` less 1 MiB for what is not counted), less what the page's definitions,
      drops and vector take, shared in order by the delta, the records phase and the documents and tombstones, a
@@ -28925,7 +28926,7 @@ with it, and not be offered while any member could carry the write without it.
      records phase). **A converge repair's bound** (ADR-237: it ends once it has walked the collection's size at
      planning) **counts the documents and tombstones its pages carried**, against that size and two full pages more, not
      its pages: a page cut short by its bytes, or one of records only, carries fewer than 512 rows, and counted as a
-     page either ended the repair before it had walked the collection (the build review's m6). Where every page is full
+     page either ended the repair before it had walked the collection. Where every page is full
      the bound is what it was.
    - **The page delta.** A keyed write on the sender after a collection's records phase and before the page that holds
      its document would reach the receiver without its record. So each member keeps a node-local **change log**,
@@ -28939,7 +28940,7 @@ with it, and not be offered while any member could carry the write without it.
      the documents. **The epoch** is a random `i64` the log is given when it begins: with its first change, or at an
      open that finds records and no log of this node's identity (a restore, since a backup carries no log; an identity
      reset), before any page is cut, so a store that holds records always has one, and a sender restored twice during
-     one pull cuts bases of two epochs (the build review's m4). Keys are compared only within one epoch: a base of
+     one pull cuts bases of two epochs. Keys are compared only within one epoch: a base of
      another epoch, or a key without one, restarts the cursor's collection from its records phase, since a sender
      restored onto a host whose clock is behind logs keys below a base cut before the restore, which no comparison of
      keys can tell; the zero base of a log that had held nothing is sent every change. **The requester holds a page asked with the zero base to the epoch the page
@@ -28950,7 +28951,7 @@ with it, and not be offered while any member could carry the write without it.
      is never refused again. That costs one records-phase restart when a sender's first keyed write lands during a pull,
      accepted. A 0.51 sender writes no `records_epoch` and holds no records; a 0.51 receiver ignores the field. With the
      open's beginning (item 6), a sender restored during a pull, once or twice, never lands an effect without its
-     record (the build review's m4). **The remainder rule:** a page carries documents only with the whole
+     record. **The remainder rule:** a page carries documents only with the whole
      remainder of the log above its base within the page's byte budget and 65,536 log rows; otherwise it is a
      records-only page, its document position unchanged and its base moved to the last key it examined, logged at
      `INFO`. A sender whose keyed
@@ -29098,17 +29099,17 @@ as built and accepted:
 - **A router with no gate installed reads as open**; **`kimmy_idempotency_requests_total` counts as item 8 says**; and
   **`GET /v1/version` publishes the engine's own window**, so the two cannot disagree.
 
-Five changes replaced parts of the design after the built parts were reviewed (the G1 analysis of how an effect could
-be relayed without its record, and the model test): **records travel with coverage** (item 5's F1 to F3 and the store
+Five changes replaced parts of the design after the built parts were reviewed (an analysis of how an effect could be
+relayed without its record, and the model test): **records travel with coverage** (item 5's F1 to F3 and the store
 on coverage), where the design stored a frame's record only in the run that took an entry of its collection, which
 left a relayed effect bare when its entry lost or its window was cut inside a commit; **`last` is a commit's last
 entry** (L1, item 2), where the design's first entry let a drop in that entry's millisecond bury a record whose
 later entry stood (moot since records outlive a drop; it stays as the truer `last` the window is measured on); **the lookahead** (G8, item 4), where the design's record-only `done` commit never reached a member
 that had pulled the last writing chunk; **the page delta** (item 5), which closes the scoped-repair residual the design
 accepted; and **a record's own row** (P1, item 5), where a row an earlier record under the key had left could ship the
-record standing now (P1's drop-purge half is moot since records outlive a drop). Three more followed the build review
-of the merged head (FIX FIRST): **records outlive a drop** (Chris, 2026-10-18, D2 option A; item 3), where the design's
-life rule made a record of a dropped life history and the purge removed it; **the contested flag** (KR, items 1 and
+record standing now (P1's drop-purge half is moot since records outlive a drop). Three more followed a review
+of the merged head: **records outlive a drop** (Chris, 2026-10-18; item 3), where the design's
+life rule made a record of a dropped life history and the purge removed it; **the contested flag** (items 1 and
 5), where two members that accepted one key for two requests merged their records into one whose answer was one
 request's and whose `first` could be the other's; and **a record past its window is not stored** unless the live
 record is of its own request (item 3), where it could merge into a new request's record and lower its `first`.
@@ -29168,7 +29169,8 @@ dropped life is history, absent on lookup and purged with the drop): a sender th
 still serves that life's entries, a member the drop has not reached yet takes a keyed `$inc` among them without its
 record, and a retry there writes again, stamped after the drop, which the next life keeps (ADR-236); closing that
 under the rule needed attempt segments carried in the record, since a resume-time rule read from a member's rows
-reopened a double, and the price of ruling A is only that a retry after a drop and recreate replays the old answer.
+reopened a double, and the price of records outliving a drop is only that a retry after a drop and recreate replays
+the old answer.
 **Replaying a contested record's winner to its own fingerprint**: one more branch, to keep a reply for one client of a
 client bug.
 
@@ -29177,9 +29179,9 @@ the construction against RFC 9562 B.2's published vector. **The model test** (`k
 `idempotency_model_tests.rs`): three or four engines run seeded schedules of keyed writes and retries on any member,
 crashes before and after any commit and failed fsyncs, pulls (short ones cut inside a window), scoped and converge
 pages, whole-database snapshots with writes between their pages, outages, restarts, backups and restores with
-the own-origin replay (its pages cut as the transport cuts them, in a frame of a few units: B2's records, and records
-alone under a records cursor), with steps between the replay's pages and the sender itself restored between a
-snapshot's pages (m4), rewinds (`restore --until`), orphan rows by stamp, drops and re-creations, unkeyed writes and
+the own-origin replay (its pages cut as the transport cuts them, in a frame of a few units: the spanning records, and
+records alone under a records cursor), with steps between the replay's pages and the sender itself restored between a
+snapshot's pages, rewinds (`restore --until`), orphan rows by stamp, drops and re-creations, unkeyed writes and
 retention with a moved clock, with steps run between any two commits of a request; it asserts I1 to I7 (never on its own effect, the record with the effect, once per
 member, convergence, exact on one member, never over, no replacement across requests), I8 (an `$inc` completes
 with every counter older than its merged `first` applied, never on another request's `first`) and Life (a member
@@ -29189,7 +29191,8 @@ into it, as the test tracks them, are two or more; a lookup refuses exactly wher
 request's; and a request whose record turns contested between two of its chunks commits no more and answers
 `partially_applied`. Every record a frame or page carries stands on its sender and rides at or above its `first`. `generated_schedules_short` runs in CI;
 `generated_schedules_long` is ignored, a gate of record, `IDEM_SEEDS` seeds `IDEM_THREADS` at a time. Named rows write
-out the G1 analysis's breaks and the shapes the mutants need; `row_f1_a_window_cut_inside_a_commit` is the one that
+out the breaks the analysis of relays without the record found, and the shapes the mutants need;
+`row_f1_a_window_cut_inside_a_commit` is the one that
 makes F1 load-bearing: a keyed `$inc` of two counters in one commit, a short pull by B that ends at the commit's first
 entry, so the only row of the record the window's advance holds is the one at `first`, and a retry on B must replay.
 Two classes are counted and do not fail a run: **S1**, a record at
@@ -29197,7 +29200,8 @@ quiescence that the merged record dominates, or none where no document holds the
 that lost where the member pulled them, or by a record-only `done`, harmless while I2 holds; and **R1**, the writes of a
 reset or restored identity that peers keep only as page state never converge to it, a convergence matter outside this
 ADR. The mutation harness (`scripts/idempotency-mutants/`, run under bash) applies each mutant to an exported tree and
-runs its suites, the model's among them; [every mutation row of B5, run again together on the merged head, is listed
+runs its suites, the model's among them; [every mutation row of idempotency keys, run again together on the merged
+head, is listed
 with the test that kills it](adr-240-mutation-rows.md): 313 rows, 297 killed, 5 equivalent and 3 superseded, and the 8
 that G repeated from C run once. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
 path, a record outliving a drop (the purge, a database drop, a late drop, a resume across a drop, a delete by id whose
@@ -29206,21 +29210,25 @@ refused on store, the coalesced barrier, the fsync and write faults, restarts, t
 and its residual, resumes across crashes and members, retention and the row at `first`, the clock, the rewind and its
 rows, the backup and the rows it carries, a row whose record is gone shipping nothing), `idempotency_repl_tests.rs` (windows,
 receivers, the store on coverage, a record at its own row and with the entry at its row, a batch that ends early, the
-snapshot's records phase and an older receiver, repair and converge pages), `idempotency_coverage_tests.rs` (the G1
-analysis's G1b, G2, G2b, G3, T2 and G8 as storage tests) and `page_delta_tests.rs` (the R1 and R2 schedules, the base
+snapshot's records phase and an older receiver, repair and converge pages), `idempotency_coverage_tests.rs` (the
+analysis's relays after a snapshot, of a losing entry and of a coverage-only window, the cross-origin relay and G8 as
+storage tests) and `page_delta_tests.rs` (the R1 and R2 schedules, the base
 read in the page's own transaction, the remainder rule by bytes and rows, a resumed pull, the epoch after a restore, an
-identity reset and a clock behind), `idempotency_review_tests.rs` (what the build review's M1 found untested: every
+identity reset and a clock behind), `idempotency_review_tests.rs` (mutants a review found no test killed: every
 record and the change log expiring, the log kept across a pull's pages, a records-only page inside a records phase)
-and `idempotency_replay.rs` (B2's selection, an orphan row, the records cursor's set, its delta and its epoch);
-`kimmy-cluster`'s `replay_tests.rs` (B2 on both ways, F3 on a replay page, a page that stops between a request's
+and `idempotency_replay.rs` (the spanning records' selection, an orphan row, the records cursor's set, its delta and
+its epoch);
+`kimmy-cluster`'s `replay_tests.rs` (the spanning records on both ways, F3 on a replay page, a page that stops between
+a request's
 effects and its `last`, an orphan row on both ways, and records at a replay's start filling several pages on both
-ways), a pull and a push whose first entry cannot cross with its records, and the build review's B1 schedules (a
+ways), a pull and a push whose first entry cannot cross with its records, and the lowest-row schedules (a
 batch stopped, or split into runs, between two rows of one record) in `idempotency_coverage_tests.rs`. A rewind that
-cuts a keyed bulk part-way removes its record (m3). `kimmy-cluster` (`tests/idempotency.rs`, in process over real sockets): C1 pulled and
+cuts a keyed bulk part-way removes its record. `kimmy-cluster` (`tests/idempotency.rs`, in process over real sockets): C1 pulled and
 pushed, C2, C3, C5, C6 with more records than a page, C8 (an old key replays after a drop and a re-creation), C9, and a fresh multi-chunk request racing writers on two
 members; C7 as the version-boundary decodes beside the protocol.
-`kimmyd` (`tests/cluster.rs`, real processes over HTTP): C1, C2, C3, C5, C6, C8, C9 and the multi-chunk race, T2 over
-four members, and a finished multi-chunk request replaying on every caught-up member. `kimmy-api` (`tests/idempotency.rs`):
+`kimmyd` (`tests/cluster.rs`, real processes over HTTP): C1, C2, C3, C5, C6, C8, C9 and the multi-chunk race, the
+cross-origin relay over four members, and a finished multi-chunk request replaying on every caught-up member.
+`kimmy-api` (`tests/idempotency.rs`):
 the header's syntax, the route guard against `openapi.yaml`, the gate with the switch off, with an older peer (`400` on
 every keyed route, deciding over an unheard one) and with an unheard peer (`503 peer_unheard` and `Retry-After` on every
 keyed route, again after a rename, then the same key's first answer and its replay), with a peer past its lease or
