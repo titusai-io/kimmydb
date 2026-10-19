@@ -22244,6 +22244,10 @@ serves*, which leaves the commit on the start and depends on task order.
 
 ## ADR-201 — What a member says about itself on the sync contact decides who may own expiry, webhooks and embeddings
 
+> **Amended by [ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once).** A
+> member that sees a peer come up or renamed, or rejoins itself, exchanges blocks with that peer at once, on the
+> opening frame pair of a sync round, rather than at the next sync contact.
+
 > **Amended by [ADR-213](#adr-213--a-member-that-cannot-do-a-class-of-work-yields-it-judged-by-its-own-heartbeats-against-its-peers).**
 > the sender now sets `yielding`, confirmation is the reader's (an echo or the
 > sync path), a block never replaces an older one from the same process, and
@@ -28586,6 +28590,9 @@ in bash, one per clause.
 
 ## ADR-242 — A member's SWIM incarnation outlives its process, and each start takes one above the last
 
+> **Amended by [ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once).** The
+> peer that renames a restarted member exchanges blocks with it at once, so the close below lasts about one contact.
+
 > **Amends [ADR-037](#adr-037--local-peer-health-and-swim-membership-above-it)**, whose identities carry an
 > incarnation that every process started at 0. No wire, table, `kimmy.format` schema, backup tag or configuration key
 > changes. One file joins the data directory, `kimmy.swim-incarnation`, which an older build never opens.
@@ -28643,7 +28650,9 @@ peer drops the block it held from the member's last process when its new identit
 its first new block arrives. Before, a quick restart that kept its identity (at incarnation 0, before any renewal) was
 judged by the dead process's block until the new one's came, so a member restarted into an older build was taken for
 one that could hold what the old process could. Now no peer judges a new process by an old one's block; the cost is that
-a peer's gates close from the rename until the new process's first block.
+a peer's gates close from the rename until the new process's first block, which the peer asks for at the rename itself
+([ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once)), so the
+close lasts about one contact rather than up to a sync interval.
 
 **Alternatives.** *An incarnation from the wall clock* (milliseconds since an epoch): one step with no state, and no
 walk for a wiped directory, but a clock that steps back by Δ walks one step per unit of Δ (a minute of milliseconds is
@@ -28773,3 +28782,100 @@ Mutations, in bash, each failing a test with only that change:
 One more is argued equivalent rather than run: marking in a second transaction after the records commit behaves the same
 in every test and differs only on a crash between the two commits, which is why the marks are written in the records'
 transaction.
+
+---
+
+## ADR-247 — A member that sees a peer come up or renamed exchanges facts blocks with it at once
+
+> **Amends [ADR-201](#adr-201--what-a-member-says-about-itself-on-the-sync-contact-decides-who-may-own-expiry-webhooks-and-embeddings)**,
+> whose blocks cross only on a sync contact, and
+> **[ADR-242](#adr-242--a-members-swim-incarnation-outlives-its-process-and-each-start-takes-one-above-the-last)**,
+> whose rename closes a peer's gates until the new process's first block. No frame, table, `kimmy.format` schema,
+> backup tag or configuration key changes.
+
+**The case.** A member's facts block crosses on a sync contact's opening frames: `AskVersions` carries the
+requester's, which the server records before it answers, and `Vectors` the server's (ADR-201, ordered by when each
+frame decoded, ADR-213). Each restart is renamed on every peer exactly once (ADR-242), and the rename drops the block
+the peer held from the old process, so the peer holds the member live with no block, and everything that waits for
+every live peer's block stays closed (the `Decimal128` net of ADR-238; ownership counts the member as no candidate,
+ADR-213), until the next contact between the two. That was up to a sync interval later: measured on three
+release-build members at the default 5 s interval, 20 restarts per shape (SIGTERM and SIGKILL, idle and under write
+load, 0 and 10 s down), a peer's window had a median of 3.2–4.7 s and a maximum of 5.0 s, and 0.15–0.7 s at a 1 s
+interval. The restarted member's own window had a 6.2 s tail under load after 10 s down: its first tick drained one
+peer for its whole budget while the other waited for the next.
+
+**Decision.**
+
+1. **What asks.** In the handling of a SWIM notification, after the change it makes: `MemberUp(m)` after `m` is
+   inserted; `Rename(old, new)` after both drops and the insert; this member's own `Rejoin` after it has cleared every
+   peer block (ADR-213), once for each peer it holds live.
+2. **At most one per member per sync interval**, counted from the last ask for that member whatever became of it. A
+   restart after the peer declared the member down is a `Rename` and a `MemberUp` in one input, and asks once; a member
+   that flaps, or does not answer, costs one exchange an interval; the sync tick stays the fallback.
+3. **The exchange** is the opening frame pair of a sync round and nothing after it: dial (TLS and the shared-secret
+   handshake, with the test refusals), `AskVersions { witnessed: true }` with this member's block, its generation and
+   its echo of the peer's block as held now, then the peer's `Vectors`, whose block is recorded ordered by its decode
+   sequence and whose echo is noted, then close. The peer handles it as any contact: it records the request's block and
+   echo before answering. Nothing else of a round happens: no pull, no divergence check, no replay served (one the peer
+   asks for on its `Vectors` stays owed to its next round), no `PeerHealth` change, no catching-up judgement, no lag
+   vector. Bounded by the dial's timeouts and 10 s more for the frame pair.
+4. **Where it runs.** A driver task the replication loop spawns beside itself, and aborts when it ends; each exchange
+   is a task of its own whose panic the driver logs. The ask queue exists from the member set's creation, so an `Up`
+   the membership task sees before the loop starts (the daemon starts membership first) is queued. The driver reads
+   this member's block, so an exchange takes no storage step and an abort can end it anywhere.
+5. **A failed exchange** is one `DEBUG` line; the next sync contact carries the blocks.
+
+**Why after the change.** The drop a rename makes records the decode sequence it happened at, and a block decoded
+before it is refused (ADR-213). An exchange asked after the drop reads its answer after it and keeps it. Asked before,
+an answer that came first would be dropped by the rename it was meant to follow, and the window would stay open until
+the next contact. The same holds for a rejoin's clear.
+
+**Why the opening frames, beside the loop, and not a round in it.** A tick is one arm of the loop's `select!`, and a
+tick that drains runs for up to an interval with nothing else polled: an ask that arrived during it would wait for it,
+which is the 6.2 s case. A round needs the loop's `PeerStalls` (snapshot resume, the set-aside, the repair ledger), so it
+cannot run beside it, and a failed round goes through the back-off, which would lengthen the window it is for. The two
+frames carry both blocks and both echoes, which is all the window waits for.
+
+**Why the rejoining member asks too.** Its rejoin cleared every block it held. Its peers' renames of it ask exchanges
+that carry their blocks to it as well, but only once each has learned the new identity by gossip, and an older peer
+during a roll never asks. Its own asks close its own window at once. A peer it still holds live that has gone costs one
+failed dial in a task of its own.
+
+**Invariant.** Every `Up` or `Rename` of a member that a member sees, and every live peer at its own `Rejoin`, starts an
+exchange with that member unless one was started with it within the last sync interval; at most one is started per
+member per interval; and an exchange that is answered leaves its starter holding the answer's block, unless a later
+change of the same input dropped it. Model rows: the deterministic SWIM simulation (`membership::rejoin_tests`), whose
+member sets take every notification through the production handling and run each exchange inside the ask: after every
+input, each exchange it started that was answered left the starter holding the block it brought. Restarts dead for 0,
+1.5, 3 and 10 s, ten each: each peer starts exactly one exchange with the member and the member one with each peer, all
+answered, and every member holds every other's current block with no tick run; a second rename within the interval
+starts none and a later one starts one; a rejoin starts one with every live peer, in the input that rejoined.
+
+**Interactions.** The catching-up marker is judged on full rounds only, so an exchange reaches no member for it; a
+marked member's block (`catching_up`) simply arrives sooner. An exchange's echo confirms a yield exactly as a round's
+does (ADR-213), and a yield still waits for the live set to hold still for a lease. An exchange and a tick's round to
+the same peer are two connections, as serving and dialling already were, and their blocks are ordered by decode
+sequence.
+
+**Cost.** One dial and one frame pair per member per `Up`, `Rename` or rejoin, at most one per member per interval: a
+restart costs each peer one exchange and the restarted member one per peer.
+
+**Rollback.** Nothing is stored and no frame is new. An older build asks no exchanges: its own window after a start is
+up to a sync interval, as before, and a peer on this build still exchanges with it at once on seeing it renamed or up.
+
+**Alternatives.** *Wake the tick for the member* (a reset tick restricted to it): it waits behind a draining tick, a
+failure backs the member off, and the extra tick moves the divergence rotation and the repair clocks. *A whole round
+beside the loop*: needs the loop's `PeerStalls`. *Carry the block over SWIM*: a field in `Member` changes the wire
+(postcard is not self-describing, ADR-242's alternatives), and a block can outgrow a datagram. *No debounce*: a flapping
+member would cost a contact per flap, and a restart after a down declaration two.
+
+**Tests.** `membership::tests`: one ask per member per interval, each member on its own, from its own last ask.
+`exchange::tests`: an exchange leaves each side holding the other's block and the asker the answerer's echo of its
+own; one with a member not serving fails at the dial and records nothing; the driver runs what is asked. The simulation
+rows above. `kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync interval, one restarted three
+times with SIGTERM; every member's `kimmy_ownership_peers{state="unknown"}` is sampled every 10 ms and no run above 0
+lasts a second. Mutation rows in bash, each failing a test with only that change: no ask on `Up`; none on `Rename`; no
+exchange at all (the simulation and the real-process test); the ask before the rename's drop; no debounce; the
+debounce keyed for every member at once; no ask at the own rejoin; the rejoin's asks before its clear; the interval
+inclusive; the driver not started; the answer's block not recorded; the request without a block; the answer's echo not
+noted; `AskVersions` without the witnessed flag; the driver dropping its asks.
