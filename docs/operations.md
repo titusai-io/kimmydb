@@ -2445,11 +2445,29 @@ discarded, and the peer passes the delete on as an entry under the member's id
 
 - While no peer holds such a delete, restoring the member again from the same
   backup with this release, as the first remedy above does, removes the
-  tombstones: this release's rewind removes those documents without one.
+  tombstones: this release's rewind removes those documents without one. If the
+  member has written anything since its 0.51 rewind while in contact with its
+  peers, take the next case.
 - Once a peer holds one, the write is deleted on every member that took the
   delete, and restoring the member again does not bring it back: the member
-  takes the delete back from its peers. Insert those documents again from a
-  backup taken before the 0.51 rewind, through any member.
+  takes the delete back from its peers. To put the writes back:
+  1. **Name the documents**: those with a tombstone under the rewound member's
+     own node id, stamped after the rewind's target at about the time the 0.51
+     rewind ran. They are among the documents present when the member's backup
+     from before the rewind is restored with this release into a scratch data
+     directory without `--until`, and absent when it is restored with the same
+     `--until`; use that backup to name them only.
+  2. **Take each one's value from a member that was not rewound, as it stood
+     before the delete reached that member**: from a backup of it taken before
+     then, or from its live store while it has not taken the delete.
+  3. **Never take a value from the rewound member's own backup from before the
+     rewind.** It holds the write the rewind undid; inserted, that write is
+     stamped now and replaces the document on every member.
+  4. **Insert each value through any member.** The insert is stamped now and
+     replaces the delete everywhere.
+
+  If no member that was not rewound holds a copy of a document, its value cannot
+  be recovered from the cluster.
 
 ### The identity comes back with it
 

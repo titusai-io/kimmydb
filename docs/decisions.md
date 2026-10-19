@@ -29013,13 +29013,19 @@ count repair would then spread to every member
 (`a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected`). At the horizon it is ADR-243's
 bound, so invariant I, witnessed at least servable, ADR-160, the coverage of what retention collected, and ADR-243's
 argument that a re-fetch brings back no insert whose delete this member collected, all hold as given there
-(`row_a_rewind_that_removes_a_document_brings_back_no_deleted_one`). The clock is unchanged: no tombstone is minted,
+(`row_a_rewind_that_removes_a_document_brings_back_no_deleted_one`). Beside a restored entry below the horizon, a late
+arrival, the floor is that entry, as for a restore alone: a write judged above it is asked for again
+(`row_a_removal_beside_a_restored_entry_below_the_horizon_floors_at_that_entry`), and there the bound's `collected`
+term is what keeps the member's collected entries covered
+(`row_a_removal_beside_a_late_restored_entry_keeps_the_members_collected_drop`). The clock is unchanged: no tombstone is minted,
 the record names what the rewind discarded, and a start resumes past it (ADR-243).
 
 **Residuals, accepted.**
 - **A judged write below a kept entry of its origin, or at or below the horizon.** Invariant I keeps the member's
-  coverage of that origin at the kept entry, and the floor at the horizon, above the judged write; one at or below the
-  horizon arrived after the member had collected past it, ADR-243's late arrival. No pull sends it again. The
+  coverage of that origin at the kept entry, and the floor at the horizon, above the judged write. One at or below the
+  horizon arrived late (ADR-243's late arrival), or arrived on time and lost before the retention pass that collected
+  past it, which takes a target within the reordering delay of the horizon
+  (`a_removal_leaves_an_on_time_judged_write_at_or_below_the_horizon_to_the_repair`). No pull sends it again. The
   divergence check repairs it: the count half
   replays the collection onto the row the member no longer holds, and a young converge row (ADR-237) or a page does the
   same. The convergence model's `row_a_rewind_that_removes_a_document_below_a_kept_entry_of_the_judged_origin`
@@ -29050,8 +29056,12 @@ target, at about the time it ran. Nothing tells them from a delete's, so nothing
 member has written again, a page from it carries them to its peers, and a peer that takes one deletes the kept write
 there and passes the delete on as an entry under the member's id. Restoring the member again from the same backup
 with this release removes the tombstones only while no peer holds such a delete. Once one does, the restored member
-takes the delete back by entries, the write stays deleted on every member that took it, and the documents are to be
-inserted again from a backup taken before the 0.51 rewind, through any member (the operations guide).
+takes the delete back by entries, and the write stays deleted on every member that took it. Each document is then to
+be inserted again, through any member, with its value taken from a member that was not rewound, as it stood before
+the delete reached that member (a backup of it from before then, or its live store while it has not taken the
+delete); never from the
+rewound member's own backup from before the rewind, which holds the write the rewind undid. With no such copy, the
+value cannot be recovered from the cluster (the operations guide).
 
 **Tests.** `rewind.rs`: `a_document_created_after_the_target_is_removed` (no record, the count, the index),
 `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged`,
@@ -29061,10 +29071,11 @@ inserted again from a backup taken before the 0.51 rewind, through any member (t
 `a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded` checks that the removed documents leave no record.
 The convergence model, on every route and by pure entries too: a removal and a judged write (B alone
 rewound, every member, and every member with C's write lost on C too), the same followed by a write of a rewound
-member, a removal over a deleted document, a document deleted at the target, and a removed row that was itself a
-tombstone. On the repaired and pages routes, which the divergence check's repairs close: a removal after a retention
-pass (pure entries do not close that case without a rewind either) and a judged write below a kept entry (the first
-residual). `a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected` runs one member's
+member, a removal over a deleted document, a document deleted at the target, a removed row that was itself a
+tombstone, a judged write above a non-zero horizon, and a removal beside a restored entry below the horizon. On the repaired and pages routes, which the divergence check's repairs close: a removal after a retention
+pass (pure entries do not close that case without a rewind either), the same beside a late restored entry, and a
+judged write below a kept entry (the first residual); a judged write at or below the horizon, which pure entries leave
+to the repair, is pinned so. `a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected` runs one member's
 retention pass ahead of the others'. The residual of a forgotten delete is pinned by its exact shape. The
 cluster harness as above. Mutation rows, in bash, each failing a test with only its own change: the removal leaving a
 tombstone at the rewind's clock; leaving one at the target; no bound when the rewind only removes; the bound under a
@@ -29072,6 +29083,7 @@ removal taken from a restored entry when there is one; the removed row deleted w
 in its index; the bound only on origins whose coverage passes the target; the bound applied when the rewind neither
 restores nor removes; a discarded entry's token refused only while the member does not hold the entry again
 (`a_rewound_entry_a_peer_sends_back_stays_refused`); the removal's floor at zero, below the horizon; the row of a
-document deleted at the target removed; only a removed live row bounding the vectors. **Equivalent under a removal:
-the bound without what retention collected**, since the floor at the horizon is at or above every collected stamp;
-ADR-243's row on a late restored entry kills it for a restore.
+document deleted at the target removed; only a removed live row bounding the vectors; the removal's floor at the
+horizon even beside a lower restored entry; and the bound without what retention collected, killed beside a late
+restored entry, with a removal or without (for a removal alone it changes nothing: the floor at the horizon is at or
+above every collected stamp).
