@@ -4,11 +4,12 @@ source, applied once to a `git archive` export, run against its suites under a t
 and reverted by copying the pristine file back. A row whose text does not occur exactly
 once fails `check` and is never run.
 
-    mutants.py list [group]            names of the rows (group: design, fix-e, lives, delta, elsewhere, all)
+    mutants.py list [group]            names of the rows (group: design, fix-e, lives, delta, elsewhere, gate-split, all)
     mutants.py check <tree>            every row applies to <tree>, exactly once
     mutants.py apply <name> <tree>     patch <tree> in place
     mutants.py files <name>            the files a row touches
     mutants.py timeout <name>          the row's own suite timeout in seconds, if it has one
+    mutants.py kills <name>            the tests that must fail under the row, one per line, if it names them
     mutants.py suites <name>           the suites a row runs, one per line:
                                        <crate> <target> <filter> <ignored: yes|no>
 """
@@ -21,6 +22,206 @@ MODEL = [("kimmy-storage", "--lib", "idempotency", "no")]
 # The model alone: what the generated sweep and the named rows see of a mutant, without
 # the unit tests that kill it elsewhere (P's page delta rows: its own table has those).
 MODEL_ONLY = [("kimmy-storage", "--lib", "idempotency_model_tests", "no")]
+
+# The gate split (B5's gate window; Chris's ruling): a live member not heard from yet is
+# `503 peer_unheard` with `Retry-After`, a held block that says no is `400`, and the block
+# that says no decides. Each row names the tests that must fail (`kills`), and `check-kills`
+# reads a row's log for them.
+GATE_UNIT = ("kimmy-cluster", "--lib", "idempotency::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides", "no")
+DECIMAL_UNIT = ("kimmy-cluster", "--lib", "decimal128::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides", "no")
+API_UNHEARD = ("kimmy-api", "--test idempotency", "a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken", "no")
+API_OLDER = ("kimmy-api", "--test idempotency", "an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard", "no")
+API_DECIMAL = ("kimmy-api", "--test api", "the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one", "no")
+CLUSTER_WINDOW = ("kimmyd", "--test cluster", "a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400", "yes")
+
+GATE_SPLIT = [
+    {
+        "name": "gs-unheard-counted-as-refusing",
+        "group": "gate-split",
+        "doc": "Collapse in the net: a live peer with no block held counts as one that says no (400)",
+        "patches": [
+            ("crates/kimmy-cluster/src/facts.rs",
+             "        .filter(|node| view.blocks.get(node).is_some_and(|held| !has(&held.facts)))\n",
+             "        .filter(|node| view.blocks.get(node).is_none_or(|held| !has(&held.facts)))\n"),
+        ],
+        "suites": [GATE_UNIT, CLUSTER_WINDOW],
+        "kills": ["idempotency::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides",
+                  "a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400"],
+    },
+    {
+        "name": "gs-idempotency-gate-unheard-as-peers",
+        "group": "gate-split",
+        "doc": "Collapse in the idempotency gate: an unheard peer is reported as one that says no",
+        "patches": [
+            ("crates/kimmy-cluster/src/idempotency.rs",
+             "            PeerNet::Unheard(peers) => Err(IdempotencyClosed::Unheard {\n"
+             "                peers: names(peers),\n"
+             "                retry_after_secs: members.unheard_retry_after_secs(),\n"
+             "            }),\n",
+             "            PeerNet::Unheard(peers) => Err(IdempotencyClosed::Peers(names(peers))),\n"),
+        ],
+        "suites": [GATE_UNIT, API_UNHEARD],
+        "kills": ["idempotency::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides",
+                  "a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken"],
+    },
+    {
+        "name": "gs-decimal128-gate-unheard-as-peers",
+        "group": "gate-split",
+        "doc": "Collapse in the Decimal128 gate: an unheard peer is reported as one that cannot",
+        "patches": [
+            ("crates/kimmy-cluster/src/decimal128.rs",
+             "            PeerNet::Unheard(peers) => Err(Decimal128Closed::Unheard {\n"
+             "                peers: names(peers),\n"
+             "                retry_after_secs: members.unheard_retry_after_secs(),\n"
+             "            }),\n",
+             "            PeerNet::Unheard(peers) => Err(Decimal128Closed::Peers(names(peers))),\n"),
+        ],
+        "suites": [DECIMAL_UNIT, API_DECIMAL],
+        "kills": ["decimal128::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides",
+                  "the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one"],
+    },
+    {
+        "name": "gs-keyed-edge-unheard-as-400",
+        "group": "gate-split",
+        "doc": "Collapse at the keyed edge: the gate's transient refusal answered 400 bad_request",
+        "patches": [
+            ("crates/kimmy-api/src/idempotency.rs",
+             "                Some(secs) => ApiError::peer_unheard(text, secs),\n",
+             "                Some(_) => ApiError::bad_request(text),\n"),
+        ],
+        "suites": [API_UNHEARD],
+        "kills": ["a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken"],
+    },
+    {
+        "name": "gs-decimal128-edge-unheard-as-400",
+        "group": "gate-split",
+        "doc": "Collapse at the API's mapping: a Decimal128 refusal for an unheard peer answered 400",
+        "patches": [
+            ("crates/kimmy-api/src/error.rs",
+             "                Some(secs) => ApiError::peer_unheard(e.to_string(), secs),\n",
+             "                Some(_) => ApiError::bad_request(e.to_string()),\n"),
+        ],
+        "suites": [("kimmy-api", "--lib", "error::tests::a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise", "no"), API_DECIMAL],
+        "kills": ["error::tests::a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise",
+                  "the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one"],
+    },
+    {
+        "name": "gs-retry-after-dropped",
+        "group": "gate-split",
+        "doc": "peer_unheard carries no Retry-After",
+        "patches": [
+            ("crates/kimmy-api/src/error.rs",
+             "            retry_after_secs: Some(retry_after_secs.max(1)),\n",
+             "            retry_after_secs: { let _ = retry_after_secs; None },\n"),
+        ],
+        "suites": [API_UNHEARD, ("kimmy-mcp", "--test mcp", "the_argument_is_gated_as_the_header_is", "no")],
+        "kills": ["a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken",
+                  "the_argument_is_gated_as_the_header_is"],
+    },
+    {
+        "name": "gs-retry-after-zero-allowed",
+        "group": "gate-split",
+        "doc": "peer_unheard's Retry-After may be 0",
+        "patches": [
+            ("crates/kimmy-api/src/error.rs",
+             "            retry_after_secs: Some(retry_after_secs.max(1)),\n",
+             "            retry_after_secs: Some(retry_after_secs),\n"),
+        ],
+        "suites": [("kimmy-api", "--lib", "error::tests::a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise", "no")],
+        "kills": ["error::tests::a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise"],
+    },
+    {
+        "name": "gs-wait-not-rounded-up",
+        "group": "gate-split",
+        "doc": "The wait truncates a fractional sync interval instead of rounding it up",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        let whole = interval.as_secs() + u64::from(interval.subsec_nanos() > 0);\n",
+             "        let whole = interval.as_secs();\n"),
+        ],
+        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second", "no")],
+        "kills": ["idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second"],
+    },
+    {
+        "name": "gs-wait-may-be-zero",
+        "group": "gate-split",
+        "doc": "The wait of a sub-second sync interval is 0",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        whole.max(1)\n    }\n",
+             "        whole\n    }\n"),
+        ],
+        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second", "no")],
+        "kills": ["idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second"],
+    },
+    {
+        "name": "gs-precedence-swapped",
+        "group": "gate-split",
+        "doc": "Precedence swapped: a peer not heard from decides over one whose block says no",
+        "patches": [
+            ("crates/kimmy-cluster/src/facts.rs",
+             "        let refused = refusing_peers(view, has);\n"
+             "        if !refused.is_empty() {\n"
+             "            return Self::Refused(refused);\n"
+             "        }\n"
+             "        let unheard = unheard_peers(view);\n"
+             "        if !unheard.is_empty() {\n"
+             "            return Self::Unheard(unheard);\n"
+             "        }\n",
+             "        let unheard = unheard_peers(view);\n"
+             "        if !unheard.is_empty() {\n"
+             "            return Self::Unheard(unheard);\n"
+             "        }\n"
+             "        let refused = refusing_peers(view, has);\n"
+             "        if !refused.is_empty() {\n"
+             "            return Self::Refused(refused);\n"
+             "        }\n"),
+        ],
+        "suites": [GATE_UNIT, DECIMAL_UNIT, API_OLDER, API_DECIMAL],
+        "kills": ["idempotency::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides",
+                  "decimal128::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides",
+                  "an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard",
+                  "the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one"],
+    },
+    {
+        "name": "gs-unheard-passes",
+        "group": "gate-split",
+        "doc": "A live peer not heard from passes the net (fails open)",
+        "patches": [
+            ("crates/kimmy-cluster/src/facts.rs",
+             "    view.live.iter().filter(|node| !view.blocks.contains_key(node)).copied().collect()\n",
+             "    view.live.iter().filter(|_| false).copied().collect()\n"),
+        ],
+        "suites": [GATE_UNIT, API_UNHEARD],
+        "kills": ["idempotency::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides",
+                  "a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken"],
+    },
+    {
+        "name": "gs-capability-listed-while-unheard",
+        "group": "gate-split",
+        "doc": "idempotency-keys listed while the gate is closed for an unheard peer",
+        "patches": [
+            ("crates/kimmy-api/src/version.rs",
+             "            Self::IdempotencyKeys => state.idempotency_gate().is_ok(),\n",
+             "            Self::IdempotencyKeys => state.idempotency_gate().map_or_else(|c| c.retry_after_secs().is_some(), |()| true),\n"),
+        ],
+        "suites": [("kimmy-api", "--lib", "version::tests::idempotency_keys_is_not_listed_while_a_member_is_unheard_or_says_no", "no"), API_UNHEARD],
+        "kills": ["version::tests::idempotency_keys_is_not_listed_while_a_member_is_unheard_or_says_no",
+                  "a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken"],
+    },
+    {
+        "name": "gs-retry-class-no",
+        "group": "gate-split",
+        "doc": "peer_unheard's retry class is no",
+        "patches": [
+            ("crates/kimmy-api/src/error.rs",
+             "            Self::PeerUnheard => Retry::Wait,\n",
+             "            Self::PeerUnheard => Retry::No,\n"),
+        ],
+        "suites": [API_UNHEARD],
+        "kills": ["a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken"],
+    },
+]
 
 ROWS = [
     {
@@ -590,14 +791,15 @@ ROWS = [
         "doc": "The live-peer net never blocks",
         "patches": [
             ("crates/kimmy-cluster/src/idempotency.rs",
-             "        let blockers = crate::facts::idempotency_records_blockers(&members.view());\n",
-             "        let blockers: Vec<kimmy_core::NodeId> = { let _ = members; Vec::new() };\n"),
+             "        match crate::facts::idempotency_records_net(&members.view()) {\n",
+             "        match { let _ = members; PeerNet::Open } {\n"),
         ],
         "suites": [
             ("kimmy-cluster", "--test idempotency", "c9_a_live_member_that_does_not_carry_records_closes_the_gate", "no"),
         ],
+        "kills": ["c9_a_live_member_that_does_not_carry_records_closes_the_gate"],
     },
-]
+] + GATE_SPLIT
 
 
 def row(name):
@@ -650,6 +852,9 @@ def main():
         print(row(sys.argv[2]).get("timeout", ""))
     elif cmd == "doc":
         print(row(sys.argv[2])["doc"])
+    elif cmd == "kills":
+        for name in row(sys.argv[2]).get("kills", []):
+            print(name)
     else:
         sys.exit(f"unknown command {cmd}")
 

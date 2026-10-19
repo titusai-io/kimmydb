@@ -28237,7 +28237,7 @@ The roll is member-at-a-time, and 0.49 and 0.51 may share a cluster if an operat
 A 0.49 or 0.50 member cannot hold a `Decimal128` `_id`, and cannot parse a `Decimal128` partial-filter bound: an entry or page that carries the new `DocId` variant fails to decode, the window is requested for ever, and a refused index definition is recorded, never retried, and survives the member's own upgrade. So accepting either is an operator declaration, the featureCompatibilityVersion pattern.
 - **The switch.** `cluster.decimal128` (bool), default `true` when clustering is off and `false` when it is on. It states that every member runs 0.51 and has migrated, and it gates local creation only. An entry, a page, a restored or a repaired definition from another member is always applied; refusing one would wedge replication.
 - **Three chokepoints**, keyed on the BSON type of the `_id`, not on the `DocId` variant (an integral decimal is an `Int64` with a decimal body, which breaks an older member's full scans): `check_insert` (insert, bulk, scope inserts, upserts and `$setOnInsert`), `replace_in_txn` (only when the replace creates the row; a replace over an existing decimal `_id` is not refused), and a local `create_index` that mints such a definition (a new one, or the re-stamp of an inherited one): an identical standing definition is the idempotent answer and a duplicate `_id` is `DuplicateKey`, as for any index or id. Each refuses with `400`, naming `cluster.decimal128` and the peers that do not advertise it.
-- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease.
+- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease. **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) (0.52.0):** the refusal tells the net's two causes apart. A live peer whose held block does not say `decimal128` (an older build) is the `400` as before, and decides; a live peer with no block held yet, after its start or a SWIM rename or rejoin, with none saying no, is `503 peer_unheard`, `retry: wait`, `Retry-After` of one sync interval, since it is heard at the next contact. 0.51 answered that case `400`, telling a client not to retry a creation that would be taken a few seconds later; the unheard peer still fails closed, and the WARN still names it only after a lease.
 - **The marker.** A `META` row `decimal128:id_present` is written in the transaction that writes or applies the first document whose body `_id` has BSON type `Decimal128`: at `write_insert`, `replace_in_txn`, `write_chosen`, and in `apply_remote_in_txn` (entries, `All` and scoped pages, the deletes a page carries, `Converge` rows), and a backup carries it. It is exposed as the gauge `kimmy_decimal128_id_present`, a `/readyz` field, and a WARN once per peer and every ten minutes while it is set and a live peer cannot hold such an id. **The marker, not the key, is the authority**: the key can be set back to `false` and the ids remain.
 - **The procedure.** Set `cluster.decimal128` only after every member runs 0.51 and has finished its migration, and never in the same change as the binary. The same procedure covers a decimal partial-filter bound.
 - **Mutation rows.** 31 rows are killed, among them: the BSON-type test replaced by the variant at both chokepoints, the key ignored, the net removed, an unheard peer passing, the marker unwritten or keyed on the variant, any of the three chokepoints ungated, the third chokepoint gating replicated definitions, the integer normalisation removed, and `to_bson` not re-padding.
@@ -28588,8 +28588,10 @@ in bash, one per clause.
 > it again with its key. Three tables are added: `idempotency` and `idempotency_by_stamp`, carried by a backup as tags
 > 12 and 13, which are a backup rollback boundary, and `idempotency_changes`, a node-local change log no backup carries.
 > No `kimmy.format` schema (still 5), `I_EPOCH`, existing codec or entry kind changes. One configuration key
-> (`cluster.idempotency_keys`), nine optional wire fields, one facts field, two error codes, a capability, a version
-> field and a response header are added.
+> (`cluster.idempotency_keys`), nine optional wire fields, one facts field, three error codes, a capability, a version
+> field and a response header are added. **Amends [ADR-238](#adr-238--a-stored-number-is-an-exact-value-a-decimal128-has-a-place-in-the-order-and-number-keys-are-exact-and-variable-length-storage-schema-5)**,
+> whose gate answered a live member not heard from yet with the same `400` as one that cannot hold a decimal: both
+> gates now answer it `503 peer_unheard` (item 7).
 
 **The case.** A write has three outcomes: it happened, it did not, or it is not known whether it did, which a client
 meets as `500 outcome_unknown` or, more often, as a connection that closed after the request was sent, because a member
@@ -28901,19 +28903,33 @@ with it, and not be offered while any member could carry the write without it.
    member of this release sends as `true` whatever its switch. An absent field or block, or a live peer not heard from
    yet, counts as not carrying records, so the net fails closed, and a clustered member with `cluster.membership` off
    refuses keys. It is a net and not a check: a member that is down is not live and is not asked, and a peer restarted
-   on an older release keeps its last block on its peers for up to one lease. Otherwise every keyed route answers
-   `400 bad_request` naming the header and the cause (the switch, or the live member), looks nothing up and writes
-   nothing; the capability is not listed, and the refusal is counted as `gated`. `400`, as ADR-238's gate answers, and
-   not `503` with `retry: wait`, because the condition lasts a whole roll or longer. A record written before the gate
-   closed stays for its window, and a retry replays from it once the gate opens again. A router with no gate installed
+   on an older release keeps its last block on its peers for up to one lease. Otherwise every keyed route refuses,
+   naming the header and the cause, looks nothing up and writes nothing; the capability is not listed, and the refusal
+   is counted as `gated`. **The net has two causes, answered apart** (`kimmy_cluster::PeerNet`): a live peer whose held
+   block does not say `idempotency_records` (*says no*: an older release) is `400 bad_request`, `retry: no`, as the
+   switch and `cluster.membership` off are, because the condition lasts a whole roll or longer; a live peer with no
+   block held (*not heard*: it came up a moment ago, or this member dropped its block on a SWIM rename or its own
+   rejoin) is **`503 peer_unheard`, `retry: wait`, with `Retry-After` of one sync interval** (whole seconds, at least
+   1), because it is heard at the next contact. **A block that says no decides**: with both, the answer is the `400`,
+   naming only the member that says no. The same split holds for ADR-238's gate, from the same view. Only the not-heard
+   cause was ever transient, and it opens after every ordinary restart: measured against this build before the split,
+   a member restarted in a three-member cluster answered `/readyz` 200 and then refused keyed writes `400`, `retry: no`,
+   in 14 to 21 of 22 restarts, for a median of about 3.6 s and up to 8.9 s, and a peer's restart or pause closed the
+   gate on the others too; a client told `no` gives up a retry that would have been safe a few seconds later.
+   Readiness is not held for the gate: a peer that pauses would take every member out of a load balancer at once.
+   A record written before the gate closed stays for its window, and a retry replays from it once the gate opens
+   again. A router with no gate installed
    reads as open, as an uninstalled Decimal128 predicate does; `kimmyd` always installs one. **The procedure:** set the
    switch only once every member runs this release, as its own configuration change and restart, never in the change
    that ships the binary. Shipped together, a member down for its upgrade is not in the live set, a keyed write is
    accepted, and if that member then comes back on 0.51 it relays the write without its record; the net closes the gate
    once its block is seen, which stops new keyed writes and not that relay.
 
-8. **What it reports.** Two codes: `idempotency_key_reused` (`422`, `no`) and `idempotency_key_in_flight` (`409`,
-   `wait`, `Retry-After: 1`), logged at `INFO` through `request failed`. Six series, bridged to OTLP:
+8. **What it reports.** Three codes: `idempotency_key_reused` (`422`, `no`) and `idempotency_key_in_flight` (`409`,
+   `wait`, `Retry-After: 1`), logged at `INFO` through `request failed`, and `peer_unheard` (`503`, `wait`,
+   `Retry-After` of one sync interval; item 7, and ADR-238's gate), which writes no line: it is bounded, explained by
+   the response, and membership already warns of a peer unheard for more than a lease. The MCP argument carries the
+   same refusal in its error's `data`, with `retry_after_secs`. Six series, bridged to OTLP:
    `kimmy_idempotency_requests_total{outcome}` (`applied`, `replayed`, `resumed`, `reused`, `in_flight`, `gated`),
    which counts a keyed request only when it ends in a write's answer or in one of the key's own refusals (a keyed
    `403`, `404`, `partially_applied` or `outcome_unknown` counts under none, and a fresh keyed request that changed
@@ -29016,7 +29032,11 @@ the vector's readers found ones that assume an own entry at every position it na
 double. A page delta whose base compares keys alone: a sender restored onto a host whose clock is behind logs keys
 below a base cut before the restore. Accepting keyed writes during a mixed roll and documenting the double: an upgraded
 member that pulled a keyed entry through an older one holds its effect without the record for good, while it lists the
-capability. `503` with `retry: wait` for the gate: the condition lasts a roll. The live-peer net without the switch:
+capability. One `503` with `retry: wait` for every cause of the gate: a member that says no, the switch and
+membership off last a roll or longer, and a client told to wait would retry for that long. One `400` for every cause,
+as built first: a peer not heard from yet lasts about a sync interval, after every restart, and `no` turns a safe retry
+into a lost one. Holding `/readyz` until the gate opens: a pause of one member would take every member out of
+readiness at once. The live-peer net without the switch:
 blind to a member that was down at the write and comes back on an older release. **The life rule** (a record of a
 dropped life is history, absent on lookup and purged with the drop): a sender that purged a dropped life's records
 still serves that life's entries, a member the drop has not reached yet takes a keyed `$inc` among them without its
@@ -29070,10 +29090,19 @@ pushed, C2, C3, C5, C6 with more records than a page, C8 (an old key replays aft
 members; C7 as the version-boundary decodes beside the protocol.
 `kimmyd` (`tests/cluster.rs`, real processes over HTTP): C1, C2, C3, C5, C6, C8, C9 and the multi-chunk race, T2 over
 four members, and a finished multi-chunk request replaying on every caught-up member. `kimmy-api` (`tests/idempotency.rs`):
-the header's syntax, the route guard against `openapi.yaml`, the gate with the switch off and with an older or unheard
-peer, an unauthenticated keyed request `401` and not counted as gated, a replay of every keyed route byte for byte, the
+the header's syntax, the route guard against `openapi.yaml`, the gate with the switch off, with an older peer (`400` on
+every keyed route, deciding over an unheard one) and with an unheard peer (`503 peer_unheard` and `Retry-After` on every
+keyed route, again after a rename, then the same key's first answer and its replay), an unauthenticated keyed request
+`401` and not counted as gated, a replay of every keyed route byte for byte, the
 derived `_id` and its echo, scope per principal, a revoked grant refused before the record, a contested key refused
 `422` on three routes writing nothing, the in-flight `409`, the resume answer, and a fresh multi-chunk request's
-`skipped` without `resumed`. `kimmy-mcp`: each keyed tool replayed with the `_meta` marker, a reused key refused, and
-a contested key refused on every keyed tool. `kimmyd`: the switch's defaults and its refusal of a misspelt key, the facts
+`skipped` without `resumed`. `kimmy-mcp`: each keyed tool replayed with the `_meta` marker, a reused key refused, a
+contested key refused on every keyed tool, and the gate's `503` as an error carrying `retry: wait` and
+`retry_after_secs`. `kimmy-cluster`: `PeerNet` over a view (the two causes as separate sets, the precedence, per
+capability), both gates' split with the wait of one sync interval, and a block dropped on a rename or a rejoin read as
+unheard again. `kimmyd` (`tests/cluster.rs`): `a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400`,
+a member restarted at a 5 s sync interval and sent a keyed and a `Decimal128` insert from its first ready answer, `503
+peer_unheard` with `Retry-After: 5` and never `400`, then the first application and its replay; C9 meets the `503`
+before the `400` of C's heard block, and the cluster tests' keyed requests are sent again through the window as a
+client sends them. `kimmyd`: the switch's defaults and its refusal of a misspelt key, the facts
 field, the gate across a cluster, and a keyed write whose own fsync fails answered by its replay after the restart.

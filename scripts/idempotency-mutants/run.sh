@@ -51,7 +51,7 @@ fi
 ROWS=()
 for s in "${SELECT[@]}"; do
     case "$s" in
-        all|design|fix-e|lives|delta|elsewhere) while read -r n; do ROWS+=("$n"); done < <(python3 "$TABLE" list "$s") ;;
+        all|design|fix-e|lives|delta|elsewhere|gate-split) while read -r n; do ROWS+=("$n"); done < <(python3 "$TABLE" list "$s") ;;
         *) ROWS+=("$s") ;;
     esac
 done
@@ -116,6 +116,14 @@ for name in "${ROWS[@]}"; do
         124) result=timeout ;;
         *) result="exit-$rc" ;;
     esac
+    # A row that names the tests that must kill it is killed only when every one of them
+    # ran and failed in its log.
+    if [ "$result" = killed ]; then
+        while read -r want; do
+            [ -z "$want" ] && continue
+            grep -q "^test .*$want \.\.\. FAILED" "$log" || result="killed-not-by-named"
+        done < <(python3 "$TABLE" kills "$name")
+    fi
     invs=$(grep -h "^MODEL-KILL:" "$log" | sed 's/MODEL-KILL: //' | tr ',' '\n' | sort -u | paste -sd, -)
     [ -z "$invs" ] && invs=$(grep -h " \.\.\. FAILED" "$log" | sed 's/^test //; s/ \.\.\. FAILED.*//' | sort -u | paste -sd, -)
     secs=$(( $(date +%s) - start ))
