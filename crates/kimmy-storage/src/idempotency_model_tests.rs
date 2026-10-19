@@ -228,6 +228,11 @@ const REPLAY_FRAME: usize = 4;
 /// transport's frame): a few records, so a delta that does not reach the log's end
 /// moves the cursor's base (m1).
 const REPLAY_DELTA_BYTES: usize = 800;
+/// Whether a replay page whose cursor's delta meets a changed record too large for it
+/// drops the cursor and goes on at its position with a fresh base (Y2's revision, the
+/// wedge alternative), rather than staying with it (Y2 as merged). See
+/// `World::delta_too_large`.
+const Y2_DROPS_THE_CURSOR: bool = false;
 
 // -- Schedules ------------------------------------------------------------------------------
 
@@ -446,6 +451,30 @@ pub(crate) struct Schedule {
     pub members: u8,
     pub requests: Vec<Request>,
     pub ops: Vec<Op>,
+    /// The budgets a schedule runs under: small ones in some generated schedules, so
+    /// that the paths behind them are reached (see [`Bias`]).
+    pub bias: Bias,
+}
+
+/// The budgets of one schedule. A generated schedule takes small ones now and then, so
+/// that the long run reaches the paths behind them in a real share of its seeds (the
+/// coverage assertion of `generated_schedules_long` holds it to that).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Bias {
+    /// The model's frame for a replay page, in units ([`REPLAY_FRAME`]).
+    pub frame: usize,
+    /// Every member's room for a snapshot page's rows, in bytes
+    /// (`Engine::set_snapshot_room_for_test`), so a collection of a few documents spans
+    /// pages; `None` for the real one.
+    pub page_room: Option<usize>,
+    /// The bytes of a replay page's records delta under a cursor ([`REPLAY_DELTA_BYTES`]).
+    pub delta_bytes: usize,
+}
+
+impl Default for Bias {
+    fn default() -> Self {
+        Bias { frame: REPLAY_FRAME, page_room: None, delta_bytes: REPLAY_DELTA_BYTES }
+    }
 }
 
 impl std::fmt::Display for Op {
@@ -660,6 +689,10 @@ pub(crate) struct Outcome {
     pub rewound_reopened: usize,
     /// Records removed with their rows left (orphan rows).
     pub orphaned: usize,
+    /// Replay pages whose cursor's delta met a changed record too large for it.
+    pub delta_too_large: usize,
+    /// Records cursors dropped for that (the Y2 hook, [`Y2_DROPS_THE_CURSOR`]).
+    pub cursor_dropped: usize,
 }
 
 type Res<T> = std::result::Result<T, String>;
@@ -823,6 +856,9 @@ struct ReplayCut {
     scanned_to: Hlc,
     exhausted: bool,
     replay_records: Option<crate::ReplayRecords>,
+    /// The page carried nothing and dropped its cursor: the next page goes on at the
+    /// same position with a fresh base (the Y2 hook, [`Y2_DROPS_THE_CURSOR`]).
+    restart_position: bool,
 }
 
 /// How much of a page fits a frame (`transport::Fits`).
@@ -1071,6 +1107,7 @@ impl World {
                 Member { _dir: dir, path, engine: Some(Arc::new(engine)), catching_up: false }
             })
             .collect();
+        let sched_frame = sched.bias.frame;
         let mut world = World {
             sched,
             members,
@@ -1094,7 +1131,7 @@ impl World {
             strict_s1: strict_s1(),
             down: vec![false; count],
             retry_catching_up: false,
-            replay_frame: REPLAY_FRAME,
+            replay_frame: sched_frame,
             backups: HashMap::new(),
             step: "setup".into(),
         };
@@ -1118,6 +1155,7 @@ impl World {
         e.set_multi_chunk_docs(CHUNK);
         e.set_idempotency_window(WINDOW_SECS);
         e.set_idempotency_clock_for_test(self.now);
+        e.set_snapshot_room_for_test(self.sched.bias.page_room);
     }
 
     fn label(&self, node: NodeId) -> String {
@@ -2838,6 +2876,11 @@ impl World {
                     }
                 }
             }
+            if cut.restart_position {
+                // The cursor dropped (the Y2 hook): the position again, a fresh base.
+                cursor = None;
+                continue;
+            }
             if let Some(next) = cut.replay_records {
                 // A page of records alone: the position stays, the cursor goes on.
                 self.out.records_alone += 1;
@@ -2851,6 +2894,37 @@ impl World {
             from = after;
         }
         Err("a replay that never ended".into())
+    }
+
+    /// A replay page at a records cursor whose delta meets a changed record too large for
+    /// it (the transport's `SnapshotRowTooLarge` arm of `cut_replay_page`).
+    ///
+    /// **Today (Y2 as merged)**: the page carries nothing, counted as unfit, and the
+    /// replay stays at its position with its cursor for this contact: `None`, as every
+    /// page that cannot carry what it must.
+    ///
+    /// **The hook for Y2's revision** (the wedge alternative, not landed): drop the
+    /// cursor and go on at the same position with a fresh base, as a first page there
+    /// cuts one. Set [`Y2_DROPS_THE_CURSOR`] when it lands, so the model follows the
+    /// transport.
+    fn delta_too_large(
+        &mut self,
+        from: Hlc,
+        cursor: Option<crate::ReplayRecords>,
+    ) -> Option<ReplayCut> {
+        let _ = cursor;
+        if !Y2_DROPS_THE_CURSOR {
+            return None;
+        }
+        self.out.cursor_dropped += 1;
+        Some(ReplayCut {
+            entries: Vec::new(),
+            records: Vec::new(),
+            scanned_to: from,
+            exhausted: false,
+            replay_records: None,
+            restart_position: true,
+        })
     }
 
     /// One page of a replay as the transport cuts it (`transport::cut_replay_page`), with
@@ -2889,10 +2963,22 @@ impl World {
         let mut collections: Vec<CollectionId> = entries.iter().map(|e| e.collection).collect();
         collections.sort();
         collections.dedup();
-        let read = self
-            .e(peer)
-            .replay_page_records(&collections, from, through, cursor.as_ref(), REPLAY_DELTA_BYTES)
-            .map_err(|e| err("replay_page_records", e))?;
+        let read = match self.e(peer).replay_page_records(
+            &collections,
+            from,
+            through,
+            cursor.as_ref(),
+            self.sched.bias.delta_bytes,
+        ) {
+            Ok(read) => read,
+            // A record the change log names as changed since the cursor's base, larger
+            // than the delta's half of a page (P2's refusal).
+            Err(StorageError::SnapshotRowTooLarge { .. }) => {
+                self.out.delta_too_large += 1;
+                return Ok(self.delta_too_large(from, cursor));
+            }
+            Err(e) => return Err(err("replay_page_records", e)),
+        };
         if cursor.is_some() && !read.resumed {
             self.out.cursor_restarts += 1;
             self.note(format!(
@@ -2958,6 +3044,7 @@ impl World {
                 scanned_to: from,
                 exhausted: false,
                 replay_records: Some(next),
+                restart_position: false,
             }));
         }
         let unanchored = lead.len();
@@ -2970,6 +3057,7 @@ impl World {
                 scanned_to,
                 exhausted,
                 replay_records: None,
+                restart_position: false,
             })),
             Fit::Only(n) if n > 0 => {
                 entries.truncate(n);
@@ -2988,6 +3076,7 @@ impl World {
                     scanned_to: end.hlc,
                     exhausted: false,
                     replay_records: None,
+                    restart_position: false,
                 }))
             }
             _ => {
@@ -3029,6 +3118,7 @@ impl World {
                     scanned_to: from,
                     exhausted: false,
                     replay_records: Some(next),
+                    restart_position: false,
                 }))
             }
         }
@@ -4509,7 +4599,113 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
         };
         ops.push(op);
     }
-    Schedule { track, home: plan.home, members: n, requests: plan.requests, ops }
+    let bias = plan.bias(&mut ops);
+    Schedule { track, home: plan.home, members: n, requests: plan.requests, ops, bias }
+}
+
+/// The time of the step at `i` of `ops`: just after the latest time a step before it
+/// carries, so an inserted step keeps every member's clock moving forward.
+fn time_at(ops: &[Op], i: usize) -> u32 {
+    ops[..i].iter().map(|op| op.t).max().unwrap_or(100).max(100) + 1
+}
+
+impl Gen {
+    /// Small budgets and the steps that reach the paths behind them, each in a share of
+    /// the seeds, so the long run reaches every one of them many times (its coverage
+    /// assertion holds it to that). Each is spliced into the schedule made so far:
+    ///
+    /// - **m4** (a third of the seeds): every member's page room is a few documents, and
+    ///   the schedule begins with a scoped pull of `orders` whose sender takes its first
+    ///   keyed write between two pages: its change log begins with an epoch, and the
+    ///   receiver's next page, asked with the zero records base, is refused.
+    /// - **KR between chunks** (a third of the `Anywhere` seeds): an `$inc` of every
+    ///   counter on one member, then another under its key on a member without its
+    ///   record, which pulls the first between its first two chunks: the record turns
+    ///   contested there and the request stops partially applied.
+    /// - **Records alone** (two fifths of the seeds): a frame of two or three units, a
+    ///   member and its first peer backed up at the start, and the member restored two
+    ///   thirds in; in half of them its first peer is restored between the replay's first
+    ///   two pages (a cursor of another epoch), and in a third of them the cursor's delta
+    ///   takes a hundred bytes (a changed record too large for it).
+    fn bias(&mut self, ops: &mut Vec<Op>) -> Bias {
+        let mut bias = Bias::default();
+        let len = ops.len();
+        if self.rng.chance(33) {
+            bias.page_room = Some(self.rng.pick(&[450, 700]));
+            let (to, from) = self.pair();
+            let r = self.requests.len() as u8;
+            self.requests.push(Request { key: r + 1, kind: Kind::Insert { id: None } });
+            self.open.push(r);
+            let send =
+                Op { step: Step::Send { r, m: from, crash: None, inner: Vec::new() }, t: 105 };
+            let converge = self.rng.chance(30);
+            let page = Step::Page {
+                to,
+                from,
+                c: ORDERS,
+                converge,
+                restart: false,
+                inner: vec![(1, vec![send])],
+            };
+            ops.insert(0, Op { step: page, t: 0 });
+        }
+        if self.track == Track::Anywhere && self.rng.chance(33) && len > 8 {
+            let at = 2 + self.rng.below(len as u64 - 6) as usize;
+            let (y, x) = self.pair();
+            let p = self.requests.len() as u8;
+            self.requests.push(Request { key: p + 1, kind: Kind::IncMulti });
+            self.requests.push(Request { key: p + 1, kind: Kind::IncMulti });
+            self.open.extend([p, p + 1]);
+            let t = time_at(ops, at);
+            let first = Op { step: Step::Send { r: p, m: x, crash: None, inner: Vec::new() }, t };
+            let pull = Op { step: Step::Pull { to: y, from: x }, t: 0 };
+            let second = Op {
+                step: Step::Send { r: p + 1, m: y, crash: None, inner: vec![(1, vec![pull])] },
+                t: t + 5,
+            };
+            ops.splice(at..at, [first, second]);
+        }
+        if self.rng.chance(50) {
+            bias.frame = self.rng.pick(&[1, 2, 2, 3]);
+            let m = self.rng.below(self.n as u64) as u8;
+            let m = if self.track == Track::Home && m == self.home { (m + 1) % self.n } else { m };
+            let peer = (0..self.n).find(|o| *o != m).expect("two members");
+            let mut inner = Vec::new();
+            let at = (ops.len() * 2 / 3).max(2);
+            match self.rng.below(10) {
+                // The sender restored between two replay pages: a cursor of another epoch.
+                0..=3 if !(self.track == Track::Home && peer == self.home) => {
+                    let again =
+                        Op { step: Step::Restore { m: peer, nth: 0, inner: Vec::new() }, t: 0 };
+                    inner.push((1 + self.rng.below(2) as u8, vec![again]));
+                }
+                // A keyed write on the sender between two replay pages, with a delta too
+                // small for the record it changes.
+                4..=6 => {
+                    bias.delta_bytes = 100;
+                    let r = self.new_request();
+                    let at_peer =
+                        if self.track == Track::Home && self.requests[r as usize].kind.is_inc() {
+                            self.home
+                        } else {
+                            peer
+                        };
+                    let t = time_at(ops, at) + 2;
+                    let send = Op {
+                        step: Step::Send { r, m: at_peer, crash: None, inner: Vec::new() },
+                        t,
+                    };
+                    inner.push((1, vec![send]));
+                }
+                _ => {}
+            }
+            let restore = Op { step: Step::Restore { m, nth: 0, inner }, t: 0 };
+            ops.insert(at, restore);
+            ops.insert(0, Op { step: Step::Backup { m: peer }, t: 0 });
+            ops.insert(0, Op { step: Step::Backup { m }, t: 0 });
+        }
+        bias
+    }
 }
 
 // -- Running many ----------------------------------------------------------------------------
@@ -4550,6 +4746,8 @@ struct Sweep {
     rewound_removed: usize,
     rewound_reopened: usize,
     orphaned: usize,
+    delta_too_large: usize,
+    cursor_dropped: usize,
 }
 
 /// Run each seed of `seeds` on both tracks, `threads` at a time; panic with the first
@@ -4604,6 +4802,8 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.rewound_removed += out.rewound_removed;
                         t.rewound_reopened += out.rewound_reopened;
                         t.orphaned += out.orphaned;
+                        t.delta_too_large += out.delta_too_large;
+                        t.cursor_dropped += out.cursor_dropped;
                     }
                     // `IDEM_LIST=1`: each counted finding's schedule, by seed and track.
                     if std::env::var("IDEM_LIST").is_ok_and(|v| v == "1")
@@ -4643,7 +4843,8 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
          algebra: {} records contested, {} lookups refused, {} requests stopped between chunks; {} snapshot pages \
          refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
          records cursors started over, {} records offered past their window (m2); {} \
-         rewinds ({} records removed, {} reopened), {} records orphaned; in {:.1?}",
+         rewinds ({} records removed, {} reopened), {} records orphaned; {} replay deltas \
+         too large for their page ({} cursors dropped); in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -4670,6 +4871,8 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.rewound_removed,
         totals.rewound_reopened,
         totals.orphaned,
+        totals.delta_too_large,
+        totals.cursor_dropped,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
@@ -4705,7 +4908,35 @@ fn generated_schedules_short() {
 fn generated_schedules_long() {
     let start = env_u64("IDEM_SEED_START", 1_000_000);
     let count = env_u64("IDEM_SEEDS", 1000);
-    sweep(start..start + count, LEN, threads());
+    let totals = sweep(start..start + count, LEN, threads());
+    assert_coverage(&totals, count);
+}
+
+/// The long run's coverage: every path the generator's bias exists for is reached at
+/// least `IDEM_MIN_EVENTS` times (default 20) per 1,000 seeds, scaled to the run, so a
+/// later change to the generator cannot lose one without the run saying so.
+fn assert_coverage(totals: &Sweep, seeds: u64) {
+    let per_thousand = env_u64("IDEM_MIN_EVENTS", 20);
+    let floor = (per_thousand * seeds).div_ceil(1000) as usize;
+    let events = [
+        ("requests stopped between chunks (KR)", totals.contested_stopped),
+        ("lookups refused on a contested record (KR)", totals.contested_refused),
+        ("snapshot pages refused at the zero records base (m4)", totals.records_restarts),
+        ("replay pages of records alone (m1)", totals.records_alone),
+        ("records cursors started over (m1, another epoch)", totals.cursor_restarts),
+        ("replay deltas too large for their page (Y2)", totals.delta_too_large),
+        ("records offered past their window (m2)", totals.past_window_offered),
+        ("rewinds", totals.rewinds),
+        ("records orphaned", totals.orphaned),
+    ];
+    let short: Vec<String> =
+        events.iter().filter(|(_, n)| *n < floor).map(|(what, n)| format!("{what}: {n}")).collect();
+    assert!(
+        short.is_empty(),
+        "the generator reached {} path(s) fewer than {floor} times in {seeds} seeds: {}",
+        short.len(),
+        short.join("; ")
+    );
 }
 
 /// One seed, for a failure's report: `IDEM_SEED`, `IDEM_TRACK` (`home` or anything
@@ -4808,7 +5039,8 @@ fn row(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>) {
 }
 
 fn row_with(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>, at_completion: bool) {
-    let sched = Schedule { track: Track::Anywhere, home: 0, members, requests, ops };
+    let sched =
+        Schedule { track: Track::Anywhere, home: 0, members, requests, ops, bias: Bias::default() };
     let out = run_with(&sched, Some(true), at_completion);
     if trace() {
         eprintln!("row {name}:\n{}", render(None, &sched, &out));
@@ -4829,7 +5061,8 @@ fn row_framed(
     ops: Vec<Op>,
     holds: impl Fn(&Outcome) -> bool,
 ) {
-    let sched = Schedule { track: Track::Anywhere, home: 0, members: 3, requests, ops };
+    let bias = Bias { frame, ..Bias::default() };
+    let sched = Schedule { track: Track::Anywhere, home: 0, members: 3, requests, ops, bias };
     let out = run_framed(&sched, Some(true), false, frame);
     let shown = render(None, &sched, &out);
     if trace() {
