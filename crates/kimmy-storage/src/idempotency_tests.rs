@@ -629,7 +629,8 @@ fn a_keyed_replace_replays_over_a_stale_if_stamp() {
 
 /// A keyed delete is replayed while its own tombstone stands; once retention
 /// has collected the tombstone the retry runs afresh, and deletes a document a
-/// peer brought back under it.
+/// peer brought back under it: a version older than the request's first write
+/// makes the record absent.
 #[test]
 fn a_keyed_delete_replays_only_while_its_tombstone_stands() {
     let (engine, coll, _dir, _path) = open();
@@ -958,13 +959,16 @@ fn a_record_past_its_window_is_absent() {
     assert_eq!(count(&engine, &coll), 1);
 }
 
-/// A peer's record past its window is not stored (the build review's m2), past
-/// the window being the one test of a record's life. Here a key reused after its
-/// window holds the new request's live record, and a peer that has not yet run
-/// retention ships the old request's: merged, it lowered the live record's
-/// `first` to the old request's, so a resume left every match changed since, and
-/// with another body it marked the new request contested. Nothing is written for
-/// it, a row included.
+/// A peer's record past its window is not stored, past the window being the one
+/// test of a record's life, when the live record here is another request's or
+/// there is none. Here a key reused after its window holds the new request's
+/// live record, and a peer that has not yet run retention ships the old
+/// request's, with another body: merged, it would lower the live record's
+/// `first` to the old request's, so a resume would leave every match changed
+/// since, and mark the new request contested. Nothing is written for it, a row
+/// included; nor for a past-window record under a key with no record here. (One
+/// of the live record's own request, the same fingerprint, is merged: the
+/// replication tests' `a_past_window_record_of_the_live_records_own_request_merges`.)
 #[test]
 fn a_peer_record_past_its_window_is_not_stored() {
     let (engine, coll, _dir, _path) = open();
@@ -974,7 +978,10 @@ fn a_peer_record_past_its_window_is_not_stored() {
     let live = record(&engine, &coll, &k).unwrap();
     let rows_before = rows(&engine);
     let now = crate::physical_now_ms();
-    for fingerprint in [k.fingerprint, reused(&k).fingerprint] {
+    let elsewhere = keyed(32);
+    for (scope, fingerprint) in
+        [(k.scope, reused(&k).fingerprint), (elsewhere.scope, elsewhere.fingerprint)]
+    {
         let old = IdempotencyRecord {
             fingerprint,
             first: stamp(now - 2 * DAY_MS, 0, 0x77),
@@ -986,12 +993,13 @@ fn a_peer_record_past_its_window_is_not_stored() {
         };
         let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
         let (stored, wrote) =
-            engine.store_record_noting(&txn, coll.id, &k.scope, &old, Some(old.last)).unwrap();
+            engine.store_record_noting(&txn, coll.id, &scope, &old, Some(old.last)).unwrap();
         assert_eq!((stored, wrote), (None, false));
         txn.commit().unwrap();
     }
     assert_eq!(record(&engine, &coll, &k), Some(live), "its first and flag as they were");
-    assert_eq!(rows(&engine), rows_before, "no row for it");
+    assert_eq!(engine.idempotency_record(coll.id, &elsewhere.scope).unwrap(), None);
+    assert_eq!(rows(&engine), rows_before, "no row for either");
     replayed(engine.insert_keyed(&coll, doc! { "v": 1 }, &k).unwrap());
 }
 
@@ -2234,6 +2242,115 @@ fn a_backup_carries_the_records() {
     replayed(restored.insert_keyed(&rcoll, doc! { "v": 1 }, &k).unwrap());
     replayed(restored.modify_where_keyed(&rcoll, &Candidates::Scan, &Inc, None, &k2).unwrap());
     assert_eq!(count(&restored, &rcoll), 3);
+}
+
+/// A peer's live record over one stored here that is past its window (retention
+/// has not run yet) replaces it: an absent record is overwritten by the next
+/// store, never merged with. Merged, the new request's record would take the old
+/// request's lower `first` and, with another body, turn contested, so a retry of
+/// the new request here would be refused `422` instead of replaying.
+#[test]
+fn a_peer_record_over_a_stored_one_past_its_window_replaces_it() {
+    let (engine, coll, _dir, _path) = open();
+    engine.set_idempotency_window(3_600);
+    let k = keyed(41);
+    let (_, at) = fresh(engine.insert_keyed(&coll, doc! { "v": 1 }, &k).unwrap());
+    let old = record(&engine, &coll, &k).expect("premise: the old request's record");
+    // Past the old record's window; no retention pass has run.
+    let later = at.hlc.wall_ms + 3_600_000 + 10_000;
+    engine.set_idempotency_clock_for_test(Some(later));
+    let theirs = IdempotencyRecord {
+        fingerprint: reused(&k).fingerprint,
+        first: stamp(later - 1_000, 0, 0x77),
+        last: stamp(later - 1_000, 0, 0x77),
+        origin: NodeId::from_bytes([0x77; 16]),
+        state: RecordState::Done,
+        outcome: RecordOutcome::Insert { stamp: stamp(later - 1_000, 0, 0x77) },
+        contested: false,
+    };
+    let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
+    let (stored, wrote) =
+        engine.store_record_noting(&txn, coll.id, &k.scope, &theirs, Some(theirs.first)).unwrap();
+    txn.commit().unwrap();
+    assert!(wrote, "premise: a change");
+    assert!(old.first < theirs.first, "premise: the old request's first is lower");
+    assert_eq!(stored, Some(theirs.clone()), "replaced, not merged with the stale record");
+    assert_eq!(record(&engine, &coll, &k), Some(theirs));
+}
+
+/// A rewind that removes two records leaves no row by stamp of either, the
+/// lower `first`'s included: its row removal ranges from the lowest `first` it
+/// removes. Ranged from a higher one, the earlier record's rows would stay above
+/// the rewound servable vector, read as F3 candidates by every frame until
+/// retention collected them.
+#[test]
+fn a_rewind_removing_two_records_leaves_no_row_of_either() {
+    let (engine, coll, _dir, _path) = open();
+    engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+    let until = engine.clock_last();
+    let (k1, k2) = (keyed(71), keyed(72));
+    fresh(engine.insert_keyed(&coll, doc! { "_id": 2i64 }, &k1).unwrap());
+    fresh(engine.insert_keyed(&coll, doc! { "_id": 3i64 }, &k2).unwrap());
+    let first = |k: &KeyedWrite| record(&engine, &coll, k).unwrap().first;
+    assert!(first(&k1) < first(&k2), "premise: two firsts");
+    let out = engine.rewind_to(until).unwrap();
+    assert_eq!(out.records_removed, 2, "premise: both discarded whole");
+    for k in [&k1, &k2] {
+        assert!(
+            rows(&engine).into_iter().all(|(_, _, scope)| scope != k.scope.0),
+            "a row by stamp still names a removed record: {:?}",
+            rows(&engine)
+        );
+    }
+}
+
+/// The change log's rows, its beginning (the empty key) aside.
+fn log_rows(engine: &Engine) -> usize {
+    use redb::{ReadableDatabase, ReadableTable};
+    let txn = engine.db().begin_read().unwrap();
+    let log = txn.open_table(tables::IDEMPOTENCY_CHANGES).unwrap();
+    log.iter().unwrap().filter(|row| !row.as_ref().unwrap().0.value().is_empty()).count()
+}
+
+/// A store whose merge changes only the contested flag is not a no-op: it
+/// writes the contested record and logs the change, so a page's delta carries
+/// it; the same store again is a no-op that logs nothing. Taken for a no-op,
+/// this member would go on replaying the winner while every other refuses.
+#[test]
+fn a_store_that_only_contests_is_written_and_logged() {
+    let (engine, coll, _dir, _path) = open();
+    let now = crate::physical_now_ms();
+    let scope = ScopeHash([3; 32]);
+    let mk = |fp: u8, last_ms: u64| IdempotencyRecord {
+        fingerprint: Fingerprint([fp; 32]),
+        first: stamp(now - 10, 0, 9),
+        last: stamp(last_ms, 0, 9),
+        origin: NodeId::from_bytes([9; 16]),
+        state: RecordState::Done,
+        outcome: RecordOutcome::Insert { stamp: stamp(now - 10, 0, 9) },
+        contested: false,
+    };
+    let store = |r: &IdempotencyRecord, carrying: Option<Stamp>| {
+        let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
+        let (stored, wrote) =
+            engine.store_record_noting(&txn, coll.id, &scope, r, carrying).unwrap();
+        txn.commit().unwrap();
+        (stored.unwrap(), wrote)
+    };
+    let winner = mk(1, now - 5);
+    assert!(store(&winner, Some(winner.last)).1);
+    let logged = log_rows(&engine);
+    assert!(!store(&winner, Some(winner.last)).1, "premise: the same store again is a no-op");
+    assert_eq!(log_rows(&engine), logged);
+    // Another request's record, a lower `last` and the same `first`: the winner and
+    // every row stay as they are, and only the flag moves.
+    let (stored, wrote) = store(&mk(2, now - 8), None);
+    assert!(wrote && stored.contested, "{stored:?}");
+    assert_eq!(IdempotencyRecord { contested: false, ..stored.clone() }, winner, "the winner");
+    assert_eq!(log_rows(&engine), logged + 1, "and the change is logged");
+    let (again, wrote) = store(&stored, Some(stored.last));
+    assert!(!wrote && again.contested, "a contested record held already is a no-op");
+    assert_eq!(engine.idempotency_record(coll.id, &scope).unwrap(), Some(stored));
 }
 
 // -- For replication ------------------------------------------------------------------------

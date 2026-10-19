@@ -71,13 +71,13 @@
 //! the name is created again, the API answers `404` as for any missing
 //! collection). Retention is the only remover.
 //!
-//! **A keyed delete by id** is replayed while its own tombstone stands: the
-//! document's stored row carries a stamp at or above the delete's (the
-//! tombstone, or a later version over it), or the row is gone and the
-//! collection's drop or incarnation floor is at or above the delete's stamp
-//! (the drop took the tombstone). Once retention has collected the tombstone
-//! with no drop over it, the record is absent for that request, which then
-//! runs afresh.
+//! **A keyed delete by id** is replayed while the request's own tombstone
+//! stands: the document's stored row carries a stamp at or above the record's
+//! `first`, the request's first write (an attempt's tombstone, or a later
+//! version over it), or the row is gone and the collection's drop or
+//! incarnation floor is at or above that stamp (the drop took the tombstone).
+//! Once retention has collected the tombstone with no drop over it, the record
+//! is absent for that request, which then runs afresh.
 //!
 //! **A contested record** is refused for every retry: two members accepted the
 //! key for two requests (two fingerprints), and their records met in a merge
@@ -1883,10 +1883,10 @@ impl Engine {
             .transpose()
     }
 
-    /// Whether a keyed delete's tombstone, stamped `deleted` and gone from
-    /// `coll`'s rows, went with a drop: the collection's drop tombstone, or the
-    /// floor of the life standing under the writer, at or above it
-    /// ([`Engine::is_history`], a tie going to the drop).
+    /// Whether a keyed delete's tombstone, stamped at or above `deleted` (the
+    /// record's `first`) and gone from `coll`'s rows, went with a drop: the
+    /// collection's drop tombstone, or the floor of the life standing under the
+    /// writer, at or above it ([`Engine::is_history`], a tie going to the drop).
     pub(crate) fn delete_taken_by_a_drop(
         &self,
         txn: &WriteTxn<'_>,
@@ -2015,11 +2015,15 @@ impl Engine {
     ///
     /// Stored whether or not a drop of its collection came after it, or the
     /// collection stands: a record outlives a drop for its window. **Not stored
-    /// when it is past its window**, the one test of a record's life: merged
-    /// into the live record of a new request under the key, it would lower that
-    /// record's `first` to the old request's, and mark it contested. What stands
-    /// under the key and is not alive (past the window, unreadable by this
-    /// build) is overwritten. Returns the record as stored, or `None`.
+    /// when it is past its window**, the one test of a record's life, **unless
+    /// the live record here is of the same request** (the same fingerprint):
+    /// merged into the live record of a new request under the key, it would
+    /// lower that record's `first` to the old request's, and mark it contested;
+    /// merged into one of its own request's later attempts, it lowers `first` to
+    /// its own attempt's, so the stamp rule leaves what that attempt wrote, which
+    /// this member may take from a sender still serving it. What stands under the
+    /// key and is not alive (past the window, unreadable by this build) is
+    /// overwritten. Returns the record as stored, or `None`.
     pub(crate) fn store_record(
         &self,
         txn: &WriteTxn<'_>,
@@ -2046,9 +2050,6 @@ impl Engine {
         record: &IdempotencyRecord,
         carrying: Option<Stamp>,
     ) -> Result<(Option<IdempotencyRecord>, bool)> {
-        if self.record_is_past_window(record) {
-            return Ok((None, false));
-        }
         let stored = match read_record(&txn.open_table(IDEMPOTENCY)?, collection, scope) {
             Ok(stored) => stored,
             // A local record this format cannot be: the peer's is good data,
@@ -2060,6 +2061,11 @@ impl Engine {
             Err(e) => return Err(e),
         };
         let live = stored.as_ref().filter(|stored| !self.record_is_past_window(stored));
+        if self.record_is_past_window(record)
+            && !live.is_some_and(|live| live.fingerprint == record.fingerprint)
+        {
+            return Ok((None, false));
+        }
         let merged = match live {
             Some(live) => live.merge(record),
             None => record.clone(),
@@ -2270,19 +2276,25 @@ impl Engine {
     /// `until`) goes, since nothing of the request stands and a retry must apply
     /// it afresh, **with its rows by stamp** ([`remove_rows_naming`]): left
     /// behind, they would be above the rewound servable vector, read as F3
-    /// candidates by every frame until retention collected them. One the rewind cuts part-way (`first` at or before `until`,
-    /// `last` after it) is of a request only some of whose writes stand:
+    /// candidates by every frame until retention collected them. One the rewind
+    /// cuts part-way (`first` at or before `until`, `last` after it) is of a
+    /// request only some of whose writes stand: a filtered write past one chunk,
+    /// a bulk insert minted across the millisecond the rewind is to (`--until`
+    /// is a millisecond), or a record of any kind two attempts merged into, the
+    /// earlier attempt's stamp its `first` and the later one's its `last`:
     ///
-    /// - **an update or delete by filter** (`Modify`) becomes `applying`, with
-    ///   no cursor, so a retry resumes from the beginning and the stamp rule
-    ///   writes what the rewind undid and nothing the request still holds. Its
-    ///   counts are left as they were, an overcount;
-    /// - **any other kind goes**, as one discarded whole does, with its rows. Only a bulk insert
-    ///   spans stamps among them (a batch minted in the millisecond the rewind
-    ///   is to keeps a prefix, since `--until` is a millisecond), and nothing
-    ///   resumes one: kept, its replay would answer every document inserted
-    ///   while only the prefix stands. Gone, a retry is a fresh attempt, which
-    ///   meets the first document that stands as a duplicate and writes nothing.
+    /// - **a bulk insert goes**, as one discarded whole does, with its rows:
+    ///   nothing resumes one, and kept, its replay would answer every document
+    ///   inserted while only a prefix stands. Gone, a retry is a fresh attempt,
+    ///   which meets the first document that stands as a duplicate and writes
+    ///   nothing;
+    /// - **every other kind becomes `applying`**, its rows kept. An update or
+    ///   delete by filter (`Modify`) loses its cursor, so a retry resumes from the
+    ///   beginning and the stamp rule writes what the rewind undid and nothing the
+    ///   request still holds; its counts are left as they were, an overcount. An
+    ///   insert, a replace, a delete by id and a `find_and_modify` replay an
+    ///   applying record: an attempt's effect stands at or below `until`, and a
+    ///   fresh retry would apply the request on top of it.
     ///
     /// A reopened record is a change, logged as every store of one is
     /// ([`IDEMPOTENCY_CHANGES`]). Returns how many records it removed and
@@ -2302,8 +2314,8 @@ impl Engine {
             let (id, scope) = key.value();
             let Ok(Some(record)) = IdempotencyRecord::decode(value.value()) else { continue };
             let cut = record.last.hlc > until;
-            let resumes = matches!(record.outcome, RecordOutcome::Modify(_));
-            if record.first.hlc > until || (cut && !resumes) {
+            let bulk = matches!(record.outcome, RecordOutcome::Bulk { .. });
+            if record.first.hlc > until || (cut && bulk) {
                 gone.push((id, scope.to_vec()));
             } else if cut {
                 let mut open = record;

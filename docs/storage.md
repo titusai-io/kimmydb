@@ -266,16 +266,18 @@ none.
 
 **How long a record lives.** A record is judged by its `last`: it is absent to
 a lookup once `last` is older than `storage.oplog_retention_secs`, and a record
-a peer sends that is already past that window is not stored. **A record
+a peer sends that is already past that window is not stored, unless the live
+record here is of the same request (the same fingerprint), which it merges
+into. **A record
 outlives a drop of its collection for its window**: a drop, a database drop, the
 drop purger and a late drop's sweep remove no record, and a record of a dropped
 life is stored and served as any other, so a retry after the name is dropped
 and created again replays its first answer and writes nothing to the new life;
 until the name is created again, the route answers `404` as for any missing
-collection. Retention is the only remover. A keyed delete by id is replayed while its
-own tombstone, or a later version over it, stands, or while the row is gone
-with a drop at or above the delete's stamp, which took the tombstone with the
-life. The
+collection. Retention is the only remover. A keyed delete by id is replayed while the
+request's own tombstone (any attempt's), or a later version over it, stands, a
+row stamped at or above the request's first write, or while the row is gone
+with a drop at or above that stamp, which took the tombstone with the life. The
 retention pass collects records **after its oplog step**: one seek per origin to
 its rows below the cutoff, under a read transaction, then 1,000 rows per commit
 with the writer released between them (ADR-151). Each row is read again under

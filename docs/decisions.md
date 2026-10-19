@@ -28675,8 +28675,11 @@ with it, and not be offered while any member could carry the write without it.
 3. **A record lives its window, and outlives a drop of its collection** (Chris, 2026-10-18, D2 option A). A record
    is judged by its `last`: it is absent once `last` is past the window, at the cutoff the retention pass collects
    at, so no record is replayed past the window that removes it, and a record a peer sends that is already past it is
-   not stored (merged into the live record of a new request under the key, it would lower that record's `first` to
-   the old request's, and mark it contested). An absent record is overwritten by the next store, never merged with.
+   not stored unless the live record here is of the same request, the same fingerprint (merged into the live record
+   of a new request under the key, it would lower that record's `first` to the old request's, and mark it contested;
+   merged into a later attempt of its own request, it lowers `first` to its own attempt's, so the stamp rule leaves
+   what that attempt wrote, which this member can still take from a sender whose retention has not run). An absent
+   record is overwritten by the next store, never merged with.
    **Nothing else ends a record**: a drop of its collection, a database drop, the drop purger and a late drop's sweep
    (ADR-231) remove no record, and a record of a dropped life is stored and served as any other. So a retry after the
    collection was dropped and created again replays its first answer and writes nothing to the new life, and another
@@ -28684,11 +28687,13 @@ with it, and not be offered while any member could carry the write without it.
    outlive a drop of their collection; until the name is created again, the route answers `404` as for any missing
    collection. A resume of an `applying` record across a drop writes nothing in the new life:
    every document of it is stamped above the drop, so at or above the record's `first`, and the stamp rule counts it
-   in `skipped`. **A keyed delete by id replays while its own tombstone stands**, or a later version over it (the
-   document's row carries a stamp at or above the delete's), **or while the row is gone with a drop at or above the
-   delete's stamp** (the collection's drop tombstone or the standing life's floor, a tie going to the drop, ADR-236),
-   which took the tombstone with the life it was written in; a row of a later life under the id is stamped above the
-   delete's and replays by the first test. Once retention has collected the tombstone with no drop over it, an older
+   in `skipped`. **A keyed delete by id replays while the request's own tombstone stands**, or a later version over
+   it (the document's row carries a stamp at or above the request's first write, its record's `first`), **or while
+   the row is gone with a drop at or above that stamp** (the collection's drop tombstone or the standing life's
+   floor, a tie going to the drop, ADR-236), which took the tombstone with the life it was written in; a row of a
+   later life under the id is stamped above it and replays by the first test. By the first write and not by the
+   delete's own stamp: a record two attempts merged into answers with the later attempt's, and a rewind between the
+   two keeps the earlier attempt's tombstone, which is the request's delete standing. Once retention has collected the tombstone with no drop over it, an older
    write a peer still holds can bring the document back, and the request runs afresh. **A filter delete and a
    `find_and_modify` removal carry no check of their own: they rely on the start check that refuses
    `storage.tombstone_retention_secs` shorter than `storage.oplog_retention_secs`**
@@ -28803,7 +28808,8 @@ with it, and not be offered while any member could carry the write without it.
      not an entry of the record's collection was taken and whether or not the collection stands here: a stamp a window
      covers is never served again, so a record vouched for at one is stored then or never. **A batch that ends at an
      entry stores no record whose row is at or past that entry; the window serves those again.** A record is stored
-     whether or not a drop of its collection came after it (item 3); one already past its window is not. Records
+     whether or not a drop of its collection came after it (item 3); one already past its window is not, unless the
+     live record here is of the same request (item 3). Records
      **merge as a join**: `first` the smaller, `last` the greater, state, outcome, cursor and origin from the greater
      `last`, `done` over `applying` at an equal one, and at an equal `last` and state the record whose bytes (but for
      `first` and the contested bit) are greater, so the merge is commutative as well as associative and idempotent,
@@ -28922,10 +28928,13 @@ with it, and not be offered while any member could carry the write without it.
    and counted. **Drops remove no record** (item 3): the drop purger, a late drop's sweep (ADR-231) and a database
    drop's burial leave the records, and retention is the only remover. A rewind removes the records of requests whose
    every write it discarded, which would replay an answer for a write that no longer exists, **with their rows by
-   stamp** (one range per origin from the lowest `first` among the records removed), and of one it cut part-way, an
-   update or delete by filter excepted, which it reopens to resume, its rows kept: only a bulk insert minted in the
-   millisecond it rewinds to is cut otherwise, with its rows, and nothing resumes one, so a retry meets the first
-   document that stands as a duplicate and writes nothing, where a kept record would answer every document inserted. Left behind, a removed
+   stamp** (one range per origin from the lowest `first` among the records removed), and of a bulk insert it cut
+   part-way, with its rows: nothing resumes one, so a retry meets the first document that stands as a duplicate and
+   writes nothing, where a kept record would answer every document inserted while only a prefix stands. Every other
+   record it cuts part-way (a filtered write past one chunk, or any record two attempts merged into, the earlier
+   attempt's stamp its `first` and the later one's its `last`) it reopens as `applying`, its rows kept: a filter's
+   resumes from the beginning under the stamp rule, and an insert, a replace, a delete by id or a `find_and_modify`
+   replays its first answer, since an attempt's effect stands at or below the target. Left behind, a removed
    record's rows would be read as F3 candidates by every frame until retention collected them. A backup carries
    `idempotency` and `idempotency_by_stamp` as tags 12 and 13, so a restored member keeps the records of the writes it
    holds, those it took by snapshot included: without them a retry there would apply on top of a write the backup
@@ -29005,7 +29014,8 @@ as built and accepted:
 - **Retention's re-check** removes a record with the first of its rows at or above its `last`, not only at it, once
   `last` is past the cutoff: a record whose `last` is below an expired row is past its window too, and only its own
   row at `last` would otherwise remove it.
-- **A keyed delete by id** replays while its tombstone or a later version over it stands, not the tombstone alone.
+- **A keyed delete by id** replays while one of its attempts' tombstones or a later version over it stands, not the
+  tombstone alone.
 - **A record of another kind of request** is a key reused, whatever the fingerprint says.
 - **The stamp rule holds on every chunk after a record exists**, not only on a resume (item 4; Chris).
 - **The engine writes the resume and replay lines**, naming the database, the collection and the record's origin; the
@@ -29037,8 +29047,8 @@ record standing now (P1's drop-purge half is moot since records outlive a drop).
 of the merged head (FIX FIRST): **records outlive a drop** (Chris, 2026-10-18, D2 option A; item 3), where the design's
 life rule made a record of a dropped life history and the purge removed it; **the contested flag** (KR, items 1 and
 5), where two members that accepted one key for two requests merged their records into one whose answer was one
-request's and whose `first` could be the other's; and **a record past its window is not stored** (item 3), where it
-could merge into a new request's record and lower its `first`.
+request's and whose `first` could be the other's; and **a record past its window is not stored** unless the live
+record is of its own request (item 3), where it could merge into a new request's record and lower its `first`.
 
 **Rollback.** The binary rollback target is 0.51.x, and the store stays at schema 5, so 0.51.x opens it. It never opens
 the three tables: its writes, drops and purges leave records untouched, its retention collects oplog entries and not
