@@ -86,9 +86,10 @@ const WALKS: [&str; 23] = [
 
 /// Functions that walk, matched as a name of their own and not where they are
 /// defined: a vector search with no graph to use scores every stored vector,
-/// and a keyword search reads every chunk's text.
-const WALKING_FUNCTIONS: [&str; 4] =
-    ["vector_search(", "keyword_search(", "load_jobs(", "union_progress("];
+/// as does one while its graph is built (`vector_search_until`, ADR-245), and
+/// a keyword search reads every chunk's text.
+const WALKING_FUNCTIONS: [&str; 5] =
+    ["vector_search(", "vector_search_until(", "keyword_search(", "load_jobs(", "union_progress("];
 
 /// Walks allowed outside a `blocking(` in their own file, per file, each
 /// bounded by something other than the data a client stored or run under a
@@ -110,9 +111,10 @@ const BOUNDED: [(&str, usize, &str); 7] = [
     ("cache.rs", 1, "`count_vectors`, reached only from `IndexCache::access`'s `blocking`"),
     (
         "search.rs",
-        2,
-        "the bodies of `vector_search` and `keyword_search`, whose calls are held to \
-         `blocking` through `WALKING_FUNCTIONS`",
+        3,
+        "the bodies of `vector_search_until` and `keyword_search`, and `vector_search`'s \
+         call of `vector_search_until`, all held to `blocking` at their callers through \
+         `WALKING_FUNCTIONS`",
     ),
     ("schema.rs", 1, "sample_documents stops at its limit"),
     ("vectors.rs", 1, "the emptiness check stops at the first live vector"),

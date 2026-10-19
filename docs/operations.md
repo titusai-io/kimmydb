@@ -68,6 +68,7 @@ fails fast on a bad volume mount.
 | `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
 | `vector.index_cache.max_bytes` | — | `536870912` | Bound on the HNSW graphs kept in memory across vector collections, least recently searched evicted first. About `dim × 4 + 5,000` bytes per chunk (6.5 KB at 384 dimensions, 11 KB at 1,536); size it so the routinely searched collections fit, or their searches pay a rebuild. A single graph over the whole bound is held anyway. `0` lifts the bound (ADR-103) |
+| `vector.index_cache.build_concurrency` | — | `1` | How many HNSW graphs are built at once, on builder threads off the request path (ADR-245). A search of a collection whose graph is being built is answered by the graph it had, or by an exact scan under `server.request_timeout_secs`. A build is CPU and memory bound (a 100,000 × 384 graph peaks at about 1.3 GiB), and the first start of 0.52.0 asks for every collection's, so they queue. At least `1`. 0.51.x refuses a configuration that names it: remove it before rolling back |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth`. Off loopback, an example's value (`changeme`, `hunter2`, …) is refused |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥32 bytes (was 16 up to 0.16.x), and **identical on every node** of a cluster |
@@ -1197,6 +1198,9 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_storage_cache_evictions_total` | **Only in a build with the `storage-cache-metrics` feature** ([the page cache's statistics](#the-page-caches-statistics)); absent otherwise. Pages the page cache gave up, since the database was opened: **read-cache pages dropped to make room**, and **write-buffer pages written out early** once a transaction's writes pass half of `storage.cache_bytes`. Rising with reads while `kimmy_storage_cache_bytes` sits at the bound means the working set is larger than the cache, so reads that miss go to the file: the miss count below shows it, and so does `kimmy_write_lock_held_component_seconds_total{component="read"}` for the reads made under the writer. Rising with one large bulk write is the write buffer spilling |
 | `kimmy_storage_cache_reads_total{result}` | **Only in a build with the `storage-cache-metrics` feature** ([the page cache's statistics](#the-page-caches-statistics)); absent otherwise. Page reads served from the cache (**`hit`**) or from the file (**`miss`**), since the database was opened. `rate(…{result="miss"}) / rate(…)` is the miss ratio: near 0 once a working set that fits is warm, and the first number to read when `storage.cache_bytes` is being sized |
 | `kimmy_vector_index_cache_bytes` | Estimated bytes of HNSW graphs resident in memory — the figure `vector.index_cache.max_bytes` bounds, by the same estimate. Pinned at the bound while vector searches are slow is eviction churn: collections are rebuilding graphs on each other's behalf, and the bound wants raising |
+| `kimmy_vector_graphs_stale` | HNSW graphs served while they are rebuilt (ADR-245): adopted from a snapshot that was behind the store, or from one a previous process saved and a builder has not yet judged. At the first start of 0.52.0 it rises to the vector collections a member has searched and falls as their rebuilds land, one at a time by default (`vector.index_cache.build_concurrency`). It counts only graphs resident: a collection with no graph, and an adopted graph evicted while its rebuild waits, are in `kimmy_vector_graph_builds_pending`. One that does not fall is a builder that cannot keep up |
+| `kimmy_vector_graph_builds_pending` | HNSW builds queued or running, one per collection (ADR-245), whether or not the collection has a graph meanwhile: what `kimmy_vector_graphs_stale` counts, and also a collection with no graph at all, whose searches are exact scans until its build lands, and an adopted graph the budget evicted while its rebuild waited. After a roll, the next member is rolled once this and `kimmy_vector_graphs_stale` both read 0 |
+| `kimmy_vector_graph_unreached_sample` | The highest score among the HNSW graphs this process built and holds: of the 128 stored vectors each build asks to find themselves, how many did not at the build check's search effort (ADR-241). 8 or more is also logged at `WARN`, naming the collection. Every vector is linked into the graph, so a high score is a collection that is hard to search approximately, which recall pays for, not one that lost data; a graph loaded from a snapshot counts 0 |
 | `kimmy_process_resident_bytes` | Resident memory of the whole process as the kernel reports it (`VmRSS` from `/proc/self/status`) — the figure a container memory limit is enforced against, which neither `kimmy_storage_bytes` (a file size) nor `kimmy_vector_index_cache_bytes` (an estimate of one part of the heap) is. It holds `storage.cache_bytes`, the graphs, every request in flight and whatever heap the allocator keeps for reuse after a burst, so it does not follow the two byte gauges down; [Capacity](#capacity) says what to expect and what to do. **Alert on this** against the container's limit — at 80% of it, and on a reading still climbing while `kimmy_requests_total` is flat. 0 where there is no `/proc` ([ADR-147](decisions.md)) |
 | `kimmy_process_resident_peak_bytes` | The most the process has had resident at any moment since it started (`VmHWM`) — what a limit was reached *by*, readable after the current figure has come back down. It is the most this process has seen, including between the kernel's own updates of `VmHWM`, which can read lower than an earlier `VmRSS`. Never falls within one process life; a restart resets it. 0 where there is no `/proc` |
 | `kimmy_requests_total` | HTTP requests handled |
@@ -2213,6 +2217,8 @@ for those the two surfaces genuinely cannot disagree.
 **The engine's block is bridged too** — `kimmy.databases`, `kimmy.collections`,
 `kimmy.unique_violations`, `kimmy.commits`, `kimmy.fsyncs`,
 `kimmy.commits.grouped`, `kimmy.storage.bytes`, `kimmy.vector.index_cache.bytes`,
+`kimmy.vector.graphs.stale`, `kimmy.vector.graph.builds_pending`,
+`kimmy.vector.graph.unreached_sample`,
 `kimmy.process.resident.bytes`, `kimmy.process.resident.peak.bytes` and
 `kimmy.up` — read fresh at each export exactly as `/metrics` reads them at
 each scrape ([ADR-142](decisions.md); the two process gauges since
@@ -3250,14 +3256,21 @@ left 0.5% to 5% of a collection of 500 vectors or more where no search could
 reach it, and links every point the library's insertion still leaves without
 an edge into it ([ADR-241](decisions.md)). A snapshot (`<data_dir>/hnsw/`)
 says in its `meta.json` which build made its graph (`"graph": 2`); one that
-does not say, saved by 0.51.x or earlier, is served once and rebuilt, **once
+does not say, saved by 0.51.x or earlier, is served while it is rebuilt, **once
 per vector collection on each member**:
 
 - **What you see.** At the first search of each vector collection after the
   member starts, one `INFO`: `adopting an HNSW snapshot a build before 0.52.0
-  made as behind`. That search is answered from the old graph at once. The
-  next search of the collection rebuilds it and saves a marked snapshot.
-  Nothing at startup.
+  made as behind`. That search is answered from the old graph at once, and
+  queues the rebuild on a builder thread ([ADR-245](decisions.md)); when it
+  lands, another `INFO`: `a rebuilt HNSW graph replaced the one served
+  meanwhile`, and a marked snapshot is saved. `kimmy_vector_graphs_stale`
+  counts the graphs served while they are rebuilt, and
+  `kimmy_vector_graph_builds_pending` the builds queued or running, which
+  includes a collection with no graph and one whose graph was evicted while
+  it waited: both rise with the collections searched and fall to 0 as the
+  rebuilds land, one at a time unless `vector.index_cache.build_concurrency`
+  says more. Nothing at startup.
 - **What it costs.** One build per collection. Measured with 384-dimensional
   vectors, one build at a time on a loaded 18-core workstation: **9 s to build
   and 4 s to save at 10,000 vectors** (peak process memory 200 MiB), and **4.4
@@ -3265,26 +3278,33 @@ per vector collection on each member**:
   100,000** (1.3 to 1.5 GiB), the upper figures on uniformly random vectors.
   Linking adds under a second at 100,000 vectors of realistic data. The next
   restart loads the snapshot in under a second.
-- **What a search sees meanwhile.** The search that rebuilds waits for the
-  build and the save, and so does every other search of that collection that
-  arrives during them; all of them then answer from the new graph.
-  `server.request_timeout_secs` does not cut that wait short. A collection with
-  fewer than 500 vectors (the exact scan) and a search whose filter admits at
-  most 1,000 documents (read by key) never use the graph and do not wait, and
-  searches of other collections are not delayed; nor are reads and writes,
-  measured with eight collections building at once on a two-worker runtime.
-- **Taking the cost before traffic.** After each member starts, two vector
-  searches of each collection of 500 vectors or more, sent to that member,
-  rebuild its graph; roll on when the second has answered.
+- **What a search sees meanwhile.** No search waits for a build. A
+  collection with a graph, old or behind, is answered by it until the rebuild
+  replaces it, which is the recall the old graph had. A collection with no
+  graph at all, such as one whose snapshot directory was removed, is answered
+  by an exact scan of every vector while its graph is built: at most two
+  scans of one collection at once, each held to `server.request_timeout_secs`
+  and answering `503` `timeout` past it, and a search waiting for a turn holds
+  no thread. A scan of 100,000 vectors of 384
+  dimensions takes about 1.4 s. Searches of other collections, and
+  reads and writes, are not delayed by the builds.
+- **Taking the cost before traffic.** After each member starts, one vector
+  search of each collection of 500 vectors or more, sent to that member,
+  queues its rebuild; roll on when that member's `kimmy_vector_graphs_stale`
+  and `kimmy_vector_graph_builds_pending` both read 0. A stop meanwhile is
+  safe: a builder lets go of the store before it saves, and a save the stop
+  cuts short leaves the old snapshot, or none, never half of one.
 - **A torn snapshot no longer takes a node down.** Before 0.52.0 a snapshot
   data file cut short made the library end the process at that collection's
   first search, on every restart; a snapshot's files are now checked before
   the library reads them, and refused and rebuilt instead. A save now syncs
   its files before the rename that publishes them.
-- **Rolling back to 0.51.x** needs nothing and rebuilds nothing: the format
-  is unchanged, and a 0.51 member loads and serves the graphs 0.52.0 saved,
-  ignoring the field that marks them. A graph 0.51 rebuilds and saves loses
-  the mark, and a member rolled forward again serves it once and rebuilds it.
+- **Rolling back to 0.51.x** rebuilds nothing: the format is unchanged, and a
+  0.51 member loads and serves the graphs 0.52.0 saved, ignoring the field
+  that marks them. **Remove `vector.index_cache.build_concurrency` from the
+  configuration first** if it was set: 0.51.x refuses a configuration that
+  names it. A graph 0.51 rebuilds and saves loses the mark, and a member
+  rolled forward again serves it once and rebuilds it.
 
 ### Vector chunk ids in 0.51.0
 

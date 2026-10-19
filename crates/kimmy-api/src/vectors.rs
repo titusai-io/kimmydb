@@ -954,7 +954,7 @@ async fn search_hits(
     let query = resolve_query_vector(state, &config, body).await?;
     let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
 
-    let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref())?;
+    let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref()).await?;
     let hits = only_live(state, &source, hits)?;
     Ok((source, hits))
 }
@@ -1000,7 +1000,7 @@ pub(crate) async fn stage_documents(
 /// The paths return the same shape and score the same way — the exact scan
 /// and the keyed join are exhaustive, the graph walk is approximate — so
 /// callers do not branch.
-fn knn(
+async fn knn(
     state: &SharedState,
     shadow: &kimmy_storage::CollectionMeta,
     config: &VectorConfig,
@@ -1008,12 +1008,12 @@ fn knn(
     options: &SearchOptions,
     allowed: Option<&Allowed>,
 ) -> Result<Vec<Hit>, ApiError> {
-    knn_joined(state, shadow, config, query, options, allowed.map(|a| (a, a.join())))
+    knn_joined(state, shadow, config, query, options, allowed.map(|a| (a, a.join()))).await
 }
 
 /// [`knn`] with the join direction chosen by the caller, so a test can run
 /// both over one fixture and hold them to the same answer.
-fn knn_joined(
+async fn knn_joined(
     state: &SharedState,
     shadow: &kimmy_storage::CollectionMeta,
     config: &VectorConfig,
@@ -1046,6 +1046,15 @@ fn knn_joined(
         Access::Exact => kimmy_storage::blocking(|| {
             search::vector_search(&state.engine, shadow, query, options, set)
         }),
+        // No graph yet, and one is being built (ADR-245): every stored vector
+        // scored, as above, but in a turn of the collection's few at once,
+        // awaited, and under the request's deadline.
+        Access::Building => {
+            state
+                .vectors
+                .scan_while_building(&state.engine, shadow, query, options, set, deadline)
+                .await
+        }
     }
     .map_err(vector_error)
 }
@@ -1088,7 +1097,7 @@ pub async fn run_hybrid_search(
     // a document ranked modestly by both should be able to beat one ranked
     // first by only one.
     let wide = SearchOptions { k: (options.k * 4).min(MAX_K), ..options.clone() };
-    let dense = knn(state, &shadow, &config, &query, &wide, allowed.as_ref())?;
+    let dense = knn(state, &shadow, &config, &query, &wide, allowed.as_ref()).await?;
     // The overlap gate applies to the lexical half only. A document it drops
     // here is still in `dense` if the dense half ranked it, and keeps that
     // contribution: the gate removes lexical evidence, not documents.
@@ -1547,8 +1556,12 @@ mod tests {
         let config = config();
         let query = [1.0f32, 0.0];
         let options = SearchOptions { k: 10, metric: config.metric, per_document: 1 };
-        let built = knn_joined(&state, &shadow, &config, &query, &options, None).unwrap();
-        assert_eq!(built.len(), 10, "the premise: a graph over the first 300");
+        // The first search is answered by a scan and queues the graph's build
+        // (ADR-245), which is let finish.
+        let built = knn_joined(&state, &shadow, &config, &query, &options, None).await.unwrap();
+        assert_eq!(built.len(), 10);
+        state.vectors.settle();
+        assert_eq!(state.vectors.len(), 1, "the premise: a graph over the first 300");
         for i in 300..400i64 {
             state
                 .engine
@@ -1570,12 +1583,14 @@ mod tests {
         allowed.set = allowed.ids.iter().cloned().collect();
         let exact =
             knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Keyed)))
+                .await
                 .unwrap();
         let ids = |hits: &[Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
 
         let timeout = std::time::Duration::from_secs(7);
         let late = crate::limits::as_a_request(std::time::Instant::now(), timeout, async {
             knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Discard)))
+                .await
         })
         .await
         .expect_err("a graph search past the request's deadline must not answer");
@@ -1586,10 +1601,16 @@ mod tests {
         let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let inside = crate::limits::as_a_request(far, timeout, async {
             knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Discard)))
+                .await
         })
         .await
         .unwrap();
         assert_eq!(ids(&inside), ids(&exact));
+    }
+
+    /// A search run to its end from a synchronous test.
+    fn ran<T>(search: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(search)
     }
 
     fn live_state(dir: &tempfile::TempDir) -> SharedState {
@@ -2047,9 +2068,15 @@ mod tests {
             let options = SearchOptions { k, metric: config.metric, per_document };
             let expected = brute_force(&state, &shadow, &query, &options, &allowed.set);
             for join in [Join::Keyed, Join::Discard] {
-                let hits =
-                    knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, join)))
-                        .unwrap();
+                let hits = ran(knn_joined(
+                    &state,
+                    &shadow,
+                    &config,
+                    &query,
+                    &options,
+                    Some((&allowed, join)),
+                ))
+                .unwrap();
                 let got: Vec<(String, u32, f32, String)> = hits
                     .into_iter()
                     .map(|h| (h.id.to_string(), h.chunk, h.score, h.text))
@@ -2062,8 +2089,9 @@ mod tests {
         let none = filter_ids(&state, &source, &parse(bson::doc! { "tag": 7 }), 1_000).unwrap();
         for join in [Join::Keyed, Join::Discard] {
             let options = SearchOptions { k: 5, metric: config.metric, per_document: 1 };
-            let hits = knn_joined(&state, &shadow, &config, &query, &options, Some((&none, join)))
-                .unwrap();
+            let hits =
+                ran(knn_joined(&state, &shadow, &config, &query, &options, Some((&none, join))))
+                    .unwrap();
             assert!(hits.is_empty(), "{join:?}");
         }
     }
@@ -2239,7 +2267,7 @@ mod tests {
         let state = live_state(&dir);
         let (_, shadow, ids) = tenants(&state);
         let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
-        let hits = knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None).unwrap();
+        let hits = ran(knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None)).unwrap();
         let mut got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
         got.sort();
         // Document 4's nearest chunk is the debris that names it, wherever it
@@ -2250,7 +2278,7 @@ mod tests {
         expected.sort();
         assert_eq!(got, expected, "four documents, not one per id length");
         assert_eq!(
-            render(&knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None).unwrap())["count"],
+            render(&ran(knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None)).unwrap())["count"],
             4
         );
     }
@@ -2270,14 +2298,14 @@ mod tests {
         for join in [Join::Keyed, Join::Discard] {
             for per_document in [1, 3] {
                 let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document };
-                let hits = knn_joined(
+                let hits = ran(knn_joined(
                     &state,
                     &shadow,
                     &config(),
                     &[1.0, 0.0],
                     &options,
                     Some((&allowed, join)),
-                )
+                ))
                 .unwrap();
                 let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
                 assert_eq!(
@@ -2316,14 +2344,14 @@ mod tests {
         assert_eq!(allowed.ids, [DocId::Int64(7)]);
         for join in [Join::Keyed, Join::Discard] {
             let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
-            let hits = knn_joined(
+            let hits = ran(knn_joined(
                 &state,
                 &shadow,
                 &config(),
                 &[1.0, 0.0],
                 &options,
                 Some((&allowed, join)),
-            )
+            ))
             .unwrap();
             let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
             assert_eq!(got, [(DocId::Int64(7), "int seven".to_string())], "{join:?}");
