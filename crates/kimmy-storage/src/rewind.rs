@@ -1396,15 +1396,15 @@ mod tests {
     ) -> u64 {
         let base = base();
         let items = e.create_collection("shop", "items").unwrap();
-        at(&e, base, 120);
+        at(e, base, 120);
         e.insert(&items, doc! { "_id": 100i64, "v": "old life" }).unwrap();
-        ended(&e, &items, base);
-        at(&e, base, 260);
+        ended(e, &items, base);
+        at(e, base, 260);
         e.drop_collection("shop", "items").unwrap();
         e.finish_purges_now().unwrap();
-        at(&e, base, 330);
+        at(e, base, 330);
         let items = e.create_collection("shop", "items").unwrap();
-        at(&e, base, 386);
+        at(e, base, 386);
         e.insert(&items, doc! { "_id": 100i64, "v": "new life" }).unwrap();
         base
     }
