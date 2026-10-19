@@ -68,7 +68,11 @@ struct Reachability {
 /// re-probing the missed points at 200, 400, 800 and 1600 changes the answer
 /// between 200 and 800 and then stops. Past the plateau more exploration buys
 /// nothing, because no amount of exploring crosses into a part of the graph
-/// that has no edges leading to it.
+/// that has no edges leading to it. (That was `hnsw_rs` 0.3.4's graph, whose
+/// losses were points with no edge into them. On a linked graph a point still
+/// missed here is reachable and hard to find: on uniformly random
+/// 384-dimensional vectors, 60% to 85% of them are found at four times the
+/// effort.)
 const REACHABILITY_CONFIRM_EF: usize = 800;
 
 /// How many neighbours the second look asks for.
@@ -81,28 +85,32 @@ const REACHABILITY_CONFIRM_K: usize = 32;
 /// How many unreachable points in a sample mean the graph lost data, rather
 /// than being the graph HNSW ordinarily produces.
 ///
-/// **Not zero, and not for the reason this comment used to give.** An earlier
-/// revision said a healthy miss was a vector among near-duplicates getting
-/// edged out by a neighbour — approximation working as designed. That was
-/// assumed, and it is wrong: re-probed at [`REACHABILITY_CONFIRM_EF`] those
-/// points are still not found, so they are not edged out, they are genuinely
-/// unreachable. **Every graph this builds orphans a little.** Over 599 healthy
-/// builds at 400 vectors, checking every point rather than a sample, the true
-/// orphaned fraction ran **0.8% to 3.0%** — never zero.
+/// **A guard against a gross failure, since 0.52.0** (ADR-241). Until then it
+/// separated `hnsw_rs` 0.3.4's routine orphaning (0.8% to 3% of every graph,
+/// sampled scores 0 to 7) from its catastrophic draws (10% to 35%, scores 13
+/// and up). 0.3.5 stores reverse edges at the right layer, and the build
+/// links every point its insertion still cuts off ([`link_cut_off`]), so no
+/// point is left that a search cannot reach, and what a probe can still miss
+/// is a reachable point the confirming search ran out of effort for.
+/// Measured with every point checked, after the linking:
 ///
-/// So the threshold separates *routine* orphaning from *catastrophic*
-/// orphaning, and both sides are measured:
+/// | vectors × dim | data | builds | not found at [`REACHABILITY_CONFIRM_EF`] | sampled score |
+/// |---|---|---|---|---|
+/// | 400 to 1,000, 16 and 384 dims | uniform, latent | 108 | none | 0 |
+/// | 4,000 × 384 | uniform | 4 | up to 0.17% | 0 |
+/// | 4,000 × 384 | latent | 4 | up to 0.03% | 0 |
+/// | 10,000 × 384 | uniform | 2 | 0.9%–1.1% | 1–3 |
+/// | 10,000 × 384 | latent | 2 | 0.01% | 0–1 |
+/// | 100,000 × 384 | latent | 1 | 0.02% | 0 |
+/// | 100,000 × 384 | uniform | 1 | 10.8% | 13 |
 ///
-/// | | true orphaned | sampled score |
-/// |---|---|---|
-/// | 599 healthy builds | 0.8%–3.0% | 0–5, median 1 |
-/// | the 1 catastrophic build | 14.8% | **22** |
-///
-/// Across a further 126 builds spanning 16 and 384 dimensions and 500 to 8,000
-/// vectors, no healthy build scored above 7. **Eight sits above every healthy
-/// observation and far below the only bad one**, and a catastrophic build at
-/// the mildest fraction on record (10%) still expects ~13 of 128 — with
-/// [`MAX_BUILD_ATTEMPTS`] fresh draws behind it.
+/// "Latent" is 24 dimensions projected into 384 with noise, nearer what an
+/// embedding model writes than independent uniform coordinates are, which
+/// are HNSW's hardest case. **Eight sits above every score measured on data
+/// of realistic intrinsic dimension and below a graph that loses a tenth of
+/// itself**, which expects 13 of 128. Uniformly random 384-dimensional
+/// vectors at 100,000 score above it, and their build is retried in vain,
+/// since another order does not make a hard search easier.
 ///
 /// **This was 3, sized against a 400-vector, 16-dimensional fixture, and the
 /// shape depends on both.** At 384 dimensions — the realistic embedding width —
@@ -115,11 +123,12 @@ const REACHABILITY_MAX_UNREACHABLE: usize = 8;
 
 /// How many times a build that loses data is discarded and retried.
 ///
-/// The layer draw is independent each time, so at a measured ~0.4% failure
-/// rate two retries take the odds to roughly one in ten million. It is
-/// bounded because an index that genuinely cannot be built well — a
-/// pathological collection rather than an unlucky draw — must still return
-/// something rather than loop.
+/// Each attempt inserts in its own order ([`insertion_order`]), the only
+/// draw `hnsw_rs` 0.3.5 leaves to vary, so a retry is another graph. With
+/// the linking no measured build needed one; it stays for a failure no
+/// measurement has shown. It is bounded because an index that genuinely
+/// cannot be built well — a pathological collection rather than an unlucky
+/// draw — must still return something rather than loop.
 const MAX_BUILD_ATTEMPTS: usize = 2;
 
 /// How many of a cut-off point's nearest linked points get an edge into it
@@ -563,8 +572,14 @@ impl HnswIndex {
     ///
     /// So the graph is checked against the property that matters, by asking a
     /// sample of stored vectors to find themselves. A failed build is
-    /// discarded and rebuilt from a fresh random draw. Draws are independent,
-    /// so one retry takes ~0.4% to ~1 in 60,000.
+    /// discarded and rebuilt in another insertion order ([`insertion_order`]).
+    ///
+    /// **Those measurements were `hnsw_rs` 0.3.4's** (ADR-241), whose
+    /// misplaced reverse edges were most of what the check caught. 0.3.5
+    /// places them right, and the build now links every point its insertion
+    /// still cuts off ([`link_cut_off`]), so the check guards against a
+    /// failure no measured build has shown; see
+    /// [`REACHABILITY_MAX_UNREACHABLE`] for what it scores now.
     pub fn build(
         engine: &Engine,
         shadow: &CollectionMeta,
