@@ -57,6 +57,9 @@ struct Reachability {
     missed: usize,
     /// Of those, the ones still missing when effort stops being the limit.
     unreachable: usize,
+    /// Edges the build added at layer 0 to link points it had cut off
+    /// ([`link_cut_off`]).
+    linked: usize,
 }
 
 /// How hard a second look is, before a miss is called data loss.
@@ -118,6 +121,23 @@ const REACHABILITY_MAX_UNREACHABLE: usize = 8;
 /// pathological collection rather than an unlucky draw — must still return
 /// something rather than loop.
 const MAX_BUILD_ATTEMPTS: usize = 2;
+
+/// How many of a cut-off point's nearest linked points get an edge into it
+/// ([`link_cut_off`]). Two, so that one later removal of a list entry cannot
+/// cut it off again; one more edge each costs nothing measurable.
+const LINK_EDGES: usize = 2;
+
+/// How wide the search for a cut-off point's nearest linked points looks.
+/// The candidates only have to be near and linked, not the true nearest: an
+/// edge from any linked point makes the point reachable.
+const LINK_CANDIDATES: usize = 16;
+const LINK_EF: usize = 100;
+
+/// How many rounds of linking a build makes before it stops. Every measured
+/// build needed one: an edge is only ever added, so a point linked stays
+/// linked, and a round can only leave a point cut off whose candidates were
+/// all cut off too.
+const LINK_ROUNDS: usize = 4;
 
 /// What a snapshot must say about itself to be trusted.
 ///
@@ -284,6 +304,133 @@ fn estimate_bytes(keys: &[String], dim: usize) -> usize {
     let per_node = dim * 4 + NODE_OVERHEAD_BYTES;
     let key_bytes: usize = keys.iter().map(|k| k.len() + 24).sum();
     keys.len() * per_node + key_bytes
+}
+
+/// Layer 0 of a graph, read from its structure: for each graph id, whether
+/// no edge leads into it, and whether the entry point's component at layer 0
+/// does not hold it (no path of edges leads to it from the entry point).
+///
+/// Every search ends its descent at some point of layer 0 and walks the edges
+/// from there, so a point with no edge into it is returned only when a
+/// descent ends on it, and a point outside the entry point's component only
+/// from a descent that ends inside its own. Either is a point the graph has
+/// lost. The entry point is the first point inserted at the top level: the
+/// library replaces it only on a strictly higher one, and graph ids are
+/// insertion order.
+struct Layer0 {
+    no_edge_in: Vec<bool>,
+    outside: Vec<bool>,
+}
+
+impl Layer0 {
+    fn read<D>(graph: &Hnsw<'static, f32, D>) -> Self
+    where
+        D: hnsw_rs::anndists::dist::Distance<f32> + Send + Sync,
+    {
+        let n = graph.get_nb_point();
+        let mut level = vec![0u8; n];
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for point in graph.get_point_indexation() {
+            let at = point.get_origin_id();
+            if at >= n {
+                continue;
+            }
+            level[at] = point.get_point_id().0;
+            edges[at] = point.get_neighborhood_id()[0].iter().map(|e| e.d_id).collect();
+        }
+        let mut into = vec![false; n];
+        for (at, out) in edges.iter().enumerate() {
+            for &to in out {
+                if to != at && to < n {
+                    into[to] = true;
+                }
+            }
+        }
+        let top = level.iter().copied().max().unwrap_or(0);
+        let mut reached = vec![false; n];
+        if let Some(entry) = (0..n).find(|&i| level[i] == top) {
+            // The entry point needs no edge into it: every search starts there.
+            into[entry] = true;
+            reached[entry] = true;
+            let mut stack = vec![entry];
+            while let Some(at) = stack.pop() {
+                for &to in &edges[at] {
+                    if to < n && !std::mem::replace(&mut reached[to], true) {
+                        stack.push(to);
+                    }
+                }
+            }
+        }
+        Self {
+            no_edge_in: into.iter().map(|linked| !linked).collect(),
+            outside: reached.iter().map(|r| !r).collect(),
+        }
+    }
+
+    /// The graph ids the graph has lost, in id order.
+    fn cut_off(&self) -> Vec<usize> {
+        (0..self.outside.len()).filter(|&i| self.no_edge_in[i] || self.outside[i]).collect()
+    }
+}
+
+/// Give every point a build left cut off at layer 0 ([`Layer0`]) an edge into
+/// it from [`LINK_EDGES`] of its nearest linked points, until none is cut off
+/// (ADR-241). Returns how many edges were added.
+///
+/// **Why a build leaves any.** `hnsw_rs` adds a new point to each of its
+/// neighbours' lists and, when a list is over its cap, drops the farthest
+/// entry, which can be the new point; a point dropped by every neighbour has
+/// no edge into it. 0.3.5 left 0.1% of a collection of low intrinsic
+/// dimension like that at 10,000 to 100,000 vectors, and 1.5% to 8% of
+/// uniformly random 384-dimensional ones; no search returns them. The edge is
+/// added past the cap, never by displacing another (`add_layer0_edges`, the
+/// one function kimmydb's copy of the library adds), so no point loses an
+/// edge into it, and every measured build was linked in one round, in under a
+/// second at 100,000 vectors of realistic data.
+fn link_cut_off<D>(graph: &Hnsw<'static, f32, D>, engine: &Engine) -> Result<usize>
+where
+    D: hnsw_rs::anndists::dist::Distance<f32> + Send + Sync,
+{
+    let mut added = 0;
+    for _ in 0..LINK_ROUNDS {
+        // A search's build, which the drain's deadline ends, as the inserts.
+        engine.check_walk(kimmy_storage::WalkScope::Request)?;
+        let layer0 = Layer0::read(graph);
+        let cut = layer0.cut_off();
+        if cut.is_empty() {
+            break;
+        }
+        let lost: HashSet<usize> = cut.iter().copied().collect();
+        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; layer0.outside.len()];
+        for point in graph.get_point_indexation() {
+            let at = point.get_origin_id();
+            if lost.contains(&at) {
+                vectors[at] = Some(point.get_v().to_vec());
+            }
+        }
+        let mut edges = Vec::with_capacity(cut.len() * LINK_EDGES);
+        for &point in &cut {
+            let Some(vector) = vectors[point].as_deref() else { continue };
+            edges.extend(
+                graph
+                    .search(vector, LINK_CANDIDATES, LINK_EF)
+                    .iter()
+                    .map(|n| n.d_id)
+                    .filter(|&from| from != point && !lost.contains(&from))
+                    .take(LINK_EDGES)
+                    .map(|from| (from, point)),
+            );
+        }
+        let linked = graph.add_layer0_edges(&edges);
+        if linked == 0 {
+            // Nothing linked could be found near what is left: a graph with
+            // no linked point at all, or one of nothing but duplicates of a
+            // cut-off point. Another round would find the same.
+            break;
+        }
+        added += linked;
+    }
+    Ok(added)
 }
 
 /// fsync a file or a directory: what [`HnswIndex::save`] writes, and the
@@ -553,13 +700,19 @@ impl HnswIndex {
             keys.push(key);
         }
 
-        debug!(vectors = keys.len(), "built HNSW index");
+        // Link what the insertion left where no search reaches (ADR-241).
+        let linked = match &graph {
+            Graph::Cosine(g) => link_cut_off(g, engine)?,
+            Graph::Euclidean(g) => link_cut_off(g, engine)?,
+        };
+
+        debug!(vectors = keys.len(), linked, "built HNSW index");
         let bytes = estimate_bytes(&keys, dim);
         let index = Self { graph, keys, metric, dim, created: shadow.created, bytes, renames };
 
         // Ask the sampled vectors to find themselves. A few dozen searches
         // against an O(n log n) build, and no extra reads.
-        let mut reach = Reachability::default();
+        let mut reach = Reachability { linked, ..Reachability::default() };
         for (i, vector) in &probes {
             reach.sampled += 1;
             let found = index.search_keys(vector, 1)?;
@@ -1065,45 +1218,11 @@ mod tests {
     /// [`cut_off`] point by point: whether each graph id has no layer-0 edge
     /// into it, and whether it is outside the entry point's component.
     fn cut_off_points(index: &HnswIndex) -> (Vec<bool>, Vec<bool>) {
-        let n = index.keys.len();
-        let mut level = vec![0u8; n];
-        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let points: Vec<_> = match &index.graph {
-            Graph::Cosine(g) => g.get_point_indexation().into_iter().collect::<Vec<_>>(),
-            Graph::Euclidean(_) => unimplemented!("the measurements are cosine"),
+        let layer0 = match &index.graph {
+            Graph::Cosine(g) => Layer0::read(g),
+            Graph::Euclidean(g) => Layer0::read(g),
         };
-        for point in points {
-            let at = point.get_origin_id();
-            level[at] = point.get_point_id().0;
-            edges[at] = point.get_neighborhood_id()[0].iter().map(|n| n.d_id).collect();
-        }
-        let mut into = vec![0usize; n];
-        for (at, out) in edges.iter().enumerate() {
-            for &to in out {
-                if to != at {
-                    into[to] += 1;
-                }
-            }
-        }
-        let no_edge_in: Vec<bool> = into.iter().map(|&c| c == 0).collect();
-        // The entry point is the first point inserted at the top level: the
-        // graph replaces it only on a strictly higher one, and ids are
-        // insertion order.
-        let top = level.iter().copied().max().unwrap_or(0);
-        let Some(entry) = (0..n).find(|&i| level[i] == top) else {
-            return (vec![false; n], vec![false; n]);
-        };
-        let mut seen = vec![false; n];
-        seen[entry] = true;
-        let mut stack = vec![entry];
-        while let Some(at) = stack.pop() {
-            for &to in &edges[at] {
-                if !std::mem::replace(&mut seen[to], true) {
-                    stack.push(to);
-                }
-            }
-        }
-        (no_edge_in, seen.iter().map(|s| !*s).collect())
+        (layer0.no_edge_in, layer0.outside)
     }
 
     /// How many of the graph's points do not come back for their own vector
@@ -1795,6 +1914,100 @@ mod tests {
         let returned = HnswIndex::build(&engine, &shadow, Metric::Cosine, 4).unwrap();
         assert_ne!(shape(&returned), shape(&first), "the retries rebuilt the first draw");
         assert_eq!(shape(&returned), shape(&last), "not the last attempt's graph");
+    }
+
+    /// A build links every point its insertion cut off at layer 0, so none is
+    /// left that no search reaches (ADR-241).
+    ///
+    /// Two fixtures that the library's insertion cuts points off in, measured
+    /// here first by inserting the same vectors in the same order with the
+    /// same parameters and reading layer 0: 300 copies of one vector (every
+    /// list fills with copies at distance zero and drops the newcomer: about
+    /// two thirds are cut off), and 1,500 uniformly random 96-dimensional
+    /// vectors (a few, in some orders). The build must leave none.
+    #[test]
+    fn a_build_links_every_point_its_insertion_cut_off() {
+        for (name, count, dim, same) in
+            [("one vector repeated", 300, 4, true), ("uniform 96-d", 1_500, 96, false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            engine.create_collection("app", "docs").unwrap();
+            engine.configure_vectors("app", "docs", config(dim)).unwrap();
+            let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+            let vector = |i: usize| {
+                if same {
+                    let mut v = vec![0.0; dim];
+                    v[0] = 1.0;
+                    v
+                } else {
+                    pseudo_random(i as u64 + 1, dim)
+                }
+            };
+            engine
+                .write_batch(kimmy_storage::WriterHolder::Embedding, |scope| {
+                    for i in 0..count {
+                        let source = DocId::Int64(i as i64);
+                        let record = VectorRecord {
+                            source: source.clone(),
+                            chunk: 0,
+                            source_hlc: Hlc::new(1, 0),
+                            vector: vector(i),
+                            text: String::new(),
+                            config: None,
+                        };
+                        let write = kimmy_storage::VectorWrite::encode(
+                            &source,
+                            &ChunkSource::from(&source),
+                            &[record],
+                        )?;
+                        scope.put_vectors(&shadow, write)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+
+            // The precondition: the library's insertion alone cuts points off,
+            // in the first attempt's order that does so (the same one on every
+            // run: a build is a function of its records and its attempt).
+            let mut walked: Vec<Vec<f32>> = Vec::new();
+            engine
+                .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |_, record| {
+                    walked.push(record.vector);
+                    Ok(true)
+                })
+                .unwrap();
+            let cut_by_insertion = |attempt: usize| {
+                let mut ordered = walked.clone();
+                insertion_order(&mut ordered, attempt);
+                let raw = Hnsw::<f32, DistCosine>::new(
+                    MAX_CONNECTIONS,
+                    count,
+                    MAX_LAYERS,
+                    EF_CONSTRUCTION,
+                    DistCosine {},
+                );
+                for (i, v) in ordered.iter().enumerate() {
+                    raw.insert((v.as_slice(), i));
+                }
+                Layer0::read(&raw).cut_off().len()
+            };
+            let Some((attempt, before)) =
+                (0..32).map(|a| (a, cut_by_insertion(a))).find(|(_, cut)| *cut > 0)
+            else {
+                panic!("{name}: no order of 32 cuts a point off, so nothing tests the linking");
+            };
+
+            let (index, reach) =
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, dim, attempt).unwrap();
+            assert_eq!(
+                cut_off(&index),
+                (0, 0),
+                "{name}: {before} points cut off before linking; points with no layer-0 edge \
+                 into them, and points outside the entry point's component, after it"
+            );
+            assert!(reach.linked >= before, "{name}: {before} cut off, {} edges", reach.linked);
+        }
     }
 
     // -----------------------------------------------------------------------
