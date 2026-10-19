@@ -2378,8 +2378,8 @@ window.
 | Refusal | Why |
 |---|---|
 | A target before the oplog horizon | Nothing describes the database before that point |
-| A schema change after the target | Dropping a collection purges its documents, and purged documents are not in the oplog either |
-| A document whose earlier value was collected | It existed at the target with a value that now exists nowhere. It is named in the error |
+| A schema change after the target | Dropping a collection purges its documents, and purged documents are not in the oplog either. A drop counts whether the member holds its oplog entry or knows it only as a collection or database tombstone, or as a collection's incarnation floor, as a snapshot page leaves it |
+| A document whose value at the target the member does not hold | It changed after the target, and the value it had there is not in this member's oplog: retention collected it, the member holds the document only as a snapshot page's state, or its entries at or below the target are of a collection life a drop ended. It is named in the error |
 
 The last one is the important one. The oplog stores what a document *became*,
 never what it was, and a delete stores nothing at all — so a document untouched
@@ -2474,6 +2474,18 @@ discarded, and the peer passes the delete on as an entry under the member's id
 
   If no member that was not rewound holds a copy of a document, its value cannot
   be recovered from the cluster.
+
+**A collection dropped and created again before the target.** A rewind takes a
+document's value at the target only from entries of the collection's life that
+stands there: a version written before the drop is of a life the drop ended, and
+is never put back ([ADR-248](decisions.md)). A rewind by 0.51 or earlier put such
+a version back when the document's latest entry at or below the target was one,
+and the member then holds a document its peers do not, which no sync or repair
+removes. Treat any member rewound by 0.51 or earlier to a target after a drop and
+re-creation of a collection it holds as affected, and compare that collection's
+documents across the members. Restore that member again from the same backup with
+this release's `kimmyd restore --from … --until …`, or stop it, remove its
+`kimmy.redb` and start it empty so it takes its peers' state.
 
 ### The identity comes back with it
 
