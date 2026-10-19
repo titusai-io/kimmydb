@@ -1101,8 +1101,8 @@ impl Engine {
     }
 
     /// [`Engine::delete_if`] under an idempotency key (B5). Replayed only
-    /// while the delete's own tombstone stands: once it is collected, the
-    /// retry runs afresh (see [`crate::idempotency`]).
+    /// while the request's own tombstone, or a later version, stands: once it
+    /// is collected, the retry runs afresh (see [`crate::idempotency`]).
     pub fn delete_keyed(
         &self,
         coll: &CollectionMeta,

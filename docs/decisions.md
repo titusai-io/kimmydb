@@ -28958,7 +28958,8 @@ as built and accepted:
 - **Retention's re-check** removes a record with the first of its rows at or above its `last`, not only at it, once
   `last` is past the cutoff: a record whose `last` is below an expired row is past its window too, and only its own
   row at `last` would otherwise remove it.
-- **A keyed delete by id** replays while its tombstone or a later version over it stands, not the tombstone alone.
+- **A keyed delete by id** replays while one of its attempts' tombstones or a later version over it stands, not the
+  tombstone alone.
 - **A record of another kind of request** is a key reused, whatever the fingerprint says.
 - **The stamp rule holds on every chunk after a record exists**, not only on a resume (item 4; Chris).
 - **The engine writes the resume and replay lines**, naming the database, the collection and the record's origin; the
