@@ -2430,27 +2430,68 @@ version vectors over them and recorded the result as verified, so no later start
 checks it again. Such a member claims each origin up to the newest entry it held
 as state, and its pulls start there: an origin's write below that point which
 the member did not already hold never reaches it by sync. A document written once
-and not touched again is missing for good, and a member that pulls that origin
-from it misses the document too. Upgrading does not lower the vector.
+and not touched again is missing for good. Upgrading does not lower the vector.
 
-**How to tell**, either of:
+**The gap spreads.** A member that took that origin's entries from the restored
+member while it claimed them claims the same coverage and lacks the same
+documents, and so does any member that later catches up from one of those first,
+by entries or by a whole-database snapshot: a member wiped and re-synced, or
+restored again, included. A backup taken of any affected member shows nothing
+wrong, since its vector already covers what it claims.
 
-- Run `python3 -I scripts/backup-held-rows.py <backup>` on the backup the member
-  was restored from. It reads the file and nothing else. A total above 0 means
-  the restore claimed history it did not take, for the origins it lists; 0 means
-  it did not.
-- On the restored member, the `WARN` `a divergence repair left rows it will not
-  write` for a collection (`left`, and the ids in `first_ids`; with
+**How to tell. Check every member, not only the restored one:**
+
+- On each member, the `WARN` `a divergence repair left rows it will not write`
+  for a collection (`left`, and the ids in `first_ids`; with
   `cluster.divergence_repair` on, the default): the digest repair found a
   document the member holds nothing for, and does not write it because its stamp
-  is older than the restore. A count finding on the same collection (`divergence
-  confirmed; planned a repair from this peer`) plans the count half's replay,
-  which brings a lost insert back while the origin still retains its entry; a
-  lost write the counts do not show is not brought back.
+  is not above both members' tombstone horizons (a restore sets the restored
+  member's to the restore's time, so there no such document is written). On a
+  member that was not restored, the repair may write a recent one back by itself;
+  what it cannot write, it leaves with this line. A
+  count finding on the same collection (`divergence confirmed; planned a repair
+  from this peer`) plans the count half's replay, which brings a lost insert
+  back while the origin still retains its entry.
+- Compare each collection across every member: its document count
+  (`POST /v1/db/{db}/coll/{coll}/count`, read with no writes to the collection
+  meanwhile) and the cut digest (`kimmy_sync_digest_divergent_collections` above
+  0 and the `WARN` `a confirmed digest divergence; a document repair is planned`,
+  which names the peer and the collection). Then compare `(id, stamp)` as
+  [What to do with a digest finding](#the-cut-digest) says, to name the ids.
+- For the member that was restored, and for it only, the backup it was restored
+  from proves the over-claim. `scripts/backup-held-rows.py` counts the oplog
+  entries above the backup's version vector, by origin. It is not in the server
+  image: take it from the repository at the release's tag. It needs Python 3 and
+  nothing else, reads the file and nothing else, and runs wherever a copy of the
+  backup is: `python3 -I backup-held-rows.py <copy of the backup>`. A total above
+  0 proves that restore claimed history it did not take, for the origins listed.
+  **A total of 0 clears that one restore and no member**: it says nothing about
+  a member that synced from an affected one, or about a backup of an affected
+  member.
 
-**What to do**: wipe the member's data directory and let it re-sync from its
-peers, or redo the restore with 0.52.0 or later, from the original backup, with
-the command above. The second marks the entries and claims nothing over them.
+**What to do.** Call a member *clean* when none of the checks above finds a
+document it lacks. The member that wrote a lost document always holds it.
+
+1. **Apply the wipe rule first**, step 3 of
+   [What to do with a digest finding](#the-cut-digest), to every member that is
+   not clean: wipe a member only if every id that differs is present on both
+   members and that member holds the older stamp on every one of them. A
+   document the member lacks is an id present on one member only, so the rule
+   forbids the wipe, and the operator rule for rows the repair leaves applies:
+   a write lost this way is one the lacking member never held, so re-insert it
+   through that member. The re-insert is a new write, above every member's
+   vector, so it reaches every member, the affected ones included, whatever each
+   one claims.
+2. **A member the rule allows you to wipe**, or the restored member restored
+   again from the original backup with 0.52.0 or later (which the same rule
+   governs, since it discards what the member took after that backup), catches
+   up from whichever peer it reaches first, and an affected peer hands it the
+   gap again. So make every member it can reach clean: stop every member that is
+   not clean, start the wiped or restored member, and wait until its
+   catching-up marker has cleared, which it does only once it holds what the
+   running members hold. Bring several back one at a time the same way. Start
+   the other members again only after that.
+3. If no member is clean, wipe none: use step 1 on every member.
 
 Restoring an older backup onto a newer build is supported while the format
 version matches; a backup from a *newer* build is refused by name rather than

@@ -28712,6 +28712,11 @@ nothing and is not carried. The member's own origin follows the same rule: a wri
 state does not raise its own position, so the start's replay of its own origin (`own_position_at_open`) still begins
 below it.
 
+**With a rewind.** `kimmyd restore --until` restores, opens and then rewinds. The rewind removes every entry above its
+target together with its mark, and whatever it does to the vectors must not raise them over a held entry, which ADR-160
+requires of it as of every writer. The marks the restore derived then stand on exactly the held entries the rewind kept,
+and invariant I holds after it.
+
 **The residual ADR-160 accepted is withdrawn.** ADR-160 left `OPLOG_HELD` out of the backup and accepted that "a
 restored node counts every entry and raises over the held ones", because carrying the table needed a backup tag that
 an older build's restore refuses. ADR-166 widened the residual to every member that has ever taken a snapshot from a
@@ -28747,12 +28752,24 @@ state and what to do about it.
 - `restore --until` over a held row does not claim it;
 - the member's own position does not rise over a write of its own held as state.
 
+- a backup whose vector names two origins at different positions: the restore marks the lower origin's held row and
+  nothing of the higher origin's, and the member takes the lower origin's write below the row.
+
 In `backup::tests`: the restored marks are exactly the entries above the backup's vector, a stale mark on a covered
 entry is not carried, and a backup of a member that holds nothing as state restores no mark. The invariant model test
-in `verified::tests` asserts, after every restore it runs, that both vectors are the backup's servable vector. The
-`restore --until` test also passes against ADR-243's lowering of the vectors.
+in `verified::tests` asserts, after every restore it runs, that both vectors are the backup's servable vector.
 
-Mutations, in bash, each failing a test with only that change: the marking removed; `>=` in place of `>`; `<` in place
-of `>`; the comparison made against an empty vector; and against the witnessed vector. One more is argued equivalent rather than
-run: marking in a second transaction after the records commit behaves the same in every test and differs only on a
-crash between the two commits, which is why the marks are written in the records' transaction.
+Mutations, in bash, each failing a test with only that change:
+- the marking removed;
+- `>=` in place of `>`;
+- `<` in place of `>`;
+- the comparison made against an empty vector;
+- one threshold for every origin, the vector's lowest position (it marks the entries of origins held further ahead);
+- one threshold for every origin, the vector's highest position (it leaves the held rows of origins held further
+  behind unmarked);
+- origins the vector does not name skipped (it leaves a row of an origin the member holds nothing of in position
+  unmarked).
+
+One more is argued equivalent rather than run: marking in a second transaction after the records commit behaves the same
+in every test and differs only on a crash between the two commits, which is why the marks are written in the records'
+transaction.
