@@ -5147,13 +5147,10 @@ mod tests {
 
     #[test]
     fn a_rewind_discards_marks_with_the_entries_and_does_not_raise_over_the_rest() {
-        // Rewind is the only remover of oplog rows outside retention, and it
-        // is wrong in two directions at once if it ignores the marks: the ones
-        // it strands can never be collected, and
-        // `reset_version_vector_to_oplog` REPLACES the vectors rather than
-        // merging, so counting a held entry there does not merely fail to
-        // withhold a raise -- it writes the claim. ADR-160, entered by another
-        // door.
+        // Rewind is the only remover of oplog rows outside retention, and the
+        // marks it strands could never be collected. Its lowering of the vectors
+        // (`lower_vectors_in`, ADR-243) never raises, so it cannot claim
+        // a held entry either: the next test holds it to that.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         let (a, _da) = sender_of_two_pages();
@@ -5232,7 +5229,8 @@ mod tests {
         assert_eq!(
             b.version_vector().unwrap().get(a.node_id()),
             Hlc::ZERO,
-            "the reset must skip held entries exactly as the open-time rebuild does"
+            "the rewind must not raise the vector over held entries, as the open-time rebuild \
+             does not"
         );
     }
 
