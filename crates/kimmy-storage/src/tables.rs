@@ -267,7 +267,7 @@ pub const UNIQUE_VIOLATIONS: TableDefinition<&[u8], &[u8]> =
 /// record that the version vector covers the oplog (invariant I), so
 /// `Engine::open` need not walk the oplog to raise it (`crate::verified`).
 ///
-/// Written only where I holds: after the open's walk, and by a rewind's reset.
+/// Written only where I holds: after the open's walk, and by a rewind's lowering.
 /// Counted only under this build's epoch and the store's schema. Its own table
 /// rather than a `META` key because no build's backup carries a table it does
 /// not list, so a restore, which can leave I broken, never carries it.
@@ -344,7 +344,9 @@ pub const META_TOMBSTONE_HORIZON: &str = "gc:tombstone_horizon";
 pub const META_DECIMAL128_ID_PRESENT: &str = "decimal128:id_present";
 
 /// Every point-in-time rewind this database has taken: its target, and per
-/// origin the newest stamp it discarded (`Engine::rewinds`).
+/// origin the newest stamp it discarded (`Engine::rewinds`); under this member's
+/// own origin, no lower than the newest tombstone it minted. A start resumes the
+/// clock past every stamp it names (`Engine::resume_hlc`).
 ///
 /// A rewind removes oplog entries a change stream may already have delivered,
 /// so a resume token naming one of them describes history that no longer

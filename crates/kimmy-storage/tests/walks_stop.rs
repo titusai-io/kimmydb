@@ -222,10 +222,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "engine::Engine::release_held_under",
         "inside the write that applies a peer's batch: close_writes bounds it (ADR-192)",
     ),
-    (
-        "engine::Engine::reset_version_vector_to_oplog",
-        "`kimmyd rewind`, which runs on a stopped node",
-    ),
+    ("engine::Engine::lower_vectors_to_target", "`kimmyd rewind`, which runs on a stopped node"),
     ("engine::Engine::snapshots_to_resume", "one row per peer a snapshot is under way with"),
     (
         "engine::collection_stands_under",

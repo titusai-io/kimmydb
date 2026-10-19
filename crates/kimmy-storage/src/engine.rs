@@ -2603,79 +2603,77 @@ impl Engine {
         Ok(crate::migrate::stored_version(db)?.unwrap_or(crate::migrate::SCHEMA_VERSION))
     }
 
-    /// Replace the version vector with exactly what the oplog now covers.
+    /// Lower both version vectors to `until`, origin by origin, and no further
+    /// (ADR-243).
     ///
-    /// **The only legitimate lowering.** `rebuild_version_vector_if_stale`
-    /// merges, so it can only raise: the vector is authoritative, and
-    /// recomputing it during normal operation would discard coverage a snapshot
-    /// granted that the oplog never held.
+    /// **The only lowering.** `rebuild_version_vector_if_stale` merges, so it can
+    /// only raise: the vectors are authoritative, because a snapshot grants
+    /// coverage the oplog never held and an entry processed without an append is
+    /// witnessed without one (ADR-054).
     ///
-    /// A point-in-time rewind is the exception, because it *removed* oplog
-    /// entries on purpose. Leaving the vector high afterwards would have the
-    /// node claim history it no longer holds, and no peer would ever send that
-    /// range again — the node would be permanently missing writes and would
-    /// look caught up.
-    pub(crate) fn reset_version_vector_to_oplog(db: &Database) -> Result<()> {
+    /// A point-in-time rewind removed every entry stamped after `until` on
+    /// purpose, and only those. Coverage above `until` has to come down: left
+    /// high, the node would claim history it no longer holds, no peer would send
+    /// that range again, and it would be permanently missing writes while looking
+    /// caught up. Coverage at or below `until` is exactly as true as it was before
+    /// the rewind, and has to stay. Rebuilding the vectors from the oplog, as 0.51
+    /// and earlier did, lowered it there too: an origin whose entries retention had
+    /// collected, this member's own among them, fell below what the member had
+    /// collected or out of the vectors altogether, so no peer that lacked a
+    /// collected entry was told so, and no page of this member's could vouch for
+    /// its own collected drop (RW1).
+    ///
+    /// So each vector's entry for each origin becomes `min(entry, until)`, which
+    /// keeps every invariant the vectors carry. Every entry the rewind keeps is at
+    /// or below `until` and was at or below the servable vector or held, so
+    /// invariant I holds; witnessed stays at least servable; nothing is raised, so
+    /// no held entry is claimed (ADR-160); and every collected entry, at or below
+    /// the horizon and so at or below `until`, stays covered.
+    pub(crate) fn lower_vectors_to_target(db: &Database, until: Hlc) -> Result<()> {
         let started = std::time::Instant::now();
+        let schema = Self::current_schema(db)?;
+        // Read and written in one transaction, so nothing appended between the
+        // read and the write can be lowered under or left above.
+        let txn = db.begin_write()?;
         let mut walk = crate::verified::VerifiedWalk::default();
-        let mut actual = kimmy_core::VersionVector::new();
+        let mut lowered = 0usize;
         {
-            let txn = db.begin_read()?;
+            // What the record says the last walk read: the oplog the rewind left.
             let oplog = txn.open_table(tables::OPLOG)?;
-            // The same exclusion the open-time rebuild makes, for the same
-            // reason and more sharply: this REPLACES the vectors rather than
-            // merging into them, so counting a held entry here does not merely
-            // fail to withhold a raise -- it writes the claim. A rewind taken
-            // while a snapshot is in flight, or one that was interrupted and
-            // not resumed, would otherwise leave the node asserting it can
-            // serve a contiguous window containing documents it took out of
-            // stamp order: the defect ADR-160 closes, entered by another door.
-            let held = txn.open_table(tables::OPLOG_HELD)?;
-            let any_held = !held.is_empty()?;
             for row in oplog.iter()? {
                 let (key, value) = row?;
                 walk.rows += 1;
                 walk.logical_bytes += (key.value().len() + value.value().len()) as u64;
-                if any_held && held.get(key.value())?.is_some() {
-                    continue;
+            }
+            // **Both** vectors. If witnessed stayed high, the node would believe
+            // it had already seen the entries the rewind removed and would never
+            // ask for them again: permanently missing writes while looking caught
+            // up, the very failure this function exists to prevent (ADR-054).
+            for table in [tables::OPLOG_VERSIONS, tables::OPLOG_WITNESSED] {
+                let mut vector = txn.open_table(table)?;
+                let mut above = Vec::new();
+                for row in vector.iter()? {
+                    let (node, hlc) = row?;
+                    if decode_hlc(hlc.value())? > until {
+                        above.push(node.value().to_vec());
+                    }
                 }
-                actual.observe(codec::decode_oplog_key(key.value())?);
+                for node in above {
+                    vector.insert(node.as_slice(), until.to_bytes().as_slice())?;
+                    lowered += 1;
+                }
             }
         }
         walk.elapsed_ms = started.elapsed().as_millis() as u64;
-
-        let schema = Self::current_schema(db)?;
-        let txn = db.begin_write()?;
-        {
-            // **Both** vectors. If witnessed stayed high, the node would
-            // believe it had already seen the entries the rewind removed and
-            // would never ask for them again — permanently missing writes
-            // while looking caught up, which is the very failure this function
-            // exists to prevent (ADR-054).
-            let mut seen = txn.open_table(tables::OPLOG_WITNESSED)?;
-            seen.retain(|_, _| false)?;
-            for (node, hlc) in actual.iter() {
-                seen.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
-            }
-
-            let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
-            // Cleared rather than overwritten: a node that appears in the old
-            // vector but no longer in the oplog has to disappear entirely, and
-            // inserting over the top would leave its stale entry behind.
-            versions.retain(|_, _| false)?;
-            for (node, hlc) in actual.iter() {
-                versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
-            }
-        }
-        // The reset leaves invariant I holding exactly: the vector is now the
-        // maximum over the entries it keeps that are not held. So it records
-        // that, as a walk at open would, and the next open skips the walk.
-        // Deleting the record instead would also be safe, but would cost the
+        // Invariant I held before the rewind (the open verified it, and every
+        // writer keeps it), and lowering to `until` keeps it, as above. So the
+        // rewind records it, as a walk at open would, and the next open skips the
+        // walk. Deleting the record instead would also be safe, but would cost the
         // first open after a `restore --until` a second cold walk.
         crate::verified::write(&txn, schema, &walk)?;
         txn.commit()?;
 
-        info!(nodes = actual.len(), "reset the version vector to the rewound oplog");
+        info!(lowered, %until, "lowered the version vectors to the rewind's target");
         Ok(())
     }
 
@@ -3512,6 +3510,13 @@ impl Engine {
     /// the clock had folded them in while the process ran (`witness`), and a restart
     /// that resumed from the oplog tail alone would mint the next change below one
     /// already standing.
+    ///
+    /// **And the rewinds' records.** A rewind removes every entry above its target and
+    /// lowers both vectors to it (ADR-243), so neither the tail nor a vector names what
+    /// it discarded, nor the tombstones it minted for documents created after the
+    /// target. A member whose clock led its wall clock would otherwise resume below
+    /// them: its next write stamped inside the discarded range, which a change-stream
+    /// token check reads as discarded, and below its own tombstones (CL1).
     fn resume_hlc(db: &Database) -> Result<Hlc> {
         let tail = Self::last_oplog_hlc(db)?;
         let named = [tables::OPLOG_VERSIONS, tables::OPLOG_WITNESSED]
@@ -3522,7 +3527,10 @@ impl Engine {
             .flat_map(|versions| versions.iter().map(|(_, hlc)| hlc).collect::<Vec<_>>())
             .max()
             .unwrap_or(Hlc::ZERO);
-        Ok(tail.max(named).max(Self::metadata_high_water(db)?))
+        Ok(tail
+            .max(named)
+            .max(Self::metadata_high_water(db)?)
+            .max(crate::rewind::rewound_high_water(db)?))
     }
 
     /// The highest stamp the stored metadata carries: each collection's `created`,
