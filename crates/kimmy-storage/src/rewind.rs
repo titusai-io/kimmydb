@@ -1602,12 +1602,14 @@ mod tests {
         at(&e, base, 330);
         let items = e.create_collection("shop", "items").unwrap();
         assert!(items.incarnation_floor.is_some_and(|floor| floor > Hlc::new(base + 150, 0)));
-        // The tombstone collected, as tombstone retention does.
-        let txn = e.db().begin_write().unwrap();
+        // The tombstone collected, as tombstone retention does. Written on the raw
+        // database: the state is the premise, not something the engine writes.
+        let db = e.db();
+        let txn = db.begin_write().unwrap();
         txn.open_table(tables::COLLECTIONS_DROPPED).unwrap().remove(items.id.0).unwrap();
         txn.commit().unwrap();
         // Every entry after the target collected as well, so no entry names the drop.
-        let txn = e.db().begin_write().unwrap();
+        let txn = db.begin_write().unwrap();
         {
             let mut oplog = txn.open_table(tables::OPLOG).unwrap();
             let after: Vec<Vec<u8>> = oplog
