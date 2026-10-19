@@ -29474,8 +29474,9 @@ it at the target; the floor refusal removed; and it at the target. Argued equiva
   the oplog window, where the ended life's entries are collected too; one arriving later is history on arrival and is
   not appended.
 - **The skip without the tombstone (the floor alone).** For a standing life the tombstone is above its floor only while
-  the sweep of an ignored drop of an older life runs, which takes the floor in its last chunk, and a record the rewind
-  put back below that drop is removed by the sweep when it resumes. For an absent collection, item 3 refuses a
+  the sweep of an ignored drop of an older life runs, which takes the floor in its last chunk. A store stopped in the
+  middle of one owes the sweep, and a start finishes it before it serves (`reconcile_late_drops`), removing any record
+  the rewind put back at or below that drop. For an absent collection, item 3 refuses a
   tombstone after the target, and no entry above a tombstone is appended while the collection is absent: the entries
   path stops at it and asks for a page, which installs the life with its floor.
 - **The skip only before the target.** An entry of an ended life after the target is above the target and at or below
