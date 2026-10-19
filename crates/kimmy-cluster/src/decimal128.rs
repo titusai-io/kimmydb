@@ -236,7 +236,7 @@ mod tests {
         let gate = gate_over(&members);
         members.insert_for_test(addr(2), node(2));
         let view = members.view();
-        let within = view.unheard_since[&node(2)] + view.lease;
+        let within = view.unheard_since[&node(2)] + view.unheard_lease;
         assert!(matches!(gate.check_at(within), Err(Decimal128Closed::Unheard { .. })));
         let after = within + Duration::from_millis(1);
         assert_eq!(gate.check_at(after), Err(Decimal128Closed::Peers(vec![node(2).to_string()])));

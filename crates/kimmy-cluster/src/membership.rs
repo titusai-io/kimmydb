@@ -191,6 +191,11 @@ struct MembersInner {
     up_since: Mutex<BTreeMap<NodeId, Instant>>,
     /// The sync interval and the fanout the lease is derived from.
     lease_shape: RwLock<(Duration, usize)>,
+    /// SWIM's timers as the running membership configured foca: its probe
+    /// period and its suspect-to-down time (`Config::probe_period`,
+    /// `Config::suspect_to_down_after`); zero until membership runs. They make
+    /// the floor of the unheard lease ([`Members::unheard_lease`]).
+    swim_timers: RwLock<SwimTimers>,
     /// When each peer's undecodable block was last said, so it is said once per
     /// [`crate::health::WARN_INTERVAL`] and peer.
     undecodable_said: Mutex<BTreeMap<NodeId, Instant>>,
@@ -198,6 +203,14 @@ struct MembersInner {
     /// When each peer was last named in the WARN that a `Decimal128` id exists
     /// here while it cannot hold one (ADR-238).
     decimal128_said: Mutex<BTreeMap<NodeId, Instant>>,
+}
+
+/// SWIM's timers the unheard lease's floor is derived from
+/// ([`Members::configure_swim`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct SwimTimers {
+    probe_period: Duration,
+    suspect_to_down_after: Duration,
 }
 
 /// The blocks held, and where a block must have been decoded after to count.
@@ -239,12 +252,17 @@ pub struct PeerView {
     /// When each live peer's block was last not held for a reason of its own
     /// time: it came up, SWIM renamed it, or this member rejoined.
     pub unheard_since: BTreeMap<NodeId, Instant>,
+    /// How long a live peer with no block held is only not heard from yet
+    /// ([`Members::unheard_lease`]): the lease, floored by SWIM's
+    /// suspect-to-down time and one sync interval.
+    pub unheard_lease: Duration,
     /// The peers whose last block did not decode, with no block held since.
     pub undecodable: BTreeSet<NodeId>,
 }
 
 impl PeerView {
-    /// Whether `node` has gone more than a lease without a block since it came
+    /// Whether `node` has gone more than the unheard lease
+    /// ([`Members::unheard_lease`]) without a block since it came
     /// up, was renamed or this member rejoined: what the unheard-peer WARN names,
     /// and what the gates count as a peer that does not say it has a capability.
     /// Within the lease it is only not heard from yet. Whether a block is held is
@@ -252,7 +270,7 @@ impl PeerView {
     pub fn unheard_beyond_lease(&self, node: &NodeId, now: Instant) -> bool {
         self.unheard_since
             .get(node)
-            .is_some_and(|since| now.saturating_duration_since(*since) > self.lease)
+            .is_some_and(|since| now.saturating_duration_since(*since) > self.unheard_lease)
     }
 
     /// The block held from `node`, if it is live, and whether it is within its lease.
@@ -342,8 +360,15 @@ impl Members {
             up.iter().filter(|(node, _)| live.contains(node)).map(|(n, at)| (*n, *at)).collect()
         };
         let undecodable = table.undecodable.keys().copied().collect();
-        let view =
-            PeerView { version, lease: self.lease(), live, blocks, unheard_since, undecodable };
+        let view = PeerView {
+            version,
+            lease: self.lease(),
+            live,
+            blocks,
+            unheard_since,
+            unheard_lease: self.unheard_lease(),
+            undecodable,
+        };
         self.0.view.store(Arc::new(view));
     }
 
@@ -408,8 +433,9 @@ impl Members {
         self.publish(&table);
     }
 
-    /// The live peers that have sent no block for more than a lease, since they
-    /// came up, were renamed or this member rejoined. Such a peer is not a
+    /// The live peers that have sent no block for more than the unheard lease
+    /// ([`Self::unheard_lease`]), since they came up, were renamed or this member
+    /// rejoined. Such a peer is not a
     /// candidate for webhooks or embeddings here, so this member also owns that
     /// share (ADR-213). The gates read the same clock from the same view
     /// ([`PeerView::unheard_beyond_lease`]).
@@ -571,6 +597,43 @@ impl Members {
         let fanout = fanout.max(1);
         let peers = self.0.live.read().len();
         interval * (peers.div_ceil(fanout) as u32 + 2)
+    }
+
+    /// SWIM's timers, from the configuration the running membership gave foca:
+    /// what [`Self::unheard_lease`] is floored by. [`run`] sets them from the
+    /// `Config` it builds, before it handles any input.
+    pub fn configure_swim(&self, config: &Config) {
+        let table = self.0.peer_facts.write();
+        *self.0.swim_timers.write() = SwimTimers {
+            probe_period: config.probe_period,
+            suspect_to_down_after: config.suspect_to_down_after,
+        };
+        self.publish(&table);
+    }
+
+    /// The longest SWIM can take, here, to declare down a live peer that has
+    /// stopped answering: foca probes one live peer per probe period, in a
+    /// round-robin over a list it reshuffles at each pass, so a peer can wait up
+    /// to `2 * peers - 1` periods for its probe, whose failure is noticed at the
+    /// next period, when it is suspected; it is declared down
+    /// `suspect_to_down_after` later. `2 * peers` probe periods and the
+    /// suspect-to-down time. Zero until membership runs.
+    pub fn swim_down_within(&self) -> Duration {
+        let timers = *self.0.swim_timers.read();
+        let peers = self.0.live.read().len() as u32;
+        timers.suspect_to_down_after + timers.probe_period * (2 * peers)
+    }
+
+    /// How long a live peer with no block held is only not heard from yet, on
+    /// the unheard clock: the lease, floored at the time SWIM can take to declare
+    /// a silent peer down ([`Self::swim_down_within`]) plus one sync interval,
+    /// `max(lease, swim_down_within + interval)`. A peer that stops answering is
+    /// then declared down, and leaves the live set, before the lease runs out,
+    /// whatever the sync interval. Past it, membership names the peer as unheard
+    /// and the gates count it as one that does not say it has their capability.
+    pub fn unheard_lease(&self) -> Duration {
+        let floor = self.swim_down_within() + self.sync_interval();
+        self.lease().max(floor)
     }
 
     /// The sync interval blocks are exchanged at, as configured, or the default
@@ -1078,6 +1141,13 @@ impl foca::Runtime<Member> for Collector {
     }
 }
 
+/// The configuration [`run`] gives foca: its LAN defaults for
+/// [`CLUSTER_SIZE_HINT`] members. Its `suspect_to_down_after` is the floor of the
+/// unheard lease ([`Members::unheard_lease`]).
+pub fn swim_config() -> Config {
+    Config::new_lan(std::num::NonZeroU32::new(CLUSTER_SIZE_HINT).expect("non-zero literal"))
+}
+
 /// Run SWIM membership until the socket fails.
 ///
 /// `local` is this node's cluster address, and must be the address peers can
@@ -1094,8 +1164,10 @@ pub async fn run(
     shutdown: kimmy_task::Shutdown,
 ) {
     let identity = Member::identified(local, node);
-    let config =
-        Config::new_lan(std::num::NonZeroU32::new(CLUSTER_SIZE_HINT).expect("non-zero literal"));
+    let config = swim_config();
+    // The unheard lease's floor comes from the timers this very configuration
+    // gives foca, set before any peer can come up.
+    members.configure_swim(&config);
 
     // Seeded from the OS. SWIM uses randomness to pick probe targets, so a
     // predictable sequence would make every node probe in the same order.

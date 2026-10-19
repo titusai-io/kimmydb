@@ -631,7 +631,7 @@ async fn a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400() {
         || node.send("POST", "/v1/db/shop/coll/orders/docs", Req::key(KEY).json(&json!({})));
     assert_eq!(insert().await.status, 503, "within its lease");
 
-    members.backdate_unheard_for_test(id, members.lease() + Duration::from_secs(1));
+    members.backdate_unheard_for_test(id, members.unheard_lease() + Duration::from_secs(1));
     let refused = |answer: &Answer, what: &str| {
         assert_eq!(answer.status, 400, "{what}: {}", answer.text);
         assert_eq!(answer.body["error"], "bad_request", "{what}: {}", answer.text);
