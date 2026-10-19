@@ -13,9 +13,10 @@
 //! The file is written, fsynced and renamed into place, with its directory
 //! fsynced, **before the identity it names is sent**: the first one before the
 //! membership task starts, and each renewal before the datagrams of the input
-//! that renewed it are dispatched. A file that is missing or cannot be read
-//! starts the member at 0, which walks once, as every start did before; a write
-//! that fails is said, and costs the next start at most the renewals it lost.
+//! that renewed it are dispatched. A file that is missing or cannot be read, or
+//! holds a value no member reaches ([`TOO_LARGE`]), starts the member at 0,
+//! which walks once, as every start did before; a write that fails is said, and
+//! costs the next start at most the renewals it lost.
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,13 @@ use tracing::{info, warn};
 
 /// The file's name, in the data directory.
 pub const FILE: &str = "kimmy.swim-incarnation";
+
+/// The least recorded value taken as one the file cannot hold: no count of
+/// starts and renewals reaches it, and a start above it could come to the top
+/// of the range, where `Identity::renew` wraps to 0, which loses to the identity
+/// it renews, so the member could never be taken again. Such a file is read as
+/// one that does not hold a number.
+pub(crate) const TOO_LARGE: u64 = 1 << 63;
 
 /// The first incarnation of a process whose data directory recorded `last`:
 /// one above it, and 0 when nothing was recorded.
@@ -96,7 +104,16 @@ fn read(path: &Path) -> Option<u64> {
         }
     };
     match text.trim().parse::<u64>() {
-        Ok(last) => Some(last),
+        Ok(last) if last < TOO_LARGE => Some(last),
+        Ok(last) => {
+            warn!(
+                path = %path.display(),
+                recorded = last,
+                "the SWIM incarnation file holds a value no member reaches; this member starts at \
+                 incarnation 0 and may renew its identity several times before its peers take it"
+            );
+            None
+        }
         Err(_) => {
             warn!(
                 path = %path.display(),
@@ -161,6 +178,19 @@ mod tests {
         let file = IncarnationFile::begin(dir.path());
         assert_eq!(file.current(), 0);
         assert_eq!(on_disk(dir.path()), "0\n");
+    }
+
+    #[test]
+    fn a_value_no_member_reaches_starts_at_zero_and_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        for value in [TOO_LARGE, u64::MAX - 1, u64::MAX] {
+            std::fs::write(dir.path().join(FILE), format!("{value}\n")).unwrap();
+            let file = IncarnationFile::begin(dir.path());
+            assert_eq!(file.current(), 0, "{value} is not taken");
+            assert_eq!(on_disk(dir.path()), "0\n");
+        }
+        std::fs::write(dir.path().join(FILE), format!("{}\n", TOO_LARGE - 1)).unwrap();
+        assert_eq!(IncarnationFile::begin(dir.path()).current(), TOO_LARGE, "the last value taken");
     }
 
     #[test]

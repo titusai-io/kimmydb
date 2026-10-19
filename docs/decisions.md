@@ -28601,19 +28601,18 @@ second close about 5 s into the run when the late `Down` lands.
 
 1. **The incarnation is kept in the data directory**, in `kimmy.swim-incarnation`: the decimal value of the last
    incarnation this member used, written to a temporary file, fsynced, renamed into place, and the directory fsynced.
-2. **A start takes one above what it records, and records that first.** `IncarnationFile::begin` reads the file,
-   takes `last + 1` (0 with nothing recorded, saturating, never wrapping), and writes it before the membership task is
-   started, so before any datagram carries it. Peers holding any identity of this member, live, suspect or down, are
-   below it, take it at once (`Rename`, and `MemberUp` if they held it down), and send no `TurnUndead`: **a restart
-   makes no rejoin.**
+2. **A start takes one above what it records, and records that first.** `IncarnationFile::begin` reads the file, takes
+   `last + 1` (0 with nothing recorded), and writes it before the membership task is started, so before any datagram
+   carries it. Peers holding any identity of this member, live, suspect or down, are below it, take it at once
+   (`Rename`, and `MemberUp` if they held it down), and send no `TurnUndead`: **a restart makes no rejoin.**
 3. **A renewal in a process is recorded before anything carries it.** The daemon's step after every input
    (`after_input`, which also resumes failure detection after a rejoin) records the identity's
    incarnation when the input rejoined, and only then are the input's datagrams sent. The next start is above it too.
 4. **A file that cannot help starts at 0, and the member walks once.** A missing file (the first start of this build on
-   a data directory an older one ran, a wiped directory, a restore into a new one), one that cannot be read, and one
-   that does not hold a number (a `WARN` for the last two) start at 0, which is what every start did before; each
-   renewal of that walk is recorded, so the next start is one step. A write that fails is said in a `WARN` and the
-   member goes on; it costs the next start at most the renewals it lost, one step each.
+   a data directory an older one ran, a wiped directory, a restore into a new one), one that cannot be read, one that
+   does not hold a number, and one that holds 2^63 or more (a `WARN` for the last three) start at 0, which is what every
+   start did before; each renewal of that walk is recorded, so the next start is one step. A write that fails is said in
+   a `WARN` and the member goes on; it costs the next start at most the renewals it lost, one step each.
 5. **No clock.** The value counts this member's starts and renewals, so a clock that steps back changes nothing.
 
 **Invariant.** The recorded value is at least the incarnation of every identity any process of this data directory
@@ -28651,8 +28650,9 @@ did not update it) and walks once more, by the starts it made on 0.51, then take
 build walks once for the same reason: the file is not there yet.
 
 **Tests.** `membership::incarnation`: the first start's 0, each start one above the last, a renewal recorded and the
-start after it above it, a file that is not a number started at 0 and rewritten, a directory that cannot take the file
-still starting, saturation at `u64::MAX`. The simulation rows above, with the five rows of a rejoining member that resumes failure
-detection unchanged. `kimmyd/tests/cluster.rs` (`--ignored`): three real members, one restarted twice after its peers declared it
-down, once after it renewed in its run (frozen until declared down, then resumed) and twice at once, with no rejoin in
-any run, its file one above the last each time and the renewal recorded. Mutation rows in bash, one per clause.
+start after it above it, a file that is not a number, or holds 2^63 or more, started at 0 and rewritten, a directory
+that cannot take the file still starting, saturation at `u64::MAX`. The simulation rows above, with the five rows of a
+rejoining member that resumes failure detection unchanged. `kimmyd/tests/cluster.rs` (`--ignored`): three real members,
+one restarted twice after its peers declared it down, once after it renewed in its run (frozen until declared down, then
+resumed) and twice at once, with no rejoin in any run, its file one above the last each time and the renewal recorded.
+Mutation rows in bash, one per clause.
