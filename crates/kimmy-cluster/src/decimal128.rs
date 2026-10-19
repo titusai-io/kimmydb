@@ -26,7 +26,7 @@
 //! can hold, so a gated creation is refused whatever the key says.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kimmy_core::Decimal128Closed;
 
@@ -65,6 +65,12 @@ impl Decimal128Gate {
     /// and if not, why. One atomic load of the membership view: it is asked
     /// under the storage writer.
     pub fn check(&self) -> Result<(), Decimal128Closed> {
+        self.check_at(Instant::now())
+    }
+
+    /// [`Self::check`] as of `now`, which decides whether a live peer not heard
+    /// from is still within its lease.
+    pub fn check_at(&self, now: Instant) -> Result<(), Decimal128Closed> {
         if !self.declared {
             return Err(Decimal128Closed::Undeclared);
         }
@@ -85,7 +91,7 @@ impl Decimal128Gate {
         };
         let names =
             |peers: Vec<kimmy_core::NodeId>| peers.iter().map(ToString::to_string).collect();
-        match crate::facts::decimal128_net(&members.view()) {
+        match crate::facts::decimal128_net(&members.view(), now) {
             PeerNet::Open => Ok(()),
             PeerNet::Refused(peers) => Err(Decimal128Closed::Peers(names(peers))),
             PeerNet::Unheard(peers) => Err(Decimal128Closed::Unheard {
@@ -218,6 +224,28 @@ mod tests {
             "{:?}",
             gate.check()
         );
+    }
+
+    /// "Not heard" lasts the unheard-peer WARN's lease, on its clock: `Unheard`
+    /// within it, `Peers` once it has run with no block, and `Peers` at once for
+    /// a block that does not decode.
+    #[test]
+    fn a_peer_not_heard_from_refuses_after_its_lease_and_an_undecodable_one_at_once() {
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(2), 3);
+        let gate = gate_over(&members);
+        members.insert_for_test(addr(2), node(2));
+        let view = members.view();
+        let within = view.unheard_since[&node(2)] + view.lease;
+        assert!(matches!(gate.check_at(within), Err(Decimal128Closed::Unheard { .. })));
+        let after = within + Duration::from_millis(1);
+        assert_eq!(gate.check_at(after), Err(Decimal128Closed::Peers(vec![node(2).to_string()])));
+
+        members.insert_for_test(addr(3), node(3));
+        members.record_peer_facts_for_test(node(2), can(Some(true)), Duration::ZERO);
+        assert!(matches!(gate.check(), Err(Decimal128Closed::Unheard { .. })));
+        members.note_undecodable_for_test(node(3));
+        assert_eq!(gate.check(), Err(Decimal128Closed::Peers(vec![node(3).to_string()])));
     }
 
     #[test]

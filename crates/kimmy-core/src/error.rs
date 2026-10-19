@@ -132,19 +132,21 @@ pub enum Decimal128Closed {
     /// `cluster.decimal128` is false: the operator has not declared that
     /// every member runs 0.51 and has migrated.
     Undeclared,
-    /// The key is set, and these live peers (node ids, sorted) sent a block
-    /// that does not say they can hold one: a build older than 0.51. It lasts
-    /// until they are upgraded.
+    /// The key is set, and these live peers (node ids, sorted) do not say they
+    /// can hold one: a held block says otherwise or nothing of it (a build older
+    /// than 0.51), their last block did not decode, or no block of theirs has
+    /// been held for more than a lease since they came up, were renamed or this
+    /// member rejoined. It lasts until they change.
     Peers(Vec<String>),
     /// The key is set, and this member cannot see what its peers say about
     /// themselves, for the reason given.
     Unseen(&'static str),
-    /// The key is set and no live peer's block says it cannot hold one, but
-    /// these live peers (node ids, sorted) have not been heard from yet: they
-    /// came up a moment ago, or this member dropped their block on a SWIM
-    /// rename or rejoin. **Transient**: a block arrives with the next contact,
-    /// about `retry_after_secs` (one sync interval) later, so the request is
-    /// answered `503` with `Retry-After` and is worth sending again as it was.
+    /// The key is set and no live peer refuses, but these live peers (node ids,
+    /// sorted) have not been heard from yet, within a lease of coming up, being
+    /// renamed or this member's rejoin. **Transient**: a block arrives with the
+    /// next contact, about `retry_after_secs` (one sync interval) later, so the
+    /// request is answered `503` with `Retry-After`; once the lease has run with
+    /// none the peer counts among [`Self::Peers`].
     Unheard { peers: Vec<String>, retry_after_secs: u64 },
 }
 
@@ -175,8 +177,9 @@ fn decimal128_refusal(what: Decimal128Use, closed: &Decimal128Closed) -> String 
              0.51 that meets one never catches up"
         ),
         Decimal128Closed::Peers(peers) => format!(
-            "{what}: cluster.decimal128 is set, but the live member(s) {} say they cannot hold \
-             one (a build older than 0.51); it is accepted once every live member can",
+            "{what}: cluster.decimal128 is set, but the live member(s) {} do not say they can \
+             hold one (a build older than 0.51, a block this member cannot read, or no block for \
+             longer than a lease); it is accepted once every live member does",
             peers.join(", ")
         ),
         Decimal128Closed::Unseen(why) => {
