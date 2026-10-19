@@ -2120,76 +2120,123 @@ fn plant_large_change(f: &Fixture, bytes: usize) {
     f.c.apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull).unwrap();
 }
 
-/// The WARN lines a page that could not carry a changed record says, in `log`.
-fn delta_refusals(log: &std::sync::Mutex<Vec<(tracing::Level, String)>>) -> usize {
+/// The lines of `level` in `log` that say `needle`.
+fn said(
+    log: &std::sync::Mutex<Vec<(tracing::Level, String)>>,
+    level: tracing::Level,
+    needle: &str,
+) -> usize {
     log.lock()
         .unwrap()
         .iter()
-        .filter(|(level, message)| {
-            *level == tracing::Level::WARN
-                && message.contains("larger than a replay page's delta can carry")
-        })
+        .filter(|(l, message)| *l == level && message.contains(needle))
         .count()
 }
 
-/// A record changed since a replay's records cursor that is larger than the
-/// delta's half of a page (refused by name in storage) cannot cross on a page of
-/// that replay: the page carries nothing, the refusal is said at `WARN` once and
-/// counted, the contact ends in step and not as a failure, and the replay stays
-/// at its position with its cursor. Inbound: C serves A's replay, a page a
-/// contact for the first, then a contact of its full page cap.
-#[tokio::test]
-async fn a_changed_record_too_large_for_an_inbound_replays_delta_is_counted_and_stays() {
+/// What the cut says when a changed record is too large for a replay's delta.
+const STARTS_OVER: &str = "the position's records start over from a new base";
+/// What the cut says when a page cannot carry what it must.
+const UNFIT: &str = "do not fit one replay page";
+
+/// A replay with a records cursor at its position, a page of records alone
+/// served for it one way, and then, on C, a change of `bytes` since that
+/// cursor's base, with this thread's log recorded from there on.
+async fn a_cursor_then_a_change(
+    outbound: bool,
+    bytes: usize,
+) -> (
+    Fixture,
+    EntryBudget,
+    Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+    tracing::subscriber::DefaultGuard,
+) {
     let f = fixture(5, 0);
     plant_spanning_records(&f, 30);
-    let _budget = EntryBudget::set(8 * 1024);
-    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(1)));
-    f.round().await.unwrap();
-    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
-    let (a, c) = (f.a.node_id(), f.c.node_id());
-    let at = f.catch_up.replay_from(c);
-    let cursor = inbound_records(c, a, at).expect("premise: a page of records alone left a cursor");
-    plant_large_change(&f, 5 * 1024);
+    let budget = EntryBudget::set(8 * 1024);
+    let c = f.c.node_id();
+    if outbound {
+        f.replay_outbound_for(Duration::ZERO).await.unwrap();
+        assert!(f.catch_up.replay_records(c).is_some(), "premise: a page of records alone");
+    } else {
+        TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(1)));
+        f.round().await.unwrap();
+        TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
+        let at = f.catch_up.replay_from(c);
+        assert!(inbound_records(c, f.a.node_id(), at).is_some(), "premise: a cursor");
+    }
+    plant_large_change(&f, bytes);
     let seen = Seen::default();
     let log = Arc::clone(&seen.0);
-    let _recording = tracing::subscriber::set_default(seen);
+    let recording = tracing::subscriber::set_default(seen);
     tracing::callsite::rebuild_interest_cache();
-    let unfit = records_unfit().get(UnfitPath::Replay);
-    let round = f.round().await;
-    assert!(round.is_ok(), "the contact is no failure: {round:?}");
-    assert!(records_unfit().get(UnfitPath::Replay) > unfit, "counted");
-    assert_eq!(delta_refusals(&log), 1, "said once, and the contact went no further");
-    assert!(!f.catch_up.replay_answered(c), "the replay stays owed");
-    assert_eq!(f.catch_up.replay_from(c), at, "at its position");
-    assert_eq!(inbound_records(c, a, at), Some(cursor), "with its cursor");
+    (f, budget, log, recording)
 }
 
-/// The same, outbound: A asks C one page a contact, then asks again with a
-/// contact's whole time; C's answer carries nothing and the cursor A sent, and A
-/// stops asking for the contact rather than asking the same page until its
-/// deadline.
+/// A record changed since a replay's records cursor that is larger than the
+/// delta's half of a page (refused by name in storage) and no larger than a
+/// page: the position's records start over from a base above the change, the
+/// record crosses as an ordinary record on a page of records alone, and the
+/// replay finishes with it and every other record, nothing left unfit.
+async fn a_changed_record_too_large_for_the_delta_starts_its_position_over(outbound: bool) {
+    let (f, _budget, log, _recording) = a_cursor_then_a_change(outbound, 5 * 1024).await;
+    if outbound {
+        f.replay_outbound_only_through().await;
+    } else {
+        f.replay_through(false).await;
+    }
+    assert!(said(&log, tracing::Level::INFO, STARTS_OVER) >= 1, "it started over");
+    assert_eq!(said(&log, tracing::Level::WARN, UNFIT), 0, "nothing was left unfit");
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    let big = kimmy_core::ScopeHash([0x6b; 32]);
+    assert!(f.a.idempotency_record(orders.id, &big).unwrap().is_some(), "the large record crossed");
+    assert_eq!(f.orders(), 2 + 5, "every lost write is back");
+}
+
 #[tokio::test]
-async fn a_changed_record_too_large_for_an_outbound_replays_delta_is_counted_and_stays() {
-    let f = fixture(5, 0);
-    plant_spanning_records(&f, 30);
-    let _budget = EntryBudget::set(8 * 1024);
-    f.replay_outbound_for(Duration::ZERO).await.unwrap();
+async fn a_changed_record_too_large_for_an_inbound_replays_delta_starts_its_position_over() {
+    a_changed_record_too_large_for_the_delta_starts_its_position_over(false).await;
+}
+
+#[tokio::test]
+async fn a_changed_record_too_large_for_an_outbound_replays_delta_starts_its_position_over() {
+    a_changed_record_too_large_for_the_delta_starts_its_position_over(true).await;
+}
+
+/// What still stalls: a changed record larger than a whole page, which no page
+/// can carry (the class of a document no page can carry). The position starts
+/// over, the pages reach the record and can go no further: each such page
+/// carries nothing, is said at `WARN` and counted, the contact ends in step, and
+/// the replay stays owed at its position.
+async fn a_changed_record_larger_than_a_page_stalls_counted(outbound: bool) {
+    let (f, _budget, log, _recording) = a_cursor_then_a_change(outbound, 9 * 1024).await;
     let c = f.c.node_id();
     let at = f.catch_up.replay_from(c);
-    let cursor = f.catch_up.replay_records(c).expect("premise: a page of records alone");
-    plant_large_change(&f, 5 * 1024);
-    let seen = Seen::default();
-    let log = Arc::clone(&seen.0);
-    let _recording = tracing::subscriber::set_default(seen);
-    tracing::callsite::rebuild_interest_cache();
     let unfit = records_unfit().get(UnfitPath::Replay);
-    let replayed = f.replay_outbound_for(Duration::from_secs(20)).await;
-    assert!(replayed.is_ok(), "the contact is no failure: {replayed:?}");
+    for _ in 0..3 {
+        let contact = if outbound {
+            f.replay_outbound_for(Duration::from_secs(20)).await
+        } else {
+            f.round().await.map(drop)
+        };
+        assert!(contact.is_ok(), "the contact is no failure: {contact:?}");
+    }
     assert!(records_unfit().get(UnfitPath::Replay) > unfit, "counted");
-    assert_eq!(delta_refusals(&log), 1, "said once, and the contact asked no more");
+    assert!(said(&log, tracing::Level::WARN, UNFIT) >= 1, "said");
     assert!(!f.catch_up.replay_answered(c), "the replay stays owed");
     assert_eq!(f.catch_up.replay_from(c), at, "at its position");
-    assert_eq!(f.catch_up.replay_records(c), Some(cursor), "with its cursor");
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    let big = kimmy_core::ScopeHash([0x6b; 32]);
+    assert!(f.a.idempotency_record(orders.id, &big).unwrap().is_none(), "it did not cross");
+}
+
+#[tokio::test]
+async fn a_changed_record_larger_than_a_page_stalls_an_inbound_replay_counted() {
+    a_changed_record_larger_than_a_page_stalls_counted(false).await;
+}
+
+#[tokio::test]
+async fn a_changed_record_larger_than_a_page_stalls_an_outbound_replay_counted() {
+    a_changed_record_larger_than_a_page_stalls_counted(true).await;
 }
 
 /// The pages a test's replay cut on this thread since it last looked.
