@@ -3572,6 +3572,193 @@ fn residual_a_rewind_forgets_a_delete_only_the_rewound_member_applied() {
     }
 }
 
+/// A rewind puts back no version of a life a drop ended. B writes `items/1` at t120 and drops
+/// `items` at t260; C takes both and creates `items` again at t330. A, which never heard of the
+/// drop, writes `items/1` at t386 and C takes it into the life standing there. A's rewind to
+/// t352 discards t386, which C holds, so every member is rewound to t352. C's oplog still holds
+/// B's t120 entry, the latest of the document at or below the target, but it is of the life
+/// the drop at t260 ended: at t352 the document did not exist in the standing life, so every
+/// member ends without it. By pure entries too. The drop reaches C by entries, by a
+/// whole-database page (no drop entry in C's oplog), or as the database's drop.
+#[test]
+fn row_a_rewind_puts_back_no_version_of_a_life_a_drop_ended() {
+    let tail = "C.create(items)@330; A.write(items/1)@386; C<-A entries; A.rewind@352; \
+                B.rewind@352; C.rewind@352";
+    row_strict_each(
+        "a version of an ended life",
+        &[
+            (
+                "the drop by entries",
+                parse(&format!(
+                    "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+                     B.drop(items)@260; C<-B entries; {tail}"
+                )),
+            ),
+            (
+                "the drop by a whole-database page",
+                parse(&format!(
+                    "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+                     C<-B entries; B.drop(items)@260; C<-B whole; {tail}"
+                )),
+            ),
+            (
+                "the database's drop",
+                parse(&format!(
+                    "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+                     B.dropdb@260; C<-B entries; {tail}"
+                )),
+            ),
+        ],
+        &[(ITEMS, Some(&[]))],
+    );
+}
+
+/// The same, with the write into the standing life a replacement: A held `items/1` in the life
+/// the drop ended, so its t386 write is a `Replace`. C's oplog holds no entry of the document in
+/// the standing life at or below the target, and a replacement says the document had a value
+/// before it, which C does not hold: C refuses the rewind and names the document, as it refuses
+/// one whose earlier value was collected or is held only as a page's state (ADR-044). A guess of
+/// "absent" would be wrong for a page's row, which is a `Replace` with no history behind it.
+/// Every member then ends with A's t386 write, which C still holds. Whether C held the document
+/// in the ended life or not, and with the ended life's write stamped in the drop's own
+/// millisecond (a tie on the `Hlc` is the drop's, ADR-236).
+#[test]
+fn row_a_rewind_refuses_a_replacement_whose_only_earlier_version_is_of_an_ended_life() {
+    let tail = "C.create(items)@330; A.write(items/1)@386; C<-A entries; A.rewind@352; \
+                B.rewind@352; C.rewind@352";
+    let variants = [
+        (
+            "C held the document in the ended life",
+            format!(
+                "A.create(items)@100; B<-A entries; C<-A entries; C.write(items/1)@120; \
+                 A<-C entries; B.drop(items)@260; C<-B entries; {tail}"
+            ),
+        ),
+        (
+            "C never held it",
+            format!(
+                "A.create(items)@100; B<-A entries; C<-A entries; A.write(items/1)@120; \
+                 B.drop(items)@260; C<-B entries; {tail}"
+            ),
+        ),
+        (
+            "the ended life's write in the drop's millisecond",
+            format!(
+                "A.create(items)@100; B<-A entries; C<-A entries; A.write(items/1)@260; \
+                 C<-A entries; B.drop(items)@260; C<-B entries; {tail}"
+            ),
+        ),
+    ];
+    for (variant, schedule) in variants {
+        let ops = parse(&schedule);
+        let mut outcomes = check_routes(&ops, &[Route::Entries, Route::Pages]);
+        let mut bad = Vec::new();
+        for outcome in &mut outcomes {
+            expected_end(&ops, outcome, &[(ITEMS, Some(&[1]))]);
+            let failures: Vec<String> = outcome
+                .failures
+                .iter()
+                .filter(|f| f.category != Category::DocsAfterAgeOut)
+                .map(|f| format!("{:?}: {}", f.category, f.detail))
+                .collect();
+            let held = ["  A:", "  B:", "  C:"].iter().all(|m| {
+                outcome.report.lines().any(|l| {
+                    l.starts_with(m) && l.contains("items:") && l.contains("docs [1@t386.1A]")
+                })
+            });
+            // The repaired route's notes are the repair's own; the schedule's are on the others.
+            let refused = outcome.route == Route::Repaired
+                || outcome.report.contains("C rewind to t352 refused")
+                    && outcome.report.contains("not in this member's oplog");
+            if !failures.is_empty() || !held || !refused {
+                bad.push(format!(
+                    "{:?}: {failures:?}, every member holds t386: {held}, C refused: {refused}\n{}",
+                    outcome.route, outcome.report
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a replacement in the standing life / {variant}:\n{}",
+            bad.join("\n")
+        );
+    }
+}
+
+/// An entry stamped in the drop's own millisecond is of the life the drop ended (a tie on the
+/// `Hlc` is the drop's, ADR-236). C writes `items/1` at t260 and B drops `items` at t260, both
+/// minted without having seen the other; C takes the drop, which removes its write, and creates
+/// `items` again at t330. The rewind to t352 does not put C's t260 version back. By pure entries
+/// too.
+#[test]
+fn row_a_rewind_takes_an_entry_in_the_drops_millisecond_as_the_ended_lifes() {
+    let ops = parse(
+        "A.create(items)@100; B<-A entries; C<-A entries; C.write(items/1)@260; \
+         B.drop(items)@260; C<-B entries; C.create(items)@330; A.write(items/1)@386; \
+         C<-A entries; A.rewind@352; B.rewind@352; C.rewind@352",
+    );
+    row_strict_each("a tie with the drop", &[("every member rewound", ops)], &[(ITEMS, Some(&[]))]);
+}
+
+/// A write made after a drop by a member that never heard of it, before the collection was
+/// created again, is of the standing life (ADR-236 keeps it), though it predates the creation:
+/// the rewind puts it back. A writes `items/2` at t290, after B's drop at t260; C creates
+/// `items` at t330 and takes it, then A's t386 replacement. Every member ends with `2@t290`. B,
+/// which dropped the collection, judges A's t290 write before it holds the new life, and pure
+/// entries do not bring it back to B with no rewind either; the repair loop and pages do.
+#[test]
+fn row_a_rewind_puts_back_a_write_made_after_the_drop_before_the_re_creation() {
+    let ops = parse(
+        "A.create(items)@100; B<-A entries; C<-A entries; B.drop(items)@260; \
+         A.write(items/2)@290; C<-B entries; C.create(items)@330; C<-A entries; \
+         A.write(items/2)@386; C<-A entries; A.rewind@352; B.rewind@352; C.rewind@352",
+    );
+    row(
+        "a write between the drop and the re-creation",
+        &[],
+        &[("every member rewound", ops)],
+        &[(ITEMS, Some(&[2]))],
+    );
+}
+
+/// The removal of an ended life's version composes with ADR-246's: a write of the standing life
+/// at or below the target that C judged against the write the rewind discards is taken again.
+/// B writes `items/1` at t340 into the life C created; it reaches C after A's t386 write and
+/// loses there. C's rewind removes the document (its t120 entry is of the ended life) and asks
+/// B again, by entries, for what it judged. Every member ends with `1@t340`. By pure entries
+/// too.
+#[test]
+fn row_a_rewind_that_removes_an_ended_lifes_version_asks_again_for_a_judged_write() {
+    let ops = parse(
+        "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+         B.drop(items)@260; C<-B entries; C.create(items)@330; B<-C entries; \
+         B.write(items/1)@340; A.write(items/1)@386; C<-A entries; C<-B entries; \
+         A.rewind@352; B.rewind@352; C.rewind@352",
+    );
+    row_strict_each(
+        "an ended life's version and a judged write",
+        &[("every member rewound", ops)],
+        &[(ITEMS, Some(&[1]))],
+    );
+}
+
+/// The control: a version of the standing life at or below the target is put back. C writes
+/// `items/1` at t340 into the life it created at t330, and the rewind to t352 puts it back on
+/// every member, B's t120 version of the ended life notwithstanding.
+#[test]
+fn row_a_rewind_puts_back_the_standing_lifes_version_over_an_ended_lifes() {
+    let ops = parse(
+        "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+         B.drop(items)@260; C<-B entries; C.create(items)@330; C.write(items/1)@340; \
+         A.write(items/1)@386; C<-A entries; A.rewind@352; B.rewind@352; C.rewind@352",
+    );
+    row_strict_each(
+        "the standing life's version",
+        &[("every member rewound", ops)],
+        &[(ITEMS, Some(&[1]))],
+    );
+}
+
 /// ADR-236's residual 1, accepted as by design (ruled 2026-10-15), pinned by its exact shape
 /// so that a change in it shows. A drops the database while holding `items`, and buries it with
 /// an entry of its own stamp (t130.2A). B drops the database later, never having held `items`,

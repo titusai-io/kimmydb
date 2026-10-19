@@ -525,6 +525,15 @@ resolver. Something untestable in place tends to stay untested.
 | The bound under a removal beside a late restored entry without what retention collected | `row_a_removal_beside_a_late_restored_entry_keeps_the_members_collected_drop` |
 | Remove the row of a document deleted at the target | `row_a_rewind_keeps_the_tombstone_of_a_document_deleted_at_the_target` |
 | Bound the vectors only for a removed live row | `row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write` |
+| Put back a version of a collection life a drop ended (no skip of history) | `a_rewind_does_not_put_back_a_version_of_a_life_a_drop_ended`, `row_a_rewind_puts_back_no_version_of_a_life_a_drop_ended` |
+| Skip an ended life's entries only after the target | `a_rewind_does_not_put_back_a_version_of_a_life_a_drop_ended` |
+| Skip an ended life's live entries only, not its deletes | `a_rewind_does_not_put_back_the_delete_of_a_life_a_drop_ended` |
+| Judge an entry's life by the collection's `created` instead of its floor and tombstone | `a_write_after_a_drop_and_before_the_re_creation_is_of_the_standing_life` |
+| Give a tie with the drop's `Hlc` to the entry | `an_entry_in_the_drops_own_millisecond_is_of_the_life_it_ended`, `row_a_rewind_takes_an_entry_in_the_drops_millisecond_as_the_ended_lifes` |
+| Ignore a drop after the target known only by its tombstone | `a_rewind_past_a_drop_a_snapshot_page_carried_is_refused_without_writing` |
+| Refuse a drop's tombstone at the target | `a_rewind_to_the_drop_itself_is_not_refused` |
+| Ignore a drop after the target known only by a floor | `a_rewind_past_a_drop_named_only_by_a_floor_is_refused` |
+| Refuse a floor at the target | `a_rewind_past_a_drop_named_only_by_a_floor_is_refused` |
 
 **The first one escaped on the first run**, and it is the most important refusal
 in the feature: without it a rewind leaves an unrecoverable document at its
@@ -538,6 +547,10 @@ collects the newest entry ([ADR-028](decisions.md)), so the document's insert
 was still the tail and the rewind cheerfully *removed* the document instead. The
 fixture had not built the condition it was named for. Only after adding writes
 to push the insert off the tail does removing the check turn it red.
+
+Three narrowings of the skip of an ended life's entries pass every rewind test and
+are argued equivalent in [ADR-248](decisions.md) rather than listed: judging by the
+tombstone alone, by the floor alone, and only at or below the target.
 
 ### The cluster's channel binding
 
