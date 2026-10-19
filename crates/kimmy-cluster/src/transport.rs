@@ -476,7 +476,7 @@ fn cut_replay_page_from(
     }) {
         Ok(read) => read,
         // A record the change log names as changed since the cursor's base that
-        // is larger than the delta's half of a page (P2's refusal): the delta
+        // is larger than the delta's half of a page (refused by name): the delta
         // cannot carry it. The position's records start over, from a base above
         // the change: the record is then no change to that base, and goes as an
         // ordinary record on a page of records alone, which holds a record up to
