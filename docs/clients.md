@@ -143,7 +143,7 @@ where it stopped instead of applying again. What a client must do to rely on it:
 - **Branch on the capability `idempotency-keys`**, per node, from
   `GET /v1/version`. A member that does not list it refuses the header with
   `400` (a cluster during a roll, or before its operator has set
-  `cluster.idempotency_keys`), or for a few seconds with a `503` that says to
+  `cluster.idempotency_keys`), or for about one contact with a `503` that says to
   wait (below), and a member of an earlier release ignores it. Without the
   capability, the rules above apply.
 - **Send the retry byte for byte as the first attempt**, with the same key.
@@ -205,7 +205,7 @@ where it stopped instead of applying again. What a client must do to rely on it:
   the rules above apply. A `400` naming the key's syntax or the route is the
   client's to fix.
 - A key is remembered for `idempotencyWindowSecs` (`GET /v1/version`), 24 hours
-  by default. A retry later than that is a new request. A keyed request past
+  by default. A retry later than that is a new request, except that a request that reuses a key after its window, with the same body, may be taken as a retry of the earlier request while a member still serves that request's record, and its stamp rule then skips the matches changed since the earlier request; use a new key for a new request. A keyed request past
   one chunk retried over more than the window, counted from its first attempt,
   may apply that attempt's chunks again: finish or abandon a key within the
   window. A drop of the collection does not end it: a retry after the collection was dropped and

@@ -3192,8 +3192,8 @@ they refuse keys again until it is rolled forward.
 **A restart opens a short window, and it is answered `503`.** A member that has
 just started, or that SWIM has just seen rejoin or renamed, is live before its
 facts block is heard: its peers, and the member itself for its peers, have not
-yet had a replication contact with it. Until they have (a few seconds, about a
-sync interval, after `/readyz` answers 200), a member that cannot yet see every live peer
+yet had a replication contact with it. Until they have (about one contact after `/readyz` answers 200, or a
+sync interval if the member is restarted again within one), a member that cannot yet see every live peer
 say it carries records answers a keyed request `503 peer_unheard`, `retry:
 wait`, `Retry-After: 1`, and does not list
 `idempotency-keys`. Nothing is written, and a client that honours `Retry-After`

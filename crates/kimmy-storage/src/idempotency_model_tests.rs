@@ -1620,7 +1620,7 @@ impl World {
                     self.out.past_window_merged += 1;
                 } else {
                     let s = format!(
-                        "m2: {} refused key {key}'s record of its own request past its window \
+                        "{} refused key {key}'s record of its own request past its window \
                          (first {}), where it holds the live one ({:?})",
                         LETTERS[to],
                         self.stamp(first),
@@ -5115,7 +5115,7 @@ impl Gen {
         let mut bias = Bias::default();
         let len = ops.len();
         if self.rng.chance(33) {
-            // Room for a fresh counter with the cursor that names it (P2 counts both at
+            // Room for a fresh counter with the cursor that names it (the page counts both at
             // the size they cross in), one or two of them a page: `orders` spans pages.
             bias.page_room = Some(self.rng.pick(&[700, 1100]));
             let (to, from) = self.pair();

@@ -1,5 +1,5 @@
 //! The change log of idempotency records across an identity reset of a store
-//! that holds no record (B5, "Snapshots carry records").
+//! that holds no record (ADR-240, "Snapshots carry records").
 //!
 //! An open begins the log again over the records a store holds when no log of
 //! this node's identity has begun (`begin_log_over_held_records`); a store that

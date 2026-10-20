@@ -3262,9 +3262,11 @@ components:
         capability, and the answer is the `400`. The idempotency-key gate
         (ADR-240), for a request carrying `Idempotency-Key`, and the
         `Decimal128` gate (ADR-238), for a creation of a `Decimal128` `_id` or
-        of a partial index with a `Decimal128` bound. Nothing was looked up or
-        written. Send the same request again, to the same member, after
-        `Retry-After` (with the same key, if it had one): it is then answered
+        of a partial index with a `Decimal128` bound. Nothing was written: the
+        keyed gate answers before the key's record is looked up, and the
+        `Decimal128` gate after the duplicate-key check and, for a keyed
+        insert, after the record lookup. Send the same request again, to the
+        same member, after `Retry-After` (with the same key, if it had one): it is then answered
         as it would have been. A live member that lacks the capability
         decides over one not heard from, and the answer is then the `400`.
       headers:
@@ -3444,7 +3446,7 @@ components:
         | `resolver_busy` | 503 | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered. Nothing was done. Carries `Retry-After`. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
         | `idempotency_key_reused` | 422 | no | The request's `Idempotency-Key` is remembered on this member for a different request (another body, path, query or method) from this principal on this collection, or two members accepted it for two different requests and their records have met (a contested record, refused for every retry of either). Nothing was written. Use a new key for a new request |
         | `idempotency_key_in_flight` | 409 | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member, or another retry of it is being answered there. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record |
-        | `peer_unheard` | 503 | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet, within the unheard lease of its coming up, rename or this member's rejoin. Nothing was looked up or written. Carries `Retry-After: 1`; the same request sent again here then, with the same key if it had one, is taken |
+        | `peer_unheard` | 503 | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet, within the unheard lease of its coming up, rename or this member's rejoin. Nothing was written: the keyed gate answers before the key's record is looked up, and the `Decimal128` gate after the duplicate-key check and, for a keyed insert, after the record lookup. Carries `Retry-After: 1`; the same request sent again here then, with the same key if it had one, is taken |
         | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
       enum:
         - bad_request

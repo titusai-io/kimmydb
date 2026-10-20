@@ -537,7 +537,7 @@ one tenth. Through 0.50.x `createIndex` refused it, because the canonical order
 ranked a `Decimal128` equal to every other number. **Creating such an index
 locally is refused (`400`, naming `cluster.decimal128`) until every member runs
 0.51 and the operator has said so** (and `503 peer_unheard`, with `Retry-After`,
-for the few seconds after a restart or rejoin, at most the unheard lease, while a live
+for about one contact after a restart or rejoin, at most the unheard lease, while a live
 member is only not yet heard from): an older member would refuse the
 definition and never build it, even after it upgrades
 ([Operations](operations.md#clusterdecimal128-and-the-marker),

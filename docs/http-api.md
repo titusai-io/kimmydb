@@ -758,9 +758,9 @@ A key is remembered **`storage.oplog_retention_secs` after the write's last
 commit**, 24 hours by default: the window in which the write itself is kept and
 replicated. `GET /v1/version` publishes it as `idempotencyWindowSecs`, and it is
 **each member's own**: members configured differently remember keys for
-different times. After it, the same request is a new one; a keyed insert
+different times. After it, a retry is a new request; a keyed insert
 without `_id` still lands on its derived `_id`, and answers `409 duplicate_key`
-while that document stands.
+while that document stands. A request that reuses a key after its window, with the same body, may be taken as a retry of the earlier request while a member still serves that request's record, and its stamp rule then skips the matches changed since the earlier request; use a new key for a new request.
 
 **A drop of the collection does not end it.** A key outlives a drop of its
 collection for its window, as MongoDB's retryable writes outlive a drop of
@@ -823,7 +823,8 @@ it, naming the header and the cause, in one of two ways:
   has not heard from yet, within the unheard lease: one that came up a moment ago, or
   whose block this member dropped when SWIM renamed it or this member rejoined.
   Every restart of a member in a roll opens such a window, on the restarted
-  member and often on its peers, of a few seconds after it answers `/readyz`.
+  member and often on its peers, of about one contact after it answers `/readyz`
+  (a sync interval, if the member is restarted again within one).
   It ends at the next contact with that member, or becomes the `400` when the
   lease runs out first: **send the same request again, with the same key, to
   the same member after `Retry-After`**. A member that does not say it carries
@@ -852,7 +853,7 @@ the gate opens again.
   it: a key outlives a drop of its collection for its window. A keyed request
   past one chunk retried over more than the window, counted from its first
   attempt, may apply that attempt's chunks again: finish or abandon a key
-  within the window.
+  within the window. A request that reuses a key after its window, with the same body, may be taken as a retry of the earlier request while a member still serves that request's record, and its stamp rule then skips the matches changed since the earlier request; use a new key for a new request.
 - Nothing on a member of an earlier release, which ignores the header.
 - Nothing across collections or principals: a key is scoped to both.
 - Nothing for schema changes, vectors, webhooks or administration, which refuse
@@ -1733,7 +1734,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent or carries an [`Idempotency-Key`](#idempotency-keys), which makes sending it again with the same key safe on the member that took it: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
 | 500 | `partially_applied` | verify | A request that commits in more than one transaction — a `multi: true` update or delete, a database drop — failed after its first commit. **What landed stands and replicates**, and `applied` says how much; `cause` says why the rest did not. Read back, or resend a request built to skip what is done: see [a request that was partly applied](#a-request-that-was-partly-applied). Never resend it blindly |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
-| 503 | `peer_unheard` | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet, within the unheard lease (the longer of `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to declare a silent member down plus one sync interval) of its coming up, being renamed or this member rejoining, as every restart in a roll causes. Past the unheard lease with no block, or with a block that does not decode, the member counts as one that does not say it has the capability, and the answer is `400 bad_request`. Nothing was looked up or written. Carries `Retry-After: 1`; the same request sent again here then (with the same key, if it had one) is taken. Not elsewhere: a keyed retry stays on the member that may hold its record ([The gate](#the-gate)) |
+| 503 | `peer_unheard` | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet, within the unheard lease (the longer of `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to declare a silent member down plus one sync interval) of its coming up, being renamed or this member rejoining, as every restart in a roll causes. Past the unheard lease with no block, or with a block that does not decode, the member counts as one that does not say it has the capability, and the answer is `400 bad_request`. Nothing was written: the keyed gate answers before the key's record is looked up, and the `Decimal128` gate after the duplicate-key check and, for a keyed insert, after the record lookup. Carries `Retry-After: 1`; the same request sent again here then (with the same key, if it had one) is taken. Not elsewhere: a keyed retry stays on the member that may hold its record ([The gate](#the-gate)) |
 | 503 | `starting` | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member ([ADR-198](decisions.md)) |
 | 503 | `catching_up` | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member ([ADR-202](decisions.md)) |
 | 503 | `node_stopping` | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member ([ADR-192](decisions.md)) |

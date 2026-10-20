@@ -401,7 +401,7 @@ Retention bounds three things:
 |---|---|
 | How long a disconnected subscriber can be away and still resume | `410 Gone`, must resubscribe |
 | How far a peer can fall behind and still catch up incrementally | The sender says so and ships a snapshot instead ([ADR-036](decisions.md)) |
-| How long a member remembers an `Idempotency-Key` | A retry is a new request. The pass collects records after the oplog step, by their rows below the same cutoff ([Storage](storage.md#idempotency-records)) |
+| How long a member remembers an `Idempotency-Key` | A retry is a new request, except that one with the same body may be taken as a retry of the earlier request while a member still serves its record ([Idempotency keys](http-api.md#how-long-a-key-is-remembered)). The pass collects records after the oplog step, by their rows below the same cutoff ([Storage](storage.md#idempotency-records)) |
 
 The expiry check exists already:
 

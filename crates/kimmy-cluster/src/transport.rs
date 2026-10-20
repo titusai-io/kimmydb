@@ -11058,7 +11058,7 @@ mod tests {
         assert_eq!(n(&a), 11, "the retry replays");
     }
 
-    /// The v0.51.0 stall (ADR-240, P2): 600 documents of 130 KiB, whose first page
+    /// The v0.51.0 stall (ADR-240): 600 documents of 130 KiB, whose first page
     /// was 68 MB, over a frame, so the listener refused it and the pull failed
     /// for good. Pages are cut by bytes now (`SNAPSHOT_PAGE_BYTES`), and the
     /// whole-database, scoped and converge pulls complete. A document no page can

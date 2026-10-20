@@ -28737,7 +28737,7 @@ with it, and not be offered while any member could carry the write without it.
    not stored unless the live record here is of the same request, the same fingerprint (merged into the live record
    of a new request under the key, it would lower that record's `first` to the old request's, and mark it contested;
    merged into a later attempt of its own request, it lowers `first` to its own attempt's, so the stamp rule leaves
-   what that attempt wrote, which this member can still take from a sender whose retention has not run). An absent
+   what that attempt wrote, which this member can still take from a sender whose retention has not run). So a request that reuses a key after its window, with the same body, may be taken as a retry of the earlier request while a member still serves that request's record, and its stamp rule then skips the matches changed since the earlier request; use a new key for a new request. An absent
    record is overwritten by the next store, never merged with.
    **Nothing else ends a record**: a drop of its collection, a database drop, the drop purger and a late drop's sweep
    (ADR-231) remove no record, and a record of a dropped life is stored and served as any other. So a retry after the
@@ -29114,8 +29114,8 @@ left a relayed effect bare when its entry lost or its window was cut inside a co
 entry** (L1, item 2), where the design's first entry let a drop in that entry's millisecond bury a record whose
 later entry stood (moot since records outlive a drop; it stays as the truer `last` the window is measured on); **the lookahead** (G8, item 4), where the design's record-only `done` commit never reached a member
 that had pulled the last writing chunk; **the page delta** (item 5), which closes the scoped-repair residual the design
-accepted; and **a record's own row** (P1, item 5), where a row an earlier record under the key had left could ship the
-record standing now (P1's drop-purge half is moot since records outlive a drop). Three more followed a review
+accepted; and **a record's own row** (item 5), where a row an earlier record under the key had left could ship the
+record standing now (its drop-purge half is moot since records outlive a drop). Three more followed a review
 of the merged head: **records outlive a drop** (Chris, 2026-10-18; item 3), where the design's
 life rule made a record of a dropped life history and the purge removed it; **the contested flag** (items 1 and
 5), where two members that accepted one key for two requests merged their records into one whose answer was one
@@ -29167,7 +29167,7 @@ below a base cut before the restore. Accepting keyed writes during a mixed roll 
 member that pulled a keyed entry through an older one holds its effect without the record for good, while it lists the
 capability. One `503` with `retry: wait` for every cause of the gate: a member that says no, the switch and
 membership off last a roll or longer, and a client told to wait would retry for that long. One `400` for every cause,
-as built first: a peer not heard from yet lasts about a sync interval, after every restart, and `no` turns a safe retry
+as built first: a peer not heard from yet lasts about a sync interval, after every restart (about one contact since ADR-247, a sync interval on a second restart within one), and `no` turns a safe retry
 into a lost one. A `503` for as long as a live peer stays unheard: a peer whose blocks never decode, or that never
 sends one, would keep clients retrying a request that cannot be taken, against what `Retry-After` promises. Counting
 an undecodable block as not heard: it was heard, and it cannot vouch. Holding `/readyz` until the gate opens: a pause
@@ -29246,14 +29246,16 @@ derived `_id` and its echo, scope per principal, a revoked grant refused before 
 `skipped` without `resumed`. `kimmy-mcp`: each keyed tool replayed with the `_meta` marker, a reused key refused, a
 contested key refused on every keyed tool, and the gate's `503` as an error carrying `retry: wait` and
 `retry_after_secs`. `kimmy-cluster`: `PeerNet` over a view (the two causes as separate sets, the precedence, per
-capability), both gates' split with the wait of one sync interval, a block dropped on a rename or a rejoin read as
+capability), both gates' split with the fixed wait of one second, a block dropped on a rename or a rejoin read as
 unheard again with its clock started again, an unheard peer refusing once the unheard-peer `WARN`'s lease has run
 (on a test clock), the unheard lease floored at foca's own timers, and an undecodable block refusing at once.
 `kimmyd` (`tests/cluster.rs`): `a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out` (at a 1 s sync
 interval, a member that rejoins while a peer is frozen answers `503` and then `200` once SWIM has declared the peer
 down, never `400`), and `a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400`,
-a member restarted at a 5 s sync interval and sent a keyed and a `Decimal128` insert from its first ready answer, `503
-peer_unheard` with `Retry-After: 5` and never `400`, then the first application and its replay; C9 meets the `503`
+a member restarted twice within a 5 s sync interval (each time waited ready), its two peers each sent a keyed and a
+`Decimal128` insert again and again from the second ready answer until each is taken: `503 peer_unheard` with
+`Retry-After: 1` while the peer has not heard its block, never `400`, then the keyed request's first application and its
+replay; C9 meets the `503`
 before the `400` of C's heard block, and the cluster tests' keyed requests are sent again through the window as a
 client sends them. `kimmyd`: the switch's defaults and its refusal of a misspelt key, the facts
 field, the gate across a cluster, and a keyed write whose own fsync fails answered by its replay after the restart.

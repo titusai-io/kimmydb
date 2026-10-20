@@ -120,7 +120,7 @@ pub enum ErrorCode {
     /// only because a live member has not been heard from yet: it came up, or
     /// this member saw it rejoin, a moment ago, and its block arrives at the
     /// next contact. The idempotency-key gate (ADR-240) and the `Decimal128` gate
-    /// (ADR-238). Nothing was looked up or written; the same request, sent
+    /// (ADR-238). Nothing was written; the same request, sent
     /// again after `Retry-After`, is taken once it has been heard.
     PeerUnheard,
 }
