@@ -4,7 +4,8 @@
     count.py [--write] [<repo>]
 
 Counts every row of every section's table by its Result: `killed` (and `killed (hung)`,
-`killed (wider suites)`), `equivalent` (and `equivalent in safety`), `superseded`, `retired`,
+`killed (wider suites)`, `killed (memory)`: a test process passed the container runner's
+memory guard), `equivalent` (and `equivalent in safety`), `superseded`, `retired`,
 `identical` (run once, as the row it repeats), and anything else as a survivor. Without
 `--write` it checks that each section's summary line, the Totals table, the sentence under it
 and the ADR-240 summary in docs/decisions.md say exactly that, and exits 1 if one does not;
@@ -41,7 +42,7 @@ parts = [p for p in re.split(r"(?m)^(?=## )", rest) if p.strip()]
 sections = []  # (title, body, totals)
 out = [head + "\n"]
 grand = dict.fromkeys(("rows",) + KINDS, 0)
-detail = dict.fromkeys(("hung", "wider"), 0)
+detail = dict.fromkeys(("hung", "wider", "memory"), 0)
 bad = []
 for part in parts:
     title = part.splitlines()[0][3:].strip()
@@ -56,6 +57,8 @@ for part in parts:
         t[kind(cells[2])] += 1
         if cells[2].startswith("killed") and "hung" in cells[2]:
             detail["hung"] += 1
+        if cells[2].startswith("killed") and "memory" in cells[2]:
+            detail["memory"] += 1
         if cells[2].startswith("killed (wider"):
             detail["wider"] += 1
     if t["rows"] == 0:
@@ -82,8 +85,10 @@ for title, t in sections:
 table.append(f"| **All** | **{grand['rows']}** | **{grand['killed']}** | **{grand['equivalent']}** | "
              f"**{grand['superseded']}** | **{grand['retired']}** | **{grand['identical']}** | **{grand['survived']}** |")
 own = grand["killed"] - detail["wider"]
+# Only a run under the container runner's memory guard has such rows; without any the sentence is unchanged.
+memory = f"; {detail['memory']} by the memory guard, a test process killed past its RSS limit" if detail["memory"] else ""
 tail = (f"Of the {grand['killed']} rows killed, {own} were killed by their own suites ({detail['hung']} of them by a "
-        f"hang, with the tests that failed before it) and {detail['wider']} by the wider suites. "
+        f"hang, with the tests that failed before it{memory}) and {detail['wider']} by the wider suites. "
         f"{grand['equivalent']} rows are equivalent, each with its argument in its Notes; {grand['superseded']} are "
         f"superseded and {grand['retired']} retired, each saying by what; {grand['identical']} repeat another row's "
         f"edit and test and ran once, as it; and {grand['survived']} survived.")
