@@ -219,6 +219,37 @@ pub(crate) fn id_wire_len(id: &DocId) -> usize {
     }
 }
 
+/// How many leading bytes of a binary or string `_id` its name carries.
+const ID_NAME_PREFIX: usize = 24;
+
+/// An `_id` named by its kind, its length and its first bytes, for an error
+/// text or a log line: the refusal of a row whose `_id` is megabytes long is
+/// sent to the requester and logged every round, so it never carries the id
+/// itself. At most a few hundred bytes whatever the id; the same id always
+/// gives the same name.
+pub(crate) fn id_name(id: &DocId) -> String {
+    match id {
+        DocId::Binary(bytes) => {
+            let shown = &bytes[..bytes.len().min(ID_NAME_PREFIX)];
+            let hex: String = shown.iter().map(|byte| format!("{byte:02x}")).collect();
+            let more = if shown.len() < bytes.len() { "..." } else { "" };
+            format!("binary _id of {} bytes starting {hex}{more}", bytes.len())
+        }
+        DocId::String(text) => {
+            let mut end = 0;
+            for (at, c) in text.char_indices() {
+                if at + c.len_utf8() > ID_NAME_PREFIX {
+                    break;
+                }
+                end = at + c.len_utf8();
+            }
+            let more = if end < text.len() { "..." } else { "" };
+            format!("string _id of {} bytes starting {:?}{more}", text.len(), &text[..end])
+        }
+        other => format!("_id {other:?}"),
+    }
+}
+
 /// What the cursor a page cuts after a row whose stored key is `stored_key`
 /// bytes long costs it, a bound: its key crosses in the legacy form, which is at
 /// most one byte longer, or 12 bytes for an integer ([`kimmy_core::legacy_key`]),
@@ -1569,8 +1600,9 @@ impl Engine {
                                 {
                                     let what = match &item {
                                         PageRow::Document(document) => format!(
-                                            "document {:?} of collection {}",
-                                            document.id, document.collection
+                                            "document with {} of collection {}",
+                                            id_name(&document.id),
+                                            document.collection
                                         ),
                                         PageRow::Tombstone(tombstone) => format!(
                                             "a tombstone of collection {}",

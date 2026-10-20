@@ -678,6 +678,49 @@ fn a_keyed_delete_replays_after_a_drop_took_its_tombstone() {
     assert!(engine.get(&again, &id).unwrap().is_some(), "the next life's document stands");
 }
 
+/// The drop case of a keyed delete's replay is judged by the record's `first`,
+/// not its `last`: two attempts merged into one record, the collection dropped
+/// between them (the first attempt's tombstone went with the drop, the second's
+/// stamp is above it). The retry replays `{"deleted": 1}`, as it does for a
+/// record of one attempt, rather than running afresh against a row that is gone
+/// and answering `{"deleted": 0}`.
+#[test]
+fn a_keyed_delete_of_two_merged_attempts_replays_after_a_drop_between_them() {
+    let (engine, coll, _dir, _path) = open();
+    let id = DocId::Int64(1);
+    engine.insert_stamped(&coll, doc! { "_id": 1i64 }).unwrap();
+    let k = keyed(11);
+    fresh(engine.delete_keyed(&coll, &id, None, &k).unwrap()).unwrap();
+    let first = record(&engine, &coll, &k).unwrap().first;
+    engine.drop_collection("shop", "orders").unwrap();
+    let dropped = engine.collection_dropped_at(coll.id).unwrap().expect("a tombstone");
+    // The second attempt, on a member that had not heard of the drop: its stamp
+    // is above the drop's, and its record reaches this member merged with the first.
+    let at = Stamp::new(dropped.hlc.successor(), NodeId::from_bytes([9; 16]));
+    let second = IdempotencyRecord {
+        fingerprint: k.fingerprint,
+        first: at,
+        last: at,
+        origin: at.node,
+        state: RecordState::Done,
+        outcome: RecordOutcome::Delete { deleted: 1, stamp: Some(at) },
+        contested: false,
+    };
+    {
+        let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
+        engine.store_record(&txn, coll.id, &k.scope, &second, Some(at)).unwrap();
+        txn.commit().unwrap();
+    }
+    engine.finish_purges_now().unwrap();
+    let again = engine.create_collection("shop", "orders").unwrap();
+    let merged = record(&engine, &again, &k).unwrap();
+    assert!(merged.first == first && merged.first.hlc <= dropped.hlc, "premise: {merged:?}");
+    assert!(merged.last == at && merged.last.hlc > dropped.hlc, "premise: {merged:?}");
+    assert!(engine.get(&again, &id).unwrap().is_none(), "premise: no row under the id");
+    let replay = replayed(engine.delete_keyed(&again, &id, None, &k).unwrap());
+    assert_eq!(replay.outcome, RecordOutcome::Delete { deleted: 1, stamp: Some(at) });
+}
+
 /// A keyed `find_and_modify` keeps its flags, the upserted `_id` as the stored
 /// body holds it (a rendered value), and the image the caller answers with.
 #[test]
@@ -1001,6 +1044,41 @@ fn a_peer_record_past_its_window_is_not_stored() {
     assert_eq!(engine.idempotency_record(coll.id, &elsewhere.scope).unwrap(), None);
     assert_eq!(rows(&engine), rows_before, "no row for either");
     replayed(engine.insert_keyed(&coll, doc! { "v": 1 }, &k).unwrap());
+}
+
+/// A past-window record of the live record's own request (the same fingerprint)
+/// merges, but one that is contested does not: it stands for two or more
+/// requests of the key's earlier life, and its flag would carry to the live
+/// request, which every retry would then get `422 idempotency_key_reused` for,
+/// on every member the merged record reaches. Not stored, nothing written, and a
+/// retry of the live request replays.
+#[test]
+fn a_contested_past_window_record_does_not_contest_a_live_request() {
+    let (engine, coll, _dir, _path) = open();
+    engine.set_idempotency_window(DAY);
+    let k = keyed(33);
+    fresh(engine.insert_keyed(&coll, doc! { "_id": 1i64 }, &k).unwrap());
+    let live = record(&engine, &coll, &k).unwrap();
+    let rows_before = rows(&engine);
+    let now = crate::physical_now_ms();
+    let old = IdempotencyRecord {
+        fingerprint: k.fingerprint,
+        first: stamp(now - 3 * DAY_MS, 0, 0x77),
+        last: stamp(now - 2 * DAY_MS, 0, 0x77),
+        origin: NodeId::from_bytes([0x77; 16]),
+        state: RecordState::Done,
+        outcome: RecordOutcome::Insert { stamp: stamp(now - 3 * DAY_MS, 0, 0x77) },
+        contested: true,
+    };
+    assert!(engine.record_is_past_window(&old) && !engine.record_is_past_window(&live), "premise");
+    let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
+    let (stored, wrote) =
+        engine.store_record_noting(&txn, coll.id, &k.scope, &old, Some(old.last)).unwrap();
+    txn.commit().unwrap();
+    assert_eq!((stored, wrote), (None, false));
+    assert_eq!(record(&engine, &coll, &k), Some(live), "its first and flag as they were");
+    assert_eq!(rows(&engine), rows_before, "no row for it");
+    replayed(engine.insert_keyed(&coll, doc! { "_id": 1i64 }, &k).unwrap());
 }
 
 // -- Durability ------------------------------------------------------------------------------

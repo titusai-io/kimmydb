@@ -1592,9 +1592,71 @@ fn a_row_goes_first_on_the_next_page_and_one_no_page_can_carry_is_refused() {
     assert!(page.documents.is_empty(), "behind the definitions");
     match y.snapshot_page(page.next.clone(), Some(plain.id)) {
         Err(e @ crate::StorageError::SnapshotRowTooLarge { .. }) => {
-            assert!(e.to_string().contains("document Int64(7)"), "{e}");
+            assert!(e.to_string().contains("document with _id Int64(7)"), "{e}");
         }
         other => panic!("expected the document refused, got {other:?}"),
+    }
+}
+
+/// The refusal of a row whose `_id` is too large to cross with its cursor names
+/// the id by its kind, its length and its first bytes, not by the id: the text is
+/// logged and sent to the requester every round, and a 3.5 MiB binary `_id` once
+/// made it 11 MB.
+#[test]
+fn the_refusal_of_a_large_id_names_it_by_its_length_and_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let y = open(&dir, "y");
+    let c = y.create_collection("shop", "wideid").unwrap();
+    let id = bson::Binary {
+        subtype: bson::spec::BinarySubtype::Generic,
+        bytes: vec![7u8; 3_584 * 1024],
+    };
+    y.insert(&c, doc! { "_id": Bson::Binary(id), "n": 1i64 }).unwrap();
+    let mut after: Option<SnapshotCursor> = None;
+    let mut refused = None;
+    for _ in 0..6 {
+        match y.snapshot_page(after.clone(), Some(c.id)) {
+            Err(e @ crate::StorageError::SnapshotRowTooLarge { .. }) => {
+                refused = Some(e.to_string());
+                break;
+            }
+            Ok(page) => match page.next {
+                Some(next) => after = Some(next),
+                None => panic!("premise: the page was served ({} documents)", page.documents.len()),
+            },
+            Err(e) => panic!("premise: {e}"),
+        }
+    }
+    let text = refused.expect("premise: the document is refused by name");
+    assert!(text.len() < 512, "a refusal of {} bytes, logged and sent every round", text.len());
+    assert!(
+        text.contains("binary _id of 3670016 bytes starting 070707070707070707070707"),
+        "{text}"
+    );
+}
+
+/// An `_id` is named by its kind, its length and at most 24 leading bytes, the
+/// same name every time, whatever its size; a kind that is small by nature is
+/// named whole.
+#[test]
+fn an_id_is_named_by_its_kind_length_and_a_short_prefix() {
+    use crate::snapshot::id_name;
+    let long = DocId::Binary((0..200u8).collect());
+    assert_eq!(
+        id_name(&long),
+        "binary _id of 200 bytes starting 000102030405060708090a0b0c0d0e0f1011121314151617..."
+    );
+    assert_eq!(id_name(&long), id_name(&long.clone()));
+    assert_eq!(id_name(&DocId::Binary(vec![1, 2])), "binary _id of 2 bytes starting 0102");
+    assert_eq!(id_name(&DocId::Binary(Vec::new())), "binary _id of 0 bytes starting ");
+    let text = DocId::String(format!("order-{}", "é".repeat(100)));
+    let name = id_name(&text);
+    // Cut at a character boundary: 6 bytes of ASCII and 9 two-byte characters.
+    assert_eq!(name, format!("string _id of 206 bytes starting \"order-{}\"...", "é".repeat(9)));
+    assert_eq!(id_name(&DocId::String("abc".into())), "string _id of 3 bytes starting \"abc\"");
+    assert_eq!(id_name(&DocId::Int64(7)), "_id Int64(7)");
+    for id in [long, text] {
+        assert!(id_name(&id).len() < 128, "{}", id_name(&id));
     }
 }
 

@@ -331,7 +331,7 @@ one is stored then or never. **A batch that ends at an entry stores no record
 whose row is at or past that entry; the window serves those again.** A record
 is stored whether or not a drop of its collection came after it, since a record
 outlives a drop for its window; one already past its window is not stored, unless the
-live record here is of the same request (the same fingerprint), which it merges into. Two records of one key
+live record here is of the same request (the same fingerprint) and the record is not contested (one that is stands for two or more requests of the key's earlier life, and its flag would contest the live one), which it merges into. Two records of one key
 merge as a join ([Time & Conflicts](time-and-conflicts.md#idempotency-records-merge-as-a-join)),
 and the receiver's clock moves past both of the record's stamps. A store that
 changes nothing writes nothing, and a frame of records held already costs no
@@ -593,7 +593,8 @@ document's `_id` at the size it crosses in. The cursor the page ends at is
 reserved with each row at the size its key crosses in: a binary `_id` and a
 cursor's key cross as arrays of integers, about ten bytes a byte. A row that
 does not fit goes first on the next page; a row no page can carry is refused by
-name, the sender answering with a fault that names the row and its size: a
+name, the sender answering with a fault that names the row (a document's `_id` by
+its kind, length and first 24 bytes, never whole) and its size: a
 document or a `find_and_modify` record larger than that, which cannot cross in a
 window either, or a document whose `_id` is so large (over about 3 MiB of binary
 or 5 MiB of string) that the cursor naming it does not fit with it. Before 0.52.0 a page
