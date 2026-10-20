@@ -287,9 +287,11 @@ struct Replay {
     answered: BTreeSet<NodeId>,
     /// How far each peer's replay has read and applied, across rounds.
     cursors: BTreeMap<NodeId, kimmy_core::Hlc>,
-    /// Where each peer's outbound replay stands in records at its position, across
-    /// rounds: the cursor of the last page of records alone this member stored
-    /// (ADR-240, records too many for a frame). In memory only.
+    /// Where the replay this member reads from each peer stands in records at its
+    /// position, across rounds: the cursor of the last page of records alone this
+    /// member stored from that peer (ADR-240, records too many for a frame). It is
+    /// this member, the reader, that holds it: it goes to the peer with each ask and
+    /// comes back echoed. In memory only.
     records: BTreeMap<NodeId, kimmy_storage::ReplayRecords>,
     /// How long a peer keeps the oplog: what is older than this can no longer be
     /// read back, and asking for it is answered `BeyondHorizon`. `None` when
