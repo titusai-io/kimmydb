@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.52.0 - 2026-10-20
 
 **Read before upgrading: `Idempotency-Key` is now refused where earlier releases ignored it, and a cluster refuses it on every route until its operator sets `cluster.idempotency_keys`.**
 
