@@ -736,6 +736,10 @@ pub(crate) struct Outcome {
     /// Records cursors dropped for that, the position's records read again from a fresh
     /// base.
     pub cursor_dropped: usize,
+    /// Replay pages whose cursor's delta read, with a changed record too large for it
+    /// outside the cursor's set (a new request's record, or one of another collection)
+    /// in the sender's change log, and went on with the cursor kept.
+    pub large_outside_left_alone: usize,
     /// Replay pages that could not carry what they must (the model's whole-frame
     /// refusal: F3 records more than a frame, or a page of records alone that sends
     /// nothing new): the replay stays at its position for the contact.
@@ -3336,13 +3340,39 @@ impl World {
             cursor.as_ref(),
             self.sched.bias.delta_bytes,
         ) {
-            Ok(read) => read,
+            Ok(read) => {
+                // A changed record too large for the delta that is not of the cursor's set
+                // is read with the page's own records: it neither crosses in the delta nor
+                // drops the cursor.
+                if read.resumed
+                    && let Some(cursor) = &cursor
+                {
+                    let (_, outside) = self.large_changes(peer, cursor)?;
+                    if outside > 0 {
+                        self.out.large_outside_left_alone += 1;
+                    }
+                }
+                read
+            }
             // A record the change log names as changed since the cursor's base, larger
             // than the delta's half of a page (refused by name): as the transport does, the
             // cursor is dropped and the position's records are read again from a fresh
             // base, which carries the record as an ordinary one on a page of records
             // alone, what earlier pages at the position sent with it.
             Err(StorageError::SnapshotRowTooLarge { .. }) => {
+                // The refusal is of a record of the cursor's set rewritten large, never of
+                // one outside it.
+                if let Some(cursor) = &cursor {
+                    let (inside, _) = self.large_changes(peer, cursor)?;
+                    if inside == 0 {
+                        return Err(format!(
+                            "{}'s replay delta refused a changed record, and none of the \
+                             cursor's set is too large for it: the cursor dropped for a \
+                             record outside its set",
+                            LETTERS[peer]
+                        ));
+                    }
+                }
                 self.out.delta_too_large += 1;
                 self.out.cursor_dropped += 1;
                 cursor = None;
@@ -3498,6 +3528,44 @@ impl World {
             }
         }
     }
+    /// The records `peer`'s change log names above `cursor`'s base that are too large for
+    /// the delta (`Bias::delta_bytes`): how many are of the cursor's set (a collection it
+    /// names, `first` at or before its end) and how many are not.
+    fn large_changes(&self, peer: usize, cursor: &crate::ReplayRecords) -> Res<(usize, usize)> {
+        use redb::ReadableDatabase;
+        let engine = self.e(peer);
+        let txn = engine.db().begin_read().map_err(|e| format!("begin_read: {e}"))?;
+        let all = crate::idempotency::records_changed_since(
+            &txn,
+            cursor.base.key,
+            &|_| true,
+            &|_, _| true,
+            crate::idempotency::DeltaBudget {
+                bytes: usize::MAX / 4,
+                rows: crate::idempotency::RECORD_DELTA_ROWS,
+            },
+        )
+        .map_err(|e| err("records_changed_since", e))?;
+        let (mut inside, mut outside) = (0, 0);
+        for carried in all.records {
+            if crate::idempotency::carried_size(carried.record.len()) <= self.sched.bias.delta_bytes
+            {
+                continue;
+            }
+            let of_the_set = cursor.collections.contains(&carried.collection)
+                && IdempotencyRecord::decode(&carried.record)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.first.hlc <= cursor.through);
+            if of_the_set {
+                inside += 1;
+            } else {
+                outside += 1;
+            }
+        }
+        Ok((inside, outside))
+    }
+
     /// A replay page that cannot carry what it must (the transport's `unfit`): counted,
     /// and the replay stays at its position for the contact.
     fn unfit(&mut self) -> Option<ReplayCut> {
@@ -5103,7 +5171,11 @@ impl Gen {
     ///   member and its first peer backed up at the start, and the member restored two
     ///   thirds in; in half of them its first peer is restored between the replay's first
     ///   two pages (a cursor of another epoch), and in a third of them the cursor's delta
-    ///   takes a hundred bytes (a changed record too large for it).
+    ///   takes a hundred bytes: in two fifths of those a new request's record is written
+    ///   between two pages (too large for the delta, outside the cursor's set, so the
+    ///   cursor is kept), in three fifths a third member's request under the key of one
+    ///   of the set's records turns that record contested there (a record of the set
+    ///   rewritten too large for the delta, so the cursor is dropped).
     /// - **A rewind across a dropped life** (a fifth of the `Anywhere` seeds): a document
     ///   written and taken, its collection dropped and created again, the document replaced
     ///   by a member that never heard of the drop, and a rewind to between the creation and
@@ -5199,6 +5271,7 @@ impl Gen {
             let m = if self.track == Track::Home && m == self.home { (m + 1) % self.n } else { m };
             let peer = (0..self.n).find(|o| *o != m).expect("two members");
             let mut inner = Vec::new();
+            let mut contest = None;
             let at = (ops.len() * 2 / 3).max(2);
             match self.rng.below(10) {
                 // The sender restored between two replay pages: a cursor of another epoch.
@@ -5208,8 +5281,9 @@ impl Gen {
                     inner.push((1 + self.rng.below(2) as u8, vec![again]));
                 }
                 // A keyed write on the sender between two replay pages, with a delta too
-                // small for the record it changes.
-                4..=8 => {
+                // small for the record it makes: a new request's, outside the cursor's set,
+                // which the delta leaves alone.
+                4..=5 => {
                     bias.delta_bytes = 100;
                     let r = self.new_request();
                     let at_peer =
@@ -5224,6 +5298,17 @@ impl Gen {
                         t,
                     };
                     inner.push((1, vec![send]));
+                }
+                // A record of the cursor's set rewritten between two replay pages, with a
+                // delta too small for it: a third member took another request under the
+                // key of the member's first write (an insert) while it was cut off, and
+                // the sender takes that member's write between the pages, which turns
+                // the sender's record contested.
+                6..=8 => {
+                    bias.delta_bytes = 100;
+                    let from = (0..self.n).find(|o| *o != m && *o != peer).expect("a third member");
+                    contest = Some(from);
+                    inner.push((1, vec![Op { step: Step::Pull { to: peer, from }, t: 0 }]));
                 }
                 _ => {}
             }
@@ -5246,6 +5331,18 @@ impl Gen {
                 block.push(Op {
                     step: Step::Send { r, m: on, crash: None, inner: Vec::new() },
                     t: t + i as u32,
+                });
+            }
+            if let Some(third) = contest {
+                // The third member, which holds none of this, takes another request under
+                // the key of the first insert.
+                let r = self.requests.len() as u8;
+                let key = self.requests[usize::from(r) - 3].key;
+                self.requests.push(Request { key, kind: Kind::Insert { id: None } });
+                self.open.push(r);
+                block.push(Op {
+                    step: Step::Send { r, m: third, crash: None, inner: Vec::new() },
+                    t: t + 3,
                 });
             }
             block.push(Op { step: Step::Pull { to: peer, from: m }, t: 0 });
@@ -5302,6 +5399,7 @@ struct Sweep {
     orphaned: usize,
     delta_too_large: usize,
     cursor_dropped: usize,
+    large_outside_left_alone: usize,
     replay_unfit: usize,
 }
 
@@ -5378,6 +5476,7 @@ fn sweep_listing(
                         t.orphaned += out.orphaned;
                         t.delta_too_large += out.delta_too_large;
                         t.cursor_dropped += out.cursor_dropped;
+                        t.large_outside_left_alone += out.large_outside_left_alone;
                         t.replay_unfit += out.replay_unfit;
                     }
                     // `IDEM_LIST=1`: each counted finding's schedule, by seed and track.
@@ -5423,8 +5522,8 @@ fn sweep_listing(
          member rewinds ({} of one member alone, {} widened to every member, {} not taken \
          on the home track; {} past a drop; refused: {} with no value at the target, {} \
          past a schema change; {} records removed, {} reopened), {} records orphaned; {} replay deltas \
-         too large for their page ({} cursors dropped, their position read again), {} replay \
-         pages unfit; in {:.1?}",
+         too large for their page ({} cursors dropped, their position read again; {} pages that met \
+         one outside the cursor's set and kept the cursor), {} replay pages unfit; in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -5459,6 +5558,7 @@ fn sweep_listing(
         totals.orphaned,
         totals.delta_too_large,
         totals.cursor_dropped,
+        totals.large_outside_left_alone,
         totals.replay_unfit,
         started.elapsed()
     );
@@ -5518,6 +5618,10 @@ fn assert_coverage(totals: &Sweep, seeds: u64) {
         (
             "replay deltas too large, the cursor dropped and the position read again",
             totals.cursor_dropped,
+        ),
+        (
+            "large changed records outside a replay's set left alone, the cursor kept",
+            totals.large_outside_left_alone,
         ),
         ("replay pages unfit, the whole-frame refusal", totals.replay_unfit),
         ("records offered past their window", totals.past_window_offered),
