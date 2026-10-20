@@ -5273,15 +5273,26 @@ async fn gate_send(
     GateAnswer { status, retry_after, replayed, text, body }
 }
 
-/// The gate window after an ordinary restart (Chris's ruling, the
-/// 503 split). B is restarted with SIGTERM, and from the moment its `/readyz` answers 200 it
-/// is sent a keyed insert and a `Decimal128`-`_id` insert, again and again, until each is
-/// taken. While B has not yet heard a live peer's facts block, each is answered `503
-/// peer_unheard`, `retry: wait`, with `Retry-After: 1` (the sync interval is 5 s here, so the
-/// window is wide), and **never `400`**: every member runs this build and says it carries
-/// records and can hold a decimal. The keyed request sent again with its key then gets its
-/// first application, once, and sent again after that its replay. Up to `RESTARTS` restarts,
-/// until the window has been met for both requests.
+/// The gate window after a member restarts twice within a sync interval.
+///
+/// A restarted member is renamed on each peer exactly once, which drops the facts block the
+/// peer held from the old process, and the peer then waits for the new process's block
+/// before it takes a keyed or `Decimal128`-`_id` request (ADR-238, ADR-242). Since ADR-247
+/// the peer asks for that block at once, so after a single restart the window is about one
+/// contact wide and a test cannot hold it open. It stays open by design in one case: the
+/// peer starts at most one exchange per member per sync interval, and an ask the interval
+/// holds becomes one trailing ask at the interval's end. So when B is restarted a second
+/// time within the sync interval of the first, A and C hold B's block dropped from the
+/// second rename until that trailing ask.
+///
+/// B is restarted twice in a row (each time waited ready), and from the second `/readyz` 200
+/// A and C are each sent a keyed insert and a `Decimal128`-`_id` insert, again and again,
+/// until each is taken. While the peer has not heard B's block, each answer is `503
+/// peer_unheard`, `retry: wait`, with `Retry-After: 1` (the sync interval is 5 s here, so
+/// the window is wide) and **never `400`**: every member runs this build and says it
+/// carries records and can hold a decimal. The keyed request sent again with its key then
+/// gets its first application, once, and sent again after that its replay. Up to `RESTARTS`
+/// double restarts, until the window has been met for both requests.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400() {
@@ -5290,88 +5301,112 @@ async fn a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_4
     const PATH: &str = "/v1/db/shop/coll/orders/docs";
     let client = reqwest::Client::new();
     let cluster = format!("{KEYED}\ndecimal128 = true");
-    let (_a, mut b, _c, t) =
+    let (a, mut b, c, t) =
         keyed_cluster_at(&client, "", &cluster, SYNC_SECS, serde_json::json!([])).await;
+    let peers = [(&a, &t[0]), (&c, &t[2])];
 
     let (mut keyed_waited, mut decimal_waited) = (0, 0);
     let mut rounds = 0;
+    let mut sent_bodies = Vec::new();
     for round in 0..RESTARTS {
         rounds += 1;
-        b.restart_with(&[]);
-        eventually("B to be ready again", || async {
-            client.get(b.url("/readyz")).send().await.is_ok_and(|r| r.status() == 200)
-        })
-        .await;
-        let key = format!("gate-window-{round:02}-6f1c0e52-8a1d");
-        let body = format!(r#"{{"v":"gate-window-{round}"}}"#);
-        let decimal = format!(r#"{{"_id":{{"$numberDecimal":"{round}.5"}}}}"#);
-        let (mut first, mut decimal_done) = (None, false);
+        // Twice in a row: the second rename lands within the sync interval of the ask the
+        // first one made, so that ask's answer is the trailing one at the interval's end.
+        for _ in 0..2 {
+            b.restart_with(&[]);
+            eventually("B to be ready again", || async {
+                client.get(b.url("/readyz")).send().await.is_ok_and(|r| r.status() == 200)
+            })
+            .await;
+        }
+        // Per peer: the keyed request (its key, its body, its first answer), whether the
+        // decimal one is taken.
+        let mut keyed: Vec<(String, String, Option<String>)> = Vec::new();
+        for index in 0..peers.len() {
+            let key = format!("gate-window-{round:02}-{index}-6f1c0e52-8a1d");
+            let body = format!(r#"{{"v":"gate-window-{round}-{index}"}}"#);
+            sent_bodies.push(body.clone());
+            keyed.push((key, body, None));
+        }
+        let decimals: Vec<String> = (0..peers.len())
+            .map(|index| format!(r#"{{"_id":{{"$numberDecimal":"{round}.{index}5"}}}}"#))
+            .collect();
+        let mut decimal_done = vec![false; peers.len()];
         let deadline = std::time::Instant::now() + patience();
-        while first.is_none() || !decimal_done {
-            assert!(std::time::Instant::now() < deadline, "round {round}: B never took both");
-            let mut probes = vec![(true, body.as_str())];
-            if !decimal_done {
-                probes.push((false, decimal.as_str()));
-            }
-            for (keyed, sent) in probes {
-                if keyed && first.is_some() {
-                    continue;
+        while keyed.iter().any(|k| k.2.is_none()) || decimal_done.contains(&false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "round {round}: B's peers never took both"
+            );
+            for (index, (node, token)) in peers.iter().enumerate() {
+                let mut probes = Vec::new();
+                if keyed[index].2.is_none() {
+                    probes.push((true, keyed[index].1.clone(), Some(keyed[index].0.clone())));
                 }
-                let answer =
-                    gate_send(&client, &b, &t[1], PATH, sent, keyed.then_some(&*key)).await;
-                match answer.status {
-                    200 if keyed => {
-                        assert!(!answer.replayed, "round {round}: the first application");
-                        first = Some(answer.text);
-                    }
-                    200 => decimal_done = true,
-                    503 => {
-                        assert_eq!(answer.body["error"], "peer_unheard", "{}", answer.text);
-                        assert_eq!(answer.body["retry"], "wait", "{}", answer.text);
-                        assert_eq!(
-                            answer.retry_after.as_deref(),
-                            Some("1"),
-                            "a fixed second: {}",
-                            answer.text
-                        );
-                        assert!(answer.text.contains("transient"), "{}", answer.text);
-                        if keyed {
-                            keyed_waited += 1;
-                        } else {
-                            decimal_waited += 1;
+                if !decimal_done[index] {
+                    probes.push((false, decimals[index].clone(), None));
+                }
+                for (is_keyed, sent, key) in probes {
+                    let answer = gate_send(&client, node, token, PATH, &sent, key.as_deref()).await;
+                    match answer.status {
+                        200 if is_keyed => {
+                            assert!(!answer.replayed, "round {round}: the first application");
+                            keyed[index].2 = Some(answer.text);
                         }
+                        200 => decimal_done[index] = true,
+                        503 => {
+                            assert_eq!(answer.body["error"], "peer_unheard", "{}", answer.text);
+                            assert_eq!(answer.body["retry"], "wait", "{}", answer.text);
+                            assert_eq!(
+                                answer.retry_after.as_deref(),
+                                Some("1"),
+                                "a fixed second: {}",
+                                answer.text
+                            );
+                            assert!(answer.text.contains("transient"), "{}", answer.text);
+                            if is_keyed {
+                                keyed_waited += 1;
+                            } else {
+                                decimal_waited += 1;
+                            }
+                        }
+                        other => panic!(
+                            "round {round}: {} answered {other}, never 400 nor anything but \
+                             200 or 503 peer_unheard: {}",
+                            node.name, answer.text
+                        ),
                     }
-                    other => panic!(
-                        "round {round}: a ready member answered {other}, never 400 nor anything \
-                         but 200 or 503 peer_unheard: {}",
-                        answer.text
-                    ),
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let again = gate_send(&client, &b, &t[1], PATH, &body, Some(&key)).await;
-        assert_eq!(again.status, 200, "{}", again.text);
-        assert!(again.replayed, "round {round}: sent again, the replay: {}", again.text);
-        assert_eq!(Some(again.text), first, "round {round}: the first answer");
+        for (index, (node, token)) in peers.iter().enumerate() {
+            let (key, body, first) = &keyed[index];
+            let again = gate_send(&client, node, token, PATH, body, Some(key)).await;
+            assert_eq!(again.status, 200, "{}", again.text);
+            assert!(again.replayed, "round {round}: sent again, the replay: {}", again.text);
+            assert_eq!(Some(again.text), *first, "round {round}: the first answer");
+        }
         if keyed_waited > 0 && decimal_waited > 0 {
             break;
         }
     }
     eprintln!(
-        "gate window: {rounds} restart(s), {keyed_waited} keyed and {decimal_waited} decimal \
-         answers 503 peer_unheard"
+        "gate window: {rounds} double restart(s), {keyed_waited} keyed and {decimal_waited} \
+         decimal answers 503 peer_unheard"
     );
     assert!(
         keyed_waited > 0 && decimal_waited > 0,
-        "no restart in {RESTARTS} met the window (keyed {keyed_waited}, decimal \
+        "no double restart in {RESTARTS} met the window (keyed {keyed_waited}, decimal \
          {decimal_waited}): the test proved nothing"
     );
-    // Each keyed insert landed once, wherever it was answered from.
-    for round in 0..RESTARTS {
-        let filter = serde_json::json!({ "v": format!("gate-window-{round}") });
-        let held = orders_where(&client, &b, &t[1], filter).await;
-        assert!(matches!(held, Some(0 | 1)), "round {round}: {held:?}");
+    // Each keyed insert landed exactly once, wherever it was answered from.
+    for body in &sent_bodies {
+        let filter: serde_json::Value = serde_json::from_str(body).unwrap();
+        eventually("each keyed insert to be held once on B", || async {
+            orders_where(&client, &b, &t[1], filter.clone()).await == Some(1)
+        })
+        .await;
     }
 }
 
