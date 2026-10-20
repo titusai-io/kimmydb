@@ -29208,8 +29208,7 @@ reset or restored identity that peers keep only as page state never converge to 
 ADR. The mutation harness (`scripts/idempotency-mutants/`, run under bash) applies each mutant to an exported tree and
 runs its suites, the model's among them; [every mutation row of idempotency keys, run again together on the merged
 head, is listed
-with the test that kills it](adr-240-mutation-rows.md): 313 rows, 297 killed, 5 equivalent and 3 superseded, and the 8
-that G repeated from C run once. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
+with the test that kills it](adr-240-mutation-rows.md): 421 rows, 392 killed, 6 equivalent, 5 superseded and 10 retired, the 8 that G repeated from C run once, and 0 survived. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
 path, a record outliving a drop (the purge, a database drop, a late drop, a resume across a drop, a delete by id whose
 tombstone a drop took) and L1, a contested record refused on every path and between chunks, a past-window record
 refused on store, the coalesced barrier, the fsync and write faults, restarts, the multi-chunk record, the lookahead

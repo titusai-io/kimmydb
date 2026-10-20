@@ -23,9 +23,9 @@ MODEL = [("kimmy-storage", "--lib", "idempotency", "no")]
 # the unit tests that kill it elsewhere (P's page delta rows: its own table has those).
 MODEL_ONLY = [("kimmy-storage", "--lib", "idempotency_model_tests", "no")]
 
-# The gate split (the gate window; Chris's ruling): a live member not heard from yet is
+# The gate split (the gate window): a live member not heard from yet is
 # `503 peer_unheard` with `Retry-After`, a held block that says no is `400`, and the block
-# that says no decides. Each row names the tests that must fail (`kills`), and `check-kills`
+# that says no decides. Each row names the tests that must fail (`kills`); the harness
 # reads a row's log for them.
 GATE_UNIT = ("kimmy-cluster", "--lib", "idempotency::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides", "no")
 DECIMAL_UNIT = ("kimmy-cluster", "--lib", "decimal128::tests::a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides", "no")
@@ -715,9 +715,9 @@ ROWS = [
         ],
         "suites": MODEL,
     },
-    # stores-a-record-with-an-earlier-entry: retired as equivalent under ruling A. Storing
+    # stores-a-record-with-an-earlier-entry: retired as equivalent now that a record outlives a drop of its collection. Storing
     # a frame's record with an earlier entry of its collection than the one at its row puts
-    # the record on the receiver before its effect, which ruling A allows (I2 is effect =>
+    # the record on the receiver before its effect, which that change allows (I2 is effect =>
     # record), so the mutant changes no observable behaviour; its rationale, a record judged
     # by the life of a drop between the two runs, went with the life rule.
     {
