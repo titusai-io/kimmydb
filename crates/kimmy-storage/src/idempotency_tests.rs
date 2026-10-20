@@ -2544,9 +2544,14 @@ fn a_row_whose_record_is_gone_ships_nothing() {
         idempotency::records_for_coverage(&txn, &nothing, &servable, &servable).unwrap();
     assert_eq!((shipped.len(), unanchored), (1, 0), "F2 and F3 pass the rows over: {shipped:?}");
     assert_eq!((shipped[0].scope, shipped[0].carrying), (k.scope, Some(at)));
-    let delta =
-        idempotency::records_changed_since(&txn, base, &|_| true, idempotency::DeltaBudget::PAGE)
-            .unwrap();
+    let delta = idempotency::records_changed_since(
+        &txn,
+        base,
+        &|_| true,
+        &|_, _| true,
+        idempotency::DeltaBudget::PAGE,
+    )
+    .unwrap();
     assert!(delta.records.iter().all(|r| r.scope != gone), "{:?}", delta.records);
     assert_eq!(delta.stopped_at, None, "read to the end, without an error");
     let (page, more) =

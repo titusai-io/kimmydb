@@ -250,10 +250,22 @@ impl Engine {
         let records = self.replay_records_in(&txn, &ids, from, cursor.through.max(through))?;
         let named: HashSet<u64> = ids.iter().map(|id| id.0).collect();
         let standing = |id: CollectionId| named.contains(&id.0);
+        let in_set: HashSet<u64> = cursor.collections.iter().map(|id| id.0).collect();
+        // The delta is of the cursor's set alone (its collections, `first` through its
+        // end): a record outside it, changed or new, is read with the page's own
+        // records, and so neither crosses in the delta nor is refused by it.
+        let of_the_set = |id: CollectionId, raw: &[u8]| {
+            in_set.contains(&id.0)
+                && IdempotencyRecord::decode(raw)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.first.hlc <= cursor.through)
+        };
         let delta = records_changed_since(
             &txn,
             cursor.base.key,
             &standing,
+            &of_the_set,
             DeltaBudget { bytes: changed_bytes, rows: RECORD_DELTA_ROWS },
         )?;
         out.changed = delta
@@ -270,7 +282,6 @@ impl Engine {
             .collect();
         let changed: HashSet<(u64, [u8; 32])> =
             out.changed.iter().map(|record| (record.collection.0, record.scope.0)).collect();
-        let in_set: HashSet<u64> = cursor.collections.iter().map(|id| id.0).collect();
         for record in records {
             // Of the cursor's set (its collections, `first` through its end), at or
             // before its key, and unchanged since its base.
@@ -538,6 +549,46 @@ mod tests {
         };
         plant(&engine, &a, 2, at(5), at(15));
         let refused = engine.replay_page_records(&[a.id], from, through, Some(&cursor), 1);
+        assert!(
+            matches!(&refused, Err(crate::StorageError::SnapshotRowTooLarge { .. })),
+            "{refused:?}"
+        );
+    }
+
+    /// The delta is of the cursor's set alone: a record changed or new since the base
+    /// whose collection the cursor did not name, or whose `first` lies past its end, is
+    /// no part of the delta and is never refused by it, however large; it is read with
+    /// the page's own records. A record of the set that changed is refused as before.
+    #[test]
+    fn a_record_outside_the_cursors_set_is_no_part_of_its_delta_and_is_never_refused() {
+        let (engine, a, b, _dir) = open();
+        let (from, through) = (at(10).hlc, at(20).hlc);
+        plant(&engine, &a, 1, at(5), at(15));
+        let cut = engine.replay_page_records(&[a.id], from, through, None, 1 << 20).unwrap();
+        let cursor = ReplayRecords {
+            at: from,
+            through,
+            collections: vec![a.id],
+            collection: a.id,
+            scope: scope(9),
+            base: cut.base,
+        };
+        plant(&engine, &a, 2, at(25), at(30)); // new, its first past the cursor's end
+        plant(&engine, &b, 3, at(5), at(15)); // new, in a collection the cursor did not name
+        // A budget no record fits: every record in the delta would be refused.
+        let read = engine
+            .replay_page_records(&[a.id, b.id], from, at(30).hlc, Some(&cursor), 1)
+            .expect("neither record is the delta's, so none is refused");
+        assert!(read.resumed && read.changed_whole);
+        assert!(read.changed.is_empty(), "{:?}", keys(&read.changed));
+        let mut rest = keys(&read.records);
+        rest.sort();
+        let mut want = vec![(a.id.0, 2), (b.id.0, 3)];
+        want.sort();
+        assert_eq!(rest, want, "both are read with the page's own records");
+        // One of the set, changed since, is refused by name.
+        plant(&engine, &a, 4, at(5), at(15));
+        let refused = engine.replay_page_records(&[a.id, b.id], from, at(30).hlc, Some(&cursor), 1);
         assert!(
             matches!(&refused, Err(crate::StorageError::SnapshotRowTooLarge { .. })),
             "{refused:?}"

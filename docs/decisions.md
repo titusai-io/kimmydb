@@ -28852,9 +28852,13 @@ with it, and not be offered while any member could carry the write without it.
      entry, or one record, or the F3 records, larger than a frame by itself) is logged at `WARN` and counted in
      `kimmy_idempotency_records_unfit_total{path}`. **A record the change log names as changed since a cursor's base
      that is larger than the delta's half of a frame** (refused by name, as a snapshot page's delta refuses one)
-     **starts the position's records over**, from a base above the change, logged at `INFO`: the record is then no
-     change to that base and crosses as an ordinary record on a page of records alone, which holds one up to a whole
-     frame, and what the earlier pages at the position sent is sent again. **Only a record larger than a whole frame
+     **starts the position's records over**, from a base above the change, logged at `WARN` and counted in
+     `kimmy_idempotency_records_unfit_total{path="replay"}`: the record is then no change to that base and crosses as
+     an ordinary record on a page of records alone, which holds one up to a whole frame, and what the earlier pages
+     at the position sent is sent again. **The delta judges only the cursor's set** (its collections, `first`
+     through its end): a record outside it, new or changed, is read with the page's own records and neither crosses
+     in the delta nor is refused by it, so a stream of new large records cannot keep a replay from finishing.
+     **Only a record larger than a whole frame
      stalls that replay** (the class of a document no page can carry): the page that reaches it carries nothing, the
      contact ends in step, and the replay of that peer's own origin stays at its position, logged at `WARN` and
      counted, until the record expires with its window. **Every other page
@@ -28904,9 +28908,13 @@ with it, and not be offered while any member could carry the write without it.
      requester stored ahead of it in this contact. A contact that ends between the two (the sender stopped, the
      connection dropped) only stored records early: the next contact is sent them ahead again, asks again, and
      takes the entry, since nothing was covered. **Mixed versions:** a 0.51 sender ignores the field and never
-     sends records ahead. A 0.51 requester refuses the empty answer, and its round fails just as it would already
-     stall on that entry (`fits: 0`); and records exist only once every member runs 0.52 and the switch is set,
-     since keyed writes are taken only then.
+     sends records ahead. **Records go ahead only to an ask that can read them**: a pull that asks for a partial
+     window or holds nothing. A 0.51 pull refuses the empty answer, and its round fails just as it would already
+     stall on that entry (`fits: 0`). A 0.51 member's replay of its own origin asks with what it holds and no
+     partial window, and would misread the answer as an empty page and step past the entry, never reading it
+     back; it is answered `fits: 0` as before, which it leaves alone, so it stalls on that entry and does not
+     skip it. Records exist only once every member runs 0.52 and the switch is set, since keyed writes are taken
+     only then.
    - **Snapshots carry records.** Per collection, a records phase in pages of up to 512 goes ahead of its documents; a
      page ends at the boundary into a collection with records and never holds one collection's records after another's
      documents; `SnapshotPage` gains `records` and `SnapshotCursor` a records position, which an older receiver drops,
@@ -29210,7 +29218,7 @@ reset or restored identity that peers keep only as page state never converge to 
 ADR. The mutation harness (`scripts/idempotency-mutants/`, run under bash) applies each mutant to an exported tree and
 runs its suites, the model's among them; [every mutation row of idempotency keys, run again together on the merged
 head, is listed
-with the test that kills it](adr-240-mutation-rows.md): 422 rows, 393 killed, 6 equivalent, 5 superseded and 10 retired, the 8 that G repeated from C run once, and 0 survived. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
+with the test that kills it](adr-240-mutation-rows.md): 435 rows, 406 killed, 6 equivalent, 5 superseded and 10 retired, the 8 that G repeated from C run once, and 0 survived. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
 path, a record outliving a drop (the purge, a database drop, a late drop, a resume across a drop, a delete by id whose
 tombstone a drop took) and L1, a contested record refused on every path and between chunks, a past-window record
 refused on store, the coalesced barrier, the fsync and write faults, restarts, the multi-chunk record, the lookahead

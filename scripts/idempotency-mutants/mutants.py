@@ -45,6 +45,8 @@ MOVED_CLOCK_UNIT = ("kimmy-cluster", "--lib", "membership::tests::a_node_that_mo
 MOVED_BLOCK_UNIT = ("kimmy-cluster", "--lib", "membership::tests::a_node_that_moved_address_keeps_the_block_of_its_new_address_when_the_old_one_is_down", "no")
 APPLIED_MARK_UNIT = ("kimmy-cluster", "--lib", "peers::tests::a_mark_collected_before_a_drop_is_ignored_when_the_round_applies_it", "no")
 
+REPLAY_TESTS = ("kimmy-cluster", "--lib", "transport::replay_tests", "no")
+
 GATE_SPLIT = [
     {
         "name": "gs-unheard-counted-as-refusing",
@@ -962,6 +964,70 @@ ROWS = [
             ("kimmy-cluster", "--test idempotency", "c9_a_live_member_that_does_not_carry_records_closes_the_gate", "no"),
         ],
         "kills": ["c9_a_live_member_that_does_not_carry_records_closes_the_gate"],
+    },
+    {
+        "name": "records-ahead-to-an-ask-that-cannot-read-them",
+        "group": "elsewhere",
+        "doc": "Records ahead of an entry go to any ask, a 0.51 member's replay of its own origin included (it steps past the entry)",
+        "patches": [
+            ("crates/kimmy-cluster/src/transport.rs",
+             "                                        .filter(|_| partial || held.is_none())\n",
+             ""),
+        ],
+        "suites": [REPLAY_TESTS],
+        "kills": ["a_051_members_replay_is_not_answered_without_reading_back_an_entry_whose_record_overfills_the_frame"],
+    },
+    {
+        "name": "replay-delta-not-limited-to-the-cursors-set",
+        "group": "elsewhere",
+        "doc": "A replay's delta takes (and refuses) any changed record of the page's collections, not only the cursor's set",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency_replay.rs",
+             "            &of_the_set,\n",
+             "            &|_, _| true,\n"),
+        ],
+        "suites": [REPLAY_TESTS, ("kimmy-storage", "--lib", "idempotency::replay::tests", "no")],
+        "kills": ["a_stream_of_large_new_records_outside_a_replays_set_does_not_restart_its_position",
+                  "a_record_outside_the_cursors_set_is_no_part_of_its_delta_and_is_never_refused"],
+    },
+    {
+        "name": "replay-restart-uncounted",
+        "group": "elsewhere",
+        "doc": "A replay position's restart on a changed record the delta refuses is not counted in the unfit series",
+        "patches": [
+            ("crates/kimmy-cluster/src/transport.rs",
+             "        Err(kimmy_storage::StorageError::SnapshotRowTooLarge { what, bytes, room }) => {\n            records_unfit().bump(UnfitPath::Replay);\n",
+             "        Err(kimmy_storage::StorageError::SnapshotRowTooLarge { what, bytes, room }) => {\n"),
+        ],
+        "suites": [REPLAY_TESTS],
+        "kills": ["a_changed_record_too_large_for_an_inbound_replays_delta_starts_its_position_over",
+                  "a_changed_record_too_large_for_an_outbound_replays_delta_starts_its_position_over"],
+    },
+    {
+        "name": "records-left-out-whatever-the-windows-first-entry",
+        "group": "elsewhere",
+        "doc": "A window asked again after records ahead leaves records out whichever entry is first, not only the one named",
+        "patches": [
+            ("crates/kimmy-cluster/src/transport.rs",
+             ".filter(|s| Some(s.hlc) == ahead_of)",
+             ".filter(|_| ahead_of.is_some())"),
+        ],
+        "suites": [REPLAY_TESTS],
+        "kills": ["an_ask_naming_an_entry_that_is_not_the_windows_first_leaves_no_records_out",
+                  "records_are_left_out_only_when_the_windows_first_entry_is_the_one_named"],
+    },
+    {
+        "name": "records-ahead-without-the-size-check",
+        "group": "elsewhere",
+        "doc": "Records ahead of an entry that together overfill a frame are written anyway, not answered fits: 0 with the WARN and the count",
+        "patches": [
+            ("crates/kimmy-cluster/src/transport.rs",
+             "    (bytes <= entry_budget()).then_some((first.hlc, ahead))\n",
+             "    Some((first.hlc, ahead)).filter(|_| bytes > 0)\n"),
+        ],
+        "suites": [REPLAY_TESTS],
+        "kills": ["records_ahead_that_overfill_a_frame_by_themselves_are_counted_and_answered_fits_zero",
+                  "records_that_together_overfill_a_frame_are_not_sent_ahead"],
     },
 ] + GATE_SPLIT
 

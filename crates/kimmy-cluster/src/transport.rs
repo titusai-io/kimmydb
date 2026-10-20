@@ -367,9 +367,28 @@ impl UnfitPath {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What this thread has counted, for a test that must not see another test's
+    /// count in the process-wide cells.
+    static COUNTED_ON_THIS_THREAD: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
 impl RecordsUnfit {
     pub(crate) fn bump(&self, path: UnfitPath) {
         self.cells[path as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        COUNTED_ON_THIS_THREAD.with(|counted| {
+            let mut now = counted.get();
+            now[path as usize] += 1;
+            counted.set(now);
+        });
+    }
+
+    /// The count for one path made on this thread, since it started.
+    #[cfg(test)]
+    pub(crate) fn counted_on_this_thread(&self, path: UnfitPath) -> u64 {
+        COUNTED_ON_THIS_THREAD.with(|counted| counted.get()[path as usize])
     }
 
     /// The count for one path, since start.
@@ -550,9 +569,14 @@ fn cut_replay_page_from(
         // a whole page. What the earlier pages at the position sent is sent again.
         // Only a record larger than a whole page still cannot cross, and that is
         // said and counted where the page is cut, as every page that cannot carry
-        // what it must.
+        // what it must. The restart itself is said at `WARN` and counted as well
+        // (`kimmy_idempotency_records_unfit_total{path="replay"}`): the delta judges
+        // only records of the cursor's set, so a restart is a record of the set
+        // rewritten as a large one, and a replay that restarts at every contact would
+        // otherwise never be seen.
         Err(kimmy_storage::StorageError::SnapshotRowTooLarge { what, bytes, room }) => {
-            info!(
+            records_unfit().bump(UnfitPath::Replay);
+            warn!(
                 %peer,
                 ?from,
                 what = %what,
@@ -1905,9 +1929,16 @@ where
                                 // the one at its own stamp included, ahead of it: an
                                 // answer of records alone that covers nothing, its
                                 // `scanned_to` naming the entry, which the peer asks
-                                // again for in this contact without them.
+                                // again for in this contact without them. Only to an ask
+                                // that reads them: a pull (`partial` as it holds, or no
+                                // `held` at all). A 0.51 member's replay of its own origin
+                                // asks with `held` and no `partial`, and reads such an
+                                // answer as an empty page and steps past the entry, so it
+                                // gets `fits: 0` below, which it leaves alone: it stalls,
+                                // and does not skip.
                                 if let Some((ahead_of, records)) =
                                     records_ahead(&window.entries, &records, unanchored)
+                                        .filter(|_| partial || held.is_none())
                                 {
                                     info!(
                                         records = records.len(),

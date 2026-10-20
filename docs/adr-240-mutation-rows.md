@@ -544,7 +544,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | gs-wait-not-rounded-up | The wait truncates a fractional sync interval instead of rounding it up | superseded | | superseded by gs-wait-longer and gs-wait-zero: the wait of a refusal for a peer not heard from yet is a fixed second now, with no sync interval to round up |
 | gs-wait-may-be-zero | The wait of a sub-second sync interval is 0 | superseded | | superseded by gs-wait-longer and gs-wait-zero: the wait of a refusal for a peer not heard from yet is a fixed second now, with no sync interval to round up |
 
-**25 rows: 23 killed, 0 equivalent, 2 superseded, 0 retired, 0 run once elsewhere, 0 survived.**
+**29 rows: 27 killed, 0 equivalent, 2 superseded, 0 retired, 0 run once elsewhere, 0 survived.**
 
 ## The review of the fixes (V)
 
@@ -572,8 +572,13 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | large-id-refusal-names-the-whole-id | The refusal of a document whose `_id` is too large to cross names the id whole (its Debug form) | killed | `the_refusal_of_a_large_id_names_it_by_its_length_and_prefix` | lets the fault and the `WARN` carry megabytes of `_id` every round |
 | keyed-delete-drop-case-by-last | A keyed delete's drop case is judged by the record's `last`, not its `first` | killed | `a_keyed_delete_of_two_merged_attempts_replays_after_a_drop_between_them` | lets a retry run afresh and answer `{"deleted": 0}` where a drop fell between two merged attempts |
 | snapshot-refusal-said-every-round | The warning of a refused snapshot row is due every time, not once per row per interval | killed | `said_once::tests::a_subject_is_said_once_per_interval` | lets the refusal of one row log at `WARN` every round |
+| records-ahead-to-an-ask-that-cannot-read-them | Records ahead of an entry go to any ask, a 0.51 member's replay of its own origin included, which reads the answer as an empty page and steps past the entry. | killed | `a_051_members_replay_is_not_answered_without_reading_back_an_entry_whose_record_overfills_the_frame` | |
+| replay-delta-not-limited-to-the-cursors-set | A replay's records delta takes, and refuses when too large, any changed record of the page's collections, not only one of the cursor's set. | killed | `a_stream_of_large_new_records_outside_a_replays_set_does_not_restart_its_position`, `a_record_outside_the_cursors_set_is_no_part_of_its_delta_and_is_never_refused` | |
+| replay-restart-uncounted | A replay position that starts over on a changed record the delta refuses is not counted in `kimmy_idempotency_records_unfit_total{path="replay"}`. | killed | `a_changed_record_too_large_for_an_inbound_replays_delta_starts_its_position_over`, `a_changed_record_too_large_for_an_outbound_replays_delta_starts_its_position_over` | |
+| records-left-out-whatever-the-windows-first-entry | A window asked again after records ahead leaves records out whichever entry is first, so an entry that is not the one named crosses without records that were never sent. | killed | `an_ask_naming_an_entry_that_is_not_the_windows_first_leaves_no_records_out`, `records_are_left_out_only_when_the_windows_first_entry_is_the_one_named` | |
+| records-ahead-without-the-size-check | Records ahead of an entry that together overfill a frame are sent anyway, not answered `fits: 0` with the `WARN` and the count. | killed | `records_ahead_that_overfill_a_frame_by_themselves_are_counted_and_answered_fits_zero`, `records_that_together_overfill_a_frame_are_not_sent_ahead` | |
 
-**16 rows: 15 killed, 1 equivalent, 0 superseded, 0 retired, 0 run once elsewhere, 0 survived.**
+**25 rows: 24 killed, 1 equivalent, 0 superseded, 0 retired, 0 run once elsewhere, 0 survived.**
 
 ## Totals
 
@@ -592,8 +597,8 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | The fingerprint's golden vectors (X) | 11 | 11 | 0 | 0 | 0 | 0 | 0 |
 | The page byte budget and the guards of the records base (B) | 29 | 29 | 0 | 0 | 0 | 0 | 0 |
 | A replay's delta too large for its page (Z) | 8 | 8 | 0 | 0 | 0 | 0 | 0 |
-| The gate split (GS) | 25 | 23 | 0 | 2 | 0 | 0 | 0 |
-| The review of the fixes (V) | 16 | 15 | 1 | 0 | 0 | 0 | 0 |
-| **All** | **422** | **393** | **6** | **5** | **10** | **8** | **0** |
+| The gate split (GS) | 29 | 27 | 0 | 2 | 0 | 0 | 0 |
+| The review of the fixes (V) | 25 | 24 | 1 | 0 | 0 | 0 | 0 |
+| **All** | **435** | **406** | **6** | **5** | **10** | **8** | **0** |
 
-Of the 393 rows killed, 386 were killed by their own suites (2 of them by a hang, with the tests that failed before it; 1 by the memory guard, a test process killed past its RSS limit) and 7 by the wider suites. 6 rows are equivalent, each with its argument in its Notes; 5 are superseded and 10 retired, each saying by what; 8 repeat another row's edit and test and ran once, as it; and 0 survived.
+Of the 406 rows killed, 399 were killed by their own suites (2 of them by a hang, with the tests that failed before it; 1 by the memory guard, a test process killed past its RSS limit) and 7 by the wider suites. 6 rows are equivalent, each with its argument in its Notes; 5 are superseded and 10 retired, each saying by what; 8 repeat another row's edit and test and ran once, as it; and 0 survived.
