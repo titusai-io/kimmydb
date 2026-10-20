@@ -5502,7 +5502,10 @@ fn generated_schedules_long() {
 
 /// The long run's coverage: every path the generator's bias exists for is reached at
 /// least `IDEM_MIN_EVENTS` times (default 20) per 1,000 seeds, scaled to the run, so a
-/// later change to the generator cannot lose one without the run saying so.
+/// later change to the generator cannot lose one without the run saying so. The floors
+/// are enforced only for a run of at least 1,000 seeds: a shorter run expects too few
+/// events of the rarest paths to tell a lost path from chance, and prints the counts
+/// without failing.
 fn assert_coverage(totals: &Sweep, seeds: u64) {
     let per_thousand = env_u64("IDEM_MIN_EVENTS", 20);
     let floor = (per_thousand * seeds).div_ceil(1000) as usize;
@@ -5530,6 +5533,12 @@ fn assert_coverage(totals: &Sweep, seeds: u64) {
         ),
         ("records orphaned", totals.orphaned),
     ];
+    if seeds < 1000 {
+        for (what, n) in &events {
+            eprintln!("coverage ({seeds} seeds, floors not enforced below 1,000): {what}: {n}");
+        }
+        return;
+    }
     let short: Vec<String> =
         events.iter().filter(|(_, n)| *n < floor).map(|(what, n)| format!("{what}: {n}")).collect();
     assert!(
