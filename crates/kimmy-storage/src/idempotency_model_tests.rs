@@ -141,7 +141,8 @@
 //!   a record missing at quiescence where a document holds K). Fixed by records travelling
 //!   with coverage. **Fails every run** (generated and named) by default; `IDEM_LENIENT=1`
 //!   counts it instead, for a tree without that fix.
-//! - **KR**, a contested key completed on (see I8): fails every run.
+//! - **Contested completion**: a request completed on a record whose merged `first` is
+//!   another request's (see I8): fails every run.
 //! - **S1**: a record at quiescence that the merged record dominates, or none where no
 //!   document holds the key: a record state carried only by entries that lost where the
 //!   member pulled them from, or by a record-only `done` (G8's ruled residual). Harmless
@@ -158,7 +159,7 @@
 //! `contested` flag, and the rows `row_d2_*`, `row_d3_*` and `row_kr_*` hold the engine to
 //! it.
 //!
-//! **Findings RW1 and BR1** (2026-10-18, outside the idempotency code, fixed on main by #209 and
+//! **Two findings outside the idempotency code** (2026-10-18, fixed on main by #209 and
 //! #211): a rewind after a retention pass lowered the version vectors below the writes
 //! retention had collected, and a restore counted the rows a page left as held state as
 //! covered. Either left a member's coverage past writes it never took, and their records
@@ -613,7 +614,7 @@ struct Backup {
     bytes: Vec<u8>,
     fps: Vec<((u8, u8), BTreeSet<u8>)>,
     /// The member's witnessed vector when the backup was taken: a restore of it claims
-    /// no more of any origin (finding BR1).
+    /// no more of any origin (a restore once counted a page's held rows as covered; #211).
     witnessed: kimmy_core::VersionVector,
 }
 
@@ -2437,7 +2438,7 @@ impl World {
         if let Some(q) = first_of_another {
             self.out.kr += 1;
             let s = format!(
-                "KR: r{r} completed on {} on a record whose first {} is r{q}'s",
+                "CONTESTED: r{r} completed on {} on a record whose first {} is r{q}'s",
                 LETTERS[m],
                 self.stamp(first)
             );
@@ -2685,7 +2686,7 @@ impl World {
         self.open(m)?;
         self.note(format!("{} restored from its backup", LETTERS[m]));
         // Coverage after a restore: never more of an origin than the store held when
-        // the backup was taken. Finding BR1 (fixed by #211): a restore counted the rows a
+        // the backup was taken. Fixed by #211: a restore counted the rows a
         // page left as held state as covered, so the member's pulls started past writes
         // it never took, their records with them.
         // Its own origin aside: what a member wrote itself is in position, and the
@@ -2695,8 +2696,7 @@ impl World {
             let then = backup.witnessed.get(origin);
             if origin != node && at > then {
                 let s = format!(
-                    "{}'s restore claims {}'s origin through {}, past the {} its backup held \
-                     (BR1)",
+                    "{}'s restore claims {}'s origin through {}, past the {} its backup held",
                     LETTERS[m],
                     self.label(origin),
                     self.hlc(at),
@@ -3640,8 +3640,8 @@ impl World {
     /// holds request `r` (its effect, under any origin and in any life) holds a live
     /// record under `r`'s key, unless `r`'s memory ended or a rewind left its writes bare
     /// by design. The relay class where it happens, not only at quiescence: a member
-    /// whose coverage passed an effect's entry without its record (as finding BR1's
-    /// restore did, before #211) holds it bare from the step that brings it.
+    /// whose coverage passed an effect's entry without its record (as a restore that
+    /// counted a page's held rows as covered did, before #211) holds it bare from the step that brings it.
     fn check_effects(&mut self) -> Res<()> {
         let mut bare = Vec::new();
         for m in 0..self.n() {
@@ -5385,7 +5385,9 @@ fn sweep_listing(
                         && out.relay + out.s1 + out.kr > 0
                     {
                         for n in out.notes.iter().filter(|n| {
-                            n.contains("finding:") || n.contains("RELAY:") || n.contains("KR:")
+                            n.contains("finding:")
+                                || n.contains("RELAY:")
+                                || n.contains("CONTESTED:")
                         }) {
                             eprintln!("FINDING seed {seed} {track:?}: {n}");
                         }
@@ -5411,7 +5413,7 @@ fn sweep_listing(
     let totals = totals.into_inner().unwrap();
     eprintln!(
         "idempotency model: seeds {seeds:?} x 2 tracks, len {len}: {} schedules, {} steps ({} \
-         between commits), {} replays, {} resumes, {} crashes, {} relay, {} S1, {} KR; drops \
+         between commits), {} replays, {} resumes, {} crashes, {} relay, {} S1, {} contested completions; drops \
          of orders: {} schedules with one during a call, {} with an `$inc` written on both \
          sides of one, {} with one call's writes on both sides; {} I8 checks, {} counters \
          left at or above a merged first, {} home runs without exact I5; the contested \
@@ -6562,11 +6564,11 @@ fn row_a_rewound_member_that_rejoins_a_cluster_holding_the_undone_write_is_outsi
     assert!(out.undone_returned >= 1, "the undone write did not come back:\n{shown}");
 }
 
-/// Finding RW1 (fixed by #209), minimised from the long run's seed 1000688: B drops
-/// `items`; B's retention pass collects its own drop entry; B rewinds to a moment after
-/// it (nothing discarded). A, which never heard of the drop, inserts into `items`. The
-/// rewind keeps B's vectors at what retention collected, so A takes the drop and every
-/// member ends with the same `items`.
+/// A rewind below what retention collected (fixed by #209), minimised from the long run's
+/// seed 1000688: B drops `items`; B's retention pass collects its own drop entry; B rewinds
+/// to a moment after it (nothing discarded). A, which never heard of the drop, inserts into
+/// `items`. The rewind keeps B's vectors at what retention collected, so A takes the drop
+/// and every member ends with the same `items`.
 #[test]
 fn row_rw1_a_rewind_after_retention_keeps_the_members_collected_writes() {
     row(

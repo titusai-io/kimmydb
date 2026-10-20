@@ -9,11 +9,10 @@ PYTHONDONTWRITEBYTECODE=1.
 
 **No finding is open**, so every failure is OTHER, a finding to report at once.
 
-RW1 (a rewind after retention lowered the version vectors
-below collected writes) and BR1 (a restore counted a page's held rows as covered) were
-fixed on main by #209 and #211; their checks stay in the model (`row_rw1_*`, and the
-restore check, whose detail ends `(BR1)`), so a failure that matches either is a
-regression, and OTHER. A new open finding, interim until its fix is on main, adds its signature to `KNOWN` with
+A rewind after retention that lowered the version vectors below collected writes, and a
+restore that counted a page's held rows as covered, were fixed on main by #209 and #211;
+their checks stay in the model (`row_rw1_*`, and the restore check, whose detail says
+`restore claims`), so a failure that matches either is a regression, and OTHER. A new open finding, interim until its fix is on main, adds its signature to `KNOWN` with
 how to recognise it, and leaves it when its fix lands.
 
 For each failure the script also says what it can see without judging it: whether the
@@ -43,10 +42,10 @@ for seed, track, inv, detail in sorted(set(fails)):
     verdict = next((name for name, matches in KNOWN if matches(detail, sched, out)), "OTHER")
     leads = []
     if "restore claims" in detail:
-        leads.append("the restore check (BR1's) fails: a regression of #211")
+        leads.append("the restore check fails (a restore claims rows it was not given): a regression of #211")
     rewinds = [int(i) for i, s in sched if re.match(r"^[A-D]\.rewind", s)]
     if rewinds:
         again = run(seed, track, ",".join(str(i) for i in rewinds))
         if "test result: ok. 1 passed" in again:
-            leads.append(f"passes without its rewinds (steps {rewinds}): look at RW1's fix (#209)")
+            leads.append(f"passes without its rewinds (steps {rewinds}): look at the rewind fix (#209)")
     print(f"{verdict}\tseed {seed} {track}\t{inv}\t{'; '.join(leads)}\t{detail[:200]}")
