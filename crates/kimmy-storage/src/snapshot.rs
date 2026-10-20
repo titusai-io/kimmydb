@@ -1382,6 +1382,7 @@ impl Engine {
                     &txn,
                     base.key,
                     &standing,
+                    &|_, _| true,
                     crate::idempotency::DeltaBudget { bytes, ..self.record_delta_budget() },
                 )?;
                 records = delta.records;

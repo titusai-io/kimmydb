@@ -1304,12 +1304,15 @@ pub(crate) struct Delta {
 /// Stops before the budget is passed ([`DeltaBudget`]), naming the last key it
 /// examined; a record larger than the whole budget, which a page holding nothing
 /// else cannot carry, is refused ([`StorageError::SnapshotRowTooLarge`]). A row whose record
-/// is gone (purged or collected) carries nothing. No keyed change since `base` is
+/// is gone (purged or collected) carries nothing. A record `wanted` does not name (given
+/// its collection and its stored bytes) is no part of the delta: it is neither carried,
+/// counted against the budget nor refused. No keyed change since `base` is
 /// an empty read.
 pub(crate) fn records_changed_since(
     txn: &ReadTransaction,
     base: Stamp,
     standing: &dyn Fn(CollectionId) -> bool,
+    wanted: &dyn Fn(CollectionId, &[u8]) -> bool,
     budget: DeltaBudget,
 ) -> Result<Delta> {
     use std::ops::Bound::{Excluded, Unbounded};
@@ -1338,7 +1341,8 @@ pub(crate) fn records_changed_since(
                     .map(|raw| raw.map(|raw| (collection, scope, raw.value().to_vec())))
             })
             .transpose()?
-            .flatten();
+            .flatten()
+            .filter(|(collection, _, record)| wanted(*collection, record));
         if let Some((collection, scope, record)) = named {
             let size = carried_size(record.len());
             if out.is_empty() && size > budget.bytes {
