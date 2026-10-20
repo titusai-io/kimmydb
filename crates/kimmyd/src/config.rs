@@ -973,6 +973,28 @@ pub struct ClusterConfig {
     /// `kimmy_decimal128_id_present` marker, not this key, says whether a
     /// decimal id exists.
     pub decimal128: Option<bool>,
+    /// Whether this member takes `Idempotency-Key` on a document write, and the
+    /// MCP argument `idempotency_key` (ADR-240): the operator's declaration that
+    /// every member runs 0.52 or later, so records travel with every keyed
+    /// write, and that no member will run an older release again. A member of
+    /// an older release relays a keyed write without its record, and a member
+    /// that pulls it through that one holds the write's effect without the
+    /// record for good, so a retry there applies it a second time. With
+    /// clustering on, a key is also refused while any live peer does not say it
+    /// carries records.
+    ///
+    /// Unset reads as `true` with clustering off and `false` with it on
+    /// ([`Self::idempotency_keys`]); `check-config` prints the value in effect.
+    /// Set it only once every member runs this release, as its own change and
+    /// restart, never in the change that upgrades the binary. It gates **local
+    /// acceptance only**: records, and keyed writes from other members, are
+    /// always stored and applied. Read at start.
+    ///
+    /// **A rollback effect.** `ClusterConfig` refuses unknown keys, so a 0.51
+    /// binary refuses to start on a config that names this key, at any value:
+    /// remove it before rolling back. Rolling any member back after the switch
+    /// is set reopens the gap it closes.
+    pub idempotency_keys: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1349,6 +1371,7 @@ impl Default for ClusterConfig {
             repair_max_documents: 2_000_000,
             repair_max_index_documents: 250_000,
             decimal128: None,
+            idempotency_keys: None,
         }
     }
 }
@@ -1359,6 +1382,14 @@ impl ClusterConfig {
     /// read one; a cluster is declared by its operator once the roll is done.
     pub fn decimal128(&self) -> bool {
         self.decimal128.unwrap_or(!self.enabled)
+    }
+
+    /// `idempotency_keys` in effect: as set, or by default `true` with
+    /// clustering off and `false` with it on. A lone node has no member that
+    /// could relay a keyed write without its record; a cluster is declared by
+    /// its operator once every member runs this release.
+    pub fn idempotency_keys(&self) -> bool {
+        self.idempotency_keys.unwrap_or(!self.enabled)
     }
 }
 
@@ -2720,6 +2751,50 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
         let err =
             toml::from_str::<Config>("[cluster]\ndecimal128_ids = true\n").unwrap_err().to_string();
         assert!(err.contains("decimal128_ids"), "unhelpful error: {err}");
+    }
+
+    /// `cluster.idempotency_keys` (ADR-240): unset reads `true` alone and `false` in a
+    /// cluster, a value set wins either way, and a typo is refused by name. The
+    /// same `deny_unknown_fields` is why a 0.51 binary refuses a config that names
+    /// the key at all: a rollback effect, documented, not tested here.
+    #[test]
+    fn idempotency_keys_defaults_by_clustering_and_parses() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.cluster.idempotency_keys, None, "unset");
+        assert!(cfg.cluster.idempotency_keys(), "a lone node relays nothing without records");
+        cfg.cluster.enabled = true;
+        assert!(!cfg.cluster.idempotency_keys(), "a cluster waits for its operator");
+
+        for (text, enabled, expected) in [
+            ("[cluster]\nidempotency_keys = true\nenabled = true\n", true, true),
+            ("[cluster]\nidempotency_keys = false\n", false, false),
+            ("[cluster]\nenabled = true\n", true, false),
+            ("", false, true),
+        ] {
+            let parsed: Config = toml::from_str(text).unwrap();
+            assert_eq!(parsed.cluster.enabled, enabled, "{text:?}");
+            assert_eq!(parsed.cluster.idempotency_keys(), expected, "{text:?}");
+        }
+        // Independent of `decimal128`, which is another declaration.
+        let parsed: Config =
+            toml::from_str("[cluster]\nenabled = true\ndecimal128 = true\n").unwrap();
+        assert!(!parsed.cluster.idempotency_keys());
+
+        let err = toml::from_str::<Config>("[cluster]\nidempotency_key = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("idempotency_key"), "unhelpful error: {err}");
+    }
+
+    /// The window `GET /v1/version` publishes when the daemon has not said
+    /// otherwise is this configuration's default retention: the API's constant
+    /// and the setting's default are one number.
+    #[test]
+    fn the_api_default_window_is_the_default_oplog_retention() {
+        assert_eq!(
+            Config::default().storage.oplog_retention_secs,
+            kimmy_api::idempotency::DEFAULT_WINDOW_SECS
+        );
     }
 
     #[test]

@@ -364,6 +364,9 @@ jobs:
       # exists only in the `lab-hooks` build of kimmyd (`KIMMY_TEST_DROP_APPLY`), which no
       # shipped artifact is: the build job below checks the release binary carries none of
       # it. The tests are compiled only with the feature, so the step above never sees them.
+      # So are the idempotency records' mixed-version test (a member that strips records,
+      # `KIMMY_TEST_STRIP_RECORDS`) and its race between chunks
+      # (`KIMMY_TEST_HOLD_BETWEEN_CHUNKS`), named `lab_hook_` for this step.
       - name: Cluster harness, the repair cases (lab-hooks build)
         env:
           KIMMY_TEST_NODE_LOGS: ${{ runner.temp }}/node-logs
@@ -616,11 +619,15 @@ jobs:
         run: cargo build --profile dist --target x86_64-unknown-linux-musl --workspace
 
       # The lab's loss of one replicated entry (`KIMMY_TEST_DROP_APPLY`, the `lab-hooks`
-      # feature) is not in what ships: not its switch, not its log lines.
+      # feature) is not in what ships: not its switch, not its log lines. Nor are the idempotency
+      # cluster tests' hooks of the same feature (`KIMMY_TEST_STRIP_RECORDS`,
+      # `KIMMY_TEST_HOLD_BETWEEN_CHUNKS`).
       - name: The shipped server carries no lab hook
         run: |
-          hooks=$(strings target/x86_64-unknown-linux-musl/dist/kimmyd | grep -c DROP_APPLY || true)
-          test "$hooks" = 0 || { echo "the release binary names DROP_APPLY $hooks times"; exit 1; }
+          for hook in DROP_APPLY KIMMY_TEST_STRIP_RECORDS KIMMY_TEST_HOLD_BETWEEN_CHUNKS; do
+            n=$(strings target/x86_64-unknown-linux-musl/dist/kimmyd | grep -c "$hook" || true)
+            test "$n" = 0 || { echo "the release binary names $hook $n times"; exit 1; }
+          done
 
       # One file, so the artifact unpacks as `kimmyd` alone.
       - uses: actions/upload-artifact@v7

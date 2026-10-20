@@ -13,6 +13,7 @@ pub mod ddl;
 pub mod decimal;
 pub mod error;
 pub mod hlc;
+pub mod idempotency;
 pub mod ids;
 pub mod index_meta;
 pub mod keyenc;
@@ -34,6 +35,7 @@ pub use ddl::{
 };
 pub use error::{Decimal128Closed, Decimal128Use, Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
+pub use idempotency::{Fingerprint, IdempotencyKey, KeyError, ScopeHash};
 pub use ids::{CollectionId, DECIMAL128_ID_LEN, Decimal128Id, DocId, NodeId};
 pub use index_meta::{Enforcement, IndexField, IndexMeta};
 pub use legacy_key::LegacyKey;

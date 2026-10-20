@@ -299,6 +299,57 @@ pub const VECTOR_VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("snapshot_progress");
 
+/// `(collection id, scope hash) -> the idempotency record` (ADR-240,
+/// `crate::idempotency`): a keyed write's record, written in the write's own
+/// transaction, so it survives exactly what the write survives.
+///
+/// The scope hash (32 bytes) is SHA-256 over the principal and the client's key;
+/// the key itself is never stored. The value leads with its own version byte. A
+/// record lives `storage.oplog_retention_secs` after its `last`, a drop of its
+/// collection notwithstanding: retention is the only remover. Carried by a
+/// backup (tag 12).
+/// Created by `Engine::open` with no schema bump: an older build never opens it.
+pub const IDEMPOTENCY: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("idempotency");
+
+/// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`:
+/// every record by the stamps that carry it (ADR-240).
+///
+/// Keyed origin-major, `node (16) ‖ hlc (10)`, so the rows of one origin in a
+/// range are one range read. A record has a row at each of its merged `first`
+/// and merged `last`, written by every store of it (a local commit, a frame, a
+/// page), and on a receiver one more at each carrying stamp a frame names, so a
+/// sender finds the records of the coverage a window grants by the rows in it.
+/// What retention reads, per origin below its cutoff, to find records past
+/// their window (it keeps a live record's `first` and `last` rows); the largest
+/// of each origin's last key is in the clock's high water at open. A row whose
+/// record is gone (a retention pass stopped between its chunks leaves some until
+/// the next) names nothing, ships nothing and expires. Carried by a backup (tag
+/// 13) only beside a record: a store that holds none writes neither tag.
+pub const IDEMPOTENCY_BY_STAMP: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("idempotency_by_stamp");
+
+/// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`: this
+/// node's **change log** of idempotency records (ADR-240, "Snapshots carry records").
+///
+/// One row per store that changes a record, on every path (a local commit, a
+/// frame, a replay page, a snapshot or converge page, a rewind's reopen), in the
+/// store's own transaction, keyed by a stamp this node mints for it under the
+/// writer: so keys are in commit order, and every change committed after a read
+/// has a key above the log's high water as that read saw it. A store that changes
+/// nothing writes no row. What a snapshot page's records delta reads, one range
+/// above the base its cursor carries. Node-local: never shipped by a window, not
+/// carried by a backup. Retention drops rows older than the record window.
+///
+/// The empty key holds where this log began, the key of the first change it
+/// held, and its **epoch** (`key (26) ‖ epoch (8)`): a random number given again
+/// when the log begins again, at the first change after a restore (a backup
+/// carries none), an identity reset, or an open that found no log. A snapshot
+/// cursor's base names the epoch, and one of another is told apart whatever the
+/// keys say. The log's high water is in the clock's at open. Created by
+/// `Engine::open` with no schema bump.
+pub const IDEMPOTENCY_CHANGES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("idempotency_changes");
+
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 pub const META_FORMAT_VERSION: &str = "format_version";

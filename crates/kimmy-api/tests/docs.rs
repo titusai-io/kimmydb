@@ -582,6 +582,12 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         held_marks_released: 14,
         held_marks: 15,
         decimal128_id_present: true,
+        idempotency: kimmy_api::metrics::IdempotencyReading {
+            records: 32,
+            received: [33, 34, 35, 36, 37],
+            undecodable: 38,
+            collected: 39,
+        },
         webhook_active: 18,
         webhook_invalidated: 19,
         webhook_unreadable: 21,

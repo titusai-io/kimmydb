@@ -9090,6 +9090,45 @@ async fn find_and_modify_can_remove_and_can_project() {
     assert_eq!(gone.status, 404);
 }
 
+/// `find_and_modify` reports the version it produced only for a document that
+/// still exists: a change reports it, a removal (whose tombstone nothing can be
+/// conditional on) and an update that left the document as it was (ADR-208) do
+/// not. Held here because the answer is now rendered from an outcome (ADR-240), and
+/// nothing else drove a removal's answer for the absence of `stamp`.
+#[tokio::test]
+async fn find_and_modify_reports_a_stamp_only_for_a_document_that_still_exists() {
+    let server = Server::start().await;
+    let token = jobs(&server).await;
+    let path = "/v1/db/app/coll/jobs/find_and_modify";
+
+    let changed = server
+        .post(
+            path,
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"status": "seen"}} }),
+        )
+        .await;
+    assert_eq!(changed.status, 200, "{:?}", changed.body);
+    assert!(changed.body["stamp"].is_string(), "a change names its version: {:?}", changed.body);
+
+    let unchanged = server
+        .post(
+            path,
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"status": "seen"}} }),
+        )
+        .await;
+    assert_eq!(unchanged.status, 200, "{:?}", unchanged.body);
+    assert_eq!(unchanged.body["modified"], 0);
+    assert!(unchanged.body.get("stamp").is_none(), "nothing written: {:?}", unchanged.body);
+
+    let removed =
+        server.post(path, Some(&token), json!({ "filter": {"_id": 1}, "remove": true })).await;
+    assert_eq!(removed.status, 200, "{:?}", removed.body);
+    assert_eq!(removed.body["modified"], 1);
+    assert!(removed.body.get("stamp").is_none(), "a tombstone is not named: {:?}", removed.body);
+}
+
 #[tokio::test]
 async fn upsert_seeds_the_filters_equalities() {
     // The Mongo behaviour people rely on: the created document carries the
@@ -10688,6 +10727,24 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_divergence_repair_enabled",
         "kimmy_gc_tombstone_horizon_seconds",
         "kimmy_decimal128_id_present",
+        "kimmy_idempotency_requests_total",
+        "kimmy_idempotency_requests_total",
+        "kimmy_idempotency_requests_total",
+        "kimmy_idempotency_requests_total",
+        "kimmy_idempotency_requests_total",
+        "kimmy_idempotency_requests_total",
+        "kimmy_idempotency_peer_replays_total",
+        "kimmy_idempotency_records",
+        "kimmy_idempotency_records_received_total",
+        "kimmy_idempotency_records_received_total",
+        "kimmy_idempotency_records_received_total",
+        "kimmy_idempotency_records_received_total",
+        "kimmy_idempotency_records_received_total",
+        "kimmy_idempotency_records_undecodable_total",
+        "kimmy_idempotency_records_unfit_total",
+        "kimmy_idempotency_records_unfit_total",
+        "kimmy_idempotency_records_unfit_total",
+        "kimmy_idempotency_records_collected_total",
         "kimmy_sync_definition_repairs_total",
         "kimmy_sync_definition_repairs_total",
         "kimmy_sync_definition_repairs_total",
@@ -15932,13 +15989,16 @@ async fn the_marker_reaches_readyz_and_metrics_with_the_first_decimal_id() {
 #[tokio::test]
 async fn the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one() {
     // The node's own gate (`kimmy_cluster::Decimal128Gate`) over a member set, with the
-    // key set: an older live peer (its block says nothing of the capability) holds both
-    // creations back, named in the 400; a live peer not heard from yet does too; once
-    // every live peer says it can, both are created.
+    // key set. An older live peer (its block says nothing of the capability) holds both
+    // creations back with a 400 that names it, and decides over a live peer not heard
+    // from yet, which is not named. Once the older peer can, the unheard one holds both
+    // back with a transient `503 peer_unheard`, `retry: wait` and `Retry-After: 1`,
+    // naming it; once every live peer says it can, both are created.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
     let members = kimmy_cluster::Members::default();
+    members.configure_lease(std::time::Duration::from_secs(3), 3);
     let gate = kimmy_cluster::Decimal128Gate::new(true, true, true);
     gate.set_members(members.clone());
     server.state.engine.set_decimal128_gate(gate.predicate());
@@ -15957,13 +16017,15 @@ async fn the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_ca
     let indexes = "/v1/db/shop/coll/c/indexes";
     let index = json!({ "name": "positive", "fields": [{ "path": "v" }],
                         "partialFilterExpression": { "v": { "$gt": decimal("0") } } });
-    for (path, body) in [(docs, json!({ "_id": decimal("1.5") })), (indexes, index.clone())] {
-        let res = server.post(path, Some(&token), body).await;
+    let creations = [(docs, json!({ "_id": decimal("1.5") })), (indexes, index)];
+    for (path, body) in &creations {
+        let res = server.post(path, Some(&token), body.clone()).await;
         assert_eq!(res.status, 400, "{path}: {:?}", res.body);
+        assert_eq!(res.body["retry"], "no", "{path}: {:?}", res.body);
+        assert!(res.header("retry-after").is_none(), "{path}: lasts a roll");
         let message = res.body["message"].as_str().unwrap_or_default();
-        for peer in [older, unheard] {
-            assert!(message.contains(&peer.to_string()), "{path}: names {peer}: {message}");
-        }
+        assert!(message.contains(&older.to_string()), "{path}: names {older}: {message}");
+        assert!(!message.contains(&unheard.to_string()), "{path}: and only it: {message}");
     }
 
     let can = |boot: u8| kimmy_cluster::Facts {
@@ -15972,10 +16034,28 @@ async fn the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_ca
         ..Default::default()
     };
     members.record_peer_facts_for_test(older, can(2), std::time::Duration::ZERO);
-    let res = server.post(docs, Some(&token), json!({ "_id": decimal("1.5") })).await;
-    assert_eq!(res.status, 400, "the unheard peer still holds it back: {:?}", res.body);
+    for (path, body) in &creations {
+        let res = server.post(path, Some(&token), body.clone()).await;
+        assert_eq!(res.status, 503, "the unheard peer still holds it back: {:?}", res.body);
+        assert_eq!(res.body["error"], "peer_unheard", "{path}: {:?}", res.body);
+        assert_eq!(res.body["retry"], "wait", "{path}: {:?}", res.body);
+        assert_eq!(res.header("retry-after").as_deref(), Some("1"), "{path}: a fixed second");
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(message.contains(&unheard.to_string()), "{path}: names {unheard}: {message}");
+        assert!(message.contains("transient"), "{path}: {message}");
+    }
+    // Past the lease the unheard peer is one that cannot: the lasting 400.
+    members.backdate_unheard_for_test(
+        unheard,
+        members.unheard_lease() + std::time::Duration::from_secs(1),
+    );
+    for (path, body) in &creations {
+        let res = server.post(path, Some(&token), body.clone()).await;
+        assert_eq!(res.status, 400, "{path}: past its lease: {:?}", res.body);
+        assert!(res.header("retry-after").is_none(), "{path}");
+    }
     members.record_peer_facts_for_test(unheard, can(3), std::time::Duration::ZERO);
-    for (path, body) in [(docs, json!({ "_id": decimal("1.5") })), (indexes, index)] {
+    for (path, body) in creations {
         let res = server.post(path, Some(&token), body).await;
         assert_eq!(res.status, 200, "{path}: {:?}", res.body);
     }

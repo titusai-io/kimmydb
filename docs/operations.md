@@ -37,7 +37,7 @@ fails fast on a bad volume mount.
 | `server.advertise` | — | derived from `bind` | The URL clients should use to reach *this* node, published to the cluster so `/v1/topology` can hand it out. It cannot be inferred from a wildcard bind, so a node on `0.0.0.0` with this unset advertises nothing and says so at startup; with a concrete bind it defaults to that address, the scheme following whether this node terminates TLS |
 | `storage.data_dir` | `KIMMY_DATA_DIR` | `/var/lib/kimmy` | Holds `kimmy.redb` |
 | `storage.tombstone_retention_secs` | — | `86400` | **Must exceed your worst tolerable partition.** Governs deleted documents, dropped collections, dropped indexes *and* dropped databases. **A roll or a rollback must finish within it of any database drop made during it** ([ADR-229](decisions.md)) |
-| `storage.oplog_retention_secs` | — | `86400` | Bounds resume and peer catch-up |
+| `storage.oplog_retention_secs` | — | `86400` | Bounds resume and peer catch-up. Also how long this member remembers an `Idempotency-Key` after the keyed write's last commit, published as `idempotencyWindowSecs` by `GET /v1/version` |
 | `storage.gc_interval_secs` | — | `600` | How often retention is enforced. `0` disables it (with it off the collected-through horizon of the divergence repair never advances and every row newer than the last start is admissible, which is safe for that repair, as nothing is collected). **Disable it on one member only while it is needed:** a member that collects nothing keeps every drop tombstone, and once another member has collected a drop before every member heard it (a partition longer than retention), a member still holding the drop's tombstone stops for good at an index or vector configuration made after that drop by a member that never heard it, and nothing behind that entry in that peer's window, in any collection, reaches it by entries ([ADR-236](decisions.md) item 4); with collection on, its own pass collects the tombstone at the same age and the stop clears. The signal is `kimmy_sync_entries_skipped_total{reason="unknown_collection"}` climbing on that member. A pass holds the single writer only to remove what it found, a thousand records per commit, and for one short commit that moves the unique-violations table's `through` when something was written since the last pass ([ADR-200](decisions.md)), never for its scans, and visits at most 100,000 documents of the tombstone scan per pass; a pass that overruns the interval is logged at `WARN` and the next runs a full interval after it finished ([ADR-151](decisions.md)) |
 | `storage.durability` | — | `durable` | `durable` (every commit fsyncs before it returns) or `coalesced` (a commit waits for the next shared fsync, one per window, so concurrent writers share it). Both are durable when the response returns; there is no class that is not (ADR-088). The sharing is among *concurrent* committers: a lone writer gains nothing from `coalesced` and waits out a window for company that never comes — one writer measured 79 docs/s under `coalesced` against 170 under `durable`, 0.46× ([Benchmarks](benchmarks.md#coalesced-durability--the-flat-line-bends)). The embedding worker is a lone writer, so on a member that embeds, `coalesced` makes that member's own embedding slower per batch, not faster; the class is for a member's concurrent clients, and a member kept for embedding stays on `durable` |
 | `storage.commit_coalesce_ms` | — | `5` | The coalescing window for `coalesced`, 1–1000 ms. Ignored under `durable` |
@@ -52,7 +52,8 @@ fails fast on a bad volume mount.
 | `cluster.divergence_repair` | — | `true` | Whether this member repairs what the divergence check finds: the document repair of a confirmed cut-digest finding and the definition repair of a confirmed definition finding. The detectors run either way; `false` makes the member detect only, as 0.49.0 does, and counts each skipped plan `disabled`. Does not touch the count half's repair. Read at start. **A rollback effect:** a 0.49.0 binary refuses to start on a config that names this key (or the two below) at any value, so remove them before rolling back |
 | `cluster.repair_max_documents` | — | `2000000` | The most live documents a collection may hold for the document repair to pull it; above it the repair is counted `too_large` and left to you. Must be greater than zero |
 | `cluster.repair_max_index_documents` | — | `250000` | The most live documents a collection may hold for the definition repair to build an index in it. The build holds the single writer for its whole length, so this is lower than the key above. Must be greater than zero |
-| `cluster.decimal128` | — | `true` with clustering off, `false` with it on | Whether this member may **create** a document whose `_id` is a `Decimal128`, or an index whose `partialFilterExpression` holds one ([ADR-238](decisions.md)). `true` declares that every member runs 0.51 or later, has finished its storage migration, and will not run an older build again: a member before 0.51 that meets such a document fails every frame carrying it and never catches up, and one that meets such an index definition never builds it, even after it upgrades. With clustering on, a creation is also refused (`400`, naming the key and the peers) until every member SWIM lists live says it can hold one; a live member not heard from yet counts as one that cannot, and a member that is down or migrating is not live, so the net cannot see it. A member that comes up or restarts is heard within about one contact, not a sync interval: each peer exchanges facts blocks with it as soon as it sees it up or renamed, and it with each peer it sees up ([ADR-247](decisions.md)). At most one exchange is started per member per sync interval, so a member that restarts again within the interval of the last exchange with it is heard at the interval's end. With `cluster.membership` off a clustered member cannot see its peers and refuses such a creation whatever the key says. **Only local creation is gated**: what a peer replicates, a snapshot restores or a repair builds is always applied, and a replace of an existing document keeps its stored `_id` and is never refused. Nor is anything that creates nothing: an insert of an `_id` that is already there is `409 duplicate_key`, and re-creating an index the member already holds (by replication, from a member whose key is set) answers as it does for any index. **Set it only after the whole roll, as its own change and restart, never in the change that upgrades the binary.** `check-config` prints the value in effect. Read at start. **A rollback effect:** a 0.49 or 0.50 binary refuses to start on a config that names this key, at any value, and setting it back to `false` does not make a rollback possible; see [`cluster.decimal128` and the marker](#clusterdecimal128-and-the-marker) |
+| `cluster.decimal128` | — | `true` with clustering off, `false` with it on | Whether this member may **create** a document whose `_id` is a `Decimal128`, or an index whose `partialFilterExpression` holds one ([ADR-238](decisions.md)). `true` declares that every member runs 0.51 or later, has finished its storage migration, and will not run an older build again: a member before 0.51 that meets such a document fails every frame carrying it and never catches up, and one that meets such an index definition never builds it, even after it upgrades. With clustering on, a creation is also refused (`400`, naming the key and the peers) until every member SWIM lists live says it can hold one; a live member whose block did not decode counts as one that cannot, and so does one not heard from for more than the unheard lease (the longer of `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to declare a silent member down plus one sync interval) since it came up, was renamed or this member rejoined; within that lease it is refused with a transient `503 peer_unheard` and `Retry-After: 1` instead (when no member refuses); and a member that is down or migrating is not live, so the net cannot see it. A member that comes up or restarts is heard within about one contact, not a sync interval: each peer exchanges facts blocks with it as soon as it sees it up or renamed, and it with each peer it sees up ([ADR-247](decisions.md)). At most one exchange is started per member per sync interval, so a member that restarts again within the interval of the last exchange with it is heard at the interval's end. With `cluster.membership` off a clustered member cannot see its peers and refuses such a creation whatever the key says. **Only local creation is gated**: what a peer replicates, a snapshot restores or a repair builds is always applied, and a replace of an existing document keeps its stored `_id` and is never refused. Nor is anything that creates nothing: an insert of an `_id` that is already there is `409 duplicate_key`, and re-creating an index the member already holds (by replication, from a member whose key is set) answers as it does for any index. **Set it only after the whole roll, as its own change and restart, never in the change that upgrades the binary.** `check-config` prints the value in effect. Read at start. **A rollback effect:** a 0.49 or 0.50 binary refuses to start on a config that names this key, at any value, and setting it back to `false` does not make a rollback possible; see [`cluster.decimal128` and the marker](#clusterdecimal128-and-the-marker) |
+| `cluster.idempotency_keys` | — | `true` with clustering off, `false` with it on | Whether this member takes `Idempotency-Key` on a document write, and the MCP argument `idempotency_key` ([HTTP API](http-api.md#idempotency-keys)). `true` declares that every member runs 0.52 or later and will not run an older release again: a member of an older release relays a keyed write without its record, and a member that pulls the write through it holds its effect without the record for good, so a retry there applies it a second time. With clustering on, a key is also refused (`400`, naming the header and the live member) while any member SWIM lists live does not say it carries records: its block says otherwise, its block did not decode, or no block of it has arrived for more than the unheard lease (the longer of `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to declare a silent member down plus one sync interval) since it came up, was renamed or this member rejoined; within that lease a member not heard from yet is refused with a transient `503 peer_unheard` and `Retry-After: 1` instead (when no member refuses); and a member that is down is not live, so the net cannot see it. A member that comes up or restarts is heard within about one contact, not a sync interval: each peer exchanges facts blocks with it as soon as it sees it up or renamed, and it with each peer it sees up ([ADR-247](decisions.md)). At most one exchange is started per member per sync interval, so a member that restarts again within the interval of the last exchange with it is heard at the interval's end. With `cluster.membership` off a clustered member refuses keys whatever the switch says. While it refuses, the member does not list `idempotency-keys` in `GET /v1/version`. **Only local acceptance is gated**: records, and keyed writes from other members, are always stored and applied. **Set it only once every member runs this release, as its own change and restart, never in the change that upgrades the binary.** `check-config` prints the value in effect. Read at start. **A rollback effect:** a 0.51 binary refuses to start on a config that names this key, at any value, and rolling any member back after setting it reopens the gap it closes; see [`cluster.idempotency_keys` and the procedure](#clusteridempotency_keys-and-the-procedure) |
 | `cluster.membership` | — | `true` | Gossip liveness over UDP. Off falls back to discovery-only peers |
 | `server.tls.cert_file` | `KIMMY_TLS_CERT` | — | PEM chain, leaf first. TLS is on when this and the key are both set. Re-read on SIGHUP, or within 60s of changing |
 | `server.tls.key_file` | `KIMMY_TLS_KEY` | — | PEM private key (PKCS#8, PKCS#1 or SEC1) |
@@ -591,6 +592,8 @@ a provider this member cannot build is one only an operator can.
 | `timeout` | `WARN` | The request was abandoned at `server.request_timeout_secs` while waiting for the rest of its body or for an embedding provider. One is usually a slow client; a *rise* is worth looking at, and the level does not distinguish the two causes because the deadline is enforced above the code that knows which one it was |
 | `resolver_busy` | `WARN` | A host the request had to resolve (a webhook's on registration, an embedding provider's on configuration or on a search's query) was not looked up, because the lookups this node allows at once were all waiting on the resolver ([Discovery formats](#discovery-formats)). Nothing was done; the client is told to wait, with `Retry-After`. One is a resolver slow for a moment or a client registering names that never answer; **a rise is a resolver that has stopped answering**, and that is yours |
 | `provider_error` | `WARN` | An upstream embedding provider failed. Nobody needs to act on one; a rise is a quota, a revoked key, or a provider that is down, and those are yours. Pair it with `kimmy_embed_provider_errors_total{kind}`, which says at which layer |
+| `idempotency_key_reused` | `INFO` | A request's `Idempotency-Key` names a different request on this member: a client reusing a key for different work, which is its bug and which the response names. Also every retry under a key two members accepted for two different requests, once their records have met (a contested record). Nothing was written. A rise is a client generating keys per session or per second rather than per request; `kimmy_idempotency_requests_total{outcome="reused"}` counts them |
+| `idempotency_key_in_flight` | `INFO` | A duplicate of a `multi: true` update or delete arrived while the request with its key was still running here, or while another retry of it was being answered here, and was told to wait (`Retry-After: 1`). Nothing was written. Expected from a client that retries on a short timeout; `kimmy_idempotency_requests_total{outcome="in_flight"}` counts them |
 | `not_implemented` | `INFO` | A caller asked for a capability that is reserved and does not exist yet. There is no operator action — no configuration turns it on — so it is recorded and nothing more. **One exception, which logs `ERROR`**: a node that cannot build *local embeddings* returns this same code, and that is a member provisioned unlike its cluster; every search of that collection landing here fails, and behind a load balancer the other members hide it |
 
 **Every other code writes no line at all**, at any level, however `log.level` or
@@ -600,9 +603,11 @@ log of nothing but the failures — half a record, and one this server has never
 kept. They are `bad_request`, `payload_too_large`, `unsupported_media_type`,
 `unauthorized`, `forbidden`, `not_found`, `conflict`, `duplicate_key`,
 `unique_violation`, `no_vectors`, `resume_token_expired`, `rate_limited`,
-`stale` and `collection_purging`. Count them with `kimmy_responses_total{class="4xx"}`,
+`stale`, `collection_purging` and `peer_unheard`. Count them with `kimmy_responses_total{class="4xx"}`,
 except `collection_purging`, a `503` the drop purger's own log lines already
-account for; read the authorization decisions among them in
+account for, and `peer_unheard`, a `503` that lasts about one contact after
+a restart or a rejoin and at most the unheard lease, after which membership's own `WARN`
+names the peer and the gate answers `400`; read the authorization decisions among them in
 [the audit log](#the-audit-log), and see [HTTP API](http-api.md#errors) for what
 each one means to the client.
 
@@ -623,6 +628,66 @@ levels live on the error-code enum, and
 disagree — a code given a level and left out here, or listed here as silent
 after it started logging, is a test failure rather than an operator finding out
 from a page.
+
+#### What a keyed write logs
+
+A request carrying an `Idempotency-Key` ([HTTP API](http-api.md#idempotency-keys))
+adds two lines, neither a fault:
+
+- **`INFO` `resumed a keyed write that had stopped`**, when a `multi: true`
+  update or delete sent again with its key continues past where an earlier
+  attempt stopped, with `db`, `collection`, `origin` (the member whose record it
+  resumed from) and the request's `matched`, `modified` and `skipped` so far.
+- **`DEBUG` `replayed a keyed write`**, when a request is answered from its
+  record, with `db`, `collection`, `origin` and `age_ms` (how long ago its last
+  commit was). Off at the default level: a replay is the feature working.
+
+Its refusals log through `request failed` at the levels above
+(`idempotency_key_reused` and `idempotency_key_in_flight` at `INFO`); the gate's
+`400` is a `bad_request` and its `503` a `peer_unheard`, neither of which writes
+a line, and both are counted as
+`kimmy_idempotency_requests_total{outcome="gated"}`. The retention pass's
+`collected expired records` line gains `idempotency_records`, the records it
+removed, so a pass that removed only records still logs. Three lines come from
+replication:
+
+- **`WARN`, when the records a member cannot vouch for by its oplog do not fit
+  one frame** (or one replay page), with `records`: records it holds at stamps
+  past what its own oplog serves, which it ships in every window until it has
+  pulled their entries. The window then carries no entries and grants the peer
+  nothing until it has. It takes a frame's worth of such records, about 63 MiB,
+  so it should not be seen.
+- **`WARN` `a snapshot page cannot be served`**, with `error`: a row of a
+  snapshot, repair or converge page, a document or the `find_and_modify` record
+  holding one, is larger than a page holds (63 MiB, what a frame holds less
+  1 MiB), with the cursor that names it: a document whose `_id` is over about
+  3 MiB of binary or 5 MiB of string does not fit with that cursor, whose key
+  crosses as an array of integers. The sender answers the request with a fault
+  naming the row (a document's collection and `_id`, a record's collection) and
+  its size, and the requester's round fails with it (`kimmy_sync_failures_total`);
+  the pull asks again on its next round, and moves on once the document is
+  smaller. A document larger than a frame cannot cross in a window either. The
+  `_id` is named by its kind, its length and its first 24 bytes (binary as hex),
+  never whole, so the line and the fault stay a few hundred bytes; the `WARN` is
+  said once per row per five minutes (a `DEBUG` line on the rounds between), though
+  the connection's own `peer connection failed` follows each round.
+- **`INFO` `a snapshot page carries only records`**, with `records`, `base` and
+  `stopped`: what changed since the page before does not fit one page with its
+  documents, so the page carries the records and the snapshot's position stays.
+  A run of them is a sender whose keyed writes outpace the pages; the snapshot
+  moves on when they slow.
+- **`INFO` `a snapshot cursor's records base is of another log`**, with `base`
+  and `epoch`: the sender was restored or reset since the cursor was cut, and the
+  cursor's collection starts again from its records.
+- **`INFO` `this store holds idempotency records and no change log of this
+  node`**, with `epoch`, at the first start after a restore or an identity reset:
+  the change log begins again there, so a snapshot cursor cut before it restarts
+  its collection from its records.
+- **`INFO` `a snapshot page asked with the zero records base comes from a sender
+  whose change log has begun since`**, with `collection` and `epoch`: the page is
+  refused and its collection asked for again from its records. Once per pull when
+  the sender's first keyed write lands during it, or after the sender was
+  restored; more than once in a pull means the sender was restored again.
 
 #### A start that rebuilds the live document counts
 
@@ -851,7 +916,9 @@ write is present, and it replicates. Its client learns this in one of two ways.
   inside another thread's reporting window, as above.
 
 Either way the write **may or may not have happened**. Clients must read it back
-before resending it, unless it is idempotent: see
+before resending it, unless it is idempotent or was sent with an
+`Idempotency-Key`, which a client resends with the same key, to the same member
+once it serves again: see
 [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome).
 `outcome_unknown` is logged at `ERROR`.
 
@@ -1258,6 +1325,13 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_sync_digest_drift_total` | Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. **A healthy node reads 0.** A rising value is a bug in the digest's maintenance, is logged at `ERROR` (`this node's kept digest of a collection disagreed with its records and has been corrected`), and means no finding was reported for that comparison. |
 | `kimmy_sync_divergence_repair_enabled` | 1 when `cluster.divergence_repair` is on, 0 when this member only detects (`cluster.divergence_repair`). A cluster of members reading 0 here is detecting and repairing nothing. |
 | `kimmy_decimal128_id_present` | 1 once a document whose `_id` is a `Decimal128` (an integral one stored as an integer id included) has been written or applied on this member, else 0 ([ADR-238](decisions.md)). Durable, never cleared, carried by a backup; also `decimal128_id_present` on `/readyz`. **Read it on every member before a rollback**: once it is 1 anywhere, no member can be rolled back by wiping it and resyncing on a build before 0.51. See [`cluster.decimal128` and the marker](#clusterdecimal128-and-the-marker). |
+| `kimmy_idempotency_requests_total{outcome}` | Requests that carried an `Idempotency-Key`, or the MCP argument `idempotency_key`, by what became of them (one instrument per outcome on the OTLP bridge, `kimmy.idempotency.requests.<outcome>`): `applied` (no record, so it was processed, and its record written with it if it changed anything), `replayed` (answered from the record, nothing written), `resumed` (a `multi: true` request that had stopped, continued), `reused` (`422 idempotency_key_reused`), `in_flight` (`409 idempotency_key_in_flight`) and `gated` (`400` because `cluster.idempotency_keys` is off here or a live member says it does not carry records, and `503 peer_unheard` while a live member has not been heard from yet). **`gated` rising after the roll** is a member whose switch was not set, or a live member of an older release; a burst of about one contact at each restart is the not-heard window ([`cluster.idempotency_keys` and the procedure](#clusteridempotency_keys-and-the-procedure)) |
+| `kimmy_idempotency_peer_replays_total` | Replays answered from a record another member wrote: the write reached this member from the one that took it, and a retry here was answered rather than applied a second time. The cross-member deduplication at work |
+| `kimmy_idempotency_records` | Idempotency records this member holds, read at the scrape from the table's own count: one per keyed request that changed something, kept `storage.oplog_retention_secs` after its last commit. About 200 bytes each for a single-document write, a bulk's stamps for a bulk, the returned document for `find_and_modify` |
+| `kimmy_idempotency_records_received_total{via}` | Records stored from peers, by how they came (one instrument per way on the OTLP bridge, `kimmy.idempotency.records.received.<via>`): `pull` (a window this member pulled), `push` (a window a peer pushed), `replay` (the replay of this member's own origin after a restore), `snapshot` (a snapshot page) and `repair` (a repair's converge page) |
+| `kimmy_idempotency_records_undecodable_total` | Records a peer sent that this build could not decode, and dropped; the write they came with is applied. A record of a newer format is skipped this way, not fatal. **Should read 0** outside a roll |
+| `kimmy_idempotency_records_unfit_total{path}` | Frames and replay pages that could not carry the idempotency records they must, each logged at `WARN`: one record, or the records the sender cannot vouch for by its oplog, larger than a frame (64 MiB less 1 MiB). `pull`: a window a peer pulled whose first entry, or one record, is larger than a frame by itself, answered as one entry that cannot replicate, or with no entries (records that overfill a frame only together with their entry go ahead of it); `push`: a push not sent; `replay`: a page of a peer's replay of its own origin that carried nothing, so that replay stays where it is; **one cause is a record larger than a whole frame (about 63 MiB, a `find_and_modify` holding a document that large): it stalls that replay at its position, logged and counted, until it expires with its window** (a record changed since the replay's records cursor that is larger than half a frame does not stall it: the position's records start over and it crosses as an ordinary record, logged at `WARN` and counted here once for each restart; only a record of the cursor's set counts, and a new or changed record outside it is read with the page's own records); another is a page that the records changed since that cursor fill, which carries them alone and goes no further past the cursor (keyed changes faster than the replay's pages carry them). Records that only overfill a frame together cross as a partial window, or replay pages, of records alone. On the OTLP bridge, `kimmy.idempotency.records.unfit.<path>`. **Should read 0** |
+| `kimmy_idempotency_records_collected_total` | Records retention removed, once `storage.oplog_retention_secs` had passed since their last commit |
 | `kimmy_sync_digest_repairs_total{outcome}` | Document repairs of a confirmed cut-digest finding ([The cut digest](#the-cut-digest)), by outcome: the end of a repair, or the gate that refused to plan one. **`applied`**: the repair ran to its end (whether it worked is the judgement below). **`too_large`**: the collection holds more live documents than `cluster.repair_max_documents`; left to you. **`abandoned`**: three rounds in a row applied nothing. **`transient`**: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation; it changes nothing but the five-minute cooldown. **`skipped_count_repair`**: a count repair of the collection is queued, active or cooling, and the replay lands what a document repair would. **`disabled`**: `cluster.divergence_repair` is off. |
 | `kimmy_sync_digest_repair_judgements_total{result}` | What the loop guard made of a document repair, at the first **compared** digest after it ended. **`effective`**: the digests matched. **`ineffective`**: they differed, and the repair backs off (5 min, 15 min, 45 min, 2 h 15 min, 6 h; a repair that wrote a row at or below the finding's cut lowers the level to 1). **`unjudged`**: no compared digest arrived within the deadline (three rotation periods, at least 30 minutes); every second one in a row counts as an ineffective step. **`recurring`**: the finding cleared and recurred more than three times in an hour and the collection was stopped (`ERROR`, below). |
 | `kimmy_sync_digest_repair_rows_total{result}` | Rows of the pages a document repair pulled. **`applied`**: rows that won last-writer-wins over a row this member held. **`created`**: young lost inserts written (stamped after every tombstone cutoff either member has applied). **`left`**: live rows this member held nothing for and the repair did not write: **read the rule below**. **`left_tombstone`**: tombstone rows this member held nothing for (digest-invisible; they raise no warning). **`superseded`**: rows that addressed a life this member has buried. |
@@ -2041,7 +2115,7 @@ surfaces.
 - more than three clear-and-recur **episodes** in a rolling hour stop the collection for six hours (or an hour with no confirmed finding): `ERROR` `a divergence recurs after repair; repair of this collection is stopped`, `kimmy_sync_digest_repair_stopped_collections` above 0. Episodes are counted per collection and per kind of repair (a digest repair that cleared its finding is no recurrence of a definition finding that stands). Episodes of **different** peers within three rotation periods, capped at 15 minutes, are one: a partition that heals on five members is not a loop. The same peer's recurrence always counts, however many collections the member holds.
 - `WARN` `a divergence repair did not clear the finding; backing off` once, on entering level 2.
 
-**Pace.** A document or definition repair never starves the peer's ordinary replication. After any such pull to a peer, the next contact with it is an ordinary one, whichever repair is next; a document repair's round is at most 20 pages (512 records each) or 10 seconds, and it resumes two contacts later where it stopped. So a repair of a large collection takes twice as many contacts as pulls. A document repair also ends, and is judged, once it has walked this member's live count of the collection at planning plus `cluster.repair_max_documents`, so a collection under heavy inserts cannot hold it for ever.
+**Pace.** A document or definition repair never starves the peer's ordinary replication. After any such pull to a peer, the next contact with it is an ordinary one, whichever repair is next; a document repair's round is at most 20 pages (up to 512 documents each, fewer when they are large) or 10 seconds, and it resumes two contacts later where it stopped. So a repair of a large collection takes twice as many contacts as pulls. A document repair also ends, and is judged, once it has walked this member's live count of the collection at planning plus `cluster.repair_max_documents`, counted in the documents and tombstones its pages carried (a page of idempotency records only counts none), so a collection under heavy inserts cannot hold it for ever.
 
 **What a restart or a member that is down loses.** The loop guard's state (levels, back-offs, episodes) is kept for a member until it has been absent from the live member list for **12 hours**, not just the tick it is down: the cluster has no configured member set to prune by, and a peer that restarts or is cut for seconds would otherwise be repaired again at level 0 on its return. A member removed for good loses its state after the 12 hours. With `cluster.divergence_repair = false` the findings of a removed member are not pruned at all, and the divergence gauges are exactly 0.49.0's.
 
@@ -2390,7 +2464,9 @@ passed**, so a refusal leaves the file exactly as the restore wrote it.
 
 > ⚠️ **A rewound database must not rejoin a cluster that still holds the undone
 > writes.** Anti-entropy would put them straight back. Run it standalone, or
-> rewind every node.
+> rewind every node. After such a rejoin, a keyed request's idempotency record
+> need not come back with its undone write, so a retry of that request may apply
+> it again.
 
 **When one member refuses during an every-member rewind**, bring up none of the
 rewound members: a cluster's rewind is all or none, and a member that was not
@@ -2523,7 +2599,20 @@ one keystroke between recovering and corrupting a cluster's identity space.
 Documents, collection and index metadata, secondary index entries, the oplog and
 its arrival index, tombstones for deleted documents, dropped collections and
 dropped indexes, the **servable** version vector, the user store, the node
-id, and the holes a snapshot left ([a member that took a snapshot](#a-member-that-took-a-snapshot-and-what-it-will-not-serve), which are `META` rows).
+id, the holes a snapshot left ([a member that took a snapshot](#a-member-that-took-a-snapshot-and-what-it-will-not-serve), which are `META` rows),
+and, from 0.52.0, the idempotency records and their rows by stamp (tags 12 and
+13), so a restored member keeps the records of the writes it holds and a retry
+there replays rather than applying on top of a write the backup brought back
+([ADR-240](decisions.md)). A backup that holds a record cannot be restored by
+0.51.x or earlier. **The rows by stamp travel only beside a record**: a backup
+of a store that holds no record carries neither tag, and restores on 0.51.x,
+even when rows whose record is gone remain (a retention pass stopped between
+its chunks leaves some until its next pass). Such a row vouches for nothing:
+every sender passes it over, and with no record there is no stamp the restored
+clock must resume above. The records' change log, `idempotency_changes`, is node-local
+and left out: the first start after the restore begins it again with a new
+epoch (logged at `INFO`), and a snapshot a peer was pulling from this member restarts the records
+of the collection it was in.
 
 **Not everything the node holds.** Three tables are deliberately left out
 because each is node-local and re-derived: the witnessed vector and the
@@ -3070,11 +3159,75 @@ defaults rolls back untouched.
 
 **Rolling back from 0.51.0 to 0.50.x or 0.49.x needs the backup taken before the upgrade.** Storage schema 5 is a rollback boundary ([ADR-238](decisions.md)): from the moment a 0.51.0 start raises `kimmy.format` to schema 5, just before its migration's first commit, 0.50 and 0.49 refuse the store, an interrupted migration's included: `kimmy.redb` and `kimmy.format` are left bytewise as they were and no file is added or removed, but the refusing build rewrites `kimmy.last-exit` to record the failed start (exit `error`, `failed_start`, the cause and a `[previous]` block), which a later 0.51.0 start reads with no effect. They refuse a backup taken on 0.51.0 before the restore creates a file, so the data directory stays empty and nothing is written. A 0.51.0 start that was refused before that point (the free-space check, an unparseable partial filter) leaves a store 0.50 opens. The way back is the backup taken before the upgrade (`BACKUP=true`): restored on 0.50, it loses every write made after it on that member, which the member then catches up from its peers. Wiping the data directory and letting the member catch up from its peers works while no member holds a document whose `_id` is a `Decimal128`.
 
+**Rolling back from 0.52.0 to 0.51.x needs no store work and one edit to the configuration, and a backup 0.52.0 took of a store holding a record does not restore on 0.51.x** ([ADR-240](decisions.md)). The `kimmy.format` schema (still 5), `I_EPOCH`, redb version and entry kinds are unchanged, so 0.51.x opens the store. The store gains three tables, `idempotency`, `idempotency_by_stamp` and the node-local change log `idempotency_changes`, which 0.51.x never opens: its writes, drops and purges leave the records untouched, and its retention pass collects oplog entries and not records. Rolled forward again, every record is judged by its window alone, a record of a collection the older build dropped included (a record outlives a drop of its collection for its window), and they are collected by age; nothing is rebuilt, since the tables are never derived from the oplog, and the change log begins again with its next change. **Remove `cluster.idempotency_keys` from the configuration first**: 0.51.x refuses to start on a configuration that names it, at any value. **Once the switch has been set, rolling back any member reopens the gap it closes** ([below](#clusteridempotency_keys-and-the-procedure)). **A backup is the boundary**: a backup taken by 0.52.0 carries the records as tags 12 and 13, and 0.51.x's `kimmyd restore` refuses a backup that holds either, naming the table it does not know (`backup contains table 12, which this build does not know`); a backup of a store that holds no record carries neither and restores, since the rows by stamp travel only beside a record ([What a backup contains](#what-a-backup-contains)). **If 0.51.x refuses a backup taken on this release, it leaves a `kimmy.redb` in the data directory. Delete it before restoring an older backup there, and never start a node on it**: restore refuses to overwrite an existing database ([Backup and restore](#backup-and-restore)), `kimmyd check-store` calls the file clean, and 0.51.x starts on it as a new, empty member with a new identity (after a warning that the previous run did not shut down cleanly, with a new root user). A standalone node then serves no data, and a clustered one rejoins as a stranger and catches up from its peers. A backup taken by 0.51.x restores into 0.52.0 with no records. The wire's additions (`records` on entries, replays, pushes and snapshot pages, a records position and a `records_base` in the snapshot cursor, `records_epoch` on snapshot pages, `replay`, `replay_records` and `records_ahead_of` on the ask for entries, and `replay_records` on its answer, on a replay page, on the replay's acknowledgement and on the vectors frame, `idempotency_records` in the facts block) are optional fields 0.51.x ignores (it answers a restored member's replay ask as a pull, with no records, and holds none), and a 0.52.0 member reads a 0.51.x block without the field as a member that does not carry records, so it refuses keys while one is live.
+
+#### `cluster.idempotency_keys` and the procedure
+
+**Set `cluster.idempotency_keys = true` only after every member runs 0.52 or
+later, and never in the same change as the binary**: its own configuration
+change, and its own restart of each member. Until then the members of this
+release refuse `Idempotency-Key` with `400` (the default with clustering on is
+`false`), and none lists `idempotency-keys`, so clients branch around it during
+the roll.
+
+**Why not with the binary.** The switch says that records travel with every
+keyed write, which holds only once no member of an older release can relay one.
+A member also refuses keys while a live peer's facts block does not say it
+carries records, but a member that is down is not live and is not asked. The
+failure this order prevents: the switch ships with the binary; A and B run
+0.52, C stops for its upgrade and is down within seconds, so A's live set holds
+only B and A accepts a keyed write. If C's start is then refused and C is
+brought back on 0.51, it pulls that write without its record and serves it on,
+and a member that pulls the write through C holds its effect without the record
+for good: a retry there applies on top of the first application. The net closes
+the gate once C's block is seen, which stops new keyed writes, not that relay.
+
+**Rolling back any member after the switch is set reopens that gap.** The
+rolled-back member serves the keyed writes accepted before the rollback without
+their records for the rest of their window, and until its peers hear its new
+block (up to one lease) they still accept keyed writes, which it relays the
+same way. Setting the switch back to `false` on every member first stops new
+keyed writes, but not the relay of those already accepted. **Before rolling a
+member back to 0.51.x, remove `cluster.idempotency_keys` from its configuration**:
+0.51 refuses to start on a configuration that names the key, at any value
+(`[cluster]` refuses unknown keys). Once its peers hear the rolled-back member,
+they refuse keys again until it is rolled forward.
+
+**A restart opens a short window, and it is answered `503`.** A member that has
+just started, or that SWIM has just seen rejoin or renamed, is live before its
+facts block is heard: its peers, and the member itself for its peers, have not
+yet had a replication contact with it. Until they have (about one contact after `/readyz` answers 200, or a
+sync interval if the member is restarted again within one), a member that cannot yet see every live peer
+say it carries records answers a keyed request `503 peer_unheard`, `retry:
+wait`, `Retry-After: 1`, and does not list
+`idempotency-keys`. Nothing is written, and a client that honours `Retry-After`
+and sends the same request again with the same key, to the same member, is
+answered normally once the block is heard. **The window is bounded by the unheard
+lease**: the longer of `ceil(peers / cluster.fanout) + 2` sync intervals and the
+time SWIM takes to declare a silent member down plus one sync interval, SWIM's time to declare a silent member down being foca's suspect-to-down time (4.8 s) plus two probe periods (1 s each) per live peer (9.8 s for
+three members at a 1 s interval; 15 s, the first term, at the default 5 s). A member that
+stops answering is declared down, and leaves the live set, before it, at any sync
+interval. It is counted from the peer's coming up,
+its rename or this member's rejoin: a live peer still not heard from at its end
+is named by membership's `WARN` (`a live peer has sent no facts block for more
+than a lease`) and counts as one that does not carry records, so the answer
+becomes the `400`, as it is at once for a peer whose block does not decode
+(`a peer sent a facts block that does not decode`). A member that does not say
+it carries records (an older release) decides over a member not heard from: the
+answer is then the `400`, which lasts until that member changes.
+
+**What to watch.** `kimmy_idempotency_requests_total{outcome="gated"}` rising
+after the roll is a member whose switch was not set, or a live member of an
+older release; the refusal's message names which, and its status says whether it
+lasts (`400`) or is the window after a restart (`503 peer_unheard`). With
+clustering off the switch defaults to `true`, and a single node takes keys with
+no setting.
+
 #### `cluster.decimal128` and the marker
 
 **`cluster.decimal128` is a rollback effect, and the marker, not the key, is the authority** ([ADR-238](decisions.md)). A 0.49.x or 0.50.x binary refuses to start on a configuration that names `cluster.decimal128`, at any value (`[cluster]` refuses unknown keys): remove it before rolling a member back. **Setting it back to `false` does not make a rollback possible.** The key gates only the local creation of a document whose `_id` is a `Decimal128` and of an index whose partial filter holds one; what was created stays, and replicates. A member before 0.51 that meets such a document fails every frame that carries it (entries, replays, pushes and snapshot pages are decoded whole), asks for the same window for ever and never catches up; a document whose `_id` is an integral decimal (`Decimal128("5")`, stored as the id `5` with the decimal kept in the body) also fails every full scan of its collection there and that member's snapshot sender.
 
-**Read the marker on every member before a rollback.** `kimmy_decimal128_id_present` (and `decimal128_id_present` on `/readyz`) is `1` once a document whose `_id` is a `Decimal128` has been written or applied on that member; it is never cleared, and a backup carries it. **Once it reads 1 on any member, no member can be rolled back by wiping its data directory and letting it resync on an older build.** A member on an older build that has met such a document is **rolled forward to 0.51**, never wiped and resynced. While the marker is set and a live peer does not say it can hold one, the member logs a `WARN` naming that peer (`a document whose _id is a Decimal128 exists on this member, and a live peer does not say it can hold one`), once and then every ten minutes; a live peer not heard from at all is named once it has been unheard for longer than a lease. A backup restore is offline and is not gated: a backup holding such a document, restored into a cluster that still has a member before 0.51, carries it past the gate.
+**Read the marker on every member before a rollback.** `kimmy_decimal128_id_present` (and `decimal128_id_present` on `/readyz`) is `1` once a document whose `_id` is a `Decimal128` has been written or applied on that member; it is never cleared, and a backup carries it. **Once it reads 1 on any member, no member can be rolled back by wiping its data directory and letting it resync on an older build.** A member on an older build that has met such a document is **rolled forward to 0.51**, never wiped and resynced. While the marker is set and a live peer does not say it can hold one, the member logs a `WARN` naming that peer (`a document whose _id is a Decimal128 exists on this member, and a live peer does not say it can hold one`), once and then every ten minutes; a live peer not heard from at all is named once it has been unheard for longer than the unheard lease ([`cluster.idempotency_keys` and the procedure](#clusteridempotency_keys-and-the-procedure) gives it). **A live peer not heard from yet is a refusal that ends by itself**: while no peer refuses and some live peer has not been heard from within the unheard lease of its start, its rename or this member's rejoin, a gated creation is answered `503 peer_unheard`, `retry: wait`, with `Retry-After: 1`, where 0.51 answered `400`. A peer still not heard from at that lease's end, one whose block does not decode, and one whose held block says it cannot each refuse, and the answer is the `400`; a peer that refuses decides. A backup restore is offline and is not gated: a backup holding such a document, restored into a cluster that still has a member before 0.51, carries it past the gate.
 
 **The procedure.** Set `cluster.decimal128 = true` only once every member runs 0.51 and has finished its storage migration, and as a configuration change and restart of its own, never in the change that upgrades the binary. The gate also refuses while any live member does not advertise the capability, but a member that is stopped for its upgrade, or still migrating, is not live and is not asked: with the key shipped beside the binary, a member whose upgrade is refused and which is brought back on 0.50 meets documents created while it was down and never catches up. The same holds for an index whose partial filter holds a `Decimal128`: created while a member is down or older, it is refused there and never built, even after that member upgrades.
 

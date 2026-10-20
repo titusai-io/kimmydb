@@ -44,7 +44,7 @@ use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 23] = [
+const WALKS: [&str; 25] = [
     ".for_each_doc(",
     ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
@@ -65,6 +65,9 @@ const WALKS: [&str; 23] = [
     // range's fallback, the whole collection walked in the write transaction.
     ".modify_where(",
     ".find_and_modify(",
+    // Their keyed twins (ADR-240), the same walk with the request's record beside it.
+    ".modify_where_keyed(",
+    ".find_and_modify_keyed(",
     // A peer's window: as long as whatever its entries carry, an index build
     // or a collection drop included.
     ".apply_peer_batch_into(",

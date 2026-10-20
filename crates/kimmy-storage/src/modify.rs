@@ -48,6 +48,10 @@ use redb::ReadableTable;
 use crate::docs::extract_id;
 use crate::engine::{WriteTxn, WriterHolder, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
+use crate::idempotency::{
+    Found, IdempotencyRecord, Keyed, KeyedWrite, ModifyRecorded, OutcomeKind, Owner, RecordOutcome,
+    RecordState, ReturnedImage,
+};
 use crate::meta::CollectionMeta;
 use crate::{Engine, codec, index, tables};
 
@@ -175,6 +179,59 @@ pub struct ModifyManyOutcome {
     /// (ADR-084). A multi write reports it too, but it describes the last
     /// document of the last chunk and nothing else.
     pub stamp: Option<Stamp>,
+    /// Matches a keyed request left because their stored stamp is at or above
+    /// its record's `first`: changed after the request's first write, by an
+    /// attempt of it on another member or by another write (ADR-240). Counted here
+    /// and not in `matched`. Always 0 for an unkeyed request.
+    pub skipped: u64,
+    /// Whether this keyed request resumed an earlier attempt that had stopped
+    /// (ADR-240). The counts are then cumulative over every attempt.
+    pub resumed: bool,
+}
+
+/// What one chunk of a filtered write did.
+// A chunk's answer, moved once to the loop that reads it.
+#[allow(clippy::large_enum_variant)]
+enum ChunkEnd {
+    /// Nothing (more) matched.
+    Nothing { examined: u64 },
+    /// `matched` documents matched and were written or left unchanged,
+    /// `skipped` matched and were left by the stamp rule, `entries` is what
+    /// was written, and the next chunk resumes after `last_key`.
+    Matched {
+        examined: u64,
+        matched: usize,
+        skipped: usize,
+        entries: Vec<OplogEntry>,
+        last_key: Vec<u8>,
+        /// Whether the chunk found the request's end past a full budget, by
+        /// its lookahead (G8), and wrote `done`: no chunk follows.
+        ended: bool,
+    },
+    /// The key's record says the request is done: its first answer.
+    Replayed(IdempotencyRecord),
+}
+
+/// What a keyed chunk's lookahead found past its last match (G8).
+enum Lookahead {
+    /// A match the request could write: the request goes on.
+    Writable,
+    /// The scan's end, past `skipped` matches the stamp rule leaves.
+    End { skipped: usize },
+    /// Its budget spent on matches the stamp rule leaves: the next chunk decides.
+    Unknown,
+}
+
+/// A keyed filtered write's hold on its record, across its chunks (ADR-240).
+struct KeyedRun<'k> {
+    keyed: &'k KeyedWrite,
+    /// Whether this request holds the key's in-flight place (a multi request
+    /// does; a single-document one never runs past one transaction).
+    owner: Owner,
+    /// Whether the first chunk has looked the record up.
+    looked: bool,
+    /// The live record as this chunk's transaction read it, under the writer.
+    live: Option<IdempotencyRecord>,
 }
 
 impl Engine {
@@ -208,6 +265,49 @@ impl Engine {
         spec: &dyn ModifySpec,
         stop_after: Option<usize>,
     ) -> Result<ModifyManyOutcome> {
+        self.modify_where_inner(coll, candidates, spec, stop_after, None)
+            .map(crate::idempotency::unkeyed)
+    }
+
+    /// [`Engine::modify_where`] under an idempotency key (ADR-240, see
+    /// [`crate::idempotency`]).
+    ///
+    /// The first chunk looks the record up under its writer: a `done` record
+    /// replays, an `applying` one not running here **resumes** (after its
+    /// cursor only when its origin is this member, and writing only matches
+    /// stored below its merged `first`). Each chunk that writes puts the record
+    /// in its own transaction, `applying` until the chunk that ends the
+    /// request writes `done`; an end found by a chunk that writes nothing, with
+    /// a record standing, is one record-only commit marking it `done`.
+    ///
+    /// A request that may take more than one chunk (`stop_after` other than
+    /// `Some(1)`) holds the key's in-flight place from before its first chunk
+    /// waits for the writer until it returns, however it returns: a duplicate
+    /// meanwhile is [`StorageError::IdempotencyKeyInFlight`].
+    pub fn modify_where_keyed(
+        &self,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        stop_after: Option<usize>,
+        keyed: &KeyedWrite,
+    ) -> Result<Keyed<ModifyManyOutcome>> {
+        let _in_flight = match stop_after {
+            Some(1) => None,
+            _ => Some(self.enter_in_flight(coll.id, &keyed.scope)?),
+        };
+        self.modify_where_inner(coll, candidates, spec, stop_after, Some(keyed))
+    }
+
+    /// The one body of a filtered write, keyed or not.
+    fn modify_where_inner(
+        &self,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        stop_after: Option<usize>,
+        keyed: Option<&KeyedWrite>,
+    ) -> Result<Keyed<ModifyManyOutcome>> {
         let chunk = self.multi_chunk_docs();
         // A request that stops after one document is a client's ordinary
         // write and is attributed as one; anything that may take a chunk is
@@ -217,12 +317,19 @@ impl Engine {
         let holder = if stop_after == Some(1) { WriterHolder::Write } else { WriterHolder::Bulk };
         let mut outcome = ModifyManyOutcome::default();
         let mut after: Option<Vec<u8>> = None;
+        let mut run = keyed.map(|keyed| KeyedRun {
+            keyed,
+            owner: if stop_after == Some(1) { Owner::No } else { Owner::Yes },
+            looked: false,
+            live: None,
+        });
 
         loop {
             // This chunk's budget: the chunk size, or what is left of
-            // `stop_after`, whichever is smaller.
-            let remaining =
-                stop_after.map_or(usize::MAX, |n| n.saturating_sub(outcome.matched as usize));
+            // `stop_after`, whichever is smaller. A match the stamp rule left
+            // is one the request has reached, and counts against it.
+            let reached = (outcome.matched + outcome.skipped) as usize;
+            let remaining = stop_after.map_or(usize::MAX, |n| n.saturating_sub(reached));
             let budget = remaining.min(chunk);
             if budget == 0 {
                 break;
@@ -240,15 +347,20 @@ impl Engine {
                 candidates,
                 spec,
                 budget,
-                after.as_deref(),
+                stop_after,
+                &mut after,
+                run.as_mut(),
+                &mut outcome,
             ) {
-                Ok((examined, None)) => {
+                Ok(ChunkEnd::Replayed(record)) => return Ok(Keyed::Replayed(record)),
+                Ok(ChunkEnd::Nothing { examined }) => {
                     outcome.examined += examined;
                     break;
                 }
-                Ok((examined, Some((matched, entries, last_key)))) => {
+                Ok(ChunkEnd::Matched { examined, matched, skipped, entries, last_key, ended }) => {
                     outcome.examined += examined;
                     outcome.matched += matched as u64;
+                    outcome.skipped += skipped as u64;
                     // A chunk whose matches were all unchanged wrote nothing
                     // and committed nothing (ADR-208): it is not a commit,
                     // and it leaves the last written stamp as it was.
@@ -263,7 +375,7 @@ impl Engine {
                     }
 
                     after = Some(last_key);
-                    if matched < budget {
+                    if ended || matched + skipped < budget {
                         break;
                     }
                 }
@@ -273,7 +385,8 @@ impl Engine {
                 // After it, what the earlier chunks wrote stands, is
                 // published, and replicates, and the answer has to say so
                 // (ADR-192). A commit whose outcome is unknown is counted
-                // apart: it may be there, and may not.
+                // apart: it may be there, and may not. A resumed request's
+                // counts are cumulative, its earlier attempts' included.
                 Err((e, in_doubt)) => {
                     return Err(StorageError::PartiallyApplied {
                         applied: crate::Applied::Modify {
@@ -292,22 +405,32 @@ impl Engine {
             // The caller expected a version to be there, and nothing was.
             return Err(StorageError::Stale { current: None });
         }
-        Ok(outcome)
+        Ok(Keyed::Fresh(outcome))
     }
 
     /// One chunk of [`Self::modify_where`]: match up to `budget` documents
-    /// strictly after `after`, change them, and commit. `None` when nothing
-    /// (more) matched, which commits nothing. Otherwise how many matched, the
-    /// entries to publish, and the key the next chunk resumes after; with,
-    /// either way, how many documents the scan examined. No entries means
-    /// every match was unchanged: the chunk is aborted, not committed, and
-    /// the next one still resumes after its last match (ADR-208).
+    /// strictly after `after`, change them, and commit. [`ChunkEnd::Nothing`]
+    /// when nothing (more) matched, which commits nothing. Otherwise how many
+    /// matched, the entries to publish, and the key the next chunk resumes
+    /// after; with, either way, how many documents the scan examined. No
+    /// entries means every match was unchanged: the chunk is aborted, not
+    /// committed, and the next one still resumes after its last match
+    /// (ADR-208).
     ///
     /// `continuing` is whether the request has already committed a chunk,
     /// which decides how it waits for the writer (ADR-192). A failure comes
     /// with the number of documents whose write is in doubt: the chunk's, if
     /// its commit's outcome is unknown, and otherwise none.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    ///
+    /// **Keyed** (`run`), under this chunk's writer: the first chunk looks the
+    /// record up, and replays or resumes it (a resume moves `after` and folds
+    /// the record's counts into `outcome`); a later one reads the live record,
+    /// merged with whatever arrived since the last. While a record stands, a
+    /// match is written only when its stored stamp is below the record's
+    /// `first`, and the others are skipped. A chunk that writes puts the
+    /// record in its own transaction; one that writes nothing and ends the
+    /// request, with a record standing, commits the record alone, `done`.
+    #[allow(clippy::too_many_arguments)]
     fn modify_chunk(
         &self,
         holder: WriterHolder,
@@ -316,29 +439,76 @@ impl Engine {
         candidates: &Candidates,
         spec: &dyn ModifySpec,
         budget: usize,
-        after: Option<&[u8]>,
-    ) -> std::result::Result<(u64, Option<(usize, Vec<OplogEntry>, Vec<u8>)>), (StorageError, u64)>
-    {
+        stop_after: Option<usize>,
+        after: &mut Option<Vec<u8>>,
+        mut run: Option<&mut KeyedRun<'_>>,
+        outcome: &mut ModifyManyOutcome,
+    ) -> std::result::Result<ChunkEnd, (StorageError, u64)> {
         fn none(e: impl Into<StorageError>) -> (StorageError, u64) {
             (e.into(), 0)
         }
         let txn =
             if continuing { self.begin_write_continuing(holder) } else { self.begin_write(holder) }
                 .map_err(none)?;
-        let (matches, examined) =
-            match self.collect_matches(&txn, coll, candidates, spec, Some(budget), after, true) {
-                Ok(found) => found,
+        if let Some(run) = run.as_deref_mut() {
+            match self.chunk_record(&txn, coll, run, after, outcome) {
+                Ok(None) => {}
+                Ok(Some(record)) => {
+                    return match self.replay(txn, coll, record, OutcomeKind::Modify) {
+                        Ok(Keyed::Replayed(record)) => Ok(ChunkEnd::Replayed(record)),
+                        Ok(Keyed::Fresh(())) => unreachable!("a replay answers with its record"),
+                        Err(e) => Err(none(e)),
+                    };
+                }
                 Err(e) => {
                     txn.abort().map_err(none)?;
                     return Err(none(e));
                 }
-            };
+            }
+        }
+        let (matches, examined) = match self.collect_matches(
+            &txn,
+            coll,
+            candidates,
+            spec,
+            Some(budget),
+            after.as_deref(),
+            true,
+            None,
+        ) {
+            Ok(found) => found,
+            Err(e) => {
+                txn.abort().map_err(none)?;
+                return Err(none(e));
+            }
+        };
+        // Whether this chunk ends the request: it found fewer than its budget,
+        // or reached `stop_after`.
+        let ends = matches.len() < budget
+            || stop_after
+                .is_some_and(|n| (outcome.matched + outcome.skipped) as usize + matches.len() >= n);
 
         let Some(last) = matches.last() else {
             // Nothing (more) matched: a no-op must not commit, mint or
-            // publish.
+            // publish. A keyed request whose record stands has reached its
+            // end here, and says so in one commit of the record alone.
+            if let Some(run) = run.as_deref()
+                && run.live.is_some()
+            {
+                let at = after.clone();
+                return match self.record_done_alone(&txn, coll, run, outcome, 0, 0, at) {
+                    Ok(()) => match txn.commit() {
+                        Ok(()) => Ok(ChunkEnd::Nothing { examined }),
+                        Err(e) => Err(none(e)),
+                    },
+                    Err(e) => {
+                        txn.abort().map_err(none)?;
+                        Err(none(e))
+                    }
+                };
+            }
             txn.abort().map_err(none)?;
-            return Ok((examined, None));
+            return Ok(ChunkEnd::Nothing { examined });
         };
         let last_key = match extract_id(&last.doc).and_then(|id| crate::docs::doc_key(&id)) {
             Ok(key) => key,
@@ -348,8 +518,18 @@ impl Engine {
             }
         };
 
+        // The stamp rule (ADR-240): while the key's record stands, a match whose
+        // stored stamp is at or above its merged `first` changed after the
+        // request's first write, by an attempt of this request somewhere or by
+        // another write, and is left as it is.
+        let first = run.as_deref().and_then(|run| run.live.as_ref()).map(|live| live.first);
+        let mut skipped = 0usize;
         let mut entries = Vec::with_capacity(matches.len());
         for found in &matches {
+            if first.is_some_and(|first| found.stamp >= first) {
+                skipped += 1;
+                continue;
+            }
             match self.modify_in_txn(&txn, coll, found, spec) {
                 Ok((_, entry)) => entries.extend(entry),
                 Err(e) => {
@@ -358,19 +538,265 @@ impl Engine {
                 }
             }
         }
+        let matched = matches.len() - skipped;
+        let found = |entries| ChunkEnd::Matched {
+            examined,
+            matched,
+            skipped,
+            entries,
+            last_key: last_key.clone(),
+            ended: false,
+        };
 
         if entries.is_empty() {
             // Matched, and nothing changed: the same rule as nothing
-            // matched, since the transaction holds no write (ADR-208).
+            // matched, since the transaction holds no document write
+            // (ADR-208). A keyed request at its end with a record standing
+            // marks it done, in a commit of the record alone.
+            if let Some(run) = run.as_deref()
+                && run.live.is_some()
+                && ends
+            {
+                let at = Some(last_key.clone());
+                return match self.record_done_alone(&txn, coll, run, outcome, matched, skipped, at)
+                {
+                    Ok(()) => match txn.commit() {
+                        Ok(()) => Ok(found(entries)),
+                        Err(e) => Err(none(e)),
+                    },
+                    Err(e) => {
+                        txn.abort().map_err(none)?;
+                        Err(none(e))
+                    }
+                };
+            }
             txn.abort().map_err(none)?;
-            return Ok((examined, Some((matches.len(), entries, last_key))));
+            return Ok(found(entries));
+        }
+
+        // The lookahead (G8): a keyed chunk that wrote and filled its budget
+        // looks past its last match for one more match it could write, within a
+        // budget of as many matches again. Finding the end instead, it writes
+        // `done` in its own record, so a member that takes this chunk's entry
+        // takes the request's end with it; a record-only `done` commit after it
+        // would keep this `last`, and never reach such a member.
+        let mut ends = ends;
+        let mut skipped_ahead = 0usize;
+        if !ends && let Some(run) = run.as_deref() {
+            let first = run.live.as_ref().map(|live| live.first);
+            match self.lookahead(&txn, coll, candidates, spec, budget, &last_key, first) {
+                Ok(Lookahead::Writable | Lookahead::Unknown) => {}
+                Ok(Lookahead::End { skipped }) => {
+                    ends = true;
+                    skipped_ahead = skipped;
+                }
+                Err(e) => {
+                    txn.abort().map_err(none)?;
+                    return Err(none(e));
+                }
+            }
+        }
+
+        // The record, in this chunk's transaction: `applying` until the chunk
+        // that ends the request, from this chunk's first entry to its last (L1).
+        if let Some(run) = run.as_deref() {
+            let (first_entry, last_entry) = (entries[0].stamp, entries[entries.len() - 1].stamp);
+            let record = IdempotencyRecord {
+                fingerprint: run.keyed.fingerprint,
+                first: first_entry,
+                last: last_entry,
+                origin: self.node_id(),
+                state: if ends { RecordState::Done } else { RecordState::Applying },
+                outcome: RecordOutcome::Modify(ModifyRecorded {
+                    matched: outcome.matched + matched as u64,
+                    modified: outcome.modified + entries.len() as u64,
+                    skipped: outcome.skipped + (skipped + skipped_ahead) as u64,
+                    commits: outcome.commits + 1,
+                    stamp: entries.last().map(|entry| entry.stamp),
+                    cursor: Some(last_key.clone()),
+                    resumed: outcome.resumed,
+                }),
+                contested: false,
+            };
+            if let Err(e) =
+                self.put_record(&txn, coll.id, &run.keyed.scope, run.live.as_ref(), &record)
+            {
+                txn.abort().map_err(none)?;
+                return Err(none(e));
+            }
         }
 
         match txn.commit() {
-            Ok(()) => Ok((examined, Some((matches.len(), entries, last_key)))),
-            Err(e @ StorageError::OutcomeUnknown(_)) => Err((e, entries.len() as u64)),
+            Ok(()) => Ok(ChunkEnd::Matched {
+                examined,
+                matched,
+                skipped: skipped + skipped_ahead,
+                entries,
+                last_key,
+                ended: ends,
+            }),
+            Err(e @ StorageError::OutcomeUnknown(_)) => {
+                let in_doubt = entries.len() as u64;
+                Err((e, in_doubt))
+            }
             Err(e) => Err(none(e)),
         }
+    }
+
+    /// A keyed chunk's record, under its writer (ADR-240). The first chunk looks it
+    /// up: a `done` one comes back to be replayed; an `applying` one is
+    /// resumed, which moves `after` to its cursor when this member is its
+    /// origin (from the beginning otherwise: a cursor from another member
+    /// would pass over documents here that attempt never saw) and folds its
+    /// counts into `outcome`. A later chunk reads the live record again.
+    fn chunk_record(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        run: &mut KeyedRun<'_>,
+        after: &mut Option<Vec<u8>>,
+        outcome: &mut ModifyManyOutcome,
+    ) -> Result<Option<IdempotencyRecord>> {
+        if run.looked {
+            run.live = self.keyed_live_record(txn, coll, run.keyed)?;
+            return Ok(None);
+        }
+        run.looked = true;
+        match self.keyed_lookup(txn, coll, run.keyed, run.owner)? {
+            Found::Absent => run.live = None,
+            Found::Done(record) => return Ok(Some(record)),
+            Found::Applying(record) => {
+                let RecordOutcome::Modify(recorded) = &record.outcome else {
+                    // Another kind of request under the key: refused by the
+                    // replay.
+                    return Ok(Some(record));
+                };
+                *after =
+                    if record.origin == self.node_id() { recorded.cursor.clone() } else { None };
+                outcome.matched = recorded.matched;
+                outcome.modified = recorded.modified;
+                outcome.skipped = recorded.skipped;
+                outcome.commits = recorded.commits;
+                outcome.stamp = recorded.stamp;
+                outcome.resumed = true;
+                self.log_resume(coll, &record);
+                run.live = Some(record);
+            }
+        }
+        Ok(None)
+    }
+
+    /// The commit of a record alone, `done` (ADR-240): a keyed request's end found
+    /// by a chunk that wrote nothing, with its record standing. Its `last` is
+    /// the standing record's ([`Self::done_alone_last`]), so the commit has no
+    /// entry of its own; at that equal `last`, `done` beats the `applying` it
+    /// replaces wherever the two meet.
+    ///
+    /// **The residual (G8).** The last writing chunk's lookahead finds the end
+    /// itself and writes `done` there, unless it cannot tell that chunk ends the
+    /// request: its budget runs out on matches the stamp rule leaves, or it
+    /// finds a match it could write that no later chunk then writes (the spec
+    /// leaves it unchanged, ADR-208, or another writer rewrites it between the
+    /// two chunks, so the stamp rule leaves it). Then a later chunk finds the
+    /// end having written nothing, and this commit marks it, and a member
+    /// that took the last writing chunk's entry before it, and so covers that
+    /// `last`, never receives `done`: a retry there resumes (`resumed: true`,
+    /// its counts cumulative, the request's own writes left by the stamp rule)
+    /// where it would replay. Never a double.
+    #[allow(clippy::too_many_arguments)]
+    fn record_done_alone(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        run: &KeyedRun<'_>,
+        outcome: &ModifyManyOutcome,
+        matched: usize,
+        skipped: usize,
+        cursor: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let live = run.live.as_ref().expect("a record-only commit is made over a live record");
+        let record = IdempotencyRecord {
+            fingerprint: run.keyed.fingerprint,
+            first: live.first,
+            last: self.done_alone_last(live),
+            origin: self.node_id(),
+            state: RecordState::Done,
+            outcome: RecordOutcome::Modify(ModifyRecorded {
+                matched: outcome.matched + matched as u64,
+                modified: outcome.modified,
+                skipped: outcome.skipped + skipped as u64,
+                commits: outcome.commits,
+                stamp: outcome.stamp,
+                cursor,
+                resumed: outcome.resumed,
+            }),
+            contested: false,
+        };
+        self.put_record(txn, coll.id, &run.keyed.scope, Some(live), &record)?;
+        Ok(())
+    }
+
+    /// The `last` of a record-only `done` commit (G8): the standing record's,
+    /// minting nothing. The one place it is decided.
+    fn done_alone_last(&self, live: &IdempotencyRecord) -> Stamp {
+        live.last
+    }
+
+    /// The lookahead of a keyed chunk that wrote and filled its budget (G8), in
+    /// that chunk's transaction: matches past `last_key`, **stopping at the
+    /// first one the request could write** (stored below its merged `first`;
+    /// every one, before a record exists, since this chunk's entries are minted
+    /// above every stored stamp), and at most `budget` of them.
+    /// [`Lookahead::Writable`] when it finds one; [`Lookahead::End`] when the
+    /// scan ends first, with how many matches the stamp rule would leave;
+    /// [`Lookahead::Unknown`] when the budget runs out on such matches.
+    ///
+    /// **What it adds to the writer's hold.** A chunk's hold is bounded by its
+    /// match budget, `Some(budget)` to [`Self::collect_matches`] (ADR-086; the
+    /// rows a scan passes between matches are bounded by nothing but
+    /// `close_writes` at a stop, ADR-192, and `examined` only reports them).
+    /// The lookahead adds one match where the request goes on (the first match
+    /// past the chunk, when it is writable, which is the case unless another
+    /// writer rewrote the tail after the request began), and at most `budget`
+    /// matches over a tail the stamp rule leaves.
+    ///
+    /// **An end found here ends the request, and never at the cost of a
+    /// double.** A document written later on this member, or by a member that
+    /// had witnessed the request's entries, is stamped above the request's
+    /// `first`, so the stamp rule would leave it. One written below `first` by
+    /// a member that had not seen the request can still replicate in after the
+    /// end, matching the filter: the request never writes it, which is
+    /// under-application, never a double.
+    #[allow(clippy::too_many_arguments)]
+    fn lookahead(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        budget: usize,
+        last_key: &[u8],
+        first: Option<Stamp>,
+    ) -> Result<Lookahead> {
+        let writable = |found: &Match| first.is_none_or(|first| found.stamp < first);
+        let (ahead, _) = self.collect_matches(
+            txn,
+            coll,
+            candidates,
+            spec,
+            Some(budget),
+            Some(last_key),
+            false,
+            Some(&writable),
+        )?;
+        if ahead.iter().any(writable) {
+            return Ok(Lookahead::Writable);
+        }
+        Ok(if ahead.len() < budget {
+            Lookahead::End { skipped: ahead.len() }
+        } else {
+            Lookahead::Unknown
+        })
     }
 
     /// Find one document, change it, and return it — atomically.
@@ -380,7 +806,78 @@ impl Engine {
         candidates: &Candidates,
         spec: &dyn ModifySpec,
     ) -> Result<ModifyOutcome> {
+        self.find_and_modify_inner(coll, candidates, spec, None).map(crate::idempotency::unkeyed)
+    }
+
+    /// [`Engine::find_and_modify`] under an idempotency key (ADR-240). The record
+    /// keeps the flags, the upserted `_id` as the stored body holds it, and
+    /// the `returned` image, the one the caller answers with. An upsert's seed
+    /// without `_id` is given the key's derived one for position 0.
+    pub fn find_and_modify_keyed(
+        &self,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        keyed: &KeyedWrite,
+        returned: ReturnedImage,
+    ) -> Result<Keyed<ModifyOutcome>> {
+        self.find_and_modify_inner(coll, candidates, spec, Some((keyed, returned)))
+    }
+
+    /// The one body of a `find_and_modify`, keyed or not.
+    fn find_and_modify_inner(
+        &self,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        keyed: Option<(&KeyedWrite, ReturnedImage)>,
+    ) -> Result<Keyed<ModifyOutcome>> {
         let txn = self.begin_write(WriterHolder::Write)?;
+        if let Some((keyed, _)) = keyed {
+            match self.keyed_lookup(&txn, coll, keyed, Owner::No) {
+                Ok(Found::Absent) => {}
+                Ok(Found::Done(record) | Found::Applying(record)) => {
+                    return self.replay(txn, coll, record, OutcomeKind::FindAndModify);
+                }
+                Err(e) => {
+                    txn.abort()?;
+                    return Err(e);
+                }
+            }
+        }
+        // The record of what this attempt wrote, in its transaction (ADR-240).
+        let recorded =
+            |outcome: &ModifyOutcome, first: Stamp| -> Option<(KeyedWrite, IdempotencyRecord)> {
+                let (keyed, returned) = keyed?;
+                let document = match returned {
+                    ReturnedImage::Before => outcome.before.clone(),
+                    ReturnedImage::After => outcome.after.clone(),
+                };
+                // The created document's own `_id`, as its stored body holds it:
+                // a rendered value, never a `DocId`.
+                let upserted_id = outcome.upserted.as_ref().map(|id| {
+                    outcome
+                        .after
+                        .as_ref()
+                        .and_then(|doc| doc.get(crate::docs::ID_FIELD))
+                        .cloned()
+                        .unwrap_or_else(|| id.to_bson())
+                });
+                let record = IdempotencyRecord::written(
+                    keyed,
+                    first,
+                    self.node_id(),
+                    RecordOutcome::FindAndModify {
+                        matched: outcome.matched,
+                        modified: outcome.modified,
+                        removed: outcome.matched && outcome.after.is_none(),
+                        upserted_id,
+                        stamp: outcome.stamp,
+                        document,
+                    },
+                );
+                Some((*keyed, record))
+            };
 
         let chosen = match self.choose(&txn, coll, candidates, spec) {
             Ok(chosen) => chosen,
@@ -400,15 +897,20 @@ impl Engine {
             }
             let Some(doc) = spec.upsert() else {
                 txn.abort()?;
-                return Ok(ModifyOutcome::default());
+                return Ok(Keyed::Fresh(ModifyOutcome::default()));
             };
-            let doc = match doc {
+            let mut doc = match doc {
                 Ok(doc) => doc,
                 Err(e) => {
                     txn.abort()?;
                     return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(e)));
                 }
             };
+            if let Some((keyed, _)) = keyed
+                && !doc.contains_key(crate::docs::ID_FIELD)
+            {
+                doc.insert(crate::docs::ID_FIELD, keyed.derived_id(coll.id, 0));
+            }
             let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -419,10 +921,8 @@ impl Engine {
             let inserted: Document = bson::deserialize_from_slice(
                 entry.body.as_deref().expect("an insert carries its body"),
             )?;
-            txn.commit()?;
             let stamp = entry.stamp;
-            self.publish(vec![entry]);
-            return Ok(ModifyOutcome {
+            let outcome = ModifyOutcome {
                 before: None,
                 after: Some(inserted),
                 matched: false,
@@ -431,7 +931,16 @@ impl Engine {
                 modified: false,
                 upserted: Some(id),
                 stamp: Some(stamp),
-            });
+            };
+            if let Some((keyed, record)) = recorded(&outcome, stamp)
+                && let Err(e) = self.put_record(&txn, coll.id, &keyed.scope, None, &record)
+            {
+                txn.abort()?;
+                return Err(e);
+            }
+            txn.commit()?;
+            self.publish(vec![entry]);
+            return Ok(Keyed::Fresh(outcome));
         };
 
         let (next, entry) = match self.modify_in_txn(&txn, coll, &chosen, spec) {
@@ -443,28 +952,38 @@ impl Engine {
         };
 
         // Unchanged: nothing was written, so nothing is committed, minted or
-        // published, and the document keeps the stamp it had (ADR-208).
-        let stamp = match entry {
-            Some(entry) => {
-                txn.commit()?;
-                let stamp = entry.stamp;
-                self.publish(vec![entry]);
-                Some(stamp)
-            }
-            None => {
-                txn.abort()?;
-                None
-            }
+        // published, and the document keeps the stamp it had (ADR-208). Nor
+        // is anything recorded: a request that changed nothing is evaluated
+        // again when it is sent again.
+        let Some(entry) = entry else {
+            txn.abort()?;
+            return Ok(Keyed::Fresh(ModifyOutcome {
+                before: Some(chosen.doc),
+                after: next,
+                matched: true,
+                modified: false,
+                upserted: None,
+                stamp: None,
+            }));
         };
-
-        Ok(ModifyOutcome {
+        let stamp = entry.stamp;
+        let outcome = ModifyOutcome {
             before: Some(chosen.doc),
             after: next,
             matched: true,
-            modified: stamp.is_some(),
+            modified: true,
             upserted: None,
-            stamp,
-        })
+            stamp: Some(stamp),
+        };
+        if let Some((keyed, record)) = recorded(&outcome, stamp)
+            && let Err(e) = self.put_record(&txn, coll.id, &keyed.scope, None, &record)
+        {
+            txn.abort()?;
+            return Err(e);
+        }
+        txn.commit()?;
+        self.publish(vec![entry]);
+        Ok(Keyed::Fresh(outcome))
     }
 
     /// Apply the spec to one matched document and write the result.
@@ -510,7 +1029,7 @@ impl Engine {
         // to `MAX_CANDIDATES` of them would otherwise be held twice over
         // under the writer.
         let (mut matches, _) =
-            self.collect_matches(txn, coll, candidates, spec, None, None, false)?;
+            self.collect_matches(txn, coll, candidates, spec, None, None, false, None)?;
 
         if matches.is_empty() {
             return Ok(None);
@@ -558,6 +1077,7 @@ impl Engine {
         limit: Option<usize>,
         after: Option<&[u8]>,
         keep_bodies: bool,
+        stop_at: Option<&dyn Fn(&Match) -> bool>,
     ) -> Result<(Vec<Match>, u64)> {
         let mut matches: Vec<Match> = Vec::new();
         let mut examined = 0u64;
@@ -579,6 +1099,9 @@ impl Engine {
                         "the filter matched more than {MAX_CANDIDATES} documents; \
                      narrow the filter, or add an index and a tighter one"
                     ))));
+                }
+                if stop_at.is_some_and(|stop| matches.last().is_some_and(stop)) {
+                    return Ok(false);
                 }
                 Ok(!limit.is_some_and(|n| matches.len() >= n))
             };
@@ -1876,7 +2399,15 @@ mod tests {
         let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
         assert_eq!(
             out,
-            ModifyManyOutcome { examined: 2, matched: 2, modified: 0, commits: 0, stamp: None }
+            ModifyManyOutcome {
+                examined: 2,
+                matched: 2,
+                modified: 0,
+                commits: 0,
+                stamp: None,
+                skipped: 0,
+                resumed: false,
+            }
         );
         assert_eq!(footprint(&engine, &coll, &[1, 2]), before, "nothing reached the store");
         assert!(drain(&mut rx).is_empty(), "nothing was published");

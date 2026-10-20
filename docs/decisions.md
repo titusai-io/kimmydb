@@ -4201,6 +4201,11 @@ behaviour change for a configuration nobody should have had.
 > failure after the first commit answers `500 partially_applied`, `verify`,
 > with the counts of the committed chunks.
 
+> **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records).** A
+> keyed request's later chunks write a match only if its stamp is below the
+> request's first write, and count the rest in `skipped`, so two attempts of
+> one request on two members never write what the other wrote.
+
 **Decision.** `update` and `delete` with `multi: true` commit in chunks of
 `storage.multi_chunk_docs` documents (default 1,000; 1 to 10,000). Each chunk
 is one write transaction, matched and written inside it exactly as ADR-083
@@ -20856,6 +20861,11 @@ addendum). The cluster harness's burst test asserts at most N.
 
 ## ADR-192 — A request that commits more than once keeps going after its first commit, and a failure after it says what landed
 
+> **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records).** A
+> `partially_applied` request sent with an `Idempotency-Key` is recovered by
+> sending it again with the same key: it resumes, and never writes a document
+> twice. The marker remains the answer for a request without one.
+
 **Decision.** A request whose effect takes more than one write transaction
 follows one rule, after MongoDB's for `updateMany` and `deleteMany`:
 
@@ -28285,7 +28295,7 @@ The roll is member-at-a-time, and 0.49 and 0.51 may share a cluster if an operat
 A 0.49 or 0.50 member cannot hold a `Decimal128` `_id`, and cannot parse a `Decimal128` partial-filter bound: an entry or page that carries the new `DocId` variant fails to decode, the window is requested for ever, and a refused index definition is recorded, never retried, and survives the member's own upgrade. So accepting either is an operator declaration, the featureCompatibilityVersion pattern.
 - **The switch.** `cluster.decimal128` (bool), default `true` when clustering is off and `false` when it is on. It states that every member runs 0.51 and has migrated, and it gates local creation only. An entry, a page, a restored or a repaired definition from another member is always applied; refusing one would wedge replication.
 - **Three chokepoints**, keyed on the BSON type of the `_id`, not on the `DocId` variant (an integral decimal is an `Int64` with a decimal body, which breaks an older member's full scans): `check_insert` (insert, bulk, scope inserts, upserts and `$setOnInsert`), `replace_in_txn` (only when the replace creates the row; a replace over an existing decimal `_id` is not refused), and a local `create_index` that mints such a definition (a new one, or the re-stamp of an inherited one): an identical standing definition is the idempotent answer and a duplicate `_id` is `DuplicateKey`, as for any index or id. Each refuses with `400`, naming `cluster.decimal128` and the peers that do not advertise it.
-- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease.
+- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease. **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) (0.52.0):** the refusal tells the net's two causes apart. A live peer that does not say `decimal128` is the `400`, and decides: its held block says otherwise or nothing of it (an older build), its last block did not decode, or no block of it has arrived for more than the unheard lease (ADR-240 item 7: the longer of the lease and SWIM's time to declare a silent member down plus one sync interval) since it came up, was renamed or this member rejoined. A live peer with no block held within that lease, with none refusing, is `503 peer_unheard`, `retry: wait`, `Retry-After: 1`, since it is heard at the next contact. 0.51 answered that case `400`.
 - **The marker.** A `META` row `decimal128:id_present` is written in the transaction that writes or applies the first document whose body `_id` has BSON type `Decimal128`: at `write_insert`, `replace_in_txn`, `write_chosen`, and in `apply_remote_in_txn` (entries, `All` and scoped pages, the deletes a page carries, `Converge` rows), and a backup carries it. It is exposed as the gauge `kimmy_decimal128_id_present`, a `/readyz` field, and a WARN once per peer and every ten minutes while it is set and a live peer cannot hold such an id. **The marker, not the key, is the authority**: the key can be set back to `false` and the ids remain.
 - **The procedure.** Set `cluster.decimal128` only after every member runs 0.51 and has finished its migration, and never in the same change as the binary. The same procedure covers a decimal partial-filter bound.
 - **Mutation rows.** 31 rows are killed, among them: the BSON-type test replaced by the variant at both chokepoints, the key ignored, the net removed, an unheard peer passing, the marker unwritten or keyed on the variant, any of the three chokepoints ungated, the third chokepoint gating replicated definitions, the integer normalisation removed, and `to_bson` not re-padding.
@@ -28624,6 +28634,640 @@ delete leaving no chunk in either format, the rescan moving or re-embedding, one
 0.50 write and a twin delete judged again when the roll ends). `kimmy-cluster`: the roll read from the facts blocks,
 and the field's lenient decode. `kimmy-api`: V2, V3 (both join directions, with debris) and V5 inverted. Mutation rows
 in bash, one per clause.
+
+---
+
+## ADR-240 — Idempotency keys: the record is written with the write and travels with it, and a member takes keys only while every member carries records
+
+> **Amends [ADR-086](#adr-086--a-multi-write-commits-in-bounded-chunks)**, whose later chunks write every match they
+> reach: a keyed request's later chunks leave a match written after the request's first write (item 4). **Amends
+> [ADR-192](#adr-192--a-request-that-commits-more-than-once-keeps-going-after-its-first-commit-and-a-failure-after-it-says-what-landed)**,
+> whose `partially_applied` a client could only recover with a marker of its own: a keyed one is recovered by sending
+> it again with its key. Three tables are added: `idempotency` and `idempotency_by_stamp`, carried by a backup as tags
+> 12 and 13, which are a backup rollback boundary, and `idempotency_changes`, a node-local change log no backup carries.
+> No `kimmy.format` schema (still 5), `I_EPOCH`, existing codec or entry kind changes. One configuration key
+> (`cluster.idempotency_keys`), fourteen optional wire fields (`replay`, `replay_records` and `records_ahead_of` on
+> `AskEntries`, `records` and `replay_records` on `Entries` and on `ReplayEntries`, `replay_records` on `ReplayAck` and
+> on `Vectors`, `records` on `Push`, `records` (the records position) and `records_base` on a snapshot cursor, `records`
+> and `records_epoch` on a snapshot page), in three new wire types
+> (`CarriedRecord`: `collection`, `scope`, an optional `carrying` and `record`; `RecordsBase`: `key` and an optional
+> `epoch`; `ReplayRecords`: `at`, `through`, `collections`, `collection`, `scope` and `base`), one facts field
+> (`idempotency_records`), three error codes, a capability, a version field and a response header are added.
+> **Amends [ADR-238](#adr-238--a-stored-number-is-an-exact-value-a-decimal128-has-a-place-in-the-order-and-number-keys-are-exact-and-variable-length-storage-schema-5)**,
+> whose gate answered a live member not heard from yet with the same `400` as one that cannot hold a decimal: both
+> gates now answer it `503 peer_unheard` (item 7).
+
+**The case.** A write has three outcomes: it happened, it did not, or it is not known whether it did, which a client
+meets as `500 outcome_unknown` or, more often, as a connection that closed after the request was sent, because a member
+whose own fsync fails stops (ADR-188). Until now a client could send again only a write that was idempotent already (a
+client `_id`, an `if_stamp`, a complete replace): an insert with a server-assigned `_id` or a `$inc` had to be read back
+first, and a `multi: true` request answered `partially_applied` (ADR-192) needed a marker of the client's own in the
+request. The draft that standardises the header (draft-ietf-httpapi-idempotency-key-header-07, expired, no RFC) assumes
+one resource state. A leaderless cluster has one per member, and the member most likely to hold the only copy of a write
+whose outcome is unknown is the one that has just stopped. So a key has to be remembered with the write itself, travel
+with it, and not be offered while any member could carry the write without it.
+
+**Decision.**
+
+1. **The contract** (`kimmy-core` `IdempotencyKey`, `kimmy-api`). A document write may carry `Idempotency-Key`, an RFC
+   9651 String of 16 to 255 printable ASCII characters once unescaped, with no parameters; the MCP tools `insert`,
+   `insert_many`, `update` and `delete` take the same value as the argument `idempotency_key`. The routes that take it
+   are insert, bulk, replace and delete by id, update, `find_and_modify` and delete. **Every other route refuses it with
+   `400`**, the health probes, `/metrics`, `/v1/version`, login and `/mcp` itself included, and so do `update` and
+   `delete` with `explain: true`: a client that believes it is protected and is not is worse off than one told no
+   (ADR-121, ADR-124). A key belongs to a principal (`principal_key`, its name) and a collection, and is remembered
+   under SHA-256 over a domain tag, the principal and the key; the key itself is never stored. A retry is the same
+   request when its fingerprint is: SHA-256 over the method, the route template, the path and query as sent and the
+   body bytes as sent (a delete by id hashes an empty body; an MCP call, the tool and its typed arguments without the
+   key). The same request replays the first answer, status and body, with `Idempotency-Replayed: ?1` (on MCP,
+   `"kimmydb/idempotency-replayed": true` in the result's `_meta`), and writes nothing; another request under a
+   remembered key is `422 idempotency_key_reused`, `retry: no`, and so is every retry under a key two members accepted
+   for two requests once their records have met (a **contested** record, item 5); a duplicate of a `multi: true` request this member is
+   running or answering is `409 idempotency_key_in_flight`, `retry: wait`, `Retry-After: 1` (item 4). A request that
+   changed nothing (refused, matched nothing, unchanged under ADR-208) leaves no record, so its retry is evaluated
+   again. Authorization runs before the record is read, so a revoked grant is `403`, never a replay. A keyed insert
+   without `_id`, each bulk position and a `find_and_modify` upsert's seed get a **derived `_id`**: a UUID version 8
+   built as RFC 9562 Appendix B.2 builds a name-based one, over the collection id, the scope, the request's fingerprint
+   and the position, stored as its 36-character string. Two applications of one request on two members then land on one
+   document key, and a key reused for another request derives another `_id` and never replaces a document. A key is
+   remembered `storage.oplog_retention_secs` after the record's `last`, the window in which the write itself replicates
+   by pull, published as `idempotencyWindowSecs` on `GET /v1/version`; `idempotency-keys` is listed while the member
+   takes keys. **The order of the refusals:** the route's refusal and a malformed key's are made before authentication,
+   as a query string's is, since they read the header and the route and nothing else; the gate (item 7) is asked after
+   authentication and **before authorization**, in the extractors that read the body (and in the MCP tool before it
+   runs), so a keyed request with no token is `401`, and one from a principal without the write grant meets the gate's
+   `400` before RBAC's `403` (the gate can name a member, and any authenticated principal can read node ids on
+   `/v1/topology` already); `explain`'s refusal is made after authorization, since only the body says it. Where this
+   departs from the draft: the error envelope is KimmyDB's (ADR-057) and carries no `Link`; single-transaction
+   duplicates are serialised by the writer, not refused `409`; a request that changed nothing is not recorded; a partly
+   applied request resumes rather than replaying its error; unsupported routes refuse the header; the replay marker is
+   KimmyDB's own, since the draft defines none and without one a client cannot tell a replay from a second application;
+   and a retry on another member is not one resource state (item 5).
+
+2. **The record, in the write's own transaction** (`kimmy-storage`, `idempotency.rs`). Each write path has a keyed twin
+   sharing its body (`insert_keyed`, `insert_many_keyed`, `replace_keyed`, `delete_keyed`, `modify_where_keyed`,
+   `find_and_modify_keyed`), so no unkeyed call site changes. Inside the write transaction it already opens, under the
+   writer, it looks the record up, writes as before and, if it wrote, puts the record and its rows, then commits and
+   publishes. That lookup is the only one, so two duplicates on one member serialise there. The record has its own
+   codec behind a leading version byte (`RECORD_FORMAT` 1): the fingerprint; `first`, the stamp of the first entry the
+   request wrote (after a merge, the smallest of its attempts'); `last`; the origin member; `applying` or `done`, with
+   the state byte's high bit (`0x80`) set when the record is contested (a record written without it reads as not
+   contested); and the outcome the first answer is rendered from, through the function that rendered it (an insert's stamp, a bulk's
+   stamps, a replace's flags, a delete's count, a filtered write's cumulative counts, `commits`, cursor and whether it
+   resumed, a `find_and_modify`'s flags, upserted `_id` and returned document), never the response bytes, which would
+   tie a record to one build's rendering. **`last` is the stamp of the last entry the commit that last changed the
+   record wrote**: for a commit of one entry, that entry's; for a bulk, a chunk of a filtered write, a replace, a
+   `find_and_modify` or a delete, the highest stamp it wrote; and the record's row moves with it. Insert and bulk
+   records keep no ids: a replay's body is the same, and a derived `_id` is derived again, which keeps a large-id bulk's
+   record, and its frame, small. A record is replayed only to its own kind of request; another kind is a key reused.
+   **The tables.** `idempotency` maps `(collection id, scope hash)` to the record. `idempotency_by_stamp` maps a row
+   key, **origin-major**, `node (16) ‖ hlc (10)`, to collection id ‖ scope hash: the stamps that vouch for the record,
+   a row at its merged `first` and one at its merged `last` written by every store of it, and one at the sender's row
+   on a receiver (item 5); origin-major so that one origin's rows between two stamps are one range, which is what the
+   coverage rule reads and retention seeks. `idempotency_changes` is the change log of item 5. All three are created at
+   open with no schema bump, as `oplog_witnessed` and `live_digests` were. **Durability.** Under `durable` the commit
+   fsyncs before the writer is released, so a later lookup sees only a durable record. Under `coalesced` a replay takes
+   a coalescing ticket while it holds the writer and waits for the flush that covers the record, answering
+   `outcome_unknown` if that flush fails, as the first attempt's commit would: without the barrier a duplicate could be
+   told `200` for a write the next flush then fails to make durable.
+
+3. **A record lives its window, and outlives a drop of its collection** (Chris, 2026-10-18). A record
+   is judged by its `last`: it is absent once `last` is past the window, at the cutoff the retention pass collects
+   at, so no record is replayed past the window that removes it, and a record a peer sends that is already past it is
+   not stored unless the live record here is of the same request, the same fingerprint (merged into the live record
+   of a new request under the key, it would lower that record's `first` to the old request's, and mark it contested;
+   merged into a later attempt of its own request, it lowers `first` to its own attempt's, so the stamp rule leaves
+   what that attempt wrote, which this member can still take from a sender whose retention has not run). So a request that reuses a key after its window, with the same body, may be taken as a retry of the earlier request while a member still serves that request's record, and its stamp rule then skips the matches changed since the earlier request; use a new key for a new request. An absent
+   record is overwritten by the next store, never merged with.
+   **Nothing else ends a record**: a drop of its collection, a database drop, the drop purger and a late drop's sweep
+   (ADR-231) remove no record, and a record of a dropped life is stored and served as any other. So a retry after the
+   collection was dropped and created again replays its first answer and writes nothing to the new life, and another
+   request under the key is `422` for the window, as MongoDB's retryable-write records in `config.transactions`
+   outlive a drop of their collection; until the name is created again, the route answers `404` as for any missing
+   collection. A resume of an `applying` record across a drop writes nothing in the new life:
+   every document of it is stamped above the drop, so at or above the record's `first`, and the stamp rule counts it
+   in `skipped`. **A keyed delete by id replays while the request's own tombstone stands**, or a later version over
+   it (the document's row carries a stamp at or above the request's first write, its record's `first`), **or while
+   the row is gone with a drop at or above that stamp** (the collection's drop tombstone or the standing life's
+   floor, a tie going to the drop, ADR-236), which took the tombstone with the life it was written in; a row of a
+   later life under the id is stamped above it and replays by the first test. By the first write and not by the
+   delete's own stamp: a record two attempts merged into answers with the later attempt's, and a rewind between the
+   two keeps the earlier attempt's tombstone, which is the request's delete standing. Once retention has collected the tombstone with no drop over it, an older
+   write a peer still holds can bring the document back, and the request runs afresh. **A filter delete and a
+   `find_and_modify` removal carry no check of their own: they rely on the start check that refuses
+   `storage.tombstone_retention_secs` shorter than `storage.oplog_retention_secs`**
+   ([ADR-085](#adr-085--tombstones-outlive-the-oplog-and-a-stale-rejoiner-is-named-not-refused),
+   `tombstone_retention_shorter_than_the_oplog_window_is_rejected`), so the tombstones they wrote are kept at least as
+   long as their record is replayed. One edge: a multi-chunk delete's record is aged by its last chunk, so an earlier
+   chunk's tombstones can be collected before the record by up to the request's own span, its first commit to its last;
+   a replay is the first answer, not the current state, and stays true of the first attempt.
+
+4. **A keyed write past one chunk** (amends ADR-086). A keyed `update` or `delete` by filter writes its record
+   `applying` with its first chunk and updates it in each later chunk's transaction, from that chunk's first entry to
+   its last. **The end is found by a lookahead** (`modify.rs`): a keyed chunk that wrote and filled its match budget
+   looks, under its writer and in its own transaction, past its last match for one more match the request could
+   write, passing over those the stamp rule leaves. Finding the end instead, it writes `done` in its own record, with
+   its own entries, so a member that takes this chunk's entries takes the request's end with them. An end found so
+   ends the request, and never at the cost of a double: a document written later here, or by a member that witnessed
+   the request's entries, is stamped above the request's `first` (minted after every stamp that member has witnessed),
+   so the stamp rule leaves it; one stamped below `first` by a member that had not seen the request can still
+   replicate in after the end and match, and the request never writes it, which is under-application, never a double.
+   **The hold:** the lookahead stops at the first writable match, so where the request goes on it adds one match to
+   the chunk's hold on the writer; only over a tail of left matches does the hold reach about twice the chunk's match
+   budget, the budget plus up to one budget of left matches. **The residual:** when the lookahead cannot tell its
+   chunk ends the request, a later chunk goes on: its budget runs out before a writable match or the end, or the
+   writable match it finds is one no later chunk writes (the spec leaves it unchanged, ADR-208, or another writer
+   rewrites it between the two chunks, so the stamp rule leaves it). If a later chunk finds the end having written
+   nothing, one record-only commit marks the record `done` and **keeps the standing `last`**, minting no stamp, so at
+   that equal `last` `done` beats the `applying` it replaces wherever the two meet. A member
+   that pulled the last writing chunk and not that commit then resumes a retry (`resumed: true`, its counts cumulative,
+   every match left by the stamp rule) where it would replay: nothing is written twice. While the request runs, its
+   `(collection, scope)` is in an in-process set, entered before the first chunk waits for the writer and left by an
+   RAII guard on every exit, so a panic cannot leave the key refused until a restart. **A retry of a `multi: true`
+   request enters that set too, and holds it while it replays**, so of two parallel retries of a done request on one
+   member, one is answered and the other is `409`. A retry of an `applying` record that is not running here
+   **resumes**: after the record's cursor only when the record's origin is this member (another member's cursor would
+   skip documents that attempt never saw), otherwise from the beginning, writing a match only when its stored stamp is
+   below the record's merged `first`, and counting the rest in a cumulative `skipped`, with `resumed: true`. **The
+   stamp rule holds on every chunk after a record exists, a fresh attempt's later chunks included** (Chris, 2026-10-17,
+   as built). The reason: in a leaderless cluster two attempts of one request can run on different members at once, a
+   retry sent elsewhere while the first still runs or before its writes have arrived there. Each writes at or above its
+   own `first`, and once their records merge the merged `first` is the smaller, so the rule leaves whatever either
+   wrote. That is what keeps invariant I1, that no application of a request writes on a version that already contains
+   it, so a keyed `$inc` lands once per document. The cost: a match another client changed after the request's first
+   write is left as that change left it, and counted in `skipped`; `skipped` is rendered whenever it is above 0,
+   `resumed` only on a real resume. A client that needs every current match written sends the request without the key,
+   for an update that is idempotent, or uses ADR-192's marker. MongoDB draws the same line from the other side: its
+   retryable writes exclude `updateMany` and `deleteMany` altogether. Unkeyed writes, and keyed ones that fit in one
+   chunk, write every match they reach, as before. A resumed request takes `now` again, so `$currentDate` in its later
+   chunks is later than in its first.
+
+5. **Records travel with coverage** (`kimmy-storage` `sync.rs`, `snapshot.rs`, `kimmy-cluster` `transport.rs`). A
+   record's rows say which stamps vouch for it, and the rule is stated in terms of the coverage a window grants, not of
+   the entries it ships: **a member whose coverage of an origin passes one of a record's rows holds the record**, so a
+   member that takes a request's effect under any origin, by a frame, a relay or a page, takes its record with it.
+   - **F1, the rows.** Every store writes a row at the record's merged `first` and one at its merged `last`, and a
+     store from a frame one at the sender's row. The row at `first` is what a window cut inside a commit holds: a
+     keyed commit of two entries whose window ends at the first covers that entry's effect, and the only row of the
+     record in its advance is the one at `first`. Retention keeps it while the record lives (item 6).
+   - **F2 and F3, what a window ships.** A peer window, a push and a replay page ship, read in the window's own read
+     transaction and one per key, every live record with a row inside the advance the window grants the requester,
+     above what it holds of that origin and at or below what the window's end and the sender's own servable vector
+     reach (F2), and every live record with a row above both what the requester holds and what the sender's servable
+     vector reaches (F3): a row a page or a lost entry left, which no window of the sender would otherwise ever vouch
+     for. A replay page carries its own advance and the F3 records, and **every live record of the collections its
+     entries name whose `last` is above the page's start and whose `first` is at or below its end, carried at its
+     `first`** (the spanning records, `Engine::records_for_replay_page`): a request whose attempts all ended on
+     other members merges into a record with no row of the restored member's origin, and without them the replay
+     handed that member its own effects bare. Carried at `first`, such a record rides with the first entry of its
+     collection the member takes, so a page that stops between an effect and `last` stores it. **A sender ships a record at a row of its own. A
+     row below the record's `first` was left by an earlier record under the same key, one past its window and overwritten, and ships nothing; a row whose record is gone names nothing and ships nothing.** **Of the
+     record's own rows the window finds, it is carried at the lowest**, whichever F3 or an origin read first found:
+     carried at a higher one, a batch that stops, or splits into runs, between the two takes the effect at the lower
+     row and, by the rule below, stores the record with neither. The frame
+     fit counts every record, the F3 records first, each other with the first entry at or after its row; **when the F3
+     records alone overfill a frame, the window carries no entries and grants nothing** (`Fits::Nothing`) until the
+     sender has pulled their entries, and the sender logs it at `WARN`. **When no entry fits with the records riding
+     the first**, a pull is answered with a partial window of records alone: the F3 records
+     and, in carrying order, the riders that fit, ending just before the first left out (or before the first entry),
+     so it grants coverage only below the rows of what it carries and the next window carries the rest; a push sends
+     nothing and leaves the change to anti-entropy; a replay page carries records alone, in key order, at the same
+     position under a **records cursor** (`AskEntries::replay_records`, `Entries::replay_records`): the position, the
+     page's end and collections, the key of the last record sent, and the sender's change log as `{key, epoch}`, the
+     shape of a snapshot cursor's `records_base`. The next page at the position carries no entry past the cursor's
+     end, sends nothing of the cursor's set at or before its key that the log does not name as changed since its
+     base, sends every record the log does name, and so goes on until what is left fits with the entries; a cursor
+     of another epoch starts the position's records over. **The cursor is held by the member replayed to, on both
+     ways**, in memory: the cursor of the last page of records alone it stored, which it sends back with every ask
+     (outbound) or echoes in its ack and hands back at its next contact's `Vectors` (inbound). The serving member
+     goes on only from a cursor so echoed and keeps none of its own, so a restart of the member replayed to (a
+     restore again from the same backup, which asks from the same position) loses the cursor, and the position's
+     records start over. **When no partial window can carry them** (the requester cannot take one, its end would not
+     pass where the scan began, or a record rides at the first entry's own stamp, as a keyed `find_and_modify`'s
+     record, which holds its document, does), **a pull sends the records riding at or below the first entry ahead of
+     it**: an answer of records alone, with no entry and nothing covered, whose `scanned_to` names the entry. The
+     requester stores them and asks again in the same contact naming that entry (`AskEntries::records_ahead_of`),
+     and the window leaves them out, so the entry crosses; a record held before its effect is safe, since a retry
+     there replays the first answer of a write that happened. **A frame or page that cannot carry even that** (an
+     entry, or one record, or the F3 records, larger than a frame by itself) is logged at `WARN` and counted in
+     `kimmy_idempotency_records_unfit_total{path}`. **A record the change log names as changed since a cursor's base
+     that is larger than the delta's half of a frame** (refused by name, as a snapshot page's delta refuses one)
+     **starts the position's records over**, from a base above the change, logged at `WARN` and counted in
+     `kimmy_idempotency_records_unfit_total{path="replay"}`: the record is then no change to that base and crosses as
+     an ordinary record on a page of records alone, which holds one up to a whole frame, and what the earlier pages
+     at the position sent is sent again. **The delta judges only the cursor's set** (its collections, `first`
+     through its end): a record outside it, new or changed, is read with the page's own records and neither crosses
+     in the delta nor is refused by it, so a stream of new large records cannot keep a replay from finishing.
+     **Only a record larger than a whole frame
+     stalls that replay** (the class of a document no page can carry): the page that reaches it carries nothing, the
+     contact ends in step, and the replay of that peer's own origin stays at its position, logged at `WARN` and
+     counted, until the record expires with its window. **Every other page
+     of records alone strictly advances the cursor's last key sent**, so the pages at a position end, with one
+     exception, also logged at `WARN` and counted there: a page that what changed since the cursor's base fills
+     carries that alone, keeps its key and moves its base, so under keyed changes faster than a page's round trip
+     carries them the replay makes no headway past its key.
+   - **The receiver stores on coverage.** **A receiver stores a frame's record with the first entry it takes at or
+     after the record's row, or in the batch's last transaction**, the one that raises its witnessed vector, whether or
+     not an entry of the record's collection was taken and whether or not the collection stands here: a stamp a window
+     covers is never served again, so a record vouched for at one is stored then or never. **A batch that ends at an
+     entry stores no record whose row is at or past that entry; the window serves those again.** A record is stored
+     whether or not a drop of its collection came after it (item 3); one already past its window is not, unless the
+     live record here is of the same request and is not itself contested (item 3). Records
+     **merge as a join**: `first` the smaller, `last` the greater, state, outcome, cursor and origin from the greater
+     `last`, `done` over `applying` at an equal one, and at an equal `last` and state the record whose bytes (but for
+     `first` and the contested bit) are greater, so the merge is commutative as well as associative and idempotent,
+     and every member picks the same record. **`contested`** is set when either side is or when the two fingerprints
+     differ: a local store never merges two fingerprints, since its lookup refuses another one before anything is
+     written, so two meet only in a peer's merge, and the flag says the requests merged into the record are two or
+     more. A function of the union, computed beside `first` after the winner is picked and never part of the
+     tie-break, it keeps the join's three properties. A contested record is refused at every keyed lookup, before a
+     replay, a resume or a delete's tombstone test, with `422 idempotency_key_reused`, for its window: its answer is
+     one request's and its merged `first` may be the other's, so neither a replay nor a resume under it is the retried
+     request's own. A `multi: true` request whose record turns contested between its chunks stops before its next
+     chunk with `partially_applied` (ADR-192), and every later retry is refused. The receiver writes the merged record's rows and witnesses both stamps,
+     so its clock passes `first`. **A store that changes nothing writes nothing**, and a frame of records held already
+     costs no commit where nothing else is written, as a page whose documents all lose costs none (ADR-152).
+   - **The wire.** `Entries`, `ReplayEntries` and `Push` carry an optional, leniently read `records` list (collection,
+     scope, `carrying`, record bytes). It may carry records that ride no shipped entry, and `carrying` names the
+     sender's row. An older receiver ignores it. **`AskEntries` gains `replay`**, a `bool` read as `false` when
+     absent and not written when false: the outbound replay (the restored member asking a peer, `replay_own_origin`)
+     sets it, and the sender cuts its answer as a replay page, sized to the frame by the sender, with the spanning
+     records.
+     A 0.51 sender ignores it and answers the window as a pull, which is safe: 0.51 holds no records, and keyed
+     writes are taken only while every live member says it carries records. **`AskEntries` and `Entries` gain an
+     optional, leniently read `replay_records`**, the records cursor above, which an older build ignores and an
+     older sender never sends; **so do `ReplayEntries`** (the cursor the page leaves), **`ReplayAck`** (the cursor
+     the member replayed to holds after storing the page, echoed) **and `Vectors`** (with `replay_from`, the cursor
+     it holds for that position), each skipped when none. A 0.51 member ignores them on either side: as a sender
+     it keeps no cursor, and as a receiver it holds no records. **An `Entries` answer of records ahead** is a new
+     shape of an existing message, with no new field: no entries, not exhausted, no `passed_through`, a non-empty
+     `records`, and `scanned_to` at the HLC of the entry the records ride. **It grants nothing**: the requester
+     stores its records and changes no vector, coverage or held mark, and before this shape an answer with no
+     entries that was neither the tail nor a partial window could only be refused. **`AskEntries` gains
+     `records_ahead_of`**, an optional HLC read leniently and skipped when none: the entry whose records the
+     requester stored ahead of it in this contact. A contact that ends between the two (the sender stopped, the
+     connection dropped) only stored records early: the next contact is sent them ahead again, asks again, and
+     takes the entry, since nothing was covered. **Mixed versions:** a 0.51 sender ignores the field and never
+     sends records ahead. **Records go ahead only to an ask that can read them**: a pull that asks for a partial
+     window or holds nothing. A 0.51 pull refuses the empty answer, and its round fails just as it would already
+     stall on that entry (`fits: 0`). A 0.51 member's replay of its own origin asks with what it holds and no
+     partial window, and would misread the answer as an empty page and step past the entry, never reading it
+     back; it is answered `fits: 0` as before. 0.51's replay fails that round on the answer (it is malformed
+     to it) and asks again, so it stalls on that entry and does not skip it. Records exist only once every
+     member runs 0.52 and the switch is set, since keyed writes are taken only then; they outlive a rollback of a
+     member to 0.51 for their window, which is the case this paragraph guards.
+   - **Snapshots carry records.** Per collection, a records phase in pages of up to 512 goes ahead of its documents; a
+     page ends at the boundary into a collection with records and never holds one collection's records after another's
+     documents; `SnapshotPage` gains `records` and `SnapshotCursor` a records position, which an older receiver drops,
+     so its sender goes straight to the documents. A whole-database snapshot, a scoped repair and a converge page
+     (ADR-237) store a page's records in the page's transaction, whether or not their collection stands here, and a
+     converge page whose documents are not applied (its sender dropped the collection, or it is of a life this member
+     has not buried) still stores its records, in a transaction of its own; a converge repair ships the collection's
+     records for the whole window ahead of what may be a handful of documents, which is accepted, since a bound on the
+     page's stamps would miss a record whose rows lie below them. The walk visits, for its records only, every
+     collection the sender dropped and has not created again while its tombstone stands, and the delta carries a record
+     whatever its collection's state: a key outlives a drop of its collection for its window (item 3), so a member
+     rebuilt by snapshot answers a retry of it as the members that saw the drop do. **One byte budget per page:**
+     `SNAPSHOT_PAGE_BYTES`, 63 MiB (`MAX_FRAME` less 1 MiB for what is not counted), less what the page's definitions,
+     drops and vector take, shared in order by the delta, the records phase and the documents and tombstones, a
+     document's `_id` at the size it crosses in, and the cursor the page ends at reserved with each row at the size its
+     key crosses in: serde writes a `DocId::Binary` and `SnapshotCursor::after_key` as arrays of `int32`s, about ten
+     bytes a byte, and the wire stays as it is. A row that does not fit goes first on the next page; one that does not
+     fit a page holding nothing else (the first page's definitions aside), its cursor included, is refused by name, the
+     sender answering with `Message::Fault` (the row and its size) instead of a frame `write_frame` refuses: a document
+     whose `_id` is over about 3 MiB of binary or 5 MiB of string cannot cross on a page. Before it a page carried 512
+     rows whatever their size, so 512 averaging over about 128 KiB (64 KiB with records on the page) made a page over a
+     frame, the connection closed, and the pull asked for the same page for ever (found in 0.51.0 while bounding the
+     records phase). **A converge repair's bound** (ADR-237: it ends once it has walked the collection's size at
+     planning) **counts the documents and tombstones its pages carried**, against that size and two full pages more, not
+     its pages: a page cut short by its bytes, or one of records only, carries fewer than 512 rows, and counted as a
+     page either ended the repair before it had walked the collection. Where every page is full
+     the bound is what it was.
+   - **The page delta.** A keyed write on the sender after a collection's records phase and before the page that holds
+     its document would reach the receiver without its record. So each member keeps a node-local **change log**,
+     `idempotency_changes`: one row per store that changes a record, on every path (a local commit, a frame, a replay
+     page, a snapshot or converge page, a rewind's reopen), in the store's own transaction, keyed by a stamp minted under
+     the writer, so in commit order; a store that changes nothing logs nothing. It is never shipped, not carried by a
+     backup, trimmed by retention at the record window, and its high water is in `resume_hlc`. `SnapshotCursor` gains
+     one optional `records_base`, `{key, epoch}`: the log's high water as the page that cut the cursor read it, in its
+     documents' transaction. Each later page carries, read in its own documents' transaction, every record the log
+     names above that base (the scoped collection's, on a scoped or converge pull), and the receiver stores them before
+     the documents. **The epoch** is a random `i64` the log is given when it begins: with its first change, or at an
+     open that finds records and no log of this node's identity (a restore, since a backup carries no log; an identity
+     reset), before any page is cut, so a store that holds records always has one, and a sender restored twice during
+     one pull cuts bases of two epochs. Keys are compared only within one epoch: a base of
+     another epoch, or a key without one, restarts the cursor's collection from its records phase, since a sender
+     restored onto a host whose clock is behind logs keys below a base cut before the restore, which no comparison of
+     keys can tell; the zero base of a log that had held nothing is sent every change. **The requester holds a page asked with the zero base to the epoch the page
+     names** (`SnapshotPage.records_epoch`, on every page, the last included, which has no cursor to carry a base): one
+     that names an epoch comes from a log begun since the base was cut, by a keyed write, which logs every record since,
+     or at an open over restored records, which logs none of them. The requester cannot tell which, so it refuses the
+     page, applies nothing of it, and asks for the cursor's collection again from its records phase with no base, which
+     is never refused again. That costs one records-phase restart when a sender's first keyed write lands during a pull,
+     accepted. A 0.51 sender writes no `records_epoch` and holds no records; a 0.51 receiver ignores the field. With the
+     open's beginning (item 6), a sender restored during a pull, once or twice, never lands an effect without its
+     record. **The remainder rule:** a page carries documents only with the whole
+     remainder of the log above its base within the page's byte budget and 65,536 log rows; otherwise it is a
+     records-only page, its document position unchanged and its base moved to the last key it examined, logged at
+     `INFO`. A sender whose keyed
+     changes, per page round trip, outrun what a frame carries sends records-only pages and stalls its snapshot until
+     they slow. An older receiver drops `records_base`, and its pages carry no delta. With the delta, **a page never
+     holds a document without the record of the write that produced it**: the residual the design accepted for a
+     scoped repair is closed.
+   - **What a member that has not received a write does.** It cannot know the key, and applies a retry a second time:
+     by id on the same documents, by filter on what the filter selects there, and where both applications started from
+     one version last-writer-wins keeps one, which is the change made once. No member asks its peers first (blind to a
+     member that is down, which is when an outcome is unknown, and the per-write coordination ADR-020 declined), and
+     none refuses what it cannot vouch for (every member is in that state after every write anywhere until it has
+     pulled it). The client's choice, retry on the member that took the write or accept the second application, is
+     documented, with no wait after which a retry elsewhere is safe. Records are not in the cut digest (ADR-230): they
+     converge with the coverage that carries them, and a difference has no repair worth a finding; the two versions of
+     a keyed insert applied on two members are transient there and settle.
+
+6. **Retention, drops, rewinds, backups and the clock.** Retention collects records after its oplog step, under a
+   read transaction one seek per origin to that origin's rows below its cutoff, removing 1,000 rows per commit with the
+   writer released between them (ADR-151) and each chunk read on from where the last ended. Each row is read again
+   under the writer: a record goes once its `last` is below the cutoff, with the first of its rows at or above `last`
+   that the pass meets, so a record a later commit changed is kept and only the row goes, and **a row at the `first`
+   of a record still inside the window is kept** (F1). The change log's rows below the cutoff are trimmed in the same
+   pass, where it begins kept; a base older than what is kept loses nothing, since a record changed only before the
+   cutoff is past its window. **A record this build cannot decode** (a newer format, or damage) has no `last` to age by:
+   it is absent to every lookup here and goes with the first of its rows to expire, which is at least one window after
+   its first commit, so it never outlives the window; a frame's or a page's undecodable record is dropped on receipt
+   and counted. **Drops remove no record** (item 3): the drop purger, a late drop's sweep (ADR-231) and a database
+   drop's burial leave the records, and retention is the only remover. A rewind removes the records of requests whose
+   every write it discarded, which would replay an answer for a write that no longer exists, **with their rows by
+   stamp** (one range per origin from the lowest `first` among the records removed), and of a bulk insert it cut
+   part-way, with its rows: nothing resumes one, so a retry meets the first document that stands as a duplicate and
+   writes nothing, where a kept record would answer every document inserted while only a prefix stands. Every other
+   record it cuts part-way (a filtered write past one chunk, or any record two attempts merged into, the earlier
+   attempt's stamp its `first` and the later one's its `last`) it reopens as `applying`, its rows kept: a filter's
+   resumes from the beginning under the stamp rule, and an insert, a replace, a delete by id or a `find_and_modify`
+   replays its first answer, since an attempt's effect stands at or below the target. Left behind, a removed
+   record's rows would be read as F3 candidates by every frame until retention collected them. A rewound member
+   that rejoins a cluster still holding the writes it undid is outside the documented procedure (operations,
+   "Point-in-time restore"): after such a rejoin, a keyed request's record need not come back with its undone write,
+   so a retry may apply it again. A backup carries
+   `idempotency` and `idempotency_by_stamp` as tags 12 and 13, so a restored member keeps the records of the writes it
+   holds, those it took by snapshot included: without them a retry there would apply on top of a write the backup
+   brought back. **The rows travel only beside a record**: a store that holds no record writes neither tag, so its
+   backup restores on 0.51.x, even while rows whose record is gone remain (a retention pass stopped between its chunks
+   leaves some until its next pass); such a row vouches for nothing, every sender passes it over, and with no record
+   there is no stamp the restored clock must resume above. It carries no change log; the first open after the
+   restore begins one with a new epoch over the restored records. **The clock:** at open `resume_hlc` takes the largest of each
+   origin's last row in `idempotency_by_stamp` and the change log's high water as well as the oplog's tail, since a
+   record a page stored came with no oplog entry here, and the witness that folded its stamps in is in memory only; a
+   clock resumed below a record's `first` would let a resume write a document twice.
+
+7. **The gate: an operator switch and a live-peer net**, after ADR-238's `cluster.decimal128`. An older release ignores
+   the header and applies the write with a random `_id`, ignores the records it is sent, and serves every origin's
+   entries from its own oplog without them; and an entry a requester's `held` vector covers is never served to it
+   again. So a member of this release that pulls a keyed entry through an older one holds its effect without the record
+   for good, while listing the capability, and a retry there applies on top of it. A member therefore takes keys only
+   while **(a)** its `cluster.idempotency_keys` is true, the operator's declaration that every member runs this release
+   and none will run an older one again (default `true` with clustering off, `false` with it on; read at start, printed
+   by `check-config`; it gates local acceptance only, and records and keyed entries from other members are always
+   stored and applied), **and (b)** every live peer's facts block (ADR-201) says `idempotency_records`, which every
+   member of this release sends as `true` whatever its switch. An absent field or block, or a live peer not heard from
+   yet, counts as not carrying records, so the net fails closed, and a clustered member with `cluster.membership` off
+   refuses keys. It is a net and not a check: a member that is down is not live and is not asked, and a peer restarted
+   on an older release keeps its last block on its peers for up to one lease. Otherwise every keyed route refuses,
+   naming the header and the cause, looks nothing up and writes nothing; the capability is not listed, and the refusal
+   is counted as `gated`. **The net has two causes, answered apart** (`kimmy_cluster::PeerNet`). A live peer that
+   *refuses* is `400 bad_request`, `retry: no`, as the switch and `cluster.membership` off are, because the condition
+   lasts until that member changes: its held block does not say `idempotency_records` (an older release), its last
+   block did not decode (heard, and unable to vouch), or no block of it has arrived for more than the *unheard lease*
+   since it came up, was renamed or this member rejoined. The unheard lease is the one after which membership's
+   unheard-peer `WARN` names the peer, on the same clock, so the gate and the `WARN` agree: the longer of the lease
+   (`ceil(peers / cluster.fanout) + 2` sync intervals) and the time SWIM takes to declare a silent member down plus one
+   sync interval, that time being foca's own (`membership::swim_config`): `2 × peers` probe periods, since foca probes
+   one live peer per period in a reshuffled round-robin and suspects a failed probe at the next period, and then
+   `suspect_to_down_after`. A member that stops answering therefore leaves the live set before its unheard lease runs
+   out, at any sync interval. A live peer *not heard yet*, with no block held within that lease (it came up a moment ago, or this member
+   dropped its block on a SWIM rename or its own rejoin), is **`503 peer_unheard`, `retry: wait`, with `Retry-After: 1`**, because it is heard by an immediate exchange (ADR-247) or at the next contact. The wait is a fixed second, whatever the sync interval; it was
+   one sync interval before the exchange, when the next contact was the only way. A `Retry-After`
+   promises a condition that ends, so the `503` lasts no longer than the unheard lease. Measured at a 1 s sync
+   interval with three members, a peer frozen just as this member rejoined was declared down 6.0 to 7.8 s later, inside
+   the 9.8 s unheard lease; the lease alone (3 s), or the suspect-to-down time and one interval (5.8 s), answered `400`
+   at their end while the peer was still live. **A peer that refuses decides**: with
+   both, the answer is the `400`, naming only the member that refuses. The same split holds for ADR-238's gate, from
+   the same view, which carries each live peer's unheard clock and the peers whose last block did not decode. That mark is
+   ordered like a block: one from a frame decoded before the peer's rename or this member's rejoin is ignored, however
+   late it is applied. Only the not-heard
+   cause was ever transient, and it opens after every ordinary restart: measured against this build before the split,
+   a member restarted in a three-member cluster answered `/readyz` 200 and then refused keyed writes `400`, `retry: no`,
+   in 14 to 21 of 22 restarts, for a median of about 3.6 s and up to 8.9 s, and a peer's restart or pause closed the
+   gate on the others too; a client told `no` gives up a retry that would have been safe a few seconds later.
+   A record written before the gate closed stays for its window, and a retry replays from it once the gate opens
+   again. A router with no gate installed
+   reads as open, as an uninstalled Decimal128 predicate does; `kimmyd` always installs one. **The procedure:** set the
+   switch only once every member runs this release, as its own configuration change and restart, never in the change
+   that ships the binary. Shipped together, a member down for its upgrade is not in the live set, a keyed write is
+   accepted, and if that member then comes back on 0.51 it relays the write without its record; the net closes the gate
+   once its block is seen, which stops new keyed writes and not that relay.
+
+8. **What it reports.** Three codes: `idempotency_key_reused` (`422`, `no`) and `idempotency_key_in_flight` (`409`,
+   `wait`, `Retry-After: 1`), logged at `INFO` through `request failed`, and `peer_unheard` (`503`, `wait`,
+   `Retry-After: 1`; item 7, and ADR-238's gate), which writes no line: it is bounded, explained by
+   the response, and membership already warns of a peer unheard for more than a lease. The MCP argument carries the
+   same refusal in its error's `data`, with `retry_after_secs`. Seven series, bridged to OTLP:
+   `kimmy_idempotency_requests_total{outcome}` (`applied`, `replayed`, `resumed`, `reused`, `in_flight`, `gated`),
+   which counts a keyed request only when it ends in a write's answer or in one of the key's own refusals (a keyed
+   `403`, `404`, `partially_applied` or `outcome_unknown` counts under none, and a fresh keyed request that changed
+   nothing counts as `applied`); `kimmy_idempotency_peer_replays_total`, the replays answered from a record another
+   member wrote; the gauge `kimmy_idempotency_records`, the table's length, which redb keeps in the tree's root;
+   `kimmy_idempotency_records_received_total{via}` (`pull`, `push`, `replay`, `snapshot`, `repair`);
+   `kimmy_idempotency_records_undecodable_total`; `kimmy_idempotency_records_unfit_total{path}` (`pull`, `push`,
+   `replay`), the frames and pages that could not carry the records they must (item 5); and
+   `kimmy_idempotency_records_collected_total`. The engine writes
+   `INFO` "resumed a keyed write that had stopped" and `DEBUG` "replayed a keyed write", where it finds the record and
+   with the record's own origin, and the retention pass's line carries `idempotency_records`. A sender logs at `WARN`
+   when the records a frame or a replay page must carry do not fit one (item 5), and at `INFO` a records-only
+   snapshot page, a partial window or a replay page of records alone, and a cursor's base of another log.
+
+**Where the build departs from the design of record, now the behaviour.** The design (v2.1 of 2026-10-16) was built in
+four parts: storage, the API's front, its wiring to the engine, and replication. Each departure below is the behaviour
+as built and accepted:
+- **At an equal `last` and state, the merge breaks the tie by the record's bytes**, so the merge is commutative and
+  every member picks the same record; the design left that tie open.
+- **A `multi: true` request holds its in-flight place while it replays too**, so of two parallel retries of a done
+  request on one member, one gets `409`.
+- **Retention's re-check** removes a record with the first of its rows at or above its `last`, not only at it, once
+  `last` is past the cutoff: a record whose `last` is below an expired row is past its window too, and only its own
+  row at `last` would otherwise remove it.
+- **A keyed delete by id** replays while one of its attempts' tombstones or a later version over it stands, not the
+  tombstone alone.
+- **A record of another kind of request** is a key reused, whatever the fingerprint says.
+- **The stamp rule holds on every chunk after a record exists**, not only on a resume (item 4; Chris).
+- **The engine writes the resume and replay lines**, naming the database, the collection and the record's origin; the
+  API writes neither, which would have written each line twice and could not name the origin a resume read.
+- **An undecodable record** is dropped on receipt and counted, and one retained goes with the first of its rows to
+  expire; a test switch (`set_test_strip_records`, and `KIMMY_TEST_STRIP_RECORDS` in the `lab-hooks` build) makes a
+  member serve without records and say nothing of them, as an older release does, for C9.
+- **The route's refusal and the key's syntax are refused before authentication, the gate after it and before
+  authorization.** The design put all three in one layer before authentication, where the gate's refusal named a peer's
+  node id to an unauthenticated caller.
+- **Every route that does not take the header refuses it**, the health probes, `/metrics`, `/v1/version` and login
+  included; a route that does not exist still answers `404`.
+- **`explain: true` with a key** is refused in the executor after authorization, with its own message, since only the
+  body says it.
+- **The MCP replay marker** is `_meta: {"kimmydb/idempotency-replayed": true}`, where the design named none, and an MCP
+  call is fingerprinted over its typed arguments, so `"multi": false` and an omitted `multi` are one call.
+- **A router with no gate installed reads as open**; **`kimmy_idempotency_requests_total` counts as item 8 says**; and
+  **`GET /v1/version` publishes the engine's own window**, so the two cannot disagree.
+
+Five changes replaced parts of the design after the built parts were reviewed (an analysis of how an effect could be
+relayed without its record, and the model test): **records travel with coverage** (item 5's F1 to F3 and the store
+on coverage), where the design stored a frame's record only in the run that took an entry of its collection, which
+left a relayed effect bare when its entry lost or its window was cut inside a commit; **`last` is a commit's last
+entry** (L1, item 2), where the design's first entry let a drop in that entry's millisecond bury a record whose
+later entry stood (moot since records outlive a drop; it stays as the truer `last` the window is measured on); **the lookahead** (G8, item 4), where the design's record-only `done` commit never reached a member
+that had pulled the last writing chunk; **the page delta** (item 5), which closes the scoped-repair residual the design
+accepted; and **a record's own row** (item 5), where a row an earlier record under the key had left could ship the
+record standing now (its drop-purge half is moot since records outlive a drop). Three more followed a review
+of the merged head: **records outlive a drop** (Chris, 2026-10-18; item 3), where the design's
+life rule made a record of a dropped life history and the purge removed it; **the contested flag** (items 1 and
+5), where two members that accepted one key for two requests merged their records into one whose answer was one
+request's and whose `first` could be the other's; and **a record past its window is not stored** unless the live
+record is of its own request (item 3), where it could merge into a new request's record and lower its `first`.
+
+**Rollback.** The binary rollback target is 0.51.x, and the store stays at schema 5, so 0.51.x opens it. It never opens
+the three tables: its writes, drops and purges leave records untouched, its retention collects oplog entries and not
+records, and its facts block omits the field, so its peers refuse keys once they hear it. **Remove
+`cluster.idempotency_keys` from the configuration first**: 0.51.x refuses to start on a configuration that names it
+(`[cluster]` denies unknown keys). **Once the switch has been set, rolling back any member reopens the gap**, and it is
+the one exception left to "once on any member that has received the write": the rolled-back member's oplog serves the
+keyed entries accepted before the rollback without their records for the rest of their window, its peers still accept
+keyed writes until they hear its new block (up to one lease), and a retry on a member that pulled such an entry through
+it can apply on top of the first application; setting the switch back to `false` everywhere first stops new keyed
+writes, not that relay. **The backup tags are a backup rollback boundary**: 0.51.x's `kimmyd restore` refuses a backup
+holding a record (tag 12 or 13), naming the table it does not know; a backup of a store holding none restores, and a
+0.51.x backup restores here with no records. Rolled forward again, a record of a collection the older build dropped is
+a record like any other, replayed for what is left of its window and collected by age, nothing is rebuilt (the tables are never derived from the oplog), and the
+change log's first change begins it again. **An undecodable record is aged by its first row in `idempotency_by_stamp`,
+so it can be removed early**, before its own window has passed. That costs something only after a rollback to this
+release from a build with a newer record format and a roll forward inside the window, where the newer build no longer
+finds the record and applies a retry afresh; and a rollback already reopens the gap. A rollback below 0.51.x crosses
+ADR-238's schema-5 boundary, which this leaves as it was.
+
+**Alternatives rejected.** Records only on the member that took the write: a retry on any member that received the
+write would apply on top of its own effect, and last-writer-wins would make the double cluster-wide. A new entry kind
+for records: an older member fails the whole frame on an unknown `OpKind`, so a roll would stop replication. A field
+inside `OplogEntry`: an older member re-encodes entries and drops it, and it touches over a hundred struct literals.
+Records that travel only with the entries a frame ships (the design's rule): a window cut inside a commit, an entry
+that lost where it was pulled from, or a version held as a snapshot's state relays the effect without the record. A
+check across members before applying (ask the peers, a quorum): blind to a member that is down, and the per-write
+coordination ADR-020 declined. Storing the response bytes: ties a record to one build's rendering. Recording refusals
+and no-ops: a commit and an fsync per refusal to repeat an answer that changed nothing. The draft's `409` for every
+concurrent duplicate: the writer already serialises single-transaction ones and both can be answered truthfully. A
+random `_id` for keyed inserts: a cross-member duplicate leaves two documents for good, which the digest cannot see. A
+key per document for bulk and update-many: N keys for documents the client cannot address one by one. Keys on schema
+changes: their retries already say what an earlier attempt did, and records would need DDL's own apply path. A separate
+retention setting: a second window to size, with no use while it outlives the one the write replicates in. Accepting
+and ignoring the header where unsupported: a client would believe it is protected. Problem details for the new errors:
+the envelope is the protocol (ADR-057). Records in the cut digest: a difference has no repair worth a finding. A resume
+driven by the cursor alone: a stale cursor re-applies to documents already written. The stamp rule on resumes only: two
+attempts running at once on two members would each write what the other had. **Raising a requester's vector over a
+record-only `done` commit**, so that G8's residual would reach a member that pulled the last writing chunk: an audit of
+the vector's readers found ones that assume an own entry at every position it names (a change stream's resume seek,
+`own_position_at_open`, the catch-up after a lost coalesced commit), so the residual stays, a resume and never a
+double. A page delta whose base compares keys alone: a sender restored onto a host whose clock is behind logs keys
+below a base cut before the restore. Accepting keyed writes during a mixed roll and documenting the double: an upgraded
+member that pulled a keyed entry through an older one holds its effect without the record for good, while it lists the
+capability. One `503` with `retry: wait` for every cause of the gate: a member that says no, the switch and
+membership off last a roll or longer, and a client told to wait would retry for that long. One `400` for every cause,
+as built first: a peer not heard from yet lasts about a sync interval, after every restart (about one contact since ADR-247, a sync interval on a second restart within one), and `no` turns a safe retry
+into a lost one. A `503` for as long as a live peer stays unheard: a peer whose blocks never decode, or that never
+sends one, would keep clients retrying a request that cannot be taken, against what `Retry-After` promises. Counting
+an undecodable block as not heard: it was heard, and it cannot vouch. Holding `/readyz` until the gate opens: a pause
+of one member would take every member out of readiness at once. The live-peer net without the switch:
+blind to a member that was down at the write and comes back on an older release. **The life rule** (a record of a
+dropped life is history, absent on lookup and purged with the drop): a sender that purged a dropped life's records
+still serves that life's entries, a member the drop has not reached yet takes a keyed `$inc` among them without its
+record, and a retry there writes again, stamped after the drop, which the next life keeps (ADR-236); closing that
+under the rule needed attempt segments carried in the record, since a resume-time rule read from a member's rows
+reopened a double, and the price of records outliving a drop is only that a retry after a drop and recreate replays
+the old answer.
+**Replaying a contested record's winner to its own fingerprint**: one more branch, to keep a reply for one client of a
+client bug.
+
+**Tests.** `kimmy-core`: golden vectors for the scope hash and the derived `_id` against an independent computation, and
+the construction against RFC 9562 B.2's published vector. **The model test** (`kimmy-storage`,
+`idempotency_model_tests.rs`): three or four engines run seeded schedules of keyed writes and retries on any member,
+crashes before and after any commit and failed fsyncs, pulls (short ones cut inside a window), scoped and converge
+pages, whole-database snapshots with writes between their pages, outages, restarts, backups and restores with
+the own-origin replay (its pages cut as the transport cuts them, in a frame of a few units: the spanning records, and
+records alone under a records cursor), with steps between the replay's pages and the sender itself restored between a
+snapshot's pages, rewinds (`restore --until`), orphan rows by stamp, drops and re-creations, unkeyed writes and
+retention with a moved clock, with steps run between any two commits of a request; it asserts I1 to I7 (never on its own effect, the record with the effect, once per
+member, convergence, exact on one member, never over, no replacement across requests), I8 (an `$inc` completes
+with every counter older than its merged `first` applied, never on another request's `first`) and Life (a member
+holding a live `done` record replays it, across a drop too, and nothing replays past the window) after every step and
+at quiescence, and the contested algebra: each member's live record is contested exactly when the requests merged
+into it, as the test tracks them, are two or more; a lookup refuses exactly where the record is contested or another
+request's; and a request whose record turns contested between two of its chunks commits no more and answers
+`partially_applied`. Every record a frame or page carries stands on its sender and rides at or above its `first`. `generated_schedules_short` runs in CI;
+`generated_schedules_long` is ignored, a gate of record, `IDEM_SEEDS` seeds `IDEM_THREADS` at a time. Named rows write
+out the breaks the analysis of relays without the record found, and the shapes the mutants need;
+`row_f1_a_window_cut_inside_a_commit` is the one that
+makes F1 load-bearing: a keyed `$inc` of two counters in one commit, a short pull by B that ends at the commit's first
+entry, so the only row of the record the window's advance holds is the one at `first`, and a retry on B must replay.
+Two classes are counted and do not fail a run: **S1**, a record at
+quiescence that the merged record dominates, or none where no document holds the key, a state carried only by entries
+that lost where the member pulled them, or by a record-only `done`, harmless while I2 holds; and **R1**, the writes of a
+reset or restored identity that peers keep only as page state never converge to it, a convergence matter outside this
+ADR. The mutation harness (`scripts/idempotency-mutants/`, run under bash) applies each mutant to an exported tree and
+runs its suites, the model's among them; [every mutation row of idempotency keys, run again together on the merged
+head, is listed
+with the test that kills it](adr-240-mutation-rows.md): 437 rows, 408 killed, 6 equivalent, 5 superseded and 10 retired, the 8 that G repeated from C run once, and 0 survived. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
+path, a record outliving a drop (the purge, a database drop, a late drop, a resume across a drop, a delete by id whose
+tombstone a drop took) and L1, a contested record refused on every path and between chunks, a past-window record
+refused on store, the coalesced barrier, the fsync and write faults, restarts, the multi-chunk record, the lookahead
+and its residual, resumes across crashes and members, retention and the row at `first`, the clock, the rewind and its
+rows, the backup and the rows it carries, a row whose record is gone shipping nothing), `idempotency_repl_tests.rs` (windows,
+receivers, the store on coverage, a record at its own row and with the entry at its row, a batch that ends early, the
+snapshot's records phase and an older receiver, repair and converge pages), `idempotency_coverage_tests.rs` (the
+analysis's relays after a snapshot, of a losing entry and of a coverage-only window, the cross-origin relay and G8 as
+storage tests) and `page_delta_tests.rs` (the R1 and R2 schedules, the base
+read in the page's own transaction, the remainder rule by bytes and rows, a resumed pull, the epoch after a restore, an
+identity reset and a clock behind), `idempotency_review_tests.rs` (mutants a review found no test killed: every
+record and the change log expiring, the log kept across a pull's pages, a records-only page inside a records phase)
+and `idempotency_replay.rs` (the spanning records' selection, an orphan row, the records cursor's set, its delta and
+its epoch);
+`kimmy-cluster`'s `replay_tests.rs` (the spanning records on both ways, F3 on a replay page, a page that stops between
+a request's
+effects and its `last`, an orphan row on both ways, and records at a replay's start filling several pages on both
+ways), a pull and a push whose first entry cannot cross with its records, and the lowest-row schedules (a
+batch stopped, or split into runs, between two rows of one record) in `idempotency_coverage_tests.rs`. A rewind that
+cuts a keyed bulk part-way removes its record. `kimmy-cluster` (`tests/idempotency.rs`, in process over real sockets): C1 pulled and
+pushed, C2, C3, C5, C6 with more records than a page, C8 (an old key replays after a drop and a re-creation), C9, and a fresh multi-chunk request racing writers on two
+members; C7 as the version-boundary decodes beside the protocol.
+`kimmyd` (`tests/cluster.rs`, real processes over HTTP): C1, C2, C3, C5, C6, C8, C9 and the multi-chunk race, the
+cross-origin relay over four members, and a finished multi-chunk request replaying on every caught-up member.
+`kimmy-api` (`tests/idempotency.rs`):
+the header's syntax, the route guard against `openapi.yaml`, the gate with the switch off, with an older peer (`400` on
+every keyed route, deciding over an unheard one) and with an unheard peer (`503 peer_unheard` and `Retry-After` on every
+keyed route, again after a rename, then the same key's first answer and its replay), with a peer past its lease or
+whose block does not decode (`400`), an unauthenticated keyed request
+`401` and not counted as gated, a replay of every keyed route byte for byte, the
+derived `_id` and its echo, scope per principal, a revoked grant refused before the record, a contested key refused
+`422` on three routes writing nothing, the in-flight `409`, the resume answer, and a fresh multi-chunk request's
+`skipped` without `resumed`. `kimmy-mcp`: each keyed tool replayed with the `_meta` marker, a reused key refused, a
+contested key refused on every keyed tool, and the gate's `503` as an error carrying `retry: wait` and
+`retry_after_secs`. `kimmy-cluster`: `PeerNet` over a view (the two causes as separate sets, the precedence, per
+capability), both gates' split with the fixed wait of one second, a block dropped on a rename or a rejoin read as
+unheard again with its clock started again, an unheard peer refusing once the unheard-peer `WARN`'s lease has run
+(on a test clock), the unheard lease floored at foca's own timers, and an undecodable block refusing at once.
+`kimmyd` (`tests/cluster.rs`): `a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out` (at a 1 s sync
+interval, a member that rejoins while a peer is frozen answers `503` and then `200` once SWIM has declared the peer
+down, never `400`), and `a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400`,
+a member restarted twice within a 5 s sync interval (each time waited ready), its two peers each sent a keyed and a
+`Decimal128` insert again and again from the second ready answer until each is taken: `503 peer_unheard` with
+`Retry-After: 1` while the peer has not heard its block, never `400`, then the keyed request's first application and its
+replay; C9 meets the `503`
+before the `400` of C's heard block, and the cluster tests' keyed requests are sent again through the window as a
+client sends them. `kimmyd`: the switch's defaults and its refusal of a misspelt key, the facts
+field, the gate across a cluster, and a keyed write whose own fsync fails answered by its replay after the restart.
 
 ---
 

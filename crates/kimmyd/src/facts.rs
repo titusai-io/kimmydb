@@ -40,7 +40,20 @@ pub fn source(
             // operator's word about the cluster, this the build's about itself.
             decimal128: Some(true),
             vector_chunk_ids: Some(kimmy_core::CHUNK_ID_FORMAT),
+            // This binary stores and relays the records keyed writes carry,
+            // whatever this member's `cluster.idempotency_keys` says (ADR-240): the
+            // switch is the operator's word about the cluster, this the build's
+            // about itself, and a peer's gate counts this member by it.
+            idempotency_records: Some(true),
             ..Facts::default()
+        };
+        // A member standing in for a release before 0.52 says nothing of records
+        // (the `lab-hooks` build's `KIMMY_TEST_STRIP_RECORDS`).
+        #[cfg(feature = "lab-hooks")]
+        let base = if crate::lab_hooks::strips_records() {
+            Facts { idempotency_records: None, ..base }
+        } else {
+            base
         };
         let mut block = match engine.upgrade() {
             // A schema that cannot be read is sent as holding nothing: the peers
@@ -183,6 +196,17 @@ mod tests {
         assert_eq!(source().decimal128, Some(true));
         drop(engine);
         assert_eq!(source().decimal128, Some(true), "whatever the store says");
+    }
+
+    /// Every block of this build says it carries idempotency records (ADR-240), with
+    /// an engine or without: the field is the binary's, not the configuration's.
+    #[test]
+    fn the_block_says_this_build_carries_idempotency_records() {
+        let (engine, _dir) = engine();
+        let source = source(Arc::downgrade(&engine), vec![1; 16], false, false, None, None);
+        assert_eq!(source().idempotency_records, Some(true));
+        drop(engine);
+        assert_eq!(source().idempotency_records, Some(true), "whatever the store says");
     }
 
     /// With the engine gone the block still says who it is, and lists nothing.

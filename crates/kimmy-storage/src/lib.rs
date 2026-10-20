@@ -33,6 +33,7 @@ pub mod format;
 pub mod gc;
 pub mod health;
 pub mod hold_meter;
+pub mod idempotency;
 pub mod index;
 #[cfg(feature = "lab-hooks")]
 pub mod lab_hooks;
@@ -125,6 +126,27 @@ mod young_stamp_model_tests;
 mod mixed_roll_tests;
 
 #[cfg(test)]
+mod idempotency_tests;
+
+#[cfg(test)]
+mod idempotency_repl_tests;
+
+#[cfg(test)]
+mod idempotency_model_tests;
+
+#[cfg(test)]
+mod page_delta_tests;
+
+#[cfg(test)]
+mod idempotency_coverage_tests;
+
+#[cfg(test)]
+mod idempotency_review_tests;
+
+#[cfg(test)]
+mod idempotency_log_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
@@ -160,6 +182,11 @@ pub use hold_meter::{
     Component as HoldComponent, HoldDecomposition, Phase as HoldPhase, SERVE_WALK_BUCKETS_US,
     ServeSnapshot, ServeWalk, WalkPath,
 };
+pub use idempotency::{
+    CarriedRecord, IdempotencyRecord, InFlightGuard, Keyed, KeyedWrite, ModifyRecorded,
+    RecordOutcome, RecordState, RecordsVia, ReplayPageRecords, ReplayRecords, ReturnedImage,
+    lenient_records,
+};
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 #[cfg(feature = "test-hooks")]
@@ -172,8 +199,9 @@ pub use open_progress::{
 pub use purge::PurgeCounters;
 pub use refusal_hint::{HintKind, RefusalHint};
 pub use snapshot::{
-    CollectionState, LEFT_IDS_NAMED, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied, SnapshotCursor,
-    SnapshotDoc, SnapshotPage, SnapshotPolicy, SnapshotProgress, SnapshotTombstone,
+    CollectionState, LEFT_IDS_NAMED, RecordsBase, SNAPSHOT_PAGE, SNAPSHOT_PAGE_BYTES, ServeVerdict,
+    SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage, SnapshotPolicy, SnapshotProgress,
+    SnapshotTombstone,
 };
 pub use sync::{
     EntryWait, MarkedRange, PeerWindow, PullTiming, SyncOutcome, UnknownCollection, WindowEnd,

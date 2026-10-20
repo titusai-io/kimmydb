@@ -49,6 +49,11 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // Retention's scans, which serve no client.
     "gc::Engine::collect_oplog",
     "gc::Engine::collect_tombstones_within",
+    // Retention's read of the idempotency records' rows below its cutoff (ADR-240).
+    "idempotency::Engine::collect_idempotency_records",
+    // A replay page's records of its collections (the spanning records),
+    // which serves no client.
+    "idempotency_replay::Engine::replay_records_in",
     // The read ahead of a drop purge chunk, which serves no client: the stop is
     // its error, so the chunk never reaches the writer during the drain.
     "engine::Engine::warm_purge_chunk",
@@ -69,7 +74,7 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "digest_probe::Engine::scan_uncovered",
     "digest_probe::Engine::walk_headers",
     // A snapshot page served to a peer, which passes over what a drop left.
-    "snapshot::Engine::snapshot_documents",
+    "snapshot::Engine::snapshot_rows",
     // The marks a pull names to its peer.
     "sync::Engine::held_marks_covered_by",
     // Where a change stream starts, and what it replays.
@@ -260,6 +265,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("revc_break_tests::rows_of", "test code reading a store of a few dozen rows it wrote itself"),
     (
+        "idempotency_model_tests::World::stored_records",
+        "test code reading the records and rows by stamp of a model member's store, a few dozen rows",
+    ),
+    (
         "migrate_v5_tests::assert_i_docs",
         "test code reading a store of a few hundred rows it wrote itself",
     ),
@@ -397,6 +406,53 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "inside find_and_modify's write transaction: close_writes bounds it (ADR-192)",
     ),
     (
+        "idempotency::Engine::records_high_water",
+        "at open: two seeks per origin that has a record row, its first key and its last",
+    ),
+    ("idempotency::Engine::rewind_records_in", "`kimmyd rewind`, which runs on a stopped node"),
+    (
+        "idempotency::remove_rows_naming",
+        "`kimmyd rewind`'s removal of the rows of the records it removed, on a stopped node",
+    ),
+    (
+        "idempotency::records_for_collection_page",
+        "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection, \
+         within the page's records budget",
+    ),
+    ("idempotency_tests::rows", "test code reading a store of a few thousand rows it wrote itself"),
+    ("idempotency_tests::log_rows", "test code reading a change log of a few rows it wrote itself"),
+    (
+        "page_delta_tests::log_rows",
+        "test code reading a store of a few thousand rows it wrote itself",
+    ),
+    (
+        "idempotency::changes_high_water",
+        "one seek, in a snapshot page's read transaction: the last key of this node's change log",
+    ),
+    (
+        "idempotency::records_changed_since",
+        "one snapshot page's records delta, in the page's read transaction: one range of this \
+         node's change log above the cursor's base, at most RECORD_DELTA_ROWS (65,536) rows",
+    ),
+    (
+        "idempotency::Engine::trim_idempotency_changes",
+        "retention's share of the change log: one seek under a read transaction, then chunks of \
+         RECORD_COLLECT_CHUNK rows below the cutoff, each in its write: close_writes bounds it \
+         (ADR-192)",
+    ),
+    (
+        "idempotency::records_in_advance",
+        "F2 of a served window's records, in the window's own read transaction: per origin, the \
+         rows inside the coverage the window grants the requester, a row per stamp its coverage \
+         passes at most",
+    ),
+    (
+        "idempotency::records_unanchored",
+        "F3 of a served window's records, in the window's own read transaction: a seek per origin \
+         with a row, and the rows above this node's own servable vector, which its next pull of \
+         their entries anchors",
+    ),
+    (
         "purge::Engine::owed_purges",
         "the dropped registry, and one row per drop: whether rows are left",
     ),
@@ -440,6 +496,9 @@ const WRITES: &[&str] = &[
     // with no usable index, the whole collection (`modify::scan_until`).
     "modify_where",
     "find_and_modify",
+    // The same, keyed (ADR-240): the same bodies, in the same transactions.
+    "modify_where_keyed",
+    "find_and_modify_keyed",
 ];
 
 /// Public walks that iterate no table themselves, and the function each

@@ -548,6 +548,15 @@ mod tests {
         let fixture = || -> Fixture {
             let (engine, _, dir) = engine_with(10);
             let orders = engine.get_collection("shop", "orders").unwrap();
+            // Keyed writes, so retention's records step has rows to be stopped
+            // among (ADR-240).
+            for n in 0..3u8 {
+                let keyed = crate::KeyedWrite::new(
+                    kimmy_core::ScopeHash([n; 32]),
+                    kimmy_core::Fingerprint([n; 32]),
+                );
+                engine.insert_keyed(&orders, doc! { "k": i32::from(n) }, &keyed).unwrap();
+            }
             for n in 10..13 {
                 engine.insert(&orders, doc! { "_id": n, "a": [1, 2], "b": [3, 4] }).unwrap();
             }
@@ -661,11 +670,21 @@ mod tests {
                 let witnessed = [(HELD_ORIGIN, Hlc::new(u64::MAX, 0))].into_iter().collect();
                 e.held_marks_covered_by(&witnessed).map(drop)
             }),
-            // covers: snapshot::Engine::snapshot_documents
+            // covers: snapshot::Engine::snapshot_rows
             ("snapshot_page", |e, _| e.snapshot_page(None, None).map(drop)),
             // covers: gc::Engine::collect_oplog, gc::Engine::collect_tombstones_within
             ("collect_garbage", |e, _| {
                 e.collect_garbage(crate::RetentionPolicy::new(0, 0)).map(drop)
+            }),
+            // A pass a year on, so every record's row is below the cutoff.
+            // covers: idempotency::Engine::collect_idempotency_records
+            ("collect_garbage (records)", |e, _| {
+                let year_on = crate::physical_now_ms() + 365 * 24 * 3_600_000;
+                e.collect_garbage_at(year_on, crate::RetentionPolicy::new(1, 1)).map(drop)
+            }),
+            // covers: idempotency_replay::Engine::replay_records_in
+            ("records_for_replay_page", |e, c| {
+                e.records_for_replay_page(&[c.id], Hlc::ZERO, Hlc::MAX).map(drop)
             }),
             // covers: index::Engine::index_keyed_entries_after
             ("index_keyed_entries_after", |e, c| {
@@ -758,7 +777,12 @@ mod tests {
         ];
         // The walks that write when they finish, so each stop needs a store
         // the last run did not change.
-        let writes = ["collect_garbage", "a client's index build", "violations_backfill_step"];
+        let writes = [
+            "collect_garbage",
+            "collect_garbage (records)",
+            "a client's index build",
+            "violations_backfill_step",
+        ];
         for (scope, walks) in [(WalkScope::Background, background), (WalkScope::Request, request)] {
             for (name, walk) in walks {
                 let rows = every_row::assert_stops_at_every_row(

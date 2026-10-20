@@ -18,8 +18,17 @@ use kimmy_storage::CollectionMeta;
 use serde_json::{Value, json};
 
 use crate::error::ApiError;
+use crate::idempotency::{IdempotentRequest, WriteAnswer};
 use crate::json::{document_to_json, json_to_document};
+use crate::outcome::{
+    BulkInsertOutcome, DeleteByIdOutcome, DeleteOutcome, FindAndModifyOutcome, InsertOutcome,
+    ReplaceOutcome, UpdateOutcome,
+};
 use crate::state::{Auth, SharedState};
+
+mod keyed;
+use keyed::KeyedCall;
+use kimmy_storage::{Keyed, RecordOutcome};
 
 /// Default page size, so an unbounded `find` cannot be used to pull an entire
 /// collection into memory by accident.
@@ -1016,22 +1025,60 @@ where
 // Writes
 // ---------------------------------------------------------------------------
 
+/// Insert one document. With an idempotency key (ADR-240) the engine's keyed twin
+/// writes it with its record, or answers the first attempt's record, and an
+/// absent `_id` is the key's derived one rather than a random ObjectId.
+///
+/// Every write below takes its key the same way: `authorize` runs first, so a
+/// principal whose grant was revoked is refused `403` and never replayed, and
+/// the key is scoped to the principal it names.
 pub fn insert(
     state: &SharedState,
     auth: &Auth,
     db: &str,
     coll: &str,
     document: &Value,
-) -> Result<Value, ApiError> {
+    key: Option<&IdempotentRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let _span = op_span("insert", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc = json_to_document(document)?;
     let sent = doc.get(kimmy_storage::ID_FIELD).cloned();
-    let (id, stamp) = state.engine.insert_stamped(&meta, doc)?;
-    Ok(json!({
-        "insertedId": crate::json::bson_to_json(&inserted_id(sent, &id)),
-        "stamp": stamp.encode(),
-    }))
+    let Some(key) = key else {
+        let (id, stamp) = state.engine.insert_stamped(&meta, doc)?;
+        return Ok(WriteAnswer::first(
+            InsertOutcome { inserted_id: inserted_id(sent, &id), stamp }.render(),
+        ));
+    };
+    let call = KeyedCall::new(state, auth, key);
+    match state.engine.insert_keyed(&meta, doc, &call.write).map_err(|e| call.refused(e))? {
+        Keyed::Fresh((id, stamp)) => {
+            let outcome = InsertOutcome { inserted_id: inserted_id(sent, &id), stamp };
+            Ok(call.fresh(outcome.render(), false))
+        }
+        Keyed::Replayed(record) => {
+            let RecordOutcome::Insert { stamp } = record.outcome else {
+                return Err(keyed::mismatched(&record));
+            };
+            // The record keeps no id: the replay's body is the first attempt's
+            // (the fingerprint says so), so the `_id` it stored is the one this
+            // body sends, or the one its key derives again.
+            let inserted_id = keyed_id(sent, &call.write, &meta, 0);
+            Ok(call.replayed(&record, InsertOutcome { inserted_id, stamp }.render()))
+        }
+    }
+}
+
+/// The `_id` a keyed insert stored at `position`, recomputed for a replay: the
+/// client's own, as sent, or else the key's derived one (ADR-240), which the engine
+/// stored as a string.
+fn keyed_id(
+    sent: Option<bson::Bson>,
+    keyed: &kimmy_storage::KeyedWrite,
+    meta: &CollectionMeta,
+    position: u64,
+) -> bson::Bson {
+    sent.unwrap_or_else(|| bson::Bson::String(keyed.derived_id(meta.id, position)))
 }
 
 /// The `_id` an insert reports: the one the client sent, which the engine
@@ -1054,7 +1101,8 @@ pub fn insert_many(
     db: &str,
     coll: &str,
     documents: &[Value],
-) -> Result<Value, ApiError> {
+    key: Option<&IdempotentRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let _span = op_span("insert_many", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
 
@@ -1074,23 +1122,53 @@ pub fn insert_many(
         .collect::<Result<Vec<_>, _>>()?;
     let sent: Vec<_> = docs.iter().map(|doc| doc.get(kimmy_storage::ID_FIELD).cloned()).collect();
 
-    let stamped = state.engine.insert_many_stamped(&meta, docs).map_err(|e| match e.index {
-        Some(i) => at_index(i, e.source.into()),
-        None => e.source.into(),
-    })?;
+    let Some(key) = key else {
+        let stamped = state.engine.insert_many_stamped(&meta, docs).map_err(|e| match e.index {
+            Some(i) => at_index(i, e.source.into()),
+            None => e.source.into(),
+        })?;
+        return Ok(WriteAnswer::first(bulk_outcome(stamped, sent).render()));
+    };
+    let call = KeyedCall::new(state, auth, key);
+    let answer =
+        state.engine.insert_many_keyed(&meta, docs, &call.write).map_err(|e| match e.index {
+            Some(i) => at_index(i, call.refused(e.source)),
+            None => call.refused(e.source),
+        })?;
+    match answer {
+        Keyed::Fresh(stamped) => Ok(call.fresh(bulk_outcome(stamped, sent).render(), false)),
+        Keyed::Replayed(record) => {
+            let RecordOutcome::Bulk { stamps } = &record.outcome else {
+                return Err(keyed::mismatched(&record));
+            };
+            if stamps.len() != sent.len() {
+                return Err(keyed::mismatched(&record));
+            }
+            // Each `_id` from the body, which is the first attempt's, or
+            // derived again for its position, as the engine derived it.
+            let inserted_ids = sent
+                .into_iter()
+                .enumerate()
+                .map(|(position, sent)| keyed_id(sent, &call.write, &meta, position as u64))
+                .collect();
+            let outcome = BulkInsertOutcome { inserted_ids, stamps: stamps.clone() };
+            Ok(call.replayed(&record, outcome.render()))
+        }
+    }
+}
 
-    // Positionally parallel to `insertedIds`: every document gets its own
-    // stamp, and a caller following one up with a conditional write needs
-    // the version it landed at, exactly as `insert` reports.
-    Ok(json!({
-        "inserted": stamped.len(),
-        "insertedIds": stamped
-            .iter()
-            .zip(sent)
-            .map(|((id, _), sent)| crate::json::bson_to_json(&inserted_id(sent, id)))
-            .collect::<Vec<_>>(),
-        "stamps": stamped.iter().map(|(_, stamp)| stamp.encode()).collect::<Vec<_>>(),
-    }))
+/// What a bulk insert answers, from what the engine stored and what the body
+/// sent. Positionally parallel to `insertedIds`: every document gets its own
+/// stamp, and a caller following one up with a conditional write needs the
+/// version it landed at, exactly as `insert` reports.
+fn bulk_outcome(
+    stamped: Vec<(DocId, kimmy_core::Stamp)>,
+    sent: Vec<Option<bson::Bson>>,
+) -> BulkInsertOutcome {
+    let inserted_ids =
+        stamped.iter().zip(sent).map(|((id, _), sent)| inserted_id(sent, id)).collect();
+    let stamps = stamped.into_iter().map(|(_, stamp)| stamp).collect();
+    BulkInsertOutcome { inserted_ids, stamps }
 }
 
 /// Name the offending document's position without changing the error envelope.
@@ -1110,6 +1188,9 @@ pub struct ReplaceParams {
     pub if_stamp: Option<String>,
 }
 
+// The by-id writes' shape, with the key every keyed write takes beside it: a
+// struct for the two would be one more name for the same eight things.
+#[allow(clippy::too_many_arguments)]
 pub fn replace(
     state: &SharedState,
     auth: &Auth,
@@ -1118,13 +1199,40 @@ pub fn replace(
     id: &str,
     document: &Value,
     params: ReplaceParams,
-) -> Result<Value, ApiError> {
+    key: Option<&IdempotentRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let _span = op_span("replace", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
     let doc = json_to_document(document)?;
     let expected = parse_if_stamp(params.if_stamp.as_deref())?;
-    let outcome = state.engine.replace_if(&meta, &doc_id, doc, params.upsert, expected)?;
+    let Some(key) = key else {
+        let outcome = state.engine.replace_if(&meta, &doc_id, doc, params.upsert, expected)?;
+        return Ok(WriteAnswer::first(replace_outcome(&outcome).render()));
+    };
+    // The record is looked up before the version check, so a retry whose
+    // `if_stamp` the first attempt moved on from is the first answer, not
+    // `409 stale`.
+    let call = KeyedCall::new(state, auth, key);
+    let answer = state
+        .engine
+        .replace_keyed(&meta, &doc_id, doc, params.upsert, expected, &call.write)
+        .map_err(|e| call.refused(e))?;
+    match answer {
+        Keyed::Fresh(outcome) => Ok(call.fresh(replace_outcome(&outcome).render(), false)),
+        Keyed::Replayed(record) => {
+            let RecordOutcome::Replace { matched, modified, upserted, stamp } = record.outcome
+            else {
+                return Err(keyed::mismatched(&record));
+            };
+            let outcome = ReplaceOutcome { matched, modified, upserted, stamp };
+            Ok(call.replayed(&record, outcome.render()))
+        }
+    }
+}
+
+/// What a replace by id answers, from what the engine did.
+fn replace_outcome(outcome: &kimmy_storage::WriteOutcome) -> ReplaceOutcome {
     // `modified` is 0 for a body identical to the stored one, which writes
     // nothing and reports no `stamp` (ADR-208).
     //
@@ -1135,16 +1243,13 @@ pub fn replace(
     // the same field name carrying two types on one protocol. Nothing stated
     // the type, so nothing disagreed until the specification's contract test
     // drove both routes and compared them (ADR-056). `upserted` stays a
-    // boolean because it genuinely is one.
-    let mut body = json!({
-        "matched": u8::from(outcome.matched),
-        "modified": u8::from(outcome.modified),
-        "upserted": outcome.upserted,
-    });
-    if let Some(stamp) = outcome.stamp {
-        body["stamp"] = json!(stamp.encode());
+    // boolean because it genuinely is one. [`ReplaceOutcome::render`] holds that.
+    ReplaceOutcome {
+        matched: outcome.matched,
+        modified: outcome.modified,
+        upserted: outcome.upserted,
+        stamp: outcome.stamp,
     }
-    Ok(body)
 }
 
 pub fn delete_by_id(
@@ -1154,7 +1259,8 @@ pub fn delete_by_id(
     coll: &str,
     id: &str,
     if_stamp: Option<&str>,
-) -> Result<Value, ApiError> {
+    key: Option<&IdempotentRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let _span = op_span("delete_by_id", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
@@ -1163,12 +1269,26 @@ pub fn delete_by_id(
     // version it produced (ADR-084): `POST .../delete` of one document
     // already did, and a by-id delete that said only `{"deleted": 1}` was the
     // one write a client could not follow with the version it made.
-    let stamp = state.engine.delete_if(&meta, &doc_id, expected)?;
-    let mut body = json!({ "deleted": u8::from(stamp.is_some()) });
-    if let Some(stamp) = stamp {
-        body["stamp"] = json!(stamp.encode());
+    let Some(key) = key else {
+        let stamp = state.engine.delete_if(&meta, &doc_id, expected)?;
+        return Ok(WriteAnswer::first(DeleteByIdOutcome { stamp }.render()));
+    };
+    // Replayed only while the delete's own tombstone stands; once retention
+    // collects it, the retry runs afresh and answers `{"deleted": 0}`.
+    let call = KeyedCall::new(state, auth, key);
+    let answer = state
+        .engine
+        .delete_keyed(&meta, &doc_id, expected, &call.write)
+        .map_err(|e| call.refused(e))?;
+    match answer {
+        Keyed::Fresh(stamp) => Ok(call.fresh(DeleteByIdOutcome { stamp }.render(), false)),
+        Keyed::Replayed(record) => {
+            let RecordOutcome::Delete { stamp, .. } = record.outcome else {
+                return Err(keyed::mismatched(&record));
+            };
+            Ok(call.replayed(&record, DeleteByIdOutcome { stamp }.render()))
+        }
     }
-    Ok(body)
 }
 
 /// A filtered write's parameters, mirroring [`FindParams`].
@@ -1221,7 +1341,8 @@ pub fn update(
     coll: &str,
     update_json: &Value,
     params: WriteParams,
-) -> Result<Value, ApiError> {
+    key: Option<&IdempotentRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let _span = op_span("update", db, Some(coll)).entered();
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
@@ -1229,6 +1350,9 @@ pub fn update(
     let update = parse_update(update_json, &params.array_filters)?;
     let expected = params.expected()?;
     let stop_after = if multi { None } else { Some(1) };
+    if explain && key.is_some() {
+        return Err(crate::idempotency::refused_with_explain());
+    }
 
     // `explain: true` plans the write and reports it, exactly as `find`
     // reports a read — it does not perform the write (ADR-131). The same
@@ -1241,12 +1365,12 @@ pub fn update(
     // has always carried.
     if explain {
         let stats = visit_matching(state, &meta, &filter, Order::Any, stop_after, |_, _| {})?;
-        return Ok(json!({
+        return Ok(WriteAnswer::first(json!({
             "matched": 0,
             "modified": 0,
             "commits": 0,
             "explain": stats.to_json(),
-        }));
+        })));
     }
 
     // Match and write in one transaction. This used to collect the targets
@@ -1264,22 +1388,109 @@ pub fn update(
         now: now_millis(),
         expected,
     };
-    // A scan's candidates, and a multikey range's fallback, are the whole
-    // collection walked in the write transaction: off the async worker
-    // (ADR-199).
-    let outcome = kimmy_storage::blocking(|| {
-        state.engine.modify_where(&meta, &candidates, &modify, stop_after)
-    })?;
-
-    let mut body = json!({
-        "matched": outcome.matched,
-        "modified": outcome.modified,
-        "commits": outcome.commits,
-    });
-    if let Some(stamp) = single_stamp(multi, &outcome) {
-        body["stamp"] = json!(stamp.encode());
+    let filtered = run_filtered(state, auth, &meta, &candidates, &modify, stop_after, key)?;
+    let counts = &filtered.counts;
+    let body = UpdateOutcome {
+        matched: counts.matched,
+        modified: counts.modified,
+        commits: counts.commits,
+        stamp: single_stamp(multi, counts.modified, counts.stamp),
+        skipped: counts.skipped,
+        resumed: counts.resumed,
     }
-    Ok(body)
+    .render();
+    Ok(filtered.answer(body))
+}
+
+/// What a filtered write counted, fresh from the engine or from the first
+/// attempt's record: cumulative over the request's commits, and over its
+/// attempts once it resumes. `skipped` and `resumed` are a keyed request's
+/// own and stay 0 and `false` for any other (ADR-240).
+struct FilteredCounts {
+    matched: u64,
+    modified: u64,
+    commits: u64,
+    /// The stamp of the last document written.
+    stamp: Option<kimmy_core::Stamp>,
+    skipped: u64,
+    resumed: bool,
+}
+
+/// A filtered write's counts, and how they were reached: without a key, fresh
+/// under one, or from its record.
+struct Filtered<'a> {
+    counts: FilteredCounts,
+    how: FilteredBy<'a>,
+}
+
+enum FilteredBy<'a> {
+    Unkeyed,
+    Fresh(KeyedCall<'a>),
+    Replayed(KeyedCall<'a>, Box<kimmy_storage::IdempotencyRecord>),
+}
+
+impl Filtered<'_> {
+    /// The response for `body`, rendered from [`Self::counts`]: a replay is
+    /// marked and counted as one, a fresh keyed answer as applied or resumed.
+    fn answer(self, body: Value) -> WriteAnswer {
+        match self.how {
+            FilteredBy::Unkeyed => WriteAnswer::first(body),
+            FilteredBy::Fresh(call) => call.fresh(body, self.counts.resumed),
+            FilteredBy::Replayed(call, record) => call.replayed(&record, body),
+        }
+    }
+}
+
+/// Run an update's or a delete's write, keyed or not. A scan's candidates, and
+/// a multikey range's fallback, are the whole collection walked in the write
+/// transaction: off the async worker (ADR-199), keyed or not.
+fn run_filtered<'a>(
+    state: &'a SharedState,
+    auth: &Auth,
+    meta: &CollectionMeta,
+    candidates: &kimmy_storage::Candidates,
+    modify: &Modify<'_>,
+    stop_after: Option<usize>,
+    key: Option<&IdempotentRequest>,
+) -> Result<Filtered<'a>, ApiError> {
+    let fresh = |outcome: kimmy_storage::ModifyManyOutcome| FilteredCounts {
+        matched: outcome.matched,
+        modified: outcome.modified,
+        commits: outcome.commits,
+        stamp: outcome.stamp,
+        skipped: outcome.skipped,
+        resumed: outcome.resumed,
+    };
+    let Some(key) = key else {
+        let outcome = kimmy_storage::blocking(|| {
+            state.engine.modify_where(meta, candidates, modify, stop_after)
+        })?;
+        return Ok(Filtered { counts: fresh(outcome), how: FilteredBy::Unkeyed });
+    };
+    let call = KeyedCall::new(state, auth, key);
+    let answer = kimmy_storage::blocking(|| {
+        state.engine.modify_where_keyed(meta, candidates, modify, stop_after, &call.write)
+    })
+    .map_err(|e| call.refused(e))?;
+    match answer {
+        Keyed::Fresh(outcome) => {
+            Ok(Filtered { counts: fresh(outcome), how: FilteredBy::Fresh(call) })
+        }
+        Keyed::Replayed(record) => {
+            let RecordOutcome::Modify(recorded) = &record.outcome else {
+                return Err(keyed::mismatched(&record));
+            };
+            let counts = FilteredCounts {
+                matched: recorded.matched,
+                modified: recorded.modified,
+                commits: recorded.commits,
+                stamp: recorded.stamp,
+                skipped: recorded.skipped,
+                resumed: recorded.resumed,
+            };
+            Ok(Filtered { counts, how: FilteredBy::Replayed(call, Box::new(record)) })
+        }
+    }
 }
 
 /// An update body and the request's `arrayFilters`, parsed together: the
@@ -1300,9 +1511,10 @@ fn parse_update(update_json: &Value, array_filters: &[Value]) -> Result<update::
 /// and not be it.
 fn single_stamp(
     multi: bool,
-    outcome: &kimmy_storage::ModifyManyOutcome,
+    modified: u64,
+    stamp: Option<kimmy_core::Stamp>,
 ) -> Option<kimmy_core::Stamp> {
-    (!multi && outcome.modified == 1).then_some(outcome.stamp).flatten()
+    (!multi && modified == 1).then_some(stamp).flatten()
 }
 
 /// Where a filtered write looks, in the engine's terms.
@@ -1447,7 +1659,8 @@ pub fn find_and_modify(
     db: &str,
     coll: &str,
     spec: FindAndModifySpec,
-) -> Result<Value, ApiError> {
+    key: Option<&IdempotentRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let _span = op_span("find_and_modify", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
 
@@ -1521,45 +1734,91 @@ pub fn find_and_modify(
 
     // As `update`'s: a scan walks the collection in the write transaction
     // (ADR-199).
-    let outcome =
-        kimmy_storage::blocking(|| state.engine.find_and_modify(&meta, &candidates, &modify))?;
-
-    let returned = match spec.return_document {
-        ReturnDocument::Before => outcome.before.clone(),
-        ReturnDocument::After => outcome.after.clone(),
+    let Some(key) = key else {
+        let outcome =
+            kimmy_storage::blocking(|| state.engine.find_and_modify(&meta, &candidates, &modify))?;
+        return Ok(WriteAnswer::first(
+            find_and_modify_outcome(&outcome, spec.return_document, projection.as_ref()).render(),
+        ));
     };
-    let document = match returned {
-        Some(doc) => document_to_json(&shape::project(projection.as_ref(), &doc)),
-        None => Value::Null,
+    // The record keeps the image the caller asked for, so a replay answers
+    // with that one; an upsert's seed without `_id` takes the key's derived
+    // one, as an insert's does.
+    let returned = match spec.return_document {
+        ReturnDocument::Before => kimmy_storage::ReturnedImage::Before,
+        ReturnDocument::After => kimmy_storage::ReturnedImage::After,
+    };
+    let call = KeyedCall::new(state, auth, key);
+    let answer = kimmy_storage::blocking(|| {
+        state.engine.find_and_modify_keyed(&meta, &candidates, &modify, &call.write, returned)
+    })
+    .map_err(|e| call.refused(e))?;
+    match answer {
+        Keyed::Fresh(outcome) => {
+            let outcome =
+                find_and_modify_outcome(&outcome, spec.return_document, projection.as_ref());
+            Ok(call.fresh(outcome.render(), false))
+        }
+        Keyed::Replayed(record) => {
+            let RecordOutcome::FindAndModify {
+                matched,
+                modified,
+                removed,
+                upserted_id,
+                stamp,
+                document,
+            } = &record.outcome
+            else {
+                return Err(keyed::mismatched(&record));
+            };
+            // The same request (the fingerprint says so), so the same
+            // projection over the image the first attempt answered with; and
+            // a stamp only for a document that still exists, as on the first
+            // answer.
+            let outcome = FindAndModifyOutcome {
+                document: document.as_ref().map(|doc| shape::project(projection.as_ref(), doc)),
+                matched: *matched,
+                modified: *modified,
+                upserted_id: upserted_id.clone(),
+                stamp: stamp.filter(|_| !removed),
+            };
+            Ok(call.replayed(&record, outcome.render()))
+        }
+    }
+}
+
+/// What a `find_and_modify` answers, from what the engine did: the image the
+/// caller asked for, projected.
+fn find_and_modify_outcome(
+    outcome: &kimmy_storage::ModifyOutcome,
+    return_document: ReturnDocument,
+    projection: Option<&shape::Projection>,
+) -> FindAndModifyOutcome {
+    let returned = match return_document {
+        ReturnDocument::Before => outcome.before.as_ref(),
+        ReturnDocument::After => outcome.after.as_ref(),
     };
 
     // `modified` as `/update` counts it (ADR-208): 1 when an existing
     // document was changed or removed, 0 when the update left it byte for
     // byte as it was, which writes nothing and so reports no `stamp`, and 0
     // for a document the upsert created, which `upserted` says, as on `PUT`.
-    let mut body = json!({
-        "document": document,
-        "matched": u64::from(outcome.matched),
-        "modified": u64::from(outcome.modified),
-        "upserted": outcome.upserted.is_some(),
-    });
-    if let Some(id) = outcome.upserted {
+    FindAndModifyOutcome {
+        document: returned.map(|doc| shape::project(projection, doc)),
+        matched: outcome.matched,
+        modified: outcome.modified,
         // The created document's own `_id`, as `insertedId` is (a binary's
         // subtype included): `after` is the image the engine stored.
-        let stored = outcome.after.as_ref().and_then(|doc| doc.get(kimmy_storage::ID_FIELD));
-        body["upsertedId"] =
-            crate::json::bson_to_json(&stored.map_or_else(|| id.to_bson(), Clone::clone));
-    }
-    if let Some(stamp) = outcome.stamp {
+        upserted_id: outcome.upserted.as_ref().map(|id| {
+            let stored = outcome.after.as_ref().and_then(|doc| doc.get(kimmy_storage::ID_FIELD));
+            stored.map_or_else(|| id.to_bson(), Clone::clone)
+        }),
         // The version the write produced — what the next conditional write
         // names. A removal produces a tombstone's stamp, which nothing can
         // be conditional on, so it is reported only for a document that
         // still exists.
-        if outcome.after.is_some() {
-            body["stamp"] = json!(stamp.encode());
-        }
+        stamp: outcome.stamp.filter(|_| outcome.after.is_some()),
     }
-    Ok(body)
 }
 
 pub fn delete(
@@ -1568,18 +1827,26 @@ pub fn delete(
     db: &str,
     coll: &str,
     params: WriteParams,
-) -> Result<Value, ApiError> {
+    key: Option<&IdempotentRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let _span = op_span("delete", db, Some(coll)).entered();
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
     let expected = params.expected()?;
     let stop_after = if multi { None } else { Some(1) };
+    if explain && key.is_some() {
+        return Err(crate::idempotency::refused_with_explain());
+    }
 
     // Plans without deleting, exactly as `update` does above (ADR-131).
     if explain {
         let stats = visit_matching(state, &meta, &filter, Order::Any, stop_after, |_, _| {})?;
-        return Ok(json!({ "deleted": 0, "commits": 0, "explain": stats.to_json() }));
+        return Ok(WriteAnswer::first(json!({
+            "deleted": 0,
+            "commits": 0,
+            "explain": stats.to_json()
+        })));
     }
 
     // The same one-transaction path as `update`, with the spec removing
@@ -1594,18 +1861,17 @@ pub fn delete(
         now: now_millis(),
         expected,
     };
-    // A scan's candidates, and a multikey range's fallback, are the whole
-    // collection walked in the write transaction: off the async worker
-    // (ADR-199).
-    let outcome = kimmy_storage::blocking(|| {
-        state.engine.modify_where(&meta, &candidates, &modify, stop_after)
-    })?;
-
-    let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
-    if let Some(stamp) = single_stamp(multi, &outcome) {
-        body["stamp"] = json!(stamp.encode());
+    let filtered = run_filtered(state, auth, &meta, &candidates, &modify, stop_after, key)?;
+    let counts = &filtered.counts;
+    let body = DeleteOutcome {
+        deleted: counts.modified,
+        commits: counts.commits,
+        stamp: single_stamp(multi, counts.modified, counts.stamp),
+        skipped: counts.skipped,
+        resumed: counts.resumed,
     }
-    Ok(body)
+    .render();
+    Ok(filtered.answer(body))
 }
 
 // ---------------------------------------------------------------------------

@@ -138,6 +138,33 @@ pub enum StorageError {
     /// and replicating; `cause` is why the request stopped there.
     #[error("the request was partly applied ({applied}) and then failed: {cause}")]
     PartiallyApplied { applied: Applied, cause: Box<StorageError> },
+
+    /// The `Idempotency-Key` names a request already made with another body,
+    /// path or query (its record's fingerprint differs), or of another kind, or
+    /// its record is contested: two members accepted it for two requests and
+    /// their records met. Nothing was written. The API's `422 idempotency_key_reused`, `retry: no`
+    /// (draft §2.7): the client must send a new key.
+    #[error("this Idempotency-Key was used for a different request")]
+    IdempotencyKeyReused,
+
+    /// A multi-chunk request with this `Idempotency-Key` is running on this
+    /// member. Nothing was written. The API's `409 idempotency_key_in_flight`,
+    /// `retry: wait`: once it ends, the retry replays or resumes it.
+    #[error("a request with this Idempotency-Key is still running on this member")]
+    IdempotencyKeyInFlight,
+
+    /// A row of a snapshot page that does not fit a page holding nothing else
+    /// (`snapshot::SNAPSHOT_PAGE_BYTES`): a document larger than a frame, or the
+    /// `find_and_modify` record holding one, whose oplog entry cannot cross in a
+    /// window either; or a document whose `_id` is so large (over about 3 MiB of
+    /// binary or 5 MiB of string) that the page's cursor naming it, whose key
+    /// crosses as an array of integers, does not fit with it. It crosses on a page
+    /// once it is smaller. The sender answers the page's request with this reason.
+    #[error(
+        "{what} is {bytes} bytes on a snapshot page with the cursor that names it, which \
+         has {room} bytes for its rows: it cannot cross on a page until it is smaller"
+    )]
+    SnapshotRowTooLarge { what: String, bytes: usize, room: usize },
 }
 
 /// What kind of refusal a [`StorageError::RefusedStore`] is (ADR-204).

@@ -14,6 +14,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::ApiError;
 use crate::exec;
+use crate::idempotency::{KeyedJson, KeyedNoBody, WriteAnswer};
 use crate::json::{JsonBody, QueryParams};
 use crate::limits::RequestLimits;
 use crate::ratelimit::{self, Decision};
@@ -64,6 +65,16 @@ pub fn router_with_limits(
         // default is exactly what axum applied when nothing set one, so an
         // operator who never touches the setting sees no change (ADR-099).
         .layer(axum::extract::DefaultBodyLimit::max(limits.max_body_bytes))
+        // Which routes take `Idempotency-Key`, and whether its value is one
+        // (ADR-240). Here, over the merged table, rather than inside `routes()`
+        // beside the query-string guard, so that `/mcp`, merged above, refuses
+        // the header too: an MCP client keys a tool call by its argument, and a
+        // header on the transport would otherwise be read as nothing. Inside
+        // the catching-up gate, so a member that is behind answers `503`
+        // first, as it does for every other refusal; inside the count, so the
+        // `400` is counted and traced. Whether this member takes keys now is
+        // the keyed routes' own question, asked after authentication.
+        .layer(axum::middleware::from_fn(idempotency_guard))
         // A member that is catching up refuses every route but the four an
         // operator or a client's routing needs (ADR-202), over the whole table
         // including `/mcp`, which is merged above. Inside the drain below, so a
@@ -291,6 +302,86 @@ pub const QUERY_STRING_ROUTES: [(&str, &str); 7] = [
     ("DELETE", "/v1/db/{db}/coll/{coll}/vector"),
     ("GET", "/v1/db/{db}/coll/{coll}/watch"),
 ];
+
+/// The routes that take `Idempotency-Key`, as `(method, route template)`, each
+/// template exactly the literal it is registered with above (ADR-240): the document
+/// writes. The MCP write tools take the key as their argument `idempotency_key`
+/// instead, and `/mcp` itself is refused the header like any route not listed.
+///
+/// **This table only opens routes; it never closes one**, like
+/// [`QUERY_STRING_ROUTES`]: [`idempotency_guard`] answers `400` to the header on
+/// any `(method, route)` not listed, so a route added above refuses it until
+/// someone lists it here, which is only right once the route writes its
+/// record. Refusing rather than ignoring is the point: a client that
+/// believes it is protected and is not is worse off than one told no (ADR-121,
+/// ADR-124). Reads (the `POST` `find`, `count` and `aggregate` included), the
+/// schema changes (whose retries already identify an earlier attempt), vectors,
+/// webhooks, users, roles and the backup are all outside it. The contract test
+/// in `tests/openapi.rs` holds this table equal to the operations
+/// `docs/openapi.yaml` gives the header.
+pub const IDEMPOTENT_ROUTES: [(&str, &str); 7] = [
+    ("POST", "/v1/db/{db}/coll/{coll}/docs"),
+    ("POST", "/v1/db/{db}/coll/{coll}/bulk"),
+    ("PUT", "/v1/db/{db}/coll/{coll}/docs/{id}"),
+    ("DELETE", "/v1/db/{db}/coll/{coll}/docs/{id}"),
+    ("POST", "/v1/db/{db}/coll/{coll}/update"),
+    ("POST", "/v1/db/{db}/coll/{coll}/find_and_modify"),
+    ("POST", "/v1/db/{db}/coll/{coll}/delete"),
+];
+
+/// Whether `(method, route)` is one [`IDEMPOTENT_ROUTES`] opens to the header.
+pub fn takes_idempotency_key(method: &str, route: &str) -> bool {
+    IDEMPOTENT_ROUTES.iter().any(|(m, r)| *m == method && *r == route)
+}
+
+/// Refuse `Idempotency-Key` where it is not taken (ADR-240). Two refusals, each a
+/// `400 bad_request` that names the header, in this order:
+///
+/// 1. on a route outside [`IDEMPOTENT_ROUTES`], `/mcp` included: this route
+///    does not take one;
+/// 2. a value that is not one well-formed key on one field line, with what is
+///    wrong with it and the published format.
+///
+/// A request without the header passes untouched, and so does one that matched
+/// no route, to the `404` it is about to get. The decision is made on the
+/// matched route template, as [`refuse_unread_query_string`]'s is.
+///
+/// # It answers before authentication, and the gate does not
+///
+/// As the query-string guard does, and for the same reasons: it reads the
+/// header and the route template, examines no credential and touches nothing,
+/// so `POST …/find` with the header and no token is `400`, not `401`; nothing
+/// in either refusal is more than the route table `docs/openapi.yaml`
+/// publishes and the caller's own header. Whether this member takes keys now
+/// (the gate, [`crate::AppState::idempotency_gate`]) is asked after
+/// authentication instead, by the keyed route's own extractor
+/// ([`crate::idempotency::KeyedJson`]): its refusal can name a live member, and
+/// a caller with no token learns nothing about the cluster from a key it sends,
+/// but the `401` it would have had anyway.
+pub async fn idempotency_guard(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !request.headers().contains_key(crate::idempotency::IDEMPOTENCY_KEY) {
+        return next.run(request).await;
+    }
+    let Some(route) = request.extensions().get::<axum::extract::MatchedPath>() else {
+        return next.run(request).await;
+    };
+    if !takes_idempotency_key(request.method().as_str(), route.as_str()) {
+        return ApiError::bad_request(
+            "this route does not take an Idempotency-Key: only the document writes do (insert, \
+             bulk, replace and delete by id, update, find_and_modify and delete), and an MCP \
+             tool takes the argument idempotency_key instead. Send the request without the \
+             header",
+        )
+        .into_response();
+    }
+    if let Err(refused) = crate::idempotency::key_from_headers(request.headers()) {
+        return refused.into_response();
+    }
+    next.run(request).await
+}
 
 /// Refuse a query string on a route that does not read one.
 ///
@@ -1046,9 +1137,9 @@ async fn insert_doc(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    JsonBody(body): JsonBody<Value>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::insert(&state, &auth, &db, &coll, &body)?))
+    KeyedJson { body, key }: KeyedJson<Value>,
+) -> Result<WriteAnswer, ApiError> {
+    exec::insert(&state, &auth, &db, &coll, &body, key.as_ref())
 }
 
 /// Insert an array of documents in one commit.
@@ -1060,12 +1151,13 @@ async fn bulk_insert_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    // `JsonBody` rather than the `Result<Json<_>, JsonRejection>` this route
-    // used to spell out: the envelope now comes from the extractor, so it is
-    // not something eighteen other handlers can forget.
-    JsonBody(documents): JsonBody<Vec<Value>>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::insert_many(&state, &auth, &db, &coll, &documents)?))
+    // `KeyedJson`, which is `JsonBody` for a request without a key, rather
+    // than the `Result<Json<_>, JsonRejection>` this route used to spell out:
+    // the envelope comes from the extractor, so it is not something eighteen
+    // other handlers can forget.
+    KeyedJson { body: documents, key }: KeyedJson<Vec<Value>>,
+) -> Result<WriteAnswer, ApiError> {
+    exec::insert_many(&state, &auth, &db, &coll, &documents, key.as_ref())
 }
 
 #[derive(Deserialize, Default)]
@@ -1223,10 +1315,10 @@ async fn replace_doc(
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
     QueryParams(q): QueryParams<ReplaceQuery>,
-    JsonBody(body): JsonBody<Value>,
-) -> Result<Json<Value>, ApiError> {
+    KeyedJson { body, key }: KeyedJson<Value>,
+) -> Result<WriteAnswer, ApiError> {
     let params = exec::ReplaceParams { upsert: q.upsert, if_stamp: q.if_stamp };
-    Ok(Json(exec::replace(&state, &auth, &db, &coll, &id, &body, params)?))
+    exec::replace(&state, &auth, &db, &coll, &id, &body, params, key.as_ref())
 }
 
 #[derive(Deserialize, Default)]
@@ -1241,8 +1333,9 @@ async fn delete_doc(
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
     QueryParams(q): QueryParams<DeleteQuery>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::delete_by_id(&state, &auth, &db, &coll, &id, q.if_stamp.as_deref())?))
+    KeyedNoBody(key): KeyedNoBody,
+) -> Result<WriteAnswer, ApiError> {
+    exec::delete_by_id(&state, &auth, &db, &coll, &id, q.if_stamp.as_deref(), key.as_ref())
 }
 
 #[derive(Deserialize)]
@@ -1278,8 +1371,8 @@ async fn find_and_modify(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    JsonBody(body): JsonBody<FindAndModifyRequest>,
-) -> Result<Json<Value>, ApiError> {
+    KeyedJson { body, key }: KeyedJson<FindAndModifyRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let return_document = match body.return_document.as_deref() {
         None | Some("before") => exec::ReturnDocument::Before,
         Some("after") => exec::ReturnDocument::After,
@@ -1301,7 +1394,7 @@ async fn find_and_modify(
         if_stamp: body.if_stamp,
         array_filters: body.array_filters,
     };
-    Ok(Json(exec::find_and_modify(&state, &auth, &db, &coll, spec)?))
+    exec::find_and_modify(&state, &auth, &db, &coll, spec, key.as_ref())
 }
 
 #[derive(Deserialize)]
@@ -1327,8 +1420,8 @@ async fn update_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    JsonBody(body): JsonBody<UpdateRequest>,
-) -> Result<Json<Value>, ApiError> {
+    KeyedJson { body, key }: KeyedJson<UpdateRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let params = exec::WriteParams {
         filter: body.filter,
         multi: body.multi,
@@ -1336,7 +1429,7 @@ async fn update_docs(
         if_stamp: body.if_stamp,
         array_filters: body.array_filters,
     };
-    Ok(Json(exec::update(&state, &auth, &db, &coll, &body.update, params)?))
+    exec::update(&state, &auth, &db, &coll, &body.update, params, key.as_ref())
 }
 
 #[derive(Deserialize)]
@@ -1358,8 +1451,8 @@ async fn delete_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    JsonBody(body): JsonBody<DeleteRequest>,
-) -> Result<Json<Value>, ApiError> {
+    KeyedJson { body, key }: KeyedJson<DeleteRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let params = exec::WriteParams {
         filter: body.filter,
         multi: body.multi,
@@ -1367,7 +1460,7 @@ async fn delete_docs(
         if_stamp: body.if_stamp,
         array_filters: Vec::new(),
     };
-    Ok(Json(exec::delete(&state, &auth, &db, &coll, params)?))
+    exec::delete(&state, &auth, &db, &coll, params, key.as_ref())
 }
 
 // ---------------------------------------------------------------------------

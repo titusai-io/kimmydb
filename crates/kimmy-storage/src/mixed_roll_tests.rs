@@ -358,7 +358,12 @@ fn v1_page(
     let more = all.len() > limit;
     let taken: Vec<Row> = all.into_iter().take(limit).collect();
     let next = match (more, taken.last()) {
-        (true, Some(last)) => Some(SnapshotCursor { collection, after_key: last.v1.clone() }),
+        (true, Some(last)) => Some(SnapshotCursor {
+            collection,
+            after_key: last.v1.clone(),
+            records: None,
+            records_base: None,
+        }),
         _ => None,
     };
     let mut page = SnapshotPage {
@@ -376,6 +381,8 @@ fn v1_page(
         deleted_documents: Vec::new(),
         dropped_indexes: Vec::new(),
         tombstone_horizon: sender.tombstone_horizon().unwrap(),
+        records: Vec::new(),
+        records_epoch: None,
     };
     for row in taken {
         match row.live {
@@ -658,7 +665,12 @@ fn the_sender_resumes_after_the_row_a_schema_4_cursor_names() {
     let ids = [1, 2, 3, A, A + 1, B - 1, B, B + 1];
     let coll = holding(&s, "orders", &ids, &[]);
     for (i, id) in ids.iter().enumerate() {
-        let after = SnapshotCursor { collection: coll.id, after_key: v1::key(&int(*id)) };
+        let after = SnapshotCursor {
+            collection: coll.id,
+            after_key: v1::key(&int(*id)),
+            records: None,
+            records_base: None,
+        };
         let page = s.snapshot_page(Some(after), Some(coll.id)).unwrap();
         let served: Vec<DocId> = page.documents.iter().map(|d| d.id.clone()).collect();
         let want: Vec<DocId> = ids[i + 1..].iter().map(|id| int(*id)).collect();
@@ -1431,7 +1443,12 @@ fn a_decimal_id_travels_marked_and_lands_on_its_own_document() {
     }
 
     // A cursor ending at a decimal id is marked, and the sender resumes after it.
-    let after = SnapshotCursor { collection: coll.id, after_key: marked(&decimal("2.5")) };
+    let after = SnapshotCursor {
+        collection: coll.id,
+        after_key: marked(&decimal("2.5")),
+        records: None,
+        records_base: None,
+    };
     let rest = s.snapshot_page(Some(after), Some(coll.id)).unwrap();
     assert_eq!(rest.documents.iter().map(|d| d.id.clone()).collect::<Vec<_>>(), vec![int(3)]);
 

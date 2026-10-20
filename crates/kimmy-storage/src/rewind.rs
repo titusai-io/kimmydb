@@ -74,6 +74,13 @@ pub struct RewindOutcome {
     pub removed: usize,
     /// Oplog entries discarded because they described the undone future.
     pub oplog_discarded: usize,
+    /// Idempotency records of requests whose every write the rewind discarded
+    /// (ADR-240).
+    pub records_removed: usize,
+    /// Idempotency records the rewind cut part-way and reopened (ADR-240): a
+    /// filtered write's to resume, any other kind's but a bulk insert's to
+    /// replay.
+    pub records_reopened: usize,
 }
 
 /// How many unrecoverable documents to name before summarising.
@@ -435,6 +442,14 @@ impl Engine {
             if !discarded.is_empty() {
                 record_rewind(&txn, until, &discarded)?;
             }
+            // The idempotency records of the undone future go with it (ADR-240): a
+            // record of a write the rewind discarded would replay an answer for
+            // a write that no longer exists, and a client would take it as
+            // applied. One the rewind cuts part-way is reopened, a bulk
+            // insert's excepted, which goes.
+            let (records_removed, records_reopened) = self.rewind_records_in(&txn, until)?;
+            outcome.records_removed = records_removed;
+            outcome.records_reopened = records_reopened;
             // The live counts moved with every record the rewind rewrote, in
             // this transaction; their mark moves with the rows it removed, or
             // the next start would walk the whole store to rebuild counts that

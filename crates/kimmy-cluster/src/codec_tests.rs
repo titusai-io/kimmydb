@@ -237,6 +237,7 @@ fn a_043_decoder_reads_the_new_block_and_frames() {
             facts_gen: Some(3),
             echo,
             replay_from: None,
+            replay_records: None,
         },
     ] {
         let bytes = bson::serialize_to_vec(&message).unwrap();
@@ -279,9 +280,15 @@ fn this_build_reads_a_043_block_and_frames() {
 fn unset_fields_add_no_keys() {
     let facts = bson::serialize_to_bson(&Facts::default()).unwrap();
     let doc = facts.as_document().unwrap();
-    for key in
-        ["class_state", "class_cause", "responsive", "writer_wedged", "started_ms", "decimal128"]
-    {
+    for key in [
+        "class_state",
+        "class_cause",
+        "responsive",
+        "writer_wedged",
+        "started_ms",
+        "decimal128",
+        "idempotency_records",
+    ] {
         assert!(!doc.contains_key(key), "{key}");
     }
     let frame = bson::serialize_to_bson(&Message::AskVersions {
@@ -340,6 +347,7 @@ fn a_full_block_round_trips() {
         responsive: Some(true),
         started_ms: Some(42),
         decimal128: Some(true),
+        idempotency_records: Some(true),
         ..Facts::default()
     };
     let back: Facts =
@@ -403,4 +411,67 @@ fn a_050_decoder_reads_a_block_carrying_decimal128() {
     let Message050::AskVersions { facts } = bson::deserialize_from_slice(&bytes).unwrap();
     let facts = facts.unwrap();
     assert_eq!((facts.boot, facts.catching_up, facts.started_ms), (vec![3; 16], true, Some(7)));
+}
+
+/// `Facts.idempotency_records` (ADR-240) is read by this build from an older sender's
+/// block as `None`, which is *does not carry records*, and a value of another shape
+/// costs the field only: the gate fails closed on anything but `Some(true)`.
+#[test]
+fn this_build_reads_idempotency_records_leniently_and_an_older_block_as_not_carrying() {
+    assert_eq!(facts_of(doc! { "idempotency_records": true }).idempotency_records, Some(true));
+    assert_eq!(facts_of(doc! { "idempotency_records": false }).idempotency_records, Some(false));
+    // A 0.51 sender: no key, though it says `decimal128`.
+    let older = facts_of(doc! { "catching_up": true, "decimal128": true, "boot": bson::Binary {
+    subtype: bson::spec::BinarySubtype::Generic, bytes: vec![8; 16] } });
+    assert_eq!(older.idempotency_records, None);
+    assert_eq!(older.decimal128, Some(true), "the rest of the block is read");
+    for odd in [Bson::String("yes".into()), Bson::Int32(1), Bson::Null, doc! { "a": 1 }.into()] {
+        let block = facts_of(doc! { "catching_up": true, "idempotency_records": odd.clone() });
+        assert!(block.catching_up, "{odd:?} cost the block");
+        assert_eq!(block.idempotency_records, None, "{odd:?} reads as does not carry");
+    }
+    // Sent as a plain boolean, and only when set.
+    let raw =
+        bson::serialize_to_bson(&Facts { idempotency_records: Some(true), ..Facts::default() })
+            .unwrap();
+    assert_eq!(raw.as_document().unwrap().get("idempotency_records"), Some(&Bson::Boolean(true)));
+}
+
+/// A 0.51 decoder, which knows nothing of `idempotency_records`, reads a 0.52 block
+/// and frame carrying it: an older member is not failed by the field.
+#[test]
+fn a_051_decoder_reads_a_block_carrying_idempotency_records() {
+    #[derive(Debug, Deserialize)]
+    struct Facts051 {
+        #[serde(default, with = "serde_bytes")]
+        boot: Vec<u8>,
+        #[serde(default)]
+        catching_up: bool,
+        #[serde(default)]
+        decimal128: Option<bool>,
+    }
+    #[derive(Debug, Deserialize)]
+    enum Message051 {
+        AskVersions {
+            #[serde(default)]
+            facts: Option<Facts051>,
+        },
+    }
+    let block = Facts {
+        boot: vec![3; 16],
+        catching_up: true,
+        decimal128: Some(true),
+        idempotency_records: Some(true),
+        ..Facts::default()
+    };
+    let message = Message::AskVersions {
+        witnessed: true,
+        facts: Some(Arc::new(block)),
+        facts_gen: Some(1),
+        echo: None,
+    };
+    let bytes = bson::serialize_to_vec(&message).unwrap();
+    let Message051::AskVersions { facts } = bson::deserialize_from_slice(&bytes).unwrap();
+    let facts = facts.unwrap();
+    assert_eq!((facts.boot, facts.catching_up, facts.decimal128), (vec![3; 16], true, Some(true)));
 }
