@@ -190,7 +190,7 @@ fn decimal128_refusal(what: Decimal128Use, closed: &Decimal128Closed) -> String 
              live member(s) {} whether they can hold one (a member that came up or rejoined a \
              moment ago; its facts arrive by an immediate exchange, or the next replication \
              contact). This is transient: nothing was written; send the same request again \
-             after Retry-After",
+             after the wait (the Retry-After header, or retry_after_secs)",
             peers.join(", ")
         ),
     }
@@ -414,7 +414,7 @@ mod tests {
             text.contains("peer-c")
                 && text.contains("not yet heard")
                 && text.contains("transient")
-                && text.contains("Retry-After"),
+                && text.contains("after the wait"),
             "{text}"
         );
         let text = Error::Decimal128Gated {

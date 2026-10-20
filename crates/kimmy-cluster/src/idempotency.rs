@@ -121,7 +121,7 @@ impl fmt::Display for IdempotencyClosed {
                  that came up or rejoined a moment ago; its facts arrive by an immediate \
                  exchange, or the next replication contact). This is transient: nothing was looked \
                  up or written; send the same request again, with the same key, after \
-                 Retry-After",
+                 the wait (the Retry-After header, or retry_after_secs)",
                 peers.join(", ")
             ),
         }
@@ -301,7 +301,8 @@ mod tests {
         );
         assert_eq!(closed.retry_after_secs(), Some(1), "a fixed second");
         let text = closed.to_string();
-        for said in ["Idempotency-Key", "not yet heard", "transient", "same key", "Retry-After"] {
+        for said in ["Idempotency-Key", "not yet heard", "transient", "same key", "after the wait"]
+        {
             assert!(text.contains(said), "says {said:?}: {text}");
         }
         assert!(text.contains(&node(2).to_string()), "names the member: {text}");

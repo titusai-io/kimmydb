@@ -449,14 +449,26 @@ impl Members {
     }
 
     fn insert(&self, addr: SocketAddr, node: NodeId) {
-        let table = self.0.peer_facts.write();
+        let mut table = self.0.peer_facts.write();
+        // A node that comes up at an address while it is live at another is a new
+        // process that moved (a rescheduled pod: SWIM sees the new address up
+        // before it declares the old one down). What the old one said, and read of
+        // ours, is not the new one's, and the new one's lease on being heard
+        // starts now, as after a rename. Both belong to the node, not to either
+        // address, so the old address's later down changes neither ([`Self::remove`]).
+        let moved = self.0.live.read().iter().any(|(held, id)| *id == node && *held != addr);
         let generation = self.0.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         self.0.generations.write().insert(addr, generation);
         self.0.live.write().insert(addr, node);
         self.live_changed_now();
-        self.0.up_since.lock().entry(node).or_insert_with(Instant::now);
+        if moved {
+            self.drop_peer(&mut table, node);
+            self.0.up_since.lock().insert(node, Instant::now());
+        } else {
+            self.0.up_since.lock().entry(node).or_insert_with(Instant::now);
+        }
         self.publish(&table);
-        // Nothing is dropped here: a block that arrived before SWIM's insert
+        // Nothing else is dropped here: a block that arrived before SWIM's insert
         // (the contact can win the race) is the peer's, and a peer SWIM declared
         // down had its block dropped then, in `remove`.
     }
@@ -468,7 +480,15 @@ impl Members {
         // Declared down: what it last said, and what it last read of ours,
         // belong to an incarnation that may be gone. A block it sends after it
         // is back is a new one, and a stale bit stays only until then (ADR-201).
-        if let Some(node) = gone {
+        //
+        // **Unless the node is still live at another address**: it moved, the new
+        // address came up first ([`Self::insert`]), and the drop and the unheard
+        // clock were taken then. The block held now may be the new process's and
+        // the clock is its own, so the old address's down must neither drop the
+        // one nor remove the other: a node live with no clock is unheard for ever.
+        if let Some(node) = gone
+            && !self.0.live.read().values().any(|id| *id == node)
+        {
             self.0.up_since.lock().remove(&node);
             self.drop_peer(&mut table, node);
         }
@@ -1954,5 +1974,110 @@ mod tests {
 
         assert_eq!(members.node_ids(), before, "the node is the same node");
         assert_ne!(members.snapshot(), BTreeSet::from([addr(7901)]));
+    }
+
+    fn moved_collector(members: &Members) -> Collector {
+        Collector {
+            outgoing: Outgoing::default(),
+            timers: Vec::new(),
+            members: members.clone(),
+            rejoined: false,
+            at: Instant::now(),
+        }
+    }
+
+    fn says_idempotency(boot: u8) -> Facts {
+        Facts { boot: vec![boot; 16], idempotency_records: Some(true), ..Facts::default() }
+    }
+
+    /// A member rescheduled onto a new address comes up there before SWIM
+    /// declares the old address down (no graceful leave). The old address's down
+    /// must not take the node's unheard clock, or its block, though the node is
+    /// live at the new address: a peer it has not been heard from since would
+    /// otherwise answer `503` for ever, and the unheard-peer WARN would never name
+    /// it. Its clock runs from the new address's up, so the `503` becomes the
+    /// ruled `400` after the lease, and the WARN names it.
+    #[test]
+    fn a_node_that_moved_address_is_bounded_by_the_lease_when_its_old_address_is_down() {
+        use crate::facts::{PeerNet, idempotency_records_net};
+        use foca::Runtime;
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(1), 3);
+        let old = Member::identified(addr(7901), node(2), 0);
+        let moved = Member::identified(addr(7902), node(2), 0);
+        let mut collector = moved_collector(&members);
+        collector.notify(Notification::MemberUp(&old));
+        members.backdate_unheard_for_test(node(2), Duration::from_secs(3600));
+        // The new address comes up, and nothing is heard from the new process.
+        collector.notify(Notification::MemberUp(&moved));
+        collector.notify(Notification::MemberDown(&old));
+
+        let view = members.view();
+        assert!(view.live.contains(&node(2)), "still live at its new address");
+        let since = view.unheard_since.get(&node(2)).expect("its clock is kept");
+        assert!(
+            since.elapsed() < Duration::from_secs(60),
+            "and runs from the new address's up, not from the old one's"
+        );
+        let now = Instant::now();
+        assert_eq!(idempotency_records_net(&view, now), PeerNet::Unheard(vec![node(2)]));
+        assert!(members.unheard_beyond_lease(now).is_empty(), "within its lease");
+        let far = now + Duration::from_secs(3600);
+        assert_eq!(idempotency_records_net(&view, far), PeerNet::Refused(vec![node(2)]));
+        assert_eq!(members.unheard_beyond_lease(far), vec![node(2)], "the WARN names it then");
+    }
+
+    /// The block the new process sent from its new address survives the old
+    /// address's down; the old process's block is dropped when the new address
+    /// comes up.
+    #[test]
+    fn a_node_that_moved_address_keeps_the_block_of_its_new_address_when_the_old_one_is_down() {
+        use crate::facts::{PeerNet, idempotency_records_net};
+        use foca::Runtime;
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(1), 3);
+        let old = Member::identified(addr(7901), node(2), 0);
+        let moved = Member::identified(addr(7902), node(2), 0);
+        let mut collector = moved_collector(&members);
+        collector.notify(Notification::MemberUp(&old));
+        members.record_peer_facts_for_test(node(2), says_idempotency(1), Duration::ZERO);
+        collector.notify(Notification::MemberUp(&moved));
+        assert!(
+            !members.view().blocks.contains_key(&node(2)),
+            "the old process's block is not the new one's"
+        );
+        members.record_peer_facts_for_test(node(2), says_idempotency(2), Duration::ZERO);
+        collector.notify(Notification::MemberDown(&old));
+
+        let view = members.view();
+        let held = view.blocks.get(&node(2)).expect("the new process's block is kept");
+        assert_eq!(held.facts.boot, vec![2; 16]);
+        assert_eq!(idempotency_records_net(&view, Instant::now()), PeerNet::Open);
+    }
+
+    /// The same node with the order reversed (the old address declared down
+    /// first) is as bounded: the clock starts at the new address's up. And a node
+    /// that is down everywhere loses its clock and its block.
+    #[test]
+    fn a_node_declared_down_at_every_address_loses_its_clock_and_block() {
+        use crate::facts::{PeerNet, idempotency_records_net};
+        use foca::Runtime;
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(1), 3);
+        let old = Member::identified(addr(7901), node(2), 0);
+        let moved = Member::identified(addr(7902), node(2), 0);
+        let mut collector = moved_collector(&members);
+        collector.notify(Notification::MemberUp(&old));
+        members.record_peer_facts_for_test(node(2), says_idempotency(1), Duration::ZERO);
+        collector.notify(Notification::MemberDown(&old));
+        collector.notify(Notification::MemberUp(&moved));
+        let far = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(idempotency_records_net(&members.view(), far), PeerNet::Refused(vec![node(2)]));
+
+        collector.notify(Notification::MemberDown(&moved));
+        let view = members.view();
+        assert!(!view.live.contains(&node(2)));
+        assert!(!view.blocks.contains_key(&node(2)));
+        assert!(!view.unheard_since.contains_key(&node(2)));
     }
 }
