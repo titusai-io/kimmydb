@@ -28868,7 +28868,7 @@ with it, and not be offered while any member could carry the write without it.
      covers is never served again, so a record vouched for at one is stored then or never. **A batch that ends at an
      entry stores no record whose row is at or past that entry; the window serves those again.** A record is stored
      whether or not a drop of its collection came after it (item 3); one already past its window is not, unless the
-     live record here is of the same request (item 3). Records
+     live record here is of the same request and is not itself contested (item 3). Records
      **merge as a join**: `first` the smaller, `last` the greater, state, outcome, cursor and origin from the greater
      `last`, `done` over `applying` at an equal one, and at an equal `last` and state the record whose bytes (but for
      `first` and the contested bit) are greater, so the merge is commutative as well as associative and idempotent,

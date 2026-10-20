@@ -2001,9 +2001,19 @@ where
                     // the requester is told which, rather than left with a
                     // connection that closed.
                     Err(e @ kimmy_storage::StorageError::SnapshotRowTooLarge { .. }) => {
-                        warn!(error = %e, "a snapshot page cannot be served");
-                        write_frame(&mut stream, &Message::Fault(e.to_string())).await?;
-                        return Err(ProtocolError::Local(e.to_string()));
+                        // The row is asked for again every round: said once per
+                        // interval and row, and the text names an `_id` by a prefix.
+                        use crate::said_once::SaidOnce;
+                        static SAID: SaidOnce = SaidOnce::new();
+                        let reason = e.to_string();
+                        let now = std::time::Instant::now();
+                        if SAID.due(&reason, now, crate::health::WARN_INTERVAL) {
+                            warn!(error = %reason, "a snapshot page cannot be served");
+                        } else {
+                            debug!(error = %reason, "a snapshot page cannot be served");
+                        }
+                        write_frame(&mut stream, &Message::Fault(reason.clone())).await?;
+                        return Err(ProtocolError::Local(reason));
                     }
                     Err(e) => return Err(ProtocolError::Local(e.to_string())),
                 };
@@ -11105,7 +11115,8 @@ mod tests {
         match pulled {
             Err(ProtocolError::Fault(reason)) => {
                 assert!(
-                    reason.contains("document Int64(0)") && reason.contains("cannot cross"),
+                    reason.contains("document with _id Int64(0)")
+                        && reason.contains("cannot cross"),
                     "{reason}"
                 );
             }

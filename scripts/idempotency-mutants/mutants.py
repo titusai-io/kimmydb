@@ -929,11 +929,11 @@ FIXES = [
      "            self.witness(&record.last);\n            if record.fingerprint != keyed.fingerprint {\n"),
     ("past-window-record-stored", "A receiver stores a record past its window, merged into a new request's",
      "crates/kimmy-storage/src/idempotency.rs",
-     "        if self.record_is_past_window(record)\n            && !live.is_some_and(|live| live.fingerprint == record.fingerprint)\n        {\n            return Ok((None, false));\n        }\n",
+     "        let own_request =\n            !record.contested && live.is_some_and(|live| live.fingerprint == record.fingerprint);\n        if self.record_is_past_window(record) && !own_request {\n            return Ok((None, false));\n        }\n",
      ""),
     ("past-window-same-request-refused", "A record past its window of the live record's own request is refused, not merged (as first built)",
      "crates/kimmy-storage/src/idempotency.rs",
-     "        if self.record_is_past_window(record)\n            && !live.is_some_and(|live| live.fingerprint == record.fingerprint)\n        {\n",
+     "        let own_request =\n            !record.contested && live.is_some_and(|live| live.fingerprint == record.fingerprint);\n        if self.record_is_past_window(record) && !own_request {\n",
      "        if self.record_is_past_window(record) {\n"),
     ("zero-base-guard-off", "A page asked with the zero records base is applied though its sender's log began since (the zero-base guard)",
      "crates/kimmy-storage/src/snapshot.rs",
@@ -990,6 +990,61 @@ FIXES = [
 ]
 for name, doc, path, old, new in FIXES:
     ROWS.append({"name": name, "group": "fixes", "doc": doc, "patches": [(path, old, new)], "suites": MODEL_ONLY})
+
+# The review of the stage after the fixes: a refused row named by a bounded name, a past-window
+# record that is contested, and a merged keyed delete's drop case. Each runs the tests that must
+# fail under it, in their own crate's lib suite.
+REVIEWED = [
+    {
+        "name": "past-window-contested-record-merges",
+        "group": "fixes",
+        "doc": "A peer's past-window record merges into the live record of its request even when it is contested, and its flag contests the live request",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency.rs",
+             "        let own_request =\n            !record.contested && live.is_some_and(|live| live.fingerprint == record.fingerprint);\n",
+             "        let own_request = live.is_some_and(|live| live.fingerprint == record.fingerprint);\n"),
+        ],
+        "suites": [("kimmy-storage", "--lib", "a_contested_past_window_record_does_not_contest_a_live_request", "no")],
+        "kills": ["a_contested_past_window_record_does_not_contest_a_live_request"],
+    },
+    {
+        "name": "large-id-refusal-names-the-whole-id",
+        "group": "fixes",
+        "doc": "The refusal of a row whose _id is too large to cross names the id whole, as its Debug form",
+        "patches": [
+            ("crates/kimmy-storage/src/snapshot.rs",
+             "                                            id_name(&document.id),\n",
+             "                                            format!(\"{:?}\", document.id),\n"),
+        ],
+        "suites": [("kimmy-storage", "--lib", "the_refusal_of_a_large_id_names_it_by_its_length_and_prefix", "no")],
+        "kills": ["the_refusal_of_a_large_id_names_it_by_its_length_and_prefix"],
+    },
+    {
+        "name": "keyed-delete-drop-case-by-last",
+        "group": "fixes",
+        "doc": "A keyed delete's drop case is judged by the record's last, not its first: a drop between two merged attempts runs the retry afresh",
+        "patches": [
+            ("crates/kimmy-storage/src/docs.rs",
+             "            None => self.delete_taken_by_a_drop(txn, coll, first)?,\n",
+             "            None => self.delete_taken_by_a_drop(txn, coll, record.last)?,\n"),
+        ],
+        "suites": [("kimmy-storage", "--lib", "a_keyed_delete_of_two_merged_attempts_replays_after_a_drop_between_them", "no")],
+        "kills": ["a_keyed_delete_of_two_merged_attempts_replays_after_a_drop_between_them"],
+    },
+    {
+        "name": "snapshot-refusal-said-every-round",
+        "group": "fixes",
+        "doc": "The warning of a refused snapshot row is due every time it is asked, not once per interval",
+        "patches": [
+            ("crates/kimmy-cluster/src/said_once.rs",
+             "        if said.get(&key).is_some_and(|at| now.saturating_duration_since(*at) < every) {\n",
+             "        if false && said.get(&key).is_some_and(|at| now.saturating_duration_since(*at) < every) {\n"),
+        ],
+        "suites": [("kimmy-cluster", "--lib", "said_once::tests::a_subject_is_said_once_per_interval", "no")],
+        "kills": ["said_once::tests::a_subject_is_said_once_per_interval"],
+    },
+]
+ROWS.extend(REVIEWED)
 
 
 def row(name):

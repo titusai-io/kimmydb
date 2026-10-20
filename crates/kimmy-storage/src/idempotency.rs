@@ -2016,7 +2016,9 @@ impl Engine {
     /// Stored whether or not a drop of its collection came after it, or the
     /// collection stands: a record outlives a drop for its window. **Not stored
     /// when it is past its window**, the one test of a record's life, **unless
-    /// the live record here is of the same request** (the same fingerprint):
+    /// the live record here is of the same request** (the same fingerprint) **and
+    /// it is not contested** (a contested record stands for two or more
+    /// requests, and merged, its flag would contest the live one):
     /// merged into the live record of a new request under the key, it would
     /// lower that record's `first` to the old request's, and mark it contested;
     /// merged into one of its own request's later attempts, it lowers `first` to
@@ -2061,9 +2063,12 @@ impl Engine {
             Err(e) => return Err(e),
         };
         let live = stored.as_ref().filter(|stored| !self.record_is_past_window(stored));
-        if self.record_is_past_window(record)
-            && !live.is_some_and(|live| live.fingerprint == record.fingerprint)
-        {
+        // A past-window record merges only as the live record's own request, and
+        // only when it stands for one: a contested record stands for two or more,
+        // and its flag would carry to the live request.
+        let own_request =
+            !record.contested && live.is_some_and(|live| live.fingerprint == record.fingerprint);
+        if self.record_is_past_window(record) && !own_request {
             return Ok((None, false));
         }
         let merged = match live {

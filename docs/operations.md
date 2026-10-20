@@ -663,10 +663,14 @@ replication:
   1 MiB), with the cursor that names it: a document whose `_id` is over about
   3 MiB of binary or 5 MiB of string does not fit with that cursor, whose key
   crosses as an array of integers. The sender answers the request with a fault
-  naming the row (a document's collection and id, a record's collection) and its
-  size, and the requester's round fails with it (`kimmy_sync_failures_total`);
+  naming the row (a document's collection and `_id`, a record's collection) and
+  its size, and the requester's round fails with it (`kimmy_sync_failures_total`);
   the pull asks again on its next round, and moves on once the document is
-  smaller. A document larger than a frame cannot cross in a window either.
+  smaller. A document larger than a frame cannot cross in a window either. The
+  `_id` is named by its kind, its length and its first 24 bytes (binary as hex),
+  never whole, so the line and the fault stay a few hundred bytes; the `WARN` is
+  said once per row per five minutes (a `DEBUG` line on the rounds between), though
+  the connection's own `peer connection failed` follows each round.
 - **`INFO` `a snapshot page carries only records`**, with `records`, `base` and
   `stopped`: what changed since the page before does not fit one page with its
   documents, so the page carries the records and the snapshot's position stays.
