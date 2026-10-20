@@ -28646,8 +28646,14 @@ in bash, one per clause.
 > it again with its key. Three tables are added: `idempotency` and `idempotency_by_stamp`, carried by a backup as tags
 > 12 and 13, which are a backup rollback boundary, and `idempotency_changes`, a node-local change log no backup carries.
 > No `kimmy.format` schema (still 5), `I_EPOCH`, existing codec or entry kind changes. One configuration key
-> (`cluster.idempotency_keys`), nine optional wire fields, one facts field, three error codes, a capability, a version
-> field and a response header are added. **Amends [ADR-238](#adr-238--a-stored-number-is-an-exact-value-a-decimal128-has-a-place-in-the-order-and-number-keys-are-exact-and-variable-length-storage-schema-5)**,
+> (`cluster.idempotency_keys`), fourteen optional wire fields (`replay`, `replay_records` and `records_ahead_of` on
+> `AskEntries`, `records` and `replay_records` on `Entries` and on `ReplayEntries`, `replay_records` on `ReplayAck` and
+> on `Vectors`, `records` on `Push`, `records` (the records position) and `records_base` on a snapshot cursor, `records`
+> and `records_epoch` on a snapshot page), in three new wire types
+> (`CarriedRecord`: `collection`, `scope`, an optional `carrying` and `record`; `RecordsBase`: `key` and an optional
+> `epoch`; `ReplayRecords`: `at`, `through`, `collections`, `collection`, `scope` and `base`), one facts field
+> (`idempotency_records`), three error codes, a capability, a version field and a response header are added.
+> **Amends [ADR-238](#adr-238--a-stored-number-is-an-exact-value-a-decimal128-has-a-place-in-the-order-and-number-keys-are-exact-and-variable-length-storage-schema-5)**,
 > whose gate answered a live member not heard from yet with the same `400` as one that cannot hold a decimal: both
 > gates now answer it `503 peer_unheard` (item 7).
 

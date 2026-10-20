@@ -715,17 +715,11 @@ ROWS = [
         ],
         "suites": MODEL,
     },
-    {
-        "name": "stores-a-record-with-an-earlier-entry",
-        "group": "lives",
-        "doc": "A receiver stores a frame's record in the run of its collection's first entry, before its row",
-        "patches": [
-            ("crates/kimmy-storage/src/idempotency.rs",
-             "        carrying.is_none_or(|row| row <= at)\n",
-             "        let _ = (carrying, at);\n        true\n"),
-        ],
-        "suites": MODEL,
-    },
+    # stores-a-record-with-an-earlier-entry: retired as equivalent under ruling A. Storing
+    # a frame's record with an earlier entry of its collection than the one at its row puts
+    # the record on the receiver before its effect, which ruling A allows (I2 is effect =>
+    # record), so the mutant changes no observable behaviour; its rationale, a record judged
+    # by the life of a drop between the two runs, went with the life rule.
     {
         "name": "stores-records-past-the-stop",
         "group": "lives",
