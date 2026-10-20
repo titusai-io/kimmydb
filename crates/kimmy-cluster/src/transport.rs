@@ -1496,7 +1496,7 @@ where
         match frame {
             Message::AskVersions { witnessed, facts, facts_gen, echo } => {
                 if undecodable && let Some(members) = members {
-                    members.note_undecodable(peer, std::time::Instant::now());
+                    members.note_undecodable(peer, decoded_seq, std::time::Instant::now());
                 }
                 // The requester's own block, which a member that is only ever
                 // contacted hands over this way (ADR-201). Recorded **before the
@@ -3132,7 +3132,7 @@ where
         } => {
             asked_replay = replay_from.map(|from| (from, replay_records));
             if undecodable {
-                stalls.facts_undecodable.push(their_node);
+                stalls.facts_undecodable.push((their_node, decoded_seq));
             }
             // What the peer says about itself, kept for the loop to hand to
             // `Members` once the contact is done (ADR-201), stamped with when
@@ -4163,8 +4163,9 @@ pub struct PeerStalls {
     /// What each answering peer's reply said it holds of this member's block,
     /// until the loop takes it.
     echoes_read: Vec<(NodeId, Option<crate::protocol::Echo>)>,
-    /// Peers whose block this tick did not decode, until the loop takes them.
-    facts_undecodable: Vec<NodeId>,
+    /// Peers whose block this tick did not decode, with the sequence number the
+    /// frame decoded at, until the loop takes them.
+    facts_undecodable: Vec<(NodeId, u64)>,
     /// What each contact's vector read showed, until the loop takes it: kept
     /// only for a round that then succeeded (ADR-202).
     reached_candidates: Vec<crate::catchup::Reached>,
@@ -5096,8 +5097,9 @@ impl PeerStalls {
         })
     }
 
-    /// The peers whose block did not decode since the last call.
-    pub fn take_facts_undecodable(&mut self) -> Vec<NodeId> {
+    /// The peers whose block did not decode since the last call, each with the
+    /// sequence number its frame decoded at.
+    pub fn take_facts_undecodable(&mut self) -> Vec<(NodeId, u64)> {
         std::mem::take(&mut self.facts_undecodable)
     }
 

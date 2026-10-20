@@ -479,8 +479,8 @@ impl Members {
     /// per interval per peer, naming it: otherwise a peer whose blocks never
     /// decode looks exactly like an older one that sends none. Answers whether it
     /// said it now.
-    pub(crate) fn note_undecodable(&self, peer: NodeId, now: Instant) -> bool {
-        self.mark_undecodable(peer, now);
+    pub(crate) fn note_undecodable(&self, peer: NodeId, decoded_seq: u64, now: Instant) -> bool {
+        self.mark_undecodable(peer, decoded_seq, now);
         let mut said = self.0.undecodable_said.lock();
         let due = said
             .get(&peer)
@@ -498,9 +498,18 @@ impl Members {
 
     /// Record that `peer`'s last block did not decode: the gates count it at once
     /// as a peer that does not say it has their capability, until a block of its
-    /// decodes or its slot is dropped.
-    fn mark_undecodable(&self, peer: NodeId, now: Instant) {
+    /// decodes or its slot is dropped. Ordered like a record: a block that decoded
+    /// before the slot's drop, or before this member's own `Defunct`, or before a
+    /// block held of the peer, marks nothing, however late the mark is applied.
+    fn mark_undecodable(&self, peer: NodeId, decoded_seq: u64, now: Instant) {
         let mut table = self.0.peer_facts.write();
+        let floor = table.floor.max(table.dropped.get(&peer).map_or(0, |(seq, _)| *seq));
+        if decoded_seq <= floor {
+            return;
+        }
+        if table.held.get(&peer).is_some_and(|held| held.decoded_seq > decoded_seq) {
+            return;
+        }
         table.undecodable.insert(peer, now);
         self.publish(&table);
     }
@@ -1174,7 +1183,7 @@ impl Members {
     /// Record that a block `node` sent did not decode, as a contact does. See
     /// [`Self::insert_for_test`].
     pub fn note_undecodable_for_test(&self, node: NodeId) {
-        self.note_undecodable(node, Instant::now());
+        self.note_undecodable(node, next_decoded_seq(), Instant::now());
     }
 
     /// Move `addr`'s generation on, as SWIM bringing it up and declaring it down
@@ -1684,6 +1693,53 @@ mod tests {
             vec![node(1)],
             "and what it read of ours"
         );
+    }
+
+    /// A mark that a peer's block did not decode is ordered like a record: one
+    /// from a frame that decoded before the peer's drop (a rename) or before this
+    /// member's own rejoin, and applied after it, marks nothing, so the new
+    /// incarnation is not refused (400) for a block it never sent. A frame that
+    /// decoded after the drop still marks at once, and so does one that decoded
+    /// after a block held of the peer.
+    #[test]
+    fn a_late_mark_from_before_a_drop_does_not_refuse_the_new_incarnation() {
+        use crate::facts::{PeerNet, idempotency_records_net};
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(5), 3);
+        members.insert_for_test(addr(7901), node(2));
+        let now = Instant::now();
+
+        // A frame decoded, then the rename dropped the peer, then the mark landed.
+        let before_rename = next_decoded_seq();
+        members.forget_peer_for_test(node(2));
+        members.note_undecodable(node(2), before_rename, now);
+        let view = members.view();
+        assert!(!view.undecodable.contains(&node(2)), "a rename's late mark is ignored");
+        assert_eq!(idempotency_records_net(&view, now), PeerNet::Unheard(vec![node(2)]));
+
+        // The same across this member's own rejoin.
+        let before_rejoin = next_decoded_seq();
+        members.rejoin_for_test();
+        members.note_undecodable(node(2), before_rejoin, now);
+        let view = members.view();
+        assert!(!view.undecodable.contains(&node(2)), "a rejoin's late mark is ignored");
+        assert_eq!(idempotency_records_net(&view, now), PeerNet::Unheard(vec![node(2)]));
+
+        // A frame that decoded after the drop marks at once.
+        members.note_undecodable(node(2), next_decoded_seq(), now);
+        let view = members.view();
+        assert!(view.undecodable.contains(&node(2)), "a mark after the drop lands");
+        assert_eq!(idempotency_records_net(&view, now), PeerNet::Refused(vec![node(2)]));
+
+        // A mark from a frame older than a held block of the peer is ignored.
+        let older = next_decoded_seq();
+        members.record_peer_facts_for_test(
+            node(2),
+            Facts { boot: vec![1; 16], ..Facts::default() },
+            Duration::ZERO,
+        );
+        members.note_undecodable(node(2), older, now);
+        assert!(!members.view().undecodable.contains(&node(2)), "older than a held block");
     }
 
     /// An immediate exchange is asked at most once per member per sync interval

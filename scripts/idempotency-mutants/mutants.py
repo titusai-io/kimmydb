@@ -40,6 +40,7 @@ CLOCK_UNIT = ("kimmy-cluster", "--lib", "facts::tests::a_rename_or_a_rejoin_star
 API_LEASE = ("kimmy-api", "--test idempotency", "a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400", "no")
 FLOOR_UNIT = ("kimmy-cluster", "--lib", "facts::tests::the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down", "no")
 FROZEN_CLUSTER = ("kimmyd", "--test cluster", "a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out", "yes")
+UNDECODABLE_MARK_UNIT = ("kimmy-cluster", "--lib", "membership::tests::a_late_mark_from_before_a_drop_does_not_refuse_the_new_incarnation", "no")
 
 GATE_SPLIT = [
     {
@@ -349,6 +350,22 @@ GATE_SPLIT = [
         ],
         "suites": [FROZEN_CLUSTER],
         "kills": ["a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out"],
+    },
+    {
+        "name": "gs-undecodable-mark-without-floor",
+        "group": "gate-split",
+        "doc": "A mark that a block did not decode lands whatever its decode sequence: one from before a rename or a rejoin refuses the new incarnation",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        let floor = table.floor.max(table.dropped.get(&peer).map_or(0, |(seq, _)| *seq));\n"
+             "        if decoded_seq <= floor {\n"
+             "            return;\n"
+             "        }\n"
+             "        if table.held.get(&peer).is_some_and(|held| held.decoded_seq > decoded_seq) {\n",
+             "        if table.held.get(&peer).is_some_and(|held| held.decoded_seq > decoded_seq) {\n"),
+        ],
+        "suites": [UNDECODABLE_MARK_UNIT],
+        "kills": ["membership::tests::a_late_mark_from_before_a_drop_does_not_refuse_the_new_incarnation"],
     },
 ]
 

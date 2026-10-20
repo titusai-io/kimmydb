@@ -1223,8 +1223,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         }
                     }
                     if let Some(members) = &config.members {
-                        for peer in stalls.take_facts_undecodable() {
-                            members.note_undecodable(peer, Instant::now());
+                        for (peer, decoded_seq) in stalls.take_facts_undecodable() {
+                            members.note_undecodable(peer, decoded_seq, Instant::now());
                         }
                     }
                     // What the peer said about itself, and what it holds of ours.

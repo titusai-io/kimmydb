@@ -29042,7 +29042,9 @@ with it, and not be offered while any member could carry the write without it.
    the 9.8 s unheard lease; the lease alone (3 s), or the suspect-to-down time and one interval (5.8 s), answered `400`
    at their end while the peer was still live. **A peer that refuses decides**: with
    both, the answer is the `400`, naming only the member that refuses. The same split holds for ADR-238's gate, from
-   the same view, which carries each live peer's unheard clock and the peers whose last block did not decode. Only the not-heard
+   the same view, which carries each live peer's unheard clock and the peers whose last block did not decode. That mark is
+   ordered like a block: one from a frame decoded before the peer's rename or this member's rejoin is ignored, however
+   late it is applied. Only the not-heard
    cause was ever transient, and it opens after every ordinary restart: measured against this build before the split,
    a member restarted in a three-member cluster answered `/readyz` 200 and then refused keyed writes `400`, `retry: no`,
    in 14 to 21 of 22 restarts, for a median of about 3.6 s and up to 8.9 s, and a peer's restart or pause closed the
@@ -29208,7 +29210,7 @@ reset or restored identity that peers keep only as page state never converge to 
 ADR. The mutation harness (`scripts/idempotency-mutants/`, run under bash) applies each mutant to an exported tree and
 runs its suites, the model's among them; [every mutation row of idempotency keys, run again together on the merged
 head, is listed
-with the test that kills it](adr-240-mutation-rows.md): 421 rows, 392 killed, 6 equivalent, 5 superseded and 10 retired, the 8 that G repeated from C run once, and 0 survived. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
+with the test that kills it](adr-240-mutation-rows.md): 422 rows, 393 killed, 6 equivalent, 5 superseded and 10 retired, the 8 that G repeated from C run once, and 0 survived. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
 path, a record outliving a drop (the purge, a database drop, a late drop, a resume across a drop, a delete by id whose
 tombstone a drop took) and L1, a contested record refused on every path and between chunks, a past-window record
 refused on store, the coalesced barrier, the fsync and write faults, restarts, the multi-chunk record, the lookahead

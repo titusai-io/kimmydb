@@ -1700,10 +1700,18 @@ mod tests {
 
         let members = cluster(&[1]);
         let t0 = Instant::now();
-        assert!(members.note_undecodable(node(1), t0));
-        assert!(!members.note_undecodable(node(1), t0 + Duration::from_secs(10)));
-        assert!(members.note_undecodable(node(2), t0), "another peer");
-        assert!(members.note_undecodable(node(1), t0 + crate::health::WARN_INTERVAL));
+        assert!(members.note_undecodable(node(1), next_decoded_seq(), t0));
+        assert!(!members.note_undecodable(
+            node(1),
+            next_decoded_seq(),
+            t0 + Duration::from_secs(10)
+        ));
+        assert!(members.note_undecodable(node(2), next_decoded_seq(), t0), "another peer");
+        assert!(members.note_undecodable(
+            node(1),
+            next_decoded_seq(),
+            t0 + crate::health::WARN_INTERVAL
+        ));
     }
 
     /// Whether every live peer writes 0.51.0's vector chunk ids (ADR-239): no

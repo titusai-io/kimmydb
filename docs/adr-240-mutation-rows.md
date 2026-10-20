@@ -510,7 +510,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 
 ## The gate split (GS)
 
-24 rows, the `gate-split` group of `scripts/idempotency-mutants/mutants.py`: the two gates' split of a live member not heard from yet (`503 peer_unheard`, with a `Retry-After` of a fixed second, for at most the unheard lease, which is floored at the time SWIM takes to declare a silent peer down plus one sync interval) from one that does not say it has the capability (`400`: its block says no or does not decode, or no block within the lease). Each row names the tests that must fail. Suites: as each row names (kimmy-cluster's gate tests, kimmy-api's, kimmy-mcp's and the kimmyd cluster test of the window), with the ignored tests where the row says so.
+25 rows, the `gate-split` group of `scripts/idempotency-mutants/mutants.py`: the two gates' split of a live member not heard from yet (`503 peer_unheard`, with a `Retry-After` of a fixed second, for at most the unheard lease, which is floored at the time SWIM takes to declare a silent peer down plus one sync interval) from one that does not say it has the capability (`400`: its block says no or does not decode, or no block within the lease). Each row names the tests that must fail. Suites: as each row names (kimmy-cluster's gate tests, kimmy-api's, kimmy-mcp's and the kimmyd cluster test of the window), with the ignored tests where the row says so.
 
 | Row | What it plants | Result | Killed by | Notes |
 |---|---|---|---|---|
@@ -535,11 +535,12 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | gs-unheard-lease-without-floor | The unheard lease is the lease alone, without SWIM's floor | killed | `the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down` | the real-process test: a frozen peer is answered `400` while live |
 | gs-floor-without-detection | The floor is SWIM's suspect-to-down time alone, without the probe periods it takes to suspect | killed | `the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down` | the real-process test: `400` at 5.8 s, the peer declared down at about 6.8 s |
 | gs-floor-not-configured | The running membership never gives the member set foca's timers: no floor | killed | `a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out` |  |
+| gs-undecodable-mark-without-floor | A mark that a block did not decode lands whatever its decode sequence: one from before a rename or a rejoin refuses the new incarnation | killed | `a_late_mark_from_before_a_drop_does_not_refuse_the_new_incarnation` | the mark is ordered like a record: ignored at or below the slot's drop and this member's rejoin floor, and below a held block's sequence; the held-block half has no row of its own |
 | live-peer-net-removed | The live-peer net never blocks | killed | `c9_a_live_member_that_does_not_carry_records_closes_the_gate` | M's row live-peer-net-removed, re-pointed at the net's call with its clock; replaces M's text; the same edit as F:G2, R:G1-live-peer-net-removed, C:K1-live-peer-net-removed, G:R-G1-live-peer-net-removed, M:live-peer-net-removed, with other suites |
 | gs-wait-not-rounded-up | The wait truncates a fractional sync interval instead of rounding it up | superseded | | superseded by gs-wait-longer and gs-wait-zero: the wait of a refusal for a peer not heard from yet is a fixed second now, with no sync interval to round up |
 | gs-wait-may-be-zero | The wait of a sub-second sync interval is 0 | superseded | | superseded by gs-wait-longer and gs-wait-zero: the wait of a refusal for a peer not heard from yet is a fixed second now, with no sync interval to round up |
 
-**24 rows: 22 killed, 0 equivalent, 2 superseded, 0 retired, 0 run once elsewhere, 0 survived.**
+**25 rows: 23 killed, 0 equivalent, 2 superseded, 0 retired, 0 run once elsewhere, 0 survived.**
 
 ## The review of the fixes (V)
 
@@ -583,8 +584,8 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | The fingerprint's golden vectors (X) | 11 | 11 | 0 | 0 | 0 | 0 | 0 |
 | The page byte budget and the guards of the records base (B) | 29 | 29 | 0 | 0 | 0 | 0 | 0 |
 | A replay's delta too large for its page (Z) | 8 | 8 | 0 | 0 | 0 | 0 | 0 |
-| The gate split (GS) | 24 | 22 | 0 | 2 | 0 | 0 | 0 |
+| The gate split (GS) | 25 | 23 | 0 | 2 | 0 | 0 | 0 |
 | The review of the fixes (V) | 16 | 15 | 1 | 0 | 0 | 0 | 0 |
-| **All** | **421** | **392** | **6** | **5** | **10** | **8** | **0** |
+| **All** | **422** | **393** | **6** | **5** | **10** | **8** | **0** |
 
-Of the 392 rows killed, 385 were killed by their own suites (2 of them by a hang, with the tests that failed before it; 1 by the memory guard, a test process killed past its RSS limit) and 7 by the wider suites. 6 rows are equivalent, each with its argument in its Notes; 5 are superseded and 10 retired, each saying by what; 8 repeat another row's edit and test and ran once, as it; and 0 survived.
+Of the 393 rows killed, 386 were killed by their own suites (2 of them by a hang, with the tests that failed before it; 1 by the memory guard, a test process killed past its RSS limit) and 7 by the wider suites. 6 rows are equivalent, each with its argument in its Notes; 5 are superseded and 10 retired, each saying by what; 8 repeat another row's edit and test and ran once, as it; and 0 survived.
