@@ -580,7 +580,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | records-ahead-only-to-a-pull-that-asks-partial | Records ahead of an entry go only to an ask for a partial window, so a pull under a replay floor, which holds nothing and asks for none, is answered `fits: 0` and fails its round on an entry that fits alone. | killed | `a_pull_under_a_replay_floor_takes_a_find_and_modifys_record_ahead_of_its_entry` | |
 | snapshot-refusal-warned-every-round-at-the-call-site | The listener says a refused snapshot row at `WARN` every time it is asked, not once per row per interval (the rate limit at the call site, beside the one planted inside the table). | killed | `a_refused_snapshot_row_is_warned_of_once_per_interval` | lets the refusal of one row log at `WARN` every round |
 
-**25 rows: 24 killed, 1 equivalent, 0 superseded, 0 retired, 0 run once elsewhere, 0 survived.**
+**27 rows: 26 killed, 1 equivalent, 0 superseded, 0 retired, 0 run once elsewhere, 0 survived.**
 
 ## Totals
 
@@ -600,7 +600,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | The page byte budget and the guards of the records base (B) | 29 | 29 | 0 | 0 | 0 | 0 | 0 |
 | A replay's delta too large for its page (Z) | 8 | 8 | 0 | 0 | 0 | 0 | 0 |
 | The gate split (GS) | 29 | 27 | 0 | 2 | 0 | 0 | 0 |
-| The review of the fixes (V) | 25 | 24 | 1 | 0 | 0 | 0 | 0 |
-| **All** | **435** | **406** | **6** | **5** | **10** | **8** | **0** |
+| The review of the fixes (V) | 27 | 26 | 1 | 0 | 0 | 0 | 0 |
+| **All** | **437** | **408** | **6** | **5** | **10** | **8** | **0** |
 
-Of the 406 rows killed, 399 were killed by their own suites (2 of them by a hang, with the tests that failed before it; 1 by the memory guard, a test process killed past its RSS limit) and 7 by the wider suites. 6 rows are equivalent, each with its argument in its Notes; 5 are superseded and 10 retired, each saying by what; 8 repeat another row's edit and test and ran once, as it; and 0 survived.
+Of the 408 rows killed, 401 were killed by their own suites (2 of them by a hang, with the tests that failed before it; 1 by the memory guard, a test process killed past its RSS limit) and 7 by the wider suites. 6 rows are equivalent, each with its argument in its Notes; 5 are superseded and 10 retired, each saying by what; 8 repeat another row's edit and test and ran once, as it; and 0 survived.
