@@ -3206,6 +3206,17 @@ async fn pull_round_rewriting_asks(
     s: &Engine,
     rewrite: impl Fn(&mut Message),
 ) -> Vec<Answer> {
+    pull_round_rewriting_asks_with(m, s, &mut PeerStalls::new(), rewrite).await.0
+}
+
+/// [`pull_round_rewriting_asks`] with the requester's `stalls` (a repair planned in
+/// them is handed out), and the round's outcome besides the answers.
+async fn pull_round_rewriting_asks_with(
+    m: &Engine,
+    s: &Engine,
+    stalls: &mut PeerStalls,
+    rewrite: impl Fn(&mut Message),
+) -> (Vec<Answer>, Result<SyncOutcome, ProtocolError>) {
     let (mut ours, relay_m) = tokio::io::duplex(MAX_FRAME);
     let (relay_s, far) = tokio::io::duplex(MAX_FRAME);
     let serving = async {
@@ -3244,14 +3255,71 @@ async fn pull_round_rewriting_asks(
             () = down => {}
         }
     };
-    let mut stalls = PeerStalls::new();
     let asking = async {
         open_handshake(m, &mut ours, SECRET, BINDING).await.unwrap();
-        let _ = sync_over(m, &mut ours, addr(), s.node_id(), None, &mut stalls).await;
+        let outcome = sync_over(m, &mut ours, addr(), s.node_id(), None, stalls).await;
         drop(ours);
+        outcome
     };
-    let ((), (), ()) = tokio::join!(serving, relay, asking);
-    answers.into_inner().unwrap()
+    let ((), (), outcome) = tokio::join!(serving, relay, asking);
+    (answers.into_inner().unwrap(), outcome)
+}
+
+/// A pull under a replay floor holds nothing (`held` is `None`) and asks for no
+/// partial window, as a count repair's replay does, but it reads records sent ahead
+/// of an entry as any pull does. The same sender, entry and record as the pull in one
+/// contact above: the window's first entry and the record riding at its
+/// own stamp overfill an 8 KiB frame together, though each fits alone. The record
+/// goes ahead of the entry, and the entry follows, in one contact.
+#[tokio::test]
+async fn a_pull_under_a_replay_floor_takes_a_find_and_modifys_record_ahead_of_its_entry() {
+    let s_dir = tempfile::tempdir().unwrap();
+    let s = Engine::open(&s_dir.path().join("kimmy.redb")).unwrap();
+    let orders = s.create_collection("shop", "orders").unwrap();
+    s.insert(&orders, bson::doc! { "_id": 1i64, "n": 0i64, "pad": "x".repeat(5_000) }).unwrap();
+    let m_dir = tempfile::tempdir().unwrap();
+    let m = Engine::open(&m_dir.path().join("kimmy.redb")).unwrap();
+    pull_all(&m, &s);
+    let base = s.version_vector().unwrap().get(s.node_id());
+    let k = lost_key(9);
+    let kimmy_storage::Keyed::Fresh(_) = s
+        .find_and_modify_keyed(
+            &orders,
+            &kimmy_storage::Candidates::Scan,
+            &IncN,
+            &k,
+            kimmy_storage::ReturnedImage::After,
+        )
+        .unwrap()
+    else {
+        panic!("a fresh key")
+    };
+    let _budget = EntryBudget::set(8 * 1024);
+    // A replay floor far above what M holds: the pull starts where M is behind, and
+    // asks from just above the insert M holds, so the window's first entry is the one
+    // with the record.
+    let mut stalls = PeerStalls::new();
+    assert!(stalls.plan_repair(s.node_id(), orders.id, Repair::Replay { from: Hlc::MAX }));
+    let asked = std::sync::Mutex::new(Vec::new());
+    let (answers, outcome) = pull_round_rewriting_asks_with(&m, &s, &mut stalls, |ask| {
+        if let Message::AskEntries { held, partial, from, .. } = ask {
+            asked.lock().unwrap().push((held.is_some(), *partial));
+            *from = base.successor();
+        }
+    })
+    .await;
+    let outcome = outcome.expect("one contact takes the record and then the entry");
+    assert!(outcome.repairing, "premise: the pull ran under the replay floor: {outcome:?}");
+    assert!(
+        asked.lock().unwrap().iter().all(|ask| *ask == (false, false)),
+        "premise: it holds nothing and asks for no partial window: {asked:?}"
+    );
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert_eq!(answers[0], Answer::Entries(0, 1), "the record goes ahead of its entry");
+    assert_eq!(answers[1], Answer::Entries(1, 0), "and the entry follows without it");
+    let morders = m.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&m, 1), 1, "the entry crossed");
+    assert!(m.idempotency_record(morders.id, &k.scope).unwrap().is_some(), "with its record");
 }
 
 /// A rewrite that names, in the ask after records ahead, another entry than the one

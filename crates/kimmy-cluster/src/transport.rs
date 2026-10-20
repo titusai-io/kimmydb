@@ -11157,6 +11157,41 @@ mod tests {
         }
     }
 
+    /// The listener says a row's refusal at `WARN` once per interval, and at `DEBUG`
+    /// every other time the row is asked for: a document no page can carry is asked
+    /// for again every round, and one line a round would fill the log.
+    #[tokio::test]
+    async fn a_refused_snapshot_row_is_warned_of_once_per_interval() {
+        use kimmy_storage::SnapshotPolicy::All;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "refused").unwrap();
+        // An `_id` no other test refuses: the table of what was said is the process's.
+        b.insert(&coll, bson::doc! { "_id": 7_100_001i64, "pad": "x".repeat(130 * 1024) }).unwrap();
+        b.set_snapshot_room_for_test(Some(64 * 1024));
+        let lines = Lines::default();
+        let seen = Arc::clone(&lines.0);
+        let _recording = tracing::subscriber::set_default(lines);
+        tracing::callsite::rebuild_interest_cache();
+        for _ in 0..2 {
+            let a_dir = tempfile::tempdir().unwrap();
+            let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+            let (served, _pulled) = pull_through(&a, &b, Some(coll.id), All).await;
+            assert!(matches!(&served, Err(ProtocolError::Local(why)) if why.contains("7100001")));
+        }
+        b.set_snapshot_room_for_test(None);
+        let warned = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, message, _)| {
+                *level == tracing::Level::WARN
+                    && message.contains("a snapshot page cannot be served")
+            })
+            .count();
+        assert_eq!(warned, 1, "the refusal of the row is said once for two rounds");
+    }
+
     /// The same through the listener with binary `_id`s of 4 KiB, which cross as
     /// arrays of integers, about ten bytes a byte: 512 documents of 110,000 bytes
     /// were counted within a page and crossed at 78.9 MB, so the listener could

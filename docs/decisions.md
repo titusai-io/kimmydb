@@ -28912,9 +28912,10 @@ with it, and not be offered while any member could carry the write without it.
      window or holds nothing. A 0.51 pull refuses the empty answer, and its round fails just as it would already
      stall on that entry (`fits: 0`). A 0.51 member's replay of its own origin asks with what it holds and no
      partial window, and would misread the answer as an empty page and step past the entry, never reading it
-     back; it is answered `fits: 0` as before, which it leaves alone, so it stalls on that entry and does not
-     skip it. Records exist only once every member runs 0.52 and the switch is set, since keyed writes are taken
-     only then.
+     back; it is answered `fits: 0` as before. 0.51's replay fails that round on the answer (it is malformed
+     to it) and asks again, so it stalls on that entry and does not skip it. Records exist only once every
+     member runs 0.52 and the switch is set, since keyed writes are taken only then; they outlive a rollback of a
+     member to 0.51 for their window, which is the case this paragraph guards.
    - **Snapshots carry records.** Per collection, a records phase in pages of up to 512 goes ahead of its documents; a
      page ends at the boundary into a collection with records and never holds one collection's records after another's
      documents; `SnapshotPage` gains `records` and `SnapshotCursor` a records position, which an older receiver drops,

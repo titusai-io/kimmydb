@@ -1029,6 +1029,30 @@ ROWS = [
         "kills": ["records_ahead_that_overfill_a_frame_by_themselves_are_counted_and_answered_fits_zero",
                   "records_that_together_overfill_a_frame_are_not_sent_ahead"],
     },
+    {
+        "name": "records-ahead-only-to-a-pull-that-asks-partial",
+        "group": "elsewhere",
+        "doc": "Records ahead of an entry go only to an ask for a partial window, not to a pull under a replay floor that holds nothing",
+        "patches": [
+            ("crates/kimmy-cluster/src/transport.rs",
+             ".filter(|_| partial || held.is_none())",
+             ".filter(|_| partial)"),
+        ],
+        "suites": [REPLAY_TESTS],
+        "kills": ["a_pull_under_a_replay_floor_takes_a_find_and_modifys_record_ahead_of_its_entry"],
+    },
+    {
+        "name": "snapshot-refusal-warned-every-round-at-the-call-site",
+        "group": "elsewhere",
+        "doc": "The listener says a refused snapshot row at WARN every time it is asked, the rate limit at the call site left out",
+        "patches": [
+            ("crates/kimmy-cluster/src/transport.rs",
+             "if SAID.due(&reason, now, crate::health::WARN_INTERVAL) {",
+             "if true || SAID.due(&reason, now, crate::health::WARN_INTERVAL) {"),
+        ],
+        "suites": [("kimmy-cluster", "--lib", "transport::tests::a_refused_snapshot_row_is_warned_of_once_per_interval", "no")],
+        "kills": ["a_refused_snapshot_row_is_warned_of_once_per_interval"],
+    },
 ] + GATE_SPLIT
 
 # The fixes after the review of the merged head, and records outliving a drop, as the model sees them: each row's killer
