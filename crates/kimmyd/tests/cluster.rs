@@ -5277,7 +5277,7 @@ async fn gate_send(
 /// 503 split). B is restarted with SIGTERM, and from the moment its `/readyz` answers 200 it
 /// is sent a keyed insert and a `Decimal128`-`_id` insert, again and again, until each is
 /// taken. While B has not yet heard a live peer's facts block, each is answered `503
-/// peer_unheard`, `retry: wait`, with `Retry-After` of one sync interval (5 s here, so the
+/// peer_unheard`, `retry: wait`, with `Retry-After: 1` (the sync interval is 5 s here, so the
 /// window is wide), and **never `400`**: every member runs this build and says it carries
 /// records and can hold a decimal. The keyed request sent again with its key then gets its
 /// first application, once, and sent again after that its replay. Up to `RESTARTS` restarts,
@@ -5330,8 +5330,8 @@ async fn a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_4
                         assert_eq!(answer.body["retry"], "wait", "{}", answer.text);
                         assert_eq!(
                             answer.retry_after.as_deref(),
-                            Some(SYNC_SECS.to_string().as_str()),
-                            "one sync interval: {}",
+                            Some("1"),
+                            "a fixed second: {}",
                             answer.text
                         );
                         assert!(answer.text.contains("transient"), "{}", answer.text);
