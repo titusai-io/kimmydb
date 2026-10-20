@@ -41,6 +41,9 @@ API_LEASE = ("kimmy-api", "--test idempotency", "a_peer_unheard_past_its_lease_o
 FLOOR_UNIT = ("kimmy-cluster", "--lib", "facts::tests::the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down", "no")
 FROZEN_CLUSTER = ("kimmyd", "--test cluster", "a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out", "yes")
 UNDECODABLE_MARK_UNIT = ("kimmy-cluster", "--lib", "membership::tests::a_late_mark_from_before_a_drop_does_not_refuse_the_new_incarnation", "no")
+MOVED_CLOCK_UNIT = ("kimmy-cluster", "--lib", "membership::tests::a_node_that_moved_address_is_bounded_by_the_lease_when_its_old_address_is_down", "no")
+MOVED_BLOCK_UNIT = ("kimmy-cluster", "--lib", "membership::tests::a_node_that_moved_address_keeps_the_block_of_its_new_address_when_the_old_one_is_down", "no")
+APPLIED_MARK_UNIT = ("kimmy-cluster", "--lib", "peers::tests::a_mark_collected_before_a_drop_is_ignored_when_the_round_applies_it", "no")
 
 GATE_SPLIT = [
     {
@@ -366,6 +369,60 @@ GATE_SPLIT = [
         ],
         "suites": [UNDECODABLE_MARK_UNIT],
         "kills": ["membership::tests::a_late_mark_from_before_a_drop_does_not_refuse_the_new_incarnation"],
+    },
+    {
+        "name": "gs-old-address-down-drops-a-moved-node",
+        "group": "gate-split",
+        "doc": "The down of a node's old address drops its unheard clock and its block though it is live at its new address",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        if let Some(node) = gone\n"
+             "            && !self.0.live.read().values().any(|id| *id == node)\n"
+             "        {\n",
+             "        if let Some(node) = gone {\n"),
+        ],
+        "suites": [MOVED_CLOCK_UNIT, MOVED_BLOCK_UNIT],
+        "kills": ["membership::tests::a_node_that_moved_address_is_bounded_by_the_lease_when_its_old_address_is_down",
+                  "membership::tests::a_node_that_moved_address_keeps_the_block_of_its_new_address_when_the_old_one_is_down"],
+    },
+    {
+        "name": "gs-moved-node-keeps-the-clock-of-its-old-address",
+        "group": "gate-split",
+        "doc": "A node that comes up at a new address while live at another keeps the unheard clock of its first up: the lease on being heard does not start at the new address",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "            self.drop_peer(&mut table, node);\n"
+             "            self.0.up_since.lock().insert(node, Instant::now());\n",
+             "            self.drop_peer(&mut table, node);\n"),
+        ],
+        "suites": [MOVED_CLOCK_UNIT],
+        "kills": ["membership::tests::a_node_that_moved_address_is_bounded_by_the_lease_when_its_old_address_is_down"],
+    },
+    {
+        "name": "gs-moved-node-keeps-the-block-of-its-old-address",
+        "group": "gate-split",
+        "doc": "A node that comes up at a new address while live at another keeps the block its old process sent: it stands as the new process's until the next contact",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "            self.drop_peer(&mut table, node);\n"
+             "            self.0.up_since.lock().insert(node, Instant::now());\n",
+             "            self.0.up_since.lock().insert(node, Instant::now());\n"),
+        ],
+        "suites": [MOVED_BLOCK_UNIT],
+        "kills": ["membership::tests::a_node_that_moved_address_keeps_the_block_of_its_new_address_when_the_old_one_is_down"],
+    },
+    {
+        "name": "gs-undecodable-mark-restamped-when-applied",
+        "group": "gate-split",
+        "doc": "The sync round applies a mark that a block did not decode with a decode sequence taken when it applies it, not when the frame decoded: one from before a rename or a rejoin refuses the new incarnation",
+        "patches": [
+            ("crates/kimmy-cluster/src/peers.rs",
+             "        members.note_undecodable(peer, decoded_seq, now);\n",
+             "        let _ = decoded_seq;\n"
+             "        members.note_undecodable(peer, crate::facts::next_decoded_seq(), now);\n"),
+        ],
+        "suites": [APPLIED_MARK_UNIT],
+        "kills": ["peers::tests::a_mark_collected_before_a_drop_is_ignored_when_the_round_applies_it"],
     },
 ]
 
