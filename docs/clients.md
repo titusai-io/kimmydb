@@ -38,6 +38,9 @@ which is opaque and whose shape nothing promises.
 server newer than the client will use ones it has never heard of. `retry` is in
 the envelope precisely so that a client does not need a table
 ([ADR-057](decisions.md)).
+`document_too_large` and `id_too_large` (`413`, retry `no`) refuse a write whose
+document encodes to more than 16 MiB or whose `_id` is over 4096 bytes; resending
+it fails the same way ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)).
 
 **Page with cursors, and end the walk on an empty page.** A `find` with no
 `limit` returns 100 documents rather than all of them, and a final page that is

@@ -52,6 +52,10 @@ pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
 pub enum ErrorCode {
     BadRequest,
     PayloadTooLarge,
+    /// A write would store a document over the 16 MiB cap (ADR-250).
+    DocumentTooLarge,
+    /// A request names an `_id` over the 4 KiB cap (ADR-250).
+    IdTooLarge,
     UnsupportedMediaType,
     Unauthorized,
     Forbidden,
@@ -191,9 +195,11 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 26] = [
+    pub const ALL: [ErrorCode; 28] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
+        Self::DocumentTooLarge,
+        Self::IdTooLarge,
         Self::UnsupportedMediaType,
         Self::Unauthorized,
         Self::Forbidden,
@@ -225,6 +231,8 @@ impl ErrorCode {
         match self {
             Self::BadRequest => "bad_request",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::DocumentTooLarge => "document_too_large",
+            Self::IdTooLarge => "id_too_large",
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
@@ -259,6 +267,8 @@ impl ErrorCode {
             // again changes nothing.
             Self::BadRequest
             | Self::PayloadTooLarge
+            | Self::DocumentTooLarge
+            | Self::IdTooLarge
             | Self::UnsupportedMediaType
             | Self::Unauthorized
             | Self::Forbidden
@@ -361,6 +371,8 @@ impl ErrorCode {
             // property of the code, not of how the process was started.
             Self::BadRequest
             | Self::PayloadTooLarge
+            | Self::DocumentTooLarge
+            | Self::IdTooLarge
             | Self::UnsupportedMediaType
             | Self::Unauthorized
             | Self::Forbidden
@@ -964,6 +976,16 @@ impl From<CoreError> for ApiError {
             CoreError::Unsupported(_) => {
                 ApiError::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::NotImplemented, e.to_string())
             }
+            // The same 413 as a body over the ceiling, for the same reason: what was
+            // sent is too big, and sending it again changes nothing.
+            CoreError::DocumentTooLarge { .. } => ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorCode::DocumentTooLarge,
+                e.to_string(),
+            ),
+            CoreError::IdTooLarge { .. } => {
+                ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::IdTooLarge, e.to_string())
+            }
             CoreError::InvalidName { .. }
             | CoreError::InvalidQuery(_)
             | CoreError::Limit(_)
@@ -1126,10 +1148,12 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 26] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 28] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
+            (DocumentTooLarge, None),
+            (IdTooLarge, None),
             (UnsupportedMediaType, None),
             (Unauthorized, None),
             (Forbidden, None),

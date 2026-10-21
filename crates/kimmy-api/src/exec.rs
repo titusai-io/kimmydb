@@ -1993,7 +1993,11 @@ pub fn parse_id(raw: &str) -> Result<DocId, ApiError> {
     if let Ok(n) = raw.parse::<i64>() {
         return Ok(DocId::Int64(n));
     }
-    Ok(DocId::String(raw.to_string()))
+    // Measured decoded, as the bytes the id is stored as, not as the escaped path
+    // it arrived in; every route that names an `_id` passes here (ADR-250).
+    let id = DocId::String(raw.to_string());
+    kimmy_core::limits::check_id(&id)?;
+    Ok(id)
 }
 
 pub fn now_millis() -> i64 {

@@ -686,6 +686,11 @@ impl Engine {
         if body.as_deref() == Some(found.body.as_slice()) {
             return Ok(None);
         }
+        // The result is what is held to the cap: an update that shrinks a document
+        // passes, one that grows it past 16 MiB is refused (ADR-250).
+        if let Some(body) = body.as_ref().filter(|_| self.caps_apply()) {
+            kimmy_core::limits::check_document(body.len())?;
+        }
         // The indexes first: a unique violation returns here, before anything
         // is minted, and the caller aborts, which discards the entries with
         // the rest.

@@ -631,10 +631,17 @@ impl Engine {
                 (id, value)
             }
         };
+        // Over the cap is refused before anything is looked up or minted (ADR-250).
+        if self.caps_apply() {
+            kimmy_core::limits::check_id(&id)?;
+        }
         let doc = with_id_first(doc, id_value);
 
         let key = doc_key(&id)?;
         let body = bson::serialize_to_vec(&doc)?;
+        if self.caps_apply() {
+            kimmy_core::limits::check_document(body.len())?;
+        }
 
         // A tombstone may still occupy the key; overwriting it is a
         // legitimate resurrection, but a live document is a conflict.
@@ -726,6 +733,10 @@ impl Engine {
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
+        // The client's admission point for a replace and an upsert (ADR-250).
+        if self.caps_apply() {
+            kimmy_core::limits::check_id(id)?;
+        }
         let txn = self.begin_write(WriterHolder::Write)?;
         match self.replace_in_txn(&txn, coll, id, doc, upsert, expected) {
             Ok((outcome, Some(entry))) => {
@@ -819,6 +830,14 @@ impl Engine {
                 let unchanged =
                     WriteOutcome { matched: true, modified: false, upserted: false, stamp: None };
                 return Ok((unchanged, None));
+            }
+            // Only a write that will be made is held to the cap, so sending a stored
+            // document again unchanged is never refused (ADR-250). The `_id` is
+            // checked where a client names it, in `replace_if`: this function also
+            // writes a document's vector chunks, whose ids are longer than the id
+            // they derive from.
+            if self.caps_apply() {
+                kimmy_core::limits::check_document(body.len())?;
             }
             // Same transaction as the document write, so the index cannot
             // describe a state that never existed. A unique violation returns

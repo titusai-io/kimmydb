@@ -874,6 +874,8 @@ fn data_can_raise(e: &kimmy_core::Error) -> bool {
         | E::InvalidDocumentId { .. }
         | E::InvalidName { .. }
         | E::InvalidUpdate(_)
+        | E::DocumentTooLarge { .. }
+        | E::IdTooLarge { .. }
         | E::UnsupportedOperator { .. }
         | E::ResumeTokenExpired
         | E::MalformedResumeToken

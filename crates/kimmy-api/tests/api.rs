@@ -15878,3 +15878,230 @@ async fn a_decimal_id_and_a_decimal_partial_filter_bound_are_created() {
     assert_eq!(res.status, 409, "{:?}", res.body);
     assert_eq!(res.body["error"], "duplicate_key", "{:?}", res.body);
 }
+
+/// A document over 16 MiB is refused wherever a client write would store it, with
+/// `413 document_too_large`, and what was stored stays as it was (ADR-250).
+#[tokio::test]
+async fn a_write_that_would_store_a_document_over_the_cap_is_refused_413() {
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        max_body_bytes: 24 * 1024 * 1024,
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let docs = "/v1/db/shop/coll/c/docs";
+    let big = "x".repeat(16 * 1024 * 1024);
+
+    // insert, bulk insert, replace, upsert and find_and_modify upsert.
+    let res = server.post(docs, Some(&token), json!({"_id": 1, "pad": big})).await;
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "document_too_large", "{:?}", res.body);
+    assert_eq!(res.body["retry"], "no");
+    let res = server
+        .post("/v1/db/shop/coll/c/bulk", Some(&token), json!([{"_id": 2}, {"_id": 3, "pad": big}]))
+        .await;
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "document_too_large", "{:?}", res.body);
+    let res = server.put(&format!("{docs}/4?upsert=true"), Some(&token), json!({"pad": big})).await;
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "document_too_large", "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({"filter": {"_id": 5}, "update": {"$set": {"pad": big}}, "upsert": true}),
+        )
+        .await;
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "document_too_large", "{:?}", res.body);
+
+    // Nothing was stored by any of them, not even the first document of the batch.
+    let found = server.post("/v1/db/shop/coll/c/find", Some(&token), json!({"filter": {}})).await;
+    assert_eq!(found.body["documents"], json!([]), "{:?}", found.body);
+
+    // A document just under the cap is stored.
+    let under = "x".repeat(16 * 1024 * 1024 - 64);
+    let res = server.post(docs, Some(&token), json!({"_id": 6, "pad": under})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body.get("message"));
+}
+
+/// An update whose result is over the cap is refused though its body is small: a
+/// 1 MiB `$set` through `arr.$[]` grows a twenty-element array to twenty times
+/// that. A document the update shrinks passes.
+#[tokio::test]
+async fn an_update_that_grows_a_document_past_the_cap_is_refused_and_one_that_shrinks_it_passes() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let res = server
+        .post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 1, "arr": vec![0; 20]}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let megabyte = "x".repeat(1024 * 1024);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({"filter": {"_id": 1}, "update": {"$set": {"arr.$[]": megabyte}}}),
+        )
+        .await;
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "document_too_large", "{:?}", res.body);
+    let found = server.post("/v1/db/shop/coll/c/find", Some(&token), json!({"filter": {}})).await;
+    assert_eq!(found.body["documents"][0]["arr"], json!(vec![0; 20]), "unchanged");
+
+    // Four copies is 4 MiB: allowed, and the shrinking write after it is too.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({"filter": {"_id": 1}, "update": {"$set": {"arr": ["y".repeat(1024 * 1024)]}}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+/// An `_id` over 4 KiB is refused with `413 id_too_large` on every route that
+/// names one: the body of an insert or a bulk insert, the path of a get, a replace,
+/// an upsert and a delete, and an upsert's filter. One at the cap passes.
+#[tokio::test]
+async fn an_id_over_the_cap_is_refused_413_on_every_route_that_names_one() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let docs = "/v1/db/shop/coll/c/docs";
+    let long = "a".repeat(4097);
+
+    let refused = |res: Res, what: &str| {
+        assert_eq!(res.status, 413, "{what}: {:?}", res.body);
+        assert_eq!(res.body["error"], "id_too_large", "{what}: {:?}", res.body);
+        assert_eq!(res.body["retry"], "no", "{what}");
+        let message = res.body["message"].as_str().unwrap_or_default().to_string();
+        assert!(!message.contains(&long), "{what}: the id is not echoed");
+    };
+    refused(server.post(docs, Some(&token), json!({"_id": long})).await, "insert");
+    refused(
+        server
+            .post("/v1/db/shop/coll/c/bulk", Some(&token), json!([{"_id": "ok"}, {"_id": long}]))
+            .await,
+        "bulk",
+    );
+    refused(server.get(&format!("{docs}/{long}"), Some(&token)).await, "get");
+    refused(
+        server.put(&format!("{docs}/{long}?upsert=true"), Some(&token), json!({"v": 1})).await,
+        "replace",
+    );
+    refused(server.delete(&format!("{docs}/{long}"), Some(&token)).await, "delete");
+    refused(
+        server
+            .post(
+                "/v1/db/shop/coll/c/find_and_modify",
+                Some(&token),
+                json!({"filter": {"_id": long}, "update": {"$set": {"v": 1}}, "upsert": true}),
+            )
+            .await,
+        "upsert from a filter",
+    );
+    let found = server.post("/v1/db/shop/coll/c/find", Some(&token), json!({"filter": {}})).await;
+    assert_eq!(found.body["documents"], json!([]), "nothing was stored: {:?}", found.body);
+
+    // At the cap it is an ordinary id.
+    let at_cap = "a".repeat(4096);
+    let res = server.post(docs, Some(&token), json!({"_id": at_cap})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(server.get(&format!("{docs}/{at_cap}"), Some(&token)).await.status, 200);
+}
+
+/// A body over `max_body_bytes` is still `payload_too_large`: the ceiling is decided
+/// while the body is read, before any document is looked at.
+#[tokio::test]
+async fn the_body_ceiling_answers_before_the_document_cap() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": "a".repeat(5000), "pad": "x".repeat(3 * 1024 * 1024)}),
+        )
+        .await;
+    assert_eq!(res.status, 413);
+    assert_eq!(res.body["error"], "payload_too_large", "{:?}", res.body);
+}
+
+/// Exactly 16 MiB stored is accepted over HTTP, one byte more is refused and the
+/// refusal names the stored size.
+#[tokio::test]
+async fn the_document_boundary_is_exact_over_http() {
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        max_body_bytes: 24 * 1024 * 1024,
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let docs = "/v1/db/shop/coll/c/docs";
+    // {"_id": "k", "pad": <n>} encodes to 26 + n bytes.
+    let n = 16 * 1024 * 1024 - 26;
+    let res = server.post(docs, Some(&token), json!({"_id": "k", "pad": "x".repeat(n)})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body.get("message"));
+    let res = server.post(docs, Some(&token), json!({"_id": "l", "pad": "x".repeat(n + 1)})).await;
+    assert_eq!(res.status, 413, "{:?}", res.body.get("message"));
+    let message = res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("16777217 bytes"), "{message}");
+}
+
+/// A multi update that crosses the cap in a later chunk: 500 partially_applied
+/// carrying document_too_large, and the first chunk stands.
+#[tokio::test]
+async fn a_multi_update_over_the_cap_in_a_later_chunk_is_partially_applied() {
+    let server = Server::start().await;
+    server.state.engine.set_multi_chunk_docs(2);
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let docs = "/v1/db/shop/coll/c/docs";
+    for (id, len) in [(1, 1), (2, 1), (3, 20)] {
+        let res = server.post(docs, Some(&token), json!({"_id": id, "arr": vec![0; len]})).await;
+        assert_eq!(res.status, 200);
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({"filter": {}, "update": {"$set": {"arr.$[]": "x".repeat(1024 * 1024)}}, "multi": true}),
+        )
+        .await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    assert_eq!(res.body["error"], "partially_applied");
+    assert_eq!(res.body["retry"], "verify");
+    assert_eq!(res.body["cause"]["code"], "document_too_large");
+    assert_eq!(res.body["applied"]["commits"], 1);
+    assert_eq!(res.body["applied"]["modified"], 2);
+    let three = server.get(&format!("{docs}/3"), Some(&token)).await;
+    assert_eq!(three.body["arr"], json!(vec![0; 20]));
+    let one = server.get(&format!("{docs}/1"), Some(&token)).await;
+    assert_eq!(one.body["arr"][0].as_str().map(str::len), Some(1024 * 1024));
+}
+
+/// Client-supplied vectors for a document whose `_id` is at the cap.
+#[tokio::test]
+async fn vectors_can_be_put_for_a_document_whose_id_is_at_the_cap() {
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    let id = "a".repeat(4096);
+    let res = server
+        .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": id, "text": "a" }))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let stored = server
+        .put(
+            &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "a" }]),
+        )
+        .await;
+    assert_eq!(stored.status, 200, "{:?}", stored.body);
+}

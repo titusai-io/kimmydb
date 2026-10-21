@@ -65,6 +65,17 @@ pub enum Error {
     #[error("invalid update: {0}")]
     InvalidUpdate(String),
 
+    /// A client write would store a document of `bytes` bytes, over the `max` a
+    /// document may have (ADR-250).
+    #[error("the document is {bytes} bytes, over the {max} byte limit a document may have")]
+    DocumentTooLarge { bytes: usize, max: usize },
+
+    /// A client write names an `_id` of `bytes` bytes, over the `max` an `_id`
+    /// may have (ADR-250). `kind` says which sort of id; the id itself is not
+    /// repeated.
+    #[error("the _id is a {kind} of {bytes} bytes, over the {max} byte limit an _id may have")]
+    IdTooLarge { kind: &'static str, bytes: usize, max: usize },
+
     /// An operator this build does not have. `operator` is the token as the
     /// request spelled it, and nothing else: query-language.md's template,
     /// `unsupported operator "$typo"`, is filled with an operator, and a
@@ -156,6 +167,8 @@ impl Error {
             Error::InvalidDocumentId { .. }
             | Error::InvalidName { .. }
             | Error::InvalidUpdate(_)
+            | Error::DocumentTooLarge { .. }
+            | Error::IdTooLarge { .. }
             | Error::ResumeTokenExpired
             | Error::MalformedResumeToken
             | Error::MalformedCursor
@@ -207,6 +220,8 @@ impl Error {
             | Error::InvalidDocumentId { .. }
             | Error::InvalidName { .. }
             | Error::InvalidUpdate(_)
+            | Error::DocumentTooLarge { .. }
+            | Error::IdTooLarge { .. }
             | Error::UnsupportedOperator { .. }
             | Error::ResumeTokenExpired
             | Error::MalformedResumeToken
