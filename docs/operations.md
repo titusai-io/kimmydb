@@ -624,6 +624,25 @@ disagree — a code given a level and left out here, or listed here as silent
 after it started logging, is a test failure rather than an operator finding out
 from a page.
 
+#### A snapshot page cannot be served
+
+**`WARN` `a snapshot page cannot be served`**, with `error`: a row of a
+snapshot, repair or converge page, a document or the tombstone of one, is larger than a page holds
+(63 MiB, what a frame holds less 1 MiB), with the cursor that names it: a
+document whose `_id` is over about 3 MiB of binary or 5 MiB of string does not
+fit with that cursor, whose key crosses as an array of integers. The sender
+answers the request with a fault naming the row (the document's collection and
+`_id`) and its size, and the requester's round fails with it
+(`kimmy_sync_failures_total`); the pull asks again on its next round, and moves
+on once the document is smaller. A document larger than a frame cannot cross in
+a window either. The `_id` is named by its kind, its length and its first 24
+bytes (binary as hex), never whole, so the line and the fault stay a few
+hundred bytes; the `WARN` is said once per row per five minutes (a `DEBUG` line
+on the rounds between), though the connection's own `peer connection failed`
+follows each round. A page is otherwise bounded by bytes as well as by count,
+so a collection of large documents crosses in smaller pages instead of failing
+([ADR-249](decisions.md#adr-249--idempotency-keys-are-removed)).
+
 #### A start that rebuilds the live document counts
 
 Each collection's live document count is kept in the database, moved by every
@@ -2041,7 +2060,7 @@ surfaces.
 - more than three clear-and-recur **episodes** in a rolling hour stop the collection for six hours (or an hour with no confirmed finding): `ERROR` `a divergence recurs after repair; repair of this collection is stopped`, `kimmy_sync_digest_repair_stopped_collections` above 0. Episodes are counted per collection and per kind of repair (a digest repair that cleared its finding is no recurrence of a definition finding that stands). Episodes of **different** peers within three rotation periods, capped at 15 minutes, are one: a partition that heals on five members is not a loop. The same peer's recurrence always counts, however many collections the member holds.
 - `WARN` `a divergence repair did not clear the finding; backing off` once, on entering level 2.
 
-**Pace.** A document or definition repair never starves the peer's ordinary replication. After any such pull to a peer, the next contact with it is an ordinary one, whichever repair is next; a document repair's round is at most 20 pages (512 records each) or 10 seconds, and it resumes two contacts later where it stopped. So a repair of a large collection takes twice as many contacts as pulls. A document repair also ends, and is judged, once it has walked this member's live count of the collection at planning plus `cluster.repair_max_documents`, so a collection under heavy inserts cannot hold it for ever.
+**Pace.** A document or definition repair never starves the peer's ordinary replication. After any such pull to a peer, the next contact with it is an ordinary one, whichever repair is next; a document repair's round is at most 20 pages (up to 512 documents each, fewer when they are large) or 10 seconds, and it resumes two contacts later where it stopped. So a repair of a large collection takes twice as many contacts as pulls. A document repair also ends, and is judged, once it has walked this member's live count of the collection at planning plus `cluster.repair_max_documents`, counted in the documents and tombstones its pages carried, so a collection under heavy inserts cannot hold it for ever.
 
 **What a restart or a member that is down loses.** The loop guard's state (levels, back-offs, episodes) is kept for a member until it has been absent from the live member list for **12 hours**, not just the tick it is down: the cluster has no configured member set to prune by, and a peer that restarts or is cut for seconds would otherwise be repaired again at level 0 on its return. A member removed for good loses its state after the 12 hours. With `cluster.divergence_repair = false` the findings of a removed member are not pruned at all, and the divergence gauges are exactly 0.49.0's.
 

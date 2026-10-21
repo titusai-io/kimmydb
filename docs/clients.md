@@ -129,11 +129,11 @@ known whether it did**. The third comes two ways:
   a reset must not retry non-idempotent writes. See
   [Operations](operations.md#a-write-whose-outcome-is-unknown).
 
-**The planned cure** is server-side idempotency keys: a key the client sends
-with a write, so that the server applies any retry of it only once. With them,
-every write becomes safe to retry after an unknown outcome. They are planned,
-on the [roadmap](roadmap.md#planned-not-scheduled) with no version set, and not
-in this release.
+**There is no key that makes a retry safe, and none is planned.** A server-side
+idempotency key promises that a retry is applied once, which in a cluster where
+any member takes any write holds only on the members that have the key's
+record. 0.52.0 had them and 0.53.0 removed them
+([ADR-249](decisions.md#adr-249--idempotency-keys-are-removed)).
 
 ---
 
