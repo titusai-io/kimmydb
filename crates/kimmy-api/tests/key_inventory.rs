@@ -437,7 +437,6 @@ const fn writer(
 
 const SLOT_WRITERS: &[SlotWriter] = &[
     writer("kimmy-storage/src/backup.rs", "restore_with", &["meta[*], copied by a restore"]),
-    writer("kimmy-storage/src/decimal128_gate.rs", "mark_in_txn", &["meta[decimal128:id_present]"]),
     writer("kimmy-storage/src/engine.rs", "flush_holding", &["meta[durability_flush]"]),
     writer("kimmy-storage/src/engine.rs", "load_or_create_node_id", &["meta[node_id]"]),
     writer("kimmy-storage/src/engine.rs", "record_state_held_in_txn", &["meta[state_held:<node>]"]),
@@ -558,13 +557,6 @@ const SLOTS: &[Slot] = &[
         anchor: r#"pub const META_TOMBSTONE_HORIZON: &str = "gc:tombstone_horizon";"#,
         class: Unchanged,
         why: "a stamp (design 5.1, m6)",
-    },
-    Slot {
-        place: "meta[decimal128:id_present]",
-        anchor_file: "kimmy-storage/src/tables.rs",
-        anchor: r#"pub const META_DECIMAL128_ID_PRESENT: &str = "decimal128:id_present";"#,
-        class: Unchanged,
-        why: "the marker's stamp",
     },
     Slot {
         place: "meta[rewound]",
@@ -995,7 +987,7 @@ fn every_slot_is_classified_and_anchored() {
             }
         }
     }
-    assert!(slots.len() >= 10, "premise: the META slots were found ({})", slots.len());
+    assert!(slots.len() >= 9, "premise: the META slots were found ({})", slots.len());
     let unlisted: Vec<String> = slots
         .iter()
         .filter(|(file, line)| !SLOTS.iter().any(|s| s.anchor_file == file && s.anchor == line))

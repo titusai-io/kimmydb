@@ -879,7 +879,6 @@ fn data_can_raise(e: &kimmy_core::Error) -> bool {
         | E::MalformedResumeToken
         | E::MalformedCursor
         | E::MalformedStamp
-        | E::Decimal128Gated { .. }
         | E::Bson(_)
         | E::Serialization(_) => false,
     }

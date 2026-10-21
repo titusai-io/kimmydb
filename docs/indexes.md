@@ -534,13 +534,8 @@ compared by its exact value like any number: `{balance: {$gt:
 {"$numberDecimal": "0.00"}}}` selects exactly the balances above zero, and
 `{k: {"$numberDecimal": "0.1"}}` does not select the double `0.1`, which is not
 one tenth. Through 0.50.x `createIndex` refused it, because the canonical order
-ranked a `Decimal128` equal to every other number. **Creating such an index
-locally is refused (`400`, naming `cluster.decimal128`) until every member runs
-0.51 and the operator has said so**: an older member would refuse the
-definition and never build it, even after it upgrades
-([Operations](operations.md#clusterdecimal128-and-the-marker),
-[ADR-238](decisions.md)). A definition that arrives from a peer, a restore or a
-repair is always applied.
+ranked a `Decimal128` equal to every other number. Since 0.53.0 such an index is always allowed
+([ADR-238](decisions.md), [ADR-249](decisions.md)).
 
 **There is no separate `sparse` flag.** A sparse index is exactly
 `{field: {$exists: true}}`, which is where MongoDB has been steering people for

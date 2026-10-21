@@ -279,9 +279,6 @@ impl Cli {
             None => Config::default(),
         };
         self.overrides.apply(&mut cfg)?;
-        // Its default follows `cluster.enabled`, which the flags above can set, so
-        // it is settled here and `check-config` prints the value in effect.
-        cfg.cluster.decimal128 = Some(cfg.cluster.decimal128());
 
         // `restore` moves a file into a data directory and exits. It never
         // serves, never authenticates anybody, and never joins a cluster, so
@@ -691,35 +688,6 @@ mod tests {
         let mut cfg = Config::default();
         parse(&[]).overrides.apply(&mut cfg).unwrap();
         assert_eq!(cfg.cluster.expected_members, None, "unset unless told");
-    }
-
-    #[test]
-    fn check_config_prints_the_decimal128_in_effect() {
-        // Settled after the flags, since `--seeds` turns clustering on and the
-        // default follows it; the printed config then says what the node will do.
-        let base = [
-            "kimmyd",
-            "--root-password",
-            "a-perfectly-adequate-password",
-            "--jwt-secret",
-            "a-signing-key-of-adequate-length",
-        ];
-        let alone = Cli::try_parse_from(base.iter().copied().chain(["check-config"])).unwrap();
-        let cfg = alone.resolve().unwrap();
-        assert_eq!(cfg.cluster.decimal128, Some(true));
-        assert!(toml::to_string_pretty(&cfg).unwrap().contains("decimal128 = true"));
-
-        let clustered = Cli::try_parse_from(base.iter().copied().chain([
-            "--seeds",
-            "10.0.0.1:7900",
-            "--cluster-secret",
-            "a-shared-cluster-secret",
-            "check-config",
-        ]))
-        .unwrap();
-        let cfg = clustered.resolve().unwrap();
-        assert_eq!(cfg.cluster.decimal128, Some(false));
-        assert!(toml::to_string_pretty(&cfg).unwrap().contains("decimal128 = false"));
     }
 
     #[test]

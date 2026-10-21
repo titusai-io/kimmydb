@@ -866,17 +866,6 @@ async fn start_and_serve(
     let class = kimmy_storage::DurabilityClass::parse(&config.storage.durability)
         .unwrap_or(kimmy_storage::DurabilityClass::Durable);
     engine.set_durability(class, Duration::from_millis(config.storage.commit_coalesce_ms));
-    // The gate on a locally created `Decimal128` id or partial-filter bound
-    // (ADR-238), installed before anything can write through this node: the
-    // operator's declaration now, the live member set once the cluster is up
-    // (until then a clustered member refuses, failing closed).
-    let decimal128 = kimmy_cluster::Decimal128Gate::new(
-        config.cluster.decimal128(),
-        config.cluster.enabled,
-        config.cluster.membership,
-    );
-    engine.set_decimal128_gate(decimal128.predicate());
-
     // Version and commit together, because during a rolling upgrade or an
     // incident the question is "which build is this exactly", and a version
     // number alone does not answer it between releases.
@@ -1338,7 +1327,6 @@ async fn start_and_serve(
     // after the router was built — hence a late hand-off rather than a
     // constructor argument.
     if let Some(members) = cluster.members.clone() {
-        decimal128.set_members(members.clone());
         state.set_members(members);
     }
 
@@ -3446,30 +3434,6 @@ mod tests {
             arm.contains("lifecycle::rebuilt(&config.storage.data_dir);"),
             "the open's Ok arm must call lifecycle::rebuilt: {arm}"
         );
-    }
-
-    /// The `Decimal128` gate (ADR-238) is installed from the configured key, the
-    /// clustering switch and the membership switch, before the engine can take a
-    /// write through this node, and is handed the live member set beside the
-    /// routes. A source check: the gate's answers are tested in `kimmy-cluster`,
-    /// and what this pins is that the node builds it from the right inputs and
-    /// in the right place.
-    #[test]
-    fn the_decimal128_gate_is_installed_from_the_key_before_anything_serves() {
-        let source = include_str!("node.rs");
-        let built = source
-            .find(
-                "kimmy_cluster::Decimal128Gate::new(\n        config.cluster.decimal128(),\n        \
-                 config.cluster.enabled,\n        config.cluster.membership,\n    );",
-            )
-            .expect("the gate built from the key, clustering and membership");
-        let installed =
-            source.find("engine.set_decimal128_gate(decimal128.predicate());").expect("installed");
-        let handed = source.find("decimal128.set_members(members.clone());").expect("handed");
-        let serving = source.find("front.install(app);").expect("the swap to serving");
-        let open = source.find("Engine::open_with(&path, &options)").expect("the open");
-        assert!(open < built && built < installed, "built from the opened engine's config");
-        assert!(installed < handed && handed < serving, "installed and handed before serving");
     }
 
     /// **The stop freezes the yield evaluator first** (ADR-213, B9): at the stop's

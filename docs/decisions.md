@@ -28282,6 +28282,8 @@ The roll is member-at-a-time, and 0.49 and 0.51 may share a cluster if an operat
 
 ### The gate
 
+> **Removed by [ADR-249](#adr-249--idempotency-keys-are-removed) (0.53.0).** The switch, the net, the marker and the refusal below no longer exist; a `Decimal128` `_id` and a decimal partial-filter bound are always allowed. The text is kept as the record of 0.51.0 and 0.52.0.
+
 A 0.49 or 0.50 member cannot hold a `Decimal128` `_id`, and cannot parse a `Decimal128` partial-filter bound: an entry or page that carries the new `DocId` variant fails to decode, the window is requested for ever, and a refused index definition is recorded, never retried, and survives the member's own upgrade. So accepting either is an operator declaration, the featureCompatibilityVersion pattern.
 - **The switch.** `cluster.decimal128` (bool), default `true` when clustering is off and `false` when it is on. It states that every member runs 0.51 and has migrated, and it gates local creation only. An entry, a page, a restored or a repaired definition from another member is always applied; refusing one would wedge replication.
 - **Three chokepoints**, keyed on the BSON type of the `_id`, not on the `DocId` variant (an integral decimal is an `Int64` with a decimal body, which breaks an older member's full scans): `check_insert` (insert, bulk, scope inserts, upserts and `$setOnInsert`), `replace_in_txn` (only when the replace creates the row; a replace over an existing decimal `_id` is not refused), and a local `create_index` that mints such a definition (a new one, or the re-stamp of an inherited one): an identical standing definition is the idempotent answer and a duplicate `_id` is `DuplicateKey`, as for any index or id. Each refuses with `400`, naming `cluster.decimal128` and the peers that do not advertise it.
@@ -30268,7 +30270,7 @@ it at the target; the floor refusal removed; and it at the target. Argued equiva
 > decided again here, as its own text (item 5):** snapshot, scoped and converge pages bounded by bytes, with the named
 > refusal of a row no page can carry and the converge repair's bound. **Amends
 > [ADR-238](#adr-238--a-stored-number-is-an-exact-value-a-decimal128-has-a-place-in-the-order-and-number-keys-are-exact-and-variable-length-storage-schema-5)**
-> in item 6: its `cluster.decimal128` gate is to be removed in the next change. A breaking change, under the pre-1.0
+> in item 6: its `cluster.decimal128` gate is removed by 0.53.0. A breaking change, under the pre-1.0
 > policy of [compatibility.md](compatibility.md).
 
 **The case.** A key promises that a request is applied once, however often it is sent. On one node that promise is a
@@ -30325,11 +30327,14 @@ documented; it is not offered.
    a page it ended the repair before it had walked the collection. Where every page is full the bound is what it was. No
    configuration, table or schema change.
 
-6. **The `Decimal128` gate is removed in the next change.** ADR-238's `cluster.decimal128` switch, its refusal of a
-   creation (`400 bad_request` naming the key and the peers) and the net over every live peer's facts block existed
-   only to keep an older member from meeting a document or index definition it cannot hold. This change leaves the
-   gate as it is; the next removes it, with the `cluster.decimal128` key. A document whose `_id` is a `Decimal128`, and
-   an index whose `partialFilterExpression` holds one, are then created with no switch.
+6. **The `Decimal128` gate is removed.** ADR-238's `cluster.decimal128` switch, its refusal of a creation (`400
+   bad_request` naming the key and the peers), the net over every live peer's facts block, the capability fact
+   `decimal128`, the marker (the `META` row `decimal128:id_present`, the gauge `kimmy_decimal128_id_present`, the OTLP
+   series `kimmy.decimal128_id_present` and the `/readyz` key `decimal128_id_present`) and the warning that read it
+   existed only to keep an older member from meeting a document or index definition it cannot hold, and are removed
+   by this change. A config that names `cluster.decimal128` refuses to start. A document whose `_id` is a
+   `Decimal128`, and an index whose `partialFilterExpression` holds one, are always allowed. ADR-238's decisions on
+   the value, its order, its key and its place as an `_id` stand.
 
 **Alternatives rejected.** Keeping keys and documenting the gap, as 0.52.0 did: the guarantee a client reads is not the
 one it gets, and every closure of the gap added state every member must carry. Keys honoured on the member that took the
@@ -30351,4 +30356,9 @@ once an interval). The frame budget (item 5): `kimmy-cluster`'s
 `a_full_batch_of_entries_leaves_the_budgets_slack_for_the_arrays_framing`, which shows that an entries array needs no
 framing term of its own. The removal (items 1 to 3): `kimmyd`'s `unknown_keys_are_rejected`, which holds that a
 configuration naming a key the build does not have, `cluster.idempotency_keys` now among them, refuses to start, and the
-`ErrorCode::ALL` pin in `kimmy-api`.
+`ErrorCode::ALL` pin in `kimmy-api`. The gate's removal (item 6): `kimmyd`'s
+`a_config_naming_cluster_decimal128_is_refused`; `kimmy-api`'s `a_decimal_id_and_a_decimal_partial_filter_bound_are_created`;
+`kimmyd`'s ignored cluster test `a_decimal128_id_and_bound_are_created_anywhere_and_applied_everywhere`, which creates a
+decimal `_id` on one member and a decimal-bound partial index on another and finds both on all three; and `kimmy-storage`'s
+`decimal_definition_tests.rs`, which holds that a replicated entry, a snapshot, a repair page and a converge row apply a
+decimal `_id` and a decimal-bound definition.

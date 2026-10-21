@@ -118,9 +118,8 @@ fn dec(text: &str) -> Bson {
 
 /// The values a partial filter may hold as a bound: every value, decimals
 /// included, since `PartialFilter::parse` accepts a `Decimal128` bound and
-/// compares by its exact value (ADR-238; a *local* creation of such an index is
-/// gated by `cluster.decimal128`, which is not this file's question). A query's
-/// operands are every value too ([`values`]).
+/// compares by its exact value (ADR-238). A query's operands are every value
+/// too ([`values`]).
 fn operands() -> Vec<Bson> {
     values()
 }
