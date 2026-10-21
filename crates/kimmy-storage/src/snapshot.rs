@@ -147,6 +147,115 @@ pub const LEFT_IDS_NAMED: usize = 10;
 /// one the receiver may not have the memory to hold.
 pub const SNAPSHOT_PAGE: usize = 512;
 
+/// The bytes one snapshot page holds: the cluster's frame (`MAX_FRAME`, 64 MiB,
+/// which asserts this) less 1 MiB, the room `write_frame` needs beyond what is
+/// counted here (the tombstone horizon, the message's own framing).
+///
+/// **What is counted against it.** The page's fixed parts, measured as they will
+/// be encoded: the definitions (the first page's), the drops, the sender's
+/// vector. Then its rows, in order, each with a bound on its framing: the
+/// documents and tombstones, a document's `_id` at the size it crosses in
+/// ([`id_wire_len`]). And the cursor the page cuts, at the size its key crosses
+/// in ([`cursor_reserve`]): the key of the row it would end at, reserved with
+/// each row. [`SNAPSHOT_PAGE`] still caps the documents and tombstones by count
+/// (ADR-249).
+///
+/// **Progress.** A row that does not fit what the page has left goes first on
+/// the next page. A row that does not fit a page holding nothing else, its
+/// definitions aside, **cannot cross on a page at all**: a document larger than
+/// a frame. It is refused, naming it
+/// ([`crate::StorageError::SnapshotRowTooLarge`]), rather than sent in a frame
+/// `write_frame` refuses; a document that size cannot cross in a window either
+/// (its oplog entry is over a frame), and it crosses once it is smaller. On the
+/// first page, which carries the definitions, such a row waits for the second.
+/// Before this bound a page of 512 documents averaging over 128 KiB was over a
+/// frame, and its pull failed for good (v0.51.0).
+pub const SNAPSHOT_PAGE_BYTES: usize = 63 * 1024 * 1024;
+
+/// What a document on a page costs beyond its body and its `_id` as it
+/// crosses ([`id_wire_len`]): its collection and stamp, the `_id`'s variant, the
+/// field names and their framing, a bound and not a measure.
+pub(crate) const DOCUMENT_OVERHEAD: usize = 160;
+
+/// What a tombstone on a page costs beyond its key (sent as bytes), likewise;
+/// 138 measured at the widest collection id and stamp.
+pub(crate) const TOMBSTONE_OVERHEAD: usize = 160;
+
+/// What the cursor a page cuts costs beyond its key as it crosses: its
+/// collection and its framing, a bound.
+pub(crate) const CURSOR_OVERHEAD: usize = 256;
+
+/// The bytes `n` bytes cross in when serde writes them as a sequence, which it
+/// does for a `Vec<u8>` without `serde_bytes`: a BSON array of `int32`s, each an
+/// element of a type byte, its decimal index as a C string and four bytes, about
+/// ten bytes a byte. So cross a `DocId::Binary` and a cursor's key
+/// ([`SnapshotCursor::after_key`]); the wire is left as it is.
+pub(crate) fn byte_array_wire_len(n: usize) -> usize {
+    // The array's length and its terminator, and each element's type byte, the
+    // index's terminator and the int32.
+    let mut total = 5 + 6 * n;
+    // And each index's digits: one each below 10, two below 100, and so on.
+    let (mut start, mut end, mut digits) = (0usize, 10usize, 1usize);
+    while start < n {
+        total += (end.min(n) - start) * digits;
+        start = end;
+        end = end.saturating_mul(10);
+        digits += 1;
+    }
+    total
+}
+
+/// What a document's `_id` costs on a page as it crosses, a bound: a binary one
+/// is an array of `int32`s ([`byte_array_wire_len`]), a string its bytes and
+/// their length and terminator, every other kind at most 32 bytes. The variant's
+/// name and framing are in [`DOCUMENT_OVERHEAD`].
+pub(crate) fn id_wire_len(id: &DocId) -> usize {
+    match id {
+        DocId::Binary(bytes) => byte_array_wire_len(bytes.len()),
+        DocId::String(text) => text.len() + 5,
+        _ => 32,
+    }
+}
+
+/// How many leading bytes of a binary or string `_id` its name carries.
+const ID_NAME_PREFIX: usize = 24;
+
+/// An `_id` named by its kind, its length and its first bytes, for an error
+/// text or a log line: the refusal of a row whose `_id` is megabytes long is
+/// sent to the requester and logged every round, so it never carries the id
+/// itself. At most a few hundred bytes whatever the id; the same id always
+/// gives the same name.
+pub(crate) fn id_name(id: &DocId) -> String {
+    match id {
+        DocId::Binary(bytes) => {
+            let shown = &bytes[..bytes.len().min(ID_NAME_PREFIX)];
+            let hex: String = shown.iter().map(|byte| format!("{byte:02x}")).collect();
+            let more = if shown.len() < bytes.len() { "..." } else { "" };
+            format!("binary _id of {} bytes starting {hex}{more}", bytes.len())
+        }
+        DocId::String(text) => {
+            let mut end = 0;
+            for (at, c) in text.char_indices() {
+                if at + c.len_utf8() > ID_NAME_PREFIX {
+                    break;
+                }
+                end = at + c.len_utf8();
+            }
+            let more = if end < text.len() { "..." } else { "" };
+            format!("string _id of {} bytes starting {:?}{more}", text.len(), &text[..end])
+        }
+        other => format!("_id {other:?}"),
+    }
+}
+
+/// What the cursor a page cuts after a row whose stored key is `stored_key`
+/// bytes long costs it, a bound: its key crosses in the legacy form, which is at
+/// most one byte longer, or 12 bytes for an integer ([`kimmy_core::legacy_key`]),
+/// as an array of `int32`s.
+pub(crate) fn cursor_reserve(stored_key: usize) -> usize {
+    CURSOR_OVERHEAD + byte_array_wire_len(stored_key.max(11) + 1)
+}
+
 /// What applying a snapshot page does (ADR-148, ADR-152, and the repair of a
 /// confirmed digest finding).
 ///
@@ -610,6 +719,12 @@ pub struct SnapshotProgress {
     pages: usize,
     /// Documents written so far — those that won last-writer-wins here.
     documents: usize,
+    /// Under [`SnapshotPolicy::Converge`]: the rows the applied pages carried,
+    /// documents and tombstones, written here or not, which is what its bound is
+    /// measured in (the transport's `bound_converge`). Never stored, as that pull
+    /// never is; 0 for every other pull.
+    #[serde(skip)]
+    rows: usize,
     /// Whether the final page has been applied.
     complete: bool,
 }
@@ -667,23 +782,28 @@ impl SnapshotProgress {
             granted: None,
             pages: 0,
             documents: 0,
+            rows: 0,
             complete: false,
         }
     }
 
     /// This progress as it stands after `page` has been applied, `applied`
-    /// documents of it having been written here.
+    /// documents of it having been written here; `deletes` the deletes it
+    /// carried (`CarriedDelete::of_page`, the one reader of them).
     ///
     /// Split out because the record persisted in the page's own transaction
     /// has to be the state the page LEAVES, and that transaction commits
     /// before the caller's `progress` is advanced. One function so the two
     /// cannot drift: a persisted cursor that disagreed with the in-memory one
     /// would resume somewhere neither had been.
-    fn advanced(&self, page: &SnapshotPage, applied: usize) -> Self {
+    fn advanced(&self, page: &SnapshotPage, applied: usize, deletes: usize) -> Self {
         let mut next = self.clone();
         next.after = page.next.clone();
         next.pages += 1;
         next.documents += applied;
+        if self.policy == SnapshotPolicy::Converge {
+            next.rows += page.documents.len() + deletes;
+        }
         next.complete = page.next.is_none();
         next
     }
@@ -725,6 +845,12 @@ impl SnapshotProgress {
     /// Documents written so far.
     pub fn documents(&self) -> usize {
         self.documents
+    }
+
+    /// Under [`SnapshotPolicy::Converge`]: the rows (documents and tombstones)
+    /// the applied pages carried, written here or not. 0 for every other pull.
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 
     /// Whether the final page has been applied.
@@ -813,7 +939,23 @@ impl Engine {
             after_key: keyenc::stored_of_legacy(&cursor.after_key),
             ..cursor
         });
-        let (documents, mut deleted_documents, next) = self.snapshot_documents(after, scope)?;
+        // The page's parts other than its rows, measured as they will be
+        // encoded: what its rows have left of `SNAPSHOT_PAGE_BYTES`.
+        let fixed = bson::serialize_to_vec(&SnapshotPage {
+            collections: collections.clone(),
+            documents: Vec::new(),
+            next: None,
+            versions: versions.clone(),
+            dropped,
+            dropped_collections: dropped_collections.clone(),
+            deleted_documents: Vec::new(),
+            dropped_indexes: dropped_indexes.clone(),
+            tombstone_horizon: None,
+        })
+        .map_or(0, |bytes| bytes.len());
+        let first = after.is_none();
+        let (documents, mut deleted_documents, next) =
+            self.snapshot_rows(after, scope, self.snapshot_rows_room(fixed), first)?;
         for tombstone in &mut deleted_documents {
             tombstone.key = keyenc::legacy_of_stored(&tombstone.key).into_bytes();
         }
@@ -837,6 +979,42 @@ impl Engine {
         })
     }
 
+    /// What a page's rows have of [`SNAPSHOT_PAGE_BYTES`] once its other parts,
+    /// `fixed` bytes of them, are counted; a test's own room when it set one, or
+    /// what a test's own page budget leaves them.
+    fn snapshot_rows_room(&self, fixed: usize) -> usize {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let set = self.snapshot_room_for_test.load(Relaxed);
+            if set != 0 {
+                return set;
+            }
+            let page = self.snapshot_page_bytes_for_test.load(Relaxed);
+            if page != 0 {
+                return page.saturating_sub(fixed);
+            }
+        }
+        SNAPSHOT_PAGE_BYTES.saturating_sub(fixed)
+    }
+
+    /// Give every snapshot page a budget of `bytes` in place of
+    /// [`SNAPSHOT_PAGE_BYTES`], which its other parts are counted against as there,
+    /// for a test of that count without 63 MiB of rows; `None` for the real one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_snapshot_page_bytes_for_test(&self, bytes: Option<usize>) {
+        let bytes = bytes.unwrap_or(0);
+        self.snapshot_page_bytes_for_test.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Give every snapshot page `bytes` for its rows, whatever its other parts
+    /// take, for a test that pages by bytes without writing 63 MiB; `None` for
+    /// [`SNAPSHOT_PAGE_BYTES`] less them.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_snapshot_room_for_test(&self, bytes: Option<usize>) {
+        self.snapshot_room_for_test.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn collection_states(&self) -> Result<Vec<CollectionState>> {
         let txn = self.db().begin_read()?;
         let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -850,139 +1028,185 @@ impl Engine {
         Ok(out)
     }
 
-    /// Read up to [`SNAPSHOT_PAGE`] records — live documents and tombstones
-    /// together — resuming after `cursor`.
+    /// One page's rows, documents and tombstones, resuming after `cursor` (its
+    /// key in the stored form): up to [`SNAPSHOT_PAGE`] of them, and within the
+    /// `room` bytes the page has for them ([`SNAPSHOT_PAGE_BYTES`]).
     ///
-    /// Walks the `docs` table in key order, which is `(collection, id)` — so a
-    /// single cursor covers every collection without needing to track which one
-    /// is in progress, and a scoped snapshot is the same walk bounded to one
-    /// collection's key range.
+    /// **Collection by collection, in id order**, each its rows of `docs` in key
+    /// order, which is `(collection, id)`; a scoped snapshot is the same walk over
+    /// its one collection.
+    ///
+    /// Only the rows of a collection that stands, read in this walk's own
+    /// transaction: under an id with no collection over it lies what a drop left
+    /// for the drop purger (ADR-189), or residue an older collector orphaned, a
+    /// life that has ended, which a receiver must never be handed.
+    ///
+    /// **Bytes** (ADR-249): each row is counted at its body, its `_id` as it
+    /// crosses and a bound on its framing, with the cursor the page would cut at
+    /// it. A row that does not fit what the page has left goes first on the next;
+    /// one that does not fit a page holding nothing else is refused, naming it,
+    /// unless this is the first page (`first`), whose definitions it waits behind.
     #[allow(clippy::type_complexity)]
-    fn snapshot_documents(
+    fn snapshot_rows(
         &self,
         after: Option<SnapshotCursor>,
         scope: Option<CollectionId>,
+        room: usize,
+        first: bool,
     ) -> Result<(Vec<SnapshotDoc>, Vec<SnapshotTombstone>, Option<SnapshotCursor>)> {
         use std::ops::Bound;
 
+        /// A document or a tombstone a page sends, once it is known to fit.
+        enum PageRow {
+            Document(SnapshotDoc),
+            Tombstone(SnapshotTombstone),
+        }
+
         let txn = self.db().begin_read()?;
         // A page served to a peer, which no client asked for, so it ends at the
-        // signal: the rows under a dropped collection it passes over are not
-        // bounded by the page.
+        // signal.
         let walk = self.walk(WalkScope::Background);
         let docs = open_walk_table(&txn, tables::DOCS, walk)?;
-
-        let mut out = Vec::new();
-        let mut deleted = Vec::new();
-        let mut cursor = None;
-        let empty: &[u8] = &[];
-
-        // `Excluded` on the resume point, so the document that ended the last
-        // page is not sent twice; from the scoped collection's first key
-        // otherwise, and from the beginning for the whole database.
-        let start = match (&after, scope) {
-            (Some(c), _) => Bound::Excluded((c.collection.0, c.after_key.as_slice())),
-            (None, Some(id)) => Bound::Included((id.0, empty)),
-            (None, None) => Bound::Unbounded,
-        };
-        // A scoped walk ends where the next collection's keys begin. The
-        // top id has no successor, and an unbounded end reads the same for
-        // it: nothing sorts after its keys.
-        let end = match scope.and_then(|id| id.0.checked_add(1)) {
-            Some(next_collection) => Bound::Excluded((next_collection, empty)),
-            None => Bound::Unbounded,
-        };
-
-        // Only the rows of a collection that stands. Under an id with no
-        // collection over it lies what a drop left for the drop purger
-        // (ADR-189), or residue an older collector orphaned: a life that has
-        // ended, which a receiver must never be handed as documents. A drop's
-        // rows lie there for as long as its purge runs, so this is an
-        // ordinary state, not a narrow one. Read in the walk's own transaction,
-        // so the set and the rows are one snapshot.
-        let live: std::collections::HashSet<u64> = {
+        // The collections that stand (the scoped one, for a scoped walk): a
+        // drop's rows lie under their id for as long as its purge runs, so this
+        // is an ordinary state, not a narrow one. Read in the walk's own
+        // transaction, so the set and the rows are one snapshot.
+        let live: std::collections::BTreeSet<u64> = {
             let collections = open_walk_table(&txn, tables::COLLECTIONS, walk)?;
-            let mut live = std::collections::HashSet::new();
+            let mut live = std::collections::BTreeSet::new();
             for row in collections.iter()? {
                 let (_, value) = row?;
                 let meta: CollectionMeta = serde_json::from_slice(value.value())?;
-                live.insert(meta.id.0);
+                if scope.is_none_or(|id| id == meta.id) {
+                    live.insert(meta.id.0);
+                }
             }
             live
         };
-        let mut start = start;
+        let next_after = |id: u64| {
+            // not a row: the next collection id the walk visits, from the set above.
+            live.range((Bound::Excluded(id), Bound::Unbounded)).next().copied()
+        };
 
-        // The key that ended a full page, kept only once the page is full.
-        let mut last_sent: Option<(u64, Vec<u8>)> = None;
-        'walk: loop {
-            for row in docs.range::<(u64, &[u8])>((start, end))? {
-                if out.len() + deleted.len() >= SNAPSHOT_PAGE {
-                    // Another row exists past a full page, so there is a next
-                    // page; the cursor names the last row sent, a document or a
-                    // tombstone. Looking
-                    // one row ahead is what lets a snapshot of exactly a page's
-                    // worth end here rather than with an empty page after it.
-                    cursor = last_sent.take().map(|(collection, after_key)| SnapshotCursor {
-                        collection: CollectionId(collection),
-                        after_key,
-                    });
-                    break;
-                }
-
-                let (key, value) = row?;
-                let (collection, doc_key) = key.value();
-                if !live.contains(&collection) {
-                    // Past the whole of that id's range in one seek, rather than
-                    // row by row through what may be a large purge.
-                    match collection.checked_add(1) {
-                        Some(next) => {
-                            start = Bound::Included((next, empty));
-                            continue 'walk;
-                        }
-                        None => break 'walk,
+        let mut out = Vec::new();
+        let mut deleted = Vec::new();
+        // What the page's rows have used of `room`.
+        let mut used = 0usize;
+        // Where the walk stands: after the last row this page sent, across
+        // collections, or where it began. What a page cut short, by count or by
+        // bytes, resumes after.
+        let mut resume: Option<(u64, Vec<u8>)> = None;
+        // The collection being walked, and the key after which: `None` from its
+        // first row.
+        let mut at: (u64, Option<Vec<u8>>) = match after {
+            // not a row: the first standing collection id, from the set above.
+            None => match live.iter().next() {
+                Some(lowest) => (*lowest, None),
+                None => return Ok((out, deleted, None)),
+            },
+            Some(cursor) => (cursor.collection.0, Some(cursor.after_key)),
+        };
+        // A page cut short: after the last row it sent.
+        let resumed = |resume: &Option<(u64, Vec<u8>)>| {
+            resume.clone().map(|(collection, after_key)| SnapshotCursor {
+                collection: CollectionId(collection),
+                after_key,
+            })
+        };
+        loop {
+            let (id, after_key) = at;
+            if resume.is_none() || after_key.is_none() {
+                // not a row: where this collection's walk begins.
+                resume = Some((id, after_key.clone().unwrap_or_default()));
+            }
+            if live.contains(&id) {
+                // `Excluded` on the resume point, so the row that ended the last
+                // page is not sent twice.
+                let start = match &after_key {
+                    Some(key) => Bound::Excluded((id, key.as_slice())),
+                    None => Bound::Included((id, [].as_slice())),
+                };
+                let end = match id.checked_add(1) {
+                    Some(next) => Bound::Excluded((next, [].as_slice())),
+                    None => Bound::Unbounded,
+                };
+                for row in docs.range::<(u64, &[u8])>((start, end))? {
+                    if out.len() + deleted.len() >= SNAPSHOT_PAGE {
+                        // Another row exists past a full page, so there is a next
+                        // page; the cursor names the last row sent. Looking one
+                        // row ahead is what lets a snapshot of exactly a page's
+                        // worth end here rather than with an empty page after it.
+                        return Ok((out, deleted, resumed(&resume)));
                     }
-                }
-                let record = codec::decode_doc_record(value.value())?;
-
-                // A tombstone travels by KEY. It has no `_id` to recover -- the
-                // body is gone and keyenc is one-way -- so it cannot be a
-                // `SnapshotDoc`, and it used to be skipped here. That skip was the
-                // defect ADR-167 closes: a receiver below this node's retention
-                // horizon may well hold the document, and completing a
-                // whole-database snapshot grants it coverage of the `Delete`, so
-                // no peer would ever send it. A receiver does not need the `_id`
-                // from us: where it holds the document, its own body carries one.
-                if !record.is_live() {
-                    deleted.push(SnapshotTombstone {
-                        collection: CollectionId(collection),
-                        key: doc_key.to_vec(),
-                        stamp: record.stamp,
-                    });
-                } else {
-                    let Some(document) = record.document()? else {
-                        continue;
+                    let (key, value) = row?;
+                    let (collection, doc_key) = key.value();
+                    let record = codec::decode_doc_record(value.value())?;
+                    // A tombstone travels by KEY (ADR-167): it has no `_id` to
+                    // recover, so it cannot be a `SnapshotDoc`, and a receiver
+                    // below this node's horizon may well hold the document.
+                    let (bytes, item) = if !record.is_live() {
+                        let tombstone = SnapshotTombstone {
+                            collection: CollectionId(collection),
+                            key: doc_key.to_vec(),
+                            stamp: record.stamp,
+                        };
+                        (doc_key.len() + TOMBSTONE_OVERHEAD, PageRow::Tombstone(tombstone))
+                    } else {
+                        let Some(document) = record.document()? else {
+                            continue;
+                        };
+                        let id = match document.get(crate::ID_FIELD) {
+                            Some(value) => DocId::try_from_bson(value)?,
+                            None => continue,
+                        };
+                        let bytes = record.body.len() + id_wire_len(&id) + DOCUMENT_OVERHEAD;
+                        let document = SnapshotDoc {
+                            collection: CollectionId(collection),
+                            id,
+                            stamp: record.stamp,
+                            body: Some(record.body),
+                        };
+                        (bytes, PageRow::Document(document))
                     };
-                    let id = match document.get(crate::ID_FIELD) {
-                        Some(value) => DocId::try_from_bson(value)?,
-                        None => continue,
-                    };
-
-                    out.push(SnapshotDoc {
-                        collection: CollectionId(collection),
-                        id,
-                        stamp: record.stamp,
-                        body: Some(record.body),
-                    });
-                }
-                if out.len() + deleted.len() == SNAPSHOT_PAGE {
-                    last_sent = Some((collection, doc_key.to_vec()));
+                    // With the cursor the page cuts if it ends at this row, whose
+                    // key crosses as an array: one cursor a page, so reserved with
+                    // each row and not added up.
+                    let reserved = cursor_reserve(doc_key.len());
+                    if used + bytes + reserved > room {
+                        if out.is_empty() && deleted.is_empty() && !first {
+                            let what = match &item {
+                                PageRow::Document(document) => format!(
+                                    "document with {} of collection {}",
+                                    id_name(&document.id),
+                                    document.collection
+                                ),
+                                PageRow::Tombstone(tombstone) => {
+                                    format!("a tombstone of collection {}", tombstone.collection)
+                                }
+                            };
+                            return Err(crate::StorageError::SnapshotRowTooLarge {
+                                what,
+                                bytes: bytes + reserved,
+                                room,
+                            });
+                        }
+                        // Not on this page: first on the next.
+                        return Ok((out, deleted, resumed(&resume)));
+                    }
+                    used += bytes;
+                    match item {
+                        PageRow::Document(document) => out.push(document),
+                        PageRow::Tombstone(tombstone) => deleted.push(tombstone),
+                    }
+                    resume = Some((collection, doc_key.to_vec()));
                 }
             }
-
-            break 'walk;
+            // The collection's rows are done: on to the next.
+            match next_after(id) {
+                Some(next) => at = (next, None),
+                None => return Ok((out, deleted, None)),
+            }
         }
-
-        Ok((out, deleted, cursor))
     }
 
     /// The first collection `page` defines that this node cannot create yet,
@@ -1304,7 +1528,7 @@ impl Engine {
                 Engine::persist_snapshot_progress_in_txn(
                     &txn,
                     peer,
-                    &progress.advanced(page, pending.len()),
+                    &progress.advanced(page, pending.len(), deletes.len()),
                 )?;
             }
             if wrote {
@@ -1320,7 +1544,7 @@ impl Engine {
             failed = error;
         }
 
-        *progress = progress.advanced(page, applied);
+        *progress = progress.advanced(page, applied, deletes.len());
         // The one completion with no page transaction to ride in: a final page
         // that wrote nothing, which cannot clear a record an earlier page
         // left. Checked before it is opened, so a snapshot that never
@@ -1535,7 +1759,7 @@ impl Engine {
             applied = count - created + replaced;
             failed = error;
         }
-        *progress = progress.advanced(page, applied + created);
+        *progress = progress.advanced(page, applied + created, deletes.len());
         if progress.complete {
             info!(
                 collection = ?progress.scope,

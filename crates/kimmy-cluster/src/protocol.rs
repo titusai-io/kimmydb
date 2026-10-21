@@ -52,6 +52,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// document rather than an 5 KiB one. Reachable, but no longer routine.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
+// A snapshot page's counted bytes leave a frame 1 MiB for what is not counted
+// (`kimmy_storage::SNAPSHOT_PAGE_BYTES`).
+const _: () = assert!(kimmy_storage::SNAPSHOT_PAGE_BYTES + 1024 * 1024 <= MAX_FRAME);
+
 /// Entries a peer will send in one response.
 ///
 /// Bounded so a node that is far behind catches up over several rounds rather

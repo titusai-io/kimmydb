@@ -69,7 +69,7 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "digest_probe::Engine::scan_uncovered",
     "digest_probe::Engine::walk_headers",
     // A snapshot page served to a peer, which passes over what a drop left.
-    "snapshot::Engine::snapshot_documents",
+    "snapshot::Engine::snapshot_rows",
     // The marks a pull names to its peer.
     "sync::Engine::held_marks_covered_by",
     // Where a change stream starts, and what it replays.
