@@ -266,9 +266,6 @@ impl AppState {
             // release counter above cannot say: it moves only when a mark
             // goes (ADR-160, ADR-172).
             held_marks: self.engine.held_marks()?,
-            // The durable marker that a `Decimal128` id exists here (ADR-238):
-            // one point read of the metadata table.
-            decimal128_id_present: self.engine.decimal128_id_present()?,
             // Read here rather than set by the dispatcher (ADR-187): live
             // state needs no writer, so it cannot be left unwritten, frozen
             // or late. A registry that cannot be read fails the scrape.

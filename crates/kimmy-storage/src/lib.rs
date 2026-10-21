@@ -16,7 +16,6 @@ pub mod check;
 pub mod class_step;
 pub mod codec;
 mod database_tombstone;
-pub mod decimal128_gate;
 pub mod definition_digest;
 pub mod definition_probe;
 mod definition_repair;
@@ -67,8 +66,6 @@ pub use walk::WalkScope;
 pub mod watch;
 pub mod writer_hold;
 
-#[cfg(test)]
-mod decimal128_gate_tests;
 #[cfg(test)]
 mod decimal_cost_tests;
 #[cfg(test)]
@@ -122,6 +119,8 @@ mod later_life_stop_tests;
 mod young_stamp_model_tests;
 
 #[cfg(test)]
+mod decimal_definition_tests;
+#[cfg(test)]
 mod mixed_roll_tests;
 
 #[cfg(test)]
@@ -133,7 +132,6 @@ mod log_capture;
 pub use live_walk::stop_open_after_rows_for_test;
 
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
-pub use decimal128_gate::Decimal128Predicate;
 pub use definition_digest::{DefinitionKey, DefinitionKind};
 pub use definition_probe::{
     DefinitionAnswered, DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome,

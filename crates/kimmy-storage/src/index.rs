@@ -938,35 +938,6 @@ impl crate::Engine {
         }
     }
 
-    /// The third chokepoint (ADR-238), asked only where a **local** create mints
-    /// a definition: a new one, or the re-stamp of an identical one inherited
-    /// from an earlier life of the collection, which replicates as a new
-    /// creation. A member before 0.51 refuses a definition whose filter holds a
-    /// `Decimal128` anywhere, records a refusal hint and never builds it, even
-    /// after it upgrades, so such a creation waits for the gate.
-    ///
-    /// **Not before the name is resolved.** An identical definition that already
-    /// stands here (it arrived by replication from a member whose key is set) is
-    /// the idempotent no-op it is for any index, and a different one under the
-    /// name is `IndexExists`: neither mints anything, so neither is the gate's
-    /// to answer. Replicated, restored and repaired definitions never ask:
-    /// refusing one would leave this member without an index its peers hold,
-    /// which is the failure the gate exists to prevent.
-    fn refuse_unless_bound_allowed(
-        &self,
-        origin: CreateOrigin<'_>,
-        index: &IndexMeta,
-    ) -> Result<()> {
-        let bound = index
-            .partial_filter
-            .as_ref()
-            .is_some_and(|filter| filter.values().any(kimmy_core::holds_decimal128));
-        if matches!(origin, CreateOrigin::Local) && bound {
-            self.refuse_unless_decimal128_allowed(kimmy_core::Decimal128Use::PartialFilterBound)?;
-        }
-        Ok(())
-    }
-
     /// `origin` is [`CreateOrigin::Replicated`] when applying a peer's
     /// definition, which must not mint an entry of its own: the originating
     /// entry is appended by the caller, and minting a second one under this
@@ -1169,8 +1140,6 @@ impl crate::Engine {
                         if matches!(origin, CreateOrigin::Local)
                             && existing.created.is_some_and(|held| held.hlc < meta.created)
                         {
-                            // A new creation, replicated: the gate's to allow.
-                            self.refuse_unless_bound_allowed(origin, &index)?;
                             let txn = self.begin_write(WriterHolder::Ddl)?;
                             if !crate::Engine::definition_is(&txn, &read)? {
                                 txn.abort()?;
@@ -1399,8 +1368,6 @@ impl crate::Engine {
                     index.name, other.name
                 )));
             }
-            // A new definition: a local one is the gate's to allow (ADR-238).
-            self.refuse_unless_bound_allowed(origin, &index)?;
 
             let txn = self.begin_write(WriterHolder::IndexBuild)?;
             // The build reads every document of the collection, so it ends at

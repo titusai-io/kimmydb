@@ -219,16 +219,6 @@ pub struct Facts {
     /// one member by the sender's own clock (ADR-213).
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_millis")]
     pub started_ms: Option<u64>,
-    /// This member can hold a document whose `_id` is a `Decimal128` and an
-    /// index whose partial filter holds one (ADR-238). Every 0.51 member sends
-    /// `Some(true)` whatever its `cluster.decimal128`: the key is the operator's
-    /// statement about the whole cluster, this is the binary's about itself.
-    /// Absent from an older sender, and anything but a bool reads as `None`,
-    /// which is *cannot*: a locally created decimal id or bound is refused
-    /// while any live peer reads anything but `Some(true)`
-    /// ([`decimal128_blockers`]).
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_bool")]
-    pub decimal128: Option<bool>,
     /// The vector chunk-id format this member writes ([`kimmy_core::CHUNK_ID_FORMAT`],
     /// ADR-239): `2` from 0.51.0. Absent from an older sender, which writes the
     /// `_id`'s display text; what tells a member that every live peer has
@@ -237,23 +227,6 @@ pub struct Facts {
     /// integer reads as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_millis")]
     pub vector_chunk_ids: Option<u64>,
-}
-
-/// The live peers that do not advertise [`Facts::decimal128`] as `Some(true)`,
-/// in node-id order (ADR-238): a peer whose block says otherwise or says nothing
-/// of it (a build older than 0.51), and **a live peer this member holds no block
-/// from yet, which fails closed**. A member SWIM does not list live is not asked:
-/// one that is down, and one migrating its store, which binds no socket until
-/// its migration is done. That is why the net is a net and not a check, and why
-/// the operator's declaration comes first.
-pub fn decimal128_blockers(view: &crate::membership::PeerView) -> Vec<NodeId> {
-    view.live
-        .iter()
-        .filter(|node| {
-            !view.blocks.get(node).is_some_and(|held| held.facts.decimal128 == Some(true))
-        })
-        .copied()
-        .collect()
 }
 
 /// One value per class of owned work.

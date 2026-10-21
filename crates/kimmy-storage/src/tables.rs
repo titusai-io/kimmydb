@@ -338,14 +338,6 @@ pub const META_OPLOG_COLLECTED_THROUGH: &str = "oplog_collected_through";
 /// start time by a start the evidence cannot vouch for.
 pub const META_TOMBSTONE_HORIZON: &str = "gc:tombstone_horizon";
 
-/// `META`: present once a document whose body `_id` has BSON type `Decimal128` has
-/// been written or applied on this member (`crate::decimal128_gate`, ADR-238); the
-/// value is the stamp of that write, as `Stamp::encode` writes it. Never removed. A
-/// backup carries it, and a build before 0.51 ignores it. What a rollback runbook
-/// reads: once it is set, wiping a member and resyncing it on an older build cannot
-/// work.
-pub const META_DECIMAL128_ID_PRESENT: &str = "decimal128:id_present";
-
 /// Every point-in-time rewind this database has taken: its target, and per
 /// origin the newest stamp it discarded (`Engine::rewinds`); under this member's
 /// own origin, no lower than the newest tombstone it minted. A start resumes the

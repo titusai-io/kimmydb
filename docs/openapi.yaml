@@ -253,22 +253,13 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, node, decimal128_id_present]
+                required: [status, node]
                 properties:
                   status:
                     const: ready
                   node:
                     type: string
                     description: This node's id.
-                  decimal128_id_present:
-                    type: boolean
-                    description: |
-                      Whether a document whose `_id` is a `Decimal128` has
-                      ever been written or applied on this member (ADR-238).
-                      Durable and never cleared. Once it is `true` on any
-                      member, no member can be rolled back by wiping it and
-                      resyncing on a build before 0.51. Also
-                      `kimmy_decimal128_id_present`.
                   catching_up:
                     const: unknown
                     description: |

@@ -286,11 +286,7 @@ fn parse_op(path: &str, value: &Bson) -> Result<PartialOp> {
     // A `Decimal128` operand is a bound like any number: `canonical_cmp`
     // places it by its exact value (ADR-238). Accepted here always, because
     // this parse is shared by a local create, a replicated or restored
-    // definition and the migration's check of stored ones, and a member that
-    // refuses a definition its peers hold never builds it. Builds before 0.51
-    // refuse it here, which is why a *local* creation of such an index is
-    // gated in storage (`cluster.decimal128`, ADR-238) until every member can
-    // hold it.
+    // definition and the migration's check of stored ones.
     let Bson::Document(spec) = value else {
         // A bare value is equality, as it is everywhere else in the filter
         // language.
@@ -736,8 +732,7 @@ mod decimal128 {
     fn a_decimal128_operand_parses_in_every_shape() {
         // Accepted always (ADR-238): the parse is shared by a local create, a
         // replicated or restored definition and the migration's check of
-        // stored ones. Whether a *local* create may persist one is the
-        // storage gate's question (`cluster.decimal128`), not this one's.
+        // stored ones.
         let d = dec("1.5");
         for filter in [
             doc! { "v": d.clone() },

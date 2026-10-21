@@ -32,7 +32,7 @@ pub use cursor::Cursor;
 pub use ddl::{
     CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, VectorSet, database_drop_id,
 };
-pub use error::{Decimal128Closed, Decimal128Use, Error, Result};
+pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
 pub use ids::{CollectionId, DECIMAL128_ID_LEN, Decimal128Id, DocId, NodeId};
 pub use index_meta::{Enforcement, IndexField, IndexMeta};
