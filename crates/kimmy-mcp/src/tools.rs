@@ -18,7 +18,7 @@ use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConf
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::principal;
@@ -332,11 +332,7 @@ pub struct HybridSearchArgs {
     pub min_overlap: Option<usize>,
 }
 
-// The four write tools' arguments are also `Serialize`: a keyed call's
-// fingerprint is taken over them serialized back, `idempotency_key` left out
-// (`kimmy_api::idempotency::tool_fingerprint` states the canonical form).
-
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InsertArgs {
     /// Database name.
@@ -345,22 +341,9 @@ pub struct InsertArgs {
     pub collection: String,
     /// The document to insert. An `_id` is generated if you omit one.
     pub document: Value,
-    /// Makes a retry of this call safe: the member that applied it answers the
-    /// same call with the same key with its first result, and writes nothing
-    /// again. 16 to 255 printable ASCII characters, such as a UUID; a new key
-    /// for every new write. Refused while this member does not take keys
-    /// (its `cluster.idempotency_keys` is off, or a member it can see does not
-    /// carry them), and a key used for a different call is refused.
-    #[schemars(required)]
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "kimmy_api::json::non_null_field"
-    )]
-    pub idempotency_key: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkInsertArgs {
     /// Database name.
@@ -369,22 +352,9 @@ pub struct BulkInsertArgs {
     pub collection: String,
     /// The documents to insert. An `_id` is generated for any that omit one.
     pub documents: Vec<Value>,
-    /// Makes a retry of this call safe: the member that applied it answers the
-    /// same call with the same key with its first result, and writes nothing
-    /// again. 16 to 255 printable ASCII characters, such as a UUID; a new key
-    /// for every new write. Refused while this member does not take keys
-    /// (its `cluster.idempotency_keys` is off, or a member it can see does not
-    /// carry them), and a key used for a different call is refused.
-    #[schemars(required)]
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "kimmy_api::json::non_null_field"
-    )]
-    pub idempotency_key: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateArgs {
     /// Database name.
@@ -411,22 +381,9 @@ pub struct UpdateArgs {
     /// element and needs no filter.
     #[serde(default, rename = "arrayFilters")]
     pub array_filters: Vec<Value>,
-    /// Makes a retry of this call safe: the member that applied it answers the
-    /// same call with the same key with its first result, and writes nothing
-    /// again. 16 to 255 printable ASCII characters, such as a UUID; a new key
-    /// for every new write. Refused while this member does not take keys
-    /// (its `cluster.idempotency_keys` is off, or a member it can see does not
-    /// carry them), and a key used for a different call is refused.
-    #[schemars(required)]
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "kimmy_api::json::non_null_field"
-    )]
-    pub idempotency_key: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteArgs {
     /// Database name.
@@ -445,19 +402,6 @@ pub struct DeleteArgs {
     /// Delete every match rather than only the first.
     #[serde(default)]
     pub multi: bool,
-    /// Makes a retry of this call safe: the member that applied it answers the
-    /// same call with the same key with its first result, and writes nothing
-    /// again. 16 to 255 printable ASCII characters, such as a UUID; a new key
-    /// for every new write. Refused while this member does not take keys
-    /// (its `cluster.idempotency_keys` is off, or a member it can see does not
-    /// carry them), and a key used for a different call is refused.
-    #[schemars(required)]
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "kimmy_api::json::non_null_field"
-    )]
-    pub idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -708,18 +652,7 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        let key = match keyed(&self.state, "insert", &args.idempotency_key, &args) {
-            Ok(key) => key,
-            Err(e) => return render(Err(e)),
-        };
-        render_answer(exec::insert(
-            &self.state,
-            &auth,
-            &args.database,
-            &args.collection,
-            &args.document,
-            key.as_ref(),
-        ))
+        render(exec::insert(&self.state, &auth, &args.database, &args.collection, &args.document))
     }
 
     /// Insert many documents at once.
@@ -733,17 +666,12 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        let key = match keyed(&self.state, "insert_many", &args.idempotency_key, &args) {
-            Ok(key) => key,
-            Err(e) => return render(Err(e)),
-        };
-        render_answer(exec::insert_many(
+        render(exec::insert_many(
             &self.state,
             &auth,
             &args.database,
             &args.collection,
             &args.documents,
-            key.as_ref(),
         ))
     }
 
@@ -761,10 +689,6 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        let key = match keyed(&self.state, "update", &args.idempotency_key, &args) {
-            Ok(key) => key,
-            Err(e) => return render(Err(e)),
-        };
         // `explain` is not surfaced to an agent: `find` already offers it for
         // working out whether an index applies, and a write is not the place
         // to go looking.
@@ -775,14 +699,13 @@ impl KimmyMcp {
             if_stamp: None,
             array_filters: args.array_filters,
         };
-        render_answer(exec::update(
+        render(exec::update(
             &self.state,
             &auth,
             &args.database,
             &args.collection,
             &args.update,
             params,
-            key.as_ref(),
         ))
     }
 
@@ -795,10 +718,6 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        let key = match keyed(&self.state, "delete", &args.idempotency_key, &args) {
-            Ok(key) => key,
-            Err(e) => return render(Err(e)),
-        };
         let params = exec::WriteParams {
             filter: args.filter,
             multi: args.multi,
@@ -806,14 +725,7 @@ impl KimmyMcp {
             if_stamp: None,
             array_filters: Vec::new(),
         };
-        render_answer(exec::delete(
-            &self.state,
-            &auth,
-            &args.database,
-            &args.collection,
-            params,
-            key.as_ref(),
-        ))
+        render(exec::delete(&self.state, &auth, &args.database, &args.collection, params))
     }
 
     /// Create a collection.
@@ -880,46 +792,6 @@ impl KimmyMcp {
 // ---------------------------------------------------------------------------
 // Result rendering
 // ---------------------------------------------------------------------------
-
-/// A write tool's `idempotency_key`, checked as the header is on the REST route
-/// beside it: malformed is refused naming the argument, and a well-formed key is
-/// refused while this member does not take keys (the gate the layer over the
-/// route table asks, `kimmy_api::AppState::idempotency_gate`). `Ok(None)`
-/// without one. The key and the call's fingerprint are what the write is then
-/// keyed by.
-fn keyed(
-    state: &kimmy_api::AppState,
-    tool: &str,
-    key: &Option<String>,
-    arguments: &impl Serialize,
-) -> Result<Option<kimmy_api::idempotency::IdempotentRequest>, ApiError> {
-    kimmy_api::idempotency::tool_key(state, tool, key.as_deref(), arguments)
-}
-
-/// The `_meta` key a replayed tool result carries, `true`: the MCP counterpart
-/// of `Idempotency-Replayed: ?1`, since a tool result has no headers. The
-/// structured content is the first answer either way.
-pub(crate) const REPLAYED_META: &str = "kimmydb/idempotency-replayed";
-
-/// Render a keyed write's answer: as [`render`], with [`REPLAYED_META`] set on
-/// a replay.
-pub(crate) fn render_answer(
-    result: Result<kimmy_api::idempotency::WriteAnswer, ApiError>,
-) -> Result<CallToolResult, ErrorData> {
-    match result {
-        Ok(answer) => {
-            let replayed = answer.replayed;
-            let mut result = ok(answer.body);
-            if replayed {
-                let mut meta = serde_json::Map::new();
-                meta.insert(REPLAYED_META.to_string(), Value::Bool(true));
-                result.meta = Some(rmcp::model::MetaObject(meta));
-            }
-            Ok(result)
-        }
-        Err(e) => render(Err(e)),
-    }
-}
 
 fn search_request(args: SearchArgs) -> (String, String, vectors::SearchRequest) {
     let request = vectors::SearchRequest {
@@ -1090,46 +962,6 @@ mod tests {
         assert_eq!(envelope["retry"], "verify");
         assert_eq!(envelope["applied"]["matched"], 1000);
         assert_eq!(envelope["cause"]["code"], "stopping");
-    }
-
-    #[test]
-    fn a_replayed_answer_is_the_same_result_marked_in_meta() {
-        let body = serde_json::json!({ "insertedId": 1, "stamp": "s" });
-        let first =
-            render_answer(Ok(kimmy_api::idempotency::WriteAnswer::first(body.clone()))).unwrap();
-        assert!(first.meta.is_none(), "a first answer is not marked");
-        let replay =
-            render_answer(Ok(kimmy_api::idempotency::WriteAnswer::replay(body.clone()))).unwrap();
-        assert_eq!(replay.structured_content, Some(body), "the first answer's content");
-        assert_eq!(replay.content, first.content);
-        let meta = replay.meta.expect("a replay is marked");
-        assert_eq!(meta.0.get(REPLAYED_META), Some(&Value::Bool(true)));
-        // A failure renders as any tool's failure does.
-        let refused = render_answer(Err(ApiError::idempotency_key_reused()))
-            .expect_err("a refusal stays a protocol error");
-        assert_eq!(refused.data.unwrap()["error"], "idempotency_key_reused");
-    }
-
-    /// The fingerprint of a tool call is its arguments without the key: the
-    /// same call under two keys is one request, and a call that differs in any
-    /// argument, or in the order a document's fields were sent, is another.
-    #[test]
-    fn a_tool_call_is_fingerprinted_over_its_arguments_without_the_key() {
-        let call = |key: Option<&str>, document: Value| InsertArgs {
-            database: "shop".into(),
-            collection: "orders".into(),
-            document,
-            idempotency_key: key.map(Into::into),
-        };
-        let fp = |args: &InsertArgs| {
-            kimmy_api::idempotency::tool_fingerprint("insert", &serde_json::to_value(args).unwrap())
-        };
-        let doc = serde_json::json!({ "a": 1, "b": 2 });
-        let base = fp(&call(Some("6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90"), doc.clone()));
-        assert_eq!(base, fp(&call(Some("another-key-of-sixteen"), doc.clone())));
-        assert_eq!(base, fp(&call(None, doc)));
-        assert_ne!(base, fp(&call(None, serde_json::json!({ "a": 1, "b": 3 }))));
-        assert_ne!(base, fp(&call(None, serde_json::json!({ "b": 2, "a": 1 }))));
     }
 
     #[test]

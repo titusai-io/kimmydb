@@ -1531,12 +1531,10 @@ pub(crate) mod tests {
             body: None,
         };
         let window = |exhausted: bool, scanned_to: u64| kimmy_storage::OplogWindow {
-            unanchored: 0,
             entries: vec![entry(10, 1), entry(20, 2)],
             scanned_to: Hlc::new(scanned_to, 0),
             exhausted,
             passed_through: None,
-            records: Vec::new(),
         };
         assert_eq!(window_end(&window(true, 20)), WindowEnd::Exhausted);
         assert_eq!(

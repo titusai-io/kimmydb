@@ -4201,11 +4201,6 @@ behaviour change for a configuration nobody should have had.
 > failure after the first commit answers `500 partially_applied`, `verify`,
 > with the counts of the committed chunks.
 
-> **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records).** A
-> keyed request's later chunks write a match only if its stamp is below the
-> request's first write, and count the rest in `skipped`, so two attempts of
-> one request on two members never write what the other wrote.
-
 **Decision.** `update` and `delete` with `multi: true` commit in chunks of
 `storage.multi_chunk_docs` documents (default 1,000; 1 to 10,000). Each chunk
 is one write transaction, matched and written inside it exactly as ADR-083
@@ -20861,11 +20856,6 @@ addendum). The cluster harness's burst test asserts at most N.
 
 ## ADR-192 — A request that commits more than once keeps going after its first commit, and a failure after it says what landed
 
-> **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records).** A
-> `partially_applied` request sent with an `Idempotency-Key` is recovered by
-> sending it again with the same key: it resumes, and never writes a document
-> twice. The marker remains the answer for a request without one.
-
 **Decision.** A request whose effect takes more than one write transaction
 follows one rule, after MongoDB's for `updateMany` and `deleteMany`:
 
@@ -28295,7 +28285,7 @@ The roll is member-at-a-time, and 0.49 and 0.51 may share a cluster if an operat
 A 0.49 or 0.50 member cannot hold a `Decimal128` `_id`, and cannot parse a `Decimal128` partial-filter bound: an entry or page that carries the new `DocId` variant fails to decode, the window is requested for ever, and a refused index definition is recorded, never retried, and survives the member's own upgrade. So accepting either is an operator declaration, the featureCompatibilityVersion pattern.
 - **The switch.** `cluster.decimal128` (bool), default `true` when clustering is off and `false` when it is on. It states that every member runs 0.51 and has migrated, and it gates local creation only. An entry, a page, a restored or a repaired definition from another member is always applied; refusing one would wedge replication.
 - **Three chokepoints**, keyed on the BSON type of the `_id`, not on the `DocId` variant (an integral decimal is an `Int64` with a decimal body, which breaks an older member's full scans): `check_insert` (insert, bulk, scope inserts, upserts and `$setOnInsert`), `replace_in_txn` (only when the replace creates the row; a replace over an existing decimal `_id` is not refused), and a local `create_index` that mints such a definition (a new one, or the re-stamp of an inherited one): an identical standing definition is the idempotent answer and a duplicate `_id` is `DuplicateKey`, as for any index or id. Each refuses with `400`, naming `cluster.decimal128` and the peers that do not advertise it.
-- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease. **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) (0.52.0):** the refusal tells the net's two causes apart. A live peer that does not say `decimal128` is the `400`, and decides: its held block says otherwise or nothing of it (an older build), its last block did not decode, or no block of it has arrived for more than the unheard lease (ADR-240 item 7: the longer of the lease and SWIM's time to declare a silent member down plus one sync interval) since it came up, was renamed or this member rejoined. A live peer with no block held within that lease, with none refusing, is `503 peer_unheard`, `retry: wait`, `Retry-After: 1`, since it is heard at the next contact. 0.51 answered that case `400`.
+- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease.
 - **The marker.** A `META` row `decimal128:id_present` is written in the transaction that writes or applies the first document whose body `_id` has BSON type `Decimal128`: at `write_insert`, `replace_in_txn`, `write_chosen`, and in `apply_remote_in_txn` (entries, `All` and scoped pages, the deletes a page carries, `Converge` rows), and a backup carries it. It is exposed as the gauge `kimmy_decimal128_id_present`, a `/readyz` field, and a WARN once per peer and every ten minutes while it is set and a live peer cannot hold such an id. **The marker, not the key, is the authority**: the key can be set back to `false` and the ids remain.
 - **The procedure.** Set `cluster.decimal128` only after every member runs 0.51 and has finished its migration, and never in the same change as the binary. The same procedure covers a decimal partial-filter bound.
 - **Mutation rows.** 31 rows are killed, among them: the BSON-type test replaced by the variant at both chokepoints, the key ignored, the net removed, an unheard peer passing, the marker unwritten or keyed on the variant, any of the three chokepoints ungated, the third chokepoint gating replicated definitions, the integer normalisation removed, and `to_bson` not re-padding.
@@ -28639,6 +28629,11 @@ in bash, one per clause.
 
 ## ADR-240 — Idempotency keys: the record is written with the write and travels with it, and a member takes keys only while every member carries records
 
+> **Superseded by [ADR-249](#adr-249--idempotency-keys-are-removed).**
+> Idempotency keys shipped in 0.52.0 and were removed in 0.53.0, because a key can promise once only on the members
+> that hold its record, and a leaderless cluster has no member that all requests reach. The byte-bounded pages (item 5,
+> the byte budget) live on in ADR-249. The rest is kept as the record of what 0.52.0 did.
+>
 > **Amends [ADR-086](#adr-086--a-multi-write-commits-in-bounded-chunks)**, whose later chunks write every match they
 > reach: a keyed request's later chunks leave a match written after the request's first write (item 4). **Amends
 > [ADR-192](#adr-192--a-request-that-commits-more-than-once-keeps-going-after-its-first-commit-and-a-failure-after-it-says-what-landed)**,
@@ -29217,9 +29212,9 @@ quiescence that the merged record dominates, or none where no document holds the
 that lost where the member pulled them, or by a record-only `done`, harmless while I2 holds; and **R1**, the writes of a
 reset or restored identity that peers keep only as page state never converge to it, a convergence matter outside this
 ADR. The mutation harness (`scripts/idempotency-mutants/`, run under bash) applies each mutant to an exported tree and
-runs its suites, the model's among them; [every mutation row of idempotency keys, run again together on the merged
-head, is listed
-with the test that kills it](adr-240-mutation-rows.md): 437 rows, 408 killed, 6 equivalent, 5 superseded and 10 retired, the 8 that G repeated from C run once, and 0 survived. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
+runs its suites, the model's among them; every mutation row of idempotency keys, run again together on the merged
+head, was listed
+with the test that killed it, in a table removed with the feature: 437 rows, 408 killed, 6 equivalent, 5 superseded and 10 retired, the 8 that G repeated from C run once, and 0 survived. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
 path, a record outliving a drop (the purge, a database drop, a late drop, a resume across a drop, a delete by id whose
 tombstone a drop took) and L1, a contested record refused on every path and between chunks, a past-window record
 refused on store, the coalesced barrier, the fsync and write faults, restarts, the multi-chunk record, the lookahead
@@ -29444,8 +29439,7 @@ update, treats it as an inactive sender and answers it with a `TurnUndead`, on w
 (`Identity::renew`, +1) and is answered again. Every process started at incarnation 0. So once a peer had seen a
 member renewed to k, each later start of it walked: k renewals to reach the identity its peers held live, k + 1 to pass
 one they held down. Each step is a `Rejoin` on the restarted member, which clears every peer block it holds
-(ADR-213), closing the gates that wait for every live peer's block (ADR-238's `Decimal128` gate, the idempotency
-gate) until the next replication contact brings them back. The peers saw one `Rename` per restart (the winning step);
+(ADR-213), closing the gates that wait for every live peer's block (ADR-238's `Decimal128` gate) until the next replication contact brings them back. The peers saw one `Rename` per restart (the winning step);
 the steps before it lost the conflict. **The walk only grew.** A stop the peers noticed renewed the member once more:
 declared down, it had to pass k; merely suspected (a 1.5 s stop is enough), it walked back to exactly the suspected
 identity at SWIM incarnation 0, never heard the suspicion (its broadcast was spent while it was dead), could not refute
@@ -30261,3 +30255,100 @@ it at the target; the floor refusal removed; and it at the target. Argued equiva
   path stops at it and asks for a page, which installs the life with its floor.
 - **The skip only before the target.** An entry of an ended life after the target is above the target and at or below
   a tombstone or a floor, which item 3 refuses.
+
+---
+
+## ADR-249 — Idempotency keys are removed
+
+> **Supersedes [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records).**
+> `Idempotency-Key`, the records, the wire fields, `cluster.idempotency_keys`, the capability `idempotency-keys`,
+> `idempotencyWindowSecs` on `GET /v1/version`, `skipped` and `resumed` on `update` and `delete` answers, the response
+> header `Idempotency-Replayed`, the seven `kimmy_idempotency_*` series and the error codes `idempotency_key_reused` and
+> `idempotency_key_in_flight` shipped in 0.52.0 and are removed in 0.53.0. **One decision of ADR-240 stands and is
+> decided again here, as its own text (item 5):** snapshot, scoped and converge pages bounded by bytes, with the named
+> refusal of a row no page can carry and the converge repair's bound. **Amends
+> [ADR-238](#adr-238--a-stored-number-is-an-exact-value-a-decimal128-has-a-place-in-the-order-and-number-keys-are-exact-and-variable-length-storage-schema-5)**
+> in item 6: its `cluster.decimal128` gate is to be removed in the next change. A breaking change, under the pre-1.0
+> policy of [compatibility.md](compatibility.md).
+
+**The case.** A key promises that a request is applied once, however often it is sent. On one node that promise is a
+row written in the write's own transaction. In a leaderless cluster (ADR-020) any member takes any write, and nothing
+makes the members agree before they do. The record therefore had to travel: with the entries, with the coverage a
+window grants, with snapshot, repair and replay pages, past a drop of its collection, past a rewind, past a backup.
+ADR-240 did all of that, and the promise still read "once, on any member that has received the write". A retry that
+reaches a member that has not (it was down, cut off, behind, or pulled the write through an older release) applies the
+request a second time, and last-writer-wins makes the second application the cluster's. A promise that holds where
+replication has caught up, and a client cannot tell where that is, is not one a client can build on, and a client that
+does loses a write or doubles it. Every gap closed added a table, wire fields, a gate on the cluster's state and an
+operator procedure, and the sentence that states the promise grew exceptions rather than shrinking.
+
+**The rule.** Every kimmydb feature must fit the leaderless architecture: what it promises must hold on whichever member
+takes the request, with no record, member or round of agreement the other members must hold first. A feature that can
+promise only on the member that took the write, or only once the cluster has caught up, is not offered with its gap
+documented; it is not offered.
+
+**Decision.**
+
+1. **Removed in 0.53.0, a breaking change.** `Idempotency-Key` is an ordinary unknown header again, and the MCP tools
+   refuse `idempotency_key` as an unknown field, as before 0.52.0. Retrying after an unknown outcome is as it was before
+   0.52.0: an idempotent write may be sent again, and any other write is resolved by reading, or by the marker pattern
+   in [http-api.md](http-api.md#a-request-that-was-partly-applied)
+   ([clients.md](clients.md#retrying-after-an-unknown-outcome)).
+
+2. **The configuration key is gone.** `cluster.idempotency_keys` is not a field of `[cluster]`, which denies unknown
+   fields, so a configuration that names it refuses to start.
+
+3. **What goes with it.** The capability `idempotency-keys`; `idempotencyWindowSecs` on `GET /v1/version`; `skipped` and
+   `resumed` on `update` and `delete` answers; the response header `Idempotency-Replayed`; the seven
+   `kimmy_idempotency_*` series and the `kimmy.idempotency.*` instruments; the error codes `idempotency_key_reused` and
+   `idempotency_key_in_flight`, so `ErrorCode::ALL` is 26. A `multi: true` `update` or `delete` is as ADR-086's chunks
+   and ADR-192's `partially_applied` have it.
+
+4. **No other change.** No `kimmy.format` schema (still 5), `I_EPOCH`, codec or entry kind changes.
+
+5. **Snapshot, scoped and converge pages are bounded by bytes, and a row no page can carry is refused by name** (carried
+   forward from ADR-240, found in 0.51.0). A page carried up to 512 documents and tombstones whatever their size, so 512
+   averaging over about 128 KiB made a page larger than a frame; the sender refused to write it and closed the
+   connection, and the requester, told nothing, asked for the same page for ever. **One byte budget per page:**
+   `SNAPSHOT_PAGE_BYTES`, 63 MiB (`MAX_FRAME` less 1 MiB for what is not counted), less what the page's definitions,
+   drops and vector take, shared by the documents and tombstones, a document's `_id` at the size it crosses in, and the
+   cursor the page ends at reserved with each row at the size its key crosses in: serde writes a `DocId::Binary` and
+   `SnapshotCursor::after_key` as arrays of `int32`s, about ten bytes a byte, and the wire stays as it is. A row that
+   does not fit goes first on the next page; one that does not fit a page holding nothing else (the first page's
+   definitions aside), its cursor included, is refused by name, the sender answering with `Message::Fault` (the
+   collection, the `_id` and the size) instead of a frame `write_frame` refuses, and logging `WARN` `a snapshot page cannot
+   be served` once per row per five minutes: a document whose `_id` is over about 3 MiB of binary or 5 MiB of string
+   cannot cross on a page, and a document larger than a page cannot replicate in a window either. An `_id` is named by
+   its kind, its length and its first 24 bytes, never whole. **A converge repair's bound** (ADR-237: it ends once it
+   has walked the collection's size at planning) **counts the documents and tombstones its pages carried**, against that
+   size and two full pages more, not its pages: a page cut short by its bytes carries fewer than 512 rows, and counted as
+   a page it ended the repair before it had walked the collection. Where every page is full the bound is what it was. No
+   configuration, table or schema change.
+
+6. **The `Decimal128` gate is removed in the next change.** ADR-238's `cluster.decimal128` switch, its refusal of a
+   creation (`400 bad_request` naming the key and the peers) and the net over every live peer's facts block existed
+   only to keep an older member from meeting a document or index definition it cannot hold. This change leaves the
+   gate as it is; the next removes it, with the `cluster.decimal128` key. A document whose `_id` is a `Decimal128`, and
+   an index whose `partialFilterExpression` holds one, are then created with no switch.
+
+**Alternatives rejected.** Keeping keys and documenting the gap, as 0.52.0 did: the guarantee a client reads is not the
+one it gets, and every closure of the gap added state every member must carry. Keys honoured on the member that took the
+write only: the retry that matters most, after a failover to another member, is the one it cannot answer. A check across
+members before applying (ask the peers, a quorum): blind to a member that is down, and the per-write coordination
+ADR-020 declined. Removing the keys without the page bytes: the oversize-page loop would remain.
+
+**Tests.** The page bytes (item 5): `kimmy-storage`'s `snapshot_pages_tests.rs`
+(`a_page_of_large_binary_ids_stays_within_a_frame`,
+`a_row_goes_first_on_the_next_page_and_one_no_page_can_carry_is_refused`,
+`a_pages_definitions_and_drops_are_counted_against_its_budget`, `the_row_overheads_bound_the_encoding` and
+`a_full_page_ending_at_a_large_id_stays_within_a_frame`) and `kimmy-cluster`'s `transport.rs`
+(`snapshot_pages_of_large_binary_ids_cross_within_a_frame`,
+`a_converge_repair_of_megabyte_documents_walks_the_whole_collection` and
+`a_converge_repair_ends_at_its_page_bound_however_much_the_collection_grew`). The named refusal of a row no page can
+carry (item 5): `kimmy-storage`'s `the_refusal_of_a_large_id_names_it_by_its_length_and_prefix` and `kimmy-cluster`'s
+`a_refused_snapshot_row_is_warned_of_once_per_interval` (the refusal reaches the requester as a `Fault` and is warned of
+once an interval). The frame budget (item 5): `kimmy-cluster`'s
+`a_full_batch_of_entries_leaves_the_budgets_slack_for_the_arrays_framing`, which shows that an entries array needs no
+framing term of its own. The removal (items 1 to 3): `kimmyd`'s `unknown_keys_are_rejected`, which holds that a
+configuration naming a key the build does not have, `cluster.idempotency_keys` now among them, refuses to start, and the
+`ErrorCode::ALL` pin in `kimmy-api`.

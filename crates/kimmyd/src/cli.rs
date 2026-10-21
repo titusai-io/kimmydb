@@ -282,7 +282,6 @@ impl Cli {
         // Its default follows `cluster.enabled`, which the flags above can set, so
         // it is settled here and `check-config` prints the value in effect.
         cfg.cluster.decimal128 = Some(cfg.cluster.decimal128());
-        cfg.cluster.idempotency_keys = Some(cfg.cluster.idempotency_keys());
 
         // `restore` moves a file into a data directory and exits. It never
         // serves, never authenticates anybody, and never joins a cluster, so
@@ -721,35 +720,6 @@ mod tests {
         let cfg = clustered.resolve().unwrap();
         assert_eq!(cfg.cluster.decimal128, Some(false));
         assert!(toml::to_string_pretty(&cfg).unwrap().contains("decimal128 = false"));
-    }
-
-    #[test]
-    fn check_config_prints_the_idempotency_keys_in_effect() {
-        // Settled after the flags, as `decimal128` is: `--seeds` turns clustering
-        // on and the default follows it.
-        let base = [
-            "kimmyd",
-            "--root-password",
-            "a-perfectly-adequate-password",
-            "--jwt-secret",
-            "a-signing-key-of-adequate-length",
-        ];
-        let alone = Cli::try_parse_from(base.iter().copied().chain(["check-config"])).unwrap();
-        let cfg = alone.resolve().unwrap();
-        assert_eq!(cfg.cluster.idempotency_keys, Some(true));
-        assert!(toml::to_string_pretty(&cfg).unwrap().contains("idempotency_keys = true"));
-
-        let clustered = Cli::try_parse_from(base.iter().copied().chain([
-            "--seeds",
-            "10.0.0.1:7900",
-            "--cluster-secret",
-            "a-shared-cluster-secret",
-            "check-config",
-        ]))
-        .unwrap();
-        let cfg = clustered.resolve().unwrap();
-        assert_eq!(cfg.cluster.idempotency_keys, Some(false));
-        assert!(toml::to_string_pretty(&cfg).unwrap().contains("idempotency_keys = false"));
     }
 
     #[test]

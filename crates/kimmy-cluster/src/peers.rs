@@ -731,18 +731,6 @@ pub(crate) fn apply_facts_read(members: &Members, stalls: &mut PeerStalls) {
     }
 }
 
-/// Apply the marks a round collected for blocks that did not decode, each with the
-/// decode sequence taken when its frame decoded. **The sequence is the one taken
-/// then, never one taken now**: a mark applied after a rename of the peer or this
-/// member's own rejoin, from a frame that decoded before it, must be ignored
-/// ([`Members::note_undecodable`]), or the new incarnation is refused for a block
-/// it never sent.
-pub(crate) fn apply_undecodable_marks(members: &Members, marks: Vec<(NodeId, u64)>, now: Instant) {
-    for (peer, decoded_seq) in marks {
-        members.note_undecodable(peer, decoded_seq, now);
-    }
-}
-
 /// When to retry a tick early, given how many ticks in a row found no peers
 /// (ADR-202's addendum): `None` for none, for more than [`EARLY_RETRIES`], and
 /// for a delay that would not be earlier than the interval itself.
@@ -1235,11 +1223,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         }
                     }
                     if let Some(members) = &config.members {
-                        apply_undecodable_marks(
-                            members,
-                            stalls.take_facts_undecodable(),
-                            Instant::now(),
-                        );
+                        for peer in stalls.take_facts_undecodable() {
+                            members.note_undecodable(peer, Instant::now());
+                        }
                     }
                     // What the peer said about itself, and what it holds of ours.
                     if let Some(members) = &config.members {
@@ -2935,35 +2921,6 @@ mod count_finding_tests;
 
 #[cfg(test)]
 mod tests {
-    /// A round collects a mark for a block that did not decode with the sequence
-    /// taken as the frame decoded, and applies it after the contact. One collected
-    /// before the peer's drop (a rename, a SWIM down) or before this member's own
-    /// rejoin and applied after it marks nothing, so the new incarnation is not
-    /// refused (400) for a block it never sent; one collected after the drop
-    /// marks.
-    #[test]
-    fn a_mark_collected_before_a_drop_is_ignored_when_the_round_applies_it() {
-        use crate::facts::next_decoded_seq;
-        let peer = super::NodeId::from_bytes([2; 16]);
-        let members = super::Members::default();
-        members.configure_lease(super::Duration::from_secs(5), 3);
-        members.insert_for_test("127.0.0.1:7901".parse().unwrap(), peer);
-        let now = super::Instant::now();
-
-        let before_rename = next_decoded_seq();
-        members.forget_peer_for_test(peer);
-        super::apply_undecodable_marks(&members, vec![(peer, before_rename)], now);
-        assert!(!members.view().undecodable.contains(&peer), "a rename's late mark is ignored");
-
-        let before_rejoin = next_decoded_seq();
-        members.rejoin_for_test();
-        super::apply_undecodable_marks(&members, vec![(peer, before_rejoin)], now);
-        assert!(!members.view().undecodable.contains(&peer), "a rejoin's late mark is ignored");
-
-        super::apply_undecodable_marks(&members, vec![(peer, next_decoded_seq())], now);
-        assert!(members.view().undecodable.contains(&peer), "a mark after the drop lands");
-    }
-
     /// A confirmed count divergence replays from the lowest of the life's floor, its
     /// `created` and the tombstone held for its id; a collection not held is a snapshot.
     #[test]

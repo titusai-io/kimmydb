@@ -832,9 +832,7 @@ Next ADR number: **ADR-062**.
 
 ## Planned, not scheduled
 
-Designed or wanted, with no milestone or version set. Nothing at present:
-idempotency keys, the last item here, shipped in 0.52.0 ([ADR-240](decisions.md),
-[HTTP API](http-api.md#idempotency-keys)).
+Designed or wanted, with no milestone or version set. Nothing at present.
 
 ---
 
@@ -843,6 +841,7 @@ idempotency keys, the last item here, shipped in 0.52.0 ([ADR-240](decisions.md)
 | | Why |
 |---|---|
 | Multi-document transactions | Requires coordination — the thing a leaderless design forgoes |
+| Idempotency keys | Shipped in 0.52.0 and removed in 0.53.0 ([ADR-249](decisions.md#adr-249--idempotency-keys-are-removed)): a key can promise that a retry is applied once only on the members that hold its record, and in a cluster where any member takes any write no member is the one every retry reaches. |
 | `$where` / JavaScript execution | An obvious injection surface |
 | MongoDB wire protocol | Considered and rejected twice — ADR-011, and again in [ADR-055](decisions.md) with the alternative examined rather than assumed. The deciding reason is topology: drivers presented with a replica set funnel every write to one `isWritablePrimary`, which a leaderless cluster cannot express |
 | gRPC | Rejected in ADR-011 and again in [ADR-055](decisions.md). Protobuf is schema-first against a schemaless store, code generation comes from OpenAPI anyway, the efficiency case is answered by the commit being the cost, and `protoc` plus `tonic`'s TLS provider land on the native-dependency discipline |

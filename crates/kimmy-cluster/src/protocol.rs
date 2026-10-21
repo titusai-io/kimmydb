@@ -95,16 +95,6 @@ fn lenient_hlc<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Opti
     Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Hlc>(raw).ok()))
 }
 
-/// A replay's records cursor, read leniently (ADR-240): one
-/// that does not decode is none, so the page's records start over at its
-/// position, and the frame is never refused for it.
-fn lenient_replay_records<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<kimmy_storage::ReplayRecords>, D::Error> {
-    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
-    Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
-}
-
 /// A digest request, read leniently (B3): one that does not decode is none, so a
 /// field of another shape costs the field and never the frame.
 fn lenient_digest_ask<'de, D: serde::Deserializer<'de>>(
@@ -260,19 +250,6 @@ pub enum Message {
             deserialize_with = "lenient_hlc"
         )]
         replay_from: Option<Hlc>,
-        /// With `replay_from`: where this member's replay stands in records at
-        /// that position, the records cursor of the last page of records alone it
-        /// stored from the requester (`ReplayEntries::replay_records`), so the
-        /// requester's serve goes on after it. The cursor is held by the member
-        /// replayed to and nowhere else: a restart loses it, and the serve starts
-        /// the position's records over. Optional and read leniently; absent from
-        /// an older answerer, which an older requester ignores.
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "lenient_replay_records"
-        )]
-        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// "Send me everything at or after this point."
     ///
@@ -307,39 +284,6 @@ pub enum Message {
         /// requester that predates it sends none, which reads as `false`.
         #[serde(default)]
         partial: bool,
-        /// The requester asks for a page of the replay of its own origin
-        /// (ADR-212), from `from` (ADR-240): the sender cuts
-        /// the answer as a replay page, with the records of the page's
-        /// collections whose request spans it, and sizes it to the frame itself,
-        /// down to a page of records alone (`Entries::replay_records`). Optional
-        /// on the wire, read as `false` when absent and not written when false: a
-        /// sender that predates it ignores it and answers the window as a pull
-        /// (0.51 holds no records, and keyed writes are taken only while every
-        /// live member carries records).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        replay: bool,
-        /// Where the replay's last page of records alone at `from` left off, as
-        /// that page's `Entries::replay_records` said: the sender goes on after
-        /// it. Optional and read leniently; absent from a requester that predates
-        /// it or has none.
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "lenient_replay_records"
-        )]
-        replay_records: Option<kimmy_storage::ReplayRecords>,
-        /// The requester stored, in this contact, the records the sender sent
-        /// ahead of the entry at this stamp (an answer of records alone, with no
-        /// entry and nothing covered, whose `scanned_to` named it): when that
-        /// entry is the window's first, the sender leaves out every record riding
-        /// at or below it, which the requester holds, so the entry crosses. Optional
-        /// and read leniently; a sender that predates it never sends records ahead.
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "lenient_hlc"
-        )]
-        records_ahead_of: Option<Hlc>,
     },
     /// The answer, in stamp order, and where the window it came from ended.
     ///
@@ -372,28 +316,6 @@ pub enum Message {
         exhausted: bool,
         #[serde(default)]
         passed_through: Option<kimmy_core::Stamp>,
-        /// The idempotency records the shipped entries carry (ADR-240, "How a
-        /// record travels"): `{collection, scope hash, carrying stamp, record
-        /// bytes}`, read in the read transaction that read the window and only
-        /// for the stamps shipped. The bytes are opaque here and pass through.
-        /// Optional on the wire and read leniently: an older receiver ignores
-        /// the field, and an older sender sends none, which reads as no records.
-        #[serde(
-            default,
-            skip_serializing_if = "Vec::is_empty",
-            deserialize_with = "kimmy_storage::lenient_records"
-        )]
-        records: Vec<kimmy_storage::CarriedRecord>,
-        /// On the answer to an `AskEntries` that set `replay`: the page carries
-        /// records alone (ADR-240), and the next page at the
-        /// same `from` goes on after this. Optional and read leniently: an older
-        /// receiver ignores it, and an older sender sends none.
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "lenient_replay_records"
-        )]
-        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// "That many entries will not fit in a frame; ask for this many."
     ///
@@ -447,29 +369,6 @@ pub enum Message {
         /// cut short before it reached the requester's entries therefore still
         /// makes progress at every contact.
         scanned_to: Hlc,
-        /// The idempotency records the shipped entries carry (ADR-240, "How a
-        /// record travels"): `{collection, scope hash, carrying stamp, record
-        /// bytes}`, read in the read transaction that read the window and only
-        /// for the stamps shipped. The bytes are opaque here and pass through.
-        /// Optional on the wire and read leniently: an older receiver ignores
-        /// the field, and an older sender sends none, which reads as no records.
-        #[serde(
-            default,
-            skip_serializing_if = "Vec::is_empty",
-            deserialize_with = "kimmy_storage::lenient_records"
-        )]
-        records: Vec<kimmy_storage::CarriedRecord>,
-        /// On a page of records alone: the records cursor the next page at the
-        /// same position goes on after, which the member replayed to keeps once it
-        /// has stored the page and echoes in its `ReplayAck` (and in its next
-        /// `Vectors`); the sender goes on only from an echoed cursor. Optional and
-        /// read leniently: an older receiver ignores it.
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "lenient_replay_records"
-        )]
-        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// The answer to [`Message::ReplayEntries`]: where the replay stands now.
     /// `next_from` is the position it asks from next; `done` that the sender has
@@ -481,17 +380,6 @@ pub enum Message {
         done: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stalled: Option<ReplayStall>,
-        /// The records cursor this member holds for the replay at `next_from`
-        /// after storing the page: the page's own (`ReplayEntries::
-        /// replay_records`), echoed, or none. The sender goes on with the next
-        /// page of records alone only from an echoed cursor. Optional and read
-        /// leniently: an older sender ignores it.
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "lenient_replay_records"
-        )]
-        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// "Send me current state instead of history."
     ///
@@ -636,24 +524,7 @@ pub enum Message {
     /// past every earlier entry from the same origin the receiver had not
     /// yet pulled, and nothing re-served them: a member could be handed an
     /// index for a collection it was never sent.
-    Push {
-        entries: Vec<OplogEntry>,
-        scanned_to: Hlc,
-        exhausted: bool,
-        versions: VersionVector,
-        /// The idempotency records the shipped entries carry (ADR-240, "How a
-        /// record travels"): `{collection, scope hash, carrying stamp, record
-        /// bytes}`, read in the read transaction that read the window and only
-        /// for the stamps shipped. The bytes are opaque here and pass through.
-        /// Optional on the wire and read leniently: an older receiver ignores
-        /// the field, and an older sender sends none, which reads as no records.
-        #[serde(
-            default,
-            skip_serializing_if = "Vec::is_empty",
-            deserialize_with = "kimmy_storage::lenient_records"
-        )]
-        records: Vec<kimmy_storage::CarriedRecord>,
-    },
+    Push { entries: Vec<OplogEntry>, scanned_to: Hlc, exhausted: bool, versions: VersionVector },
     /// What the pushed window became on the receiver: the fields of its
     /// `SyncOutcome` a pusher can act on. `ddl_declined` is a drop the
     /// receiver turned away as older than the index it holds (ADR-141).
@@ -1052,9 +923,6 @@ mod tests {
                 held: None,
                 marked: Vec::new(),
                 partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None,
             },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
@@ -1062,9 +930,6 @@ mod tests {
                 held: Some(populated_vector()),
                 marked: Vec::new(),
                 partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None,
             },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
@@ -1076,9 +941,6 @@ mod tests {
                     through: Hlc::new(5, 2),
                 }],
                 partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None,
             },
             Message::Versions(populated_vector()),
             Message::Vectors {
@@ -1088,23 +950,18 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
-                replay_records: None,
             },
             Message::Entries {
                 entries: Vec::new(),
                 scanned_to: Hlc::new(11, 2),
                 exhausted: false,
                 passed_through: None,
-                records: Vec::new(),
-                replay_records: None,
             },
             Message::Entries {
                 entries: Vec::new(),
                 scanned_to: Hlc::ZERO,
                 exhausted: true,
                 passed_through: None,
-                records: Vec::new(),
-                replay_records: None,
             },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
             Message::Confirm { proof: vec![9, 9] },
@@ -1122,13 +979,6 @@ mod tests {
                 after: Some(SnapshotCursor {
                     collection: CollectionId(u64::MAX),
                     after_key: vec![1, 2],
-                    records: None,
-                    // A records delta's base: a key of the sender's change
-                    // log and its epoch (ADR-240).
-                    records_base: Some(kimmy_storage::RecordsBase {
-                        key: kimmy_core::Stamp::new(Hlc::new(77, 1), NodeId::from_bytes([3; 16])),
-                        epoch: Some(i64::MIN + 5),
-                    }),
                 }),
                 collection: Some(CollectionId(u64::MAX)),
             },
@@ -1161,7 +1011,6 @@ mod tests {
                 scanned_to: Hlc::new(11, 2),
                 exhausted: false,
                 versions: populated_vector(),
-                records: Vec::new(),
             },
             Message::Pushed {
                 applied: 1,
@@ -1208,9 +1057,6 @@ mod tests {
                 held: None,
                 marked: Vec::new(),
                 partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None,
             },
         )
         .await
@@ -1228,10 +1074,7 @@ mod tests {
                 limit: 5,
                 held: None,
                 marked: Vec::new(),
-                partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None
+                partial: false
             }
         );
     }
@@ -1252,16 +1095,7 @@ mod tests {
         buffer.extend_from_slice(&body);
         assert_eq!(
             read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries {
-                from,
-                limit: 10,
-                held: None,
-                marked: Vec::new(),
-                partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None
-            },
+            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new(), partial: false },
             "a request without the field must read as one that did not send it"
         );
 
@@ -1275,168 +1109,9 @@ mod tests {
         buffer.extend_from_slice(&body);
         assert_eq!(
             read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries {
-                from,
-                limit: 10,
-                held: None,
-                marked: Vec::new(),
-                partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None
-            },
+            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new(), partial: false },
             "a field this build does not know must not fail the frame"
         );
-    }
-
-    /// The same boundary for `AskEntries::replay` and the replay's records cursor
-    /// (ADR-240), in both directions. A request that
-    /// sets neither writes neither key; a sender before them reads a request that
-    /// sets them as the window it knew; a frame from before them reads as `false`
-    /// and `None`; and a cursor of another shape reads as none, never refusing the
-    /// frame.
-    #[tokio::test]
-    async fn the_replay_fields_cross_a_version_boundary_in_both_directions() {
-        /// `AskEntries` as a sender before 0.52 declares it.
-        #[derive(Debug, Deserialize)]
-        struct AskEntriesBeforeReplay {
-            from: Hlc,
-            limit: usize,
-            #[serde(default)]
-            partial: bool,
-        }
-        async fn body_of(message: &Message, variant: &str) -> bson::Document {
-            let mut written = Vec::new();
-            write_frame(&mut written, message).await.unwrap();
-            let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
-            body.get_document(variant).unwrap().clone()
-        }
-        async fn read_back(variant: &str, fields: bson::Document) -> Message {
-            let bytes = bson::serialize_to_vec(&bson::doc! { variant: fields }).unwrap();
-            let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
-            frame.extend_from_slice(&bytes);
-            read_frame(&mut frame.as_slice()).await.unwrap()
-        }
-        let cursor = kimmy_storage::ReplayRecords {
-            at: Hlc::new(7, 1),
-            through: Hlc::new(9, 0),
-            collections: vec![kimmy_core::CollectionId(u64::MAX - 3)],
-            collection: kimmy_core::CollectionId(u64::MAX - 3),
-            scope: kimmy_core::ScopeHash([5; 32]),
-            base: kimmy_storage::RecordsBase {
-                key: kimmy_core::Stamp::new(Hlc::new(8, 0), NodeId::generate()),
-                epoch: Some(-42),
-            },
-        };
-        let plain = Message::AskEntries {
-            from: Hlc::new(7, 1),
-            limit: 10,
-            held: None,
-            marked: Vec::new(),
-            partial: false,
-            replay: false,
-            replay_records: None,
-            records_ahead_of: None,
-        };
-        let sent = body_of(&plain, "AskEntries").await;
-        assert!(!sent.contains_key("replay") && !sent.contains_key("replay_records"), "{sent}");
-        let ask = Message::AskEntries {
-            from: Hlc::new(7, 1),
-            limit: 10,
-            held: None,
-            marked: Vec::new(),
-            partial: false,
-            replay: true,
-            replay_records: Some(cursor.clone()),
-            records_ahead_of: None,
-        };
-        let sent = body_of(&ask, "AskEntries").await;
-        assert_eq!(sent.get_bool("replay").ok(), Some(true), "{sent}");
-        assert_eq!(read_back("AskEntries", sent.clone()).await, ask, "it round-trips");
-        let older: AskEntriesBeforeReplay = bson::deserialize_from_document(sent.clone())
-            .expect("a sender that predates the fields reads the request");
-        assert_eq!((older.from, older.limit, older.partial), (Hlc::new(7, 1), 10, false));
-        let mut before = sent.clone();
-        before.remove("replay");
-        before.remove("replay_records");
-        assert_eq!(read_back("AskEntries", before).await, plain, "from before: a pull");
-        let mut other = sent;
-        other.insert("replay_records", "a cursor of another shape");
-        let Message::AskEntries { replay_records: none, replay, .. } =
-            read_back("AskEntries", other).await
-        else {
-            panic!("not AskEntries")
-        };
-        assert!(replay && none.is_none(), "a cursor of another shape reads as none");
-
-        let page = Message::Entries {
-            entries: Vec::new(),
-            scanned_to: Hlc::new(7, 1),
-            exhausted: false,
-            passed_through: None,
-            records: Vec::new(),
-            replay_records: Some(cursor.clone()),
-        };
-        let sent = body_of(&page, "Entries").await;
-        assert_eq!(read_back("Entries", sent.clone()).await, page, "it round-trips");
-        let mut before = sent;
-        before.remove("replay_records");
-        let Message::Entries { replay_records: none, .. } = read_back("Entries", before).await
-        else {
-            panic!("not Entries")
-        };
-        assert!(none.is_none(), "an answer from before the field carries no cursor");
-
-        // The inbound way's cursor, held by the member replayed to: on the page,
-        // echoed in the ack, and handed back at the next contact's `Vectors`.
-        let ack = Message::ReplayAck {
-            next_from: Hlc::new(7, 1),
-            done: false,
-            stalled: None,
-            replay_records: Some(cursor.clone()),
-        };
-        let sent = body_of(&ack, "ReplayAck").await;
-        assert_eq!(read_back("ReplayAck", sent.clone()).await, ack, "it round-trips");
-        let mut before = sent;
-        before.remove("replay_records");
-        let Message::ReplayAck { replay_records: none, .. } = read_back("ReplayAck", before).await
-        else {
-            panic!("not ReplayAck")
-        };
-        assert!(none.is_none(), "an ack from before the field echoes no cursor");
-        let page = Message::ReplayEntries {
-            from: Hlc::new(7, 1),
-            entries: Vec::new(),
-            exhausted: false,
-            horizon: false,
-            scanned_to: Hlc::new(7, 1),
-            records: Vec::new(),
-            replay_records: Some(cursor.clone()),
-        };
-        let sent = body_of(&page, "ReplayEntries").await;
-        assert_eq!(read_back("ReplayEntries", sent).await, page, "it round-trips");
-        let plain = Message::ReplayEntries {
-            from: Hlc::new(7, 1),
-            entries: Vec::new(),
-            exhausted: false,
-            horizon: false,
-            scanned_to: Hlc::new(7, 1),
-            records: Vec::new(),
-            replay_records: None,
-        };
-        let sent = body_of(&plain, "ReplayEntries").await;
-        assert!(!sent.contains_key("replay_records"), "none is not written: {sent}");
-        let vectors = Message::Vectors {
-            servable: VersionVector::new(),
-            witnessed: VersionVector::new(),
-            facts: None,
-            facts_gen: None,
-            echo: None,
-            replay_from: Some(Hlc::new(7, 1)),
-            replay_records: Some(cursor),
-        };
-        let sent = body_of(&vectors, "Vectors").await;
-        assert_eq!(read_back("Vectors", sent).await, vectors, "it round-trips");
     }
 
     /// The same boundary for `AskEntries::partial` and `Entries::
@@ -1484,9 +1159,6 @@ mod tests {
             held: Some(held.clone()),
             marked: Vec::new(),
             partial: true,
-            replay: false,
-            replay_records: None,
-            records_ahead_of: None,
         };
         let sent = body_of(&ask, "AskEntries").await;
         assert_eq!(
@@ -1509,9 +1181,6 @@ mod tests {
                 held: Some(held),
                 marked: Vec::new(),
                 partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None
             },
             "a request from before the field asks for a whole window"
         );
@@ -1522,8 +1191,6 @@ mod tests {
             scanned_to: p.hlc,
             exhausted: false,
             passed_through: Some(p),
-            records: Vec::new(),
-            replay_records: None,
         };
         let sent = body_of(&entries, "Entries").await;
         assert!(sent.contains_key("passed_through"), "the frame carries the field: {sent}");
@@ -1540,276 +1207,9 @@ mod tests {
                 scanned_to: p.hlc,
                 exhausted: false,
                 passed_through: None,
-                records: Vec::new(),
-                replay_records: None
             },
             "a window from before the field names no end of its own"
         );
-    }
-
-    /// The idempotency records cross a version boundary in
-    /// both directions on every frame that carries them (`Entries`,
-    /// `ReplayEntries`, `Push`, a snapshot page, and the records position of a
-    /// snapshot cursor). A receiver before the field reads a frame carrying
-    /// records as the frame it knew; a frame from a sender before the field
-    /// reads with no records; a record element this build cannot read is
-    /// dropped and the frame stands. The facts field is the gate's half, and
-    /// is tested with the facts codec (`codec_tests.rs`,
-    /// `this_build_reads_idempotency_records_leniently_and_an_older_block_as_not_carrying`
-    /// and `a_051_decoder_reads_a_block_carrying_idempotency_records`).
-    #[tokio::test]
-    async fn the_idempotency_records_cross_a_version_boundary_in_both_directions() {
-        /// `Entries` as a requester before 0.52 declares it.
-        #[derive(Debug, Deserialize)]
-        struct EntriesBeforeRecords {
-            entries: Vec<OplogEntry>,
-            scanned_to: Hlc,
-            exhausted: bool,
-            #[serde(default)]
-            passed_through: Option<kimmy_core::Stamp>,
-        }
-        /// `ReplayEntries` as a receiver before 0.52 declares it.
-        #[derive(Debug, Deserialize)]
-        struct ReplayBeforeRecords {
-            from: Hlc,
-            entries: Vec<OplogEntry>,
-            exhausted: bool,
-            #[serde(default)]
-            horizon: bool,
-            scanned_to: Hlc,
-        }
-        /// `Push` as a receiver before 0.52 declares it.
-        #[derive(Debug, Deserialize)]
-        struct PushBeforeRecords {
-            entries: Vec<OplogEntry>,
-            scanned_to: Hlc,
-            exhausted: bool,
-            versions: VersionVector,
-        }
-        /// `SnapshotCursor` as a receiver before 0.52 declares it.
-        #[derive(Debug, Deserialize, Serialize)]
-        struct CursorBeforeRecords {
-            collection: CollectionId,
-            after_key: Vec<u8>,
-        }
-        /// `SnapshotPage`, as far as a receiver before 0.52 reads it.
-        #[derive(Debug, Deserialize)]
-        struct PageBeforeRecords {
-            documents: Vec<kimmy_storage::SnapshotDoc>,
-            next: Option<CursorBeforeRecords>,
-        }
-        async fn body_of(message: &Message, variant: &str) -> bson::Document {
-            let mut written = Vec::new();
-            write_frame(&mut written, message).await.unwrap();
-            let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
-            body.get_document(variant).unwrap().clone()
-        }
-        async fn read_back(variant: &str, fields: bson::Document) -> Message {
-            let bytes = bson::serialize_to_vec(&bson::doc! { variant: fields }).unwrap();
-            let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
-            frame.extend_from_slice(&bytes);
-            read_frame(&mut frame.as_slice()).await.unwrap()
-        }
-
-        let node = NodeId::from_bytes([5; 16]);
-        let at = kimmy_core::Stamp::new(Hlc::new(11, 2), node);
-        // A collection id above `i64::MAX`, as half of all derived ids are.
-        let high = CollectionId(u64::MAX - 7);
-        let entry = OplogEntry {
-            stamp: at,
-            kind: kimmy_core::OpKind::Insert,
-            collection: high,
-            doc_id: Some(kimmy_core::DocId::Int64(1)),
-            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1i64 }).unwrap()),
-        };
-        let record = kimmy_storage::CarriedRecord {
-            collection: high,
-            scope: kimmy_core::ScopeHash([9; 32]),
-            carrying: Some(at),
-            record: vec![1, 2, 3, 4],
-        };
-        let records = vec![record.clone()];
-        // A record element a later build might send and this one cannot read.
-        let unreadable = bson::Bson::String("a record from the future".into());
-
-        // Entries.
-        let message = Message::Entries {
-            entries: vec![entry.clone()],
-            scanned_to: at.hlc,
-            exhausted: true,
-            passed_through: None,
-            records: records.clone(),
-            replay_records: None,
-        };
-        let sent = body_of(&message, "Entries").await;
-        assert!(sent.get_array("records").is_ok_and(|r| r.len() == 1), "carried: {sent}");
-        let older: EntriesBeforeRecords = bson::deserialize_from_document(sent.clone())
-            .expect("a requester that predates the field reads the window");
-        assert_eq!(
-            (older.entries, older.scanned_to, older.exhausted),
-            (vec![entry.clone()], at.hlc, true)
-        );
-        assert_eq!(older.passed_through, None);
-        assert_eq!(read_back("Entries", sent.clone()).await, message, "this build reads it whole");
-        let mut lenient = sent.clone();
-        lenient.get_array_mut("records").unwrap().push(unreadable.clone());
-        assert_eq!(
-            read_back("Entries", lenient).await,
-            message,
-            "an unreadable element is dropped"
-        );
-        let mut before = sent;
-        before.remove("records");
-        let Message::Entries { records: none, entries, .. } = read_back("Entries", before).await
-        else {
-            panic!("not a window")
-        };
-        assert!(none.is_empty() && entries.len() == 1, "a window from before carries none");
-
-        // ReplayEntries.
-        let message = Message::ReplayEntries {
-            from: Hlc::new(3, 0),
-            entries: vec![entry.clone()],
-            exhausted: false,
-            horizon: false,
-            scanned_to: at.hlc,
-            records: records.clone(),
-            replay_records: None,
-        };
-        let sent = body_of(&message, "ReplayEntries").await;
-        assert!(sent.contains_key("records"), "carried: {sent}");
-        let older: ReplayBeforeRecords = bson::deserialize_from_document(sent.clone())
-            .expect("a receiver that predates the field reads the page");
-        assert_eq!((older.from, older.entries.len(), older.exhausted), (Hlc::new(3, 0), 1, false));
-        assert_eq!((older.horizon, older.scanned_to), (false, at.hlc));
-        assert_eq!(read_back("ReplayEntries", sent.clone()).await, message);
-        let mut lenient = sent.clone();
-        lenient.insert("records", bson::Bson::Int32(7));
-        let Message::ReplayEntries { records: none, .. } =
-            read_back("ReplayEntries", lenient).await
-        else {
-            panic!("not a replay page")
-        };
-        assert!(none.is_empty(), "a field this build cannot read is no records");
-        let mut before = sent;
-        before.remove("records");
-        let Message::ReplayEntries { records: none, .. } = read_back("ReplayEntries", before).await
-        else {
-            panic!("not a replay page")
-        };
-        assert!(none.is_empty());
-
-        // Push.
-        let mut versions = VersionVector::new();
-        versions.insert(node, at.hlc);
-        let message = Message::Push {
-            entries: vec![entry.clone()],
-            scanned_to: at.hlc,
-            exhausted: true,
-            versions: versions.clone(),
-            records: records.clone(),
-        };
-        let sent = body_of(&message, "Push").await;
-        assert!(sent.contains_key("records"), "carried: {sent}");
-        let older: PushBeforeRecords = bson::deserialize_from_document(sent.clone())
-            .expect("a receiver that predates the field reads the push");
-        assert_eq!((older.entries.len(), older.scanned_to, older.exhausted), (1, at.hlc, true));
-        assert_eq!(older.versions, versions);
-        assert_eq!(read_back("Push", sent.clone()).await, message);
-        let mut before = sent;
-        before.remove("records");
-        let Message::Push { records: none, .. } = read_back("Push", before).await else {
-            panic!("not a push")
-        };
-        assert!(none.is_empty());
-
-        // A snapshot page with records, and a cursor in a records phase.
-        let page = SnapshotPage {
-            collections: Vec::new(),
-            documents: Vec::new(),
-            next: Some(SnapshotCursor {
-                collection: high,
-                after_key: Vec::new(),
-                records: Some(vec![9; 32]),
-                // And the records delta's base.
-                records_base: Some(kimmy_storage::RecordsBase { key: at, epoch: Some(-1) }),
-            }),
-            versions: versions.clone(),
-            dropped: None,
-            dropped_collections: Vec::new(),
-            deleted_documents: Vec::new(),
-            dropped_indexes: Vec::new(),
-            tombstone_horizon: None,
-            records: vec![kimmy_storage::CarriedRecord { carrying: None, ..record }],
-            // And the epoch of the sender's change log, on every page.
-            records_epoch: Some(i64::MIN + 3),
-        };
-        let message = Message::Snapshot(Box::new(page.clone()));
-        let sent = body_of(&message, "Snapshot").await;
-        assert!(sent.contains_key("records"), "carried: {sent}");
-        assert!(sent.contains_key("records_epoch"), "the epoch rides the page: {sent}");
-        let older: PageBeforeRecords = bson::deserialize_from_document(sent.clone())
-            .expect("a receiver that predates the field reads the page");
-        assert!(older.documents.is_empty());
-        let echoed = older.next.expect("the cursor");
-        assert_eq!((echoed.collection, echoed.after_key.clone()), (high, Vec::new()));
-        let cut = sent.get_document("next").unwrap();
-        assert!(cut.contains_key("records_base"), "the delta's base rides the cursor: {cut}");
-        assert_eq!(read_back("Snapshot", sent.clone()).await, message, "this build reads it whole");
-        let mut before = sent;
-        before.remove("records");
-        let Message::Snapshot(read) = read_back("Snapshot", before).await else {
-            panic!("not a page")
-        };
-        assert!(read.records.is_empty(), "a page from before carries none");
-        // A sender before the epoch writes none, which reads as none; one of
-        // another shape reads as none too.
-        let mut before = body_of(&message, "Snapshot").await;
-        before.remove("records_epoch");
-        let Message::Snapshot(read) = read_back("Snapshot", before.clone()).await else {
-            panic!("not a page")
-        };
-        assert_eq!(read.records_epoch, None, "a page from before names no epoch");
-        before.insert("records_epoch", "not an epoch");
-        let Message::Snapshot(read) = read_back("Snapshot", before).await else {
-            panic!("not a page")
-        };
-        assert_eq!((read.records_epoch, read.records.len()), (None, 1), "read leniently");
-        // The older receiver echoes `{collection, after_key}`: read as the
-        // documents phase of the collection, which is where its sender goes.
-        let ask = bson::doc! {
-            "after": bson::serialize_to_bson(&echoed).unwrap(),
-            "collection": bson::Bson::Null,
-        };
-        let Message::AskSnapshot { after: Some(after), .. } = read_back("AskSnapshot", ask).await
-        else {
-            panic!("not a snapshot request")
-        };
-        assert_eq!(
-            after,
-            SnapshotCursor {
-                collection: high,
-                after_key: Vec::new(),
-                records: None,
-                records_base: None,
-            },
-            "an echo without the position asks for the documents, and without the base for no \
-             records delta"
-        );
-        // A base of another shape is none: the cursor still reads.
-        let ask = bson::doc! {
-            "after": {
-                "collection": bson::serialize_to_bson(&high).unwrap(),
-                "after_key": bson::Bson::Array(Vec::new()),
-                "records_base": "not a base",
-            },
-            "collection": bson::Bson::Null,
-        };
-        let Message::AskSnapshot { after: Some(after), .. } = read_back("AskSnapshot", ask).await
-        else {
-            panic!("not a snapshot request")
-        };
-        assert_eq!(after.records_base, None);
     }
 
     /// The same boundary for `AskEntries::marked` (ADR-172). A receiver
@@ -1838,9 +1238,6 @@ mod tests {
                 through: Hlc::new(5, 2),
             }],
             partial: false,
-            replay: false,
-            replay_records: None,
-            records_ahead_of: None,
         };
         let mut written = Vec::new();
         write_frame(&mut written, &request).await.unwrap();
@@ -1873,9 +1270,6 @@ mod tests {
                 held: Some(held),
                 marked: Vec::new(),
                 partial: false,
-                replay: false,
-                replay_records: None,
-                records_ahead_of: None
             },
             "a request without the field must read as one naming no spans"
         );
@@ -2137,7 +1531,6 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
-                replay_records: None,
             },
         ] {
             let mut written = Vec::new();
@@ -2212,7 +1605,6 @@ mod tests {
             facts_gen: None,
             echo: None,
             replay_from: None,
-            replay_records: None,
         };
         write_frame(&mut wire, &full).await.unwrap();
         assert_eq!(read_frame(&mut wire.as_slice()).await.unwrap(), full);
@@ -2226,7 +1618,6 @@ mod tests {
                 facts_gen: None,
                 echo: None,
                 replay_from: None,
-                replay_records: None,
             },
         )
         .await
@@ -2335,8 +1726,6 @@ mod tests {
                 deleted_documents: Vec::new(),
                 dropped_indexes: Vec::new(),
                 tombstone_horizon: None,
-                records: Vec::new(),
-                records_epoch: None,
             })),
         )
         .await
@@ -2396,12 +1785,7 @@ mod tests {
         let page = SnapshotPage {
             collections: Vec::new(),
             documents: Vec::new(),
-            next: Some(SnapshotCursor {
-                collection: CollectionId(7),
-                after_key: vec![1, 2, 3],
-                records: None,
-                records_base: None,
-            }),
+            next: Some(SnapshotCursor { collection: CollectionId(7), after_key: vec![1, 2, 3] }),
             versions: versions.clone(),
             dropped: None,
             dropped_collections: vec![(CollectionId(9), stamp(500))],
@@ -2412,8 +1796,6 @@ mod tests {
             }],
             dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
             tombstone_horizon: Some(Hlc::new(777, 3)),
-            records: Vec::new(),
-            records_epoch: None,
         };
 
         let mut written = Vec::new();

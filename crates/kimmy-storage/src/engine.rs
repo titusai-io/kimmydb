@@ -148,10 +148,6 @@ pub struct Engine {
     /// (ADR-086). Set from configuration at startup; the storage default
     /// stands for a bare engine.
     multi_chunk_docs: std::sync::atomic::AtomicUsize,
-    /// How far behind the wall clock this engine's clock reads its physical time,
-    /// for a test of a member restored onto a host whose clock is behind.
-    #[cfg(test)]
-    clock_behind_ms: std::sync::atomic::AtomicU64,
     /// A test's room for a snapshot page's rows (`snapshot::SNAPSHOT_PAGE_BYTES`);
     /// 0 for the real one.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -276,9 +272,6 @@ pub struct Engine {
     expiry_cursors: parking_lot::Mutex<std::collections::HashMap<(u64, u32), ExpiryCursor>>,
     /// The drop purger's queue, wake and counters (ADR-189).
     pub(crate) purges: crate::purge::Purges,
-    /// Idempotency keys in process (ADR-240): the in-flight set, the window, the
-    /// retention count.
-    pub(crate) idempotency: crate::idempotency::IdempotencyState,
 }
 
 /// Upper bounds of the writer-wait histogram, in microseconds.
@@ -682,13 +675,6 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
-thread_local! {
-    /// How far behind the wall clock an engine opened on this thread starts
-    /// ([`Engine::open_with_clock_behind_for_test`]); 0 for the wall clock's own.
-    static OPEN_CLOCK_BEHIND_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 /// Run `f` and say how long it spent waiting for the single writer, across
 /// every time it took it (ADR-175).
 ///
@@ -1000,36 +986,6 @@ impl WriteTxn<'_> {
         let result = txn.abort();
         self.release();
         result
-    }
-
-    /// Abort, for a keyed write answered from the idempotency record it found
-    /// under the writer (ADR-240), and return only once that record is durable.
-    ///
-    /// Under `coalesced` a commit is visible before it is durable: the record a
-    /// replay found may belong to a commit whose flush has not run, and a
-    /// replay told `200` for it could be undone by that flush failing. So the
-    /// replay takes a ticket while it still holds the gate, as a committer does
-    /// in [`Self::commit`]: the flush that covers the ticket covers every commit
-    /// that landed before it, the record's included. It waits for that flush,
-    /// at most one window, and a failed one is
-    /// [`StorageError::OutcomeUnknown`], exactly as the first attempt is
-    /// answered. Under `durable` the record's commit fsynced before the writer
-    /// was let go, so there is nothing to wait for. A ticket is taken whatever
-    /// the class was when this transaction opened: a class changed since then
-    /// can have left a record committed without its flush.
-    pub(crate) fn abort_for_replay(mut self) -> Result<()> {
-        let txn = self.txn.take().expect("a transaction is taken once");
-        let engine = self.engine;
-        let ticket = engine.issue_ticket();
-        let waits = self.coalesced || ticket.is_some();
-        let aborted = txn.abort();
-        self.release();
-        aborted?;
-        if waits {
-            blocking(|| engine.wait_for_flush(ticket))
-                .map_err(|e| StorageError::OutcomeUnknown(e.to_string()))?;
-        }
-        Ok(())
     }
 }
 
@@ -1423,14 +1379,6 @@ impl Engine {
             // The violations table, with the others so a read never meets it
             // missing (ADR-200).
             let _ = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
-            // The idempotency records and their rows by stamp (ADR-240), created as
-            // the tables above were, with no schema bump: an older build never
-            // opens them, and ignores them.
-            let _ = txn.open_table(tables::IDEMPOTENCY)?;
-            let _ = txn.open_table(tables::IDEMPOTENCY_BY_STAMP)?;
-            // And this node's change log of them, which no backup carries: its
-            // first change says where it begins.
-            let _ = txn.open_table(tables::IDEMPOTENCY_CHANGES)?;
             // The tombstone horizon's reset, in this commit and before the sidecar is
             // brought to this build (design 13.1): a store the evidence cannot vouch
             // for, or with no key, starts at this start's time, never lower than it was.
@@ -1536,10 +1484,6 @@ impl Engine {
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
             ),
-            #[cfg(test)]
-            clock_behind_ms: std::sync::atomic::AtomicU64::new(
-                OPEN_CLOCK_BEHIND_MS.with(std::cell::Cell::get),
-            ),
             #[cfg(any(test, feature = "test-hooks"))]
             snapshot_room_for_test: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1588,12 +1532,7 @@ impl Engine {
             gc_scan_cursor: parking_lot::Mutex::new(None),
             expiry_cursors: Default::default(),
             purges: Default::default(),
-            idempotency: Default::default(),
         };
-
-        // Records with no log of this node over them (a restore, an identity
-        // reset) begin the log, with a new epoch, before any page is cut.
-        crate::idempotency::begin_log_over_held_records(&engine)?;
 
         // A drop a restart interrupted is announced here and finished by the
         // drop purger once the node serves, not before it binds (ADR-158's
@@ -3637,13 +3576,6 @@ impl Engine {
     /// that resumed from the oplog tail alone would mint the next change below one
     /// already standing.
     ///
-    /// And the highest stamp an idempotency record carries (ADR-240, the last key of
-    /// `IDEMPOTENCY_BY_STAMP`): a record a page stored was folded into the clock
-    /// while the process ran, and a resume of its request must write above its
-    /// `first` after a restart too. And the records' change log's last key and
-    /// where it began (`IDEMPOTENCY_CHANGES`): a snapshot page's base is a key of
-    /// it, and every change after a restart must be logged above that base.
-    ///
     /// **And the rewinds' records.** A rewind removes every entry above its target and
     /// lowers both vectors to it (ADR-243), so neither the tail nor a vector names what
     /// it discarded. A member whose clock led its wall clock would otherwise resume
@@ -3662,8 +3594,6 @@ impl Engine {
         Ok(tail
             .max(named)
             .max(Self::metadata_high_water(db)?)
-            .max(Self::records_high_water(db)?)
-            .max(crate::idempotency::changes_high_water_at_open(db)?)
             .max(crate::rewind::rewound_high_water(db)?))
     }
 
@@ -3779,40 +3709,8 @@ impl Engine {
 
     /// Mint the next stamp for a local write.
     pub(crate) fn next_stamp(&self) -> Stamp {
-        let hlc = self.clock.lock().tick(self.clock_physical_ms());
+        let hlc = self.clock.lock().tick(physical_now_ms());
         Stamp::new(hlc, self.node_id)
-    }
-
-    /// The physical time the clock ticks from: the wall clock's, or, in a test
-    /// that holds it back, that far behind it.
-    fn clock_physical_ms(&self) -> u64 {
-        #[cfg(test)]
-        {
-            let behind = self.clock_behind_ms.load(std::sync::atomic::Ordering::Relaxed);
-            if behind > 0 {
-                return physical_now_ms().saturating_sub(behind);
-            }
-        }
-        physical_now_ms()
-    }
-
-    /// Hold this engine's clock `ms` behind the wall clock, as a host whose clock
-    /// is behind would (0 for the wall clock's own): stamps it mints then rise by
-    /// their counter above what it has witnessed.
-    #[cfg(test)]
-    pub(crate) fn set_clock_behind_for_test(&self, ms: u64) {
-        self.clock_behind_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// [`Self::open`], with the clock `ms` behind the wall clock from the open
-    /// on, so what the open itself mints is behind too: a store opened on a host
-    /// whose clock is behind.
-    #[cfg(test)]
-    pub(crate) fn open_with_clock_behind_for_test(path: &Path, ms: u64) -> Result<Self> {
-        OPEN_CLOCK_BEHIND_MS.with(|behind| behind.set(ms));
-        let opened = Self::open(path);
-        OPEN_CLOCK_BEHIND_MS.with(|behind| behind.set(0));
-        opened
     }
 
     /// The last time the clock handed out, for a test that a path mints
@@ -5320,9 +5218,6 @@ impl Engine {
                     }
                     removed += keys.len();
                 }
-                // The collection's idempotency records stay: a record outlives a
-                // drop of its collection for its window, and retention alone
-                // removes it (ADR-240).
                 // The ranges are exhausted: the digest row of a collection
                 // that is gone goes with this commit (a row of zeros and the
                 // highest stamps of a life that has ended).

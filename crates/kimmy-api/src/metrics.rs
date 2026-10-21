@@ -144,10 +144,6 @@ pub struct StorageReadings {
     /// applied on this member (`Engine::decimal128_id_present`, ADR-238): the
     /// durable marker a rollback runbook reads, read at scrape.
     pub decimal128_id_present: bool,
-    /// The records keyed writes leave (ADR-240): how many this member holds, and
-    /// the engine's counts of the ones it took from peers, could not decode and
-    /// collected ([`crate::AppState::idempotency_reading`]).
-    pub idempotency: IdempotencyReading,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -167,38 +163,6 @@ pub struct StorageReadings {
     pub cluster_members: u64,
     /// Ownership as this member sees it (ADR-201).
     pub ownership: OwnershipReading,
-}
-
-/// The ways a record of a keyed write arrives from a peer (ADR-240), the labels of
-/// `kimmy_idempotency_records_received_total{via}`, in the order of
-/// [`IdempotencyReading::received`]: a window this member pulled, a window a
-/// peer pushed, the replay of this member's own origin (ADR-212), a snapshot
-/// page, and a repair's converge page.
-pub const RECORDS_RECEIVED_VIA: [&str; 5] = ["pull", "push", "replay", "snapshot", "repair"];
-
-/// The position of `via` in [`RECORDS_RECEIVED_VIA`]: how a reader that names a
-/// way, the OTLP bridge, finds its count. Panics on a name that is not one of
-/// them, which only a typo in such a reader makes.
-pub fn received_via_slot(via: &str) -> usize {
-    RECORDS_RECEIVED_VIA
-        .iter()
-        .position(|known| *known == via)
-        .unwrap_or_else(|| panic!("`{via}` is not a way an idempotency record is received"))
-}
-
-/// The storage engine's idempotency records, read at the scrape (ADR-240). Counts
-/// since the process started, but for `records`, which is a level.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IdempotencyReading {
-    /// Records held now: the table's length, which redb keeps in the tree's
-    /// root, so the read is O(1).
-    pub records: u64,
-    /// Records stored from peers, by [`RECORDS_RECEIVED_VIA`].
-    pub received: [u64; RECORDS_RECEIVED_VIA.len()],
-    /// Records a peer sent that this build could not decode, and dropped.
-    pub undecodable: u64,
-    /// Records retention removed.
-    pub collected: u64,
 }
 
 /// How this member sees the ownership of work, read at the scrape (ADR-201).
@@ -546,18 +510,6 @@ pub struct MetricsSnapshot {
     /// 1 once a document whose `_id` is a `Decimal128` has been written or
     /// applied on this member (ADR-238): an engine reading.
     pub decimal128_id_present: u64,
-    /// Keyed requests by outcome, in `KeyedOutcome::ALL` order, and the
-    /// replays answered from a record another member wrote (ADR-240).
-    pub idempotency_requests: [u64; crate::idempotency::KeyedOutcome::ALL.len()],
-    pub idempotency_peer_replays: u64,
-    /// The engine's records (ADR-240), as [`StorageReadings::idempotency`] read them.
-    pub idempotency_records: u64,
-    pub idempotency_records_received: [u64; RECORDS_RECEIVED_VIA.len()],
-    pub idempotency_records_undecodable: u64,
-    /// Records that fit no frame or replay page that must carry them, by
-    /// `kimmy_cluster::UnfitPath` (ADR-240, records too many for a frame).
-    pub idempotency_records_unfit: [u64; 3],
-    pub idempotency_records_collected: u64,
     /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
     /// the loop guard's judgements of them (`DefinitionJudgement::ALL`) and what their pages
     /// did with indexes (`kimmy_storage::DEFINITION_RESULTS`).
@@ -798,11 +750,6 @@ pub struct Metrics {
     vector_counters: OnceLock<std::sync::Arc<kimmy_vector::WorkerCounters>>,
     /// The drop purger's, for its progress age (ADR-189).
     purge_counters: OnceLock<std::sync::Arc<kimmy_storage::PurgeCounters>>,
-    /// Keyed requests by what became of them, and the replays of another
-    /// member's record among them (ADR-240): counted by the edge, which is the one
-    /// place every keyed request passes, the gate's refusals included.
-    idempotency_requests: [AtomicU64; crate::idempotency::KeyedOutcome::ALL.len()],
-    idempotency_peer_replays: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -890,8 +837,6 @@ impl Default for Metrics {
             jwks_refresh_failed: AtomicU64::new(0),
             vector_counters: OnceLock::new(),
             purge_counters: OnceLock::new(),
-            idempotency_requests: std::array::from_fn(|_| AtomicU64::new(0)),
-            idempotency_peer_replays: AtomicU64::new(0),
         }
     }
 }
@@ -950,17 +895,6 @@ impl Metrics {
     /// apart from the login limiter's refusals, which mean something else.
     pub fn record_principal_rate_limited(&self) {
         self.rate_limited_principal.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// One keyed request, by what became of it (ADR-240).
-    pub fn record_idempotency(&self, outcome: crate::idempotency::KeyedOutcome) {
-        self.idempotency_requests[outcome.slot()].fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// One replay answered from a record another member wrote: the
-    /// cross-member deduplication at work (ADR-240). Also counted as `replayed`.
-    pub fn record_idempotency_peer_replay(&self) {
-        self.idempotency_peer_replays.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One delivery attempt, and how many events it carried.
@@ -1576,17 +1510,6 @@ impl Metrics {
             sync_divergence_repair_enabled: self.get(&self.sync_divergence_repair_enabled),
             gc_tombstone_horizon_seconds: self.get(&self.gc_tombstone_horizon_seconds),
             decimal128_id_present: u64::from(readings.decimal128_id_present),
-            idempotency_requests: std::array::from_fn(|slot| {
-                self.get(&self.idempotency_requests[slot])
-            }),
-            idempotency_peer_replays: self.get(&self.idempotency_peer_replays),
-            idempotency_records: readings.idempotency.records,
-            idempotency_records_received: readings.idempotency.received,
-            idempotency_records_undecodable: readings.idempotency.undecodable,
-            idempotency_records_unfit: std::array::from_fn(|slot| {
-                kimmy_cluster::records_unfit().get(kimmy_cluster::UnfitPath::ALL[slot])
-            }),
-            idempotency_records_collected: readings.idempotency.collected,
             sync_definition_repairs: std::array::from_fn(|slot| {
                 self.get(&self.sync_definition_repairs[slot])
             }),
@@ -2018,27 +1941,6 @@ impl Metrics {
              # HELP kimmy_decimal128_id_present 1 once a document whose _id is a Decimal128 (an integral one stored as an integer id included) has been written or applied on this member, else 0. Durable and never cleared, and a backup carries it. Read it on every member before a rollback: once it is 1 anywhere, no member can be rolled back by wiping it and resyncing on a build before 0.51 (operations.md, cluster.decimal128 and the marker).\n\
              # TYPE kimmy_decimal128_id_present gauge\n\
              kimmy_decimal128_id_present {decimal128_id_present}\n\
-             # HELP kimmy_idempotency_requests_total Requests that carried an Idempotency-Key, or the MCP argument idempotency_key, by outcome. applied: no record, so the request was processed, and its record written with it if it changed anything. replayed: the first answer returned from the record, with Idempotency-Replayed: ?1, and nothing written. resumed: a multi-document update or delete that had stopped, continued past where it stopped. reused: the key names a different request on this member (422 idempotency_key_reused). in_flight: a multi-chunk request with the key is still running here (409 idempotency_key_in_flight). gated: refused with 400 because cluster.idempotency_keys is false here or a live member does not carry records.\n\
-             # TYPE kimmy_idempotency_requests_total counter\n\
-             {idempotency_requests_lines}\
-             # HELP kimmy_idempotency_peer_replays_total Replays answered from a record another member wrote: the write reached this member from the one that took it, and a retry here was answered rather than applied a second time.\n\
-             # TYPE kimmy_idempotency_peer_replays_total counter\n\
-             kimmy_idempotency_peer_replays_total {idempotency_peer_replays}\n\
-             # HELP kimmy_idempotency_records Idempotency records this member holds, read at the scrape: one per keyed request that changed something, kept storage.oplog_retention_secs after its last commit.\n\
-             # TYPE kimmy_idempotency_records gauge\n\
-             kimmy_idempotency_records {idempotency_records}\n\
-             # HELP kimmy_idempotency_records_received_total Idempotency records stored from peers, by the way they came. pull: a window this member pulled. push: a window a peer pushed. replay: the replay of this member's own origin after a restore. snapshot: a snapshot page. repair: a repair's converge page.\n\
-             # TYPE kimmy_idempotency_records_received_total counter\n\
-             {idempotency_received_lines}\
-             # HELP kimmy_idempotency_records_undecodable_total Idempotency records a peer sent that this build could not decode, and dropped; the write they came with is applied. A record of a newer format is skipped this way, not fatal.\n\
-             # TYPE kimmy_idempotency_records_undecodable_total counter\n\
-             kimmy_idempotency_records_undecodable_total {idempotency_undecodable}\n\
-             # HELP kimmy_idempotency_records_unfit_total Frames and replay pages that could not carry the idempotency records they must, by path, each logged at WARN: one record, or the records the sender cannot vouch for by its oplog, larger than a frame. pull: a window a peer pulled, answered as one entry that cannot replicate or with no entries; push: a push not sent; replay: a page of a peer's replay that carried nothing. Should read 0.\n\
-             # TYPE kimmy_idempotency_records_unfit_total counter\n\
-             {idempotency_unfit_lines}\
-             # HELP kimmy_idempotency_records_collected_total Idempotency records retention removed, once storage.oplog_retention_secs had passed since their last commit.\n\
-             # TYPE kimmy_idempotency_records_collected_total counter\n\
-             kimmy_idempotency_records_collected_total {idempotency_collected}\n\
              # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.\n\
              # TYPE kimmy_sync_definition_repairs_total counter\n\
              {sync_definition_repairs_lines}\
@@ -2243,37 +2145,6 @@ impl Metrics {
             sync_divergence_repair_enabled = self.get(&self.sync_divergence_repair_enabled),
             gc_tombstone_horizon = self.get(&self.gc_tombstone_horizon_seconds),
             decimal128_id_present = u64::from(readings.decimal128_id_present),
-            idempotency_requests_lines = crate::idempotency::KeyedOutcome::ALL
-                .iter()
-                .map(|outcome| {
-                    format!(
-                        "kimmy_idempotency_requests_total{{outcome=\"{}\"}} {}\n",
-                        outcome.label(),
-                        self.get(&self.idempotency_requests[outcome.slot()])
-                    )
-                })
-                .collect::<String>(),
-            idempotency_peer_replays = self.get(&self.idempotency_peer_replays),
-            idempotency_records = readings.idempotency.records,
-            idempotency_received_lines = RECORDS_RECEIVED_VIA
-                .iter()
-                .zip(readings.idempotency.received)
-                .map(|(via, count)| {
-                    format!("kimmy_idempotency_records_received_total{{via=\"{via}\"}} {count}\n")
-                })
-                .collect::<String>(),
-            idempotency_undecodable = readings.idempotency.undecodable,
-            idempotency_unfit_lines = kimmy_cluster::UnfitPath::ALL
-                .iter()
-                .map(|path| {
-                    format!(
-                        "kimmy_idempotency_records_unfit_total{{path=\"{}\"}} {}\n",
-                        path.label(),
-                        kimmy_cluster::records_unfit().get(*path)
-                    )
-                })
-                .collect::<String>(),
-            idempotency_collected = readings.idempotency.collected,
             sync_definition_repairs_lines = kimmy_cluster::DigestRepairOutcome::DEFINITION
                 .iter()
                 .map(|outcome| {
@@ -2972,18 +2843,6 @@ mod tests {
         }
 
         m.record_backup(Duration::from_secs(42));
-        // Each keyed outcome a count of its own, so one rendered under another
-        // label cannot match (ADR-240).
-        for (outcome, times) in
-            crate::idempotency::KeyedOutcome::ALL.into_iter().zip([3, 5, 7, 2, 4, 6])
-        {
-            for _ in 0..times {
-                m.record_idempotency(outcome);
-            }
-        }
-        for _ in 0..9 {
-            m.record_idempotency_peer_replay();
-        }
         m.record_expiry(11, 12, 93);
         m.record_webhook_delivery(true, 13);
         m.record_webhook_delivery(true, 14);
@@ -3286,12 +3145,6 @@ mod tests {
             held_marks_released: 53,
             held_marks: 54,
             decimal128_id_present: true,
-            idempotency: IdempotencyReading {
-                records: 1_601,
-                received: [1_611, 1_612, 1_613, 1_614, 1_615],
-                undecodable: 1_621,
-                collected: 1_631,
-            },
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -3988,38 +3841,6 @@ kimmy_gc_tombstone_horizon_seconds 1700000002
 # HELP kimmy_decimal128_id_present 1 once a document whose _id is a Decimal128 (an integral one stored as an integer id included) has been written or applied on this member, else 0. Durable and never cleared, and a backup carries it. Read it on every member before a rollback: once it is 1 anywhere, no member can be rolled back by wiping it and resyncing on a build before 0.51 (operations.md, cluster.decimal128 and the marker).
 # TYPE kimmy_decimal128_id_present gauge
 kimmy_decimal128_id_present 1
-# HELP kimmy_idempotency_requests_total Requests that carried an Idempotency-Key, or the MCP argument idempotency_key, by outcome. applied: no record, so the request was processed, and its record written with it if it changed anything. replayed: the first answer returned from the record, with Idempotency-Replayed: ?1, and nothing written. resumed: a multi-document update or delete that had stopped, continued past where it stopped. reused: the key names a different request on this member (422 idempotency_key_reused). in_flight: a multi-chunk request with the key is still running here (409 idempotency_key_in_flight). gated: refused with 400 because cluster.idempotency_keys is false here or a live member does not carry records.
-# TYPE kimmy_idempotency_requests_total counter
-kimmy_idempotency_requests_total{outcome=\"applied\"} 3
-kimmy_idempotency_requests_total{outcome=\"replayed\"} 5
-kimmy_idempotency_requests_total{outcome=\"resumed\"} 7
-kimmy_idempotency_requests_total{outcome=\"reused\"} 2
-kimmy_idempotency_requests_total{outcome=\"in_flight\"} 4
-kimmy_idempotency_requests_total{outcome=\"gated\"} 6
-# HELP kimmy_idempotency_peer_replays_total Replays answered from a record another member wrote: the write reached this member from the one that took it, and a retry here was answered rather than applied a second time.
-# TYPE kimmy_idempotency_peer_replays_total counter
-kimmy_idempotency_peer_replays_total 9
-# HELP kimmy_idempotency_records Idempotency records this member holds, read at the scrape: one per keyed request that changed something, kept storage.oplog_retention_secs after its last commit.
-# TYPE kimmy_idempotency_records gauge
-kimmy_idempotency_records 1601
-# HELP kimmy_idempotency_records_received_total Idempotency records stored from peers, by the way they came. pull: a window this member pulled. push: a window a peer pushed. replay: the replay of this member's own origin after a restore. snapshot: a snapshot page. repair: a repair's converge page.
-# TYPE kimmy_idempotency_records_received_total counter
-kimmy_idempotency_records_received_total{via=\"pull\"} 1611
-kimmy_idempotency_records_received_total{via=\"push\"} 1612
-kimmy_idempotency_records_received_total{via=\"replay\"} 1613
-kimmy_idempotency_records_received_total{via=\"snapshot\"} 1614
-kimmy_idempotency_records_received_total{via=\"repair\"} 1615
-# HELP kimmy_idempotency_records_undecodable_total Idempotency records a peer sent that this build could not decode, and dropped; the write they came with is applied. A record of a newer format is skipped this way, not fatal.
-# TYPE kimmy_idempotency_records_undecodable_total counter
-kimmy_idempotency_records_undecodable_total 1621
-# HELP kimmy_idempotency_records_unfit_total Frames and replay pages that could not carry the idempotency records they must, by path, each logged at WARN: one record, or the records the sender cannot vouch for by its oplog, larger than a frame. pull: a window a peer pulled, answered as one entry that cannot replicate or with no entries; push: a push not sent; replay: a page of a peer's replay that carried nothing. Should read 0.
-# TYPE kimmy_idempotency_records_unfit_total counter
-kimmy_idempotency_records_unfit_total{path=\"pull\"} 0
-kimmy_idempotency_records_unfit_total{path=\"push\"} 0
-kimmy_idempotency_records_unfit_total{path=\"replay\"} 0
-# HELP kimmy_idempotency_records_collected_total Idempotency records retention removed, once storage.oplog_retention_secs had passed since their last commit.
-# TYPE kimmy_idempotency_records_collected_total counter
-kimmy_idempotency_records_collected_total 1631
 # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.
 # TYPE kimmy_sync_definition_repairs_total counter
 kimmy_sync_definition_repairs_total{outcome=\"applied\"} 262
@@ -4690,32 +4511,6 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         ));
         expect(&format!("kimmy_gc_tombstone_horizon_seconds {}\n", s.gc_tombstone_horizon_seconds));
         expect(&format!("kimmy_decimal128_id_present {}\n", s.decimal128_id_present));
-        for outcome in crate::idempotency::KeyedOutcome::ALL {
-            expect(&format!(
-                "kimmy_idempotency_requests_total{{outcome=\"{}\"}} {}\n",
-                outcome.label(),
-                s.idempotency_requests[outcome.slot()]
-            ));
-        }
-        expect(&format!("kimmy_idempotency_peer_replays_total {}\n", s.idempotency_peer_replays));
-        expect(&format!("kimmy_idempotency_records {}\n", s.idempotency_records));
-        for (via, count) in RECORDS_RECEIVED_VIA.iter().zip(s.idempotency_records_received) {
-            expect(&format!("kimmy_idempotency_records_received_total{{via=\"{via}\"}} {count}\n"));
-        }
-        expect(&format!(
-            "kimmy_idempotency_records_undecodable_total {}\n",
-            s.idempotency_records_undecodable
-        ));
-        for (path, count) in kimmy_cluster::UnfitPath::ALL.iter().zip(s.idempotency_records_unfit) {
-            expect(&format!(
-                "kimmy_idempotency_records_unfit_total{{path=\"{}\"}} {count}\n",
-                path.label()
-            ));
-        }
-        expect(&format!(
-            "kimmy_idempotency_records_collected_total {}\n",
-            s.idempotency_records_collected
-        ));
         for outcome in kimmy_cluster::DigestRepairOutcome::DEFINITION {
             expect(&format!(
                 "kimmy_sync_definition_repairs_total{{outcome=\"{}\"}} {}\n",
@@ -5159,16 +4954,6 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_cluster::DigestRepairOutcome::DEFINITION.len()
                 + kimmy_cluster::DefinitionJudgement::ALL.len()
                 + kimmy_storage::DEFINITION_RESULTS.len()
-                // Keyed requests by outcome, peer replays, the records held, the
-                // records received by way, undecodable and collected (ADR-240), and
-                // those that fit no frame, by path.
-                + crate::idempotency::KeyedOutcome::ALL.len()
-                + 1
-                + 1
-                + RECORDS_RECEIVED_VIA.len()
-                + 1
-                + 1
-                + kimmy_cluster::UnfitPath::ALL.len()
                 // The HNSW graphs served while rebuilt, the builds queued or
                 // running, and the highest sampled unreached score among the
                 // graphs built here (ADR-245).

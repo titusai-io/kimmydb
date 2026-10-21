@@ -165,27 +165,6 @@ const TABLES: &[Table] = &[
         why: "the 3 -> 4 markers: (collection, index) -> (); deleted in the first 4 -> 5 commit",
     },
     Table {
-        name: "idempotency",
-        class: Unchanged,
-        why: "(collection id, scope hash) -> record (ADR-240): stamps, counts, a find_and_modify's \
-              document as stored; a multi request's cursor is a stored DOCS key, written in the \
-              schema-5 form from the start (no build before schema 5 has the table), read back \
-              only by the member it names as origin, and only a saving: a resume writes nothing \
-              its stamp rule refuses, so a cursor in another form under-applies and never \
-              doubles (modify_chunk assembles it, record_done_alone carries it)",
-    },
-    Table {
-        name: "idempotency_by_stamp",
-        class: Unchanged,
-        why: "stamp -> collection id and scope hash (ADR-240); no key bytes",
-    },
-    Table {
-        name: "idempotency_changes",
-        class: Unchanged,
-        why: "the node-local change log of idempotency records (ADR-240): a minted stamp -> \
-              collection id and scope hash, and where the log begins; no key bytes",
-    },
-    Table {
         name: "partial_rebuilt_unique_violations",
         class: ReKeyed,
         why: "3 -> 4 holders in schema 4, converted into schema5_carried_collisions in the first \
@@ -307,12 +286,6 @@ const CALL_SITES: &[Site] = &[
     ),
     site("kimmy-storage/src/docs.rs", "record_stamp", Use::Stored, "a point read"),
     site(
-        "kimmy-storage/src/docs.rs",
-        "unless_tombstone_gone",
-        Use::Stored,
-        "a keyed delete's replay reads its tombstone's row (ADR-240)",
-    ),
-    site(
         "kimmy-storage/src/modify.rs",
         "modify_chunk",
         Use::Stored,
@@ -388,11 +361,7 @@ const PERSISTERS: &[Persister] = &[
         "create_collection_in_txn",
         "reads whether a drop's rows remain under the id; writes the definition",
     ),
-    persister(
-        "kimmy-storage/src/engine.rs",
-        "purge_chunk",
-        "removes rows (the collection's idempotency records stay); forgets the digest row",
-    ),
+    persister("kimmy-storage/src/engine.rs", "purge_chunk", "removes rows; forgets the digest row"),
     persister("kimmy-storage/src/index.rs", "drop_index_inner", "removes entries; writes a stamp"),
     persister(
         "kimmy-storage/src/late_drop.rs",

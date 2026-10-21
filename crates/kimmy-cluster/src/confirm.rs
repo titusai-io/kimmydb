@@ -43,50 +43,6 @@ pub const MAX_CONFIRM_BACKOFF: Duration = Duration::from_secs(60);
 /// member's writer (ADR-191).
 pub const REDIAL_GUARD: Duration = Duration::from_secs(1);
 
-/// Why a push sent nothing when the idempotency records its sender cannot
-/// vouch for by its oplog do not fit one frame (ADR-240): the window would carry no
-/// entries and grant nothing.
-const RECORDS_OVERFILL_UNREACHED: &str = "the idempotency records this node cannot vouch for by \
-     its oplog do not fit one frame; anti-entropy will carry the change once this node pulls \
-     their entries";
-
-/// Why a push sent nothing when not even its first entry fits one frame: with
-/// the idempotency records that ride it when some do, and otherwise beside the
-/// records the sender cannot vouch for by its oplog, or by itself.
-fn first_entry_unfit_unreached(
-    from: impl std::fmt::Debug,
-    riding: bool,
-    unanchored: bool,
-) -> String {
-    if riding {
-        format!(
-            "the member's first entry at or after {from:?} does not fit one frame with the \
-             idempotency records that ride it; anti-entropy will carry them"
-        )
-    } else if unanchored {
-        format!(
-            "the member's first entry at or after {from:?} does not fit one frame beside the \
-             idempotency records this node cannot vouch for by its oplog"
-        )
-    } else {
-        format!("the member's first entry at or after {from:?} does not fit one frame by itself")
-    }
-}
-
-/// Whether any record rides a window's first entry, as `how_many_fit` counts
-/// them: past the first `unanchored`, a record whose row is at or before that
-/// entry. One whose row is past every entry counts at the window's end instead.
-fn riding_the_first_entry(
-    entries: &[OplogEntry],
-    records: &[kimmy_storage::CarriedRecord],
-    unanchored: usize,
-) -> bool {
-    let Some(first) = entries.first() else { return false };
-    records[unanchored.min(records.len())..]
-        .iter()
-        .any(|record| record.carrying.is_some_and(|at| at <= first.stamp))
-}
-
 /// What a confirmation became on one member.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolution {
@@ -730,28 +686,12 @@ impl Confirmer {
             Ok(window) => window,
             Err(e) => return failed(crate::transport::from_storage(e, ProtocolError::Malformed)),
         };
-        let fits = how_many_fit(&window.entries, &window.records, window.unanchored);
-        if let Fits::Nothing = fits {
-            crate::transport::records_unfit().bump(crate::transport::UnfitPath::Push);
-            return PushResult::NothingSent {
-                their_node,
-                unreached: Some(RECORDS_OVERFILL_UNREACHED.into()),
-            };
-        }
-        if let Fits::Only(fits) = fits {
+        if let Fits::Only(fits) = how_many_fit(&window.entries) {
             if fits == 0 {
-                // No entry fits with the records riding the first, or the first
-                // is larger than a frame itself:
-                // nothing is pushed, and the waiters resolve pending. A pull's
-                // partial window of records alone carries such records.
-                return PushResult::NothingSent {
-                    their_node,
-                    unreached: Some(first_entry_unfit_unreached(
-                        from,
-                        riding_the_first_entry(&window.entries, &window.records, window.unanchored),
-                        window.unanchored > 0,
-                    )),
-                };
+                return failed(ProtocolError::Malformed(format!(
+                    "a single oplog entry at or after {from:?} exceeds the frame limit and \
+                     cannot replicate"
+                )));
             }
             // The same push read again to fit its frame, not a second push
             // window: it is not counted.
@@ -822,8 +762,6 @@ impl Confirmer {
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
             versions: mine.clone(),
-            // The records the window ships, read with it (ADR-240).
-            records: crate::transport::records_to_send(engine, window.records),
         };
         if let Err(e) = write_frame(&mut stream, &push).await {
             return sent_failure(e.to_string());
@@ -1111,57 +1049,6 @@ mod tests {
     use crate::transport::PushHook;
 
     const SECRET: &str = "a-confirm-test-secret";
-
-    /// A wrapped message literal reads as one sentence: a line break inside it
-    /// without its `\` continuation once carried the next line's indentation
-    /// into the message as a run of spaces.
-    #[test]
-    fn the_records_overfill_message_reads_as_one_sentence() {
-        let message = RECORDS_OVERFILL_UNREACHED;
-        assert!(!message.contains("  "), "a run of spaces: {message:?}");
-        assert!(message.ends_with("pulls their entries"), "{message:?}");
-    }
-
-    /// A push whose first entry does not fit one frame says why: the records
-    /// riding it only when some do, the records it cannot vouch for when those
-    /// are what it does not fit beside, and otherwise the entry by itself.
-    #[test]
-    fn a_first_entry_that_does_not_fit_says_whether_records_ride_it() {
-        let riding = first_entry_unfit_unreached(7, true, true);
-        assert!(riding.contains("with the idempotency records that ride it"), "{riding}");
-        let beside = first_entry_unfit_unreached(7, false, true);
-        assert!(beside.contains("beside the idempotency records this node cannot"), "{beside}");
-        assert!(!beside.contains("ride"), "{beside}");
-        let alone = first_entry_unfit_unreached(7, false, false);
-        assert!(alone.ends_with("does not fit one frame by itself"), "{alone}");
-        assert!(!alone.contains("record"), "{alone}");
-        for message in [riding, beside, alone] {
-            assert!(message.starts_with("the member's first entry at or after 7 "), "{message}");
-            assert!(!message.contains("  "), "a run of spaces: {message:?}");
-        }
-    }
-
-    /// A record rides the first entry when it is past the unvouched ones and
-    /// its row is at or before that entry; one carried by a later entry, one at
-    /// the window's end and an unvouched one do not.
-    #[test]
-    fn a_record_rides_the_first_entry_only_at_or_before_it() {
-        let record = |carrying: Option<Stamp>| kimmy_storage::CarriedRecord {
-            collection: CollectionId(1),
-            scope: kimmy_core::ScopeHash([7; 32]),
-            carrying,
-            record: Vec::new(),
-        };
-        let entries = [entry(stamp(10, 1), OpKind::Insert), entry(stamp(20, 1), OpKind::Insert)];
-        let at = |hlc| record(Some(stamp(hlc, 1)));
-        assert!(riding_the_first_entry(&entries, &[at(10)], 0));
-        assert!(riding_the_first_entry(&entries, &[at(5)], 0));
-        assert!(!riding_the_first_entry(&entries, &[at(20)], 0), "a later entry carries it");
-        assert!(!riding_the_first_entry(&entries, &[record(None)], 0), "at the window's end");
-        assert!(!riding_the_first_entry(&entries, &[at(10)], 1), "an unvouched record");
-        assert!(riding_the_first_entry(&entries, &[at(30), at(10)], 1));
-        assert!(!riding_the_first_entry(&[], &[at(10)], 0), "no entry");
-    }
 
     /// What a serving member's push hook saw: each window's schema changes
     /// applied and entries deferred, in order; and levers to hold its answer
@@ -2055,62 +1942,6 @@ mod tests {
                 assert!(reason.contains("ran past its budget"), "{reason}");
             }
             other => panic!("not left to anti-entropy for the budget: {other:?}"),
-        }
-        assert_eq!(a.pushes.load(Ordering::SeqCst), 0, "no Push frame was sent");
-        assert!(b.served.windows().is_empty(), "the member was sent no window");
-    }
-
-    /// A push none of whose entries fits one frame
-    /// with the idempotency records riding its first sends nothing and leaves the
-    /// change to anti-entropy, whose partial windows carry such records alone,
-    /// rather than failing as an entry that cannot replicate.
-    #[tokio::test]
-    async fn a_push_whose_first_entry_cannot_cross_with_its_records_sends_nothing() {
-        let b = member().await;
-        let a = pusher_for(&b, quick());
-        let node = b.engine.node_id();
-        let orders = a.engine.get_collection("shop", "orders").unwrap();
-        let me = a.engine.node_id();
-        let base = a.engine.version_vector().unwrap().get(me);
-        let pad = "p".repeat(1_000);
-        for k in 0..40u16 {
-            let at = Stamp::new(Hlc::new(base.wall_ms + 1, k), me);
-            let record = kimmy_storage::IdempotencyRecord {
-                fingerprint: kimmy_core::Fingerprint([3; 32]),
-                first: at,
-                last: at,
-                origin: me,
-                state: kimmy_storage::RecordState::Done,
-                contested: false,
-                outcome: kimmy_storage::RecordOutcome::FindAndModify {
-                    matched: true,
-                    modified: true,
-                    removed: false,
-                    upserted_id: None,
-                    stamp: Some(at),
-                    document: Some(bson::doc! { "pad": pad.clone() }),
-                },
-            };
-            let mut scope = [3u8; 32];
-            scope[30..].copy_from_slice(&k.to_be_bytes());
-            let carried = kimmy_storage::CarriedRecord {
-                collection: orders.id,
-                scope: kimmy_core::ScopeHash(scope),
-                carrying: Some(at),
-                record: record.encode(),
-            };
-            a.engine
-                .apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull)
-                .unwrap();
-        }
-        crate::transport::TEST_ENTRY_BUDGET.with(|budget| budget.set(Some(8 * 1024)));
-        let one = a.confirmer.confirm(b.addr, node, create(&a.engine, "e1"), DEADLINE).await;
-        crate::transport::TEST_ENTRY_BUDGET.with(|budget| budget.set(None));
-        match &one {
-            Resolution::Pending { outcome: ConfirmOutcome::Unreached, reason } => {
-                assert!(reason.contains("with the idempotency records that ride it"), "{reason}");
-            }
-            other => panic!("not left to anti-entropy for the records: {other:?}"),
         }
         assert_eq!(a.pushes.load(Ordering::SeqCst), 0, "no Push frame was sent");
         assert!(b.served.windows().is_empty(), "the member was sent no window");
