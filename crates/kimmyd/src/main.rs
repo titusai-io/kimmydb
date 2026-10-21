@@ -4,8 +4,6 @@ mod cli;
 mod config;
 mod facts;
 mod front;
-#[cfg(feature = "lab-hooks")]
-mod lab_hooks;
 mod lifecycle;
 mod logging;
 mod node;

@@ -32,11 +32,6 @@ use tracing::{Level, error, info, warn};
 /// The `Retry-After` a `collection_purging` refusal carries, in seconds.
 pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
 
-/// The `Retry-After` an `idempotency_key_in_flight` refusal carries, in
-/// seconds (ADR-240): a chunk of a multi-document write commits in far less, so a
-/// second is a wait that usually finds the request done.
-pub const IDEMPOTENCY_KEY_IN_FLIGHT_RETRY_AFTER_SECS: u64 = 1;
-
 /// Every code the API can return, and nothing else.
 ///
 /// **Adding a variant here also means a change in the client libraries**, which
@@ -108,21 +103,6 @@ pub enum ErrorCode {
     /// (`kimmy_egress::MAX_LOOKUPS_IN_FLIGHT` and
     /// `MAX_REQUEST_LOOKUPS_IN_FLIGHT`). Nothing was done.
     ResolverBusy,
-    /// An `Idempotency-Key` this member remembers for a different request:
-    /// another body, path, query or method under the same key, collection and
-    /// principal (ADR-240). Nothing was written.
-    IdempotencyKeyReused,
-    /// A multi-chunk request with this `Idempotency-Key` is still running on
-    /// this member (ADR-240). Nothing was written; once it ends, the same request
-    /// is answered from its record.
-    IdempotencyKeyInFlight,
-    /// A gate that reads every live member's facts block (ADR-201) is closed
-    /// only because a live member has not been heard from yet: it came up, or
-    /// this member saw it rejoin, a moment ago, and its block arrives at the
-    /// next contact. The idempotency-key gate (ADR-240) and the `Decimal128` gate
-    /// (ADR-238). Nothing was written; the same request, sent
-    /// again after `Retry-After`, is taken once it has been heard.
-    PeerUnheard,
 }
 
 /// What a client may do about a failure.
@@ -211,7 +191,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 29] = [
+    pub const ALL: [ErrorCode; 26] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -238,9 +218,6 @@ impl ErrorCode {
         Self::Starting,
         Self::CatchingUp,
         Self::ResolverBusy,
-        Self::IdempotencyKeyReused,
-        Self::IdempotencyKeyInFlight,
-        Self::PeerUnheard,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -272,9 +249,6 @@ impl ErrorCode {
             Self::Starting => "starting",
             Self::CatchingUp => "catching_up",
             Self::ResolverBusy => "resolver_busy",
-            Self::IdempotencyKeyReused => "idempotency_key_reused",
-            Self::IdempotencyKeyInFlight => "idempotency_key_in_flight",
-            Self::PeerUnheard => "peer_unheard",
         }
     }
 
@@ -301,11 +275,7 @@ impl ErrorCode {
             // The document moved on. The client re-reads, decides again, and
             // sends a *different* request carrying the new stamp; repeating
             // this one can only fail the same way.
-            | Self::Stale
-            // The key names another request on this member until its memory
-            // ends, so the same request under it fails the same way: the
-            // client's bug, a key reused for different work (draft-07 §2.7).
-            | Self::IdempotencyKeyReused => Retry::No,
+            | Self::Stale => Retry::No,
 
             // `not_implemented` has two sources and takes the conservative
             // answer. `CoreError::Unsupported` is a capability that exists
@@ -337,17 +307,6 @@ impl ErrorCode {
             // remembered for `Retry-After`'s 5 s, so a retry sooner gets the
             // same answer.
             Self::ResolverBusy => Retry::Wait,
-            // The request with this key is running here and ends by itself; the
-            // same request sent once it has is answered from its record. Not
-            // `elsewhere`: another member that has not received the record
-            // would apply the request a second time (ADR-240, guarantee 3).
-            Self::IdempotencyKeyInFlight => Retry::Wait,
-            // The peer's block arrives with its next contact, about a sync
-            // interval away, and the gate opens here then. Not `elsewhere`: a
-            // keyed retry must stay on the member that may hold its record
-            // (ADR-240, guarantee 3), and every member that restarted or saw a
-            // rejoin is in the same window.
-            Self::PeerUnheard => Retry::Wait,
             // It may already have happened, and replicates if it did: read
             // before resending, which neither waiting nor moving replaces.
             Self::OutcomeUnknown => Retry::Verify,
@@ -415,14 +374,7 @@ impl ErrorCode {
             | Self::Stale
             // Expected, bounded and explained by the response itself; the
             // drop purger's own log lines are the operator's record.
-            | Self::CollectionPurging
-            // Expected after every restart and rejoin, bounded by a sync
-            // interval and explained by the response itself. A peer that stays
-            // unheard is the operator's to see, and membership already warns
-            // of one once it has been unheard for more than a lease;
-            // `kimmy_idempotency_requests_total{outcome="gated"}` counts the
-            // keyed ones.
-            | Self::PeerUnheard => None,
+            | Self::CollectionPurging => None,
 
             // Reserved and unbuilt, by default. The reference says this will
             // be refused, the caller asked for it anyway, and there is no
@@ -440,14 +392,6 @@ impl ErrorCode {
             // whole code to suit its commoner source would have hidden that
             // one, which is the failure this level split exists to prevent.
             Self::NotImplemented => Some(LogLevel::Info),
-
-            // A key at work, not a fault: a reused key is a client's bug the
-            // answer names, and a duplicate of a running request waits it out.
-            // `INFO` rather than `None` because both say something about how
-            // clients use keys that an operator sizing up a retry storm or a
-            // key generator should be able to see; `kimmy_idempotency_requests_total`
-            // counts them without the line.
-            Self::IdempotencyKeyReused | Self::IdempotencyKeyInFlight => Some(LogLevel::Info),
 
             // An upstream embedding provider failed, and the comment on
             // `retry()` above says whose fault that is: the upstream's. No
@@ -853,47 +797,6 @@ impl ApiError {
         e
     }
 
-    /// `422 idempotency_key_reused` (ADR-240): the key is remembered here for a
-    /// request whose fingerprint differs from this one's, or its record is
-    /// contested, two requests having met under it
-    /// (`StorageError::IdempotencyKeyReused`).
-    pub fn idempotency_key_reused() -> Self {
-        Self::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            ErrorCode::IdempotencyKeyReused,
-            "this Idempotency-Key was used for a different request (another body, path, query or \
-             method) and is remembered for that one; nothing was written. Use a new key for a \
-             new request",
-        )
-    }
-
-    /// `409 idempotency_key_in_flight` (ADR-240): a multi-chunk request with this
-    /// key is running on this member. `Retry-After: 1`: the request ends by
-    /// itself, and the same request sent then is answered from its record
-    /// (`StorageError::IdempotencyKeyInFlight`).
-    pub fn idempotency_key_in_flight() -> Self {
-        Self {
-            retry_after_secs: Some(IDEMPOTENCY_KEY_IN_FLIGHT_RETRY_AFTER_SECS),
-            ..Self::new(
-                StatusCode::CONFLICT,
-                ErrorCode::IdempotencyKeyInFlight,
-                "a request with this Idempotency-Key is still running on this member; nothing \
-                 was written. Send it again once it has finished, here: it is then answered \
-                 from its record",
-            )
-        }
-    }
-
-    /// `503 peer_unheard`, `retry: wait` (see [`ErrorCode::PeerUnheard`]): a
-    /// gate closed only because a live member has not been heard from yet.
-    /// `Retry-After` is the gate's own figure, a fixed second, never 0; `message` is the gate's words, which name the member.
-    pub fn peer_unheard(message: impl Into<String>, retry_after_secs: u64) -> Self {
-        Self {
-            retry_after_secs: Some(retry_after_secs.max(1)),
-            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::PeerUnheard, message)
-        }
-    }
-
     /// A request this node did not complete, because it is stopping: a write
     /// it did not begin (ADR-192), or a walk that ended at the drain's
     /// deadline. Nothing was written. `503 node_stopping`, and `elsewhere`: the node is
@@ -1073,15 +976,9 @@ impl From<CoreError> for ApiError {
             // A creation this member will not persist yet (ADR-238): the
             // request names a `Decimal128` id or partial-filter bound, and
             // the answer names `cluster.decimal128` and any peer that holds
-            // it back. A live peer not heard from yet, with no held block
-            // saying no, ends by itself within about a contact: `503
-            // peer_unheard`, with the gate's `Retry-After`. Every other cause
-            // lasts until the operator or the roll acts, so 400, never a retry
-            // hint: repeating it changes nothing until then.
-            CoreError::Decimal128Gated { closed, .. } => match closed.retry_after_secs() {
-                Some(secs) => ApiError::peer_unheard(e.to_string(), secs),
-                None => ApiError::bad_request(e.to_string()),
-            },
+            // it back. The caller's to act on, so 400, never a retry hint:
+            // repeating it changes nothing until the operator acts.
+            CoreError::Decimal128Gated { .. } => ApiError::bad_request(e.to_string()),
             CoreError::ResumeTokenExpired => {
                 ApiError::new(StatusCode::GONE, ErrorCode::ResumeTokenExpired, e.to_string())
             }
@@ -1126,12 +1023,6 @@ impl From<StorageError> for ApiError {
             // its own. Nothing was written, as with a busy writer, and this
             // node is going away: another member serves.
             StorageError::Stopping(reason) => ApiError::node_stopping(reason),
-            // The two answers a key can draw from the engine (ADR-240). Nothing was
-            // written either way: a key used for another request is the
-            // client's to fix, and a request still running with it ends by
-            // itself.
-            StorageError::IdempotencyKeyReused => ApiError::idempotency_key_reused(),
-            StorageError::IdempotencyKeyInFlight => ApiError::idempotency_key_in_flight(),
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.
@@ -1241,7 +1132,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 29] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 26] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1257,15 +1148,9 @@ mod tests {
             (RateLimited, None),
             (Stale, None),
             (CollectionPurging, None),
-            // A peer not heard from yet: bounded, explained, and warned of by
-            // membership once it lasts a lease.
-            (PeerUnheard, None),
             // Refused on purpose, with no operator action to take. The
             // default only: `vectors.rs` raises its own source above this.
             (NotImplemented, Some(LogLevel::Info)),
-            // A key at work (ADR-240): seen, never a fault.
-            (IdempotencyKeyReused, Some(LogLevel::Info)),
-            (IdempotencyKeyInFlight, Some(LogLevel::Info)),
             // Somebody else's fault, or nobody's; a rise is the finding.
             (ProviderError, Some(LogLevel::Warn)),
             (Timeout, Some(LogLevel::Warn)),
@@ -1708,73 +1593,5 @@ mod tests {
         assert_eq!(cause_of(&failed), "storage_failed");
         assert_eq!(failed.log_level(), Some(LogLevel::Error));
         assert!(!failed.message.contains("shutdown deadline"), "{}", failed.message);
-    }
-
-    /// The two answers a key can draw (ADR-240), as a client meets them: the draft's
-    /// statuses (§2.7), the envelope's retry class, and `Retry-After: 1` on the
-    /// one that says to wait. Neither names the key: it is the client's own, and
-    /// the line it logs is read by an operator.
-    #[tokio::test]
-    async fn the_two_key_answers_carry_their_status_retry_and_wait() {
-        let response = ApiError::idempotency_key_reused().into_response();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(response.headers().get(axum::http::header::RETRY_AFTER).is_none());
-        let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "idempotency_key_reused");
-        assert_eq!(body["retry"], "no");
-        assert!(body["message"].as_str().unwrap().contains("Idempotency-Key"), "{body}");
-
-        let response = ApiError::idempotency_key_in_flight().into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            response.headers().get(axum::http::header::RETRY_AFTER).map(|v| v.to_str().unwrap()),
-            Some("1")
-        );
-        let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "idempotency_key_in_flight");
-        assert_eq!(body["retry"], "wait");
-    }
-
-    /// A gated `Decimal128` creation as a client meets it: `503 peer_unheard`,
-    /// `retry: wait` and the gate's `Retry-After` while a live member is only not
-    /// heard from yet, and `400 bad_request`, `retry: no` and no `Retry-After`
-    /// for every cause that lasts.
-    #[tokio::test]
-    async fn a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise() {
-        use kimmy_core::{Decimal128Closed, Decimal128Use};
-        let gated = |closed| CoreError::Decimal128Gated { what: Decimal128Use::Id, closed };
-        let unheard =
-            Decimal128Closed::Unheard { peers: vec!["peer-c".into()], retry_after_secs: 4 };
-        let response = ApiError::from(gated(unheard)).into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers().get(axum::http::header::RETRY_AFTER).map(|v| v.to_str().unwrap()),
-            Some("4"),
-            "the gate's own wait"
-        );
-        let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!((&body["error"], &body["retry"]), (&json!("peer_unheard"), &json!("wait")));
-        assert!(body["message"].as_str().unwrap().contains("peer-c"), "{body}");
-
-        for lasting in [
-            Decimal128Closed::Undeclared,
-            Decimal128Closed::Peers(vec!["peer-c".into()]),
-            Decimal128Closed::Unseen("membership is off"),
-        ] {
-            let response = ApiError::from(gated(lasting.clone())).into_response();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{lasting:?}");
-            assert!(response.headers().get(axum::http::header::RETRY_AFTER).is_none());
-            let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!((&body["error"], &body["retry"]), (&json!("bad_request"), &json!("no")));
-        }
-        assert_eq!(
-            ApiError::peer_unheard("x", 0).retry_after_secs,
-            Some(1),
-            "never a Retry-After of 0"
-        );
     }
 }

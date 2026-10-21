@@ -1547,20 +1547,7 @@ mod tests {
     }
 
     /// This process's peak resident set, in KiB.
-    ///
-    /// On Linux the peak is read from the process's own `VmHWM`: a child
-    /// started from a large parent (the whole test run) inherits the parent's
-    /// `ru_maxrss` across exec, so `getrusage` would report the parent's peak.
     fn max_rss_kib() -> u64 {
-        #[cfg(target_os = "linux")]
-        if let Some(kib) = std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("VmHWM:"))
-                .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
-        }) {
-            return kib;
-        }
         // SAFETY: `getrusage` fills the struct it is given and reads nothing.
         let usage = unsafe {
             let mut usage: libc::rusage = std::mem::zeroed();

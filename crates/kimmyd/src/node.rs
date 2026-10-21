@@ -826,9 +826,6 @@ async fn start_and_serve(
             lifecycle::rebuilt(&config.storage.data_dir);
             opened.store(true, std::sync::atomic::Ordering::SeqCst);
             let engine = Arc::new(engine);
-            // The idempotency cluster tests' lab hooks (a build with the `lab-hooks` feature only).
-            #[cfg(feature = "lab-hooks")]
-            crate::lab_hooks::arm(&engine);
             // Kept for `run` from the moment the store is open, so that whatever
             // fails after it closes the store as a stop does: opened implies
             // kept, with no gap between.
@@ -864,10 +861,6 @@ async fn start_and_serve(
             .context("writing the replay floor")?;
     }
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
-    // An idempotency key is remembered for the oplog's window (ADR-240):
-    // the lookup treats a record past it as absent, at the cutoff the retention
-    // pass collects it at, so the two read one setting.
-    engine.set_idempotency_window(config.storage.oplog_retention_secs);
     // Validation already refused anything else; the fallback is only so a
     // future class name cannot silently mean "durable".
     let class = kimmy_storage::DurabilityClass::parse(&config.storage.durability)
@@ -1121,17 +1114,6 @@ async fn start_and_serve(
     // Before any task that reads it is spawned: expiry and the dispatcher take the
     // marker from the state when they start.
     state.set_catch_up(Arc::clone(&catch_up));
-    // The gate on `Idempotency-Key` (ADR-240), installed before anything serves: the
-    // operator's switch now, the live member set once the cluster is up (until
-    // then a clustered member refuses keys, failing closed). And how long this
-    // member remembers a key, which `GET /v1/version` publishes.
-    let idempotency = kimmy_cluster::IdempotencyGate::new(
-        config.cluster.idempotency_keys(),
-        config.cluster.enabled,
-        config.cluster.membership,
-    );
-    state.set_idempotency_gate(idempotency.predicate());
-    state.set_idempotency_window_secs(config.storage.oplog_retention_secs);
 
     // The yield evaluator's pieces (ADR-213), built before anything sends a block:
     // with probation its start decision (every class stalled, the yield bits set)
@@ -1357,7 +1339,6 @@ async fn start_and_serve(
     // constructor argument.
     if let Some(members) = cluster.members.clone() {
         decimal128.set_members(members.clone());
-        idempotency.set_members(members.clone());
         state.set_members(members);
     }
 
@@ -3256,9 +3237,6 @@ fn spawn_collector(
                 Ok(outcome) => info!(
                     oplog = outcome.oplog_removed,
                     tombstones = outcome.tombstones_removed,
-                    // Idempotency records (ADR-240), collected on the oplog's
-                    // window, so a pass that removed only these still says so.
-                    idempotency_records = outcome.records_removed,
                     elapsed_ms = elapsed.as_millis() as u64,
                     "collected expired records"
                 ),
@@ -3492,38 +3470,6 @@ mod tests {
         let open = source.find("Engine::open_with(&path, &options)").expect("the open");
         assert!(open < built && built < installed, "built from the opened engine's config");
         assert!(installed < handed && handed < serving, "installed and handed before serving");
-    }
-
-    /// The `Idempotency-Key` gate (ADR-240) is built from the switch, the clustering
-    /// switch and the membership switch, installed on the API state before the
-    /// router serves, and handed the live member set beside the routes; the
-    /// window is the configured oplog retention. A source check, as the
-    /// `Decimal128` gate's is: the gate's answers are tested in `kimmy-cluster`
-    /// and over HTTP in `kimmy-api`, and what this pins is that the node builds
-    /// it from the right inputs and in the right place.
-    #[test]
-    fn the_idempotency_gate_is_installed_from_the_switch_before_anything_serves() {
-        let source = include_str!("node.rs");
-        let built = source
-            .find(
-                "kimmy_cluster::IdempotencyGate::new(\n        config.cluster.idempotency_keys(),\n        \
-                 config.cluster.enabled,\n        config.cluster.membership,\n    );",
-            )
-            .expect("the gate built from the switch, clustering and membership");
-        let state = source.find("let state = kimmy_api::state_with_policies(").expect("the state");
-        let installed =
-            source.find("state.set_idempotency_gate(idempotency.predicate());").expect("installed");
-        let window = source
-            .find("state.set_idempotency_window_secs(config.storage.oplog_retention_secs);")
-            .expect("the window");
-        let handed = source.find("idempotency.set_members(members.clone());").expect("handed");
-        let router = source
-            .find("kimmy_api::router_with_limits(Arc::clone(&state), mcp")
-            .expect("the router");
-        let serving = source.find("front.install(app);").expect("the swap to serving");
-        assert!(state < built && built < installed, "built after the state, then installed");
-        assert!(installed < router && window < router, "before the router is built");
-        assert!(handed < serving, "handed the members before serving");
     }
 
     /// **The stop freezes the yield evaluator first** (ADR-213, B9): at the stop's

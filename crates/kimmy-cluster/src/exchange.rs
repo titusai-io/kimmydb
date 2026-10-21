@@ -179,7 +179,7 @@ where
     match frame {
         Message::Vectors { facts, facts_gen, echo, .. } => {
             if undecodable {
-                members.note_undecodable(their_node, decoded_seq, Instant::now());
+                members.note_undecodable(their_node, Instant::now());
             }
             if let Some(facts) = facts {
                 members.record_peer_facts(

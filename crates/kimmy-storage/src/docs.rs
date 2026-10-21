@@ -20,9 +20,6 @@ use tracing::warn;
 use crate::codec;
 use crate::engine::{Engine, Position, WriteTxn, WriterHolder, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
-use crate::idempotency::{
-    Found, IdempotencyRecord, Keyed, KeyedWrite, OutcomeKind, Owner, RecordOutcome,
-};
 use crate::index;
 use crate::meta::CollectionMeta;
 use crate::tables;
@@ -502,44 +499,7 @@ impl Engine {
     /// [`Engine::insert`], also returning the stamp the write produced — the
     /// version a caller needs for a conditional write that follows.
     pub fn insert_stamped(&self, coll: &CollectionMeta, doc: Document) -> Result<(DocId, Stamp)> {
-        self.insert_one(coll, doc, None).map(crate::idempotency::unkeyed)
-    }
-
-    /// [`Engine::insert_stamped`] under an idempotency key (ADR-240, see
-    /// [`crate::idempotency`]): the first attempt's record replays it, and a
-    /// document without `_id` is given the key's derived one for position 0.
-    pub fn insert_keyed(
-        &self,
-        coll: &CollectionMeta,
-        doc: Document,
-        keyed: &KeyedWrite,
-    ) -> Result<Keyed<(DocId, Stamp)>> {
-        self.insert_one(coll, doc, Some(keyed))
-    }
-
-    /// The one body of an insert, keyed or not.
-    fn insert_one(
-        &self,
-        coll: &CollectionMeta,
-        mut doc: Document,
-        keyed: Option<&KeyedWrite>,
-    ) -> Result<Keyed<(DocId, Stamp)>> {
         let txn = self.begin_write(WriterHolder::Write)?;
-        if let Some(keyed) = keyed {
-            match self.keyed_lookup(&txn, coll, keyed, Owner::No) {
-                Ok(Found::Absent) => {}
-                Ok(Found::Done(record) | Found::Applying(record)) => {
-                    return self.replay(txn, coll, record, OutcomeKind::Insert);
-                }
-                Err(e) => {
-                    txn.abort()?;
-                    return Err(e);
-                }
-            }
-            if !doc.contains_key(ID_FIELD) {
-                doc.insert(ID_FIELD, keyed.derived_id(coll.id, 0));
-            }
-        }
         let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
             Ok(pair) => pair,
             Err(e) => {
@@ -547,23 +507,11 @@ impl Engine {
                 return Err(e);
             }
         };
-        let stamp = entry.stamp;
-        // In the write's own transaction: the record survives exactly what the
-        // write survives (ADR-240).
-        if let Some(keyed) = keyed {
-            let outcome = RecordOutcome::Insert { stamp };
-            let record = IdempotencyRecord::written(keyed, stamp, self.node_id(), outcome);
-            if let Err(e) = self.put_record(&txn, coll.id, &keyed.scope, None, &record) {
-                txn.abort()?;
-                return Err(e);
-            }
-        }
         txn.commit()?;
-        #[cfg(test)]
-        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::KeyedCommitted);
+        let stamp = entry.stamp;
         self.publish(vec![entry]);
 
-        Ok(Keyed::Fresh((id, stamp)))
+        Ok((id, stamp))
     }
 
     /// Insert many documents in a single transaction, or none of them.
@@ -595,58 +543,14 @@ impl Engine {
         coll: &CollectionMeta,
         docs: Vec<Document>,
     ) -> std::result::Result<Vec<(DocId, Stamp)>, BulkInsertError> {
-        self.insert_batch(coll, docs, None).map(crate::idempotency::unkeyed)
-    }
-
-    /// [`Engine::insert_many_stamped`] under an idempotency key (ADR-240): one key,
-    /// one record for the batch, which is one transaction. A document without
-    /// `_id` is given the key's derived one for its position in the batch.
-    /// The record keeps the stamps and no ids: a replay's body is the first
-    /// attempt's, so its ids are the body's or derived again.
-    pub fn insert_many_keyed(
-        &self,
-        coll: &CollectionMeta,
-        docs: Vec<Document>,
-        keyed: &KeyedWrite,
-    ) -> std::result::Result<Keyed<Vec<(DocId, Stamp)>>, BulkInsertError> {
-        self.insert_batch(coll, docs, Some(keyed))
-    }
-
-    /// The one body of a bulk insert, keyed or not.
-    fn insert_batch(
-        &self,
-        coll: &CollectionMeta,
-        docs: Vec<Document>,
-        keyed: Option<&KeyedWrite>,
-    ) -> std::result::Result<Keyed<Vec<(DocId, Stamp)>>, BulkInsertError> {
         // Nothing to do, and nothing to log: an empty batch must not open a
         // transaction, or it would append an oplog entry for a write that
-        // never happened. A keyed one still asks its record, so a key reused
-        // with an empty body is refused as with any other, and writes none.
-        if docs.is_empty() && keyed.is_none() {
-            return Ok(Keyed::Fresh(Vec::new()));
+        // never happened.
+        if docs.is_empty() {
+            return Ok(Vec::new());
         }
 
         let txn = self.begin_write(WriterHolder::Bulk).map_err(BulkInsertError::transaction)?;
-
-        if let Some(keyed) = keyed {
-            match self.keyed_lookup(&txn, coll, keyed, Owner::No) {
-                Ok(Found::Absent) => {}
-                Ok(Found::Done(record) | Found::Applying(record)) => {
-                    return self
-                        .replay(txn, coll, record, OutcomeKind::Bulk)
-                        .map_err(BulkInsertError::transaction);
-                }
-                Err(e) => {
-                    txn.abort().map_err(BulkInsertError::transaction)?;
-                    return Err(BulkInsertError::transaction(e));
-                }
-            }
-            if docs.is_empty() {
-                txn.abort().map_err(BulkInsertError::transaction)?;
-                return Ok(Keyed::Fresh(Vec::new()));
-            }
-        }
 
         // First every document is checked, in order, against the stored state
         // and against the ones before it in the batch, and filed in the
@@ -655,12 +559,7 @@ impl Engine {
         // the clock where it was, as a lone refused insert does.
         let mut seen = std::collections::HashSet::with_capacity(docs.len());
         let mut pending = Vec::with_capacity(docs.len());
-        for (index, mut doc) in docs.into_iter().enumerate() {
-            if let Some(keyed) = keyed
-                && !doc.contains_key(ID_FIELD)
-            {
-                doc.insert(ID_FIELD, keyed.derived_id(coll.id, index as u64));
-            }
+        for (index, doc) in docs.into_iter().enumerate() {
             // Each document is checked against this transaction's own
             // uncommitted writes, so two documents colliding *within* the batch
             // are caught by exactly the checks that catch a collision with
@@ -691,28 +590,10 @@ impl Engine {
             }
         }
 
-        // From the batch's first entry to its last (L1), in the batch's
-        // transaction (ADR-240).
-        if let Some(keyed) = keyed {
-            let stamps: Vec<Stamp> = ids.iter().map(|(_, stamp)| *stamp).collect();
-            let (first, last) = (stamps[0], stamps[stamps.len() - 1]);
-            let record = IdempotencyRecord::written_through(
-                keyed,
-                first,
-                last,
-                self.node_id(),
-                RecordOutcome::Bulk { stamps },
-            );
-            if let Err(e) = self.put_record(&txn, coll.id, &keyed.scope, None, &record) {
-                txn.abort().map_err(BulkInsertError::transaction)?;
-                return Err(BulkInsertError::transaction(e));
-            }
-        }
-
         txn.commit().map_err(BulkInsertError::transaction)?;
         self.publish(entries);
 
-        Ok(Keyed::Fresh(ids))
+        Ok(ids)
     }
 
     /// The whole of an insert except the transaction's lifecycle.
@@ -864,73 +745,19 @@ impl Engine {
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
-        self.replace_one(coll, id, doc, upsert, expected, None).map(crate::idempotency::unkeyed)
-    }
-
-    /// [`Engine::replace_if`] under an idempotency key (ADR-240). The record is
-    /// looked up before the version check, so a retry whose `expected` the
-    /// first attempt moved on from is answered from the record and not `Stale`.
-    pub fn replace_keyed(
-        &self,
-        coll: &CollectionMeta,
-        id: &DocId,
-        doc: Document,
-        upsert: bool,
-        expected: Option<Stamp>,
-        keyed: &KeyedWrite,
-    ) -> Result<Keyed<WriteOutcome>> {
-        self.replace_one(coll, id, doc, upsert, expected, Some(keyed))
-    }
-
-    /// The one body of a replace by id, keyed or not.
-    fn replace_one(
-        &self,
-        coll: &CollectionMeta,
-        id: &DocId,
-        doc: Document,
-        upsert: bool,
-        expected: Option<Stamp>,
-        keyed: Option<&KeyedWrite>,
-    ) -> Result<Keyed<WriteOutcome>> {
         let txn = self.begin_write(WriterHolder::Write)?;
-        if let Some(keyed) = keyed {
-            match self.keyed_lookup(&txn, coll, keyed, Owner::No) {
-                Ok(Found::Absent) => {}
-                Ok(Found::Done(record) | Found::Applying(record)) => {
-                    return self.replay(txn, coll, record, OutcomeKind::Replace);
-                }
-                Err(e) => {
-                    txn.abort()?;
-                    return Err(e);
-                }
-            }
-        }
         match self.replace_in_txn(&txn, coll, id, doc, upsert, expected) {
             Ok((outcome, Some(entry))) => {
-                if let Some(keyed) = keyed {
-                    let recorded = RecordOutcome::Replace {
-                        matched: outcome.matched,
-                        modified: outcome.modified,
-                        upserted: outcome.upserted,
-                        stamp: outcome.stamp,
-                    };
-                    let record =
-                        IdempotencyRecord::written(keyed, entry.stamp, self.node_id(), recorded);
-                    if let Err(e) = self.put_record(&txn, coll.id, &keyed.scope, None, &record) {
-                        txn.abort()?;
-                        return Err(e);
-                    }
-                }
                 txn.commit()?;
                 self.publish(vec![entry]);
-                Ok(Keyed::Fresh(outcome))
+                Ok(outcome)
             }
             // Unmatched and not an upsert, or a body identical to the stored
             // one (ADR-208): nothing was written, so nothing is committed —
-            // a miss or a no-op must not cost an fsync, and leaves no record.
+            // a miss or a no-op must not cost an fsync.
             Ok((outcome, None)) => {
                 txn.abort()?;
-                Ok(Keyed::Fresh(outcome))
+                Ok(outcome)
             }
             Err(e) => {
                 txn.abort()?;
@@ -1077,8 +904,7 @@ impl Engine {
     /// arrives from a peer later; removing the key outright would make that
     /// insert look brand new and silently undo the delete.
     pub fn delete(&self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
-        let deleted = self.delete_where(WriterHolder::Write, coll, id, None, |_, _| Ok(true))?;
-        Ok(crate::idempotency::unkeyed(deleted).is_some())
+        Ok(self.delete_where(WriterHolder::Write, coll, id, |_, _| Ok(true))?.is_some())
     }
 
     /// [`Engine::delete`], conditional on the document's current version,
@@ -1097,44 +923,20 @@ impl Engine {
         id: &DocId,
         expected: Option<Stamp>,
     ) -> Result<Option<Stamp>> {
-        self.delete_by_id(coll, id, expected, None).map(crate::idempotency::unkeyed)
-    }
-
-    /// [`Engine::delete_if`] under an idempotency key (ADR-240). Replayed only
-    /// while the request's own tombstone, or a later version, stands: once it
-    /// is collected, the retry runs afresh (see [`crate::idempotency`]).
-    pub fn delete_keyed(
-        &self,
-        coll: &CollectionMeta,
-        id: &DocId,
-        expected: Option<Stamp>,
-        keyed: &KeyedWrite,
-    ) -> Result<Keyed<Option<Stamp>>> {
-        self.delete_by_id(coll, id, expected, Some(keyed))
-    }
-
-    /// The one body of a delete by id, keyed or not.
-    fn delete_by_id(
-        &self,
-        coll: &CollectionMeta,
-        id: &DocId,
-        expected: Option<Stamp>,
-        keyed: Option<&KeyedWrite>,
-    ) -> Result<Keyed<Option<Stamp>>> {
         let Some(expected) = expected else {
-            return self.delete_where(WriterHolder::Write, coll, id, keyed, |_, _| Ok(true));
+            return self.delete_where(WriterHolder::Write, coll, id, |_, _| Ok(true));
         };
         // The absent case is decided here rather than in the guard, which
         // only ever sees a live document.
-        match self.delete_where(WriterHolder::Write, coll, id, keyed, |current, _| {
+        match self.delete_where(WriterHolder::Write, coll, id, |current, _| {
             if current == expected {
                 Ok(true)
             } else {
                 Err(StorageError::Stale { current: Some(current) })
             }
         })? {
-            Keyed::Fresh(None) => Err(StorageError::Stale { current: None }),
-            answer => Ok(answer),
+            Some(stamp) => Ok(Some(stamp)),
+            None => Err(StorageError::Stale { current: None }),
         }
     }
 
@@ -1157,9 +959,7 @@ impl Engine {
         // The expiry pass's own hold, not a client's: a TTL delete costs the
         // same transaction as a client's delete, and an operator asking what
         // held the writer needs the two apart (ADR-159).
-        let deleted =
-            self.delete_where(WriterHolder::Expiry, coll, id, None, |_, doc| Ok(guard(doc)))?;
-        Ok(crate::idempotency::unkeyed(deleted).is_some())
+        Ok(self.delete_where(WriterHolder::Expiry, coll, id, |_, doc| Ok(guard(doc)))?.is_some())
     }
 
     /// One delete body, shared by `delete`, `delete_if` and `delete_guarded`:
@@ -1182,89 +982,28 @@ impl Engine {
         holder: WriterHolder,
         coll: &CollectionMeta,
         id: &DocId,
-        keyed: Option<&KeyedWrite>,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
-    ) -> Result<Keyed<Option<Stamp>>> {
+    ) -> Result<Option<Stamp>> {
         let txn = self.begin_write(holder)?;
-        if let Some(keyed) = keyed {
-            let found = self
-                .keyed_lookup(&txn, coll, keyed, Owner::No)
-                .and_then(|found| self.unless_tombstone_gone(&txn, coll, id, found));
-            match found {
-                Ok(Found::Absent) => {}
-                Ok(Found::Done(record) | Found::Applying(record)) => {
-                    return self.replay(txn, coll, record, OutcomeKind::Delete);
-                }
-                Err(e) => {
-                    txn.abort()?;
-                    return Err(e);
-                }
-            }
-        }
         match self.delete_in_txn(&txn, coll, id, guard) {
             Ok(Some(entry)) => {
-                let stamp = entry.stamp;
-                if let Some(keyed) = keyed {
-                    let recorded = RecordOutcome::Delete { deleted: 1, stamp: Some(stamp) };
-                    let record = IdempotencyRecord::written(keyed, stamp, self.node_id(), recorded);
-                    if let Err(e) = self.put_record(&txn, coll.id, &keyed.scope, None, &record) {
-                        txn.abort()?;
-                        return Err(e);
-                    }
-                }
                 txn.commit()?;
+                let stamp = entry.stamp;
                 self.publish(vec![entry]);
-                Ok(Keyed::Fresh(Some(stamp)))
+                Ok(Some(stamp))
             }
             // Nothing to remove, or the guard declined: nothing was written,
             // so nothing is committed — a refused expiry must not cost an
             // fsync.
             Ok(None) => {
                 txn.abort()?;
-                Ok(Keyed::Fresh(None))
+                Ok(None)
             }
             Err(e) => {
                 txn.abort()?;
                 Err(e)
             }
         }
-    }
-
-    /// A keyed delete's record is replayed only while the request's own
-    /// tombstone stands (ADR-240): the document's row carries a stamp at or above
-    /// the record's `first`, the tombstone of one of its attempts or a later
-    /// version over it; or the row is gone with a drop of the collection at or
-    /// above `first`, which took the tombstone with the life the delete was
-    /// made in (the record outlives the drop, and a row of a later life under
-    /// the id is stamped above it). By `first` and not by the delete's own
-    /// stamp: a record two attempts merged into answers with the later one's,
-    /// and a rewind between them keeps the earlier one's tombstone. Once
-    /// retention has collected the tombstone with no drop over it, an older
-    /// write a peer still holds can bring the document back, and
-    /// `{"deleted": 1}` would describe nothing that stands; the record is then
-    /// absent for this request, which runs afresh. A record of another kind
-    /// passes, for the replay to refuse.
-    fn unless_tombstone_gone(
-        &self,
-        txn: &WriteTxn<'_>,
-        coll: &CollectionMeta,
-        id: &DocId,
-        found: Found,
-    ) -> Result<Found> {
-        let (Found::Done(record) | Found::Applying(record)) = &found else {
-            return Ok(found);
-        };
-        let RecordOutcome::Delete { stamp: Some(_), .. } = &record.outcome else {
-            return Ok(found);
-        };
-        let first = record.first;
-        let key = doc_key(id)?;
-        let docs = txn.open_table(tables::DOCS)?;
-        let stands = match docs.get((coll.id.0, key.as_slice()))? {
-            Some(raw) => codec::doc_record_header(raw.value())?.0 >= first,
-            None => self.delete_taken_by_a_drop(txn, coll, first)?,
-        };
-        Ok(if stands { found } else { Found::Absent })
     }
 
     /// The whole of a delete except the transaction's lifecycle, the way

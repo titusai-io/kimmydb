@@ -27,12 +27,10 @@ pub mod exec;
 pub mod expiry;
 pub mod explain;
 pub mod federation;
-pub mod idempotency;
 pub mod json;
 pub mod limits;
 pub mod local_login;
 pub mod metrics;
-pub mod outcome;
 pub mod ownership;
 pub mod ratelimit;
 pub mod roles;
@@ -147,7 +145,6 @@ pub fn state_with_policies(
         stale_peers: Default::default(),
         local_login: std::sync::OnceLock::new(),
         expiry_off: std::sync::OnceLock::new(),
-        idempotency_gate: std::sync::OnceLock::new(),
     }))
 }
 

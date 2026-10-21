@@ -132,34 +132,13 @@ pub enum Decimal128Closed {
     /// `cluster.decimal128` is false: the operator has not declared that
     /// every member runs 0.51 and has migrated.
     Undeclared,
-    /// The key is set, and these live peers (node ids, sorted) do not say they
-    /// can hold one: a held block says otherwise or nothing of it (a build older
-    /// than 0.51), their last block did not decode, or no block of theirs has
-    /// been held for more than a lease since they came up, were renamed or this
-    /// member rejoined. It lasts until they change.
+    /// The key is set, and these live peers (node ids, sorted) do not
+    /// advertise that they can hold one: an older build, or a peer this
+    /// member has not heard from yet.
     Peers(Vec<String>),
     /// The key is set, and this member cannot see what its peers say about
     /// themselves, for the reason given.
     Unseen(&'static str),
-    /// The key is set and no live peer refuses, but these live peers (node ids,
-    /// sorted) have not been heard from yet, within a lease of coming up, being
-    /// renamed or this member's rejoin. **Transient**: a block arrives with the
-    /// next contact, about `retry_after_secs` (a fixed second) later, so the
-    /// request is answered `503` with `Retry-After`; once the lease has run with
-    /// none the peer counts among [`Self::Peers`].
-    Unheard { peers: Vec<String>, retry_after_secs: u64 },
-}
-
-impl Decimal128Closed {
-    /// The seconds to wait before sending the request again, for the one cause
-    /// that ends by itself ([`Self::Unheard`]); `None` for a refusal that lasts
-    /// until the operator or the roll changes something.
-    pub fn retry_after_secs(&self) -> Option<u64> {
-        match self {
-            Self::Unheard { retry_after_secs, .. } => Some(*retry_after_secs),
-            Self::Undeclared | Self::Peers(_) | Self::Unseen(_) => None,
-        }
-    }
 }
 
 fn decimal128_refusal(what: Decimal128Use, closed: &Decimal128Closed) -> String {
@@ -178,21 +157,13 @@ fn decimal128_refusal(what: Decimal128Use, closed: &Decimal128Closed) -> String 
         ),
         Decimal128Closed::Peers(peers) => format!(
             "{what}: cluster.decimal128 is set, but the live member(s) {} do not say they can \
-             hold one (a build older than 0.51, a block this member cannot read, or no block for \
-             longer than a lease); it is accepted once every live member does",
+             hold one (a build older than 0.51, or a member not yet heard from); it is accepted \
+             once every live member does",
             peers.join(", ")
         ),
         Decimal128Closed::Unseen(why) => {
             format!("{what}: cluster.decimal128 is set, but {why}")
         }
-        Decimal128Closed::Unheard { peers, .. } => format!(
-            "{what} yet: cluster.decimal128 is set, but this member has not yet heard from the \
-             live member(s) {} whether they can hold one (a member that came up or rejoined a \
-             moment ago; its facts arrive by an immediate exchange, or the next replication \
-             contact). This is transient: nothing was written; send the same request again \
-             after the wait (the Retry-After header, or retry_after_secs)",
-            peers.join(", ")
-        ),
     }
 }
 
@@ -393,36 +364,6 @@ mod tests {
         // Never skipped by replication, never set aside by an expression.
         assert!(!peers.is_a_request_refusal());
         assert!(!peers.is_deferrable());
-    }
-
-    /// A peer not heard from yet is its own cause: transient, with the wait it
-    /// carries, and said so; the three others carry none.
-    #[test]
-    fn a_decimal128_refusal_for_an_unheard_peer_is_transient_and_says_so() {
-        let unheard =
-            Decimal128Closed::Unheard { peers: vec!["peer-c".into()], retry_after_secs: 3 };
-        assert_eq!(unheard.retry_after_secs(), Some(3));
-        for lasting in [
-            Decimal128Closed::Undeclared,
-            Decimal128Closed::Peers(vec!["peer-c".into()]),
-            Decimal128Closed::Unseen("membership is off"),
-        ] {
-            assert_eq!(lasting.retry_after_secs(), None, "{lasting:?}");
-        }
-        let text = Error::Decimal128Gated { what: Decimal128Use::Id, closed: unheard }.to_string();
-        assert!(
-            text.contains("peer-c")
-                && text.contains("not yet heard")
-                && text.contains("transient")
-                && text.contains("after the wait"),
-            "{text}"
-        );
-        let text = Error::Decimal128Gated {
-            what: Decimal128Use::Id,
-            closed: Decimal128Closed::Peers(vec!["peer-c".into()]),
-        }
-        .to_string();
-        assert!(!text.contains("heard") && !text.contains("transient"), "{text}");
     }
 
     #[test]

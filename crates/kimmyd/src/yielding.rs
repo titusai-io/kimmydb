@@ -286,8 +286,7 @@ impl TestSwitches {
             switches.notes.push((
                 "KIMMY_TEST_DNS_SERVER",
                 value,
-                "makes this member resolve its `dns:` and `k8s:` seeds against that one name \
-                 server from the start, and not the host's resolv.conf"
+                "makes this member resolve its `dns:` and `k8s:` seeds against that one name                  server from the start, and not the host's resolv.conf"
                     .into(),
             ));
         }

@@ -25,12 +25,10 @@ pub mod discovery;
 mod exchange;
 pub mod facts;
 pub mod health;
-pub mod idempotency;
 pub mod membership;
 pub mod peers;
 pub mod protocol;
 pub mod repair_ledger;
-mod said_once;
 pub mod tls;
 pub mod transport;
 pub mod yielding;
@@ -44,12 +42,10 @@ pub use confirm::{
 pub use decimal128::{DECIMAL128_WARN_INTERVAL, Decimal128Gate};
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource, names_another_member};
 pub use facts::{
-    CatchUpReason, ClassState, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerNet,
-    PeerState, PerClass, StallCause, TtlHeld, Yielding, decimal128_blockers, decimal128_net,
-    facts_undecodable_total, idempotency_records_net, refusing_peers, unheard_peers,
+    CatchUpReason, ClassState, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState,
+    PerClass, StallCause, TtlHeld, Yielding, decimal128_blockers, facts_undecodable_total,
 };
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
-pub use idempotency::{IdempotencyClosed, IdempotencyGate, IdempotencyPredicate};
 pub use membership::{Member, Members, PeerView, SeedFeed, ViewBlock};
 pub use peers::{
     ContactEnd, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ENTRY_WAIT_BUCKETS_US,
@@ -58,8 +54,7 @@ pub use peers::{
 };
 pub use transport::{
     AcceptErrorHook, AcceptListener, DefinitionJudgement, DigestRepairOutcome, FROZEN_CONTACTS,
-    Judgement, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS,
-    RecordsUnfit, Repair, RepairCounts, ReplayCounters, ReplayResult, RowResult, ServeFailHook,
-    ServeFailure, UnfitPath, accept_error_is_the_listeners, records_unfit, replay_counters, serve,
-    serve_with, sync_once, sync_once_with,
+    Judgement, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS, Repair,
+    RepairCounts, ReplayCounters, ReplayResult, RowResult, ServeFailHook, ServeFailure,
+    accept_error_is_the_listeners, replay_counters, serve, serve_with, sync_once, sync_once_with,
 };

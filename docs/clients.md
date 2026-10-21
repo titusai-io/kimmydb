@@ -119,9 +119,8 @@ known whether it did**. The third comes two ways:
   it restarts and serves its peers.
 - **Never blindly resend** an insert with a server-assigned `_id`, or an
   `$inc`: that is how one write becomes two.
-- **Never resend a multi-document write automatically** without a key,
-  whatever it was answered: a `multi: true` update or delete, or a database
-  drop. It commits
+- **Never resend a multi-document write automatically**, whatever it was
+  answered: a `multi: true` update or delete, or a database drop. It commits
   in several transactions, and a failure after the first is answered
   `partially_applied` with what landed; a resend re-applies that part. Build a
   non-idempotent one with a marker so it can be sent again safely: see
@@ -130,87 +129,11 @@ known whether it did**. The third comes two ways:
   a reset must not retry non-idempotent writes. See
   [Operations](operations.md#a-write-whose-outcome-is-unknown).
 
-**Send an idempotency key, and the write is safe to send again.** From 0.52.0
-a document write may carry `Idempotency-Key`: one quoted string of 16 to 255
-printable ASCII characters, a new UUID per request
-([HTTP API](http-api.md#idempotency-keys)). The member that applied the write
-keeps a record of it in the write's own transaction, so the same request sent
-again with the same key, after `outcome_unknown` or a dropped connection, is
-answered with the first answer and `Idempotency-Replayed: ?1`, and nothing is
-written twice. A `multi: true` update or delete sent again with its key resumes
-where it stopped instead of applying again. What a client must do to rely on it:
-
-- **Branch on the capability `idempotency-keys`**, per node, from
-  `GET /v1/version`. A member that does not list it refuses the header with
-  `400` (a cluster during a roll, or before its operator has set
-  `cluster.idempotency_keys`), or for about one contact with a `503` that says to
-  wait (below), and a member of an earlier release ignores it. Without the
-  capability, the rules above apply.
-- **Send the retry byte for byte as the first attempt**, with the same key.
-  The same key with a different body, path or query is
-  `422 idempotency_key_reused`; a new request needs a new key. So is every
-  retry under a key that two members each accepted for two different requests
-  (a key reused across them before either had the other's record), once their
-  records have met: neither first answer can stand for the key.
-- **Retry on the member that took the write, once it serves again.** A member
-  that has not yet received the write cannot know the key and applies it a
-  second time, answering without the marker; there is no wait after which
-  retrying elsewhere is safe. Selection is sticky already; keep it so for a
-  keyed retry, and move only if that member does not come back.
-- **Expect a string `_id`.** A keyed insert without `_id` gets one derived from
-  the key and the request, a UUID string, which sorts apart from ObjectIds and
-  falls outside an `_id` range over them.
-- **`409 idempotency_key_in_flight`** means the same `multi: true` request is
-  still running there, or another retry of it is being answered there (two
-  retries sent at once: one is answered, the other refused): wait
-  (`Retry-After: 1`) and send it again to the same member.
-- **Read the marker.** `Idempotency-Replayed: ?1` (on MCP,
-  `"kimmydb/idempotency-replayed": true` in the result's `_meta`) says the
-  answer is the first attempt's, read from its record: its `stamp` names the
-  version that attempt produced, which may have moved on since, so an
-  `if_stamp` built from it can be `409 stale`. A keyed answer without the marker
-  was applied by this attempt, and on a member other than the one that took the
-  first attempt that can be a second application.
-- **A `multi: true` update or delete sent again with its key resumes**: its
-  counts are cumulative over the attempts, and the matches it left because they
-  changed after its first write are counted in `skipped`, with `resumed: true`.
-  A keyed request past one chunk leaves such matches on its first attempt too.
-  A retry of a finished request can also come back as a resume, with nothing
-  written twice, on a member that has its last writing chunk and not yet the
-  record of its end.
-  To have every current match written, send it without the key, if the update
-  is idempotent ([HTTP API](http-api.md#a-keyed-write-past-one-chunk)).
-- **A `503 peer_unheard` with `retry: wait`** means the member has not yet
-  heard from a live member whether it carries records: one that came up, or
-  that it saw rejoin, a moment ago, which every restart of a member in a roll
-  causes. It wrote nothing and looked nothing up. It lasts until that member is
-  heard, about one contact, and at most the unheard lease (the longer of
-  `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to
-  declare a silent member down plus one sync interval), after which the member that is still not
-  heard from is answered with the `400` below. **Honour `Retry-After` and send the same request again,
-  with the same key, to the same member**: that is the keyed retry the rules
-  above describe, and it is answered with the first application or its replay.
-  Not elsewhere, for the reason a keyed retry stays on its member. It is the
-  `wait` class, so a client acting on the class handles it by that class. On
-  MCP the same refusal is the tool error whose `data`
-  carries `"error": "peer_unheard"`, `"retry": "wait"` and `retry_after_secs`.
-- **A `400` naming `Idempotency-Key` and the cluster** (the member does not take
-  keys now: its `cluster.idempotency_keys` is off, or a live member does not say
-  it carries records: a member of an earlier release during a roll, one whose
-  block does not decode, or one not heard from for more than the unheard lease) wrote
-  nothing and looked nothing up, and lasts until the operator, the roll or that
-  member changes it. A
-  record written before the member stopped taking keys stays for its window,
-  and the retry replays from it once the member takes them again; until then
-  the rules above apply. A `400` naming the key's syntax or the route is the
-  client's to fix.
-- A key is remembered for `idempotencyWindowSecs` (`GET /v1/version`), 24 hours
-  by default. A retry later than that is a new request, except that a request that reuses a key after its window, with the same body, may be taken as a retry of the earlier request while a member still serves that request's record, and its stamp rule then skips the matches changed since the earlier request; use a new key for a new request. A keyed request past
-  one chunk retried over more than the window, counted from its first attempt,
-  may apply that attempt's chunks again: finish or abandon a key within the
-  window. A drop of the collection does not end it: a retry after the collection was dropped and
-  created again replays its first answer and writes nothing; until the name is
-  created again, the route answers `404` as for any missing collection.
+**The planned cure** is server-side idempotency keys: a key the client sends
+with a write, so that the server applies any retry of it only once. With them,
+every write becomes safe to retry after an unknown outcome. They are planned,
+on the [roadmap](roadmap.md#planned-not-scheduled) with no version set, and not
+in this release.
 
 ---
 

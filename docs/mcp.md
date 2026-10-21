@@ -196,28 +196,6 @@ Both require the collection to have embeddings configured — see
 | `create_collection` | Required before inserting; a write to a missing collection fails rather than creating it. Needs `ddl` |
 | `create_index` | Secondary index. Needs `ddl` |
 
-`insert`, `insert_many`, `update` and `delete` take an optional
-`idempotency_key`, the MCP form of the `Idempotency-Key` header: 16 to 255
-printable ASCII characters, such as a UUID, with no quotes
-([HTTP API](http-api.md#idempotency-keys)). The same call sent again with the
-same key is answered with its first result, which carries
-`"kimmydb/idempotency-replayed": true` in its `_meta`, and nothing is written
-again. A call is the same when the tool and its other arguments are, every
-document's fields in the order sent. The argument is refused where the header
-would be: malformed, reused for a different call, or while this member does not
-take keys. While the only reason it does not is a live member not heard from yet
-(after a restart or a rejoin, for about one contact and at most the unheard lease, which a member that stops answering does not outlast), the refusal is the
-error whose `data` carries `"error": "peer_unheard"`, `"retry": "wait"` and
-`retry_after_secs`: wait that long and send the same call again with the same
-key. `/mcp` itself refuses the header: a tool call is keyed by its
-argument. A keyed `update` or `delete` with `multi: true` that runs past one
-chunk (1,000 documents by default) never touches a document written after its
-first write, by anyone, and counts those matches in `skipped`; `resumed: true`
-appears only when a call continued one that had stopped. Unkeyed calls, and
-keyed ones that fit in one chunk, are unchanged. Two attempts of one call can
-run on different members at once, and this is what keeps any of them from
-writing on top of its own effect ([HTTP API](http-api.md#a-keyed-write-past-one-chunk)).
-
 `ddl` is its own action, and it federates ([ADR-090](decisions.md)): an agent
 authenticating through an identity provider can be given the right to create
 the collection it writes to without being given the server. Before 0.14.0 both
