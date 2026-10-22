@@ -124,6 +124,8 @@ mod decimal_definition_tests;
 mod mixed_roll_tests;
 
 #[cfg(test)]
+mod size_cap_tests;
+#[cfg(test)]
 mod snapshot_pages_tests;
 
 #[cfg(test)]

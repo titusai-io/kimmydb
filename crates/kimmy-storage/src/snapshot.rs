@@ -1015,6 +1015,23 @@ impl Engine {
         self.snapshot_room_for_test.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Lift the caps a client write is held to (ADR-250) for this engine, so a test
+    /// can store a document or an `_id` over them: state a peer could carry that no
+    /// client could write.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn lift_admission_caps_for_test(&self) {
+        self.caps_lifted_for_test.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the caps of a client write apply (always, outside a test).
+    pub(crate) fn caps_apply(&self) -> bool {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.caps_lifted_for_test.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        true
+    }
+
     fn collection_states(&self) -> Result<Vec<CollectionState>> {
         let txn = self.db().begin_read()?;
         let collections = txn.open_table(tables::COLLECTIONS)?;

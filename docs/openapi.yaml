@@ -3179,6 +3179,8 @@ components:
         |---|---|---|---|
         | `bad_request` | 400, 422 | no | Malformed filter, update, projection or Extended JSON; a body of the wrong shape; a batch over the cap |
         | `payload_too_large` | 413 | no | Request body over the node's ceiling (`server.max_body_bytes`, 2 MiB by default) |
+        | `document_too_large` | 413 | no | A write that would store a document encoding to more than 16 MiB, checked on the result of an insert, bulk, replace, upsert or update. A `multi` update over it in a later chunk is `500 partially_applied` with this code in `cause` |
+        | `id_too_large` | 413 | no | An `_id` over 4096 bytes (a string or binary id), in a write or in the path of a route that names one |
         | `unsupported_media_type` | 415 | no | A JSON body without a JSON content type |
         | `unauthorized` | 401 | no | Missing, invalid or expired token; bad credentials; an account deleted, disabled or re-credentialed since the token was issued |
         | `forbidden` | 403 | no | Denied by RBAC. Identical whether or not the target exists |
@@ -3206,6 +3208,8 @@ components:
       enum:
         - bad_request
         - payload_too_large
+        - document_too_large
+        - id_too_large
         - unsupported_media_type
         - unauthorized
         - forbidden

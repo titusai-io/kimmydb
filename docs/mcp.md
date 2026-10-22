@@ -348,6 +348,9 @@ a REST client does:
 `retry` is `no`, `wait`, `elsewhere` or `verify`, as in the
 [HTTP API](http-api.md), and a class a client does not know reads as `no`.
 `retry_after_secs` is present where REST would send a `Retry-After` header.
+The size caps hold here too: a write that would store a document over 16 MiB, or
+name an `_id` over 4096 bytes, is `invalid_params` with `document_too_large` or
+`id_too_large` in `data`, retry `no` ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)).
 
 **A write whose outcome is unknown is a tool result, not an error.** Its retry
 class is `verify`: the write may have been applied, and if it was, it

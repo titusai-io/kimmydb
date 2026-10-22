@@ -64,7 +64,7 @@ fails fast on a bad volume mount.
 | `server.rate_limit.per_principal` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL` | `0` | Requests per authenticated principal per window, on every route that takes a token. `0` disables — the default. See [Security](security.md#limits-on-authenticated-requests) |
 | `server.rate_limit.per_principal_window_secs` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS` | `60` | |
 | `server.request_timeout_secs` | `KIMMY_REQUEST_TIMEOUT_SECS` | `30` | Deadline for a request still waiting for its body, for an embedding provider, or for the lookup of a webhook's or provider's host; `503 timeout` past it. Not a query timeout — storage work already running completes. Change streams, `/mcp` and `GET /v1/admin/backup` are exempt |
-| `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced |
+| `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced. Decided first, while the body is read: a document that a small body would grow past 16 MiB is refused after it, `413 document_too_large` ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)) |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
 | `vector.index_cache.max_bytes` | — | `536870912` | Bound on the HNSW graphs kept in memory across vector collections, least recently searched evicted first. About `dim × 4 + 5,000` bytes per chunk (6.5 KB at 384 dimensions, 11 KB at 1,536); size it so the routinely searched collections fit, or their searches pay a rebuild. A single graph over the whole bound is held anyway. `0` lifts the bound (ADR-103) |
 | `vector.index_cache.build_concurrency` | — | `1` | How many HNSW graphs are built at once, on builder threads off the request path (ADR-245). A search of a collection whose graph is being built is answered by the graph it had, or by an exact scan under `server.request_timeout_secs`. A build is CPU and memory bound (a 100,000 × 384 graph peaks at about 1.3 GiB), and the first start of 0.52.0 asks for every collection's, so they queue. At least `1`. 0.51.x refuses a configuration that names it: remove it before rolling back |
@@ -596,7 +596,8 @@ a provider this member cannot build is one only an operator can.
 `RUST_LOG` is set. These are the refusals the caller caused and the caller can
 already read in full in the response body, so logging them would be an access
 log of nothing but the failures — half a record, and one this server has never
-kept. They are `bad_request`, `payload_too_large`, `unsupported_media_type`,
+kept. They are `bad_request`, `payload_too_large`, `document_too_large`,
+`id_too_large`, `unsupported_media_type`,
 `unauthorized`, `forbidden`, `not_found`, `conflict`, `duplicate_key`,
 `unique_violation`, `no_vectors`, `resume_token_expired`, `rate_limited`,
 `stale` and `collection_purging`. Count them with `kimmy_responses_total{class="4xx"}`,

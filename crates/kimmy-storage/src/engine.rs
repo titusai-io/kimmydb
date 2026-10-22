@@ -148,6 +148,10 @@ pub struct Engine {
     /// (ADR-086). Set from configuration at startup; the storage default
     /// stands for a bare engine.
     multi_chunk_docs: std::sync::atomic::AtomicUsize,
+    /// Whether a test has lifted the caps of a client write (ADR-250), to store a row
+    /// a peer could have carried that no client could write.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) caps_lifted_for_test: std::sync::atomic::AtomicBool,
     /// A test's room for a snapshot page's rows (`snapshot::SNAPSHOT_PAGE_BYTES`);
     /// 0 for the real one.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1481,6 +1485,8 @@ impl Engine {
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
             ),
+            #[cfg(any(test, feature = "test-hooks"))]
+            caps_lifted_for_test: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             snapshot_room_for_test: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-hooks"))]

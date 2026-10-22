@@ -9812,6 +9812,7 @@ mod tests {
         use kimmy_storage::SnapshotPolicy::All;
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        b.lift_admission_caps_for_test();
         let coll = b.create_collection("shop", "bin").unwrap();
         let pad = "x".repeat(110_000);
         for chunk in 0..8u32 {

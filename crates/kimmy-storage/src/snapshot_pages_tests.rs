@@ -51,8 +51,12 @@ impl ModifySpec for Inc {
     }
 }
 
+/// An engine that takes any row: the tests store ids and documents a peer could carry
+/// but no client could write under the caps of ADR-250.
 fn open(dir: &tempfile::TempDir, name: &str) -> Engine {
-    Engine::open(&dir.path().join(format!("{name}.redb"))).unwrap()
+    let engine = Engine::open(&dir.path().join(format!("{name}.redb"))).unwrap();
+    engine.lift_admission_caps_for_test();
+    engine
 }
 
 fn count(engine: &Engine, coll: &CollectionMeta) -> u64 {

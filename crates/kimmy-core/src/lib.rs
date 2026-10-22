@@ -17,6 +17,7 @@ pub mod ids;
 pub mod index_meta;
 pub mod keyenc;
 pub mod legacy_key;
+pub mod limits;
 pub mod matching;
 pub mod oplog;
 pub mod partial;

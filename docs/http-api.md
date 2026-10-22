@@ -140,6 +140,24 @@ route that takes a token). A client should treat a `429` as possible on every
 authenticated call, not only on login. See
 [Security](security.md#limits-on-authenticated-requests).
 
+**Two size caps apply to every write a client makes** ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)):
+a document that would be stored may encode to at most 16 MiB (`413
+document_too_large`), and an `_id` may be at most 4096 bytes (`413
+id_too_large`), measured as the bytes of a string or binary id; an ObjectId, an
+integer, a Uuid and a Decimal128 are never over. The document cap is checked on
+the result, so it covers insert, bulk, replace, upsert and every update (an
+update whose result is at or under the cap passes, whatever it did to the document,
+and a write that changes nothing is never refused), and the id cap on every route that names an `_id`, including `GET`,
+`PUT` and `DELETE` on `/docs/{id}` and the vector by-id routes, with the id
+measured decoded; a path longer than the HTTP layer allows is refused by it before the
+handler, with no error envelope (`414` over HTTP/1.1 above about 64 KiB, `431` over HTTP/2
+above about 16 KiB). The body ceiling answers first, while the body is read, so a
+small body whose result is over the cap is refused `document_too_large`: a 1 MiB
+`$set` through `arr.$[]` on a 20-element array stores 20 MiB. A `multi` update
+over the cap in its first chunk is a clean `413`; in a later one it is `500
+partially_applied` whose `cause` carries `document_too_large`, and the earlier
+chunks stay applied.
+
 **Login may be restricted to the host.** Under `auth.local.login =
 "loopback_only"`, `/v1/auth/login` and `/v1/auth/refresh` answer `403
 forbidden` to any connection whose TCP peer is not loopback; under `"disabled"`
@@ -206,9 +224,12 @@ unique index — fail the batch even though neither was there when it started.
 Two ceilings, whichever binds first: **1000 documents**, and the **request
 body limit** (`server.max_body_bytes`, 2 MiB by default; `413`,
 `"error": "payload_too_large"`), which is the lower of the two for documents
-over about 2 KB. Over the document cap is
+over about 2 KB. Over 1000 documents is
 **400**; a body that is not an array is **422**. An empty array is a no-op
-that inserts nothing and commits nothing.
+that inserts nothing and commits nothing. Each document is also held to the
+16 MiB cap and each `_id` to 4096 bytes (`413 document_too_large` and
+`id_too_large`); a batch with one document over either is refused whole and
+stores nothing.
 
 Measured end to end over loopback, this is what it buys: 500 documents in one
 request took **0.16 s**, against **11.6 s** as 500 separate requests.
@@ -1376,6 +1397,8 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 503 | `resolver_busy` | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered ([Operations](operations.md#discovery-formats)). Nothing was done. Carries `Retry-After` in seconds, how long a failed lookup's answer is kept. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
 | 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above; this answer also comes *before* the embedding provider is built, so it is what a node whose provider it could not build answers too, for as long as the collection is empty. The three are different questions, and [Vectors](vectors.md#search) puts them side by side |
 | 413 | `payload_too_large` | no | Request body over `server.max_body_bytes` (2 MiB by default) |
+| 413 | `document_too_large` | no | A write that would store a document encoding to more than 16 MiB, checked on the result: insert, a bulk batch (refused whole), replace, upsert, and any update, including through `arr.$[]`. A `multi` update over it in a later chunk is `500 partially_applied` with this code in `cause` ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)) |
+| 413 | `id_too_large` | no | An `_id` over 4096 bytes (a string or binary id), named in a write or in the path of any by-id route: `GET`, `PUT`, `DELETE` and the vector by-id routes |
 | 415 | `unsupported_media_type` | no | A JSON body without a JSON content type |
 | 501 | `not_implemented` | no | A reserved capability that does not exist yet |
 | 410 | `resume_token_expired` | no | Resume point collected from the oplog. Resubscribe — retrying the token loops forever |

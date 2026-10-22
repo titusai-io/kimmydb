@@ -1824,3 +1824,55 @@ async fn a_vector_search_whose_filter_expr_cannot_be_evaluated_is_refused() {
     assert!(message.contains("$expr cannot be evaluated for the document with _id"), "{message}");
     assert!(message.contains("$add needs numbers, found a string"), "{message}");
 }
+
+/// The caps hold over MCP as over HTTP: an `_id` or a document over the limit is
+/// refused with the same codes, in the envelope's `data` (ADR-250).
+#[tokio::test]
+async fn the_size_caps_hold_over_mcp() {
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+
+    let body = server
+        .call(
+            &root,
+            "insert",
+            json!({"database":"sales","collection":"orders","document":{"_id":"a".repeat(4097)}}),
+        )
+        .await;
+    assert_eq!(body["error"]["data"]["error"], "id_too_large", "{body}");
+    assert_eq!(body["error"]["data"]["retry"], "no", "{body}");
+
+    let body = server
+        .call(
+            &root,
+            "insert_many",
+            json!({"database":"sales","collection":"orders",
+                   "documents":[{"_id":"ok"},{"_id":"b".repeat(4097)}]}),
+        )
+        .await;
+    assert_eq!(body["error"]["data"]["error"], "id_too_large", "{body}");
+
+    // An update through every element of an array grows the document past 16 MiB.
+    server
+        .call_ok(
+            &root,
+            "insert",
+            json!({"database":"sales","collection":"orders","document":{"_id":"arr","list":vec![0; 20]}}),
+        )
+        .await;
+    let body = server
+        .call(
+            &root,
+            "update",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"arr"},
+                   "update":{"$set":{"list.$[]":"x".repeat(1024 * 1024)}}}),
+        )
+        .await;
+    assert_eq!(body["error"]["data"]["error"], "document_too_large", "{body}");
+
+    // Nothing from the refused calls is stored: the three seeded documents and "arr".
+    let found =
+        server.call_ok(&root, "find", json!({"database":"sales","collection":"orders"})).await;
+    assert_eq!(found["count"], 4, "{found}");
+}

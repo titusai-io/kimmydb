@@ -30362,3 +30362,31 @@ configuration naming a key the build does not have, `cluster.idempotency_keys` n
 decimal `_id` on one member and a decimal-bound partial index on another and finds both on all three; and `kimmy-storage`'s
 `decimal_definition_tests.rs`, which holds that a replicated entry, a snapshot, a repair page and a converge row apply a
 decimal `_id` and a decimal-bound definition.
+
+## ADR-250 — Size caps at client admission
+
+**The case.** Nothing bounded the size of a document or of an `_id` a client could store. A peer frame is at most 64 MiB (`MAX_FRAME`), and a document that encodes to more than that cannot cross it: the write was applied on the member that took it, the sender could not write the frame, and every later write from that origin waited behind it, with no line logged and no error returned. An update could make the document: a `$set` of 1 MiB through `arr.$[]` on a 20-element array stores 20 MiB, and a longer array reached 100 MiB from a body under the 2 MiB `server.max_body_bytes`. No route checked the size of an `_id`, so a key could be as large as a body.
+
+**Decision.**
+
+1. **Two caps, in `kimmy_core::limits`.** `MAX_DOCUMENT_BYTES` is 16 MiB (16 * 1024 * 1024), measured on the encoding of the document that would be stored. `MAX_ID_BYTES` is 4096, measured as the bytes of a string `_id` or a binary `_id`; an ObjectId, an integer, a Uuid and a Decimal128 are never over it.
+
+2. **Refused at client admission only, with `413` and a new code each.** `document_too_large` and `id_too_large`, retry `no`, never logged (log level none, as `payload_too_large`). Both are new `ErrorCode` variants, so `ErrorCode::ALL` is 28. Over MCP the same codes are in the error `data`.
+
+3. **Where the document cap is checked.** Insert; bulk insert, where the batch is refused whole and nothing is stored; replace by id; upsert-replace by id; and the result of every update, whatever the operator (including `arr.$[]` and `multi`), of `find_and_modify` with an update, and of `find_and_modify` with an upsert.
+
+4. **Where the id cap is checked.** The `_id` of an insert, a bulk document, a replace and an upsert, including an upsert's `_id` taken from an equality in its filter, and every route that names an `_id` in its path: `GET`, `PUT` and `DELETE` on `/docs/{id}` and the vector by-id routes. The id is measured decoded, not as the escaped path segment.
+
+5. **The check is on the result.** An update whose result is at or under 16 MiB passes, so a write can reduce a document; one whose result stays over the cap is refused. A write that changes nothing is never refused.
+
+6. **Order.** `server.max_body_bytes` keeps its 2 MiB default and `payload_too_large` is decided first, while the body is read, before any document check. A small body can still be refused `413 document_too_large`: the 1 MiB `$set` through `arr.$[]` on 20 elements has a 20 MiB result. A path longer than the HTTP layer allows is refused by it first, before any handler and with no error envelope: `414` over HTTP/1.1 above about 64 KiB of target, `431` over HTTP/2 above about 16 KiB of header list; an id within those limits is judged by `id_too_large`.
+
+7. **A `multi: true` update that crosses the cap.** In its first chunk it is a clean `413 document_too_large` and nothing is written. In a later chunk it is `500 partially_applied` whose `cause` carries `document_too_large`; the earlier chunks stay applied, as ADR-192 has it.
+
+8. **Not checked.** Anything a peer sends, snapshot, repair, rewind and restore, migrations and TTL expiry: none of them admits a client write, and a state already admitted is carried as it is.
+
+9. **No handling of documents that predate the cap.** None is made. No `kimmy.format` schema, entry kind or wire change. A breaking change under the pre-1.0 policy of [compatibility.md](compatibility.md): a client that stored a document over 16 MiB or an `_id` over 4 KiB is now refused.
+
+**Alternatives rejected.** Caps in replication: a peer carries state a member has already admitted, and refusing it there leaves members that disagree about what is stored. A cap in the update evaluator: it holds values, not encoded bytes, and the storage functions hold the final bytes of the document they write, so the check sits there and sees the same number whichever operator produced it. Refusing `GET` and `DELETE` with a long id less strictly than a write: one rule applies to every route that names an `_id`, so a client never has to know which routes measure it.
+
+**Tests.** `crates/kimmy-core/src/limits.rs` tests; `kimmy-storage`'s `size_cap_tests.rs`; `kimmy-api`'s `tests/api.rs` (`a_write_that_would_store_a_document_over_the_cap_is_refused_413`, `an_update_that_grows_a_document_past_the_cap_is_refused_and_one_that_shrinks_it_passes`, `an_id_over_the_cap_is_refused_413_on_every_route_that_names_one` and `the_body_ceiling_answers_before_the_document_cap`); `kimmy-mcp`'s `tests/mcp.rs` (`the_size_caps_hold_over_mcp`); and the boundary and the vector writers: `size_cap_tests.rs` (`the_document_boundary_is_exact_on_insert_replace_and_update`, `binary_and_multibyte_ids_are_measured_in_bytes_at_the_cap`, `the_vectors_of_a_document_whose_id_is_within_the_cap_can_be_stored`, `a_multi_update_crossing_the_cap_in_a_later_chunk_is_partially_applied`) and `tests/api.rs` (`the_document_boundary_is_exact_over_http`, `a_multi_update_over_the_cap_in_a_later_chunk_is_partially_applied`, `vectors_can_be_put_for_a_document_whose_id_is_at_the_cap`).
