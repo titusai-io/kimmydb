@@ -63,7 +63,8 @@ pub fn release_fault(theirs: Option<u32>) -> String {
         Some(n) => format!("cluster protocol {n}"),
     };
     format!(
-        "this member speaks cluster protocol {PROTOCOL} (KimmyDB 0.53.0); the peer speaks {peer}; every member must run one release"
+        "this member speaks cluster protocol {PROTOCOL} (KimmyDB {}); the peer speaks {peer}; every member must run one release",
+        kimmy_core::build::SCHEMA_6_RELEASE
     )
 }
 

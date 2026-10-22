@@ -842,10 +842,10 @@ impl HnswIndex {
         // headroom a rebuild needed, paid every `MAX_STALENESS` under writes.
         //
         // The key is the id the chunk is stored under, never one recomputed
-        // from the record (ADR-239): the record's source carries no binary
-        // subtype, so a recomputed key would miss it. A record stored
-        // under an id that is not a String (a client's insert into the
-        // shadow) has no key a load can name, and is left out.
+        // from the record (ADR-239), so a graph and its documents agree on
+        // the key by construction. A record stored under an id that is not
+        // a String (a client's insert into the shadow) has no key a load
+        // can name, and is left out.
         // Read before the walk, so a move that lands during it makes the
         // graph read as behind, never as fresh.
         let renames = engine.vector_renames(shadow.id)?;

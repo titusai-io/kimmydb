@@ -922,8 +922,7 @@ impl crate::Engine {
 
     /// Visit every stored vector, with the id it is stored under. Used by
     /// search and by index rebuilds; a graph is keyed by the stored id, never
-    /// by one recomputed from the record (ADR-239), which carries no binary
-    /// subtype.
+    /// by one recomputed from the record (ADR-239).
     ///
     /// A document that does not decode as a vector record is **skipped, not
     /// fatal**. A shadow collection is an ordinary collection, so a client with

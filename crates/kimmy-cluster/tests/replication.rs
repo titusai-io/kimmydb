@@ -10582,12 +10582,13 @@ async fn a_definition_repair_does_not_move_the_count_halfs_repair_rounds() {
 }
 
 // ---------------------------------------------------------------------------
-// Decimal128 design 7.1: keys on the wire are legacy, through the real exchange
+// Two large integer ids, deleted and repaired by key, through the real exchange
 // ---------------------------------------------------------------------------
 
-/// The id whose stored (schema-5) key is the schema-4 key of [`A2_B`] (design 6.1).
+/// One of a pair of large integer ids whose keys are close in the order, so that a
+/// repair or a page boundary that mistook one for the other would show.
 const A2_A: i64 = 0x5000_0081_0180_0000;
-/// The id whose schema-4 key is the stored key of [`A2_A`].
+/// The other of the pair.
 const A2_B: i64 = 0x5000_7F80_8101_8000;
 
 fn held_live(node: &Node, id: i64) -> bool {
@@ -10598,7 +10599,7 @@ fn held_live(node: &Node, id: i64) -> bool {
 /// A delete B lost (witnessed, not applied) of the A2 pair's second id, in a collection that
 /// holds both, beside an insert it lost too, so the counts agree and only the digest sees it.
 /// The document repair's page carries the delete by key: it lands on `A2_B` and never on
-/// `A2_A`, whose stored key is the carried one's schema-4 bytes.
+/// `A2_A`.
 #[tokio::test]
 async fn a_lost_delete_of_the_a2_pair_is_repaired_onto_its_own_document() {
     use kimmy_cluster::Judgement;

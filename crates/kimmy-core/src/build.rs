@@ -14,6 +14,11 @@
 /// The workspace version, e.g. `0.1.0`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The release that introduced storage schema 6 and cluster protocol 2, and
+/// with them the refusal of an older store, backup or peer. The one place the
+/// refusals name it, so they cannot disagree.
+pub const SCHEMA_6_RELEASE: &str = "0.53.0";
+
 /// Short commit hash, with no decoration; `unknown` without git.
 pub const COMMIT: &str = env!("KIMMY_BUILD_COMMIT");
 

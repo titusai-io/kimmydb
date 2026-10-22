@@ -25,8 +25,13 @@ use crate::tables;
 pub const SCHEMA_VERSION: u8 = 6;
 
 /// What a refusal of a store or backup of an older schema tells the operator.
-pub(crate) const NO_UPGRADE: &str = "0.53.0 does not upgrade stores; stop every member, wipe this \
-data directory, start on an empty one and reseed.";
+pub(crate) fn no_upgrade() -> String {
+    format!(
+        "{} does not upgrade stores; stop every member, wipe this data directory, start on an \
+         empty one and reseed.",
+        kimmy_core::build::SCHEMA_6_RELEASE
+    )
+}
 
 /// Stamp a fresh database, or refuse one of another schema. `raise` records in
 /// the store's sidecar that its schema is about to be written (ADR-190),
@@ -43,6 +48,8 @@ pub(crate) fn run(
             write_version(db, SCHEMA_VERSION)
         }
         Some(SCHEMA_VERSION) => Ok(()),
+        // Unreachable through `Engine::open`, which refuses any other schema in
+        // `refuse_other_schema` first; kept as a guard for a caller that does not.
         Some(found) => Err(refuse_schema(found, path)),
     }
 }
@@ -57,31 +64,17 @@ fn refuse_schema(found: u8, path: &std::path::Path) -> StorageError {
         kind: RefusedKind::Older,
         why: format!(
             "{} was written by a build that left no kimmy.format, with storage schema {found} \
-             (this build: {SCHEMA_VERSION}). {NO_UPGRADE}",
-            path.display()
+             (this build: {SCHEMA_VERSION}). {}",
+            path.display(),
+            no_upgrade()
         ),
     }
 }
 
-/// The cost of an index rebuild, per document per index, that the up-front
-/// estimate is made from (ADR-183).
-///
-/// **Not linear in the document count, which is why this is a bound and not a
-/// rate.** Measured on the machine the migration was written on: 73 s for 10
-/// million documents, some 7.3 µs each, and 5.4 s for 2 million, some 2.7 µs
-/// each. The per-document cost grows with the working set, because a larger
-/// store spills out of the page cache. 8 covers both sizes measured; above ten
-/// million documents it is an extrapolation, and the announcement's estimate
-/// says "estimate" for that reason. The documentation quotes this same number,
-/// and the manifest in the operations guide allows more than twice the estimate
-/// this produces, so the two cannot drift into a probe that kills the node
-/// during its own documented example.
-pub const MICROS_PER_DOCUMENT: u64 = 8;
-
 /// Record the redb major.minor in META, if it is not already what is there
 /// (ADR-190): run on the raw database during `Engine::open`, so the read-only check can refuse a clean store with no sidecar that a
 /// newer redb wrote. Never lowered: a newer version recorded there is the
-/// evidence that check reads, and `refuse_newer` has already stopped the open.
+/// evidence that check reads, and `refuse_other_schema` has already stopped the open.
 pub(crate) fn record_redb_version(
     db: &Database,
     build: &crate::format::BuildVersions,
@@ -117,7 +110,7 @@ pub(crate) fn stored_version(db: &Database) -> Result<Option<u8>> {
 /// What reaches here is a dirty store with no sidecar, which redb has just
 /// repaired: the repair wrote, which is the gap ADR-190 documents, but the
 /// session stops here, and META still says which schema and redb wrote the store.
-pub(crate) fn refuse_newer(
+pub(crate) fn refuse_other_schema(
     db: &Database,
     path: &std::path::Path,
     build: &crate::format::BuildVersions,
@@ -269,7 +262,7 @@ mod tests {
         let (_dir, path) = a_schema_5_store();
         {
             let db = Database::create(&path).unwrap();
-            match refuse_newer(&db, &path, &BuildVersions::ours()) {
+            match refuse_other_schema(&db, &path, &BuildVersions::ours()) {
                 Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
                     assert!(why.contains("storage schema 5"), "{why}");
                     assert!(why.contains("does not upgrade stores"), "{why}");

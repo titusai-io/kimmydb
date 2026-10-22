@@ -303,8 +303,8 @@ fn a_pages_definitions_and_drops_are_counted_against_its_budget() {
 /// The bounds the budget counts rows and the cursor at hold of the BSON encoding,
 /// row by row, for the shapes that maximise them: the widest collection id and
 /// stamp, and `_id`s of every kind, binary ones as
-/// large as 4 KiB, which serde writes as an array of `int32`s; and the cursor,
-/// whose key crosses the same way.
+/// large as 4 KiB, which cross as a BSON binary with their subtype; and the
+/// cursor, whose key crosses as an array of `int32`s.
 #[test]
 fn the_row_overheads_bound_the_encoding() {
     use crate::snapshot::{

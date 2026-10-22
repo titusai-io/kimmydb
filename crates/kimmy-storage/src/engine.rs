@@ -1344,7 +1344,7 @@ impl Engine {
         // not after it. The check before the open already refused every store
         // it could read; this makes the order structural, and it is what stops
         // a dirty store with no sidecar that a newer redb wrote.
-        crate::migrate::refuse_newer(&db, path, &cleared.build)?;
+        crate::migrate::refuse_other_schema(&db, path, &cleared.build)?;
 
         // Ensure every table exists up front so that read transactions never
         // have to handle a missing table.

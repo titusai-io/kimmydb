@@ -364,10 +364,13 @@ pub enum ServeFailure {
     /// The TLS session gave no channel binding, so the peer was refused
     /// before the handshake.
     Binding,
+    /// This node refused the peer at the handshake: it runs another release
+    /// (ProtocolError::Release).
+    Release,
 }
 
 impl ServeFailure {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Io,
         Self::Timeout,
@@ -376,6 +379,7 @@ impl ServeFailure {
         Self::Unauthenticated,
         Self::Fault,
         Self::Binding,
+        Self::Release,
     ];
 
     pub const fn slot(self) -> usize {
@@ -391,6 +395,7 @@ impl ServeFailure {
             Self::Unauthenticated => "unauthenticated",
             Self::Fault => "fault",
             Self::Binding => "binding",
+            Self::Release => "release",
         }
     }
 
@@ -411,7 +416,8 @@ impl ServeFailure {
             // failure of a peer.
             ProtocolError::SelfContact => None,
             ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
-            ProtocolError::Fault(_) | ProtocolError::Release(_) => Some(Self::Fault),
+            ProtocolError::Fault(_) => Some(Self::Fault),
+            ProtocolError::Release(_) => Some(Self::Release),
         }
     }
 }
@@ -1243,8 +1249,8 @@ where
         return Err(ProtocolError::Malformed("expected Hello".into()));
     };
     if protocol != Some(crate::protocol::PROTOCOL) {
+        // Logged once, with the peer's address, by the serve-failure line.
         let reason = crate::protocol::release_fault(protocol);
-        warn!(peer = ?node, "refusing a peer: {reason}");
         let _ = write_frame(stream, &Message::Fault(reason.clone())).await;
         return Err(ProtocolError::Release(reason));
     }
@@ -9984,6 +9990,27 @@ mod tests {
         assert_eq!(seen, vec![ServeFailure::Unauthenticated]);
     }
 
+    /// Write `message` as a 0.52 build did, which has no `protocol` field at all:
+    /// the key is absent from the frame, not present as null.
+    async fn write_frame_without_protocol<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        message: &Message,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut document = bson::serialize_to_document(message).unwrap();
+        let mut removed = false;
+        for (_, variant) in document.iter_mut() {
+            if let bson::Bson::Document(fields) = variant {
+                removed |= fields.remove("protocol").is_some();
+            }
+        }
+        assert!(removed, "the message carries a protocol field to leave out");
+        let body = bson::serialize_to_vec(&document).unwrap();
+        writer.write_all(&(body.len() as u32).to_be_bytes()).await.unwrap();
+        writer.write_all(&body).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
     /// A `Hello` that names no protocol, which is a 0.52 build's.
     #[tokio::test]
     async fn a_hello_without_a_protocol_is_refused_by_name_and_the_refuser_sends_the_fault() {
@@ -9995,12 +10022,11 @@ mod tests {
         let peer = kimmy_core::NodeId::generate();
         let refusing = accept_handshake(&engine, &mut theirs, SECRET, BINDING);
         let asking = async {
-            write_frame(
+            write_frame_without_protocol(
                 &mut ours,
-                &Message::Hello { node: peer, nonce: nonce(peer), protocol: None },
+                &Message::Hello { node: peer, nonce: nonce(peer), protocol: Some(0) },
             )
-            .await
-            .unwrap();
+            .await;
             read_frame(&mut ours).await.unwrap()
         };
         let (refused, answer) = tokio::join!(refusing, asking);
@@ -10058,17 +10084,16 @@ mod tests {
                 panic!("expected a Hello");
             };
             assert_eq!(protocol, Some(crate::protocol::PROTOCOL));
-            write_frame(
+            write_frame_without_protocol(
                 &mut ours,
                 &Message::Welcome {
                     node: peer,
                     nonce: nonce(peer),
                     proof: prove(SECRET, &asked, BINDING),
-                    protocol: None,
+                    protocol: Some(0),
                 },
             )
-            .await
-            .unwrap();
+            .await;
             read_frame(&mut ours).await.unwrap()
         };
         let (refused, answer) = tokio::join!(refusing, answering);
@@ -10129,6 +10154,7 @@ mod tests {
             (ProtocolError::Local("disk full".into()), Some(ServeFailure::Local)),
             (ProtocolError::Unauthenticated, Some(ServeFailure::Unauthenticated)),
             (ProtocolError::Fault("x".into()), Some(ServeFailure::Fault)),
+            (ProtocolError::Release("x".into()), Some(ServeFailure::Release)),
         ];
         for (error, expected) in cases {
             assert_eq!(ServeFailure::of(&error), expected, "{error}");

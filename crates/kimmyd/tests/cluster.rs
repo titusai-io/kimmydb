@@ -807,13 +807,19 @@ async fn bins_on(
 /// Two binary `_id`s that differ only by subtype are two documents on every member:
 /// `BinData(0, X)` is inserted on A and `BinData(4, X)` on B, C updates the second and A deletes
 /// the first. Every member ends with `BinData(4, X)` holding C's body and `BinData(0, X)` gone,
-/// the digest shows no finding, and an empty fourth member that catches up by whole-database
-/// snapshot reaches the same state.
+/// the digest shows no finding, and an empty fourth member, started after the oplog
+/// retention has collected A's history, catches up by whole-database snapshot and reaches the
+/// same state.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn two_binary_subtypes_of_one_byte_string_replicate_as_two_documents() {
     let client = reqwest::Client::new();
-    let (a, b, c) = three_nodes(&client).await;
+    // A short oplog window, so that A's history is gone by the time the fourth member asks.
+    let (a, b, c) = three_nodes_with(
+        &client,
+        "oplog_retention_secs = 8\ntombstone_retention_secs = 600\ngc_interval_secs = 2",
+    )
+    .await;
     eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
     let (generic, uuid) = (binary_id(0x00), binary_id(0x04));
 
@@ -899,7 +905,10 @@ async fn two_binary_subtypes_of_one_byte_string_replicate_as_two_documents() {
     })
     .await;
 
-    // An empty fourth member, which knows only A, takes the whole database by snapshot.
+    // An empty fourth member, which knows only A, started once A's oplog window has passed
+    // and its history is collected: A answers it beyond its horizon, and it takes the whole
+    // database by snapshot.
+    tokio::time::sleep(Duration::from_secs(14)).await;
     let d = Node::spawn_with("node-d", ports::choose(), &[a.cluster], "");
     d.wait_ready(&client).await;
     let d_token = d.login(&client).await;
@@ -913,6 +922,12 @@ async fn two_binary_subtypes_of_one_byte_string_replicate_as_two_documents() {
         async move { d.gauge(client, "kimmy_sync_digest_divergent_collections").await == Some(0) }
     })
     .await;
+    let log =
+        std::fs::read_to_string(d.dir.path().join("stderr.log")).unwrap_or_default() + &d.log();
+    assert!(
+        log.contains("falling back to a snapshot"),
+        "the fourth member caught up by the oplog, not by snapshot:\n{log}"
+    );
 }
 
 /// A schema change made right after its collection reaches every member.

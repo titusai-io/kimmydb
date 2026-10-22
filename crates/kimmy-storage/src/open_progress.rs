@@ -1,17 +1,16 @@
 //! What a store's open is doing, for a probe to answer while it runs.
 //!
 //! `Engine::open` can take minutes on a large store: redb's repair after an
-//! unclean stop, the schema migration, the walk that verifies the version
-//! vector and the live counts' rebuild all run before it returns. The daemon
+//! unclean stop, the walk that verifies the version vector and the live
+//! counts' rebuild all run before it returns. The daemon
 //! listens before it opens (ADR-198), and this is what its `/readyz` says in
 //! the meantime: the phase, how long it has lasted, and how far through it is.
 //!
 //! One store is opened at a time in a daemon, so the state is process-wide:
 //! an atomic phase, its start, a done and a total. It changes no behaviour of
 //! the open, except that a stop asked for during it ([`request_open_stop`]) is
-//! honoured at the two points that can take it safely: between two of the
-//! migration's chunks (which are resumable, one commit each), and in the
-//! verification walk, which is abandoned and simply not recorded.
+//! honoured where it can be taken safely: in the verification walk, which is
+//! abandoned and simply not recorded.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
@@ -28,46 +27,26 @@ pub enum OpenPhase {
     Repairing = 1,
     /// Opening the file and reading its tables.
     Opening = 2,
-    /// The schema migration's re-key of one collection's documents (ADR-238):
-    /// rows moved of `total`, first into the staging table and then back.
-    Migrating = 3,
     /// The walk that verifies the version vector against the oplog: rows
     /// read of the oplog's rows.
-    Verifying = 4,
+    Verifying = 3,
     /// Rebuilding the live document counts.
-    Counting = 5,
+    Counting = 4,
     /// The store is open and the node is starting its tasks, before it
     /// serves.
-    Starting = 6,
+    Starting = 5,
     /// Burying what a database's drop covers (ADR-229): `done` of `total`
     /// databases, before the node serves.
-    Reconciling = 7,
-    /// The schema migration's drain of one index (ADR-238): entries removed of
-    /// `total`, the index's entries counted before its first chunk; and, before
-    /// a TTL partial index's drain, its count, documents scanned of the
-    /// collection's documents.
-    Draining = 8,
-    /// The schema migration's refill of one collection's indexes (ADR-238):
-    /// documents walked of `total`, the collection's documents when the refill
-    /// began, raised to stay ahead of `done` and set to it when the refill ends.
-    Refilling = 9,
-    /// The schema migration's preflight (ADR-238): its read of the documents
-    /// with a number `_id`, rows read of `total`, before anything of the
-    /// migration is written.
-    Preflight = 10,
+    Reconciling = 6,
 }
 
 impl OpenPhase {
     /// Every phase a probe reports, `Idle` (no open running) left out. A test
     /// holds this to the numbering and to the phases the OpenAPI document lists.
-    pub const fn reported() -> [OpenPhase; 10] {
+    pub const fn reported() -> [OpenPhase; 6] {
         [
             Self::Repairing,
             Self::Opening,
-            Self::Preflight,
-            Self::Migrating,
-            Self::Draining,
-            Self::Refilling,
             Self::Verifying,
             Self::Counting,
             Self::Starting,
@@ -80,14 +59,10 @@ impl OpenPhase {
             Self::Idle => "idle",
             Self::Repairing => "repairing",
             Self::Opening => "opening",
-            Self::Migrating => "migrating",
             Self::Verifying => "verifying",
             Self::Counting => "counting",
             Self::Starting => "starting",
             Self::Reconciling => "reconciling",
-            Self::Draining => "draining",
-            Self::Refilling => "refilling",
-            Self::Preflight => "preflight",
         }
     }
 
@@ -95,14 +70,10 @@ impl OpenPhase {
         match n {
             1 => Self::Repairing,
             2 => Self::Opening,
-            3 => Self::Migrating,
-            4 => Self::Verifying,
-            5 => Self::Counting,
-            6 => Self::Starting,
-            7 => Self::Reconciling,
-            8 => Self::Draining,
-            9 => Self::Refilling,
-            10 => Self::Preflight,
+            3 => Self::Verifying,
+            4 => Self::Counting,
+            5 => Self::Starting,
+            6 => Self::Reconciling,
             _ => Self::Idle,
         }
     }

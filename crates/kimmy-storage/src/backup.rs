@@ -349,7 +349,7 @@ pub fn restore_with(
                 "the backup was written under storage schema {found} (this build: {}), and \
                  nothing was restored. {}",
                 build.schema,
-                crate::migrate::NO_UPGRADE
+                crate::migrate::no_upgrade()
             ),
         });
     }

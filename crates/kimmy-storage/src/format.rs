@@ -406,7 +406,7 @@ fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> R
                 sidecar.written_by,
                 sidecar.schema,
                 build.schema,
-                crate::migrate::NO_UPGRADE
+                crate::migrate::no_upgrade()
             ),
         ));
     }
@@ -519,7 +519,7 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
                         "it was written by a build that left no kimmy.format, with storage \
                          schema {schema} (this build: {}). {}",
                         build.schema,
-                        crate::migrate::NO_UPGRADE
+                        crate::migrate::no_upgrade()
                     ),
                 ));
             }

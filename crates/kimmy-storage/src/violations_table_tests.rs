@@ -909,3 +909,33 @@ fn a_violation_written_between_the_passes_check_and_its_advance_is_covered() {
     assert_in_step(&engine, "after the interleaved advance");
     same_answer(&engine, &coll, "after the interleaved advance");
 }
+
+/// Two standing violations whose holders are 16-byte binaries of one subtype are
+/// two groups: a group is told apart by its ids, not by their `Display` text,
+/// which names a binary by its length alone.
+#[test]
+fn groups_of_same_length_binary_holders_are_reported_apart() {
+    let (engine, coll, _dir) = store();
+    let binary = |byte: u8| {
+        bson::Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: vec![byte; 16],
+        })
+    };
+    for (n, (mine, theirs)) in [(1u8, 2u8), (3, 4)].into_iter().enumerate() {
+        let email = format!("e{n}@x");
+        engine.insert(&coll, doc! { "_id": binary(mine), "email": email.clone() }).unwrap();
+        let entry = OplogEntry {
+            stamp: Stamp::new(Hlc::new(9_000 + n as u64, 0), NodeId::generate()),
+            kind: OpKind::Insert,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::try_from_bson(&binary(theirs)).unwrap()),
+            body: Some(
+                bson::serialize_to_vec(&doc! { "_id": binary(theirs), "email": email }).unwrap(),
+            ),
+        };
+        assert!(engine.apply_remote(&coll, &entry).unwrap());
+    }
+    let groups = engine.live_unique_violations(&coll, None, WalkScope::Request).unwrap();
+    assert_eq!(groups.len(), 2, "{groups:?}");
+}
