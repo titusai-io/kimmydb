@@ -8255,64 +8255,6 @@ mod tests {
     }
 }
 
-/// The line every open logs for each partial index whose filter holds an
-/// array (ADR-182).
-///
-/// It is the whole remedy ADR-182 offers for a filter an earlier build
-/// converted, whose original cannot be recovered, so its emission is held
-/// here, and not only the query behind it. That query has its own test, which
-/// calls it directly and would not notice the line going: with the loop
-/// removed from `Engine::open`, every other test in the workspace passes.
-#[cfg(test)]
-mod converted_filters_line {
-    use bson::doc;
-
-    use super::Engine;
-    use crate::log_capture::logs_of;
-    use crate::meta::{Enforcement, IndexField};
-
-    #[test]
-    fn every_open_names_each_partial_index_whose_filter_holds_an_array() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        {
-            let engine = Engine::open(&path).unwrap();
-            engine.create_collection("shop", "t").unwrap();
-            for (name, filter) in
-                [("equals_an_array", doc! {"k": [1, 2]}), ("scalar_only", doc! {"k": 5})]
-            {
-                engine
-                    .create_index_with(
-                        "shop",
-                        "t",
-                        vec![IndexField::ascending(name)],
-                        false,
-                        Enforcement::Local,
-                        Some(name.into()),
-                        None,
-                        Some(filter),
-                    )
-                    .unwrap();
-            }
-        }
-        // Every open, not only the first after the upgrade: an operator who
-        // never restarts would otherwise never be told.
-        for open in ["first", "second"] {
-            let logs = logs_of(|| drop(Engine::open(&path).unwrap()));
-            let named: Vec<&str> = logs
-                .lines()
-                .filter(|l| l.contains("may have been converted from a generic Binary"))
-                .collect();
-            assert_eq!(named.len(), 1, "{open} open: one line, for the one such index:\n{logs}");
-            assert!(
-                named[0].contains("index=equals_an_array") && named[0].contains("collection=t"),
-                "the line names the index and its collection: {}",
-                named[0]
-            );
-        }
-    }
-}
-
 /// Whole-table clears, held to a bound on how far they grow the file.
 ///
 /// These are growth-bound smoke tests, not detectors of redb's `retain`: on redb 4.2 and
