@@ -770,6 +770,151 @@ async fn replication_converges_through_gossip_discovered_peers() {
     .await;
 }
 
+/// A binary `_id` of sixteen fixed bytes under `subtype`, as the API takes it.
+fn binary_id(subtype: u8) -> serde_json::Value {
+    bson::Bson::Binary(bson::Binary { subtype: subtype.into(), bytes: vec![0x5a; 16] })
+        .into_relaxed_extjson()
+}
+
+/// The documents `node` holds in `shop.bins`, as `(subtype, who)` pairs in `_id` order.
+async fn bins_on(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+) -> Option<Vec<(String, String)>> {
+    let res = client
+        .post(node.url("/v1/db/shop/coll/bins/find"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "filter": {}, "sort": { "_id": 1 } }))
+        .send()
+        .await
+        .ok()?;
+    let body = res.json::<serde_json::Value>().await.ok()?;
+    let documents = body["documents"].as_array()?;
+    Some(
+        documents
+            .iter()
+            .map(|d| {
+                (
+                    d["_id"]["$binary"]["subType"].as_str().unwrap_or("?").to_string(),
+                    d["who"].as_str().unwrap_or("?").to_string(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Two binary `_id`s that differ only by subtype are two documents on every member:
+/// `BinData(0, X)` is inserted on A and `BinData(4, X)` on B, C updates the second and A deletes
+/// the first. Every member ends with `BinData(4, X)` holding C's body and `BinData(0, X)` gone,
+/// the digest shows no finding, and an empty fourth member that catches up by whole-database
+/// snapshot reaches the same state.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn two_binary_subtypes_of_one_byte_string_replicate_as_two_documents() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let (generic, uuid) = (binary_id(0x00), binary_id(0x04));
+
+    let a_token = a.login(&client).await;
+    let b_token = b.login(&client).await;
+    let c_token = c.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({ "name": "bins" }))
+        .send()
+        .await
+        .unwrap();
+    eventually("the collection to reach B", || {
+        let (client, b, b_token) = (&client, &b, &b_token);
+        async move { bins_on(client, b, b_token).await.is_some() }
+    })
+    .await;
+
+    let inserted = client
+        .post(a.url("/v1/db/shop/coll/bins/docs"))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({ "_id": generic, "who": "a" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inserted.status(), 200, "{:?}", inserted.text().await);
+    let inserted = client
+        .post(b.url("/v1/db/shop/coll/bins/docs"))
+        .bearer_auth(&b_token)
+        .json(&serde_json::json!({ "_id": uuid, "who": "b" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inserted.status(), 200, "{:?}", inserted.text().await);
+
+    let both = vec![("00".to_string(), "a".to_string()), ("04".to_string(), "b".to_string())];
+    for (node, token) in [(&a, &a_token), (&b, &b_token), (&c, &c_token)] {
+        eventually("both documents to reach the member", || {
+            let (client, both) = (&client, &both);
+            async move { bins_on(client, node, token).await.as_ref() == Some(both) }
+        })
+        .await;
+    }
+
+    let updated = client
+        .post(c.url("/v1/db/shop/coll/bins/update"))
+        .bearer_auth(&c_token)
+        .json(
+            &serde_json::json!({ "filter": { "_id": uuid }, "update": { "$set": { "who": "c" } } }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), 200, "{:?}", updated.text().await);
+    let deleted = client
+        .post(a.url("/v1/db/shop/coll/bins/delete"))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({ "filter": { "_id": generic } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 200, "{:?}", deleted.text().await);
+
+    let settled = vec![("04".to_string(), "c".to_string())];
+    for (node, token) in [(&a, &a_token), (&b, &b_token), (&c, &c_token)] {
+        eventually("the member to hold BinData(4, X) as C wrote it and not BinData(0, X)", || {
+            let (client, settled) = (&client, &settled);
+            async move { bins_on(client, node, token).await.as_ref() == Some(settled) }
+        })
+        .await;
+    }
+    eventually("every member to show no divergence finding", || {
+        let (client, nodes) = (&client, [&a, &b, &c]);
+        async move {
+            for node in nodes {
+                if node.gauge(client, "kimmy_sync_digest_divergent_collections").await != Some(0) {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
+
+    // An empty fourth member, which knows only A, takes the whole database by snapshot.
+    let d = Node::spawn_with("node-d", ports::choose(), &[a.cluster], "");
+    d.wait_ready(&client).await;
+    let d_token = d.login(&client).await;
+    eventually("the fourth member to hold the same state", || {
+        let (client, d, d_token, settled) = (&client, &d, &d_token, &settled);
+        async move { bins_on(client, d, d_token).await.as_ref() == Some(settled) }
+    })
+    .await;
+    eventually("the fourth member to show no divergence finding", || {
+        let (client, d) = (&client, &d);
+        async move { d.gauge(client, "kimmy_sync_digest_divergent_collections").await == Some(0) }
+    })
+    .await;
+}
+
 /// A schema change made right after its collection reaches every member.
 ///
 /// The regression from the first form of ADR-140's push. The index, pushed

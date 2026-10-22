@@ -1046,10 +1046,8 @@ async fn find_by_id(server: &Server, token: &str, coll: &str, id: &Value) -> Vec
 /// An insert, a bulk insert and an upserting `find_and_modify` answer the
 /// `_id` they stored, a binary's subtype included.
 ///
-/// The echo was rendered from the document key, which folds every binary to
-/// subtype 00: a UUID `_id` came back as a generic binary of the same bytes,
-/// and `find {_id: <echo>}` then matched nothing, because a filter compares
-/// the subtype the key does not hold.
+/// The echo carries the subtype the client sent, and `find {_id: <echo>}`
+/// finds the document.
 #[tokio::test]
 async fn every_insert_route_echoes_the_binary_id_it_stored_with_its_subtype() {
     let server = Server::start().await;
@@ -1226,6 +1224,187 @@ async fn a_duplicate_binary_id_is_refused_naming_the_value() {
     assert_eq!(res.status, 409, "{:?}", res.body);
     let message = res.body["message"].as_str().unwrap();
     assert!(message.contains("index 1") && message.contains(&named), "{message}");
+}
+
+/// A binary `_id` of the fixed bytes of length `len` under `subtype`: two
+/// subtypes of it are the two ids that differ by subtype alone.
+fn same_bytes_id(subtype: u8, len: usize) -> Value {
+    bson::Bson::Binary(bson::Binary { subtype: subtype.into(), bytes: vec![7; len] })
+        .into_relaxed_extjson()
+}
+
+/// Two ids that differ only by binary subtype are two documents, on insert,
+/// find, update, delete, upsert and bulk, and a duplicate of one is refused
+/// without touching the other.
+#[tokio::test]
+async fn two_subtypes_of_one_byte_string_are_two_documents() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["c", "bulk", "up"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    let (generic, uuid) = (same_bytes_id(0x00, 16), same_bytes_id(0x04, 16));
+    assert_ne!(generic, uuid);
+
+    for (id, tag) in [(&generic, "generic"), (&uuid, "uuid")] {
+        let res = server
+            .post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "tag": tag}))
+            .await;
+        assert_eq!(res.status, 200, "{tag}: {:?}", res.body);
+        assert_eq!(&res.body["insertedId"], id);
+    }
+    for (id, tag) in [(&generic, "generic"), (&uuid, "uuid")] {
+        let found = find_by_id(&server, &token, "c", id).await;
+        assert_eq!(found.len(), 1, "{tag}: {found:?}");
+        assert_eq!(found[0]["tag"], tag);
+        assert_eq!(&found[0]["_id"], id);
+    }
+
+    // A second insert of one subtype is still a duplicate.
+    let res = server
+        .post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": uuid, "tag": "again"}))
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key");
+    assert_eq!(find_by_id(&server, &token, "c", &uuid).await[0]["tag"], "uuid");
+
+    // An update of one leaves the other untouched.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({"filter": {"_id": uuid}, "update": {"$set": {"tag": "uuid2"}}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 1, "{:?}", res.body);
+    assert_eq!(find_by_id(&server, &token, "c", &uuid).await[0]["tag"], "uuid2");
+    assert_eq!(find_by_id(&server, &token, "c", &generic).await[0]["tag"], "generic");
+
+    // A delete of one leaves the other.
+    let res = server
+        .post("/v1/db/shop/coll/c/delete", Some(&token), json!({"filter": {"_id": generic}}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["deleted"], 1, "{:?}", res.body);
+    assert!(find_by_id(&server, &token, "c", &generic).await.is_empty());
+    assert_eq!(find_by_id(&server, &token, "c", &uuid).await[0]["tag"], "uuid2");
+
+    // A bulk insert that holds both, and a duplicate of one inside a batch.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/bulk/bulk",
+            Some(&token),
+            json!([{"_id": generic, "tag": "generic"}, {"_id": uuid, "tag": "uuid"}]),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["insertedIds"], json!([generic, uuid]));
+    for (id, tag) in [(&generic, "generic"), (&uuid, "uuid")] {
+        assert_eq!(find_by_id(&server, &token, "bulk", id).await[0]["tag"], tag);
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/bulk/bulk",
+            Some(&token),
+            json!([{"_id": same_bytes_id(0x03, 16)}, {"_id": same_bytes_id(0x03, 16)}]),
+        )
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+
+    // An upsert of each creates its own document.
+    for (id, tag) in [(&generic, "generic"), (&uuid, "uuid")] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/up/find_and_modify",
+                Some(&token),
+                json!({ "filter": {"_id": id}, "update": {"$set": {"tag": tag}}, "upsert": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{tag}: {:?}", res.body);
+        assert_eq!(res.body["upserted"], true, "{tag}: the other subtype is not a match");
+        assert_eq!(&res.body["upsertedId"], id);
+    }
+    for (id, tag) in [(&generic, "generic"), (&uuid, "uuid")] {
+        let found = find_by_id(&server, &token, "up", id).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["tag"], tag);
+    }
+}
+
+/// `sort {_id: 1}` orders binary ids as MongoDB does, by length, then subtype,
+/// then bytes; `{_id: -1}` is its exact mirror; and a pager of one sees each
+/// document once.
+#[tokio::test]
+async fn binary_ids_sort_by_length_then_subtype_then_bytes() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "c"})).await;
+    // Inserted out of order.
+    let mut expected = Vec::new();
+    for len in [5usize, 16] {
+        for subtype in [0x00u8, 0x03, 0x04, 0x80] {
+            expected.push(same_bytes_id(subtype, len));
+        }
+    }
+    for id in expected.iter().rev() {
+        let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id})).await;
+        assert_eq!(res.status, 200, "{id}: {:?}", res.body);
+    }
+
+    let ids_of = |body: &Value| -> Vec<Value> {
+        body["documents"].as_array().unwrap().iter().map(|d| d["_id"].clone()).collect()
+    };
+    let up =
+        server.post("/v1/db/shop/coll/c/find", Some(&token), json!({"sort": {"_id": 1}})).await;
+    assert_eq!(up.status, 200, "{:?}", up.body);
+    assert_eq!(ids_of(&up.body), expected);
+    let down =
+        server.post("/v1/db/shop/coll/c/find", Some(&token), json!({"sort": {"_id": -1}})).await;
+    assert_eq!(down.status, 200, "{:?}", down.body);
+    let mut mirrored = ids_of(&down.body);
+    mirrored.reverse();
+    assert_eq!(mirrored, expected, "descending is the exact mirror of ascending");
+
+    // A pager of one sees each document once, in that order.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..expected.len() + 2 {
+        let mut req = json!({"filter": {}, "limit": 1, "sort": {"_id": 1}});
+        if let Some(c) = &cursor {
+            req["cursor"] = json!(c);
+        }
+        let res = server.post("/v1/db/shop/coll/c/find", Some(&token), req).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        seen.extend(ids_of(&res.body));
+        match res.body.get("nextCursor").and_then(|c| c.as_str()) {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected, "each document once, in order");
+}
+
+/// A change stream's `documentKey` names the binary `_id` with its subtype.
+#[tokio::test]
+async fn a_change_stream_names_a_binary_id_with_its_subtype() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "c"})).await;
+    let mut socket = open_watch(&server.base, "/v1/db/shop/coll/c/watch", &token).await;
+    let (generic, uuid) = (same_bytes_id(0x00, 16), same_bytes_id(0x04, 16));
+    for id in [&generic, &uuid] {
+        let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id})).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    for id in [&generic, &uuid] {
+        let frame =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_text_frame(&mut socket))
+                .await
+                .expect("an event should arrive");
+        let event: Value = serde_json::from_str(&frame).expect("a JSON event");
+        assert_eq!(&event["documentKey"]["_id"], id, "{event}");
+    }
 }
 
 #[tokio::test]
@@ -3613,10 +3792,7 @@ async fn standing_unique_violations_are_reported_until_resolved() {
 }
 
 /// The violations report names each holder by the `_id` it stored: a UUID
-/// holder with subtype 04, where the report used to fold it to 00.
-///
-/// The peer's entry carries the folded document id, as every replicated
-/// entry does, and its body the UUID: the report reads the holder.
+/// holder with subtype 04.
 #[tokio::test]
 async fn a_violation_names_a_uuid_holder_with_its_subtype() {
     let server = Server::start().await;

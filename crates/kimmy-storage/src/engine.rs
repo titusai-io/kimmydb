@@ -1391,10 +1391,9 @@ impl Engine {
         }
         txn.commit()?;
 
-        // Before anything reads a collection id: schema 1 allocated them from a
-        // counter, schema 2 derives them from the name.
+        // A fresh store is stamped with this build's schema.
         let build = cleared.build.clone();
-        let unreported = crate::migrate::run(&db, path, &|schema| {
+        crate::migrate::run(&db, path, &|schema| {
             crate::format::raise_schema(path, schema, &build)
         })?;
         // The redb that last opened this store for writing, in the store too,
@@ -1542,19 +1541,6 @@ impl Engine {
         // long as the drop had left, and a restart part-way through a large
         // purge is exactly when a node is most wanted back.
         engine.announce_owed_purges()?;
-
-        // The collisions a migration's rebuild of a unique partial index found
-        // (ADR-183), reported as a replicated build's are, now that there is
-        // an engine to count them and log their entries.
-        for (meta, violations) in &unreported {
-            engine.report_index_backfill_violations(meta, violations)?;
-        }
-        // Only now, once every one of them was reported: they are held in the
-        // store precisely so that a crash before this point does not lose them,
-        // so deleting them any earlier would defeat that. Whatever was reported,
-        // even nothing: rows whose collection or index is gone are not reported,
-        // and would otherwise keep the table for good.
-        crate::migrate::forget_reported_violations(engine.db())?;
 
         // Whether the violations table is complete: after the reports above, so
         // the tail it is compared with includes them (ADR-200).
@@ -6173,12 +6159,11 @@ mod tests {
         // Where a commit happens before or outside an open `Engine`, and so
         // cannot be counted by one. Each is a whole-file exemption because each
         // file's entire job is one of these.
-        const NO_ENGINE_YET: [&str; 5] = [
-            "migrate.rs",    // runs on the raw database during `Engine::open`
-            "migrate_v5.rs", // the schema 5 migration, likewise, a chunk per commit
-            "live_walk.rs",  // the open's rebuild of the counts and digests, in chunks
-            "backup.rs",     // restores into a fresh file that no engine has opened
-            "engine.rs",     // `Engine::open` itself, plus the chokepoint
+        const NO_ENGINE_YET: [&str; 4] = [
+            "migrate.rs",   // runs on the raw database during `Engine::open`
+            "live_walk.rs", // the open's rebuild of the counts and digests, in chunks
+            "backup.rs",    // restores into a fresh file that no engine has opened
+            "engine.rs",    // `Engine::open` itself, plus the chokepoint
         ];
 
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

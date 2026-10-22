@@ -24,9 +24,9 @@ ObjectId is its hex, an integer its decimal and a String itself, as before, but
 a binary `_id` is `~b:`, its bytes in hex, `.` and its subtype (a UUID's
 ends `.04`), and a String that could be read as another type (one that begins
 with `~`, is 24 lowercase hex digits, or is an integer's decimal) is `~s:` and
-itself. Until 0.51.0 a binary `_id` was written as its length, so every UUID in a
-collection shared one chunk set; see [Operations](operations.md#vector-chunk-ids-in-0510)
-for what the first start of 0.51.0 does about the chunks such a collection holds.
+itself. Since 0.53.0 the binary `_id` the chunk names and the `_id` a hit returns are the
+same exact id, subtype included ([ADR-251](decisions.md#adr-251--binary-_id-subtypes)): two
+documents that differ only by subtype have separate chunks and separate hits.
 
 Nothing special maintains it. A background worker subscribes to the oplog as an
 ordinary change-stream consumer and reacts to what it sees:

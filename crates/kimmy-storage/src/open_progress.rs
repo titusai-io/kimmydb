@@ -125,24 +125,6 @@ static SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static STOP: AtomicBool = AtomicBool::new(false);
-/// `KIMMY_TEST_OPEN_STEP_MS`: how long each migration step waits after its
-/// commit, for a test that needs to stop an open between two of them.
-static TEST_STEP_MS: AtomicU64 = AtomicU64::new(0);
-
-/// Make every migration step wait `pause` after its commit (0 for none). A test
-/// switch, set once before the open.
-pub fn set_test_open_step_pause(pause: Duration) {
-    TEST_STEP_MS.store(u64::try_from(pause.as_millis()).unwrap_or(u64::MAX), Relaxed);
-}
-
-/// The wait [`set_test_open_step_pause`] asked for, in slices so a stop ends it.
-pub(crate) fn test_step_pause() {
-    let until = Instant::now() + Duration::from_millis(TEST_STEP_MS.load(Relaxed));
-    while Instant::now() < until && !open_stop_requested() {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -173,18 +155,6 @@ pub(crate) fn set_open_done(done: u64) {
     #[cfg(test)]
     tests::THIS_THREAD_DONE.with(|seen| seen.set(done));
     DONE.store(done, Relaxed);
-}
-
-/// A new total for the current phase: when its first was an estimate the work
-/// has outrun, and when a step ends, its final total.
-pub(crate) fn set_open_total(total: u64) {
-    #[cfg(test)]
-    tests::THIS_THREAD_PHASE.with(|seen| {
-        if let Some((phase, _)) = seen.get() {
-            seen.set(Some((phase, total)));
-        }
-    });
-    TOTAL.store(total, Relaxed);
 }
 
 /// The open in progress, as a probe reads it.

@@ -340,9 +340,7 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
                         if live {
                             *counts.entry(collection).or_default() += 1;
                         }
-                        // The legacy form, as every fold site hashes (`live_digest`).
-                        let key = kimmy_core::keyenc::legacy_of_stored(doc_key);
-                        live_digest::fold_walked(&mut digests, collection, &key, &stamp, live);
+                        live_digest::fold_walked(&mut digests, collection, doc_key, &stamp, live);
                     }
                     // Not counted, as no reader can return it either; refusing
                     // to open over one unreadable record would be worse than a

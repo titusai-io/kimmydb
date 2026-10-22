@@ -94,33 +94,9 @@
 //! walked, so the first page's vector never claims a document the snapshot
 //! did not carry; whatever the sender wrote after it is above that vector and
 //! the next round pulls it from the oplog, which is where it still is.
-//!
-//! # Keys on a page are legacy
-//!
-//! A page carries document keys in two places: a carried delete's
-//! [`SnapshotTombstone::key`] and the cursor, [`SnapshotCursor::after_key`].
-//! Schema 5 changed the stored bytes of every number key, and in a mixed roll
-//! the other end may be a 0.50 member, which stores, sends and reads schema-4
-//! keys. So both are the frozen schema-4 form on the wire (Decimal128 design
-//! 7.1; `kimmy_core::legacy_key`), and the conversions live here, at the
-//! engine's wire API and nowhere else: [`Engine::snapshot_page`] converts the
-//! request's cursor to the stored form on entry and every key to the legacy form
-//! on exit, and [`Engine::apply_snapshot_page`] converts every carried delete's
-//! key to the stored form as its first act, before the policy dispatch, so the
-//! `All`, `Converge` and `Definitions` paths only ever see stored keys
-//! (`CarriedDelete`). A page's `next` is **not** converted by a receiver: it
-//! is stored as received and sent back, and only a sender uses a cursor as a
-//! bound. The transport passes frames through unchanged, so every caller, the
-//! model tests included, exercises these conversions.
-//!
-//! Left unconverted, the receiver's point read of a received schema-4 key in a
-//! schema-5 `DOCS` can find **another** document: the schema-5 key of id
-//! `0x5000008101800000` is byte for byte the schema-4 key of `0x50007F8081018000`
-//! (design 6.1), so a delete of the second would land on the first.
 
 use std::fmt;
 
-use kimmy_core::keyenc;
 use kimmy_core::{
     CollectionId, DocId, Hlc, IndexMeta, NodeId, OpKind, OplogEntry, Stamp, VectorConfig,
     VersionVector,
@@ -188,8 +164,8 @@ pub(crate) const CURSOR_OVERHEAD: usize = 256;
 /// The bytes `n` bytes cross in when serde writes them as a sequence, which it
 /// does for a `Vec<u8>` without `serde_bytes`: a BSON array of `int32`s, each an
 /// element of a type byte, its decimal index as a C string and four bytes, about
-/// ten bytes a byte. So cross a `DocId::Binary` and a cursor's key
-/// ([`SnapshotCursor::after_key`]); the wire is left as it is.
+/// ten bytes a byte. So crosses a cursor's key ([`SnapshotCursor::after_key`]);
+/// the wire is left as it is.
 pub(crate) fn byte_array_wire_len(n: usize) -> usize {
     // The array's length and its terminator, and each element's type byte, the
     // index's terminator and the int32.
@@ -206,12 +182,12 @@ pub(crate) fn byte_array_wire_len(n: usize) -> usize {
 }
 
 /// What a document's `_id` costs on a page as it crosses, a bound: a binary one
-/// is an array of `int32`s ([`byte_array_wire_len`]), a string its bytes and
-/// their length and terminator, every other kind at most 32 bytes. The variant's
+/// is its bytes and at most 32 more for the subtype and framing, a string its
+/// bytes and their length and terminator, every other kind at most 32 bytes. The variant's
 /// name and framing are in [`DOCUMENT_OVERHEAD`].
 pub(crate) fn id_wire_len(id: &DocId) -> usize {
     match id {
-        DocId::Binary(bytes) => byte_array_wire_len(bytes.len()),
+        DocId::Binary { bytes, .. } => bytes.len() + 32,
         DocId::String(text) => text.len() + 5,
         _ => 32,
     }
@@ -227,11 +203,14 @@ const ID_NAME_PREFIX: usize = 24;
 /// gives the same name.
 pub(crate) fn id_name(id: &DocId) -> String {
     match id {
-        DocId::Binary(bytes) => {
+        DocId::Binary { subtype, bytes } => {
             let shown = &bytes[..bytes.len().min(ID_NAME_PREFIX)];
             let hex: String = shown.iter().map(|byte| format!("{byte:02x}")).collect();
             let more = if shown.len() < bytes.len() { "..." } else { "" };
-            format!("binary _id of {} bytes starting {hex}{more}", bytes.len())
+            format!(
+                "binary _id of subtype {subtype} and {} bytes starting {hex}{more}",
+                bytes.len()
+            )
         }
         DocId::String(text) => {
             let mut end = 0;
@@ -248,12 +227,10 @@ pub(crate) fn id_name(id: &DocId) -> String {
     }
 }
 
-/// What the cursor a page cuts after a row whose stored key is `stored_key`
-/// bytes long costs it, a bound: its key crosses in the legacy form, which is at
-/// most one byte longer, or 12 bytes for an integer ([`kimmy_core::legacy_key`]),
-/// as an array of `int32`s.
-pub(crate) fn cursor_reserve(stored_key: usize) -> usize {
-    CURSOR_OVERHEAD + byte_array_wire_len(stored_key.max(11) + 1)
+/// What the cursor a page cuts after a row whose key is `key` bytes long costs
+/// it, a bound: the key crosses as an array of `int32`s.
+pub(crate) fn cursor_reserve(key: usize) -> usize {
+    CURSOR_OVERHEAD + byte_array_wire_len(key)
 }
 
 /// What applying a snapshot page does (ADR-148, ADR-152, and the repair of a
@@ -293,8 +270,7 @@ pub struct SnapshotCursor {
     /// beyond a peer's retention horizon — the only case a snapshot serves —
     /// could never catch up. Same defect as ADR-031's, on the other wire type.
     pub collection: CollectionId,
-    /// Encoded document key, in the legacy (schema-4) form on the wire (module
-    /// docs); the next page starts strictly after it.
+    /// Encoded document key; the next page starts strictly after it.
     pub after_key: Vec<u8>,
 }
 
@@ -424,37 +400,32 @@ pub struct SnapshotDoc {
 pub struct SnapshotTombstone {
     /// See [`SnapshotCursor::collection`] for why this is not a `u64`.
     pub collection: CollectionId,
-    /// The encoded document key the tombstone is stored under, in the legacy
-    /// (schema-4) form on the wire (module docs).
+    /// The encoded document key the tombstone is stored under.
     #[serde(with = "serde_bytes")]
     pub key: Vec<u8>,
     /// The stamp of the delete.
     pub stamp: Stamp,
 }
 
-/// A delete a received page carries, with its key in the **stored** form: what the
-/// receiver's paths work with (module docs, "Keys on a page are legacy").
+/// A delete a received page carries, as the receiver's paths work with it.
 ///
-/// A type of its own rather than a [`SnapshotTombstone`] with its key rewritten, so
-/// that a wire tombstone, whose key is legacy, cannot reach a read or a write of
-/// `DOCS`: only [`CarriedDelete::of_page`] makes one.
+/// Only [`CarriedDelete::of_page`] makes one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CarriedDelete {
     collection: CollectionId,
-    /// The stored (schema-5) key.
+    /// The stored key.
     key: Vec<u8>,
     stamp: Stamp,
 }
 
 impl CarriedDelete {
-    /// The page's carried deletes, each key converted from the legacy form to the
-    /// stored one (total: bytes in neither form are kept as they are).
+    /// The page's carried deletes.
     fn of_page(page: &SnapshotPage) -> Vec<Self> {
         page.deleted_documents
             .iter()
             .map(|tombstone| CarriedDelete {
                 collection: tombstone.collection,
-                key: keyenc::stored_of_legacy(&tombstone.key),
+                key: tombstone.key.clone(),
                 stamp: tombstone.stamp,
             })
             .collect()
@@ -927,18 +898,6 @@ impl Engine {
         // the whole database, the one collection's for a repair.
         let dropped_indexes = self.indexes_dropped(scope)?;
 
-        // The wire boundary (Decimal128 design 7.1): every key on a page, the
-        // cursor the requester sends back included, is the frozen schema-4 form,
-        // which is what a 0.50 member stores, sends and reads. The walk works on
-        // the stored form, so the request's cursor is converted on the way in and
-        // every key on the way out. A requester stores the cursor as it received
-        // it (`SnapshotProgress`, `SNAPSHOT_PROGRESS`), so it is legacy whichever
-        // build sent it, and the walk is in value order in both forms, so it
-        // resumes where it ended.
-        let after = after.map(|cursor| SnapshotCursor {
-            after_key: keyenc::stored_of_legacy(&cursor.after_key),
-            ..cursor
-        });
         // The page's parts other than its rows, measured as they will be
         // encoded: what its rows have left of `SNAPSHOT_PAGE_BYTES`.
         let fixed = bson::serialize_to_vec(&SnapshotPage {
@@ -954,15 +913,8 @@ impl Engine {
         })
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
-        let (documents, mut deleted_documents, next) =
+        let (documents, deleted_documents, next) =
             self.snapshot_rows(after, scope, self.snapshot_rows_room(fixed), first)?;
-        for tombstone in &mut deleted_documents {
-            tombstone.key = keyenc::legacy_of_stored(&tombstone.key).into_bytes();
-        }
-        let next = next.map(|cursor| SnapshotCursor {
-            after_key: keyenc::legacy_of_stored(&cursor.after_key).into_bytes(),
-            ..cursor
-        });
         // After the walk: monotone, so a value read later is at least what the rows
         // above were collected under (design 13.1, "where it is read").
         let tombstone_horizon = self.tombstone_horizon()?;
@@ -2009,10 +1961,8 @@ impl Engine {
             };
             // The id read back from the body must encode to the key the
             // tombstone names, or the delete would land on another document. A
-            // stored id can disagree with it: `DocId::try_from_bson` reads any
-            // binary as the generic subtype, while a document written through
-            // `Engine` under a `DocId::Uuid` is keyed under subtype 4. Such a
-            // document keeps its delete here rather than lose another's.
+            // stored id of a well-formed row agrees with it; a row that does
+            // not keeps its delete here rather than lose another's.
             if crate::docs::doc_key(&id)? != tombstone.key {
                 warn!(
                     collection = %tombstone.collection,
@@ -6259,8 +6209,7 @@ mod tests {
         let mut page = a.snapshot_page(None, None).unwrap();
         page.deleted_documents = vec![SnapshotTombstone {
             collection: ca.id,
-            // The wire form, as a sender puts it on a page.
-            key: kimmy_core::keyenc::legacy_key(&DocId::Int64(1)).into_bytes(),
+            key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
             stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()),
         }];
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6513,8 +6462,7 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: vec![SnapshotTombstone {
                 collection: id,
-                // The wire form, as a sender puts it on a page.
-                key: kimmy_core::keyenc::legacy_key(&DocId::Int64(1)).into_bytes(),
+                key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
                 stamp: delete,
             }],
             dropped_indexes: Vec::new(),
@@ -6525,47 +6473,6 @@ mod tests {
         assert!(
             b.get(&cb, &DocId::Int64(1)).unwrap().is_some(),
             "a delete at the floor is history, though it sorts above the tombstone"
-        );
-    }
-
-    #[test]
-    fn a_carried_delete_whose_id_does_not_re_encode_to_its_key_is_not_applied() {
-        // The key check, reachable through `Engine` though not over HTTP: a
-        // document written under `DocId::Uuid` is keyed as binary subtype 4,
-        // and `DocId::try_from_bson` reads its `_id` back as generic binary,
-        // which keys differently. Without the check the delete would land on
-        // whatever B holds under that generic key -- another document.
-        let (a, _da) = engine();
-        let (b, _db) = engine();
-        let ca = a.create_collection("shop", "orders").unwrap();
-        let uuid = uuid::Uuid::from_bytes([7; 16]);
-        a.replace(&ca, &DocId::Uuid(uuid), doc! { "v": 1 }, true).unwrap();
-        b.apply_batch(&a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap())
-            .unwrap();
-        let cb = b.get_collection("shop", "orders").unwrap();
-        let generic = bson::Bson::Binary(bson::Binary {
-            subtype: bson::spec::BinarySubtype::Generic,
-            bytes: uuid.as_bytes().to_vec(),
-        });
-        b.insert(&cb, doc! { "_id": generic, "other": true }).unwrap();
-        assert_eq!(
-            b.count(&cb, crate::WalkScope::Request).unwrap(),
-            2,
-            "the fixture must hold both documents"
-        );
-
-        assert!(a.delete(&ca, &DocId::Uuid(uuid)).unwrap());
-        let page = a.snapshot_page(None, None).unwrap();
-        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
-
-        assert!(
-            b.get(&cb, &DocId::Binary(uuid.as_bytes().to_vec())).unwrap().is_some(),
-            "the delete must never land on another document"
-        );
-        assert_eq!(
-            b.count(&cb, crate::WalkScope::Request).unwrap(),
-            2,
-            "and the mismatched one keeps its delete"
         );
     }
 
@@ -7709,7 +7616,7 @@ mod tests {
         let carried = page
             .deleted_documents
             .iter()
-            .find(|t| t.key == kimmy_core::keyenc::legacy_key(&DocId::Int64(3)).into_bytes());
+            .find(|t| t.key == crate::docs::doc_key(&DocId::Int64(3)).unwrap());
         assert_eq!(stamp_of(3).stamp, carried.unwrap().stamp);
     }
 
@@ -7751,7 +7658,7 @@ mod tests {
         let orphan = DocId::Int64(777);
         let mut page = a.snapshot_page(None, None).unwrap();
         for t in &mut page.deleted_documents {
-            t.key = kimmy_core::keyenc::legacy_key(&orphan).into_bytes();
+            t.key = crate::docs::doc_key(&orphan).unwrap();
         }
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
         assert!(holds_tombstone(&b, &cb, &orphan), "premise: recorded");

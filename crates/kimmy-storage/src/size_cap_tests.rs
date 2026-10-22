@@ -200,12 +200,12 @@ fn the_vectors_of_a_document_whose_id_is_within_the_cap_can_be_stored() {
     for source in [
         DocId::String("a".repeat(MAX_ID_BYTES)),
         DocId::String("a".repeat(MAX_ID_BYTES - 1)),
-        DocId::Binary(vec![1; 3000]),
-        DocId::Binary(vec![1; 2045]),
+        DocId::Binary { subtype: 0, bytes: vec![1; 3000] },
+        DocId::Binary { subtype: 4, bytes: vec![1; 2045] },
     ] {
         let label = match &source {
             DocId::String(s) => format!("string {}", s.len()),
-            DocId::Binary(b) => format!("binary {}", b.len()),
+            DocId::Binary { bytes, .. } => format!("binary {}", bytes.len()),
             _ => unreachable!(),
         };
         if let Err(err) = e.put_vectors(&shadow, &source, &[record(source.clone())]) {

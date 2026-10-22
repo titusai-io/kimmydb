@@ -632,6 +632,18 @@ mod tests {
         lt(short, long);
     }
 
+    #[test]
+    fn binary_orders_by_length_then_subtype_then_bytes() {
+        let bin = |subtype: u8, bytes: Vec<u8>| {
+            Bson::Binary(bson::Binary { subtype: bson::spec::BinarySubtype::from(subtype), bytes })
+        };
+        lt(bin(0xFF, vec![1]), bin(0, vec![0, 0]));
+        lt(bin(0, vec![9]), bin(3, vec![0]));
+        lt(bin(3, vec![9]), bin(4, vec![0]));
+        lt(bin(4, vec![9]), bin(0x80, vec![0]));
+        lt(bin(4, vec![1]), bin(4, vec![2]));
+    }
+
     mod props {
         use proptest::prelude::*;
 

@@ -2073,7 +2073,7 @@ surfaces.
 3. **Since 0.50.0 the repair does this for you** for the ids both members hold at different stamps and the young lost inserts; what it leaves is `left` (above). **Wipe a member only if every id that differs is present on both members and that member holds the older stamp on every one of them**, and only if the repair has not cleared it: if any differing id is present on one member only, wipe neither (apply the operator rule above), because wipe discards what only that member holds.
 4. Then reseed the member that is behind (and only when step 3 allowed it): wipe its data directory and let it catch up from its peers ([A damaged store](#a-damaged-store)); it starts marked as catching up and refuses requests until it holds what they hold ([A member that is catching up](#a-member-that-is-catching-up)).
 
-**Rolling.** The digest rides optional fields on the two existing divergence messages, so a mixed roll is safe: a member before 0.48.0 ignores the request and answers without digests, which a 0.48.0 member counts as `unanswered` and never compares, so the digest runs between two 0.48.0 members only. A 0.48.0 member that is already answering a digest probe says so (`busy`), which is not the same thing as not answering. Read the release notes' **Read before upgrading**: the divergence gauge can now read above 0 where it read 0, and pages an existing alert.
+**Rolling.** The digest rides optional fields on the two existing divergence messages, so a member before 0.48.0 ignores the request and answers without digests, which a 0.48.0 member counts as `unanswered` and never compares, so the digest runs between two 0.48.0 members only. A 0.48.0 member that is already answering a digest probe says so (`busy`), which is not the same thing as not answering. Read the release notes' **Read before upgrading**: the divergence gauge can now read above 0 where it read 0, and pages an existing alert.
 
 #### The definition digest
 
@@ -2095,7 +2095,7 @@ surfaces.
 
 **A stamp that does not advance.** A collection whose definition was made or dropped above the cut is deferred (`definition_above_cut`): it is in motion. If the stamp comes from a node this cluster can no longer hear from (a decommissioned member whose last create reached one member), the cut never covers it and the collection is never compared with that peer. After sixty contacts on which the cut at the stamp's origin did not advance, one `WARN` names the origin and says the stamp has not advanced; a peer that is only lagging never reaches it.
 
-**Rolling.** The definition digest rides optional fields on the two existing divergence messages, so a mixed roll is safe: a member before 0.49.0 ignores the request and answers without definitions, which a 0.49.0 member counts as `unanswered` and never compares. Refusal hints are rows in the member's metadata, so a backup carries them, and they are never trusted without being re-derived: a stale one (a rollback, a restore, a recreated collection, a definition changed since) explains nothing.
+**Rolling.** The definition digest rides optional fields on the two existing divergence messages, so a member before 0.49.0 ignores the request and answers without definitions, which a 0.49.0 member counts as `unanswered` and never compares. Refusal hints are rows in the member's metadata, so a backup carries them, and they are never trusted without being re-derived: a stale one (a rollback, a restore, a recreated collection, a definition changed since) explains nothing.
 
 ### Tracing
 
@@ -2828,46 +2828,46 @@ and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 
 ## Upgrades
 
-The on-disk **schema version** is checked on open, and the two directions are
-treated differently on purpose:
+KimmyDB runs one version in a cluster, and an upgrade that changes data wipes the
+data. The on-disk **storage schema** is checked on open, and 0.53.0 opens only
+schema **6**:
 
 | Stored version | Behaviour |
 |---|---|
-| Older than this build | **Migrated in place** on open, logged at `info` |
+| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.53.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
 | Equal | Opens normally |
 | Newer | **Refuses to start** |
 
-Refusing on a *newer* schema is the right failure: a build cannot know a layout
-that did not exist when it was written, and guessing corrupts further. Migrating
-an *older* one is equally right — a user with data has no other route forward.
+The check reads `kimmy.format` before the database is opened, and runs again
+after the open. `kimmyd restore` applies the same rule to a backup's schema: a
+backup written by 0.52 or older is refused. 0.53.0 has no schema 1 to 5
+migration (it was removed with [ADR-251](decisions.md#adr-251--binary-_id-subtypes)),
+because a schema-5 store's binary `_id` keys mean something else, and a build
+cannot know that a layout it never wrote is safe to guess at.
 
-Current schema is **5**. Migrations run in sequence, so an older database steps
-through each one rather than needing its own path to the latest.
+**Cluster protocol 2.** `Hello` and `Welcome` carry the cluster protocol, and
+0.53.0 speaks 2. A member refuses a peer that speaks anything else, or none (0.52
+and older), at the handshake: it sends a fault naming both protocols and logs
+the refusal with the peer's node id. Every member must run one release.
 
-| Step | What it does |
-|---|---|
-| 1 → 2 | Collections renumbered to ids derived from their names ([ADR-031](decisions.md)) — rewrites document keys, index entries, and the collection field of every oplog entry |
-| 2 → 3 | Indexes renumbered to ids derived from their names ([ADR-032](decisions.md)) — rewrites index-entry keys |
-| 3 → 4 | Every partial index rebuilt so that it holds what `find` with its filter returns, plus the documents the filter cannot decide ([ADR-183](decisions.md), [ADR-185](decisions.md)) — **moves no bytes of the layout** and changes what a partial index's entries mean. One transaction per index, with a marker per index so an interrupted run resumes rather than starting again. Schema 4 is written with the *first* index, so a half-migrated directory is refused by the older build rather than opened and maintained under the old rule. **Not run on the way to 5**: 4 → 5 rebuilds every index under the current rule, which covers it |
-| 4 → 5 | Every number key made exact ([ADR-238](decisions.md)): every document with an integer `_id` re-keyed and **every index drained and rebuilt**, in chunks that each commit and resume. A **rollback boundary**: from the moment it starts, 0.50 and 0.49 refuse the store. See [Storage schema 5](#storage-schema-5-the-first-start-of-0510) |
+**Upgrading from 0.52.x or older to 0.53.0: stop all, wipe, start all, reseed.**
+1. Stop every member.
+2. Move each data directory aside (it is the rollback) and create an empty one
+   with the same owner.
+3. Start every member on 0.53.0. A member started on an old directory exits with
+   the schema refusal and writes nothing to it; one that meets an older peer
+   logs the protocol refusal.
+4. Check `/readyz` on each member and that `/v1/topology` lists every member
+   live, then reseed from your source of truth.
 
-All four are idempotent and run before the node serves anything.
-
-> **Back up the data directory before a version-crossing upgrade**, and for
-> 0.51.0 roll with the deploy tool's `BACKUP=true`: the backup taken before the
-> upgrade is the only way back to 0.50 or 0.49. The
-> migration is transactional per step, but a rollback to the older build is not
-> possible once it has run — the older build will refuse the newer schema. **An
-> upgrade interrupted part-way cannot be rolled back either**, and deliberately
-> so: from schema 4 the version is written with the first index rebuilt, so a
-> directory holding a mixture of rebuilt and not-yet-rebuilt partial indexes is
-> refused rather than opened by a build that would maintain the rest under the
-> old rule and leave entries no query can find. To roll a single member back,
-> wipe its data directory and let it catch up from its peers, keeping clients
-> off it until it has (see [ADR-183](decisions.md)); to roll the whole cluster
-> back, restore the backup.
+There is no mixed-version cluster and no member-at-a-time roll across this
+release. **Rolling back:** stop every member, then start 0.52.x on the data
+directories moved aside at the upgrade, or wipe and reseed; 0.52 refuses a
+schema-6 store, and nothing a 0.53 store held crosses back.
 
 ### Storage schema 5: the first start of 0.51.0
+
+This section records what 0.51.0 did. 0.53.0 does not migrate: it refuses a store of schema 5 or older ([Upgrades](#upgrades)).
 
 **The first start of 0.51.0 on a store of an earlier release migrates it before
 the node serves anything** ([ADR-238](decisions.md)). Every number key on disk
@@ -3039,9 +3039,8 @@ newer than the build: the storage schema, the redb major.minor, or redb's file
 format. The database and its sidecar are left byte for byte as they were. A
 newer redb *patch* alone is not a boundary.
 
-"Writes nothing" applies to refusing a **newer** store. Upgrading an **older**
-store still migrates it, and a migration can stop partway through, for example
-on a partial filter this build can't parse, as described above.
+Since 0.53.0 the refusal is the same for an **older** store: it is refused by
+name and nothing is written to it ([Upgrades](#upgrades)).
 
 **The release after 0.36.0 moves redb from 4.1 to 4.3, and that is a rollback
 boundary.** Once a store has been opened by it, 0.36.x refuses the store and
@@ -3341,81 +3340,6 @@ per vector collection on each member**:
   names it. A graph 0.51 rebuilds and saves loses the mark, and a member
   rolled forward again serves it once and rebuilds it.
 
-### Vector chunk ids in 0.51.0
-
-Until 0.51.0 a vector chunk was stored under its source `_id`'s display text,
-so **every binary `_id` of one length (every UUID) in a collection shared one
-chunk set**, and a String `_id` shared the chunks of the integer or ObjectId it
-prints as. Such a collection kept one document's vectors per id length, a
-delete of any document removed them, and a filtered search could return a
-document its filter excluded. 0.51.0 stores each chunk under an encoding that
-tells every two documents apart ([ADR-239](decisions.md)), and **keeps the old
-id for ObjectId, integer and every other String `_id`**, so those chunks do not
-move.
-
-- **Reads are right from the first start**, on every 0.51.0 member: a
-  document's chunks are read by the document their record names, under the new
-  id and under the old one.
-- **Every collection the server embeds is rechecked once.** A single node
-  queues the recheck at its first start, logged once at `INFO` (`queued a
-  one-time recheck of embedded collections for 0.51.0's vector chunk ids`,
-  with the collections), and its scans log `the 0.51.0 chunk-id recheck` as
-  their reason. A cluster member rechecks the collections it owns at its
-  first start, once its ownership has held, as every start's rescan of what a
-  member owns does. The collection's owner rescans it: **every document with a binary `_id` is
-  re-embedded once**, one provider call's worth each, though only one per id
-  length still had vectors; the chunks of a String `_id` that begins with `~`,
-  is 24 lowercase hex digits or is an integer's decimal are **moved, with no
-  provider call**, unless an integer or ObjectId of the same text shares them,
-  in which case it is re-embedded; everything else reads as current and costs
-  a read. A single node records that the recheck was queued
-  (`vector_chunk_ids` in its metadata), so later starts queue nothing; **a
-  backup taken before 0.51.0 and restored on it is queued again.** Size the
-  provider budget for the binary-keyed documents.
-- **Client-supplied (`byo`) collections are not rechecked**: no worker writes
-  them. Their vectors are served as they are, and the client's next `PUT` of a
-  document's vectors stores them under the new id and removes the old.
-- **Every vector index rebuilds once.** The HNSW snapshot on disk
-  (`<data_dir>/hnsw/`) is now format 3, keyed by the ids chunks are stored
-  under; a format-2 snapshot is refused (`discarding an unusable HNSW
-  snapshot`, `snapshot format 2 is not 3`) and rebuilt on the collection's first
-  search after the upgrade, on each member. A format-3 snapshot also records
-  how many times the collection's chunks had been moved to other ids when it
-  was built (`vector_renames:<collection id>` in the store's metadata, which
-  counts the moves this member made and the removals replication brought it),
-  and one saved before the recheck moved them is rebuilt after a restart rather
-  than served with ids that no longer exist, on the owner and on every other
-  member. Nothing to do.
-- **During a roll** both builds write the same ids for ObjectId, integer and
-  plain-String documents. For a binary or reserved-String document the ids
-  differ: a 0.51.0 member reads a 0.50 member's chunks and moves or re-embeds
-  them at its next look, a 0.50 member finds a 0.51.0 member's only by a full
-  scan, and each move of a collection's ownership between the two builds costs
-  one provider call per such document. Members converge either way, and
-  deletes reach both kinds of id, **except one case**: a 0.50 member's delete
-  of a document whose `_id` is a String equal to an integer's decimal or an
-  ObjectId's hex removes the integer's or ObjectId's vectors too, on every
-  member. Each member says in its facts block which chunk-id format it writes
-  (`vector_chunk_ids`); **when every live member writes 0.51.0's**, logged at
-  `INFO` (`every live member now writes 0.51.0's vector chunk ids`), each
-  owner rechecks its collections once more after its ownership has held, which
-  re-embeds such a document and judges again whatever a 0.50 member wrote
-  after a document was last judged. **That happens about 30 s after the last
-  0.50 member leaves**, when it stops to be upgraded, not when it returns.
-  What it wrote that no peer had pulled before it stopped arrives when it
-  comes back as 0.51.0: its own first-sight rescan judges it in the
-  collections it then owns, and in any other the document's next write or a
-  restart of that collection's owner does. The filter defect stays on 0.50
-  members until they are upgraded. To force a recheck of a collection by hand
-  on a cluster, restart its owner: every clustered start rescans what the
-  member owns.
-- **Rolling back to 0.50.x** needs no store work: no schema, codec, wire field
-  or configuration key changed. A 0.50 build finds the chunks 0.51.0 wrote for
-  binary and reserved-String documents only by full scans and does not remove
-  them when their document is deleted (a search drops their hits, but they keep
-  storage), the shared chunk sets come back, and it rebuilds each vector index
-  once, refusing the format-3 snapshots.
-
 ### Rebuild vector indexes after upgrading past 2026-08-15
 
 **Builds before this date could produce an HNSW index that silently lost part
@@ -3496,7 +3420,7 @@ node. How to read and consume it, and what it does not prove, is in
 |---|---|
 | `no root password configured` | Set `KIMMY_ROOT_PASSWORD` or pass `--insecure-no-auth` on loopback |
 | `insecure_no_auth is set but the server binds to 0.0.0.0` | Bind to `127.0.0.1` or configure auth |
-| `on-disk format version N is not supported` | Data directory written by a **newer** build; older ones migrate automatically |
+| `on-disk format version N is not supported` | Data directory written by a **newer** build, or by an older one: 0.53.0 refuses a store older than schema 6 by name ([Upgrades](#upgrades)) |
 | 401 on a token that worked a moment ago | Token expired (1 h default), or the node has a different `jwt_secret` |
 | 403 where you expected 404 | Deliberate — authorization does not reveal existence |
 | `410 resume_token_expired` | Resume point passed out of the retained oplog; resubscribe |

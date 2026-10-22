@@ -132,9 +132,9 @@ const UNKNOWN_BUILD: &str = "unknown";
 enum Prior {
     /// No database, or an empty file.
     Fresh,
-    /// A sidecar, no newer than this build.
+    /// A sidecar of this build's schema, and no newer redb.
     Sidecar(Sidecar),
-    /// No sidecar, a clean store no newer than this build; its META schema.
+    /// No sidecar, a clean store of this build's schema or none; its META schema.
     CleanNoSidecar { schema: Option<u8> },
     /// No sidecar, a dirty store: last written by a build before this one.
     DirtyNoSidecar,
@@ -397,6 +397,19 @@ pub(crate) fn major_minor(version: &str) -> Option<(u64, u64)> {
 }
 
 fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> Result<()> {
+    if sidecar.schema < build.schema {
+        return Err(refused(
+            database,
+            RefusedKind::Older,
+            format!(
+                "it was written by {} with storage schema {} (this build: {}). {}",
+                sidecar.written_by,
+                sidecar.schema,
+                build.schema,
+                crate::migrate::NO_UPGRADE
+            ),
+        ));
+    }
     let redb = major_minor(&sidecar.redb_version).expect("parsed");
     let newer = if sidecar.schema > build.schema {
         Some(format!("storage schema {} (this build: {})", sidecar.schema, build.schema))
@@ -496,6 +509,20 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
                 }
             };
             drop(db);
+            if let Some(schema) = schema
+                && schema < build.schema
+            {
+                return Err(refused(
+                    database,
+                    RefusedKind::Older,
+                    format!(
+                        "it was written by a build that left no kimmy.format, with storage \
+                         schema {schema} (this build: {}). {}",
+                        build.schema,
+                        crate::migrate::NO_UPGRADE
+                    ),
+                ));
+            }
             if let Some(schema) = schema
                 && schema > build.schema
             {
@@ -1162,6 +1189,34 @@ mod tests {
             }
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("restored a newer schema"),
+        }
+        assert!(!restored.exists(), "no file is created");
+        assert!(!sidecar_path(&restored).exists());
+    }
+
+    /// A backup of an older schema is refused by name before the restore
+    /// creates a file: the restoring build is one schema ahead of the backup.
+    #[test]
+    fn a_restore_refuses_a_backup_of_an_older_schema_before_writing() {
+        let (_dir, path) = a_store();
+        let engine = Engine::open(&path).unwrap();
+        let mut backup = Vec::new();
+        engine.backup_to(&mut backup, crate::WalkScope::Request).unwrap();
+        drop(engine);
+        let dir = tempfile::tempdir().unwrap();
+        let restored = dir.path().join("kimmy.redb");
+        let ahead =
+            BuildVersions { schema: crate::migrate::SCHEMA_VERSION + 1, ..BuildVersions::ours() };
+        match crate::backup::restore_with(&restored, &mut backup.as_slice(), &ahead) {
+            Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
+                assert!(
+                    why.contains(&format!("schema {}", crate::migrate::SCHEMA_VERSION)),
+                    "{why}"
+                );
+                assert!(why.contains("does not upgrade stores"), "{why}");
+            }
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("restored an older schema"),
         }
         assert!(!restored.exists(), "no file is created");
         assert!(!sidecar_path(&restored).exists());

@@ -11,8 +11,8 @@
 //! exchanged, and neither sends it:
 //!
 //! ```text
-//!   Hello   { node, nonce_a }              ───▶
-//!           ◀───  Welcome { node, nonce_b, HMAC(secret, nonce_a) }
+//!   Hello   { node, nonce_a, protocol }    ───▶
+//!           ◀───  Welcome { node, nonce_b, protocol, HMAC(secret, nonce_a) }
 //!   Confirm { HMAC(secret, nonce_b) }      ───▶
 //! ```
 //!
@@ -50,6 +50,23 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Documents now travel as binary rather than as arrays of int32s, so an entry
 /// costs about the document's own size and 64 KiB each is a genuinely large
 /// document rather than an 5 KiB one. Reachable, but no longer routine.
+/// The cluster protocol this build speaks. Every member must run one
+/// release: a `Hello` or `Welcome` that does not name this protocol is refused
+/// ([`release_fault`]).
+pub const PROTOCOL: u32 = 2;
+
+/// What a member says to a peer whose handshake named `theirs` instead of
+/// [`PROTOCOL`], naming both.
+pub fn release_fault(theirs: Option<u32>) -> String {
+    let peer = match theirs {
+        None => "none (0.52.x or older)".to_string(),
+        Some(n) => format!("cluster protocol {n}"),
+    };
+    format!(
+        "this member speaks cluster protocol {PROTOCOL} (KimmyDB 0.53.0); the peer speaks {peer}; every member must run one release"
+    )
+}
+
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 // A snapshot page's counted bytes leave a frame 1 MiB for what is not counted
@@ -149,10 +166,23 @@ pub enum ReplayStall {
 /// What one side says to the other.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
-    /// Opens a connection: who I am, and a challenge for you to answer.
-    Hello { node: NodeId, nonce: Vec<u8> },
+    /// Opens a connection: who I am, the cluster protocol I speak, and a
+    /// challenge for you to answer. `protocol` is absent from a 0.52 build's
+    /// frame, which reads as `None` and is refused ([`PROTOCOL`]).
+    Hello {
+        node: NodeId,
+        nonce: Vec<u8>,
+        #[serde(default)]
+        protocol: Option<u32>,
+    },
     /// Answers the challenge, and issues one of my own.
-    Welcome { node: NodeId, nonce: Vec<u8>, proof: Vec<u8> },
+    Welcome {
+        node: NodeId,
+        nonce: Vec<u8>,
+        proof: Vec<u8>,
+        #[serde(default)]
+        protocol: Option<u32>,
+    },
     /// Answers the responder's challenge. The handshake is complete after this.
     Confirm { proof: Vec<u8> },
     /// "What do you hold?" — and, when `witnessed` is set, "what have you
@@ -618,6 +648,11 @@ pub enum ProtocolError {
     /// says nothing about the cluster.
     #[error("the peer is this node itself")]
     SelfContact,
+    /// The peer's handshake named a cluster protocol other than this build's
+    /// (or none). The text names both; it is also what the refuser sent the
+    /// peer as a [`Message::Fault`].
+    #[error("release mismatch: {0}")]
+    Release(String),
 }
 
 /// Write one length-prefixed frame.
@@ -963,7 +998,11 @@ mod tests {
                 exhausted: true,
                 passed_through: None,
             },
-            Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
+            Message::Hello {
+                node: NodeId::generate(),
+                nonce: vec![1, 2, 3],
+                protocol: Some(PROTOCOL),
+            },
             Message::Confirm { proof: vec![9, 9] },
             Message::AskDivergence {
                 probe: Some(CollectionId(42)),

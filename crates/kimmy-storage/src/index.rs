@@ -64,14 +64,8 @@ pub(crate) const UNKEYED: &[u8] = &[];
 ///
 /// **No build since storage schema 5 writes or reads this run** (ADR-238). The
 /// comparator places a decimal by its exact value, so the filter decides such a
-/// document like any other and the index holds exactly what the filter selects.
-/// Two places still name the key, both on a schema 4 store and both inside the
-/// schema 5 migration: the TTL count reads the run as "what 0.50 did not
-/// select" before the drain (`migrate_v5::ttl_selection_changes`), and the
-/// drain removes it with the rest of the index's range. The migration drains
-/// and rebuilds every index before the store serves, so a schema 5 store holds
-/// no entry under it, and a query, a write, a TTL pass and the index listing
-/// need not look.
+/// document like any other and the index holds exactly what the filter selects:
+/// a query, a write, a TTL pass and the index listing need not look.
 pub(crate) const UNDECIDABLE: &[u8] = &[0x00];
 
 /// Where every query's range starts: strictly above every sentinel run, and
@@ -2545,8 +2539,8 @@ pub(crate) mod clear_hooks {
 /// 4.3 it is the faster of the two and grows the file no more: draining
 /// 300,000 entries left the file at 184 MiB either way, and 1,000,000 entries
 /// drained in 61 ms by `retain_in` against 647 ms by key, the file at 736 MiB
-/// either way (`migrate_v5_tests::draining_keeps_the_file_near_its_size`, in
-/// release, with this function's body replaced by a `retain_in`).
+/// either way (measured in release, with this function's body replaced by a
+/// `retain_in`).
 pub(crate) fn clear_index_entries(
     entries: &mut WalkTable<'_, redb::Table<'_, tables::IndexKey<'static>, ()>>,
     range: impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static,

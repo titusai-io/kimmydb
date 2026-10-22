@@ -44,11 +44,6 @@ use crate::error::Result;
 
 mod number;
 
-// The frozen schema-4 form of a document key lives in its own module, which
-// shares no code with this encoder; it is re-exported here because it is this
-// encoding's other half.
-pub use crate::legacy_key::{LegacyKey, legacy_key, legacy_of_stored, stored_of_legacy};
-
 // Type tags. These match the ranks in `cmp::type_rank` so that cross-type
 // ordering falls out of the leading byte alone.
 const TAG_MIN_KEY: u8 = 0x01;
@@ -710,9 +705,22 @@ mod tests {
                 any::<bool>().prop_map(Bson::Boolean),
                 any::<i64>().prop_map(|m| Bson::DateTime(bson::DateTime::from_millis(m))),
                 any::<[u8; 12]>().prop_map(|b| Bson::ObjectId(bson::oid::ObjectId::from_bytes(b))),
-                prop::collection::vec(any::<u8>(), 0..4).prop_map(|bytes| Bson::Binary(
-                    bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes }
-                )),
+                (
+                    prop_oneof![
+                        Just(0u8),
+                        Just(2u8),
+                        Just(3u8),
+                        Just(4u8),
+                        Just(0x80u8),
+                        Just(0xFFu8),
+                        any::<u8>(),
+                    ],
+                    prop::collection::vec(any::<u8>(), 0..4),
+                )
+                    .prop_map(|(subtype, bytes)| Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::from(subtype),
+                        bytes,
+                    })),
             ];
 
             leaf.prop_recursive(3, 12, 3, |inner| {

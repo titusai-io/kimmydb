@@ -203,3 +203,62 @@ fn operation_name(kind: kimmy_core::OpKind) -> &'static str {
         kimmy_core::OpKind::UniqueViolation => "uniqueViolation",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kimmy_core::{DocId, NodeId, OpKind, OplogEntry, Stamp, UniqueViolationDetail};
+
+    use super::*;
+
+    fn binary(subtype: u8) -> DocId {
+        DocId::Binary { subtype, bytes: vec![9; 16] }
+    }
+
+    fn rendered(entry: OplogEntry) -> Value {
+        let token = ResumeToken::from_stamp(entry.stamp);
+        render(&ChangeEvent::Change { entry: Arc::new(entry), token }, false).unwrap()
+    }
+
+    fn entry(kind: OpKind, id: DocId, body: Option<Vec<u8>>) -> OplogEntry {
+        OplogEntry {
+            stamp: Stamp::new(Hlc::new(5, 0), NodeId::generate()),
+            kind,
+            collection: kimmy_core::ids::CollectionId(1),
+            doc_id: Some(id),
+            body,
+        }
+    }
+
+    /// The `documentKey` of an event names the binary `_id` with its subtype,
+    /// and two subtypes of one byte string render as two keys.
+    #[test]
+    fn a_document_key_carries_the_binary_subtype() {
+        let generic = rendered(entry(OpKind::Insert, binary(0x00), None));
+        let uuid = rendered(entry(OpKind::Insert, binary(0x04), None));
+        assert_eq!(generic["documentKey"]["_id"]["$binary"]["subType"], "00", "{generic}");
+        assert_eq!(uuid["documentKey"]["_id"]["$binary"]["subType"], "04", "{uuid}");
+        assert_eq!(
+            generic["documentKey"]["_id"]["$binary"]["base64"],
+            uuid["documentKey"]["_id"]["$binary"]["base64"]
+        );
+    }
+
+    /// A violation event's `documentKeys` and `merged` carry each holder's
+    /// subtype.
+    #[test]
+    fn a_violation_names_its_binary_holders_with_their_subtypes() {
+        let detail = UniqueViolationDetail {
+            index: "email_1".into(),
+            ids: vec![binary(0x00), binary(0x04)],
+            merged: binary(0x04),
+        };
+        let body = bson::serialize_to_vec(&detail).unwrap();
+        let event = rendered(entry(OpKind::UniqueViolation, binary(0x04), Some(body)));
+        let keys = event["documentKeys"].as_array().unwrap();
+        let subtypes: Vec<&Value> = keys.iter().map(|k| &k["_id"]["$binary"]["subType"]).collect();
+        assert_eq!(subtypes, ["00", "04"], "{event}");
+        assert_eq!(event["merged"]["$binary"]["subType"], "04", "{event}");
+    }
+}

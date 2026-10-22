@@ -1,5 +1,7 @@
 # ADR-238: the mutation rows, and the test that kills each
 
+> **Removed by [ADR-251](decisions.md#adr-251--binary-_id-subtypes) (0.53.0).** The rows below that name `mixed_roll_tests`, `migrate_v5_tests`, the frozen `legacy_key` form, the token and cursor conversions or the vector chunk-id adoption and legacy reads cite tests that no longer exist; they are kept as the record of 0.51.0 and 0.52.0.
+
 This is the table [ADR-238](decisions.md) refers to. Each row is a change to the source that must make a test fail: it was applied to the post-format text, run against the targeted tests under a timeout, and reset. A row that is recorded as *equivalent* cannot be killed, and says why. The rows are grouped by the piece of the change they guard.
 
 ## The comparator and the number key

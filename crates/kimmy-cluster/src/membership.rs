@@ -876,28 +876,6 @@ impl Members {
         BTreeSet::new()
     }
 
-    /// Whether every live peer writes this build's vector chunk ids, as its
-    /// block says ([`Facts::vector_chunk_ids`], ADR-239): `Some(false)` while a
-    /// live peer's block says otherwise (a build before 0.51.0 sends no such
-    /// field), `None` while a live peer has not been heard and none says
-    /// otherwise, `Some(true)` once every one has said so. The embedding
-    /// worker judges again what an older member wrote during the roll when
-    /// this turns from `Some(false)` to `Some(true)`.
-    pub fn chunk_ids_everywhere(&self) -> Option<bool> {
-        let table = self.0.peer_facts.read();
-        let mut everywhere = Some(true);
-        for peer in self.node_ids() {
-            match table.held.get(&peer) {
-                Some(held) if held.facts.vector_chunk_ids != Some(kimmy_core::CHUNK_ID_FORMAT) => {
-                    return Some(false);
-                }
-                Some(_) => {}
-                None => everywhere = None,
-            }
-        }
-        everywhere
-    }
-
     /// Whether a live peer that lists `collection` among its TTL indexes, and has
     /// expiry on, says it is catching up: what tells "every holder is catching
     /// up, so expiry waits" from "nobody holds the index" (ADR-201). One with

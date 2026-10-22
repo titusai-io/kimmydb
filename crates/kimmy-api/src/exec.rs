@@ -465,8 +465,8 @@ fn sort_is_id_ascending(sort: &[shape::SortKey]) -> bool {
 /// Reading it back out of the page would have made `{"_id": 0}` a walk that
 /// ended after one page, silently and looking like the end of the collection.
 ///
-/// Built from the stored key; the token the client is given is its legacy form
-/// (`kimmy_core::Cursor::encode`, Decimal128 design 7.2).
+/// Built from the stored key; the token the client is given is its base64
+/// (`kimmy_core::Cursor::encode`).
 fn next_cursor(last: Option<&bson::Bson>) -> Option<kimmy_core::Cursor> {
     let id = DocId::try_from_bson(last?).ok()?;
     let key = kimmy_core::keyenc::encode(&id.to_bson()).ok()?;
@@ -751,10 +751,9 @@ pub enum Order<'a> {
     /// `_id` ascending, resuming strictly after an encoded document key — the
     /// order a page is returned in and a cursor resumes from.
     ///
-    /// `after` is a **stored** key: a client's token was converted from the legacy
-    /// form by `kimmy_core::Cursor::decode`, and the vector filter's paging hands
-    /// its own stored keys straight in. Nothing here may read it as legacy
-    /// (Decimal128 design 7.2).
+    /// `after` is a stored key: a client's token is read by
+    /// `kimmy_core::Cursor::decode`, and the vector filter's paging hands its own
+    /// stored keys straight in.
     ById { after: Option<&'a [u8]> },
     /// Whichever order the access path finds cheapest. For a count, which
     /// has no order, or a sort, which imposes its own.
@@ -1037,9 +1036,8 @@ pub fn insert(
 /// The `_id` an insert reports: the one the client sent, which the engine
 /// stores as sent, or else the ObjectId it generated.
 ///
-/// Not `id.to_bson()` for a sent one. The document key folds a binary's
-/// subtype to generic, so a UUID `_id` echoed from it is another value, one
-/// `find {_id: <echo>}` does not match.
+/// Not `id.to_bson()` for a sent one: the echo is the value as the client sent
+/// it, which for an integral `Decimal128` is not the key's `Int64`.
 fn inserted_id(sent: Option<bson::Bson>, id: &DocId) -> bson::Bson {
     sent.unwrap_or_else(|| id.to_bson())
 }
@@ -1864,10 +1862,10 @@ pub fn violations(
 
 /// The `_id` the document `id` names is stored under, and the document.
 ///
-/// A violation names its documents by key, and the key folds a binary's
-/// subtype to generic, so the report reads each one's own `_id` rather than
-/// echoing a value no filter on `_id` matches. A document gone since the
-/// violation was re-evaluated keeps the key's form.
+/// A violation names its documents by key, so the report reads each one's own
+/// `_id` rather than the key's form, which for an integral `Decimal128` is an
+/// `Int64`. A document gone since the violation was re-evaluated keeps the
+/// key's form.
 fn stored_id(
     state: &SharedState,
     meta: &CollectionMeta,
@@ -3801,6 +3799,3 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
-
-#[cfg(test)]
-mod token_tests;

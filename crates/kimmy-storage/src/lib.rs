@@ -41,9 +41,6 @@ pub mod live_digest;
 mod live_walk;
 pub mod meta;
 pub mod migrate;
-mod migrate_v5;
-#[cfg(test)]
-mod migrate_v5_tests;
 pub mod modify;
 pub mod open_progress;
 pub mod purge;
@@ -121,9 +118,6 @@ mod young_stamp_model_tests;
 #[cfg(test)]
 mod decimal_definition_tests;
 #[cfg(test)]
-mod mixed_roll_tests;
-
-#[cfg(test)]
 mod size_cap_tests;
 #[cfg(test)]
 mod snapshot_pages_tests;
@@ -165,12 +159,9 @@ pub use hold_meter::{
 };
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
-#[cfg(feature = "test-hooks")]
-pub use migrate::make_schema_4_for_test;
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
 pub use open_progress::{
     OpenPhase, OpenSnapshot, open_snapshot, open_stop_requested, request_open_stop, set_open_phase,
-    set_test_open_step_pause,
 };
 pub use purge::PurgeCounters;
 pub use refusal_hint::{HintKind, RefusalHint};

@@ -500,34 +500,6 @@ jobs:
             verified::tests::a_skipping_open_reads_a_fixed_amount_and_a_walking_one_reads_the_oplog 2>&1 | tee skipping-open.log
           grep -q 'test result: ok. 1 passed' skipping-open.log
 
-      # The schema 5 migration drains and refills 300,000 index entries at
-      # its shipped chunk sizes, and the file stays near its size and inside
-      # the one growth step its preflight asks room for (ADR-238). Ignored in
-      # the default run, where a debug build spends about 20 s of one core on
-      # it; in release it is about 2 s, and it shares the build of the step
-      # above.
-      - name: A migration's drain keeps the file near its size
-        shell: bash
-        run: |
-          cargo test -p kimmy-storage --release --lib -- \
-            --include-ignored --exact \
-            migrate_v5_tests::draining_keeps_the_file_near_its_size 2>&1 | tee migration-drain.log
-          grep -q 'test result: ok. 1 passed' migration-drain.log
-
-      # The migration's preflight on a store whose dropped collection was
-      # purged (its file is freed pages and no document), and a refill at the
-      # shipped chunk sizes over a partial index that selects nothing, which
-      # must still commit every 8,192 documents (ADR-238). About 1 s and 7 s
-      # in release, sharing the build above.
-      - name: A migration's preflight and its refill chunks at the shipped sizes
-        shell: bash
-        run: |
-          cargo test -p kimmy-storage --release --lib -- --include-ignored --exact \
-            migrate_v5_tests::the_preflight_of_a_store_whose_collection_was_dropped_and_purged \
-            migrate_v5_tests::a_sparse_refill_at_the_shipped_chunk_sizes_commits_every_8192_documents \
-            2>&1 | tee migration-preflight.log
-          grep -q 'test result: ok. 2 passed' migration-preflight.log
-
       # The number key's two large corpora (ADR-238): the order, the equal
       # bytes of equal values, the closed-form `END` against the exact path
       # and the fast window against the exact one, over every exponent and the

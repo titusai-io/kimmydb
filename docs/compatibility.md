@@ -198,10 +198,7 @@ rollback boundary to 0.50.x and 0.49.x.** Every number
 key on disk changes, so the first start migrates the store before it serves (about 16 to 19 minutes
 for 2,000,000 documents with integer `_id`s and three indexes on the lab host) and, from the
 moment it raises the sidecar, a 0.50 or 0.49 build refuses the store (leaving `kimmy.redb` and `kimmy.format` as they were, though it rewrites `kimmy.last-exit` to record the failed start); the way back is the
-backup taken before the upgrade. The wire does not change shape: every key a member sends
-or hashes into the cut digest keeps its schema 4 form, so a 0.50 and a 0.51 member in one
-cluster compare and repair as two 0.50 members do, and a 0.51 member's tombstone horizon
-resets at its first start. A `Decimal128`
+backup taken before the upgrade. A `Decimal128`
 `_id` fails to decode on 0.50 and 0.49, and a `Decimal128` partial-index bound is refused
 there and never retried; since 0.53.0 nothing refuses their creation, so members are not mixed
 across this boundary: KimmyDB runs one version at a time, and a release that changes data
@@ -209,6 +206,8 @@ deploys stop-all with a wipe. A migration that outlasts `storage.oplog_retention
 turns the member's return into a whole-database snapshot. Two differences outlast the roll
 until a member migrates: its partial unique indexes enforce on decimals (and its TTL
 indexes decide them by exact value), where a 0.50 member's do not.
+
+**Storage schema 6 and cluster protocol 2 (0.53.0, [ADR-251](decisions.md#adr-251--binary-_id-subtypes)) make 0.53.0 the release that does not upgrade a store.** A binary `_id` is keyed with its subtype, so a schema-5 store's keys mean something else. 0.53.0 refuses, by name, a data directory or a backup written by 0.52 or older, and a peer that speaks no cluster protocol 2, and the schema 1 to 5 migrations are removed. The upgrade is stop all, wipe, start all, reseed ([Upgrades](operations.md#upgrades)); there is no mixed-version cluster. 0.52 refuses a schema-6 store, so the way back is to start 0.52.x on the data directories moved aside.
 
 **A member-at-a-time roll is not evidence that mixed versions work together.**
 The 0.28.0 roll took about 10 s from first member to last, the cluster was

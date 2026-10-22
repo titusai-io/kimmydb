@@ -771,19 +771,6 @@ async fn start_and_serve(
         // have lost, which the clear's owed hold reads (ADR-212).
         catch_up.note_store_created_this_run();
     }
-    if let Ok(value) = std::env::var("KIMMY_TEST_OPEN_STEP_MS") {
-        let ms = value.parse::<u64>().ok();
-        warn!(
-            KIMMY_TEST_OPEN_STEP_MS = %value,
-            recognised = ms.is_some(),
-            "a test switch is set that makes every step of a migration wait on purpose; unset \
-             KIMMY_TEST_OPEN_STEP_MS outside a test"
-        );
-        if let Some(ms) = ms {
-            kimmy_storage::set_test_open_step_pause(Duration::from_millis(ms));
-        }
-    }
-
     // A test switch that makes the open last: the store opens only after this
     // many seconds, so a test can see what a node answers while it opens, and
     // stop one. In the shipped binary like the other switches, and announced.
@@ -1477,7 +1464,6 @@ async fn start_and_serve(
         // a full-corpus provider bill on every member at once.
         let worker_me = engine.node_id();
         let worker_members = cluster.members.clone();
-        let worker_roll = cluster.members.clone();
         let worker_gate = state.catch_up().cloned();
         let worker_clustered = config.cluster.enabled;
         let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
@@ -1499,11 +1485,6 @@ async fn start_and_serve(
                     embedding_owner_check(worker_me, worker_members, worker_gate, worker_clustered)
                 {
                     worker.set_owner_check(check);
-                }
-                // When every live member writes 0.51.0's chunk ids, from what
-                // each says about itself (ADR-239).
-                if let Some(members) = worker_roll {
-                    worker.set_chunk_ids_check(Box::new(move || members.chunk_ids_everywhere()));
                 }
                 worker.set_counters(worker_counters);
                 // Every error `run` returns is a storage error, which is

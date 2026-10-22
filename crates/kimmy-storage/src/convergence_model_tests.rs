@@ -47,15 +47,6 @@
 //! whether or not the writer had heard of it: ADR-236) must be on every member with
 //! that stamp.
 //!
-//! **The wire's form** (Decimal128 design 10, review Q7). A mixed 0.50/0.51 pair behaves as
-//! a pair of this build exactly when what this build puts on the wire is 0.50's bytes and
-//! its digests are 0.50's, so two oracles ride every run (`mixed_roll_tests::oracle`): every
-//! page a member serves, and every uncovered list of a digest probe made before each pull,
-//! carries schema-4 keys only, each the key of its own id; and at quiescence every member's
-//! digest row of every collection equals the schema-4 digest of its own documents. A breach
-//! is not a convergence outcome but a defect in what the members exchange, so it fails the
-//! run whatever the schedule.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -986,8 +977,7 @@ impl Cluster {
     }
 
     /// A cut-digest probe of `from` by `to`, each collection named busy in turn, as a contact
-    /// makes one before its pull: read only, and held to the wire oracle (module docs). Its
-    /// verdicts are not judged here: members differ mid-schedule by design.
+    /// makes one before its pull: read only. Its verdicts are not judged here: members differ mid-schedule by design.
     fn probe_digests(&self, to: usize, from: usize) -> Res<()> {
         let (requester, answerer) = (self.e(to), self.e(from));
         let budget = crate::ScanBudget::default();
@@ -1002,26 +992,11 @@ impl Cluster {
             else {
                 continue;
             };
-            if let Err(e) =
-                crate::mixed_roll_tests::oracle::exchange(requester, &plan.ask, answerer, &reply)
-            {
-                panic!("the wire oracle, step {}: {e}\n{}", self.step, self.notes.join("\n"));
-            }
             requester
                 .digest_compare(&plan, &reply, budget)
                 .map_err(|e| err("digest_compare", e))?;
         }
         Ok(())
-    }
-
-    /// The digest oracle (module docs): every member's every digest row is the schema-4
-    /// digest of its own documents.
-    fn check_digests(&self, at: &str) {
-        for (m, letter) in LETTERS.iter().enumerate() {
-            if let Err(e) = crate::mixed_roll_tests::oracle::digests(self.e(m)) {
-                panic!("the digest oracle, {letter} {at}: {e}\n{}", self.notes.join("\n"));
-            }
-        }
     }
 
     fn transfer(&mut self, to: usize, from: usize, scope: Option<CollectionId>) -> Res<()> {
@@ -1034,9 +1009,6 @@ impl Cluster {
             let page = src
                 .snapshot_page(progress.after().cloned(), progress.scope())
                 .map_err(|e| err("snapshot_page", e))?;
-            if let Err(e) = crate::mixed_roll_tests::oracle::page(src, &page) {
-                panic!("the wire oracle, step {}: {e}\n{}", self.step, self.notes.join("\n"));
-            }
             let applied = dst
                 .apply_snapshot_page(src.node_id(), &mut progress, &page)
                 .map_err(|e| err("apply_snapshot_page", e))?;
@@ -1705,7 +1677,6 @@ fn settle(cluster: &mut Cluster, route: Route) -> RouteOutcome {
     let mut settled = None;
     let notes_from = cluster.notes.len();
     let quiesced = cluster.quiesce(route);
-    cluster.check_digests(&format!("at quiescence by {route:?}"));
     match quiesced {
         Err(e) => {
             failures.push(Failure { category: Category::Error, detail: format!("quiescence: {e}") })
@@ -3910,7 +3881,6 @@ fn residual_4_is_closed_by_the_document_repair() {
         let mut pages = 0;
         while !progress.is_complete() {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            crate::mixed_roll_tests::oracle::page(from, &page).unwrap();
             applied +=
                 to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap().applied;
             pages += 1;
@@ -3920,7 +3890,6 @@ fn residual_4_is_closed_by_the_document_repair() {
     };
     assert!(pull(&cluster, C, A) >= 1, "the repair wrote the document C lacked");
     // The digest oracle after the repair; `settle` held it before.
-    cluster.check_digests("after the repair");
 
     assert_eq!(held(&cluster, C).0, "t160.1B", "C holds B's write: {}", render(&ops, &[settled]));
     assert_eq!(digest(&cluster, C), digest(&cluster, A), "the digests agree");

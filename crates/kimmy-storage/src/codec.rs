@@ -104,7 +104,7 @@ const DOC_ID_OBJECT_ID: u8 = 1;
 const DOC_ID_STRING: u8 = 2;
 const DOC_ID_INT64: u8 = 3;
 const DOC_ID_BINARY: u8 = 4;
-const DOC_ID_UUID: u8 = 5;
+// Tag 5 was `Uuid` and is retired; it decodes as an unknown tag.
 /// A `Decimal128` id: its 19 canonical bytes (`DocId`'s `Decimal128Id`).
 const DOC_ID_DECIMAL128: u8 = 6;
 
@@ -122,13 +122,10 @@ pub fn encode_doc_id(id: &DocId, out: &mut Vec<u8>) {
             out.push(DOC_ID_INT64);
             out.extend_from_slice(&v.to_be_bytes());
         }
-        DocId::Binary(b) => {
+        DocId::Binary { subtype, bytes } => {
             out.push(DOC_ID_BINARY);
-            put_bytes(b, out);
-        }
-        DocId::Uuid(u) => {
-            out.push(DOC_ID_UUID);
-            out.extend_from_slice(u.as_bytes());
+            out.push(*subtype);
+            put_bytes(bytes, out);
         }
         DocId::Decimal128(d) => {
             out.push(DOC_ID_DECIMAL128);
@@ -155,10 +152,9 @@ pub fn decode_doc_id(input: &mut &[u8]) -> Result<DocId> {
             let bytes: [u8; 8] = take(input, 8)?.try_into().expect("8 bytes");
             DocId::Int64(i64::from_be_bytes(bytes))
         }
-        DOC_ID_BINARY => DocId::Binary(take_bytes(input)?.to_vec()),
-        DOC_ID_UUID => {
-            let bytes: [u8; 16] = take(input, 16)?.try_into().expect("16 bytes");
-            DocId::Uuid(uuid::Uuid::from_bytes(bytes))
+        DOC_ID_BINARY => {
+            let subtype = take(input, 1)?[0];
+            DocId::Binary { subtype, bytes: take_bytes(input)?.to_vec() }
         }
         DOC_ID_DECIMAL128 => {
             let bytes = take(input, kimmy_core::DECIMAL128_ID_LEN)?;
@@ -357,9 +353,11 @@ mod tests {
             DocId::String(String::new()),
             DocId::Int64(i64::MIN),
             DocId::Int64(0),
-            DocId::Binary(vec![0, 1, 2, 255]),
-            DocId::Binary(Vec::new()),
-            DocId::Uuid(uuid::Uuid::new_v4()),
+            DocId::Binary { subtype: 0, bytes: vec![0, 1, 2, 255] },
+            DocId::Binary { subtype: 0, bytes: Vec::new() },
+            DocId::Binary { subtype: 4, bytes: vec![7; 16] },
+            DocId::Binary { subtype: 0x80, bytes: vec![1] },
+            DocId::Binary { subtype: 0xFF, bytes: Vec::new() },
             DocId::try_from_bson(&bson::Bson::Decimal128("-1.5".parse().unwrap())).unwrap(),
             DocId::try_from_bson(&bson::Bson::Decimal128("1E+6144".parse().unwrap())).unwrap(),
         ];
@@ -374,6 +372,26 @@ mod tests {
             assert_eq!(decode_doc_id(&mut slice).unwrap(), id);
             assert!(slice.is_empty(), "decoder left trailing bytes for {id:?}");
         }
+    }
+
+    #[test]
+    fn binary_doc_id_keeps_its_subtype_and_tag_5_is_refused() {
+        let mut buf = Vec::new();
+        encode_doc_id(&DocId::Binary { subtype: 4, bytes: vec![9, 8] }, &mut buf);
+        assert_eq!(buf[0], 4);
+        assert_eq!(buf[1], 4);
+        let mut slice = buf.as_slice();
+        assert_eq!(
+            decode_doc_id(&mut slice).unwrap(),
+            DocId::Binary { subtype: 4, bytes: vec![9, 8] }
+        );
+        let mut other = Vec::new();
+        encode_doc_id(&DocId::Binary { subtype: 0, bytes: vec![9, 8] }, &mut other);
+        assert_ne!(buf, other);
+
+        let mut retired = vec![5u8];
+        retired.extend_from_slice(&[0; 16]);
+        assert!(decode_doc_id(&mut retired.as_slice()).is_err());
     }
 
     #[test]

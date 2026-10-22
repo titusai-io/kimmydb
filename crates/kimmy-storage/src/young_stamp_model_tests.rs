@@ -670,9 +670,7 @@ struct RepairOut {
     held_before: Option<(Vec<Event>, Vec<Event>)>,
 }
 
-/// The sender's page as the requester receives it: from a 0.49 sender, no horizon. Held to
-/// the wire oracle (review Q7): every key on it is the schema-4 key of its own id, which is
-/// what lets this model's all-0.51 runs stand for a 0.50/0.51 pair.
+/// The sender's page as the requester receives it: from a 0.49 sender, no horizon.
 fn page_from(
     from: &Engine,
     from_old: bool,
@@ -680,9 +678,6 @@ fn page_from(
     scope: Option<CollectionId>,
 ) -> crate::Result<crate::SnapshotPage> {
     let mut page = from.snapshot_page(after, scope)?;
-    if let Err(e) = crate::mixed_roll_tests::oracle::page(from, &page) {
-        panic!("the wire oracle: {e}");
-    }
     if from_old {
         page.tombstone_horizon = None;
     }
@@ -1569,9 +1564,6 @@ impl Cluster {
             let mut page = src
                 .snapshot_page(progress.after().cloned(), progress.scope())
                 .map_err(|e| err("snapshot_page", e))?;
-            if let Err(e) = crate::mixed_roll_tests::oracle::page(&src, &page) {
-                panic!("the wire oracle, step {}: {e}\n{}", self.step, self.notes.join("\n"));
-            }
             if strip {
                 page.tombstone_horizon = None;
             }

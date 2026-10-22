@@ -411,7 +411,7 @@ impl ServeFailure {
             // failure of a peer.
             ProtocolError::SelfContact => None,
             ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
-            ProtocolError::Fault(_) => Some(Self::Fault),
+            ProtocolError::Fault(_) | ProtocolError::Release(_) => Some(Self::Fault),
         }
     }
 }
@@ -1239,9 +1239,15 @@ pub(crate) async fn accept_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Message::Hello { node, nonce: their_nonce } = read_frame(stream).await? else {
+    let Message::Hello { node, nonce: their_nonce, protocol } = read_frame(stream).await? else {
         return Err(ProtocolError::Malformed("expected Hello".into()));
     };
+    if protocol != Some(crate::protocol::PROTOCOL) {
+        let reason = crate::protocol::release_fault(protocol);
+        warn!(peer = ?node, "refusing a peer: {reason}");
+        let _ = write_frame(stream, &Message::Fault(reason.clone())).await;
+        return Err(ProtocolError::Release(reason));
+    }
 
     // Answer their challenge and issue ours in the same frame.
     let ours = nonce(engine.node_id());
@@ -1251,6 +1257,7 @@ where
             node: engine.node_id(),
             nonce: ours.clone(),
             proof: prove(secret, &their_nonce, binding),
+            protocol: Some(crate::protocol::PROTOCOL),
         },
     )
     .await?;
@@ -5890,10 +5897,26 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let ours = nonce(engine.node_id());
-    write_frame(stream, &Message::Hello { node: engine.node_id(), nonce: ours.clone() }).await?;
+    write_frame(
+        stream,
+        &Message::Hello {
+            node: engine.node_id(),
+            nonce: ours.clone(),
+            protocol: Some(crate::protocol::PROTOCOL),
+        },
+    )
+    .await?;
 
     let (their_node, their_nonce, proof) = match read_frame(stream).await? {
-        Message::Welcome { node, nonce, proof } => (node, nonce, proof),
+        Message::Welcome { node, nonce, proof, protocol } => {
+            if protocol != Some(crate::protocol::PROTOCOL) {
+                let reason = crate::protocol::release_fault(protocol);
+                warn!(peer = ?node, "refusing a peer: {reason}");
+                let _ = write_frame(stream, &Message::Fault(reason.clone())).await;
+                return Err(ProtocolError::Release(reason));
+            }
+            (node, nonce, proof)
+        }
         Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
         other => {
             return Err(ProtocolError::Malformed(format!("expected Welcome, got {other:?}")));
@@ -6121,66 +6144,6 @@ mod tests {
         io::Error::from_raw_os_error(24)
     }
 
-    /// The keys on a snapshot page and in the cut digest's uncovered lists are converted
-    /// between the stored and the legacy (schema-4) form at the engine's wire API and
-    /// nowhere else (Decimal128 design 7.1, review v2.3-delta M2): `snapshot_page`,
-    /// `apply_snapshot_page`, `digest_plan`, `digest_answer` and `digest_compare` take and
-    /// give legacy keys. This crate builds and reads the frames, and passes them through
-    /// unchanged. A source guard: a conversion here would run a second time over keys the
-    /// engine already converted, and every in-process test, the model runs among them,
-    /// calls the engine directly and would never see it.
-    #[test]
-    fn the_transport_passes_wire_keys_through_unchanged() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        let mut pending = vec![dir];
-        while let Some(dir) = pending.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    files.push(path);
-                }
-            }
-        }
-        let transport = files.iter().find(|p| p.ends_with("src/transport.rs")).expect("transport");
-        let source = std::fs::read_to_string(transport).unwrap();
-        // Up to the tests module: test hooks earlier in the file are `#[cfg(test)]` items too.
-        let product = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
-        for call in [
-            "engine.snapshot_page(",
-            "engine.apply_snapshot_page(",
-            "engine.digest_plan(",
-            "engine.digest_answer(",
-            "engine.digest_compare(",
-        ] {
-            assert!(product.contains(call), "the frames are no longer built here: {call}");
-        }
-        for path in &files {
-            if path.to_string_lossy().ends_with("tests.rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(path).unwrap();
-            let source = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
-            for conversion in [
-                "legacy_of_stored",
-                "stored_of_legacy",
-                "legacy_key",
-                "LegacyKey",
-                "keyenc::",
-                "STORED_FORM_MARKER",
-            ] {
-                assert!(
-                    !source.contains(conversion),
-                    "{} names `{conversion}`: the engine's wire API converts, the transport \
-                     passes keys through",
-                    path.display()
-                );
-            }
-        }
-    }
-
     fn counting_hook() -> (AcceptErrorHook, Arc<std::sync::atomic::AtomicU64>) {
         let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let hook: AcceptErrorHook = Arc::new({
@@ -6294,7 +6257,7 @@ mod tests {
         let messages = Messages::default();
         let seen = Arc::clone(&messages.0);
         let _recording = tracing::subscriber::set_default(messages);
-        let peer = NodeId::generate();
+        let peer = kimmy_core::NodeId::generate();
         {
             let _walk = ServeWalk::begin(peer);
             assert_eq!(*seen.lock().unwrap(), ["a serve walk started for a peer's pull"]);
@@ -10003,7 +9966,11 @@ mod tests {
         let seen = serve_failures(|mut ours, peer| async move {
             write_frame(
                 &mut ours,
-                &Message::Hello { node: peer.node_id(), nonce: nonce(peer.node_id()) },
+                &Message::Hello {
+                    node: peer.node_id(),
+                    nonce: nonce(peer.node_id()),
+                    protocol: Some(crate::protocol::PROTOCOL),
+                },
             )
             .await
             .unwrap();
@@ -10015,6 +9982,101 @@ mod tests {
         })
         .await;
         assert_eq!(seen, vec![ServeFailure::Unauthenticated]);
+    }
+
+    /// A `Hello` that names no protocol, which is a 0.52 build's.
+    #[tokio::test]
+    async fn a_hello_without_a_protocol_is_refused_by_name_and_the_refuser_sends_the_fault() {
+        const SECRET: &str = "a-release-secret";
+        const BINDING: &[u8] = b"a-release-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = kimmy_core::NodeId::generate();
+        let refusing = accept_handshake(&engine, &mut theirs, SECRET, BINDING);
+        let asking = async {
+            write_frame(
+                &mut ours,
+                &Message::Hello { node: peer, nonce: nonce(peer), protocol: None },
+            )
+            .await
+            .unwrap();
+            read_frame(&mut ours).await.unwrap()
+        };
+        let (refused, answer) = tokio::join!(refusing, asking);
+        let Err(ProtocolError::Release(reason)) = refused else {
+            panic!("expected a release refusal, got {refused:?}");
+        };
+        assert_eq!(
+            reason,
+            "this member speaks cluster protocol 2 (KimmyDB 0.53.0); the peer speaks none \
+             (0.52.x or older); every member must run one release"
+        );
+        assert_eq!(answer, Message::Fault(reason));
+    }
+
+    /// A `Hello` that names another protocol is refused the same way, naming it.
+    #[tokio::test]
+    async fn a_hello_naming_another_protocol_is_refused_naming_both() {
+        const SECRET: &str = "a-release-secret";
+        const BINDING: &[u8] = b"a-release-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = kimmy_core::NodeId::generate();
+        let refusing = accept_handshake(&engine, &mut theirs, SECRET, BINDING);
+        let asking = async {
+            write_frame(
+                &mut ours,
+                &Message::Hello { node: peer, nonce: nonce(peer), protocol: Some(3) },
+            )
+            .await
+            .unwrap();
+            read_frame(&mut ours).await.unwrap()
+        };
+        let (refused, answer) = tokio::join!(refusing, asking);
+        assert!(matches!(refused, Err(ProtocolError::Release(_))), "{refused:?}");
+        let Message::Fault(reason) = answer else { panic!("expected a Fault, got {answer:?}") };
+        assert!(reason.contains("protocol 2") && reason.contains("cluster protocol 3"), "{reason}");
+    }
+
+    /// A `Welcome` that names no protocol is refused by the initiator, which
+    /// sends the Fault before it answers the challenge.
+    #[tokio::test]
+    async fn a_welcome_without_a_protocol_is_refused_by_name_and_the_refuser_sends_the_fault() {
+        const SECRET: &str = "a-release-secret";
+        const BINDING: &[u8] = b"a-release-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = kimmy_core::NodeId::generate();
+        let refusing = open_handshake(&engine, &mut theirs, SECRET, BINDING);
+        let answering = async {
+            let Message::Hello { nonce: asked, protocol, .. } =
+                read_frame(&mut ours).await.unwrap()
+            else {
+                panic!("expected a Hello");
+            };
+            assert_eq!(protocol, Some(crate::protocol::PROTOCOL));
+            write_frame(
+                &mut ours,
+                &Message::Welcome {
+                    node: peer,
+                    nonce: nonce(peer),
+                    proof: prove(SECRET, &asked, BINDING),
+                    protocol: None,
+                },
+            )
+            .await
+            .unwrap();
+            read_frame(&mut ours).await.unwrap()
+        };
+        let (refused, answer) = tokio::join!(refusing, answering);
+        let Err(ProtocolError::Release(reason)) = refused else {
+            panic!("expected a release refusal, got {refused:?}");
+        };
+        assert!(reason.contains("the peer speaks none (0.52.x or older)"), "{reason}");
+        assert_eq!(answer, Message::Fault(reason));
     }
 
     #[tokio::test]

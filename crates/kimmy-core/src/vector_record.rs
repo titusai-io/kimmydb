@@ -34,19 +34,10 @@ use serde::{Deserialize, Serialize};
 use crate::hlc::Hlc;
 use crate::ids::DocId;
 
-/// The chunk-id format this build writes (ADR-239): 2, the injective encoding
-/// of [`ChunkSource`]. 0.50.0 and every build before it wrote the `_id`'s
-/// display text, which is format 1 and is never named. A member says it in its
-/// facts block, and a store records that the recheck the change owes was
-/// queued under it.
-pub const CHUNK_ID_FORMAT: u64 = 2;
-
 /// What a chunk id names as its source: the `_id` value as the document key
-/// identifies it, and a binary's subtype (ADR-239).
-///
-/// The document key folds a binary's subtype (until 0.53.0), so two sources
-/// that differ only by subtype are one document. Their chunk ids differ all
-/// the same, and the document's run ([`VectorRecord::run_prefix`]) holds both.
+/// identifies it, and a binary's subtype (ADR-239). Two sources that differ
+/// only by subtype are two documents, and each document's run
+/// ([`VectorRecord::run_prefix`]) holds one source's chunks.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ChunkSource {
     ObjectId([u8; 12]),
@@ -56,7 +47,7 @@ pub enum ChunkSource {
     /// The canonical 19 bytes of a `Decimal128` `_id` ([`Decimal128Id::to_bytes`],
     /// ADR-238): equal values have equal bytes, so one decimal is one source.
     Decimal128([u8; 19]),
-    /// Any length. `DocId::Uuid(u)` is subtype 4 over `u`'s bytes.
+    /// Any length, with its subtype.
     Binary {
         subtype: u8,
         bytes: Vec<u8>,
@@ -64,9 +55,7 @@ pub enum ChunkSource {
 }
 
 impl From<&DocId> for ChunkSource {
-    /// Total over `DocId`. A folded `DocId::Binary` carries no subtype and is
-    /// the generic one, 0; [`ChunkSource::of`] takes the subtype from the
-    /// stored body where there is one.
+    /// Total over `DocId`, and exact: a binary keeps its subtype.
     fn from(id: &DocId) -> Self {
         // No wildcard, here or in the other matches over `DocId` below: a new
         // kind of `_id` must name its chunk source, and the compiler asks.
@@ -74,58 +63,43 @@ impl From<&DocId> for ChunkSource {
             DocId::ObjectId(oid) => Self::ObjectId(oid.bytes()),
             DocId::String(s) => Self::String(s.clone()),
             DocId::Int64(i) => Self::Int64(*i),
-            DocId::Binary(bytes) => Self::Binary { subtype: 0x00, bytes: bytes.clone() },
-            DocId::Uuid(u) => Self::Binary { subtype: 0x04, bytes: u.as_bytes().to_vec() },
+            DocId::Binary { subtype, bytes } => {
+                Self::Binary { subtype: *subtype, bytes: bytes.clone() }
+            }
             DocId::Decimal128(d) => Self::Decimal128(d.to_bytes()),
         }
     }
 }
 
 impl ChunkSource {
-    /// The chunk source of the document keyed `id` whose stored body carries
-    /// `body_id` as its `_id`: the body's binary subtype when the body's `_id`
-    /// is a binary of the same bytes, and [`ChunkSource::from`] otherwise.
-    ///
-    /// The key folds the subtype and the body keeps it, so only a writer that
-    /// holds the body can name it; the embedding worker does, in `prepare`.
-    pub fn of(id: &DocId, body_id: Option<&bson::Bson>) -> Self {
-        if let Some(bson::Bson::Binary(stored)) = body_id {
-            let source =
-                Self::Binary { subtype: u8::from(stored.subtype), bytes: stored.bytes.clone() };
-            if source.is_of(id) {
-                return source;
-            }
-        }
-        Self::from(id)
-    }
-
-    /// The document this source is a chunk source of, as the key identifies
-    /// it: a binary's subtype folded away. `None` for a `Decimal128` whose
+    /// The document this source is a chunk source of. `None` for a `Decimal128` whose
     /// bytes are not a canonical id (a chunk id is parsed from stored text).
     pub fn document(&self) -> Option<DocId> {
         match self {
             Self::ObjectId(bytes) => Some(DocId::ObjectId(bson::oid::ObjectId::from_bytes(*bytes))),
             Self::String(s) => Some(DocId::String(s.clone())),
             Self::Int64(i) => Some(DocId::Int64(*i)),
-            Self::Binary { bytes, .. } => Some(DocId::Binary(bytes.clone())),
+            Self::Binary { subtype, bytes } => {
+                Some(DocId::Binary { subtype: *subtype, bytes: bytes.clone() })
+            }
             Self::Decimal128(bytes) => {
                 crate::ids::Decimal128Id::from_bytes(bytes).map(DocId::Decimal128)
             }
         }
     }
 
-    /// Whether this is a source of the document keyed `id`: the same value,
-    /// or for a binary the same bytes under any subtype, since the key folds
-    /// the subtype.
+    /// Whether this is the source of the document keyed `id`: the same value,
+    /// and for a binary the same subtype.
     pub fn is_of(&self, id: &DocId) -> bool {
         match id {
             DocId::ObjectId(oid) => *self == Self::ObjectId(oid.bytes()),
             DocId::String(s) => matches!(self, Self::String(own) if own == s),
             DocId::Int64(i) => *self == Self::Int64(*i),
-            DocId::Binary(b) => matches!(self, Self::Binary { bytes, .. } if bytes == b),
-            DocId::Uuid(u) => {
-                matches!(self, Self::Binary { bytes, .. } if bytes.as_slice() == u.as_bytes())
-            }
+            DocId::Binary { subtype, bytes } => matches!(
+                self,
+                Self::Binary { subtype: own_subtype, bytes: own_bytes }
+                    if own_subtype == subtype && own_bytes == bytes
+            ),
             DocId::Decimal128(d) => *self == Self::Decimal128(d.to_bytes()),
         }
     }
@@ -340,53 +314,12 @@ impl VectorRecord {
     }
 
     /// The prefix every chunk id of the document keyed `id` begins with, and
-    /// which a scan of its run starts from. For a binary it stops before the
-    /// subtype, `~b:` and the bytes and `.`, since the key folds the subtype
-    /// (until 0.53.0): the run of the bytes under every subtype. The prefix
-    /// is not proof of ownership (a String may contain `#`), so a reader parses
+    /// which a scan of its run starts from. For a binary it includes the
+    /// subtype, so the run of `BinData(4, X)` holds none of `BinData(0, X)`'s
+    /// chunks. The prefix is not proof of ownership (a String may contain `#`), so a reader parses
     /// each key and asks [`ChunkSource::is_of`].
     pub fn run_prefix(id: &DocId) -> String {
-        let binary = |bytes: &[u8]| {
-            let mut out = String::from("~b:");
-            push_hex(&mut out, bytes);
-            out.push('.');
-            out
-        };
-        match id {
-            DocId::Binary(bytes) => binary(bytes),
-            DocId::Uuid(u) => binary(u.as_bytes()),
-            DocId::ObjectId(_) | DocId::String(_) | DocId::Int64(_) | DocId::Decimal128(_) => {
-                format!("{}#", ChunkSource::from(id).encode())
-            }
-        }
-    }
-
-    /// The prefix of the chunk ids a 0.50 build wrote for the document keyed
-    /// `id`, frozen, for the kinds whose id changed: a binary, whose 0.50 id
-    /// was its length (`bin(16 bytes)#`; a `DocId::Uuid`, its hyphenated text),
-    /// and a reserved String, whose 0.50 id was its raw text. `None` for every
-    /// other kind, whose id did not change.
-    ///
-    /// What sits under it is read, never written: it may hold another
-    /// document's chunks, so a reader keeps only those whose body names `id`.
-    pub fn legacy_prefix(id: &DocId) -> Option<String> {
-        match id {
-            DocId::Binary(bytes) => Some(format!("bin({} bytes)#", bytes.len())),
-            DocId::Uuid(u) => Some(format!("{u}#")),
-            DocId::String(s) if is_reserved(s) => Some(format!("{s}#")),
-            // A Decimal128 `_id` did not exist before 0.51.0, so no 0.50 chunk is its.
-            DocId::String(_) | DocId::ObjectId(_) | DocId::Int64(_) | DocId::Decimal128(_) => None,
-        }
-    }
-
-    /// The chunk number of `id` when it is a key at the legacy location
-    /// `prefix` ([`Self::legacy_prefix`]): the prefix, then a chunk number,
-    /// and nothing else.
-    pub fn legacy_chunk(id: &DocId, prefix: &str) -> Option<u32> {
-        let DocId::String(s) = id else {
-            return None;
-        };
-        parse_chunk(s.strip_prefix(prefix)?)
+        format!("{}#", ChunkSource::from(id).encode())
     }
 
     /// The document `id` as search tells documents apart: the encoding of
@@ -528,8 +461,7 @@ mod tests {
             DocId::ObjectId(oid) => oid.to_hex(),
             DocId::String(s) => s.clone(),
             DocId::Int64(i) => i.to_string(),
-            DocId::Binary(b) => format!("bin({} bytes)", b.len()),
-            DocId::Uuid(u) => u.to_string(),
+            DocId::Binary { bytes, .. } => format!("bin({} bytes)", bytes.len()),
             // No Decimal128 `_id` existed in 0.50.0; this is its `Display`, which
             // is the twin a String can be made to collide with.
             DocId::Decimal128(d) => d.to_string(),
@@ -552,8 +484,6 @@ mod tests {
     #[derive(Clone, Debug)]
     enum Value {
         Bson(bson::Bson),
-        /// A `DocId::Uuid`, which only the engine's API builds.
-        Uuid(uuid::Uuid),
         /// A `Decimal128` `_id`'s bytes, any 19 of them: the encoding is tested
         /// over bytes that are not a canonical id too; `Value::Bson` carries the
         /// real ones.
@@ -561,11 +491,11 @@ mod tests {
     }
 
     /// Two values are one source exactly when kimmydb keys them as one
-    /// document and, for a binary, they carry one subtype. Computed from the
+    /// document, which for a binary includes its subtype. Computed from the
     /// document key, independently of the encoding under test.
     #[derive(Debug, PartialEq, Eq)]
     enum Identity {
-        Key(Vec<u8>, Option<u8>),
+        Key(Vec<u8>),
         Decimal([u8; 19]),
     }
 
@@ -574,19 +504,7 @@ mod tests {
             match self {
                 Value::Bson(b) => {
                     let id = DocId::try_from_bson(b).unwrap();
-                    let subtype = match b {
-                        bson::Bson::Binary(bin) => Some(u8::from(bin.subtype)),
-                        _ => None,
-                    };
-                    Identity::Key(crate::keyenc::encode(&id.to_bson()).unwrap(), subtype)
-                }
-                // As the binary subtype 4 it is: the engine keys a `DocId::Uuid`
-                // under subtype 4, but nothing outside its API builds one, and
-                // every other route folds a binary's subtype in the key (until
-                // 0.53.0, which keys every binary by its subtype).
-                Value::Uuid(u) => {
-                    let folded = DocId::Binary(u.as_bytes().to_vec()).to_bson();
-                    Identity::Key(crate::keyenc::encode(&folded).unwrap(), Some(4))
+                    Identity::Key(crate::keyenc::encode(&id.to_bson()).unwrap())
                 }
                 Value::Decimal(bytes) => Identity::Decimal(*bytes),
             }
@@ -594,8 +512,7 @@ mod tests {
 
         fn source(&self) -> ChunkSource {
             match self {
-                Value::Bson(b) => ChunkSource::of(&DocId::try_from_bson(b).unwrap(), Some(b)),
-                Value::Uuid(u) => ChunkSource::from(&DocId::Uuid(*u)),
+                Value::Bson(b) => ChunkSource::from(&DocId::try_from_bson(b).unwrap()),
                 Value::Decimal(bytes) => ChunkSource::Decimal128(*bytes),
             }
         }
@@ -654,7 +571,6 @@ mod tests {
                     prop::collection::vec(0u8..2, 0..=2)
                 )
                     .prop_map(|(st, b)| Value::Bson(binary(st, b))),
-                any::<[u8; 16]>().prop_map(|b| Value::Uuid(uuid::Uuid::from_bytes(b))),
                 any::<[u8; 19]>().prop_map(Value::Decimal),
                 // Real decimals, which `DocId` keys by value: an integral one in
                 // range is an `Int64` (and one source with it), the rest are
@@ -679,7 +595,6 @@ mod tests {
                     (3, Value::Bson(bson::Bson::Binary(bin))) => {
                         Value::Bson(binary(st, bin.bytes.clone()))
                     }
-                    (3, Value::Uuid(u)) => Value::Bson(binary(st, u.as_bytes().to_vec())),
                     (4, Value::Bson(bson::Bson::Int32(i))) => {
                         Value::Bson(bson::Bson::Int64(i64::from(*i)))
                     }
@@ -715,13 +630,12 @@ mod tests {
             }
 
             /// A source names the document its key identifies, a binary's
-            /// subtype folded: what the graph's key pre-filter looks up.
+            /// subtype included: what the graph's key pre-filter looks up.
             #[test]
             fn a_source_names_the_document_its_key_identifies(a in any_value()) {
                 let source = a.source();
                 let expected = match &a {
                     Value::Bson(b) => Some(DocId::try_from_bson(b).unwrap()),
-                    Value::Uuid(u) => Some(DocId::Binary(u.as_bytes().to_vec())),
                     Value::Decimal(_) => None,
                 };
                 prop_assert_eq!(source.document(), expected.clone());
@@ -786,30 +700,25 @@ mod tests {
                 let kept = match &id {
                     DocId::ObjectId(_) | DocId::Int64(_) => true,
                     DocId::String(s) => !is_reserved(s),
-                    DocId::Binary(_) | DocId::Uuid(_) => false,
+                    DocId::Binary { .. } => false,
                     // There was no such id in 0.50.0, so there is no 0.50 form to keep.
                     DocId::Decimal128(_) => return Ok(()),
                 };
                 let now = VectorRecord::id(&ChunkSource::from(&id), n);
                 prop_assert_eq!(now == id_050(&id, n), kept, "{:?}: {:?}", id, now);
-                // And the legacy prefix is the 0.50 form exactly where it moved.
-                let legacy = VectorRecord::legacy_prefix(&id);
-                prop_assert_eq!(legacy.clone(), (!kept).then(|| format!("{}#", display_050(&id))));
-                if let Some(prefix) = legacy {
-                    prop_assert_eq!(VectorRecord::legacy_chunk(&id_050(&id, n), &prefix), Some(n));
-                }
             }
 
-            /// Test 5, the folded binary run: an id begins with the run prefix
-            /// of bytes `b` exactly when it is a chunk of `b`, under any
-            /// subtype.
+            /// Test 5, the binary run: an id begins with the run prefix of
+            /// `BinData(s, b)` exactly when it is a chunk of that source, so
+            /// another subtype's chunks of the same bytes are not in the run.
             #[test]
             fn the_binary_run_is_prefix_closed(
                 bytes in prop::collection::vec(0u8..3, 0..=4),
                 (other, _) in any_pair(),
-                cut in 0usize..5, st in any::<u8>(), n in any_chunk(),
+                cut in 0usize..5, st in any::<u8>(), own in any::<u8>(), n in any_chunk(),
             ) {
-                let prefix = VectorRecord::run_prefix(&DocId::Binary(bytes.clone()));
+                let document = DocId::Binary { subtype: own, bytes: bytes.clone() };
+                let prefix = VectorRecord::run_prefix(&document);
                 let mut near = bytes.clone();
                 near.truncate(cut);
                 near.push(st % 3);
@@ -821,9 +730,10 @@ mod tests {
                     ChunkSource::String(prefix.clone()),
                 ] {
                     let id = VectorRecord::id(&candidate, n);
-                    let of = matches!(&candidate, ChunkSource::Binary { bytes: b, .. } if *b == bytes);
+                    let of = matches!(&candidate,
+                        ChunkSource::Binary { subtype, bytes: b } if *subtype == own && *b == bytes);
                     prop_assert_eq!(text(&id).starts_with(&prefix), of, "{:?}", candidate);
-                    prop_assert_eq!(candidate.is_of(&DocId::Binary(bytes.clone())), of);
+                    prop_assert_eq!(candidate.is_of(&document), of);
                 }
             }
         }
@@ -844,7 +754,6 @@ mod tests {
         let chunk = VectorRecord::id(&source, 3);
         assert_eq!(VectorRecord::parse_id(&chunk), Some((source.clone(), 3)));
         assert!(text(&chunk).starts_with(&VectorRecord::run_prefix(&one_and_a_half)));
-        assert_eq!(VectorRecord::legacy_prefix(&one_and_a_half), None, "0.50 had no decimal ids");
         // An integral decimal in range is the Int64 id of that value: one source with it.
         assert_eq!(ChunkSource::from(&id("5.00").unwrap()), ChunkSource::from(&DocId::Int64(5)));
     }
@@ -897,7 +806,6 @@ mod tests {
     #[test]
     fn chunk_ids_are_pinned_to_exact_strings() {
         let oid = bson::oid::ObjectId::parse_str("65f1a2b3c4d5e6f708192a3b").unwrap();
-        let uuid = uuid::Uuid::from_bytes([0xab; 16]);
         let golden: [(ChunkSource, u32, &str); 13] = [
             (ChunkSource::from(&DocId::ObjectId(oid)), 0, "65f1a2b3c4d5e6f708192a3b#0"),
             (ChunkSource::from(&DocId::Int64(7)), 3, "7#3"),
@@ -912,8 +820,16 @@ mod tests {
             ),
             (ChunkSource::String("~x".into()), 0, "~s:~x#0"),
             (ChunkSource::String("007".into()), 0, "007#0"),
-            (ChunkSource::from(&DocId::Binary(vec![0, 1, 0xfe])), 2, "~b:0001fe.00#2"),
-            (ChunkSource::from(&DocId::Uuid(uuid)), 0, "~b:abababababababababababababababab.04#0"),
+            (
+                ChunkSource::from(&DocId::Binary { subtype: 0, bytes: vec![0, 1, 0xfe] }),
+                2,
+                "~b:0001fe.00#2",
+            ),
+            (
+                ChunkSource::from(&DocId::Binary { subtype: 4, bytes: vec![0xab; 16] }),
+                0,
+                "~b:abababababababababababababababab.04#0",
+            ),
             (ChunkSource::Decimal128([0x11; 19]), 0, "~d:11111111111111111111111111111111111111#0"),
             (
                 ChunkSource::Binary { subtype: 0x80, bytes: Vec::new() },
@@ -924,42 +840,43 @@ mod tests {
         for (source, chunk, expected) in golden {
             assert_eq!(VectorRecord::id(&source, chunk), DocId::String(expected.into()));
         }
-        assert_eq!(VectorRecord::run_prefix(&DocId::Binary(vec![0, 1])), "~b:0001.");
+        assert_eq!(
+            VectorRecord::run_prefix(&DocId::Binary { subtype: 0, bytes: vec![0, 1] }),
+            "~b:0001.00#"
+        );
+        assert_eq!(
+            VectorRecord::run_prefix(&DocId::Binary { subtype: 0x80, bytes: vec![0, 1] }),
+            "~b:0001.80#"
+        );
         assert_eq!(VectorRecord::run_prefix(&DocId::String("7".into())), "~s:7#");
         assert_eq!(VectorRecord::run_prefix(&DocId::Int64(7)), "7#");
-        assert_eq!(
-            VectorRecord::legacy_prefix(&DocId::Binary(vec![0; 16])).unwrap(),
-            "bin(16 bytes)#"
-        );
-        assert_eq!(VectorRecord::legacy_prefix(&DocId::String("7".into())).unwrap(), "7#");
-        assert_eq!(VectorRecord::legacy_prefix(&DocId::String("x".into())), None);
-        assert_eq!(VectorRecord::legacy_prefix(&DocId::Int64(7)), None);
         assert_eq!(VectorRecord::source_key(&DocId::String("7".into())), "~s:7");
         assert_eq!(VectorRecord::source_key(&DocId::Int64(7)), "7");
     }
 
-    /// The subtype comes from the stored body's `_id`, and only when that is a
-    /// binary of the document's own bytes.
+    /// A binary source is exact: its subtype is part of the source, the
+    /// document it names, the run it belongs to and its source key.
     #[test]
-    fn the_subtype_comes_from_the_body_that_names_the_same_bytes() {
-        let id = DocId::Binary(vec![1, 2]);
-        let of = |body: Option<bson::Bson>| ChunkSource::of(&id, body.as_ref());
-        assert_eq!(
-            of(Some(binary(4, vec![1, 2]))),
-            ChunkSource::Binary { subtype: 4, bytes: vec![1, 2] }
-        );
-        assert_eq!(of(None), ChunkSource::Binary { subtype: 0, bytes: vec![1, 2] });
-        assert_eq!(
-            of(Some(binary(4, vec![9]))),
-            ChunkSource::Binary { subtype: 0, bytes: vec![1, 2] }
-        );
-        assert_eq!(
-            of(Some(bson::Bson::Int32(1))),
-            ChunkSource::Binary { subtype: 0, bytes: vec![1, 2] }
-        );
-        let int = DocId::Int64(5);
-        assert_eq!(ChunkSource::of(&int, Some(&bson::Bson::Int32(5))), ChunkSource::Int64(5));
-        assert_eq!(ChunkSource::of(&int, Some(&binary(4, vec![5]))), ChunkSource::Int64(5));
+    fn a_binary_source_is_exact_in_its_subtype() {
+        let zero = DocId::Binary { subtype: 0, bytes: vec![1, 2] };
+        let four = DocId::Binary { subtype: 4, bytes: vec![1, 2] };
+        let (s0, s4) = (ChunkSource::from(&zero), ChunkSource::from(&four));
+        assert_eq!(s0, ChunkSource::Binary { subtype: 0, bytes: vec![1, 2] });
+        assert_eq!(s4, ChunkSource::Binary { subtype: 4, bytes: vec![1, 2] });
+        assert_eq!(s0.document(), Some(zero.clone()));
+        assert_eq!(s4.document(), Some(four.clone()));
+        assert!(s0.is_of(&zero) && s4.is_of(&four));
+        assert!(!s0.is_of(&four) && !s4.is_of(&zero));
+        assert_ne!(VectorRecord::source_key(&zero), VectorRecord::source_key(&four));
+        // The run of BinData(4, X) matches none of BinData(0, X)'s chunk ids, and
+        // the other way round.
+        let (run0, run4) = (VectorRecord::run_prefix(&zero), VectorRecord::run_prefix(&four));
+        for n in [0, 1, 9, 10, u32::MAX] {
+            let chunk0 = VectorRecord::id(&s0, n);
+            let chunk4 = VectorRecord::id(&s4, n);
+            assert!(text(&chunk0).starts_with(&run0) && !text(&chunk0).starts_with(&run4), "{n}");
+            assert!(text(&chunk4).starts_with(&run4) && !text(&chunk4).starts_with(&run0), "{n}");
+        }
     }
 
     /// Above `i64::MAX`, as half of all fingerprints are: the value BSON would

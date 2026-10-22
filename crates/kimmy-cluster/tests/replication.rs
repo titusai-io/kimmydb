@@ -3513,6 +3513,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
                         node: origin,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
+                        protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                     };
                     if write_frame(&mut stream, &welcome).await.is_err() {
                         return;
@@ -7396,6 +7397,7 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
                     node: origin,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
+                    protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                 };
                 if write_frame(&mut stream, &welcome).await.is_err() {
                     return;
@@ -7514,6 +7516,7 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
                     node: origin,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
+                    protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                 };
                 if write_frame(&mut stream, &welcome).await.is_err() {
                     return;
@@ -7631,6 +7634,7 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
                     node: origin,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
+                    protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                 };
                 if write_frame(&mut stream, &welcome).await.is_err() {
                     return;
@@ -8035,6 +8039,7 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
                         node: origin,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
+                        protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                     };
                     if write_frame(&mut stream, &welcome).await.is_err() {
                         return;
@@ -8200,6 +8205,7 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
                         node: origin,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
+                        protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                     };
                     if write_frame(&mut stream, &welcome).await.is_err() {
                         return;
