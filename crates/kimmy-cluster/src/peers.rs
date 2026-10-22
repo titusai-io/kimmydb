@@ -149,8 +149,8 @@ pub struct RoundReport {
     /// `divergence_checks` rises is a digest that has looked at nothing, which
     /// a gauge reading 0 cannot say.
     pub digest_compared: usize,
-    /// Checked contacts whose peer answered no digest: one that predates it,
-    /// or that failed to compute it. Never compared.
+    /// Checked contacts whose peer answered no digest: one that failed to
+    /// compute it. Never compared.
     pub digest_unanswered: usize,
     /// Contacts asked with the cut alone, to learn whether the peer answers a
     /// digest before this node pays for its own scan.
@@ -184,7 +184,7 @@ pub struct RoundReport {
     /// an operator can see refusals masking collections.
     pub definition_explained: usize,
     /// Checked contacts whose peer answered no definition digest: one that
-    /// predates it, or failed to compute it, or saw two different cuts.
+    /// failed to compute it, or saw two different cuts.
     pub definition_unanswered: usize,
     /// Collections whose definitions were not compared in this tick, by reason
     /// (`DefinitionDefer::ALL` order): none of them silent.
@@ -1238,8 +1238,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                 %peer,
                                 "a peer has not echoed this member's block, which says it \
                                  yields the class; this member keeps owning the class \
-                                 until every live peer has echoed it (an older version \
-                                 never does)"
+                                 until every live peer has echoed it"
                             );
                         }
                         // A live peer heard from not at all keeps this member

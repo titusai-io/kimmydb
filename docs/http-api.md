@@ -1281,7 +1281,7 @@ its block. `yielding` lists the classes the node yields (`ttl`, `webhooks`,
 `embeddings`); `classState` says how each class stands on it (`ok`, `idle`,
 `suspect`, `stalled`, or `unknown`). For the answering node these are what its own
 evaluator last decided; for a peer, what its last block said. They are present
-only when there is something to say: for a peer from an older build `yielding` is
+only when there is something to say: for a peer that has sent no block `yielding` is
 `[]` and `classState` is absent, and it is never a target for a yield. They are **advertised, not effective**: a member
 keeps owning a class it yields until every live peer has confirmed it, so read
 them as "where work is going", and compare members after a lease, never a single
@@ -1294,7 +1294,7 @@ single writer has been held for more than 60 seconds, so no write can be made an
 peer hands it work, and `"runtime"` when its async runtime stalled within the last
 judged ticks. **Advisory:** writes and owner work on that node may stall, reads may
 still be served, prefer a node without it. It says nothing of `catchingUp` or
-`classState`. **A missing `degraded` is not "healthy"**: a peer of an older build, a
+`classState`. **A missing `degraded` is not "healthy"**: a
 peer the answering node holds no block from and a member still starting have none.
 When every node has it, use them anyway; it orders a preference and forbids nothing.
 `status` is unchanged.

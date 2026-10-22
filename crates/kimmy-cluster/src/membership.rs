@@ -277,7 +277,7 @@ struct PeerTable {
 #[derive(Clone, Debug)]
 pub struct ViewBlock {
     pub facts: Arc<Facts>,
-    /// The sender's generation of the block, `None` from a 0.43 sender.
+    /// The sender's generation of the block, `None` when it gave none.
     pub generation: Option<u64>,
     pub received: Instant,
 }
@@ -413,7 +413,7 @@ impl Members {
 
     /// A block from `peer` did not decode and was treated as none. Says so, once
     /// per interval per peer, naming it: otherwise a peer whose blocks never
-    /// decode looks exactly like an older one that sends none. Answers whether it
+    /// decode looks exactly like one that sends none. Answers whether it
     /// said it now.
     pub(crate) fn note_undecodable(&self, peer: NodeId, now: Instant) -> bool {
         let mut said = self.0.undecodable_said.lock();
@@ -425,7 +425,7 @@ impl Members {
             warn!(
                 %peer,
                 "a peer sent a facts block that does not decode; it is treated as having sent \
-                 none, as an older version's peer is"
+                 none"
             );
         }
         due
@@ -721,7 +721,7 @@ impl Members {
     /// sender's start time.** The held block is replaced only when one of these
     /// holds, and a block that does not replace it does not refresh `received`:
     /// - (a) same boot: decoded later **and** a generation at least the held one
-    ///   (a 0.43 sender has none, which skips that half);
+    ///   (a block with no generation skips that half);
     /// - (b) a different boot: decoded later **and** `started_ms` at least the
     ///   held one's (either missing skips that half);
     /// - (c) a different boot, the held block past its lease, and this one decoded
@@ -892,7 +892,7 @@ impl Members {
     }
 
     /// The live peers that have not confirmed this member's yield of `class`:
-    /// those that do not echo (a 0.43 peer, or one whose echo did not decode) and
+    /// those that do not echo (or whose echo did not decode) and
     /// those whose echo is below the generation that set the bit. What a yielding
     /// member waits on before it stops owning (ADR-201, ADR-213). Empty when the
     /// member does not yield the class.

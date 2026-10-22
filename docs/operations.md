@@ -643,9 +643,7 @@ Each collection's live document count is kept in the database, moved by every
 document write, so the divergence check reads a number instead of walking a
 collection ([ADR-174](decisions.md)). A start rebuilds those counts when it
 cannot trust them:
-- the first start of 0.30.0 or later on a database;
 - a start after `kimmyd restore`, since a backup does not carry the counts;
-- a start after an older build wrote to the database;
 - a start that also rebuilt the arrival index.
 
 A rewind does not force it: the counts' mark moves with the rows a rewind
@@ -1157,7 +1155,7 @@ stall; reads may still be served; prefer a node without it. `"writer"` is the we
 above and `"runtime"` is a stalled async runtime within the last six judged ticks;
 `"writer"` wins when both hold. It is present only on a `live` node, for the
 answering node from its own evaluator and for a peer from its last block. **Its
-absence is not "healthy":** an older build's peer, a peer the answering node holds
+absence is not "healthy":** a peer the answering node holds
 no block from, and a member in its first thirty seconds have none. When every node
 has it (a disk slow for the whole cluster), a client uses them anyway.
 
@@ -1297,7 +1295,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_violations_backfill_rows_total` | Oplog rows the completing pass has read since start; flat at 0 on a store whose table was ready at open. On the OTLP bridge, `kimmy.violations.backfill_rows` |
 | `kimmy_violations_walk_path_total{path}` | `GET …/violations` calls by how they were answered: `table`, or `oplog` (the walk, while the table is not ready). On the OTLP bridge, `kimmy.violations.walk_path.table` and `.oplog` |
 | `kimmy_ownership_peers{state}` | Live peers as **this member** sees them by the block each last sent on the replication contact ([ADR-201](decisions.md)): `eligible`, `ineligible_catching_up` (the catching-up marker is set; no class overrides it), `ineligible_yielding` (at least one class given up), `unknown` (no block yet: an older version, or not yet heard; after a member comes up or restarts, or this member rejoins, about one contact, since each side asks the other for its block at once, at most once per member per sync interval, and at the interval's end for one that came within it, [ADR-247](decisions.md)) and `stale` (a block past its lease, which keeps saying what it last said: not hearing from a member is not evidence that it recovered). Every state is always present. Views differ while blocks converge, so compare members after a lease, never a single scrape. The lease is `ceil(peers / cluster.fanout) + 2` sync intervals. On the OTLP bridge, `kimmy.ownership.peers.<state>` |
-| `kimmy_yield_unconfirmed_peers{class}` | Live peers that have not confirmed this member's yield of `class` (`ttl`, `webhooks`, `embeddings`): those that do not echo the block back (an older version never does) and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and its live set has held still for a lease, so a peer that never does keeps it owning; alert on a value that stays above 0. 0 while no class yields. On the OTLP bridge, `kimmy.yield.unconfirmed_peers.<class>` |
+| `kimmy_yield_unconfirmed_peers{class}` | Live peers that have not confirmed this member's yield of `class` (`ttl`, `webhooks`, `embeddings`): those that do not echo the block back and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and its live set has held still for a lease, so a peer that never does keeps it owning; alert on a value that stays above 0. 0 while no class yields. On the OTLP bridge, `kimmy.yield.unconfirmed_peers.<class>` |
 | `kimmy_owner_class_state{class,state,cause}` | How this member's own class of owned work stands, one-hot over `ok`, `idle`, `suspect` and `stalled`; only the `stalled` series carries a `cause` (`local`, `runtime`, `probation`). The state last decided, so read it beside `kimmy_task_progress_age_seconds{task="yield_evaluator"}`. On the OTLP bridge, `kimmy.owner.class_state.<class>.<state>` and `.stalled.<cause>` ([ADR-213](decisions.md)) |
 | `kimmy_owner_class_owned{class}` | Items the class owned at its last owner check. A negative test that nothing owned work proves nothing: read it beside the state. For embeddings the count is set by the worker's loop, so while a provider call is held (two attempts of 60 s at most) it lags until the call ends; the class is judged by its heartbeat meanwhile. On the OTLP bridge, `kimmy.owner.class_owned.<class>` |
 | `kimmy_yielding{class}` | 1 while this member **advertises** that it yields the class. Advertised, not effective: it keeps owning the class until every live peer has echoed the block. On the OTLP bridge, `kimmy.yielding.<class>` |

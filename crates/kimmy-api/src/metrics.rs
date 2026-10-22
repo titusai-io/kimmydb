@@ -2510,7 +2510,7 @@ fn render_ownership(out: &mut String, ownership: &OwnershipReading) {
     }
     let _ = writeln!(
         out,
-        "# HELP kimmy_yield_unconfirmed_peers Live peers that have not confirmed this member's yield of the class: those that do not echo the block back (an older version never does) and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and the live set has held still for a lease; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.\n\
+        "# HELP kimmy_yield_unconfirmed_peers Live peers that have not confirmed this member's yield of the class: those that do not echo the block back and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and the live set has held still for a lease; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.\n\
          # TYPE kimmy_yield_unconfirmed_peers gauge"
     );
     for class in kimmy_cluster::OwnerClass::ALL {
@@ -4104,7 +4104,7 @@ kimmy_ownership_peers{state=\"ineligible_catching_up\"} 1502
 kimmy_ownership_peers{state=\"ineligible_yielding\"} 1503
 kimmy_ownership_peers{state=\"unknown\"} 1504
 kimmy_ownership_peers{state=\"stale\"} 1505
-# HELP kimmy_yield_unconfirmed_peers Live peers that have not confirmed this member's yield of the class: those that do not echo the block back (an older version never does) and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and the live set has held still for a lease; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.
+# HELP kimmy_yield_unconfirmed_peers Live peers that have not confirmed this member's yield of the class: those that do not echo the block back and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and the live set has held still for a lease; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.
 # TYPE kimmy_yield_unconfirmed_peers gauge
 kimmy_yield_unconfirmed_peers{class=\"ttl\"} 1511
 kimmy_yield_unconfirmed_peers{class=\"webhooks\"} 1512

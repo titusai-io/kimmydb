@@ -106,10 +106,10 @@ pub const OWNERSHIP_TICK: Duration = Duration::from_secs(5);
 /// but the one that owned the collection when its configuration was set, since
 /// a non-owner skips that backfill and records nothing.
 ///
-/// Since 0.43.0 a record says which configuration made it (ADR-203), and a
-/// record made under another is stale on every scan, forced or not; so what
-/// this decides is only how a record **with no fingerprint** is read: one an
-/// older release or an older member wrote.
+/// A record says which configuration made it (ADR-203), and a record made
+/// under another is stale on every scan, forced or not; so what this decides
+/// is only how a record **with no fingerprint** is read: one a client stored
+/// into a collection the server embeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unscanned {
     /// Read such a record as stale: a configuration change's own backfill, and
@@ -117,11 +117,10 @@ enum Unscanned {
     Force,
     /// Trust such a record's version: an ownership rescan (ADR-201). The
     /// previous owner's vectors replicated here and are almost always current,
-    /// and forcing would send every document older releases embedded to the
-    /// provider on every member that gains the collection. A reindex the
-    /// previous owner left unfinished is still completed, since what it had
-    /// not reached carries the old configuration's fingerprint, unless those
-    /// records were written before 0.43.0.
+    /// and forcing would send every such document to the provider on every
+    /// member that gains the collection. A reindex the previous owner left
+    /// unfinished is still completed, since what it had not reached carries the
+    /// old configuration's fingerprint, unless those records carry none.
     Check,
 }
 
@@ -1303,13 +1302,13 @@ impl EmbeddingWorker {
     /// record behind its document, or made under another configuration than
     /// the collection's (ADR-203), so a reindex the previous owner left
     /// unfinished is finished here. It forces every record with no
-    /// fingerprint (one written before 0.43.0) only when this member recorded
+    /// fingerprint only when this member recorded
     /// a completed scan under a configuration that has since changed and its
     /// own stream has not yet passed the change (a member that skips a
     /// change's backfill forgets what it recorded). So a collection the
     /// previous owner had kept up costs reads, not provider calls. What
     /// remains of the gap [`Unscanned::Check`] names is an unfinished reindex
-    /// of records written before 0.43.0.
+    /// of records with no fingerprint.
     ///
     /// **A first sight after a start is a gain.** The position a worker resumes
     /// from has passed every document it deferred, and the deferrals went with
@@ -1899,8 +1898,8 @@ impl EmbeddingWorker {
     ) -> Result<Scanned> {
         // Whether this scan reads a record with no configuration fingerprint
         // as stale. A record that carries one is judged by it on every scan
-        // (ADR-203); one written before 0.43.0, or by an older member, cannot
-        // say which configuration made it, and the HLC check cannot see a
+        // (ADR-203); one with no fingerprint cannot say which configuration
+        // made it, and the HLC check cannot see a
         // configuration change — configurations do not touch documents — so
         // for such records the decision comes from a fingerprint of the
         // configuration the last *completed* scan ran under. Written only
@@ -2123,7 +2122,7 @@ impl EmbeddingWorker {
     ///
     /// `judgement.unstamped` is how a record with no fingerprint is read.
     /// [`Unstamped::Stale`] re-embeds such current-looking vectors — the
-    /// configuration changed, and a record from before 0.43.0 cannot say it
+    /// configuration changed, and a record with no fingerprint cannot say it
     /// was made under the new one. Once `judgement.handed_over`, only such a
     /// document is prepared: every other stale one is the new owner's.
     fn prepare_one(
@@ -6774,13 +6773,13 @@ pub(crate) mod tests {
     /// since changed, and whose stream has not passed the change (so it has not
     /// forgotten what it recorded), is behind: its ownership rescan re-embeds
     /// every document whose records cannot say which configuration made them
-    /// (written before 0.43.0), and then records the configuration it scanned
+    /// (they carry no fingerprint), and then records the configuration it scanned
     /// under.
     #[tokio::test]
     async fn an_ownership_rescan_forces_on_a_member_whose_recorded_configuration_changed() {
         let (engine, coll, _worker, _dir) = setup().await;
         let ids = current_without_a_fingerprint(&engine, &coll).await;
-        written_before_043(&engine, &ids);
+        without_a_fingerprint(&engine, &ids);
         engine.put_vector_fingerprint(coll.id, 0x0bad_c0de).unwrap();
         let fake = rescan_at_first_sight(&engine, &coll).await;
         assert!(fake.calls() >= 1, "every document is sent again");
@@ -6835,8 +6834,8 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------------
 
     /// Rewrite each document's records without a configuration fingerprint, as
-    /// a release before 0.43.0, or an older member, wrote them.
-    fn written_before_043(engine: &Engine, ids: &[kimmy_core::DocId]) {
+    /// a client's are stored.
+    fn without_a_fingerprint(engine: &Engine, ids: &[kimmy_core::DocId]) {
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
         for id in ids {
             let records: Vec<VectorRecord> = engine
@@ -7062,17 +7061,16 @@ pub(crate) mod tests {
         assert_eq!(made_under(&engine, &streamed), Some(config.fingerprint()));
     }
 
-    /// Records written before 0.43.0 carry no fingerprint and are judged by
-    /// their version where nothing says the configuration changed: an ownership
-    /// rescan and a replayed entry send nothing for current ones, and a changed
-    /// document is still re-embedded. Reading them as stale would re-embed
-    /// everything older releases wrote, on every member that gains the
-    /// collection.
+    /// Records with no fingerprint are judged by their version where nothing
+    /// says the configuration changed: an ownership rescan and a replayed entry
+    /// send nothing for current ones, and a changed document is still
+    /// re-embedded. Reading them as stale would re-embed every such record, on
+    /// every member that gains the collection.
     #[tokio::test]
     async fn records_without_a_fingerprint_are_judged_by_their_version() {
         let (engine, coll, _worker, _dir) = setup().await;
         let ids = current_without_a_fingerprint(&engine, &coll).await;
-        written_before_043(&engine, &ids);
+        without_a_fingerprint(&engine, &ids);
         let fake = rescan_at_first_sight(&engine, &coll).await;
         assert_eq!(fake.calls(), 0, "every document was current by its version");
         assert!(ids.iter().all(|id| made_under(&engine, id).is_none()), "and nothing rewritten");
@@ -7289,7 +7287,7 @@ pub(crate) mod tests {
             ids.push(id);
         }
         if before_043 {
-            written_before_043(engine, &ids);
+            without_a_fingerprint(engine, &ids);
         }
         let b = VectorConfig { document_prefix: Some("passage: ".into()), ..a };
         engine.configure_vectors("app", "docs", b.clone()).unwrap();
@@ -7329,7 +7327,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Records written before 0.43.0 are the exception: the new owner's rescan
+    /// Records with no fingerprint are the exception: the new owner's rescan
     /// trusts them by version, so the old owner's forced scan goes on for them
     /// after it loses the collection, and they still end up under B, each
     /// sent once.
