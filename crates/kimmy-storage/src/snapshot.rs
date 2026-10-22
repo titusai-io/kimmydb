@@ -303,13 +303,7 @@ pub struct CollectionState {
     /// divergence check looked newer than the tombstone that peer holds for
     /// it. Both are the same resurrection through different doors.
     ///
-    /// An `Option`, and optional on the wire, because a sender that predates
-    /// the field sends no stamp at all: that is a fact the receiver has to be
-    /// able to see, and `Hlc::ZERO` would make it look like an incarnation
-    /// older than every tombstone rather than like an absence. What the
-    /// receiver does with the absence is on `Engine::restore_collection`.
-    #[serde(default)]
-    pub created: Option<Hlc>,
+    pub created: Hlc,
     /// The stamp of the latest change to `vector`: a configuration, a change of it,
     /// or turning it off (`CollectionMeta::vector_changed`, ADR-226).
     ///
@@ -355,7 +349,7 @@ impl From<CollectionMeta> for CollectionState {
             name: meta.name,
             indexes: meta.indexes,
             vector: meta.vector,
-            created: Some(meta.created),
+            created: meta.created,
             vector_changed: meta.vector_changed,
             redated_from,
             incarnation_floor: meta.incarnation_floor,
@@ -1195,14 +1189,12 @@ impl Engine {
             // A definition the tombstone here makes history is not restored
             // (`restore_collection`'s rule), so it waits on nothing.
             if let Some(dropped) = self.collection_dropped_at(id)?
-                && state
-                    .created
-                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
+                && crate::sync::creation_is_history(state.created, dropped.hlc)
             {
                 continue;
             }
             // Nor one the drop of its database makes history (ADR-229).
-            if self.database_refusal(&state.db, state.created)?.is_some() {
+            if self.database_refusal(&state.db, Some(state.created))?.is_some() {
                 continue;
             }
             if self.purge_pending(id)? {
@@ -1784,7 +1776,7 @@ impl Engine {
         };
         Ok(crate::sync::arriving_life_ends_the_standing_one(
             &standing,
-            state.created,
+            Some(state.created),
             state.redated_from,
             Some(floor),
         ))
@@ -2457,7 +2449,7 @@ impl Engine {
         }
         if !crate::sync::arriving_life_ends_the_standing_one(
             &standing,
-            state.created,
+            Some(state.created),
             state.redated_from,
             Some(floor),
         ) {
@@ -2499,9 +2491,7 @@ impl Engine {
     ) -> Result<usize> {
         // The creation, before it is stored: the clock must be past the incarnation this
         // node is about to serve, or its next local write is stamped below it.
-        if let Some(created) = state.created {
-            self.witness_covered_hlc(created, versions);
-        }
+        self.witness_covered_hlc(state.created, versions);
         self.bury_the_life_this_one_followed(state, versions, carried)?;
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
@@ -2511,17 +2501,9 @@ impl Engine {
             // it right. The same rule `sync::apply_ddl` applies to a replayed
             // `CreateCollection`, in the one place a collection can otherwise
             // arrive without an entry behind it.
-            //
-            // A page carrying no stamp comes from a sender that predates the
-            // field, and reads as the incarnation this node dropped rather
-            // than as a later one — the mixed-version choice, made this way
-            // because a genuine recreation still arrives through the entries
-            // path, where a resurrection cannot be undone.
             let id = CollectionId::derive(&state.db, &state.name);
             if let Some(dropped) = self.collection_dropped_at(id)?
-                && state
-                    .created
-                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
+                && crate::sync::creation_is_history(state.created, dropped.hlc)
             {
                 debug!(
                     db = %state.db,
@@ -2536,8 +2518,8 @@ impl Engine {
             // write after the page's vector) are history here, not a stop that
             // lasts until a snapshot, and snapshot coverage would hide the
             // creation that would have recorded it.
-            if self.database_refusal(&state.db, state.created)?.is_some() {
-                self.record_database_refusal(&state.db, &state.name, state.created)?;
+            if self.database_refusal(&state.db, Some(state.created))?.is_some() {
+                self.record_database_refusal(&state.db, &state.name, Some(state.created))?;
                 debug!(
                     db = %state.db,
                     collection = %state.name,
@@ -2545,7 +2527,7 @@ impl Engine {
                 );
                 return Ok(0);
             }
-            if self.parent_buried_since(&state.db, &state.name, state.created)? {
+            if self.parent_buried_since(&state.db, &state.name, Some(state.created))? {
                 debug!(
                     db = %state.db,
                     collection = %state.name,
@@ -2560,15 +2542,12 @@ impl Engine {
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Restore);
             // The tombstone rule above, judged again under the writer.
-            let history = |dropped: Stamp| {
-                state
-                    .created
-                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
-            };
+            let history =
+                |dropped: Stamp| crate::sync::creation_is_history(state.created, dropped.hlc);
             // A re-dated life arrives with the creation it was re-dated from, and
             // is created with it in the one transaction, so that no stop leaves it
             // standing without the marker ADR-235's lineage comparison reads.
-            let redated_from = state.redated_from.filter(|_| state.created.is_some());
+            let redated_from = state.redated_from;
             // The floor the page carries and its coverage names. The clock passes it as it
             // passes the floor a burial restores (ADR-233): the page may name the floor and
             // not the life's creation, and a clock left behind would mint writes at or below
@@ -2581,7 +2560,7 @@ impl Engine {
                 &state.db,
                 &state.name,
                 false,
-                state.created,
+                Some(state.created),
                 &history,
                 redated_from,
                 adopted,
@@ -2591,7 +2570,7 @@ impl Engine {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
                     // A database's drop that landed since the check above.
-                    self.record_database_refusal(&state.db, &state.name, state.created)?;
+                    self.record_database_refusal(&state.db, &state.name, Some(state.created))?;
                     return Ok(0);
                 }
                 // Checked outside the writer, so the name can be created in
@@ -2617,11 +2596,9 @@ impl Engine {
         // against the floor and the tombstones here, as the entries route judges it
         // (`definition_of_an_ended_life`), under the writer (ADR-236); judged by the life, as it was, a member that
         // took this page took the sender's coverage of the definition with it and
-        // never held it. Only a definition with no stamp is judged by the life.
+        // never held it.
         let earlier = |standing: &CollectionMeta| {
-            standing
-                .incarnation_floor
-                .is_some_and(|floor| state.created.is_none_or(|created| created <= floor))
+            standing.incarnation_floor.is_some_and(|floor| state.created <= floor)
         };
         // By the rule the entries route uses (`definition_of_an_ended_life`: the floor,
         // and the collection's and the database's tombstones, which close the window
@@ -2937,7 +2914,7 @@ impl Engine {
     fn shadows_orphaned(&self, page: &SnapshotPage) -> Result<Vec<CollectionId>> {
         let mut orphaned = Vec::new();
         for state in &page.collections {
-            if self.parent_buried_since(&state.db, &state.name, state.created)?
+            if self.parent_buried_since(&state.db, &state.name, Some(state.created))?
                 && self.get_collection(&state.db, &state.name).is_err()
             {
                 orphaned.push(CollectionId::derive(&state.db, &state.name));
@@ -4434,33 +4411,6 @@ mod tests {
         let cb = b.get_collection("shop", "orders").unwrap();
         assert_eq!(cb.created, ca.created, "restored under the sender's incarnation");
         assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), 1);
-    }
-
-    /// The mixed-version rule at the restore's door: a sender that predates
-    /// `CollectionState::created` names no incarnation, and an absent stamp
-    /// reads as the life this node dropped rather than as a later one. The
-    /// collection is not recreated for the minutes a roll is under way; a
-    /// genuine recreation still arrives through the entries path, where a
-    /// resurrection could not be undone.
-    #[test]
-    fn a_snapshot_that_names_no_incarnation_does_not_recreate_a_dropped_collection() {
-        let (a, _da) = engine();
-        let (b, _db) = engine();
-        let ca = a.create_collection("shop", "orders").unwrap();
-        a.insert(&ca, doc! { "_id": 1 }).unwrap();
-        b.create_collection("shop", "orders").unwrap();
-        a_moment();
-        b.drop_collection("shop", "orders").unwrap();
-
-        let mut page = a.snapshot_page(None, None).unwrap();
-        for state in &mut page.collections {
-            state.created = None;
-        }
-        let outcome = b
-            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
-            .unwrap();
-        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
-        assert_eq!((outcome.applied, outcome.superseded), (0, 1), "{outcome:?}");
     }
 
     /// A restored collection carries the **sender's** `created`, not this

@@ -197,15 +197,8 @@ pub enum Message {
     /// servable one, answered as [`Message::Vectors`] (ADR-146): the count
     /// half of the divergence check gates on what the peer has *processed*,
     /// which its servable vector understates for ever after an entry it
-    /// processed without appending. Optional on the wire, for the reason
-    /// `AskEntries::held` is: the handshake negotiates no version, so a
-    /// receiver that predates the field ignores it and answers
-    /// [`Message::Versions`] as before, which the requester reads as "no
-    /// witnessed vector" and gates on the servable one for that contact; a
-    /// requester that predates it sends none and is answered as it always
-    /// was. Neither direction of a mixed-version cluster fails a round.
+    /// processed without appending.
     AskVersions {
-        #[serde(default)]
         witnessed: bool,
         /// The requester's own block (ADR-201), so a member that is only ever
         /// contacted and never contacts still hands it over. Optional on the
@@ -288,32 +281,20 @@ pub enum Message {
     /// from — so the sender can judge the horizon per origin rather than by
     /// the single threshold: a requester below the coarse horizon is served
     /// when nothing it lacks has been collected, and told `BeyondHorizon`
-    /// only when something has (ADR-097). Optional on the wire, because the
-    /// handshake negotiates no version: a sender that predates the field
-    /// ignores it and judges by `from` as before, and a requester that
-    /// predates it sends none, which a sender reads the same way. Neither
-    /// direction of a mixed-version cluster loses anything it had.
+    /// only when something has (ADR-097). `None` when the requester asks for
+    /// the replay of its own origin, which is judged by `from` alone.
     AskEntries {
         from: Hlc,
         limit: usize,
-        #[serde(default)]
         held: Option<VersionVector>,
         /// Spans of history the requester holds as state at or below `held`,
         /// which the skip would otherwise never serve it again (ADR-172):
         /// the sender serves the entries inside them as well. Written on
-        /// every request, empty when there are none, so a mixed-version
-        /// cluster exercises the boundary on every pull. Optional on the wire
-        /// for the reason `held` is: a sender that predates the field ignores
-        /// it and serves as ADR-171 does, and a requester that predates it
-        /// sends none, which reads as no spans.
-        #[serde(default)]
+        /// every request, empty when there are none.
         marked: Vec<kimmy_storage::MarkedRange>,
         /// The requester can take a partial window (ADR-194): the sender may
         /// end its walk at a budget, however few entries it has kept, and say
-        /// where in `Entries::passed_through`. A sender that predates the
-        /// field ignores it and serves the whole window, as before; a
-        /// requester that predates it sends none, which reads as `false`.
-        #[serde(default)]
+        /// where in `Entries::passed_through`.
         partial: bool,
     },
     /// The answer, in stamp order, and where the window it came from ended.
@@ -485,19 +466,9 @@ pub enum Message {
     /// node has not heard about yet from one recreated since: a name dropped
     /// and created again derives the same id, so `collections` alone cannot.
     /// A `Vec` on the wire like `collections`, made a map at the boundary.
-    ///
-    /// Optional on the wire, for the reason `AskEntries::held` is: the
-    /// handshake negotiates no version. A requester that predates the field
-    /// ignores it and compares names alone as before; a sender that predates
-    /// it writes none, which the requester reads as "the incarnation I
-    /// dropped" for anything it holds a tombstone for
-    /// (`kimmy_storage::compare_divergence`, which states what that costs).
-    /// `collections` is untouched, so an older receiver reads the answer
-    /// exactly as it always did.
     Divergence {
         collections: Vec<CollectionId>,
         probe_count: Option<u64>,
-        #[serde(default)]
         incarnations: Vec<(CollectionId, Hlc)>,
         /// The cut digest of every collection quiet at the requester's cut,
         /// and of the one busy collection it named (B3). `None` from a peer
@@ -565,37 +536,25 @@ pub enum Message {
         /// entry it already held as sent: those are `ddl_held`.
         ddl: usize,
         /// Schema changes the window carried that the receiver already held,
-        /// entry and all, and so did not apply again or append. Absent from a
-        /// receiver on a version before the field, which counted them in
-        /// `ddl`.
-        #[serde(default)]
+        /// entry and all, and so did not apply again or append.
         ddl_held: usize,
         ddl_refused: usize,
         unknown_collection: usize,
         ddl_declined: usize,
         /// Entries the receiver left for its next pull rather than
-        /// witnessing (ADR-148). Absent from a receiver on a version before
-        /// the field, which never left any.
-        #[serde(default)]
+        /// witnessing (ADR-148).
         deferred: usize,
         /// Batches the receiver stopped at a creation that waits for its drop
-        /// purger (ADR-189). Absent from a receiver on a version before the
-        /// field, which never stopped there.
-        #[serde(default)]
+        /// purger (ADR-189).
         purge_pending: usize,
         /// The entries in the window the receiver refused or declined, by
         /// stamp (ADR-191): what lets a pusher whose window carried several
-        /// changes say which of them a member could not take. Absent from a
-        /// receiver on a version before the field; the pusher then finds it
-        /// does not account for the counts above and says so rather than
-        /// guessing (ADR-191).
-        #[serde(default)]
+        /// changes say which of them a member could not take.
         refused: Vec<kimmy_core::Stamp>,
         /// The entry the batch stopped at, for an unknown collection
         /// (ADR-148) or a creation waiting for the drop purger (ADR-189): it
-        /// and everything after it in the window were not taken. Absent from
-        /// a receiver on a version before the field, like `refused`.
-        #[serde(default)]
+        /// and everything after it in the window were not taken. `None` when
+        /// the batch did not stop.
         stopped_at: Option<kimmy_core::Stamp>,
     },
     /// Something went wrong; the sender is closing.
@@ -1119,59 +1078,11 @@ mod tests {
         );
     }
 
+    /// `Entries::passed_through` (ADR-194) in both directions: a requester before
+    /// the field reads a partial window's frame as the window it knew, and a frame
+    /// without it names no end of its own.
     #[tokio::test]
-    async fn ask_entries_crosses_a_version_boundary_in_both_directions() {
-        // The handshake negotiates no protocol version, so a field added to a
-        // request has to be one an older peer can ignore and a newer peer can
-        // do without. Both halves, as frames: what a requester before `held`
-        // sends, and what a sender before `held` sees.
-        let from = Hlc::new(7, 1);
-
-        // A frame from a requester that predates the field: no `held` at all.
-        let old_request = bson::doc! { "AskEntries": { "from": bson::serialize_to_bson(&from).unwrap(), "limit": 10i64 } };
-        let mut buffer = Vec::new();
-        let body = bson::serialize_to_vec(&old_request).unwrap();
-        buffer.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buffer.extend_from_slice(&body);
-        assert_eq!(
-            read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new(), partial: false },
-            "a request without the field must read as one that did not send it"
-        );
-
-        // A frame carrying a field this build does not know, standing in for
-        // what a sender that predates `held` sees when a newer requester
-        // writes one: it must be ignored, not refused.
-        let future = bson::doc! { "AskEntries": { "from": bson::serialize_to_bson(&from).unwrap(), "limit": 10i64, "somethingNewer": true } };
-        let mut buffer = Vec::new();
-        let body = bson::serialize_to_vec(&future).unwrap();
-        buffer.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buffer.extend_from_slice(&body);
-        assert_eq!(
-            read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new(), partial: false },
-            "a field this build does not know must not fail the frame"
-        );
-    }
-
-    /// The same boundary for `AskEntries::partial` and `Entries::
-    /// passed_through` (ADR-194), in both directions. A sender before
-    /// `partial` reads a request that sets it as the request it knew, and
-    /// serves a whole window; a requester before `passed_through` reads a
-    /// partial window's frame as the window it knew. A frame from a build
-    /// before either reads as `false` and `None`.
-    #[tokio::test]
-    async fn the_partial_window_fields_cross_a_version_boundary_in_both_directions() {
-        /// `AskEntries` as a sender before ADR-194 declares it.
-        #[derive(Debug, Deserialize)]
-        struct AskEntriesBeforePartial {
-            from: Hlc,
-            limit: usize,
-            #[serde(default)]
-            held: Option<VersionVector>,
-            #[serde(default)]
-            marked: Vec<kimmy_storage::MarkedRange>,
-        }
+    async fn passed_through_crosses_a_version_boundary_in_both_directions() {
         /// `Entries` as a requester before ADR-194 declares it.
         #[derive(Debug, Deserialize)]
         struct EntriesBeforePassedThrough {
@@ -1191,39 +1102,6 @@ mod tests {
             frame.extend_from_slice(&bytes);
             read_frame(&mut frame.as_slice()).await.unwrap()
         }
-
-        let held = populated_vector();
-        let ask = Message::AskEntries {
-            from: Hlc::new(7, 1),
-            limit: 10,
-            held: Some(held.clone()),
-            marked: Vec::new(),
-            partial: true,
-        };
-        let sent = body_of(&ask, "AskEntries").await;
-        assert_eq!(
-            sent.get_bool("partial").ok(),
-            Some(true),
-            "the frame carries the field: {sent}"
-        );
-        let older: AskEntriesBeforePartial = bson::deserialize_from_document(sent.clone())
-            .expect("a sender that predates the field reads the request");
-        assert_eq!((older.from, older.limit), (Hlc::new(7, 1), 10));
-        assert_eq!(older.held, Some(held.clone()));
-        assert!(older.marked.is_empty());
-        let mut before = sent;
-        before.remove("partial");
-        assert_eq!(
-            read_back("AskEntries", before).await,
-            Message::AskEntries {
-                from: Hlc::new(7, 1),
-                limit: 10,
-                held: Some(held),
-                marked: Vec::new(),
-                partial: false,
-            },
-            "a request from before the field asks for a whole window"
-        );
 
         let p = kimmy_core::Stamp::new(Hlc::new(11, 2), NodeId::generate());
         let entries = Message::Entries {
@@ -1252,234 +1130,113 @@ mod tests {
         );
     }
 
-    /// The same boundary for `AskEntries::marked` (ADR-172). A receiver
-    /// before the field reads a request carrying spans as the request it
-    /// knew; a requester before the field sends none, which reads as a
-    /// request naming no spans and is served as ADR-171 serves it.
+    /// The frame `message` writes, as a document, so a test can take a field out.
+    async fn written_document(message: &Message) -> bson::Document {
+        let mut written = Vec::new();
+        write_frame(&mut written, message).await.unwrap();
+        bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap()
+    }
+
+    /// `document` as the one frame it makes, for [`read_frame`].
+    fn framed(document: &bson::Document) -> Vec<u8> {
+        let bytes = bson::serialize_to_vec(document).unwrap();
+        let mut buffer = (bytes.len() as u32).to_be_bytes().to_vec();
+        buffer.extend_from_slice(&bytes);
+        buffer
+    }
+
+    /// A field every member writes is required: a frame without it is malformed,
+    /// not read as a default. There is no member that does not write them, because
+    /// a peer of another release is refused at the handshake.
     #[tokio::test]
-    async fn ask_entries_marked_crosses_a_version_boundary_in_both_directions() {
-        /// `AskEntries` as a receiver before ADR-172 declares it.
-        #[derive(Debug, Deserialize)]
-        struct AskEntriesBeforeMarked {
-            from: Hlc,
-            limit: usize,
-            #[serde(default)]
-            held: Option<VersionVector>,
+    async fn a_frame_without_a_field_every_member_writes_is_malformed() {
+        let messages = [
+            (
+                Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+                "AskVersions",
+                vec!["witnessed"],
+            ),
+            (
+                Message::AskEntries {
+                    from: Hlc::new(7, 1),
+                    limit: 10,
+                    held: Some(populated_vector()),
+                    marked: Vec::new(),
+                    partial: true,
+                },
+                "AskEntries",
+                vec!["marked", "partial"],
+            ),
+            (
+                Message::Pushed {
+                    applied: 1,
+                    ddl: 1,
+                    ddl_held: 1,
+                    ddl_refused: 0,
+                    unknown_collection: 0,
+                    ddl_declined: 0,
+                    deferred: 1,
+                    purge_pending: 1,
+                    refused: Vec::new(),
+                    stopped_at: None,
+                },
+                "Pushed",
+                vec!["ddl_held", "deferred", "purge_pending", "refused"],
+            ),
+            (
+                Message::Divergence {
+                    collections: vec![CollectionId(1)],
+                    probe_count: Some(7),
+                    incarnations: vec![(CollectionId(1), Hlc::new(9, 2))],
+                    digests: None,
+                    digest_busy: false,
+                    definitions: None,
+                },
+                "Divergence",
+                vec!["incarnations"],
+            ),
+        ];
+        for (message, variant, fields) in messages {
+            let whole = written_document(&message).await;
+            assert_eq!(read_frame(&mut framed(&whole).as_slice()).await.unwrap(), message);
+            for field in fields {
+                let mut without = whole.clone();
+                let removed = without.get_document_mut(variant).unwrap().remove(field);
+                assert!(removed.is_some(), "{variant} writes {field}: {whole}");
+                let read = read_frame(&mut framed(&without).as_slice()).await;
+                assert!(
+                    matches!(read, Err(ProtocolError::Malformed(_))),
+                    "{variant} without {field} must be malformed: {read:?}"
+                );
+            }
         }
-
-        let held = populated_vector();
-        let request = Message::AskEntries {
-            from: Hlc::new(7, 1),
-            limit: 10,
-            held: Some(held.clone()),
-            marked: vec![kimmy_storage::MarkedRange {
-                origin: NodeId::generate(),
-                from: Hlc::new(3, 0),
-                through: Hlc::new(5, 2),
-            }],
-            partial: false,
-        };
-        let mut written = Vec::new();
-        write_frame(&mut written, &request).await.unwrap();
-        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
-        let sent = body.get_document("AskEntries").unwrap().clone();
-        assert!(
-            sent.contains_key("marked"),
-            "the frame must carry the field for this to test anything: {sent}"
-        );
-
-        let older: AskEntriesBeforeMarked = bson::deserialize_from_document(sent.clone())
-            .expect("a receiver that predates the field must still read the request");
-        assert_eq!(older.from, Hlc::new(7, 1));
-        assert_eq!(older.limit, 10);
-        assert_eq!(older.held, Some(held.clone()));
-
-        let mut before = sent;
-        before.remove("marked");
-        let frame = {
-            let bytes = bson::serialize_to_vec(&bson::doc! { "AskEntries": before }).unwrap();
-            let mut buffer = (bytes.len() as u32).to_be_bytes().to_vec();
-            buffer.extend_from_slice(&bytes);
-            buffer
-        };
-        assert_eq!(
-            read_frame(&mut frame.as_slice()).await.unwrap(),
-            Message::AskEntries {
-                from: Hlc::new(7, 1),
-                limit: 10,
-                held: Some(held),
-                marked: Vec::new(),
-                partial: false,
-            },
-            "a request without the field must read as one naming no spans"
-        );
     }
 
-    /// `Pushed::purge_pending` (ADR-189) is a backward-compatible addition: a
-    /// receiver before the field sends a `Pushed` without it, which reads as
-    /// no stop at a pending creation, which is what that receiver never made.
+    /// The shapes this build writes for the fields above.
     #[tokio::test]
-    async fn pushed_without_purge_pending_reads_as_none() {
-        let mut written = Vec::new();
-        let current = Message::Pushed {
-            applied: 1,
-            ddl: 1,
-            ddl_held: 0,
-            ddl_refused: 0,
-            unknown_collection: 0,
-            ddl_declined: 0,
-            deferred: 0,
-            purge_pending: 1,
-            refused: Vec::new(),
-            stopped_at: None,
+    async fn the_required_fields_are_written_in_their_wire_shape() {
+        let asked =
+            Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None };
+        assert_eq!(
+            written_document(&asked).await,
+            bson::doc! { "AskVersions": { "witnessed": true } }
+        );
+        let answered = Message::Divergence {
+            collections: vec![CollectionId(1)],
+            probe_count: Some(7),
+            incarnations: vec![(CollectionId(1), Hlc::new(9, 2))],
+            digests: None,
+            digest_busy: false,
+            definitions: None,
         };
-        write_frame(&mut written, &current).await.unwrap();
-        let mut body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
-        let fields = body.get_document_mut("Pushed").expect("a struct variant");
-        assert!(fields.remove("purge_pending").is_some(), "the field is on the wire: {fields:?}");
-
-        let bytes = bson::serialize_to_vec(&body).unwrap();
-        let mut old = (bytes.len() as u32).to_be_bytes().to_vec();
-        old.extend_from_slice(&bytes);
         assert_eq!(
-            read_frame(&mut old.as_slice()).await.unwrap(),
-            Message::Pushed {
-                applied: 1,
-                ddl: 1,
-                ddl_held: 0,
-                ddl_refused: 0,
-                unknown_collection: 0,
-                ddl_declined: 0,
-                deferred: 0,
-                purge_pending: 0,
-                refused: Vec::new(),
-                stopped_at: None,
-            },
-            "an older receiver's reply must read as no stop"
+            written_document(&answered).await,
+            bson::doc! { "Divergence": {
+                "collections": [1i64],
+                "probe_count": 7i64,
+                "incarnations": [[1i64, { "wall_ms": 9i64, "counter": 2i32 }]],
+            } }
         );
-    }
-
-    /// `Pushed::ddl_held` is a backward-compatible addition: a receiver
-    /// before the field sends a `Pushed` without it, which reads as none
-    /// held -- that receiver counted them in `ddl`.
-    #[tokio::test]
-    async fn pushed_without_ddl_held_reads_as_none_held() {
-        let pushed = |ddl_held| Message::Pushed {
-            applied: 0,
-            ddl: 1,
-            ddl_held,
-            ddl_refused: 0,
-            unknown_collection: 0,
-            ddl_declined: 0,
-            deferred: 0,
-            purge_pending: 0,
-            refused: Vec::new(),
-            stopped_at: None,
-        };
-        let mut written = Vec::new();
-        write_frame(&mut written, &pushed(2)).await.unwrap();
-        let mut body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
-        let fields = body.get_document_mut("Pushed").expect("a struct variant");
-        assert!(fields.remove("ddl_held").is_some(), "the field is on the wire: {fields:?}");
-
-        let bytes = bson::serialize_to_vec(&body).unwrap();
-        let mut old = (bytes.len() as u32).to_be_bytes().to_vec();
-        old.extend_from_slice(&bytes);
-        assert_eq!(
-            read_frame(&mut old.as_slice()).await.unwrap(),
-            pushed(0),
-            "an older receiver's reply must read as none held"
-        );
-    }
-
-    /// `Pushed::refused` and `Pushed::stopped_at` (ADR-191) are
-    /// backward-compatible additions: a receiver before them sends a
-    /// `Pushed` without either, which reads as none named. The pusher tells
-    /// that apart from "none happened" by the counts, not by the fields.
-    #[tokio::test]
-    async fn pushed_without_the_per_change_fields_reads_as_none_named() {
-        let stamp = kimmy_core::Stamp::new(Hlc::new(9, 0), NodeId::from_bytes([3; 16]));
-        let mut written = Vec::new();
-        let current = Message::Pushed {
-            applied: 0,
-            ddl: 1,
-            ddl_held: 0,
-            ddl_refused: 1,
-            unknown_collection: 1,
-            ddl_declined: 0,
-            deferred: 0,
-            purge_pending: 0,
-            refused: vec![stamp],
-            stopped_at: Some(stamp),
-        };
-        write_frame(&mut written, &current).await.unwrap();
-        let mut body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
-        let fields = body.get_document_mut("Pushed").expect("a struct variant");
-        assert!(fields.remove("refused").is_some(), "the field is on the wire: {fields:?}");
-        assert!(fields.remove("stopped_at").is_some(), "the field is on the wire: {fields:?}");
-
-        let bytes = bson::serialize_to_vec(&body).unwrap();
-        let mut old = (bytes.len() as u32).to_be_bytes().to_vec();
-        old.extend_from_slice(&bytes);
-        assert_eq!(
-            read_frame(&mut old.as_slice()).await.unwrap(),
-            Message::Pushed {
-                applied: 0,
-                ddl: 1,
-                ddl_held: 0,
-                ddl_refused: 1,
-                unknown_collection: 1,
-                ddl_declined: 0,
-                deferred: 0,
-                purge_pending: 0,
-                refused: Vec::new(),
-                stopped_at: None,
-            },
-            "an older receiver's reply must read as naming nothing"
-        );
-    }
-
-    /// The same boundary for `AskVersions::witnessed` (ADR-146), which is
-    /// what keeps a sync round from failing against a peer on either side
-    /// of the upgrade: a requester before the field sends an empty
-    /// document, which reads as not asking; a receiver before the field
-    /// sees a field it does not know on an empty struct variant, which it
-    /// must ignore rather than refuse.
-    #[tokio::test]
-    async fn ask_versions_crosses_a_version_boundary_in_both_directions() {
-        let frame = |body: bson::Document| {
-            let mut buffer = Vec::new();
-            let bytes = bson::serialize_to_vec(&body).unwrap();
-            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            buffer.extend_from_slice(&bytes);
-            buffer
-        };
-
-        let old_request = frame(bson::doc! { "AskVersions": {} });
-        assert_eq!(
-            read_frame(&mut old_request.as_slice()).await.unwrap(),
-            Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
-            "a request without the field must read as one that did not ask"
-        );
-
-        let future = frame(bson::doc! { "AskVersions": { "somethingNewer": true } });
-        assert_eq!(
-            read_frame(&mut future.as_slice()).await.unwrap(),
-            Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
-            "a field this build does not know must not fail the frame"
-        );
-
-        // And the frame this build writes when it asks is exactly the shape
-        // an old receiver is handed above: an unknown field on `AskVersions`.
-        let mut asked = Vec::new();
-        write_frame(
-            &mut asked,
-            &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
-        )
-        .await
-        .unwrap();
-        let body = bson::deserialize_from_slice::<bson::Document>(&asked[4..]).unwrap();
-        assert_eq!(body, bson::doc! { "AskVersions": { "witnessed": true } });
     }
 
     /// Another task decoding an undecodable block on the same thread while this
@@ -1748,7 +1505,7 @@ mod tests {
             name: "orders".into(),
             indexes: Vec::new(),
             vector: None,
-            created: Some(Hlc::new(900, 0)),
+            created: Hlc::new(900, 0),
             vector_changed: None,
             redated_from: Some(Hlc::new(100, 0)),
             incarnation_floor: Some(Hlc::new(200, 0)),
@@ -1908,72 +1665,6 @@ mod tests {
         );
     }
 
-    /// The same boundary for `Divergence::incarnations`. The answer is what
-    /// crosses the version line here rather than the request: a requester
-    /// that predates the field ignores it and compares names alone; an
-    /// answering peer that predates it writes none, which a requester that
-    /// knows the field reads as "the incarnation you dropped" for every id it
-    /// holds a tombstone for (`kimmy_storage::compare_divergence`).
-    /// `collections` is untouched either way, so nothing an older receiver
-    /// already read changes shape.
-    #[tokio::test]
-    async fn divergence_crosses_a_version_boundary_in_both_directions() {
-        let frame = |body: bson::Document| {
-            let mut buffer = Vec::new();
-            let bytes = bson::serialize_to_vec(&body).unwrap();
-            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            buffer.extend_from_slice(&bytes);
-            buffer
-        };
-        let answered = |collections| Message::Divergence {
-            collections,
-            probe_count: Some(7),
-            incarnations: Vec::new(),
-            digests: None,
-            digest_busy: false,
-            definitions: None,
-        };
-
-        let old_answer =
-            frame(bson::doc! { "Divergence": { "collections": [1i64], "probe_count": 7i64 } });
-        assert_eq!(
-            read_frame(&mut old_answer.as_slice()).await.unwrap(),
-            answered(vec![CollectionId(1)]),
-            "an answer without the field must read as one that named no incarnation"
-        );
-
-        let future = frame(
-            bson::doc! { "Divergence": { "collections": [1i64], "probe_count": 7i64, "somethingNewer": true } },
-        );
-        assert_eq!(
-            read_frame(&mut future.as_slice()).await.unwrap(),
-            answered(vec![CollectionId(1)]),
-            "a field this build does not know must not fail the frame"
-        );
-
-        // And the frame this build answers with is exactly that shape to an
-        // older requester: the two fields it knows, and one it ignores.
-        let mut written = Vec::new();
-        let held = Message::Divergence {
-            collections: vec![CollectionId(1)],
-            probe_count: Some(7),
-            incarnations: vec![(CollectionId(1), Hlc::new(9, 2))],
-            digests: None,
-            digest_busy: false,
-            definitions: None,
-        };
-        write_frame(&mut written, &held).await.unwrap();
-        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
-        assert_eq!(
-            body,
-            bson::doc! { "Divergence": {
-                "collections": [1i64],
-                "probe_count": 7i64,
-                "incarnations": [[1i64, { "wall_ms": 9i64, "counter": 2i32 }]],
-            } }
-        );
-    }
-
     /// B3: the cut digest crosses the version line in both directions, for the
     /// request and for the answer.
     #[tokio::test]
@@ -2038,8 +1729,9 @@ mod tests {
         assert!(matches!(old, Old::AskDivergence { probe: None }), "{old:?}");
 
         // An answer from a build before the digest: no field, read as none.
-        let old_answer =
-            frame(bson::doc! { "Divergence": { "collections": [1i64], "probe_count": 7i64 } });
+        let old_answer = frame(
+            bson::doc! { "Divergence": { "collections": [1i64], "probe_count": 7i64, "incarnations": [] } },
+        );
         let Message::Divergence { digests, digest_busy, .. } =
             read_frame(&mut old_answer.as_slice()).await.unwrap()
         else {
@@ -2049,7 +1741,7 @@ mod tests {
 
         // The busy marker is its own thing, not a missing field.
         let busy = frame(bson::doc! { "Divergence": {
-        "collections": [1i64], "probe_count": 7i64, "digest_busy": true } });
+        "collections": [1i64], "probe_count": 7i64, "incarnations": [], "digest_busy": true } });
         let Message::Divergence { digests, digest_busy, .. } =
             read_frame(&mut busy.as_slice()).await.unwrap()
         else {
@@ -2263,7 +1955,7 @@ mod tests {
             },
         );
         let garbled_answer = frame(bson::doc! { "Divergence": {
-        "collections": [1i64], "probe_count": 7i64, "definitions": [1, 2, 3] } });
+        "collections": [1i64], "probe_count": 7i64, "incarnations": [], "definitions": [1, 2, 3] } });
         let Message::Divergence { collections, probe_count, definitions, .. } =
             read_frame(&mut garbled_answer.as_slice()).await.unwrap()
         else {
@@ -2288,7 +1980,7 @@ mod tests {
             "deferred": "a_reason_from_a_later_build",
         });
         let mixed = frame(bson::doc! { "Divergence": {
-        "collections": [1i64],
+        "collections": [1i64], "incarnations": [],
         "definitions": { "entries": [unknown_reason, good, "garbage"] } } });
         let Message::Divergence { definitions, .. } =
             read_frame(&mut mixed.as_slice()).await.unwrap()
@@ -2324,7 +2016,7 @@ mod tests {
             "a request of another shape is no request, and the probe is still read"
         );
         let garbled_answer = frame(bson::doc! { "Divergence": {
-        "collections": [1i64], "probe_count": 7i64, "digests": [1, 2, 3] } });
+        "collections": [1i64], "probe_count": 7i64, "incarnations": [], "digests": [1, 2, 3] } });
         let Message::Divergence { collections, probe_count, digests, .. } =
             read_frame(&mut garbled_answer.as_slice()).await.unwrap()
         else {
@@ -2348,7 +2040,7 @@ mod tests {
             "deferred": "a_reason_from_a_later_build",
         });
         let mixed = frame(bson::doc! { "Divergence": {
-        "collections": [5i64, 6i64], "probe_count": null,
+        "collections": [5i64, 6i64], "probe_count": null, "incarnations": [],
         "digests": { "entries": [unknown_reason, good] } } });
         let Message::Divergence { digests, .. } = read_frame(&mut mixed.as_slice()).await.unwrap()
         else {

@@ -8049,7 +8049,7 @@ mod tests {
                 vector: None,
                 // The incarnation the sender holds, older than every
                 // document it carries, as a real sender's would be.
-                created: Some(Hlc::ZERO),
+                created: Hlc::ZERO,
                 vector_changed: None,
                 redated_from: None,
                 incarnation_floor: None,
@@ -8329,7 +8329,7 @@ mod tests {
         let written = created + 1;
         let mut page =
             snapshot_page(origin, &[written], Some(cursor(written)), theirs.clone(), true);
-        page.collections[0].created = Some(Hlc::new(created, 0));
+        page.collections[0].created = Hlc::new(created, 0);
 
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(their_node, orders, Repair::Snapshot));

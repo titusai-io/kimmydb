@@ -178,6 +178,7 @@ fn the_frames_decode_whatever_the_new_fields_hold() {
     assert_eq!(echo, None, "an echo that does not decode is none: a peer that does not echo");
 
     let frame = frame_of(doc! { "AskVersions": {
+        "witnessed": false,
         "facts_gen": 9_i64,
         "echo": { "boot": bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![1, 2, 3] }, "generation": 7_i64 },
     } });

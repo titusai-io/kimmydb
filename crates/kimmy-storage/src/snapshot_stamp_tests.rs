@@ -231,7 +231,7 @@ fn a_scoped_drop_or_a_creation_the_senders_coverage_does_not_name_moves_nothing(
     let mut page = a.snapshot_page(None, Some(orders.id)).unwrap();
     page.dropped = Some(Stamp::new(far, a.node_id()));
     for state in &mut page.collections {
-        state.created = Some(far);
+        state.created = far;
     }
     b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders.id), &page)
         .unwrap();

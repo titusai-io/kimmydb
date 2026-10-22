@@ -200,10 +200,7 @@ pub struct PeerAnswer {
     /// not hold it.
     pub probe_count: Option<u64>,
     /// The incarnation the peer holds each of those collections at
-    /// (`Engine::collection_incarnations`). Empty from a peer that predates
-    /// the field, which [`compare`] reads as "the incarnation I dropped" for
-    /// any id this node holds a tombstone for — see its own documentation
-    /// for why that direction, and what it costs.
+    /// (`Engine::collection_incarnations`).
     pub incarnations: BTreeMap<CollectionId, Hlc>,
 }
 
@@ -266,15 +263,6 @@ pub struct Findings {
 /// travels through the entries path like any other change; a peer that has
 /// not applied it yet is behind, which is the one thing the existence half
 /// must never read as divergence (above).
-///
-/// A peer that predates `PeerAnswer::incarnations` reports no stamp, and for
-/// an id this node holds a tombstone for that reads as the incarnation this
-/// node dropped: not reported. The cost is a collection genuinely recreated
-/// on such a peer, whose `CreateCollection` entry has already aged out of the
-/// oplog, which this check leaves alone until the roll completes or the
-/// tombstone expires. That is chosen over resurrecting a drop, which is not
-/// recoverable by waiting; and the ordinary recreation is unaffected, because
-/// its entry still arrives through the entries path and is applied there.
 pub fn compare(mine: &LocalState, peer: &PeerAnswer) -> Findings {
     let existence = peer
         .collections
@@ -1276,31 +1264,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(compare(&mine, &peer).existence, set(&[3]));
-    }
-
-    #[test]
-    fn a_peer_that_names_no_incarnation_is_read_as_holding_the_one_this_node_dropped() {
-        // The mixed-version rule, and it is deliberate. A peer that predates
-        // the field answers with names alone; reading that as a recreation
-        // resurrects the drop, and no later round undoes that, where the
-        // recreation this refuses to report is pulled as soon as the roll
-        // finishes — or through the entries path, which is untouched.
-        let mine = LocalState {
-            collections: BTreeSet::new(),
-            dropped: stamps(&[(3, 50)]),
-            ..Default::default()
-        };
-        assert_eq!(
-            compare(&mine, &PeerAnswer { collections: set(&[3]), ..Default::default() }).existence,
-            BTreeSet::new()
-        );
-        // It subtracts; it does not gate. An id with no tombstone here is
-        // reported from that same stampless answer exactly as before.
-        assert_eq!(
-            compare(&mine, &PeerAnswer { collections: set(&[3, 4]), ..Default::default() })
-                .existence,
-            set(&[4])
-        );
     }
 
     #[test]

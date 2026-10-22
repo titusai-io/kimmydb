@@ -167,7 +167,7 @@ fn a_floor_the_senders_coverage_does_not_name_buries_nothing() {
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
     for state in &mut page.collections {
         state.incarnation_floor = Some(far);
-        state.created = Some(Hlc::new(crate::physical_now_ms() + 86_400_001, 0));
+        state.created = Hlc::new(crate::physical_now_ms() + 86_400_001, 0);
     }
     b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
         .unwrap();
@@ -804,7 +804,7 @@ fn a_floor_at_or_above_the_life_it_belongs_to_is_not_adopted() {
     // the life was made after, so it is below `created`.
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
     for state in &mut page.collections {
-        state.incarnation_floor = state.created;
+        state.incarnation_floor = Some(state.created);
     }
     r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
         .unwrap();
@@ -1179,7 +1179,7 @@ fn the_clock_passes_an_adopted_floor() {
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
     for state in &mut page.collections {
         state.incarnation_floor = Some(ahead);
-        state.created = Some(ahead.successor());
+        state.created = ahead.successor();
     }
     page.versions.insert(a.node_id(), ahead);
     r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)

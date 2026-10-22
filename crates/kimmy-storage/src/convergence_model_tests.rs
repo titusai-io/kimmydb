@@ -1047,7 +1047,7 @@ impl Cluster {
         let covered = |stamp: &Stamp| stamp.hlc <= page.versions.get(stamp.node);
         let mut vouched: Vec<(&str, Hlc)> = Vec::new();
         for state in &page.collections {
-            if let Some(created) = state.created.filter(|c| named(*c)) {
+            if let Some(created) = Some(state.created).filter(|c| named(*c)) {
                 vouched.push(("a creation", created));
             }
         }
