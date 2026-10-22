@@ -105,13 +105,9 @@ impl Engine {
     /// creation whose origin stamped it at `created` is refused iff
     /// `created <= S.hlc`. **One comparison, an `Hlc` against an `Hlc`, on every
     /// route** (the entries path, a snapshot page, the sweep), so the order in
-    /// which a creation and the drop arrive cannot change the outcome. A
-    /// creation naming no `created` (a page from a sender before the field)
-    /// reads as older.
-    pub(crate) fn database_refusal(&self, db: &str, created: Option<Hlc>) -> Result<Option<Stamp>> {
-        Ok(self
-            .database_dropped_at(db)?
-            .filter(|dropped| created.is_none_or(|created| created <= dropped.hlc)))
+    /// which a creation and the drop arrive cannot change the outcome.
+    pub(crate) fn database_refusal(&self, db: &str, created: Hlc) -> Result<Option<Stamp>> {
+        Ok(self.database_dropped_at(db)?.filter(|dropped| created <= dropped.hlc))
     }
 
     /// Record, for a creation the database's drop refused, the tombstone of the
@@ -124,12 +120,7 @@ impl Engine {
     /// stops the batch as unknown until a snapshot, and a snapshot's coverage
     /// hides the creation that would have recorded it. Both ids, as a burial
     /// records both: a shadow's chunks are judged by the shadow's id.
-    pub(crate) fn record_database_refusal(
-        &self,
-        db: &str,
-        name: &str,
-        created: Option<Hlc>,
-    ) -> Result<()> {
+    pub(crate) fn record_database_refusal(&self, db: &str, name: &str, created: Hlc) -> Result<()> {
         let Some(dropped) = self.database_refusal(db, created)? else {
             return Ok(());
         };

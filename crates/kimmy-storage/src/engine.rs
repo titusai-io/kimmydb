@@ -4430,9 +4430,11 @@ impl Engine {
             // creation from elsewhere that the database's drop covers is
             // history, by one comparison of the origin's `Hlc` against the
             // drop's, on every route. A local creation always mints after
-            // what this node has seen, so it stands; a creation naming no
-            // `created` reads as older.
-            if !log && self.database_refusal(db, origin)?.is_some() {
+            // what this node has seen, so it stands.
+            if !log
+                && let Some(created) = origin
+                && self.database_refusal(db, created)?.is_some()
+            {
                 return Ok(InTxn::History);
             }
             let database_dropped = self.database_dropped_at(db)?;
@@ -4447,16 +4449,16 @@ impl Engine {
             // drop, and created here it stood parentless (ADR-138). Judged
             // under the writer for the reason `history` is. Only under a
             // tombstone: a parent absent with none has not arrived yet, and the
-            // shadow is created. A creation naming no `created` of its own under
-            // such a tombstone reads as the older one.
+            // shadow is created.
             if !log
+                && let Some(created) = origin
                 && let Some(base) = kimmy_core::vector_meta::base_name(name)
                 && collections.get((db, base))?.is_none()
             {
                 let tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
                 if let Some(raw) = tombstones.get(CollectionId::derive(db, base).0)? {
                     let buried = codec::decode_oplog_key(raw.value())?;
-                    if origin.is_none_or(|created| created <= buried.hlc) {
+                    if created <= buried.hlc {
                         return Ok(InTxn::History);
                     }
                 }

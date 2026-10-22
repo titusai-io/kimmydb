@@ -381,7 +381,7 @@ fn a_definition_stamped_exactly_at_the_tombstone_is_restored_as_the_entries_rout
 
 #[test]
 fn an_unstamped_definition_is_not_rebuilt_over_the_receivers_tombstone() {
-    // A sender that predates the stamp. Building it over the tombstone is the
+    // A definition with no stamp. Building it over the tombstone is the
     // defect; a real recreation arrives by the entries route with a stamp.
     let (a, b, id, _dirs) = b_dropped_what_a_still_serves(false, None);
     let mut page = a.snapshot_page(None, Some(id)).unwrap();

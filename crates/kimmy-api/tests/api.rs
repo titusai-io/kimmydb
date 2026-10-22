@@ -10848,7 +10848,6 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_ddl_confirmations_total",
         "kimmy_ddl_confirmations_total",
         "kimmy_ddl_confirmations_total",
-        "kimmy_ddl_confirmations_total",
         "kimmy_ddl_confirm_pushes_total",
         "kimmy_replay_total",
         "kimmy_replay_total",

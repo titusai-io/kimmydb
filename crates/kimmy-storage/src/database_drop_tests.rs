@@ -1785,10 +1785,10 @@ fn a_definition_the_database_refuses_does_not_wait_on_an_older_lifes_purge() {
 #[test]
 fn recording_a_refusal_already_held_takes_no_writer() {
     let (a, _b, _da, _db, _late) = the_field_sequence();
-    a.record_database_refusal("shop", "late", Some(Hlc::new(1, 0))).unwrap();
+    a.record_database_refusal("shop", "late", Hlc::new(1, 0)).unwrap();
     let slot = crate::engine::WriterHolder::Ddl.slot();
     let before = a.writer_hold().count[slot];
-    a.record_database_refusal("shop", "late", Some(Hlc::new(1, 0))).unwrap();
+    a.record_database_refusal("shop", "late", Hlc::new(1, 0)).unwrap();
     assert_eq!(a.writer_hold().count[slot], before, "a held refusal took the writer");
 }
 

@@ -184,20 +184,17 @@ pub enum Message {
     },
     /// Answers the responder's challenge. The handshake is complete after this.
     Confirm { proof: Vec<u8> },
-    /// "What do you hold?" — and, when `witnessed` is set, "what have you
-    /// processed?"
+    /// "What do you hold, and what have you processed?"
     ///
     /// A struct variant rather than a unit variant: BSON has no
     /// representation for a bare value at the top level, and a unit variant
     /// serializes to a string. Every message on this wire must be a document.
     ///
-    /// `witnessed` asks for the receiver's witnessed vector beside its
-    /// servable one, answered as [`Message::Vectors`] (ADR-146): the count
-    /// half of the divergence check gates on what the peer has *processed*,
-    /// which its servable vector understates for ever after an entry it
-    /// processed without appending.
+    /// Answered as [`Message::Vectors`]: the receiver's witnessed vector beside
+    /// its servable one (ADR-146). The count half of the divergence check gates
+    /// on what the peer has *processed*, which its servable vector understates
+    /// for ever after an entry it processed without appending.
     AskVersions {
-        witnessed: bool,
         /// The requester's own block (ADR-201), so a member that is only ever
         /// contacted and never contacts still hands it over. Absent when this
         /// member has nothing to say, and read leniently: a block that does not
@@ -225,14 +222,11 @@ pub enum Message {
         )]
         echo: Option<Echo>,
     },
-    /// The answer: what the receiver can serve.
-    Versions(VersionVector),
-    /// The answer to an `AskVersions` that set `witnessed`: what the receiver
-    /// can serve, and what it has processed (ADR-146). `servable` is exactly
-    /// what [`Message::Versions`] carries; `witnessed` is what
-    /// [`Message::Witnessed`] carries. One frame rather than two requests,
-    /// because every sync round asks the first question and a checked
-    /// contact needs the second.
+    /// The answer to an `AskVersions`: what the receiver can serve, and what it
+    /// has processed (ADR-146). `servable` is what a version vector of the
+    /// oplog carries; `witnessed` is what [`Message::Witnessed`] carries. One
+    /// frame rather than two requests, because every sync round asks the first
+    /// question and a checked contact needs the second.
     Vectors {
         servable: VersionVector,
         witnessed: VersionVector,
@@ -481,7 +475,7 @@ pub enum Message {
     /// *serve*. The one caller is a push (ADR-143): the pusher derives the
     /// window the member lacks from this exactly as the member would derive
     /// it for itself, so a push never carries an entry out of order. A sync
-    /// round asks the same question through `AskVersions { witnessed: true }`
+    /// round asks the same question through `AskVersions`
     /// (ADR-146), on the frame it already spends.
     AskWitnessed {},
     /// The answer.
@@ -887,8 +881,7 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip() {
         let messages = [
-            Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
-            Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+            Message::AskVersions { facts: None, facts_gen: None, echo: None },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
                 limit: 10,
@@ -914,7 +907,6 @@ mod tests {
                 }],
                 partial: false,
             },
-            Message::Versions(populated_vector()),
             Message::Vectors {
                 servable: populated_vector(),
                 witnessed: populated_vector(),
@@ -1021,7 +1013,7 @@ mod tests {
         let mut buffer = Vec::new();
         write_frame(
             &mut buffer,
-            &Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
+            &Message::AskVersions { facts: None, facts_gen: None, echo: None },
         )
         .await
         .unwrap();
@@ -1041,7 +1033,7 @@ mod tests {
         let mut stream = buffer.as_slice();
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
-            Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None }
+            Message::AskVersions { facts: None, facts_gen: None, echo: None }
         );
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
@@ -1052,58 +1044,6 @@ mod tests {
                 marked: Vec::new(),
                 partial: false
             }
-        );
-    }
-
-    /// `Entries::passed_through` (ADR-194) in both directions: a requester before
-    /// the field reads a partial window's frame as the window it knew, and a frame
-    /// without it names no end of its own.
-    #[tokio::test]
-    async fn passed_through_crosses_a_version_boundary_in_both_directions() {
-        /// `Entries` as a requester before ADR-194 declares it.
-        #[derive(Debug, Deserialize)]
-        struct EntriesBeforePassedThrough {
-            entries: Vec<OplogEntry>,
-            scanned_to: Hlc,
-            exhausted: bool,
-        }
-        async fn body_of(message: &Message, variant: &str) -> bson::Document {
-            let mut written = Vec::new();
-            write_frame(&mut written, message).await.unwrap();
-            let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
-            body.get_document(variant).unwrap().clone()
-        }
-        async fn read_back(variant: &str, fields: bson::Document) -> Message {
-            let bytes = bson::serialize_to_vec(&bson::doc! { variant: fields }).unwrap();
-            let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
-            frame.extend_from_slice(&bytes);
-            read_frame(&mut frame.as_slice()).await.unwrap()
-        }
-
-        let p = kimmy_core::Stamp::new(Hlc::new(11, 2), NodeId::generate());
-        let entries = Message::Entries {
-            entries: Vec::new(),
-            scanned_to: p.hlc,
-            exhausted: false,
-            passed_through: Some(p),
-        };
-        let sent = body_of(&entries, "Entries").await;
-        assert!(sent.contains_key("passed_through"), "the frame carries the field: {sent}");
-        let older: EntriesBeforePassedThrough = bson::deserialize_from_document(sent.clone())
-            .expect("a requester that predates the field reads the window");
-        assert!(older.entries.is_empty());
-        assert_eq!((older.scanned_to, older.exhausted), (p.hlc, false));
-        let mut before = sent;
-        before.remove("passed_through");
-        assert_eq!(
-            read_back("Entries", before).await,
-            Message::Entries {
-                entries: Vec::new(),
-                scanned_to: p.hlc,
-                exhausted: false,
-                passed_through: None,
-            },
-            "a window from before the field names no end of its own"
         );
     }
 
@@ -1128,11 +1068,6 @@ mod tests {
     #[tokio::test]
     async fn a_frame_without_a_field_every_member_writes_is_malformed() {
         let messages = [
-            (
-                Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
-                "AskVersions",
-                vec!["witnessed"],
-            ),
             (
                 Message::AskEntries {
                     from: Hlc::new(7, 1),
@@ -1192,12 +1127,8 @@ mod tests {
     /// The shapes this build writes for the fields above.
     #[tokio::test]
     async fn the_required_fields_are_written_in_their_wire_shape() {
-        let asked =
-            Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None };
-        assert_eq!(
-            written_document(&asked).await,
-            bson::doc! { "AskVersions": { "witnessed": true } }
-        );
+        let asked = Message::AskVersions { facts: None, facts_gen: None, echo: None };
+        assert_eq!(written_document(&asked).await, bson::doc! { "AskVersions": {} });
         let answered = Message::Divergence {
             collections: vec![CollectionId(1)],
             probe_count: Some(7),
@@ -1256,26 +1187,11 @@ mod tests {
         assert!(!waiting.await.unwrap().unwrap(), "and not on the frame that was waiting");
     }
 
-    /// The boundary for `facts` (ADR-201), in both directions and on both
-    /// messages. An older build reads a message carrying the key and drops it;
-    /// this build reads one without the key as unknown; a block with fewer fields
-    /// than this build's decodes; and a member with no block writes no key at all,
-    /// so its frame is byte for byte the frame an older build wrote.
+    /// The `facts` block (ADR-201) on both messages: a message with no block reads
+    /// as unknown; a partial block decodes; a block that does not decode is no
+    /// block, never a failed exchange; and a member with no block writes no key.
     #[tokio::test]
-    async fn facts_cross_a_version_boundary_in_both_directions() {
-        use serde::Deserialize;
-        // What the message was before the field, as an older build reads it.
-        #[derive(Debug, PartialEq, Deserialize)]
-        enum Before {
-            AskVersions {
-                #[serde(default)]
-                witnessed: bool,
-            },
-            Vectors {
-                servable: VersionVector,
-                witnessed: VersionVector,
-            },
-        }
+    async fn the_facts_block_is_advice_on_both_messages() {
         let frame = |body: bson::Document| {
             let mut buffer = Vec::new();
             let bytes = bson::serialize_to_vec(&body).unwrap();
@@ -1290,50 +1206,19 @@ mod tests {
                     digest: vec![0xFF; 8],
                 }]);
 
-        // New writes, old reads.
-        for message in [
-            Message::AskVersions {
-                witnessed: true,
-                facts: Some(std::sync::Arc::new(facts.clone())),
-                facts_gen: None,
-                echo: None,
-            },
-            Message::Vectors {
-                servable: populated_vector(),
-                witnessed: populated_vector(),
-                facts: Some(std::sync::Arc::new(facts.clone())),
-                facts_gen: None,
-                echo: None,
-                replay_from: None,
-            },
-        ] {
-            let mut written = Vec::new();
-            write_frame(&mut written, &message).await.unwrap();
-            let old: Before = bson::deserialize_from_slice(&written[4..]).unwrap();
-            match (message, old) {
-                (Message::AskVersions { .. }, Before::AskVersions { witnessed }) => {
-                    assert!(witnessed);
-                }
-                (Message::Vectors { servable, .. }, Before::Vectors { servable: seen, .. }) => {
-                    assert_eq!(seen, servable);
-                }
-                other => panic!("the same variant either way: {other:?}"),
-            }
-        }
-
-        // Old writes, new reads: no key means no block.
-        let old_vectors = frame(bson::doc! { "Vectors": { "servable": {}, "witnessed": {} } });
-        match read_frame(&mut old_vectors.as_slice()).await.unwrap() {
+        // No key means no block.
+        let no_block = frame(bson::doc! { "Vectors": { "servable": {}, "witnessed": {} } });
+        match read_frame(&mut no_block.as_slice()).await.unwrap() {
             Message::Vectors { facts, .. } => assert_eq!(facts, None),
             other => panic!("{other:?}"),
         }
-        let old_ask = frame(bson::doc! { "AskVersions": { "witnessed": true } });
+        let no_ask_block = frame(bson::doc! { "AskVersions": {} });
         assert_eq!(
-            read_frame(&mut old_ask.as_slice()).await.unwrap(),
-            Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None }
+            read_frame(&mut no_ask_block.as_slice()).await.unwrap(),
+            Message::AskVersions { facts: None, facts_gen: None, echo: None }
         );
 
-        // A block from a build with fewer fields, on the wire in a reply.
+        // A partial block, on the wire in a reply.
         let fewer = frame(bson::doc! {
             "Vectors": { "servable": {}, "witnessed": {}, "facts": { "catching_up": true } }
         });
@@ -1358,7 +1243,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let partial = frame(bson::doc! {
-            "AskVersions": { "witnessed": true, "facts": { "yielding": { "ttl": true } } }
+            "AskVersions": { "facts": { "yielding": { "ttl": true } } }
         });
         match read_frame(&mut partial.as_slice()).await.unwrap() {
             Message::AskVersions { facts: Some(facts), .. } => {
@@ -1399,12 +1284,9 @@ mod tests {
         let body = bson::deserialize_from_slice::<bson::Document>(&bare[4..]).unwrap();
         assert!(!body.get_document("Vectors").unwrap().contains_key("facts"));
         let mut ask = Vec::new();
-        write_frame(
-            &mut ask,
-            &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
-        )
-        .await
-        .unwrap();
+        write_frame(&mut ask, &Message::AskVersions { facts: None, facts_gen: None, echo: None })
+            .await
+            .unwrap();
         let body = bson::deserialize_from_slice::<bson::Document>(&ask[4..]).unwrap();
         assert!(!body.get_document("AskVersions").unwrap().contains_key("facts"));
     }

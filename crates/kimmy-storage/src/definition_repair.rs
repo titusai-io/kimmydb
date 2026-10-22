@@ -131,9 +131,7 @@ impl crate::Engine {
             Some(state) => {
                 self.restore_definitions(state, page.tombstone_horizon, limit, &mut left)?
             }
-            // The page names no such collection: the sender holds it under no definition
-            // (a sender that predates the scope serves its whole database, whose first page
-            // need not carry it).
+            // The page names no such collection: the sender holds it under no definition.
             None => DefinitionRestore { gone: 1, ..Default::default() },
         };
         progress.finish_after_one_page();

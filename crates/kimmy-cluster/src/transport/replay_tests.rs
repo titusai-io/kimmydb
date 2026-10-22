@@ -162,12 +162,9 @@ where
 async fn f_script(_stream: &mut tokio::io::DuplexStream, _f: &Fixture) {}
 
 async fn ask_versions(stream: &mut tokio::io::DuplexStream) -> Option<Hlc> {
-    write_frame(
-        stream,
-        &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
-    )
-    .await
-    .unwrap();
+    write_frame(stream, &Message::AskVersions { facts: None, facts_gen: None, echo: None })
+        .await
+        .unwrap();
     match read_frame(stream).await.unwrap() {
         Message::Vectors { replay_from, .. } => replay_from,
         other => panic!("{other:?}"),

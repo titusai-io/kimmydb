@@ -174,7 +174,7 @@ where
     // What this member holds of the peer's block, read now (after a rename,
     // nothing): the confirmation of the peer's yield, as on every request.
     let echo = Some(members.echo_for(their_node));
-    write_frame(stream, &Message::AskVersions { witnessed: true, facts, facts_gen, echo }).await?;
+    write_frame(stream, &Message::AskVersions { facts, facts_gen, echo }).await?;
     let (frame, undecodable, decoded_seq) = read_frame_noting_facts(stream).await?;
     match frame {
         Message::Vectors { facts, facts_gen, echo, .. } => {
@@ -193,9 +193,6 @@ where
             members.note_echo(their_node, echo.as_ref());
             Ok(())
         }
-        // A peer older than the witnessed flag answers with its vector alone,
-        // and no block.
-        Message::Versions(_) => Ok(()),
         Message::Fault(reason) => Err(ProtocolError::Fault(reason)),
         other => Err(ProtocolError::Malformed(format!("expected Vectors, got {other:?}"))),
     }

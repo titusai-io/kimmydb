@@ -483,12 +483,9 @@ async fn a_peer_that_never_proves_itself_learns_nothing() {
 
     let mut stream = TcpStream::connect(a.addr).await.unwrap();
     // Skip the handshake entirely and ask straight out.
-    write_frame(
-        &mut stream,
-        &Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
-    )
-    .await
-    .unwrap();
+    write_frame(&mut stream, &Message::AskVersions { facts: None, facts_gen: None, echo: None })
+        .await
+        .unwrap();
 
     let response = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await;
     match response {
@@ -4518,7 +4515,7 @@ async fn a_pushed_drop_older_than_the_holders_index_is_reported_as_declined() {
 
     // The window carries B's collection creation and its drop, two changes:
     // only the declined stamp on the wire lets the drop be named refused
-    // rather than unattributable (ADR-191).
+    // rather than the whole window (ADR-191).
     let (resolution, windows) = confirm(&b, &a, &entry).await;
     assert_eq!(resolution, kimmy_cluster::Resolution::Refused, "{windows:?}");
     assert_eq!(windows.len(), 1, "{windows:?}");
@@ -10585,7 +10582,7 @@ async fn a_definition_repair_does_not_move_the_count_halfs_repair_rounds() {
 // Two large integer ids, deleted and repaired by key, through the real exchange
 // ---------------------------------------------------------------------------
 
-/// One of a pair of large integer ids whose keys are close in the order, so that a
+/// One of a pair of large integer ids, adjacent among the test's ids, so that a
 /// repair or a page boundary that mistook one for the other would show.
 const A2_A: i64 = 0x5000_0081_0180_0000;
 /// The other of the pair.

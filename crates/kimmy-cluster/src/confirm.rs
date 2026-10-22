@@ -96,16 +96,13 @@ pub enum ConfirmOutcome {
     TaskEnded,
     /// The member's queue is backing off after a push it did not answer.
     Backoff,
-    /// The member's answer cannot be attributed per change (a version before
-    /// ADR-191's fields).
-    Unattributable,
     /// The request stopped waiting before any of the above: its client went
     /// away, and the request with it.
     Cancelled,
 }
 
 impl ConfirmOutcome {
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 11;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Confirmed,
         Self::Refused,
@@ -117,7 +114,6 @@ impl ConfirmOutcome {
         Self::OtherMember,
         Self::TaskEnded,
         Self::Backoff,
-        Self::Unattributable,
         Self::Cancelled,
     ];
 
@@ -137,7 +133,6 @@ impl ConfirmOutcome {
             Self::OtherMember => "other_member",
             Self::TaskEnded => "task_ended",
             Self::Backoff => "backoff",
-            Self::Unattributable => "unattributable",
             Self::Cancelled => "cancelled",
         }
     }
@@ -254,8 +249,6 @@ struct Answer {
     their_node: NodeId,
     /// The stamps in the window, in its order.
     sent: Vec<Stamp>,
-    /// The schema changes among them.
-    ddl_in_window: usize,
     /// What this node could serve, read before the window.
     versions: VersionVector,
     reply: Reply,
@@ -743,8 +736,6 @@ impl Confirmer {
                 )),
             };
         }
-        let ddl_in_window = window.entries.iter().filter(|entry| entry.kind.is_ddl()).count();
-
         progress.sending.store(true, Ordering::SeqCst);
         if let Some(hook) = &self.on_push {
             hook();
@@ -778,7 +769,6 @@ impl Confirmer {
             }) => PushResult::Answered(Answer {
                 their_node,
                 sent,
-                ddl_in_window,
                 versions: mine,
                 reply: Reply {
                     ddl_refused,
@@ -934,18 +924,6 @@ fn resolve_answered(waiter: &Waiter, answer: &Answer) -> Option<Resolution> {
             Resolution::pending(ConfirmOutcome::Unreached, "the window did not carry the change")
         });
     }
-    let attributable = reply.refused.len() == reply.ddl_refused + reply.ddl_declined
-        && reply.stopped_at.is_some() == (reply.unknown_collection + reply.purge_pending > 0);
-    if !attributable {
-        return Some(if answer.ddl_in_window > 1 || reply.unknown_collection > 0 {
-            Resolution::pending(
-                ConfirmOutcome::Unattributable,
-                "the member's answer cannot be attributed per change (older version)",
-            )
-        } else {
-            per_window(reply)
-        });
-    }
     let stop = reply.stopped_at.map(|at| answer.sent.iter().position(|sent| *sent == at));
     match stop {
         Some(stop) if stop.is_none_or(|stop| stop <= index) => {
@@ -965,19 +943,6 @@ fn resolve_answered(waiter: &Waiter, answer: &Answer) -> Option<Resolution> {
         }
         _ if reply.refused.contains(&stamp) => Some(Resolution::Refused),
         _ => Some(Resolution::Confirmed),
-    }
-}
-
-/// The per-window rule a confirmation used before ADR-191, kept for the one
-/// window it is exact for: one schema change, from a member whose answer does
-/// not name changes.
-fn per_window(reply: &Reply) -> Resolution {
-    if reply.purge_pending > 0 {
-        Resolution::pending(ConfirmOutcome::Purging, "still purging a drop of this name")
-    } else if reply.ddl_refused > 0 || reply.ddl_declined > 0 {
-        Resolution::Refused
-    } else {
-        Resolution::Confirmed
     }
 }
 
@@ -1367,7 +1332,7 @@ mod tests {
         }
     }
 
-    fn answered(sent: &[Stamp], ddl_in_window: usize, versions: &[Stamp], reply: Reply) -> Answer {
+    fn answered(sent: &[Stamp], versions: &[Stamp], reply: Reply) -> Answer {
         let mut vector = VersionVector::new();
         for at in versions {
             vector.observe(*at);
@@ -1375,7 +1340,6 @@ mod tests {
         Answer {
             their_node: NodeId::from_bytes([9; 16]),
             sent: sent.to_vec(),
-            ddl_in_window,
             versions: vector,
             reply,
         }
@@ -1387,7 +1351,7 @@ mod tests {
     #[test]
     fn an_entry_in_the_window_but_above_its_versions_is_not_resolved_by_it() {
         let (e1, e2) = (stamp(1, 1), stamp(2, 1));
-        let answer = answered(&[e1, e2], 2, &[e1], Reply::default());
+        let answer = answered(&[e1, e2], &[e1], Reply::default());
         assert_eq!(resolve_answered(&waiter(e1, true), &answer), Some(Resolution::Confirmed));
         assert_eq!(resolve_answered(&waiter(e2, false), &answer), None, "carried");
 
@@ -1396,42 +1360,11 @@ mod tests {
         // "before the stop" means.
         let (late, early) = (stamp(9, 1), stamp(3, 2));
         let stopped = Reply { unknown_collection: 1, stopped_at: Some(early), ..Reply::default() };
-        let answer = answered(&[late, early], 2, &[late, early], stopped);
+        let answer = answered(&[late, early], &[late, early], stopped);
         assert_eq!(
             resolve_answered(&waiter(late, true), &answer),
             Some(Resolution::Confirmed),
             "before the stop in the window, though its stamp is higher"
-        );
-    }
-
-    /// T4's fallback half and T16: an answer whose per-change fields do not
-    /// account for its counts (an older member) is never read as refusing a
-    /// change it cannot name (ADR-191).
-    #[test]
-    fn an_old_style_answer_refuses_nothing_it_cannot_attribute() {
-        let (e1, e2) = (stamp(1, 1), stamp(2, 1));
-        // Zero counts: attributable by empty fields, so covered is confirmed.
-        let quiet = answered(&[e1, e2], 2, &[e1, e2], Reply::default());
-        assert_eq!(resolve_answered(&waiter(e2, true), &quiet), Some(Resolution::Confirmed));
-
-        // A refusal the answer does not name, in a window of two changes.
-        let unnamed = Reply { ddl_refused: 1, ..Reply::default() };
-        let two = answered(&[e1, e2], 2, &[e1, e2], unnamed.clone());
-        for at in [e1, e2] {
-            assert_eq!(
-                resolve_answered(&waiter(at, true), &two).map(|r| r.outcome()),
-                Some(ConfirmOutcome::Unattributable)
-            );
-        }
-        // One change: the old per-window rule is exact there.
-        let one = answered(&[e1], 1, &[e1], unnamed);
-        assert_eq!(resolve_answered(&waiter(e1, true), &one), Some(Resolution::Refused));
-        // A purge stop the answer does not place: pending, never confirmed.
-        let purging = Reply { purge_pending: 1, ..Reply::default() };
-        let two = answered(&[e1, e2], 2, &[e1, e2], purging);
-        assert_eq!(
-            resolve_answered(&waiter(e1, true), &two).map(|r| r.outcome()),
-            Some(ConfirmOutcome::Unattributable)
         );
     }
 
@@ -1441,7 +1374,7 @@ mod tests {
     fn a_named_refusal_refuses_only_its_own_change() {
         let (e1, e2) = (stamp(1, 1), stamp(2, 1));
         let reply = Reply { ddl_refused: 1, refused: vec![e1], ..Reply::default() };
-        let answer = answered(&[e1, e2], 2, &[e1, e2], reply);
+        let answer = answered(&[e1, e2], &[e1, e2], reply);
         assert_eq!(resolve_answered(&waiter(e1, true), &answer), Some(Resolution::Refused));
         assert_eq!(resolve_answered(&waiter(e2, true), &answer), Some(Resolution::Confirmed));
     }
@@ -1452,7 +1385,7 @@ mod tests {
     fn a_stop_in_a_shared_window_leaves_what_follows_it_pending() {
         let (e1, e2, e3) = (stamp(1, 1), stamp(2, 1), stamp(3, 1));
         let purge = Reply { purge_pending: 1, stopped_at: Some(e2), ..Reply::default() };
-        let answer = answered(&[e1, e2, e3], 3, &[e1, e2, e3], purge);
+        let answer = answered(&[e1, e2, e3], &[e1, e2, e3], purge);
         assert_eq!(resolve_answered(&waiter(e1, true), &answer), Some(Resolution::Confirmed));
         for at in [e2, e3] {
             assert_eq!(
@@ -1461,24 +1394,11 @@ mod tests {
             );
         }
         let unknown = Reply { unknown_collection: 1, stopped_at: Some(e2), ..Reply::default() };
-        let answer = answered(&[e1, e2, e3], 3, &[e1, e2, e3], unknown);
+        let answer = answered(&[e1, e2, e3], &[e1, e2, e3], unknown);
         assert_eq!(resolve_answered(&waiter(e2, true), &answer), Some(Resolution::Refused));
         assert_eq!(
             resolve_answered(&waiter(e3, true), &answer).map(|r| r.outcome()),
             Some(ConfirmOutcome::StoppedUnknown)
-        );
-    }
-
-    /// T25: an old-style answer that stopped, in a window of one document
-    /// then one change, does not call the unreached change refused.
-    #[test]
-    fn an_old_style_answer_stopped_at_a_document_does_not_refuse_the_one_ddl() {
-        let (doc, ddl) = (stamp(1, 1), stamp(2, 1));
-        let stopped = Reply { unknown_collection: 1, ..Reply::default() };
-        let answer = answered(&[doc, ddl], 1, &[doc, ddl], stopped);
-        assert_eq!(
-            resolve_answered(&waiter(ddl, true), &answer).map(|r| r.outcome()),
-            Some(ConfirmOutcome::Unattributable)
         );
     }
 
@@ -1494,7 +1414,6 @@ mod tests {
             introduced in 0usize..17,
             stop in proptest::option::of((0usize..16, proptest::bool::ANY)),
             refuse in proptest::collection::vec(proptest::bool::ANY, 16),
-            old_style in proptest::bool::ANY,
             flagged in proptest::collection::vec(proptest::bool::ANY, 16),
         ) {
             let n = kinds.len();
@@ -1529,12 +1448,15 @@ mod tests {
                     ddl_refused += 1;
                 }
             }
-            let reply = if old_style {
-                Reply { ddl_refused, unknown_collection: unknown, purge_pending: purge, ..Reply::default() }
-            } else {
-                Reply { ddl_refused, unknown_collection: unknown, purge_pending: purge, refused: refused.clone(), stopped_at, ..Reply::default() }
+            let reply = Reply {
+                ddl_refused,
+                unknown_collection: unknown,
+                purge_pending: purge,
+                refused: refused.clone(),
+                stopped_at,
+                ..Reply::default()
             };
-            let answer = answered(&stamps, (0..n).filter(|i| is_ddl(*i)).count(), &versions, reply);
+            let answer = answered(&stamps, &versions, reply);
             for i in (0..n).filter(|i| is_ddl(*i)) {
                 // A flagged waiter's entry is always within the versions.
                 let pre_queued = flagged[i] && covered_by_versions(i);

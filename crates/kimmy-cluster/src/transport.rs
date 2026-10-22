@@ -778,7 +778,7 @@ where
         let (frame, undecodable, decoded_seq) =
             crate::protocol::read_frame_noting_facts(&mut stream).await?;
         match frame {
-            Message::AskVersions { witnessed, facts, facts_gen, echo } => {
+            Message::AskVersions { facts, facts_gen, echo } => {
                 if undecodable && let Some(members) = members {
                     members.note_undecodable(peer, std::time::Instant::now());
                 }
@@ -803,12 +803,6 @@ where
                 }
                 let servable =
                     engine.version_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
-                if !witnessed {
-                    // A requester that predates the flag, answered as it
-                    // always was (ADR-146).
-                    write_frame(&mut stream, &Message::Versions(servable)).await?;
-                    continue;
-                }
                 // Read after the servable vector, never before: the
                 // witnessed vector stays at or above the servable one by
                 // construction (ADR-054), and reading it second keeps that
@@ -1343,8 +1337,8 @@ pub async fn sync_once(
 /// processed position behind this node has come back unchanged on
 /// [`FROZEN_CONTACTS`] consecutive checked contacts — see
 /// `divergence_probe_for` for why a moving position and a still one are
-/// different facts, and [`PeerStalls::gate_vector`] for which of the peer's
-/// two vectors "behind" is judged on.
+/// different facts. "Behind" is judged on the vector the peer says it has
+/// processed.
 pub async fn sync_once_with(
     engine: &Engine,
     peer: SocketAddr,
@@ -2086,25 +2080,18 @@ where
 {
     // Both of the peer's vectors, on the one frame every round spends
     // anyway (ADR-146): what it can serve drives the pull, and what it
-    // has processed drives the count half's gate below. A peer that
-    // predates the flag answers with the first alone.
+    // has processed drives the count half's gate below.
     let ours = stalls.local_facts.clone();
     // What this member holds of the peer's block, as the confirmation of the
     // peer's yield (ADR-213): only what is recorded, read now and not at the
     // start of the tick, so an earlier contact's block is counted.
     let echo = stalls.members.as_ref().map(|members| members.echo_for(their_node));
-    write_frame(
-        stream,
-        &Message::AskVersions { witnessed: true, facts: ours, facts_gen: stalls.local_gen, echo },
-    )
-    .await?;
+    write_frame(stream, &Message::AskVersions { facts: ours, facts_gen: stalls.local_gen, echo })
+        .await?;
     let (frame, undecodable, decoded_seq) =
         crate::protocol::read_frame_noting_facts(stream).await?;
-    let mut their_facts = None;
-    let mut asked_replay = None;
-    let (theirs, their_witnessed) = match frame {
+    let (theirs, their_witnessed, their_facts, asked_replay) = match frame {
         Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
-            asked_replay = replay_from;
             if undecodable {
                 stalls.facts_undecodable.push(their_node);
             }
@@ -2112,19 +2099,17 @@ where
             // `Members` once the contact is done (ADR-201), stamped with when
             // this frame decoded so a late apply cannot undo a later block
             // (ADR-213). The reply's echo is what the peer holds of ours.
-            their_facts = facts.clone();
-            if let Some(facts) = facts {
+            if let Some(facts) = &facts {
                 stalls.facts_read.push(FactsRead {
                     node: their_node,
-                    facts,
+                    facts: facts.clone(),
                     generation: facts_gen,
                     decoded_seq,
                 });
             }
             stalls.echoes_read.push((their_node, echo));
-            (servable, Some(witnessed))
+            (servable, witnessed, facts, replay_from)
         }
-        Message::Versions(servable) => (servable, None),
         Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
         other => {
             return Err(ProtocolError::Malformed(format!("expected Vectors, got {other:?}")));
@@ -2133,7 +2118,7 @@ where
     // What the peer's block says of its catching-up marker, read before the block
     // is handed on: the count half's gate below defers on it.
     let peer_catching_up = their_facts.as_ref().is_some_and(|facts| facts.catching_up);
-    let processed = stalls.gate_vector(peer, their_node, &theirs, their_witnessed.as_ref());
+    let processed = &their_witnessed;
     // For the lag gauge, whatever becomes of the round from here.
     stalls.vectors_read.push((peer, theirs.clone()));
     // What this contact read, for the catching-up marker's judgement (ADR-202):
@@ -2141,7 +2126,7 @@ where
     stalls.reached_candidates.push(crate::catchup::Reached {
         node: their_node,
         servable: theirs.clone(),
-        witnessed: their_witnessed.clone(),
+        witnessed: Some(their_witnessed.clone()),
         facts: their_facts,
     });
 
@@ -2260,8 +2245,8 @@ where
         if catching_up && gate.deferred {
             debug!(%peer, peer_catching_up, "count probe deferred: a member is catching up");
         }
-        let context = their_witnessed.as_ref().map(|theirs_witnessed| DigestContext {
-            theirs_witnessed,
+        let context = Some(DigestContext {
+            theirs_witnessed: &their_witnessed,
             busy,
             capable: stalls.digest_capable.contains(&their_node),
             detail: stalls.definition_detail(&their_node),
@@ -2813,8 +2798,8 @@ where
         if catching_up && gate.deferred {
             debug!(%peer, peer_catching_up, "count probe deferred: a member is catching up");
         }
-        let context = their_witnessed.as_ref().map(|theirs_witnessed| DigestContext {
-            theirs_witnessed,
+        let context = Some(DigestContext {
+            theirs_witnessed: &their_witnessed,
             busy,
             capable: stalls.digest_capable.contains(&their_node),
             detail: stalls.definition_detail(&their_node),
@@ -3096,10 +3081,6 @@ pub struct PeerStalls {
     /// `by_peer`, so a member that is itself draining a backlog is not read
     /// as holding a different count from a member that has more of it.
     by_self: HashMap<NodeId, Stall>,
-    /// Peers whose last answer carried no witnessed vector — a version
-    /// before ADR-146 — so the gate is judged on their servable one, and
-    /// the log says so once rather than every round.
-    without_witnessed: HashSet<NodeId>,
     /// Peers that have answered a digest request with digests (B3): only to
     /// these does this node pay for its own scan before asking, so a peer that
     /// predates the digest is not made to wait on one it will ignore.
@@ -5053,61 +5034,13 @@ impl PeerStalls {
             .is_some_and(|repairs| repairs.active.is_some() || !repairs.queued.is_empty())
     }
 
-    /// Which of the peer's two vectors this contact's gate is judged on
-    /// (ADR-146): what it has processed, when it said; what it can serve,
-    /// from a peer that answered `AskVersions` without the witnessed vector
-    /// — a version before the flag — which is ADR-133's gate exactly as it
-    /// was, for that contact only, rather than a failed round. A peer that
-    /// processed an entry without appending it reads as behind under that
-    /// gate, and the count half defers or, after [`FROZEN_CONTACTS`]
-    /// contacts, compares it for the wrong reason, which is the state this
-    /// node was in before the peer is upgraded. Logged once per peer each
-    /// way, at info, because a rolling upgrade is bounded and ends, and a
-    /// `/metrics` series for it would read 0 for ever after: the line
-    /// names the member, and the operations guide names what a `deferred`
-    /// trickle on an idle cluster means.
-    pub fn gate_vector<'a>(
-        &mut self,
-        peer: SocketAddr,
-        node: NodeId,
-        servable: &'a VersionVector,
-        witnessed: Option<&'a VersionVector>,
-    ) -> &'a VersionVector {
-        match witnessed {
-            Some(witnessed) => {
-                if self.without_witnessed.remove(&node) {
-                    info!(
-                        %peer,
-                        node = %node,
-                        "peer now says what it has processed; the count half of the \
-                         divergence check is gated on it again"
-                    );
-                }
-                witnessed
-            }
-            None => {
-                if self.without_witnessed.insert(node) {
-                    info!(
-                        %peer,
-                        node = %node,
-                        "peer answered without saying what it has processed (a version before \
-                         the field); the count half of the divergence check is gated on what \
-                         it can serve until it does, which reads an entry it processed without \
-                         appending as a position it is behind on"
-                    );
-                }
-                servable
-            }
-        }
-    }
-
     /// Where this checked contact with `peer` stands for the count half, on
     /// both sides (ADR-168): the peer's position behind this node
     /// ([`Self::observe`]) and this node's position behind the peer when its
     /// count was read ([`Self::observe_self`]), folded by [`combine`].
     ///
-    /// `processed` is the vector the peer's side is judged on
-    /// ([`Self::gate_vector`]); `mine` is this node's witnessed vector just
+    /// `processed` is the vector the peer's side is judged on (what the peer
+    /// says it has processed); `mine` is this node's witnessed vector just
     /// before the check; `servable` is what the peer said it can serve when
     /// the contact opened; `probe` carries the vector this node's count was
     /// read at.
@@ -5207,9 +5140,8 @@ impl PeerStalls {
 
     /// Fold in the vector this checked contact with `peer` opened with, and
     /// say where the peer stands. `theirs` is the peer's witnessed vector as
-    /// fetched at the top of the round — or its servable one, from a peer
-    /// that did not say ([`Self::gate_vector`]); `mine` is this node's
-    /// witnessed vector as of just before the check.
+    /// fetched at the top of the round; `mine` is this node's witnessed
+    /// vector as of just before the check.
     ///
     /// Called once per contact the check runs on, and not on a contact
     /// ADR-133's cap-truncation skip applies to: "consecutive" is
@@ -7162,40 +7094,11 @@ mod tests {
         );
     }
 
-    /// Which vector the gate is judged on, and the one line each way. A
-    /// peer that said what it has processed is judged on that; one that
-    /// did not is judged on what it can serve, and the log line fires on
-    /// the first such answer and on the first answer that says again,
-    /// never in between.
-    #[test]
-    fn the_gate_is_judged_on_what_the_peer_processed_or_on_what_it_serves_if_it_did_not_say() {
-        let peer = node(1);
-        let addr: SocketAddr = "127.0.0.1:7900".parse().unwrap();
-        let servable = vector(&[(peer, 5)]);
-        let witnessed = vector(&[(peer, 5), (node(2), 100)]);
-        let mut stalls = PeerStalls::new();
-
-        assert_eq!(stalls.gate_vector(addr, peer, &servable, Some(&witnessed)), &witnessed);
-        assert!(stalls.without_witnessed.is_empty());
-
-        assert_eq!(stalls.gate_vector(addr, peer, &servable, None), &servable);
-        assert!(stalls.without_witnessed.contains(&peer), "remembered, so the line fires once");
-        assert_eq!(stalls.gate_vector(addr, peer, &servable, None), &servable);
-
-        assert_eq!(stalls.gate_vector(addr, peer, &servable, Some(&witnessed)), &witnessed);
-        assert!(stalls.without_witnessed.is_empty(), "upgraded: forgotten, so the line fires once");
-    }
-
-    /// A peer on one side of the upgrade or the other, over the wire this
-    /// round runs on. Both fake peers hold nothing this node lacks and
-    /// answer the same count; one answers `AskVersions` with both vectors
-    /// and a witnessed position level with this node's, the other — a
-    /// version before the flag — with its servable vector alone, which
-    /// trails. The first is compared; the second falls back to the old
-    /// gate and is deferred, and the round completes either way rather
-    /// than failing.
+    /// A peer that answers `AskVersions` with both vectors and a witnessed
+    /// position level with this node's, over the wire this round runs on, is
+    /// compared even though it can serve less than it has processed.
     #[tokio::test]
-    async fn a_peer_that_answers_without_its_witnessed_vector_is_gated_on_its_servable_one() {
+    async fn a_peer_is_gated_on_what_it_processed_and_not_on_what_it_can_serve() {
         use tokio::io::DuplexStream;
 
         let dir = tempfile::tempdir().unwrap();
@@ -7217,7 +7120,7 @@ mod tests {
 
         async fn fake_peer(mut stream: DuplexStream, answer: Message) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, .. } => {}
+                Message::AskVersions { .. } => {}
                 other => panic!("the round opens by asking for both vectors, got {other:?}"),
             }
             write_frame(&mut stream, &answer).await.unwrap();
@@ -7236,7 +7139,7 @@ mod tests {
             write_frame(&mut stream, &divergence).await.unwrap();
         }
 
-        // Upgraded: both vectors, gated on what it has processed.
+        // Both vectors, gated on what it has processed.
         let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
         let answer = Message::Vectors {
             servable: trailing.clone(),
@@ -7257,21 +7160,10 @@ mod tests {
             "compared, and equal: {outcome:?}"
         );
         assert!(!outcome.count_probe_deferred, "{outcome:?}");
-
-        // Not yet upgraded: the servable vector alone, and the old gate
-        // reads the same peer as behind. The round completes.
-        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
-        let peer = tokio::spawn(fake_peer(theirs, Message::Versions(trailing)));
-        let outcome = sync_over(&engine, ours, addr, their_node, probe, &mut stalls).await.unwrap();
-        peer.await.unwrap();
-        assert_eq!(outcome.count_probe, None, "deferred under the old gate: {outcome:?}");
-        assert!(outcome.count_probe_deferred, "{outcome:?}");
-        assert!(stalls.without_witnessed.contains(&their_node), "and noted as answering without");
-        assert_eq!(outcome.divergent, Some(std::collections::BTreeSet::new()), "the check ran");
     }
     /// The served side records the block a requester sends and answers with its
-    /// own, and notes that the requester has read it (ADR-201). An older
-    /// requester, which sends none, is answered as it always was.
+    /// own, and notes that the requester has read it (ADR-201). A requester that
+    /// sends none is answered the same.
     #[tokio::test]
     async fn the_serve_arm_exchanges_blocks() {
         use crate::facts::Facts;
@@ -7309,7 +7201,6 @@ mod tests {
             write_frame(
                 &mut ours,
                 &Message::AskVersions {
-                    witnessed: true,
                     facts: Some(Arc::new(theirs.clone())),
                     facts_gen: None,
                     echo: None,
@@ -7318,31 +7209,18 @@ mod tests {
             .await
             .unwrap();
             let with = read_frame(&mut ours).await.unwrap();
-            // An older requester: no block sent, none recorded, none required.
+            // A requester with no block: none sent, none recorded, none required.
             write_frame(
                 &mut ours,
-                &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+                &Message::AskVersions { facts: None, facts_gen: None, echo: None },
             )
             .await
             .unwrap();
             let without = read_frame(&mut ours).await.unwrap();
-            // And one that predates the witnessed vector at all.
-            write_frame(
-                &mut ours,
-                &Message::AskVersions {
-                    witnessed: false,
-                    facts: None,
-                    facts_gen: None,
-                    echo: None,
-                },
-            )
-            .await
-            .unwrap();
-            let old = read_frame(&mut ours).await.unwrap();
             drop(ours);
-            (with, without, old)
+            (with, without)
         };
-        let ((), (with, without, old)) = tokio::join!(serving, asking);
+        let ((), (with, without)) = tokio::join!(serving, asking);
         match with {
             Message::Vectors { facts, .. } => assert_eq!(facts.as_deref(), Some(&mine)),
             other => panic!("{other:?}"),
@@ -7351,7 +7229,6 @@ mod tests {
             Message::Vectors { facts, .. } => assert_eq!(facts.as_deref(), Some(&mine)),
             other => panic!("{other:?}"),
         }
-        assert!(matches!(old, Message::Versions(_)), "{old:?}");
         assert_eq!(
             members.peer_states()[&asker_node],
             crate::facts::PeerState::IneligibleCatchingUp,
@@ -7406,7 +7283,6 @@ mod tests {
             let asking = async {
                 open_handshake(&asker, &mut ours, SECRET, BINDING).await.unwrap();
                 let asks = Message::AskVersions {
-                    witnessed: true,
                     facts: Some(Arc::new(Facts::default())),
                     facts_gen: Some(1),
                     echo,
@@ -7457,7 +7333,7 @@ mod tests {
 
         async fn peer(mut stream: tokio::io::DuplexStream, answer: Message, expect: Option<Facts>) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, facts, .. } => {
+                Message::AskVersions { facts, .. } => {
                     assert_eq!(facts.as_deref(), expect.as_ref());
                 }
                 other => panic!("{other:?}"),
@@ -7522,7 +7398,7 @@ mod tests {
 
         async fn fake_peer(mut stream: DuplexStream, servable: VersionVector) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, .. } => {}
+                Message::AskVersions { .. } => {}
                 other => panic!("the round opens by asking for both vectors, got {other:?}"),
             }
             let answer = Message::Vectors {
@@ -7580,7 +7456,7 @@ mod tests {
             window: Vec<OplogEntry>,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, .. } => {}
+                Message::AskVersions { .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
             let answer = Message::Vectors {
@@ -7697,10 +7573,7 @@ mod tests {
             expect_from: Hlc,
             window: Vec<OplogEntry>,
         ) {
-            assert!(matches!(
-                read_frame(&mut stream).await.unwrap(),
-                Message::AskVersions { witnessed: true, .. }
-            ));
+            assert!(matches!(read_frame(&mut stream).await.unwrap(), Message::AskVersions { .. }));
             let answer = Message::Vectors {
                 servable: theirs.clone(),
                 witnessed: theirs,
@@ -7771,7 +7644,7 @@ mod tests {
             page: SnapshotPage,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, .. } => {}
+                Message::AskVersions { .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
             let answer = Message::Vectors {
@@ -7944,7 +7817,7 @@ mod tests {
             exhausted: bool,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, .. } => {}
+                Message::AskVersions { .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
             let answer = Message::Vectors {
@@ -8125,7 +7998,7 @@ mod tests {
             then_check: bool,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, .. } => {}
+                Message::AskVersions { .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
             let answer = Message::Vectors {
@@ -8300,10 +8173,7 @@ mod tests {
             theirs: VersionVector,
             page: SnapshotPage,
         ) {
-            assert!(matches!(
-                read_frame(&mut stream).await.unwrap(),
-                Message::AskVersions { witnessed: true, .. }
-            ));
+            assert!(matches!(read_frame(&mut stream).await.unwrap(), Message::AskVersions { .. }));
             let answer = Message::Vectors {
                 servable: theirs.clone(),
                 witnessed: theirs,
@@ -8411,7 +8281,7 @@ mod tests {
             page: Option<SnapshotPage>,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, .. } => {}
+                Message::AskVersions { .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
             let answer = Message::Vectors {
@@ -8663,7 +8533,7 @@ mod tests {
             incarnations: Vec<(CollectionId, Hlc)>,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true, .. } => {}
+                Message::AskVersions { .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
             let answer = Message::Vectors {
@@ -9940,7 +9810,7 @@ mod tests {
                 .unwrap();
             write_frame(
                 &mut ours,
-                &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+                &Message::AskVersions { facts: None, facts_gen: None, echo: None },
             )
             .await
             .unwrap();
@@ -10029,7 +9899,10 @@ mod tests {
             .await;
             read_frame(&mut ours).await.unwrap()
         };
-        let (refused, answer) = tokio::join!(refusing, asking);
+        let (refused, answer) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(refusing, asking) })
+                .await
+                .expect("the refusal ends the handshake");
         let Err(ProtocolError::Release(reason)) = refused else {
             panic!("expected a release refusal, got {refused:?}");
         };
@@ -10124,7 +9997,7 @@ mod tests {
                 .unwrap();
             write_frame(
                 &mut ours,
-                &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+                &Message::AskVersions { facts: None, facts_gen: None, echo: None },
             )
             .await
             .unwrap();
@@ -10405,7 +10278,7 @@ mod tests {
         answer_divergence: bool,
     ) {
         match read_frame(&mut stream).await.unwrap() {
-            Message::AskVersions { witnessed: true, .. } => {}
+            Message::AskVersions { .. } => {}
             other => panic!("expected AskVersions, got {other:?}"),
         }
         let answer = Message::Vectors {
@@ -10915,7 +10788,7 @@ mod tests {
         let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
         write_frame(
             &mut stream,
-            &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+            &Message::AskVersions { facts: None, facts_gen: None, echo: None },
         )
         .await
         .unwrap();

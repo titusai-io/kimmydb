@@ -10,7 +10,8 @@
 //! an atomic phase, its start, a done and a total. It changes no behaviour of
 //! the open, except that a stop asked for during it ([`request_open_stop`]) is
 //! honoured where it can be taken safely: in the verification walk, which is
-//! abandoned and simply not recorded.
+//! abandoned and simply not recorded, and between the chunks of the counts'
+//! rebuild and the sweeps that bury what a drop covers.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
