@@ -1410,20 +1410,6 @@ impl Engine {
         Self::rebuild_arrival_index_if_stale(&db)?;
         Self::verify_version_vector_at_open(&db)?;
         Self::seed_collected_if_untracked(&db)?;
-        // A filter created with a generic `Binary` before ADR-182 was stored
-        // as an array, and nothing records which arrays those were, so every
-        // array is named -- each open, since an operator who never restarts
-        // after upgrading would otherwise never be told.
-        for (db_name, collection, index) in crate::index::partial_filters_holding_an_array(&db)? {
-            info!(
-                db = %db_name,
-                collection = %collection,
-                index = %index,
-                "this partial index's filter holds an array, which may have been converted from \
-                 a generic Binary by a build before ADR-182; if it was created with a Binary \
-                 value, drop and recreate it. An array the client wrote is left as it is"
-            );
-        }
         // After the arrival index, whose end the counts' mark is compared
         // against: a repaired index appends positions, and the counts are
         // rebuilt with it (ADR-174). One walk rebuilds the counts and the
@@ -2963,8 +2949,7 @@ impl Engine {
     /// cannot be served a contiguous one: the entries between are not here. One
     /// maximum per origin, so it is conservative: a peer behind this node's own
     /// prefix of the origin is refused too, though the prefix could be served.
-    /// Empty on a node that never took a whole-database snapshot, and for a
-    /// snapshot taken by a build before 0.46.0, which did not record it.
+    /// Empty on a node that never took a whole-database snapshot.
     pub fn state_held(&self) -> Result<kimmy_core::VersionVector> {
         let txn = self.db.begin_read()?;
         Self::state_held_in(&txn)
@@ -4446,7 +4431,7 @@ impl Engine {
             // history, by one comparison of the origin's `Hlc` against the
             // drop's, on every route. A local creation always mints after
             // what this node has seen, so it stands; a creation naming no
-            // `created` (a page from a sender before the field) reads as older.
+            // `created` reads as older.
             if !log && self.database_refusal(db, origin)?.is_some() {
                 return Ok(InTxn::History);
             }
@@ -4462,10 +4447,8 @@ impl Engine {
             // drop, and created here it stood parentless (ADR-138). Judged
             // under the writer for the reason `history` is. Only under a
             // tombstone: a parent absent with none has not arrived yet, and the
-            // shadow is created. A creation naming no `created` of its own (a
-            // page from a sender before the field) under such a tombstone reads
-            // as the older one, as `restore_collection` reads that page's
-            // collection.
+            // shadow is created. A creation naming no `created` of its own under
+            // such a tombstone reads as the older one.
             if !log
                 && let Some(base) = kimmy_core::vector_meta::base_name(name)
                 && collections.get((db, base))?.is_none()

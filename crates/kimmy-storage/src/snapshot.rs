@@ -311,10 +311,9 @@ pub struct CollectionState {
     /// off": a member holding the configuration kept it, and a completed snapshot's
     /// grant meant the entry that turned it off was never served again. With the
     /// stamp, "off at s" is a dated fact, and a receiver applies it when it is newer
-    /// than its own and the sender's coverage names it (ADR-163). Optional on the
-    /// wire: a sender that predates it writes none, and a page without one never
-    /// overrides a stamped local value.
-    #[serde(default)]
+    /// than its own and the sender's coverage names it (ADR-163). `None` when the
+    /// collection's vector configuration was never changed: a page without one
+    /// never overrides a stamped local value.
     pub vector_changed: Option<Stamp>,
     /// For a life a drop re-dated to keep what was written after it
     /// (`CollectionMeta::redated`, ADR-231 extended): the `created` the life had
@@ -323,21 +322,18 @@ pub struct CollectionState {
     /// continuing from a newer one, and the receiver stores it as the marker. A
     /// database's drop judges the definition by `created`, as every drop does
     /// (ADR-236): the life holds nothing stamped at or before its re-dating drop,
-    /// so nothing it carries is older than `created`. Optional on the wire: a
-    /// sender that predates it writes none, and a receiver that predates it
-    /// ignores it. (0.49.0 refused the definition under a database tombstone at
-    /// or after this, ADR-231 D-3's guard that ADR-236 removes.)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// so nothing it carries is older than `created`. `None` for a life that was
+    /// never re-dated.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub redated_from: Option<Hlc>,
     /// The sender's incarnation floor for this life (`CollectionMeta::incarnation_floor`):
     /// the drop it was created after. The one fact on a page that tells a life made
     /// after a drop from a life made by another member at the same time with no drop
     /// between, which `created` alone cannot: with the drop's tombstone aged out on the
     /// sender, the receiver holding the life before had nothing to learn the first from
-    /// (ADR-235). Optional on the wire: a sender that predates it writes none, a receiver
-    /// that predates it ignores it, and a page without one is read as no evidence, so
-    /// nothing is buried.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// (ADR-235). `None` for a life with no floor, which a receiver reads as no
+    /// evidence, so nothing is buried.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub incarnation_floor: Option<Hlc>,
 }
 
@@ -541,13 +537,8 @@ pub struct SnapshotPage {
     /// instead: this field names one collection, and that route has to deny
     /// many.
     ///
-    /// Optional on the wire, because a sender that predates the field never
-    /// writes it (ADR-152). Nothing about the field changed to carry it on
-    /// later pages; what changed is when a sender fills it, and a receiver
-    /// that predates *that* reads a resumed page's drop exactly as it reads a
-    /// first page's, because its own gate is on the snapshot being scoped and
-    /// never was on the page being the first.
-    #[serde(default)]
+    /// `None` on a whole-database page and when the collection is not dropped
+    /// (ADR-152).
     pub dropped: Option<Stamp>,
     /// For a whole-database snapshot: every collection tombstone the sender
     /// holds, so the page conveys **absence** and not only presence.
@@ -567,16 +558,10 @@ pub struct SnapshotPage {
     /// was in flight. The list is bounded by `tombstone_retention_secs`, which
     /// is what makes re-sending it affordable.
     ///
-    /// Defaulted on the wire, so a sender that predates the field writes
-    /// nothing and a receiver that predates it ignores what it cannot read —
-    /// no negotiation, and a mixed-version cluster simply keeps the old
-    /// behaviour until both ends have rolled.
-    ///
     /// **A receiver honours an entry only where `versions` covers its stamp**
     /// — a peer may only deny what its own coverage names (ADR-163). Both
     /// halves of a pair come off the wire here, so without that gate one
     /// malformed entry destroys an arbitrary collection unrecoverably.
-    #[serde(default)]
     pub dropped_collections: Vec<(CollectionId, Stamp)>,
     /// The document tombstones the page's walk passed, so a page conveys a
     /// document's **absence** as well as a collection's (ADR-167).
@@ -589,18 +574,14 @@ pub struct SnapshotPage {
     /// healed nothing either.
     ///
     /// By key, in a list of its own, and never as a `SnapshotDoc` with no body:
-    /// that type needs a `DocId`, which a tombstone does not have, and an older
-    /// receiver would apply a bodiless `SnapshotDoc` as a delete of whatever id
-    /// it carried. Defaulted on the wire as `dropped_collections` is, so an
-    /// older sender writes nothing and an older receiver ignores the list, and
-    /// a mixed-version pair keeps the previous behaviour until both have rolled.
+    /// that type needs a `DocId`, which a tombstone does not have, and a receiver
+    /// would apply a bodiless `SnapshotDoc` as a delete of whatever id it carried.
     ///
     /// Tombstones share the page with documents — they count toward
     /// [`SNAPSHOT_PAGE`] and can end a page — so the cursor stays one walk in
     /// key order. A receiver honours one only where `versions` covers its stamp
     /// (ADR-163), and only against a live document it out-stamps: see
     /// `Engine::apply_carried_document_deletes`.
-    #[serde(default)]
     pub deleted_documents: Vec<SnapshotTombstone>,
     /// The indexes the sender has dropped, by collection and derived index id with
     /// the stamp of the drop, so a page conveys an index's **absence** as well as
@@ -618,16 +599,13 @@ pub struct SnapshotPage {
     /// ADR-162 applied to the whole-database one: a drop can land between two
     /// pages of a transfer that runs for minutes. For a scoped snapshot, those of
     /// the one collection. Bounded by `tombstone_retention_secs`, as the sender's
-    /// collection tombstones are. Defaulted on the wire as `dropped_collections`
-    /// is: an older sender writes nothing and an older receiver ignores the list,
-    /// so a mixed pair keeps the previous behaviour until both have rolled.
+    /// collection tombstones are.
     ///
     /// **A receiver honours an entry only where `versions` covers its stamp**
     /// (ADR-163), and judges it as a replicated `DropIndex` is judged (ADR-132): an
     /// index created after the drop is left alone. Denials are applied before the
     /// definitions on the same page, so an index dropped and recreated arrives as
     /// the new definition and the old drop, and the new one stands.
-    #[serde(default)]
     pub dropped_indexes: Vec<(CollectionId, u32, Stamp)>,
     /// The sender's collected-through horizon: the highest tombstone cutoff its
     /// retention passes have applied, read **in or after the walk this page's rows came
@@ -635,11 +613,10 @@ pub struct SnapshotPage {
     /// section 13.1). The young-stamp rule of a `Converge` pull compares a row's stamp
     /// with the larger of this and the receiver's own.
     ///
-    /// **An `Option`, never an `Hlc` defaulting to zero.** Absent from a sender that
-    /// predates it: the receiver's rule is then off for that pull, and every row it
-    /// holds nothing for is `left`. Optional on the wire, so an older receiver ignores
-    /// it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **An `Option`, never an `Hlc` defaulting to zero.** `None` when the sender
+    /// has collected nothing: the receiver's rule is then off for that pull, and every
+    /// row it holds nothing for is `left`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tombstone_horizon: Option<Hlc>,
 }
 
@@ -2627,7 +2604,10 @@ impl Engine {
                 indexes.push(index);
             }
         }
-        let vectors_of_the_life_before = of_the_life_before(&standing, state.vector_changed)?;
+        let vectors_of_the_life_before = match state.vector_changed {
+            Some(changed) => self.definition_of_an_ended_life(&standing, changed)?,
+            None => false,
+        };
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::RestoreDefinitions);
 
@@ -2727,7 +2707,7 @@ impl Engine {
         }
 
         if !vectors_of_the_life_before {
-            refused += self.restore_vector_state(state, versions, &earlier)?;
+            refused += self.restore_vector_state(state, versions)?;
         }
         Ok(refused)
     }
@@ -2735,48 +2715,25 @@ impl Engine {
     /// The vector configuration a page describes, applied by the stamp it carries
     /// (ADR-226).
     ///
-    /// - **A dated page** (`vector_changed`): applied when the sender's own coverage
-    ///   names the stamp (ADR-163; it comes off the wire) and it is **newer than the
-    ///   standing change**, an unstamped standing state reading as older than any
-    ///   (judged where the change is made, under the writer). A
-    ///   configuration is set, a turned-off configuration is turned off, and the stamp
-    ///   is recorded either way. The clock observes the stamp, so a later local change
-    ///   cannot mint one below it.
-    /// - **An undated page** (a sender that predates the stamp) never overrides a
-    ///   stamped local value: it can only add a configuration to a collection whose
-    ///   vector state was last written unstamped, as it always did, and it can never
-    ///   turn one off.
-    ///
-    /// `earlier` judges an undated page by the life it names (see `restore_collection`);
-    /// a dated one is judged by its stamp against the floor, as the entries route
-    /// judges a `ConfigureVectors` (ADR-236).
+    /// A page whose `vector_changed` is `None` describes a collection whose vector
+    /// state was never changed, and has nothing to apply. Otherwise it is applied
+    /// when the sender's own coverage names the stamp (ADR-163; it comes off the
+    /// wire) and it is **newer than the standing change** (judged where the change is
+    /// made, under the writer). A configuration is set, a turned-off configuration is
+    /// turned off, and the stamp is recorded either way. The clock observes the
+    /// stamp, so a later local change cannot mint one below it. It is judged by its
+    /// stamp against the floor, as the entries route judges a `ConfigureVectors`
+    /// (ADR-236).
     fn restore_vector_state(
         &self,
         state: &CollectionState,
         versions: &VersionVector,
-        earlier: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<usize> {
-        let Some(existing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
+        if Self::unless_gone(self.get_collection(&state.db, &state.name))?.is_none() {
             // Dropped here since the definitions began: nothing to put it on.
             return Ok(0);
-        };
+        }
         let Some(stamp) = state.vector_changed else {
-            // Undated: the old rule, and only where nothing dated stands here.
-            if let Some(config) = &state.vector
-                && existing.vector_changed.is_none()
-                && existing.vector.as_ref() != Some(config)
-            {
-                return self.settled_vector_step(
-                    state,
-                    self.configure_vectors_inner(
-                        &state.db,
-                        &state.name,
-                        config.clone(),
-                        crate::vectors::Configured::FromSnapshot(None),
-                        &|standing| Ok(earlier(standing)),
-                    ),
-                );
-            }
             return Ok(0);
         };
         if stamp.hlc > versions.get(stamp.node) {
@@ -2797,7 +2754,7 @@ impl Engine {
         self.witness(&stamp);
         let history = |standing: &CollectionMeta| self.definition_of_an_ended_life(standing, stamp);
         let history: &dyn Fn(&CollectionMeta) -> Result<bool> = &history;
-        let by = crate::vectors::Configured::FromSnapshot(Some(stamp));
+        let by = crate::vectors::Configured::FromSnapshot(stamp);
         match &state.vector {
             Some(config) => self.settled_vector_step(
                 state,

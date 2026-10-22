@@ -237,15 +237,13 @@ pub struct VectorRecord {
     /// configuration this was made under, compared against the collection's
     /// current one to detect a configuration change (ADR-203).
     ///
-    /// `None` on a record written before 0.43.0, by an older member, or by a
-    /// client into a collection the server embeds; such a record is judged by
-    /// its version alone, as every record was before ([`Unstamped`]). A
+    /// `None` on a record a client stores into a collection the server embeds;
+    /// such a record is judged by its version alone ([`Unstamped`]). A
     /// record a client stores into a `byo` collection carries the `byo`
     /// configuration's, so a later switch to a server-side provider reads it
     /// as made under another configuration.
     ///
-    /// Additive on disk: absent when `None`, so such a record encodes exactly
-    /// as before, and a build that does not know the key ignores it. Stored as
+    /// Absent when `None`. Stored as
     /// the fingerprint's bits in a signed 64-bit integer, since BSON refuses a
     /// `u64` above `i64::MAX` and half of all fingerprints are.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "fingerprint_bits")]
@@ -256,8 +254,7 @@ pub struct VectorRecord {
 /// [`VectorRecord::is_stale`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unstamped {
-    /// By its source version alone, as every record was judged before records
-    /// carried a fingerprint. What a record written by an older release gets
+    /// By its source version alone. What a record with no fingerprint gets
     /// wherever nothing says the configuration changed since: re-embedding
     /// every such record on each ownership move would cost a provider call per
     /// document, for vectors that are almost always current.
@@ -912,10 +909,10 @@ mod tests {
         }
     }
 
-    /// A record with no fingerprint (an older release's, an older member's, or
-    /// a client's in a collection the server embeds) is judged by its version
-    /// unless the caller knows the configuration changed. Reading it as stale
-    /// everywhere would re-embed everything older releases wrote.
+    /// A record with no fingerprint (a client's in a collection the server
+    /// embeds) is judged by its version unless the caller knows the
+    /// configuration changed. Reading it as stale everywhere would re-embed
+    /// every such record.
     #[test]
     fn a_record_without_a_fingerprint_is_judged_as_the_caller_says() {
         let r = record(0, 100);
@@ -933,67 +930,17 @@ mod tests {
         assert_eq!(serde_json::from_str::<VectorRecord>(&text).unwrap(), stamped);
     }
 
-    // -----------------------------------------------------------------------
-    // The stored format across the 0.43.0 boundary
-    // -----------------------------------------------------------------------
-
-    /// `VectorRecord` as 0.42.0 declared it, copied here so the tests below
-    /// decode with the shape an older build has. Records are stored, and
-    /// replicated, snapshotted and backed up, as the BSON documents of an
-    /// ordinary collection, and every build reads them with serde and without
-    /// `deny_unknown_fields`.
-    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-    struct RecordBefore043 {
-        source: DocId,
-        chunk: u32,
-        source_hlc: Hlc,
-        vector: Vec<f32>,
-        text: String,
-    }
-
-    fn before_043() -> RecordBefore043 {
-        let r = record(3, 42);
-        RecordBefore043 {
-            source: r.source,
-            chunk: r.chunk,
-            source_hlc: r.source_hlc,
-            vector: r.vector,
-            text: r.text,
-        }
-    }
-
-    /// An older build reads a record carrying a fingerprint, from the stored
-    /// document and from its bytes as a replication frame or snapshot page
-    /// carries them, and drops the key: so a member rolled back to 0.42.0 reads
-    /// every record 0.43.0 wrote. A fingerprint above `i64::MAX` encodes at
-    /// all, which as a plain `u64` BSON would refuse.
+    /// A record with no fingerprint stores no `config` key.
     #[test]
-    fn an_older_build_reads_a_record_carrying_a_fingerprint() {
+    fn a_record_with_no_fingerprint_stores_no_key() {
+        let doc = bson::serialize_to_document(&record(3, 42)).unwrap();
+        assert!(!doc.contains_key("config"), "{doc:?}");
         let stamped = VectorRecord { config: Some(HIGH), ..record(3, 42) };
         let doc = bson::serialize_to_document(&stamped).unwrap();
         assert!(doc.contains_key("config"), "the fingerprint is stored: {doc:?}");
-        let old: RecordBefore043 = bson::deserialize_from_document(doc.clone()).unwrap();
-        assert_eq!(old, before_043());
-        let bytes = bson::serialize_to_vec(&stamped).unwrap();
-        let old: RecordBefore043 = bson::deserialize_from_slice(&bytes).unwrap();
-        assert_eq!(old, before_043());
-        // And it comes back whole.
+        // A fingerprint above `i64::MAX` encodes at all, which as a plain `u64`
+        // BSON would refuse, and it comes back whole.
         assert_eq!(bson::deserialize_from_document::<VectorRecord>(doc).unwrap(), stamped);
-    }
-
-    /// This build reads a record an older build wrote, as having no
-    /// fingerprint; and a record with none encodes exactly as an older build
-    /// encoded it, so nothing about such a record changes on disk or the wire.
-    #[test]
-    fn this_build_reads_a_record_an_older_build_wrote() {
-        let doc = bson::serialize_to_document(&before_043()).unwrap();
-        let read: VectorRecord = bson::deserialize_from_document(doc.clone()).unwrap();
-        assert_eq!(read, record(3, 42));
-        assert_eq!(read.config, None);
-        let bytes = bson::serialize_to_vec(&before_043()).unwrap();
-        assert_eq!(bson::deserialize_from_slice::<VectorRecord>(&bytes).unwrap(), record(3, 42));
-        assert_eq!(bson::serialize_to_document(&record(3, 42)).unwrap(), doc, "no key when none");
-        assert_eq!(bson::serialize_to_vec(&record(3, 42)).unwrap(), bytes);
     }
 
     // -----------------------------------------------------------------------

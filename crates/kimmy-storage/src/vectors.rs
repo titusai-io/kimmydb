@@ -99,10 +99,9 @@ pub(crate) enum Configured {
     /// created replicated back to the members that had dropped it.
     FromEntry(kimmy_core::Stamp),
     /// A snapshot page's definition, with the stamp of the change it describes
-    /// (`CollectionState::vector_changed`): `None` from a sender that did not stamp
-    /// it. The shadow is its own collection on the page, restored at its own stamp,
-    /// and is not created here.
-    FromSnapshot(Option<kimmy_core::Stamp>),
+    /// (`CollectionState::vector_changed`). The shadow is its own collection on the
+    /// page, restored at its own stamp, and is not created here.
+    FromSnapshot(kimmy_core::Stamp),
     /// A late-drop sweep turning off a configuration of the life before (ADR-231),
     /// at the stamp given: the drop's, or the change's own where that sorts above the
     /// drop's in the drop's own `Hlc` (ADR-236: a tie is the drop's). Judged by
@@ -120,7 +119,7 @@ impl Configured {
     /// and cannot be replayed here. Never a local change, which mints its own stamp
     /// and is a client's request to be refused or not on this member's state.
     fn is_dated_from_elsewhere(self) -> bool {
-        matches!(self, Self::FromSnapshot(Some(_)) | Self::FromEntry(_))
+        matches!(self, Self::FromSnapshot(_) | Self::FromEntry(_))
     }
 
     /// The stamp of the change this applies, when it comes with one from another
@@ -129,8 +128,7 @@ impl Configured {
     fn stamp(self) -> Option<kimmy_core::Stamp> {
         match self {
             Self::Locally => None,
-            Self::FromEntry(stamp) | Self::Swept(stamp) => Some(stamp),
-            Self::FromSnapshot(stamp) => stamp,
+            Self::FromEntry(stamp) | Self::Swept(stamp) | Self::FromSnapshot(stamp) => Some(stamp),
         }
     }
 }
@@ -322,15 +320,12 @@ impl crate::Engine {
                 continue;
             }
             // The stamp of this change: minted here, after the shadow's, for a local
-            // one, and the entry's own for a peer's. A page from a sender that did not
-            // stamp it leaves the standing stamp alone.
+            // one, and the entry's own for a peer's.
             let stamp = match by {
                 Configured::Locally => Some(self.next_stamp_above(meta.vector_changed)),
                 other => other.stamp(),
             };
-            if stamp.is_some() {
-                meta.vector_changed = stamp;
-            }
+            meta.vector_changed = stamp;
             crate::Engine::put_collection_meta(&txn, &meta)?;
             // The configuration changed here (set or turned off): a refusal of it
             // is mended, and must not explain a later loss.
@@ -509,9 +504,7 @@ impl crate::Engine {
                 Configured::Locally => Some(self.next_stamp_above(meta.vector_changed)),
                 other => other.stamp(),
             };
-            if stamp.is_some() {
-                meta.vector_changed = stamp;
-            }
+            meta.vector_changed = stamp;
             crate::Engine::put_collection_meta(&txn, &meta)?;
             // The configuration changed here (set or turned off): a refusal of it
             // is mended, and must not explain a later loss.

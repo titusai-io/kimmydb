@@ -277,7 +277,6 @@ const BOUNDED_READS: &[(&str, &str)] = &[
          for a drop, a rebuild or a migration, which close_writes bounds (ADR-192), and the \
          build's own for a superseded definition's clear, which stops with the build",
     ),
-    ("index::partial_filters_holding_an_array", "at open, a migration's check of the registry"),
     (
         "live_walk::run",
         "at open, before the node serves: chunked, each chunk committed, and it looks for the \

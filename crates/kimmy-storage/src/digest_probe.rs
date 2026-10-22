@@ -234,11 +234,10 @@ pub struct Uncovered {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestAsk {
     pub cut: VersionVector,
-    #[serde(default, deserialize_with = "lenient_uncovered")]
+    #[serde(deserialize_with = "lenient_uncovered")]
     pub uncovered: Vec<Uncovered>,
     /// The busy collection this contact's rotation names: the peer answers
     /// every collection that is quiet on its side, and this one if it is busy.
-    #[serde(default)]
     pub busy: Option<CollectionId>,
 }
 
@@ -261,10 +260,8 @@ pub struct DigestEntry {
     /// requester's own count must equal for the comparison to be valid.
     pub applied: u32,
     /// The peer's own uncovered keys, for a collection that was busy there.
-    #[serde(default)]
     pub uncovered: Vec<ByteBuf>,
     /// Set instead of a digest when the peer cannot compare this collection.
-    #[serde(default)]
     pub deferred: Option<Defer>,
 }
 
@@ -272,14 +269,13 @@ pub struct DigestEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct DigestReply {
     pub entries: Vec<DigestEntry>,
-    /// Entries that did not decode (a reason or a shape from a later build) and
-    /// were dropped: read, never written, so that the caller can count them.
+    /// Entries that did not decode and were dropped: read, never written, so that the caller can count them.
     #[serde(skip)]
     pub malformed: u32,
 }
 
 /// Entries are read one at a time: one that does not decode is dropped and
-/// counted, and the rest are kept, so a new field costs the entry and never
+/// counted, and the rest are kept, so a damaged entry costs the entry and never
 /// the frame.
 impl<'de> Deserialize<'de> for DigestReply {
     fn deserialize<D: serde::Deserializer<'de>>(
@@ -287,7 +283,6 @@ impl<'de> Deserialize<'de> for DigestReply {
     ) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Raw {
-            #[serde(default)]
             entries: Vec<bson::Bson>,
         }
         let raw = Raw::deserialize(deserializer)?;
@@ -306,8 +301,7 @@ pub enum DigestAnswered {
     Answered,
     /// Already answering a probe: distinct from not answering at all.
     Busy,
-    /// With none: a peer that predates the digest, or one that failed to
-    /// compute it. Never compared.
+    /// With none: a peer that failed to compute it. Never compared.
     Unanswered,
     /// Asked with the cut alone, to learn whether the peer answers digests
     /// before paying for this side's scan (a peer that has not yet answered

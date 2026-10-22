@@ -61,7 +61,6 @@ pub enum DefinitionKind {
 pub struct DefinitionKey {
     pub kind: DefinitionKind,
     /// The index's name; empty for the vector configuration.
-    #[serde(default)]
     pub name: String,
 }
 
