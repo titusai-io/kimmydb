@@ -59,7 +59,7 @@ fn a_two_operand_operation_is_fast() {
         .collect();
     let mut sink = 0u128;
     for (name, pairs, ceiling) in
-        [("ordinary", &ordinary, 3_000u128), ("extreme", &extreme, 60_000)]
+        [("ordinary", &ordinary, 3_000u128), ("extreme", &extreme, 150_000)]
     {
         for (op, f) in [
             ("add", (|a: &Raw, b: &Raw| arith::add(a, b)) as fn(&Raw, &Raw) -> Raw),

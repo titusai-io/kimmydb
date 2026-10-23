@@ -625,6 +625,19 @@ jobs:
             --ignored --exact arithmetic_agrees_with_decnumber_over_a_million_pairs 2>&1 | tee decnumber.log
           grep -q 'test result: ok. 1 passed' decnumber.log
 
+      # The design's cost ceilings, as ignored tests in release. A runner is
+      # slower than the machine they were measured on, so each asserts several
+      # times the measured figure; a real regression still crosses it.
+      - name: Cost ceilings
+        shell: bash
+        run: |
+          cargo test -p kimmy-core --release --test decimal_cost -- \
+            --ignored --test-threads 1 2>&1 | tee cost-core.log
+          grep -q 'test result: ok. 4 passed' cost-core.log
+          cargo test -p kimmy-query --release --test decimal_cost -- \
+            --ignored --test-threads 1 2>&1 | tee cost-query.log
+          grep -q 'test result: ok. 2 passed' cost-query.log
+
       # The golden corpus and the R1 properties, in release: the shipped
       # profile wraps on integer overflow, and the test profile panics, so the
       # corpus is the one place the release arithmetic is held to its bytes.
