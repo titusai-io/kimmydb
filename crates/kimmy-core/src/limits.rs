@@ -27,8 +27,8 @@ pub fn check_document(bytes: usize) -> Result<()> {
 pub fn check_id(id: &DocId) -> Result<()> {
     let (kind, bytes) = match id {
         DocId::String(s) => ("string", s.len()),
-        DocId::Binary(b) => ("binary", b.len()),
-        DocId::ObjectId(_) | DocId::Int64(_) | DocId::Uuid(_) | DocId::Decimal128(_) => {
+        DocId::Binary { bytes, .. } => ("binary", bytes.len()),
+        DocId::ObjectId(_) | DocId::Int64(_) | DocId::Decimal128(_) => {
             return Ok(());
         }
     };
@@ -53,12 +53,12 @@ mod tests {
     #[test]
     fn a_string_or_binary_id_is_measured_in_bytes() {
         assert!(check_id(&DocId::String("a".repeat(MAX_ID_BYTES))).is_ok());
-        assert!(check_id(&DocId::Binary(vec![0; MAX_ID_BYTES])).is_ok());
+        assert!(check_id(&DocId::Binary { subtype: 4, bytes: vec![0; MAX_ID_BYTES] }).is_ok());
         // A multi-byte character counts as its bytes, not as one.
         let wide = "\u{e9}".repeat(MAX_ID_BYTES / 2 + 1);
         for id in [
             DocId::String("a".repeat(MAX_ID_BYTES + 1)),
-            DocId::Binary(vec![0; MAX_ID_BYTES + 1]),
+            DocId::Binary { subtype: 4, bytes: vec![0; MAX_ID_BYTES + 1] },
             DocId::String(wide),
         ] {
             let err = check_id(&id).unwrap_err();

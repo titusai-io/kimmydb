@@ -152,11 +152,9 @@ impl Pending {
     /// One write to `key` of `collection`: the record that was there and the
     /// one now, each as its stamp and whether it is live.
     ///
-    /// `key` is the stored key, and the digest moves by the terms of its
-    /// **legacy** form (`live_digest`'s module docs): the one conversion every
-    /// write to `DOCS` passes through, `put_record`, `put_bare_tombstone` and
-    /// `remove_record` (the drop purger's) alike. Total, so no row can refuse a
-    /// write here.
+    /// `key` is the stored key, and the digest moves by the terms of it: every
+    /// write to `DOCS` passes through here, `put_record`, `put_bare_tombstone` and
+    /// `remove_record` (the drop purger's) alike.
     #[cfg(not(kimmy_bench_no_live_counts))]
     fn wrote(
         &mut self,
@@ -165,8 +163,7 @@ impl Pending {
         before: Option<(kimmy_core::Stamp, bool)>,
         after: Option<(kimmy_core::Stamp, bool)>,
     ) {
-        let key = kimmy_core::keyenc::legacy_of_stored(key);
-        self.digests.entry(collection).or_default().wrote(&key, before, after);
+        self.digests.entry(collection).or_default().wrote(key, before, after);
     }
 
     /// The control's no-op (`--cfg kimmy_bench_no_live_counts`).
@@ -320,11 +317,10 @@ pub(crate) fn live_count(txn: &redb::ReadTransaction, id: kimmy_core::Collection
 /// position, then the oplog's newest key if it has one.
 ///
 /// **Both, because either alone comes back to a value it held.** The arrival
-/// end moves down when a rewind or retention removes rows, and an older build
-/// appending as many entries as were removed brings it back to exactly the
-/// mark. The oplog's newest key moves on with that append, and a 0.29.x rewind
-/// — which removes oplog rows and leaves the arrival index alone — moves it
-/// back. A store written behind a build that keeps the counts matches neither.
+/// end moves down when a rewind or retention removes rows, and appending as
+/// many entries as were removed brings it back to exactly the mark; the oplog's
+/// newest key moves on with that append. A store written behind the counts
+/// matches neither.
 pub(crate) fn mark_of(
     arrival: &impl ReadableTable<u64, &'static [u8]>,
     oplog: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -359,7 +355,7 @@ pub(crate) fn mark_through(txn: &WriteTransaction, mark: &[u8]) -> Result<()> {
 /// Carry the mark from `before` to `after` across a removal that appends
 /// nothing — a rewind, or retention — **only if it matched `before`**.
 ///
-/// A mark that already did not match says an older build wrote behind the
+/// A mark that already did not match says the store was written behind the
 /// counts, and moving it to the new state would hide that from the next open.
 pub(crate) fn carry_mark(txn: &WriteTxn<'_>, before: &[u8], after: &[u8]) -> Result<()> {
     // A transaction that appended would have its own mark waiting in [`Pending`],
@@ -388,8 +384,8 @@ pub(crate) fn carry_mark(txn: &WriteTxn<'_>, before: &[u8], after: &[u8]) -> Res
     }
     drop(table);
     // The digest rows' own mark, under the same rule: a mark that did not
-    // match says a build that does not keep them wrote since, and moving it
-    // forward would hide that from the next open.
+    // match says the rows were not kept current, and moving it forward would
+    // hide that from the next open.
     crate::live_digest::carry_mark(txn, before, after)?;
     Ok(())
 }
@@ -450,8 +446,7 @@ pub(crate) mod test_support {
             let (key, value) = row.unwrap();
             let (collection, doc_key) = key.value();
             let (stamp, live) = codec::doc_record_header(value.value()).unwrap();
-            let key = kimmy_core::keyenc::legacy_of_stored(doc_key);
-            crate::live_digest::fold_walked(&mut walked, collection, &key, &stamp, live);
+            crate::live_digest::fold_walked(&mut walked, collection, doc_key, &stamp, live);
         }
         let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
         let mut kept: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();
@@ -774,50 +769,6 @@ mod tests {
         assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(3));
     }
 
-    /// Write `name` into `coll` the way a build that does not keep the counts
-    /// does: the record, its oplog entry and both halves of the arrival index,
-    /// and neither the count nor the mark.
-    fn write_as_an_older_build(engine: &Engine, coll: &CollectionMeta, name: &str, live: bool) {
-        let stamp = engine.next_stamp();
-        let body = bson::serialize_to_vec(&doc! { "_id": name }).unwrap();
-        let record = codec::encode_doc_record(&match live {
-            true => kimmy_core::DocRecord::live(stamp, body.clone()),
-            false => kimmy_core::DocRecord::tombstone(stamp),
-        });
-        let key = crate::docs::doc_key(&id(name)).unwrap();
-        let db = engine.db();
-        let txn = db.begin_write().unwrap();
-        txn.open_table(tables::DOCS)
-            .unwrap()
-            .insert((coll.id.0, key.as_slice()), record.as_slice())
-            .unwrap();
-        {
-            // Its entry, as any document write appends one: the oplog row
-            // and both halves of the arrival index, so the index still
-            // covers the oplog and is not rebuilt.
-            let entry = OplogEntry {
-                stamp,
-                kind: if live { OpKind::Insert } else { OpKind::Delete },
-                collection: coll.id,
-                doc_id: Some(id(name)),
-                body: live.then_some(body),
-            };
-            let oplog_key = codec::oplog_key(&stamp);
-            txn.open_table(tables::OPLOG)
-                .unwrap()
-                .insert(oplog_key.as_slice(), codec::encode_oplog_entry(&entry).as_slice())
-                .unwrap();
-            let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
-            let next = arrival.last().unwrap().map_or(0, |(seq, _)| seq.value() + 1);
-            arrival.insert(next, oplog_key.as_slice()).unwrap();
-            txn.open_table(tables::OPLOG_ARRIVAL_SEQ)
-                .unwrap()
-                .insert(oplog_key.as_slice(), next)
-                .unwrap();
-        }
-        txn.commit().unwrap();
-    }
-
     #[test]
     fn a_rewind_leaves_the_counts_trusted_at_the_next_open() {
         // A rewind removes arrival rows and appends nothing. The mark moves
@@ -848,68 +799,6 @@ mod tests {
             Some(7),
             "the start after a rewind walked the store to rebuild the counts"
         );
-    }
-
-    #[test]
-    fn a_build_that_writes_as_many_entries_as_a_rewind_removed_is_caught_at_open() {
-        // The sequence a mark of the arrival end alone cannot see: the rewind
-        // takes the end down by one, and an older build's one append brings it
-        // back to exactly the old mark.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        let coll_id = {
-            let engine = Engine::open(&path).unwrap();
-            let coll = engine.create_collection("app", "docs").unwrap();
-            engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
-            let until = engine.version_vector().unwrap().iter().map(|(_, h)| h).max().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
-            engine.rewind_to(until).unwrap();
-            write_as_an_older_build(&engine, &coll, "older", true);
-            coll.id
-        };
-        let engine = Engine::open(&path).unwrap();
-        assert_counts_exact(&engine, "an open after an older build wrote behind a rewind");
-        assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(2));
-    }
-
-    #[test]
-    fn an_older_build_rewinding_then_writing_is_caught_at_open() {
-        // A 0.29.x rewind removes oplog rows and leaves the arrival index, so
-        // the next start rebuilds the index, renumbered, to fewer positions.
-        // One older write later, the renumbered end is the old mark again; the
-        // oplog's newest key is not, which is why the mark carries both.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        let coll_id = {
-            let engine = Engine::open(&path).unwrap();
-            let coll = engine.create_collection("app", "docs").unwrap();
-            engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
-            engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
-            let undone = engine.read_arrival_from(0, 100).unwrap().pop().unwrap().stamp;
-            // The older rewind: its entry out of the oplog, its document
-            // tombstoned, the arrival index and the count left as they were.
-            let key = crate::docs::doc_key(&id("undone")).unwrap();
-            let tombstone =
-                codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(engine.next_stamp()));
-            let db = engine.db();
-            let txn = db.begin_write().unwrap();
-            txn.open_table(tables::OPLOG)
-                .unwrap()
-                .remove(codec::oplog_key(&undone).as_slice())
-                .unwrap();
-            txn.open_table(tables::DOCS)
-                .unwrap()
-                .insert((coll.id.0, key.as_slice()), tombstone.as_slice())
-                .unwrap();
-            txn.commit().unwrap();
-            // Then an older delete, of the document still live.
-            write_as_an_older_build(&engine, &coll, "kept", false);
-            coll.id
-        };
-        let engine = Engine::open(&path).unwrap();
-        assert_counts_exact(&engine, "an open after an older build rewound and wrote");
-        assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(0));
     }
 
     #[test]
@@ -1413,45 +1302,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_write_by_a_build_that_does_not_keep_the_counts_is_caught_at_open() {
-        // An older build writes a document and appends its entry, and moves
-        // neither the count nor the mark. The mark then trails the arrival
-        // index, and the next open rebuilds.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        let coll_id = {
-            let engine = Engine::open(&path).unwrap();
-            let coll = engine.create_collection("app", "docs").unwrap();
-            engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
-            write_as_an_older_build(&engine, &coll, "older", true);
-            coll.id
-        };
-        let engine = Engine::open(&path).unwrap();
-        assert_counts_exact(&engine, "an open after an older build wrote");
-        assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(2));
-    }
-
     /// Every write to `DOCS` goes through this module, or a count drifts.
     #[test]
     fn every_document_write_moves_the_count() {
-        // Exempt: `migrate.rs` moves rows between ids during `Engine::open`,
-        // before the counts are rebuilt; `migrate_v5.rs` re-keys rows within
-        // their own id during `Engine::open`, which moves no count (each row
-        // leaves and returns as the same record) and no digest term (the term
-        // is the key's schema 4 form, which a re-key does not change), and its
-        // tests build schema 4 stores by hand; `backup.rs` restores into a file
-        // no engine has opened, which the first open rebuilds; `faults.rs`
-        // stores test-only records that are not documents, for readers that
-        // must survive them; and this module.
-        const EXEMPT: [&str; 6] = [
-            "live_count.rs",
-            "migrate.rs",
-            "migrate_v5.rs",
-            "migrate_v5_tests.rs",
-            "backup.rs",
-            "faults.rs",
-        ];
+        // Exempt: `migrate.rs` stamps the version of a fresh store during
+        // `Engine::open`; `backup.rs` restores into a file no engine has opened,
+        // which the first open rebuilds; `faults.rs` stores test-only records that
+        // are not documents, for readers that must survive them; and this module.
+        const EXEMPT: [&str; 4] = ["live_count.rs", "migrate.rs", "backup.rs", "faults.rs"];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
         for entry in std::fs::read_dir(&src).unwrap() {

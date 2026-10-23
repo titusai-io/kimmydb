@@ -421,33 +421,6 @@ fn the_rendering_of_every_filter_type_is_pinned() {
 
 // -- The stored forms -----------------------------------------------------------
 
-/// A filter written by a build before ADR-182 is in the relaxed form, which reads
-/// a small `Int64` back as an `Int32`. Every member reads a stored form the same
-/// way, and a rewrite stores the canonical form of the already-lossy value, so
-/// members that converged agree: the digest of the meta read from the relaxed
-/// text equals that of the meta read back from its own rewrite.
-#[test]
-fn a_relaxed_stored_filter_and_its_canonical_rewrite_hash_alike() {
-    let relaxed = serde_json::json!({
-        "id": CollectionId::derive("shop", "orders"),
-        "db": "shop",
-        "name": "orders",
-        "created": Hlc::new(10, 0),
-        "indexes": [{
-            "id": IndexMeta::derive_id("f"),
-            "name": "f",
-            "fields": [{ "path": "n", "descending": false }],
-            "partial_filter": { "n": { "$gte": 5 }, "s": "x" },
-        }],
-    });
-    let from_relaxed: CollectionMeta = serde_json::from_value(relaxed).unwrap();
-    let rewritten = serde_json::to_string(&from_relaxed).unwrap();
-    assert!(rewritten.contains("$numberInt"), "premise: the rewrite is canonical: {rewritten}");
-    let from_canonical: CollectionMeta = serde_json::from_str(&rewritten).unwrap();
-    assert_eq!(from_relaxed.indexes[0].partial_filter, from_canonical.indexes[0].partial_filter);
-    assert_eq!(definition_digest(&from_relaxed), definition_digest(&from_canonical));
-}
-
 /// Strings in a list split differently: framed by length, so they do not hash alike.
 #[test]
 fn a_vector_configurations_fields_are_framed_by_length() {

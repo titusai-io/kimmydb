@@ -153,7 +153,8 @@ fn a_row_goes_first_on_the_next_page_and_one_no_page_can_carry_is_refused() {
 /// The refusal of a row whose `_id` is too large to cross with its cursor names
 /// the id by its kind, its length and its first bytes, not by the id: the text is
 /// logged and sent to the requester every round, and a 3.5 MiB binary `_id` once
-/// made it 11 MB.
+/// made it 11 MB. (A binary id crosses as bytes, so it takes one over about 6 MiB to
+/// leave no room for its cursor.)
 #[test]
 fn the_refusal_of_a_large_id_names_it_by_its_length_and_prefix() {
     let dir = tempfile::tempdir().unwrap();
@@ -161,7 +162,7 @@ fn the_refusal_of_a_large_id_names_it_by_its_length_and_prefix() {
     let c = y.create_collection("shop", "wideid").unwrap();
     let id = bson::Binary {
         subtype: bson::spec::BinarySubtype::Generic,
-        bytes: vec![7u8; 3_584 * 1024],
+        bytes: vec![7u8; 7 * 1024 * 1024],
     };
     y.insert(&c, doc! { "_id": Bson::Binary(id), "n": 1i64 }).unwrap();
     let mut after: Option<SnapshotCursor> = None;
@@ -182,7 +183,9 @@ fn the_refusal_of_a_large_id_names_it_by_its_length_and_prefix() {
     let text = refused.expect("premise: the document is refused by name");
     assert!(text.len() < 512, "a refusal of {} bytes, logged and sent every round", text.len());
     assert!(
-        text.contains("binary _id of 3670016 bytes starting 070707070707070707070707"),
+        text.contains(
+            "binary _id of subtype 0 and 7340032 bytes starting 070707070707070707070707"
+        ),
         "{text}"
     );
 }
@@ -193,14 +196,20 @@ fn the_refusal_of_a_large_id_names_it_by_its_length_and_prefix() {
 #[test]
 fn an_id_is_named_by_its_kind_length_and_a_short_prefix() {
     use crate::snapshot::id_name;
-    let long = DocId::Binary((0..200u8).collect());
+    let long = DocId::Binary { subtype: 0, bytes: (0..200u8).collect() };
     assert_eq!(
         id_name(&long),
-        "binary _id of 200 bytes starting 000102030405060708090a0b0c0d0e0f1011121314151617..."
+        "binary _id of subtype 0 and 200 bytes starting 000102030405060708090a0b0c0d0e0f1011121314151617..."
     );
     assert_eq!(id_name(&long), id_name(&long.clone()));
-    assert_eq!(id_name(&DocId::Binary(vec![1, 2])), "binary _id of 2 bytes starting 0102");
-    assert_eq!(id_name(&DocId::Binary(Vec::new())), "binary _id of 0 bytes starting ");
+    assert_eq!(
+        id_name(&DocId::Binary { subtype: 4, bytes: vec![1, 2] }),
+        "binary _id of subtype 4 and 2 bytes starting 0102"
+    );
+    assert_eq!(
+        id_name(&DocId::Binary { subtype: 0, bytes: Vec::new() }),
+        "binary _id of subtype 0 and 0 bytes starting "
+    );
     let text = DocId::String(format!("order-{}", "é".repeat(100)));
     let name = id_name(&text);
     // Cut at a character boundary: 6 bytes of ASCII and 9 two-byte characters.
@@ -294,8 +303,8 @@ fn a_pages_definitions_and_drops_are_counted_against_its_budget() {
 /// The bounds the budget counts rows and the cursor at hold of the BSON encoding,
 /// row by row, for the shapes that maximise them: the widest collection id and
 /// stamp, and `_id`s of every kind, binary ones as
-/// large as 4 KiB, which serde writes as an array of `int32`s; and the cursor,
-/// whose key crosses the same way, at the legacy form of each key.
+/// large as 4 KiB, which cross as a BSON binary with their subtype; and the
+/// cursor, whose key crosses as an array of `int32`s.
 #[test]
 fn the_row_overheads_bound_the_encoding() {
     use crate::snapshot::{
@@ -321,13 +330,16 @@ fn the_row_overheads_bound_the_encoding() {
     for (name, id) in [
         ("int64", DocId::Int64(i64::MIN)),
         ("objectid", DocId::ObjectId(bson::oid::ObjectId::new())),
-        ("uuid", DocId::Uuid(uuid::Uuid::new_v4())),
         ("decimal", decimal),
         ("string-1k", DocId::String("s".repeat(1024))),
-        ("binary-0", DocId::Binary(Vec::new())),
-        ("binary-32", DocId::Binary(vec![9; 32])),
-        ("binary-256", DocId::Binary(vec![9; 256])),
-        ("binary-4k", DocId::Binary(vec![9; 4096])),
+        ("binary-0-0", DocId::Binary { subtype: 0, bytes: vec![9; 0] }),
+        ("binary-0-32", DocId::Binary { subtype: 0, bytes: vec![9; 32] }),
+        ("binary-0-256", DocId::Binary { subtype: 0, bytes: vec![9; 256] }),
+        ("binary-0-4096", DocId::Binary { subtype: 0, bytes: vec![9; 4096] }),
+        ("binary-4-0", DocId::Binary { subtype: 4, bytes: vec![9; 0] }),
+        ("binary-4-32", DocId::Binary { subtype: 4, bytes: vec![9; 32] }),
+        ("binary-4-256", DocId::Binary { subtype: 4, bytes: vec![9; 256] }),
+        ("binary-4-4096", DocId::Binary { subtype: 4, bytes: vec![9; 4096] }),
     ] {
         let key = crate::docs::doc_key(&id).unwrap();
         let body =
@@ -347,7 +359,7 @@ fn the_row_overheads_bound_the_encoding() {
         let tombstones: Vec<SnapshotTombstone> = (0..SNAPSHOT_PAGE)
             .map(|_| SnapshotTombstone {
                 collection: kimmy_core::CollectionId(u64::MAX),
-                key: kimmy_core::legacy_key::legacy_of_stored(&key).into_bytes(),
+                key: key.clone(),
                 stamp,
             })
             .collect();
@@ -358,7 +370,7 @@ fn the_row_overheads_bound_the_encoding() {
         // The cursor a page cuts at such a row.
         let cursor = SnapshotCursor {
             collection: kimmy_core::CollectionId(u64::MAX),
-            after_key: kimmy_core::legacy_key::legacy_of_stored(&key).into_bytes(),
+            after_key: key.clone(),
         };
         let page = SnapshotPage { next: Some(cursor), ..bare.clone() };
         let actual = size(&page) - base;

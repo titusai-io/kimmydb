@@ -30,31 +30,13 @@
 //! verified on a real cluster; this inherits it by construction rather than by
 //! arrangement.
 //!
-//! # Why it is portable between versions
-//!
-//! Schema 5 changed the stored bytes of every number key (Decimal128 design 7.2),
-//! and during a roll a client pages across a 0.50 member and a 0.51 one. So the
-//! token carries the frozen **schema-4** form of the key ([`crate::legacy_key`]),
-//! for every id that form can represent, and `FF ‖ stored key` for a `Decimal128`
-//! id, which has none; and it accepts both. The conversion is made here, at the
-//! client boundary, in [`Cursor::decode`] and [`Cursor::encode`], and **never in
-//! the executor**: a [`Cursor`] holds the stored key, which is what the scan's
-//! bound is, and the executor is also handed stored keys by callers that are not
-//! clients (the vector filter's paging). Reading "starts `0x20`" as legacy there
-//! would run stored keys through the schema-4 decoder, and some of them decode as
-//! another id. That reading is safe at this boundary only because no build
-//! issues a stored number key in a token.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::error::{Error, Result};
-use crate::keyenc;
 
 /// A position in `_id` order, exclusive: paging resumes *after* it.
-///
-/// Holds the **stored** key; the token a client sees is its legacy form (module
-/// docs).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Cursor(Vec<u8>);
 
@@ -69,20 +51,18 @@ impl Cursor {
         &self.0
     }
 
-    /// The token: the legacy form of the key, so a member of the previous release
-    /// can continue it.
+    /// The token: the base64 of the key.
     pub fn encode(&self) -> String {
-        URL_SAFE_NO_PAD.encode(keyenc::legacy_of_stored(&self.0).as_bytes())
+        URL_SAFE_NO_PAD.encode(&self.0)
     }
 
-    /// Read a token, legacy (`0x20…`, what every build issues for an integer id)
-    /// or marked (`0xFF…`, a `Decimal128` id), into the stored key it names.
+    /// Read a token into the key it names.
     pub fn decode(s: &str) -> Result<Self> {
         let raw = URL_SAFE_NO_PAD.decode(s).map_err(|_| Error::MalformedCursor)?;
         // An empty key would mean "after the beginning", which is just the
         // first page — expressible by sending no cursor at all. Refusing it
         // keeps one way to say one thing.
-        let key = keyenc::stored_of_legacy(&raw);
+        let key = raw;
         if key.is_empty() {
             return Err(Error::MalformedCursor);
         }
@@ -151,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn a_token_carries_the_legacy_key_and_reads_back_to_the_stored_one() {
+    fn a_token_is_the_base64_of_the_key_and_reads_back_to_it() {
         let decimal =
             DocId::try_from_bson(&bson::Bson::Decimal128("1.5".parse().unwrap())).unwrap();
         for id in [
@@ -164,10 +144,9 @@ mod tests {
             let stored = key_of(&id);
             let token = Cursor::from_key(stored.clone()).encode();
             let raw = URL_SAFE_NO_PAD.decode(&token).unwrap();
-            assert_eq!(raw, keyenc::legacy_key(&id).into_bytes(), "{id:?}: issued legacy");
-            assert_eq!(Cursor::decode(&token).unwrap().key(), stored, "{id:?}: read stored");
+            assert_eq!(raw, stored, "{id:?}: issued as the key");
+            assert_eq!(Cursor::decode(&token).unwrap().key(), stored, "{id:?}: read back");
         }
-        // A marker with no key behind it says "after the beginning": refused, as empty is.
-        assert!(Cursor::decode(&URL_SAFE_NO_PAD.encode([0xFF])).is_err());
+        assert!(Cursor::decode(&URL_SAFE_NO_PAD.encode([] as [u8; 0])).is_err());
     }
 }

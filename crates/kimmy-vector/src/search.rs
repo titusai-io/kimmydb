@@ -1069,12 +1069,14 @@ mod tests {
     // Document identity (ADR-239)
     // -----------------------------------------------------------------------
 
-    /// Test 17: two documents with binary `_id`s of one length are two
-    /// documents to the per-document cap and to fusion. Under `Display` both
-    /// were `bin(16 bytes)`, one allowance and one fused hit.
+    /// Test 17: two documents whose binary `_id`s differ only by subtype are
+    /// two documents to the per-document cap and to fusion.
     #[test]
-    fn two_binary_ids_of_one_length_take_two_slots_and_fuse_as_two() {
-        let (x, y) = (DocId::Binary(vec![1; 16]), DocId::Binary(vec![2; 16]));
+    fn two_binary_ids_of_one_byte_string_take_two_slots_and_fuse_as_two() {
+        let (x, y) = (
+            DocId::Binary { subtype: 4, bytes: vec![1; 16] },
+            DocId::Binary { subtype: 0, bytes: vec![1; 16] },
+        );
         let hit =
             |id: &DocId, score: f32| Hit { id: id.clone(), score, chunk: 0, text: String::new() };
         let options = SearchOptions { k: 2, per_document: 1, ..Default::default() };

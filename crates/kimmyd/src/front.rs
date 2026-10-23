@@ -346,14 +346,14 @@ mod tests {
     #[test]
     fn a_phase_with_a_count_says_how_far_and_one_without_does_not() {
         let counted = OpenSnapshot {
-            phase: OpenPhase::Migrating,
+            phase: OpenPhase::Verifying,
             phase_age: Duration::from_secs(3),
             done: 2,
             total: 7,
         };
         let fields = progress_fields(counted);
         let get = |name: &str| fields.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone());
-        assert_eq!(get("phase"), Some(json!("migrating")));
+        assert_eq!(get("phase"), Some(json!("verifying")));
         assert_eq!((get("done"), get("total")), (Some(json!(2)), Some(json!(7))));
 
         let plain = OpenSnapshot { phase: OpenPhase::Repairing, total: 0, done: 0, ..counted };

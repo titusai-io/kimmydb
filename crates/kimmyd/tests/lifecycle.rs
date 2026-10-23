@@ -445,9 +445,8 @@ fn a_start_that_fails_to_bind(dir: &Path, name: &str) -> String {
     failed.log()
 }
 
-/// Round 0380's sequence, with a start that fails to bind in place of an
-/// older build refusing the store: a run killed, then a start that fails
-/// before it serves, then a start. The last one reports both, the failed
+/// Round 0380's sequence, with a start that fails to bind: a run killed, then a
+/// start that fails before it serves, then a start. The last one reports both, the failed
 /// start and the unclean end before it. The failed start used to replace the
 /// evidence of the kill.
 #[tokio::test]
@@ -2029,72 +2028,6 @@ async fn a_bind_that_fails_never_opens_the_store() {
     );
 }
 
-/// A stop asked for while a migration runs ends the open between two of its
-/// steps and concludes as a clean shutdown, with no engine: exit 0, a
-/// `shutdown` marker, no serving. The next start resumes from the migration's
-/// markers and finds nothing to repair.
-#[tokio::test]
-async fn a_stop_between_two_migration_steps_is_a_clean_shutdown_and_the_next_start_resumes() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    std::fs::create_dir_all(&data).unwrap();
-    let path = data.join("kimmy.redb");
-    {
-        let engine = kimmy_storage::Engine::open(&path).unwrap();
-        let coll = engine.create_collection("shop", "orders").unwrap();
-        engine
-            .insert_many(&coll, (0..20i64).map(|i| bson::doc! { "_id": i, "n": i + 1 }).collect())
-            .unwrap();
-        for name in ["a", "b", "c"] {
-            engine
-                .create_index_with(
-                    "shop",
-                    "orders",
-                    vec![kimmy_storage::IndexField { path: "n".into(), descending: false }],
-                    false,
-                    Default::default(),
-                    Some(name.into()),
-                    None,
-                    Some(bson::doc! { "n": { "$gt": 0 } }),
-                )
-                .unwrap();
-        }
-        engine.close().unwrap();
-    }
-    kimmy_storage::make_schema_4_for_test(&path).unwrap();
-
-    let mut run = Run::spawn_with(dir.path(), "migrating", &[("KIMMY_TEST_OPEN_STEP_MS", "20000")]);
-    let deadline = Instant::now() + PATIENCE;
-    // The re-key's step ends with this line, and the indexes are still owed.
-    while !run.log().contains("re-keyed a collection's documents") {
-        assert!(Instant::now() < deadline, "no step finished: {}", run.log());
-        tokio::time::sleep(POLL).await;
-    }
-    let before = Instant::now();
-    run.signal("TERM");
-    let status = run.wait_exit();
-    assert!(status.success(), "{status:?}: {}", run.log());
-    assert!(before.elapsed() < Duration::from_secs(10), "the stop waited for the open");
-    let log = run.log();
-    assert!(log.contains("stopping without serving"), "{log}");
-    assert!(log.contains("shutdown complete"), "{log}");
-    assert!(!log.contains("serving HTTP and WebSocket"), "{log}");
-    assert!(!log.contains("exiting on an error"), "not a failed start: {log}");
-    let marker = marker(dir.path()).expect("a stop leaves its marker");
-    assert!(marker.contains("exit = \"shutdown\""), "{marker}");
-    assert!(!marker.contains("failed_start"), "{marker}");
-
-    let client = reqwest::Client::new();
-    let mut next = Run::spawn(dir.path(), "resumed");
-    next.wait_ready(&client).await;
-    let log = next.log();
-    assert!(log.contains("previous run ended cleanly"), "{log}");
-    assert!(!log.contains("repair"), "{log}");
-    assert!(log.contains("rebuilt an index for storage schema 5"), "the migration resumed: {log}");
-    next.signal("TERM");
-    assert!(next.wait_exit().success());
-}
-
 /// A stop asked for while the node starts, after the store is open, stops it
 /// and never says it serves (what an operator greps for is a node that did).
 #[tokio::test]
@@ -2931,21 +2864,10 @@ async fn a_start_buries_what_a_database_drop_covers_before_it_serves() {
 }
 
 /// B3 design 2.1: whether a start rebuilds the live counts and the digests,
-/// whatever their marks say, follows from what the previous run was.
-///
-/// A run is trusted to have kept the digests only if a build at or above the
-/// first one that keeps them wrote its marker. This build is whichever it is,
-/// so the test asks what it should expect of itself: a development build below
-/// that version rebuilds after every start (its own marker reads as older),
-/// and a release at or above it rebuilds after a kill and not after a clean
-/// stop. Either way a kill is unclean, and the start after it rebuilds.
+/// whatever their marks say, follows from what the previous run was: not after
+/// a clean stop, and after a kill.
 #[tokio::test]
 async fn a_start_rebuilds_the_digests_when_the_previous_run_cannot_be_shown_to_have_kept_them() {
-    let keeps_digests = {
-        let mut parts = env!("CARGO_PKG_VERSION").split(['.', '-', '+']);
-        let mut next = || parts.next().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
-        (next(), next(), next()) >= (0, 48, 0)
-    };
     const REBUILT: &str = "rebuilt the live document counts before serving";
     const FORCED: &str = "the previous run cannot be shown to have kept the digests";
 
@@ -2957,17 +2879,12 @@ async fn a_start_rebuilds_the_digests_when_the_previous_run_cannot_be_shown_to_h
     let (status, _) = stop(&mut first);
     assert!(status.success(), "{status:?}");
 
-    // After a clean stop of the build that wrote it.
+    // After a clean stop.
     let log = next_start_log(dir.path(), "after-a-clean-stop", &client).await;
     let walked = log.lines().find(|l| l.contains(REBUILT));
-    if keeps_digests {
-        assert!(walked.is_none(), "a clean stop of a build that keeps them is trusted: {log}");
-    } else {
-        let line = walked.unwrap_or_else(|| panic!("no rebuild:\n{log}"));
-        assert!(line.contains(FORCED), "{line}");
-    }
+    assert!(walked.is_none(), "a clean stop is trusted: {log}");
 
-    // After a kill, whatever the build.
+    // After a kill.
     let mut killed = Run::spawn(dir.path(), "killed");
     killed.wait_ready(&client).await;
     killed.signal("KILL");
@@ -2983,11 +2900,11 @@ async fn a_start_rebuilds_the_digests_when_the_previous_run_cannot_be_shown_to_h
 }
 
 /// The decision to rebuild persists until a rebuild completes (B3 review): after
-/// a clean stop of an older build, two starts stopped during the open must leave
-/// the third start rebuilding, as the first of them did. A marker of 0.47.2 is
-/// written by hand; the starts are real processes. (The model test in
-/// `lifecycle.rs` covers a stop before the open's first write, which a real
-/// start cannot be stopped at; here the stop lands at the rebuild's first look.)
+/// a killed run, two starts stopped during the open must leave the third start
+/// rebuilding, as the first of them did. The starts are real processes. (The
+/// model test in `lifecycle.rs` covers a stop before the open's first write,
+/// which a real start cannot be stopped at; here the stop lands at the
+/// rebuild's first look.)
 #[tokio::test]
 async fn two_starts_stopped_before_the_rebuild_leave_the_third_forced() {
     const REBUILT: &str = "rebuilt the live document counts before serving";
@@ -2997,15 +2914,8 @@ async fn two_starts_stopped_before_the_rebuild_leave_the_third_forced() {
     let client = reqwest::Client::new();
     let mut first = Run::spawn(dir.path(), "first");
     first.wait_ready(&client).await;
-    let (status, _) = stop(&mut first);
-    assert!(status.success(), "{status:?}");
-
-    // What 0.47.2 leaves after serving and stopping clean.
-    let path = dir.path().join("data").join(LAST_EXIT_FILE);
-    let body = std::fs::read_to_string(&path).unwrap();
-    let version =
-        body.lines().find(|l| l.starts_with("version = ")).expect("a version").to_string();
-    std::fs::write(&path, body.replace(&version, "version = \"0.47.2\"")).unwrap();
+    first.signal("KILL");
+    let _ = first.wait_exit();
 
     for name in ["stopped-once", "stopped-twice"] {
         let mut run = Run::spawn_with(dir.path(), name, &[("KIMMY_TEST_OPEN_DELAY_SECS", "40")]);

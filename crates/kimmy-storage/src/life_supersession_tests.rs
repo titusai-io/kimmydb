@@ -147,7 +147,7 @@ fn a_write_the_receiver_made_after_the_drop_is_kept() {
 
 #[test]
 fn a_page_without_a_floor_buries_nothing() {
-    // A sender that predates the field, or a life with no drop behind it.
+    // A life with no drop behind it.
     let (a, b, _dirs) = receiver_holds_the_previous_life();
     forget_the_tombstone(&a);
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
@@ -167,7 +167,7 @@ fn a_floor_the_senders_coverage_does_not_name_buries_nothing() {
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
     for state in &mut page.collections {
         state.incarnation_floor = Some(far);
-        state.created = Some(Hlc::new(crate::physical_now_ms() + 86_400_001, 0));
+        state.created = Hlc::new(crate::physical_now_ms() + 86_400_001, 0);
     }
     b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
         .unwrap();
@@ -380,53 +380,46 @@ mod predicate {
     #[test]
     fn a_life_made_after_a_drop_that_ended_the_standing_one_ends_it() {
         // Standing created at 100; the drop at 200; the arriving life created at 300.
-        assert!(ends(&standing(100), Some(h(300)), None, Some(h(200))));
+        assert!(ends(&standing(100), h(300), None, Some(h(200))));
     }
 
     #[test]
     fn no_floor_is_no_evidence() {
-        assert!(!ends(&standing(100), Some(h(300)), None, None));
-        assert!(!ends(&standing(100), None, None, Some(h(200))), "and no creation says nothing");
+        assert!(!ends(&standing(100), h(300), None, None));
     }
 
     #[test]
     fn the_arriving_life_must_be_newer() {
-        assert!(!ends(&standing(300), Some(h(300)), None, Some(h(200))), "the same life");
-        assert!(!ends(&standing(400), Some(h(300)), None, Some(h(200))), "a sender that is behind");
-        assert!(
-            ends(&standing(100), Some(h(101)), None, Some(h(100))),
-            "one tick newer, at the edge"
-        );
+        assert!(!ends(&standing(300), h(300), None, Some(h(200))), "the same life");
+        assert!(!ends(&standing(400), h(300), None, Some(h(200))), "a sender that is behind");
+        assert!(ends(&standing(100), h(101), None, Some(h(100))), "one tick newer, at the edge");
     }
 
     #[test]
     fn the_drop_must_be_at_or_after_the_standing_creation() {
         // A floor below the standing creation is a drop the standing life was made after.
-        assert!(!ends(&standing(250), Some(h(300)), None, Some(h(200))));
-        assert!(
-            ends(&standing(200), Some(h(300)), None, Some(h(200))),
-            "at it is a drop it followed"
-        );
+        assert!(!ends(&standing(250), h(300), None, Some(h(200))));
+        assert!(ends(&standing(200), h(300), None, Some(h(200))), "at it is a drop it followed");
     }
 
     #[test]
     fn the_drop_must_be_before_the_arriving_creation() {
-        assert!(!ends(&standing(100), Some(h(300)), None, Some(h(300))), "a floor at the creation");
-        assert!(!ends(&standing(100), Some(h(300)), None, Some(h(400))), "a floor above it");
-        assert!(ends(&standing(100), Some(h(300)), None, Some(h(299))));
+        assert!(!ends(&standing(100), h(300), None, Some(h(300))), "a floor at the creation");
+        assert!(!ends(&standing(100), h(300), None, Some(h(400))), "a floor above it");
+        assert!(ends(&standing(100), h(300), None, Some(h(299))));
     }
 
     #[test]
     fn a_re_dated_life_is_the_standing_life_continuing() {
         // The arriving life was re-dated from the creation the standing one has.
-        assert!(!ends(&standing(100), Some(h(201)), Some(h(100)), Some(h(200))));
+        assert!(!ends(&standing(100), h(201), Some(h(100)), Some(h(200))));
         // The same life re-dated by another drop: both sides began at 100.
-        assert!(!ends(&redated(100, 151), Some(h(251)), Some(h(100)), Some(h(250))));
+        assert!(!ends(&redated(100, 151), h(251), Some(h(100)), Some(h(250))));
         // A standing life that was re-dated is compared by where it began, not where it was
         // dated to: an arriving life that began elsewhere is a different life.
-        assert!(ends(&redated(100, 151), Some(h(400)), None, Some(h(300))));
+        assert!(ends(&redated(100, 151), h(400), None, Some(h(300))));
         // And re-dated from a different beginning than the standing one's.
-        assert!(ends(&standing(100), Some(h(401)), Some(h(350)), Some(h(400))));
+        assert!(ends(&standing(100), h(401), Some(h(350)), Some(h(400))));
     }
 }
 
@@ -804,7 +797,7 @@ fn a_floor_at_or_above_the_life_it_belongs_to_is_not_adopted() {
     // the life was made after, so it is below `created`.
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
     for state in &mut page.collections {
-        state.incarnation_floor = state.created;
+        state.incarnation_floor = Some(state.created);
     }
     r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
         .unwrap();
@@ -1179,7 +1172,7 @@ fn the_clock_passes_an_adopted_floor() {
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
     for state in &mut page.collections {
         state.incarnation_floor = Some(ahead);
-        state.created = Some(ahead.successor());
+        state.created = ahead.successor();
     }
     page.versions.insert(a.node_id(), ahead);
     r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)

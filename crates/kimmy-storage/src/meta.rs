@@ -26,7 +26,6 @@ pub struct CollectionMeta {
     pub db: String,
     pub name: String,
     pub created: Hlc,
-    #[serde(default)]
     pub indexes: Vec<IndexMeta>,
     /// Monotonic index-id allocator.
     ///
@@ -34,15 +33,12 @@ pub struct CollectionMeta {
     /// value would hand a dropped index's id to the next one created — and a
     /// dropped index's entries are removed lazily, so the new index would
     /// inherit them.
-    #[serde(default)]
     index_id_counter: u32,
     /// Auto-embedding configuration, when enabled for this collection.
-    #[serde(default)]
     pub vector: Option<VectorConfig>,
     /// The stamp of the latest change to `vector`: a configuration, a change of it,
     /// or turning it off (ADR-226). `None` on a collection whose vector state was
-    /// last written by a build that did not stamp it, which reads as older than any
-    /// stamped change.
+    /// never changed, which reads as older than any stamped change.
     ///
     /// It makes "off" a dated fact. A snapshot page carries `vector` as a presence
     /// only, so a configuration turned off could not be told from one never turned
@@ -50,24 +46,20 @@ pub struct CollectionMeta {
     /// sides, the later change wins and a page can say "off at s". The same stamp
     /// makes the entries path last-writer-wins, which arrival order was not.
     ///
-    /// Not inside `VectorConfig`, which refuses unknown fields: a build that does not
-    /// know this reads a `CollectionMeta` carrying it and ignores it.
-    #[serde(default)]
+    /// Not inside `VectorConfig`, which refuses unknown fields.
     pub vector_changed: Option<kimmy_core::Stamp>,
     /// The stamp below which an entry targets a **previous incarnation** of
-    /// this collection — set on every creation since ADR-081.
+    /// this collection.
     ///
     /// Collections derive their id from `(db, name)`, so a drop-and-recreate
     /// yields the same id, and replicated entries from the old life still
     /// resolve. `created` alone cannot arbitrate that: a *replicated*
     /// creation records the receiver's clock at apply time (which sits after
     /// the entire catch-up backlog), not the moment the incarnation began.
-    /// The floor is the originating creation stamp instead, and it is
-    /// deliberately absent (`None`) on metas written before ADR-081 — for
-    /// those rows the tombstone comparison remains the only guard, exactly as
-    /// before, because inventing a floor from a local clock would suppress
+    /// The floor is the originating creation stamp instead, and it is `None`
+    /// for a life with no drop before it, where the tombstone comparison is the
+    /// only guard: inventing a floor from a local clock would suppress
     /// legitimate catch-up.
-    #[serde(default)]
     pub incarnation_floor: Option<Hlc>,
     /// Set when a replicated drop met writes stamped after it and the life was
     /// **re-dated** instead of buried: `created` was moved to just after the
@@ -76,9 +68,6 @@ pub struct CollectionMeta {
     ///
     /// Valid only while its `created` is the meta's own: any later change of
     /// `created` leaves a value that no longer matches, and it is ignored.
-    /// Additive like `vector_changed`: a build that does not know it ignores it
-    /// and, rewriting the meta, drops it, which costs a stream open the walk it
-    /// made before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redated: Option<Redated>,
 }
@@ -215,16 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn index_metadata_written_before_enforcement_existed_defaults_to_local() {
-        // The field was added once the cross-node semantics were settled; older
-        // metadata must keep loading, and must not silently claim a stronger
-        // guarantee than it was created with.
-        let json = r#"{"id":0,"name":"email_1","fields":[{"path":"email"}],"unique":true}"#;
-        let index: IndexMeta = serde_json::from_str(json).unwrap();
-        assert_eq!(index.enforcement, Enforcement::Local);
-    }
-
-    #[test]
     fn index_ids_are_derived_from_the_name() {
         // Every node must compute the same id, or a replicated index definition
         // would key entries differently on each of them.
@@ -244,33 +223,6 @@ mod tests {
     fn default_index_names_follow_mongo_convention() {
         let fields = vec![IndexField::ascending("age"), IndexField::descending("name")];
         assert_eq!(IndexMeta::default_name(&fields), "age_1_name_-1");
-    }
-
-    #[test]
-    fn older_metadata_without_new_fields_still_loads() {
-        // Forward compatibility for the M2 vector config: metadata written
-        // before that field existed must still deserialize.
-        let json = r#"{"id":1,"db":"app","name":"orders","created":{"wall_ms":10,"counter":0}}"#;
-        let m: CollectionMeta = serde_json::from_str(json).unwrap();
-        assert!(m.indexes.is_empty());
-        assert!(m.vector.is_none());
-    }
-
-    #[test]
-    fn an_index_written_before_ttl_existed_still_loads() {
-        // The same guarantee one level down, for M9's `expire_after_secs`.
-        // Both formats this crosses are self-describing — JSON here and BSON
-        // in the replicated `IndexCreate` — so an added optional field is
-        // tolerated rather than read as corruption. That is *why* a TTL could
-        // be an index option at all: a new `OpKind` would not have been,
-        // because `op_kind_from_tag` refuses an unknown tag.
-        let json = r#"{"id":1,"db":"app","name":"orders","created":{"wall_ms":10,"counter":0},
-            "indexes":[{"id":7,"name":"age_1","fields":[{"path":"age"}],"unique":false}]}"#;
-        let m: CollectionMeta = serde_json::from_str(json).unwrap();
-        let index = m.index("age_1").expect("the index still loads");
-        assert_eq!(index.expire_after_secs, None);
-        assert!(!index.is_ttl());
-        assert_eq!(index.ttl_path(), None);
     }
 
     #[test]

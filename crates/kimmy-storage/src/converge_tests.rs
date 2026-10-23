@@ -78,7 +78,7 @@ fn converge(into: &Engine, from: &Engine) -> SnapshotApplied {
 }
 
 /// [`converge`] with the sender's horizon stripped from every page: the young-stamp rule is
-/// off for the pull, as it is against a sender that predates the field.
+/// off for the pull, as it is against a sender that has collected nothing.
 fn converge_without_a_horizon(into: &Engine, from: &Engine) -> SnapshotApplied {
     let mut progress =
         SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
@@ -892,11 +892,11 @@ fn a_tombstone_collected_between_the_plan_and_the_page_does_not_let_the_row_back
     assert!(!held_row(&b, 1), "a document this member deleted came back");
 }
 
-/// A sender that predates the horizon sends none. The rule is then off for the pull: nothing is
-/// young and every id this member holds nothing for is `left`, but a strictly newer row still
-/// lands over a held one (the 0.49-shaped sender under Converge, design 6 test 9).
+/// A sender with no horizon (it has collected nothing) sends none. The rule is then off for the
+/// pull: nothing is young and every id this member holds nothing for is `left`, but a strictly
+/// newer row still lands over a held one (design 6 test 9).
 #[test]
-fn a_0_49_shaped_sender_still_has_its_newer_rows_applied_over_held_rows() {
+fn a_sender_with_no_horizon_still_has_its_newer_rows_applied_over_held_rows() {
     let (a, b, _d) = pair();
     a.insert(&coll(&a), doc! { "_id": 1, "v": 1 }).unwrap();
     pull(&b, &a);

@@ -1052,6 +1052,10 @@ access path and every sort order.
 > in different orders. Add an explicit `sort` when the subset matters — this
 > matches MongoDB.
 
+**Binary `_id`s order by length, then subtype, then bytes** (MongoDB's order), for
+`sort: {"_id": 1}`, its reverse `{"_id": -1}` and cursor paging; two binary `_id`s that
+differ only by subtype are two documents ([ADR-251](decisions.md#adr-251--binary-_id-subtypes)).
+
 An unsorted query — or one sorted by `{"_id": 1}`, the order every access path
 already delivers — stops scanning once it has `skip + limit` matches and holds
 only the page: what it skips is counted past, not kept. A sorted query must see

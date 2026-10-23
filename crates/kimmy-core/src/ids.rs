@@ -204,8 +204,13 @@ pub enum DocId {
     ObjectId(bson::oid::ObjectId),
     String(String),
     Int64(i64),
-    Binary(Vec<u8>),
-    Uuid(Uuid),
+    /// A BSON binary with its subtype: `BinData(0, X)` and `BinData(4, X)` are
+    /// two ids. Keyed as `0x60 || len || subtype || bytes`.
+    Binary {
+        subtype: u8,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
     /// A `Decimal128` that is not an integer in `i64` range. An integer one is
     /// [`DocId::Int64`]. Appended last: serde numbers variants by position.
     Decimal128(Decimal128Id),
@@ -231,7 +236,9 @@ impl DocId {
             bson::Bson::String(s) => Ok(Self::String(s.clone())),
             bson::Bson::Int32(i) => Ok(Self::Int64(i64::from(*i))),
             bson::Bson::Int64(i) => Ok(Self::Int64(*i)),
-            bson::Bson::Binary(b) => Ok(Self::Binary(b.bytes.clone())),
+            bson::Bson::Binary(b) => {
+                Ok(Self::Binary { subtype: u8::from(b.subtype), bytes: b.bytes.clone() })
+            }
             bson::Bson::Decimal128(d) => match decimal::decode(d) {
                 Decimal::Zero => Ok(Self::Int64(0)),
                 finite @ Decimal::Finite { .. } => {
@@ -253,13 +260,9 @@ impl DocId {
             Self::ObjectId(oid) => bson::Bson::ObjectId(*oid),
             Self::String(s) => bson::Bson::String(s.clone()),
             Self::Int64(i) => bson::Bson::Int64(*i),
-            Self::Binary(b) => bson::Bson::Binary(bson::Binary {
-                subtype: bson::spec::BinarySubtype::Generic,
-                bytes: b.clone(),
-            }),
-            Self::Uuid(u) => bson::Bson::Binary(bson::Binary {
-                subtype: bson::spec::BinarySubtype::Uuid,
-                bytes: u.as_bytes().to_vec(),
+            Self::Binary { subtype, bytes } => bson::Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::from(*subtype),
+                bytes: bytes.clone(),
             }),
             Self::Decimal128(d) => bson::Bson::Decimal128(d.to_decimal128()),
         }
@@ -272,8 +275,9 @@ impl fmt::Display for DocId {
             Self::ObjectId(oid) => write!(f, "{oid}"),
             Self::String(s) => write!(f, "{s}"),
             Self::Int64(i) => write!(f, "{i}"),
-            Self::Binary(b) => write!(f, "bin({} bytes)", b.len()),
-            Self::Uuid(u) => write!(f, "{u}"),
+            Self::Binary { subtype, bytes } => {
+                write!(f, "bin(subtype {subtype:#04x}, {} bytes)", bytes.len())
+            }
             Self::Decimal128(d) => write!(f, "{d}"),
         }
     }
@@ -672,6 +676,54 @@ mod tests {
         assert_eq!(id("-0.15").to_string(), "-1.5E-1");
         assert_eq!(id("1E+19").to_string(), "1E+19");
         assert_eq!(id("1.50").to_string(), id("1.5").to_string());
+    }
+
+    #[test]
+    fn every_binary_subtype_round_trips_and_keeps_ids_apart() {
+        for subtype in [0x00u8, 0x02, 0x03, 0x04, 0x80, 0xFF] {
+            let id = DocId::Binary { subtype, bytes: vec![1, 2, 3] };
+            let value = id.to_bson();
+            let bson::Bson::Binary(b) = &value else { panic!("a binary: {value:?}") };
+            assert_eq!(u8::from(b.subtype), subtype);
+            assert_eq!(b.bytes, vec![1, 2, 3]);
+            assert_eq!(DocId::try_from_bson(&value).unwrap(), id, "subtype {subtype:#04x}");
+        }
+        let a = DocId::Binary { subtype: 0, bytes: vec![7; 16] };
+        let b = DocId::Binary { subtype: 4, bytes: vec![7; 16] };
+        assert_ne!(a, b);
+        assert_ne!(a.to_bson(), b.to_bson());
+        assert_ne!(
+            crate::keyenc::encode(&a.to_bson()).unwrap(),
+            crate::keyenc::encode(&b.to_bson()).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_binary_id_crosses_as_bson_binary_with_its_subtype() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct W {
+            id: DocId,
+        }
+        let w = W { id: DocId::Binary { subtype: 4, bytes: vec![0xde, 0xad] } };
+        let bytes = bson::serialize_to_vec(&w).unwrap();
+        // { id: { Binary: { subtype: Int32(4), bytes: BinData(0, de ad) } } }
+        let golden: Vec<u8> = vec![
+            0x36, 0, 0, 0, // document length
+            0x03, b'i', b'd', 0, // "id": embedded document
+            0x2d, 0, 0, 0, // length
+            0x03, b'B', b'i', b'n', b'a', b'r', b'y', 0, // "Binary": embedded document
+            0x20, 0, 0, 0, // length
+            0x10, b's', b'u', b'b', b't', b'y', b'p', b'e', 0, 4, 0, 0,
+            0, // subtype: Int32(4)
+            0x05, b'b', b'y', b't', b'e', b's', 0, 2, 0, 0, 0, 0x00, 0xde,
+            0xad, // bytes: BinData(0)
+            0,    // end "Binary"
+            0,    // end "id"
+            0,    // end document
+        ];
+        assert_eq!(bytes, golden);
+        let back: W = bson::deserialize_from_slice(&bytes).unwrap();
+        assert_eq!(back, w);
     }
 
     #[test]

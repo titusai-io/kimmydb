@@ -78,7 +78,7 @@ const WARN_EVERY: Duration = Duration::from_secs(600);
 /// The least time a member that owes the replay must have been gone from the
 /// cluster, continuously, before it is treated as having left (ADR-212): the
 /// dwell is the longer of this and `cluster.catch_up_wait_secs`. A constant,
-/// not a configuration key, so a configuration stays loadable by an older build.
+/// not a configuration key.
 pub const DWELL_FLOOR: Duration = Duration::from_secs(600);
 
 /// Why a member whose marker is set serves as `unknown` (`/readyz`'s
@@ -184,11 +184,10 @@ pub struct Reached {
     pub node: NodeId,
     /// What the peer can serve, from this round's `Vectors` frame.
     pub servable: VersionVector,
-    /// What the peer has processed, from the same frame; `None` from a peer that
-    /// predates the field.
+    /// What the peer has processed, from the same frame; `None` when it gave none.
     pub witnessed: Option<VersionVector>,
-    /// What the peer said about itself; `None` from a peer that has sent no block
-    /// (an older version), which counts.
+    /// What the peer said about itself; `None` from a peer that has sent no block,
+    /// which counts.
     pub facts: Option<Arc<Facts>>,
 }
 
@@ -1570,8 +1569,7 @@ fn read_replay_floor(path: &Path) -> Option<kimmy_core::Hlc> {
 }
 
 /// The floor in `path` and the members its `owed =` lines name (ADR-212), at most
-/// [`MAX_SEEN`] of them. Lines without `=` and unknown keys are skipped, as 0.43
-/// skips the `owed` lines; an `owed` value that does not name a node is skipped
+/// [`MAX_SEEN`] of them. Lines without `=` and unknown keys are skipped; an `owed` value that does not name a node is skipped
 /// with one `WARN` for the file, and never voids the floor. A file that cannot be
 /// read is the lowest floor, with no owed lines.
 fn read_replay_floor_file(path: &Path) -> Option<(kimmy_core::Hlc, Vec<NodeId>)> {
@@ -1643,8 +1641,7 @@ fn write_replay_floor_file(path: &Path, floor: kimmy_core::Hlc) -> std::io::Resu
 }
 
 /// The floor file: the two floor lines first and always, so a file that names
-/// owed members never lacks a floor (0.43 would read such a file as a floor of
-/// zero), then one `owed = <node id>` line per member, sorted, at most
+/// owed members never lacks a floor, then one `owed = <node id>` line per member, sorted, at most
 /// [`MAX_SEEN`].
 fn write_replay_floor_with(
     path: &Path,
@@ -3762,31 +3759,9 @@ mod tests {
         );
     }
 
-    /// A reader of the floor file as 0.43 wrote it: it reads the floor lines and
-    /// skips every other key. Kept here, verbatim from that release, to show a
-    /// rollback reads the file this build writes.
-    fn read_replay_floor_as_0_43(path: &Path) -> Option<kimmy_core::Hlc> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(_) => return Some(kimmy_core::Hlc::ZERO),
-        };
-        let (mut ms, mut counter) = (None, 0u16);
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else { continue };
-            match key.trim() {
-                "floor_ms" => ms = value.trim().parse::<u64>().ok(),
-                "floor_counter" => counter = value.trim().parse::<u16>().unwrap_or(0),
-                _ => {}
-            }
-        }
-        Some(kimmy_core::Hlc::new(ms.unwrap_or(0), if ms.is_some() { counter } else { 0 }))
-    }
-
     /// Every write of the floor file carries the floor lines; the arming
     /// rewrite keeps the owed lines it loaded, drops one that does not parse (with
-    /// a `WARN`), and never lets it void the floor; and 0.43's reader reads the
-    /// same floor from it.
+    /// a `WARN`), and never lets it void the floor.
     #[test]
     fn the_floor_file_always_carries_the_floor_and_the_arming_rewrite_keeps_the_owed_lines() {
         let events = Events::default();
@@ -3815,7 +3790,6 @@ mod tests {
             ],
             "{text}"
         );
-        assert_eq!(read_replay_floor_as_0_43(&path), Some(floor), "0.43 reads the same floor");
         let skipped = events.matching("does not name a node");
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert_eq!(skipped[0].0, tracing::Level::WARN);
@@ -3828,19 +3802,6 @@ mod tests {
         catchup.arm_replay_at(kimmy_core::Hlc::new(2_000, 0), None, Instant::now()).unwrap();
         assert_eq!(catchup.replay_floor(), kimmy_core::Hlc::new(1_000, 3));
         assert!(catchup.owed_members().is_empty());
-    }
-
-    /// The owed lines a tick writes are read by 0.43 as nothing: its reader finds
-    /// the same floor in the file, which does carry them.
-    #[test]
-    fn a_0_43_reader_reads_the_floor_and_ignores_the_owed_lines() {
-        let (f, t0) = restored_armed();
-        judge(&f.catchup, &members_of(&[1, 2]), &[peer_b()], &covering(), t0 + secs(5));
-        let path = f._dir.path().join(REPLAY_FLOOR_FILE);
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains(&format!("owed = {}\n", node(2))), "{text}");
-        assert_eq!(read_replay_floor_as_0_43(&path), Some(kimmy_core::Hlc::new(50, 0)));
-        assert_eq!(read_replay_floor(&path), Some(kimmy_core::Hlc::new(50, 0)));
     }
 
     /// A rewrite of the owed lines from a tick that fails says so, keeps

@@ -188,7 +188,7 @@ async fn the_sync_path_confirms_only_on_an_echo() {
     // The scripted peer answers with the reply it is told to.
     async fn answer(mut stream: tokio::io::DuplexStream, reply: Message) {
         match read_frame(&mut stream).await.unwrap() {
-            Message::AskVersions { witnessed: true, .. } => {}
+            Message::AskVersions { .. } => {}
             other => panic!("{other:?}"),
         }
         write_frame(&mut stream, &reply).await.unwrap();
@@ -261,7 +261,6 @@ async fn an_echo_of_the_previous_process_confirms_nothing_on_either_path() {
     let asking = async {
         open_handshake(&p_engine, &mut ours, SECRET, BINDING).await.unwrap();
         let ask = Message::AskVersions {
-            witnessed: true,
             facts: Some(Arc::new(Facts { boot: vec![0xB; 16], ..Facts::default() })),
             facts_gen: Some(1),
             echo: Some(old.clone()),

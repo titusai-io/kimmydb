@@ -1,6 +1,6 @@
 //! Reading this workspace's production source, for the guards that check it.
 //!
-//! Shared by `supervision.rs`, `walks_leave_the_worker.rs` and `key_inventory.rs`, because all
+//! Shared by `supervision.rs` and `walks_leave_the_worker.rs`, because all
 //! ask the same first question — which lines of a file are production code —
 //! and an answer written twice drifts. The walk it replaced in the second guard
 //! cut each file at its first `#[cfg(test)]`, which in `sessions.rs` sits on a

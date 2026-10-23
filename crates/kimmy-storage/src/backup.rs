@@ -340,6 +340,19 @@ pub fn restore_with(
     {
         return Err(StorageError::UnsupportedFormat { found, expected: build.schema });
     }
+    if let Some(found) = schema
+        && found < build.schema
+    {
+        return Err(StorageError::RefusedStore {
+            kind: crate::error::RefusedKind::Older,
+            why: format!(
+                "the backup was written under storage schema {found} (this build: {}), and \
+                 nothing was restored. {}",
+                build.schema,
+                crate::migrate::no_upgrade()
+            ),
+        });
+    }
 
     // A new file, which no check before it could read (ADR-190).
     #[allow(clippy::disallowed_methods)]

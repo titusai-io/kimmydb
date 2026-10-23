@@ -739,10 +739,9 @@ async fn every_write_tool_reports_the_stamp_it_produced() {
 
 #[tokio::test]
 async fn insert_and_insert_many_echo_the_id_they_stored() {
-    // A binary `_id` keeps its subtype in the echo, where the tools used to
-    // answer every binary as subtype 00, a value `find` does not match; a
-    // generated ObjectId and an integer echo as they always did. Each case's
-    // bytes differ, because a binary is keyed by length and bytes only.
+    // A binary `_id` keeps its subtype in the echo; a generated ObjectId and
+    // an integer echo as they always did. Every subtype of a length holds the
+    // same bytes, so the subtype alone tells the ids apart.
     let server = Server::start().await;
     server.engine.create_collection("app", "one").unwrap();
     server.engine.create_collection("app", "many").unwrap();
@@ -750,7 +749,7 @@ async fn insert_and_insert_many_echo_the_id_they_stored() {
     let mut sent: Vec<(Value, Value)> = Vec::new();
     for subtype in [0x00u8, 0x03, 0x04, 0x80] {
         for len in [16usize, 5] {
-            let bytes = (0..len).map(|i| [subtype, len as u8].get(i).copied().unwrap_or(i as u8));
+            let bytes = (0..len).map(|i| i as u8);
             let id = bson::Bson::Binary(bson::Binary {
                 subtype: subtype.into(),
                 bytes: bytes.collect(),

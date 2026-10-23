@@ -257,13 +257,12 @@ fn every_long_lived_task_is_spawned_through_the_supervisor() {
     }
     assert!(checked > 40, "premise: files with test modules were checked ({checked})");
 
-    // And six regions the second review measured by hand, named so that a
+    // And the regions the second review measured by hand, named so that a
     // regression says which one went dark rather than only that one did. Each
     // sits after a `#[cfg(test)]` that is **not** on a module -- a `const`, a
     // `type`, a test-hook module -- and each was hidden until the walk stopped
     // cutting at a line.
     for (file, production) in [
-        ("kimmy-storage/src/migrate.rs", "fn refuse_unparseable_partial_filters"),
         ("kimmy-vector/src/cache.rs", "impl IndexCache"),
         ("kimmyd/src/logging.rs", "fn hold_instruments"),
         ("kimmy-storage/src/engine.rs", "pub(crate) fn doc_range("),

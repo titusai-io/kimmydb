@@ -1781,30 +1781,14 @@ fn a_definition_the_database_refuses_does_not_wait_on_an_older_lifes_purge() {
     assert!(!holds(&r, "shop", "x"));
 }
 
-/// A creation naming no `created` (a page from a sender before the field) reads
-/// as older than the drop.
-#[test]
-fn a_definition_naming_no_creation_reads_as_older_than_the_drop() {
-    let (a, _b, _da, _db, _late) = the_field_sequence();
-    let (f, _df) = engine();
-    later();
-    f.create_collection("shop", "fresh").unwrap();
-    let mut page = f.snapshot_page(None, None).unwrap();
-    for c in page.collections.iter_mut() {
-        c.created = None;
-    }
-    a.apply_snapshot_page(f.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
-    assert!(!holds(&a, "shop", "fresh"), "a definition with no creation stamp was read as newer");
-}
-
 /// Recording a refusal already held takes no writer (ADR-152).
 #[test]
 fn recording_a_refusal_already_held_takes_no_writer() {
     let (a, _b, _da, _db, _late) = the_field_sequence();
-    a.record_database_refusal("shop", "late", Some(Hlc::new(1, 0))).unwrap();
+    a.record_database_refusal("shop", "late", Hlc::new(1, 0)).unwrap();
     let slot = crate::engine::WriterHolder::Ddl.slot();
     let before = a.writer_hold().count[slot];
-    a.record_database_refusal("shop", "late", Some(Hlc::new(1, 0))).unwrap();
+    a.record_database_refusal("shop", "late", Hlc::new(1, 0)).unwrap();
     assert_eq!(a.writer_hold().count[slot], before, "a held refusal took the writer");
 }
 

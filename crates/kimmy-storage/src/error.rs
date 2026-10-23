@@ -156,7 +156,7 @@ pub enum StorageError {
 /// What kind of refusal a [`StorageError::RefusedStore`] is (ADR-204).
 ///
 /// Only [`RefusedKind::Damaged`] says the store itself is damaged. A store a
-/// newer build wrote is healthy, and telling an operator to wipe it would lose
+/// newer or older build wrote is healthy, and telling an operator to wipe it would lose
 /// it; a refusal for any other reason (an unreadable sidecar, a store that
 /// changed while it was checked, a read that failed) says nothing either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +166,9 @@ pub enum RefusedKind {
     Damaged,
     /// A newer build wrote it: a newer schema, redb or file format.
     Newer,
+    /// An older build wrote it: an older storage schema, which this build does
+    /// not upgrade. The store is healthy and is left as it is.
+    Older,
     /// Neither: the store may be healthy, and this refusal cannot say.
     Other,
 }

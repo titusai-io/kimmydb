@@ -483,12 +483,9 @@ async fn a_peer_that_never_proves_itself_learns_nothing() {
 
     let mut stream = TcpStream::connect(a.addr).await.unwrap();
     // Skip the handshake entirely and ask straight out.
-    write_frame(
-        &mut stream,
-        &Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
-    )
-    .await
-    .unwrap();
+    write_frame(&mut stream, &Message::AskVersions { facts: None, facts_gen: None, echo: None })
+        .await
+        .unwrap();
 
     let response = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await;
     match response {
@@ -3513,6 +3510,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
                         node: origin,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
+                        protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                     };
                     if write_frame(&mut stream, &welcome).await.is_err() {
                         return;
@@ -4517,7 +4515,7 @@ async fn a_pushed_drop_older_than_the_holders_index_is_reported_as_declined() {
 
     // The window carries B's collection creation and its drop, two changes:
     // only the declined stamp on the wire lets the drop be named refused
-    // rather than unattributable (ADR-191).
+    // rather than the whole window (ADR-191).
     let (resolution, windows) = confirm(&b, &a, &entry).await;
     assert_eq!(resolution, kimmy_cluster::Resolution::Refused, "{windows:?}");
     assert_eq!(windows.len(), 1, "{windows:?}");
@@ -7396,6 +7394,7 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
                     node: origin,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
+                    protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                 };
                 if write_frame(&mut stream, &welcome).await.is_err() {
                     return;
@@ -7514,6 +7513,7 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
                     node: origin,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
+                    protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                 };
                 if write_frame(&mut stream, &welcome).await.is_err() {
                     return;
@@ -7631,6 +7631,7 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
                     node: origin,
                     nonce: vec![7; 32],
                     proof: prove(SECRET, &nonce, &binding),
+                    protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                 };
                 if write_frame(&mut stream, &welcome).await.is_err() {
                     return;
@@ -8035,6 +8036,7 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
                         node: origin,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
+                        protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                     };
                     if write_frame(&mut stream, &welcome).await.is_err() {
                         return;
@@ -8200,6 +8202,7 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
                         node: origin,
                         nonce: vec![7; 32],
                         proof: prove(SECRET, &nonce, &binding),
+                        protocol: Some(kimmy_cluster::protocol::PROTOCOL),
                     };
                     if write_frame(&mut stream, &welcome).await.is_err() {
                         return;
@@ -10576,12 +10579,13 @@ async fn a_definition_repair_does_not_move_the_count_halfs_repair_rounds() {
 }
 
 // ---------------------------------------------------------------------------
-// Decimal128 design 7.1: keys on the wire are legacy, through the real exchange
+// Two large integer ids, deleted and repaired by key, through the real exchange
 // ---------------------------------------------------------------------------
 
-/// The id whose stored (schema-5) key is the schema-4 key of [`A2_B`] (design 6.1).
+/// One of a pair of large integer ids, adjacent among the test's ids, so that a
+/// repair or a page boundary that mistook one for the other would show.
 const A2_A: i64 = 0x5000_0081_0180_0000;
-/// The id whose schema-4 key is the stored key of [`A2_A`].
+/// The other of the pair.
 const A2_B: i64 = 0x5000_7F80_8101_8000;
 
 fn held_live(node: &Node, id: i64) -> bool {
@@ -10592,7 +10596,7 @@ fn held_live(node: &Node, id: i64) -> bool {
 /// A delete B lost (witnessed, not applied) of the A2 pair's second id, in a collection that
 /// holds both, beside an insert it lost too, so the counts agree and only the digest sees it.
 /// The document repair's page carries the delete by key: it lands on `A2_B` and never on
-/// `A2_A`, whose stored key is the carried one's schema-4 bytes.
+/// `A2_A`.
 #[tokio::test]
 async fn a_lost_delete_of_the_a2_pair_is_repaired_onto_its_own_document() {
     use kimmy_cluster::Judgement;

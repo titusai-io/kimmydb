@@ -30,12 +30,10 @@
 //!
 //! **Resume.** Only if both marks are absent (so the first commit of a walk
 //! ran), the cursor's build, schema and digest format are this build's, and it
-//! was left by a cooperative stop. Both marks absent also shows that no older
-//! build has served since the walk began: an older build that completed an
-//! open restored the counts' mark (`live_count`'s rebuild), and one that did
-//! not changed no document record at open (B3 design 8.9). Anything else
-//! discards the cursor and walks from the start, so a crash mid-walk costs a
-//! restart, as the design accepts.
+//! was left by a cooperative stop. Both marks absent also shows that no open
+//! has completed since the walk began: one that did restored the counts' mark
+//! (`live_count`'s rebuild). Anything else discards the cursor and walks from
+//! the start, so a crash mid-walk costs a restart, as the design accepts.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -340,9 +338,7 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
                         if live {
                             *counts.entry(collection).or_default() += 1;
                         }
-                        // The legacy form, as every fold site hashes (`live_digest`).
-                        let key = kimmy_core::keyenc::legacy_of_stored(doc_key);
-                        live_digest::fold_walked(&mut digests, collection, &key, &stamp, live);
+                        live_digest::fold_walked(&mut digests, collection, doc_key, &stamp, live);
                     }
                     // Not counted, as no reader can return it either; refusing
                     // to open over one unreadable record would be worse than a
@@ -870,70 +866,6 @@ mod tests {
             assert!(!resumed, "a cursor with another {tamper} was resumed");
             assert_counts_exact(&engine, "a walk that discarded the cursor");
         }
-    }
-
-    #[test]
-    fn a_stopped_walk_then_an_older_build_that_completed_its_open_restarts_from_zero() {
-        for forced in [true, false] {
-            a_stopped_walk_then_an_older_build(forced);
-        }
-    }
-
-    /// `forced`: the start decided the rebuild, so it deletes the stale cursor
-    /// as its first write; not forced, the walk's own resume rule must refuse
-    /// a cursor with a mark beside it.
-    fn a_stopped_walk_then_an_older_build(forced: bool) {
-        // Rollback-gate row 3, at the store: stop a forced walk mid-chunk, an
-        // older build starts to ready (its open rebuilt the counts and wrote
-        // their mark; it knows nothing of the digests), stops, and this build
-        // starts again. Both marks are no longer absent, so the walk restarts.
-        let (_dir, path) = a_store();
-        lose_the_marks(&path);
-        test_hooks::chunked_by(4, || {
-            test_hooks::stop_after_rows(6);
-            assert!(stopped(Engine::open_with(
-                &path,
-                &OpenOptions::new().force_rebuild("the previous run cannot be shown")
-            )));
-            test_hooks::clear_stop();
-        });
-        {
-            let db = Database::open(&path).unwrap();
-            let txn = db.begin_write().unwrap();
-            let mark = {
-                let arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
-                let oplog = txn.open_table(tables::OPLOG).unwrap();
-                mark_of(&arrival, &oplog).unwrap()
-            };
-            // What 0.47.2's rebuild leaves: exact counts, and their mark.
-            let mut counts: std::collections::BTreeMap<u64, u64> = Default::default();
-            for row in txn.open_table(tables::DOCS).unwrap().iter().unwrap() {
-                let (key, value) = row.unwrap();
-                if codec::doc_record_is_live(value.value()).unwrap() {
-                    *counts.entry(key.value().0).or_default() += 1;
-                }
-            }
-            {
-                let mut table = txn.open_table(tables::LIVE_COUNTS).unwrap();
-                table.retain(|_, _| false).unwrap();
-                for (id, n) in counts {
-                    table.insert(id, n).unwrap();
-                }
-            }
-            crate::live_count::mark_through(&txn, &mark).unwrap();
-            txn.commit().unwrap();
-        }
-        assert_eq!(marks_present(&path), (true, false));
-        test_hooks::chunked_by(4, || {
-            let options = match forced {
-                true => OpenOptions::new().force_rebuild("the previous run cannot be shown"),
-                false => OpenOptions::new(),
-            };
-            let engine = Engine::open_with(&path, &options).unwrap();
-            let (resumed, _, _) = test_hooks::last().unwrap();
-            assert!(!resumed, "the cursor was resumed over rows an older build may have changed");
-            assert_counts_exact(&engine, "a walk restarted after an older build");
-        });
     }
 
     #[test]

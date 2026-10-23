@@ -10,12 +10,9 @@
 //! [`Members`](crate::membership::Members) keeps what it hears, so the
 //! candidate set can be filtered by it.
 //!
-//! **Compatibility is argued from the codec.** A [`crate::protocol::Message`]
-//! is a length-prefixed BSON document and a decoder ignores keys it does not
-//! know, so an older build reads a reply carrying `facts` and drops the key, and
-//! a build that reads a reply without it sees `None`. Every field carries
-//! `serde(default)`, so a block from a build with fewer fields decodes. An
-//! absent block is *unknown*, never a fault.
+//! **The block is advice, so it is read leniently.** Every field carries
+//! `serde(default)`, so a partial block decodes, and a block that does not decode
+//! is no block (see [`lenient`]). An absent block is *unknown*, never a fault.
 //!
 //! **Digests and ids go on the wire as `Binary` or as a collection id**, never
 //! as a `u64`: BSON refuses an integer above `i64::MAX`, and a hash is uniformly
@@ -108,8 +105,7 @@ impl OwnerClass {
 }
 
 /// Which classes this member has stopped owning because it cannot do them.
-/// Honoured by a reader since 0.43.0 and set by the evaluator since 0.44.0
-/// (ADR-213); the **effective** bits, which a member acts on itself, are these
+/// Set by the evaluator (ADR-213); the **effective** bits, which a member acts on itself, are these
 /// masked by what every live peer has echoed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Yielding {
@@ -166,7 +162,7 @@ pub struct Facts {
     #[serde(default)]
     pub catching_up: bool,
     /// Why, when `catching_up`: the mutual clear needs every reached peer to be
-    /// `seeded_empty`. Absent from a build that predates the field.
+    /// `seeded_empty`.
     #[serde(default)]
     pub catching_up_reason: Option<CatchUpReason>,
     #[serde(default)]
@@ -184,8 +180,8 @@ pub struct Facts {
     pub ttl: Vec<TtlHeld>,
     #[serde(default)]
     pub ttl_truncated: bool,
-    /// How each class of owned work stands on this member (ADR-213). Absent from
-    /// a 0.43 sender, which reads as *not a target*; a key that is missing, or a
+    /// How each class of owned work stands on this member (ADR-213). `None` reads
+    /// as *not a target*; a key that is missing, or a
     /// value that is not one of the four names, reads `Unknown` for that class,
     /// never `Idle`.
     #[serde(
@@ -209,8 +205,8 @@ pub struct Facts {
     pub responsive: Option<bool>,
     /// The member's writer has been held past `yielding::WRITER_WEDGE` by a hold
     /// that is bounded by nature (ADR-220): it can do no write, and no peer may
-    /// hand it work, whatever its classes own. Absent from a 0.44.0 sender, and
-    /// anything but a bool reads as `None`, which is *not known*, never `false`
+    /// hand it work, whatever its classes own. Anything but a bool
+    /// reads as `None`, which is *not known*, never `false`
     /// for a decision that needs a positive.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_bool")]
     pub writer_wedged: Option<bool>,
@@ -219,14 +215,6 @@ pub struct Facts {
     /// one member by the sender's own clock (ADR-213).
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_millis")]
     pub started_ms: Option<u64>,
-    /// The vector chunk-id format this member writes ([`kimmy_core::CHUNK_ID_FORMAT`],
-    /// ADR-239): `2` from 0.51.0. Absent from an older sender, which writes the
-    /// `_id`'s display text; what tells a member that every live peer has
-    /// finished the roll to the injective chunk ids, and so when what an older
-    /// one wrote during it must be judged again. Anything but a non-negative
-    /// integer reads as `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_millis")]
-    pub vector_chunk_ids: Option<u64>,
 }
 
 /// One value per class of owned work.
@@ -662,7 +650,7 @@ pub enum PeerState {
     IneligibleCatchingUp,
     /// A block that yields at least one class.
     IneligibleYielding,
-    /// The peer has never sent a block: an older version, or one not yet heard.
+    /// The peer has never sent a block, or one has not been heard yet.
     Unknown,
     /// A block past its lease with no fresh one. It keeps saying what it last
     /// said: not hearing from a member is not evidence that it recovered.
@@ -741,7 +729,7 @@ pub(crate) fn may_own(
 /// round for a field that is only advice.
 ///
 /// **It is counted and said**, or a peer whose blocks never decode would look
-/// exactly like an older peer that sends none: the count is
+/// exactly like a peer that sends none: the count is
 /// [`facts_undecodable_total`], and the read that decoded the frame reports it
 /// (`protocol::read_frame_noting_facts`), which is the only place that knows
 /// which peer sent it.
@@ -953,10 +941,10 @@ mod tests {
         assert_eq!(back.ttl[0].collection, CollectionId(5), "in collection-id order");
     }
 
-    /// A block from a build with fewer fields decodes, each absent field at its
-    /// default, and an empty document is the default block.
+    /// A partial block decodes, each absent field at its default, and an empty
+    /// document is the default block.
     #[test]
-    fn a_block_with_fewer_fields_decodes() {
+    fn a_partial_block_decodes() {
         let older = bson::doc! { "catching_up": true };
         let back: Facts =
             bson::deserialize_from_slice(&bson::serialize_to_vec(&older).unwrap()).unwrap();
@@ -1384,47 +1372,5 @@ mod tests {
         assert!(!members.note_undecodable(node(1), t0 + Duration::from_secs(10)));
         assert!(members.note_undecodable(node(2), t0), "another peer");
         assert!(members.note_undecodable(node(1), t0 + crate::health::WARN_INTERVAL));
-    }
-
-    /// Whether every live peer writes 0.51.0's vector chunk ids (ADR-239): no
-    /// while one's block says otherwise (an older build sends no field), not
-    /// known while one is unheard and none says otherwise, yes once every one
-    /// says so. A peer that leaves stops counting.
-    #[test]
-    fn every_live_peer_writing_this_builds_chunk_ids_is_read_from_their_blocks() {
-        let members = cluster(&[1, 2]);
-        let current = || Facts { vector_chunk_ids: Some(kimmy_core::CHUNK_ID_FORMAT), ..block() };
-        assert_eq!(members.chunk_ids_everywhere(), None, "nobody heard");
-        hear(&members, 1, current());
-        assert_eq!(members.chunk_ids_everywhere(), None, "peer 2 unheard");
-        hear(&members, 2, block());
-        assert_eq!(members.chunk_ids_everywhere(), Some(false), "peer 2 is an older build");
-        hear(&members, 2, Facts { vector_chunk_ids: Some(1), ..block() });
-        assert_eq!(members.chunk_ids_everywhere(), Some(false));
-        hear(&members, 2, current());
-        assert_eq!(members.chunk_ids_everywhere(), Some(true));
-        members.remove_for_test(&addr(2));
-        members.insert_for_test(addr(3), node(3));
-        hear(&members, 3, block());
-        assert_eq!(members.chunk_ids_everywhere(), Some(false));
-        members.remove_for_test(&addr(3));
-        assert_eq!(members.chunk_ids_everywhere(), Some(true), "the older one left");
-        assert_eq!(cluster(&[]).chunk_ids_everywhere(), Some(true), "alone");
-    }
-
-    /// The field is additive: absent from an older sender and from a block
-    /// that does not set it, and anything but a non-negative integer reads as
-    /// absent, never as a failure of the block.
-    #[test]
-    fn the_chunk_id_format_decodes_leniently() {
-        let mine = Facts { vector_chunk_ids: Some(2), ..block() };
-        let doc = bson::serialize_to_document(&mine).unwrap();
-        assert_eq!(doc.get_i64("vector_chunk_ids").ok(), Some(2));
-        assert_eq!(bson::deserialize_from_document::<Facts>(doc).unwrap(), mine);
-        let older = bson::serialize_to_document(&block()).unwrap();
-        assert!(!older.contains_key("vector_chunk_ids"), "not sent when unset");
-        let mut odd = older.clone();
-        odd.insert("vector_chunk_ids", "two");
-        assert_eq!(bson::deserialize_from_document::<Facts>(odd).unwrap().vector_chunk_ids, None);
     }
 }

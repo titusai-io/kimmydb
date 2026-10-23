@@ -1420,13 +1420,6 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
-            "kimmy.ddl.confirmations.unattributable",
-            "{confirmation}",
-            "Schema-change confirmations on a member that ended unattributable.",
-            |s| s.ddl_confirmations[ConfirmOutcome::Unattributable.slot()]
-        );
-        observe!(
-            u64_observable_counter,
             "kimmy.ddl.confirmations.cancelled",
             "{confirmation}",
             "Schema-change confirmations on a member that ended cancelled.",

@@ -971,15 +971,6 @@ fn the_documented_manifest_probes_healthz_to_start_and_readyz_to_serve() {
          OrderedReady would hold every other pod down behind it"
     );
     assert!(OPERATIONS.contains("publishNotReadyAddresses: true"));
-
-    // And the guide quotes the code's migration rate as its own number, so the
-    // prose cannot drift from it. As a whole token: a bare `contains` would
-    // accept "18 us per" as a match for 8, which hides a drift.
-    let quoted = format!("{} us per", kimmy_storage::migrate::MICROS_PER_DOCUMENT);
-    let quoted_as_a_token = OPERATIONS.match_indices(&quoted).any(|(i, _)| {
-        i == 0 || !OPERATIONS[..i].chars().next_back().is_some_and(|c| c.is_ascii_digit())
-    });
-    assert!(quoted_as_a_token, "the guide does not quote the code's {quoted:?} as its own number");
 }
 
 /// Every Markdown file under the repository root, relative to it, outside

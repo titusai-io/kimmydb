@@ -260,21 +260,6 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("revc_break_tests::rows_of", "test code reading a store of a few dozen rows it wrote itself"),
     (
-        "migrate_v5_tests::assert_i_docs",
-        "test code reading a store of a few hundred rows it wrote itself",
-    ),
-    ("migrate_v5_tests::docs_of", "test code reading a store it wrote itself"),
-    ("migrate_v5_tests::entries_of", "test code reading a store it wrote itself"),
-    ("migrate_v5_tests::metas_of", "test code reading a store it wrote itself"),
-    ("migrate_v5_tests::phases", "test code reading a store it wrote itself"),
-    (
-        "migrate_v5_tests::progress_advances_with_every_chunk_in_every_phase",
-        "test code reading a store it wrote itself",
-    ),
-    ("migrate_v5_tests::rewind_keys_to_v1", "test code rewriting a store it wrote itself"),
-    ("migrate_v5_tests::rows", "test code reading a store it wrote itself"),
-    ("migrate_v5_tests::to_schema_4", "test code rewriting a store it wrote itself"),
-    (
         "young_stamp_model_tests::held_events",
         "test code reading a store of a few dozen rows it wrote itself",
     ),
@@ -287,110 +272,16 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "test code reading a store of a few dozen rows it wrote itself",
     ),
     (
-        "mixed_roll_tests::count_rows",
-        "test code reading a store of a few hundred rows it wrote itself",
-    ),
-    (
-        "mixed_roll_tests::digests",
-        "test code reading the catalogue of a store of a few collections it wrote itself",
-    ),
-    (
-        "mixed_roll_tests::records",
-        "test code reading a store of a few hundred rows it wrote itself",
-    ),
-    ("mixed_roll_tests::rows", "test code reading a store of a few hundred rows it wrote itself"),
-    (
         "index::clear_index_entries_upto",
         "walks the walk table its caller opened, so its caller's WalkStop decides: in_write \
          for a drop, a rebuild or a migration, which close_writes bounds (ADR-192), and the \
          build's own for a superseded definition's clear, which stops with the build",
     ),
-    ("index::partial_filters_holding_an_array", "at open, a migration's check of the registry"),
     (
         "live_walk::run",
         "at open, before the node serves: chunked, each chunk committed, and it looks for the \
          stop itself every 256 rows and at each chunk boundary, ending at the cursor it \
          committed (B3 design 5)",
-    ),
-    ("migrate::derive_collection_ids", "a migration, at open, before the node serves"),
-    (
-        "migrate::make_schema_4_for_test",
-        "test support, built only with test-hooks: rewrites a closed store on purpose",
-    ),
-    ("migrate::derive_index_ids", "a migration, at open, before the node serves"),
-    ("migrate::move_documents", "a migration, at open, before the node serves"),
-    ("migrate::move_index_entries", "a migration, at open, before the node serves"),
-    ("migrate::move_index_ids", "a migration, at open, before the node serves"),
-    ("migrate::refuse_unparseable_partial_filters", "a migration, at open, before the node serves"),
-    ("migrate::rewrite_oplog", "a migration, at open, before the node serves"),
-    (
-        "migrate_v5::begin",
-        "the schema 5 migration's first commit, at open, before the node serves: the registry, \
-         and one seek per collection-id range",
-    ),
-    (
-        "migrate_v5::carry_partial_rebuilt_violations",
-        "the schema 3 -> 4 rebuild's pending collisions, one row per index, in the first commit",
-    ),
-    (
-        "migrate_v5::finish",
-        "the schema 5 migration's last commit, at open: its markers, one row per range and index",
-    ),
-    (
-        "migrate_v5::entries_left",
-        "one index's entries, keys only, once before its drain, at open, before the node \
-         serves; it looks for the stop every 4,096 entries itself",
-    ),
-    ("migrate_v5::has_numeric", "one seek: whether a range holds a numeric key"),
-    (
-        "migrate_v5::index_bytes_upto",
-        "the preflight, at open, before the node serves: index entries up to one chunk's bytes \
-         (16 MiB), then it ends",
-    ),
-    (
-        "migrate_v5::move_back_chunk",
-        "one chunk of a range's staged rows, at open, before the node serves; the stop is looked \
-         for between two chunks",
-    ),
-    (
-        "migrate_v5::plan",
-        "at open, before the node serves: the registry, and one seek per collection-id range",
-    ),
-    ("migrate_v5::range_ids", "one seek per collection-id range: no row is read twice"),
-    (
-        "migrate_v5::recorded_collisions",
-        "at open, before the node serves: the recorded collisions and the registry",
-    ),
-    (
-        "migrate_v5::refill",
-        "one chunk of a collection's documents, at open, before the node serves; the stop is \
-         looked for between two chunks, inside an index",
-    ),
-    (
-        "migrate_v5::rekey_chunk",
-        "one chunk of a range's old-form rows, at open, before the node serves; the stop is \
-         looked for between two chunks",
-    ),
-    (
-        "migrate_v5::run",
-        "the schema 5 migration's markers and the registry, at open: one row per range, \
-         collection and index",
-    ),
-    (
-        "migrate_v5::settle_carried",
-        "the schema 5 migration's last commit, at open: the recorded collisions, the registry \
-         and one document per carried holder",
-    ),
-    (
-        "migrate_v5::staged",
-        "the preflight's one read of the documents, at open, before the node serves and before \
-         anything is written; it looks for the stop every 4,096 rows itself",
-    ),
-    ("migrate_v5::staged_is_empty", "one seek: whether a range has staged rows"),
-    (
-        "migrate_v5::ttl_selection_changes",
-        "one TTL partial index's collection, once, at open, before the node serves; it looks \
-         for the stop every 4,096 rows itself",
     ),
     (
         "modify::scan_until",
@@ -484,10 +375,6 @@ const IN_WRITE_SITES: &[&str] = &[
     "index::scan_range_in_write",
     // An index drop's removal of its entries, in the drop's write.
     "index::Engine::drop_index_inner",
-    // Migrations at open, each in its own write.
-    "migrate::move_index_entries",
-    "migrate_v5::drain",
-    "migrate_v5::refill",
 ];
 
 /// Loops that do not iterate a table, each of which must call `check_walk(`,

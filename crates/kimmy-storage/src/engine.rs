@@ -1344,7 +1344,7 @@ impl Engine {
         // not after it. The check before the open already refused every store
         // it could read; this makes the order structural, and it is what stops
         // a dirty store with no sidecar that a newer redb wrote.
-        crate::migrate::refuse_newer(&db, path, &cleared.build)?;
+        crate::migrate::refuse_other_schema(&db, path, &cleared.build)?;
 
         // Ensure every table exists up front so that read transactions never
         // have to handle a missing table.
@@ -1391,10 +1391,9 @@ impl Engine {
         }
         txn.commit()?;
 
-        // Before anything reads a collection id: schema 1 allocated them from a
-        // counter, schema 2 derives them from the name.
+        // A fresh store is stamped with this build's schema.
         let build = cleared.build.clone();
-        let unreported = crate::migrate::run(&db, path, &|schema| {
+        crate::migrate::run(&db, path, &|schema| {
             crate::format::raise_schema(path, schema, &build)
         })?;
         // The redb that last opened this store for writing, in the store too,
@@ -1411,20 +1410,6 @@ impl Engine {
         Self::rebuild_arrival_index_if_stale(&db)?;
         Self::verify_version_vector_at_open(&db)?;
         Self::seed_collected_if_untracked(&db)?;
-        // A filter created with a generic `Binary` before ADR-182 was stored
-        // as an array, and nothing records which arrays those were, so every
-        // array is named -- each open, since an operator who never restarts
-        // after upgrading would otherwise never be told.
-        for (db_name, collection, index) in crate::index::partial_filters_holding_an_array(&db)? {
-            info!(
-                db = %db_name,
-                collection = %collection,
-                index = %index,
-                "this partial index's filter holds an array, which may have been converted from \
-                 a generic Binary by a build before ADR-182; if it was created with a Binary \
-                 value, drop and recreate it. An array the client wrote is left as it is"
-            );
-        }
         // After the arrival index, whose end the counts' mark is compared
         // against: a repaired index appends positions, and the counts are
         // rebuilt with it (ADR-174). One walk rebuilds the counts and the
@@ -1542,19 +1527,6 @@ impl Engine {
         // long as the drop had left, and a restart part-way through a large
         // purge is exactly when a node is most wanted back.
         engine.announce_owed_purges()?;
-
-        // The collisions a migration's rebuild of a unique partial index found
-        // (ADR-183), reported as a replicated build's are, now that there is
-        // an engine to count them and log their entries.
-        for (meta, violations) in &unreported {
-            engine.report_index_backfill_violations(meta, violations)?;
-        }
-        // Only now, once every one of them was reported: they are held in the
-        // store precisely so that a crash before this point does not lose them,
-        // so deleting them any earlier would defeat that. Whatever was reported,
-        // even nothing: rows whose collection or index is gone are not reported,
-        // and would otherwise keep the table for good.
-        crate::migrate::forget_reported_violations(engine.db())?;
 
         // Whether the violations table is complete: after the reports above, so
         // the tail it is compared with includes them (ADR-200).
@@ -2977,8 +2949,7 @@ impl Engine {
     /// cannot be served a contiguous one: the entries between are not here. One
     /// maximum per origin, so it is conservative: a peer behind this node's own
     /// prefix of the origin is refused too, though the prefix could be served.
-    /// Empty on a node that never took a whole-database snapshot, and for a
-    /// snapshot taken by a build before 0.46.0, which did not record it.
+    /// Empty on a node that never took a whole-database snapshot.
     pub fn state_held(&self) -> Result<kimmy_core::VersionVector> {
         let txn = self.db.begin_read()?;
         Self::state_held_in(&txn)
@@ -4459,9 +4430,11 @@ impl Engine {
             // creation from elsewhere that the database's drop covers is
             // history, by one comparison of the origin's `Hlc` against the
             // drop's, on every route. A local creation always mints after
-            // what this node has seen, so it stands; a creation naming no
-            // `created` (a page from a sender before the field) reads as older.
-            if !log && self.database_refusal(db, origin)?.is_some() {
+            // what this node has seen, so it stands.
+            if !log
+                && let Some(created) = origin
+                && self.database_refusal(db, created)?.is_some()
+            {
                 return Ok(InTxn::History);
             }
             let database_dropped = self.database_dropped_at(db)?;
@@ -4476,18 +4449,16 @@ impl Engine {
             // drop, and created here it stood parentless (ADR-138). Judged
             // under the writer for the reason `history` is. Only under a
             // tombstone: a parent absent with none has not arrived yet, and the
-            // shadow is created. A creation naming no `created` of its own (a
-            // page from a sender before the field) under such a tombstone reads
-            // as the older one, as `restore_collection` reads that page's
-            // collection.
+            // shadow is created.
             if !log
+                && let Some(created) = origin
                 && let Some(base) = kimmy_core::vector_meta::base_name(name)
                 && collections.get((db, base))?.is_none()
             {
                 let tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
                 if let Some(raw) = tombstones.get(CollectionId::derive(db, base).0)? {
                     let buried = codec::decode_oplog_key(raw.value())?;
-                    if origin.is_none_or(|created| created <= buried.hlc) {
+                    if created <= buried.hlc {
                         return Ok(InTxn::History);
                     }
                 }
@@ -6173,12 +6144,11 @@ mod tests {
         // Where a commit happens before or outside an open `Engine`, and so
         // cannot be counted by one. Each is a whole-file exemption because each
         // file's entire job is one of these.
-        const NO_ENGINE_YET: [&str; 5] = [
-            "migrate.rs",    // runs on the raw database during `Engine::open`
-            "migrate_v5.rs", // the schema 5 migration, likewise, a chunk per commit
-            "live_walk.rs",  // the open's rebuild of the counts and digests, in chunks
-            "backup.rs",     // restores into a fresh file that no engine has opened
-            "engine.rs",     // `Engine::open` itself, plus the chokepoint
+        const NO_ENGINE_YET: [&str; 4] = [
+            "migrate.rs",   // runs on the raw database during `Engine::open`
+            "live_walk.rs", // the open's rebuild of the counts and digests, in chunks
+            "backup.rs",    // restores into a fresh file that no engine has opened
+            "engine.rs",    // `Engine::open` itself, plus the chokepoint
         ];
 
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -8284,64 +8254,6 @@ mod tests {
             .await
             .unwrap();
         assert!(written.is_ok(), "{written:?}");
-    }
-}
-
-/// The line every open logs for each partial index whose filter holds an
-/// array (ADR-182).
-///
-/// It is the whole remedy ADR-182 offers for a filter an earlier build
-/// converted, whose original cannot be recovered, so its emission is held
-/// here, and not only the query behind it. That query has its own test, which
-/// calls it directly and would not notice the line going: with the loop
-/// removed from `Engine::open`, every other test in the workspace passes.
-#[cfg(test)]
-mod converted_filters_line {
-    use bson::doc;
-
-    use super::Engine;
-    use crate::log_capture::logs_of;
-    use crate::meta::{Enforcement, IndexField};
-
-    #[test]
-    fn every_open_names_each_partial_index_whose_filter_holds_an_array() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        {
-            let engine = Engine::open(&path).unwrap();
-            engine.create_collection("shop", "t").unwrap();
-            for (name, filter) in
-                [("equals_an_array", doc! {"k": [1, 2]}), ("scalar_only", doc! {"k": 5})]
-            {
-                engine
-                    .create_index_with(
-                        "shop",
-                        "t",
-                        vec![IndexField::ascending(name)],
-                        false,
-                        Enforcement::Local,
-                        Some(name.into()),
-                        None,
-                        Some(filter),
-                    )
-                    .unwrap();
-            }
-        }
-        // Every open, not only the first after the upgrade: an operator who
-        // never restarts would otherwise never be told.
-        for open in ["first", "second"] {
-            let logs = logs_of(|| drop(Engine::open(&path).unwrap()));
-            let named: Vec<&str> = logs
-                .lines()
-                .filter(|l| l.contains("may have been converted from a generic Binary"))
-                .collect();
-            assert_eq!(named.len(), 1, "{open} open: one line, for the one such index:\n{logs}");
-            assert!(
-                named[0].contains("index=equals_an_array") && named[0].contains("collection=t"),
-                "the line names the index and its collection: {}",
-                named[0]
-            );
-        }
     }
 }
 

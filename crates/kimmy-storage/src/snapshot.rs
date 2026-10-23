@@ -94,33 +94,9 @@
 //! walked, so the first page's vector never claims a document the snapshot
 //! did not carry; whatever the sender wrote after it is above that vector and
 //! the next round pulls it from the oplog, which is where it still is.
-//!
-//! # Keys on a page are legacy
-//!
-//! A page carries document keys in two places: a carried delete's
-//! [`SnapshotTombstone::key`] and the cursor, [`SnapshotCursor::after_key`].
-//! Schema 5 changed the stored bytes of every number key, and in a mixed roll
-//! the other end may be a 0.50 member, which stores, sends and reads schema-4
-//! keys. So both are the frozen schema-4 form on the wire (Decimal128 design
-//! 7.1; `kimmy_core::legacy_key`), and the conversions live here, at the
-//! engine's wire API and nowhere else: [`Engine::snapshot_page`] converts the
-//! request's cursor to the stored form on entry and every key to the legacy form
-//! on exit, and [`Engine::apply_snapshot_page`] converts every carried delete's
-//! key to the stored form as its first act, before the policy dispatch, so the
-//! `All`, `Converge` and `Definitions` paths only ever see stored keys
-//! (`CarriedDelete`). A page's `next` is **not** converted by a receiver: it
-//! is stored as received and sent back, and only a sender uses a cursor as a
-//! bound. The transport passes frames through unchanged, so every caller, the
-//! model tests included, exercises these conversions.
-//!
-//! Left unconverted, the receiver's point read of a received schema-4 key in a
-//! schema-5 `DOCS` can find **another** document: the schema-5 key of id
-//! `0x5000008101800000` is byte for byte the schema-4 key of `0x50007F8081018000`
-//! (design 6.1), so a delete of the second would land on the first.
 
 use std::fmt;
 
-use kimmy_core::keyenc;
 use kimmy_core::{
     CollectionId, DocId, Hlc, IndexMeta, NodeId, OpKind, OplogEntry, Stamp, VectorConfig,
     VersionVector,
@@ -188,8 +164,8 @@ pub(crate) const CURSOR_OVERHEAD: usize = 256;
 /// The bytes `n` bytes cross in when serde writes them as a sequence, which it
 /// does for a `Vec<u8>` without `serde_bytes`: a BSON array of `int32`s, each an
 /// element of a type byte, its decimal index as a C string and four bytes, about
-/// ten bytes a byte. So cross a `DocId::Binary` and a cursor's key
-/// ([`SnapshotCursor::after_key`]); the wire is left as it is.
+/// ten bytes a byte. So crosses a cursor's key ([`SnapshotCursor::after_key`]);
+/// the wire is left as it is.
 pub(crate) fn byte_array_wire_len(n: usize) -> usize {
     // The array's length and its terminator, and each element's type byte, the
     // index's terminator and the int32.
@@ -206,12 +182,12 @@ pub(crate) fn byte_array_wire_len(n: usize) -> usize {
 }
 
 /// What a document's `_id` costs on a page as it crosses, a bound: a binary one
-/// is an array of `int32`s ([`byte_array_wire_len`]), a string its bytes and
-/// their length and terminator, every other kind at most 32 bytes. The variant's
+/// is its bytes and at most 32 more for the subtype and framing, a string its
+/// bytes and their length and terminator, every other kind at most 32 bytes. The variant's
 /// name and framing are in [`DOCUMENT_OVERHEAD`].
 pub(crate) fn id_wire_len(id: &DocId) -> usize {
     match id {
-        DocId::Binary(bytes) => byte_array_wire_len(bytes.len()),
+        DocId::Binary { bytes, .. } => bytes.len() + 32,
         DocId::String(text) => text.len() + 5,
         _ => 32,
     }
@@ -227,11 +203,14 @@ const ID_NAME_PREFIX: usize = 24;
 /// gives the same name.
 pub(crate) fn id_name(id: &DocId) -> String {
     match id {
-        DocId::Binary(bytes) => {
+        DocId::Binary { subtype, bytes } => {
             let shown = &bytes[..bytes.len().min(ID_NAME_PREFIX)];
             let hex: String = shown.iter().map(|byte| format!("{byte:02x}")).collect();
             let more = if shown.len() < bytes.len() { "..." } else { "" };
-            format!("binary _id of {} bytes starting {hex}{more}", bytes.len())
+            format!(
+                "binary _id of subtype {subtype} and {} bytes starting {hex}{more}",
+                bytes.len()
+            )
         }
         DocId::String(text) => {
             let mut end = 0;
@@ -248,12 +227,10 @@ pub(crate) fn id_name(id: &DocId) -> String {
     }
 }
 
-/// What the cursor a page cuts after a row whose stored key is `stored_key`
-/// bytes long costs it, a bound: its key crosses in the legacy form, which is at
-/// most one byte longer, or 12 bytes for an integer ([`kimmy_core::legacy_key`]),
-/// as an array of `int32`s.
-pub(crate) fn cursor_reserve(stored_key: usize) -> usize {
-    CURSOR_OVERHEAD + byte_array_wire_len(stored_key.max(11) + 1)
+/// What the cursor a page cuts after a row whose key is `key` bytes long costs
+/// it, a bound: the key crosses as an array of `int32`s.
+pub(crate) fn cursor_reserve(key: usize) -> usize {
+    CURSOR_OVERHEAD + byte_array_wire_len(key)
 }
 
 /// What applying a snapshot page does (ADR-148, ADR-152, and the repair of a
@@ -293,8 +270,7 @@ pub struct SnapshotCursor {
     /// beyond a peer's retention horizon — the only case a snapshot serves —
     /// could never catch up. Same defect as ADR-031's, on the other wire type.
     pub collection: CollectionId,
-    /// Encoded document key, in the legacy (schema-4) form on the wire (module
-    /// docs); the next page starts strictly after it.
+    /// Encoded document key; the next page starts strictly after it.
     pub after_key: Vec<u8>,
 }
 
@@ -327,13 +303,7 @@ pub struct CollectionState {
     /// divergence check looked newer than the tombstone that peer holds for
     /// it. Both are the same resurrection through different doors.
     ///
-    /// An `Option`, and optional on the wire, because a sender that predates
-    /// the field sends no stamp at all: that is a fact the receiver has to be
-    /// able to see, and `Hlc::ZERO` would make it look like an incarnation
-    /// older than every tombstone rather than like an absence. What the
-    /// receiver does with the absence is on `Engine::restore_collection`.
-    #[serde(default)]
-    pub created: Option<Hlc>,
+    pub created: Hlc,
     /// The stamp of the latest change to `vector`: a configuration, a change of it,
     /// or turning it off (`CollectionMeta::vector_changed`, ADR-226).
     ///
@@ -341,10 +311,9 @@ pub struct CollectionState {
     /// off": a member holding the configuration kept it, and a completed snapshot's
     /// grant meant the entry that turned it off was never served again. With the
     /// stamp, "off at s" is a dated fact, and a receiver applies it when it is newer
-    /// than its own and the sender's coverage names it (ADR-163). Optional on the
-    /// wire: a sender that predates it writes none, and a page without one never
-    /// overrides a stamped local value.
-    #[serde(default)]
+    /// than its own and the sender's coverage names it (ADR-163). `None` when the
+    /// collection's vector configuration was never changed: a page without one
+    /// never overrides a stamped local value.
     pub vector_changed: Option<Stamp>,
     /// For a life a drop re-dated to keep what was written after it
     /// (`CollectionMeta::redated`, ADR-231 extended): the `created` the life had
@@ -353,21 +322,18 @@ pub struct CollectionState {
     /// continuing from a newer one, and the receiver stores it as the marker. A
     /// database's drop judges the definition by `created`, as every drop does
     /// (ADR-236): the life holds nothing stamped at or before its re-dating drop,
-    /// so nothing it carries is older than `created`. Optional on the wire: a
-    /// sender that predates it writes none, and a receiver that predates it
-    /// ignores it. (0.49.0 refused the definition under a database tombstone at
-    /// or after this, ADR-231 D-3's guard that ADR-236 removes.)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// so nothing it carries is older than `created`. `None` for a life that was
+    /// never re-dated.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub redated_from: Option<Hlc>,
     /// The sender's incarnation floor for this life (`CollectionMeta::incarnation_floor`):
     /// the drop it was created after. The one fact on a page that tells a life made
     /// after a drop from a life made by another member at the same time with no drop
     /// between, which `created` alone cannot: with the drop's tombstone aged out on the
     /// sender, the receiver holding the life before had nothing to learn the first from
-    /// (ADR-235). Optional on the wire: a sender that predates it writes none, a receiver
-    /// that predates it ignores it, and a page without one is read as no evidence, so
-    /// nothing is buried.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// (ADR-235). `None` for a life with no floor, which a receiver reads as no
+    /// evidence, so nothing is buried.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub incarnation_floor: Option<Hlc>,
 }
 
@@ -379,7 +345,7 @@ impl From<CollectionMeta> for CollectionState {
             name: meta.name,
             indexes: meta.indexes,
             vector: meta.vector,
-            created: Some(meta.created),
+            created: meta.created,
             vector_changed: meta.vector_changed,
             redated_from,
             incarnation_floor: meta.incarnation_floor,
@@ -424,37 +390,32 @@ pub struct SnapshotDoc {
 pub struct SnapshotTombstone {
     /// See [`SnapshotCursor::collection`] for why this is not a `u64`.
     pub collection: CollectionId,
-    /// The encoded document key the tombstone is stored under, in the legacy
-    /// (schema-4) form on the wire (module docs).
+    /// The encoded document key the tombstone is stored under.
     #[serde(with = "serde_bytes")]
     pub key: Vec<u8>,
     /// The stamp of the delete.
     pub stamp: Stamp,
 }
 
-/// A delete a received page carries, with its key in the **stored** form: what the
-/// receiver's paths work with (module docs, "Keys on a page are legacy").
+/// A delete a received page carries, as the receiver's paths work with it.
 ///
-/// A type of its own rather than a [`SnapshotTombstone`] with its key rewritten, so
-/// that a wire tombstone, whose key is legacy, cannot reach a read or a write of
-/// `DOCS`: only [`CarriedDelete::of_page`] makes one.
+/// Only [`CarriedDelete::of_page`] makes one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CarriedDelete {
     collection: CollectionId,
-    /// The stored (schema-5) key.
+    /// The stored key.
     key: Vec<u8>,
     stamp: Stamp,
 }
 
 impl CarriedDelete {
-    /// The page's carried deletes, each key converted from the legacy form to the
-    /// stored one (total: bytes in neither form are kept as they are).
+    /// The page's carried deletes.
     fn of_page(page: &SnapshotPage) -> Vec<Self> {
         page.deleted_documents
             .iter()
             .map(|tombstone| CarriedDelete {
                 collection: tombstone.collection,
-                key: keyenc::stored_of_legacy(&tombstone.key),
+                key: tombstone.key.clone(),
                 stamp: tombstone.stamp,
             })
             .collect()
@@ -576,13 +537,8 @@ pub struct SnapshotPage {
     /// instead: this field names one collection, and that route has to deny
     /// many.
     ///
-    /// Optional on the wire, because a sender that predates the field never
-    /// writes it (ADR-152). Nothing about the field changed to carry it on
-    /// later pages; what changed is when a sender fills it, and a receiver
-    /// that predates *that* reads a resumed page's drop exactly as it reads a
-    /// first page's, because its own gate is on the snapshot being scoped and
-    /// never was on the page being the first.
-    #[serde(default)]
+    /// `None` on a whole-database page and when the collection is not dropped
+    /// (ADR-152).
     pub dropped: Option<Stamp>,
     /// For a whole-database snapshot: every collection tombstone the sender
     /// holds, so the page conveys **absence** and not only presence.
@@ -602,16 +558,10 @@ pub struct SnapshotPage {
     /// was in flight. The list is bounded by `tombstone_retention_secs`, which
     /// is what makes re-sending it affordable.
     ///
-    /// Defaulted on the wire, so a sender that predates the field writes
-    /// nothing and a receiver that predates it ignores what it cannot read —
-    /// no negotiation, and a mixed-version cluster simply keeps the old
-    /// behaviour until both ends have rolled.
-    ///
     /// **A receiver honours an entry only where `versions` covers its stamp**
     /// — a peer may only deny what its own coverage names (ADR-163). Both
     /// halves of a pair come off the wire here, so without that gate one
     /// malformed entry destroys an arbitrary collection unrecoverably.
-    #[serde(default)]
     pub dropped_collections: Vec<(CollectionId, Stamp)>,
     /// The document tombstones the page's walk passed, so a page conveys a
     /// document's **absence** as well as a collection's (ADR-167).
@@ -624,18 +574,14 @@ pub struct SnapshotPage {
     /// healed nothing either.
     ///
     /// By key, in a list of its own, and never as a `SnapshotDoc` with no body:
-    /// that type needs a `DocId`, which a tombstone does not have, and an older
-    /// receiver would apply a bodiless `SnapshotDoc` as a delete of whatever id
-    /// it carried. Defaulted on the wire as `dropped_collections` is, so an
-    /// older sender writes nothing and an older receiver ignores the list, and
-    /// a mixed-version pair keeps the previous behaviour until both have rolled.
+    /// that type needs a `DocId`, which a tombstone does not have, and a receiver
+    /// would apply a bodiless `SnapshotDoc` as a delete of whatever id it carried.
     ///
     /// Tombstones share the page with documents — they count toward
     /// [`SNAPSHOT_PAGE`] and can end a page — so the cursor stays one walk in
     /// key order. A receiver honours one only where `versions` covers its stamp
     /// (ADR-163), and only against a live document it out-stamps: see
     /// `Engine::apply_carried_document_deletes`.
-    #[serde(default)]
     pub deleted_documents: Vec<SnapshotTombstone>,
     /// The indexes the sender has dropped, by collection and derived index id with
     /// the stamp of the drop, so a page conveys an index's **absence** as well as
@@ -653,16 +599,13 @@ pub struct SnapshotPage {
     /// ADR-162 applied to the whole-database one: a drop can land between two
     /// pages of a transfer that runs for minutes. For a scoped snapshot, those of
     /// the one collection. Bounded by `tombstone_retention_secs`, as the sender's
-    /// collection tombstones are. Defaulted on the wire as `dropped_collections`
-    /// is: an older sender writes nothing and an older receiver ignores the list,
-    /// so a mixed pair keeps the previous behaviour until both have rolled.
+    /// collection tombstones are.
     ///
     /// **A receiver honours an entry only where `versions` covers its stamp**
     /// (ADR-163), and judges it as a replicated `DropIndex` is judged (ADR-132): an
     /// index created after the drop is left alone. Denials are applied before the
     /// definitions on the same page, so an index dropped and recreated arrives as
     /// the new definition and the old drop, and the new one stands.
-    #[serde(default)]
     pub dropped_indexes: Vec<(CollectionId, u32, Stamp)>,
     /// The sender's collected-through horizon: the highest tombstone cutoff its
     /// retention passes have applied, read **in or after the walk this page's rows came
@@ -670,11 +613,10 @@ pub struct SnapshotPage {
     /// section 13.1). The young-stamp rule of a `Converge` pull compares a row's stamp
     /// with the larger of this and the receiver's own.
     ///
-    /// **An `Option`, never an `Hlc` defaulting to zero.** Absent from a sender that
-    /// predates it: the receiver's rule is then off for that pull, and every row it
-    /// holds nothing for is `left`. Optional on the wire, so an older receiver ignores
-    /// it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **An `Option`, never an `Hlc` defaulting to zero.** `None` when the sender
+    /// has collected nothing: the receiver's rule is then off for that pull, and every
+    /// row it holds nothing for is `left`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tombstone_horizon: Option<Hlc>,
 }
 
@@ -927,18 +869,6 @@ impl Engine {
         // the whole database, the one collection's for a repair.
         let dropped_indexes = self.indexes_dropped(scope)?;
 
-        // The wire boundary (Decimal128 design 7.1): every key on a page, the
-        // cursor the requester sends back included, is the frozen schema-4 form,
-        // which is what a 0.50 member stores, sends and reads. The walk works on
-        // the stored form, so the request's cursor is converted on the way in and
-        // every key on the way out. A requester stores the cursor as it received
-        // it (`SnapshotProgress`, `SNAPSHOT_PROGRESS`), so it is legacy whichever
-        // build sent it, and the walk is in value order in both forms, so it
-        // resumes where it ended.
-        let after = after.map(|cursor| SnapshotCursor {
-            after_key: keyenc::stored_of_legacy(&cursor.after_key),
-            ..cursor
-        });
         // The page's parts other than its rows, measured as they will be
         // encoded: what its rows have left of `SNAPSHOT_PAGE_BYTES`.
         let fixed = bson::serialize_to_vec(&SnapshotPage {
@@ -954,15 +884,8 @@ impl Engine {
         })
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
-        let (documents, mut deleted_documents, next) =
+        let (documents, deleted_documents, next) =
             self.snapshot_rows(after, scope, self.snapshot_rows_room(fixed), first)?;
-        for tombstone in &mut deleted_documents {
-            tombstone.key = keyenc::legacy_of_stored(&tombstone.key).into_bytes();
-        }
-        let next = next.map(|cursor| SnapshotCursor {
-            after_key: keyenc::legacy_of_stored(&cursor.after_key).into_bytes(),
-            ..cursor
-        });
         // After the walk: monotone, so a value read later is at least what the rows
         // above were collected under (design 13.1, "where it is read").
         let tombstone_horizon = self.tombstone_horizon()?;
@@ -1243,9 +1166,7 @@ impl Engine {
             // A definition the tombstone here makes history is not restored
             // (`restore_collection`'s rule), so it waits on nothing.
             if let Some(dropped) = self.collection_dropped_at(id)?
-                && state
-                    .created
-                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
+                && crate::sync::creation_is_history(state.created, dropped.hlc)
             {
                 continue;
             }
@@ -1670,8 +1591,8 @@ impl Engine {
             // is read **in this write transaction**, beside the "no row" read below, so a
             // collection that commits between a plan and this page cannot leave the page
             // judging with a horizon that has not moved while the tombstone is gone. The
-            // sender's rides on the page; absent (a sender that predates it) turns the rule
-            // off for the pull. An absent own key fails closed too.
+            // sender's rides on the page; absent (a sender that has collected nothing) turns
+            // the rule off for the pull. An absent own key fails closed too.
             let young_above =
                 match (crate::tombstone_horizon::read_in_txn(&txn)?, page.tombstone_horizon) {
                     (Some(own), Some(sender)) => Some(own.max(sender)),
@@ -2009,10 +1930,8 @@ impl Engine {
             };
             // The id read back from the body must encode to the key the
             // tombstone names, or the delete would land on another document. A
-            // stored id can disagree with it: `DocId::try_from_bson` reads any
-            // binary as the generic subtype, while a document written through
-            // `Engine` under a `DocId::Uuid` is keyed under subtype 4. Such a
-            // document keeps its delete here rather than lose another's.
+            // stored id of a well-formed row agrees with it; a row that does
+            // not keeps its delete here rather than lose another's.
             if crate::docs::doc_key(&id)? != tombstone.key {
                 warn!(
                     collection = %tombstone.collection,
@@ -2549,9 +2468,7 @@ impl Engine {
     ) -> Result<usize> {
         // The creation, before it is stored: the clock must be past the incarnation this
         // node is about to serve, or its next local write is stamped below it.
-        if let Some(created) = state.created {
-            self.witness_covered_hlc(created, versions);
-        }
+        self.witness_covered_hlc(state.created, versions);
         self.bury_the_life_this_one_followed(state, versions, carried)?;
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
@@ -2561,17 +2478,9 @@ impl Engine {
             // it right. The same rule `sync::apply_ddl` applies to a replayed
             // `CreateCollection`, in the one place a collection can otherwise
             // arrive without an entry behind it.
-            //
-            // A page carrying no stamp comes from a sender that predates the
-            // field, and reads as the incarnation this node dropped rather
-            // than as a later one — the mixed-version choice, made this way
-            // because a genuine recreation still arrives through the entries
-            // path, where a resurrection cannot be undone.
             let id = CollectionId::derive(&state.db, &state.name);
             if let Some(dropped) = self.collection_dropped_at(id)?
-                && state
-                    .created
-                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
+                && crate::sync::creation_is_history(state.created, dropped.hlc)
             {
                 debug!(
                     db = %state.db,
@@ -2610,15 +2519,12 @@ impl Engine {
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Restore);
             // The tombstone rule above, judged again under the writer.
-            let history = |dropped: Stamp| {
-                state
-                    .created
-                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
-            };
+            let history =
+                |dropped: Stamp| crate::sync::creation_is_history(state.created, dropped.hlc);
             // A re-dated life arrives with the creation it was re-dated from, and
             // is created with it in the one transaction, so that no stop leaves it
             // standing without the marker ADR-235's lineage comparison reads.
-            let redated_from = state.redated_from.filter(|_| state.created.is_some());
+            let redated_from = state.redated_from;
             // The floor the page carries and its coverage names. The clock passes it as it
             // passes the floor a burial restores (ADR-233): the page may name the floor and
             // not the life's creation, and a clock left behind would mint writes at or below
@@ -2631,7 +2537,7 @@ impl Engine {
                 &state.db,
                 &state.name,
                 false,
-                state.created,
+                Some(state.created),
                 &history,
                 redated_from,
                 adopted,
@@ -2667,11 +2573,9 @@ impl Engine {
         // against the floor and the tombstones here, as the entries route judges it
         // (`definition_of_an_ended_life`), under the writer (ADR-236); judged by the life, as it was, a member that
         // took this page took the sender's coverage of the definition with it and
-        // never held it. Only a definition with no stamp is judged by the life.
+        // never held it.
         let earlier = |standing: &CollectionMeta| {
-            standing
-                .incarnation_floor
-                .is_some_and(|floor| state.created.is_none_or(|created| created <= floor))
+            standing.incarnation_floor.is_some_and(|floor| state.created <= floor)
         };
         // By the rule the entries route uses (`definition_of_an_ended_life`: the floor,
         // and the collection's and the database's tombstones, which close the window
@@ -2700,7 +2604,10 @@ impl Engine {
                 indexes.push(index);
             }
         }
-        let vectors_of_the_life_before = of_the_life_before(&standing, state.vector_changed)?;
+        let vectors_of_the_life_before = match state.vector_changed {
+            Some(changed) => self.definition_of_an_ended_life(&standing, changed)?,
+            None => false,
+        };
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::RestoreDefinitions);
 
@@ -2745,12 +2652,10 @@ impl Engine {
                 // replicated `CreateIndex` is (`sync.rs`): a definition made before this
                 // node dropped the index is history here, though the sender, which has
                 // not heard of the drop, still serves it. `dropped` is read where the
-                // build is decided, under the writer. A definition with no stamp (a
-                // sender that predates the stamp) is history over a tombstone, as
-                // `earlier` and the collection's own creation rule read an unstamped
-                // life: building it is the defect, a real recreation arrives by the
-                // entries route with a stamp, and with no tombstone it is restored as
-                // it was.
+                // build is decided, under the writer. A definition with no stamp
+                // is history over a tombstone: building it is the defect, a real
+                // recreation arrives by the entries route with a stamp, and with no
+                // tombstone it is restored as it was.
                 &|standing, dropped| {
                     Ok(of_the_life_before(standing, index.created)?
                         || dropped
@@ -2800,7 +2705,7 @@ impl Engine {
         }
 
         if !vectors_of_the_life_before {
-            refused += self.restore_vector_state(state, versions, &earlier)?;
+            refused += self.restore_vector_state(state, versions)?;
         }
         Ok(refused)
     }
@@ -2808,48 +2713,25 @@ impl Engine {
     /// The vector configuration a page describes, applied by the stamp it carries
     /// (ADR-226).
     ///
-    /// - **A dated page** (`vector_changed`): applied when the sender's own coverage
-    ///   names the stamp (ADR-163; it comes off the wire) and it is **newer than the
-    ///   standing change**, an unstamped standing state reading as older than any
-    ///   (judged where the change is made, under the writer). A
-    ///   configuration is set, a turned-off configuration is turned off, and the stamp
-    ///   is recorded either way. The clock observes the stamp, so a later local change
-    ///   cannot mint one below it.
-    /// - **An undated page** (a sender that predates the stamp) never overrides a
-    ///   stamped local value: it can only add a configuration to a collection whose
-    ///   vector state was last written unstamped, as it always did, and it can never
-    ///   turn one off.
-    ///
-    /// `earlier` judges an undated page by the life it names (see `restore_collection`);
-    /// a dated one is judged by its stamp against the floor, as the entries route
-    /// judges a `ConfigureVectors` (ADR-236).
+    /// A page whose `vector_changed` is `None` describes a collection whose vector
+    /// state was never changed, and has nothing to apply. Otherwise it is applied
+    /// when the sender's own coverage names the stamp (ADR-163; it comes off the
+    /// wire) and it is **newer than the standing change** (judged where the change is
+    /// made, under the writer). A configuration is set, a turned-off configuration is
+    /// turned off, and the stamp is recorded either way. The clock observes the
+    /// stamp, so a later local change cannot mint one below it. It is judged by its
+    /// stamp against the floor, as the entries route judges a `ConfigureVectors`
+    /// (ADR-236).
     fn restore_vector_state(
         &self,
         state: &CollectionState,
         versions: &VersionVector,
-        earlier: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<usize> {
-        let Some(existing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
+        if Self::unless_gone(self.get_collection(&state.db, &state.name))?.is_none() {
             // Dropped here since the definitions began: nothing to put it on.
             return Ok(0);
-        };
+        }
         let Some(stamp) = state.vector_changed else {
-            // Undated: the old rule, and only where nothing dated stands here.
-            if let Some(config) = &state.vector
-                && existing.vector_changed.is_none()
-                && existing.vector.as_ref() != Some(config)
-            {
-                return self.settled_vector_step(
-                    state,
-                    self.configure_vectors_inner(
-                        &state.db,
-                        &state.name,
-                        config.clone(),
-                        crate::vectors::Configured::FromSnapshot(None),
-                        &|standing| Ok(earlier(standing)),
-                    ),
-                );
-            }
             return Ok(0);
         };
         if stamp.hlc > versions.get(stamp.node) {
@@ -2870,7 +2752,7 @@ impl Engine {
         self.witness(&stamp);
         let history = |standing: &CollectionMeta| self.definition_of_an_ended_life(standing, stamp);
         let history: &dyn Fn(&CollectionMeta) -> Result<bool> = &history;
-        let by = crate::vectors::Configured::FromSnapshot(Some(stamp));
+        let by = crate::vectors::Configured::FromSnapshot(stamp);
         match &state.vector {
             Some(config) => self.settled_vector_step(
                 state,
@@ -2999,12 +2881,10 @@ impl Engine {
     /// Whether `name` is a vector shadow whose parent is absent here under a
     /// tombstone at or after `created`: a shadow the parent's drop ended,
     /// though a node that never held the shadow buried none (ADR-178). A
-    /// parent absent with no tombstone has not arrived yet: `false`. A shadow
-    /// with no `created` (a sender before the field) under a parent tombstone
-    /// reads as the older, as `restore_collection` reads a page's creation.
+    /// parent absent with no tombstone has not arrived yet: `false`.
     /// Answered cheaply here; `create_collection_in_txn` judges it again
     /// under the writer.
-    fn parent_buried_since(&self, db: &str, name: &str, created: Option<Hlc>) -> Result<bool> {
+    fn parent_buried_since(&self, db: &str, name: &str, created: Hlc) -> Result<bool> {
         let Some(base) = kimmy_core::vector_meta::base_name(name) else {
             return Ok(false);
         };
@@ -3015,7 +2895,7 @@ impl Engine {
         }
         Ok(self
             .collection_dropped_at(CollectionId::derive(db, base))?
-            .is_some_and(|buried| created.is_none_or(|created| created <= buried.hlc)))
+            .is_some_and(|buried| created <= buried.hlc))
     }
 
     /// Whether a peer asking from `from` can be served from the oplog.
@@ -4486,33 +4366,6 @@ mod tests {
         assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), 1);
     }
 
-    /// The mixed-version rule at the restore's door: a sender that predates
-    /// `CollectionState::created` names no incarnation, and an absent stamp
-    /// reads as the life this node dropped rather than as a later one. The
-    /// collection is not recreated for the minutes a roll is under way; a
-    /// genuine recreation still arrives through the entries path, where a
-    /// resurrection could not be undone.
-    #[test]
-    fn a_snapshot_that_names_no_incarnation_does_not_recreate_a_dropped_collection() {
-        let (a, _da) = engine();
-        let (b, _db) = engine();
-        let ca = a.create_collection("shop", "orders").unwrap();
-        a.insert(&ca, doc! { "_id": 1 }).unwrap();
-        b.create_collection("shop", "orders").unwrap();
-        a_moment();
-        b.drop_collection("shop", "orders").unwrap();
-
-        let mut page = a.snapshot_page(None, None).unwrap();
-        for state in &mut page.collections {
-            state.created = None;
-        }
-        let outcome = b
-            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
-            .unwrap();
-        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
-        assert_eq!((outcome.applied, outcome.superseded), (0, 1), "{outcome:?}");
-    }
-
     /// A restored collection carries the **sender's** `created`, not this
     /// node's clock at apply time.
     ///
@@ -5797,12 +5650,9 @@ mod tests {
     }
 
     #[test]
-    fn a_page_that_predates_the_field_denies_nothing_and_breaks_nothing() {
-        // Wire compatibility, asserted rather than assumed: the field is
-        // defaulted, so a page from a sender that predates it deserialises
-        // with an empty list and the receiver keeps what it holds -- the old
-        // behaviour, which is what a mixed-version cluster must see until both
-        // ends have rolled.
+    fn a_page_with_no_drops_denies_nothing_and_breaks_nothing() {
+        // A page whose list of dropped collections is empty denies nothing, and
+        // the receiver keeps what it holds.
         let (a, _da) = engine();
         let (b, _db) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
@@ -5814,14 +5664,13 @@ mod tests {
         let mut progress = SnapshotProgress::whole_database();
         while !progress.is_complete() {
             let mut page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            // What an older sender puts on the wire.
             page.dropped_collections.clear();
             b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         }
 
         assert!(
             b.get_collection("shop", "orders").is_ok(),
-            "an older sender denies nothing, so the receiver keeps what it has"
+            "a page with no drops denies nothing, so the receiver keeps what it has"
         );
     }
 
@@ -6259,8 +6108,7 @@ mod tests {
         let mut page = a.snapshot_page(None, None).unwrap();
         page.deleted_documents = vec![SnapshotTombstone {
             collection: ca.id,
-            // The wire form, as a sender puts it on a page.
-            key: kimmy_core::keyenc::legacy_key(&DocId::Int64(1)).into_bytes(),
+            key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
             stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()),
         }];
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6315,11 +6163,10 @@ mod tests {
 
     #[test]
     fn a_tombstone_is_never_sent_as_a_bodiless_document() {
-        // The mixed-version rule. An older receiver reads a `SnapshotDoc` with
-        // no body as a delete of the id it carries, and a tombstone has no id,
-        // so one sent in that shape deletes whatever placeholder it names.
-        // Deletes go in a list an older receiver ignores, and an older
-        // sender's page, which has no such list, still decodes.
+        // A `SnapshotDoc` with no body reads as a delete of the id it carries,
+        // and a tombstone has no id, so one sent in that shape would delete
+        // whatever placeholder it names. Deletes go in a list of their own,
+        // which every page carries.
         let (a, _da) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
         a.insert(&ca, doc! { "_id": 1 }).unwrap();
@@ -6330,10 +6177,12 @@ mod tests {
         assert!(page.documents.iter().all(|d| d.body.is_some()), "{:?}", page.documents);
         assert_eq!(page.deleted_documents.len(), 1);
 
-        let mut older = bson::serialize_to_document(&page).unwrap();
-        assert!(older.remove("deleted_documents").is_some(), "the field must be on the wire");
-        let read: SnapshotPage = bson::deserialize_from_document(older).unwrap();
-        assert!(read.deleted_documents.is_empty(), "an older sender's page must still decode");
+        let mut without = bson::serialize_to_document(&page).unwrap();
+        assert!(without.remove("deleted_documents").is_some(), "the field must be on the wire");
+        assert!(
+            bson::deserialize_from_document::<SnapshotPage>(without).is_err(),
+            "a page without the list is malformed"
+        );
     }
 
     #[test]
@@ -6513,8 +6362,7 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: vec![SnapshotTombstone {
                 collection: id,
-                // The wire form, as a sender puts it on a page.
-                key: kimmy_core::keyenc::legacy_key(&DocId::Int64(1)).into_bytes(),
+                key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
                 stamp: delete,
             }],
             dropped_indexes: Vec::new(),
@@ -6525,47 +6373,6 @@ mod tests {
         assert!(
             b.get(&cb, &DocId::Int64(1)).unwrap().is_some(),
             "a delete at the floor is history, though it sorts above the tombstone"
-        );
-    }
-
-    #[test]
-    fn a_carried_delete_whose_id_does_not_re_encode_to_its_key_is_not_applied() {
-        // The key check, reachable through `Engine` though not over HTTP: a
-        // document written under `DocId::Uuid` is keyed as binary subtype 4,
-        // and `DocId::try_from_bson` reads its `_id` back as generic binary,
-        // which keys differently. Without the check the delete would land on
-        // whatever B holds under that generic key -- another document.
-        let (a, _da) = engine();
-        let (b, _db) = engine();
-        let ca = a.create_collection("shop", "orders").unwrap();
-        let uuid = uuid::Uuid::from_bytes([7; 16]);
-        a.replace(&ca, &DocId::Uuid(uuid), doc! { "v": 1 }, true).unwrap();
-        b.apply_batch(&a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap())
-            .unwrap();
-        let cb = b.get_collection("shop", "orders").unwrap();
-        let generic = bson::Bson::Binary(bson::Binary {
-            subtype: bson::spec::BinarySubtype::Generic,
-            bytes: uuid.as_bytes().to_vec(),
-        });
-        b.insert(&cb, doc! { "_id": generic, "other": true }).unwrap();
-        assert_eq!(
-            b.count(&cb, crate::WalkScope::Request).unwrap(),
-            2,
-            "the fixture must hold both documents"
-        );
-
-        assert!(a.delete(&ca, &DocId::Uuid(uuid)).unwrap());
-        let page = a.snapshot_page(None, None).unwrap();
-        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
-
-        assert!(
-            b.get(&cb, &DocId::Binary(uuid.as_bytes().to_vec())).unwrap().is_some(),
-            "the delete must never land on another document"
-        );
-        assert_eq!(
-            b.count(&cb, crate::WalkScope::Request).unwrap(),
-            2,
-            "and the mismatched one keeps its delete"
         );
     }
 
@@ -7709,7 +7516,7 @@ mod tests {
         let carried = page
             .deleted_documents
             .iter()
-            .find(|t| t.key == kimmy_core::keyenc::legacy_key(&DocId::Int64(3)).into_bytes());
+            .find(|t| t.key == crate::docs::doc_key(&DocId::Int64(3)).unwrap());
         assert_eq!(stamp_of(3).stamp, carried.unwrap().stamp);
     }
 
@@ -7751,7 +7558,7 @@ mod tests {
         let orphan = DocId::Int64(777);
         let mut page = a.snapshot_page(None, None).unwrap();
         for t in &mut page.deleted_documents {
-            t.key = kimmy_core::keyenc::legacy_key(&orphan).into_bytes();
+            t.key = crate::docs::doc_key(&orphan).unwrap();
         }
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
         assert!(holds_tombstone(&b, &cb, &orphan), "premise: recorded");
@@ -8506,15 +8313,6 @@ mod tests {
         (a, da, b, db)
     }
 
-    /// Write `engine`'s vector state back as a build that did not stamp it left it.
-    fn unstamp(engine: &Engine, db: &str, name: &str) {
-        let mut meta = engine.get_collection(db, name).unwrap();
-        meta.vector_changed = None;
-        let txn = engine.begin_write(crate::engine::WriterHolder::Ddl).unwrap();
-        Engine::put_collection_meta(&txn, &meta).unwrap();
-        txn.commit().unwrap();
-    }
-
     fn vector_state(engine: &Engine) -> (bool, Option<Stamp>) {
         let meta = engine.get_collection("shop", "orders").unwrap();
         (meta.vector.is_some(), meta.vector_changed)
@@ -8536,31 +8334,6 @@ mod tests {
             page.versions.get(off.unwrap().node) >= off.unwrap().hlc,
             "and the sender's own coverage names it"
         );
-    }
-
-    #[test]
-    fn a_state_from_a_sender_that_predates_the_stamp_reads_as_unstamped() {
-        // On the wire the stamp is optional: an older sender writes none, and an older
-        // receiver ignores the key.
-        let (a, _da, _b, _db) = both_hold_a_configuration();
-        let state = a
-            .snapshot_page(None, None)
-            .unwrap()
-            .collections
-            .into_iter()
-            .find(|c| c.name == "orders")
-            .unwrap();
-        assert!(state.vector_changed.is_some(), "premise");
-        let mut written = bson::serialize_to_document(&state).unwrap();
-        assert!(written.remove("vector_changed").is_some());
-        let read: CollectionState = bson::deserialize_from_document(written).unwrap();
-        assert_eq!(read.vector_changed, None);
-        assert_eq!(read.vector, state.vector, "and everything else as sent");
-
-        let mut future = bson::serialize_to_document(&state).unwrap();
-        future.insert("somethingNewer", true);
-        let read: CollectionState = bson::deserialize_from_document(future).unwrap();
-        assert_eq!(read, state, "a key this build does not know does not fail the state");
     }
 
     #[test]
@@ -8589,19 +8362,6 @@ mod tests {
     }
 
     #[test]
-    fn unstamped_local_state_reads_as_older_than_a_stamped_off() {
-        // A member that last wrote its vector state before 0.46 has no stamp.
-        let (a, _da, b, _db) = both_hold_a_configuration();
-        unstamp(&b, "shop", "orders");
-        a.disable_vectors("shop", "orders", false).unwrap();
-        age_the_oplog_out(&a);
-
-        transfer(&b, &a);
-
-        assert!(!vector_state(&b).0, "converges to the sender's off");
-    }
-
-    #[test]
     fn a_stamped_local_configuration_newer_than_the_pages_off_stays() {
         let (a, _da, b, _db) = both_hold_a_configuration();
         a.disable_vectors("shop", "orders", false).unwrap();
@@ -8615,48 +8375,6 @@ mod tests {
 
         assert_eq!(vector_state(&b), mine, "a later local change is not undone by an older off");
         assert!(mine.0);
-    }
-
-    #[test]
-    fn a_page_without_a_stamp_never_overrides_a_stamped_local_value() {
-        // A sender from before the stamp writes none. Against a stamped local value it
-        // changes nothing, whichever way it points.
-        let (a, _da, b, _db) = both_hold_a_configuration();
-        let mine = vector_state(&b);
-        let mut page = a.snapshot_page(None, None).unwrap();
-        for state in &mut page.collections {
-            state.vector_changed = None;
-            state.vector = None; // would turn it off
-        }
-        let mut progress = SnapshotProgress::whole_database();
-        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-        assert_eq!(vector_state(&b), mine, "an undated off turns nothing off");
-
-        for state in page.collections.iter_mut().filter(|c| c.name == "orders") {
-            let mut other = vector_config();
-            other.dim = 16;
-            state.vector = Some(other);
-        }
-        let mut progress = SnapshotProgress::whole_database();
-        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-        assert_eq!(vector_state(&b), mine, "and an undated configuration changes nothing");
-    }
-
-    #[test]
-    fn a_page_without_a_stamp_still_adds_a_configuration_to_unstamped_state() {
-        // The old rule, kept for a pair that has not rolled: it only ever added.
-        let (a, _da) = engine();
-        a.create_collection("shop", "orders").unwrap();
-        a.configure_vectors("shop", "orders", vector_config()).unwrap();
-        let (b, _db) = engine();
-        b.create_collection("shop", "orders").unwrap();
-        let mut page = a.snapshot_page(None, None).unwrap();
-        for state in &mut page.collections {
-            state.vector_changed = None;
-        }
-        let mut progress = SnapshotProgress::whole_database();
-        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-        assert!(vector_state(&b).0);
     }
 
     #[test]
@@ -8961,7 +8679,6 @@ mod tests {
         let (b, _db) = engine();
         b.create_collection("shop", "orders").unwrap();
         b.configure_vectors("shop", "orders", vector_config()).unwrap();
-        unstamp(&b, "shop", "orders");
         a.disable_vectors("shop", "orders", false).unwrap();
         age_the_oplog_out(&a);
 
@@ -9045,25 +8762,6 @@ mod tests {
         transfer(&b, &a);
 
         assert_eq!(b.get_collection("shop", "orders").unwrap(), before);
-    }
-
-    #[test]
-    fn a_page_without_a_stamp_never_changes_a_width() {
-        // Not a winner by anything, so not given the exemption: it is refused, counted,
-        // and the page still lands.
-        let (a, _da, b, _db) = a_width_changed_through_an_off();
-        unstamp(&b, "shop", "orders");
-        let before = b.get_collection("shop", "orders").unwrap();
-        let mut page = a.snapshot_page(None, None).unwrap();
-        for state in &mut page.collections {
-            state.vector_changed = None;
-        }
-        let mut progress = SnapshotProgress::whole_database();
-
-        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-
-        assert_eq!(b.get_collection("shop", "orders").unwrap(), before);
-        assert_eq!(outcome.ddl_refused, 1, "counted");
     }
 
     #[test]

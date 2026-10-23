@@ -2187,6 +2187,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_rendered_document_key_carries_a_binary_subtype() {
+        let mut generic = entry(OpKind::Insert, 1, 100);
+        generic.doc_id = Some(DocId::Binary { subtype: 0x00, bytes: vec![9; 16] });
+        let mut uuid = generic.clone();
+        uuid.doc_id = Some(DocId::Binary { subtype: 0x04, bytes: vec![9; 16] });
+        for (entry, subtype) in [(&generic, "00"), (&uuid, "04")] {
+            let full = render(entry, "shop", "orders");
+            assert_eq!(full["documentKey"]["_id"]["$binary"]["subType"], subtype, "{full}");
+            let bare = render_without_document(entry, "shop", "orders");
+            assert_eq!(bare["documentKey"]["_id"]["$binary"]["subType"], subtype, "{bare}");
+        }
+    }
+
+    #[test]
     fn a_rendered_event_names_its_database_and_collection() {
         // A receiver fed by several subscriptions routes on these. They
         // shipped as empty strings for all of M6 — this is the test that was

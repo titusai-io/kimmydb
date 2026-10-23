@@ -695,6 +695,41 @@ mod tests {
         assert!(!key("KEPT").is_empty(), "the kept one stays in it");
     }
 
+    /// Rewind is per key: two subtypes of one byte string are two documents, so the
+    /// one created after the target is removed, leaving no record, and the other
+    /// goes back to its value at the target (ADR-251).
+    #[test]
+    fn two_subtypes_of_one_byte_string_are_rewound_apart() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("shop", "bins").unwrap();
+        let binary = |subtype: u8| {
+            bson::Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::from(subtype),
+                bytes: (0u8..16).collect(),
+            })
+        };
+        let id = |subtype: u8| DocId::try_from_bson(&binary(subtype)).unwrap();
+        engine.insert(&coll, doc! { "_id": binary(0), "v": 1 }).unwrap();
+        let target = latest(&engine);
+        engine.insert(&coll, doc! { "_id": binary(4), "v": 1 }).unwrap();
+        engine.replace(&coll, &id(0), doc! { "_id": binary(0), "v": 2 }, false).unwrap();
+
+        let outcome = engine.rewind_to(target).unwrap();
+        assert_eq!((outcome.removed, outcome.reverted), (1, 1));
+        assert!(engine.get(&coll, &id(4)).unwrap().is_none(), "it did not exist then");
+        assert_eq!(
+            engine.get(&coll, &id(0)).unwrap().unwrap(),
+            doc! { "_id": binary(0), "v": 1 },
+            "the other subtype holds the value it had at the target"
+        );
+        assert_eq!(
+            crate::docs::record_stamp(&engine, &coll, &id(4)).unwrap(),
+            None,
+            "the removed document leaves no tombstone"
+        );
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(1));
+    }
+
     #[test]
     fn indexes_follow_the_rewind() {
         // An index left pointing at the undone future would answer a query with

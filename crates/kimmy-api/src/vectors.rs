@@ -1946,11 +1946,9 @@ mod tests {
         assert_eq!(none.stats.matched, 0);
     }
 
-    /// The filter's paging hands the executor its own **stored** keys, which the executor
-    /// must take as they are (Decimal128 design 7.2): only a client's token is read as
-    /// legacy, and in `Cursor::decode`. The stored key of `A` below is the schema-4 key of
-    /// `B` (design 6.1), so a resume bound read as legacy here would skip from `A` to past
-    /// `B`. Through a scan and through an index.
+    /// The filter's paging hands the executor its own stored keys, which the executor
+    /// must take as they are: a resume after `A` continues at the next id and skips none.
+    /// Through a scan and through an index.
     #[test]
     fn a_filters_paging_over_integer_ids_resumes_on_the_stored_key() {
         const A: i64 = 0x5000_0081_0180_0000;
@@ -2189,15 +2187,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Write `records` for the document keyed `id` as the embedding worker
-    /// does: under the chunk source its stored `_id` names.
+    /// does: under the chunk source its id names.
     fn embedded_as_stored(
         state: &SharedState,
         shadow: &kimmy_storage::CollectionMeta,
         id: &DocId,
-        stored_id: &bson::Bson,
         records: Vec<VectorRecord>,
     ) {
-        let source = kimmy_core::ChunkSource::of(id, Some(stored_id));
+        let source = kimmy_core::ChunkSource::from(id);
         let write = kimmy_storage::VectorWrite::encode(id, &source, &records).unwrap();
         state
             .engine
@@ -2247,7 +2244,7 @@ mod tests {
                     bson::doc! { "_id": stored.clone(), "tenant": tenant, "text": text },
                 )
                 .unwrap();
-            embedded_as_stored(state, &shadow, &id, &stored, vec![chunk(&id, angle, text)]);
+            embedded_as_stored(state, &shadow, &id, vec![chunk(&id, angle, text)]);
             ids.push(id);
         }
         let debris = bson::serialize_to_document(&chunk(&ids[3], 0.0, "debris of delta")).unwrap();
@@ -2338,7 +2335,7 @@ mod tests {
                 .engine
                 .insert(&source, bson::doc! { "_id": stored.clone(), "text": text })
                 .unwrap();
-            embedded_as_stored(&state, &shadow, &id, &stored, vec![chunk(&id, angle, text)]);
+            embedded_as_stored(&state, &shadow, &id, vec![chunk(&id, angle, text)]);
         }
         let allowed = filter_ids(&state, &source, &parse(bson::doc! { "_id": 7 }), 1_000).unwrap();
         assert_eq!(allowed.ids, [DocId::Int64(7)]);
@@ -2356,5 +2353,69 @@ mod tests {
             let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
             assert_eq!(got, [(DocId::Int64(7), "int seven".to_string())], "{join:?}");
         }
+    }
+
+    /// Two documents whose ids differ only by subtype are two documents in
+    /// search: a filter that admits `BinData(4, X)` returns only it, rendered
+    /// with subtype 4, by both join directions and any per-document cap.
+    #[test]
+    fn a_filter_on_one_binary_subtype_does_not_return_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        state.engine.create_collection("app", "docs").unwrap();
+        state.engine.configure_vectors("app", "docs", config()).unwrap();
+        let source = state.engine.get_collection("app", "docs").unwrap();
+        let shadow = state.engine.vector_collection("app", "docs").unwrap().unwrap();
+        let binary =
+            |subtype| bson::Bson::Binary(bson::Binary { subtype, bytes: (1u8..=16).collect() });
+        for (subtype, text, angle) in [
+            (bson::spec::BinarySubtype::Generic, "generic one", 0.0f32),
+            (bson::spec::BinarySubtype::Uuid, "uuid one", 0.5),
+        ] {
+            let id = state
+                .engine
+                .insert(&source, bson::doc! { "_id": binary(subtype), "text": text })
+                .unwrap();
+            embedded_as_stored(&state, &shadow, &id, vec![chunk(&id, angle, text)]);
+        }
+        let allowed = filter_ids(
+            &state,
+            &source,
+            &parse(bson::doc! { "_id": binary(bson::spec::BinarySubtype::Uuid) }),
+            1_000,
+        )
+        .unwrap();
+        let wanted = DocId::try_from_bson(&binary(bson::spec::BinarySubtype::Uuid)).unwrap();
+        assert_eq!(allowed.ids, std::slice::from_ref(&wanted));
+        for join in [Join::Keyed, Join::Discard] {
+            for per_document in [1, 3] {
+                let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document };
+                let hits = ran(knn_joined(
+                    &state,
+                    &shadow,
+                    &config(),
+                    &[1.0, 0.0],
+                    &options,
+                    Some((&allowed, join)),
+                ))
+                .unwrap();
+                let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
+                assert_eq!(
+                    got,
+                    [(wanted.clone(), "uuid one".to_string())],
+                    "{join:?}, per_document {per_document}"
+                );
+            }
+        }
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let all = ran(knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None)).unwrap();
+        assert_eq!(all.len(), 2, "both documents are found unfiltered");
+        let rendered = render(&all);
+        let ids: Vec<&Value> =
+            rendered["matches"].as_array().unwrap().iter().map(|h| &h["_id"]).collect();
+        assert_ne!(ids[0], ids[1], "the subtype is in the rendered id");
+        assert!(
+            ids.contains(&&crate::json::bson_to_json(&binary(bson::spec::BinarySubtype::Uuid)))
+        );
     }
 }

@@ -121,7 +121,6 @@ impl DefinitionDefer {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefinitionAsk {
     pub cut: VersionVector,
-    #[serde(default)]
     pub detail: Vec<CollectionId>,
 }
 
@@ -140,20 +139,16 @@ pub struct DefinitionEntry {
     /// `u128` on the wire.
     pub digest: ByteBuf,
     /// Set instead of a digest when the peer cannot compare this collection.
-    #[serde(default)]
     pub deferred: Option<DefinitionDefer>,
     /// For a collection deferred as [`DefinitionDefer::DefinitionAboveCut`]: the
     /// origin of a stamp above the cut, so the requester can tell a stamp that
     /// is only in motion from one the cut can never cover (h2-N4).
-    #[serde(default)]
     pub above: Option<NodeId>,
     /// For a collection named in the request's `detail`: the peer's definitions.
-    #[serde(default)]
     pub definitions: Vec<WireDefinition>,
     /// For a collection named in `detail`: the refusals the peer holds that are
     /// still above the standing life's floor **and valid on its own side**, each
     /// with its kind. The requester applies that kind's shape against both lists.
-    #[serde(default)]
     pub refused: Vec<WireRefusal>,
 }
 
@@ -162,7 +157,6 @@ pub struct DefinitionEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireDefinition {
     pub kind: DefinitionKind,
-    #[serde(default)]
     pub name: String,
     pub hash: ByteBuf,
 }
@@ -172,7 +166,6 @@ pub struct WireDefinition {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireRefusal {
     pub hint: crate::refusal_hint::HintKind,
-    #[serde(default)]
     pub name: String,
     pub hash: ByteBuf,
 }
@@ -180,28 +173,24 @@ pub struct WireRefusal {
 /// The peer's answer.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct DefinitionReply {
-    /// The digest's format ([`FORMAT`]) the peer computed under. Absent (0) from
-    /// a build that predates it, which is never equal to this one's.
+    /// The digest's format ([`FORMAT`]) the peer computed under.
     pub format: u8,
     pub entries: Vec<DefinitionEntry>,
-    /// Entries that did not decode (a reason or a shape from a later build) and
-    /// were dropped: read, never written, so that the caller can count them.
+    /// Entries that did not decode and were dropped: read, never written, so that the caller can count them.
     #[serde(skip)]
     pub malformed: u32,
 }
 
 /// Entries are read one at a time: one that does not decode is dropped and
-/// counted, and the rest are kept, so a new field costs the entry and never the
-/// frame.
+/// counted, and the rest are kept, so a damaged entry costs the entry and never
+/// the frame.
 impl<'de> Deserialize<'de> for DefinitionReply {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Raw {
-            #[serde(default)]
             format: u8,
-            #[serde(default)]
             entries: Vec<bson::Bson>,
         }
         let raw = Raw::deserialize(deserializer)?;
@@ -218,8 +207,8 @@ impl<'de> Deserialize<'de> for DefinitionReply {
 pub enum DefinitionAnswered {
     /// With definitions.
     Answered,
-    /// With none: a peer that predates the digest of definitions, or one that
-    /// failed to compute it, or one that saw two different cuts. Never compared.
+    /// With none: a peer that failed to compute it, or one that saw two different
+    /// cuts. Never compared.
     Unanswered,
     /// This side failed to compute or to compare, with an error that was not a
     /// stop: the contact went on without it.

@@ -143,27 +143,6 @@ mod tests {
     }
 
     #[test]
-    fn a_definition_stamped_by_a_build_that_had_no_stamp_decodes_as_unstamped() {
-        // The stored-format rule reaches the wire too: absent must arrive as
-        // `None` rather than as a decode failure, or the field could not have
-        // been added to a payload that already replicates.
-        let create = stamped(None);
-        let bytes = bson::serialize_to_vec(&create).unwrap();
-        let document: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
-        let index = document.get_document("index").unwrap();
-        assert_eq!(index.get("created"), Some(&bson::Bson::Null));
-
-        let mut without = index.clone();
-        without.remove("created");
-        let mut trimmed = document.clone();
-        trimmed.insert("index", without);
-        let bytes = bson::serialize_to_vec(&trimmed).unwrap();
-        let back: IndexCreate = bson::deserialize_from_slice(&bytes).unwrap();
-        assert_eq!(back.index.created, None);
-        assert_eq!(back, create);
-    }
-
-    #[test]
     fn disabling_vectors_is_distinct_from_never_configuring_them() {
         // `None` has to survive the round trip as `None` rather than collapsing
         // into an absent field, or a replicated disable would be a no-op.

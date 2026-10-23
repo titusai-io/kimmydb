@@ -178,6 +178,7 @@ fn the_frames_decode_whatever_the_new_fields_hold() {
     assert_eq!(echo, None, "an echo that does not decode is none: a peer that does not echo");
 
     let frame = frame_of(doc! { "AskVersions": {
+        "witnessed": false,
         "facts_gen": 9_i64,
         "echo": { "boot": bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![1, 2, 3] }, "generation": 7_i64 },
     } });
@@ -225,7 +226,6 @@ fn a_043_decoder_reads_the_new_block_and_frames() {
     let echo = Some(Echo { boot: vec![4; 16], generation: 12 });
     for message in [
         Message::AskVersions {
-            witnessed: true,
             facts: Some(Arc::new(block.clone())),
             facts_gen: Some(3),
             echo: echo.clone(),
@@ -267,10 +267,7 @@ fn this_build_reads_a_043_block_and_frames() {
     );
     assert_eq!((facts_gen, echo), (None, None));
     let frame = frame_of(doc! { "AskVersions": { "witnessed": true } });
-    assert!(matches!(
-        frame,
-        Message::AskVersions { facts: None, facts_gen: None, echo: None, witnessed: true }
-    ));
+    assert!(matches!(frame, Message::AskVersions { facts: None, facts_gen: None, echo: None }));
 }
 
 /// A block and a frame that set none of the new fields encode exactly as 0.43's do:
@@ -282,13 +279,9 @@ fn unset_fields_add_no_keys() {
     for key in ["class_state", "class_cause", "responsive", "writer_wedged", "started_ms"] {
         assert!(!doc.contains_key(key), "{key}");
     }
-    let frame = bson::serialize_to_bson(&Message::AskVersions {
-        witnessed: true,
-        facts: None,
-        facts_gen: None,
-        echo: None,
-    })
-    .unwrap();
+    let frame =
+        bson::serialize_to_bson(&Message::AskVersions { facts: None, facts_gen: None, echo: None })
+            .unwrap();
     let body = frame.as_document().unwrap().get_document("AskVersions").unwrap();
     assert!(!body.contains_key("facts_gen") && !body.contains_key("echo"));
 }
@@ -299,7 +292,6 @@ fn unset_fields_add_no_keys() {
 fn a_generation_round_trips_as_an_int64() {
     for generation in [0u64, 1, u64::from(u32::MAX) + 1, 1 << 62, i64::MAX as u64] {
         let message = Message::AskVersions {
-            witnessed: true,
             facts: None,
             facts_gen: Some(generation),
             echo: Some(Echo { boot: vec![1; 16], generation }),
@@ -311,12 +303,8 @@ fn a_generation_round_trips_as_an_int64() {
         let body = raw.get_document("AskVersions").unwrap();
         assert!(matches!(body.get("facts_gen"), Some(Bson::Int64(_))));
     }
-    let too_big = Message::AskVersions {
-        witnessed: true,
-        facts: None,
-        facts_gen: Some(i64::MAX as u64 + 1),
-        echo: None,
-    };
+    let too_big =
+        Message::AskVersions { facts: None, facts_gen: Some(i64::MAX as u64 + 1), echo: None };
     assert!(bson::serialize_to_vec(&too_big).is_err(), "never reached by a counter");
 }
 

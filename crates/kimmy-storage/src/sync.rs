@@ -1755,11 +1755,11 @@ pub(crate) fn aims_at_a_previous_incarnation(current: &CollectionMeta, dropped: 
 ///   are compared, and equal ones are one life continuing.
 pub(crate) fn arriving_life_ends_the_standing_one(
     standing: &CollectionMeta,
-    created: Option<Hlc>,
+    created: Hlc,
     redated_from: Option<Hlc>,
     floor: Option<Hlc>,
 ) -> bool {
-    let (Some(created), Some(floor)) = (created, floor) else {
+    let Some(floor) = floor else {
         return false;
     };
     let standing_began = if standing.is_redated() {
@@ -2312,8 +2312,8 @@ impl Engine {
                 // And older than the drop of its database (ADR-229): the
                 // collection is history here, and so are its documents, which
                 // name it by an id this node can only judge by a tombstone.
-                if self.database_refusal(&target.db, Some(entry.stamp.hlc))?.is_some() {
-                    self.record_database_refusal(&target.db, &target.name, Some(entry.stamp.hlc))?;
+                if self.database_refusal(&target.db, entry.stamp.hlc)?.is_some() {
+                    self.record_database_refusal(&target.db, &target.name, entry.stamp.hlc)?;
                     debug!(
                         db = %target.db,
                         collection = %target.name,
@@ -2364,7 +2364,7 @@ impl Engine {
                                 self.record_database_refusal(
                                     &target.db,
                                     &target.name,
-                                    Some(entry.stamp.hlc),
+                                    entry.stamp.hlc,
                                 )?;
                                 debug!(
                                     db = %target.db,

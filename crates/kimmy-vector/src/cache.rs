@@ -877,9 +877,7 @@ impl Shared {
 
     /// How many resident graphs came from a snapshot that is behind the
     /// store, or not yet judged, and are served while a builder rebuilds or
-    /// judges them — the `kimmy_vector_graphs_stale` gauge (ADR-241). A
-    /// roll to 0.52.0 raises it to every vector collection a member serves
-    /// and it falls as the rebuilds land.
+    /// judges them — the `kimmy_vector_graphs_stale` gauge (ADR-241).
     pub fn stale_graphs(&self) -> u64 {
         let entries = self.entries.lock();
         entries
@@ -1124,26 +1122,6 @@ impl Shared {
             }
         };
 
-        // A graph `hnsw_rs` 0.3.4 built, saved by 0.51 or earlier, is behind
-        // whatever the counts say: it left part of the collection where no
-        // search reaches it (ADR-241). It is served while its rebuild runs,
-        // as any behind snapshot is.
-        if !index.built_by_this_build() {
-            tracing::info!(
-                ?path,
-                vectors = index.len(),
-                "adopting an HNSW snapshot a build before 0.52.0 made as behind; it is \
-                 served until its rebuild replaces it"
-            );
-            return Some(Entry::new(
-                Decision::Index(Arc::new(index)),
-                BEHIND,
-                shadow.created,
-                metric,
-                dim,
-                Instant::now() - MAX_STALENESS,
-            ));
-        }
         let (generation, decided) = match self.saved_at.lock().get(&shadow.id).copied() {
             Some(saved_at) if saved_at == generation => (generation, Instant::now()),
             Some(saved_at) => {
@@ -2658,76 +2636,6 @@ mod tests {
         assert_eq!(index.len(), 60);
     }
 
-    /// A snapshot a 0.51 build saved, its graph built by `hnsw_rs` 0.3.4, is
-    /// served once and rebuilt, never adopted as fresh (ADR-241). Its
-    /// `meta.json` has no `graph` field, and its dump's layout is the same as
-    /// this build's, so nothing else tells the graph with 0.3.4's unreachable
-    /// vectors from a sound one. It covers exactly what the store holds, so
-    /// on any other test it would be adopted as fresh; the control shows that.
-    #[test]
-    fn a_snapshot_0_51_saved_serves_once_and_is_rebuilt() {
-        let (engine, shadow, dir) = setup(60);
-        let cache = snapshot_cache(&dir);
-        access(&cache, &engine, &shadow, Metric::Cosine, 4);
-        cache.settle();
-        drop(cache);
-        drop(engine);
-        let snapshot = dir.path().join("hnsw").join(format!("{:016x}", shadow.id.0));
-        let meta = |path: &std::path::Path| -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(path.join("meta.json")).unwrap()).unwrap()
-        };
-        assert_eq!(meta(&snapshot)["format"], 3, "the format is 0.51's");
-        assert_eq!(meta(&snapshot)["graph"], 2, "this build says what built the graph");
-        // A file a load leaves where it is and a save, which replaces the
-        // directory, does not: which of the two an access did.
-        let marked = |path: &std::path::Path| path.join("adopted-marker").exists();
-
-        // The control: as saved, the snapshot is adopted as fresh, and the
-        // next access serves the same graph.
-        std::fs::write(snapshot.join("adopted-marker"), b"").unwrap();
-        let (engine, shadow) = reopen(&dir);
-        let cache = snapshot_cache(&dir);
-        let Access::Approximate(first) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
-            panic!("the snapshot should serve");
-        };
-        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
-        else {
-            panic!("and keep serving");
-        };
-        assert!(Arc::ptr_eq(&first, &second), "the control: a marked snapshot is fresh");
-        assert!(marked(&snapshot));
-        cache.settle();
-        drop((cache, first, second));
-        drop(engine);
-
-        // The same snapshot as a 0.51 build writes it: no `graph` field.
-        let mut old = meta(&snapshot);
-        old.as_object_mut().unwrap().remove("graph");
-        std::fs::write(snapshot.join("meta.json"), serde_json::to_vec(&old).unwrap()).unwrap();
-        let (engine, shadow) = reopen(&dir);
-        let cache = snapshot_cache(&dir);
-        let gate = Gate::install(&cache, shadow.id);
-        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
-            panic!("0.51's snapshot should serve the search that loads it");
-        };
-        assert_eq!(first.len(), 60);
-        gate.wait_for_build_to_start();
-        assert!(marked(&snapshot), "served as it was, not rebuilt yet");
-        assert!(
-            matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Approximate(g) if Arc::ptr_eq(&g, &first)),
-            "served while its rebuild runs"
-        );
-        gate.release();
-        cache.settle();
-        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
-        else {
-            panic!("then a rebuild serves");
-        };
-        assert!(!Arc::ptr_eq(&first, &second), "0.51's snapshot was adopted as fresh");
-        assert!(!marked(&snapshot), "the rebuild saved its own graph");
-        assert_eq!(meta(&snapshot)["graph"], 2);
-    }
-
     // -----------------------------------------------------------------------
     // A dump the library would end the process on (ADR-241)
     // -----------------------------------------------------------------------
@@ -3925,131 +3833,5 @@ mod tests {
             )
             .unwrap();
         assert_eq!(graph(&cache, &engine, &a).len(), 60, "loaded from the snapshot, not rebuilt");
-    }
-
-    /// A move of chunk ids keeps the count, so a snapshot a previous process
-    /// saved before one is behind though the count agrees (ADR-239): it is
-    /// served once and rebuilt, not adopted as fresh with keys that no longer
-    /// exist.
-    #[test]
-    fn a_snapshot_saved_before_a_move_of_chunk_ids_is_rebuilt() {
-        let (engine, shadow, dir) = setup(60);
-        // A String's chunk where a 0.50 build wrote it, in the graph.
-        let source = DocId::String("12345".into());
-        let record = VectorRecord {
-            source: source.clone(),
-            chunk: 0,
-            source_hlc: Hlc::new(1, 0),
-            vector: vec![99.0, 1.0, 0.0, 0.0],
-            text: "t".into(),
-            config: None,
-        };
-        let doc = bson::serialize_to_document(&record).unwrap();
-        engine.replace(&shadow, &DocId::String("12345#0".into()), doc, true).unwrap();
-        let cache = snapshot_cache(&dir);
-        access(&cache, &engine, &shadow, Metric::Cosine, 4);
-        cache.settle();
-        drop(cache);
-        drop(engine);
-
-        let (engine, shadow) = reopen(&dir);
-        assert_eq!(engine.adopt_legacy_chunks(&shadow, &source).unwrap(), 1);
-        let cache = snapshot_cache(&dir);
-        let Access::Approximate(first) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
-            panic!("the snapshot serves once");
-        };
-        assert_eq!(first.len(), 61, "the count agrees");
-        // Rebuilt by a builder while the snapshot serves (ADR-245).
-        cache.settle();
-        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
-        else {
-            panic!("then a rebuild serves");
-        };
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "a snapshot from before the move was adopted as fresh"
-        );
-        let hits = second
-            .search(
-                &engine,
-                &shadow,
-                &[99.0, 1.0, 0.0, 0.0],
-                &crate::search::SearchOptions { k: 1, ..Default::default() },
-                None,
-            )
-            .unwrap();
-        assert_eq!(hits[0].id, source, "found under its new id");
-    }
-
-    /// One direction of replication, until there is nothing left to pull.
-    fn pull(into: &Engine, from: &Engine) {
-        loop {
-            let (mine, theirs) = (into.version_vector().unwrap(), from.version_vector().unwrap());
-            let Some(start) = mine.behind(&theirs) else { return };
-            let entries = from
-                .entries_for_peer(start, 10_000, kimmy_storage::WalkScope::Background)
-                .unwrap()
-                .entries;
-            if into.apply_batch(&entries).unwrap().applied == 0 {
-                return;
-            }
-        }
-    }
-
-    /// On a member that does not own the collection, the moves of chunk ids
-    /// arrive by replication, an insert and a removal that keep the count: a
-    /// graph that member saved before them is rebuilt after a restart, not
-    /// adopted as fresh with keys that no longer exist (ADR-239).
-    #[test]
-    fn a_non_owners_snapshot_saved_before_a_replicated_move_is_rebuilt() {
-        let (owner, owner_shadow, _owner_dir) = setup(60);
-        let source = DocId::String("12345".into());
-        let record = VectorRecord {
-            source: source.clone(),
-            chunk: 0,
-            source_hlc: Hlc::new(1, 0),
-            vector: vec![99.0, 1.0, 0.0, 0.0],
-            text: "t".into(),
-            config: None,
-        };
-        let doc = bson::serialize_to_document(&record).unwrap();
-        owner.replace(&owner_shadow, &DocId::String("12345#0".into()), doc, true).unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let replica = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
-        pull(&replica, &owner);
-        let shadow = replica.vector_collection("app", "docs").unwrap().unwrap();
-        let cache = snapshot_cache(&dir);
-        access(&cache, &replica, &shadow, Metric::Cosine, 4);
-        cache.settle();
-        drop(cache);
-
-        assert_eq!(owner.adopt_legacy_chunks(&owner_shadow, &source).unwrap(), 1);
-        let renames = replica.vector_renames(shadow.id).unwrap();
-        pull(&replica, &owner);
-        assert_eq!(replica.vector_renames(shadow.id).unwrap(), renames + 1, "the removal counted");
-        drop(replica);
-
-        let (replica, shadow) = reopen(&dir);
-        let cache = snapshot_cache(&dir);
-        let Access::Approximate(first) = access(&cache, &replica, &shadow, Metric::Cosine, 4)
-        else {
-            panic!("the snapshot serves once");
-        };
-        assert_eq!(first.len(), 61, "the count agrees");
-        // Rebuilt by a builder while the snapshot serves (ADR-245).
-        cache.settle();
-        let Access::Approximate(second) = access(&cache, &replica, &shadow, Metric::Cosine, 4)
-        else {
-            panic!("then a rebuild serves");
-        };
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "a snapshot from before the move was adopted as fresh"
-        );
-        let options = crate::search::SearchOptions { k: 1, ..Default::default() };
-        let hits =
-            second.search(&replica, &shadow, &[99.0, 1.0, 0.0, 0.0], &options, None).unwrap();
-        assert_eq!(hits[0].id, source, "found under its new id");
     }
 }

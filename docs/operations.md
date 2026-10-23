@@ -430,11 +430,7 @@ length, and a start that used to be killed and begun again for ever, because
 nothing listened until the open finished and Kubernetes' defaults restart a
 container after about 30 seconds of failed liveness checks, now finishes. What
 the open is doing is on `/readyz`: `phase` is one of `repairing`, `opening`,
-`preflight`, `migrating`, `draining` and `refilling` (the schema migration's steps, each
-with its own `done` of `total`: the preflight's rows read, a collection's rows re-keyed,
-one index's entries drained, one collection's rows walked to refill its indexes, [Storage schema
-5](#storage-schema-5-the-first-start-of-0510)), `verifying` (`done` of `total` oplog
-rows), `counting`, `starting` and `reconciling` (`done` of `total` databases whose
+`verifying` (`done` of `total` oplog rows), `counting`, `starting` and `reconciling` (`done` of `total` databases whose
 drop the node is burying before it serves, [ADR-229](decisions.md), or collections it is sweeping of what a
 drop that reached them late left behind, [ADR-231](decisions.md); absent when
 there is none), with `phase_age_seconds`. **That sweep finds its work through the drop tombstones the
@@ -444,10 +440,8 @@ database's drop covers for any reason but a stop (a damaged collection row, say)
 `burying what a database's drop covers` with the cause, and the next start fails the same way: run
 [`kimmyd check-store`](#checking-a-store) on the stopped member, and if the store is damaged, wipe its data
 directory and let it catch up from its peers ([A member that is catching up](#a-member-that-is-catching-up)). The open's cost is
-unchanged: the walk of the retained oplog is about 46 s per 10 million entries
-with the store in the page cache and far more cold, and the schema 5 migration
-adds about 16 us per document re-keyed and 8 us per document per index to it,
-as bounds; a node logs a line for each phase as it goes.
+the walk of the retained oplog: about 46 s per 10 million entries
+with the store in the page cache and far more cold; a node logs a line for each phase as it goes.
 **A start after an unclean stop repairs the database file first**, before the
 open's own work: about 0.4 s per GiB of `kimmy.redb`, measured at 1.3 s for a
 4 GiB file and 5.2 s for 12 GiB on an NVMe disk ([ADR-188](decisions.md)). It
@@ -649,9 +643,7 @@ Each collection's live document count is kept in the database, moved by every
 document write, so the divergence check reads a number instead of walking a
 collection ([ADR-174](decisions.md)). A start rebuilds those counts when it
 cannot trust them:
-- the first start of 0.30.0 or later on a database;
 - a start after `kimmyd restore`, since a backup does not carry the counts;
-- a start after an older build wrote to the database;
 - a start that also rebuilt the arrival index.
 
 A rewind does not force it: the counts' mark moves with the rows a rewind
@@ -1000,18 +992,12 @@ snapshot.
   sender's index-drop tombstones (one per index dropped within tombstone retention), the
   receiver judges each as a replicated drop (an index created after it is left alone), records
   it, and serves it onward. Before, a member that took a snapshot kept an index the sender had
-  dropped: a unique index went on refusing inserts, a TTL index on expiring documents. An older
-  sender writes nothing and an older receiver ignores the list, so a mixed cluster keeps the old
-  behaviour until every member has rolled.
+  dropped: a unique index went on refusing inserts, a TTL index on expiring documents.
 - **A snapshot carries a vector configuration turned off too** ([ADR-226](decisions.md)): a
   collection's vector state carries the stamp of its latest change, a page says when it was
   turned off, and the receiver applies the later of its own and the page's. The entries path is
   last-writer-wins on the same stamp, and a `disable` of a configuration already off is stamped
-  and logged (a retried disable writes and replicates). State written before this release is
-  unstamped and counts as older than any stamped change, so a change made on a 0.45 build after
-  the origin turned the configuration off is lost when a page arrives; so is, after rolling back to
-  0.45 and forward again, a change made on 0.45 to a page stamped older than it in real time but
-  newer than the member's last stamped change (0.45 leaves the collection unstamped).
+  and logged (a retried disable writes and replicates).
 - **A snapshot page's vector configuration is settled like an entry's** ([ADR-227](decisions.md)).
   A member that held a client-supplied (`byo`) vector configuration of one width, whose peer
   turned it off and configured another, used to refuse the page in every round: the snapshot
@@ -1163,7 +1149,7 @@ stall; reads may still be served; prefer a node without it. `"writer"` is the we
 above and `"runtime"` is a stalled async runtime within the last six judged ticks;
 `"writer"` wins when both hold. It is present only on a `live` node, for the
 answering node from its own evaluator and for a peer from its last block. **Its
-absence is not "healthy":** an older build's peer, a peer the answering node holds
+absence is not "healthy":** a peer the answering node holds
 no block from, and a member in its first thirty seconds have none. When every node
 has it (a disk slow for the whole cluster), a client uses them anyway.
 
@@ -1257,9 +1243,9 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_sync_ddl_declined_total` | Replicated index drops this node declined because the index standing under the name here was created *after* the drop ([ADR-132](decisions.md)) — **and which it had not already recorded**. A drop it applied when the drop was current left a tombstone, so a re-served window carrying that drop past the recreation it preceded is recognised as a replay and is **not** counted: that case rose on a healthy cluster and sent operators looking for a clock problem that was not there. What is left is the case worth a look, and it counts **once per drop this member had not seen**: declining records the drop's tombstone, so the same drop re-served afterwards is the replay above and is not counted again. That case is a drop this member has never seen, older than the index it names, which means a member whose clock ran ahead when it created the index and which is now the only member still holding it; drop it directly on that member ([ADR-141](decisions.md)). Logged at info with both stamps; the uncounted replay is logged at debug |
 | `kimmy_sync_ddl_applied_total{via}` | Replicated schema changes this node applied, by how they arrived: **`pull`**, in a window this node pulled from a peer, or **`push`**, in a window a peer pushed to it to confirm an index create or drop ([ADR-140](decisions.md)). It counts **entries applied, not entries received**. A refused, declined or skipped entry is not counted here. Neither is a replayed drop this node had already recorded, or a change for a collection dropped here (counted only as superseded); no outcome series counts those two. **Nor is a change whose entry this node already held as sent**: it is not applied again and its append commits nothing (a kind's own writes are unchanged), and it is counted in `kimmy_sync_ddl_held_total` instead. A change applied again whose entry was not held — a definition standing here without its entry, or a creation or drop that is history — is counted. A burst of N index creates on one member should raise this by about **N on each other member, summed over both labels**; windows also carry other members' earlier changes, so read it as the **increase over a burst**, compared between builds, not as an absolute. Counted as each apply commits, whether or not the round or push then fails ([ADR-177](decisions.md)); a snapshot restore does not count here. In 0.38.0 and earlier a change already held was counted here too, each time a window carried it, so a burst read higher on earlier builds |
 | `kimmy_sync_ddl_held_total{via}` | Replicated schema changes a window carried that this node **already held, entry and all**, by the same `pull` and `push` as `kimmy_sync_ddl_applied_total`. Not applied again, and **the append of the entry commits nothing**: the check is a read, repeated under the writer only when the first look finds the entry missing, and an apply that loses that race aborts rather than commits ([ADR-180](decisions.md)). A kind's own writes are unchanged: a replayed drop of an index already gone still commits its tombstone, as before. Windows overlap by design — a pull that read this node's position before a push landed, or a third member relaying what the origin pushed — and this is how much. It is not a fault; for an index create, the kind a burst carries, a rise costs reads, not fsyncs |
-| `kimmy_sync_serve_failures_total{reason}` | Replication connections a peer opened to this node that ended in an error **on this side**, by reason. **`io`**: reading or writing the connection failed mid-exchange, such as a `Connection reset`. **For peers that gave up waiting it is a lower bound**: a pusher that stops waiting usually closes cleanly, this node's answer lands in the socket buffer, and its next read sees an ordinary close, so it is counted only when a reset wins the race. The reliable signal for abandoned pushes is on the pushing member, `kimmy_ddl_confirmations_total{outcome="failed"}` and `{outcome="timeout"}`. **`timeout`**: the handshake ran out of time. **`malformed`**: a frame this node could not read or would not accept. **`local`**: this node's own storage failed while answering the peer — a read to serve it, or a write applying a window it pushed (a pushed entry this node cannot decode is `malformed`); read it beside `kimmy_storage_bytes` and the storage-failure stop (ADR-188), not as a wire problem. **`unauthenticated`**: the peer failed the shared-secret proof, or hung up on reading this node's. That is how a member with a different `cluster_secret` ends the handshake, and also how a member that is shutting down, or gives up mid-handshake, ends one, so **a burst during a rolling restart is expected**; the `WARN` names all three. **`fault`** and **`binding`**: the peer reported a fault of its own, or the TLS session gave no channel binding. A `kimmyd` member produces neither once its handshake has completed, so these come from something that is not a current member, or from before the handshake. A clean close between requests is how every contact ends, and is not counted; a TLS handshake that never completes is not counted either, because anything that can reach the port can cause one. Each counted failure is also logged at `WARN` as `peer connection failed`, naming the peer and the reason. `kimmy_sync_failures_total` is the other side: rounds this node **pulled** that failed. A steady rise in `unauthenticated` outside a restart is a member with the wrong `cluster_secret`, or something that is not a member |
+| `kimmy_sync_serve_failures_total{reason}` | Replication connections a peer opened to this node that ended in an error **on this side**, by reason. **`io`**: reading or writing the connection failed mid-exchange, such as a `Connection reset`. **For peers that gave up waiting it is a lower bound**: a pusher that stops waiting usually closes cleanly, this node's answer lands in the socket buffer, and its next read sees an ordinary close, so it is counted only when a reset wins the race. The reliable signal for abandoned pushes is on the pushing member, `kimmy_ddl_confirmations_total{outcome="failed"}` and `{outcome="timeout"}`. **`timeout`**: the handshake ran out of time. **`malformed`**: a frame this node could not read or would not accept. **`local`**: this node's own storage failed while answering the peer — a read to serve it, or a write applying a window it pushed (a pushed entry this node cannot decode is `malformed`); read it beside `kimmy_storage_bytes` and the storage-failure stop (ADR-188), not as a wire problem. **`unauthenticated`**: the peer failed the shared-secret proof, or hung up on reading this node's. That is how a member with a different `cluster_secret` ends the handshake, and also how a member that is shutting down, or gives up mid-handshake, ends one, so **a burst during a rolling restart is expected**; the `WARN` names all three. **`fault`** and **`binding`**: the peer reported a fault of its own, or the TLS session gave no channel binding. A `kimmyd` member produces neither once its handshake has completed, so these come from something that is not a current member, or from before the handshake. **`release`**: this node refused the peer at the handshake because it runs another release (a different cluster protocol): a stray member of an older release, which must be stopped or upgraded. A clean close between requests is how every contact ends, and is not counted; a TLS handshake that never completes is not counted either, because anything that can reach the port can cause one. Each counted failure is also logged at `WARN` as `peer connection failed`, naming the peer and the reason. `kimmy_sync_failures_total` is the other side: rounds this node **pulled** that failed. A steady rise in `unauthenticated` outside a restart is a member with the wrong `cluster_secret`, or something that is not a member |
 | `kimmy_accept_errors_total{listener}` | Accept errors that were **the listener's own**, by listener: `cluster` (the replication port) and `http` (the client port). These are the errors that refuse every new connection until they clear, almost always the process running out of file descriptors (`EMFILE`, `ENFILE`) and otherwise out of buffers or memory. A client whose connection went away before it was accepted (aborted, reset, refused) is not counted. Both listeners wait after an error rather than retrying at once: the replication listener backs off from 50 ms to 1 s and starts over after an accept succeeds, and the HTTP listener retries every 50 ms. Each is logged, at `WARN` on the replication listener (naming the OS error number, and at most once every ten seconds while the errors continue) and at `ERROR` on the HTTP listener (at most once a second). **Both series rising together is descriptor exhaustion for the whole process**: raise the limit (`ulimit -n`, `LimitNOFILE`, the container's `nofile`) or find what is holding descriptors; peers and clients reconnect by themselves once accepts succeed again |
-| `kimmy_ddl_confirmations_total{outcome}` | Schema-change confirmations on a member: one per member for each index create or drop this node made, by how it ended ([ADR-140](decisions.md), [ADR-191](decisions.md)). **`confirmed`**: the member took the change and did not refuse it. **`refused`**: it could not apply it, or declined a drop older than the index it holds; it counted that itself. The rest are **pending**, and anti-entropy carries the change: **`timeout`**, the request's deadline passed first; **`failed`**, the push errored or hit its timeout; **`unreached`**, the member is more than a batch behind or below the retention horizon; **`purging`**, it is still purging a drop of the name; **`stopped_unknown`**, its batch stopped earlier at a collection it lacks; **`other_member`**, a different node answered at the address; **`task_ended`**, the push task panicked or was aborted at shutdown; **`backoff`**, the member did not answer the last push, and for a while (from `cluster.sync_interval_secs`, doubling to 60 s, ended early when SWIM sees the member come back) nothing is pushed to it. A request that arrives during the back-off is answered `backoff` at once; one that was already waiting behind the push that failed is answered `backoff` when that push fails, so a `backoff` answer can take up to the request timeout; **`unattributable`**, the member runs a version whose answer does not name which change it refused; **`cancelled`**, the request went away before any answer, with its client. **Alert on** `timeout` and `failed` rising together with the writer-held share of a member: that member's writer is saturated |
+| `kimmy_ddl_confirmations_total{outcome}` | Schema-change confirmations on a member: one per member for each index create or drop this node made, by how it ended ([ADR-140](decisions.md), [ADR-191](decisions.md)). **`confirmed`**: the member took the change and did not refuse it. **`refused`**: it could not apply it, or declined a drop older than the index it holds; it counted that itself. The rest are **pending**, and anti-entropy carries the change: **`timeout`**, the request's deadline passed first; **`failed`**, the push errored or hit its timeout; **`unreached`**, the member is more than a batch behind or below the retention horizon; **`purging`**, it is still purging a drop of the name; **`stopped_unknown`**, its batch stopped earlier at a collection it lacks; **`other_member`**, a different node answered at the address; **`task_ended`**, the push task panicked or was aborted at shutdown; **`backoff`**, the member did not answer the last push, and for a while (from `cluster.sync_interval_secs`, doubling to 60 s, ended early when SWIM sees the member come back) nothing is pushed to it. A request that arrives during the back-off is answered `backoff` at once; one that was already waiting behind the push that failed is answered `backoff` when that push fails, so a `backoff` answer can take up to the request timeout; **`cancelled`**, the request went away before any answer, with its client. **Alert on** `timeout` and `failed` rising together with the writer-held share of a member: that member's writer is saturated |
 | `kimmy_ddl_confirm_pushes_total` | Windows pushed to members to confirm schema changes ([ADR-191](decisions.md)). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than `kimmy_ddl_confirmations_total`: the ratio between them is the coalescing. About 1 when creates arrive one at a time |
 | `kimmy_replay_total{via,result}` | Pages of the restored-member replay ([ADR-212](decisions.md)'s addendum). `via`: `inbound` (a peer served them on a connection it opened) or `outbound` (this member asked on one it dialled). `result`: `served` (this member sent a page to a peer that asked), `applied` (a page carrying this member's own entries; an empty one is not counted), `refused` (a page that was not what was asked for), `ack_timeout` (the acknowledgement did not come, so the contact ended and the ordinary pull and push happen at the next one), `stalled` (a page named a collection this member lacks or is purging, and was not applied: a rising `stalled` means that collection is on its way by an ordinary round with another member, and it clears itself once it arrives; a count that keeps rising with no collection arriving is a member that can reach none that holds it). Always rendered, all zero on a member that was never restored. A restored member that rises on `outbound` and never on `inbound` is one its peers cannot dial |
 | `kimmy_sync_ddl_relogged_total` | Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward ([ADR-180](decisions.md)). **Not an error: a rising value is the restore doing its job.** It reads 0 on a member that has never caught up by snapshot, and rises by one for each index definition a snapshot restores where this node did not already hold the entry behind it. A member that caught up by snapshot, past its peers' retention, and then served a third member is exactly what it makes visible — before it, such a member served windows that left those index definitions out, and nothing counted that |
@@ -1303,7 +1289,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_violations_backfill_rows_total` | Oplog rows the completing pass has read since start; flat at 0 on a store whose table was ready at open. On the OTLP bridge, `kimmy.violations.backfill_rows` |
 | `kimmy_violations_walk_path_total{path}` | `GET …/violations` calls by how they were answered: `table`, or `oplog` (the walk, while the table is not ready). On the OTLP bridge, `kimmy.violations.walk_path.table` and `.oplog` |
 | `kimmy_ownership_peers{state}` | Live peers as **this member** sees them by the block each last sent on the replication contact ([ADR-201](decisions.md)): `eligible`, `ineligible_catching_up` (the catching-up marker is set; no class overrides it), `ineligible_yielding` (at least one class given up), `unknown` (no block yet: an older version, or not yet heard; after a member comes up or restarts, or this member rejoins, about one contact, since each side asks the other for its block at once, at most once per member per sync interval, and at the interval's end for one that came within it, [ADR-247](decisions.md)) and `stale` (a block past its lease, which keeps saying what it last said: not hearing from a member is not evidence that it recovered). Every state is always present. Views differ while blocks converge, so compare members after a lease, never a single scrape. The lease is `ceil(peers / cluster.fanout) + 2` sync intervals. On the OTLP bridge, `kimmy.ownership.peers.<state>` |
-| `kimmy_yield_unconfirmed_peers{class}` | Live peers that have not confirmed this member's yield of `class` (`ttl`, `webhooks`, `embeddings`): those that do not echo the block back (an older version never does) and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and its live set has held still for a lease, so a peer that never does keeps it owning; alert on a value that stays above 0. 0 while no class yields. On the OTLP bridge, `kimmy.yield.unconfirmed_peers.<class>` |
+| `kimmy_yield_unconfirmed_peers{class}` | Live peers that have not confirmed this member's yield of `class` (`ttl`, `webhooks`, `embeddings`): those that do not echo the block back and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and its live set has held still for a lease, so a peer that never does keeps it owning; alert on a value that stays above 0. 0 while no class yields. On the OTLP bridge, `kimmy.yield.unconfirmed_peers.<class>` |
 | `kimmy_owner_class_state{class,state,cause}` | How this member's own class of owned work stands, one-hot over `ok`, `idle`, `suspect` and `stalled`; only the `stalled` series carries a `cause` (`local`, `runtime`, `probation`). The state last decided, so read it beside `kimmy_task_progress_age_seconds{task="yield_evaluator"}`. On the OTLP bridge, `kimmy.owner.class_state.<class>.<state>` and `.stalled.<cause>` ([ADR-213](decisions.md)) |
 | `kimmy_owner_class_owned{class}` | Items the class owned at its last owner check. A negative test that nothing owned work proves nothing: read it beside the state. For embeddings the count is set by the worker's loop, so while a provider call is held (two attempts of 60 s at most) it lags until the call ends; the class is judged by its heartbeat meanwhile. On the OTLP bridge, `kimmy.owner.class_owned.<class>` |
 | `kimmy_yielding{class}` | 1 while this member **advertises** that it yields the class. Advertised, not effective: it keeps owning the class until every live peer has echoed the block. On the OTLP bridge, `kimmy.yielding.<class>` |
@@ -1514,8 +1500,7 @@ collection tombstones on every page** and applies them through the same
 incarnation check the rest of the drop machinery uses. On a cluster where every
 member has rolled past that, this route is closed.
 
-Before it — and on any pair where one end has not rolled, since the field is
-defaulted and an older sender sends nothing — the whole-database snapshot
+Before it, the whole-database snapshot
 carried no collection drops and, on completing, granted the member coverage of
 the sender's history, so the drop entry it never applied was below that coverage
 and no peer would serve it. The member keeps the collection, live and writable,
@@ -1817,10 +1802,7 @@ reconciliation would:
   reporting it meant repairing the drop away and re-seeding the members that
   had it right ([ADR-155](decisions.md)). The peer names the incarnation it
   holds in its answer, so a collection genuinely *recreated* since the drop
-  is still reported. A peer on a release that predates the field names none,
-  and is read as holding the dropped incarnation, so during a rolling upgrade
-  a recreation on a member not yet rolled is left to the ordinary entries
-  path rather than reported here.
+  is still reported.
 - **One collection's live document count**, chosen in turn from this node's
   own collection list. Since 0.30.0 the count is kept in the database and read
   as one value on each member ([ADR-174](decisions.md)); before, each member
@@ -2073,7 +2055,7 @@ surfaces.
 3. **Since 0.50.0 the repair does this for you** for the ids both members hold at different stamps and the young lost inserts; what it leaves is `left` (above). **Wipe a member only if every id that differs is present on both members and that member holds the older stamp on every one of them**, and only if the repair has not cleared it: if any differing id is present on one member only, wipe neither (apply the operator rule above), because wipe discards what only that member holds.
 4. Then reseed the member that is behind (and only when step 3 allowed it): wipe its data directory and let it catch up from its peers ([A damaged store](#a-damaged-store)); it starts marked as catching up and refuses requests until it holds what they hold ([A member that is catching up](#a-member-that-is-catching-up)).
 
-**Rolling.** The digest rides optional fields on the two existing divergence messages, so a mixed roll is safe: a member before 0.48.0 ignores the request and answers without digests, which a 0.48.0 member counts as `unanswered` and never compares, so the digest runs between two 0.48.0 members only. A 0.48.0 member that is already answering a digest probe says so (`busy`), which is not the same thing as not answering. Read the release notes' **Read before upgrading**: the divergence gauge can now read above 0 where it read 0, and pages an existing alert.
+**Rolling.** The digest rides optional fields on the two existing divergence messages, so a member before 0.48.0 ignores the request and answers without digests, which a 0.48.0 member counts as `unanswered` and never compares, so the digest runs between two 0.48.0 members only. A 0.48.0 member that is already answering a digest probe says so (`busy`), which is not the same thing as not answering. Read the release notes' **Read before upgrading**: the divergence gauge can now read above 0 where it read 0, and pages an existing alert.
 
 #### The definition digest
 
@@ -2095,7 +2077,7 @@ surfaces.
 
 **A stamp that does not advance.** A collection whose definition was made or dropped above the cut is deferred (`definition_above_cut`): it is in motion. If the stamp comes from a node this cluster can no longer hear from (a decommissioned member whose last create reached one member), the cut never covers it and the collection is never compared with that peer. After sixty contacts on which the cut at the stamp's origin did not advance, one `WARN` names the origin and says the stamp has not advanced; a peer that is only lagging never reaches it.
 
-**Rolling.** The definition digest rides optional fields on the two existing divergence messages, so a mixed roll is safe: a member before 0.49.0 ignores the request and answers without definitions, which a 0.49.0 member counts as `unanswered` and never compares. Refusal hints are rows in the member's metadata, so a backup carries them, and they are never trusted without being re-derived: a stale one (a rollback, a restore, a recreated collection, a definition changed since) explains nothing.
+**Rolling.** The definition digest rides optional fields on the two existing divergence messages, so a member before 0.49.0 ignores the request and answers without definitions, which a 0.49.0 member counts as `unanswered` and never compares. Refusal hints are rows in the member's metadata, so a backup carries them, and they are never trusted without being re-derived: a stale one (a rollback, a restore, a recreated collection, a definition changed since) explains nothing.
 
 ### Tracing
 
@@ -2828,46 +2810,49 @@ and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 
 ## Upgrades
 
-The on-disk **schema version** is checked on open, and the two directions are
-treated differently on purpose:
+KimmyDB runs one version in a cluster, and an upgrade that changes data wipes the
+data. The on-disk **storage schema** is checked on open, and 0.53.0 opens only
+schema **6**:
 
 | Stored version | Behaviour |
 |---|---|
-| Older than this build | **Migrated in place** on open, logged at `info` |
+| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.53.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
 | Equal | Opens normally |
 | Newer | **Refuses to start** |
 
-Refusing on a *newer* schema is the right failure: a build cannot know a layout
-that did not exist when it was written, and guessing corrupts further. Migrating
-an *older* one is equally right — a user with data has no other route forward.
+The check reads `kimmy.format` before the database is opened, and runs again
+after the open. `kimmyd restore` applies the same rule to a backup's schema: a
+backup written by 0.52 or older is refused. 0.53.0 has no schema 1 to 5
+migration (it was removed with [ADR-251](decisions.md#adr-251--binary-_id-subtypes)),
+because a schema-5 store's binary `_id` keys mean something else, and a build
+cannot know that a layout it never wrote is safe to guess at.
 
-Current schema is **5**. Migrations run in sequence, so an older database steps
-through each one rather than needing its own path to the latest.
+**Cluster protocol 2.** `Hello` and `Welcome` carry the cluster protocol, and
+0.53.0 speaks 2. A member refuses a peer that speaks anything else, or none (0.52
+and older), at the handshake: it sends a fault naming both protocols and logs
+the refusal naming the peer: its address on the accepting member, its node id
+on the dialling one. Every member must run one release.
 
-| Step | What it does |
-|---|---|
-| 1 → 2 | Collections renumbered to ids derived from their names ([ADR-031](decisions.md)) — rewrites document keys, index entries, and the collection field of every oplog entry |
-| 2 → 3 | Indexes renumbered to ids derived from their names ([ADR-032](decisions.md)) — rewrites index-entry keys |
-| 3 → 4 | Every partial index rebuilt so that it holds what `find` with its filter returns, plus the documents the filter cannot decide ([ADR-183](decisions.md), [ADR-185](decisions.md)) — **moves no bytes of the layout** and changes what a partial index's entries mean. One transaction per index, with a marker per index so an interrupted run resumes rather than starting again. Schema 4 is written with the *first* index, so a half-migrated directory is refused by the older build rather than opened and maintained under the old rule. **Not run on the way to 5**: 4 → 5 rebuilds every index under the current rule, which covers it |
-| 4 → 5 | Every number key made exact ([ADR-238](decisions.md)): every document with an integer `_id` re-keyed and **every index drained and rebuilt**, in chunks that each commit and resume. A **rollback boundary**: from the moment it starts, 0.50 and 0.49 refuse the store. See [Storage schema 5](#storage-schema-5-the-first-start-of-0510) |
+**Upgrading from 0.52.x or older to 0.53.0: stop all, wipe, start all, reseed.**
+1. Stop every member.
+2. Move each data directory aside (it is the rollback) and create an empty one
+   with the same owner.
+3. Start every member on 0.53.0. A member started on an old directory exits with
+   the schema refusal and writes nothing to it; one that meets an older peer
+   logs the protocol refusal.
+4. Check `/readyz` on each member and that `/v1/topology` lists every member
+   live, then reseed from your source of truth.
 
-All four are idempotent and run before the node serves anything.
-
-> **Back up the data directory before a version-crossing upgrade**, and for
-> 0.51.0 roll with the deploy tool's `BACKUP=true`: the backup taken before the
-> upgrade is the only way back to 0.50 or 0.49. The
-> migration is transactional per step, but a rollback to the older build is not
-> possible once it has run — the older build will refuse the newer schema. **An
-> upgrade interrupted part-way cannot be rolled back either**, and deliberately
-> so: from schema 4 the version is written with the first index rebuilt, so a
-> directory holding a mixture of rebuilt and not-yet-rebuilt partial indexes is
-> refused rather than opened by a build that would maintain the rest under the
-> old rule and leave entries no query can find. To roll a single member back,
-> wipe its data directory and let it catch up from its peers, keeping clients
-> off it until it has (see [ADR-183](decisions.md)); to roll the whole cluster
-> back, restore the backup.
+There is no mixed-version cluster and no member-at-a-time roll across this
+release. **Rolling back:** stop every member, then start 0.52.x on the data
+directories moved aside at the upgrade, or wipe and reseed; 0.52 refuses a
+schema-6 store, and nothing a 0.53 store held crosses back.
 
 ### Storage schema 5: the first start of 0.51.0
+
+This section records what 0.51.0 did. 0.53.0 does not migrate: it refuses a store of schema 5 or older ([Upgrades](#upgrades)).
+
+0.51.0's migration, as a bound on the open's cost, added about 16 us per document re-keyed and 8 us per document per index to the walk of the retained oplog, and `/readyz` reported its steps as the phases `preflight`, `migrating`, `draining` and `refilling`, each with its own `done` of `total`.
 
 **The first start of 0.51.0 on a store of an earlier release migrates it before
 the node serves anything** ([ADR-238](decisions.md)). Every number key on disk
@@ -3039,9 +3024,8 @@ newer than the build: the storage schema, the redb major.minor, or redb's file
 format. The database and its sidecar are left byte for byte as they were. A
 newer redb *patch* alone is not a boundary.
 
-"Writes nothing" applies to refusing a **newer** store. Upgrading an **older**
-store still migrates it, and a migration can stop partway through, for example
-on a partial filter this build can't parse, as described above.
+Since 0.53.0 the refusal is the same for an **older** store: it is refused by
+name and nothing is written to it ([Upgrades](#upgrades)).
 
 **The release after 0.36.0 moves redb from 4.1 to 4.3, and that is a rollback
 boundary.** Once a store has been opened by it, 0.36.x refuses the store and
@@ -3341,81 +3325,6 @@ per vector collection on each member**:
   names it. A graph 0.51 rebuilds and saves loses the mark, and a member
   rolled forward again serves it once and rebuilds it.
 
-### Vector chunk ids in 0.51.0
-
-Until 0.51.0 a vector chunk was stored under its source `_id`'s display text,
-so **every binary `_id` of one length (every UUID) in a collection shared one
-chunk set**, and a String `_id` shared the chunks of the integer or ObjectId it
-prints as. Such a collection kept one document's vectors per id length, a
-delete of any document removed them, and a filtered search could return a
-document its filter excluded. 0.51.0 stores each chunk under an encoding that
-tells every two documents apart ([ADR-239](decisions.md)), and **keeps the old
-id for ObjectId, integer and every other String `_id`**, so those chunks do not
-move.
-
-- **Reads are right from the first start**, on every 0.51.0 member: a
-  document's chunks are read by the document their record names, under the new
-  id and under the old one.
-- **Every collection the server embeds is rechecked once.** A single node
-  queues the recheck at its first start, logged once at `INFO` (`queued a
-  one-time recheck of embedded collections for 0.51.0's vector chunk ids`,
-  with the collections), and its scans log `the 0.51.0 chunk-id recheck` as
-  their reason. A cluster member rechecks the collections it owns at its
-  first start, once its ownership has held, as every start's rescan of what a
-  member owns does. The collection's owner rescans it: **every document with a binary `_id` is
-  re-embedded once**, one provider call's worth each, though only one per id
-  length still had vectors; the chunks of a String `_id` that begins with `~`,
-  is 24 lowercase hex digits or is an integer's decimal are **moved, with no
-  provider call**, unless an integer or ObjectId of the same text shares them,
-  in which case it is re-embedded; everything else reads as current and costs
-  a read. A single node records that the recheck was queued
-  (`vector_chunk_ids` in its metadata), so later starts queue nothing; **a
-  backup taken before 0.51.0 and restored on it is queued again.** Size the
-  provider budget for the binary-keyed documents.
-- **Client-supplied (`byo`) collections are not rechecked**: no worker writes
-  them. Their vectors are served as they are, and the client's next `PUT` of a
-  document's vectors stores them under the new id and removes the old.
-- **Every vector index rebuilds once.** The HNSW snapshot on disk
-  (`<data_dir>/hnsw/`) is now format 3, keyed by the ids chunks are stored
-  under; a format-2 snapshot is refused (`discarding an unusable HNSW
-  snapshot`, `snapshot format 2 is not 3`) and rebuilt on the collection's first
-  search after the upgrade, on each member. A format-3 snapshot also records
-  how many times the collection's chunks had been moved to other ids when it
-  was built (`vector_renames:<collection id>` in the store's metadata, which
-  counts the moves this member made and the removals replication brought it),
-  and one saved before the recheck moved them is rebuilt after a restart rather
-  than served with ids that no longer exist, on the owner and on every other
-  member. Nothing to do.
-- **During a roll** both builds write the same ids for ObjectId, integer and
-  plain-String documents. For a binary or reserved-String document the ids
-  differ: a 0.51.0 member reads a 0.50 member's chunks and moves or re-embeds
-  them at its next look, a 0.50 member finds a 0.51.0 member's only by a full
-  scan, and each move of a collection's ownership between the two builds costs
-  one provider call per such document. Members converge either way, and
-  deletes reach both kinds of id, **except one case**: a 0.50 member's delete
-  of a document whose `_id` is a String equal to an integer's decimal or an
-  ObjectId's hex removes the integer's or ObjectId's vectors too, on every
-  member. Each member says in its facts block which chunk-id format it writes
-  (`vector_chunk_ids`); **when every live member writes 0.51.0's**, logged at
-  `INFO` (`every live member now writes 0.51.0's vector chunk ids`), each
-  owner rechecks its collections once more after its ownership has held, which
-  re-embeds such a document and judges again whatever a 0.50 member wrote
-  after a document was last judged. **That happens about 30 s after the last
-  0.50 member leaves**, when it stops to be upgraded, not when it returns.
-  What it wrote that no peer had pulled before it stopped arrives when it
-  comes back as 0.51.0: its own first-sight rescan judges it in the
-  collections it then owns, and in any other the document's next write or a
-  restart of that collection's owner does. The filter defect stays on 0.50
-  members until they are upgraded. To force a recheck of a collection by hand
-  on a cluster, restart its owner: every clustered start rescans what the
-  member owns.
-- **Rolling back to 0.50.x** needs no store work: no schema, codec, wire field
-  or configuration key changed. A 0.50 build finds the chunks 0.51.0 wrote for
-  binary and reserved-String documents only by full scans and does not remove
-  them when their document is deleted (a search drops their hits, but they keep
-  storage), the shared chunk sets come back, and it rebuilds each vector index
-  once, refusing the format-3 snapshots.
-
 ### Rebuild vector indexes after upgrading past 2026-08-15
 
 **Builds before this date could produce an HNSW index that silently lost part
@@ -3496,7 +3405,7 @@ node. How to read and consume it, and what it does not prove, is in
 |---|---|
 | `no root password configured` | Set `KIMMY_ROOT_PASSWORD` or pass `--insecure-no-auth` on loopback |
 | `insecure_no_auth is set but the server binds to 0.0.0.0` | Bind to `127.0.0.1` or configure auth |
-| `on-disk format version N is not supported` | Data directory written by a **newer** build; older ones migrate automatically |
+| `on-disk format version N is not supported` | Data directory written by a **newer** build, or by an older one: 0.53.0 refuses a store older than schema 6 by name ([Upgrades](#upgrades)) |
 | 401 on a token that worked a moment ago | Token expired (1 h default), or the node has a different `jwt_secret` |
 | 403 where you expected 404 | Deliberate — authorization does not reveal existence |
 | `410 resume_token_expired` | Resume point passed out of the retained oplog; resubscribe |

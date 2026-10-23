@@ -21,11 +21,9 @@ pub struct IndexMeta {
     pub id: u32,
     pub name: String,
     pub fields: Vec<IndexField>,
-    #[serde(default)]
     pub unique: bool,
     /// How `unique` is enforced once the node has peers. Ignored when
     /// `unique` is false.
-    #[serde(default)]
     pub enforcement: Enforcement,
     /// Whether any indexed field has ever held an array — or a path that fans
     /// out through one — in this collection.
@@ -41,7 +39,6 @@ pub struct IndexMeta {
     /// a range — `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}` — so a two-sided
     /// key range is only sound when no document contributes more than one key.
     /// `false` here is what licenses using both bounds.
-    #[serde(default)]
     pub multikey: bool,
     /// Delete a document this many seconds after the indexed date.
     ///
@@ -61,7 +58,6 @@ pub struct IndexMeta {
     ///
     /// Only meaningful on a single-field index over a date, which is enforced
     /// at creation.
-    #[serde(default)]
     pub expire_after_secs: Option<i64>,
     /// Index only the documents matching this filter, as `find` reads it: a
     /// `Decimal128` at a filtered path is decided by its exact value like any
@@ -84,9 +80,8 @@ pub struct IndexMeta {
     /// [`stored_filter`]. It used to be the relaxed form, which read a small
     /// `Int64` back as an `Int32` and a generic `Binary` back as an array, so
     /// the filter every member held and built from was not the filter the
-    /// client wrote. A filter stored that way before ADR-182 is still read as
-    /// it was stored, an array included: nothing records what it was sent as.
-    #[serde(default, with = "stored_filter")]
+    /// client wrote.
+    #[serde(with = "stored_filter")]
     pub partial_filter: Option<Document>,
     /// The stamp of the create that produced *this* index, at its origin:
     /// the stamp of the `CreateIndex` entry a local create minted, or the
@@ -101,16 +96,13 @@ pub struct IndexMeta {
     /// have to agree on a winner, which is the later stamp, exactly as two
     /// concurrent writes to one document do ([`Stamp::wins_over`], ADR-020).
     ///
-    /// **`None` is an index created before the stamp existed**, and reads as
-    /// *older than every drop and every rival definition*: a replayed drop
-    /// applies to it and a rival definition is refused rather than resolved,
-    /// which is the behaviour ADR-123 left. Deliberately not backfilled from
-    /// a local clock at open — a stamp invented here would sort after drops
-    /// that genuinely superseded the index and would make this node's copy
-    /// win a comparison it knows nothing about. The ambiguity ends the first
-    /// time the index is recreated. Same reasoning, and the same `None`, as a
-    /// collection's incarnation floor before ADR-081.
-    #[serde(default)]
+    /// `None` while a local create is being built, before its stamp is minted
+    /// under the writer; a stored, replicated or restored definition carries
+    /// one. A `None` reads as *older than every drop and every rival
+    /// definition*: a replayed drop applies to it and a rival definition is
+    /// refused rather than resolved (ADR-123), and it is never backfilled from
+    /// a local clock, which would sort after drops that genuinely superseded
+    /// the index.
     pub created: Option<Stamp>,
 }
 
@@ -119,9 +111,8 @@ pub struct IndexMeta {
 /// **Written** as canonical Extended JSON to a human-readable serializer —
 /// the collection metadata's JSON — and as the plain document to any other,
 /// which is BSON: a `CreateIndex` body and a snapshot page are the bytes they
-/// always were. **Read** exactly as before. The reader already understood the
-/// canonical form, which is why an older build reads a filter a newer one
-/// wrote, and a newer one reads the relaxed form an older one left behind.
+/// always were. **Read** as the plain document, in whichever form it was
+/// written.
 pub mod stored_filter {
     use bson::{Bson, Document};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -209,7 +200,6 @@ pub enum Enforcement {
 pub struct IndexField {
     /// Dot path into the document, e.g. `"address.city"`.
     pub path: String,
-    #[serde(default)]
     pub descending: bool,
 }
 
@@ -375,15 +365,6 @@ mod stored_filter_tests {
         assert!(text.contains("$binary") && text.contains("$numberLong"), "canonical: {text}");
         let back: IndexMeta = serde_json::from_str(&text).unwrap();
         assert_eq!(back.partial_filter, Some(filter()));
-    }
-
-    #[test]
-    fn a_filter_an_earlier_build_stored_reads_as_it_was_stored() {
-        // The relaxed form: what a build before ADR-182 wrote for `filter()`.
-        let text = r#"{"id":1,"name":"f","fields":[{"path":"x","descending":false}],
-                       "partial_filter":{"k":[1,2],"n":{"$gte":5}}}"#;
-        let read: IndexMeta = serde_json::from_str(text).unwrap();
-        assert_eq!(read.partial_filter, Some(doc! {"k": [1, 2], "n": {"$gte": 5_i32}}));
     }
 
     /// `IndexMeta` as it was before ADR-182, field for field, without the

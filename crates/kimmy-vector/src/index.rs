@@ -175,62 +175,18 @@ struct SnapshotMeta {
     /// `created` rather than `incarnation_floor`, which is `None` on a first
     /// creation and so cannot tell two incarnations apart when it matters
     /// most.
-    ///
-    /// Defaulted on read so that a format-1 file, which has no such field,
-    /// parses far enough for the format check below to name what is wrong,
-    /// rather than failing on a missing field first. Either way it is refused.
-    #[serde(default)]
     created: Hlc,
     keys: Vec<String>,
     /// [`Engine::vector_renames`] of the shadow when the graph was built: a
-    /// move of chunks to other ids since (an adoption, or a re-embed that took
-    /// a document off its 0.50 ids) keeps the count and changes the keys, so
-    /// a previous process's graph is judged by this as well as by the count
-    /// (ADR-239). Defaulted, for a snapshot without it, which format 3 refuses
-    /// anyway when it is older.
-    #[serde(default)]
+    /// move of chunks to other ids since (a put that removed an id it did not
+    /// rewrite) can keep the count and change the keys, so a previous
+    /// process's graph is judged by this as well as by the count (ADR-239).
     renames: u64,
-    /// Which build of the graph this is ([`GRAPH_BUILD`]); 0 when absent.
-    ///
-    /// A field rather than a format, so that 0.51, which ignores a field it
-    /// does not know, loads this build's graphs (the dump's layout is the
-    /// same) and a rollback rebuilds nothing; and exact, because 0.51 writes
-    /// its `meta.json` from its own fields, so a graph it rebuilt and saved
-    /// over one of these reads as 0 again.
-    #[serde(default)]
-    graph: u32,
 }
 
-/// Bumped when the snapshot layout changes; a mismatch is a rebuild, not a
-/// migration.
-///
-/// 2 added `created`. Every snapshot written by an earlier build is refused
-/// and rebuilt on its first access, which is the ordinary cost of a format
-/// change and cheaper than trusting a graph that cannot say which incarnation
-/// of a name it was built for.
-///
-/// 3 keys the graph by the id each chunk is stored under (ADR-239). A format-2
-/// graph's keys were recomputed from the records under 0.50's chunk ids, which
-/// named every binary `_id` of one length alike and miss every chunk this build
-/// writes for a binary or for a String whose id changed; adopted on an equal
-/// count, it would serve them for as long as the count held. The cost is one
-/// rebuild per vector collection per member, on its first search after the
-/// upgrade. A 0.50 build refuses a format-3 snapshot in turn, and rebuilds.
-///
-/// **Not bumped for 0.52.0's graphs** (ADR-241), which say what built them in
-/// [`SnapshotMeta::graph`] instead: the dump's layout did not change, so a
-/// 0.51 member reads a 0.52 graph and serves it, and a rollback rebuilds
-/// nothing.
+/// The snapshot layout; a snapshot of another format is refused and rebuilt on
+/// its first access, not migrated.
 const SNAPSHOT_FORMAT: u32 = 3;
-
-/// What [`SnapshotMeta::graph`] says of a graph this build made: `hnsw_rs`
-/// 0.3.5, with every point its insertion cut off at layer 0 linked
-/// ([`link_cut_off`]). A snapshot without it (0, the field absent) was built
-/// by 0.3.4, whose graphs left 0.5% to 5% of a collection where no search
-/// reaches it, and is adopted as behind: it serves the search that loaded it,
-/// and the next one rebuilds it. 1 was never written: no release built 0.3.5
-/// graphs without the linking.
-const GRAPH_BUILD: u32 = 2;
 
 /// What the snapshot at `dir` says it was built for, read from its
 /// `meta.json` and nothing else: which incarnation, and at which shape.
@@ -699,9 +655,6 @@ pub struct HnswIndex {
     /// [`SnapshotMeta::renames`]: the shadow's moves of chunk ids when this was
     /// built, read before its walk.
     renames: u64,
-    /// [`SnapshotMeta::graph`]: [`GRAPH_BUILD`] for a graph this build made,
-    /// what the snapshot said for one it loaded.
-    built_by: u32,
     /// The build check's sampled score ([`Reachability::unreachable`]); 0 for
     /// a graph loaded from a snapshot, which was not sampled here.
     unreached: usize,
@@ -844,11 +797,10 @@ impl HnswIndex {
         // headroom a rebuild needed, paid every `MAX_STALENESS` under writes.
         //
         // The key is the id the chunk is stored under, never one recomputed
-        // from the record (ADR-239): the record's source carries no binary
-        // subtype, and a chunk under a 0.50 id is not at the id this build
-        // would compute, so a recomputed key misses both. A record stored
-        // under an id that is not a String (a client's insert into the
-        // shadow) has no key a load can name, and is left out.
+        // from the record (ADR-239), so a graph and its documents agree on
+        // the key by construction. A record stored under an id that is not
+        // a String (a client's insert into the shadow) has no key a load
+        // can name, and is left out.
         // Read before the walk, so a move that lands during it makes the
         // graph read as behind, never as fresh.
         let renames = engine.vector_renames(shadow.id)?;
@@ -971,7 +923,6 @@ impl HnswIndex {
             created: shadow.created,
             bytes,
             renames,
-            built_by: GRAPH_BUILD,
             unreached: 0,
         };
 
@@ -1057,13 +1008,6 @@ impl HnswIndex {
         self.unreached
     }
 
-    /// Whether this build's library and linking made the graph
-    /// ([`GRAPH_BUILD`]). A loaded graph that was not is behind whatever the
-    /// store holds.
-    pub(crate) fn built_by_this_build(&self) -> bool {
-        self.built_by >= GRAPH_BUILD
-    }
-
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -1118,7 +1062,6 @@ impl HnswIndex {
             created: self.created,
             keys: self.keys.clone(),
             renames: self.renames,
-            graph: self.built_by,
         };
         std::fs::write(
             staging.join("meta.json"),
@@ -1214,7 +1157,6 @@ impl HnswIndex {
             created: meta.created,
             bytes,
             renames: meta.renames,
-            built_by: meta.graph,
             unreached: 0,
         })
     }
@@ -1245,13 +1187,11 @@ impl HnswIndex {
     ///
     /// `allowed` holds *document* ids. A candidate is admitted only once its
     /// record is loaded, by the document the record names (ADR-239): a key
-    /// names a slot, not who holds it, and a chunk a 0.50 build left at
-    /// another document's id, or debris, would be admitted under one document
-    /// and returned as another. **What is loaded is chosen by the key first**
-    /// ([`may_hold`]): only a key that can hold an admitted document's chunk,
-    /// its run's or its 0.50 id, so a filtered search reads what it reads
-    /// unfiltered scaled by the filter, not every candidate of the widened
-    /// walk.
+    /// names a slot, not who holds it, and debris would be admitted under one
+    /// document and returned as another. **What is loaded is chosen by the key
+    /// first** ([`may_hold`]): only a key that can hold an admitted document's
+    /// chunk, so a filtered search reads what it reads unfiltered scaled by the
+    /// filter, not every candidate of the widened walk.
     ///
     /// **A filtered search returns as many hits as the admitted documents can
     /// give, up to `k`** (ADR-241). Filtering happens after the walk, so the
@@ -1359,12 +1299,11 @@ impl HnswIndex {
     ) -> Result<Walked> {
         let keys = self.search_keys(query, width)?;
         let candidates = keys.len();
-        let old_forms = allowed.map(old_forms).unwrap_or_default();
 
         let mut hits = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(allowed) = allowed
-                && !may_hold(allowed, &old_forms, &key)
+                && !may_hold(allowed, &key)
             {
                 continue;
             }
@@ -1455,34 +1394,15 @@ fn walk_width(k: usize, filtered: bool) -> usize {
     if filtered { over_fetch * 8 } else { over_fetch }
 }
 
-/// The 0.50 forms of the admitted documents whose chunk ids changed in 0.51.0
-/// ([`VectorRecord::legacy_prefix`], less its `#`): the text before a key's
-/// last `#` when it holds such a document's chunk under the id a 0.50 build
-/// wrote. Empty unless the filter admitted a binary or a reserved String.
-fn old_forms(allowed: &HashSet<DocId>) -> HashSet<String> {
-    allowed
-        .iter()
-        .filter_map(VectorRecord::legacy_prefix)
-        .map(|mut prefix| {
-            prefix.pop();
-            prefix
-        })
-        .collect()
-}
-
 /// Whether the chunk at `key` can be an admitted document's, judged before it
-/// is loaded: its id parses to a source of one (a binary's under any subtype,
-/// as the document key folds it), or it is one's 0.50 id (`old_forms`). Those
-/// are exactly the places a document's own read covers, its run and its 0.50
-/// ids, so no chunk of an admitted document is passed over; whether a loaded
-/// chunk is that document's is still the record's to say.
-fn may_hold(allowed: &HashSet<DocId>, old_forms: &HashSet<String>, key: &str) -> bool {
-    let by_run = VectorRecord::parse_key(key)
+/// is loaded: its id parses to a source of one (a binary's under its own
+/// subtype). That is exactly the place a document's own read covers, its run,
+/// so no chunk of an admitted document is passed over; whether a loaded chunk
+/// is that document's is still the record's to say.
+fn may_hold(allowed: &HashSet<DocId>, key: &str) -> bool {
+    VectorRecord::parse_key(key)
         .and_then(|(source, _)| source.document())
-        .is_some_and(|document| allowed.contains(&document));
-    let by_legacy = !old_forms.is_empty()
-        && key.rsplit_once('#').is_some_and(|(text, _)| old_forms.contains(text));
-    by_run || by_legacy
+        .is_some_and(|document| allowed.contains(&document))
 }
 
 /// Fetch one chunk record by its stored key.
@@ -3259,7 +3179,7 @@ mod tests {
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
         let mut ids = Vec::new();
         for i in 0..n {
-            let id = DocId::Binary(vec![i; 16]);
+            let id = DocId::Binary { subtype: 4, bytes: vec![i; 16] };
             let angle = f32::from(i) * 0.05;
             put_as_uuid(&engine, &shadow, &id, vec![angle.cos(), angle.sin()], &format!("doc {i}"));
             ids.push(id);
@@ -3274,7 +3194,7 @@ mod tests {
     fn assert_walk_returns(index: &HnswIndex, query: &[f32], width: usize, documents: &[DocId]) {
         let walked = index.search_keys(query, width).unwrap();
         for document in documents {
-            let DocId::Binary(bytes) = document else { panic!("a binary") };
+            let DocId::Binary { bytes, .. } = document else { panic!("a binary") };
             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
             let key = format!("~b:{hex}.04#0");
             assert!(
@@ -3292,8 +3212,7 @@ mod tests {
         vector: Vec<f32>,
         text: &str,
     ) {
-        let DocId::Binary(bytes) = id else { panic!("a binary") };
-        let source = ChunkSource::Binary { subtype: 4, bytes: bytes.clone() };
+        let source = ChunkSource::from(id);
         let record = VectorRecord {
             source: id.clone(),
             chunk: 0,
@@ -3371,30 +3290,8 @@ mod tests {
         }
     }
 
-    /// What built a loaded graph is what its snapshot says: this build's
-    /// marker as saved, and nothing when the field is absent, as in every
-    /// snapshot 0.51 and earlier wrote (ADR-241).
-    #[test]
-    fn a_snapshot_says_what_built_its_graph() {
-        let (engine, shadow, _ids, _dir) = uuid_documents(10);
-        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
-        assert!(index.built_by_this_build());
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("snapshot");
-        index.save(&path).unwrap();
-        let loaded = HnswIndex::load(&path, Metric::Cosine, 2, shadow.created).unwrap();
-        assert!(loaded.built_by_this_build(), "as saved");
-
-        let mut meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path.join("meta.json")).unwrap()).unwrap();
-        meta.as_object_mut().unwrap().remove("graph");
-        std::fs::write(path.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
-        let loaded = HnswIndex::load(&path, Metric::Cosine, 2, shadow.created).unwrap();
-        assert!(!loaded.built_by_this_build(), "0.51's snapshot, which has no marker");
-    }
-
-    /// Test 18: a snapshot in the format a 0.50 build wrote, whose keys were
-    /// recomputed from the records, is refused, and so rebuilt.
+    /// Test 18: a snapshot of another format, whose keys were recomputed from
+    /// the records, is refused, and so rebuilt.
     #[test]
     fn a_format_2_snapshot_is_refused() {
         let (engine, shadow, _ids, _dir) = uuid_documents(10);
@@ -3411,65 +3308,49 @@ mod tests {
         let refused = HnswIndex::load(&path, Metric::Cosine, 2, shadow.created);
         assert!(
             matches!(&refused, Err(VectorError::Snapshot(detail)) if detail.contains("format 2")),
-            "a format-2 graph keyed by 0.50's ids must not be adopted: {:?}",
+            "a format-2 graph must not be adopted: {:?}",
             refused.as_ref().err()
         );
     }
 
     /// The filtered graph path loads a candidate only when its key can hold an
-    /// admitted document's chunk, and that includes the ids a 0.50 build
-    /// wrote: an admitted binary whose only chunk is at `bin(16 bytes)#0`, and
-    /// an admitted reserved String whose only chunk is at its raw text, are
-    /// found; another document's chunk at those ids is still refused by its
+    /// admitted document's chunk: an admitted reserved String whose only chunk
+    /// is at its run is found; another document's chunk is still refused by its
     /// record.
     #[test]
-    fn the_filtered_graph_finds_a_document_whose_only_chunk_is_under_its_050_id() {
+    fn the_filtered_graph_finds_a_reserved_string_whose_only_chunk_is_in_its_run() {
         let (engine, shadow, ids, _dir) = uuid_documents(40);
-        let old_binary = DocId::Binary(vec![200; 16]);
         let tilde = DocId::String("~x".into());
-        for (key, source, vector, text) in [
-            ("bin(16 bytes)#0", &old_binary, vec![1.0, 0.0], "old binary"),
-            ("~x#0", &tilde, vec![0.999, 0.04], "old tilde"),
-        ] {
+        {
             let record = VectorRecord {
-                source: source.clone(),
+                source: tilde.clone(),
                 chunk: 0,
                 source_hlc: Hlc::new(1, 0),
-                vector,
-                text: text.into(),
+                vector: vec![0.999, 0.04],
+                text: "old tilde".into(),
                 config: None,
             };
             let doc = bson::serialize_to_document(&record).unwrap();
-            engine.replace(&shadow, &DocId::String(key.into()), doc, true).unwrap();
+            engine.replace(&shadow, &DocId::String("~s:~x#0".into()), doc, true).unwrap();
         }
         let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
-        let allowed: HashSet<DocId> =
-            [old_binary.clone(), tilde.clone(), ids[1].clone()].into_iter().collect();
+        let allowed: HashSet<DocId> = [tilde.clone(), ids[1].clone()].into_iter().collect();
         let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
         // The walk returns every admitted chunk first, so a red below names
         // the key pre-filter or the admission, and a red here graph recall.
         // This test failed about one run in sixteen on hnsw_rs 0.3.4, whose
-        // graph left `~x#0` unreachable: that red was here, not below.
+        // graph left `~s:~x#0` unreachable: that red was here, not below.
         let walked = index.search_keys(&[1.0, 0.0], walk_width(options.k, true)).unwrap();
-        for key in ["bin(16 bytes)#0", "~x#0"] {
-            assert!(
-                walked.iter().any(|k| k == key),
-                "graph recall: the walk of {} returned {} keys and not {key}",
-                walk_width(options.k, true),
-                walked.len()
-            );
-        }
+        assert!(
+            walked.iter().any(|k| k == "~s:~x#0"),
+            "graph recall: the walk of {} returned {} keys and not ~s:~x#0",
+            walk_width(options.k, true),
+            walked.len()
+        );
         assert_walk_returns(&index, &[1.0, 0.0], walk_width(options.k, true), &ids[1..3]);
         let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&allowed)).unwrap();
         let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
-        assert_eq!(
-            got,
-            [
-                (old_binary, "old binary".to_string()),
-                (tilde, "old tilde".to_string()),
-                (ids[1].clone(), "doc 1".to_string())
-            ]
-        );
+        assert_eq!(got, [(tilde, "old tilde".to_string()), (ids[1].clone(), "doc 1".to_string())]);
         // A 16-byte binary not admitted keeps its own chunks out.
         let only: HashSet<DocId> = [ids[2].clone()].into_iter().collect();
         let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&only)).unwrap();
@@ -3477,29 +3358,32 @@ mod tests {
     }
 
     /// The key pre-filter loads what the filter can admit and nothing else:
-    /// a candidate whose key names no admitted document, in its run or under a
-    /// 0.50 id, is never read.
+    /// a candidate whose key names no admitted document, in its run, is never
+    /// read.
     #[test]
-    fn the_key_pre_filter_admits_by_run_and_by_050_id_only() {
-        let allowed: HashSet<DocId> =
-            [DocId::Binary(vec![1; 16]), DocId::String("7".into()), DocId::Int64(9)]
-                .into_iter()
-                .collect();
-        let old = old_forms(&allowed);
+    fn the_key_pre_filter_admits_by_run_only() {
+        let allowed: HashSet<DocId> = [
+            DocId::Binary { subtype: 4, bytes: vec![1; 16] },
+            DocId::String("7".into()),
+            DocId::Int64(9),
+        ]
+        .into_iter()
+        .collect();
         let hex: String = std::iter::repeat_n("01", 16).collect();
         for (key, expected) in [
             (format!("~b:{hex}.04#0"), true),
-            (format!("~b:{hex}.00#3"), true),
-            ("bin(16 bytes)#0".to_string(), true),
+            (format!("~b:{hex}.04#3"), true),
+            (format!("~b:{hex}.00#3"), false),
+            ("bin(16 bytes)#0".to_string(), false),
             ("~s:7#0".to_string(), true),
-            ("7#0".to_string(), true),
+            ("7#0".to_string(), false),
             ("9#2".to_string(), true),
             ("8#0".to_string(), false),
             ("bin(8 bytes)#0".to_string(), false),
             ("~s:8#0".to_string(), false),
             ("junk".to_string(), false),
         ] {
-            assert_eq!(may_hold(&allowed, &old, &key), expected, "{key}");
+            assert_eq!(may_hold(&allowed, &key), expected, "{key}");
         }
     }
 }

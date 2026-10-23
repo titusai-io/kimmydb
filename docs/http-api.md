@@ -1076,22 +1076,16 @@ is stored with 34 digits, `1E+6144` as `1000000000000000000000000000000000E+6111
 crate's parser, which took `""`, `"."` and `"-"` as zero, `"++1"` as `1`,
 `"0+5"` as `5` and `"e100"` as `0E+100`; each is now refused.
 
-**A binary `_id` is echoed with its subtype, but keyed without it.** The ids
-a write or a report answers with (`insertedId`, `insertedIds`, `upsertedId`,
-and the `ids` and `merged` of `GET .../violations`) are the `_id` as stored,
-subtype included, so `find {_id: <echo>}` finds the document. Two things
-still carry the subtype folded to `00`:
-- **A change stream's and a webhook's `documentKey`, and a `uniqueViolation`
-  event's `documentKeys` and `merged`.** A delete's entry carries no body, so
-  its key cannot carry the subtype, and an insert's `documentKey` that did
-  would never match its later delete's. Match a binary `documentKey` on its
-  bytes, or read the subtype from `fullDocument`.
-- **The document key.** A binary `_id` is keyed by its length and bytes only,
-  so `BinData(0, X)`, `BinData(3, X)` and `BinData(4, X)` are one document: a
-  second insert of the same bytes under another subtype is refused
-  `duplicate_key`, and writes of the two on two members are merged into one
-  document, last writer wins. **Do not mix subtypes for one value**: write a
-  UUID in one representation everywhere.
+**A binary `_id` carries its subtype everywhere.** `BinData(0, X)` and
+`BinData(4, X)` are two documents ([ADR-251](decisions.md#adr-251--binary-_id-subtypes)):
+a second insert of the same bytes under another subtype succeeds, and a second
+insert of the same subtype is refused `duplicate_key`. `{_id: BinData(4, X)}`
+finds only that one. Every rendering of a binary `_id` shows its real
+subtype: `insertedId`, `insertedIds`, `upsertedId`, the `ids` and `merged` of
+`GET .../violations`, a change stream's and a webhook's `documentKey`, a
+`uniqueViolation` event's `documentKeys` and `merged`, and the `_id` of a
+vector hit. Binary `_id`s order by length, then subtype, then bytes, for
+`sort: {_id: 1}`, `{_id: -1}`, the range operators and `nextCursor` paging.
 
 **Whole numbers stay integers.** A JSON `42` becomes `Int32`, not `Double`.
 Widening would break `$type` queries and lose precision above 2^53; `2^53 + 1`
@@ -1287,7 +1281,7 @@ its block. `yielding` lists the classes the node yields (`ttl`, `webhooks`,
 `embeddings`); `classState` says how each class stands on it (`ok`, `idle`,
 `suspect`, `stalled`, or `unknown`). For the answering node these are what its own
 evaluator last decided; for a peer, what its last block said. They are present
-only when there is something to say: for a peer from an older build `yielding` is
+only when there is something to say: for a peer that has sent no block `yielding` is
 `[]` and `classState` is absent, and it is never a target for a yield. They are **advertised, not effective**: a member
 keeps owning a class it yields until every live peer has confirmed it, so read
 them as "where work is going", and compare members after a lease, never a single
@@ -1300,7 +1294,7 @@ single writer has been held for more than 60 seconds, so no write can be made an
 peer hands it work, and `"runtime"` when its async runtime stalled within the last
 judged ticks. **Advisory:** writes and owner work on that node may stall, reads may
 still be served, prefer a node without it. It says nothing of `catchingUp` or
-`classState`. **A missing `degraded` is not "healthy"**: a peer of an older build, a
+`classState`. **A missing `degraded` is not "healthy"**: a
 peer the answering node holds no block from and a member still starting have none.
 When every node has it, use them anyway; it orders a preference and forbids nothing.
 `status` is unchanged.
