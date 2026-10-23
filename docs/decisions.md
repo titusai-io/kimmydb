@@ -20479,7 +20479,7 @@ release, and a format change also moves the header byte. Refusing on a patch
 would make every routine dependency bump a rollback boundary for nothing, and a
 patch that did change the file would move the header byte, which step 2
 refuses. So the two checks together catch a format change at any version level.
-`redb = "~4.3"` in `Cargo.toml` keeps a minor bump a deliberate edit. A test
+`redb = "~4.4"` in `Cargo.toml` keeps a minor bump a deliberate edit. A test
 compares `REDB_MAJOR_MINOR` against `Cargo.lock`, and another creates a store
 and pins its format byte to 3.
 

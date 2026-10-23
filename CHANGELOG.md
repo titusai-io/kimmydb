@@ -12,6 +12,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+**Read before upgrading: 0.54.0 moves redb from 4.3 to 4.4 and does not open a store 0.53.0 wrote. Stop every member, wipe the data, start on empty directories and reseed.**
+
+**Breaking:** the store records the redb major.minor that wrote it in `kimmy.format`, and a build refuses a store whose major.minor is not its own, so a store written under redb 4.3 is refused with nothing written.
+
 The minimum supported Rust is 1.99.
 
 ## 0.53.0 - 2026-10-23

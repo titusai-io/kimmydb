@@ -48,11 +48,11 @@ use crate::error::{RefusedKind, Result, StorageError};
 use crate::tables;
 
 /// The redb major.minor this build is compiled against. `Cargo.toml` pins redb
-/// to `~4.3`, so a patch release is the only kind that can arrive unnoticed; a
+/// to `~4.4`, so a patch release is the only kind that can arrive unnoticed; a
 /// test holds this constant to `Cargo.lock`.
-pub const REDB_MAJOR_MINOR: (u64, u64) = (4, 3);
+pub const REDB_MAJOR_MINOR: (u64, u64) = (4, 4);
 
-/// The file-format byte redb 4.3 writes in each commit slot, the same as 4.1's.
+/// The file-format byte redb 4.4 writes in each commit slot, the same as 4.1's.
 /// A test creates a store and reads it back.
 pub const REDB_FILE_FORMAT: u8 = 3;
 
@@ -1960,7 +1960,7 @@ mod tests {
         std::fs::File::open(&path).unwrap().try_lock().expect("nothing holds the store");
     }
 
-    /// Why the catches around redb's opens exist, kept honest: redb 4.3
+    /// Why the catches around redb's opens exist, kept honest: redb 4.4
     /// itself, with nothing in front of it, panics on a commit slot that
     /// verifies and names a root of the wrong order inside the file, where it
     /// should return an error. The store is a plain redb file of 500 rows.
@@ -2022,7 +2022,7 @@ mod tests {
         assert!(fingerprints(&path) == before, "the store or its sidecar changed");
     }
 
-    /// Why [`check_roots`] exists, kept honest: redb 4.3 itself, with nothing
+    /// Why [`check_roots`] exists, kept honest: redb 4.4 itself, with nothing
     /// in front of it, still allocates a root page that lies past the file's
     /// end before it fails, rather than refusing it without allocating. Each
     /// open runs plain redb in a child. The damaged file's root is of order

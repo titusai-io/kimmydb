@@ -110,11 +110,11 @@ bson = { version = "3", features = ["serde", "serde_json-1", "uuid-1"] }
 toml = "1"
 
 # Storage
-# Pinned to 4.3.x: a redb minor may change allocator or system-table rules,
+# Pinned to 4.4.x: a redb minor may change allocator or system-table rules,
 # which is a format event for a store (ADR-190). A patch may not.
 # redb's `cache_metrics` is not enabled here: kimmy-storage's `cache-metrics`
 # feature turns it on, for a build that wants `kimmy_storage_cache_*`.
-redb = "~4.3"
+redb = "~4.4"
 
 # HTTP client, for every request the node makes outward: webhook deliveries,
 # the remote embedding providers, and OIDC discovery and JWKS. One spec, so
@@ -247,7 +247,7 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 [profile.dev]
 debug = "line-tables-only"
 
-# redb 4.3's cache statistics count a write's cache hit before its total and
+# redb 4.3 and 4.4 count a write's cache hit before its total and
 # subtract one from the other, so a reading taken between the two increments
 # underflows. With overflow checks, as in dev and test builds, that is a
 # panic on roughly one `/metrics` scrape in a hundred during writes; a release

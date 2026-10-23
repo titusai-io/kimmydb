@@ -7649,7 +7649,7 @@ mod tests {
     #[cfg(feature = "cache-metrics")]
     #[test]
     fn reading_the_cache_while_another_thread_commits_does_not_panic() {
-        // redb 4.3 counts a write's cache hit before its total, and derives
+        // redb 4.3 and 4.4 count a write's cache hit before its total, and derives
         // the misses as the difference, so a reading taken between the two
         // increments underflows: a panic under overflow checks, which debug
         // and test builds have. `[profile.dev.package.redb]` turns them off
