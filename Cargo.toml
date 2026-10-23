@@ -114,7 +114,7 @@ toml = "1"
 # which is a format event for a store (ADR-190). A patch may not.
 # redb's `cache_metrics` is not enabled here: kimmy-storage's `cache-metrics`
 # feature turns it on, for a build that wants `kimmy_storage_cache_*`.
-redb = "~4.3"
+redb = "~4.4"
 
 # HTTP client, for every request the node makes outward: webhook deliveries,
 # the remote embedding providers, and OIDC discovery and JWKS. One spec, so
