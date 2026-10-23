@@ -204,10 +204,10 @@ pub fn update_parse_apply(data: &[u8]) {
             // it was: a result is never a coefficient above 10^34 - 1 or an
             // exponent out of range, in a field the update changed.
             for (key, value) in &target {
-                if let Bson::Decimal128(d) = value {
-                    if fixture.get(key) != Some(value) {
-                        assert_canonical(d, &doc);
-                    }
+                if let Bson::Decimal128(d) = value
+                    && fixture.get(key) != Some(value)
+                {
+                    assert_canonical(d, &doc);
                 }
             }
         }
