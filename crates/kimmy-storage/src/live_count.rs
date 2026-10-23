@@ -317,7 +317,7 @@ pub(crate) fn live_count(txn: &redb::ReadTransaction, id: kimmy_core::Collection
 /// position, then the oplog's newest key if it has one.
 ///
 /// **Both, because either alone comes back to a value it held.** The arrival
-/// end moves down when a rewind or retention removes rows, and appending as
+/// end moves down when rows are removed behind the counts, and appending as
 /// many entries as were removed brings it back to exactly the mark; the oplog's
 /// newest key moves on with that append. A store written behind the counts
 /// matches neither.
@@ -1304,8 +1304,13 @@ mod tests {
     /// Write `name` into `coll` the way a repair or a restore can: the record, its
     /// oplog entry and both halves of the arrival index, and neither the count nor
     /// the mark.
-    fn write_behind_the_counts(engine: &Engine, coll: &CollectionMeta, name: &str, live: bool) {
-        let stamp = engine.next_stamp();
+    fn write_behind_the_counts(
+        engine: &Engine,
+        coll: &CollectionMeta,
+        name: &str,
+        live: bool,
+        stamp: Stamp,
+    ) {
         let body = bson::serialize_to_vec(&doc! { "_id": name }).unwrap();
         let record = codec::encode_doc_record(&match live {
             true => kimmy_core::DocRecord::live(stamp, body.clone()),
@@ -1345,8 +1350,8 @@ mod tests {
         txn.commit().unwrap();
     }
 
-    /// Take the newest write out of the store the way a restore to an older copy
-    /// does: its record, its oplog entry and both halves of the arrival index, and
+    /// Take the newest write out of the store the way an edit outside the engine
+    /// would: its record, its oplog entry and both halves of the arrival index, and
     /// neither the count nor the mark.
     fn remove_behind_the_counts(engine: &Engine, coll: &CollectionMeta, name: &str) {
         let key = crate::docs::doc_key(&id(name)).unwrap();
@@ -1381,12 +1386,31 @@ mod tests {
             engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
             engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
             remove_behind_the_counts(&engine, &coll, "undone");
-            write_behind_the_counts(&engine, &coll, "older", false);
+            write_behind_the_counts(&engine, &coll, "older", false, engine.next_stamp());
             coll.id
         };
         let engine = Engine::open(&path).unwrap();
         assert_counts_exact(&engine, "an open after a write behind the counts followed a removal");
         assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn a_write_behind_the_counts_under_the_newest_key_is_caught_at_open() {
+        // The other half of the mark: the write is stamped before the oplog's
+        // newest entry, so that key does not move and only the arrival end tells.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let coll_id = {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            let older = engine.next_stamp();
+            engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+            write_behind_the_counts(&engine, &coll, "older", true, older);
+            coll.id
+        };
+        let engine = Engine::open(&path).unwrap();
+        assert_counts_exact(&engine, "an open after a write stamped under the newest key");
+        assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(2));
     }
 
     /// Every write to `DOCS` goes through this module, or a count drifts.

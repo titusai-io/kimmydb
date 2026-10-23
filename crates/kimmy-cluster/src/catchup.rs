@@ -1474,8 +1474,8 @@ fn mutual_clear_holds(
     //    be reached and is not. Kept as a comment and not as a second check: a
     //    predicate that no input can reach alone is one no test can hold.
     // 4. Mutual coverage against each one's last known vectors, both from the same
-    //    frame: what each holds is not missing from the other. A peer with no
-    //    witnessed vector (empty) covers nothing and takes no part in this rule.
+    //    frame: what each holds is not missing from the other. An empty
+    //    witnessed vector covers only an empty servable one.
     let covered = window.iter().all(|peer| {
         tick.mine_witnessed.covers(&peer.servable) && peer.witnessed.covers(tick.mine_servable)
     });
