@@ -3232,7 +3232,7 @@ async fn a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull() {
 /// margin (`Instant::now() < deadline`) a fourth pull starts whenever the third
 /// ended with any time left, which three pulls of up to 1.3 floors each leave;
 /// on a host that is not that quick the mutation goes unseen by this test, and
-/// is never reported as a failure of the margin. Three assertions:
+/// is never reported as a failure of the margin. Two assertions:
 ///
 /// 1. **The budget cut a drain short**, at least once: a precondition. With
 ///    24 batches behind a tick of three pulls and no more it holds unless the
@@ -3241,8 +3241,18 @@ async fn a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull() {
 /// 2. **No tick made more than three pulls.** This is the claim. Reverting
 ///    `fits_before` to `Instant::now() < deadline` lets a tick whose pulls ran
 ///    at near the floor make a fourth, and this is what fails.
-/// 3. **Some tick drained more than one batch.** Reverting the drain arm in
-///    `peers.rs` makes every contact one pull, and this is what fails.
+///
+/// **That a tick drains several batches is not asserted here**, because no
+/// interval makes it a fact about the margin and not about the host. A second
+/// pull is started only when the first left more than its own duration of the
+/// interval, so a runner on which a pull takes longer than half of 3.9 floors
+/// makes one pull per tick, correctly, and the test, which used to require two,
+/// failed with "25 pulls in 25 contacts, at most 1 in a tick" (reproduced in
+/// Docker on 2 CPUs with eight busy loops competing, three runs in three). The
+/// interval cannot be widened to leave room for the host without the bound in
+/// assertion 2 going with it. The drain arm is held by
+/// `a_peer_five_batches_behind_is_drained_inside_one_tick`, whose interval is
+/// 20 s: with that arm reverted it reads five contacts where it expects one.
 #[tokio::test]
 async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() {
     use kimmy_cluster::ContactEnd;
@@ -3264,8 +3274,6 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     let (looping, mut rx) = drain_loop(&b, relay, interval);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     let (mut budget_ends, mut most_pulls, mut ticks) = (0u64, 0u64, 0usize);
-    let mut contacts = 0usize;
-    let mut pulls_in_all = 0u64;
     while b.engine.count_by_id(ca.id).unwrap() != Some(entries as u64) {
         let report = tokio::time::timeout_at(deadline, rx.recv())
             .await
@@ -3274,10 +3282,7 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
         assert_eq!(report.failed, 0, "a backlog is not a failure: {report:?}");
         ticks += 1;
         budget_ends += report.pulls.contacts[ContactEnd::Budget.slot()];
-        let pulls = report.pulls.serve.count;
-        most_pulls = most_pulls.max(pulls);
-        pulls_in_all += pulls;
-        contacts += report.divergence_checks + report.divergence_skips;
+        most_pulls = most_pulls.max(report.pulls.serve.count);
     }
     looping.abort();
 
@@ -3291,11 +3296,6 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
         most_pulls <= 3,
         "a tick must not start a pull the budget's margin says will not fit: one made \
          {most_pulls} pulls, at an interval of {interval:?} for a floor of {FLOOR:?}"
-    );
-    assert!(
-        most_pulls >= 2 && contacts > 0 && pulls_in_all > contacts as u64,
-        "the ticks must have drained several batches per contact: {pulls_in_all} pulls in \
-         {contacts} contacts, at most {most_pulls} in a tick"
     );
 }
 
