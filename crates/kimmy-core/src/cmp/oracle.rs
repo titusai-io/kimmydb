@@ -3,21 +3,106 @@
 //!
 //! It shares no code with either. A `Decimal128` is read from the `bson`
 //! crate's own text (`Display`) by a parser written here, never through
-//! [`crate::decimal::decode`]; a `Double` through `num-rational`'s exact
-//! conversion; an integer as itself. Values are `num-rational` rationals and
-//! are compared by cross-multiplication, never by `Ratio`'s own `Ord`, which
-//! walks a continued fraction and, on two equal values with twenty-thousand-bit
-//! denominators, recurses for as long as the fraction is.
+//! [`crate::decimal::decode`]; a `Double` through the exact conversion of its
+//! bits, [`Rational::from_f64`]; an integer as itself. Values are [`Rational`]s
+//! over `num-bigint` integers and are compared by cross-multiplication. (They
+//! were `num-rational` rationals until that crate had no release on
+//! `num-bigint` 0.5; its `Ord` walked a continued fraction and, on two equal
+//! values with twenty-thousand-bit denominators, recursed for as long as the
+//! fraction is, so nothing here used it.)
 
 use std::cmp::Ordering;
 use std::sync::OnceLock;
 
 use bson::Bson;
 use num_bigint::{BigInt, Sign};
-use num_rational::BigRational;
 use proptest::prelude::*;
 
 use crate::decimal::{self, MAX_COEFFICIENT, MAX_EXPONENT, MIN_EXPONENT};
+
+/// An exact rational: a numerator over a positive denominator, never reduced
+/// (reducing would cost a twenty-thousand-bit gcd, and every comparison
+/// cross-multiplies).
+#[derive(Clone, Debug)]
+pub(crate) struct Rational {
+    numer: BigInt,
+    denom: BigInt,
+}
+
+/// Equal values are equal however far each is reduced.
+impl PartialEq for Rational {
+    fn eq(&self, other: &Self) -> bool {
+        &self.numer * &other.denom == &other.numer * &self.denom
+    }
+}
+
+impl Eq for Rational {}
+
+impl Rational {
+    pub(crate) fn from_integer(n: BigInt) -> Self {
+        Rational { numer: n, denom: BigInt::from(1) }
+    }
+
+    /// `numer / denom` as given; the denominator must be positive.
+    pub(crate) fn new_raw(numer: BigInt, denom: BigInt) -> Self {
+        assert!(denom.sign() == Sign::Plus, "a positive denominator");
+        Rational { numer, denom }
+    }
+
+    /// A finite double, exactly: `±mantissa × 2^exponent` from its bits.
+    pub(crate) fn from_f64(v: f64) -> Option<Self> {
+        if !v.is_finite() {
+            return None;
+        }
+        let bits = v.to_bits();
+        let biased = ((bits >> 52) & 0x7ff) as i64;
+        let fraction = bits & ((1u64 << 52) - 1);
+        let (mantissa, exponent) =
+            if biased == 0 { (fraction, -1074) } else { (fraction | (1 << 52), biased - 1075) };
+        let magnitude = BigInt::from(mantissa);
+        let signed = if v.is_sign_negative() { -magnitude } else { magnitude };
+        Some(if exponent >= 0 {
+            Rational::from_integer(signed << exponent as usize)
+        } else {
+            Rational::new_raw(signed, BigInt::from(1) << (-exponent) as usize)
+        })
+    }
+
+    pub(crate) fn numer(&self) -> &BigInt {
+        &self.numer
+    }
+
+    pub(crate) fn denom(&self) -> &BigInt {
+        &self.denom
+    }
+
+    pub(crate) fn is_integer(&self) -> bool {
+        (&self.numer % &self.denom).sign() == Sign::NoSign
+    }
+
+    /// The greatest integer not above the value.
+    pub(crate) fn floor(&self) -> BigInt {
+        let q = &self.numer / &self.denom;
+        if (&self.numer % &self.denom).sign() == Sign::Minus { q - 1 } else { q }
+    }
+
+    /// `self / other`, for a nonzero `other`.
+    pub(crate) fn div(&self, other: &Rational) -> Rational {
+        assert!(other.numer.sign() != Sign::NoSign, "division by zero");
+        let numer = &self.numer * &other.denom;
+        let denom = &self.denom * &other.numer;
+        if denom.sign() == Sign::Minus {
+            Rational::new_raw(-numer, -denom)
+        } else {
+            Rational::new_raw(numer, denom)
+        }
+    }
+
+    /// `self * other`.
+    pub(crate) fn mul(&self, other: &Rational) -> Rational {
+        Rational::new_raw(&self.numer * &other.numer, &self.denom * &other.denom)
+    }
+}
 
 /// A `Decimal128` as its text spells it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -66,7 +151,7 @@ pub(crate) enum Exact {
     Nan,
     NegInfinity,
     /// Zero included, with a positive denominator.
-    Finite(BigRational),
+    Finite(Rational),
     PosInfinity,
 }
 
@@ -90,29 +175,29 @@ pub(crate) fn pow10(k: u32) -> BigInt {
 /// `±c × 10^e` as an unreduced rational with a positive denominator. Reducing
 /// would cost a twenty-thousand-bit gcd and buy nothing: every comparison
 /// cross-multiplies.
-pub(crate) fn scaled(negative: bool, coefficient: BigInt, exponent: i64) -> BigRational {
+pub(crate) fn scaled(negative: bool, coefficient: BigInt, exponent: i64) -> Rational {
     if coefficient.sign() == Sign::NoSign {
         // A zero's exponent can be anything its bits say; its value is zero.
-        return BigRational::from_integer(coefficient);
+        return Rational::from_integer(coefficient);
     }
     let sign = if negative { BigInt::from(-1) } else { BigInt::from(1) };
     let magnitude = u32::try_from(exponent.unsigned_abs()).expect("an exponent in range");
     if exponent >= 0 {
-        BigRational::new_raw(sign * coefficient * pow10(magnitude), BigInt::from(1))
+        Rational::new_raw(sign * coefficient * pow10(magnitude), BigInt::from(1))
     } else {
-        BigRational::new_raw(sign * coefficient, pow10(magnitude))
+        Rational::new_raw(sign * coefficient, pow10(magnitude))
     }
 }
 
 pub(crate) fn exact(value: &Bson) -> Option<Exact> {
-    let finite = |r: BigRational| Some(Exact::Finite(r));
+    let finite = |r: Rational| Some(Exact::Finite(r));
     match value {
-        Bson::Int32(v) => finite(BigRational::from_integer(BigInt::from(*v))),
-        Bson::Int64(v) => finite(BigRational::from_integer(BigInt::from(*v))),
+        Bson::Int32(v) => finite(Rational::from_integer(BigInt::from(*v))),
+        Bson::Int64(v) => finite(Rational::from_integer(BigInt::from(*v))),
         Bson::Double(v) if v.is_nan() => Some(Exact::Nan),
         Bson::Double(v) if *v == f64::INFINITY => Some(Exact::PosInfinity),
         Bson::Double(v) if *v == f64::NEG_INFINITY => Some(Exact::NegInfinity),
-        Bson::Double(v) => finite(BigRational::from_float(*v).expect("a finite double")),
+        Bson::Double(v) => finite(Rational::from_f64(*v).expect("a finite double")),
         Bson::Decimal128(d) => match parse_text(&d.to_string()) {
             Text::Nan => Some(Exact::Nan),
             Text::Infinity { negative: true } => Some(Exact::NegInfinity),
@@ -139,7 +224,7 @@ fn class(value: &Exact) -> u8 {
 }
 
 /// Compare two rationals with positive denominators by cross-multiplication.
-pub(crate) fn cmp_rational(a: &BigRational, b: &BigRational) -> Ordering {
+pub(crate) fn cmp_rational(a: &Rational, b: &Rational) -> Ordering {
     assert!(a.denom().sign() == Sign::Plus && b.denom().sign() == Sign::Plus);
     (a.numer() * b.denom()).cmp(&(b.numer() * a.denom()))
 }
@@ -274,11 +359,11 @@ pub(crate) fn decimal_near_double(d: f64, offset: i64) -> Option<Bson> {
     if !d.is_finite() || d == 0.0 {
         return None;
     }
-    let r = BigRational::from_float(d.abs()).unwrap();
+    let r = Rational::from_f64(d.abs()).unwrap();
     // A first guess from the float, corrected exactly below.
     let mut e = d.abs().log10().floor() as i64 - 33;
     loop {
-        let c = (&r / scaled(false, BigInt::from(1), e)).floor().to_integer();
+        let c = r.div(&scaled(false, BigInt::from(1), e)).floor();
         if c >= pow10(34) {
             e += 1;
         } else if c < pow10(33) {

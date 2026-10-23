@@ -935,14 +935,15 @@ mod number_keys {
     }
 
     fn oracle_mantissa(v: f64, f: i32) -> BigUint {
-        let r = num_rational::BigRational::from_float(v).unwrap();
-        let scaled = if f >= 0 {
-            r / num_bigint::BigInt::from(BigUint::from(1u32) << f as usize)
-        } else {
-            r * num_bigint::BigInt::from(BigUint::from(1u32) << (-f) as usize)
+        let r = oracle::Rational::from_f64(v).unwrap();
+        let power = |k: i32| {
+            oracle::Rational::from_integer(num_bigint::BigInt::from(
+                BigUint::from(1u32) << k as usize,
+            ))
         };
+        let scaled = if f >= 0 { r.div(&power(f)) } else { r.mul(&power(-f)) };
         assert!(scaled.is_integer());
-        scaled.to_integer().into_parts().1
+        scaled.floor().into_parts().1
     }
 
     /// The inverse of an odd `a` modulo `2^64`.
