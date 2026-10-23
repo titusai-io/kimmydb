@@ -272,6 +272,14 @@ def r1_rows(n):
         emit(double_to_bits(d))
     for _ in range(n // 8):  # integral doubles
         emit(double_to_bits(float(rng.randint(-10 ** 6, 10 ** 6) * 10 ** rng.randint(0, 20))))
+    for _ in range(n // 4):  # integral doubles of 35 digits and more that end in zeros:
+        # they drop only zeros when rounded to 34, so they are exact
+        a = rng.randint(14, 22)
+        c = rng.randrange(1, (1 << 53) // 5 ** a, 2)  # odd, so 5^a is all the fives
+        shift = rng.randint(a + 1, 900)
+        value = c * 5 ** a * 2 ** shift
+        if len(str(value)) >= 35 and value < 2 ** 1023:
+            emit(double_to_bits(math.ldexp(float(c * 5 ** a), shift)))
     for bits in (0, 1 << 63, 1, (1 << 52) - 1, 1 << 52, 0x7FEFFFFFFFFFFFFF, 0x7FF0000000000000,
                  0xFFF0000000000000, 0x7FF8000000000000):
         emit(bits)
@@ -295,11 +303,44 @@ def conversion_rows(n):
         out("tolong", show(d), v if -(2 ** 63) <= v < 2 ** 63 else "ERR")
     for d in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
         out("tolong", show(d), "ERR")
+    halfway_rows()
     for _ in range(n):
         d = finite()
         out("tostr", show(d), str(d))
     for d in ("Infinity", "-Infinity", "0", "-0", "0E+6111", "1E-6176"):
         out("tostr", show(Decimal(d)), str(Decimal(d)))
+
+
+def halfway_rows():
+    """Decimals a hair either side of the midpoint between two doubles, where only
+    the bits past the 128-bit window of the key encoder decide the rounding.
+
+    In the binade [2^135, 2^136) the midpoint above the even mantissa `m` is
+    `M = (2m + 1) · 2^82`, and a decimal `c · 10^7` of 34 digits can sit `delta`
+    above or below it, `delta` = 128 or 256 (below 2^-127 relative, so the window
+    reads exactly half and `inexact` says which side). `delta` has to be a multiple
+    of 2^7 for `M ± delta` to be divisible by 10^7, and `m` is then fixed mod 5^7."""
+    modulus = 5 ** 7
+    inverse = pow(2 ** 83, -1, modulus)
+    low, high = 1 << 52, 1 << 53
+    for sign_of_delta in (1, -1):
+        for delta in (128, 256):
+            for _ in range(20):
+                # (2m + 1) 2^82 + sign * delta ≡ 0 (mod 10^7)
+                r = ((-sign_of_delta * delta - 2 ** 82) * inverse) % modulus
+                m = r + modulus * rng.randrange((low - r) // modulus + 1, (high - r) // modulus)
+                if m % 2:
+                    m += modulus
+                if not (low <= m < high):
+                    continue
+                value = (2 * m + 1) * 2 ** 82 + sign_of_delta * delta
+                assert value % 10 ** 7 == 0
+                c = value // 10 ** 7
+                assert len(str(c)) == 34
+                for negative in (False, True):
+                    text = f"{'-' if negative else ''}{c}e7"
+                    d = Decimal(text)
+                    out("todouble", show(d), f"{double_to_bits(float(text)):016x}")
 
 
 GRAMMAR = [

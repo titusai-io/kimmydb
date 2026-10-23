@@ -17,7 +17,8 @@
 //!
 //! Two sets are accepted, each by the sha256 of its files: version 2.62 from
 //! speleotrove's `dectest.zip`, and version 2.59 as CPython ships it
-//! (`Lib/test/decimaltestdata`). `dqBase.decTest` is the same in both.
+//! (`Lib/test/decimaltestdata`). `dqBase.decTest` has the same cases in both
+//! (the files differ in their headers, so their sha256s do).
 
 #[path = "common/dectest.rs"]
 mod dectest;
@@ -131,9 +132,11 @@ fn every_dq_base_case_is_refused_or_read_exactly() {
     );
     assert_eq!(syntax, 99, "premise: the suite's 99 syntax errors");
     assert_eq!(bson_lax.len(), 13, "premise: the 13 the lax parser read as numbers");
-    assert!(
-        exact_cases > 500 && rounding > 50,
-        "premise: {exact_cases} exact, {rounding} rounding"
+    // The cases are the same in both pinned sets.
+    assert_eq!(
+        (exact_cases, rounding),
+        (606, 223),
+        "premise: the exact cases read exactly, and those that need rounding refused"
     );
 }
 

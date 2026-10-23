@@ -359,7 +359,7 @@ rule for a double was chosen; 0.54.0 chose one, ADR-252.)
 
 ---
 
-## 🟡 Arithmetic on a `Decimal128` differs from MongoDB's in three places
+## 🟡 Arithmetic on a `Decimal128` differs from MongoDB's in four places
 
 **Raised 2026-10-16 (refused, not skipped, with 0.51.0); built in 0.54.0
 ([ADR-252](decisions.md)).** `$add`, `$subtract`, `$multiply`, `$divide`, the
@@ -368,8 +368,8 @@ and a decimal among the operands makes the result a decimal, as in MongoDB
 ("integer → long → double → decimal"). The arithmetic is IEEE 754 decimal128
 under one fixed context, in [aggregation.md](aggregation.md#decimal128-arithmetic)
 and [query-language.md](query-language.md#decimal128-arithmetic-in-updates).
-It differs from MongoDB's in three places, verified against its source and
-manual on 2026-10-16:
+It differs from MongoDB's in four places (verified against its source and manual
+on 2026-10-16, except the n-ary `$add`, which is by reading):
 
 - **A double converts exactly, not at 15 digits.** MongoDB converts a double to a
   decimal at 15 significant digits, with trailing zeros kept, in `$add`,
@@ -384,6 +384,12 @@ manual on 2026-10-16:
   document order: over `1E+34`, `0.5`, `0.5`, `-1E+34` one order gives `0E+1`
   and another `1.0`. Here the exact sum is rounded once, at the end, and `$avg`
   divides the exact sum rather than a rounded one.
+- **An n-ary `$add` is one exact sum, rounded once.** MongoDB's `$add` adds
+  decimals one operand at a time, so each step rounds and the result depends on
+  the order: `{$add: [1E+34, 0.5, 0.5, -1E+34]}` is `0E+1` there (by reading, not
+  run) and `1.0` here, in every order. `$multiply` is the other way round and
+  agrees: it multiplies left to right and rounds each step, as MongoDB does
+  (Chris's ruling, ADR-252).
 - **`$inc` and `$mul` refuse a double operand on a decimal field that is not
   exactly a decimal.** MongoDB widens it at 15 digits and stores the result.
   Here `$inc: {bal: 0.01}` on `Decimal128("19.99")` is a `400` that names

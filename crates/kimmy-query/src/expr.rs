@@ -1990,10 +1990,6 @@ impl Total {
             None => self.plain.unwrap_or(Num::Int(0)).to_bson(),
         }
     }
-
-    pub fn as_f64(&self) -> f64 {
-        self.plain.map_or(0.0, Num::as_f64)
-    }
 }
 
 /// The mean of a group's numbers. Doubles and integers are averaged as they

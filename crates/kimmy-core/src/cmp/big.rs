@@ -170,17 +170,12 @@ impl Big {
             }
             let t = i128::from(u[j + 2]) - borrow - carry as i128;
             u[j + 2] = t as u64;
-            if t < 0 {
-                // qhat was one too large: add the divisor back.
-                qhat -= 1;
-                let mut carry = 0u128;
-                for (k, v) in [v0, v1].into_iter().enumerate() {
-                    let sum = u128::from(u[j + k]) + u128::from(v) + carry;
-                    u[j + k] = sum as u64;
-                    carry = sum >> 64;
-                }
-                u[j + 2] = u[j + 2].wrapping_add(carry as u64);
-            }
+            // With a two-limb divisor the correction loop above is exact: its test
+            // `qhat · v0 > rhat · 2^64 + u[j]` is `qhat · divisor > (u[j + 2],
+            // u[j + 1], u[j])`, so `qhat` is the true digit and the subtraction
+            // cannot go negative. Algorithm D's add-back, which a divisor of three
+            // limbs or more would need, is therefore not here.
+            debug_assert!(t >= 0, "a two-limb divisor's quotient digit is exact");
             quotient[j] = qhat as u64;
         }
         assert!(quotient.iter().skip(2).all(|&l| l == 0), "the quotient does not fit 128 bits");

@@ -6,10 +6,12 @@
 //! - a `$sum` over 100,000 doubles, with no decimal in the group, moves by no
 //!   more than noise.
 //!
-//! The second is measured against its own baseline: the double-only group does
-//! one extra push of 8 bytes per document and nothing else, and the test holds
-//! that to 25% of the group (the design says 5%; a laptop's timer noise on a
-//! few milliseconds is larger than that, so the figure printed is what to read).
+//! The second test asserts an absolute bound only: 100,000 documents are 100,000
+//! clones and field reads, and the 8-byte push each double adds to the group's
+//! buffer cannot take half a second. It does not assert the design's 5%: a
+//! laptop's timer noise on a few milliseconds is larger than that, so the figure
+//! to read is the microbenchmark in ADR-252 (9 ns a value), not this group-level
+//! one.
 //! Time, so ignored in the ordinary run; CI's `decimal` job runs it in release.
 
 use std::time::{Duration, Instant};

@@ -1,4 +1,4 @@
-//! The golden corpus for the Decimal128 arithmetic (ADR-252): about 3,000 rows
+//! The golden corpus for the Decimal128 arithmetic (ADR-252): 4,804 rows
 //! written by `scripts/decimal_golden.py` from libmpdec, an implementation that
 //! shares no code with this one.
 //!
@@ -143,13 +143,26 @@ fn every_row_of_the_corpus_is_reproduced_to_the_byte() {
         *counts.entry(f[0].to_string()).or_default() += 1;
     }
     assert!(stepwise_differs >= 50, "only {stepwise_differs} rows tell a chain from one rounding");
-    // A corpus that shrank is a test that stopped testing.
-    let total: u64 = counts.values().sum();
-    assert!(total > 2_500, "the corpus has {total} rows: {counts:?}");
-    for kind in [
-        "r1", "add", "sub", "mul", "div", "sum", "avg", "prod", "todouble", "tolong", "tostr",
-        "parse",
-    ] {
-        assert!(counts.get(kind).copied().unwrap_or(0) > 100, "{kind}: {counts:?}");
-    }
+    // A corpus that lost rows is a test that stopped testing: the counts are
+    // exact, so regenerating it changes them in a diff that is read.
+    let want: std::collections::BTreeMap<&str, u64> = [
+        ("r1", 1_564),
+        ("add", 350),
+        ("sub", 350),
+        ("mul", 350),
+        ("div", 350),
+        ("sum", 254),
+        ("avg", 254),
+        ("prod", 369),
+        ("todouble", 352),
+        ("tolong", 203),
+        ("tostr", 206),
+        ("parse", 202),
+    ]
+    .into_iter()
+    .collect();
+    let got: std::collections::BTreeMap<&str, u64> =
+        counts.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    assert_eq!(got, want, "rows per kind");
+    assert_eq!(counts.values().sum::<u64>(), 4_804);
 }

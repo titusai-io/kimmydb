@@ -755,6 +755,28 @@ proptest! {
     }
 }
 
+/// Where the value sits a hair above or below the midpoint between two doubles
+/// (`delta` of 128 or 256 in 2^-127 relative terms), the 128-bit window reads
+/// exactly half and only the end bit, `inexact`, says which side. Ignoring it
+/// rounds a decimal above the midpoint to the even neighbour (it must go up).
+/// Random inputs land here about once in a million midpoints, so the values are
+/// constructed (see `halfway_rows` in `scripts/decimal_golden.py`).
+#[test]
+fn a_decimal_a_hair_off_a_midpoint_is_decided_by_the_end_bit() {
+    // Just above the midpoint: up to the odd neighbour, 0x...8341, not 0x...8340.
+    let above = "4355614296620508741932764053194405E+7";
+    assert_eq!(arith::to_binary64(&d(above)), 0x4860_0000_0000_8341);
+    // And a second, in the same binade, with its own bits.
+    let second = "4355614296641093363648506267077962E+7";
+    for sign in ["", "-"] {
+        for text in [above, second] {
+            let text = format!("{sign}{text}");
+            let want: f64 = text.replace("E+", "e").parse().unwrap();
+            assert_eq!(arith::to_binary64(&d(&text)), want.to_bits(), "{text}");
+        }
+    }
+}
+
 #[test]
 fn a_decimal_converts_to_a_double_at_the_edges() {
     let to = |t: &str| f64::from_bits(arith::to_binary64(&d(t)));

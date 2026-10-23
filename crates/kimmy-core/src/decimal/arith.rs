@@ -4,7 +4,8 @@
 //! **The context** is a constant: 34 digits, the interchange format's exponent
 //! range, round half to even, and IEEE's preferred exponents for exact results
 //! (`1.10 + 1.20` is `2.30`). Nothing here reads or keeps a status, and nothing
-//! is global or thread-local.
+//! is thread-local; the only static is an immutable table of powers of five,
+//! built once and the same everywhere.
 //!
 //! **Every operation is exact, then rounded once** ([`round`]): a sum is the
 //! exact sum of its operands as they were converted, a product the exact
