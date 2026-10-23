@@ -10,6 +10,10 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+The minimum supported Rust is 1.99.
+
 ## 0.53.0 - 2026-10-23
 
 **Read before upgrading: 0.53.0 does not upgrade a data directory or join a cluster of 0.52 or older. Stop every member, wipe the data, start on empty directories and reseed.**

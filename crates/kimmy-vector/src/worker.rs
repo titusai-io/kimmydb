@@ -6872,14 +6872,11 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl EmbeddingProvider for GoesAway {
-        // `fetch_update` is `try_update` from Rust 1.99, which the 1.90
-        // minimum does not have.
-        #[allow(deprecated)]
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             use std::sync::atomic::Ordering;
             if self
                 .good
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_err()
             {
                 return Err(VectorError::Transport {
