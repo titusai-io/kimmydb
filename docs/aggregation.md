@@ -182,8 +182,8 @@ wrong quietly:
 
 | | Over non-numeric values | Over `null` and missing | When nothing was usable |
 |---|---|---|---|
-| `$sum` | **Ignored** — a string, a bool, an array, a document contributes nothing. A field holding `42` on some documents and `"42"` on others sums only the first kind. **A `Decimal128` is refused**, `400`, `$sum needs numbers, found a Decimal128` — it is a number, and decimal arithmetic is not built; an array or a document holding one is ignored like any other | Ignored | `0` |
-| `$avg` | Ignored, in the numerator **and** the count — a field present on half the documents gives the mean of that half, not half the mean. **A `Decimal128` is refused**, as by `$sum` | Ignored | `null` |
+| `$sum` | **Ignored** — a string, a bool, an array, a document contributes nothing. A field holding `42` on some documents and `"42"` on others sums only the first kind. **A group that holds a `Decimal128` is summed exactly** ([Decimal128 arithmetic](#decimal128-arithmetic)): a `Decimal128`, rounded once to 34 digits, the same bytes in any document order; an array or a document holding one is ignored like any other | Ignored | `0` |
+| `$avg` | Ignored, in the numerator **and** the count — a field present on half the documents gives the mean of that half, not half the mean. **A group that holds a `Decimal128` is averaged exactly**: the exact sum divided by the count of numeric values, rounded once | Ignored | `null` |
 | `$min` `$max` | **Compared**, across types, in the [canonical order](key-encoding.md#type-ordering) — numbers below strings below documents below arrays below binary below ObjectIds below bools below dates | **Skipped**, both of them | `null` |
 | `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
 | `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them, and `undefined` is that same member | — nothing is unusable |
@@ -676,13 +676,29 @@ an error.
   form**: `1e21` is `"1000000000000000000000"` and `1e-7` is `"0.0000001"`.
   The engine's JSON output prints doubles the same way.
 
-**`decimal` (`Decimal128`) is refused at parse**: converting a double to a
-`Decimal128` needs a rounding rule — a double's exact binary value can run to
-about 767 significant digits and a `Decimal128` holds 34, so the double `0.1`
-has no equal decimal — and choosing one is a decimal-arithmetic decision this
-build does not make. Convert to `double` or `long` instead. A `Decimal128` in
-the data, or written as a literal, is compared, grouped and indexed by its
-exact value; it is only the conversion that is missing.
+**`decimal` (`Decimal128`)** is a target ([Decimal128 arithmetic](#decimal128-arithmetic)):
+
+- An integer, a boolean and a date (its epoch milliseconds) convert exactly.
+- A **double** converts to its exact binary value rounded once to 34 digits,
+  half to even (IEEE 754 `convertFormat`): `0.1` is
+  `0.1000000000000000055511151231257827`, because that is the double 0.1, not
+  the decimal one tenth. To get one tenth, send `{"$numberDecimal": "0.1"}` or
+  convert the string `"0.1"`. `2.5` is `2.5`, `100.0` is `100`, `-0.0` is `-0`.
+- A **string** is read by the strict parser and is exact or an error: `"1.50"`
+  is `1.50` with its two places, and `""`, `"."`, `" 1"`, `"1e"` and a value that
+  would need rounding (a nonzero 35th digit, or below `1E-6176`) are conversion
+  errors, which `onError` answers.
+- A `Decimal128` is itself, the same bytes. A `null` or missing input answers
+  `onNull`. Anything else is a conversion error.
+
+A `Decimal128` converts to `double` (the nearest, half to even; `1E+400` is
+`Infinity`, `1E-400` is `0.0`), to `long` and `int` (truncated toward zero from
+the exact value; `NaN`, an infinity and a value outside the range are
+conversion errors), to `string` (BSON's text form, which keeps the cohort:
+`2.30`, `1E+3`, `-0`), to `bool` (a zero of any sign or exponent is `false`)
+and to `date` (the exact value truncated toward zero to whole milliseconds;
+`NaN`, an infinity and a value outside `i64` are conversion errors). To an
+`ObjectId` it is a conversion error.
 
 ---
 
@@ -698,13 +714,111 @@ keeps documents' integer types intact ([ADR-002](decisions.md)).
 
 **`$avg` skips non-numeric and missing values rather than counting them as
 zero.** A field present on half the documents would otherwise halve the mean,
-silently. A `Decimal128` is not skipped but refused, by `$avg` and `$sum`
-alike: it is a number, and a mean or a total of the other numbers would be a
-wrong answer that looks right.
+silently. A `Decimal128` is a number and is counted and summed, exactly
+([Decimal128 arithmetic](#decimal128-arithmetic)).
 
 **`$group` buckets by value, not by type.** `5`, `5.0` and `5i64` share a
 bucket, because they share an index entry everywhere else in this database. The
 grouping key goes through the same encoder the indexes use.
+
+---
+
+## Decimal128 arithmetic
+
+`$add`, `$subtract`, `$multiply` and `$divide`, the `$sum` and `$avg`
+accumulators, and `$inc` and `$mul` in an update ([Query language](query-language.md#decimal128-arithmetic-in-updates))
+do arithmetic on a `Decimal128` ([ADR-252](decisions.md)). It is IEEE 754
+decimal128 arithmetic under one fixed context: 34 digits, the format's exponent
+range, round half to even, and IEEE's preferred exponents. There is no setting
+to change it. It is not a full implementation of the standard, which also asks
+for a selectable rounding direction and exposed flags; kimmydb has neither.
+
+**If a decimal is an operand, the result is a decimal.** With no decimal
+operand, every result is what it always was.
+
+- **An integer enters exactly.** `Int32` and `Int64` count as themselves, at
+  exponent 0.
+- **A double enters as its exact binary value, rounded once to 34 digits, half to
+  even** (IEEE 754 `convertFormat`), which is also what `$toDecimal` gives. The
+  double `0.1` is `0.1000000000000000055511151231257827`; the double's binary
+  error is in the digits, where it can be seen. To compute with one tenth, send
+  `{"$numberDecimal": "0.1"}`. This rule never reverses an order the comparator
+  gives, which the shortest round-trip text of a double (`0.3`) and MongoDB's 15
+  digits both can. `{$add: ["$bal", 0.01]}` over `Decimal128("10.00")` shows
+  `10.01000000000000000020816681711722`.
+- A `null`, `undefined` or missing operand makes the result `null`, as before. A
+  string is `400`, `$add needs numbers, found a string`.
+
+**A computation is exact over its operands as converted, and rounded once.**
+
+- `$add` of any number of operands is one exact sum, and `$subtract` the exact
+  sum of `a` and `-b`: `{$add: [1E+34, 0.5, 0.5, -1E+34]}` is `1.0` in every
+  order, where adding left to right gives `0E+1`.
+- `$multiply` of any number of operands is one exact product, rounded once, so
+  `[1E+5000, 1E+5000, 1E-5000]` is `1E+5000` in every order and never overflows
+  on the way.
+- `$divide` rounds the exact quotient once. `$avg` divides the **exact** sum by
+  the count and rounds once; it is not `$sum` followed by `$divide`, which
+  rounds twice.
+- **`$sum` and `$avg` over a group with a decimal give the same bytes under any
+  document order, plan and member.** Integers and doubles in such a group are
+  converted as above and joined to the exact sum. A group with no decimal sums as
+  it always did: `Int64` with a widening to double on overflow, or a double.
+- Values that are not numbers are skipped, as ever, and an array or a document is
+  not read inside.
+
+**The result keeps IEEE's preferred quantum**, so a money field keeps its scale:
+
+| | |
+|---|---|
+| `1.10 + 1.20` | `2.30` |
+| `1.5 + 0.00` | `1.50` |
+| `10.00 - 0.50` | `9.50` |
+| `1.5 × 1.0` | `1.50` |
+| `2.30 / 2` | `1.15` |
+| `$sum` of `1.10`, `1.20`, `3` | `5.30` (the least exponent of all the terms; an integer's is 0) |
+| `$avg` of `1.10`, `1.20` | `1.15` |
+
+Equal values still compare, group and key as one, so `2.30` and `2.3` are one
+`$group` bucket, one `$addToSet` member and one unique-index entry. The bytes
+differ, the JSON text differs (`"2.30"` against `"2.3"`), and an update that
+changes only which member is stored counts in `modified`
+([Query language](query-language.md#decimal128-arithmetic-in-updates)). `$group`'s `_id`, `$min`,
+`$max` and `$first` report the first member seen, as they always did, so which
+of `2.3` and `2.30` they show depends on document order; `$sum` and `$avg` do not.
+
+**There is no `$round`, `$trunc` or quantize** (that is a separate, later item),
+so an inexact result shows all 34 digits: `$avg` of `1.00`, `2.00`, `2.00` is
+`1.666666666666666666666666666666667`, and `1 / 3` is
+`0.3333333333333333333333333333333333`.
+
+**Special values follow IEEE 754.** Every NaN result is the one quiet NaN, with
+no payload (a signalling or payload NaN in gives the plain NaN out, so a `$sum`
+cannot depend on which NaN came first). `Infinity - Infinity`, `Infinity × 0` and
+`Infinity / Infinity` are `NaN`; `Infinity + 5` is `Infinity`; `5 / Infinity` is
+`-0E-6176` or `0E-6176`. The sum of two zeros is `-0` only if both are. **Any
+zero divisor is `400`, `$divide by zero`**, whatever its spelling (`0`, `-0`,
+`0E-100`, `0.0`) and whatever the dividend: IEEE would give an infinity or a
+NaN, and kimmydb refuses every zero divisor for every number.
+
+**Overflow is `Infinity` in an expression or an accumulator**
+(`9.999…E+6144 × 10`), as double arithmetic is, and **refused in `$inc` and
+`$mul`**, as an `Int64` overflow is. **Underflow is gradual** and not refused: a
+result below `1E-6143` becomes a subnormal, or a zero with exponent `-6176`.
+
+Two things that look like bugs and are not:
+
+- `{$eq: [{$add: ["$bal", {"$numberDecimal": "0.1"}]}, 10.1]}` is `false` when
+  `bal` is `10.00`: the sum `10.10` is a decimal, and the double `10.1` is not
+  10.1 but `10.0999999999999996447286321199499070644378662109375`.
+- `$toDecimal(d)` equals the double `d` only when the double's exact binary
+  expansion has at most 34 significant digits (`2.5` does, `0.1` does not).
+
+**Cost.** In a release build a two-operand operation takes about a quarter of a
+microsecond for money-sized values (under 20 µs at the extremes of the exponent
+range), a `$sum` over 100,000 decimal prices costs about 1.3 times the same over
+`Int64`, and the exact `$multiply` of a thousand operands at extreme exponents
+takes about 8 ms (the exact product grows by 34 digits per operand).
 
 ---
 
@@ -1059,9 +1173,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | `$zip`, `$sortArray` | Not built, by decision: both are refused at parse as **unknown operators**. `$map` over a `$range` of indexes, with `$arrayElemAt`, reads several arrays by position, and an `$unwind`, `$sort` and `$group` with `$push` orders an array's elements |
 | System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
-| `$convert` to `decimal` (or code `19`) | Converting a double to a `Decimal128` needs a rounding rule (a double's exact value can run to about 767 significant digits, a `Decimal128` holds 34), and choosing one is a decimal-arithmetic decision this build does not make; refused at parse, naming `double` and `long` as the alternatives. A `Decimal128` literal, or one in the data, is compared and grouped by its exact value ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)) |
-| `$toDecimal` | Never built as an operator, and refused at parse with the reason `$convert` gives for `decimal`: `unsupported operator "$toDecimal": converting to Decimal128 needs a rounding rule, because a double's exact binary value can run to about 767 significant digits and a Decimal128 holds 34, and this build has none; convert to double or long instead`. A `400`, as before |
-| Arithmetic on a `Decimal128` — `$add`, `$subtract`, `$multiply`, `$divide`, `$mod`, and the `$sum` and `$avg` accumulators | Not built, and refused wherever it would be done, never skipped: each answers `400`, *`<operator>` needs numbers, found a Decimal128* (`$add needs numbers, found a Decimal128`, `$sum needs numbers, found a Decimal128`). Until 0.51.0 `$sum` and `$avg` skipped a decimal as they skip a string and answered a total or a mean of the other numbers. An array or a document holding a decimal is ignored by `$sum` and `$avg` as any array or document is: they never read inside one. Comparing, grouping and sorting a decimal need no arithmetic and take it by value ([Deviations](deviations.md)) |
+| `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). `$round`, `$trunc`, `$abs`, `$pow` and `$sqrt` do not exist for any number |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
