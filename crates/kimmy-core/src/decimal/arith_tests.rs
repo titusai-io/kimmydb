@@ -44,6 +44,13 @@ fn same(got: Raw, want: &str) {
     assert_eq!(show(&got), show(&d(want)), "want {want}");
 }
 
+/// A property's configuration: `cases` of them, and rejections (a divisor of
+/// zero, a double that is not finite) that do not abort the run however many
+/// cases `PROPTEST_CASES` asks for.
+fn config(cases: u32) -> ProptestConfig {
+    ProptestConfig { cases, max_global_rejects: 1_000_000, ..ProptestConfig::default() }
+}
+
 // ---------------------------------------------------------------------------
 // The reference
 // ---------------------------------------------------------------------------
@@ -461,7 +468,7 @@ fn an_integer_enters_exactly_even_the_smallest() {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(4000))]
+    #![proptest_config(config(4000))]
 
     #[test]
     fn add_agrees_with_the_reference((a, b) in pair()) {
@@ -487,7 +494,7 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(600))]
+    #![proptest_config(config(600))]
 
     #[test]
     fn sums_and_means_agree_with_the_reference_in_any_order(
@@ -648,12 +655,18 @@ fn r1_examples_from_the_design() {
     same(r1(f64::NAN).0, "NaN");
     same(r1(f64::INFINITY).0, "Infinity");
     same(r1(f64::NEG_INFINITY).0, "-Infinity");
+    // An integral double of 35 digits whose last digits are zeros drops only
+    // zeros: it is its exact value, so the conversion is exact.
+    let zeros = (3 * 5u64.pow(22)) as f64 * 2f64.powi(61);
+    let (x, inexact) = r1(zeros);
+    assert!(!inexact, "{zeros:e} is 3 · 2^39 · 10^22 exactly");
+    same(x, "16492674416640000000000000000000000");
     same(r1(0.3).0, "0.2999999999999999888977697537484346");
     same(r1(0.1 + 0.2).0, "0.3000000000000000444089209850062616");
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(5000))]
+    #![proptest_config(config(5000))]
 
     #[test]
     fn r1_agrees_with_the_reference(v in double_cases()) {
@@ -771,4 +784,133 @@ fn the_raw_decoder_keeps_a_zeros_sign_and_exponent() {
     // from the normal form's 126..113.
     let large = (0b11u128 << 125) | (6177u128 << 111);
     assert_eq!(decode_raw_bits(large), fin(false, 0, 1));
+}
+
+// ---------------------------------------------------------------------------
+// Against the comparator
+// ---------------------------------------------------------------------------
+
+/// The exact value of a finite double as `(numerator, denominator)`.
+fn double_value(v: f64) -> (BigInt, BigInt) {
+    let bits = v.to_bits();
+    let biased = ((bits >> 52) & 0x7FF) as i64;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (m, f) =
+        if biased == 0 { (fraction, -1074i64) } else { (fraction | 1 << 52, biased - 1075) };
+    let n = BigInt::from(m);
+    let n = if bits >> 63 == 1 { -n } else { n };
+    if f >= 0 {
+        (n << (f as usize), BigInt::from(1))
+    } else {
+        (n, BigInt::from(1) << ((-f) as usize))
+    }
+}
+
+mod against_the_comparator {
+    use super::*;
+    use crate::canonical_cmp;
+    use bson::Bson;
+
+    fn decimal(raw: Raw) -> Bson {
+        Bson::Decimal128(pack_raw(raw))
+    }
+
+    /// The decimals next to `raw` in its own cohort's coefficient line:
+    /// `±1` and `±2` units of the last place.
+    fn neighbours(raw: Raw) -> Vec<Raw> {
+        let Raw::Finite { negative, coefficient, exponent } = raw else { return vec![] };
+        let mut out = Vec::new();
+        for delta in [-2i128, -1, 1, 2] {
+            let signed = if negative { -(coefficient as i128) } else { coefficient as i128 };
+            let moved = signed + delta;
+            let c = moved.unsigned_abs();
+            if c <= MAX_COEFFICIENT {
+                out.push(fin(moved < 0, c, exponent));
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(config(4000))]
+
+        /// **R1 never reverses an order the comparator gives.** For every
+        /// double `d` and decimal `x`, `d < x` means `R1(d) <= x`, and the
+        /// mirror. The shortest round-trip decimal and 15 digits both break it
+        /// (`0.3` against `0.29999999999999999`), which is why R1 is the
+        /// exact value rounded once.
+        #[test]
+        fn r1_never_reverses_an_order_the_comparator_gives(v in double_cases()) {
+            prop_assume!(v.is_finite());
+            let (r1, _) = arith::from_binary64(v.to_bits());
+            for x in neighbours(r1) {
+                let double = Bson::Double(v);
+                let against = canonical_cmp(&double, &decimal(x));
+                let after = canonical_cmp(&decimal(r1), &decimal(x));
+                match against {
+                    Ordering::Less => prop_assert_ne!(after, Ordering::Greater, "{:e} against {}", v, show(&x)),
+                    Ordering::Greater => prop_assert_ne!(after, Ordering::Less, "{:e} against {}", v, show(&x)),
+                    Ordering::Equal => prop_assert_eq!(after, Ordering::Equal, "{:e} against {}", v, show(&x)),
+                }
+            }
+        }
+
+        /// A result is a canonical decimal the key encoder takes whatever its
+        /// exponent, and its key orders as the comparator orders (the keys are
+        /// cohort-independent, so `2.30` and `2.3` are one key).
+        #[test]
+        fn the_key_of_a_result_orders_as_the_comparator_does((a, b) in pair(), (c, d) in pair()) {
+            let results = [arith::add(&a, &b), arith::product(&[a, b]), arith::sub(&c, &d)];
+            for x in results {
+                for y in results {
+                    let (bx, by) = (decimal(x), decimal(y));
+                    let (kx, ky) = (crate::keyenc::encode(&bx).unwrap(), crate::keyenc::encode(&by).unwrap());
+                    prop_assert_eq!(kx.cmp(&ky), canonical_cmp(&bx, &by), "{} against {}", show(&x), show(&y));
+                }
+            }
+        }
+
+        /// A decimal converts to the nearest double, by exact distances: the
+        /// chosen double is no farther from the decimal than either of its
+        /// neighbours, and when it is as far as one of them it is the even one.
+        #[test]
+        fn a_decimal_converts_to_the_nearest_double_by_exact_distances(
+            negative in any::<bool>(),
+            c in coefficient(),
+            e in -330i16..=310,
+        ) {
+            prop_assume!(c != 0);
+            let raw = fin(negative, c, e);
+            let chosen = f64::from_bits(arith::to_binary64(&raw));
+            prop_assume!(chosen.is_finite());
+            let step = |v: f64, up: bool| -> f64 {
+                let bits = v.to_bits();
+                if v == 0.0 {
+                    let tiny = f64::from_bits(1);
+                    return if up { tiny } else { -tiny };
+                }
+                f64::from_bits(if (v > 0.0) == up { bits + 1 } else { bits - 1 })
+            };
+            let (nx, dx) = value(&raw);
+            let distance = |v: f64| -> (BigInt, BigInt) {
+                let (n, d) = double_value(v);
+                // |x - v| = |nx·d - n·dx| / (dx·d)
+                let top = (&nx * &d - n * &dx).magnitude().clone();
+                (BigInt::from(top), dx.clone() * d)
+            };
+            let smaller_or_equal = |a: &(BigInt, BigInt), b: &(BigInt, BigInt)| (&a.0 * &b.1).cmp(&(&b.0 * &a.1));
+            let mine = distance(chosen);
+            for neighbour in [step(chosen, false), step(chosen, true)] {
+                if !neighbour.is_finite() {
+                    continue;
+                }
+                let theirs = distance(neighbour);
+                match smaller_or_equal(&mine, &theirs) {
+                    Ordering::Less => {}
+                    Ordering::Equal => prop_assert_eq!(chosen.to_bits() & 1, 0, "a tie goes to the even double: {}", show(&raw)),
+                    Ordering::Greater => prop_assert!(false, "{} is nearer to {:e} than to {:e}", show(&raw), neighbour, chosen),
+                }
+            }
+        }
+    }
 }

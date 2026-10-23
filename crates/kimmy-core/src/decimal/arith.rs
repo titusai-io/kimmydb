@@ -41,6 +41,13 @@ const LIMB: u64 = 10_000_000_000_000_000_000;
 const LIMB_WIDE: u128 = LIMB as u128;
 const LIMB_DIGITS: u32 = 19;
 
+/// `t / 10^19` and `t % 10^19`, from one division.
+#[inline]
+fn split_limb(t: u128) -> (u128, u64) {
+    let quotient = t / LIMB_WIDE;
+    (quotient, (t - quotient * LIMB_WIDE) as u64)
+}
+
 /// Dividing by zero: the one refusal in this file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DivisionByZero;
@@ -132,8 +139,7 @@ impl Mag {
         for limb in &mut self.0 {
             // At most (10^19 - 1)(2^64 - 1) + carry, far below 2^128.
             let product = u128::from(*limb) * u128::from(m) + carry;
-            *limb = (product % LIMB_WIDE) as u64;
-            carry = product / LIMB_WIDE;
+            (carry, *limb) = split_limb(product);
         }
         while carry != 0 {
             self.0.push((carry % LIMB_WIDE) as u64);
@@ -141,25 +147,25 @@ impl Mag {
         }
     }
 
-    /// `self · other`, schoolbook.
+    /// `self · other`, schoolbook, the shorter operand outside so the long one
+    /// is a single run of multiply-and-carry per limb of the short.
     fn mul(&self, other: &Mag) -> Mag {
         if self.is_zero() || other.is_zero() {
             return Mag::zero();
         }
-        let mut out = vec![0u64; self.0.len() + other.0.len()];
-        for (i, &a) in self.0.iter().enumerate() {
+        let (short, long) =
+            if self.0.len() <= other.0.len() { (self, other) } else { (other, self) };
+        let mut out = vec![0u64; short.0.len() + long.0.len()];
+        for (i, &a) in short.0.iter().enumerate() {
             let mut carry = 0u128;
-            for (j, &b) in other.0.iter().enumerate() {
+            for (j, &b) in long.0.iter().enumerate() {
                 // (10^19 - 1)^2 + 2 · 10^19 < 2^127.
                 let t = u128::from(a) * u128::from(b) + u128::from(out[i + j]) + carry;
-                out[i + j] = (t % LIMB_WIDE) as u64;
-                carry = t / LIMB_WIDE;
+                (carry, out[i + j]) = split_limb(t);
             }
-            let mut k = i + other.0.len();
+            let mut k = i + long.0.len();
             while carry != 0 {
-                let t = u128::from(out[k]) + carry;
-                out[k] = (t % LIMB_WIDE) as u64;
-                carry = t / LIMB_WIDE;
+                (carry, out[k]) = split_limb(u128::from(out[k]) + carry);
                 k += 1;
             }
         }
@@ -711,6 +717,22 @@ pub fn from_i64(value: i64) -> Raw {
 // Binary64
 // ---------------------------------------------------------------------------
 
+/// `5^(27 j)` for `j` up to 40, built once: the largest `k = -f` a double has
+/// is 1074, which is 39 whole steps of 27 and a remainder.
+fn powers_of_five() -> &'static [Mag] {
+    static TABLE: std::sync::OnceLock<Vec<Mag>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let step = 5u64.pow(27);
+        let mut table = vec![Mag::from_u64(1)];
+        for _ in 1..=40 {
+            let mut next = table.last().expect("one entry").clone();
+            next.mul_small(step);
+            table.push(next);
+        }
+        table
+    })
+}
+
 /// **R1**: a binary64 (its 64 bits) as a `Decimal128`, IEEE 754
 /// `convertFormat` under round-half-even: its exact value, rounded once to 34
 /// digits. Whether the conversion was inexact is the second answer; it is IEEE's
@@ -724,6 +746,9 @@ pub fn from_i64(value: i64) -> Raw {
 ///   the largest exponent that holds the value). More than 34 digits are
 ///   rounded half to even and the exponent rises by the digits dropped.
 /// - It cannot overflow, underflow or need clamping.
+///
+/// The answer is inexact exactly when the value changed (IEEE's inexact
+/// signal), not whenever digits were dropped: dropping zeros loses nothing.
 pub fn from_binary64(bits: u64) -> (Raw, bool) {
     let negative = bits >> 63 == 1;
     let biased = ((bits >> 52) & 0x7FF) as i64;
@@ -750,13 +775,16 @@ pub fn from_binary64(bits: u64) -> (Raw, bool) {
         }
         (value, 0)
     } else {
-        let mut value = Mag::from_u64(m);
-        let mut left = -f;
-        while left >= 27 {
-            value.mul_small(5u64.pow(27));
-            left -= 27;
-        }
-        value.mul_small(5u64.pow(left as u32));
+        // `m · 5^k` with `k = -f` up to 1074: `5^(k mod 27)` folds into the
+        // mantissa (below 2^113), and the rest is one entry of the table of
+        // `5^(27 j)`, so the worst double is a single pass over about 40 limbs.
+        let k = (-f) as u32;
+        let small = u128::from(m) * u128::from(5u64.pow(k % 27));
+        let value = Mag::from_u128(small);
+        let value = match k / 27 {
+            0 => value,
+            j => value.mul(&powers_of_five()[j as usize]),
+        };
         (value, f)
     };
     let digits = value.digits();
@@ -779,7 +807,9 @@ pub fn from_binary64(bits: u64) -> (Raw, bool) {
         coefficient /= 10;
         e += 1;
     }
-    (finite(negative, coefficient, e), true)
+    // Inexact only if the digits dropped were not all zero: an integral double
+    // with trailing zeros past the 34th digit is still its exact value.
+    (finite(negative, coefficient, e), !tail.is_zero())
 }
 
 /// A `Decimal128` as the nearest binary64 (its 64 bits), round half to even,
