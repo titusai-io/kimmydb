@@ -1399,7 +1399,7 @@ impl Engine {
         // The redb that last opened this store for writing, in the store too,
         // so a clean store whose sidecar is gone is still refused by an older
         // redb's build.
-        crate::migrate::record_redb_version(&db, &build)?;
+        crate::migrate::record_redb_version(&db, &build, path)?;
         crate::format::reconcile_after_open(path, crate::migrate::stored_version(&db)?, &build);
 
         // The arrival index is derived from the oplog, so a database written

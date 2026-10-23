@@ -2596,8 +2596,13 @@ schema-6 store, and nothing a 0.53 store held crosses back.
 redb's file header and `kimmy.format`, a small sidecar file beside the database.
 It refuses to start, with the path and what was different, when the storage
 schema, the redb major.minor or redb's file format is not the one the build
-writes. The database and its sidecar are left byte for byte as they were. A
-newer redb *patch* alone is not a boundary. A store of an older schema is
+writes. **The redb major.minor is refused in either direction**: a redb minor
+is a format event, so a build opens only a store written under the minor it was
+built on. 0.54.0 moved from redb 4.3 to 4.4, so it refuses a store 0.53.0 wrote
+(`stop every member, wipe this data directory, start on an empty one and
+reseed`), as 0.53.0 refuses one 0.54.0 wrote. The database and its sidecar are
+left byte for byte as they were, and nothing re-stamps an older record as the
+build's. A redb *patch* alone is not a boundary. A store of an older schema is
 refused the same way ([Upgrades](#upgrades)).
 
 **A store is locked while a node has it open**, and a second start on the same
@@ -2611,12 +2616,14 @@ you move or copy a data directory.
   and with redb unable to read a dirty file without repairing it, the build
   can't tell whether a newer build wrote it. So it repairs the store. To avoid
   this, start the build that wrote the store, or restore the backup taken before
-  the upgrade. If the store records that a newer redb wrote it, the start stops
+  the upgrade. If the store records that another redb minor wrote it, older or newer, the start stops
   right after the repair. Nothing is written but redb's own repair and close,
   and the record stays in place, so every later start refuses the store before
   opening it.
 - A clean store copied without its sidecar is still checked: the build reads
-  the schema and redb version from the database without writing.
+  the schema and redb version from the database without writing. A store that
+  records a schema and no redb version is refused as damaged, because every
+  start of this build records it.
 - **An unreadable `kimmy.format` refuses the start.** Restore the file from the
   source directory or from the backup. Don't delete it: it records which builds
   may open the store, and without it the check falls back to the weaker
@@ -2626,7 +2633,9 @@ you move or copy a data directory.
 /v1/admin/backup`) holds documents and definitions, not redb's pages, and a
 restore (`kimmyd restore`) builds a new file with the restoring build's own
 redb. A backup of a different storage schema is refused before the restore
-creates any file. A restore writes a fresh `kimmy.format` for the build that
+creates any file. A backup does not record the redb that wrote its source file
+(the restore ignores it), so a backup taken under redb 4.3 restores under 4.4:
+the redb minor is no obstacle to a restore. A restore writes a fresh `kimmy.format` for the build that
 ran it.
 
 The start after a refusal still reports the run before it. See

@@ -520,7 +520,7 @@ pub fn restore_with(
     // The sidecar is regenerated, never carried: this build's redb wrote the
     // file, and the schema is what the restored META says (ADR-190). The
     // backup format does not change.
-    crate::migrate::record_redb_version(&db, build)?;
+    crate::migrate::record_redb_version(&db, build, path)?;
     let schema = crate::migrate::stored_version(&db)?.unwrap_or(0);
     crate::format::write_sidecar(path, &crate::format::stamp(schema, build))?;
 
