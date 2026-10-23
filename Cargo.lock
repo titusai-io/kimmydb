@@ -2509,6 +2509,7 @@ dependencies = [
  "hickory-resolver",
  "hmac 0.13.0",
  "kimmy-core",
+ "kimmy-query",
  "kimmy-storage",
  "kimmy-task",
  "libc",

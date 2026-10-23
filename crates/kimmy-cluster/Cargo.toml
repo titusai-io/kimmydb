@@ -46,6 +46,9 @@ libc.workspace = true
 
 [dev-dependencies]
 kimmy-storage = { workspace = true, features = ["test-hooks"] }
+# Evaluates an `$inc` for the decimal replication test (ADR-252): the operator is
+# applied on one member and its post-image must arrive byte for byte on the other.
+kimmy-query.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true

@@ -9544,6 +9544,82 @@ async fn control_the_same_database_drop_without_the_snapshot_hop() {
 }
 
 // ---------------------------------------------------------------------------
+// Decimal128 arithmetic replicates as a post-image (ADR-252)
+// ---------------------------------------------------------------------------
+
+/// An update operator evaluated on one member arrives on another as bytes: the
+/// oplog carries the whole post-image, so `$inc` is evaluated once, by the member
+/// that took the request, and a peer stores what it was sent and never
+/// re-evaluates. So a decimal result is the same bytes on both members, and the
+/// cut digest, which hashes key and stamp, agrees.
+#[tokio::test]
+async fn a_decimal_inc_arrives_on_another_member_as_the_same_bytes() {
+    struct Operator(kimmy_query::Update);
+    impl kimmy_storage::ModifySpec for Operator {
+        fn matches(&self, _: &bson::Document) -> kimmy_core::Result<bool> {
+            Ok(true)
+        }
+        fn compare(&self, _: &bson::Document, _: &bson::Document) -> std::cmp::Ordering {
+            std::cmp::Ordering::Equal
+        }
+        fn apply(&self, doc: &bson::Document) -> Result<Option<bson::Document>, String> {
+            let mut next = doc.clone();
+            kimmy_query::update::apply(&self.0, &mut next, 0).map_err(|e| e.to_string())?;
+            Ok(Some(next))
+        }
+        fn upsert(&self) -> Option<Result<bson::Document, String>> {
+            None
+        }
+    }
+    let dec = |text: &str| bson::Bson::Decimal128(kimmy_core::decimal::parse(text).unwrap());
+    let operator = |update: bson::Document| Operator(kimmy_query::update::parse(&update).unwrap());
+
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "accounts").unwrap();
+    let id = DocId::String("acct".into());
+    a.engine.insert(&ca, doc! { "_id": "acct", "bal": dec("10.00"), "n": 5, "avg": 0.1 }).unwrap();
+    sync(&a, &b).await;
+    let cb = b.engine.get_collection("shop", "accounts").unwrap();
+
+    let all = kimmy_storage::Candidates::Scan;
+    // A decimal operand on a decimal field, an integer made a decimal, and a
+    // stored double meeting a decimal operand by R1.
+    let update = operator(doc! {
+        "$inc": { "bal": dec("0.01"), "n": dec("0.5"), "avg": dec("1") }
+    });
+    let out = a.engine.modify_where(&ca, &all, &update, None).unwrap();
+    assert_eq!((out.matched, out.modified), (1, 1));
+    let after_a = a.engine.get(&ca, &id).unwrap().unwrap();
+    assert_eq!(after_a.get("bal"), Some(&dec("10.01")));
+    assert_eq!(after_a.get("n"), Some(&dec("5.5")));
+    assert_eq!(after_a.get("avg"), Some(&dec("1.100000000000000005551115123125783")));
+
+    let pulled = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(pulled.applied, 1, "{pulled:?}");
+    let after_b = b.engine.get(&cb, &id).unwrap().unwrap();
+    // The same document, and for each decimal the same 16 bytes.
+    assert_eq!(after_b, after_a);
+    for field in ["bal", "n", "avg"] {
+        let (x, y) = (after_a.get(field).unwrap(), after_b.get(field).unwrap());
+        match (x, y) {
+            (bson::Bson::Decimal128(x), bson::Bson::Decimal128(y)) => {
+                assert_eq!(x.bytes(), y.bytes(), "{field}")
+            }
+            other => panic!("{field}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        a.engine.document_stamp(&ca, &id).unwrap(),
+        b.engine.document_stamp(&cb, &id).unwrap()
+    );
+
+    // And the members agree by digest.
+    let round = probe_twice(&b, &a).await;
+    assert_eq!(compared(&round, ca.id), Some(true), "{round:?}");
+}
+
+// ---------------------------------------------------------------------------
 // B3: the cut digest between two live nodes
 // ---------------------------------------------------------------------------
 
