@@ -221,6 +221,13 @@ tempfile = "3"
 # `x509-parser`).
 num-bigint = "0.4"
 num-rational = "0.4"
+# decNumber, the reference implementation of the General Decimal Arithmetic
+# specification, as a second oracle for the Decimal128 arithmetic (ADR-252). Dev-only:
+# the product carries its own integer-only code, and this adds C and an ICU-licensed
+# build dependency to tests alone (`deny.toml` does not check dev-dependencies, and
+# nothing in a release links it). Pinned, so a different decNumber cannot change what
+# the oracle answers.
+dec = "=0.4.11"
 # Structured inputs for the fuzz harnesses (ADR-111): turns fuzzer bytes into
 # BSON values and token claims. Pure Rust, and reaches the tree only through
 # `kimmy-fuzz-harness`, which ships nothing.
