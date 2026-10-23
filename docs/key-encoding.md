@@ -169,7 +169,7 @@ decimal can have is 36 bytes: a window of `80`, fourteen zero bytes and a last
 byte, truncated. Through 0.50.x a finite number's key was always 12 bytes, a
 fixed 8-byte mantissa with no escape and no end; every number key on disk
 changed in 0.51.0, which is what storage schema 5's migration re-keys and
-rebuilds ([Operations](operations.md#storage-schema-5-the-first-start-of-0510)).
+rebuilds.
 
 ### Why 128 bits suffice: the order, in two lemmas
 

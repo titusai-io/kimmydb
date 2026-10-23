@@ -5572,8 +5572,8 @@ pub(crate) fn append_oplog_at(
     arrival.insert(next, key.as_slice())?;
     by_stamp.insert(key.as_slice(), next)?;
     // Every document write appends, so this is where a build that keeps the
-    // live counts says so; a mark that no longer matches at open means one that
-    // does not wrote since (ADR-174). Read here, where `arrival` and `oplog`
+    // live counts says so; a mark that no longer matches at open means the
+    // store was written behind the counts (ADR-174). Read here, where `arrival` and `oplog`
     // are already open, and written once at the commit: writing it per entry
     // rewrote the same single key once for every entry in a batch, while
     // computing it at the commit instead would have to open these two tables

@@ -115,97 +115,13 @@ does not have.
 
 ---
 
-## A cluster is not one version
+## A cluster is one version
 
-Nodes are upgraded one at a time, and a client that fails over between nodes may
-reach an older node immediately after a newer one. Three consequences, all of which
-follow from the rules above rather than adding to them:
-
-- **Ask each node.** `/v1/version` describes the node that answered it, and the
-  answer is worth caching per node rather than per cluster.
-- **A request using a field an older node does not know is refused**, with
-  `422` and `bad_request` — every request body rejects unknown fields
-  ([ADR-121](decisions.md)), so a typo is an error rather than a silent
-  no-op. A query string is held to the same rule at `400`: a parameter the
-  route does not define, or any query string on a route that takes none
-  ([ADR-124](decisions.md)). That refusal is *correct*, and it is why
-  capability discovery exists: check first, do not send and hope.
-- **Failover does not paper over this.** A `retry: elsewhere` failure means the
-  node was unable; it does not mean the next node is newer. A client that
-  retries a capability-dependent request around the cluster will get the same
-  refusal from every node that lacks the feature.
-
-**The cluster wire is a different contract entirely.** SWIM identities are
-encoded with postcard, which is not self-describing, so adding or reordering a
-field there breaks membership outright — three such upgrades are already
-documented in [Operations](operations.md) as stop-the-cluster events
-([ADR-040](decisions.md), [ADR-051](decisions.md), [ADR-053](decisions.md)).
-The client protocol deliberately has the opposite property, and the contrast is
-the point: the internal wire is optimized for size and changed under an outage
-window; the client wire is optimized for not breaking anyone.
-
-**Replication frames are not SWIM datagrams, and break differently.** The
-replication protocol is BSON, which *is* self-describing, so changing the
-*shape of a message variant* is a decode error on arrival rather than a value
-misread as something else. That is narrower than "this wire is safe": messages
-are plain serde with no `deny_unknown_fields`, so an **added optional field**
-crosses versions silently in both directions, which is exactly how
-`AskEntries::held` shipped ([ADR-097](decisions.md)). A change is loud only
-when it cannot be read as the old shape.
-
-The first break of that loud kind — `Message::Entries` becoming a struct
-variant to carry where the sender's window ended ([ADR-127](decisions.md)) — is
-therefore the first cluster-wire change that is safe to **roll**: mixed members
-fail each other's sync rounds, `kimmy_sync_failures_total` rises on both sides,
-membership and failure detection are untouched, and anti-entropy reconciles
-when the roll finishes. Being unreadable rather than misreadable is the
-property being bought, and it is why this one does not join the
-stop-the-cluster list. Finish inside `storage.oplog_retention_secs` — see
-[Operations](operations.md).
-
-**A database drop (0.47.0, [ADR-229](decisions.md)) changes what a route means,
-and a roll has a clock on it.** `DELETE /v1/db/{db}` now also deletes, on every
-member, the collections created before it that the answering member had not
-received. A 0.46.0 member in a mixed cluster does not act on the drop's tombstone
-(it applies it as the drop of a collection it never held) and keeps serving a
-collection the dropper never held until it restarts on 0.47.0, which buries it.
-That restart needs the tombstone, which every member collects after
-`storage.tombstone_retention_secs`: **a roll or rollback must finish inside it of
-any database drop made during it**, or the collection, and with it the database,
-comes back on every member.
-
-**A database drop keeps what is stamped after it (0.50.0, [ADR-236](decisions.md)),
-which changes what the route means again.** A write made into a collection of the
-database after the drop's stamp, through a member that had not received the drop,
-is kept, as for a collection's drop since 0.49.0, so the collection and the database
-can come back holding only such writes. A 0.49.x member in a mixed cluster buries such
-a collection with the write, and refuses the kept collection from a 0.50.0 member
-until it is upgraded; **a store rolled back to 0.49.x buries, at its next start, every
-collection 0.50.0 kept under a database drop, with the writes it kept**, so the members
-differ until they run one version. Two other differences outlast the roll. A creation
-in a drop's own millisecond that a 0.49.x member applied stays where it was applied
-(0.50.0 gives such a tie to the drop, and nothing repairs the life a 0.49.x member
-kept). And a 0.49.x member that buried a collection its database's drop covered,
-indexes and all, still serves an index or vector change stamped after the drop for as
-long as it retains the entry: a 0.50.0 member that lacks the collection stops at it
-once, and the 0.49.x member's snapshot of the collection, which holds nothing, lets it
-pass. No table, schema, wire field, backup tag or entry kind changed; a 0.50.0 member
-relays a drop it ignored and a creation its database's drop refused, as entries a
-0.49.x member reads and judges as it would the originals.
-
-**Decimal128 and storage schema 5 (0.51.0, [ADR-238](decisions.md)) make 0.51.0 a
-rollback boundary to 0.50.x and 0.49.x.** Every number
-key on disk changes, so the first start migrates the store before it serves (about 16 to 19 minutes
-for 2,000,000 documents with integer `_id`s and three indexes on the lab host) and, from the
-moment it raises the sidecar, a 0.50 or 0.49 build refuses the store (leaving `kimmy.redb` and `kimmy.format` as they were, though it rewrites `kimmy.last-exit` to record the failed start); the way back is the
-backup taken before the upgrade. A `Decimal128`
-`_id` fails to decode on 0.50 and 0.49, and a `Decimal128` partial-index bound is refused
-there and never retried; since 0.53.0 nothing refuses their creation, so members are not mixed
-across this boundary: KimmyDB runs one version at a time, and a release that changes data
-deploys stop-all with a wipe. A migration that outlasts `storage.oplog_retention_secs`
-turns the member's return into a whole-database snapshot. Two differences outlast the roll
-until a member migrates: its partial unique indexes enforce on decimals (and its TTL
-indexes decide them by exact value), where a 0.50 member's do not.
+Cluster protocol 2 makes a member refuse a peer of another release at the
+handshake, so every member of a cluster answers `/v1/version` alike. A request
+that uses a field a node does not know is refused with `422` and `bad_request`,
+as every request body rejects unknown fields ([ADR-121](decisions.md)); a query
+string is held to the same rule at `400` ([ADR-124](decisions.md)).
 
 **Storage schema 6 and cluster protocol 2 (0.53.0, [ADR-251](decisions.md#adr-251--binary-_id-subtypes)) make 0.53.0 the release that does not upgrade a store.** A binary `_id` is keyed with its subtype, so a schema-5 store's keys mean something else. 0.53.0 refuses, by name, a data directory or a backup written by 0.52 or older, and a peer that speaks no cluster protocol 2, and the schema 1 to 5 migrations are removed. The upgrade is stop all, wipe, start all, reseed ([Upgrades](operations.md#upgrades)); there is no mixed-version cluster. 0.52 refuses a schema-6 store, so the way back is to start 0.52.x on the data directories moved aside.
 
