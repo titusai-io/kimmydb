@@ -713,7 +713,7 @@ pub fn from_i64(value: i64) -> Raw {
 
 /// **R1**: a binary64 (its 64 bits) as a `Decimal128`, IEEE 754
 /// `convertFormat` under round-half-even: its exact value, rounded once to 34
-/// digits. Whether the conversion was exact is the second answer; it is IEEE's
+/// digits. Whether the conversion was inexact is the second answer; it is IEEE's
 /// inexact signal, which the update guard reads.
 ///
 /// - NaN is the quiet NaN, an infinity an infinity, and `±0.0` is `±0` at

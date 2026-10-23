@@ -17,6 +17,9 @@ pub mod plan;
 pub mod shape;
 pub mod update;
 
+#[cfg(test)]
+mod decimal_arith_tests;
+
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};
 pub use filter::{Condition, Filter, matches};

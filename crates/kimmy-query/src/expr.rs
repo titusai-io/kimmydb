@@ -69,6 +69,8 @@
 use std::cmp::Ordering;
 
 use bson::{Bson, Document};
+use kimmy_core::decimal::arith::{self, ExactSum};
+use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
 use kimmy_core::{Error, Result, canonical_cmp, path};
 
 // ---------------------------------------------------------------------------
@@ -334,10 +336,8 @@ impl Op {
 
 /// The type a `$convert` produces.
 ///
-/// Seven of MongoDB's targets. `decimal` is refused at parse, for the reason
-/// in [`DECIMAL_TARGET_REASON`]: producing a `Decimal128` from a double needs a
-/// rounding rule this build does not have. Comparing, grouping and indexing a
-/// `Decimal128` are not the reason; all three take one by its exact value.
+/// Eight of MongoDB's targets. A double converts to `decimal` by its exact
+/// binary value, rounded once to 34 digits (ADR-252).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConvertTo {
     Double,
@@ -347,19 +347,8 @@ pub enum ConvertTo {
     Date,
     Int,
     Long,
+    Decimal,
 }
-
-/// Why `decimal` is not a conversion target, in the words `$convert` and
-/// `$toDecimal` both refuse with.
-///
-/// A conversion to `Decimal128` must round: a double's exact binary value can
-/// run to about 767 significant digits and a `Decimal128` holds 34, so `0.1`
-/// the double has no `Decimal128` equal to it. Which rounding to apply is a
-/// decision about decimal arithmetic, which this build does not make; until it
-/// does, producing one would pick a rule silently.
-const DECIMAL_TARGET_REASON: &str = "converting to Decimal128 needs a rounding rule, because a \
-     double's exact binary value can run to about 767 significant digits and a Decimal128 holds \
-     34, and this build has none; convert to double or long instead";
 
 impl ConvertTo {
     /// `to` as written: a type name or its numeric BSON code, both as `$type`
@@ -378,7 +367,8 @@ impl ConvertTo {
             Bson::Int32(_) | Bson::Int64(_) => {
                 return Err(Error::InvalidQuery(format!(
                     "$convert `to` code {value} is not a convertible type; use 1 (double), 2 \
-                     (string), 7 (objectId), 8 (bool), 9 (date), 16 (int) or 18 (long)"
+                     (string), 7 (objectId), 8 (bool), 9 (date), 16 (int), 18 (long) or 19 \
+                     (decimal)"
                 )));
             }
             other => {
@@ -396,15 +386,11 @@ impl ConvertTo {
             "date" => ConvertTo::Date,
             "int" => ConvertTo::Int,
             "long" => ConvertTo::Long,
-            "decimal" => {
-                return Err(Error::InvalidQuery(format!(
-                    "$convert to decimal is not supported: {DECIMAL_TARGET_REASON}"
-                )));
-            }
+            "decimal" => ConvertTo::Decimal,
             other => {
                 return Err(Error::InvalidQuery(format!(
                     "$convert cannot target {other:?}; supported: double, string, objectId, \
-                     bool, date, int, long"
+                     bool, date, int, long, decimal"
                 )));
             }
         })
@@ -420,6 +406,7 @@ impl ConvertTo {
             "$toDate" => ConvertTo::Date,
             "$toInt" => ConvertTo::Int,
             "$toLong" => ConvertTo::Long,
+            "$toDecimal" => ConvertTo::Decimal,
             _ => return None,
         })
     }
@@ -434,6 +421,7 @@ impl ConvertTo {
             ConvertTo::Date => "date",
             ConvertTo::Int => "int",
             ConvertTo::Long => "long",
+            ConvertTo::Decimal => "decimal",
         }
     }
 }
@@ -1084,12 +1072,6 @@ impl Expr {
             "$map" => Self::parse_map(raw, declared),
             "$reduce" => Self::parse_reduce(raw, declared),
             "$convert" => Self::parse_convert(raw, declared),
-            // The one `$toX` name that is not a shorthand: it has no target to
-            // convert to, so it is refused with the reason `$convert` gives.
-            "$toDecimal" => Err(Error::UnsupportedOperator {
-                operator: "$toDecimal".into(),
-                reason: Some(DECIMAL_TARGET_REASON.into()),
-            }),
             name if ConvertTo::from_shorthand(name).is_some() => {
                 Self::parse_convert_shorthand(name, raw, declared)
             }
@@ -1906,34 +1888,146 @@ impl Num {
     }
 }
 
+/// The numbers of a group seen so far, kept so that the first `Decimal128` can
+/// turn them into one exact sum (ADR-252).
+///
+/// Before a decimal, nothing is rounded and nothing is lost: the integers
+/// add as one exact `i128` and each double is kept as its 64 bits (at most 100,000
+/// of them, the pipeline's own ceiling on documents). At the first decimal an
+/// [`ExactSum`] takes the integers exactly and every buffered double by R1, and
+/// from then on each number goes straight in. The sum is rounded once, at the
+/// end, so it is the same bytes in any document order.
+#[derive(Clone, Debug, Default)]
+struct Seen {
+    integers: i128,
+    integer_count: u64,
+    doubles: Vec<u64>,
+    exact: Option<ExactSum>,
+}
+
+impl Seen {
+    fn add_integer(&mut self, n: i64) {
+        match &mut self.exact {
+            Some(sum) => sum.add_integers(i128::from(n), 1),
+            None => {
+                self.integers += i128::from(n);
+                self.integer_count += 1;
+            }
+        }
+    }
+
+    fn add_double(&mut self, d: f64) {
+        match &mut self.exact {
+            Some(sum) => sum.add(&arith::from_binary64(d.to_bits()).0),
+            None => self.doubles.push(d.to_bits()),
+        }
+    }
+
+    fn add_decimal(&mut self, d: &bson::Decimal128) {
+        let sum = match &mut self.exact {
+            Some(sum) => sum,
+            none => {
+                let mut sum = ExactSum::new();
+                sum.add_integers(self.integers, self.integer_count);
+                for bits in self.doubles.drain(..) {
+                    sum.add(&arith::from_binary64(bits).0);
+                }
+                none.insert(sum)
+            }
+        };
+        sum.add(&decode_raw(d));
+    }
+
+    /// Take a number into the group; anything else is skipped.
+    fn add(&mut self, value: &Bson) {
+        match value {
+            Bson::Int32(n) => self.add_integer(i64::from(*n)),
+            Bson::Int64(n) => self.add_integer(*n),
+            Bson::Double(d) => self.add_double(*d),
+            Bson::Decimal128(d) => self.add_decimal(d),
+            _ => {}
+        }
+    }
+}
+
 /// Accumulate integers exactly, and only widen when something forces it.
 ///
 /// Exposed to `aggregate` so `$sum` shares this path rather than keeping its
 /// own `f64`-with-a-flag version, which lost precision above 2^53 despite a
 /// comment saying it must not.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Total(Option<Num>);
+///
+/// A group that holds a `Decimal128` is summed exactly instead (ADR-252): every
+/// numeric value as converted, integers exactly and each double by R1, rounded
+/// once to a `Decimal128`. A group with none is summed as it always was.
+#[derive(Clone, Debug, Default)]
+pub struct Total {
+    plain: Option<Num>,
+    seen: Seen,
+}
 
 impl Total {
     pub fn add(&mut self, value: &Bson) {
         // A non-numeric operand is ignored, which is what `$sum` has always
         // done: summing a field that is sometimes a string should total the
         // numbers, not refuse the whole group.
+        if let Bson::Decimal128(_) = value {
+            self.seen.add(value);
+            return;
+        }
         let Some(n) = Num::from_bson(value) else {
             return;
         };
-        self.0 = Some(match self.0 {
+        self.seen.add(value);
+        self.plain = Some(match self.plain {
             Some(acc) => acc.add(n),
             None => n,
         });
     }
 
-    pub fn to_bson(self) -> Bson {
-        self.0.unwrap_or(Num::Int(0)).to_bson()
+    pub fn to_bson(&self) -> Bson {
+        match &self.seen.exact {
+            Some(sum) => Bson::Decimal128(pack_raw(sum.finish_sum())),
+            None => self.plain.unwrap_or(Num::Int(0)).to_bson(),
+        }
     }
 
-    pub fn as_f64(self) -> f64 {
-        self.0.map_or(0.0, Num::as_f64)
+    pub fn as_f64(&self) -> f64 {
+        self.plain.map_or(0.0, Num::as_f64)
+    }
+}
+
+/// The mean of a group's numbers. Doubles and integers are averaged as they
+/// always were; a group that holds a `Decimal128` gets the exact sum divided by
+/// the count and rounded once (ADR-252), not the rounded sum divided, which
+/// rounds twice.
+#[derive(Clone, Debug, Default)]
+pub struct Mean {
+    total: f64,
+    count: usize,
+    seen: Seen,
+}
+
+impl Mean {
+    pub fn add(&mut self, value: &Bson) {
+        // Non-numeric values are skipped rather than counted as zero, or a
+        // field that is missing on half the documents would halve the mean.
+        match value {
+            Bson::Int32(n) => self.total += f64::from(*n),
+            Bson::Int64(n) => self.total += *n as f64,
+            Bson::Double(d) => self.total += *d,
+            Bson::Decimal128(_) => {}
+            _ => return,
+        }
+        self.count += 1;
+        self.seen.add(value);
+    }
+
+    pub fn to_bson(&self) -> Bson {
+        match &self.seen.exact {
+            Some(sum) => Bson::Decimal128(pack_raw(sum.finish_avg())),
+            None if self.count == 0 => Bson::Null,
+            None => Bson::Double(self.total / self.count as f64),
+        }
     }
 }
 
@@ -1958,11 +2052,81 @@ fn numbers(op: Op, args: &[Bson]) -> Result<Option<Vec<Num>>> {
     Ok(Some(out))
 }
 
+/// An operand of `$add`, `$subtract`, `$multiply` or `$divide`: a plain number,
+/// or a `Decimal128` as arithmetic reads it. `$mod` takes only the first kind.
+enum Operand {
+    Plain(Num),
+    Decimal(Raw),
+}
+
+impl Operand {
+    /// The operand as a `Decimal128` operand: an integer exactly, a double by
+    /// R1 (its exact binary value rounded once to 34 digits, ties to even).
+    fn widen(&self) -> Raw {
+        match self {
+            Operand::Plain(Num::Int(n)) => arith::from_i64(*n),
+            Operand::Plain(Num::Dbl(d)) => arith::from_binary64(d.to_bits()).0,
+            Operand::Decimal(raw) => *raw,
+        }
+    }
+}
+
+/// [`numbers`], with a `Decimal128` allowed. The type of the result is decided
+/// over all the operands before anything is computed, so `[i64::MAX, 1,
+/// Decimal128("0")]` is the exact `9223372036854775808`.
+fn operands(op: Op, args: &[Bson]) -> Result<Option<Vec<Operand>>> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            Bson::Null | Bson::Undefined => return Ok(None),
+            Bson::Decimal128(d) => out.push(Operand::Decimal(decode_raw(d))),
+            other => match Num::from_bson(other) {
+                Some(n) => out.push(Operand::Plain(n)),
+                None => {
+                    return Err(Error::InvalidQuery(format!(
+                        "{} needs numbers, found {}",
+                        op.name(),
+                        type_name(other)
+                    )));
+                }
+            },
+        }
+    }
+    Ok(Some(out))
+}
+
+fn any_decimal(operands: &[Operand]) -> bool {
+    operands.iter().any(|o| matches!(o, Operand::Decimal(_)))
+}
+
+fn decimal_result(raw: Raw) -> Bson {
+    Bson::Decimal128(pack_raw(raw))
+}
+
+/// `$add` and `$multiply` over any number of operands. With a decimal among
+/// them the result is a `Decimal128`: one exact sum or one exact product,
+/// rounded once, so the order of the operands cannot change the bytes.
 fn fold_numeric(op: Op, args: &[Bson], f: fn(Num, Num) -> Num) -> Result<Bson> {
-    let Some(nums) = numbers(op, args)? else {
+    let Some(operands) = operands(op, args)? else {
         return Ok(Bson::Null);
     };
-    let mut it = nums.into_iter();
+    if any_decimal(&operands) {
+        let widened: Vec<Raw> = operands.iter().map(Operand::widen).collect();
+        return Ok(decimal_result(match op {
+            Op::Multiply => arith::product(&widened),
+            _ => {
+                let mut sum = ExactSum::new();
+                for term in &widened {
+                    sum.add(term);
+                }
+                sum.finish_sum()
+            }
+        }));
+    }
+    let mut it = operands.into_iter().map(|o| match o {
+        Operand::Plain(n) => n,
+        Operand::Decimal(_) => unreachable!("no decimal operand"),
+    });
     let first = it.next().expect("arity checked at parse");
     Ok(it.fold(first, f).to_bson())
 }
@@ -2023,22 +2187,44 @@ fn arithmetic_subtract(a: &Bson, b: &Bson) -> Result<Bson> {
         (_, Bson::DateTime(_)) => {
             Err(Error::InvalidQuery("$subtract cannot take a date away from a number".into()))
         }
-        _ => fold_numeric(Op::Subtract, &[a.clone(), b.clone()], Num::sub),
+        _ => {
+            let Some(operands) = operands(Op::Subtract, &[a.clone(), b.clone()])? else {
+                return Ok(Bson::Null);
+            };
+            if any_decimal(&operands) {
+                // The exact sum of `a` and `-b`.
+                return Ok(decimal_result(arith::sub(&operands[0].widen(), &operands[1].widen())));
+            }
+            let [Operand::Plain(x), Operand::Plain(y)] = operands.as_slice() else {
+                unreachable!("two plain operands");
+            };
+            Ok(x.sub(*y).to_bson())
+        }
     }
 }
 
 fn divide(a: &Bson, b: &Bson) -> Result<Bson> {
-    let Some(nums) = numbers(Op::Divide, &[a.clone(), b.clone()])? else {
+    let Some(operands) = operands(Op::Divide, &[a.clone(), b.clone()])? else {
         return Ok(Bson::Null);
     };
-    let divisor = nums[1].as_f64();
+    if any_decimal(&operands) {
+        // Any zero divisor is refused, whatever the dividend, as it is for
+        // every number; IEEE would give an infinity or a NaN.
+        return arith::div(&operands[0].widen(), &operands[1].widen())
+            .map(decimal_result)
+            .map_err(|_| Error::InvalidQuery("$divide by zero".into()));
+    }
+    let [Operand::Plain(x), Operand::Plain(y)] = operands.as_slice() else {
+        unreachable!("two plain operands");
+    };
+    let divisor = y.as_f64();
     if divisor == 0.0 {
         return Err(Error::InvalidQuery("$divide by zero".into()));
     }
     // Always a double, as MongoDB does: an integer result would make
     // `{$divide: [1, 2]}` round to zero, which is a wrong answer rather than
     // an imprecise one.
-    Ok(Bson::Double(nums[0].as_f64() / divisor))
+    Ok(Bson::Double(x.as_f64() / divisor))
 }
 
 fn modulo(a: &Bson, b: &Bson) -> Result<Bson> {
@@ -2814,6 +3000,9 @@ fn convert(value: &Bson, to: ConvertTo) -> Result<Bson> {
             Bson::Int64(n) => *n as f64,
             Bson::Boolean(b) => f64::from(u8::from(*b)),
             Bson::DateTime(dt) => dt.timestamp_millis() as f64,
+            // The nearest double to the exact value, half to even; beyond the
+            // range an infinity, as `"1e400"` is (ADR-252).
+            Bson::Decimal128(d) => f64::from_bits(arith::to_binary64(&decode_raw(d))),
             Bson::String(s) => s.parse::<f64>().map_err(|_| {
                 Error::InvalidQuery(format!("$convert cannot read {s:?} as a double"))
             })?,
@@ -2832,6 +3021,8 @@ fn convert(value: &Bson, to: ConvertTo) -> Result<Bson> {
             Bson::Int64(n) => n.to_string(),
             Bson::Double(d) => double_to_string(*d),
             Bson::Boolean(b) => b.to_string(),
+            // BSON's text form, which keeps the cohort member: `2.30`, `1E+3`.
+            Bson::Decimal128(d) => d.to_string(),
             // ISO 8601 with milliseconds, which is `$dateToString`'s default
             // and what `$toDate` reads back.
             Bson::DateTime(dt) => format_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?,
@@ -2850,9 +3041,32 @@ fn convert(value: &Bson, to: ConvertTo) -> Result<Bson> {
             Bson::Double(d) => bson::DateTime::from_millis(double_to_i64(*d).ok_or_else(|| {
                 Error::InvalidQuery(format!("$convert: {d} is not a whole number of milliseconds"))
             })?),
+            // The exact value truncated toward zero to whole milliseconds, as a
+            // double is, but read from the exact value and never through a
+            // double.
+            Bson::Decimal128(d) => bson::DateTime::from_millis(decimal_to_i64(d).ok_or_else(|| {
+                Error::InvalidQuery(format!("$convert: {d} is not a date in milliseconds"))
+            })?),
             Bson::String(s) => parse_date(s)?,
             // The creation time an ObjectId carries in its leading bytes.
             Bson::ObjectId(oid) => oid.timestamp(),
+            _ => return Err(unsupported()),
+        })),
+        // Exact for an integer, a boolean, a date's milliseconds and a string
+        // the strict parser reads without rounding; a double by its exact
+        // binary value rounded once to 34 digits (ADR-252). A string that
+        // would need rounding is an error, not a rounded number: `onError` is
+        // the escape.
+        ConvertTo::Decimal => Ok(Bson::Decimal128(match value {
+            Bson::Decimal128(d) => *d,
+            Bson::Int32(n) => pack_raw(arith::from_i64(i64::from(*n))),
+            Bson::Int64(n) => pack_raw(arith::from_i64(*n)),
+            Bson::Double(d) => pack_raw(arith::from_binary64(d.to_bits()).0),
+            Bson::Boolean(b) => pack_raw(arith::from_i64(i64::from(*b))),
+            Bson::DateTime(dt) => pack_raw(arith::from_i64(dt.timestamp_millis())),
+            Bson::String(s) => kimmy_core::decimal::parse(s).map_err(|e| {
+                Error::InvalidQuery(format!("$convert cannot read {s:?} as a decimal: {e}"))
+            })?,
             _ => return Err(unsupported()),
         })),
         ConvertTo::ObjectId => match value {
@@ -2878,6 +3092,11 @@ fn convert_integer(value: &Bson, to: ConvertTo) -> Result<i64> {
         Bson::Double(d) => double_to_i64(*d).ok_or_else(|| {
             Error::InvalidQuery(format!("$convert: {d} has no {} representation", to.name()))
         }),
+        // Truncated toward zero, from the exact value; NaN, an infinity and a
+        // value past `i64` are errors, as for a double.
+        Bson::Decimal128(d) => decimal_to_i64(d).ok_or_else(|| {
+            Error::InvalidQuery(format!("$convert: {d} has no {} representation", to.name()))
+        }),
         // A base-10 integer and nothing else: `"1.5"` is not one, and neither
         // is `"12abc"`. Reading a prefix would turn a data error into a number.
         Bson::String(s) => s.parse::<i64>().map_err(|_| {
@@ -2893,6 +3112,11 @@ fn convert_integer(value: &Bson, to: ConvertTo) -> Result<i64> {
             to.name()
         ))),
     }
+}
+
+/// A decimal truncated toward zero, when that is an `i64`.
+fn decimal_to_i64(d: &bson::Decimal128) -> Option<i64> {
+    kimmy_core::decimal::integer_part(d).filter(|part| part.in_range).map(|part| part.value)
 }
 
 /// A double truncated toward zero, when that is an `i64`.
@@ -4655,48 +4879,6 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_decimal_is_refused_with_a_reason() {
-        // A conversion to Decimal128 needs a rounding rule for a double, which
-        // this build does not have. Comparing one is not the reason: a
-        // Decimal128 compares, groups and indexes by its exact value.
-        let by_name = Expr::parse(&doc! {"$convert": {"input": 1, "to": "decimal"}}.into());
-        let by_code = Expr::parse(&doc! {"$convert": {"input": 1, "to": 19}}.into());
-        for result in [by_name, by_code] {
-            let msg = result.expect_err("decimal must be refused").to_string();
-            assert!(
-                msg.contains("Decimal128") && msg.contains("rounding rule"),
-                "the refusal should say why: {msg}"
-            );
-            assert!(!msg.contains("key encoding"), "the old reason is gone: {msg}");
-        }
-    }
-
-    #[test]
-    fn to_decimal_is_refused_for_the_reason_convert_gives() {
-        // The shorthand was never an operator; it used to be refused as an
-        // unknown one, and the message pointed at nothing. It now says why,
-        // in the words `$convert` uses, and still names the operator in the
-        // quotes of the `unsupported operator` template.
-        let convert = Expr::parse(&doc! {"$convert": {"input": 1, "to": "decimal"}}.into())
-            .expect_err("decimal must be refused")
-            .to_string();
-        let reason =
-            convert.split_once("not supported: ").map(|(_, rest)| rest).expect("a reason follows");
-        for arg in [Bson::from("$n"), Bson::from(vec![Bson::from("$n")]), Bson::Int32(1)] {
-            let err = Expr::parse(&doc! {"$toDecimal": arg}.into()).expect_err("must be refused");
-            assert!(matches!(err, Error::UnsupportedOperator { .. }), "{err:?}");
-            assert_eq!(
-                err.to_string(),
-                "unsupported operator \"$toDecimal\": converting to Decimal128 needs a rounding \
-                 rule, because a double's exact binary value can run to about 767 significant \
-                 digits and a Decimal128 holds 34, and this build has none; convert to double or \
-                 long instead"
-            );
-            assert!(err.to_string().ends_with(reason), "{err} vs {convert}");
-        }
-    }
-
-    #[test]
     fn a_null_or_missing_input_is_null_unless_on_null_says_otherwise() {
         assert_eq!(on(doc! {"$toInt": "$gone"}.into(), doc! {}), Bson::Null);
         assert_eq!(on(doc! {"$toInt": "$n"}.into(), doc! {"n": Bson::Null}), Bson::Null);
@@ -5455,11 +5637,10 @@ mod decimal128 {
             let parsed = Expr::parse(&expr).unwrap_or_else(|e| panic!("{expr:?}: {e}"));
             assert_eq!(parsed.eval(&none).unwrap(), want, "{expr:?}");
         }
-        // Arithmetic on a `Decimal128` is not part of this: `$add` refuses one,
-        // a literal as a stored value, when it evaluates.
+        // Arithmetic on one is exact and gives a `Decimal128` (ADR-252): the
+        // literal as a stored value, when it evaluates.
         let add = Expr::parse(&Bson::Document(doc! { "$add": ["$v", b("1.5")] })).unwrap();
-        let msg = add.eval(&doc! { "v": 1 }).unwrap_err().to_string();
-        assert!(msg.contains("$add needs numbers, found a Decimal128"), "{msg}");
+        assert_eq!(add.eval(&doc! { "v": 1 }).unwrap(), b("2.5"));
     }
 
     /// Every comparison an expression makes reads a `Decimal128` by its exact
