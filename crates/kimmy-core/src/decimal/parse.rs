@@ -244,10 +244,11 @@ fn fit(number: &Written<'_>) -> Result<(u128, i16), ParseError> {
 #[cfg(test)]
 mod tests {
     use num_bigint::BigInt;
+    use num_rational::BigRational;
     use proptest::prelude::*;
 
     use super::*;
-    use crate::cmp::oracle::{Rational, scaled};
+    use crate::cmp::oracle::scaled;
     use crate::decimal::{Decimal, decode};
 
     fn word(d: Decimal128) -> u128 {
@@ -461,7 +462,7 @@ mod tests {
 
     /// The exact rational a text in the grammar denotes, by a reader that
     /// shares nothing with [`parse`].
-    fn rational(text: &str) -> Rational {
+    fn rational(text: &str) -> BigRational {
         let (negative, rest) = match text.strip_prefix('-') {
             Some(rest) => (true, rest),
             None => (false, text.strip_prefix('+').unwrap_or(text)),
@@ -475,9 +476,9 @@ mod tests {
         scaled(negative, digits, exponent - fraction.len() as i64)
     }
 
-    fn value(d: Decimal128) -> Rational {
+    fn value(d: Decimal128) -> BigRational {
         match decode(&d) {
-            Decimal::Zero => Rational::from_integer(0.into()),
+            Decimal::Zero => BigRational::from_integer(0.into()),
             Decimal::Finite { negative, coefficient, exponent } => {
                 scaled(negative, coefficient.into(), i64::from(exponent))
             }

@@ -213,13 +213,14 @@ tracing-opentelemetry = { version = "0.34", default-features = false, features =
 # Dev / test
 proptest = "1"
 tempfile = "3"
-# Exact-arithmetic oracle for kimmy-core's number comparator and number keys.
+# Exact-arithmetic oracles for kimmy-core's number comparator and number keys.
 # Dev-only on purpose: the product carries its own few-operation big integer,
 # so the component whose failure mode is a silent wrong answer adds no
 # supply-chain surface, and the oracle it is checked against is somebody
-# else's arithmetic. Already in the graph (through `jsonschema` and
+# else's arithmetic. Both already in the graph (through `jsonschema` and
 # `x509-parser`).
-num-bigint = "0.5"
+num-bigint = "0.4"
+num-rational = "0.4"
 # Structured inputs for the fuzz harnesses (ADR-111): turns fuzzer bytes into
 # BSON values and token claims. Pure Rust, and reaches the tree only through
 # `kimmy-fuzz-harness`, which ships nothing.
