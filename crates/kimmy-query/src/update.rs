@@ -1203,7 +1203,7 @@ fn decimal_arithmetic(base: &Bson, operand: &Bson, op: &Arith, path: &str) -> Re
     };
     let result = match op {
         Arith::Add => arith::add(&stored, &given),
-        Arith::Mul => arith::product(&[stored, given]),
+        Arith::Mul => arith::mul(&stored, &given),
     };
     let infinite_input = matches!(stored, Raw::Inf { .. }) || matches!(given, Raw::Inf { .. });
     if matches!(result, Raw::Inf { .. }) && !infinite_input {

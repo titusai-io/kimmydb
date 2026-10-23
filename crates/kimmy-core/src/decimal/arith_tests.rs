@@ -213,6 +213,29 @@ fn reference_product(ops: &[Raw]) -> Raw {
     }
 }
 
+/// `a × b` for any two operands, rounded once: the reference for one step of a
+/// chain, with the specials the exact reference does not take.
+fn reference_mul2(a: &Raw, b: &Raw) -> Raw {
+    let negative =
+        |r: &Raw| matches!(r, Raw::Inf { negative: true } | Raw::Finite { negative: true, .. });
+    match (a, b) {
+        (Raw::Nan, _) | (_, Raw::Nan) => Raw::Nan,
+        (Raw::Inf { .. }, o) | (o, Raw::Inf { .. }) => {
+            if o.is_zero() {
+                Raw::Nan
+            } else {
+                Raw::Inf { negative: negative(a) != negative(b) }
+            }
+        }
+        _ => reference_product(&[*a, *b]),
+    }
+}
+
+/// A chain left to right, each step rounded.
+fn reference_chain(ops: &[Raw]) -> Raw {
+    ops[1..].iter().fold(ops[0], |acc, next| reference_mul2(&acc, next))
+}
+
 fn reference_div(a: &Raw, b: &Raw) -> Raw {
     let (na, da) = value(a);
     let (nb, db) = value(b);
@@ -364,13 +387,35 @@ fn a_sum_does_not_depend_on_the_order_of_its_terms() {
 }
 
 #[test]
-fn a_product_is_one_exact_product() {
-    let ops = [d("1E+5000"), d("1E+5000"), d("1E-5000")];
-    for order in [[0, 1, 2], [0, 2, 1], [2, 0, 1], [2, 1, 0]] {
-        let ordered: Vec<Raw> = order.iter().map(|&i| ops[i]).collect();
-        same(arith::product(&ordered), "1E+5000");
-    }
-    same(arith::product(&[d("1.5"), d("1.0"), d("2")]), "3.00");
+fn a_product_is_a_chain_with_each_step_rounded() {
+    // Left to right, as MongoDB multiplies and IEEE 754 defines a sequence of
+    // operations (ADR-252): the order matters where a step overflows or rounds.
+    let chain = |ops: &[&str]| arith::product(&ops.iter().map(|t| d(t)).collect::<Vec<_>>());
+    same(chain(&["1E+5000", "1E+5000", "1E-5000"]), "Infinity");
+    same(chain(&["1E+5000", "1E-5000", "1E+5000"]), "1E+5000");
+    same(chain(&["1E-5000", "1E+5000", "1E+5000"]), "1E+5000");
+    same(chain(&["1.5", "1.0", "2"]), "3.00");
+    // A step that rounds: the first two factors' product has 68 digits and is
+    // rounded to 34 before the third, where the exact product of all three
+    // rounds once. The pair differs by one unit in the last place (a row of the
+    // golden corpus, with libmpdec multiplying one pair after another).
+    let ops = [
+        "1000000000000000000000000957877941E-34",
+        "9999999999999999999999999787852355E-35",
+        "1000000000000000000000000407746305E-32",
+    ];
+    let terms: Vec<Raw> = ops.iter().map(|t| d(t)).collect();
+    let stepwise = arith::product(&terms);
+    let exact_once = reference_product(&terms);
+    assert_ne!(stepwise, exact_once, "the premise: rounding each step differs");
+    same(stepwise, "1000000000000000000000001344409481E-34");
+    same(exact_once, "1000000000000000000000001344409482E-34");
+    // One operand is itself, canonical; none is one.
+    same(chain(&["2.30"]), "2.30");
+    assert_eq!(arith::product(&[]), arith::from_i64(1));
+    // The same chain with the operands reversed.
+    assert_eq!(chain(&["-0", "5", "Infinity"]), Raw::Nan);
+    assert_eq!(chain(&["5", "Infinity", "-0"]), Raw::Nan);
 }
 
 #[test]
@@ -519,14 +564,9 @@ proptest! {
     }
 
     #[test]
-    fn products_agree_with_the_reference_in_any_order(
-        ops in prop::collection::vec(finite_raw(), 1..7),
-    ) {
-        let want = reference_product(&ops);
-        prop_assert_eq!(arith::product(&ops), want);
-        let mut reversed = ops.clone();
-        reversed.reverse();
-        prop_assert_eq!(arith::product(&reversed), want);
+    fn a_product_is_the_chain_of_rounded_steps(ops in prop::collection::vec(any_special(), 1..7)) {
+        let want = if ops.len() == 1 { arith::product(&ops) } else { reference_chain(&ops) };
+        prop_assert_eq!(arith::product(&ops), want, "{:?}", ops.iter().map(show).collect::<Vec<_>>());
     }
 
     #[test]

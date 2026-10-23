@@ -19,7 +19,9 @@ Row kinds (tab separated; a value is `[-]<coefficient>E<exponent>`, `NaN`,
 
     r1      <binary64 bits, hex>  <value>  <inexact 0|1>
     add|sub|mul|div  <value>  <value>  <value>
-    sum|avg|prod     <value> <value> ...  <value>        (the multiset, then the answer)
+    sum|avg          <value> <value> ...  <value>        (the multiset, then the answer)
+    prod             <value> <value> ...  <value>  <value|->   (a chain left to right, each step rounded,
+                                                              then the exact product rounded once)
     todouble  <value>  <binary64 bits, hex>
     tolong    <value>  <integer | ERR>                     (truncated; ERR outside i64)
     tostr     <value>  <BSON text form>
@@ -167,8 +169,6 @@ def multiset_rows(n):
         # rounded once. The product: exact, rounded once.
         out("sum", shown, show(IEEE.create_decimal(total)))
         out("avg", shown, show(IEEE.divide(total, Decimal(size))))
-        if size >= 2 and all(t.is_finite() for t in terms):
-            out("prod", shown, show(IEEE.create_decimal(exact_product(terms))))
     # The design's worked examples.
     for text in (
         ["1E+34", "0.5", "0.5", "-1E+34"],
@@ -181,9 +181,56 @@ def multiset_rows(n):
         total = exact_sum(terms)
         out("sum", shown, show(IEEE.create_decimal(total)))
         out("avg", shown, show(IEEE.divide(total, Decimal(len(terms)))))
-    for text in (["1E+5000", "1E+5000", "1E-5000"], ["1.5", "1.0", "2"]):
-        terms = [Decimal(t) for t in text]
-        out("prod", " ".join(show(t) for t in terms), show(IEEE.create_decimal(exact_product(terms))))
+
+
+def chain(terms):
+    """A product left to right, each step rounded: what libmpdec gives for one
+    multiplication after another, and what IEEE 754 defines a sequence of
+    operations to be."""
+    acc = terms[0]
+    for t in terms[1:]:
+        acc = IEEE.multiply(acc, t)
+    if len(terms) == 1:
+        acc = IEEE.multiply(Decimal(1), acc)
+    return acc
+
+
+def product_rows(n):
+    """`prod <terms> <chain> <exact-once>`: the chain with each step rounded, and
+    beside it the exact product rounded once (`-` when a term is not finite).
+    The two differ where a step overflows, underflows or rounds, which is what
+    the rows are for: the test asserts that many of them do."""
+    def row(terms):
+        shown = " ".join(show(t) for t in terms)
+        stepwise = show(chain(terms))
+        once = show(IEEE.create_decimal(exact_product(terms))) if all(t.is_finite() for t in terms) else "-"
+        out("prod", shown, stepwise, once)
+
+    for _ in range(n):  # random chains
+        size = rng.randint(1, 8)
+        row([special_or_finite(0.03) for _ in range(size)])
+    for _ in range(n):  # 34-digit coefficients near 1: every step rounds
+        size = rng.randint(2, 7)
+        row([make(0, 10 ** 33 + rng.randint(0, 10 ** 9), rng.randint(-34, -30))
+             if rng.random() < 0.5 else
+             make(0, rng.randint(10 ** 34 - 10 ** 9, 10 ** 34 - 1), rng.randint(-35, -33))
+             for _ in range(size)])
+    for _ in range(n):  # extreme exponents: a step overflows or underflows
+        size = rng.randint(3, 6)
+        row([make(rng.getrandbits(1), coefficient() or 1, rng.choice([rng.randint(ETOP - 40, ETOP), rng.randint(ETINY, ETINY + 40), rng.randint(-3000, 3000)]))
+             for _ in range(size)])
+    for text in (
+        ["1E+5000", "1E+5000", "1E-5000"],
+        ["1E+5000", "1E-5000", "1E+5000"],
+        ["1E-5000", "1E+5000", "1E+5000"],
+        ["1.5", "1.0", "2"],
+        ["1.000000000000000000000000000000001"] * 3,
+        ["9.999999999999999999999999999999999"] * 4,
+        ["2.30"],
+        ["-0", "5", "Infinity"],
+        ["5", "Infinity", "-0"],
+    ):
+        row([Decimal(t) for t in text])
 
 
 def bits_to_double(bits):
@@ -312,6 +359,7 @@ def main():
     r1_rows(500)
     binary_rows(350)
     multiset_rows(250)
+    product_rows(120)
     conversion_rows(200)
     parse_rows()
 

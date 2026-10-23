@@ -102,7 +102,7 @@ fn run(file: &str, text: &str) -> Tally {
         let got = match op.as_str() {
             "add" => arith::add(&x, &y),
             "subtract" => arith::sub(&x, &y),
-            "multiply" => arith::product(&[x, y]),
+            "multiply" => arith::mul(&x, &y),
             "divide" => arith::div(&x, &y).unwrap_or_else(|_| panic!("{file} {id}: refused")),
             other => panic!("{file} {id}: an operation this test does not know: {other}"),
         };

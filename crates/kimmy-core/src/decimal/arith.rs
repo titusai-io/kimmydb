@@ -643,31 +643,46 @@ pub fn sub(a: &Raw, b: &Raw) -> Raw {
 // Products and quotients
 // ---------------------------------------------------------------------------
 
-/// The product of any number of operands: one exact product, rounded once, at
-/// the sum of the exponents. So `[1E+5000, 1E+5000, 1E-5000]` is `1E+5000` in
-/// every order, where a left fold would overflow on the way.
-pub fn product(operands: &[Raw]) -> Raw {
-    if operands.iter().any(|o| matches!(o, Raw::Nan)) {
+/// `a × b`, rounded once: the exact product of the coefficients at the sum of
+/// the exponents (the preferred exponent), so `1.5 × 1.0` is `1.50` and
+/// `0 × 1.50` is `0.00`.
+pub fn mul(a: &Raw, b: &Raw) -> Raw {
+    let negative =
+        |r: &Raw| matches!(r, Raw::Inf { negative: true } | Raw::Finite { negative: true, .. });
+    if matches!(a, Raw::Nan) || matches!(b, Raw::Nan) {
         return Raw::Nan;
     }
-    let negative = operands
-        .iter()
-        .filter(|o| matches!(o, Raw::Inf { negative: true } | Raw::Finite { negative: true, .. }))
-        .count()
-        % 2
-        == 1;
-    if operands.iter().any(|o| matches!(o, Raw::Inf { .. })) {
-        return if operands.iter().any(Raw::is_zero) { Raw::Nan } else { Raw::Inf { negative } };
-    }
-    let mut magnitude = Mag::from_u64(1);
-    let mut exponent = 0i64;
-    for operand in operands {
-        if let Raw::Finite { coefficient, exponent: e, .. } = *operand {
-            magnitude = magnitude.mul(&Mag::from_u128(coefficient));
-            exponent += i64::from(e);
+    let sign = negative(a) != negative(b);
+    match (a, b) {
+        (Raw::Inf { .. }, other) | (other, Raw::Inf { .. }) => {
+            // An infinity with a zero is invalid; with anything else it is an
+            // infinity of the product's sign.
+            if other.is_zero() { Raw::Nan } else { Raw::Inf { negative: sign } }
         }
+        (
+            Raw::Finite { coefficient: c1, exponent: e1, .. },
+            Raw::Finite { coefficient: c2, exponent: e2, .. },
+        ) => {
+            let exponent = i64::from(*e1) + i64::from(*e2);
+            round(sign, Mag::from_u128(*c1).mul(&Mag::from_u128(*c2)), exponent, false, exponent)
+        }
+        _ => unreachable!("a NaN returned above"),
     }
-    round(negative, magnitude, exponent, false, exponent)
+}
+
+/// The product of any number of operands, **left to right, each step rounded**:
+/// a chain of two-operand multiplications, as IEEE 754 defines a sequence of
+/// operations and as MongoDB multiplies. It is linear in the number of operands
+/// and a long chain cannot grow an exact value without bound. It depends on the
+/// order: `[1E+5000, 1E+5000, 1E-5000]` overflows on the first step and
+/// `[1E+5000, 1E-5000, 1E+5000]` does not. A single operand is returned as the
+/// canonical decimal it is.
+pub fn product(operands: &[Raw]) -> Raw {
+    match operands {
+        [] => from_i64(1),
+        [only] => mul(&from_i64(1), only),
+        [first, rest @ ..] => rest.iter().fold(*first, |acc, next| mul(&acc, next)),
+    }
 }
 
 /// `c1 · 10^e1 / (c2 · 10^e2)`, rounded once, for a nonzero `c2`: the dividend

@@ -105,7 +105,7 @@ fn check(a: &Raw, b: &Raw) -> Result<(), TestCaseError> {
     let cases: [(&str, Raw, Decimal128); 3] = [
         ("+", arith::add(a, b), ctx.add(x, y)),
         ("-", arith::sub(a, b), ctx.sub(x, y)),
-        ("*", arith::product(&[*a, *b]), ctx.mul(x, y)),
+        ("*", arith::mul(a, b), ctx.mul(x, y)),
     ];
     for (op, got, want) in cases {
         prop_assert_eq!(got, from_dec(&want), "{} {} {}", dec_text(a), op, dec_text(b));
@@ -129,6 +129,28 @@ fn run(cases: u32) {
     let mut runner =
         TestRunner::new(Config { cases, failure_persistence: None, ..Config::default() });
     runner.run(&pair(), |(a, b)| check(&a, &b)).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// A chain of multiplications, left to right and each step rounded, is what
+/// decNumber computes by multiplying one pair after another (ADR-252).
+#[test]
+fn a_product_is_decnumbers_chain_of_steps() {
+    let mut runner =
+        TestRunner::new(Config { cases: 20_000, failure_persistence: None, ..Config::default() });
+    runner
+        .run(&prop::collection::vec(operand(), 2..9), |ops| {
+            let mut ctx = Context::<Decimal128>::default();
+            let decs: Vec<Decimal128> = ops.iter().map(to_dec).collect();
+            let want = decs[1..].iter().fold(decs[0], |acc, next| ctx.mul(acc, *next));
+            prop_assert_eq!(
+                arith::product(&ops),
+                from_dec(&want),
+                "{:?}",
+                ops.iter().map(dec_text).collect::<Vec<_>>()
+            );
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
 }
 
 #[test]

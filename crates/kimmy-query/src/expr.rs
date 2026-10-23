@@ -2104,8 +2104,11 @@ fn decimal_result(raw: Raw) -> Bson {
 }
 
 /// `$add` and `$multiply` over any number of operands. With a decimal among
-/// them the result is a `Decimal128`: one exact sum or one exact product,
-/// rounded once, so the order of the operands cannot change the bytes.
+/// them the result is a `Decimal128`. `$add` is one exact sum, rounded once, so
+/// the order of the operands cannot change the bytes. `$multiply` multiplies
+/// left to right and **rounds each step**, as MongoDB and IEEE 754's sequence of
+/// operations do (ADR-252): linear in the number of operands, and order
+/// dependent where an intermediate overflows or rounds.
 fn fold_numeric(op: Op, args: &[Bson], f: fn(Num, Num) -> Num) -> Result<Bson> {
     let Some(operands) = operands(op, args)? else {
         return Ok(Bson::Null);

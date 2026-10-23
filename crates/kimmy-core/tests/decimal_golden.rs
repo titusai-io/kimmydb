@@ -57,6 +57,7 @@ fn text(raw: &Raw) -> String {
 fn every_row_of_the_corpus_is_reproduced_to_the_byte() {
     let corpus = include_str!("data/decimal_golden.tsv");
     let mut counts = std::collections::BTreeMap::<String, u64>::new();
+    let mut stepwise_differs = 0u64;
     for (number, line) in corpus.lines().enumerate() {
         if line.starts_with('#') || line.is_empty() {
             continue;
@@ -103,8 +104,15 @@ fn every_row_of_the_corpus_is_reproduced_to_the_byte() {
                 assert_eq!(word(again), word(want), "{at}: reversed");
             }
             "prod" => {
+                // A chain left to right with each step rounded, as libmpdec
+                // multiplies one pair after another.
                 let got = arith::product(&values(f[1]));
                 assert_eq!(word(got), word(value(f[2])), "{at}: got {}", text(&got));
+                // And the corpus holds the rows where that differs from the
+                // exact product rounded once, so the rule cannot be swapped.
+                if f[3] != "-" && word(value(f[2])) != word(value(f[3])) {
+                    stepwise_differs += 1;
+                }
             }
             "todouble" => {
                 let got = arith::to_binary64(&value(f[1]));
@@ -134,6 +142,7 @@ fn every_row_of_the_corpus_is_reproduced_to_the_byte() {
         }
         *counts.entry(f[0].to_string()).or_default() += 1;
     }
+    assert!(stepwise_differs >= 50, "only {stepwise_differs} rows tell a chain from one rounding");
     // A corpus that shrank is a test that stopped testing.
     let total: u64 = counts.values().sum();
     assert!(total > 2_500, "the corpus has {total} rows: {counts:?}");

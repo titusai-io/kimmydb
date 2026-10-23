@@ -90,13 +90,26 @@ fn a_sum_and_a_product_of_any_length_are_one_exact_value() {
     same(sum(terms.to_vec()), "1.0");
     same(sum(vec![terms[0].clone(), terms[3].clone(), terms[1].clone(), terms[2].clone()]), "1.0");
     same(sum(terms.iter().rev().cloned().collect()), "1.0");
-    // A product rounds once: a left fold would overflow on the way.
+    // A product is a chain, left to right, each step rounded (as MongoDB
+    // multiplies): it is linear in the operands, and the order matters where a
+    // step overflows or rounds.
     let product = |ops: Vec<Bson>| val(op("$multiply", ops), none());
-    for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
-        let ops = [dec("1E+5000"), dec("1E+5000"), dec("1E-5000")];
-        same(product(order.iter().map(|&i| ops[i].clone()).collect()), "1E+5000");
-    }
+    same(product(vec![dec("1E+5000"), dec("1E+5000"), dec("1E-5000")]), "Infinity");
+    same(product(vec![dec("1E+5000"), dec("1E-5000"), dec("1E+5000")]), "1E+5000");
+    same(product(vec![dec("1E-5000"), dec("1E+5000"), dec("1E+5000")]), "1E+5000");
     same(product(vec![dec("1.5"), dec("1.0"), Bson::Int32(2)]), "3.00");
+    // A step that rounds, against the exact product rounded once.
+    same(
+        product(vec![
+            dec("1000000000000000000000000957877941E-34"),
+            dec("9999999999999999999999999787852355E-35"),
+            dec("1000000000000000000000000407746305E-32"),
+        ]),
+        "1000000000000000000000001344409481E-34",
+    );
+    // An integer is exact and a double enters by R1 at its position.
+    same(product(vec![Bson::Int32(3), dec("1.5"), Bson::Double(0.5)]), "2.25");
+    same(product(vec![Bson::Double(0.1), dec("10")]), "1.000000000000000055511151231257827");
 }
 
 #[test]
@@ -626,4 +639,21 @@ fn a_value_preserving_update_changes_the_bytes_only_when_the_cohort_member_chang
         (((1u128 << 113) - 1) | (6176u128 << 113)).to_le_bytes(),
     ));
     assert!(!same_bytes(doc! { "$inc": { "n": 0 } }, non_canonical));
+}
+
+#[test]
+fn add_over_a_list_is_sum_over_the_same_values() {
+    // `$add` of the operands and `$sum` of a group holding them are one exact
+    // sum, rounded once: the same bytes, whatever the values.
+    let lists: [Vec<Bson>; 5] = [
+        vec![dec("1.10"), dec("1.20"), Bson::Int32(3)],
+        vec![dec("1E+34"), dec("0.5"), dec("0.5"), dec("-1E+34")],
+        vec![Bson::Double(0.1), Bson::Double(0.2), dec("0.3")],
+        vec![dec("-0"), dec("-0")],
+        vec![Bson::Int64(i64::MAX), Bson::Int64(i64::MAX), dec("1E-5")],
+    ];
+    for values in lists {
+        let added = val(op("$add", values.clone()), doc! {});
+        assert_eq!(added, group("$sum", values.clone()), "{values:?}");
+    }
 }

@@ -63,7 +63,7 @@ fn a_two_operand_operation_is_fast() {
     {
         for (op, f) in [
             ("add", (|a: &Raw, b: &Raw| arith::add(a, b)) as fn(&Raw, &Raw) -> Raw),
-            ("mul", |a, b| arith::product(&[*a, *b])),
+            ("mul", |a, b| arith::mul(a, b)),
             ("div", |a, b| arith::div(a, b).unwrap_or(Raw::Nan)),
         ] {
             let got = p99(pairs.len(), |i| {
@@ -111,19 +111,41 @@ fn a_sum_of_doubles_from_every_binade_and_one_decimal_is_bounded() {
 
 #[test]
 #[ignore = "time; run in release by CI's decimal job"]
-fn a_thousand_operand_product_at_extreme_exponents_is_bounded() {
-    let mut state = 13u64;
-    let ops: Vec<Raw> = (0..1_000)
-        .map(|_| {
-            let c = u128::from(splitmix(&mut state)) * u128::from(splitmix(&mut state))
-                % (MAX_COEFFICIENT + 1);
-            let e = -6176 + (splitmix(&mut state) % 12_288) as i16;
-            fin(false, c.max(1), e)
-        })
-        .collect();
-    let start = Instant::now();
-    std::hint::black_box(arith::product(&ops));
-    let took = start.elapsed();
-    eprintln!("1,000 operands at extreme exponents: {took:?}");
-    assert!(took < Duration::from_millis(100), "{took:?}");
+fn a_long_chain_of_multiplications_is_linear() {
+    // A product is a chain of rounded steps (ADR-252), so each operand costs one
+    // two-operand multiplication whatever the chain so far: 100,000 operands cost
+    // about ten times 10,000, not a hundred times.
+    let chain = |n: usize| -> (Duration, Raw) {
+        let mut state = 13u64;
+        // 34-digit coefficients near 1 and its reciprocal, so the value stays in
+        // range and every step rounds.
+        let ops: Vec<Raw> = (0..n)
+            .map(|i| {
+                let c = 1_000_000_000_000_000_000_000_000_000_000_000u128
+                    + u128::from(splitmix(&mut state) % 1_000_000);
+                if i % 2 == 0 {
+                    fin(false, c, -33)
+                } else {
+                    fin(
+                        false,
+                        9_999_999_999_999_999_999_999_999_999_999_999
+                            - u128::from(splitmix(&mut state) % 1_000_000),
+                        -34,
+                    )
+                }
+            })
+            .collect();
+        let start = Instant::now();
+        let product = arith::product(&ops);
+        (start.elapsed(), std::hint::black_box(product))
+    };
+    let (small, _) = chain(10_000);
+    let (large, product) = chain(100_000);
+    eprintln!("10,000 operands {small:?}, 100,000 operands {large:?}");
+    assert!(matches!(product, Raw::Finite { .. }));
+    assert!(large < Duration::from_millis(500), "{large:?}");
+    assert!(
+        large.as_secs_f64() < 40.0 * small.as_secs_f64().max(2e-3),
+        "{small:?} against {large:?}"
+    );
 }

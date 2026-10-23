@@ -749,14 +749,19 @@ operand, every result is what it always was.
 - A `null`, `undefined` or missing operand makes the result `null`, as before. A
   string is `400`, `$add needs numbers, found a string`.
 
-**A computation is exact over its operands as converted, and rounded once.**
+**A sum, a quotient and a mean are exact over their operands as converted, and rounded once. A product is a chain of rounded steps.**
 
 - `$add` of any number of operands is one exact sum, and `$subtract` the exact
   sum of `a` and `-b`: `{$add: [1E+34, 0.5, 0.5, -1E+34]}` is `1.0` in every
   order, where adding left to right gives `0E+1`.
-- `$multiply` of any number of operands is one exact product, rounded once, so
-  `[1E+5000, 1E+5000, 1E-5000]` is `1E+5000` in every order and never overflows
-  on the way.
+- `$multiply` of any number of operands **multiplies left to right and rounds
+  each step**, to 34 digits half to even, as MongoDB does and as IEEE 754 defines a
+  sequence of operations. It is linear in the number of operands, with no limit
+  beyond the request size, and **it depends on the order** where an intermediate
+  overflows or rounds: `[1E+5000, 1E+5000, 1E-5000]` is `Infinity` (the first
+  step overflows), `[1E+5000, 1E-5000, 1E+5000]` is `1E+5000`, and three factors
+  of 34 digits can differ in the last digit from the exact product rounded once.
+  An integer is exact and a double enters by the rule above at its position.
 - `$divide` rounds the exact quotient once. `$avg` divides the **exact** sum by
   the count and rounds once; it is not `$sum` followed by `$divide`, which
   rounds twice.
@@ -817,8 +822,8 @@ Two things that look like bugs and are not:
 **Cost.** In a release build a two-operand operation takes about a quarter of a
 microsecond for money-sized values (under 20 µs at the extremes of the exponent
 range), a `$sum` over 100,000 decimal prices costs about 1.3 times the same over
-`Int64`, and the exact `$multiply` of a thousand operands at extreme exponents
-takes about 8 ms (the exact product grows by 34 digits per operand).
+`Int64`, and a `$multiply` of 100,000 operands takes about 15 ms (a chain of
+rounded steps is linear).
 
 ---
 
