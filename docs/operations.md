@@ -2633,9 +2633,7 @@ you move or copy a data directory.
 /v1/admin/backup`) holds documents and definitions, not redb's pages, and a
 restore (`kimmyd restore`) builds a new file with the restoring build's own
 redb. A backup of a different storage schema is refused before the restore
-creates any file. A backup does not record the redb that wrote its source file
-(the restore ignores it), so a backup taken under redb 4.3 restores under 4.4:
-the redb minor is no obstacle to a restore. A restore writes a fresh `kimmy.format` for the build that
+creates any file. A restore writes a fresh `kimmy.format` for the build that
 ran it.
 
 The start after a refusal still reports the run before it. See
