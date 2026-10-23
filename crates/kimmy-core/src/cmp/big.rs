@@ -5,9 +5,11 @@
 //! compares them (`c · 5^p · 2^(p+t)` against `m · 5^q · 2^(q+s)`), which takes
 //! a multiplication by a word, a shift and a comparison. The encoder reads the
 //! top bits of `c · 5^e`, or of `c · 2^k / 5^q`, which adds a division by a word
-//! and a read of the top bits. That is the whole surface: no general
-//! multiplication, no general division, nothing that a crate would add but
-//! nobody here calls. It is not exported, and every operation is checked
+//! and a read of the top bits. The decimal arithmetic adds the three it needs:
+//! a multiply-and-add by a word (building a value from base-10^19 limbs), a
+//! read of one bit, and a division by a `u128` whose quotient fits one. That is
+//! the whole surface: no general multiplication, no general division, nothing
+//! that a crate would add but nobody here calls. It is not exported, and every operation is checked
 //! against `num-bigint` (a dev-dependency) in the tests below.
 
 use std::cmp::Ordering;
@@ -91,6 +93,54 @@ impl Big {
         }
         self.trim();
         remainder as u64
+    }
+
+    /// `self = self · m + a`.
+    pub(crate) fn mul_add_small(&mut self, m: u64, a: u64) {
+        let mut carry = u128::from(a);
+        for limb in &mut self.limbs {
+            let product = u128::from(*limb) * u128::from(m) + carry;
+            *limb = product as u64;
+            carry = product >> 64;
+        }
+        if carry != 0 {
+            self.limbs.push(carry as u64);
+        }
+        self.trim();
+    }
+
+    /// Bit `i` (0 is the least significant); a bit past the top is zero.
+    pub(crate) fn bit(&self, i: u32) -> bool {
+        self.limbs.get((i / 64) as usize).is_some_and(|limb| (limb >> (i % 64)) & 1 == 1)
+    }
+
+    /// `⌊self / d⌋` and the remainder, for a quotient that fits a `u128`.
+    ///
+    /// Binary long division: the remainder stays below `d`, so it takes one
+    /// bit at a time without overflowing a `u128` when `d < 2^127`. A value of
+    /// at most 128 bits goes straight to the hardware's division.
+    ///
+    /// # Panics
+    /// If `d` is zero or at least `2^127`, or if the quotient needs more than
+    /// 128 bits.
+    pub(crate) fn div_rem_u128(&self, d: u128) -> (u128, u128) {
+        assert!(d != 0 && d < 1 << 127, "div_rem_u128 by {d}");
+        let len = self.bit_len();
+        if len <= 128 {
+            let n = self.limbs.iter().rev().fold(0u128, |acc, &l| (acc << 64) | u128::from(l));
+            return (n / d, n % d);
+        }
+        let (mut quotient, mut remainder) = (0u128, 0u128);
+        for i in (0..len).rev() {
+            assert!(quotient >> 127 == 0, "the quotient does not fit 128 bits");
+            remainder = (remainder << 1) | u128::from(self.bit(i));
+            quotient <<= 1;
+            if remainder >= d {
+                remainder -= d;
+                quotient |= 1;
+            }
+        }
+        (quotient, remainder)
     }
 
     /// The number of significant bits; zero has none.
@@ -207,6 +257,36 @@ mod tests {
 
     fn any_word() -> impl Strategy<Value = u64> {
         prop_oneof![any::<u64>(), Just(u64::MAX), Just(POW5_27), Just(5u64), Just(1u64), 2..1000u64]
+    }
+
+    proptest! {
+        #[test]
+        fn mul_add_small_agrees_with_num_bigint(a in any_big(), m in any_word(), x in any::<u64>()) {
+            let mut got = a.clone();
+            got.mul_add_small(m, x);
+            prop_assert_eq!(oracle(&got), oracle(&a) * m + x);
+            prop_assert_eq!(got.limbs.last() != Some(&0), true);
+        }
+
+        #[test]
+        fn bit_reads_the_bits_of_the_value(a in any_big(), i in 0u32..600) {
+            prop_assert_eq!(a.bit(i), oracle(&a).bit(u64::from(i)));
+        }
+
+        #[test]
+        fn div_rem_u128_agrees_with_num_bigint(
+            a in prop::collection::vec(any::<u64>(), 0..4).prop_map(from_limbs),
+            d in prop_oneof![1u128..1000, any::<u128>().prop_map(|d| (d >> 15).max(1)), Just((1u128 << 127) - 1)],
+        ) {
+            // Only a quotient that fits 128 bits: it has at most
+            // `len(a) - len(d) + 1` of them.
+            let d_bits = 128 - d.leading_zeros();
+            prop_assume!(a.bit_len() <= 128 || a.bit_len() <= d_bits + 127);
+            let (q, r) = a.div_rem_u128(d);
+            let n = oracle(&a);
+            prop_assert_eq!(BigUint::from(q), &n / d);
+            prop_assert_eq!(BigUint::from(r), &n % d);
+        }
     }
 
     #[test]
