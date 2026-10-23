@@ -2126,7 +2126,7 @@ where
     stalls.reached_candidates.push(crate::catchup::Reached {
         node: their_node,
         servable: theirs.clone(),
-        witnessed: Some(their_witnessed.clone()),
+        witnessed: their_witnessed.clone(),
         facts: their_facts,
     });
 
@@ -2889,7 +2889,7 @@ fn behind_beyond_horizon(
 /// converged idle cluster, a steady trickle of `deferred` from a peer that
 /// had nothing to catch up on. "Behind" means what ADR-133 says only when
 /// it is asked of what the peer has *processed*, which is the vector
-/// `AskVersions { witnessed: true }` now carries beside the servable one.
+/// the `Vectors` reply carries beside the servable one.
 ///
 /// **Behind and still is not behind and catching up (ADR-145).** The rule
 /// above reads every peer that is behind as a peer that is catching up, and
@@ -10830,7 +10830,7 @@ mod tests {
         let candidate = || crate::catchup::Reached {
             node: NodeId::from_bytes([7; 16]),
             servable: VersionVector::new(),
-            witnessed: None,
+            witnessed: VersionVector::new(),
             facts: None,
         };
         let mut stalls = PeerStalls::new();
@@ -11248,10 +11248,15 @@ mod tests {
                 Reached {
                     node: b,
                     servable: engine.version_vector().unwrap(),
-                    witnessed: None,
+                    witnessed: VersionVector::new(),
                     facts: None,
                 },
-                Reached { node: c, servable: theirs.clone(), witnessed: None, facts: None },
+                Reached {
+                    node: c,
+                    servable: theirs.clone(),
+                    witnessed: VersionVector::new(),
+                    facts: None,
+                },
             ];
             catch_up.replay_note_members(&ReplayTick {
                 me,

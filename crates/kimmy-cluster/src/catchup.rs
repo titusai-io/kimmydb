@@ -184,8 +184,8 @@ pub struct Reached {
     pub node: NodeId,
     /// What the peer can serve, from this round's `Vectors` frame.
     pub servable: VersionVector,
-    /// What the peer has processed, from the same frame; `None` when it gave none.
-    pub witnessed: Option<VersionVector>,
+    /// What the peer has processed, from the same frame.
+    pub witnessed: VersionVector,
     /// What the peer said about itself; `None` from a peer that has sent no block,
     /// which counts.
     pub facts: Option<Arc<Facts>>,
@@ -948,9 +948,7 @@ impl CatchUp {
         }
         for peer in tick.reached.iter().filter(|peer| peer.node != me) {
             replay.origins.extend(peer.servable.iter().map(|(node, _)| node));
-            if let Some(witnessed) = &peer.witnessed {
-                replay.origins.extend(witnessed.iter().map(|(node, _)| node));
-            }
+            replay.origins.extend(peer.witnessed.iter().map(|(node, _)| node));
         }
         replay.origins.remove(&me);
         replay.present.extend(present.iter().copied());
@@ -1203,9 +1201,7 @@ impl CatchUp {
         }
         for peer in tick.reached {
             seen_now.extend(peer.servable.iter().map(|(node, _)| node));
-            if let Some(w) = &peer.witnessed {
-                seen_now.extend(w.iter().map(|(node, _)| node));
-            }
+            seen_now.extend(peer.witnessed.iter().map(|(node, _)| node));
         }
         seen_now.remove(&tick.me);
         for id in seen_now {
@@ -1479,12 +1475,9 @@ fn mutual_clear_holds(
     //    predicate that no input can reach alone is one no test can hold.
     // 4. Mutual coverage against each one's last known vectors, both from the same
     //    frame: what each holds is not missing from the other. A peer with no
-    //    witnessed vector takes no part in this rule.
+    //    witnessed vector (empty) covers nothing and takes no part in this rule.
     let covered = window.iter().all(|peer| {
-        peer.witnessed.as_ref().is_some_and(|theirs_witnessed| {
-            tick.mine_witnessed.covers(&peer.servable)
-                && theirs_witnessed.covers(tick.mine_servable)
-        })
+        tick.mine_witnessed.covers(&peer.servable) && peer.witnessed.covers(tick.mine_servable)
     });
     if !covered {
         return false;
@@ -1742,7 +1735,7 @@ mod tests {
         witnessed: Option<VersionVector>,
         facts: Option<Arc<Facts>>,
     ) -> Reached {
-        Reached { node: node(n), servable, witnessed, facts }
+        Reached { node: node(n), servable, witnessed: witnessed.unwrap_or_default(), facts }
     }
 
     struct Fixture {

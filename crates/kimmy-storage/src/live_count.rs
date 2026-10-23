@@ -336,9 +336,8 @@ pub(crate) fn mark_of(
 /// Whether the kept counts match the store, read without writing: the test
 /// [`crate::live_walk::run`] makes before it walks.
 ///
-/// For a reader that runs before `Engine::open` has rebuilt them — the schema
-/// 4 migration's announcement (ADR-183) — and must not trust a table a restore
-/// left empty.
+/// For a reader that runs before `Engine::open` has rebuilt them, and must not
+/// trust a table a restore left empty.
 pub(crate) fn counts_are_current(txn: &redb::ReadTransaction) -> Result<bool> {
     let mark = mark_of(&txn.open_table(tables::OPLOG_ARRIVAL)?, &txn.open_table(tables::OPLOG)?)?;
     let through = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
@@ -973,8 +972,8 @@ mod tests {
     }
 
     /// `carry_mark` moves the digest mark only if it matched `before`: one
-    /// that did not says a build that does not keep the digests wrote since,
-    /// and moving it forward would hide that from the next open.
+    /// that did not says the rows were not kept current, and moving it forward
+    /// would hide that from the next open.
     #[test]
     fn the_digest_mark_is_carried_only_if_it_matched_before() {
         let (engine, coll, _dir) = engine();
@@ -1300,6 +1299,94 @@ mod tests {
             Some(7),
             "a start with the mark at the arrival index's end rebuilt anyway"
         );
+    }
+
+    /// Write `name` into `coll` the way a repair or a restore can: the record, its
+    /// oplog entry and both halves of the arrival index, and neither the count nor
+    /// the mark.
+    fn write_behind_the_counts(engine: &Engine, coll: &CollectionMeta, name: &str, live: bool) {
+        let stamp = engine.next_stamp();
+        let body = bson::serialize_to_vec(&doc! { "_id": name }).unwrap();
+        let record = codec::encode_doc_record(&match live {
+            true => kimmy_core::DocRecord::live(stamp, body.clone()),
+            false => kimmy_core::DocRecord::tombstone(stamp),
+        });
+        let key = crate::docs::doc_key(&id(name)).unwrap();
+        let db = engine.db();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(tables::DOCS)
+            .unwrap()
+            .insert((coll.id.0, key.as_slice()), record.as_slice())
+            .unwrap();
+        {
+            // Its entry, as any document write appends one: the oplog row
+            // and both halves of the arrival index, so the index still
+            // covers the oplog and is not rebuilt.
+            let entry = OplogEntry {
+                stamp,
+                kind: if live { OpKind::Insert } else { OpKind::Delete },
+                collection: coll.id,
+                doc_id: Some(id(name)),
+                body: live.then_some(body),
+            };
+            let oplog_key = codec::oplog_key(&stamp);
+            txn.open_table(tables::OPLOG)
+                .unwrap()
+                .insert(oplog_key.as_slice(), codec::encode_oplog_entry(&entry).as_slice())
+                .unwrap();
+            let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+            let next = arrival.last().unwrap().map_or(0, |(seq, _)| seq.value() + 1);
+            arrival.insert(next, oplog_key.as_slice()).unwrap();
+            txn.open_table(tables::OPLOG_ARRIVAL_SEQ)
+                .unwrap()
+                .insert(oplog_key.as_slice(), next)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// Take the newest write out of the store the way a restore to an older copy
+    /// does: its record, its oplog entry and both halves of the arrival index, and
+    /// neither the count nor the mark.
+    fn remove_behind_the_counts(engine: &Engine, coll: &CollectionMeta, name: &str) {
+        let key = crate::docs::doc_key(&id(name)).unwrap();
+        let db = engine.db();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(tables::DOCS).unwrap().remove((coll.id.0, key.as_slice())).unwrap();
+        let oplog_key = {
+            let mut oplog = txn.open_table(tables::OPLOG).unwrap();
+            let newest = oplog.last().unwrap().map(|(k, _)| k.value().to_vec()).unwrap();
+            oplog.remove(newest.as_slice()).unwrap();
+            newest
+        };
+        let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+        let last = arrival.last().unwrap().map(|(seq, _)| seq.value()).unwrap();
+        arrival.remove(last).unwrap();
+        txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap().remove(oplog_key.as_slice()).unwrap();
+        drop(arrival);
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_write_behind_the_counts_as_large_as_a_removal_is_caught_at_open() {
+        // The sequence a mark of the arrival end alone cannot see: the removal
+        // takes the end down by one, and one write behind the counts brings it
+        // back to exactly the mark the counts were kept at. Only the oplog's
+        // newest key, the mark's second part, differs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let coll_id = {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+            engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
+            remove_behind_the_counts(&engine, &coll, "undone");
+            write_behind_the_counts(&engine, &coll, "older", false);
+            coll.id
+        };
+        let engine = Engine::open(&path).unwrap();
+        assert_counts_exact(&engine, "an open after a write behind the counts followed a removal");
+        assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(1));
     }
 
     /// Every write to `DOCS` goes through this module, or a count drifts.

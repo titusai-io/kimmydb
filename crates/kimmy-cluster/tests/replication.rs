@@ -8877,7 +8877,7 @@ async fn a_peer_that_answers_a_horizon_for_the_whole_wait_is_given_up_on() {
     let reached = [kimmy_cluster::catchup::Reached {
         node: peer,
         servable: scenario.peer.engine.version_vector().unwrap(),
-        witnessed: None,
+        witnessed: kimmy_core::VersionVector::new(),
         facts: None,
     }];
     catch_up.replay_note_members(&kimmy_cluster::catchup::ReplayTick {
@@ -9064,7 +9064,7 @@ async fn a_live_peer_that_holds_the_tail_holds_the_clear_until_it_has_answered()
             .map(|peer| Reached {
                 node: peer.engine.node_id(),
                 servable: peer.engine.version_vector().unwrap(),
-                witnessed: None,
+                witnessed: kimmy_core::VersionVector::new(),
                 facts: None,
             })
             .collect();
@@ -9120,7 +9120,7 @@ async fn a_restored_member_owed_by_a_live_holder_serves_as_unknown_until_it_answ
             .map(|peer| Reached {
                 node: peer.engine.node_id(),
                 servable: peer.engine.version_vector().unwrap(),
-                witnessed: None,
+                witnessed: kimmy_core::VersionVector::new(),
                 facts: None,
             })
             .collect();

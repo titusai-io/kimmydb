@@ -4202,7 +4202,7 @@ mod tests {
         [crate::catchup::Reached {
             node: NodeId::from_bytes([4; 16]),
             servable: engine.version_vector().unwrap(),
-            witnessed: None,
+            witnessed: kimmy_core::VersionVector::new(),
             facts: None,
         }]
     }
@@ -4266,7 +4266,7 @@ mod tests {
             crate::catchup::Reached {
                 node: snapshot_peer,
                 servable: kimmy_core::VersionVector::new(),
-                witnessed: None,
+                witnessed: kimmy_core::VersionVector::new(),
                 facts: None,
             },
         ];
@@ -4367,8 +4367,12 @@ mod tests {
         let mut servable = engine.version_vector().unwrap();
         servable.insert(departed, kimmy_core::Hlc::new(10, 0));
         let peer = NodeId::from_bytes([4; 16]);
-        let reached =
-            [crate::catchup::Reached { node: peer, servable, witnessed: None, facts: None }];
+        let reached = [crate::catchup::Reached {
+            node: peer,
+            servable,
+            witnessed: kimmy_core::VersionVector::new(),
+            facts: None,
+        }];
         catch_up.replay_finished(peer);
         judge_catch_up_at(&catch_up, &engine, &PeerStalls::new(), None, &reached, None, t0);
         assert!(catch_up.replay_armed(), "within the window the departed origin holds it");

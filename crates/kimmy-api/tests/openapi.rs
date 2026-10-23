@@ -2604,7 +2604,8 @@ fn into_owed_replay(catch_up: &kimmy_cluster::catchup::CatchUp) {
     servable.insert(b, Hlc::new(100, 0));
     let mut mine = servable.clone();
     mine.insert(me, Hlc::new(200, 0));
-    let reached = [Reached { node: b, servable, witnessed: None, facts: None }];
+    let reached =
+        [Reached { node: b, servable, witnessed: kimmy_core::VersionVector::new(), facts: None }];
     let t0 = std::time::Instant::now();
     catch_up.arm_replay_at(Hlc::new(50, 0), None, t0).unwrap();
     catch_up.replay_finished(b);
