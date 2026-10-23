@@ -13306,11 +13306,10 @@ async fn a_decimal128_filter_operand_is_compared_by_its_exact_value() {
 }
 
 #[tokio::test]
-async fn sum_and_avg_over_a_decimal128_answer_400_where_they_skipped_it() {
-    // `$sum` and `$avg` used to skip a `Decimal128` as they skip a string, so
-    // over 1, 2.5 (a decimal) and 2 a report read a total of 3 and a mean of
-    // 1.5, where the values add up to 5.5. Decimal arithmetic is not built, so
-    // the pipeline is refused, `400`, in the words `$add` refuses one with.
+async fn sum_and_avg_over_a_decimal128_are_exact() {
+    // `$sum` and `$avg` used to skip a `Decimal128` as they skip a string, and
+    // then (0.51.0) refused it. Over 1, 2.5 (a decimal) and 2 the values add up
+    // to 5.5, and ADR-252 answers that: every value as converted, rounded once.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "s" })).await;
@@ -13329,19 +13328,26 @@ async fn sum_and_avg_over_a_decimal128_answer_400_where_they_skipped_it() {
                 .await
         }
     };
-    for op in ["$sum", "$avg"] {
-        let res = aggregate(json!([{ "$group": { "_id": null, "r": { op: "$v" } } }])).await;
-        assert_eq!(res.status, 400, "{op}: {:?}", res.body);
-        assert_eq!(res.body["error"], "bad_request", "{op}");
-        assert_eq!(
-            res.body["message"],
-            format!("invalid query: {op} needs numbers, found a Decimal128"),
-            "{op}"
-        );
-    }
-    let add = aggregate(json!([{ "$project": { "r": { "$add": ["$v", 1] } } }])).await;
-    assert_eq!(add.status, 400, "{:?}", add.body);
-    assert_eq!(add.body["message"], "invalid query: $add needs numbers, found a Decimal128");
+    let res = aggregate(
+        json!([{ "$group": { "_id": null, "s": { "$sum": "$v" }, "m": { "$avg": "$v" } } }]),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["s"], dec("5.5"), "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["m"], dec("1.833333333333333333333333333333333"));
+    // The expressions answer too: an integer plus a decimal is a decimal.
+    let add = aggregate(json!([
+        { "$project": { "r": { "$add": ["$v", 1] } } },
+        { "$sort": { "_id": 1 } }
+    ]))
+    .await;
+    assert_eq!(add.status, 200, "{:?}", add.body);
+    assert_eq!(add.body["documents"][1]["r"], dec("3.5"), "{:?}", add.body);
+    // A zero divisor is refused whatever its spelling.
+    let divide =
+        aggregate(json!([{ "$project": { "r": { "$divide": ["$v", dec("0.00")] } } }])).await;
+    assert_eq!(divide.status, 400, "{:?}", divide.body);
+    assert_eq!(divide.body["message"], "invalid query: $divide by zero");
 
     // Counting, and the accumulators that do no arithmetic, are unaffected.
     let res = aggregate(json!([{ "$group": {
