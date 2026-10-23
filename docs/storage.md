@@ -228,7 +228,7 @@ store that was closed cleanly:
 | A damaged header, or a commit slot or root that cannot be right (a checksum that fails on a clean store, a page order redb never writes, a root past the end of the file) | Yes, at the open: the start is refused as damaged ([A damaged store](operations.md#a-damaged-store)) |
 | A flipped bit in a page that still decodes, on a store closed cleanly (bit rot) | **Not by a serving node**: the page is served as data. **Yes, by `kimmyd check-store`** on the stopped member, which verifies every page reachable from the commit slot (exit 65) |
 | Damage in the latest commit of a store that was not closed cleanly | Rolled back at the next open as a torn write, by the node and by the check alike. The check reports the rollback, and calls it damage only when the previous run ended cleanly |
-| Damage to `hnsw/`, the vector indexes' snapshots | **No.** They carry no checksum and the check does not read them. They are derived: delete them and they are rebuilt ([Rebuild vector indexes](operations.md#rebuild-vector-indexes-after-upgrading-past-2026-08-15)) |
+| Damage to `hnsw/`, the vector indexes' snapshots | **No.** They carry no checksum and the check does not read them. They are derived: delete them and they are rebuilt |
 | A file changed on purpose | **No**, by neither. A hash that is not cryptographic can be made to match, and nothing holds a key |
 
 The check is a full read of the store, run on a stopped member and writing

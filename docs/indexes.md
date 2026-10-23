@@ -633,8 +633,7 @@ of that is gone, and it changes what a store holds:
 
 - **The upgrade decides every such document.** Storage schema 5's migration
   rebuilds every index under the current rule, so the run is emptied and each
-  document is filed by what the filter selects
-  ([Operations](operations.md#storage-schema-5-the-first-start-of-0510)).
+  document is filed by what the filter selects.
 - **A partial unique index starts enforcing.** Two holders 0.50 accepted
   become a reported violation (`/violations`, `kimmy_unique_violations_total`
   and a log line), and a write that would keep or add a holder of the key is
