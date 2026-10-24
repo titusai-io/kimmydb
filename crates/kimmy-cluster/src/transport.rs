@@ -8453,6 +8453,7 @@ mod tests {
         kimmy_storage::SnapshotCursor {
             collection: CollectionId::derive("shop", "orders"),
             after_key: after.to_be_bytes().to_vec(),
+            until_key: None,
         }
     }
 
@@ -10043,6 +10044,90 @@ mod tests {
             pulled
         };
         tokio::join!(serving, pulling)
+    }
+
+    /// **A scoped snapshot repair ends at the collection as it stood when it began, and
+    /// frees the repair slot.** The receiver lacks collection `grow`; its sender keeps
+    /// inserting monotonic ids faster than the pull walks (two pages of new rows between
+    /// one page and the next). The pull used to chase that tail for ever, advancing every
+    /// round and so never abandoned, and held the peer's one repair slot, so a second repair
+    /// queued against the same peer was never handed out. Now the pull ends at the last key
+    /// the collection had when its first page was served; the rows written after arrive by
+    /// entries.
+    #[tokio::test]
+    async fn a_scoped_snapshot_repair_ends_at_the_collection_as_it_stood_and_frees_the_slot() {
+        const SECRET: &str = "a-tail-chasing-secret";
+        const BINDING: &[u8] = b"a-tail-chasing-binding";
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let grow = b.create_collection("shop", "grow").unwrap();
+        let quiet = b.create_collection("shop", "quiet").unwrap();
+        b.insert(&quiet, bson::doc! { "_id": 0 }).unwrap();
+        let rows = |from: i64, n: i64| -> Vec<bson::Document> {
+            (from..from + n).map(|i| bson::doc! { "_id": i, "v": 1 }).collect()
+        };
+        let page = kimmy_storage::SNAPSHOT_PAGE as i64;
+        // Three pages' worth when the repair begins.
+        b.insert_many(&grow, rows(0, 3 * page)).unwrap();
+        let mut next_id = 3 * page;
+        let node = b.node_id();
+
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(node, grow.id, Repair::Snapshot));
+        assert_eq!(stalls.repair_due(node, false), Some((grow.id, Repair::Snapshot)));
+        assert!(stalls.plan_repair(node, quiet.id, Repair::Snapshot), "queued behind it");
+
+        let mut ended_after = None;
+        for round in 1..=30 {
+            // One page a round: the deadline is past, and it is checked between pages.
+            let (mut ours, theirs) = tokio::io::duplex(1 << 20);
+            let serving = async {
+                serve_peer(&b, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None).await
+            };
+            let pulling = async {
+                open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
+                let pulled = pull_snapshot(
+                    &a,
+                    &mut ours,
+                    "127.0.0.1:1".parse().unwrap(),
+                    node,
+                    Some(grow.id),
+                    kimmy_storage::SnapshotPolicy::All,
+                    &mut stalls,
+                    Instant::now(),
+                    &RoundClock::default(),
+                )
+                .await;
+                drop(ours);
+                pulled
+            };
+            let (_, pulled) = tokio::join!(serving, pulling);
+            if pulled.expect("the round").complete {
+                stalls.repair_finished(node);
+                ended_after = Some(round);
+                break;
+            }
+            // The tail grows faster than the walk.
+            b.insert_many(&grow, rows(next_id, 2 * page)).unwrap();
+            next_id += 2 * page;
+            assert_eq!(
+                stalls.repair_due(node, false),
+                Some((grow.id, Repair::Snapshot)),
+                "round {round}: the repair is still the active one"
+            );
+        }
+        let ended_after = ended_after.expect("30 rounds and the snapshot chased the tail still");
+        assert!(ended_after <= 4, "it walks the three pages it began with: {ended_after}");
+        assert_eq!(
+            stalls.repair_due(node, false),
+            Some((quiet.id, Repair::Snapshot)),
+            "the queued repair is handed out once the slot is free"
+        );
+        // What was written after it began is not in the pull: it comes by entries.
+        let received = a.get_collection("shop", "grow").unwrap();
+        assert_eq!(a.count_by_id(received.id).unwrap(), Some(3 * page as u64));
     }
 
     /// The v0.51.0 stall (ADR-249): 600 documents of 130 KiB, whose first page
