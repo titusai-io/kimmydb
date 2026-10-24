@@ -1440,7 +1440,7 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.sync.serve_failures.timeout",
             "{connection}",
-            "Peer replication connections this node failed to serve because the handshake ran out of time.",
+            "Peer replication connections this node failed to serve because a bounded wait ran out mid-exchange: the handshake, a frame that stopped arriving, or an answer the peer stopped reading.",
             |s| s.sync_serve_failures[ServeFailure::Timeout.slot()]
         );
         observe!(
@@ -1477,6 +1477,20 @@ impl TelemetryGuard {
             "{connection}",
             "Peer replication connections refused because the TLS session gave no channel binding.",
             |s| s.sync_serve_failures[ServeFailure::Binding.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.release",
+            "{connection}",
+            "Peer replication connections refused at the handshake because the peer runs another release.",
+            |s| s.sync_serve_failures[ServeFailure::Release.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.idle",
+            "{connection}",
+            "Peer replication connections ended because they sent no request for the idle bound.",
+            |s| s.sync_serve_failures[ServeFailure::Idle.slot()]
         );
         observe!(
             u64_observable_counter,
@@ -3329,5 +3343,23 @@ mod tests {
         assert!(matches!(protocol(&cfg), Protocol::HttpBinary));
         cfg.protocol = "http/json".into();
         assert!(matches!(protocol(&cfg), Protocol::HttpJson));
+    }
+
+    /// Every reason a replication connection can fail to be served has an OTLP
+    /// instrument, named for its label: the table is built by hand, and `release` was
+    /// once left out of it.
+    #[test]
+    fn every_serve_failure_reason_has_an_otlp_instrument() {
+        let source = include_str!("logging.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        for reason in kimmy_cluster::ServeFailure::ALL {
+            let name = format!("\"kimmy.sync.serve_failures.{}\"", reason.label());
+            assert_eq!(source.matches(&name).count(), 1, "{name} must be registered once");
+        }
+        assert_eq!(
+            source.matches("\"kimmy.sync.serve_failures.").count(),
+            kimmy_cluster::ServeFailure::COUNT,
+            "an instrument for a reason that does not exist"
+        );
     }
 }

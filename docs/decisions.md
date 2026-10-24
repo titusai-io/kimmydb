@@ -18401,6 +18401,15 @@ before it, apply included, would fit in the tick's remaining budget, so a
 slow apply ends that contact. The sequential contact loop is held by one round
 for one window's apply, or one page budget, beyond the exchange, as before.
 
+> **Amended by the serving side's idle bound (300 s).** "A round whose own apply
+> takes long is not a failure" holds up to the apply plus writer wait the serving
+> side will wait through: 300 s of quiet on a connection ends it, and a dialler's
+> apply that long (a replicated index build, a wait behind a local one) would find
+> it ended at its next request. The round therefore does not send on a connection
+> it has not heard from in 270 s: it ends the round without the follow-up
+> divergence check, which runs on the next round. The apply is not charged to the
+> peer, nothing is lost and the peer is not backed off.
+
 **Each delivery counts its decisions once, at the step that makes them final,
 whatever error follows.** This is ADR-123's per-delivery rule, kept: a
 decision is counted by every delivery that makes it, so a repair's replay of a
