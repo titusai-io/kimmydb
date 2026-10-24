@@ -1201,10 +1201,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // not outlive it.
                 let mut dialling = DialsInFlight::default();
                 for &peer in &chosen {
+                    let dial = dial_for_round(Arc::clone(&engine), peer, config.secret.clone());
                     // UNSUPERVISED: one dial, whose end is the result its round awaits; a
                     // panic in it is that round's failure, and the guard aborts it with the tick.
-                    let task =
-                        tokio::spawn(dial_for_round(Arc::clone(&engine), peer, config.secret.clone()));
+                    let task = tokio::spawn(dial);
                     dialling.0.insert(peer, task);
                 }
                 let mut draining: VecDeque<Contact> =
