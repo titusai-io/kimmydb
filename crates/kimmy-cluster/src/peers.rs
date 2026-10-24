@@ -910,16 +910,32 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         let resolver = config.resolver.clone();
                         let seeds = config.seeds.clone();
                         let local = config.local;
+                        let announce = config.announce.clone();
                         // UNSUPERVISED: one resolution at a time, whose end is the
                         // loop's next message; a resolver that panics ends its task
                         // without an answer, which the loop sees as an error and
                         // clears (it costs one resolution, not discovery), and the
                         // guard aborts the task if the loop itself ends first.
                         let task = tokio::spawn(async move {
-                            match resolver {
+                            let found = match resolver {
                                 Some(resolver) => resolver().await,
                                 None => resolve(&seeds, local).await,
+                            };
+                            // Offer every resolved address to membership, from here
+                            // and not from the loop's join arm below: a sync tick
+                            // stuck on frozen peers holds that arm for as long as
+                            // its dials time out, and the offers are what lets a
+                            // member find a cluster whatever the tick is doing.
+                            // Announcing to one membership already knows is
+                            // harmless (foca ignores it), and doing it every
+                            // interval is what lets a node that started alone join
+                            // the cluster whenever it appears.
+                            if let Some(announce) = &announce {
+                                for peer in &found {
+                                    let _ = announce.try_send(*peer);
+                                }
                             }
+                            found
                         });
                         resolving = Some(Resolving(tokio::time::Instant::now(), task));
                     }
@@ -945,16 +961,6 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 if fresh && peerless_ticks > 0 && !discovered.is_empty() {
                     sync.reset_immediately();
                     tick_is_early_retry = true;
-                }
-
-                // Offer every resolved address to membership. Announcing to one
-                // we already know is harmless — foca ignores it — and doing it
-                // every interval is what lets a node that started alone join
-                // the cluster whenever it appears.
-                if let Some(announce) = &config.announce {
-                    for peer in &discovered {
-                        let _ = announce.try_send(*peer);
-                    }
                 }
             }
             _ = sync.tick() => {
@@ -3136,6 +3142,91 @@ mod tests {
             let _ = tx.send(report);
         }));
         (rx, tokio::spawn(replicate(Arc::clone(engine), config)))
+    }
+
+    /// **A sync tick that is stuck does not hold up the offers of a resolution that
+    /// is already running.** The offers to membership were made by the loop's join
+    /// arm, which a tick stuck on frozen peers (its dials time out one after the
+    /// other) holds for as long as it lasts; the resolution task makes them itself
+    /// now. The tick is stuck by the round hook, which blocks in the first tick
+    /// that follows the start of the second resolution; that resolution waits for
+    /// the block and then answers, and its offer must reach membership while the hook
+    /// is still blocked. Real time on a runtime with threads to spare, since the
+    /// hook blocks one of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_stuck_tick_does_not_hold_back_the_offers_of_a_resolution_in_flight() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let offered: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let blocked = Arc::new(AtomicBool::new(false));
+        let block_began = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (announce, mut offers) = tokio::sync::mpsc::channel::<SocketAddr>(16);
+
+        let local = "127.0.0.1:1".parse().unwrap();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![])], "a-secret".into(), local);
+        config.sync_interval = Duration::from_secs(60);
+        config.discovery_interval = Duration::from_millis(50);
+        config.announce = Some(announce);
+        config.resolver = Some({
+            let block_began = Arc::clone(&block_began);
+            let asked = Arc::clone(&asked);
+            Arc::new(move || {
+                let first = asked.fetch_add(1, SeqCst) == 0;
+                let block_began = Arc::clone(&block_began);
+                Box::pin(async move {
+                    if first {
+                        return BTreeSet::new();
+                    }
+                    // The second resolution is running before the tick blocks and
+                    // answers only once it has.
+                    block_began.notified().await;
+                    BTreeSet::from([offered])
+                })
+            })
+        });
+        config.on_round = Some({
+            let blocked = Arc::clone(&blocked);
+            let released = Arc::clone(&released);
+            let asked = Arc::clone(&asked);
+            let block_began = Arc::clone(&block_began);
+            Arc::new(move |_report| {
+                // The first tick after the second resolution has started (an
+                // early retry: this member has no peer), which a block before it
+                // would have kept from starting.
+                if asked.load(SeqCst) >= 2 && !blocked.swap(true, SeqCst) {
+                    // Woken from a thread of its own: a wake from this worker
+                    // would put the task in this worker's queue, which is what
+                    // is blocked.
+                    let began = Arc::clone(&block_began);
+                    std::thread::spawn(move || began.notify_one());
+                    let until = std::time::Instant::now() + Duration::from_secs(10);
+                    while !released.load(SeqCst) && std::time::Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            })
+        });
+        let looping = tokio::spawn(replicate(Arc::clone(&engine), config));
+
+        // Polled with the thread's own clock: the hook holds a worker, and the test
+        // does not lean on the runtime's timers while it does.
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let got = loop {
+            match offers.try_recv() {
+                Ok(peer) => break Some(peer),
+                Err(_) if std::time::Instant::now() >= until => break None,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let still_blocked = !released.load(SeqCst);
+        released.store(true, SeqCst);
+        looping.abort();
+        assert_eq!(got, Some(offered), "the offer arrived");
+        assert!(still_blocked, "while the tick was still stuck, not after it");
     }
 
     /// **A resolver that never answers holds up neither the sync ticks nor the
