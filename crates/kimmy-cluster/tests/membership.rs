@@ -198,3 +198,46 @@ async fn a_node_does_not_list_itself() {
 
     assert!(!a.members.snapshot().contains(&a.addr));
 }
+
+/// A member that is alone finds a peer that comes back **without anything
+/// offering the peer to it**: the alone timer is wired into `run`.
+///
+/// A and B meet, then B stops. A declares B down and holds no active member, with
+/// B's address still in its table. B comes back on the same address with an empty
+/// table of its own and no offer from anywhere (as after a partition that the
+/// replication loop's contacts to frozen peers hold the discovery offers
+/// behind). Nothing foca schedules runs for A while it is `Disconnected`, so A
+/// reaches B again only if the loop's own timer announces to its table. The
+/// unit tests drive that rule's function; this goes through the task and the
+/// loop's arm.
+#[tokio::test]
+async fn a_member_alone_announces_to_its_table_on_its_own_timer() {
+    let a = node().await;
+    let b = node().await;
+    a.announce.send(b.addr).await.unwrap();
+    eventually("a to see b", || a.members.snapshot().contains(&b.addr)).await;
+
+    let (b_addr, b_id) = (b.addr, b.node_id);
+    b.handle.abort();
+    let _ = b.handle.await;
+    drop(b.announce);
+    eventually("a to declare b down", || a.members.snapshot().is_empty()).await;
+
+    let socket = UdpSocket::bind(b_addr).await.unwrap();
+    let members = Members::default();
+    let (_offers, feed) = SeedFeed::channel();
+    let dir = tempfile::tempdir().unwrap();
+    let incarnation = kimmy_cluster::membership::IncarnationFile::begin(dir.path());
+    let back = tokio::spawn(kimmy_cluster::membership::run(
+        socket,
+        b_addr,
+        b_id,
+        incarnation,
+        SECRET.to_string(),
+        members.clone(),
+        feed,
+        kimmy_task::Shutdown::new(),
+    ));
+    eventually("a to find b again, with no offer", || a.members.snapshot().contains(&b_addr)).await;
+    back.abort();
+}

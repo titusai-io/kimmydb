@@ -3614,6 +3614,7 @@ kimmy_task_retries_total{task=\"drop_purger\"} 0
 kimmy_task_retries_total{task=\"embedding_worker\"} 0
 kimmy_task_retries_total{task=\"jwks_refresher\"} 0
 kimmy_task_retries_total{task=\"membership\"} 0
+kimmy_task_retries_total{task=\"membership_alone_announce\"} 0
 kimmy_task_retries_total{task=\"membership_announce\"} 0
 kimmy_task_retries_total{task=\"membership_inbound\"} 0
 kimmy_task_retries_total{task=\"membership_timer\"} 0

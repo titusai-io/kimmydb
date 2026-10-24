@@ -966,8 +966,11 @@ enum Input {
     /// The alone timer ([`ALONE_ANNOUNCE_EVERY`]): if this member holds no
     /// active member, announce to the whole member table. Sent by this loop's
     /// own task, so it does not wait on discovery, which shares a loop with
-    /// replication.
-    AloneTick,
+    /// replication. Carries the instant the tick was **scheduled** for: the
+    /// throttle judges by that and not by when the loop got to the tick, since
+    /// two ticks handled a little closer together than they were scheduled
+    /// would otherwise lose one of them to the other's announce.
+    AloneTick(Instant),
 }
 
 /// This crate's SWIM instance.
@@ -1334,10 +1337,10 @@ pub async fn run(
             let mut ticker = tokio::time::interval(ALONE_ANNOUNCE_EVERY);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
+                let scheduled = ticker.tick().await.into_std();
                 // A full channel means the loop is behind: skip this tick, the
                 // next one follows. The channel closing ends the task.
-                match tx.try_send(Input::AloneTick) {
+                match tx.try_send(Input::AloneTick(scheduled)) {
                     Err(mpsc::error::TrySendError::Closed(_)) => return,
                     Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                 }
@@ -1361,9 +1364,9 @@ pub async fn run(
         let result = match input {
             Input::Data(bytes) => foca.handle_data(&bytes, &mut collector),
             Input::Timer(timer) => foca.handle_timer(timer, &mut collector),
-            Input::AloneTick => {
+            Input::AloneTick(scheduled) => {
                 let mut result = Ok(());
-                for target in alone_announce_targets(&foca, &mut announced_alone, Instant::now()) {
+                for target in alone_announce_targets(&foca, &mut announced_alone, scheduled) {
                     if let Err(e) = foca.announce(Member::announcing(target), &mut collector) {
                         result = Err(e);
                     }
