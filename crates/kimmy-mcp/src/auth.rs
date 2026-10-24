@@ -85,9 +85,9 @@ async fn authenticate(
 ) -> Result<Response, kimmy_api::ApiError> {
     use axum::extract::FromRequestParts;
 
-    // The request's time starts here, as REST's does in `enforce_timeout`: one deadline
-    // over the body and the call. The call (`tools::within_deadline`) gets what the body
-    // left of it.
+    // The request's time starts here, as REST's does in `enforce_timeout`, and covers the
+    // body and the call together. The call (`tools::within_deadline`) gets what the body
+    // left of it, its wait for the writer included.
     let started = std::time::Instant::now();
     let (mut parts, body) = request.into_parts();
     let Auth(principal) = Auth::from_request_parts(&mut parts, &state).await?;

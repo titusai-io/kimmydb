@@ -5278,8 +5278,9 @@ this, and must either come before the commit or be capped the same way.
 > stopped after its headers held the connection), so `mcp_router`'s
 > authentication layer starts the request's time and bounds the body's arrival, and
 > answers a body that did not arrive `503 timeout` as REST does (not rmcp's
-> plain-text 500). One deadline covers body and call, as on REST: the tool call
-> gets what the body left of it. The same sentence stands for a schema-change
+> plain-text 500). One deadline covers body and call: the tool call, and its wait
+> for the storage writer, get what the body left of it. (REST sets the full write-wait
+> budget before it reads the body; aligning it is a separate change.) The same sentence stands for a schema-change
 > confirmation: it is capped to the time left and answers the change as made, its
 > unheard members `pending`, not as a timeout. The deadline's other exemptions, the change-stream upgrade and
 > the backup, stand.

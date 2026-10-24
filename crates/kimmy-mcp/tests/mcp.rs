@@ -2104,6 +2104,11 @@ async fn a_slow_body_leaves_the_call_less_time() {
     assert_eq!(status, 200, "{json}");
     assert_eq!(json["result"]["isError"], true, "{json}");
     assert_eq!(json["result"]["structuredContent"]["error"], "timeout");
+    let message = json["result"]["structuredContent"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("of the 3 s request deadline"),
+        "the wait is named beside the setting, not as the setting: {message}"
+    );
     assert!(
         took >= std::time::Duration::from_millis(2900)
             && took < std::time::Duration::from_millis(4300),

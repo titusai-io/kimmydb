@@ -859,8 +859,8 @@ pub(crate) fn render(result: Result<Value, ApiError>) -> Result<CallToolResult, 
 /// handler's, so a layer around `/mcp` would not reach them. See
 /// [`kimmy_api::limits::within_request_deadline`] for what they are.
 ///
-/// `left` is what the request body left of the configured time (REST has one deadline over
-/// body and work); the answer names the configured number.
+/// `left` is what the request body left of the configured time; the call and its wait for
+/// the storage writer are bounded by it, and the answer names the configured number.
 pub(crate) async fn within_deadline(
     limits: RequestLimits,
     left: std::time::Duration,

@@ -374,8 +374,9 @@ before writing again. See [retrying after an unknown
 outcome](clients.md#retrying-after-an-unknown-outcome).
 
 **A call that runs out of time is a tool result too.** An MCP request has the same deadline
-as a REST request (`server.request_timeout_secs`, [ADR-099](decisions.md)), one deadline over
-the request body's arrival and the call: a call gets what the body left of it. A write that
+as a REST request (`server.request_timeout_secs`, [ADR-099](decisions.md)), and it covers the
+request body's arrival and the call together: a call, and its wait for the storage writer, get
+what the body left of it. (REST gives a write the whole wait budget after its body is read.) A write that
 cannot take the storage writer inside it, a search that sees the deadline pass, or a call
 still pending at it, comes back with `isError: true` and the REST `503` envelope as
 `structuredContent`:

@@ -672,18 +672,25 @@ impl ApiError {
     /// `server.request_timeout_secs` and nothing was done — and the retry
     /// hint is the same. The message says what the time went on.
     pub fn writer_busy(waited: std::time::Duration) -> Self {
-        Self::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::Timeout,
-            format!(
-                "the write waited {} seconds (server.request_timeout_secs) for the storage \
-                 writer, which another transaction held throughout, and was abandoned; \
-                 nothing was written",
-                // Rounded, not truncated: a wait cut a hair short of its budget (a request
-                // whose body took part of it) is still the budget in whole seconds.
-                waited.as_secs_f64().round() as u64
-            ),
-        )
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Timeout, {
+            // Rounded, not truncated: a wait cut a hair short of its budget is still
+            // the budget in whole seconds.
+            let waited = waited.as_secs_f64().round() as u64;
+            match crate::limits::request_timeout().map(|t| t.as_secs()) {
+                // A wait shorter than the configured deadline (the body took the rest of
+                // it, over MCP): say both, so it does not read as the setting being `waited`.
+                Some(configured) if configured != waited => format!(
+                    "the write waited {waited} s of the {configured} s request deadline \
+                         (server.request_timeout_secs) for the storage writer, which another \
+                         transaction held throughout, and was abandoned; nothing was written"
+                ),
+                _ => format!(
+                    "the write waited {waited} seconds (server.request_timeout_secs) for the \
+                         storage writer, which another transaction held throughout, and was \
+                         abandoned; nothing was written"
+                ),
+            }
+        })
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -1093,6 +1100,39 @@ impl From<AuthError> for ApiError {
                 ApiError::internal("authentication failure")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod writer_busy_wording_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A wait that equals the request deadline is worded as it always was; one cut short by
+    /// a body that took part of the deadline names both numbers, so it does not read as
+    /// the setting being the wait.
+    #[tokio::test]
+    async fn a_wait_shorter_than_the_deadline_names_both_numbers() {
+        let whole = crate::limits::as_a_request(Instant::now(), Duration::from_secs(3), async {
+            ApiError::writer_busy(Duration::from_secs(3))
+        })
+        .await;
+        assert!(
+            whole.message.starts_with("the write waited 3 seconds (server.request_timeout_secs)")
+        );
+        let short = crate::limits::as_a_request(Instant::now(), Duration::from_secs(3), async {
+            ApiError::writer_busy(Duration::from_millis(1100))
+        })
+        .await;
+        assert!(
+            short.message.starts_with(
+                "the write waited 1 s of the 3 s request deadline (server.request_timeout_secs)"
+            ),
+            "{}",
+            short.message
+        );
+        // Outside a request deadline there is no number to name: the plain wording.
+        assert!(ApiError::writer_busy(Duration::from_secs(2)).message.contains("2 seconds"));
     }
 }
 

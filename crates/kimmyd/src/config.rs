@@ -305,10 +305,10 @@ pub struct ServerConfig {
     /// backup carry no deadline. An `/mcp` tool call has this deadline too (the same
     /// four scopes: abandoned if still pending, the wait for the storage writer, the
     /// vector search's and the confirmation's reading of the time left, the number in
-    /// messages), and is answered, past it, as a tool result with `error: timeout`. As
-    /// on REST it is one deadline over the request body's arrival and the call: a call
-    /// gets what the body left, and a body still arriving at the deadline is answered
-    /// `503 timeout`.
+    /// messages), and is answered, past it, as a tool result with `error: timeout`. It
+    /// covers the request body's arrival and the call together: a call, and its wait for
+    /// the storage writer, get what the body left, and a body still arriving at the
+    /// deadline is answered `503 timeout`.
     pub request_timeout_secs: u64,
     /// Largest request body the API will read, in bytes (ADR-099). Over it,
     /// `413 payload_too_large`.
