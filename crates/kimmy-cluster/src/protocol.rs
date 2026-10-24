@@ -1027,6 +1027,7 @@ mod tests {
                 after: Some(SnapshotCursor {
                     collection: CollectionId(u64::MAX),
                     after_key: vec![1, 2],
+                    until_key: Some(vec![9, 9]),
                 }),
                 collection: Some(CollectionId(u64::MAX)),
             },
@@ -1513,7 +1514,11 @@ mod tests {
         let page = SnapshotPage {
             collections: Vec::new(),
             documents: Vec::new(),
-            next: Some(SnapshotCursor { collection: CollectionId(7), after_key: vec![1, 2, 3] }),
+            next: Some(SnapshotCursor {
+                collection: CollectionId(7),
+                after_key: vec![1, 2, 3],
+                until_key: None,
+            }),
             versions,
             dropped: None,
             dropped_collections: vec![(CollectionId(9), stamp(500))],
