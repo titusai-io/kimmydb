@@ -1440,7 +1440,7 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.sync.serve_failures.timeout",
             "{connection}",
-            "Peer replication connections this node failed to serve because the handshake ran out of time.",
+            "Peer replication connections this node failed to serve because a bounded wait ran out mid-exchange: the handshake, a frame that stopped arriving, or an answer the peer stopped reading.",
             |s| s.sync_serve_failures[ServeFailure::Timeout.slot()]
         );
         observe!(
@@ -1477,6 +1477,13 @@ impl TelemetryGuard {
             "{connection}",
             "Peer replication connections refused because the TLS session gave no channel binding.",
             |s| s.sync_serve_failures[ServeFailure::Binding.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.idle",
+            "{connection}",
+            "Peer replication connections ended because they sent no request for the idle bound.",
+            |s| s.sync_serve_failures[ServeFailure::Idle.slot()]
         );
         observe!(
             u64_observable_counter,

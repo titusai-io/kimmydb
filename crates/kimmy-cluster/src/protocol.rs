@@ -551,6 +551,12 @@ pub enum ProtocolError {
     /// there.
     #[error("{0} timed out")]
     TimedOut(String),
+    /// The serving side waited for a connection's next request and none came: not a
+    /// wait that ran out in the middle of an exchange, so it has its own variant
+    /// and its own label (a dialler behind a long local apply is expected to land
+    /// here, and an alert on timeouts must not fire for it).
+    #[error("an idle connection timed out")]
+    Idle,
     #[error("frame of {size} bytes exceeds the {MAX_FRAME} byte limit")]
     TooLarge { size: usize },
     #[error("peer failed authentication")]
@@ -641,13 +647,14 @@ pub(crate) struct FrameWaits {
 async fn read_within<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
-    wait: Option<(std::time::Duration, &'static str)>,
+    wait: Option<(std::time::Duration, bool)>,
 ) -> Result<usize, ProtocolError> {
     match wait {
         None => Ok(reader.read(buf).await?),
-        Some((limit, what)) => match tokio::time::timeout(limit, reader.read(buf)).await {
+        Some((limit, idle)) => match tokio::time::timeout(limit, reader.read(buf)).await {
             Ok(read) => Ok(read?),
-            Err(_) => Err(ProtocolError::TimedOut(what.into())),
+            Err(_) if idle => Err(ProtocolError::Idle),
+            Err(_) => Err(ProtocolError::TimedOut("a frame in progress".into())),
         },
     }
 }
@@ -700,9 +707,7 @@ async fn read_body_within<R: AsyncRead + Unpin>(
     let mut len = [0u8; 4];
     let mut got = 0;
     while got < len.len() {
-        let wait = waits.map(|w| {
-            if got == 0 { (w.idle, "an idle connection") } else { (w.stall, "a frame in progress") }
-        });
+        let wait = waits.map(|w| if got == 0 { (w.idle, true) } else { (w.stall, false) });
         let read = match read_within(reader, &mut len[got..], wait).await {
             Err(ProtocolError::Io(e)) if got == 0 && e.kind() == io::ErrorKind::UnexpectedEof => {
                 return Err(ProtocolError::Closed);
@@ -733,7 +738,7 @@ async fn read_body_within<R: AsyncRead + Unpin>(
         body.resize(start + BODY_CHUNK.min(size - start), 0);
         let mut filled = start;
         while filled < body.len() {
-            let wait = waits.map(|w| (w.stall, "a frame in progress"));
+            let wait = waits.map(|w| (w.stall, false));
             let read = read_within(reader, &mut body[filled..], wait).await?;
             if read == 0 {
                 return Err(ProtocolError::Io(io::Error::new(
