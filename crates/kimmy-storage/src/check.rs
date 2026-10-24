@@ -846,12 +846,25 @@ mod tests {
     /// A copy taken while an engine had the store open: one that was not
     /// closed, as a kill leaves it.
     fn an_unclean_store() -> (tempfile::TempDir, PathBuf) {
+        an_unclean_store_with(0)
+    }
+
+    /// [`an_unclean_store`], with `extra` more documents, which move where the
+    /// file's last page falls against the end of the file.
+    fn an_unclean_store_with(extra: usize) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("live.redb");
         let path = dir.path().join("data").join("kimmy.redb");
         std::fs::create_dir(path.parent().unwrap()).unwrap();
         let engine = Engine::open(&live).unwrap();
         fill(&engine);
+        if extra > 0 {
+            let c = engine.get_collection("shop", "orders").unwrap();
+            let docs = (0..extra)
+                .map(|i| bson::doc! { "_id": format!("x{i}"), "pad": "yyyyyyyyyyyyyyyyyyyyyyyy" })
+                .collect();
+            engine.insert_many(&c, docs).unwrap();
+        }
         std::fs::copy(&live, &path).unwrap();
         std::fs::copy(crate::format::sidecar_path(&live), crate::format::sidecar_path(&path))
             .unwrap();
@@ -1173,9 +1186,38 @@ mod tests {
     }
 
     /// A store cut short: redb's repair walks to pages past the end of the
-    /// file, which the view refuses before reading anything. Damage, exit 65.
+    /// file, which the view refuses before reading anything. Damage, exit 65,
+    /// and the verdict is the view's own (`past the end of the file`), not redb's.
+    /// With 300 more documents the file's last page falls where an eight-block
+    /// cut leaves redb's layout check satisfied and the walk reaches past the end.
+    /// That window recurs as redb doubles the file (700 and 2,400 more documents
+    /// repair clean, 150 to 600 and 900 to 1,800 reach the view), so a change that
+    /// moves the store's size out of it fails this test loudly, on the verdict,
+    /// and the count is then re-found by probing.
     #[test]
     fn a_killed_store_cut_short_is_damaged() {
+        let (_dir, path) = an_unclean_store_with(300);
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 8 * BLOCK)
+            .unwrap();
+        let report = check_untouched(&path, PreviousRun::NotClean);
+        assert_eq!(report.verdict, Verdict::Damaged, "{report:?}");
+        assert_eq!(report.exit_code(), 65);
+        assert!(
+            report.detail.contains("reached past the end of the file"),
+            "the view's own verdict: {report:?}"
+        );
+        assert!(report.detail.contains("kimmyd restore"), "{report:?}");
+    }
+
+    /// The same cut of a store whose last page is nearer the end of the file:
+    /// redb's own layout check refuses it first, as damage with the same exit.
+    #[test]
+    fn a_killed_store_cut_into_its_last_region_is_damaged_by_redb() {
         let (_dir, path) = an_unclean_store();
         let len = std::fs::metadata(&path).unwrap().len();
         std::fs::OpenOptions::new()
@@ -1187,14 +1229,7 @@ mod tests {
         let report = check_untouched(&path, PreviousRun::NotClean);
         assert_eq!(report.verdict, Verdict::Damaged, "{report:?}");
         assert_eq!(report.exit_code(), 65);
-        // Which of the two sees it first depends on how far the file reaches past
-        // its last page: the view's own refusal of a read past the end of the
-        // file, or redb's of a page past the end of its region.
-        assert!(
-            report.detail.contains("past the end of the file")
-                || report.detail.contains("extends past the end of its region"),
-            "{report:?}"
-        );
+        assert!(report.detail.contains("extends past the end of its region"), "{report:?}");
         assert!(report.detail.contains("kimmyd restore"), "{report:?}");
     }
 
