@@ -397,7 +397,12 @@ pub(crate) fn major_minor(version: &str) -> Option<(u64, u64)> {
 }
 
 fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> Result<()> {
-    if sidecar.schema < build.schema {
+    // Schema 0 is what a first open writes before any schema exists
+    // (`stamp(0)`, ahead of redb laying the file out): a stop between that and
+    // the schema's own commit leaves it beside a store with no schema in META,
+    // which the next open finishes. It is no older build's: the oldest schema
+    // that was ever written is 1, and `refuse_other_schema` reads META's.
+    if sidecar.schema < build.schema && sidecar.schema != 0 {
         return Err(refused(
             database,
             RefusedKind::Older,
@@ -429,8 +434,34 @@ fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> R
             RefusedKind::Newer,
             format!("it was written by {} with {what}", sidecar.written_by),
         )),
+        // The same schema under an older redb: the build's redb does not open
+        // a store another redb minor wrote, in either direction.
+        None if redb < build.redb => Err(refused(
+            database,
+            RefusedKind::Older,
+            format!(
+                "it was written by {} with redb {}.{} (this build: {}.{}). {}",
+                sidecar.written_by,
+                redb.0,
+                redb.1,
+                build.redb.0,
+                build.redb.1,
+                redb_no_upgrade(build)
+            ),
+        )),
         None => Ok(()),
     }
+}
+
+/// What to do about a store another redb minor wrote: the refusal's way out,
+/// in the words the schema refusal uses.
+pub(crate) fn redb_no_upgrade(build: &BuildVersions) -> String {
+    format!(
+        "A redb minor is a format event, so this build (redb {}.{}) does not open a store \
+         another minor wrote: stop every member, wipe this data directory, start on an empty \
+         one and reseed.",
+        build.redb.0, build.redb.1
+    )
 }
 
 /// [`read_only_fallback`], with a panic in redb refused as damage.
@@ -532,17 +563,46 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
                     format!("storage schema {schema} (this build: {})", build.schema),
                 ));
             }
-            if let Some(version) = redb
-                && major_minor(&version).is_some_and(|v| v > build.redb)
-            {
-                return Err(refused(
-                    database,
-                    RefusedKind::Newer,
-                    format!(
-                        "redb {version} last wrote it (this build: {}.{})",
-                        build.redb.0, build.redb.1
-                    ),
-                ));
+            match redb.as_deref().map(|v| (v, major_minor(v))) {
+                Some((version, Some(v))) if v > build.redb => {
+                    return Err(refused(
+                        database,
+                        RefusedKind::Newer,
+                        format!(
+                            "redb {version} last wrote it (this build: {}.{})",
+                            build.redb.0, build.redb.1
+                        ),
+                    ));
+                }
+                Some((version, Some(v))) if v < build.redb => {
+                    return Err(refused(
+                        database,
+                        RefusedKind::Older,
+                        format!(
+                            "redb {version} last wrote it (this build: {}.{}). {}",
+                            build.redb.0,
+                            build.redb.1,
+                            redb_no_upgrade(build)
+                        ),
+                    ));
+                }
+                Some((version, None)) => {
+                    return Err(refused(
+                        database,
+                        RefusedKind::Damaged,
+                        format!("the redb version it records, {version:?}, is not major.minor"),
+                    ));
+                }
+                // A store with a schema and no redb version was not written by
+                // this build, which records it on every open.
+                None if schema.is_some() => {
+                    return Err(refused(
+                        database,
+                        RefusedKind::Damaged,
+                        "it records a storage schema and no redb version".into(),
+                    ));
+                }
+                _ => {}
             }
             Ok(Prior::CleanNoSidecar { schema })
         }
@@ -1116,6 +1176,325 @@ mod tests {
         assert_refused_untouched(&copy, &BuildVersions::ours(), "the next start");
     }
 
+    /// The mirror of the newer-redb tests: this build's redb does not open a
+    /// store another minor wrote, in either direction (the 0.54.0 move from
+    /// redb 4.3 to 4.4 is a wipe release). Refused by name, before anything is
+    /// written, with the way out.
+    #[test]
+    fn an_older_redb_minor_in_the_sidecar_is_refused_untouched_with_the_way_out() {
+        let (_dir, path) = a_store();
+        let older = format!("{}.{}", REDB_MAJOR_MINOR.0, REDB_MAJOR_MINOR.1 - 1);
+        with_sidecar(&path, |s| s.redb_version = older.clone());
+        assert_refused_untouched(&path, &BuildVersions::ours(), "redb minor");
+        match Engine::open(&path) {
+            Err(StorageError::RefusedStore { kind, why }) => {
+                assert_eq!(kind, RefusedKind::Older, "{why}");
+                assert!(why.contains(&format!("redb {older}")), "{why}");
+                assert!(why.contains("stop every member, wipe this data directory"), "{why}");
+            }
+            other => panic!("not refused as older: {:?}", other.err()),
+        }
+        // An older major is the same boundary.
+        let (_dir, path) = a_store();
+        with_sidecar(&path, |s| s.redb_version = format!("{}.{}", REDB_MAJOR_MINOR.0 - 1, 9));
+        assert_refused_untouched(&path, &BuildVersions::ours(), "redb major");
+    }
+
+    /// With no sidecar, an older redb recorded in META is refused on a clean
+    /// store, and so is a schema with no redb recorded at all (this build
+    /// records it on every open): damaged, never stamped.
+    #[test]
+    fn with_no_sidecar_an_older_or_missing_redb_in_meta_is_refused_untouched() {
+        let older = format!("{}.{}", REDB_MAJOR_MINOR.0, REDB_MAJOR_MINOR.1 - 1);
+        for (what, edit) in [
+            ("older redb", Some(older.as_bytes().to_vec())),
+            ("unreadable redb", Some(b"four".to_vec())),
+            ("no redb", None),
+        ] {
+            let (_dir, path) = a_store();
+            std::fs::remove_file(sidecar_path(&path)).unwrap();
+            {
+                let db = redb::Database::create(&path).unwrap();
+                let txn = db.begin_write().unwrap();
+                {
+                    let mut meta = txn.open_table(tables::META).unwrap();
+                    match &edit {
+                        Some(value) => {
+                            meta.insert(META_REDB_VERSION, value.as_slice()).unwrap();
+                        }
+                        None => {
+                            meta.remove(META_REDB_VERSION).unwrap();
+                        }
+                    }
+                }
+                txn.commit().unwrap();
+            }
+            assert_refused_untouched(&path, &BuildVersions::ours(), what);
+        }
+    }
+
+    /// A dirty store with no sidecar that an older redb wrote: the open stops
+    /// before the ensure-tables commit, and META is not restamped as this
+    /// build's, so the next start still refuses it.
+    #[test]
+    fn a_dirty_store_an_older_redb_wrote_with_no_sidecar_stops_and_is_not_restamped() {
+        let (dir, live) = a_store();
+        std::fs::remove_file(sidecar_path(&live)).unwrap();
+        let older = format!("{}.{}", REDB_MAJOR_MINOR.0, REDB_MAJOR_MINOR.1 - 1);
+        let copy = dir.path().join("copy.redb");
+        {
+            let db = redb::Database::create(&live).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::META)
+                .unwrap()
+                .insert(META_REDB_VERSION, older.as_bytes())
+                .unwrap();
+            txn.commit().unwrap();
+            std::fs::copy(&live, &copy).unwrap();
+        }
+        assert!(matches!(
+            redb::Builder::new().open_read_only(&copy),
+            Err(redb::DatabaseError::RepairAborted)
+        ));
+        match Engine::open(&copy) {
+            Err(StorageError::RefusedStore { kind, why }) => {
+                assert_eq!(kind, RefusedKind::Older, "{why}");
+                assert!(why.contains(&older) && why.contains("stop every member"), "{why}");
+            }
+            other => panic!("not refused as older: {:?}", other.err()),
+        }
+        assert!(!sidecar_path(&copy).exists(), "no sidecar claims this build wrote it");
+        {
+            let db = redb::Builder::new().open_read_only(&copy).unwrap();
+            let txn = db.begin_read().unwrap();
+            let meta = txn.open_table(tables::META).unwrap();
+            let recorded = meta.get(META_REDB_VERSION).unwrap().unwrap().value().to_vec();
+            assert_eq!(recorded, older.as_bytes(), "META still names the older redb");
+        }
+        assert_refused_untouched(&copy, &BuildVersions::ours(), "the next start");
+    }
+
+    /// The check before the ensure-tables commit reads META alone: another
+    /// minor recorded, either way, a record that is not major.minor, and a
+    /// schema with no redb recorded are each refused there, by name, with
+    /// nothing written; this build's minor, and a patch of it, pass.
+    #[test]
+    fn the_check_before_the_ensure_tables_commit_refuses_another_redb_minor_either_way() {
+        let build = BuildVersions::ours();
+        let record = |db: &redb::Database, value: Option<&str>| {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(tables::META).unwrap();
+                match value {
+                    Some(v) => {
+                        meta.insert(META_REDB_VERSION, v.as_bytes()).unwrap();
+                    }
+                    None => {
+                        meta.remove(META_REDB_VERSION).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let db = redb::Database::create(&path).unwrap();
+        // A schema is recorded, as in every store this build wrote.
+        let txn = db.begin_write().unwrap();
+        txn.open_table(tables::META)
+            .unwrap()
+            .insert(tables::META_FORMAT_VERSION, [crate::migrate::SCHEMA_VERSION].as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        let (major, minor) = REDB_MAJOR_MINOR;
+        let check = |db: &redb::Database| crate::migrate::refuse_other_schema(db, &path, &build);
+
+        record(&db, None);
+        assert!(
+            matches!(
+                check(&db),
+                Err(StorageError::RefusedStore { kind: RefusedKind::Damaged, .. })
+            ),
+            "a schema and no redb version"
+        );
+        record(&db, Some("four"));
+        assert!(matches!(
+            check(&db),
+            Err(StorageError::RefusedStore { kind: RefusedKind::Damaged, .. })
+        ));
+        record(&db, Some(&format!("{major}.{}", minor - 1)));
+        match check(&db) {
+            Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
+                assert!(why.contains("stop every member"), "{why}")
+            }
+            other => panic!("older minor: {other:?}"),
+        }
+        record(&db, Some(&format!("{major}.{}", minor + 1)));
+        assert!(matches!(
+            check(&db),
+            Err(StorageError::RefusedStore { kind: RefusedKind::Newer, .. })
+        ));
+        record(&db, Some(&format!("{major}.{minor}.7")));
+        check(&db).expect("a patch is not a boundary");
+        record(&db, Some(&format!("{major}.{minor}")));
+        check(&db).expect("this build's minor");
+    }
+
+    /// `record_redb_version` stamps a store that records none and leaves one
+    /// that records this build's alone; it never rewrites another minor, which
+    /// used to turn an older store into one this build wrote.
+    #[test]
+    fn recording_the_redb_version_never_restamps_another_minor() {
+        let build = BuildVersions::ours();
+        let ours = format!("{}.{}", build.redb.0, build.redb.1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let db = redb::Database::create(&path).unwrap();
+        // None recorded: stamped.
+        crate::migrate::record_redb_version(&db, &build, &path).unwrap();
+        let recorded = |db: &redb::Database| {
+            let txn = db.begin_read().unwrap();
+            let meta = txn.open_table(tables::META).unwrap();
+            let value = meta.get(META_REDB_VERSION).unwrap().unwrap().value().to_vec();
+            String::from_utf8(value).unwrap()
+        };
+        assert_eq!(recorded(&db), ours);
+        // This build's: untouched. A patch is not a boundary, and is not rewritten.
+        crate::migrate::record_redb_version(&db, &build, &path).unwrap();
+        for other in [
+            format!("{}.{}", build.redb.0, build.redb.1 - 1),
+            format!("{}.{}", build.redb.0, build.redb.1 + 1),
+        ] {
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::META)
+                .unwrap()
+                .insert(META_REDB_VERSION, other.as_bytes())
+                .unwrap();
+            txn.commit().unwrap();
+            let err = crate::migrate::record_redb_version(&db, &build, &path).unwrap_err();
+            assert!(matches!(err, StorageError::RefusedStore { .. }), "{other}: {err}");
+            assert_eq!(recorded(&db), other, "not restamped");
+        }
+    }
+
+    /// Remove the schema from META: the state of a first open stopped after the
+    /// ensure-tables commit and before the schema's.
+    fn without_a_schema(path: &Path) {
+        let db = redb::Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(tables::META).unwrap().remove(tables::META_FORMAT_VERSION).unwrap();
+        txn.commit().unwrap();
+    }
+
+    /// **A store this build wrote always opens.** The first open commits in
+    /// order the tables (with the redb version), the schema in the sidecar, then
+    /// the schema in META. A stop after any of them leaves a store the next start
+    /// opens and finishes: it used to be refused as written by "storage schema 0",
+    /// and, between the schema and the redb version, as damaged.
+    #[test]
+    fn a_first_open_stopped_after_any_of_its_commits_leaves_a_store_that_opens() {
+        // After the tables: no schema in META, the sidecar still at schema 0.
+        // After the sidecar's schema: no schema in META, the sidecar at 6.
+        // And with no sidecar at all, for a store copied without it.
+        for (what, sidecar_schema) in
+            [("tables only", Some(0u8)), ("sidecar raised", Some(6)), ("no sidecar", None)]
+        {
+            let (_dir, path) = a_store();
+            without_a_schema(&path);
+            match sidecar_schema {
+                Some(schema) => with_sidecar(&path, |s| s.schema = schema),
+                None => std::fs::remove_file(sidecar_path(&path)).unwrap(),
+            }
+            let engine = Engine::open(&path).unwrap_or_else(|e| panic!("{what}: {e}"));
+            drop(engine);
+            let sidecar = read_sidecar(&path).expect("a sidecar after the open");
+            assert_eq!(sidecar.schema, crate::migrate::SCHEMA_VERSION, "{what}");
+            let db = redb::Builder::new().open_read_only(&path).unwrap();
+            let txn = db.begin_read().unwrap();
+            let meta = txn.open_table(tables::META).unwrap();
+            assert!(meta.get(tables::META_FORMAT_VERSION).unwrap().is_some(), "{what}: a schema");
+            assert!(meta.get(META_REDB_VERSION).unwrap().is_some(), "{what}: a redb version");
+        }
+    }
+
+    /// The first open of a fresh store, stopped as a kill would after each of its
+    /// commits. Every stop leaves a store the next start opens and finishes, and
+    /// none leaves a schema without the redb that wrote it (which is refused as
+    /// damaged): the redb version is recorded in the first commit, ahead of the
+    /// schema.
+    #[test]
+    fn a_fresh_open_stopped_after_a_commit_leaves_a_store_that_opens() {
+        for stage in ["tables", "schema"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("kimmy.redb");
+            crate::hold_meter::test_hooks::STOP_OPEN_AFTER.with(|s| s.set(Some(stage)));
+            let stopped = Engine::open(&path);
+            crate::hold_meter::test_hooks::STOP_OPEN_AFTER.with(|s| s.set(None));
+            assert!(matches!(stopped, Err(StorageError::Database(_))), "{stage}: stopped");
+            {
+                let db = redb::Builder::new().open_read_only(&path).unwrap();
+                let txn = db.begin_read().unwrap();
+                let meta = txn.open_table(tables::META).unwrap();
+                let recorded = meta.get(META_REDB_VERSION).unwrap().expect("redb recorded first");
+                let recorded = std::str::from_utf8(recorded.value()).unwrap().to_string();
+                assert_eq!(major_minor(&recorded), Some(REDB_MAJOR_MINOR), "{stage}");
+                let schema = meta.get(tables::META_FORMAT_VERSION).unwrap().is_some();
+                assert_eq!(schema, stage == "schema", "{stage}: the schema is the second commit");
+            }
+            crate::format::check_before_open(&path).unwrap_or_else(|e| panic!("{stage}: {e}"));
+            Engine::open(&path).unwrap_or_else(|e| panic!("{stage}: the next start: {e}"));
+            assert_eq!(
+                read_sidecar(&path).unwrap().schema,
+                crate::migrate::SCHEMA_VERSION,
+                "{stage}"
+            );
+        }
+    }
+
+    /// A patch recorded in META is not a boundary at any point of the open: the
+    /// check before the ensure-tables commit let it through, and the recorder
+    /// refused it as older after the open had written.
+    #[test]
+    fn a_patch_recorded_in_meta_opens() {
+        let (_dir, path) = a_store();
+        std::fs::remove_file(sidecar_path(&path)).unwrap();
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            let patched = format!("{}.{}.9", REDB_MAJOR_MINOR.0, REDB_MAJOR_MINOR.1);
+            txn.open_table(tables::META)
+                .unwrap()
+                .insert(META_REDB_VERSION, patched.as_bytes())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        Engine::open(&path).expect("a recorded patch is not a boundary");
+    }
+
+    /// The whole message of an older minor, as operations.md quotes its way out.
+    #[test]
+    fn the_older_minor_message_is_the_one_the_documentation_quotes() {
+        let (_dir, path) = a_store();
+        let older = format!("{}.{}", REDB_MAJOR_MINOR.0, REDB_MAJOR_MINOR.1 - 1);
+        with_sidecar(&path, |s| s.redb_version = older.clone());
+        let written_by = read_sidecar(&path).unwrap().written_by;
+        let expected = format!(
+            "{} is not opened by this build, and nothing in it was changed: it was written by \
+             {written_by} with redb {older} (this build: {}.{}). A redb minor is a format event, \
+             so this build (redb {}.{}) does not open a store another minor wrote: stop every \
+             member, wipe this data directory, start on an empty one and reseed.",
+            path.display(),
+            REDB_MAJOR_MINOR.0,
+            REDB_MAJOR_MINOR.1,
+            REDB_MAJOR_MINOR.0,
+            REDB_MAJOR_MINOR.1,
+        );
+        match Engine::open(&path) {
+            Err(StorageError::RefusedStore { why, .. }) => assert_eq!(why, expected),
+            other => panic!("not refused: {:?}", other.err()),
+        }
+    }
+
     #[test]
     fn an_open_records_its_redb_in_meta() {
         let (_dir, path) = a_store();
@@ -1525,24 +1904,22 @@ mod tests {
         (fingerprint(path), fingerprint(&sidecar_path(path)))
     }
 
-    /// The sidecars a damaged store is tried with: none; this build's, which
-    /// the open does not rewrite; and one an older redb stamped, which it
-    /// rewrites before redb's open and must put back.
+    /// The sidecars a damaged store is tried with: none, and this build's,
+    /// which the open does not rewrite. (A sidecar another redb stamped is
+    /// refused before redb is asked, and has tests of its own: since 0.54.0 the
+    /// open no longer rewrites it.)
     #[derive(Clone, Copy, Debug)]
     enum SidecarCase {
         None,
         Ours,
-        OlderRedb,
     }
 
-    const SIDECAR_CASES: [SidecarCase; 3] =
-        [SidecarCase::None, SidecarCase::Ours, SidecarCase::OlderRedb];
+    const SIDECAR_CASES: [SidecarCase; 2] = [SidecarCase::None, SidecarCase::Ours];
 
     fn with_sidecar_case(path: &Path, case: SidecarCase) {
         match case {
             SidecarCase::None => std::fs::remove_file(sidecar_path(path)).unwrap(),
             SidecarCase::Ours => {}
-            SidecarCase::OlderRedb => with_sidecar(path, |s| s.redb_version = "4.1".into()),
         }
     }
 
@@ -1906,7 +2283,7 @@ mod tests {
     #[test]
     fn the_sidecar_is_put_back_only_under_the_stores_lock() {
         let (_dir, path) = a_store();
-        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         damage_page_order(&path, 1);
         let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
         let hold = std::rc::Rc::clone(&holder);
@@ -1935,9 +2312,9 @@ mod tests {
         drop(holder.borrow_mut().take());
 
         // Nothing holding it: put back, and the lock let go after.
-        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         assert!(matches!(Engine::open(&path), Err(StorageError::RefusedStore { .. })));
-        assert_eq!(read_sidecar(&path).unwrap().redb_version, "4.1", "put back");
+        assert_eq!(read_sidecar(&path).unwrap().redb_file_format, REDB_FILE_FORMAT - 1, "put back");
         std::fs::File::open(&path).unwrap().try_lock().expect("the put-back let the lock go");
     }
 
@@ -2147,7 +2524,7 @@ mod tests {
     #[test]
     fn an_open_that_fails_after_redb_wrote_keeps_this_builds_sidecar() {
         let (_dir, path) = a_store();
-        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         let header = std::fs::read(&path).unwrap()[..HEADER_LEN].to_vec();
         crate::hold_meter::test_hooks::ARM_AT_OPEN.with(|a| a.set(Some("sync_data")));
         let result = Engine::open(&path);
@@ -2175,7 +2552,7 @@ mod tests {
         {
             for changed in [false, true] {
                 let (_dir, path) = a_store();
-                with_sidecar(&path, |s| s.redb_version = "4.1".into());
+                with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
                 let older = std::fs::read(sidecar_path(&path)).unwrap();
                 let cleared = check_before_open(&path).unwrap();
                 write_sidecar(&path, &cleared.sidecar_before_open().unwrap()).unwrap();
@@ -2204,7 +2581,7 @@ mod tests {
         }
         // Any other error keeps it, however unchanged the store.
         let (_dir, path) = a_store();
-        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         let cleared = check_before_open(&path).unwrap();
         let written = cleared.sidecar_before_open().unwrap();
         write_sidecar(&path, &written).unwrap();
@@ -2235,7 +2612,7 @@ mod tests {
     #[test]
     fn a_flock_held_by_another_descriptor_refuses_the_open_before_anything_is_written() {
         let (_dir, path) = a_store();
-        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         let holder = std::fs::File::open(&path).unwrap();
         holder.try_lock().unwrap();
         let before = fingerprints(&path);
@@ -2293,7 +2670,7 @@ mod tests {
     fn a_second_engine_on_a_held_store_is_refused_before_it_writes_the_sidecar() {
         let (_dir, path) = a_store();
         let engine = Engine::open(&path).unwrap();
-        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         let sidecar = fingerprint(&sidecar_path(&path));
         assert!(matches!(Engine::open(&path), Err(StorageError::StoreInUse(_))));
         assert!(fingerprint(&sidecar_path(&path)) == sidecar, "the sidecar was rewritten");
@@ -2307,7 +2684,7 @@ mod tests {
     fn the_lock_is_held_while_the_sidecar_is_written() {
         use redb::StorageBackend as _;
         let (_dir, path) = a_store();
-        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        with_sidecar(&path, |s| s.redb_file_format = REDB_FILE_FORMAT - 1);
         let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
         let record = std::rc::Rc::clone(&seen);
         crate::store_lock::test_hooks::BEFORE_SIDECAR_WRITE.with(|p| {

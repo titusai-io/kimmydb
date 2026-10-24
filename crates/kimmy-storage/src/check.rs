@@ -1187,7 +1187,14 @@ mod tests {
         let report = check_untouched(&path, PreviousRun::NotClean);
         assert_eq!(report.verdict, Verdict::Damaged, "{report:?}");
         assert_eq!(report.exit_code(), 65);
-        assert!(report.detail.contains("past the end of the file"), "{report:?}");
+        // Which of the two sees it first depends on how far the file reaches past
+        // its last page: the view's own refusal of a read past the end of the
+        // file, or redb's of a page past the end of its region.
+        assert!(
+            report.detail.contains("past the end of the file")
+                || report.detail.contains("extends past the end of its region"),
+            "{report:?}"
+        );
         assert!(report.detail.contains("kimmyd restore"), "{report:?}");
     }
 

@@ -321,7 +321,7 @@ fn the_sidecar_written_before_the_open_keeps_the_prior_build_until_the_reset_lan
     }
     let mut sidecar = crate::format::read_sidecar(&path_of(&dir)).expect("a sidecar");
     sidecar.written_by = "0.48.0".into();
-    sidecar.redb_version = "0.1".into();
+    sidecar.redb_file_format = crate::format::REDB_FILE_FORMAT - 1;
     crate::format::write_sidecar(&path_of(&dir), &sidecar).unwrap();
     let cleared = crate::format::check_before_open(&path_of(&dir)).unwrap();
     let before_open = cleared.sidecar_before_open().expect("the redb fields are brought up");

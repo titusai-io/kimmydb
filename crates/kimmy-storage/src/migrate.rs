@@ -71,25 +71,70 @@ fn refuse_schema(found: u8, path: &std::path::Path) -> StorageError {
     }
 }
 
-/// Record the redb major.minor in META, if it is not already what is there
-/// (ADR-190): run on the raw database during `Engine::open`, so the read-only check can refuse a clean store with no sidecar that a
-/// newer redb wrote. Never lowered: a newer version recorded there is the
-/// evidence that check reads, and `refuse_other_schema` has already stopped the open.
+/// Record the redb major.minor in META of a store that has none (ADR-190): run
+/// on the raw database during `Engine::open`, so the read-only check can refuse
+/// a clean store with no sidecar that another redb wrote.
+///
+/// **Never restamped.** A fresh store, and a restored one (which carries none of
+/// its source's), records this build's. A store that records another minor,
+/// older or newer, is refused here as it was before the open: the build's redb
+/// does not open a store another minor wrote, and rewriting the record would
+/// hide that from the next build to look.
 pub(crate) fn record_redb_version(
     db: &Database,
     build: &crate::format::BuildVersions,
+    path: &std::path::Path,
 ) -> Result<()> {
     let ours = format!("{}.{}", build.redb.0, build.redb.1);
-    let stored = stored_redb_version(db)?;
-    if stored.as_deref() == Some(ours.as_str())
-        || stored.as_deref().and_then(crate::format::major_minor).is_some_and(|v| v > build.redb)
-    {
-        return Ok(());
+    match stored_redb_version(db)? {
+        // This build's minor, a patch of it included: not a boundary.
+        Some(stored) if crate::format::major_minor(&stored) == Some(build.redb) => return Ok(()),
+        Some(stored) => return Err(refuse_redb(&stored, path, build)),
+        None => {}
     }
     let txn = db.begin_write()?;
     txn.open_table(tables::META)?.insert(crate::format::META_REDB_VERSION, ours.as_bytes())?;
     txn.commit()?;
     Ok(())
+}
+
+/// The refusal of a store whose recorded redb is not this build's minor.
+fn refuse_redb(
+    recorded: &str,
+    path: &std::path::Path,
+    build: &crate::format::BuildVersions,
+) -> StorageError {
+    match crate::format::major_minor(recorded) {
+        Some(v) if v > build.redb => StorageError::RefusedStore {
+            kind: RefusedKind::Newer,
+            why: format!(
+                "{} was last written by redb {recorded}, newer than this build's {}.{}. It had no \
+                 kimmy.format and was not shut down cleanly, so redb repaired it before that \
+                 could be read; nothing but redb's own repair and close was written. Start the \
+                 build that wrote it, or restore a backup",
+                path.display(),
+                build.redb.0,
+                build.redb.1
+            ),
+        },
+        Some(_) => StorageError::RefusedStore {
+            kind: RefusedKind::Older,
+            why: format!(
+                "{} was last written by redb {recorded}, older than this build's {}.{}. {}",
+                path.display(),
+                build.redb.0,
+                build.redb.1,
+                crate::format::redb_no_upgrade(build)
+            ),
+        },
+        None => StorageError::RefusedStore {
+            kind: RefusedKind::Damaged,
+            why: format!(
+                "{} records the redb version {recorded:?}, which is not major.minor",
+                path.display()
+            ),
+        },
+    }
 }
 
 /// The schema META records, `None` for a store with no META yet.
@@ -105,8 +150,8 @@ pub(crate) fn stored_version(db: &Database) -> Result<Option<u8>> {
 }
 
 /// Refuse a store of another schema, reading only, before the ensure-tables
-/// commit (ADR-190): a newer or an older schema, or a newer redb recorded in
-/// META. The check before the open already refused every store it could read.
+/// commit (ADR-190): a newer or an older schema, or another redb minor recorded
+/// in META. The check before the open already refused every store it could read.
 /// What reaches here is a dirty store with no sidecar, which redb has just
 /// repaired: the repair wrote, which is the gap ADR-190 documents, but the
 /// session stops here, and META still says which schema and redb wrote the store.
@@ -121,21 +166,22 @@ pub(crate) fn refuse_other_schema(
         }
         _ => {}
     }
-    if let Some(recorded) = stored_redb_version(db)?
-        && crate::format::major_minor(&recorded).is_some_and(|v| v > build.redb)
-    {
-        return Err(StorageError::RefusedStore {
-            kind: RefusedKind::Newer,
-            why: format!(
-                "{} was last written by redb {recorded}, newer than this build's {}.{}. It had no \
-                 kimmy.format and was not shut down cleanly, so redb repaired it before that \
-                 could be read; nothing but redb's own repair and close was written. Start the \
-                 build that wrote it, or restore a backup",
-                path.display(),
-                build.redb.0,
-                build.redb.1
-            ),
-        });
+    match stored_redb_version(db)? {
+        Some(recorded) if recorded != format!("{}.{}", build.redb.0, build.redb.1) => {
+            // A patch recorded is not a boundary: compare major.minor.
+            if crate::format::major_minor(&recorded) != Some(build.redb) {
+                return Err(refuse_redb(&recorded, path, build));
+            }
+        }
+        // A store with a schema and no redb version was not written by this
+        // build, which records it on every open: damaged, not stamped.
+        None if stored_version(db)?.is_some() => {
+            return Err(StorageError::RefusedStore {
+                kind: RefusedKind::Damaged,
+                why: format!("{} records a storage schema and no redb version", path.display()),
+            });
+        }
+        _ => {}
     }
     Ok(())
 }

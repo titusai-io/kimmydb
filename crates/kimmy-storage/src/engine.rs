@@ -1350,7 +1350,18 @@ impl Engine {
         // have to handle a missing table.
         let txn = db.begin_write()?;
         {
-            let _ = txn.open_table(tables::META)?;
+            {
+                // The redb that writes this store, recorded in the first commit
+                // that makes META and before the schema: a store this build wrote
+                // therefore never holds a schema without it, whichever commit a
+                // stop falls after. `refuse_other_schema` has just run, so what
+                // reaches here records this build's minor or nothing.
+                let mut meta = txn.open_table(tables::META)?;
+                if meta.get(crate::format::META_REDB_VERSION)?.is_none() {
+                    let ours = format!("{}.{}", cleared.build.redb.0, cleared.build.redb.1);
+                    meta.insert(crate::format::META_REDB_VERSION, ours.as_bytes())?;
+                }
+            }
             let _ = txn.open_table(tables::DATABASES)?;
             let _ = txn.open_table(tables::COLLECTIONS)?;
             let _ = txn.open_table(tables::DOCS)?;
@@ -1390,16 +1401,24 @@ impl Engine {
             )?;
         }
         txn.commit()?;
+        #[cfg(test)]
+        if crate::hold_meter::test_hooks::STOP_OPEN_AFTER.with(|s| s.get()) == Some("tables") {
+            return Err(StorageError::Database("stopped after the tables".into()));
+        }
 
         // A fresh store is stamped with this build's schema.
         let build = cleared.build.clone();
         crate::migrate::run(&db, path, &|schema| {
             crate::format::raise_schema(path, schema, &build)
         })?;
+        #[cfg(test)]
+        if crate::hold_meter::test_hooks::STOP_OPEN_AFTER.with(|s| s.get()) == Some("schema") {
+            return Err(StorageError::Database("stopped after the schema".into()));
+        }
         // The redb that last opened this store for writing, in the store too,
         // so a clean store whose sidecar is gone is still refused by an older
         // redb's build.
-        crate::migrate::record_redb_version(&db, &build)?;
+        crate::migrate::record_redb_version(&db, &build, path)?;
         crate::format::reconcile_after_open(path, crate::migrate::stored_version(&db)?, &build);
 
         // The arrival index is derived from the oplog, so a database written
@@ -8376,7 +8395,9 @@ mod clearing {
         let path = p_dir.path().join("kimmy.redb");
         let p = super::Engine::open(&path).unwrap();
         let t = a.create_collection("shop", "t").unwrap();
-        let docs: Vec<bson::Document> = (0..5_000i64).map(|i| doc! {"_id": i}).collect();
+        // A count that does not leave the file next to one of redb's growth steps: the
+        // bound below is on growth, and a store a commit smaller or larger can sit on one.
+        let docs: Vec<bson::Document> = (0..6_000i64).map(|i| doc! {"_id": i}).collect();
         a.insert_many(&t, docs).unwrap();
 
         let mut progress = crate::snapshot::SnapshotProgress::whole_database();

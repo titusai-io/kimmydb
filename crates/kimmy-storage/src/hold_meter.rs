@@ -930,6 +930,11 @@ pub(crate) mod test_hooks {
         /// The backend call the next engine open on this thread fails once,
         /// armed before redb's open runs.
         pub static ARM_AT_OPEN: Cell<Option<&'static str>> = const { Cell::new(None) };
+        /// Where the next engine open on this thread stops, as a kill would:
+        /// `"tables"` after the ensure-tables commit, `"schema"` after the
+        /// schema's. The open then returns an error and leaves the store as that
+        /// commit left it.
+        pub static STOP_OPEN_AFTER: Cell<Option<&'static str>> = const { Cell::new(None) };
     }
 
     /// A released hold: who held it, what was metered, the CPU over the hold,
