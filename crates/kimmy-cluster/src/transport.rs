@@ -1457,6 +1457,9 @@ pub(crate) async fn dial(
 pub(crate) struct Dialled {
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     their_node: kimmy_core::NodeId,
+    /// When the dial finished: how long the stream has been held is what decides
+    /// whether it is trusted ([`HELD_STREAM_MAX_AGE`]).
+    at: Instant,
 }
 
 /// [`dial`] as a task's whole body, for a tick that dials its peers together. Owns
@@ -1467,8 +1470,16 @@ pub(crate) async fn dial_for_round(
     secret: String,
 ) -> Result<Dialled, ProtocolError> {
     let (stream, their_node) = dial(&engine, peer, &secret).await?;
-    Ok(Dialled { stream, their_node })
+    Ok(Dialled { stream, their_node, at: Instant::now() })
 }
+
+/// How long a dialled stream may be held before its round and still be used as it
+/// is. A peer that froze, or whose host went, after the dial finished leaves a
+/// stream that looks alive and answers nothing, and a round on it waits out
+/// [`REQUEST_TIMEOUT`] (30 s), where a dial to the same peer fails in
+/// [`CONNECT_TIMEOUT`]. Older than the bound a dial itself is given, the stream
+/// is dialled again first: what the dial knew of the peer is no longer news.
+pub(crate) const HELD_STREAM_MAX_AGE: Duration = CONNECT_TIMEOUT;
 
 /// Whether a stream held idle has been ended from the far end: a read that is ready
 /// at once, with the end of the stream, an error or bytes nobody asked for. A peer
@@ -1483,10 +1494,12 @@ fn held_stream_is_gone<S: AsyncRead + Unpin>(stream: &mut S) -> bool {
 }
 
 /// [`sync_once_with`] over a connection dialled earlier in the tick. It waited for
-/// the rounds ahead of it; if the peer ended it meanwhile (it restarted, or its
-/// side went away), it is dialled once more, here, before the round, so that a
-/// peer that is up is not recorded as having failed for a connection that was
-/// only old. A dial that fails after that is the round's failure, as for any dial.
+/// the rounds ahead of it. If the peer ended it meanwhile (it restarted, or its
+/// side went away), or it has been held longer than [`HELD_STREAM_MAX_AGE`], it is
+/// dialled once more, here, before the round: a peer that is up is not recorded
+/// as having failed for a connection that was only old, and one that froze while
+/// the stream waited costs a dial's bound and not a request's. A dial that fails
+/// after that is the round's failure, as for any dial.
 pub(crate) async fn sync_once_dialled(
     engine: &Engine,
     peer: SocketAddr,
@@ -1495,9 +1508,25 @@ pub(crate) async fn sync_once_dialled(
     stalls: &mut PeerStalls,
     dialled: Dialled,
 ) -> Result<SyncOutcome, ProtocolError> {
-    let Dialled { mut stream, mut their_node } = dialled;
-    if held_stream_is_gone(&mut stream) {
-        debug!(%peer, "a connection dialled for this tick was ended while it waited; dialling again");
+    sync_once_dialled_within(engine, peer, secret, probe, stalls, dialled, HELD_STREAM_MAX_AGE)
+        .await
+}
+
+/// [`sync_once_dialled`] with `max_age` for [`HELD_STREAM_MAX_AGE`], for a test that
+/// cannot hold a stream for five seconds.
+async fn sync_once_dialled_within(
+    engine: &Engine,
+    peer: SocketAddr,
+    secret: &str,
+    probe: Option<DivergenceProbe>,
+    stalls: &mut PeerStalls,
+    dialled: Dialled,
+    max_age: Duration,
+) -> Result<SyncOutcome, ProtocolError> {
+    let Dialled { mut stream, mut their_node, at } = dialled;
+    let old = at.elapsed() > max_age;
+    if old || held_stream_is_gone(&mut stream) {
+        debug!(%peer, old, "a connection dialled for this tick is not used as it is; dialling again");
         close(&mut stream).await;
         (stream, their_node) = dial(engine, peer, secret).await?;
     }
@@ -10804,9 +10833,17 @@ mod tests {
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
         let dialled = dial_for_round_on(&b, addr, CLOSING_SECRET).await.expect("the dial");
         tokio::time::sleep(HANDSHAKE_TIMEOUT + Duration::from_secs(2)).await;
-        sync_once_dialled(&b, addr, CLOSING_SECRET, None, &mut PeerStalls::new(), dialled)
-            .await
-            .expect("the round over the held stream");
+        sync_once_dialled_within(
+            &b,
+            addr,
+            CLOSING_SECRET,
+            None,
+            &mut PeerStalls::new(),
+            dialled,
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("the round over the held stream");
         assert!(b.get_collection("shop", "orders").is_ok(), "the round replicated");
     }
 
@@ -10817,7 +10854,64 @@ mod tests {
         secret: &str,
     ) -> Result<Dialled, ProtocolError> {
         let (stream, their_node) = dial(engine, peer, secret).await?;
-        Ok(Dialled { stream, their_node })
+        Ok(Dialled { stream, their_node, at: Instant::now() })
+    }
+
+    /// A TCP relay in front of `to`: the address to dial, and the task of each
+    /// connection it has relayed (aborting one ends that connection from the far
+    /// side, as a peer that went away would).
+    async fn relay_to(
+        to: SocketAddr,
+    ) -> (SocketAddr, Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>) {
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let relayed: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let keep = Arc::clone(&relayed);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut from, _)) = relay.accept().await else { return };
+                let link = tokio::spawn(async move {
+                    if let Ok(mut to) = TcpStream::connect(to).await {
+                        let _ = tokio::io::copy_bidirectional(&mut from, &mut to).await;
+                    }
+                });
+                keep.lock().push(link);
+            }
+        });
+        (relay_addr, relayed)
+    }
+
+    /// **A stream held past the bound is dialled again, though nothing ended it.** A
+    /// peer that froze after the dial leaves a stream that looks alive, and a round
+    /// on it waits out the request timeout where a dial fails at the connect bound.
+    #[tokio::test]
+    async fn a_stream_held_past_the_bound_is_dialled_again() {
+        let (a, _a_dir, addr, _served) = serving_counted().await;
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let (relay_addr, relayed) = relay_to(addr).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        for (held, connections) in [(Duration::from_secs(3600), 1), (Duration::ZERO, 2)] {
+            let dialled = dial_for_round_on(&b, relay_addr, CLOSING_SECRET).await.unwrap();
+            let before = relayed.lock().len();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            sync_once_dialled_within(
+                &b,
+                relay_addr,
+                CLOSING_SECRET,
+                None,
+                &mut PeerStalls::new(),
+                dialled,
+                held,
+            )
+            .await
+            .unwrap();
+            let made = relayed.lock().len() - before + 1;
+            assert_eq!(made, connections, "with a bound of {held:?}");
+            relayed.lock().clear();
+        }
     }
 
     /// **A stream the peer ended while it waited is dialled again, and the round
@@ -10832,22 +10926,7 @@ mod tests {
         let orders = a.create_collection("shop", "orders").unwrap();
         a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
 
-        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let relay_addr = relay.local_addr().unwrap();
-        let relayed: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
-            Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let keep = Arc::clone(&relayed);
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut from, _)) = relay.accept().await else { return };
-                let link = tokio::spawn(async move {
-                    if let Ok(mut to) = TcpStream::connect(addr).await {
-                        let _ = tokio::io::copy_bidirectional(&mut from, &mut to).await;
-                    }
-                });
-                keep.lock().push(link);
-            }
-        });
+        let (relay_addr, relayed) = relay_to(addr).await;
 
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
