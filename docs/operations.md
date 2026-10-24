@@ -2622,8 +2622,9 @@ you move or copy a data directory.
   opening it.
 - A clean store copied without its sidecar is still checked: the build reads
   the schema and redb version from the database without writing. A store that
-  records a schema and no redb version is refused as damaged, because every
-  start of this build records it.
+  records a schema and no redb version is refused as damaged: this build records
+  the redb version in the first commit of a store, ahead of the schema, and in the
+  data commit of a restore, so no stop of a first start or a restore leaves one.
 - **An unreadable `kimmy.format` refuses the start.** Restore the file from the
   source directory or from the backup. Don't delete it: it records which builds
   may open the store, and without it the check falls back to the weaker

@@ -514,13 +514,20 @@ pub fn restore_with(
                     marked += 1;
                 }
             }
+            // The redb version, in the same commit as the schema the data holds
+            // (the source's own record was skipped above): a stop after this
+            // commit leaves a store that opens, never a schema without it.
+            meta.insert(
+                crate::format::META_REDB_VERSION,
+                format!("{}.{}", build.redb.0, build.redb.1).as_bytes(),
+            )?;
         }
         txn.commit()?;
     }
     // The sidecar is regenerated, never carried: this build's redb wrote the
     // file, and the schema is what the restored META says (ADR-190). The
-    // backup format does not change.
-    crate::migrate::record_redb_version(&db, build, path)?;
+    // backup format does not change. META already records this build's redb,
+    // written in the data commit above.
     let schema = crate::migrate::stored_version(&db)?.unwrap_or(0);
     crate::format::write_sidecar(path, &crate::format::stamp(schema, build))?;
 
@@ -609,6 +616,34 @@ mod tests {
         engine.create_index("shop", "orders", vec![field("qty")], false, None).unwrap();
         engine.drop_index("shop", "orders", "qty_1").unwrap();
         (engine, dir)
+    }
+
+    /// The restore commits the data with the redb version in the same
+    /// transaction, so a stop before the sidecar is written leaves a store that
+    /// opens (a schema with no redb version is refused as damaged, and used to be
+    /// reachable here: the version was recorded in a commit of its own).
+    #[test]
+    fn a_restore_stopped_before_its_sidecar_leaves_a_store_that_opens() {
+        let (engine, _dir) = populated();
+        let mut buf = Vec::new();
+        engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let path = dest.path().join("restored.redb");
+        restore(&path, &mut buf.as_slice()).unwrap();
+        // The state after the data commit and before the sidecar: no sidecar.
+        std::fs::remove_file(crate::format::sidecar_path(&path)).unwrap();
+        {
+            let db = redb::Builder::new().open_read_only(&path).unwrap();
+            let txn = db.begin_read().unwrap();
+            let meta = txn.open_table(tables::META).unwrap();
+            assert!(meta.get(tables::META_FORMAT_VERSION).unwrap().is_some(), "a schema");
+            assert!(
+                meta.get(crate::format::META_REDB_VERSION).unwrap().is_some(),
+                "and the redb that wrote it"
+            );
+        }
+        crate::format::check_before_open(&path).expect("the check passes");
+        Engine::open(&path).expect("the store opens");
     }
 
     #[test]

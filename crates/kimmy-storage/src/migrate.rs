@@ -87,7 +87,8 @@ pub(crate) fn record_redb_version(
 ) -> Result<()> {
     let ours = format!("{}.{}", build.redb.0, build.redb.1);
     match stored_redb_version(db)? {
-        Some(stored) if stored == ours => return Ok(()),
+        // This build's minor, a patch of it included: not a boundary.
+        Some(stored) if crate::format::major_minor(&stored) == Some(build.redb) => return Ok(()),
         Some(stored) => return Err(refuse_redb(&stored, path, build)),
         None => {}
     }
