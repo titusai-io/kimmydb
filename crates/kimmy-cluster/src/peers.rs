@@ -12,8 +12,11 @@ use tracing::{Instrument, debug, error, info, warn};
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
 use crate::membership::Members;
+use crate::protocol::ProtocolError;
 use crate::repair_ledger::Judged;
-use crate::transport::{DivergenceProbe, PeerStalls, Repair, sync_once_with};
+use crate::transport::{
+    Dialled, DivergenceProbe, PeerStalls, Repair, dial_for_round, sync_once_dialled, sync_once_with,
+};
 
 /// How often to run a round against every known peer.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -748,6 +751,61 @@ fn early_retry_delay(peerless_ticks: u32, interval: Duration) -> Option<Duration
     (delay < interval).then_some(delay)
 }
 
+/// What the first pull of a contact is charged for the dial that came before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialCharge {
+    /// The pull dialled its own connection, inside its clock.
+    None,
+    /// The dial succeeded, in this long (measured by the dial itself).
+    Made(Duration),
+    /// The dial failed; the round waited this long for it.
+    Failed(Duration),
+}
+
+/// How long a pull took, for `Contact::pulled` and `fits_before`: the round, and the
+/// dial's own time added to it. The round's clock starts when the dial is in hand, so
+/// a dial the round waited for is not counted twice, and one that finished early is
+/// not left out.
+fn pull_took(round: Duration, dial: DialCharge) -> Duration {
+    match dial {
+        DialCharge::None => round,
+        DialCharge::Made(dial) | DialCharge::Failed(dial) => round + dial,
+    }
+}
+
+/// One dial a tick started: its result is the connection, ready for the round.
+/// Aborts the dial when dropped, whether or not it is being awaited: a round that is
+/// waiting for its dial when the loop ends takes the dial with it, which a bare
+/// `JoinHandle` would not (dropping one detaches the task).
+struct DialTask(tokio::task::JoinHandle<Result<Dialled, ProtocolError>>);
+
+impl std::future::Future for DialTask {
+    type Output = Result<Result<Dialled, ProtocolError>, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl Drop for DialTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The dials a tick started, by peer, each taken when that peer's round begins.
+#[derive(Default)]
+struct DialsInFlight(BTreeMap<SocketAddr, DialTask>);
+
+impl DialsInFlight {
+    fn take(&mut self, peer: &SocketAddr) -> Option<DialTask> {
+        self.0.remove(peer)
+    }
+}
+
 /// Run anti-entropy against known peers, forever.
 pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut discovered: BTreeSet<SocketAddr> = BTreeSet::new();
@@ -1164,8 +1222,38 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // Every peer this tick has contacted or queued, so a peer added when a
                 // snapshot is set aside is one that was not already going to be asked.
                 let mut tried: BTreeSet<SocketAddr> = chosen.iter().copied().collect();
+                // Every chosen peer is dialled now, together, and its round runs
+                // when its turn comes. The dials were one after the other with the
+                // rounds, so each peer that did not answer cost its whole dial
+                // timeout (5 s) in front of every peer behind it, and three of them
+                // held the tick, discovery's join and the round's report for
+                // fifteen. Now the tick waits for the longest, once. The rounds
+                // stay in order and one at a time: they share `stalls` and queue
+                // for the single writer, and it is the dial that waits on a peer.
+                // Aborted with the tick, so a dial still running when it ends does
+                // not outlive it.
                 let mut draining: VecDeque<Contact> =
                     chosen.into_iter().map(Contact::new).collect();
+                let mut dialling = DialsInFlight::default();
+                for contact in &draining {
+                    // Its own span, not the contact's: the contact's `cluster.sync` span
+                    // opens at its first pull (the doc on `Contact::span`), and one made
+                    // here would count the time this peer waited behind the others.
+                    let dial = dial_for_round(
+                        Arc::clone(&engine),
+                        contact.peer,
+                        config.secret.clone(),
+                    )
+                    .instrument(tracing::info_span!(
+                        "cluster.dial",
+                        otel.kind = "client",
+                        peer = %contact.peer
+                    ));
+                    // UNSUPERVISED: one dial, whose end is the result its round awaits; a
+                    // panic in it is that round's failure, and the guard aborts it with the tick.
+                    let task = DialTask(tokio::spawn(dial));
+                    dialling.0.insert(contact.peer, task);
+                }
                 // Contacts whose `BeyondHorizon` was set aside (ADR-224), asked again
                 // when everything else in the tick has finished, a truncated contact
                 // still draining included.
@@ -1211,12 +1299,59 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
                     let span = contact.span();
+                    // The first pull of a contact goes over the connection dialled
+                    // at the top of the tick; a further pull of a drain, and a peer
+                    // asked again after a set-aside, dial their own. The dial was
+                    // made beside the loop, so the round's clock starts when it is in
+                    // hand, and what the pull is charged for the dial is the dial's
+                    // own time (`pull_took`), whether it finished long before this
+                    // turn or was waited for here: the contact's next pull pays a
+                    // dial, and `fits_before` judges it by this one.
+                    let waiting_from = Instant::now();
+                    let dial = match dialling.take(&peer) {
+                        Some(dial) => Some(dial.await),
+                        None => None,
+                    };
+                    let waited = waiting_from.elapsed();
                     let started = Instant::now();
-                    let pulled =
-                        sync_once_with(&engine, peer, &config.secret, probe.clone(), &mut stalls)
+                    let mut dialled_in = DialCharge::None;
+                    let pulled = match dial {
+                        Some(dial) => match dial {
+                            Ok(Ok(dialled)) => {
+                                dialled_in = DialCharge::Made(dialled.dial_took());
+                                sync_once_dialled(
+                                    &engine,
+                                    peer,
+                                    &config.secret,
+                                    probe.clone(),
+                                    &mut stalls,
+                                    dialled,
+                                )
+                                .instrument(span)
+                                .await
+                            }
+                            Ok(Err(e)) => {
+                                dialled_in = DialCharge::Failed(waited);
+                                Err(e)
+                            }
+                            Err(e) => {
+                                dialled_in = DialCharge::Failed(waited);
+                                Err(std::io::Error::other(format!("dialling {peer}: {e}")).into())
+                            }
+                        },
+                        None => {
+                            sync_once_with(
+                                &engine,
+                                peer,
+                                &config.secret,
+                                probe.clone(),
+                                &mut stalls,
+                            )
                             .instrument(span)
-                            .await;
-                    let took = started.elapsed();
+                            .await
+                        }
+                    };
+                    let took = pull_took(started.elapsed(), dialled_in);
                     // Taken whether the round succeeded or not: a window
                     // applied before a failure later in the round is work
                     // done, and the pull series must not lose it in exactly
@@ -3227,6 +3362,152 @@ mod tests {
         looping.abort();
         assert_eq!(got, Some(offered), "the offer arrived");
         assert!(still_blocked, "while the tick was still stuck, not after it");
+    }
+
+    /// **A peer that does not answer costs the tick its dial timeout once, not once
+    /// per such peer.** Two listeners accept the connection and say nothing, so each
+    /// dial waits out the TLS bound (5 s); the third peer answers. The dials were one
+    /// after the other with the rounds, so the second silent peer was dialled 5 s
+    /// after the first and the tick took ten; they are together now, so both see
+    /// their connection at the same time and the tick ends after one bound. Real
+    /// time, since the bound is a real timeout on a real socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peers_that_do_not_answer_are_waited_for_together_and_not_one_after_the_other() {
+        async fn silent() -> (SocketAddr, tokio::task::JoinHandle<Instant>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen = tokio::spawn(async move {
+                let (held, _) = listener.accept().await.unwrap();
+                let at = Instant::now();
+                // Held open, never spoken to, until the test ends.
+                tokio::spawn(async move {
+                    let _held = held;
+                    std::future::pending::<()>().await;
+                });
+                at
+            });
+            (addr, seen)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let healthy_dir = tempfile::tempdir().unwrap();
+        let healthy_engine =
+            Arc::new(Engine::open(&healthy_dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy = listener.local_addr().unwrap();
+        let serving =
+            tokio::spawn(crate::transport::serve(healthy_engine, listener, "a-secret".to_string()));
+        let (first, first_seen) = silent().await;
+        let (second, second_seen) = silent().await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Instant, RoundReport)>();
+        let local = "127.0.0.1:1".parse().unwrap();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![])], "a-secret".into(), local);
+        config.sync_interval = Duration::from_secs(60);
+        config.discovery_interval = Duration::from_secs(600);
+        config.resolver = Some(Arc::new(move || {
+            Box::pin(async move { BTreeSet::from([first, second, healthy]) })
+        }));
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send((Instant::now(), report));
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&engine), config));
+
+        let first_at = tokio::time::timeout(Duration::from_secs(20), first_seen)
+            .await
+            .expect("the first silent peer was dialled")
+            .unwrap();
+        let second_at = tokio::time::timeout(Duration::from_secs(20), second_seen)
+            .await
+            .expect("the second silent peer was dialled")
+            .unwrap();
+        let apart = if second_at > first_at { second_at - first_at } else { first_at - second_at };
+        // The tick that has all three: the first may have found nobody yet.
+        let (ended, report) = loop {
+            let (at, report) = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                .await
+                .expect("a tick with the three peers ended")
+                .unwrap();
+            if report.peers_known == 3 {
+                break (at, report);
+            }
+        };
+        looping.abort();
+        serving.abort();
+        assert!(apart < Duration::from_secs(2), "dialled {apart:?} apart, one after the other");
+        assert_eq!(report.failed, 2, "the two silent peers failed: {report:?}");
+        let took = ended - first_at.min(second_at);
+        assert!(
+            took < Duration::from_secs(8),
+            "the tick took {took:?}: two bounds of 5 s one after the other, not one"
+        );
+    }
+
+    /// **A dial still running when the loop ends is aborted with it.** The tick
+    /// dials its peers beside the round, and the guard that holds the dials aborts
+    /// them when the loop's future is dropped; without it the dial goes on, holding
+    /// its socket, until its own 5 s bound. A silent listener accepts the connection
+    /// and the loop is aborted while that dial waits on it: the listener must see the
+    /// connection end (EOF) well before the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dial_in_flight_ends_with_the_loop() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = listener.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let local = "127.0.0.1:1".parse().unwrap();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![])], "a-secret".into(), local);
+        config.sync_interval = Duration::from_secs(60);
+        config.discovery_interval = Duration::from_secs(600);
+        config.resolver = Some(Arc::new(move || Box::pin(async move { BTreeSet::from([silent]) })));
+        let looping = tokio::spawn(replicate(engine, config));
+        let (mut held, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
+            .await
+            .expect("the loop dialled the silent listener")
+            .unwrap();
+        let aborted = Instant::now();
+        looping.abort();
+        let _ = looping.await;
+        // The dial's ClientHello arrives first; the end of the connection is what is read for.
+        let ended = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut buf = [0u8; 4096];
+            loop {
+                match held.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "the dial was still holding its connection {:?} after the loop ended",
+            aborted.elapsed()
+        );
+    }
+
+    /// What a first pull is charged for its dial is the dial's own time, added once:
+    /// a dial that finished before the round's turn and one the round waited for cost
+    /// the same, since the round's clock starts when the dial is in hand.
+    #[test]
+    fn a_first_pull_is_charged_its_dials_own_time_once() {
+        let round = Duration::from_millis(20);
+        let dial = Duration::from_millis(80);
+        // Finished long before the turn, or awaited at it: the dial's time is the same.
+        assert_eq!(pull_took(round, DialCharge::Made(dial)), Duration::from_millis(100));
+        // A pull that dialled for itself had the dial inside its clock already.
+        assert_eq!(
+            pull_took(Duration::from_millis(100), DialCharge::None),
+            Duration::from_millis(100)
+        );
+        // A dial that failed is what the round waited for it.
+        assert_eq!(
+            pull_took(Duration::ZERO, DialCharge::Failed(Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
     }
 
     /// **A resolver that never answers holds up neither the sync ticks nor the

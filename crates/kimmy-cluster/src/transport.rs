@@ -1689,6 +1689,120 @@ pub(crate) async fn dial(
     Ok((stream, their_node))
 }
 
+/// A connection [`dial`] opened for a round that has not started: dialled with the
+/// tick's other peers at once, and used when its peer's turn comes.
+pub(crate) struct Dialled {
+    stream: tokio_rustls::client::TlsStream<TcpStream>,
+    their_node: kimmy_core::NodeId,
+    /// When the dial finished: how long the stream has been held is what decides
+    /// whether it is trusted ([`HELD_STREAM_MAX_AGE`]).
+    at: Instant,
+    /// How long the dial took, which the contact's first pull is charged with as
+    /// when the dial was made inside it (the next pull's estimate counts a dial).
+    took: Duration,
+}
+
+impl Dialled {
+    pub(crate) fn dial_took(&self) -> Duration {
+        self.took
+    }
+}
+
+/// [`dial`] as a task's whole body, for a tick that dials its peers together. Owns
+/// what it needs, so it can run beside the loop that will use the result.
+pub(crate) async fn dial_for_round(
+    engine: Arc<Engine>,
+    peer: SocketAddr,
+    secret: String,
+) -> Result<Dialled, ProtocolError> {
+    let started = Instant::now();
+    let (stream, their_node) = dial(&engine, peer, &secret).await?;
+    let at = Instant::now();
+    Ok(Dialled { stream, their_node, at, took: at.duration_since(started) })
+}
+
+/// How long a dialled stream may be held before its round and still be used as it
+/// is. A peer that froze, or whose host went, after the dial finished leaves a
+/// stream that looks alive and answers nothing, and a round on it waits out
+/// [`REQUEST_TIMEOUT`] (30 s), where a dial to the same peer fails in
+/// [`CONNECT_TIMEOUT`]. Older than the bound a dial itself is given, the stream
+/// is dialled again first: what the dial knew of the peer is no longer news.
+pub(crate) const HELD_STREAM_MAX_AGE: Duration = CONNECT_TIMEOUT;
+
+/// Whether a stream held idle has been ended from the far end: a read that is ready
+/// at once, with the end of the stream, an error or bytes nobody asked for. A peer
+/// sends nothing between rounds, so a stream that is alive has nothing to read.
+///
+/// **Two things that would make a dead stream read as alive, and what is done
+/// about each.** (1) Tokio's co-operative budget: a task that has spent it gets
+/// `Pending` from a socket read without the socket being looked at, so the poll is
+/// `unconstrained`, and the task yields first, which also refills the budget.
+/// (2) Tokio's readiness is cached, and learns of a close when the I/O driver
+/// processes the event; the yield gives the driver its turn at the scheduler, but
+/// does not promise it. A close the driver has not yet seen reads as alive, and the
+/// round on that stream fails and backs off, as it would have before the stream
+/// was pre-dialled.
+///
+/// **Why not a kernel `recv(MSG_PEEK | MSG_DONTWAIT)`**, which has no cache. It
+/// would be sound here: the dial reads the server's session tickets before it reads
+/// `Welcome`, so nothing unasked-for is waiting on a healthy held stream, and bytes
+/// or an end on it (a `close_notify` included) do mean the peer is gone. It is not
+/// used because it needs either `unsafe` (this crate has none) or a socket library's
+/// `peek` on the raw socket (a dependency, added for keepalive in another change),
+/// to close a gap whose cost, when it opens, is one failed round and a back-off.
+/// Reading through the TLS layer needs neither.
+async fn held_stream_is_gone<S: AsyncRead + Unpin>(stream: &mut S) -> bool {
+    use std::future::Future;
+    use tokio::io::AsyncReadExt;
+    tokio::task::yield_now().await;
+    let mut byte = [0u8; 1];
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut read = std::pin::pin!(tokio::task::unconstrained(stream.read(&mut byte)));
+    read.as_mut().poll(&mut cx).is_ready()
+}
+
+/// [`sync_once_with`] over a connection dialled earlier in the tick. It waited for
+/// the rounds ahead of it. If the peer ended it meanwhile (it restarted, or its
+/// side went away), or it has been held longer than [`HELD_STREAM_MAX_AGE`], it is
+/// dialled once more, here, before the round: a peer that is up is not recorded
+/// as having failed for a connection that was only old, and one that froze while
+/// the stream waited costs a dial's bound and not a request's. A dial that fails
+/// after that is the round's failure, as for any dial.
+pub(crate) async fn sync_once_dialled(
+    engine: &Engine,
+    peer: SocketAddr,
+    secret: &str,
+    probe: Option<DivergenceProbe>,
+    stalls: &mut PeerStalls,
+    dialled: Dialled,
+) -> Result<SyncOutcome, ProtocolError> {
+    sync_once_dialled_within(engine, peer, secret, probe, stalls, dialled, HELD_STREAM_MAX_AGE)
+        .await
+}
+
+/// [`sync_once_dialled`] with `max_age` for [`HELD_STREAM_MAX_AGE`], for a test that
+/// cannot hold a stream for five seconds.
+async fn sync_once_dialled_within(
+    engine: &Engine,
+    peer: SocketAddr,
+    secret: &str,
+    probe: Option<DivergenceProbe>,
+    stalls: &mut PeerStalls,
+    dialled: Dialled,
+    max_age: Duration,
+) -> Result<SyncOutcome, ProtocolError> {
+    let Dialled { mut stream, mut their_node, at, .. } = dialled;
+    let old = at.elapsed() > max_age;
+    if old || held_stream_is_gone(&mut stream).await {
+        debug!(%peer, old, "a connection dialled for this tick is not used as it is; dialling again");
+        close(&mut stream).await;
+        (stream, their_node) = dial(engine, peer, secret).await?;
+    }
+    let outcome = sync_over(engine, &mut stream, peer, their_node, probe, stalls).await;
+    close(&mut stream).await;
+    outcome
+}
+
 /// Say, once per process, that a contact was with a node that has this node's id.
 ///
 /// Two things look the same from here: a seed that names **this** node by an
@@ -11423,6 +11537,183 @@ mod tests {
             .unwrap();
         assert_eq!(failures, [ServeFailure::Timeout]);
         drop(stream);
+    }
+
+    /// A dialled stream held while the rounds ahead of it ran still carries its
+    /// round: the serving side's idle bound (300 s) is far above what a tick holds a
+    /// stream for, and this holds one past the longest of the dialler's bounds that
+    /// could be mistaken for it (the 10 s of the handshake).
+    #[tokio::test]
+    async fn a_dialled_stream_held_idle_carries_its_round() {
+        let (a, _a_dir, addr, _served) = serving_counted().await;
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let dialled = dial_for_round_on(&b, addr, CLOSING_SECRET).await.expect("the dial");
+        tokio::time::sleep(HANDSHAKE_TIMEOUT + Duration::from_secs(2)).await;
+        sync_once_dialled_within(
+            &b,
+            addr,
+            CLOSING_SECRET,
+            None,
+            &mut PeerStalls::new(),
+            dialled,
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("the round over the held stream");
+        assert!(b.get_collection("shop", "orders").is_ok(), "the round replicated");
+    }
+
+    /// `dial_for_round` for a test that holds an engine and not an `Arc` of one.
+    async fn dial_for_round_on(
+        engine: &Engine,
+        peer: SocketAddr,
+        secret: &str,
+    ) -> Result<Dialled, ProtocolError> {
+        let (stream, their_node) = dial(engine, peer, secret).await?;
+        Ok(Dialled { stream, their_node, at: Instant::now(), took: Duration::ZERO })
+    }
+
+    /// A TCP relay in front of `to`: the address to dial, and the task of each
+    /// connection it has relayed (aborting one ends that connection from the far
+    /// side, as a peer that went away would).
+    async fn relay_to(
+        to: SocketAddr,
+    ) -> (SocketAddr, Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>) {
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let relayed: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let keep = Arc::clone(&relayed);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut from, _)) = relay.accept().await else { return };
+                let link = tokio::spawn(async move {
+                    if let Ok(mut to) = TcpStream::connect(to).await {
+                        let _ = tokio::io::copy_bidirectional(&mut from, &mut to).await;
+                    }
+                });
+                keep.lock().push(link);
+            }
+        });
+        (relay_addr, relayed)
+    }
+
+    /// **A stream held past the bound is dialled again, though nothing ended it.** A
+    /// peer that froze after the dial leaves a stream that looks alive, and a round
+    /// on it waits out the request timeout where a dial fails at the connect bound.
+    #[tokio::test]
+    async fn a_stream_held_past_the_bound_is_dialled_again() {
+        let (a, _a_dir, addr, _served) = serving_counted().await;
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let (relay_addr, relayed) = relay_to(addr).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        for (held, connections) in [(Duration::from_secs(3600), 1), (Duration::ZERO, 2)] {
+            let dialled = dial_for_round_on(&b, relay_addr, CLOSING_SECRET).await.unwrap();
+            let before = relayed.lock().len();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            sync_once_dialled_within(
+                &b,
+                relay_addr,
+                CLOSING_SECRET,
+                None,
+                &mut PeerStalls::new(),
+                dialled,
+                held,
+            )
+            .await
+            .unwrap();
+            let made = relayed.lock().len() - before + 1;
+            assert_eq!(made, connections, "with a bound of {held:?}");
+            relayed.lock().clear();
+        }
+    }
+
+    /// **A stream the peer ended while it waited is dialled again, and the round
+    /// goes on without a failure.** The dialler's connection runs through a relay;
+    /// the relay's first connection is dropped after the dial, as a peer that
+    /// restarted or went away would, and its second goes through. The held stream
+    /// reads as gone, and the round over it succeeds (it would be an I/O error
+    /// without the second dial, and the peer would be backed off as failed).
+    #[tokio::test]
+    async fn a_stream_the_peer_ended_while_it_waited_is_dialled_again() {
+        let (a, _a_dir, addr, _served) = serving_counted().await;
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+
+        let (relay_addr, relayed) = relay_to(addr).await;
+
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let mut dialled =
+            dial_for_round_on(&b, relay_addr, CLOSING_SECRET).await.expect("the dial");
+        assert!(
+            !held_stream_is_gone(&mut dialled.stream).await,
+            "premise: a live stream is not gone"
+        );
+        let first = relayed.lock().pop().expect("the relay's first connection");
+        first.abort();
+        let _ = first.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(held_stream_is_gone(&mut dialled.stream).await, "the ended stream reads as gone");
+
+        sync_once_dialled(&b, relay_addr, CLOSING_SECRET, None, &mut PeerStalls::new(), dialled)
+            .await
+            .expect("the round, over a second dial");
+        assert!(b.get_collection("shop", "orders").is_ok(), "the round replicated");
+        assert_eq!(relayed.lock().len(), 1, "one more connection was made, once");
+    }
+
+    /// **The ended-stream check holds with the task's co-operative budget spent.**
+    /// Tokio answers a socket read `Pending` without looking at the socket once the
+    /// task has used its budget, so a stream the peer had closed read as alive
+    /// exactly when the previous round had used the last unit.
+    #[tokio::test]
+    async fn an_ended_stream_reads_as_gone_with_the_coop_budget_spent() {
+        let (_a, _a_dir, addr, _served) = serving_counted().await;
+        let (relay_addr, relayed) = relay_to(addr).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let mut dialled = dial_for_round_on(&b, relay_addr, CLOSING_SECRET).await.unwrap();
+        let first = relayed.lock().pop().unwrap();
+        first.abort();
+        let _ = first.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Spend the budget: polled until it answers `Pending`.
+        {
+            use std::future::Future;
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut units = 0usize;
+            loop {
+                let mut spend = std::pin::pin!(tokio::task::consume_budget());
+                if spend.as_mut().poll(&mut cx).is_pending() || units > 100_000 {
+                    break;
+                }
+                units += 1;
+            }
+            assert!(units < 100_000, "premise: the budget runs out");
+        }
+        assert!(
+            held_stream_is_gone(&mut dialled.stream).await,
+            "an ended stream read as alive because the task's budget was spent"
+        );
+    }
+
+    /// A dial made beside the loop says how long it took, which the contact's first
+    /// pull is charged with (the next pull's estimate counts a dial).
+    #[tokio::test]
+    async fn a_dial_made_beside_the_loop_reports_how_long_it_took() {
+        let (_a, _a_dir, addr, _served) = serving_counted().await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Arc::new(Engine::open(&b_dir.path().join("kimmy.redb")).unwrap());
+        let began = Instant::now();
+        let dialled = dial_for_round(b, addr, CLOSING_SECRET.to_string()).await.unwrap();
+        let took = dialled.dial_took();
+        assert!(took > Duration::ZERO && took <= began.elapsed(), "{took:?}");
     }
 
     /// An idle two-node cluster's rounds end as rounds, not as failures. Each
