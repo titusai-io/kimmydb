@@ -20,6 +20,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 **Fixed:** a member left alone after a partition (it had declared every peer down) could wait for the replication loop's contacts to frozen peers before it re-announced itself. It announced to its member table only when discovery offered a seed, and discovery shares a loop with the sync tick, which waits out a handshake (10 s) and an exchange (10 s) on each peer that does not answer. The membership loop now announces on its own timer, at most once a second, while it holds no active member; a member with a peer does not.
 
+**Fixed:** a member's offers of the peers discovery resolved to its membership waited for the replication loop's sync tick: a tick stuck on frozen peers held them back for as long as its dials took to time out. The task that resolves the seeds makes the offers itself now.
+
 **Fixed:** a first start killed after the tables were created and before the schema was written left a store, with a sidecar at storage schema 0, that was refused on every later start as written by an older build (0.53.0 has the same flaw). The next start now finishes the first start; a schema-0 sidecar beside a store that records a schema is refused before anything is written when the store is clean; a dirty one is decided after redb's repair.
 
 The minimum supported Rust is 1.99.
