@@ -4673,10 +4673,15 @@ async fn x_and_m_alone_together(client: &reqwest::Client, x: &Node, m: &Node) ->
 #[ignore = "boots a real four-node cluster; run with --ignored"]
 async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_frozen_peers_down() {
     let client = reqwest::Client::new();
-    // Discovery asks once a minute, far past the bound below: only the membership
-    // loop's own alone timer can reunite X and M inside it. With the template's
-    // 2 s, a tick of the replication loop that did not stall let discovery's
-    // offer do it, and a regression of the timer showed in one run of eight.
+    // Discovery asks once a minute, far past the bound below, so the membership
+    // loop's own alone timer is what reunites X and M inside it. With the
+    // template's 2 s, a tick of the replication loop that did not stall let
+    // discovery's offer do it, and a regression of the timer showed in one run of
+    // eight. At a minute it shows in most runs (4 of 5 on main's code; the fifth
+    // passed in 6.9 s, the cursor and the probes lining up), not in all: this test
+    // measures the SWIM timing and the timer together, and the deterministic guard
+    // for the timer's wiring is `a_member_alone_announces_to_its_table_on_its_own_timer`
+    // in `kimmy-cluster/tests/membership.rs`.
     let (y, z, x, m) = rejoin_cluster("discovery_interval_secs = 60");
     for node in [&y, &z, &x, &m] {
         node.wait_ready(&client).await;
