@@ -1504,12 +1504,16 @@ pub(crate) const HELD_STREAM_MAX_AGE: Duration = CONNECT_TIMEOUT;
 /// processes the event; the yield gives the driver its turn at the scheduler, but
 /// does not promise it. A close the driver has not yet seen reads as alive, and the
 /// round on that stream fails and backs off, as it would have before the stream
-/// was pre-dialled. A kernel `recv(MSG_PEEK | MSG_DONTWAIT)` would not have the
-/// cache, but TLS puts data on the socket that is not a close: the server's session
-/// tickets after the handshake (until they are read) and a `close_notify` are both
-/// bytes, so a peek that counts bytes as gone re-dials nearly every stream, and one
-/// that does not cannot see `close_notify`. Reading through the TLS layer is the
-/// only check that tells them apart, so that is what is done.
+/// was pre-dialled.
+///
+/// **Why not a kernel `recv(MSG_PEEK | MSG_DONTWAIT)`**, which has no cache. It
+/// would be sound here: the dial reads the server's session tickets before it reads
+/// `Welcome`, so nothing unasked-for is waiting on a healthy held stream, and bytes
+/// or an end on it (a `close_notify` included) do mean the peer is gone. It is not
+/// used because it needs either `unsafe` (this crate has none) or a socket library's
+/// `peek` on the raw socket (a dependency, added for keepalive in another change),
+/// to close a gap whose cost, when it opens, is one failed round and a back-off.
+/// Reading through the TLS layer needs neither.
 async fn held_stream_is_gone<S: AsyncRead + Unpin>(stream: &mut S) -> bool {
     use std::future::Future;
     use tokio::io::AsyncReadExt;

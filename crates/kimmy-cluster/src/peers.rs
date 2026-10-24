@@ -751,6 +751,28 @@ fn early_retry_delay(peerless_ticks: u32, interval: Duration) -> Option<Duration
     (delay < interval).then_some(delay)
 }
 
+/// What the first pull of a contact is charged for the dial that came before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialCharge {
+    /// The pull dialled its own connection, inside its clock.
+    None,
+    /// The dial succeeded, in this long (measured by the dial itself).
+    Made(Duration),
+    /// The dial failed; the round waited this long for it.
+    Failed(Duration),
+}
+
+/// How long a pull took, for `Contact::pulled` and `fits_before`: the round, and the
+/// dial's own time added to it. The round's clock starts when the dial is in hand, so
+/// a dial the round waited for is not counted twice, and one that finished early is
+/// not left out.
+fn pull_took(round: Duration, dial: DialCharge) -> Duration {
+    match dial {
+        DialCharge::None => round,
+        DialCharge::Made(dial) | DialCharge::Failed(dial) => round + dial,
+    }
+}
+
 /// One dial a tick started: its result is the connection, ready for the round.
 /// Aborts the dial when dropped, whether or not it is being awaited: a round that is
 /// waiting for its dial when the loop ends takes the dial with it, which a bare
@@ -1213,15 +1235,20 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 let mut draining: VecDeque<Contact> =
                     chosen.into_iter().map(Contact::new).collect();
                 let mut dialling = DialsInFlight::default();
-                for contact in &mut draining {
-                    // Under the contact's own `cluster.sync` span, so what the dial
-                    // logs carries the peer, as it did when the round made it.
+                for contact in &draining {
+                    // Its own span, not the contact's: the contact's `cluster.sync` span
+                    // opens at its first pull (the doc on `Contact::span`), and one made
+                    // here would count the time this peer waited behind the others.
                     let dial = dial_for_round(
                         Arc::clone(&engine),
                         contact.peer,
                         config.secret.clone(),
                     )
-                    .instrument(contact.span());
+                    .instrument(tracing::info_span!(
+                        "cluster.dial",
+                        otel.kind = "client",
+                        peer = %contact.peer
+                    ));
                     // UNSUPERVISED: one dial, whose end is the result its round awaits; a
                     // panic in it is that round's failure, and the guard aborts it with the tick.
                     let task = DialTask(tokio::spawn(dial));
@@ -1272,19 +1299,26 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
                     let span = contact.span();
-                    let started = Instant::now();
                     // The first pull of a contact goes over the connection dialled
                     // at the top of the tick; a further pull of a drain, and a peer
-                    // asked again after a set-aside, dial their own.
-                    // The dial was made beside the loop, before this round's turn:
-                    // its time is charged to this pull as if it had been made here,
-                    // since the contact's next pull pays a dial and `fits_before`
-                    // judges it by this one.
-                    let mut dial_took = Duration::ZERO;
-                    let pulled = match dialling.take(&peer) {
-                        Some(dial) => match dial.await {
+                    // asked again after a set-aside, dial their own. The dial was
+                    // made beside the loop, so the round's clock starts when it is in
+                    // hand, and what the pull is charged for the dial is the dial's
+                    // own time (`pull_took`), whether it finished long before this
+                    // turn or was waited for here: the contact's next pull pays a
+                    // dial, and `fits_before` judges it by this one.
+                    let waiting_from = Instant::now();
+                    let dial = match dialling.take(&peer) {
+                        Some(dial) => Some(dial.await),
+                        None => None,
+                    };
+                    let waited = waiting_from.elapsed();
+                    let started = Instant::now();
+                    let mut dialled_in = DialCharge::None;
+                    let pulled = match dial {
+                        Some(dial) => match dial {
                             Ok(Ok(dialled)) => {
-                                dial_took = dialled.dial_took();
+                                dialled_in = DialCharge::Made(dialled.dial_took());
                                 sync_once_dialled(
                                     &engine,
                                     peer,
@@ -1296,8 +1330,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                 .instrument(span)
                                 .await
                             }
-                            Ok(Err(e)) => Err(e),
-                            Err(e) => Err(std::io::Error::other(format!("dialling {peer}: {e}")).into()),
+                            Ok(Err(e)) => {
+                                dialled_in = DialCharge::Failed(waited);
+                                Err(e)
+                            }
+                            Err(e) => {
+                                dialled_in = DialCharge::Failed(waited);
+                                Err(std::io::Error::other(format!("dialling {peer}: {e}")).into())
+                            }
                         },
                         None => {
                             sync_once_with(
@@ -1311,7 +1351,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             .await
                         }
                     };
-                    let took = started.elapsed() + dial_took;
+                    let took = pull_took(started.elapsed(), dialled_in);
                     // Taken whether the round succeeded or not: a window
                     // applied before a failure later in the round is work
                     // done, and the pull series must not lose it in exactly
@@ -3446,6 +3486,27 @@ mod tests {
             ended.is_ok(),
             "the dial was still holding its connection {:?} after the loop ended",
             aborted.elapsed()
+        );
+    }
+
+    /// What a first pull is charged for its dial is the dial's own time, added once:
+    /// a dial that finished before the round's turn and one the round waited for cost
+    /// the same, since the round's clock starts when the dial is in hand.
+    #[test]
+    fn a_first_pull_is_charged_its_dials_own_time_once() {
+        let round = Duration::from_millis(20);
+        let dial = Duration::from_millis(80);
+        // Finished long before the turn, or awaited at it: the dial's time is the same.
+        assert_eq!(pull_took(round, DialCharge::Made(dial)), Duration::from_millis(100));
+        // A pull that dialled for itself had the dial inside its clock already.
+        assert_eq!(
+            pull_took(Duration::from_millis(100), DialCharge::None),
+            Duration::from_millis(100)
+        );
+        // A dial that failed is what the round waited for it.
+        assert_eq!(
+            pull_took(Duration::ZERO, DialCharge::Failed(Duration::from_secs(5))),
+            Duration::from_secs(5)
         );
     }
 
