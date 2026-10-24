@@ -233,16 +233,17 @@ const STOP_BOUND: Duration = Duration::from_secs(10);
 async fn write_is_not_held(b: &Arc<Engine>) -> Duration {
     let b = Arc::clone(b);
     let began = Instant::now();
-    let wrote = tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::task::spawn_blocking(move || {
-            let probe = b.create_collection("shop", "after").unwrap();
-            b.insert(&probe, bson::doc! { "_id": 1 }).unwrap();
-        }),
-    )
-    .await;
+    let (done, wrote) = tokio::sync::oneshot::channel();
+    // A thread of its own, never joined: a write that is never let in must fail the test, not
+    // hold the runtime's shutdown (a blocking task would) and hang the run.
+    // UNSUPERVISED: a test driver; if the write is held for ever the test fails and the thread is left
+    std::thread::spawn(move || {
+        let probe = b.create_collection("shop", "after").unwrap();
+        b.insert(&probe, bson::doc! { "_id": 1 }).unwrap();
+        let _ = done.send(());
+    });
+    let wrote = tokio::time::timeout(Duration::from_secs(60), wrote).await;
     assert!(wrote.is_ok(), "a write after the stop never got in: the stop left the writer held");
-    wrote.unwrap().unwrap();
     began.elapsed()
 }
 
@@ -294,11 +295,11 @@ impl Writers {
 
 /// A Converge repair of a collection of many pages, under background writers on the
 /// requester, stopped part-way the way a node stops its replication loop: the walks are
-/// stopped and the task aborted (`kimmy_task::supervised`). Timed: the task must end
-/// promptly, no write transaction may be left held (a write right after the stop lands at
-/// once), and the writers are never held for long by a page.
+/// stopped and the task aborted (`kimmy_task::supervised`). The repair must be cut short
+/// and not run to its end, the task must end within `STOP_BOUND`, and no write transaction
+/// may be left held (a write after the stop gets in).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stop_mid_converge_with_background_writers_is_prompt_and_holds_nothing() {
+async fn a_stop_mid_converge_with_background_writers_ends_the_repair_and_frees_the_writer() {
     const SECRET: &str = "review-rrb-stop-converge";
     let a_dir = tempfile::tempdir().unwrap();
     let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
@@ -372,6 +373,10 @@ async fn a_stop_mid_converge_with_background_writers_is_prompt_and_holds_nothing
     looping.abort();
     let _ = looping.await;
     let stopped_in = stopping.elapsed();
+    // The stop interrupted the repair: it did not wait for the walk to finish. This is what
+    // the time bound alone cannot show (the whole repair takes about ten seconds here, so a
+    // stop that waited for it would only just exceed `STOP_BOUND`); it holds on any host.
+    assert_eq!(version(docs - 1), 1, "the repair ran to its end instead of stopping");
     // The background writers end first, so the probe write below waits for nothing but a
     // transaction the stop left held: the single writer is not first come first served, and
     // a write queued with four tight writers measured their contention, not the stop.
@@ -389,7 +394,7 @@ async fn a_stop_mid_converge_with_background_writers_is_prompt_and_holds_nothing
 /// stopped part-way as a node stops: the build is a background walk, which ends at
 /// `stop_walks`, so the stop is prompt and the writer is released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stop_mid_definition_build_with_background_writers_is_prompt() {
+async fn a_stop_mid_definition_build_with_background_writers_ends_the_build_and_frees_the_writer() {
     const SECRET: &str = "review-rrb-stop-definition";
     let a_dir = tempfile::tempdir().unwrap();
     let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
@@ -463,6 +468,10 @@ async fn a_stop_mid_definition_build_with_background_writers_is_prompt() {
         stopping - started,
     );
     assert!(stopped_in < STOP_BOUND, "the stop waited {stopped_in:?} for the build");
+    // And the build was interrupted, not waited out: it takes some three seconds more than
+    // the 400 ms it is given here (measured with the stop made to wait for it), so on any
+    // host the index is not there when a stop that stops has returned.
+    assert_eq!(built, 0, "the index build ran to its end instead of stopping");
 }
 
 // -- Observability: the end line of the next repair ----------------------------------------
