@@ -36,6 +36,7 @@ tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
 bson.workspace = true
+kimmy-vector = { workspace = true, features = ["test-hooks"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower.workspace = true

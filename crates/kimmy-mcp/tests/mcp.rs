@@ -21,6 +21,7 @@ struct Server {
     base: String,
     tokens: TokenIssuer,
     engine: Arc<Engine>,
+    state: kimmy_api::SharedState,
     _dir: tempfile::TempDir,
 }
 
@@ -30,6 +31,14 @@ impl Server {
     }
 
     async fn start_with(limits: kimmy_api::RequestLimits) -> Self {
+        Self::start_providers(limits, kimmy_vector::ProviderPolicy::default()).await
+    }
+
+    /// A server whose embedding providers are governed by `providers`.
+    async fn start_providers(
+        limits: kimmy_api::RequestLimits,
+        providers: kimmy_vector::ProviderPolicy,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
         UserStore::open(&engine).unwrap();
@@ -37,14 +46,39 @@ impl Server {
         let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
         // No limits: these tests mint tokens directly and never log in, so a
         // limiter would add state without exercising anything.
-        let state = kimmy_api::state(
+        let state = kimmy_api::state_with_policies(
             Arc::clone(&engine),
             tokens.clone(),
             false,
             kimmy_api::RateLimits::disabled(),
+            kimmy_api::egress::EgressPolicy::public_only(kimmy_api::egress::WEBHOOKS),
+            providers,
         )
         .unwrap();
+        Self::serve(state, engine, tokens, limits, dir).await
+    }
 
+    /// The same node and store, served at `limits`: a second front door for a test that
+    /// needs one setup and a different deadline.
+    async fn again(&self, limits: kimmy_api::RequestLimits) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        Self::serve(
+            Arc::clone(&self.state),
+            Arc::clone(&self.engine),
+            self.tokens.clone(),
+            limits,
+            dir,
+        )
+        .await
+    }
+
+    async fn serve(
+        state: kimmy_api::SharedState,
+        engine: Arc<Engine>,
+        tokens: TokenIssuer,
+        limits: kimmy_api::RequestLimits,
+        dir: tempfile::TempDir,
+    ) -> Self {
         // Merged exactly as the daemon merges it, so the test exercises the
         // real mounting rather than a convenient stand-in. That faithfulness
         // used to reproduce a defect instead of catching it: both sides said
@@ -61,7 +95,7 @@ impl Server {
             let _ = axum::serve(listener, app).await;
         });
 
-        Self { base: format!("http://{addr}"), tokens, engine, _dir: dir }
+        Self { base: format!("http://{addr}"), tokens, engine, state, _dir: dir }
     }
 
     /// Mint a token directly, so a test can describe the grants it needs
@@ -1963,27 +1997,315 @@ async fn the_timeout_answer_over_mcp_is_the_one_rest_gives() {
     assert_eq!(body["result"]["structuredContent"]["retry"], rest.retry().as_str());
 }
 
-/// A body that is sent slowly is cut at the deadline: rmcp reads its own bodies, and the
-/// connection would otherwise be held by a client that sends the headers and then trickles.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_body_that_does_not_arrive_in_time_is_cut_off() {
+/// What a raw exchange answered: the status line's code and the JSON body, if any.
+fn answer(raw: &[u8]) -> (u16, Value) {
+    let text = String::from_utf8_lossy(raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, parse_body(head, body))
+}
+
+/// A POST to `/mcp` whose body is sent in two parts, `pause` apart, and what the server answered.
+async fn slow_post(
+    server: &Server,
+    token: &str,
+    body: &Value,
+    pause: std::time::Duration,
+    complete: bool,
+) -> (u16, Value, std::time::Duration) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let server = Server::start_with(limits_of(1)).await;
-    let root = server.root();
     let host = server.base.strip_prefix("http://").unwrap();
-    let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+    let payload = body.to_string();
+    let (first, rest) = payload.split_at(payload.len() / 2);
     let head = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Type: application/json\r\n\
-         Accept: application/json, text/event-stream\r\nAuthorization: Bearer {root}\r\n\
-         Content-Length: 1000\r\n\r\n{{\"jsonrpc\":"
+        "POST /mcp HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+         Authorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{first}",
+        payload.len()
     );
-    stream.write_all(head.as_bytes()).await.unwrap();
-    // The rest of the body never comes.
     let began = std::time::Instant::now();
+    let stream = tokio::net::TcpStream::connect(host).await.unwrap();
+    let (mut read, mut write) = stream.into_split();
+    write.write_all(head.as_bytes()).await.unwrap();
+    // The rest of the body follows in its own time, beside the wait for the answer.
+    let rest = rest.to_string();
+    let sender = tokio::spawn(async move {
+        tokio::time::sleep(pause).await;
+        if complete {
+            let _ = write.write_all(rest.as_bytes()).await;
+        }
+        write
+    });
     let mut raw = Vec::new();
     let ended =
-        tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut raw))
+        tokio::time::timeout(std::time::Duration::from_secs(20), read.read_to_end(&mut raw)).await;
+    assert!(ended.is_ok(), "the server held a connection whose body never completed");
+    sender.abort();
+    let (status, json) = answer(&raw);
+    (status, json, began.elapsed())
+}
+
+fn insert_call(id: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"insert","arguments":
+        {"database":"sales","collection":"orders","document":{"_id": id, "x": 1}}}})
+}
+
+/// A body that does not arrive in time is the request deadline, answered as REST answers
+/// it: `503`, `timeout`, `retry: wait`, not rmcp's plain-text 500. Both a body cut off
+/// and a complete, valid one sent slower than the limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_that_does_not_arrive_in_time_is_answered_503_timeout() {
+    let server = Server::start_with(limits_of(1)).await;
+    seed(&server);
+    let root = server.root();
+    // Cut off after its start: the rest never comes.
+    let (status, json, took) =
+        slow_post(&server, &root, &insert_call("cut"), std::time::Duration::from_secs(4), false)
             .await;
-    assert!(ended.is_ok(), "the server held a connection whose body never arrived");
-    assert!(began.elapsed() < std::time::Duration::from_secs(8), "{:?}", began.elapsed());
+    assert_eq!(status, 503, "{json}");
+    assert_eq!(json["error"], "timeout", "{json}");
+    assert_eq!(json["retry"], "wait");
+    assert!(took < std::time::Duration::from_secs(4), "{took:?}");
+    // Complete and valid, but over the limit: cut like the other.
+    let (status, json, _) = slow_post(
+        &server,
+        &root,
+        &insert_call("slow"),
+        std::time::Duration::from_millis(1600),
+        true,
+    )
+    .await;
+    assert_eq!(status, 503, "{json}");
+    assert_eq!(json["error"], "timeout");
+    // Nothing ran: neither document is there.
+    let count =
+        server.call_ok(&root, "count", json!({"database":"sales","collection":"orders"})).await;
+    assert_eq!(count["count"], 3);
+}
+
+/// **One deadline over body and call, as on REST.** A body that took most of the time
+/// leaves the call only the rest: the writer is held, the limit is 3 s, the body takes 2 s,
+/// and the answer comes at about 3 s, not 5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_body_leaves_the_call_less_time() {
+    let server = Server::start_with(limits_of(3)).await;
+    seed(&server);
+    let root = server.root();
+    let hold = server.engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+    let (status, json, took) =
+        slow_post(&server, &root, &insert_call("late"), std::time::Duration::from_secs(2), true)
+            .await;
+    drop(hold);
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["result"]["isError"], true, "{json}");
+    assert_eq!(json["result"]["structuredContent"]["error"], "timeout");
+    assert!(
+        took >= std::time::Duration::from_millis(2900)
+            && took < std::time::Duration::from_millis(4300),
+        "the body and the call share the 3 s: {took:?}"
+    );
+}
+
+/// **A filtered vector search whose keyed join outlasts the deadline answers `timeout`**
+/// (ADR-241), over MCP as over REST. The graph is built over 300 documents and the filter
+/// admits only 100 written after it, so the search gives way to the keyed join, which reads
+/// the request's deadline. The deadline is 1 ms: gone by the time the join starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keyed_join_past_the_deadline_answers_timeout() {
+    use kimmy_core::{ChunkConfig, DocId, Metric, ProviderConfig, VectorConfig, VectorRecord};
+    let server = Server::start().await;
+    let meta = server.engine.create_collection("kb", "joined").unwrap();
+    server
+        .engine
+        .configure_vectors(
+            "kb",
+            "joined",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: ProviderConfig::Byo {},
+                dim: 2,
+                metric: Metric::Cosine,
+                chunk: ChunkConfig::default(),
+                document_prefix: None,
+                query_prefix: None,
+            },
+        )
+        .unwrap();
+    let shadow = server.engine.vector_collection("kb", "joined").unwrap().unwrap();
+    let add = |i: i64, tag: i64| {
+        server
+            .engine
+            .insert(&meta, bson::doc! { "_id": i, "tag": tag, "text": format!("d{i}") })
+            .unwrap();
+        let record = VectorRecord {
+            source: DocId::Int64(i),
+            chunk: 0,
+            source_hlc: kimmy_core::Hlc::new(1, 0),
+            vector: vec![(i as f32 * 0.37).cos(), (i as f32 * 0.37).sin()],
+            text: format!("d{i}c0"),
+            config: None,
+        };
+        server.engine.put_vectors(&shadow, &DocId::Int64(i), &[record]).unwrap();
+    };
+    for i in 0..300 {
+        add(i, 0);
+    }
+    let root = server.root();
+    let search = json!({"database":"kb","collection":"joined","vector":[1.0, 0.0],"k":5,
+                        "filter":{"tag":99}});
+    // The first search is a scan and queues the graph's build; let it finish.
+    let first = server
+        .call_ok(
+            &root,
+            "vector_search",
+            json!({"database":"kb","collection":"joined","vector":[1.0, 0.0],"k":5}),
+        )
+        .await;
+    assert!(first["matches"].is_array(), "{first}");
+    server.state.vectors.settle();
+    for i in 300..400 {
+        add(i, 99);
+    }
+    // Inside its time the filtered search answers.
+    let inside = server.call_ok(&root, "vector_search", search.clone()).await;
+    assert!(!inside.to_string().is_empty());
+    // With no time left it answers `timeout`, as a result.
+    let tight = server
+        .again(kimmy_api::RequestLimits {
+            request_timeout: std::time::Duration::from_millis(1),
+            ..Default::default()
+        })
+        .await;
+    let body = tight.call(&root, "vector_search", search).await;
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert_eq!(body["result"]["structuredContent"]["error"], "timeout", "{body}");
+}
+
+/// **An embedding provider that never answers is cut at the configured seconds**, over MCP:
+/// a text query behind `vector_search` awaits the provider, and the tool call is abandoned at
+/// the deadline with the `timeout` result, a second here, not the provider client's own bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_embedding_provider_that_never_answers_is_cut_at_the_deadline() {
+    use kimmy_core::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/embed", silent.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = silent.accept().await {
+            held.push(socket);
+        }
+    });
+    let providers = kimmy_vector::ProviderPolicy::new(
+        kimmy_vector::policy::default_allowed_key_env(),
+        vec!["127.0.0.1".into()],
+        false,
+        Default::default(),
+    )
+    .unwrap();
+    let server = Server::start_providers(limits_of(1), providers).await;
+    server.engine.create_collection("kb", "embedded").unwrap();
+    server
+        .engine
+        .configure_vectors(
+            "kb",
+            "embedded",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: ProviderConfig::CustomHttp { endpoint, api_key_env: None },
+                dim: 2,
+                metric: Metric::Cosine,
+                chunk: ChunkConfig::default(),
+                document_prefix: None,
+                query_prefix: None,
+            },
+        )
+        .unwrap();
+    // A stored vector, so the search gets as far as embedding the query.
+    let meta = server.engine.get_collection("kb", "embedded").unwrap();
+    let shadow = server.engine.vector_collection("kb", "embedded").unwrap().unwrap();
+    server.engine.insert(&meta, bson::doc! { "_id": "a", "text": "green paint" }).unwrap();
+    let source = kimmy_core::DocId::String("a".into());
+    let stamp = server.engine.document_stamp(&meta, &source).unwrap().unwrap();
+    server
+        .engine
+        .put_vectors(
+            &shadow,
+            &source,
+            &[kimmy_core::VectorRecord {
+                source: source.clone(),
+                chunk: 0,
+                source_hlc: stamp.hlc,
+                vector: vec![1.0, 0.0],
+                text: "green paint".into(),
+                config: None,
+            }],
+        )
+        .unwrap();
+    let root = server.root();
+    let began = std::time::Instant::now();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        server.call(
+            &root,
+            "vector_search",
+            json!({"database":"kb","collection":"embedded","query":"red apple","k":3}),
+        ),
+    )
+    .await
+    .expect("abandoned at the deadline, not left to the provider");
+    let took = began.elapsed();
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert_eq!(body["result"]["structuredContent"]["error"], "timeout", "{body}");
+    assert!(
+        took >= std::time::Duration::from_millis(900) && took < std::time::Duration::from_secs(8),
+        "{took:?}"
+    );
+}
+
+/// **A schema-change confirmation that hears from no one is capped, not a timeout**:
+/// `create_index` over MCP with a confirmer that never answers returns the index and lists
+/// the member as pending, within the deadline, and is not `isError`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_that_hears_from_no_one_is_pending_and_not_a_timeout() {
+    let server = Server::start_with(limits_of(2)).await;
+    seed(&server);
+    let member = kimmy_core::NodeId::from_bytes([9; 16]);
+    server.state.set_ddl_confirmer(Arc::new(move |_entry, cap| {
+        Box::pin(async move {
+            // Honours the cap it is given, as the daemon's does: no time, ready at once; else
+            // it waits for the whole cap and reports the member pending. With no cap it
+            // would wait for its own long deadline.
+            match cap {
+                Some(cap) if cap.is_zero() => {}
+                Some(cap) => tokio::time::sleep(cap).await,
+                None => tokio::time::sleep(std::time::Duration::from_secs(30)).await,
+            }
+            let mut found = kimmy_api::DdlConfirmation::default();
+            found.pending.push((member, "no answer".into()));
+            found
+        })
+    }));
+    let root = server.root();
+    let began = std::time::Instant::now();
+    let body = server
+        .call(
+            &root,
+            "create_index",
+            json!({"database":"sales","collection":"orders","fields":[{"path":"status"}]}),
+        )
+        .await;
+    let took = began.elapsed();
+    assert!(body["result"]["isError"].is_null() || body["result"]["isError"] == false, "{body}");
+    let confirmation = &body["result"]["structuredContent"]["confirmation"];
+    assert!(
+        confirmation["pending"].as_array().is_some_and(|p| !p.is_empty()),
+        "the member is listed as pending: {body}"
+    );
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    assert!(!server.engine.list_indexes("sales", "orders").unwrap().is_empty(), "the index exists");
 }

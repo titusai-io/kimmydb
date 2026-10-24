@@ -85,9 +85,14 @@ async fn authenticate(
 ) -> Result<Response, kimmy_api::ApiError> {
     use axum::extract::FromRequestParts;
 
+    // The request's time starts here, as REST's does in `enforce_timeout`: one deadline
+    // over the body and the call. The call (`tools::within_deadline`) gets what the body
+    // left of it.
+    let started = std::time::Instant::now();
     let (mut parts, body) = request.into_parts();
     let Auth(principal) = Auth::from_request_parts(&mut parts, &state).await?;
     parts.extensions.insert(principal);
+    parts.extensions.insert(ArrivalStart(started));
 
     // rmcp reads its own bodies, with no time bound of its own that this server can see
     // (it takes the stream and reads it in its service); a client that sends the headers
@@ -95,9 +100,26 @@ async fn authenticate(
     // ADR-099. The body gets `request_timeout_secs` to arrive. This bounds the *reading*
     // only, not the call: once the body is in, the call runs under the deadline its tool
     // handler sets (`tools::within_deadline`).
-    let body = axum::body::Body::new(TimedBody::new(body, limits.request_timeout));
-    Ok(next.run(Request::from_parts(parts, body)).await)
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body = axum::body::Body::new(TimedBody::new(
+        body,
+        started + limits.request_timeout,
+        Arc::clone(&fired),
+    ));
+    let response = next.run(Request::from_parts(parts, body)).await;
+    // rmcp answers a body that failed to read with a plain-text 500. A body that did not
+    // arrive in time is the request deadline, and is answered as REST answers it: `503`,
+    // `timeout`, `retry: wait` (ADR-099).
+    if fired.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(kimmy_api::ApiError::timeout(limits.request_timeout));
+    }
+    Ok(response)
 }
+
+/// When this request's time began, carried in its extensions to the tool call (rmcp copies
+/// the HTTP parts into the call's context): the call runs under what the body left.
+#[derive(Clone, Copy)]
+pub(crate) struct ArrivalStart(pub(crate) std::time::Instant);
 
 /// A request body that must arrive within a time: the stream ends with an error if it
 /// has not been read to its end by then. Unlike a whole-request deadline it says nothing
@@ -105,11 +127,21 @@ async fn authenticate(
 struct TimedBody {
     inner: axum::body::Body,
     timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+    /// Set when the timer ended the body, for `authenticate` to see.
+    fired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TimedBody {
-    fn new(inner: axum::body::Body, within: std::time::Duration) -> Self {
-        Self { inner, timer: Box::pin(tokio::time::sleep(within)) }
+    fn new(
+        inner: axum::body::Body,
+        until: std::time::Instant,
+        fired: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            inner,
+            timer: Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(until))),
+            fired,
+        }
     }
 }
 
@@ -138,6 +170,7 @@ impl http_body::Body for TimedBody {
             Poll::Ready(frame) => Poll::Ready(frame),
             Poll::Pending => {
                 if self.timer.as_mut().poll(cx).is_ready() {
+                    self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
                     Poll::Ready(Some(Err(axum::Error::new(BodyTimedOut))))
                 } else {
                     Poll::Pending

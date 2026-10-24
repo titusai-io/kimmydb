@@ -838,8 +838,10 @@ fn omit_internal(mut value: Value, key: &str, is_internal: fn(&str) -> bool) -> 
 /// next step, reading it back, is the model's to take: the MCP specification
 /// reports a tool's execution errors in its result so that the model sees them
 /// and can act, where a protocol error goes to the client and often stops
-/// there. Every other failure stays a protocol error, carrying its code and
-/// class in `data`.
+/// there. So is one that ran out of time (`ErrorCode::Timeout`: the deadline, a write that
+/// could not take the writer): the REST `503` envelope in `structuredContent`, class
+/// `wait`. Every other failure stays a protocol error, carrying its code and class in
+/// `data`.
 pub(crate) fn render(result: Result<Value, ApiError>) -> Result<CallToolResult, ErrorData> {
     match result {
         Ok(value) => Ok(ok(value)),
@@ -856,11 +858,15 @@ pub(crate) fn render(result: Result<Value, ApiError>) -> Result<CallToolResult, 
 /// task-locals, and rmcp runs a tool in its service loop's task, not in the HTTP
 /// handler's, so a layer around `/mcp` would not reach them. See
 /// [`kimmy_api::limits::within_request_deadline`] for what they are.
+///
+/// `left` is what the request body left of the configured time (REST has one deadline over
+/// body and work); the answer names the configured number.
 pub(crate) async fn within_deadline(
     limits: RequestLimits,
+    left: std::time::Duration,
     call: impl std::future::Future<Output = Result<rmcp::model::CallToolResponse, ErrorData>>,
 ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
-    match kimmy_api::limits::within_request_deadline(limits.request_timeout, call).await {
+    match kimmy_api::limits::within_request_deadline_of(limits.request_timeout, left, call).await {
         Ok(result) => result,
         Err(_elapsed) => Ok(timed_out(ApiError::timeout(limits.request_timeout)).into()),
     }
@@ -958,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn every_other_failure_is_an_error_carrying_its_code_and_class() {
+    fn a_refusal_and_a_server_fault_are_errors_carrying_their_code_and_class() {
         let refused = render(Err(ApiError::bad_request("no such operator $nope")))
             .expect_err("a refusal stays a protocol error");
         assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
@@ -967,6 +973,23 @@ mod tests {
         assert_eq!(data["retry"], "no");
         assert_eq!(data["message"], "no such operator $nope");
 
+        // A server fault that is not a timeout is an internal error, the envelope in `data`.
+        let fault = render(Err(ApiError::new(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Snapshot,
+            "the snapshot could not be read",
+        )))
+        .expect_err("a server fault stays a protocol error");
+        assert_eq!(fault.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        let data = fault.data.expect("the envelope rides in data");
+        assert_eq!(data["error"], "snapshot");
+        assert_eq!(data["message"], "the snapshot could not be read");
+    }
+
+    /// A write that could not take the writer is a tool result the model reads, with REST's
+    /// `503 timeout` envelope (ADR-151).
+    #[test]
+    fn a_busy_writer_is_a_tool_result_carrying_the_timeout_envelope() {
         let mut busy = ApiError::writer_busy(std::time::Duration::from_secs(30));
         busy.retry_after_secs = Some(2);
         let busy = render(Err(busy)).expect("a busy writer is a tool result the model reads");
@@ -985,7 +1008,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(7),
             ..Default::default()
         };
-        let result = within_deadline(limits, std::future::pending())
+        let result = within_deadline(limits, limits.request_timeout, std::future::pending())
             .await
             .expect("a tool result, not a protocol error");
         let rmcp::model::CallToolResponse::Complete(result) = result else {

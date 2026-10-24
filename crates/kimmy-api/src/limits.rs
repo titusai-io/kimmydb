@@ -102,7 +102,8 @@ impl Default for RequestLimits {
 
 tokio::task_local! {
     /// When the request this task serves must be answered by: set by
-    /// [`enforce_timeout`] for the handler it wraps.
+    /// [`enforce_timeout`] for the handler it wraps, or by
+    /// [`within_request_deadline`] for another transport's.
     static REQUEST_DEADLINE: std::time::Instant;
     /// The deadline's length, `server.request_timeout_secs`: for an answer
     /// that names it, given by a handler that saw the deadline pass itself.
@@ -115,8 +116,8 @@ pub fn request_timeout() -> Option<Duration> {
     REQUEST_TIMEOUT.try_with(|timeout| *timeout).ok()
 }
 
-/// How long the request this task serves has left before [`enforce_timeout`]
-/// abandons it, or `None` outside a request with a deadline.
+/// How long the request this task serves has left before [`enforce_timeout`] (or
+/// [`within_request_deadline`]) abandons it, or `None` outside a request with a deadline.
 ///
 /// For a handler with work that can run after its change has committed, the
 /// confirmation of a schema change (ADR-140): capped by this, it answers with
@@ -184,12 +185,24 @@ pub async fn within_request_deadline<F: std::future::Future>(
     timeout: Duration,
     work: F,
 ) -> Result<F::Output, tokio::time::error::Elapsed> {
-    let deadline = std::time::Instant::now() + timeout;
+    within_request_deadline_of(timeout, timeout, work).await
+}
+
+/// [`within_request_deadline`] for a request that has already spent part of its time
+/// (reading its body): `left` is what remains, and bounds the work, the writer wait and
+/// what the work reads from [`request_time_left`]; `timeout` is the configured number,
+/// the one a message names.
+pub async fn within_request_deadline_of<F: std::future::Future>(
+    timeout: Duration,
+    left: Duration,
+    work: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    let deadline = std::time::Instant::now() + left;
     let work = REQUEST_DEADLINE.scope(
         deadline,
-        REQUEST_TIMEOUT.scope(timeout, kimmy_storage::with_write_wait_budget(timeout, work)),
+        REQUEST_TIMEOUT.scope(timeout, kimmy_storage::with_write_wait_budget(left, work)),
     );
-    tokio::time::timeout(timeout, work).await
+    tokio::time::timeout(left, work).await
 }
 
 /// Read the rest of a refused body before the `413` is written.

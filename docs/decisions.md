@@ -5273,10 +5273,15 @@ this, and must either come before the commit or be capped the same way.
 > envelope (`error: timeout`, `retry: wait`, the same message), where the
 > specification puts a tool's execution errors so that the model sees them; a
 > write that could not take the writer wrote nothing, as on REST. Storage work
-> already running is not cut, as on REST. The time the **request body** takes to
-> arrive is bounded by the same number at the HTTP layer (`mcp_router`): rmcp reads
-> its own bodies and does not bound it (a body that stopped after its headers held
-> the connection). The deadline's other exemptions, the change-stream upgrade and
+> already running is not cut, as on REST. The **request body** is under the same
+> deadline: rmcp reads its own bodies and does not bound the time (a body that
+> stopped after its headers held the connection), so `mcp_router`'s
+> authentication layer starts the request's time and bounds the body's arrival, and
+> answers a body that did not arrive `503 timeout` as REST does (not rmcp's
+> plain-text 500). One deadline covers body and call, as on REST: the tool call
+> gets what the body left of it. The same sentence stands for a schema-change
+> confirmation: it is capped to the time left and answers the change as made, its
+> unheard members `pending`, not as a timeout. The deadline's other exemptions, the change-stream upgrade and
 > the backup, stand.
 
 ---

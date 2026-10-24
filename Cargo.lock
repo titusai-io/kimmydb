@@ -2588,6 +2588,7 @@ dependencies = [
  "kimmy-core",
  "kimmy-query",
  "kimmy-storage",
+ "kimmy-vector",
  "rmcp",
  "schemars",
  "serde",

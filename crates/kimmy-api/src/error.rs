@@ -679,7 +679,9 @@ impl ApiError {
                 "the write waited {} seconds (server.request_timeout_secs) for the storage \
                  writer, which another transaction held throughout, and was abandoned; \
                  nothing was written",
-                waited.as_secs()
+                // Rounded, not truncated: a wait cut a hair short of its budget (a request
+                // whose body took part of it) is still the budget in whole seconds.
+                waited.as_secs_f64().round() as u64
             ),
         )
     }
