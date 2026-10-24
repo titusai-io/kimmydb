@@ -308,6 +308,28 @@ fn set_keepalive(stream: &TcpStream) {
     }
 }
 
+/// How long a round waits for the answer to its **first** request, `AskVersions`.
+///
+/// The rest of a round has [`REQUEST_TIMEOUT`] (30 s) because its answers can be
+/// large and walk the oplog. This one cannot: the serving side answers it with two
+/// small read transactions over the version tables (one row per origin) and its
+/// own block from memory, behind neither the writer nor a walk. A peer that took
+/// the connection and the handshake and then does not answer it within the
+/// handshake's own 10 s is frozen, gone or wedged, and waiting 30 s for it only
+/// holds the rest of the tick (the rounds are one after another) behind it.
+const FIRST_REPLY_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+
+const _: () = assert!(FIRST_REPLY_TIMEOUT.as_secs() < REQUEST_TIMEOUT.as_secs());
+
+/// [`FIRST_REPLY_TIMEOUT`], or a test's shorter one.
+fn first_reply_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(shorter) = test_hooks::FIRST_REPLY.with(|t| t.get()) {
+        return shorter;
+    }
+    FIRST_REPLY_TIMEOUT
+}
+
 /// Called on the serving side with what a pushed batch became (ADR-140), so
 /// the receiver's own counters see a refusal that arrived by push exactly as
 /// one that arrived by pull.
@@ -2444,8 +2466,12 @@ where
     let echo = stalls.members.as_ref().map(|members| members.echo_for(their_node));
     write_frame(stream, &Message::AskVersions { facts: ours, facts_gen: stalls.local_gen, echo })
         .await?;
-    let (frame, undecodable, decoded_seq) =
-        crate::protocol::read_frame_noting_facts(stream).await?;
+    let (frame, undecodable, decoded_seq) = tokio::time::timeout(
+        first_reply_timeout(),
+        crate::protocol::read_frame_noting_facts(stream),
+    )
+    .await
+    .map_err(|_| ProtocolError::TimedOut("the first reply".into()))??;
     clock.heard_now();
     let (theirs, their_witnessed, their_facts, asked_replay) = match frame {
         Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
@@ -6353,6 +6379,9 @@ pub(crate) mod test_hooks {
     }
 
     thread_local! {
+        /// A shorter first-reply bound for a test that cannot wait ten seconds.
+        pub static FIRST_REPLY: std::cell::Cell<Option<std::time::Duration>> =
+            const { std::cell::Cell::new(None) };
         /// Slept after a round's window is applied, inside the apply's time.
         pub static APPLY_TAKES: std::cell::Cell<std::time::Duration> =
             const { std::cell::Cell::new(std::time::Duration::ZERO) };
@@ -11786,6 +11815,53 @@ mod tests {
         let dialled = dial_for_round(b, addr, CLOSING_SECRET.to_string()).await.unwrap();
         let took = dialled.dial_took();
         assert!(took > Duration::ZERO && took <= began.elapsed(), "{took:?}");
+    }
+
+    /// A node that completes the handshake and then freezes: it accepts, proves itself and
+    /// answers nothing, as a process stopped after its connection was made.
+    async fn serve_then_freeze(
+        engine: Arc<Engine>,
+        listener: tokio::net::TcpListener,
+        secret: &str,
+    ) {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = crate::tls::ClusterTls::new().unwrap();
+        let mut stream = tls.acceptor().accept(tcp).await.unwrap();
+        let binding = crate::tls::binding(stream.get_ref().1).unwrap();
+        accept_handshake(&engine, &mut stream, secret, &binding).await.unwrap();
+        std::future::pending::<()>().await;
+    }
+
+    /// **A peer frozen after the handshake costs the first-reply bound, not the request
+    /// timeout.** The round's first request is answered from the version tables, so a
+    /// peer that does not answer it is not slow, it is gone; with the bound at a second
+    /// here, the round fails as `the first reply timed out` in about a second and the
+    /// 30 s of the round's own timeout is never reached.
+    #[tokio::test]
+    async fn a_peer_frozen_after_the_handshake_fails_the_round_on_the_first_reply_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let frozen = tokio::spawn(serve_then_freeze(a, listener, CLOSING_SECRET));
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        test_hooks::FIRST_REPLY.with(|t| t.set(Some(Duration::from_secs(1))));
+        let began = Instant::now();
+        let round = sync_once_with(&b, addr, CLOSING_SECRET, None, &mut PeerStalls::new()).await;
+        test_hooks::FIRST_REPLY.with(|t| t.set(None));
+        frozen.abort();
+        let e = round.expect_err("nothing answers");
+        assert!(matches!(&e, ProtocolError::TimedOut(what) if what == "the first reply"), "{e:?}");
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+    }
+
+    /// The bound is the handshake's, and a later request keeps the longer one.
+    #[test]
+    fn the_first_reply_bound_is_the_handshakes_and_the_rest_keep_the_request_timeout() {
+        assert_eq!(first_reply_timeout(), HANDSHAKE_TIMEOUT);
+        assert_eq!(first_reply_timeout(), Duration::from_secs(10));
+        assert!(REQUEST_TIMEOUT > first_reply_timeout());
     }
 
     /// An idle two-node cluster's rounds end as rounds, not as failures. Each
