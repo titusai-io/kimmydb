@@ -363,6 +363,7 @@ pub const TASKS: &[&str] = &[
     "embedding_worker",
     "jwks_refresher",
     "membership",
+    "membership_alone_announce",
     "membership_announce",
     "membership_inbound",
     "membership_timer",

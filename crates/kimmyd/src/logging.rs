@@ -534,6 +534,7 @@ impl TelemetryGuard {
         task_retries!("kimmy.task.retries.embedding_worker", "embedding_worker");
         task_retries!("kimmy.task.retries.jwks_refresher", "jwks_refresher");
         task_retries!("kimmy.task.retries.membership", "membership");
+        task_retries!("kimmy.task.retries.membership_alone_announce", "membership_alone_announce");
         task_retries!("kimmy.task.retries.membership_announce", "membership_announce");
         task_retries!("kimmy.task.retries.membership_inbound", "membership_inbound");
         task_retries!("kimmy.task.retries.membership_timer", "membership_timer");

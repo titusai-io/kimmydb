@@ -22,6 +22,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 **Fixed:** a member's offers of the peers discovery resolved to its membership waited for the replication loop's sync tick: a tick stuck on frozen peers held them back for as long as its dials took to time out. The task that resolves the seeds makes the offers itself now.
 
+**Fixed:** a first start killed after the tables were created and before the schema was written left a store, with a sidecar at storage schema 0, that was refused on every later start as written by an older build (0.53.0 has the same flaw). The next start now finishes the first start; a schema-0 sidecar beside a store that records a schema is refused before anything is written when the store is clean; a dirty one is decided after redb's repair.
+
 The minimum supported Rust is 1.99.
 
 ## 0.53.0 - 2026-10-23
