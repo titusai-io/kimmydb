@@ -32,6 +32,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 **Fixed:** an MCP tool call ran with no request deadline: a write that needed the storage writer waited for as long as the writer was held and the client saw a hang, a filtered vector search's keyed join had no deadline, and a request body that stopped arriving held the connection. MCP tool calls now get the same scopes as a REST request, with the same `server.request_timeout_secs`, and it covers the request body and the call together (a call gets what the body left; a body still arriving at the deadline is answered `503 timeout`, not rmcp's plain-text 500). A tool call that runs out of time is answered as a tool result with `isError: true` and `error: timeout`, `retry: wait` (the REST `503` envelope); storage work already running is not cut, as on REST. A `timeout` that used to reach an MCP client as a protocol error (a write that could not get the writer) is now that tool result.
 
+**Fixed:** a REST write that came after a slow request body waited for the storage writer for the whole `server.request_timeout_secs` again, so a body that took 25 s of 30 s and a held writer answered `503 timeout` at about 55 s; the write-wait budget is now what is left of the request's deadline when the write begins, so the answer comes at the deadline. The same holds for a second write in one request. The `503` names the wait beside the deadline when they differ (`waited 5 s of the 30 s request deadline`).
+
 The minimum supported Rust is 1.99.
 
 ## 0.53.0 - 2026-10-23
