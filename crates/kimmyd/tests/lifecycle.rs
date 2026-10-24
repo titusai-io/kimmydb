@@ -626,6 +626,8 @@ async fn a_store_a_newer_build_wrote_is_refused_and_left_as_it_was() {
 /// node does not log, and for one it logs without a `bind=`.
 #[tokio::test]
 async fn a_port_line_the_harness_cannot_read_fails_at_once() {
+    // It tells "the node listens and logs no such line" from "not yet" with `lsof`.
+    ports::require_lsof();
     let client = reqwest::Client::new();
     for (line, says) in
         [("a line kimmyd never logs", "never logged"), ("starting kimmyd", "without a bind=ADDR")]

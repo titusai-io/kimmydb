@@ -181,6 +181,8 @@ pub fn bound_http_port(stdout_log: &std::path::Path, line: &str, pid: u32, known
 
 /// The TCP ports `pid` is listening on, from `lsof`; `None` where it cannot
 /// be run, which leaves a missing log line to the patience budget.
+///
+/// A test that depends on the answer asks [`require_lsof`] first.
 pub fn listening_ports(pid: u32) -> Option<Vec<u16>> {
     let out = std::process::Command::new("lsof")
         .args(["-w", "-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN", "-Fn"])
@@ -193,6 +195,16 @@ pub fn listening_ports(pid: u32) -> Option<Vec<u16>> {
             .filter_map(|name| name.rsplit(':').next()?.parse().ok())
             .collect(),
     )
+}
+
+/// For a test whose result depends on [`listening_ports`]: fail at once, saying what is
+/// missing, where `lsof` cannot be run, instead of waiting out the patience budget for an
+/// answer that cannot come.
+pub fn require_lsof() {
+    assert!(
+        listening_ports(std::process::id()).is_some(),
+        "lsof is not installed: this test needs it"
+    );
 }
 
 /// A log line with its colour escapes removed.
