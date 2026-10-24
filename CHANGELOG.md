@@ -10,9 +10,9 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.54.0 - 2026-10-24
 
-**Read before upgrading: 0.54.0 moves redb from 4.3 to 4.4 and does not open a store 0.53.0 wrote. Stop every member, wipe the data, start on empty directories and reseed.**
+**Read before upgrading: 0.54.0 does not open a store or backup 0.53.0 wrote (redb 4.3 → 4.4). Stop every member, wipe the data, start on empty directories and reseed.**
 
 **Breaking:** the store records the redb major.minor that wrote it in `kimmy.format` (and in the database's metadata), and a build refuses a store whose major.minor is not its own, in either direction, by name and before anything is written, with the same way out as the schema refusal. So 0.54.0 refuses a store 0.53.0 wrote, and no longer re-stamps an older record as its own. A store that records a schema and no redb version is refused as damaged.
 
