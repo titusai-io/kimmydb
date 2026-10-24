@@ -637,13 +637,23 @@ pub async fn serve_with(
         // before any storage step, so a step's continuation never polls one
         // after the runtime has shut down (0.40.2).
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!(%peer, error = %e, "TLS handshake failed");
-                    return;
-                }
-            };
+            // Bounded by the handshake's own bound: the dialler gives its side 5 s
+            // ([`CONNECT_TIMEOUT`]), so a connection that has not completed TLS in
+            // twice that is not a peer working, and it held a task and a descriptor
+            // for nothing. Not counted, as a failed TLS handshake is not: anything
+            // that can reach the port can cause one.
+            let tls_stream =
+                match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        debug!(%peer, error = %e, "TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        debug!(%peer, "TLS handshake did not complete in time");
+                        return;
+                    }
+                };
             let binding = {
                 let (_, conn) = tls_stream.get_ref();
                 match crate::tls::binding(conn) {
@@ -10991,6 +11001,33 @@ mod tests {
             seen = timer();
         }
         assert_eq!(seen.as_deref(), Some("02"), "the accepted socket's keepalive timer");
+        serving.abort();
+    }
+
+    /// **A connection that never completes TLS is ended on the handshake bound.**
+    /// It connects and says nothing, so the server's TLS accept waits for a
+    /// ClientHello that will not come. (Real time: the bound is 10 s.)
+    #[tokio::test]
+    async fn a_connection_that_never_starts_tls_is_ended_on_the_handshake_bound() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(serve(a, listener, CLOSING_SECRET.to_string()));
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let began = Instant::now();
+        let mut buf = [0u8; 16];
+        let ended =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT + Duration::from_secs(5), silent.read(&mut buf))
+                .await
+                .expect("the server ended the connection that never started TLS");
+        assert!(matches!(ended, Ok(0) | Err(_)), "{ended:?}");
+        assert!(
+            began.elapsed() >= HANDSHAKE_TIMEOUT - Duration::from_millis(500),
+            "{:?}",
+            began.elapsed()
+        );
         serving.abort();
     }
 
