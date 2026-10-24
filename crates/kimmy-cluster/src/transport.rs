@@ -2711,7 +2711,15 @@ where
                 // connection the serving side may have ended. The round is left
                 // for the next one, which pulls this window.
                 debug!(%peer, "the pull is left to the next round: this connection has been quiet too long");
-                return Ok(SyncOutcome::default());
+                // The contact is a skipped check, as a pull that found its peer level
+                // and left the check is: it names the peer, so the loop counts it
+                // (`ran` + `skipped` is every contact), and carries the real lag.
+                return Ok(SyncOutcome {
+                    peer: Some(their_node),
+                    behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
+                    peer_catching_up,
+                    ..SyncOutcome::default()
+                });
             }
             write_frame(
                 stream,
@@ -2724,7 +2732,9 @@ where
                 },
             )
             .await?;
-            read_frame(stream).await?
+            let answer = read_frame(stream).await?;
+            clock.heard_now();
+            answer
         }
     };
 
@@ -2748,9 +2758,8 @@ where
         };
         write_frame(stream, &retry).await?;
         answer = read_frame(stream).await?;
+        clock.heard_now();
     }
-
-    clock.heard_now();
 
     // Answered with a window (or with nothing to give because this member is
     // level): whatever was set aside for this peer is settled (ADR-224).
@@ -6009,9 +6018,24 @@ where
 
     loop {
         let after = stalls.snapshot_progress(node, scope, policy).after().cloned();
+        if clock.quiet_too_long() {
+            // Before every page, the first included: a long apply ahead of it (a
+            // replay's, or the previous page's) and the serving side may have ended the
+            // connection. The snapshot resumes from the page recorded, next round.
+            debug!(%peer, "the snapshot is left to the next round: this connection has been quiet too long");
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: false,
+                sender_dropped: false,
+                history: false,
+            });
+        }
         write_frame(stream, &Message::AskSnapshot { after, collection: scope }).await?;
         let page = match read_frame(stream).await? {
-            Message::Snapshot(page) => page,
+            Message::Snapshot(page) => {
+                clock.heard_now();
+                page
+            }
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
             other => {
                 return Err(ProtocolError::Malformed(format!("expected Snapshot, got {other:?}")));
@@ -11453,6 +11477,54 @@ mod tests {
     async fn a_quiet_connection_leaves_the_pull_to_the_next_round() {
         let (_, pulled) = quiet_round(1, Duration::ZERO, Duration::ZERO).await;
         assert!(!pulled, "no request was sent, so nothing was pulled");
+    }
+
+    /// **A skipped pull is still a contact**: it names the peer, so the replication loop
+    /// counts it as skipped (`ran` + `skipped` is every contact), with the real lag.
+    #[tokio::test]
+    async fn a_pull_left_to_the_next_round_still_names_its_peer() {
+        let (outcome, pulled) = quiet_round(1, Duration::ZERO, Duration::ZERO).await;
+        assert!(!pulled);
+        assert!(outcome.peer.is_some(), "the peer is named, so the contact is counted");
+        assert!(outcome.divergent.is_none(), "and it ran no check: a skipped contact");
+    }
+
+    /// **A snapshot is not requested on a connection quiet past the bound**, the first
+    /// page included: the pull ends with nothing applied, to resume next round.
+    #[tokio::test]
+    async fn a_snapshot_is_not_requested_on_a_quiet_connection() {
+        const SECRET: &str = "a-quiet-snapshot-secret";
+        const BINDING: &[u8] = b"a-quiet-snapshot-binding";
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "orders").unwrap();
+        b.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
+        let (mut ours, theirs) = tokio::io::duplex(1 << 20);
+        let serving = serve_peer(&b, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None);
+        let pulling = async {
+            open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
+            let clock = RoundClock { reuse_within: Duration::ZERO, ..RoundClock::default() };
+            let pulled = pull_snapshot(
+                &a,
+                &mut ours,
+                "127.0.0.1:1".parse().unwrap(),
+                b.node_id(),
+                None,
+                kimmy_storage::SnapshotPolicy::All,
+                &mut PeerStalls::new(),
+                Instant::now() + Duration::from_secs(300),
+                &clock,
+            )
+            .await;
+            drop(ours);
+            pulled
+        };
+        let (_, pulled) = tokio::join!(serving, pulling);
+        let pulled = pulled.expect("the pull ends without failing");
+        assert!(!pulled.complete);
+        assert!(a.get_collection("shop", "orders").is_err(), "no page was requested or applied");
     }
 
     /// A write that makes no progress is ended: a stream whose far end never reads.
