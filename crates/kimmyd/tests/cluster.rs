@@ -152,13 +152,19 @@ bind = "127.0.0.1:{cluster}"
 seeds = [{seed_list}]
 cluster_secret = "{CLUSTER_SECRET}"
 sync_interval_secs = {sync_interval_secs}
-discovery_interval_secs = 2
+{discovery}
 {cluster_extra}
 
 [webhooks]
 allowed_hosts = ["127.0.0.1"]
 "#,
             data = dir.path().join("data").display(),
+            // The template's own, unless `cluster_extra` sets one.
+            discovery = if cluster_extra.contains("discovery_interval_secs") {
+                ""
+            } else {
+                "discovery_interval_secs = 2"
+            },
         );
         let config_path = dir.path().join("kimmy.toml");
         std::fs::write(&config_path, config).unwrap();
@@ -4505,13 +4511,17 @@ async fn lab_hook_a_lost_insert_is_repaired_by_either_half() {
 
 /// Y, Z, X and M, seeded as the field run that found it: Y and Z seed each
 /// other, X and M seed Y.
-fn rejoin_cluster() -> (Node, Node, Node, Node) {
+///
+/// `cluster_extra` is added to each node's `[cluster]` section.
+fn rejoin_cluster(cluster_extra: &str) -> (Node, Node, Node, Node) {
     let (py, pz, px, pm) = (ports::choose(), ports::choose(), ports::choose(), ports::choose());
+    let spawn =
+        |name, port, seeds: &[u16]| Node::spawn_configured(name, port, seeds, "", 1, cluster_extra);
     (
-        Node::spawn_with("node-y", py, &[pz], ""),
-        Node::spawn_with("node-z", pz, &[py], ""),
-        Node::spawn_with("node-x", px, &[py], ""),
-        Node::spawn_with("node-m", pm, &[py], ""),
+        spawn("node-y", py, &[pz]),
+        spawn("node-z", pz, &[py]),
+        spawn("node-x", px, &[py]),
+        spawn("node-m", pm, &[py]),
     )
 }
 
@@ -4529,14 +4539,39 @@ async fn x_and_m_alone_together(client: &reqwest::Client, x: &Node, m: &Node) ->
 /// X and M are frozen (SIGSTOP) until Y and Z declare them down, then Y and Z
 /// are frozen and X and M resumed. X and M learn they were declared down and
 /// rejoin; they must then declare the frozen Y and Z down within SWIM's own
-/// timing (a probe, its round trip and the suspicion time, about 6.5 s here)
-/// and find each other. Before the fix a member that rejoined on a `TurnUndead`
-/// sat disconnected, probing no one: X and M held Y and Z live for good.
+/// timing and find each other. Before the fix a member that rejoined on a
+/// `TurnUndead` sat disconnected, probing no one: X and M held Y and Z live for
+/// good.
+///
+/// **The bound, derived from the config** (`Config::new_lan(16)`: probe period
+/// 1 s, suspicion `max(1, log10 16) * 4 * 1 s` = 4.816 s). The clock starts at
+/// M's `SIGCONT`, the later one. A rejoined member probes one table member per
+/// period, round-robin, and foca does not reset its cursor when the identity
+/// changes (`member.rs:172-177`), so the rest of the old cycle can come first:
+/// the last member's probe starts at most 3 s after the rejoin plus one period
+/// for that remainder = 4 s, goes suspect 1 s later (the ack and the indirect
+/// probes take the period), and is declared down 4.816 s after that:
+/// 4 + 1 + 4.816 = 9.8 s. Two members that have declared everyone down are
+/// alone, and the membership loop's own timer announces to the table at most
+/// 1 s later (`ALONE_ANNOUNCE_EVERY`, throttled on the tick's scheduled instant,
+/// so the period is exactly that), which the other end answers in a round trip:
+/// 9.8 + 1 + the datagram and the two scrapes that observe it (250 ms apart) =
+/// about 12 to 13 s. The bound is 20 s: well over that for a loaded runner (the
+/// timers are real time, and two members and two frozen peers share the machine),
+/// and tight enough that a rejoin which stalls fails it. The 30 s it replaced had
+/// no derivation, and a member waited out the replication loop's contacts to the
+/// frozen peers before it announced (each a handshake timeout of 10 s): 25 s on
+/// a two-core box under load. Discovery is set to a minute for this test so that
+/// it cannot do the timer's work inside the bound.
 #[tokio::test]
 #[ignore = "boots a real four-node cluster; run with --ignored"]
 async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_frozen_peers_down() {
     let client = reqwest::Client::new();
-    let (y, z, x, m) = rejoin_cluster();
+    // Discovery asks once a minute, far past the bound below: only the membership
+    // loop's own alone timer can reunite X and M inside it. With the template's
+    // 2 s, a tick of the replication loop that did not stall let discovery's
+    // offer do it, and a regression of the timer showed in one run of eight.
+    let (y, z, x, m) = rejoin_cluster("discovery_interval_secs = 60");
     for node in [&y, &z, &x, &m] {
         node.wait_ready(&client).await;
     }
@@ -4553,7 +4588,8 @@ async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_frozen_pee
     tokio::time::sleep(Duration::from_secs(2)).await;
     m.signal("CONT");
     let took = x_and_m_alone_together(&client, &x, &m).await;
-    assert!(took < Duration::from_secs(30), "X and M took {took:?}");
+    eprintln!("X and M alone together after {took:?}");
+    assert!(took < Duration::from_secs(20), "X and M took {took:?}");
     y.signal("CONT");
     z.signal("CONT");
 }
@@ -4563,7 +4599,7 @@ async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_frozen_pee
 #[ignore = "boots a real four-node cluster; run with --ignored"]
 async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_dead_peers_down() {
     let client = reqwest::Client::new();
-    let (y, z, x, m) = rejoin_cluster();
+    let (y, z, x, m) = rejoin_cluster("");
     for node in [&y, &z, &x, &m] {
         node.wait_ready(&client).await;
     }

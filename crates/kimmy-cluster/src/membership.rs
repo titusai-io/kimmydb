@@ -963,6 +963,14 @@ enum Input {
     Timer(Timer<Member>),
     /// Introduce ourselves to a discovered address.
     Announce(SocketAddr),
+    /// The alone timer ([`ALONE_ANNOUNCE_EVERY`]): if this member holds no
+    /// active member, announce to the whole member table. Sent by this loop's
+    /// own task, so it does not wait on discovery, which shares a loop with
+    /// replication. Carries the instant the tick was **scheduled** for: the
+    /// throttle judges by that and not by when the loop got to the tick, since
+    /// two ticks handled a little closer together than they were scheduled
+    /// would otherwise lose one of them to the other's announce.
+    AloneTick(Instant),
 }
 
 /// This crate's SWIM instance.
@@ -1070,20 +1078,57 @@ mod step {
 pub(crate) fn announce_targets(swim: &Swim, offered: SocketAddr) -> Vec<SocketAddr> {
     let mut targets = vec![offered];
     if swim.num_members() == 0 {
-        let own = swim.identity().addr;
-        for member in swim.iter_membership_state() {
-            let addr = member.id().addr;
-            if addr != own && !targets.contains(&addr) {
-                targets.push(addr);
-            }
+        add_table_addresses(swim, &mut targets);
+    }
+    targets
+}
+
+/// Every address in foca's member table other than this member's own, the
+/// members held down included, added to `targets` once each.
+fn add_table_addresses(swim: &Swim, targets: &mut Vec<SocketAddr>) {
+    let own = swim.identity().addr;
+    for member in swim.iter_membership_state() {
+        let addr = member.id().addr;
+        if addr != own && !targets.contains(&addr) {
+            targets.push(addr);
+        }
+    }
+}
+
+/// What the alone timer announces to at `now`: the member table, **only while
+/// this member holds no active member**, and at most once per
+/// [`ALONE_ANNOUNCE_EVERY`] across this timer and the discovery offers (they
+/// share `last`). Empty for a member with a peer, which announces on foca's own
+/// schedule and never on this one.
+///
+/// **Why a timer of its own.** The discovery offers come from the replication
+/// loop's `select!`, whose sync arm runs to completion: with the peers frozen
+/// (or partitioned), a tick waits out each contact's handshake and exchange
+/// timeouts in turn, and no discovery tick, hence no offer, comes meanwhile. An
+/// alone member is `Disconnected` and says nothing foca schedules, so it would
+/// wait for the end of that tick before it announced to anyone. Measured: 19 s
+/// with nothing sent by two members that had both declared everyone down.
+pub(crate) fn alone_announce_targets(
+    swim: &Swim,
+    last: &mut Option<Instant>,
+    now: Instant,
+) -> Vec<SocketAddr> {
+    let due = swim.num_members() == 0
+        && last.is_none_or(|at| now.saturating_duration_since(at) >= ALONE_ANNOUNCE_EVERY);
+    let mut targets = Vec::new();
+    if due {
+        add_table_addresses(swim, &mut targets);
+        if !targets.is_empty() {
+            *last = Some(now);
         }
     }
     targets
 }
 
 /// The least time between two announces to the whole member table by a member
-/// that is alone ([`announce_targets`]): discovery offers each seed every
-/// interval, and the table is announced to once for all of them.
+/// that is alone ([`announce_targets`], [`alone_announce_targets`]): discovery
+/// offers each seed every interval, and the table is announced to once for all
+/// of them. It is also the period of the alone timer.
 const ALONE_ANNOUNCE_EVERY: Duration = Duration::from_secs(1);
 
 /// Collects foca's outputs so they can be dispatched after the call returns.
@@ -1281,6 +1326,28 @@ pub async fn run(
         }
     });
 
+    // The alone timer: ticks this loop once per [`ALONE_ANNOUNCE_EVERY`], and
+    // the loop announces to its table if it holds no active member. Its own
+    // task, so nothing the replication loop is waiting on delays it. One-shot in
+    // the supervisor's sense, as the announcing task above: it ends when the
+    // receiver is gone, and a panic is fatal.
+    let _alone = kimmy_task::supervise_oneshot("membership_alone_announce", shutdown.clone(), {
+        let tx = tx.clone();
+        async move {
+            let mut ticker = tokio::time::interval(ALONE_ANNOUNCE_EVERY);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let scheduled = ticker.tick().await.into_std();
+                // A full channel means the loop is behind: skip this tick, the
+                // next one follows. The channel closing ends the task.
+                match tx.try_send(Input::AloneTick(scheduled)) {
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                }
+            }
+        }
+    });
+
     info!(bind = %local, "gossiping membership");
 
     let mut collector = Collector {
@@ -1297,6 +1364,15 @@ pub async fn run(
         let result = match input {
             Input::Data(bytes) => foca.handle_data(&bytes, &mut collector),
             Input::Timer(timer) => foca.handle_timer(timer, &mut collector),
+            Input::AloneTick(scheduled) => {
+                let mut result = Ok(());
+                for target in alone_announce_targets(&foca, &mut announced_alone, scheduled) {
+                    if let Err(e) = foca.announce(Member::announcing(target), &mut collector) {
+                        result = Err(e);
+                    }
+                }
+                result
+            }
             Input::Announce(addr) => {
                 let alone_due = foca.num_members() == 0
                     && announced_alone.is_none_or(|at| at.elapsed() >= ALONE_ANNOUNCE_EVERY);
