@@ -614,6 +614,116 @@ async fn all_report(client: &reqwest::Client, nodes: Vec<&Node>, expected: u64) 
     true
 }
 
+/// A write on a healthy member reaches an observer whose peers include `frozen`
+/// members that were frozen just before it, and how long that takes. **A
+/// measurement more than a test**: it prints the time and asserts only that the
+/// write arrives within a minute, because the time has two parts and only one of
+/// them is bounded tightly.
+///
+/// The observer's sync tick dials its chosen peers (up to the fanout of three). A
+/// frozen member (`SIGSTOP`: the kernel accepts the connection, nothing answers)
+/// holds a dial for the TLS bound of 5 s. The dials were one after the other with
+/// the rounds, so a healthy peer behind `n` frozen ones waited `5 n` s for its
+/// turn; they are together now, so the wait is one bound whatever `n` is. That
+/// is the part this change bounds, and under load the runs without the second
+/// part land at 7 to 12 s.
+///
+/// The second part: a peer that froze **after** its connection was made, in the
+/// middle of a tick, holds its round for the request timeout (30 s), and the
+/// rounds are one after another, so two such peers are 60 s and a healthy peer
+/// behind them waits. On a loaded two-core box that is a third of the runs. It is
+/// not changed here (a bound on a round's first reply would be); a minute is what
+/// the assertion allows it.
+async fn a_write_reaches_the_observer_past_frozen_members(frozen: usize) {
+    const NAMES: [&str; 3] = ["node-f1", "node-f2", "node-f3"];
+    let client = reqwest::Client::new();
+    let (po, ph) = (ports::choose(), ports::choose());
+    let observer = Node::spawn_with_interval("node-o", po, &[ph], "", 1);
+    let healthy = Node::spawn_with_interval("node-h", ph, &[po], "", 1);
+    let frozen_nodes: Vec<Node> = (0..frozen)
+        .map(|i| Node::spawn_with_interval(NAMES[i], ports::choose(), &[po], "", 1))
+        .collect();
+    let mut everyone: Vec<&Node> = vec![&observer, &healthy];
+    everyone.extend(frozen_nodes.iter());
+    for node in &everyone {
+        node.try_ready(&client).await.unwrap_or_else(|exited| panic!("{exited}"));
+    }
+    eventually("gossip to form", || all_report(&client, everyone.clone(), frozen as u64 + 1)).await;
+
+    let token = healthy.login(&client).await;
+    for path_and_body in [
+        ("/v1/db/shop/collections".to_string(), serde_json::json!({ "name": "c" })),
+        ("/v1/db/shop/coll/c/docs".to_string(), serde_json::json!({ "_id": 0 })),
+    ] {
+        client
+            .post(healthy.url(&path_and_body.0))
+            .bearer_auth(&token)
+            .json(&path_and_body.1)
+            .send()
+            .await
+            .unwrap();
+    }
+    let seen = |id: u64| {
+        let (client, observer) = (&client, &observer);
+        async move {
+            let token = observer.login(client).await;
+            let Ok(res) = client
+                .post(observer.url("/v1/db/shop/coll/c/find"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "filter": { "_id": id } }))
+                .send()
+                .await
+            else {
+                return false;
+            };
+            let Ok(body) = res.json::<serde_json::Value>().await else {
+                return false;
+            };
+            body["count"].as_u64() == Some(1)
+        }
+    };
+    eventually("the first write to reach the observer", || seen(0)).await;
+
+    for node in &frozen_nodes {
+        node.signal("STOP");
+    }
+    let started = std::time::Instant::now();
+    client
+        .post(healthy.url("/v1/db/shop/coll/c/docs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "_id": 1 }))
+        .send()
+        .await
+        .unwrap();
+    while !seen(1).await {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the write never reached the observer"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let took = started.elapsed();
+    eprintln!("write reached the observer after {took:?} past {frozen} frozen");
+}
+
+#[tokio::test]
+#[ignore = "boots a real cluster; run with --ignored"]
+async fn a_write_reaches_an_observer_past_one_frozen_member() {
+    a_write_reaches_the_observer_past_frozen_members(1).await;
+}
+
+#[tokio::test]
+#[ignore = "boots a real cluster; run with --ignored"]
+async fn a_write_reaches_an_observer_past_two_frozen_members() {
+    a_write_reaches_the_observer_past_frozen_members(2).await;
+}
+
+#[tokio::test]
+#[ignore = "boots a real cluster; run with --ignored"]
+async fn a_write_reaches_an_observer_past_three_frozen_members() {
+    a_write_reaches_the_observer_past_frozen_members(3).await;
+}
+
 // ---------------------------------------------------------------------------
 // Membership
 // ---------------------------------------------------------------------------
