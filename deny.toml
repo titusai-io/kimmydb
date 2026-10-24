@@ -73,6 +73,23 @@ ignore = [
     # to move to (the advisory says so); revisit when `rsa` 0.10 ships with
     # the constant-time rewrite.
     { id = "RUSTSEC-2023-0071", reason = "RSA is used for signature verification with public keys only; the timing side channel needs a private-key operation the server never performs" },
+    # `crypto-bigint` 0.5.5 reaches the graph through `jsonwebtoken`'s `rust_crypto`
+    # backend (`p256`, `p384` via `elliptic-curve` 0.13, and `rsa` 0.9). The
+    # advisory is timing variability in its subtraction, zero-count, division,
+    # Montgomery multiplication, `UintRef` equality and `BoxedMontyForm::invert`.
+    # The server only *verifies* ES256 and RS256 tokens, against the identity
+    # provider's public JWKs (`DecodingKey::from_jwk`), so every operand is a
+    # public key, a public signature or a message hash; its own tokens are HS256
+    # (HMAC and SHA-2, no `crypto-bigint`). No production code builds an EC or
+    # RSA signing key: the guard test `no_production_code_builds_an_ec_or_rsa_signing_key`
+    # in kimmy-auth fails if one appears, which is the moment this line stops
+    # being true. The fix is `crypto-bigint` 0.7.6, which `jsonwebtoken` can take
+    # once its RustCrypto update lands (upstream PR Keats/jsonwebtoken#536, open on
+    # 2026-10-24; 11.1.0 pins `p256`/`p384` 0.13). `aws_lc_rs` would remove it but
+    # adds CMake and a C build (ADR-016). Re-check at the next `jsonwebtoken`
+    # release and by 2026-11-24; the `unused-ignored-advisory` warning says when
+    # it stops matching.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 via jsonwebtoken rust_crypto: the server only verifies ES256/RS256 with public JWKs and signs HS256 with HMAC, so no secret operand reaches it; guarded by a kimmy-auth test; fix needs jsonwebtoken to adopt the p256/p384 0.14 line (upstream PR 536); re-check by 2026-11-24" },
 ]
 
 [licenses]
