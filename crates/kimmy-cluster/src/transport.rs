@@ -169,12 +169,38 @@ const STREAM_REUSE_WITHIN: Duration = Duration::from_secs(270);
 
 const _: () = assert!(STREAM_REUSE_WITHIN.as_secs() < SERVE_IDLE_TIMEOUT.as_secs());
 
+/// The payload of the error [`WriteProgress`] raises, so that only this bound's own
+/// timeout is a serving-side `timeout`; the kernel's `ETIMEDOUT` (a keepalive that
+/// found the peer gone) carries the same kind and stays `io`.
+#[derive(Debug)]
+struct WriteStalled(Duration);
+
+impl std::fmt::Display for WriteStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the peer made no progress reading for {:?}", self.0)
+    }
+}
+
+impl std::error::Error for WriteStalled {}
+
+/// Whether `e` is [`WriteProgress`]'s own timeout.
+fn is_write_stall(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<WriteStalled>())
+}
+
 /// A stream whose writes must make progress: a write (or flush) that is `Pending`
 /// for `stall` without letting any bytes through ends with `TimedOut`. A peer that
 /// is alive at TCP and has stopped reading answers every zero-window probe, so
 /// neither keepalive nor retransmission ever ends the connection, and the serving
 /// side's task would wait on its answer for ever. Each chunk the kernel takes
 /// restarts the clock, so a slow reader is not a stalled one.
+///
+/// **What a "chunk" is for a TLS stream.** `poll_write` takes plaintext into the TLS
+/// session's buffer and reports progress as it does; but `poll_flush` reports none
+/// until everything buffered has gone: the final flush of an answer (up to the
+/// session's buffer limit, 64 KiB) must complete within the stall bound. A reader
+/// slower than about 2 KiB/s is therefore cut at the end of an answer, though it
+/// was reading all along.
 struct WriteProgress<S> {
     inner: S,
     stall: Duration,
@@ -205,10 +231,7 @@ impl<S> WriteProgress<S> {
                 let timer = self.waiting.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
                 if timer.as_mut().poll(cx).is_ready() {
                     self.waiting = None;
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("the peer made no progress reading for {stall:?}"),
-                    )))
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, WriteStalled(stall))))
                 } else {
                     Poll::Pending
                 }
@@ -579,8 +602,9 @@ impl ServeFailure {
         match error {
             ProtocolError::Closed => None,
             // A write that made no progress for the stall bound is a peer that is
-            // alive and stopped reading: a wait that ran out, not a broken pipe.
-            ProtocolError::Io(e) if e.kind() == io::ErrorKind::TimedOut => Some(Self::Timeout),
+            // alive and stopped reading: a wait that ran out, not a broken pipe. The
+            // kernel's own `ETIMEDOUT` (keepalive found the peer gone) is `Io`.
+            ProtocolError::Io(e) if is_write_stall(e) => Some(Self::Timeout),
             ProtocolError::Io(_) => Some(Self::Io),
             ProtocolError::TimedOut(_) => Some(Self::Timeout),
             ProtocolError::Idle => Some(Self::Idle),
@@ -1758,6 +1782,7 @@ where
 /// follows for that reason. The replay stays owed by that peer, is reported once,
 /// and asks again next round from a position that has moved on with the peers'
 /// retention.
+#[allow(clippy::too_many_arguments)]
 async fn replay_own_origin<S>(
     engine: &Engine,
     stream: &mut S,
@@ -1766,6 +1791,7 @@ async fn replay_own_origin<S>(
     theirs: &VersionVector,
     catch_up: &crate::catchup::CatchUp,
     deadline: Instant,
+    clock: &RoundClock,
 ) -> Result<(), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1831,6 +1857,7 @@ where
                 )));
             }
         };
+        clock.heard_now();
         let (entries, exhausted, scanned_to) = entries;
         match replay_apply(
             engine,
@@ -1855,7 +1882,9 @@ where
             ReplayPage::Empty { next } if next > from => from = next,
             ReplayPage::Empty { .. } => return Ok(()),
         }
-        if Instant::now() >= deadline {
+        // The replay stays owed and asks again next round, from where the cursor is;
+        // after a long apply it does not send on a connection that may be gone.
+        if Instant::now() >= deadline || clock.quiet_too_long() {
             return Ok(());
         }
     }
@@ -2303,6 +2332,7 @@ where
         .await?;
     let (frame, undecodable, decoded_seq) =
         crate::protocol::read_frame_noting_facts(stream).await?;
+    clock.heard_now();
     let (theirs, their_witnessed, their_facts, asked_replay) = match frame {
         Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
             if undecodable {
@@ -2365,8 +2395,17 @@ where
         && catch_up.replay_armed()
         && !catch_up.replay_answered(their_node)
     {
-        replay_own_origin(engine, stream, peer, their_node, &theirs, &catch_up, snapshot_deadline)
-            .await?;
+        replay_own_origin(
+            engine,
+            stream,
+            peer,
+            their_node,
+            &theirs,
+            &catch_up,
+            snapshot_deadline,
+            clock,
+        )
+        .await?;
     }
 
     // What we have *seen*, not what we could serve. Asking against the
@@ -2464,8 +2503,21 @@ where
             capable: stalls.digest_capable.contains(&their_node),
             detail: stalls.definition_detail(&their_node),
         });
+        if clock.quiet_too_long() {
+            // After a replay whose apply was long: no request on a connection the
+            // serving side may have ended. The check runs next round.
+            debug!(%peer, "the divergence check is left to the next round: this connection has been quiet too long");
+            return Ok(SyncOutcome {
+                peer: Some(their_node),
+                behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
+                exhausted: true,
+                peer_catching_up,
+                ..SyncOutcome::default()
+            });
+        }
         let (findings, digest, definitions) =
             ask_divergence(engine, stream, gate.probe, context).await?;
+        clock.heard_now();
         stalls.note_digest(their_node, digest.as_ref());
         return Ok(SyncOutcome {
             peer: Some(their_node),
@@ -2540,6 +2592,13 @@ where
             Message::BeyondHorizon {}
         }
         _ => {
+            if clock.quiet_too_long() {
+                // A replay's long apply ahead of this request: not sent on a
+                // connection the serving side may have ended. The round is left
+                // for the next one, which pulls this window.
+                debug!(%peer, "the pull is left to the next round: this connection has been quiet too long");
+                return Ok(SyncOutcome::default());
+            }
             write_frame(
                 stream,
                 &Message::AskEntries {
@@ -2577,9 +2636,7 @@ where
         answer = read_frame(stream).await?;
     }
 
-    // When the peer last spoke on this connection: the serving side's idle bound
-    // runs from here, through the apply below.
-    let heard = Instant::now();
+    clock.heard_now();
 
     // Answered with a window (or with nothing to give because this member is
     // level): whatever was set aside for this peer is settled (ADR-224).
@@ -3007,7 +3064,7 @@ where
     // each comfortably under the batch cap — still get checked on
     // nearly every round, unlike a single global "nothing to pull" gate,
     // which a continuous trickle of new writes can starve indefinitely.
-    if window_exhausted && heard.elapsed() >= clock.reuse_within {
+    if window_exhausted && clock.quiet_too_long() {
         // The apply (its writer wait, a replicated index build) took so long that the
         // serving side has ended the connection, or is about to: the check would send
         // a request on a stream it has dropped, and the round would fail and back a
@@ -3426,11 +3483,33 @@ struct RoundClock {
     /// How long after the last frame heard the round still sends on its connection
     /// ([`STREAM_REUSE_WITHIN`]); a field so a test can shorten it.
     reuse_within: Duration,
+    /// When the peer last spoke on this round's connection: the serving side's idle
+    /// bound runs from there, through any apply.
+    heard: parking_lot::Mutex<Instant>,
 }
 
 impl Default for RoundClock {
     fn default() -> Self {
-        Self { applying_nanos: Default::default(), reuse_within: STREAM_REUSE_WITHIN }
+        Self {
+            applying_nanos: Default::default(),
+            reuse_within: STREAM_REUSE_WITHIN,
+            heard: parking_lot::Mutex::new(Instant::now()),
+        }
+    }
+}
+
+impl RoundClock {
+    /// A frame was just read from the peer.
+    fn heard_now(&self) {
+        *self.heard.lock() = Instant::now();
+    }
+
+    /// Whether the connection has been quiet so long that the serving side may have
+    /// ended it: asked before **every** request that can follow an apply (a replay
+    /// page's, a window's, the divergence check), since any of them may follow a
+    /// long one.
+    fn quiet_too_long(&self) -> bool {
+        self.heard.lock().elapsed() >= self.reuse_within
     }
 }
 
@@ -11192,36 +11271,74 @@ mod tests {
         serving.abort();
     }
 
-    /// **A round that has been quiet past the reuse bound leaves its follow-up check
-    /// to the next round** instead of sending on a connection the serving side may
-    /// have ended. The round pulls a window (so there is an apply) and the window is
-    /// exhausted, so the divergence check follows; with the bound spent it does not,
-    /// and the round still succeeds. With the default bound it runs.
-    #[tokio::test]
-    async fn a_round_quiet_past_the_reuse_bound_skips_its_follow_up_check() {
+    /// One round against a node holding `docs` documents (0 or 1), with the reuse bound
+    /// and the extra apply time a test chooses.
+    async fn quiet_round(
+        docs: i64,
+        reuse_within: Duration,
+        apply_takes: Duration,
+    ) -> (SyncOutcome, bool) {
         let (a, _a_dir, addr, _served) = serving_counted().await;
-        let orders = a.create_collection("shop", "orders").unwrap();
-        a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
-        for (reuse_within, checked) in [(STREAM_REUSE_WITHIN, true), (Duration::ZERO, false)] {
-            let b_dir = tempfile::tempdir().unwrap();
-            let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
-            let (mut stream, their_node) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
-            let clock = RoundClock { reuse_within, ..RoundClock::default() };
-            let outcome = sync_round(
-                &b,
-                &mut stream,
-                addr,
-                their_node,
-                None,
-                &mut PeerStalls::new(),
-                Instant::now() + Duration::from_secs(60),
-                &clock,
-            )
-            .await
-            .expect("the round succeeds either way");
-            assert!(b.get_collection("shop", "orders").is_ok(), "the pull applied");
-            assert_eq!(outcome.divergent.is_some(), checked, "reuse bound {reuse_within:?}");
+        if docs > 0 {
+            let orders = a.create_collection("shop", "orders").unwrap();
+            a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
         }
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, their_node) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let clock = RoundClock { reuse_within, ..RoundClock::default() };
+        test_hooks::APPLY_TAKES.with(|t| t.set(apply_takes));
+        let outcome = sync_round(
+            &b,
+            &mut stream,
+            addr,
+            their_node,
+            None,
+            &mut PeerStalls::new(),
+            Instant::now() + Duration::from_secs(60),
+            &clock,
+        )
+        .await
+        .expect("the round succeeds either way");
+        test_hooks::APPLY_TAKES.with(|t| t.set(Duration::ZERO));
+        (outcome, b.get_collection("shop", "orders").is_ok())
+    }
+
+    /// **A round that has been quiet past the reuse bound sends nothing more on its
+    /// connection**, whichever request would come next, and still succeeds: the serving
+    /// side may have ended the connection (its idle bound), and a request on it would
+    /// fail the round and back a live peer off. All the sites ask one helper
+    /// (`RoundClock::quiet_too_long`).
+    ///
+    /// (1) A long apply ahead of the divergence check that follows a pull: the pull is
+    /// made and applied, the check is left to the next round.
+    #[tokio::test]
+    async fn a_long_apply_leaves_the_divergence_check_to_the_next_round() {
+        let (outcome, pulled) =
+            quiet_round(1, Duration::from_millis(200), Duration::from_millis(400)).await;
+        assert!(pulled, "the pull was made and applied");
+        assert!(outcome.divergent.is_none(), "the check was left to the next round");
+        let (outcome, pulled) = quiet_round(1, STREAM_REUSE_WITHIN, Duration::ZERO).await;
+        assert!(pulled);
+        assert!(outcome.divergent.is_some(), "with the connection fresh, the check runs");
+    }
+
+    /// (2) A connection already quiet past the bound ahead of the divergence check of a
+    /// round with nothing to pull (the check that follows a replay): left alone.
+    #[tokio::test]
+    async fn a_quiet_connection_leaves_the_check_of_a_converged_round_to_the_next() {
+        let (outcome, _) = quiet_round(0, Duration::ZERO, Duration::ZERO).await;
+        assert!(outcome.divergent.is_none() && outcome.exhausted);
+        let (outcome, _) = quiet_round(0, STREAM_REUSE_WITHIN, Duration::ZERO).await;
+        assert!(outcome.divergent.is_some(), "fresh, the check runs");
+    }
+
+    /// (3) A quiet connection ahead of the pull's own request (what follows a replay's
+    /// long apply): the request is not sent, and nothing is applied.
+    #[tokio::test]
+    async fn a_quiet_connection_leaves_the_pull_to_the_next_round() {
+        let (_, pulled) = quiet_round(1, Duration::ZERO, Duration::ZERO).await;
+        assert!(!pulled, "no request was sent, so nothing was pulled");
     }
 
     /// A write that makes no progress is ended: a stream whose far end never reads.
@@ -11231,11 +11348,20 @@ mod tests {
         let (near, _far) = tokio::io::duplex(64);
         let mut stream = WriteProgress::new(near, Duration::from_secs(1));
         let began = Instant::now();
-        let written = stream.write_all(&vec![7u8; 1024 * 1024]).await;
+        let written = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.write_all(&vec![7u8; 1024 * 1024]),
+        )
+        .await
+        .expect("the write ended on the stall bound and did not hang");
         let e = written.expect_err("nothing reads, so the write cannot finish");
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert!(began.elapsed() >= Duration::from_millis(900), "{:?}", began.elapsed());
         assert_eq!(ServeFailure::of(&ProtocolError::Io(e)), Some(ServeFailure::Timeout));
+        // The kernel's ETIMEDOUT, from keepalive finding the peer gone, is not ours.
+        let kernel = io::Error::from_raw_os_error(libc::ETIMEDOUT);
+        assert_eq!(kernel.kind(), io::ErrorKind::TimedOut, "premise: same kind");
+        assert_eq!(ServeFailure::of(&ProtocolError::Io(kernel)), Some(ServeFailure::Io));
     }
 
     /// A slow reader is not a stalled one: each chunk it takes restarts the clock.
@@ -11791,9 +11917,18 @@ mod tests {
         let round = || async {
             let (mut ours, theirs_end) = tokio::io::duplex(MAX_FRAME);
             let peer = tokio::spawn(holder(theirs_end, served.borrow().clone()));
-            replay_own_origin(&engine, &mut ours, addr, c, &theirs, &catch_up, ample())
-                .await
-                .unwrap();
+            replay_own_origin(
+                &engine,
+                &mut ours,
+                addr,
+                c,
+                &theirs,
+                &catch_up,
+                ample(),
+                &RoundClock::default(),
+            )
+            .await
+            .unwrap();
             drop(ours);
             peer.await.unwrap();
         };
@@ -11951,6 +12086,7 @@ mod tests {
                         theirs,
                         catch_up,
                         deadline,
+                        &RoundClock::default(),
                     )
                     .await;
                     drop(ours);
@@ -12034,6 +12170,7 @@ mod tests {
                 &theirs,
                 &catch_up,
                 ample(),
+                &RoundClock::default(),
             )
             .await;
             drop(ours);
