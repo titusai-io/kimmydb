@@ -752,24 +752,35 @@ fn early_retry_delay(peerless_ticks: u32, interval: Duration) -> Option<Duration
 }
 
 /// One dial a tick started: its result is the connection, ready for the round.
-type DialTask = tokio::task::JoinHandle<Result<Dialled, ProtocolError>>;
+/// Aborts the dial when dropped, whether or not it is being awaited: a round that is
+/// waiting for its dial when the loop ends takes the dial with it, which a bare
+/// `JoinHandle` would not (dropping one detaches the task).
+struct DialTask(tokio::task::JoinHandle<Result<Dialled, ProtocolError>>);
+
+impl std::future::Future for DialTask {
+    type Output = Result<Result<Dialled, ProtocolError>, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl Drop for DialTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// The dials a tick started, by peer, each taken when that peer's round begins.
-/// Dropping it aborts the dials still running.
 #[derive(Default)]
 struct DialsInFlight(BTreeMap<SocketAddr, DialTask>);
 
 impl DialsInFlight {
     fn take(&mut self, peer: &SocketAddr) -> Option<DialTask> {
         self.0.remove(peer)
-    }
-}
-
-impl Drop for DialsInFlight {
-    fn drop(&mut self) {
-        for dial in self.0.values() {
-            dial.abort();
-        }
     }
 }
 
@@ -1199,16 +1210,23 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // for the single writer, and it is the dial that waits on a peer.
                 // Aborted with the tick, so a dial still running when it ends does
                 // not outlive it.
-                let mut dialling = DialsInFlight::default();
-                for &peer in &chosen {
-                    let dial = dial_for_round(Arc::clone(&engine), peer, config.secret.clone());
-                    // UNSUPERVISED: one dial, whose end is the result its round awaits; a
-                    // panic in it is that round's failure, and the guard aborts it with the tick.
-                    let task = tokio::spawn(dial);
-                    dialling.0.insert(peer, task);
-                }
                 let mut draining: VecDeque<Contact> =
                     chosen.into_iter().map(Contact::new).collect();
+                let mut dialling = DialsInFlight::default();
+                for contact in &mut draining {
+                    // Under the contact's own `cluster.sync` span, so what the dial
+                    // logs carries the peer, as it did when the round made it.
+                    let dial = dial_for_round(
+                        Arc::clone(&engine),
+                        contact.peer,
+                        config.secret.clone(),
+                    )
+                    .instrument(contact.span());
+                    // UNSUPERVISED: one dial, whose end is the result its round awaits; a
+                    // panic in it is that round's failure, and the guard aborts it with the tick.
+                    let task = DialTask(tokio::spawn(dial));
+                    dialling.0.insert(contact.peer, task);
+                }
                 // Contacts whose `BeyondHorizon` was set aside (ADR-224), asked again
                 // when everything else in the tick has finished, a truncated contact
                 // still draining included.
@@ -1258,9 +1276,15 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // The first pull of a contact goes over the connection dialled
                     // at the top of the tick; a further pull of a drain, and a peer
                     // asked again after a set-aside, dial their own.
+                    // The dial was made beside the loop, before this round's turn:
+                    // its time is charged to this pull as if it had been made here,
+                    // since the contact's next pull pays a dial and `fits_before`
+                    // judges it by this one.
+                    let mut dial_took = Duration::ZERO;
                     let pulled = match dialling.take(&peer) {
                         Some(dial) => match dial.await {
                             Ok(Ok(dialled)) => {
+                                dial_took = dialled.dial_took();
                                 sync_once_dialled(
                                     &engine,
                                     peer,
@@ -1287,7 +1311,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             .await
                         }
                     };
-                    let took = started.elapsed();
+                    let took = started.elapsed() + dial_took;
                     // Taken whether the round succeeded or not: a window
                     // applied before a failure later in the round is work
                     // done, and the pull series must not lose it in exactly
@@ -3377,6 +3401,51 @@ mod tests {
         assert!(
             took < Duration::from_secs(8),
             "the tick took {took:?}: two bounds of 5 s one after the other, not one"
+        );
+    }
+
+    /// **A dial still running when the loop ends is aborted with it.** The tick
+    /// dials its peers beside the round, and the guard that holds the dials aborts
+    /// them when the loop's future is dropped; without it the dial goes on, holding
+    /// its socket, until its own 5 s bound. A silent listener accepts the connection
+    /// and the loop is aborted while that dial waits on it: the listener must see the
+    /// connection end (EOF) well before the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dial_in_flight_ends_with_the_loop() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = listener.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let local = "127.0.0.1:1".parse().unwrap();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![])], "a-secret".into(), local);
+        config.sync_interval = Duration::from_secs(60);
+        config.discovery_interval = Duration::from_secs(600);
+        config.resolver = Some(Arc::new(move || Box::pin(async move { BTreeSet::from([silent]) })));
+        let looping = tokio::spawn(replicate(engine, config));
+        let (mut held, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
+            .await
+            .expect("the loop dialled the silent listener")
+            .unwrap();
+        let aborted = Instant::now();
+        looping.abort();
+        let _ = looping.await;
+        // The dial's ClientHello arrives first; the end of the connection is what is read for.
+        let ended = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut buf = [0u8; 4096];
+            loop {
+                match held.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "the dial was still holding its connection {:?} after the loop ended",
+            aborted.elapsed()
         );
     }
 
