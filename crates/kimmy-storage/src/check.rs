@@ -1190,6 +1190,10 @@ mod tests {
     /// and the verdict is the view's own (`past the end of the file`), not redb's.
     /// With 300 more documents the file's last page falls where an eight-block
     /// cut leaves redb's layout check satisfied and the walk reaches past the end.
+    /// That window recurs as redb doubles the file (700 and 2,400 more documents
+    /// repair clean, 150 to 600 and 900 to 1,800 reach the view), so a change that
+    /// moves the store's size out of it fails this test loudly, on the verdict,
+    /// and the count is then re-found by probing.
     #[test]
     fn a_killed_store_cut_short_is_damaged() {
         let (_dir, path) = an_unclean_store_with(300);
