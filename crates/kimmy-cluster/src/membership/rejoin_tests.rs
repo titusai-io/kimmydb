@@ -249,6 +249,9 @@ struct Node {
     keeps: bool,
     /// The running process's member set.
     members: Members,
+    /// When the alone timer last announced to the table
+    /// ([`super::alone_announce_targets`]).
+    alone_last: Option<Instant>,
 }
 
 /// The simulated network: nodes, a clock in milliseconds, and the timers each
@@ -298,6 +301,7 @@ impl Net {
                     kept: Some(first),
                     keeps: true,
                     members: process_members(&exchanges, i, 0),
+                    alone_last: None,
                 }
             })
             .collect();
@@ -513,6 +517,25 @@ impl Net {
             }
         }
         self.now = until;
+    }
+
+    /// One tick of every running member's alone timer: what it announces to,
+    /// announced.
+    fn alone_tick(&mut self) {
+        let now = self.base + Duration::from_millis(self.now);
+        for node in 0..self.nodes.len() {
+            if self.nodes[node].life != Life::Running {
+                continue;
+            }
+            let n = &mut self.nodes[node];
+            let targets = super::alone_announce_targets(&n.swim, &mut n.alone_last, now);
+            for addr in targets {
+                let to = Member::announcing(addr);
+                self.input(node, Via::Other, |swim, out| {
+                    let _ = swim.announce(to, out);
+                });
+            }
+        }
     }
 
     fn freeze(&mut self, node: usize) {
@@ -1126,6 +1149,77 @@ fn a_renewal_walk_ends_with_every_block_held_against_peers_on_this_build() {
         for peer in [A, C] {
             assert_eq!(held_boot(&net, B, peer), Some(boot(peer, 0)), "walk of {walks}");
             assert_eq!(held_boot(&net, peer, B), Some(boot(B, net.nodes[B].epoch)));
+        }
+    }
+}
+
+/// The alone timer: two members that rejoined after a freeze, whose peers are
+/// frozen and whose discovery offers never come (the replication loop's tick is
+/// stuck on the frozen peers, which is what the field showed: 19 s with nothing
+/// sent by either), find each other on the timer alone. A member that holds a
+/// peer announces nothing on it, and the timer sends once per second at most.
+#[test]
+fn members_alone_after_a_freeze_find_each_other_on_the_alone_timer_without_discovery_offers() {
+    let mut net = Net::new(FIELD_SEEDS, daemon);
+    // Formed: nobody is alone, so the timer announces to no one.
+    let mut last = None;
+    let now = net.base + Duration::from_millis(net.now);
+    for member in [X, Y, Z, M] {
+        assert!(
+            super::alone_announce_targets(&net.nodes[member].swim, &mut last, now).is_empty(),
+            "{member} holds peers: the timer is silent"
+        );
+        assert!(last.is_none(), "and records nothing");
+    }
+    net.freeze(X);
+    net.freeze(M);
+    net.run_for(15_000);
+    net.freeze(Y);
+    net.freeze(Z);
+    // Discovery never offers: nothing but the timer introduces anyone.
+    net.next_discovery = u64::MAX;
+    net.resume(X);
+    net.run_for(2_000);
+    net.resume(M);
+    net.run_for(25_000);
+    for member in [X, M] {
+        assert!(
+            net.live_at(member).is_empty(),
+            "premise: {member} declared everyone down and nobody has found it: {:?}",
+            net.live_at(member)
+        );
+    }
+    // Once per second at most, across calls.
+    let mut once = None;
+    let t0 = net.base + Duration::from_millis(net.now);
+    assert!(!super::alone_announce_targets(&net.nodes[X].swim, &mut once, t0).is_empty());
+    assert!(
+        super::alone_announce_targets(
+            &net.nodes[X].swim,
+            &mut once,
+            t0 + Duration::from_millis(999)
+        )
+        .is_empty(),
+        "not twice inside a second"
+    );
+    assert!(
+        !super::alone_announce_targets(
+            &net.nodes[X].swim,
+            &mut once,
+            t0 + super::ALONE_ANNOUNCE_EVERY
+        )
+        .is_empty(),
+        "and again a second later"
+    );
+    for _ in 0..6 {
+        net.alone_tick();
+        net.run_for(1_000);
+    }
+    let (x, m) = (net.nodes[X].addr, net.nodes[M].addr);
+    assert!(net.live_at(X).contains(&m) && net.live_at(M).contains(&x), "X and M found each other");
+    for member in [X, M] {
+        for peer in [Y, Z] {
+            assert!(!net.live_at(member).contains(&net.nodes[peer].addr), "{member} holds {peer}");
         }
     }
 }

@@ -4529,9 +4529,26 @@ async fn x_and_m_alone_together(client: &reqwest::Client, x: &Node, m: &Node) ->
 /// X and M are frozen (SIGSTOP) until Y and Z declare them down, then Y and Z
 /// are frozen and X and M resumed. X and M learn they were declared down and
 /// rejoin; they must then declare the frozen Y and Z down within SWIM's own
-/// timing (a probe, its round trip and the suspicion time, about 6.5 s here)
-/// and find each other. Before the fix a member that rejoined on a `TurnUndead`
-/// sat disconnected, probing no one: X and M held Y and Z live for good.
+/// timing and find each other. Before the fix a member that rejoined on a
+/// `TurnUndead` sat disconnected, probing no one: X and M held Y and Z live for
+/// good.
+///
+/// **The bound, derived from the config** (`Config::new_lan(16)`: probe period
+/// 1 s, suspicion `max(1, log10 16) * 4 * 1 s` = 4.816 s). The clock starts at
+/// M's `SIGCONT`, the later one. A rejoined member probes one table member per
+/// period in a shuffled cycle of three (X: Y, Z, M; M: X, Y, Z), so its last
+/// member's probe starts at most 3 s after the rejoin, goes suspect 1 s later
+/// (the ack and the indirect probes take the period), and is declared down
+/// 4.816 s after that: 3 + 1 + 4.816 = 8.8 s. Two members that have declared
+/// everyone down are alone, and the membership loop's own alone timer announces
+/// to the table at most 1 s later (`ALONE_ANNOUNCE_EVERY`), which the other end
+/// answers in a round trip: 8.8 + 1 + the datagram and the two scrapes that
+/// observe it = about 11 s. The bound is 20 s: about twice that for a loaded
+/// runner (the timers are real time, and two members and two frozen peers share
+/// the machine), and tight enough that a rejoin which stalls fails it. The 30 s it
+/// replaced had no derivation, and a member waited out the replication loop's
+/// contacts to the frozen peers before it announced (each a handshake timeout of
+/// 10 s): 25 s on a two-core box under load.
 #[tokio::test]
 #[ignore = "boots a real four-node cluster; run with --ignored"]
 async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_frozen_peers_down() {
@@ -4553,7 +4570,8 @@ async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_frozen_pee
     tokio::time::sleep(Duration::from_secs(2)).await;
     m.signal("CONT");
     let took = x_and_m_alone_together(&client, &x, &m).await;
-    assert!(took < Duration::from_secs(30), "X and M took {took:?}");
+    eprintln!("X and M alone together after {took:?}");
+    assert!(took < Duration::from_secs(20), "X and M took {took:?}");
     y.signal("CONT");
     z.signal("CONT");
 }
