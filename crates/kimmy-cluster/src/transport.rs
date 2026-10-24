@@ -122,6 +122,56 @@ const SNAPSHOT_PAGE_RESERVE: Duration = Duration::from_secs(5);
 /// from, which is exactly what [`crate::PeerHealth`] then does.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the serving side waits for the first byte of the next request on a
+/// connection before it ends it, and how long a frame that has begun may stall.
+///
+/// **Why a bound at all.** A dialler that dies without a FIN or an RST (a power
+/// loss, a cut cable) leaves the server reading a socket that will never speak, and
+/// the server writes nothing meanwhile, so TCP never notices either. Each such
+/// connection held a task, a file descriptor and a TLS session for the life of the
+/// process. Keepalive ([`KEEPALIVE_IDLE`]) detects the dead peer; this ends a peer
+/// that is alive at TCP and silent at ours.
+///
+/// **Why 300 s.** The longest legitimate gap between two requests on one connection
+/// is a dialler working between them, and the work that takes time is local storage:
+/// it applies what a request returned (a batch of at most 1,024 entries or a
+/// snapshot page of at most 63 MiB, one transaction) and *waits as long as it takes*
+/// for the single writer first, since background work sets no wait budget
+/// ([`kimmy_storage::with_write_wait_budget`]). A hold of the writer longer than 60 s
+/// is a wedge (ADR-220), except an index build or drop, so a pull queued behind two
+/// other holds and then applying is 3 x 60 s = 180 s, in the worst case that is still
+/// a healthy node. Building the next window to push or confirm is a bounded read
+/// (the serve walk's examine budget, seconds). 300 s is that 180 s and then 120 s
+/// over, and 5 x the wedge bound. A dialler that waits longer (behind an index
+/// build, which has no bound) finds its connection ended at its next request: the
+/// round fails and backs off, nothing is lost, and the pull is repeated, which is
+/// idempotent.
+const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long a frame that has begun may go without its next bytes: a request's body
+/// is written at once by a live peer, so this is a peer that stopped mid-frame.
+const SERVE_FRAME_STALL: Duration = REQUEST_TIMEOUT;
+
+/// TCP keepalive on every cluster connection, dialled and accepted: the first probe
+/// after 30 s idle, then every 10 s, three unanswered probes ending the connection,
+/// so a peer that vanished is found in about 60 s. The kernel answers the probes of
+/// a live peer, so a connection a dialler holds idle for a long tick is unaffected.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_PROBES: u32 = 3;
+
+/// Turn keepalive on for `stream`. Best effort: a socket that refuses it still
+/// serves, and the idle bound still ends a dead peer.
+fn set_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_PROBES);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        debug!(error = %e, "could not set TCP keepalive on a cluster connection");
+    }
+}
+
 /// Called on the serving side with what a pushed batch became (ADR-140), so
 /// the receiver's own counters see a refusal that arrived by push exactly as
 /// one that arrived by pull.
@@ -430,12 +480,22 @@ pub(crate) struct ServeBudgets {
     /// [`REQUEST_TIMEOUT`]: the requester of a whole window has stopped
     /// waiting by then, and cannot take one in part.
     pub(crate) whole: Duration,
+    /// How long to wait for the next request, and for the rest of one begun
+    /// ([`SERVE_IDLE_TIMEOUT`], [`SERVE_FRAME_STALL`]).
+    pub(crate) waits: crate::protocol::FrameWaits,
 }
 
 impl ServeBudgets {
     /// What a node serves its peers with, read when a connection is served.
     pub(crate) fn serving() -> Self {
-        Self { partial: kimmy_storage::ExamineBudget::serve(), whole: REQUEST_TIMEOUT }
+        Self {
+            partial: kimmy_storage::ExamineBudget::serve(),
+            whole: REQUEST_TIMEOUT,
+            waits: crate::protocol::FrameWaits {
+                idle: SERVE_IDLE_TIMEOUT,
+                stall: SERVE_FRAME_STALL,
+            },
+        }
     }
 }
 
@@ -560,6 +620,7 @@ pub async fn serve_with(
             continue;
         }
 
+        set_keepalive(&stream);
         let engine = Arc::clone(&engine);
         let secret = secret.clone();
         let on_pushed = on_pushed.clone();
@@ -776,7 +837,7 @@ where
     let mut replay_cursor: Option<kimmy_core::Hlc> = None;
     loop {
         let (frame, undecodable, decoded_seq) =
-            crate::protocol::read_frame_noting_facts(&mut stream).await?;
+            crate::protocol::read_frame_noting_facts_within(&mut stream, budgets.waits).await?;
         match frame {
             Message::AskVersions { facts, facts_gen, echo } => {
                 if undecodable && let Some(members) = members {
@@ -1401,6 +1462,8 @@ pub(crate) async fn dial(
                 format!("connecting to {peer} timed out after {CONNECT_TIMEOUT:?}"),
             )
         })??;
+
+    set_keepalive(&tcp);
 
     // Built per round rather than held: a sync round is seconds apart, and a
     // dialling node has no accept loop to amortise it against.
@@ -5999,6 +6062,28 @@ pub(crate) mod test_serving {
         )
         .await;
         ended.lock().take()
+    }
+
+    /// Serve one connection accepted on `listener` with `budgets`, and answer how it
+    /// ended: the failure it was counted as, if any.
+    pub(crate) async fn serve_one_counting(
+        engine: Arc<Engine>,
+        listener: tokio::net::TcpListener,
+        secret: &str,
+        budgets: ServeBudgets,
+    ) -> Vec<ServeFailure> {
+        let (tcp, peer) = listener.accept().await.unwrap();
+        let tls = crate::tls::ClusterTls::new().unwrap();
+        let stream = tls.acceptor().accept(tcp).await.unwrap();
+        let binding = crate::tls::binding(stream.get_ref().1).unwrap();
+        let failures = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let hook: ServeFailHook = {
+            let failures = Arc::clone(&failures);
+            Arc::new(move |why| failures.lock().push(why))
+        };
+        serve_connection(&engine, stream, secret, &binding, None, Some(&hook), peer, budgets, None)
+            .await;
+        std::mem::take(&mut *failures.lock())
     }
 
     /// A node's serve counted: every failure, from the hook that is called
@@ -10737,6 +10822,178 @@ mod tests {
         (engine, dir, addr, counted)
     }
 
+    /// A serving side's budgets with the waits a test can sit through.
+    fn waits_of(idle: Duration, stall: Duration) -> ServeBudgets {
+        let mut budgets = ServeBudgets::serving();
+        budgets.waits = crate::protocol::FrameWaits { idle, stall };
+        budgets
+    }
+
+    async fn serving_one(
+        budgets: ServeBudgets,
+    ) -> (Arc<Engine>, tempfile::TempDir, SocketAddr, tokio::task::JoinHandle<Vec<ServeFailure>>)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(test_serving::serve_one_counting(
+            Arc::clone(&engine),
+            listener,
+            CLOSING_SECRET,
+            budgets,
+        ));
+        (engine, dir, addr, served)
+    }
+
+    async fn ask_versions(stream: &mut tokio_rustls::client::TlsStream<TcpStream>) {
+        write_frame(stream, &Message::AskVersions { facts: None, facts_gen: None, echo: None })
+            .await
+            .unwrap();
+        assert!(matches!(read_frame(stream).await, Ok(Message::Vectors { .. })));
+    }
+
+    /// **A peer that goes silent is dropped after the idle timeout**, counted as a
+    /// timeout: the connection is alive at TCP and says nothing, which keepalive
+    /// cannot tell from a quiet one.
+    #[tokio::test]
+    async fn a_peer_that_goes_silent_is_dropped_after_the_idle_timeout() {
+        let (_a, _dir, addr, served) =
+            serving_one(waits_of(Duration::from_secs(1), Duration::from_secs(1))).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        ask_versions(&mut stream).await;
+        let began = std::time::Instant::now();
+        let failures = tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("the server ended the silent connection")
+            .unwrap();
+        assert_eq!(failures, [ServeFailure::Timeout]);
+        assert!(began.elapsed() >= Duration::from_millis(900), "not before the timeout");
+        drop(stream);
+    }
+
+    /// **A slow but legitimate gap survives**: a dialler that works between two
+    /// requests for less than the idle timeout (an apply, a wait for the writer)
+    /// finds its connection as it left it.
+    #[tokio::test]
+    async fn a_gap_between_requests_shorter_than_the_idle_timeout_survives() {
+        let (_a, _dir, addr, served) =
+            serving_one(waits_of(Duration::from_secs(4), Duration::from_secs(4))).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        ask_versions(&mut stream).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        ask_versions(&mut stream).await;
+        close(&mut stream).await;
+        let failures = served.await.unwrap();
+        assert_eq!(failures, [], "a gap inside the bound is not a failure");
+    }
+
+    /// A frame that has begun and stops arriving is dropped on the stall bound,
+    /// idle timeout notwithstanding.
+    #[tokio::test]
+    async fn a_frame_that_stops_arriving_is_dropped_on_the_stall_bound() {
+        use tokio::io::AsyncWriteExt;
+        let (_a, _dir, addr, served) =
+            serving_one(waits_of(Duration::from_secs(60), Duration::from_secs(1))).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        stream.write_all(&1000u32.to_be_bytes()).await.unwrap();
+        stream.write_all(&[0u8; 10]).await.unwrap();
+        stream.flush().await.unwrap();
+        let failures = tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("the server ended the stalled frame")
+            .unwrap();
+        assert_eq!(failures, [ServeFailure::Timeout]);
+        drop(stream);
+    }
+
+    /// Frames still cross the chunked read whole: one that spans several chunks, one
+    /// that is exactly a chunk, and a claim of the largest frame that is then cut
+    /// short, which is an error and not a 64 MiB allocation.
+    #[tokio::test]
+    async fn a_frame_body_is_read_in_chunks_and_a_cut_claim_is_an_error() {
+        use tokio::io::AsyncWriteExt;
+        for size in [0usize, 1, 1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1, 3 * 1024 * 1024 + 5]
+        {
+            let (mut near, mut far) = tokio::io::duplex(8 * 1024 * 1024);
+            let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            near.write_all(&(size as u32).to_be_bytes()).await.unwrap();
+            near.write_all(&body).await.unwrap();
+            assert_eq!(crate::protocol::read_body_for_test(&mut far).await.unwrap(), body);
+        }
+        let (mut near, mut far) = tokio::io::duplex(1024);
+        near.write_all(&(MAX_FRAME as u32).to_be_bytes()).await.unwrap();
+        near.write_all(&[1u8; 100]).await.unwrap();
+        drop(near);
+        let cut = crate::protocol::read_body_for_test(&mut far).await;
+        assert!(matches!(cut, Err(ProtocolError::Io(_))), "{cut:?}");
+    }
+
+    /// Keepalive is on for the sockets a node dials, at the intervals stated.
+    #[tokio::test]
+    async fn a_dialled_cluster_socket_has_keepalive() {
+        let (_a, _dir, addr, _served) = serving_counted().await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let socket = socket2::SockRef::from(stream.get_ref().0);
+        assert!(socket.keepalive().unwrap(), "keepalive is on");
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(socket.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(socket.tcp_keepalive_retries().unwrap(), KEEPALIVE_PROBES);
+    }
+
+    /// Keepalive is on for the sockets a node **accepts**, as for those it dials:
+    /// read from the kernel's table, where a socket with its keepalive timer
+    /// running shows timer kind 2. Linux only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_accepted_cluster_socket_has_keepalive() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(serve(Arc::clone(&a), listener, CLOSING_SECRET.to_string()));
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let client = stream.get_ref().0.local_addr().unwrap();
+        // The kernel's table lists ports in hex; the accepted socket is the one whose
+        // local port is the server's and whose remote port is the client's. Its timer
+        // is the retransmit timer (1) while a segment is unacknowledged, so it is read
+        // until the traffic of the handshake has settled.
+        let (server_port, client_port) = (addr.port(), client.port());
+        let timer = || {
+            let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+            table.lines().skip(1).find_map(|line| {
+                let mut fields = line.split_whitespace().skip(1);
+                let (l, r) = (fields.next()?, fields.next()?);
+                let port = |addr: &str| u16::from_str_radix(addr.rsplit(':').next()?, 16).ok();
+                if port(l)? == server_port && port(r)? == client_port {
+                    Some(fields.nth(2)?.split(':').next()?.to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        let mut seen = timer();
+        for _ in 0..40 {
+            if seen.as_deref() == Some("02") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            seen = timer();
+        }
+        assert_eq!(seen.as_deref(), Some("02"), "the accepted socket's keepalive timer");
+        serving.abort();
+    }
+
     /// An idle two-node cluster's rounds end as rounds, not as failures. Each
     /// round used to end with the dialler dropping its TLS stream, which the
     /// serving side read as an end with no `close_notify` and logged at WARN
@@ -11762,7 +12019,8 @@ mod partial_windows_never_skip {
     ) -> (Result<kimmy_storage::SyncOutcome, ProtocolError>, Option<Hlc>) {
         let (mut ours, near) = tokio::io::duplex(MAX_FRAME);
         let (far, theirs) = tokio::io::duplex(MAX_FRAME);
-        let budgets = ServeBudgets { partial, whole: REQUEST_TIMEOUT };
+        let budgets =
+            ServeBudgets { partial, whole: REQUEST_TIMEOUT, waits: ServeBudgets::serving().waits };
         let serving = serve_peer(sender, theirs, SECRET, BINDING, None, budgets, None);
         let asked: std::cell::Cell<Option<Hlc>> = std::cell::Cell::new(None);
         let relaying = async {
