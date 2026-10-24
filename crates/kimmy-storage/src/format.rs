@@ -211,9 +211,16 @@ pub(crate) fn check_reading_only(database: &Path, build: &BuildVersions) -> Resu
         Some(bytes) => {
             let sidecar = parse_sidecar(&sidecar_file, bytes)?;
             check_sidecar(database, &sidecar, build)?;
+            // A schema-0 sidecar is accepted only beside a store that records no
+            // schema, which META says: read it now, before the open, so a refusal
+            // writes nothing. A dirty store cannot be read without repair; the check
+            // after the open decides it.
+            if sidecar.schema == 0 {
+                read_only_fallback_unless_it_panics(database, build, true)?;
+            }
             Prior::Sidecar(sidecar)
         }
-        None => read_only_fallback_unless_it_panics(database, build)?,
+        None => read_only_fallback_unless_it_panics(database, build, false)?,
     };
     let sidecar_modified = match sidecar_bytes {
         Some(_) => std::fs::metadata(&sidecar_file).and_then(|m| m.modified()).ok(),
@@ -464,6 +471,16 @@ pub(crate) fn redb_no_upgrade(build: &BuildVersions) -> String {
     )
 }
 
+/// Who the older-schema refusal says wrote the store: a build that left no
+/// sidecar, or the one whose sidecar records no schema yet.
+fn who_wrote(zero_sidecar: bool) -> &'static str {
+    if zero_sidecar {
+        "its kimmy.format records no storage schema, and the store was written by a build with"
+    } else {
+        "it was written by a build that left no kimmy.format, with"
+    }
+}
+
 /// [`read_only_fallback`], with a panic in redb refused as damage.
 ///
 /// **Reported upstream and declined, so this is kimmydb's own permanent
@@ -476,11 +493,15 @@ pub(crate) fn redb_no_upgrade(build: &BuildVersions) -> String {
 /// `format::tests::redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`
 /// fails if a redb release stops panicking, and both catches and that test
 /// can then go together.
-fn read_only_fallback_unless_it_panics(database: &Path, build: &BuildVersions) -> Result<Prior> {
+fn read_only_fallback_unless_it_panics(
+    database: &Path,
+    build: &BuildVersions,
+    zero_sidecar: bool,
+) -> Result<Prior> {
     #[cfg(test)]
     let started = std::time::Instant::now();
     let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        read_only_fallback(database, build)
+        read_only_fallback(database, build, zero_sidecar)
     }));
     #[cfg(test)]
     redb_time::add(started.elapsed());
@@ -520,7 +541,7 @@ pub(crate) fn redb_panicked(panic: &(dyn std::any::Any + Send)) -> String {
     format!("redb panicked reading it ({message}), so it is damaged. {DAMAGED_WAY_OUT}")
 }
 
-fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
+fn read_only_fallback(database: &Path, build: &BuildVersions, zero_sidecar: bool) -> Result<Prior> {
     match redb::Builder::new().open_read_only(database) {
         Ok(db) => {
             let (schema, redb) = {
@@ -547,8 +568,8 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
                     database,
                     RefusedKind::Older,
                     format!(
-                        "it was written by a build that left no kimmy.format, with storage \
-                         schema {schema} (this build: {}). {}",
+                        "{} with storage schema {schema} (this build: {}). {}",
+                        who_wrote(zero_sidecar),
                         build.schema,
                         crate::migrate::no_upgrade()
                     ),
@@ -561,6 +582,20 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
                     database,
                     RefusedKind::Newer,
                     format!("storage schema {schema} (this build: {})", build.schema),
+                ));
+            }
+            // A sidecar at schema 0 is a first open's mark before any schema: it is
+            // accepted only beside a store whose META records none.
+            if zero_sidecar && schema.is_some() {
+                return Err(refused(
+                    database,
+                    RefusedKind::Other,
+                    format!(
+                        "its kimmy.format records no storage schema, and the store records \
+                         schema {} (this build: {})",
+                        schema.unwrap_or(0),
+                        build.schema
+                    ),
                 ));
             }
             match redb.as_deref().map(|v| (v, major_minor(v))) {
@@ -1469,6 +1504,44 @@ mod tests {
             txn.commit().unwrap();
         }
         Engine::open(&path).expect("a recorded patch is not a boundary");
+    }
+
+    /// A sidecar at schema 0 is a first open's mark before any schema exists. Beside
+    /// a store that records a schema it is refused before the open, so the files
+    /// are as they were, and the message does not say there was no sidecar.
+    #[test]
+    fn a_schema_zero_sidecar_beside_a_store_with_a_schema_is_refused_untouched() {
+        for (what, meta_schema) in [
+            ("this build's schema", Some(crate::migrate::SCHEMA_VERSION)),
+            ("an older schema", Some(crate::migrate::SCHEMA_VERSION - 1)),
+            ("a newer schema", Some(crate::migrate::SCHEMA_VERSION + 1)),
+        ] {
+            let (_dir, path) = a_store();
+            with_sidecar(&path, |s| s.schema = 0);
+            if let Some(schema) = meta_schema {
+                let db = redb::Database::create(&path).unwrap();
+                let txn = db.begin_write().unwrap();
+                txn.open_table(tables::META)
+                    .unwrap()
+                    .insert(tables::META_FORMAT_VERSION, [schema].as_slice())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+            assert_refused_untouched(&path, &BuildVersions::ours(), what);
+            match Engine::open(&path) {
+                Err(StorageError::RefusedStore { why, .. }) => {
+                    // A newer schema is refused as newer, in the words of any newer store.
+                    if meta_schema != Some(crate::migrate::SCHEMA_VERSION + 1) {
+                        assert!(
+                            why.contains("kimmy.format records no storage schema"),
+                            "{what}: {why}"
+                        );
+                    }
+                    assert!(!why.contains("left no kimmy.format"), "{what}: {why}");
+                }
+                other => panic!("{what}: not refused: {:?}", other.err()),
+            }
+        }
     }
 
     /// The whole message of an older minor, as operations.md quotes its way out.
