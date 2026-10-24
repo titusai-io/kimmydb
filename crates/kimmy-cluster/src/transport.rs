@@ -122,6 +122,192 @@ const SNAPSHOT_PAGE_RESERVE: Duration = Duration::from_secs(5);
 /// from, which is exactly what [`crate::PeerHealth`] then does.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the serving side waits for the first byte of the next request on a
+/// connection before it ends it, and how long a frame that has begun may stall.
+///
+/// **Why a bound at all.** A dialler that dies without a FIN or an RST (a power
+/// loss, a cut cable) leaves the server reading a socket that will never speak, and
+/// the server writes nothing meanwhile, so TCP never notices either. Each such
+/// connection held a task, a file descriptor and a TLS session for the life of the
+/// process. Keepalive ([`KEEPALIVE_IDLE`]) detects the dead peer; this ends a peer
+/// that is alive at TCP and silent at ours.
+///
+/// **Why 300 s.** The longest legitimate gap between two requests on one connection
+/// is a dialler working between them, and the work that takes time is local storage:
+/// it applies what a request returned (a batch of at most 1,024 entries or a
+/// snapshot page of at most 63 MiB, one transaction) and *waits as long as it takes*
+/// for the single writer first, since background work sets no wait budget
+/// ([`kimmy_storage::with_write_wait_budget`]). **That wait has no queue bound**: the
+/// writer's lock is not first come first served, and what can hold it ahead of a pull
+/// (client writes, TTL, retention, the embedding worker, pushes and replays from
+/// every other peer, purge chunks) has no count. So the margin rests on measured
+/// holds and on the wedge bound, not on an arithmetic of queue places. Measured
+/// (ADR-220): no hold over 30 s in either round of its measurement, the worst one
+/// that is not a drop the embedding worker's at 8.04 s; ADR-177's own observation was
+/// a drop apply of 60 to 71 s. Past [`crate::yielding::WRITER_WEDGE`] (60 s) a hold is
+/// a wedge, and the member says so, except an index build or drop, which has no
+/// bound. 300 s is five times the wedge bound and some 37 times the worst measured
+/// hold, asserted below to stay at least three times the wedge bound if that moves.
+///
+/// **What happens past it.** A dialler whose apply (an index build inside a
+/// replicated `createIndex`, or a wait behind a local one) outlasts it finds the
+/// connection ended. It does not send on it: before the one request that can follow
+/// an apply, the round looks at how long it has been since it last heard from the
+/// peer, and past [`STREAM_REUSE_WITHIN`] it ends the round without that check (it
+/// runs on the next round). The serving side counts the end as `idle`, at INFO.
+const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+const _: () = assert!(
+    SERVE_IDLE_TIMEOUT.as_secs() >= 3 * crate::yielding::WRITER_WEDGE.as_secs(),
+    "the serve idle bound is derived from the writer wedge bound"
+);
+
+/// How long after the last frame it heard a round still trusts its connection with
+/// another request: the serving side's idle bound less a margin for the apply's
+/// last moments and the clocks of the two ends.
+const STREAM_REUSE_WITHIN: Duration = Duration::from_secs(270);
+
+const _: () = assert!(STREAM_REUSE_WITHIN.as_secs() < SERVE_IDLE_TIMEOUT.as_secs());
+
+/// The payload of the error [`WriteProgress`] raises, so that only this bound's own
+/// timeout is a serving-side `timeout`; the kernel's `ETIMEDOUT` (a keepalive that
+/// found the peer gone) carries the same kind and stays `io`.
+#[derive(Debug)]
+struct WriteStalled(Duration);
+
+impl std::fmt::Display for WriteStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the peer made no progress reading for {:?}", self.0)
+    }
+}
+
+impl std::error::Error for WriteStalled {}
+
+/// Whether `e` is [`WriteProgress`]'s own timeout.
+fn is_write_stall(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<WriteStalled>())
+}
+
+/// A stream whose writes must make progress: a write (or flush) that is `Pending`
+/// for `stall` without letting any bytes through ends with `TimedOut`. A peer that
+/// is alive at TCP and has stopped reading answers every zero-window probe, so
+/// neither keepalive nor retransmission ever ends the connection, and the serving
+/// side's task would wait on its answer for ever. Each chunk the kernel takes
+/// restarts the clock, so a slow reader is not a stalled one.
+///
+/// **What a "chunk" is for a TLS stream.** `poll_write` takes plaintext into the TLS
+/// session's buffer and reports progress as it does; but `poll_flush` reports none
+/// until everything buffered has gone: the final flush of an answer (up to the
+/// session's buffer limit, 64 KiB) must complete within the stall bound. A reader
+/// slower than about 2 KiB/s is therefore cut at the end of an answer, though it
+/// was reading all along.
+struct WriteProgress<S> {
+    inner: S,
+    stall: Duration,
+    waiting: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteProgress<S> {
+    fn new(inner: S, stall: Duration) -> Self {
+        Self { inner, stall, waiting: None }
+    }
+
+    /// Judge a write-side poll: progress clears the clock, and a pending one is
+    /// allowed `stall` from the first time it was pending.
+    fn judged<T>(
+        &mut self,
+        polled: std::task::Poll<io::Result<T>>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<T>> {
+        use std::future::Future;
+        use std::task::Poll;
+        match polled {
+            Poll::Ready(result) => {
+                self.waiting = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                let stall = self.stall;
+                let timer = self.waiting.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+                if timer.as_mut().poll(cx).is_ready() {
+                    self.waiting = None;
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, WriteStalled(stall))))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteProgress<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteProgress<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.judged(polled, cx)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.judged(polled, cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.judged(polled, cx)
+    }
+}
+
+/// How long a frame that has begun may go without its next bytes: a request's body
+/// is written at once by a live peer, so this is a peer that stopped mid-frame.
+const SERVE_FRAME_STALL: Duration = REQUEST_TIMEOUT;
+
+/// TCP keepalive on every cluster connection, dialled and accepted: the first probe
+/// after 30 s idle, then every 10 s, three unanswered probes ending the connection,
+/// so a peer that vanished is found in about 60 s. The kernel answers the probes of
+/// a live peer, so a connection a dialler holds idle for a long tick is unaffected.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_PROBES: u32 = 3;
+
+/// Turn keepalive on for `stream`. Best effort: a socket that refuses it still
+/// serves, and the idle bound still ends a dead peer.
+fn set_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_PROBES);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        // Said once per process: it is the same failure for every connection, and an
+        // operator should learn that keepalive is off, not read it per connection.
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                error = %e,
+                "could not set TCP keepalive on a cluster connection; a peer that vanishes \
+                 without closing is found by the idle bound alone"
+            );
+        }
+    }
+}
+
 /// Called on the serving side with what a pushed batch became (ADR-140), so
 /// the receiver's own counters see a refusal that arrived by push exactly as
 /// one that arrived by pull.
@@ -346,7 +532,9 @@ pub enum ServeFailure {
     /// mid-exchange, the `Broken pipe` and `Connection reset` of a pusher that
     /// gave up waiting (ProtocolError::Io).
     Io,
-    /// A bounded wait ran out: the handshake (ProtocolError::TimedOut).
+    /// A bounded wait ran out in the middle of an exchange: the handshake, a frame
+    /// that began and stopped arriving, or an answer the peer stopped reading
+    /// (ProtocolError::TimedOut, or a write that made no progress).
     Timeout,
     /// A frame this node could not read or would not accept
     /// (ProtocolError::Malformed, TooLarge).
@@ -367,10 +555,16 @@ pub enum ServeFailure {
     /// This node refused the peer at the handshake: it runs another release
     /// (ProtocolError::Release).
     Release,
+    /// The connection sent no request for the idle bound ([`SERVE_IDLE_TIMEOUT`]):
+    /// a dialler that died without closing it, or one working locally for longer
+    /// (ProtocolError::Idle). Its own label and logged at INFO, since the second
+    /// is expected during an index build and an alert on `timeout` must not fire
+    /// for it.
+    Idle,
 }
 
 impl ServeFailure {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Io,
         Self::Timeout,
@@ -380,6 +574,7 @@ impl ServeFailure {
         Self::Fault,
         Self::Binding,
         Self::Release,
+        Self::Idle,
     ];
 
     pub const fn slot(self) -> usize {
@@ -396,6 +591,7 @@ impl ServeFailure {
             Self::Fault => "fault",
             Self::Binding => "binding",
             Self::Release => "release",
+            Self::Idle => "idle",
         }
     }
 
@@ -405,8 +601,13 @@ impl ServeFailure {
     pub fn of(error: &ProtocolError) -> Option<Self> {
         match error {
             ProtocolError::Closed => None,
+            // A write that made no progress for the stall bound is a peer that is
+            // alive and stopped reading: a wait that ran out, not a broken pipe. The
+            // kernel's own `ETIMEDOUT` (keepalive found the peer gone) is `Io`.
+            ProtocolError::Io(e) if is_write_stall(e) => Some(Self::Timeout),
             ProtocolError::Io(_) => Some(Self::Io),
             ProtocolError::TimedOut(_) => Some(Self::Timeout),
+            ProtocolError::Idle => Some(Self::Idle),
             ProtocolError::Malformed(_) | ProtocolError::TooLarge { .. } => Some(Self::Malformed),
             ProtocolError::Local(_) => Some(Self::Local),
             // Handled before this is asked: a node shutting down refuses
@@ -430,12 +631,22 @@ pub(crate) struct ServeBudgets {
     /// [`REQUEST_TIMEOUT`]: the requester of a whole window has stopped
     /// waiting by then, and cannot take one in part.
     pub(crate) whole: Duration,
+    /// How long to wait for the next request, and for the rest of one begun
+    /// ([`SERVE_IDLE_TIMEOUT`], [`SERVE_FRAME_STALL`]).
+    pub(crate) waits: crate::protocol::FrameWaits,
 }
 
 impl ServeBudgets {
     /// What a node serves its peers with, read when a connection is served.
     pub(crate) fn serving() -> Self {
-        Self { partial: kimmy_storage::ExamineBudget::serve(), whole: REQUEST_TIMEOUT }
+        Self {
+            partial: kimmy_storage::ExamineBudget::serve(),
+            whole: REQUEST_TIMEOUT,
+            waits: crate::protocol::FrameWaits {
+                idle: SERVE_IDLE_TIMEOUT,
+                stall: SERVE_FRAME_STALL,
+            },
+        }
     }
 }
 
@@ -560,6 +771,7 @@ pub async fn serve_with(
             continue;
         }
 
+        set_keepalive(&stream);
         let engine = Arc::clone(&engine);
         let secret = secret.clone();
         let on_pushed = on_pushed.clone();
@@ -576,13 +788,23 @@ pub async fn serve_with(
         // before any storage step, so a step's continuation never polls one
         // after the runtime has shut down (0.40.2).
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!(%peer, error = %e, "TLS handshake failed");
-                    return;
-                }
-            };
+            // Bounded by the handshake's own bound: the dialler gives its side 5 s
+            // ([`CONNECT_TIMEOUT`]), so a connection that has not completed TLS in
+            // twice that is not a peer working, and it held a task and a descriptor
+            // for nothing. Not counted, as a failed TLS handshake is not: anything
+            // that can reach the port can cause one.
+            let tls_stream =
+                match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        debug!(%peer, error = %e, "TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        debug!(%peer, "TLS handshake did not complete in time");
+                        return;
+                    }
+                };
             let binding = {
                 let (_, conn) = tls_stream.get_ref();
                 match crate::tls::binding(conn) {
@@ -710,6 +932,16 @@ async fn serve_connection<S>(
                 hook(ServeFailure::Unauthenticated);
             }
         }
+        Some(ServeFailure::Idle) => {
+            info!(
+                %peer,
+                reason = ServeFailure::Idle.label(),
+                "ended a replication connection that sent no request for the idle bound"
+            );
+            if let Some(hook) = on_failed {
+                hook(ServeFailure::Idle);
+            }
+        }
         Some(reason) => {
             warn!(%peer, error = %e, reason = reason.label(), "peer connection failed");
             if let Some(hook) = on_failed {
@@ -746,7 +978,7 @@ impl Drop for ServeWalk {
 /// cannot take in part and has stopped waiting for by then.
 async fn serve_peer<S>(
     engine: &Engine,
-    mut stream: S,
+    stream: S,
     secret: &str,
     binding: &[u8],
     on_pushed: Option<&PushHook>,
@@ -756,6 +988,9 @@ async fn serve_peer<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Every write this side makes must make progress (see `WriteProgress`), as
+    // every read it makes does.
+    let mut stream = WriteProgress::new(stream, budgets.waits.stall);
     let peer = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         accept_handshake(engine, &mut stream, secret, binding),
@@ -776,7 +1011,7 @@ where
     let mut replay_cursor: Option<kimmy_core::Hlc> = None;
     loop {
         let (frame, undecodable, decoded_seq) =
-            crate::protocol::read_frame_noting_facts(&mut stream).await?;
+            crate::protocol::read_frame_noting_facts_within(&mut stream, budgets.waits).await?;
         match frame {
             Message::AskVersions { facts, facts_gen, echo } => {
                 if undecodable && let Some(members) = members {
@@ -1402,6 +1637,8 @@ pub(crate) async fn dial(
             )
         })??;
 
+    set_keepalive(&tcp);
+
     // Built per round rather than held: a sync round is seconds apart, and a
     // dialling node has no accept loop to amortise it against.
     let tls = crate::tls::ClusterTls::new()
@@ -1659,6 +1896,7 @@ where
 /// follows for that reason. The replay stays owed by that peer, is reported once,
 /// and asks again next round from a position that has moved on with the peers'
 /// retention.
+#[allow(clippy::too_many_arguments)]
 async fn replay_own_origin<S>(
     engine: &Engine,
     stream: &mut S,
@@ -1667,6 +1905,7 @@ async fn replay_own_origin<S>(
     theirs: &VersionVector,
     catch_up: &crate::catchup::CatchUp,
     deadline: Instant,
+    clock: &RoundClock,
 ) -> Result<(), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1732,6 +1971,7 @@ where
                 )));
             }
         };
+        clock.heard_now();
         let (entries, exhausted, scanned_to) = entries;
         match replay_apply(
             engine,
@@ -1756,7 +1996,9 @@ where
             ReplayPage::Empty { next } if next > from => from = next,
             ReplayPage::Empty { .. } => return Ok(()),
         }
-        if Instant::now() >= deadline {
+        // The replay stays owed and asks again next round, from where the cursor is;
+        // after a long apply it does not send on a connection that may be gone.
+        if Instant::now() >= deadline || clock.quiet_too_long() {
             return Ok(());
         }
     }
@@ -2204,6 +2446,7 @@ where
         .await?;
     let (frame, undecodable, decoded_seq) =
         crate::protocol::read_frame_noting_facts(stream).await?;
+    clock.heard_now();
     let (theirs, their_witnessed, their_facts, asked_replay) = match frame {
         Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
             if undecodable {
@@ -2266,8 +2509,17 @@ where
         && catch_up.replay_armed()
         && !catch_up.replay_answered(their_node)
     {
-        replay_own_origin(engine, stream, peer, their_node, &theirs, &catch_up, snapshot_deadline)
-            .await?;
+        replay_own_origin(
+            engine,
+            stream,
+            peer,
+            their_node,
+            &theirs,
+            &catch_up,
+            snapshot_deadline,
+            clock,
+        )
+        .await?;
     }
 
     // What we have *seen*, not what we could serve. Asking against the
@@ -2365,8 +2617,21 @@ where
             capable: stalls.digest_capable.contains(&their_node),
             detail: stalls.definition_detail(&their_node),
         });
+        if clock.quiet_too_long() {
+            // After a replay whose apply was long: no request on a connection the
+            // serving side may have ended. The check runs next round.
+            debug!(%peer, "the divergence check is left to the next round: this connection has been quiet too long");
+            return Ok(SyncOutcome {
+                peer: Some(their_node),
+                behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
+                exhausted: true,
+                peer_catching_up,
+                ..SyncOutcome::default()
+            });
+        }
         let (findings, digest, definitions) =
             ask_divergence(engine, stream, gate.probe, context).await?;
+        clock.heard_now();
         stalls.note_digest(their_node, digest.as_ref());
         return Ok(SyncOutcome {
             peer: Some(their_node),
@@ -2441,6 +2706,21 @@ where
             Message::BeyondHorizon {}
         }
         _ => {
+            if clock.quiet_too_long() {
+                // A replay's long apply ahead of this request: not sent on a
+                // connection the serving side may have ended. The round is left
+                // for the next one, which pulls this window.
+                debug!(%peer, "the pull is left to the next round: this connection has been quiet too long");
+                // The contact is a skipped check, as a pull that found its peer level
+                // and left the check is: it names the peer, so the loop counts it
+                // (`ran` + `skipped` is every contact), and carries the real lag.
+                return Ok(SyncOutcome {
+                    peer: Some(their_node),
+                    behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
+                    peer_catching_up,
+                    ..SyncOutcome::default()
+                });
+            }
             write_frame(
                 stream,
                 &Message::AskEntries {
@@ -2452,7 +2732,9 @@ where
                 },
             )
             .await?;
-            read_frame(stream).await?
+            let answer = read_frame(stream).await?;
+            clock.heard_now();
+            answer
         }
     };
 
@@ -2476,6 +2758,7 @@ where
         };
         write_frame(stream, &retry).await?;
         answer = read_frame(stream).await?;
+        clock.heard_now();
     }
 
     // Answered with a window (or with nothing to give because this member is
@@ -2904,7 +3187,14 @@ where
     // each comfortably under the batch cap — still get checked on
     // nearly every round, unlike a single global "nothing to pull" gate,
     // which a continuous trickle of new writes can starve indefinitely.
-    if window_exhausted {
+    if window_exhausted && clock.quiet_too_long() {
+        // The apply (its writer wait, a replicated index build) took so long that the
+        // serving side has ended the connection, or is about to: the check would send
+        // a request on a stream it has dropped, and the round would fail and back a
+        // live peer off. It is skipped (`divergent` stays `None`, as for a truncated
+        // window) and runs on the next round.
+        debug!(%peer, "the divergence check is left to the next round: this connection has been quiet too long");
+    } else if window_exhausted {
         let position = stalls.position(their_node, processed, &mine, &theirs, probe.as_ref());
         let busy = probe.as_ref().map(|p| p.id);
         let catching_up = count_catching_up(peer_catching_up, stalls.catch_up.as_deref());
@@ -3311,9 +3601,39 @@ pub struct AppliedCounts {
 /// Local apply time a round's deadline does not charge the peer for
 /// (ADR-177). A round is bounded because a peer can be slow or silent; this
 /// node's own apply, however long it takes, says nothing about the peer.
-#[derive(Default)]
 struct RoundClock {
     applying_nanos: std::sync::atomic::AtomicU64,
+    /// How long after the last frame heard the round still sends on its connection
+    /// ([`STREAM_REUSE_WITHIN`]); a field so a test can shorten it.
+    reuse_within: Duration,
+    /// When the peer last spoke on this round's connection: the serving side's idle
+    /// bound runs from there, through any apply.
+    heard: parking_lot::Mutex<Instant>,
+}
+
+impl Default for RoundClock {
+    fn default() -> Self {
+        Self {
+            applying_nanos: Default::default(),
+            reuse_within: STREAM_REUSE_WITHIN,
+            heard: parking_lot::Mutex::new(Instant::now()),
+        }
+    }
+}
+
+impl RoundClock {
+    /// A frame was just read from the peer.
+    fn heard_now(&self) {
+        *self.heard.lock() = Instant::now();
+    }
+
+    /// Whether the connection has been quiet so long that the serving side may have
+    /// ended it: asked before **every** request that can follow an apply (a replay
+    /// page's, a window's, the divergence check), since any of them may follow a
+    /// long one.
+    fn quiet_too_long(&self) -> bool {
+        self.heard.lock().elapsed() >= self.reuse_within
+    }
 }
 
 impl RoundClock {
@@ -5698,9 +6018,24 @@ where
 
     loop {
         let after = stalls.snapshot_progress(node, scope, policy).after().cloned();
+        if clock.quiet_too_long() {
+            // Before every page, the first included: a long apply ahead of it (a
+            // replay's, or the previous page's) and the serving side may have ended the
+            // connection. The snapshot resumes from the page recorded, next round.
+            debug!(%peer, "the snapshot is left to the next round: this connection has been quiet too long");
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: false,
+                sender_dropped: false,
+                history: false,
+            });
+        }
         write_frame(stream, &Message::AskSnapshot { after, collection: scope }).await?;
         let page = match read_frame(stream).await? {
-            Message::Snapshot(page) => page,
+            Message::Snapshot(page) => {
+                clock.heard_now();
+                page
+            }
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
             other => {
                 return Err(ProtocolError::Malformed(format!("expected Snapshot, got {other:?}")));
@@ -6113,6 +6448,28 @@ pub(crate) mod test_serving {
         )
         .await;
         ended.lock().take()
+    }
+
+    /// Serve one connection accepted on `listener` with `budgets`, and answer how it
+    /// ended: the failure it was counted as, if any.
+    pub(crate) async fn serve_one_counting(
+        engine: Arc<Engine>,
+        listener: tokio::net::TcpListener,
+        secret: &str,
+        budgets: ServeBudgets,
+    ) -> Vec<ServeFailure> {
+        let (tcp, peer) = listener.accept().await.unwrap();
+        let tls = crate::tls::ClusterTls::new().unwrap();
+        let stream = tls.acceptor().accept(tcp).await.unwrap();
+        let binding = crate::tls::binding(stream.get_ref().1).unwrap();
+        let failures = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let hook: ServeFailHook = {
+            let failures = Arc::clone(&failures);
+            Arc::new(move |why| failures.lock().push(why))
+        };
+        serve_connection(&engine, stream, secret, &binding, None, Some(&hook), peer, budgets, None)
+            .await;
+        std::mem::take(&mut *failures.lock())
     }
 
     /// A node's serve counted: every failure, from the hook that is called
@@ -10851,10 +11208,413 @@ mod tests {
         (engine, dir, addr, counted)
     }
 
+    /// A serving side's budgets with the waits a test can sit through.
+    fn waits_of(idle: Duration, stall: Duration) -> ServeBudgets {
+        let mut budgets = ServeBudgets::serving();
+        budgets.waits = crate::protocol::FrameWaits { idle, stall };
+        budgets
+    }
+
+    async fn serving_one(
+        budgets: ServeBudgets,
+    ) -> (Arc<Engine>, tempfile::TempDir, SocketAddr, tokio::task::JoinHandle<Vec<ServeFailure>>)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(test_serving::serve_one_counting(
+            Arc::clone(&engine),
+            listener,
+            CLOSING_SECRET,
+            budgets,
+        ));
+        (engine, dir, addr, served)
+    }
+
+    async fn ask_versions(stream: &mut tokio_rustls::client::TlsStream<TcpStream>) {
+        write_frame(stream, &Message::AskVersions { facts: None, facts_gen: None, echo: None })
+            .await
+            .unwrap();
+        assert!(matches!(read_frame(stream).await, Ok(Message::Vectors { .. })));
+    }
+
+    /// **A peer that goes silent is dropped after the idle timeout**, counted as a
+    /// timeout: the connection is alive at TCP and says nothing, which keepalive
+    /// cannot tell from a quiet one.
+    #[tokio::test]
+    async fn a_peer_that_goes_silent_is_dropped_after_the_idle_timeout() {
+        let (_a, _dir, addr, served) =
+            serving_one(waits_of(Duration::from_secs(1), Duration::from_secs(1))).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        ask_versions(&mut stream).await;
+        let began = std::time::Instant::now();
+        let failures = tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("the server ended the silent connection")
+            .unwrap();
+        assert_eq!(failures, [ServeFailure::Idle]);
+        assert!(began.elapsed() >= Duration::from_millis(900), "not before the timeout");
+        drop(stream);
+    }
+
+    /// **A slow but legitimate gap survives**: a dialler that works between two
+    /// requests for less than the idle timeout (an apply, a wait for the writer)
+    /// finds its connection as it left it.
+    #[tokio::test]
+    async fn a_gap_between_requests_shorter_than_the_idle_timeout_survives() {
+        let (_a, _dir, addr, served) =
+            serving_one(waits_of(Duration::from_secs(4), Duration::from_secs(1))).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        ask_versions(&mut stream).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        ask_versions(&mut stream).await;
+        close(&mut stream).await;
+        let failures = served.await.unwrap();
+        assert_eq!(failures, [], "a gap inside the bound is not a failure");
+    }
+
+    /// A frame that has begun and stops arriving is dropped on the stall bound,
+    /// idle timeout notwithstanding.
+    #[tokio::test]
+    async fn a_frame_that_stops_arriving_is_dropped_on_the_stall_bound() {
+        use tokio::io::AsyncWriteExt;
+        let (_a, _dir, addr, served) =
+            serving_one(waits_of(Duration::from_secs(60), Duration::from_secs(1))).await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        stream.write_all(&1000u32.to_be_bytes()).await.unwrap();
+        stream.write_all(&[0u8; 10]).await.unwrap();
+        stream.flush().await.unwrap();
+        let failures = tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("the server ended the stalled frame")
+            .unwrap();
+        assert_eq!(failures, [ServeFailure::Timeout]);
+        drop(stream);
+    }
+
+    /// Frames still cross the chunked read whole: one that spans several chunks, one
+    /// that is exactly a chunk, and a claim of the largest frame that is then cut
+    /// short, which is an error and not a 64 MiB allocation.
+    #[tokio::test]
+    async fn a_frame_body_is_read_in_chunks_and_a_cut_claim_is_an_error() {
+        use tokio::io::AsyncWriteExt;
+        for size in [0usize, 1, 1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1, 3 * 1024 * 1024 + 5]
+        {
+            let (mut near, mut far) = tokio::io::duplex(8 * 1024 * 1024);
+            let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            near.write_all(&(size as u32).to_be_bytes()).await.unwrap();
+            near.write_all(&body).await.unwrap();
+            assert_eq!(crate::protocol::read_body_for_test(&mut far).await.unwrap(), body);
+        }
+        let (mut near, mut far) = tokio::io::duplex(1024);
+        near.write_all(&(MAX_FRAME as u32).to_be_bytes()).await.unwrap();
+        near.write_all(&[1u8; 100]).await.unwrap();
+        drop(near);
+        let cut = crate::protocol::read_body_for_test(&mut far).await;
+        assert!(matches!(cut, Err(ProtocolError::Io(_))), "{cut:?}");
+    }
+
+    /// Keepalive is on for the sockets a node dials, at the intervals stated. Where
+    /// socket2 can read the options back.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_dialled_cluster_socket_has_keepalive() {
+        let (_a, _dir, addr, _served) = serving_counted().await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let socket = socket2::SockRef::from(stream.get_ref().0);
+        assert!(socket.keepalive().unwrap(), "keepalive is on");
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(socket.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(socket.tcp_keepalive_retries().unwrap(), KEEPALIVE_PROBES);
+    }
+
+    /// Keepalive is on for the sockets a node **accepts**, as for those it dials:
+    /// read from the kernel's table, where a socket with its keepalive timer
+    /// running shows timer kind 2. Linux only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_accepted_cluster_socket_has_keepalive() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(serve(Arc::clone(&a), listener, CLOSING_SECRET.to_string()));
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let client = stream.get_ref().0.local_addr().unwrap();
+        // The kernel's table lists ports in hex; the accepted socket is the one whose
+        // local port is the server's and whose remote port is the client's. Its timer
+        // is the retransmit timer (1) while a segment is unacknowledged, so it is read
+        // until the traffic of the handshake has settled.
+        let (server_port, client_port) = (addr.port(), client.port());
+        let timer = || {
+            let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+            table.lines().skip(1).find_map(|line| {
+                let mut fields = line.split_whitespace().skip(1);
+                let (l, r) = (fields.next()?, fields.next()?);
+                let port = |addr: &str| u16::from_str_radix(addr.rsplit(':').next()?, 16).ok();
+                if port(l)? == server_port && port(r)? == client_port {
+                    Some(fields.nth(2)?.split(':').next()?.to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        let mut seen = timer();
+        for _ in 0..40 {
+            if seen.as_deref() == Some("02") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            seen = timer();
+        }
+        assert_eq!(seen.as_deref(), Some("02"), "the accepted socket's keepalive timer");
+        serving.abort();
+    }
+
+    /// **A connection that never completes TLS is ended on the handshake bound.**
+    /// It connects and says nothing, so the server's TLS accept waits for a
+    /// ClientHello that will not come. (Real time: the bound is 10 s.)
+    #[tokio::test]
+    async fn a_connection_that_never_starts_tls_is_ended_on_the_handshake_bound() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(serve(a, listener, CLOSING_SECRET.to_string()));
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let began = Instant::now();
+        let mut buf = [0u8; 16];
+        let ended =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT + Duration::from_secs(5), silent.read(&mut buf))
+                .await
+                .expect("the server ended the connection that never started TLS");
+        assert!(matches!(ended, Ok(0) | Err(_)), "{ended:?}");
+        assert!(
+            began.elapsed() >= HANDSHAKE_TIMEOUT - Duration::from_millis(500),
+            "{:?}",
+            began.elapsed()
+        );
+        serving.abort();
+    }
+
+    /// One round against a node holding `docs` documents (0 or 1), with the reuse bound
+    /// and the extra apply time a test chooses.
+    async fn quiet_round(
+        docs: i64,
+        reuse_within: Duration,
+        apply_takes: Duration,
+    ) -> (SyncOutcome, bool) {
+        let (a, _a_dir, addr, _served) = serving_counted().await;
+        if docs > 0 {
+            let orders = a.create_collection("shop", "orders").unwrap();
+            a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        }
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, their_node) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        let clock = RoundClock { reuse_within, ..RoundClock::default() };
+        test_hooks::APPLY_TAKES.with(|t| t.set(apply_takes));
+        let outcome = sync_round(
+            &b,
+            &mut stream,
+            addr,
+            their_node,
+            None,
+            &mut PeerStalls::new(),
+            Instant::now() + Duration::from_secs(60),
+            &clock,
+        )
+        .await
+        .expect("the round succeeds either way");
+        test_hooks::APPLY_TAKES.with(|t| t.set(Duration::ZERO));
+        (outcome, b.get_collection("shop", "orders").is_ok())
+    }
+
+    /// **A round that has been quiet past the reuse bound sends nothing more on its
+    /// connection**, whichever request would come next, and still succeeds: the serving
+    /// side may have ended the connection (its idle bound), and a request on it would
+    /// fail the round and back a live peer off. All the sites ask one helper
+    /// (`RoundClock::quiet_too_long`).
+    ///
+    /// (1) A long apply ahead of the divergence check that follows a pull: the pull is
+    /// made and applied, the check is left to the next round.
+    #[tokio::test]
+    async fn a_long_apply_leaves_the_divergence_check_to_the_next_round() {
+        let (outcome, pulled) =
+            quiet_round(1, Duration::from_millis(200), Duration::from_millis(400)).await;
+        assert!(pulled, "the pull was made and applied");
+        assert!(outcome.divergent.is_none(), "the check was left to the next round");
+        let (outcome, pulled) = quiet_round(1, STREAM_REUSE_WITHIN, Duration::ZERO).await;
+        assert!(pulled);
+        assert!(outcome.divergent.is_some(), "with the connection fresh, the check runs");
+    }
+
+    /// (2) A connection already quiet past the bound ahead of the divergence check of a
+    /// round with nothing to pull (the check that follows a replay): left alone.
+    #[tokio::test]
+    async fn a_quiet_connection_leaves_the_check_of_a_converged_round_to_the_next() {
+        let (outcome, _) = quiet_round(0, Duration::ZERO, Duration::ZERO).await;
+        assert!(outcome.divergent.is_none() && outcome.exhausted);
+        let (outcome, _) = quiet_round(0, STREAM_REUSE_WITHIN, Duration::ZERO).await;
+        assert!(outcome.divergent.is_some(), "fresh, the check runs");
+    }
+
+    /// (3) A quiet connection ahead of the pull's own request (what follows a replay's
+    /// long apply): the request is not sent, and nothing is applied.
+    #[tokio::test]
+    async fn a_quiet_connection_leaves_the_pull_to_the_next_round() {
+        let (_, pulled) = quiet_round(1, Duration::ZERO, Duration::ZERO).await;
+        assert!(!pulled, "no request was sent, so nothing was pulled");
+    }
+
+    /// **A skipped pull is still a contact**: it names the peer, so the replication loop
+    /// counts it as skipped (`ran` + `skipped` is every contact), with the real lag.
+    #[tokio::test]
+    async fn a_pull_left_to_the_next_round_still_names_its_peer() {
+        let (outcome, pulled) = quiet_round(1, Duration::ZERO, Duration::ZERO).await;
+        assert!(!pulled);
+        assert!(outcome.peer.is_some(), "the peer is named, so the contact is counted");
+        assert!(outcome.divergent.is_none(), "and it ran no check: a skipped contact");
+    }
+
+    /// **A snapshot is not requested on a connection quiet past the bound**, the first
+    /// page included: the pull ends with nothing applied, to resume next round.
+    #[tokio::test]
+    async fn a_snapshot_is_not_requested_on_a_quiet_connection() {
+        const SECRET: &str = "a-quiet-snapshot-secret";
+        const BINDING: &[u8] = b"a-quiet-snapshot-binding";
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "orders").unwrap();
+        b.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
+        let (mut ours, theirs) = tokio::io::duplex(1 << 20);
+        let serving = serve_peer(&b, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None);
+        let pulling = async {
+            open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
+            let clock = RoundClock { reuse_within: Duration::ZERO, ..RoundClock::default() };
+            let pulled = pull_snapshot(
+                &a,
+                &mut ours,
+                "127.0.0.1:1".parse().unwrap(),
+                b.node_id(),
+                None,
+                kimmy_storage::SnapshotPolicy::All,
+                &mut PeerStalls::new(),
+                Instant::now() + Duration::from_secs(300),
+                &clock,
+            )
+            .await;
+            drop(ours);
+            pulled
+        };
+        let (_, pulled) = tokio::join!(serving, pulling);
+        let pulled = pulled.expect("the pull ends without failing");
+        assert!(!pulled.complete);
+        assert!(a.get_collection("shop", "orders").is_err(), "no page was requested or applied");
+    }
+
+    /// A write that makes no progress is ended: a stream whose far end never reads.
+    #[tokio::test]
+    async fn a_write_that_makes_no_progress_is_ended_on_the_stall_bound() {
+        use tokio::io::AsyncWriteExt;
+        let (near, _far) = tokio::io::duplex(64);
+        let mut stream = WriteProgress::new(near, Duration::from_secs(1));
+        let began = Instant::now();
+        let written = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.write_all(&vec![7u8; 1024 * 1024]),
+        )
+        .await
+        .expect("the write ended on the stall bound and did not hang");
+        let e = written.expect_err("nothing reads, so the write cannot finish");
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(began.elapsed() >= Duration::from_millis(900), "{:?}", began.elapsed());
+        assert_eq!(ServeFailure::of(&ProtocolError::Io(e)), Some(ServeFailure::Timeout));
+        // The kernel's ETIMEDOUT, from keepalive finding the peer gone, is not ours.
+        let kernel = io::Error::from_raw_os_error(libc::ETIMEDOUT);
+        assert_eq!(kernel.kind(), io::ErrorKind::TimedOut, "premise: same kind");
+        assert_eq!(ServeFailure::of(&ProtocolError::Io(kernel)), Some(ServeFailure::Io));
+    }
+
+    /// A slow reader is not a stalled one: each chunk it takes restarts the clock.
+    #[tokio::test]
+    async fn a_slow_reader_that_keeps_reading_is_not_cut_off() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (near, mut far) = tokio::io::duplex(64);
+        let mut stream = WriteProgress::new(near, Duration::from_millis(800));
+        let reading = tokio::spawn(async move {
+            let mut got = 0usize;
+            let mut buf = [0u8; 64];
+            while got < 512 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                got += far.read(&mut buf).await.unwrap();
+            }
+            got
+        });
+        // 512 bytes through a 64-byte pipe at one chunk per 300 ms: about 2.4 s in
+        // all, three times the stall bound, with no single wait near it.
+        stream.write_all(&[1u8; 512]).await.expect("progress restarts the clock");
+        assert!(reading.await.unwrap() >= 512);
+    }
+
+    /// **The serving side ends an answer the dialler stops reading.** The dialler asks
+    /// for a window much larger than the two sockets' buffers and then reads
+    /// nothing; the server's write stops making progress and the connection ends as
+    /// a timeout, not held for ever.
+    #[tokio::test]
+    async fn an_answer_the_dialler_stops_reading_is_ended_on_the_stall_bound() {
+        let (_a, _dir, addr, served) =
+            serving_one(waits_of(Duration::from_secs(60), Duration::from_secs(1))).await;
+        let a = &_a;
+        let docs = a.create_collection("shop", "big").unwrap();
+        let body = "x".repeat(100 * 1024);
+        for id in 0..400i64 {
+            a.insert(&docs, bson::doc! { "_id": id, "body": body.clone() }).unwrap();
+        }
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        socket2::SockRef::from(stream.get_ref().0).set_recv_buffer_size(4096).unwrap();
+        ask_versions(&mut stream).await;
+        write_frame(
+            &mut stream,
+            &Message::AskEntries {
+                from: kimmy_core::Hlc::ZERO,
+                limit: MAX_BATCH,
+                held: None,
+                marked: Vec::new(),
+                partial: false,
+            },
+        )
+        .await
+        .unwrap();
+        // Read nothing. The answer is some 40 MB.
+        let failures = tokio::time::timeout(Duration::from_secs(20), served)
+            .await
+            .expect("the server ended the connection whose answer nobody reads")
+            .unwrap();
+        assert_eq!(failures, [ServeFailure::Timeout]);
+        drop(stream);
+    }
+
     /// A dialled stream held while the rounds ahead of it ran still carries its
-    /// round: the serving side has no idle read timeout after the handshake, and
-    /// this holds one past the longest of the dialler's bounds that could be mistaken
-    /// for one (the 10 s of the handshake).
+    /// round: the serving side's idle bound (300 s) is far above what a tick holds a
+    /// stream for, and this holds one past the longest of the dialler's bounds that
+    /// could be mistaken for it (the 10 s of the handshake).
     #[tokio::test]
     async fn a_dialled_stream_held_idle_carries_its_round() {
         let (a, _a_dir, addr, _served) = serving_counted().await;
@@ -11520,9 +12280,18 @@ mod tests {
         let round = || async {
             let (mut ours, theirs_end) = tokio::io::duplex(MAX_FRAME);
             let peer = tokio::spawn(holder(theirs_end, served.borrow().clone()));
-            replay_own_origin(&engine, &mut ours, addr, c, &theirs, &catch_up, ample())
-                .await
-                .unwrap();
+            replay_own_origin(
+                &engine,
+                &mut ours,
+                addr,
+                c,
+                &theirs,
+                &catch_up,
+                ample(),
+                &RoundClock::default(),
+            )
+            .await
+            .unwrap();
             drop(ours);
             peer.await.unwrap();
         };
@@ -11680,6 +12449,7 @@ mod tests {
                         theirs,
                         catch_up,
                         deadline,
+                        &RoundClock::default(),
                     )
                     .await;
                     drop(ours);
@@ -11763,6 +12533,7 @@ mod tests {
                 &theirs,
                 &catch_up,
                 ample(),
+                &RoundClock::default(),
             )
             .await;
             drop(ours);
@@ -12053,7 +12824,8 @@ mod partial_windows_never_skip {
     ) -> (Result<kimmy_storage::SyncOutcome, ProtocolError>, Option<Hlc>) {
         let (mut ours, near) = tokio::io::duplex(MAX_FRAME);
         let (far, theirs) = tokio::io::duplex(MAX_FRAME);
-        let budgets = ServeBudgets { partial, whole: REQUEST_TIMEOUT };
+        let budgets =
+            ServeBudgets { partial, whole: REQUEST_TIMEOUT, waits: ServeBudgets::serving().waits };
         let serving = serve_peer(sender, theirs, SECRET, BINDING, None, budgets, None);
         let asked: std::cell::Cell<Option<Hlc>> = std::cell::Cell::new(None);
         let relaying = async {

@@ -20,6 +20,9 @@ bson.workspace = true
 # RustCrypto, so peer authentication adds no *additional* native dependency.
 # The build already carries `ring` via `reqwest` (ADR-016), so the rule is not
 # to add a second crypto stack rather than to have none.
+# Keepalive on the cluster sockets (tokio has no API for it); already in the lock
+# file through tokio and hyper.
+socket2 = { version = "0.6", features = ["all"] }
 tokio-rustls.workspace = true
 rustls.workspace = true
 rcgen.workspace = true

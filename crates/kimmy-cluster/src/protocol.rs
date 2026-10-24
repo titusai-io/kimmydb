@@ -551,6 +551,12 @@ pub enum ProtocolError {
     /// there.
     #[error("{0} timed out")]
     TimedOut(String),
+    /// The serving side waited for a connection's next request and none came: not a
+    /// wait that ran out in the middle of an exchange, so it has its own variant
+    /// and its own label (a dialler behind a long local apply is expected to land
+    /// here, and an alert on timeouts must not fire for it).
+    #[error("an idle connection timed out")]
+    Idle,
     #[error("frame of {size} bytes exceeds the {MAX_FRAME} byte limit")]
     TooLarge { size: usize },
     #[error("peer failed authentication")]
@@ -629,8 +635,66 @@ fn decode(body: &[u8]) -> Result<Message, ProtocolError> {
         .map_err(|e| ProtocolError::Malformed(format!("decoding: {e}")))
 }
 
+/// How long to wait on a frame: for its first byte, which is the connection being
+/// idle between two requests, and then for each read that follows within it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameWaits {
+    pub(crate) idle: std::time::Duration,
+    pub(crate) stall: std::time::Duration,
+}
+
+/// `read`, bounded by `wait` if there is one.
+async fn read_within<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    wait: Option<(std::time::Duration, bool)>,
+) -> Result<usize, ProtocolError> {
+    match wait {
+        None => Ok(reader.read(buf).await?),
+        Some((limit, idle)) => match tokio::time::timeout(limit, reader.read(buf)).await {
+            Ok(read) => Ok(read?),
+            Err(_) if idle => Err(ProtocolError::Idle),
+            Err(_) => Err(ProtocolError::TimedOut("a frame in progress".into())),
+        },
+    }
+}
+
+/// [`read_frame_noting_facts`], bounded: the serving side's wait for the next
+/// request. The first byte has `waits.idle`, and a frame that has begun must go on
+/// arriving, a read at a time, within `waits.stall`.
+pub(crate) async fn read_frame_noting_facts_within<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    waits: FrameWaits,
+) -> Result<(Message, bool, u64), ProtocolError> {
+    let body = read_body_within(reader, Some(waits)).await?;
+    crate::facts::take_undecodable();
+    let message = decode(&body)?;
+    let seq = crate::facts::next_decoded_seq();
+    Ok((message, crate::facts::take_undecodable(), seq))
+}
+
 /// The bytes of one length-prefixed frame.
 async fn read_body<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
+    read_body_within(reader, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn read_body_for_test<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, ProtocolError> {
+    read_body(reader).await
+}
+
+/// How much of a frame's body is made room for at a time. The length is the
+/// sender's claim, up to [`MAX_FRAME`], and a connection that says 64 MiB and sends
+/// nothing must not hold 64 MiB: room is made for what has arrived, and this much
+/// more.
+const BODY_CHUNK: usize = 1024 * 1024;
+
+async fn read_body_within<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    waits: Option<FrameWaits>,
+) -> Result<Vec<u8>, ProtocolError> {
     // Closed only at a frame boundary, before the first byte of a prefix. A
     // connection that ends inside the prefix ended mid-frame, which is an
     // I/O failure like one that ends inside the body.
@@ -643,8 +707,9 @@ async fn read_body<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, Prot
     let mut len = [0u8; 4];
     let mut got = 0;
     while got < len.len() {
-        let read = match reader.read(&mut len[got..]).await {
-            Err(e) if got == 0 && e.kind() == io::ErrorKind::UnexpectedEof => {
+        let wait = waits.map(|w| if got == 0 { (w.idle, true) } else { (w.stall, false) });
+        let read = match read_within(reader, &mut len[got..], wait).await {
+            Err(ProtocolError::Io(e)) if got == 0 && e.kind() == io::ErrorKind::UnexpectedEof => {
                 return Err(ProtocolError::Closed);
             }
             read => read?,
@@ -667,8 +732,23 @@ async fn read_body<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, Prot
         return Err(ProtocolError::TooLarge { size });
     }
 
-    let mut body = vec![0u8; size];
-    reader.read_exact(&mut body).await?;
+    let mut body = Vec::new();
+    while body.len() < size {
+        let start = body.len();
+        body.resize(start + BODY_CHUNK.min(size - start), 0);
+        let mut filled = start;
+        while filled < body.len() {
+            let wait = waits.map(|w| (w.stall, false));
+            let read = read_within(reader, &mut body[filled..], wait).await?;
+            if read == 0 {
+                return Err(ProtocolError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                )));
+            }
+            filled += read;
+        }
+    }
     Ok(body)
 }
 
