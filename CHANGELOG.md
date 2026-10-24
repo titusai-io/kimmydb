@@ -26,6 +26,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 **Fixed:** a sync tick dialled its peers one after the other, so each peer that did not answer cost the dial bound (5 s) in front of every peer behind it, and three of them held the tick, discovery's join and the round's report for fifteen seconds; a write on a healthy member reached a member that was waiting on them late. The tick dials its peers together now and runs the rounds in order, one at a time as before. A connection held longer than the dial bound, or ended while it waited, is dialled again before its round. A peer that stops answering after its connection was made still costs the request timeout (30 s) in its round.
 
+**Fixed:** a sync round against a peer that froze after its connection was made (the process stopped, or the host stalled) waited the request timeout, 30 s, for the answer to its first request, and the rounds of a tick are one after another, so every peer behind it waited too. The first request is answered from two small reads of the version tables, so its answer now has the handshake's 10 s; the rest of a round keeps 30 s. A failure is reported as `the first reply timed out`.
+
 The minimum supported Rust is 1.99.
 
 ## 0.53.0 - 2026-10-23
