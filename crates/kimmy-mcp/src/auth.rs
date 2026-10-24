@@ -23,8 +23,8 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use kimmy_api::SharedState;
 use kimmy_api::state::Auth;
+use kimmy_api::{RequestLimits, SharedState};
 use kimmy_auth::Principal;
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
@@ -38,7 +38,7 @@ use crate::tools::KimmyMcp;
 ///
 /// `allowed_hosts` restricts the `Host` header rmcp will accept; an empty list
 /// disables that check. See [`mcp_router`]'s note on DNS rebinding below.
-pub fn mcp_router(state: SharedState, allowed_hosts: Vec<String>) -> Router {
+pub fn mcp_router(state: SharedState, allowed_hosts: Vec<String>, limits: RequestLimits) -> Router {
     // Stateless. A session would pin a conversation to one node's memory, which
     // is exactly the property M4 replication is meant to avoid needing — and it
     // would let a token authenticated once keep working after it expired. Every
@@ -61,7 +61,7 @@ pub fn mcp_router(state: SharedState, allowed_hosts: Vec<String>) -> Router {
     let service = StreamableHttpService::new(
         {
             let state = Arc::clone(&state);
-            move || Ok(KimmyMcp::new(Arc::clone(&state)))
+            move || Ok(KimmyMcp::new(Arc::clone(&state), limits))
         },
         Arc::new(NeverSessionManager::default()),
         config,
@@ -69,7 +69,7 @@ pub fn mcp_router(state: SharedState, allowed_hosts: Vec<String>) -> Router {
 
     Router::new()
         .route_service("/mcp", service)
-        .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), authenticate))
+        .layer(axum::middleware::from_fn_with_state((Arc::clone(&state), limits), authenticate))
         .with_state(state)
 }
 
@@ -79,7 +79,7 @@ pub fn mcp_router(state: SharedState, allowed_hosts: Vec<String>) -> Router {
 /// header: token parsing, the `insecure_no_auth` escape hatch, and the shape of
 /// a 401 are all decided in one place, and this is not a second one.
 async fn authenticate(
-    State(state): State<SharedState>,
+    State((state, limits)): State<(SharedState, RequestLimits)>,
     request: Request,
     next: Next,
 ) -> Result<Response, kimmy_api::ApiError> {
@@ -89,7 +89,70 @@ async fn authenticate(
     let Auth(principal) = Auth::from_request_parts(&mut parts, &state).await?;
     parts.extensions.insert(principal);
 
+    // rmcp reads its own bodies, with no time bound of its own that this server can see
+    // (it takes the stream and reads it in its service); a client that sends the headers
+    // and then trickles the body would hold the connection, as it could on REST before
+    // ADR-099. The body gets `request_timeout_secs` to arrive. This bounds the *reading*
+    // only, not the call: once the body is in, the call runs under the deadline its tool
+    // handler sets (`tools::within_deadline`).
+    let body = axum::body::Body::new(TimedBody::new(body, limits.request_timeout));
     Ok(next.run(Request::from_parts(parts, body)).await)
+}
+
+/// A request body that must arrive within a time: the stream ends with an error if it
+/// has not been read to its end by then. Unlike a whole-request deadline it says nothing
+/// once the body is complete.
+struct TimedBody {
+    inner: axum::body::Body,
+    timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl TimedBody {
+    fn new(inner: axum::body::Body, within: std::time::Duration) -> Self {
+        Self { inner, timer: Box::pin(tokio::time::sleep(within)) }
+    }
+}
+
+#[derive(Debug)]
+struct BodyTimedOut;
+
+impl std::fmt::Display for BodyTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the request body did not arrive within server.request_timeout_secs")
+    }
+}
+
+impl std::error::Error for BodyTimedOut {}
+
+impl http_body::Body for TimedBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::future::Future;
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(frame) => Poll::Ready(frame),
+            Poll::Pending => {
+                if self.timer.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(Some(Err(axum::Error::new(BodyTimedOut))))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Recover the principal a tool call is running as.

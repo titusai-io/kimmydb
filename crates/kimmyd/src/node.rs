@@ -1175,7 +1175,11 @@ async fn start_and_serve(
     // traces and challenges, which is how `/mcp` came to answer 401 with no
     // `WWW-Authenticate` and to be missing from `/metrics` entirely.
     let mcp = config.server.mcp.then(|| {
-        kimmy_mcp::mcp_router(Arc::clone(&state), config.server.mcp_allowed_hosts.clone())
+        kimmy_mcp::mcp_router(
+            Arc::clone(&state),
+            config.server.mcp_allowed_hosts.clone(),
+            config.server.request_limits(),
+        )
     });
     let serving_mcp = mcp.is_some();
     // The request deadline and body ceiling ride in with the router rather

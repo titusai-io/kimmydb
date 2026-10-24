@@ -26,6 +26,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with(kimmy_api::RequestLimits::default()).await
+    }
+
+    async fn start_with(limits: kimmy_api::RequestLimits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
         UserStore::open(&engine).unwrap();
@@ -48,7 +52,7 @@ impl Server {
         // counts, times, traces and challenges.
         let app = kimmy_api::router_with(
             Arc::clone(&state),
-            Some(kimmy_mcp::mcp_router(Arc::clone(&state), Vec::new())),
+            Some(kimmy_mcp::mcp_router(Arc::clone(&state), Vec::new(), limits)),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1872,4 +1876,114 @@ async fn the_size_caps_hold_over_mcp() {
     let found =
         server.call_ok(&root, "find", json!({"database":"sales","collection":"orders"})).await;
     assert_eq!(found["count"], 4, "{found}");
+}
+
+// ---------------------------------------------------------------------------
+// The request deadline (ADR-099, ADR-151)
+// ---------------------------------------------------------------------------
+
+fn limits_of(seconds: u64) -> kimmy_api::RequestLimits {
+    kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_secs(seconds),
+        ..Default::default()
+    }
+}
+
+/// **A write over MCP waits for the writer no longer than REST does.** The writer is held,
+/// as by a bulk load or an index build; a tool call that needs it used to wait for as long
+/// as the hold lasted and the client saw a hang. It now ends at the request deadline with
+/// the answer REST gives (`503 timeout`, ADR-151), as a tool result the model reads, and
+/// nothing is written. This also proves the deadline's scopes reach the tool: rmcp runs it
+/// in its own task, not the HTTP handler's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_tool_waits_for_a_held_writer_no_longer_than_the_deadline() {
+    let server = Server::start_with(limits_of(1)).await;
+    seed(&server);
+    let root = server.root();
+    let hold = server.engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+
+    let began = std::time::Instant::now();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        server.call(
+            &root,
+            "insert",
+            json!({"database":"sales","collection":"orders","document":{"_id":"late","x":1}}),
+        ),
+    )
+    .await
+    .expect("the call ended on the deadline and did not wait for the writer");
+    let took = began.elapsed();
+    drop(hold);
+
+    assert!(body["error"].is_null(), "a tool result, not a protocol error: {body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let envelope = &body["result"]["structuredContent"];
+    assert_eq!(envelope["error"], "timeout", "{body}");
+    assert_eq!(envelope["retry"], "wait");
+    assert!(
+        took >= std::time::Duration::from_millis(900) && took < std::time::Duration::from_secs(10),
+        "{took:?}"
+    );
+    // Nothing was written, and with the writer free the same call succeeds.
+    let after =
+        server.call_ok(&root, "count", json!({"database":"sales","collection":"orders"})).await;
+    assert_eq!(after["count"], 3);
+    let again = server
+        .call(
+            &root,
+            "insert",
+            json!({"database":"sales","collection":"orders","document":{"_id":"late","x":1}}),
+        )
+        .await;
+    assert!(again["result"]["isError"].is_null() || again["result"]["isError"] == false, "{again}");
+}
+
+/// The answer is the one REST gives the same condition: the same code, class and wording.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_timeout_answer_over_mcp_is_the_one_rest_gives() {
+    let server = Server::start_with(limits_of(1)).await;
+    seed(&server);
+    let root = server.root();
+    let hold = server.engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        server.call(
+            &root,
+            "insert",
+            json!({"database":"sales","collection":"orders","document":{"x":1}}),
+        ),
+    )
+    .await
+    .expect("ended on the deadline");
+    drop(hold);
+    let message = body["result"]["structuredContent"]["message"].as_str().unwrap().to_string();
+    let rest = kimmy_api::ApiError::writer_busy(std::time::Duration::from_secs(1));
+    assert_eq!(message, rest.message, "one wording for both transports");
+    assert_eq!(body["result"]["structuredContent"]["retry"], rest.retry().as_str());
+}
+
+/// A body that is sent slowly is cut at the deadline: rmcp reads its own bodies, and the
+/// connection would otherwise be held by a client that sends the headers and then trickles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_that_does_not_arrive_in_time_is_cut_off() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = Server::start_with(limits_of(1)).await;
+    let root = server.root();
+    let host = server.base.strip_prefix("http://").unwrap();
+    let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nAuthorization: Bearer {root}\r\n\
+         Content-Length: 1000\r\n\r\n{{\"jsonrpc\":"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    // The rest of the body never comes.
+    let began = std::time::Instant::now();
+    let mut raw = Vec::new();
+    let ended =
+        tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut raw))
+            .await;
+    assert!(ended.is_ok(), "the server held a connection whose body never arrived");
+    assert!(began.elapsed() < std::time::Duration::from_secs(8), "{:?}", began.elapsed());
 }

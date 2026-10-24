@@ -2581,6 +2581,7 @@ dependencies = [
  "axum",
  "bson",
  "http",
+ "http-body",
  "http-body-util",
  "kimmy-api",
  "kimmy-auth",

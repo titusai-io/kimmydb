@@ -10,8 +10,8 @@
 //! tool is for and which other tool to reach for instead, not just what its
 //! arguments are named.
 
-use kimmy_api::error::Retry;
-use kimmy_api::{ApiError, SharedState, exec, schema, vectors};
+use kimmy_api::error::{ErrorCode, Retry};
+use kimmy_api::{ApiError, RequestLimits, SharedState, exec, schema, vectors};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig};
@@ -26,12 +26,16 @@ use crate::auth::principal;
 #[derive(Clone)]
 pub struct KimmyMcp {
     pub(crate) state: SharedState,
+    /// The request deadline every tool call runs under, `server.request_timeout_secs`
+    /// (ADR-099): the same number, and the same four scopes around the call, as a REST
+    /// request has.
+    pub(crate) limits: RequestLimits,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
 impl KimmyMcp {
-    pub fn new(state: SharedState) -> Self {
-        Self { state, tool_router: Self::tool_router() }
+    pub fn new(state: SharedState, limits: RequestLimits) -> Self {
+        Self { state, limits, tool_router: Self::tool_router() }
     }
 
     pub(crate) fn server_info() -> ServerConfig {
@@ -840,8 +844,38 @@ pub(crate) fn render(result: Result<Value, ApiError>) -> Result<CallToolResult, 
     match result {
         Ok(value) => Ok(ok(value)),
         Err(e) if e.retry() == Retry::Verify => Ok(unknown(e)),
+        Err(e) if e.code == ErrorCode::Timeout => Ok(timed_out(e)),
         Err(e) => Err(error(e)),
     }
+}
+
+/// Run a tool call under the request deadline (ADR-099), and answer a call still
+/// pending at it as [`timed_out`] does.
+///
+/// Called from the handler, inside the task rmcp runs it in: the deadline's scopes are
+/// task-locals, and rmcp runs a tool in its service loop's task, not in the HTTP
+/// handler's, so a layer around `/mcp` would not reach them. See
+/// [`kimmy_api::limits::within_request_deadline`] for what they are.
+pub(crate) async fn within_deadline(
+    limits: RequestLimits,
+    call: impl std::future::Future<Output = Result<rmcp::model::CallToolResponse, ErrorData>>,
+) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+    match kimmy_api::limits::within_request_deadline(limits.request_timeout, call).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(timed_out(ApiError::timeout(limits.request_timeout)).into()),
+    }
+}
+
+/// A call that ran out of time, as a tool result the model reads, with the code, class
+/// and wording REST gives the same condition (the `503 timeout` envelope: ADR-099, and
+/// ADR-151 for a write that could not take the writer). The model sees it and can act:
+/// the class is `wait`. It says no more than REST does about what was done.
+fn timed_out(e: ApiError) -> CallToolResult {
+    let envelope = envelope(&e);
+    let text = format!("{} ({}, retry: {})", e.message, e.code.as_str(), e.retry().as_str());
+    let mut result = CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)]);
+    result.structured_content = Some(envelope);
+    result
 }
 
 /// A write whose outcome is not known, as a tool result the model reads.
@@ -935,12 +969,35 @@ mod tests {
 
         let mut busy = ApiError::writer_busy(std::time::Duration::from_secs(30));
         busy.retry_after_secs = Some(2);
-        let busy = render(Err(busy)).expect_err("a busy writer stays a protocol error");
-        assert_eq!(busy.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
-        let data = busy.data.expect("the envelope rides in data");
+        let busy = render(Err(busy)).expect("a busy writer is a tool result the model reads");
+        assert_eq!(busy.is_error, Some(true));
+        let data = busy.structured_content.expect("the envelope rides in the result");
         assert_eq!(data["error"], "timeout");
         assert_eq!(data["retry"], "wait");
         assert_eq!(data["retry_after_secs"], 2, "Retry-After has no header to ride in here");
+    }
+
+    /// The deadline's answer carries REST's wording and class, and a call still pending at
+    /// it is abandoned.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_pending_at_the_deadline_is_a_timeout_result_with_rests_wording() {
+        let limits = RequestLimits {
+            request_timeout: std::time::Duration::from_secs(7),
+            ..Default::default()
+        };
+        let result = within_deadline(limits, std::future::pending())
+            .await
+            .expect("a tool result, not a protocol error");
+        let rmcp::model::CallToolResponse::Complete(result) = result else {
+            panic!("a completed call")
+        };
+        assert_eq!(result.is_error, Some(true));
+        let envelope = result.structured_content.expect("the envelope");
+        assert_eq!(envelope["error"], "timeout");
+        assert_eq!(envelope["retry"], "wait");
+        assert_eq!(envelope["message"], ApiError::timeout(limits.request_timeout).message);
+        let text = result.content[0].as_text().expect("text").text.clone();
+        assert!(text.contains("7 seconds") && text.contains("retry: wait"), "{text}");
     }
 
     #[test]

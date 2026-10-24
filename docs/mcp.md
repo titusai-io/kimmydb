@@ -373,6 +373,23 @@ transport the same way**: its outcome is unknown, and it reads the target back
 before writing again. See [retrying after an unknown
 outcome](clients.md#retrying-after-an-unknown-outcome).
 
+**A call that runs out of time is a tool result too.** An MCP tool call has the same
+deadline as a REST request (`server.request_timeout_secs`, [ADR-099](decisions.md)). A
+write that cannot take the storage writer inside it, a search or a confirmation that
+sees the deadline pass, or a call still pending at it, comes back with `isError: true` and
+the REST `503` envelope as `structuredContent`:
+
+```json
+{"isError": true,
+ "content": [{"type": "text", "text": "the request was not completed within 30 seconds (server.request_timeout_secs) and was abandoned (timeout, retry: wait)"}],
+ "structuredContent": {"error": "timeout", "message": "…", "retry": "wait"}}
+```
+
+`retry` is `wait`. A write answered `timeout` because it could not get the writer wrote
+nothing; any other timeout says what REST says and no more. Storage work already running
+(a scan, a bulk commit, an index build) is not cut and is answered with its result, as on
+REST. The request body must also arrive within the same number of seconds.
+
 An argument a tool does not define is refused the same way, by name: `limt`
 where `limit` was meant is an error result that names the field and lists the
 ones the tool takes, not a call that ran without it. Each tool's `inputSchema`
