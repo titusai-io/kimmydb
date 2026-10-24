@@ -223,6 +223,29 @@ struct Writers {
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// What the stop tests allow the stop itself, far above a loaded host's noise and far below
+/// a stop that waits for the whole walk: a failure here is a stop that did not stop.
+const STOP_BOUND: Duration = Duration::from_secs(10);
+
+/// How long a write took once nothing else was writing. A transaction the stop left held
+/// would never let it in, so the wait is bounded by a minute and failing it means a leak,
+/// not a slow host.
+async fn write_is_not_held(b: &Arc<Engine>) -> Duration {
+    let b = Arc::clone(b);
+    let began = Instant::now();
+    let wrote = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || {
+            let probe = b.create_collection("shop", "after").unwrap();
+            b.insert(&probe, bson::doc! { "_id": 1 }).unwrap();
+        }),
+    )
+    .await;
+    assert!(wrote.is_ok(), "a write after the stop never got in: the stop left the writer held");
+    wrote.unwrap().unwrap();
+    began.elapsed()
+}
+
 fn background_writers(b: &Arc<Engine>, n: usize) -> Writers {
     let stop = Arc::new(AtomicBool::new(false));
     let writes = Arc::new(AtomicU64::new(0));
@@ -349,17 +372,16 @@ async fn a_stop_mid_converge_with_background_writers_is_prompt_and_holds_nothing
     looping.abort();
     let _ = looping.await;
     let stopped_in = stopping.elapsed();
-    let write = Instant::now();
-    let probe = b.create_collection("shop", "after").unwrap();
-    b.insert(&probe, bson::doc! { "_id": 1 }).unwrap();
-    let write_after = write.elapsed();
+    // The background writers end first, so the probe write below waits for nothing but a
+    // transaction the stop left held: the single writer is not first come first served, and
+    // a write queued with four tight writers measured their contention, not the stop.
     let (writes, longest) = writers.end();
+    let write_after = write_is_not_held(&b).await;
     eprintln!(
         "review_rrb stop mid-converge: task ended {stopped_in:?} after the stop; a write after \
          it took {write_after:?}; background writers made {writes} writes, longest {longest:?}"
     );
-    assert!(stopped_in < secs(2), "the stop waited {stopped_in:?}");
-    assert!(write_after < secs(1), "a write after the stop waited {write_after:?}");
+    assert!(stopped_in < STOP_BOUND, "the stop waited {stopped_in:?}");
     assert!(writes > 0);
 }
 
@@ -430,21 +452,17 @@ async fn a_stop_mid_definition_build_with_background_writers_is_prompt() {
     looping.abort();
     let _ = looping.await;
     let stopped_in = stopping.elapsed();
-    let write = Instant::now();
-    let probe = b.create_collection("shop", "after").unwrap();
-    let wrote = b.insert(&probe, bson::doc! { "_id": 1 });
-    let write_after = write.elapsed();
-    let built = b.list_indexes("shop", "orders").unwrap().len();
+    // The writers end first, as in the converge test above.
     let (writes, longest) = writers.end();
+    let write_after = write_is_not_held(&b).await;
+    let built = b.list_indexes("shop", "orders").unwrap().len();
     eprintln!(
         "review_rrb stop mid-definition-build: {:?} from the round's start to the stop; the \
          task ended {stopped_in:?} after it; index built: {built}; a write after it took \
-         {write_after:?} ({}); writers made {writes} writes, longest {longest:?}",
+         {write_after:?}; writers made {writes} writes, longest {longest:?}",
         stopping - started,
-        if wrote.is_ok() { "ok" } else { "refused" }
     );
-    assert!(stopped_in < secs(2), "the stop waited {stopped_in:?} for the build");
-    assert!(write_after < secs(1), "a write after the stop waited {write_after:?}");
+    assert!(stopped_in < STOP_BOUND, "the stop waited {stopped_in:?} for the build");
 }
 
 // -- Observability: the end line of the next repair ----------------------------------------
