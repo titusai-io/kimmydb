@@ -519,11 +519,15 @@ pub(crate) enum Continuing {
 
 tokio::task_local! {
     /// The longest the current task is prepared to wait for the writer.
-    static WRITE_WAIT_BUDGET: std::time::Duration;
+    static WRITE_WAIT_DEADLINE: std::time::Instant;
 }
 
-/// Run `f` with every write it opens bounded to `budget` of waiting for the
-/// writer (ADR-151).
+/// Run `f` with every write it opens bounded to waiting for the writer until `budget` from
+/// now (ADR-151).
+///
+/// The budget is a **deadline**, read at each write: a write that comes after other work
+/// (a request's slow body, an earlier write of the same request) waits for what is left of
+/// it, not a fresh `budget`, so one request is bounded as a whole by the time it was given.
 ///
 /// A write that cannot take the writer inside the budget fails with
 /// [`StorageError::WriterBusy`] rather than blocking, having written nothing.
@@ -537,12 +541,14 @@ pub async fn with_write_wait_budget<F: std::future::Future>(
     budget: std::time::Duration,
     f: F,
 ) -> F::Output {
-    WRITE_WAIT_BUDGET.scope(budget, f).await
+    WRITE_WAIT_DEADLINE.scope(std::time::Instant::now() + budget, f).await
 }
 
-/// The budget the current task set, if any.
+/// What is left of the budget the current task set, if any.
 fn write_wait_budget() -> Option<std::time::Duration> {
-    WRITE_WAIT_BUDGET.try_with(|budget| *budget).ok()
+    WRITE_WAIT_DEADLINE
+        .try_with(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok()
 }
 
 /// An exclusive hold of the writer; see [`Engine::hold_writer`].

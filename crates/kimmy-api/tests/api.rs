@@ -15080,6 +15080,66 @@ async fn a_write_that_cannot_get_the_writer_in_time_is_a_503_timeout() {
     );
 }
 
+/// **One deadline over a request's body and its write.** A body that takes most of the
+/// deadline leaves the write's wait for the storage writer only what is left: the limit is
+/// 3 s, the body takes 2 s, the writer is held, and the `503 timeout` comes at about 3 s,
+/// not at 5 (a fresh budget when the write began).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_after_a_slow_body_waits_for_the_writer_only_for_what_is_left() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_secs(3),
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+
+    let hold = server.state.engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+    let body = r#"{"_id":"late","n":1}"#;
+    let (first, rest) = body.split_at(body.len() / 2);
+    let host = server.base.strip_prefix("http://").expect("http url");
+    let began = std::time::Instant::now();
+    let stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+    let (mut read, mut write) = stream.into_split();
+    let head = format!(
+        "POST /v1/db/shop/coll/orders/docs HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nAuthorization: Bearer {token}\r\n\
+         Content-Length: {}\r\n\r\n{first}",
+        body.len()
+    );
+    write.write_all(head.as_bytes()).await.unwrap();
+    let rest = rest.to_string();
+    // Kept until the answer is read: dropping the write half would half-close the connection
+    // and the server would take the client for gone.
+    let sender = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let _ = write.write_all(rest.as_bytes()).await;
+        write
+    });
+    let mut raw = Vec::new();
+    let ended =
+        tokio::time::timeout(std::time::Duration::from_secs(15), read.read_to_end(&mut raw)).await;
+    let took = began.elapsed();
+    drop(hold);
+    sender.abort();
+    assert!(ended.is_ok(), "no answer: the write waited out a fresh budget");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, json) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    let json: Value = serde_json::from_str(json.trim()).unwrap_or(Value::Null);
+    assert_eq!(json["error"], "timeout", "{json}");
+    let message = json["message"].as_str().unwrap_or_default();
+    assert!(message.contains("of the 3 s request deadline"), "{message}");
+    assert!(
+        took >= std::time::Duration::from_millis(2900)
+            && took < std::time::Duration::from_millis(4300),
+        "the body and the write share the 3 s: {took:?}"
+    );
+    let read_back = server.get("/v1/db/shop/coll/orders/docs/late", Some(&token)).await;
+    assert_eq!(read_back.status, 404, "nothing was written: {:?}", read_back.body);
+}
+
 /// A schema change runs off the async worker, under `kimmy_storage::blocking`,
 /// and keeps the request's write budget there (ADR-151): `block_in_place`
 /// runs it on the same thread, inside the task the budget is scoped to. Run on
