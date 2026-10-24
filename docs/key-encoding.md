@@ -250,8 +250,9 @@ decimal its exact place in the order and in the key, so a `Decimal128` is
 compared, sorted and indexed by value, and can be an `_id`
 ([Indexes](indexes.md#a-decimal128-at-a-filtered-path),
 [Query language](query-language.md#3-comparisons-do-not-cross-type-groups)).
-`$convert` to `decimal` and `$toDecimal` stay refused, for a reason of their
-own: converting a double needs a rounding rule ([Deviations](deviations.md)).
+`$convert` to `decimal` and `$toDecimal` convert a double by its exact binary
+value rounded once to 34 digits ([Deviations](deviations.md)), and a decimal
+result of arithmetic is a canonical `Decimal128` this encoding keys like any other.
 
 ---
 

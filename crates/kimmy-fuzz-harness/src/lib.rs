@@ -97,6 +97,23 @@ pub static FIXTURES: LazyLock<Vec<Document>> = LazyLock::new(|| {
             "n": [decimal("3"), 1], "nested": { "a": [{ "b": decimal("2.0") }] },
             "items": [{ "sku": "a", "qty": decimal("9") }],
         },
+        // What the arithmetic meets (ADR-252): decimals at the ends of the range,
+        // an infinity, a negative zero, a non-canonical coefficient and the
+        // large-coefficient form (both zeros), and doubles that are not
+        // dyadic, so `$inc` and `$mul` have a stored decimal to guard and a
+        // stored double to widen.
+        doc! {
+            "_id": 8, "top": decimal("9.999999999999999999999999999999999E+6144"),
+            "tiny": decimal("1E-6176"), "inf": decimal("Infinity"), "negzero": decimal("-0"),
+            "cents": decimal("19.99"), "wide": decimal("1234567890123456789012345678901234"),
+            "bad_coefficient": Bson::Decimal128(bson::Decimal128::from_bytes(
+                (((1u128 << 113) - 1) | (6176u128 << 113)).to_le_bytes(),
+            )),
+            "large_form": Bson::Decimal128(bson::Decimal128::from_bytes(
+                ((0b11u128 << 125) | (6177u128 << 111)).to_le_bytes(),
+            )),
+            "tenth": 0.1, "third": 0.333_333_333_333_333_3, "ints": [1, 2_i64, decimal("0.5")],
+        },
         doc! {},
     ]
 });
@@ -183,8 +200,29 @@ pub fn update_parse_apply(data: &[u8]) {
         let id_before = target.get("_id").cloned();
         if update::apply(&update, &mut target, NOW_MS).is_ok() {
             assert_eq!(target.get("_id"), id_before.as_ref(), "an update changed _id: {doc:?}");
+            // Arithmetic writes a canonical Decimal128 or leaves the field as
+            // it was: a result is never a coefficient above 10^34 - 1 or an
+            // exponent out of range, in a field the update changed.
+            for (key, value) in &target {
+                if let Bson::Decimal128(d) = value
+                    && fixture.get(key) != Some(value)
+                {
+                    assert_canonical(d, &doc);
+                }
+            }
         }
     }
+}
+
+/// A decimal arithmetic wrote is canonical BID: reading it and packing it again
+/// gives the same 16 bytes.
+fn assert_canonical(d: &bson::Decimal128, update: &Document) {
+    use kimmy_core::decimal::{decode_raw, pack_raw};
+    assert_eq!(
+        pack_raw(decode_raw(d)).bytes(),
+        d.bytes(),
+        "an update wrote a non-canonical Decimal128 {d}: {update:?}"
+    );
 }
 
 /// Projection and sort documents: parse, then project and sort the fixtures.
@@ -575,6 +613,30 @@ mod tests {
             for input in inputs {
                 harness(input);
             }
+        }
+    }
+
+    /// Updates that meet the decimal arithmetic's edges run clean over every
+    /// fixture, whatever they are refused for: the guard, an overflow, a field
+    /// that is not a number.
+    #[test]
+    fn decimal_updates_run_clean_over_every_fixture() {
+        let updates = [
+            r#"{"$inc":{"qty":{"$numberDecimal":"0.01"}}}"#,
+            r#"{"$inc":{"qty":0.01}}"#,
+            r#"{"$inc":{"cents":0.01}}"#,
+            r#"{"$inc":{"cents":0.25,"qty":1}}"#,
+            r#"{"$mul":{"top":10}}"#,
+            r#"{"$mul":{"tiny":{"$numberDecimal":"0.1"}}}"#,
+            r#"{"$inc":{"inf":{"$numberDecimal":"-Infinity"}}}"#,
+            r#"{"$inc":{"negzero":0,"bad_coefficient":0,"large_form":0}}"#,
+            r#"{"$mul":{"tenth":{"$numberDecimal":"1.10"},"third":3}}"#,
+            r#"{"$inc":{"wide":{"$numberDecimal":"0.001"}}}"#,
+            r#"{"$inc":{"ints.0":{"$numberDecimal":"1E+6000"},"ints.2":0.5}}"#,
+            r#"{"$mul":{"price":{"$numberDecimal":"NaN"},"total":2}}"#,
+        ];
+        for update in updates {
+            update_parse_apply(update.as_bytes());
         }
     }
 

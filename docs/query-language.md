@@ -452,7 +452,7 @@ both — mixing them is rejected rather than guessed at.
 |---|---|
 | `$set` `$unset` | Set / remove, at any dot path |
 | `$setOnInsert` | Set only when an upsert inserts; ignored on a match |
-| `$inc` `$mul` | Arithmetic; a missing field starts at `0` |
+| `$inc` `$mul` | Arithmetic; a missing field starts at `0`. A `Decimal128` on either side makes the result one: see [Decimal128 arithmetic in updates](#decimal128-arithmetic-in-updates) |
 | `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups), a `Decimal128` by its exact value: `$max: {v: 5}` over a stored `Decimal128("1.5")` sets `5` |
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
 | `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)), by value: `2`, `2.0` and `{"$numberDecimal": "2.00"}` are one member, and `0.1` the decimal and `0.1` the double are two; takes `$each` |
@@ -682,6 +682,66 @@ silently widening to `f64` — widening loses precision quietly, which is worse
 than failing. So `$inc` and `$mul` do not change a field's type behind the
 caller: `$type: "int"` keeps finding a counter that stays small.
 
+### Decimal128 arithmetic in updates
+
+`$inc` and `$mul` take a `Decimal128` operand, and a stored `Decimal128`
+([ADR-252](decisions.md)). The arithmetic is the one described under
+[Decimal128 arithmetic](aggregation.md#decimal128-arithmetic): exact, rounded
+once to 34 digits half to even, at IEEE's preferred quantum. Rows are the stored
+value, columns the operand:
+
+| Stored | `Int32`, `Int64` | `Double` | `Decimal128` |
+|---|---|---|---|
+| absent (starts as the integer `0`) | the integer | the double | `Decimal128` |
+| an integer | the integer | the double | `Decimal128` |
+| a double | the double | the double | `Decimal128`; the **stored** double by its exact binary value rounded once to 34 digits, exact or not |
+| `Decimal128` | `Decimal128` | `Decimal128` if the double is exactly a decimal, **otherwise `400`** | `Decimal128` |
+
+**A double operand that is not exactly a decimal is refused on a decimal
+field.** An operand double is almost always the parse of decimal text, and the
+double `0.01` is `0.01000000000000000020816681711721685…`; adding it would store
+that noise in a field that kept `19.99` to the cent. So
+
+```javascript
+{ "$inc": { "bal": 0.01 } }                       // on Decimal128("10.00")
+// 400 $inc on field "bal": the double 0.01 is not exactly a decimal
+//     (it is 0.01000000000000000020816681711721685…); send {"$numberDecimal": "0.01"}
+{ "$inc": { "bal": { "$numberDecimal": "0.01" } } }   // -> 10.01
+{ "$inc": { "bal": 0.25 } }                       // -> 10.25: 0.25 is exact
+{ "$inc": { "bal": 1 } }                          // -> 11.00
+{ "$mul": { "price": 1.1 } }                      // on 100.00: 400, as 1.1 is not exact
+{ "$mul": { "price": { "$numberDecimal": "1.1" } } }  // -> 110.000
+```
+
+`0.5`, `0.25`, `2.0`, `1e20`, an infinity and a NaN are exact doubles and are
+applied, as is every integer and every decimal. Under an array path
+(`items.$[].qty`) each element is checked, and one refusal refuses the whole
+update, as every update refusal does. In a `multi` update the refusal of a later
+chunk ends the request `500 partially_applied`, with the chunks before it
+applied ([ADR-192](decisions.md)), as any per-document refusal does. A stored
+double is **not** guarded: its exact value is the one the database already
+holds and compares by.
+
+**Overflow is refused, underflow is accepted.** A result whose adjusted exponent
+exceeds 6144 from finite inputs is a `400`, `arithmetic on field "v" overflowed
+a Decimal128`, as an `Int64` overflow is. An infinite input gives its IEEE
+result (`Infinity × 10` is stored as `Infinity`). A result below `1E-6143` is a
+subnormal, or a zero at `-6176`: `$mul` of `1E-6000` by `1E-6000` stores
+`0E-6176`.
+
+**A stored non-number is refused as ever** (`cannot apply arithmetic to
+non-numeric field`), and `_id` is still immutable.
+
+**Which cohort member is stored is a write.** `1.5 + 0` is `1.5` and counts as
+no change, but `1.5 + 0.00` is `1.50`: another member of the same cohort, other
+bytes ([`modified` counts changes](#modified-counts-changes)). It mints a stamp
+and can win last-writer-wins over a concurrent real change made on another
+member, which is the harm ADR-208 names, so do not send value-preserving decimal
+updates as no-ops. Two concurrent `$inc`s on two members still lose one to
+whole-document last-writer-wins, as they do for integers: the oplog carries the
+post-image, so the operator is evaluated once, by the member that took the
+request, and a peer stores the bytes it is sent.
+
 ### `_id` is immutable
 
 A replacement (`PUT`) stores `_id` as the document was keyed. An integer id in
@@ -733,6 +793,16 @@ it had, so an `if_stamp` that named it still does ([ADR-208](decisions.md)).
 | `$addToSet` of a present value; `$pull` of an absent one; `$push` with an empty `$each` onto an array | | no |
 | `$inc: {n: 0}` | `n` a 64-bit integer or a double | no |
 | `$inc: {n: 0}` | `n` a 32-bit integer | no: [integer arithmetic](#integers-stay-integral) keeps it a 32-bit integer |
+| `$inc: {n: 0}` or `{n: 0.0}` or `{n: -0.0}` | `n: Decimal128("1.5")` | no: `1.5 + 0` is `1.5` |
+| `$mul: {n: 1}` | `n: Decimal128("1.5")` | no |
+| `$inc: {n: Decimal128("0.00")}` | `n: Decimal128("1.5")` | **yes**: `1.50`, another member of the cohort |
+| `$mul: {n: Decimal128("1.0")}` | `n: Decimal128("1.5")` | **yes**: `1.50` |
+| `$inc: {n: 0}` | `n: Decimal128("-0")` | **yes**: `+0` |
+| `$inc: {n: 0}` | `n: Decimal128("0.00")` | no |
+| `$inc: {n: 0}` | `n:` a NaN with a payload, or a signalling NaN | **yes**: the plain NaN |
+| `$inc: {n: 0}` | `n: Decimal128("NaN")` | no |
+| `$inc: {n: 0}` | `n:` a non-canonical decimal | **yes**: a canonical zero |
+| `$inc: {n: Decimal128("0")}` | `n: 5` (a 32-bit integer) | **yes**: the field becomes `Decimal128("5")` |
 | `$currentDate` | an earlier time | **yes** |
 
 A replacement (`PUT`, or a whole document as the `update` of `/update` or

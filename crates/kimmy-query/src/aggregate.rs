@@ -50,7 +50,7 @@ use std::collections::HashSet;
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
-use crate::expr::{Binding, Expr, Scope, Total, type_name};
+use crate::expr::{Binding, Expr, Mean, Scope, Total, type_name};
 use crate::filter::{self, Filter};
 use crate::shape::{self, ID_FIELD, Projection, SortKey};
 
@@ -1253,7 +1253,9 @@ enum AccState {
     /// `(f64, bool)` accumulated in a double and cast back, so a total above
     /// 2^53 was silently wrong despite the flag saying it was an integer.
     Sum(Total),
-    Avg(f64, usize),
+    /// The mean: a double while no value is a `Decimal128`, an exact sum divided
+    /// by the count once one is (ADR-252).
+    Avg(Mean),
     MinMax(Option<Bson>),
     First(Option<Bson>),
     /// The latest document's value, or why it has none. Only the last
@@ -1317,7 +1319,7 @@ fn group(
 fn init((_, acc): &(String, Accumulator)) -> AccState {
     match acc {
         Accumulator::Sum(_) => AccState::Sum(Total::default()),
-        Accumulator::Avg(_) => AccState::Avg(0.0, 0),
+        Accumulator::Avg(_) => AccState::Avg(Mean::default()),
         Accumulator::Min(_) | Accumulator::Max(_) => AccState::MinMax(None),
         Accumulator::First(_) => AccState::First(None),
         Accumulator::Last(_) => AccState::Last(None),
@@ -1329,20 +1331,9 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
 fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     match (state, acc) {
         (AccState::Sum(total), Accumulator::Sum(e)) => {
-            let v = e.eval_in(scope)?;
-            arithmetic_operand("$sum", &v)?;
-            total.add(&v);
+            total.add(&e.eval_in(scope)?);
         }
-        (AccState::Avg(total, n), Accumulator::Avg(e)) => {
-            let v = e.eval_in(scope)?;
-            arithmetic_operand("$avg", &v)?;
-            // Non-numeric values are skipped rather than counted as zero, or a
-            // field that is missing on half the documents would halve the mean.
-            if let Some(x) = numeric(&v) {
-                *total += x;
-                *n += 1;
-            }
-        }
+        (AccState::Avg(mean), Accumulator::Avg(e)) => mean.add(&e.eval_in(scope)?),
         (AccState::MinMax(current), Accumulator::Min(e)) => {
             let v = e.eval_in(scope)?;
             if !matches!(v, Bson::Null)
@@ -1390,37 +1381,11 @@ fn finish(state: AccState) -> Result<Bson> {
         // `Total` accumulates in i64 and only widens when an operand is a
         // double or the addition overflows. Same reasoning as ADR-002.
         AccState::Sum(total) => total.to_bson(),
-        AccState::Avg(_, 0) => Bson::Null,
-        AccState::Avg(total, n) => Bson::Double(total / n as f64),
+        AccState::Avg(mean) => mean.to_bson(),
         AccState::MinMax(v) | AccState::First(v) => v.unwrap_or(Bson::Null),
         AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
         AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
     })
-}
-
-/// Refuse a `Decimal128` operand of `$sum` or `$avg`, in the words `$add`
-/// refuses one with.
-///
-/// Both skip a value that is not a number, but a decimal is one: skipping it
-/// answered a total or a mean of the other numbers, which looks right and is
-/// not. Adding one needs decimal arithmetic, which this build does not have,
-/// so the group is refused instead, as an expression's `$add` is. Only the
-/// operand itself counts: an array or a document is not a number to these
-/// accumulators, which never read inside one, and is skipped whatever it holds.
-fn arithmetic_operand(op: &str, value: &Bson) -> Result<()> {
-    if matches!(value, Bson::Decimal128(_)) {
-        return Err(Error::InvalidQuery(format!("{op} needs numbers, found {}", type_name(value))));
-    }
-    Ok(())
-}
-
-fn numeric(value: &Bson) -> Option<f64> {
-    match value {
-        Bson::Int32(n) => Some(f64::from(*n)),
-        Bson::Int64(n) => Some(*n as f64),
-        Bson::Double(d) => Some(*d),
-        _ => None,
-    }
 }
 
 /// The values a document joins under at `field`, as a filter reads the path
@@ -3852,57 +3817,76 @@ mod identity {
         panic!("{pipeline:?} should be refused, gave {current:?}");
     }
 
-    /// `$sum` and `$avg` refuse a `Decimal128` operand, `400`, in the words
-    /// `$add` uses. They used to skip it as they skip a string, which answered
-    /// a total or a mean of the other numbers: over `1`, `Decimal128("2.5")`
-    /// and `2` a `$sum` of `3` and an `$avg` of `1.5`, where the values add up
-    /// to 5.5. Decimal arithmetic is not built, so the group is refused.
+    /// `$sum` and `$avg` over a group that holds a `Decimal128` are exact
+    /// (ADR-252): every numeric value as converted, rounded once, as a
+    /// `Decimal128`. Over `1`, `Decimal128("2.5")` and `2` the values add up to
+    /// 5.5, and the mean is that sum over three, to 34 digits.
     #[test]
-    fn sum_and_avg_refuse_a_decimal128_operand() {
+    fn sum_and_avg_over_a_group_with_a_decimal128_are_exact() {
         let input = || vec![doc! { "v": 1 }, doc! { "v": dec("2.5") }, doc! { "v": 2 }];
-        for op in ["$sum", "$avg"] {
-            let mut acc = Document::new();
-            acc.insert(op, "$v");
-            let msg = refused(vec![doc! { "$group": { "_id": null, "r": acc.clone() } }], input());
-            assert_eq!(msg, format!("invalid query: {op} needs numbers, found a Decimal128"));
-            // Wherever the decimal stands, first or last, and per bucket.
-            for order in [
-                vec![doc! { "v": dec("2.5") }, doc! { "v": 1 }],
-                vec![doc! { "v": 1 }, doc! { "v": dec("2.5") }],
-            ] {
-                assert!(
-                    refused(vec![doc! { "$group": { "_id": null, "r": acc.clone() } }], order)
-                        .contains("found a Decimal128")
-                );
-            }
-            let grouped = vec![doc! { "k": 1, "v": 1 }, doc! { "k": 2, "v": dec("0") }];
-            assert!(
-                refused(vec![doc! { "$group": { "_id": "$k", "r": acc.clone() } }], grouped)
-                    .contains("found a Decimal128")
-            );
-            // A decimal literal is an operand on every document.
-            let mut literal = Document::new();
-            literal.insert(op, dec("1"));
-            assert!(
-                refused(vec![doc! { "$group": { "_id": null, "r": literal } }], input())
-                    .contains("found a Decimal128")
-            );
-        }
-        // `$add`'s own refusal is the wording matched.
-        let add = refused(
-            vec![doc! { "$project": { "r": { "$add": ["$v", 1] } } }],
-            vec![doc! { "v": dec("2.5") }],
+        let out = run(
+            vec![doc! { "$group": { "_id": null, "s": { "$sum": "$v" }, "m": { "$avg": "$v" } } }],
+            input(),
         );
-        assert_eq!(add, "invalid query: $add needs numbers, found a Decimal128");
+        assert_eq!(out[0].get("s"), Some(&dec("5.5")));
+        assert_eq!(out[0].get("m"), Some(&dec("1.833333333333333333333333333333333")));
+        // Wherever the decimal stands, and in every order: the same bytes.
+        let values = [dec("2.5"), Bson::Int32(1), Bson::Int64(2), Bson::Double(0.5), dec("0.10")];
+        let mut seen = std::collections::BTreeSet::new();
+        for rotation in 0..values.len() {
+            for reversed in [false, true] {
+                let mut order: Vec<Bson> =
+                    values.iter().cycle().skip(rotation).take(5).cloned().collect();
+                if reversed {
+                    order.reverse();
+                }
+                let docs: Vec<Document> = order.into_iter().map(|v| doc! { "v": v }).collect();
+                let out = run(
+                    vec![
+                        doc! { "$group": { "_id": null, "s": { "$sum": "$v" }, "m": { "$avg": "$v" } } },
+                    ],
+                    docs,
+                );
+                let (s, m) = (out[0].get("s").unwrap().clone(), out[0].get("m").unwrap().clone());
+                let bytes = |b: &Bson| match b {
+                    Bson::Decimal128(d) => d.bytes(),
+                    other => panic!("not a decimal: {other:?}"),
+                };
+                seen.insert((bytes(&s), bytes(&m)));
+            }
+        }
+        assert_eq!(seen.len(), 1, "one answer in any order");
+        // Per bucket: one with a decimal and one without keep their own types.
+        let grouped = vec![
+            doc! { "k": 1, "v": 1 },
+            doc! { "k": 2, "v": dec("0.10") },
+            doc! { "k": 1, "v": 2 },
+        ];
+        let out = run(
+            vec![
+                doc! { "$group": { "_id": "$k", "s": { "$sum": "$v" }, "m": { "$avg": "$v" } } },
+                doc! { "$sort": { "_id": 1 } },
+            ],
+            grouped,
+        );
+        assert_eq!(out[0].get("s"), Some(&Bson::Int64(3)));
+        assert_eq!(out[0].get("m"), Some(&Bson::Double(1.5)));
+        assert_eq!(out[1].get("s"), Some(&dec("0.10")));
+        assert_eq!(out[1].get("m"), Some(&dec("0.10")));
+        // A decimal literal is an operand on every document.
+        let mut literal = Document::new();
+        literal.insert("$sum", dec("1"));
+        let out = run(vec![doc! { "$group": { "_id": null, "r": literal } }], input());
+        assert_eq!(out[0].get("r"), Some(&dec("3")));
     }
 
-    /// Only the operand itself is refused. An array or a document is not a
+    /// Only the operand itself is summed. An array or a document is not a
     /// number to these accumulators, which never read inside one, so it is
     /// skipped whatever it holds, a decimal included, exactly as before; a
     /// missing field and `null` are skipped; and the accumulators that do no
     /// arithmetic take a decimal as they take any value.
     #[test]
-    fn only_a_decimal128_operand_is_refused_and_the_other_accumulators_take_one() {
+    fn only_a_decimal128_operand_is_summed_and_the_other_accumulators_take_one() {
         let input = vec![
             doc! { "v": 1, "a": [1, dec("2.5")], "d": { "n": dec("2.5") } },
             doc! { "v": 2, "a": [1, 2], "d": { "n": 2 } },
@@ -3971,14 +3955,23 @@ mod identity {
                 assert!(err.contains(op) && err.contains("not an expression operator"), "{err}");
             }
         }
-        // The other arithmetic refuses a decimal when it evaluates.
-        for op in ["$add", "$subtract", "$multiply", "$divide", "$mod"] {
+        // The other arithmetic takes a decimal when it evaluates (ADR-252),
+        // except `$mod`, which refuses one by name.
+        for (op, want) in [
+            ("$add", dec("2.5")),
+            ("$subtract", dec("0.5")),
+            ("$multiply", dec("1.5")),
+            ("$divide", dec("1.5")),
+        ] {
             let mut expr = Document::new();
             expr.insert(op, vec![Bson::from("$v"), Bson::Int32(1)]);
-            let msg =
-                refused(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
-            assert_eq!(msg, format!("invalid query: {op} needs numbers, found a Decimal128"));
+            let out = run(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
+            assert_eq!(out[0].get("r"), Some(&want), "{op}");
         }
+        let mut expr = Document::new();
+        expr.insert("$mod", vec![Bson::from("$v"), Bson::Int32(1)]);
+        let msg = refused(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
+        assert_eq!(msg, "invalid query: $mod needs numbers, found a Decimal128");
     }
 
     /// A number re-spelled as an equal value of another type, or a decimal as

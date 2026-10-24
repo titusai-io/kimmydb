@@ -6,6 +6,8 @@
 
 use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
+use kimmy_core::decimal::arith;
+use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -567,7 +569,9 @@ fn touches_id(path: &str) -> bool {
 fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
     let numeric = |arg: &Bson| -> Result<Bson> {
         match arg {
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => Ok(arg.clone()),
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                Ok(arg.clone())
+            }
             _ => Err(Error::InvalidUpdate(format!("${op} requires a number"))),
         }
     };
@@ -1093,8 +1097,23 @@ enum Arith {
     Mul,
 }
 
+impl Arith {
+    fn name(&self) -> &'static str {
+        match self {
+            Arith::Add => "$inc",
+            Arith::Mul => "$mul",
+        }
+    }
+}
+
 /// Apply arithmetic, keeping the narrowest integer type that holds the result.
+///
+/// A `Decimal128` on either side makes the result one (ADR-252), exact and
+/// rounded once; see [`decimal_arithmetic`].
 fn arithmetic(base: &Bson, operand: &Bson, op: Arith, path: &str) -> Result<Bson> {
+    if matches!(base, Bson::Decimal128(_)) || matches!(operand, Bson::Decimal128(_)) {
+        return decimal_arithmetic(base, operand, &op, path);
+    }
     let both_int = matches!(base, Bson::Int32(_) | Bson::Int64(_))
         && matches!(operand, Bson::Int32(_) | Bson::Int64(_));
 
@@ -1133,6 +1152,66 @@ fn arithmetic(base: &Bson, operand: &Bson, op: Arith, path: &str) -> Result<Bson
         Arith::Add => a + b,
         Arith::Mul => a * b,
     }))
+}
+
+/// `$inc` and `$mul` where the stored value or the operand is a `Decimal128`.
+///
+/// - An integer enters exactly. A stored double enters by R1 (its exact binary
+///   value rounded once to 34 digits), exact or not: the value the database
+///   already holds and compares by.
+/// - **A double operand meeting a stored decimal must convert exactly.** An
+///   operand double is almost always the parse of decimal text, and widening
+///   it would store its binary noise in a decimal field (`$inc 0.01` on `19.99`
+///   would store `20.00000000000000000020816681711722`), so it is refused with
+///   the spelling that does what was meant. `0.5`, `0.25`, `2.0`, the
+///   integers, the infinities and a NaN are exact and are applied.
+/// - An overflow from finite inputs is refused, as an `Int64` overflow is; an
+///   infinite input gives its IEEE result. Underflow is gradual and accepted.
+fn decimal_arithmetic(base: &Bson, operand: &Bson, op: &Arith, path: &str) -> Result<Bson> {
+    let stored = match base {
+        Bson::Int32(n) => arith::from_i64(i64::from(*n)),
+        Bson::Int64(n) => arith::from_i64(*n),
+        Bson::Double(d) => arith::from_binary64(d.to_bits()).0,
+        Bson::Decimal128(d) => decode_raw(d),
+        _ => {
+            return Err(Error::InvalidUpdate(format!(
+                "cannot apply arithmetic to non-numeric field {path:?}"
+            )));
+        }
+    };
+    let given = match operand {
+        Bson::Int32(n) => arith::from_i64(i64::from(*n)),
+        Bson::Int64(n) => arith::from_i64(*n),
+        Bson::Double(d) => {
+            let (raw, inexact) = arith::from_binary64(d.to_bits());
+            if inexact && matches!(base, Bson::Decimal128(_)) {
+                return Err(Error::InvalidUpdate(format!(
+                    "{} on field {path:?}: the double {d:?} is not exactly a decimal (it is \
+                     {}\u{2026}); send {{\"$numberDecimal\": \"{d:?}\"}}",
+                    op.name(),
+                    pack_raw(raw),
+                )));
+            }
+            raw
+        }
+        Bson::Decimal128(d) => decode_raw(d),
+        _ => {
+            return Err(Error::InvalidUpdate(
+                "cannot apply arithmetic with a non-numeric operand".to_string(),
+            ));
+        }
+    };
+    let result = match op {
+        Arith::Add => arith::add(&stored, &given),
+        Arith::Mul => arith::mul(&stored, &given),
+    };
+    let infinite_input = matches!(stored, Raw::Inf { .. }) || matches!(given, Raw::Inf { .. });
+    if matches!(result, Raw::Inf { .. }) && !infinite_input {
+        return Err(Error::InvalidUpdate(format!(
+            "arithmetic on field {path:?} overflowed a Decimal128"
+        )));
+    }
+    Ok(Bson::Decimal128(pack_raw(result)))
 }
 
 fn as_i64(value: &Bson) -> Option<i64> {
@@ -2886,19 +2965,6 @@ mod decimal128 {
             v(after(doc! { "$max": { "v": { "n": dec("0.5") } } }, doc! { "v": { "n": 1 } })),
             Bson::Document(doc! { "n": 1 })
         );
-    }
-
-    /// `$inc` and `$mul` are arithmetic, which this change leaves as it was: a
-    /// decimal operand is refused at parse and a stored decimal at apply.
-    #[test]
-    fn inc_and_mul_on_a_decimal128_are_what_they_were() {
-        for op in ["$inc", "$mul"] {
-            let msg = parse(&doc! { op: { "v": dec("1") } }).unwrap_err().to_string();
-            assert!(msg.contains("requires a number"), "{op}: {msg}");
-            let parsed = parse(&doc! { op: { "v": 1 } }).unwrap();
-            let msg = apply(&parsed, &mut doc! { "v": dec("1.5") }, 0).unwrap_err().to_string();
-            assert!(msg.contains("non-numeric field"), "{op}: {msg}");
-        }
     }
 
     #[test]

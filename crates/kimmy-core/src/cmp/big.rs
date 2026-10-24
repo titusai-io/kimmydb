@@ -5,9 +5,11 @@
 //! compares them (`c · 5^p · 2^(p+t)` against `m · 5^q · 2^(q+s)`), which takes
 //! a multiplication by a word, a shift and a comparison. The encoder reads the
 //! top bits of `c · 5^e`, or of `c · 2^k / 5^q`, which adds a division by a word
-//! and a read of the top bits. That is the whole surface: no general
-//! multiplication, no general division, nothing that a crate would add but
-//! nobody here calls. It is not exported, and every operation is checked
+//! and a read of the top bits. The decimal arithmetic adds the two it needs: a
+//! multiply-and-add by a word (building a value from base-10^19 limbs) and a
+//! division by a `u128` whose quotient fits one. That is the whole surface: no
+//! general multiplication, no general division, nothing that a crate would add
+//! but nobody here calls. It is not exported, and every operation is checked
 //! against `num-bigint` (a dev-dependency) in the tests below.
 
 use std::cmp::Ordering;
@@ -91,6 +93,94 @@ impl Big {
         }
         self.trim();
         remainder as u64
+    }
+
+    /// `self = self · m + a`.
+    pub(crate) fn mul_add_small(&mut self, m: u64, a: u64) {
+        let mut carry = u128::from(a);
+        for limb in &mut self.limbs {
+            let product = u128::from(*limb) * u128::from(m) + carry;
+            *limb = product as u64;
+            carry = product >> 64;
+        }
+        if carry != 0 {
+            self.limbs.push(carry as u64);
+        }
+        self.trim();
+    }
+
+    /// `⌊self / d⌋` and the remainder, for a quotient that fits a `u128`.
+    ///
+    /// A divisor of one limb divides limb by limb; a divisor of two is Knuth's
+    /// algorithm D (TAOCP 4.3.1) on 64-bit limbs, whose quotient digit is
+    /// estimated from the divisor's top limb and corrected at most twice. A value
+    /// of at most 128 bits goes straight to the hardware's division.
+    ///
+    /// # Panics
+    /// If `d` is zero, or if the quotient needs more than 128 bits.
+    pub(crate) fn div_rem_u128(&self, d: u128) -> (u128, u128) {
+        assert!(d != 0, "div_rem_u128 by zero");
+        let as_u128 =
+            |limbs: &[u64]| limbs.iter().rev().fold(0u128, |acc, &l| (acc << 64) | u128::from(l));
+        if self.bit_len() <= 128 {
+            let n = as_u128(&self.limbs);
+            return (n / d, n % d);
+        }
+        if d >> 64 == 0 {
+            let mut quotient = self.clone();
+            let remainder = quotient.div_small(d as u64);
+            assert!(quotient.limbs.len() <= 2, "the quotient does not fit 128 bits");
+            return (as_u128(&quotient.limbs), u128::from(remainder));
+        }
+        // Two-limb divisor, normalised so its top bit is set.
+        let shift = d.leading_zeros();
+        let divisor = d << shift;
+        let (v1, v0) = ((divisor >> 64) as u64, divisor as u64);
+        let mut u: Vec<u64> = self.limbs.clone();
+        u.push(0);
+        if shift != 0 {
+            let mut carry = 0u64;
+            for limb in &mut u {
+                let out = *limb >> (64 - shift);
+                *limb = (*limb << shift) | carry;
+                carry = out;
+            }
+        }
+        let n = self.limbs.len();
+        let mut quotient = vec![0u64; n - 1];
+        for j in (0..n - 1).rev() {
+            let top = (u128::from(u[j + 2]) << 64) | u128::from(u[j + 1]);
+            let (mut qhat, mut rhat) = (top / u128::from(v1), top % u128::from(v1));
+            while qhat >> 64 != 0 || qhat * u128::from(v0) > ((rhat << 64) | u128::from(u[j])) {
+                qhat -= 1;
+                rhat += u128::from(v1);
+                if rhat >> 64 != 0 {
+                    break;
+                }
+            }
+            // u[j..j + 3] -= qhat · divisor.
+            let mut borrow = 0i128;
+            let mut carry = 0u128;
+            for (k, v) in [v0, v1].into_iter().enumerate() {
+                let product = qhat * u128::from(v) + carry;
+                carry = product >> 64;
+                let t = i128::from(u[j + k]) - borrow - i128::from(product as u64);
+                u[j + k] = t as u64;
+                borrow = i128::from(t < 0);
+            }
+            let t = i128::from(u[j + 2]) - borrow - carry as i128;
+            u[j + 2] = t as u64;
+            // With a two-limb divisor the correction loop above is exact: its test
+            // `qhat · v0 > rhat · 2^64 + u[j]` is `qhat · divisor > (u[j + 2],
+            // u[j + 1], u[j])`, so `qhat` is the true digit and the subtraction
+            // cannot go negative. Algorithm D's add-back, which a divisor of three
+            // limbs or more would need, is therefore not here.
+            debug_assert!(t >= 0, "a two-limb divisor's quotient digit is exact");
+            quotient[j] = qhat as u64;
+        }
+        assert!(quotient.iter().skip(2).all(|&l| l == 0), "the quotient does not fit 128 bits");
+        let remainder = ((u128::from(u[1]) << 64) | u128::from(u[0])) >> shift;
+        (as_u128(&quotient[..quotient.len().min(2)]), remainder)
     }
 
     /// The number of significant bits; zero has none.
@@ -207,6 +297,40 @@ mod tests {
 
     fn any_word() -> impl Strategy<Value = u64> {
         prop_oneof![any::<u64>(), Just(u64::MAX), Just(POW5_27), Just(5u64), Just(1u64), 2..1000u64]
+    }
+
+    proptest! {
+        #[test]
+        fn mul_add_small_agrees_with_num_bigint(a in any_big(), m in any_word(), x in any::<u64>()) {
+            let mut got = a.clone();
+            got.mul_add_small(m, x);
+            prop_assert_eq!(oracle(&got), oracle(&a) * m + x);
+            prop_assert_eq!(got.limbs.last() != Some(&0), true);
+        }
+
+        #[test]
+        fn div_rem_u128_agrees_with_num_bigint(
+            a in prop::collection::vec(any::<u64>(), 0..4).prop_map(from_limbs),
+            d in prop_oneof![
+                1u128..1000,
+                any::<u128>().prop_map(|d| (d >> 15).max(1)),
+                any::<u128>().prop_map(|d| d.max(1)),
+                Just((1u128 << 127) - 1),
+                Just(u128::MAX),
+                Just((1u128 << 64) + 1),
+                Just(1u128 << 64),
+                Just(u128::from(u64::MAX)),
+            ],
+        ) {
+            // Only a quotient that fits 128 bits: it has at most
+            // `len(a) - len(d) + 1` of them.
+            let d_bits = 128 - d.leading_zeros();
+            prop_assume!(a.bit_len() <= 128 || a.bit_len() <= d_bits + 127);
+            let (q, r) = a.div_rem_u128(d);
+            let n = oracle(&a);
+            prop_assert_eq!(BigUint::from(q), &n / d);
+            prop_assert_eq!(BigUint::from(r), &n % d);
+        }
     }
 
     #[test]

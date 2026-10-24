@@ -42,7 +42,7 @@ use crate::cmp::{Numeric, decompose};
 use crate::decimal::{self, Decimal};
 use crate::error::Result;
 
-mod number;
+pub(crate) mod number;
 
 // Type tags. These match the ranks in `cmp::type_rank` so that cross-type
 // ordering falls out of the leading byte alone.

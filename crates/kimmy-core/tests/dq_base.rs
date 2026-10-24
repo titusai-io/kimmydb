@@ -4,17 +4,24 @@
 //! without rounding (no `Inexact`, `Overflow` or `Underflow`) gives exactly the
 //! suite's result, and each case that needs rounding is refused, never rounded.
 //!
-//! The file is not in this repository (it is © Mike Cowlishaw and IBM, under
-//! its own licence). Fetch it from the suite at speleotrove.com/decimal, or
-//! take it from CPython's `Lib/test/decimaltestdata`, and point the test at it:
+//! The files are not in this repository (they are © Mike Cowlishaw and IBM,
+//! under their own licence, and are never vendored). `scripts/fetch-dectest.sh`
+//! fetches them into a directory, checked against the sha256 pinned in
+//! `tests/common/dectest.rs`, and CI keeps that directory in its own cache. Point
+//! the test at the directory:
 //!
 //! ```text
-//! KIMMY_DQBASE_DECTEST=/path/to/dqBase.decTest \
+//! KIMMY_DECTEST_DIR=/path/to/dectest \
 //!     cargo test -p kimmy-core --test dq_base -- --ignored
 //! ```
 //!
-//! The copy this was written against has sha256
-//! `22ee8af01c98c26eb581503bed93d38f9218530d1a7700a6c2a2f73ae972e60a`.
+//! Two sets are accepted, each by the sha256 of its files: version 2.62 from
+//! speleotrove's `dectest.zip`, and version 2.59 as CPython ships it
+//! (`Lib/test/decimaltestdata`). `dqBase.decTest` has the same cases in both
+//! (the files differ in their headers, so their sha256s do).
+
+#[path = "common/dectest.rs"]
+mod dectest;
 
 use std::str::FromStr;
 
@@ -22,74 +29,7 @@ use bson::Decimal128;
 use kimmy_core::decimal::{ParseError, parse};
 use num_bigint::BigInt;
 
-/// One line of a `.decTest` file, split into its tokens: whitespace separates
-/// them, a token in `'` or `"` quotes keeps its spaces and doubles a quote to
-/// hold one, and `--` outside quotes starts a comment.
-fn tokens(line: &str) -> Vec<String> {
-    let chars: Vec<char> = line.chars().collect();
-    let (mut out, mut i) = (Vec::new(), 0);
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            i += 1;
-        } else if c == '-' && chars.get(i + 1) == Some(&'-') {
-            break;
-        } else if c == '\'' || c == '"' {
-            let mut token = String::new();
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == c {
-                    if chars.get(i + 1) == Some(&c) {
-                        token.push(c);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                token.push(chars[i]);
-                i += 1;
-            }
-            out.push(token);
-        } else {
-            let start = i;
-            while i < chars.len() && !chars[i].is_whitespace() {
-                i += 1;
-            }
-            out.push(chars[start..i].iter().collect());
-        }
-    }
-    out
-}
-
-/// What the suite's result string says the decQuad is, read by a reader
-/// written for its two output forms (scientific and engineering) and sharing
-/// nothing with the parser under test: the 128 bits of that decQuad.
-fn result_bits(result: &str) -> u128 {
-    let (negative, rest) = match result.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, result),
-    };
-    let sign = u128::from(negative) << 127;
-    if rest == "Infinity" {
-        return sign | (0b11110 << 122);
-    }
-    for (prefix, signalling) in [("sNaN", true), ("NaN", false)] {
-        if let Some(payload) = rest.strip_prefix(prefix) {
-            let payload: u128 = if payload.is_empty() { 0 } else { payload.parse().unwrap() };
-            return sign | (0b11111 << 122) | (u128::from(signalling) << 121) | payload;
-        }
-    }
-    let (mantissa, exponent) = match rest.split_once('E') {
-        Some((m, e)) => (m, e.parse::<i64>().unwrap()),
-        None => (rest, 0),
-    };
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let coefficient: u128 = format!("{whole}{fraction}").parse().unwrap();
-    let exponent = exponent - fraction.len() as i64;
-    assert!(coefficient < 10u128.pow(34) && (-6176..=6111).contains(&exponent), "{result}");
-    sign | (((exponent + 6176) as u128) << 113) | coefficient
-}
+use dectest::{result_bits, tokens};
 
 /// `±c × 10^e` of a finite text, exactly: `(negative, c, e)`.
 fn exact(text: &str) -> Option<(bool, BigInt, i64)> {
@@ -119,12 +59,11 @@ fn same_value((n1, c1, e1): &(bool, BigInt, i64), (n2, c2, e2): &(bool, BigInt, 
 }
 
 #[test]
-#[ignore = "needs dqBase.decTest, which is not in the repository: see the module documentation"]
+#[ignore = "needs the dectest files, which are not in the repository: see the module documentation"]
 fn every_dq_base_case_is_refused_or_read_exactly() {
-    let path = std::env::var("KIMMY_DQBASE_DECTEST")
-        .expect("set KIMMY_DQBASE_DECTEST to the path of dqBase.decTest");
-    let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.lines().any(|l| l.trim() == "version: 2.62"), "premise: version 2.62");
+    let Some((version, files)) = dectest::load() else { return };
+    let text = &files.iter().find(|(name, _)| *name == "dqBase.decTest").expect("dqBase").1;
+    assert!(text.lines().any(|l| l.trim() == format!("version: {version}")), "the file's version");
 
     let (mut syntax, mut exact_cases, mut rounding, mut bson_lax) = (0, 0, 0, Vec::new());
     for line in text.lines() {
@@ -193,9 +132,11 @@ fn every_dq_base_case_is_refused_or_read_exactly() {
     );
     assert_eq!(syntax, 99, "premise: the suite's 99 syntax errors");
     assert_eq!(bson_lax.len(), 13, "premise: the 13 the lax parser read as numbers");
-    assert!(
-        exact_cases > 500 && rounding > 50,
-        "premise: {exact_cases} exact, {rounding} rounding"
+    // The cases are the same in both pinned sets.
+    assert_eq!(
+        (exact_cases, rounding),
+        (606, 223),
+        "premise: the exact cases read exactly, and those that need rounding refused"
     );
 }
 

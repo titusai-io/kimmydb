@@ -12,6 +12,9 @@
 
 use bson::Decimal128;
 
+pub mod arith;
+#[cfg(test)]
+mod arith_tests;
 mod parse;
 
 pub use parse::{ParseError, parse};
@@ -72,6 +75,101 @@ pub fn decode_bits(bits: u128) -> Decimal {
         return Decimal::Zero;
     }
     Decimal::Finite { negative, coefficient, exponent: (biased - EXPONENT_BIAS) as i16 }
+}
+
+/// A `Decimal128` as arithmetic reads it: [`Decimal`] with a zero keeping its
+/// sign and its exponent, because a sum's and a product's quantum depends on
+/// both (`1.5 + 0.00` is `1.50`, and `-0 + -0` is `-0`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Raw {
+    /// Quiet or signalling, any payload, either sign: one NaN. A result is
+    /// always the plain quiet NaN, `0x7C00…00`.
+    Nan,
+    Inf {
+        negative: bool,
+    },
+    /// `±coefficient × 10^exponent`, `0 <= coefficient < 10^34`, a zero included.
+    Finite {
+        negative: bool,
+        coefficient: u128,
+        exponent: i16,
+    },
+}
+
+impl Raw {
+    /// Any zero: `+0`, `-0`, `0E-100`.
+    pub fn is_zero(&self) -> bool {
+        matches!(self, Raw::Finite { coefficient: 0, .. })
+    }
+
+    /// `-self`; a NaN has no sign worth keeping.
+    pub fn negated(self) -> Raw {
+        match self {
+            Raw::Nan => Raw::Nan,
+            Raw::Inf { negative } => Raw::Inf { negative: !negative },
+            Raw::Finite { negative, coefficient, exponent } => {
+                Raw::Finite { negative: !negative, coefficient, exponent }
+            }
+        }
+    }
+}
+
+/// Decode the BID bytes of a `Decimal128` for arithmetic.
+pub fn decode_raw(d: &Decimal128) -> Raw {
+    decode_raw_bits(u128::from_le_bytes(d.bytes()))
+}
+
+/// [`decode_raw`] on the 128 bits of the BID word.
+///
+/// A coefficient above `10^34 - 1` is zero (IEEE 754 §3.5.2), as it is in
+/// [`decode_bits`]; the large-coefficient form takes its exponent from bits
+/// 124..111. A zero's exponent is read, then clamped into the format's range.
+pub fn decode_raw_bits(bits: u128) -> Raw {
+    let negative = bits >> 127 == 1;
+    if (bits >> 125) & 0b11 == 0b11 {
+        return match (bits >> 122) & 0b11111 {
+            0b11110 => Raw::Inf { negative },
+            0b11111 => Raw::Nan,
+            _ => {
+                let biased = ((bits >> 111) & 0x3FFF) as i32;
+                Raw::Finite { negative, coefficient: 0, exponent: clamp_exponent(biased) }
+            }
+        };
+    }
+    let biased = ((bits >> 113) & 0x3FFF) as i32;
+    let coefficient = bits & ((1u128 << 113) - 1);
+    if coefficient == 0 || coefficient > MAX_COEFFICIENT {
+        return Raw::Finite { negative, coefficient: 0, exponent: clamp_exponent(biased) };
+    }
+    Raw::Finite { negative, coefficient, exponent: (biased - EXPONENT_BIAS) as i16 }
+}
+
+fn clamp_exponent(biased: i32) -> i16 {
+    (biased - EXPONENT_BIAS).clamp(i32::from(MIN_EXPONENT), i32::from(MAX_EXPONENT)) as i16
+}
+
+/// Pack a result into canonical BID: a coefficient of at most `10^34 - 1` in
+/// the normal form, an exponent in range, the plain quiet NaN, and the two
+/// infinities. A zero is written with its sign and exponent.
+///
+/// # Panics
+/// If a finite value is not canonical.
+pub fn pack_raw(raw: Raw) -> Decimal128 {
+    const NAN: u128 = 0b11111 << 122;
+    const INFINITY: u128 = 0b11110 << 122;
+    let bits = match raw {
+        Raw::Nan => NAN,
+        Raw::Inf { negative } => (u128::from(negative) << 127) | INFINITY,
+        Raw::Finite { negative, coefficient, exponent } => {
+            assert!(
+                coefficient <= MAX_COEFFICIENT && (MIN_EXPONENT..=MAX_EXPONENT).contains(&exponent),
+                "not a canonical finite Decimal128: {coefficient}E{exponent}"
+            );
+            let biased = (i32::from(exponent) + EXPONENT_BIAS) as u128;
+            (u128::from(negative) << 127) | (biased << 113) | coefficient
+        }
+    };
+    Decimal128::from_bytes(bits.to_le_bytes())
 }
 
 /// Pack a finite value into canonical BID.

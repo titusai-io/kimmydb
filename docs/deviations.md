@@ -281,17 +281,17 @@ on a write would be just as silent about the bug.
 
 ---
 
-## 🟡 Type conversion is a strict superset of MongoDB's table, and `decimal` is outside it
+## 🟡 Type conversion is a strict superset of MongoDB's table, and `decimal` converts a double differently
 
 **Raised 2026-08-30, with `$convert` and the `$toX` shorthands.** The
 conversion pairs follow MongoDB's table, and every pipeline MongoDB accepts
 means the same thing here. Four places are more lenient or differently
-spelled, and one target is missing.
+spelled, and one target converts a double by a different rule.
 
 **Ruled 2026-09-29, kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).** The four differences stay,
-recorded exactly below and in [aggregation.md](aggregation.md#type-conversion);
-`decimal` stays refused; and `$toDecimal` is refused with the explanation
-`$convert` gives (changed in the same release, still a `400`).
+recorded exactly below and in [aggregation.md](aggregation.md#type-conversion).
+**Changed in 0.54.0 (ADR-252): `decimal` is a target**, and `$toDecimal` an
+operator; the entry below records how the conversion differs from MongoDB's.
 
 - **`int` → `date` is accepted.** MongoDB refuses it — its table admits
   `long`, `double` and `decimal` to `date` but not `int`, for no reason the
@@ -325,21 +325,21 @@ recorded exactly below and in [aggregation.md](aggregation.md#type-conversion);
   converted string and a returned double read alike. A string built from a
   large or small double therefore compares unequal to the same string built
   there.
-- **`decimal` is refused.** Converting a double to a `Decimal128` needs a
-  rounding rule: a double's exact binary value can run to about 767
-  significant digits and a `Decimal128` holds 34, so the double `0.1` has no
-  equal decimal. Choosing the rule is a decimal-arithmetic decision this build
-  does not make. (Until 0.51.0 the reason given was that a `Decimal128` had no
-  exact key encoding; it has one now, and is compared, grouped and indexed by
-  its exact value.) `$convert` to `decimal` or `19` is a `400` naming `double`
-  and `long` as the alternatives. **`$toDecimal` is a `400` with the same
-  explanation**: `unsupported operator "$toDecimal": converting to Decimal128
-  needs a rounding rule, because a double's exact binary value can run to about
-  767 significant digits and a Decimal128 holds 34, and this build has none;
-  convert to double or long instead`. It was never built as an operator and
-  used to be refused as an unknown one, with a message that pointed at nothing;
-  it is still refused for any argument. A `Decimal128` *input* is likewise
-  unconvertible.
+- **`decimal` converts a double by its exact binary value, rounded once to 34
+  digits (ADR-252); MongoDB rounds it to 15 significant digits.** `{$toDecimal:
+  0.1}` is `0.1000000000000000055511151231257827` here and `Decimal128("0.100000000000000")`
+  there, and `{$toDecimal: 2.5}` is `2.5` here and `2.50000000000000` there. The
+  15-digit rule reverses orders the comparator gives (`0.3` against
+  `0.29999999999999999`), merges distinct doubles (`0.1 + 0.2` with `0.3`) and
+  pads. This conversion is IEEE 754 `convertFormat`, never reverses an order,
+  and keeps the double's own value: to get one tenth, convert the string
+  `"0.1"` or send `{"$numberDecimal": "0.1"}`. A **string** converts exactly or
+  is an error, where IEEE 754 §5.12.2 asks for correct rounding of character
+  input: rounding a 40-digit string would turn a data error into a number, and
+  `onError` is the escape. A `Decimal128` converts to `double` (the nearest, half
+  to even), `int` and `long` (truncated toward zero from the exact value; `NaN`,
+  an infinity and a value out of range are errors), `string` (BSON's text form,
+  which keeps the cohort), `bool` and `date` (truncated to milliseconds).
 
 **`$mod` and `$pullAll` have no entry.** Both follow MongoDB — `$mod`
 truncates doubles toward zero, refuses a zero divisor, and refuses a `NaN` or
@@ -354,37 +354,56 @@ recorded rather than scheduled. The third and fourth close by widening the
 date parser and adding an exponent threshold to the double renderer, if a
 ported pipeline ever needs either; the second by evaluating `to` per document,
 which a `decimal` target would then have to be refused at run time. None is
-planned: the four are kept on purpose, and `decimal` goes when a rounding rule
-for a double is chosen. (It was to go "when the canonical order can place one";
-0.51.0 does, and that turned out not to be what the conversion lacks.)
+planned: the four are kept on purpose. (`decimal` was refused until a rounding
+rule for a double was chosen; 0.54.0 chose one, ADR-252.)
 
 ---
 
-## 🟡 Arithmetic on a `Decimal128` is refused, where MongoDB computes it
+## 🟡 Arithmetic on a `Decimal128` differs from MongoDB's in four places
 
-**Raised 2026-10-16, with 0.51.0, which gives a `Decimal128` its exact place in
-the order; ruled the same day: refused, not skipped.** A decimal is compared,
-grouped, sorted and indexed by its exact value, but nothing here adds,
-multiplies or divides one: decimal arithmetic needs its own rounding rules and
-is a later design. Until it is built, every operation that would do arithmetic
-on a decimal refuses it, `400`, rather than leave it out of the answer:
+**Raised 2026-10-16 (refused, not skipped, with 0.51.0); built in 0.54.0
+([ADR-252](decisions.md)).** `$add`, `$subtract`, `$multiply`, `$divide`, the
+`$sum` and `$avg` accumulators, and `$inc` and `$mul` compute on a `Decimal128`,
+and a decimal among the operands makes the result a decimal, as in MongoDB
+("integer → long → double → decimal"). The arithmetic is IEEE 754 decimal128
+under one fixed context, in [aggregation.md](aggregation.md#decimal128-arithmetic)
+and [query-language.md](query-language.md#decimal128-arithmetic-in-updates).
+It differs from MongoDB's in four places (verified against its source and manual
+on 2026-10-16, except the n-ary `$add`, which is by reading):
 
-- **The expression operators** `$add`, `$subtract`, `$multiply`, `$divide` and
-  `$mod`: `$add needs numbers, found a Decimal128`, as ever.
-- **The `$sum` and `$avg` accumulators of `$group`**, in the same words:
-  `$sum needs numbers, found a Decimal128`. **Changed in 0.51.0:** they used to
-  skip a decimal as they skip a string, so over `1`, `Decimal128("2.5")` and
-  `2` a report read a total of `3` and a mean of `1.5`, where the values add up
-  to `5.5`. The operand itself is what counts: an array or a document holding a
-  decimal is ignored by both, as any array or document is, because they never
-  read inside one (MongoDB's `$group` does not either). `$sum: 1` counts as ever.
-  `$sum` and `$avg` are not expression operators here, so there is no `$project`
-  form to refuse a decimal in.
-- **The update operators `$inc` and `$mul`**: a decimal operand is refused at
-  parse (`$inc requires a number`) and a stored decimal when the update applies
-  (`cannot apply arithmetic to non-numeric field "v"`).
-- **`$convert` to `decimal` and `$toDecimal`** are refused for a related reason,
-  the rounding rule a double needs (the entry above).
+- **A double converts exactly, not at 15 digits.** MongoDB converts a double to a
+  decimal at 15 significant digits, with trailing zeros kept, in `$add`,
+  `$subtract`, `$multiply` and `$divide` (`Value::coerceToDecimal`, the
+  `kRoundTo15Digits` default), in `$toDecimal`, and in `$inc` and `$mul`
+  (`SafeNum::getDecimal`). Here it is the double's exact binary value rounded
+  once to 34 digits, half to even, everywhere. `0.1 + Decimal128("0.2")` is
+  `0.3000000000000000055511151231257827` here and `0.300000000000000` there.
+  Only MongoDB's own `$sum` converts the double part at 34 digits.
+- **`$sum` and `$avg` are exact and independent of order.** MongoDB's `$sum`
+  rounds decimals at each document (`decimalTotal.add`), so the total depends on
+  document order: over `1E+34`, `0.5`, `0.5`, `-1E+34` one order gives `0E+1`
+  and another `1.0`. Here the exact sum is rounded once, at the end, and `$avg`
+  divides the exact sum rather than a rounded one.
+- **An n-ary `$add` is one exact sum, rounded once.** MongoDB's `$add` adds
+  decimals one operand at a time, so each step rounds and the result depends on
+  the order: `{$add: [1E+34, 0.5, 0.5, -1E+34]}` is `0E+1` there (by reading, not
+  run) and `1.0` here, in every order. `$multiply` is the other way round and
+  agrees: it multiplies left to right and rounds each step, as MongoDB does
+  (Chris's ruling, ADR-252).
+- **`$inc` and `$mul` refuse a double operand on a decimal field that is not
+  exactly a decimal.** MongoDB widens it at 15 digits and stores the result.
+  Here `$inc: {bal: 0.01}` on `Decimal128("19.99")` is a `400` that names
+  `{"$numberDecimal": "0.01"}`, because widening the double exactly would store
+  `20.00000000000000000020816681711722` in a field that kept cents. The
+  exact doubles (`0.5`, `0.25`, `2.0`, integers) and every decimal are applied.
+
+Also decided with it: a zero divisor of any spelling is a `400` for a decimal as
+for every number (IEEE would give an infinity or a NaN), an overflow in `$inc` and
+`$mul` is a `400` as an `Int64` overflow is (the double path still stores
+`Infinity`), and every NaN result is the one quiet NaN. `$mod` with
+a decimal, and date arithmetic with one, stay refused (`$mod needs numbers, found
+a Decimal128`), and `$round`, `$trunc` and quantize are a separate, later item, so
+a decimal mean or quotient shows 34 digits.
 
 A filter's `$mod` is not arithmetic on the value but a test of its integer
 part: it truncates a decimal toward zero, operand and stored value alike, as
@@ -395,14 +414,12 @@ double of that value.
 
 **One numeric argument stays refused for a decimal: a `$vectorSearch` query
 vector's components.** The engine searches 32-bit floats; a double or an
-integer is converted the way it always was, and a decimal would need the
-decimal-to-binary rounding rule this build does not have. The refusal says so:
-`a Decimal128 would have to be rounded to a 32-bit float`. It goes with
-decimal arithmetic.
+integer is converted the way it always was, and a decimal would be rounded a
+second time on the way to one. The refusal says so: `a Decimal128 would have to
+be rounded to a 32-bit float`. ADR-252 converts a decimal to a double only.
 
-**To close:** decimal arithmetic, with the rounding rules MongoDB's `Decimal128`
-follows, as its own design. Until then a refusal is the honest answer: a total
-that leaves a number out is wrong and says nothing.
+**To close:** none planned. The three differences are the point of the design;
+`$round` and quantize are the follow-up.
 
 ---
 

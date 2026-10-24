@@ -73,6 +73,9 @@ jobs:
       # Whether the storage-cache-metrics feature's tests run: see that step
       # in the `test` job.
       cache_feature: ${{ steps.classify.outputs.cache_feature }}
+      # Whether the Decimal128 arithmetic's two architectures are run: see the
+      # `decimal-arm64` job.
+      decimal: ${{ steps.classify.outputs.decimal }}
     steps:
       # The whole history, because the classification is a diff against the
       # merge base and the default single-commit fetch cannot reach it. The
@@ -95,6 +98,7 @@ jobs:
             echo "No usable range (${BASE:-none}...${HEAD:-none}); running the full gate."
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "cache_feature=true" >> "$GITHUB_OUTPUT"
+            echo "decimal=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -109,6 +113,7 @@ jobs:
             echo "An empty range tells us nothing; running the full gate."
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "cache_feature=true" >> "$GITHUB_OUTPUT"
+            echo "decimal=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -134,6 +139,19 @@ jobs:
           else
             echo "Nothing the storage-cache-metrics tests guard changed; skipping them."
             echo "cache_feature=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # The Decimal128 arithmetic's golden corpus and its R1 properties run
+          # on aarch64 as well, because the corpus pins the bytes on both
+          # release architectures (ADR-252). On a pull request only when
+          # something they read changed; always on a push to main.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] \
+             || printf '%s\n' "$changed" \
+                | grep -qE '^crates/kimmy-core/(src/decimal|src/cmp/big|src/keyenc|tests/)|^crates/kimmy-query/|^scripts/decimal_golden\.py$|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
+            echo "decimal=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing the Decimal128 arithmetic reads changed; skipping its aarch64 job."
+            echo "decimal=false" >> "$GITHUB_OUTPUT"
           fi
 
   # The pull-request gate is two jobs so that the cheap verdicts arrive first:
@@ -519,6 +537,155 @@ jobs:
             --ignored --exact \
             keyenc::number_keys::a_large_corpus 2>&1 | tee key-corpus-b.log
           grep -q 'test result: ok. 1 passed' key-corpus-b.log
+
+  # The Decimal128 arithmetic against its reference suites (ADR-252): the
+  # General Decimal Arithmetic test files, decNumber over a million pairs, and
+  # the golden corpus, in release.
+  #
+  # **The dectest files are fetched, never vendored**: they are (c) Mike
+  # Cowlishaw and IBM with no licence grant. `scripts/fetch-dectest.sh` takes
+  # them from speleotrove (or, failing that, CPython at a pinned commit) and
+  # checks every file against a pinned sha256; the tests check again when they
+  # read. The directory is kept in `actions/cache`, and **saved from main only**,
+  # as the rust caches are (see the `lint` job): a pull request restores it and
+  # fetches on a miss, and never writes one. The key names the zip's sha256, so
+  # it changes only if the pin does, and `cache-cleanup.yml` keeps the newest
+  # entry of its family.
+  #
+  # Each test is named, with the `grep -q` that a name matching nothing cannot
+  # slip past: `cargo test --exact` passes having run nothing. `shell: bash`
+  # sets pipefail, so a failed run fails the step through the `tee`.
+  decimal:
+    name: decimal arithmetic
+    runs-on: ubuntu-latest
+    needs: changes
+    # `!cancelled()`, as the required jobs: a `changes` job that failed would
+    # otherwise skip this one, and a skipped check reads as a pass. Its outputs
+    # are then empty, which reads as not documentation-only and runs it.
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    env:
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Save only from main — see the note on the `lint` job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - id: dectest-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/dectest
+          key: dectest-b70a224cd52e82b7a8150aedac5efa2d0cb3941696fd829bdbe674f9f65c3926
+
+      - name: Fetch the dectest files
+        if: steps.dectest-cache.outputs.cache-hit != 'true'
+        run: scripts/fetch-dectest.sh "${{ runner.temp }}/dectest"
+
+      # Only a fetch on main is kept: a pull request's copy would be a cache
+      # entry nothing else can read, since a cache is readable from the ref
+      # that wrote it or from the default branch.
+      - name: Keep the dectest files
+        if: steps.dectest-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/dectest
+          key: dectest-b70a224cd52e82b7a8150aedac5efa2d0cb3941696fd829bdbe674f9f65c3926
+
+      # The four arithmetic files: every case run under half-even or exact
+      # under any mode, and the zero divisors refused (2,411 cases in all).
+      - name: The reference suite, arithmetic
+        shell: bash
+        env:
+          KIMMY_DECTEST_DIR: ${{ runner.temp }}/dectest
+        run: |
+          cargo test -p kimmy-core --release --test dectest -- \
+            --ignored --exact arithmetic_meets_the_reference_suite 2>&1 | tee dectest.log
+          grep -q 'test result: ok. 1 passed' dectest.log
+
+      # `dqBase`: the strict parser against all 99 syntax errors and every
+      # exact conversion.
+      - name: The reference suite, conversion
+        shell: bash
+        env:
+          KIMMY_DECTEST_DIR: ${{ runner.temp }}/dectest
+        run: |
+          cargo test -p kimmy-core --release --test dq_base -- \
+            --ignored --exact every_dq_base_case_is_refused_or_read_exactly 2>&1 | tee dq-base.log
+          grep -q 'test result: ok. 1 passed' dq-base.log
+
+      # decNumber, the specification's reference implementation, over a
+      # million pairs for each of the four operations.
+      - name: decNumber over a million pairs
+        shell: bash
+        run: |
+          cargo test -p kimmy-core --release --test decnumber_oracle -- \
+            --ignored --exact arithmetic_agrees_with_decnumber_over_a_million_pairs 2>&1 | tee decnumber.log
+          grep -q 'test result: ok. 1 passed' decnumber.log
+
+      # The design's cost ceilings, as ignored tests in release. A runner is
+      # slower than the machine they were measured on, so each asserts several
+      # times the measured figure; a real regression still crosses it.
+      - name: Cost ceilings
+        shell: bash
+        run: |
+          cargo test -p kimmy-core --release --test decimal_cost -- \
+            --ignored --test-threads 1 2>&1 | tee cost-core.log
+          grep -q 'test result: ok. 4 passed' cost-core.log
+          cargo test -p kimmy-query --release --test decimal_cost -- \
+            --ignored --test-threads 1 2>&1 | tee cost-query.log
+          grep -q 'test result: ok. 2 passed' cost-query.log
+
+      # The golden corpus and the R1 properties, in release: the shipped
+      # profile wraps on integer overflow, and the test profile panics, so the
+      # corpus is the one place the release arithmetic is held to its bytes.
+      - name: The golden corpus, release
+        shell: bash
+        run: |
+          cargo test -p kimmy-core --release --test decimal_golden 2>&1 | tee golden.log
+          grep -q 'test result: ok. 1 passed' golden.log
+
+  # The same corpus on aarch64, the other release architecture
+  # (dist-workspace.toml). Rust's integer arithmetic is the same on both, and
+  # this is what pins that: the corpus is generated once, by libmpdec, and both
+  # architectures must reproduce its bytes. kimmydb is public, so a runner
+  # costs no billed minutes.
+  #
+  # On a pull request only when the arithmetic or what it reads changed (the
+  # `decimal` output of the `changes` job); there is no workflow-level path
+  # filter, so the filter is here, at the job. Always on a push to main.
+  decimal-arm64:
+    name: decimal arithmetic (arm64)
+    runs-on: ubuntu-24.04-arm
+    needs: changes
+    # As the job above; an empty `decimal` output (a failed `changes`) runs it.
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.decimal != 'false' }}
+    env:
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Save only from main — see the note on the `lint` job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: The golden corpus and the R1 properties, release
+        shell: bash
+        run: |
+          cargo test -p kimmy-core --release --test decimal_golden 2>&1 | tee golden.log
+          grep -q 'test result: ok. 1 passed' golden.log
+          cargo test -p kimmy-core --release --lib -- decimal:: 2>&1 | tee lib.log
+          grep -qE 'test result: ok. [1-9][0-9]+ passed' lib.log
 
   # One build of `kimmyd`, shared — and it is the build the release makes.
   #
