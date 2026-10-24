@@ -301,8 +301,14 @@ pub struct ServerConfig {
     /// to itself. It does not cut short storage work already running: a scan,
     /// a bulk commit or an index backfill runs to completion and is answered
     /// with its result however long it took, so a long query is not turned
-    /// into a refusal after the work was done. Change-stream upgrades and
-    /// `/mcp` carry no deadline.
+    /// into a refusal after the work was done. Change-stream upgrades and the
+    /// backup carry no deadline. An `/mcp` tool call has this deadline too (the same
+    /// four scopes: abandoned if still pending, the wait for the storage writer, the
+    /// vector search's and the confirmation's reading of the time left, the number in
+    /// messages), and is answered, past it, as a tool result with `error: timeout`. It
+    /// covers the request body's arrival and the call together: a call, and its wait for
+    /// the storage writer, get what the body left, and a body still arriving at the
+    /// deadline is answered `503 timeout`.
     pub request_timeout_secs: u64,
     /// Largest request body the API will read, in bytes (ADR-099). Over it,
     /// `413 payload_too_large`.

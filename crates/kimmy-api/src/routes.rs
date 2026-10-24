@@ -43,11 +43,15 @@ pub fn router_with(state: SharedState, extra: Option<Router>) -> Router {
 /// serve, since an MCP client has no other way to discover its authorization
 /// server — and every MCP request was invisible to `/metrics` and to tracing.
 ///
-/// `extra` is deliberately **outside** the request deadline (ADR-099): `/mcp`
-/// is a streaming transport whose responses may be held open, and it is merged
-/// here after [`routes`] has already applied the deadline to the routes that
-/// take one. It is inside the body ceiling, though rmcp reads its own bodies
-/// under its own limit, so the ceiling reaches it only in name.
+/// `extra` is merged here after [`routes`] has applied the deadline layer, so that layer
+/// does not wrap it, **and that is deliberate**: rmcp runs a tool call in a task of its
+/// own, so the deadline's task-locals (`limits::within_request_deadline`) set around the
+/// HTTP handler would not reach it, and a timeout there would answer a bare HTTP `503`
+/// where an MCP client reads a tool result. `/mcp` takes the deadline another way
+/// (ADR-099, amended): `kimmy_mcp::mcp_router` is given the same [`RequestLimits`], runs
+/// every tool call inside `within_request_deadline` in the handler's own task, and bounds
+/// the time the request body takes to arrive. It is inside the body ceiling, though rmcp
+/// reads its own bodies under its own limit, so the ceiling reaches it only in name.
 pub fn router_with_limits(
     state: SharedState,
     extra: Option<Router>,
@@ -156,9 +160,9 @@ fn routes(state: SharedState, limits: RequestLimits) -> Router {
 /// Routes whose response is a connection or a stream rather than a document,
 /// and which therefore carry no request deadline.
 ///
-/// The change-stream upgrade and the backup. `/mcp` is the other streaming
-/// surface, and it is exempt by being merged after the deadline is applied —
-/// see [`router_with_limits`]. Every other route answers in one piece.
+/// The change-stream upgrade and the backup. `/mcp` is not one of them: it answers in one
+/// piece (stateless, JSON responses) and has the deadline by another route — see
+/// [`router_with_limits`]. Every other route answers in one piece.
 ///
 /// For the upgrade, the stream itself is outside the handler: axum hands the
 /// upgraded socket to a task of its own once the `101` is written. What runs

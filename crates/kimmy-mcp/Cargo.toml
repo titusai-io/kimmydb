@@ -16,6 +16,7 @@ kimmy-auth.workspace = true
 kimmy-api.workspace = true
 axum.workspace = true
 http = "1"
+http-body.workspace = true
 # `server` and `transport-streamable-http-server` only: the client half and the
 # stdio/child-process transports would be dead weight in a database server, and
 # the OAuth feature would be a second authentication system beside the one that
@@ -35,6 +36,7 @@ tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 
 [dev-dependencies]
 bson.workspace = true
+kimmy-vector = { workspace = true, features = ["test-hooks"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower.workspace = true

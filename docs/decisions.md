@@ -5254,6 +5254,37 @@ is answered without a confirmation. An audit of every `.await` in the API and
 MCP crates found no other one after a commit. A new one after a commit breaks
 this, and must either come before the commit or be capped the same way.
 
+> **Amended: `/mcp` has the request deadline** (the first sentence of the decision
+> says it does not; the reason no longer holds). `/mcp` is stateless and answers
+> each call with one JSON body (`json_response`), not a held-open stream, so it
+> was exempt for a reason it does not have. What exempted it was also a cost: a
+> tool call that needs the storage writer waited for as long as the writer was
+> held, a filtered vector search's keyed join had no deadline to see (ADR-241),
+> and a schema-change confirmation was not capped to the request's time. The
+> deadline is not a layer on `/mcp`: rmcp runs a tool call in a task of its own
+> (its service loop), so the task-locals a layer sets around the HTTP handler do
+> not reach it, and a layer would answer a bare `503` where an MCP client reads
+> a tool result. It is applied in the tool dispatcher, inside that task
+> (`call_tool`, through `limits::within_request_deadline`, the function
+> `enforce_timeout` uses too), with the same `server.request_timeout_secs`: the
+> same four things as REST: the timeout, the write-wait budget (ADR-151), the
+> deadline read by the search and the confirmation, and the configured number.
+> A call that ends on it is a **tool result** with `isError: true` and the REST
+> envelope (`error: timeout`, `retry: wait`, the same message), where the
+> specification puts a tool's execution errors so that the model sees them; a
+> write that could not take the writer wrote nothing, as on REST. Storage work
+> already running is not cut, as on REST. The **request body** is under the same
+> deadline: rmcp reads its own bodies and does not bound the time (a body that
+> stopped after its headers held the connection), so `mcp_router`'s
+> authentication layer starts the request's time and bounds the body's arrival, and
+> answers a body that did not arrive `503 timeout` as REST does (not rmcp's
+> plain-text 500). One deadline covers body and call: the tool call, and its wait
+> for the storage writer, get what the body left of it. (REST sets the full write-wait
+> budget before it reads the body; aligning it is a separate change.) The same sentence stands for a schema-change
+> confirmation: it is capped to the time left and answers the change as made, its
+> unheard members `pending`, not as a timeout. The deadline's other exemptions, the change-stream upgrade and
+> the backup, stand.
+
 ---
 
 ## ADR-100 — Local login is a mode, and a federated subject has a display name that is never an identity

@@ -47,6 +47,30 @@ impl ServerHandler for KimmyMcp {
         Self::server_info()
     }
 
+    /// A tool call, under the request deadline REST has (ADR-099).
+    ///
+    /// Written out rather than left to `tool_handler`, which would run the call with no
+    /// deadline: the call has to be scoped here, in the task rmcp runs it in. The
+    /// resource handlers below are not: they have nothing to await and write nothing,
+    /// so the deadline would bound nothing in them.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        // What the body left of the request's time: one deadline over body and call.
+        let left = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<crate::auth::ArrivalStart>())
+            .map_or(self.limits.request_timeout, |start| {
+                self.limits.request_timeout.saturating_sub(start.0.elapsed())
+            });
+        let tool_context =
+            rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::tools::within_deadline(self.limits, left, self.tool_router.call(tool_context)).await
+    }
+
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,

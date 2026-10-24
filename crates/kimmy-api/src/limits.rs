@@ -102,7 +102,8 @@ impl Default for RequestLimits {
 
 tokio::task_local! {
     /// When the request this task serves must be answered by: set by
-    /// [`enforce_timeout`] for the handler it wraps.
+    /// [`enforce_timeout`] for the handler it wraps, or by
+    /// [`within_request_deadline`] for another transport's.
     static REQUEST_DEADLINE: std::time::Instant;
     /// The deadline's length, `server.request_timeout_secs`: for an answer
     /// that names it, given by a handler that saw the deadline pass itself.
@@ -115,8 +116,8 @@ pub fn request_timeout() -> Option<Duration> {
     REQUEST_TIMEOUT.try_with(|timeout| *timeout).ok()
 }
 
-/// How long the request this task serves has left before [`enforce_timeout`]
-/// abandons it, or `None` outside a request with a deadline.
+/// How long the request this task serves has left before [`enforce_timeout`] (or
+/// [`within_request_deadline`]) abandons it, or `None` outside a request with a deadline.
 ///
 /// For a handler with work that can run after its change has committed, the
 /// confirmation of a schema change (ADR-140): capped by this, it answers with
@@ -158,18 +159,50 @@ pub async fn enforce_timeout(
     // ends — a write that could not get the writer hung for as long as it
     // was held, and the client saw a transport timeout rather than the
     // documented refusal.
-    let deadline = std::time::Instant::now() + limits.request_timeout;
-    let handler = REQUEST_DEADLINE.scope(
-        deadline,
-        REQUEST_TIMEOUT.scope(
-            limits.request_timeout,
-            kimmy_storage::with_write_wait_budget(limits.request_timeout, next.run(request)),
-        ),
-    );
-    match tokio::time::timeout(limits.request_timeout, handler).await {
+    match within_request_deadline(limits.request_timeout, next.run(request)).await {
         Ok(response) => response,
         Err(_elapsed) => ApiError::timeout(limits.request_timeout).into_response(),
     }
+}
+
+/// Run `work` as a request with a deadline of `timeout`: the four things a REST
+/// request has around its handler, in one place so that another transport can have
+/// exactly them.
+///
+/// 1. [`tokio::time::timeout`]: `work` is abandoned if it is still pending at the
+///    deadline (an embedding provider's answer, a confirmation).
+/// 2. The write-wait budget (ADR-151): a write that cannot take the storage writer
+///    within `timeout` fails with `WriterBusy` and writes nothing.
+/// 3. [`request_time_left`]: what a handler that cannot yield reads to end itself
+///    (a filtered vector search's keyed join, ADR-241) or to cap a wait (a
+///    schema-change confirmation).
+/// 4. [`request_timeout`]: the configured number, for an answer that names it.
+///
+/// These are task-locals, so they hold for `work` and what it awaits in this task,
+/// and **not** for anything it `tokio::spawn`s. A transport that runs its handlers in
+/// a task of its own (`/mcp`: rmcp's service loop) must call this inside that task.
+pub async fn within_request_deadline<F: std::future::Future>(
+    timeout: Duration,
+    work: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    within_request_deadline_of(timeout, timeout, work).await
+}
+
+/// [`within_request_deadline`] for a request that has already spent part of its time
+/// (reading its body): `left` is what remains, and bounds the work, the writer wait and
+/// what the work reads from [`request_time_left`]; `timeout` is the configured number,
+/// the one a message names.
+pub async fn within_request_deadline_of<F: std::future::Future>(
+    timeout: Duration,
+    left: Duration,
+    work: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    let deadline = std::time::Instant::now() + left;
+    let work = REQUEST_DEADLINE.scope(
+        deadline,
+        REQUEST_TIMEOUT.scope(timeout, kimmy_storage::with_write_wait_budget(left, work)),
+    );
+    tokio::time::timeout(left, work).await
 }
 
 /// Read the rest of a refused body before the `413` is written.
@@ -305,6 +338,54 @@ impl Drop for Retained {
         if let (Some(body), Some(give_back)) = (self.inner.take(), self.give_back.take()) {
             let _ = give_back.send((body, self.read));
         }
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// The four things a request has around its handler are there inside the work, and
+    /// gone outside it.
+    #[tokio::test(start_paused = true)]
+    async fn the_work_sees_the_deadline_the_number_and_the_write_budget() {
+        assert!(request_time_left().is_none() && request_timeout().is_none());
+        let seen = within_request_deadline(Duration::from_secs(30), async {
+            (request_time_left(), request_timeout())
+        })
+        .await
+        .expect("it finishes");
+        let (left, number) = seen;
+        assert_eq!(number, Some(Duration::from_secs(30)));
+        let left = left.expect("a deadline is set");
+        assert!(left <= Duration::from_secs(30) && left > Duration::from_secs(29), "{left:?}");
+        assert!(request_time_left().is_none(), "and not outside it");
+    }
+
+    /// Work still pending at the deadline is abandoned.
+    #[tokio::test(start_paused = true)]
+    async fn work_pending_at_the_deadline_is_abandoned() {
+        let out =
+            within_request_deadline(Duration::from_secs(5), std::future::pending::<()>()).await;
+        assert!(out.is_err());
+    }
+
+    /// A write inside the work waits for the writer no longer than the deadline.
+    #[tokio::test]
+    async fn a_write_inside_the_work_gets_the_write_wait_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let hold = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+        let began = std::time::Instant::now();
+        let out = within_request_deadline(Duration::from_millis(300), async {
+            engine.create_collection("shop", "orders")
+        })
+        .await
+        .expect("the write ends on its own budget, before the timeout cuts it");
+        assert!(matches!(out, Err(kimmy_storage::StorageError::WriterBusy { .. })), "{out:?}");
+        assert!(began.elapsed() < Duration::from_secs(5));
+        drop(hold);
+        assert!(engine.create_collection("shop", "orders").is_ok(), "nothing was written");
     }
 }
 
