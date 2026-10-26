@@ -29,6 +29,8 @@ use super::{MAX_EXPONENT, MIN_EXPONENT, Raw};
 use crate::cmp::big::Big;
 use crate::keyenc::number;
 
+pub mod func;
+
 /// Digits of a coefficient.
 const PREC: u32 = 34;
 /// `emax`: the largest adjusted exponent.
