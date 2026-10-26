@@ -455,10 +455,18 @@ impl Engine {
     /// question over the same window: "was this deleted more recently than the
     /// thing a peer is trying to replay?"
     fn collect_dropped_collections(&self, cutoff: Hlc) -> Result<usize> {
-        // Found under a read transaction, removed under the writer only when
-        // there is something to remove, so a pass with nothing to collect
-        // never takes the writer (ADR-151). One row per dropped collection, so the
-        // table is walked whole.
+        let expired = self.scan_dropped_collections(cutoff)?;
+        self.remove_dropped_collections(&expired, cutoff)
+    }
+
+    /// The collection tombstones older than `cutoff`, each with the stamp bytes
+    /// the scan saw, and with no rows still owed under them.
+    ///
+    /// Found under a read transaction, removed under the writer only when
+    /// there is something to remove, so a pass with nothing to collect
+    /// never takes the writer (ADR-151). One row per dropped collection, so the
+    /// table is walked whole.
+    pub(crate) fn scan_dropped_collections(&self, cutoff: Hlc) -> Result<Vec<(u64, Vec<u8>)>> {
         let expired = {
             let txn = self.db().begin_read()?;
             let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
@@ -484,6 +492,16 @@ impl Engine {
         expired.retain(|(id, _)| {
             matches!(self.collection_range_is_empty(CollectionId(*id)), Ok(true))
         });
+        Ok(expired)
+    }
+
+    /// Remove the collection tombstones a scan found, re-checking each under
+    /// the writer.
+    pub(crate) fn remove_dropped_collections(
+        &self,
+        expired: &[(u64, Vec<u8>)],
+        cutoff: Hlc,
+    ) -> Result<usize> {
         if expired.is_empty() {
             return Ok(0);
         }
@@ -492,7 +510,7 @@ impl Engine {
         let mut removed = 0usize;
         {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
-            for (key, seen) in &expired {
+            for (key, seen) in expired {
                 // Still the tombstone the scan saw: a drop recorded again
                 // since then carries a newer stamp and is kept.
                 let unchanged = dropped.get(*key)?.is_some_and(|v| v.value() == seen);
@@ -513,26 +531,41 @@ impl Engine {
     /// the creation a peer is replaying?" — and so is the window in which the
     /// answer can be trusted (ADR-123).
     fn collect_dropped_indexes(&self, cutoff: Hlc) -> Result<usize> {
-        // Found under a read transaction, removed under the writer only when
-        // there is something to remove, so a pass with nothing to collect
-        // never takes the writer (ADR-151). One row per dropped index, so the
-        // table is walked whole.
-        let expired = {
-            let txn = self.db().begin_read()?;
-            let dropped = txn.open_table(tables::INDEXES_DROPPED)?;
-            let mut expired = Vec::new();
-            for row in dropped.iter()? {
-                let (key, value) = row?;
-                let Ok(stamp) = codec::decode_oplog_key(value.value()) else {
-                    warn!("undecodable index tombstone retained");
-                    continue;
-                };
-                if stamp.hlc < cutoff {
-                    expired.push((key.value(), value.value().to_vec()));
-                }
+        let expired = self.scan_dropped_indexes(cutoff)?;
+        self.remove_dropped_indexes(&expired, cutoff)
+    }
+
+    /// The index tombstones older than `cutoff`, each with the stamp bytes the
+    /// scan saw.
+    ///
+    /// Found under a read transaction, removed under the writer only when
+    /// there is something to remove, so a pass with nothing to collect
+    /// never takes the writer (ADR-151). One row per dropped index, so the
+    /// table is walked whole.
+    pub(crate) fn scan_dropped_indexes(&self, cutoff: Hlc) -> Result<Vec<IndexTombstone>> {
+        let txn = self.db().begin_read()?;
+        let dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+        let mut expired = Vec::new();
+        for row in dropped.iter()? {
+            let (key, value) = row?;
+            let Ok(stamp) = codec::decode_oplog_key(value.value()) else {
+                warn!("undecodable index tombstone retained");
+                continue;
+            };
+            if stamp.hlc < cutoff {
+                expired.push((key.value(), value.value().to_vec()));
             }
-            expired
-        };
+        }
+        Ok(expired)
+    }
+
+    /// Remove the index tombstones a scan found, re-checking each under the
+    /// writer.
+    pub(crate) fn remove_dropped_indexes(
+        &self,
+        expired: &[IndexTombstone],
+        cutoff: Hlc,
+    ) -> Result<usize> {
         if expired.is_empty() {
             return Ok(0);
         }
@@ -541,7 +574,7 @@ impl Engine {
         let mut removed = 0usize;
         {
             let mut dropped = txn.open_table(tables::INDEXES_DROPPED)?;
-            for (key, seen) in &expired {
+            for (key, seen) in expired {
                 // Still the tombstone the scan saw: a drop recorded again
                 // since then carries a newer stamp and is kept.
                 let unchanged = dropped.get(*key)?.is_some_and(|v| v.value() == seen);
@@ -565,6 +598,10 @@ impl Engine {
         }
     }
 }
+
+/// An index tombstone a scan found: `(collection id, index id)` and the stamp
+/// bytes it held.
+pub(crate) type IndexTombstone = ((u64, u32), Vec<u8>);
 
 /// The timestamp below which a record of this age is expired.
 ///

@@ -2842,6 +2842,8 @@ impl Engine {
         {
             return Ok(());
         }
+        #[cfg(test)]
+        crate::writer_reread_tests::between_the_check_and_the_writer();
         let txn = self.begin_write(WriterHolder::Ddl)?;
         let wrote = {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;

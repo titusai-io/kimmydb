@@ -121,6 +121,8 @@ mod decimal_definition_tests;
 mod size_cap_tests;
 #[cfg(test)]
 mod snapshot_pages_tests;
+#[cfg(test)]
+mod writer_reread_tests;
 
 #[cfg(test)]
 mod log_capture;

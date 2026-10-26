@@ -232,11 +232,8 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "engine::collection_stands_under",
         "the collection registry: one row per collection, however many documents",
     ),
-    (
-        "gc::Engine::collect_dropped_collections",
-        "the dropped-collection registry: one row per drop",
-    ),
-    ("gc::Engine::collect_dropped_indexes", "the dropped-index registry: one row per drop"),
+    ("gc::Engine::scan_dropped_collections", "the dropped-collection registry: one row per drop"),
+    ("gc::Engine::scan_dropped_indexes", "the dropped-index registry: one row per drop"),
     (
         "gc::Engine::trim_violation_rows",
         "the violations table: one row per retained violation entry, read in a retention pass \
