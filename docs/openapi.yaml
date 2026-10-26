@@ -259,6 +259,7 @@ paths:
                     const: ready
                   node:
                     type: string
+                    format: uuid
                     description: This node's id.
                   catching_up:
                     const: unknown
@@ -564,6 +565,7 @@ paths:
                       half-upgraded cluster claim the same version.
                   node:
                     type: string
+                    format: uuid
                     description: The node that answered.
                   capabilities:
                     type: array
@@ -3390,6 +3392,7 @@ components:
       properties:
         node:
           type: string
+          format: uuid
           description: The node id, stable across restarts and address changes.
         endpoint:
           oneOf:
@@ -3400,13 +3403,16 @@ components:
             when the node has not been told what to advertise; the answering
             node may be null this way and still be usable, since a client that
             reached it already knows its address.
+            A member listed with a null `endpoint` cannot be handed to a
+            client; skip it. A client that gets every endpoint null still has
+            the address it used to reach the answering node.
         version:
           oneOf:
             - type: string
             - type: "null"
           description: |
             The build the node was running when it last registered, which is at
-            its last start. Useful mid-rolling-upgrade.
+            its last start. Null when the registry entry carries none.
         status:
           type: string
           enum: [live, unknown]
@@ -3903,7 +3909,7 @@ components:
             type: object
             required: [node, reason]
             properties:
-              node: { type: string }
+              node: { type: string, format: uuid }
               reason: { type: string }
 
     CollectionDescription:

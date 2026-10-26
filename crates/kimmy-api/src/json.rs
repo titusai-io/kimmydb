@@ -272,6 +272,19 @@ fn extended_json(map: &Map<String, Value>) -> Result<Option<Bson>, ApiError> {
     }))
 }
 
+/// The canonical Extended JSON spelling of a double JSON has no number for.
+/// Every NaN is one value (`NaN`, whatever its sign bit), which is how the
+/// store and `cmp` already treat it.
+fn non_finite_spelling(f: f64) -> &'static str {
+    if f.is_nan() {
+        "NaN"
+    } else if f.is_sign_positive() {
+        "Infinity"
+    } else {
+        "-Infinity"
+    }
+}
+
 /// Convert BSON back to JSON, emitting Extended JSON for types JSON lacks.
 pub fn bson_to_json(value: &Bson) -> Value {
     match value {
@@ -282,9 +295,9 @@ pub fn bson_to_json(value: &Bson) -> Value {
         Bson::Int64(i) => Value::from(*i),
         Bson::Double(f) => serde_json::Number::from_f64(*f)
             .map(Value::Number)
-            // NaN and the infinities have no JSON form; Extended JSON spells
-            // them as strings rather than silently becoming null.
-            .unwrap_or_else(|| serde_json::json!({ "$numberDouble": f.to_string() })),
+            // NaN and the infinities have no JSON form; canonical Extended JSON
+            // spells them as these strings rather than silently becoming null.
+            .unwrap_or_else(|| serde_json::json!({ "$numberDouble": non_finite_spelling(*f) })),
         Bson::Array(items) => Value::Array(items.iter().map(bson_to_json).collect()),
         Bson::Document(doc) => document_to_json(doc),
         Bson::ObjectId(oid) => serde_json::json!({ "$oid": oid.to_hex() }),
@@ -617,8 +630,19 @@ mod tests {
         // value on the way out.
         let out = bson_to_json(&Bson::Double(f64::NAN));
         assert_eq!(out, json!({ "$numberDouble": "NaN" }));
+        let negative_nan = f64::from_bits(f64::NAN.to_bits() | (1 << 63));
+        assert!(negative_nan.is_sign_negative() && negative_nan.is_nan());
+        let out = bson_to_json(&Bson::Double(negative_nan));
+        assert_eq!(out, json!({ "$numberDouble": "NaN" }));
         let out = bson_to_json(&Bson::Double(f64::INFINITY));
-        assert_eq!(out, json!({ "$numberDouble": "inf" }));
+        assert_eq!(out, json!({ "$numberDouble": "Infinity" }));
+        let out = bson_to_json(&Bson::Double(f64::NEG_INFINITY));
+        assert_eq!(out, json!({ "$numberDouble": "-Infinity" }));
+        // What is spelled comes back as the same value.
+        for spelled in ["NaN", "Infinity", "-Infinity"] {
+            let doc = json_to_document(&json!({ "v": { "$numberDouble": spelled } })).unwrap();
+            assert!(matches!(doc.get("v"), Some(Bson::Double(_))), "{spelled}");
+        }
     }
 
     #[test]
