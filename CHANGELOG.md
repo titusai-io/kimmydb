@@ -12,6 +12,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+**Breaking:** a resume token in the pre-0.30.0 single-stamp form is refused as malformed (`400`), as any string that is not a token a member issued is, where it was accepted and resumed from the entry alone. A client holding such a token resubscribes without one. Tokens a member issued (0.30.0 and later) are unchanged.
+
 **Fixed:** a clustered node configured to bind HTTP on port 0 published `:0` to the topology, so clients were handed an address nothing listens on; it now publishes the port it bound. A double with no JSON number (`Infinity`, `-Infinity`, `NaN`) is spelled as canonical Extended JSON in responses (`inf` before), and a stored partial filter spells every NaN `NaN` whatever its sign bit (`-NaN` before; the definition compares the same either way). `docs/openapi.yaml` declares the node id as a UUID.
 
 **Fixed:** a repair that pulls one collection's snapshot from a peer (the count half's scoped snapshot, for a collection this member lacks) walked every key written ahead of its cursor, so a collection receiving inserts at the tail of its key range faster than the pull committed pages kept it advancing without reaching the end. An advancing repair is never abandoned, so it held the peer's one repair slot and every other repair queued against that peer waited. The pull now ends at the last key the collection held when its first page was served; rows written after arrive by entries ([ADR-152](docs/decisions.md)).

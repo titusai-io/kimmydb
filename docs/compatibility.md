@@ -156,11 +156,9 @@ the cluster wire.
 **A resume token's format is a client contract, and changes only in a
 `0.MINOR`.** A token is opaque, but clients store it across restarts and hand
 it to whichever node answers, so a new format breaks anything holding the old
-one. It ships in a `0.MINOR` release, and the previous format stays accepted
-for that whole minor release line; a later minor may refuse it, with a release
-note.
-The single-stamp token 0.30.0 replaced is the first case
-([ADR-173](decisions.md)).
+one. It ships in a `0.MINOR` release, with a release note. The single-stamp token
+0.30.0 replaced ([ADR-173](decisions.md)) was the first case; it is refused as
+malformed.
 
 **A downgrade across a storage boundary is refused before anything is
 written.** A storage schema change, a redb major.minor bump or a redb

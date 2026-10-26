@@ -157,9 +157,7 @@ so a database written before they existed is repaired rather than refused.
 A resume token names an entry by stamp, and the member that issued it translates
 it to an arrival position by point lookup when a stream opens. Any other member
 resumes from the delivered vector the token also carries, because its own
-arrival order is different ([ADR-173](decisions.md)). Tokens live in *clients*,
-where no migration can reach them, which is why the single-stamp form stays
-accepted for a release.
+arrival order is different ([ADR-173](decisions.md)).
 
 ---
 
@@ -174,13 +172,9 @@ base64url( 0x02 ‖ hlc(10) ‖ node(16) ‖ issued-by(16) ‖ origins(u16) ‖ 
     →   164 characters on a three-member cluster
 ```
 
-A token issued before 0.30.0 is the entry alone. It is guaranteed to be accepted
-through 0.30.x and has been accepted since; a later minor may refuse it, and its
-release notes will say so:
-
-```
-base64url( hlc(10 bytes) ‖ node(16 bytes) )   →   35 characters
-```
+A token in the pre-0.30.0 single-stamp form, `hlc ‖ node` (26 bytes, 35
+characters), is refused as malformed, as any other string that is not an issued
+token is.
 
 ```rust
 pub fn exclusive_start(&self) -> Hlc {
