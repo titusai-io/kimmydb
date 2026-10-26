@@ -2583,8 +2583,15 @@ fn meter_provider(cfg: &TelemetryConfig, resource: Resource) -> Result<SdkMeterP
 /// compared the two surfaces, so nothing objected. OTLP support is a standing
 /// requirement (ADR-070), so the default is bridged and an exception has to be
 /// written down here to compile.
+///
+/// The third field names the instruments that carry what the bridge does have of
+/// the series (a histogram's sum and count, a summary of it), by their OTLP
+/// names. The coverage test matches a series by the stem of its name, and an
+/// entry here skips even that, so without them the sum and count could leave
+/// the bridge with every test passing. Each must appear exactly once in the
+/// instruments above this list; an empty list says the series has none.
 #[cfg(test)]
-const NOT_BRIDGED: &[(&str, &str)] = &[
+const NOT_BRIDGED: &[(&str, &str, &[&str])] = &[
     (
         "kimmy_request_duration_seconds",
         "A histogram. Every instrument on this bridge is observable (async): a \
@@ -2595,6 +2602,7 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
          is a different change with its own design (bucket boundaries against the \
          Prometheus ones, and what the collector should export back). Deliberately \
          left for that change.",
+        &[],
     ),
     (
         "kimmy_write_lock_wait_seconds",
@@ -2602,6 +2610,7 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
          the same change: it is recorded synchronously where a transaction takes \
          the writer (ADR-151). Its two summaries — the writes that gave up waiting, \
          and the longest hold — are observable and are on the bridge.",
+        &["kimmy.write_lock.wait_timeouts", "kimmy.write_lock.held_seconds.max"],
     ),
     (
         "kimmy_sync_pull_seconds",
@@ -2610,18 +2619,26 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
          bridged as kimmy.sync.pull_seconds.serve, .wait and .apply, and the pull \
          count they share as kimmy.sync.pulls, so a collector still has where the \
          pulls' time went (ADR-175).",
+        &[
+            "kimmy.sync.pull_seconds.serve",
+            "kimmy.sync.pull_seconds.wait",
+            "kimmy.sync.pull_seconds.apply",
+            "kimmy.sync.pulls",
+        ],
     ),
     (
         "kimmy_sync_entry_wait_seconds",
         "A histogram, for the same reason. Its sum is bridged as \
          kimmy.sync.entry_wait_seconds and its count as kimmy.sync.entry_waits, and \
          the pulls it could not observe as kimmy.sync.entry_wait_ahead (ADR-175).",
+        &["kimmy.sync.entry_wait_seconds", "kimmy.sync.entry_waits", "kimmy.sync.entry_wait_ahead"],
     ),
     (
         "kimmy_sync_serve_walk_seconds",
         "A histogram, for the same reason as the ones above. Its sum is bridged as \
          kimmy.sync.serve_walk_seconds and its count is kimmy.sync.served_windows \
          (ADR-176).",
+        &["kimmy.sync.serve_walk_seconds", "kimmy.sync.served_windows"],
     ),
     (
         "kimmy_backup_duration_seconds",
@@ -2630,6 +2647,7 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
          as kimmy.backup.duration_seconds and its count is kimmy.backups, so a \
          collector still has how many backups ran and how long they took in total \
          (ADR-170).",
+        &["kimmy.backup.duration_seconds", "kimmy.backups"],
     ),
 ];
 
@@ -2820,8 +2838,7 @@ mod tests {
         }
         // The serve series, named one by one for the same reason ADR-175's
         // are: their stems overlap, so one would satisfy the match for all.
-        let source = include_str!("logging.rs");
-        let source = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        let source = &instrument_source();
         // And the whole table is registered, every holder of it: counted by
         // the function the bridge calls, against a meter that exports nothing.
         let meter = opentelemetry::global::meter("hold-instruments-test");
@@ -2881,24 +2898,15 @@ mod tests {
 
     #[test]
     fn the_sync_pull_instruments_the_stem_match_cannot_see_reach_the_bridge() {
-        // The coverage test below matches a series by the stem of its name,
-        // and both ADR-175 histograms are in `NOT_BRIDGED` for their buckets,
-        // so it would pass with their sums and counts gone from the bridge.
-        // Those summaries are the only form of either histogram a collector
-        // sees, so they are named here one by one.
+        // The sums and counts of the ADR-175 histograms are named in
+        // `NOT_BRIDGED` and checked by the coverage test. What it cannot see
+        // are the labelled counters, which it matches by stem too: any one of
+        // the four satisfies it for all of them, so they are named here.
         // Everything above the first test-only item: the instruments, and not
         // this list of their names.
         let source = include_str!("logging.rs");
         let source = &source[..source.find("#[cfg(test)]").expect("a test-only item")];
         for name in [
-            "kimmy.sync.pull_seconds.serve",
-            "kimmy.sync.pull_seconds.wait",
-            "kimmy.sync.pull_seconds.apply",
-            "kimmy.sync.pulls",
-            "kimmy.sync.entry_wait_seconds",
-            "kimmy.sync.entry_waits",
-            // Labelled counters are matched by stem too, so any one of the
-            // four satisfies it for all of them.
             "kimmy.sync.contacts.caught_up",
             "kimmy.sync.contacts.budget",
             "kimmy.sync.contacts.ceiling",
@@ -3100,6 +3108,16 @@ mod tests {
         }
     }
 
+    /// This file up to its tests, without `NOT_BRIDGED`, whose third field names
+    /// instruments and would count as a second registration of each.
+    fn instrument_source() -> String {
+        let source = include_str!("logging.rs");
+        let list = source.find("#[cfg(test)]\nconst NOT_BRIDGED").expect("the list");
+        let after = source.find("/// Register every instrument of the hold decomposition").unwrap();
+        let end = source.find("#[cfg(test)]\nmod tests").expect("the tests");
+        format!("{}{}", &source[..list], &source[after..end])
+    }
+
     #[test]
     fn every_metrics_series_reaches_the_bridge() {
         // The guard the bridge did not have. `/metrics` is the surface an
@@ -3150,12 +3168,23 @@ mod tests {
         // An exception has to carry a reason, or the list becomes the place a
         // series goes to stop being asked about — which is the failure this
         // whole test exists to prevent, rebuilt one level up.
-        for (name, why) in NOT_BRIDGED {
+        let instruments = &source[..source.find("#[cfg(test)]").expect("a test-only item")];
+        for (name, why, summaries) in NOT_BRIDGED {
             assert!(
                 why.trim().len() > 40,
                 "`{name}` is in NOT_BRIDGED with no real reason. An exception that does not say \
                  why is indistinguishable from an oversight, which is how the twelve got there"
             );
+            // The summaries it says are bridged are on the bridge, once each,
+            // counted over the instruments and not over this list of them.
+            for instrument in *summaries {
+                assert_eq!(
+                    instruments.matches(&format!("\"{instrument}\",")).count(),
+                    1,
+                    "NOT_BRIDGED says `{instrument}` carries `{name}`'s sum or count, and it is \
+                     not an instrument on the bridge"
+                );
+            }
             // And it has to name a series that still exists. An exception that
             // outlives the series it excused is a permission nobody granted.
             assert!(
@@ -3178,7 +3207,7 @@ mod tests {
             if bridged.iter().any(|b| b == stem || b.starts_with(&format!("{stem}_"))) {
                 continue;
             }
-            if NOT_BRIDGED.iter().any(|(name, _)| *name == series) {
+            if NOT_BRIDGED.iter().any(|(name, _, _)| *name == series) {
                 continue;
             }
             unbridged.push(series.to_string());

@@ -178,11 +178,15 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       RUSTFLAGS: -D warnings
     steps:
-      # Every step below is gated on there being code to check. On a
-      # documentation-only change the job still runs, runs nothing, and
-      # reports `fmt, clippy` green in a few seconds.
+      # The checkout and the conflict-marker check run on every change,
+      # documentation-only ones included: a marker left in a page is not a
+      # build failure anywhere else. Every step after them is gated on there
+      # being code to check; on a documentation-only change those are skipped
+      # and the job reports `fmt, clippy` green in a few seconds.
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.docs_only != 'true'
+
+      - name: No git conflict markers
+        run: ./scripts/check-conflict-markers.sh
 
       - name: Install Rust
         if: needs.changes.outputs.docs_only != 'true'
