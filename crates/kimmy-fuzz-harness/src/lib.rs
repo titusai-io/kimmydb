@@ -640,6 +640,43 @@ mod tests {
         }
     }
 
+    /// `$bit`, a conditional `$pull` and the four `$bits*` filters run clean
+    /// over every fixture, the refused spellings included: a double or decimal
+    /// field, a BinData-free mask out of range, a mixed `$pull` document.
+    #[test]
+    fn bit_pull_conditions_and_bit_filters_run_clean_over_every_fixture() {
+        let updates = [
+            r#"{"$bit":{"qty":{"or":1},"n":{"and":3}}}"#,
+            r#"{"$bit":{"missing":{"xor":7},"_id":{"or":1}}}"#,
+            r#"{"$bit":{"price":{"and":1},"total":{"or":1}}}"#,
+            r#"{"$bit":{"missing":{"and":1.5}}}"#,
+            r#"{"$bit":{"x":{"or":{"$numberLong":"9223372036854775807"},"and":-1,"xor":3}}}"#,
+            r#"{"$pull":{"tags":{"$gte":1}}}"#,
+            r#"{"$pull":{"items":{"$elemMatch":{"qty":{"$gt":1}}}}}"#,
+            r#"{"$pull":{"n":{"$bitsAllSet":1}}}"#,
+            r#"{"$pull":{"tags":{"$gte":1,"sku":"a"}}}"#,
+            r#"{"$pull":{"items":{"sku":"a"}}}"#,
+            r#"{"$pull":{"tags":{"$regex":"^a","$not":{"$type":"string"}}}}"#,
+        ];
+        for update in updates {
+            update_parse_apply(update.as_bytes());
+        }
+        let filters = [
+            r#"{"qty":{"$bitsAllSet":5}}"#,
+            r#"{"n":{"$bitsAnySet":[0,63]}}"#,
+            r#"{"_id":{"$bitsAllClear":0}}"#,
+            r#"{"total":{"$bitsAnyClear":[]}}"#,
+            r#"{"price":{"$not":{"$bitsAllSet":1}}}"#,
+            r#"{"items":{"$elemMatch":{"qty":{"$bitsAnySet":8}}}}"#,
+            r#"{"qty":{"$bitsAllSet":-1}}"#,
+            r#"{"qty":{"$bitsAllSet":[64]}}"#,
+            r#"{"qty":{"$bitsAllSet":{"$binary":{"base64":"BQ==","subType":"00"}}}}"#,
+        ];
+        for filter in filters {
+            filter_parse(filter.as_bytes());
+        }
+    }
+
     /// The value targets over pseudo-random bytes, a few thousand inputs on
     /// the stable path: the generator draws a `Decimal128` as often as any
     /// number, so the key encoder's order is checked against the comparator

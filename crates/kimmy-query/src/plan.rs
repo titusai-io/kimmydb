@@ -858,6 +858,26 @@ mod tests {
     }
 
     #[test]
+    fn bit_tests_are_residual_and_never_answered_from_an_index() {
+        // A bit test selects no key range and proves nothing about a partial
+        // index, so it neither plans alone nor narrows a sibling equality.
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        for op in ["$bitsAllSet", "$bitsAnySet", "$bitsAllClear", "$bitsAnyClear"] {
+            assert!(plan(doc! { "a": { op: 5 } }, &idx).is_none(), "{op}");
+            assert!(plan(doc! { "a": { op: [0, 2] } }, &idx).is_none(), "{op}");
+            assert!(pk(doc! { "_id": { op: 5 } }).is_none(), "{op}");
+            let p = plan(doc! { "a": 8, "b": { op: 5 } }, &idx).expect("the equality plans");
+            assert_eq!(p.fields_used, 1, "{op}");
+            // Beside a range on the same field the range is all the plan has.
+            let p = plan(doc! { "a": { "$gte": 1, op: 5 } }, &idx).expect("the range plans");
+            assert_eq!(p.fields_used, 1, "{op}");
+        }
+        // And it is not a containment fact for a partial index.
+        let filter = crate::filter::parse(&doc! { "a": { "$bitsAllSet": 5 } }).unwrap();
+        assert!(containment_predicates(&filter).is_empty());
+    }
+
+    #[test]
     fn a_descending_range_swaps_which_end_each_bound_narrows() {
         // Descending encoding inverts bytes, reversing order — so the
         // value-space lower bound must cap the key-space *top*. The proof is

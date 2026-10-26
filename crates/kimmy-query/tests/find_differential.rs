@@ -378,3 +378,74 @@ fn every_numeric_comparison_answers_by_exact_value() {
     }
     assert!(checked > 9_000, "premise: {checked}");
 }
+
+/// The integer a value stands for as a bit pattern, by a rule written apart
+/// from the matcher's: a stored integer, or a double or decimal that is a
+/// whole number of at most 53 bits (decimals beyond that are not read here,
+/// because their text would be read through a double, and exponent forms).
+fn reference_bits(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Int32(n) => Some(i64::from(*n)),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 && d.abs() < 9.2e18 => Some(*d as i64),
+        Bson::Decimal128(d) => {
+            let text = d.to_string();
+            // An exponent form is read by the matcher's own unit tests; here
+            // a tiny value would parse to zero and be mistaken for one.
+            if text.contains('E') {
+                return None;
+            }
+            // A fraction that a double would round away is still a fraction.
+            if text.split_once('.').is_some_and(|(_, fraction)| fraction.chars().any(|c| c != '0'))
+            {
+                return None;
+            }
+            let x: f64 = text.parse().ok()?;
+            (x.is_finite() && x.fract() == 0.0 && x.abs() < 9_007_199_254_740_992.0)
+                .then_some(x as i64)
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn the_bit_operators_answer_as_a_bit_by_bit_reference_over_the_corpus() {
+    let masks: [i64; 7] = [0, 1, 5, 6, 255, 1 << 40, i64::MAX];
+    for v in values() {
+        // Skip a decimal the reference cannot read; the matcher's own rule
+        // for it is held by the unit tests.
+        if matches!(v, Bson::Decimal128(_)) && reference_bits(&v).is_none() {
+            continue;
+        }
+        let d = doc! {"_id": 0, "k": v.clone()};
+        for mask in masks {
+            let positions: Vec<i32> = (0..64).filter(|b| mask >> b & 1 == 1).collect();
+            for (op, test) in [
+                (
+                    "$bitsAllSet",
+                    (|x: u64, m: u64| (0..64).all(|b| m >> b & 1 == 0 || x >> b & 1 == 1))
+                        as fn(u64, u64) -> bool,
+                ),
+                ("$bitsAnySet", |x, m| (0..64).any(|b| m >> b & 1 == 1 && x >> b & 1 == 1)),
+                ("$bitsAllClear", |x, m| (0..64).all(|b| m >> b & 1 == 0 || x >> b & 1 == 0)),
+                ("$bitsAnyClear", |x, m| (0..64).any(|b| m >> b & 1 == 1 && x >> b & 1 == 0)),
+            ] {
+                // An array matches when one of its elements (not a nested array's) does.
+                let elements: Vec<&Bson> = match &v {
+                    Bson::Array(items) => items.iter().collect(),
+                    one => vec![one],
+                };
+                let want = elements
+                    .iter()
+                    .any(|e| reference_bits(e).is_some_and(|x| test(x as u64, mask as u64)));
+                for arg in [
+                    Bson::Int64(mask),
+                    Bson::Array(positions.iter().map(|p| Bson::Int32(*p)).collect()),
+                ] {
+                    let f = doc! {"k": {op: arg.clone()}};
+                    assert_eq!(answer(&f, &d), if want { "1" } else { "0" }, "{f:?} on {d:?}");
+                }
+            }
+        }
+    }
+}

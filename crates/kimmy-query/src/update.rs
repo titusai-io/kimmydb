@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::aggregate::group_key;
 use crate::expr::Expr;
-use crate::filter::{self, Filter};
+use crate::filter::{self, Filter, type_name_of as type_name};
 use crate::path;
 use crate::shape::{self, SortKey};
 
@@ -56,6 +56,9 @@ pub enum OpKind {
     Unset,
     Inc(Bson),
     Mul(Bson),
+    /// `$bit`: bitwise `and`, `or` and `xor` of an integer field, in the order
+    /// written. Each operand is an `Int32` or an `Int64`.
+    Bit(Vec<(BitOp, Bson)>),
     /// Set only if the new value is smaller than the current one.
     Min(Bson),
     /// Set only if the new value is larger than the current one.
@@ -67,6 +70,9 @@ pub enum OpKind {
     AddToSet(Vec<Bson>),
     /// Remove every element equal to this value.
     Pull(Bson),
+    /// Remove every element that satisfies this condition, parsed once with the
+    /// update (`$pull` with an all-operator document; see [`pull_is_condition`]).
+    PullWhere(Filter),
     /// Remove every element equal to any of these values.
     PullAll(Vec<Bson>),
     /// Remove the first (`-1`) or last (`1`) element.
@@ -84,17 +90,26 @@ impl OpKind {
             OpKind::Unset => "$unset",
             OpKind::Inc(_) => "$inc",
             OpKind::Mul(_) => "$mul",
+            OpKind::Bit(_) => "$bit",
             OpKind::Min(_) => "$min",
             OpKind::Max(_) => "$max",
             OpKind::Push(_) | OpKind::PushEach(_) => "$push",
             OpKind::AddToSet(_) => "$addToSet",
-            OpKind::Pull(_) => "$pull",
+            OpKind::Pull(_) | OpKind::PullWhere(_) => "$pull",
             OpKind::PullAll(_) => "$pullAll",
             OpKind::Pop(_) => "$pop",
             OpKind::Rename(_) => "$rename",
             OpKind::CurrentDate => "$currentDate",
         }
     }
+}
+
+/// One bitwise operation of a `$bit` specification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitOp {
+    And,
+    Or,
+    Xor,
 }
 
 /// `$push` with `$each` and its modifiers.
@@ -582,6 +597,7 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
         "unset" => OpKind::Unset,
         "inc" => OpKind::Inc(numeric(arg)?),
         "mul" => OpKind::Mul(numeric(arg)?),
+        "bit" => OpKind::Bit(parse_bit(arg)?),
         // `$min`, `$max`, `$pull` and `$pullAll` compare their operand with
         // what is stored through the canonical order, which places a
         // `Decimal128` by its exact value, so they take any operand.
@@ -595,7 +611,7 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
             Some(modifiers) => OpKind::AddToSet(parse_add_to_set_each(modifiers)?),
             None => OpKind::AddToSet(vec![arg.clone()]),
         },
-        "pull" => OpKind::Pull(arg.clone()),
+        "pull" => parse_pull(arg)?,
         "pullAll" => match arg {
             Bson::Array(values) => OpKind::PullAll(values.clone()),
             _ => return Err(Error::InvalidUpdate("$pullAll requires an array of values".into())),
@@ -614,6 +630,79 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
             return Err(Error::UnsupportedOperator { operator: format!("${other}"), reason: None });
         }
     })
+}
+
+/// Whether a `$pull` operand is a condition rather than a value to match.
+///
+/// The one place this is decided. A document every key of which starts with
+/// `$` is a condition, evaluated for each element with the filter matcher; any
+/// other operand (a scalar, an array, a document with no `$` key, the empty
+/// document) is a value, removed by canonical equality as `$pull` always has.
+/// A document with some `$` keys and some not is neither, and is refused by
+/// [`parse_pull`] rather than guessed at.
+fn pull_is_condition(operand: &Bson) -> bool {
+    matches!(operand, Bson::Document(d) if !d.is_empty() && d.keys().all(|k| k.starts_with('$')))
+}
+
+/// `$pull`: a condition for an all-operator document, a value otherwise.
+fn parse_pull(arg: &Bson) -> Result<OpKind> {
+    if let Bson::Document(doc) = arg
+        && pull_is_condition(arg)
+    {
+        return Ok(OpKind::PullWhere(filter::parse_condition_document(doc)?));
+    }
+    if let Bson::Document(doc) = arg
+        && let Some(operator) = doc.keys().find(|k| k.starts_with('$'))
+        && let Some(plain) = doc.keys().find(|k| !k.starts_with('$'))
+    {
+        return Err(Error::InvalidUpdate(format!(
+            "$pull cannot mix operators with plain fields in one document (found {operator:?} \
+             and {plain:?}); to remove the elements whose fields satisfy conditions, spell it \
+             {{\"$elemMatch\": {{...}}}}, as in {{\"$pull\": {{\"results\": {{\"$elemMatch\": \
+             {{\"score\": 8}}}}}}}}"
+        )));
+    }
+    Ok(OpKind::Pull(arg.clone()))
+}
+
+/// `$bit`'s specification: a non-empty document of `and`, `or` and `xor`, each
+/// with an `Int32` or `Int64` operand. A double is refused even where it holds
+/// an integral value: a bitwise operand is a bit pattern, and which pattern a
+/// double stands for is not something to guess.
+fn parse_bit(arg: &Bson) -> Result<Vec<(BitOp, Bson)>> {
+    let Bson::Document(spec) = arg else {
+        return Err(Error::InvalidUpdate(format!(
+            "$bit needs a document of and, or and xor operations per field, as in \
+             {{\"and\": 5}}; found {}",
+            type_name(arg)
+        )));
+    };
+    if spec.is_empty() {
+        return Err(Error::InvalidUpdate(
+            "$bit needs at least one of and, or and xor, as in {\"or\": 5}".into(),
+        ));
+    }
+    let mut steps = Vec::with_capacity(spec.len());
+    for (key, operand) in spec {
+        let op = match key.as_str() {
+            "and" => BitOp::And,
+            "or" => BitOp::Or,
+            "xor" => BitOp::Xor,
+            other => {
+                return Err(Error::InvalidUpdate(format!(
+                    "$bit does not know the operation {other:?}; use and, or or xor"
+                )));
+            }
+        };
+        if !matches!(operand, Bson::Int32(_) | Bson::Int64(_)) {
+            return Err(Error::InvalidUpdate(format!(
+                "$bit {key} needs an integer operand (int or long), found {}",
+                type_name(operand)
+            )));
+        }
+        steps.push((op, operand.clone()));
+    }
+    Ok(steps)
 }
 
 /// The argument as a modifier document, if that is what it is.
@@ -962,6 +1051,12 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             set(doc, arithmetic(&base, factor, Arith::Mul, &op.path)?)?;
         }
 
+        OpKind::Bit(steps) => {
+            // An absent field starts at zero, so `or` and `xor` create it.
+            let base = current.unwrap_or(Bson::Int32(0));
+            set(doc, bitwise(&base, steps, &op.path)?)?;
+        }
+
         OpKind::Min(candidate) => {
             let replace = match &current {
                 Some(existing) => canonical_cmp(candidate, existing) == Ordering::Less,
@@ -1036,6 +1131,19 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             set(doc, Bson::Array(kept))?;
         }
 
+        OpKind::PullWhere(condition) => {
+            let Some(Bson::Array(items)) = current else {
+                return Ok(());
+            };
+            let mut kept = Vec::with_capacity(items.len());
+            for item in items {
+                if !filter::matches_pull_element(condition, &item)? {
+                    kept.push(item);
+                }
+            }
+            set(doc, Bson::Array(kept))?;
+        }
+
         OpKind::PullAll(values) => {
             // Each listed value is matched as `$pull` matches a literal —
             // canonical equality, so `2` removes `2.0`. Pulling from a missing
@@ -1090,6 +1198,50 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `$bit` over the stored value: each step in turn, the result an `Int32`
+/// while the stored value and every operand are, an `Int64` once any is one
+/// (the rule `$inc` follows, without its widening: two 32-bit results never
+/// leave 32 bits). Only an integer, or an absent field read as `0`, has bits.
+fn bitwise(base: &Bson, steps: &[(BitOp, Bson)], path: &str) -> Result<Bson> {
+    let (mut value, mut wide) = match base {
+        Bson::Int32(n) => (i64::from(*n), false),
+        Bson::Int64(n) => (*n, true),
+        other => {
+            return Err(Error::InvalidUpdate(format!(
+                "cannot apply $bit to field {path:?} of type {}: it must be an int or a long",
+                type_name(other)
+            )));
+        }
+    };
+    for (op, operand) in steps {
+        let operand = match operand {
+            Bson::Int32(n) => i64::from(*n),
+            Bson::Int64(n) => {
+                wide = true;
+                *n
+            }
+            // `parse_bit` admits only integers; refuse rather than guess.
+            other => {
+                return Err(Error::InvalidUpdate(format!(
+                    "$bit needs an integer operand, found {}",
+                    type_name(other)
+                )));
+            }
+        };
+        value = match op {
+            BitOp::And => value & operand,
+            BitOp::Or => value | operand,
+            BitOp::Xor => value ^ operand,
+        };
+    }
+    // Sign-extended 32-bit operands give a result that fits 32 bits whenever
+    // every input did, so the narrowing cannot fail for a narrow result.
+    Ok(match (wide, i32::try_from(value)) {
+        (false, Ok(n)) => Bson::Int32(n),
+        _ => Bson::Int64(value),
+    })
 }
 
 enum Arith {
@@ -2898,6 +3050,326 @@ mod tests {
     #[test]
     fn set_on_insert_may_not_touch_id() {
         assert!(parse(&doc! { "$setOnInsert": { "_id": 1 } }).is_err());
+    }
+
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
+    }
+
+    // -- $bit ----------------------------------------------------------------
+
+    #[test]
+    fn bit_applies_and_or_xor() {
+        assert_eq!(
+            applied(doc! { "$bit": { "n": { "and": 6 } } }, doc! { "n": 12 }),
+            doc! { "n": 4 }
+        );
+        assert_eq!(
+            applied(doc! { "$bit": { "n": { "or": 3 } } }, doc! { "n": 12 }),
+            doc! { "n": 15 }
+        );
+        assert_eq!(
+            applied(doc! { "$bit": { "n": { "xor": 5 } } }, doc! { "n": 12 }),
+            doc! { "n": 9 }
+        );
+        // Negative values are two's complement.
+        assert_eq!(
+            applied(doc! { "$bit": { "n": { "and": 255 } } }, doc! { "n": -1 }),
+            doc! { "n": 255 }
+        );
+        // Several fields, and a nested path.
+        assert_eq!(
+            applied(
+                doc! { "$bit": { "a": { "or": 1 }, "b.c": { "xor": 1 } } },
+                doc! { "a": 2, "b": { "c": 3 } }
+            ),
+            doc! { "a": 3, "b": { "c": 2 } }
+        );
+    }
+
+    #[test]
+    fn bit_applies_the_operations_of_one_spec_in_the_order_written() {
+        let out =
+            applied(doc! { "$bit": { "n": { "or": 8, "and": 12, "xor": 5 } } }, doc! { "n": 3 });
+        // (3 | 8) = 11; 11 & 12 = 8; 8 ^ 5 = 13.
+        assert_eq!(out, doc! { "n": 13 });
+        let out =
+            applied(doc! { "$bit": { "n": { "xor": 5, "and": 12, "or": 8 } } }, doc! { "n": 3 });
+        // (3 ^ 5) = 6; 6 & 12 = 4; 4 | 8 = 12.
+        assert_eq!(out, doc! { "n": 12 });
+    }
+
+    #[test]
+    fn bit_types_its_result_as_inc_types_integer_sums() {
+        let ty = |d: Document| d.get("n").cloned().unwrap();
+        // Two int32 stay int32, even with the high bit set.
+        assert_eq!(
+            ty(applied(doc! { "$bit": { "n": { "or": i32::MIN } } }, doc! { "n": 1_i32 })),
+            Bson::Int32(i32::MIN | 1)
+        );
+        // An int64 operand or a stored int64 gives int64.
+        assert_eq!(
+            ty(applied(doc! { "$bit": { "n": { "and": 3_i64 } } }, doc! { "n": 7_i32 })),
+            Bson::Int64(3)
+        );
+        assert_eq!(
+            ty(applied(doc! { "$bit": { "n": { "and": 3_i32 } } }, doc! { "n": 7_i64 })),
+            Bson::Int64(3)
+        );
+        assert_eq!(
+            ty(applied(doc! { "$bit": { "n": { "or": 1_i64 << 40 } } }, doc! { "n": 1_i32 })),
+            Bson::Int64((1_i64 << 40) | 1)
+        );
+        // A later int64 operand widens the whole result.
+        assert_eq!(
+            ty(applied(
+                doc! { "$bit": { "n": { "and": 1_i32, "or": 0_i64 } } },
+                doc! { "n": 7_i32 }
+            )),
+            Bson::Int64(1)
+        );
+        // Negative int32s: -1 & -2 stays int32.
+        assert_eq!(
+            ty(applied(doc! { "$bit": { "n": { "and": -2_i32 } } }, doc! { "n": -1_i32 })),
+            Bson::Int32(-2)
+        );
+    }
+
+    #[test]
+    fn bit_creates_a_missing_field_from_zero() {
+        assert_eq!(applied(doc! { "$bit": { "n": { "and": 7 } } }, doc! {}), doc! { "n": 0 });
+        assert_eq!(applied(doc! { "$bit": { "n": { "or": 7 } } }, doc! {}), doc! { "n": 7 });
+        assert_eq!(
+            applied(doc! { "$bit": { "n": { "xor": 7 } } }, doc! { "m": 1 }),
+            doc! { "m": 1, "n": 7 }
+        );
+        assert_eq!(
+            applied(doc! { "$bit": { "a.b": { "or": 7_i64 } } }, doc! {}),
+            doc! { "a": { "b": 7_i64 } }
+        );
+    }
+
+    #[test]
+    fn bit_that_changes_nothing_leaves_the_document_equal() {
+        // The storage layer reports "no change" by comparing the bytes
+        // before and after, as for `$inc: 0`.
+        let before = doc! { "n": 12_i32 };
+        assert_eq!(applied(doc! { "$bit": { "n": { "and": -1 } } }, before.clone()), before);
+        assert_eq!(applied(doc! { "$bit": { "n": { "or": 0 } } }, before.clone()), before);
+        assert_eq!(applied(doc! { "$bit": { "n": { "xor": 0 } } }, before.clone()), before);
+        assert_eq!(applied(doc! { "$bit": { "n": { "or": 4 } } }, before.clone()), before);
+        // A wider operand changes the type, as `$inc` by an int64 zero does.
+        assert_ne!(applied(doc! { "$bit": { "n": { "or": 0_i64 } } }, before.clone()), before);
+    }
+
+    #[test]
+    fn bit_refuses_what_it_cannot_apply() {
+        for (update, doc, needle) in [
+            (doc! { "$bit": { "n": { "and": 1 } } }, doc! { "n": 1.5 }, "\"n\" of type double"),
+            (doc! { "$bit": { "n": { "and": 1 } } }, doc! { "n": 2.0 }, "of type double"),
+            (doc! { "$bit": { "n": { "and": 1 } } }, doc! { "n": "x" }, "of type string"),
+            (doc! { "$bit": { "n": { "and": 1 } } }, doc! { "n": [1] }, "of type array"),
+            (doc! { "$bit": { "n": { "and": 1 } } }, doc! { "n": Bson::Null }, "of type null"),
+            (doc! { "$bit": { "n": { "and": 1 } } }, doc! { "n": dec("5") }, "of type decimal"),
+            (doc! { "$bit": { "n": { "and": 1.0 } } }, doc! { "n": 1 }, "integer operand"),
+            (doc! { "$bit": { "n": { "or": dec("1") } } }, doc! { "n": 1 }, "integer operand"),
+            (doc! { "$bit": { "n": { "xor": "1" } } }, doc! { "n": 1 }, "integer operand"),
+            (doc! { "$bit": { "n": { "nand": 1 } } }, doc! { "n": 1 }, "use and, or or xor"),
+            (doc! { "$bit": { "n": { "and": 1, "not": 1 } } }, doc! { "n": 1 }, "\"not\""),
+            (doc! { "$bit": { "n": {} } }, doc! { "n": 1 }, "at least one of and, or and xor"),
+            (doc! { "$bit": { "n": 5 } }, doc! { "n": 1 }, "$bit needs a document"),
+            (doc! { "$bit": { "n": [1] } }, doc! { "n": 1 }, "$bit needs a document"),
+        ] {
+            let message = apply_err(update.clone(), doc);
+            assert!(message.contains(needle), "{update}: {message}");
+        }
+        // An operation that fails leaves the document as it was.
+        let mut d = doc! { "a": 1, "n": 1.5 };
+        let parsed = parse(&doc! { "$bit": { "a": { "or": 2 }, "n": { "or": 1 } } }).unwrap();
+        assert!(apply(&parsed, &mut d, NOW).is_err());
+    }
+
+    #[test]
+    fn bit_takes_part_in_the_path_conflict_check() {
+        let message = conflict_err(doc! { "$bit": { "n": { "or": 1 } }, "$inc": { "n": 1 } });
+        assert!(message.contains("$bit") && message.contains("$inc"), "{message}");
+        let message = conflict_err(doc! { "$set": { "a": {} }, "$bit": { "a.n": { "or": 1 } } });
+        assert!(message.contains("$bit"), "{message}");
+        assert!(parse(&doc! { "$bit": { "a": { "or": 1 }, "b": { "or": 1 } } }).is_ok());
+    }
+
+    #[test]
+    fn bit_works_through_positional_paths() {
+        let out = applied_with(
+            doc! { "$bit": { "items.$[].f": { "or": 1 } } },
+            vec![],
+            doc! { "items": [{ "f": 2 }, { "f": 4 }] },
+        );
+        assert_eq!(out, doc! { "items": [{ "f": 3 }, { "f": 5 }] });
+        let out = applied_with(
+            doc! { "$bit": { "items.$[line].f": { "xor": 1 } } },
+            vec![doc! { "line.k": "x" }],
+            doc! { "items": [{ "k": "x", "f": 2 }, { "k": "y", "f": 4 }] },
+        );
+        assert_eq!(out, doc! { "items": [{ "k": "x", "f": 3 }, { "k": "y", "f": 4 }] });
+    }
+
+    // -- $pull with a condition ----------------------------------------------
+
+    fn results() -> Document {
+        doc! { "results": [
+            { "score": 8, "item": "A" },
+            { "score": 8, "item": "B" },
+            { "score": 8 },
+            { "score": 7, "item": "C" },
+        ] }
+    }
+
+    #[test]
+    fn pull_with_an_all_operator_document_is_a_condition() {
+        assert_eq!(
+            applied(doc! { "$pull": { "v": { "$gte": 6 } } }, doc! { "v": [0, 5, 6, 7, 2.5, 9.5] }),
+            doc! { "v": [0, 5, 2.5] }
+        );
+        assert_eq!(
+            applied(doc! { "$pull": { "v": { "$gt": 1, "$lt": 5 } } }, doc! { "v": [1, 2, 4, 5] }),
+            doc! { "v": [1, 5] }
+        );
+        assert_eq!(
+            applied(doc! { "$pull": { "v": { "$in": [1, 2] } } }, doc! { "v": [1, 2, 3, 2.0] }),
+            doc! { "v": [3] }
+        );
+        assert_eq!(
+            applied(doc! { "$pull": { "v": { "$not": { "$gt": 2 } } } }, doc! { "v": [1, 2, 3] }),
+            doc! { "v": [3] }
+        );
+        assert_eq!(
+            applied(doc! { "$pull": { "v": { "$regex": "^a" } } }, doc! { "v": ["ab", "ba", 5] }),
+            doc! { "v": ["ba", 5] }
+        );
+        assert_eq!(
+            applied(doc! { "$pull": { "v": { "$bitsAllSet": 4 } } }, doc! { "v": [1, 4, 6, "4"] }),
+            doc! { "v": [1, "4"] }
+        );
+    }
+
+    #[test]
+    fn pull_elem_match_removes_the_documents_whose_fields_match() {
+        let out =
+            applied(doc! { "$pull": { "results": { "$elemMatch": { "score": 8 } } } }, results());
+        assert_eq!(out, doc! { "results": [{ "score": 7, "item": "C" }] });
+        let out = applied(
+            doc! { "$pull": { "results": { "$elemMatch": { "score": { "$gte": 8 }, "item": "B" } } } },
+            results(),
+        );
+        assert_eq!(out.get_array("results").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn pull_with_a_plain_document_matches_the_whole_element() {
+        // `{score: 8}` is not a condition: it removes only the elements equal
+        // to it, not the superset `{score: 8, item: "B"}`.
+        let out = applied(doc! { "$pull": { "results": { "score": 8 } } }, results());
+        assert_eq!(
+            out,
+            doc! { "results": [
+                { "score": 8, "item": "A" },
+                { "score": 8, "item": "B" },
+                { "score": 7, "item": "C" },
+            ] }
+        );
+        // Field order counts, as it always has.
+        let out = applied(
+            doc! { "$pull": { "r": { "a": 1, "b": 2 } } },
+            doc! { "r": [{ "b": 2, "a": 1 }, { "a": 1, "b": 2 }] },
+        );
+        assert_eq!(out, doc! { "r": [{ "b": 2, "a": 1 }] });
+        // The empty document is a value too: it removes the empty documents.
+        let out = applied(doc! { "$pull": { "r": {} } }, doc! { "r": [{}, { "a": 1 }, 5] });
+        assert_eq!(out, doc! { "r": [{ "a": 1 }, 5] });
+    }
+
+    #[test]
+    fn pull_with_a_mixed_document_is_refused_saying_how_to_spell_it() {
+        for operand in [
+            doc! { "$gte": 6, "score": 8 },
+            doc! { "score": 8, "$lt": 3 },
+            doc! { "a": 1, "$elemMatch": { "b": 1 } },
+        ] {
+            let message = apply_err(doc! { "$pull": { "r": operand.clone() } }, results());
+            assert!(
+                message.contains("$pull cannot mix operators with plain fields")
+                    && message.contains("$elemMatch"),
+                "{operand}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn pull_with_a_non_document_operand_is_unchanged() {
+        assert_eq!(
+            applied(doc! { "$pull": { "tags": "a" } }, doc! { "tags": ["a", "b", "a"] }),
+            doc! { "tags": ["b"] }
+        );
+        assert_eq!(
+            applied(doc! { "$pull": { "v": 2 } }, doc! { "v": [1, 2.0, 3] }),
+            doc! { "v": [1, 3] }
+        );
+        // An array operand removes the elements equal to that array.
+        assert_eq!(
+            applied(doc! { "$pull": { "v": [1, 2] } }, doc! { "v": [[1, 2], [1], 3] }),
+            doc! { "v": [[1], 3] }
+        );
+    }
+
+    #[test]
+    fn pull_condition_errors_are_found_when_the_update_is_parsed() {
+        // Before any document or element is looked at.
+        for (operand, needle) in [
+            (doc! { "$nope": 1 }, "unsupported operator"),
+            (doc! { "$in": 5 }, "$in requires an array"),
+            (doc! { "$bitsAllSet": -1 }, "non-negative"),
+            (doc! { "$gte": 1, "$regex": "(" }, ""),
+        ] {
+            let message = parse(&doc! { "$pull": { "v": operand.clone() } })
+                .expect_err(&format!("{operand} must not parse"))
+                .to_string();
+            assert!(message.contains(needle), "{operand}: {message}");
+        }
+    }
+
+    #[test]
+    fn pull_condition_leaves_a_missing_field_alone_and_refuses_a_non_array_as_before() {
+        assert_eq!(
+            applied(doc! { "$pull": { "v": { "$gte": 1 } } }, doc! { "b": 1 }),
+            doc! { "b": 1 }
+        );
+        // As an equality `$pull` does today, a scalar field is left alone.
+        assert_eq!(
+            applied(doc! { "$pull": { "v": { "$gte": 1 } } }, doc! { "v": 5 }),
+            doc! { "v": 5 }
+        );
+    }
+
+    #[test]
+    fn pull_condition_works_through_a_positional_path_and_conflicts_like_pull() {
+        let out = applied_with(
+            doc! { "$pull": { "items.$[line].tags": { "$in": ["x", "y"] } } },
+            vec![doc! { "line.k": 1 }],
+            doc! { "items": [{ "k": 1, "tags": ["x", "z"] }, { "k": 2, "tags": ["x"] }] },
+        );
+        assert_eq!(out, doc! { "items": [{ "k": 1, "tags": ["z"] }, { "k": 2, "tags": ["x"] }] });
+        let message = conflict_err(doc! { "$push": { "t": "x" }, "$pull": { "t": { "$gt": 1 } } });
+        assert!(message.contains("$pull"), "{message}");
+    }
+
+    #[test]
+    fn pull_all_still_compares_operator_documents_as_plain_documents() {
+        let out = applied(
+            doc! { "$pullAll": { "v": [{ "$gte": 6 }] } },
+            doc! { "v": [7, { "$gte": 6 }, 1] },
+        );
+        assert_eq!(out, doc! { "v": [7, 1] });
     }
 }
 
