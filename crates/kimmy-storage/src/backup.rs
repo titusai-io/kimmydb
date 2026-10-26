@@ -14,12 +14,19 @@
 //!
 //! # What a backup contains
 //!
-//! Every table a restored node cannot rebuild for itself, including secondary
-//! index entries. Three are deliberately omitted because they are re-derived:
-//! `OPLOG_WITNESSED` and `OPLOG_COLLECTED` by the first open, and `OPLOG_HELD`
-//! (ADR-160) by [`restore`] itself, from the backup's own vector (ADR-244) --
-//! and the tag list below is hand-written in both directions, so a table added
-//! to it makes every backup this build writes unrestorable by an older one.
+//! Eleven tables, the ones a restored node cannot rebuild for itself, including
+//! secondary index entries: `META`, `DATABASES`, `COLLECTIONS`, `DOCS`,
+//! `INDEX_ENTRIES`, `OPLOG`, `OPLOG_ARRIVAL`, `OPLOG_ARRIVAL_SEQ`,
+//! `COLLECTIONS_DROPPED`, `OPLOG_VERSIONS` and `INDEXES_DROPPED`. The other ten
+//! are node-local or derived and are left out: the live counts and digests and
+//! the marks they are current through, `UNIQUE_VIOLATIONS`, `VECTOR_VERIFIED`
+//! and `SNAPSHOT_PROGRESS`, which the first open rebuilds or a restore must not
+//! carry, `OPLOG_WITNESSED` and `OPLOG_COLLECTED`, which the first open derives,
+//! and `OPLOG_HELD` (ADR-160), which [`restore`] derives itself from the backup's
+//! own vector (ADR-244). `every_table_is_either_carried_by_a_backup_or_named_as_not`
+//! makes a new table in `tables.rs` say which it is. The tag list below is
+//! hand-written in both directions, so a table added to it makes every backup
+//! this build writes unrestorable by an older one.
 //!
 //! Index entries are derivable
 //! from documents, so omitting them would make backups smaller — and would make
@@ -595,6 +602,141 @@ mod tests {
         assert!(metas > 0, "the backup carries META");
         assert!(tags[metas..].iter().all(|&t| t != T_META), "every META record leads: {tags:?}");
         assert!(metas < tags.len(), "and other tables follow it");
+    }
+
+    /// The tables a backup carries, by their name in `tables.rs`.
+    const CARRIED: &[&str] = &[
+        "META",
+        "DATABASES",
+        "COLLECTIONS",
+        "DOCS",
+        "INDEX_ENTRIES",
+        "OPLOG",
+        "OPLOG_ARRIVAL",
+        "OPLOG_ARRIVAL_SEQ",
+        "COLLECTIONS_DROPPED",
+        "OPLOG_VERSIONS",
+        "INDEXES_DROPPED",
+    ];
+
+    /// The tables it does not, and why. Each is node-local or derived; the doc
+    /// comment of each in `tables.rs` says which.
+    const NOT_CARRIED: &[(&str, &str)] = &[
+        ("LIVE_COUNTS", "a node-local count, rebuilt by the first open"),
+        ("LIVE_COUNTS_THROUGH", "the position LIVE_COUNTS is current through"),
+        ("LIVE_DIGESTS", "a node-local digest, rebuilt by the first open"),
+        ("LIVE_DIGESTS_THROUGH", "the position LIVE_DIGESTS is current through"),
+        ("OPLOG_WITNESSED", "derived from the oplog by the first open"),
+        ("OPLOG_COLLECTED", "derived by the first open"),
+        ("OPLOG_HELD", "re-derived by `restore` from the backup's vector (ADR-244)"),
+        ("UNIQUE_VIOLATIONS", "derived from the oplog"),
+        (
+            "VECTOR_VERIFIED",
+            "the record that the vector covers the oplog, which a restore can break",
+        ),
+        (
+            "SNAPSHOT_PROGRESS",
+            "the resume cursor of a pull in flight, which must not outlive its records",
+        ),
+    ];
+
+    /// The names `source` declares as `pub const NAME: TableDefinition<..>`.
+    fn declared_tables(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("pub const ")?;
+                let (name, ty) = rest.split_once(':')?;
+                ty.trim_start().starts_with("TableDefinition").then_some(name)
+            })
+            .collect()
+    }
+
+    /// A table added to `tables.rs` is a decision about backups: carried, or
+    /// named here as not and why. Without this, a new table silently stays out
+    /// of every backup, and two documents said otherwise for months.
+    #[test]
+    fn every_table_is_either_carried_by_a_backup_or_named_as_not() {
+        let declared = declared_tables(include_str!("tables.rs"));
+        assert!(declared.len() >= 20, "premise: tables.rs declares its tables: {declared:?}");
+        let classified: Vec<&str> =
+            CARRIED.iter().copied().chain(NOT_CARRIED.iter().map(|(name, _)| *name)).collect();
+        for name in &declared {
+            assert!(
+                classified.contains(name),
+                "{name} is in tables.rs and neither carried by a backup nor listed as not: add \
+                 it to CARRIED (with a tag and a read arm) or to NOT_CARRIED with the reason"
+            );
+        }
+        for name in &classified {
+            assert!(declared.contains(name), "{name} is classified here and not in tables.rs");
+        }
+        let mut sorted = classified.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), classified.len(), "a table is classified twice");
+    }
+
+    /// The write side reads exactly the carried tables, and the stream has a
+    /// record for each of them, so CARRIED is neither stale nor aspirational.
+    #[test]
+    fn the_carried_tables_are_the_ones_the_backup_reads_and_writes() {
+        let source = include_str!("backup.rs");
+        let write_side = &source
+            [source.find("pub fn backup_to").unwrap()..source.find("pub fn restore(").unwrap()];
+        let mut read: Vec<&str> = declared_tables(include_str!("tables.rs"))
+            .into_iter()
+            .filter(|name| write_side.contains(&format!("tables::{name},")))
+            .collect();
+        read.sort();
+        let mut carried = CARRIED.to_vec();
+        carried.sort();
+        assert_eq!(read, carried, "backup_to reads a different set than CARRIED");
+
+        let (engine, _dir) = populated();
+        let mut out = Vec::new();
+        engine.backup_to(&mut out, crate::WalkScope::Request).unwrap();
+        let mut rest = &out[8 + 1 + 16 + 8..];
+        let mut tags = std::collections::BTreeSet::new();
+        while rest[0] != END {
+            tags.insert(rest[0]);
+            rest = &rest[1..];
+            read_chunk(&mut rest).unwrap();
+            read_chunk(&mut rest).unwrap();
+        }
+        assert_eq!(
+            tags.into_iter().collect::<Vec<u8>>(),
+            (1..=CARRIED.len() as u8).collect::<Vec<u8>>(),
+            "a populated engine's backup carries one tag per carried table, 1 to {}",
+            CARRIED.len()
+        );
+    }
+
+    /// Every tag is declared once and read by `restore`, which refuses an
+    /// unknown one: a tag with no arm writes a backup nothing can restore.
+    #[test]
+    fn every_tag_is_unique_and_has_a_read_arm() {
+        let source = include_str!("backup.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        let tags: Vec<(&str, u8)> = production
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("const T_")?;
+                let (name, value) = rest.split_once(": u8 = ")?;
+                Some((name, value.trim_end_matches(';').parse().ok()?))
+            })
+            .collect();
+        assert_eq!(tags.len(), CARRIED.len(), "one tag per carried table: {tags:?}");
+        let mut values: Vec<u8> = tags.iter().map(|(_, v)| *v).collect();
+        values.sort();
+        values.dedup();
+        assert_eq!(values.len(), tags.len(), "a tag value is used twice: {tags:?}");
+        for (name, _) in &tags {
+            assert!(
+                production.contains(&format!("T_{name} =>")),
+                "T_{name} has no read arm in restore"
+            );
+        }
     }
 
     /// An engine holding a bit of everything a backup has to carry.

@@ -1759,6 +1759,9 @@ gauge at all: an alert that cries wolf on a healthy cluster is the one an
 operator disables, landing back in the exact blind spot this gauge exists to
 close.
 
+Which vector each side of this gate reads, and why, is in
+[Which vector answers which question](oplog.md#which-vector-answers-which-question).
+
 **Behind and standing still is a different thing from behind and catching
 up** ([ADR-145](decisions.md)). A member whose inbound replication has
 stopped is behind for good, and the rule above, on its own, deferred the
