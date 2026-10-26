@@ -193,7 +193,7 @@ pub struct Engine {
     /// path that takes and releases the writer in a tight loop is made to
     /// hand it over rather than winning every time against a thread that
     /// was woken and had to race for it.
-    writer_gate: parking_lot::Mutex<()>,
+    writer_gate: WriterGate,
     /// Which hold has the writer, and since when, for the yield evaluator
     /// (ADR-220).
     writer_hold: Arc<crate::writer_hold::WriterHoldWord>,
@@ -481,6 +481,53 @@ impl WriterHolder {
     /// states: a build or an index drop that never ends is not detected.
     pub const fn is_unbounded(self) -> bool {
         matches!(self, Self::IndexBuild | Self::IndexDrop | Self::Rewind)
+    }
+}
+
+/// The queue for the single writer (ADR-151): a mutex that, in a test build,
+/// counts how many times it was taken.
+///
+/// A newtype so that the field is the only way to the lock and the count cannot
+/// be skipped by a path that takes it: every acquisition goes through `lock` or
+/// `try_lock_for`.
+struct WriterGate {
+    gate: parking_lot::Mutex<()>,
+    #[cfg(test)]
+    acquired: std::sync::atomic::AtomicU64,
+}
+
+impl WriterGate {
+    fn new() -> Self {
+        Self {
+            gate: parking_lot::Mutex::new(()),
+            #[cfg(test)]
+            acquired: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        let guard = self.gate.lock();
+        self.took();
+        guard
+    }
+
+    fn try_lock_for(&self, cap: std::time::Duration) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        let guard = self.gate.try_lock_for(cap)?;
+        self.took();
+        Some(guard)
+    }
+
+    #[cfg(test)]
+    fn try_lock(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        let guard = self.gate.try_lock()?;
+        self.took();
+        Some(guard)
+    }
+
+    #[inline]
+    fn took(&self) {
+        #[cfg(test)]
+        self.acquired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1511,7 +1558,7 @@ impl Engine {
             durability_violations: Default::default(),
             fsyncs: std::sync::atomic::AtomicU64::new(0),
             grouped_commits: std::sync::atomic::AtomicU64::new(0),
-            writer_gate: parking_lot::Mutex::new(()),
+            writer_gate: WriterGate::new(),
             writer_hold: Arc::new(crate::writer_hold::WriterHoldWord::new()),
             writer_wait_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             writer_wait_count: std::sync::atomic::AtomicU64::new(0),
@@ -1634,6 +1681,14 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn try_raw_gate_for_test(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
         self.writer_gate.try_lock()
+    }
+
+    /// How many times the writer gate has been taken, by any path: a test's way
+    /// to ask whether every acquisition was one something measured
+    /// (`every_acquisition_of_the_writer_gate_is_a_measured_hold`).
+    #[cfg(test)]
+    pub(crate) fn writer_gate_acquisitions(&self) -> u64 {
+        self.writer_gate.acquired.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The word that says which hold has the writer, and since when. Cloned
@@ -6208,6 +6263,111 @@ mod tests {
              undercounts them and every conclusion drawn from it is wrong:\n  {}",
             offenders.join("\n  ")
         );
+    }
+
+    /// The other half of the claim `commits_are_counted_at_one_chokepoint`
+    /// makes for commits, made for the writer itself: a hold nothing measured
+    /// is a stall nothing can attribute, and the way it appears is a path that
+    /// takes `writer_gate` and builds no hold on it.
+    ///
+    /// Behavioural, because that text match cannot see a lock: the gate counts
+    /// its own acquisitions in a test build, and after one of every path that
+    /// takes it, each acquisition is exactly one recorded hold. A new path that
+    /// takes the gate and measures nothing leaves the counts apart. The one
+    /// exemption is `close_writes`, which takes the writer to prove no
+    /// transaction holds it, writes nothing and measures no hold of its own (a
+    /// last flush it runs goes through the measured one); it is accounted for
+    /// below by name and not by a tolerance, so a second one is not absorbed.
+    #[test]
+    fn every_acquisition_of_the_writer_gate_is_a_measured_hold() {
+        let holds = |engine: &Engine| -> u64 { engine.writer_hold().count.iter().sum() };
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
+        drop(engine.hold_writer(WriterHolder::Write));
+        // The coalescing barrier's leader takes the writer without opening a
+        // counted transaction: the one path that did, once, and was unmeasured.
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(2));
+        engine.insert(&coll, bson::doc! { "_id": 2 }).unwrap();
+        engine.insert(&coll, bson::doc! { "_id": 3 }).unwrap();
+        let flushes = engine.flush_starts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(flushes >= 1, "premise: the barrier's leader took the writer: {flushes}");
+
+        let taken = engine.writer_gate_acquisitions();
+        assert!(taken >= 6, "premise: the paths above took the gate: {taken}");
+        assert_eq!(taken, holds(&engine), "a path takes the writer gate and measures no hold");
+
+        assert!(engine.close_writes(std::time::Duration::from_secs(5)));
+        assert_eq!(engine.writer_gate_acquisitions(), taken + 1, "close_writes took it once");
+        assert_eq!(holds(&engine), taken, "and measured no hold, as it says it does not");
+    }
+
+    /// Where `writer_gate` is locked is a short list, and a new entry on it is a
+    /// decision about metering: the allowlist names each function, and a
+    /// function on it must be one that builds a hold or meters the wait.
+    ///
+    /// The behavioural test above catches an unmeasured acquisition on a path it
+    /// runs; this catches the one nothing runs yet. `writer_gate` is private to
+    /// this module, so no other file can name it, and the scan reads this one.
+    #[test]
+    fn the_writer_gate_is_locked_in_a_known_few_functions() {
+        let source = include_str!("engine.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        let lines: Vec<&str> = production.lines().collect();
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            let code = line.trim_start();
+            let locks = ["writer_gate.lock(", "writer_gate.try_lock_for(", "writer_gate.try_lock("];
+            if code.starts_with("//") || !locks.iter().any(|lock| code.contains(lock)) {
+                continue;
+            }
+            let name = lines[..=n]
+                .iter()
+                .rev()
+                .find_map(|l| {
+                    let head = l.trim_start();
+                    let at = head.find("fn ")?;
+                    let (prefix, rest) = head.split_at(at);
+                    prefix
+                        .split_whitespace()
+                        .all(|w| w.starts_with("pub") || ["async", "const", "unsafe"].contains(&w))
+                        .then(|| rest[3..].split(['(', '<']).next().unwrap_or("").to_string())
+                })
+                .expect("a lock site is inside a function");
+            found.push((name, code.to_string()));
+        }
+        // function -> what makes its acquisition measured
+        const ALLOWED: &[(&str, &str)] = &[
+            ("begin_write_as", "record_writer_wait("),
+            ("flush_now", "meter_writer_wait("),
+            ("hold_writer", "WriterHold::new("),
+            (
+                "close_writes",
+                "exempt: see `every_acquisition_of_the_writer_gate_is_a_measured_hold`",
+            ),
+            ("try_raw_gate_for_test", "exempt: a test's raw look at the gate"),
+        ];
+        for (name, code) in &found {
+            let Some((_, measure)) = ALLOWED.iter().find(|(allowed, _)| allowed == name) else {
+                panic!(
+                    "`{name}` locks the writer gate ({code}) and is not on the list: build a \
+                     `WriterHold` on it or meter the wait, then add it to ALLOWED with which"
+                );
+            };
+            if !measure.starts_with("exempt") {
+                let start = production.find(&format!("fn {name}(")).expect("the function");
+                let body = &production[start..];
+                let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+                assert!(body.contains(measure), "`{name}` locks the gate and never {measure}");
+            }
+        }
+        for (allowed, _) in ALLOWED {
+            assert!(
+                found.iter().any(|(name, _)| name == allowed),
+                "{allowed} is on the list and no longer locks the gate: remove it"
+            );
+        }
+        assert!(found.len() >= 6, "premise: the scan found the lock sites: {found:?}");
     }
 
     /// The same invariant checked against the source, because the way it
