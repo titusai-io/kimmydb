@@ -2172,6 +2172,12 @@ fn run_stages(
                 limits,
                 vars,
             )?,
+            aggregate::Stage::Facet(facets) => {
+                let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
+                    run_stages(state, auth, db, sub, input, limits, vars)
+                })?;
+                vec![answer]
+            }
             other => aggregate::apply_with_vars(other, docs, limits, vars)?,
         };
     }

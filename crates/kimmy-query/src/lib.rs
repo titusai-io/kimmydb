@@ -21,6 +21,8 @@ pub mod update;
 mod decimal_arith_tests;
 #[cfg(test)]
 mod math_tests;
+#[cfg(test)]
+mod facet_tests;
 
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};

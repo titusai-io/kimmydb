@@ -130,6 +130,10 @@ pub enum Stage {
         as_field: String,
         join: Join,
     },
+    /// `$facet`: several sub-pipelines over the same input, answered as one
+    /// document holding each one's output under its name (ADR-254). Run by
+    /// [`run_facet`], which the caller gives the way to run a sub-pipeline.
+    Facet(Vec<(String, Vec<Stage>)>),
 }
 
 /// The fields of a `$vectorSearch` stage: the endpoint's own request fields
@@ -253,7 +257,13 @@ impl Lead {
 impl Stage {
     /// Whether running this stage needs a storage handle.
     pub fn needs_storage(&self) -> bool {
-        matches!(self, Stage::Lookup { .. })
+        match self {
+            Stage::Lookup { .. } => true,
+            Stage::Facet(facets) => {
+                facets.iter().any(|(_, stages)| stages.iter().any(Stage::needs_storage))
+            }
+            _ => false,
+        }
     }
 
     /// The name as written, for error messages.
@@ -271,6 +281,7 @@ impl Stage {
             Stage::Count(_) => "$count",
             Stage::Lookup { .. } => "$lookup",
             Stage::VectorSearch(_) => "$vectorSearch",
+            Stage::Facet(_) => "$facet",
         }
     }
 }
@@ -382,6 +393,7 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         "$unwind" => parse_unwind(value),
         "$group" => parse_group(as_document(name, value)?, vars),
         "$lookup" => parse_lookup(as_document(name, value)?, vars),
+        "$facet" => parse_facet(as_document(name, value)?, vars, at),
         "$vectorSearch" => {
             // The stage is the pipeline's source, in place of the collection
             // scan, so it can only be the first stage of the top-level
@@ -409,9 +421,114 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         // message a caller actually reads.
         other => Err(Error::InvalidQuery(format!(
             "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
-             $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup, $vectorSearch"
+             $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup, $facet, \
+             $vectorSearch"
         ))),
     }
+}
+
+/// The most facets one `$facet` may name. Each is a pipeline over the whole input,
+/// run in turn, so the number is a bound on the work one stage can ask for.
+pub const MAX_FACETS: usize = 64;
+
+/// `{$facet: {<name>: [<stages>], ...}}`.
+///
+/// Each facet is a pipeline parsed in the scope the `$facet` sits in, at the
+/// same placement (so a `$lookup` `let` name is readable in it, and the rule
+/// about a `$$name` string in a `$match` applies where it applies outside).
+/// Refused: no facets, more than [`MAX_FACETS`], a name that is empty, starts
+/// with `$` or holds a `.` or a NUL (it becomes a field of the answer), a facet
+/// that is not an array of stage documents, and, inside a facet, `$facet` (a
+/// facet's output is one document, and a facet of facets has no use another
+/// stage does not have) and `$vectorSearch` (it is the pipeline's source, and a
+/// facet's source is the stage's input).
+fn parse_facet(spec: &Document, vars: &[String], at: Placement) -> Result<Stage> {
+    if spec.is_empty() {
+        return Err(Error::InvalidQuery(
+            "$facet needs at least one facet: {$facet: {<name>: [<stages>]}}".into(),
+        ));
+    }
+    if spec.len() > MAX_FACETS {
+        return Err(Error::InvalidQuery(format!(
+            "$facet names {} facets, over the limit of {MAX_FACETS}",
+            spec.len()
+        )));
+    }
+    let mut facets = Vec::with_capacity(spec.len());
+    for (name, value) in spec {
+        if name.is_empty() || name.starts_with('$') || name.contains('.') || name.contains('\0') {
+            return Err(Error::InvalidQuery(format!(
+                "a $facet name becomes a field of the answer, so it cannot be empty, start with \
+                 `$` or contain `.`: {name:?}"
+            )));
+        }
+        let Bson::Array(raw) = value else {
+            return Err(Error::InvalidQuery(format!(
+                "$facet `{name}` is an array of pipeline stages, found {}",
+                type_name(value)
+            )));
+        };
+        let raw = raw
+            .iter()
+            .map(|stage| {
+                let doc = stage.as_document().ok_or_else(|| {
+                    Error::InvalidQuery(format!(
+                        "each $facet `{name}` stage is a document, found {}",
+                        type_name(stage)
+                    ))
+                })?;
+                if let Some(refused) = doc.keys().find(|k| *k == "$facet" || *k == "$vectorSearch")
+                {
+                    return Err(Error::InvalidQuery(format!(
+                        "{refused} cannot be used inside a $facet (in `{name}`)"
+                    )));
+                }
+                Ok(doc.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        facets.push((name.clone(), parse_pipeline(&raw, vars, at)?));
+    }
+    Ok(Stage::Facet(facets))
+}
+
+/// Run a `$facet`: every facet over the same `input`, in the order written, and
+/// the answer is the one document `{<name>: [<output>], ...}`.
+///
+/// `run` runs one facet's stages over the documents it is given; the caller
+/// supplies it because only it can run a `$lookup` (the pure pipeline in
+/// [`apply_with_vars`] passes one that cannot). The input is copied for every
+/// facet but the last, which takes it, and a facet's output is kept while the
+/// next runs, so what is held is bounded two ways, both **refused**, never cut
+/// short: the facets' outputs together may not exceed the pipeline's document
+/// ceiling, and the answer, which is one document, may not exceed the size a
+/// stored document may (`kimmy_core::limits::MAX_DOCUMENT_BYTES`). A facet that
+/// fails fails the stage. `$$NOW` is the same date in every facet: it is read
+/// when the pipeline is parsed.
+pub fn run_facet<E: From<Error>>(
+    facets: &[(String, Vec<Stage>)],
+    input: Vec<Document>,
+    limits: &Limits,
+    mut run: impl FnMut(&[Stage], Vec<Document>) -> std::result::Result<Vec<Document>, E>,
+) -> std::result::Result<Document, E> {
+    let mut answer = Document::new();
+    let mut held = 0usize;
+    let mut input = Some(input);
+    for (at, (name, stages)) in facets.iter().enumerate() {
+        let docs = if at + 1 == facets.len() {
+            input.take().unwrap_or_default()
+        } else {
+            input.clone().unwrap_or_default()
+        };
+        let out = run(stages, docs)?;
+        held += out.len();
+        check_limit("$facet", held, limits)?;
+        answer.insert(name.clone(), Bson::Array(out.into_iter().map(Bson::Document).collect()));
+    }
+    let bytes = bson::serialize_to_vec(&answer)
+        .map_err(|e| Error::Internal(format!("$facet answer could not be encoded: {e}")))?
+        .len();
+    kimmy_core::limits::check_document(bytes)?;
+    Ok(answer)
 }
 
 /// Parse a `$vectorSearch` stage.
@@ -1045,6 +1162,21 @@ pub fn apply_with_vars(
                  holds the vector index, not by the pure pipeline"
                     .into(),
             ));
+        }
+        Stage::Facet(facets) => {
+            if stage.needs_storage() {
+                return Err(Error::Unsupported(
+                    "a $facet holding a $lookup reads another collection and must be run by the \
+                     executor that holds a storage handle, not by the pure pipeline"
+                        .into(),
+                ));
+            }
+            let answer = run_facet(facets, input, limits, |stages, docs| {
+                stages
+                    .iter()
+                    .try_fold(docs, |docs, stage| apply_with_vars(stage, docs, limits, vars))
+            })?;
+            vec![answer]
         }
         Stage::Lookup { .. } => {
             // Not silently passed through: a join that returns its input
