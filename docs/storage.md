@@ -94,11 +94,26 @@ erDiagram
 | `oplog_witnessed` | node id (16 bytes) | newest `Hlc` **processed** from that node, appended or not (ADR-054) |
 | `oplog_collected` | node id (16 bytes) | highest `Hlc` retention has removed for that origin |
 | `oplog_held` | oplog key | `()` — the entry was appended as **state**, not history (ADR-160) |
+| `live_counts` | collection id | The collection's live document count, moved by every document write |
+| `live_counts_through` | `&str` | Where the counts are current through, so a start can tell when it may not trust them |
+| `live_digests` | collection id | The collection's live-document digest |
+| `live_digests_through` | `&str` | The same mark for the digests, behind a format number |
+| `unique_violations` | collection id \|\| stamp key | `()` — one row per retained `UniqueViolation` entry, so `/violations` does not read the whole oplog |
+| `vector_verified` | `&str` | The record that the version vector covers the oplog, so a start need not walk it |
+| `snapshot_progress` | peer node id (16 bytes) | The resume cursor of a snapshot pull in flight |
 
-The last three are **node-local and absent from a backup**: each is re-derived
-when the database is opened, so a restored node rebuilds them rather than
-carrying them across. See [operations.md](operations.md) for what that means when
-restoring during a snapshot.
+**A backup carries eleven of these:** `meta`, `databases`, `collections`, `docs`,
+`index_entries`, `oplog`, `oplog_arrival`, `oplog_arrival_seq`, `oplog_versions`,
+`collections_dropped` and `indexes_dropped`. The other ten are **node-local or
+derived and absent from a backup**: a restored node re-derives them, when the
+database is opened or, for `oplog_held`, in the restore itself, from the vector
+the backup carries (ADR-244), rather than carrying them across. A unit test in
+`backup.rs` makes every table in `tables.rs` either carried or named as not, so
+this list cannot fall behind it. See [operations.md](operations.md) for what that
+means when restoring during a snapshot.
+
+New node state does not get a new table: it goes in a `META` key, which a backup
+already carries, because no build's backup carries a table it does not list.
 
 ### Why the keys are shaped this way
 

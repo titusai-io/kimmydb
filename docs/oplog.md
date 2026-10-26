@@ -229,9 +229,7 @@ would apply it and mint another, trading the same change forever.
 collection `__dropped_database`** (`validate_name` refuses every `__` name, so
 no client can create it). Its tombstone is the row `collections_dropped` holds
 for that name's id, and it means: every collection of `db` created at or before
-its stamp is dropped, and none can be created at or before it. A build that
-predates the rule applies the entry as the drop of a collection it never held
-and serves it onward (ADR-229).
+its stamp is dropped, and none can be created at or before it.
 
 **A drop outlives its entry.** `DropCollection` and `DropIndex` each leave a
 tombstone — `collections_dropped` and `indexes_dropped`, see
@@ -354,8 +352,11 @@ oplog_versions:  node id (16 bytes) -> Hlc (10 bytes)
 
 Maintained on every append rather than computed, because deriving it would mean
 scanning the whole log for a max-per-node — for a value read on every sync
-round. Like the arrival index it is derived state, and `Engine::open` rebuilds
-it if it disagrees with the oplog.
+round. It is **not purely derived**: `Engine::open` raises it to cover the oplog
+when it does not already, but never lowers it, and it skips the entries this
+node holds as state, so a completed snapshot's grant is in the vector and not
+in the oplog. This is the **servable** vector, one of five that answer five
+different questions; see [Which vector answers which question](#which-vector-answers-which-question).
 
 Two peers exchange vectors and each works out what to ask for:
 
@@ -466,6 +467,51 @@ there to serve, and a peer that reads the vector and the window in that
 interval is served neither the entry nor a reason to come back for it
 ([ADR-148](decisions.md)).
 
+### Which vector answers which question
+
+A node keeps more than one record of "how far along am I", and they are not
+interchangeable. Each is right for one question and wrong for the others;
+substituting the one that is in scope for the one that answers is the mistake
+this section exists to stop.
+
+| Name | Where | What it is | Raised by |
+|---|---|---|---|
+| **Servable** | `oplog_versions`, the vector above | The highest `Hlc` per origin this node can *send*: appended to the oplog in position, or granted by a completed snapshot | An in-position append; a snapshot's grant, recorded on completion; a rewind rebuilds it from the oplog it kept |
+| **Witnessed** | `oplog_witnessed` | The newest stamp per origin this node has *processed*, appended or not (ADR-054) | Every entry it applies or supersedes, and a batch's coverage; a rewind rebuilds it from the oplog it kept |
+| **Granted** | no table of its own | A snapshot's first-page vector, taken into both vectors above when the snapshot completes | Recording the snapshot |
+| **Collected** | `oplog_collected` | The highest stamp retention has removed per origin | The retention pass |
+| **Held** | `oplog_held` | The *entries*, not a position: those appended as state, not history, by a snapshot or a repair (ADR-160) | Appending out of position; released by a grant, an in-position arrival, retention or a rewind |
+
+Witnessed is always at or above servable, because an append raises both. They
+differ for what a node handles without writing an entry: a replicated schema
+change (not logged), a document that loses last-writer-wins, an entry skipped by
+design.
+
+**Granted coverage is why servable is not the oplog.** A snapshot grants
+servable a position whose entries the oplog does not hold, so the vector can
+claim more than the oplog proves. Anything that asks "what can I send" and then
+reads the oplog sees the difference; anything that asks "what has retention
+taken" must not be answered from servable, and the other way round.
+
+**Held is not a vector.** An entry above the servable vector for its origin is
+allowed only while it is held: present in the oplog, and withheld from pullers
+until it arrives in position. A restore marks the entries above the backup's
+vector for each origin, which are the ones the source held as state (ADR-244).
+
+The rule: **choose the pair by the question, and never substitute one vector
+for another because it is the one in scope.**
+
+| The question | Compare | Why that pair |
+|---|---|---|
+| "Has this node taken in everything the peer can send, so should it pull?" | My witnessed against their servable (the pull's own `mine.behind(&theirs)`) | What a peer can send is what it appended; an entry it processed without appending is never sent, and this node reaches it only from the entry's origin |
+| "Has the *peer* processed everything this node has?" (the divergence count gate's peer side, ADR-146) | Their witnessed against my witnessed | Processed on both sides: a member that processed an entry without appending it can serve less of an origin than it has processed, for ever, and judged on servable it would read as behind indefinitely and the count half would never run |
+| "Had *this node's* count seen everything the peer's can have?" (the gate's own side, ADR-168) | My witnessed, read just before the count, against their servable | The same reason as the first row; judged on their witnessed it would trail an idle peer after every entry the peer processed without appending, ADR-146's trickle in reverse |
+| "Does the peer lack an entry retention took, so must it snapshot?" | Its witnessed vector (the `held` field of `AskEntries`) against collected, per origin (ADR-097) | The horizon concerns what has been removed, not what this node never held |
+| "Does this entry sit above what I advertise?" | The entry against servable, then `oplog_held` | Present and withheld, not absent |
+
+Two names collide. The `held` field a peer sends with `AskEntries` carries its
+**witnessed** vector; it has nothing to do with the `oplog_held` table.
+
 ### Past the horizon
 
 A peer can ask for entries the oplog no longer holds. `oplog_collected_through`
@@ -548,9 +594,9 @@ origin** (`oplog_collected`), and a peer sends its witnessed vector with
 `AskEntries` (`held`). The sender then asks the precise question: at any origin
 the peer trails, does it lack something collected? If not, it is served from
 the threshold, however far below the coarse horizon that is — everything under
-it is the peer's own coverage. If so, `BeyondHorizon` as before. A peer that
-sends no vector is judged by the threshold, exactly as before, so the two
-builds interoperate in either direction ([ADR-097](decisions.md)).
+it is the peer's own coverage. If so, `BeyondHorizon` as before. A request that
+carries no vector (the replay of the requester's own origin) is judged by the
+threshold alone ([ADR-097](decisions.md)).
 
 The same per-origin record refines the stale-rejoiner verdict ([ADR-085](decisions.md)):
 a peer trailing this node by more than tombstone retention is named only at an

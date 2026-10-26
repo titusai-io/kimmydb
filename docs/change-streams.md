@@ -394,9 +394,7 @@ again.
 accepted through 0.30.x and have been accepted since; a later minor may refuse
 them, and its release notes will say so. Where accepted, they resume as before
 where the member holds the entry, and where it does not, from the first entry
-stamped after it rather than at the tail. A 0.29 member refuses
-a 0.30 token as malformed (`400`), so a client that fails over during a roll to
-a member not yet upgraded is refused until the roll is done.
+stamped after it rather than at the tail.
 
 Verified by the cluster harness: a stream cut mid-flow on one member under
 concurrent writers, with the members paused in turn so their arrival orders
