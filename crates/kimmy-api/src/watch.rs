@@ -45,7 +45,7 @@ pub async fn watch_collection(
 
     let options = WatchOptions {
         resume_after: match &q.resume_after {
-            Some(raw) => Some(ResumeToken::decode(raw).map_err(ApiError::from)?),
+            Some(raw) => Some(ResumeToken::decode_client(raw).map_err(ApiError::from)?),
             None => None,
         },
         start_at: q.from_start.then_some(Hlc::ZERO),

@@ -390,11 +390,10 @@ have given up`. Both carry `elapsed_ms`, the kind of open (`token_kind`),
 timeout is shorter than that gives up and retries, and the retry searches
 again.
 
-**Tokens from before 0.30.0** name only an entry. They are guaranteed to be
-accepted through 0.30.x and have been accepted since; a later minor may refuse
-them, and its release notes will say so. Where accepted, they resume as before
-where the member holds the entry, and where it does not, from the first entry
-stamped after it rather than at the tail.
+**A token in the pre-0.30.0 single-stamp form is refused as malformed**
+(`400`), as any string that is not a token a member issued is. It names only an
+entry, so a member other than the one that issued it could not tell what the
+client had.
 
 Verified by the cluster harness: a stream cut mid-flow on one member under
 concurrent writers, with the members paused in turn so their arrival orders

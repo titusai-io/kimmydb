@@ -131,8 +131,9 @@ impl OplogEntry {
 /// it, the stamp names a position in that order, which is exact. Anywhere else
 /// that position means nothing, so a member resumes from the vector instead.
 ///
-/// A token without `issued` is the single stamp every member issued before
-/// 0.30.0, still accepted for one minor release.
+/// A token without `issued` is a position inside a process, which a background
+/// consumer (the vector worker) records and resumes from. No member issues one to
+/// a client, and a client's is refused ([`ResumeToken::decode_client`]).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ResumeToken {
@@ -220,6 +221,20 @@ impl ResumeToken {
             buf.extend_from_slice(&hlc.to_bytes());
         }
         URL_SAFE_NO_PAD.encode(buf)
+    }
+
+    /// A token a client handed back: one a member issued, with its `issued`.
+    ///
+    /// The single-stamp form (`hlc ‖ node`, 26 bytes) is what every member
+    /// issued before 0.30.0. It is refused here as any other malformed token is,
+    /// with the same error. [`Self::decode`] still reads it, because it is the
+    /// form a background consumer's position is stored in.
+    pub fn decode_client(s: &str) -> Result<Self> {
+        let token = Self::decode(s)?;
+        if token.issued.is_none() {
+            return Err(Error::MalformedResumeToken);
+        }
+        Ok(token)
     }
 
     pub fn decode(s: &str) -> Result<Self> {
@@ -347,7 +362,7 @@ mod tests {
     /// so a change to how a single-stamp token is written cannot also change
     /// what this test expects of one.
     #[test]
-    fn a_single_stamp_token_issued_before_0_30_still_decodes() {
+    fn a_single_stamp_token_is_refused_from_a_client_as_any_malformed_one_is() {
         let hlc = Hlc::new(1_700_000_000_000, 42);
         let node = NodeId::from_bytes([9; 16]);
         let mut raw = Vec::new();
@@ -355,10 +370,21 @@ mod tests {
         raw.extend_from_slice(&node.to_bytes());
         let old = URL_SAFE_NO_PAD.encode(&raw);
 
-        let token = ResumeToken::decode(&old).unwrap();
-        assert_eq!(token.to_stamp(), Stamp::new(hlc, node));
-        assert_eq!(token.issued, None, "a single-stamp token names no issuing member");
-        assert_eq!(token.encode(), old, "and is written back unchanged");
+        let refused = ResumeToken::decode_client(&old).unwrap_err();
+        let garbage = ResumeToken::decode_client("not base64!!").unwrap_err();
+        assert_eq!(refused.to_string(), garbage.to_string(), "the same error as a garbage token");
+        assert!(matches!(refused, Error::MalformedResumeToken));
+
+        // A token a member issues still resumes.
+        let issued = issued_token();
+        assert_eq!(ResumeToken::decode_client(&issued.encode()).unwrap(), issued);
+
+        // And a process's own position is still read back from where it is
+        // stored: the form is the vector worker's, not a client's.
+        let position = ResumeToken::decode(&old).unwrap();
+        assert_eq!(position.to_stamp(), Stamp::new(hlc, node));
+        assert_eq!(position.issued, None);
+        assert_eq!(position.encode(), old);
     }
 
     #[test]
