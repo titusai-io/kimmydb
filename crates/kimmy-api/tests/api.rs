@@ -13779,6 +13779,77 @@ async fn facet_answers_one_document_of_arrays_and_refuses_what_it_cannot_hold() 
 }
 
 #[tokio::test]
+async fn bucket_and_bucket_auto_build_histograms_and_refuse_what_they_cannot_place() {
+    // ADR-254: `$bucket` ranges are [lower, upper), a value in none is refused unless
+    // there is a `default`; `$bucketAuto` never splits a value and has no granularity.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "b" })).await;
+    for (id, price) in [(1, 5), (2, 15), (3, 15), (4, 25), (5, 250)] {
+        let res = server
+            .post("/v1/db/shop/coll/b/docs", Some(&token), json!({ "_id": id, "price": price }))
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/b/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    let res = aggregate(json!([{ "$bucket": {
+        "groupBy": "$price", "boundaries": [0, 10, 20, 100], "default": "big",
+        "output": { "n": { "$sum": 1 }, "ids": { "$push": "$_id" } }
+    } }]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            { "_id": 0, "n": 1, "ids": [1] },
+            { "_id": 10, "n": 2, "ids": [2, 3] },
+            { "_id": 20, "n": 1, "ids": [4] },
+            { "_id": "big", "n": 1, "ids": [5] }
+        ])
+    );
+    let res =
+        aggregate(json!([{ "$bucket": { "groupBy": "$price", "boundaries": [0, 10, 20, 100] } }]))
+            .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(
+        res.body["message"],
+        "invalid query: $bucket: the value 250 falls in no bucket and there is no `default`; add a \
+         `default`, or a boundary below and above it"
+    );
+    let res =
+        aggregate(json!([{ "$bucket": { "groupBy": "$price", "boundaries": [0, 20, 10] } }])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let res = aggregate(json!([{ "$bucketAuto": { "groupBy": "$price", "buckets": 2 } }])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            { "_id": { "min": 5, "max": 25 }, "count": 3 },
+            { "_id": { "min": 25, "max": 250 }, "count": 2 }
+        ])
+    );
+    let res = aggregate(
+        json!([{ "$bucketAuto": { "groupBy": "$price", "buckets": 2, "granularity": "R5" } }]),
+    )
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("`granularity` is not supported"));
+    let res = aggregate(json!([{ "$facet": {
+        "hist": [ { "$bucket": { "groupBy": "$price", "boundaries": [0, 100], "default": "x" } } ]
+    } }]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn aggregation_groups_joins_and_ranks_a_decimal128_by_its_value() {
     // Design 2.2: `$group`, `$addToSet` and the `$lookup` join keys identify
     // equal numbers and decimals as one member, a bucket's `_id` the first

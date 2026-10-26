@@ -2572,7 +2572,7 @@ fn as_array(op: Op, value: &Bson) -> Result<Option<&[Bson]>> {
 /// A decimal is read by its exact value, as the double of that value is:
 /// `Decimal128("1")` and `Decimal128("1.00")` are 1, `Decimal128("1.5")` is
 /// refused, and one past `i64` saturates as `2.0e19` does.
-fn as_integer(value: &Bson, what: &str) -> Result<i64> {
+pub(crate) fn as_integer(value: &Bson, what: &str) -> Result<i64> {
     let refused = || {
         Error::InvalidQuery(format!("{what} must be a whole number, found {}", type_name(value)))
     };

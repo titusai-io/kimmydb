@@ -31,6 +31,7 @@ can answer it, which only a *leading* `$match` gets (see
 | `$group` | [Blocking](#the-memory-limit). **One row per distinct key**, so an empty input produces no rows at all. Accumulators below |
 | `$count` | `{$count: "name"}` — a document holding the count, **always**: over an empty input it is one document holding `0`, not no document. [Blocking](#the-memory-limit) |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
+| `$bucket`, `$bucketAuto` | A histogram: documents counted into ranges you give, or into about equal parts. [Blocking](#the-memory-limit). Below |
 | `$facet` | Several sub-pipelines over the same input, answered as **one document** of arrays. Below |
 | `$vectorSearch` | Semantic search as the pipeline's **source**: the hits, as documents, flow into the rest of the pipeline. **First stage only**. [Below](#vectorsearch) |
 
@@ -61,6 +62,54 @@ is read. `[0]["n"]` after a `$count` is always there, so a total needs no
 defensive read; `[0]` after a `$group` may not be, so a pipeline ending in
 `$group` can legitimately answer `[]`, and `{"_id": null}` is not a promise of
 one row.
+
+### `$bucket` and `$bucketAuto`
+
+```json
+{ "$bucket": { "groupBy": "$price", "boundaries": [0, 10, 100, 1000], "default": "other",
+               "output": { "n": { "$sum": 1 }, "top": { "$max": "$price" } } } }
+```
+
+**`$bucket`** puts each document in the range `[b_i, b_i+1)` its `groupBy` value
+falls in (the lower boundary is included, the upper is not) and answers one
+document per range **that received one**, in boundary order: `_id` is the lower
+boundary as written, then the `output` accumulators (the `$group` ones), or
+`count` if there is no `output` ([ADR-254](decisions.md)). A range nothing fell
+in is not answered.
+
+- **`boundaries`** are constants, at least two, **of one kind** (every number
+  type is one kind and compares by value; or all strings, all dates, all
+  ObjectIds, all booleans) and **strictly ascending**; anything else is `400`, as
+  is a `NaN`, a `null`, an array or a document, and a string starting with `$`.
+- **A value that falls in no range is refused**, `400` naming the value, **unless
+  there is a `default`**: a constant, which must be below the first boundary or at
+  or above the last (not inside), and which takes every such value and also a
+  `null`, a missing field and a value of another kind than the boundaries'. The
+  `default` bucket is answered last, with `_id` the `default`.
+- `output` is a non-empty document of accumulators; a key the stage does not
+  define (`buckets`, `granularity`) is `400`.
+
+**`$bucketAuto`** sorts the documents by `groupBy` (the order `$sort` uses) and
+cuts them into `buckets` runs of about equal size:
+
+```json
+{ "$bucketAuto": { "groupBy": "$price", "buckets": 4 } }
+```
+
+Each bucket is `{_id: {min, max}, count}` (or the `output` accumulators): `min` is
+its first value and `max` the **next bucket's first value**, the last bucket's its
+own largest. With `r` documents and `b` buckets left, the next bucket takes
+`ceil(r / b)` documents and then every further document holding the value of its
+last: **a value is never split across two buckets**, so buckets are as even as
+the values allow and there are fewer than asked for when values repeat (four
+distinct values in 3 buckets of `[1, 1, 1, 1, 2, 3]` are `[1×4] [2] [3]`). An
+empty input answers nothing. **`granularity` is refused**, `400`: no
+preferred-number series rounds the boundaries here, and a stage that ignored it
+would answer boundaries the caller did not ask for. `buckets` is a whole number of
+at least 1.
+
+Both are blocking, hold the input, and count their answer against the pipeline's
+document limit like `$group`.
 
 ### `$facet`
 
@@ -1287,7 +1336,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |
-| `$bucket`, `$bucketAuto`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
+| `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
 | Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |

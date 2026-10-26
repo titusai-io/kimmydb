@@ -205,6 +205,19 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
         }
         // Only ever first, where it is the source; described here for completeness.
         Stage::VectorSearch(_) => "ranks the vector index; a source, only ever first".into(),
+        Stage::Bucket { boundaries, default, .. } => {
+            out["boundaries"] = json!(boundaries.len());
+            out["default"] = json!(default.is_some());
+            "blocking, in memory: counts each document into the range its value falls in; a \
+             value in no range is refused unless there is a default"
+                .into()
+        }
+        Stage::BucketAuto { buckets, .. } => {
+            out["buckets"] = json!(buckets);
+            "blocking, in memory: sorts by the value and cuts the run into at most that many \
+             buckets of about equal size, never splitting a value"
+                .into()
+        }
         Stage::Facet(facets) => {
             out["facets"] = json!(
                 facets
