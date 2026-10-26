@@ -85,6 +85,56 @@ systems use.
 
 ---
 
+## 🟡 A BinData mask is refused by `$bitsAllSet` and its three siblings, and a BinData field value never matches, where MongoDB reads the bytes
+
+**Raised 2026-10-26, with ADR-253.** MongoDB accepts a BinData value as the mask of `$bitsAllSet`, `$bitsAnySet`, `$bitsAllClear` and `$bitsAnyClear`, reading its bytes as a bit string, and tests a BinData field against an integer mask the same way. KimmyDB takes an integer mask (a non-negative whole number in 63 bits) or an array of bit positions, and a BinData mask is a `400` saying that BinData bitmasks are not supported. A BinData **field** value is not an integer, so it does not match any of the four operators (no error; `$not` inverts that).
+
+**Why.** Reading bytes as a bit string needs a byte order, a width and a rule for a mask longer than the value, and none of them has been chosen; an answer from a guessed rule would be wrong for whoever guessed otherwise. A refusal can be relaxed later without changing an answer anyone has relied on.
+
+**What it costs.** A port that sends a BinData mask gets a `400` and sends the integer or the positions it stands for.
+
+**Closing it** means deciding the byte order and width and reading BinData on both sides. Not planned.
+
+---
+
+## 🟡 A bit position above 63 is refused by the four `$bits*` operators, where MongoDB accepts the positions a longer value reaches
+
+**Raised 2026-10-26, with ADR-253.** An array of positions is limited to `0` to `63`, bit 0 the least significant, because a value is read as one 64-bit two's complement integer. `{"$bitsAllSet": [64]}` and `[-1]` are `400`s naming the position and the range; MongoDB accepts positions past 63, which are meaningful when the field holds BinData.
+
+**Why.** With no BinData reading (previous entry) there is no value for which a position past 63 means anything but sign extension, and silently answering by it would hide a typo.
+
+**What closes it.** Reading BinData (previous entry). Not planned.
+
+---
+
+## 🟡 A plain-document `$pull` matches the whole element, where MongoDB reads it as a query on the element's fields
+
+**Raised 2026-10-26, with ADR-253.** `{"$pull": {"results": {"score": 8}}}` removes the elements **equal** to `{score: 8}` and leaves `{score: 8, item: "B"}`, as `$pull` of a document always has here. MongoDB reads a document operand as a query against each element, and removes `{score: 8, item: "B"}` too. A document whose keys all start with `$` is a condition here (`{"$pull": {"scores": {"$gte": 6}}}`), as there, and a document mixing `$` keys and plain keys is a `400`.
+
+**The spelling that does what MongoDB's plain document does** is `$elemMatch`: `{"$pull": {"results": {"$elemMatch": {"score": 8}}}}` removes `{score: 8}` and `{score: 8, item: "B"}` alike, and takes the conditions a filter does (`{"$elemMatch": {"score": {"$gte": 8}, "item": "B"}}`).
+
+**Why.** Every `$pull` that worked before still does what it did, byte for byte: a plain document was always a value. Reading it as a query would have made an update that removed one element remove several, with a `200`, for a caller who changed nothing. Only a document that could not have matched anything before (an operator document compared as a value) changed meaning.
+
+**What it costs.** A port written against MongoDB's reading of a plain document removes less here, silently, and must spell it `$elemMatch`.
+
+**Closing it** means reading a plain document as a query, which changes the result of every existing partial-document `$pull`. Not planned.
+
+---
+
+## 🟡 `$bit` takes an integer operand and an integer field only
+
+**Raised 2026-10-26, with ADR-253.** `{"$bit": {"n": {"and": 6.0}}}` is a `400` here: the operand must be an `Int32` or `Int64`. A field holding a double (`2.0` included), a decimal, a string, an array or `null` is a `400` naming the field and its type; a missing field is read as `0` and created.
+
+**Why.** A bitwise operand is a bit pattern, and which pattern a double stands for is a guess nobody asked KimmyDB to make; JSON has one number type, so `6.0` is as likely to be a computation's rounding as a pattern. A refusal costs the caller one cast.
+
+**What it costs.** A client that serialises every number as a double (some JSON encoders do for a whole value) must send an integer type; Extended JSON `{"$numberInt": "6"}` or `{"$numberLong": "6"}` does.
+
+**Closing it** means accepting a whole double and reading it as an integer. Not planned.
+
+---
+
+---
+
 ## 🟡 An inclusion projection leaves out a sub-document that holds none of its paths, where MongoDB answers it empty
 
 **Raised 2026-10-01, with ADR-214.** A projection through an array now does
