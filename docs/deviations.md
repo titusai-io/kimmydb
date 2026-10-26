@@ -17,6 +17,74 @@ Status meanings:
 
 ---
 
+## 🟡 `$$REMOVE` outside a field-dropping position reads as null, and a path on `$$NOW` or `$$REMOVE` is refused
+
+**Raised 2026-10-26, with ADR-253.** `$$NOW` and `$$REMOVE` are built.
+`$$REMOVE` as the value of a field in `$project` or `$addFields`, or in a
+document an expression builds, drops the field, and it reaches the field through
+the chosen result of `$cond`, `$switch` and `$let`. **Anywhere else it reads as
+`null`**: as an operand (`{$add: ["$$REMOVE", 1]}` is `null`), under `$ifNull`
+(which takes its replacement), as an element of an array expression, and as the
+value of a `$let` variable that a field is later set from
+(`{$let: {vars: {x: "$$REMOVE"}, in: "$$x"}}` writes `null`, where the variable
+itself would have to carry "missing" to drop the field). That is how a missing
+field path reads in this engine, which has no missing value inside an
+expression: an expression always produces a value, as the array operators' entry
+below records. A pipeline that relies on `$$REMOVE` surviving a variable keeps
+the `$cond` at the field instead.
+
+**`$$NOW.x` and `$$REMOVE.x` are `400`** (`has no fields to read into`), where a
+path under either is "missing" elsewhere. A date has no fields, and a path under
+a value that is not there is a typo worth refusing.
+
+**`$$NOW` is one date for the request, read from the clock of the member that
+runs it when the pipeline is parsed.** The same date in every stage and in every
+`$lookup` sub-pipeline; a long pipeline does not see time pass, and two requests
+a millisecond apart read different dates. It has millisecond precision.
+
+**To close:** none planned.
+
+---
+
+## 🟡 Math on doubles uses the platform's library, `$round` of a double reads its exact value, and a decimal result of the five functions has no quantum
+
+**Raised 2026-10-26, with ADR-253.** `$abs`, `$ceil`, `$floor`, `$round`,
+`$trunc`, `$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` are built for integers,
+doubles and `Decimal128` ([aggregation.md](aggregation.md#math)). Where they
+differ from other systems' versions of the same names:
+
+- **A double's `$sqrt`, `$exp`, `$ln`, `$log10` and non-integer `$pow` are the
+  platform's math library's.** The last digit can differ between architectures,
+  which a `Decimal128` result never does. A result is computed on the member that
+  runs the request and is never replicated by itself, so two members can disagree
+  in a last digit only about the same request, never about stored data.
+- **`$round` and `$trunc` of a double act on its exact binary value**, rounding
+  half to even: `{$round: [2.675, 2]}` is `2.67` because the double nearest 2.675
+  is `2.67499999999999982…`, and `{$round: [0.125, 2]}` is `0.12`. A system that
+  rounds a double through its shortest text answers `2.68` for the first. The
+  rule is ADR-252's for a double meeting a decimal: its value is the exact one.
+- **An integer result is always `Int64`**, as in the rest of the arithmetic;
+  a result past `Int64` (`$pow: [2, 63]`, `$abs` of the
+  smallest `Int64`, `$round` rounding up past it) is a double.
+- **A negative base to a power that is not a whole number is `400`**, where a
+  math library answers `NaN`. So are `$sqrt` of a negative number and `$ln` and
+  `$log10` of zero or less; a `NaN` argument gives `NaN`, and the refusal is for
+  an argument outside the domain, never a way to ask for one.
+- **The result of `$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` on a `Decimal128`
+  has its trailing zeros stripped** (`$sqrt` of `4.00` is `2`), because IEEE 754
+  gives these functions no preferred exponent. It is the value rounded once to
+  34 digits, half to even, to within 10^-60 of a rounding midpoint: a true value
+  that close to one can round the wrong way, which no input a person types does.
+  `$round` and `$trunc` of a decimal give exponent `-place`.
+- **`$round` and `$trunc` take a place of -20 to 100**, a whole number, and a
+  `null` place gives `null`; anything else is `400`.
+
+**To close:** none planned. A correctly rounded double library would make the
+first point go away at the price of a dependency; the sixth is the range other
+systems use.
+
+---
+
 ## 🟡 An inclusion projection leaves out a sub-document that holds none of its paths, where MongoDB answers it empty
 
 **Raised 2026-10-01, with ADR-214.** A projection through an array now does
@@ -402,8 +470,9 @@ for every number (IEEE would give an infinity or a NaN), an overflow in `$inc` a
 `$mul` is a `400` as an `Int64` overflow is (the double path still stores
 `Infinity`), and every NaN result is the one quiet NaN. `$mod` with
 a decimal, and date arithmetic with one, stay refused (`$mod needs numbers, found
-a Decimal128`), and `$round`, `$trunc` and quantize are a separate, later item, so
-a decimal mean or quotient shows 34 digits.
+a Decimal128`). `$round`, `$trunc`, `$abs`, `$ceil`, `$floor`, `$pow`, `$sqrt`, `$exp`,
+`$ln` and `$log10` take a decimal since 0.56.0 ([ADR-253](decisions.md)); a decimal
+mean or quotient shows 34 digits until the pipeline rounds it.
 
 A filter's `$mod` is not arithmetic on the value but a test of its integer
 part: it truncates a decimal toward zero, operand and stored value alike, as
@@ -418,8 +487,7 @@ integer is converted the way it always was, and a decimal would be rounded a
 second time on the way to one. The refusal says so: `a Decimal128 would have to
 be rounded to a 32-bit float`. ADR-252 converts a decimal to a double only.
 
-**To close:** none planned. The three differences are the point of the design;
-`$round` and quantize are the follow-up.
+**To close:** none planned. The three differences are the point of the design.
 
 ---
 
