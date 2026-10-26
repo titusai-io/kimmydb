@@ -31,6 +31,7 @@ can answer it, which only a *leading* `$match` gets (see
 | `$group` | [Blocking](#the-memory-limit). **One row per distinct key**, so an empty input produces no rows at all. Accumulators below |
 | `$count` | `{$count: "name"}` — a document holding the count, **always**: over an empty input it is one document holding `0`, not no document. [Blocking](#the-memory-limit) |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
+| `$facet` | Several sub-pipelines over the same input, answered as **one document** of arrays. Below |
 | `$vectorSearch` | Semantic search as the pipeline's **source**: the hits, as documents, flow into the rest of the pipeline. **First stage only**. [Below](#vectorsearch) |
 
 **Stage operands with a fixed key set are closed; field-path maps stay
@@ -60,6 +61,42 @@ is read. `[0]["n"]` after a `$count` is always there, so a total needs no
 defensive read; `[0]` after a `$group` may not be, so a pipeline ending in
 `$group` can legitimately answer `[]`, and `{"_id": null}` is not a promise of
 one row.
+
+### `$facet`
+
+```json
+{ "$facet": {
+    "total":  [ { "$count": "n" } ],
+    "byCity": [ { "$group": { "_id": "$city", "sum": { "$sum": "$qty" } } }, { "$sort": { "_id": 1 } } ],
+    "newest": [ { "$sort": { "placed": -1 } }, { "$limit": 5 }, { "$project": { "sku": 1 } } ] } }
+```
+
+answers **one document**, `{total: [{n: 3}], byCity: [...], newest: [...]}`: each name
+is a field, holding the array of documents its sub-pipeline produced
+([ADR-254](decisions.md)). Every sub-pipeline reads the **same input**, the documents
+that reached the stage, and none sees another's output. The stages after a `$facet`
+see its one document (`$unwind` a facet and `$replaceRoot` it to continue with its
+rows). Over an empty input every facet runs over nothing: `$count` still answers
+`[{n: 0}]` and the others `[]`, and the answer is still one document.
+
+- **A facet is an array of stages**, as long as you like, empty included (an empty
+  one answers the input as it is). Any stage but the two below, `$lookup` among them
+  (authorized like any other), and a `$lookup` `let` name is readable inside.
+- **Refused, `400`, at parse**: a `$facet` inside a facet, and a `$vectorSearch`
+  inside one (it is a pipeline's source, and a facet's source is the stage's input);
+  no facets; more than 64; a name that is empty, starts with `$` or holds a `.`
+  (it becomes a field of the answer); a facet that is not an array of stage
+  documents. A stage that is wrong inside a facet is refused as it is anywhere.
+- **Bounded, and refused when over, never cut short.** The facets' outputs together
+  count against the pipeline's document limit (100,000), because they are held while
+  the next facet runs; and the answer is one document, so it may not encode to more
+  than a stored document may (16 MiB), `413`. A pipeline that needs more takes the
+  facets as separate requests, or narrows each with `$limit` and `$project`.
+- **`$$NOW` is the same date in every facet**: it is read once when the pipeline is
+  parsed. A facet that fails fails the request.
+- **Each facet reads its input once, in turn.** The input is copied for every facet
+  but the last, so a `$facet` costs about its facets' number of times the input
+  held in memory transiently; put the `$match` that narrows it before the `$facet`.
 
 ### `$project`
 
@@ -1250,7 +1287,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |
-| `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
+| `$bucket`, `$bucketAuto`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
 | Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |

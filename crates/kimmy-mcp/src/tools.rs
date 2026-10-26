@@ -566,8 +566,9 @@ impl KimmyMcp {
                        reduce. Stages: $match (filter, put it first so later stages see \
                        less), $group (with $sum, $avg, $min, $max, $first, $last, $push, \
                        $addToSet), $unwind, $project, $sort, $skip, $limit, $count, and \
-                       $lookup (join; you need read access to the joined collection too), and \
-                       $vectorSearch (semantic search as the first stage, with query or \
+                       $lookup (join; you need read access to the joined collection too), \
+                       $facet (several sub-pipelines over one input, answered as one \
+                       document of arrays), and $vectorSearch (semantic search as the first stage, with query or \
                        vector, k, per_document, filter; needs read access). \
                        Field references are written \"$field\"; computed expressions \
                        ($add, $concat, $cond, $size, $filter, $map and the rest) work \

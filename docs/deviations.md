@@ -17,6 +17,28 @@ Status meanings:
 
 ---
 
+## 🟡 `$facet` refuses a nested `$facet` and a `$vectorSearch`, takes at most 64 facets, and counts its outputs against the document limit
+
+**Raised 2026-10-26, with ADR-254.** `$facet` is built: several sub-pipelines over one
+input, answered as one document ([aggregation.md](aggregation.md#facet)). Where it differs
+from other systems' version of the stage:
+
+- **A `$facet` inside a facet, and a `$vectorSearch` inside one, are `400`s** naming the
+  stage and the facet. Other systems refuse the same family (a facet cannot hold a stage
+  that writes, reads storage statistics or is a source), and refuse `$facet` in a facet
+  as well; the list here is the two stages this server has that fit the description.
+- **At most 64 facets** (`400` over it): each is a pipeline over the whole input, run in
+  turn, and the number is the bound on the work one stage can ask for.
+- **The facets' outputs together count against the pipeline's document limit** (100,000),
+  and the answer may not exceed 16 MiB (`413`), both refused rather than truncated. A
+  system with a larger memory budget answers a pipeline that holds more than that in
+  facets; here it is two requests, or `$limit` and `$project` inside the facets.
+- **An empty facet (`[]`) answers the input as it is.**
+
+**To close:** none planned.
+
+---
+
 ## 🟡 `$$REMOVE` outside a field-dropping position reads as null, and a path on `$$NOW` or `$$REMOVE` is refused
 
 **Raised 2026-10-26, with ADR-253.** `$$NOW` and `$$REMOVE` are built.

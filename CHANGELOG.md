@@ -18,6 +18,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 **Breaking:** `$pull` of a value on a field that is not an array is `400` (`cannot apply $pull to non-array field "v"`), as `$pullAll` already was, where it was a silent no-op that reported the update as applied. A field that is missing is still a no-op. **Breaking:** a `$not` whose document has no operator in it (`{"r": {"$not": {"score": 8}}}`) is `400`, naming `$ne` and `$elemMatch`; it was read as the negation of an equality on a whole document and matched nearly every document.
 
+**Added:** the `$facet` aggregation stage ([ADR-254](docs/decisions.md#adr-254--the-facet-bucket-bucketauto-and-graphlookup-stages)): several sub-pipelines over the same input, answered as one document holding each one's output under its name. A `$lookup` works inside a facet; `$$NOW` is one date across them. A `$facet` or a `$vectorSearch` inside a facet, no facets, more than 64, a name that is empty, starts with `$` or holds a `.`, and a facet that is not an array of stages are `400`. The facets' outputs together count against the pipeline's document limit and the answer may not exceed the size of a stored document (16 MiB, `413`); both are refused, never truncated.
+
 ## 0.55.0 - 2026-10-26
 
 **Read before upgrading: 0.55.0 opens a store and a backup 0.54.0 wrote, with no wipe. Stop every member and start them all on 0.55.0.**
