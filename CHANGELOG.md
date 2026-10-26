@@ -10,7 +10,9 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.55.0 - 2026-10-26
+
+**Read before upgrading: 0.55.0 opens a store and a backup 0.54.0 wrote, with no wipe. Stop every member and start them all on 0.55.0.**
 
 **Breaking:** a resume token in the pre-0.30.0 single-stamp form is refused as malformed (`400`), as any string that is not a token a member issued is, where it was accepted and resumed from the entry alone. A client holding such a token resubscribes without one. Tokens a member issued (0.30.0 and later) are unchanged.
 
