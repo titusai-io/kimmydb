@@ -69,7 +69,49 @@ pub enum Condition {
         divisor: i64,
         remainder: i64,
     },
+    /// `$bitsAllSet`, `$bitsAnySet`, `$bitsAllClear` and `$bitsAnyClear`: the
+    /// value, read as a 64-bit two's complement integer, tested against a mask.
+    /// Whole numbers only; never answered from an index.
+    Bits {
+        test: BitTest,
+        mask: u64,
+    },
     Not(Box<Condition>),
+}
+
+/// Which way a [`Condition::Bits`] reads the bits its mask names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitTest {
+    /// Every masked bit is 1. Holds for every number when the mask is empty.
+    AllSet,
+    /// At least one masked bit is 1. Holds for nothing when the mask is empty.
+    AnySet,
+    /// Every masked bit is 0. Holds for every number when the mask is empty.
+    AllClear,
+    /// At least one masked bit is 0. Holds for nothing when the mask is empty.
+    AnyClear,
+}
+
+impl BitTest {
+    /// The operator's name as a filter spells it.
+    fn name(self) -> &'static str {
+        match self {
+            BitTest::AllSet => "$bitsAllSet",
+            BitTest::AnySet => "$bitsAnySet",
+            BitTest::AllClear => "$bitsAllClear",
+            BitTest::AnyClear => "$bitsAnyClear",
+        }
+    }
+
+    /// Whether `value`'s bits satisfy the test against `mask`.
+    fn holds(self, value: u64, mask: u64) -> bool {
+        match self {
+            BitTest::AllSet => value & mask == mask,
+            BitTest::AnySet => value & mask != 0,
+            BitTest::AllClear => value & mask == 0,
+            BitTest::AnyClear => value & mask != mask,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +374,10 @@ fn parse_condition(
             _ => return Err(Error::InvalidQuery("$size requires an integer".into())),
         },
         "mod" => parse_mod(arg)?,
+        "bitsAllSet" => parse_bits(BitTest::AllSet, arg)?,
+        "bitsAnySet" => parse_bits(BitTest::AnySet, arg)?,
+        "bitsAllClear" => parse_bits(BitTest::AllClear, arg)?,
+        "bitsAnyClear" => parse_bits(BitTest::AnyClear, arg)?,
         "type" => Condition::Type(parse_type_arg(arg)?),
         "regex" => match arg {
             Bson::String(pattern) => regex_condition(pattern, sibling_options)?,
@@ -528,6 +574,90 @@ fn mod_operand(value: &Bson, what: &str) -> Result<i64> {
             type_name_of(other)
         ))),
     }
+}
+
+/// A number that is a whole value in `i64`, of any numeric type: an integer,
+/// or a double or decimal with no fraction that fits. `None` for every other
+/// value, a NaN, an infinity and a number past 64 bits included.
+fn whole_i64(value: &Bson) -> Option<i64> {
+    match value {
+        Bson::Int32(n) => Some(i64::from(*n)),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) if d.fract() == 0.0 => truncate_to_i64(*d),
+        Bson::Decimal128(d) => kimmy_core::decimal::integer_part(d)
+            .filter(|part| part.whole && part.in_range)
+            .map(|part| part.value),
+        _ => None,
+    }
+}
+
+/// The argument of `$bitsAllSet`, `$bitsAnySet`, `$bitsAllClear` and
+/// `$bitsAnyClear`: a mask, or the positions of the bits it holds.
+///
+/// A mask is a non-negative whole number that fits in 63 bits (an `Int32`, an
+/// `Int64`, or a double or decimal with that value). Positions are an array of
+/// whole numbers in `0..=63`, bit 0 the least significant; an empty array is
+/// the empty mask, as `0` is. A BinData mask is refused: the bytes would need
+/// a byte order and a width this database has not chosen, and a refusal now
+/// can be relaxed later where a guess could not. Anything else is refused
+/// too, never ignored (a negative mask has no bits that are the caller's to
+/// name; a fractional one names none).
+fn parse_bits(test: BitTest, arg: &Bson) -> Result<Condition> {
+    let op = test.name();
+    let mask = match arg {
+        Bson::Array(positions) => {
+            let mut mask = 0u64;
+            for (at, position) in positions.iter().enumerate() {
+                match whole_i64(position) {
+                    Some(p) if (0..=63).contains(&p) => mask |= 1u64 << p,
+                    Some(p) => {
+                        return Err(Error::InvalidQuery(format!(
+                            "{op} bit positions must be between 0 and 63, found {p} at \
+                             position {at}"
+                        )));
+                    }
+                    None => {
+                        return Err(Error::InvalidQuery(format!(
+                            "{op} bit positions must be whole numbers between 0 and 63, found \
+                             {} at position {at}",
+                            type_name_of(position)
+                        )));
+                    }
+                }
+            }
+            mask
+        }
+        Bson::Binary(_) => {
+            return Err(Error::InvalidQuery(format!(
+                "{op}: BinData bitmasks are not supported; use an integer mask or an array of \
+                 bit positions"
+            )));
+        }
+        number @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)) => {
+            match whole_i64(number) {
+                Some(n) if n >= 0 => n as u64,
+                Some(n) => {
+                    return Err(Error::InvalidQuery(format!(
+                        "{op} requires a non-negative bitmask, found {n}"
+                    )));
+                }
+                None => {
+                    return Err(Error::InvalidQuery(format!(
+                        "{op} requires a bitmask that is a whole number fitting in 63 bits, \
+                         found {number}"
+                    )));
+                }
+            }
+        }
+        other => {
+            return Err(Error::InvalidQuery(format!(
+                "{op} requires a non-negative integer bitmask or an array of bit positions, \
+                 found {}",
+                type_name_of(other)
+            )));
+        }
+    };
+    Ok(Condition::Bits { test, mask })
 }
 
 /// A decimal truncated toward zero, when that is an `i64`: the double's rule,
@@ -839,7 +969,7 @@ fn type_name_for_code(code: i64) -> Result<String> {
     .to_string())
 }
 
-fn type_name_of(value: &Bson) -> &'static str {
+pub(crate) fn type_name_of(value: &Bson) -> &'static str {
     match value {
         Bson::Double(_) => "double",
         Bson::String(_) => "string",
@@ -943,6 +1073,7 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
             | Condition::Regex(_)
             | Condition::All(_)
             | Condition::Size(_)
+            | Condition::Bits { .. }
             | Condition::Mod { .. } => false,
         }
     }
@@ -1118,6 +1249,15 @@ fn condition_matches(
             n.checked_rem(*divisor).unwrap_or(0) == *remainder
         }),
 
+        // The value read as 64 bits of two's complement, so a negative number
+        // has its high bits set. A value that is not a whole number that fits
+        // (a string, a null, a fraction, BinData) matches nothing, and a
+        // missing field has no value to read.
+        Condition::Bits { test, mask } => any_element(values, |v| match whole_i64(v) {
+            Some(n) => test.holds(n as u64, *mask),
+            None => false,
+        }),
+
         Condition::Not(inner) => !condition_matches(inner, values, vars)?,
 
         Condition::AlwaysTrue => true,
@@ -1182,6 +1322,52 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
             let bindings = [(identifier, element)];
             e.eval_in(&expr::Scope::with_bindings(&root, &bindings)).map(|v| expr::truthy(&v))
         }
+    }
+}
+
+/// Parse the condition document of an update's `$pull`: every key an operator,
+/// as in the body of an `$elemMatch` over scalars (`{$gte: 6}`,
+/// `{$in: [1, 2]}`, `{$elemMatch: {score: 8}}`). Parsed once per update, so an
+/// unknown operator or a bad argument is refused before any element is tested.
+pub fn parse_condition_document(doc: &Document) -> Result<Filter> {
+    let _budget = RegexBudget::open();
+    parse_elem_match(doc, Scope::NONE)
+}
+
+/// Whether one array element satisfies a condition parsed by
+/// [`parse_condition_document`], as `$pull` asks of each element.
+///
+/// The conditions are tested against the element itself, as an `$elemMatch`
+/// over scalars tests them. A top-level `$elemMatch` (or one under `$not`)
+/// reads the element as the thing to match, not as an array to search: a
+/// document element is matched against its body by field, a scalar element
+/// as `$elemMatch: {$gt: 5}` matches one. A document-level clause (`$and`,
+/// `$or`, `$nor`, `$expr`) is matched against a document element and holds for
+/// no scalar. `Err` only when a `$expr` cannot be evaluated against the element.
+pub fn matches_pull_element(filter: &Filter, element: &Bson) -> Result<bool> {
+    pull_element_matches(filter, element).map_err(|e| unevaluable(e, None, "an array element of "))
+}
+
+fn pull_element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
+    fn condition(c: &Condition, element: &Bson) -> Result<bool> {
+        match c {
+            Condition::ElemMatch(inner) => match element {
+                Bson::Document(d) => evaluate(inner, d, &[]),
+                scalar => matches_scalar_against(inner, scalar, &[]),
+            },
+            Condition::Not(inner) => Ok(!condition(inner, element)?),
+            Condition::Both(a, b) => all_of(&[a.as_ref(), b.as_ref()], |c| condition(c, element)),
+            other => condition_matches(other, &[element], &[]),
+        }
+    }
+    match filter {
+        Filter::Field { path, conditions } if path.is_empty() => {
+            all_of(conditions, |c| condition(c, element))
+        }
+        other => match element {
+            Bson::Document(d) => evaluate(other, d, &[]),
+            scalar => matches_scalar_against(other, scalar, &[]),
+        },
     }
 }
 
@@ -2587,6 +2773,266 @@ mod tests {
         assert!(parse(&doc! { "$expr": { "$gt": ["$$ROOT.a", 1] } }).is_ok());
         // `$expr` is not a field operator.
         assert!(parse(&doc! { "a": { "$expr": { "$gt": ["$a", 1] } } }).is_err());
+    }
+
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
+    }
+
+    // -----------------------------------------------------------------------
+    // $bitsAllSet, $bitsAnySet, $bitsAllClear, $bitsAnyClear
+    // -----------------------------------------------------------------------
+
+    const BITS: [&str; 4] = ["$bitsAllSet", "$bitsAnySet", "$bitsAllClear", "$bitsAnyClear"];
+
+    fn bits(op: &str, arg: impl Into<Bson>, value: impl Into<Bson>) -> bool {
+        hits(doc! { "a": { op: arg.into() } }, doc! { "a": value.into() })
+    }
+
+    #[test]
+    fn bits_operators_test_a_mask_of_an_integer() {
+        // 10 is 0b1010.
+        assert!(bits("$bitsAllSet", 10, 14));
+        assert!(!bits("$bitsAllSet", 10, 12));
+        assert!(bits("$bitsAnySet", 5, 14));
+        assert!(!bits("$bitsAnySet", 5, 10));
+        assert!(bits("$bitsAllClear", 5, 10));
+        assert!(!bits("$bitsAllClear", 5, 14));
+        assert!(bits("$bitsAnyClear", 5, 14));
+        assert!(!bits("$bitsAnyClear", 5, 15));
+        // Int64 values and masks; bit 40 is past 32 bits.
+        assert!(bits("$bitsAllSet", 1i64 << 40, (1i64 << 40) | 1));
+        assert!(!bits("$bitsAllSet", 1i64 << 40, 1i64));
+    }
+
+    #[test]
+    fn bits_positions_name_the_same_bits_as_a_mask() {
+        assert!(bits("$bitsAllSet", vec![1, 3], 10));
+        assert!(!bits("$bitsAllSet", vec![1, 2], 10));
+        assert!(bits("$bitsAnySet", vec![0, 1], 10));
+        assert!(bits("$bitsAllClear", vec![0, 2], 10));
+        assert!(bits("$bitsAnyClear", vec![1, 2], 10));
+        // Whole numbers of any numeric type name a position, and 63 is the top.
+        assert!(bits("$bitsAllSet", vec![Bson::Double(1.0), Bson::Int64(3)], 10));
+        assert!(bits("$bitsAllSet", vec![63], i64::MIN));
+        assert!(!bits("$bitsAllSet", vec![63], i64::MAX));
+    }
+
+    #[test]
+    fn a_mask_may_be_a_whole_double_or_decimal() {
+        assert!(bits("$bitsAllSet", 10.0, 14));
+        assert!(bits("$bitsAllSet", dec("10"), 14));
+        assert!(bits("$bitsAllSet", dec("1.0E+1"), 14));
+        assert!(bits("$bitsAllSet", 0.0, 14));
+        // 2^62 is the largest power of two a double mask can carry.
+        assert!(bits("$bitsAllSet", 4_611_686_018_427_387_904.0, 1i64 << 62));
+    }
+
+    #[test]
+    fn an_empty_mask_or_position_list() {
+        for empty in [Bson::Int32(0), Bson::Array(vec![])] {
+            assert!(bits("$bitsAllSet", empty.clone(), 7));
+            assert!(bits("$bitsAllClear", empty.clone(), 7));
+            assert!(!bits("$bitsAnySet", empty.clone(), 7));
+            assert!(!bits("$bitsAnyClear", empty.clone(), 7));
+            // Every number, but only a number.
+            assert!(bits("$bitsAllSet", empty.clone(), 0));
+            assert!(!bits("$bitsAllSet", empty, "7"));
+        }
+    }
+
+    #[test]
+    fn a_negative_value_is_read_as_64_bit_twos_complement() {
+        // -1 is all ones; -2 is all ones but bit 0.
+        assert!(bits("$bitsAllSet", vec![0, 31, 32, 63], -1));
+        assert!(bits("$bitsAllSet", vec![1, 63], -2));
+        assert!(bits("$bitsAllClear", vec![0], -2));
+        assert!(bits("$bitsAnyClear", 1, -2));
+        assert!(!bits("$bitsAnyClear", 1, -1));
+        // An Int32 -1 is sign-extended, not 32 ones.
+        assert!(bits("$bitsAllSet", 1i64 << 40, Bson::Int32(-1)));
+        assert!(bits("$bitsAllSet", i64::MAX, -1));
+    }
+
+    #[test]
+    fn a_value_with_no_bits_to_read_does_not_match() {
+        for op in BITS {
+            for value in [
+                Bson::String("5".into()),
+                Bson::Null,
+                Bson::Boolean(true),
+                Bson::Double(5.5),
+                Bson::Double(f64::NAN),
+                Bson::Double(f64::INFINITY),
+                Bson::Double(1e30),
+                dec("5.5"),
+                dec("1E+30"),
+                Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: vec![5],
+                }),
+                Bson::Document(doc! { "x": 5 }),
+            ] {
+                // Under `$not` too, as the negation of no match.
+                assert!(!bits(op, 5, value.clone()), "{op} on {value:?}");
+                assert!(hits(doc! { "a": { "$not": { op: 5 } } }, doc! { "a": value }));
+            }
+            assert!(!hits(doc! { "a": { op: 5 } }, doc! { "b": 5 }), "{op} on a missing field");
+        }
+    }
+
+    #[test]
+    fn a_whole_double_or_decimal_value_has_the_bits_of_its_integer() {
+        assert!(bits("$bitsAllSet", 10, 10.0));
+        assert!(bits("$bitsAllSet", 10, dec("10")));
+        assert!(bits("$bitsAllSet", vec![63], -9_223_372_036_854_775_808.0));
+        assert!(bits("$bitsAllSet", vec![0], -1.0));
+    }
+
+    #[test]
+    fn bits_in_an_array_match_when_any_element_does() {
+        let hit = |op: &str, mask: i32, arr: Vec<Bson>| {
+            hits(doc! { "a": { op: mask } }, doc! { "a": arr })
+        };
+        assert!(hit("$bitsAllSet", 4, vec![Bson::Int32(1), Bson::Int32(6)]));
+        assert!(!hit("$bitsAllSet", 4, vec![Bson::Int32(1), Bson::Int32(2)]));
+        // A string among the elements is skipped, not an error.
+        assert!(hit("$bitsAllSet", 4, vec![Bson::String("x".into()), Bson::Int32(4)]));
+        assert!(!hit("$bitsAnySet", 4, vec![]));
+        assert!(hit("$bitsAnyClear", 4, vec![Bson::Int32(4), Bson::Int32(0)]));
+    }
+
+    #[test]
+    fn bits_work_under_not_and_elem_match() {
+        assert!(hits(doc! { "a": { "$not": { "$bitsAllSet": 5 } } }, doc! { "a": 4 }));
+        assert!(!hits(doc! { "a": { "$not": { "$bitsAllSet": 5 } } }, doc! { "a": 5 }));
+        assert!(hits(doc! { "a": { "$not": { "$bitsAllSet": 5 } } }, doc! { "b": 1 }));
+        assert!(hits(
+            doc! { "a": { "$not": { "$bitsAnySet": 1, "$bitsAnyClear": 2 } } },
+            doc! { "a": 4 }
+        ));
+        // Several in one condition: both must hold.
+        assert!(hits(doc! { "a": { "$bitsAllSet": 1, "$bitsAllClear": 2 } }, doc! { "a": 5 }));
+        assert!(!hits(doc! { "a": { "$bitsAllSet": 1, "$bitsAllClear": 2 } }, doc! { "a": 7 }));
+        // Over scalar elements, and over a field of document elements.
+        assert!(hits(doc! { "a": { "$elemMatch": { "$bitsAllSet": 4 } } }, doc! { "a": [1, 6] }));
+        assert!(!hits(doc! { "a": { "$elemMatch": { "$bitsAllSet": 4 } } }, doc! { "a": [1, 2] }));
+        assert!(hits(
+            doc! { "a": { "$elemMatch": { "f": { "$bitsAnySet": 2 } } } },
+            doc! { "a": [{ "f": 1 }, { "f": 3 }] }
+        ));
+    }
+
+    #[test]
+    fn a_bad_bits_argument_is_refused_naming_the_operator() {
+        let big = 9_223_372_036_854_775_808.0; // 2^63
+        let binary = Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: vec![0b101],
+        });
+        for op in BITS {
+            for (arg, needle) in [
+                (binary.clone(), "BinData bitmasks are not supported"),
+                (Bson::Int32(-1), "non-negative"),
+                (Bson::Int64(-5), "non-negative"),
+                (Bson::Double(-1.0), "non-negative"),
+                (dec("-3"), "non-negative"),
+                (Bson::Double(1.5), "whole number"),
+                (dec("2.5"), "whole number"),
+                (Bson::Double(f64::NAN), "whole number"),
+                (Bson::Double(f64::INFINITY), "whole number"),
+                (Bson::Double(big), "63 bits"),
+                (dec("9223372036854775808"), "63 bits"),
+                (Bson::String("5".into()), "found string"),
+                (Bson::Null, "found null"),
+                (Bson::Boolean(true), "found bool"),
+                (Bson::Document(doc! { "a": 1 }), "found object"),
+                (Bson::Array(vec![Bson::Int32(64)]), "between 0 and 63, found 64"),
+                (Bson::Array(vec![Bson::Int32(-1)]), "between 0 and 63, found -1"),
+                (Bson::Array(vec![Bson::Int32(1), Bson::Int32(99)]), "found 99 at position 1"),
+                (Bson::Array(vec![Bson::Double(1.5)]), "whole numbers"),
+                (Bson::Array(vec![Bson::String("1".into())]), "found string"),
+                (Bson::Array(vec![binary.clone()]), "found binData"),
+            ] {
+                let message = refused(doc! { "a": { op: arg.clone() } });
+                assert!(
+                    message.starts_with(op) && message.contains(needle),
+                    "{op} {arg:?}: {message}"
+                );
+                // Refused under `$not` and `$elemMatch` too.
+                refused(doc! { "a": { "$not": { op: arg.clone() } } });
+                refused(doc! { "a": { "$elemMatch": { op: arg } } });
+            }
+        }
+    }
+
+    #[test]
+    fn bits_stay_out_of_the_filters_an_index_could_answer() {
+        // The planner reads `Field` conditions by variant and ignores the
+        // rest; a bit test is a residual predicate, so it is neither a bound
+        // nor a containment fact. Checked in `plan.rs`; here, that it is its
+        // own condition and not an equality in disguise.
+        let f = parse(&doc! { "a": { "$bitsAllSet": 5 } }).unwrap();
+        assert_eq!(
+            f,
+            Filter::Field {
+                path: "a".into(),
+                conditions: vec![Condition::Bits { test: BitTest::AllSet, mask: 5 }]
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The condition of `$pull`
+    // -----------------------------------------------------------------------
+
+    fn pull_cond(condition: Document) -> Filter {
+        parse_condition_document(&condition).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    fn pulls(condition: Document, element: impl Into<Bson>) -> bool {
+        matches_pull_element(&pull_cond(condition), &element.into())
+            .unwrap_or_else(|e| panic!("evaluation failed: {e}"))
+    }
+
+    #[test]
+    fn a_pull_condition_tests_the_element_itself() {
+        assert!(pulls(doc! { "$gte": 6 }, 7));
+        assert!(!pulls(doc! { "$gte": 6 }, 5));
+        assert!(pulls(doc! { "$gt": 1, "$lt": 5 }, 3));
+        assert!(!pulls(doc! { "$gt": 1, "$lt": 5 }, 5));
+        assert!(pulls(doc! { "$in": [1, 2] }, 2));
+        assert!(pulls(doc! { "$not": { "$gt": 5 } }, 5));
+        assert!(!pulls(doc! { "$not": { "$gt": 5 } }, 6));
+        assert!(pulls(doc! { "$regex": "^a" }, "abc"));
+        assert!(!pulls(doc! { "$regex": "^a" }, 5));
+        assert!(pulls(doc! { "$bitsAllSet": 4 }, 6));
+        assert!(!pulls(doc! { "$bitsAllSet": 4 }, "6"));
+        assert!(pulls(doc! { "$type": "string" }, "x"));
+        assert!(pulls(doc! { "$eq": { "a": 1 } }, doc! { "a": 1 }));
+    }
+
+    #[test]
+    fn a_pull_elem_match_reads_the_element_as_the_thing_to_match() {
+        let c = || doc! { "$elemMatch": { "score": 8 } };
+        assert!(pulls(c(), doc! { "score": 8, "item": "B" }));
+        assert!(!pulls(c(), doc! { "score": 7, "item": "B" }));
+        assert!(!pulls(c(), 8));
+        // Over scalars it is the scalar form of an `$elemMatch`.
+        assert!(pulls(doc! { "$elemMatch": { "$gte": 6, "$lt": 8 } }, 7));
+        assert!(!pulls(doc! { "$elemMatch": { "$gte": 6, "$lt": 8 } }, 8));
+        // Under `$not`.
+        assert!(pulls(doc! { "$not": { "$elemMatch": { "score": 8 } } }, 8));
+        assert!(!pulls(doc! { "$not": { "$elemMatch": { "score": 8 } } }, doc! { "score": 8 }));
+    }
+
+    #[test]
+    fn a_pull_condition_is_refused_at_parse_time() {
+        let err = |d: Document| parse_condition_document(&d).unwrap_err();
+        assert!(matches!(err(doc! { "$nope": 1 }), Error::UnsupportedOperator { .. }));
+        assert!(matches!(err(doc! { "$in": 1 }), Error::InvalidQuery(_)));
+        assert!(matches!(err(doc! { "$bitsAllSet": -1 }), Error::InvalidQuery(_)));
+        assert!(matches!(err(doc! { "$regex": "(" }), Error::InvalidQuery(_)));
     }
 }
 

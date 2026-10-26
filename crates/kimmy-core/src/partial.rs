@@ -386,6 +386,13 @@ mod tests {
             doc! {"a": {"$elemMatch": {"b": 1}}},
             doc! {"a": {"$exists": false}},
             doc! {"a": {"$gt": 1, "$lt": 5}},
+            // A bit test is a residual predicate, not a shape containment can
+            // decide.
+            doc! {"a": {"$bitsAllSet": 5}},
+            doc! {"a": {"$bitsAnySet": [0, 2]}},
+            doc! {"a": {"$bitsAllClear": 5}},
+            doc! {"a": {"$bitsAnyClear": 5}},
+            doc! {"a": {"$mod": [4, 0]}},
             // An expression is outside the language too, so a write never has
             // to evaluate one to decide what an index holds (ADR-206).
             doc! {"$expr": {"$gt": ["$a", 1]}},
