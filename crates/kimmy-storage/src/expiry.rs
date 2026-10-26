@@ -595,6 +595,54 @@ mod tests {
         assert_eq!(out.skipped, 1, "offered by the scan, declined by the date: {out:?}");
         assert_eq!((out.deleted, out.skipped_filter), (0, 0), "{out:?}");
         assert!(engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().is_some());
+
+        // And the passes after it, which the one above does not run: the
+        // refreshed document is not offered again, and once it has aged past
+        // the policy it is deleted, within the cycle and not never.
+        let again = engine.expire_documents(&coll, &index, 100_000).unwrap();
+        assert_eq!(
+            again,
+            ExpiryOutcome::default(),
+            "nothing is offered while it is fresh: {again:?}"
+        );
+        let aged = engine.expire_documents(&coll, &index, 100_000 + 60_000).unwrap();
+        assert_eq!((aged.deleted, aged.skipped, aged.truncated), (1, 0, false), "{aged:?}");
+        assert!(engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn documents_an_index_cannot_key_by_date_never_cost_a_pass_its_budget() {
+        // ADR-139: a document with no date at the field (missing, a string, an
+        // integer) is in the index's unkeyed run, which sorts below every date.
+        // A scan that read that run would examine more than a pass's budget of
+        // them, count each as skipped, and stop at the budget with a cycle left
+        // -- every pass, so the one expired document behind them would wait for
+        // ever. Over more passes than one, because that is where it shows.
+        let (engine, _, _dir) = engine();
+        let (coll, index) = with_ttl(&engine, 60);
+        let unkeyed = MAX_EXPIRED_PER_PASS as i64 + 100;
+        let mut docs: Vec<Document> = (0..unkeyed)
+            .map(|i| match i % 3 {
+                0 => doc! {"_id": i},
+                1 => doc! {"_id": i, "seen": "not a date"},
+                _ => doc! {"_id": i, "seen": i},
+            })
+            .collect();
+        docs.push(doc! {"_id": unkeyed, "seen": dt(0)});
+        engine.insert_many(&coll, docs).unwrap();
+
+        for pass in 1..=3 {
+            let out = engine.expire_documents(&coll, &index, 10_000_000).unwrap();
+            assert_eq!(
+                (out.skipped, out.skipped_filter, out.truncated),
+                (0, 0, false),
+                "pass {pass} examined what the index could not key: {out:?}"
+            );
+            assert_eq!(out.deleted, u64::from(pass == 1), "pass {pass}: {out:?}");
+        }
+        assert!(engine.get(&coll, &kimmy_core::DocId::Int64(unkeyed)).unwrap().is_none());
+        assert!(engine.get(&coll, &kimmy_core::DocId::Int64(0)).unwrap().is_some());
+        assert!(engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().is_some());
     }
 
     /// Entries in `index` for the documents of `coll` that `declined` names,

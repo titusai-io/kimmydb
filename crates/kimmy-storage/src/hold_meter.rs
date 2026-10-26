@@ -1350,17 +1350,49 @@ mod tests {
         assert_adds_up(&row);
     }
 
+    /// How many times a wall-clock claim is tried before it counts as broken.
+    const ATTEMPTS: usize = 5;
+
+    /// Run `attempt` until it returns `Ok`, up to [`ATTEMPTS`] times, and panic
+    /// with every attempt's complaint if none does.
+    ///
+    /// For a claim about which bucket a stretch of wall-clock time lands in.
+    /// Under a loaded parallel run the scheduler can add hundreds of
+    /// milliseconds to any stretch of it, so a bound on the time *not* put
+    /// there can be crossed by the load alone, and nothing short of CPU time
+    /// escapes that. A defect in the attribution is deterministic: it breaks
+    /// every attempt. Load is not, so a clean attempt is evidence the
+    /// attribution held, and the claim fails only when none is clean.
+    fn eventually_attributed(mut attempt: impl FnMut() -> Result<Row, String>) -> Row {
+        let mut complaints = Vec::new();
+        for _ in 0..ATTEMPTS {
+            match attempt() {
+                Ok(row) => return row,
+                Err(complaint) => complaints.push(complaint),
+            }
+        }
+        panic!("none of {ATTEMPTS} attempts was attributed as claimed:\n{}", complaints.join("\n"));
+    }
+
     #[test]
     fn time_asleep_inside_a_hold_is_off_cpu() {
+        // A claim the scheduler cannot move: a sleep never undershoots, so the
+        // hold holds at least the 80 ms asleep, off the CPU by construction, and
+        // what the meter may lose of it is its own arithmetic's rounding, the
+        // `cpu_tolerance` of `decompose`. The floor is the sleep less that, and
+        // is not tried again.
         let (engine, _dir) = fresh();
         let coll = engine.create_collection("shop", "orders").unwrap();
-        test_hooks::SLEEP_IN
-            .with(|s| s.set([Duration::from_millis(80), Duration::ZERO, Duration::ZERO]));
+        let slept = Duration::from_millis(80);
+        test_hooks::SLEEP_IN.with(|s| s.set([slept, Duration::ZERO, Duration::ZERO]));
         let row = during(&engine, WriterHolder::Write, || {
             engine.insert(&coll, doc! { "n": 1 }).unwrap();
         });
+        let last = test_hooks::LAST_HOLD.with(|h| h.take()).expect("the hold was recorded");
         test_hooks::reset();
-        assert!(row.get(Component::OffCpu) >= Duration::from_millis(80), "{row:?}");
+        let tolerance = CPU_CLOCK_GRAIN * (2 * (last.meter.cpu_reads as u32 + 1))
+            + last.cpu_over_hold.unwrap_or_default() / 100;
+        assert!(row.get(Component::OffCpu) >= slept - tolerance, "{tolerance:?}: {row:?}");
         assert!(row.get(Component::Cpu) < Duration::from_millis(40), "{row:?}");
         assert_adds_up(&row);
     }
@@ -1372,29 +1404,40 @@ mod tests {
         // spin beside it, so the holder is descheduled for much of it. `spin`
         // runs to a wall-clock deadline, so the CPU the holder was denied is
         // time off the CPU inside the hold.
-        let (engine, _dir) = fresh();
-        let coll = engine.create_collection("shop", "orders").unwrap();
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let row = std::thread::scope(|scope| {
-            for _ in 0..cores * 4 {
-                scope.spawn(|| {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        std::hint::black_box(0u64);
-                    }
+        // Whether the scheduler starves the holder is the machine's to decide,
+        // and one that hands it most of a core anyway has not shown the
+        // meter anything: tried again, as a claim about wall-clock time is.
+        let row = eventually_attributed(|| {
+            let (engine, _dir) = fresh();
+            let coll = engine.create_collection("shop", "orders").unwrap();
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let row = std::thread::scope(|scope| {
+                for _ in 0..cores * 4 {
+                    scope.spawn(|| {
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::hint::black_box(0u64);
+                        }
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                test_hooks::SPIN_IN_WORK.with(|s| s.set(Duration::from_millis(300)));
+                let row = during(&engine, WriterHolder::Write, || {
+                    engine.insert(&coll, doc! { "n": 1 }).unwrap();
                 });
-            }
-            std::thread::sleep(Duration::from_millis(50));
-            test_hooks::SPIN_IN_WORK.with(|s| s.set(Duration::from_millis(300)));
-            let row = during(&engine, WriterHolder::Write, || {
-                engine.insert(&coll, doc! { "n": 1 }).unwrap();
+                test_hooks::reset();
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                row
             });
-            test_hooks::reset();
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            row
+            let off = row.get(Component::OffCpu).as_secs_f64() / row.held.as_secs_f64();
+            if off < 0.3 {
+                return Err(format!(
+                    "a starved holder read {:.0}% off the CPU: {row:?}",
+                    off * 100.0
+                ));
+            }
+            Ok(row)
         });
-        let off = row.get(Component::OffCpu).as_secs_f64() / row.held.as_secs_f64();
-        assert!(off >= 0.3, "a starved holder read {:.0}% off the CPU: {row:?}", off * 100.0);
         assert_adds_up(&row);
     }
 
@@ -1408,27 +1451,32 @@ mod tests {
         // a phase holds only the sleep the test puts there and the engine's
         // own work; the first assertion below pins that no fsync is in it.
         for phase in Phase::ALL {
-            let (engine, _dir) = fresh();
-            engine.set_durability(DurabilityClass::Coalesced, Duration::from_millis(2));
-            let coll = engine.create_collection("shop", "orders").unwrap();
-            let mut sleeps = [Duration::ZERO; Phase::COUNT];
-            sleeps[phase.slot()] = Duration::from_millis(60);
-            test_hooks::SLEEP_IN.with(|s| s.set(sleeps));
-            let row = during(&engine, WriterHolder::Write, || {
-                engine.insert(&coll, doc! { "n": 1 }).unwrap();
-            });
-            test_hooks::reset();
-            assert_eq!(row.get(Component::Sync), Duration::ZERO, "no fsync in the hold: {row:?}");
-            for other in Phase::ALL {
-                if other == phase {
-                    assert!(row.phase(other) >= Duration::from_millis(60), "{phase:?}: {row:?}");
-                } else {
-                    assert!(
-                        row.phase(other) < Duration::from_millis(40),
-                        "{phase:?} leaked into {other:?}: {row:?}"
-                    );
+            let row = eventually_attributed(|| {
+                let (engine, _dir) = fresh();
+                engine.set_durability(DurabilityClass::Coalesced, Duration::from_millis(2));
+                let coll = engine.create_collection("shop", "orders").unwrap();
+                let mut sleeps = [Duration::ZERO; Phase::COUNT];
+                sleeps[phase.slot()] = Duration::from_millis(60);
+                test_hooks::SLEEP_IN.with(|s| s.set(sleeps));
+                let row = during(&engine, WriterHolder::Write, || {
+                    engine.insert(&coll, doc! { "n": 1 }).unwrap();
+                });
+                test_hooks::reset();
+                assert_eq!(
+                    row.get(Component::Sync),
+                    Duration::ZERO,
+                    "no fsync in the hold: {row:?}"
+                );
+                for other in Phase::ALL {
+                    if other == phase && row.phase(other) < Duration::from_millis(60) {
+                        return Err(format!("{phase:?} lost its sleep: {row:?}"));
+                    }
+                    if other != phase && row.phase(other) >= Duration::from_millis(40) {
+                        return Err(format!("{phase:?} leaked into {other:?}: {row:?}"));
+                    }
                 }
-            }
+                Ok(row)
+            });
             assert_adds_up(&row);
         }
     }

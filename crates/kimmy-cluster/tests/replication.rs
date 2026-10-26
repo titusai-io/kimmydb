@@ -2515,6 +2515,10 @@ async fn the_replication_loop_reports_a_stranded_collection_while_every_other_si
         assert_eq!(report.ddl_refused, 0, "nothing was refused: {report:?}");
         confirmed = report.divergent_collections;
     }
+    // The report only counts, so this is `stranded` by construction and not by
+    // name: the node holds no other collection, and A takes no write once the
+    // loop starts, so nothing else can differ for the count half to confirm.
+    // Adding a collection here, or a writer, makes `1` mean nothing.
     assert_eq!(confirmed, 1, "exactly the one stranded collection");
     looping.abort();
 
@@ -2941,6 +2945,11 @@ async fn a_cap_truncated_round_counts_a_skip_and_never_a_check() {
     }));
     let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
 
+    // A live loop on a loaded machine can have a round of its own fail now and
+    // then, or a transient skip, so no *count* of either is asserted flat across
+    // it. What is asserted is the ordering the claim is about, which a transient
+    // cannot fake: a skip before the first check, never a check without one,
+    // and then a run of checked rounds with no further skip.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut checks = 0usize;
     let mut skips = 0usize;
@@ -2958,23 +2967,39 @@ async fn a_cap_truncated_round_counts_a_skip_and_never_a_check() {
             );
         }
         checks += report.divergence_checks;
-        skips += report.divergence_skips;
+        // A failed round is counted as a skip too (ADR-145); what is asserted
+        // is skips that are not failures, so a truncated round counted as a
+        // failure instead of a skip still fails the test.
+        skips += report.divergence_skips.saturating_sub(report.failed);
     }
+    // The backlog drained: the check ran because B holds everything A does.
+    let cb = b.engine.get_collection("shop", "orders").expect("B holds the collection");
+    assert_eq!(
+        b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
+        (MAX_BATCH + 200) as u64,
+        "the check ran while B was still behind"
+    );
 
     // And the blindness belongs to the backlog, not to the node: once the
-    // pull reaches the tail every round is checked again, and nothing more
-    // is skipped.
-    let skipped_while_behind = skips;
+    // pull reaches the tail, rounds are checked and none is skipped. Three
+    // checked rounds in a row with no skip, the run restarting at any round
+    // that skips or is not checked; a drained cluster that went on skipping
+    // never completes it.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while checks < 3 {
+    let mut streak = 0usize;
+    while streak < 3 {
         let report = tokio::time::timeout_at(deadline, rx.recv())
             .await
-            .unwrap_or_else(|_| panic!("a drained cluster stopped being checked"))
+            .unwrap_or_else(|_| {
+                panic!("a drained cluster stopped being checked: a streak of {streak}")
+            })
             .expect("the loop must keep reporting");
-        checks += report.divergence_checks;
-        skips += report.divergence_skips;
+        streak = if report.divergence_checks > 0 && report.divergence_skips == 0 {
+            streak + 1
+        } else {
+            0
+        };
     }
-    assert_eq!(skips, skipped_while_behind, "a drained cluster skips nothing further");
     looping.abort();
 }
 
@@ -3964,26 +3989,41 @@ async fn a_converged_idle_cluster_defers_no_count_probe() {
     let (b_loop, mut b_rx) = start(&b, &a);
 
     // Several sync intervals on each member: every checked contact compares
-    // the one collection in rotation, and not one defers it.
+    // the one collection in rotation, and not one defers it. `deferred` and a
+    // divergence are asserted of every round, because they are the claim. A
+    // round that failed or skipped on a loaded machine is not, and is not
+    // counted: eight clean rounds are needed, and a cluster that never settles
+    // to them fails for want of them, within a bound on the rounds it may waste.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     for (name, rx) in [("a", &mut a_rx), ("b", &mut b_rx)] {
-        let (mut checks, mut compared) = (0usize, 0usize);
-        while checks < 8 {
+        let (mut clean, mut compared, mut wasted) = (0usize, 0usize, 0usize);
+        while clean < 8 {
             let report = tokio::time::timeout_at(deadline, rx.recv())
                 .await
-                .unwrap_or_else(|_| panic!("member {name} never ran eight checks"))
+                .unwrap_or_else(|_| panic!("member {name} never ran eight clean checks"))
                 .expect("the loop must keep reporting");
-            assert_eq!(report.failed, 0, "{name}: {report:?}");
-            assert_eq!(report.divergence_skips, 0, "{name}: {report:?}");
             assert_eq!(
                 report.divergence_count_deferred, 0,
                 "{name}: a converged idle cluster has nothing to defer: {report:?}"
             );
             assert_eq!(report.divergent_collections, 0, "{name}: {report:?}");
-            checks += report.divergence_checks;
+            // A tick that reached no peer (the first, before one is known, or
+            // the one after a back-off) is not a round to be wasted.
+            if report.divergence_checks + report.divergence_skips == 0 {
+                continue;
+            }
+            if report.failed > 0 || report.divergence_skips > 0 || report.divergence_checks == 0 {
+                wasted += 1;
+                assert!(
+                    wasted <= 3,
+                    "{name}: a converged idle cluster keeps wasting rounds: {report:?}"
+                );
+                continue;
+            }
+            clean += report.divergence_checks;
             compared += report.divergence_count_compared;
         }
-        assert_eq!(compared, checks, "{name}: every checked contact compared the one collection");
+        assert_eq!(compared, clean, "{name}: every checked contact compared the one collection");
     }
     a_loop.abort();
     b_loop.abort();

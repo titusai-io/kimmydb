@@ -8634,6 +8634,52 @@ mod tests {
     }
 
     #[test]
+    fn a_creation_that_merges_its_stamp_forward_is_history_below_a_drop_recorded_meanwhile() {
+        // The merge path's own history check, under the writer: a replicated
+        // creation of an index already held, under a winning stamp, settles the
+        // stamp only if no drop of the index is newer than the creation. The
+        // drop lands after the outside checks and leaves the definition alone,
+        // so the definition read is still current and only the tombstone says
+        // the creation is history. The closure is the one the replicated route
+        // passes, for a stamp below the drop.
+        let (engine, _dir) = collection_with_documents();
+        engine
+            .create_index("shop", "orders", vec![field("a")], false, Some("by_a".into()))
+            .unwrap();
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        let held_at = coll.index("by_a").unwrap().created;
+        let index_id = coll.index("by_a").unwrap().id;
+        let arriving = Stamp::new(Hlc::new(u64::MAX / 4, 0), NodeId::from_bytes([9; 16]));
+        let dropped_at = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let competing = Arc::clone(&engine);
+        let (outcome, ()) = race_hooks::race(
+            race_hooks::Race::IndexCreation,
+            move || competing.record_index_drop(coll.id, index_id, dropped_at).unwrap(),
+            || {
+                engine.create_index_inner(
+                    "shop",
+                    "orders",
+                    vec![field("a")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some("by_a".into()),
+                    None,
+                    None,
+                    crate::index::CreateOrigin::Replicated {
+                        created: Some(arriving),
+                        logged: None,
+                    },
+                    &|_, dropped| Ok(dropped.is_some_and(|dropped_at| arriving < dropped_at)),
+                )
+            },
+        );
+        let (created, _) = outcome.expect("the create");
+        assert!(matches!(created, crate::index::IndexCreated::Older), "settled, not Older");
+        let held = engine.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.index("by_a").unwrap().created, held_at, "the stamp was not settled");
+    }
+
+    #[test]
     fn an_index_create_does_not_bring_back_an_index_dropped_meanwhile() {
         let (engine, _dir) = collection_with_documents();
         engine
