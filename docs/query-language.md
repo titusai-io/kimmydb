@@ -305,7 +305,7 @@ and matched nothing, or compiled without the flag.
 else**, as the request spelled it, so a client can match or log it. Where there
 is more to say, it follows after a colon: a partial index's filter refuses `$or`
 as `unsupported operator "$or": it cannot appear in a partialFilterExpression:
-…`, and an expression refuses `$$NOW` as `unsupported operator "$$NOW": a
+…`, and an expression refuses `$$DESCEND` as `unsupported operator "$$DESCEND": a
 system variable this build does not have; …`. Before 0.41.0 some refusals put
 that whole sentence inside the quotes.
 

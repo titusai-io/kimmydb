@@ -2264,7 +2264,7 @@ mod tests {
         // An unbound uppercase name is a system variable this build does not
         // have, never a second identifier, while the entry's names are collected.
         refused(
-            doc! { "$expr": { "$gt": ["$$short.qty", "$$NOW"] } },
+            doc! { "$expr": { "$gt": ["$$short.qty", "$$DESCEND"] } },
             "a system variable this build does not have",
         );
         // Under an `$elemMatch` the entry's name is not bound: that body is a

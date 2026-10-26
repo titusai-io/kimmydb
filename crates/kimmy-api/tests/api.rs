@@ -13373,6 +13373,104 @@ async fn sum_and_avg_over_a_decimal128_are_exact() {
 }
 
 #[tokio::test]
+async fn the_math_operators_now_and_remove_run_through_the_aggregate_route() {
+    // ADR-253: the operators compute per document, `$$NOW` is one date for the
+    // request, `$$REMOVE` leaves a field out, and a bad argument is a `400`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "m" })).await;
+    for (id, doc) in [
+        (1, json!({ "v": 2.5, "d": dec("2.675"), "n": -7, "s": "text" })),
+        (2, json!({ "v": 3.5, "d": dec("1.005"), "n": 9, "s": "more" })),
+    ] {
+        let mut doc = doc;
+        doc["_id"] = json!(id);
+        let res = server.post("/v1/db/shop/coll/m/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/m/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    let res = aggregate(json!([
+        { "$sort": { "_id": 1 } },
+        { "$project": {
+            "half_even": { "$round": ["$v"] },
+            "cents": { "$round": ["$d", 2] },
+            "cut": { "$trunc": ["$d", 1] },
+            "abs": { "$abs": "$n" },
+            "pow": { "$pow": [2, 10] },
+            "root": { "$sqrt": 16 },
+            "dec_root": { "$sqrt": dec("4.00") },
+            "ceil": { "$ceil": "$v" },
+            "tens": { "$round": [1250, -2] }
+        } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let (first, second) = (&res.body["documents"][0], &res.body["documents"][1]);
+    assert_eq!(first["half_even"], 2.0, "{first:?}");
+    assert_eq!(second["half_even"], 4.0, "{second:?}");
+    assert_eq!(first["cents"], dec("2.68"), "{first:?}");
+    assert_eq!(second["cents"], dec("1.00"), "{second:?}");
+    assert_eq!(first["cut"], dec("2.6"), "{first:?}");
+    assert_eq!((first["abs"].clone(), second["abs"].clone()), (json!(7), json!(9)));
+    assert_eq!(first["pow"], 1024);
+    assert_eq!(first["root"], 4.0);
+    assert_eq!(first["dec_root"], dec("2"), "{first:?}");
+    assert_eq!(first["ceil"], 3.0);
+    assert_eq!(first["tens"], 1200);
+
+    // One date for the request, the same on every document and in every stage.
+    let res = aggregate(json!([
+        { "$sort": { "_id": 1 } },
+        { "$addFields": { "a": "$$NOW" } },
+        { "$addFields": { "b": "$$NOW", "gone": "$$REMOVE", "s": "$$REMOVE" } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert!(docs[0]["a"].get("$date").is_some(), "{:?}", docs[0]);
+    assert_eq!(docs[0]["a"], docs[0]["b"]);
+    assert_eq!(docs[0]["a"], docs[1]["a"]);
+    assert!(docs[0].get("s").is_none() && docs[1].get("s").is_none(), "{docs:?}");
+    assert_eq!(docs[0]["v"], 2.5);
+    // And through a `$lookup` sub-pipeline.
+    let res = aggregate(json!([
+        { "$limit": 1 },
+        { "$addFields": { "outer": "$$NOW" } },
+        { "$lookup": { "from": "m", "pipeline": [
+            { "$limit": 1 }, { "$project": { "inner": "$$NOW" } }
+        ], "as": "j" } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["outer"], res.body["documents"][0]["j"][0]["inner"]);
+
+    // A bad argument is refused, never turned into a NaN.
+    for (expr, message) in [
+        (json!({ "$sqrt": -1 }), "invalid query: $sqrt needs a number greater than or equal to 0"),
+        (json!({ "$ln": 0 }), "invalid query: $ln needs a positive number"),
+        (json!({ "$pow": [0, -1] }), "invalid query: $pow cannot raise 0 to a negative power"),
+        (
+            json!({ "$round": ["$v", 101] }),
+            "invalid query: the place of $round must be between -20 and 100, found 101",
+        ),
+        (json!({ "$abs": "$s" }), "invalid query: $abs needs numbers, found a string"),
+        (json!("$$NOW.x"), "invalid query: $$NOW has no fields to read into"),
+    ] {
+        let res = aggregate(json!([{ "$project": { "r": expr.clone() } }])).await;
+        assert_eq!(res.status, 400, "{expr}: {:?}", res.body);
+        assert_eq!(res.body["message"], message, "{expr}");
+    }
+}
+
+#[tokio::test]
 async fn aggregation_groups_joins_and_ranks_a_decimal128_by_its_value() {
     // Design 2.2: `$group`, `$addToSet` and the `$lookup` join keys identify
     // equal numbers and decimals as one member, a bucket's `_id` the first

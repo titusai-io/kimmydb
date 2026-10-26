@@ -123,6 +123,7 @@ pub fn parse_with_vars(doc: &Document, vars: &[String]) -> Result<Filter> {
 
 fn parse_scoped(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
     let _budget = RegexBudget::open();
+    let _clock = expr::RequestClock::open();
     let mut clauses = Vec::new();
 
     for (key, value) in doc {
