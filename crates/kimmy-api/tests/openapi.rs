@@ -965,6 +965,14 @@ fn the_capability_example_in_the_http_reference_is_the_list_the_server_emits() {
 // ---------------------------------------------------------------------------
 
 /// Follow a local `$ref`, once. Everything in this document refers to itself.
+/// The schema says `format: uuid`, and the validator treats `format` as an
+/// annotation only, so the value is parsed here.
+fn assert_is_node_id(node: &Value) {
+    let text = node.as_str().unwrap_or_else(|| panic!("a node id is a string: {node}"));
+    let id = uuid::Uuid::parse_str(text).unwrap_or_else(|e| panic!("{text} is not a uuid: {e}"));
+    assert_eq!(id.hyphenated().to_string(), text, "hyphenated, as the schema documents");
+}
+
 fn resolve<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
     let Some(reference) = node.get("$ref").and_then(Value::as_str) else {
         return node;
@@ -1274,7 +1282,8 @@ async fn every_documented_operation_answers_as_the_specification_says() {
 
     // -- health, and the routes that need no token ------------------------
     c.check("GET", "/healthz", "/healthz", None, None, 200).await;
-    c.check("GET", "/readyz", "/readyz", None, None, 200).await;
+    let ready = c.check("GET", "/readyz", "/readyz", None, None, 200).await;
+    assert_is_node_id(&ready["node"]);
 
     let metrics = c.server.request("GET", "/metrics", None, None).await;
     assert_eq!(metrics.status, 200);
@@ -1311,6 +1320,7 @@ async fn every_documented_operation_answers_as_the_specification_says() {
 
     // Unauthenticated on purpose: a client negotiates before it holds a token.
     let advertised = c.check("GET", "/v1/version", "/v1/version", None, None, 200).await;
+    assert_is_node_id(&advertised["node"]);
     assert_eq!(advertised["protocol"], kimmy_api::version::PROTOCOL);
     assert_eq!(advertised["version"], env!("CARGO_PKG_VERSION"));
     let served: Vec<&str> = advertised["capabilities"]
@@ -1375,6 +1385,7 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     assert_eq!(topology["count"], 1);
     assert_eq!(topology["nodes"][0]["self"], true);
     assert_eq!(topology["nodes"][0]["status"], "live");
+    assert_is_node_id(&topology["nodes"][0]["node"]);
 
     // -- users -------------------------------------------------------------
     let clerk_grants = json!([{ "db": "shop", "collection": "*", "actions": ["read"] }]);

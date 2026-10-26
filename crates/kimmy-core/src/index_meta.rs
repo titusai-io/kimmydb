@@ -123,7 +123,23 @@ pub mod stored_filter {
 
     /// `filter` as the collection metadata stores it: canonical Extended JSON.
     pub fn canonical(filter: &Option<Document>) -> Option<serde_json::Value> {
-        filter.as_ref().map(|filter| Bson::Document(filter.clone()).into_canonical_extjson())
+        filter.as_ref().map(|filter| Bson::Document(unsigned_nan(filter)).into_canonical_extjson())
+    }
+
+    /// `filter` with every NaN replaced by the one quiet NaN. `bson` spells a
+    /// NaN by its sign bit (`NaN`, `-NaN`), but every NaN is one value to
+    /// `find` and to `cmp`, so a stored or compared definition must not be two
+    /// by spelling; the response spells it `NaN` too (`json::bson_to_json`).
+    fn unsigned_nan(filter: &Document) -> Document {
+        fn bson(value: &Bson) -> Bson {
+            match value {
+                Bson::Double(f) if f.is_nan() => Bson::Double(f64::NAN),
+                Bson::Document(d) => Bson::Document(unsigned_nan(d)),
+                Bson::Array(a) => Bson::Array(a.iter().map(bson).collect()),
+                other => other.clone(),
+            }
+        }
+        filter.iter().map(|(k, v)| (k.clone(), bson(v))).collect()
     }
 
     /// `filter` as two definitions are compared by
@@ -153,7 +169,7 @@ pub mod stored_filter {
             fields.sort_by(|a, b| a.0.cmp(b.0));
             let sorted: Document =
                 fields.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            Bson::Document(sorted).into_canonical_extjson().to_string()
+            Bson::Document(unsigned_nan(&sorted)).into_canonical_extjson().to_string()
         })
     }
 
@@ -422,6 +438,27 @@ mod stored_filter_tests {
             let (a, b) = (index(Some(filter.clone())), index(Some(filter.clone())));
             assert!(a.differences(&b).is_empty(), "{filter} differs from itself");
         }
+    }
+
+    #[test]
+    fn every_nan_is_one_stored_value_whatever_its_sign_bit() {
+        let negative = f64::from_bits(f64::NAN.to_bits() | (1 << 63));
+        assert!(negative.is_nan() && negative.is_sign_negative());
+        let (plain, signed) =
+            (doc! { "k": { "$gte": f64::NAN } }, doc! { "k": { "$gte": negative } });
+        assert_eq!(
+            stored_filter::canonical(&Some(plain.clone())),
+            stored_filter::canonical(&Some(signed.clone()))
+        );
+        let stored = stored_filter::canonical(&Some(signed.clone())).unwrap().to_string();
+        assert!(stored.contains("\"NaN\"") && !stored.contains("-NaN"), "{stored}");
+        assert!(index(Some(plain)).differences(&index(Some(signed))).is_empty());
+        // The infinities keep their sign.
+        let inf =
+            stored_filter::canonical(&Some(doc! { "a": f64::INFINITY, "b": f64::NEG_INFINITY }))
+                .unwrap()
+                .to_string();
+        assert!(inf.contains("\"Infinity\"") && inf.contains("\"-Infinity\""), "{inf}");
     }
 
     #[test]

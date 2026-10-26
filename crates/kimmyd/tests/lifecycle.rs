@@ -2572,6 +2572,50 @@ async fn a_member_whose_seed_reaches_itself_serves_as_unknown_with_the_marker_se
     assert!(run.wait_exit().success());
 }
 
+/// A clustered node bound to HTTP port 0 advertises the port it got, not the
+/// 0 it was configured with: `/v1/topology` hands that address to clients.
+#[tokio::test]
+async fn a_clustered_node_on_port_zero_advertises_the_port_it_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = spawn_self_seeded(dir.path(), "port-zero", 3).await;
+    until_ready_is(&run, &client, "200 unknown", |status, header, _| {
+        status == 200 && header.as_deref() == Some("unknown")
+    })
+    .await;
+    let port = *run.http.get().unwrap();
+    assert_ne!(port, 0);
+    let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
+    let login: serde_json::Value = client
+        .post(url("/v1/auth/login"))
+        .json(&serde_json::json!({ "user": "root", "password": "harness-root-password" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = login["token"].as_str().expect("a token").to_string();
+    let topology: serde_json::Value = client
+        .get(url("/v1/topology"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let me = topology["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["self"] == true)
+        .unwrap_or_else(|| panic!("no self entry: {topology}"));
+    assert_eq!(me["endpoint"], format!("http://127.0.0.1:{port}"), "{topology}");
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+}
+
 // ---------------------------------------------------------------------------
 // A restored store (ADR-202)
 // ---------------------------------------------------------------------------

@@ -1196,7 +1196,7 @@ async fn start_and_serve(
     // answer for the whole cluster; liveness comes from SWIM separately.
     if let Some(endpoint) = kimmy_api::topology::advertised_endpoint(
         config.server.advertise.as_deref(),
-        config.server.bind,
+        local,
         config.server.tls.is_enabled(),
     ) && let Err(e) = kimmy_api::topology::register(&state, &endpoint)
     {
