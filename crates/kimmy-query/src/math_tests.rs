@@ -67,7 +67,7 @@ fn abs_keeps_the_type_and_falls_to_a_double_only_where_an_int64_cannot_hold_it()
     assert_eq!(val(one("$abs", Bson::Int64(7)), none()), Bson::Int64(7));
     assert_eq!(val(one("$abs", Bson::Double(-2.5)), none()), Bson::Double(2.5));
     assert_eq!(val(one("$abs", Bson::Double(-0.0)), none()), Bson::Double(0.0));
-    assert_eq!(val(one("$abs", Bson::Int64(i64::MIN)), none()), Bson::Double(9.223372036854775808e18));
+    assert_eq!(val(one("$abs", Bson::Int64(i64::MIN)), none()), Bson::Double(2f64.powi(63)));
     assert_eq!(val(one("$abs", Bson::String("$n".into())), doc! {"n": -3}), Bson::Int64(3));
     same(val(one("$abs", dec("-1.50")), none()), "1.50");
     same(val(one("$abs", dec("-0E+3")), none()), "0E+3");
@@ -273,7 +273,7 @@ fn pow_of_integers_is_an_integer_while_it_fits() {
     assert_eq!(pow(Bson::Int32(-1), Bson::Int64(i64::MAX)), Bson::Int64(-1));
     assert_eq!(pow(Bson::Int32(0), Bson::Int64(i64::MAX)), Bson::Int64(0));
     // Past Int64 it is a double, as an overflowing `$multiply` is.
-    assert_eq!(pow(Bson::Int32(2), Bson::Int32(63)), Bson::Double(9.223372036854775808e18));
+    assert_eq!(pow(Bson::Int32(2), Bson::Int32(63)), Bson::Double(2f64.powi(63)));
     assert_eq!(pow(Bson::Int32(10), Bson::Int32(30)), Bson::Double(1e30));
 }
 
