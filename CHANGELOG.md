@@ -10,6 +10,10 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+**Fixed:** a repair that pulls one collection's snapshot from a peer (the count half's scoped snapshot, for a collection this member lacks) walked every key written ahead of its cursor, so a collection receiving inserts at the tail of its key range faster than the pull committed pages kept it advancing without reaching the end. An advancing repair is never abandoned, so it held the peer's one repair slot and every other repair queued against that peer waited. The pull now ends at the last key the collection held when its first page was served; rows written after arrive by entries ([ADR-152](docs/decisions.md)).
+
 ## 0.54.0 - 2026-10-24
 
 **Read before upgrading: 0.54.0 does not open a store or backup 0.53.0 wrote (redb 4.3 → 4.4). Stop every member, wipe the data, start on empty directories and reseed.**
