@@ -73,7 +73,7 @@ differ from other systems' versions of the same names:
 - **The result of `$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` on a `Decimal128`
   has its trailing zeros stripped** (`$sqrt` of `4.00` is `2`), because IEEE 754
   gives these functions no preferred exponent. It is the value rounded once to
-  34 digits, half to even, to within 10^-60 of a rounding midpoint: a true value
+  34 digits, half to even, to within 10^-75 of a rounding midpoint: a true value
   that close to one can round the wrong way, which no input a person types does.
   `$round` and `$trunc` of a decimal give exponent `-place`.
 - **`$round` and `$trunc` take a place of -20 to 100**, a whole number, and a

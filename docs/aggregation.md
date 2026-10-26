@@ -410,8 +410,8 @@ underflow is gradual, as in the rest of the decimal arithmetic. The result of
 `$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` has its trailing zeros stripped
 (`$sqrt` of `4.00` is `2`, `$pow: [1.1, 2]` is `1.21`), because a quantum means
 nothing for them; `$abs`, `$ceil`, `$floor`, `$round` and `$trunc` keep the
-scale rules in the table. Where the true value is within 10^-60 of a rounding
-midpoint (a case that needs a coincidence of 25 digits) the last digit can differ
+scale rules in the table. Where the true value is within 10^-75 of a rounding
+midpoint (a case that needs a coincidence of 40 digits) the last digit can differ
 from the correctly rounded one.
 
 **A double uses the platform's math library** for `$sqrt`, `$exp`, `$ln`,
