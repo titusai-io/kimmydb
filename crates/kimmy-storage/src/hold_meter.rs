@@ -1376,23 +1376,24 @@ mod tests {
 
     #[test]
     fn time_asleep_inside_a_hold_is_off_cpu() {
-        let row = eventually_attributed(|| {
-            let (engine, _dir) = fresh();
-            let coll = engine.create_collection("shop", "orders").unwrap();
-            test_hooks::SLEEP_IN
-                .with(|s| s.set([Duration::from_millis(80), Duration::ZERO, Duration::ZERO]));
-            let row = during(&engine, WriterHolder::Write, || {
-                engine.insert(&coll, doc! { "n": 1 }).unwrap();
-            });
-            test_hooks::reset();
-            if row.get(Component::OffCpu) < Duration::from_millis(80) {
-                return Err(format!("less than the 80 ms asleep read off the CPU: {row:?}"));
-            }
-            if row.get(Component::Cpu) >= Duration::from_millis(40) {
-                return Err(format!("the sleep read as CPU: {row:?}"));
-            }
-            Ok(row)
+        // A claim the scheduler cannot move: a sleep never undershoots, so the
+        // hold holds at least the 80 ms asleep, off the CPU by construction, and
+        // what the meter may lose of it is its own arithmetic's rounding, the
+        // `cpu_tolerance` of `decompose`. The floor is the sleep less that, and
+        // is not tried again.
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        let slept = Duration::from_millis(80);
+        test_hooks::SLEEP_IN.with(|s| s.set([slept, Duration::ZERO, Duration::ZERO]));
+        let row = during(&engine, WriterHolder::Write, || {
+            engine.insert(&coll, doc! { "n": 1 }).unwrap();
         });
+        let last = test_hooks::LAST_HOLD.with(|h| h.take()).expect("the hold was recorded");
+        test_hooks::reset();
+        let tolerance = CPU_CLOCK_GRAIN * (2 * (last.meter.cpu_reads as u32 + 1))
+            + last.cpu_over_hold.unwrap_or_default() / 100;
+        assert!(row.get(Component::OffCpu) >= slept - tolerance, "{tolerance:?}: {row:?}");
+        assert!(row.get(Component::Cpu) < Duration::from_millis(40), "{row:?}");
         assert_adds_up(&row);
     }
 

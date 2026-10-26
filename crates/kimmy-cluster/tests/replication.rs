@@ -2958,6 +2958,7 @@ async fn a_cap_truncated_round_counts_a_skip_and_never_a_check() {
             .await
             .unwrap_or_else(|_| panic!("the check never ran once the backlog drained"))
             .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "the backlog is not a failure: {report:?}");
         if report.divergence_checks > 0 {
             assert!(
                 skips >= 1,
@@ -2966,7 +2967,10 @@ async fn a_cap_truncated_round_counts_a_skip_and_never_a_check() {
             );
         }
         checks += report.divergence_checks;
-        skips += report.divergence_skips;
+        // A failed round is counted as a skip too (ADR-145); what is asserted
+        // is skips that are not failures, so a truncated round counted as a
+        // failure instead of a skip still fails the test.
+        skips += report.divergence_skips.saturating_sub(report.failed);
     }
     // The backlog drained: the check ran because B holds everything A does.
     let cb = b.engine.get_collection("shop", "orders").expect("B holds the collection");
@@ -4003,6 +4007,11 @@ async fn a_converged_idle_cluster_defers_no_count_probe() {
                 "{name}: a converged idle cluster has nothing to defer: {report:?}"
             );
             assert_eq!(report.divergent_collections, 0, "{name}: {report:?}");
+            // A tick that reached no peer (the first, before one is known, or
+            // the one after a back-off) is not a round to be wasted.
+            if report.divergence_checks + report.divergence_skips == 0 {
+                continue;
+            }
             if report.failed > 0 || report.divergence_skips > 0 || report.divergence_checks == 0 {
                 wasted += 1;
                 assert!(
