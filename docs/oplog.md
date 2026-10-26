@@ -229,9 +229,7 @@ would apply it and mint another, trading the same change forever.
 collection `__dropped_database`** (`validate_name` refuses every `__` name, so
 no client can create it). Its tombstone is the row `collections_dropped` holds
 for that name's id, and it means: every collection of `db` created at or before
-its stamp is dropped, and none can be created at or before it. A build that
-predates the rule applies the entry as the drop of a collection it never held
-and serves it onward (ADR-229).
+its stamp is dropped, and none can be created at or before it.
 
 **A drop outlives its entry.** `DropCollection` and `DropIndex` each leave a
 tombstone — `collections_dropped` and `indexes_dropped`, see
@@ -596,9 +594,9 @@ origin** (`oplog_collected`), and a peer sends its witnessed vector with
 `AskEntries` (`held`). The sender then asks the precise question: at any origin
 the peer trails, does it lack something collected? If not, it is served from
 the threshold, however far below the coarse horizon that is — everything under
-it is the peer's own coverage. If so, `BeyondHorizon` as before. A peer that
-sends no vector is judged by the threshold, exactly as before, so the two
-builds interoperate in either direction ([ADR-097](decisions.md)).
+it is the peer's own coverage. If so, `BeyondHorizon` as before. A request that
+carries no vector (the replay of the requester's own origin) is judged by the
+threshold alone ([ADR-097](decisions.md)).
 
 The same per-origin record refines the stale-rejoiner verdict ([ADR-085](decisions.md)):
 a peer trailing this node by more than tombstone retention is named only at an

@@ -699,9 +699,7 @@ converge on the drop, not on the copy. One route in a converged cluster is
 outside that guarantee and is recorded rather than closed: a member so far
 behind that it catches up by copying a peer's *whole database* rather than by
 replaying changes is not told about drops that way, and keeps a collection it
-already held (ADR-155 states what follows from that). During a rolling upgrade
-there is a second and temporary one, for a member not yet on the release that
-carries this. Past `storage.tombstone_retention_secs`
+already held (ADR-155 states what follows from that). Past `storage.tombstone_retention_secs`
 the tombstone is collected and the ordinary resurrection case applies, the same
 one a deleted document is subject to ([ADR-085](decisions.md)); the retention
 setting is the width of that window and [Operations](operations.md) says how to
@@ -1339,8 +1337,8 @@ server's enum, that table and this list to one set.
 
 `commit` and `durability` are fields, not capabilities. `commit` is the short
 git commit the binary was built from — `unknown` for a build made without git,
-which is a supported build — and is for the operator staring at a
-half-upgraded cluster where two nodes claim the same `version`. `durability`
+which is a supported build — and is for the operator who needs the exact build
+a node runs when two nodes claim the same `version`. `durability`
 is how this node makes a commit durable, `durable` or `coalesced`; both are
 durable when a write returns, and the value is a fact about the node's
 configuration rather than its build, which is why it is not in the capability

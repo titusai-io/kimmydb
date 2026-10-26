@@ -418,8 +418,8 @@ That one field does the work of a queue:
   current one is stale wherever it is read, so a reindex that stopped part-way
   is finished by whichever member next scans the collection, and what it had
   already re-embedded is not sent again ([ADR-203](decisions.md)).
-- **A record with no fingerprint** (written before 0.43.0, by an older member,
-  or by a client into a collection the server embeds) is judged by its HLC
+- **A record with no fingerprint** (written by a client into a collection the
+  server embeds) is judged by its HLC
   alone, except in a *forced* scan, which re-embeds it: a configuration
   change's own backfill on the member that owns the collection, and the
   recovery of a lost stream position, each unless this member has already
@@ -500,8 +500,8 @@ one goes on only for records with no fingerprint, which the new owner's rescan
 trusts. A member that owns the collection again at its next ownership check,
 after losing it for a moment, counts that as a gain and rescans it once the
 gain has held, which finishes what its scan left. Two members that each believe
-they own the collection, across a partition, both scan it. Records written
-before 0.43.0 cannot say, and a rescan re-embeds them only on a member that
+they own the collection, across a partition, both scan it. Records with no
+fingerprint cannot say, and a rescan re-embeds them only on a member that
 completed a scan under an earlier configuration and has not yet processed the
 change itself (a member that sees a change backfilled by another member forgets
 which configuration it last scanned under); otherwise, an unfinished reindex of
