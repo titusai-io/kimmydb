@@ -228,10 +228,14 @@ pub(crate) fn id_name(id: &DocId) -> String {
 }
 
 /// What the cursor a page cuts after a row whose key is `key` bytes long costs
-/// it, a bound: the key crosses as an array of `int32`s.
-pub(crate) fn cursor_reserve(key: usize) -> usize {
-    CURSOR_OVERHEAD + byte_array_wire_len(key)
+/// it, a bound: the key crosses as an array of `int32`s, and so does the key the
+/// snapshot ends at (`until` bytes; 0 when it has none), with its field.
+pub(crate) fn cursor_reserve(key: usize, until: usize) -> usize {
+    CURSOR_OVERHEAD + byte_array_wire_len(key) + UNTIL_FIELD_OVERHEAD + byte_array_wire_len(until)
 }
+
+/// The `until_key` field's name, type byte and framing in a cursor, a bound.
+const UNTIL_FIELD_OVERHEAD: usize = 32;
 
 /// What applying a snapshot page does (ADR-148, ADR-152, and the repair of a
 /// confirmed digest finding).
@@ -272,6 +276,15 @@ pub struct SnapshotCursor {
     pub collection: CollectionId,
     /// Encoded document key; the next page starts strictly after it.
     pub after_key: Vec<u8>,
+    /// For a snapshot of one collection: the last key the collection held when the first
+    /// page was served, which every later page stops at. A pull that goes on for rounds
+    /// would otherwise walk every key written ahead of its cursor and, under sustained
+    /// inserts at the tail of the key range, never reach the end, advancing every round and
+    /// so holding the peer's one repair slot for ever. What is written after the first page
+    /// reaches the receiver by entries (a scoped snapshot grants no coverage). `None` for a
+    /// whole-database snapshot, and for a collection that had no rows. The sender sets it
+    /// and every cursor it returns carries it back: the receiver stores the cursor whole.
+    pub until_key: Option<Vec<u8>>,
 }
 
 /// `collection/hex-key`, for a log line that says where a snapshot stands.
@@ -1028,6 +1041,28 @@ impl Engine {
             live.range((Bound::Excluded(id), Bound::Unbounded)).next().copied()
         };
 
+        // Where a snapshot of one collection ends: the last key it held when the first page
+        // was served, carried by every cursor after it (`SnapshotCursor::until_key`).
+        let until: Option<Vec<u8>> = match (&after, scope) {
+            // Only a snapshot of one collection ends at a key: a whole-database walk grants
+            // coverage, so cutting it would lose the rows past the cut for good.
+            (Some(cursor), Some(_)) => cursor.until_key.clone(),
+            (Some(_), None) => None,
+            (None, Some(id)) => {
+                let end = match id.0.checked_add(1) {
+                    Some(next) => Bound::Excluded((next, [].as_slice())),
+                    None => Bound::Unbounded,
+                };
+                let mut rows =
+                    docs.range::<(u64, &[u8])>((Bound::Included((id.0, [].as_slice())), end))?;
+                if let Some(row) = rows.next_back() {
+                    Some(row?.0.value().1.to_vec())
+                } else {
+                    None
+                }
+            }
+            (None, None) => None,
+        };
         let mut out = Vec::new();
         let mut deleted = Vec::new();
         // What the page's rows have used of `room`.
@@ -1051,6 +1086,7 @@ impl Engine {
             resume.clone().map(|(collection, after_key)| SnapshotCursor {
                 collection: CollectionId(collection),
                 after_key,
+                until_key: until.clone(),
             })
         };
         loop {
@@ -1071,6 +1107,12 @@ impl Engine {
                     None => Bound::Unbounded,
                 };
                 for row in docs.range::<(u64, &[u8])>((start, end))? {
+                    let (key, value) = row?;
+                    let (collection, doc_key) = key.value();
+                    // A scoped snapshot ends at the last key it had when it began.
+                    if until.as_deref().is_some_and(|until| doc_key > until) {
+                        break;
+                    }
                     if out.len() + deleted.len() >= SNAPSHOT_PAGE {
                         // Another row exists past a full page, so there is a next
                         // page; the cursor names the last row sent. Looking one
@@ -1078,8 +1120,6 @@ impl Engine {
                         // worth end here rather than with an empty page after it.
                         return Ok((out, deleted, resumed(&resume)));
                     }
-                    let (key, value) = row?;
-                    let (collection, doc_key) = key.value();
                     let record = codec::decode_doc_record(value.value())?;
                     // A tombstone travels by KEY (ADR-167): it has no `_id` to
                     // recover, so it cannot be a `SnapshotDoc`, and a receiver
@@ -1111,7 +1151,8 @@ impl Engine {
                     // With the cursor the page cuts if it ends at this row, whose
                     // key crosses as an array: one cursor a page, so reserved with
                     // each row and not added up.
-                    let reserved = cursor_reserve(doc_key.len());
+                    let reserved =
+                        cursor_reserve(doc_key.len(), until.as_ref().map_or(0, Vec::len));
                     if used + bytes + reserved > room {
                         if out.is_empty() && deleted.is_empty() && !first {
                             let what = match &item {

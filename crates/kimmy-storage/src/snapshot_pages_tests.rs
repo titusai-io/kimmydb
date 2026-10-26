@@ -97,6 +97,66 @@ fn rows_bytes(page: &SnapshotPage) -> usize {
     documents + tombstones
 }
 
+// -- A scoped snapshot ends where the collection ended when it began --------------------
+
+/// **A scoped snapshot stops at the last key the collection held when its first page was
+/// served**, however much is written after it. The rows after it reach the receiver by
+/// entries. Three pages' worth at the start, two pages' worth added after every page: the
+/// pull completes after three pages and carries only what stood at the start. A collection
+/// that stood at exactly a page's worth ends on that page, with no empty one after it.
+#[test]
+fn a_scoped_snapshot_stops_at_the_collection_as_it_stood_when_it_began() {
+    let dir = tempfile::tempdir().unwrap();
+    let (from, to) = (open(&dir, "from"), open(&dir, "to"));
+    let page = crate::snapshot::SNAPSHOT_PAGE as i64;
+    for (name, standing, expected_pages) in [("grows", 3 * page, 3usize), ("exact", page, 1)] {
+        let coll = from.create_collection("shop", name).unwrap();
+        let rows = |first: i64, n: i64| -> Vec<bson::Document> {
+            (first..first + n).map(|i| bson::doc! { "_id": i }).collect()
+        };
+        from.insert_many(&coll, rows(0, standing)).unwrap();
+        let mut progress = SnapshotProgress::of_collection(coll.id);
+        let mut next = standing;
+        let mut pages = 0usize;
+        while !progress.is_complete() {
+            assert!(pages < 20, "{name}: it chased the tail for {pages} pages");
+            take(&to, &from, &mut progress);
+            pages += 1;
+            from.insert_many(&coll, rows(next, 2 * page)).unwrap();
+            next += 2 * page;
+        }
+        assert_eq!(pages, expected_pages, "{name}");
+        let received = to.get_collection("shop", name).unwrap();
+        assert_eq!(count(&to, &received), standing as u64, "{name}: only what stood at the start");
+    }
+}
+
+/// A whole-database walk is never cut at an `until_key`: it grants coverage, so the rows past a
+/// cut would be lost for good. Only a snapshot of one collection ends at a key; a whole-database
+/// cursor that carries one (it should not) is walked to the end all the same.
+#[test]
+fn a_whole_database_walk_ignores_an_until_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = open(&dir, "from");
+    let page = crate::snapshot::SNAPSHOT_PAGE as i64;
+    let coll = from.create_collection("shop", "wide").unwrap();
+    let rows: Vec<bson::Document> = (0..3 * page).map(|i| bson::doc! { "_id": i }).collect();
+    from.insert_many(&coll, rows).unwrap();
+    let first = from.snapshot_page(None, None).unwrap();
+    let mut cursor = first.next.clone().expect("more than a page");
+    assert_eq!(cursor.until_key, None, "a whole-database page names no end");
+    // A cursor with an end that cuts everything after the first page.
+    cursor.until_key = Some(vec![0]);
+    let mut documents = first.documents.len();
+    let mut after = Some(cursor);
+    while let Some(cursor) = after {
+        let page = from.snapshot_page(Some(cursor), None).unwrap();
+        documents += page.documents.len();
+        after = page.next;
+    }
+    assert_eq!(documents as i64, 3 * page, "every row, whatever the cursor says");
+}
+
 /// A row that does not fit what a page has left goes first on the next page, and
 /// every row arrives. A row that does not fit a page holding nothing else cannot
 /// cross on a page: it is refused, naming it; the first page, which carries the
@@ -371,10 +431,11 @@ fn the_row_overheads_bound_the_encoding() {
         let cursor = SnapshotCursor {
             collection: kimmy_core::CollectionId(u64::MAX),
             after_key: key.clone(),
+            until_key: Some(key.clone()),
         };
         let page = SnapshotPage { next: Some(cursor), ..bare.clone() };
         let actual = size(&page) - base;
-        let reserved = cursor_reserve(key.len());
+        let reserved = cursor_reserve(key.len(), key.len());
         assert!(actual <= reserved, "the cursor at {name}: {actual} bytes, reserved {reserved}");
     }
 }
@@ -476,10 +537,10 @@ fn a_converge_pull_counts_its_tombstones_with_its_documents() {
 }
 
 /// A page's cursor names a key that crosses as an array of integers, which can be
-/// large: under a test page budget of 4 MiB, a pull of documents with 200 KiB
-/// string `_id`s (about 2.5 MB as the cursor that names one crosses) reserves the
-/// cursor with each row, so every page's encoding stays within the budget and
-/// every document arrives once.
+/// large: under a test page budget of 8 MiB, a pull of documents with 200 KiB
+/// string `_id`s (about 2.5 MB as each of the cursor's two keys crosses, so about
+/// 5 MB for the cursor that names one) reserves the cursor with each row, so every
+/// page's encoding stays within the budget and every document arrives once.
 #[test]
 fn a_page_reserves_the_large_key_of_the_cursor_it_cuts() {
     let dir = tempfile::tempdir().unwrap();
@@ -490,7 +551,9 @@ fn a_page_reserves_the_large_key_of_the_cursor_it_cuts() {
     for i in 0..6 {
         y.insert(&cy, doc! { "_id": wide(i), "n": 0i64, "pad": pad.clone() }).unwrap();
     }
-    let budget = 4 * 1024 * 1024;
+    // The cursor carries the key twice now (where to resume, and where the snapshot ends),
+    // each as an array of `int32`s, so a page of these keys needs room for both.
+    let budget = 8 * 1024 * 1024;
     y.set_snapshot_page_bytes_for_test(Some(budget));
     let mut progress = SnapshotProgress::of_collection(cy.id);
     let pages = finish(&x, &y, &mut progress);
