@@ -6309,7 +6309,9 @@ mod tests {
         let (engine, _dir) = engine();
         let coll = engine.create_collection("shop", "orders").unwrap();
         engine.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
+        let waits = engine.writer_wait().count;
         drop(engine.hold_writer(WriterHolder::Write));
+        assert_eq!(engine.writer_wait().count, waits + 1, "hold_writer meters its wait");
         // The coalescing barrier's leader takes the writer without opening a
         // counted transaction: the one path that did, once, and was unmeasured.
         engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(2));
@@ -6400,7 +6402,13 @@ mod tests {
                 let start = production.find(&format!("fn {name}(")).expect("the function");
                 let body = &production[start..];
                 let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
-                assert!(body.contains(measure), "`{name}` takes the gate and never {measure}");
+                // Code, not a comment that names the call.
+                let code: String = body
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(code.contains(measure), "`{name}` takes the gate and never {measure}");
             }
         }
         for (allowed, _) in GATE {
@@ -6411,8 +6419,10 @@ mod tests {
         }
 
         // A write transaction opened on the redb database directly takes the
-        // writer without the gate: only the open's own repairs, before any
-        // engine exists to meter, and the two functions that sit behind the gate.
+        // writer without the gate, whatever the receiver (redb's takes no
+        // argument; the engine's takes a holder). Only the open's own repairs,
+        // which run on the database as `open` builds the engine and before it
+        // is returned, and the two functions that sit behind the gate.
         const RAW: &[&str] = &[
             "open_cleared_forced",
             "load_or_create_node_id",
@@ -6425,7 +6435,7 @@ mod tests {
             "begin_write_as",
             "flush_holding",
         ];
-        let raw = mentions("db.begin_write(");
+        let raw = mentions(".begin_write()");
         for (name, code) in &raw {
             assert!(
                 RAW.contains(&name.as_str()),
