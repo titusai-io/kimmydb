@@ -3534,7 +3534,7 @@ mod lead {
     /// variables only.
     #[test]
     fn system_variables_other_than_root_and_current_stay_refused() {
-        for name in ["NOW", "CLUSTER_TIME", "REMOVE", "USER_ROLES"] {
+        for name in ["DESCEND", "CLUSTER_TIME", "PRUNE", "USER_ROLES"] {
             let refused = parse(&[doc! {"$lookup": {
                 "from": "a", "let": {"v": "$v"},
                 "pipeline": [{"$match": {"$expr": {"$eq": ["$k", format!("$${name}")]}}}],
