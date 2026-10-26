@@ -131,6 +131,32 @@ fn a_scoped_snapshot_stops_at_the_collection_as_it_stood_when_it_began() {
     }
 }
 
+/// A whole-database walk is never cut at an `until_key`: it grants coverage, so the rows past a
+/// cut would be lost for good. Only a snapshot of one collection ends at a key; a whole-database
+/// cursor that carries one (it should not) is walked to the end all the same.
+#[test]
+fn a_whole_database_walk_ignores_an_until_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = open(&dir, "from");
+    let page = crate::snapshot::SNAPSHOT_PAGE as i64;
+    let coll = from.create_collection("shop", "wide").unwrap();
+    let rows: Vec<bson::Document> = (0..3 * page).map(|i| bson::doc! { "_id": i }).collect();
+    from.insert_many(&coll, rows).unwrap();
+    let first = from.snapshot_page(None, None).unwrap();
+    let mut cursor = first.next.clone().expect("more than a page");
+    assert_eq!(cursor.until_key, None, "a whole-database page names no end");
+    // A cursor with an end that cuts everything after the first page.
+    cursor.until_key = Some(vec![0]);
+    let mut documents = first.documents.len();
+    let mut after = Some(cursor);
+    while let Some(cursor) = after {
+        let page = from.snapshot_page(Some(cursor), None).unwrap();
+        documents += page.documents.len();
+        after = page.next;
+    }
+    assert_eq!(documents as i64, 3 * page, "every row, whatever the cursor says");
+}
+
 /// A row that does not fit what a page has left goes first on the next page, and
 /// every row arrives. A row that does not fit a page holding nothing else cannot
 /// cross on a page: it is refused, naming it; the first page, which carries the
@@ -511,10 +537,10 @@ fn a_converge_pull_counts_its_tombstones_with_its_documents() {
 }
 
 /// A page's cursor names a key that crosses as an array of integers, which can be
-/// large: under a test page budget of 4 MiB, a pull of documents with 200 KiB
-/// string `_id`s (about 2.5 MB as the cursor that names one crosses) reserves the
-/// cursor with each row, so every page's encoding stays within the budget and
-/// every document arrives once.
+/// large: under a test page budget of 8 MiB, a pull of documents with 200 KiB
+/// string `_id`s (about 2.5 MB as each of the cursor's two keys crosses, so about
+/// 5 MB for the cursor that names one) reserves the cursor with each row, so every
+/// page's encoding stays within the budget and every document arrives once.
 #[test]
 fn a_page_reserves_the_large_key_of_the_cursor_it_cuts() {
     let dir = tempfile::tempdir().unwrap();

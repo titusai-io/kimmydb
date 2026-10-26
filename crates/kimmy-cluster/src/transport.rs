@@ -10076,55 +10076,53 @@ mod tests {
 
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(node, grow.id, Repair::Snapshot));
-        assert_eq!(stalls.repair_due(node, false), Some((grow.id, Repair::Snapshot)));
         assert!(stalls.plan_repair(node, quiet.id, Repair::Snapshot), "queued behind it");
-
-        let mut ended_after = None;
-        for round in 1..=30 {
-            // One page a round: the deadline is past, and it is checked between pages.
+        let active = |stalls: &PeerStalls| stalls.repairs.get(&node).and_then(|r| r.active);
+        // One page a round: the snapshot deadline is past, and it is checked between pages.
+        // The round is the production one, so the slot is freed by its own call.
+        async fn round(a: &Engine, b: &Engine, node: NodeId, stalls: &mut PeerStalls) {
+            const SECRET: &str = "a-tail-chasing-secret";
+            const BINDING: &[u8] = b"a-tail-chasing-binding";
             let (mut ours, theirs) = tokio::io::duplex(1 << 20);
-            let serving = async {
-                serve_peer(&b, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None).await
-            };
-            let pulling = async {
-                open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
-                let pulled = pull_snapshot(
-                    &a,
+            let serving =
+                serve_peer(b, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None);
+            let asking = async {
+                open_handshake(a, &mut ours, SECRET, BINDING).await.unwrap();
+                let outcome = sync_round(
+                    a,
                     &mut ours,
                     "127.0.0.1:1".parse().unwrap(),
                     node,
-                    Some(grow.id),
-                    kimmy_storage::SnapshotPolicy::All,
-                    &mut stalls,
+                    None,
+                    stalls,
                     Instant::now(),
                     &RoundClock::default(),
                 )
                 .await;
                 drop(ours);
-                pulled
+                outcome
             };
-            let (_, pulled) = tokio::join!(serving, pulling);
-            if pulled.expect("the round").complete {
-                stalls.repair_finished(node);
-                ended_after = Some(round);
+            tokio::join!(serving, asking).1.expect("the round");
+        }
+
+        let mut freed_after = None;
+        for n in 1..=30 {
+            round(&a, &b, node, &mut stalls).await;
+            if active(&stalls).is_none() {
+                freed_after = Some(n);
                 break;
             }
+            assert_eq!(active(&stalls), Some((grow.id, Repair::Snapshot)), "round {n}");
             // The tail grows faster than the walk.
             b.insert_many(&grow, rows(next_id, 2 * page)).unwrap();
             next_id += 2 * page;
-            assert_eq!(
-                stalls.repair_due(node, false),
-                Some((grow.id, Repair::Snapshot)),
-                "round {round}: the repair is still the active one"
-            );
         }
-        let ended_after = ended_after.expect("30 rounds and the snapshot chased the tail still");
-        assert!(ended_after <= 4, "it walks the three pages it began with: {ended_after}");
-        assert_eq!(
-            stalls.repair_due(node, false),
-            Some((quiet.id, Repair::Snapshot)),
-            "the queued repair is handed out once the slot is free"
-        );
+        let freed_after = freed_after.expect("30 rounds and the snapshot chased the tail still");
+        assert!(freed_after <= 4, "it walks the three pages it began with: {freed_after}");
+        // The next round hands the queued repair out (a document: its one page completes it).
+        round(&a, &b, node, &mut stalls).await;
+        let handed = a.get_collection("shop", "quiet").expect("the queued repair ran");
+        assert_eq!(a.count_by_id(handed.id).unwrap(), Some(1));
         // What was written after it began is not in the pull: it comes by entries.
         let received = a.get_collection("shop", "grow").unwrap();
         assert_eq!(a.count_by_id(received.id).unwrap(), Some(3 * page as u64));

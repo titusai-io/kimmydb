@@ -1044,7 +1044,10 @@ impl Engine {
         // Where a snapshot of one collection ends: the last key it held when the first page
         // was served, carried by every cursor after it (`SnapshotCursor::until_key`).
         let until: Option<Vec<u8>> = match (&after, scope) {
-            (Some(cursor), _) => cursor.until_key.clone(),
+            // Only a snapshot of one collection ends at a key: a whole-database walk grants
+            // coverage, so cutting it would lose the rows past the cut for good.
+            (Some(cursor), Some(_)) => cursor.until_key.clone(),
+            (Some(_), None) => None,
             (None, Some(id)) => {
                 let end = match id.0.checked_add(1) {
                     Some(next) => Bound::Excluded((next, [].as_slice())),

@@ -12534,6 +12534,27 @@ and the repair abandoned — and `ask_snapshot_crosses_a_version_boundary_in_bot
 for the frame each side of an upgrade sees; and by the existing
 `kimmy-cluster/tests/replication.rs` snapshot and repair tests through the
 real loop, which now pull one collection.
+
+**Addendum, 2026-10-24: a scoped snapshot ends where its collection ended when it began.** A scoped
+pull used to walk every key written ahead of its cursor. A collection receiving inserts at
+the tail of its key range (monotonic ids) faster than the receiver committed pages could
+keep a pull advancing without reaching the end; an advancing repair is never abandoned
+(the stall count resets on every page), so it held the peer's one repair slot for as long
+as the inserts lasted and every other repair queued against that peer waited. Converge
+repairs had a row bound for this (sized from the collection when planned); the count
+half's scoped snapshot (`Repair::Snapshot`) had none. The first page of a scoped snapshot
+now names the last key the collection held when it was served, `SnapshotCursor::until_key`;
+every cursor the sender returns carries it, the receiver stores the cursor whole, and the
+walk stops at it. What is written after that reaches the receiver by entries, since a
+scoped snapshot grants no coverage. A collection with no rows has no `until_key`, and a
+whole-database snapshot has none (it grants coverage, so it is not cut this way). A
+collection that stood at exactly a page's worth ends on that page, with no empty page
+after it. Rows that were older than the cut but reached the sender only after the first page (a peer's late-arriving entries) are not in the pull and are healed by a later count repair, after the cooldown. Tested by `transport.rs`'s
+`a_scoped_snapshot_repair_ends_at_the_collection_as_it_stood_and_frees_the_slot` (a
+sender whose tail grows two pages a round; the second repair queued against the peer is
+handed out when the first ends) and `snapshot_pages_tests.rs`'s
+`a_scoped_snapshot_stops_at_the_collection_as_it_stood_when_it_began`.
+
 ## ADR-153 — A read's walk runs under `block_in_place`; a primary-key probe stays on the worker
 
 > **Extended by [ADR-199](#adr-199--a-background-tasks-storage-walk-runs-under-blocking-its-point-reads-stay-on-the-worker).**
@@ -13929,25 +13950,6 @@ tests — `a_cap_truncated_round_counts_a_skip_and_never_a_check`,
 `a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong` —
 which pass unchanged.
 
-**Addendum: a scoped snapshot ends where its collection ended when it began.** A scoped
-pull used to walk every key written ahead of its cursor. A collection receiving inserts at
-the tail of its key range (monotonic ids) faster than the receiver committed pages could
-keep a pull advancing without reaching the end; an advancing repair is never abandoned
-(the stall count resets on every page), so it held the peer's one repair slot for as long
-as the inserts lasted and every other repair queued against that peer waited. Converge
-repairs had a row bound for this (sized from the collection when planned); the count
-half's scoped snapshot (`Repair::Snapshot`) had none. The first page of a scoped snapshot
-now names the last key the collection held when it was served, `SnapshotCursor::until_key`;
-every cursor the sender returns carries it, the receiver stores the cursor whole, and the
-walk stops at it. What is written after that reaches the receiver by entries, since a
-scoped snapshot grants no coverage. A collection with no rows has no `until_key`, and a
-whole-database snapshot has none (it grants coverage, so it is not cut this way). A
-collection that stood at exactly a page's worth ends on that page, with no empty page
-after it. Tested by `transport.rs`'s
-`a_scoped_snapshot_repair_ends_at_the_collection_as_it_stood_and_frees_the_slot` (a
-sender whose tail grows two pages a round; the second repair queued against the peer is
-handed out when the first ends) and `snapshot_pages_tests.rs`'s
-`a_scoped_snapshot_stops_at_the_collection_as_it_stood_when_it_began`.
 ---
 
 ## ADR-158 — A collection drop is chunked, and its tombstone is written before the first chunk
