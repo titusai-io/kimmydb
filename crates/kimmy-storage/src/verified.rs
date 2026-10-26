@@ -1267,8 +1267,16 @@ mod tests {
     /// it lists, and this is not one of them.
     #[test]
     fn no_backup_lists_the_record() {
+        // The code of the backup module and not its comments or its tests: the
+        // module doc names the table as not carried, and
+        // `backup::tests::every_table_is_either_carried_by_a_backup_or_named_as_not`
+        // holds that classification.
         let source = include_str!("backup.rs");
-        assert!(!source.contains("VECTOR_VERIFIED"), "backup.rs names the record's table");
+        let named = source[..source.find("#[cfg(test)]").expect("the tests")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .any(|line| line.contains("VECTOR_VERIFIED"));
+        assert!(!named, "backup.rs's code names the record's table");
         let (_dir, path, _) = store(2);
         let mut backup = Vec::new();
         Engine::open(&path).unwrap().backup_to(&mut backup, crate::WalkScope::Request).unwrap();
