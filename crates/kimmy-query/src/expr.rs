@@ -1528,9 +1528,9 @@ impl Expr {
                     )),
                 }
             }
-            Expr::Let { vars, body } => Self::with_let_frame(vars, body, scope, |body, scope| {
-                body.eval_field(scope)
-            }),
+            Expr::Let { vars, body } => {
+                Self::with_let_frame(vars, body, scope, |body, scope| body.eval_field(scope))
+            }
             other => other.eval_in(scope).map(Some),
         }
     }
@@ -3871,9 +3871,9 @@ mod tests {
 
     #[test]
     fn an_unsupported_system_variable_says_so() {
-        // `$$NOW` is a feature this does not have, not a typo, and the error
+        // `$$DESCEND` is a feature this does not have, not a typo, and the error
         // class says which.
-        let err = Expr::parse(&Bson::String("$$NOW".into())).unwrap_err();
+        let err = Expr::parse(&Bson::String("$$DESCEND".into())).unwrap_err();
         assert!(matches!(err, Error::UnsupportedOperator { .. }), "{err:?}");
         assert!(Expr::parse(&Bson::String("$$".into())).is_err());
         assert!(Expr::parse(&Bson::String("$$ROOT.".into())).is_err());

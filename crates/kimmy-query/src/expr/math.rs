@@ -238,15 +238,15 @@ pub(super) fn pow(base: &Bson, exponent: &Bson) -> Result<Bson> {
         return Ok(Bson::Null);
     };
     if any_decimal(&operands) {
-        return func::pow(&operands[0].widen(), &operands[1].widen())
-            .map(decimal_result)
-            .map_err(|_| {
+        return func::pow(&operands[0].widen(), &operands[1].widen()).map(decimal_result).map_err(
+            |_| {
                 Error::InvalidQuery(
                     "$pow cannot raise 0 to a negative power or a negative number to a power \
                      that is not a whole number"
                         .into(),
                 )
-            });
+            },
+        );
     }
     let [Operand::Plain(b), Operand::Plain(e)] = operands.as_slice() else {
         unreachable!("two plain operands");
