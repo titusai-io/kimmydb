@@ -107,7 +107,13 @@ fn a_variable_string_in_restrict_search_with_match_in_a_lookup_sub_pipeline_is_r
     "from": "x", "let": {"who": "$w"},
     "pipeline": [{"$graphLookup": inner.clone()}], "as": "j"}}]);
     let message = in_lookup.expect_err("a variable is not read by the filter language").to_string();
-    assert!(message.contains("$$who"), "{message}");
+    assert!(
+        message.contains("$$who")
+            && message
+                .contains("`restrictSearchWithMatch`: `let` variables are not available there")
+            && !message.contains("write the comparison in $expr"),
+        "{message}"
+    );
     // At the top level there is no `let`, and the string is the literal it is in a `$match`.
     assert!(aggregate::parse(&[doc! {"$graphLookup": inner}]).is_ok());
 }

@@ -744,20 +744,28 @@ fn parse_query_vector(value: &Bson) -> Result<Vec<f32>> {
 /// too; nothing meaningful is lost, since `$` anchors and a pattern that
 /// opens with two of them can match nothing a `$$`-free one cannot.
 fn refuse_variables_in_match(doc: &Document) -> Result<()> {
-    fn walk_doc(doc: &Document) -> Result<()> {
-        doc.iter().filter(|(key, _)| key.as_str() != "$expr").try_for_each(|(_, value)| walk(value))
+    match first_variable_string(doc) {
+        Some(s) => Err(Error::InvalidQuery(format!(
+            "{s} is not available as a value in a $match: the filter language has no \
+             variables; write the comparison in $expr, {{$expr: {{$eq: [\"$field\", \
+             \"{s}\"]}}}}, or bind it in an $addFields stage and $match on the computed \
+             field"
+        ))),
+        None => Ok(()),
     }
-    fn walk(value: &Bson) -> Result<()> {
+}
+
+/// The first `"$$name"` string value a filter holds, outside any `$expr`.
+fn first_variable_string(doc: &Document) -> Option<String> {
+    fn walk_doc(doc: &Document) -> Option<String> {
+        doc.iter().filter(|(key, _)| key.as_str() != "$expr").find_map(|(_, value)| walk(value))
+    }
+    fn walk(value: &Bson) -> Option<String> {
         match value {
-            Bson::String(s) if s.starts_with("$$") => Err(Error::InvalidQuery(format!(
-                "{s} is not available as a value in a $match: the filter language has no \
-                 variables; write the comparison in $expr, {{$expr: {{$eq: [\"$field\", \
-                 \"{s}\"]}}}}, or bind it in an $addFields stage and $match on the computed \
-                 field"
-            ))),
+            Bson::String(s) if s.starts_with("$$") => Some(s.clone()),
             Bson::Document(doc) => walk_doc(doc),
-            Bson::Array(items) => items.iter().try_for_each(walk),
-            _ => Ok(()),
+            Bson::Array(items) => items.iter().find_map(walk),
+            _ => None,
         }
     }
     walk_doc(doc)
@@ -1196,8 +1204,17 @@ fn parse_graph_lookup(spec: &Document, vars: &[String], at: Placement) -> Result
         Some(Bson::Document(raw)) => {
             // As a `$match` in a `$lookup` sub-pipeline: a `"$$name"` string would be a
             // literal here, and the author almost certainly meant the variable.
-            if at.sub {
-                refuse_variables_in_match(raw)?;
+            if at.sub
+                && let Some(s) = first_variable_string(raw)
+            {
+                // Not `$match`'s advice: this filter is parsed with no `let` bindings at
+                // all, `$expr` included, so writing the comparison there is a 400 too.
+                return Err(Error::InvalidQuery(format!(
+                    "{s} is not available in $graphLookup `restrictSearchWithMatch`: `let` \
+                     variables are not available there, and a \"$$name\" string would be the \
+                     literal text. Restrict with a field condition, and compare against the \
+                     variable in a stage after the $graphLookup"
+                )));
             }
             Some(filter::parse(raw)?)
         }

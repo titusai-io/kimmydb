@@ -101,7 +101,11 @@ equality join.
   expressions; one beginning with `$` is `400`, and so is a dotted `as` or `depthField`
   (each is the name of one field, not a path). `depthField` holds the step as a long.
   `restrictSearchWithMatch` is a filter document over the foreign documents; one it does
-  not admit is neither reached nor followed.
+  not admit is neither reached nor followed. It is parsed with no `let` variables, so
+  inside a `$lookup` sub-pipeline a `"$$name"` string in it is `400` (not read as the
+  variable, and not the literal text), and `$expr` there cannot read one either: restrict
+  with a field condition and compare against the variable in a stage after the
+  `$graphLookup`.
 - **Order**: step 0 first, then step 1, and so on; within a step, the order of the
   foreign scan. (Other systems leave the order unspecified; sort the array if you rely
   on it.) A key not listed above is `400`.
