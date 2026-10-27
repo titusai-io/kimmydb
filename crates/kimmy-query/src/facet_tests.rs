@@ -215,3 +215,19 @@ fn a_facet_that_holds_a_lookup_needs_storage_and_the_pure_pipeline_refuses_it() 
     assert!(!plain[0].needs_storage());
     assert!(matches!(&plain[0], Stage::Facet(f) if f.len() == 1));
 }
+
+#[test]
+fn a_pipeline_with_facets_reads_the_clock_once() {
+    let before = crate::expr::clock_reads();
+    let stages = aggregate::parse(&[
+        doc! {"$match": {"$expr": {"$lt": ["$at", "$$NOW"]}}},
+        doc! {"$facet": {
+            "a": [{"$addFields": {"t": "$$NOW"}}],
+            "b": [{"$match": {"$expr": {"$gt": ["$$NOW", "$at"]}}}, {"$lookup": {
+                "from": "x", "pipeline": [{"$addFields": {"deep": "$$NOW"}}], "as": "j"}}],
+        }},
+    ])
+    .unwrap();
+    assert_eq!(crate::expr::clock_reads() - before, 1);
+    drop(stages);
+}
