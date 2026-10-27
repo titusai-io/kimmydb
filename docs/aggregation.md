@@ -33,6 +33,7 @@ can answer it, which only a *leading* `$match` gets (see
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
 | `$bucket`, `$bucketAuto` | A histogram: documents counted into ranges you give, or into about equal parts. [Blocking](#the-memory-limit). Below |
 | `$facet` | Several sub-pipelines over the same input, answered as **one document** of arrays. Below |
+| `$graphLookup` | Walk another collection (or the same one) link by link from each document, to a depth you give. **Authorized separately**. Below |
 | `$vectorSearch` | Semantic search as the pipeline's **source**: the hits, as documents, flow into the rest of the pipeline. **First stage only**. [Below](#vectorsearch) |
 
 **Stage operands with a fixed key set are closed; field-path maps stay
@@ -62,6 +63,54 @@ is read. `[0]["n"]` after a `$count` is always there, so a total needs no
 defensive read; `[0]` after a `$group` may not be, so a pipeline ending in
 `$group` can legitimately answer `[]`, and `{"_id": null}` is not a promise of
 one row.
+
+### `$graphLookup`
+
+```json
+{ "$graphLookup": { "from": "employees", "startWith": "$reportsTo",
+                    "connectFromField": "reportsTo", "connectToField": "name",
+                    "as": "chain", "maxDepth": 10, "depthField": "level",
+                    "restrictSearchWithMatch": { "active": true } } }
+```
+
+For each input document, walks `from`: the documents whose `connectToField` equals a
+`startWith` value are the first step (`level: 0`), those matched by the
+`connectFromField` values of the documents just found are the next, and so on, **to
+`maxDepth` steps after the first**; the documents reached, each once, are attached as
+the array `as` ([ADR-254](decisions.md)). `maxDepth: 0` is the first match alone, an
+equality join.
+
+- **`maxDepth` is required**, a whole number from 0 to 1000: a walk with no bound the
+  caller chose is not run (`400`). The depth is the one thing that ends a walk early,
+  and it is yours; nothing else cuts a walk off. **A walk that stops at `maxDepth` is
+  complete for that depth**: every document within `maxDepth` steps is there, and only
+  those further out are not. A document is visited once per walk, so a cycle ends.
+- **Memory is a budget, refused when over, never silently cut off.** The foreign
+  collection is read once and held, as a `$lookup`'s is, and what the walks reach is held
+  with the input; both count against the pipeline's document limit (100,000), `400`
+  naming `$graphLookup`. **The read stops at the first document past the limit**, not
+  at the end of the collection, so a very large one is refused promptly. Narrow the
+  foreign side with `restrictSearchWithMatch` (it applies as the collection is read, so
+  what it declines is not held or counted), the input with an earlier `$match`, or the
+  walk with `maxDepth`.
+- `startWith` is an expression: a value, or an array of values to start from each. A
+  `null` or missing one starts nothing, a `null` in an array starts nothing, and a
+  `null` link is not followed (a `null` is not a key to look up). Values match by the
+  equality join's rule (numbers of every type by value, an array field by its elements).
+- `connectFromField`, `connectToField`, `as` and `depthField` are field names, not
+  expressions; one beginning with `$` is `400`, and so is a dotted `as` or `depthField`
+  (each is the name of one field, not a path). `depthField` holds the step as a long.
+  `restrictSearchWithMatch` is a filter document over the foreign documents; one it does
+  not admit is neither reached nor followed. It is parsed with no `let` variables, so
+  inside a `$lookup` sub-pipeline a `"$$name"` string in it is `400` (not read as the
+  variable, and not the literal text), and `$expr` there cannot read one either: restrict
+  with a field condition and compare against the variable in a stage after the
+  `$graphLookup`.
+- **Order**: step 0 first, then step 1, and so on; within a step, the order of the
+  foreign scan. (Other systems leave the order unspecified; sort the array if you rely
+  on it.) A key not listed above is `400`.
+- Run inside a `$facet` and a `$lookup` sub-pipeline like any stage. `from` needs read
+  access, like a `$lookup`'s.
 
 ### `$bucket` and `$bucketAuto`
 
@@ -1344,7 +1393,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |
-| `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
+| `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
 | Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |

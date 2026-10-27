@@ -149,7 +149,35 @@ pub enum Stage {
         buckets: usize,
         fields: Vec<(String, Accumulator)>,
     },
+    /// `$graphLookup`: for each input document, the documents of another collection
+    /// reached by following `connect_from` to `connect_to` from `start_with`, at most
+    /// `max_depth` steps. Executed by the caller, which holds a storage handle (ADR-254).
+    GraphLookup(Box<GraphLookup>),
 }
+
+/// The fields of a `$graphLookup` stage.
+#[derive(Clone, Debug)]
+pub struct GraphLookup {
+    pub from: String,
+    /// Where each walk starts: the value, or the elements of an array.
+    pub start_with: Expr,
+    /// The field of a reached document whose values are followed.
+    pub connect_from: String,
+    /// The field of a foreign document a followed value is matched against.
+    pub connect_to: String,
+    pub as_field: String,
+    /// The most steps taken after the first match; `0` is the first match alone.
+    pub max_depth: usize,
+    /// A field to hold the step (`0` for the first match) each document was reached in.
+    pub depth_field: Option<String>,
+    /// Only foreign documents this admits are reachable.
+    pub restrict: Option<Filter>,
+}
+
+/// The most steps a `$graphLookup` may be asked to take. A walk visits each
+/// document once however deep it goes, so the number bounds the rounds of lookups,
+/// not the memory; a chain longer than this is a request for a different tool.
+pub const MAX_GRAPH_DEPTH: usize = 1000;
 
 /// The fields of a `$vectorSearch` stage: the endpoint's own request fields
 /// and no others (ADR-216).
@@ -273,7 +301,7 @@ impl Stage {
     /// Whether running this stage needs a storage handle.
     pub fn needs_storage(&self) -> bool {
         match self {
-            Stage::Lookup { .. } => true,
+            Stage::Lookup { .. } | Stage::GraphLookup(_) => true,
             Stage::Facet(facets) => {
                 facets.iter().any(|(_, stages)| stages.iter().any(Stage::needs_storage))
             }
@@ -299,6 +327,7 @@ impl Stage {
             Stage::Facet(_) => "$facet",
             Stage::Bucket { .. } => "$bucket",
             Stage::BucketAuto { .. } => "$bucketAuto",
+            Stage::GraphLookup(_) => "$graphLookup",
         }
     }
 }
@@ -428,6 +457,7 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
             }
             parse_facet(as_document(name, value)?, vars, at)
         }
+        "$graphLookup" => parse_graph_lookup(as_document(name, value)?, vars, at),
         "$bucket" => parse_bucket(as_document(name, value)?, vars),
         "$bucketAuto" => parse_bucket_auto(as_document(name, value)?, vars),
         "$vectorSearch" => {
@@ -465,7 +495,7 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         other => Err(Error::InvalidQuery(format!(
             "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
              $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup, $facet, \
-             $bucket, $bucketAuto, $vectorSearch"
+             $bucket, $bucketAuto, $graphLookup, $vectorSearch"
         ))),
     }
 }
@@ -714,20 +744,28 @@ fn parse_query_vector(value: &Bson) -> Result<Vec<f32>> {
 /// too; nothing meaningful is lost, since `$` anchors and a pattern that
 /// opens with two of them can match nothing a `$$`-free one cannot.
 fn refuse_variables_in_match(doc: &Document) -> Result<()> {
-    fn walk_doc(doc: &Document) -> Result<()> {
-        doc.iter().filter(|(key, _)| key.as_str() != "$expr").try_for_each(|(_, value)| walk(value))
+    match first_variable_string(doc) {
+        Some(s) => Err(Error::InvalidQuery(format!(
+            "{s} is not available as a value in a $match: the filter language has no \
+             variables; write the comparison in $expr, {{$expr: {{$eq: [\"$field\", \
+             \"{s}\"]}}}}, or bind it in an $addFields stage and $match on the computed \
+             field"
+        ))),
+        None => Ok(()),
     }
-    fn walk(value: &Bson) -> Result<()> {
+}
+
+/// The first `"$$name"` string value a filter holds, outside any `$expr`.
+fn first_variable_string(doc: &Document) -> Option<String> {
+    fn walk_doc(doc: &Document) -> Option<String> {
+        doc.iter().filter(|(key, _)| key.as_str() != "$expr").find_map(|(_, value)| walk(value))
+    }
+    fn walk(value: &Bson) -> Option<String> {
         match value {
-            Bson::String(s) if s.starts_with("$$") => Err(Error::InvalidQuery(format!(
-                "{s} is not available as a value in a $match: the filter language has no \
-                 variables; write the comparison in $expr, {{$expr: {{$eq: [\"$field\", \
-                 \"{s}\"]}}}}, or bind it in an $addFields stage and $match on the computed \
-                 field"
-            ))),
+            Bson::String(s) if s.starts_with("$$") => Some(s.clone()),
             Bson::Document(doc) => walk_doc(doc),
-            Bson::Array(items) => items.iter().try_for_each(walk),
-            _ => Ok(()),
+            Bson::Array(items) => items.iter().find_map(walk),
+            _ => None,
         }
     }
     walk_doc(doc)
@@ -1074,6 +1112,129 @@ fn is_nan(value: &Bson) -> bool {
         }
         _ => false,
     }
+}
+
+/// `{$graphLookup: {from, startWith, connectFromField, connectToField, as,
+/// maxDepth, depthField?, restrictSearchWithMatch?}}`.
+///
+/// **`maxDepth` is required**, a whole number from 0 to [`MAX_GRAPH_DEPTH`]: a walk
+/// that follows links until it runs out has no bound the caller chose, and one the
+/// server chose would cut it off without a word. The traversal is the caller's
+/// depth and nothing else; what bounds the memory is refused, not cut (see the
+/// executor). Every other key is closed. The two connect fields and the field
+/// names are paths, not expressions: a name beginning with `$` is refused.
+fn parse_graph_lookup(spec: &Document, vars: &[String], at: Placement) -> Result<Stage> {
+    deny_unknown_keys(
+        "$graphLookup",
+        spec,
+        &[
+            "from",
+            "startWith",
+            "connectFromField",
+            "connectToField",
+            "as",
+            "maxDepth",
+            "depthField",
+            "restrictSearchWithMatch",
+        ],
+    )?;
+    let name = |key: &str| -> Result<String> {
+        match spec.get(key) {
+            Some(Bson::String(s))
+                if !s.is_empty() && !s.split('.').any(|seg| seg.starts_with('$')) =>
+            {
+                Ok(s.clone())
+            }
+            Some(Bson::String(_)) => Err(Error::InvalidQuery(format!(
+                "$graphLookup `{key}` is a field name: not empty, and no part of it begins with $"
+            ))),
+            _ => Err(Error::InvalidQuery(format!(
+                "$graphLookup needs a string `{key}`; it takes from, startWith, \
+                 connectFromField, connectToField, as and maxDepth"
+            ))),
+        }
+    };
+    let from = name("from")?;
+    let connect_from = name("connectFromField")?;
+    let connect_to = name("connectToField")?;
+    let as_field = name("as")?;
+    // `as` and `depthField` are written as a field of the document, whole: a dotted name
+    // would be a path, which nests, fails through an array and is not what the caller
+    // reads back, so it is refused rather than guessed at.
+    if as_field.contains('.') {
+        return Err(Error::InvalidQuery(format!(
+            "$graphLookup `as` is the name of one field, not a path: {as_field:?}"
+        )));
+    }
+    let start_with = spec.get("startWith").ok_or_else(|| {
+        Error::InvalidQuery(
+            "$graphLookup needs `startWith`, an expression for where each walk starts".into(),
+        )
+    })?;
+    let start_with = Expr::parse_with_vars(start_with, vars)?;
+    let max_depth = spec.get("maxDepth").ok_or_else(|| {
+        Error::InvalidQuery(format!(
+            "$graphLookup needs `maxDepth`, the most steps to follow (0 to {MAX_GRAPH_DEPTH}); \
+             a walk with no bound the caller chose is not run"
+        ))
+    })?;
+    let max_depth = match crate::expr::as_integer(max_depth, "$graphLookup `maxDepth`") {
+        Ok(n) if (0..=MAX_GRAPH_DEPTH as i64).contains(&n) => n as usize,
+        Ok(n) => {
+            return Err(Error::InvalidQuery(format!(
+                "$graphLookup `maxDepth` is from 0 to {MAX_GRAPH_DEPTH}, found {n}"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let depth_field = match spec.get("depthField") {
+        None => None,
+        Some(_) => {
+            let field = name("depthField")?;
+            if field.contains('.') {
+                return Err(Error::InvalidQuery(format!(
+                    "$graphLookup `depthField` is the name of one field, not a path: {field:?}"
+                )));
+            }
+            Some(field)
+        }
+    };
+    let restrict = match spec.get("restrictSearchWithMatch") {
+        None => None,
+        Some(Bson::Document(raw)) => {
+            // As a `$match` in a `$lookup` sub-pipeline: a `"$$name"` string would be a
+            // literal here, and the author almost certainly meant the variable.
+            if at.sub
+                && let Some(s) = first_variable_string(raw)
+            {
+                // Not `$match`'s advice: this filter is parsed with no `let` bindings at
+                // all, `$expr` included, so writing the comparison there is a 400 too.
+                return Err(Error::InvalidQuery(format!(
+                    "{s} is not available in $graphLookup `restrictSearchWithMatch`: `let` \
+                     variables are not available there, and a \"$$name\" string would be the \
+                     literal text. Restrict with a field condition, and compare against the \
+                     variable in a stage after the $graphLookup"
+                )));
+            }
+            Some(filter::parse(raw)?)
+        }
+        Some(other) => {
+            return Err(Error::InvalidQuery(format!(
+                "$graphLookup `restrictSearchWithMatch` is a filter document, found {}",
+                type_name(other)
+            )));
+        }
+    };
+    Ok(Stage::GraphLookup(Box::new(GraphLookup {
+        from,
+        start_with,
+        connect_from,
+        connect_to,
+        as_field,
+        max_depth,
+        depth_field,
+        restrict,
+    })))
 }
 
 /// `{$bucket: {groupBy, boundaries, default?, output?}}`.
@@ -1469,6 +1630,13 @@ pub fn apply_with_vars(
                     .try_fold(docs, |docs, stage| apply_with_vars(stage, docs, limits, vars))
             })?;
             vec![answer]
+        }
+        Stage::GraphLookup(_) => {
+            return Err(Error::Unsupported(
+                "$graphLookup reads another collection and must be run by the executor that \
+                 holds a storage handle, not by the pure pipeline"
+                    .into(),
+            ));
         }
         Stage::Lookup { .. } => {
             // Not silently passed through: a join that returns its input

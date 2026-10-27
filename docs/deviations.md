@@ -17,6 +17,31 @@ Status meanings:
 
 ---
 
+## 🟡 `$graphLookup` requires `maxDepth`, caps it at 1000, holds its collection against the document limit and orders its result
+
+**Raised 2026-10-26, with ADR-254.** `$graphLookup` is built
+([aggregation.md](aggregation.md#graphlookup)). Where it differs from other systems':
+
+- **`maxDepth` is required** and at most 1000 (`400` without or over). Elsewhere it is
+  optional and a walk runs to exhaustion.
+- **The foreign collection is held whole against the pipeline's document limit**
+  (100,000), `400` over, and so is what the walks reach in all. Elsewhere a walk is
+  bounded by a memory budget in bytes, spilling or failing; here nothing is cut off and
+  a larger hierarchy takes `restrictSearchWithMatch`, an earlier `$match` or a lower
+  `maxDepth`.
+- **The result is ordered** (step by step, each step in scan order); elsewhere it is
+  unspecified.
+- **A `null` or missing `startWith` starts nothing**, as a missing `localField` joins
+  nothing in `$lookup`; a `null` in a `startWith` array and a `null` link are not
+  followed either.
+- `connectFromField`, `connectToField`, `as` and `depthField` must be names without a `$`
+  part, `as` and `depthField` are one field each (a dotted one is `400`), and `depthField`
+  is a long.
+
+**To close:** none planned.
+
+---
+
 ## 🟡 `$bucketAuto` refuses `granularity`, cuts by its own rule, and `$bucket` leaves empty ranges out
 
 **Raised 2026-10-26, with ADR-254.** `$bucket` and `$bucketAuto` are built

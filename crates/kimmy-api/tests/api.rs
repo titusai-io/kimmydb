@@ -13850,6 +13850,73 @@ async fn bucket_and_bucket_auto_build_histograms_and_refuse_what_they_cannot_pla
 }
 
 #[tokio::test]
+async fn graph_lookup_walks_a_collection_and_requires_a_depth() {
+    // ADR-254: the walk follows connectFromField into connectToField, each document
+    // once, to the caller's `maxDepth`; the depth is required, and the foreign
+    // collection is authorized as for `$lookup`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "emp" })).await;
+    for (id, boss) in [("a", json!(null)), ("b", json!("a")), ("c", json!("b")), ("d", json!("c"))]
+    {
+        let res = server
+            .post("/v1/db/shop/coll/emp/docs", Some(&token), json!({ "_id": id, "boss": boss }))
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/emp/aggregate",
+                    Some(token),
+                    json!({ "pipeline": pipeline }),
+                )
+                .await
+        }
+    };
+    let walk = |extra: Value| {
+        let mut spec = json!({ "from": "emp", "startWith": "$boss", "connectFromField": "boss",
+                               "connectToField": "_id", "as": "up" });
+        for (k, v) in extra.as_object().unwrap() {
+            spec[k] = v.clone();
+        }
+        json!([{ "$match": { "_id": "d" } }, { "$graphLookup": spec }])
+    };
+    let res = aggregate(walk(json!({ "maxDepth": 10, "depthField": "step" }))).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"][0]["up"],
+        json!([
+            { "_id": "c", "boss": "b", "step": 0 },
+            { "_id": "b", "boss": "a", "step": 1 },
+            { "_id": "a", "boss": null, "step": 2 }
+        ])
+    );
+    let res = aggregate(walk(json!({ "maxDepth": 0 }))).await;
+    assert_eq!(
+        res.body["documents"][0]["up"],
+        json!([{ "_id": "c", "boss": "b" }]),
+        "{:?}",
+        res.body
+    );
+
+    let res = aggregate(walk(json!({}))).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("needs `maxDepth`"), "{:?}", res.body);
+    let res = aggregate(walk(json!({ "maxDepth": 1001 }))).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(
+        res.body["message"],
+        "invalid query: $graphLookup `maxDepth` is from 0 to 1000, found 1001"
+    );
+    let res = aggregate(walk(json!({ "maxDepth": 1, "from": "nope" }))).await;
+    assert!(res.status == 404 || res.status == 403, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn aggregation_groups_joins_and_ranks_a_decimal128_by_its_value() {
     // Design 2.2: `$group`, `$addToSet` and the `$lookup` join keys identify
     // equal numbers and decimals as one member, a bucket's `_id` the first
