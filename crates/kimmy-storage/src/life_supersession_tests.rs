@@ -1184,3 +1184,74 @@ fn the_clock_passes_an_adopted_floor() {
 fn kimmy_storage_now_ms() -> u64 {
     crate::physical_now_ms()
 }
+
+/// The entries route never decides between "a second life of this name" and "two
+/// members that created one name": a create for a name the receiver holds is a no-op
+/// there (`apply_ddl`), and the create entry carries no floor. What keeps that from
+/// mattering is the serving gate. A receiver that holds the older life lacks the drop
+/// that ended it, so once retention has collected the drop the sender cannot serve the
+/// receiver the entries it lacks (`ServeVerdict::Collected`, answered `BeyondHorizon`
+/// on the wire), and the receiver takes the snapshot route, which replaces the life.
+///
+/// If this fails because the verdict is `Serve`, a create of the second life can reach
+/// the receiver alone and change nothing: the create entry then needs the sender's
+/// floor (ADR-236, "Two readings the entries route never decides").
+#[test]
+fn a_receiver_holding_the_older_life_is_sent_to_the_snapshot_once_the_drop_is_collected() {
+    use crate::{RetentionPolicy, ServeVerdict};
+
+    let (a, _da) = engine();
+    let (p, _dp) = engine();
+    let first = a.create_collection("shop", "orders").unwrap();
+    a.insert(&first, doc! { "_id": 1 }).unwrap();
+    pull(&p, &a);
+    assert!(has(&p, 1), "premise: the receiver holds the older life, by entries");
+    later();
+    a.drop_collection("shop", "orders").unwrap();
+    a.finish_purges_now().unwrap();
+    later();
+    let second = a.create_collection("shop", "orders").unwrap();
+    a.insert(&second, doc! { "_id": 2 }).unwrap();
+
+    let entries = a.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+    let dropped = entries.iter().find(|e| e.kind == OpKind::DropCollection).unwrap().stamp.hlc;
+    let recreated = entries
+        .iter()
+        .filter(|e| e.kind == OpKind::CreateCollection)
+        .map(|e| e.stamp.hlc)
+        .max()
+        .unwrap();
+    assert!(recreated.wall_ms > dropped.wall_ms + 2, "premise: the second life is younger");
+
+    let held = p.witnessed_vector().unwrap();
+    assert_eq!(
+        a.serve_verdict(&held).unwrap(),
+        ServeVerdict::Serve,
+        "with the drop still here the receiver is served the drop and then the create"
+    );
+
+    // Retention collects the drop, and not the second life's creation.
+    let out = a
+        .collect_garbage_at(dropped.wall_ms + 1_000 + 2, RetentionPolicy::new(1, 10_000_000))
+        .unwrap();
+    assert!(out.oplog_removed > 0, "premise: retention collected: {out:?}");
+    let kinds: Vec<_> = a
+        .entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.kind)
+        .collect();
+    assert!(
+        kinds.contains(&OpKind::CreateCollection) && !kinds.contains(&OpKind::DropCollection),
+        "premise: the creation of the second life is left and the drop is gone: {kinds:?}"
+    );
+
+    assert_eq!(
+        a.serve_verdict(&held).unwrap(),
+        ServeVerdict::Collected,
+        "the receiver lacks the collected drop, so it is not served the lone create"
+    );
+    transfer(&p, &a);
+    assert_holds_the_senders_life(&a, &p, "snapshot after the drop was collected");
+}

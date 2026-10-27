@@ -1325,6 +1325,27 @@ mod tests {
                 assert_eq!(compared(&verdicts, id), Some(true), "{id:?}: {verdicts:?}");
             }
         }
+        // Every document is on both members, whichever `created` each keeps ...
+        for (who, e) in [("a", &a), ("b", &b)] {
+            let coll = e.get_collection("shop", "orders").unwrap();
+            for i in (0..5i64).chain(10..15) {
+                assert!(e.get(&coll, &DocId::Int64(i)).unwrap().is_some(), "{who} lacks {i}");
+            }
+        }
+        // ... and the difference changes no outcome: a later drop on one member leaves
+        // both without the collection.
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        a.drop_collection("shop", "orders").unwrap();
+        a.finish_purges_now().unwrap();
+        sync(&a, &b);
+        sync(&a, &b);
+        let _ = b.finish_purges_now();
+        for (who, e) in [("a", &a), ("b", &b)] {
+            assert!(
+                e.get_collection("shop", "orders").is_err(),
+                "{who} still holds the collection after the drop"
+            );
+        }
     }
 
     fn system_collections(e: &Engine) -> usize {
