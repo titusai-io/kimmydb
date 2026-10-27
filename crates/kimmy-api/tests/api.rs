@@ -10542,7 +10542,7 @@ async fn an_unknown_pipeline_stage_is_a_bad_request() {
         .post(
             "/v1/db/shop/coll/orders/aggregate",
             Some(&token),
-            json!({"pipeline": [{"$bucketAuto": {}}]}),
+            json!({"pipeline": [{"$merge": {}}]}),
         )
         .await;
     // 400, not 501: an unknown stage is the same class as an unknown filter
@@ -10551,7 +10551,7 @@ async fn an_unknown_pipeline_stage_is_a_bad_request() {
     // like `coordinated` unique enforcement.
     assert_eq!(res.status, 400, "{:?}", res.body);
     let body = format!("{:?}", res.body);
-    assert!(body.contains("$bucketAuto"), "the error must name what was rejected: {body}");
+    assert!(body.contains("$merge"), "the error must name what was rejected: {body}");
     assert!(body.contains("$group"), "and list what is supported: {body}");
 }
 
@@ -13776,6 +13776,77 @@ async fn facet_answers_one_document_of_arrays_and_refuses_what_it_cannot_hold() 
     assert_eq!(res.status, 400, "{:?}", res.body);
     let res = aggregate(json!([{ "$facet": { "a": [ { "$lookup": { "from": "nope", "localField": "city", "foreignField": "city", "as": "g" } } ] } }])).await;
     assert!(res.status == 404 || res.status == 403, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn bucket_and_bucket_auto_build_histograms_and_refuse_what_they_cannot_place() {
+    // ADR-254: `$bucket` ranges are [lower, upper), a value in none is refused unless
+    // there is a `default`; `$bucketAuto` never splits a value and has no granularity.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "b" })).await;
+    for (id, price) in [(1, 5), (2, 15), (3, 15), (4, 25), (5, 250)] {
+        let res = server
+            .post("/v1/db/shop/coll/b/docs", Some(&token), json!({ "_id": id, "price": price }))
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/b/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    let res = aggregate(json!([{ "$bucket": {
+        "groupBy": "$price", "boundaries": [0, 10, 20, 100], "default": "big",
+        "output": { "n": { "$sum": 1 }, "ids": { "$push": "$_id" } }
+    } }]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            { "_id": 0, "n": 1, "ids": [1] },
+            { "_id": 10, "n": 2, "ids": [2, 3] },
+            { "_id": 20, "n": 1, "ids": [4] },
+            { "_id": "big", "n": 1, "ids": [5] }
+        ])
+    );
+    let res =
+        aggregate(json!([{ "$bucket": { "groupBy": "$price", "boundaries": [0, 10, 20, 100] } }]))
+            .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(
+        res.body["message"],
+        "invalid query: $bucket: the value 250 falls in no bucket and there is no `default`; add a \
+         `default`, or a boundary below and above it"
+    );
+    let res =
+        aggregate(json!([{ "$bucket": { "groupBy": "$price", "boundaries": [0, 20, 10] } }])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let res = aggregate(json!([{ "$bucketAuto": { "groupBy": "$price", "buckets": 2 } }])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            { "_id": { "min": 5, "max": 25 }, "count": 3 },
+            { "_id": { "min": 25, "max": 250 }, "count": 2 }
+        ])
+    );
+    let res = aggregate(
+        json!([{ "$bucketAuto": { "groupBy": "$price", "buckets": 2, "granularity": "R5" } }]),
+    )
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("`granularity` is not supported"));
+    let res = aggregate(json!([{ "$facet": {
+        "hist": [ { "$bucket": { "groupBy": "$price", "boundaries": [0, 100], "default": "x" } } ]
+    } }]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
 }
 
 #[tokio::test]

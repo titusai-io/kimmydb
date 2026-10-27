@@ -17,6 +17,30 @@ Status meanings:
 
 ---
 
+## 🟡 `$bucketAuto` refuses `granularity`, cuts by its own rule, and `$bucket` leaves empty ranges out
+
+**Raised 2026-10-26, with ADR-254.** `$bucket` and `$bucketAuto` are built
+([aggregation.md](aggregation.md#bucket-and-bucketauto)). Where they differ from other
+systems' versions:
+
+- **`granularity` is a `400`** in `$bucketAuto`. The preferred-number series (E6 to E192,
+  powers of two, 1-2-5) that round its boundaries are not built, and the option is refused
+  rather than ignored.
+- **`$bucketAuto` cuts by a documented rule**: `ceil(r / b)` documents of what is left,
+  extended to the end of a run of equal values. Other systems divide by their own rule, so
+  a port can see different `min`/`max` and counts where values repeat or the count does
+  not divide evenly. Every value is in exactly one bucket and a value is never split, in
+  both.
+- **`$bucket` answers only the ranges that received a document.** A port that expects a
+  row of `count: 0` for an empty range fills the gap from its boundaries.
+- **A `$bucket` `default` must be outside the ranges** (below the first boundary or at or
+  above the last), and boundaries must be constants of one kind, strictly ascending (a
+  `NaN`, a `null` and a `$`-string are refused).
+
+**To close:** the series would close the first point; the cut is a choice. Not planned.
+
+---
+
 ## 🟡 `$facet` refuses a nested `$facet` and a `$vectorSearch`, takes at most 64 facets, and counts its outputs against the document limit
 
 **Raised 2026-10-26, with ADR-254.** `$facet` is built: several sub-pipelines over one

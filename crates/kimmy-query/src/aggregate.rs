@@ -134,6 +134,21 @@ pub enum Stage {
     /// document holding each one's output under its name (ADR-254). Run by
     /// [`run_facet`], which the caller gives the way to run a sub-pipeline.
     Facet(Vec<(String, Vec<Stage>)>),
+    /// `$bucket`: documents grouped into the ranges `[b0, b1)`, `[b1, b2)`, ... of
+    /// `boundaries`, and the rest into `default` if there is one (ADR-254).
+    Bucket {
+        group_by: Expr,
+        boundaries: Vec<Bson>,
+        default: Option<Bson>,
+        fields: Vec<(String, Accumulator)>,
+    },
+    /// `$bucketAuto`: documents sorted by `group_by` and cut into at most `buckets`
+    /// runs of about equal size, a value never split across two (ADR-254).
+    BucketAuto {
+        group_by: Expr,
+        buckets: usize,
+        fields: Vec<(String, Accumulator)>,
+    },
 }
 
 /// The fields of a `$vectorSearch` stage: the endpoint's own request fields
@@ -282,6 +297,8 @@ impl Stage {
             Stage::Lookup { .. } => "$lookup",
             Stage::VectorSearch(_) => "$vectorSearch",
             Stage::Facet(_) => "$facet",
+            Stage::Bucket { .. } => "$bucket",
+            Stage::BucketAuto { .. } => "$bucketAuto",
         }
     }
 }
@@ -411,6 +428,8 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
             }
             parse_facet(as_document(name, value)?, vars, at)
         }
+        "$bucket" => parse_bucket(as_document(name, value)?, vars),
+        "$bucketAuto" => parse_bucket_auto(as_document(name, value)?, vars),
         "$vectorSearch" => {
             // The stage is the pipeline's source, in place of the collection
             // scan, so it can only be the first stage of the top-level
@@ -446,7 +465,7 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         other => Err(Error::InvalidQuery(format!(
             "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
              $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup, $facet, \
-             $vectorSearch"
+             $bucket, $bucketAuto, $vectorSearch"
         ))),
     }
 }
@@ -952,19 +971,32 @@ fn parse_group(spec: &Document, vars: &[String]) -> Result<Stage> {
     })?;
     let id = Expr::parse_with_vars(id, vars)?;
 
+    let fields = parse_accumulators("$group", spec, vars, true)?;
+    Ok(Stage::Group { id, fields })
+}
+
+/// The `{<name>: {<accumulator>: <expression>}}` fields of `$group`, `$bucket`
+/// and `$bucketAuto`. `skip_id` leaves out the `_id` key, which `$group` reads
+/// itself.
+fn parse_accumulators(
+    stage: &str,
+    spec: &Document,
+    vars: &[String],
+    skip_id: bool,
+) -> Result<Vec<(String, Accumulator)>> {
     let mut fields = Vec::new();
     for (name, value) in spec {
-        if name == "_id" {
+        if skip_id && name == "_id" {
             continue;
         }
         let acc = value.as_document().ok_or_else(|| {
             Error::InvalidQuery(format!(
-                "$group field `{name}` must be an accumulator document, e.g. {{$sum: 1}}"
+                "{stage} field `{name}` must be an accumulator document, e.g. {{$sum: 1}}"
             ))
         })?;
         if acc.len() != 1 {
             return Err(Error::InvalidQuery(format!(
-                "$group field `{name}` must name exactly one accumulator"
+                "{stage} field `{name}` must name exactly one accumulator"
             )));
         }
         let (op, arg) = acc.iter().next().expect("length checked above");
@@ -987,7 +1019,210 @@ fn parse_group(spec: &Document, vars: &[String]) -> Result<Stage> {
         };
         fields.push((name.clone(), accumulator));
     }
-    Ok(Stage::Group { id, fields })
+    Ok(fields)
+}
+
+/// `_id` is the bucket's key, so an `output` field of that name would overwrite it.
+fn refuse_id_in_output(stage: &str, output: &Document) -> Result<()> {
+    if output.contains_key("_id") {
+        return Err(Error::InvalidQuery(format!(
+            "{stage} `output` cannot name `_id`: it is the bucket's key; name the accumulator \
+             something else"
+        )));
+    }
+    Ok(())
+}
+
+/// What a `$bucket` or `$bucketAuto` computes when it is given no `output`.
+fn default_bucket_output() -> Vec<(String, Accumulator)> {
+    vec![("count".to_string(), Accumulator::Sum(Expr::Literal(Bson::Int32(1))))]
+}
+
+/// The kind of value a `$bucket` boundary is, so that a list of them is one
+/// ordered series: every number is one kind (they compare by value), and so on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BoundaryKind {
+    Number,
+    String,
+    Date,
+    ObjectId,
+    Bool,
+}
+
+impl BoundaryKind {
+    fn of(value: &Bson) -> Option<Self> {
+        match value {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                Some(Self::Number)
+            }
+            Bson::String(_) => Some(Self::String),
+            Bson::DateTime(_) => Some(Self::Date),
+            Bson::ObjectId(_) => Some(Self::ObjectId),
+            Bson::Boolean(_) => Some(Self::Bool),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a boundary is a number that is not one: a `NaN` has no place in an
+/// ordered series (it compares below every number).
+fn is_nan(value: &Bson) -> bool {
+    match value {
+        Bson::Double(d) => d.is_nan(),
+        Bson::Decimal128(d) => {
+            matches!(kimmy_core::decimal::decode_raw(d), kimmy_core::decimal::Raw::Nan)
+        }
+        _ => false,
+    }
+}
+
+/// `{$bucket: {groupBy, boundaries, default?, output?}}`.
+///
+/// Refused at parse: a key not in that list; no `groupBy`; `boundaries` that is
+/// not an array of at least two values, holds a value that is not a number, a
+/// string, a date, an ObjectId or a boolean (a string beginning with `$` is a
+/// field path in an expression, and is not read as one here: a boundary is a
+/// constant), a `NaN`, values of more than one kind, or values not strictly
+/// ascending; a `default` that falls inside the ranges (it must be below the first
+/// boundary or at or above the last, by the order every comparison uses); an
+/// `output` that is not a non-empty document of accumulators.
+fn parse_bucket(spec: &Document, vars: &[String]) -> Result<Stage> {
+    deny_unknown_keys("$bucket", spec, &["groupBy", "boundaries", "default", "output"])?;
+    let group_by = spec.get("groupBy").ok_or_else(|| {
+        Error::InvalidQuery("$bucket needs a `groupBy` expression, e.g. \"$price\"".into())
+    })?;
+    let group_by = Expr::parse_with_vars(group_by, vars)?;
+    let Some(Bson::Array(boundaries)) = spec.get("boundaries") else {
+        return Err(Error::InvalidQuery(
+            "$bucket needs `boundaries`, an array of at least two values in ascending order".into(),
+        ));
+    };
+    if boundaries.len() < 2 {
+        return Err(Error::InvalidQuery(format!(
+            "$bucket `boundaries` needs at least two values, found {}",
+            boundaries.len()
+        )));
+    }
+    let mut kind = None;
+    for (at, boundary) in boundaries.iter().enumerate() {
+        let Some(this) = BoundaryKind::of(boundary).filter(|_| !is_nan(boundary)) else {
+            return Err(Error::InvalidQuery(format!(
+                "$bucket `boundaries` holds numbers, strings, dates, ObjectIds or booleans, \
+                 found {} at position {at}",
+                if is_nan(boundary) { "a NaN" } else { type_name(boundary) }
+            )));
+        };
+        if matches!(boundary, Bson::String(s) if s.starts_with('$')) {
+            return Err(Error::InvalidQuery(format!(
+                "$bucket `boundaries` are constants, and position {at} begins with $"
+            )));
+        }
+        match kind {
+            None => kind = Some(this),
+            Some(first) if first != this => {
+                return Err(Error::InvalidQuery(format!(
+                    "$bucket `boundaries` must all be of one type, and position {at} is {} \
+                     where position 0 is {}",
+                    type_name(boundary),
+                    type_name(&boundaries[0])
+                )));
+            }
+            Some(_) => {}
+        }
+        if at > 0 && !kimmy_core::cmp::canonical_cmp(&boundaries[at - 1], boundary).is_lt() {
+            return Err(Error::InvalidQuery(format!(
+                "$bucket `boundaries` must be in ascending order without repeats, and \
+                 position {at} is not above position {}",
+                at - 1
+            )));
+        }
+    }
+    let default = spec.get("default").cloned();
+    if let Some(Bson::String(s)) = &default
+        && s.starts_with('$')
+    {
+        return Err(Error::InvalidQuery(
+            "$bucket `default` is a constant, and it begins with $".into(),
+        ));
+    }
+    if let Some(default) = &default {
+        let (first, last) = (&boundaries[0], &boundaries[boundaries.len() - 1]);
+        let inside = kimmy_core::cmp::canonical_cmp(default, first).is_ge()
+            && kimmy_core::cmp::canonical_cmp(default, last).is_lt();
+        if inside {
+            return Err(Error::InvalidQuery(
+                "$bucket `default` must be below the first boundary or at or above the last, \
+                 not inside the ranges"
+                    .into(),
+            ));
+        }
+    }
+    let fields = match spec.get("output") {
+        None => default_bucket_output(),
+        Some(Bson::Document(output)) if !output.is_empty() => {
+            refuse_id_in_output("$bucket", output)?;
+            parse_accumulators("$bucket", output, vars, false)?
+        }
+        Some(_) => {
+            return Err(Error::InvalidQuery(
+                "$bucket `output` is a document of accumulators, e.g. {n: {$sum: 1}}, with at \
+                 least one"
+                    .into(),
+            ));
+        }
+    };
+    Ok(Stage::Bucket { group_by, boundaries: boundaries.clone(), default, fields })
+}
+
+/// `{$bucketAuto: {groupBy, buckets, output?}}`. `granularity` is refused: the
+/// preferred-number series that round the boundaries are not built, and a stage
+/// that ignored the option would answer boundaries the caller did not ask for.
+fn parse_bucket_auto(spec: &Document, vars: &[String]) -> Result<Stage> {
+    deny_unknown_keys("$bucketAuto", spec, &["groupBy", "buckets", "output", "granularity"])?;
+    if spec.contains_key("granularity") {
+        return Err(Error::InvalidQuery(
+            "$bucketAuto `granularity` is not supported: the boundaries are the values at the \
+             cut points, and no preferred-number series rounds them"
+                .into(),
+        ));
+    }
+    let group_by = spec.get("groupBy").ok_or_else(|| {
+        Error::InvalidQuery("$bucketAuto needs a `groupBy` expression, e.g. \"$price\"".into())
+    })?;
+    let group_by = Expr::parse_with_vars(group_by, vars)?;
+    let buckets = spec.get("buckets").ok_or_else(|| {
+        Error::InvalidQuery("$bucketAuto needs `buckets`, the number of buckets wanted".into())
+    })?;
+    let buckets = match crate::expr::as_integer(buckets, "$bucketAuto `buckets`") {
+        Ok(n) if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
+        // A whole number below 1 is named by its value, anything else by its type.
+        Ok(n) => {
+            return Err(Error::InvalidQuery(format!(
+                "$bucketAuto `buckets` is a whole number of at least 1, found {n}"
+            )));
+        }
+        Err(_) => {
+            return Err(Error::InvalidQuery(format!(
+                "$bucketAuto `buckets` is a whole number of at least 1, found {}",
+                type_name(buckets)
+            )));
+        }
+    };
+    let fields = match spec.get("output") {
+        None => default_bucket_output(),
+        Some(Bson::Document(output)) if !output.is_empty() => {
+            refuse_id_in_output("$bucketAuto", output)?;
+            parse_accumulators("$bucketAuto", output, vars, false)?
+        }
+        Some(_) => {
+            return Err(Error::InvalidQuery(
+                "$bucketAuto `output` is a document of accumulators, e.g. {n: {$sum: 1}}, with \
+                 at least one"
+                    .into(),
+            ));
+        }
+    };
+    Ok(Stage::BucketAuto { group_by, buckets, fields })
 }
 
 /// Two forms, told apart by their keys and never mixed.
@@ -1207,6 +1442,12 @@ pub fn apply_with_vars(
             unwind(input, p, *preserve_null_and_empty, include_array_index.as_deref(), limits)?
         }
         Stage::Group { id, fields } => group(input, id, fields, limits, vars)?,
+        Stage::Bucket { group_by, boundaries, default, fields } => {
+            bucket(input, group_by, boundaries, default.as_ref(), fields, limits, vars)?
+        }
+        Stage::BucketAuto { group_by, buckets, fields } => {
+            bucket_auto(input, group_by, *buckets, fields, limits, vars)?
+        }
         Stage::VectorSearch(_) => {
             return Err(Error::Unsupported(
                 "$vectorSearch is the pipeline's source and must be run by the executor that \
@@ -1475,15 +1716,29 @@ fn group(
     limits: &Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
-    // Keyed by the *encoded* group value rather than by `Bson`, because `Bson`
-    // is not `Hash` and because two numerically equal values of different types
-    // must land in the same bucket — the same rule indexes use.
+    group_keyed("$group", input, fields, limits, vars, |scope| id.eval_in(scope).map(Some))
+}
+
+/// [`group`] with the key of each document given by `key`, which may decline a
+/// document by answering `None` (it is then in no group and is left out).
+///
+/// Keyed by the *encoded* key rather than by `Bson`, because `Bson` is not `Hash`
+/// and because two numerically equal values of different types must land in the
+/// same bucket, the same rule indexes use.
+fn group_keyed(
+    stage: &str,
+    input: Vec<Document>,
+    fields: &[(String, Accumulator)],
+    limits: &Limits,
+    vars: &[Binding<'_>],
+    mut key_of: impl FnMut(&Scope<'_>) -> Result<Option<Bson>>,
+) -> Result<Vec<Document>> {
     let mut order: Vec<Bucket> = Vec::new();
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
 
     for doc in &input {
         let scope = Scope::with_bindings(doc, vars);
-        let key = id.eval_in(&scope)?;
+        let Some(key) = key_of(&scope)? else { continue };
         let encoded = group_key(&key);
         let slot = match index.get(&encoded) {
             Some(&slot) => slot,
@@ -1493,7 +1748,7 @@ fn group(
                 index.insert(encoded, slot);
                 // One bucket per distinct value, so a high-cardinality key is
                 // exactly the shape that exhausts memory.
-                check_limit("$group", order.len(), limits)?;
+                check_limit(stage, order.len(), limits)?;
                 slot
             }
         };
@@ -1513,6 +1768,123 @@ fn group(
             Ok(out)
         })
         .collect()
+}
+
+/// Run a `$bucket`: each document goes to the range its `groupBy` value falls in,
+/// `[b_i, b_i+1)`, whose key is `b_i` as written; to `default` if the value is
+/// outside every range or is not of the boundaries' kind; and a document with
+/// neither is **refused**, naming the value. Only buckets that received a
+/// document are answered, in boundary order and the `default` bucket last.
+fn bucket(
+    input: Vec<Document>,
+    group_by: &Expr,
+    boundaries: &[Bson],
+    default: Option<&Bson>,
+    fields: &[(String, Accumulator)],
+    limits: &Limits,
+    vars: &[Binding<'_>],
+) -> Result<Vec<Document>> {
+    let kind = BoundaryKind::of(&boundaries[0]);
+    let mut out = group_keyed("$bucket", input, fields, limits, vars, |scope| {
+        let value = group_by.eval_in(scope)?;
+        let inside = (BoundaryKind::of(&value) == kind && !is_nan(&value))
+            .then(|| {
+                boundaries.partition_point(|b| kimmy_core::cmp::canonical_cmp(b, &value).is_le())
+            })
+            .filter(|&above| above > 0 && above < boundaries.len());
+        match (inside, default) {
+            (Some(above), _) => Ok(Some(boundaries[above - 1].clone())),
+            (None, Some(default)) => Ok(Some(default.clone())),
+            (None, None) => Err(Error::InvalidQuery(format!(
+                "$bucket: {} falls in no bucket and there is no `default`; add a `default`, \
+                 or a boundary below and above it",
+                describe_value(&value)
+            ))),
+        }
+    })?;
+    let default_key = default.map(group_key);
+    out.sort_by(|a, b| {
+        let (ka, kb) = (a.get("_id").unwrap_or(&Bson::Null), b.get("_id").unwrap_or(&Bson::Null));
+        let is_default = |k: &Bson| default_key.as_ref().is_some_and(|d| *d == group_key(k));
+        is_default(ka).cmp(&is_default(kb)).then_with(|| kimmy_core::cmp::canonical_cmp(ka, kb))
+    });
+    Ok(out)
+}
+
+/// A value in an error message: its text if it is short, its type if not.
+fn describe_value(value: &Bson) -> String {
+    let text = match value {
+        Bson::Null => return "null or a missing value".to_string(),
+        Bson::String(s) => format!("{s:?}"),
+        Bson::Int32(_)
+        | Bson::Int64(_)
+        | Bson::Double(_)
+        | Bson::Boolean(_)
+        | Bson::Decimal128(_)
+        | Bson::DateTime(_)
+        | Bson::ObjectId(_) => value.to_string(),
+        other => return format!("a value of {}", type_name(other)),
+    };
+    if text.chars().count() > 60 {
+        format!("a value of {}", type_name(value))
+    } else {
+        format!("the value {text}")
+    }
+}
+
+/// Run a `$bucketAuto`: the documents sorted by their `groupBy` value (the
+/// order `$sort` uses, stable) and cut into at most `buckets` runs.
+///
+/// With `r` documents and `b` buckets left, the next bucket takes `ceil(r / b)`
+/// documents and then every further document holding the value of its last (a value
+/// is never split across two buckets), so buckets are as even as the values allow
+/// and there are fewer than asked for when values repeat. A bucket is answered as
+/// `_id: {min, max}`: its first value, and the next bucket's first value (the
+/// last bucket's own largest). Nothing is answered for an empty input.
+fn bucket_auto(
+    input: Vec<Document>,
+    group_by: &Expr,
+    buckets: usize,
+    fields: &[(String, Accumulator)],
+    limits: &Limits,
+    vars: &[Binding<'_>],
+) -> Result<Vec<Document>> {
+    let mut keyed: Vec<(Bson, Document)> = Vec::with_capacity(input.len());
+    for doc in input {
+        let key = group_by.eval_in(&Scope::with_bindings(&doc, vars))?;
+        keyed.push((key, doc));
+    }
+    keyed.sort_by(|a, b| kimmy_core::cmp::canonical_cmp(&a.0, &b.0));
+    let same = |a: &Bson, b: &Bson| kimmy_core::cmp::canonical_cmp(a, b).is_eq();
+
+    let mut out = Vec::new();
+    let (mut start, mut left) = (0usize, buckets);
+    while start < keyed.len() {
+        let remaining = keyed.len() - start;
+        let mut end = if left <= 1 { keyed.len() } else { start + remaining.div_ceil(left) };
+        while end < keyed.len() && same(&keyed[end - 1].0, &keyed[end].0) {
+            end += 1;
+        }
+        let mut states: Vec<AccState> = fields.iter().map(init).collect();
+        for (_, doc) in &keyed[start..end] {
+            let scope = Scope::with_bindings(doc, vars);
+            for (state, (_, acc)) in states.iter_mut().zip(fields) {
+                accumulate(state, acc, &scope)?;
+            }
+        }
+        let max = if end < keyed.len() { keyed[end].0.clone() } else { keyed[end - 1].0.clone() };
+        let mut answer = Document::new();
+        answer.insert("_id", bson::doc! { "min": keyed[start].0.clone(), "max": max });
+        for (state, (name, _)) in states.into_iter().zip(fields) {
+            answer.insert(name.clone(), finish(state)?);
+        }
+        out.push(answer);
+        // Counted as they are emitted: `buckets` asked for is not the buckets made.
+        check_limit("$bucketAuto", out.len(), limits)?;
+        start = end;
+        left = left.saturating_sub(1).max(1);
+    }
+    Ok(out)
 }
 
 fn init((_, acc): &(String, Accumulator)) -> AccState {
@@ -2435,8 +2807,8 @@ mod tests {
 
     #[test]
     fn an_unknown_stage_names_what_is_supported() {
-        let err = parse(&[doc! {"$bucketAuto": {}}]).unwrap_err().to_string();
-        assert!(err.contains("$bucketAuto"), "{err}");
+        let err = parse(&[doc! {"$merge": {}}]).unwrap_err().to_string();
+        assert!(err.contains("$merge"), "{err}");
         assert!(err.contains("$group"), "the error should list what does work: {err}");
     }
 
@@ -2802,13 +3174,13 @@ mod tests {
 
     #[test]
     fn the_unsupported_stage_message_lists_vector_search() {
-        let err = parse(&[doc! {"$bucket": {}}]).unwrap_err().to_string();
+        let err = parse(&[doc! {"$out": "x"}]).unwrap_err().to_string();
         assert!(err.contains("$vectorSearch"), "{err}");
     }
 
     #[test]
     fn the_unsupported_stage_message_lists_the_new_stages() {
-        let err = parse(&[doc! {"$bucket": {}}]).unwrap_err().to_string();
+        let err = parse(&[doc! {"$out": "x"}]).unwrap_err().to_string();
         assert!(err.contains("$addFields"), "got: {err}");
         assert!(err.contains("$replaceRoot"), "got: {err}");
     }
