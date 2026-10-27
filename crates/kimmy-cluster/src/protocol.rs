@@ -614,6 +614,17 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message,
     decode(&read_body(reader).await?)
 }
 
+/// [`read_frame`], bounded: the first byte has `waits.idle`, and a frame that
+/// has begun must go on arriving, a read at a time, within `waits.stall`. A wait
+/// that runs out at the first byte is [`ProtocolError::Idle`]; one inside a frame
+/// is [`ProtocolError::TimedOut`].
+pub(crate) async fn read_frame_within<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    waits: FrameWaits,
+) -> Result<Message, ProtocolError> {
+    decode(&read_body_within(reader, Some(waits)).await?)
+}
+
 /// [`read_frame`], whether this frame carried a `facts` block that did not
 /// decode (ADR-201), and the **decode sequence** taken as it decoded (ADR-213).
 /// The flag is cleared and taken with **no await between**, right around the

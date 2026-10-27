@@ -330,6 +330,53 @@ fn first_reply_timeout() -> Duration {
     FIRST_REPLY_TIMEOUT
 }
 
+/// How long a round waits for the reply to an **ordinary pull**, `AskEntries`
+/// with `held`: the first byte of the answer, and then each read of a frame that
+/// has begun.
+///
+/// A pull that says what it holds is partial-capable (ADR-194): the serving walk
+/// ends at its 2 s or 65,536-row budget, so the answer does not wait on a long
+/// walk, and a serving member that is only busy answers in well under this (no
+/// pull of round 0580's 3,425 had a serve phase over 2.5 s). A peer that has
+/// answered the first request and then says nothing is frozen, gone or wedged,
+/// and waiting [`REQUEST_TIMEOUT`] (30 s) for it holds the rest of the tick
+/// behind it, as the first reply did before [`FIRST_REPLY_TIMEOUT`]. The bound is
+/// on the silence, never on the frame: a large window that keeps arriving is not
+/// cut short. A replay (no `held`) walks the oplog without a budget and a
+/// snapshot's pages are not a pull, so they keep [`REQUEST_TIMEOUT`].
+const PULL_REPLY_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+
+const _: () = assert!(PULL_REPLY_TIMEOUT.as_secs() < REQUEST_TIMEOUT.as_secs());
+
+/// [`PULL_REPLY_TIMEOUT`], or a test's shorter one.
+fn pull_reply_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(shorter) = test_hooks::PULL_REPLY.with(|t| t.get()) {
+        return shorter;
+    }
+    PULL_REPLY_TIMEOUT
+}
+
+/// The reply to an ordinary pull (`partial`: it asked with `held`), or to any other
+/// window request, which keeps the round's own limit. A silence over
+/// [`PULL_REPLY_TIMEOUT`] fails the round as `the reply to a pull`.
+async fn read_pull_reply<S>(stream: &mut S, partial: bool) -> Result<Message, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    if !partial {
+        return read_frame(stream).await;
+    }
+    let silence = pull_reply_timeout();
+    let waits = crate::protocol::FrameWaits { idle: silence, stall: silence };
+    match crate::protocol::read_frame_within(stream, waits).await {
+        Err(ProtocolError::Idle | ProtocolError::TimedOut(_)) => {
+            Err(ProtocolError::TimedOut("the reply to a pull".into()))
+        }
+        other => other,
+    }
+}
+
 /// Called on the serving side with what a pushed batch became (ADR-140), so
 /// the receiver's own counters see a refusal that arrived by push exactly as
 /// one that arrived by pull.
@@ -2758,7 +2805,7 @@ where
                 },
             )
             .await?;
-            let answer = read_frame(stream).await?;
+            let answer = read_pull_reply(stream, asked_partial).await?;
             clock.heard_now();
             answer
         }
@@ -2783,7 +2830,7 @@ where
             partial: asked_partial,
         };
         write_frame(stream, &retry).await?;
-        answer = read_frame(stream).await?;
+        answer = read_pull_reply(stream, asked_partial).await?;
         clock.heard_now();
     }
 
@@ -6381,6 +6428,10 @@ pub(crate) mod test_hooks {
     thread_local! {
         /// A shorter first-reply bound for a test that cannot wait ten seconds.
         pub static FIRST_REPLY: std::cell::Cell<Option<std::time::Duration>> =
+            const { std::cell::Cell::new(None) };
+        /// A shorter bound on the reply to an ordinary pull, for a test that cannot
+        /// wait ten seconds.
+        pub static PULL_REPLY: std::cell::Cell<Option<std::time::Duration>> =
             const { std::cell::Cell::new(None) };
         /// Slept after a round's window is applied, inside the apply's time.
         pub static APPLY_TAKES: std::cell::Cell<std::time::Duration> =
@@ -11945,6 +11996,100 @@ mod tests {
         assert_eq!(first_reply_timeout(), HANDSHAKE_TIMEOUT);
         assert_eq!(first_reply_timeout(), Duration::from_secs(10));
         assert!(REQUEST_TIMEOUT > first_reply_timeout());
+    }
+
+    /// **A peer that answers the first request and then freezes costs the pull-reply
+    /// bound, not the round's thirty seconds.** The fake peer advertises entries the
+    /// member lacks, reads the `AskEntries` that says what the member holds, and says
+    /// nothing more; with the bound at a second the round fails as `the reply to a
+    /// pull` in about a second.
+    #[tokio::test]
+    async fn a_peer_frozen_after_the_first_reply_fails_the_pull_on_the_pull_reply_bound() {
+        use tokio::io::DuplexStream;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let mut ahead = VersionVector::new();
+        ahead.insert(node(7), Hlc::new(5_000, 0));
+
+        async fn freezing_peer(mut stream: DuplexStream, servable: VersionVector) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { .. } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let answer = Message::Vectors {
+                servable: servable.clone(),
+                witnessed: servable,
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+            };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskEntries { held: Some(_), partial: true, .. } => {}
+                other => panic!("expected an ordinary partial-capable pull, got {other:?}"),
+            }
+            std::future::pending::<()>().await;
+        }
+
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(freezing_peer(theirs, ahead));
+        test_hooks::PULL_REPLY.with(|t| t.set(Some(Duration::from_secs(1))));
+        let began = Instant::now();
+        let addr: SocketAddr = "127.0.0.1:3".parse().unwrap();
+        let round = sync_over(&engine, ours, addr, node(7), None, &mut PeerStalls::new()).await;
+        test_hooks::PULL_REPLY.with(|t| t.set(None));
+        peer.abort();
+        let e = round.expect_err("nothing answers the pull");
+        assert!(
+            matches!(&e, ProtocolError::TimedOut(what) if what == "the reply to a pull"),
+            "{e:?}"
+        );
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+    }
+
+    /// The bound is on a pull's reply and on silence: a reply that arrives inside it is
+    /// read, and a request that is not an ordinary pull (a replay, which sends no
+    /// `held`) keeps the round's own limit however late its reply is.
+    #[tokio::test]
+    async fn only_an_ordinary_pulls_reply_has_the_short_bound() {
+        async fn replies_after(delay: Duration) -> tokio::io::DuplexStream {
+            let (ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let nothing = Message::Entries {
+                    entries: Vec::new(),
+                    scanned_to: Hlc::ZERO,
+                    exhausted: true,
+                    passed_through: None,
+                };
+                write_frame(&mut theirs, &nothing).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            ours
+        }
+        test_hooks::PULL_REPLY.with(|t| t.set(Some(Duration::from_secs(1))));
+        // Inside the bound: read.
+        let mut early = replies_after(Duration::from_millis(200)).await;
+        assert!(read_pull_reply(&mut early, true).await.is_ok());
+        // Past it: a pull's reply fails, a replay's is waited for.
+        let mut late = replies_after(Duration::from_millis(1_500)).await;
+        let e = read_pull_reply(&mut late, true).await.expect_err("silent past the bound");
+        assert!(
+            matches!(&e, ProtocolError::TimedOut(what) if what == "the reply to a pull"),
+            "{e:?}"
+        );
+        let mut replay = replies_after(Duration::from_millis(1_500)).await;
+        assert!(read_pull_reply(&mut replay, false).await.is_ok());
+        test_hooks::PULL_REPLY.with(|t| t.set(None));
+    }
+
+    /// The bound is the handshake's, shorter than the request timeout it replaces for
+    /// an ordinary pull's reply.
+    #[test]
+    fn the_pull_reply_bound_is_the_handshakes_and_shorter_than_the_request_timeout() {
+        assert_eq!(pull_reply_timeout(), HANDSHAKE_TIMEOUT);
+        assert!(pull_reply_timeout() < REQUEST_TIMEOUT);
     }
 
     /// An idle two-node cluster's rounds end as rounds, not as failures. Each
