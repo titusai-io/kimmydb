@@ -59,7 +59,7 @@ regex as a value too. See [Deviations](deviations.md).
 | Operator | Meaning |
 |---|---|
 | `$and` `$or` `$nor` | Top-level, take arrays of filter documents |
-| `$not` | Applied to a **field's** operators, not at the top level |
+| `$not` | Applied to a **field's** operators, not at the top level. Its document must hold at least one operator: `{"$not": {"score": 8}}` is a `400` (write `$ne`, or `{"$not": {"$elemMatch": {...}}}`) |
 | `$expr` | Top-level, takes an [aggregation expression](aggregation.md#expressions); matches when it is truthy |
 
 ```javascript
@@ -508,7 +508,8 @@ removes `2.0`, and a document matches whole, field order included. `$pull`
 also takes a condition (below); `$pullAll` does not, and compares an operator
 document in its list as the plain document it is. `$pullAll` on a field that
 is missing does nothing; on a field that is not an array it is a `400`,
-because the caller believes the field is an array and it is not.
+because the caller believes the field is an array and it is not. **So is `$pull`,
+of a value or a condition**: `cannot apply $pull to non-array field "v"`.
 
 ### `$pull`: a value or a condition
 
@@ -537,7 +538,11 @@ their fields, spell it `$elemMatch`: it matches the fields of a document
 element, where the plain `{ "score": 8 }` is a value and removes only a
 document equal to it. The condition is parsed once, with the update: an
 unknown operator or a bad argument (`{ "$in": 3 }`) is a `400` before any
-element is looked at. `$pull` from a field that is missing does nothing.
+element is looked at. `$pull` from a field that is missing does nothing, and from
+one that is not an array is a `400`. A `$not` in a condition takes operators, as
+everywhere (`{ "$not": { "$gt": 2 } }`): `{ "$not": { "score": 8 } }` is a `400`
+naming `$ne` and `$elemMatch`, because a document with no operator in it would be
+read as the negation of an equality on a whole document.
 
 ### `$bit`
 

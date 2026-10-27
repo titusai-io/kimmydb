@@ -101,6 +101,18 @@ fn null_and_missing_give_null_and_a_non_number_is_refused() {
         assert_eq!(val(op(name, vec![Bson::Int32(5), Bson::Null]), none()), Bson::Null);
         assert_eq!(val(op(name, vec![Bson::Null, Bson::Int32(2)]), none()), Bson::Null);
         assert!(err(op(name, vec![Bson::String("x".into())]), none()).contains("needs numbers"));
+        // A value that is not a number is refused whatever the place is, a null one included.
+        for place in [Bson::Null, Bson::Int32(2)] {
+            assert!(
+                err(op(name, vec![Bson::String("text".into()), place]), none())
+                    .contains("needs numbers")
+            );
+        }
+        // An unusable place is refused even when the number is null.
+        assert!(
+            err(op(name, vec![Bson::Null, Bson::Int32(101)]), none())
+                .contains("between -20 and 100")
+        );
     }
     assert_eq!(val(op("$pow", vec![Bson::Null, Bson::Int32(2)]), none()), Bson::Null);
     assert_eq!(val(op("$pow", vec![Bson::Int32(2), Bson::Null]), none()), Bson::Null);
@@ -661,4 +673,45 @@ fn every_now_of_a_request_is_the_same_date_across_parses_that_share_a_clock() {
     let third = Expr::parse(&Bson::String("$$NOW".into())).unwrap();
     assert_eq!(first, third);
     drop(second);
+}
+
+/// A pipeline of one stage run over one document, which may be refused.
+fn try_run(pipeline: &[Document], input: Document) -> kimmy_core::Result<Vec<Document>> {
+    let mut docs = vec![input];
+    for stage in aggregate::parse(pipeline)? {
+        docs = aggregate::apply(&stage, docs, &Limits::default())?;
+    }
+    Ok(docs)
+}
+
+#[test]
+fn remove_at_a_path_a_value_could_not_be_written_to_is_refused_with_the_same_error() {
+    // Through an array by a name: `$addFields` of a value there is refused, so is leaving it out.
+    let value = try_run(&[doc! {"$addFields": {"a.b": 1}}], doc! {"a": [{"b": 1}]})
+        .expect_err("a value cannot be written through an array by a name")
+        .to_string();
+    let removed = try_run(&[doc! {"$addFields": {"a.b": "$$REMOVE"}}], doc! {"a": [{"b": 1}]})
+        .expect_err("nor can it be left out")
+        .to_string();
+    assert_eq!(removed, value);
+    assert!(removed.contains("cannot set \"a.b\""), "{removed}");
+    // A position in the array leaves a null hole, as `$unset` does; a position that is not
+    // there, a field that is not, and a path through a scalar are nothing to remove.
+    assert_eq!(
+        try_run(&[doc! {"$addFields": {"a.0": "$$REMOVE"}}], doc! {"a": [1, 2]}).unwrap(),
+        vec![doc! {"a": [Bson::Null, 2]}]
+    );
+    assert_eq!(
+        try_run(&[doc! {"$addFields": {"a.0.b": "$$REMOVE"}}], doc! {"a": [{"b": 1, "c": 2}]})
+            .unwrap(),
+        vec![doc! {"a": [{"c": 2}]}]
+    );
+    for input in [doc! {"a": [1, 2]}, doc! {"a": 5}, doc! {}, doc! {"a": {"c": 1}}] {
+        let path =
+            if input.get("a").is_some_and(|a| a.as_array().is_some()) { "a.7" } else { "a.b.c" };
+        assert_eq!(
+            try_run(&[doc! {"$addFields": {path: "$$REMOVE"}}], input.clone()).unwrap(),
+            vec![input]
+        );
+    }
 }

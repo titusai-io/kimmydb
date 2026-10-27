@@ -780,8 +780,10 @@ fn pow_special_values() {
     assert_eq!(pow(&NEG_INF, &d("-3")), Ok(neg_zero));
     assert_eq!(pow(&NEG_INF, &two), Ok(INFINITY));
     assert_eq!(pow(&NEG_INF, &d("-2")), Ok(zero));
-    assert_eq!(pow(&NEG_INF, &half), Ok(INFINITY));
-    assert_eq!(pow(&NEG_INF, &d("-0.5")), Ok(zero));
+    // A negative infinity to a power that is not a whole number has no real value.
+    assert_eq!(pow(&NEG_INF, &half), Err(Domain));
+    assert_eq!(pow(&NEG_INF, &d("2.5")), Err(Domain));
+    assert_eq!(pow(&NEG_INF, &d("-0.5")), Err(Domain));
     assert_eq!(pow(&INFINITY, &INFINITY), Ok(INFINITY));
     assert_eq!(pow(&INFINITY, &NEG_INF), Ok(zero));
     assert_eq!(pow(&NEG_INF, &INFINITY), Ok(INFINITY));

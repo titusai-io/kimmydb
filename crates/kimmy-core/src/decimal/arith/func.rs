@@ -47,7 +47,7 @@
 //! multiplied by `y`, which is bounded because a `|y ln x|` above 14300 is
 //! decided at once (an overflow or an underflow); the worst is about `10^-76`.
 //! **So the relative error before the last rounding is below `10^-75` for
-//! every input, against the `10^-60` the contract asks, and the only inputs
+//! every input, and the only inputs
 //! that can round the wrong way are those whose exact result lies within
 //! `10^-75` of a midpoint between two 34-digit neighbours.** No input is known
 //! to: the oracle test against decNumber at 120 digits (about 30,000 inputs
@@ -979,6 +979,11 @@ pub fn pow(x: &Raw, y: &Raw) -> Result<Raw, Domain> {
         return Ok(NAN);
     };
     let ye = i64::from(ye);
+    // A negative base to a power that is not a whole number has no real value, an
+    // infinite base included: refused before the infinities are looked at.
+    if matches!(*x, Raw::Inf { negative: true }) && y_parity == Whole::No {
+        return Err(Domain);
+    }
     if let Raw::Inf { negative: x_negative } = *x {
         let negative = x_negative && y_parity == Whole::Odd;
         return Ok(if y_negative { signed_zero(negative) } else { Raw::Inf { negative } });

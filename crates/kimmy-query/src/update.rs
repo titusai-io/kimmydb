@@ -3342,6 +3342,25 @@ mod tests {
     }
 
     #[test]
+    fn pull_with_a_not_of_no_operator_is_refused_at_parse() {
+        let message = parse(&doc! { "$pull": { "r": { "$not": { "score": 8 } } } })
+            .expect_err("a $not of a plain document")
+            .to_string();
+        assert!(
+            message.contains("$not takes operators") && message.contains("$elemMatch"),
+            "{message}"
+        );
+        // The operator form is the condition.
+        assert_eq!(
+            applied(
+                doc! { "$pull": { "r": { "$not": { "$gte": 5 } } } },
+                doc! { "r": [1, 6, 4, 9] }
+            ),
+            doc! { "r": [6, 9] }
+        );
+    }
+
+    #[test]
     fn pull_leaves_a_missing_field_alone_and_refuses_a_non_array_in_both_forms() {
         for operand in [bson::Bson::Document(doc! { "$gte": 1 }), bson::Bson::Int32(5)] {
             assert_eq!(

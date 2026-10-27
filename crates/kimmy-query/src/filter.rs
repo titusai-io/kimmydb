@@ -409,6 +409,18 @@ fn parse_condition(
         },
         "not" => match arg {
             Bson::Document(d) => {
+                // `$not` takes operators. A document with no operator key would be
+                // read as an equality on a whole document, and `{$not: {score: 8}}`
+                // would then remove or match nearly everything: refused, with the
+                // spellings that say what was meant.
+                if !d.keys().any(|k| k.starts_with('$')) {
+                    return Err(Error::InvalidQuery(
+                        "$not takes operators, e.g. {$not: {$gt: 5}}; to negate an equality \
+                         write $ne, and to negate a condition on the fields of an embedded \
+                         document write {$not: {$elemMatch: {...}}}"
+                            .into(),
+                    ));
+                }
                 // `{$not: {$gt: 1, $lt: 5}}` negates the whole conjunction, so
                 // the operators are combined before the negation is applied.
                 let combined = parse_conditions(path, &Bson::Document(d.clone()), scope)?
@@ -2245,6 +2257,45 @@ mod tests {
     fn top_level_not_is_rejected_with_a_useful_message() {
         let err = parse(&doc! { "$not": { "a": 1 } }).unwrap_err().to_string();
         assert!(err.contains("$not"), "unhelpful error: {err}");
+    }
+
+    /// `$not` takes operators. A document with none was read as an equality on a whole
+    /// document, so `{$not: {score: 8}}` matched nearly everything: refused now.
+    #[test]
+    fn not_with_a_document_that_has_no_operator_is_refused() {
+        for filter in [
+            doc! { "r": { "$not": { "score": 8 } } },
+            doc! { "r": { "$not": { "score": 8, "item": "B" } } },
+            doc! { "r": { "$not": { "a.b": 1 } } },
+        ] {
+            let err = parse(&filter).unwrap_err().to_string();
+            assert!(
+                err.contains("$not takes operators")
+                    && err.contains("$ne")
+                    && err.contains("$elemMatch"),
+                "{filter}: {err}"
+            );
+        }
+        // The operator forms are unchanged, a regex too, and `$elemMatch` says what was meant.
+        assert!(hits(
+            doc! { "r": { "$not": { "$elemMatch": { "score": 8 } } } },
+            doc! { "r": [{ "score": 1 }] }
+        ));
+        assert!(!hits(
+            doc! { "r": { "$not": { "$elemMatch": { "score": 8 } } } },
+            doc! { "r": [{ "score": 8 }] }
+        ));
+        assert!(hits(doc! { "n": { "$not": { "$ne": 5 } } }, doc! { "n": 5 }));
+        assert!(parse(&doc! { "s": { "$not": { "$regex": "a" } } }).is_ok());
+        // The empty document is a document with no operator too.
+        assert!(
+            parse(&doc! { "r": { "$not": {} } })
+                .unwrap_err()
+                .to_string()
+                .contains("$not takes operators")
+        );
+        // A mix of operator and plain keys is refused by the parser of the conditions.
+        assert!(parse(&doc! { "r": { "$not": { "$gt": 1, "score": 8 } } }).is_err());
     }
 
     #[test]

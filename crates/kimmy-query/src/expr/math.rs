@@ -107,6 +107,9 @@ enum Mode {
 /// that many digits after the point, a negative one rounds to the tens, hundreds
 /// and so on; a null number or a null place gives null.
 pub(super) fn round(op: Op, number: &Bson, place: Option<&Bson>) -> Result<Bson> {
+    // The number is read first: a value that is not a number is `400` whatever the
+    // place is, a null place included.
+    let operands = operands(op, std::slice::from_ref(number))?;
     let place = match place {
         None => 0,
         Some(Bson::Null | Bson::Undefined) => return Ok(Bson::Null),
@@ -121,7 +124,7 @@ pub(super) fn round(op: Op, number: &Bson, place: Option<&Bson>) -> Result<Bson>
             n as i32
         }
     };
-    let Some(mut operands) = operands(op, std::slice::from_ref(number))? else {
+    let Some(mut operands) = operands else {
         return Ok(Bson::Null);
     };
     let mode = if op == Op::Round { Mode::HalfEven } else { Mode::Trunc };

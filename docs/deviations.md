@@ -33,6 +33,8 @@ expression: an expression always produces a value, as the array operators' entry
 below records. A pipeline that relies on `$$REMOVE` surviving a variable keeps
 the `$cond` at the field instead.
 
+**`{$ifNull: ["$a", "$$REMOVE"]}` writes `null`**, not a missing field, when `a` is missing: the replacement is read in a value position, where `$$REMOVE` is `null`. A path that names a field through an array by a name is refused (`$$REMOVE` there is the same `400` a value written to it is), and a numeric position (`"a.0": "$$REMOVE"`) leaves a `null` in the array, which is what `$unset` does here so that the other positions keep their index.
+
 **`$$NOW.x` and `$$REMOVE.x` are `400`** (`has no fields to read into`), where a
 path under either is "missing" elsewhere. A date has no fields, and a path under
 a value that is not there is a typo worth refusing.
@@ -63,7 +65,7 @@ differ from other systems' versions of the same names:
   is `2.67499999999999982…`, and `{$round: [0.125, 2]}` is `0.12`. A system that
   rounds a double through its shortest text answers `2.68` for the first. The
   rule is ADR-252's for a double meeting a decimal: its value is the exact one.
-- **An integer result is always `Int64`**, as in the rest of the arithmetic;
+- **An integer result is always `Int64`**, an `Int32` argument included, as in the rest of the arithmetic;
   a result past `Int64` (`$pow: [2, 63]`, `$abs` of the
   smallest `Int64`, `$round` rounding up past it) is a double.
 - **A negative base to a power that is not a whole number is `400`**, where a
@@ -130,8 +132,6 @@ systems use.
 **What it costs.** A client that serialises every number as a double (some JSON encoders do for a whole value) must send an integer type; Extended JSON `{"$numberInt": "6"}` or `{"$numberLong": "6"}` does.
 
 **Closing it** means accepting a whole double and reading it as an integer. Not planned.
-
----
 
 ---
 

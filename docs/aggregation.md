@@ -391,8 +391,8 @@ that is not a number is `400`.
 
 | Operator | Result |
 |---|---|
-| `{$abs: x}` | The absolute value, of the same type. `$abs` of the smallest `Int64` is a double, as an overflowing `$add` is. A decimal keeps its exponent: `$abs` of `-1.50` is `1.50` |
-| `{$ceil: x}`, `{$floor: x}` | The integer nearest toward `+∞` or `-∞`. An integer is itself; a double stays a double; a decimal has exponent 0 (`$ceil` of `1.20` is `2`) |
+| `{$abs: x}` | The absolute value; an integer gives an `Int64`, as every integer result of an expression does (an `Int32` becomes an `Int64`). `$abs` of the smallest `Int64` is a double, as an overflowing `$add` is. A decimal keeps its exponent: `$abs` of `-1.50` is `1.50` |
+| `{$ceil: x}`, `{$floor: x}` | The integer nearest toward `+∞` or `-∞`. An integer is itself, as an `Int64`; a double stays a double; a decimal has exponent 0 (`$ceil` of `1.20` is `2`) |
 | `{$round: [x, place]}`, `{$trunc: [x, place]}` | `place` digits after the point, default 0. **`$round` rounds half to even** (`$round: [2.5]` is `2`, `[3.5]` is `4`, `[-2.5]` is `-2`); `$trunc` cuts toward zero. A negative `place` rounds to tens, hundreds, and so on (`$round: [1250, -2]` is `1200`, an integer). `place` is a whole number from `-20` to `100`, a `null` place gives `null`, and any other is `400`. An integer is exact, and a decimal result has exponent `-place` (`$round: [2.5, 2]` over `Decimal128("2.5")` is `2.50`), unless that needs more than 34 digits, when it is returned as it was. A double is rounded on its **exact binary value**: `$round: [2.675, 2]` is `2.67`, because the double nearest 2.675 is below it, and `$round: [0.125, 2]` is `0.12`, an exact tie |
 | `{$pow: [base, exponent]}` | An integer base and a non-negative integer exponent give an integer while it fits `Int64`, a double after; otherwise a double, or a decimal with a decimal operand. `0` to a negative power, and a negative base to a power that is not a whole number, are `400` (not an infinity or a `NaN`) |
 | `{$sqrt: x}` | The square root. A negative argument is `400` |
@@ -480,7 +480,7 @@ has no variables.
 **`$$REMOVE` leaves a field out.** As the value of a field in `$project` or
 `$addFields`, or in a document an expression builds, it drops that field, and in
 `$addFields` it removes a field the document already had:
-`{$addFields: {secret: "$$REMOVE"}}`. It works through the result position of
+`{$addFields: {secret: "$$REMOVE"}}`. A path that names a field *through an array by a name* (`a.b` over `a: [{b: 1}]`) is refused as a value written there would be, with the same error; a numeric position (`a.0`) leaves a `null` in the array, as `$unset` does, so other positions keep their index. It works through the result position of
 `$cond`, `$switch` and `$let`, so `{$cond: [{$gt: ["$qty", 0]}, "$qty", "$$REMOVE"]}`
 keeps the field only when it is positive. Anywhere else it reads as `null`, the
 same as a path to a missing field does in this engine (an expression always

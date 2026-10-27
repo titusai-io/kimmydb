@@ -1078,7 +1078,16 @@ fn set_computed(
             Some(value) => path::set(target, name, value)
                 .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?,
             None => {
-                path::unset(target, name);
+                if !path::unset(target, name) && crossing_array(target, name).is_some() {
+                    // A path the write of a value would refuse is refused for the
+                    // removal too, with the same error: a field named through an array
+                    // by a name, not a position, is not a place a field can be left out
+                    // of. A numeric position leaves a null in the array, as `$unset` does.
+                    let mut probe = target.clone();
+                    if let Err(e) = path::set(&mut probe, name, Bson::Null) {
+                        return Err(Error::InvalidQuery(format!("cannot set {name:?}: {e}")));
+                    }
+                }
             }
         }
     }
