@@ -32,9 +32,11 @@ Status meanings:
 - **The result is ordered** (step by step, each step in scan order); elsewhere it is
   unspecified.
 - **A `null` or missing `startWith` starts nothing**, as a missing `localField` joins
-  nothing in `$lookup`.
+  nothing in `$lookup`; a `null` in a `startWith` array and a `null` link are not
+  followed either.
 - `connectFromField`, `connectToField`, `as` and `depthField` must be names without a `$`
-  part, and `depthField` is a long.
+  part, `as` and `depthField` are one field each (a dotted one is `400`), and `depthField`
+  is a long.
 
 **To close:** none planned.
 

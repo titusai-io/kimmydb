@@ -88,13 +88,18 @@ equality join.
 - **Memory is a budget, refused when over, never silently cut off.** The foreign
   collection is read once and held, as a `$lookup`'s is, and what the walks reach is held
   with the input; both count against the pipeline's document limit (100,000), `400`
-  naming `$graphLookup`. Narrow the foreign side with `restrictSearchWithMatch`, the
-  input with an earlier `$match`, or the walk with `maxDepth`.
+  naming `$graphLookup`. **The read stops at the first document past the limit**, not
+  at the end of the collection, so a very large one is refused promptly. Narrow the
+  foreign side with `restrictSearchWithMatch` (it applies as the collection is read, so
+  what it declines is not held or counted), the input with an earlier `$match`, or the
+  walk with `maxDepth`.
 - `startWith` is an expression: a value, or an array of values to start from each. A
-  `null` or missing one starts nothing. Values match by the equality join's rule
-  (numbers of every type by value, an array field by its elements).
+  `null` or missing one starts nothing, a `null` in an array starts nothing, and a
+  `null` link is not followed (a `null` is not a key to look up). Values match by the
+  equality join's rule (numbers of every type by value, an array field by its elements).
 - `connectFromField`, `connectToField`, `as` and `depthField` are field names, not
-  expressions; one beginning with `$` is `400`. `depthField` holds the step as a long.
+  expressions; one beginning with `$` is `400`, and so is a dotted `as` or `depthField`
+  (each is the name of one field, not a path). `depthField` holds the step as a long.
   `restrictSearchWithMatch` is a filter document over the foreign documents; one it does
   not admit is neither reached nor followed.
 - **Order**: step 0 first, then step 1, and so on; within a step, the order of the
