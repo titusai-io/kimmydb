@@ -59,7 +59,7 @@ regex as a value too. See [Deviations](deviations.md).
 | Operator | Meaning |
 |---|---|
 | `$and` `$or` `$nor` | Top-level, take arrays of filter documents |
-| `$not` | Applied to a **field's** operators, not at the top level. Its document must hold at least one operator: `{"$not": {"score": 8}}` is a `400` (write `$ne`, or `{"$not": {"$elemMatch": {...}}}`) |
+| `$not` | Applied to a **field's** operators, not at the top level. Its document must hold at least one operator: `{"$not": {"score": 8}}` is a `400`: write `$ne` for an equality, `{"$not": {"$elemMatch": {...}}}` for an array of documents (or inside `$pull`), and a dotted path for one embedded document, `{"r.score": {"$ne": 8}}` (`$elemMatch` matches arrays only, so over a single document `{"$not": {"$elemMatch": ...}}` matches it) |
 | `$expr` | Top-level, takes an [aggregation expression](aggregation.md#expressions); matches when it is truthy |
 
 ```javascript

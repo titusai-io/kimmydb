@@ -416,8 +416,9 @@ fn parse_condition(
                 if !d.keys().any(|k| k.starts_with('$')) {
                     return Err(Error::InvalidQuery(
                         "$not takes operators, e.g. {$not: {$gt: 5}}; to negate an equality \
-                         write $ne, and to negate a condition on the fields of an embedded \
-                         document write {$not: {$elemMatch: {...}}}"
+                         write $ne; for an array of documents (or inside $pull) write {$not: \
+                         {$elemMatch: {...}}}; for one embedded document write a dotted path, \
+                         e.g. {\"r.score\": {$ne: 8}}"
                             .into(),
                     ));
                 }
@@ -2272,7 +2273,8 @@ mod tests {
             assert!(
                 err.contains("$not takes operators")
                     && err.contains("$ne")
-                    && err.contains("$elemMatch"),
+                    && err.contains("$elemMatch")
+                    && err.contains("{\"r.score\": {$ne: 8}}"),
                 "{filter}: {err}"
             );
         }

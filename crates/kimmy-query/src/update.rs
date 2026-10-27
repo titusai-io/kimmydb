@@ -1386,7 +1386,6 @@ fn slice(items: &mut Vec<Bson>, n: i64) {
     }
 }
 
-/// Interpret the current value as an array for the array operators.
 /// The array `$pull` and `$pullAll` take from: `None` for a missing field (a no-op),
 /// an error for a field that is not an array, because the caller believes it is one.
 fn pull_target(current: Option<Bson>, operator: &str, path: &str) -> Result<Option<Vec<Bson>>> {
@@ -1399,6 +1398,7 @@ fn pull_target(current: Option<Bson>, operator: &str, path: &str) -> Result<Opti
     }
 }
 
+/// Interpret the current value as an array for the array operators.
 fn as_array(current: &Option<Bson>, path: &str) -> Result<Vec<Bson>> {
     match current {
         Some(Bson::Array(items)) => Ok(items.clone()),
