@@ -1897,7 +1897,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_window_cut_by_the_frame_limit_confirms_what_fits() {
         let b = member().await;
-        let a = pusher_for(&b, quick());
+        // The push carries most of a frame (tens of MiB, read, encoded, sent and
+        // applied), which a starved host stretches past `quick()`'s ten seconds: the
+        // test waits for the member's answer, not for the clock (`HELD`, the guard
+        // against a hang), so the outcome it asserts is the window's, never the
+        // timeout's.
+        let a = pusher_for(&b, ConfirmConfig { request_timeout: HELD, ..quick() });
         let node = b.engine.node_id();
         let inside = create(&a.engine, "e1");
         let orders = a.engine.get_collection("shop", "orders").unwrap();
