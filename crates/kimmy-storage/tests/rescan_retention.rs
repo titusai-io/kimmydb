@@ -12,6 +12,13 @@
 //! freed) after the walk. The control is a walk of the other collection, which
 //! must retain more, or the measurement could not tell them apart.
 //!
+//! **A measurement, ignored by default** (it builds about 640 MB of store, twice
+//! over): `cargo test --release -p kimmy-storage --test rescan_retention --
+//! --ignored`. A debug build reads the whole store at open, so the control only
+//! means something in release. It showed 16.9 MiB retained by the rescan of the
+//! 2,000-document collection, the same with 500 and with 20,000 documents in the
+//! other collection, against 66 MB for the control.
+//!
 //! Its own binary, with a counting `#[global_allocator]`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -88,6 +95,7 @@ fn retained(other_docs: usize, which: &str) -> isize {
 }
 
 #[test]
+#[ignore = "a measurement: run with --release -- --ignored"]
 fn a_rescans_reads_leave_the_collections_pages_and_not_the_stores_size() {
     let small = retained(500, "target");
     let large = retained(20_000, "target");
