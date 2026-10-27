@@ -2056,6 +2056,9 @@ mod tests {
         assert!(!changes(doc! {"n": 5_i64}, doc! {"$inc": {"n": 0_i64}}));
         assert!(!changes(doc! {"n": 2.5}, doc! {"$inc": {"n": 0.0}}));
         assert!(!changes(doc! {"n": 5_i64}, doc! {"$mul": {"n": 1_i64}}));
+        assert!(!changes(doc! {"n": 5_i32}, doc! {"$bit": {"n": {"and": -1_i32}}}));
+        assert!(!changes(doc! {"n": 5_i32}, doc! {"$bit": {"n": {"or": 4_i32}}}));
+        assert!(!changes(doc! {"l": [1_i32, 5_i32]}, doc! {"$pull": {"l": {"$gt": 9_i32}}}));
         assert!(!changes(doc! {"n": 5_i64}, doc! {"$min": {"n": 9_i64}}));
         assert!(!changes(doc! {"n": 5_i64}, doc! {"$max": {"n": 1_i64}}));
         assert!(!changes(doc! {"l": [1_i32, 2_i32]}, doc! {"$push": {"l": {"$each": []}}}));
@@ -2076,6 +2079,9 @@ mod tests {
         // write. An int32 operand keeps it, so `$inc` by zero is no change.
         assert!(changes(doc! {"n": 5_i32}, doc! {"$inc": {"n": 0_i64}}));
         assert!(!changes(doc! {"n": 5_i32}, doc! {"$inc": {"n": 0_i32}}));
+        assert!(changes(doc! {"n": 5_i32}, doc! {"$bit": {"n": {"or": 0_i64}}}));
+        assert!(changes(doc! {"a": 1_i32}, doc! {"$bit": {"n": {"and": 0_i32}}}));
+        assert!(changes(doc! {"l": [1_i32, 5_i32]}, doc! {"$pull": {"l": {"$gt": 4_i32}}}));
         assert!(!changes(doc! {"n": 5_i32}, doc! {"$mul": {"n": 1_i32}}));
         // `$currentDate` sets the time of the write over an earlier one.
         assert!(changes(

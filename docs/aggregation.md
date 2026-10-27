@@ -237,6 +237,7 @@ field path.
 | Group | Operators |
 |---|---|
 | Arithmetic | `$add` `$subtract` `$multiply` `$divide` `$mod` |
+| Math | `$abs` `$ceil` `$floor` `$round` `$trunc` `$pow` `$sqrt` `$exp` `$ln` `$log10` — see [Math](#math) |
 | Strings | `$concat` `$toUpper` `$toLower` `$substr` (`$substrCP`) `$split` `$strLenCP` |
 | Conditional | `$cond` `$ifNull` `$switch` |
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
@@ -246,7 +247,7 @@ field path.
 | Sets | `$setUnion` `$setIntersection` `$setDifference` `$setEquals` `$setIsSubset` `$anyElementTrue` `$allElementsTrue` |
 | Documents | `$objectToArray` `$arrayToObject` |
 | Iteration | `$filter` `$map` `$reduce` — each binds a variable per element |
-| Variables | `$$ROOT` `$$CURRENT` `$let` |
+| Variables | `$$ROOT` `$$CURRENT` `$$NOW` `$$REMOVE` `$let` |
 | Type conversion | `$convert` `$toString` `$toInt` `$toLong` `$toDouble` `$toBool` `$toDate` `$toObjectId` |
 | Escape | `$literal` |
 
@@ -381,6 +382,51 @@ specifier is an error rather than being copied through — a literal `%q` in eve
 row of a report is the kind of wrong output nobody notices. BSON dates carry no
 zone, so there is nothing for `%z` to convert to.
 
+### Math
+
+`$abs`, `$ceil`, `$floor`, `$round`, `$trunc`, `$pow`, `$sqrt`, `$exp`, `$ln` and
+`$log10` take an `Int32`, `Int64`, double or `Decimal128` ([ADR-253](decisions.md)).
+A `null` or missing argument gives `null`, as in the rest of arithmetic; a value
+that is not a number is `400`.
+
+| Operator | Result |
+|---|---|
+| `{$abs: x}` | The absolute value; an integer gives an `Int64`, as every integer result of an expression does (an `Int32` becomes an `Int64`). `$abs` of the smallest `Int64` is a double, as an overflowing `$add` is. A decimal keeps its exponent: `$abs` of `-1.50` is `1.50` |
+| `{$ceil: x}`, `{$floor: x}` | The integer nearest toward `+∞` or `-∞`. An integer is itself, as an `Int64`; a double stays a double; a decimal has exponent 0 (`$ceil` of `1.20` is `2`) |
+| `{$round: [x, place]}`, `{$trunc: [x, place]}` | `place` digits after the point, default 0. **`$round` rounds half to even** (`$round: [2.5]` is `2`, `[3.5]` is `4`, `[-2.5]` is `-2`); `$trunc` cuts toward zero. A negative `place` rounds to tens, hundreds, and so on (`$round: [1250, -2]` is `1200`, an integer). `place` is a whole number from `-20` to `100`, a `null` place gives `null`, and any other is `400`. An integer is exact, and a decimal result has exponent `-place` (`$round: [2.5, 2]` over `Decimal128("2.5")` is `2.50`), unless that needs more than 34 digits, when it is returned as it was. A double is rounded on its **exact binary value**: `$round: [2.675, 2]` is `2.67`, because the double nearest 2.675 is below it, and `$round: [0.125, 2]` is `0.12`, an exact tie |
+| `{$pow: [base, exponent]}` | An integer base and a non-negative integer exponent give an integer while it fits `Int64`, a double after; otherwise a double, or a decimal with a decimal operand. `0` to a negative power, and a negative base to a power that is not a whole number, are `400` (not an infinity or a `NaN`) |
+| `{$sqrt: x}` | The square root. A negative argument is `400` |
+| `{$exp: x}`, `{$ln: x}`, `{$log10: x}` | `e^x`, the natural logarithm and the base-10 logarithm. `$ln` and `$log10` of zero or a negative are `400`; `$log10` of an exact power of ten is exact |
+
+An integer or a double argument to `$sqrt`, `$exp`, `$ln` and `$log10` gives a
+double; a `Decimal128` gives a `Decimal128`. A `NaN` is a `NaN` out, and `$exp`,
+`$sqrt` and `$ln` of an infinity are the infinity or zero the limit gives.
+**A refused argument is never turned into a `NaN` or an infinity.**
+
+**A `Decimal128` is exact to one rule**: the result is the true value rounded
+once to 34 digits, half to even, in ADR-252's context, computed in integers, so
+it is the same bytes on every member and architecture. Overflow is `Infinity` and
+underflow is gradual, as in the rest of the decimal arithmetic. The result of
+`$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` has its trailing zeros stripped
+(`$sqrt` of `4.00` is `2`, `$pow: [1.1, 2]` is `1.21`), because a quantum means
+nothing for them; `$abs`, `$ceil`, `$floor`, `$round` and `$trunc` keep the
+scale rules in the table. Where the true value is within 10^-75 of a rounding
+midpoint (a case that needs a coincidence of 40 digits) the last digit can differ
+from the correctly rounded one.
+
+**A double uses the platform's math library** for `$sqrt`, `$exp`, `$ln`,
+`$log10` and a non-integer `$pow`, so the last digit of a double result can
+differ between architectures ([Deviations](deviations.md)). Use a `Decimal128`
+where the digits must agree.
+
+```json
+{ "$project": {
+    "cents":  { "$round": [ { "$multiply": ["$price", 100] }, 0 ] },
+    "fee":    { "$trunc": [ { "$multiply": ["$amount", 0.029] }, 2 ] },
+    "growth": { "$pow": [ 1.07, "$years" ] },
+    "decibel": { "$multiply": [ 10, { "$log10": "$ratio" } ] } } }
+```
+
 ### Variables
 
 An expression evaluates in a **scope**: the document, plus whatever the
@@ -391,6 +437,8 @@ constructs around it have bound. A variable is written `$$name`, and
 |---|---|---|
 | `$$ROOT` | always | the document the expression is evaluated against |
 | `$$CURRENT` | always | the same document — nothing here rebinds it |
+| `$$NOW` | always | the date of the request: one value, read from the clock of the member running it |
+| `$$REMOVE` | always | no value: the field it would be written to is left out |
 | `$$this` | `$filter`, `$map` (or the name given as `as`), `$reduce` | the current element |
 | `$$value` | `$reduce` | the accumulator so far |
 | any lowercase name | `$let`, a `$lookup` `let` | what its expression evaluated to |
@@ -415,8 +463,29 @@ the same way, and the outer binding is back once the inner construct closes.
 that binds it, `$$order` where the `let` said `oid`, or a typo in either, is
 refused before a single document is read. Reading it as a field called `$this`
 would silently yield null in every row. MongoDB's other system variables —
-`$$NOW`, `$$REMOVE`, `$$DESCEND` and the rest — are refused with a message that
-says they are unsupported rather than misspelled.
+`$$DESCEND`, `$$PRUNE` and `$$KEEP` — are refused with a message that says they
+are unsupported rather than misspelled.
+
+**`$$NOW` is one date for the whole request.** The pipeline is parsed once, on
+the member that runs it, and every `$$NOW` in it is the wall-clock time of that
+moment: the same date in every document, every stage and every `$lookup`
+sub-pipeline, and a date a long pipeline cannot move past
+([ADR-253](decisions.md)). It is a `Date` with millisecond precision, from the
+executing member's clock, so two members answering the same request a second
+apart disagree, as any two clocks do. `$$NOW.path` is refused: a date has no
+fields. `$$NOW` is a value in an expression; a `$match` takes it through
+`$expr`, `{$expr: {$lt: ["$expires", "$$NOW"]}}`, because the filter language
+has no variables.
+
+**`$$REMOVE` leaves a field out.** As the value of a field in `$project` or
+`$addFields`, or in a document an expression builds, it drops that field, and in
+`$addFields` it removes a field the document already had:
+`{$addFields: {secret: "$$REMOVE"}}`. A path that names a field *through an array by a name* (`a.b` over `a: [{b: 1}]`) is refused as a value written there would be, with the same error; a numeric position (`a.0`) leaves a `null` in the array, as `$unset` does, so other positions keep their index. It works through the result position of
+`$cond`, `$switch` and `$let`, so `{$cond: [{$gt: ["$qty", 0]}, "$qty", "$$REMOVE"]}`
+keeps the field only when it is positive. Anywhere else it reads as `null`, the
+same as a path to a missing field does in this engine (an expression always
+produces a value), so `{$ifNull: ["$$REMOVE", 1]}` is `1`, an element of an array
+expression is `null`, and `$$REMOVE.path` is refused ([Deviations](deviations.md)).
 
 **`$let` values see the enclosing scope, not each other.** `{vars: {a: 1, b:
 "$$a"}}` is refused; nest a second `$let` to build on the first. **A `$let`
@@ -792,10 +861,12 @@ changes only which member is stored counts in `modified`
 `$max` and `$first` report the first member seen, as they always did, so which
 of `2.3` and `2.30` they show depends on document order; `$sum` and `$avg` do not.
 
-**There is no `$round`, `$trunc` or quantize** (that is a separate, later item),
-so an inexact result shows all 34 digits: `$avg` of `1.00`, `2.00`, `2.00` is
-`1.666666666666666666666666666666667`, and `1 / 3` is
-`0.3333333333333333333333333333333333`.
+**`$round` and `$trunc` quantize** ([Math](#math)): an inexact result shows all 34
+digits unless the pipeline cuts it, so `$avg` of `1.00`, `2.00`, `2.00` is
+`1.666666666666666666666666666666667`, `{$round: [<that>, 2]}` is `1.67`, and
+`1 / 3` is `0.3333333333333333333333333333333333`. `$abs`, `$ceil`, `$floor`,
+`$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` take a decimal too and give a decimal,
+rounded once.
 
 **Special values follow IEEE 754.** Every NaN result is the one quiet NaN, with
 no payload (a signalling or payload NaN in gives the plain NaN out, so a `$sum`
@@ -1176,9 +1247,9 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | | Why |
 |---|---|
 | `$zip`, `$sortArray` | Not built, by decision: both are refused at parse as **unknown operators**. `$map` over a `$range` of indexes, with `$arrayElemAt`, reads several arrays by position, and an `$unwind`, `$sort` and `$group` with `$push` orders an array's elements |
-| System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
+| System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
-| `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). `$round`, `$trunc`, `$abs`, `$pow` and `$sqrt` do not exist for any number |
+| `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |

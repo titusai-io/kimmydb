@@ -66,6 +66,8 @@
 //! 1]}` is an error because a string is not a number. Returning null for both
 //! would make a typo and a type error indistinguishable in the output.
 
+mod math;
+
 use std::cmp::Ordering;
 
 use bson::{Bson, Document};
@@ -90,6 +92,16 @@ pub enum Op {
     Multiply,
     Divide,
     Mod,
+    Abs,
+    Ceil,
+    Floor,
+    Round,
+    Trunc,
+    Pow,
+    Sqrt,
+    Exp,
+    Ln,
+    Log10,
     // Strings
     Concat,
     ToUpper,
@@ -162,6 +174,16 @@ impl Op {
             "$multiply" => Op::Multiply,
             "$divide" => Op::Divide,
             "$mod" => Op::Mod,
+            "$abs" => Op::Abs,
+            "$ceil" => Op::Ceil,
+            "$floor" => Op::Floor,
+            "$round" => Op::Round,
+            "$trunc" => Op::Trunc,
+            "$pow" => Op::Pow,
+            "$sqrt" => Op::Sqrt,
+            "$exp" => Op::Exp,
+            "$ln" => Op::Ln,
+            "$log10" => Op::Log10,
             "$concat" => Op::Concat,
             "$toUpper" => Op::ToUpper,
             "$toLower" => Op::ToLower,
@@ -219,6 +241,16 @@ impl Op {
             Op::Multiply => "$multiply",
             Op::Divide => "$divide",
             Op::Mod => "$mod",
+            Op::Abs => "$abs",
+            Op::Ceil => "$ceil",
+            Op::Floor => "$floor",
+            Op::Round => "$round",
+            Op::Trunc => "$trunc",
+            Op::Pow => "$pow",
+            Op::Sqrt => "$sqrt",
+            Op::Exp => "$exp",
+            Op::Ln => "$ln",
+            Op::Log10 => "$log10",
             Op::Concat => "$concat",
             Op::ToUpper => "$toUpper",
             Op::ToLower => "$toLower",
@@ -281,6 +313,7 @@ impl Op {
             Op::Subtract
             | Op::Divide
             | Op::Mod
+            | Op::Pow
             | Op::Split
             | Op::IfNull
             | Op::Eq
@@ -297,8 +330,16 @@ impl Op {
             Op::Substr => Arity::Exact(3),
             Op::Cond => Arity::Exact(3),
             Op::Slice | Op::Range => Arity::Between(2, 3),
+            Op::Round | Op::Trunc => Arity::Between(1, 2),
             Op::IndexOfArray => Arity::Between(2, 4),
-            Op::ToUpper
+            Op::Abs
+            | Op::Ceil
+            | Op::Floor
+            | Op::Sqrt
+            | Op::Exp
+            | Op::Ln
+            | Op::Log10
+            | Op::ToUpper
             | Op::ToLower
             | Op::StrLenCp
             | Op::Not
@@ -717,6 +758,84 @@ impl Drop for FreeVariables {
     }
 }
 
+thread_local! {
+    /// The wall-clock value `$$NOW` takes while a [`RequestClock`] is open on this
+    /// thread: unread (`None`) until the first `$$NOW` of the parse asks for it.
+    static REQUEST_NOW: std::cell::Cell<Option<Option<bson::DateTime>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One reading of the clock for the expressions parsed until it is dropped
+/// (ADR-253).
+///
+/// `$$NOW` is a constant of the request: the first one parsed reads the
+/// executing member's wall clock, and every other `$$NOW` parsed while the clock
+/// is open, in a later stage or in a `$lookup` sub-pipeline, is that same date.
+/// The pipeline is parsed once on the member that runs it, so the request has
+/// one date and the members need not agree on a time.
+///
+/// Opening one while another is open joins it, as [`crate::filter::RegexBudget`]
+/// does, so a filter parsed inside a pipeline shares the pipeline's date. Only
+/// the outermost closes it. A `$$NOW` parsed with no clock open reads its own.
+pub struct RequestClock {
+    outermost: bool,
+}
+
+thread_local! {
+    /// Clock reads made by [`RequestClock`] on this thread, for the tests that hold a
+    /// request to one.
+    static CLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times a `$$NOW` parse has read the wall clock on this thread: **one per
+/// request**, which is what makes `$$NOW` one date. For tests, which read it before
+/// and after a parse.
+#[doc(hidden)]
+pub fn clock_reads() -> u64 {
+    CLOCK_READS.with(std::cell::Cell::get)
+}
+
+impl RequestClock {
+    /// Open the request's clock: every `$$NOW` parsed until the guard drops is one
+    /// date. A handler that parses more than one thing for a request (a filter, an
+    /// update and its `arrayFilters`) opens one around all of it.
+    pub fn open() -> Self {
+        REQUEST_NOW.with(|now| {
+            let outermost = now.get().is_none();
+            if outermost {
+                now.set(Some(None));
+            }
+            Self { outermost }
+        })
+    }
+
+    /// The date `$$NOW` is for the parse in progress.
+    fn now() -> bson::DateTime {
+        REQUEST_NOW.with(|now| match now.get() {
+            Some(Some(date)) => date,
+            Some(None) => {
+                let date = read_clock();
+                now.set(Some(Some(date)));
+                date
+            }
+            None => read_clock(),
+        })
+    }
+}
+
+fn read_clock() -> bson::DateTime {
+    CLOCK_READS.with(|reads| reads.set(reads.get() + 1));
+    bson::DateTime::now()
+}
+
+impl Drop for RequestClock {
+    fn drop(&mut self) {
+        if self.outermost {
+            REQUEST_NOW.with(|now| now.set(None));
+        }
+    }
+}
+
 /// The lexical environment of a parse: the names in scope, innermost last, and
 /// how many bindings of each are in scope, so that asking whether a name is
 /// bound is one hash lookup and not a walk of everything bound (ADR-105). A
@@ -795,6 +914,7 @@ impl Expr {
     pub fn parse_with_vars(value: &Bson, vars: &[String]) -> Result<Self> {
         #[cfg(test)]
         PARSES.with(|n| n.set(n.get() + 1));
+        let _clock = RequestClock::open();
         let mut declared = Declared::new(vars);
         Self::parse_in(value, &mut declared)
     }
@@ -928,6 +1048,7 @@ impl Expr {
     /// construct. Names are validated here so both callers refuse the same
     /// things.
     pub fn parse_bindings(raw: &Document, vars: &[String]) -> Result<Vec<(String, Expr)>> {
+        let _clock = RequestClock::open();
         let mut declared = Declared::new(vars);
         Self::parse_bindings_in(raw, &mut declared)
     }
@@ -967,6 +1088,19 @@ impl Expr {
         if path.is_some_and(str::is_empty) {
             return Err(Error::InvalidQuery(format!("$${name}. needs a field path after the dot")));
         }
+        // `$$NOW` is the request's date, read once when the pipeline is parsed
+        // (`RequestClock`), and `$$REMOVE` drops the field it is the value of
+        // (`Expr::eval_field`). Neither is a document, so neither has fields.
+        if name == "NOW" || name == "REMOVE" {
+            if path.is_some() {
+                return Err(Error::InvalidQuery(format!("$${name} has no fields to read into")));
+            }
+            return Ok(if name == "NOW" {
+                Expr::Literal(Bson::DateTime(RequestClock::now()))
+            } else {
+                Expr::Var { name: name.to_string(), path: None }
+            });
+        }
         if !SYSTEM_VARIABLES.contains(&name) && !declared.binds(name) {
             // Collecting free variables: a lowercase name nothing binds is the
             // answer, not an error. An uppercase one is a system variable this
@@ -982,8 +1116,8 @@ impl Expr {
                 return Err(Error::UnsupportedOperator {
                     operator: format!("$${name}"),
                     reason: Some(
-                        "a system variable this build does not have; $$ROOT and $$CURRENT are \
-                         the ones it does"
+                        "a system variable this build does not have; $$ROOT, $$CURRENT, $$NOW \
+                         and $$REMOVE are the ones it does"
                             .into(),
                     ),
                 });
@@ -1359,6 +1493,70 @@ impl Expr {
         self.eval_in(&Scope::new(doc))
     }
 
+    /// Run `body` in the frame of a `$let`'s variables.
+    ///
+    /// Variables see the enclosing scope, not each other (`{a: 1, b: "$$a"}` is
+    /// an error at parse, not 1), and are evaluated when the body first reads
+    /// them, in that enclosing scope: one the body never reads is never evaluated
+    /// (ADR-219).
+    fn with_let_frame<T>(
+        vars: &[(String, Expr)],
+        body: &Expr,
+        scope: &Scope<'_>,
+        run: impl FnOnce(&Expr, &Scope<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut frame: Vec<Needed<'_>> = vars
+            .iter()
+            .map(|(name, expr)| Needed {
+                name: name.as_str(),
+                expr,
+                value: std::cell::OnceCell::new(),
+            })
+            .collect();
+        if frame.len() > BISECT_FRAME {
+            frame.sort_unstable_by(|a, b| a.name.cmp(b.name));
+            return run(body, &scope.nested_needed_sorted(&frame));
+        }
+        run(body, &scope.nested_needed(&frame))
+    }
+
+    /// [`Self::eval_in`] for a value that becomes a field: `None` when the
+    /// expression is `$$REMOVE`, or an `$cond`, `$switch` or `$let` whose chosen
+    /// result is, and the field is then left out (ADR-253). Anywhere else
+    /// `$$REMOVE` reads as null, as a missing field path does.
+    pub fn eval_field(&self, scope: &Scope<'_>) -> Result<Option<Bson>> {
+        match self {
+            Expr::Var { name, .. } if name == "REMOVE" => Ok(None),
+            Expr::Op(Op::Cond, args) => match args.as_slice() {
+                [cond, then, otherwise] => {
+                    if truthy(&cond.eval_in(scope)?) {
+                        then.eval_field(scope)
+                    } else {
+                        otherwise.eval_field(scope)
+                    }
+                }
+                _ => unreachable!("arity checked at parse"),
+            },
+            Expr::Switch { branches, default } => {
+                for (case, then) in branches {
+                    if truthy(&case.eval_in(scope)?) {
+                        return then.eval_field(scope);
+                    }
+                }
+                match default {
+                    Some(d) => d.eval_field(scope),
+                    None => Err(Error::InvalidQuery(
+                        "no $switch branch matched and there is no `default`".into(),
+                    )),
+                }
+            }
+            Expr::Let { vars, body } => {
+                Self::with_let_frame(vars, body, scope, |body, scope| body.eval_field(scope))
+            }
+            other => other.eval_in(scope).map(Some),
+        }
+    }
+
     /// Resolve in a scope that may already bind variables.
     pub fn eval_in(&self, scope: &Scope<'_>) -> Result<Bson> {
         match self {
@@ -1368,7 +1566,9 @@ impl Expr {
             Expr::Object(fields) => {
                 let mut out = Document::new();
                 for (key, expr) in fields {
-                    out.insert(key.clone(), expr.eval_in(scope)?);
+                    if let Some(value) = expr.eval_field(scope)? {
+                        out.insert(key.clone(), value);
+                    }
                 }
                 Ok(Bson::Document(out))
             }
@@ -1420,23 +1620,7 @@ impl Expr {
                 }
             }
             Expr::Let { vars, body } => {
-                // Variables see the enclosing scope, not each other (`{a: 1,
-                // b: "$$a"}` is an error at parse, not 1), and are evaluated
-                // when the body first reads them, in that enclosing scope: one
-                // the body never reads is never evaluated (ADR-219).
-                let mut frame: Vec<Needed<'_>> = vars
-                    .iter()
-                    .map(|(name, expr)| Needed {
-                        name: name.as_str(),
-                        expr,
-                        value: std::cell::OnceCell::new(),
-                    })
-                    .collect();
-                if frame.len() > BISECT_FRAME {
-                    frame.sort_unstable_by(|a, b| a.name.cmp(b.name));
-                    return body.eval_in(&scope.nested_needed_sorted(&frame));
-                }
-                body.eval_in(&scope.nested_needed(&frame))
+                Self::with_let_frame(vars, body, scope, |body, scope| body.eval_in(scope))
             }
             Expr::Filter { input, as_name, cond, limit } => {
                 eval_filter(input, as_name, cond, limit.as_deref(), scope)
@@ -1537,6 +1721,11 @@ fn value_path(value: &Bson, p: &str) -> Option<Bson> {
 }
 
 fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bson> {
+    // Read where a value is wanted, `$$REMOVE` is a missing value, which here
+    // is null like a missing field; `Expr::eval_field` is where it drops one.
+    if name == "REMOVE" {
+        return Ok(Bson::Null);
+    }
     if SYSTEM_VARIABLES.contains(&name) {
         return Ok(match path {
             None => Bson::Document(scope.root.clone()),
@@ -1765,6 +1954,11 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::Multiply => fold_numeric(op, args, Num::mul),
         Op::Divide => divide(&args[0], &args[1]),
         Op::Mod => modulo(&args[0], &args[1]),
+        Op::Abs | Op::Ceil | Op::Floor | Op::Sqrt | Op::Exp | Op::Ln | Op::Log10 => {
+            math::unary(op, &args[0])
+        }
+        Op::Round | Op::Trunc => math::round(op, &args[0], args.get(1)),
+        Op::Pow => math::pow(&args[0], &args[1]),
 
         Op::Concat => concat(args),
         Op::ToUpper => Ok(Bson::String(as_string_lossy(&args[0], op)?.to_uppercase())),
@@ -3699,9 +3893,9 @@ mod tests {
 
     #[test]
     fn an_unsupported_system_variable_says_so() {
-        // `$$NOW` is a feature this does not have, not a typo, and the error
+        // `$$DESCEND` is a feature this does not have, not a typo, and the error
         // class says which.
-        let err = Expr::parse(&Bson::String("$$NOW".into())).unwrap_err();
+        let err = Expr::parse(&Bson::String("$$DESCEND".into())).unwrap_err();
         assert!(matches!(err, Error::UnsupportedOperator { .. }), "{err:?}");
         assert!(Expr::parse(&Bson::String("$$".into())).is_err());
         assert!(Expr::parse(&Bson::String("$$ROOT.".into())).is_err());

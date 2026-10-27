@@ -17,6 +17,124 @@ Status meanings:
 
 ---
 
+## 🟡 `$$REMOVE` outside a field-dropping position reads as null, and a path on `$$NOW` or `$$REMOVE` is refused
+
+**Raised 2026-10-26, with ADR-253.** `$$NOW` and `$$REMOVE` are built.
+`$$REMOVE` as the value of a field in `$project` or `$addFields`, or in a
+document an expression builds, drops the field, and it reaches the field through
+the chosen result of `$cond`, `$switch` and `$let`. **Anywhere else it reads as
+`null`**: as an operand (`{$add: ["$$REMOVE", 1]}` is `null`), under `$ifNull`
+(which takes its replacement), as an element of an array expression, and as the
+value of a `$let` variable that a field is later set from
+(`{$let: {vars: {x: "$$REMOVE"}, in: "$$x"}}` writes `null`, where the variable
+itself would have to carry "missing" to drop the field). That is how a missing
+field path reads in this engine, which has no missing value inside an
+expression: an expression always produces a value, as the array operators' entry
+below records. A pipeline that relies on `$$REMOVE` surviving a variable keeps
+the `$cond` at the field instead.
+
+**`{$ifNull: ["$a", "$$REMOVE"]}` writes `null`**, not a missing field, when `a` is missing: the replacement is read in a value position, where `$$REMOVE` is `null`. A path that names a field through an array by a name is refused (`$$REMOVE` there is the same `400` a value written to it is), and a numeric position (`"a.0": "$$REMOVE"`) leaves a `null` in the array, which is what `$unset` does here so that the other positions keep their index.
+
+**`$$NOW.x` and `$$REMOVE.x` are `400`** (`has no fields to read into`), where a
+path under either is "missing" elsewhere. A date has no fields, and a path under
+a value that is not there is a typo worth refusing.
+
+**`$$NOW` is one date for the request, read from the clock of the member that
+runs it when the pipeline is parsed.** The same date in every stage and in every
+`$lookup` sub-pipeline; a long pipeline does not see time pass, and two requests
+a millisecond apart read different dates. It has millisecond precision.
+
+**To close:** none planned.
+
+---
+
+## 🟡 Math on doubles uses the platform's library, `$round` of a double reads its exact value, and a decimal result of the five functions has no quantum
+
+**Raised 2026-10-26, with ADR-253.** `$abs`, `$ceil`, `$floor`, `$round`,
+`$trunc`, `$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` are built for integers,
+doubles and `Decimal128` ([aggregation.md](aggregation.md#math)). Where they
+differ from other systems' versions of the same names:
+
+- **A double's `$sqrt`, `$exp`, `$ln`, `$log10` and non-integer `$pow` are the
+  platform's math library's.** The last digit can differ between architectures,
+  which a `Decimal128` result never does. A result is computed on the member that
+  runs the request and is never replicated by itself, so two members can disagree
+  in a last digit only about the same request, never about stored data.
+- **`$round` and `$trunc` of a double act on its exact binary value**, rounding
+  half to even: `{$round: [2.675, 2]}` is `2.67` because the double nearest 2.675
+  is `2.67499999999999982…`, and `{$round: [0.125, 2]}` is `0.12`. A system that
+  rounds a double through its shortest text answers `2.68` for the first. The
+  rule is ADR-252's for a double meeting a decimal: its value is the exact one.
+- **An integer result is always `Int64`**, an `Int32` argument included, as in the rest of the arithmetic;
+  a result past `Int64` (`$pow: [2, 63]`, `$abs` of the
+  smallest `Int64`, `$round` rounding up past it) is a double.
+- **A negative base to a power that is not a whole number is `400`**, where a
+  math library answers `NaN`. So are `$sqrt` of a negative number and `$ln` and
+  `$log10` of zero or less; a `NaN` argument gives `NaN`, and the refusal is for
+  an argument outside the domain, never a way to ask for one.
+- **The result of `$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` on a `Decimal128`
+  has its trailing zeros stripped** (`$sqrt` of `4.00` is `2`), because IEEE 754
+  gives these functions no preferred exponent. It is the value rounded once to
+  34 digits, half to even, to within 10^-75 of a rounding midpoint: a true value
+  that close to one can round the wrong way, which no input a person types does.
+  `$round` and `$trunc` of a decimal give exponent `-place`.
+- **`$round` and `$trunc` take a place of -20 to 100**, a whole number, and a
+  `null` place gives `null`; anything else is `400`.
+
+**To close:** none planned. A correctly rounded double library would make the
+first point go away at the price of a dependency; the sixth is the range other
+systems use.
+
+---
+
+## 🟡 A BinData mask is refused by `$bitsAllSet` and its three siblings, and a BinData field value never matches, where MongoDB reads the bytes
+
+**Raised 2026-10-26, with ADR-253.** MongoDB accepts a BinData value as the mask of `$bitsAllSet`, `$bitsAnySet`, `$bitsAllClear` and `$bitsAnyClear`, reading its bytes as a bit string, and tests a BinData field against an integer mask the same way. KimmyDB takes an integer mask (a non-negative whole number in 63 bits) or an array of bit positions, and a BinData mask is a `400` saying that BinData bitmasks are not supported. A BinData **field** value is not an integer, so it does not match any of the four operators (no error; `$not` inverts that).
+
+**Why.** Reading bytes as a bit string needs a byte order, a width and a rule for a mask longer than the value, and none of them has been chosen; an answer from a guessed rule would be wrong for whoever guessed otherwise. A refusal can be relaxed later without changing an answer anyone has relied on.
+
+**What it costs.** A port that sends a BinData mask gets a `400` and sends the integer or the positions it stands for.
+
+**Closing it** means deciding the byte order and width and reading BinData on both sides. Not planned.
+
+---
+
+## 🟡 A bit position above 63 is refused by the four `$bits*` operators, where MongoDB accepts the positions a longer value reaches
+
+**Raised 2026-10-26, with ADR-253.** An array of positions is limited to `0` to `63`, bit 0 the least significant, because a value is read as one 64-bit two's complement integer. `{"$bitsAllSet": [64]}` and `[-1]` are `400`s naming the position and the range; MongoDB accepts positions past 63, which are meaningful when the field holds BinData.
+
+**Why.** With no BinData reading (previous entry) there is no value for which a position past 63 means anything but sign extension, and silently answering by it would hide a typo.
+
+**What closes it.** Reading BinData (previous entry). Not planned.
+
+---
+
+## 🟡 A plain-document `$pull` matches the whole element, where MongoDB reads it as a query on the element's fields
+
+**Raised 2026-10-26, with ADR-253.** `{"$pull": {"results": {"score": 8}}}` removes the elements **equal** to `{score: 8}` and leaves `{score: 8, item: "B"}`, as `$pull` of a document always has here. MongoDB reads a document operand as a query against each element, and removes `{score: 8, item: "B"}` too. A document whose keys all start with `$` is a condition here (`{"$pull": {"scores": {"$gte": 6}}}`), as there, and a document mixing `$` keys and plain keys is a `400`.
+
+**The spelling that does what MongoDB's plain document does** is `$elemMatch`: `{"$pull": {"results": {"$elemMatch": {"score": 8}}}}` removes `{score: 8}` and `{score: 8, item: "B"}` alike, and takes the conditions a filter does (`{"$elemMatch": {"score": {"$gte": 8}, "item": "B"}}`).
+
+**Why.** Every `$pull` that worked before still does what it did, byte for byte: a plain document was always a value. Reading it as a query would have made an update that removed one element remove several, with a `200`, for a caller who changed nothing. Only a document that could not have matched anything before (an operator document compared as a value) changed meaning.
+
+**What it costs.** A port written against MongoDB's reading of a plain document removes less here, silently, and must spell it `$elemMatch`.
+
+**Closing it** means reading a plain document as a query, which changes the result of every existing partial-document `$pull`. Not planned.
+
+---
+
+## 🟡 `$bit` takes an integer operand and an integer field only
+
+**Raised 2026-10-26, with ADR-253.** `{"$bit": {"n": {"and": 6.0}}}` is a `400` here: the operand must be an `Int32` or `Int64`. A field holding a double (`2.0` included), a decimal, a string, an array or `null` is a `400` naming the field and its type; a missing field is read as `0` and created.
+
+**Why.** A bitwise operand is a bit pattern, and which pattern a double stands for is a guess nobody asked KimmyDB to make; JSON has one number type, so `6.0` is as likely to be a computation's rounding as a pattern. A refusal costs the caller one cast.
+
+**What it costs.** A client that serialises every number as a double (some JSON encoders do for a whole value) must send an integer type; Extended JSON `{"$numberInt": "6"}` or `{"$numberLong": "6"}` does.
+
+**Closing it** means accepting a whole double and reading it as an integer. Not planned.
+
+---
+
 ## 🟡 An inclusion projection leaves out a sub-document that holds none of its paths, where MongoDB answers it empty
 
 **Raised 2026-10-01, with ADR-214.** A projection through an array now does
@@ -402,8 +520,9 @@ for every number (IEEE would give an infinity or a NaN), an overflow in `$inc` a
 `$mul` is a `400` as an `Int64` overflow is (the double path still stores
 `Infinity`), and every NaN result is the one quiet NaN. `$mod` with
 a decimal, and date arithmetic with one, stay refused (`$mod needs numbers, found
-a Decimal128`), and `$round`, `$trunc` and quantize are a separate, later item, so
-a decimal mean or quotient shows 34 digits.
+a Decimal128`). `$round`, `$trunc`, `$abs`, `$ceil`, `$floor`, `$pow`, `$sqrt`, `$exp`,
+`$ln` and `$log10` take a decimal since 0.56.0 ([ADR-253](decisions.md)); a decimal
+mean or quotient shows 34 digits until the pipeline rounds it.
 
 A filter's `$mod` is not arithmetic on the value but a test of its integer
 part: it truncates a decimal toward zero, operand and stored value alike, as
@@ -418,8 +537,7 @@ integer is converted the way it always was, and a decimal would be rounded a
 second time on the way to one. The refusal says so: `a Decimal128 would have to
 be rounded to a 32-bit float`. ADR-252 converts a decimal to a double only.
 
-**To close:** none planned. The three differences are the point of the design;
-`$round` and quantize are the follow-up.
+**To close:** none planned. The three differences are the point of the design.
 
 ---
 

@@ -3657,6 +3657,216 @@ async fn positional_updates_address_array_elements() {
     assert_eq!(untouched["items"], "no");
 }
 
+/// `$bit` over HTTP: the three operations, a missing field created from zero,
+/// the type of the result, "no change" reported as `modified: 0`, and the
+/// `400`s for a field that is not an integer and a bad specification.
+#[tokio::test]
+async fn bit_updates_an_integer_field() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": 1, "flags": 12, "name": "x", "ratio": 1.5}),
+        )
+        .await;
+    let update = |spec: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/c/update",
+                    Some(token),
+                    json!({"filter": {"_id": 1}, "update": spec}),
+                )
+                .await
+        }
+    };
+
+    let res = update(json!({"$bit": {"flags": {"and": 6}, "fresh": {"or": 5}}})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 1);
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["flags"], 4, "{doc}");
+    assert_eq!(doc["fresh"], 5, "a missing field starts at zero: {doc}");
+
+    // Operations in one specification run in the order written.
+    let res = update(json!({"$bit": {"flags": {"xor": 1, "or": 8}}})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["flags"], 13, "{doc}");
+
+    // A result that equals what is stored writes nothing.
+    let res = update(json!({"$bit": {"flags": {"or": 0}}})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 1);
+    assert_eq!(res.body["modified"], 0, "no change, no write");
+
+    // Refusals are 400s that name what was found.
+    for (spec, needle) in [
+        (json!({"$bit": {"name": {"or": 1}}}), "\"name\" of type string"),
+        (json!({"$bit": {"ratio": {"or": 1}}}), "of type double"),
+        (json!({"$bit": {"flags": {"or": 1.0}}}), "integer operand"),
+        (json!({"$bit": {"flags": {"nand": 1}}}), "and, or or xor"),
+        (json!({"$bit": {"flags": {}}}), "at least one"),
+        (json!({"$bit": {"flags": 3}}), "$bit needs a document"),
+    ] {
+        let res = update(spec.clone()).await;
+        assert_eq!(res.status, 400, "{spec}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(needle), "{spec}: {msg}");
+    }
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["flags"], 13, "refused updates wrote nothing: {doc}");
+}
+
+/// `$bitsAllSet`, `$bitsAnySet`, `$bitsAllClear` and `$bitsAnyClear` in a
+/// `find`, with a mask and with bit positions, and the `400` for a bad one.
+#[tokio::test]
+async fn bits_operators_filter_a_find() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for (id, value) in [
+        (1, json!(0)),
+        (2, json!(5)),
+        (3, json!(6)),
+        (4, json!(-1)),
+        (5, json!("5")),
+        (6, json!(5.5)),
+        (7, json!([8, 4])),
+    ] {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "v": value})).await;
+    }
+    let ids = |filter: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/c/find",
+                    Some(token),
+                    json!({"filter": filter, "sort": {"_id": 1}}),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+            res.body["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["_id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(ids(json!({"v": {"$bitsAllSet": 5}})).await, [2, 4]);
+    assert_eq!(ids(json!({"v": {"$bitsAllSet": [0, 2]}})).await, [2, 4]);
+    assert_eq!(ids(json!({"v": {"$bitsAnySet": 1}})).await, [2, 4]);
+    assert_eq!(ids(json!({"v": {"$bitsAllClear": 5}})).await, [1, 7]);
+    assert_eq!(ids(json!({"v": {"$bitsAnyClear": 5}})).await, [1, 3, 7]);
+    assert_eq!(ids(json!({"v": {"$bitsAnySet": []}})).await, Vec::<i64>::new());
+    assert_eq!(ids(json!({"v": {"$not": {"$bitsAllSet": 5}}})).await, [1, 3, 5, 6, 7]);
+
+    // The same filter through an index on `v` is the same answer.
+    let res = server
+        .post("/v1/db/shop/coll/c/indexes", Some(&token), json!({"fields": [{"path": "v"}]}))
+        .await;
+    assert!(res.status == 200 || res.status == 201, "{:?}", res.body);
+    assert_eq!(ids(json!({"v": {"$bitsAllSet": 5}})).await, [2, 4]);
+
+    for (filter, needle) in [
+        (json!({"v": {"$bitsAllSet": -1}}), "non-negative"),
+        (json!({"v": {"$bitsAllSet": 1.5}}), "whole number"),
+        (json!({"v": {"$bitsAnySet": [64]}}), "between 0 and 63"),
+        (json!({"v": {"$bitsAnySet": [-1]}}), "between 0 and 63"),
+        (json!({"v": {"$bitsAllClear": "5"}}), "found string"),
+        (
+            json!({"v": {"$bitsAllClear": {"$binary": {"base64": "BQ==", "subType": "00"}}}}),
+            "BinData bitmasks are not supported",
+        ),
+    ] {
+        let res =
+            server.post("/v1/db/shop/coll/c/find", Some(&token), json!({"filter": filter})).await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(needle), "{filter}: {msg}");
+    }
+}
+
+/// `$pull` with an operator document removes the elements that satisfy it; a
+/// plain document still matches whole; a mixed one is a `400`.
+#[tokio::test]
+async fn pull_with_a_condition_removes_the_matching_elements() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let results = json!([
+        {"score": 8, "item": "A"},
+        {"score": 8, "item": "B"},
+        {"score": 8},
+        {"score": 7, "item": "C"},
+    ]);
+    for id in 1..=3 {
+        server
+            .post(
+                "/v1/db/shop/coll/c/docs",
+                Some(&token),
+                json!({"_id": id, "scores": [1, 6, 7, 9], "results": results}),
+            )
+            .await;
+    }
+    let update = |id: i64, spec: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/c/update",
+                    Some(token),
+                    json!({"filter": {"_id": id}, "update": spec}),
+                )
+                .await
+        }
+    };
+
+    // An operator document is a condition.
+    let res = update(1, json!({"$pull": {"scores": {"$gte": 6}}})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 1);
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["scores"], json!([1]), "{doc}");
+    let res = update(1, json!({"$pull": {"results": {"$elemMatch": {"score": 8}}}})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["results"], json!([{"score": 7, "item": "C"}]), "{doc}");
+
+    // A plain document matches the whole element, so the supersets stay.
+    let res = update(2, json!({"$pull": {"results": {"score": 8}}})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await.body;
+    assert_eq!(
+        doc["results"],
+        json!([{"score": 8, "item": "A"}, {"score": 8, "item": "B"}, {"score": 7, "item": "C"}]),
+        "{doc}"
+    );
+
+    // A mixed document and a bad condition are 400s, and write nothing.
+    for (spec, needle) in [
+        (json!({"$pull": {"results": {"$gte": 6, "score": 8}}}), "$elemMatch"),
+        (json!({"$pull": {"scores": {"$nope": 1}}}), "unsupported operator"),
+        (json!({"$pull": {"scores": {"$in": 3}}}), "$in requires an array"),
+    ] {
+        let res = update(3, spec.clone()).await;
+        assert_eq!(res.status, 400, "{spec}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(needle), "{spec}: {msg}");
+    }
+    let doc = server.get("/v1/db/shop/coll/c/docs/3", Some(&token)).await.body;
+    assert_eq!(doc["scores"], json!([1, 6, 7, 9]), "{doc}");
+}
+
 /// A `multi: true` request lands in chunks of `storage.multi_chunk_docs`
 /// (the engine default here, 1,000) and says how many (ADR-086).
 #[tokio::test]
@@ -13370,6 +13580,104 @@ async fn sum_and_avg_over_a_decimal128_are_exact() {
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(res.body["documents"][0]["t"], 3);
     assert_eq!(res.body["documents"][0]["m"], 1.5);
+}
+
+#[tokio::test]
+async fn the_math_operators_now_and_remove_run_through_the_aggregate_route() {
+    // ADR-253: the operators compute per document, `$$NOW` is one date for the
+    // request, `$$REMOVE` leaves a field out, and a bad argument is a `400`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "m" })).await;
+    for (id, doc) in [
+        (1, json!({ "v": 2.5, "d": dec("2.675"), "n": -7, "s": "text" })),
+        (2, json!({ "v": 3.5, "d": dec("1.005"), "n": 9, "s": "more" })),
+    ] {
+        let mut doc = doc;
+        doc["_id"] = json!(id);
+        let res = server.post("/v1/db/shop/coll/m/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/m/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    let res = aggregate(json!([
+        { "$sort": { "_id": 1 } },
+        { "$project": {
+            "half_even": { "$round": ["$v"] },
+            "cents": { "$round": ["$d", 2] },
+            "cut": { "$trunc": ["$d", 1] },
+            "abs": { "$abs": "$n" },
+            "pow": { "$pow": [2, 10] },
+            "root": { "$sqrt": 16 },
+            "dec_root": { "$sqrt": dec("4.00") },
+            "ceil": { "$ceil": "$v" },
+            "tens": { "$round": [1250, -2] }
+        } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let (first, second) = (&res.body["documents"][0], &res.body["documents"][1]);
+    assert_eq!(first["half_even"], 2.0, "{first:?}");
+    assert_eq!(second["half_even"], 4.0, "{second:?}");
+    assert_eq!(first["cents"], dec("2.68"), "{first:?}");
+    assert_eq!(second["cents"], dec("1.00"), "{second:?}");
+    assert_eq!(first["cut"], dec("2.6"), "{first:?}");
+    assert_eq!((first["abs"].clone(), second["abs"].clone()), (json!(7), json!(9)));
+    assert_eq!(first["pow"], 1024);
+    assert_eq!(first["root"], 4.0);
+    assert_eq!(first["dec_root"], dec("2"), "{first:?}");
+    assert_eq!(first["ceil"], 3.0);
+    assert_eq!(first["tens"], 1200);
+
+    // One date for the request, the same on every document and in every stage.
+    let res = aggregate(json!([
+        { "$sort": { "_id": 1 } },
+        { "$addFields": { "a": "$$NOW" } },
+        { "$addFields": { "b": "$$NOW", "gone": "$$REMOVE", "s": "$$REMOVE" } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert!(docs[0]["a"].get("$date").is_some(), "{:?}", docs[0]);
+    assert_eq!(docs[0]["a"], docs[0]["b"]);
+    assert_eq!(docs[0]["a"], docs[1]["a"]);
+    assert!(docs[0].get("s").is_none() && docs[1].get("s").is_none(), "{docs:?}");
+    assert_eq!(docs[0]["v"], 2.5);
+    // And through a `$lookup` sub-pipeline.
+    let res = aggregate(json!([
+        { "$limit": 1 },
+        { "$addFields": { "outer": "$$NOW" } },
+        { "$lookup": { "from": "m", "pipeline": [
+            { "$limit": 1 }, { "$project": { "inner": "$$NOW" } }
+        ], "as": "j" } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["outer"], res.body["documents"][0]["j"][0]["inner"]);
+
+    // A bad argument is refused, never turned into a NaN.
+    for (expr, message) in [
+        (json!({ "$sqrt": -1 }), "invalid query: $sqrt needs a number greater than or equal to 0"),
+        (json!({ "$ln": 0 }), "invalid query: $ln needs a positive number"),
+        (json!({ "$pow": [0, -1] }), "invalid query: $pow cannot raise 0 to a negative power"),
+        (
+            json!({ "$round": ["$v", 101] }),
+            "invalid query: the place of $round must be between -20 and 100, found 101",
+        ),
+        (json!({ "$abs": "$s" }), "invalid query: $abs needs numbers, found a string"),
+        (json!("$$NOW.x"), "invalid query: $$NOW has no fields to read into"),
+    ] {
+        let res = aggregate(json!([{ "$project": { "r": expr.clone() } }])).await;
+        assert_eq!(res.status, 400, "{expr}: {:?}", res.body);
+        assert_eq!(res.body["message"], message, "{expr}");
+    }
 }
 
 #[tokio::test]

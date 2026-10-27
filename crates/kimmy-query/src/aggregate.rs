@@ -295,6 +295,7 @@ pub fn parse(pipeline: &[Document]) -> Result<Vec<Stage>> {
 /// stage are held together while the pipeline runs.
 pub fn parse_with_vars(pipeline: &[Document], vars: &[String]) -> Result<Vec<Stage>> {
     let _budget = crate::filter::RegexBudget::open();
+    let _clock = crate::expr::RequestClock::open();
     parse_pipeline(pipeline, vars, Placement::TopLevel)
 }
 
@@ -1071,9 +1072,24 @@ fn set_computed(
     source: &Scope<'_>,
 ) -> Result<()> {
     for (name, expr) in computed {
-        let value = expr.eval_in(source)?;
-        path::set(target, name, value)
-            .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
+        // `$$REMOVE` leaves the field out: not written, and removed if the stage
+        // would otherwise carry it (ADR-253).
+        match expr.eval_field(source)? {
+            Some(value) => path::set(target, name, value)
+                .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?,
+            None => {
+                if !path::unset(target, name) && crossing_array(target, name).is_some() {
+                    // A path the write of a value would refuse is refused for the
+                    // removal too, with the same error: a field named through an array
+                    // by a name, not a position, is not a place a field can be left out
+                    // of. A numeric position leaves a null in the array, as `$unset` does.
+                    let mut probe = target.clone();
+                    if let Err(e) = path::set(&mut probe, name, Bson::Null) {
+                        return Err(Error::InvalidQuery(format!("cannot set {name:?}: {e}")));
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -3527,7 +3543,7 @@ mod lead {
     /// variables only.
     #[test]
     fn system_variables_other_than_root_and_current_stay_refused() {
-        for name in ["NOW", "CLUSTER_TIME", "REMOVE", "USER_ROLES"] {
+        for name in ["DESCEND", "CLUSTER_TIME", "PRUNE", "USER_ROLES"] {
             let refused = parse(&[doc! {"$lookup": {
                 "from": "a", "let": {"v": "$v"},
                 "pipeline": [{"$match": {"$expr": {"$eq": ["$k", format!("$${name}")]}}}],

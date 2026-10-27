@@ -59,7 +59,7 @@ regex as a value too. See [Deviations](deviations.md).
 | Operator | Meaning |
 |---|---|
 | `$and` `$or` `$nor` | Top-level, take arrays of filter documents |
-| `$not` | Applied to a **field's** operators, not at the top level |
+| `$not` | Applied to a **field's** operators, not at the top level. Its document must hold at least one operator: `{"$not": {"score": 8}}` is a `400`: write `$ne` for an equality, `{"$not": {"$elemMatch": {...}}}` for an array of documents (or inside `$pull`), and a dotted path for one embedded document, `{"r.score": {"$ne": 8}}` (`$elemMatch` matches arrays only, so over a single document `{"$not": {"$elemMatch": ...}}` matches it) |
 | `$expr` | Top-level, takes an [aggregation expression](aggregation.md#expressions); matches when it is truthy |
 
 ```javascript
@@ -256,6 +256,41 @@ tested:
 leaves it to the residual re-check every candidate goes through; an equality or
 range beside it still uses the index.
 
+### Bit tests
+
+| Operator | Matches when, of the bits the mask names |
+|---|---|
+| `$bitsAllSet` | every one is `1` |
+| `$bitsAnySet` | at least one is `1` |
+| `$bitsAllClear` | every one is `0` |
+| `$bitsAnyClear` | at least one is `0` |
+
+```javascript
+{ "flags": { "$bitsAllSet": 5 } }         // bits 0 and 2 are both set
+{ "flags": { "$bitsAnySet": [1, 3] } }    // bit 1 or bit 3 is set
+{ "flags": { "$not": { "$bitsAllClear": 6 } } }
+{ "items": { "$elemMatch": { "$bitsAnyClear": 1 } } }
+```
+
+The argument is either a **mask**, a non-negative whole number that fits in
+63 bits (an `Int32`, an `Int64`, or a double or `Decimal128` with that value),
+or an **array of bit positions**, each a whole number from `0` (least
+significant) to `63`. Anything else is a `400` naming the operator and what was
+found: a negative or fractional mask, a position of `64` or `-1`, a string.
+**A BinData mask is refused** ("BinData bitmasks are not supported").
+
+- **The value is read as 64-bit two's complement**: `-1` has all 64 bits set.
+  It must be an integer, or a double or `Decimal128` with a whole value that fits an
+  `Int64`. A string, `null`, a missing field, a fraction and BinData **never
+  match**, with no error (`$not` inverts that).
+- **An empty mask (`0`) or position list**: `$bitsAllSet` and `$bitsAllClear`
+  match every number; `$bitsAnySet` and `$bitsAnyClear` match none.
+- **Arrays match element-wise**, like the comparison operators: `[8, 4]`
+  satisfies `{"$bitsAllSet": 4}` through the `4`.
+- Never index-eligible. A bit test is a residual predicate every candidate
+  goes through; an equality or range beside it still uses an index. It cannot
+  appear in a partial index's filter.
+
 ### `$type`
 
 ```javascript
@@ -305,7 +340,7 @@ and matched nothing, or compiled without the flag.
 else**, as the request spelled it, so a client can match or log it. Where there
 is more to say, it follows after a colon: a partial index's filter refuses `$or`
 as `unsupported operator "$or": it cannot appear in a partialFilterExpression:
-…`, and an expression refuses `$$NOW` as `unsupported operator "$$NOW": a
+…`, and an expression refuses `$$DESCEND` as `unsupported operator "$$DESCEND": a
 system variable this build does not have; …`. Before 0.41.0 some refusals put
 that whole sentence inside the quotes.
 
@@ -456,7 +491,8 @@ both — mixing them is rejected rather than guessed at.
 | `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups), a `Decimal128` by its exact value: `$max: {v: 5}` over a stored `Decimal128("1.5")` sets `5` |
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
 | `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)), by value: `2`, `2.0` and `{"$numberDecimal": "2.00"}` are one member, and `0.1` the decimal and `0.1` the double are two; takes `$each` |
-| `$pull` `$pop` | Remove matching elements / one end. Matching is by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")` |
+| `$bit` | Bitwise `and`, `or`, `xor` of an integer field: `{"$bit": {"flags": {"or": 4}}}`. See [`$bit`](#bit) |
+| `$pull` `$pop` | Remove matching elements / one end. A plain value matches by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")`. A document of operators is a condition: `$pull: {scores: {$gte: 6}}`. See [`$pull`](#pull-a-value-or-a-condition) |
 | `$pullAll` | Remove every element equal to **any** value in a list, by value as `$pull` matches |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
@@ -467,10 +503,72 @@ both — mixing them is rejected rather than guessed at.
 { "$pullAll": { "tags": ["draft", "stale"] } }
 ```
 
-`$pull` and `$pullAll` match by **canonical equality** — `2` removes `2.0`, and
-a document matches whole, field order included. `$pullAll` on a field that is
-missing does nothing; on a field that is not an array it is a `400`, because
-the caller believes the field is an array and it is not.
+`$pull` of a value and `$pullAll` match by **canonical equality** — `2`
+removes `2.0`, and a document matches whole, field order included. `$pull`
+also takes a condition (below); `$pullAll` does not, and compares an operator
+document in its list as the plain document it is. `$pullAll` on a field that
+is missing does nothing; on a field that is not an array it is a `400`,
+because the caller believes the field is an array and it is not. **So is `$pull`,
+of a value or a condition**: `cannot apply $pull to non-array field "v"`.
+
+### `$pull`: a value or a condition
+
+What `$pull` does with a **document** operand depends on its keys, and
+nothing else about it changes. A scalar or an array operand always removes the
+elements equal to it, as `$pull: {tags: "a"}` does.
+
+| Operand | Reading | Example |
+|---|---|---|
+| A document whose keys **all** start with `$` | A **condition**, tested against each element with the filter language | `{ "$pull": { "scores": { "$gte": 6 } } }` over `[1, 6, 9]` leaves `[1]` |
+| A document with **no** key starting with `$` (the empty document too) | A **value**: removes the elements equal to the whole document, field order included | `{ "$pull": { "results": { "score": 8 } } }` over `[{score: 8}, {score: 8, item: "B"}]` leaves `[{score: 8, item: "B"}]` |
+| A document with **some** keys starting with `$` and some not | Refused with a `400`: say which you mean | `{ "$pull": { "results": { "$gte": 6, "score": 8 } } }` is a `400` |
+
+```javascript
+{ "$pull": { "scores": { "$gt": 1, "$lt": 5 } } }            // [1, 2, 4, 5] -> [1, 5]
+{ "$pull": { "tags": { "$in": ["draft", "stale"] } } }
+{ "$pull": { "words": { "$regex": "^tmp" } } }
+{ "$pull": { "flags": { "$bitsAllSet": 4 } } }                // see the bit operators
+{ "$pull": { "scores": { "$not": { "$gt": 2 } } } }
+{ "$pull": { "results": { "$elemMatch": { "score": 8 } } } }  // removes {score: 8, item: "B"} too
+```
+
+A condition holds the operators of an `$elemMatch` over scalars, and an
+element is a scalar or a sub-document. To remove sub-documents by **some** of
+their fields, spell it `$elemMatch`: it matches the fields of a document
+element, where the plain `{ "score": 8 }` is a value and removes only a
+document equal to it. The condition is parsed once, with the update: an
+unknown operator or a bad argument (`{ "$in": 3 }`) is a `400` before any
+element is looked at. `$pull` from a field that is missing does nothing, and from
+one that is not an array is a `400`. A `$not` in a condition takes operators, as
+everywhere (`{ "$not": { "$gt": 2 } }`): `{ "$not": { "score": 8 } }` is a `400`
+naming `$ne` and `$elemMatch`, because a document with no operator in it would be
+read as the negation of an equality on a whole document.
+
+### `$bit`
+
+```javascript
+{ "$bit": { "flags": { "or": 4 } } }               // set bit 2
+{ "$bit": { "flags": { "and": 12, "xor": 1 } } }    // and 12, then xor 1: in the order written
+```
+
+`and`, `or` and `xor` take an `Int32` or an `Int64`; a spec document holds
+one or more of them and applies them in the order written. Negative numbers
+are 64-bit two's complement, so `{"and": 255}` on `-1` leaves `255`.
+
+- **The operand must be an integer.** A double is refused even when it is
+  whole (`{"and": 6.0}` is a `400`), as is a `Decimal128`, a string or any
+  other type. An unknown key (`nand`), an empty spec and a spec that is not a
+  document are `400`s too, naming the three operations.
+- **The field must be an integer or missing.** A double, a decimal, a string,
+  an array or `null` is a `400` naming the field and its type. A **missing**
+  field is read as `0` and created: `and` gives `0`, `or` and `xor` give the
+  operand.
+- **The result follows [integer arithmetic](#integers-stay-integral):** two
+  32-bit integers give a 32-bit integer, and a 64-bit stored value or operand
+  gives a 64-bit integer. A result equal to the stored value counts as no
+  change, as `$inc: 0` does ([`modified`](#modified-counts-changes)).
+- It takes part in [one write per path](#one-write-per-path) and works through
+  `$[]` and `$[<identifier>]` paths as `$inc` does.
 
 ### `$push` modifiers
 
@@ -793,6 +891,9 @@ it had, so an `if_stamp` that named it still does ([ADR-208](decisions.md)).
 | `$addToSet` of a present value; `$pull` of an absent one; `$push` with an empty `$each` onto an array | | no |
 | `$inc: {n: 0}` | `n` a 64-bit integer or a double | no |
 | `$inc: {n: 0}` | `n` a 32-bit integer | no: [integer arithmetic](#integers-stay-integral) keeps it a 32-bit integer |
+| `$bit: {n: {or: 0}}`, `{and: -1}`, `{xor: 0}`, or any operation that leaves the bits as they are | `n` a 32-bit integer, 32-bit operands | no |
+| `$bit: {n: {or: NumberLong(0)}}` | `n` a 32-bit integer | **yes**: a 64-bit operand makes the result a 64-bit integer |
+| `$pull` with a condition no element satisfies | | no |
 | `$inc: {n: 0}` or `{n: 0.0}` or `{n: -0.0}` | `n: Decimal128("1.5")` | no: `1.5 + 0` is `1.5` |
 | `$mul: {n: 1}` | `n: Decimal128("1.5")` | no |
 | `$inc: {n: Decimal128("0.00")}` | `n: Decimal128("1.5")` | **yes**: `1.50`, another member of the cohort |
@@ -1084,11 +1185,8 @@ than as an `$or` of one `$regex` each.
 | Feature | Status |
 |---|---|
 | `$vectorSearch` | ✅ Built as the first [aggregation](aggregation.md#vectorsearch) stage, with the fields of the [vector search endpoint](vectors.md); other systems' field names are refused |
-| `$bit` | 📋 Planned — the next tier of update-operator compatibility |
 | `$` positional update operator (`items.$.qty`) | ⛔ Not planned — the matcher does not report which element a filter matched, and `$[<identifier>]` with `arrayFilters` expresses the same thing without depending on the query; see [Positional updates](#positional-updates) |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
-| `$pull` with a query condition (`{ "$pull": { "scores": { "$gte": 6 } } }`) | 📋 Not built — `$pull` and `$pullAll` match literal values only, so a condition document is compared as a document and removes nothing |
-| `$bitsAllSet` `$bitsAnySet` `$bitsAllClear` `$bitsAnyClear` | 📋 Not built |
 | `$jsonSchema` | 📋 Not built |
 | Geospatial operators | ⛔ Not planned |
 | Text indexes / `$text` | ⛔ Superseded by [vector and hybrid search](vectors.md) |
