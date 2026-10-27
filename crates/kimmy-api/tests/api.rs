@@ -13756,7 +13756,7 @@ async fn facet_answers_one_document_of_arrays_and_refuses_what_it_cannot_hold() 
         ),
         (
             json!({ "a.b": [] }),
-            "invalid query: a $facet name becomes a field of the answer, so it cannot be empty, start with `$` or contain `.`: \"a.b\"",
+            "invalid query: a $facet name becomes a field of the answer, so it cannot be empty, start with `$`, or contain `.` or a NUL: \"a.b\"",
         ),
         (
             json!({ "a": { "$count": "n" } }),

@@ -307,7 +307,7 @@ pub fn parse(pipeline: &[Document]) -> Result<Vec<Stage>> {
 pub fn parse_with_vars(pipeline: &[Document], vars: &[String]) -> Result<Vec<Stage>> {
     let _budget = crate::filter::RegexBudget::open();
     let _clock = crate::expr::RequestClock::open();
-    parse_pipeline(pipeline, vars, Placement::TopLevel)
+    parse_pipeline(pipeline, vars, Placement::TOP)
 }
 
 /// Where a pipeline sits, for the one rule that depends on it.
@@ -318,10 +318,18 @@ pub fn parse_with_vars(pipeline: &[Document], vars: &[String]) -> Result<Vec<Sta
 /// stored document may hold. Inside a `$lookup` sub-pipeline it is almost
 /// certainly a variable the author expected the filter to substitute, and
 /// the filter never will — see [`refuse_variables_in_match`].
+///
+/// `in_facet` marks a pipeline anywhere under a `$facet`, a `$lookup` sub-pipeline of
+/// one included, where `$facet` and `$vectorSearch` are refused.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Placement {
-    TopLevel,
-    SubPipeline,
+struct Placement {
+    /// Inside a `$lookup` sub-pipeline.
+    sub: bool,
+    in_facet: bool,
+}
+
+impl Placement {
+    const TOP: Placement = Placement { sub: false, in_facet: false };
 }
 
 fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
@@ -369,7 +377,7 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
     match name.as_str() {
         "$match" => {
             let raw = as_document(name, value)?;
-            if at == Placement::SubPipeline {
+            if at.sub {
                 refuse_variables_in_match(raw)?;
                 // A `$expr` here reads the `let` names in scope (ADR-222).
                 return Ok(Stage::Match(Box::new(filter::parse_in_scope(raw, vars)?)));
@@ -392,14 +400,30 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         },
         "$unwind" => parse_unwind(value),
         "$group" => parse_group(as_document(name, value)?, vars),
-        "$lookup" => parse_lookup(as_document(name, value)?, vars),
-        "$facet" => parse_facet(as_document(name, value)?, vars, at),
+        "$lookup" => parse_lookup(as_document(name, value)?, vars, at),
+        "$facet" => {
+            if at.in_facet {
+                return Err(Error::InvalidQuery(
+                    "$facet cannot be used inside a $facet, a $lookup sub-pipeline of one \
+                     included"
+                        .into(),
+                ));
+            }
+            parse_facet(as_document(name, value)?, vars, at)
+        }
         "$vectorSearch" => {
             // The stage is the pipeline's source, in place of the collection
             // scan, so it can only be the first stage of the top-level
             // pipeline; a `$lookup` sub-pipeline's source is the foreign
             // collection scan.
-            if at == Placement::SubPipeline {
+            if at.in_facet {
+                return Err(Error::InvalidQuery(
+                    "$vectorSearch cannot be used inside a $facet: it is a pipeline's source, \
+                     and a facet's source is the stage's input"
+                        .into(),
+                ));
+            }
+            if at.sub {
                 return Err(Error::InvalidQuery(
                     "$vectorSearch must be the first stage of the top-level pipeline; it cannot \
                      run inside a $lookup sub-pipeline"
@@ -459,7 +483,7 @@ fn parse_facet(spec: &Document, vars: &[String], at: Placement) -> Result<Stage>
         if name.is_empty() || name.starts_with('$') || name.contains('.') || name.contains('\0') {
             return Err(Error::InvalidQuery(format!(
                 "a $facet name becomes a field of the answer, so it cannot be empty, start with \
-                 `$` or contain `.`: {name:?}"
+                 `$`, or contain `.` or a NUL: {name:?}"
             )));
         }
         let Bson::Array(raw) = value else {
@@ -486,7 +510,8 @@ fn parse_facet(spec: &Document, vars: &[String], at: Placement) -> Result<Stage>
                 Ok(doc.clone())
             })
             .collect::<Result<Vec<_>>>()?;
-        facets.push((name.clone(), parse_pipeline(&raw, vars, at)?));
+        facets
+            .push((name.clone(), parse_pipeline(&raw, vars, Placement { in_facet: true, ..at })?));
     }
     Ok(Stage::Facet(facets))
 }
@@ -501,7 +526,9 @@ fn parse_facet(spec: &Document, vars: &[String], at: Placement) -> Result<Stage>
 /// next runs, so what is held is bounded two ways, both **refused**, never cut
 /// short: the facets' outputs together may not exceed the pipeline's document
 /// ceiling, and the answer, which is one document, may not exceed the size a
-/// stored document may (`kimmy_core::limits::MAX_DOCUMENT_BYTES`). A facet that
+/// stored document may (`kimmy_core::limits::MAX_DOCUMENT_BYTES`), counted as the
+/// facets finish and refused at the first document that passes it, so a later
+/// facet never runs for an answer that cannot be returned. A facet that
 /// fails fails the stage. `$$NOW` is the same date in every facet: it is read
 /// when the pipeline is parsed.
 pub fn run_facet<E: From<Error>>(
@@ -512,6 +539,9 @@ pub fn run_facet<E: From<Error>>(
 ) -> std::result::Result<Document, E> {
     let mut answer = Document::new();
     let mut held = 0usize;
+    // The bytes the answer will encode to, kept as it grows: a document header and
+    // terminator, then for each facet its element and its array.
+    let mut bytes = 5usize;
     let mut input = Some(input);
     for (at, (name, stages)) in facets.iter().enumerate() {
         let docs = if at + 1 == facets.len() {
@@ -522,12 +552,28 @@ pub fn run_facet<E: From<Error>>(
         let out = run(stages, docs)?;
         held += out.len();
         check_limit("$facet", held, limits)?;
+        // The element (type byte, name, terminator), the array's header and terminator,
+        // and each document as an element of it (type byte, decimal index, terminator).
+        bytes += 1 + name.len() + 1 + 4 + 1;
+        for (index, doc) in out.iter().enumerate() {
+            let encoded = bson::serialize_to_vec(doc)
+                .map_err(|e| Error::Internal(format!("$facet output could not be encoded: {e}")))?;
+            bytes += 1 + index.to_string().len() + 1 + encoded.len();
+            // Refused as soon as it is over, so a later facet is never run for an answer
+            // that cannot be returned.
+            if bytes > kimmy_core::limits::MAX_DOCUMENT_BYTES {
+                return Err(Error::AnswerTooLarge {
+                    what: "$facet answer",
+                    bytes,
+                    max: kimmy_core::limits::MAX_DOCUMENT_BYTES,
+                    remedy: "split the facets into separate requests, or $limit and $project \
+                             inside them",
+                }
+                .into());
+            }
+        }
         answer.insert(name.clone(), Bson::Array(out.into_iter().map(Bson::Document).collect()));
     }
-    let bytes = bson::serialize_to_vec(&answer)
-        .map_err(|e| Error::Internal(format!("$facet answer could not be encoded: {e}")))?
-        .len();
-    kimmy_core::limits::check_document(bytes)?;
     Ok(answer)
 }
 
@@ -947,7 +993,7 @@ fn parse_group(spec: &Document, vars: &[String]) -> Result<Stage> {
 /// indexed pass with a per-document loop, and a caller who wants to reshape
 /// what an equality join attached can do that with `$filter` or `$map` in the
 /// stage after it.
-fn parse_lookup(spec: &Document, vars: &[String]) -> Result<Stage> {
+fn parse_lookup(spec: &Document, vars: &[String], at: Placement) -> Result<Stage> {
     // Closed over the union of both forms' keys; which subset is actually
     // legal together is decided below, where the two forms are told apart.
     deny_unknown_keys(
@@ -1017,7 +1063,7 @@ fn parse_lookup(spec: &Document, vars: &[String]) -> Result<Stage> {
             in_scope.extend(let_vars.iter().map(|(name, _)| name.clone()));
             // A sub-pipeline is one whether or not this `$lookup` has a
             // `let`, and wherever the `$lookup` itself sits.
-            let stages = parse_pipeline(&raw_stages, &in_scope, Placement::SubPipeline)?;
+            let stages = parse_pipeline(&raw_stages, &in_scope, Placement { sub: true, ..at })?;
             let lead = match stages.first() {
                 Some(Stage::Match(f)) => Lead::analyze(f, &in_scope).map(Box::new),
                 _ => None,
