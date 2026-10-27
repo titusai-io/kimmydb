@@ -3653,7 +3653,7 @@ mod tests {
         let small = aggregate::Limits { max_documents: 5 };
         let err = agg_limits(&state, &superuser(), "app", "emp", &from(json!(["d"]), 10), small)
             .expect_err("six foreign documents under a ceiling of five");
-        assert!(format!("{err:?}").contains("$graphLookup produced 6 documents"), "{err:?}");
+        assert!(format!("{err:?}").contains("$graphLookup reads `emp` whole"), "{err:?}");
         // What the walks reach, in all, is held to it too: 3 + 2 + 1 is six, and `e` adds two more.
         let six = aggregate::Limits { max_documents: 6 };
         let out =
