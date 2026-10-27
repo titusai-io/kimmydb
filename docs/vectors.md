@@ -488,7 +488,14 @@ owns when its worker starts, since what was deferred before a restart went with
 the process and the recorded position has passed it (in a cluster only: a
 single node never defers). A rescan embeds what each document's own check says
 is stale or missing, so a collection the previous owner kept up costs reads, not
-provider calls. That check sees a configuration change as well as a document
+provider calls. Those reads hold in memory only the collection's document ids
+while the scan runs, and leave redb's page cache holding the pages they touched:
+about 1.65 times the collection's stored bytes (measured, 16.9 MiB for 2,000
+documents of 5 KiB), whatever the size of the rest of the store, and never more
+than the `storage.cache_bytes` bound. A rescan is not what makes a member's
+resident memory climb after a restart; the cache filling for the divergence
+checks and the serve walks is, and the rescan only happens to run in the same
+minute. That check sees a configuration change as well as a document
 change, since each record says which configuration made it, so a reindex the
 previous owner left unfinished, because it stopped or left part-way through, is
 finished by the member that takes the collection over, and the documents the
