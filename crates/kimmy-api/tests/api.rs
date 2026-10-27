@@ -13681,6 +13681,104 @@ async fn the_math_operators_now_and_remove_run_through_the_aggregate_route() {
 }
 
 #[tokio::test]
+async fn facet_answers_one_document_of_arrays_and_refuses_what_it_cannot_hold() {
+    // ADR-254: every facet runs over the same input; a `$lookup` works inside one;
+    // `$$NOW` is one date; what a facet cannot hold is a `400`, never ignored.
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["f", "g"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    for (id, city, n) in [(1, "oslo", 3), (2, "oslo", 5), (3, "rome", 7)] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/f/docs",
+                Some(&token),
+                json!({ "_id": id, "city": city, "n": n }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    for (id, city, label) in [(1, "oslo", "north"), (2, "rome", "south")] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/g/docs",
+                Some(&token),
+                json!({ "_id": id, "city": city, "label": label }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/f/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    let res = aggregate(json!([
+        { "$match": { "n": { "$gte": 3 } } },
+        { "$facet": {
+            "total": [ { "$count": "n" } ],
+            "byCity": [ { "$group": { "_id": "$city", "sum": { "$sum": "$n" } } }, { "$sort": { "_id": 1 } } ],
+            "joined": [
+                { "$lookup": { "from": "g", "localField": "city", "foreignField": "city", "as": "g" } },
+                { "$sort": { "_id": 1 } },
+                { "$project": { "label": { "$arrayElemAt": ["$g.label", 0] }, "at": "$$NOW" } }
+            ],
+            "again": [ { "$limit": 1 }, { "$project": { "at": "$$NOW" } } ]
+        } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 1, "{:?}", res.body);
+    let answer = &res.body["documents"][0];
+    assert_eq!(answer["total"], json!([{ "n": 3 }]));
+    assert_eq!(answer["byCity"], json!([{ "_id": "oslo", "sum": 8 }, { "_id": "rome", "sum": 7 }]));
+    assert_eq!(answer["joined"][0]["label"], "north");
+    assert_eq!(answer["joined"][2]["label"], "south");
+    assert_eq!(answer["joined"][0]["at"], answer["again"][0]["at"], "{answer:?}");
+
+    for (facet, message) in [
+        (
+            json!({}),
+            "invalid query: $facet needs at least one facet: {$facet: {<name>: [<stages>]}}",
+        ),
+        (
+            json!({ "a": [ { "$facet": { "b": [] } } ] }),
+            "invalid query: $facet cannot be used inside a $facet (in `a`)",
+        ),
+        (
+            json!({ "a": [ { "$vectorSearch": { "query": "x" } } ] }),
+            "invalid query: $vectorSearch cannot be used inside a $facet (in `a`)",
+        ),
+        (
+            json!({ "a.b": [] }),
+            "invalid query: a $facet name becomes a field of the answer, so it cannot be empty, start with `$`, or contain `.` or a NUL: \"a.b\"",
+        ),
+        (
+            json!({ "a": { "$count": "n" } }),
+            "invalid query: $facet `a` is an array of pipeline stages, found a document",
+        ),
+    ] {
+        let res = aggregate(json!([{ "$facet": facet.clone() }])).await;
+        assert_eq!(res.status, 400, "{facet}: {:?}", res.body);
+        assert_eq!(res.body["message"], message, "{facet}");
+    }
+    // A facet that fails is the request's failure, and a foreign collection it names is
+    // authorized like any other.
+    let res = aggregate(
+        json!([{ "$facet": { "a": [ { "$project": { "x": { "$add": ["$city", 1] } } } ] } }]),
+    )
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let res = aggregate(json!([{ "$facet": { "a": [ { "$lookup": { "from": "nope", "localField": "city", "foreignField": "city", "as": "g" } } ] } }])).await;
+    assert!(res.status == 404 || res.status == 403, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn aggregation_groups_joins_and_ranks_a_decimal128_by_its_value() {
     // Design 2.2: `$group`, `$addToSet` and the `$lookup` join keys identify
     // equal numbers and decimals as one member, a bucket's `_id` the first

@@ -108,6 +108,11 @@ fn collect_foreign<'a>(stages: &'a [Stage], out: &mut Vec<&'a str>) {
                 collect_foreign(sub, out);
             }
         }
+        if let Stage::Facet(facets) = stage {
+            for (_, sub) in facets {
+                collect_foreign(sub, out);
+            }
+        }
     }
 }
 
@@ -200,6 +205,22 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
         }
         // Only ever first, where it is the source; described here for completeness.
         Stage::VectorSearch(_) => "ranks the vector index; a source, only ever first".into(),
+        Stage::Facet(facets) => {
+            out["facets"] = json!(
+                facets
+                    .iter()
+                    .map(|(name, sub)| {
+                        json!({
+                            "name": name,
+                            "stages": sub.iter().map(|s| describe(s, false)).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
+            "runs every facet over the same input, in memory, and answers one document of \
+             arrays; each facet's output counts against the pipeline's document limit"
+                .into()
+        }
         Stage::Lookup { from, as_field, join } => {
             out["from"] = json!(from);
             out["as"] = json!(as_field);
