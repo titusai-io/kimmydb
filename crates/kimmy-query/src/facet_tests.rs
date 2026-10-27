@@ -268,7 +268,7 @@ fn an_answer_over_the_cap_is_refused_before_a_later_facet_runs() {
 #[test]
 fn the_size_counted_as_the_facets_finish_is_the_size_the_answer_encodes_to() {
     // `{a: [{p: "x…"}]}` encodes to the padding plus 29 bytes: the answer's header and
-    // terminator (5), the element `a` (4), its array (5), the element `0` of it (3) and
+    // terminator (5), the element `a` (3: type, name, terminator), its array (5), the element `0` of it (3) and
     // the document `{p: …}` (padding + 13). So the padding that makes the answer exactly
     // the cap is accepted, and one byte more is refused.
     let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
@@ -304,4 +304,28 @@ fn a_facet_inside_a_lookup_inside_a_facet_is_refused_too() {
         "from": "x", "pipeline": [{"$facet": {"b": []}}], "as": "j"}}])
         .is_ok()
     );
+}
+
+#[test]
+fn an_empty_facet_with_a_long_name_is_charged_for_its_header() {
+    // A first facet that fills the answer to a few bytes under the cap, then facets that
+    // emit nothing and whose names alone pass it: refused, though no document is ever added after the first.
+    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
+    // `{a: [{p: …}], <long>: []}`: the first part is padding + 29 bytes.
+    let padding = cap - 29 - 100;
+    let long = "n".repeat(200);
+    let mut facets = Document::new();
+    facets.insert("a", Bson::Array(vec![]));
+    facets.insert(long.clone(), Bson::Array(vec![Bson::Document(doc! {"$limit": 0})]));
+    let err = run(&[doc! {"$facet": facets}], vec![doc! {"p": "x".repeat(padding)}])
+        .expect_err("the second facet's header passes the cap");
+    assert!(
+        matches!(err, kimmy_core::Error::AnswerTooLarge { bytes, .. } if bytes > cap),
+        "{err:?}"
+    );
+    // A name that fits under the cap is accepted.
+    let mut facets = Document::new();
+    facets.insert("a", Bson::Array(vec![]));
+    facets.insert("short", Bson::Array(vec![Bson::Document(doc! {"$limit": 0})]));
+    assert!(run(&[doc! {"$facet": facets}], vec![doc! {"p": "x".repeat(padding)}]).is_ok());
 }
