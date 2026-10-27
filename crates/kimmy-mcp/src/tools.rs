@@ -565,12 +565,15 @@ impl KimmyMcp {
                        the work in the database rather than returning rows for you to \
                        reduce. Stages: $match (filter, put it first so later stages see \
                        less), $group (with $sum, $avg, $min, $max, $first, $last, $push, \
-                       $addToSet), $unwind, $project, $sort, $skip, $limit, $count, and \
+                       $addToSet), $unwind, $project, $sort, $skip, $limit, $count, \
                        $lookup (join; you need read access to the joined collection too), \
                        $facet (several sub-pipelines over one input, answered as one \
-                       document of arrays), $bucket and $bucketAuto (histograms), $graphLookup (walk a self-referencing \
-                       collection; maxDepth is required; you need read access to it), and $vectorSearch (semantic search as the first stage, with query or \
-                       vector, k, per_document, filter; needs read access). \
+                       document of arrays), $bucket and $bucketAuto (histograms), \
+                       $graphLookup (walk a collection link by link; maxDepth is required, \
+                       restrictSearchWithMatch narrows the collection it reads whole; you \
+                       need read access to it), and $vectorSearch (semantic search as the \
+                       first stage, with query or vector, k, per_document, filter; needs \
+                       read access). \
                        Field references are written \"$field\"; computed expressions \
                        ($add, $concat, $cond, $size, $filter, $map and the rest) work \
                        anywhere a value is derived. A pipeline that would hold too many \

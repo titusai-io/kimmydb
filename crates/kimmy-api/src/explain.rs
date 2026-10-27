@@ -217,7 +217,9 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
             out["maxDepth"] = json!(spec.max_depth);
             out["connectFromField"] = json!(spec.connect_from);
             out["connectToField"] = json!(spec.connect_to);
-            out["readsForeign"] = json!("once per execution of the stage");
+            out["readsForeign"] = json!(
+                "once per execution of the stage, and not at all when no document reaches it"
+            );
             "scans the foreign collection once, files it in memory by connectToField and walks \
              it per input document, each document at most once; what is reached counts against \
              the pipeline's document limit"

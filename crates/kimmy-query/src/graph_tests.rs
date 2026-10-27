@@ -82,3 +82,32 @@ fn every_other_required_key_and_every_unknown_key_is_refused() {
     let message = refused(with("graph", 1));
     assert!(message.contains("graph"), "{message}");
 }
+
+#[test]
+fn as_and_depth_field_are_one_field_not_a_path() {
+    for key in ["as", "depthField"] {
+        let message = refused(with(key, "a.b"));
+        assert!(
+            message.contains(&format!(
+                "`{}` is the name of one field, not a path",
+                if key == "as" { "as" } else { "depthField" }
+            )) && message.contains("a.b"),
+            "{key}: {message}"
+        );
+    }
+    assert!(aggregate::parse(&[doc! {"$graphLookup": with("depthField", "step")}]).is_ok());
+}
+
+#[test]
+fn a_variable_string_in_restrict_search_with_match_in_a_lookup_sub_pipeline_is_refused() {
+    let restrict = doc! {"restrictSearchWithMatch": {"owner": "$$who"}};
+    let mut inner = spec();
+    inner.extend(restrict);
+    let in_lookup = aggregate::parse(&[doc! {"$lookup": {
+    "from": "x", "let": {"who": "$w"},
+    "pipeline": [{"$graphLookup": inner.clone()}], "as": "j"}}]);
+    let message = in_lookup.expect_err("a variable is not read by the filter language").to_string();
+    assert!(message.contains("$$who"), "{message}");
+    // At the top level there is no `let`, and the string is the literal it is in a `$match`.
+    assert!(aggregate::parse(&[doc! {"$graphLookup": inner}]).is_ok());
+}

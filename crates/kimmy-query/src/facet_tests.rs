@@ -193,7 +193,12 @@ fn an_answer_over_the_document_size_cap_is_refused_not_cut_short() {
     let big = "x".repeat(6 * 1024 * 1024);
     let input: Vec<Document> = (0..3).map(|i| doc! {"_id": i, "pad": big.clone()}).collect();
     let err = run(&[doc! {"$facet": {"all": []}}], input).unwrap_err();
-    assert!(matches!(err, kimmy_core::Error::DocumentTooLarge { .. }), "{err:?}");
+    assert!(matches!(err, kimmy_core::Error::AnswerTooLarge { .. }), "{err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains("$facet answer") && message.contains("$limit and $project"),
+        "{message}"
+    );
     // The same data trimmed by a facet that keeps one is fine.
     let input: Vec<Document> = (0..3).map(|i| doc! {"_id": i, "pad": big.clone()}).collect();
     let out =
@@ -230,4 +235,73 @@ fn a_pipeline_with_facets_reads_the_clock_once() {
     .unwrap();
     assert_eq!(crate::expr::clock_reads() - before, 1);
     drop(stages);
+}
+
+#[test]
+fn an_answer_over_the_cap_is_refused_before_a_later_facet_runs() {
+    // One facet emits one document holding everything: a document count of 1 and
+    // 18 MiB. The facet after it would fail, and must never be reached.
+    let big = "x".repeat(6 * 1024 * 1024);
+    let input: Vec<Document> = (0..3).map(|i| doc! {"_id": i, "pad": big.clone()}).collect();
+    let err = run(
+        &[doc! {"$facet": {
+            "everything": [{"$group": {"_id": null, "all": {"$push": "$$ROOT"}}}],
+            "never": [{"$addFields": {"x": {"$add": ["$_id", "text"]}}}],
+        }}],
+        input,
+    )
+    .unwrap_err();
+    assert!(matches!(err, kimmy_core::Error::AnswerTooLarge { .. }), "{err:?}");
+    // The same facets, with the failing one first, report that failure instead.
+    let input: Vec<Document> = (0..3).map(|i| doc! {"_id": i, "pad": big.clone()}).collect();
+    let err = run(
+        &[doc! {"$facet": {
+            "first": [{"$addFields": {"x": {"$add": ["$_id", "text"]}}}],
+            "everything": [{"$group": {"_id": null, "all": {"$push": "$$ROOT"}}}],
+        }}],
+        input,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("$add needs numbers"), "{err}");
+}
+
+#[test]
+fn the_size_counted_as_the_facets_finish_is_the_size_the_answer_encodes_to() {
+    // `{a: [{p: "x…"}]}` encodes to the padding plus 29 bytes: the answer's header and
+    // terminator (5), the element `a` (4), its array (5), the element `0` of it (3) and
+    // the document `{p: …}` (padding + 13). So the padding that makes the answer exactly
+    // the cap is accepted, and one byte more is refused.
+    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
+    let facet =
+        |padding: usize| run(&[doc! {"$facet": {"a": []}}], vec![doc! {"p": "x".repeat(padding)}]);
+    let out = facet(cap - 29).expect("exactly the cap is allowed");
+    assert_eq!(bson::serialize_to_vec(&out[0]).unwrap().len(), cap);
+    let err = facet(cap - 28).expect_err("one byte over");
+    assert!(
+        matches!(err, kimmy_core::Error::AnswerTooLarge { bytes, .. } if bytes == cap + 1),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_facet_inside_a_lookup_inside_a_facet_is_refused_too() {
+    for inner in [doc! {"$facet": {"b": []}}, doc! {"$vectorSearch": {"query": "x"}}] {
+        let message = refused(&[doc! {"$facet": {"a": [{"$lookup": {
+        "from": "x", "pipeline": [inner.clone()], "as": "j"}}]}}]);
+        assert!(
+            message.contains("inside a $facet") || message.contains("$lookup sub-pipeline"),
+            "{inner}: {message}"
+        );
+    }
+    // A lookup in a facet with neither is fine, and a facet in a lookup outside one is too.
+    assert!(
+        aggregate::parse(&[doc! {"$facet": {"a": [{"$lookup": {
+        "from": "x", "pipeline": [{"$limit": 1}], "as": "j"}}]}}])
+        .is_ok()
+    );
+    assert!(
+        aggregate::parse(&[doc! {"$lookup": {
+        "from": "x", "pipeline": [{"$facet": {"b": []}}], "as": "j"}}])
+        .is_ok()
+    );
 }

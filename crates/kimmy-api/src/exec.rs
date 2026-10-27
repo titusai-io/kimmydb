@@ -2323,15 +2323,21 @@ fn lookup_pipeline(
         return Ok(input);
     }
 
-    let mut foreign: Vec<bson::Document> = Vec::new();
-    // The whole foreign collection, so a walk (ADR-153).
-    kimmy_storage::blocking(|| {
-        state.engine.for_each_doc(&foreign_meta, kimmy_storage::WalkScope::Request, |_id, doc| {
-            foreign.push(doc);
-            Ok(true)
-        })
-    })?;
-    aggregate::check_limit("$lookup", foreign.len(), limits)?;
+    // The whole foreign collection, held for the loop: refused at the first document past
+    // the ceiling, not after the collection has been read.
+    let foreign = read_foreign(
+        state,
+        &foreign_meta,
+        limits,
+        |_| Ok(true),
+        |max| {
+            format!(
+                "$lookup's pipeline form holds the whole of `{from}`, which has more than {max} \
+             documents, the pipeline limit. Join on a key with localField and foreignField, \
+             which holds only the documents the input names"
+            )
+        },
+    )?;
 
     // A leading `$match` that reads no `let` variable is applied once, before the
     // loop, and its errors are the request's, as they always were. One that does
@@ -2414,34 +2420,32 @@ fn graph_lookup(
     if input.is_empty() {
         return Ok(input);
     }
-    let mut foreign: Vec<bson::Document> = Vec::new();
+    // The foreign side, narrowed by `restrictSearchWithMatch` as it is read, and refused
+    // at the first admitted document past the ceiling: a restriction that would raise
+    // further on is never reached.
+    let foreign = read_foreign(
+        state,
+        &foreign_meta,
+        limits,
+        |doc| match &spec.restrict {
+            Some(restrict) => Ok(filter::matches(restrict, doc)?),
+            None => Ok(true),
+        },
+        |max| {
+            format!(
+                "$graphLookup reads `{}` whole, and the search can reach more than {max} of its \
+                 documents, the pipeline limit. Narrow it with restrictSearchWithMatch",
+                spec.from
+            )
+        },
+    )?;
     let mut table: std::collections::HashMap<Vec<u8>, Vec<usize>> =
         std::collections::HashMap::new();
-    let mut restrict_error = None;
-    kimmy_storage::blocking(|| {
-        state.engine.for_each_doc(&foreign_meta, kimmy_storage::WalkScope::Request, |_id, doc| {
-            if let Some(restrict) = &spec.restrict {
-                match filter::matches(restrict, &doc) {
-                    Ok(true) => {}
-                    Ok(false) => return Ok(true),
-                    Err(e) => {
-                        restrict_error = Some(e);
-                        return Ok(false);
-                    }
-                }
-            }
-            let at = foreign.len();
-            for key in join_keys(&doc, &spec.connect_to) {
-                table.entry(key).or_default().push(at);
-            }
-            foreign.push(doc);
-            Ok(true)
-        })
-    })?;
-    if let Some(e) = restrict_error {
-        return Err(e.into());
+    for (at, doc) in foreign.iter().enumerate() {
+        for key in link_keys(doc, &spec.connect_to) {
+            table.entry(key).or_default().push(at);
+        }
     }
-    aggregate::check_limit("$graphLookup", foreign.len(), limits)?;
 
     let mut held = 0usize;
     let mut out = Vec::with_capacity(input.len());
@@ -2454,7 +2458,12 @@ fn graph_lookup(
             if let bson::Bson::Array(items) = &start {
                 values.extend(items.iter());
             }
-            frontier = values.into_iter().filter_map(encode_key).collect();
+            // A `null` starts nothing, in an array as alone.
+            frontier = values
+                .into_iter()
+                .filter(|v| !matches!(v, bson::Bson::Null | bson::Bson::Undefined))
+                .filter_map(encode_key)
+                .collect();
             frontier.sort_unstable();
             frontier.dedup();
         }
@@ -2476,7 +2485,7 @@ fn graph_lookup(
             for &at in &found {
                 visited.insert(at);
                 reached.push((at, depth));
-                for key in join_keys(&foreign[at], &spec.connect_from) {
+                for key in link_keys(&foreign[at], &spec.connect_from) {
                     if searched.insert(key.clone()) {
                         next.push(key);
                     }
@@ -2495,8 +2504,8 @@ fn graph_lookup(
         let joined = reached.into_iter().map(|(at, depth)| {
             let mut copy = foreign[at].clone();
             if let Some(field) = &spec.depth_field {
-                // Written with the stage's own path rules, as `$lookup`'s `as` is.
-                let _ = kimmy_query::path::set(&mut copy, field, bson::Bson::Int64(depth as i64));
+                // A name of one field (a path is refused when the stage is parsed).
+                copy.insert(field.clone(), bson::Bson::Int64(depth as i64));
             }
             bson::Bson::Document(copy)
         });
@@ -2504,6 +2513,64 @@ fn graph_lookup(
         out.push(doc);
     }
     Ok(out)
+}
+
+/// A foreign collection read whole, in one walk, for a join that holds it (ADR-153).
+///
+/// `admit` narrows it as it is read (a document it declines is not held and does not
+/// count); the walk **stops at the first admitted document past the pipeline's
+/// ceiling** and the request is refused with `refused(max)`, so a collection far over it
+/// is not read to its end first, and an `admit` that would raise further on is never
+/// reached. An error from `admit` is the request's.
+fn read_foreign(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    limits: &aggregate::Limits,
+    mut admit: impl FnMut(&bson::Document) -> Result<bool, ApiError>,
+    refused: impl FnOnce(usize) -> String,
+) -> Result<Vec<bson::Document>, ApiError> {
+    let max = limits.max_documents;
+    let mut foreign: Vec<bson::Document> = Vec::new();
+    let mut failure = None;
+    let mut over = false;
+    kimmy_storage::blocking(|| {
+        state.engine.for_each_doc(meta, kimmy_storage::WalkScope::Request, |_id, doc| {
+            match admit(&doc) {
+                Ok(true) => {}
+                Ok(false) => return Ok(true),
+                Err(e) => {
+                    failure = Some(e);
+                    return Ok(false);
+                }
+            }
+            if foreign.len() >= max {
+                over = true;
+                return Ok(false);
+            }
+            foreign.push(doc);
+            Ok(true)
+        })
+    })?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    if over {
+        return Err(kimmy_core::Error::Limit(refused(max)).into());
+    }
+    Ok(foreign)
+}
+
+/// The keys a document links under at `field`, [`join_keys`] without the `null` and
+/// undefined ones: a `null` link follows nothing, and nothing is filed under it.
+fn link_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = aggregate::join_values(doc, field)
+        .into_iter()
+        .filter(|v| !matches!(v, bson::Bson::Null | bson::Bson::Undefined))
+        .filter_map(encode_key)
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// What a `$lookup` execution knows about its variable-reading leading `$match`.
@@ -3615,6 +3682,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["documents"].as_array().unwrap().len(), 4);
+    }
+
+    /// A document filed under two keys, reached by one and linking to the other, is in the
+    /// answer once: a walk visits each document once.
+    #[test]
+    fn a_graph_lookup_reaches_each_document_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_docs(
+            &state,
+            "nodes",
+            vec![
+                bson::doc! { "_id": 1, "keys": ["a", "b"], "next": "b" },
+                bson::doc! { "_id": 2, "keys": ["c"], "next": ["a", "b", "c"] },
+                bson::doc! { "_id": 3, "keys": ["start"], "next": "a" },
+            ],
+        );
+        let pipeline = json!([{ "$match": { "_id": 3 } },
+            { "$graphLookup": { "from": "nodes", "startWith": "start", "connectFromField": "next",
+                                "connectToField": "keys", "as": "up", "maxDepth": 10,
+                                "depthField": "d" } }]);
+        let out = agg(&state, &superuser(), "app", "nodes", &pipeline).unwrap();
+        let reached: Vec<(i64, i64)> = out["documents"][0]["up"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| (d["_id"].as_i64().unwrap(), d["d"].as_i64().unwrap()))
+            .collect();
+        // 3 is reached by "start"; its link "a" reaches 1 (also filed under "b", which its
+        // own link follows to 1 again); 2 is reached by nothing here.
+        assert_eq!(reached, vec![(3, 0), (1, 1)]);
+    }
+
+    /// A `null` start, an array holding one, and a `null` link follow nothing.
+    #[test]
+    fn a_graph_lookup_follows_no_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_docs(
+            &state,
+            "n",
+            vec![
+                bson::doc! { "_id": 1, "key": bson::Bson::Null, "link": bson::Bson::Null },
+                bson::doc! { "_id": 2, "key": "x", "link": [bson::Bson::Null, "y"] },
+                bson::doc! { "_id": 3, "key": "y" },
+                bson::doc! { "_id": 4 },
+            ],
+        );
+        let run = |start: Value| {
+            let pipeline = json!([{ "$match": { "_id": 4 } },
+                { "$addFields": { "s": start } },
+                { "$graphLookup": { "from": "n", "startWith": "$s", "connectFromField": "link",
+                                    "connectToField": "key", "as": "up", "maxDepth": 10 } }]);
+            let out = agg(&state, &superuser(), "app", "n", &pipeline).unwrap();
+            out["documents"][0]["up"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["_id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(json!(null)), Vec::<i64>::new());
+        assert_eq!(run(json!([null])), Vec::<i64>::new(), "the null documents are not found by it");
+        assert_eq!(run(json!([null, "x"])), vec![2, 3], "and the null link of 2 is not followed");
+    }
+
+    /// The foreign side is read up to the ceiling and no further: a `restrictSearchWithMatch`
+    /// that would raise on a later document is never reached, in `$graphLookup` and in a
+    /// `$lookup` pipeline.
+    #[test]
+    fn a_foreign_collection_over_the_ceiling_is_not_read_to_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        // Documents in `_id` order; the last holds a string where the filter wants a number.
+        let mut docs: Vec<bson::Document> =
+            (0..10).map(|i| bson::doc! { "_id": i, "n": i }).collect();
+        docs.push(bson::doc! { "_id": 10, "n": "text" });
+        seed_docs(&state, "big", docs);
+        seed_docs(&state, "one", vec![bson::doc! { "_id": 1, "k": 1 }]);
+        let three = aggregate::Limits { max_documents: 3 };
+        let graph = json!([{ "$graphLookup": { "from": "big", "startWith": "$k",
+            "connectFromField": "n", "connectToField": "n", "as": "up", "maxDepth": 1,
+            "restrictSearchWithMatch": { "$expr": { "$gt": [{ "$add": ["$n", 1] }, 0] } } } }]);
+        let err = agg_limits(&state, &superuser(), "app", "one", &graph, three)
+            .expect_err("eleven documents under a ceiling of three");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("$graphLookup reads `big` whole")
+                && text.contains("restrictSearchWithMatch"),
+            "{text}"
+        );
+        assert!(!text.contains("$add needs numbers"), "the restriction was reached: {text}");
+        let lookup = json!([{ "$lookup": { "from": "big", "let": { "k": "$k" },
+            "pipeline": [{ "$match": { "$expr": { "$eq": ["$n", "$$k"] } } }], "as": "j" } }]);
+        let err = agg_limits(&state, &superuser(), "app", "one", &lookup, three)
+            .expect_err("the pipeline form holds the whole collection");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("$lookup's pipeline form holds the whole of `big`")
+                && text.contains("localField and foreignField"),
+            "{text}"
+        );
+        // Under the ceiling both still run.
+        let roomy = aggregate::Limits { max_documents: 100 };
+        assert!(agg_limits(&state, &superuser(), "app", "one", &lookup, roomy).is_ok());
     }
 
     /// The ceiling counts what a join attaches, in all, before any is copied
