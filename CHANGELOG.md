@@ -22,6 +22,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 **Added:** the `$bucket` and `$bucketAuto` aggregation stages ([ADR-254](docs/decisions.md#adr-254--the-facet-bucket-bucketauto-and-graphlookup-stages)). `$bucket` counts documents into the ranges `[b_i, b_i+1)` of `boundaries` (constants of one kind, strictly ascending; anything else is `400`) and answers only the ranges that received one, in boundary order; a value in no range is refused unless there is a `default` (below the first boundary or at or above the last), which takes every such value and is answered last. `$bucketAuto` sorts by the value and cuts it into at most `buckets` runs of about equal size, never splitting a value, as `{_id: {min, max}}`. Both take the `$group` accumulators as `output` (`count` by default). `$bucketAuto` `granularity` is refused.
 
+**Added:** the `$graphLookup` aggregation stage ([ADR-254](docs/decisions.md#adr-254--the-facet-bucket-bucketauto-and-graphlookup-stages)): for each document, the documents of another collection reached by following `connectFromField` into `connectToField` from `startWith`, each once, attached as an array. **`maxDepth` is required** (0 to 1000) and is the only thing that ends a walk early; `depthField` records the step, `restrictSearchWithMatch` narrows the foreign side. The foreign collection is held whole and what the walks reach is held with the input, both against the pipeline's document limit and refused when over, never cut off. The collection named by `from` needs read access, as a `$lookup`'s does.
+
 ## 0.55.0 - 2026-10-26
 
 **Read before upgrading: 0.55.0 opens a store and a backup 0.54.0 wrote, with no wipe. Stop every member and start them all on 0.55.0.**

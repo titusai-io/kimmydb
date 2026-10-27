@@ -108,6 +108,11 @@ fn collect_foreign<'a>(stages: &'a [Stage], out: &mut Vec<&'a str>) {
                 collect_foreign(sub, out);
             }
         }
+        if let Stage::GraphLookup(spec) = stage
+            && !out.contains(&spec.from.as_str())
+        {
+            out.push(&spec.from);
+        }
         if let Stage::Facet(facets) = stage {
             for (_, sub) in facets {
                 collect_foreign(sub, out);
@@ -205,6 +210,19 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
         }
         // Only ever first, where it is the source; described here for completeness.
         Stage::VectorSearch(_) => "ranks the vector index; a source, only ever first".into(),
+        Stage::GraphLookup(spec) => {
+            out["from"] = json!(spec.from);
+            out["as"] = json!(spec.as_field);
+            out["runs"] = json!("foreignScan");
+            out["maxDepth"] = json!(spec.max_depth);
+            out["connectFromField"] = json!(spec.connect_from);
+            out["connectToField"] = json!(spec.connect_to);
+            out["readsForeign"] = json!("once per execution of the stage");
+            "scans the foreign collection once, files it in memory by connectToField and walks \
+             it per input document, each document at most once; what is reached counts against \
+             the pipeline's document limit"
+                .into()
+        }
         Stage::Bucket { boundaries, default, .. } => {
             out["boundaries"] = json!(boundaries.len());
             out["default"] = json!(default.is_some());
