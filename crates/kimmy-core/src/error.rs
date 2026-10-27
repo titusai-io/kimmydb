@@ -70,6 +70,12 @@ pub enum Error {
     #[error("the document is {bytes} bytes, over the {max} byte limit a document may have")]
     DocumentTooLarge { bytes: usize, max: usize },
 
+    /// A stage's answer is one document of `bytes` bytes, over the `max` a document
+    /// may have, and is refused rather than cut short. `what` names the answer and
+    /// `remedy` says how to ask for less.
+    #[error("the {what} is {bytes} bytes, over the {max} byte limit of one document; {remedy}")]
+    AnswerTooLarge { what: &'static str, bytes: usize, max: usize, remedy: &'static str },
+
     /// A client write names an `_id` of `bytes` bytes, over the `max` an `_id`
     /// may have (ADR-250). `kind` says which sort of id; the id itself is not
     /// repeated.
@@ -168,6 +174,7 @@ impl Error {
             | Error::InvalidName { .. }
             | Error::InvalidUpdate(_)
             | Error::DocumentTooLarge { .. }
+            | Error::AnswerTooLarge { .. }
             | Error::IdTooLarge { .. }
             | Error::ResumeTokenExpired
             | Error::MalformedResumeToken
@@ -221,6 +228,7 @@ impl Error {
             | Error::InvalidName { .. }
             | Error::InvalidUpdate(_)
             | Error::DocumentTooLarge { .. }
+            | Error::AnswerTooLarge { .. }
             | Error::IdTooLarge { .. }
             | Error::UnsupportedOperator { .. }
             | Error::ResumeTokenExpired

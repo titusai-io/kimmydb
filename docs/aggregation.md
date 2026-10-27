@@ -86,8 +86,10 @@ in is not answered.
   or above the last (not inside), and which takes every such value and also a
   `null`, a missing field and a value of another kind than the boundaries'. The
   `default` bucket is answered last, with `_id` the `default`.
-- `output` is a non-empty document of accumulators; a key the stage does not
-  define (`buckets`, `granularity`) is `400`.
+- `output` is a non-empty document of accumulators and **may not name `_id`**
+  (`400`: it is the bucket's key); a key the stage does not define (`buckets`,
+  `granularity`) is `400`. A `default` is a constant like a boundary: one beginning
+  with `$` is `400`.
 
 **`$bucketAuto`** sorts the documents by `groupBy` (the order `$sort` uses) and
 cuts them into `buckets` runs of about equal size:
@@ -132,20 +134,26 @@ rows). Over an empty input every facet runs over nothing: `$count` still answers
   one answers the input as it is). Any stage but the two below, `$lookup` among them
   (authorized like any other), and a `$lookup` `let` name is readable inside.
 - **Refused, `400`, at parse**: a `$facet` inside a facet, and a `$vectorSearch`
-  inside one (it is a pipeline's source, and a facet's source is the stage's input);
-  no facets; more than 64; a name that is empty, starts with `$` or holds a `.`
-  (it becomes a field of the answer); a facet that is not an array of stage
+  inside one at any depth, a `$lookup` sub-pipeline of one included (a `$vectorSearch`
+  is a pipeline's source, and a facet's source is the stage's input);
+  no facets; more than 64; a name that is empty, starts with `$` or holds a `.` or a
+  NUL (it becomes a field of the answer); a facet that is not an array of stage
   documents. A stage that is wrong inside a facet is refused as it is anywhere.
 - **Bounded, and refused when over, never cut short.** The facets' outputs together
   count against the pipeline's document limit (100,000), because they are held while
   the next facet runs; and the answer is one document, so it may not encode to more
-  than a stored document may (16 MiB), `413`. A pipeline that needs more takes the
-  facets as separate requests, or narrows each with `$limit` and `$project`.
+  than a stored document may (16 MiB), `413`. The size is counted as each facet
+  finishes and the request is refused at the first document that passes it, so a
+  later facet does not run for an answer that cannot be returned (one document that
+  holds a whole facet, a `$group` with `$push: "$$ROOT"`, counts for its bytes, not
+  for one). A pipeline that needs more takes the facets as separate requests, or
+  narrows each with `$limit` and `$project`.
 - **`$$NOW` is the same date in every facet**: it is read once when the pipeline is
   parsed. A facet that fails fails the request.
-- **Each facet reads its input once, in turn.** The input is copied for every facet
-  but the last, so a `$facet` costs about its facets' number of times the input
-  held in memory transiently; put the `$match` that narrows it before the `$facet`.
+- **Facets run one after the other.** One copy of the input is alive while a facet
+  runs (the last facet takes the input itself), and the outputs of the facets that
+  finished are held, up to the limits above; put the `$match` that narrows the input
+  before the `$facet`.
 
 ### `$project`
 

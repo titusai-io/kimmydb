@@ -987,7 +987,7 @@ impl From<CoreError> for ApiError {
             }
             // The same 413 as a body over the ceiling, for the same reason: what was
             // sent is too big, and sending it again changes nothing.
-            CoreError::DocumentTooLarge { .. } => ApiError::new(
+            CoreError::DocumentTooLarge { .. } | CoreError::AnswerTooLarge { .. } => ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorCode::DocumentTooLarge,
                 e.to_string(),

@@ -40,12 +40,23 @@ fn bucket_counts_each_range_and_names_it_by_its_lower_boundary() {
 
 #[test]
 fn a_range_includes_its_lower_boundary_and_excludes_its_upper() {
+    // The documents each range took, by `_id`: 9 and 10 are on either side of the boundary
+    // 10, and 19 and 20 of 20, so a lower bound that excluded or an upper bound that
+    // included would move one of them.
     let out = run(
-        doc! {"$bucket": {"groupBy": "$price", "boundaries": [10, 20], "default": "other"}},
-        prices(&[9, 10, 19, 20]),
+        doc! {"$bucket": {"groupBy": "$price", "boundaries": [0, 10, 20], "default": "other",
+        "output": {"ids": {"$push": "$_id"}}}},
+        prices(&[0, 9, 10, 19, 20, 25, -1]),
     )
     .unwrap();
-    assert_eq!(out, vec![doc! {"_id": 10, "count": 2i64}, doc! {"_id": "other", "count": 2i64}]);
+    assert_eq!(
+        out,
+        vec![
+            doc! {"_id": 0, "ids": [0, 1]},
+            doc! {"_id": 10, "ids": [2, 3]},
+            doc! {"_id": "other", "ids": [4, 5, 6]},
+        ]
+    );
 }
 
 #[test]
@@ -314,10 +325,14 @@ fn the_bucket_count_is_held_to_the_pipeline_ceiling() {
         aggregate::parse(&[doc! {"$bucketAuto": {"groupBy": "$price", "buckets": 10}}]).unwrap();
     let err =
         aggregate::apply(&stages[0], prices(&[1, 2, 3, 4, 5]), &limits).unwrap_err().to_string();
+    // Counted as the buckets are made: the fourth is the first over.
     assert!(
-        err.contains("$bucketAuto produced 5 documents, over the pipeline limit of 3"),
+        err.contains("$bucketAuto produced 4 documents, over the pipeline limit of 3"),
         "{err}"
     );
+    // Asking for many buckets of few documents is not what is counted.
+    let wide = aggregate::apply(&stages[0], prices(&[1, 1, 1, 1, 1]), &limits).unwrap();
+    assert_eq!(wide.len(), 1);
     let stages = aggregate::parse(&[
         doc! {"$bucket": {"groupBy": "$price", "boundaries": [0, 1, 2, 3, 4, 5, 6], "default": 9}},
     ])
@@ -339,4 +354,43 @@ fn a_bucket_stage_inside_a_facet_runs() {
     .unwrap();
     assert_eq!(out[0].get_array("hist").unwrap().len(), 2);
     assert_eq!(out[0].get_array("auto").unwrap().len(), 2);
+}
+
+#[test]
+fn an_output_field_named_id_is_refused_in_both_stages() {
+    for stage in ["$bucket", "$bucketAuto"] {
+        let mut spec = doc! {"groupBy": "$p", "output": {"_id": {"$sum": 1}}};
+        if stage == "$bucket" {
+            spec.insert("boundaries", vec![0, 10]);
+        } else {
+            spec.insert("buckets", 2);
+        }
+        let message = refused(doc! {stage: spec});
+        assert!(
+            message.contains("cannot name `_id`") && message.contains(stage),
+            "{stage}: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_default_beginning_with_a_dollar_is_refused_as_a_boundary_is() {
+    let message =
+        refused(doc! {"$bucket": {"groupBy": "$p", "boundaries": [0, 10], "default": "$other"}});
+    assert!(message.contains("`default` is a constant"), "{message}");
+    assert!(
+        aggregate::parse(&[
+            doc! {"$bucket": {"groupBy": "$p", "boundaries": [0, 10], "default": "other"}}
+        ])
+        .is_ok()
+    );
+}
+
+#[test]
+fn the_buckets_error_names_a_number_by_its_value_and_anything_else_by_its_type() {
+    let message = |b: Bson| refused(doc! {"$bucketAuto": {"groupBy": "$p", "buckets": b}});
+    assert!(message(Bson::Int32(0)).contains("found 0"));
+    assert!(message(Bson::Int32(-2)).contains("found -2"));
+    assert!(message(Bson::String("3".into())).contains("found a string"));
+    assert!(message(Bson::Double(1.5)).contains("found a double"));
 }
