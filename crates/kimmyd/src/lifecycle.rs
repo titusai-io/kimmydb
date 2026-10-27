@@ -1048,10 +1048,15 @@ mod tests {
         assert!(dir.path().join(PREVIOUS_FILE).exists(), "set aside until serving");
         settle(dir.path());
         assert!(!dir.path().join(PREVIOUS_FILE).exists(), "and gone once serving");
-        assert_eq!(
-            previous_run(dir.path(), &db),
-            PreviousRun::Unclean { last_write_secs_ago: Some(0), before: None }
-        );
+        // The marker is gone, so this end reads as unclean. The database file's age is
+        // the clock's, and a loaded host stretches the test past any one second, so it
+        // is read as an age and not as the second it was written in.
+        match previous_run(dir.path(), &db) {
+            PreviousRun::Unclean { last_write_secs_ago: Some(secs), before: None } => {
+                assert!(secs < 60, "{secs}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
