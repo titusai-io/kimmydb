@@ -10542,7 +10542,7 @@ async fn an_unknown_pipeline_stage_is_a_bad_request() {
         .post(
             "/v1/db/shop/coll/orders/aggregate",
             Some(&token),
-            json!({"pipeline": [{"$bucketAuto": {}}]}),
+            json!({"pipeline": [{"$merge": {}}]}),
         )
         .await;
     // 400, not 501: an unknown stage is the same class as an unknown filter
@@ -10551,7 +10551,7 @@ async fn an_unknown_pipeline_stage_is_a_bad_request() {
     // like `coordinated` unique enforcement.
     assert_eq!(res.status, 400, "{:?}", res.body);
     let body = format!("{:?}", res.body);
-    assert!(body.contains("$bucketAuto"), "the error must name what was rejected: {body}");
+    assert!(body.contains("$merge"), "the error must name what was rejected: {body}");
     assert!(body.contains("$group"), "and list what is supported: {body}");
 }
 

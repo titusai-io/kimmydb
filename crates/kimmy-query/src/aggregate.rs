@@ -2729,8 +2729,8 @@ mod tests {
 
     #[test]
     fn an_unknown_stage_names_what_is_supported() {
-        let err = parse(&[doc! {"$bucketAuto": {}}]).unwrap_err().to_string();
-        assert!(err.contains("$bucketAuto"), "{err}");
+        let err = parse(&[doc! {"$merge": {}}]).unwrap_err().to_string();
+        assert!(err.contains("$merge"), "{err}");
         assert!(err.contains("$group"), "the error should list what does work: {err}");
     }
 
@@ -3096,13 +3096,13 @@ mod tests {
 
     #[test]
     fn the_unsupported_stage_message_lists_vector_search() {
-        let err = parse(&[doc! {"$bucket": {}}]).unwrap_err().to_string();
+        let err = parse(&[doc! {"$out": "x"}]).unwrap_err().to_string();
         assert!(err.contains("$vectorSearch"), "{err}");
     }
 
     #[test]
     fn the_unsupported_stage_message_lists_the_new_stages() {
-        let err = parse(&[doc! {"$bucket": {}}]).unwrap_err().to_string();
+        let err = parse(&[doc! {"$out": "x"}]).unwrap_err().to_string();
         assert!(err.contains("$addFields"), "got: {err}");
         assert!(err.contains("$replaceRoot"), "got: {err}");
     }
