@@ -777,12 +777,29 @@ thread_local! {
 /// Opening one while another is open joins it, as [`crate::filter::RegexBudget`]
 /// does, so a filter parsed inside a pipeline shares the pipeline's date. Only
 /// the outermost closes it. A `$$NOW` parsed with no clock open reads its own.
-pub(crate) struct RequestClock {
+pub struct RequestClock {
     outermost: bool,
 }
 
+thread_local! {
+    /// Clock reads made by [`RequestClock`] on this thread, for the tests that hold a
+    /// request to one.
+    static CLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times a `$$NOW` parse has read the wall clock on this thread: **one per
+/// request**, which is what makes `$$NOW` one date. For tests, which read it before
+/// and after a parse.
+#[doc(hidden)]
+pub fn clock_reads() -> u64 {
+    CLOCK_READS.with(std::cell::Cell::get)
+}
+
 impl RequestClock {
-    pub(crate) fn open() -> Self {
+    /// Open the request's clock: every `$$NOW` parsed until the guard drops is one
+    /// date. A handler that parses more than one thing for a request (a filter, an
+    /// update and its `arrayFilters`) opens one around all of it.
+    pub fn open() -> Self {
         REQUEST_NOW.with(|now| {
             let outermost = now.get().is_none();
             if outermost {
@@ -797,13 +814,18 @@ impl RequestClock {
         REQUEST_NOW.with(|now| match now.get() {
             Some(Some(date)) => date,
             Some(None) => {
-                let date = bson::DateTime::now();
+                let date = read_clock();
                 now.set(Some(Some(date)));
                 date
             }
-            None => bson::DateTime::now(),
+            None => read_clock(),
         })
     }
+}
+
+fn read_clock() -> bson::DateTime {
+    CLOCK_READS.with(|reads| reads.set(reads.get() + 1));
+    bson::DateTime::now()
 }
 
 impl Drop for RequestClock {

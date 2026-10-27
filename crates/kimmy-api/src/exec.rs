@@ -1220,6 +1220,8 @@ pub fn update(
     update_json: &Value,
     params: WriteParams,
 ) -> Result<Value, ApiError> {
+    // One date for every `$$NOW` of the request's filter, update and `arrayFilters`.
+    let _clock = kimmy_query::expr::RequestClock::open();
     let _span = op_span("update", db, Some(coll)).entered();
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
@@ -1446,6 +1448,8 @@ pub fn find_and_modify(
     coll: &str,
     spec: FindAndModifySpec,
 ) -> Result<Value, ApiError> {
+    // One date for every `$$NOW` of the request's filter, update and `arrayFilters`.
+    let _clock = kimmy_query::expr::RequestClock::open();
     let _span = op_span("find_and_modify", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
 
@@ -3280,6 +3284,68 @@ mod tests {
         let one = aggregate::Limits { max_documents: 1 };
         let out = agg_limits(&state, &superuser(), "app", "orders", &wide, one).unwrap();
         assert_eq!(out["documents"][0]["p"].as_array().unwrap().len(), 1);
+    }
+
+    /// `$$NOW` is one date for a request (ADR-253): an update's filter, its update
+    /// and its `arrayFilters` are parsed under one reading of the clock, and so are a
+    /// findAndModify's, and an aggregate's.
+    #[test]
+    fn a_write_reads_the_clock_once_for_everything_it_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_docs(&state, "c", vec![bson::doc! { "_id": 1, "items": [{ "k": 1 }], "at": 0 }]);
+        let filter = json!({ "$expr": { "$lt": ["$at", "$$NOW"] } });
+        let array_filters = vec![
+            json!({ "a.k": 1, "$expr": { "$lt": ["$$a", "$$NOW"] } }),
+            json!({ "b.k": 2, "$expr": { "$gt": ["$$b", "$$NOW"] } }),
+        ];
+        let update_body = json!({ "$set": { "items.$[a].x": 1, "items.$[b].y": 1 } });
+
+        let before = kimmy_query::expr::clock_reads();
+        update(
+            &state,
+            &superuser(),
+            "app",
+            "c",
+            &update_body,
+            WriteParams {
+                filter: Some(filter.clone()),
+                array_filters: array_filters.clone(),
+                ..WriteParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(kimmy_query::expr::clock_reads() - before, 1, "update");
+
+        let before = kimmy_query::expr::clock_reads();
+        find_and_modify(
+            &state,
+            &superuser(),
+            "app",
+            "c",
+            FindAndModifySpec {
+                filter: Some(filter.clone()),
+                sort: None,
+                update: Some(update_body),
+                remove: false,
+                upsert: false,
+                return_document: ReturnDocument::After,
+                projection: None,
+                if_stamp: None,
+                array_filters,
+            },
+        )
+        .unwrap();
+        assert_eq!(kimmy_query::expr::clock_reads() - before, 1, "find_and_modify");
+
+        let pipeline = json!([
+            { "$match": filter },
+            { "$lookup": { "from": "c", "let": { "t": "$$NOW" },
+                           "pipeline": [{ "$addFields": { "n": "$$NOW" } }], "as": "j" } }
+        ]);
+        let before = kimmy_query::expr::clock_reads();
+        agg(&state, &superuser(), "app", "c", &pipeline).unwrap();
+        assert_eq!(kimmy_query::expr::clock_reads() - before, 1, "aggregate");
     }
 
     /// The ceiling counts what a join attaches, in all, before any is copied

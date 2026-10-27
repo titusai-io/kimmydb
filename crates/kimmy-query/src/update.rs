@@ -189,6 +189,8 @@ pub fn parse(doc: &Document) -> Result<Update> {
 /// always a misspelt identifier, and applying the update regardless would
 /// change elements the caller never selected.
 pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<Update> {
+    // One date for every `$$NOW` of the update and its `arrayFilters` (ADR-253).
+    let _clock = crate::expr::RequestClock::open();
     let has_operators = doc.keys().any(|k| k.starts_with('$'));
     let has_plain = doc.keys().any(|k| !k.starts_with('$'));
 
@@ -1120,10 +1122,10 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
         }
 
         OpKind::Pull(value) => {
-            // Pulling from a missing field is a no-op, not an error.
-            let Some(Bson::Array(items)) = current else {
-                return Ok(());
-            };
+            // Pulling from a missing field is a no-op, not an error; from a scalar it
+            // is, because the caller believes the field is an array and it is not.
+            let items = pull_target(current, "$pull", &op.path)?;
+            let Some(items) = items else { return Ok(()) };
             let kept: Vec<Bson> = items
                 .into_iter()
                 .filter(|item| canonical_cmp(item, value) != Ordering::Equal)
@@ -1132,9 +1134,7 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
         }
 
         OpKind::PullWhere(condition) => {
-            let Some(Bson::Array(items)) = current else {
-                return Ok(());
-            };
+            let Some(items) = pull_target(current, "$pull", &op.path)? else { return Ok(()) };
             let mut kept = Vec::with_capacity(items.len());
             for item in items {
                 if !filter::matches_pull_element(condition, &item)? {
@@ -1149,16 +1149,7 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             // canonical equality, so `2` removes `2.0`. Pulling from a missing
             // field is a no-op; pulling from a scalar is an error, because the
             // caller believes the field is an array and it is not.
-            let items = match current {
-                None => return Ok(()),
-                Some(Bson::Array(items)) => items,
-                Some(_) => {
-                    return Err(invalid(format!(
-                        "cannot apply $pullAll to non-array field {:?}",
-                        op.path
-                    )));
-                }
-            };
+            let Some(items) = pull_target(current, "$pullAll", &op.path)? else { return Ok(()) };
             let kept: Vec<Bson> = items
                 .into_iter()
                 .filter(|item| {
@@ -1396,6 +1387,18 @@ fn slice(items: &mut Vec<Bson>, n: i64) {
 }
 
 /// Interpret the current value as an array for the array operators.
+/// The array `$pull` and `$pullAll` take from: `None` for a missing field (a no-op),
+/// an error for a field that is not an array, because the caller believes it is one.
+fn pull_target(current: Option<Bson>, operator: &str, path: &str) -> Result<Option<Vec<Bson>>> {
+    match current {
+        None => Ok(None),
+        Some(Bson::Array(items)) => Ok(Some(items)),
+        Some(_) => Err(Error::InvalidUpdate(format!(
+            "cannot apply {operator} to non-array field {path:?}"
+        ))),
+    }
+}
+
 fn as_array(current: &Option<Bson>, path: &str) -> Result<Vec<Bson>> {
     match current {
         Some(Bson::Array(items)) => Ok(items.clone()),
@@ -3339,16 +3342,26 @@ mod tests {
     }
 
     #[test]
-    fn pull_condition_leaves_a_missing_field_alone_and_refuses_a_non_array_as_before() {
-        assert_eq!(
-            applied(doc! { "$pull": { "v": { "$gte": 1 } } }, doc! { "b": 1 }),
-            doc! { "b": 1 }
-        );
-        // As an equality `$pull` does today, a scalar field is left alone.
-        assert_eq!(
-            applied(doc! { "$pull": { "v": { "$gte": 1 } } }, doc! { "v": 5 }),
-            doc! { "v": 5 }
-        );
+    fn pull_leaves_a_missing_field_alone_and_refuses_a_non_array_in_both_forms() {
+        for operand in [bson::Bson::Document(doc! { "$gte": 1 }), bson::Bson::Int32(5)] {
+            assert_eq!(
+                applied(doc! { "$pull": { "v": operand.clone() } }, doc! { "b": 1 }),
+                doc! { "b": 1 },
+                "a missing field is a no-op"
+            );
+            for stored in [bson::Bson::Int32(5), bson::Bson::String("x".into()), bson::Bson::Null] {
+                let message = apply_err(
+                    doc! { "$pull": { "v": operand.clone() } },
+                    doc! { "v": stored.clone() },
+                );
+                assert_eq!(
+                    message, "invalid update: cannot apply $pull to non-array field \"v\"",
+                    "{operand} on {stored}"
+                );
+            }
+        }
+        let message = apply_err(doc! { "$pullAll": { "v": [1] } }, doc! { "v": 5 });
+        assert_eq!(message, "invalid update: cannot apply $pullAll to non-array field \"v\"");
     }
 
     #[test]

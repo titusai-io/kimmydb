@@ -599,3 +599,66 @@ fn remove_read_as_a_value_is_null() {
     let stages = add_fields(&[doc! {"$replaceRoot": {"newRoot": "$$REMOVE"}}]);
     assert!(aggregate::apply(&stages[0], vec![doc! {"a": 1}], &Limits::default()).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// One clock read per request
+// ---------------------------------------------------------------------------
+
+/// The reads of the wall clock the closure's parses make.
+fn reads(parse: impl FnOnce()) -> u64 {
+    let before = crate::expr::clock_reads();
+    parse();
+    crate::expr::clock_reads() - before
+}
+
+#[test]
+fn a_pipeline_reads_the_clock_once_however_many_places_name_now() {
+    let pipeline = [
+        doc! {"$match": {"$expr": {"$lt": ["$at", "$$NOW"]}}},
+        doc! {"$addFields": {"a": "$$NOW"}},
+        doc! {"$lookup": {
+            "from": "x", "let": {"t": "$$NOW"},
+            "pipeline": [
+                {"$match": {"$expr": {"$lt": ["$at", "$$NOW"]}}},
+                {"$lookup": {"from": "y", "pipeline": [{"$addFields": {"deep": "$$NOW"}}], "as": "z"}},
+            ],
+            "as": "j",
+        }},
+    ];
+    assert_eq!(reads(|| drop(aggregate::parse(&pipeline).unwrap())), 1);
+    // A pipeline that never names it does not read the clock at all.
+    assert_eq!(reads(|| drop(aggregate::parse(&[doc! {"$limit": 1}]).unwrap())), 0);
+}
+
+#[test]
+fn an_update_its_array_filters_and_its_filter_read_the_clock_once() {
+    let update = doc! {"$set": {"items.$[a].x": 1, "items.$[b].y": 1},
+    "$pull": {"tags": {"$elemMatch": {"$expr": {"$lt": ["$$ROOT", "$$NOW"]}}}}};
+    let filters = vec![
+        doc! {"a.at": {"$lt": 5}, "$expr": {"$lt": ["$$a", "$$NOW"]}},
+        doc! {"$expr": {"$gt": ["$$b", "$$NOW"]}},
+    ];
+    assert_eq!(
+        reads(|| drop(crate::update::parse_with_filters(&update, &filters).unwrap())),
+        1,
+        "the update, its arrayFilters and a $pull condition"
+    );
+    // And a handler that parses the filter beside it joins them with its own clock.
+    let one = reads(|| {
+        let _clock = crate::expr::RequestClock::open();
+        filter::parse(&doc! {"$expr": {"$lt": ["$at", "$$NOW"]}}).unwrap();
+        crate::update::parse_with_filters(&update, &filters).unwrap();
+    });
+    assert_eq!(one, 1);
+}
+
+#[test]
+fn every_now_of_a_request_is_the_same_date_across_parses_that_share_a_clock() {
+    let _clock = crate::expr::RequestClock::open();
+    let first = Expr::parse(&Bson::String("$$NOW".into())).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = crate::filter::parse(&doc! {"$expr": {"$lt": ["$at", "$$NOW"]}}).unwrap();
+    let third = Expr::parse(&Bson::String("$$NOW".into())).unwrap();
+    assert_eq!(first, third);
+    drop(second);
+}
