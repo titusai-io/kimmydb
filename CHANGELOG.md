@@ -10,7 +10,9 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.56.0 - 2026-10-27
+
+**Read before upgrading: 0.56.0 opens a store and a backup 0.55.0 wrote, with no wipe. Stop every member and start them all on 0.56.0.**
 
 **Added:** the math operators `$abs`, `$ceil`, `$floor`, `$round`, `$trunc`, `$pow`, `$sqrt`, `$exp`, `$ln` and `$log10` in an expression, for `Int32`, `Int64`, double and `Decimal128` ([ADR-253](docs/decisions.md#adr-253--math-operators-now-and-remove-bit-the-bits-query-operators-and-pull-with-a-condition)). `$round` rounds half to even; `$round` and `$trunc` take a place from -20 to 100 (a negative place rounds to tens, hundreds, and so on); a decimal result is rounded once to 34 digits, and `$round` and `$trunc` of a decimal give exponent `-place`; an integer stays an integer while it fits `Int64`. `$sqrt` of a negative number, `$ln` and `$log10` of zero or less, `0` to a negative power and a negative base to a power that is not a whole number are `400`, never a `NaN`. A double's `$sqrt`, `$exp`, `$ln`, `$log10` and non-integer `$pow` come from the platform's math library, so their last digit can differ between architectures; a `Decimal128` result is the same bytes everywhere. `$$NOW` and `$$REMOVE` are system variables: `$$NOW` is one date for the whole request, read from the clock of the member that runs it, the same in every stage and sub-pipeline; `$$REMOVE` as the value of a field in `$project`, `$addFields` or a built document leaves the field out, and anywhere else reads as `null`. Before this the operators did not exist, and `$$NOW` and `$$REMOVE` were refused as unsupported system variables.
 
