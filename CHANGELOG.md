@@ -10,6 +10,10 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+**Changed:** a replication pull that says what the member holds now fails after 10 s of silence from its peer, logged as `the reply to a pull timed out` and counted in `kimmy_sync_failures_total`, where it waited 30 s; a peer that answered the round's first request and then froze no longer holds the rest of the tick for half a minute. The bound is on silence, not on the frame, so a large window that keeps arriving is never cut short. Replays and snapshot pages keep 30 s ([ADR-177](docs/decisions.md)).
+
 ## 0.56.0 - 2026-10-27
 
 **Read before upgrading: 0.56.0 opens a store and a backup 0.55.0 wrote, with no wipe. Stop every member and start them all on 0.56.0.**

@@ -18616,6 +18616,27 @@ that is nearly the whole purge. The loop itself runs throughout: rounds
 complete, entries stamped before the creation still arrive, and
 `kimmy_sync_entries_skipped_total{reason="purge_pending"}` names the stop.
 
+
+**Amendment (0.57.0): the reply to an ordinary pull has ten seconds of silence, not the round's thirty.**
+The round's `REQUEST_TIMEOUT` (30 s of the peer's time) was the bound on every
+reply after the first, because a reply could wait on a walk of the oplog. That
+stopped holding for a pull that says what it holds: ADR-194's serve budget (2 s
+or 65,536 rows) ends its walk, so its answer does not wait on a long walk, and
+no pull of round 0580's 3,425 had a serve phase over 2.5 s. A peer that answers
+the first request and then freezes therefore held the round for the full thirty
+seconds, and the rounds behind it, which run one after another. The reply to
+such a pull (`AskEntries` with `held`, and the `BatchTooLarge` retry) now fails
+as `the reply to a pull` after ten seconds (`PULL_REPLY_TIMEOUT`, the
+handshake's own bound) **of silence**: ten seconds to the first byte and ten
+between the reads of a frame that has begun, never ten seconds for the frame, so
+a 64 MiB window that keeps arriving over a slow link is not cut short. A replay
+sends no `held` and walks without a budget, and a snapshot's pages are not a
+pull; both keep the round's thirty seconds. Concurrent rounds were considered
+and not built: the measured load is the single writer's apply, which concurrency
+cannot speed up, and they would fetch the same entries from several peers.
+Chris's ruling of 2026-10-27: no concurrent rounds, build this bound. If a lab
+shows a healthy pull over ten seconds under load, the number becomes fifteen.
+
 ---
 
 ## ADR-178 — A vector shadow is created at the stamp of the change that needs it, and only a client's configuration logs its creation
