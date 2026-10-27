@@ -561,6 +561,21 @@ pub fn run_facet<E: From<Error>>(
     // The bytes the answer will encode to, kept as it grows: a document header and
     // terminator, then for each facet its element and its array.
     let mut bytes = 5usize;
+    // Every increment is checked, so no part of the answer (a facet's header included,
+    // an empty facet's with a long name) can pass the cap unseen.
+    let charge = |bytes: &mut usize, n: usize| -> Result<()> {
+        *bytes += n;
+        if *bytes > kimmy_core::limits::MAX_DOCUMENT_BYTES {
+            return Err(Error::AnswerTooLarge {
+                what: "$facet answer",
+                bytes: *bytes,
+                max: kimmy_core::limits::MAX_DOCUMENT_BYTES,
+                remedy: "split the facets into separate requests, or $limit and $project \
+                         inside them",
+            });
+        }
+        Ok(())
+    };
     let mut input = Some(input);
     for (at, (name, stages)) in facets.iter().enumerate() {
         let docs = if at + 1 == facets.len() {
@@ -573,23 +588,13 @@ pub fn run_facet<E: From<Error>>(
         check_limit("$facet", held, limits)?;
         // The element (type byte, name, terminator), the array's header and terminator,
         // and each document as an element of it (type byte, decimal index, terminator).
-        bytes += 1 + name.len() + 1 + 4 + 1;
+        charge(&mut bytes, 1 + name.len() + 1 + 4 + 1)?;
         for (index, doc) in out.iter().enumerate() {
             let encoded = bson::serialize_to_vec(doc)
                 .map_err(|e| Error::Internal(format!("$facet output could not be encoded: {e}")))?;
-            bytes += 1 + index.to_string().len() + 1 + encoded.len();
             // Refused as soon as it is over, so a later facet is never run for an answer
             // that cannot be returned.
-            if bytes > kimmy_core::limits::MAX_DOCUMENT_BYTES {
-                return Err(Error::AnswerTooLarge {
-                    what: "$facet answer",
-                    bytes,
-                    max: kimmy_core::limits::MAX_DOCUMENT_BYTES,
-                    remedy: "split the facets into separate requests, or $limit and $project \
-                             inside them",
-                }
-                .into());
-            }
+            charge(&mut bytes, 1 + index.to_string().len() + 1 + encoded.len())?;
         }
         answer.insert(name.clone(), Bson::Array(out.into_iter().map(Bson::Document).collect()));
     }
