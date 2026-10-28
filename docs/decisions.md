@@ -28585,6 +28585,8 @@ The tests are listed with the pieces above, and [every mutation row with the tes
 
 Documents, queries, sorts and unique indexes behave by value. A `Decimal128` is indexable and can be an `_id`. Two equal values of different types collide in a unique index. `Decimal128("0.1")` is not `Double(0.1)`, and a filter that relied on a stored decimal ranking equal to every number returns different documents. The first start of 0.51.0 migrates before it serves, which takes time proportional to the documents and indexes plus the oplog walk, and needs free space. Once a `Decimal128` `_id` exists a member cannot be rolled back by wipe and resync.
 
+**Addendum, 0.57.0:** `num-rational` is dropped (Chris, 2026-10-28): it has no release on `num-bigint` 0.5. The oracle has its own exact `Rational`, a numerator over a positive denominator compared by cross-multiplication, and `num-bigint` is 0.5. Both are still test-only, so no product dependency changes.
+
 ---
 
 ## ADR-239 — A vector chunk id is an injective encoding of the source `_id`, keeping the 0.50 form where it was unambiguous
