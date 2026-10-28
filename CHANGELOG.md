@@ -12,7 +12,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
-**Changed:** a replication pull that says what the member holds now fails after 10 s of silence from its peer, logged as `the reply to a pull timed out` and counted in `kimmy_sync_failures_total`, where it waited 30 s; a peer that answered the round's first request and then froze no longer holds the rest of the tick for half a minute. The bound is on silence, not on the frame, so a large window that keeps arriving is never cut short. Replays and snapshot pages keep 30 s ([ADR-177](docs/decisions.md)).
+**Changed:** a replication round now fails after 10 s of silence from its peer on the reply to an ordinary pull (a request that says what the member holds) and on the reply to the divergence check, logged as `the reply to a pull timed out` and `the reply to the divergence check timed out` and counted in `kimmy_sync_failures_total`, where each waited the round's 30 s. A peer that answered the round's first request and then froze no longer holds the rest of the tick for half a minute. The bound is on silence, not on the frame, so a large window that keeps arriving is never cut short. Replays and snapshot pages keep 30 s ([ADR-177](docs/decisions.md)).
 
 ## 0.56.0 - 2026-10-27
 

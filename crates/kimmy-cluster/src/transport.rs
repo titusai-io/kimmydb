@@ -330,36 +330,63 @@ fn first_reply_timeout() -> Duration {
     FIRST_REPLY_TIMEOUT
 }
 
-/// How long a round waits for the reply to an **ordinary pull**, `AskEntries`
-/// with `held`: the first byte of the answer, and then each read of a frame that
-/// has begun.
+/// How long a round waits, in **silence**, for the reply to a request whose serving
+/// side is bounded: the first byte of the answer, and then each read of a frame
+/// that has begun. Never the frame's whole time, so a large window that keeps
+/// arriving is not cut short.
 ///
-/// A pull that says what it holds is partial-capable (ADR-194): the serving walk
-/// ends at its 2 s or 65,536-row budget, so the answer does not wait on a long
-/// walk, and a serving member that is only busy answers in well under this (no
-/// pull of round 0580's 3,425 had a serve phase over 2.5 s). A peer that has
-/// answered the first request and then says nothing is frozen, gone or wedged,
-/// and waiting [`REQUEST_TIMEOUT`] (30 s) for it holds the rest of the tick
-/// behind it, as the first reply did before [`FIRST_REPLY_TIMEOUT`]. The bound is
-/// on the silence, never on the frame: a large window that keeps arriving is not
-/// cut short. A replay (no `held`) walks the oplog without a budget and a
-/// snapshot's pages are not a pull, so they keep [`REQUEST_TIMEOUT`].
-const PULL_REPLY_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+/// Two requests have it, after [`FIRST_REPLY_TIMEOUT`]'s `AskVersions`:
+/// - **An ordinary pull**, `AskEntries` with `held`. It is partial-capable
+///   (ADR-194): the serving walk ends at its 2 s or 65,536-row budget, so the
+///   answer does not wait on a long walk, and no pull of round 0580's 3,425 had a
+///   serve phase over 2.5 s.
+/// - **The divergence check**, `AskDivergence`. It is answered from metadata and
+///   kept counts: the collections' incarnations, the named collection's kept count
+///   (ADR-174), the cut digest under `ScanBudget::default()` (200 ms and 8 MiB,
+///   one probe at a time, a second is answered busy and not waited for) and the
+///   definition digest (one read transaction over metadata). A real-process lab
+///   (2026-10-28) found it the request every 30 s round timeout was waiting on.
+///
+/// A peer that answered the first request and then says nothing is frozen, gone or
+/// wedged, and waiting [`REQUEST_TIMEOUT`] (30 s) for it holds the rest of the tick
+/// behind it. A replay (no `held`) walks the oplog without a budget and a
+/// snapshot's pages are not a pull; they keep [`REQUEST_TIMEOUT`], as does every
+/// request not named here.
+const REPLY_SILENCE_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 
-const _: () = assert!(PULL_REPLY_TIMEOUT.as_secs() < REQUEST_TIMEOUT.as_secs());
+const _: () = assert!(REPLY_SILENCE_TIMEOUT.as_secs() < REQUEST_TIMEOUT.as_secs());
 
-/// [`PULL_REPLY_TIMEOUT`], or a test's shorter one.
-fn pull_reply_timeout() -> Duration {
+/// [`REPLY_SILENCE_TIMEOUT`], or a test's shorter one.
+fn reply_silence_timeout() -> Duration {
     #[cfg(test)]
-    if let Some(shorter) = test_hooks::PULL_REPLY.with(|t| t.get()) {
+    if let Some(shorter) = test_hooks::REPLY_SILENCE.with(|t| t.get()) {
         return shorter;
     }
-    PULL_REPLY_TIMEOUT
+    REPLY_SILENCE_TIMEOUT
 }
 
-/// The reply to an ordinary pull (`partial`: it asked with `held`), or to any other
-/// window request, which keeps the round's own limit. A silence over
-/// [`PULL_REPLY_TIMEOUT`] fails the round as `the reply to a pull`.
+/// One frame, with [`REPLY_SILENCE_TIMEOUT`] of silence: a wait that runs out
+/// fails the round as `what` timed out.
+async fn read_reply_within_silence<S>(
+    stream: &mut S,
+    what: &'static str,
+) -> Result<Message, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    let silence = reply_silence_timeout();
+    let waits = crate::protocol::FrameWaits { idle: silence, stall: silence };
+    match crate::protocol::read_frame_within(stream, waits).await {
+        Err(ProtocolError::Idle | ProtocolError::TimedOut(_)) => {
+            Err(ProtocolError::TimedOut(what.into()))
+        }
+        other => other,
+    }
+}
+
+/// The reply to an ordinary pull (`partial`: it asked with `held`), bounded by
+/// silence as `the reply to a pull`; any other window request keeps the round's own
+/// limit.
 async fn read_pull_reply<S>(stream: &mut S, partial: bool) -> Result<Message, ProtocolError>
 where
     S: AsyncRead + Unpin,
@@ -367,14 +394,16 @@ where
     if !partial {
         return read_frame(stream).await;
     }
-    let silence = pull_reply_timeout();
-    let waits = crate::protocol::FrameWaits { idle: silence, stall: silence };
-    match crate::protocol::read_frame_within(stream, waits).await {
-        Err(ProtocolError::Idle | ProtocolError::TimedOut(_)) => {
-            Err(ProtocolError::TimedOut("the reply to a pull".into()))
-        }
-        other => other,
-    }
+    read_reply_within_silence(stream, "the reply to a pull").await
+}
+
+/// The reply to the divergence check, bounded by silence as `the reply to the
+/// divergence check`.
+async fn read_divergence_reply<S>(stream: &mut S) -> Result<Message, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    read_reply_within_silence(stream, "the reply to the divergence check").await
 }
 
 /// Called on the serving side with what a pushed batch became (ADR-140), so
@@ -5864,7 +5893,7 @@ where
     )
     .await?;
     let (peer_collections, probe_count, peer_incarnations, digests, digest_busy, definitions) =
-        match read_frame(stream).await? {
+        match read_divergence_reply(stream).await? {
             Message::Divergence {
                 collections,
                 probe_count,
@@ -6429,9 +6458,8 @@ pub(crate) mod test_hooks {
         /// A shorter first-reply bound for a test that cannot wait ten seconds.
         pub static FIRST_REPLY: std::cell::Cell<Option<std::time::Duration>> =
             const { std::cell::Cell::new(None) };
-        /// A shorter bound on the reply to an ordinary pull, for a test that cannot
-        /// wait ten seconds.
-        pub static PULL_REPLY: std::cell::Cell<Option<std::time::Duration>> =
+        /// A shorter silence bound on a reply, for a test that cannot wait ten seconds.
+        pub static REPLY_SILENCE: std::cell::Cell<Option<std::time::Duration>> =
             const { std::cell::Cell::new(None) };
         /// Slept after a round's window is applied, inside the apply's time.
         pub static APPLY_TAKES: std::cell::Cell<std::time::Duration> =
@@ -12004,7 +12032,7 @@ mod tests {
     /// nothing more; with the bound at a second the round fails as `the reply to a
     /// pull` in about a second.
     #[tokio::test]
-    async fn a_peer_frozen_after_the_first_reply_fails_the_pull_on_the_pull_reply_bound() {
+    async fn a_peer_frozen_after_the_first_reply_fails_the_pull_on_the_silence_bound() {
         use tokio::io::DuplexStream;
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
@@ -12034,15 +12062,64 @@ mod tests {
 
         let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
         let peer = tokio::spawn(freezing_peer(theirs, ahead));
-        test_hooks::PULL_REPLY.with(|t| t.set(Some(Duration::from_secs(1))));
+        test_hooks::REPLY_SILENCE.with(|t| t.set(Some(Duration::from_secs(1))));
         let began = Instant::now();
         let addr: SocketAddr = "127.0.0.1:3".parse().unwrap();
         let round = sync_over(&engine, ours, addr, node(7), None, &mut PeerStalls::new()).await;
-        test_hooks::PULL_REPLY.with(|t| t.set(None));
+        test_hooks::REPLY_SILENCE.with(|t| t.set(None));
         peer.abort();
         let e = round.expect_err("nothing answers the pull");
         assert!(
             matches!(&e, ProtocolError::TimedOut(what) if what == "the reply to a pull"),
+            "{e:?}"
+        );
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+    }
+
+    /// **A peer that freezes in the middle of the divergence check costs the silence
+    /// bound, not the round's thirty seconds.** The fake peer is level with the
+    /// member, so there is no pull: it answers the first request, reads the
+    /// `AskDivergence` and says nothing more. Round 0580's lab found this the request
+    /// every 30 s round timeout was waiting on.
+    #[tokio::test]
+    async fn a_peer_frozen_in_the_divergence_check_fails_the_round_on_the_silence_bound() {
+        use tokio::io::DuplexStream;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+
+        async fn freezing_peer(mut stream: DuplexStream) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { .. } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let level = VersionVector::new();
+            let answer = Message::Vectors {
+                servable: level.clone(),
+                witnessed: level,
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+            };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskDivergence { .. } => {}
+                other => panic!("expected the divergence check, got {other:?}"),
+            }
+            std::future::pending::<()>().await;
+        }
+
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(freezing_peer(theirs));
+        test_hooks::REPLY_SILENCE.with(|t| t.set(Some(Duration::from_secs(1))));
+        let began = Instant::now();
+        let addr: SocketAddr = "127.0.0.1:4".parse().unwrap();
+        let round = sync_over(&engine, ours, addr, node(7), None, &mut PeerStalls::new()).await;
+        test_hooks::REPLY_SILENCE.with(|t| t.set(None));
+        peer.abort();
+        let e = round.expect_err("nothing answers the check");
+        assert!(
+            matches!(&e, ProtocolError::TimedOut(what) if what == "the reply to the divergence check"),
             "{e:?}"
         );
         assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
@@ -12068,7 +12145,7 @@ mod tests {
             });
             ours
         }
-        test_hooks::PULL_REPLY.with(|t| t.set(Some(Duration::from_secs(1))));
+        test_hooks::REPLY_SILENCE.with(|t| t.set(Some(Duration::from_secs(1))));
         // Inside the bound: read.
         let mut early = replies_after(Duration::from_millis(200)).await;
         assert!(read_pull_reply(&mut early, true).await.is_ok());
@@ -12081,15 +12158,24 @@ mod tests {
         );
         let mut replay = replies_after(Duration::from_millis(1_500)).await;
         assert!(read_pull_reply(&mut replay, false).await.is_ok());
-        test_hooks::PULL_REPLY.with(|t| t.set(None));
+        // The divergence check's reply has the same bound, with its own text.
+        let mut check_early = replies_after(Duration::from_millis(200)).await;
+        assert!(read_divergence_reply(&mut check_early).await.is_ok());
+        let mut check_late = replies_after(Duration::from_millis(1_500)).await;
+        let e = read_divergence_reply(&mut check_late).await.expect_err("silent past the bound");
+        assert!(
+            matches!(&e, ProtocolError::TimedOut(what) if what == "the reply to the divergence check"),
+            "{e:?}"
+        );
+        test_hooks::REPLY_SILENCE.with(|t| t.set(None));
     }
 
     /// The bound is the handshake's, shorter than the request timeout it replaces for
     /// an ordinary pull's reply.
     #[test]
     fn the_pull_reply_bound_is_the_handshakes_and_shorter_than_the_request_timeout() {
-        assert_eq!(pull_reply_timeout(), HANDSHAKE_TIMEOUT);
-        assert!(pull_reply_timeout() < REQUEST_TIMEOUT);
+        assert_eq!(reply_silence_timeout(), HANDSHAKE_TIMEOUT);
+        assert!(reply_silence_timeout() < REQUEST_TIMEOUT);
     }
 
     /// An idle two-node cluster's rounds end as rounds, not as failures. Each
