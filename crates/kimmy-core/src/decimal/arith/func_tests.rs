@@ -7,8 +7,8 @@
 
 use std::cmp::Ordering;
 
+use crate::cmp::oracle::{Rational, scaled};
 use num_bigint::{BigInt, BigUint};
-use num_rational::BigRational;
 
 use super::*;
 use crate::decimal::{MAX_COEFFICIENT, MIN_EXPONENT, arith, decode_raw, parse};
@@ -53,16 +53,9 @@ fn valid(raw: &Raw) -> bool {
 }
 
 /// The exact value of a finite `Raw`.
-fn value(raw: &Raw) -> BigRational {
+fn value(raw: &Raw) -> Rational {
     let Raw::Finite { negative, coefficient, exponent } = *raw else { panic!("finite") };
-    let c = BigInt::from(coefficient) * if negative { -1 } else { 1 };
-    let ten = BigInt::from(10);
-    let e = i32::from(exponent);
-    if e >= 0 {
-        BigRational::from_integer(c * ten.pow(e as u32))
-    } else {
-        BigRational::new(c, ten.pow((-e) as u32))
-    }
+    scaled(negative, BigInt::from(coefficient), i64::from(exponent))
 }
 
 /// `a` against `b` as numbers (an infinity is beyond every finite value): by
@@ -1024,7 +1017,12 @@ fn ceil_and_floor_agree_with_the_reference_everywhere() {
                         let exact = value(&x);
                         let integer =
                             if mode == RefMode::Ceil { exact.ceil() } else { exact.floor() };
-                        assert_eq!(value(&got), integer, "{name}({}) value", show(&x));
+                        assert_eq!(
+                            value(&got),
+                            Rational::from_integer(integer),
+                            "{name}({}) value",
+                            show(&x)
+                        );
                     }
                 }
             }
