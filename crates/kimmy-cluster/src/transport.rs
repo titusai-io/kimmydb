@@ -359,7 +359,7 @@ fn first_reply_timeout() -> Duration {
 /// keeps [`REQUEST_TIMEOUT`].
 const REPLY_SILENCE_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 
-const _: () = assert!(REPLY_SILENCE_TIMEOUT.as_secs() < REQUEST_TIMEOUT.as_secs());
+const _: () = assert!(REPLY_SILENCE_TIMEOUT.as_millis() < REQUEST_TIMEOUT.as_millis());
 
 // A served window's walk ends at its time budget, and that, twice over (the walk and
 // the wire and the requester's own scheduling), must fit inside the silence bound.
@@ -12229,8 +12229,9 @@ mod tests {
         assert!(replay.await.unwrap().is_ok(), "a replay's reply is waited for");
     }
 
-    /// The bound is the handshake's, shorter than the request timeout it replaces, and
-    /// a serving walk's budget fits inside it with room for the wire.
+    /// The bound is the handshake's, shorter than the request timeout it replaces.
+    /// That a serving walk's budget fits inside it is the const assert beside
+    /// [`REPLY_SILENCE_TIMEOUT`].
     #[test]
     fn the_silence_bound_is_the_handshakes_and_shorter_than_the_request_timeout() {
         assert_eq!(REPLY_SILENCE_TIMEOUT, HANDSHAKE_TIMEOUT);

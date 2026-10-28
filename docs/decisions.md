@@ -18657,8 +18657,9 @@ A snapshot's pages are not a pull, and the first request keeps its own ten
 seconds (the first reply); every other request keeps the round's thirty.
 Concurrent rounds were considered and not built: the measured load is the single
 writer's apply, which concurrency cannot speed up, and they would fetch the same
-entries from several peers. Chris's ruling of 2026-10-27: no concurrent rounds,
-build the bound, and extend it to the request the lab found stalled. If a lab
+entries from several peers. Chris ruled on 2026-10-27: no concurrent rounds, bound
+the ordinary pull's reply. After the lab, on 2026-10-28, Chris ruled: extend the
+bound to the request the lab found stalled (the divergence check). If a lab
 shows a healthy reply over ten seconds under load, the number becomes fifteen.
 
 ---
