@@ -18616,41 +18616,50 @@ that is nearly the whole purge. The loop itself runs throughout: rounds
 complete, entries stamped before the creation still arrive, and
 `kimmy_sync_entries_skipped_total{reason="purge_pending"}` names the stop.
 
-
-**Amendment (0.57.0): the replies to an ordinary pull and to the divergence check have ten seconds of silence, not the round's thirty.**
+**Addendum, 0.57.0: the replies to a pull that can take a partial window and to
+the divergence check have ten seconds of silence, not the round's thirty.**
 The round's `REQUEST_TIMEOUT` (30 s of the peer's time) was the bound on every
 reply after the first, because a reply could wait on a walk of the oplog. That
 holds for few requests. A peer that answers the first request and then freezes
 held the round for the full thirty seconds, and the rounds behind it, which run
-one after another. A real-process lab (observer, a healthy writer and frozen
-members, `--cpus 2` with four busy loops) first showed a bound on the pull's
-reply alone did nothing: 0 of 60 rounds failed on it. Logging each round's
-requests showed all 11 round timeouts of the next lab stalled on `AskDivergence`,
-the observer being level with the frozen peer when it froze, so no pull was
-asked. Two requests now have ten seconds (`REPLY_SILENCE_TIMEOUT`, the
-handshake's own bound) **of silence**, ten seconds to the first byte and ten
-between the reads of a frame that has begun, never ten seconds for the frame, so
-a 64 MiB window that keeps arriving over a slow link is not cut short. Each fails
-the round with its own text:
-- **An ordinary pull** (`AskEntries` with `held`, and the `BatchTooLarge` retry),
-  `the reply to a pull`. Its serving walk ends at ADR-194's budget of 2 s or 65,536
-  rows, so its answer does not wait on a long walk, and no pull of round 0580's
-  3,425 had a serve phase over 2.5 s.
+one after another. Two real-process labs with frozen members (observer, a
+healthy writer and the frozen members, `--cpus 2` with four busy loops, 2026-10-28)
+settled which requests matter. A bound on the pull's reply alone did nothing: 0 of
+60 rounds failed on it. Logging each round's requests then showed all 11 round
+timeouts of the next lab stalled on `AskDivergence`, the observer being level
+with the frozen peer when it froze, so no pull was asked. Two requests now have
+ten seconds (`REPLY_SILENCE_TIMEOUT`, the handshake's own bound) **of silence**:
+ten seconds to the first byte and ten between the reads of a frame that has
+begun. It is not a bound on the frame: a 64 MiB window that keeps arriving over a
+slow link is not cut short by it, though the round's own thirty seconds of the
+peer's time still applies. Each fails the round with its own text:
+- **A pull that can take a partial window** (ADR-194: `AskEntries` with `held` and
+  `partial`, and the `BatchTooLarge` retry), `the reply to a pull`. Its serving
+  walk ends at ADR-194's budget of 2 s or 65,536 rows, so its answer does not wait
+  on a long walk, and no pull of round 0580's 3,425 (analysed 2026-10-27) had a
+  serve phase over 2.5 s. The serve time is asserted to fit twice over inside the
+  bound. The own-origin replay also sends `held` but asks for no partial window and
+  walks without a budget: it keeps thirty seconds.
 - **The divergence check** (`AskDivergence`), `the reply to the divergence check`.
-  It is answered from metadata and kept counts: the collections' incarnations, the
-  named collection's kept count (ADR-174), the cut digest under
+  It is answered from metadata and kept counts: the collections' incarnations (in
+  `blocking`), the named collection's kept count (ADR-174), the cut digest under
   `ScanBudget::default()` (200 ms and 8 MiB, one probe at a time, a second one
   answered busy and not waited for) and the definition digest (one read
-  transaction over metadata, no scan).
+  transaction over metadata, no scan). Only the digest scan has a wall budget; the
+  rest are per-collection loops outside it, so the reply's cost is bounded by the
+  number of collections, not by a clock. Review measured about 0.4 s at 2,000
+  collections, and the lab's healthy replies (100 collections, 300 secondary
+  indexes, four busy loops on two cores) took 2.7 s at most. What remains is
+  cold metadata on slow storage, or a starved runtime, taking longer than ten
+  seconds: the round then fails and backs off, as it does for a frozen peer.
 
-A replay sends no `held` and walks without a budget, a snapshot's pages are not a
-pull, and the first request keeps its own ten seconds (the first reply); every
-other request keeps the round's thirty. Concurrent rounds were considered and not
-built: the measured load is the single writer's apply, which concurrency cannot
-speed up, and they would fetch the same entries from several peers. Chris's ruling
-of 2026-10-27: no concurrent rounds, build the bound, and extend it to the request
-the lab found stalled. If a lab shows a healthy reply over ten seconds under load,
-the number becomes fifteen.
+A snapshot's pages are not a pull, and the first request keeps its own ten
+seconds (the first reply); every other request keeps the round's thirty.
+Concurrent rounds were considered and not built: the measured load is the single
+writer's apply, which concurrency cannot speed up, and they would fetch the same
+entries from several peers. Chris's ruling of 2026-10-27: no concurrent rounds,
+build the bound, and extend it to the request the lab found stalled. If a lab
+shows a healthy reply over ten seconds under load, the number becomes fifteen.
 
 ---
 
