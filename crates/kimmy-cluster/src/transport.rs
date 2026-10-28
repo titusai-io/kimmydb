@@ -310,8 +310,9 @@ fn set_keepalive(stream: &TcpStream) {
 
 /// How long a round waits for the answer to its **first** request, `AskVersions`.
 ///
-/// The rest of a round has [`REQUEST_TIMEOUT`] (30 s) because its answers can be
-/// large and walk the oplog. This one cannot: the serving side answers it with two
+/// The rest of a round has [`REQUEST_TIMEOUT`] (30 s), because its answers can be
+/// large and walk the oplog, except the two replies [`REPLY_SILENCE_TIMEOUT`] bounds
+/// by silence. This one cannot be slow: the serving side answers it with two
 /// small read transactions over the version tables (one row per origin) and its
 /// own block from memory, behind neither the writer nor a walk. A peer that took
 /// the connection and the handshake and then does not answer it within the
@@ -328,6 +329,83 @@ fn first_reply_timeout() -> Duration {
         return shorter;
     }
     FIRST_REPLY_TIMEOUT
+}
+
+/// How long a round waits, in **silence**, for the reply to a request whose serving
+/// side is bounded: the first byte of the answer, and then each read of a frame
+/// that has begun. It is not a bound on the frame: a large window that keeps
+/// arriving is not cut short by this bound (the round's own 30 s still applies).
+///
+/// Two requests have it, after [`FIRST_REPLY_TIMEOUT`]'s `AskVersions`:
+/// - **A pull that can take a partial window** (ADR-194), `AskEntries` with `held`
+///   and `partial`. The serving walk ends at its 2 s or 65,536-row budget, so the
+///   answer does not wait on a long walk, and no pull of round 0580's 3,425 had a
+///   serve phase over 2.5 s. The own-origin replay also sends `held`, but asks for
+///   no partial window and walks without a budget: it keeps [`REQUEST_TIMEOUT`].
+/// - **The divergence check**, `AskDivergence`. It is answered from metadata and
+///   kept counts: the collections' incarnations, the named collection's kept count
+///   (ADR-174), the cut digest under `ScanBudget::default()` (200 ms and 8 MiB,
+///   one probe at a time, a second is answered busy and not waited for) and the
+///   definition digest (one read transaction over metadata). Only the digest scan
+///   has a wall budget: the rest are per-collection loops, so the reply's cost
+///   grows with the number of collections (about 0.4 s at 2,000, measured in
+///   review), and the risk that remains is cold metadata on slow storage or a
+///   starved runtime. A lab with frozen peers (2026-10-28) found it the request
+///   every 30 s round timeout was waiting on.
+///
+/// A peer that answered the first request and then says nothing is frozen, gone or
+/// wedged, and waiting [`REQUEST_TIMEOUT`] (30 s) for it holds the rest of the tick
+/// behind it. A snapshot's pages are not a pull, and every request not named here
+/// keeps [`REQUEST_TIMEOUT`].
+const REPLY_SILENCE_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+
+const _: () = assert!(REPLY_SILENCE_TIMEOUT.as_millis() < REQUEST_TIMEOUT.as_millis());
+
+// A served window's walk ends at its time budget, and that, twice over (the walk and
+// the wire and the requester's own scheduling), must fit inside the silence bound.
+const _: () = assert!(
+    kimmy_storage::ExamineBudget::SERVE_TIME.as_secs() * 2 < REPLY_SILENCE_TIMEOUT.as_secs()
+);
+
+/// One frame, with [`REPLY_SILENCE_TIMEOUT`] of silence: a wait that runs out
+/// fails the round as `what` timed out.
+async fn read_reply_within_silence<S>(
+    stream: &mut S,
+    what: &'static str,
+) -> Result<Message, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    let silence = REPLY_SILENCE_TIMEOUT;
+    let waits = crate::protocol::FrameWaits { idle: silence, stall: silence };
+    match crate::protocol::read_frame_within(stream, waits).await {
+        Err(ProtocolError::Idle | ProtocolError::TimedOut(_)) => {
+            Err(ProtocolError::TimedOut(what.into()))
+        }
+        other => other,
+    }
+}
+
+/// The reply to a pull that can take a partial window (`partial`, ADR-194), bounded by
+/// silence as `the reply to a pull`; any other window request (a replay) keeps the
+/// round's own limit.
+async fn read_pull_reply<S>(stream: &mut S, partial: bool) -> Result<Message, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    if !partial {
+        return read_frame(stream).await;
+    }
+    read_reply_within_silence(stream, "the reply to a pull").await
+}
+
+/// The reply to the divergence check, bounded by silence as `the reply to the
+/// divergence check`.
+async fn read_divergence_reply<S>(stream: &mut S) -> Result<Message, ProtocolError>
+where
+    S: AsyncRead + Unpin,
+{
+    read_reply_within_silence(stream, "the reply to the divergence check").await
 }
 
 /// Called on the serving side with what a pushed batch became (ADR-140), so
@@ -1330,8 +1408,7 @@ where
                 // of what this node holds: the ids, and the incarnation each
                 // stands at, which is what the requester's tombstones are
                 // compared against.
-                let held = engine
-                    .collection_incarnations()
+                let held = kimmy_storage::blocking(|| engine.collection_incarnations())
                     .map_err(|e| ProtocolError::Local(e.to_string()))?;
                 // The one document read in this exchange, bounded to the
                 // single collection the requester named (ADR-133).
@@ -2758,7 +2835,7 @@ where
                 },
             )
             .await?;
-            let answer = read_frame(stream).await?;
+            let answer = read_pull_reply(stream, asked_partial).await?;
             clock.heard_now();
             answer
         }
@@ -2783,7 +2860,7 @@ where
             partial: asked_partial,
         };
         write_frame(stream, &retry).await?;
-        answer = read_frame(stream).await?;
+        answer = read_pull_reply(stream, asked_partial).await?;
         clock.heard_now();
     }
 
@@ -5817,7 +5894,7 @@ where
     )
     .await?;
     let (peer_collections, probe_count, peer_incarnations, digests, digest_busy, definitions) =
-        match read_frame(stream).await? {
+        match read_divergence_reply(stream).await? {
             Message::Divergence {
                 collections,
                 probe_count,
@@ -11945,6 +12022,220 @@ mod tests {
         assert_eq!(first_reply_timeout(), HANDSHAKE_TIMEOUT);
         assert_eq!(first_reply_timeout(), Duration::from_secs(10));
         assert!(REQUEST_TIMEOUT > first_reply_timeout());
+    }
+
+    /// **A peer that answers the first request and then freezes costs the silence
+    /// bound, not the round's thirty seconds.** The fake peer advertises entries the
+    /// member lacks, reads the `AskEntries` of a pull that can take a partial window,
+    /// and says nothing more; the round fails as `the reply to a pull` after the
+    /// bound's ten seconds, on a paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_frozen_after_the_first_reply_fails_the_pull_on_the_silence_bound() {
+        use tokio::io::DuplexStream;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let mut ahead = VersionVector::new();
+        ahead.insert(node(7), Hlc::new(5_000, 0));
+
+        async fn freezing_peer(mut stream: DuplexStream, servable: VersionVector) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { .. } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let answer = Message::Vectors {
+                servable: servable.clone(),
+                witnessed: servable,
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+            };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskEntries { held: Some(_), partial: true, .. } => {}
+                other => panic!("expected a pull that can take a partial window, got {other:?}"),
+            }
+            std::future::pending::<()>().await;
+        }
+
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(freezing_peer(theirs, ahead));
+        let began = Instant::now();
+        let addr: SocketAddr = "127.0.0.1:3".parse().unwrap();
+        let round = sync_over(&engine, ours, addr, node(7), None, &mut PeerStalls::new()).await;
+        peer.abort();
+        let e = round.expect_err("nothing answers the pull");
+        assert!(
+            matches!(&e, ProtocolError::TimedOut(what) if what == "the reply to a pull"),
+            "{e:?}"
+        );
+        assert_failed_on_the_silence_bound(began.elapsed());
+    }
+
+    /// **A peer that freezes in the middle of the divergence check costs the silence
+    /// bound, not the round's thirty seconds.** The fake peer is level with the
+    /// member, so there is no pull: it answers the first request, reads the
+    /// `AskDivergence` and says nothing more. A lab with frozen peers (2026-10-28)
+    /// found this the request every 30 s round timeout was waiting on.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_frozen_in_the_divergence_check_fails_the_round_on_the_silence_bound() {
+        use tokio::io::DuplexStream;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+
+        async fn freezing_peer(mut stream: DuplexStream) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { .. } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let level = VersionVector::new();
+            let answer = Message::Vectors {
+                servable: level.clone(),
+                witnessed: level,
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+            };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskDivergence { .. } => {}
+                other => panic!("expected the divergence check, got {other:?}"),
+            }
+            std::future::pending::<()>().await;
+        }
+
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(freezing_peer(theirs));
+        let began = Instant::now();
+        let addr: SocketAddr = "127.0.0.1:4".parse().unwrap();
+        let round = sync_over(&engine, ours, addr, node(7), None, &mut PeerStalls::new()).await;
+        peer.abort();
+        let e = round.expect_err("nothing answers the check");
+        assert!(
+            matches!(&e, ProtocolError::TimedOut(what) if what == "the reply to the divergence check"),
+            "{e:?}"
+        );
+        assert_failed_on_the_silence_bound(began.elapsed());
+    }
+
+    /// A round that failed on the silence bound did so after its ten seconds and well
+    /// before the round's thirty (a clock paused, so exactly).
+    fn assert_failed_on_the_silence_bound(took: Duration) {
+        assert!(took >= REPLY_SILENCE_TIMEOUT, "{took:?}");
+        assert!(took < REPLY_SILENCE_TIMEOUT + Duration::from_secs(1), "{took:?}");
+    }
+
+    /// One empty window, as the bytes a peer would send for it.
+    fn frame_bytes() -> Vec<u8> {
+        let window = Message::Entries {
+            entries: Vec::new(),
+            scanned_to: Hlc::ZERO,
+            exhausted: true,
+            passed_through: None,
+        };
+        let body = bson::serialize_to_vec(&window).unwrap();
+        let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    /// A peer that sends `bytes` in `pieces` equal parts, `gap` apart, then goes
+    /// quiet for good.
+    fn trickling(bytes: Vec<u8>, pieces: usize, gap: Duration) -> tokio::io::DuplexStream {
+        use tokio::io::AsyncWriteExt;
+        let (ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+        tokio::spawn(async move {
+            let size = bytes.len().div_ceil(pieces);
+            for (n, piece) in bytes.chunks(size).enumerate() {
+                if n > 0 {
+                    tokio::time::sleep(gap).await;
+                }
+                theirs.write_all(piece).await.unwrap();
+                theirs.flush().await.unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        ours
+    }
+
+    /// **The bound is on silence, not on the frame.** A reply that trickles in, each
+    /// gap inside the bound and the whole frame far past it (and past the round's
+    /// thirty seconds), is read whole, for both bounded requests; a replay's reply
+    /// (no partial window) keeps no bound of this kind at all. Fails if the bound is
+    /// put on the whole frame.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_that_keeps_arriving_is_not_cut_by_the_silence_bound() {
+        let gap = REPLY_SILENCE_TIMEOUT - Duration::from_secs(3);
+        let pieces = 8;
+        assert!(
+            gap * (pieces as u32 - 1) > REQUEST_TIMEOUT,
+            "the frame outlasts the round's limit"
+        );
+        let began = Instant::now();
+        let mut pull = trickling(frame_bytes(), pieces, gap);
+        assert!(matches!(read_pull_reply(&mut pull, true).await, Ok(Message::Entries { .. })));
+        assert!(began.elapsed() > REPLY_SILENCE_TIMEOUT);
+        let mut check = trickling(frame_bytes(), pieces, gap);
+        assert!(matches!(read_divergence_reply(&mut check).await, Ok(Message::Entries { .. })));
+    }
+
+    /// **A freeze inside a frame is silence too, wherever it lands.** The peer sends
+    /// part of the length prefix, or the prefix and part of the body, and stops: each
+    /// fails with the reply's own text after the silence bound, not after the round's
+    /// thirty. Fails if a frame in progress is given the request timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_freeze_inside_the_prefix_or_the_body_fails_on_the_silence_bound() {
+        use tokio::io::AsyncWriteExt;
+        let whole = frame_bytes();
+        for (sent, what_frozen) in [(2, "the length prefix"), (whole.len() / 2, "the body")] {
+            for divergence in [false, true] {
+                let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+                theirs.write_all(&whole[..sent]).await.unwrap();
+                theirs.flush().await.unwrap();
+                let began = Instant::now();
+                let (read, what) = if divergence {
+                    (read_divergence_reply(&mut ours).await, "the reply to the divergence check")
+                } else {
+                    (read_pull_reply(&mut ours, true).await, "the reply to a pull")
+                };
+                let e = read.expect_err(what_frozen);
+                assert!(
+                    matches!(&e, ProtocolError::TimedOut(w) if w == what),
+                    "{what_frozen}, {what}: {e:?}"
+                );
+                assert_failed_on_the_silence_bound(began.elapsed());
+                drop(theirs);
+            }
+        }
+    }
+
+    /// A reply that arrives inside the bound is read, and a request that cannot take a
+    /// partial window (a replay) keeps the round's own limit however late its reply is.
+    #[tokio::test(start_paused = true)]
+    async fn a_replays_reply_keeps_the_round_limit_and_an_early_reply_is_read() {
+        let mut early = trickling(frame_bytes(), 1, Duration::ZERO);
+        assert!(read_pull_reply(&mut early, true).await.is_ok());
+        let late = REPLY_SILENCE_TIMEOUT + Duration::from_secs(5);
+        let replay = tokio::spawn(async move {
+            let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+            tokio::spawn(async move {
+                tokio::time::sleep(late).await;
+                tokio::io::AsyncWriteExt::write_all(&mut theirs, &frame_bytes()).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            read_pull_reply(&mut ours, false).await
+        });
+        assert!(replay.await.unwrap().is_ok(), "a replay's reply is waited for");
+    }
+
+    /// The bound is the handshake's, shorter than the request timeout it replaces.
+    /// That a serving walk's budget fits inside it is the const assert beside
+    /// [`REPLY_SILENCE_TIMEOUT`].
+    #[test]
+    fn the_silence_bound_is_the_handshakes_and_shorter_than_the_request_timeout() {
+        assert_eq!(REPLY_SILENCE_TIMEOUT, HANDSHAKE_TIMEOUT);
+        assert!(REPLY_SILENCE_TIMEOUT < REQUEST_TIMEOUT);
     }
 
     /// An idle two-node cluster's rounds end as rounds, not as failures. Each

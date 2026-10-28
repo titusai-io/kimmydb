@@ -10,6 +10,10 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+**Changed:** a replication round now fails after 10 s of silence from its peer on the reply to a pull that can take a partial window and on the reply to the divergence check, logged as `the reply to a pull timed out` and `the reply to the divergence check timed out` and counted in `kimmy_sync_failures_total`, where each waited the round's 30 s. A peer that answered the round's first request and then froze no longer holds the rest of the tick for half a minute (a lab with frozen members: no run at 30 s or more in 60, against 16 of 60). The bound is on silence, not on the frame, so a large window that keeps arriving is not cut short by it (the round's 30 s still applies). Replays and snapshot pages keep 30 s ([ADR-177](docs/decisions.md)).
+
 ## 0.56.0 - 2026-10-27
 
 **Read before upgrading: 0.56.0 opens a store and a backup 0.55.0 wrote, with no wipe. Stop every member and start them all on 0.56.0.**

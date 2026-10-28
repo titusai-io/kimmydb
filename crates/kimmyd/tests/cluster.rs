@@ -2974,10 +2974,12 @@ async fn a_stop_with_every_duty_running_closes_every_members_store() {
 /// whose end the requester keeps, so each pull starts further on (ADR-194).
 ///
 /// Deterministic and small: C's every walk row is slowed
-/// (`KIMMY_TEST_WALK_ROW_MS`), so a walk over A's 2,200-document load would
-/// take about 55 s, past the round's budget, as a cold walk of 2 GB did on the
-/// lab host; and C's serve budget is 500 rows with the time lifted
-/// (`KIMMY_TEST_SERVE_WALK_*`), so each window is about 12.5 s, inside it.
+/// (`KIMMY_TEST_WALK_ROW_MS`, 20 ms), so a walk over A's 2,200-document load would
+/// take about 44 s, past the round's budget, as a cold walk of 2 GB did on the
+/// lab host; and C's serve budget is 300 rows with the time lifted
+/// (`KIMMY_TEST_SERVE_WALK_*`), so each window is about 6 s, inside the round's
+/// budget and inside the 10 s of silence a pull's reply may have
+/// (`REPLY_SILENCE_TIMEOUT`).
 /// Then C takes one write, which must reach A and B, each draining C in
 /// exactly as many partial windows as C's oplog holds whole budgets of rows.
 /// On a build before the budget, the write never reaches them.
@@ -3014,10 +3016,11 @@ async fn a_quiet_members_write_reaches_its_peers_after_a_large_load_elsewhere() 
     let held = client.get(c.url(&last)).bearer_auth(&token).send().await.unwrap();
     assert!(held.status().is_success(), "premise: C holds the load");
 
-    // Every walk row on C takes 25 ms from here: a walk over the load, 50 s.
+    // Every walk row on C takes 20 ms from here: a walk over the load, 44 s; a
+    // window of 300 rows, 6 s.
     let before = c.restart_with(&[
-        ("KIMMY_TEST_WALK_ROW_MS", "25"),
-        ("KIMMY_TEST_SERVE_WALK_ROWS", "500"),
+        ("KIMMY_TEST_WALK_ROW_MS", "20"),
+        ("KIMMY_TEST_SERVE_WALK_ROWS", "300"),
         ("KIMMY_TEST_SERVE_WALK_MS", "600000"),
     ]);
     assert!(before.success(), "{before:?}");
@@ -3039,7 +3042,7 @@ async fn a_quiet_members_write_reaches_its_peers_after_a_large_load_elsewhere() 
     // sorts after the node its last row belongs to (the coverage rule's tie,
     // ADR-148): a row or two a pull, three origins at most. A load well away
     // from a multiple of the budget keeps that from moving the count.
-    let (budget, margin) = (500, 3 * 4);
+    let (budget, margin) = (300, 3 * 4);
     assert!(
         rows % budget > margin && rows % budget < budget - margin,
         "premise: {rows} rows sit too near a multiple of {budget} for an exact count"
@@ -3654,11 +3657,12 @@ async fn kimmy_replication_lag_seconds_reads_non_zero_while_a_member_trails_and_
     )
     .await;
 
-    // Every walk row on C takes 30 ms from here: a walk over the load is
-    // tens of seconds, wide enough to scrape mid-flight reliably.
+    // Every walk row on C takes 20 ms from here: a walk over the load is 44 s,
+    // wide enough to scrape mid-flight reliably, and a window of 300 rows (6 s)
+    // stays inside a pull's 10 s of silence.
     let before = c.restart_with(&[
-        ("KIMMY_TEST_WALK_ROW_MS", "30"),
-        ("KIMMY_TEST_SERVE_WALK_ROWS", "500"),
+        ("KIMMY_TEST_WALK_ROW_MS", "20"),
+        ("KIMMY_TEST_SERVE_WALK_ROWS", "300"),
         ("KIMMY_TEST_SERVE_WALK_MS", "600000"),
     ]);
     assert!(before.success(), "{before:?}");

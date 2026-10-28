@@ -1108,7 +1108,8 @@ pub struct ExamineBudget {
 
 impl ExamineBudget {
     /// The time a window served to a peer that asked for a partial one may
-    /// take: well inside a sync round's thirty seconds, and about two pulls
+    /// take: well inside a sync round's thirty seconds and inside the ten seconds
+    /// of silence its reply may have (ADR-177's addendum), and about two pulls
     /// per five-second tick (ADR-157).
     pub const SERVE_TIME: std::time::Duration = std::time::Duration::from_secs(2);
     /// And the rows, 64 batches' worth: what bounds a warm walk, which reads
