@@ -496,7 +496,7 @@ both — mixing them is rejected rather than guessed at.
 | `$pullAll` | Remove every element equal to **any** value in a list, by value as `$pull` matches |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
-| `$[]` / `$[<identifier>]` in a path | Address array elements — see [Positional updates](#positional-updates) |
+| `$`, `$[]` / `$[<identifier>]` in a path | Address array elements — see [Positional updates](#positional-updates) |
 
 ```javascript
 { "$inc": { "qty": -1 }, "$push": { "history": "shipped" } }
@@ -745,18 +745,54 @@ The rules, which are MongoDB's:
   `null` in its position rather than closing the gap, so the other elements
   keep their indices — the same rule as `$unset` of `items.1`.
 
-**`$` — MongoDB's "the element the query matched" — is not implemented, and
-that is deliberate.** An update path with a `$` segment is a **`400`**
-(`the $ positional operator is not supported (in path "items.$.shipped"); use
-$[<identifier>] with arrayFilters, or $[] for every element`) and nothing is
-written. It depends on the filter reporting *which* element satisfied it,
-which the matcher does not track, and `$[<identifier>]` says the same thing without
-depending on the query: `{"items.sku": "gasket"}` with `items.$.shipped` is
-`items.$[line].shipped` with `[{"line.sku": "gasket"}]` — and the second form
-reaches every gasket line rather than only the first. An update that uses `$`
-is refused with a message that says so. Recorded in
-[Deviations](deviations.md); the reasoning is ADR-104, and the ruling to keep
-it is [ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set).
+**`$` — the element the query matched.** `items.$.shipped` writes the element
+of `items` that the update's filter matched, which `$[<identifier>]` cannot say
+because it does not look at the query:
+
+```javascript
+// {_id: 7, items: [{sku: "bolt"}, {sku: "gasket"}, {sku: "gasket"}]}
+update({_id: 7, "items.sku": "gasket"}, {$set: {"items.$.shipped": true}})
+// sets shipped on the FIRST gasket line (index 1) only
+
+update({_id: 7}, {$set: {"items.$[line].shipped": true}},
+       {arrayFilters: [{"line.sku": "gasket"}]})
+// sets it on both
+```
+
+The position is worked out per document, from that document, so `multi`
+updates each order's own first match. Which element:
+
+- **The array** is the last one the filter matched on, in the order the
+  filter holds its clauses. `{scores: {$gte: 6}, "items.sku": "gasket"}`
+  positions `items`; written the other way round it positions `scores`. For a
+  path that runs through nested arrays (`orders.lines.sku`) it is the
+  outermost, `orders`.
+- **The element** is the first one that satisfied the condition: the element
+  that satisfied the sub-filter for `$elemMatch`, the first whose `sku`
+  satisfies `items.sku: "gasket"`, the first scalar for `scores: {$gte: 6}`.
+  With several conditions on one array path (`{s: {$gt: 2, $lt: 9}}`, or
+  clauses of an `$and`), it is the first element satisfying the one evaluated
+  last.
+- **`$or`** records from the first branch that held. `$nor`, `$not`, `$ne`,
+  `$nin`, `$exists`, `$size`, `$all` and `$expr` record no position, and
+  neither does an explicit index in the filter (`items.0.sku`).
+
+Refused, each a **`400`** that writes nothing:
+
+- a `$` when the filter matched no array element, or went through a different
+  array than the path does (`items.$.x` under a filter on `scores`); the
+  message names both;
+- more than one `$` in a path, or `$` as the first segment;
+- `$rename` of a path with a `$`;
+- any `$` in an upsert that inserts a document, because the filter matched no
+  existing one. An upsert whose filter finds a document updates it, with that
+  document's position.
+
+`$` may be followed by `$[]` or `$[<identifier>]` (`orders.$.lines.$[].done`)
+and may sit beside paths that use them. The update pipeline form takes none
+of these. Replacement updates do not read the filter at all. Recorded in
+[Deviations](deviations.md); the decision is
+[ADR-256](decisions.md).
 
 ### Integers stay integral
 
@@ -1110,16 +1146,30 @@ array or a document is refused `400` — `projection value for "x" must be 0 or
 1`. A document whose key is an operator — `{"items": {"$slice": 3}}`,
 `{"items": {"$elemMatch": {…}}}` — is refused by name: `projection operator
 $slice is not supported for "items"; a projection value must be 0 or 1`. There
-are no projection operators; reshape an array in an
+are no projection operators besides the positional `$` below; reshape an array in an
 [aggregation](aggregation.md) pipeline, where `$slice` exists as an expression.
 
-**`$` in a find projection path is not the positional operator.** A projection
-path is read literally, so `{"items.$": 1}` names a field called `$` inside
-`items` and finds none: the request succeeds, and when `items` is an array
-each document element comes back `{}` (`items: [{}, {}]`) by the array rule
-above; when it is a document, `items` is absent. The refusal of `$` under [positional
-updates](#positional-updates) is a rule about *update* paths and does not
-reach projections.
+**`{"items.$": 1}` is the positional projection.** A `find` or
+`find_and_modify` projection with a path ending in `$` returns the document
+with that array reduced to the first element the filter matched, chosen by the
+rules of [positional updates](#positional-updates) (the last array the filter
+matched on, the first element that satisfied it). Other inclusions behave as
+usual: `{"items.$": 1, "n": 1}` keeps `_id`, `n` and the one element, and
+`"_id": 0` drops `_id`. It is a `400` when:
+
+- the filter did not match an element of that array (or matched on a different
+  array), or the request has no filter;
+- the value is not an inclusion (`{"items.$": 0}`), or it is beside an
+  exclusion;
+- `$` is not the last segment (`items.$.sku`), or there is more than one;
+- another entry names the same array, including `$slice` and `$elemMatch`
+  documents.
+
+`find_and_modify` positions `returnDocument: "after"` by the document the
+filter matched, since the updated image may no longer satisfy the filter. A
+`$project` stage in an [aggregation](aggregation.md) is not a find projection:
+there `items.$` is still a path to a field called `$`, which an element rarely
+has, so it answers `items: [{}, …]` over an array of documents.
 
 ---
 
@@ -1185,7 +1235,7 @@ than as an `$or` of one `$regex` each.
 | Feature | Status |
 |---|---|
 | `$vectorSearch` | ✅ Built as the first [aggregation](aggregation.md#vectorsearch) stage, with the fields of the [vector search endpoint](vectors.md); other systems' field names are refused |
-| `$` positional update operator (`items.$.qty`) | ⛔ Not planned — the matcher does not report which element a filter matched, and `$[<identifier>]` with `arrayFilters` expresses the same thing without depending on the query; see [Positional updates](#positional-updates) |
+| `$` positional update operator (`items.$.qty`) and positional projection (`items.$`) | ✅ Built — the last array the filter matched on, the first element that satisfied it; see [Positional updates](#positional-updates) and [Sort and projection](#sort-and-projection) |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
 | `$jsonSchema` | 📋 Not built |
 | Geospatial operators | ⛔ Not planned |

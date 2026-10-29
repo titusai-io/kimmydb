@@ -1735,7 +1735,11 @@ paths:
 
         An update path may address array elements: `items.$[].qty` reaches
         every element, and `items.$[line].qty` reaches the elements the
-        `arrayFilters` entry for `line` selects (ADR-104).
+        `arrayFilters` entry for `line` selects (ADR-104). `items.$.qty`
+        reaches the first element the filter matched, on the last array the
+        filter matched on; it is `400` when the filter matched no array
+        element, matched a different array than the path names, or the
+        request is an upsert that inserts (ADR-256).
 
         An update writes each path once: two writes to one path, or to a
         path and a path inside it, are refused `400` and nothing is written,
@@ -3648,7 +3652,10 @@ components:
       additionalProperties: false
       description: |
         Every read parameter. `filter`, `sort` and `projection` follow the
-        query language in `docs/query-language.md`.
+        query language in `docs/query-language.md`. A projection entry
+        `<array>.$: 1` returns the first element of the array that the filter
+        matched; it is `400` when the filter matched no element of that array
+        or the request has no filter (ADR-256).
       properties:
         filter: { $ref: "#/components/schemas/Document" }
         sort: { $ref: "#/components/schemas/Document" }

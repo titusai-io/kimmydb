@@ -440,8 +440,8 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
 ```
 
 `find_and_modify` takes the same field. The rules — one identifier per filter
-document, every identifier filtered and every filter used, `$` not
-implemented — are in [Query language](query-language.md#positional-updates).
+document, every identifier filtered and every filter used, and the `$` of the
+element the filter matched — are in [Query language](query-language.md#positional-updates).
 
 > **Sharp edge.** A `multi: true` request is atomic per chunk, not per
 > request. Once a chunk has committed, the later chunks wait for the writer

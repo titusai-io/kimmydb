@@ -275,10 +275,10 @@ of its own that nobody has asked for.
 **Three smaller points, same entry.** `{"a": 1, "a.b": 1}` is accepted and
 includes `a` whole, where MongoDB refuses the overlap as a path collision; a
 request MongoDB refuses means something here, so nothing ported changes
-meaning. `{"items.$": 1}` is a field called `$`, not the positional projection
+meaning. In a `$project` stage `{"items.$": 1}` is a field called `$`, not the
+positional projection a `find` takes
 ([Query language](query-language.md#sort-and-projection)), so it answers
-`items: [{}, …]` over an array of documents where MongoDB answers the first
-element the filter matched. And a `$project` or `$addFields` field computed
+`items: [{}, …]` over an array of documents. And a `$project` or `$addFields` field computed
 into an array through a named segment — `{"p.total": …}` with `p` an array —
 is refused `400`, where MongoDB writes it into each element; through a
 numeric segment (`"p.0"`) it replaces that element by position.
@@ -658,46 +658,48 @@ be rounded to a 32-bit float`. ADR-252 converts a decimal to a double only.
 
 ---
 
-## 🟡 The `$` positional operator is not implemented; `$[<identifier>]` and `$[]` are
+## 🟢 The `$` positional operator, in updates and in a find projection, is built (ADR-256)
 
-**Raised 2026-08-30, with ADR-104.** MongoDB has three ways to address array
-elements in an update path: `$[<identifier>]` (the elements an `arrayFilters`
-entry selects), `$[]` (every element) and `$` (the first element the *query*
-matched). The first two are implemented; `$` is refused at parse time with a
-message that points at the first.
+**Was.** MongoDB has three ways to address array elements in an update path:
+`$[<identifier>]` (the elements an `arrayFilters` entry selects), `$[]` (every
+element) and `$` (the first element the *query* matched). `$` was refused at
+parse time ([ADR-104](decisions.md), kept by
+[ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set))
+because the matcher answered a `bool`. The find projection `{"items.$": 1}`
+read `$` as a field name.
 
-**Ruled 2026-09-29, kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).** The refusal is deliberate and
-stays: the `400` reads *the `$` positional operator is not supported (in path
-"items.$.shipped"); use `$[<identifier>]` with arrayFilters, or `$[]` for every
-element*, and nothing is written. A caller porting such an update rewrites it
-as the second form.
+**Now.** Built ([ADR-256](decisions.md)). `filter::matches_at` answers the
+matcher's own yes or no and, for a document that matched, the array and the
+index of the element that satisfied the filter: the **last array the filter
+matched on**, and in it the **first element that satisfied the condition**.
+`items.$.shipped` writes that element, on every operator that takes a path
+except `$rename`, and `{"items.$": 1}` returns the document with `items` cut to
+that element. The worked rules, with the `items.sku: "gasket"` example, are
+under [Positional updates](query-language.md#positional-updates) and
+[Sort and projection](query-language.md#sort-and-projection).
 
-**Why not `$`.** Its meaning depends on which element satisfied the filter,
-and the matcher answers a `bool`: `filter::matches` tests a path's values with
-*any* semantics and never records the index it stopped at. Reporting one would
-mean threading a position out of every comparison, a rule for which position
-wins when several clauses touch arrays (MongoDB's own rule — the last array
-field in the query — is a documented source of surprise), and carrying the
-value from the match into the update inside the write transaction.
-`$[<identifier>]` needs none of that, because its filter is evaluated per
-element at apply time, and it says the same thing more precisely:
-`{"items.sku": "gasket"}` with `items.$.shipped` is `items.$[line].shipped`
-with `[{"line.sku": "gasket"}]`, and the second reaches every gasket line
-rather than the first.
+**What still differs.**
 
-**What differs for a caller.** An update ported from MongoDB that uses `$` is
-a `400` rather than a write; the message names the replacement. Two smaller
-points, both on the strict side: a filter document that names no identifier —
-`{"$and": []}` — is refused rather than read as always-true, and only field
-conditions and `$and`/`$or`/`$nor` are accepted at the top of a filter
-document. A positional update that selects no element leaves the document
-unchanged, so it is not written and does not count in `modified`
-([ADR-208](decisions.md)).
+- **A `$` the filter did not earn is a `400`.** The filter must match on an
+  array field, and the `$` path must go through that same array; `items.$.x`
+  under a filter positioned on `scores` is refused, naming both arrays.
+- **Several conditions on one array path** leave the first element satisfying
+  the *last* condition evaluated. `$nor`, `$not`, `$ne`, `$nin`, `$exists`,
+  `$size`, `$all` and `$expr` record no position; an explicit index in the
+  filter (`items.0.sku`) records none either.
+- **An upsert that inserts is a `400`** for a `$` path: there was no existing
+  document to match, so no element. An upsert whose filter finds a document
+  updates it and the `$` reads that document.
+- **One `$` per path.** `items.$.sub.$[]` and `items.$.sub.$[id]` are
+  accepted; `$` after another positional segment, or twice, is refused.
+- **A positional projection is a find feature.** `$project` and `$addFields`
+  still read `items.$` as a field called `$`. `findAndModify` positions the
+  returned `after` document by the document the filter matched, since the
+  updated image may no longer satisfy the filter.
+- **A positional projection that cannot name an element is a `400`** for the
+  request, not an empty array for that document.
+- **Breaking, accepted.** `{"items.$": 1}` used to answer `items: [{}, …]`.
 
-**Closing it** would mean a second evaluation mode for `Filter::Field` that
-returns the matching element's index, plumbed from `ModifySpec::matches` into
-`update::apply`. Not planned, by the ruling above: nothing `$` can express is
-out of reach.
 
 ---
 
