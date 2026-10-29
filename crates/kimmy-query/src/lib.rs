@@ -28,13 +28,15 @@ mod graph_tests;
 #[cfg(test)]
 mod math_tests;
 #[cfg(test)]
+mod positional_tests;
+#[cfg(test)]
 mod sink_tests;
 #[cfg(test)]
 mod sort_zip_tests;
 
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};
-pub use filter::{Condition, Filter, matches};
+pub use filter::{ArrayPosition, Condition, Filter, matches, matches_at};
 pub use plan::{IndexPlan, choose};
-pub use shape::{Projection, ProjectionPaths, SortKey};
+pub use shape::{FindProjection, Projection, ProjectionPaths, SortKey};
 pub use update::Update;

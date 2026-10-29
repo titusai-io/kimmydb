@@ -1043,6 +1043,127 @@ pub fn matches_with(filter: &Filter, doc: &Document, vars: &[expr::Binding<'_>])
     evaluate(filter, doc, vars).map_err(|e| unevaluable(e, doc.get("_id"), ""))
 }
 
+/// The element of an array a filter matched, for the positional `$` of an
+/// update path and of a find projection (ADR-256).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayPosition {
+    /// The array's path in the document: the outermost array the matched
+    /// field's path runs through, so `items` for `items.sku` and for
+    /// `items.tags`.
+    pub path: String,
+    /// The index of the first element that satisfied the condition.
+    pub index: usize,
+}
+
+/// [`matches`], and where in an array the document matched.
+///
+/// The boolean is [`matches`]'s own answer, computed first and unchanged; the
+/// position is looked for only in a document that matched, by a second walk
+/// over the same filter that shares [`condition_matches`] with it. Nothing the
+/// ordinary matcher does depends on this function.
+///
+/// The position is the one MongoDB's `$` uses: **the last array field the
+/// filter matched on**, and in it **the first element that satisfied the
+/// condition**. Clauses are visited in the order the filter holds them, so a
+/// later clause on another array replaces an earlier one's position, and
+/// several conditions on one array path leave the first element that
+/// satisfies the last of them. An `$or` records from the first branch that
+/// holds. `$nor`, `$not`, `$ne`, `$nin`, `$exists`, `$size`, `$all` and
+/// `$expr` record nothing, because what they report is not an element that
+/// satisfied anything. `None` means the document matched without an array
+/// element being the reason.
+pub fn matches_at(filter: &Filter, doc: &Document) -> Result<(bool, Option<ArrayPosition>)> {
+    if !matches(filter, doc)? {
+        return Ok((false, None));
+    }
+    let mut at = None;
+    record_position(filter, doc, &mut at);
+    Ok((true, at))
+}
+
+fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPosition>) {
+    match filter {
+        Filter::AlwaysTrue | Filter::Nor(_) | Filter::Expr(_) => {}
+        Filter::And(branches) => {
+            for branch in branches {
+                record_position(branch, doc, at);
+            }
+        }
+        Filter::Or(branches) => {
+            // A branch that cannot be evaluated did not decide the match.
+            if let Some(branch) =
+                branches.iter().find(|b| matches!(evaluate(b, doc, &[]), Ok(true)))
+            {
+                record_position(branch, doc, at);
+            }
+        }
+        Filter::Field { path, conditions } => {
+            for condition in conditions {
+                if let Some(found) = condition_position(condition, doc, path) {
+                    *at = Some(found);
+                }
+            }
+        }
+    }
+}
+
+/// The first element of the outermost array on `path` that satisfies
+/// `condition`, for a condition that is about elements.
+fn condition_position(condition: &Condition, doc: &Document, path: &str) -> Option<ArrayPosition> {
+    if !matches!(
+        condition,
+        Condition::Eq(_)
+            | Condition::Gt(_)
+            | Condition::Gte(_)
+            | Condition::Lt(_)
+            | Condition::Lte(_)
+            | Condition::In(_)
+            | Condition::Type(_)
+            | Condition::Regex(_)
+            | Condition::ElemMatch(_)
+            | Condition::Mod { .. }
+            | Condition::Bits { .. }
+    ) {
+        return None;
+    }
+    let segments = path::segments(path);
+    let mut current = doc;
+    for (at, segment) in segments.iter().enumerate() {
+        match current.get(*segment) {
+            Some(Bson::Document(inner)) => current = inner,
+            Some(Bson::Array(items)) => {
+                let rest = segments[at + 1..].join(".");
+                let index =
+                    items.iter().position(|item| element_satisfies(condition, item, &rest))?;
+                return Some(ArrayPosition { path: segments[..=at].join("."), index });
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether one element of the array, with `rest` of the path below it, makes
+/// `condition` hold.
+fn element_satisfies(condition: &Condition, item: &Bson, rest: &str) -> bool {
+    let held = if rest.is_empty() {
+        // `$elemMatch` reads the elements of the array it is given; the
+        // element alone is wrapped so that it is the one it tests.
+        match condition {
+            Condition::ElemMatch(_) => {
+                condition_matches(condition, &[&Bson::Array(vec![item.clone()])], &[])
+            }
+            _ => condition_matches(condition, &[item], &[]),
+        }
+    } else {
+        match item {
+            Bson::Document(inner) => condition_matches(condition, &path::resolve(inner, rest), &[]),
+            _ => return false,
+        }
+    };
+    matches!(held, Ok(true))
+}
+
 /// The refusal for a `$expr` that could not be evaluated, against the
 /// document with `_id` when it has one, or against something `within` it.
 fn unevaluable(e: Error, id: Option<&Bson>, within: &str) -> Error {

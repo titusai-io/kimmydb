@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::aggregate::group_key;
 use crate::expr::Expr;
-use crate::filter::{self, Filter, type_name_of as type_name};
+use crate::filter::{self, ArrayPosition, Filter, type_name_of as type_name};
 use crate::path;
 use crate::shape::{self, SortKey};
 
@@ -262,21 +262,49 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
     Ok(Update::Operators(operations))
 }
 
-/// Whether a path has any `$[...]` segment.
+/// Whether a path has any `$`, `$[]` or `$[<identifier>]` segment.
 fn has_positional(path: &str) -> bool {
-    path::segments(path).iter().any(|segment| segment.starts_with("$["))
+    path::segments(path).iter().any(|segment| *segment == "$" || segment.starts_with("$["))
+}
+
+/// Whether a path has a `$` segment, which reads the position the filter
+/// matched.
+fn has_matched_position(path: &str) -> bool {
+    path::segments(path).contains(&"$")
+}
+
+impl Update {
+    /// Whether any path has a `$` segment, which is resolved against the
+    /// element the filter matched ([`apply_matched`]).
+    pub fn uses_matched_position(&self) -> bool {
+        match self {
+            Update::Replace(_) => false,
+            Update::Operators(ops) => ops.iter().any(|op| has_matched_position(&op.path)),
+        }
+    }
 }
 
 /// Check a path's positional segments and return the identifiers they name,
 /// in order of first use and without repeats. `$[]` names none.
 fn positional_identifiers(path: &str) -> Result<Vec<String>> {
     let mut identifiers: Vec<String> = Vec::new();
+    let mut dollars = 0;
     for (position, segment) in path::segments(path).iter().enumerate() {
         if *segment == "$" {
-            return Err(Error::InvalidUpdate(format!(
-                "the `$` positional operator is not supported (in path {path:?}); use \
-                 `$[<identifier>]` with arrayFilters, or `$[]` for every element"
-            )));
+            dollars += 1;
+            if position == 0 {
+                return Err(Error::InvalidUpdate(format!(
+                    "path {path:?} begins with a positional segment, but a document is not an \
+                     array"
+                )));
+            }
+            if dollars > 1 {
+                return Err(Error::InvalidUpdate(format!(
+                    "the path {path:?} has more than one `$` positional operator; a path may \
+                     have one"
+                )));
+            }
+            continue;
         }
         let Some(inner) = segment.strip_prefix("$[") else {
             continue;
@@ -821,6 +849,25 @@ pub fn apply(update: &Update, doc: &mut Document, now_ms: i64) -> Result<()> {
     apply_to(update, doc, now_ms, Target::Existing)
 }
 
+/// Apply an update to an existing document that `filter` matched, resolving a
+/// `$` segment to the element the filter matched ([`filter::matches_at`]).
+///
+/// The position is read from `doc` itself, so each document an update visits
+/// has its own. An update with no `$` segment is [`apply`] and the filter is
+/// not consulted.
+pub fn apply_matched(
+    update: &Update,
+    filter: &Filter,
+    doc: &mut Document,
+    now_ms: i64,
+) -> Result<()> {
+    if !update.uses_matched_position() {
+        return apply(update, doc, now_ms);
+    }
+    let (_, at) = filter::matches_at(filter, doc)?;
+    apply_to_at(update, doc, now_ms, Target::Existing, at.as_ref())
+}
+
 /// Apply an update to the document an upsert is about to insert.
 ///
 /// `doc` arrives already seeded from the filter's equalities. `$setOnInsert`
@@ -838,6 +885,16 @@ enum Target {
 }
 
 fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) -> Result<()> {
+    apply_to_at(update, doc, now_ms, target, None)
+}
+
+fn apply_to_at(
+    update: &Update,
+    doc: &mut Document,
+    now_ms: i64,
+    target: Target,
+    at: Option<&ArrayPosition>,
+) -> Result<()> {
     let operations = match update {
         Update::Replace(replacement) => {
             // `_id` belongs to the document's identity, not its contents, and
@@ -868,7 +925,16 @@ fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) ->
     // found it (ADR-205).
     let applies =
         |op: &Operation| target == Target::Inserted || !matches!(op.kind, OpKind::SetOnInsert(_));
-    let concrete = concrete_paths(operations, doc, applies)?;
+    if target == Target::Inserted
+        && operations.iter().any(|op| applies(op) && has_matched_position(&op.path))
+    {
+        return Err(Error::InvalidUpdate(
+            "the `$` positional operator cannot be used when an upsert inserts a document: the \
+             filter matched no existing document, so there is no element for it to name"
+                .into(),
+        ));
+    }
+    let concrete = concrete_paths(operations, doc, at, applies)?;
     if operations.iter().any(|op| has_positional(&op.path)) {
         claim_concrete(operations, &concrete)?;
     }
@@ -892,6 +958,7 @@ fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) ->
 fn concrete_paths(
     operations: &[Operation],
     doc: &Document,
+    at: Option<&ArrayPosition>,
     applies: impl Fn(&Operation) -> bool,
 ) -> Result<Vec<Vec<String>>> {
     operations
@@ -900,7 +967,7 @@ fn concrete_paths(
             if !applies(op) {
                 Ok(Vec::new())
             } else if has_positional(&op.path) {
-                expand_positional(&op.path, &op.array_filters, doc)
+                expand_positional(&op.path, &op.array_filters, doc, at)
             } else {
                 Ok(vec![op.path.clone()])
             }
@@ -951,30 +1018,78 @@ fn apply_at(op: &Operation, paths: &[String], doc: &mut Document, now_ms: i64) -
 /// items satisfy `line` becomes `["items.1.qty", "items.3.qty"]`. An empty
 /// result means no element was selected, and the operation leaves the
 /// document as it found it.
-fn expand_positional(path: &str, filters: &[ArrayFilter], doc: &Document) -> Result<Vec<String>> {
+fn expand_positional(
+    path: &str,
+    filters: &[ArrayFilter],
+    doc: &Document,
+    at: Option<&ArrayPosition>,
+) -> Result<Vec<String>> {
     let segments = path::segments(path);
     let (head, rest) = segments.split_first().expect("non-empty path");
     let mut prefix = vec![(*head).to_string()];
     let mut out = Vec::new();
-    expand_into(doc.get(*head), rest, filters, path, &mut prefix, &mut out, doc.get(ID_FIELD))?;
+    let ctx = Expansion { filters, path, at, id: doc.get(ID_FIELD) };
+    expand_into(doc.get(*head), rest, &ctx, &mut prefix, &mut out)?;
     Ok(out)
+}
+
+/// What expanding one path reads besides the segments: the request's filters,
+/// the position the query matched, and the `_id` for messages.
+struct Expansion<'a> {
+    filters: &'a [ArrayFilter],
+    path: &'a str,
+    /// The element the filter matched, for a `$` segment.
+    at: Option<&'a ArrayPosition>,
+    /// The `_id` of the document being updated, for the message when an
+    /// array filter's `$expr` cannot be evaluated.
+    id: Option<&'a Bson>,
 }
 
 fn expand_into(
     value: Option<&Bson>,
     segments: &[&str],
-    filters: &[ArrayFilter],
-    path: &str,
+    ctx: &Expansion<'_>,
     prefix: &mut Vec<String>,
     out: &mut Vec<String>,
-    // The `_id` of the document being updated, for the message when an
-    // array filter's `$expr` cannot be evaluated.
-    id: Option<&Bson>,
 ) -> Result<()> {
+    let (filters, path, id) = (ctx.filters, ctx.path, ctx.id);
     let Some((head, rest)) = segments.split_first() else {
         out.push(prefix.join("."));
         return Ok(());
     };
+
+    if *head == "$" {
+        let here = prefix.join(".");
+        let Some(at) = ctx.at else {
+            return Err(Error::InvalidUpdate(format!(
+                "the `$` positional operator in {path:?} needs the query to have matched an \
+                 element of an array: the filter must match on an array field, and the update \
+                 path must go through that same array"
+            )));
+        };
+        if at.path != here {
+            return Err(Error::InvalidUpdate(format!(
+                "the `$` in {path:?} follows {here:?}, but the filter matched an element of \
+                 {:?}; the update path must go through the array the filter matched on",
+                at.path
+            )));
+        }
+        let Some(Bson::Array(items)) = value else {
+            return Err(Error::InvalidUpdate(format!(
+                "the path {here:?} must be an array to apply \"$\" in {path:?}"
+            )));
+        };
+        let Some(item) = items.get(at.index) else {
+            return Err(Error::InvalidUpdate(format!(
+                "the element {} the filter matched is not in {here:?} (in {path:?})",
+                at.index
+            )));
+        };
+        prefix.push(at.index.to_string());
+        expand_into(Some(item), rest, ctx, prefix, out)?;
+        prefix.pop();
+        return Ok(());
+    }
 
     if let Some(identifier) = head.strip_prefix("$[").and_then(|s| s.strip_suffix(']')) {
         // A positional segment has nothing to select from unless there is an
@@ -1005,7 +1120,7 @@ fn expand_into(
             };
             if selected {
                 prefix.push(index.to_string());
-                expand_into(Some(item), rest, filters, path, prefix, out, id)?;
+                expand_into(Some(item), rest, ctx, prefix, out)?;
                 prefix.pop();
             }
         }
@@ -1021,7 +1136,7 @@ fn expand_into(
         _ => None,
     };
     prefix.push((*head).to_string());
-    expand_into(next, rest, filters, path, prefix, out, id)?;
+    expand_into(next, rest, ctx, prefix, out)?;
     prefix.pop();
     Ok(())
 }
@@ -2215,9 +2330,9 @@ mod tests {
     }
 
     #[test]
-    fn the_dollar_positional_operator_is_refused_with_a_pointer() {
+    fn the_dollar_positional_operator_needs_the_query_to_have_matched_an_array() {
         let err = apply_err_with(doc! { "$set": { "items.$.shipped": true } }, vec![], order());
-        assert!(err.contains("$[<identifier>]"), "unhelpful error: {err}");
+        assert!(err.contains("matched an element"), "unhelpful error: {err}");
     }
 
     #[test]
@@ -3034,7 +3149,7 @@ mod tests {
         )
         .unwrap();
         let Update::Operators(operations) = &update else { unreachable!() };
-        let concrete = concrete_paths(operations, &doc, |_| true).unwrap();
+        let concrete = concrete_paths(operations, &doc, None, |_| true).unwrap();
         let paths: usize = concrete.iter().map(Vec::len).sum();
         assert_eq!(paths, 3 * n as usize);
         let probes = claim_concrete(operations, &concrete).unwrap();
