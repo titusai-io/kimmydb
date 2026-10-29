@@ -4026,6 +4026,7 @@ async fn a_sorted_find_refuses_a_positional_projection_for_the_page_only() {
     }
     assert_eq!(pages[0], json!([{"sku": "g"}]));
     assert_eq!(pages[0], pages[1]);
+}
 
 /// A document the offset steps over cannot refuse the page either: the one
 /// with no element sorts first and is skipped.
