@@ -106,6 +106,7 @@ impl Engine {
         docs: Vec<Document>,
         mode: SinkMode,
     ) -> Result<SinkOutcome> {
+        self.check_output_ids(&docs)?;
         if mode == SinkMode::Insert {
             refuse_duplicate_ids(&docs)?;
         }
@@ -140,6 +141,23 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Refuse the whole output if any document's `_id` could not be stored: a
+    /// type no `_id` may have, or one over the size cap. Every document is in
+    /// memory before the first write, so a client error in the pipeline's own
+    /// output is answered as one, with nothing written and, when the caller asks
+    /// first, nothing created. A document with no `_id` is given one on insert.
+    pub fn check_output_ids(&self, docs: &[Document]) -> Result<()> {
+        for doc in docs {
+            if let Some(value) = doc.get(ID_FIELD) {
+                let id = DocId::try_from_bson(value)?;
+                if self.caps_apply() {
+                    kimmy_core::limits::check_id(&id)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One transaction of [`Self::write_documents`]: the counts of the
@@ -272,4 +290,67 @@ fn refuse_duplicate_ids(docs: &[Document]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bson::{Bson, doc};
+
+    use super::*;
+
+    fn engine() -> (Engine, CollectionMeta, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let c = e.create_collection("app", "rollup").unwrap();
+        (e, c, dir)
+    }
+
+    const MERGE: SinkMode =
+        SinkMode::Merge { when_matched: WhenMatched::Replace, insert_unmatched: true };
+
+    #[test]
+    fn an_id_no_document_may_have_refuses_the_whole_output_in_both_modes() {
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(2);
+        let bad_ids = [
+            Bson::Null,
+            Bson::Double(2.5),
+            Bson::Document(doc! { "d": "mon" }),
+            Bson::Array(vec![Bson::Int32(1)]),
+        ];
+        for mode in [SinkMode::Insert, MERGE] {
+            for bad in &bad_ids {
+                let docs = vec![
+                    doc! { "_id": 1, "n": 1 },
+                    doc! { "_id": 2, "n": 2 },
+                    doc! { "_id": 3, "n": 3 },
+                    doc! { "_id": bad.clone() },
+                ];
+                let before = engine.commits();
+                let err = engine.write_documents(&coll, docs, mode).unwrap_err();
+                assert!(
+                    matches!(err, StorageError::Core(kimmy_core::Error::InvalidDocumentId { .. })),
+                    "{mode:?} {bad:?}: {err:?}"
+                );
+                assert_eq!(engine.commits(), before, "{mode:?} {bad:?}: nothing committed");
+                assert!(engine.get(&coll, &DocId::Int64(1)).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn the_allowed_id_types_are_written_and_a_missing_id_is_minted() {
+        let (engine, coll, _dir) = engine();
+        let docs = vec![
+            doc! { "_id": bson::oid::ObjectId::new() },
+            doc! { "_id": "s" },
+            doc! { "_id": 7_i32 },
+            doc! { "_id": 8_i64 },
+            doc! { "_id": Bson::Binary(bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![1, 2] }) },
+            doc! { "_id": Bson::Decimal128(kimmy_core::decimal::parse("2.5").unwrap()) },
+            doc! { "n": 1 },
+        ];
+        let out = engine.write_documents(&coll, docs, MERGE).unwrap();
+        assert_eq!(out.counts.inserted, 7);
+    }
 }

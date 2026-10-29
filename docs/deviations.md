@@ -103,7 +103,11 @@ from other systems' version of the stage:
   and `let` are `400`s** naming what is refused. The two `fail` modes are checks that
   cannot hold across members, which can each accept the write the other would have
   failed on; the pipeline form and `let` are not built.
-- **`$out` writes only a new or empty collection**, `400` for one that holds documents.
+- **`$out` writes only a new or empty collection**, `400` for one that holds documents,
+  and no `_id` already stored, as this member holds the target when the `$out` runs.
+  Across members the target can already hold documents, and an `_id` written
+  elsewhere meets the output by last-writer-wins, as any two inserts of one `_id` do
+  (ADR-006).
   Elsewhere `$out` replaces the target atomically. A replace that swaps a collection
   for another in one step has no equivalent here (collections are not renamed, and a
   member that is behind would serve the old one), so it is not offered: drop the
@@ -2874,7 +2878,7 @@ here so that the absence of a decision is visible as a decision.
 | No certificate expiry metric | A failed reload is counted, but a certificate nobody ever tried to rotate reports nothing. `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime dependency (pure Rust — not a second crypto stack, so `check-native-deps.sh` would still pass) | not scheduled |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
-| Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` with `multi: true` are **atomic per chunk** of `storage.multi_chunk_docs` documents (default 1,000): each chunk is one transaction, the writer is released between chunks, and a failure in a later chunk leaves the earlier ones committed — so a `multi` can stop partway, at a chunk boundary, and a concurrent reader can see the state between two chunks ([ADR-086](decisions.md)). Nothing spans two requests. The full table is [What each operation guarantees](compatibility.md#what-each-operation-guarantees) | by design |
+| Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` with `multi: true` are **atomic per chunk** of `storage.multi_chunk_docs` documents (default 1,000): each chunk is one transaction, the writer is released between chunks, and a failure in a later chunk leaves the earlier ones committed — so a `multi` can stop partway, at a chunk boundary, and a concurrent reader can see the state between two chunks ([ADR-086](decisions.md)). An `aggregate` ending in `$merge` or `$out` is **atomic per chunk** of `storage.multi_chunk_docs`, not atomic overall; a later failure is `500 partially_applied` ([ADR-255](decisions.md)). Nothing spans two requests. The full table is [What each operation guarantees](compatibility.md#what-each-operation-guarantees) | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |
 | No token refresh | `/v1/auth/login` is the only way to obtain a token and it expires. A long-running client has no option but to re-send credentials, which no driver should ask of an application | **M10 task 4** |
