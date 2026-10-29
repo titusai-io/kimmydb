@@ -762,34 +762,42 @@ update({_id: 7}, {$set: {"items.$[line].shipped": true}},
 The position is worked out per document, from that document, so `multi`
 updates each order's own first match. Which element:
 
-- **The array** is the last one the filter matched on, in the order the
-  filter holds its clauses. `{scores: {$gte: 6}, "items.sku": "gasket"}`
-  positions `items`; written the other way round it positions `scores`. For a
-  path that runs through nested arrays (`orders.lines.sku`) it is the
-  outermost, `orders`.
-- **The element** is the first one that satisfied the condition: the element
-  that satisfied the sub-filter for `$elemMatch`, the first whose `sku`
-  satisfies `items.sku: "gasket"`, the first scalar for `scores: {$gte: 6}`.
-  With several conditions on one array path (`{s: {$gt: 2, $lt: 9}}`, or
-  clauses of an `$and`), it is the first element satisfying the one evaluated
-  last.
-- **`$or`** records from the first branch that held. `$nor`, `$not`, `$ne`,
-  `$nin`, `$exists`, `$size`, `$all` and `$expr` record no position, and
-  neither does an explicit index in the filter (`items.0.sku`).
+- **The array** is the last one the filter matched on, in the order its
+  clauses are written. `{scores: {$gte: 6}, "items.sku": "gasket"}`
+  positions `items`; written the other way round it positions `scores`. A
+  clause holding a `$expr` counts where it is written, though the filter
+  evaluates it last. Inside one field's conditions the order is the one the
+  filter holds them in, which puts a condition holding a `$expr` (only an
+  `$elemMatch` can) after the others. For a path that runs through nested
+  arrays (`orders.lines.sku`) it is the outermost, `orders`.
+- **The element** is the first one that satisfied the condition, tested as the
+  filter itself tests it: one level into the array and no further. An element
+  that is itself an array is one value, so `{tags: "red"}` over
+  `{tags: [["red", "blue"], "red"]}` names index 1, and `tags.$` writes the
+  `"red"`, not the nested array. The element is the one that satisfied the
+  sub-filter for `$elemMatch`, the first whose `sku` satisfies
+  `items.sku: "gasket"`, the first scalar for `scores: {$gte: 6}`. With
+  several conditions on one array path (`{s: {$gt: 2, $lt: 9}}`, or clauses of
+  an `$and`), it is the first element satisfying the one evaluated last.
+- **`$or`** records from the first branch, in the order written, that held.
+  `$nor`, `$not`, `$ne`, `$nin`, `$exists`, `$size`, `$all` and `$expr`
+  record no position, and neither does an explicit index in the filter
+  (`items.0.sku`).
 
 Refused, each a **`400`** that writes nothing:
 
 - a `$` when the filter matched no array element, or went through a different
   array than the path does (`items.$.x` under a filter on `scores`); the
   message names both;
-- more than one `$` in a path, or `$` as the first segment;
+- more than one `$` in a path, `$` as the first segment, or a `$` after a `$[]`
+  or `$[<identifier>]` segment (`items.$[].tags.$`), at parse time;
 - `$rename` of a path with a `$`;
 - any `$` in an upsert that inserts a document, because the filter matched no
   existing one. An upsert whose filter finds a document updates it, with that
   document's position.
 
-`$` may be followed by `$[]` or `$[<identifier>]` (`orders.$.lines.$[].done`)
-and may sit beside paths that use them. The update pipeline form takes none
+`$` may be followed by `$[]` or `$[<identifier>]` (`orders.$.lines.$[].done`),
+but not the other way round, and may sit beside paths that use them. The update pipeline form takes none
 of these. Replacement updates do not read the filter at all. Recorded in
 [Deviations](deviations.md); the decision is
 [ADR-256](decisions.md).
@@ -1165,9 +1173,25 @@ usual: `{"items.$": 1, "n": 1}` keeps `_id`, `n` and the one element, and
 - another entry names the same array, including `$slice` and `$elemMatch`
   documents.
 
-`find_and_modify` positions `returnDocument: "after"` by the document the
-filter matched, since the updated image may no longer satisfy the filter. A
-`$project` stage in an [aggregation](aggregation.md) is not a find projection:
+On `find_and_modify` the element is the one the filter matched in the
+document as it was before the write, at the same index in the document
+returned. `returnDocument: "before"` (the default) and `remove: true` return
+the matched element of the document as it was. `"after"` returns the element
+at that index of the updated document, so `items.$.qty` incremented and
+returned shows the incremented element. An update that leaves the array with
+another length, or no longer an array (`$pull`, `$push`, `$set` of the whole
+array), is a `400`, because the index no longer names the slot that matched.
+The check runs inside the write transaction, so a refused request writes
+nothing: not the update, not an upsert's insert, not a removal. An `upsert`
+with `returnDocument: "after"` is refused for every request, since an upsert
+may insert and an inserted document has no matched element; with
+`"before"` it is accepted.
+
+A sorted `find` judges the documents it returns. A document the sort window
+drops, or that `skip` steps over, cannot make the request a `400`, so the
+answer does not depend on the order the scan met the documents in.
+
+A `$project` stage in an [aggregation](aggregation.md) is not a find projection:
 there `items.$` is still a path to a field called `$`, which an element rarely
 has, so it answers `items: [{}, …]` over an array of documents.
 

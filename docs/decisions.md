@@ -5617,6 +5617,10 @@ setting, one more series.
 
 ## ADR-104 — Array elements are addressed by filtered identifiers, not by query position
 
+> **Amended by [ADR-256](#adr-256--the-positional--in-update-paths-and-find-projections).** MongoDB's `$`, "the element the query matched", is no longer refused: it
+> addresses the first element of the array the filter matched on, in an update path and in a find projection.
+> `$[]` and `$[<identifier>]` are as described here.
+
 **Decision.** An update path may contain `$[]` and `$[<identifier>]`
 segments, with the identifiers defined by an `arrayFilters` field on the
 `update` and `find_and_modify` requests — camel-cased like `returnDocument`,
@@ -24834,6 +24838,9 @@ the pull request).
 
 ## ADR-217 — The refusals and differences ruled to stay are recorded as a set
 
+> **Amended by [ADR-256](#adr-256--the-positional--in-update-paths-and-find-projections).** The first of the five refusals, the `$` positional operator in an update path, is no longer
+> one: it is built, and the other four stand.
+
 **Status:** accepted, decided 2026-09-29 and recorded for the next
 `0.MINOR`. Records ten rulings that leave behaviour as it is, with the one
 message change that came with them. Supplements
@@ -30685,13 +30692,13 @@ decimal `_id` and a decimal-bound definition.
 
 **Decision.**
 
-1. **The matcher is not changed.** `filter::matches_at` answers the matcher's yes or no and, for a document that matched, the array and element that satisfied the filter. The boolean comes from `matches` first, and the position from a second walk that shares the comparison primitive (`condition_matches`), so the walk cannot change the boolean. A table test runs 26 filters over 8 documents through both functions and asserts identical results, errors included; the existing property and golden suites stay green.
-2. **Which array.** The last array the filter matched on, in the order the filter holds its clauses, and the outermost array on a nested path (`orders.lines.sku` names `orders`).
-3. **Which element.** The first element that satisfies the last-evaluated condition on that path. `$or` records from its first matching branch. `$nor`, `$not`, `$ne`, `$nin`, `$exists`, `$size`, `$all`, `$expr` and an explicit index such as `items.0.sku` record nothing.
-4. **Update paths.** `$` is resolved per document by `update::apply_matched`, in the same expansion that handles `$[]` and `$[<id>]`, on every operator that takes a path except `$rename`, which is refused. It is a `400` when the filter matched no array, when it matched a different array than the path names (the message names both), when a path holds two `$` or begins with one, and when an upsert inserts (there is no matched element); an upsert that finds a document updates it with that document's position. `orders.$.lines.$[].done` is accepted.
-5. **Find projections.** `{"items.$": 1}` in `find` and in `findAndModify` returns the document with the array cut to the matched element (find-and-modify positions by the document the filter matched). It must be an inclusion, last in its path, alone on its array (no `$slice` or `$elemMatch` on it, no exclusion beside it) and backed by a filter; a request whose document has no element to name is a `400`. `$project` and `$addFields` are unchanged and still read `$` as a field name.
+1. **The matcher is not changed.** `filter::matches_at` answers the matcher's yes or no and, for a document that matched, the array and element that satisfied the filter. The boolean comes from `matches` first, and the position from a second walk that shares the comparison primitive (`condition_matches`), so the walk cannot change the boolean. The element it names is the one the matcher tested: a differential test over generated documents checks that the recorded index is the first element for which the matcher, given the array with that element alone, answers yes; the existing property and golden suites stay green.
+2. **Which array.** The last array the filter matched on, in the order its clauses are written (the parser evaluates a clause holding a `$expr` last, and records where it was written), and the outermost array on a nested path (`orders.lines.sku` names `orders`).
+3. **Which element.** The first element that satisfies the last-evaluated condition on that path, tested one level into the array as the matcher tests it (an element that is itself an array is one value). `$or` records from its first matching branch in written order. `$nor`, `$not`, `$ne`, `$nin`, `$exists`, `$size`, `$all`, `$expr` and an explicit index such as `items.0.sku` record nothing.
+4. **Update paths.** `$` is resolved per document by `update::apply_matched`, in the same expansion that handles `$[]` and `$[<id>]`, on every operator that takes a path except `$rename`, which is refused. It is a `400` when the filter matched no array, when it matched a different array than the path names (the message names both), when a path holds two `$`, begins with one, or has one after a `$[]` or `$[<id>]` segment, and when an upsert inserts (there is no matched element); an upsert that finds a document updates it with that document's position. `orders.$.lines.$[].done` is accepted.
+5. **Find projections.** `{"items.$": 1}` in `find` and in `findAndModify` returns the document with the array cut to the matched element. `findAndModify` takes the element from the document the filter matched and cuts the returned document at the same index; `returnDocument: "after"` is a `400` when the update changes the array's length or makes it not an array, and so is an `upsert` with it, and the check runs inside the write transaction so a refusal writes nothing. It must be an inclusion, last in its path, alone on its array (no `$slice` or `$elemMatch` on it, no exclusion beside it) and backed by a filter; a request whose returned document has no element to name is a `400`, and a sorted `find` judges only the documents on the page it returns. `$project` and `$addFields` are unchanged and still read `$` as a field name.
 6. **Replication is unaffected.** The update engine returns the full resulting document and the oplog entry is built from it; the operator document is never replicated, so no member re-evaluates a `$`.
 
 **Alternatives rejected.** Rewriting every comparison to return a position and deriving yes or no from it: it touches the most-used code path for no gain, and the unchanged boolean could not be proved. Keeping the refusal: `$[line]` with `arrayFilters` marks every match where `$` marks the first, so it is not a substitute. Answering an empty array for a projection with no matched element: it hides a mismatch between the filter and the path.
 
-**Tests.** `positional_tests` in `kimmy-query` pin each rule above, every refusal and the boolean equivalence; `kimmy-api` tests run updates, `updateMany` with per-document positions, find and find-and-modify through the routes, and that `$project` is unchanged. Eighteen hand mutants were each killed.
+**Tests.** `positional_tests` in `kimmy-query` pin each rule above, every refusal, and the differential check of the recorded element; `kimmy-api` tests run updates, `updateMany` with per-document positions, find and find-and-modify through the routes, and that `$project` is unchanged. Hand mutants of each rule were each killed.
