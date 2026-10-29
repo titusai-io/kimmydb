@@ -4026,6 +4026,32 @@ async fn a_sorted_find_refuses_a_positional_projection_for_the_page_only() {
     }
     assert_eq!(pages[0], json!([{"sku": "g"}]));
     assert_eq!(pages[0], pages[1]);
+
+/// A document the offset steps over cannot refuse the page either: the one
+/// with no element sorts first and is skipped.
+#[tokio::test]
+async fn a_skipped_document_cannot_refuse_a_sorted_find() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for d in [
+        json!({"_id": 1, "n": 1, "vip": true, "items": [{"sku": "x"}]}),
+        json!({"_id": 2, "n": 2, "items": [{"sku": "g"}]}),
+    ] {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), d).await;
+    }
+    let find = |extra: Value| {
+        let (server, token) = (&server, &token);
+        let mut body = json!({"filter": {"$or": [{"items.sku": "g"}, {"vip": true}]},
+                              "sort": {"n": 1}, "projection": {"items.$": 1}});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        async move { server.post("/v1/db/shop/coll/c/find", Some(token), body).await }
+    };
+    let res = find(json!({"skip": 1, "limit": 1})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 2, "items": [{"sku": "g"}]}]));
+    let res = find(json!({"limit": 1})).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
 }
 
 /// `$bit` over HTTP: the three operations, a missing field created from zero,
