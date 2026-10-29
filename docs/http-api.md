@@ -62,7 +62,7 @@ has been incomplete before.
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/find_and_modify` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | `write` |
-| `POST` | `/v1/db/{db}/coll/{coll}/aggregate` | `read` (and `search`, implied by it, for a `$vectorSearch` stage) — see [Aggregation](aggregation.md) |
+| `POST` | `/v1/db/{db}/coll/{coll}/aggregate` | `read` (and `search`, implied by it, for a `$vectorSearch` stage; and `write` on the target, with `ddl` when it is created, for a `$merge` or `$out` last stage) — see [Aggregation](aggregation.md) |
 | `GET` | `/v1/db/{db}/coll/{coll}/describe` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/vector` | `ddl` — configure embedding ([Vectors](vectors.md)) |
 | `GET` `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}/vectors` | `read` / `write` / `write` |
@@ -454,7 +454,8 @@ implemented — are in [Query language](query-language.md#positional-updates).
 #### A request that was partly applied
 
 A request that commits in more than one transaction — `update` or `delete`
-with `multi: true`, and `DELETE /v1/db/{db}` — and fails after its first commit
+with `multi: true`, an `aggregate` ending in `$merge` or `$out`, and
+`DELETE /v1/db/{db}` — and fails after its first commit
 is answered `500 partially_applied`, `retry: verify` ([ADR-192](decisions.md)).
 What landed stands, is published and replicates. The envelope carries it, as
 fields beside the usual three:
@@ -469,7 +470,9 @@ fields beside the usual three:
   committed chunks, and chunks in which nothing changed, which commit nothing
   (`matched` includes their documents, `modified` and `commits` do not).
   **`in_doubt`** is the number of documents written in a chunk whose commit's
-  outcome is unknown: they may be there. A database drop
+  outcome is unknown: they may be there. A `$merge` or `$out` answers
+  `{"matched", "inserted", "replaced", "merged", "kept", "discarded", "commits",
+  "in_doubt"}`, by the decision taken for each document. A database drop
   answers `{"dropped": [names…], "in_doubt": name-or-null}`. Its first commit is
   the database's tombstone (ADR-229), so `dropped` can be **empty** while a commit
   landed: the drop is recorded and replicates, and what this member still holds
@@ -850,6 +853,14 @@ not execute the read it describes. `source` carries the same `strategy`, `index`
 non-boolean `explain`, `null` included, is `422`, and so is any other field the
 route does not define; `?explain=true` is `400`, as on any route with no query
 string. It needs the access a run needs, `$lookup` collections included.
+
+**An `aggregate` whose last stage is `$merge` or `$out` writes**
+([ADR-255](decisions.md), [Aggregation](aggregation.md#merge)). It answers
+`{"documents": [], "count": 0, "merge": {"matched", "inserted", "replaced", "merged",
+"kept", "discarded", "commits"}}` (`"out": {"inserted", "commits"}` for `$out`), in
+chunks of `storage.multi_chunk_docs` and **not atomically**: a failure in a later chunk
+is `500 partially_applied` with the counts that landed, and the earlier chunks stand.
+`explain: true` on it plans and writes nothing.
 
 **On `update` and `delete`, `explain: true` plans the write; it does not
 perform it** ([ADR-131](decisions.md)). It answers with the same

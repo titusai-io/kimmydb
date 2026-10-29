@@ -789,6 +789,23 @@ impl ApiError {
                     "in_doubt": in_doubt,
                 }),
             ),
+            kimmy_storage::Applied::Write { counts, commits, in_doubt } => (
+                format!(
+                    "{} documents were inserted and {} matched a stored one, written in {commits} \
+                     commits, and {in_doubt} more may have been",
+                    counts.inserted, counts.matched
+                ),
+                json!({
+                    "matched": counts.matched,
+                    "inserted": counts.inserted,
+                    "replaced": counts.replaced,
+                    "merged": counts.merged,
+                    "kept": counts.kept,
+                    "discarded": counts.discarded,
+                    "commits": commits,
+                    "in_doubt": in_doubt,
+                }),
+            ),
             kimmy_storage::Applied::DropDatabase { dropped, in_doubt } => (
                 format!(
                     "{} collections were dropped{}",

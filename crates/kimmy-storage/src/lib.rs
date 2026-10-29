@@ -39,6 +39,7 @@ mod late_drop;
 mod live_count;
 pub mod live_digest;
 mod live_walk;
+pub mod merge;
 pub mod meta;
 pub mod migrate;
 pub mod modify;
@@ -160,6 +161,7 @@ pub use hold_meter::{
     ServeSnapshot, ServeWalk, WalkPath,
 };
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
+pub use merge::{SinkCounts, SinkMode, SinkOutcome, WhenMatched};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
 pub use open_progress::{
