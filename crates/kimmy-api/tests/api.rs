@@ -17221,8 +17221,14 @@ async fn a_merge_needs_write_on_the_target_and_ddl_to_create_it() {
     };
     for (user, extra) in [
         ("reader", vec![]),
-        ("writer", vec![json!({"db": "shop", "collection": "t", "actions": ["write"]})]),
-        ("maker", vec![json!({"db": "shop", "collection": "n*", "actions": ["write", "ddl"]})]),
+        (
+            "writer",
+            vec![
+                json!({"db": "shop", "collection": "t", "actions": ["write"]}),
+                json!({"db": "shop", "collection": "novel", "actions": ["write"]}),
+            ],
+        ),
+        ("maker", vec![json!({"db": "shop", "collection": "novel", "actions": ["write", "ddl"]})]),
         ("readsink", vec![json!({"db": "shop", "collection": "t", "actions": ["read"]})]),
     ] {
         let made = server
