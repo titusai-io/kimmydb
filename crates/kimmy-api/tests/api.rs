@@ -3770,6 +3770,9 @@ async fn the_positional_dollar_updates_the_element_the_filter_matched() {
     .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
     assert!(res.body["message"].as_str().unwrap_or_default().contains("upsert"), "{:?}", res.body);
+    // Labelled as an update error, as the other `$` refusals are.
+    let msg = res.body["message"].as_str().unwrap_or_default();
+    assert!(msg.starts_with("invalid update:"), "{msg}");
     assert_eq!(server.get("/v1/db/shop/coll/c/docs/99", Some(&token)).await.status, 404);
 }
 

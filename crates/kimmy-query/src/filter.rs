@@ -288,7 +288,7 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
     Ok(match op {
         "and" => Filter::And(Branches::cheap_first(branches(value)?)),
         "or" => Filter::Or(Branches::cheap_first(branches(value)?)),
-        "nor" => Filter::Nor(branches(value)?),
+        "nor" => Filter::Nor(cheap_first(branches(value)?, filter_has_expr)),
         // The expression parser reports its own errors — an unknown operator,
         // a wrong arity — in the same error type as the rest of this module,
         // so a caller sees one kind of `400` whichever half of the filter was
