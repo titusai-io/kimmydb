@@ -258,6 +258,9 @@ impl AppState {
             // Whether /violations reads its table, and what it has cost to make
             // it so (ADR-200).
             violations: self.engine.violations_snapshot(),
+            validation_warnings: self.engine.validation_totals().0,
+            validation_refusals: self.engine.validation_totals().1,
+            validators_unparseable: self.engine.validators_unparseable(),
             // Entries held as state that a window released (ADR-169's
             // addendum), counted by the engine on commit so a pulled and a
             // pushed window land on the same series.

@@ -22,6 +22,7 @@ pub mod oplog;
 pub mod partial;
 pub mod path;
 pub mod record;
+pub mod validator;
 pub mod vector_meta;
 pub mod vector_record;
 pub mod version;
@@ -30,7 +31,8 @@ pub use cmp::{canonical_cmp, holds_decimal128};
 pub use conflict::UniqueViolationDetail;
 pub use cursor::Cursor;
 pub use ddl::{
-    CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, VectorSet, database_drop_id,
+    CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, ValidatorSet, VectorSet,
+    database_drop_id,
 };
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
@@ -39,6 +41,7 @@ pub use index_meta::{Enforcement, IndexField, IndexMeta};
 pub use oplog::{Issued, MAX_TOKEN_ORIGINS, OpKind, OplogEntry, ResumeToken};
 pub use partial::{PartialFilter, PartialOp};
 pub use record::DocRecord;
+pub use validator::{ValidationAction, ValidationLevel, ValidatorSpec};
 pub use vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
 pub use vector_record::{ChunkSource, Unstamped, VectorRecord, similarity};
 pub use version::VersionVector;

@@ -917,6 +917,27 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.validation.warnings",
+            "{write}",
+            "Writes accepted although they fail their collection's validator, because its validationAction is warn.",
+            validation_warnings
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.validation.refusals",
+            "{write}",
+            "Writes refused because they fail their collection's validator and its validationAction is error.",
+            validation_refusals
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.validator.unparseable",
+            "{validator}",
+            "Stored validators this build could not parse; such a collection is not validated.",
+            validators_unparseable
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.sync.serve_walk_path.serve.keys",
             "{window}",
             "Windows served by a peer pull that were read by the `keys` path.",

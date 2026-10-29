@@ -2054,6 +2054,7 @@ async fn every_documented_operation_refuses_a_query_parameter_it_does_not_read()
             "{id}" => json!({ "note": "y" }),
             "indexes" => json!({ "fields": [{ "path": "other" }] }),
             "vector" => json!({ "fields": ["note"], "provider": { "kind": "byo" }, "dim": 3 }),
+            "validator" => json!({ "validator": { "$jsonSchema": {} } }),
             "vectors" => json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "x" }]),
             "vector_search" => json!({ "vector": [1.0, 0.0, 0.0], "k": 1 }),
             "hybrid_search" => json!({ "query": "x", "vector": [1.0, 0.0, 0.0], "k": 1 }),
@@ -11703,6 +11704,9 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_violations_backfill_rows_total",
         "kimmy_violations_walk_path_total",
         "kimmy_violations_walk_path_total",
+        "kimmy_validation_warnings_total",
+        "kimmy_validation_refusals_total",
+        "kimmy_validator_unparseable_total",
     ])
     .chain(std::iter::repeat_n("kimmy_ownership_peers", kimmy_cluster::PeerState::ALL.len()))
     .chain(std::iter::repeat_n(
@@ -18251,4 +18255,479 @@ async fn explain_of_a_write_stage_needs_the_grants_the_run_does() {
         )
         .await;
     assert_eq!(res.status, 403, "{:?}", res.body);
+}
+
+// ---------------------------------------------------------------------------
+// The collection validator (ADR-257)
+// ---------------------------------------------------------------------------
+
+fn qty_schema() -> Value {
+    json!({ "$jsonSchema": {
+        "bsonType": "object",
+        "required": ["qty"],
+        "properties": { "qty": { "bsonType": "number", "minimum": 0 } },
+    }})
+}
+
+/// `shop.items` holding `{_id: 1, qty: 5}`, validated by [`qty_schema`] with the given
+/// policies.
+async fn validated_items(server: &Server, token: &str, action: &str, level: &str) {
+    let made = server
+        .post(
+            "/v1/db/shop/collections",
+            Some(token),
+            json!({ "name": "items", "validator": qty_schema(),
+                    "validationAction": action, "validationLevel": level }),
+        )
+        .await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+    let first = server
+        .post("/v1/db/shop/coll/items/docs", Some(token), json!({ "_id": 1, "qty": 5 }))
+        .await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+}
+
+fn refused(res: &Res, what: &str) {
+    assert_eq!(res.status, 422, "{what}: {:?}", res.body);
+    assert_eq!(res.body["error"], "validation_failed", "{what}: {:?}", res.body);
+    assert_eq!(res.body["retry"], "no", "{what}: {:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("qty"), "{what}: the failing path is named: {message}");
+}
+
+async fn count_of(server: &Server, token: &str) -> u64 {
+    let res = server.post("/v1/db/shop/coll/items/count", Some(token), json!({})).await;
+    res.body["count"].as_u64().expect("a count")
+}
+
+#[tokio::test]
+async fn a_validator_set_at_creation_is_described_and_refuses_what_it_does_not_accept() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    validated_items(&server, &token, "error", "strict").await;
+
+    let described = server.get("/v1/db/shop/coll/items/describe", Some(&token)).await;
+    assert_eq!(described.status, 200, "{:?}", described.body);
+    assert_eq!(described.body["validator"], qty_schema());
+    assert_eq!(described.body["validationAction"], "error");
+    assert_eq!(described.body["validationLevel"], "strict");
+
+    // A collection with none says so.
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "plain" })).await;
+    let plain = server.get("/v1/db/shop/coll/plain/describe", Some(&token)).await;
+    assert_eq!(plain.body["validator"], Value::Null, "{:?}", plain.body);
+    assert!(plain.body.get("validationAction").is_none(), "{:?}", plain.body);
+}
+
+#[tokio::test]
+async fn a_validator_is_refused_for_what_is_wrong_with_it_and_creates_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let create = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/collections", Some(token), body).await }
+    };
+
+    // Only `$jsonSchema` is a validator.
+    let filter = create(json!({ "name": "a", "validator": { "qty": { "$gte": 0 } } })).await;
+    assert_eq!(filter.status, 400, "{:?}", filter.body);
+    assert!(
+        filter.body["message"].as_str().unwrap().contains("only `$jsonSchema` is supported"),
+        "{:?}",
+        filter.body
+    );
+    let both = create(json!({ "name": "a", "validator": { "$jsonSchema": {}, "qty": 1 } })).await;
+    assert_eq!(both.status, 400, "{:?}", both.body);
+    // A schema this build cannot read is refused with the parser's message.
+    let bad =
+        create(json!({ "name": "a", "validator": { "$jsonSchema": { "$ref": "#/x" } } })).await;
+    assert_eq!(bad.status, 400, "{:?}", bad.body);
+    assert!(bad.body["message"].as_str().unwrap().contains("$ref"), "{:?}", bad.body);
+    // Unknown policies, and a policy with nothing to apply to.
+    let action = create(json!({ "name": "a", "validator": qty_schema(), "validationAction": "x" }));
+    assert_eq!(action.await.status, 400);
+    let level = create(json!({ "name": "a", "validator": qty_schema(), "validationLevel": "x" }));
+    assert_eq!(level.await.status, 400);
+    let orphan = create(json!({ "name": "a", "validationAction": "warn" })).await;
+    assert_eq!(orphan.status, 400, "{:?}", orphan.body);
+    // Not an object at all.
+    assert_eq!(create(json!({ "name": "a", "validator": 3 })).await.status, 400);
+
+    let gone = server.get("/v1/db/shop/coll/a/describe", Some(&token)).await;
+    assert_eq!(gone.status, 404, "none of them created the collection: {:?}", gone.body);
+}
+
+#[tokio::test]
+async fn put_and_delete_replace_and_remove_the_validator() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "items" })).await;
+    let url = "/v1/db/shop/coll/items/validator";
+
+    let set = server
+        .put(url, Some(&token), json!({ "validator": qty_schema(), "validationAction": "warn" }))
+        .await;
+    assert_eq!(set.status, 200, "{:?}", set.body);
+    assert_eq!(set.body["validationAction"], "warn");
+    assert_eq!(set.body["validationLevel"], "strict", "unnamed is the default, not the old one");
+
+    // Setting replaces all three.
+    let replaced = server.put(url, Some(&token), json!({ "validator": qty_schema() })).await;
+    assert_eq!(replaced.body["validationAction"], "error", "{:?}", replaced.body);
+
+    // A refusal leaves what was there.
+    let bad = server
+        .put(url, Some(&token), json!({ "validator": { "$jsonSchema": { "$ref": "x" } } }))
+        .await;
+    assert_eq!(bad.status, 400, "{:?}", bad.body);
+    let missing = server.put(url, Some(&token), json!({})).await;
+    assert_eq!(missing.status, 400, "{:?}", missing.body);
+    let wrong = server.put(url, Some(&token), json!({ "validator": { "qty": 1 } })).await;
+    assert_eq!(wrong.status, 400, "{:?}", wrong.body);
+    let described = server.get("/v1/db/shop/coll/items/describe", Some(&token)).await;
+    assert_eq!(described.body["validator"], qty_schema());
+
+    let off = server.delete(url, Some(&token)).await;
+    assert_eq!(off.body, json!({ "removed": true }));
+    let again = server.delete(url, Some(&token)).await;
+    assert_eq!(again.body, json!({ "removed": false }), "a removal sent again finds nothing");
+    let described = server.get("/v1/db/shop/coll/items/describe", Some(&token)).await;
+    assert_eq!(described.body["validator"], Value::Null);
+
+    // A collection that is not there is a 404 on both.
+    let gone = server
+        .put(
+            "/v1/db/shop/coll/nope/validator",
+            Some(&token),
+            json!({
+        "validator": qty_schema() }),
+        )
+        .await;
+    assert_eq!(gone.status, 404, "{:?}", gone.body);
+    assert_eq!(server.delete("/v1/db/shop/coll/nope/validator", Some(&token)).await.status, 404);
+}
+
+#[tokio::test]
+async fn the_validator_routes_need_ddl_and_the_report_needs_read() {
+    let server = Server::start().await;
+    let root = server.root().await;
+    validated_items(&server, &root, "error", "strict").await;
+    let user = |name: &str, actions: Value| {
+        let (server, root) = (&server, &root);
+        let name = name.to_string();
+        async move {
+            let made = server
+                .post(
+                    "/v1/users",
+                    Some(root),
+                    json!({ "user": name, "password": format!("{name}-password"), "grants": [
+                        { "db": "shop", "collection": "items", "actions": actions }
+                    ]}),
+                )
+                .await;
+            assert_eq!(made.status, 201, "{:?}", made.body);
+            server.login(&name, &format!("{name}-password")).await
+        }
+    };
+    let writer = user("writer", json!(["read", "write"])).await;
+    let reader = user("reader", json!(["read"])).await;
+    let nobody = user("nobody", json!(["watch"])).await;
+    let ddl = user("shaper", json!(["ddl"])).await;
+    let url = "/v1/db/shop/coll/items/validator";
+
+    for token in [&writer, &reader, &nobody] {
+        let put = server.put(url, Some(token), json!({ "validator": qty_schema() })).await;
+        assert_eq!(put.status, 403, "{:?}", put.body);
+        assert_eq!(server.delete(url, Some(token)).await.status, 403);
+    }
+    let put = server.put(url, Some(&ddl), json!({ "validator": qty_schema() })).await;
+    assert_eq!(put.status, 200, "{:?}", put.body);
+    assert_eq!(server.delete(url, Some(&ddl)).await.status, 200);
+
+    let report = format!("{url}/violations");
+    assert_eq!(server.get(&report, Some(&reader)).await.status, 200);
+    assert_eq!(server.get(&report, Some(&nobody)).await.status, 403);
+    assert_eq!(server.get(&report, Some(&ddl)).await.status, 403);
+    assert_eq!(server.get(&report, None).await.status, 401);
+}
+
+#[tokio::test]
+async fn every_write_route_refuses_a_document_the_validator_does_not_accept() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    validated_items(&server, &token, "error", "strict").await;
+    let docs = "/v1/db/shop/coll/items/docs";
+
+    refused(&server.post(docs, Some(&token), json!({ "_id": 2, "qty": -1 })).await, "insert");
+    refused(&server.post(docs, Some(&token), json!({ "_id": 2, "note": "x" })).await, "no qty");
+    // Bulk: the whole batch, with the position named, and nothing stored.
+    let bulk = server
+        .post(
+            "/v1/db/shop/coll/items/bulk",
+            Some(&token),
+            json!([{ "_id": 3, "qty": 1 }, { "_id": 4, "qty": "x" }]),
+        )
+        .await;
+    refused(&bulk, "bulk");
+    assert!(bulk.body["message"].as_str().unwrap().contains("index 1"), "{:?}", bulk.body);
+    // Update, one and many, every operator.
+    for update in [
+        json!({ "$set": { "qty": -1 } }),
+        json!({ "$inc": { "qty": -9 } }),
+        json!({ "$unset": { "qty": "" } }),
+        json!({ "$mul": { "qty": -1 } }),
+    ] {
+        for multi in [false, true] {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/items/update",
+                    Some(&token),
+                    json!({ "filter": {}, "update": update, "multi": multi }),
+                )
+                .await;
+            refused(&res, &format!("update {update} multi {multi}"));
+        }
+    }
+    // PUT by id, replacing and upserting.
+    refused(&server.put(&format!("{docs}/1"), Some(&token), json!({ "qty": -1 })).await, "replace");
+    let upsert =
+        server.put(&format!("{docs}/9?upsert=true"), Some(&token), json!({ "qty": -1 })).await;
+    refused(&upsert, "put upsert");
+    // findAndModify: the update image, and the upsert's insert.
+    let fam = server
+        .post(
+            "/v1/db/shop/coll/items/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "$set": { "qty": -1 } } }),
+        )
+        .await;
+    refused(&fam, "find_and_modify");
+    let fam = server
+        .post(
+            "/v1/db/shop/coll/items/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 77 }, "update": { "$set": { "qty": -1 } }, "upsert": true }),
+        )
+        .await;
+    refused(&fam, "find_and_modify upsert");
+
+    let kept = server.get(&format!("{docs}/1"), Some(&token)).await;
+    assert_eq!(kept.body["qty"], 5, "{:?}", kept.body);
+    assert_eq!(count_of(&server, &token).await, 1, "nothing else was stored");
+
+    // And what conforms goes through every one of them.
+    let ok = server.post(docs, Some(&token), json!({ "_id": 2, "qty": 1 })).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    let ok = server
+        .post(
+            "/v1/db/shop/coll/items/update",
+            Some(&token),
+            json!({ "filter": {}, "update": { "$inc": { "qty": 1 } }, "multi": true }),
+        )
+        .await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    // Counted, with no collection named.
+    let metrics = metrics_text(&server).await;
+    let refusals: u64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("kimmy_validation_refusals_total "))
+        .and_then(|v| v.parse().ok())
+        .expect("the series");
+    assert!(refusals >= 14, "{refusals}");
+    assert!(!metrics.contains("items"), "{metrics}");
+}
+
+#[tokio::test]
+async fn warn_accepts_a_failing_write_and_counts_it() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    validated_items(&server, &token, "warn", "strict").await;
+    let docs = "/v1/db/shop/coll/items/docs";
+    let warnings = |text: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix("kimmy_validation_warnings_total "))
+            .and_then(|v| v.parse().ok())
+            .expect("the series")
+    };
+    let before = warnings(&metrics_text(&server).await);
+
+    let one = server.post(docs, Some(&token), json!({ "_id": 2, "qty": -1 })).await;
+    assert_eq!(one.status, 200, "{:?}", one.body);
+    let bulk = server
+        .post(
+            "/v1/db/shop/coll/items/bulk",
+            Some(&token),
+            json!([{ "_id": 3 }, { "_id": 4, "qty": 1 }]),
+        )
+        .await;
+    assert_eq!(bulk.status, 200, "{:?}", bulk.body);
+    let update = server
+        .post(
+            "/v1/db/shop/coll/items/update",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "$set": { "qty": -5 } } }),
+        )
+        .await;
+    assert_eq!(update.status, 200, "{:?}", update.body);
+    let put = server.put(&format!("{docs}/1"), Some(&token), json!({ "qty": -6 })).await;
+    assert_eq!(put.status, 200, "{:?}", put.body);
+
+    assert_eq!(count_of(&server, &token).await, 4, "every one was stored");
+    let stored = server.get(&format!("{docs}/1"), Some(&token)).await;
+    assert_eq!(stored.body["qty"], -6);
+    assert_eq!(warnings(&metrics_text(&server).await) - before, 4, "and each counted once");
+    let refusals = metrics_text(&server).await;
+    assert!(refusals.contains("kimmy_validation_refusals_total 0"), "{refusals}");
+}
+
+#[tokio::test]
+async fn moderate_leaves_a_document_that_did_not_conform_free_to_change() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    validated_items(&server, &token, "error", "strict").await;
+    let url = "/v1/db/shop/coll/items/validator";
+    // A document stored while no validator was in force.
+    server.delete(url, Some(&token)).await;
+    server.post("/v1/db/shop/coll/items/docs", Some(&token), json!({ "_id": 2, "qty": -1 })).await;
+    server
+        .put(url, Some(&token), json!({ "validator": qty_schema(), "validationLevel": "moderate" }))
+        .await;
+    let docs = "/v1/db/shop/coll/items/docs";
+
+    // Inserts and updates of a conforming document are still checked.
+    refused(&server.post(docs, Some(&token), json!({ "_id": 3, "qty": -1 })).await, "insert");
+    let set = |id: i64, qty: i64| {
+        let token = token.clone();
+        let server = &server;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/items/update",
+                    Some(&token),
+                    json!({ "filter": { "_id": id }, "update": { "$set": { "qty": qty } } }),
+                )
+                .await
+        }
+    };
+    refused(&set(1, -1).await, "update of a conforming document");
+    // The one that did not conform changes freely, to anything.
+    assert_eq!(set(2, -2).await.status, 200);
+    let put = server.put(&format!("{docs}/2"), Some(&token), json!({ "qty": -3, "note": 1 })).await;
+    assert_eq!(put.status, 200, "{:?}", put.body);
+
+    // Strict refuses the same.
+    server.put(url, Some(&token), json!({ "validator": qty_schema() })).await;
+    refused(&set(2, -4).await, "strict");
+}
+
+#[tokio::test]
+async fn a_merge_or_out_into_a_validated_collection_is_refused_before_it_writes_anything() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    validated_items(&server, &token, "error", "strict").await;
+    sink_seed(
+        &server,
+        &token,
+        "src",
+        vec![
+            json!({ "_id": 10, "qty": 1 }),
+            json!({ "_id": 11, "qty": 2 }),
+            json!({ "_id": 12, "qty": -3 }),
+        ],
+    )
+    .await;
+    // $merge: unmatched documents are inserted as they are.
+    let merge = sink_run(&server, &token, "src", json!([{ "$merge": { "into": "items" } }])).await;
+    refused(&merge, "$merge");
+    assert_eq!(count_of(&server, &token).await, 1, "no chunk was written");
+
+    // The same with a `whenMatched: replace` that would also insert.
+    let replace = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([{ "$merge": { "into": "items", "whenMatched": "replace" } }]),
+    )
+    .await;
+    refused(&replace, "$merge replace");
+
+    // $out into a new collection that has no validator is not held to one, and into a
+    // validated empty one it is.
+    server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "target", "validator": qty_schema() }),
+        )
+        .await;
+    let out = sink_run(&server, &token, "src", json!([{ "$out": "target" }])).await;
+    refused(&out, "$out");
+    let empty = server.post("/v1/db/shop/coll/target/count", Some(&token), json!({})).await;
+    assert_eq!(empty.body["count"], 0);
+
+    // A merge whose result is what is checked: an incoming document with no `qty`
+    // merged over a stored one that has it conforms.
+    let merged = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([{ "$match": { "_id": 10 } }, { "$project": { "_id": 1 } },
+               { "$addFields": { "_id": 1, "note": "n" } },
+               { "$merge": { "into": "items", "whenMatched": "merge", "whenNotMatched": "discard" } }]),
+    )
+    .await;
+    assert_eq!(merged.status, 200, "{:?}", merged.body);
+    let stored = server.get("/v1/db/shop/coll/items/docs/1", Some(&token)).await;
+    assert_eq!(stored.body["note"], "n", "{:?}", stored.body);
+    assert_eq!(stored.body["qty"], 5);
+}
+
+#[tokio::test]
+async fn the_report_lists_the_documents_that_fail_the_validator_a_page_at_a_time() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    validated_items(&server, &token, "error", "strict").await;
+    let report = "/v1/db/shop/coll/items/validator/violations";
+
+    let clean = server.get(report, Some(&token)).await;
+    assert_eq!(clean.status, 200, "{:?}", clean.body);
+    assert_eq!(clean.body["violations"], json!([]));
+    assert_eq!(clean.body["validator"], true);
+
+    // Documents stored while no validator was in force.
+    let url = "/v1/db/shop/coll/items/validator";
+    server.delete(url, Some(&token)).await;
+    for id in 2..=7 {
+        let doc = if id % 2 == 0 {
+            json!({ "_id": id, "qty": -1 })
+        } else {
+            json!({ "_id": id, "qty": 1 })
+        };
+        server.post("/v1/db/shop/coll/items/docs", Some(&token), doc).await;
+    }
+    let none = server.get(report, Some(&token)).await;
+    assert_eq!(none.body["violations"], json!([]), "no validator, no violations");
+    assert_eq!(none.body["validator"], false);
+    server.put(url, Some(&token), json!({ "validator": qty_schema() })).await;
+
+    let first = server.get(&format!("{report}?limit=2"), Some(&token)).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    let ids: Vec<&Value> =
+        first.body["violations"].as_array().unwrap().iter().map(|v| &v["_id"]).collect();
+    assert_eq!(ids, [&json!(2), &json!(4)]);
+    assert!(first.body["violations"][0]["reason"].as_str().unwrap().contains("qty"));
+    let cursor = first.body["nextCursor"].as_str().expect("more to scan").to_string();
+    let second = server.get(&format!("{report}?limit=2&cursor={cursor}"), Some(&token)).await;
+    assert_eq!(second.body["violations"].as_array().unwrap().len(), 1, "{:?}", second.body);
+    assert_eq!(second.body["violations"][0]["_id"], 6);
+    assert!(second.body.get("nextCursor").is_none(), "{:?}", second.body);
+
+    let bad = server.get(&format!("{report}?cursor=!!"), Some(&token)).await;
+    assert_eq!(bad.status, 400, "{:?}", bad.body);
+    let unknown = server.get(&format!("{report}?page=2"), Some(&token)).await;
+    assert_eq!(unknown.status, 400, "{:?}", unknown.body);
+    assert_eq!(
+        server.get("/v1/db/shop/coll/nope/validator/violations", Some(&token)).await.status,
+        404
+    );
 }

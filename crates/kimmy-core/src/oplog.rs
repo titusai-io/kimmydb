@@ -60,6 +60,9 @@ pub enum OpKind {
     DropIndex,
     /// Auto-embedding was configured or turned off. Body: [`crate::VectorSet`].
     ConfigureVectors,
+    /// A collection's validator was set, replaced or removed. Body:
+    /// [`crate::ValidatorSet`].
+    ConfigureValidator,
 }
 
 impl OpKind {
@@ -72,6 +75,7 @@ impl OpKind {
                 | Self::CreateIndex
                 | Self::DropIndex
                 | Self::ConfigureVectors
+                | Self::ConfigureValidator
         )
     }
 

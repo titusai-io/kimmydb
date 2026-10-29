@@ -1,0 +1,571 @@
+//! The collection validator (ADR-257): what it holds, which writes it refuses, and
+//! that nothing replicated ever meets it.
+
+use std::cmp::Ordering;
+
+use bson::{Document, doc};
+use kimmy_core::{
+    DocId, Error as CoreError, Hlc, OpKind, Stamp, ValidationAction, ValidationLevel, ValidatorSpec,
+};
+
+use crate::merge::{SinkMode, WhenMatched};
+use crate::{Candidates, Engine, ModifySpec, StorageError};
+
+fn open() -> (Engine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
+}
+
+fn spec(action: ValidationAction, level: ValidationLevel) -> ValidatorSpec {
+    ValidatorSpec {
+        schema: doc! {
+            "bsonType": "object",
+            "required": ["qty"],
+            "properties": { "qty": { "bsonType": "int", "minimum": 0 } },
+        },
+        action,
+        level,
+    }
+}
+
+fn strict_error() -> ValidatorSpec {
+    spec(ValidationAction::Error, ValidationLevel::Strict)
+}
+
+fn invalid(err: StorageError) -> String {
+    match err {
+        StorageError::Core(CoreError::DocumentInvalid { reason }) => reason,
+        other => panic!("not a validation refusal: {other:?}"),
+    }
+}
+
+/// Sets `qty` on every document.
+struct SetQty(i32);
+
+impl ModifySpec for SetQty {
+    fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+        Ok(true)
+    }
+    fn compare(&self, _: &Document, _: &Document) -> Ordering {
+        Ordering::Equal
+    }
+    fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+        let mut next = doc.clone();
+        next.insert("qty", self.0);
+        Ok(Some(next))
+    }
+    fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+        None
+    }
+}
+
+/// Matches nothing and upserts `doc`.
+struct Upsert(Document);
+
+impl ModifySpec for Upsert {
+    fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+        Ok(false)
+    }
+    fn compare(&self, _: &Document, _: &Document) -> Ordering {
+        Ordering::Equal
+    }
+    fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+        Ok(Some(doc.clone()))
+    }
+    fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+        Some(Ok(self.0.clone()))
+    }
+}
+
+/// A collection `c` with the validator set and one conforming document.
+fn collection(e: &Engine, validator: ValidatorSpec) -> crate::CollectionMeta {
+    e.create_collection("shop", "c").unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    e.insert(&c, doc! { "_id": 1i64, "qty": 5 }).unwrap();
+    e.set_validator("shop", "c", Some(validator)).unwrap()
+}
+
+fn qty_of(e: &Engine, c: &crate::CollectionMeta, id: i64) -> Option<Bson> {
+    e.get(c, &DocId::Int64(id)).unwrap().and_then(|d| d.get("qty").cloned())
+}
+
+use bson::Bson;
+
+#[test]
+fn a_validator_is_stamped_and_removing_it_is_a_later_dated_change() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    assert_eq!(e.get_collection("shop", "c").unwrap().validator_changed, None);
+
+    let on = e.set_validator("shop", "c", Some(strict_error())).unwrap();
+    assert_eq!(on.validator, Some(strict_error()));
+    let set_at = on.validator_changed.expect("a change is stamped");
+
+    let off = e.set_validator("shop", "c", None).unwrap();
+    assert_eq!(off.validator, None);
+    assert!(off.validator_changed > Some(set_at), "removing it is a change, later");
+
+    // A removal of what is not there is a change too: stamped and logged.
+    let again = e.set_validator("shop", "c", None).unwrap();
+    assert!(again.validator_changed > off.validator_changed);
+    let kinds: Vec<OpKind> = e
+        .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|entry| entry.kind)
+        .collect();
+    assert_eq!(kinds.iter().filter(|k| **k == OpKind::ConfigureValidator).count(), 3, "{kinds:?}");
+}
+
+#[test]
+fn a_schema_that_does_not_parse_is_refused_when_it_is_set() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    let bad = ValidatorSpec {
+        schema: doc! { "$ref": "#/definitions/x" },
+        action: ValidationAction::Error,
+        level: ValidationLevel::Strict,
+    };
+    let err = e.set_validator("shop", "c", Some(bad)).unwrap_err();
+    assert!(matches!(err, StorageError::Core(CoreError::InvalidQuery(_))), "{err:?}");
+    assert_eq!(e.get_collection("shop", "c").unwrap().validator, None);
+}
+
+#[test]
+fn a_shadow_collection_takes_no_validator() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    let err = e.set_validator("shop", "c.__vectors", Some(strict_error())).unwrap_err();
+    assert!(matches!(err, StorageError::Core(CoreError::InvalidName { .. })), "{err:?}");
+}
+
+#[test]
+fn every_client_write_path_is_refused_under_error() {
+    let (e, _d) = open();
+    let c = collection(&e, strict_error());
+
+    // insert
+    let reason = invalid(e.insert(&c, doc! { "_id": 2i64, "qty": -1 }).unwrap_err());
+    assert!(reason.contains("qty"), "the failing keyword path is named: {reason}");
+    assert!(e.get(&c, &DocId::Int64(2)).unwrap().is_none());
+    // insert_many: whole batch refused, and the position is named
+    let err = e
+        .insert_many(&c, vec![doc! { "_id": 3i64, "qty": 1 }, doc! { "_id": 4i64, "qty": "x" }])
+        .unwrap_err();
+    assert_eq!(err.index, Some(1));
+    invalid(err.source);
+    assert!(e.get(&c, &DocId::Int64(3)).unwrap().is_none(), "the batch is refused whole");
+    // replace, and an upsert that inserts
+    invalid(e.replace(&c, &DocId::Int64(1), doc! { "qty": -5 }, false).unwrap_err());
+    invalid(e.replace(&c, &DocId::Int64(9), doc! { "qty": -5 }, true).unwrap_err());
+    // update (multi)
+    invalid(e.modify_where(&c, &Candidates::Scan, &SetQty(-1), None).unwrap_err());
+    // find-and-modify: the update, and the upsert's insert
+    invalid(e.find_and_modify(&c, &Candidates::Scan, &SetQty(-1)).unwrap_err());
+    let upsert = Upsert(doc! { "_id": 7i64, "qty": -1 });
+    let nothing = Candidates::Keys(vec![]);
+    invalid(e.find_and_modify(&c, &nothing, &upsert).unwrap_err());
+    // $out / $merge
+    invalid(
+        e.write_documents(&c, vec![doc! { "_id": 8i64, "qty": -1 }], SinkMode::Insert).unwrap_err(),
+    );
+
+    assert_eq!(qty_of(&e, &c, 1), Some(Bson::Int32(5)), "the stored document never changed");
+    assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 1);
+    let counts = e.validation_counts();
+    assert_eq!(counts.len(), 1);
+    assert!(counts[0].refusals >= 8 && counts[0].warnings == 0, "{counts:?}");
+
+    // And conforming writes pass on each of them.
+    e.insert(&c, doc! { "_id": 2i64, "qty": 1 }).unwrap();
+    e.replace(&c, &DocId::Int64(1), doc! { "qty": 6 }, false).unwrap();
+    e.modify_where(&c, &Candidates::Scan, &SetQty(7), None).unwrap();
+    e.write_documents(&c, vec![doc! { "_id": 8i64, "qty": 2 }], SinkMode::Insert).unwrap();
+}
+
+#[test]
+fn a_refused_output_writes_nothing_before_the_first_chunk() {
+    let (e, _d) = open();
+    let c = collection(&e, strict_error());
+    e.set_multi_chunk_docs(2);
+    let docs = vec![
+        doc! { "_id": 10i64, "qty": 1 },
+        doc! { "_id": 11i64, "qty": 1 },
+        doc! { "_id": 12i64, "qty": 1 },
+        doc! { "_id": 13i64, "qty": -1 },
+    ];
+    invalid(e.write_documents(&c, docs.clone(), SinkMode::Insert).unwrap_err());
+    assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 1, "no chunk was written");
+    let replace_all =
+        SinkMode::Merge { when_matched: WhenMatched::Replace, insert_unmatched: true };
+    invalid(e.write_documents(&c, docs, replace_all).unwrap_err());
+    assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 1);
+}
+
+#[test]
+fn a_merge_is_validated_in_its_final_form() {
+    let (e, _d) = open();
+    let c = collection(&e, strict_error());
+    let merge = SinkMode::Merge { when_matched: WhenMatched::Merge, insert_unmatched: true };
+    // The incoming document has no `qty`; merged over the stored one it has.
+    e.write_documents(&c, vec![doc! { "_id": 1i64, "note": "hi" }], merge).unwrap();
+    assert_eq!(qty_of(&e, &c, 1), Some(Bson::Int32(5)));
+    // The same document, unmatched, is an insert that fails the schema.
+    invalid(e.write_documents(&c, vec![doc! { "_id": 2i64, "note": "hi" }], merge).unwrap_err());
+    // A merge whose result fails is refused in the transaction.
+    invalid(e.write_documents(&c, vec![doc! { "_id": 1i64, "qty": -4 }], merge).unwrap_err());
+    assert_eq!(qty_of(&e, &c, 1), Some(Bson::Int32(5)));
+}
+
+#[test]
+fn warn_accepts_the_write_and_counts_it() {
+    let (e, _d) = open();
+    let c = collection(&e, spec(ValidationAction::Warn, ValidationLevel::Strict));
+    e.insert(&c, doc! { "_id": 2i64, "qty": -1 }).unwrap();
+    e.insert_many(&c, vec![doc! { "_id": 3i64 }, doc! { "_id": 4i64, "qty": "x" }]).unwrap();
+    e.replace(&c, &DocId::Int64(1), doc! { "qty": -2 }, false).unwrap();
+    e.modify_where(&c, &Candidates::Scan, &SetQty(-3), None).unwrap();
+    e.write_documents(&c, vec![doc! { "_id": 9i64, "qty": -9 }], SinkMode::Insert).unwrap();
+    let counts = e.validation_counts();
+    assert_eq!(counts[0].refusals, 0);
+    assert!(counts[0].warnings >= 6, "{counts:?}");
+    assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 5);
+}
+
+#[test]
+fn moderate_checks_inserts_and_updates_only_of_conforming_documents() {
+    let (e, _d) = open();
+    collection(&e, spec(ValidationAction::Error, ValidationLevel::Moderate));
+    // A document that does not conform, stored before the validator was in force.
+    let unvalidated = e.set_validator("shop", "c", None).unwrap();
+    e.insert(&unvalidated, doc! { "_id": 2i64, "qty": -1 }).unwrap();
+    let c = e
+        .set_validator("shop", "c", Some(spec(ValidationAction::Error, ValidationLevel::Moderate)))
+        .unwrap();
+
+    // Inserts are checked.
+    invalid(e.insert(&c, doc! { "_id": 3i64, "qty": -1 }).unwrap_err());
+    // An update of a conforming document is checked.
+    invalid(e.replace(&c, &DocId::Int64(1), doc! { "qty": -1 }, false).unwrap_err());
+    // An update of one that did not conform is free, to anything.
+    e.replace(&c, &DocId::Int64(2), doc! { "qty": -7, "note": 1 }, false).unwrap();
+    assert_eq!(qty_of(&e, &c, 2), Some(Bson::Int32(-7)));
+    // The same through the update path.
+    let only_two = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(2)).unwrap()]);
+    e.modify_where(&c, &only_two, &SetQty(-8), None).unwrap();
+    assert_eq!(qty_of(&e, &c, 2), Some(Bson::Int32(-8)));
+
+    // Strict refuses the same updates.
+    let c = e.set_validator("shop", "c", Some(strict_error())).unwrap();
+    invalid(e.replace(&c, &DocId::Int64(2), doc! { "qty": -9 }, false).unwrap_err());
+    invalid(e.modify_where(&c, &only_two, &SetQty(-9), None).unwrap_err());
+}
+
+#[test]
+fn deleting_and_an_unchanged_write_are_not_validated() {
+    let (e, _d) = open();
+    collection(&e, strict_error());
+    let unvalidated = e.set_validator("shop", "c", None).unwrap();
+    e.insert(&unvalidated, doc! { "_id": 2i64, "qty": -1 }).unwrap();
+    let c = e.set_validator("shop", "c", Some(strict_error())).unwrap();
+    // Sent again unchanged: nothing is written, so nothing is judged.
+    e.replace(&c, &DocId::Int64(2), doc! { "qty": -1 }, false).unwrap();
+    assert!(e.delete(&c, &DocId::Int64(2)).unwrap());
+}
+
+/// `b` holding `a`'s collection by entries, then `b` made to hold the validator.
+fn replica_with_validator(a: &Engine) -> (Engine, tempfile::TempDir) {
+    let (b, dir) = open();
+    let entries = a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+    b.apply_batch(&entries).unwrap();
+    b.set_validator("shop", "c", Some(strict_error())).unwrap();
+    (b, dir)
+}
+
+#[test]
+fn a_replicated_write_is_never_refused_and_nothing_held_is_rechecked() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    let ca = a.get_collection("shop", "c").unwrap();
+    let (b, _db) = replica_with_validator(&a);
+    let cb = b.get_collection("shop", "c").unwrap();
+
+    // `a` has no validator, so it accepts what `b`'s would refuse.
+    a.insert(&ca, doc! { "_id": 1i64, "qty": -1 }).unwrap();
+    a.insert(&ca, doc! { "_id": 2i64, "note": "no qty" }).unwrap();
+    let entries = a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+    b.apply_batch(&entries).unwrap();
+    assert_eq!(qty_of(&b, &cb, 1), Some(Bson::Int32(-1)), "kept");
+    assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_some(), "kept");
+    assert!(b.validation_counts().is_empty(), "and never judged");
+
+    // The same member refuses the same document from a client.
+    invalid(b.insert(&cb, doc! { "_id": 3i64, "qty": -1 }).unwrap_err());
+
+    // Setting a validator does not recheck what is held; the report lists it.
+    let page = b.validator_violations(&cb, None, 100).unwrap();
+    let ids: Vec<Bson> = page.rows.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(ids, vec![Bson::Int64(1), Bson::Int64(2)]);
+    assert_eq!(page.scanned, 2);
+}
+
+#[test]
+fn a_snapshot_page_is_never_refused_either() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    let ca = a.get_collection("shop", "c").unwrap();
+    a.insert(&ca, doc! { "_id": 1i64, "qty": -1 }).unwrap();
+    let (b, _db) = replica_with_validator(&a);
+    let cb = b.get_collection("shop", "c").unwrap();
+    transfer(&b, &a);
+    assert_eq!(qty_of(&b, &cb, 1), Some(Bson::Int32(-1)));
+}
+
+fn transfer(into: &Engine, from: &Engine) {
+    let mut progress = crate::SnapshotProgress::whole_database();
+    while !progress.is_complete() {
+        let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        let page: crate::SnapshotPage =
+            bson::deserialize_from_slice(&bson::serialize_to_vec(&page).unwrap()).unwrap();
+        into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+    }
+}
+
+#[test]
+fn the_validator_reaches_a_replica_by_entries_and_removal_follows() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    let (b, _db) = open();
+    let sync = |from: &Engine, into: &Engine| {
+        let entries =
+            from.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+        into.apply_batch(&entries).unwrap();
+    };
+    sync(&a, &b);
+
+    let on = a.set_validator("shop", "c", Some(strict_error())).unwrap();
+    sync(&a, &b);
+    let held = b.get_collection("shop", "c").unwrap();
+    assert_eq!(held.validator, Some(strict_error()));
+    assert_eq!(held.validator_changed, on.validator_changed);
+    invalid(b.insert(&held, doc! { "_id": 1i64, "qty": -1 }).unwrap_err());
+
+    let off = a.set_validator("shop", "c", None).unwrap();
+    sync(&a, &b);
+    let held = b.get_collection("shop", "c").unwrap();
+    assert_eq!(held.validator, None);
+    assert_eq!(held.validator_changed, off.validator_changed);
+    b.insert(&held, doc! { "_id": 1i64, "qty": -1 }).unwrap();
+}
+
+#[test]
+fn the_later_stamp_wins_whatever_order_the_changes_arrive_in() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    let first = a.set_validator("shop", "c", Some(strict_error())).unwrap();
+    let warn = spec(ValidationAction::Warn, ValidationLevel::Moderate);
+    let second = a.set_validator("shop", "c", Some(warn.clone())).unwrap();
+    assert!(second.validator_changed > first.validator_changed);
+
+    let changes: Vec<_> = a
+        .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == OpKind::ConfigureValidator)
+        .collect();
+    assert_eq!(changes.len(), 2);
+    let creation: Vec<_> = a
+        .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == OpKind::CreateCollection)
+        .collect();
+
+    for order in [[0, 1], [1, 0]] {
+        let (b, _db) = open();
+        b.apply_batch(&creation).unwrap();
+        for i in order {
+            b.apply_batch(std::slice::from_ref(&changes[i])).unwrap();
+        }
+        let held = b.get_collection("shop", "c").unwrap();
+        assert_eq!(held.validator, Some(warn.clone()), "order {order:?}");
+        assert_eq!(held.validator_changed, second.validator_changed);
+    }
+}
+
+#[test]
+fn a_snapshot_carries_the_validator_and_says_when_it_was_removed() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    let on = a.set_validator("shop", "c", Some(strict_error())).unwrap();
+
+    let (b, _db) = open();
+    transfer(&b, &a);
+    let held = b.get_collection("shop", "c").unwrap();
+    assert_eq!(held.validator, Some(strict_error()));
+    assert_eq!(held.validator_changed, on.validator_changed);
+
+    // "Off at s": the page carries the removal's stamp, and the receiver that held
+    // the validator drops it.
+    let off = a.set_validator("shop", "c", None).unwrap();
+    let page = a.snapshot_page(None, None).unwrap();
+    let state = page.collections.iter().find(|c| c.name == "c").unwrap();
+    assert!(state.validator.is_none() && state.validator_changed == off.validator_changed);
+    transfer(&b, &a);
+    let held = b.get_collection("shop", "c").unwrap();
+    assert_eq!(held.validator, None);
+    assert_eq!(held.validator_changed, off.validator_changed);
+}
+
+#[test]
+fn a_page_older_than_the_standing_change_does_not_override_it() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    a.set_validator("shop", "c", None).unwrap();
+    let (b, _db) = open();
+    transfer(&b, &a);
+    // `b` changes it after `a`'s removal; `a`'s page is now the older fact.
+    let b_set = b.set_validator("shop", "c", Some(strict_error())).unwrap();
+    transfer(&b, &a);
+    let held = b.get_collection("shop", "c").unwrap();
+    assert_eq!(held.validator, Some(strict_error()));
+    assert_eq!(held.validator_changed, b_set.validator_changed);
+}
+
+#[test]
+fn a_page_whose_stamp_its_senders_coverage_does_not_name_is_ignored() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    a.set_validator("shop", "c", Some(strict_error())).unwrap();
+    let (b, _db) = open();
+    let mut progress = crate::SnapshotProgress::whole_database();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    for state in &mut page.collections {
+        if let Some(stamp) = &mut state.validator_changed {
+            *stamp = Stamp::new(Hlc::new(stamp.hlc.wall_ms + 10_000_000, 0), stamp.node);
+        }
+    }
+    b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    assert_eq!(b.get_collection("shop", "c").unwrap().validator, None);
+}
+
+#[test]
+fn the_validator_is_part_of_the_definition_digest() {
+    let (e, _d) = open();
+    let none = e.create_collection("shop", "c").unwrap();
+    let on = e.set_validator("shop", "c", Some(strict_error())).unwrap();
+    let warn = e
+        .set_validator("shop", "c", Some(spec(ValidationAction::Warn, ValidationLevel::Strict)))
+        .unwrap();
+    let digest = crate::definition_digest::definition_digest;
+    assert_ne!(digest(&none), digest(&on));
+    assert_ne!(digest(&on), digest(&warn), "the policies are hashed");
+    let again = e.set_validator("shop", "c", Some(strict_error())).unwrap();
+    assert_eq!(digest(&on), digest(&again), "and the stamp is not");
+    assert_eq!(
+        crate::definition_digest::definition_list(&on).last().map(|(k, _)| k.clone()),
+        Some(crate::definition_digest::DefinitionKey::validator())
+    );
+}
+
+#[test]
+fn a_stored_schema_that_no_longer_parses_leaves_the_collection_writable() {
+    let (e, _d) = open();
+    let c = collection(&e, strict_error());
+    // A build that changed the dialect: the stored schema carries a keyword this one
+    // refuses. Set past the parse that a client's change is held to.
+    let mut meta = c.clone();
+    meta.validator = Some(ValidatorSpec {
+        schema: doc! { "$ref": "#/x" },
+        action: ValidationAction::Error,
+        level: ValidationLevel::Strict,
+    });
+    e.insert(&meta, doc! { "_id": 5i64, "qty": -1 }).expect("not validated, not wedged");
+    e.insert(&meta, doc! { "_id": 6i64, "qty": -1 }).unwrap();
+    assert_eq!(e.validators_unparseable(), 1, "counted once per change of it, not per write");
+    assert!(e.validator_violations(&meta, None, 10).unwrap().rows.is_empty());
+}
+
+#[test]
+fn the_report_pages_through_a_scan_and_names_why() {
+    let (e, _d) = open();
+    collection(&e, strict_error());
+    let c = e.set_validator("shop", "c", None).unwrap();
+    for i in 2..=7i64 {
+        let doc = if i % 2 == 0 {
+            doc! { "_id": i, "qty": -1 }
+        } else {
+            doc! { "_id": i, "qty": 1 }
+        };
+        e.insert(&c, doc).unwrap();
+    }
+    let c = e.set_validator("shop", "c", Some(strict_error())).unwrap();
+
+    let first = e.validator_violations(&c, None, 2).unwrap();
+    assert_eq!(
+        first.rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        vec![Bson::Int64(2), Bson::Int64(4)]
+    );
+    assert!(first.rows[0].1.contains("qty"), "{:?}", first.rows[0]);
+    let next = first.next.clone().expect("more to scan");
+    let second = e.validator_violations(&c, Some(&next), 2).unwrap();
+    assert_eq!(second.rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec![Bson::Int64(6)]);
+    assert_eq!(second.next, None, "the scan reached the end");
+
+    // With no validator the report is empty.
+    let c = e.set_validator("shop", "c", None).unwrap();
+    assert!(e.validator_violations(&c, None, 10).unwrap().rows.is_empty());
+}
+
+#[test]
+fn a_meta_written_before_the_validator_existed_reads_without_one() {
+    // The store written by 0.57.0 holds no `validator` and no `validator_changed`:
+    // both are optional with defaults, so it opens as it is and no migration exists.
+    let (e, _d) = open();
+    let current = e.create_collection("shop", "c").unwrap();
+    let mut json: serde_json::Value = serde_json::to_value(&current).unwrap();
+    let object = json.as_object_mut().unwrap();
+    assert!(!object.contains_key("validator"), "absent when unset");
+    assert!(!object.contains_key("validator_changed"), "absent when unset");
+    object.remove("validator");
+    object.remove("validator_changed");
+    let old: crate::CollectionMeta = serde_json::from_value(json).unwrap();
+    assert_eq!(old, current);
+    assert_eq!(old.validator, None);
+    assert_eq!(old.validator_changed, None);
+}
+
+#[test]
+fn a_snapshot_page_from_before_the_validator_existed_carries_none() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    let page = a.snapshot_page(None, None).unwrap();
+    let mut doc = bson::serialize_to_document(&page.collections[0]).unwrap();
+    assert!(!doc.contains_key("validator") && !doc.contains_key("validator_changed"));
+    doc.remove("validator");
+    let state: crate::CollectionState = bson::deserialize_from_document(doc).unwrap();
+    assert!(state.validator.is_none() && state.validator_changed.is_none());
+}
+
+#[test]
+fn the_oplog_kind_round_trips_through_its_tag() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    e.set_validator("shop", "c", Some(strict_error())).unwrap();
+    let entry = e
+        .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.kind == OpKind::ConfigureValidator)
+        .unwrap();
+    let back = crate::codec::decode_oplog_entry(&crate::codec::encode_oplog_entry(&entry)).unwrap();
+    assert_eq!(back, entry);
+    assert!(entry.kind.is_ddl() && !entry.kind.is_document());
+    let body: kimmy_core::ValidatorSet =
+        bson::deserialize_from_slice(&entry.body.unwrap()).unwrap();
+    assert_eq!(body.validator, Some(strict_error()));
+}

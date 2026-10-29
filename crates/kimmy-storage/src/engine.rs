@@ -144,6 +144,8 @@ pub struct Engine {
     /// which is what M11 task 1 needed: the daemon was paying two commits per
     /// insert where a bare engine paid one, and nothing said so.
     commits: std::sync::atomic::AtomicU64,
+    /// The parsed validators and their counters (ADR-257).
+    pub(crate) validators: crate::validator::ValidatorState,
     /// Documents a `multi: true` filtered write commits per transaction
     /// (ADR-086). Set from configuration at startup; the storage default
     /// stands for a bare engine.
@@ -1553,6 +1555,7 @@ impl Engine {
             definition_fail_in: std::sync::atomic::AtomicU32::new(0),
             hint_write_fails: std::sync::atomic::AtomicBool::new(false),
             commits: std::sync::atomic::AtomicU64::new(0),
+            validators: Default::default(),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
             ),
@@ -3671,7 +3674,7 @@ impl Engine {
     }
 
     /// The highest stamp the stored metadata carries: each collection's `created`,
-    /// incarnation floor, vector-change stamp and indexes' creation stamps, and the
+    /// incarnation floor, vector- and validator-change stamps and indexes' creation stamps, and the
     /// collection and index drop tombstones.
     ///
     /// A snapshot restores these with its sender's stamps and folds them into the
@@ -3694,6 +3697,7 @@ impl Engine {
                 high = high.max(meta.created);
                 high = high.max(meta.incarnation_floor.unwrap_or(Hlc::ZERO));
                 high = high.max(meta.vector_changed.map_or(Hlc::ZERO, |stamp| stamp.hlc));
+                high = high.max(meta.validator_changed.map_or(Hlc::ZERO, |stamp| stamp.hlc));
                 for index in &meta.indexes {
                     high = high.max(index.created.map_or(Hlc::ZERO, |stamp| stamp.hlc));
                 }

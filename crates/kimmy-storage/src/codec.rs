@@ -230,6 +230,7 @@ fn op_kind_tag(kind: OpKind) -> u8 {
         OpKind::CreateIndex => 9,
         OpKind::DropIndex => 10,
         OpKind::ConfigureVectors => 11,
+        OpKind::ConfigureValidator => 12,
     }
 }
 
@@ -246,6 +247,7 @@ fn op_kind_from_tag(tag: u8) -> Result<OpKind> {
         9 => OpKind::CreateIndex,
         10 => OpKind::DropIndex,
         11 => OpKind::ConfigureVectors,
+        12 => OpKind::ConfigureValidator,
         other => return Err(corrupt(&format!("unknown op kind {other}"))),
     })
 }

@@ -691,6 +691,11 @@ impl Engine {
         if let Some(body) = body.as_ref().filter(|_| self.caps_apply()) {
             kimmy_core::limits::check_document(body.len())?;
         }
+        // The collection's validator, on the result, against the document as it stood
+        // (ADR-257). A removal is not an update to be validated.
+        if let Some(next) = next {
+            self.check_validation(coll, Some(&found.doc), next)?;
+        }
         // The indexes first: a unique violation returns here, before anything
         // is minted, and the caller aborts, which discards the entries with
         // the rest.

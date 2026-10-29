@@ -1670,8 +1670,10 @@ impl Engine {
 /// tombstone for ever. A definition at or before the drop is of the life it ended,
 /// as everywhere else.
 pub(crate) fn defines_a_later_life(entry: &OplogEntry, dropped: Stamp) -> bool {
-    matches!(entry.kind, OpKind::CreateIndex | OpKind::ConfigureVectors)
-        && entry.stamp.hlc > dropped.hlc
+    matches!(
+        entry.kind,
+        OpKind::CreateIndex | OpKind::ConfigureVectors | OpKind::ConfigureValidator
+    ) && entry.stamp.hlc > dropped.hlc
 }
 
 /// Whether a collection's creation, stamped `created` at its origin, belongs to
@@ -2771,6 +2773,38 @@ impl Engine {
                             refused_config.as_ref(),
                             entry.stamp,
                         )?;
+                        return Ok(DdlOutcome::Refused);
+                    }
+                    Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
+                }
+            }
+            OpKind::ConfigureValidator => {
+                let target: kimmy_core::ValidatorSet = bson::deserialize_from_slice(body)?;
+                // Last writer wins, on the stamp, and never refused for what the schema
+                // says: a replicated change is applied as sent (ADR-257).
+                let applied = settle(self.set_validator_inner(
+                    &target.db,
+                    &target.collection,
+                    target.validator,
+                    crate::validator::Validated::FromEntry(entry.stamp),
+                    &|standing| self.definition_of_an_ended_life(standing, entry.stamp),
+                ))?;
+                match applied {
+                    Ddl::Applied(_) => {}
+                    Ddl::Gone => {
+                        return Ok(DdlOutcome::UnknownCollection(format!(
+                            "{}.{}",
+                            target.db, target.collection
+                        )));
+                    }
+                    Ddl::Refused(reason) => {
+                        warn!(
+                            db = %target.db,
+                            collection = %target.collection,
+                            reason = %reason,
+                            "skipped a replicated validator this node cannot apply; the \
+                             divergence is counted in kimmy_sync_ddl_refused_total"
+                        );
                         return Ok(DdlOutcome::Refused);
                     }
                     Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),

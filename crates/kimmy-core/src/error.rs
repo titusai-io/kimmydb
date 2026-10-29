@@ -70,6 +70,12 @@ pub enum Error {
     #[error("the document is {bytes} bytes, over the {max} byte limit a document may have")]
     DocumentTooLarge { bytes: usize, max: usize },
 
+    /// A client write would store a document that fails the collection's
+    /// validator under `validationAction: "error"` (ADR-257). `reason` is the
+    /// schema's own account of the first failure, naming the keyword path.
+    #[error("the document does not satisfy the collection's validator: {reason}")]
+    DocumentInvalid { reason: String },
+
     /// A stage's answer is one document of `bytes` bytes, over the `max` a document
     /// may have, and is refused rather than cut short. `what` names the answer and
     /// `remedy` says how to ask for less.
@@ -174,6 +180,7 @@ impl Error {
             | Error::InvalidName { .. }
             | Error::InvalidUpdate(_)
             | Error::DocumentTooLarge { .. }
+            | Error::DocumentInvalid { .. }
             | Error::AnswerTooLarge { .. }
             | Error::IdTooLarge { .. }
             | Error::ResumeTokenExpired
@@ -228,6 +235,7 @@ impl Error {
             | Error::InvalidName { .. }
             | Error::InvalidUpdate(_)
             | Error::DocumentTooLarge { .. }
+            | Error::DocumentInvalid { .. }
             | Error::AnswerTooLarge { .. }
             | Error::IdTooLarge { .. }
             | Error::UnsupportedOperator { .. }

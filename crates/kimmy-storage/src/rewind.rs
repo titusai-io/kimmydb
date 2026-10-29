@@ -171,6 +171,7 @@ impl Engine {
                     | OpKind::CreateIndex
                     | OpKind::DropIndex
                     | OpKind::ConfigureVectors
+                    | OpKind::ConfigureValidator
                     | OpKind::Collection => {
                         if after {
                             schema_changes.push(entry.kind);

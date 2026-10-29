@@ -1797,6 +1797,39 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     )
     .await;
 
+    // -- validators --------------------------------------------------------
+    let validator = "/v1/db/shop/coll/orders/validator";
+    let validator_t = "/v1/db/{db}/coll/{coll}/validator";
+    let set = c
+        .check(
+            "PUT",
+            validator_t,
+            validator,
+            Some(&root),
+            Some(json!({
+                "validator": { "$jsonSchema": { "required": ["colour"] } },
+                "validationAction": "warn",
+                "validationLevel": "moderate",
+            })),
+            200,
+        )
+        .await;
+    assert_eq!(set["validationAction"], "warn", "{set}");
+    let report = c
+        .check(
+            "GET",
+            "/v1/db/{db}/coll/{coll}/validator/violations",
+            "/v1/db/shop/coll/orders/validator/violations?limit=1",
+            Some(&root),
+            None,
+            200,
+        )
+        .await;
+    assert_eq!(report["validator"], true, "{report}");
+    assert!(report["violations"].as_array().is_some_and(|v| v.len() == 1), "{report}");
+    let removed = c.check("DELETE", validator_t, validator, Some(&root), None, 200).await;
+    assert_eq!(removed["removed"], true, "{removed}");
+
     // -- vectors -----------------------------------------------------------
     let vector = "/v1/db/shop/coll/orders/vector";
     let vector_t = "/v1/db/{db}/coll/{coll}/vector";

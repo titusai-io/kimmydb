@@ -135,6 +135,13 @@ pub struct StorageReadings {
     pub serve: kimmy_storage::ServeSnapshot,
     /// The unique-violations table's state (ADR-200).
     pub violations: kimmy_storage::ViolationsSnapshot,
+    /// Writes accepted under `validationAction: "warn"` that failed the schema, writes
+    /// refused under `"error"`, and stored validators this build could not parse
+    /// (ADR-257). Totals for the member: `/metrics` is unauthenticated and names no
+    /// collection.
+    pub validation_warnings: u64,
+    pub validation_refusals: u64,
+    pub validators_unparseable: u64,
     /// Entries held as state that a sync window released, since start
     /// (`Engine::held_marks_released`, ADR-169's addendum).
     pub held_marks_released: u64,
@@ -402,6 +409,10 @@ pub struct MetricsSnapshot {
     pub sync_serve: kimmy_storage::ServeSnapshot,
     /// The unique-violations table's state (ADR-200).
     pub violations: kimmy_storage::ViolationsSnapshot,
+    /// The validator counters (ADR-257), as `StorageReadings` carries them.
+    pub validation_warnings: u64,
+    pub validation_refusals: u64,
+    pub validators_unparseable: u64,
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
     pub webhook_events: u64,
@@ -1433,6 +1444,9 @@ impl Metrics {
             write_lock_hold: readings.writer_hold_decomposition,
             sync_serve: readings.serve,
             violations: readings.violations,
+            validation_warnings: readings.validation_warnings,
+            validation_refusals: readings.validation_refusals,
+            validators_unparseable: readings.validators_unparseable,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -2208,6 +2222,7 @@ impl Metrics {
         render_sync_pulls(&mut out, &pulls);
         render_sync_serve(&mut out, &readings.serve);
         render_violations(&mut out, &readings.violations);
+        render_validation(&mut out, readings);
         render_ownership(&mut out, &readings.ownership);
         out
     }
@@ -2487,6 +2502,28 @@ fn render_violations(out: &mut String, violations: &kimmy_storage::ViolationsSna
         violations.backfilled_rows,
         violations.calls_from_table,
         violations.calls_from_oplog,
+    );
+}
+
+/// The collection validator's counters (ADR-257): writes accepted under `warn` that
+/// failed the schema, writes refused under `error`, and stored validators this build
+/// could not parse. Totals for the member, with no collection named: `/metrics` is
+/// served without a credential.
+fn render_validation(out: &mut String, readings: &StorageReadings) {
+    use std::fmt::Write;
+
+    let _ = write!(
+        out,
+        "# HELP kimmy_validation_warnings_total Writes accepted although they fail their collection's validator, because its validationAction is warn. Counted on the member that accepted the write, since start; each is also logged at warning with the collection and the reason, at most one line a second per collection.\n\
+         # TYPE kimmy_validation_warnings_total counter\n\
+         kimmy_validation_warnings_total {}\n\
+         # HELP kimmy_validation_refusals_total Writes refused because they fail their collection's validator and its validationAction is error (validation_failed). Counted on the member that refused the write, since start.\n\
+         # TYPE kimmy_validation_refusals_total counter\n\
+         kimmy_validation_refusals_total {}\n\
+         # HELP kimmy_validator_unparseable_total Stored validators this build could not parse, each counted when first read. The collection is not validated until its validator is replaced or removed, and the cause is logged at error: a build that changed the $jsonSchema dialect under a stored validator.\n\
+         # TYPE kimmy_validator_unparseable_total counter\n\
+         kimmy_validator_unparseable_total {}\n",
+        readings.validation_warnings, readings.validation_refusals, readings.validators_unparseable,
     );
 }
 
@@ -3164,6 +3201,9 @@ mod tests {
                 calls_from_table: 1_402,
                 calls_from_oplog: 1_403,
             },
+            validation_warnings: 1_601,
+            validation_refusals: 1_602,
+            validators_unparseable: 1_603,
         }
     }
 
@@ -4098,6 +4138,15 @@ kimmy_violations_backfill_rows_total 1401
 # TYPE kimmy_violations_walk_path_total counter
 kimmy_violations_walk_path_total{path=\"table\"} 1402
 kimmy_violations_walk_path_total{path=\"oplog\"} 1403
+# HELP kimmy_validation_warnings_total Writes accepted although they fail their collection's validator, because its validationAction is warn. Counted on the member that accepted the write, since start; each is also logged at warning with the collection and the reason, at most one line a second per collection.
+# TYPE kimmy_validation_warnings_total counter
+kimmy_validation_warnings_total 1601
+# HELP kimmy_validation_refusals_total Writes refused because they fail their collection's validator and its validationAction is error (validation_failed). Counted on the member that refused the write, since start.
+# TYPE kimmy_validation_refusals_total counter
+kimmy_validation_refusals_total 1602
+# HELP kimmy_validator_unparseable_total Stored validators this build could not parse, each counted when first read. The collection is not validated until its validator is replaced or removed, and the cause is logged at error: a build that changed the $jsonSchema dialect under a stored validator.
+# TYPE kimmy_validator_unparseable_total counter
+kimmy_validator_unparseable_total 1603
 # HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block held from the peer's current process: an older version, one not yet heard, or one this member dropped on SWIM down or its own rejoin; an unknown peer is no longer a candidate for webhooks or embeddings); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.
 # TYPE kimmy_ownership_peers gauge
 kimmy_ownership_peers{state=\"eligible\"} 1501
@@ -4571,6 +4620,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             "kimmy_jwks_refresh_total{{outcome=\"failed\"}} {}\n",
             s.jwks_refresh_failed
         ));
+        expect(&format!("kimmy_validation_warnings_total {}\n", s.validation_warnings));
+        expect(&format!("kimmy_validation_refusals_total {}\n", s.validation_refusals));
+        expect(&format!("kimmy_validator_unparseable_total {}\n", s.validators_unparseable));
+
         expect(&format!("kimmy_embed_documents_total {}\n", s.embed_documents_embedded));
         expect(&format!("kimmy_embed_chunks_total {}\n", s.embed_chunks_embedded));
         expect(&format!("kimmy_embed_deferred_total {}\n", s.embed_deferred));
@@ -4898,6 +4951,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // The unique-violations table: ready, backfill rows, and the
                 // two ways a call is answered (ADR-200).
                 + 4
+                // The collection validator's warnings and refusals, and the
+                // stored validators that did not parse (ADR-257).
+                + 3
                 // Peers by state, and the peers a yielding class waits on
                 // (ADR-201).
                 + kimmy_cluster::PeerState::ALL.len()

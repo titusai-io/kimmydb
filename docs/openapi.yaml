@@ -1260,6 +1260,9 @@ paths:
                   description: |
                     A leading `__` is reserved for system collections and is
                     refused here.
+                validator: { $ref: "#/components/schemas/ValidatorInput" }
+                validationAction: { $ref: "#/components/schemas/ValidationAction" }
+                validationLevel: { $ref: "#/components/schemas/ValidationLevel" }
       responses:
         "200":
           description: |
@@ -2249,6 +2252,129 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/db/{db}/coll/{coll}/validator:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    put:
+      tags: [collections]
+      operationId: setValidator
+      summary: Set or replace the collection's validator.
+      description: |
+        The validator is `{ "$jsonSchema": <schema> }` and nothing else, with the two
+        policies beside it (ADR-257). It replaces the standing validator and both
+        policies: a body naming no `validationAction` sets the default. The schema is
+        parsed here; one this build cannot read is a `400` and changes nothing. The
+        change is stamped and replicates, last writer winning; a member that has not
+        yet received it accepts writes the validator would refuse, and documents
+        accepted that way are kept (docs/validation.md).
+      x-kimmy-action: ddl
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ValidatorRequest" }
+      responses:
+        "200":
+          description: Set.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ValidatorState"
+                  - type: object
+                    required: [collection]
+                    properties:
+                      collection: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [collections]
+      operationId: removeValidator
+      summary: Remove the collection's validator.
+      description: |
+        A change all the same: stamped and replicated, so a member that was down while
+        it was removed learns it is gone. Answers whether there was one to remove.
+      x-kimmy-action: ddl
+      responses:
+        "200":
+          description: Removed, or there was nothing to remove.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/validator/violations:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    get:
+      tags: [collections]
+      operationId: listValidatorViolations
+      summary: The documents that fail the collection's current validator.
+      description: |
+        **A scan.** Each call reads the collection's documents in `_id` order on the
+        member that answers and tests them against the current validator; nothing is
+        kept. A page examines at most 10,000 documents and returns at most `limit`
+        failures, and `nextCursor` is present whenever the collection holds more to
+        examine, even on a page with fewer failures than `limit`. A collection with no
+        validator answers an empty page with `validator: false`.
+      x-kimmy-action: read
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 100 }
+          description: The most failures to return. Clamped to 10,000.
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+          description: The `nextCursor` of the previous page.
+      responses:
+        "200":
+          description: One page of failures.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [violations, count, scanned, validator]
+                properties:
+                  violations:
+                    type: array
+                    items:
+                      type: object
+                      required: [_id, reason]
+                      properties:
+                        _id: {}
+                        reason:
+                          type: string
+                          description: The schema's account of the first failure, naming the keyword path.
+                  count: { type: integer }
+                  scanned:
+                    type: integer
+                    description: Documents this page examined.
+                  validator:
+                    type: boolean
+                    description: Whether the collection has a validator.
+                  nextCursor:
+                    type: string
+                    description: Present when there is more to examine.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /v1/db/{db}/coll/{coll}/indexes:
     parameters:
       - $ref: "#/components/parameters/Db"
@@ -3117,6 +3243,10 @@ components:
         value is re-read through a second deserializer once the `kind` tag
         is matched, and the path tracker cannot see across the seam. An
         ordinary nested object, `chunk` among them, is unaffected.
+
+        On a write to a collection with a validator, a `422` may instead carry
+        `validation_failed`: the body was well formed and the document is not one the
+        collection accepts (ADR-257). The code says which.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -3225,6 +3355,7 @@ components:
         | `payload_too_large` | 413 | no | Request body over the node's ceiling (`server.max_body_bytes`, 2 MiB by default) |
         | `document_too_large` | 413 | no | A write that would store a document encoding to more than 16 MiB, checked on the result of an insert, bulk, replace, upsert or update. A `multi` update over it in a later chunk is `500 partially_applied` with this code in `cause` |
         | `id_too_large` | 413 | no | An `_id` over 4096 bytes (a string or binary id), in a write or in the path of a route that names one |
+        | `validation_failed` | 422 | no | A write that would store a document failing its collection's validator, under `validationAction: error` (ADR-257): insert, bulk (refused whole), replace, upsert, every update, `find_and_modify`, `$merge`, `$out`. The message names the keyword path that failed. Never returned for a replicated write |
         | `unsupported_media_type` | 415 | no | A JSON body without a JSON content type |
         | `unauthorized` | 401 | no | Missing, invalid or expired token; bad credentials; an account deleted, disabled or re-credentialed since the token was issued |
         | `forbidden` | 403 | no | Denied by RBAC. Identical whether or not the target exists |
@@ -3254,6 +3385,7 @@ components:
         - payload_too_large
         - document_too_large
         - id_too_large
+        - validation_failed
         - unsupported_media_type
         - unauthorized
         - forbidden
@@ -3967,6 +4099,59 @@ components:
               node: { type: string, format: uuid }
               reason: { type: string }
 
+    Validator:
+      type: object
+      description: |
+        A collection's validator as the server reports it: `{ "$jsonSchema": <schema> }`.
+        The schema is the `$jsonSchema` operator's dialect.
+      required: ["$jsonSchema"]
+      properties:
+        "$jsonSchema": { type: object }
+
+    ValidatorInput:
+      type: object
+      description: |
+        A validator as a request names it: `{ "$jsonSchema": <schema> }` and no other
+        key (ADR-257); any other is a `400` saying only `$jsonSchema` is supported. A
+        schema this build cannot parse is a `400` with the parser's message.
+      additionalProperties: false
+      required: ["$jsonSchema"]
+      properties:
+        "$jsonSchema": { type: object }
+
+    ValidationAction:
+      type: string
+      enum: [error, warn]
+      default: error
+      description: |
+        What a write that fails the validator does: `error` refuses it (`422
+        validation_failed`), `warn` accepts it, logs it and counts it.
+
+    ValidationLevel:
+      type: string
+      enum: [strict, moderate]
+      default: strict
+      description: |
+        Which writes are checked: `strict` every insert and update; `moderate` every
+        insert, and an update only of a document that conformed before the write.
+
+    ValidatorRequest:
+      type: object
+      additionalProperties: false
+      required: [validator]
+      properties:
+        validator: { $ref: "#/components/schemas/ValidatorInput" }
+        validationAction: { $ref: "#/components/schemas/ValidationAction" }
+        validationLevel: { $ref: "#/components/schemas/ValidationLevel" }
+
+    ValidatorState:
+      type: object
+      required: [validator, validationAction, validationLevel]
+      properties:
+        validator: { $ref: "#/components/schemas/Validator" }
+        validationAction: { $ref: "#/components/schemas/ValidationAction" }
+        validationLevel: { $ref: "#/components/schemas/ValidationLevel" }
+
     CollectionDescription:
       type: object
       required:
@@ -3975,6 +4160,13 @@ components:
         database: { type: string }
         collection: { type: string }
         documentCount: { type: integer }
+        validator:
+          description: The collection's validator, or `null` when it has none (ADR-257).
+          oneOf:
+            - $ref: "#/components/schemas/Validator"
+            - type: "null"
+        validationAction: { $ref: "#/components/schemas/ValidationAction" }
+        validationLevel: { $ref: "#/components/schemas/ValidationLevel" }
         nodeDurability:
           type: string
           enum: [durable, coalesced]

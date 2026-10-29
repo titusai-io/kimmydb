@@ -21,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::index_meta::IndexMeta;
+use crate::validator::ValidatorSpec;
 use crate::vector_meta::VectorConfig;
 
 /// Which collection an operation applies to.
@@ -88,6 +89,15 @@ pub struct VectorSet {
     /// collection is ordinary data and reconciles through the same anti-entropy
     /// as everything else.
     pub config: Option<VectorConfig>,
+}
+
+/// A collection's validator being set, replaced or removed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorSet {
+    pub db: String,
+    pub collection: String,
+    /// `None` removes the validator.
+    pub validator: Option<ValidatorSpec>,
 }
 
 #[cfg(test)]
