@@ -314,66 +314,238 @@ fn each_document_has_its_own_position() {
     assert_eq!(b.get_array("items").unwrap()[0].as_document().unwrap().get_i32("f").ok(), Some(1));
 }
 
-// ---- the matcher is untouched ----------------------------------------------
+// ---- the element is the one the matcher tested ------------------------------
+
+/// The matcher goes one level into an array and no further: `{a: 1}` does not
+/// match `{a: [[1, 2]]}`. The recorded element is the one it tested.
+#[test]
+fn the_matcher_does_not_look_inside_an_array_that_is_an_element() {
+    assert!(!filter::matches(&filt(doc! { "a": 1 }), &doc! { "a": [[1, 2]] }).unwrap());
+}
 
 #[test]
-fn the_recorder_never_changes_the_yes_or_no() {
-    let filters: Vec<Document> = vec![
-        doc! {},
-        doc! { "a": 1 },
-        doc! { "s": { "$gte": 4 } },
-        doc! { "s": { "$gt": 1, "$lt": 4 } },
-        doc! { "items.sku": "g" },
-        doc! { "items.sku": { "$ne": "g" } },
-        doc! { "items": { "$elemMatch": { "sku": "g", "qty": { "$gt": 1 } } } },
-        doc! { "items": { "$elemMatch": { "sku": "z" } } },
-        doc! { "s": { "$elemMatch": { "$gt": 3 } } },
-        doc! { "$or": [ { "a": 9 }, { "s": 5 } ] },
-        doc! { "$nor": [ { "a": 1 } ] },
-        doc! { "$and": [ { "s": 1 }, { "items.qty": 2 } ] },
-        doc! { "s": { "$not": { "$gt": 4 } } },
-        doc! { "s": { "$size": 3 } },
-        doc! { "s": { "$all": [1, 5] } },
-        doc! { "x": { "$exists": false } },
-        doc! { "t": { "$type": "string" } },
-        doc! { "t": { "$regex": "^ab" } },
-        doc! { "s": { "$mod": [2, 1] } },
-        doc! { "s": { "$bitsAllSet": 1 } },
-        doc! { "s": [1, 5, 3] },
-        doc! { "$expr": { "$gt": ["$a", 0] } },
-        doc! { "$expr": { "$gt": ["$t", 0] }, "a": 7 },
-        doc! { "items.0.sku": "g" },
-        doc! { "s": { "$in": [5, 100] } },
-        doc! { "s": null },
+fn an_element_that_is_an_array_is_not_the_one_a_scalar_condition_matched() {
+    let d = doc! { "_id": 1, "tags": [["red", "blue"], "red"] };
+    assert_eq!(at(doc! { "tags": "red" }, &d), Some(("tags".into(), 1)));
+    let out = updated(doc! { "tags": "red" }, doc! { "$set": { "tags.$": "green" } }, vec![], &d);
+    assert_eq!(out, doc! { "_id": 1, "tags": [["red", "blue"], "green"] });
+}
+
+/// Each element condition, over an array whose first element is an array that
+/// holds a value the condition would accept and whose second is the match.
+#[test]
+fn each_element_condition_skips_an_array_element_holding_its_value() {
+    let cases: Vec<(Document, Document)> = vec![
+        (doc! { "a": [[1, 2], 1] }, doc! { "a": 1 }),
+        (doc! { "a": [[1, 2], 1] }, doc! { "a": { "$eq": 1 } }),
+        (doc! { "a": [[1, 2], 1] }, doc! { "a": { "$in": [1, 9] } }),
+        (doc! { "a": [[7], 8] }, doc! { "a": { "$gt": 5 } }),
+        (doc! { "a": [[7], 5] }, doc! { "a": { "$gte": 5 } }),
+        (doc! { "a": [[3], 1] }, doc! { "a": { "$lt": 2 } }),
+        (doc! { "a": [[1], 2] }, doc! { "a": { "$lte": 2 } }),
+        (doc! { "a": [[7], 8] }, doc! { "a": { "$type": "int" } }),
+        (doc! { "a": [["xa"], "xb"] }, doc! { "a": { "$regex": "^x" } }),
+        (doc! { "a": [[4], 6] }, doc! { "a": { "$mod": [2, 0] } }),
+        (doc! { "a": [[3], 3] }, doc! { "a": { "$bitsAllSet": 3 } }),
+        (doc! { "a": [[3], 3] }, doc! { "a": { "$bitsAnySet": 1 } }),
+        (doc! { "a": [[3], 4] }, doc! { "a": { "$bitsAllClear": 3 } }),
+        (doc! { "a": [[7], 3] }, doc! { "a": { "$bitsAnyClear": 4 } }),
+        (doc! { "a": [[null], null] }, doc! { "a": null }),
+        (doc! { "a": [[1, 2], { "b": 1 }] }, doc! { "a": { "$elemMatch": { "b": 1 } } }),
+        (doc! { "a": [[{ "b": 1 }], { "b": 1 }] }, doc! { "a.b": 1 }),
     ];
-    let docs: Vec<Document> = vec![
-        doc! {},
-        doc! { "a": 1 },
-        doc! { "a": 1, "s": [1, 5, 3], "t": "abc", "items": [ { "sku": "g", "qty": 2 }, { "sku": "h", "qty": 1 } ] },
-        doc! { "a": 7, "s": [4], "t": 5, "items": [ { "sku": "z", "qty": 9 } ] },
-        doc! { "s": [], "items": [] },
-        doc! { "s": 5, "items": { "sku": "g", "qty": 2 } },
-        doc! { "s": [[1, 2], [5]], "items": [ 3, { "sku": "g" } ] },
-        doc! { "a": 0, "s": [2, 4, 6], "t": "xabc", "items": [ { "qty": 2 }, { "sku": "g", "qty": 2 } ] },
-    ];
-    let mut with_position = 0;
-    for f in &filters {
+    for (mut d, f) in cases {
+        d.insert("_id", 1);
         let parsed = filt(f.clone());
-        for d in &docs {
-            let plain = filter::matches(&parsed, d);
-            let recorded = filter::matches_at(&parsed, d);
-            match (plain, recorded) {
-                (Ok(yes), Ok((also, found))) => {
-                    assert_eq!(yes, also, "{f} over {d}");
-                    assert!(also || found.is_none(), "{f} over {d}: a position without a match");
-                    with_position += usize::from(found.is_some());
-                }
-                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{f} over {d}"),
-                (a, b) => panic!("{f} over {d}: {a:?} against {b:?}"),
+        assert!(filter::matches(&parsed, &d).unwrap(), "{f} must match {d}");
+        let (_, found) = filter::matches_at(&parsed, &d).unwrap();
+        assert_eq!(found.map(|p| (p.path, p.index)), Some(("a".into(), 1)), "{f} over {d}");
+    }
+}
+
+/// Conditions that are not about one element record nothing, whatever the
+/// array holds.
+#[test]
+fn conditions_that_are_not_about_an_element_record_nothing() {
+    let d = doc! { "_id": 1, "a": [[1, 2], 1, 5] };
+    for f in [
+        doc! { "a": { "$nin": [9] } },
+        doc! { "a": { "$ne": 9 } },
+        doc! { "a": { "$size": 3 } },
+        doc! { "a": { "$exists": true } },
+        doc! { "a": { "$all": [1, 5] } },
+        doc! { "a": { "$not": { "$gt": 99 } } },
+    ] {
+        assert_eq!(at(f.clone(), &d), None, "{f}");
+    }
+}
+
+#[test]
+fn a_find_projection_returns_the_element_the_matcher_tested() {
+    let d = doc! { "_id": 1, "tags": [["red", "blue"], "red"], "n": 1 };
+    let p = projection(doc! { "tags.$": 1 });
+    assert_eq!(
+        p.project(&filt(doc! { "tags": "red" }), &d).unwrap(),
+        doc! { "_id": 1, "tags": ["red"] }
+    );
+}
+
+/// The oracle: the first index `i` for which the filter matches the document
+/// with the array replaced by `[array[i]]` alone.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+fn generated_element(r: &mut Rng, depth: u32, nested: bool) -> Bson {
+    let mut pick = r.below(if depth == 0 { 6 } else { 3 });
+    if !nested && depth == 0 && pick == 3 {
+        pick = 4;
+    }
+    match pick {
+        0 | 2 => Bson::Int32(r.below(4) as i32),
+        1 => Bson::String(["x", "y"][r.below(2) as usize].into()),
+        3 => {
+            Bson::Array((0..r.below(3)).map(|_| generated_element(r, depth + 1, nested)).collect())
+        }
+        _ => {
+            let mut d = Document::new();
+            if r.below(3) > 0 {
+                d.insert("b", generated_element(r, depth + 1, nested));
             }
+            if r.below(2) > 0 {
+                let c = (0..r.below(3)).map(|_| Bson::Int32(r.below(4) as i32));
+                d.insert("c", Bson::Array(c.collect()));
+            }
+            Bson::Document(d)
         }
     }
-    assert!(with_position > 10, "the table must exercise recorded positions: {with_position}");
+}
+
+fn generated_filter(r: &mut Rng) -> Document {
+    let v = Bson::Int32(r.below(4) as i32);
+    match r.below(16) {
+        0 => doc! { "a": v },
+        1 => doc! { "a": { "$gt": v } },
+        2 => doc! { "a": { "$in": [v, "y"] } },
+        3 => {
+            let kind = ["int", "string", "object"][r.below(3) as usize];
+            doc! { "a": { "$type": kind } }
+        }
+        4 => doc! { "a.b": v },
+        5 => doc! { "a.b": { "$gte": v } },
+        6 => doc! { "a.c": v },
+        7 => doc! { "a": { "$elemMatch": { "b": v } } },
+        8 => doc! { "a": { "$elemMatch": { "$gt": v } } },
+        9 => doc! { "a": { "$regex": "^x" } },
+        10 => doc! { "a": { "$lt": v } },
+        11 => doc! { "a": { "$lte": v } },
+        12 => doc! { "a": { "$mod": [2, r.below(2) as i32] } },
+        13 => doc! { "a": { "$bitsAllSet": r.below(4) as i32 } },
+        14 => doc! { "a": { "$bitsAnyClear": r.below(4) as i32 } },
+        _ => doc! { "a": { "$eq": v } },
+    }
+}
+
+fn differential(nested: bool) -> (usize, Vec<String>) {
+    let mut r = Rng(0x2710_5eed);
+    let (mut checked, mut wrong) = (0, Vec::new());
+    for _ in 0..20000 {
+        let array: Vec<Bson> =
+            (0..1 + r.below(4)).map(|_| generated_element(&mut r, 0, nested)).collect();
+        let d = doc! { "_id": 1, "a": array.clone() };
+        let f = generated_filter(&mut r);
+        let parsed = filt(f.clone());
+        if !filter::matches(&parsed, &d).unwrap() {
+            continue;
+        }
+        checked += 1;
+        let oracle = (0..array.len()).find(|&i| {
+            let single = doc! { "_id": 1, "a": [array[i].clone()] };
+            filter::matches(&parsed, &single).unwrap()
+        });
+        let (_, got) = filter::matches_at(&parsed, &d).unwrap();
+        let got = got.map(|p| (p.path, p.index));
+        let want = oracle.map(|i| ("a".to_string(), i));
+        if got != want {
+            wrong.push(format!("{f} over {d}: recorded {got:?}, oracle {want:?}"));
+        }
+    }
+    (checked, wrong)
+}
+
+/// The recorded element is the first one for which the matcher, given the
+/// array with that element alone, answers yes. Over arrays that hold arrays
+/// and arrays that do not, for every element condition.
+#[test]
+fn the_recorded_element_is_the_first_the_matcher_accepts_alone() {
+    for nested in [true, false] {
+        let (checked, wrong) = differential(nested);
+        assert!(checked > 3000, "nested {nested}: only {checked} cases matched");
+        assert!(
+            wrong.is_empty(),
+            "nested {nested}: {} of {checked} disagree: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(5)]
+        );
+    }
+}
+
+// ---- written order -----------------------------------------------------------
+
+#[test]
+fn the_last_array_is_the_last_written_even_when_a_clause_holds_an_expr() {
+    let d = doc! { "_id": 1, "items": [{ "q": 5, "m": 1 }], "tags": ["x", "y"] };
+    let items_first = doc! {
+        "items": { "$elemMatch": { "$expr": { "$gt": ["$q", "$m"] } } },
+        "tags": "y",
+    };
+    assert_eq!(at(items_first, &d), Some(("tags".into(), 1)));
+    let tags_first = doc! {
+        "tags": "y",
+        "items": { "$elemMatch": { "$expr": { "$gt": ["$q", "$m"] } } },
+    };
+    assert_eq!(at(tags_first, &d), Some(("items".into(), 0)));
+    let in_and = doc! { "$and": [
+        { "items": { "$elemMatch": { "$expr": { "$gt": ["$q", "$m"] } } } },
+        { "tags": "y" },
+    ] };
+    assert_eq!(at(in_and, &d), Some(("tags".into(), 1)));
+}
+
+#[test]
+fn an_or_records_from_the_first_branch_written_that_holds_even_with_an_expr() {
+    let d = doc! { "_id": 1, "items": [{ "sku": "a" }] };
+    let expr_first = doc! { "$or": [ { "$expr": { "$eq": [1, 1] } }, { "items.sku": "a" } ] };
+    assert_eq!(at(expr_first, &d), None);
+    let expr_last = doc! { "$or": [ { "items.sku": "a" }, { "$expr": { "$eq": [1, 1] } } ] };
+    assert_eq!(at(expr_last, &d), Some(("items".into(), 0)));
+}
+
+// ---- `$` after an array-positional segment -----------------------------------
+
+#[test]
+fn dollar_after_an_array_positional_segment_is_refused_at_parse() {
+    for path in ["items.$[].tags.$", "items.$[line].tags.$", "a.$[].b.$[x].c.$"] {
+        let err = update::parse_with_filters(
+            &doc! { "$set": { path: 1 } },
+            &[doc! { "line.k": 1 }, doc! { "x.k": 1 }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must come before"), "{path}: {err}");
+    }
+    // `$` before `$[]` is accepted.
+    assert!(update::parse(&doc! { "$set": { "orders.$.lines.$[].done": true } }).is_ok());
 }
 
 // ---- find projection --------------------------------------------------------
@@ -460,4 +632,51 @@ fn project_stages_still_read_dollar_as_a_field_name() {
     let d = doc! { "_id": 1, "items": [ { "$": 5, "z": 1 }, 3 ] };
     assert_eq!(shape::project(p.as_ref(), &d), doc! { "_id": 1, "items": [ { "$": 5 } ] });
     let _ = Bson::Null;
+}
+
+// ---- the answer of a findAndModify --------------------------------------------
+
+#[test]
+fn the_image_after_an_in_place_change_is_cut_at_the_matched_index() {
+    let p = projection(doc! { "items.$": 1 });
+    let f = filt(doc! { "items.sku": "gasket" });
+    let before = order();
+    let after = updated(
+        doc! { "items.sku": "gasket" },
+        doc! { "$set": { "items.$.sku": "washer" } },
+        vec![],
+        &before,
+    );
+    // The element no longer satisfies the filter, and is still the one named.
+    let out = p.project_returned(&f, &before, &after).unwrap();
+    assert_eq!(out.get_array("items").unwrap().len(), 1);
+    assert_eq!(
+        out.get_array("items").unwrap()[0].as_document().unwrap().get_str("sku").ok(),
+        Some("washer")
+    );
+    let same = p.project_returned(&f, &before, &before).unwrap();
+    assert_eq!(
+        same.get_array("items").unwrap()[0].as_document().unwrap().get_i32("qty").ok(),
+        Some(2)
+    );
+}
+
+#[test]
+fn the_image_after_a_change_of_length_is_refused_and_never_the_whole_array() {
+    let p = projection(doc! { "items.$": 1 });
+    let f = filt(doc! { "items.sku": "gasket" });
+    let before = order();
+    for (update, words) in [
+        (doc! { "$pull": { "items": { "$elemMatch": { "sku": "bolt" } } } }, "changed the length"),
+        (doc! { "$push": { "items": { "sku": "nut" } } }, "changed the length"),
+        (doc! { "$set": { "items": 5 } }, "changed the length"),
+        (doc! { "$unset": { "items": "" } }, "changed the length"),
+    ] {
+        let after = updated(doc! { "_id": 7 }, update.clone(), vec![], &before);
+        let err = p
+            .project_returned(&f, &before, &after)
+            .expect_err(&format!("{update} -> {after}"))
+            .to_string();
+        assert!(err.contains(words), "{update}: {err}");
+    }
 }

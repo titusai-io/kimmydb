@@ -289,6 +289,7 @@ impl Update {
 fn positional_identifiers(path: &str) -> Result<Vec<String>> {
     let mut identifiers: Vec<String> = Vec::new();
     let mut dollars = 0;
+    let mut after_array_positional = false;
     for (position, segment) in path::segments(path).iter().enumerate() {
         if *segment == "$" {
             dollars += 1;
@@ -302,6 +303,12 @@ fn positional_identifiers(path: &str) -> Result<Vec<String>> {
                 return Err(Error::InvalidUpdate(format!(
                     "the path {path:?} has more than one `$` positional operator; a path may \
                      have one"
+                )));
+            }
+            if after_array_positional {
+                return Err(Error::InvalidUpdate(format!(
+                    "the `$` positional operator in {path:?} comes after a `$[]` or \
+                     `$[<identifier>]` segment; `$` must come before any of them"
                 )));
             }
             continue;
@@ -319,6 +326,7 @@ fn positional_identifiers(path: &str) -> Result<Vec<String>> {
                 "path {path:?} begins with a positional segment, but a document is not an array"
             )));
         }
+        after_array_positional = true;
         if identifier.is_empty() {
             continue;
         }

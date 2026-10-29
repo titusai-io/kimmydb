@@ -22,8 +22,8 @@ use crate::path;
 pub enum Filter {
     /// Matches everything. The parse of `{}`.
     AlwaysTrue,
-    And(Vec<Filter>),
-    Or(Vec<Filter>),
+    And(Branches),
+    Or(Branches),
     Nor(Vec<Filter>),
     /// All conditions on one field path must hold.
     Field {
@@ -38,6 +38,67 @@ pub enum Filter {
     /// growing a field-reference syntax of its own (ADR-106). The planner
     /// never reads it: an expression names no field it could put bounds on.
     Expr(Box<Expr>),
+}
+
+/// The clauses of an `$and` or `$or`, in the order they are evaluated, and
+/// where each was written.
+///
+/// The parser puts the clauses that hold no `$expr` first (ADR-206). The
+/// written place is kept for the one reader that depends on it, the position
+/// of the positional `$` ([`matches_at`]). Two lists are equal when they hold
+/// the same clauses in the same evaluation order.
+#[derive(Clone, Debug)]
+pub struct Branches {
+    items: Vec<Filter>,
+    /// `written[i]` is the place `items[i]` had in the written list.
+    written: Vec<usize>,
+}
+
+impl Branches {
+    /// `clauses`, written in this order, with those that hold no `$expr` first.
+    fn cheap_first(clauses: Vec<Filter>) -> Self {
+        let mut order: Vec<usize> = (0..clauses.len()).collect();
+        order.sort_by_key(|&i| filter_has_expr(&clauses[i]));
+        let mut slots: Vec<Option<Filter>> = clauses.into_iter().map(Some).collect();
+        let items = order.iter().map(|&i| slots[i].take().expect("each place once")).collect();
+        Branches { items, written: order }
+    }
+
+    /// The clauses in the order they were written.
+    fn in_written_order(&self) -> impl Iterator<Item = &Filter> {
+        let mut by_place: Vec<usize> = (0..self.items.len()).collect();
+        by_place.sort_by_key(|&i| self.written[i]);
+        by_place.into_iter().map(|i| &self.items[i])
+    }
+}
+
+impl From<Vec<Filter>> for Branches {
+    /// Clauses already in the order to evaluate them, taken as written.
+    fn from(items: Vec<Filter>) -> Self {
+        let written = (0..items.len()).collect();
+        Branches { items, written }
+    }
+}
+
+impl PartialEq for Branches {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+
+impl std::ops::Deref for Branches {
+    type Target = [Filter];
+    fn deref(&self) -> &[Filter] {
+        &self.items
+    }
+}
+
+impl<'a> IntoIterator for &'a Branches {
+    type Item = &'a Filter;
+    type IntoIter = std::slice::Iter<'a, Filter>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,7 +257,7 @@ fn parse_scoped(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
 /// makes the answer independent of the written order: the matcher keeps an
 /// expression's error until no clause has decided, whatever came first.
 pub fn conjunction(clauses: Vec<Filter>) -> Filter {
-    Filter::And(cheap_first(clauses, filter_has_expr))
+    Filter::And(Branches::cheap_first(clauses))
 }
 
 /// `items` with those `has_expr` marks moved to the end, keeping each
@@ -221,12 +282,12 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
                 _ => Err(Error::InvalidQuery(format!("${op} entries must be documents"))),
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(cheap_first(parsed, filter_has_expr))
+        Ok(parsed)
     };
 
     Ok(match op {
-        "and" => Filter::And(branches(value)?),
-        "or" => Filter::Or(branches(value)?),
+        "and" => Filter::And(Branches::cheap_first(branches(value)?)),
+        "or" => Filter::Or(Branches::cheap_first(branches(value)?)),
         "nor" => Filter::Nor(branches(value)?),
         // The expression parser reports its own errors — an unknown operator,
         // a wrong arity — in the same error type as the rest of this module,
@@ -1062,16 +1123,20 @@ pub struct ArrayPosition {
 /// over the same filter that shares [`condition_matches`] with it. Nothing the
 /// ordinary matcher does depends on this function.
 ///
-/// The position is the one MongoDB's `$` uses: **the last array field the
-/// filter matched on**, and in it **the first element that satisfied the
-/// condition**. Clauses are visited in the order the filter holds them, so a
-/// later clause on another array replaces an earlier one's position, and
-/// several conditions on one array path leave the first element that
-/// satisfies the last of them. An `$or` records from the first branch that
-/// holds. `$nor`, `$not`, `$ne`, `$nin`, `$exists`, `$size`, `$all` and
-/// `$expr` record nothing, because what they report is not an element that
-/// satisfied anything. `None` means the document matched without an array
-/// element being the reason.
+/// The position is **the last array field the filter matched on**, and in it
+/// **the first element that satisfied the condition**, the rule the reference
+/// language states for its `$`. Clauses are visited in the order they were
+/// written, so a later clause on another array replaces an earlier one's
+/// position, and several conditions on one array path (kept in the order the
+/// filter evaluates them) leave the first element
+/// that satisfies the last of them. An element is tested as [`matches`] tests
+/// it, one level into the array. An `$or` records from the first branch, in
+/// the order written, that holds; the reference passes no match details to the
+/// branches of an `$or`, so this is an extension (deviations register). `$nor`,
+/// `$not`, `$ne`, `$nin`, `$exists`, `$size`, `$all` and `$expr` record
+/// nothing, because what they report is not an element that satisfied
+/// anything. `None` means the document matched without an array element being
+/// the reason.
 pub fn matches_at(filter: &Filter, doc: &Document) -> Result<(bool, Option<ArrayPosition>)> {
     if !matches(filter, doc)? {
         return Ok((false, None));
@@ -1085,14 +1150,14 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
     match filter {
         Filter::AlwaysTrue | Filter::Nor(_) | Filter::Expr(_) => {}
         Filter::And(branches) => {
-            for branch in branches {
+            for branch in branches.in_written_order() {
                 record_position(branch, doc, at);
             }
         }
         Filter::Or(branches) => {
             // A branch that cannot be evaluated did not decide the match.
             if let Some(branch) =
-                branches.iter().find(|b| matches!(evaluate(b, doc, &[]), Ok(true)))
+                branches.in_written_order().find(|b| matches!(evaluate(b, doc, &[]), Ok(true)))
             {
                 record_position(branch, doc, at);
             }
@@ -1144,17 +1209,17 @@ fn condition_position(condition: &Condition, doc: &Document, path: &str) -> Opti
 }
 
 /// Whether one element of the array, with `rest` of the path below it, makes
-/// `condition` hold.
+/// `condition` hold, as the matcher decides it.
+///
+/// With `rest` empty the matcher applies a condition to the array's value and
+/// to each of its elements, and goes no deeper: an element that is itself an
+/// array is one value, and its members are not tried. [`item_holds`] is that
+/// per-element step, from the predicates [`condition_matches`] applies. With a
+/// path below the element, the values under it are the matcher's own
+/// ([`path::resolve`]) and the condition is evaluated over them whole.
 fn element_satisfies(condition: &Condition, item: &Bson, rest: &str) -> bool {
     let held = if rest.is_empty() {
-        // `$elemMatch` reads the elements of the array it is given; the
-        // element alone is wrapped so that it is the one it tests.
-        match condition {
-            Condition::ElemMatch(_) => {
-                condition_matches(condition, &[&Bson::Array(vec![item.clone()])], &[])
-            }
-            _ => condition_matches(condition, &[item], &[]),
-        }
+        item_holds(condition, item)
     } else {
         match item {
             Bson::Document(inner) => condition_matches(condition, &path::resolve(inner, rest), &[]),
@@ -1162,6 +1227,35 @@ fn element_satisfies(condition: &Condition, item: &Bson, rest: &str) -> bool {
         }
     };
     matches!(held, Ok(true))
+}
+
+/// Whether `condition` holds for one array element standing for the array,
+/// for the conditions that are about elements: what [`condition_matches`]
+/// decides for that element when it tests the array's elements one by one.
+fn item_holds(condition: &Condition, item: &Bson) -> Result<bool> {
+    Ok(match condition {
+        Condition::Eq(expected) => matching::value_equals(item, expected),
+        Condition::Gt(bound) => matching::value_compares(item, bound, &[Ordering::Greater]),
+        Condition::Gte(bound) => {
+            matching::value_compares(item, bound, &[Ordering::Greater, Ordering::Equal])
+        }
+        Condition::Lt(bound) => matching::value_compares(item, bound, &[Ordering::Less]),
+        Condition::Lte(bound) => {
+            matching::value_compares(item, bound, &[Ordering::Less, Ordering::Equal])
+        }
+        Condition::In(options) => options.iter().any(|o| matching::value_equals(item, o)),
+        Condition::Type(names) => type_holds(names, item),
+        Condition::Regex(re) => regex_holds(re, item),
+        Condition::Mod { divisor, remainder } => mod_holds(*divisor, *remainder, item),
+        Condition::Bits { test, mask } => bits_holds(*test, *mask, item),
+        // `$elemMatch` reads the elements of the array it is given; the
+        // element alone is wrapped so that it is the one it tests.
+        Condition::ElemMatch(_) => {
+            condition_matches(condition, &[&Bson::Array(vec![item.clone()])], &[])?
+        }
+        // Not about elements: `condition_position` does not ask.
+        _ => false,
+    })
 }
 
 /// The refusal for a `$expr` that could not be evaluated, against the
@@ -1213,9 +1307,10 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
     }
     match filter {
         Filter::AlwaysTrue => false,
-        Filter::And(branches) | Filter::Or(branches) | Filter::Nor(branches) => {
+        Filter::And(branches) | Filter::Or(branches) => {
             branches.iter().any(|f| reads_variable(f, names))
         }
+        Filter::Nor(branches) => branches.iter().any(|f| reads_variable(f, names)),
         Filter::Field { conditions, .. } => conditions.iter().any(|c| condition(c, names)),
         Filter::Expr(e) => e.reads_variable(names),
     }
@@ -1225,9 +1320,8 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
 fn filter_has_expr(filter: &Filter) -> bool {
     match filter {
         Filter::AlwaysTrue => false,
-        Filter::And(branches) | Filter::Or(branches) | Filter::Nor(branches) => {
-            branches.iter().any(filter_has_expr)
-        }
+        Filter::And(branches) | Filter::Or(branches) => branches.iter().any(filter_has_expr),
+        Filter::Nor(branches) => branches.iter().any(filter_has_expr),
         Filter::Field { conditions, .. } => conditions.iter().any(condition_has_expr),
         Filter::Expr(_) => true,
     }
@@ -1299,6 +1393,50 @@ pub(crate) fn expr_evaluations() -> usize {
     EXPR_EVALUATIONS.with(std::cell::Cell::get)
 }
 
+/// `$type` on one value.
+fn type_holds(names: &[String], value: &Bson) -> bool {
+    names.iter().any(|n| n == type_name_of(value))
+}
+
+/// `$regex` on one value; only a string can match.
+fn regex_holds(re: &RegexPattern, value: &Bson) -> bool {
+    match value {
+        Bson::String(s) => re.is_match(s),
+        _ => false,
+    }
+}
+
+/// `$mod` on one value, numeric only. The value is truncated to an integer
+/// first, so 8.5 satisfies `[4, 0]`, and the remainder keeps the dividend's
+/// sign: `-7` satisfies `[3, -1]`, not `[3, 2]`, both as MongoDB does.
+fn mod_holds(divisor: i64, remainder: i64, value: &Bson) -> bool {
+    let n = match value {
+        Bson::Int32(n) => i64::from(*n),
+        Bson::Int64(n) => *n,
+        Bson::Double(d) => match truncate_to_i64(*d) {
+            Some(n) => n,
+            None => return false,
+        },
+        Bson::Decimal128(d) => match truncate_decimal(d) {
+            Some(n) => n,
+            None => return false,
+        },
+        _ => return false,
+    };
+    // `i64::MIN % -1` overflows; its remainder is zero.
+    n.checked_rem(divisor).unwrap_or(0) == remainder
+}
+
+/// A bit test on one value, read as 64 bits of two's complement, so a negative
+/// number has its high bits set. A value that is not a whole number that fits
+/// (a string, a null, a fraction, BinData) matches nothing.
+fn bits_holds(test: BitTest, mask: u64, value: &Bson) -> bool {
+    match whole_i64(value) {
+        Some(n) => test.holds(n as u64, mask),
+        None => false,
+    }
+}
+
 /// Evaluate one condition against the values found at a path.
 ///
 /// `values` is empty when the path is absent, which several operators treat
@@ -1327,14 +1465,9 @@ fn condition_matches(
         Condition::In(options) => options.iter().any(|option| matching::equals(values, option)),
         Condition::Nin(options) => !options.iter().any(|option| matching::equals(values, option)),
 
-        Condition::Type(names) => {
-            any_element(values, |v| names.iter().any(|n| n == type_name_of(v)))
-        }
+        Condition::Type(names) => any_element(values, |v| type_holds(names, v)),
 
-        Condition::Regex(re) => any_element(values, |v| match v {
-            Bson::String(s) => re.is_match(s),
-            _ => false,
-        }),
+        Condition::Regex(re) => any_element(values, |v| regex_holds(re, v)),
 
         // Array-shaped operators inspect the array itself rather than its
         // elements, so they must not go through `any_element`.
@@ -1362,35 +1495,13 @@ fn condition_matches(
         })?,
 
         // Element-wise like the comparisons, and numeric only: a string never
-        // has a remainder. The value is truncated to an integer first, so 8.5
-        // satisfies `[4, 0]`, and the remainder keeps the dividend's sign —
-        // `-7` satisfies `[3, -1]`, not `[3, 2]` — both as MongoDB does.
-        Condition::Mod { divisor, remainder } => any_element(values, |v| {
-            let n = match v {
-                Bson::Int32(n) => i64::from(*n),
-                Bson::Int64(n) => *n,
-                Bson::Double(d) => match truncate_to_i64(*d) {
-                    Some(n) => n,
-                    None => return false,
-                },
-                Bson::Decimal128(d) => match truncate_decimal(d) {
-                    Some(n) => n,
-                    None => return false,
-                },
-                _ => return false,
-            };
-            // `i64::MIN % -1` overflows; its remainder is zero.
-            n.checked_rem(*divisor).unwrap_or(0) == *remainder
-        }),
+        // has a remainder (`mod_holds`).
+        Condition::Mod { divisor, remainder } => {
+            any_element(values, |v| mod_holds(*divisor, *remainder, v))
+        }
 
-        // The value read as 64 bits of two's complement, so a negative number
-        // has its high bits set. A value that is not a whole number that fits
-        // (a string, a null, a fraction, BinData) matches nothing, and a
-        // missing field has no value to read.
-        Condition::Bits { test, mask } => any_element(values, |v| match whole_i64(v) {
-            Some(n) => test.holds(n as u64, *mask),
-            None => false,
-        }),
+        // The value read as 64 bits of two's complement (`bits_holds`).
+        Condition::Bits { test, mask } => any_element(values, |v| bits_holds(*test, *mask, v)),
 
         Condition::Not(inner) => !condition_matches(inner, values, vars)?,
 
@@ -2863,8 +2974,8 @@ mod tests {
         };
         let d = doc! { "_id": 1 };
         for filter in [
-            Filter::Or(vec![unbound(), Filter::AlwaysTrue]),
-            Filter::And(vec![unbound(), parse(&doc! { "_id": 2 }).unwrap()]),
+            Filter::Or(vec![unbound(), Filter::AlwaysTrue].into()),
+            Filter::And(vec![unbound(), parse(&doc! { "_id": 2 }).unwrap()].into()),
             unbound(),
         ] {
             let e = matches(&filter, &d).unwrap_err();
