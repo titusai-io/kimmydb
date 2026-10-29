@@ -9,6 +9,7 @@
 pub mod aggregate;
 pub mod expr;
 pub mod filter;
+pub mod json_schema;
 
 /// Dot-path resolution. Lives in `kimmy-core` because index maintenance in
 /// `kimmy-storage` needs it too; re-exported here for convenience.
@@ -26,6 +27,8 @@ mod facet_tests;
 #[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
+mod json_schema_tests;
+#[cfg(test)]
 mod math_tests;
 #[cfg(test)]
 mod positional_tests;
@@ -37,6 +40,7 @@ mod sort_zip_tests;
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};
 pub use filter::{ArrayPosition, Condition, Filter, matches, matches_at};
+pub use json_schema::Schema;
 pub use plan::{IndexPlan, choose};
 pub use shape::{FindProjection, Projection, ProjectionPaths, SortKey};
 pub use update::Update;

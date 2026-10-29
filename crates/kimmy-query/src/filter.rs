@@ -15,6 +15,7 @@ use regex_automata::meta;
 use regex_automata::util::syntax;
 
 use crate::expr::{self, Expr, all_of, any_of};
+use crate::json_schema::Schema;
 use crate::path;
 
 /// A parsed filter.
@@ -38,6 +39,11 @@ pub enum Filter {
     /// growing a field-reference syntax of its own (ADR-106). The planner
     /// never reads it: an expression names no field it could put bounds on.
     Expr(Box<Expr>),
+    /// `{$jsonSchema: <schema>}` — matches the documents the schema accepts.
+    ///
+    /// Like `$expr` it is a clause on the whole document, and the planner
+    /// never reads it: a schema names no key range an index could answer.
+    JsonSchema(Schema),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -246,6 +252,7 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
             }
             Filter::Expr(Box::new(expr))
         }
+        "jsonSchema" => Filter::JsonSchema(Schema::parse(value)?),
         // `$not` is only meaningful applied to a field's operators; at the top
         // level Mongo rejects it too, and the clearer error is worth it.
         "not" => {
@@ -317,7 +324,7 @@ fn parse_conditions(path: &str, value: &Bson, scope: Scope<'_>) -> Result<Vec<Co
 /// fields of one element. MongoDB refuses `$expr` under `$elemMatch` outright;
 /// accepting it here is a strict superset, noted in `docs/deviations.md`.
 fn parse_elem_match(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
-    const DOCUMENT_LEVEL: [&str; 4] = ["$and", "$or", "$nor", "$expr"];
+    const DOCUMENT_LEVEL: [&str; 5] = ["$and", "$or", "$nor", "$expr", "$jsonSchema"];
     let scalar_form = !doc.is_empty()
         && doc.keys().all(|k| k.starts_with('$') && !DOCUMENT_LEVEL.contains(&k.as_str()));
 
@@ -437,6 +444,14 @@ fn parse_condition(
             }
             _ => return Err(Error::InvalidQuery("$not requires a document or regex".into())),
         },
+        "jsonSchema" => {
+            return Err(Error::InvalidQuery(
+                "$jsonSchema applies to a whole document, so it stands at the top of a filter,                  as in {$jsonSchema: {properties: {age: {bsonType: \"int\"}}}}, and not under \
+                 a field; to test a nested document, describe the field in the schema's \
+                 properties"
+                    .into(),
+            ));
+        }
         other => {
             return Err(Error::UnsupportedOperator { operator: format!("${other}"), reason: None });
         }
@@ -691,7 +706,7 @@ fn truncate_to_i64(d: f64) -> Option<i64> {
 /// Every name a value can report: what [`type_name_of`] returns, and so every
 /// alias `$type` accepts. Not [`type_name_for_code`]'s table, which has no
 /// code for `symbol` or `dbPointer` and would refuse types `$type` finds.
-const TYPE_NAMES: [&str; 20] = [
+pub(crate) const TYPE_NAMES: [&str; 20] = [
     "double",
     "string",
     "object",
@@ -1083,7 +1098,7 @@ pub fn matches_at(filter: &Filter, doc: &Document) -> Result<(bool, Option<Array
 
 fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPosition>) {
     match filter {
-        Filter::AlwaysTrue | Filter::Nor(_) | Filter::Expr(_) => {}
+        Filter::AlwaysTrue | Filter::Nor(_) | Filter::Expr(_) | Filter::JsonSchema(_) => {}
         Filter::And(branches) => {
             for branch in branches {
                 record_position(branch, doc, at);
@@ -1218,6 +1233,7 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
         }
         Filter::Field { conditions, .. } => conditions.iter().any(|c| condition(c, names)),
         Filter::Expr(e) => e.reads_variable(names),
+        Filter::JsonSchema(_) => false,
     }
 }
 
@@ -1230,6 +1246,7 @@ fn filter_has_expr(filter: &Filter) -> bool {
         }
         Filter::Field { conditions, .. } => conditions.iter().any(condition_has_expr),
         Filter::Expr(_) => true,
+        Filter::JsonSchema(_) => false,
     }
 }
 
@@ -1259,6 +1276,7 @@ fn evaluate(filter: &Filter, doc: &Document, vars: &[expr::Binding<'_>]) -> Resu
             all_of(conditions, |c| condition_matches(c, &values, vars))
         }
         Filter::Expr(e) => expr_matches(e, doc, vars),
+        Filter::JsonSchema(schema) => Ok(schema.is_valid(doc)),
     }
 }
 
@@ -1456,6 +1474,10 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
             let bindings = [(identifier, element)];
             e.eval_in(&expr::Scope::with_bindings(&root, &bindings)).map(|v| expr::truthy(&v))
         }
+        // A schema describes a document; any other element satisfies none.
+        Filter::JsonSchema(schema) => {
+            Ok(matches!(element, Bson::Document(d) if schema.is_valid(d)))
+        }
     }
 }
 
@@ -1529,6 +1551,8 @@ fn matches_scalar_against(
         // An expression reads fields, and a scalar has none to read: nothing
         // is evaluated, so there is nothing to fail.
         Filter::Expr(_) => Ok(false),
+        // A scalar is not a document, which is all a schema describes.
+        Filter::JsonSchema(_) => Ok(false),
     }
 }
 

@@ -298,8 +298,13 @@ fn gather_containment(filter: &Filter, out: &mut Vec<(String, PartialOp)>) {
                 }
             }
         }
-        // An expression proves nothing the partial-filter vocabulary can state.
-        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue | Filter::Expr(_) => {}
+        // An expression proves nothing the partial-filter vocabulary can state, nor
+        // does a schema.
+        Filter::Or(_)
+        | Filter::Nor(_)
+        | Filter::AlwaysTrue
+        | Filter::Expr(_)
+        | Filter::JsonSchema(_) => {}
     }
 }
 
@@ -358,8 +363,13 @@ fn collect(filter: &Filter, out: &mut HashMap<String, Bounds>) {
         // A disjunction constrains nothing that must universally hold, and an
         // `$expr` names no field it puts bounds on: `{$gt: ["$a", "$b"]}` is
         // a relation between two values that an index on either cannot see.
-        // It is always the scan's, or the residual re-check's, to answer.
-        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue | Filter::Expr(_) => {}
+        // It is always the scan's, or the residual re-check's, to answer. A
+        // `$jsonSchema` is the same: it describes the whole document, not a key range.
+        Filter::Or(_)
+        | Filter::Nor(_)
+        | Filter::AlwaysTrue
+        | Filter::Expr(_)
+        | Filter::JsonSchema(_) => {}
     }
 }
 
