@@ -21,7 +21,7 @@ can answer it, which only a *leading* `$match` gets (see
 
 | Stage | Notes |
 |---|---|
-| `$match` | The same filter language as `find` — every operator it has, `$expr` and `$mod` included. **Planned like `find` when it is the first stage** |
+| `$match` | The same filter language as `find` — every operator it has, `$expr`, `$mod` and `$jsonSchema` included. **Planned like `find` when it is the first stage** |
 | `$project` | The same [projection language](query-language.md#sort-and-projection) as `find`, a path through an array included, **plus computed fields**. Below |
 | `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |

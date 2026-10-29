@@ -61,6 +61,7 @@ regex as a value too. See [Deviations](deviations.md).
 | `$and` `$or` `$nor` | Top-level, take arrays of filter documents |
 | `$not` | Applied to a **field's** operators, not at the top level. Its document must hold at least one operator: `{"$not": {"score": 8}}` is a `400`: write `$ne` for an equality, `{"$not": {"$elemMatch": {...}}}` for an array of documents (or inside `$pull`), and a dotted path for one embedded document, `{"r.score": {"$ne": 8}}` (`$elemMatch` matches arrays only, so over a single document `{"$not": {"$elemMatch": ...}}` matches it) |
 | `$expr` | Top-level, takes an [aggregation expression](aggregation.md#expressions); matches when it is truthy |
+| `$jsonSchema` | Top-level, takes a schema document; matches the documents the schema accepts — see [`$jsonSchema`](#jsonschema) |
 
 ```javascript
 { "$or": [ { "qty": { "$lt": 5 } }, { "status": "urgent" } ] }
@@ -290,6 +291,92 @@ found: a negative or fractional mask, a position of `64` or `-1`, a string.
 - Never index-eligible. A bit test is a residual predicate every candidate
   goes through; an equality or range beside it still uses an index. It cannot
   appear in a partial index's filter.
+
+### `$jsonSchema`
+
+```javascript
+{ "$jsonSchema": {
+    "required": ["email", "age"],
+    "properties": {
+      "email": { "bsonType": "string", "pattern": "@" },
+      "age":   { "bsonType": ["int", "long"], "minimum": 0, "maximum": 150 }
+    }
+} }
+
+// the documents that break it: wrap it in $nor
+{ "$nor": [ { "$jsonSchema": { "required": ["email", "age"], "properties": { "age": { "bsonType": "int" } } } } ] }
+```
+
+A document matches when the schema accepts it. It stands at the **top** of a
+filter, alone or beside other conditions, and inside `$and`, `$or`, `$nor` and
+an `$elemMatch` over documents; `{"age": {"$jsonSchema": ...}}` is a `400`,
+because a schema describes a whole document (describe the field in
+`properties`). It works in `find`, `count`, `update`, `delete`, `$match`, and
+anywhere else a filter does.
+
+The dialect is draft-4 JSON Schema with `bsonType`, as other systems read it.
+
+| Keywords | Meaning |
+|---|---|
+| `bsonType` | A type alias or an array of them (any one holds): `double`, `string`, `object`, `array`, `binData`, `undefined`, `objectId`, `bool`, `date`, `null`, `regex`, `javascript`, `int`, `timestamp`, `long`, `decimal`, `minKey`, `maxKey`, `symbol`, `dbPointer`, and `number` for the four numeric types. `int` does not accept a double of whole value |
+| `type` | `object`, `array`, `number`, `boolean`, `string`, `null`, or an array of them. With `bsonType` on the same level, both must hold |
+| `enum` | A non-empty array; the value must equal one, by the sort order, so `1` equals `1.0` and `Decimal128("1.00")` |
+| `required` | A non-empty array of distinct property names that must be present |
+| `properties` | A schema for each named property. **A property the document lacks is not tested**: only `required` asks for it |
+| `additionalProperties` | `false`, `true`, or a schema for the properties that neither `properties` nor `patternProperties` names |
+| `patternProperties` | A schema for every property whose name the pattern matches (a search, not a full match); a property both named and matched answers to both |
+| `minProperties` `maxProperties` | The number of properties |
+| `dependencies` | For a property that is present: an array of properties that must be too, or a schema the whole document must satisfy |
+| `minimum` `maximum` | Inclusive bounds on a number; with `exclusiveMinimum: true` or `exclusiveMaximum: true` beside it, exclusive. The flag needs its bound |
+| `multipleOf` | A number above zero. Exact for `int`, `long` and `Decimal128`; see below |
+| `minLength` `maxLength` | The length of a string in characters (code points) |
+| `pattern` | A string pattern, searched for in the value: `"b"` matches `"abc"`, `"^b$"` does not |
+| `items` | A schema for every element, or an array of schemas for the elements by position |
+| `additionalItems` | With an `items` array, `false`, `true` or a schema for the elements past it. Ignored beside a single `items` schema |
+| `minItems` `maxItems` | The number of elements |
+| `uniqueItems` | `true`: no two elements are equal, by the sort order, so `1` and `1.0` are one element |
+| `allOf` `anyOf` `oneOf` | A non-empty array of schemas: all, at least one, exactly one |
+| `not` | The value must not satisfy the schema |
+| `title` `description` | A string, read and ignored |
+
+**What each keyword tests depends on the value.** A keyword written for one
+type, such as `minLength`, `items` or `required`, does not apply to a value of
+another type and is ignored for it, as in draft 4: `{"minLength": 3}` accepts
+the number `5`. Put `bsonType` beside it to require the type.
+
+**Everything else is refused when the filter is parsed**, by name, with a `400`
+that says the keyword is not supported and where it stands: `$ref`, `$schema`,
+`default`, `definitions`, `format`, `id`, `contentMediaType`, and any keyword
+not in the table, wherever it is nested (`properties`, `items`, `allOf`, ...).
+A keyword is never skipped, so a schema that parses is a schema that is
+evaluated in full. A property named `format` or `$ref` is a name, not a keyword.
+Every argument is checked as well: `required` is an array of distinct strings,
+`minLength` a non-negative whole number, an unknown `bsonType` is refused with
+the list of names, and so on.
+
+- **Numbers compare by value across types**, `Decimal128` included, as the
+  comparison operators do: `{"minimum": 1}` accepts `Int32(1)`, `Double(1.0)`
+  and `Decimal128("1.00")`; the double `0.1` is above the decimal `0.1`. A NaN
+  sorts below every number, so it is below every `minimum` and under every `maximum`.
+- **`multipleOf`**: exact when the value and the divisor are `int`, `long` or
+  `Decimal128` (`Decimal128("0.30")` is a multiple of `Decimal128("0.1")`). When either
+  is a double, both are read as doubles and the test is that the floating-point
+  remainder (`fmod`) is zero, so the double `0.3` is **not** a multiple of the
+  double `0.1`: write the divisor and the values as decimals when exactness matters.
+  A NaN or infinity is a multiple of nothing.
+- **Limits.** A schema nests at most 32 levels (the outermost is level 1), a `400`
+  beyond. Evaluation follows the schema, so a deeply nested document costs no more
+  depth. `pattern` and `patternProperties` use the same engine and the same limits
+  as [`$regex`](#regex-compatibility): a pattern with a backreference or a lookaround, or one over
+  the size limit, is a `400`, and a filter's patterns, `$regex` and schema together,
+  are counted against its 32. `uniqueItems` sorts a reference to each element, so
+  it takes time n log n and at most 8 bytes per element, bounded by the 16 MiB
+  document limit.
+- **Never index-eligible.** A schema is a residual predicate every candidate goes
+  through, so it neither selects a key range nor narrows one; an equality or range
+  beside it still uses an index. It cannot appear in a partial index's filter.
+- Inside an `$elemMatch`, `$pull` condition or `arrayFilters` entry it tests
+  an element that is a document; a scalar element never satisfies it.
 
 ### `$type`
 
@@ -1237,7 +1324,7 @@ than as an `$or` of one `$regex` each.
 | `$vectorSearch` | ✅ Built as the first [aggregation](aggregation.md#vectorsearch) stage, with the fields of the [vector search endpoint](vectors.md); other systems' field names are refused |
 | `$` positional update operator (`items.$.qty`) and positional projection (`items.$`) | ✅ Built — the last array the filter matched on, the first element that satisfied it; see [Positional updates](#positional-updates) and [Sort and projection](#sort-and-projection) |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
-| `$jsonSchema` | 📋 Not built |
+| `$jsonSchema` | ✅ Built as a filter operator — see [`$jsonSchema`](#jsonschema) |
 | Geospatial operators | ⛔ Not planned |
 | Text indexes / `$text` | ⛔ Superseded by [vector and hybrid search](vectors.md) |
 

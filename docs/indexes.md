@@ -399,6 +399,7 @@ re-applied regardless.
 | `$exists` `$regex` `$size` `$all` `$elemMatch` | Cannot be turned into a key range safely |
 | `$mod` | A remainder is not a range — every fourth key is not a contiguous run of them |
 | `$bitsAllSet` `$bitsAnySet` `$bitsAllClear` `$bitsAnyClear` | A bit pattern is not a range either; each is a residual re-check, and none can appear in a partial filter |
+| `$jsonSchema` | A schema describes a whole document, not a key range; it is a residual re-check, and cannot appear in a partial filter |
 | The **second end** of a two-sided range, on a **multikey** index only | See below — an array field can satisfy each bound with a *different element* |
 
 `$in` **is planned**, as a union of point probes — one per distinct value,
