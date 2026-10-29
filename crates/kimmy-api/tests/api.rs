@@ -3991,6 +3991,165 @@ async fn bits_operators_filter_a_find() {
     }
 }
 
+/// `$jsonSchema` as a filter: in a `find`, under `$nor` to find the documents
+/// that break a schema, in a `$match`, a `count`, an update and a delete, and
+/// the `400` for a field-level use, a bad schema and a partial index filter.
+#[tokio::test]
+async fn json_schema_filters_every_route_that_takes_a_filter() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for doc in [
+        json!({"_id": 1, "email": "a@x.io", "age": 30}),
+        json!({"_id": 2, "email": "b@x.io", "age": -4}),
+        json!({"_id": 3, "email": "c@x.io"}),
+        json!({"_id": 4, "age": 41}),
+        json!({"_id": 5, "email": "e@x.io", "age": "old"}),
+        json!({"_id": 6, "email": "f@x.io", "age": 22.5}),
+        json!({"_id": 7, "email": "g@x.io", "age": 7}),
+    ] {
+        let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    // The schema from the write-up: both fields are there, the age is a whole
+    // number from 0 up.
+    let schema = json!({
+        "required": ["email", "age"],
+        "properties": {
+            "email": {"bsonType": "string"},
+            "age": {"bsonType": ["int", "long"], "minimum": 0}
+        }
+    });
+    let ids = |filter: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/c/find",
+                    Some(token),
+                    json!({"filter": filter, "sort": {"_id": 1}}),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+            res.body["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["_id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    assert_eq!(ids(json!({"$jsonSchema": schema})).await, [1, 7]);
+    // Finding the bad data.
+    assert_eq!(ids(json!({"$nor": [{"$jsonSchema": schema}]})).await, [2, 3, 4, 5, 6]);
+    assert_eq!(
+        ids(json!({"$jsonSchema": schema, "age": {"$gt": 10}})).await,
+        [1],
+        "beside an ordinary condition"
+    );
+    assert_eq!(ids(json!({"$or": [{"$jsonSchema": schema}, {"_id": 4}]})).await, [1, 4, 7]);
+
+    // The same answers through an index on `age`: the schema is never what the
+    // index answers.
+    let res = server
+        .post("/v1/db/shop/coll/c/indexes", Some(&token), json!({"fields": [{"path": "age"}]}))
+        .await;
+    assert!(res.status == 200 || res.status == 201, "{:?}", res.body);
+    assert_eq!(ids(json!({"$jsonSchema": schema})).await, [1, 7]);
+    assert_eq!(ids(json!({"age": {"$gte": 0}, "$jsonSchema": schema})).await, [1, 7]);
+
+    // `$match` in an aggregation.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$match": {"$nor": [{"$jsonSchema": schema}]}},
+                {"$sort": {"_id": 1}},
+                {"$project": {"_id": 1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"],
+        json!([{"_id": 2}, {"_id": 3}, {"_id": 4}, {"_id": 5}, {"_id": 6}])
+    );
+
+    // `count`.
+    let res = server
+        .post("/v1/db/shop/coll/c/count", Some(&token), json!({"filter": {"$jsonSchema": schema}}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 2);
+
+    // An update and a delete take the same filter.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({
+                "filter": {"$nor": [{"$jsonSchema": schema}]},
+                "update": {"$set": {"flagged": true}},
+                "multi": true
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 5, "{:?}", res.body);
+    assert_eq!(ids(json!({"flagged": true})).await, [2, 3, 4, 5, 6]);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/delete",
+            Some(&token),
+            json!({"filter": {"$nor": [{"$jsonSchema": schema}]}, "multi": true}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["deleted"], 5, "{:?}", res.body);
+    assert_eq!(ids(json!({})).await, [1, 7]);
+
+    // The refusals are all a 400 that says why.
+    for (filter, needle) in [
+        (json!({"age": {"$jsonSchema": {}}}), "top of a filter"),
+        (json!({"age": {"$not": {"$jsonSchema": {}}}}), "top of a filter"),
+        (json!({"$jsonSchema": 5}), "schema document"),
+        (json!({"$jsonSchema": {"format": "email"}}), "\"format\""),
+        (json!({"$jsonSchema": {"properties": {"a": {"$ref": "#/x"}}}}), "not supported"),
+        (json!({"$jsonSchema": {"bsonType": "integer"}}), "integer"),
+        (json!({"$jsonSchema": {"required": []}}), "required"),
+        (json!({"$jsonSchema": {"properties": {"a": {"pattern": "("}}}}), "pattern"),
+    ] {
+        let res =
+            server.post("/v1/db/shop/coll/c/find", Some(&token), json!({"filter": filter})).await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(needle), "{filter}: {msg}");
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/count",
+            Some(&token),
+            json!({"filter": {"$jsonSchema": {"default": 1}}}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+
+    // A partial index filter holds no schema, at the top or under a field.
+    for bad in [json!({"$jsonSchema": {}}), json!({"age": {"$jsonSchema": {}}})] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/c/indexes",
+                Some(&token),
+                json!({"name": "bad", "fields": [{"path": "email"}], "partialFilterExpression": bad}),
+            )
+            .await;
+        assert_eq!(res.status, 400, "{bad}: {:?}", res.body);
+    }
+}
+
 /// `$pull` with an operator document removes the elements that satisfy it; a
 /// plain document still matches whole; a mixed one is a `400`.
 #[tokio::test]
