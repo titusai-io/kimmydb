@@ -106,6 +106,7 @@ impl Engine {
         docs: Vec<Document>,
         mode: SinkMode,
     ) -> Result<SinkOutcome> {
+        self.check_output_ids(&docs)?;
         if mode == SinkMode::Insert {
             refuse_duplicate_ids(&docs)?;
         }
@@ -140,6 +141,23 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Refuse the whole output if any document's `_id` could not be stored: a
+    /// type no `_id` may have, or one over the size cap. Every document is in
+    /// memory before the first write, so a client error in the pipeline's own
+    /// output is answered as one, with nothing written and, when the caller asks
+    /// first, nothing created. A document with no `_id` is given one on insert.
+    pub fn check_output_ids(&self, docs: &[Document]) -> Result<()> {
+        for doc in docs {
+            if let Some(value) = doc.get(ID_FIELD) {
+                let id = DocId::try_from_bson(value)?;
+                if self.caps_apply() {
+                    kimmy_core::limits::check_id(&id)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One transaction of [`Self::write_documents`]: the counts of the

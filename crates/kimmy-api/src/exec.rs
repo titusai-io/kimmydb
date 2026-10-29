@@ -2268,6 +2268,9 @@ fn write_sink(
 ) -> Result<Value, ApiError> {
     let SinkPlan { db, coll, existing } = plan;
     let is_out = matches!(stage, aggregate::Stage::Out(_));
+    // A refused output creates nothing: its `_id`s are checked before the target
+    // is created, as `write_documents` checks them before its first chunk.
+    state.engine.check_output_ids(&docs)?;
     let not_empty = |meta: &CollectionMeta| -> Result<(), ApiError> {
         let mut holds = false;
         kimmy_storage::blocking(|| {
