@@ -2089,7 +2089,12 @@ pub(crate) async fn aggregate_run_stats(
 ) -> Result<(Value, Option<QueryStats>), ApiError> {
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
-    let stages = parse_pipeline(pipeline)?;
+    let all_stages = parse_pipeline(pipeline)?;
+    // A trailing `$merge` or `$out` is checked, and its target resolved, before
+    // anything is read (ADR-255).
+    let sink = plan_sink(state, auth, db, coll, &all_stages)?;
+    let body = all_stages.len() - usize::from(sink.is_some());
+    let stages = &all_stages[..body];
 
     // A `$vectorSearch` first stage is the source (ADR-216): the hits, as
     // documents, take the collection scan's place. It needs `search` as well
@@ -2108,7 +2113,7 @@ pub(crate) async fn aggregate_run_stats(
         // stages is taken — `aggregate::leading_match` says why — and every later
         // stage runs exactly as it did, on exactly the input it had. A pipeline
         // with no leading `$match` is the collection, through the same scan.
-        let (filter, consumed, what) = match aggregate::leading_match(&stages) {
+        let (filter, consumed, what) = match aggregate::leading_match(stages) {
             Some((filter, consumed)) => (filter, consumed, "the leading $match"),
             None => (filter::Filter::AlwaysTrue, 0, "the source collection"),
         };
@@ -2127,6 +2132,11 @@ pub(crate) async fn aggregate_run_stats(
     };
 
     let docs = run_stages(state, auth, db, &stages[consumed..], docs, &limits, &[])?;
+
+    if let Some(sink) = sink {
+        let last = all_stages.last().expect("a sink is a stage of the pipeline");
+        return Ok((write_sink(state, sink, last, docs)?, source_stats));
+    }
 
     let documents: Vec<Value> = docs.iter().map(document_to_json).collect();
     Ok((json!({ "documents": documents, "count": documents.len() }), source_stats))
@@ -2185,6 +2195,153 @@ fn run_stages(
         };
     }
     Ok(docs)
+}
+
+/// Where a trailing `$merge` or `$out` writes, once the request is known to be
+/// allowed to write there (ADR-255).
+pub(crate) struct SinkPlan {
+    db: String,
+    coll: String,
+    /// The target as it stands: `None` when it does not exist yet, which the
+    /// write creates.
+    existing: Option<CollectionMeta>,
+}
+
+/// Check a pipeline's trailing `$merge` or `$out`, if it has one, and resolve its
+/// target. Writes nothing, so `explain` asks it too.
+///
+/// Refused: a target the pipeline reads, which is the source and every
+/// `$lookup` and `$graphLookup` collection however deeply nested. A pipeline
+/// that reads what it writes has no defined answer, because each stage reads
+/// storage when it runs (see [`aggregate`]), and the chunked write is already
+/// under way while a later chunk is read. Then the caller needs `write` on the
+/// target, and `ddl` as well when the target does not exist, since the write
+/// creates it: an insert never creates a collection, and a `write` grant is not
+/// a grant to shape the data.
+pub(crate) fn plan_sink(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    stages: &[aggregate::Stage],
+) -> Result<Option<SinkPlan>, ApiError> {
+    let target = match stages.last() {
+        Some(aggregate::Stage::Merge(spec)) => &spec.into,
+        Some(aggregate::Stage::Out(target)) => target,
+        _ => return Ok(None),
+    };
+    let name = stages.last().map_or("", |s| s.name());
+    let (target_db, target_coll) = (target.db.as_deref().unwrap_or(db), target.coll.as_str());
+    kimmy_core::Error::validate_name(target_db)?;
+    kimmy_core::Error::validate_name(target_coll)?;
+    let reads_it = target_db == db
+        && (target_coll == coll || aggregate::foreign_collections(stages).contains(&target_coll));
+    if reads_it {
+        return Err(ApiError::bad_request(format!(
+            "{name} cannot write `{target_db}`.`{target_coll}`: the pipeline reads it, as its \
+             source or in a $lookup or $graphLookup. Write to a collection the pipeline does not \
+             read"
+        )));
+    }
+    auth.require(Action::Write, target_db, Some(target_coll))?;
+    let existing = match state.engine.get_collection(target_db, target_coll) {
+        Ok(meta) => Some(meta),
+        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+            ..
+        })) => {
+            auth.require(Action::Ddl, target_db, Some(target_coll))?;
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(Some(SinkPlan { db: target_db.into(), coll: target_coll.into(), existing }))
+}
+
+/// Write a pipeline's output through the sink stage that ends it, and answer with
+/// the counts instead of documents: the shape of an aggregate answer, with no
+/// documents, and the stage's own counts under its name.
+fn write_sink(
+    state: &SharedState,
+    plan: SinkPlan,
+    stage: &aggregate::Stage,
+    docs: Vec<bson::Document>,
+) -> Result<Value, ApiError> {
+    let SinkPlan { db, coll, existing } = plan;
+    let is_out = matches!(stage, aggregate::Stage::Out(_));
+    // A refused output creates nothing: its `_id`s are checked before the target
+    // is created, as `write_documents` checks them before its first chunk.
+    state.engine.check_output_ids(&docs)?;
+    if is_out {
+        state.engine.check_unique_output_ids(&docs)?;
+    }
+    let not_empty = |meta: &CollectionMeta| -> Result<(), ApiError> {
+        let mut holds = false;
+        kimmy_storage::blocking(|| {
+            state.engine.for_each_doc(meta, kimmy_storage::WalkScope::Request, |_, _| {
+                holds = true;
+                Ok(false)
+            })
+        })?;
+        if holds {
+            return Err(ApiError::bad_request(format!(
+                "$out writes only into a new or empty collection, and `{db}`.`{coll}` holds \
+                 documents. Drop the collection first, or use $merge"
+            )));
+        }
+        Ok(())
+    };
+    // Checked before the pipeline's output is spent, not when it is written; a
+    // writer that slips in between is an ordinary concurrent writer.
+    if let (true, Some(meta)) = (is_out, &existing) {
+        not_empty(meta)?;
+    }
+    let meta = match existing {
+        Some(meta) => meta,
+        None => match kimmy_storage::blocking(|| state.engine.create_collection(&db, &coll)) {
+            Ok(meta) => meta,
+            // Created by someone else since the plan: it is theirs, and for `$out`
+            // it is no longer new.
+            Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionExists {
+                ..
+            })) => {
+                let meta = collection(state, &db, &coll)?;
+                if is_out {
+                    not_empty(&meta)?;
+                }
+                meta
+            }
+            Err(e) => return Err(e.into()),
+        },
+    };
+    let mode = match stage {
+        aggregate::Stage::Merge(spec) => kimmy_storage::SinkMode::Merge {
+            when_matched: match spec.when_matched {
+                aggregate::WhenMatched::Replace => kimmy_storage::WhenMatched::Replace,
+                aggregate::WhenMatched::Merge => kimmy_storage::WhenMatched::Merge,
+                aggregate::WhenMatched::KeepExisting => kimmy_storage::WhenMatched::KeepExisting,
+            },
+            insert_unmatched: spec.insert_unmatched,
+        },
+        _ => kimmy_storage::SinkMode::Insert,
+    };
+    let outcome = kimmy_storage::blocking(|| state.engine.write_documents(&meta, docs, mode))?;
+    let counts = outcome.counts;
+    let written = if is_out {
+        json!({ "inserted": counts.inserted, "commits": outcome.commits })
+    } else {
+        json!({
+            "matched": counts.matched,
+            "inserted": counts.inserted,
+            "replaced": counts.replaced,
+            "merged": counts.merged,
+            "kept": counts.kept,
+            "discarded": counts.discarded,
+            "commits": outcome.commits,
+        })
+    };
+    let mut body = json!({ "documents": [], "count": 0 });
+    body[if is_out { "out" } else { "merge" }] = written;
+    Ok(body)
 }
 
 pub(crate) fn parse_pipeline(pipeline: &Value) -> Result<Vec<aggregate::Stage>, ApiError> {

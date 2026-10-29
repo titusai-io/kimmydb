@@ -75,6 +75,8 @@ use kimmy_core::decimal::arith::{self, ExactSum};
 use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
 use kimmy_core::{Error, Result, canonical_cmp, path};
 
+use crate::shape::{self, SortKey};
+
 // ---------------------------------------------------------------------------
 // The operator set
 // ---------------------------------------------------------------------------
@@ -471,6 +473,20 @@ impl ConvertTo {
 // The tree
 // ---------------------------------------------------------------------------
 
+/// How `$sortArray` orders an array: whole elements, or documents by keys.
+///
+/// Both are [`canonical_cmp`], the order `$sort` uses, and both are stable.
+/// A sort document applies to a non-document element as to a document that
+/// holds none of the keys: every key reads as null.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArrayOrder {
+    /// `sortBy: 1` or `-1`: the elements compared as they are. `true` is
+    /// descending.
+    Whole(bool),
+    /// `sortBy: {path: 1 | -1, ...}`: the `$sort` stage's keys, never empty.
+    Keys(Vec<SortKey>),
+}
+
 /// A computed expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -508,6 +524,10 @@ pub enum Expr {
     /// `{$reduce: {input: <expr>, initialValue: <expr>, in: <expr>}}` — `in`
     /// sees `$$value` and `$$this`.
     Reduce { input: Box<Expr>, initial: Box<Expr>, body: Box<Expr> },
+    /// `{$sortArray: {input: <expr>, sortBy: <1 | -1 | {path: 1 | -1, ...}>}}`.
+    SortArray { input: Box<Expr>, order: ArrayOrder },
+    /// `{$zip: {inputs: [<expr>, ...], useLongestLength: <bool>, defaults: [<expr>, ...]}}`.
+    Zip { inputs: Vec<Expr>, longest: bool, defaults: Option<Vec<Expr>> },
     /// A document whose values are expressions.
     Object(Vec<(String, Expr)>),
     /// An array whose elements are expressions, evaluated in order to the
@@ -967,6 +987,10 @@ impl Expr {
             Expr::Reduce { input, initial, body } => {
                 input.reads_document() || initial.reads_document() || body.reads_document()
             }
+            Expr::SortArray { input, .. } => input.reads_document(),
+            Expr::Zip { inputs, defaults, .. } => {
+                any(inputs) || defaults.as_deref().is_some_and(any)
+            }
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_document()),
             Expr::Array(items) => any(items),
         }
@@ -988,6 +1012,8 @@ impl Expr {
             | Expr::Filter { .. }
             | Expr::Map { .. }
             | Expr::Reduce { .. }
+            | Expr::SortArray { .. }
+            | Expr::Zip { .. }
             | Expr::Object(_)
             | Expr::Array(_) => "an expression".to_string(),
         }
@@ -1035,6 +1061,10 @@ impl Expr {
                 input.reads_variable(names)
                     || initial.reads_variable(names)
                     || body.reads_variable(names)
+            }
+            Expr::SortArray { input, .. } => input.reads_variable(names),
+            Expr::Zip { inputs, defaults, .. } => {
+                any(inputs) || defaults.as_deref().is_some_and(any)
             }
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_variable(names)),
             Expr::Array(items) => any(items),
@@ -1205,6 +1235,8 @@ impl Expr {
             "$filter" => Self::parse_filter(raw, declared),
             "$map" => Self::parse_map(raw, declared),
             "$reduce" => Self::parse_reduce(raw, declared),
+            "$sortArray" => Self::parse_sort_array(raw, declared),
+            "$zip" => Self::parse_zip(raw, declared),
             "$convert" => Self::parse_convert(raw, declared),
             name if ConvertTo::from_shorthand(name).is_some() => {
                 Self::parse_convert_shorthand(name, raw, declared)
@@ -1406,6 +1438,90 @@ impl Expr {
         let body = Self::required("$map", spec, "in")?;
         let body = Self::parse_scoped(body, [as_name.as_str()], declared)?;
         Ok(Expr::Map { input: Box::new(input), as_name, body: Box::new(body) })
+    }
+
+    /// `sortBy` is a constant: a direction, or a sort document of paths and
+    /// directions. A malformed one is refused here, before a row is read.
+    fn parse_sort_array(raw: &Bson, declared: &mut Declared) -> Result<Self> {
+        let spec = Self::named_spec("$sortArray", raw, &["input", "sortBy"])?;
+        let input = Self::parse_in(Self::required("$sortArray", spec, "input")?, declared)?;
+        let order = match Self::required("$sortArray", spec, "sortBy")? {
+            Bson::Document(keys) => {
+                if keys.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "$sortArray sortBy needs at least one key".into(),
+                    ));
+                }
+                let mut parsed = Vec::with_capacity(keys.len());
+                for (path, direction) in keys {
+                    let Some(descending) = shape::direction_of(direction) else {
+                        return Err(Error::InvalidQuery(format!(
+                            "$sortArray sortBy for {path:?} must be 1 or -1"
+                        )));
+                    };
+                    parsed.push(SortKey { path: path.clone(), descending });
+                }
+                ArrayOrder::Keys(parsed)
+            }
+            direction => match shape::direction_of(direction) {
+                Some(descending) => ArrayOrder::Whole(descending),
+                None => {
+                    return Err(Error::InvalidQuery(format!(
+                        "$sortArray sortBy must be 1, -1 or a sort document, found {}",
+                        type_name(direction)
+                    )));
+                }
+            },
+        };
+        Ok(Expr::SortArray { input: Box::new(input), order })
+    }
+
+    /// `inputs` is written as an array, not computed: its length is how many
+    /// arrays are zipped and how many `defaults` must follow.
+    fn parse_zip(raw: &Bson, declared: &mut Declared) -> Result<Self> {
+        let spec = Self::named_spec("$zip", raw, &["inputs", "useLongestLength", "defaults"])?;
+        let list = |key: &str, declared: &mut Declared| -> Result<Vec<Expr>> {
+            match Self::required("$zip", spec, key)? {
+                Bson::Array(items) => items.iter().map(|v| Self::parse_in(v, declared)).collect(),
+                other => Err(Error::InvalidQuery(format!(
+                    "$zip {key} must be an array written out, found {}",
+                    type_name(other)
+                ))),
+            }
+        };
+        let inputs = list("inputs", declared)?;
+        if inputs.is_empty() {
+            return Err(Error::InvalidQuery("$zip needs at least one input".into()));
+        }
+        let longest = match spec.get("useLongestLength") {
+            None => false,
+            Some(Bson::Boolean(b)) => *b,
+            Some(other) => {
+                return Err(Error::InvalidQuery(format!(
+                    "$zip useLongestLength must be a boolean, found {}",
+                    type_name(other)
+                )));
+            }
+        };
+        let defaults = if spec.contains_key("defaults") {
+            if !longest {
+                return Err(Error::InvalidQuery(
+                    "$zip takes `defaults` only with useLongestLength: true".into(),
+                ));
+            }
+            let defaults = list("defaults", declared)?;
+            if defaults.len() != inputs.len() {
+                return Err(Error::InvalidQuery(format!(
+                    "$zip defaults must have one entry per input: {} inputs, {} defaults",
+                    inputs.len(),
+                    defaults.len()
+                )));
+            }
+            Some(defaults)
+        } else {
+            None
+        };
+        Ok(Expr::Zip { inputs, longest, defaults })
     }
 
     fn parse_reduce(raw: &Bson, declared: &mut Declared) -> Result<Self> {
@@ -1627,6 +1743,15 @@ impl Expr {
             }
             Expr::Map { input, as_name, body } => eval_map(input, as_name, body, scope),
             Expr::Reduce { input, initial, body } => eval_reduce(input, initial, body, scope),
+            Expr::SortArray { input, order } => {
+                let Some(items) = iteration_input("$sortArray", input.eval_in(scope)?)? else {
+                    return Ok(Bson::Null);
+                };
+                Ok(Bson::Array(sort_array(items, order)))
+            }
+            Expr::Zip { inputs, longest, defaults } => {
+                eval_zip(inputs, *longest, defaults.as_deref(), scope)
+            }
             Expr::Op(op, args) if op.is_lazy() => eval_lazy(*op, args, scope),
             Expr::Op(op, args) => {
                 let values = args.iter().map(|a| a.eval_in(scope)).collect::<Result<Vec<_>>>()?;
@@ -1945,6 +2070,110 @@ fn eval_reduce(input: &Expr, initial: &Expr, body: &Expr, scope: &Scope<'_>) -> 
         acc = next;
     }
     Ok(acc)
+}
+
+/// Sorts `items` by `order`, stably: elements that compare equal keep their
+/// input order, in either direction.
+///
+/// The comparison is the `$sort` stage's own ([`shape::compare_keys`]) over the
+/// keys read once per element. A sort document reads an element that is not a
+/// document as an empty one, so every key is null and it ties with a document
+/// holding none of them. With `sortBy: 1` or `-1` whole elements are compared,
+/// documents included, by [`canonical_cmp`].
+fn sort_array(items: Vec<Bson>, order: &ArrayOrder) -> Vec<Bson> {
+    match order {
+        ArrayOrder::Whole(descending) => {
+            let mut items = items;
+            items.sort_by(|a, b| {
+                let ordering = canonical_cmp(a, b);
+                if *descending { ordering.reverse() } else { ordering }
+            });
+            items
+        }
+        ArrayOrder::Keys(keys) => {
+            let none = Document::new();
+            let mut keyed: Vec<(Vec<Bson>, Bson)> = items
+                .into_iter()
+                .map(|item| {
+                    let doc = if let Bson::Document(d) = &item { d } else { &none };
+                    (shape::sort_keys(keys, doc), item)
+                })
+                .collect();
+            keyed.sort_by(|a, b| shape::compare_keys(keys, &a.0, &b.0));
+            keyed.into_iter().map(|(_, item)| item).collect()
+        }
+    }
+}
+
+/// The most cells (rows times inputs) `$zip` will build.
+///
+/// A result holds a cell for every input at every position, so it can be
+/// several times the size of the arrays it reads; the length is decided before
+/// anything is allocated, as `$range`'s is.
+pub const MAX_ZIP_CELLS: usize = 1_000_000;
+
+fn eval_zip(
+    inputs: &[Expr],
+    longest: bool,
+    defaults: Option<&[Expr]>,
+    scope: &Scope<'_>,
+) -> Result<Bson> {
+    // Every input's type is checked before a null is honoured, so a non-array
+    // is refused wherever it stands.
+    let values = inputs.iter().map(|e| e.eval_in(scope)).collect::<Result<Vec<_>>>()?;
+    let mut arrays = Vec::with_capacity(values.len());
+    let mut any_null = false;
+    for value in &values {
+        match value {
+            Bson::Null | Bson::Undefined => any_null = true,
+            Bson::Array(items) => arrays.push(items.as_slice()),
+            other => {
+                return Err(Error::InvalidQuery(format!(
+                    "$zip needs an array for each input, found {}",
+                    type_name(other)
+                )));
+            }
+        }
+    }
+    if any_null {
+        return Ok(Bson::Null);
+    }
+    let rows = if longest {
+        arrays.iter().map(|a| a.len()).max()
+    } else {
+        arrays.iter().map(|a| a.len()).min()
+    }
+    .unwrap_or(0);
+    if rows.saturating_mul(arrays.len()) > MAX_ZIP_CELLS {
+        return Err(Error::InvalidQuery(format!(
+            "$zip would produce {} values, over the limit of {MAX_ZIP_CELLS}",
+            rows.saturating_mul(arrays.len())
+        )));
+    }
+    // A shorter input's padding: its default, or null. Defaults are read in
+    // the scope the `$zip` sits in, and only when `useLongestLength` is set.
+    let padding = match defaults {
+        Some(exprs) if longest => exprs
+            .iter()
+            .map(|e| match e.eval_in(scope)? {
+                Bson::Undefined => Ok(Bson::Null),
+                v => Ok(v),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => vec![Bson::Null; arrays.len()],
+    };
+    let out = (0..rows)
+        .map(|i| {
+            Bson::Array(
+                arrays
+                    .iter()
+                    .zip(&padding)
+                    .map(|(array, pad)| array.get(i).unwrap_or(pad).clone())
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(Bson::Array(out))
 }
 
 fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
@@ -6597,16 +6826,6 @@ mod sets_and_pairs {
         } } };
         let got = on(expr, doc! { "attrs": { "tier": "gold", "since": 2019 } });
         assert_eq!(got, Bson::Document(doc! { "TIER": "gold", "SINCE": 2019 }));
-    }
-
-    #[test]
-    fn zip_and_sort_array_stay_unknown_operators() {
-        for name in ["$zip", "$sortArray"] {
-            let mut expr = Document::new();
-            expr.insert(name, doc! { "inputs": [[1]] });
-            let msg = Expr::parse(&Bson::Document(expr)).unwrap_err().to_string();
-            assert!(msg.contains(name) && msg.contains("not an expression operator"), "{msg}");
-        }
     }
 }
 

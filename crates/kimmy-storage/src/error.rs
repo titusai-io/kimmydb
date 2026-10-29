@@ -206,6 +206,10 @@ pub enum Applied {
     /// A database drop: the collections whose burial committed, and the one
     /// whose burial's outcome is unknown, if any.
     DropDatabase { dropped: Vec<String>, in_doubt: Option<String> },
+    /// A `$merge` or `$out` write of a pipeline's output (ADR-255). Counts are
+    /// of committed chunks only; `in_doubt` is the size of a chunk whose commit's
+    /// outcome is unknown, which is not in the counts.
+    Write { counts: crate::SinkCounts, commits: u64, in_doubt: u64 },
 }
 
 impl std::fmt::Display for Applied {
@@ -214,6 +218,11 @@ impl std::fmt::Display for Applied {
             Self::Modify { matched, commits, in_doubt, .. } => {
                 write!(f, "{matched} matched in {commits} commits, {in_doubt} in doubt")
             }
+            Self::Write { counts, commits, in_doubt } => write!(
+                f,
+                "{} inserted, {} matched in {commits} commits, {in_doubt} in doubt",
+                counts.inserted, counts.matched
+            ),
             Self::DropDatabase { dropped, in_doubt } => {
                 write!(f, "{} collections dropped", dropped.len())?;
                 match in_doubt {

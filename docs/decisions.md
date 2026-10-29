@@ -23465,6 +23465,10 @@ the clauses without `$expr` not put first.
 
 ## ADR-207 — A set operator's member is what `$eq` calls equal, its result is first-seen, and what it cannot compare it refuses
 
+> **Amended by [ADR-255](#adr-255--the-merge-and-out-stages-and-the-sortarray-and-zip-operators)**: `$zip` and `$sortArray` are no
+> longer refused at parse. The "left so" in the gap below describes the code before ADR-255; both
+> operators are built, and `$sortArray` orders with the `$sort` stage's own comparison.
+
 **Status:** accepted, for the next `0.MINOR`. Extends the expression scope of
 [ADR-105](#adr-105--expressions-evaluate-in-a-lexical-scope) and its rule that
 null propagates and a type violation refuses. Takes the identity of
@@ -25953,6 +25957,11 @@ flag, a wedge that is bad for a class owning nothing, a wedge that overrides a
 neutral class, and a bad tick that does not reset the good run.
 
 ## ADR-221 — `aggregate` takes `explain: true` and answers with a plan, without running anything
+
+> **Amended by [ADR-255](#adr-255--the-merge-and-out-stages-and-the-sortarray-and-zip-operators)**: `$out` and `$merge` now exist, as the
+> last stage of a pipeline, so "No writes: `aggregate` is a read" below holds only for a pipeline
+> that does not end in one. Its explain plans the stage and writes and creates nothing, and needs the
+> access a run needs, as this ADR says it must.
 
 > **Amended 2026-10-06 by [ADR-222](#adr-222--a-lookup-sub-pipelines-match-reads-the-let-names-through-expr-and-a-correlated-eq-is-a-hash-join).**
 > A sub-pipeline `$match` that reads a `let` name is no longer hoisted whole: it
@@ -30642,3 +30651,29 @@ decimal `_id` and a decimal-bound definition.
 **Alternatives rejected.** A default `maxDepth` (unbounded or a server number): the first is a walk the caller did not bound, the second a cut-off the caller did not ask for. Truncating a walk at the ceiling: a `200` with half a hierarchy is the failure this engine refuses everywhere. Reading the foreign side per step through the index of `connectToField`: it would walk the planner's paths per frontier for a table the one read already is, and the foreign side is held under the same ceiling either way. An unspecified order: the table makes the order free, and an unspecified one is a result nobody can test.
 
 **Tests.** `graph_tests` in `kimmy-query` pin the parse, every refusal and the `maxDepth` rules; `kimmy-api`'s `exec` tests pin the walk (depths, a cycle, `depthField`, `restrictSearchWithMatch`, array and null starts) and both ceilings; `graph_lookup_walks_a_collection_and_requires_a_depth` runs a hierarchy through the route.
+
+
+## ADR-255 — The `$merge` and `$out` stages, and the `$sortArray` and `$zip` operators
+
+**The case.** An aggregation could only read, so a rollup was an aggregate followed by a bulk write from the client, and two array operators were declined (ADR-207) because their workarounds were costly. Two things changed: the stage that writes its result fits the leaderless design when it is held to the writes the store can already make safely, and since ADR-238 there is one total order for every value, so `$sortArray` has a defined answer for any array.
+
+**Decision, `$merge` and `$out`.**
+
+1. **Where they may stand.** `$merge` and `$out` are accepted as the last stage of a top-level pipeline, and the output is written instead of returned: the answer is `documents: []`, `count: 0` and the stage's counts under `merge` or `out`. Anywhere else, and inside a `$facet` or `$lookup` sub-pipeline, they are `400`.
+2. **`$merge` matches on `_id` and only `_id`**, because the store enforces no uniqueness across members (ADR-006): a match on another key is a read then a write that two members can do at once, each finding no match and each inserting, so `on` other than `"_id"` is a `400` that says so. `whenMatched` is `merge` (the default; top-level fields laid over the stored document), `replace` or `keepExisting`; `whenNotMatched` is `insert` (the default) or `discard`. The `fail` modes, a pipeline-form `whenMatched` and `let` are `400`s naming what is refused and why (a failure cannot be checked cluster-wide).
+3. **The write path is the ordinary one.** Every document goes through the insert and replace bodies in a write transaction, so indexes, size caps, the oplog, change streams, webhooks, expiry and replication behave as for client writes, and a unique violation is refused as an insert's is. Matching is by `_id` inside the transaction, so a later document in a chunk sees an earlier one. The counts are decisions (`matched == replaced + merged + kept`); an unchanged document commits nothing.
+4. **Chunked, not atomic.** Documents are written in chunks of `storage.multi_chunk_docs`, one transaction per chunk, as a multi update is. A failure aborts its chunk and leaves earlier chunks committed; the answer is `500 partially_applied` with the counts that landed (`Applied::Write`). This is documented, not hidden.
+5. **A pipeline may not write what it reads.** Its source or any `$lookup` or `$graphLookup` target, nested sub-pipelines and `$facet` branches included, compared by database and collection, is a `400` before anything is read.
+6. **`$out` is the insert-only form**, accepted for a new or empty target only, and with no `_id` already stored, as this member holds the target when the `$out` runs: a collection that holds any live document is a `400` pointing to `$merge` or a prior drop, because the atomic replace of a populated collection has no equivalent in a store without collection renames (its own milestone). Duplicate `_id`s in the output are a `409` before anything is written; the `timeseries` form is refused by name. The emptiness check is made before the output is spent; a concurrent writer in between is an ordinary concurrent writer. Across members the target can already hold documents, and an `_id` written elsewhere meets the output by last-writer-wins, as any two inserts of one `_id` do (ADR-006). A local safety net is acceptable here although the `fail` modes were refused, because `fail` promises a refusal the client relies on, while the emptiness check is a guard against an obvious mistake and is documented as member-local.
+7. **Permissions.** `read` on everything the pipeline reads and `write` on the target (in the target's own database for `{db, coll}`), and also `ddl` when the target does not exist and is created, since `write` alone must not become a grant to create collections. The target is created only after the pipeline has run, and only after every `_id` of the output has been checked (an ObjectId, string, integer, binary or finite decimal; anything else is a `400`), so a failing pipeline and a refused output leave no empty collection. `explain` runs the same refusals and grant checks, lists the stage with `runs: "write"`, and writes and creates nothing.
+8. **A missing target on this member** may exist on another member that has not synced; it is then created here, the race `POST /collections` already has.
+
+**Decision, `$sortArray` and `$zip`.** Both are expression operators, ending the ADR-207 decline.
+
+1. **`$sortArray`** takes `{input, sortBy}`, where `sortBy` is a constant: `1`, `-1`, or a sort document of paths (dotted allowed) and directions. It orders with the `$sort` stage's own comparison (`shape::compare_keys` over `canonical_cmp`, the ADR-238 total order, a `Decimal128` placed by exact value) and is stable in both directions. `sortBy: 1` or `-1` compares whole elements, documents included. A sort document reads an element that is not a document, or lacks a key, as null for that key, so it sorts lowest and ties with other nulls. A key path through an array uses `$sort`'s smallest-element rule (recorded in deviations). A null or missing `input` answers null; any other non-array is a `400`. `$sortArray` has no size cap of its own, since it cannot enlarge its input.
+2. **`$zip`** takes `{inputs, useLongestLength, defaults}`. The result is as long as the shortest input, or the longest with `useLongestLength: true`, and an input that has run out contributes null or its `defaults` entry. A null or missing input makes the result null, and a non-array is a `400` even beside a null. Refused, each as a `400` naming the operator: `defaults` without `useLongestLength: true` or of a different length than `inputs`, a non-boolean `useLongestLength`, `inputs` or `defaults` not written as an array, empty `inputs`, and unknown keys. `$zip` is limited to 1,000,000 values (rows times inputs), counted before allocation, because it multiplies the size of the arrays it reads.
+3. Variables resolve in every operand as for `$map`, `$filter` and `$reduce`, and both operators work wherever an expression does.
+
+**Alternatives rejected.** `$merge` on another key with a "best effort" match: it duplicates under concurrency with a `200`. The `fail` modes: they can only be honoured on the member that runs them. An atomic `$out` replace now: it needs a name-to-collection indirection through every path (its own milestone, designed first). Letting `write` alone create the target: it turns a data grant into a schema grant. Capping `$sortArray`: it never grows its input.
+
+**Tests.** `sink_tests` in `kimmy-query` pin the parse of both stages and every refusal; `kimmy-api` tests run the modes of `$merge`, `$out` into a missing, empty and non-empty target, the self-read refusals, the grants, the chunk boundary and a failure in a later chunk, and that `explain` writes nothing; `sort_zip_tests` pin both operators, and `sort_array_and_zip_run_in_a_pipeline_over_http` runs them through the route.

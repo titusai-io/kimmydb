@@ -88,6 +88,44 @@ from other systems' version of the stage:
 
 ---
 
+## 🟡 `$merge` matches on `_id` only and has no `fail` modes, pipeline form or `let`; `$out` writes a new or empty collection only; both write in chunks and are not atomic
+
+**Raised 2026-10-28, with ADR-255.** `$merge` and `$out` are built
+([aggregation.md](aggregation.md#merge)). Where they differ from other systems':
+
+- **`$merge` `on` can only be `_id`** (or absent), `400` for another field or an array
+  of fields. Elsewhere a unique index on the `on` fields lets the system find the match
+  and refuse a duplicate. Here no uniqueness is enforced across members, so a match on
+  another key is a read then a write that two members can do at the same moment, each
+  finding no match and each inserting; the duplicate the key was meant to prevent is the
+  result. `_id` is the key one document per is kept for.
+- **`whenMatched: "fail"` and `whenNotMatched: "fail"`, a pipeline-form `whenMatched`
+  and `let` are `400`s** naming what is refused. The two `fail` modes are checks that
+  cannot hold across members, which can each accept the write the other would have
+  failed on; the pipeline form and `let` are not built.
+- **`$out` writes only a new or empty collection**, `400` for one that holds documents,
+  and no `_id` already stored, as this member holds the target when the `$out` runs.
+  Across members the target can already hold documents, and an `_id` written
+  elsewhere meets the output by last-writer-wins, as any two inserts of one `_id` do
+  (ADR-006).
+  Elsewhere `$out` replaces the target atomically. A replace that swaps a collection
+  for another in one step has no equivalent here (collections are not renamed, and a
+  member that is behind would serve the old one), so it is not offered: drop the
+  collection first, or `$merge` into it. The `timeseries` form is refused by name.
+- **Both write in chunks of `storage.multi_chunk_docs` and are not atomic.** A failure
+  leaves the earlier chunks written and replicating, and is `partially_applied` with
+  the counts that landed. Elsewhere a failed `$out` leaves the target as it was.
+- **Neither may write a collection the pipeline reads**, `400`. Elsewhere a `$merge`
+  into its own source is allowed.
+- **A missing target is created, which needs `ddl` on it in addition to `write`.**
+  An ordinary insert never creates a collection here.
+
+**To close:** none planned. A matching key other than `_id` would need uniqueness
+enforced across members ([ADR-006](decisions.md)); an atomic `$out` would need a
+collection swap the store does not have.
+
+---
+
 ## 🟡 `$$REMOVE` outside a field-dropping position reads as null, and a path on `$$NOW` or `$$REMOVE` is refused
 
 **Raised 2026-10-26, with ADR-253.** `$$NOW` and `$$REMOVE` are built.
@@ -191,6 +229,18 @@ systems use.
 **What it costs.** A port written against MongoDB's reading of a plain document removes less here, silently, and must spell it `$elemMatch`.
 
 **Closing it** means reading a plain document as a query, which changes the result of every existing partial-document `$pull`. Not planned.
+
+---
+
+## 🟡 `$sortArray` reads a sort-document path through an array by its smallest element, and `$zip` refuses an empty `inputs` and a result over a million values
+
+**Raised 2026-10-28, with ADR-255.** `$sortArray` with a sort document orders by the `$sort` stage's own rule, so a key path that passes through an array in an element gives that element the **smallest** value the path reaches, in either direction. MongoDB takes the largest for a descending key. An element that is not a document, or lacks the key, sorts as null, lowest. `{$zip: {inputs: []}}` is a `400` here; MongoDB answers `[]`. A `$zip` whose result would hold more than 1,000,000 values (rows times inputs) is a `400` naming the limit, counted before anything is built.
+
+**Why.** One order for every sort keeps a port's `$sort` and `$sortArray` agreeing with each other, and the `$sort` difference is already recorded. An empty `inputs` is nearly always a typo for a computed list, which `inputs` does not accept. The limit stops an expression from multiplying the size of the arrays it reads.
+
+**What it costs.** A port that sorts descending by a path through an array, or zips no arrays, or zips past the limit, gets a different answer or a `400`.
+
+**What closes it.** Taking the largest for a descending key, in `$sort` and `$sortArray` together. Not planned.
 
 ---
 
@@ -2826,8 +2876,7 @@ here so that the absence of a decision is visible as a decision.
 | No certificate expiry metric | A failed reload is counted, but a certificate nobody ever tried to rotate reports nothing. `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime dependency (pure Rust — not a second crypto stack, so `check-native-deps.sh` would still pass) | not scheduled |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
-| `$zip` and `$sortArray` | Refused at parse as unknown operators, so a ported pipeline using either fails loudly. Declined when the set operators, `$objectToArray` and `$arrayToObject` were built (2026-09-29, ADR-207): `$map` over a `$range` of indexes with `$arrayElemAt` reads arrays by position, and `$unwind`, `$sort` and `$group` with `$push` order an array's elements | not planned |
-| Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` with `multi: true` are **atomic per chunk** of `storage.multi_chunk_docs` documents (default 1,000): each chunk is one transaction, the writer is released between chunks, and a failure in a later chunk leaves the earlier ones committed — so a `multi` can stop partway, at a chunk boundary, and a concurrent reader can see the state between two chunks ([ADR-086](decisions.md)). Nothing spans two requests. The full table is [What each operation guarantees](compatibility.md#what-each-operation-guarantees) | by design |
+| Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` with `multi: true` are **atomic per chunk** of `storage.multi_chunk_docs` documents (default 1,000): each chunk is one transaction, the writer is released between chunks, and a failure in a later chunk leaves the earlier ones committed — so a `multi` can stop partway, at a chunk boundary, and a concurrent reader can see the state between two chunks ([ADR-086](decisions.md)). An `aggregate` ending in `$merge` or `$out` is **atomic per chunk** of `storage.multi_chunk_docs`, not atomic overall; a later failure is `500 partially_applied` ([ADR-255](decisions.md)). Nothing spans two requests. The full table is [What each operation guarantees](compatibility.md#what-each-operation-guarantees) | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |
 | No token refresh | `/v1/auth/login` is the only way to obtain a token and it expires. A long-running client has no option but to re-send credentials, which no driver should ask of an application | **M10 task 4** |
