@@ -264,13 +264,42 @@ impl FindProjection {
         self.project_at(at.as_ref(), doc, array)
     }
 
-    /// Shape `doc` with the position `at` found in another image of it: the
-    /// document a `findAndModify` returns may no longer satisfy the filter.
-    pub fn project_with(&self, at: Option<&ArrayPosition>, doc: &Document) -> Result<Document> {
-        match &self.positional {
-            None => Ok(project(Some(&self.projection), doc)),
-            Some(array) => self.project_at(at, doc, array),
+    /// Shape `returned`, a `findAndModify` answer, when `matched` is the image
+    /// the filter matched. The element is the one the filter matched in
+    /// `matched`, at the same index in `returned`.
+    ///
+    /// `returned` is `matched` for the image from before the write. The
+    /// image from after it is refused when the update left the array with a
+    /// different length, or no longer an array: the index no longer names
+    /// the slot the filter matched, and an index past the end must not
+    /// answer with the whole array. An update that changes the matched element
+    /// in place, as `items.$.qty` does, keeps its slot.
+    ///
+    /// Run inside the write transaction, where `Err` writes nothing.
+    pub fn project_returned(
+        &self,
+        filter: &Filter,
+        matched: &Document,
+        returned: &Document,
+    ) -> Result<Document> {
+        let Some(array) = &self.positional else {
+            return Ok(project(Some(&self.projection), returned));
+        };
+        let (_, at) = filter::matches_at(filter, matched)?;
+        let len = |doc: &Document| match path::resolve(doc, array).first() {
+            Some(Bson::Array(items)) => Some(items.len()),
+            _ => None,
+        };
+        self.check_position(at.as_ref(), array)?;
+        if len(matched) != len(returned) {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ cannot name an element of the document \
+                 after the update: the update changed the length of {array:?}, or made it \
+                 not an array. Use returnDocument \"before\", or an update that leaves the \
+                 array's length alone"
+            )));
         }
+        self.project_at(at.as_ref(), returned, array)
     }
 
     fn project_at(
@@ -279,6 +308,33 @@ impl FindProjection {
         doc: &Document,
         array: &str,
     ) -> Result<Document> {
+        let at = self.check_position(at, array)?;
+        let kept = match path::resolve(doc, array).first() {
+            Some(Bson::Array(items)) => items.get(at.index),
+            _ => None,
+        };
+        // The position was found in a document with this array, so the
+        // element is there; anything else is refused rather than answered
+        // with the whole array.
+        let Some(kept) = kept else {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ found no element at index {} of \
+                 {array:?}",
+                at.index
+            )));
+        };
+        let mut narrowed = doc.clone();
+        path::set(&mut narrowed, array, Bson::Array(vec![kept.clone()]))
+            .map_err(Error::InvalidQuery)?;
+        Ok(project(Some(&self.projection), &narrowed))
+    }
+
+    /// The position, when the filter matched an element of `array`.
+    fn check_position<'a>(
+        &self,
+        at: Option<&'a ArrayPosition>,
+        array: &str,
+    ) -> Result<&'a ArrayPosition> {
         let Some(at) = at else {
             return Err(Error::InvalidQuery(format!(
                 "the positional projection {array:?}.$ needs the query to have matched an \
@@ -292,14 +348,7 @@ impl FindProjection {
                 at.path
             )));
         }
-        let mut narrowed = doc.clone();
-        if let Some(Bson::Array(items)) = path::resolve(doc, array).first()
-            && let Some(kept) = items.get(at.index)
-        {
-            path::set(&mut narrowed, array, Bson::Array(vec![kept.clone()]))
-                .map_err(Error::InvalidQuery)?;
-        }
-        Ok(project(Some(&self.projection), &narrowed))
+        Ok(at)
     }
 }
 

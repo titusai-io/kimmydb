@@ -733,18 +733,34 @@ under [Positional updates](query-language.md#positional-updates) and
 - **Several conditions on one array path** leave the first element satisfying
   the *last* condition evaluated. `$nor`, `$not`, `$ne`, `$nin`, `$exists`,
   `$size`, `$all` and `$expr` record no position; an explicit index in the
-  filter (`items.0.sku`) records none either.
+  filter (`items.0.sku`) records none either. The clauses of a filter are
+  ordered as written for "the last array"; the conditions inside one field
+  are in the filter's evaluation order, which puts one holding a `$expr` last.
+- **`$` under `$or` works here and is refused by the reference.** `$or` records
+  from the first branch, in the order written, that held. MongoDB's `$or` does
+  not pass match details to its branches, so an update that uses `$` under
+  `$or` fails there (*the positional operator did not find the match needed
+  from the query*). A filter written for this engine that relies on it does not
+  port.
 - **An upsert that inserts is a `400`** for a `$` path: there was no existing
   document to match, so no element. An upsert whose filter finds a document
   updates it and the `$` reads that document.
-- **One `$` per path.** `items.$.sub.$[]` and `items.$.sub.$[id]` are
-  accepted; `$` after another positional segment, or twice, is refused.
+- **`$` comes before any `$[]` or `$[<identifier>]` in a path.** `items.$.sub.$[]`
+  and `items.$.sub.$[id]` are accepted; `$` after another positional segment
+  (`items.$[].tags.$`), or twice, is refused when the update is parsed.
 - **A positional projection is a find feature.** `$project` and `$addFields`
-  still read `items.$` as a field called `$`. `findAndModify` positions the
-  returned `after` document by the document the filter matched, since the
-  updated image may no longer satisfy the filter.
+  still read `items.$` as a field called `$`. `findAndModify` takes the element
+  from the document the filter matched, at the same index in the returned
+  document; an update that changes the array's length is a `400` for
+  `returnDocument: "after"`, and so is an `upsert` with it.
 - **A positional projection that cannot name an element is a `400`** for the
-  request, not an empty array for that document.
+  request, not an empty array for that document. On `findAndModify` it is
+  refused inside the write transaction, so nothing is written. A sorted find
+  judges only the documents it returns.
+- **Two smaller points, both on the strict side, remain from the refusal.** An
+  `arrayFilters` document that names no identifier (`{"$and": []}`) is refused
+  rather than read as always-true, and only field conditions, `$expr` and
+  `$and`/`$or`/`$nor` are accepted at the top of one.
 - **Breaking, accepted.** `{"items.$": 1}` used to answer `items: [{}, …]`.
 
 

@@ -3538,8 +3538,8 @@ async fn a_change_stream_sees_no_event_for_an_unchanged_document() {
 /// `$[<identifier>]` with `arrayFilters` and `$[]` address array elements
 /// through the request, on `update` and on `find_and_modify` (ADR-104). The
 /// refusals are `400`s: an identifier without a filter, a filter without an
-/// identifier, the `$` positional operator, and a positional segment where
-/// there is no array.
+/// identifier, and a positional segment where there is no array. (The `$`
+/// positional operator is accepted since ADR-256 and has its own tests.)
 #[tokio::test]
 async fn positional_updates_address_array_elements() {
     let server = Server::start().await;
@@ -3749,7 +3749,6 @@ async fn the_positional_dollar_updates_the_element_the_filter_matched() {
     let res = fam(json!({
         "filter": {"_id": 3, "items.sku": "nut"}, "upsert": true,
         "update": {"$set": {"items.$.qty": 9}}, "returnDocument": "after",
-        "projection": {"items.$": 1},
     }))
     .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
@@ -3772,6 +3771,9 @@ async fn the_positional_dollar_updates_the_element_the_filter_matched() {
     .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
     assert!(res.body["message"].as_str().unwrap_or_default().contains("upsert"), "{:?}", res.body);
+    // Labelled as an update error, as the other `$` refusals are.
+    let msg = res.body["message"].as_str().unwrap_or_default();
+    assert!(msg.starts_with("invalid update:"), "{msg}");
     assert_eq!(server.get("/v1/db/shop/coll/c/docs/99", Some(&token)).await.status, 404);
 }
 
@@ -3852,6 +3854,206 @@ async fn a_positional_projection_returns_the_matched_element() {
         .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(res.body["documents"], json!([{"_id": 2, "items": [{}]}]));
+}
+
+/// A positional projection that cannot name an element is a `400` that writes
+/// nothing: not an `$inc`, not an upsert's insert, not a removal. The check
+/// runs inside the write transaction, before the commit.
+#[tokio::test]
+async fn a_refused_positional_projection_on_find_and_modify_writes_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": 1, "n": 0, "items": [{"sku": "a"}], "tags": ["t"]}),
+        )
+        .await;
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/c/find_and_modify", Some(token), body).await }
+    };
+    let stored = || {
+        let (server, token) = (&server, &token);
+        async move { server.get("/v1/db/shop/coll/c/docs/1", Some(token)).await }
+    };
+    let unchanged = json!({"_id": 1, "n": 0, "items": [{"sku": "a"}], "tags": ["t"]});
+
+    // The filter matched on `_id` alone: no element to keep.
+    let res = fam(json!({"filter": {"_id": 1}, "update": {"$inc": {"n": 1}},
+                         "projection": {"items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let msg = res.body["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("needs the query to have matched an element"), "{msg}");
+    assert_eq!(stored().await.body, unchanged);
+
+    // The last array the filter matched on is `tags`, not `items`.
+    let res = fam(json!({"filter": {"items.sku": "a", "tags": "t"}, "update": {"$inc": {"n": 1}},
+                         "projection": {"items.$": 1}, "returnDocument": "after"}))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let msg = res.body["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("names an array the query did not match on"), "{msg}");
+    assert_eq!(stored().await.body, unchanged);
+
+    // An upsert may insert, and an inserted document has no element: refused
+    // for the request, whether or not a document would have matched.
+    for filter in [json!({"items.sku": "zz"}), json!({"items.sku": "a"})] {
+        let res = fam(json!({"filter": filter, "upsert": true,
+                             "update": {"$set": {"flag": true}},
+                             "projection": {"items.$": 1}, "returnDocument": "after"}))
+        .await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("upsert"), "{msg}");
+    }
+    let found = server
+        .post("/v1/db/shop/coll/c/find", Some(&token), json!({"filter": {"flag": true}}))
+        .await;
+    assert_eq!(found.body["count"], 0, "{:?}", found.body);
+    assert_eq!(stored().await.body, unchanged);
+
+    // An upsert that answers with the image from before is not refused.
+    let res = fam(json!({"filter": {"items.sku": "a"}, "upsert": true,
+                         "update": {"$inc": {"n": 1}}, "projection": {"items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"_id": 1, "items": [{"sku": "a"}]}));
+    assert_eq!(stored().await.body["n"], 1);
+
+    // A removal answers with the document as it was: refused, and still there,
+    // when the filter named no element.
+    let res =
+        fam(json!({"filter": {"_id": 1}, "remove": true, "projection": {"items.$": 1}})).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(stored().await.status, 200, "the removal must not have landed");
+
+    // And removed, with the matched element returned, when it named one.
+    let res =
+        fam(json!({"filter": {"items.sku": "a"}, "remove": true, "projection": {"items.$": 1}}))
+            .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"_id": 1, "items": [{"sku": "a"}]}));
+    assert_eq!(stored().await.status, 404);
+}
+
+/// `returnDocument: "after"` with a positional projection cuts the image
+/// from after the write at the index the filter matched. An update that
+/// changes the array's length is refused, and writes nothing, rather than
+/// naming another element or answering with the whole array.
+#[tokio::test]
+async fn a_positional_projection_after_the_write_keeps_the_matched_slot() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let abc = json!({"_id": 5, "items": [{"sku": "a"}, {"sku": "b"}, {"sku": "c"}]});
+    let ab = json!({"_id": 6, "items": [{"sku": "a"}, {"sku": "b"}]});
+    for d in [&abc, &ab] {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), d.clone()).await;
+    }
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/c/find_and_modify", Some(token), body).await }
+    };
+    let stored = |id: u32| {
+        let (server, token) = (&server, &token);
+        async move { server.get(&format!("/v1/db/shop/coll/c/docs/{id}"), Some(token)).await.body }
+    };
+    for (id, filter, update) in [
+        (5, json!({"_id": 5, "items.sku": "b"}), json!({"$pull": {"items": {"sku": "a"}}})),
+        (6, json!({"_id": 6, "items.sku": "b"}), json!({"$pull": {"items": {"sku": "b"}}})),
+        (6, json!({"_id": 6, "items.sku": "b"}), json!({"$push": {"items": {"sku": "z"}}})),
+    ] {
+        let res = fam(json!({"filter": filter, "update": update, "returnDocument": "after",
+                             "projection": {"items.$": 1}}))
+        .await;
+        assert_eq!(res.status, 400, "{update}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("changed the length"), "{update}: {msg}");
+        assert_eq!(stored(id).await, if id == 5 { abc.clone() } else { ab.clone() });
+    }
+    // An in-place change keeps its slot, and the before image is always cut at
+    // the matched element.
+    let res = fam(json!({"filter": {"_id": 5, "items.sku": "b"},
+                         "update": {"$set": {"items.$.sku": "B"}}, "returnDocument": "after",
+                         "projection": {"items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"_id": 5, "items": [{"sku": "B"}]}));
+    let res = fam(json!({"filter": {"_id": 6, "items.sku": "b"},
+                         "update": {"$pull": {"items": {"sku": "b"}}},
+                         "projection": {"items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"_id": 6, "items": [{"sku": "b"}]}));
+}
+
+/// A sorted find judges the documents it returns, as an unsorted one does: a
+/// document the window drops, or the offset steps over, cannot refuse it,
+/// whatever order the scan meets the documents in.
+#[tokio::test]
+async fn a_sorted_find_refuses_a_positional_projection_for_the_page_only() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let mut pages = Vec::new();
+    for (coll, a_id, b_id) in [("c1", 1, 2), ("c2", 2, 1)] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({"name": coll})).await;
+        // A is on the page. B matches through `vip` and has no element, and
+        // sorts after A.
+        let a = json!({"_id": a_id, "n": 1, "items": [{"sku": "g"}]});
+        let b = json!({"_id": b_id, "n": 2, "vip": true, "items": [{"sku": "x"}]});
+        for d in [a, b] {
+            server.post(&format!("/v1/db/shop/coll/{coll}/docs"), Some(&token), d).await;
+        }
+        let find = |extra: Value| {
+            let (server, token) = (&server, &token);
+            let mut body = json!({"filter": {"$or": [{"items.sku": "g"}, {"vip": true}]},
+                                  "sort": {"n": 1}, "projection": {"items.$": 1}});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            async move { server.post(&format!("/v1/db/shop/coll/{coll}/find"), Some(token), body).await }
+        };
+        let page = find(json!({"limit": 1})).await;
+        assert_eq!(page.status, 200, "{coll}: {:?}", page.body);
+        pages.push(page.body["documents"][0]["items"].clone());
+        // B is on this page, so the page is refused wherever it was scanned.
+        let both = find(json!({"limit": 2})).await;
+        assert_eq!(both.status, 400, "{coll}: {:?}", both.body);
+        // Past A the page is B alone.
+        let skipped = find(json!({"skip": 1, "limit": 1})).await;
+        assert_eq!(skipped.status, 400, "{coll}: {:?}", skipped.body);
+    }
+    assert_eq!(pages[0], json!([{"sku": "g"}]));
+    assert_eq!(pages[0], pages[1]);
+}
+
+/// A document the offset steps over cannot refuse the page either: the one
+/// with no element sorts first and is skipped.
+#[tokio::test]
+async fn a_skipped_document_cannot_refuse_a_sorted_find() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for d in [
+        json!({"_id": 1, "n": 1, "vip": true, "items": [{"sku": "x"}]}),
+        json!({"_id": 2, "n": 2, "items": [{"sku": "g"}]}),
+    ] {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), d).await;
+    }
+    let find = |extra: Value| {
+        let (server, token) = (&server, &token);
+        let mut body = json!({"filter": {"$or": [{"items.sku": "g"}, {"vip": true}]},
+                              "sort": {"n": 1}, "projection": {"items.$": 1}});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        async move { server.post("/v1/db/shop/coll/c/find", Some(token), body).await }
+    };
+    let res = find(json!({"skip": 1, "limit": 1})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 2, "items": [{"sku": "g"}]}]));
+    let res = find(json!({"limit": 1})).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
 }
 
 /// `$bit` over HTTP: the three operations, a missing field created from zero,
@@ -17775,8 +17977,38 @@ async fn out_refuses_duplicate_ids_in_its_output_before_writing_anything() {
     .await;
     assert_eq!(res.status, 409, "{:?}", res.body);
     assert_eq!(res.body["error"], "duplicate_key");
-    // The target was created before the write, and holds nothing.
-    assert!(sink_dump(&server, &token, "shop", "snap").await.is_empty());
+    // The refusal comes before the target is created.
+    let described = server.get("/v1/db/shop/coll/snap/describe", Some(&token)).await;
+    assert_eq!(described.status, 404, "{:?}", described.body);
+}
+
+#[tokio::test]
+async fn an_id_over_the_size_cap_in_a_later_chunk_writes_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    sink_seed(&server, &token, "src", (1..=4).map(|i| json!({"_id": i})).collect()).await;
+    sink_seed(&server, &token, "t", vec![]).await;
+    server.state.engine.set_multi_chunk_docs(2);
+    // An 8192-byte `_id` on the last document, which falls in the second chunk.
+    let big = json!({"$reduce": {
+        "input": {"$range": [0, 13]},
+        "initialValue": "x",
+        "in": {"$concat": ["$$value", "$$value"]},
+    }});
+    let res = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([
+            {"$sort": {"_id": 1}},
+            {"$project": {"_id": {"$cond": [{"$eq": ["$_id", 4]}, big, "$_id"]}}},
+            {"$merge": {"into": "t"}},
+        ]),
+    )
+    .await;
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "id_too_large");
+    assert!(sink_dump(&server, &token, "shop", "t").await.is_empty());
 }
 
 #[tokio::test]

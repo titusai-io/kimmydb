@@ -1747,8 +1747,9 @@ paths:
         `arrayFilters` entry for `line` selects (ADR-104). `items.$.qty`
         reaches the first element the filter matched, on the last array the
         filter matched on; it is `400` when the filter matched no array
-        element, matched a different array than the path names, or the
-        request is an upsert that inserts (ADR-256).
+        element, matched a different array than the path names, the path has
+        a `$` after a `$[]` or `$[<identifier>]` segment, or the request is an
+        upsert that inserts (ADR-256).
 
         An update writes each path once: two writes to one path, or to a
         path and a path inside it, are refused `400` and nothing is written,
@@ -1906,7 +1907,15 @@ paths:
                   type: string
                   enum: [before, after]
                   default: before
-                projection: { $ref: "#/components/schemas/Document" }
+                projection:
+                  $ref: "#/components/schemas/Document"
+                  description: |
+                    A projection entry `<array>.$: 1` returns the element the
+                    filter matched in the document as it was, at the same index
+                    in the returned one. A refusal is `400` and writes nothing:
+                    no matched element, `returnDocument: after` with an update
+                    that changes the array's length, and `upsert` with
+                    `returnDocument: after` (ADR-256).
                 if_stamp:
                   allOf: [{ $ref: "#/components/schemas/Stamp" }]
                   description: |
@@ -3797,8 +3806,9 @@ components:
         Every read parameter. `filter`, `sort` and `projection` follow the
         query language in `docs/query-language.md`. A projection entry
         `<array>.$: 1` returns the first element of the array that the filter
-        matched; it is `400` when the filter matched no element of that array
-        or the request has no filter (ADR-256).
+        matched; it is `400` when a returned document has no matched element of
+        that array or the request has no filter. A sorted find judges only the
+        documents it returns (ADR-256).
       properties:
         filter: { $ref: "#/components/schemas/Document" }
         sort: { $ref: "#/components/schemas/Document" }

@@ -575,8 +575,8 @@ impl KimmyMcp {
                        first stage, with query or vector, k, per_document, filter; needs \
                        read access), and the last-stage writes $merge (into a collection \
                        by _id: whenMatched replace, merge or keepExisting, whenNotMatched \
-                       insert or discard; needs write access to the target, and ddl \
-                       to create it) and $out (into a new or empty collection). A \
+                       insert or discard; needs write access to the target, and ddl to \
+                       create it) and $out (into a new or empty collection). A \
                        pipeline ending in one of them writes, in chunks and not atomically, and answers with counts \
                        instead of documents; it may not write a collection it reads. \
                        Field references are written \"$field\"; computed expressions \

@@ -406,7 +406,9 @@ impl Engine {
                 Ok(doc) => doc,
                 Err(e) => {
                     txn.abort()?;
-                    return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(e)));
+                    // The caller's reason for refusing to insert, an update's
+                    // as much as a query's: it keeps the label it was given.
+                    return Err(StorageError::Core(kimmy_core::Error::InvalidUpdate(e)));
                 }
             };
             let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {

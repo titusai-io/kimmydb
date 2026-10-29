@@ -210,6 +210,12 @@ impl Engine {
         Ok(())
     }
 
+    /// Refuse an output in which two documents carry one `_id`, as `write_documents`
+    /// does before its first chunk; the caller runs it before creating a target.
+    pub fn check_unique_output_ids(&self, docs: &[Document]) -> Result<()> {
+        refuse_duplicate_ids(docs)
+    }
+
     /// One transaction of [`Self::write_documents`]: the counts of the
     /// decisions taken and the entries to publish. A failure comes with the
     /// number of documents whose commit is in doubt, as in `modify_chunk`.

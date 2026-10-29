@@ -314,7 +314,7 @@ impl Lead {
         }
         let all = |leaves: &[&Filter]| match leaves {
             [] => Filter::AlwaysTrue,
-            leaves => Filter::And(leaves.iter().map(|l| (*l).clone()).collect()),
+            leaves => Filter::And(leaves.iter().map(|l| (*l).clone()).collect::<Vec<_>>().into()),
         };
         let key_at = variable.iter().position(|leaf| key_of(leaf, names).is_some());
         let key = key_at.and_then(|at| key_of(variable[at], names));
@@ -3779,10 +3779,13 @@ mod tests {
         assert_eq!(consumed, 2, "the $match after $count is not part of the run");
         assert_eq!(
             filter,
-            Filter::And(vec![
-                filter::parse(&doc! {"a": 1}).unwrap(),
-                filter::parse(&doc! {"b": {"$gt": 2}}).unwrap(),
-            ])
+            Filter::And(
+                vec![
+                    filter::parse(&doc! {"a": 1}).unwrap(),
+                    filter::parse(&doc! {"b": {"$gt": 2}}).unwrap(),
+                ]
+                .into()
+            )
         );
     }
 
