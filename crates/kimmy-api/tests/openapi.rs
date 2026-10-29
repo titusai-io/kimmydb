@@ -1594,6 +1594,24 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         .await;
     assert_eq!(plan["explain"]["executed"], false);
     assert!(plan.get("documents").is_none());
+    // A run ending in `$merge`: its counts under `merge`, validated against the
+    // aggregate answer, and no documents.
+    let merged = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/aggregate",
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&root),
+            Some(json!({ "pipeline": [
+                { "$group": { "_id": "$sku", "total": { "$sum": "$qty" } } },
+                { "$merge": { "into": "sku_totals" } },
+            ] })),
+            200,
+        )
+        .await;
+    assert_eq!(merged["count"], 0, "{merged}");
+    assert_eq!(merged["merge"]["matched"], 0, "{merged}");
+    assert!(merged["merge"]["inserted"].as_u64().unwrap_or(0) > 0, "{merged}");
     c.check(
         "POST",
         "/v1/db/{db}/coll/{coll}/update",
