@@ -1642,8 +1642,12 @@ paths:
         later chunk leaves the earlier ones written and answers
         `500 partially_applied` with the counts that landed under `applied`. The
         answer has `documents: []`, `count: 0` and the stage's counts under
-        `merge` or `out`. `$out` refuses a target that holds documents (`400`).
-      x-kimmy-action: read
+        `merge` or `out`. `$out` refuses a target that holds documents (`400`),
+        as this member holds it when the `$out` runs. A `409` is a unique
+        violation or a repeated `_id` in the output, and a refused output (an
+        `_id` that is null, a document, an array or a double) is `400` with
+        nothing written and nothing created.
+      x-kimmy-action: read (plus write on the target, and ddl to create it, when the pipeline ends in `$merge` or `$out`)
       requestBody:
         required: true
         content:
@@ -1712,6 +1716,8 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/PartiallyApplied" }
 
   /v1/db/{db}/coll/{coll}/update:
     parameters:
@@ -3054,7 +3060,8 @@ components:
     PartiallyApplied:
       description: |
         `partially_applied`, `retry: verify` (ADR-192): a `multi: true`
-        request failed after its first chunk committed. What landed stands
+        request, or an aggregate ending in `$merge` or `$out` (ADR-255),
+        failed after its first chunk committed. What landed stands
         and replicates; `applied` says how much, and `cause` why the rest did
         not: the code and message the failure would have had on its own, such
         as `bad_request` for an operator a later document cannot take or a
@@ -3178,7 +3185,11 @@ components:
             `matched`, `modified`, `commits` and `in_doubt` (documents
             written in a chunk whose commit's outcome is unknown). `matched`
             also counts documents in chunks where nothing changed, which
-            commit nothing (ADR-208). For a database drop,
+            commit nothing (ADR-208). For an aggregate ending in `$merge` or
+            `$out`, the counts of the decisions that landed: `matched`,
+            `inserted`, `replaced`, `merged`, `kept`, `discarded`, `commits`
+            and `in_doubt` (`$out` has only `inserted`, `commits` and
+            `in_doubt` non-zero). For a database drop,
             `dropped` (the collections whose drop committed, which can be
             empty: the database's tombstone is the first commit, ADR-229) and
             `in_doubt`.
