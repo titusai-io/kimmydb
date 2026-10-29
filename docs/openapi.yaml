@@ -1631,7 +1631,18 @@ paths:
         `documentsMatched`, `indexEntriesRead`): nothing was examined or read. It
         reads the pipeline and the definitions of the collections it names, and
         needs the access a run needs: `read` on the collection and on every
-        `$lookup` collection (nested ones included), `search` for `$vectorSearch`.
+        `$lookup` collection (nested ones included), `search` for `$vectorSearch`,
+        and for a trailing `$merge` or `$out` the run's refusals and grants.
+
+        **A pipeline whose last stage is `$merge` or `$out` writes** (ADR-255). It
+        needs `write` on the target as well as `read` on what it reads, and `ddl`
+        on a target that does not exist yet, which the write creates. It may not
+        write a collection it reads (`400`). The documents are written in chunks of
+        `storage.multi_chunk_docs` and the write is **not atomic**: a failure in a
+        later chunk leaves the earlier ones written and answers
+        `500 partially_applied` with the counts that landed under `applied`. The
+        answer has `documents: []`, `count: 0` and the stage's counts under
+        `merge` or `out`. `$out` refuses a target that holds documents (`400`).
       x-kimmy-action: read
       requestBody:
         required: true
@@ -1666,6 +1677,32 @@ paths:
                         items: { $ref: "#/components/schemas/Document" }
                       count:
                         type: integer
+                      merge:
+                        type: object
+                        description: |
+                          Present when the last stage is `$merge` (and `documents`
+                          is empty): what was done, by the decision taken for each
+                          document. `matched` is `replaced + merged + kept`.
+                        required: [matched, inserted, replaced, merged, kept, discarded, commits]
+                        properties:
+                          matched: { type: integer }
+                          inserted: { type: integer }
+                          replaced: { type: integer }
+                          merged: { type: integer }
+                          kept: { type: integer }
+                          discarded: { type: integer }
+                          commits:
+                            type: integer
+                            description: Write transactions that committed something.
+                      out:
+                        type: object
+                        description: |
+                          Present when the last stage is `$out` (and `documents`
+                          is empty).
+                        required: [inserted, commits]
+                        properties:
+                          inserted: { type: integer }
+                          commits: { type: integer }
                   - type: object
                     required: [explain]
                     properties:

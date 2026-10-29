@@ -153,6 +153,42 @@ pub enum Stage {
     /// reached by following `connect_from` to `connect_to` from `start_with`, at most
     /// `max_depth` steps. Executed by the caller, which holds a storage handle (ADR-254).
     GraphLookup(Box<GraphLookup>),
+    /// `$merge`: the pipeline's output written into a collection, each document
+    /// matched to a stored one by `_id` (ADR-255). Only ever last. Executed by the
+    /// caller, which holds a storage handle and the write path.
+    Merge(Box<MergeSpec>),
+    /// `$out`: the pipeline's output inserted into a collection that is new or empty
+    /// (ADR-255). Only ever last. Executed by the caller.
+    Out(Target),
+}
+
+/// A collection a write stage names: `"name"`, or `{db, coll}` for one in another
+/// database. `db` is `None` for the database the pipeline runs in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub db: Option<String>,
+    pub coll: String,
+}
+
+/// What a `$merge` does with a document that matches a stored one by `_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhenMatched {
+    /// Replace the stored document whole, keeping its `_id`.
+    Replace,
+    /// Lay the incoming document's top-level fields over the stored one's.
+    Merge,
+    /// Leave the stored document alone.
+    KeepExisting,
+}
+
+/// The fields of a `$merge` stage. The match key is always `_id`: see
+/// [`parse_merge`] for why `on` is not a choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeSpec {
+    pub into: Target,
+    pub when_matched: WhenMatched,
+    /// `whenNotMatched: "insert"`; `false` is `"discard"`.
+    pub insert_unmatched: bool,
 }
 
 /// The fields of a `$graphLookup` stage.
@@ -301,7 +337,7 @@ impl Stage {
     /// Whether running this stage needs a storage handle.
     pub fn needs_storage(&self) -> bool {
         match self {
-            Stage::Lookup { .. } | Stage::GraphLookup(_) => true,
+            Stage::Lookup { .. } | Stage::GraphLookup(_) | Stage::Merge(_) | Stage::Out(_) => true,
             Stage::Facet(facets) => {
                 facets.iter().any(|(_, stages)| stages.iter().any(Stage::needs_storage))
             }
@@ -328,8 +364,43 @@ impl Stage {
             Stage::Bucket { .. } => "$bucket",
             Stage::BucketAuto { .. } => "$bucketAuto",
             Stage::GraphLookup(_) => "$graphLookup",
+            Stage::Merge(_) => "$merge",
+            Stage::Out(_) => "$out",
         }
     }
+
+    /// Whether this stage writes a collection rather than producing documents.
+    pub fn writes(&self) -> bool {
+        matches!(self, Stage::Merge(_) | Stage::Out(_))
+    }
+}
+
+/// The collections a pipeline's `$lookup` and `$graphLookup` stages read, nested
+/// sub-pipelines and `$facet` branches included, in the order a run reaches them,
+/// each once. All are in the database the pipeline runs in.
+pub fn foreign_collections(stages: &[Stage]) -> Vec<&str> {
+    fn walk<'a>(stages: &'a [Stage], out: &mut Vec<&'a str>) {
+        for stage in stages {
+            match stage {
+                Stage::Lookup { from, join, .. } => {
+                    if !out.contains(&from.as_str()) {
+                        out.push(from);
+                    }
+                    if let Join::Pipeline { stages: sub, .. } = join {
+                        walk(sub, out);
+                    }
+                }
+                Stage::GraphLookup(spec) if !out.contains(&spec.from.as_str()) => {
+                    out.push(&spec.from);
+                }
+                Stage::Facet(facets) => facets.iter().for_each(|(_, sub)| walk(sub, out)),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(stages, &mut out);
+    out
 }
 
 /// Parse a pipeline.
@@ -379,7 +450,22 @@ impl Placement {
 }
 
 fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
-    pipeline.iter().enumerate().map(|(i, stage)| parse_stage(stage, vars, at, i)).collect()
+    let stages = pipeline
+        .iter()
+        .enumerate()
+        .map(|(i, stage)| parse_stage(stage, vars, at, i))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some((at, stage)) =
+        stages.iter().enumerate().find(|(i, s)| s.writes() && i + 1 < stages.len())
+    {
+        return Err(Error::InvalidQuery(format!(
+            "{} must be the last stage of the pipeline, but it is stage {} of {}",
+            stage.name(),
+            at + 1,
+            stages.len()
+        )));
+    }
+    Ok(stages)
 }
 
 /// The `$match` stages a pipeline *begins* with, merged into one filter, and
@@ -488,6 +574,20 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
             }
             parse_vector_search(as_document(name, value)?)
         }
+        "$merge" | "$out" => {
+            if at.in_facet || at.sub {
+                return Err(Error::InvalidQuery(format!(
+                    "{name} writes a collection, so it can only be the last stage of the \
+                     top-level pipeline; it cannot run inside a {}",
+                    if at.in_facet { "$facet" } else { "$lookup sub-pipeline" }
+                )));
+            }
+            if name == "$merge" {
+                parse_merge(as_document(name, value)?)
+            } else {
+                parse_target(name, value).map(Stage::Out)
+            }
+        }
         // `UnsupportedOperator` renders its payload quoted — `unsupported
         // operator "x"` — so the guidance goes in an `InvalidQuery`, whose
         // format composes with a sentence. Both are a 400; this is about the
@@ -495,9 +595,141 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         other => Err(Error::InvalidQuery(format!(
             "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
              $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup, $facet, \
-             $bucket, $bucketAuto, $graphLookup, $vectorSearch"
+             $bucket, $bucketAuto, $graphLookup, $vectorSearch, $merge, $out"
         ))),
     }
+}
+
+/// The target of `$merge`'s `into` or of `$out`: a collection name, or `{db, coll}`.
+fn parse_target(stage: &str, value: &Bson) -> Result<Target> {
+    match value {
+        Bson::String(coll) if !coll.is_empty() => Ok(Target { db: None, coll: coll.clone() }),
+        Bson::Document(spec) => {
+            if spec.contains_key("timeseries") {
+                return Err(Error::InvalidQuery(format!(
+                    "{stage} cannot create a time series collection: its `timeseries` option is \
+                     not supported"
+                )));
+            }
+            deny_unknown_keys(stage, spec, &["db", "coll"])?;
+            let name = |key: &str| match spec.get(key) {
+                Some(Bson::String(s)) if !s.is_empty() => Ok(s.clone()),
+                _ => Err(Error::InvalidQuery(format!(
+                    "{stage} takes a collection name or {{db: <name>, coll: <name>}}, with both \
+                     as non-empty strings"
+                ))),
+            };
+            Ok(Target { db: Some(name("db")?), coll: name("coll")? })
+        }
+        _ => Err(Error::InvalidQuery(format!(
+            "{stage} takes a collection name or {{db: <name>, coll: <name>}}, found {}",
+            type_name(value)
+        ))),
+    }
+}
+
+/// `{$merge: {into, on, whenMatched, whenNotMatched}}` (ADR-255).
+///
+/// The match key is `_id` and nothing else. A match on another field is a read
+/// followed by a write, and with no uniqueness enforced across members two members
+/// running the same `$merge` at the same time each read "no match" and each insert:
+/// the collection ends up with the duplicate the key was meant to prevent. `_id` is
+/// the one key the store keeps one document per, so `on` is accepted only as
+/// absent or `"_id"`. `whenMatched: "fail"` and `whenNotMatched: "fail"` are
+/// refused for the same kind of reason (they are checks that would have to hold
+/// across members), a pipeline-form `whenMatched` and `let` because they are not
+/// built.
+fn parse_merge(spec: &Document) -> Result<Stage> {
+    if spec.contains_key("let") {
+        return Err(Error::InvalidQuery(
+            "$merge `let` is not supported: it only serves a pipeline-form `whenMatched`, which \
+             is not supported either"
+                .into(),
+        ));
+    }
+    deny_unknown_keys("$merge", spec, &["into", "on", "whenMatched", "whenNotMatched"])?;
+    let Some(into) = spec.get("into") else {
+        return Err(Error::InvalidQuery(
+            "$merge needs `into`: a collection name or {db, coll}".into(),
+        ));
+    };
+    let into = parse_target("$merge", into)?;
+    match spec.get("on") {
+        None => {}
+        Some(Bson::String(field)) if field == ID_FIELD => {}
+        Some(other) => {
+            return Err(Error::InvalidQuery(format!(
+                "$merge `on` can only be \"_id\" (or left out), found {}: a match on any other \
+                 key is a read then a write, and two members merging at the same time would each \
+                 find no match and each insert, leaving duplicates that nothing enforces against",
+                match other {
+                    Bson::String(field) => format!("{field:?}"),
+                    other => type_name(other).to_string(),
+                }
+            )));
+        }
+    }
+    let when_matched = match spec.get("whenMatched") {
+        None => WhenMatched::Merge,
+        Some(Bson::String(mode)) => match mode.as_str() {
+            "replace" => WhenMatched::Replace,
+            "merge" => WhenMatched::Merge,
+            "keepExisting" => WhenMatched::KeepExisting,
+            "fail" => {
+                return Err(Error::InvalidQuery(
+                    "$merge whenMatched \"fail\" is not supported: it cannot be checked across \
+                     members, which can each accept a write of the same `_id` before either \
+                     hears of the other"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(Error::InvalidQuery(format!(
+                    "$merge whenMatched is \"replace\", \"merge\" or \"keepExisting\", found \
+                     {other:?}"
+                )));
+            }
+        },
+        Some(Bson::Array(_)) => {
+            return Err(Error::InvalidQuery(
+                "a pipeline-form $merge `whenMatched` is not supported; use \"replace\", \
+                 \"merge\" or \"keepExisting\""
+                    .into(),
+            ));
+        }
+        Some(other) => {
+            return Err(Error::InvalidQuery(format!(
+                "$merge whenMatched is \"replace\", \"merge\" or \"keepExisting\", found {}",
+                type_name(other)
+            )));
+        }
+    };
+    let insert_unmatched = match spec.get("whenNotMatched") {
+        None => true,
+        Some(Bson::String(mode)) => match mode.as_str() {
+            "insert" => true,
+            "discard" => false,
+            "fail" => {
+                return Err(Error::InvalidQuery(
+                    "$merge whenNotMatched \"fail\" is not supported: it cannot be checked \
+                     across members, which can each lack a document another already has"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(Error::InvalidQuery(format!(
+                    "$merge whenNotMatched is \"insert\" or \"discard\", found {other:?}"
+                )));
+            }
+        },
+        Some(other) => {
+            return Err(Error::InvalidQuery(format!(
+                "$merge whenNotMatched is \"insert\" or \"discard\", found {}",
+                type_name(other)
+            )));
+        }
+    };
+    Ok(Stage::Merge(Box::new(MergeSpec { into, when_matched, insert_unmatched })))
 }
 
 /// The most facets one `$facet` may name. Each is a pipeline over the whole input,
@@ -1630,6 +1862,13 @@ pub fn apply_with_vars(
                     .try_fold(docs, |docs, stage| apply_with_vars(stage, docs, limits, vars))
             })?;
             vec![answer]
+        }
+        Stage::Merge(_) | Stage::Out(_) => {
+            return Err(Error::Unsupported(format!(
+                "{} writes a collection and must be run by the executor that holds a storage \
+                 handle, not by the pure pipeline",
+                stage.name()
+            )));
         }
         Stage::GraphLookup(_) => {
             return Err(Error::Unsupported(
@@ -2975,9 +3214,10 @@ mod tests {
 
     #[test]
     fn an_unknown_stage_names_what_is_supported() {
-        let err = parse(&[doc! {"$merge": {}}]).unwrap_err().to_string();
-        assert!(err.contains("$merge"), "{err}");
+        let err = parse(&[doc! {"$typo": {}}]).unwrap_err().to_string();
+        assert!(err.contains("$typo"), "{err}");
         assert!(err.contains("$group"), "the error should list what does work: {err}");
+        assert!(err.contains("$merge") && err.contains("$out"), "and the write stages: {err}");
     }
 
     #[test]
@@ -3342,13 +3582,13 @@ mod tests {
 
     #[test]
     fn the_unsupported_stage_message_lists_vector_search() {
-        let err = parse(&[doc! {"$out": "x"}]).unwrap_err().to_string();
+        let err = parse(&[doc! {"$typo": "x"}]).unwrap_err().to_string();
         assert!(err.contains("$vectorSearch"), "{err}");
     }
 
     #[test]
     fn the_unsupported_stage_message_lists_the_new_stages() {
-        let err = parse(&[doc! {"$out": "x"}]).unwrap_err().to_string();
+        let err = parse(&[doc! {"$typo": "x"}]).unwrap_err().to_string();
         assert!(err.contains("$addFields"), "got: {err}");
         assert!(err.contains("$replaceRoot"), "got: {err}");
     }

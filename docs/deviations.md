@@ -88,6 +88,40 @@ from other systems' version of the stage:
 
 ---
 
+## 🟡 `$merge` matches on `_id` only and has no `fail` modes, pipeline form or `let`; `$out` writes a new or empty collection only; both write in chunks and are not atomic
+
+**Raised 2026-10-28, with ADR-255.** `$merge` and `$out` are built
+([aggregation.md](aggregation.md#merge)). Where they differ from other systems':
+
+- **`$merge` `on` can only be `_id`** (or absent), `400` for another field or an array
+  of fields. Elsewhere a unique index on the `on` fields lets the system find the match
+  and refuse a duplicate. Here no uniqueness is enforced across members, so a match on
+  another key is a read then a write that two members can do at the same moment, each
+  finding no match and each inserting; the duplicate the key was meant to prevent is the
+  result. `_id` is the key one document per is kept for.
+- **`whenMatched: "fail"` and `whenNotMatched: "fail"`, a pipeline-form `whenMatched`
+  and `let` are `400`s** naming what is refused. The two `fail` modes are checks that
+  cannot hold across members, which can each accept the write the other would have
+  failed on; the pipeline form and `let` are not built.
+- **`$out` writes only a new or empty collection**, `400` for one that holds documents.
+  Elsewhere `$out` replaces the target atomically. A replace that swaps a collection
+  for another in one step has no equivalent here (collections are not renamed, and a
+  member that is behind would serve the old one), so it is not offered: drop the
+  collection first, or `$merge` into it. The `timeseries` form is refused by name.
+- **Both write in chunks of `storage.multi_chunk_docs` and are not atomic.** A failure
+  leaves the earlier chunks written and replicating, and is `partially_applied` with
+  the counts that landed. Elsewhere a failed `$out` leaves the target as it was.
+- **Neither may write a collection the pipeline reads**, `400`. Elsewhere a `$merge`
+  into its own source is allowed.
+- **A missing target is created, which needs `ddl` on it in addition to `write`.**
+  An ordinary insert never creates a collection here.
+
+**To close:** none planned. A matching key other than `_id` would need uniqueness
+enforced across members ([ADR-006](decisions.md)); an atomic `$out` would need a
+collection swap the store does not have.
+
+---
+
 ## 🟡 `$$REMOVE` outside a field-dropping position reads as null, and a path on `$$NOW` or `$$REMOVE` is refused
 
 **Raised 2026-10-26, with ADR-253.** `$$NOW` and `$$REMOVE` are built.

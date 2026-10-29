@@ -5,14 +5,16 @@
 //! [`exec::plan_access`] decides from the filter and the index definitions alone:
 //! the same function the read itself asks, so the two cannot diverge. No
 //! document, no index entry and no oplog record is read, no embedding provider is
-//! called, and nothing is written (`aggregate` is a read, and `$out` and `$merge`
-//! do not exist). The answer has no `documents` and no `count`, and none of the
+//! called, and nothing is written (`aggregate` is a read; a trailing `$out` or
+//! `$merge` is planned and described, and neither writes nor creates its target). The answer has no `documents` and no `count`, and none of the
 //! measured keys of `find`'s explain (`documentsExamined`, `documentsMatched`,
 //! `indexEntriesRead`, ...): nothing was examined, matched or read.
 //!
 //! **Authorization is the run's, and a little more.** `read` on the collection,
 //! `read` on every collection a `$lookup` names, a nested `$lookup`'s included,
-//! and `search` for a `$vectorSearch`, in the order a run takes them: the source,
+//! `search` for a `$vectorSearch`, and for a trailing `$merge` or `$out` the run's
+//! refusals and grants (a target the pipeline reads, `write` on it, `ddl` when it
+//! does not exist), in the order a run takes them: the source,
 //! then the parse (a `400`), then the foreign collections. A run does not reach a
 //! nested `$lookup` when no document reaches it, so explain can be stricter than
 //! a run there, and says so in the documentation.
@@ -50,14 +52,14 @@ pub fn aggregate_explain_with_limits(
     let stages = exec::parse_pipeline(pipeline)?;
 
     // Every collection the pipeline names, in the order a run would reach them.
-    let mut foreign = Vec::new();
-    collect_foreign(&stages, &mut foreign);
+    let foreign = aggregate::foreign_collections(&stages);
     if matches!(stages.first(), Some(Stage::VectorSearch(_))) {
         auth.require(kimmy_auth::Action::Search, db, Some(coll))?;
     }
     for from in foreign {
         exec::authorize(state, auth, kimmy_auth::Action::Read, db, from)?;
     }
+    exec::plan_sink(state, auth, db, coll, &stages)?;
 
     let (source, consumed) = match stages.first() {
         Some(Stage::VectorSearch(spec)) => (vector_source(&meta, spec), 1),
@@ -94,31 +96,6 @@ pub fn aggregate_explain_with_limits(
             "stages": rest,
         }
     }))
-}
-
-/// The collections a pipeline's `$lookup`s name, nested ones included, in the order
-/// a run reaches them, each once.
-fn collect_foreign<'a>(stages: &'a [Stage], out: &mut Vec<&'a str>) {
-    for stage in stages {
-        if let Stage::Lookup { from, join, .. } = stage {
-            if !out.contains(&from.as_str()) {
-                out.push(from);
-            }
-            if let Join::Pipeline { stages: sub, .. } = join {
-                collect_foreign(sub, out);
-            }
-        }
-        if let Stage::GraphLookup(spec) = stage
-            && !out.contains(&spec.from.as_str())
-        {
-            out.push(&spec.from);
-        }
-        if let Stage::Facet(facets) = stage {
-            for (_, sub) in facets {
-                collect_foreign(sub, out);
-            }
-        }
-    }
 }
 
 /// A `$vectorSearch` source, from the collection's configuration alone. It never
@@ -165,6 +142,14 @@ fn vector_source(meta: &kimmy_storage::CollectionMeta, spec: &aggregate::VectorS
     out["queryUsable"] = json!(usable);
     out["queryNote"] = json!(note);
     out
+}
+
+/// A write stage's target as the plan reports it.
+fn target_json(target: &aggregate::Target) -> Value {
+    match &target.db {
+        Some(db) => json!({ "db": db, "coll": target.coll }),
+        None => json!(target.coll),
+    }
 }
 
 /// One stage after the source. `per_input` marks a stage of a `$lookup`
@@ -252,6 +237,29 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
             );
             "runs every facet over the same input, in memory, and answers one document of \
              arrays; each facet's output counts against the pipeline's document limit"
+                .into()
+        }
+        Stage::Merge(spec) => {
+            out["into"] = target_json(&spec.into);
+            out["on"] = json!("_id");
+            out["whenMatched"] = json!(match spec.when_matched {
+                aggregate::WhenMatched::Replace => "replace",
+                aggregate::WhenMatched::Merge => "merge",
+                aggregate::WhenMatched::KeepExisting => "keepExisting",
+            });
+            out["whenNotMatched"] = json!(if spec.insert_unmatched { "insert" } else { "discard" });
+            out["runs"] = json!("write");
+            "writes the pipeline's output into the target, matching each document to a stored \
+             one by `_id`, in chunks of storage.multi_chunk_docs; not atomic, so a failure \
+             leaves the earlier chunks written. A plan writes nothing and creates nothing"
+                .into()
+        }
+        Stage::Out(target) => {
+            out["into"] = target_json(target);
+            out["runs"] = json!("write");
+            "inserts the pipeline's output into the target, which must be new or empty (a run \
+             refuses one that holds documents), in chunks of storage.multi_chunk_docs; not \
+             atomic. A plan writes nothing and creates nothing"
                 .into()
         }
         Stage::Lookup { from, as_field, join } => {

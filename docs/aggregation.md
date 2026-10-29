@@ -34,6 +34,8 @@ can answer it, which only a *leading* `$match` gets (see
 | `$bucket`, `$bucketAuto` | A histogram: documents counted into ranges you give, or into about equal parts. [Blocking](#the-memory-limit). Below |
 | `$facet` | Several sub-pipelines over the same input, answered as **one document** of arrays. Below |
 | `$graphLookup` | Walk another collection (or the same one) link by link from each document, to a depth you give. **Authorized separately**. Below |
+| `$merge` | Write the pipeline's output into a collection, each document matched to a stored one by `_id`. **Last stage only; writes**. [Below](#merge) |
+| `$out` | Insert the pipeline's output into a collection that is **new or empty**. **Last stage only; writes**. [Below](#out) |
 | `$vectorSearch` | Semantic search as the pipeline's **source**: the hits, as documents, flow into the rest of the pipeline. **First stage only**. [Below](#vectorsearch) |
 
 **Stage operands with a fixed key set are closed; field-path maps stay
@@ -203,6 +205,109 @@ rows). Over an empty input every facet runs over nothing: `$count` still answers
   runs (the last facet takes the input itself), and the outputs of the facets that
   finished are held, up to the limits above; put the `$match` that narrows the input
   before the `$facet`.
+
+### `$merge`
+
+```json
+[ { "$match": { "status": "paid" } },
+  { "$group": { "_id": "$day", "total": { "$sum": "$amount" }, "n": { "$sum": 1 } } },
+  { "$merge": { "into": "daily_sales", "on": "_id" } } ]
+```
+
+writes the pipeline's output into `daily_sales` instead of returning it ([ADR-255](decisions.md)):
+a rollup that can be run again. The spec is `{into, on, whenMatched, whenNotMatched}`:
+
+| Field | Values |
+|---|---|
+| `into` | A collection name in the pipeline's database, or `{db, coll}` for one in another. **Required** |
+| `on` | `"_id"`, or left out. Nothing else (below) |
+| `whenMatched` | What a document does when a stored one has its `_id`. `"merge"` (the default): the incoming document's top-level fields are laid over the stored one, fields only the stored one has are kept, the others overwritten. `"replace"`: the stored document is replaced whole, its `_id` kept. `"keepExisting"`: the stored document is left alone |
+| `whenNotMatched` | `"insert"` (the default), or `"discard"`: the document is dropped |
+
+A document with no `_id` (a `$project` took it out) cannot match, so it is inserted
+with a generated `_id`, or discarded. Two output documents with one `_id` are applied
+in order: the second sees the first. The answer carries counts and **no documents**:
+
+```json
+{ "documents": [], "count": 0,
+  "merge": { "matched": 1, "inserted": 1, "replaced": 0, "merged": 1, "kept": 0,
+             "discarded": 0, "commits": 1 } }
+```
+
+The counts are the decisions taken, so `matched` is always `replaced + merged + kept`;
+a `merge` over a stored document that already held those values is counted `merged`
+and writes nothing. `commits` is the write transactions that committed something.
+
+- **The key is `_id`, and only `_id`.** `on` as another field, or as an array (an
+  array of `["_id"]` too), is `400` with the reason: a match on another key is a read
+  then a write, no uniqueness is enforced across members, and two members running the
+  same `$merge` at the same time would each find no match and each insert. `_id` is
+  the key the store keeps one document per.
+- **Refused, `400`, each naming what and why**: `whenMatched: "fail"` and
+  `whenNotMatched: "fail"` (neither can be checked across members), a pipeline-form
+  `whenMatched` (an array), and `let` (it only serves the pipeline form).
+- **Last stage only.** In any other position, and inside a `$facet` or a `$lookup`
+  sub-pipeline, it is `400` at parse.
+- **It may not write a collection the pipeline reads**: the source, and every
+  `$lookup` and `$graphLookup` collection, nested sub-pipelines and `$facet` branches
+  included, compared by database and collection. `400`, before anything is read. A
+  pipeline that reads what it writes has no answer, because every stage reads storage
+  when it runs.
+- **Permissions.** `read` on the source and on every collection it joins, as for any
+  aggregation, **and `write` on the target**. A target in another database (`{db,
+  coll}`) needs `write` there; a grant on the same name in the pipeline's database is
+  not one. **A target that does not exist is created, which needs `ddl` on it as well**:
+  an insert never creates a collection, and `write` is not a grant to shape the data.
+  Neither is checked after the pipeline has run: a refused request has read and written
+  nothing, and a refused creation leaves nothing behind.
+- **It is the ordinary write path.** Each document is an ordinary insert or replace
+  inside a write transaction: the unique and other indexes, the document and `_id` size
+  caps, the oplog, change streams, webhooks, expiry and replication see the same writes
+  a client's would. A document that violates a unique index is refused the way an
+  insert is (`409 unique_violation`).
+- **Not atomic.** The documents are written in transactions of at most
+  `storage.multi_chunk_docs` (default 1,000), as a `multi: true` update is, and the
+  writer is released between them. A failure aborts the chunk it is in and **leaves
+  the earlier chunks written, published and replicating**; the answer is then
+  `500 partially_applied`, whose `applied` holds the counts of what landed and
+  `cause` why it stopped. A failure in the first chunk writes nothing and is the
+  plain error (a `409` for a unique violation, `413` for a document over the cap).
+  Run it again: a `$merge` that is idempotent for its documents (`merge`, `replace`,
+  `keepExisting`) lands the rest.
+- **The pipeline's output obeys the pipeline's ceilings** (100,000 documents per
+  stage, [The memory limit](#the-memory-limit)); what is written obeys the stored
+  document's caps.
+- **`explain: true` plans it and writes nothing**: the stage is listed with
+  `runs: "write"`, `into`, `on` and the modes, and the target is not created. It
+  applies a run's refusals (a target the pipeline reads, a pipeline that does not
+  parse) and needs the grants a run needs, `write` and `ddl` on the target included.
+
+### `$out`
+
+```json
+[ { "$match": { "year": 2026 } },
+  { "$out": "orders_2026" } ]
+```
+
+inserts the pipeline's output into `orders_2026`, or into `{db, coll}` of another
+database. **The target must be new or empty**: a collection that holds any live
+document is `400` (`$out writes only into a new or empty collection ... Drop the
+collection first, or use $merge`), and a missing one is created. A collection
+emptied by deletes is empty. There is no atomic replace of a collection that holds
+documents; drop it first, or `$merge` into it.
+
+It is the insert half of `$merge`, with the same rules: last stage only, never
+inside a `$facet` or a `$lookup` sub-pipeline, never a collection the pipeline
+reads, `write` on the target and `ddl` when it must be created, the ordinary write
+path, chunks of `storage.multi_chunk_docs` and **not atomic**. The answer is
+`{"documents": [], "count": 0, "out": {"inserted": 2, "commits": 1}}`.
+
+Two output documents with one `_id` are refused **before anything is written**
+(`409 duplicate_key`, as a bulk insert refuses them; the target may have been
+created, and is empty). An `_id` that is already stored cannot happen in a new or
+empty target, except to a writer that slips in between the check and the write,
+which fails the chunk it lands in as `partially_applied`. The `timeseries` form,
+`{db, coll, timeseries: ...}`, is refused by name.
 
 ### `$project`
 
@@ -1393,7 +1498,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |
-| `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
+| `$merge` with `on` other than `_id`, `whenMatched`/`whenNotMatched: "fail"`, a pipeline `whenMatched`, `let`; `$out` into a collection that holds documents, `$out` with `timeseries` | Refused, `400`, each naming what and why. [`$merge`](#merge), [`$out`](#out), and the [deviations register](deviations.md) |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
 | Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |
