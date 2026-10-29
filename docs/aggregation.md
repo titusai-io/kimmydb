@@ -386,7 +386,7 @@ field path.
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
 | Boolean | `$and` `$or` `$not` |
 | Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$dateToString` |
-| Arrays | `$size` `$arrayElemAt` `$first` `$last` `$slice` `$concatArrays` `$in` `$indexOfArray` `$isArray` `$reverseArray` `$range` |
+| Arrays | `$size` `$arrayElemAt` `$first` `$last` `$slice` `$concatArrays` `$in` `$indexOfArray` `$isArray` `$reverseArray` `$range` `$sortArray` `$zip` |
 | Sets | `$setUnion` `$setIntersection` `$setDifference` `$setEquals` `$setIsSubset` `$anyElementTrue` `$allElementsTrue` |
 | Documents | `$objectToArray` `$arrayToObject` |
 | Iteration | `$filter` `$map` `$reduce` — each binds a variable per element |
@@ -728,6 +728,52 @@ exhaustion written as an expression, and it is refused before anything is
 allocated. Its elements are 64-bit integers, as every integer result here is
 , so `$type` of an element is `"long"`
 ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).
+
+### Sorting and zipping arrays
+
+```json
+{ "$project": {
+    "ranked": { "$sortArray": { "input": "$players", "sortBy": { "points": -1, "name": 1 } } },
+    "pairs":  { "$zip": { "inputs": [ "$keys", "$values" ] } }
+} }
+```
+
+Over `{keys: ["a", "b", "c"], values: [1, 2]}` the `pairs` are `[["a", 1], ["b", 2]]`.
+
+| Operator | Specification | Result |
+|---|---|---|
+| `$sortArray` | `{input: <array>, sortBy: 1 \| -1 \| {path: 1 \| -1, ...}}` | the array in order |
+| `$zip` | `{inputs: [<array>, ...], useLongestLength: <bool>, defaults: [<expr>, ...]}` | an array of arrays, element `i` holding each input's element `i` |
+
+**`$sortArray` orders by the `$sort` stage's order** ([ADR-238](decisions.md)), so a
+sorted array and a sorted collection agree: null, then numbers (a `Decimal128`
+by its exact value), strings, documents, arrays, booleans. `sortBy: 1` or `-1`
+compares the elements whole, a document element included. A sort document
+orders document elements by those keys, dotted paths allowed, the first key
+deciding and the next breaking its ties; an element that is not a document, or
+lacks a key, reads as null for it. The sort is **stable**: elements that compare
+equal keep their input order, in both directions. `input` is an expression; null
+or missing gives null and any other non-array is a `400`. `sortBy` is written
+out, not computed, and a missing `input` or `sortBy`, another key, a number
+other than `1` or `-1`, an empty sort document and a direction other than `1`
+or `-1` are each a `400` naming `$sortArray`.
+
+**`$zip` stops at the shortest input** by default. With
+`useLongestLength: true` it runs to the longest, and an input that has run out
+contributes `null`, or its entry of `defaults` (one expression per input, in
+order). `defaults` without `useLongestLength: true`, or of another length than
+`inputs`, is a `400`, as is a `useLongestLength` that is not a boolean. `inputs`
+is an array written out, not computed, and must not be empty. If any input is
+null or missing the result is null; a non-array input is a `400` even beside a
+null. A result is at most 1,000,000 values (rows times inputs), counted before
+anything is built, so a larger one is a `400` naming the limit.
+
+Both read variables as their siblings do (`{$map: {input: "$pairs", in:
+{$zip: {inputs: ["$$this.k", "$$this.v"]}}}}`) and work wherever an expression
+does. Where they differ from the reference system is in
+[Deviations](deviations.md). To order by something an element does not hold,
+or to pair by a computed rule, `$map` over a `$range` of indexes with
+`$arrayElemAt`, or `$unwind` with `$sort` and `$group`, still works.
 
 ### Sets
 
@@ -1389,7 +1435,6 @@ documents holding large arrays can exceed the cap long before the stage ends.
 
 | | Why |
 |---|---|
-| `$zip`, `$sortArray` | Not built, by decision: both are refused at parse as **unknown operators**. `$map` over a `$range` of indexes, with `$arrayElemAt`, reads several arrays by position, and an `$unwind`, `$sort` and `$group` with `$push` orders an array's elements |
 | System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |

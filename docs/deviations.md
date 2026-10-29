@@ -194,6 +194,18 @@ systems use.
 
 ---
 
+## 🟡 `$sortArray` reads a sort-document path through an array by its smallest element, and `$zip` refuses an empty `inputs` and a result over a million values
+
+**Raised 2026-10-28, with ADR-255.** `$sortArray` with a sort document orders by the `$sort` stage's own rule, so a key path that passes through an array in an element gives that element the **smallest** value the path reaches, in either direction. MongoDB takes the largest for a descending key. An element that is not a document, or lacks the key, sorts as null, lowest. `{$zip: {inputs: []}}` is a `400` here; MongoDB answers `[]`. A `$zip` whose result would hold more than 1,000,000 values (rows times inputs) is a `400` naming the limit, counted before anything is built.
+
+**Why.** One order for every sort keeps a port's `$sort` and `$sortArray` agreeing with each other, and the `$sort` difference is already recorded. An empty `inputs` is nearly always a typo for a computed list, which `inputs` does not accept. The limit stops an expression from multiplying the size of the arrays it reads.
+
+**What it costs.** A port that sorts descending by a path through an array, or zips no arrays, or zips past the limit, gets a different answer or a `400`.
+
+**What closes it.** Taking the largest for a descending key, in `$sort` and `$sortArray` together. Not planned.
+
+---
+
 ## 🟡 `$bit` takes an integer operand and an integer field only
 
 **Raised 2026-10-26, with ADR-253.** `{"$bit": {"n": {"and": 6.0}}}` is a `400` here: the operand must be an `Int32` or `Int64`. A field holding a double (`2.0` included), a decimal, a string, an array or `null` is a `400` naming the field and its type; a missing field is read as `0` and created.
@@ -2826,7 +2838,6 @@ here so that the absence of a decision is visible as a decision.
 | No certificate expiry metric | A failed reload is counted, but a certificate nobody ever tried to rotate reports nothing. `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime dependency (pure Rust — not a second crypto stack, so `check-native-deps.sh` would still pass) | not scheduled |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
-| `$zip` and `$sortArray` | Refused at parse as unknown operators, so a ported pipeline using either fails loudly. Declined when the set operators, `$objectToArray` and `$arrayToObject` were built (2026-09-29, ADR-207): `$map` over a `$range` of indexes with `$arrayElemAt` reads arrays by position, and `$unwind`, `$sort` and `$group` with `$push` order an array's elements | not planned |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` with `multi: true` are **atomic per chunk** of `storage.multi_chunk_docs` documents (default 1,000): each chunk is one transaction, the writer is released between chunks, and a failure in a later chunk leaves the earlier ones committed — so a `multi` can stop partway, at a chunk boundary, and a concurrent reader can see the state between two chunks ([ADR-086](decisions.md)). Nothing spans two requests. The full table is [What each operation guarantees](compatibility.md#what-each-operation-guarantees) | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |
