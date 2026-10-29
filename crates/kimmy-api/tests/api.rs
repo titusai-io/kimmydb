@@ -9776,6 +9776,57 @@ async fn computed_expressions_derive_fields_over_http() {
 }
 
 #[tokio::test]
+async fn sort_array_and_zip_run_in_a_pipeline_over_http() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"teams"})).await;
+    for body in [
+        json!({"_id": 1, "keys": ["a", "b", "c"], "values": [1, 2],
+               "players": [{"n": "x", "p": 5}, {"n": "y", "p": 9}, {"n": "z", "p": 5}]}),
+        json!({"_id": 2, "keys": ["q"], "values": [7], "players": []}),
+        json!({"_id": 3, "keys": ["r"]}),
+    ] {
+        let res = server.post("/v1/db/shop/coll/teams/docs", Some(&token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/teams/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$project": {
+                    "ranked": {"$sortArray": {"input": "$players", "sortBy": {"p": -1, "n": -1}}},
+                    "pairs": {"$zip": {"inputs": ["$keys", "$values"]}},
+                    "padded": {"$zip": {
+                        "inputs": ["$keys", "$values"],
+                        "useLongestLength": true,
+                        "defaults": ["-", 0]
+                    }},
+                    "desc": {"$sortArray": {"input": "$keys", "sortBy": -1}},
+                }},
+                {"$sort": {"_id": 1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(
+        docs[0]["ranked"],
+        json!([{"n": "y", "p": 9}, {"n": "z", "p": 5}, {"n": "x", "p": 5}])
+    );
+    assert_eq!(docs[0]["pairs"], json!([["a", 1], ["b", 2]]));
+    assert_eq!(docs[0]["padded"], json!([["a", 1], ["b", 2], ["c", 0]]));
+    assert_eq!(docs[0]["desc"], json!(["c", "b", "a"]));
+    assert_eq!(docs[1]["ranked"], json!([]));
+    assert_eq!(docs[1]["pairs"], json!([["q", 7]]));
+    // A missing array makes the result null, whatever else is there.
+    for field in ["ranked", "pairs", "padded"] {
+        assert_eq!(docs[2][field], Value::Null, "{field}: {:?}", docs[2]);
+    }
+    assert_eq!(docs[2]["desc"], json!(["r"]));
+}
+
+#[tokio::test]
 async fn set_operators_and_pair_conversions_run_in_a_pipeline_over_http() {
     let server = Server::start().await;
     let token = server.root().await;
@@ -9864,9 +9915,13 @@ async fn set_operators_and_pair_conversions_run_in_a_pipeline_over_http() {
         (json!([{"$project": {"o": {"$arrayToObject": [[[1, 1]]]}}}]), "a key must be a string"),
         (json!([{"$project": {"o": {"$setUnion": ["$tags", "eu"]}}}]), "needs an array"),
         (json!([{"$project": {"o": {"$objectToArray": "$tags"}}}]), "needs a document"),
-        (json!([{"$project": {"o": {"$zip": {"inputs": ["$tags"]}}}}]), "$zip"),
+        (json!([{"$project": {"o": {"$zip": {"inputs": "$tags"}}}}]), "$zip"),
         (
-            json!([{"$project": {"o": {"$sortArray": {"input": "$tags", "sortBy": 1}}}}]),
+            json!([{"$project": {"o": {"$sortArray": {"input": "$tags", "sortBy": 0}}}}]),
+            "$sortArray",
+        ),
+        (
+            json!([{"$project": {"o": {"$sortArray": {"input": "$attrs", "sortBy": 1}}}}]),
             "$sortArray",
         ),
     ] {

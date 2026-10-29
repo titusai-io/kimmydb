@@ -57,9 +57,9 @@ fn a_partial_filters_refusals_name_the_operator_and_say_why_after_it() {
 
 #[test]
 fn an_expressions_refusals_name_the_operator() {
-    let unknown = Expr::parse(&Bson::Document(doc! { "$zip": "$a" })).unwrap_err();
-    assert_eq!(slot(&unknown), "$zip");
-    assert_eq!(unknown.to_string(), "unsupported operator \"$zip\": not an expression operator");
+    let unknown = Expr::parse(&Bson::Document(doc! { "$nope": "$a" })).unwrap_err();
+    assert_eq!(slot(&unknown), "$nope");
+    assert_eq!(unknown.to_string(), "unsupported operator \"$nope\": not an expression operator");
     let variable = Expr::parse(&Bson::String("$$DESCEND".into())).unwrap_err();
     assert_eq!(slot(&variable), "$$DESCEND");
 }

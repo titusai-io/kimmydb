@@ -26,21 +26,28 @@ pub struct SortKey {
 pub fn parse_sort(doc: &Document) -> Result<Vec<SortKey>> {
     doc.iter()
         .map(|(path, direction)| {
-            let descending = match direction {
-                Bson::Int32(1) | Bson::Int64(1) | Bson::Double(1.0) => false,
-                Bson::Int32(-1) | Bson::Int64(-1) | Bson::Double(-1.0) => true,
-                // A decimal direction by its value, as `1.0` and `-1.0` are.
-                Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(1) => false,
-                Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(-1) => true,
-                _ => {
-                    return Err(Error::InvalidQuery(format!(
-                        "sort direction for {path:?} must be 1 or -1"
-                    )));
-                }
+            let Some(descending) = direction_of(direction) else {
+                return Err(Error::InvalidQuery(format!(
+                    "sort direction for {path:?} must be 1 or -1"
+                )));
             };
             Ok(SortKey { path: path.clone(), descending })
         })
         .collect()
+}
+
+/// Whether a sort direction is descending: `Some(false)` for `1`, `Some(true)`
+/// for `-1`, in any numeric type that holds the value, and `None` for anything
+/// else.
+pub fn direction_of(direction: &Bson) -> Option<bool> {
+    match direction {
+        Bson::Int32(1) | Bson::Int64(1) | Bson::Double(1.0) => Some(false),
+        Bson::Int32(-1) | Bson::Int64(-1) | Bson::Double(-1.0) => Some(true),
+        // A decimal direction by its value, as `1.0` and `-1.0` are.
+        Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(1) => Some(false),
+        Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(-1) => Some(true),
+        _ => None,
+    }
 }
 
 /// Compare two documents by a sort specification.
