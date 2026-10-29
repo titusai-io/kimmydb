@@ -260,6 +260,13 @@ and writes nothing. `commits` is the write transactions that committed something
   an insert never creates a collection, and `write` is not a grant to shape the data.
   Neither is checked after the pipeline has run: a refused request has read and written
   nothing, and a refused creation leaves nothing behind.
+- **The output's `_id` must be one a document can have**: an ObjectId, string,
+  integer, binary or finite decimal. Any other type, `null` (the `_id` of a `$group`
+  on a key some documents lack), a document (a compound `$group` key), an array and
+  a double included, is `400`. Build a compound key with `$concat` first. Every `_id`
+  of the output is checked, in both stages, before the target is created and before
+  the first chunk is written, so a refused output writes nothing and creates nothing.
+  (A string or binary `_id` over the size cap is refused in the same place.)
 - **It is the ordinary write path.** Each document is an ordinary insert or replace
   inside a write transaction: the unique and other indexes, the document and `_id` size
   caps, the oplog, change streams, webhooks, expiry and replication see the same writes
@@ -273,7 +280,8 @@ and writes nothing. `commits` is the write transactions that committed something
   `cause` why it stopped. A failure in the first chunk writes nothing and is the
   plain error (a `409` for a unique violation, `413` for a document over the cap).
   Run it again: a `$merge` that is idempotent for its documents (`merge`, `replace`,
-  `keepExisting`) lands the rest.
+  `keepExisting`) lands the rest when every output document carries its `_id`; a
+  document without one is given a new ObjectId each time it is inserted.
 - **The pipeline's output obeys the pipeline's ceilings** (100,000 documents per
   stage, [The memory limit](#the-memory-limit)); what is written obeys the stored
   document's caps.
@@ -290,10 +298,14 @@ and writes nothing. `commits` is the write transactions that committed something
 ```
 
 inserts the pipeline's output into `orders_2026`, or into `{db, coll}` of another
-database. **The target must be new or empty**: a collection that holds any live
+database. **The target must be new or empty, and no `_id` already stored, as this
+member holds the target when the `$out` runs.** A collection that holds any live
 document is `400` (`$out writes only into a new or empty collection ... Drop the
 collection first, or use $merge`), and a missing one is created. A collection
-emptied by deletes is empty. There is no atomic replace of a collection that holds
+emptied by deletes is empty. Across members the target can already hold documents,
+and an `_id` written elsewhere meets the output by last-writer-wins, as any two
+inserts of one `_id` do ([ADR-006](decisions.md)): the check is a guard against an
+obvious mistake on this member, not a promise about the cluster. There is no atomic replace of a collection that holds
 documents; drop it first, or `$merge` into it.
 
 It is the insert half of `$merge`, with the same rules: last stage only, never
@@ -304,9 +316,10 @@ path, chunks of `storage.multi_chunk_docs` and **not atomic**. The answer is
 
 Two output documents with one `_id` are refused **before anything is written**
 (`409 duplicate_key`, as a bulk insert refuses them; the target may have been
-created, and is empty). An `_id` that is already stored cannot happen in a new or
-empty target, except to a writer that slips in between the check and the write,
-which fails the chunk it lands in as `partially_applied`. The `timeseries` form,
+created, and is empty). An `_id` that is already stored cannot happen in a target
+this member holds as new or empty, except to a writer that slips in between the
+check and the write, which is a `409` in the first chunk and `partially_applied`
+after it. The `timeseries` form,
 `{db, coll, timeseries: ...}`, is refused by name.
 
 ### `$project`

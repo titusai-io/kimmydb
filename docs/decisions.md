@@ -23465,6 +23465,10 @@ the clauses without `$expr` not put first.
 
 ## ADR-207 — A set operator's member is what `$eq` calls equal, its result is first-seen, and what it cannot compare it refuses
 
+> **Amended by [ADR-255](#adr-255--the-merge-and-out-stages-and-the-sortarray-and-zip-operators)**: `$zip` and `$sortArray` are no
+> longer refused at parse. The "left so" in the gap below describes the code before ADR-255; both
+> operators are built, and `$sortArray` orders with the `$sort` stage's own comparison.
+
 **Status:** accepted, for the next `0.MINOR`. Extends the expression scope of
 [ADR-105](#adr-105--expressions-evaluate-in-a-lexical-scope) and its rule that
 null propagates and a type violation refuses. Takes the identity of
@@ -25953,6 +25957,11 @@ flag, a wedge that is bad for a class owning nothing, a wedge that overrides a
 neutral class, and a bad tick that does not reset the good run.
 
 ## ADR-221 — `aggregate` takes `explain: true` and answers with a plan, without running anything
+
+> **Amended by [ADR-255](#adr-255--the-merge-and-out-stages-and-the-sortarray-and-zip-operators)**: `$out` and `$merge` now exist, as the
+> last stage of a pipeline, so "No writes: `aggregate` is a read" below holds only for a pipeline
+> that does not end in one. Its explain plans the stage and writes and creates nothing, and needs the
+> access a run needs, as this ADR says it must.
 
 > **Amended 2026-10-06 by [ADR-222](#adr-222--a-lookup-sub-pipelines-match-reads-the-let-names-through-expr-and-a-correlated-eq-is-a-hash-join).**
 > A sub-pipeline `$match` that reads a `let` name is no longer hoisted whole: it
@@ -30655,8 +30664,8 @@ decimal `_id` and a decimal-bound definition.
 3. **The write path is the ordinary one.** Every document goes through the insert and replace bodies in a write transaction, so indexes, size caps, the oplog, change streams, webhooks, expiry and replication behave as for client writes, and a unique violation is refused as an insert's is. Matching is by `_id` inside the transaction, so a later document in a chunk sees an earlier one. The counts are decisions (`matched == replaced + merged + kept`); an unchanged document commits nothing.
 4. **Chunked, not atomic.** Documents are written in chunks of `storage.multi_chunk_docs`, one transaction per chunk, as a multi update is. A failure aborts its chunk and leaves earlier chunks committed; the answer is `500 partially_applied` with the counts that landed (`Applied::Write`). This is documented, not hidden.
 5. **A pipeline may not write what it reads.** Its source or any `$lookup` or `$graphLookup` target, nested sub-pipelines and `$facet` branches included, compared by database and collection, is a `400` before anything is read.
-6. **`$out` is the insert-only form**, accepted for a new or empty target only: a collection that holds any live document is a `400` pointing to `$merge` or a prior drop, because the atomic replace of a populated collection has no equivalent in a store without collection renames (its own milestone). Duplicate `_id`s in the output are a `409` before anything is written; the `timeseries` form is refused by name. The emptiness check is made before the output is spent; a concurrent writer in between is an ordinary concurrent writer.
-7. **Permissions.** `read` on everything the pipeline reads and `write` on the target (in the target's own database for `{db, coll}`), and also `ddl` when the target does not exist and is created, since `write` alone must not become a grant to create collections. The target is created only after the pipeline has run, so a failing pipeline leaves no empty collection. `explain` runs the same refusals and grant checks, lists the stage with `runs: "write"`, and writes and creates nothing.
+6. **`$out` is the insert-only form**, accepted for a new or empty target only, and with no `_id` already stored, as this member holds the target when the `$out` runs: a collection that holds any live document is a `400` pointing to `$merge` or a prior drop, because the atomic replace of a populated collection has no equivalent in a store without collection renames (its own milestone). Duplicate `_id`s in the output are a `409` before anything is written; the `timeseries` form is refused by name. The emptiness check is made before the output is spent; a concurrent writer in between is an ordinary concurrent writer. Across members the target can already hold documents, and an `_id` written elsewhere meets the output by last-writer-wins, as any two inserts of one `_id` do (ADR-006). A local safety net is acceptable here although the `fail` modes were refused, because `fail` promises a refusal the client relies on, while the emptiness check is a guard against an obvious mistake and is documented as member-local.
+7. **Permissions.** `read` on everything the pipeline reads and `write` on the target (in the target's own database for `{db, coll}`), and also `ddl` when the target does not exist and is created, since `write` alone must not become a grant to create collections. The target is created only after the pipeline has run, and only after every `_id` of the output has been checked (an ObjectId, string, integer, binary or finite decimal; anything else is a `400`), so a failing pipeline and a refused output leave no empty collection. The one exception is the `$out` duplicate-`_id` `409`, which is found after the target is created. `explain` runs the same refusals and grant checks, lists the stage with `runs: "write"`, and writes and creates nothing.
 8. **A missing target on this member** may exist on another member that has not synced; it is then created here, the race `POST /collections` already has.
 
 **Decision, `$sortArray` and `$zip`.** Both are expression operators, ending the ADR-207 decline.

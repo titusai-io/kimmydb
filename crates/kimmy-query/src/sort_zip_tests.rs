@@ -123,6 +123,59 @@ fn equal_elements_keep_their_input_order_in_both_directions() {
     }
 }
 
+/// Past the length where an unstable sort falls back to insertion sort, so that
+/// a sort which does not keep equal elements in order shows.
+#[test]
+fn a_hundred_equal_elements_keep_their_input_order_in_both_directions() {
+    // Every element equals the others as a number; the type tells them apart,
+    // and `Int32(0)` and `Int32(2)` sit among them to give the sort work to do.
+    let kinds = [Bson::Int32(1), Bson::Double(1.0), Bson::Int64(1)];
+    let mut input = Vec::new();
+    for i in 0..100 {
+        input.push(kinds[i % 3].clone());
+        if i % 7 == 0 {
+            input.push(Bson::Int32(if i % 2 == 0 { 0 } else { 2 }));
+        }
+    }
+    let ones: Vec<Bson> =
+        input.iter().filter(|b| !matches!(b, Bson::Int32(0) | Bson::Int32(2))).cloned().collect();
+    for direction in [1, -1] {
+        let Bson::Array(items) = sorted(Bson::Array(input.clone()), Bson::Int32(direction)) else {
+            panic!("not an array")
+        };
+        let kept: Vec<Bson> = items
+            .iter()
+            .filter(|b| !matches!(b, Bson::Int32(0) | Bson::Int32(2)))
+            .cloned()
+            .collect();
+        assert_eq!(kept, ones, "whole elements, direction {direction}");
+    }
+}
+
+#[test]
+fn a_hundred_documents_with_equal_keys_keep_their_input_order_in_both_directions() {
+    let rows: Vec<Bson> = (0..100)
+        .map(|n| Bson::Document(doc! { "k": if n % 10 == 0 { 0 } else { 1 }, "n": n }))
+        .collect();
+    let in_order = |rows: &[Bson], key: i32| -> Vec<i32> {
+        rows.iter()
+            .filter_map(|r| r.as_document())
+            .filter(|d| d.get_i32("k").ok() == Some(key))
+            .map(|d| d.get_i32("n").unwrap())
+            .collect()
+    };
+    let expected: Vec<i32> = (0..100).filter(|n| n % 10 != 0).collect();
+    for direction in [1, -1] {
+        let Bson::Array(items) = sorted(Bson::Array(rows.clone()), bson!({ "k": direction }))
+        else {
+            panic!("not an array")
+        };
+        assert_eq!(in_order(&items, 1), expected, "sort document, direction {direction}");
+        let zeros: Vec<i32> = (0..100).filter(|n| n % 10 == 0).collect();
+        assert_eq!(in_order(&items, 0), zeros, "sort document, direction {direction}");
+    }
+}
+
 #[test]
 fn a_sort_document_orders_documents_by_its_keys() {
     let people = bson!([

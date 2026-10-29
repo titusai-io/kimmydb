@@ -17611,8 +17611,8 @@ async fn a_merge_may_not_write_what_the_pipeline_reads() {
         assert!(message.contains("the pipeline reads it"), "{what}: {message}");
         assert_eq!(sink_dump(&server, &token, "shop", "other").await, before, "{what}");
     }
-    // A collection the pipeline does not read is fine, and so is the same name
-    // in another database.
+    // A collection the pipeline does not read is fine (the same name in another
+    // database is `the_same_name_in_another_database_is_not_a_self_read`).
     let ok =
         sink_run(&server, &token, "src", json!([lookup("other"), {"$merge": {"into": "t"}}])).await;
     assert_eq!(ok.status, 200, "{:?}", ok.body);
@@ -17960,6 +17960,214 @@ async fn merge_and_out_write_through_the_ordinary_indexes_and_change_stream() {
         server.post("/v1/db/shop/coll/t/find", Some(&token), json!({"filter": {"a": 1}})).await;
     assert_eq!(gone.body["documents"].as_array().map(Vec::len), Some(0), "{:?}", gone.body);
     assert_eq!(server.state.engine.commits() - oplog_before, 1);
+}
+
+/// Source rows whose `$group` by `day` yields a null `_id` for the last one.
+async fn seed_days_with_one_undated(server: &Server, token: &str) {
+    let docs = vec![
+        json!({"_id": 1, "day": "a"}),
+        json!({"_id": 2, "day": "b"}),
+        json!({"_id": 3, "day": "c"}),
+        json!({"_id": 4}),
+    ];
+    sink_seed(server, token, "src", docs).await;
+}
+
+fn group_by_day_into(sink: Value) -> Value {
+    json!([
+        {"$group": {"_id": "$day", "n": {"$sum": 1}}},
+        {"$sort": {"_id": -1}},
+        sink,
+    ])
+}
+
+#[tokio::test]
+async fn a_refused_output_id_in_a_later_chunk_writes_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_days_with_one_undated(&server, &token).await;
+    sink_seed(&server, &token, "rollup", vec![]).await;
+    sink_seed(&server, &token, "snap", vec![]).await;
+    server.state.engine.set_multi_chunk_docs(2);
+    let commits = server.state.engine.commits();
+    for (stage, target) in
+        [(json!({"$merge": {"into": "rollup"}}), "rollup"), (json!({"$out": "snap"}), "snap")]
+    {
+        let res = sink_run(&server, &token, "src", group_by_day_into(stage.clone())).await;
+        assert_eq!(res.status, 400, "{stage}: {:?}", res.body);
+        assert_ne!(res.body["error"], "partially_applied", "{stage}: {:?}", res.body);
+        assert!(sink_dump(&server, &token, "shop", target).await.is_empty(), "{stage}");
+    }
+    assert_eq!(server.state.engine.commits(), commits, "nothing was committed");
+}
+
+#[tokio::test]
+async fn a_refused_output_id_creates_no_target() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_days_with_one_undated(&server, &token).await;
+    for (stage, target) in [
+        (json!({"$merge": {"into": "fresh_m"}}), "fresh_m"),
+        (json!({"$out": "fresh_o"}), "fresh_o"),
+    ] {
+        for chunk in [2, 1000] {
+            server.state.engine.set_multi_chunk_docs(chunk);
+            let res = sink_run(&server, &token, "src", group_by_day_into(stage.clone())).await;
+            assert_eq!(res.status, 400, "{stage}: {:?}", res.body);
+            let found = server
+                .post(&format!("/v1/db/shop/coll/{target}/find"), Some(&token), json!({}))
+                .await;
+            assert_eq!(found.status, 404, "{stage} created `{target}`");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_compound_or_double_output_id_is_refused_and_a_concat_key_is_not() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    sink_seed(
+        &server,
+        &token,
+        "sales",
+        vec![
+            json!({"_id": 1, "d": "mon", "s": "x", "p": 2.5}),
+            json!({"_id": 2, "d": "mon", "s": "x", "p": 2.5}),
+        ],
+    )
+    .await;
+    let cases = [("compound", json!({"d": "$d", "s": "$s"})), ("double", json!("$p"))];
+    for (what, key) in cases {
+        for (kind, stage) in [
+            ("merge", json!({"$merge": {"into": format!("m_{what}")}})),
+            ("out", json!({"$out": format!("o_{what}")})),
+        ] {
+            let res = sink_run(
+                &server,
+                &token,
+                "sales",
+                json!([{"$group": {"_id": key.clone(), "n": {"$sum": 1}}}, stage]),
+            )
+            .await;
+            assert_eq!(res.status, 400, "{kind} {what}: {:?}", res.body);
+            let target = if kind == "merge" { format!("m_{what}") } else { format!("o_{what}") };
+            let found = server
+                .post(&format!("/v1/db/shop/coll/{target}/find"), Some(&token), json!({}))
+                .await;
+            assert_eq!(found.status, 404, "{kind} {what} created `{target}`");
+        }
+    }
+    let res = sink_run(
+        &server,
+        &token,
+        "sales",
+        json!([
+            {"$group": {"_id": {"$concat": ["$d", "|", "$s"]}, "n": {"$sum": 1}}},
+            {"$merge": {"into": "by_key"}},
+        ]),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        sink_dump(&server, &token, "shop", "by_key").await,
+        vec![json!({"_id": "mon|x", "n": 2})]
+    );
+}
+
+#[tokio::test]
+async fn the_same_name_in_another_database_is_not_a_self_read() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    sink_seed(&server, &token, "src", sink_source()).await;
+    sink_seed(&server, &token, "daily", sink_target()).await;
+    let res = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([
+            {"$lookup": {"from": "daily", "localField": "_id", "foreignField": "_id", "as": "j"}},
+            {"$merge": {"into": {"db": "reports", "coll": "daily"}}},
+        ]),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(sink_dump(&server, &token, "reports", "daily").await.len(), 2);
+    let res =
+        sink_run(&server, &token, "src", json!([{"$out": {"db": "reports", "coll": "src"}}])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(sink_dump(&server, &token, "reports", "src").await, sink_source());
+}
+
+#[tokio::test]
+async fn a_change_stream_sees_the_writes_of_a_merge() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    sink_seed(&server, &token, "src", sink_source()).await;
+    sink_seed(&server, &token, "t", sink_target()).await;
+    let mut socket = open_watch(&server.base, "/v1/db/shop/coll/t/watch", &token).await;
+    let res = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([{"$sort": {"_id": 1}}, {"$merge": {"into": "t", "whenMatched": "replace"}}]),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let frame =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_text_frame(&mut socket))
+                .await
+                .expect("a change event for each write");
+        let event: Value = serde_json::from_str(&frame).unwrap();
+        seen.push((event["operationType"].clone(), event["documentKey"]["_id"].clone()));
+    }
+    assert_eq!(seen, vec![(json!("replace"), json!(1)), (json!("insert"), json!(3))]);
+}
+
+#[tokio::test]
+async fn sort_array_orders_documents_as_the_sort_stage_does() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let docs = vec![
+        json!({"_id": 1, "k": [1, 5]}),
+        json!({"_id": 2, "k": 3}),
+        json!({"_id": 3, "k": [2, 4]}),
+        json!({"_id": 4}),
+        json!({"_id": 5, "k": {"$numberDecimal": "2.5"}}),
+        json!({"_id": 6, "k": "s"}),
+        json!({"_id": 7, "k": {"x": 1}}),
+        json!({"_id": 8, "k": null}),
+    ];
+    sink_seed(&server, &token, "src", docs).await;
+    let expected = [(1, json!([4, 8, 1, 3, 5, 2, 6, 7])), (-1, json!([7, 6, 2, 5, 3, 1, 4, 8]))];
+    for (dir, expected) in expected {
+        let stage = sink_run(
+            &server,
+            &token,
+            "src",
+            json!([{"$sort": {"k": dir, "_id": 1}}, {"$project": {"_id": 1}}]),
+        )
+        .await;
+        let ids: Vec<Value> =
+            stage.body["documents"].as_array().unwrap().iter().map(|d| d["_id"].clone()).collect();
+        let array = sink_run(
+            &server,
+            &token,
+            "src",
+            json!([
+                {"$sort": {"_id": 1}},
+                {"$group": {"_id": null, "all": {"$push": "$$ROOT"}}},
+                {"$project": {"_id": 0, "ids": {"$map": {
+                    "input": {"$sortArray": {"input": "$all", "sortBy": {"k": dir, "_id": 1}}},
+                    "in": "$$this._id"}}}},
+            ]),
+        )
+        .await;
+        assert_eq!(array.status, 200, "{:?}", array.body);
+        assert_eq!(json!(ids), expected, "$sort, direction {dir}");
+        assert_eq!(array.body["documents"][0]["ids"], expected, "$sortArray, direction {dir}");
+    }
 }
 
 #[tokio::test]
