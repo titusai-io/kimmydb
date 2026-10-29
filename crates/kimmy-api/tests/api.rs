@@ -3753,6 +3753,17 @@ async fn the_positional_dollar_updates_the_element_the_filter_matched() {
     .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(res.body["document"], json!({"_id": 3, "items": [{"sku": "nut", "qty": 9}]}));
+    // The returned `after` image no longer satisfies the filter at the
+    // element that was changed, and is still cut to that element.
+    let res = fam(json!({
+        "filter": {"_id": 1, "items.sku": "gasket"},
+        "update": {"$set": {"items.$.sku": "washer"}}, "returnDocument": "after",
+        "projection": {"items.$": 1},
+    }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"]["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(res.body["document"]["items"][0]["sku"], "washer", "{:?}", res.body);
     let res = fam(json!({
         "filter": {"_id": 99, "items.sku": "nut"}, "upsert": true,
         "update": {"$set": {"items.$.qty": 9}},

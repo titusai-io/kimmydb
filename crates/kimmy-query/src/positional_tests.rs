@@ -206,6 +206,9 @@ fn nor_not_ne_and_nin_record_nothing() {
     assert_eq!(at(doc! { "scores": { "$not": { "$gt": 100 } } }, &d), None);
     assert_eq!(at(doc! { "items.sku": { "$ne": "nut" } }, &d), None);
     assert_eq!(at(doc! { "scores": { "$nin": [100] } }, &d), None);
+    // A `$nor` branch is false as a whole, though one of its clauses held.
+    let f = doc! { "$nor": [ { "scores": { "$gte": 6 }, "items.sku": "nut" } ] };
+    assert_eq!(at(f, &d), None);
     // A positive clause beside them still records.
     assert_eq!(
         at(doc! { "scores": { "$nin": [100] }, "items.sku": "bolt" }, &d),

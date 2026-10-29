@@ -344,10 +344,9 @@ pub fn parse_find_projection(doc: &Document) -> Result<Option<FindProjection>> {
     let mut named = doc.clone();
     named.remove(entry.as_str());
     named.insert(array.clone(), 1);
+    // The entry is an inclusion, so a mix with an exclusion is the refusal
+    // `parse_projection` already makes.
     let projection = parse_projection(&named)?.expect("one entry was kept");
-    if matches!(projection, Projection::Exclude(_)) {
-        return refuse("`$` cannot be combined with an exclusion");
-    }
     Ok(Some(FindProjection { projection, positional: Some(array) }))
 }
 
