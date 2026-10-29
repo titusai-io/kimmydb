@@ -17416,8 +17416,38 @@ async fn out_refuses_duplicate_ids_in_its_output_before_writing_anything() {
     .await;
     assert_eq!(res.status, 409, "{:?}", res.body);
     assert_eq!(res.body["error"], "duplicate_key");
-    // The target was created before the write, and holds nothing.
-    assert!(sink_dump(&server, &token, "shop", "snap").await.is_empty());
+    // The refusal comes before the target is created.
+    let described = server.get("/v1/db/shop/coll/snap/describe", Some(&token)).await;
+    assert_eq!(described.status, 404, "{:?}", described.body);
+}
+
+#[tokio::test]
+async fn an_id_over_the_size_cap_in_a_later_chunk_writes_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    sink_seed(&server, &token, "src", (1..=4).map(|i| json!({"_id": i})).collect()).await;
+    sink_seed(&server, &token, "t", vec![]).await;
+    server.state.engine.set_multi_chunk_docs(2);
+    // An 8192-byte `_id` on the last document, which falls in the second chunk.
+    let big = json!({"$reduce": {
+        "input": {"$range": [0, 13]},
+        "initialValue": "x",
+        "in": {"$concat": ["$$value", "$$value"]},
+    }});
+    let res = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([
+            {"$sort": {"_id": 1}},
+            {"$project": {"_id": {"$cond": [{"$eq": ["$_id", 4]}, big, "$_id"]}}},
+            {"$merge": {"into": "t"}},
+        ]),
+    )
+    .await;
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "id_too_large");
+    assert!(sink_dump(&server, &token, "shop", "t").await.is_empty());
 }
 
 #[tokio::test]

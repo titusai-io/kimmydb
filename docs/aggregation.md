@@ -315,8 +315,8 @@ path, chunks of `storage.multi_chunk_docs` and **not atomic**. The answer is
 `{"documents": [], "count": 0, "out": {"inserted": 2, "commits": 1}}`.
 
 Two output documents with one `_id` are refused **before anything is written**
-(`409 duplicate_key`, as a bulk insert refuses them; the target may have been
-created, and is empty). An `_id` that is already stored cannot happen in a target
+(`409 duplicate_key`, as a bulk insert refuses them, and the target is not
+created). An `_id` that is already stored cannot happen in a target
 this member holds as new or empty, except to a writer that slips in between the
 check and the write, which is a `409` in the first chunk and `partially_applied`
 after it. The `timeseries` form,
