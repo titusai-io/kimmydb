@@ -2348,6 +2348,9 @@ fn write_sink(
     // A refused output creates nothing: its `_id`s are checked before the target
     // is created, as `write_documents` checks them before its first chunk.
     state.engine.check_output_ids(&docs)?;
+    if is_out {
+        state.engine.check_unique_output_ids(&docs)?;
+    }
     let not_empty = |meta: &CollectionMeta| -> Result<(), ApiError> {
         let mut holds = false;
         kimmy_storage::blocking(|| {
