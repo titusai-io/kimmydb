@@ -1265,9 +1265,15 @@ document as it was before the write, at the same index in the document
 returned. `returnDocument: "before"` (the default) and `remove: true` return
 the matched element of the document as it was. `"after"` returns the element
 at that index of the updated document, so `items.$.qty` incremented and
-returned shows the incremented element. An update that leaves the array with
-another length, or no longer an array (`$pull`, `$push`, `$set` of the whole
-array), is a `400`, because the index no longer names the slot that matched.
+returned shows the incremented element. With `"after"`, an update is a `400`
+unless every path it writes is under `items.$` or shares no prefix with
+`items`: a write to `items` itself, to a parent of it (`$set` of the document
+that holds it), or to a descendant of it that does not go through `$`
+(`items.0.qty`, `items.$[].qty`, `items.$[<id>].qty`) is refused, whatever the
+operator (`$set`, `$unset`, `$rename`, `$push`, `$pull`, `$pop`, `$addToSet`,
+`$sort` inside `$push`), because the index could then name an element the
+filter did not match. `$[]` and `$[<id>]` cannot move elements, but can change
+which one matched, and are refused with the rest. `"before"` is not affected.
 The check runs inside the write transaction, so a refused request writes
 nothing: not the update, not an upsert's insert, not a removal. An `upsert`
 with `returnDocument: "after"` is refused for every request, since an upsert

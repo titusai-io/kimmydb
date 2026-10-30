@@ -751,8 +751,10 @@ under [Positional updates](query-language.md#positional-updates) and
 - **A positional projection is a find feature.** `$project` and `$addFields`
   still read `items.$` as a field called `$`. `findAndModify` takes the element
   from the document the filter matched, at the same index in the returned
-  document; an update that changes the array's length is a `400` for
-  `returnDocument: "after"`, and so is an `upsert` with it.
+  document; `returnDocument: "after"` is a `400` when the update writes the
+  array, a parent of it, or a descendant of it not reached through `$`
+  (`items.0.qty`, `items.$[].qty`); only `items.$...` and unrelated fields are
+  allowed. So is an `upsert` with it.
 - **A positional projection that cannot name an element is a `400`** for the
   request, not an empty array for that document. On `findAndModify` it is
   refused inside the write transaction, so nothing is written. A sorted find
