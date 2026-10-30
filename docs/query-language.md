@@ -319,8 +319,8 @@ The dialect is draft-4 JSON Schema with `bsonType`, as other systems read it.
 | Keywords | Meaning |
 |---|---|
 | `bsonType` | A type alias or an array of them (any one holds): `double`, `string`, `object`, `array`, `binData`, `undefined`, `objectId`, `bool`, `date`, `null`, `regex`, `javascript`, `int`, `timestamp`, `long`, `decimal`, `minKey`, `maxKey`, `symbol`, `dbPointer`, and `number` for the four numeric types. `int` does not accept a double of whole value |
-| `type` | `object`, `array`, `number`, `boolean`, `string`, `null`, or an array of them. With `bsonType` on the same level, both must hold |
-| `enum` | A non-empty array; the value must equal one, by the sort order, so `1` equals `1.0` and `Decimal128("1.00")` |
+| `type` | `object`, `array`, `number`, `boolean`, `string`, `null`, or an array of them. Not on the same level as `bsonType`: both together are a `400`, and so is a name listed twice |
+| `enum` | A non-empty array of distinct values; the value must equal one, by the sort order, so `1` equals `1.0` and `Decimal128("1.00")`. Embedded documents are equal when they hold the same fields with equal values **in any order**: `{x: 1, y: 2}` equals `{y: 2, x: 1}`. Listing a value twice (`1` and `1.0` are one value) is a `400` |
 | `required` | A non-empty array of distinct property names that must be present |
 | `properties` | A schema for each named property. **A property the document lacks is not tested**: only `required` asks for it |
 | `additionalProperties` | `false`, `true`, or a schema for the properties that neither `properties` nor `patternProperties` names |
@@ -334,7 +334,7 @@ The dialect is draft-4 JSON Schema with `bsonType`, as other systems read it.
 | `items` | A schema for every element, or an array of schemas for the elements by position |
 | `additionalItems` | With an `items` array, `false`, `true` or a schema for the elements past it. Ignored beside a single `items` schema |
 | `minItems` `maxItems` | The number of elements |
-| `uniqueItems` | `true`: no two elements are equal, by the sort order, so `1` and `1.0` are one element |
+| `uniqueItems` | `true`: no two elements are equal, by the sort order, so `1` and `1.0` are one element, and two documents with the same fields and values in another order are one element |
 | `allOf` `anyOf` `oneOf` | A non-empty array of schemas: all, at least one, exactly one |
 | `not` | The value must not satisfy the schema |
 | `title` `description` | A string, read and ignored |

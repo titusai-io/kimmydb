@@ -133,12 +133,32 @@ fn type_names_map_to_their_bson_types() {
 }
 
 #[test]
-fn type_and_bson_type_on_one_level_must_both_hold() {
-    check(
-        doc! {"properties": {"v": {"type": "number", "bsonType": "int"}}},
-        &[doc! {"v": 1}],
-        &[doc! {"v": 1.5}, doc! {"v": "a"}],
-    );
+fn type_and_bson_type_on_one_level_are_refused() {
+    let m = refusal(doc! {"properties": {"v": {"type": "number", "bsonType": "int"}}});
+    assert!(m.contains("type") && m.contains("bsonType"), "{m}");
+    assert!(m.contains("properties"), "the place is named: {m}");
+    // Either alone, and one on each of two levels, are fine.
+    schema(doc! {"type": "object"});
+    schema(doc! {"bsonType": "object"});
+    schema(doc! {"type": "object", "properties": {"v": {"bsonType": "int"}}});
+    schema(doc! {"bsonType": "object", "anyOf": [{"type": "object"}]});
+    assert!(refusal(doc! {"anyOf": [{"type": "object", "bsonType": "object"}]}).contains("anyOf"));
+}
+
+#[test]
+fn a_type_name_listed_twice_is_refused() {
+    for (keyword, names) in [
+        ("bsonType", vec!["int", "string", "int"]),
+        ("bsonType", vec!["number", "number"]),
+        ("type", vec!["string", "string"]),
+        ("type", vec!["number", "string", "number"]),
+    ] {
+        let m = refusal(doc! {keyword: names});
+        assert!(m.contains(keyword) && m.contains("twice"), "{m}");
+    }
+    // Different names that stand for overlapping types are not a repeat.
+    schema(doc! {"bsonType": ["number", "int"]});
+    schema(doc! {"bsonType": ["int", "long", "string"]});
 }
 
 #[test]
@@ -168,6 +188,65 @@ fn enum_compares_by_the_total_order() {
         &[doc! {"v": {"a": 1.0}}, doc! {"v": [1.0, 2]}],
         &[doc! {"v": {"a": 2}}, doc! {"v": [2, 1]}],
     );
+}
+
+#[test]
+fn enum_and_unique_items_compare_embedded_documents_in_any_field_order() {
+    // The reference compares documents with their fields unordered.
+    check(
+        doc! {"properties": {"v": {"enum": [{"x": 1, "y": 2}, [{"p": 1, "q": {"a": 1, "b": 2}}]]}}},
+        &[
+            doc! {"v": {"x": 1, "y": 2}},
+            doc! {"v": {"y": 2, "x": 1}},
+            doc! {"v": {"y": 2.0, "x": 1}},
+            doc! {"v": [{"q": {"b": 2, "a": 1}, "p": 1}]},
+        ],
+        &[
+            doc! {"v": {"x": 1}},
+            doc! {"v": {"x": 1, "y": 2, "z": 3}},
+            doc! {"v": {"x": 2, "y": 1}},
+            doc! {"v": {"x": 1, "z": 2}},
+            doc! {"v": [{"q": {"b": 2, "a": 1}, "p": 2}]},
+        ],
+    );
+    check(doc! {"enum": [{"x": 1, "y": 2}]}, &[doc! {"y": 2, "x": 1}], &[doc! {"y": 2}]);
+    // An array is still ordered.
+    check(
+        doc! {"properties": {"v": {"enum": [[{"a": 1}, {"b": 2}]]}}},
+        &[doc! {"v": [{"a": 1}, {"b": 2}]}],
+        &[doc! {"v": [{"b": 2}, {"a": 1}]}],
+    );
+    let s = doc! {"properties": {"v": {"uniqueItems": true}}};
+    check(
+        s,
+        &[
+            doc! {"v": [{"x": 1, "y": 2}, {"x": 1, "y": 3}]},
+            doc! {"v": [{"x": 1, "y": 2}, {"x": 1}]},
+            doc! {"v": [[{"a": 1}, {"b": 1}], [{"b": 1}, {"a": 1}]]},
+        ],
+        &[
+            doc! {"v": [{"x": 1, "y": 2}, {"y": 2, "x": 1}]},
+            doc! {"v": [{"x": 1, "y": 2}, {"y": 2.0, "x": 1}]},
+            doc! {"v": [1, {"p": {"a": 1, "b": 2}}, 2, {"p": {"b": 2, "a": 1}}]},
+            doc! {"v": [[{"a": 1, "b": 2}], [{"b": 2, "a": 1}]]},
+        ],
+    );
+}
+
+#[test]
+fn a_value_listed_twice_in_an_enum_is_refused() {
+    for list in [
+        vec![Bson::Int32(1), Bson::Int32(1)],
+        vec![Bson::Int32(1), Bson::Double(1.0)],
+        vec![Bson::Int32(1), dec("1.00")],
+        vec![Bson::String("a".into()), Bson::Int32(2), Bson::String("a".into())],
+        vec![Bson::Document(doc! {"x": 1, "y": 2}), Bson::Document(doc! {"y": 2, "x": 1})],
+        vec![Bson::Null, Bson::Null],
+    ] {
+        let m = refusal(doc! {"properties": {"v": {"enum": list.clone()}}});
+        assert!(m.contains("enum") && m.contains("twice"), "{list:?}: {m}");
+    }
+    schema(doc! {"enum": [1, "1", Bson::Null, [1], [1, 1], {"a": 1}, {"a": 2}, {"b": 1}]});
 }
 
 #[test]

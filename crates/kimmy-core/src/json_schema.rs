@@ -9,14 +9,16 @@
 //! documents its author meant to reject.
 //!
 //! Evaluation is pure. It allocates only for `uniqueItems` (a vector of
-//! references to the array's elements, so at most 8 bytes per element and
-//! bounded by the 16 MiB document cap) and, in
+//! references to the array's elements, so at most 8 bytes per element, and a copy
+//! of each element that holds an embedded document, to put its fields in key order;
+//! both bounded by the 16 MiB document cap) and, in
 //! [`Schema::explain_failure`], for the message. Its recursion follows the
 //! schema, never the document: each step into a property or an element moves
 //! to a sub-schema, so it is at most [`MAX_DEPTH`] deep whatever the nesting
 //! of the document tested. (Only the order of two values, in `enum` and
 //! `uniqueItems`, descends into the document, as every comparison does.)
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -270,6 +272,9 @@ impl Parser {
                 "type" => node.json_type = Some(self.types(kw, value, true)?),
                 "enum" => match value {
                     Bson::Array(items) if !items.is_empty() => {
+                        if !all_distinct(items) {
+                            return Err(self.refuse(kw, "must not list a value twice"));
+                        }
                         node.enum_values = Some(items.clone());
                     }
                     _ => return Err(self.refuse(kw, "must be a non-empty array")),
@@ -375,6 +380,9 @@ impl Parser {
             }
         }
 
+        if node.bson_type.is_some() && node.json_type.is_some() {
+            return Err(self.refuse("type", "cannot be used with bsonType in one schema"));
+        }
         node.minimum = self.bound("minimum", minimum, "exclusiveMinimum", exclusive_minimum)?;
         node.maximum = self.bound("maximum", maximum, "exclusiveMaximum", exclusive_maximum)?;
         Ok(node)
@@ -430,7 +438,17 @@ impl Parser {
             Bson::Array(names) if names.is_empty() => {
                 Err(self.refuse(keyword, "must name at least one type"))
             }
-            Bson::Array(names) => names.iter().map(one).collect(),
+            Bson::Array(names) => {
+                let specs = names.iter().map(one).collect::<Result<Vec<_>>>()?;
+                let mut seen = HashSet::new();
+                for (spec, name) in specs.iter().zip(names) {
+                    if !seen.insert(spec.label) {
+                        let name = if let Bson::String(name) = name { name.as_str() } else { "" };
+                        return Err(self.refuse(keyword, &format!("names {name:?} twice")));
+                    }
+                }
+                Ok(specs)
+            }
             single => Ok(vec![one(single)?]),
         }
     }
@@ -665,10 +683,10 @@ impl Run {
 
         if let Some(values) = &n.enum_values {
             let found = match v {
-                V::Val(b) => values.iter().any(|e| canonical_cmp(b, e) == Ordering::Equal),
+                V::Val(b) => values.iter().any(|e| same_value(b, e)),
                 V::Doc(d) => {
                     let whole = Bson::Document(d.clone());
-                    values.iter().any(|e| canonical_cmp(&whole, e) == Ordering::Equal)
+                    values.iter().any(|e| same_value(&whole, e))
                 }
             };
             if !found {
@@ -905,14 +923,61 @@ impl Run {
     }
 }
 
-/// Whether no two items are equal in the canonical order, so `1` and `1.0`
-/// are one item. Sorted, so n log n comparisons.
+/// Whether two values are equal for `enum` and `uniqueItems`: in the canonical
+/// order, so `1`, `1.0` and `Decimal128("1.00")` are one value, **and with the fields
+/// of an embedded document in any order**, as the reference compares them
+/// (`{x: 1, y: 2}` equals `{y: 2, x: 1}`). An array is equal elementwise, in order,
+/// its documents compared the same way.
+fn same_value(a: &Bson, b: &Bson) -> bool {
+    match (a, b) {
+        (Bson::Document(x), Bson::Document(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(key, vx)| y.get(key).is_some_and(|vy| same_value(vx, vy)))
+        }
+        (Bson::Array(x), Bson::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(vx, vy)| same_value(vx, vy))
+        }
+        _ => canonical_cmp(a, b) == Ordering::Equal,
+    }
+}
+
+/// `value` with the fields of every embedded document in key order, so that two
+/// values [`same_value`] calls equal compare equal in the canonical order. A value
+/// holding no document is borrowed as it is.
+fn keyed(value: &Bson) -> Cow<'_, Bson> {
+    fn holds_document(value: &Bson) -> bool {
+        match value {
+            Bson::Document(_) => true,
+            Bson::Array(items) => items.iter().any(holds_document),
+            _ => false,
+        }
+    }
+    match value {
+        Bson::Document(doc) => {
+            let mut fields: Vec<(&String, Bson)> =
+                doc.iter().map(|(key, value)| (key, keyed(value).into_owned())).collect();
+            fields.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            Cow::Owned(Bson::Document(
+                fields.into_iter().map(|(key, value)| (key.clone(), value)).collect(),
+            ))
+        }
+        Bson::Array(items) if items.iter().any(holds_document) => {
+            Cow::Owned(Bson::Array(items.iter().map(|item| keyed(item).into_owned()).collect()))
+        }
+        other => Cow::Borrowed(other),
+    }
+}
+
+/// Whether no two items are equal by [`same_value`]. Each item is put in key order
+/// (a copy only for an item that holds a document) and the items are sorted, so n
+/// log n comparisons.
 fn all_distinct(items: &[Bson]) -> bool {
     match items {
         [] | [_] => true,
-        [a, b] => canonical_cmp(a, b) != Ordering::Equal,
+        [a, b] => !same_value(a, b),
         _ => {
-            let mut sorted: Vec<&Bson> = items.iter().collect();
+            let keyed: Vec<Cow<'_, Bson>> = items.iter().map(keyed).collect();
+            let mut sorted: Vec<&Bson> = keyed.iter().map(|k| k.as_ref()).collect();
             sorted.sort_unstable_by(|a, b| canonical_cmp(a, b));
             sorted.windows(2).all(|w| canonical_cmp(w[0], w[1]) != Ordering::Equal)
         }
