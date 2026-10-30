@@ -1466,10 +1466,10 @@ impl Engine {
                 // `Hold`: a snapshot document must not move the vectors —
                 // the coverage is granted once, below, and the reason is on
                 // `Position::Hold`.
-                if let RemoteApplied::Applied { id, violations, .. } =
+                if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                     self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
                 {
-                    pending.push(Pending { collection, entry, id, violations });
+                    pending.push(Pending { collection, entry, id, violations, unkeyed });
                 }
             }
 
@@ -1714,7 +1714,7 @@ impl Engine {
                     doc_id: Some(document.id.clone()),
                     body: document.body.clone(),
                 };
-                if let RemoteApplied::Applied { id, violations, .. } =
+                if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                     self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
                 {
                     if young {
@@ -1723,7 +1723,7 @@ impl Engine {
                     } else {
                         applied_at_cut += usize::from(at_cut(document.stamp));
                     }
-                    pending.push(Pending { collection, entry, id, violations });
+                    pending.push(Pending { collection, entry, id, violations, unkeyed });
                 }
             }
             let documents_applied = pending.len();
@@ -1843,13 +1843,14 @@ impl Engine {
         let count = pending.len();
         let mut failed = None;
         let mut published = Vec::with_capacity(count);
-        for Pending { collection, entry, id, violations } in pending {
+        for Pending { collection, entry, id, violations, unkeyed } in pending {
             match self.report_remote_write(
                 WriterHolder::Repair,
                 &collection,
                 &entry,
                 &id,
                 &violations,
+                &unkeyed,
             ) {
                 Ok(entries) => published.extend(entries),
                 Err(e) => {
@@ -2002,10 +2003,10 @@ impl Engine {
                 doc_id: Some(id),
                 body: None,
             };
-            if let RemoteApplied::Applied { id, violations, .. } =
+            if let RemoteApplied::Applied { id, violations, unkeyed, .. } =
                 self.apply_remote_in_txn(txn, &collection, &entry, Position::Hold)?
             {
-                pending.push(Pending { collection, entry, id, violations });
+                pending.push(Pending { collection, entry, id, violations, unkeyed });
             }
         }
         Ok(recorded)
@@ -3773,6 +3774,19 @@ mod tests {
         let cb = b.get_collection("shop", "orders").unwrap();
         let index = cb.index("tags_1_cats_1").expect("the definition builds here too");
         assert_eq!(b.unkeyed_count(&cb, index.id).unwrap(), 1, "B's own document, filed unkeyed");
+        let reported: Vec<_> = b
+            .read_oplog_from(kimmy_core::Hlc::ZERO, 1_000, crate::WalkScope::Request)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == kimmy_core::OpKind::UnkeyedDocument)
+            .map(|e| {
+                bson::deserialize_from_slice::<kimmy_core::UnkeyedDocumentDetail>(&e.body.unwrap())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(reported.len(), 1, "and reported once, on B: {reported:?}");
+        assert_eq!(reported[0].id, DocId::String("both".into()));
+        assert_eq!(reported[0].index, "tags_1_cats_1");
         for id in ["a-1", "a-2", "both"] {
             assert!(b.get(&cb, &DocId::String(id.into())).unwrap().is_some(), "{id}");
         }

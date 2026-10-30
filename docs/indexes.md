@@ -202,29 +202,61 @@ value like any number ([Key Encoding](key-encoding.md#numbers-the-hard-part),
 answered from the index, and a unique index enforces on it; the storage schema 5
 migration rebuilds every index, and a decimal leaves the unkeyed run there.
 
-MongoDB refuses the first ("cannot index parallel arrays"). KimmyDB used to
-refuse these, per document, at write time. **It no longer refuses any of
-them.** The document is stored, and the index files it under its **unkeyed
-run** — one entry under an empty key, which no real key can be and which
-sorts ahead of every real key. Every scan of the index reads that run beside
-its ranges and rechecks each document against the full filter, exactly as it
-rechecks any candidate. So every query still finds the document, and none
+MongoDB refuses the first ("cannot index parallel arrays"), and so does
+KimmyDB, **on the member that takes the write**. A local insert, bulk insert,
+replace, upsert, update, `find_and_modify` or `$merge`/`$out` write that an index
+on that member cannot key is a `400 bad_request`, checked on the document the
+write would store, inside the transaction that stores it, so nothing is
+written:
+
+```
+cannot index parallel arrays [sizes] [tags] (index "tags_1_sizes_1", _id 1)
+```
+
+or, for the second shape, `document would produce more than 1000 index keys,
+the most one document may have in an index (index "tags_1", _id 1)`. Creating an
+index over documents already stored that it cannot key is a `400` as well: it
+counts them, lists the first ten `_id`s and says how many more, and creates
+nothing. A write to a collection with no index that cannot key it is unaffected,
+and a partial index is asked only about the documents its filter selects. The
+refusals are counted in `kimmy_index_unkeyed_refusals_total`. A unique index
+refuses these with the longer message below.
+
+**A document another member accepted is filed, not refused.** The refusal is made
+against the indexes the accepting member holds, which is all a leaderless store
+can know. A member that had not yet received the definition accepts the document,
+and a member that then receives the document by replication, or receives the
+definition over documents it holds, cannot refuse it without diverging from the
+member that accepted it. So replication, a snapshot, a catch-up, a repair and a
+restore never refuse. The document is stored, and the index files it under its
+**unkeyed run** — one entry under an empty key, which no real key can be and
+which sorts ahead of every real key. Every scan of the index reads that run
+beside its ranges and rechecks each document against the full filter, exactly as
+it rechecks any candidate. So every query still finds the document, and none
 finds it wrongly: the range was too wide, never too narrow, which is the rule
 everything above follows from.
 
-**An index is an access path, not a schema.** That is the whole of the
-reasoning, and [ADR-139](decisions.md) records what it cost to learn: a
-refusal that depends on an index is a constraint, and a leaderless store
-cannot hold a constraint across members without coordination. A member that
-had not yet received a definition legally accepted a document the
+**An index is an access path, not a schema, on the replicated path.** That is the
+reasoning behind the filing, and [ADR-139](decisions.md) records what it cost to
+learn: a refusal on replication that depends on an index is a constraint, and a
+leaderless store cannot hold a constraint across members without coordination. A
+member that had not yet received a definition legally accepted a document the
 definition's holder could then neither apply nor skip, and the holder's
-replication stopped for the life of the process. The rule bought a smaller
-index and an early error for a badly shaped document; it cost a cluster its
-convergence.
+replication stopped for the life of the process. [ADR-258](decisions.md) restores
+the refusal where a client is there to be told, and leaves the replicated path as
+ADR-139 made it.
 
 **Where it shows.** Each unkeyed filing is logged at warning naming the
 database, collection, index and document id, and counted in
-`kimmy_index_unkeyed_total`. The index listing, `describe` and `createIndex`
+`kimmy_index_unkeyed_total`. It is announced on the collection's change stream
+as an [`unkeyedDocument` event](change-streams.md) on each member that files it,
+and `GET /v1/db/{db}/coll/{coll}/indexes/{name}/unkeyed` lists the documents an
+index holds unkeyed, with `reason` `parallel_arrays` or `too_many_keys`, paged
+like the violations reports (`limit`, `cursor`; `404` for an index the
+collection does not have). The event is sent on the move **into** the unkeyed run
+— a replicated write that arrives unkeyed, a replicated definition's backfill, an
+update that makes a keyed document unkeyed — and not again while the document
+stays there. The index listing, `describe` and `createIndex`
 report `unkeyed` — how many documents the index holds that it could not
 key — and `explain` reports `unkeyedCandidates` beside `indexEntriesRead`,
 the entries a query read from the run. **That figure means this reason and no
@@ -234,17 +266,22 @@ documents a partial index held because its filter could not *decide* them, with
 [below](#a-decimal128-at-a-filtered-path).) Zero is the index doing its whole
 job. Anything else is the cost of leaving such documents under the index:
 every scan of it rechecks all of them. The fix is the collection owner's, and
-needs no access to the server — reshape the documents, or split the compound
-index into single-field ones, which key every shape.
+needs no access to the server — reshape the documents (a local write that
+leaves a listed document unkeyed is refused, so reshape it with a replace), or
+split the compound index into single-field ones, which key every shape.
 
-**The unique exception.** A unique index must be able to key every document
-it covers, or it reports a constraint it does not hold. So a **local** write
-a unique index cannot key is still refused with `400`, naming the index, and
-creating a unique index over such a document is refused too — a client on
-this member is there to be told ([ADR-020](decisions.md)). A **replicated**
-write a unique index cannot key is a fact another member accepted: it is
-filed unkeyed, takes part in no uniqueness check, and is warned about and
-counted like any other, rather than refused.
+**The unique index.** A unique index must be able to key every document it
+covers, or it reports a constraint it does not hold. So a local write a unique
+index cannot key is refused with `400`, naming the index and saying why a unique
+index needs every document keyed, and creating a unique index over such a
+document is refused too ([ADR-020](decisions.md)). A **replicated** write a
+unique index cannot key is a fact another member accepted: it is filed unkeyed,
+takes part in no uniqueness check, and is reported and counted like any other,
+rather than refused.
+
+**A replicated definition is accepted over documents it cannot key.** The
+member files each one unkeyed and says so with one event per document; it does
+not refuse the definition.
 
 **On a clustered node, `createIndex` and `dropIndex` do not answer until
 every live member has applied or refused the change**, or a deadline has
@@ -842,8 +879,8 @@ A duplicate write is rejected with **409 `unique_violation`**. A document's own
 existing entry never counts against it, so updating in place works. Creating a
 unique index over data that *already* violates it is refused — building it
 anyway would advertise a constraint that does not hold. For the same reason a
-unique index refuses a document it cannot key, where every other index files
-it unkeyed: see [Documents an index cannot key](#documents-an-index-cannot-key).
+unique index refuses a document it cannot key with a message of its own, where
+a replicated one is filed unkeyed: see [Documents an index cannot key](#documents-an-index-cannot-key).
 
 ### The cross-node limit, stated plainly
 

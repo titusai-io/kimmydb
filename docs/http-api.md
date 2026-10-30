@@ -72,6 +72,7 @@ has been incomplete before.
 | `DELETE` | `/v1/db/{db}/coll/{coll}/webhooks/{id}` | `webhook` ([Webhooks](webhooks.md)) |
 | `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `ddl` |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `ddl` |
+| `GET` | `/v1/db/{db}/coll/{coll}/indexes/{name}/unkeyed` | `read` — the documents the index files unkeyed and why, paged ([Indexes](indexes.md#documents-an-index-cannot-key)) |
 | `GET` | `/v1/db/{db}/coll/{coll}/violations` | `read` — unique violations still standing ([Indexes](indexes.md#resolving-a-unique-violation)) |
 | `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/validator` | `ddl` — set, replace or remove the collection's `$jsonSchema` validator ([Validators](validation.md)) |
 | `GET` | `/v1/db/{db}/coll/{coll}/validator/violations` | `read` — the documents that fail the current validator, found by a scan, paged ([Validators](validation.md#finding-the-documents-that-fail-it)) |
@@ -817,6 +818,26 @@ it, create the index partial:
 `"partialFilterExpression": {"email": {"$exists": true}}`
 ([partial indexes](indexes.md#partial-indexes--indexing-only-some-documents)).
 
+**A write an index cannot key is refused `400 bad_request`** on the member that
+takes it: arrays at two of a compound index's paths, or more than 1,000 keys
+for one document. The message is `cannot index parallel arrays [sizes] [tags]
+(index "tags_1_sizes_1", _id 1)` for the first, and says `document would
+produce more than 1000 index keys` for the second. It covers every write that
+stores a document: insert, bulk insert, replace, upsert, update, `find_and_modify`
+and `$merge`/`$out`. Creating an index over documents that already hold such a
+shape is a `400` too, naming how many, the first ten `_id`s and how many more,
+and creating nothing. A write or a definition that arrives by **replication** is
+never refused; it is filed unkeyed, announced by an `unkeyedDocument` change event
+and listed by `GET …/indexes/{name}/unkeyed`
+([Documents an index cannot key](indexes.md#documents-an-index-cannot-key),
+[ADR-258](decisions.md)).
+
+`GET …/indexes/{name}/unkeyed?limit=&cursor=` answers
+`{"index": "tags_1_sizes_1", "unkeyed": [{"_id": 1, "reason": "parallel_arrays"}],
+"count": 1, "nextCursor": "…"}`, `nextCursor` present while the run holds more;
+`reason` is `parallel_arrays` or `too_many_keys`. An index the collection does not
+have is `404`.
+
 Creating an index under a name the collection already has is **idempotent
 when the definition is identical** and **409 `conflict`** when any part of it
 differs — the field list, `unique`, `expireAfterSeconds` or
@@ -1177,7 +1198,8 @@ named. The status differs from a body's `422` because a query string is part
 of the request line rather than an entity the server could not process; the
 envelope is the same. A route that takes no query parameters — every route
 other than `GET .../docs`, `PUT` and `DELETE .../docs/{id}`,
-`GET .../describe`, `GET .../violations`, `DELETE .../vector` and
+`GET .../describe`, `GET .../violations`, `GET .../validator/violations`,
+`GET .../indexes/{name}/unkeyed`, `DELETE .../vector` and
 `GET .../watch` — refuses *any* query string at all, `400 bad_request`
 naming the first parameter and saying the route takes none
 ([ADR-124](decisions.md)). So `if_stamp` on `update`, `delete` and

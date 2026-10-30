@@ -106,11 +106,16 @@ pub struct Engine {
     unique_violations: std::sync::atomic::AtomicU64,
     /// Documents filed under an index's unkeyed run, since start: stored,
     /// but with no key the index could derive for them, so every scan of that
-    /// index rechecks them (ADR-139). Local writes, replicated writes and
-    /// backfills all count here, because all three file them; a client sees
+    /// index rechecks them (ADR-139). Replicated writes, backfills and a
+    /// rewind count here, because they file them (a local write is refused,
+    /// ADR-258, and counts in `unkeyed_refusals`); a client sees
     /// the standing number per index as `unkeyed` on the listing, and this is
     /// the rate, for the metrics endpoint.
     unkeyed_writes: std::sync::atomic::AtomicU64,
+    /// Local writes and creates refused because an index on this member could
+    /// not key what they would store, since start. The replicated path never
+    /// refuses and counts in `unkeyed_writes` instead.
+    unkeyed_refusals: std::sync::atomic::AtomicU64,
     /// Entries a snapshot restore appended behind the schema it restored, so
     /// that this node can serve them onward (ADR-180), since start. Counted
     /// after the commit that made each one durable, here rather than on the
@@ -1546,6 +1551,7 @@ impl Engine {
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
             unkeyed_writes: std::sync::atomic::AtomicU64::new(0),
+            unkeyed_refusals: std::sync::atomic::AtomicU64::new(0),
             ddl_relogged: std::sync::atomic::AtomicU64::new(0),
             state_held_refusals: std::sync::atomic::AtomicU64::new(0),
             digest_probe_busy: std::sync::atomic::AtomicBool::new(false),
@@ -2128,6 +2134,12 @@ impl Engine {
         self.unkeyed_writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many local writes an index refused since start because it could
+    /// not key the document (400).
+    pub fn unkeyed_refusals(&self) -> u64 {
+        self.unkeyed_refusals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many schema changes a snapshot restore has appended to this node's
     /// oplog since start, so that it can serve them onward (ADR-180).
     pub fn ddl_relogged(&self) -> u64 {
@@ -2179,6 +2191,10 @@ impl Engine {
 
     pub(crate) fn count_unique_violation(&self) {
         self.unique_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_unkeyed_refusal(&self) {
+        self.unkeyed_refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn count_unkeyed(&self, n: u64) {

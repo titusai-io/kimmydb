@@ -1656,13 +1656,14 @@ impl ChangeStream {
         // issued by a stream that had taken it. Before the drop check, so a
         // drop the issuing stream had already taken does not end this one.
         //
-        // A violation is never passed over. Each member reports a merge's
-        // violation under its own stamp and peers never serve one another's,
-        // so the vector can cover this member's report without the issuing
-        // member ever having held it (ADR-173). Delivering it can only repeat
-        // a report of the same merge.
+        // A local observation is never passed over. Each member reports a
+        // merge's violation, or a document it filed unkeyed, under its own
+        // stamp and peers never serve one another's, so the vector can cover
+        // this member's report without the issuing member ever having held it
+        // (ADR-173). Delivering it can only repeat a report of the same
+        // event.
         if let Some(skip) = &self.skip
-            && entry.kind != OpKind::UniqueViolation
+            && !entry.kind.is_local_observation()
             && entry.stamp.hlc <= skip.get(entry.stamp.node)
         {
             return None;

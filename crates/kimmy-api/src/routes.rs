@@ -251,6 +251,7 @@ fn timed_routes() -> Router<SharedState> {
         .route("/v1/db/{db}/coll/{coll}/describe", get(describe_collection))
         .route("/v1/db/{db}/coll/{coll}/indexes", get(list_indexes).post(create_index))
         .route("/v1/db/{db}/coll/{coll}/indexes/{name}", delete(drop_index))
+        .route("/v1/db/{db}/coll/{coll}/indexes/{name}/unkeyed", get(list_unkeyed))
         .route("/v1/db/{db}/coll/{coll}/violations", get(list_violations))
         .route(
             "/v1/db/{db}/coll/{coll}/validator",
@@ -294,13 +295,14 @@ fn timed_routes() -> Router<SharedState> {
 /// `docs/openapi.yaml` gives a query parameter, so a parameter documented on a
 /// route this table does not open, or opened here and documented nowhere, is
 /// a failing test rather than a route that quietly behaves otherwise.
-pub const QUERY_STRING_ROUTES: [(&str, &str); 8] = [
+pub const QUERY_STRING_ROUTES: [(&str, &str); 9] = [
     ("GET", "/v1/db/{db}/coll/{coll}/docs"),
     ("PUT", "/v1/db/{db}/coll/{coll}/docs/{id}"),
     ("DELETE", "/v1/db/{db}/coll/{coll}/docs/{id}"),
     ("GET", "/v1/db/{db}/coll/{coll}/describe"),
     ("GET", "/v1/db/{db}/coll/{coll}/violations"),
     ("GET", "/v1/db/{db}/coll/{coll}/validator/violations"),
+    ("GET", "/v1/db/{db}/coll/{coll}/indexes/{name}/unkeyed"),
     ("DELETE", "/v1/db/{db}/coll/{coll}/vector"),
     ("GET", "/v1/db/{db}/coll/{coll}/watch"),
 ];
@@ -1506,6 +1508,32 @@ async fn list_violations(
     QueryParams(q): QueryParams<ViolationsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::violations(&state, &auth, &db, &coll, q.index.as_deref())?))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct UnkeyedQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+/// `GET .../indexes/{name}/unkeyed`: the documents the index files unkeyed
+/// and why, one page at a time (ADR-258).
+async fn list_unkeyed(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll, name)): Path<(String, String, String)>,
+    QueryParams(q): QueryParams<UnkeyedQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(exec::unkeyed_documents(
+        &state,
+        &auth,
+        &db,
+        &coll,
+        &name,
+        q.limit,
+        q.cursor.as_deref(),
+    )?))
 }
 
 async fn drop_index(

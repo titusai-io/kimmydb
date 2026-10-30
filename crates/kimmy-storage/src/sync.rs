@@ -979,7 +979,7 @@ impl Engine {
             skip
         };
         let keep = |entry: &OplogEntry| {
-            let keep = entry.kind != OpKind::UniqueViolation;
+            let keep = !entry.kind.is_local_observation();
             passed.set(passed.get() + u64::from(!keep));
             keep
         };
@@ -1492,13 +1492,14 @@ impl Engine {
         self.count_held_marks_released(std::mem::take(&mut run.released));
         let mut published = Vec::with_capacity(run.pending.len());
         let mut failed = None;
-        for Pending { collection, entry, id, violations } in run.pending.drain(..) {
+        for Pending { collection, entry, id, violations, unkeyed } in run.pending.drain(..) {
             match self.report_remote_write(
                 WriterHolder::Replication,
                 &collection,
                 &entry,
                 &id,
                 &violations,
+                &unkeyed,
             ) {
                 Ok(entries) => published.extend(entries),
                 Err(e) => {
@@ -1831,6 +1832,7 @@ pub(crate) struct Pending {
     pub(crate) entry: OplogEntry,
     pub(crate) id: DocId,
     pub(crate) violations: Vec<UniqueViolation>,
+    pub(crate) unkeyed: Vec<OplogEntry>,
 }
 
 /// How one replicated schema change went against this node's state.
@@ -2129,9 +2131,10 @@ impl Engine {
         memo: &mut Memo,
         outcome: &mut SyncOutcome,
     ) -> Result<Step> {
-        // A node's own observation of a broken constraint is not a fact
-        // about the data; refuse it even if a peer sends one.
-        if entry.kind == OpKind::UniqueViolation {
+        // A node's own observation of its data, a broken constraint or a
+        // document filed unkeyed, is not a fact about the data; refuse it
+        // even if a peer sends one.
+        if entry.kind.is_local_observation() {
             return Ok(Step::Taken);
         }
 
@@ -2237,10 +2240,16 @@ impl Engine {
         };
         let txn = self.run_txn(run)?;
         match self.apply_remote_in_txn(txn, &collection, entry, position)? {
-            RemoteApplied::Applied { id, violations, released } => {
+            RemoteApplied::Applied { id, violations, unkeyed, released } => {
                 outcome.applied += 1;
                 run.released += u64::from(released);
-                run.pending.push(Pending { collection, entry: entry.clone(), id, violations });
+                run.pending.push(Pending {
+                    collection,
+                    entry: entry.clone(),
+                    id,
+                    violations,
+                    unkeyed,
+                });
             }
             // Nothing was written, so the run's transaction is exactly as it
             // was — save a held mark released — and the next entry carries on
@@ -5178,6 +5187,13 @@ mod tests {
         assert_eq!(outcome.applied, 2, "both of B's documents apply: {outcome:?}");
         assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
         assert_eq!(a.commits() - commits, 1, "one run, one commit, unkeyed document included");
+        let reported: Vec<_> = a
+            .read_oplog_from(Hlc::ZERO, 1_000, crate::WalkScope::Request)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == OpKind::UnkeyedDocument)
+            .collect();
+        assert_eq!(reported.len(), 1, "and reported in the same commit: {reported:?}");
         assert!(a.get(&ca, &DocId::String("both".into())).unwrap().is_some(), "stored on A");
         assert_eq!(index_state(&a, "tags_1_cats_1"), Some(1), "held, with one unkeyed document");
         assert_eq!(a.unkeyed_writes(), 1);
@@ -5234,6 +5250,11 @@ mod tests {
                 "{name} holds the index, with the document filed unkeyed under it"
             );
         }
+        // Each member's report of the document it filed is a local entry, never
+        // served, and it puts that member's vector one stamp ahead of the other's;
+        // one round each way reads past it, and then there is nothing left.
+        round(&a, &b, BATCH);
+        round(&b, &a, BATCH);
         assert_eq!(round(&a, &b, BATCH), SyncOutcome::default(), "converged, a's side");
         assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "converged, b's side");
     }

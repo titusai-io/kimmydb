@@ -586,13 +586,21 @@ mod tests {
             engine
                 .create_index("shop", "orders", vec![field("_id")], true, Some("by_n".into()))
                 .unwrap();
+            // As a definition from a peer builds, over documents it cannot key: a
+            // local create over them is refused (ADR-258).
+            let created = kimmy_core::Stamp::new(Hlc::new(5, 0), kimmy_core::NodeId::generate());
             engine
-                .create_index(
+                .create_index_inner(
                     "shop",
                     "orders",
                     vec![field("a"), field("b")],
                     false,
+                    crate::Enforcement::Local,
                     Some("ab".into()),
+                    None,
+                    None,
+                    crate::index::CreateOrigin::Replicated { created: Some(created), logged: None },
+                    &|_, _| Ok(false),
                 )
                 .unwrap();
             let db = engine.db();
@@ -726,6 +734,11 @@ mod tests {
             }),
             // covers: index::holders_of
             ("unkeyed_count", |e, c| e.unkeyed_count(c, c.index("ab").unwrap().id).map(drop)),
+            // covers: index::Engine::unkeyed_documents
+            ("unkeyed_documents", |e, c| {
+                let index = c.index("ab").unwrap();
+                e.unkeyed_documents(c, index, None, 100).map(drop)
+            }),
             // The candidate walks: in index order, one exact run, exact runs
             // merged, and an inexact range put in key order.
             // covers: index::has_entries_at, index::Walk::in_index_order

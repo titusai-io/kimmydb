@@ -2153,7 +2153,12 @@ pub(crate) mod tests {
     fn only_document_changes_are_delivered() {
         // A webhook asked for changes to documents. Schema changes carry no
         // document, and a violation record is not a change at all.
-        for kind in [OpKind::CreateCollection, OpKind::DropIndex, OpKind::UniqueViolation] {
+        for kind in [
+            OpKind::CreateCollection,
+            OpKind::DropIndex,
+            OpKind::UniqueViolation,
+            OpKind::UnkeyedDocument,
+        ] {
             assert!(!wanted(&entry(kind, 1, 1), 1, &[]), "{kind:?} must not be delivered");
         }
         for kind in [OpKind::Insert, OpKind::Update, OpKind::Replace, OpKind::Delete] {

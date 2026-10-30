@@ -64,6 +64,8 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "index::has_entries_at",
     "index::holders_of",
     "index::scan_table",
+    // The page of an index's unkeyed run behind `GET …/indexes/{name}/unkeyed`.
+    "index::Engine::unkeyed_documents",
     // The digest probe's read of the oplog above a cut, and the self-check's
     // walk of one collection's headers (B3).
     "digest_probe::Engine::scan_uncovered",
@@ -365,8 +367,9 @@ const DELEGATES: &[(&str, &str)] = &[
 /// bounds (ADR-192). A read path that used it would be a walk that ignores
 /// the stop, so every use is listed here.
 const IN_WRITE_SITES: &[&str] = &[
-    // A write's index maintenance: its unique checks.
-    "index::maintain",
+    // A write's index maintenance: its unique checks. `maintain` and the
+    // rewind's form are one body, `maintain_local`.
+    "index::maintain_local",
     "index::maintain_remote",
     // find_and_modify's candidates, read in the write it commits.
     "index::scan_range_in_write",

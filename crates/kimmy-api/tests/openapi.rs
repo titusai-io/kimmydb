@@ -1776,6 +1776,17 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         )
         .await;
     let index_name = index["name"].as_str().expect("an index name").to_string();
+    let unkeyed = c
+        .check(
+            "GET",
+            "/v1/db/{db}/coll/{coll}/indexes/{name}/unkeyed",
+            &format!("/v1/db/shop/coll/orders/indexes/{index_name}/unkeyed?limit=1"),
+            Some(&root),
+            None,
+            200,
+        )
+        .await;
+    assert_eq!(unkeyed["unkeyed"], json!([]), "{unkeyed}");
     c.check(
         "GET",
         "/v1/db/{db}/coll/{coll}/indexes",

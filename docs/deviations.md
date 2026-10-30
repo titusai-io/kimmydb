@@ -352,39 +352,54 @@ doing nothing with it.
 
 ---
 
-## 🟡 A compound index over two array fields indexes nothing for that document, where MongoDB refuses the write
+## 🟡 A compound index over two array fields is refused on the member that takes the write, as MongoDB does, but a document another member accepted is filed unkeyed
 
-**Raised 2026-09-06, with ADR-139.** MongoDB refuses a write that would put
+**Raised 2026-09-06, with ADR-139; changed with ADR-258.** MongoDB refuses a write that would put
 arrays at two of a compound index's paths ("cannot index parallel arrays"),
-and refuses to build such an index over existing documents. KimmyDB used to
-do the same, per document, at write time. It no longer refuses either: the
-document is stored and filed under the index's *unkeyed* run, which every
-scan of that index reads beside its ranges and rechecks like any other
-candidate, so every query still finds it and none finds it wrongly. The same
-holds for a document that would produce more than 1,000 keys. (It held for one
-holding a `Decimal128` at an indexed path through 0.50.x; since 0.51.0 a
-`Decimal128` has an exact key and is indexed like any number, ADR-238.) A
-unique index still refuses such a document on a local write, because a unique
-index must be able to key every document it covers.
+and refuses to build such an index over existing documents. KimmyDB refused
+both from the start, then stopped for a while (ADR-139), and refuses them again
+now, on the member that takes the request. A local insert, bulk insert, replace,
+upsert, update, `find_and_modify` or `$merge`/`$out` write, and a local
+`createIndex` over documents already stored, answers `400 bad_request`:
+`cannot index parallel arrays [sizes] [tags]`, or a message naming the cap for a
+document that would produce more than 1,000 keys. The `createIndex` message
+counts the documents, lists the first ten `_id`s and says how many more; nothing
+is created. (Since 0.51.0 a `Decimal128` has an exact key and is indexed like any
+number, ADR-238.)
+
+**What is left of the gap.** The refusal is made by the member that accepts the
+write against the indexes that member holds, which is all a leaderless store can
+do. A member that has not yet received an index definition accepts a document the
+definition cannot key; a member that holds the definition and then receives that
+document by replication, or receives a definition over a document it holds, cannot
+refuse it without diverging from the member that accepted it (ADR-139). So it is
+accepted and filed under the index's *unkeyed* run, which every scan of that index
+reads beside its ranges and rechecks like any other candidate: every query still
+finds it and none finds it wrongly. The member says so: an `unkeyedDocument`
+change-stream event when it files the document, `GET …/indexes/{name}/unkeyed`
+listing what stands, the `unkeyed` count on the index listing, and
+`kimmy_index_unkeyed_total`. A client that is refused on one member and
+accepted on another is the same difference as a unique index's.
+
+**What else differs.** A local write that would leave an already-unkeyed document
+unkeyed is refused too, including an update of an unrelated field: the check is on
+the document the write would store. The remedy is a replace that reshapes it.
 
 **Why.** A refusal that depends on an index is a constraint, and a leaderless
 store cannot hold a constraint across members without coordination
 (ADR-020). A member that had not yet received a definition legally accepted
 a document the definition's holder could then neither apply nor skip, and
 the holder's replication stopped for the life of the process (ADR-139). The
-refusal bought a smaller index and an early error for a badly shaped
-document; it cost a cluster its convergence. MongoDB can afford the refusal
-because every write goes through one primary and an index build commits on
-a quorum; a store that accepts writes on every member cannot.
+refusal on the accepting member keeps what MongoDB gives a client; the filing on
+the others keeps the cluster convergent.
 
-**What closes it.** Nothing needs to: a client that wants the refusal back
-polices document shape itself, or splits the compound index into single-field
-indexes, which key every shape. The `unkeyed` field on the index listing and
-`unkeyedCandidates` on `explain` say when it matters, and they count *this*
-reason only. (From 0.34.0 to 0.50.x the listing also reported `undecidable`, the
-documents a partial filter could not decide, [ADR-185](decisions.md); a filter
-decides a `Decimal128` by its exact value since 0.51.0, and the field is
-removed, [ADR-238](decisions.md).)
+**What closes it.** The remaining gap closes only with a coordination step that
+asks the other members before a write commits, which costs the availability the
+design is built on and is not scheduled. The report and the list are what the
+design offers instead. (From 0.34.0 to 0.50.x the listing also reported
+`undecidable`, the documents a partial filter could not decide,
+[ADR-185](decisions.md); a filter decides a `Decimal128` by its exact value since
+0.51.0, and the field is removed, [ADR-238](decisions.md).)
 
 ---
 

@@ -11635,6 +11635,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_ttl_skipped_total",
         "kimmy_ttl_skipped_filter_total",
         "kimmy_index_unkeyed_total",
+        "kimmy_index_unkeyed_refusals_total",
         "kimmy_webhook_deliveries_total",
         "kimmy_webhook_deliveries_total",
         "kimmy_webhook_events_total",
@@ -13326,98 +13327,312 @@ async fn the_storage_cache_series_read_this_nodes_engine() {
     assert!(value("kimmy_storage_cache_reads_total{result=\"hit\"}") > 0, "{text}");
 }
 
+/// A server whose collection `u` holds one keyable document under the compound
+/// index `ab`, and a collection `src` holding documents to merge from.
+async fn indexed_collection(server: &Server, token: &str) {
+    server.post("/v1/db/shop/collections", Some(token), json!({ "name": "u" })).await;
+    let seeded = server
+        .post("/v1/db/shop/coll/u/docs", Some(token), json!({ "_id": 1, "a": 1, "b": 1 }))
+        .await;
+    assert_eq!(seeded.status, 200, "{:?}", seeded.body);
+    let created = server
+        .post(
+            "/v1/db/shop/coll/u/indexes",
+            Some(token),
+            json!({ "name": "ab", "fields": [{ "path": "a" }, { "path": "b" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+}
+
+/// A document another member accepted, as replication delivers it.
+fn replicated(server: &Server, id: i64, wall: u64, body: bson::Document) {
+    replicated_into(server, "u", kimmy_core::DocId::Int64(id), wall, body);
+}
+
+/// [`replicated`] into any collection of `shop`, under any `_id`.
+fn replicated_into(
+    server: &Server,
+    coll: &str,
+    id: kimmy_core::DocId,
+    wall: u64,
+    mut body: bson::Document,
+) {
+    let meta = server.state.engine.get_collection("shop", coll).unwrap();
+    body.insert("_id", id.to_bson());
+    let entry = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(wall, 0),
+            kimmy_core::NodeId::generate(),
+        ),
+        kind: kimmy_core::OpKind::Insert,
+        collection: meta.id,
+        doc_id: Some(id),
+        body: Some(bson::serialize_to_vec(&body).unwrap()),
+    };
+    server.state.engine.apply_remote(&meta, &entry).unwrap();
+}
+
 #[tokio::test]
-async fn a_document_an_index_cannot_key_is_stored_found_and_reported() {
-    // The write that used to be refused with 400 — arrays at two of a
-    // compound index's paths — is stored, found by every query a scan finds
-    // it by, and reported everywhere a client or an operator would look:
-    // `explain`, the index listing, `describe`, and `/metrics` (ADR-139).
+async fn a_write_an_index_cannot_key_is_refused_with_400_on_every_path() {
+    // The write that ADR-139 stored and filed unkeyed is a 400 again on the
+    // member that takes it (ADR-258), as it is for a unique index: arrays at
+    // two of a compound index's paths, or more than 1,000 keys. Nothing is
+    // stored, and the answer names the index and the document.
     let server = Server::start().await;
     let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "tagged" })).await;
-    let docs = "/v1/db/shop/coll/tagged/docs";
-    for i in 0..5 {
+    indexed_collection(&server, &token).await;
+    let docs = "/v1/db/shop/coll/u/docs";
+    let two_arrays = json!({ "a": [1, 2], "b": [3, 4] });
+    let refused = |res: &Res, why: &str| {
+        assert_eq!(res.status, 400, "{why}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{why}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains("cannot index parallel arrays [b] [a]"), "{why}: {message}");
+        assert!(message.contains("\"ab\""), "{why}: names the index: {message}");
+    };
+
+    let mut one = two_arrays.clone();
+    one["_id"] = json!(2);
+    refused(&server.post(docs, Some(&token), one).await, "insert");
+    let bulk = server
+        .post(
+            "/v1/db/shop/coll/u/bulk",
+            Some(&token),
+            json!([{ "_id": 3, "a": 1 }, { "_id": 4, "a": [1], "b": [2] }]),
+        )
+        .await;
+    refused(&bulk, "bulk insert");
+    refused(&server.put(&format!("{docs}/1"), Some(&token), two_arrays.clone()).await, "replace");
+    let update = server
+        .post(
+            "/v1/db/shop/coll/u/update",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "$set": two_arrays.clone() } }),
+        )
+        .await;
+    refused(&update, "update");
+    let upsert = server
+        .post(
+            "/v1/db/shop/coll/u/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 6 }, "update": { "$set": two_arrays.clone() }, "upsert": true }),
+        )
+        .await;
+    refused(&upsert, "upsert");
+    let fam = server
+        .post(
+            "/v1/db/shop/coll/u/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "$set": two_arrays.clone() } }),
+        )
+        .await;
+    refused(&fam, "find_and_modify");
+
+    // $merge and $out write through the same checks.
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "src" })).await;
+    let mut from = two_arrays.clone();
+    from["_id"] = json!(7);
+    assert_eq!(server.post("/v1/db/shop/coll/src/docs", Some(&token), from).await.status, 200);
+    let merge = server
+        .post(
+            "/v1/db/shop/coll/src/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$merge": { "into": "u" } }] }),
+        )
+        .await;
+    refused(&merge, "$merge");
+
+    // The key cap names itself.
+    let big = server
+        .post(
+            "/v1/db/shop/coll/u/docs",
+            Some(&token),
+            json!({ "_id": 8, "a": (0..1_000).collect::<Vec<i32>>(), "b": 5 }),
+        )
+        .await;
+    assert_eq!(big.status, 400, "{:?}", big.body);
+    let message = big.body["message"].as_str().unwrap();
+    assert!(message.contains("more than 1000 index keys"), "{message}");
+
+    // None of it was stored, and the stored document is untouched.
+    let all = server.post("/v1/db/shop/coll/u/find", Some(&token), json!({})).await;
+    assert_eq!(all.body["documents"].as_array().unwrap().len(), 1, "{}", all.body);
+    let listed = server.get("/v1/db/shop/coll/u/indexes", Some(&token)).await;
+    assert_eq!(listed.body["indexes"][0]["unkeyed"], 0, "{}", listed.body);
+    let metrics = metrics_text(&server).await;
+    assert!(metrics.contains("kimmy_index_unkeyed_total 0\n"), "{metrics}");
+    assert!(metrics.contains("kimmy_index_unkeyed_refusals_total 8\n"), "{metrics}");
+
+    // A shape the index can key goes through on each path.
+    let fine = server.post(docs, Some(&token), json!({ "_id": 9, "a": [1, 2], "b": 3 })).await;
+    assert_eq!(fine.status, 200, "{:?}", fine.body);
+}
+
+#[tokio::test]
+async fn creating_an_index_over_documents_it_cannot_key_is_a_400_that_lists_them() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "u" })).await;
+    for i in 0..12 {
         let res = server
             .post(
-                docs,
+                "/v1/db/shop/coll/u/docs",
                 Some(&token),
-                json!({ "_id": i, "tags": ["a", "b"], "cats": format!("c{i}") }),
+                json!({ "_id": i, "a": [1, 2], "b": [3, 4] }),
             )
             .await;
         assert_eq!(res.status, 200, "{:?}", res.body);
     }
-    let created = server
+    let refused = server
         .post(
-            "/v1/db/shop/coll/tagged/indexes",
+            "/v1/db/shop/coll/u/indexes",
             Some(&token),
-            json!({ "name": "tc", "fields": [{ "path": "tags" }, { "path": "cats" }] }),
+            json!({ "name": "ab", "fields": [{ "path": "a" }, { "path": "b" }] }),
         )
         .await;
-    assert_eq!(created.status, 200, "{:?}", created.body);
-    assert_eq!(created.body["multikey"], true);
-    assert_eq!(created.body["unkeyed"], 0, "every existing document was keyable");
+    assert_eq!(refused.status, 400, "{:?}", refused.body);
+    let message = refused.body["message"].as_str().unwrap();
+    assert!(message.contains("12 existing documents"), "{message}");
+    assert!(message.contains("_ids: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 and 2 more"), "{message}");
+    assert!(message.contains("no index was created"), "{message}");
+    let listed = server.get("/v1/db/shop/coll/u/indexes", Some(&token)).await;
+    assert_eq!(listed.body["indexes"], json!([]), "{}", listed.body);
+}
 
-    let both = server
-        .post(docs, Some(&token), json!({ "_id": 9, "tags": ["a", "b"], "cats": ["c1", "c9"] }))
-        .await;
-    assert_eq!(both.status, 200, "stored, not refused: {:?}", both.body);
-    assert_eq!(server.get(&format!("{docs}/9"), Some(&token)).await.status, 200);
+#[tokio::test]
+async fn a_document_another_member_accepted_is_filed_found_listed_and_reported() {
+    // The leaderless gap, ADR-139's half that stays: a document that reaches
+    // this member by replication is accepted whatever the index says, filed
+    // unkeyed, found by every query, and reported everywhere a client or an
+    // operator would look: the listing, `describe`, `explain`, `/metrics`, the
+    // index's own list of them, and the change stream.
+    let server = Server::start().await;
+    let token = server.root().await;
+    indexed_collection(&server, &token).await;
+    let mut socket = open_watch(&server.base, "/v1/db/shop/coll/u/watch", &token).await;
 
-    let (server_ref, token_ref) = (&server, &token);
-    let count = move |filter: Value| async move {
-        let res = server_ref
-            .post(
-                "/v1/db/shop/coll/tagged/count",
-                Some(token_ref),
-                json!({ "filter": filter, "explain": true }),
-            )
-            .await;
-        assert_eq!(res.status, 200, "{:?}", res.body);
-        res.body
+    replicated(&server, 9, 9_000, bson::doc! { "a": [1, 2], "b": [3, 4] });
+    let event: Value = serde_json::from_str(
+        &tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame = read_text_frame(&mut socket).await;
+                let event: Value = serde_json::from_str(&frame).unwrap();
+                if event["operationType"] == "unkeyedDocument" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the event arrives on the stream"),
+    )
+    .unwrap();
+    assert_eq!(event["index"], "ab", "{event}");
+    assert_eq!(event["documentKey"], json!({ "_id": 9 }), "{event}");
+    assert_eq!(event["reason"], "parallel_arrays", "{event}");
+    assert!(event["resumeToken"].is_string() && event["clusterTime"].is_string(), "{event}");
+
+    let count = |filter: Value| {
+        server.post(
+            "/v1/db/shop/coll/u/count",
+            Some(&token),
+            json!({ "filter": filter, "explain": true }),
+        )
     };
-    // Found through the index, by the recheck, and only by the queries it
-    // matches.
-    let hit = count(json!({ "tags": "a", "cats": "c9" })).await;
-    assert_eq!(hit["explain"]["strategy"], "index", "{hit}");
-    assert_eq!(hit["count"], 1, "{hit}");
-    assert_eq!(hit["explain"]["unkeyedCandidates"], 1, "read from the unkeyed run: {hit}");
-    let miss = count(json!({ "tags": "a", "cats": "c7" })).await;
-    assert_eq!(miss["count"], 0, "rechecked and rejected: {miss}");
-    assert_eq!(miss["explain"]["unkeyedCandidates"], 1, "read all the same: {miss}");
-    let all = count(json!({ "tags": "a" })).await;
-    assert_eq!(all["count"], 6, "{all}");
-    let scan = count(json!({ "cats": "c9" })).await;
-    assert_eq!(scan["explain"]["strategy"], "collectionScan", "{scan}");
-    assert!(scan["explain"].get("unkeyedCandidates").is_none(), "no index, no run: {scan}");
-    assert_eq!(scan["count"], 1, "{scan}");
-
-    // Reported on the index, wherever it is listed.
-    let listed = server.get("/v1/db/shop/coll/tagged/indexes", Some(&token)).await;
-    let tc = listed.body["indexes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|i| i["name"] == "tc")
-        .expect("the index is listed");
-    assert_eq!(tc["unkeyed"], 1, "{listed:?}", listed = listed.body);
-    let described = server.get("/v1/db/shop/coll/tagged/describe", Some(&token)).await;
-    assert_eq!(described.status, 200, "{:?}", described.body);
+    let hit = count(json!({ "a": 1 })).await;
+    assert_eq!(hit.body["count"], 2, "found through the index, with the keyed one: {}", hit.body);
+    assert_eq!(hit.body["explain"]["unkeyedCandidates"], 1, "{}", hit.body);
+    let listed = server.get("/v1/db/shop/coll/u/indexes", Some(&token)).await;
+    assert_eq!(listed.body["indexes"][0]["unkeyed"], 1, "{}", listed.body);
+    let described = server.get("/v1/db/shop/coll/u/describe", Some(&token)).await;
     assert_eq!(described.body["indexes"][0]["unkeyed"], 1, "{}", described.body);
     let metrics = metrics_text(&server).await;
     assert!(metrics.contains("kimmy_index_unkeyed_total 1\n"), "{metrics}");
+    assert!(metrics.contains("kimmy_index_unkeyed_refusals_total 0\n"), "{metrics}");
 
-    // Reshaping the document files it under real keys and clears the run.
-    let fixed = server
-        .put(&format!("{docs}/9"), Some(&token), json!({ "tags": ["a", "b"], "cats": "c9" }))
-        .await;
+    // And it is listed, with why.
+    let list = server.get("/v1/db/shop/coll/u/indexes/ab/unkeyed", Some(&token)).await;
+    assert_eq!(list.status, 200, "{:?}", list.body);
+    assert_eq!(
+        list.body,
+        json!({
+            "index": "ab",
+            "unkeyed": [{ "_id": 9, "reason": "parallel_arrays" }],
+            "count": 1,
+        })
+    );
+
+    // Reshaping it with a replace clears the run; leaving it as it is cannot
+    // be written locally.
+    let still =
+        server.put("/v1/db/shop/coll/u/docs/9", Some(&token), json!({ "a": [1], "b": [2] })).await;
+    assert_eq!(still.status, 400, "{:?}", still.body);
+    let fixed =
+        server.put("/v1/db/shop/coll/u/docs/9", Some(&token), json!({ "a": 1, "b": 1 })).await;
     assert_eq!(fixed.status, 200, "{:?}", fixed.body);
-    let listed = server.get("/v1/db/shop/coll/tagged/indexes", Some(&token)).await;
-    assert_eq!(listed.body["indexes"][0]["unkeyed"], 0, "{}", listed.body);
-    let hit = count(json!({ "tags": "a", "cats": "c9" })).await;
-    assert_eq!(hit["count"], 1, "{hit}");
-    assert_eq!(hit["explain"]["unkeyedCandidates"], 0, "{hit}");
+    let list = server.get("/v1/db/shop/coll/u/indexes/ab/unkeyed", Some(&token)).await;
+    assert_eq!(list.body["unkeyed"], json!([]), "{}", list.body);
     let metrics = metrics_text(&server).await;
     assert!(metrics.contains("kimmy_index_unkeyed_total 1\n"), "a counter, not a level: {metrics}");
+}
+
+#[tokio::test]
+async fn the_unkeyed_list_pages_is_read_gated_and_404s_for_an_unknown_index() {
+    let server = Server::start().await;
+    let root = server.root().await;
+    indexed_collection(&server, &root).await;
+    for id in 10..15 {
+        replicated(&server, id, 9_000 + id as u64, bson::doc! { "a": [1, 2], "b": [3, 4] });
+    }
+
+    let path = "/v1/db/shop/coll/u/indexes/ab/unkeyed";
+    let mut seen = Vec::new();
+    let mut url = format!("{path}?limit=2");
+    loop {
+        let page = server.get(&url, Some(&root)).await;
+        assert_eq!(page.status, 200, "{:?}", page.body);
+        for row in page.body["unkeyed"].as_array().unwrap() {
+            assert_eq!(row["reason"], "parallel_arrays");
+            seen.push(row["_id"].as_i64().unwrap());
+        }
+        match page.body["nextCursor"].as_str() {
+            Some(cursor) => url = format!("{path}?limit=2&cursor={cursor}"),
+            None => break,
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, [10, 11, 12, 13, 14]);
+
+    assert_eq!(
+        server.get("/v1/db/shop/coll/u/indexes/nope/unkeyed", Some(&root)).await.status,
+        404
+    );
+    assert_eq!(
+        server.get("/v1/db/shop/coll/absent/indexes/ab/unkeyed", Some(&root)).await.status,
+        404
+    );
+    assert_eq!(server.get(&format!("{path}?bogus=1"), Some(&root)).await.status, 400);
+
+    // `read` opens it, `watch` and `ddl` do not, and no token is a 401.
+    for (user, actions, status) in [
+        ("reader", json!(["read"]), 200),
+        ("watcher", json!(["watch"]), 403),
+        ("shaper", json!(["ddl"]), 403),
+    ] {
+        server
+            .post(
+                "/v1/users",
+                Some(&root),
+                json!({
+                    "user": user, "password": format!("{user}-password"),
+                    "grants": [{ "db": "shop", "collection": "*", "actions": actions }]
+                }),
+            )
+            .await;
+        let token = server.login(user, &format!("{user}-password")).await;
+        assert_eq!(server.get(path, Some(&token)).await.status, status, "{user}");
+    }
+    assert_eq!(server.get(path, None).await.status, 401);
 }
 
 #[tokio::test]
@@ -13467,144 +13682,6 @@ async fn a_unique_index_still_refuses_a_document_it_cannot_key() {
         "{:?}",
         refused.body
     );
-}
-
-// ---------------------------------------------------------------------------
-// The member that accepts a write files it exactly as its peers do (ADR-139)
-// ---------------------------------------------------------------------------
-
-/// The three shapes an index over `a` and `b` cannot key, as a client sends
-/// them: arrays at both paths, more than 1,000 keys from one array, and a
-/// `Decimal128` at the second path. Each keeps `a` scalar or holding `1`, so
-/// `{a: 1}` reaches every one of them through the index, and each carries
-/// something on `b` that only a collection scan can ask for.
-fn unkeyable_shapes() -> Vec<(&'static str, Value, Value)> {
-    vec![
-        ("arrays at two paths", json!({ "a": [1, 2], "b": [3, 4] }), json!({ "b": 3 })),
-        (
-            "more than 1,000 keys",
-            json!({ "a": (0..1_000).collect::<Vec<i32>>(), "b": 5 }),
-            json!({ "b": 5 }),
-        ),
-    ]
-}
-
-/// How a document reaches the collection on the member that accepts it.
-#[derive(Clone, Copy, Debug)]
-enum Arrival {
-    Insert,
-    Replace,
-    Set,
-    BeforeTheIndex,
-}
-
-/// One shape, one arrival: the document lands under the index's unkeyed run,
-/// is reported everywhere the run is reported, is found through the index and
-/// by a scan alike, and leaves nothing behind once reshaped.
-async fn unkeyed_on_the_accepting_member(shape: &str, body: Value, scan_only: Value, via: Arrival) {
-    let why = format!("{shape} via {via:?}");
-    let server = Server::start().await;
-    let token = server.root().await;
-    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "u" })).await;
-    let docs = "/v1/db/shop/coll/u/docs";
-    let indexes = "/v1/db/shop/coll/u/indexes";
-    let index = json!({ "name": "ab", "fields": [{ "path": "a" }, { "path": "b" }] });
-    let mut with_id = body.clone();
-    with_id["_id"] = json!(7);
-
-    if !matches!(via, Arrival::BeforeTheIndex) {
-        let created = server.post(indexes, Some(&token), index.clone()).await;
-        assert_eq!(created.status, 200, "{why}: {:?}", created.body);
-    }
-    match via {
-        Arrival::Insert | Arrival::BeforeTheIndex => {
-            let res = server.post(docs, Some(&token), with_id).await;
-            assert_eq!(res.status, 200, "{why}: stored, not refused: {:?}", res.body);
-        }
-        Arrival::Replace => {
-            let seeded = server.post(docs, Some(&token), json!({ "_id": 7, "a": 1, "b": 1 })).await;
-            assert_eq!(seeded.status, 200, "{why}: {:?}", seeded.body);
-            let res = server.put(&format!("{docs}/7"), Some(&token), body).await;
-            assert_eq!(res.status, 200, "{why}: {:?}", res.body);
-        }
-        Arrival::Set => {
-            let seeded = server.post(docs, Some(&token), json!({ "_id": 7, "a": 1, "b": 1 })).await;
-            assert_eq!(seeded.status, 200, "{why}: {:?}", seeded.body);
-            let res = server
-                .post(
-                    "/v1/db/shop/coll/u/update",
-                    Some(&token),
-                    json!({ "filter": { "_id": 7 }, "update": { "$set": body } }),
-                )
-                .await;
-            assert_eq!(res.status, 200, "{why}: {:?}", res.body);
-            assert_eq!(res.body["matched"], 1, "{why}: {:?}", res.body);
-        }
-    }
-    if matches!(via, Arrival::BeforeTheIndex) {
-        let created = server.post(indexes, Some(&token), index).await;
-        assert_eq!(created.status, 200, "{why}: {:?}", created.body);
-        assert_eq!(created.body["unkeyed"], 1, "{why}: the backfill filed it: {:?}", created.body);
-    }
-
-    let (server_ref, token_ref) = (&server, &token);
-    let count = move |filter: Value| async move {
-        let res = server_ref
-            .post(
-                "/v1/db/shop/coll/u/count",
-                Some(token_ref),
-                json!({ "filter": filter, "explain": true }),
-            )
-            .await;
-        assert_eq!(res.status, 200, "{:?}", res.body);
-        res.body
-    };
-
-    // Reported: on the listing, on describe, on explain and on /metrics.
-    let listed = server.get(indexes, Some(&token)).await;
-    assert_eq!(listed.body["indexes"][0]["unkeyed"], 1, "{why}: listing: {}", listed.body);
-    let described = server.get("/v1/db/shop/coll/u/describe", Some(&token)).await;
-    assert_eq!(described.body["indexes"][0]["unkeyed"], 1, "{why}: describe: {}", described.body);
-    let hit = count(json!({ "a": 1 })).await;
-    assert_eq!(hit["explain"]["strategy"], "index", "{why}: {hit}");
-    assert_eq!(hit["count"], 1, "{why}: found through the index: {hit}");
-    assert_eq!(hit["explain"]["unkeyedCandidates"], 1, "{why}: read from the run: {hit}");
-    let scan = count(scan_only).await;
-    assert_eq!(scan["explain"]["strategy"], "collectionScan", "{why}: {scan}");
-    assert_eq!(scan["count"], 1, "{why}: found by a scan: {scan}");
-    let metrics = metrics_text(&server).await;
-    assert!(metrics.contains("kimmy_index_unkeyed_total 1\n"), "{why}: {metrics}");
-
-    // Reshaped to something the index can key, the run clears and the one
-    // entry the index now holds is the only one a full range reads: an
-    // orphan left under a key the old image never filed would read as two.
-    let fixed = server.put(&format!("{docs}/7"), Some(&token), json!({ "a": 1, "b": 1 })).await;
-    assert_eq!(fixed.status, 200, "{why}: {:?}", fixed.body);
-    let listed = server.get(indexes, Some(&token)).await;
-    assert_eq!(listed.body["indexes"][0]["unkeyed"], 0, "{why}: cleared: {}", listed.body);
-    let hit = count(json!({ "a": 1 })).await;
-    assert_eq!(hit["count"], 1, "{why}: {hit}");
-    assert_eq!(hit["explain"]["unkeyedCandidates"], 0, "{why}: {hit}");
-    assert_eq!(hit["explain"]["indexEntriesRead"], 1, "{why}: nothing leaked: {hit}");
-    let metrics = metrics_text(&server).await;
-    assert!(metrics.contains("kimmy_index_unkeyed_total 1\n"), "{why}: a counter: {metrics}");
-}
-
-#[tokio::test]
-async fn every_unkeyable_shape_is_filed_unkeyed_on_the_member_that_accepts_it() {
-    // The member that accepts a write used to file a Decimal128 document
-    // under a real key while both peers, applying the same bytes through
-    // replication, filed it unkeyed: the JSON edge did not read
-    // `$numberDecimal`, so the accepting member keyed a nested document
-    // where every re-decode of the stored bytes held a Decimal128. A
-    // `Decimal128` has a key now and is no longer one of the shapes; the rest,
-    // by every way a document can arrive, land in the one state ADR-139
-    // promises.
-    for (shape, body, scan_only) in unkeyable_shapes() {
-        for via in [Arrival::Insert, Arrival::Replace, Arrival::Set, Arrival::BeforeTheIndex] {
-            unkeyed_on_the_accepting_member(shape, body.clone(), scan_only.clone(), via).await;
-        }
-    }
 }
 
 #[tokio::test]
@@ -16373,16 +16450,10 @@ async fn an_index_carries_every_field_the_specification_requires() {
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
-    // A partial compound index, and documents with arrays at both of its paths,
-    // which it cannot key: one the filter selects, by a decimal's exact value,
-    // so `unkeyed` is not merely present, and one it does not, which the index
-    // does not hold at all.
-    let docs = "/v1/db/shop/coll/orders/docs";
-    for (id, k) in [("a", "9"), ("b", "1")] {
-        let doc =
-            json!({ "_id": id, "note": ["x", "y"], "tag": [1, 2], "k": { "$numberDecimal": k } });
-        assert_eq!(server.post(docs, Some(&token), doc).await.status, 200);
-    }
+    // A partial compound index, then documents with arrays at both of its
+    // paths arriving as another member's writes do, which it cannot key: one the
+    // filter selects, by a decimal's exact value, so `unkeyed` is not merely
+    // present, and one it does not, which the index does not hold at all.
     let created = server
         .post(
             "/v1/db/shop/coll/orders/indexes",
@@ -16393,6 +16464,16 @@ async fn an_index_carries_every_field_the_specification_requires() {
             }),
         )
         .await;
+    for (n, (id, k)) in [("a", "9"), ("b", "1")].into_iter().enumerate() {
+        let dec = bson::Bson::Decimal128(k.parse().unwrap());
+        replicated_into(
+            &server,
+            "orders",
+            kimmy_core::DocId::String(id.into()),
+            9_000 + n as u64,
+            bson::doc! { "note": ["x", "y"], "tag": [1, 2], "k": dec },
+        );
+    }
     let listed = server.get("/v1/db/shop/coll/orders/indexes", Some(&token)).await;
     let listing = listed.body["indexes"][0].clone();
 

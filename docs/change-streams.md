@@ -38,7 +38,7 @@ Each event is one JSON text frame:
 | `full_document=true` | Include the post-image on every event |
 
 `operationType` is `insert`, `update`, `replace`, `delete`, `uniqueViolation`,
-or `invalidate`. Requires the `watch` action on the collection — which is
+`unkeyedDocument`, or `invalidate`. Requires the `watch` action on the collection — which is
 **not** implied by `read`. See [Security](security.md).
 
 **An event is a change.** An update, replace or `find_and_modify` that leaves
@@ -66,6 +66,37 @@ document is *the* problem — but names the index and every colliding id:
 Both documents still exist. Uniqueness cannot be enforced across nodes without
 coordination, so this converts a silent constraint break into something an
 application can reconcile. See [ADR-020](decisions.md).
+
+An `unkeyedDocument` event reports that **this member** filed a document under an
+index's unkeyed run, because the index could not key it: arrays at two of a
+compound index's paths, or more than 1,000 keys. A write a client sends to a
+member is refused instead (`400`), so the event is for what a member accepts
+without being asked: a replicated write, a replicated index definition built
+over a document it cannot key, and a snapshot or catch-up. It names the index,
+the document and why:
+
+```json
+{
+  "operationType": "unkeyedDocument",
+  "index": "tags_1_sizes_1",
+  "documentKey": { "_id": 1 },
+  "reason": "parallel_arrays",
+  "resumeToken": "…",
+  "clusterTime": "…"
+}
+```
+
+`reason` is `parallel_arrays` or `too_many_keys`. The event is **per member and
+not replicated**, like `uniqueViolation`: each member that files the document
+reports it under its own stamp, so a watcher on any member sees one event per
+index per document on that member. It is sent on the **move into the unkeyed
+run**: when a write leaves a document unkeyed under an index it was not unkeyed
+under (new to the index, keyed before, or not there), and when a backfill finds
+it. A write that leaves it unkeyed, a re-save or an update to another field, is
+not announced again, and neither is a re-delivery of an entry already applied. The
+document is stored and every query still finds it. `GET
+…/indexes/{name}/unkeyed` lists what stands. See [ADR-139](decisions.md) and
+[ADR-258](decisions.md).
 
 ---
 

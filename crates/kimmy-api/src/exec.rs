@@ -2004,6 +2004,44 @@ pub fn violations(
     Ok(json!({ "index": name, "count": groups.len(), "groups": groups }))
 }
 
+/// One page of the documents an index files unkeyed, each with why (ADR-258).
+///
+/// Read from the unkeyed run the index keeps, so it costs the page and not the
+/// collection. An index this collection does not have is a `404`.
+pub fn unkeyed_documents(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    index: &str,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+) -> Result<Value, ApiError> {
+    let _span = op_span("unkeyed_documents", db, Some(coll)).entered();
+    let meta = authorize(state, auth, Action::Read, db, coll)?;
+    let Some(definition) = meta.index(index) else {
+        return Err(ApiError::not_found(format!("no index named {index:?} on {db}.{coll}")));
+    };
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let after = match cursor {
+        Some(raw) => Some(kimmy_core::Cursor::decode(raw)?),
+        None => None,
+    };
+    let page = kimmy_storage::blocking(|| {
+        state.engine.unkeyed_documents(&meta, definition, after.as_ref().map(|c| c.key()), limit)
+    })?;
+    let rows: Vec<Value> = page
+        .rows
+        .iter()
+        .map(|(id, reason)| json!({ "_id": crate::json::bson_to_json(id), "reason": reason }))
+        .collect();
+    let mut body = json!({ "index": index, "unkeyed": rows, "count": rows.len() });
+    if let Some(next) = page.next {
+        body["nextCursor"] = json!(kimmy_core::Cursor::from_key(next).encode());
+    }
+    Ok(body)
+}
+
 /// The `_id` the document `id` names is stored under, and the document.
 ///
 /// A violation names its documents by key, so the report reads each one's own
