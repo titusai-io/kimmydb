@@ -4487,6 +4487,51 @@ async fn a_validator_set_on_one_member_is_enforced_by_the_others_and_its_removal
     assert_eq!(now_ok, 200);
 }
 
+/// A collection created with a validator reaches the other members with it: the first
+/// time a member holds the collection at all, it holds the validator (the creation is one
+/// entry, applied in one transaction), and it refuses what the validator forbids.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_collection_created_with_a_validator_never_reaches_a_member_without_it() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let (a_token, b_token, c_token) =
+        (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+    create_collection_on(
+        &client,
+        &a,
+        &a_token,
+        serde_json::json!({ "name": "items", "validator": validator_schema() }),
+    )
+    .await;
+    for (node, token) in [(&b, &b_token), (&c, &c_token)] {
+        // Polled quickly until the member holds the collection; the first answer that is
+        // not "not here yet" is the one that must carry the validator.
+        let mut first = None;
+        for _ in 0..600 {
+            if let Some(held) = validator_on(&client, node, token, "items").await {
+                first = Some(held);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            first,
+            Some(validator_schema()),
+            "the member held the collection, and not the validator it was created with"
+        );
+    }
+    let bad =
+        insert_status(&client, &b, &b_token, "items", serde_json::json!({ "_id": 1, "qty": -1 }))
+            .await;
+    assert_eq!(bad, 422);
+    let good =
+        insert_status(&client, &c, &c_token, "items", serde_json::json!({ "_id": 2, "qty": 1 }))
+            .await;
+    assert_eq!(good, 200);
+}
+
 /// A member that accepted a write before the validator reached it keeps the document, it
 /// replicates to the members that refuse the same write from a client, and every member's
 /// report lists it.
