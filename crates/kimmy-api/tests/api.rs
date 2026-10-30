@@ -3941,8 +3941,9 @@ async fn a_refused_positional_projection_on_find_and_modify_writes_nothing() {
 
 /// `returnDocument: "after"` with a positional projection cuts the image
 /// from after the write at the index the filter matched. An update that
-/// changes the array's length is refused, and writes nothing, rather than
-/// naming another element or answering with the whole array.
+/// writes the array, a parent of it, or a descendant of it not reached
+/// through `$` is refused, and writes nothing, rather than naming another
+/// element or answering with the whole array.
 #[tokio::test]
 async fn a_positional_projection_after_the_write_keeps_the_matched_slot() {
     let server = Server::start().await;
@@ -3965,15 +3966,64 @@ async fn a_positional_projection_after_the_write_keeps_the_matched_slot() {
         (5, json!({"_id": 5, "items.sku": "b"}), json!({"$pull": {"items": {"sku": "a"}}})),
         (6, json!({"_id": 6, "items.sku": "b"}), json!({"$pull": {"items": {"sku": "b"}}})),
         (6, json!({"_id": 6, "items.sku": "b"}), json!({"$push": {"items": {"sku": "z"}}})),
+        // The same length, with another element at the matched index.
+        (
+            6,
+            json!({"_id": 6, "items.sku": "b"}),
+            json!({"$set": {"items": [{"sku": "b"}, {"sku": "a"}]}}),
+        ),
+        (
+            6,
+            json!({"_id": 6, "items.sku": "b"}),
+            json!({"$push": {"items": {"$each": [], "$sort": {"sku": -1}}}}),
+        ),
+        (6, json!({"_id": 6, "items.sku": "b"}), json!({"$set": {"items.0.sku": "z"}})),
+        (6, json!({"_id": 6, "items.sku": "b"}), json!({"$set": {"items.$[].sku": "z"}})),
+        (6, json!({"_id": 6, "items.sku": "b"}), json!({"$unset": {"items": ""}})),
     ] {
         let res = fam(json!({"filter": filter, "update": update, "returnDocument": "after",
                              "projection": {"items.$": 1}}))
         .await;
         assert_eq!(res.status, 400, "{update}: {:?}", res.body);
         let msg = res.body["message"].as_str().unwrap_or_default();
-        assert!(msg.contains("changed the length"), "{update}: {msg}");
+        assert!(msg.contains("cannot name an element"), "{update}: {msg}");
         assert_eq!(stored(id).await, if id == 5 { abc.clone() } else { ab.clone() });
     }
+    // An update to a field unrelated to the array keeps the matched element.
+    let res = fam(json!({"filter": {"_id": 6, "items.sku": "b"},
+                         "update": {"$set": {"note": "x"}}, "returnDocument": "after",
+                         "projection": {"items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"_id": 6, "items": [{"sku": "b"}]}));
+    // `$inc` through `$` returns the incremented matched element.
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": 9, "items": [{"sku": "a", "qty": 0}, {"sku": "b", "qty": 0}]}),
+        )
+        .await;
+    let res = fam(json!({"filter": {"_id": 9, "items.sku": "b"},
+                         "update": {"$inc": {"items.$.qty": 2}}, "returnDocument": "after",
+                         "projection": {"items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"_id": 9, "items": [{"sku": "b", "qty": 2}]}));
+    // A parent of a nested array is refused as the array is.
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": 8, "a": {"items": [{"sku": "a"}, {"sku": "b"}]}}),
+        )
+        .await;
+    let res = fam(json!({"filter": {"_id": 8, "a.items.sku": "b"},
+                         "update": {"$set": {"a": {"items": [{"sku": "b"}, {"sku": "a"}]}}},
+                         "returnDocument": "after", "projection": {"a.items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(stored(8).await, json!({"_id": 8, "a": {"items": [{"sku": "a"}, {"sku": "b"}]}}));
     // An in-place change keeps its slot, and the before image is always cut at
     // the matched element.
     let res = fam(json!({"filter": {"_id": 5, "items.sku": "b"},

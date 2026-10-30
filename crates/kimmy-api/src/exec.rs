@@ -1481,7 +1481,13 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
             other => other.to_string(),
         })?;
         let answered = match self.answer {
-            Some((_, ReturnDocument::After)) => &next,
+            Some((projection, ReturnDocument::After)) => {
+                projection.check_update(update).map_err(|e| match e {
+                    kimmy_core::Error::InvalidQuery(reason) => reason,
+                    other => other.to_string(),
+                })?;
+                &next
+            }
             _ => doc,
         };
         self.check_answer(doc, answered)?;
@@ -4582,3 +4588,77 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod positional_answer {
+    //! `Modify::apply` under a positional projection (ADR-256): the update is
+    //! refused before it is returned unless it is confined to the matched
+    //! element or to unrelated fields, and a refusal returns no document to
+    //! write.
+
+    use super::*;
+    use bson::doc;
+    use kimmy_storage::ModifySpec;
+
+    fn apply(
+        filter: Document,
+        update: Document,
+        after: ReturnDocument,
+        stored: &Document,
+    ) -> std::result::Result<Option<Document>, String> {
+        let filter = filter::parse(&filter).unwrap();
+        let update = update::parse(&update).unwrap();
+        let projection = shape::parse_find_projection(&doc! { "items.$": 1 }).unwrap().unwrap();
+        let modify = Modify {
+            filter: &filter,
+            sort: &[],
+            update: Some(&update),
+            upsert: None,
+            now: 0,
+            expected: None,
+            answer: Some((&projection, after)),
+        };
+        modify.apply(stored)
+    }
+
+    fn stored() -> Document {
+        doc! { "_id": 1, "n": 0, "items": [ { "sku": "a", "qty": 1 }, { "sku": "b", "qty": 2 } ] }
+    }
+
+    #[test]
+    fn an_update_that_writes_the_array_or_a_parent_is_refused_for_after() {
+        let f = doc! { "items.sku": "b" };
+        for update in [
+            doc! { "$set": { "items": [ { "sku": "b" }, { "sku": "a" } ] } },
+            doc! { "$push": { "items": { "$each": [], "$sort": { "sku": -1 } } } },
+            doc! { "$pull": { "items": { "sku": "a" } } },
+            doc! { "$push": { "items": { "sku": "c" } } },
+            doc! { "$set": { "items.0.sku": "z" } },
+            doc! { "$set": { "items.$[].qty": 0 } },
+        ] {
+            let err = apply(f.clone(), update.clone(), ReturnDocument::After, &stored())
+                .expect_err(&format!("{update}"));
+            assert!(err.contains("cannot name an element"), "{update}: {err}");
+            // The same update answers with the image from before.
+            assert!(
+                apply(f.clone(), update.clone(), ReturnDocument::Before, &stored()).is_ok(),
+                "{update}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_update_confined_to_the_matched_element_or_other_fields_is_applied() {
+        let f = doc! { "items.sku": "b" };
+        for update in [
+            doc! { "$inc": { "items.$.qty": 5 } },
+            doc! { "$set": { "n": 1 } },
+            doc! { "$inc": { "items.$.qty": 5 }, "$set": { "n": 1 } },
+        ] {
+            let next = apply(f.clone(), update.clone(), ReturnDocument::After, &stored())
+                .unwrap_or_else(|e| panic!("{update}: {e}"))
+                .expect("a document");
+            assert_ne!(next, stored(), "{update}");
+        }
+    }
+}

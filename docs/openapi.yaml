@@ -1911,7 +1911,9 @@ paths:
                     filter matched in the document as it was, at the same index
                     in the returned one. A refusal is `400` and writes nothing:
                     no matched element, `returnDocument: after` with an update
-                    that changes the array's length, and `upsert` with
+                    that writes the array, a parent of it, or a descendant of
+                    it not reached through `$` (only `<array>.$...` and
+                    unrelated fields are allowed), and `upsert` with
                     `returnDocument: after` (ADR-256).
                 if_stamp:
                   allOf: [{ $ref: "#/components/schemas/Stamp" }]
