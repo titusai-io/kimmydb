@@ -360,7 +360,7 @@ both from the start, then stopped for a while (ADR-139), and refuses them again
 now, on the member that takes the request. A local insert, bulk insert, replace,
 upsert, update, `find_and_modify` or `$merge`/`$out` write, and a local
 `createIndex` over documents already stored, answers `400 bad_request`:
-`cannot index parallel arrays [sizes] [tags]`, or a message naming the cap for a
+`invalid query: cannot index parallel arrays [sizes] [tags] (index …)`, or a message naming the cap for a
 document that would produce more than 1,000 keys. The `createIndex` message
 counts the documents, lists the first ten `_id`s and says how many more; nothing
 is created. (Since 0.51.0 a `Decimal128` has an exact key and is indexed like any
@@ -377,9 +377,9 @@ reads beside its ranges and rechecks like any other candidate: every query still
 finds it and none finds it wrongly. The member says so: an `unkeyedDocument`
 change-stream event when it files the document, `GET …/indexes/{name}/unkeyed`
 listing what stands, the `unkeyed` count on the index listing, and
-`kimmy_index_unkeyed_total`. A rewind (`kimmyd restore --until`) that puts a
+`kimmy_index_unkeyed_total`, which counts replicated writes, the backfill of a replicated, restored or repaired definition and a rewind's filings alike. A rewind (`kimmyd restore --until`) that puts a
 document back in a form an index cannot key files it unkeyed and says so the same
-way, in its own transaction; it still refuses for a unique index. A client that is refused on one member and
+way, in its own transaction; it still refuses for a unique index. A rewind that trims the report of a document it leaves unkeyed announces that document again, so a standing filing always has a retained report. A client that is refused on one member and
 accepted on another is the same difference as a unique index's.
 
 **What else differs.** A `$merge` or `$out` output is checked against the target's

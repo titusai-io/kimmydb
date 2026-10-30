@@ -210,10 +210,12 @@ write would store, inside the transaction that stores it, so nothing is
 written:
 
 ```
-cannot index parallel arrays [sizes] [tags] (index "tags_1_sizes_1", _id 1)
+invalid query: cannot index parallel arrays [sizes] [tags] (index "tags_1_sizes_1", _id 1)
 ```
 
-or, for the second shape, `document would produce more than 1000 index keys,
+(the `invalid query: ` prefix is the status line's own; the rest is the reference wording)
+
+or, for the second shape, `invalid query: document would produce more than 1000 index keys,
 the most one document may have in an index (index "tags_1", _id 1)`. Creating an
 index over documents already stored that it cannot key is a `400` as well: it
 counts them, lists the first ten `_id`s and says how many more, and creates
@@ -251,15 +253,15 @@ ADR-139 made it.
 
 **Where it shows.** Each unkeyed filing is logged at warning naming the
 database, collection, index and document id, and counted in
-`kimmy_index_unkeyed_total`. It is announced on the collection's change stream
+`kimmy_index_unkeyed_total`, which counts every filing a member makes without being asked: a replicated write, the backfill of a replicated, restored or repaired definition, and a rewind that puts a document back. It is announced on the collection's change stream
 as an [`unkeyedDocument` event](change-streams.md) on each member that files it,
 and `GET /v1/db/{db}/coll/{coll}/indexes/{name}/unkeyed` lists the documents an
-index holds unkeyed, with `reason` `parallel_arrays` or `too_many_keys`, paged
+index holds unkeyed, with `reason` `parallel_arrays` or `too_many_keys` (the OpenAPI enum also lists `unencodable`, a reason kept for a key the encoder refuses; no current build files a document under it), paged
 like the violations reports (`limit`, `cursor`; `404` for an index the
 collection does not have). The event is sent on the move **into** the unkeyed run
 — a replicated write that arrives unkeyed, a replicated definition's backfill, an
 update that makes a keyed document unkeyed, a rewind that puts such a document
-back — and not again while the document stays there. The index listing, `describe` and `createIndex`
+back, and a rewind that leaves a standing filing in place after trimming its report — and not again while the document stays there. The index listing, `describe` and `createIndex`
 report `unkeyed` — how many documents the index holds that it could not
 key — and `explain` reports `unkeyedCandidates` beside `indexEntriesRead`,
 the entries a query read from the run. **That figure means this reason and no

@@ -820,7 +820,7 @@ it, create the index partial:
 
 **A write an index cannot key is refused `400 bad_request`** on the member that
 takes it: arrays at two of a compound index's paths, or more than 1,000 keys
-for one document. The message is `cannot index parallel arrays [sizes] [tags]
+for one document. The message is `invalid query: cannot index parallel arrays [sizes] [tags]
 (index "tags_1_sizes_1", _id 1)` for the first, and says `document would
 produce more than 1000 index keys` for the second. It covers every write that
 stores a document: insert, bulk insert, replace, upsert, update, `find_and_modify`

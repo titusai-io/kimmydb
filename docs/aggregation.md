@@ -268,8 +268,8 @@ and writes nothing. `commits` is the write transactions that committed something
   the first chunk is written, so a refused output writes nothing and creates nothing.
   (A string or binary `_id` over the size cap is refused in the same place.)
 - **The output is checked against the target's indexes before anything is written.**
-  A document that an index of the target cannot key (parallel arrays in a compound or
-  multikey index, or more than 1,000 index keys) is `400` with the message a client
+  A document that an index of the target cannot key (parallel arrays in a compound
+  index, or more than 1,000 index keys) is `400` with the message a client
   write of it gets, naming the index, the `_id` and the document's place in the output,
   and the request writes nothing; a target that does not exist yet has no index, so a
   refusal never leaves one created. It covers what is stored as it stands: every

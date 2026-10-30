@@ -2604,6 +2604,10 @@ paths:
                         _id: {}
                         reason:
                           type: string
+                          description: |
+                            Why the index cannot key the document. `unencodable`
+                            is kept for a key the encoder refuses; no current
+                            build files a document under it.
                           enum: [parallel_arrays, too_many_keys, unencodable]
                   count: { type: integer }
                   nextCursor:
@@ -4548,6 +4552,10 @@ components:
                 _id: {}
             reason:
               type: string
+              description: |
+                Why the index cannot key the document. `unencodable` is kept
+                for a key the encoder refuses; no current build files a
+                document under it.
               enum: [parallel_arrays, too_many_keys, unencodable]
         - type: object
           title: invalidate
