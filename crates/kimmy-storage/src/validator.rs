@@ -31,7 +31,7 @@ use kimmy_core::{
     CollectionId, DocId, Error as CoreError, Stamp, ValidationAction, ValidationLevel,
     ValidatorSpec, vector_meta,
 };
-use kimmy_query::json_schema::Schema;
+use kimmy_core::json_schema::Schema;
 use parking_lot::{Mutex, RwLock};
 use tracing::{error, info, warn};
 

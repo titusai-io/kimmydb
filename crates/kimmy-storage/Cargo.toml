@@ -29,9 +29,6 @@ lab-hooks = []
 
 [dependencies]
 kimmy-core.workspace = true
-# The collection validator's `$jsonSchema` (ADR-257): parsed and evaluated by the query
-# crate, which depends on nothing above kimmy-core.
-kimmy-query.workspace = true
 redb.workspace = true
 bson.workspace = true
 serde.workspace = true
@@ -51,6 +48,9 @@ xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 
 [dev-dependencies]
 criterion.workspace = true
+# Dev-only: lets the index tests check that an index-backed result is
+# identical to a full scan. No production dependency in this direction.
+kimmy-query.workspace = true
 # Dev-only: the write-cost tests build decimals against the key encoder's
 # table by continued fractions (`decimal_cost_tests`).
 num-bigint.workspace = true

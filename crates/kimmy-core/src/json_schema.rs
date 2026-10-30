@@ -22,11 +22,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bson::{Bson, Document};
-use kimmy_core::cmp::canonical_cmp;
-use kimmy_core::decimal::{self, Decimal};
-use kimmy_core::{Error, Result};
 
-use crate::filter::{RegexBudget, RegexPattern, TYPE_NAMES, type_name_of};
+use crate::cmp::canonical_cmp;
+use crate::decimal::{self, Decimal};
+use crate::regex::{RegexBudget, RegexPattern};
+use crate::type_names::{TYPE_NAMES, type_name_of};
+use crate::{Error, Result};
 
 /// The deepest a schema may nest, the outermost schema being level 1: each
 /// of `properties`, `patternProperties`, `items`, `additionalProperties`,
@@ -60,7 +61,7 @@ impl Schema {
     /// meets, naming the keyword and where in the schema it stands. Every
     /// `pattern` is compiled as a `$regex` is and charged to the same budget:
     /// inside a filter, the filter's; otherwise one of its own, so a schema
-    /// holds at most [`crate::filter::REGEX_CONDITIONS_LIMIT`] patterns.
+    /// holds at most [`crate::regex::REGEX_CONDITIONS_LIMIT`] patterns.
     pub fn parse(schema: &Bson) -> Result<Schema> {
         let _budget = RegexBudget::open();
         let Bson::Document(source) = schema else {

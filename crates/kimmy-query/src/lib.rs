@@ -9,7 +9,9 @@
 pub mod aggregate;
 pub mod expr;
 pub mod filter;
-pub mod json_schema;
+/// The `$jsonSchema` engine. Lives in `kimmy-core` so that `kimmy-storage` can parse a
+/// validator without depending on this crate (ADR-181, ADR-257); re-exported here.
+pub use kimmy_core::json_schema;
 
 /// Dot-path resolution. Lives in `kimmy-core` because index maintenance in
 /// `kimmy-storage` needs it too; re-exported here for convenience.
@@ -27,7 +29,7 @@ mod facet_tests;
 #[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
-mod json_schema_tests;
+mod json_schema_filter_tests;
 #[cfg(test)]
 mod math_tests;
 #[cfg(test)]
