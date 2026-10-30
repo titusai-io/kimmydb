@@ -19129,7 +19129,10 @@ async fn an_output_over_the_key_cap_is_refused_before_the_first_chunk() {
     assert_eq!(res.status, 400, "{:?}", res.body);
     assert_ne!(res.body["error"], "partially_applied");
     let message = res.body["message"].as_str().unwrap_or_default();
-    assert!(message.contains("more than 1000 index keys"), "{message}");
+    assert!(
+        message.contains("index keys, the most one document may have in an index"),
+        "{message}"
+    );
     assert!(sink_dump(&server, &token, "shop", "t").await.is_empty());
 }
 
