@@ -490,3 +490,41 @@ fn a_rewind_that_makes_an_unkeyed_document_keyed_announces_nothing_and_drops_the
     assert_eq!(unkeyed_of(&e, &c), 0);
     assert!(events(&e).is_empty(), "the report of the undone write left with it");
 }
+
+#[test]
+fn write_documents_refuses_an_unkeyable_output_before_its_first_chunk() {
+    let (e, _d) = open();
+    e.create_collection("shop", "t").unwrap();
+    e.create_index("shop", "t", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "t").unwrap();
+    e.set_multi_chunk_docs(2);
+    let output = || {
+        vec![
+            doc! { "_id": 1i64, "a": 1, "b": 1 },
+            doc! { "_id": 2i64, "a": 2, "b": 2 },
+            with_id(3, bad()),
+        ]
+    };
+    for mode in [
+        SinkMode::Insert,
+        SinkMode::Merge { when_matched: WhenMatched::Replace, insert_unmatched: true },
+        SinkMode::Merge { when_matched: WhenMatched::Merge, insert_unmatched: true },
+    ] {
+        let message = refusal(e.write_documents(&c, output(), mode).unwrap_err());
+        assert!(message.contains("cannot index parallel arrays"), "{message}");
+        assert!(message.contains("_id 3") && message.ends_with("output document 2"), "{message}");
+        assert_eq!(
+            e.count(&c, crate::WalkScope::Request).unwrap(),
+            0,
+            "the first chunk was not written"
+        );
+    }
+    // An output document with no `_id` is named by its place.
+    let message = refusal(e.write_documents(&c, vec![bad()], SinkMode::Insert).unwrap_err());
+    assert!(message.ends_with("output document 0"), "{message}");
+
+    // A document the stage would not write is not asked about.
+    e.insert(&c, doc! { "_id": 3i64, "a": 3, "b": 3 }).unwrap();
+    let keep = SinkMode::Merge { when_matched: WhenMatched::KeepExisting, insert_unmatched: true };
+    assert_eq!(e.write_documents(&c, output(), keep).unwrap().counts.kept, 1);
+}
