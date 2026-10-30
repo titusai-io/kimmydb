@@ -19008,8 +19008,81 @@ async fn the_report_lists_the_documents_that_fail_the_validator_a_page_at_a_time
     assert_eq!(bad.status, 400, "{:?}", bad.body);
     let unknown = server.get(&format!("{report}?page=2"), Some(&token)).await;
     assert_eq!(unknown.status, 400, "{:?}", unknown.body);
+    // A page of no violations reports none: refused, naming the parameter, not read as 1.
+    let zero = server.get(&format!("{report}?limit=0"), Some(&token)).await;
+    assert_eq!(zero.status, 400, "{:?}", zero.body);
+    assert!(zero.body["message"].as_str().unwrap().contains("limit"), "{:?}", zero.body);
     assert_eq!(
         server.get("/v1/db/shop/coll/nope/validator/violations", Some(&token)).await.status,
         404
     );
+}
+
+#[tokio::test]
+async fn a_binary_in_an_enum_is_the_binary_the_validator_enforces() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let bin = json!({ "$binary": { "base64": "AQID", "subType": "00" } });
+    let made = server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "keys", "validator": { "$jsonSchema": {
+                "required": ["k"], "properties": { "k": { "enum": [bin.clone()] } } } } }),
+        )
+        .await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+    // What the store holds is what was sent: the binary, not an array of its bytes.
+    let described = server.get("/v1/db/shop/coll/keys/describe", Some(&token)).await;
+    assert_eq!(
+        described.body["validator"]["$jsonSchema"]["properties"]["k"]["enum"][0], bin,
+        "{:?}",
+        described.body
+    );
+    let listed = server
+        .post("/v1/db/shop/coll/keys/docs", Some(&token), json!({ "_id": 1, "k": bin }))
+        .await;
+    assert_eq!(listed.status, 200, "the binary the enum lists was refused: {:?}", listed.body);
+    let bytes = server
+        .post("/v1/db/shop/coll/keys/docs", Some(&token), json!({ "_id": 2, "k": [1, 2, 3] }))
+        .await;
+    assert_eq!(bytes.status, 422, "an array of its bytes was accepted: {:?}", bytes.body);
+}
+
+#[tokio::test]
+async fn a_bound_of_negative_infinity_keeps_the_rest_of_the_validator_in_force() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "n" })).await;
+    let set = server
+        .put(
+            "/v1/db/shop/coll/n/validator",
+            Some(&token),
+            json!({ "validator": { "$jsonSchema": { "required": ["v"], "properties": { "v": {
+                "bsonType": "int", "minimum": { "$numberDouble": "-Infinity" } } } } } }),
+        )
+        .await;
+    assert_eq!(set.status, 200, "{:?}", set.body);
+    let described = server.get("/v1/db/shop/coll/n/describe", Some(&token)).await;
+    assert_eq!(
+        described.body["validator"]["$jsonSchema"]["properties"]["v"]["minimum"],
+        json!({ "$numberDouble": "-Infinity" }),
+        "{:?}",
+        described.body
+    );
+    let wrong_type = server
+        .post("/v1/db/shop/coll/n/docs", Some(&token), json!({ "_id": 1, "v": "text" }))
+        .await;
+    assert_eq!(wrong_type.status, 422, "{:?}", wrong_type.body);
+    let missing = server.post("/v1/db/shop/coll/n/docs", Some(&token), json!({ "_id": 2 })).await;
+    assert_eq!(missing.status, 422, "{:?}", missing.body);
+    let fine =
+        server.post("/v1/db/shop/coll/n/docs", Some(&token), json!({ "_id": 3, "v": -5 })).await;
+    assert_eq!(fine.status, 200, "{:?}", fine.body);
+    let metrics = metrics_text(&server).await;
+    let unparseable = metrics
+        .lines()
+        .find(|l| l.starts_with("kimmy_validator_unparseable_total "))
+        .unwrap_or_default();
+    assert!(unparseable.ends_with(" 0"), "the stored schema parses: {unparseable}");
 }

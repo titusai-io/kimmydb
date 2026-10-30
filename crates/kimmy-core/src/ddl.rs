@@ -37,6 +37,21 @@ impl CollectionRef {
     }
 }
 
+/// A collection being created: the body of a `CreateCollection` entry.
+///
+/// It is a [`CollectionRef`] and, when the collection is created with a validator,
+/// that validator, so that the collection and the validator it was created with
+/// reach a member in one entry and are applied in one transaction (ADR-257). With no
+/// validator the field is absent and the bytes are a `CollectionRef`'s, which an
+/// entry written before it, or by a build that does not know it, is read as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionCreate {
+    pub db: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator: Option<ValidatorSpec>,
+}
+
 /// The reserved collection name a database's drop is filed under (ADR-229).
 ///
 /// A database drop is recorded as the tombstone of a collection with this name

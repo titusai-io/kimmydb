@@ -178,9 +178,9 @@ pub fn create_collection(
 /// [`create_collection`] with a validator set at creation (ADR-257).
 ///
 /// The validator is parsed before the collection exists, so a bad schema creates
-/// nothing. It is then set by the same change a later `PUT` makes, stamped and
-/// replicated as its own entry after the creation's: a member that has the
-/// collection and not yet the validator accepts what the validator would refuse.
+/// nothing. It is written with the collection in one transaction and replicated in
+/// the one `CreateCollection` entry, so the collection never stands, here or on a
+/// member that applies the entry, without the validator it was created with.
 pub fn create_collection_validated(
     state: &SharedState,
     auth: &Auth,
@@ -197,10 +197,10 @@ pub fn create_collection_validated(
     // drop takes as long as the data under it, and any of them can wait for
     // the single writer for the whole of the request's budget. A handler that
     // holds a worker stalls every task queued on it (ADR-153).
-    let meta = kimmy_storage::blocking(|| state.engine.create_collection(db, name))?;
-    if validator.is_some() {
-        kimmy_storage::blocking(|| state.engine.set_validator(db, name, validator))?;
-    }
+    let meta = kimmy_storage::blocking(|| match validator {
+        Some(spec) => state.engine.create_collection_with_validator(db, name, spec),
+        None => state.engine.create_collection(db, name),
+    })?;
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
 }
 

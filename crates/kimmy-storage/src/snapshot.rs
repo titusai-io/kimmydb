@@ -2597,6 +2597,7 @@ impl Engine {
                 &history,
                 redated_from,
                 adopted,
+                None,
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {

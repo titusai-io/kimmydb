@@ -276,6 +276,7 @@ impl crate::Engine {
                     None,
                     &|_| false,
                     || self.next_stamp(),
+                    None,
                 )),
                 Configured::FromEntry(stamp) => Some(self.create_collection_in_txn(
                     &txn,
@@ -285,6 +286,7 @@ impl crate::Engine {
                     Some(stamp.hlc),
                     &|dropped| crate::sync::creation_is_history(stamp.hlc, dropped.hlc),
                     || stamp,
+                    None,
                 )),
                 // A sweep only turns a configuration off, and never configures.
                 Configured::FromSnapshot(_) | Configured::Swept(_) => None,
