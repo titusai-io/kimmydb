@@ -131,6 +131,19 @@ pub struct ViolationsQuery {
     cursor: Option<String>,
 }
 
+/// The page size asked for: `0` is refused rather than read as `1`, because a page of
+/// no violations cannot report any, and the specification declares `minimum: 1`; above
+/// the maximum is clamped, as documented.
+fn violations_limit(requested: Option<usize>) -> Result<usize, ApiError> {
+    match requested {
+        None => Ok(DEFAULT_LIMIT),
+        Some(0) => Err(ApiError::bad_request(
+            "query parameter `limit` must be at least 1: a page of no violations reports none",
+        )),
+        Some(n) => Ok(n.min(MAX_LIMIT)),
+    }
+}
+
 /// `GET .../validator/violations`: the documents that fail the collection's
 /// current validator, found by scanning it, one bounded page at a time.
 pub async fn validator_violations(
@@ -141,7 +154,7 @@ pub async fn validator_violations(
 ) -> Result<Json<Value>, ApiError> {
     let _span = exec::op_span("validator_violations", &db, Some(&coll)).entered();
     let meta = exec::authorize(&state, &auth, Action::Read, &db, &coll)?;
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let limit = violations_limit(q.limit)?;
     let after = match &q.cursor {
         Some(raw) => Some(kimmy_core::Cursor::decode(raw)?),
         None => None,
@@ -164,4 +177,20 @@ pub async fn validator_violations(
         body["nextCursor"] = json!(kimmy_core::Cursor::from_key(next).encode());
     }
     Ok(Json(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_limit_is_refused_and_a_large_one_is_clamped() {
+        assert_eq!(violations_limit(None).unwrap(), DEFAULT_LIMIT);
+        assert_eq!(violations_limit(Some(1)).unwrap(), 1);
+        assert_eq!(violations_limit(Some(MAX_LIMIT + 1)).unwrap(), MAX_LIMIT);
+        let err = violations_limit(Some(0)).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("`limit`"), "names the parameter: {}", err.message);
+        assert!(err.message.contains("at least 1"), "states the minimum: {}", err.message);
+    }
 }

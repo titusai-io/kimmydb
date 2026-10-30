@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use crate::filter::{self, ArrayPosition, Filter};
 use crate::path;
+use crate::update::Update;
 
 /// The `_id` field, which projection treats specially.
 pub(crate) const ID_FIELD: &str = "_id";
@@ -264,16 +265,52 @@ impl FindProjection {
         self.project_at(at.as_ref(), doc, array)
     }
 
+    /// The array path of a positional projection, `None` for an ordinary one.
+    pub fn positional_array(&self) -> Option<&str> {
+        self.positional.as_deref()
+    }
+
+    /// Whether `update` may run under this projection when the request
+    /// returns the image from after the write (ADR-256).
+    ///
+    /// The element is the one the filter matched in the document as it was,
+    /// at the same index in the document returned, so the index must still
+    /// name that element. Only an update confined to the matched element
+    /// through `$` (`items.$.qty`), or to fields unrelated to the array, keeps
+    /// that true. An update that writes the array, an ancestor of it, or a
+    /// descendant of it not reached through `$` (`items.0.qty`,
+    /// `items.$[].qty`) is refused.
+    pub fn check_update(&self, update: &Update) -> Result<()> {
+        let Some(array) = &self.positional else {
+            return Ok(());
+        };
+        if matches!(update, Update::Replace(_)) {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ cannot name an element of the document \
+                 after a replacement, which replaces every element. Use returnDocument \
+                 \"before\""
+            )));
+        }
+        match update.first_write_outside_matched(array) {
+            None => Ok(()),
+            Some(written) => Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ cannot name an element of the document \
+                 after the update: the update writes {written:?}, which is {array:?}, a parent \
+                 of it, or inside it other than through `$`. Use returnDocument \"before\", or \
+                 an update confined to {array:?}.$ or to other fields"
+            ))),
+        }
+    }
+
     /// Shape `returned`, a `findAndModify` answer, when `matched` is the image
     /// the filter matched. The element is the one the filter matched in
     /// `matched`, at the same index in `returned`.
     ///
-    /// `returned` is `matched` for the image from before the write. The
-    /// image from after it is refused when the update left the array with a
-    /// different length, or no longer an array: the index no longer names
-    /// the slot the filter matched, and an index past the end must not
-    /// answer with the whole array. An update that changes the matched element
-    /// in place, as `items.$.qty` does, keeps its slot.
+    /// `returned` is `matched` for the image from before the write. For the
+    /// image from after it, [`FindProjection::check_update`] has refused the
+    /// updates that could move the index off the matched element; an index
+    /// past the end of the array is still refused here, never answered with the
+    /// whole array.
     ///
     /// Run inside the write transaction, where `Err` writes nothing.
     pub fn project_returned(
@@ -286,19 +323,6 @@ impl FindProjection {
             return Ok(project(Some(&self.projection), returned));
         };
         let (_, at) = filter::matches_at(filter, matched)?;
-        let len = |doc: &Document| match path::resolve(doc, array).first() {
-            Some(Bson::Array(items)) => Some(items.len()),
-            _ => None,
-        };
-        self.check_position(at.as_ref(), array)?;
-        if len(matched) != len(returned) {
-            return Err(Error::InvalidQuery(format!(
-                "the positional projection {array:?}.$ cannot name an element of the document \
-                 after the update: the update changed the length of {array:?}, or made it \
-                 not an array. Use returnDocument \"before\", or an update that leaves the \
-                 array's length alone"
-            )));
-        }
         self.project_at(at.as_ref(), returned, array)
     }
 

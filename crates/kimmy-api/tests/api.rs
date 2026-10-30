@@ -3940,10 +3940,41 @@ async fn a_refused_positional_projection_on_find_and_modify_writes_nothing() {
     assert_eq!(stored().await.status, 404);
 }
 
+/// The refusal is decided by the request, not by the data: the same request
+/// answers `400` whether or not a document matches, and a replacement document
+/// has a message of its own.
+#[tokio::test]
+async fn a_positional_projection_after_an_unfit_update_is_refused_even_when_nothing_matches() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 1, "items": [{"sku": "a"}]}))
+        .await;
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/c/find_and_modify", Some(token), body).await }
+    };
+    for filter in [json!({"_id": 1, "items.sku": "a"}), json!({"_id": 99, "items.sku": "a"})] {
+        let res = fam(json!({"filter": filter, "update": {"$set": {"items.0.sku": "z"}},
+                             "returnDocument": "after", "projection": {"items.$": 1}}))
+        .await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let res = fam(json!({"filter": filter, "update": {"x": 1},
+                             "returnDocument": "after", "projection": {"items.$": 1}}))
+        .await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("after a replacement"), "{msg}");
+        assert!(!msg.contains("which is"), "{msg}");
+    }
+}
+
 /// `returnDocument: "after"` with a positional projection cuts the image
 /// from after the write at the index the filter matched. An update that
-/// changes the array's length is refused, and writes nothing, rather than
-/// naming another element or answering with the whole array.
+/// writes the array, a parent of it, or a descendant of it not reached
+/// through `$` is refused, and writes nothing, rather than naming another
+/// element or answering with the whole array.
 #[tokio::test]
 async fn a_positional_projection_after_the_write_keeps_the_matched_slot() {
     let server = Server::start().await;
@@ -3966,15 +3997,64 @@ async fn a_positional_projection_after_the_write_keeps_the_matched_slot() {
         (5, json!({"_id": 5, "items.sku": "b"}), json!({"$pull": {"items": {"sku": "a"}}})),
         (6, json!({"_id": 6, "items.sku": "b"}), json!({"$pull": {"items": {"sku": "b"}}})),
         (6, json!({"_id": 6, "items.sku": "b"}), json!({"$push": {"items": {"sku": "z"}}})),
+        // The same length, with another element at the matched index.
+        (
+            6,
+            json!({"_id": 6, "items.sku": "b"}),
+            json!({"$set": {"items": [{"sku": "b"}, {"sku": "a"}]}}),
+        ),
+        (
+            6,
+            json!({"_id": 6, "items.sku": "b"}),
+            json!({"$push": {"items": {"$each": [], "$sort": {"sku": -1}}}}),
+        ),
+        (6, json!({"_id": 6, "items.sku": "b"}), json!({"$set": {"items.0.sku": "z"}})),
+        (6, json!({"_id": 6, "items.sku": "b"}), json!({"$set": {"items.$[].sku": "z"}})),
+        (6, json!({"_id": 6, "items.sku": "b"}), json!({"$unset": {"items": ""}})),
     ] {
         let res = fam(json!({"filter": filter, "update": update, "returnDocument": "after",
                              "projection": {"items.$": 1}}))
         .await;
         assert_eq!(res.status, 400, "{update}: {:?}", res.body);
         let msg = res.body["message"].as_str().unwrap_or_default();
-        assert!(msg.contains("changed the length"), "{update}: {msg}");
+        assert!(msg.contains("cannot name an element"), "{update}: {msg}");
         assert_eq!(stored(id).await, if id == 5 { abc.clone() } else { ab.clone() });
     }
+    // An update to a field unrelated to the array keeps the matched element.
+    let res = fam(json!({"filter": {"_id": 6, "items.sku": "b"},
+                         "update": {"$set": {"note": "x"}}, "returnDocument": "after",
+                         "projection": {"items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"_id": 6, "items": [{"sku": "b"}]}));
+    // `$inc` through `$` returns the incremented matched element.
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": 9, "items": [{"sku": "a", "qty": 0}, {"sku": "b", "qty": 0}]}),
+        )
+        .await;
+    let res = fam(json!({"filter": {"_id": 9, "items.sku": "b"},
+                         "update": {"$inc": {"items.$.qty": 2}}, "returnDocument": "after",
+                         "projection": {"items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"_id": 9, "items": [{"sku": "b", "qty": 2}]}));
+    // A parent of a nested array is refused as the array is.
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": 8, "a": {"items": [{"sku": "a"}, {"sku": "b"}]}}),
+        )
+        .await;
+    let res = fam(json!({"filter": {"_id": 8, "a.items.sku": "b"},
+                         "update": {"$set": {"a": {"items": [{"sku": "b"}, {"sku": "a"}]}}},
+                         "returnDocument": "after", "projection": {"a.items.$": 1}}))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(stored(8).await, json!({"_id": 8, "a": {"items": [{"sku": "a"}, {"sku": "b"}]}}));
     // An in-place change keeps its slot, and the before image is always cut at
     // the matched element.
     let res = fam(json!({"filter": {"_id": 5, "items.sku": "b"},
@@ -19039,6 +19119,10 @@ async fn the_report_lists_the_documents_that_fail_the_validator_a_page_at_a_time
     assert_eq!(bad.status, 400, "{:?}", bad.body);
     let unknown = server.get(&format!("{report}?page=2"), Some(&token)).await;
     assert_eq!(unknown.status, 400, "{:?}", unknown.body);
+    // A page of no violations reports none: refused, naming the parameter, not read as 1.
+    let zero = server.get(&format!("{report}?limit=0"), Some(&token)).await;
+    assert_eq!(zero.status, 400, "{:?}", zero.body);
+    assert!(zero.body["message"].as_str().unwrap().contains("limit"), "{:?}", zero.body);
     assert_eq!(
         server.get("/v1/db/shop/coll/nope/validator/violations", Some(&token)).await.status,
         404
@@ -19241,4 +19325,73 @@ async fn a_keyable_output_is_not_refused_by_the_index_check() {
     let res = sink_run(&server, &token, "src", json!([by_id(), {"$out": "t"}])).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(res.body["out"]["inserted"], 4, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_binary_in_an_enum_is_the_binary_the_validator_enforces() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let bin = json!({ "$binary": { "base64": "AQID", "subType": "00" } });
+    let made = server
+        .post(
+            "/v1/db/shop/collections",
+            Some(&token),
+            json!({ "name": "keys", "validator": { "$jsonSchema": {
+                "required": ["k"], "properties": { "k": { "enum": [bin.clone()] } } } } }),
+        )
+        .await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+    // What the store holds is what was sent: the binary, not an array of its bytes.
+    let described = server.get("/v1/db/shop/coll/keys/describe", Some(&token)).await;
+    assert_eq!(
+        described.body["validator"]["$jsonSchema"]["properties"]["k"]["enum"][0], bin,
+        "{:?}",
+        described.body
+    );
+    let listed = server
+        .post("/v1/db/shop/coll/keys/docs", Some(&token), json!({ "_id": 1, "k": bin }))
+        .await;
+    assert_eq!(listed.status, 200, "the binary the enum lists was refused: {:?}", listed.body);
+    let bytes = server
+        .post("/v1/db/shop/coll/keys/docs", Some(&token), json!({ "_id": 2, "k": [1, 2, 3] }))
+        .await;
+    assert_eq!(bytes.status, 422, "an array of its bytes was accepted: {:?}", bytes.body);
+}
+
+#[tokio::test]
+async fn a_bound_of_negative_infinity_keeps_the_rest_of_the_validator_in_force() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "n" })).await;
+    let set = server
+        .put(
+            "/v1/db/shop/coll/n/validator",
+            Some(&token),
+            json!({ "validator": { "$jsonSchema": { "required": ["v"], "properties": { "v": {
+                "bsonType": "int", "minimum": { "$numberDouble": "-Infinity" } } } } } }),
+        )
+        .await;
+    assert_eq!(set.status, 200, "{:?}", set.body);
+    let described = server.get("/v1/db/shop/coll/n/describe", Some(&token)).await;
+    assert_eq!(
+        described.body["validator"]["$jsonSchema"]["properties"]["v"]["minimum"],
+        json!({ "$numberDouble": "-Infinity" }),
+        "{:?}",
+        described.body
+    );
+    let wrong_type = server
+        .post("/v1/db/shop/coll/n/docs", Some(&token), json!({ "_id": 1, "v": "text" }))
+        .await;
+    assert_eq!(wrong_type.status, 422, "{:?}", wrong_type.body);
+    let missing = server.post("/v1/db/shop/coll/n/docs", Some(&token), json!({ "_id": 2 })).await;
+    assert_eq!(missing.status, 422, "{:?}", missing.body);
+    let fine =
+        server.post("/v1/db/shop/coll/n/docs", Some(&token), json!({ "_id": 3, "v": -5 })).await;
+    assert_eq!(fine.status, 200, "{:?}", fine.body);
+    let metrics = metrics_text(&server).await;
+    let unparseable = metrics
+        .lines()
+        .find(|l| l.starts_with("kimmy_validator_unparseable_total "))
+        .unwrap_or_default();
+    assert!(unparseable.ends_with(" 0"), "the stored schema parses: {unparseable}");
 }

@@ -662,21 +662,81 @@ fn the_image_after_an_in_place_change_is_cut_at_the_matched_index() {
 }
 
 #[test]
-fn the_image_after_a_change_of_length_is_refused_and_never_the_whole_array() {
+fn the_image_after_is_refused_for_an_update_that_writes_outside_the_matched_element() {
+    let p = projection(doc! { "items.$": 1 });
+    for (update, written) in [
+        (doc! { "$set": { "items": [ { "sku": "a" } ] } }, "items"),
+        (doc! { "$unset": { "items": "" } }, "items"),
+        (doc! { "$rename": { "items": "lines" } }, "items"),
+        (doc! { "$rename": { "other": "items" } }, "items"),
+        (doc! { "$push": { "items": { "sku": "nut" } } }, "items"),
+        (doc! { "$push": { "items": { "$each": [], "$sort": { "sku": -1 } } } }, "items"),
+        (doc! { "$pull": { "items": { "sku": "bolt" } } }, "items"),
+        (doc! { "$pop": { "items": 1 } }, "items"),
+        (doc! { "$addToSet": { "items": { "sku": "nut" } } }, "items"),
+        (doc! { "$set": { "items.0.qty": 9 } }, "items.0.qty"),
+        (doc! { "$set": { "items.$[].qty": 9 } }, "items.$[].qty"),
+        (doc! { "$set": { "items.$[f].qty": 9 } }, "items.$[f].qty"),
+        (doc! { "$set": { "items.$.qty": 1, "items.1.qty": 9 } }, "items.1.qty"),
+    ] {
+        let filters =
+            if written.contains("$[f]") { vec![doc! { "f.qty": { "$gte": 0 } }] } else { vec![] };
+        let parsed = update::parse_with_filters(&update, &filters).unwrap();
+        let err = p.check_update(&parsed).expect_err(&format!("{update}")).to_string();
+        assert!(err.contains(&format!("writes {written:?}")), "{update}: {err}");
+    }
+    // A replacement document writes everything.
+    let replace = update::parse(&doc! { "items": [] }).unwrap();
+    assert!(p.check_update(&replace).is_err());
+}
+
+#[test]
+fn the_image_after_is_allowed_for_an_update_confined_to_the_matched_element() {
+    let p = projection(doc! { "items.$": 1 });
+    for update in [
+        doc! { "$inc": { "items.$.qty": 1 } },
+        doc! { "$set": { "items.$": { "sku": "x" } } },
+        doc! { "$set": { "items.$.sku": "washer" }, "$unset": { "note": "" } },
+        doc! { "$set": { "itemsx": 1, "item": 2, "scores": [1] } },
+    ] {
+        let parsed = update::parse(&update).unwrap();
+        p.check_update(&parsed).unwrap_or_else(|e| panic!("{update}: {e}"));
+    }
+}
+
+#[test]
+fn the_image_after_is_refused_for_a_parent_of_a_nested_array() {
+    let p = projection(doc! { "a.items.$": 1 });
+    for (update, ok) in [
+        (doc! { "$set": { "a": { "items": [] } } }, false),
+        (doc! { "$unset": { "a": "" } }, false),
+        (doc! { "$set": { "a.items": [] } }, false),
+        (doc! { "$set": { "a.items.$.qty": 1 } }, true),
+        (doc! { "$set": { "a.other": 1 } }, true),
+        (doc! { "$set": { "b": 1 } }, true),
+    ] {
+        let parsed = update::parse(&update).unwrap();
+        assert_eq!(p.check_update(&parsed).is_ok(), ok, "{update}");
+    }
+}
+
+#[test]
+fn an_index_past_the_end_is_refused_and_never_the_whole_array() {
     let p = projection(doc! { "items.$": 1 });
     let f = filt(doc! { "items.sku": "gasket" });
     let before = order();
-    for (update, words) in [
-        (doc! { "$pull": { "items": { "$elemMatch": { "sku": "bolt" } } } }, "changed the length"),
-        (doc! { "$push": { "items": { "sku": "nut" } } }, "changed the length"),
-        (doc! { "$set": { "items": 5 } }, "changed the length"),
-        (doc! { "$unset": { "items": "" } }, "changed the length"),
+    for after in [
+        doc! { "_id": 7, "items": [ { "sku": "a" } ] },
+        doc! { "_id": 7, "items": 5 },
+        doc! { "_id": 7 },
     ] {
-        let after = updated(doc! { "_id": 7 }, update.clone(), vec![], &before);
-        let err = p
-            .project_returned(&f, &before, &after)
-            .expect_err(&format!("{update} -> {after}"))
-            .to_string();
-        assert!(err.contains(words), "{update}: {err}");
+        let err = p.project_returned(&f, &before, &after).expect_err(&format!("{after}"));
+        assert!(err.to_string().contains("found no element"), "{after}: {err}");
     }
+}
+
+#[test]
+fn a_whole_array_operand_equals_a_nested_array_element_as_a_whole() {
+    let d = doc! { "a": [ [1, 2], 3 ] };
+    assert_eq!(at(doc! { "a": [1, 2] }, &d), Some(("a".to_string(), 0)));
 }

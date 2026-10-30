@@ -15,6 +15,7 @@ pub mod error;
 pub mod hlc;
 pub mod ids;
 pub mod index_meta;
+pub mod json_schema;
 pub mod keyenc;
 pub mod limits;
 pub mod matching;
@@ -22,17 +23,22 @@ pub mod oplog;
 pub mod partial;
 pub mod path;
 pub mod record;
+pub mod regex;
+pub mod type_names;
 pub mod validator;
 pub mod vector_meta;
 pub mod vector_record;
 pub mod version;
 
+#[cfg(test)]
+mod json_schema_tests;
+
 pub use cmp::{canonical_cmp, holds_decimal128};
 pub use conflict::{UniqueViolationDetail, UnkeyedDocumentDetail};
 pub use cursor::Cursor;
 pub use ddl::{
-    CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, ValidatorSet, VectorSet,
-    database_drop_id,
+    CollectionCreate, CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, ValidatorSet,
+    VectorSet, database_drop_id,
 };
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};

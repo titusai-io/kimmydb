@@ -282,6 +282,44 @@ impl Update {
             Update::Operators(ops) => ops.iter().any(|op| has_matched_position(&op.path)),
         }
     }
+
+    /// The first path this update writes that is not confined to the matched
+    /// element of `array` and not unrelated to it (ADR-256), or `None`.
+    ///
+    /// A write is allowed when it lies under `array.$` (the element the
+    /// filter matched) or shares no prefix with `array`. It is not allowed
+    /// when its path is `array` itself or an ancestor of it, which can
+    /// replace or reorder the elements, or when it descends from `array`
+    /// without `$` as the next segment (`items.0.qty`, `items.$[].qty`,
+    /// `items.$[f].qty`), which can change which element the filter matched.
+    /// `$rename` counts both of its paths, and a replacement document counts
+    /// as writing everything.
+    pub fn first_write_outside_matched(&self, array: &str) -> Option<String> {
+        let ops = match self {
+            Update::Replace(_) => return Some("the replacement document".to_string()),
+            Update::Operators(ops) => ops,
+        };
+        let array = path::segments(array);
+        let confined = |written: &str| {
+            let written = path::segments(written);
+            let shared = written.iter().zip(&array).take_while(|(w, a)| w == a).count();
+            if shared < written.len() && shared < array.len() {
+                return true;
+            }
+            written.len() > array.len() && written[array.len()] == "$"
+        };
+        ops.iter().find_map(|op| {
+            let target = match &op.kind {
+                OpKind::Rename(to) => Some(to.as_str()),
+                _ => None,
+            };
+            [Some(op.path.as_str()), target]
+                .into_iter()
+                .flatten()
+                .find(|written| !confined(written))
+                .map(str::to_string)
+        })
+    }
 }
 
 /// Check a path's positional segments and return the identifiers they name,

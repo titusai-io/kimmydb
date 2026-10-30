@@ -14,7 +14,7 @@ fn refusal(s: Document) -> String {
     match Schema::parse(&Bson::Document(s)) {
         Ok(_) => panic!("should have been refused"),
         Err(e) => {
-            assert!(matches!(e, kimmy_core::Error::InvalidQuery(_)), "not a 400: {e:?}");
+            assert!(matches!(e, crate::Error::InvalidQuery(_)), "not a 400: {e:?}");
             e.to_string()
         }
     }
@@ -133,12 +133,32 @@ fn type_names_map_to_their_bson_types() {
 }
 
 #[test]
-fn type_and_bson_type_on_one_level_must_both_hold() {
-    check(
-        doc! {"properties": {"v": {"type": "number", "bsonType": "int"}}},
-        &[doc! {"v": 1}],
-        &[doc! {"v": 1.5}, doc! {"v": "a"}],
-    );
+fn type_and_bson_type_on_one_level_are_refused() {
+    let m = refusal(doc! {"properties": {"v": {"type": "number", "bsonType": "int"}}});
+    assert!(m.contains("type") && m.contains("bsonType"), "{m}");
+    assert!(m.contains("properties"), "the place is named: {m}");
+    // Either alone, and one on each of two levels, are fine.
+    schema(doc! {"type": "object"});
+    schema(doc! {"bsonType": "object"});
+    schema(doc! {"type": "object", "properties": {"v": {"bsonType": "int"}}});
+    schema(doc! {"bsonType": "object", "anyOf": [{"type": "object"}]});
+    assert!(refusal(doc! {"anyOf": [{"type": "object", "bsonType": "object"}]}).contains("anyOf"));
+}
+
+#[test]
+fn a_type_name_listed_twice_is_refused() {
+    for (keyword, names) in [
+        ("bsonType", vec!["int", "string", "int"]),
+        ("bsonType", vec!["number", "number"]),
+        ("type", vec!["string", "string"]),
+        ("type", vec!["number", "string", "number"]),
+    ] {
+        let m = refusal(doc! {keyword: names});
+        assert!(m.contains(keyword) && m.contains("twice"), "{m}");
+    }
+    // Different names that stand for overlapping types are not a repeat.
+    schema(doc! {"bsonType": ["number", "int"]});
+    schema(doc! {"bsonType": ["int", "long", "string"]});
 }
 
 #[test]
@@ -168,6 +188,65 @@ fn enum_compares_by_the_total_order() {
         &[doc! {"v": {"a": 1.0}}, doc! {"v": [1.0, 2]}],
         &[doc! {"v": {"a": 2}}, doc! {"v": [2, 1]}],
     );
+}
+
+#[test]
+fn enum_and_unique_items_compare_embedded_documents_in_any_field_order() {
+    // The reference compares documents with their fields unordered.
+    check(
+        doc! {"properties": {"v": {"enum": [{"x": 1, "y": 2}, [{"p": 1, "q": {"a": 1, "b": 2}}]]}}},
+        &[
+            doc! {"v": {"x": 1, "y": 2}},
+            doc! {"v": {"y": 2, "x": 1}},
+            doc! {"v": {"y": 2.0, "x": 1}},
+            doc! {"v": [{"q": {"b": 2, "a": 1}, "p": 1}]},
+        ],
+        &[
+            doc! {"v": {"x": 1}},
+            doc! {"v": {"x": 1, "y": 2, "z": 3}},
+            doc! {"v": {"x": 2, "y": 1}},
+            doc! {"v": {"x": 1, "z": 2}},
+            doc! {"v": [{"q": {"b": 2, "a": 1}, "p": 2}]},
+        ],
+    );
+    check(doc! {"enum": [{"x": 1, "y": 2}]}, &[doc! {"y": 2, "x": 1}], &[doc! {"y": 2}]);
+    // An array is still ordered.
+    check(
+        doc! {"properties": {"v": {"enum": [[{"a": 1}, {"b": 2}]]}}},
+        &[doc! {"v": [{"a": 1}, {"b": 2}]}],
+        &[doc! {"v": [{"b": 2}, {"a": 1}]}],
+    );
+    let s = doc! {"properties": {"v": {"uniqueItems": true}}};
+    check(
+        s,
+        &[
+            doc! {"v": [{"x": 1, "y": 2}, {"x": 1, "y": 3}]},
+            doc! {"v": [{"x": 1, "y": 2}, {"x": 1}]},
+            doc! {"v": [[{"a": 1}, {"b": 1}], [{"b": 1}, {"a": 1}]]},
+        ],
+        &[
+            doc! {"v": [{"x": 1, "y": 2}, {"y": 2, "x": 1}]},
+            doc! {"v": [{"x": 1, "y": 2}, {"y": 2.0, "x": 1}]},
+            doc! {"v": [1, {"p": {"a": 1, "b": 2}}, 2, {"p": {"b": 2, "a": 1}}]},
+            doc! {"v": [[{"a": 1, "b": 2}], [{"b": 2, "a": 1}]]},
+        ],
+    );
+}
+
+#[test]
+fn a_value_listed_twice_in_an_enum_is_refused() {
+    for list in [
+        vec![Bson::Int32(1), Bson::Int32(1)],
+        vec![Bson::Int32(1), Bson::Double(1.0)],
+        vec![Bson::Int32(1), dec("1.00")],
+        vec![Bson::String("a".into()), Bson::Int32(2), Bson::String("a".into())],
+        vec![Bson::Document(doc! {"x": 1, "y": 2}), Bson::Document(doc! {"y": 2, "x": 1})],
+        vec![Bson::Null, Bson::Null],
+    ] {
+        let m = refusal(doc! {"properties": {"v": {"enum": list.clone()}}});
+        assert!(m.contains("enum") && m.contains("twice"), "{list:?}: {m}");
+    }
+    schema(doc! {"enum": [1, "1", Bson::Null, [1], [1, 1], {"a": 1}, {"a": 2}, {"b": 1}]});
 }
 
 #[test]
@@ -277,23 +356,85 @@ fn multiple_of_is_exact_for_decimals() {
 }
 
 #[test]
-fn multiple_of_on_doubles_is_the_floating_point_remainder() {
-    let half = schema(doc! {"properties": {"v": {"multipleOf": 0.5}}});
-    assert!(half.is_valid(&doc! {"v": 2.5}));
-    assert!(half.is_valid(&doc! {"v": 3}));
-    assert!(!half.is_valid(&doc! {"v": 2.6}));
-    // Neither 0.3 nor 0.1 is stored exactly, so the double test says no.
-    let tenth = schema(doc! {"properties": {"v": {"multipleOf": 0.1}}});
-    assert!(!tenth.is_valid(&doc! {"v": 0.3}));
-    assert!(!tenth.is_valid(&doc! {"v": 0.5}));
-    let quarter = schema(doc! {"properties": {"v": {"multipleOf": 0.25}}});
-    assert!(quarter.is_valid(&doc! {"v": 0.75}));
-    let int_divisor = schema(doc! {"properties": {"v": {"multipleOf": 2}}});
-    assert!(int_divisor.is_valid(&doc! {"v": 4.0}));
-    assert!(!int_divisor.is_valid(&doc! {"v": 4.5}));
-    for odd in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        assert!(!half.is_valid(&doc! {"v": odd}), "{odd}");
+fn multiple_of_on_doubles_is_a_decimal_remainder_of_the_values_as_written() {
+    // A double is rounded to 15 significant digits and the remainder is exact, so
+    // the prices and the tenths read as they are written.
+    let multiple = |v: f64, d: f64| {
+        schema(doc! {"properties": {"v": {"multipleOf": d}}}).is_valid(&doc! {"v": v})
+    };
+    for (v, d) in [(0.3, 0.1), (19.99, 0.01), (4.35, 0.05), (1.1, 0.1), (0.75, 0.25), (2.5, 0.5)] {
+        assert!(multiple(v, d), "{v} against {d}");
     }
+    for (v, d) in [(0.35, 0.1), (7.0, 2.0), (2.6, 0.5), (0.5, 0.3), (19.995, 0.01)] {
+        assert!(!multiple(v, d), "{v} against {d}");
+    }
+    // Negative values and zero.
+    assert!(
+        multiple(-0.3, 0.1) && multiple(-19.99, 0.01) && multiple(0.0, 0.1) && multiple(-0.0, 0.1)
+    );
+    assert!(!multiple(-0.35, 0.1));
+    // A double against an integer divisor and the reverse.
+    let two = schema(doc! {"properties": {"v": {"multipleOf": 2}}});
+    assert!(two.is_valid(&doc! {"v": 4.0}) && two.is_valid(&doc! {"v": -6.0}));
+    assert!(!two.is_valid(&doc! {"v": 4.5}) && !two.is_valid(&doc! {"v": 7.0}));
+    let tenth = schema(doc! {"properties": {"v": {"multipleOf": 0.1}}});
+    assert!(tenth.is_valid(&doc! {"v": 3}) && tenth.is_valid(&doc! {"v": 3_i64}));
+    // A decimal against a double divisor is exact on its own side.
+    assert!(tenth.is_valid(&doc! {"v": dec("0.3")}));
+    assert!(!tenth.is_valid(&doc! {"v": dec("0.30000000000000000000000000000001")}));
+    // An Int64 past 2^53 is read exactly, not through a double.
+    let two_f = schema(doc! {"properties": {"v": {"multipleOf": 2.0}}});
+    assert!(!two_f.is_valid(&doc! {"v": 9_007_199_254_740_993_i64}));
+    assert!(two_f.is_valid(&doc! {"v": 9_007_199_254_740_992_i64}));
+    // A value that is not a number, or not finite, is a multiple of nothing.
+    for odd in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(!tenth.is_valid(&doc! {"v": odd}), "{odd}");
+        assert!(!two.is_valid(&doc! {"v": odd}), "{odd}");
+    }
+}
+
+#[test]
+fn every_price_to_the_cent_is_a_multiple_of_a_cent() {
+    let cent = schema(doc! {"properties": {"price": {"multipleOf": 0.01}}});
+    for cents in 1..=100_000_i64 {
+        // The nearest double to the price as written: what a client sends.
+        let price: f64 = format!("{}.{:02}", cents / 100, cents % 100).parse().unwrap();
+        assert!(cent.is_valid(&doc! {"price": price}), "{price}");
+    }
+    let tenth = schema(doc! {"properties": {"v": {"multipleOf": 0.1}}});
+    for tenths in 1..=1_000_i64 {
+        let v: f64 = format!("{}.{}", tenths / 10, tenths % 10).parse().unwrap();
+        assert!(tenth.is_valid(&doc! {"v": v}), "{v}");
+    }
+    // And a price between two cents is not.
+    for cents in (1..1_000_i64).step_by(7) {
+        let half: f64 = format!("{}.{:02}5", cents / 100, cents % 100).parse().unwrap();
+        assert!(!cent.is_valid(&doc! {"price": half}), "{half}");
+    }
+}
+
+#[test]
+fn multiple_of_on_huge_and_tiny_doubles_is_decided_without_allocating() {
+    let half = schema(doc! {"properties": {"v": {"multipleOf": 0.5}}});
+    let three = schema(doc! {"properties": {"v": {"multipleOf": 3.0}}});
+    // 1e300 reads as 1 followed by 300 zeros: a whole number, so a multiple of a half;
+    // not of three, which does not divide a power of ten.
+    assert!(half.is_valid(&doc! {"v": 1e300}));
+    assert!(!three.is_valid(&doc! {"v": 1e300}));
+    assert!(half.is_valid(&doc! {"v": f64::MAX}) && half.is_valid(&doc! {"v": -f64::MAX}));
+    // A divisor of 1e-300 against a value of 1: ten to the three hundredth times.
+    let tiny = schema(doc! {"properties": {"v": {"multipleOf": 1e-300}}});
+    assert!(tiny.is_valid(&doc! {"v": 1.0}) && tiny.is_valid(&doc! {"v": 1e-299}));
+    assert!(!tiny.is_valid(&doc! {"v": 1.5e-301}));
+    // The smallest subnormal reads as 4.94065645841247e-324: it is a multiple of itself
+    // and a whole number is not one (twice it reads 9.88131291682493e-324, rounded alone).
+    let denormal = schema(doc! {"properties": {"v": {"multipleOf": 5e-324}}});
+    assert!(denormal.is_valid(&doc! {"v": 5e-324}));
+    assert!(!denormal.is_valid(&doc! {"v": 1.0}));
+    assert!(!half.is_valid(&doc! {"v": 1e-300}));
+    assert!(half.is_valid(&doc! {"v": 0.0}));
+    let huge_divisor = schema(doc! {"properties": {"v": {"multipleOf": 1e300}}});
+    assert!(huge_divisor.is_valid(&doc! {"v": 3e300}) && !huge_divisor.is_valid(&doc! {"v": 1.0}));
 }
 
 // -- strings -----------------------------------------------------------------
@@ -812,13 +953,6 @@ fn patterns_share_the_regex_limits() {
     assert!(m.contains("32"), "{m}");
     many.remove("^p0$");
     schema(doc! {"patternProperties": many});
-    // And a filter's budget is the one they are charged to.
-    let mut filter = Vec::new();
-    for _ in 0..31 {
-        filter.push(Bson::Document(doc! {"s": {"$regex": "a"}}));
-    }
-    let too_many = doc! {"$and": filter, "$jsonSchema": {"patternProperties": {"a": {}, "b": {}}}};
-    assert!(crate::filter::parse(&too_many).is_err());
 }
 
 // -- reasons -----------------------------------------------------------------
@@ -985,98 +1119,6 @@ fn schemas_compare_and_clone_cheaply() {
     assert_ne!(a, schema(doc! {"required": ["b"]}));
     assert_eq!(a.clone(), a);
     assert_eq!(a.document(), &doc! {"required": ["a"]});
-}
-
-// -- as a filter -------------------------------------------------------------
-
-mod as_filter {
-    use bson::{Document, doc};
-
-    use crate::filter::{Filter, matches, parse, parse_condition_document};
-
-    fn hits(filter: Document, d: Document) -> bool {
-        matches(&parse(&filter).expect("parses"), &d).expect("evaluates")
-    }
-
-    #[test]
-    fn a_top_level_schema_matches_the_documents_it_accepts() {
-        let f = doc! {"$jsonSchema": {"required": ["a"], "properties": {"a": {"bsonType": "int"}}}};
-        assert!(hits(f.clone(), doc! {"a": 1}));
-        assert!(!hits(f.clone(), doc! {"a": "x"}));
-        assert!(!hits(f, doc! {}));
-        assert!(matches!(parse(&doc! {"$jsonSchema": {}}).unwrap(), Filter::JsonSchema(_)));
-    }
-
-    #[test]
-    fn it_combines_with_other_clauses_and_the_logical_operators() {
-        let schema = || doc! {"required": ["a"]};
-        assert!(hits(doc! {"$jsonSchema": schema(), "b": 2}, doc! {"a": 1, "b": 2}));
-        assert!(!hits(doc! {"$jsonSchema": schema(), "b": 2}, doc! {"a": 1, "b": 3}));
-        assert!(hits(doc! {"$and": [{"$jsonSchema": schema()}, {"b": 2}]}, doc! {"a": 1, "b": 2}));
-        assert!(hits(doc! {"$or": [{"$jsonSchema": schema()}, {"b": 2}]}, doc! {"b": 2}));
-        // $nor finds the documents that break the schema.
-        let bad = doc! {"$nor": [{"$jsonSchema": schema()}]};
-        assert!(hits(bad.clone(), doc! {"b": 1}));
-        assert!(!hits(bad, doc! {"a": 1}));
-    }
-
-    #[test]
-    fn it_tests_the_document_elements_of_an_elem_match() {
-        let f = doc! {"l": {"$elemMatch": {"$jsonSchema": {"required": ["q"]}}}};
-        assert!(hits(f.clone(), doc! {"l": [{"x": 1}, {"q": 1}]}));
-        assert!(!hits(f.clone(), doc! {"l": [{"x": 1}, 5]}));
-        assert!(!hits(f, doc! {"l": [1, 2]}));
-    }
-
-    #[test]
-    fn it_tests_the_document_elements_of_a_pull_condition() {
-        let f = parse_condition_document(&doc! {"$jsonSchema": {"required": ["q"]}}).unwrap();
-        assert!(crate::filter::matches_pull_element(&f, &bson::bson!({"q": 1})).unwrap());
-        assert!(!crate::filter::matches_pull_element(&f, &bson::bson!({"x": 1})).unwrap());
-        assert!(!crate::filter::matches_pull_element(&f, &bson::Bson::Int32(1)).unwrap());
-    }
-
-    #[test]
-    fn a_field_level_schema_is_refused() {
-        for f in [
-            doc! {"a": {"$jsonSchema": {}}},
-            doc! {"a": {"$not": {"$jsonSchema": {}}}},
-            doc! {"a": {"$gt": 1, "$jsonSchema": {}}},
-            doc! {"$or": [{"a": {"$jsonSchema": {}}}]},
-        ] {
-            let e = parse(&f).expect_err("refused");
-            assert!(matches!(e, kimmy_core::Error::InvalidQuery(_)), "{e:?}");
-            assert!(e.to_string().contains("$jsonSchema"), "{e}");
-        }
-    }
-
-    #[test]
-    fn a_bad_schema_is_a_bad_filter() {
-        for f in [
-            doc! {"$jsonSchema": 5},
-            doc! {"$jsonSchema": "x"},
-            doc! {"$jsonSchema": {"format": "email"}},
-            doc! {"$nor": [{"$jsonSchema": {"properties": {"a": {"$ref": "#"}}}}]},
-            doc! {"l": {"$elemMatch": {"$jsonSchema": {"default": 1}}}},
-        ] {
-            let e = parse(&f).expect_err("refused");
-            assert!(matches!(e, kimmy_core::Error::InvalidQuery(_)), "{e:?}");
-        }
-    }
-
-    #[test]
-    fn partial_index_filters_do_not_take_it() {
-        use kimmy_core::PartialFilter;
-        assert!(PartialFilter::parse(&doc! {"$jsonSchema": {}}).is_err());
-        assert!(PartialFilter::parse(&doc! {"a": {"$jsonSchema": {}}}).is_err());
-    }
-
-    #[test]
-    fn the_filter_clones_and_compares() {
-        let a = parse(&doc! {"$jsonSchema": {"required": ["a"]}}).unwrap();
-        assert_eq!(a.clone(), a);
-        assert_ne!(a, parse(&doc! {"$jsonSchema": {"required": ["b"]}}).unwrap());
-    }
 }
 
 // -- no panics ---------------------------------------------------------------

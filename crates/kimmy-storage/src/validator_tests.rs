@@ -569,3 +569,400 @@ fn the_oplog_kind_round_trips_through_its_tag() {
         bson::deserialize_from_slice(&entry.body.unwrap()).unwrap();
     assert_eq!(body.validator, Some(strict_error()));
 }
+
+// -- the stored schema keeps its types (ADR-182's rule, ADR-257) ----------------
+
+/// A schema holding a value of every type the relaxed JSON form loses or blurs:
+/// a generic binary, a `NaN`, both infinities, an `Int64` beside an `Int32` that
+/// reads the same, a `Decimal128`, a date and an `ObjectId`.
+fn typed_schema() -> Document {
+    use bson::{Binary, Decimal128, spec::BinarySubtype};
+    doc! {
+        "bsonType": "object",
+        "properties": {
+            "bin": { "enum": [Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2, 3] })] },
+            "low": { "bsonType": "int", "minimum": f64::NEG_INFINITY },
+            "high": { "maximum": f64::INFINITY },
+            "nan": { "enum": [f64::NAN, 1] },
+            "wide": { "enum": [Bson::Int64(5), Bson::Int32(6)] },
+            "dec": { "multipleOf": "1.50".parse::<Decimal128>().unwrap() },
+            "date": { "enum": [bson::DateTime::from_millis(1_700_000_000_123)] },
+            "oid": { "enum": [bson::oid::ObjectId::parse_str("0123456789abcdef01234567").unwrap()] },
+        },
+        "required": ["bin"],
+    }
+}
+
+fn typed_spec() -> ValidatorSpec {
+    ValidatorSpec {
+        schema: typed_schema(),
+        action: ValidationAction::Error,
+        level: ValidationLevel::Strict,
+    }
+}
+
+/// The schema `held` carries is exactly `typed_schema`, every type kept: compared
+/// by canonical Extended JSON, where `Int64(5)` and `Int32(5)`, a binary and its
+/// bytes, and a `NaN` and a `null` are all different.
+fn assert_typed(held: &crate::CollectionMeta, what: &str) {
+    let validator = held.validator.as_ref().unwrap_or_else(|| panic!("{what}: no validator"));
+    assert_eq!(
+        kimmy_core::validator::stored_schema::canonical(&validator.schema),
+        kimmy_core::validator::stored_schema::canonical(&typed_schema()),
+        "{what}: the schema read back is not the schema set"
+    );
+    assert_eq!(validator, &typed_spec(), "{what}");
+}
+
+/// What the typed schema must still decide, whichever path it came by.
+fn assert_enforced(e: &Engine, what: &str) {
+    let c = e.get_collection("shop", "c").unwrap();
+    let bin = Bson::Binary(bson::Binary {
+        subtype: bson::spec::BinarySubtype::Generic,
+        bytes: vec![1, 2, 3],
+    });
+    let refused = |r: crate::Result<DocId>| {
+        assert!(
+            matches!(r, Err(StorageError::Core(CoreError::DocumentInvalid { .. }))),
+            "{what}: {r:?}"
+        );
+    };
+    e.insert(&c, doc! { "_id": 1i64, "bin": bin.clone() })
+        .unwrap_or_else(|x| panic!("{what}: {x:?}"));
+    // The listed binary is accepted and its bytes as an array are not.
+    refused(e.insert(&c, doc! { "_id": 2i64, "bin": [1, 2, 3] }));
+    // `required` and `bsonType` stand: a validator that did not parse would let both by.
+    refused(e.insert(&c, doc! { "_id": 3i64 }));
+    refused(e.insert(&c, doc! { "_id": 4i64, "bin": bin.clone(), "low": "text" }));
+    // A `NaN` in an `enum` is listed; a `null` is not.
+    e.insert(&c, doc! { "_id": 5i64, "bin": bin.clone(), "nan": f64::NAN }).unwrap();
+    refused(e.insert(&c, doc! { "_id": 6i64, "bin": bin.clone(), "nan": Bson::Null }));
+    // `-Infinity` as a floor is no floor.
+    e.insert(&c, doc! { "_id": 7i64, "bin": bin.clone(), "low": i32::MIN }).unwrap();
+    assert_eq!(e.validators_unparseable(), 0, "{what}: the stored schema parses");
+}
+
+#[test]
+fn the_stored_schema_keeps_every_type_through_the_store_and_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let e = Engine::open(&path).unwrap();
+        e.create_collection("shop", "c").unwrap();
+        e.set_validator("shop", "c", Some(typed_spec())).unwrap();
+        // Read back from the store, not the value `set_validator` returned.
+        assert_typed(&e.get_collection("shop", "c").unwrap(), "same session");
+        assert_enforced(&e, "same session");
+    }
+    let e = Engine::open(&path).unwrap();
+    assert_typed(&e.get_collection("shop", "c").unwrap(), "after a restart");
+    // The documents the first session accepted are held, so the enforcement is
+    // checked against a fresh collection of the same validator.
+    e.create_collection("shop", "d").unwrap();
+    e.set_validator("shop", "d", Some(typed_spec())).unwrap();
+    drop(e);
+    let e = Engine::open(&path).unwrap();
+    assert_typed(&e.get_collection("shop", "d").unwrap(), "a second restart");
+    let c = e.get_collection("shop", "d").unwrap();
+    let r = e.insert(&c, doc! { "_id": 1i64, "bin": [1, 2, 3] });
+    assert!(matches!(r, Err(StorageError::Core(CoreError::DocumentInvalid { .. }))), "{r:?}");
+}
+
+#[test]
+fn a_typed_schema_enforces_what_it_says_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let e = Engine::open(&path).unwrap();
+        e.create_collection("shop", "c").unwrap();
+        e.set_validator("shop", "c", Some(typed_spec())).unwrap();
+    }
+    let e = Engine::open(&path).unwrap();
+    assert_enforced(&e, "after a restart");
+}
+
+#[test]
+fn a_typed_schema_survives_an_entry_a_snapshot_page_and_a_restart_on_a_replica() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    a.set_validator("shop", "c", Some(typed_spec())).unwrap();
+
+    // By oplog entries, each through its stored byte form and BSON on the wire.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let b = Engine::open(&path).unwrap();
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| {
+                crate::codec::decode_oplog_entry(&crate::codec::encode_oplog_entry(entry)).unwrap()
+            })
+            .collect();
+        let body = entries
+            .iter()
+            .find(|entry| entry.kind == OpKind::ConfigureValidator)
+            .and_then(|entry| entry.body.clone())
+            .unwrap();
+        let set: kimmy_core::ValidatorSet = bson::deserialize_from_slice(&body).unwrap();
+        assert_eq!(set.validator, Some(typed_spec()), "the entry body");
+        b.apply_batch(&entries).unwrap();
+        assert_typed(&b.get_collection("shop", "c").unwrap(), "by entries");
+    }
+    let b = Engine::open(&path).unwrap();
+    assert_typed(&b.get_collection("shop", "c").unwrap(), "by entries, after a restart");
+    assert_enforced(&b, "by entries, after a restart");
+
+    // By snapshot page.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let b = Engine::open(&path).unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        let page: crate::SnapshotPage =
+            bson::deserialize_from_slice(&bson::serialize_to_vec(&page).unwrap()).unwrap();
+        let state = page.collections.iter().find(|c| c.name == "c").unwrap();
+        assert_eq!(state.validator, Some(typed_spec()), "the page");
+        transfer(&b, &a);
+        assert_typed(&b.get_collection("shop", "c").unwrap(), "by page");
+    }
+    let b = Engine::open(&path).unwrap();
+    assert_typed(&b.get_collection("shop", "c").unwrap(), "by page, after a restart");
+    assert_enforced(&b, "by page, after a restart");
+}
+
+#[test]
+fn identical_typed_definitions_are_not_a_conflict_with_themselves() {
+    // A `NaN` in the schema made the derived `==` of the metadata false against
+    // itself; the definition check compares encodings, and so does the spec.
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    e.set_validator("shop", "c", Some(typed_spec())).unwrap();
+    // The same change again, and a retry over it, complete rather than loop.
+    e.set_validator("shop", "c", Some(typed_spec())).unwrap();
+    let held = e.get_collection("shop", "c").unwrap();
+    assert_eq!(held.validator, Some(typed_spec()));
+    assert_eq!(
+        crate::definition_digest::validator_hash(held.validator.as_ref().unwrap()),
+        crate::definition_digest::validator_hash(&typed_spec())
+    );
+}
+
+// -- a collection created with its validator (ADR-257) -------------------------
+
+fn plain(schema: Document) -> ValidatorSpec {
+    ValidatorSpec { schema, action: ValidationAction::Error, level: ValidationLevel::Strict }
+}
+
+fn entries_of(e: &Engine) -> Vec<kimmy_core::OplogEntry> {
+    e.entries_for_peer(Hlc::ZERO, 1000, crate::WalkScope::Request).unwrap().entries
+}
+
+#[test]
+fn creating_a_collection_with_a_validator_is_one_commit_and_one_entry() {
+    let (plain_engine, _dp) = open();
+    let before = plain_engine.commits();
+    plain_engine.create_collection("shop", "c").unwrap();
+    let one_creation = plain_engine.commits() - before;
+
+    let (e, _d) = open();
+    let before = e.commits();
+    let made = e.create_collection_with_validator("shop", "c", strict_error()).unwrap();
+    assert_eq!(e.commits() - before, one_creation, "the collection and its validator, one commit");
+
+    // Standing, read back from the store, with the validator stamped by the creation.
+    let held = e.get_collection("shop", "c").unwrap();
+    assert_eq!(held.validator, Some(strict_error()));
+    assert_eq!(held.validator_changed.map(|s| s.hlc), Some(held.created));
+    assert_eq!(held, made);
+
+    // One entry: the creation, carrying the validator. No `ConfigureValidator` follows it.
+    let kinds: Vec<OpKind> = entries_of(&e).iter().map(|entry| entry.kind).collect();
+    assert_eq!(kinds, [OpKind::CreateCollection], "{kinds:?}");
+    let create = &entries_of(&e)[0];
+    assert_eq!(create.stamp.hlc, held.created);
+    let body: kimmy_core::CollectionCreate =
+        bson::deserialize_from_slice(create.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body.validator, Some(strict_error()));
+
+    // It enforces from the first write.
+    invalid(e.insert(&held, doc! { "_id": 1i64, "qty": -1 }).unwrap_err());
+    e.insert(&held, doc! { "_id": 2i64, "qty": 1 }).unwrap();
+
+    // A change after it is a later one, and wins.
+    let off = e.set_validator("shop", "c", None).unwrap();
+    assert!(off.validator_changed > held.validator_changed);
+}
+
+#[test]
+fn a_refused_create_with_a_validator_leaves_nothing_behind() {
+    let (e, _d) = open();
+    // A schema that does not parse: no collection, no entry.
+    let err = e
+        .create_collection_with_validator("shop", "c", plain(doc! { "$ref": "#/definitions/x" }))
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Core(CoreError::InvalidQuery(_))), "{err:?}");
+    assert!(matches!(
+        e.get_collection("shop", "c"),
+        Err(StorageError::Core(CoreError::CollectionNotFound { .. }))
+    ));
+    assert!(entries_of(&e).is_empty());
+
+    // A name that exists keeps what it has: no validator is laid over it.
+    e.create_collection("shop", "d").unwrap();
+    let err = e.create_collection_with_validator("shop", "d", strict_error()).unwrap_err();
+    assert!(matches!(err, StorageError::Core(CoreError::CollectionExists { .. })), "{err:?}");
+    assert_eq!(e.get_collection("shop", "d").unwrap().validator, None);
+    assert_eq!(entries_of(&e).len(), 1, "the one plain creation");
+
+    // A shadow name cannot take a validator, created or set.
+    assert!(e.create_collection_with_validator("shop", "__vec_c", strict_error()).is_err());
+}
+
+#[test]
+fn a_member_never_holds_a_collection_created_with_a_validator_without_it() {
+    let (a, _da) = open();
+    a.create_collection_with_validator("shop", "c", typed_spec()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let b = Engine::open(&path).unwrap();
+        // The entry alone, each through its stored byte form, as a peer is served it.
+        let entries: Vec<_> = entries_of(&a)
+            .iter()
+            .map(|entry| {
+                crate::codec::decode_oplog_entry(&crate::codec::encode_oplog_entry(entry)).unwrap()
+            })
+            .collect();
+        assert_eq!(entries.len(), 1);
+        // What applying a plain creation costs, for comparison.
+        let plain_apply = {
+            let (src, _ds) = open();
+            src.create_collection("shop", "c").unwrap();
+            let (fresh, _df) = open();
+            let at = fresh.commits();
+            fresh.apply_batch(&entries_of(&src)).unwrap();
+            fresh.commits() - at
+        };
+        let at = b.commits();
+        b.apply_batch(&entries).unwrap();
+        assert_eq!(b.commits() - at, plain_apply, "the applied creation is the same commits");
+        assert_typed(&b.get_collection("shop", "c").unwrap(), "applied");
+        assert_eq!(
+            b.get_collection("shop", "c").unwrap().validator_changed,
+            Some(entries[0].stamp),
+            "stamped by the entry that carried it"
+        );
+    }
+    let b = Engine::open(&path).unwrap();
+    assert_typed(&b.get_collection("shop", "c").unwrap(), "after a restart");
+    assert_enforced(&b, "after a restart");
+}
+
+#[test]
+fn a_creation_met_again_does_not_bring_back_a_validator_that_was_removed() {
+    let (a, _da) = open();
+    a.create_collection_with_validator("shop", "c", strict_error()).unwrap();
+    let (b, _db) = open();
+    let creation = entries_of(&a);
+    b.apply_batch(&creation).unwrap();
+    assert_eq!(b.get_collection("shop", "c").unwrap().validator, Some(strict_error()));
+
+    // Removed here, later: the creation met again (a re-served window) is the older change.
+    a.set_validator("shop", "c", None).unwrap();
+    b.apply_batch(&entries_of(&a)).unwrap();
+    assert_eq!(b.get_collection("shop", "c").unwrap().validator, None);
+    b.apply_batch(&creation).unwrap();
+    assert_eq!(b.get_collection("shop", "c").unwrap().validator, None, "last writer wins");
+}
+
+#[test]
+fn a_creation_carrying_a_validator_reaches_a_member_that_made_the_name_itself() {
+    let (a, _da) = open();
+    a.create_collection_with_validator("shop", "c", strict_error()).unwrap();
+    // The name was made here, plain, before the creation arrived.
+    let (b, _db) = open();
+    b.create_collection("shop", "c").unwrap();
+    b.apply_batch(&entries_of(&a)).unwrap();
+    assert_eq!(b.get_collection("shop", "c").unwrap().validator, Some(strict_error()));
+}
+
+// -- the reviewer's probes, adopted ----------------------------------------------
+
+#[test]
+fn an_upsert_that_inserts_is_checked_under_moderate() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    e.insert(&c, doc! { "_id": 1i64, "n": "bad" }).unwrap();
+    e.insert(&c, doc! { "_id": 2i64, "n": 1 }).unwrap();
+    e.set_validator(
+        "shop",
+        "c",
+        Some(ValidatorSpec {
+            schema: doc! { "properties": { "n": { "bsonType": "int" } } },
+            action: ValidationAction::Error,
+            level: ValidationLevel::Moderate,
+        }),
+    )
+    .unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    // Replace of the document that did not conform: free.
+    e.replace(&c, &DocId::Int64(1), doc! { "n": "still bad" }, false).unwrap();
+    // Replace of the one that did, with a bad image: refused.
+    invalid(e.replace(&c, &DocId::Int64(2), doc! { "n": "now bad" }, false).unwrap_err());
+    // An upsert that inserts is an insert, and is checked.
+    invalid(e.replace(&c, &DocId::Int64(3), doc! { "n": "bad" }, true).unwrap_err());
+    e.replace(&c, &DocId::Int64(3), doc! { "n": 3 }, true).unwrap();
+}
+
+#[test]
+fn an_old_lifes_validator_entry_does_not_reach_the_new_life() {
+    let (a, _da) = open();
+    a.create_collection("shop", "c").unwrap();
+    a.set_validator("shop", "c", Some(plain(doc! { "required": ["old"] }))).unwrap();
+    a.drop_collection("shop", "c").unwrap();
+    a.create_collection("shop", "c").unwrap();
+    let all = entries_of(&a);
+    let (late, rest): (Vec<_>, Vec<_>) =
+        all.iter().cloned().partition(|e| e.kind == OpKind::ConfigureValidator);
+    assert_eq!(late.len(), 1, "premise: the first life's validator entry");
+    // The validator entry delivered last, after the drop and the new life, and in order.
+    for (name, batches) in
+        [("validator last", vec![rest.clone(), late.clone()]), ("in order", vec![all.clone()])]
+    {
+        let (b, _db) = open();
+        for batch in batches {
+            b.apply_batch(&batch).unwrap();
+        }
+        let held = b.get_collection("shop", "c").unwrap();
+        assert_eq!(held.validator, None, "{name}: the first life's validator reached the second");
+        b.insert(&held, doc! { "_id": 1i64, "x": 1 }).expect("the new life has no validator");
+    }
+    assert_eq!(a.get_collection("shop", "c").unwrap().validator, None);
+}
+
+#[test]
+fn a_reserved_validator_of_a_dropped_life_does_not_reach_the_next() {
+    let (a, _da) = open();
+    let (b, _db) = open();
+    a.create_collection("shop", "c").unwrap();
+    a.set_validator("shop", "c", Some(plain(doc! { "required": ["old"] }))).unwrap();
+    a.drop_collection("shop", "c").unwrap();
+    a.create_collection("shop", "c").unwrap();
+    let theirs = a.version_vector().unwrap();
+    let whole = a.entries_for_peer(Hlc::ZERO, 1000, crate::WalkScope::Background).unwrap();
+    b.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, whole.exhausted).unwrap();
+    assert!(b.get_collection("shop", "c").unwrap().validator.is_none());
+    // The first life's validator entry served again, alone, to a member holding the
+    // drop and the new life.
+    let at = whole.entries.iter().position(|e| e.kind == OpKind::ConfigureValidator).unwrap();
+    let one = &whole.entries[at..at + 1];
+    b.apply_peer_batch(&theirs, one, one[0].stamp.hlc, false).unwrap();
+    assert!(
+        b.get_collection("shop", "c").unwrap().validator.is_none(),
+        "the first life's validator reached the second"
+    );
+}

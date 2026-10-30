@@ -42,12 +42,11 @@ Also recorded here, so they are not read as bugs:
 
 ---
 
-## 🟡 `$jsonSchema` refuses the keywords it does not implement, and `multipleOf` on a double is a floating-point remainder
+## 🟡 `$jsonSchema` refuses the keywords it does not implement
 
 **Raised 2026-10-28, with ADR-257.** `$jsonSchema` is built as a filter operator ([query-language.md](query-language.md#jsonschema)), with draft-4 semantics and `bsonType`, as MongoDB reads it. Where it differs:
 
 - **A keyword outside the supported list is a `400` at parse**, naming it and where it stands, wherever it is nested: `$ref`, `$schema`, `default`, `definitions`, `format`, `id`, `contentMediaType`, and any unknown one. The only keywords read and ignored are `title` and `description`; nothing else is skipped silently.
-- **`multipleOf` is exact for `int`, `long` and `Decimal128`, and a floating-point remainder when either side is a double**: `fmod(value, divisor) == 0`, so the double `0.3` is not a multiple of the double `0.1`. This is the reference's behaviour for doubles, kept; a decimal divisor and decimal values give the exact answer.
 - **`pattern` and `patternProperties` use the `$regex` engine**, not PCRE: no backreferences or lookaround, a size limit per pattern, and a count shared with the filter's other patterns (32).
 - **`required`, `enum`, `allOf`, `anyOf`, `oneOf`, a property dependency's array and `bsonType`/`type` arrays must be non-empty**, and `required` and a dependency's array hold distinct names, as the draft-4 meta-schema says. `exclusiveMinimum` and `exclusiveMaximum` are the draft-4 booleans and need `minimum` / `maximum` beside them.
 - **A schema nests at most 32 levels.**
@@ -773,8 +772,10 @@ under [Positional updates](query-language.md#positional-updates) and
 - **A positional projection is a find feature.** `$project` and `$addFields`
   still read `items.$` as a field called `$`. `findAndModify` takes the element
   from the document the filter matched, at the same index in the returned
-  document; an update that changes the array's length is a `400` for
-  `returnDocument: "after"`, and so is an `upsert` with it.
+  document; `returnDocument: "after"` is a `400` when the update writes the
+  array, a parent of it, or a descendant of it not reached through `$`
+  (`items.0.qty`, `items.$[].qty`); only `items.$...` and unrelated fields are
+  allowed. So is an `upsert` with it.
 - **A positional projection that cannot name an element is a `400`** for the
   request, not an empty array for that document. On `findAndModify` it is
   refused inside the write transaction, so nothing is written. A sorted find

@@ -319,8 +319,8 @@ The dialect is draft-4 JSON Schema with `bsonType`, as other systems read it.
 | Keywords | Meaning |
 |---|---|
 | `bsonType` | A type alias or an array of them (any one holds): `double`, `string`, `object`, `array`, `binData`, `undefined`, `objectId`, `bool`, `date`, `null`, `regex`, `javascript`, `int`, `timestamp`, `long`, `decimal`, `minKey`, `maxKey`, `symbol`, `dbPointer`, and `number` for the four numeric types. `int` does not accept a double of whole value |
-| `type` | `object`, `array`, `number`, `boolean`, `string`, `null`, or an array of them. With `bsonType` on the same level, both must hold |
-| `enum` | A non-empty array; the value must equal one, by the sort order, so `1` equals `1.0` and `Decimal128("1.00")` |
+| `type` | `object`, `array`, `number`, `boolean`, `string`, `null`, or an array of them. Not on the same level as `bsonType`: both together are a `400`, and so is a name listed twice |
+| `enum` | A non-empty array of distinct values; the value must equal one, by the sort order, so `1` equals `1.0` and `Decimal128("1.00")`. Embedded documents are equal when they hold the same fields with equal values **in any order**: `{x: 1, y: 2}` equals `{y: 2, x: 1}`. Listing a value twice (`1` and `1.0` are one value) is a `400` |
 | `required` | A non-empty array of distinct property names that must be present |
 | `properties` | A schema for each named property. **A property the document lacks is not tested**: only `required` asks for it |
 | `additionalProperties` | `false`, `true`, or a schema for the properties that neither `properties` nor `patternProperties` names |
@@ -328,13 +328,13 @@ The dialect is draft-4 JSON Schema with `bsonType`, as other systems read it.
 | `minProperties` `maxProperties` | The number of properties |
 | `dependencies` | For a property that is present: an array of properties that must be too, or a schema the whole document must satisfy |
 | `minimum` `maximum` | Inclusive bounds on a number; with `exclusiveMinimum: true` or `exclusiveMaximum: true` beside it, exclusive. The flag needs its bound |
-| `multipleOf` | A number above zero. Exact for `int`, `long` and `Decimal128`; see below |
+| `multipleOf` | A number above zero. The remainder is taken exactly, a double read to 15 significant digits first; see below |
 | `minLength` `maxLength` | The length of a string in characters (code points) |
 | `pattern` | A string pattern, searched for in the value: `"b"` matches `"abc"`, `"^b$"` does not |
 | `items` | A schema for every element, or an array of schemas for the elements by position |
 | `additionalItems` | With an `items` array, `false`, `true` or a schema for the elements past it. Ignored beside a single `items` schema |
 | `minItems` `maxItems` | The number of elements |
-| `uniqueItems` | `true`: no two elements are equal, by the sort order, so `1` and `1.0` are one element |
+| `uniqueItems` | `true`: no two elements are equal, by the sort order, so `1` and `1.0` are one element, and two documents with the same fields and values in another order are one element |
 | `allOf` `anyOf` `oneOf` | A non-empty array of schemas: all, at least one, exactly one |
 | `not` | The value must not satisfy the schema |
 | `title` `description` | A string, read and ignored |
@@ -358,12 +358,16 @@ the list of names, and so on.
   comparison operators do: `{"minimum": 1}` accepts `Int32(1)`, `Double(1.0)`
   and `Decimal128("1.00")`; the double `0.1` is above the decimal `0.1`. A NaN
   sorts below every number, so it is below every `minimum` and under every `maximum`.
-- **`multipleOf`**: exact when the value and the divisor are `int`, `long` or
-  `Decimal128` (`Decimal128("0.30")` is a multiple of `Decimal128("0.1")`). When either
-  is a double, both are read as doubles and the test is that the floating-point
-  remainder (`fmod`) is zero, so the double `0.3` is **not** a multiple of the
-  double `0.1`: write the divisor and the values as decimals when exactness matters.
-  A NaN or infinity is a multiple of nothing.
+- **`multipleOf`**: both numbers are read as decimals and the remainder is taken
+  exactly. An `int`, a `long` and a `Decimal128` are read as they are
+  (`Decimal128("0.30")` is a multiple of `Decimal128("0.1")`; an `Int64` is never
+  read through a double). A double is first rounded to 15 significant decimal
+  digits, so the double `0.3` **is** a multiple of the double `0.1`, `19.99` of
+  `0.01` and `4.35` of `0.05`, as they read when written, and `0.35` is not a
+  multiple of `0.1`. A cents rule written with doubles therefore accepts every
+  price to the cent. A NaN or infinity is a multiple of nothing, and a huge double
+  such as `1e300` is a multiple of `0.5` (it is a whole number) and of nothing that
+  does not divide a power of ten.
 - **Limits.** A schema nests at most 32 levels (the outermost is level 1), a `400`
   beyond. Evaluation follows the schema, so a deeply nested document costs no more
   depth. `pattern` and `patternProperties` use the same engine and the same limits
@@ -375,8 +379,12 @@ the list of names, and so on.
 - **Never index-eligible.** A schema is a residual predicate every candidate goes
   through, so it neither selects a key range nor narrows one; an equality or range
   beside it still uses an index. It cannot appear in a partial index's filter.
-- Inside an `$elemMatch`, `$pull` condition or `arrayFilters` entry it tests
-  an element that is a document; a scalar element never satisfies it.
+- Inside an `$elemMatch` or a `$pull` condition it tests an element that is a
+  document; a scalar element never satisfies it. An `arrayFilters` entry
+  **refuses** it, both as `{"$jsonSchema": ...}` and under the identifier
+  (`{"e": {"$jsonSchema": ...}}`): an entry takes field conditions, `$expr` and
+  `$and`/`$or`/`$nor`, and a schema under a field is the field-level use that is
+  a `400` everywhere. Filter the elements with `$elemMatch` in the query filter.
 
 ### `$type`
 
@@ -1265,9 +1273,15 @@ document as it was before the write, at the same index in the document
 returned. `returnDocument: "before"` (the default) and `remove: true` return
 the matched element of the document as it was. `"after"` returns the element
 at that index of the updated document, so `items.$.qty` incremented and
-returned shows the incremented element. An update that leaves the array with
-another length, or no longer an array (`$pull`, `$push`, `$set` of the whole
-array), is a `400`, because the index no longer names the slot that matched.
+returned shows the incremented element. With `"after"`, an update is a `400`
+unless every path it writes is under `items.$` or shares no prefix with
+`items`: a write to `items` itself, to a parent of it (`$set` of the document
+that holds it), or to a descendant of it that does not go through `$`
+(`items.0.qty`, `items.$[].qty`, `items.$[<id>].qty`) is refused, whatever the
+operator (`$set`, `$unset`, `$rename`, `$push`, `$pull`, `$pop`, `$addToSet`,
+`$sort` inside `$push`), because the index could then name an element the
+filter did not match. `$[]` and `$[<id>]` cannot move elements, but can change
+which one matched, and are refused with the rest. `"before"` is not affected.
 The check runs inside the write transaction, so a refused request writes
 nothing: not the update, not an upsert's insert, not a removal. An `upsert`
 with `returnDocument: "after"` is refused for every request, since an upsert
