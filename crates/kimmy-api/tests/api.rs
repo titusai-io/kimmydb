@@ -3940,6 +3940,36 @@ async fn a_refused_positional_projection_on_find_and_modify_writes_nothing() {
     assert_eq!(stored().await.status, 404);
 }
 
+/// The refusal is decided by the request, not by the data: the same request
+/// answers `400` whether or not a document matches, and a replacement document
+/// has a message of its own.
+#[tokio::test]
+async fn a_positional_projection_after_an_unfit_update_is_refused_even_when_nothing_matches() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 1, "items": [{"sku": "a"}]}))
+        .await;
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/c/find_and_modify", Some(token), body).await }
+    };
+    for filter in [json!({"_id": 1, "items.sku": "a"}), json!({"_id": 99, "items.sku": "a"})] {
+        let res = fam(json!({"filter": filter, "update": {"$set": {"items.0.sku": "z"}},
+                             "returnDocument": "after", "projection": {"items.$": 1}}))
+        .await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let res = fam(json!({"filter": filter, "update": {"x": 1},
+                             "returnDocument": "after", "projection": {"items.$": 1}}))
+        .await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let msg = res.body["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("after a replacement"), "{msg}");
+        assert!(!msg.contains("which is"), "{msg}");
+    }
+}
+
 /// `returnDocument: "after"` with a positional projection cuts the image
 /// from after the write at the index the filter matched. An update that
 /// writes the array, a parent of it, or a descendant of it not reached

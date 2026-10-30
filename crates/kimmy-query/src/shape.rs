@@ -284,6 +284,13 @@ impl FindProjection {
         let Some(array) = &self.positional else {
             return Ok(());
         };
+        if matches!(update, Update::Replace(_)) {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ cannot name an element of the document \
+                 after a replacement, which replaces every element. Use returnDocument \
+                 \"before\""
+            )));
+        }
         match update.first_write_outside_matched(array) {
             None => Ok(()),
             Some(written) => Err(Error::InvalidQuery(format!(
