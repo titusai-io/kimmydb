@@ -27,11 +27,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bson::{Bson, Document};
+use kimmy_core::json_schema::Schema;
 use kimmy_core::{
     CollectionId, DocId, Error as CoreError, Stamp, ValidationAction, ValidationLevel,
     ValidatorSpec, vector_meta,
 };
-use kimmy_core::json_schema::Schema;
 use parking_lot::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
