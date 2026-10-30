@@ -281,6 +281,7 @@ impl Engine {
         // Whether the rewind removed a document it holds no entry of at or below
         // the target: the vectors are then bounded by the horizon as well.
         let mut removed_any = false;
+        let mut unkeyed = Vec::new();
         let schema = Engine::schema_for_record(self.db())?;
         let txn = self.begin_write(WriterHolder::Rewind)?;
         {
@@ -363,7 +364,7 @@ impl Engine {
                 // Index entries follow the document, or an index-backed query
                 // would answer from the future the rewind just undid.
                 if let Some(meta) = collections.get(&collection_id) {
-                    let newly_multikey = index::maintain_rewound(
+                    let (newly_multikey, filings) = index::maintain_rewound(
                         self,
                         &txn,
                         meta,
@@ -374,6 +375,14 @@ impl Engine {
                     // A restored image can hold arrays the current one did not;
                     // the flag is one-way, so marking is the only safe answer.
                     index::mark_multikey(&txn, &meta.db, &meta.name, &newly_multikey)?;
+                    // Reported like every other filing, on the move into the
+                    // unkeyed run only; appended below, once the discarded
+                    // future has left the log, or the pass that removes
+                    // everything above the target would remove these too.
+                    if let Some(after) = after.as_ref().filter(|_| !filings.is_empty()) {
+                        let id = crate::docs::extract_id(after)?;
+                        unkeyed.extend(crate::docs::unkeyed_details(meta.id, &id, &filings));
+                    }
                 }
             }
 
@@ -468,7 +477,11 @@ impl Engine {
             restored_floor
         };
         Engine::lower_vectors_in(&txn, schema, until, floor)?;
+        // After the log lost everything above the target, so these survive it,
+        // and in the transaction that filed the documents.
+        let unkeyed_entries = self.append_unkeyed(&txn, unkeyed)?;
         txn.commit()?;
+        self.publish(unkeyed_entries);
 
         info!(
             reverted = outcome.reverted,

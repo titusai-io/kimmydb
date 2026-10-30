@@ -378,7 +378,9 @@ reads beside its ranges and rechecks like any other candidate: every query still
 finds it and none finds it wrongly. The member says so: an `unkeyedDocument`
 change-stream event when it files the document, `GET …/indexes/{name}/unkeyed`
 listing what stands, the `unkeyed` count on the index listing, and
-`kimmy_index_unkeyed_total`. A client that is refused on one member and
+`kimmy_index_unkeyed_total`. A rewind (`kimmyd restore --until`) that puts a
+document back in a form an index cannot key files it unkeyed and says so the same
+way, in its own transaction; it still refuses for a unique index. A client that is refused on one member and
 accepted on another is the same difference as a unique index's.
 
 **What else differs.** A local write that would leave an already-unkeyed document

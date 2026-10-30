@@ -400,3 +400,93 @@ fn the_unkeyed_list_pages_and_names_the_reason_of_each_document() {
     assert!(e.apply_remote(&c, &fixed).unwrap());
     assert_eq!(e.unkeyed_documents(&c, index, None, 100).unwrap().rows.len(), 4);
 }
+
+/// Applies replicated replaces of document 5, stamped a known distance after
+/// the index was created, so a rewind can be aimed between them.
+struct Replays {
+    base: u64,
+}
+
+impl Replays {
+    fn new() -> Self {
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                as u64;
+        Self { base: now + 1_000_000 }
+    }
+
+    fn put(&self, e: &Engine, c: &CollectionMeta, offset: u64, body: Document) {
+        let mut entry = remote(c, 5, self.base + offset, body);
+        entry.kind = OpKind::Replace;
+        assert!(e.apply_remote(c, &entry).unwrap());
+    }
+
+    /// A target between the writes at offsets 10 and 20.
+    fn between(&self) -> Hlc {
+        Hlc::new(self.base + 15, 0)
+    }
+}
+
+#[test]
+fn a_rewind_that_puts_back_an_unkeyed_document_announces_it() {
+    let (e, _d) = open();
+    let c = indexed(&e);
+    let mut rx = e.subscribe();
+    let at = Replays::new();
+    at.put(&e, &c, 10, bad());
+    at.put(&e, &c, 20, doc! { "a": 1, "b": 1 });
+    assert_eq!(events(&e).len(), 1, "the arrival of the unkeyed document");
+    assert_eq!(unkeyed_of(&e, &c), 0);
+    while rx.try_recv().is_ok() {}
+
+    let counted = e.unkeyed_writes();
+    e.rewind_to(at.between()).unwrap();
+
+    // Filed unkeyed again, counted, and announced a second time in the
+    // rewind's own transaction.
+    assert_eq!(unkeyed_of(&e, &c), 1);
+    assert_eq!(e.unkeyed_writes(), counted + 1);
+    let named: Vec<(DocId, String)> = events(&e).into_iter().map(|d| (d.id, d.reason)).collect();
+    assert_eq!(
+        named,
+        vec![
+            (DocId::Int64(5), "parallel_arrays".to_string()),
+            (DocId::Int64(5), "parallel_arrays".to_string())
+        ]
+    );
+    let kinds: Vec<OpKind> = std::iter::from_fn(|| rx.try_recv().ok()).map(|x| x.kind).collect();
+    assert_eq!(kinds, vec![OpKind::UnkeyedDocument]);
+    // Still this member's own report.
+    let served = e.entries_for_peer(Hlc::ZERO, 1_000, crate::WalkScope::Request).unwrap().entries;
+    assert!(served.iter().all(|x| x.kind != OpKind::UnkeyedDocument), "{served:?}");
+}
+
+#[test]
+fn a_rewind_that_leaves_a_document_unkeyed_announces_nothing() {
+    let (e, _d) = open();
+    let c = indexed(&e);
+    let at = Replays::new();
+    at.put(&e, &c, 10, bad());
+    at.put(&e, &c, 20, doc! { "a": [1, 2], "b": [3, 4], "note": "x" });
+    assert_eq!(events(&e).len(), 1);
+
+    e.rewind_to(at.between()).unwrap();
+
+    assert_eq!(unkeyed_of(&e, &c), 1);
+    assert_eq!(events(&e).len(), 1, "unkeyed before and after: not a move into the run");
+}
+
+#[test]
+fn a_rewind_that_makes_an_unkeyed_document_keyed_announces_nothing_and_drops_the_old_report() {
+    let (e, _d) = open();
+    let c = indexed(&e);
+    let at = Replays::new();
+    at.put(&e, &c, 10, doc! { "a": 1, "b": 1 });
+    at.put(&e, &c, 20, bad());
+    assert_eq!(events(&e).len(), 1);
+
+    e.rewind_to(at.between()).unwrap();
+
+    assert_eq!(unkeyed_of(&e, &c), 0);
+    assert!(events(&e).is_empty(), "the report of the undone write left with it");
+}

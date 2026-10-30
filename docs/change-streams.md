@@ -72,7 +72,9 @@ index's unkeyed run, because the index could not key it: arrays at two of a
 compound index's paths, or more than 1,000 keys. A write a client sends to a
 member is refused instead (`400`), so the event is for what a member accepts
 without being asked: a replicated write, a replicated index definition built
-over a document it cannot key, and a snapshot or catch-up. It names the index,
+over a document it cannot key, a snapshot or catch-up, and a rewind
+(`kimmyd restore --until`) that puts back a document in a form the index cannot
+key. It names the index,
 the document and why:
 
 ```json

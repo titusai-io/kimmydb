@@ -395,7 +395,9 @@ pub(crate) fn maintain(
 /// back an image this member held, which a replicated write may have filed
 /// unkeyed, and refusing it would leave the rewind half done. A unique index
 /// still refuses, as it always has. What it files unkeyed is counted and
-/// logged, and has no event: the rewind rewrites the history the event sits in.
+/// logged, and is returned so the rewind can report each move into the unkeyed
+/// run as an `unkeyedDocument` entry in its own transaction, as every other
+/// path that files a document unkeyed does.
 pub(crate) fn maintain_rewound(
     engine: &crate::Engine,
     txn: &redb::WriteTransaction,
@@ -403,8 +405,8 @@ pub(crate) fn maintain_rewound(
     old: Option<&Document>,
     new: Option<&Document>,
     doc_key: &[u8],
-) -> Result<Vec<u32>> {
-    Ok(maintain_local(engine, txn, coll, old, new, doc_key, false)?.0)
+) -> Result<(Vec<u32>, Vec<UnkeyedFiling>)> {
+    maintain_local(engine, txn, coll, old, new, doc_key, false)
 }
 
 fn maintain_local(

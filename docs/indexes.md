@@ -255,8 +255,8 @@ index holds unkeyed, with `reason` `parallel_arrays` or `too_many_keys`, paged
 like the violations reports (`limit`, `cursor`; `404` for an index the
 collection does not have). The event is sent on the move **into** the unkeyed run
 — a replicated write that arrives unkeyed, a replicated definition's backfill, an
-update that makes a keyed document unkeyed — and not again while the document
-stays there. The index listing, `describe` and `createIndex`
+update that makes a keyed document unkeyed, a rewind that puts such a document
+back — and not again while the document stays there. The index listing, `describe` and `createIndex`
 report `unkeyed` — how many documents the index holds that it could not
 key — and `explain` reports `unkeyedCandidates` beside `indexEntriesRead`,
 the entries a query read from the run. **That figure means this reason and no
