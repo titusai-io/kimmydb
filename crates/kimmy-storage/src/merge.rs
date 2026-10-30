@@ -227,7 +227,8 @@ impl Engine {
     /// its final form, the stored document with the incoming fields laid over it,
     /// known only inside the transaction that writes it, and is left to the write
     /// (an earlier chunk has then committed, as for any other failure in a later
-    /// chunk). A document that is kept, or discarded because it is unmatched, is
+    /// chunk). A document repeating the `_id` of an earlier output document that
+    /// the write inserts is matched by that insert, not an insert itself. A document that is kept, or discarded because it is unmatched, is
     /// never written and is not checked. Whether a document is matched is read
     /// here, ahead of the write; a writer that slips in between is an ordinary
     /// concurrent writer.
@@ -240,6 +241,10 @@ impl Engine {
         if coll.indexes.is_empty() {
             return Ok(());
         }
+        // Keys of the earlier output documents the write inserts: a later document
+        // with one of them finds that insert in the same transaction, so it is
+        // matched by it, as `stored_document` reads.
+        let mut inserted = std::collections::HashSet::new();
         for (position, doc) in docs.iter().enumerate() {
             let certain = match mode {
                 SinkMode::Insert => true,
@@ -248,10 +253,20 @@ impl Engine {
                     if replaces && insert_unmatched {
                         true
                     } else {
-                        let matched = match doc.get(ID_FIELD) {
-                            Some(value) => self.get(coll, &DocId::try_from_bson(value)?)?.is_some(),
-                            None => false,
+                        let key = match doc.get(ID_FIELD) {
+                            Some(value) => Some(doc_key(&DocId::try_from_bson(value)?)?),
+                            None => None,
                         };
+                        let matched = match (&key, doc.get(ID_FIELD)) {
+                            (Some(key), Some(value)) => {
+                                inserted.contains(key)
+                                    || self.get(coll, &DocId::try_from_bson(value)?)?.is_some()
+                            }
+                            _ => false,
+                        };
+                        if !matched && insert_unmatched {
+                            inserted.extend(key);
+                        }
                         if matched { replaces } else { insert_unmatched }
                     }
                 }

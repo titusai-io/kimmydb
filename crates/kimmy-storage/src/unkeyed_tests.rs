@@ -528,3 +528,200 @@ fn write_documents_refuses_an_unkeyable_output_before_its_first_chunk() {
     let keep = SinkMode::Merge { when_matched: WhenMatched::KeepExisting, insert_unmatched: true };
     assert_eq!(e.write_documents(&c, output(), keep).unwrap().counts.kept, 1);
 }
+
+/// An output document repeating the `_id` of an earlier one that the write
+/// inserts is matched by that insert inside the write. `keepExisting` keeps it,
+/// never writing it, so it is not checked (ADR-258).
+#[test]
+fn a_kept_output_document_repeating_an_earlier_id_is_not_checked() {
+    let (e, _d) = open();
+    e.create_collection("shop", "t").unwrap();
+    e.create_index("shop", "t", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "t").unwrap();
+    let output = vec![with_id(7, doc! { "a": 1, "b": 1 }), with_id(7, bad())];
+    let keep = SinkMode::Merge { when_matched: WhenMatched::KeepExisting, insert_unmatched: true };
+
+    // What the write alone does, a call each.
+    let (alone, _d2) = open();
+    alone.create_collection("shop", "t").unwrap();
+    alone.create_index("shop", "t", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let ac = alone.get_collection("shop", "t").unwrap();
+    assert_eq!(
+        alone.write_documents(&ac, vec![output[0].clone()], keep).unwrap().counts.inserted,
+        1
+    );
+    assert_eq!(alone.write_documents(&ac, vec![output[1].clone()], keep).unwrap().counts.kept, 1);
+
+    let counts = e.write_documents(&c, output, keep).unwrap().counts;
+    assert_eq!((counts.inserted, counts.kept), (1, 1));
+    assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 1);
+}
+
+/// Under the default merge the repeat is matched by the earlier insert, and is
+/// stored in its final form, known only inside the write: the up-front check
+/// leaves it to the write, whose refusal names no output position. `replace`
+/// stores the incoming document as it stands, and is refused up front.
+#[test]
+fn a_merged_output_document_repeating_an_earlier_id_is_left_to_the_write() {
+    let (e, _d) = open();
+    e.create_collection("shop", "t").unwrap();
+    e.create_index("shop", "t", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "t").unwrap();
+    let merge = SinkMode::Merge { when_matched: WhenMatched::Merge, insert_unmatched: true };
+    let output = vec![with_id(7, doc! { "a": 1, "b": 1 }), with_id(7, bad())];
+    let message = refusal(e.write_documents(&c, output.clone(), merge).unwrap_err());
+    assert!(message.contains("cannot index parallel arrays"), "{message}");
+    assert!(!message.contains("output document"), "refused by the write, not ahead: {message}");
+    assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 0, "one chunk, rolled back");
+
+    let replace = SinkMode::Merge { when_matched: WhenMatched::Replace, insert_unmatched: true };
+    let message = refusal(e.write_documents(&c, output, replace).unwrap_err());
+    assert!(message.ends_with("output document 1"), "{message}");
+}
+
+/// A document the stage discards as unmatched is never written, so a later
+/// document with its `_id` is unmatched too, and is not matched by it.
+#[test]
+fn a_discarded_output_document_does_not_match_a_later_one() {
+    let (e, _d) = open();
+    e.create_collection("shop", "t").unwrap();
+    e.create_index("shop", "t", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "t").unwrap();
+    let discard = SinkMode::Merge { when_matched: WhenMatched::Merge, insert_unmatched: false };
+    let output = vec![with_id(7, doc! { "a": 1, "b": 1 }), with_id(7, bad())];
+    assert_eq!(e.write_documents(&c, output, discard).unwrap().counts.discarded, 2);
+}
+
+#[test]
+fn write_documents_refuses_an_output_a_unique_index_cannot_key_before_its_first_chunk() {
+    let (e, _d) = open();
+    e.create_collection("shop", "t").unwrap();
+    e.create_index("shop", "t", fields(&["a", "b"]), true, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "t").unwrap();
+    e.set_multi_chunk_docs(2);
+    let output = || {
+        vec![
+            doc! { "_id": 1i64, "a": 1, "b": 1 },
+            doc! { "_id": 2i64, "a": 2, "b": 2 },
+            with_id(3, bad()),
+        ]
+    };
+    for mode in [
+        SinkMode::Insert,
+        SinkMode::Merge { when_matched: WhenMatched::Replace, insert_unmatched: true },
+    ] {
+        let message = refusal(e.write_documents(&c, output(), mode).unwrap_err());
+        assert!(message.contains("a unique index must be able to key every document"), "{message}");
+        assert!(message.ends_with("output document 2"), "{message}");
+        assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 0, "nothing was written");
+    }
+}
+
+#[test]
+fn a_rewind_keeps_the_report_of_a_filing_that_still_stands() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    e.create_index("shop", "c", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as u64;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Written elsewhere at now + 10, arriving here 200 ms later: its report is
+    // stamped above the target, the document's own stamp below it.
+    assert!(e.apply_remote(&c, &remote(&c, 5, now + 10, bad())).unwrap());
+    assert_eq!(events(&e).len(), 1);
+    let mut rx = e.subscribe();
+
+    e.rewind_to(Hlc::new(now + 50, 0)).unwrap();
+
+    let c = e.get_collection("shop", "c").unwrap();
+    assert_eq!(unkeyed_of(&e, &c), 1, "the document stands, unkeyed");
+    let named: Vec<(DocId, String)> = events(&e).into_iter().map(|d| (d.id, d.reason)).collect();
+    assert_eq!(named, vec![(DocId::Int64(5), "parallel_arrays".to_string())]);
+    let kinds: Vec<OpKind> = std::iter::from_fn(|| rx.try_recv().ok()).map(|x| x.kind).collect();
+    assert_eq!(kinds, vec![OpKind::UnkeyedDocument]);
+
+    // A second rewind to the same point does not pile reports up.
+    e.rewind_to(Hlc::new(now + 50, 0)).unwrap();
+    assert_eq!(events(&e).len(), 1);
+}
+
+#[test]
+fn a_rewind_does_not_re_announce_a_report_whose_document_is_gone_or_keyed() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    e.create_index("shop", "c", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as u64;
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(e.apply_remote(&c, &remote(&c, 5, now + 10, bad())).unwrap());
+    assert!(e.apply_remote(&c, &remote(&c, 6, now + 10, bad())).unwrap());
+    assert_eq!(events(&e).len(), 2);
+    // Document 5 is fixed and document 6 deleted, both at or below the target:
+    // neither is in the rewind's plan, and neither stands unkeyed.
+    let mut fixed = remote(&c, 5, now + 20, doc! { "a": 1, "b": 1 });
+    fixed.kind = OpKind::Replace;
+    assert!(e.apply_remote(&c, &fixed).unwrap());
+    let mut gone = remote(&c, 6, now + 30, doc! {});
+    gone.kind = OpKind::Delete;
+    gone.body = None;
+    assert!(e.apply_remote(&c, &gone).unwrap());
+    assert_eq!(unkeyed_of(&e, &c), 0);
+
+    e.rewind_to(Hlc::new(now + 50, 0)).unwrap();
+
+    let c = e.get_collection("shop", "c").unwrap();
+    assert_eq!(unkeyed_of(&e, &c), 0);
+    assert!(events(&e).is_empty(), "{:?}", events(&e));
+}
+
+#[test]
+fn the_parallel_arrays_message_names_the_path_when_one_path_holds_both_arrays() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    e.create_index("shop", "c", fields(&["x.a", "c"]), false, Some("xa_c".into())).unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    let message = refusal(
+        e.insert(&c, doc! { "_id": 1i64, "x": [{ "a": [1] }, { "a": [2] }], "c": 1 }).unwrap_err(),
+    );
+    assert!(message.contains("cannot index parallel arrays [x.a] [x.a]"), "{message}");
+    assert!(!message.contains('?'), "{message}");
+    // Two paths still name both, the later field first.
+    let (e, _d) = open();
+    let c = indexed(&e);
+    let message = refusal(e.insert(&c, with_id(2, bad())).unwrap_err());
+    assert!(message.contains("cannot index parallel arrays [b] [a]"), "{message}");
+}
+
+#[test]
+fn a_unique_refusal_and_a_refused_create_are_counted() {
+    let (e, _d) = open();
+    e.create_collection("shop", "u").unwrap();
+    e.create_index("shop", "u", fields(&["a", "b"]), true, Some("ab".into())).unwrap();
+    let u = e.get_collection("shop", "u").unwrap();
+    refusal(e.insert(&u, with_id(1, bad())).unwrap_err());
+    assert_eq!(e.unkeyed_refusals(), 1, "a unique index's refusal of a write");
+
+    // A refused local create is one refusal, however many documents it names.
+    e.create_collection("shop", "v").unwrap();
+    let v = e.get_collection("shop", "v").unwrap();
+    for i in 0..3 {
+        e.insert(&v, with_id(i, bad())).unwrap();
+    }
+    refusal(
+        e.create_index("shop", "v", fields(&["a", "b"]), false, Some("ab".into())).unwrap_err(),
+    );
+    assert_eq!(e.unkeyed_refusals(), 2, "a refused create of a non-unique index");
+    refusal(
+        e.create_index("shop", "v", fields(&["a", "b"]), true, Some("abu".into())).unwrap_err(),
+    );
+    assert_eq!(e.unkeyed_refusals(), 3, "a refused create of a unique index");
+
+    // A create that succeeds, and a rewind that files, count nothing.
+    e.create_collection("shop", "w").unwrap();
+    e.create_index("shop", "w", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    assert_eq!(e.unkeyed_refusals(), 3);
+}

@@ -301,12 +301,24 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
 /// enforced (ADR-185's undecidable run), so two documents `{email: "x",
 /// balance: Decimal128("10")}` under the filter `{balance: {$gt: 0}}` were
 /// both accepted; the second is refused now.
-fn unique_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
+///
+/// `refusing` is the engine that counts the refusal, for a local write; a rewind,
+/// which refuses a unique index as it always has, passes `None` and counts nothing.
+fn unique_keys(
+    refusing: Option<&crate::Engine>,
+    index: &IndexMeta,
+    doc: &Document,
+) -> Result<Vec<Vec<u8>>> {
     match document_keys(index, doc)? {
         DocumentKeys::Keyed { keys, .. } => Ok(keys),
-        DocumentKeys::Unkeyed { reason, .. } => Err(StorageError::Core(CoreError::InvalidQuery(
-            format!("{reason}; a unique index must be able to key every document it covers"),
-        ))),
+        DocumentKeys::Unkeyed { reason, .. } => {
+            if let Some(engine) = refusing {
+                engine.count_unkeyed_refusal();
+            }
+            Err(StorageError::Core(CoreError::InvalidQuery(format!(
+                "{reason}; a unique index must be able to key every document it covers"
+            ))))
+        }
     }
 }
 
@@ -342,7 +354,7 @@ pub(crate) fn check_keyable(
 ) -> Result<()> {
     for index in indexes {
         if index.unique {
-            unique_keys(index, doc)?;
+            unique_keys(Some(engine), index, doc)?;
         } else {
             refuse_unkeyed(engine, index, doc)?;
         }
@@ -359,7 +371,10 @@ fn refusal_message(index: &IndexMeta, doc: &Document, cause: UnkeyedCause, reaso
             let arrays = array_paths(index, doc);
             let (first, second) = match arrays.as_slice() {
                 [first, second, ..] => (first.as_str(), second.as_str()),
-                _ => ("?", "?"),
+                // One path that fans out through an array of documents holding
+                // arrays is the only array field: name it twice.
+                [only] => (only.as_str(), only.as_str()),
+                [] => ("?", "?"),
             };
             format!(
                 "cannot index parallel arrays [{second}] [{first}] (index {:?}, _id {id})",
@@ -457,7 +472,7 @@ fn maintain_local(
                 }
                 continue;
             }
-            for key in unique_keys(index, new)? {
+            for key in unique_keys(refuse.then_some(engine), index, new)? {
                 for holder in holders_of(&table, coll.id, index.id, &key)? {
                     if holder != doc_key {
                         return Err(StorageError::Core(CoreError::UniqueViolation {
@@ -1684,6 +1699,7 @@ impl crate::Engine {
                             // is built with the document filed unkeyed, as
                             // `maintain_remote` files one that arrives later.
                             if index.unique && matches!(origin, CreateOrigin::Local) {
+                                self.count_unkeyed_refusal();
                                 return Err(StorageError::Core(CoreError::InvalidQuery(format!(
                                     "{reason}; a unique index must be able to key every document \
                                  it covers, so it cannot be created"
@@ -1726,6 +1742,7 @@ impl crate::Engine {
                 }
 
                 if let Some(refusal) = refused.refusal(index) {
+                    self.count_unkeyed_refusal();
                     return Err(refusal);
                 }
 

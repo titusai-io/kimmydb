@@ -2035,7 +2035,7 @@ pub fn unkeyed_documents(
     let Some(definition) = meta.index(index) else {
         return Err(ApiError::not_found(format!("no index named {index:?} on {db}.{coll}")));
     };
-    let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = crate::validator::violations_limit(limit)?;
     let after = match cursor {
         Some(raw) => Some(kimmy_core::Cursor::decode(raw)?),
         None => None,

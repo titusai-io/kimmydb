@@ -416,9 +416,20 @@ impl Engine {
             let mut violations = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
             let mark_before = crate::live_count::mark_of(&arrival, &oplog)?;
             let mut discarded = VersionVector::new();
+            // The reports the trim removes: a document the rewind leaves alone
+            // can stand unkeyed with its only report above the target.
+            let mut trimmed_reports = Vec::new();
             for key in doomed {
                 if let Some(old) = oplog.remove(key.as_slice())? {
                     let header = codec::decode_oplog_kind_and_collection(old.value());
+                    if let Ok((kimmy_core::OpKind::UnkeyedDocument, collection)) = header {
+                        let report = codec::decode_oplog_entry(old.value())?;
+                        if let Some(body) = &report.body {
+                            let detail: kimmy_core::UnkeyedDocumentDetail =
+                                bson::deserialize_from_slice(body)?;
+                            trimmed_reports.push((collection, detail));
+                        }
+                    }
                     drop(old);
                     if let Ok((kimmy_core::OpKind::UniqueViolation, collection)) = header {
                         violations.remove(
@@ -432,6 +443,37 @@ impl Engine {
                 }
                 discarded.observe(codec::decode_oplog_key(&key)?);
                 outcome.oplog_discarded += 1;
+            }
+            // Re-announce the trimmed reports whose filing still stands: the
+            // document is stored, and its index still files it unkeyed, and the
+            // rewind has not announced it already. Without it a watcher that
+            // starts from the beginning never learns of a document that
+            // `GET .../unkeyed` lists.
+            for (collection, detail) in trimmed_reports {
+                let announced = unkeyed.iter().any(
+                    |(c, d): &(kimmy_core::CollectionId, kimmy_core::UnkeyedDocumentDetail)| {
+                        *c == collection && d.index == detail.index && d.id == detail.id
+                    },
+                );
+                if announced {
+                    continue;
+                }
+                let Some(meta) = collections.get(&collection.0) else { continue };
+                let Some(index) = meta.indexes.iter().find(|i| i.name == detail.index) else {
+                    continue;
+                };
+                let Some(raw) =
+                    docs.get((collection.0, crate::docs::doc_key(&detail.id)?.as_slice()))?
+                else {
+                    continue;
+                };
+                let Some(stored) = codec::decode_doc_record(raw.value())?.document()? else {
+                    continue;
+                };
+                drop(raw);
+                if let index::DocumentKeys::Unkeyed { .. } = index::document_keys(index, &stored)? {
+                    unkeyed.push((collection, detail));
+                }
             }
             if let Some(through) = crate::violations_table::through_of(&violations)? {
                 let tail = oplog.last()?.map(|(k, _)| k.value().to_vec());

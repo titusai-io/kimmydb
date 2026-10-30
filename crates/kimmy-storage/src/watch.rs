@@ -3686,6 +3686,64 @@ mod tests {
         );
     }
 
+    /// A member's report of a document it filed unkeyed is its own and no peer
+    /// serves it, so a resume token's vector covering its stamp says nothing of
+    /// whether the client was sent it: it is delivered, where the document write
+    /// the vector covers is passed over (ADR-173, ADR-258).
+    #[tokio::test]
+    async fn a_resume_whose_vector_covers_an_unkeyed_report_still_delivers_it() {
+        let (engine, _coll, _dir) = setup();
+        engine
+            .create_index(
+                "app",
+                "docs",
+                vec![
+                    crate::meta::IndexField::ascending("a"),
+                    crate::meta::IndexField::ascending("b"),
+                ],
+                false,
+                Some("ab".into()),
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let now = crate::physical_now_ms();
+        // Not covered by the token, and arriving first: where the resume starts.
+        engine.apply_remote(&coll, &remote_entry(&coll, "first", now - 10_000)).unwrap();
+        let mut unkeyed = remote_entry(&coll, "u", now - 9_000);
+        unkeyed.body =
+            Some(bson::serialize_to_vec(&doc! { "_id": "u", "a": [1, 2], "b": [3, 4] }).unwrap());
+        engine.apply_remote(&coll, &unkeyed).unwrap();
+        let report = newest_stamp(&engine);
+        assert_eq!(report.node, engine.node_id(), "the report is this member's own");
+
+        let mut delivered = VersionVector::new();
+        delivered.insert(unkeyed.stamp.node, unkeyed.stamp.hlc);
+        delivered.insert(report.node, report.hlc);
+        let token = ResumeToken::issued(report, NodeId::generate(), delivered);
+        let mut stream = engine
+            .watch(
+                WatchScope::Cluster,
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(400), stream.next(&engine)).await
+        {
+            if let ChangeEvent::Change { entry, .. } = event {
+                seen.push((entry.kind, entry.doc_id.clone()));
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (OpKind::Insert, Some(kimmy_core::DocId::String("first".into()))),
+                (OpKind::UnkeyedDocument, None)
+            ],
+            "the covered document write is passed over and its report is not"
+        );
+    }
+
     #[tokio::test]
     async fn a_seeded_retention_record_does_not_refuse_a_token_covering_a_quiet_origin() {
         let dir = tempfile::tempdir().unwrap();

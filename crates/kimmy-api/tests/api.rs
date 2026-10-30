@@ -13692,6 +13692,11 @@ async fn the_unkeyed_list_pages_is_read_gated_and_404s_for_an_unknown_index() {
         404
     );
     assert_eq!(server.get(&format!("{path}?bogus=1"), Some(&root)).await.status, 400);
+    // A page of no rows reports none: refused, naming the parameter, as the
+    // validator's violations are.
+    let zero = server.get(&format!("{path}?limit=0"), Some(&root)).await;
+    assert_eq!(zero.status, 400, "{:?}", zero.body);
+    assert!(zero.body["message"].as_str().unwrap().contains("`limit`"), "{:?}", zero.body);
 
     // `read` opens it, `watch` and `ddl` do not, and no token is a 401.
     for (user, actions, status) in [
@@ -19160,6 +19165,39 @@ async fn seed_unkeyable_third(server: &Server, token: &str) {
 
 fn by_id() -> Value {
     json!({"$sort": {"_id": 1}})
+}
+
+/// The same as `an_output_an_index_cannot_key_in_a_later_chunk_writes_nothing`
+/// over a unique index, which refuses in the same place.
+#[tokio::test]
+async fn an_output_a_unique_index_cannot_key_in_a_later_chunk_writes_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_unkeyable_third(&server, &token).await;
+    for target in ["t_out", "t_merge"] {
+        sink_seed(&server, &token, target, vec![]).await;
+        let index = server
+            .post(
+                &format!("/v1/db/shop/coll/{target}/indexes"),
+                Some(&token),
+                json!({"fields": [{"path": "a"}, {"path": "b"}], "unique": true}),
+            )
+            .await;
+        assert_eq!(index.status, 200, "{:?}", index.body);
+    }
+    server.state.engine.set_multi_chunk_docs(2);
+    let commits = server.state.engine.commits();
+    for (stage, target) in
+        [(json!({"$out": "t_out"}), "t_out"), (json!({"$merge": {"into": "t_merge"}}), "t_merge")]
+    {
+        let res = sink_run(&server, &token, "src", json!([by_id(), stage.clone()])).await;
+        assert_eq!(res.status, 400, "{stage}: {:?}", res.body);
+        assert_ne!(res.body["error"], "partially_applied", "{stage}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains("a unique index must be able to key"), "{stage}: {message}");
+        assert!(sink_dump(&server, &token, "shop", target).await.is_empty(), "{stage}");
+    }
+    assert_eq!(server.state.engine.commits(), commits, "nothing was committed");
 }
 
 #[tokio::test]

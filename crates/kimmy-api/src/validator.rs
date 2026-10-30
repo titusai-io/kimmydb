@@ -131,14 +131,14 @@ pub struct ViolationsQuery {
     cursor: Option<String>,
 }
 
-/// The page size asked for: `0` is refused rather than read as `1`, because a page of
-/// no violations cannot report any, and the specification declares `minimum: 1`; above
+/// The page size asked for by the violations and the unkeyed listings: `0` is refused rather than read as `1`, because a page of
+/// no rows cannot report any, and the specification declares `minimum: 1`; above
 /// the maximum is clamped, as documented.
-fn violations_limit(requested: Option<usize>) -> Result<usize, ApiError> {
+pub(crate) fn violations_limit(requested: Option<usize>) -> Result<usize, ApiError> {
     match requested {
         None => Ok(DEFAULT_LIMIT),
         Some(0) => Err(ApiError::bad_request(
-            "query parameter `limit` must be at least 1: a page of no violations reports none",
+            "query parameter `limit` must be at least 1: a page of no rows reports none",
         )),
         Some(n) => Ok(n.min(MAX_LIMIT)),
     }
