@@ -921,24 +921,19 @@ fn all_distinct(items: &[Bson]) -> bool {
 
 /// Whether `value` is a whole multiple of `divisor`, a number above zero.
 ///
-/// Exact when both are `int`, `long` or `decimal`. When either is a `double`
-/// both are read as doubles and the test is that the floating-point remainder
-/// (`fmod`) is zero, which is the reference's: `0.3` is not a multiple of
-/// `0.1` because neither is stored exactly. A value that is not finite is a
-/// multiple of nothing.
+/// Both numbers are read as decimals and the remainder is taken exactly, which is
+/// the reference's rule (it converts each side to a `Decimal128` and tests the
+/// remainder for zero). An `int`, a `long` and a `decimal` are read as they are. A
+/// `double` is first rounded to 15 significant decimal digits, the precision a
+/// double is reliably printed at, so `0.3` is a multiple of `0.1`, `19.99` of `0.01`
+/// and `4.35` of `0.05`, as they read on the page, though none of them is stored
+/// exactly in binary. A value that is not finite is a multiple of nothing; `0` is
+/// a multiple of every divisor.
+///
+/// Nothing here grows with the size of the numbers: a coefficient is at most 34
+/// digits and the exponents are only compared, so `1e300` against `0.5` is decided
+/// in a few operations (it is a multiple).
 fn is_multiple(value: &Bson, divisor: &Bson) -> bool {
-    let whole = |b: &Bson| match b {
-        Bson::Int32(n) => Some(i64::from(*n)),
-        Bson::Int64(n) => Some(*n),
-        _ => None,
-    };
-    if let (Some(v), Some(d)) = (whole(value), whole(divisor)) {
-        return v.checked_rem(d) == Some(0);
-    }
-    if matches!(value, Bson::Double(_)) || matches!(divisor, Bson::Double(_)) {
-        let (v, d) = (as_f64(value), as_f64(divisor));
-        return v.is_finite() && d.is_finite() && d > 0.0 && v % d == 0.0;
-    }
     let (Some((cv, ev)), Some((cd, ed))) = (decimal_parts(value), decimal_parts(divisor)) else {
         return false;
     };
@@ -951,22 +946,34 @@ fn is_multiple(value: &Bson, divisor: &Bson) -> bool {
     decimal_multiple(cv, ev, cd, ed)
 }
 
-fn as_f64(b: &Bson) -> f64 {
-    match b {
-        Bson::Int32(n) => f64::from(*n),
-        Bson::Int64(n) => *n as f64,
-        Bson::Double(d) => *d,
-        Bson::Decimal128(d) => f64::from_bits(decimal::arith::to_binary64(&decimal::decode_raw(d))),
-        _ => f64::NAN,
+/// A double as `coefficient * 10^exponent`, rounded to 15 significant digits, the
+/// way the reference converts one to a `Decimal128`; `None` for a `NaN` or an
+/// infinity. A zero is `(0, 0)`.
+fn double_parts(d: f64) -> Option<(u128, i32)> {
+    if !d.is_finite() {
+        return None;
     }
+    if d == 0.0 {
+        return Some((0, 0));
+    }
+    // `{:.14e}` is one digit, a point, fourteen digits, `e`, the decimal exponent:
+    // 15 significant digits, rounded from the exact binary value.
+    let text = format!("{:.14e}", d.abs());
+    let (mantissa, exponent) = text.split_once('e')?;
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let coefficient = digits.parse::<u128>().ok()?;
+    let exponent = exponent.parse::<i32>().ok()?;
+    Some((coefficient, exponent - 14))
 }
 
-/// The magnitude of an integer or a finite decimal as `coefficient *
-/// 10^exponent`, a zero as `(0, 0)`; `None` for a NaN or an infinity.
+/// The magnitude of a finite number as `coefficient * 10^exponent`, a zero as
+/// `(0, 0)`; `None` for a NaN, an infinity or a value that is not a number. A double
+/// is rounded first ([`double_parts`]).
 fn decimal_parts(b: &Bson) -> Option<(u128, i32)> {
     match b {
         Bson::Int32(n) => Some((u128::from(n.unsigned_abs()), 0)),
         Bson::Int64(n) => Some((u128::from(n.unsigned_abs()), 0)),
+        Bson::Double(d) => double_parts(*d),
         Bson::Decimal128(d) => match decimal::decode(d) {
             Decimal::Zero => Some((0, 0)),
             Decimal::Finite { coefficient, exponent, .. } => {

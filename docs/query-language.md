@@ -328,7 +328,7 @@ The dialect is draft-4 JSON Schema with `bsonType`, as other systems read it.
 | `minProperties` `maxProperties` | The number of properties |
 | `dependencies` | For a property that is present: an array of properties that must be too, or a schema the whole document must satisfy |
 | `minimum` `maximum` | Inclusive bounds on a number; with `exclusiveMinimum: true` or `exclusiveMaximum: true` beside it, exclusive. The flag needs its bound |
-| `multipleOf` | A number above zero. Exact for `int`, `long` and `Decimal128`; see below |
+| `multipleOf` | A number above zero. The remainder is taken exactly, a double read to 15 significant digits first; see below |
 | `minLength` `maxLength` | The length of a string in characters (code points) |
 | `pattern` | A string pattern, searched for in the value: `"b"` matches `"abc"`, `"^b$"` does not |
 | `items` | A schema for every element, or an array of schemas for the elements by position |
@@ -358,12 +358,16 @@ the list of names, and so on.
   comparison operators do: `{"minimum": 1}` accepts `Int32(1)`, `Double(1.0)`
   and `Decimal128("1.00")`; the double `0.1` is above the decimal `0.1`. A NaN
   sorts below every number, so it is below every `minimum` and under every `maximum`.
-- **`multipleOf`**: exact when the value and the divisor are `int`, `long` or
-  `Decimal128` (`Decimal128("0.30")` is a multiple of `Decimal128("0.1")`). When either
-  is a double, both are read as doubles and the test is that the floating-point
-  remainder (`fmod`) is zero, so the double `0.3` is **not** a multiple of the
-  double `0.1`: write the divisor and the values as decimals when exactness matters.
-  A NaN or infinity is a multiple of nothing.
+- **`multipleOf`**: both numbers are read as decimals and the remainder is taken
+  exactly. An `int`, a `long` and a `Decimal128` are read as they are
+  (`Decimal128("0.30")` is a multiple of `Decimal128("0.1")`; an `Int64` is never
+  read through a double). A double is first rounded to 15 significant decimal
+  digits, so the double `0.3` **is** a multiple of the double `0.1`, `19.99` of
+  `0.01` and `4.35` of `0.05`, as they read when written, and `0.35` is not a
+  multiple of `0.1`. A cents rule written with doubles therefore accepts every
+  price to the cent. A NaN or infinity is a multiple of nothing, and a huge double
+  such as `1e300` is a multiple of `0.5` (it is a whole number) and of nothing that
+  does not divide a power of ten.
 - **Limits.** A schema nests at most 32 levels (the outermost is level 1), a `400`
   beyond. Evaluation follows the schema, so a deeply nested document costs no more
   depth. `pattern` and `patternProperties` use the same engine and the same limits

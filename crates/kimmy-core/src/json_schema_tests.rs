@@ -277,23 +277,85 @@ fn multiple_of_is_exact_for_decimals() {
 }
 
 #[test]
-fn multiple_of_on_doubles_is_the_floating_point_remainder() {
-    let half = schema(doc! {"properties": {"v": {"multipleOf": 0.5}}});
-    assert!(half.is_valid(&doc! {"v": 2.5}));
-    assert!(half.is_valid(&doc! {"v": 3}));
-    assert!(!half.is_valid(&doc! {"v": 2.6}));
-    // Neither 0.3 nor 0.1 is stored exactly, so the double test says no.
-    let tenth = schema(doc! {"properties": {"v": {"multipleOf": 0.1}}});
-    assert!(!tenth.is_valid(&doc! {"v": 0.3}));
-    assert!(!tenth.is_valid(&doc! {"v": 0.5}));
-    let quarter = schema(doc! {"properties": {"v": {"multipleOf": 0.25}}});
-    assert!(quarter.is_valid(&doc! {"v": 0.75}));
-    let int_divisor = schema(doc! {"properties": {"v": {"multipleOf": 2}}});
-    assert!(int_divisor.is_valid(&doc! {"v": 4.0}));
-    assert!(!int_divisor.is_valid(&doc! {"v": 4.5}));
-    for odd in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        assert!(!half.is_valid(&doc! {"v": odd}), "{odd}");
+fn multiple_of_on_doubles_is_a_decimal_remainder_of_the_values_as_written() {
+    // A double is rounded to 15 significant digits and the remainder is exact, so
+    // the prices and the tenths read as they are written.
+    let multiple = |v: f64, d: f64| {
+        schema(doc! {"properties": {"v": {"multipleOf": d}}}).is_valid(&doc! {"v": v})
+    };
+    for (v, d) in [(0.3, 0.1), (19.99, 0.01), (4.35, 0.05), (1.1, 0.1), (0.75, 0.25), (2.5, 0.5)] {
+        assert!(multiple(v, d), "{v} against {d}");
     }
+    for (v, d) in [(0.35, 0.1), (7.0, 2.0), (2.6, 0.5), (0.5, 0.3), (19.995, 0.01)] {
+        assert!(!multiple(v, d), "{v} against {d}");
+    }
+    // Negative values and zero.
+    assert!(
+        multiple(-0.3, 0.1) && multiple(-19.99, 0.01) && multiple(0.0, 0.1) && multiple(-0.0, 0.1)
+    );
+    assert!(!multiple(-0.35, 0.1));
+    // A double against an integer divisor and the reverse.
+    let two = schema(doc! {"properties": {"v": {"multipleOf": 2}}});
+    assert!(two.is_valid(&doc! {"v": 4.0}) && two.is_valid(&doc! {"v": -6.0}));
+    assert!(!two.is_valid(&doc! {"v": 4.5}) && !two.is_valid(&doc! {"v": 7.0}));
+    let tenth = schema(doc! {"properties": {"v": {"multipleOf": 0.1}}});
+    assert!(tenth.is_valid(&doc! {"v": 3}) && tenth.is_valid(&doc! {"v": 3_i64}));
+    // A decimal against a double divisor is exact on its own side.
+    assert!(tenth.is_valid(&doc! {"v": dec("0.3")}));
+    assert!(!tenth.is_valid(&doc! {"v": dec("0.30000000000000000000000000000001")}));
+    // An Int64 past 2^53 is read exactly, not through a double.
+    let two_f = schema(doc! {"properties": {"v": {"multipleOf": 2.0}}});
+    assert!(!two_f.is_valid(&doc! {"v": 9_007_199_254_740_993_i64}));
+    assert!(two_f.is_valid(&doc! {"v": 9_007_199_254_740_992_i64}));
+    // A value that is not a number, or not finite, is a multiple of nothing.
+    for odd in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(!tenth.is_valid(&doc! {"v": odd}), "{odd}");
+        assert!(!two.is_valid(&doc! {"v": odd}), "{odd}");
+    }
+}
+
+#[test]
+fn every_price_to_the_cent_is_a_multiple_of_a_cent() {
+    let cent = schema(doc! {"properties": {"price": {"multipleOf": 0.01}}});
+    for cents in 1..=100_000_i64 {
+        // The nearest double to the price as written: what a client sends.
+        let price: f64 = format!("{}.{:02}", cents / 100, cents % 100).parse().unwrap();
+        assert!(cent.is_valid(&doc! {"price": price}), "{price}");
+    }
+    let tenth = schema(doc! {"properties": {"v": {"multipleOf": 0.1}}});
+    for tenths in 1..=1_000_i64 {
+        let v: f64 = format!("{}.{}", tenths / 10, tenths % 10).parse().unwrap();
+        assert!(tenth.is_valid(&doc! {"v": v}), "{v}");
+    }
+    // And a price between two cents is not.
+    for cents in (1..1_000_i64).step_by(7) {
+        let half: f64 = format!("{}.{:02}5", cents / 100, cents % 100).parse().unwrap();
+        assert!(!cent.is_valid(&doc! {"price": half}), "{half}");
+    }
+}
+
+#[test]
+fn multiple_of_on_huge_and_tiny_doubles_is_decided_without_allocating() {
+    let half = schema(doc! {"properties": {"v": {"multipleOf": 0.5}}});
+    let three = schema(doc! {"properties": {"v": {"multipleOf": 3.0}}});
+    // 1e300 reads as 1 followed by 300 zeros: a whole number, so a multiple of a half;
+    // not of three, which does not divide a power of ten.
+    assert!(half.is_valid(&doc! {"v": 1e300}));
+    assert!(!three.is_valid(&doc! {"v": 1e300}));
+    assert!(half.is_valid(&doc! {"v": f64::MAX}) && half.is_valid(&doc! {"v": -f64::MAX}));
+    // A divisor of 1e-300 against a value of 1: ten to the three hundredth times.
+    let tiny = schema(doc! {"properties": {"v": {"multipleOf": 1e-300}}});
+    assert!(tiny.is_valid(&doc! {"v": 1.0}) && tiny.is_valid(&doc! {"v": 1e-299}));
+    assert!(!tiny.is_valid(&doc! {"v": 1.5e-301}));
+    // The smallest subnormal reads as 4.94065645841247e-324: it is a multiple of itself
+    // and a whole number is not one (twice it reads 9.88131291682493e-324, rounded alone).
+    let denormal = schema(doc! {"properties": {"v": {"multipleOf": 5e-324}}});
+    assert!(denormal.is_valid(&doc! {"v": 5e-324}));
+    assert!(!denormal.is_valid(&doc! {"v": 1.0}));
+    assert!(!half.is_valid(&doc! {"v": 1e-300}));
+    assert!(half.is_valid(&doc! {"v": 0.0}));
+    let huge_divisor = schema(doc! {"properties": {"v": {"multipleOf": 1e300}}});
+    assert!(huge_divisor.is_valid(&doc! {"v": 3e300}) && !huge_divisor.is_valid(&doc! {"v": 1.0}));
 }
 
 // -- strings -----------------------------------------------------------------
