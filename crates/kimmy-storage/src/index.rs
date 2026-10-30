@@ -367,7 +367,7 @@ fn refusal_message(index: &IndexMeta, doc: &Document, cause: UnkeyedCause, reaso
             )
         }
         UnkeyedCause::TooManyKeys => format!(
-            "document would produce more than {MAX_KEYS_PER_DOCUMENT} index keys, the most one              document may have in an index (index {:?}, _id {id})",
+            "document would produce more than {MAX_KEYS_PER_DOCUMENT} index keys, the most one document may have in an index (index {:?}, _id {id})",
             index.name
         ),
         UnkeyedCause::Unencodable => format!("{reason} (_id {id})"),

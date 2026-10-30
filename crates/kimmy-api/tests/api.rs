@@ -19214,3 +19214,28 @@ async fn an_unkeyable_output_is_refused_ahead_of_a_non_empty_out_target() {
     let message = res.body["message"].as_str().unwrap_or_default();
     assert!(message.contains("cannot index parallel arrays"), "{message}");
 }
+
+#[tokio::test]
+async fn a_keyable_output_is_not_refused_by_the_index_check() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    // A whole array is a key as well as its elements: 999 elements is the most.
+    let at_cap: Vec<i64> = (0..999).collect();
+    sink_seed(
+        &server,
+        &token,
+        "src",
+        vec![
+            json!({"_id": 1, "a": [1, 2], "b": 3}),
+            json!({"_id": 2, "a": 1, "b": [3, 4]}),
+            json!({"_id": 3, "a": 7}),
+            json!({"_id": 4, "a": at_cap}),
+        ],
+    )
+    .await;
+    sink_indexed(&server, &token, "t", vec![]).await;
+    server.state.engine.set_multi_chunk_docs(2);
+    let res = sink_run(&server, &token, "src", json!([by_id(), {"$out": "t"}])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["out"]["inserted"], 4, "{:?}", res.body);
+}
