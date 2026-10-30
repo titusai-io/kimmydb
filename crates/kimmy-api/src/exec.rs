@@ -1581,6 +1581,13 @@ pub fn find_and_modify(
         Some(value) => Some(parse_update(value, &spec.array_filters)?),
         None => None,
     };
+    if let (Some(projection), Some(update), ReturnDocument::After) =
+        (positional, &update, spec.return_document)
+    {
+        // Said for the request, not for the data: a request that no document
+        // matches is refused as the one that some document matches would be.
+        projection.check_update(update)?;
+    }
 
     let now = now_millis();
 
