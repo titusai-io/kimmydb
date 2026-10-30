@@ -1703,6 +1703,35 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     assert_eq!(modified["document"]["items"][0]["shipped"], true, "{modified}");
     assert_eq!(modified["document"]["items"][1]["shipped"], true, "{modified}");
 
+    // The positional `$` (ADR-256), driven on both routes: the element the
+    // filter matched, and a `400` when it matched none.
+    let positional = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/find_and_modify",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(&root),
+            Some(json!({ "filter": { "_id": "lines", "items.sku": "gasket" },
+                         "update": { "$set": { "items.$.note": "first" } },
+                         "projection": { "items.$": 1 },
+                         "returnDocument": "after" })),
+            200,
+        )
+        .await;
+    assert_eq!(positional["document"]["items"].as_array().map(Vec::len), Some(1), "{positional}");
+    assert_eq!(positional["document"]["items"][0]["note"], "first", "{positional}");
+    c.check(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/update",
+        "/v1/db/shop/coll/orders/update",
+        Some(&root),
+        Some(
+            json!({ "filter": { "_id": "lines" }, "update": { "$set": { "items.$.note": "x" } } }),
+        ),
+        400,
+    )
+    .await;
+
     let by_id = "/v1/db/shop/coll/orders/docs/a";
     let by_id_t = "/v1/db/{db}/coll/{coll}/docs/{id}";
     c.check("GET", by_id_t, by_id, Some(&root), None, 200).await;

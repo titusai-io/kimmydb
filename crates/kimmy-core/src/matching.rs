@@ -42,8 +42,17 @@ pub fn exists(values: &[&Bson], want: bool) -> bool {
 /// single most surprising Mongo rule to get wrong.
 pub fn equals(values: &[&Bson], expected: &Bson) -> bool {
     match expected {
-        Bson::Null => values.is_empty() || any_element(values, |v| matches!(v, Bson::Null)),
-        expected => any_element(values, |v| canonical_cmp(v, expected) == Ordering::Equal),
+        Bson::Null => values.is_empty() || any_element(values, |v| value_equals(v, expected)),
+        expected => any_element(values, |v| value_equals(v, expected)),
+    }
+}
+
+/// Whether one value equals `expected`, with no look into it if it is an
+/// array: the predicate [`equals`] applies to each value and to each element.
+pub fn value_equals(value: &Bson, expected: &Bson) -> bool {
+    match expected {
+        Bson::Null => matches!(value, Bson::Null),
+        expected => canonical_cmp(value, expected) == Ordering::Equal,
     }
 }
 
@@ -53,5 +62,11 @@ pub fn equals(values: &[&Bson], expected: &Bson) -> bool {
 /// Comparisons only apply within a type group; Mongo does not report that a
 /// string is greater than a number, and neither does this.
 pub fn compares(values: &[&Bson], bound: &Bson, accept: &[Ordering]) -> bool {
-    any_element(values, |v| same_type_group(v, bound) && accept.contains(&canonical_cmp(v, bound)))
+    any_element(values, |v| value_compares(v, bound, accept))
+}
+
+/// Whether one value orders as `accept` says against `bound`: the predicate
+/// [`compares`] applies to each value and to each element.
+pub fn value_compares(value: &Bson, bound: &Bson, accept: &[Ordering]) -> bool {
+    same_type_group(value, bound) && accept.contains(&canonical_cmp(value, bound))
 }

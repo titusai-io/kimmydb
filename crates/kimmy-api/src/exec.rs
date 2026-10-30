@@ -303,9 +303,10 @@ pub fn find(
         None => Vec::new(),
     };
     let projection = match &params.projection {
-        Some(v) => shape::parse_projection(&json_to_document(v)?)?,
+        Some(v) => shape::parse_find_projection(&json_to_document(v)?)?,
         None => None,
     };
+    refuse_positional_without_filter(projection.as_ref(), &filter)?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let skip = params.skip.unwrap_or(0);
 
@@ -382,16 +383,17 @@ pub fn find(
             // feed a stable sort — so the page is the one the full sort gave,
             // whatever order the matches arrive in.
             let order = with_id_tiebreak(&sort);
-            let mut top = TopK::new(window, &order, projection.as_ref());
+            let mut top = TopK::new(window, &order, projection.as_ref(), &filter);
             let stats = visit_matching(state, &meta, &filter, Order::Any, None, |stamp, doc| {
                 top.offer(stamp, doc);
             })?;
             // The window shaped `skip + limit` documents and `skip` of them
-            // are dropped here. Nothing cheaper is available: which matches
-            // the offset steps over is not known until the sort is done, and
-            // the alternative — holding stored documents and projecting the
-            // survivors — is the thing this record is about.
-            let (stamps, docs) = top.into_sorted().into_iter().skip(skip).unzip();
+            // are dropped here, with any refusal they hold. Nothing cheaper
+            // is available: which matches the offset steps over is not known
+            // until the sort is done, and the alternative — holding stored
+            // documents and projecting the survivors — is the thing this
+            // record is about.
+            let (stamps, docs) = top.into_sorted(skip)?.into_iter().unzip();
             (stamps, docs, stats)
         } else {
             // What is skipped is counted past, not held — and not shaped
@@ -399,6 +401,7 @@ pub fn find(
             // so this path knows a match is skipped before it would project
             // it, and projects exactly the documents the page returns.
             let mut seen = 0usize;
+            let mut refused: Option<ApiError> = None;
             let (mut stamps, mut docs) = (Vec::new(), Vec::new());
             let stats = visit_matching(
                 state,
@@ -412,18 +415,29 @@ pub fn find(
                         if continuable {
                             last_id = doc.get(kimmy_storage::ID_FIELD).cloned();
                         }
-                        stamps.push(stamp);
                         // Moved rather than shaped when there is no
                         // projection: `shape::project(None, ..)` is a clone,
                         // and an unprojected page has no reason to copy the
                         // document it was handed.
-                        docs.push(match projection.as_ref() {
-                            None => doc,
-                            Some(projection) => shape::project(Some(projection), &doc),
-                        });
+                        let shaped = match projection.as_ref() {
+                            None => Ok(doc),
+                            Some(projection) => projection.project(&filter, &doc),
+                        };
+                        match shaped {
+                            Ok(shaped) => {
+                                stamps.push(stamp);
+                                docs.push(shaped);
+                            }
+                            Err(e) => {
+                                refused.get_or_insert(e.into());
+                            }
+                        }
                     }
                 },
             )?;
+            if let Some(e) = refused {
+                return Err(e);
+            }
             (stamps, docs, stats)
         };
 
@@ -506,7 +520,9 @@ fn with_id_tiebreak(sort: &[shape::SortKey]) -> Vec<shape::SortKey> {
 struct TopK<'a> {
     n: usize,
     order: &'a [shape::SortKey],
-    projection: Option<&'a shape::Projection>,
+    projection: Option<&'a shape::FindProjection>,
+    /// The filter the matches satisfied, which a positional projection reads.
+    filter: &'a filter::Filter,
     heap: std::collections::BinaryHeap<Ranked<'a>>,
 }
 
@@ -515,7 +531,11 @@ struct Ranked<'a> {
     order: &'a [shape::SortKey],
     stamp: kimmy_core::Stamp,
     keys: Vec<bson::Bson>,
-    doc: bson::Document,
+    /// The shaped document, or why it cannot be shaped. A refusal is held with
+    /// the match it belongs to and raised only if that match is on the page
+    /// (`TopK::into_sorted`): a document the window drops, or that `skip`
+    /// steps over, is never shown to the caller, so it is not judged.
+    doc: Result<bson::Document, kimmy_core::Error>,
 }
 
 impl Ord for Ranked<'_> {
@@ -542,12 +562,14 @@ impl<'a> TopK<'a> {
     fn new(
         n: usize,
         order: &'a [shape::SortKey],
-        projection: Option<&'a shape::Projection>,
+        projection: Option<&'a shape::FindProjection>,
+        filter: &'a filter::Filter,
     ) -> Self {
         Self {
             n,
             order,
             projection,
+            filter,
             heap: std::collections::BinaryHeap::with_capacity(n.min(MAX_LIMIT) + 1),
         }
     }
@@ -572,15 +594,25 @@ impl<'a> TopK<'a> {
         // `shape::project(None, ..)` is a clone, and the window may as well
         // hold the document it was handed.
         let doc = match self.projection {
-            None => doc,
-            Some(projection) => shape::project(Some(projection), &doc),
+            None => Ok(doc),
+            Some(projection) => projection.project(self.filter, &doc),
         };
         self.heap.push(Ranked { order: self.order, stamp, keys, doc });
     }
 
-    /// Everything held, least first.
-    fn into_sorted(self) -> Vec<(kimmy_core::Stamp, bson::Document)> {
-        self.heap.into_sorted_vec().into_iter().map(|r| (r.stamp, r.doc)).collect()
+    /// The page: everything held, least first, after `skip`. A projection
+    /// refused for a document on the page is the request's error; one refused
+    /// for a document the page does not hold is not.
+    fn into_sorted(
+        self,
+        skip: usize,
+    ) -> Result<Vec<(kimmy_core::Stamp, bson::Document)>, ApiError> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .skip(skip)
+            .map(|r| r.doc.map(|doc| (r.stamp, doc)).map_err(ApiError::from))
+            .collect()
     }
 }
 
@@ -1263,6 +1295,7 @@ pub fn update(
         upsert: None,
         now: now_millis(),
         expected,
+        answer: None,
     };
     // A scan's candidates, and a multikey range's fallback, are the whole
     // collection walked in the write transaction: off the async worker
@@ -1288,6 +1321,23 @@ pub fn update(
 fn parse_update(update_json: &Value, array_filters: &[Value]) -> Result<update::Update, ApiError> {
     let filters = array_filters.iter().map(json_to_document).collect::<Result<Vec<_>, _>>()?;
     Ok(update::parse_with_filters(&json_to_document(update_json)?, &filters)?)
+}
+
+/// A positional projection names the element a filter matched, so a request
+/// with no filter has none to name (ADR-256).
+fn refuse_positional_without_filter(
+    projection: Option<&shape::FindProjection>,
+    filter: &filter::Filter,
+) -> Result<(), ApiError> {
+    if projection.is_some_and(shape::FindProjection::is_positional)
+        && matches!(filter, filter::Filter::AlwaysTrue)
+    {
+        return Err(ApiError::bad_request(
+            "a positional projection (`<array>.$`) needs a filter that matches an element of \
+             that array; this request has none",
+        ));
+    }
+    Ok(())
 }
 
 /// The stamp a filtered write produced, when there is exactly one to report.
@@ -1376,10 +1426,31 @@ struct Modify<'a> {
     sort: &'a [shape::SortKey],
     /// `None` means remove.
     update: Option<&'a update::Update>,
-    upsert: Option<Document>,
+    upsert: Option<std::result::Result<Document, String>>,
     now: i64,
     /// The version the write is conditional on, if any.
     expected: Option<kimmy_core::Stamp>,
+    /// A `findAndModify`'s positional projection and the image it answers
+    /// with. Checked in `apply`, where a refusal writes nothing.
+    answer: Option<(&'a shape::FindProjection, ReturnDocument)>,
+}
+
+impl Modify<'_> {
+    /// Refuse a positional projection that cannot name an element of
+    /// `answered`, the image the request returns, before anything is written.
+    fn check_answer(
+        &self,
+        matched: &Document,
+        answered: &Document,
+    ) -> std::result::Result<(), String> {
+        if let Some((projection, _)) = self.answer {
+            projection.project_returned(self.filter, matched, answered).map_err(|e| match e {
+                kimmy_core::Error::InvalidQuery(reason) => reason,
+                other => other.to_string(),
+            })?;
+        }
+        Ok(())
+    }
 }
 
 impl kimmy_storage::ModifySpec for Modify<'_> {
@@ -1397,21 +1468,34 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
 
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
         let Some(update) = self.update else {
+            // A removal answers with the document as it was.
+            self.check_answer(doc, doc)?;
             return Ok(None);
         };
         let mut next = doc.clone();
         // The engine reports this string as an `InvalidQuery`, so a refusal
         // that already is one gives its reason alone, rather than
         // `invalid query: invalid query: …`.
-        update::apply(update, &mut next, self.now).map_err(|e| match e {
+        update::apply_matched(update, self.filter, &mut next, self.now).map_err(|e| match e {
             kimmy_core::Error::InvalidQuery(reason) => reason,
             other => other.to_string(),
         })?;
+        let answered = match self.answer {
+            Some((projection, ReturnDocument::After)) => {
+                projection.check_update(update).map_err(|e| match e {
+                    kimmy_core::Error::InvalidQuery(reason) => reason,
+                    other => other.to_string(),
+                })?;
+                &next
+            }
+            _ => doc,
+        };
+        self.check_answer(doc, answered)?;
         Ok(Some(next))
     }
 
     fn upsert(&self) -> Option<std::result::Result<Document, String>> {
-        self.upsert.clone().map(Ok)
+        self.upsert.clone()
     }
 }
 
@@ -1478,13 +1562,32 @@ pub fn find_and_modify(
         None => Vec::new(),
     };
     let projection = match &spec.projection {
-        Some(value) => shape::parse_projection(&json_to_document(value)?)?,
+        Some(value) => shape::parse_find_projection(&json_to_document(value)?)?,
         None => None,
     };
+    refuse_positional_without_filter(projection.as_ref(), &filter)?;
+    let positional = projection.as_ref().filter(|p| p.is_positional());
+    if positional.is_some() && spec.upsert && spec.return_document == ReturnDocument::After {
+        // An upsert may insert, and the inserted document has no element the
+        // filter matched. Said for the request, not for the data, so that a
+        // request is refused or accepted whatever the collection holds.
+        return Err(ApiError::bad_request(
+            "a positional projection `<array>.$` cannot be used with `upsert` and returnDocument \
+             \"after\": an upsert may insert a document, and an inserted document has no matched \
+             element",
+        ));
+    }
     let update = match &spec.update {
         Some(value) => Some(parse_update(value, &spec.array_filters)?),
         None => None,
     };
+    if let (Some(projection), Some(update), ReturnDocument::After) =
+        (positional, &update, spec.return_document)
+    {
+        // Said for the request, not for the data: a request that no document
+        // matches is refused as the one that some document matches would be.
+        projection.check_update(update)?;
+    }
 
     let now = now_millis();
 
@@ -1493,10 +1596,24 @@ pub fn find_and_modify(
     let upsert_doc = if spec.upsert {
         let mut seed = Document::new();
         implied_equalities(&filter, &mut seed);
-        if let Some(update) = &update {
-            update::apply_on_insert(update, &mut seed, now)?;
+        match &update {
+            // A `$` has no matched element in a document that is inserted.
+            // It is said only if nothing matches: a document that does is
+            // updated, and the position is its own.
+            Some(update) if update.uses_matched_position() => {
+                Some(update::apply_on_insert(update, &mut seed, now).map(|()| seed).map_err(|e| {
+                    match e {
+                        kimmy_core::Error::InvalidUpdate(reason) => reason,
+                        other => other.to_string(),
+                    }
+                }))
+            }
+            Some(update) => {
+                update::apply_on_insert(update, &mut seed, now)?;
+                Some(Ok(seed))
+            }
+            None => Some(Ok(seed)),
         }
-        Some(seed)
     } else {
         None
     };
@@ -1519,6 +1636,7 @@ pub fn find_and_modify(
         upsert: upsert_doc,
         now,
         expected,
+        answer: positional.map(|p| (p, spec.return_document)),
     };
 
     // As `update`'s: a scan walks the collection in the write transaction
@@ -1530,8 +1648,20 @@ pub fn find_and_modify(
         ReturnDocument::Before => outcome.before.clone(),
         ReturnDocument::After => outcome.after.clone(),
     };
+    // A positional projection reads the element the filter matched in the
+    // document it matched, which is the image from before the write. It was
+    // checked against the image to return before the write, so it holds here.
     let document = match returned {
-        Some(doc) => document_to_json(&shape::project(projection.as_ref(), &doc)),
+        Some(doc) => {
+            let shaped = match projection.as_ref() {
+                None => doc,
+                Some(projection) => {
+                    let matched = outcome.before.as_ref().unwrap_or(&doc);
+                    projection.project_returned(&filter, matched, &doc)?
+                }
+            };
+            document_to_json(&shaped)
+        }
         None => Value::Null,
     };
 
@@ -1595,6 +1725,7 @@ pub fn delete(
         upsert: None,
         now: now_millis(),
         expected,
+        answer: None,
     };
     // A scan's candidates, and a multikey range's fallback, are the whole
     // collection walked in the write transaction: off the async worker
@@ -3323,14 +3454,15 @@ mod tests {
                     .collect();
 
                 let order = with_id_tiebreak(&sort);
-                let mut top = TopK::new(skip + limit, &order, None);
+                let all = filter::Filter::AlwaysTrue;
+                let mut top = TopK::new(skip + limit, &order, None, &all);
                 for (stamp, doc) in scrambled.iter().cloned() {
                     top.offer(stamp, doc);
                 }
                 let got: Vec<i64> = top
-                    .into_sorted()
+                    .into_sorted(skip)
+                    .unwrap()
                     .into_iter()
-                    .skip(skip)
                     .map(|(_, d)| d.get_i64("_id").unwrap())
                     .collect();
                 assert_eq!(got, expected, "sort {spec:?}, skip {skip}, limit {limit}");
@@ -4096,11 +4228,11 @@ mod tests {
         let (all, _) = collect_matching_stamped_after(&state, &meta, &filter, None, None).unwrap();
 
         let order = with_id_tiebreak(&[]);
-        let mut top = TopK::new(0, &order, None);
+        let mut top = TopK::new(0, &order, None, &filter);
         for (stamp, doc) in all {
             top.offer(stamp, doc);
         }
-        assert!(top.into_sorted().is_empty());
+        assert!(top.into_sorted(0).unwrap().is_empty());
     }
 
     #[test]
@@ -4463,3 +4595,77 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod positional_answer {
+    //! `Modify::apply` under a positional projection (ADR-256): the update is
+    //! refused before it is returned unless it is confined to the matched
+    //! element or to unrelated fields, and a refusal returns no document to
+    //! write.
+
+    use super::*;
+    use bson::doc;
+    use kimmy_storage::ModifySpec;
+
+    fn apply(
+        filter: Document,
+        update: Document,
+        after: ReturnDocument,
+        stored: &Document,
+    ) -> std::result::Result<Option<Document>, String> {
+        let filter = filter::parse(&filter).unwrap();
+        let update = update::parse(&update).unwrap();
+        let projection = shape::parse_find_projection(&doc! { "items.$": 1 }).unwrap().unwrap();
+        let modify = Modify {
+            filter: &filter,
+            sort: &[],
+            update: Some(&update),
+            upsert: None,
+            now: 0,
+            expected: None,
+            answer: Some((&projection, after)),
+        };
+        modify.apply(stored)
+    }
+
+    fn stored() -> Document {
+        doc! { "_id": 1, "n": 0, "items": [ { "sku": "a", "qty": 1 }, { "sku": "b", "qty": 2 } ] }
+    }
+
+    #[test]
+    fn an_update_that_writes_the_array_or_a_parent_is_refused_for_after() {
+        let f = doc! { "items.sku": "b" };
+        for update in [
+            doc! { "$set": { "items": [ { "sku": "b" }, { "sku": "a" } ] } },
+            doc! { "$push": { "items": { "$each": [], "$sort": { "sku": -1 } } } },
+            doc! { "$pull": { "items": { "sku": "a" } } },
+            doc! { "$push": { "items": { "sku": "c" } } },
+            doc! { "$set": { "items.0.sku": "z" } },
+            doc! { "$set": { "items.$[].qty": 0 } },
+        ] {
+            let err = apply(f.clone(), update.clone(), ReturnDocument::After, &stored())
+                .expect_err(&format!("{update}"));
+            assert!(err.contains("cannot name an element"), "{update}: {err}");
+            // The same update answers with the image from before.
+            assert!(
+                apply(f.clone(), update.clone(), ReturnDocument::Before, &stored()).is_ok(),
+                "{update}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_update_confined_to_the_matched_element_or_other_fields_is_applied() {
+        let f = doc! { "items.sku": "b" };
+        for update in [
+            doc! { "$inc": { "items.$.qty": 5 } },
+            doc! { "$set": { "n": 1 } },
+            doc! { "$inc": { "items.$.qty": 5 }, "$set": { "n": 1 } },
+        ] {
+            let next = apply(f.clone(), update.clone(), ReturnDocument::After, &stored())
+                .unwrap_or_else(|e| panic!("{update}: {e}"))
+                .expect("a document");
+            assert_ne!(next, stored(), "{update}");
+        }
+    }
+}

@@ -7,7 +7,9 @@ use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::filter::{self, ArrayPosition, Filter};
 use crate::path;
+use crate::update::Update;
 
 /// The `_id` field, which projection treats specially.
 pub(crate) const ID_FIELD: &str = "_id";
@@ -227,6 +229,210 @@ pub fn parse_projection(doc: &Document) -> Result<Option<Projection>> {
         return Ok(Some(Projection::Include(include.into())));
     }
     Ok(Some(Projection::Exclude(exclude.into())))
+}
+
+/// A find's projection: the ordinary one, and when `{"items.$": 1}` was
+/// written, the array whose matched element is all that is kept (ADR-256).
+///
+/// `$` is a find feature. [`parse_projection`], which `$project` also uses,
+/// still reads `items.$` as a field called `$`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FindProjection {
+    projection: Projection,
+    /// The array path of the one `<array>.$` entry, when there is one.
+    positional: Option<String>,
+}
+
+impl FindProjection {
+    /// Whether the projection asks for the matched element, and so needs the
+    /// filter that matched the document.
+    pub fn is_positional(&self) -> bool {
+        self.positional.is_some()
+    }
+
+    /// The projection with no positional entry.
+    pub fn plain(&self) -> Option<&Projection> {
+        self.positional.is_none().then_some(&self.projection)
+    }
+
+    /// Shape `doc`, which `filter` matched. A positional projection keeps only
+    /// the element the filter matched in its array.
+    pub fn project(&self, filter: &Filter, doc: &Document) -> Result<Document> {
+        let Some(array) = &self.positional else {
+            return Ok(project(Some(&self.projection), doc));
+        };
+        let (_, at) = filter::matches_at(filter, doc)?;
+        self.project_at(at.as_ref(), doc, array)
+    }
+
+    /// The array path of a positional projection, `None` for an ordinary one.
+    pub fn positional_array(&self) -> Option<&str> {
+        self.positional.as_deref()
+    }
+
+    /// Whether `update` may run under this projection when the request
+    /// returns the image from after the write (ADR-256).
+    ///
+    /// The element is the one the filter matched in the document as it was,
+    /// at the same index in the document returned, so the index must still
+    /// name that element. Only an update confined to the matched element
+    /// through `$` (`items.$.qty`), or to fields unrelated to the array, keeps
+    /// that true. An update that writes the array, an ancestor of it, or a
+    /// descendant of it not reached through `$` (`items.0.qty`,
+    /// `items.$[].qty`) is refused.
+    pub fn check_update(&self, update: &Update) -> Result<()> {
+        let Some(array) = &self.positional else {
+            return Ok(());
+        };
+        if matches!(update, Update::Replace(_)) {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ cannot name an element of the document \
+                 after a replacement, which replaces every element. Use returnDocument \
+                 \"before\""
+            )));
+        }
+        match update.first_write_outside_matched(array) {
+            None => Ok(()),
+            Some(written) => Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ cannot name an element of the document \
+                 after the update: the update writes {written:?}, which is {array:?}, a parent \
+                 of it, or inside it other than through `$`. Use returnDocument \"before\", or \
+                 an update confined to {array:?}.$ or to other fields"
+            ))),
+        }
+    }
+
+    /// Shape `returned`, a `findAndModify` answer, when `matched` is the image
+    /// the filter matched. The element is the one the filter matched in
+    /// `matched`, at the same index in `returned`.
+    ///
+    /// `returned` is `matched` for the image from before the write. For the
+    /// image from after it, [`FindProjection::check_update`] has refused the
+    /// updates that could move the index off the matched element; an index
+    /// past the end of the array is still refused here, never answered with the
+    /// whole array.
+    ///
+    /// Run inside the write transaction, where `Err` writes nothing.
+    pub fn project_returned(
+        &self,
+        filter: &Filter,
+        matched: &Document,
+        returned: &Document,
+    ) -> Result<Document> {
+        let Some(array) = &self.positional else {
+            return Ok(project(Some(&self.projection), returned));
+        };
+        let (_, at) = filter::matches_at(filter, matched)?;
+        self.project_at(at.as_ref(), returned, array)
+    }
+
+    fn project_at(
+        &self,
+        at: Option<&ArrayPosition>,
+        doc: &Document,
+        array: &str,
+    ) -> Result<Document> {
+        let at = self.check_position(at, array)?;
+        let kept = match path::resolve(doc, array).first() {
+            Some(Bson::Array(items)) => items.get(at.index),
+            _ => None,
+        };
+        // The position was found in a document with this array, so the
+        // element is there; anything else is refused rather than answered
+        // with the whole array.
+        let Some(kept) = kept else {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ found no element at index {} of \
+                 {array:?}",
+                at.index
+            )));
+        };
+        let mut narrowed = doc.clone();
+        path::set(&mut narrowed, array, Bson::Array(vec![kept.clone()]))
+            .map_err(Error::InvalidQuery)?;
+        Ok(project(Some(&self.projection), &narrowed))
+    }
+
+    /// The position, when the filter matched an element of `array`.
+    fn check_position<'a>(
+        &self,
+        at: Option<&'a ArrayPosition>,
+        array: &str,
+    ) -> Result<&'a ArrayPosition> {
+        let Some(at) = at else {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ needs the query to have matched an \
+                 element of that array (the filter must match on an array field)"
+            )));
+        };
+        if at.path != array {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ names an array the query did not match \
+                 on: it matched an element of {:?}",
+                at.path
+            )));
+        }
+        Ok(at)
+    }
+}
+
+/// Parse a find's projection, which may carry one `<array>.$: 1` entry.
+///
+/// The entry must be an inclusion at the end of a path, alone for its array:
+/// `items.$.sku` is not a path, `items.$: 0` excludes nothing a projection
+/// could keep, and `items` or `items.sku` beside `items.$` would name the same
+/// array twice. The refusals of [`parse_projection`] stand, so an exclusion
+/// beside it is the mix of both kinds it already refuses. A filter that is
+/// empty cannot have matched an element, so [`FindProjection::project`] has
+/// nothing to keep for it; the caller says so before reading any document.
+pub fn parse_find_projection(doc: &Document) -> Result<Option<FindProjection>> {
+    let positional: Vec<&String> =
+        doc.keys().filter(|path| path::segments(path).contains(&"$")).collect();
+    let Some(entry) = positional.first() else {
+        return Ok(parse_projection(doc)?
+            .map(|projection| FindProjection { projection, positional: None }));
+    };
+    let refuse =
+        |why: &str| Err(Error::InvalidQuery(format!("positional projection {entry:?}: {why}")));
+    if positional.len() > 1 {
+        return refuse("a projection may have one `$` entry");
+    }
+    let segments = path::segments(entry);
+    if segments.last() != Some(&"$") || segments.iter().filter(|s| **s == "$").count() > 1 {
+        return refuse("`$` is valid only as the last segment of a path, as in `items.$`");
+    }
+    if segments.len() == 1 {
+        return refuse("`$` must follow the path of an array");
+    }
+    if !matches!(&doc[entry.as_str()], v if is_inclusion_flag(v)) {
+        return refuse("the value must be 1, because `$` includes the matched element");
+    }
+    let array = segments[..segments.len() - 1].join(".");
+    for other in doc.keys().filter(|k| *k != *entry) {
+        let (a, b) = (path::segments(other), path::segments(&array));
+        if a.starts_with(&b) || b.starts_with(&a) {
+            return refuse("the array is also named by another projection entry");
+        }
+    }
+    let mut named = doc.clone();
+    named.remove(entry.as_str());
+    named.insert(array.clone(), 1);
+    // The entry is an inclusion, so a mix with an exclusion is the refusal
+    // `parse_projection` already makes.
+    let projection = parse_projection(&named)?.expect("one entry was kept");
+    Ok(Some(FindProjection { projection, positional: Some(array) }))
+}
+
+/// Whether a projection value includes, as [`parse_projection`] reads it.
+fn is_inclusion_flag(flag: &Bson) -> bool {
+    match flag {
+        Bson::Int32(n) => *n != 0,
+        Bson::Int64(n) => *n != 0,
+        Bson::Double(d) => *d != 0.0,
+        Bson::Boolean(b) => *b,
+        Bson::Decimal128(d) => kimmy_core::decimal::decode(d) != kimmy_core::decimal::Decimal::Zero,
+        _ => false,
+    }
 }
 
 /// Apply a projection, returning the reshaped document.
