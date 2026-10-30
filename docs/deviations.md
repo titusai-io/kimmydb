@@ -21,7 +21,7 @@ Status meanings:
 
 **Raised 2026-10-29, with ADR-257 part 2.** A collection's validator ([validation.md](validation.md)) is replicated metadata and a guard on client writes. A leaderless cluster cannot make a schema change atomic, and a replicated write is never refused, so two gaps are accepted as the price:
 
-- **A member that has not yet received the validator (or its change) accepts a write the validator would refuse.** The window is the time the change takes to reach that member; a collection created with a validator has it too, because the validator is its own entry after the creation's.
+- **A member that has not yet received the validator (or its change) accepts a write the validator would refuse.** The window is the time the change takes to reach that member. A collection created with a validator is one replicated entry that carries the validator, so a member that applies the creation holds the collection and the validator together; the one gap left is a member that made the same name itself before the entry reached it, which holds that collection without the validator, and accepts what it forbids, until the creation entry arrives (the validator then applies by its stamp).
 - **A document accepted that way replicates to members that hold the validator, and is kept.** Replication, a snapshot page, a repair, a catch-up and a restore are never validated, and a change of the validator does not re-examine what is stored, so a collection can hold documents that fail its validator. `GET …/validator/violations` lists them, by a scan of the member that answers.
 
 Also recorded here, so they are not read as bugs:

@@ -59,8 +59,9 @@ curl -XDELETE localhost:7878/v1/db/shop/coll/orders/validator -H "$A"
   learns the validator is gone.
 - `GET …/describe` shows `validator` (`null` when there is none) and, with one,
   `validationAction` and `validationLevel`.
-- Creating with a validator is the creation and then the same change `PUT` makes,
-  as two replicated entries. The schema is parsed first, so a bad one creates
+- Creating with a validator is one replicated entry: the creation carries the
+  validator, and a member that applies it creates the collection and sets the
+  validator in one commit. The schema is parsed first, so a bad one creates
   nothing.
 
 ## What it checks
@@ -131,9 +132,12 @@ validator is a guard and not an invariant:
 1. **A member that has not received the change accepts a write the validator would
    refuse.** Between `PUT` on one member and its arrival on another, the other
    accepts documents the new schema forbids. A collection created with a validator
-   has no such gap on a member that applies its `CreateCollection` entry, which
-   creates both together; a member that has not yet received the entry does not
-   hold the collection.
+   is one entry, so a member that applies its `CreateCollection` entry holds the
+   collection and the validator together, and a member that has not received the
+   entry does not hold the collection. The gap that remains is a member that
+   created the same name itself before the entry arrived: it holds that collection
+   without the validator, and accepts what the validator forbids, until the entry
+   reaches it.
 2. **A document accepted that way is kept.** It replicates to the members that have
    the validator, which store it without judging it, so a collection can hold
    documents that fail its validator. So can a collection whose validator was added
