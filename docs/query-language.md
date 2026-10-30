@@ -379,8 +379,12 @@ the list of names, and so on.
 - **Never index-eligible.** A schema is a residual predicate every candidate goes
   through, so it neither selects a key range nor narrows one; an equality or range
   beside it still uses an index. It cannot appear in a partial index's filter.
-- Inside an `$elemMatch`, `$pull` condition or `arrayFilters` entry it tests
-  an element that is a document; a scalar element never satisfies it.
+- Inside an `$elemMatch` or a `$pull` condition it tests an element that is a
+  document; a scalar element never satisfies it. An `arrayFilters` entry
+  **refuses** it, both as `{"$jsonSchema": ...}` and under the identifier
+  (`{"e": {"$jsonSchema": ...}}`): an entry takes field conditions, `$expr` and
+  `$and`/`$or`/`$nor`, and a schema under a field is the field-level use that is
+  a `400` everywhere. Filter the elements with `$elemMatch` in the query filter.
 
 ### `$type`
 

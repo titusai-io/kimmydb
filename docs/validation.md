@@ -109,7 +109,7 @@ with the chunks before it applied.
 
 ## Replication
 
-The validator is stamped and replicates as a `ConfigureValidator` oplog entry,
+The validator is stamped and replicates as a `ConfigureValidator` oplog entry (a collection created with one carries it on its `CreateCollection` entry, applied in the same transaction as the creation),
 last writer winning on the stamp, exactly as a vector configuration does
 ([ADR-226](decisions.md#adr-226--a-vector-configuration-carries-the-stamp-of-its-latest-change-and-a-snapshot-page-says-when-it-was-turned-off)):
 two members that changed it concurrently converge on the later change, a replayed
@@ -130,8 +130,10 @@ validator is a guard and not an invariant:
 
 1. **A member that has not received the change accepts a write the validator would
    refuse.** Between `PUT` on one member and its arrival on another, the other
-   accepts documents the new schema forbids. The same gap applies to a collection
-   just created with a validator.
+   accepts documents the new schema forbids. A collection created with a validator
+   has no such gap on a member that applies its `CreateCollection` entry, which
+   creates both together; a member that has not yet received the entry does not
+   hold the collection.
 2. **A document accepted that way is kept.** It replicates to the members that have
    the validator, which store it without judging it, so a collection can hold
    documents that fail its validator. So can a collection whose validator was added

@@ -510,9 +510,10 @@ fn parse_condition(
         },
         "jsonSchema" => {
             return Err(Error::InvalidQuery(
-                "$jsonSchema applies to a whole document, so it stands at the top of a filter,                  as in {$jsonSchema: {properties: {age: {bsonType: \"int\"}}}}, and not under \
-                 a field; to test a nested document, describe the field in the schema's \
-                 properties"
+                "$jsonSchema applies to a whole document, so it stands at the top of a \
+                 filter, as in {$jsonSchema: {properties: {age: {bsonType: \"int\"}}}}, \
+                 and not under a field; to test a nested document, describe the field in \
+                 the schema's properties"
                     .into(),
             ));
         }

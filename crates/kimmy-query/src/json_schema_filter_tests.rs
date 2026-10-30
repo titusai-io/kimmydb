@@ -98,3 +98,20 @@ fn a_filters_regex_budget_is_the_one_a_schemas_patterns_are_charged_to() {
     let too_many = doc! {"$and": filter, "$jsonSchema": {"patternProperties": {"a": {}, "b": {}}}};
     assert!(parse(&too_many).is_err());
 }
+
+#[test]
+fn array_filters_refuse_a_schema_in_both_forms() {
+    for filters in [
+        vec![doc! {"$jsonSchema": {"required": ["q"]}}],
+        vec![doc! {"e": {"$jsonSchema": {"required": ["q"]}}}],
+        vec![doc! {"$and": [{"e": {"$jsonSchema": {}}}]}],
+    ] {
+        let update = doc! {"$set": {"l.$[e].ok": true}};
+        let err = crate::update::parse_with_filters(&update, &filters)
+            .expect_err(&format!("{filters:?} is refused"));
+        assert!(
+            matches!(err, kimmy_core::Error::InvalidUpdate(_) | kimmy_core::Error::InvalidQuery(_)),
+            "{err:?}"
+        );
+    }
+}
