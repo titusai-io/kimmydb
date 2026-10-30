@@ -217,7 +217,10 @@ or, for the second shape, `document would produce more than 1000 index keys,
 the most one document may have in an index (index "tags_1", _id 1)`. Creating an
 index over documents already stored that it cannot key is a `400` as well: it
 counts them, lists the first ten `_id`s and says how many more, and creates
-nothing. A write to a collection with no index that cannot key it is unaffected,
+nothing. A `$merge` or `$out` output is checked against the target's indexes
+before its first chunk, so a refused output writes nothing and creates nothing
+([the aggregation guide](aggregation.md#merge)); a matched `$merge` document is
+checked by the write in its final form. A write to a collection with no index that cannot key it is unaffected,
 and a partial index is asked only about the documents its filter selects. The
 refusals are counted in `kimmy_index_unkeyed_refusals_total`. A unique index
 refuses these with the longer message below.

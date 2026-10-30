@@ -2452,6 +2452,22 @@ fn write_sink(
     if is_out {
         state.engine.check_unique_output_ids(&docs)?;
     }
+    // And so are the target's indexes: an output one of them cannot key is `400`
+    // with the target as it was. A target that does not exist has none.
+    let mode = match stage {
+        aggregate::Stage::Merge(spec) => kimmy_storage::SinkMode::Merge {
+            when_matched: match spec.when_matched {
+                aggregate::WhenMatched::Replace => kimmy_storage::WhenMatched::Replace,
+                aggregate::WhenMatched::Merge => kimmy_storage::WhenMatched::Merge,
+                aggregate::WhenMatched::KeepExisting => kimmy_storage::WhenMatched::KeepExisting,
+            },
+            insert_unmatched: spec.insert_unmatched,
+        },
+        _ => kimmy_storage::SinkMode::Insert,
+    };
+    if let Some(meta) = &existing {
+        kimmy_storage::blocking(|| state.engine.check_output_indexes(meta, &docs, mode))?;
+    }
     let not_empty = |meta: &CollectionMeta| -> Result<(), ApiError> {
         let mut holds = false;
         kimmy_storage::blocking(|| {
@@ -2490,17 +2506,6 @@ fn write_sink(
             }
             Err(e) => return Err(e.into()),
         },
-    };
-    let mode = match stage {
-        aggregate::Stage::Merge(spec) => kimmy_storage::SinkMode::Merge {
-            when_matched: match spec.when_matched {
-                aggregate::WhenMatched::Replace => kimmy_storage::WhenMatched::Replace,
-                aggregate::WhenMatched::Merge => kimmy_storage::WhenMatched::Merge,
-                aggregate::WhenMatched::KeepExisting => kimmy_storage::WhenMatched::KeepExisting,
-            },
-            insert_unmatched: spec.insert_unmatched,
-        },
-        _ => kimmy_storage::SinkMode::Insert,
     };
     let outcome = kimmy_storage::blocking(|| state.engine.write_documents(&meta, docs, mode))?;
     let counts = outcome.counts;

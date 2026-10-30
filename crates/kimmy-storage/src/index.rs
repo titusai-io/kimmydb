@@ -329,6 +329,27 @@ fn refuse_unkeyed(engine: &crate::Engine, index: &IndexMeta, doc: &Document) -> 
     Err(StorageError::Core(CoreError::InvalidQuery(refusal_message(index, doc, cause, &reason))))
 }
 
+/// Refuse `doc` if any of `indexes` cannot key it, as a local write of it would.
+///
+/// The check `maintain` makes, by the same functions and with the same message,
+/// without the transaction: for a caller that holds the documents before it
+/// writes any and means to refuse them all up front (`$merge` and `$out`). It
+/// asks nothing about uniqueness, which needs the stored documents.
+pub(crate) fn check_keyable(
+    engine: &crate::Engine,
+    indexes: &[IndexMeta],
+    doc: &Document,
+) -> Result<()> {
+    for index in indexes {
+        if index.unique {
+            unique_keys(index, doc)?;
+        } else {
+            refuse_unkeyed(engine, index, doc)?;
+        }
+    }
+    Ok(())
+}
+
 /// The sentence a refusal of `doc` under `index` carries.
 fn refusal_message(index: &IndexMeta, doc: &Document, cause: UnkeyedCause, reason: &str) -> String {
     let id = id_of(doc);

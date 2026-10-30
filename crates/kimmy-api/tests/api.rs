@@ -19044,3 +19044,173 @@ async fn the_report_lists_the_documents_that_fail_the_validator_a_page_at_a_time
         404
     );
 }
+
+/// `shop.<name>` created with a compound index over two array fields, `a` and `b`.
+async fn sink_indexed(server: &Server, token: &str, name: &str, docs: Vec<Value>) {
+    sink_seed(server, token, name, docs).await;
+    let index = server
+        .post(
+            &format!("/v1/db/shop/coll/{name}/indexes"),
+            Some(token),
+            json!({"fields": [{"path": "a"}, {"path": "b"}]}),
+        )
+        .await;
+    assert_eq!(index.status, 200, "{:?}", index.body);
+}
+
+/// A source whose third document, by `_id`, has arrays at both indexed paths.
+async fn seed_unkeyable_third(server: &Server, token: &str) {
+    sink_seed(
+        server,
+        token,
+        "src",
+        vec![
+            json!({"_id": 1, "a": 1, "b": 1}),
+            json!({"_id": 2, "a": 2, "b": 2}),
+            json!({"_id": 3, "a": [1, 2], "b": [3, 4]}),
+            json!({"_id": 4, "a": 4, "b": 4}),
+        ],
+    )
+    .await;
+}
+
+fn by_id() -> Value {
+    json!({"$sort": {"_id": 1}})
+}
+
+#[tokio::test]
+async fn an_output_an_index_cannot_key_in_a_later_chunk_writes_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_unkeyable_third(&server, &token).await;
+    for target in ["t_out", "t_merge", "t_replace", "t_keep"] {
+        sink_indexed(&server, &token, target, vec![]).await;
+    }
+    server.state.engine.set_multi_chunk_docs(2);
+    let commits = server.state.engine.commits();
+    let refusals = server.state.engine.unkeyed_refusals();
+    for (stage, target) in [
+        (json!({"$out": "t_out"}), "t_out"),
+        (json!({"$merge": {"into": "t_merge"}}), "t_merge"),
+        (json!({"$merge": {"into": "t_replace", "whenMatched": "replace"}}), "t_replace"),
+        (json!({"$merge": {"into": "t_keep", "whenMatched": "keepExisting"}}), "t_keep"),
+    ] {
+        let res = sink_run(&server, &token, "src", json!([by_id(), stage.clone()])).await;
+        assert_eq!(res.status, 400, "{stage}: {:?}", res.body);
+        assert_ne!(res.body["error"], "partially_applied", "{stage}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains("cannot index parallel arrays"), "{stage}: {message}");
+        assert!(message.contains("_id 3") && message.contains("output document 2"), "{message}");
+        assert!(sink_dump(&server, &token, "shop", target).await.is_empty(), "{stage}");
+    }
+    assert_eq!(server.state.engine.commits(), commits, "nothing was committed");
+    assert_eq!(server.state.engine.unkeyed_refusals(), refusals + 4);
+}
+
+#[tokio::test]
+async fn an_output_over_the_key_cap_is_refused_before_the_first_chunk() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let many: Vec<i64> = (0..1001).collect();
+    sink_seed(
+        &server,
+        &token,
+        "src",
+        vec![json!({"_id": 1, "a": 1}), json!({"_id": 2, "a": 2}), json!({"_id": 3, "a": many})],
+    )
+    .await;
+    sink_seed(&server, &token, "t", vec![]).await;
+    let index = server
+        .post("/v1/db/shop/coll/t/indexes", Some(&token), json!({"fields": [{"path": "a"}]}))
+        .await;
+    assert_eq!(index.status, 200, "{:?}", index.body);
+    server.state.engine.set_multi_chunk_docs(2);
+    let res = sink_run(&server, &token, "src", json!([by_id(), {"$out": "t"}])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_ne!(res.body["error"], "partially_applied");
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("more than 1000 index keys"), "{message}");
+    assert!(sink_dump(&server, &token, "shop", "t").await.is_empty());
+}
+
+#[tokio::test]
+async fn an_unkeyable_output_for_a_target_with_no_index_or_no_target_is_written() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_unkeyable_third(&server, &token).await;
+    sink_seed(&server, &token, "plain", vec![]).await;
+    server.state.engine.set_multi_chunk_docs(2);
+    // No index on the target: nothing can fail to key.
+    let res = sink_run(&server, &token, "src", json!([by_id(), {"$out": "plain"}])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(sink_dump(&server, &token, "shop", "plain").await.len(), 4);
+    // A target that does not exist has no index, and is created.
+    let res =
+        sink_run(&server, &token, "src", json!([by_id(), {"$merge": {"into": "fresh"}}])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(sink_dump(&server, &token, "shop", "fresh").await.len(), 4);
+}
+
+#[tokio::test]
+async fn a_document_the_merge_does_not_write_is_not_checked() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_unkeyable_third(&server, &token).await;
+    server.state.engine.set_multi_chunk_docs(2);
+    // Kept: the stored document 3 stays, and the incoming one is never written.
+    sink_indexed(&server, &token, "kept", vec![json!({"_id": 3, "a": 3, "b": 3})]).await;
+    let res = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([by_id(), {"$merge": {"into": "kept", "whenMatched": "keepExisting"}}]),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["merge"]["kept"], 1, "{:?}", res.body);
+    // Discarded: unmatched, so never written.
+    sink_indexed(&server, &token, "discarded", vec![json!({"_id": 1, "a": 0, "b": 0})]).await;
+    let res = sink_run(
+        &server,
+        &token,
+        "src",
+        json!([by_id(), {"$merge": {"into": "discarded", "whenNotMatched": "discard"}}]),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["merge"]["discarded"], 3, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_matched_merge_is_checked_by_the_write_in_its_final_form() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_unkeyable_third(&server, &token).await;
+    server.state.engine.set_multi_chunk_docs(2);
+    // Document 3 is held by the target, so the output is not known to be
+    // unkeyable until it is laid over the stored one, inside the write: the
+    // first chunk has committed by then.
+    sink_indexed(&server, &token, "t", vec![json!({"_id": 3, "a": 3, "b": 3})]).await;
+    let res = sink_run(&server, &token, "src", json!([by_id(), {"$merge": {"into": "t"}}])).await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(res.body["applied"]["inserted"], 2, "{:?}", res.body);
+    let ids: Vec<i64> = sink_dump(&server, &token, "shop", "t")
+        .await
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [1, 2, 3]);
+}
+
+#[tokio::test]
+async fn an_unkeyable_output_is_refused_ahead_of_a_non_empty_out_target() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_unkeyable_third(&server, &token).await;
+    sink_indexed(&server, &token, "held", vec![json!({"_id": 9, "a": 9, "b": 9})]).await;
+    let res = sink_run(&server, &token, "src", json!([by_id(), {"$out": "held"}])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("cannot index parallel arrays"), "{message}");
+}

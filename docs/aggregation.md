@@ -267,6 +267,18 @@ and writes nothing. `commits` is the write transactions that committed something
   of the output is checked, in both stages, before the target is created and before
   the first chunk is written, so a refused output writes nothing and creates nothing.
   (A string or binary `_id` over the size cap is refused in the same place.)
+- **The output is checked against the target's indexes before anything is written.**
+  A document that an index of the target cannot key (parallel arrays in a compound or
+  multikey index, or more than 1,000 index keys) is `400` with the message a client
+  write of it gets, naming the index, the `_id` and the document's place in the output,
+  and the request writes nothing; a target that does not exist yet has no index, so a
+  refusal never leaves one created. It covers what is stored as it stands: every
+  document of `$out`, and of a `$merge` the documents inserted because the target holds
+  none with their `_id` and, under `whenMatched: "replace"`, the matched ones. A matched
+  document under `merge` is stored as the stored document with the incoming fields laid
+  over it, which only the write knows, so the write checks it, and a refusal there can
+  come after earlier chunks committed (`partially_applied`). A document the stage never
+  writes (kept, or unmatched under `whenNotMatched: "discard"`) is not checked.
 - **It is the ordinary write path.** Each document is an ordinary insert or replace
   inside a write transaction: the unique and other indexes, the document and `_id` size
   caps, the oplog, change streams, webhooks, expiry and replication see the same writes

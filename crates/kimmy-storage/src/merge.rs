@@ -35,6 +35,7 @@ use redb::ReadableTable;
 use crate::docs::{doc_key, extract_id};
 use crate::engine::WriterHolder;
 use crate::error::{Result, StorageError};
+use crate::index;
 use crate::meta::CollectionMeta;
 use crate::{Engine, ID_FIELD, codec, tables};
 
@@ -108,6 +109,7 @@ impl Engine {
     ) -> Result<SinkOutcome> {
         self.check_output_ids(&docs)?;
         self.check_output_validation(coll, &docs, mode)?;
+        self.check_output_indexes(coll, &docs, mode)?;
         if mode == SinkMode::Insert {
             refuse_duplicate_ids(&docs)?;
         }
@@ -206,6 +208,65 @@ impl Engine {
                 probe.insert(ID_FIELD, DocId::generate().to_bson());
                 self.check_validation(coll, None, &probe)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse the whole output before the first chunk when one of the target's
+    /// indexes cannot key one of its documents (ADR-258), so a refused output writes
+    /// nothing and, when the caller asks first, creates nothing. A target that does
+    /// not exist yet has no index and nothing to check.
+    ///
+    /// The refusal is the one the write gives, from the function `index::maintain`
+    /// uses, naming the document by its `_id` and its place in the output.
+    ///
+    /// **Only what is certain from the output alone.** A document that is stored as
+    /// it stands is checked as an insert: every document of `Insert`; of a `Merge`
+    /// that inserts the unmatched, those the target holds no document for, and under
+    /// `replace` the matched as well. A matched document under `merge` is stored in
+    /// its final form, the stored document with the incoming fields laid over it,
+    /// known only inside the transaction that writes it, and is left to the write
+    /// (an earlier chunk has then committed, as for any other failure in a later
+    /// chunk). A document that is kept, or discarded because it is unmatched, is
+    /// never written and is not checked. Whether a document is matched is read
+    /// here, ahead of the write; a writer that slips in between is an ordinary
+    /// concurrent writer.
+    pub fn check_output_indexes(
+        &self,
+        coll: &CollectionMeta,
+        docs: &[Document],
+        mode: SinkMode,
+    ) -> Result<()> {
+        if coll.indexes.is_empty() {
+            return Ok(());
+        }
+        for (position, doc) in docs.iter().enumerate() {
+            let certain = match mode {
+                SinkMode::Insert => true,
+                SinkMode::Merge { when_matched, insert_unmatched } => {
+                    let replaces = when_matched == WhenMatched::Replace;
+                    if replaces && insert_unmatched {
+                        true
+                    } else {
+                        let matched = match doc.get(ID_FIELD) {
+                            Some(value) => self.get(coll, &DocId::try_from_bson(value)?)?.is_some(),
+                            None => false,
+                        };
+                        if matched { replaces } else { insert_unmatched }
+                    }
+                }
+            };
+            if !certain {
+                continue;
+            }
+            index::check_keyable(self, &coll.indexes, doc).map_err(|e| match e {
+                StorageError::Core(kimmy_core::Error::InvalidQuery(message)) => {
+                    StorageError::Core(kimmy_core::Error::InvalidQuery(format!(
+                        "{message}; output document {position}"
+                    )))
+                }
+                other => other,
+            })?;
         }
         Ok(())
     }

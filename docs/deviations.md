@@ -383,7 +383,12 @@ document back in a form an index cannot key files it unkeyed and says so the sam
 way, in its own transaction; it still refuses for a unique index. A client that is refused on one member and
 accepted on another is the same difference as a unique index's.
 
-**What else differs.** A local write that would leave an already-unkeyed document
+**What else differs.** A `$merge` or `$out` output is checked against the target's
+indexes before the first chunk, for the documents stored as they stand, so a refused
+output writes nothing and creates nothing; a matched `$merge` document is stored as
+the stored document with the incoming fields laid over it, known only inside the
+transaction, so the write refuses it and a refusal there can follow earlier chunks
+(`partially_applied`), as for a validator (ADR-257). A local write that would leave an already-unkeyed document
 unkeyed is refused too, including an update of an unrelated field: the check is on
 the document the write would store. The remedy is a replace that reshapes it.
 
