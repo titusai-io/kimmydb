@@ -21,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::index_meta::IndexMeta;
+use crate::validator::ValidatorSpec;
 use crate::vector_meta::VectorConfig;
 
 /// Which collection an operation applies to.
@@ -34,6 +35,21 @@ impl CollectionRef {
     pub fn new(db: impl Into<String>, name: impl Into<String>) -> Self {
         Self { db: db.into(), name: name.into() }
     }
+}
+
+/// A collection being created: the body of a `CreateCollection` entry.
+///
+/// It is a [`CollectionRef`] and, when the collection is created with a validator,
+/// that validator, so that the collection and the validator it was created with
+/// reach a member in one entry and are applied in one transaction (ADR-257). With no
+/// validator the field is absent and the bytes are a `CollectionRef`'s, which an
+/// entry written before it, or by a build that does not know it, is read as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionCreate {
+    pub db: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator: Option<ValidatorSpec>,
 }
 
 /// The reserved collection name a database's drop is filed under (ADR-229).
@@ -88,6 +104,15 @@ pub struct VectorSet {
     /// collection is ordinary data and reconciles through the same anti-entropy
     /// as everything else.
     pub config: Option<VectorConfig>,
+}
+
+/// A collection's validator being set, replaced or removed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorSet {
+    pub db: String,
+    pub collection: String,
+    /// `None` removes the validator.
+    pub validator: Option<ValidatorSpec>,
 }
 
 #[cfg(test)]

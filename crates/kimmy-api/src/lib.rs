@@ -41,6 +41,7 @@ pub mod state;
 pub mod telemetry;
 pub mod topology;
 pub mod users;
+pub mod validator;
 pub mod vectors;
 pub mod version;
 pub mod watch;

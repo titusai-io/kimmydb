@@ -41,6 +41,10 @@ the envelope precisely so that a client does not need a table
 `document_too_large` and `id_too_large` (`413`, retry `no`) refuse a write whose
 document encodes to more than 16 MiB or whose `_id` is over 4096 bytes; resending
 it fails the same way ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)).
+`validation_failed` (`422`, retry `no`) refuses a write whose document fails its
+collection's validator under `validationAction: "error"`; the message names the keyword
+path, and a client reads it to fix the document ([Validators](validation.md)). It is new
+in the release that added validators, and a client that does not know it reads it as `no`.
 
 **Page with cursors, and end the walk on an empty page.** A `find` with no
 `limit` returns 100 documents rather than all of them, and a final page that is

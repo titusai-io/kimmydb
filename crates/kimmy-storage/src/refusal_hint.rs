@@ -118,7 +118,8 @@ impl RefusalHint {
     ) -> Self {
         let name = match kind.definition() {
             DefinitionKind::Index => name.into(),
-            DefinitionKind::Vector => String::new(),
+            // A validator is never refused (ADR-257), so no hint is about one.
+            DefinitionKind::Vector | DefinitionKind::Validator => String::new(),
         };
         Self { collection, kind, name, stamp, version: env!("CARGO_PKG_VERSION").to_string(), hash }
     }
@@ -371,11 +372,12 @@ impl Engine {
     ) -> Result<usize> {
         let mut meta = txn.open_table(tables::META)?;
         let mut cleared = 0usize;
-        let kinds = match definition.kind {
-            DefinitionKind::Index => [HintKind::Index, HintKind::DropIndex],
-            DefinitionKind::Vector => [HintKind::Vector, HintKind::DropVector],
+        let kinds: &[HintKind] = match definition.kind {
+            DefinitionKind::Index => &[HintKind::Index, HintKind::DropIndex],
+            DefinitionKind::Vector => &[HintKind::Vector, HintKind::DropVector],
+            DefinitionKind::Validator => &[],
         };
-        for kind in kinds {
+        for kind in kinds.iter().copied() {
             let key = format!("{PREFIX}{}:{}:{}", collection.0, kind.as_str(), definition.name);
             if meta.remove(key.as_str())?.is_some() {
                 cleared += 1;

@@ -56,6 +56,9 @@ pub enum ErrorCode {
     DocumentTooLarge,
     /// A request names an `_id` over the 4 KiB cap (ADR-250).
     IdTooLarge,
+    /// A write would store a document that fails the collection's validator, under
+    /// `validationAction: "error"` (ADR-257).
+    ValidationFailed,
     UnsupportedMediaType,
     Unauthorized,
     Forbidden,
@@ -195,11 +198,12 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 28] = [
+    pub const ALL: [ErrorCode; 29] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::DocumentTooLarge,
         Self::IdTooLarge,
+        Self::ValidationFailed,
         Self::UnsupportedMediaType,
         Self::Unauthorized,
         Self::Forbidden,
@@ -233,6 +237,7 @@ impl ErrorCode {
             Self::PayloadTooLarge => "payload_too_large",
             Self::DocumentTooLarge => "document_too_large",
             Self::IdTooLarge => "id_too_large",
+            Self::ValidationFailed => "validation_failed",
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
@@ -269,6 +274,7 @@ impl ErrorCode {
             | Self::PayloadTooLarge
             | Self::DocumentTooLarge
             | Self::IdTooLarge
+            | Self::ValidationFailed
             | Self::UnsupportedMediaType
             | Self::Unauthorized
             | Self::Forbidden
@@ -373,6 +379,7 @@ impl ErrorCode {
             | Self::PayloadTooLarge
             | Self::DocumentTooLarge
             | Self::IdTooLarge
+            | Self::ValidationFailed
             | Self::UnsupportedMediaType
             | Self::Unauthorized
             | Self::Forbidden
@@ -1012,6 +1019,14 @@ impl From<CoreError> for ApiError {
             CoreError::IdTooLarge { .. } => {
                 ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::IdTooLarge, e.to_string())
             }
+            // The document is well formed and the collection will not take it: 422, not
+            // 400, which is a request that cannot be read, and not 409, which is a
+            // conflict with another document. Sending it again changes nothing.
+            CoreError::DocumentInvalid { .. } => ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorCode::ValidationFailed,
+                e.to_string(),
+            ),
             CoreError::InvalidName { .. }
             | CoreError::InvalidQuery(_)
             | CoreError::Limit(_)
@@ -1207,12 +1222,13 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 28] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 29] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
             (DocumentTooLarge, None),
             (IdTooLarge, None),
+            (ValidationFailed, None),
             (UnsupportedMediaType, None),
             (Unauthorized, None),
             (Forbidden, None),

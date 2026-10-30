@@ -298,8 +298,13 @@ fn gather_containment(filter: &Filter, out: &mut Vec<(String, PartialOp)>) {
                 }
             }
         }
-        // An expression proves nothing the partial-filter vocabulary can state.
-        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue | Filter::Expr(_) => {}
+        // An expression proves nothing the partial-filter vocabulary can state, nor
+        // does a schema.
+        Filter::Or(_)
+        | Filter::Nor(_)
+        | Filter::AlwaysTrue
+        | Filter::Expr(_)
+        | Filter::JsonSchema(_) => {}
     }
 }
 
@@ -358,8 +363,13 @@ fn collect(filter: &Filter, out: &mut HashMap<String, Bounds>) {
         // A disjunction constrains nothing that must universally hold, and an
         // `$expr` names no field it puts bounds on: `{$gt: ["$a", "$b"]}` is
         // a relation between two values that an index on either cannot see.
-        // It is always the scan's, or the residual re-check's, to answer.
-        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue | Filter::Expr(_) => {}
+        // It is always the scan's, or the residual re-check's, to answer. A
+        // `$jsonSchema` is the same: it describes the whole document, not a key range.
+        Filter::Or(_)
+        | Filter::Nor(_)
+        | Filter::AlwaysTrue
+        | Filter::Expr(_)
+        | Filter::JsonSchema(_) => {}
     }
 }
 
@@ -874,6 +884,29 @@ mod tests {
         }
         // And it is not a containment fact for a partial index.
         let filter = crate::filter::parse(&doc! { "a": { "$bitsAllSet": 5 } }).unwrap();
+        assert!(containment_predicates(&filter).is_empty());
+    }
+
+    #[test]
+    fn a_json_schema_is_residual_and_never_answered_from_an_index() {
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        let schema = || doc! { "$jsonSchema": { "properties": { "a": { "minimum": 1 } } } };
+        assert!(plan(schema(), &idx).is_none());
+        assert!(pk(schema()).is_none());
+        // Beside an equality the equality plans and the schema is left to the
+        // re-check; beside a range it does not narrow the range.
+        let mut both = schema();
+        both.insert("a", 8);
+        let p = plan(both, &idx).expect("the equality plans");
+        assert_eq!(p.fields_used, 1);
+        let mut ranged = schema();
+        ranged.insert("a", doc! { "$gte": 1 });
+        assert_eq!(plan(ranged, &idx).expect("the range plans").fields_used, 1);
+        // Under $or, $nor it proves and narrows nothing.
+        assert!(plan(doc! { "$nor": [schema()] }, &idx).is_none());
+        assert!(plan(doc! { "$or": [schema(), { "a": 1 }] }, &idx).is_none());
+        // And it is not a containment fact for a partial index.
+        let filter = crate::filter::parse(&schema()).unwrap();
         assert!(containment_predicates(&filter).is_empty());
     }
 

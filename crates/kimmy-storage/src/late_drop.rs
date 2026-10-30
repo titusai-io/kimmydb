@@ -137,8 +137,8 @@ impl Engine {
 
     /// Sweep the stragglers of the life before `dropped` out of the collection
     /// `db.name`, if it owes the sweep: the definitions that life brought
-    /// (indexes created, and a vector configuration changed, at or before the
-    /// drop), then the records, and the floor taken up to the drop in the
+    /// (indexes created, and a vector configuration or a validator changed, at or
+    /// before the drop), then the records, and the floor taken up to the drop in the
     /// commit of the last chunk. Returns how many records it removed.
     ///
     /// Called with the drop's tombstone already recorded, so a record that
@@ -366,6 +366,20 @@ impl Engine {
                 name,
                 false,
                 crate::vectors::Configured::Swept(dropped.max(changed)),
+                &|_| Ok(false),
+            )?;
+        }
+        // And a validator of the life before, removed at its own stamp where that sorts
+        // above the drop's, judged strictly like the configuration above (ADR-257).
+        if standing.validator.is_some()
+            && let Some(changed) =
+                standing.validator_changed.filter(|changed| changed.hlc <= dropped.hlc)
+        {
+            self.set_validator_inner(
+                db,
+                name,
+                None,
+                crate::validator::Validated::Swept(dropped.max(changed)),
                 &|_| Ok(false),
             )?;
         }
@@ -792,6 +806,7 @@ fn redate(meta: &mut CollectionMeta, dropped: Hlc) {
 fn holds_a_definition_stamped_after(standing: &CollectionMeta, dropped: Hlc) -> bool {
     standing.indexes.iter().any(|index| index.created.is_some_and(|c| c.hlc > dropped))
         || standing.vector_changed.is_some_and(|changed| changed.hlc > dropped)
+        || standing.validator_changed.is_some_and(|changed| changed.hlc > dropped)
 }
 
 /// The collection `db.name` as `txn` sees it.
@@ -1775,6 +1790,32 @@ mod tests {
         assert!(standing.vector.is_none(), "the tie was kept: {:?}", standing.vector);
         assert_eq!(standing.vector_changed, Some(above), "turned off at the change's own stamp");
         assert_eq!(standing.incarnation_floor, Some(dropped.hlc), "and the sweep finished");
+    }
+
+    /// A validator the old life brought (changed at or before the drop) is removed by the
+    /// sweep, as its configuration of vectors is; one changed after the drop is the newer
+    /// life's and stays (ADR-257).
+    #[test]
+    fn a_validator_of_the_life_before_is_swept_and_a_later_one_stays() {
+        let validator = || kimmy_core::ValidatorSpec {
+            schema: bson::doc! { "required": ["a"] },
+            action: Default::default(),
+            level: Default::default(),
+        };
+        let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
+        b.set_validator("shop", "orders", Some(validator())).unwrap();
+        let before = Stamp::new(Hlc::new(dropped.hlc.wall_ms - 1, 0), NodeId::from_bytes([1; 16]));
+        edit_meta(&b, |meta| meta.validator_changed = Some(before));
+        pull(&b, &a);
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(standing.validator.is_none(), "the old life's validator was kept: {standing:?}");
+        assert_eq!(standing.incarnation_floor, Some(dropped.hlc), "and the sweep finished");
+
+        // A validator the newer life set after the drop is not the sweep's.
+        let (a, b, _da, _db, _dropped) = a_drop_and_a_later_life();
+        b.set_validator("shop", "orders", Some(validator())).unwrap();
+        pull(&b, &a);
+        assert_eq!(b.get_collection("shop", "orders").unwrap().validator, Some(validator()));
     }
 
     /// f-1. A newer life's index with the same derived id as the old one's (same

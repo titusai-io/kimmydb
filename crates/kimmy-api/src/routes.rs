@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, Path, State};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use opentelemetry_semantic_conventions::attribute as semconv;
 use serde::Deserialize;
@@ -253,6 +253,14 @@ fn timed_routes() -> Router<SharedState> {
         .route("/v1/db/{db}/coll/{coll}/indexes/{name}", delete(drop_index))
         .route("/v1/db/{db}/coll/{coll}/violations", get(list_violations))
         .route(
+            "/v1/db/{db}/coll/{coll}/validator",
+            put(crate::validator::set_validator).delete(crate::validator::remove_validator),
+        )
+        .route(
+            "/v1/db/{db}/coll/{coll}/validator/violations",
+            get(crate::validator::validator_violations),
+        )
+        .route(
             "/v1/db/{db}/coll/{coll}/vector",
             get(crate::vectors::get_vector_config)
                 .post(crate::vectors::configure_vectors)
@@ -286,12 +294,13 @@ fn timed_routes() -> Router<SharedState> {
 /// `docs/openapi.yaml` gives a query parameter, so a parameter documented on a
 /// route this table does not open, or opened here and documented nowhere, is
 /// a failing test rather than a route that quietly behaves otherwise.
-pub const QUERY_STRING_ROUTES: [(&str, &str); 7] = [
+pub const QUERY_STRING_ROUTES: [(&str, &str); 8] = [
     ("GET", "/v1/db/{db}/coll/{coll}/docs"),
     ("PUT", "/v1/db/{db}/coll/{coll}/docs/{id}"),
     ("DELETE", "/v1/db/{db}/coll/{coll}/docs/{id}"),
     ("GET", "/v1/db/{db}/coll/{coll}/describe"),
     ("GET", "/v1/db/{db}/coll/{coll}/violations"),
+    ("GET", "/v1/db/{db}/coll/{coll}/validator/violations"),
     ("DELETE", "/v1/db/{db}/coll/{coll}/vector"),
     ("GET", "/v1/db/{db}/coll/{coll}/watch"),
 ];
@@ -1012,6 +1021,15 @@ async fn list_collections(
 #[serde(deny_unknown_fields)]
 struct CreateCollectionRequest {
     name: String,
+    /// The collection's validator, `{ "$jsonSchema": <schema> }` (ADR-257).
+    #[serde(default)]
+    validator: Option<Value>,
+    /// `error` (the default) or `warn`.
+    #[serde(default, rename = "validationAction")]
+    validation_action: Option<String>,
+    /// `strict` (the default) or `moderate`.
+    #[serde(default, rename = "validationLevel")]
+    validation_level: Option<String>,
 }
 
 async fn create_collection(
@@ -1020,7 +1038,13 @@ async fn create_collection(
     Path(db): Path<String>,
     JsonBody(body): JsonBody<CreateCollectionRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::create_collection(&state, &auth, &db, &body.name)?))
+    let validator = crate::validator::ValidatorInput {
+        validator: body.validator,
+        validation_action: body.validation_action,
+        validation_level: body.validation_level,
+    }
+    .into_spec()?;
+    Ok(Json(exec::create_collection_validated(&state, &auth, &db, &body.name, validator)?))
 }
 
 async fn drop_collection(

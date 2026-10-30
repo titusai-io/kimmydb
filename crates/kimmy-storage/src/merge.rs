@@ -107,6 +107,7 @@ impl Engine {
         mode: SinkMode,
     ) -> Result<SinkOutcome> {
         self.check_output_ids(&docs)?;
+        self.check_output_validation(coll, &docs, mode)?;
         if mode == SinkMode::Insert {
             refuse_duplicate_ids(&docs)?;
         }
@@ -155,6 +156,55 @@ impl Engine {
                 if self.caps_apply() {
                     kimmy_core::limits::check_id(&id)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse the whole output before the first chunk when the target's validator
+    /// (action `error`) would certainly refuse one of its documents, so a refused
+    /// output writes nothing (ADR-257).
+    ///
+    /// **Only what is certain from the output alone.** A document `Insert` stores as
+    /// it stands, and a `Replace` that also inserts the unmatched stores as it stands
+    /// whether or not a document is there, so each is checked as an insert; under
+    /// level `moderate` the second is not certain (a stored document that did not
+    /// conform is replaced freely) and is left to the write. A `Merge` of a matched
+    /// document is validated in its final form, the stored document with the incoming
+    /// fields laid over it, inside the transaction that writes it (`write_one`, through
+    /// `replace_in_txn`), where an earlier chunk has already committed, as for any
+    /// other failure in a later chunk. Under `warn` nothing is refused and nothing
+    /// is counted here: the write counts each warning once.
+    fn check_output_validation(
+        &self,
+        coll: &CollectionMeta,
+        docs: &[Document],
+        mode: SinkMode,
+    ) -> Result<()> {
+        let Some(compiled) = self.validator_of(coll) else {
+            return Ok(());
+        };
+        if compiled.action != kimmy_core::ValidationAction::Error {
+            return Ok(());
+        }
+        let certain = match mode {
+            SinkMode::Insert => true,
+            SinkMode::Merge { when_matched: WhenMatched::Replace, insert_unmatched: true } => {
+                compiled.level == kimmy_core::ValidationLevel::Strict
+            }
+            SinkMode::Merge { .. } => false,
+        };
+        if !certain {
+            return Ok(());
+        }
+        for doc in docs {
+            if doc.contains_key(ID_FIELD) {
+                self.check_validation(coll, None, doc)?;
+            } else {
+                // The insert gives it an `_id` before the schema sees it.
+                let mut probe = doc.clone();
+                probe.insert(ID_FIELD, DocId::generate().to_bson());
+                self.check_validation(coll, None, &probe)?;
             }
         }
         Ok(())

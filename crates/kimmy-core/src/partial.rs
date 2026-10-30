@@ -396,6 +396,10 @@ mod tests {
             // An expression is outside the language too, so a write never has
             // to evaluate one to decide what an index holds (ADR-206).
             doc! {"$expr": {"$gt": ["$a", 1]}},
+            // A schema describes the whole document, which a per-field
+            // predicate cannot.
+            doc! {"$jsonSchema": {"required": ["a"]}},
+            doc! {"a": {"$jsonSchema": {"required": ["a"]}}},
         ] {
             assert!(parse(bad.clone()).is_err(), "should have been refused: {bad:?}");
         }

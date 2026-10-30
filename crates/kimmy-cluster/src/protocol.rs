@@ -1460,6 +1460,8 @@ mod tests {
             vector_changed: None,
             redated_from: Some(Hlc::new(100, 0)),
             incarnation_floor: Some(Hlc::new(200, 0)),
+            validator: None,
+            validator_changed: None,
         };
         let mut written = Vec::new();
         write_frame(

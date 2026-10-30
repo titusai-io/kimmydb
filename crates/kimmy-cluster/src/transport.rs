@@ -8500,6 +8500,8 @@ mod tests {
                 vector_changed: None,
                 redated_from: None,
                 incarnation_floor: None,
+                validator: None,
+                validator_changed: None,
             }]
         } else {
             Vec::new()

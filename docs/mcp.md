@@ -351,6 +351,8 @@ a REST client does:
 The size caps hold here too: a write that would store a document over 16 MiB, or
 name an `_id` over 4096 bytes, is `invalid_params` with `document_too_large` or
 `id_too_large` in `data`, retry `no` ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)).
+A write to a collection whose validator it fails is `invalid_params` with `validation_failed`
+in `data`, retry `no`, the message naming the keyword path ([Validators](validation.md)).
 
 **A write whose outcome is unknown is a tool result, not an error.** Its retry
 class is `verify`: the write may have been applied, and if it was, it

@@ -348,6 +348,18 @@ pub struct CollectionState {
     /// evidence, so nothing is buried.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incarnation_floor: Option<Hlc>,
+    /// The collection's validator (`CollectionMeta::validator`, ADR-257), absent when it
+    /// has none. Absent on a page from a sender that never had one, and also when the
+    /// sender removed it: `validator_changed` says which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator: Option<kimmy_core::ValidatorSpec>,
+    /// The stamp of the latest change to `validator`, as `vector_changed` is for the
+    /// vector configuration (ADR-226): "off at s" is a dated fact a receiver applies
+    /// when it is newer than its own and the sender's coverage names it (ADR-163).
+    /// `None` when the validator was never changed: a page without one never overrides
+    /// a stamped local value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_changed: Option<Stamp>,
 }
 
 impl From<CollectionMeta> for CollectionState {
@@ -362,6 +374,8 @@ impl From<CollectionMeta> for CollectionState {
             vector_changed: meta.vector_changed,
             redated_from,
             incarnation_floor: meta.incarnation_floor,
+            validator: meta.validator,
+            validator_changed: meta.validator_changed,
         }
     }
 }
@@ -2390,6 +2404,7 @@ impl Engine {
             .iter()
             .filter_map(|index| index.created)
             .chain(state.vector_changed)
+            .chain(state.validator_changed)
             .filter(|stamp| stamp.hlc > dropped.hlc)
             .collect())
     }
@@ -2582,6 +2597,7 @@ impl Engine {
                 &history,
                 redated_from,
                 adopted,
+                None,
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -2748,7 +2764,74 @@ impl Engine {
         if !vectors_of_the_life_before {
             refused += self.restore_vector_state(state, versions)?;
         }
+        let validator_of_the_life_before = match state.validator_changed {
+            Some(changed) => self.definition_of_an_ended_life(&standing, changed)?,
+            None => false,
+        };
+        if !validator_of_the_life_before {
+            self.restore_validator_state(state, versions)?;
+        }
         Ok(refused)
+    }
+
+    /// The validator a page describes, applied by the stamp it carries (ADR-257), as
+    /// [`Self::restore_vector_state`] applies a vector configuration (ADR-226).
+    ///
+    /// A page whose `validator_changed` is `None` describes a collection whose validator
+    /// was never changed and has nothing to apply. Otherwise it is applied when the
+    /// sender's own coverage names the stamp (ADR-163) and it is newer than the standing
+    /// change, judged where the change is made, under the writer: a validator is set, or
+    /// removed (**"off at s"**), and the stamp recorded either way. The clock observes
+    /// the stamp, so a later local change cannot mint one below it. It is never
+    /// validated against the documents held (ADR-257), and a schema this build cannot
+    /// parse is stored as sent.
+    fn restore_validator_state(
+        &self,
+        state: &CollectionState,
+        versions: &VersionVector,
+    ) -> Result<()> {
+        let Some(stamp) = state.validator_changed else {
+            return Ok(());
+        };
+        if Self::unless_gone(self.get_collection(&state.db, &state.name))?.is_none() {
+            return Ok(());
+        }
+        if stamp.hlc > versions.get(stamp.node) {
+            warn!(
+                db = %state.db,
+                collection = %state.name,
+                stamp = ?stamp,
+                covered_to = ?versions.get(stamp.node),
+                "a snapshot page changed a validator at a stamp its sender's own coverage \
+                 does not name; ignored"
+            );
+            return Ok(());
+        }
+        self.witness(&stamp);
+        let applied = self.set_validator_inner(
+            &state.db,
+            &state.name,
+            state.validator.clone(),
+            crate::validator::Validated::FromSnapshot(stamp),
+            &|standing| self.definition_of_an_ended_life(standing, stamp),
+        );
+        match crate::sync::settle(applied)? {
+            crate::sync::Ddl::Applied(_) | crate::sync::Ddl::Gone => Ok(()),
+            crate::sync::Ddl::PurgePending(_) => Err(crate::StorageError::CollectionPurging {
+                db: state.db.clone(),
+                name: state.name.clone(),
+                id: CollectionId::derive(&state.db, &state.name),
+            }),
+            crate::sync::Ddl::Refused(reason) => {
+                warn!(
+                    db = %state.db,
+                    collection = %state.name,
+                    reason = %reason,
+                    "skipped a validator in a snapshot this node cannot apply"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// The vector configuration a page describes, applied by the stamp it carries

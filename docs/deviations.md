@@ -17,6 +17,48 @@ Status meanings:
 
 ---
 
+## 🟡 A collection validator is enforced by the member that accepts the write, so a non-conforming document can be stored and kept
+
+**Raised 2026-10-29, with ADR-257 part 2.** A collection's validator ([validation.md](validation.md)) is replicated metadata and a guard on client writes. A leaderless cluster cannot make a schema change atomic, and a replicated write is never refused, so two gaps are accepted as the price:
+
+- **A member that has not yet received the validator (or its change) accepts a write the validator would refuse.** The window is the time the change takes to reach that member. A collection created with a validator is one replicated entry that carries the validator, so a member that applies the creation holds the collection and the validator together; the one gap left is a member that made the same name itself before the entry reached it, which holds that collection without the validator, and accepts what it forbids, until the creation entry arrives (the validator then applies by its stamp).
+- **A document accepted that way replicates to members that hold the validator, and is kept.** Replication, a snapshot page, a repair, a catch-up and a restore are never validated, and a change of the validator does not re-examine what is stored, so a collection can hold documents that fail its validator. `GET …/validator/violations` lists them, by a scan of the member that answers.
+
+Also recorded here, so they are not read as bugs:
+
+- **`validationAction: "warn"`** accepts the write, logs it at `WARN` (at most one line a second per collection) and counts it in `kimmy_validation_warnings_total`, a total for the member with no collection named, because `/metrics` is unauthenticated.
+- **`validationLevel: "moderate"`** checks inserts, and updates only of a document that conformed before the write; a document that does not conform may be changed to anything.
+- **A `$merge` of a matched document is validated in its final form inside the transaction that writes it**, so a refusal there can come after earlier chunks committed (`partially_applied`); an `$out`, and a `$merge` that replaces and inserts under `strict`, are refused whole before the first chunk.
+- **One validator holds at most 32 `pattern`s and 2 MiB of compiled pattern**, the `$jsonSchema` parser's own budget; a schema over it is `400` when set.
+- **A refusal is `422 validation_failed`** (retry `no`, never logged); TTL expiry, deletes, index builds and every replicated path bypass the validator.
+- **A stored validator that does not parse** (only possible if a build changed the dialect) leaves the collection writable and unvalidated, logged at `ERROR` and counted in `kimmy_validator_unparseable_total`.
+- **A definition-digest difference in the validator is a finding, not a repair**: like any definition that is not a missing plain index, the definition repair does not apply it. Ordinary replication and snapshot pages are what converge it.
+
+**Why.** Coordinating the change would give up availability on every write to the collection, and refusing replicated documents would make members diverge permanently: a document one member holds and another refuses is never reconciled. Accepting both is the choice every other replicated constraint here makes (a `local` unique index, [ADR-020](decisions.md)).
+
+**What it costs.** A schema is a strong guard on one member and an eventually-true property of the cluster. A reader must not assume every stored document conforms.
+
+**Closing it** means a coordinated schema change that every member acknowledges before the guard is enforced, and a decision about documents that arrive failing it. Not planned.
+
+---
+
+## 🟡 `$jsonSchema` refuses the keywords it does not implement
+
+**Raised 2026-10-28, with ADR-257.** `$jsonSchema` is built as a filter operator ([query-language.md](query-language.md#jsonschema)), with draft-4 semantics and `bsonType`, as MongoDB reads it. Where it differs:
+
+- **A keyword outside the supported list is a `400` at parse**, naming it and where it stands, wherever it is nested: `$ref`, `$schema`, `default`, `definitions`, `format`, `id`, `contentMediaType`, and any unknown one. The only keywords read and ignored are `title` and `description`; nothing else is skipped silently.
+- **`pattern` and `patternProperties` use the `$regex` engine**, not PCRE: no backreferences or lookaround, a size limit per pattern, and a count shared with the filter's other patterns (32).
+- **`required`, `enum`, `allOf`, `anyOf`, `oneOf`, a property dependency's array and `bsonType`/`type` arrays must be non-empty**, and `required` and a dependency's array hold distinct names, as the draft-4 meta-schema says. `exclusiveMinimum` and `exclusiveMaximum` are the draft-4 booleans and need `minimum` / `maximum` beside them.
+- **A schema nests at most 32 levels.**
+
+**Why.** A validator that ignored a keyword it did not understand would accept documents its author meant to reject, and a `$ref` or `format` that is quietly skipped looks like a schema that works. A refusal can be relaxed later without changing an answer anyone relied on.
+
+**What it costs.** A schema generated by a tool that emits `$schema`, `default` or `format` has to have them removed first.
+
+**Closing it** means implementing a keyword, one at a time; a `$ref` needs a decision about where references resolve. Not planned.
+
+---
+
 ## 🟡 `$graphLookup` requires `maxDepth`, caps it at 1000, holds its collection against the document limit and orders its result
 
 **Raised 2026-10-26, with ADR-254.** `$graphLookup` is built

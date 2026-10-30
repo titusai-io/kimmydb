@@ -73,6 +73,8 @@ has been incomplete before.
 | `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `ddl` |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `ddl` |
 | `GET` | `/v1/db/{db}/coll/{coll}/violations` | `read` — unique violations still standing ([Indexes](indexes.md#resolving-a-unique-violation)) |
+| `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/validator` | `ddl` — set, replace or remove the collection's `$jsonSchema` validator ([Validators](validation.md)) |
+| `GET` | `/v1/db/{db}/coll/{coll}/validator/violations` | `read` — the documents that fail the current validator, found by a scan, paged ([Validators](validation.md#finding-the-documents-that-fail-it)) |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | `watch` (WebSocket) |
 | `GET` | `/v1/admin/backup` | `admin` over `*` — see [Backup](#backup) |
 | `POST` | `/mcp` | authenticated; per-tool ([MCP](mcp.md)) |
@@ -522,6 +524,9 @@ curl "localhost:7878/v1/db/shop/coll/orders/describe?sample=200&examples=true" -
 | `sample` | Documents to inspect. Default 100. `0` is refused `400` naming the parameter — a sample of nothing describes nothing — and a value above 1000 is clamped to 1000, as `find` clamps `limit`; `sampled` in the answer is how many were actually read |
 | `examples` | Include one example value per field |
 
+The answer also carries the collection's `validator` (`null` when it has none) and,
+with one, its `validationAction` and `validationLevel`.
+
 Array elements are reported under `path[]`, matching how a query on the field
 matches an *element*. `presence` is a fraction of the **sample**, counting
 documents — it is inference, not a schema, and a field missing from the sample
@@ -559,9 +564,15 @@ The same information backs the MCP `describe_collection` tool; see
 curl localhost:7878/v1/databases -H "$A"
 curl localhost:7878/v1/db/shop/collections -H "$A"
 curl -XPOST localhost:7878/v1/db/shop/collections -H "$A" -d '{"name":"orders"}'
+curl -XPOST localhost:7878/v1/db/shop/collections -H "$A" \
+  -d '{"name":"orders","validator":{"$jsonSchema":{"required":["sku"]}},"validationAction":"warn"}'
 curl -XDELETE localhost:7878/v1/db/shop/coll/orders -H "$A"
 curl -XDELETE localhost:7878/v1/db/shop -H "$A"           # every collection in it
 ```
+
+`validator`, `validationAction` and `validationLevel` are optional on creation and
+set the collection's validator ([Validators](validation.md)); a schema that does
+not parse is `400` and creates nothing.
 
 Databases are created implicitly by their first collection and removed
 implicitly with their last: dropping the last collection takes the database
@@ -1399,6 +1410,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 503 | `collection_purging` | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` in seconds; the retry succeeds once the removal is done ([ADR-189](decisions.md)) |
 | 503 | `resolver_busy` | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered ([Operations](operations.md#discovery-formats)). Nothing was done. Carries `Retry-After` in seconds, how long a failed lookup's answer is kept. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
 | 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above; this answer also comes *before* the embedding provider is built, so it is what a node whose provider it could not build answers too, for as long as the collection is empty. The three are different questions, and [Vectors](vectors.md#search) puts them side by side |
+| 422 | `validation_failed` | no | A write that would store a document failing its collection's validator, under `validationAction: "error"` ([Validators](validation.md)): insert, a bulk batch (refused whole, naming the position), replace, upsert, every update, `find_and_modify`, and a `$merge` or `$out` write. The message names the keyword path that failed. Replication, snapshots and restore are never refused |
 | 413 | `payload_too_large` | no | Request body over `server.max_body_bytes` (2 MiB by default) |
 | 413 | `document_too_large` | no | A write that would store a document encoding to more than 16 MiB, checked on the result: insert, a bulk batch (refused whole), replace, upsert, and any update, including through `arr.$[]`. A `multi` update over it in a later chunk is `500 partially_applied` with this code in `cause` ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)) |
 | 413 | `id_too_large` | no | An `_id` over 4096 bytes (a string or binary id), named in a write or in the path of any by-id route: `GET`, `PUT`, `DELETE` and the vector by-id routes |

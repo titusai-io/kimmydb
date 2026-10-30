@@ -172,13 +172,35 @@ pub fn create_collection(
     db: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
+    create_collection_validated(state, auth, db, name, None)
+}
+
+/// [`create_collection`] with a validator set at creation (ADR-257).
+///
+/// The validator is parsed before the collection exists, so a bad schema creates
+/// nothing. It is written with the collection in one transaction and replicated in
+/// the one `CreateCollection` entry, so the collection never stands, here or on a
+/// member that applies the entry, without the validator it was created with.
+pub fn create_collection_validated(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    name: &str,
+    validator: Option<kimmy_core::ValidatorSpec>,
+) -> Result<Value, ApiError> {
     let _span = op_span("create_collection", db, Some(name)).entered();
     auth.require(Action::Ddl, db, Some(name))?;
+    if let Some(spec) = &validator {
+        kimmy_storage::check_validator_spec(spec)?;
+    }
     // Off the async worker, as every schema change here is: an index build or
     // drop takes as long as the data under it, and any of them can wait for
     // the single writer for the whole of the request's budget. A handler that
     // holds a worker stalls every task queued on it (ADR-153).
-    let meta = kimmy_storage::blocking(|| state.engine.create_collection(db, name))?;
+    let meta = kimmy_storage::blocking(|| match validator {
+        Some(spec) => state.engine.create_collection_with_validator(db, name, spec),
+        None => state.engine.create_collection(db, name),
+    })?;
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
 }
 

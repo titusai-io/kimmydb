@@ -200,6 +200,7 @@ fn operation_name(kind: kimmy_core::OpKind) -> &'static str {
         kimmy_core::OpKind::CreateIndex => "createIndex",
         kimmy_core::OpKind::DropIndex => "dropIndex",
         kimmy_core::OpKind::ConfigureVectors => "configureVectors",
+        kimmy_core::OpKind::ConfigureValidator => "configureValidator",
         kimmy_core::OpKind::UniqueViolation => "uniqueViolation",
     }
 }

@@ -5,7 +5,7 @@
 //! able to read it directly when diagnosing a broken data directory is worth
 //! more than the space.
 
-pub use kimmy_core::{Enforcement, IndexField, IndexMeta, VectorConfig};
+pub use kimmy_core::{Enforcement, IndexField, IndexMeta, ValidatorSpec, VectorConfig};
 use kimmy_core::{Hlc, ids::CollectionId};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,17 @@ pub struct CollectionMeta {
     ///
     /// Not inside `VectorConfig`, which refuses unknown fields.
     pub vector_changed: Option<kimmy_core::Stamp>,
+    /// The collection's validator, when it has one (ADR-257).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator: Option<ValidatorSpec>,
+    /// The stamp of the latest change to `validator`: setting it, replacing it, or
+    /// removing it. As for `vector_changed` (ADR-226), it makes "removed" a dated
+    /// fact: the entries path and a snapshot page both apply a change only when it is
+    /// newer than the one standing, so two members that changed the validator
+    /// concurrently converge on the later stamp and a page can say "off at s".
+    /// `None` on a collection whose validator was never changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_changed: Option<kimmy_core::Stamp>,
     /// The stamp below which an entry targets a **previous incarnation** of
     /// this collection.
     ///
@@ -126,6 +137,8 @@ impl CollectionMeta {
             index_id_counter: 0,
             vector: None,
             vector_changed: None,
+            validator: None,
+            validator_changed: None,
             incarnation_floor,
             redated: None,
         }

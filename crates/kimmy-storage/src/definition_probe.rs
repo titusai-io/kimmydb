@@ -6,7 +6,7 @@
 //! collection's digest is computed from its metadata.
 //!
 //! **One exchange.** Every definition change carries a stamp (an index's
-//! `created`, an `INDEXES_DROPPED` stamp, `vector_changed`). A collection with a
+//! `created`, an `INDEXES_DROPPED` stamp, `vector_changed`, `validator_changed`). A collection with a
 //! stamp **above the cut** is in motion and is deferred
 //! ([`DefinitionDefer::DefinitionAboveCut`]); at or below it, nothing can change
 //! what is hashed without a stamp above the cut. So the responder answers from
@@ -398,6 +398,7 @@ impl Engine {
             .iter()
             .filter_map(|i| i.created.as_ref())
             .chain(meta.vector_changed.as_ref())
+            .chain(meta.validator_changed.as_ref())
             .find(|stamp| above(stamp))
         {
             return Ok(Some(stamp.node));
@@ -607,7 +608,9 @@ impl Engine {
             let Some(hash) = hash_of(pair.hash.as_slice()) else { continue };
             let name = match pair.hint.definition() {
                 DefinitionKind::Index => pair.name.clone(),
-                DefinitionKind::Vector => String::new(),
+                // A validator is never refused (ADR-257), so no hint is about one; named
+                // for the match to be total.
+                DefinitionKind::Vector | DefinitionKind::Validator => String::new(),
             };
             let key = DefinitionKey { kind: pair.hint.definition(), name };
             let valid = if pair.hint.is_drop() {

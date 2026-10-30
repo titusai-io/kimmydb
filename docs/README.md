@@ -75,6 +75,7 @@ graph TD
 | [Storage](storage.md) | redb tables, on-disk record formats, tombstones, durability |
 | [Key Encoding](key-encoding.md) | Order-preserving byte encoding — the subtlest component |
 | [Indexes](indexes.md) | Index maintenance, the planner, multikey and unique semantics |
+| [Validators](validation.md) | A collection's `$jsonSchema` validator: what it refuses, warn and moderate, and what replication does with it |
 | [Time & Conflicts](time-and-conflicts.md) | Hybrid logical clocks, last-writer-wins, the consistency model |
 | [Oplog](oplog.md) | The shared log, its three consumers, retention |
 | [Vectors](vectors.md) | Auto-embeddings, providers, chunking, the two search paths |

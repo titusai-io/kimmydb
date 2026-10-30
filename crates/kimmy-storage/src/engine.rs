@@ -144,6 +144,8 @@ pub struct Engine {
     /// which is what M11 task 1 needed: the daemon was paying two commits per
     /// insert where a bare engine paid one, and nothing said so.
     commits: std::sync::atomic::AtomicU64,
+    /// The parsed validators and their counters (ADR-257).
+    pub(crate) validators: crate::validator::ValidatorState,
     /// Documents a `multi: true` filtered write commits per transaction
     /// (ADR-086). Set from configuration at startup; the storage default
     /// stands for a bare engine.
@@ -1553,6 +1555,7 @@ impl Engine {
             definition_fail_in: std::sync::atomic::AtomicU32::new(0),
             hint_write_fails: std::sync::atomic::AtomicBool::new(false),
             commits: std::sync::atomic::AtomicU64::new(0),
+            validators: Default::default(),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
             ),
@@ -3671,7 +3674,7 @@ impl Engine {
     }
 
     /// The highest stamp the stored metadata carries: each collection's `created`,
-    /// incarnation floor, vector-change stamp and indexes' creation stamps, and the
+    /// incarnation floor, vector- and validator-change stamps and indexes' creation stamps, and the
     /// collection and index drop tombstones.
     ///
     /// A snapshot restores these with its sender's stamps and folds them into the
@@ -3694,6 +3697,7 @@ impl Engine {
                 high = high.max(meta.created);
                 high = high.max(meta.incarnation_floor.unwrap_or(Hlc::ZERO));
                 high = high.max(meta.vector_changed.map_or(Hlc::ZERO, |stamp| stamp.hlc));
+                high = high.max(meta.validator_changed.map_or(Hlc::ZERO, |stamp| stamp.hlc));
                 for index in &meta.indexes {
                     high = high.max(index.created.map_or(Hlc::ZERO, |stamp| stamp.hlc));
                 }
@@ -4396,7 +4400,38 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
-        self.create_collection_marked(db, name, log, origin, history, None, None)
+        self.create_collection_marked(db, name, log, origin, history, None, None, None)
+    }
+
+    /// Create a collection **with its validator, in one transaction** (ADR-257).
+    ///
+    /// The metadata is written with the validator set and the `CreateCollection` entry
+    /// carries it, so the collection is never durable here without the validator it
+    /// was created with, no insert can land between the two, and a member applying the
+    /// entry creates both in one transaction. The validator is stamped with the
+    /// creation's own stamp. A schema that does not parse is refused before anything
+    /// is written.
+    pub fn create_collection_with_validator(
+        &self,
+        db: &str,
+        name: &str,
+        validator: kimmy_core::ValidatorSpec,
+    ) -> Result<CollectionMeta> {
+        CoreError::validate_name(db)?;
+        CoreError::validate_name(name)?;
+        crate::validator::check_validator_spec(&validator)?;
+        Ok(self
+            .create_collection_marked(
+                db,
+                name,
+                true,
+                None,
+                &|_| false,
+                None,
+                None,
+                Some((&validator, None)),
+            )?
+            .expect("a creation that judges nothing history always creates"))
     }
 
     /// [`Self::create_collection_inner`] for a life a collection's drop re-dated
@@ -4414,6 +4449,7 @@ impl Engine {
         history: &dyn Fn(Stamp) -> bool,
         redated_from: Option<Hlc>,
         sender_floor: Option<Hlc>,
+        validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
     ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
@@ -4434,7 +4470,7 @@ impl Engine {
         // that reason: a caller that mints one mints it with the writer held,
         // and a replicated shadow takes its configuration entry's stamp.
         let mint = || self.next_stamp();
-        match self.create_collection_in_txn(&txn, db, name, log, origin, history, mint) {
+        match self.create_collection_in_txn(&txn, db, name, log, origin, history, mint, validator) {
             Ok(InTxn::Created(mut meta, logged)) => {
                 let mut changed = false;
                 if let Some(from) = redated_from {
@@ -4505,6 +4541,7 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
         mint: impl FnOnce() -> Stamp,
+        validator: Option<(&kimmy_core::ValidatorSpec, Option<Stamp>)>,
     ) -> Result<InTxn> {
         let id = CollectionId::derive(db, name);
         let (meta, stamp) = {
@@ -4631,8 +4668,15 @@ impl Engine {
             // entry's stamp rather than this node's clock at apply time. A
             // replayed drop is judged against it, and a local clock would
             // misjudge a legitimate drop stamped just before a late apply.
-            let meta =
+            let mut meta =
                 CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
+            // A validator the collection is created with is written with it, stamped
+            // by the creation that carries it (the entry's stamp from elsewhere, this
+            // creation's own here), so no state holds the collection without it.
+            if let Some((spec, at)) = validator {
+                meta.validator = Some(spec.clone());
+                meta.validator_changed = Some(at.unwrap_or(stamp));
+            }
             collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;
             // A name dropped and created again derives the same id: the new
             // incarnation starts with no digest row, so the old one's highest
@@ -4677,7 +4721,11 @@ impl Engine {
                 stamp,
                 OpKind::CreateCollection,
                 meta.id,
-                &kimmy_core::CollectionRef::new(db, name),
+                &kimmy_core::CollectionCreate {
+                    db: db.to_string(),
+                    name: name.to_string(),
+                    validator: validator.map(|(spec, _)| spec.clone()),
+                },
             )?;
             append_oplog(txn, &entry)?;
             Some(entry)

@@ -90,7 +90,7 @@ graph TB
         CLU["kimmy-cluster<br/>discovery · replication<br/>SWIM membership ✅"]
     end
 
-    CORE["kimmy-core — Hlc · Stamp · DocId · DocRecord · OplogEntry · keyenc · cmp<br/>(no I/O)"]
+    CORE["kimmy-core — Hlc · Stamp · DocId · DocRecord · OplogEntry · keyenc · cmp · json_schema<br/>(no I/O)"]
 
     API --> AUTH
     MCP --> API

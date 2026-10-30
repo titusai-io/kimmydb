@@ -642,6 +642,8 @@ impl Engine {
         if self.caps_apply() {
             kimmy_core::limits::check_document(body.len())?;
         }
+        // The collection's validator, on the document as it will be stored (ADR-257).
+        self.check_validation(coll, None, &doc)?;
 
         // A tombstone may still occupy the key; overwriting it is a
         // legitimate resurrection, but a live document is a conflict.
@@ -839,6 +841,9 @@ impl Engine {
             if self.caps_apply() {
                 kimmy_core::limits::check_document(body.len())?;
             }
+            // The validator, on the image to be stored, against the stored document
+            // when there is one (ADR-257): an upsert that creates it is an insert.
+            self.check_validation(coll, previous.as_ref(), &doc)?;
             // Same transaction as the document write, so the index cannot
             // describe a state that never existed. A unique violation returns
             // here, before anything is minted, and the caller aborts, which

@@ -4331,6 +4331,373 @@ fn strip_ansi(line: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// A collection's validator across members (ADR-257)
+// ---------------------------------------------------------------------------
+
+fn validator_schema() -> serde_json::Value {
+    serde_json::json!({ "$jsonSchema": {
+        "bsonType": "object",
+        "required": ["qty"],
+        "properties": { "qty": { "bsonType": "number", "minimum": 0 } },
+    }})
+}
+
+/// The `validator` the member reports for `shop.<coll>`: `Some(null)` when the collection
+/// has none, `None` while the member does not hold the collection.
+async fn validator_on(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    coll: &str,
+) -> Option<serde_json::Value> {
+    let res = client
+        .get(node.url(&format!("/v1/db/shop/coll/{coll}/describe")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
+    if res.status() != 200 {
+        return None;
+    }
+    let body: serde_json::Value = res.json().await.ok()?;
+    Some(body["validator"].clone())
+}
+
+/// Insert `doc` into `shop.<coll>` on `node`, answering the status.
+async fn insert_status(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    coll: &str,
+    doc: serde_json::Value,
+) -> u16 {
+    client
+        .post(node.url(&format!("/v1/db/shop/coll/{coll}/docs")))
+        .bearer_auth(token)
+        .json(&doc)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// The `_id`s the member's validator report lists for `shop.<coll>`.
+async fn reported_ids(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    coll: &str,
+) -> Vec<serde_json::Value> {
+    let res = client
+        .get(node.url(&format!("/v1/db/shop/coll/{coll}/validator/violations")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap_or_default();
+    body["violations"]
+        .as_array()
+        .map(|rows| rows.iter().map(|row| row["_id"].clone()).collect())
+        .unwrap_or_default()
+}
+
+async fn create_collection_on(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    body: serde_json::Value,
+) {
+    let res = client
+        .post(node.url("/v1/db/shop/collections"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{:?}", res.text().await);
+}
+
+/// A validator set on one member reaches the others, which refuse what it forbids, and its
+/// removal reaches them too.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_validator_set_on_one_member_is_enforced_by_the_others_and_its_removal_follows() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let (a_token, b_token, c_token) =
+        (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+    create_collection_on(&client, &a, &a_token, serde_json::json!({ "name": "items" })).await;
+    for (node, token) in [(&b, &b_token), (&c, &c_token)] {
+        eventually("the collection to reach the member", || {
+            let (client, node, token) = (&client, node, token);
+            async move { validator_on(client, node, token, "items").await.is_some() }
+        })
+        .await;
+    }
+
+    let set = client
+        .put(a.url("/v1/db/shop/coll/items/validator"))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({ "validator": validator_schema() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), 200, "{:?}", set.text().await);
+    for (node, token) in [(&b, &b_token), (&c, &c_token)] {
+        eventually("the validator to reach the member", || {
+            let (client, node, token) = (&client, node, token);
+            async move {
+                validator_on(client, node, token, "items").await == Some(validator_schema())
+            }
+        })
+        .await;
+    }
+    // B refuses what the validator forbids, and takes what it allows.
+    let bad =
+        insert_status(&client, &b, &b_token, "items", serde_json::json!({ "_id": 1, "qty": -1 }))
+            .await;
+    assert_eq!(bad, 422);
+    let good =
+        insert_status(&client, &b, &b_token, "items", serde_json::json!({ "_id": 2, "qty": 1 }))
+            .await;
+    assert_eq!(good, 200);
+
+    // Removing it replicates: the members stop refusing.
+    let removed = client
+        .delete(a.url("/v1/db/shop/coll/items/validator"))
+        .bearer_auth(&a_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200, "{:?}", removed.text().await);
+    for (node, token) in [(&b, &b_token), (&c, &c_token)] {
+        eventually("the removal to reach the member", || {
+            let (client, node, token) = (&client, node, token);
+            async move {
+                validator_on(client, node, token, "items").await == Some(serde_json::Value::Null)
+            }
+        })
+        .await;
+    }
+    let now_ok =
+        insert_status(&client, &c, &c_token, "items", serde_json::json!({ "_id": 3, "qty": -1 }))
+            .await;
+    assert_eq!(now_ok, 200);
+}
+
+/// A collection created with a validator reaches the other members with it: the first
+/// time a member holds the collection at all, it holds the validator (the creation is one
+/// entry, applied in one transaction), and it refuses what the validator forbids.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_collection_created_with_a_validator_never_reaches_a_member_without_it() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let (a_token, b_token, c_token) =
+        (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+    create_collection_on(
+        &client,
+        &a,
+        &a_token,
+        serde_json::json!({ "name": "items", "validator": validator_schema() }),
+    )
+    .await;
+    for (node, token) in [(&b, &b_token), (&c, &c_token)] {
+        // Polled quickly until the member holds the collection; the first answer that is
+        // not "not here yet" is the one that must carry the validator.
+        let mut first = None;
+        for _ in 0..600 {
+            if let Some(held) = validator_on(&client, node, token, "items").await {
+                first = Some(held);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            first,
+            Some(validator_schema()),
+            "the member held the collection, and not the validator it was created with"
+        );
+    }
+    let bad =
+        insert_status(&client, &b, &b_token, "items", serde_json::json!({ "_id": 1, "qty": -1 }))
+            .await;
+    assert_eq!(bad, 422);
+    let good =
+        insert_status(&client, &c, &c_token, "items", serde_json::json!({ "_id": 2, "qty": 1 }))
+            .await;
+    assert_eq!(good, 200);
+}
+
+/// A member that accepted a write before the validator reached it keeps the document, it
+/// replicates to the members that refuse the same write from a client, and every member's
+/// report lists it.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_document_accepted_before_the_validator_arrived_is_kept_everywhere_and_reported() {
+    let client = reqwest::Client::new();
+    let (mut a, mut b, mut c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let a_token = a.login(&client).await;
+    create_collection_on(&client, &a, &a_token, serde_json::json!({ "name": "items" })).await;
+    for node in [&b, &c] {
+        let token = node.login(&client).await;
+        eventually("the collection to reach the member", || {
+            let (client, node, token) = (&client, node, &token);
+            async move { validator_on(client, node, token, "items").await.is_some() }
+        })
+        .await;
+    }
+
+    // C is cut off: it dials nobody, and nobody dials it.
+    let addr = |n: &Node| format!("127.0.0.1:{}", n.cluster);
+    c.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &format!("{},{}", addr(&a), addr(&b)))]);
+    a.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &addr(&c))]);
+    b.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &addr(&c))]);
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    let (a_token, b_token, c_token) =
+        (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+
+    let set = client
+        .put(a.url("/v1/db/shop/coll/items/validator"))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({ "validator": validator_schema() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), 200, "{:?}", set.text().await);
+    eventually("the validator to reach B", || {
+        let (client, b, token) = (&client, &b, &b_token);
+        async move { validator_on(client, b, token, "items").await == Some(validator_schema()) }
+    })
+    .await;
+    assert_eq!(validator_on(&client, &c, &c_token, "items").await, Some(serde_json::Value::Null));
+
+    // The same document: refused where the validator is, accepted where it has not arrived.
+    let bad = serde_json::json!({ "_id": 7, "qty": -1 });
+    assert_eq!(insert_status(&client, &a, &a_token, "items", bad.clone()).await, 422);
+    assert_eq!(insert_status(&client, &b, &b_token, "items", bad.clone()).await, 422);
+    assert_eq!(insert_status(&client, &c, &c_token, "items", bad).await, 200);
+
+    // C rejoins: A and B store its document without judging it, and C takes the validator.
+    for node in [&mut a, &mut b, &mut c] {
+        node.restart_with(&[]);
+    }
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    let (a_token, b_token, c_token) =
+        (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+    eventually("C to take the validator", || {
+        let (client, c, token) = (&client, &c, &c_token);
+        async move { validator_on(client, c, token, "items").await == Some(validator_schema()) }
+    })
+    .await;
+    for (node, token) in [(&a, &a_token), (&b, &b_token), (&c, &c_token)] {
+        eventually("the document to be held and reported by the member", || {
+            let (client, node, token) = (&client, node, token);
+            async move { reported_ids(client, node, token, "items").await == vec![serde_json::json!(7)] }
+        })
+        .await;
+    }
+    // And C now refuses what it accepted before.
+    let again =
+        insert_status(&client, &c, &c_token, "items", serde_json::json!({ "_id": 8, "qty": -1 }))
+            .await;
+    assert_eq!(again, 422);
+}
+
+/// A member that was down while a validator was set, on a collection it had never seen, and
+/// while another was removed, catches up by snapshot and ends with the first and without the
+/// second ("removed at s").
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_snapshot_carries_a_validator_and_its_removal_to_a_member_that_was_down() {
+    let client = reqwest::Client::new();
+    // A short oplog window, so that the history is gone by the time the member returns.
+    let (mut a, mut b, mut c) = three_nodes_with(
+        &client,
+        "oplog_retention_secs = 8\ntombstone_retention_secs = 600\ngc_interval_secs = 2",
+    )
+    .await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let a_token = a.login(&client).await;
+    create_collection_on(
+        &client,
+        &a,
+        &a_token,
+        serde_json::json!({ "name": "items", "validator": validator_schema() }),
+    )
+    .await;
+    let c_token = c.login(&client).await;
+    eventually("C to hold the validator", || {
+        let (client, c, token) = (&client, &c, &c_token);
+        async move { validator_on(client, c, token, "items").await == Some(validator_schema()) }
+    })
+    .await;
+
+    // C is cut off while A removes that validator and creates a collection with another.
+    let addr = |n: &Node| format!("127.0.0.1:{}", n.cluster);
+    c.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &format!("{},{}", addr(&a), addr(&b)))]);
+    a.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &addr(&c))]);
+    b.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &addr(&c))]);
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    let a_token = a.login(&client).await;
+    let removed = client
+        .delete(a.url("/v1/db/shop/coll/items/validator"))
+        .bearer_auth(&a_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200, "{:?}", removed.text().await);
+    create_collection_on(
+        &client,
+        &a,
+        &a_token,
+        serde_json::json!({ "name": "fresh", "validator": validator_schema(), "validationAction": "error" }),
+    )
+    .await;
+
+    // Long enough for A's and B's oplogs to drop all of it.
+    tokio::time::sleep(Duration::from_secs(14)).await;
+    for node in [&mut a, &mut b, &mut c] {
+        node.restart_with(&[]);
+    }
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    let c_token = c.login(&client).await;
+    eventually("C to hold the second collection's validator", || {
+        let (client, c, token) = (&client, &c, &c_token);
+        async move { validator_on(client, c, token, "fresh").await == Some(validator_schema()) }
+    })
+    .await;
+    eventually("C to drop the validator that was removed while it was down", || {
+        let (client, c, token) = (&client, &c, &c_token);
+        async move {
+            validator_on(client, c, token, "items").await == Some(serde_json::Value::Null)
+        }
+    })
+    .await;
+    let log =
+        c.log() + &std::fs::read_to_string(c.dir.path().join("stderr.log")).unwrap_or_default();
+    assert!(
+        log.contains("falling back to a snapshot"),
+        "C caught up by the oplog, not by snapshot:\n{log}"
+    );
+    let bad = serde_json::json!({ "_id": 1, "qty": -1 });
+    assert_eq!(insert_status(&client, &c, &c_token, "fresh", bad.clone()).await, 422);
+    assert_eq!(insert_status(&client, &c, &c_token, "items", bad).await, 200);
+}
+
+// ---------------------------------------------------------------------------
 // The divergence repair, on real processes (repair design sections 15 and 6)
 // ---------------------------------------------------------------------------
 //

@@ -52,12 +52,17 @@ mod store_lock;
 pub mod sync;
 pub mod tables;
 mod tombstone_horizon;
+pub mod validator;
 pub mod vectors;
 pub mod verified;
 pub mod violations_table;
 #[cfg(test)]
 mod violations_table_tests;
 pub mod walk;
+pub use validator::{
+    Compiled as CompiledValidator, VIOLATIONS_PAGE_MAX, VIOLATIONS_SCAN_PAGE, ValidationCount,
+    ValidatorViolations, check_validator_spec,
+};
 pub use verified::VerifiedWalk;
 pub use violations_table::{BackfillStep, ViolationsSnapshot};
 pub use walk::WalkScope;
@@ -122,6 +127,8 @@ mod decimal_definition_tests;
 mod size_cap_tests;
 #[cfg(test)]
 mod snapshot_pages_tests;
+#[cfg(test)]
+mod validator_tests;
 #[cfg(test)]
 mod writer_reread_tests;
 

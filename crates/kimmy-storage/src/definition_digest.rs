@@ -33,7 +33,8 @@
 
 use kimmy_core::index_meta::stored_filter;
 use kimmy_core::{
-    ChunkConfig, Enforcement, IndexField, IndexMeta, Metric, ProviderConfig, VectorConfig,
+    ChunkConfig, Enforcement, IndexField, IndexMeta, Metric, ProviderConfig, ValidationAction,
+    ValidationLevel, ValidatorSpec, VectorConfig,
 };
 
 use crate::meta::CollectionMeta;
@@ -41,6 +42,12 @@ use crate::meta::CollectionMeta;
 /// The definition digest's format: what is hashed and how it is framed. A
 /// change to either bumps it, so a digest from a build under another format is
 /// never equal to this one's by accident.
+///
+/// The validator (ADR-257) joined the list without a bump: no hash of an index or a
+/// vector configuration changed, the framing did not change, and the list of a
+/// collection with no validator is byte for byte what it was, so a digest is equal
+/// across the change exactly where the definitions are. A collection that has a
+/// validator differs from one that has not, which is the finding wanted.
 pub const FORMAT: u8 = 2;
 
 /// What a definition is. Not a name's business: an index can be named anything.
@@ -51,6 +58,7 @@ pub const FORMAT: u8 = 2;
 pub enum DefinitionKind {
     Index,
     Vector,
+    Validator,
 }
 
 /// One definition of a collection: an index by its name, or its vector
@@ -72,6 +80,10 @@ impl DefinitionKey {
     pub fn vector() -> Self {
         Self { kind: DefinitionKind::Vector, name: String::new() }
     }
+
+    pub fn validator() -> Self {
+        Self { kind: DefinitionKind::Validator, name: String::new() }
+    }
 }
 
 impl std::fmt::Display for DefinitionKey {
@@ -81,6 +93,7 @@ impl std::fmt::Display for DefinitionKey {
         match self.kind {
             DefinitionKind::Index => write!(f, "index {}", self.name),
             DefinitionKind::Vector => write!(f, "the vector configuration"),
+            DefinitionKind::Validator => write!(f, "the validator"),
         }
     }
 }
@@ -92,6 +105,7 @@ pub type DefinitionHash = u128;
 /// list can never be equal to one another by construction.
 const INDEX: u8 = b'I';
 const VECTOR: u8 = b'V';
+const VALIDATOR: u8 = b'A';
 const LIST: u8 = b'C';
 
 /// Bytes being framed: every variable-length value is length-prefixed and every
@@ -271,8 +285,26 @@ pub fn vector_hash(config: &VectorConfig) -> DefinitionHash {
     frame.finish()
 }
 
+/// The hash of a validator: its schema as the canonical Extended JSON `compared()`
+/// renders (the same rendering a partial filter is hashed by), and its two policies.
+/// Not the stamp of its last change, for the reason `vector_hash` gives.
+pub fn validator_hash(spec: &ValidatorSpec) -> DefinitionHash {
+    let ValidatorSpec { schema, action, level } = spec;
+    let mut frame = Frame::new(VALIDATOR);
+    frame.opt_str(stored_filter::compared(&Some(schema.clone())).as_deref());
+    frame.tag(match action {
+        ValidationAction::Error => 0,
+        ValidationAction::Warn => 1,
+    });
+    frame.tag(match level {
+        ValidationLevel::Strict => 0,
+        ValidationLevel::Moderate => 1,
+    });
+    frame.finish()
+}
+
 /// The collection's definitions as `(key, hash)`, indexes sorted by
-/// `(derived id, name)` and the vector configuration, if any, last.
+/// `(derived id, name)`, then the vector configuration and the validator, if any, last.
 ///
 /// Sorted by the id and then the name because the id is a 32-bit hash of the
 /// name and two names can share one; a tie would otherwise order
@@ -290,6 +322,9 @@ pub fn definition_list(meta: &CollectionMeta) -> Vec<(DefinitionKey, DefinitionH
         .collect();
     if let Some(config) = &meta.vector {
         list.push((DefinitionKey::vector(), vector_hash(config)));
+    }
+    if let Some(spec) = &meta.validator {
+        list.push((DefinitionKey::validator(), validator_hash(spec)));
     }
     list
 }
@@ -313,6 +348,7 @@ pub fn digest_of_list(list: &[(DefinitionKey, DefinitionHash)]) -> DefinitionHas
                 frame.str(&key.name);
             }
             DefinitionKind::Vector => frame.tag(1),
+            DefinitionKind::Validator => frame.tag(2),
         }
         frame.0.extend_from_slice(&hash.to_be_bytes());
     }

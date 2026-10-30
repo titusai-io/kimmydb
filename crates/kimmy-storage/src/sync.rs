@@ -1670,8 +1670,10 @@ impl Engine {
 /// tombstone for ever. A definition at or before the drop is of the life it ended,
 /// as everywhere else.
 pub(crate) fn defines_a_later_life(entry: &OplogEntry, dropped: Stamp) -> bool {
-    matches!(entry.kind, OpKind::CreateIndex | OpKind::ConfigureVectors)
-        && entry.stamp.hlc > dropped.hlc
+    matches!(
+        entry.kind,
+        OpKind::CreateIndex | OpKind::ConfigureVectors | OpKind::ConfigureValidator
+    ) && entry.stamp.hlc > dropped.hlc
 }
 
 /// Whether a collection's creation, stamped `created` at its origin, belongs to
@@ -2251,6 +2253,45 @@ impl Engine {
         Ok(Step::Taken)
     }
 
+    /// The validator a `CreateCollection` entry carries, for a collection this node
+    /// already held when it met the entry: applied as a `ConfigureValidator` at the
+    /// entry's stamp would be, so a validator already held at that stamp or a later one
+    /// stands (ADR-257). `None` when there is nothing to do, or it is done; otherwise
+    /// what the entry's outcome is.
+    fn validator_of_a_creation(
+        &self,
+        target: &kimmy_core::CollectionCreate,
+        entry: &OplogEntry,
+    ) -> Result<Option<DdlOutcome>> {
+        let Some(spec) = &target.validator else {
+            return Ok(None);
+        };
+        let applied = settle(self.set_validator_inner(
+            &target.db,
+            &target.name,
+            Some(spec.clone()),
+            crate::validator::Validated::FromEntry(entry.stamp),
+            &|standing| self.definition_of_an_ended_life(standing, entry.stamp),
+        ))?;
+        Ok(match applied {
+            Ddl::Applied(_) => None,
+            Ddl::Gone => {
+                Some(DdlOutcome::UnknownCollection(format!("{}.{}", target.db, target.name)))
+            }
+            Ddl::Refused(reason) => {
+                warn!(
+                    db = %target.db,
+                    collection = %target.name,
+                    reason = %reason,
+                    "skipped a replicated validator this node cannot apply; the divergence is \
+                     counted in kimmy_sync_ddl_refused_total"
+                );
+                Some(DdlOutcome::Refused)
+            }
+            Ddl::PurgePending(name) => Some(DdlOutcome::PurgePending(name)),
+        })
+    }
+
     /// Apply a replicated schema change.
     ///
     /// Every arm is idempotent, because a peer resending an overlapping range
@@ -2282,7 +2323,7 @@ impl Engine {
         let mut recorded_with_the_append: Vec<(CollectionId, Stamp)> = Vec::new();
         match entry.kind {
             OpKind::CreateCollection => {
-                let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
+                let target: kimmy_core::CollectionCreate = bson::deserialize_from_slice(body)?;
 
                 // The name a database's drop is filed under is no collection
                 // (ADR-229): a client cannot create it, and a peer that sends
@@ -2337,7 +2378,14 @@ impl Engine {
                 }
 
                 match self.get_collection(&target.db, &target.name) {
-                    Ok(_) => {}
+                    // Held already: by this entry applied before, or by another creation
+                    // of the name. The validator it carries is then a change like a
+                    // `ConfigureValidator`'s, last writer winning on the stamp.
+                    Ok(_) => {
+                        if let Some(outcome) = self.validator_of_a_creation(&target, entry)? {
+                            return Ok(outcome);
+                        }
+                    }
                     Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
                         ..
                     })) => {
@@ -2345,12 +2393,17 @@ impl Engine {
                         race_hooks::reach(race_hooks::Race::ReplicatedCreate);
                         // The tombstone rule above, judged again under the
                         // writer: a drop can land between that check and here.
-                        match self.create_collection_inner(
+                        // A validator the entry carries is written with the
+                        // collection, in the one transaction (ADR-257).
+                        match self.create_collection_marked(
                             &target.db,
                             &target.name,
                             false,
                             Some(entry.stamp.hlc),
                             &|dropped_at| creation_is_history(entry.stamp.hlc, dropped_at.hlc),
+                            None,
+                            None,
+                            target.validator.as_ref().map(|spec| (spec, Some(entry.stamp))),
                         ) {
                             Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");
@@ -2400,6 +2453,11 @@ impl Engine {
                                     collection = %target.name,
                                     "a replicated collection was created by a concurrent apply"
                                 );
+                                if let Some(outcome) =
+                                    self.validator_of_a_creation(&target, entry)?
+                                {
+                                    return Ok(outcome);
+                                }
                             }
                             Err(e) => return Err(e),
                         }
@@ -2771,6 +2829,38 @@ impl Engine {
                             refused_config.as_ref(),
                             entry.stamp,
                         )?;
+                        return Ok(DdlOutcome::Refused);
+                    }
+                    Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
+                }
+            }
+            OpKind::ConfigureValidator => {
+                let target: kimmy_core::ValidatorSet = bson::deserialize_from_slice(body)?;
+                // Last writer wins, on the stamp, and never refused for what the schema
+                // says: a replicated change is applied as sent (ADR-257).
+                let applied = settle(self.set_validator_inner(
+                    &target.db,
+                    &target.collection,
+                    target.validator,
+                    crate::validator::Validated::FromEntry(entry.stamp),
+                    &|standing| self.definition_of_an_ended_life(standing, entry.stamp),
+                ))?;
+                match applied {
+                    Ddl::Applied(_) => {}
+                    Ddl::Gone => {
+                        return Ok(DdlOutcome::UnknownCollection(format!(
+                            "{}.{}",
+                            target.db, target.collection
+                        )));
+                    }
+                    Ddl::Refused(reason) => {
+                        warn!(
+                            db = %target.db,
+                            collection = %target.collection,
+                            reason = %reason,
+                            "skipped a replicated validator this node cannot apply; the \
+                             divergence is counted in kimmy_sync_ddl_refused_total"
+                        );
                         return Ok(DdlOutcome::Refused);
                     }
                     Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
