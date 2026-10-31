@@ -213,7 +213,7 @@ written:
 invalid query: cannot index parallel arrays [sizes] [tags] (index "tags_1_sizes_1", _id 1)
 ```
 
-(the `invalid query: ` prefix is the status line's own; the rest is the reference wording)
+(the `invalid query: ` prefix is how the error kind renders inside the JSON `message`; the status line is `400 Bad Request`; the rest is the reference wording)
 
 or, for the second shape, `invalid query: document would produce more than 1000 index keys,
 the most one document may have in an index (index "tags_1", _id 1)`. Creating an
