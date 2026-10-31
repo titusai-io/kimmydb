@@ -66,7 +66,11 @@
 //! 1]}` is an error because a string is not a number. Returning null for both
 //! would make a typo and a type error indistinguishable in the output.
 
+mod docops;
 mod math;
+mod strings;
+
+pub(crate) use docops::merge_into;
 
 use std::cmp::Ordering;
 
@@ -111,6 +115,11 @@ pub enum Op {
     Substr,
     Split,
     StrLenCp,
+    IndexOfCp,
+    IndexOfBytes,
+    Strcasecmp,
+    StrLenBytes,
+    SubstrBytes,
     // Conditional
     Cond,
     IfNull,
@@ -156,6 +165,9 @@ pub enum Op {
     // Documents and arrays of pairs
     ObjectToArray,
     ArrayToObject,
+    MergeObjects,
+    // Types
+    IsNumber,
     // Escape
     Literal,
 }
@@ -192,6 +204,11 @@ impl Op {
             "$substr" | "$substrCP" => Op::Substr,
             "$split" => Op::Split,
             "$strLenCP" => Op::StrLenCp,
+            "$indexOfCP" => Op::IndexOfCp,
+            "$indexOfBytes" => Op::IndexOfBytes,
+            "$strcasecmp" => Op::Strcasecmp,
+            "$strLenBytes" => Op::StrLenBytes,
+            "$substrBytes" => Op::SubstrBytes,
             "$cond" => Op::Cond,
             "$ifNull" => Op::IfNull,
             "$eq" => Op::Eq,
@@ -230,6 +247,8 @@ impl Op {
             "$allElementsTrue" => Op::AllElementsTrue,
             "$objectToArray" => Op::ObjectToArray,
             "$arrayToObject" => Op::ArrayToObject,
+            "$mergeObjects" => Op::MergeObjects,
+            "$isNumber" => Op::IsNumber,
             "$literal" => Op::Literal,
             _ => return None,
         })
@@ -259,6 +278,11 @@ impl Op {
             Op::Substr => "$substr",
             Op::Split => "$split",
             Op::StrLenCp => "$strLenCP",
+            Op::IndexOfCp => "$indexOfCP",
+            Op::IndexOfBytes => "$indexOfBytes",
+            Op::Strcasecmp => "$strcasecmp",
+            Op::StrLenBytes => "$strLenBytes",
+            Op::SubstrBytes => "$substrBytes",
             Op::Cond => "$cond",
             Op::IfNull => "$ifNull",
             Op::Eq => "$eq",
@@ -297,6 +321,8 @@ impl Op {
             Op::AllElementsTrue => "$allElementsTrue",
             Op::ObjectToArray => "$objectToArray",
             Op::ArrayToObject => "$arrayToObject",
+            Op::MergeObjects => "$mergeObjects",
+            Op::IsNumber => "$isNumber",
             Op::Literal => "$literal",
         }
     }
@@ -311,12 +337,14 @@ impl Op {
             | Op::ConcatArrays
             | Op::SetUnion
             | Op::SetIntersection => Arity::AtLeast(1),
+            Op::MergeObjects => Arity::AtLeast(0),
             Op::SetEquals => Arity::AtLeast(2),
             Op::Subtract
             | Op::Divide
             | Op::Mod
             | Op::Pow
             | Op::Split
+            | Op::Strcasecmp
             | Op::IfNull
             | Op::Eq
             | Op::Ne
@@ -329,7 +357,8 @@ impl Op {
             | Op::In
             | Op::SetDifference
             | Op::SetIsSubset => Arity::Exact(2),
-            Op::Substr => Arity::Exact(3),
+            Op::Substr | Op::SubstrBytes => Arity::Exact(3),
+            Op::IndexOfCp | Op::IndexOfBytes => Arity::Between(2, 4),
             Op::Cond => Arity::Exact(3),
             Op::Slice | Op::Range => Arity::Between(2, 3),
             Op::Round | Op::Trunc => Arity::Between(1, 2),
@@ -344,6 +373,8 @@ impl Op {
             | Op::ToUpper
             | Op::ToLower
             | Op::StrLenCp
+            | Op::StrLenBytes
+            | Op::IsNumber
             | Op::Not
             | Op::Year
             | Op::Month
@@ -528,6 +559,11 @@ pub enum Expr {
     SortArray { input: Box<Expr>, order: ArrayOrder },
     /// `{$zip: {inputs: [<expr>, ...], useLongestLength: <bool>, defaults: [<expr>, ...]}}`.
     Zip { inputs: Vec<Expr>, longest: bool, defaults: Option<Vec<Expr>> },
+    /// `$trim`, `$ltrim`, `$rtrim`, `$regexMatch`, `$regexFind`, `$regexFindAll`,
+    /// `$replaceOne` and `$replaceAll` (ADR-260).
+    Str(Box<strings::StrExpr>),
+    /// `$getField`, `$setField`, `$unsetField` and `$type` (ADR-260).
+    Doc(Box<docops::DocExpr>),
     /// A document whose values are expressions.
     Object(Vec<(String, Expr)>),
     /// An array whose elements are expressions, evaluated in order to the
@@ -991,6 +1027,8 @@ impl Expr {
             Expr::Zip { inputs, defaults, .. } => {
                 any(inputs) || defaults.as_deref().is_some_and(any)
             }
+            Expr::Str(s) => s.children().into_iter().any(Expr::reads_document),
+            Expr::Doc(d) => d.reads_current() || d.children().into_iter().any(Expr::reads_document),
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_document()),
             Expr::Array(items) => any(items),
         }
@@ -1014,6 +1052,8 @@ impl Expr {
             | Expr::Reduce { .. }
             | Expr::SortArray { .. }
             | Expr::Zip { .. }
+            | Expr::Str(_)
+            | Expr::Doc(_)
             | Expr::Object(_)
             | Expr::Array(_) => "an expression".to_string(),
         }
@@ -1065,6 +1105,11 @@ impl Expr {
             Expr::SortArray { input, .. } => input.reads_variable(names),
             Expr::Zip { inputs, defaults, .. } => {
                 any(inputs) || defaults.as_deref().is_some_and(any)
+            }
+            Expr::Str(s) => s.children().into_iter().any(|e| e.reads_variable(names)),
+            Expr::Doc(d) => {
+                (d.reads_current() && names.iter().any(|n| n == "CURRENT" || n == "ROOT"))
+                    || d.children().into_iter().any(|e| e.reads_variable(names))
             }
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_variable(names)),
             Expr::Array(items) => any(items),
@@ -1238,6 +1283,13 @@ impl Expr {
             "$sortArray" => Self::parse_sort_array(raw, declared),
             "$zip" => Self::parse_zip(raw, declared),
             "$convert" => Self::parse_convert(raw, declared),
+            name @ ("$trim" | "$ltrim" | "$rtrim" | "$regexMatch" | "$regexFind"
+            | "$regexFindAll" | "$replaceOne" | "$replaceAll") => {
+                strings::StrExpr::parse(name, raw, declared)
+            }
+            name @ ("$getField" | "$setField" | "$unsetField" | "$type") => {
+                docops::DocExpr::parse(name, raw, declared)
+            }
             name if ConvertTo::from_shorthand(name).is_some() => {
                 Self::parse_convert_shorthand(name, raw, declared)
             }
@@ -1669,6 +1721,8 @@ impl Expr {
             Expr::Let { vars, body } => {
                 Self::with_let_frame(vars, body, scope, |body, scope| body.eval_field(scope))
             }
+            // An absent field read by `$getField` is left out, not written null.
+            Expr::Doc(d) => d.eval_opt(scope),
             other => other.eval_in(scope).map(Some),
         }
     }
@@ -1716,6 +1770,8 @@ impl Expr {
                     type_name(&other)
                 ))),
             },
+            Expr::Str(s) => s.eval(scope),
+            Expr::Doc(d) => Ok(d.eval_opt(scope)?.unwrap_or(Bson::Null)),
             Expr::Convert { input, to, on_error, on_null } => {
                 // An error in the input expression itself is not a conversion
                 // error and is not caught by `onError`: a fallback is for a
@@ -2195,6 +2251,10 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::Substr => substr(args),
         Op::Split => split(&args[0], &args[1]),
         Op::StrLenCp => Ok(Bson::Int64(as_string_strict(&args[0], op)?.chars().count() as i64)),
+        Op::IndexOfCp | Op::IndexOfBytes => strings::index_of(op, args),
+        Op::Strcasecmp => strings::strcasecmp(&args[0], &args[1]),
+        Op::StrLenBytes => strings::str_len_bytes(&args[0]),
+        Op::SubstrBytes => strings::substr_bytes(args),
 
         Op::Eq => Ok(Bson::Boolean(canonical_cmp(&args[0], &args[1]) == Ordering::Equal)),
         Op::Ne => Ok(Bson::Boolean(canonical_cmp(&args[0], &args[1]) != Ordering::Equal)),
@@ -2233,6 +2293,8 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::AnyElementTrue | Op::AllElementsTrue => element_truth(op, &args[0]),
         Op::ObjectToArray => object_to_array(&args[0]),
         Op::ArrayToObject => array_to_object(&args[0]),
+        Op::MergeObjects => docops::merge_objects(args),
+        Op::IsNumber => Ok(docops::is_number(&args[0])),
 
         Op::Cond | Op::IfNull | Op::And | Op::Or | Op::Literal => {
             unreachable!("handled lazily")
@@ -3651,6 +3713,9 @@ pub(crate) fn type_name(value: &Bson) -> &'static str {
         _ => "that type",
     }
 }
+
+#[cfg(test)]
+mod strdoc_tests;
 
 #[cfg(test)]
 mod tests {

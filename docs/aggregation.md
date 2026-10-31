@@ -433,7 +433,7 @@ row that was not produced by an array element has no index to report.
 
 ### Accumulators
 
-`$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`.
+`$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`, `$mergeObjects`.
 
 ```json
 [ { "$match":  { "status": "shipped" } },
@@ -511,14 +511,15 @@ field path.
 |---|---|
 | Arithmetic | `$add` `$subtract` `$multiply` `$divide` `$mod` |
 | Math | `$abs` `$ceil` `$floor` `$round` `$trunc` `$pow` `$sqrt` `$exp` `$ln` `$log10` — see [Math](#math) |
-| Strings | `$concat` `$toUpper` `$toLower` `$substr` (`$substrCP`) `$split` `$strLenCP` |
+| Strings | `$concat` `$toUpper` `$toLower` `$substr` (`$substrCP`) `$split` `$strLenCP` — and, see [Strings](#strings): `$trim` `$ltrim` `$rtrim` `$indexOfCP` `$indexOfBytes` `$regexMatch` `$regexFind` `$regexFindAll` `$replaceOne` `$replaceAll` `$strcasecmp` `$strLenBytes` `$substrBytes` |
 | Conditional | `$cond` `$ifNull` `$switch` |
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
 | Boolean | `$and` `$or` `$not` |
 | Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$dateToString` |
 | Arrays | `$size` `$arrayElemAt` `$first` `$last` `$slice` `$concatArrays` `$in` `$indexOfArray` `$isArray` `$reverseArray` `$range` `$sortArray` `$zip` |
 | Sets | `$setUnion` `$setIntersection` `$setDifference` `$setEquals` `$setIsSubset` `$anyElementTrue` `$allElementsTrue` |
-| Documents | `$objectToArray` `$arrayToObject` |
+| Documents | `$objectToArray` `$arrayToObject` `$mergeObjects` `$getField` `$setField` `$unsetField` — see [Documents as pairs](#documents-as-pairs) and [Getting, setting and merging fields](#getting-setting-and-merging-fields) |
+| Types | `$type` `$isNumber` — see [Types](#types) |
 | Iteration | `$filter` `$map` `$reduce` — each binds a variable per element |
 | Variables | `$$ROOT` `$$CURRENT` `$$NOW` `$$REMOVE` `$let` |
 | Type conversion | `$convert` `$toString` `$toInt` `$toLong` `$toDouble` `$toBool` `$toDate` `$toObjectId` |
@@ -646,9 +647,10 @@ integer result would make `{$divide: [1, 2]}` zero.
 between two dates gives the interval in milliseconds, and `$subtract` of a
 number from a date shifts it back.
 
-**Strings are counted in code points, not bytes.** `$substr` is `$substrCP`;
-there is no byte-oriented variant, because it can split a character and produce
-invalid UTF-8.
+**Strings are counted in code points, not bytes.** `$substr` is `$substrCP`.
+The byte-oriented `$substrBytes`, `$indexOfBytes` and `$strLenBytes` exist
+([Strings](#strings)); `$substrBytes` refuses an offset inside a character, so it
+cannot produce invalid UTF-8.
 
 **`$dateToString` supports `%Y %m %d %H %M %S %L %%`, all UTC.** An unknown
 specifier is an error rather than being copied through — a literal `%q` in every
@@ -1005,6 +1007,73 @@ cannot read such a field (`"$a.b"` is a path, not a name), but
 **A repeated key keeps its first place and takes its last value**:
 `[["a", 1], ["b", 2], ["a", 3]]` is `{"a": 3, "b": 2}`. An empty array is
 `{}`; null or missing is null.
+
+### Strings
+
+Beyond `$concat`, `$toUpper`, `$toLower`, `$substr`/`$substrCP`, `$split` and
+`$strLenCP`, these are all pure functions of one document ([ADR-260](decisions.md)),
+and answer what the reference does. A null or missing operand is null unless the
+line says otherwise; a value of the wrong type is a `400` naming the operator.
+
+| Operator | Form | Notes |
+|---|---|---|
+| `$trim` `$ltrim` `$rtrim` | `{input, chars}` | `chars` is a **set of code points** to strip, not a prefix. Without it: NUL, space, U+0009 to U+000D, U+00A0, U+1680 and U+2000 to U+200A (not U+0085, U+2028, U+2029, U+202F, U+205F, U+3000). `chars: ""` strips nothing; a null `chars` gives null |
+| `$indexOfCP` `$indexOfBytes` | `[string, substring, start?, end?]` | Position of the first match inside `[start, end)`, or `-1`; counted in code points or in bytes. `start` and `end` must be non-negative whole numbers. A null string is null; the substring must be a string |
+| `$regexMatch` | `{input, regex, options}` | `true`/`false`; null input or regex is `false` |
+| `$regexFind` | same | `{match, idx, captures}` or null; `idx` in **code points**, `captures` one string per group (null for a group that took no part) |
+| `$regexFindAll` | same | An array of those documents, left to right, not overlapping; null input or regex is `[]`. After an empty match the search resumes one code point on, so `a*` over `"abc"` finds `"a"` and then empty matches at 1, 2 and 3 |
+| `$replaceOne` `$replaceAll` | `{input, find, replacement}` | `find` is literal text, not a pattern. Any of the three null gives null; an empty `find` matches before the first code point (`$replaceAll`: between every one and at both ends) |
+| `$strcasecmp` | `[a, b]` | `-1`, `0` or `1`. **Folds ASCII only**: `é` and `É` differ. Null is `""`; a number is read as its text |
+| `$strLenBytes` | `string` | UTF-8 length. Null is refused, as `$strLenCP` refuses it |
+| `$substrBytes` | `[string, start, length]` | Byte offsets that must fall **between** code points: one inside a character is a `400` (starting or ending index is a UTF-8 continuation byte). A start past the end, or negative, is `""`; a negative length is "to the end"; a null string is `""` |
+
+The regex operators run the engine of the `$regex` filter ([regex
+compatibility](query-language.md#regex-compatibility)): no backreferences or
+lookaround, the flags `i`, `m`, `s` and `x`, a size limit per pattern, and the
+patterns of one pipeline counted against the filter budget of 32. `regex` is a
+string (with `options`) or a regex value; flags given in both places are a
+`400`. A `regex` that is a constant is compiled, and refused if it is bad, when
+the pipeline is parsed; one computed from the document is compiled when it is
+evaluated. All three type-check `input`, `regex` and `options` before they
+answer null, as the reference does.
+
+### Getting, setting and merging fields
+
+```json
+{ "$addFields": {
+    "price":  { "$getField": { "field": { "$literal": "$price" }, "input": "$meta" } },
+    "meta2":  { "$setField":  { "field": "tier", "input": "$meta", "value": "gold" } },
+    "meta3":  { "$unsetField": { "field": "tmp", "input": "$meta" } },
+    "all":    { "$mergeObjects": ["$defaults", "$overrides"] } } }
+```
+
+**`$getField`** takes a field name (`{"$getField": "a"}`) or `{field, input}`,
+`input` defaulting to `$$CURRENT`. The name is a **name**, never a path: `"x.y"`
+is a field called `x.y`, and a name that starts with `$` is written
+`{"$literal": "$price"}`. A field the document lacks is *missing*: `$type` says
+`"missing"` and `$addFields`/`$project` leave the field out. A null or missing
+`input` is null; a non-document `input` or a non-string `field` is a `400`.
+
+**`$setField`** `{field, input, value}` returns `input` with `field` set: an
+existing field keeps its place, a new one goes last. `value` as `$$REMOVE` (or a
+missing field path) removes it; null is stored. **`$unsetField`** `{field,
+input}` removes. Both give null for a null or missing `input`.
+
+**`$mergeObjects`** merges documents left to right: a later value wins, a key
+keeps the place it first had, a nested document is replaced whole, and null and
+missing operands are skipped (no operand left is `{}`). A non-document operand
+is a `400`. It is also a `$group` accumulator over one expression per document,
+with the same rules; a group with nothing to merge gives `{}`.
+
+### Types
+
+**`$type`** answers the type's name: `double`, `string`, `object`, `array`,
+`binData`, `undefined`, `objectId`, `bool`, `date`, `null`, `regex`, `dbPointer`,
+`javascript`, `symbol`, `javascriptWithScope`, `int`, `timestamp`, `long`,
+`decimal`, `minKey`, `maxKey`, and `missing` for a field path that reaches
+nothing (or `$$REMOVE`). Integers computed here are `long` (see [Numbers](#behaviours-worth-knowing)).
+**`$isNumber`** is true for an `int`, `long`, `double` or `decimal`, and false
+for anything else, null and missing included.
 
 ### Type conversion
 
