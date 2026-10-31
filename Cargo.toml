@@ -80,6 +80,17 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
 
+# Time zones for the date operators (ADR-261). Pure Rust, no C, and the tz
+# database is compiled in (`tzdb-bundle-always`), so a result is the same on
+# every host and never depends on /usr/share/zoneinfo. Only its offset and
+# transition lookups are used; the calendar arithmetic is ours, because a BSON
+# date reaches far outside the years jiff represents. `alloc` is the one
+# runtime feature the bundled database needs.
+jiff = { version = "0.2", default-features = false, features = ["alloc", "tzdb-bundle-always"] }
+# The same bundle jiff reads, named only to report which tz database version is
+# compiled in (`VERSION`), so the docs and a test can state it. Raw data, no code.
+jiff-tzdb = "0.1"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` is load-bearing, not a convenience. Without it

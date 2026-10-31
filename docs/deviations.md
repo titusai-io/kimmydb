@@ -3508,6 +3508,31 @@ keys per chunk and is unchanged here.
 
 ---
 
+## Date operators and time zones (ADR-261)
+
+Where these differ from the reference (MongoDB 6.0), they differ on purpose:
+
+- **`$dateFromString` reads fewer shapes without a `format`.** The reference
+  hands the string to a general date parser that also reads `Jan 1 2018`,
+  `2018/02/08`, week dates and the like. Here it is `YYYY-MM-DD` with an optional
+  `T` or space and `HH:MM[:SS[.fff]]` and an optional `Z`, `UTC`, `GMT` or
+  offset. Anything else is the conversion error (which `onError` takes). Give a
+  `format` for another layout. Fractions of a second are cut to milliseconds.
+- **`$dateFromString` with a `format` reads fixed-width fields** (`%Y` four
+  digits, `%d` two, ...), which is what the reference documents; a field it
+  would read with fewer digits is an error here.
+- **Dates outside the tz database's years** use the zone's earliest or latest
+  offset. The reference's own database has the same edges, but where exactly the
+  last rule applies can differ by a clock change in the far future.
+- **A format given as an expression** (`$dateToString`'s `format`) is accepted
+  as the reference accepts it; a constant one is checked when the pipeline is
+  parsed.
+- **Error messages** carry the reference's wording where it is known, without
+  its numeric codes, and every date error is a `400`.
+- **The tz database is the one built in** (2026e), not the host's. A zone whose
+  rules changed after the build keeps the old rules until the dependency is
+  bumped.
+
 ## How to use this document
 
 When something here is closed, move it to 🟢 with a note on what changed —

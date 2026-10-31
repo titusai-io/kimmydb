@@ -66,9 +66,11 @@
 //! 1]}` is an error because a string is not a number. Returning null for both
 //! would make a typo and a type error indistinguishable in the output.
 
+mod dates;
 mod docops;
 mod math;
 mod strings;
+mod tz;
 
 pub(crate) use docops::merge_into;
 
@@ -135,13 +137,6 @@ pub enum Op {
     And,
     Or,
     Not,
-    // Dates
-    Year,
-    Month,
-    DayOfMonth,
-    Hour,
-    Minute,
-    Second,
     // Arrays
     Size,
     ArrayElemAt,
@@ -221,12 +216,6 @@ impl Op {
             "$and" => Op::And,
             "$or" => Op::Or,
             "$not" => Op::Not,
-            "$year" => Op::Year,
-            "$month" => Op::Month,
-            "$dayOfMonth" => Op::DayOfMonth,
-            "$hour" => Op::Hour,
-            "$minute" => Op::Minute,
-            "$second" => Op::Second,
             "$size" => Op::Size,
             "$arrayElemAt" => Op::ArrayElemAt,
             "$first" => Op::First,
@@ -295,12 +284,6 @@ impl Op {
             Op::And => "$and",
             Op::Or => "$or",
             Op::Not => "$not",
-            Op::Year => "$year",
-            Op::Month => "$month",
-            Op::DayOfMonth => "$dayOfMonth",
-            Op::Hour => "$hour",
-            Op::Minute => "$minute",
-            Op::Second => "$second",
             Op::Size => "$size",
             Op::ArrayElemAt => "$arrayElemAt",
             Op::First => "$first",
@@ -376,12 +359,6 @@ impl Op {
             | Op::StrLenBytes
             | Op::IsNumber
             | Op::Not
-            | Op::Year
-            | Op::Month
-            | Op::DayOfMonth
-            | Op::Hour
-            | Op::Minute
-            | Op::Second
             | Op::Size
             | Op::First
             | Op::Last
@@ -532,8 +509,9 @@ pub enum Expr {
     Op(Op, Vec<Expr>),
     /// `{$switch: {branches: [{case, then}, ...], default: <expr>}}`.
     Switch { branches: Vec<(Expr, Expr)>, default: Option<Box<Expr>> },
-    /// `{$dateToString: {date: <expr>, format: "<fmt>"}}`.
-    DateToString { date: Box<Expr>, format: String },
+    /// A date operator, with its `timezone` (ADR-261): `$year` .. `$second`, `$dateToString`,
+    /// `$dateFromString`, `$dateAdd`, `$dateDiff`, and the rest of the family.
+    Date(Box<dates::DateExpr>),
     /// `{$convert: {input, to, onError?, onNull?}}`, and the `$toX` shorthands,
     /// which are the same node with no fallbacks.
     ///
@@ -1005,7 +983,7 @@ impl Expr {
                 branches.iter().any(|(case, then)| case.reads_document() || then.reads_document())
                     || default.as_ref().is_some_and(|d| d.reads_document())
             }
-            Expr::DateToString { date, .. } => date.reads_document(),
+            Expr::Date(d) => d.children().any(Expr::reads_document),
             Expr::Convert { input, on_error, on_null, .. } => {
                 input.reads_document()
                     || on_error.as_ref().is_some_and(|e| e.reads_document())
@@ -1044,7 +1022,7 @@ impl Expr {
             Expr::Literal(_)
             | Expr::Op(..)
             | Expr::Switch { .. }
-            | Expr::DateToString { .. }
+            | Expr::Date(_)
             | Expr::Convert { .. }
             | Expr::Let { .. }
             | Expr::Filter { .. }
@@ -1080,7 +1058,7 @@ impl Expr {
                     .any(|(case, then)| case.reads_variable(names) || then.reads_variable(names))
                     || default.as_ref().is_some_and(|d| d.reads_variable(names))
             }
-            Expr::DateToString { date, .. } => date.reads_variable(names),
+            Expr::Date(d) => d.children().any(|e| e.reads_variable(names)),
             Expr::Convert { input, on_error, on_null, .. } => {
                 input.reads_variable(names)
                     || on_error.as_ref().is_some_and(|e| e.reads_variable(names))
@@ -1275,7 +1253,9 @@ impl Expr {
         let raw = doc.get(first).expect("key from the same document");
         match first.as_str() {
             "$switch" => Self::parse_switch(raw, declared),
-            "$dateToString" => Self::parse_date_to_string(raw, declared),
+            name if dates::Kind::from_name(name).is_some() => {
+                Ok(Expr::Date(Box::new(dates::DateExpr::parse(name, raw, declared)?)))
+            }
             "$let" => Self::parse_let(raw, declared),
             "$filter" => Self::parse_filter(raw, declared),
             "$map" => Self::parse_map(raw, declared),
@@ -1366,27 +1346,6 @@ impl Expr {
             None => None,
         };
         Ok(Expr::Switch { branches, default })
-    }
-
-    fn parse_date_to_string(raw: &Bson, declared: &mut Declared) -> Result<Self> {
-        let spec = Self::named_spec("$dateToString", raw, &["date", "format"])?;
-        let Some(date) = spec.get("date") else {
-            return Err(Error::InvalidQuery("$dateToString needs a `date`".into()));
-        };
-        // The format is a constant rather than an expression. Making it
-        // computed would mean re-parsing the specifier string per document for
-        // a flexibility nobody has asked for.
-        let format = match spec.get("format") {
-            Some(Bson::String(f)) => f.clone(),
-            None => "%Y-%m-%dT%H:%M:%S.%LZ".to_string(),
-            Some(other) => {
-                return Err(Error::InvalidQuery(format!(
-                    "$dateToString `format` is a string, found {}",
-                    type_name(other)
-                )));
-            }
-        };
-        Ok(Expr::DateToString { date: Box::new(Self::parse_in(date, declared)?), format })
     }
 
     // -- the binding operators ------------------------------------------
@@ -1762,16 +1721,9 @@ impl Expr {
                     )),
                 }
             }
-            Expr::DateToString { date, format } => match date.eval_in(scope)? {
-                Bson::Null => Ok(Bson::Null),
-                Bson::DateTime(dt) => Ok(Bson::String(format_date(dt.timestamp_millis(), format)?)),
-                other => Err(Error::InvalidQuery(format!(
-                    "$dateToString needs a date, found {}",
-                    type_name(&other)
-                ))),
-            },
             Expr::Str(s) => s.eval(scope),
             Expr::Doc(d) => Ok(d.eval_opt(scope)?.unwrap_or(Bson::Null)),
+            Expr::Date(d) => d.eval(scope),
             Expr::Convert { input, to, on_error, on_null } => {
                 // An error in the input expression itself is not a conversion
                 // error and is not caught by `onError`: a fallback is for a
@@ -2269,10 +2221,6 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         })),
 
         Op::Not => Ok(Bson::Boolean(!truthy(&args[0]))),
-
-        Op::Year | Op::Month | Op::DayOfMonth | Op::Hour | Op::Minute | Op::Second => {
-            date_part(op, &args[0])
-        }
 
         Op::Size => array_size(&args[0]),
         Op::ArrayElemAt => array_elem_at(&args[0], &args[1]),
@@ -3346,117 +3294,6 @@ fn array_to_object(value: &Bson) -> Result<Bson> {
 // Dates
 // ---------------------------------------------------------------------------
 
-fn date_part(op: Op, value: &Bson) -> Result<Bson> {
-    let millis = match value {
-        Bson::Null | Bson::Undefined => return Ok(Bson::Null),
-        Bson::DateTime(dt) => dt.timestamp_millis(),
-        other => {
-            return Err(Error::InvalidQuery(format!(
-                "{} needs a date, found {}",
-                op.name(),
-                type_name(other)
-            )));
-        }
-    };
-    let parts = Civil::from_millis(millis);
-    Ok(Bson::Int32(match op {
-        Op::Year => parts.year,
-        Op::Month => parts.month,
-        Op::DayOfMonth => parts.day,
-        Op::Hour => parts.hour,
-        Op::Minute => parts.minute,
-        Op::Second => parts.second,
-        _ => unreachable!("only date operators reach here"),
-    }))
-}
-
-/// A UTC calendar date broken into parts.
-///
-/// Computed here rather than through `chrono` because the conversion is
-/// twenty lines of well-known arithmetic and the alternative is a new runtime
-/// dependency for it. Everything is UTC: BSON dates carry no zone, so there is
-/// nothing to convert to and offering `%z` would be inventing information.
-#[derive(Debug, PartialEq, Eq)]
-struct Civil {
-    year: i32,
-    month: i32,
-    day: i32,
-    hour: i32,
-    minute: i32,
-    second: i32,
-    milli: i32,
-}
-
-impl Civil {
-    fn from_millis(millis: i64) -> Self {
-        // Floor division, so dates before 1970 do not round towards zero and
-        // land a day late.
-        let days = millis.div_euclid(86_400_000);
-        let rem = millis.rem_euclid(86_400_000);
-
-        // Howard Hinnant's civil_from_days, shifted to a 1 March year start so
-        // the leap day falls at the end of the cycle.
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
-        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = doy - (153 * mp + 2) / 5 + 1;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = if month <= 2 { y + 1 } else { y };
-
-        Self {
-            year: year as i32,
-            month: month as i32,
-            day: day as i32,
-            hour: (rem / 3_600_000) as i32,
-            minute: (rem / 60_000 % 60) as i32,
-            second: (rem / 1_000 % 60) as i32,
-            milli: (rem % 1_000) as i32,
-        }
-    }
-}
-
-/// The `$dateToString` specifier subset.
-///
-/// `%Y %m %d %H %M %S %L %%` — the parts a date can actually be broken into
-/// here. A specifier this does not know is an **error** rather than being
-/// copied through: a silently literal `%q` in every row is the kind of wrong
-/// output nobody notices until it is in a report.
-fn format_date(millis: i64, format: &str) -> Result<String> {
-    let c = Civil::from_millis(millis);
-    let mut out = String::with_capacity(format.len() + 8);
-    let mut chars = format.chars();
-
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('Y') => out.push_str(&format!("{:04}", c.year)),
-            Some('m') => out.push_str(&format!("{:02}", c.month)),
-            Some('d') => out.push_str(&format!("{:02}", c.day)),
-            Some('H') => out.push_str(&format!("{:02}", c.hour)),
-            Some('M') => out.push_str(&format!("{:02}", c.minute)),
-            Some('S') => out.push_str(&format!("{:02}", c.second)),
-            Some('L') => out.push_str(&format!("{:03}", c.milli)),
-            Some('%') => out.push('%'),
-            Some(other) => {
-                return Err(Error::InvalidQuery(format!(
-                    "$dateToString does not support the specifier %{other}"
-                )));
-            }
-            None => {
-                return Err(Error::InvalidQuery("$dateToString format ends with a bare %".into()));
-            }
-        }
-    }
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // Type conversion
 // ---------------------------------------------------------------------------
@@ -3509,7 +3346,7 @@ fn convert(value: &Bson, to: ConvertTo) -> Result<Bson> {
             Bson::Decimal128(d) => d.to_string(),
             // ISO 8601 with milliseconds, which is `$dateToString`'s default
             // and what `$toDate` reads back.
-            Bson::DateTime(dt) => format_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?,
+            Bson::DateTime(dt) => dates::format_iso_utc(dt.timestamp_millis())?,
             Bson::ObjectId(oid) => oid.to_hex(),
             _ => return Err(unsupported()),
         })),
@@ -4522,26 +4359,6 @@ mod tests {
         assert_eq!(on(doc! {"$hour": "$t"}.into(), d.clone()), Bson::Int32(13));
         assert_eq!(on(doc! {"$minute": "$t"}.into(), d.clone()), Bson::Int32(45));
         assert_eq!(on(doc! {"$second": "$t"}.into(), d), Bson::Int32(7));
-    }
-
-    #[test]
-    fn the_epoch_and_a_leap_day_are_right() {
-        assert_eq!(Civil::from_millis(0).year, 1970);
-        assert_eq!(Civil::from_millis(0).month, 1);
-        assert_eq!(Civil::from_millis(0).day, 1);
-
-        // 2024-02-29T00:00:00Z — a leap day, the case the cycle arithmetic
-        // exists to get right.
-        let leap = Civil::from_millis(1_709_164_800_000);
-        assert_eq!((leap.year, leap.month, leap.day), (2024, 2, 29));
-    }
-
-    #[test]
-    fn dates_before_the_epoch_do_not_land_a_day_late() {
-        // Floor division rather than truncation: 1969-12-31T23:59:59Z.
-        let before = Civil::from_millis(-1_000);
-        assert_eq!((before.year, before.month, before.day), (1969, 12, 31));
-        assert_eq!((before.hour, before.minute, before.second), (23, 59, 59));
     }
 
     #[test]
