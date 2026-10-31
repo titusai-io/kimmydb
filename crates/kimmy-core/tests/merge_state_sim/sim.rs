@@ -388,8 +388,8 @@ impl Node {
         self.logged(r, log)
     }
     /// A `$setOnInsert` upsert: two sequential writes by one writer (the creation
-    /// and the increment). The writer hands back only its final state, so both
-    /// oplog entries carry it, with both stamps contained.
+    /// and the increment), each logged with its own causal past and appended as
+    /// its own oplog entry carrying the state right after it.
     pub fn upsert_soi(
         &mut self,
         fields: &[(&str, Value)],
@@ -399,17 +399,10 @@ impl Node {
         log: &mut Log,
         skew: u64,
     ) -> Option<MStamp> {
-        let (created, incd) = self.w.upsert_soi(fields, inc_path, n, sets, skew)?;
-        let (s1, s2) = (created.stamp, incd.stamp);
-        log.insert(s1, (self.contained.clone(), created.record));
-        self.contained.insert(s1);
-        log.insert(s2, (self.contained.clone(), incd.record));
-        self.contained.insert(s2);
-        for st in [s1, s2] {
-            let ent = Ent::W { st, state: self.w.state.clone(), contained: self.contained.clone() };
-            self.append(Rc::new(ent));
-        }
-        Some(s2)
+        let created = self.w.upsert_soi_create(fields, sets, skew);
+        let s1 = self.logged(created, log)?;
+        let incd = self.w.upsert_inc_on(s1, inc_path, n, skew);
+        self.logged(incd, log)
     }
     pub fn set(&mut self, p: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
         let r = self.w.write_set(p, v, skew);
