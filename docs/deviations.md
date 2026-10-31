@@ -37,12 +37,11 @@ Status meanings:
 
 ---
 
-## 🟡 The `$stdDev*`, `$top*`, `$bottom*`, `$firstN`, `$lastN`, `$maxN`, `$minN` and `$count` accumulators: decimal as double, the cap on ranked buffers, and the array forms
+## 🟡 The `$stdDev*`, `$top*`, `$bottom*`, `$firstN`, `$lastN`, `$maxN`, `$minN` and `$count` accumulators: decimal as double and the array forms
 
 **Raised 2026-10-31, with ADR-262; revised after the review of PR #276.** Where these differ from, or rest on a reading of, the reference:
 
 - **`$stdDevPop`/`$stdDevSamp` convert a `Decimal128` to the nearest double** before accumulating, so a decimal with more than 15 significant digits can differ from the reference in the last printed digit of the double result.
-- **The rows held by `$topN`/`$bottomN`/`$maxN`/`$minN` are counted against `Limits::max_documents`,** across all the groups of a stage, and a stage that holds more is refused (`Error::Limit`, a `400`). The reference has no such count. It answers a large `n` over a small group (`n: 1000000` over six documents answers the six, as here); the difference is a stage that keeps more than the limit's worth of ranked rows in all, which the reference answers and this server refuses. `$firstN`/`$lastN`, like `$push`, are not counted.
 - **`n` is one value for the group**, evaluated at parse or at first use. An `n` that reads a document field is refused, as the reference refuses it (it reads the group key, where the field is missing), with a different message.
 - **`$count` answers an int** (a long past 2^31-1), as `{$sum: 1}` does in the reference, whereas this server's `$sum: 1` answers a long.
 - **The array forms of `$firstN`, `$lastN`, `$maxN`, `$minN`, `$stdDevPop` and `$stdDevSamp`** (as `$project` or `$addFields` expressions) answer the reference's cases (`{$maxN: {n: 2, input: [1, 3, 2, null]}}` is `[3, 2]`, `{$stdDevPop: [1, 2, 3, 4]}` is `1.118033988749895`). What was not checked against the reference: a `null` or missing `input` answers `null` here, and an `input` that is not an array is a `400`. `$stdDev*` reads a single operand that is an array as its elements and any other list as the operands.

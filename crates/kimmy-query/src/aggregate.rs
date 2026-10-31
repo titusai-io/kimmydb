@@ -2155,7 +2155,6 @@ fn group_keyed(
 ) -> Result<Vec<Document>> {
     let mut order: Vec<Bucket> = Vec::new();
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
-    let mut mut_held = 0usize;
 
     for doc in &input {
         let scope = Scope::with_bindings(doc, vars);
@@ -2175,9 +2174,7 @@ fn group_keyed(
         };
         for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
             accumulate(state, acc, &scope)?;
-            mut_held += 1;
         }
-        if mut_held > limits.max_documents { return Err(Error::Limit("held".into())); }
     }
 
     order

@@ -576,11 +576,10 @@ rows `a`, `b`, `c` are both `a`, and `$bottomN` with `n: 2` is `["a", "b"]`.
 `n` is a positive integer constant (or an expression that needs no document, or
 a variable): `0`, a negative, a fraction, a string, `null` or a field path is
 `400`. No `n` is refused for its size: `n: 1000000` over six documents answers
-the six. A buffer grows with the rows it receives, and a row costs O(log n). The
-rows held by `$topN`, `$bottomN`, `$maxN` and `$minN` across all the groups of a
-stage are counted against the pipeline document limit as they are buffered
-(`$firstN`, `$lastN`, `$push` and `$addToSet` are not counted). Where this
-differs from the reference see [deviations.md](deviations.md).
+the six. A buffer grows with the rows it receives, and a row costs O(log n). Like
+`$push`, the buffers are not counted against the pipeline document limit: each
+holds at most the rows of its group, which the stage's input already bounds.
+Where this differs from the reference see [deviations.md](deviations.md).
 
 **As expressions.** `$firstN`, `$lastN`, `$maxN` and `$minN` also work in
 `$project`, `$addFields` and any other expression over an array,

@@ -558,9 +558,11 @@ fn a_huge_n_answers_every_row_of_a_small_group() {
     }
 }
 
+/// The buffers are bounded by the stage's input, as `$push`'s are: many groups
+/// each holding up to `n` rows are not refused, whatever the pipeline limit
+/// says about the rows held in all.
 #[test]
-fn ranked_rows_held_across_groups_are_charged_to_the_cap() {
-    // Each group's n is within the cap; together the buffers are not.
+fn buffers_across_many_groups_are_not_refused() {
     let limits = Limits { max_documents: 10 };
     let input: Vec<Document> = (0..12).map(|i| doc! {"g": i % 3, "x": i}).collect();
     for acc in [
@@ -568,41 +570,29 @@ fn ranked_rows_held_across_groups_are_charged_to_the_cap() {
         doc! {"$bottomN": {"n": 10, "sortBy": {"x": 1}, "output": "$x"}},
         doc! {"$maxN": {"n": 10, "input": "$x"}},
         doc! {"$minN": {"n": 10, "input": "$x"}},
+        doc! {"$firstN": {"n": 10, "input": "$x"}},
+        doc! {"$lastN": {"n": 10, "input": "$x"}},
     ] {
-        let err =
+        let out =
             run_with(doc! {"$group": {"_id": "$g", "r": acc.clone()}}, input.clone(), &limits)
-                .expect_err("12 rows held, cap 10");
-        assert!(matches!(err, kimmy_core::Error::Limit(_)), "{acc}: {err}");
+                .unwrap_or_else(|e| panic!("{acc}: {e}"));
+        assert_eq!(out.len(), 3, "{acc}");
+        for group in &out {
+            assert_eq!(group.get_array("r").unwrap().len(), 4, "{acc}");
+        }
     }
-    // A buffer that stays at n rows does not grow past it.
+    // Two of them beside a $push, in a $bucketAuto too.
     let out = run_with(
-        doc! {"$group": {"_id": "$g", "r": {"$topN": {"n": 2, "sortBy": {"x": 1}, "output": "$x"}}}},
+        doc! {"$bucketAuto": {"groupBy": "$x", "buckets": 2, "output": {
+        "a": {"$topN": {"n": 10, "sortBy": {"x": 1}, "output": "$x"}},
+        "b": {"$maxN": {"n": 10, "input": "$x"}},
+        "c": {"$push": "$x"}}}},
         input,
         &limits,
     )
     .unwrap();
-    assert_eq!(out.len(), 3);
-}
-
-/// `$firstN` and `$lastN` hold what `$push` holds and are charged no more than
-/// it is: two of them over every row of a stage pass where the ranked forms,
-/// at the same limit, do not.
-#[test]
-fn first_n_and_last_n_are_not_charged_to_the_cap_as_push_is_not() {
-    let limits = Limits { max_documents: 10 };
-    let input: Vec<Document> = (0..12).map(|i| doc! {"g": i % 3, "x": i}).collect();
-    let out = run_with(
-        doc! {"$group": {"_id": "$g",
-        "a": {"$firstN": {"n": 10, "input": "$x"}},
-        "b": {"$lastN": {"n": 10, "input": "$x"}},
-        "c": {"$push": "$x"}}},
-        input,
-        &limits,
-    )
-    .unwrap();
-    assert_eq!(out.len(), 3);
-    assert_eq!(out[0].get_array("a").unwrap().len(), 4);
-    assert_eq!(out[0].get_array("b").unwrap().len(), 4);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].get_array("a").unwrap().len(), 6);
 }
 
 // ---------------------------------------------------------------------------

@@ -8,13 +8,9 @@
 //! where the state can, which is the shape a sliding window needs. Only `$group`,
 //! `$bucket` and `$bucketAuto` drive them today.
 //!
-//! The ranked buffers (`$topN`, `$bottomN`, `$maxN`, `$minN`) are charged to the
-//! cap `$group` already holds its buckets to (`Limits::max_documents`):
-//! [`State::accumulate`] reports how many rows the state grew by and the caller
-//! totals them across the groups of the stage. `$firstN` and `$lastN` hold the
-//! values they were given, as `$push` does, and are not charged. No `n` is
-//! refused for its size and nothing is allocated from it: a buffer grows with the
-//! rows it receives.
+//! No `n` is refused for its size and nothing is allocated from it: a buffer
+//! grows with the rows it receives, so each accumulator holds at most the rows of
+//! its group, which the stage's input already bounds (as `$push` does).
 //!
 //! The ranked forms keep a heap and a sequence number, so a row costs
 //! O(log n) and equal rows keep their order of arrival.
@@ -473,18 +469,8 @@ fn key_cmp(a: &Bson, b: &Bson) -> Ordering {
 }
 
 impl State {
-    /// Rows held, which the caller charges to the stage's cap.
-    pub fn held(&self) -> usize {
-        match &self.body {
-            Body::Ranked(rows) => rows.len(),
-            Body::Best(rows) => rows.len(),
-            _ => 0,
-        }
-    }
-
-    /// Take one document. Returns how many rows the state grew by.
-    pub fn accumulate(&mut self, spec: &Spec, scope: &Scope<'_>) -> Result<usize> {
-        let before = self.held();
+    /// Take one document.
+    pub fn accumulate(&mut self, spec: &Spec, scope: &Scope<'_>) -> Result<()> {
         if self.limit.is_none() && self.needs_limit() {
             self.limit = Some(spec.resolve(scope)?);
         }
@@ -513,7 +499,7 @@ impl State {
                 self.take(value);
             }
         }
-        Ok(self.held().saturating_sub(before))
+        Ok(())
     }
 
     /// Take one value into a `$firstN`, `$lastN`, `$maxN` or `$minN`.
