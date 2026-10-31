@@ -17,6 +17,19 @@ Status meanings:
 
 ---
 
+## 🟡 The `$stdDev*`, `$top*`, `$bottom*`, `$firstN`, `$lastN`, `$maxN`, `$minN` and `$count` accumulators: decimal as double, tie order, and the `$sort` array key
+
+**Raised 2026-10-31, with ADR-262.** Where these differ from, or rest on a reading of, the reference:
+
+- **`$stdDevPop`/`$stdDevSamp` convert a `Decimal128` to the nearest double** before accumulating, so a decimal with more than 15 significant digits can differ from the reference in the last printed digit of the double result.
+- **Ties in `$top`/`$bottom`/`$topN`/`$bottomN` keep arrival order** (the first of equal rows is first); the reference does not specify the order of rows that sort equal, so a tie may be answered differently.
+- **`$top*`/`$bottom*` pick the array element by direction**, as the reference sorts, whereas the `$sort` stage here uses the smallest element for both directions.
+- **`n` is one value for the group**, evaluated at parse or at first use; an `n` that reads a document field is refused, where the reference refuses it with a different message. An `n` over `Limits::max_documents`, and buffers over it in total, are refused (`Error::Limit`); the reference has a byte cap instead.
+- **`$count` answers an int** (a long past 2^31-1), as `{$sum: 1}` does in the reference, whereas this server's `$sum: 1` answers a long.
+- **`$firstN`/`$lastN` include null and a missing value as `null`;** `$maxN`/`$minN` skip them. This is the reading of the reference documented in ADR-262 and marked uncertain in the probe script.
+
+---
+
 ## 🟡 A collection validator is enforced by the member that accepts the write, so a non-conforming document can be stored and kept
 
 **Raised 2026-10-29, with ADR-257 part 2.** A collection's validator ([validation.md](validation.md)) is replicated metadata and a guard on client writes. A leaderless cluster cannot make a schema change atomic, and a replicated write is never refused, so two gaps are accepted as the price:

@@ -433,7 +433,9 @@ row that was not produced by an array element has no index to report.
 
 ### Accumulators
 
-`$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`.
+`$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, `$addToSet`, `$count`,
+`$stdDevPop`, `$stdDevSamp`, `$top`, `$bottom`, `$topN`, `$bottomN`, `$firstN`, `$lastN`,
+`$maxN`, `$minN`. The last group is described [below](#the-remaining-accumulators).
 
 ```json
 [ { "$match":  { "status": "shipped" } },
@@ -542,6 +544,31 @@ all of them, on purpose** ([ADR-217](decisions.md#adr-217--the-refusals-and-diff
 is refused, and the message names the key to drop. A refused typo is better
 than an answer that is wrong without a sign. (See [Deviations](deviations.md)
 for a pipeline ported from elsewhere.)
+
+
+#### The remaining accumulators
+
+([ADR-262](decisions.md#adr-262--the-remaining-group-accumulators).) All work in `$group`, `$bucket` and `$bucketAuto`.
+
+| Accumulator | Argument | Answer |
+|---|---|---|
+| `$count` | `{}` | The number of documents in the group, every document counted: an int, a long past 2^31-1 |
+| `$stdDevPop`, `$stdDevSamp` | an expression | A **double**. Only ints, longs, doubles and decimals are counted (a decimal is converted to a double); everything else, `null` and missing included, is ignored. `null` when nothing was counted, and for `$stdDevSamp` when only one value was. One value gives `0` for `$stdDevPop`. Computed with Welford's update, so `1e9 + 4, 1e9 + 7, ...` keeps its spread |
+| `$top`, `$bottom` | `{sortBy, output}` | The `output` of the first / last row in `sortBy` order |
+| `$topN`, `$bottomN` | `{n, sortBy, output}` | An array of the first / last `n` outputs, in `sortBy` order |
+| `$firstN`, `$lastN` | `{n, input}` | The first / last `n` values in input order; `null` and missing are values (a missing one is `null`) |
+| `$maxN`, `$minN` | `{n, input}` | The `n` largest, largest first / the `n` smallest, smallest first, in the canonical type order; `null` and missing are skipped. Fewer than `n` values give all of them, and none gives `[]` |
+
+`sortBy` is a `$sort` document over the group's input documents; a missing key
+sorts as `null`, a key that meets an array uses its smallest element ascending
+and its largest descending, and rows that sort equal stay in input order. A
+missing `output` is `null`. `n` is a positive integer constant (or an expression
+that needs no document, or a variable): `0`, a negative, a fraction, a string,
+`null` or a field path is `400`. Every buffer `n` bounds is held to the pipeline
+document limit: an `n` over it is refused when the first document arrives, and
+the rows held across all the groups of the stage are counted against it as they
+are buffered. Where this differs from the reference see
+[deviations.md](deviations.md).
 
 ### How a value is read
 
