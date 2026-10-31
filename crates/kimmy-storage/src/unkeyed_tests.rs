@@ -678,22 +678,40 @@ fn a_rewind_does_not_re_announce_a_report_whose_document_is_gone_or_keyed() {
     assert!(events(&e).is_empty(), "{:?}", events(&e));
 }
 
+/// Arrays nested on one path are one chain, not parallel arrays: the reference
+/// keys these, and a local write of each is accepted.
 #[test]
-fn the_parallel_arrays_message_names_the_path_when_one_path_holds_both_arrays() {
+fn arrays_nested_on_one_path_are_not_parallel_arrays() {
     let (e, _d) = open();
     e.create_collection("shop", "c").unwrap();
     e.create_index("shop", "c", fields(&["x.a", "c"]), false, Some("xa_c".into())).unwrap();
     let c = e.get_collection("shop", "c").unwrap();
+    // r03 and the earlier m4 shape.
+    e.insert(&c, doc! { "_id": 1i64, "x": [{ "a": [1, 2] }], "c": 1 }).unwrap();
+    e.insert(&c, doc! { "_id": 2i64, "x": [{ "a": [1] }, { "a": [2] }], "c": 1 }).unwrap();
+    // r07, the reference's own example.
+    e.create_collection("shop", "d").unwrap();
+    e.create_index("shop", "d", fields(&["a.x", "a.z"]), false, Some("az".into())).unwrap();
+    let d = e.get_collection("shop", "d").unwrap();
+    e.insert(&d, doc! { "_id": 1i64, "a": [{ "x": 5, "z": [1, 2] }, { "z": [1, 2] }] }).unwrap();
+    assert_eq!(e.unkeyed_refusals(), 0);
+    // r08 is the documented over-refusal: inner arrays in different elements.
+    e.create_collection("shop", "f").unwrap();
+    e.create_index("shop", "f", fields(&["x.a", "x.b"]), false, Some("xy".into())).unwrap();
+    let f = e.get_collection("shop", "f").unwrap();
     let message = refusal(
-        e.insert(&c, doc! { "_id": 1i64, "x": [{ "a": [1] }, { "a": [2] }], "c": 1 }).unwrap_err(),
+        e.insert(&f, doc! { "_id": 1i64, "x": [{ "a": [1, 2] }, { "b": [3, 4] }] }).unwrap_err(),
     );
-    assert!(message.contains("cannot index parallel arrays [x.a] [x.a]"), "{message}");
-    assert!(!message.contains('?'), "{message}");
-    // Two paths still name both, the later field first.
+    assert!(message.contains("cannot index parallel arrays [b] [a]"), "{message}");
+}
+
+#[test]
+fn the_parallel_arrays_message_names_the_arrays_later_first() {
     let (e, _d) = open();
     let c = indexed(&e);
     let message = refusal(e.insert(&c, with_id(2, bad())).unwrap_err());
     assert!(message.contains("cannot index parallel arrays [b] [a]"), "{message}");
+    assert!(!message.contains('?'), "{message}");
 }
 
 #[test]
@@ -897,7 +915,7 @@ fn a_path_through_an_array_of_documents_and_an_array_are_parallel_arrays() {
     let (e, _d) = open();
     let c = nested_index(&e, false);
     let message = refusal(e.insert(&c, with_id(1, fanned())).unwrap_err());
-    assert!(message.starts_with("cannot index parallel arrays [c] [x.a]"), "{message}");
+    assert!(message.starts_with("cannot index parallel arrays [c] [x]"), "{message}");
     // A single-element array of documents is an array too.
     let message =
         refusal(e.insert(&c, doc! { "_id": 2i64, "x": [{ "a": 1 }], "c": [1, 2] }).unwrap_err());

@@ -367,7 +367,12 @@ is created. (Since 0.51.0 a `Decimal128` has an exact key and is indexed like an
 number, ADR-238.) The arrays are counted by their place in the path, so a path that
 fans out through an array of documents (`x.a` over `x: [{a: 1}, {a: 2}]`) is an array
 beside an array at `c`, as in the reference; two paths through one array are not
-parallel (ADR-259).
+parallel (ADR-259), and an array inside the elements of an array the path already
+went through is not parallel to it. **One over-refusal:** two paths that meet inner
+arrays in different elements of one outer array (`{x.a, x.b}` over
+`{x: [{a: [1, 2]}, {b: [3, 4]}]}`) are refused here and keyed by MongoDB, which checks
+the arrays level by level inside each element. Reshape the document, or index one of
+the two paths.
 
 **What is left of the gap.** The refusal is made by the member that accepts the
 write against the indexes that member holds, which is all a leaderless store can

@@ -200,14 +200,11 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
 
     // Per field, the set of values this document offers.
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(index.fields.len());
-    // The distinct arrays the indexed paths go through, by place in the path.
-    let mut arrays: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut multikey = false;
 
     for field in &index.fields {
         let resolved = path::resolve(doc, &field.path);
         let mut values: Vec<Bson> = Vec::new();
-        arrays.extend(path::array_prefixes(doc, &field.path));
 
         // A path that resolves to several values has fanned out through an
         // array of documents — multikey even though no value is itself an
@@ -244,7 +241,7 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
         })
     };
 
-    if arrays.len() > 1 && index.fields.len() > 1 {
+    if index.fields.len() > 1 && parallel_arrays(index, doc).is_some() {
         return unkeyed(
             UnkeyedCause::ParallelArrays,
             "a compound index may span at most one array field".into(),
@@ -368,15 +365,11 @@ fn refusal_message(index: &IndexMeta, doc: &Document, cause: UnkeyedCause, reaso
     let id = id_of(doc);
     match cause {
         UnkeyedCause::ParallelArrays => {
-            // Two names, the later field first, as the reference words it.
-            let arrays = array_paths(index, doc);
-            let (first, second) = match arrays.as_slice() {
-                [first, second, ..] => (first.as_str(), second.as_str()),
-                // One path that fans out through an array of documents holding
-                // arrays is the only array field: name it twice.
-                [only] => (only.as_str(), only.as_str()),
-                [] => ("?", "?"),
-            };
+            // Two arrays, named as the reference names them (the last segment of
+            // each array's place in the path), the later first.
+            let (first, second) = parallel_arrays(index, doc)
+                .map(|(a, b)| (last_segment(&a).to_string(), last_segment(&b).to_string()))
+                .unwrap_or_else(|| ("?".into(), "?".into()));
             format!(
                 "cannot index parallel arrays [{second}] [{first}] (index {:?}, _id {id})",
                 index.name
@@ -390,14 +383,43 @@ fn refusal_message(index: &IndexMeta, doc: &Document, cause: UnkeyedCause, reaso
     }
 }
 
-/// The indexed paths that go through or end in an array of `doc`, in the index's order.
-fn array_paths(index: &IndexMeta, doc: &Document) -> Vec<String> {
-    index
-        .fields
-        .iter()
-        .filter(|field| !path::array_prefixes(doc, &field.path).is_empty())
-        .map(|field| field.path.clone())
-        .collect()
+fn last_segment(prefix: &str) -> &str {
+    prefix.rsplit('.').next().unwrap_or(prefix)
+}
+
+/// Whether array `a` and array `b`, named by their place in the path, lie on one
+/// path: equal, or one inside the elements of the other.
+fn on_one_path(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('.'))
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// The first two arrays of `doc` that the index's paths meet and that do not lie
+/// on one path, in the index's field order (`x` and `c` for `{x.a, c}` over
+/// `{x: [{a: 1}], c: [1, 2]}`).
+///
+/// An array inside the elements of an array a path already went through is not
+/// parallel to it (`{x.a, c}` over `{x: [{a: [1, 2]}], c: 1}` is keyed), and
+/// two paths through one array share it. Two paths that meet different inner
+/// arrays in different elements of one outer array (`{x.a, x.b}` over
+/// `{x: [{a: [1, 2]}, {b: [3, 4]}]}`) are refused though the reference keys
+/// them: the over-refusal is documented (ADR-259).
+fn parallel_arrays(index: &IndexMeta, doc: &Document) -> Option<(String, String)> {
+    let mut met: Vec<String> = Vec::new();
+    for field in &index.fields {
+        for prefix in path::array_prefixes(doc, &field.path) {
+            if !met.contains(&prefix) {
+                met.push(prefix);
+            }
+        }
+    }
+    for (j, later) in met.iter().enumerate() {
+        if let Some(earlier) = met[..j].iter().find(|earlier| !on_one_path(earlier, later)) {
+            return Some((earlier.clone(), later.clone()));
+        }
+    }
+    None
 }
 
 /// Bring every index on a collection in line with one document write.
@@ -3234,11 +3256,13 @@ mod tests {
         assert_eq!(index_keys(&idx, &doc! { "a": [1, 2], "b": 3 }).unwrap().len(), 3);
     }
 
-    /// The arrays a compound index spans are counted by where they sit in the
-    /// path, as the reference counts them: a path that fans out through an array
-    /// of documents is an array, however many values it resolves to.
+    /// A compound index is parallel when its paths meet two arrays that do not
+    /// lie on one path, as the reference counts them: a path that fans out
+    /// through an array of documents is an array, however many values it
+    /// resolves to, and an array inside its elements is not parallel to it.
+    /// Shapes r01..r16 are checked against MongoDB 6.0.5.
     #[test]
-    fn a_compound_index_counts_the_distinct_arrays_its_paths_go_through() {
+    fn a_compound_index_is_parallel_when_its_paths_meet_arrays_not_on_one_path() {
         let keyed = |idx: &IndexMeta, d: Document| match document_keys(idx, &d).unwrap() {
             DocumentKeys::Keyed { keys, .. } => Some(keys.len()),
             DocumentKeys::Unkeyed { cause, .. } => {
@@ -3246,28 +3270,71 @@ mod tests {
                 None
             }
         };
-        let xa_c = index(vec![IndexField::ascending("x.a"), IndexField::ascending("c")], false);
-        // The gap: an array of documents at x and an array at c.
+        let idx = |paths: &[&str]| {
+            index(paths.iter().map(|p| IndexField::ascending(*p)).collect::<Vec<_>>(), false)
+        };
+        let xa_c = idx(&["x.a", "c"]);
+        let xa_c_like = |other: &str| idx(&["x.a", other]);
+        // r01, r02: an array of documents at x and an array at c; one element counts.
         assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": 1 }, { "a": 2 }], "c": [1, 2] }), None);
-        // A single-element array is still an array.
         assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": 1 }], "c": [1, 2] }), None);
-        // One array is fine, at either path.
-        assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": 1 }, { "a": 2 }], "c": 3 }), Some(2));
-        assert_eq!(keyed(&xa_c, doc! { "x": { "a": 1 }, "c": [1, 2] }), Some(3));
-        // Nested arrays on one path: an array at x and an array at x.a.
-        assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": [1, 2] }], "c": 1 }), None);
-        // Two paths through ONE array share it: allowed.
-        let xa_xb = index(vec![IndexField::ascending("x.a"), IndexField::ascending("x.b")], false);
-        assert_eq!(
-            keyed(&xa_xb, doc! { "x": [{ "a": 1, "b": 2 }, { "a": 3, "b": 4 }] }),
-            Some(4),
-            "x.a and x.b over one array x are the reference's allowed shape"
-        );
-        // ...but not when each also ends in an array of its own.
+        // r11 and one array at either path.
+        assert!(keyed(&xa_c, doc! { "x": [{ "a": 1 }, { "a": 2 }], "c": 3 }).is_some());
+        assert!(keyed(&xa_c, doc! { "x": { "a": 1 }, "c": [1, 2] }).is_some());
+        // r03, r04: arrays nested on one path are one chain, not parallel.
+        assert!(keyed(&xa_c, doc! { "x": [{ "a": [1, 2] }], "c": 1 }).is_some());
+        assert!(keyed(&xa_c, doc! { "x": [{ "a": [1] }, { "a": [2] }], "c": 1 }).is_some());
+        // r15: ...until another field holds an array of its own.
+        assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": [1, 2] }], "c": [3] }), None);
+        // r05: two paths through one array share it.
+        let xa_xb = idx(&["x.a", "x.b"]);
+        assert!(keyed(&xa_xb, doc! { "x": [{ "a": 1, "b": 2 }, { "a": 3, "b": 4 }] }).is_some());
+        // r06: ...but not when each meets an inner array of its own.
         assert_eq!(keyed(&xa_xb, doc! { "x": [{ "a": [1, 2], "b": [3, 4] }] }), None);
+        // r07, the reference's own documented example.
+        let ax_az = idx(&["a.x", "a.z"]);
+        assert!(keyed(&ax_az, doc! { "a": [{ "x": 5, "z": [1, 2] }, { "z": [1, 2] }] }).is_some());
+        // r08: inner arrays in different elements. The reference keys it; the
+        // rule refuses it, a documented over-refusal.
+        assert_eq!(keyed(&xa_xb, doc! { "x": [{ "a": [1, 2] }, { "b": [3, 4] }] }), None);
+        // r09, r10, r12: a position, an array of arrays and an empty array are arrays.
+        assert_eq!(keyed(&idx(&["x.0.a", "c"]), doc! { "x": [{ "a": 1 }], "c": [1, 2] }), None);
+        assert_eq!(keyed(&xa_c, doc! { "x": [[{ "a": 1 }]], "c": [1, 2] }), None);
+        assert_eq!(keyed(&xa_c, doc! { "x": [], "c": [1, 2] }), None);
+        // r13: plain arrays at two fields.
+        assert_eq!(keyed(&idx(&["a", "b"]), doc! { "a": [1, 2], "b": [3, 4] }), None);
+        // r14, r16: a chain through several nested arrays.
+        assert!(
+            keyed(&idx(&["a.b.c", "a.d"]), doc! { "a": [{ "b": [{ "c": 1 }], "d": 1 }] }).is_some()
+        );
+        assert!(
+            keyed(&idx(&["x.y.z", "c"]), doc! { "x": [{ "y": [{ "z": [1, 2] }] }], "c": 1 })
+                .is_some()
+        );
+        // A name that merely starts with another's is not on its path.
+        assert_eq!(keyed(&xa_c_like("xy"), doc! { "x": [{ "a": 1 }], "xy": [1, 2] }), None);
+        assert_eq!(keyed(&idx(&["xy", "x.a"]), doc! { "x": [{ "a": 1 }], "xy": [1, 2] }), None);
         // A single-field index has nothing to be parallel with.
-        let single = index(vec![IndexField::ascending("x.a")], false);
+        let single = idx(&["x.a"]);
         assert_eq!(keyed(&single, doc! { "x": [{ "a": [1, 2] }, { "a": [3] }] }), Some(5));
+    }
+
+    #[test]
+    fn the_parallel_arrays_pair_is_named_by_the_arrays_later_first() {
+        let named = |paths: &[&str], d: Document| {
+            let idx = index(paths.iter().map(|p| IndexField::ascending(*p)).collect(), false);
+            parallel_arrays(&idx, &d)
+                .map(|(a, b)| (last_segment(&a).to_string(), last_segment(&b).to_string()))
+        };
+        // r01 [c] [x], r06 [b] [a], r13 [b] [a] in the reference's words.
+        assert_eq!(
+            named(&["x.a", "c"], doc! { "x": [{ "a": 1 }], "c": [1, 2] }),
+            Some(("x".into(), "c".into()))
+        );
+        assert_eq!(
+            named(&["x.a", "x.b"], doc! { "x": [{ "a": [1], "b": [2] }] }),
+            Some(("a".into(), "b".into()))
+        );
     }
 
     #[test]
