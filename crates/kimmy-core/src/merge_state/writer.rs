@@ -244,29 +244,24 @@ impl Writer {
                 kind: LifeKind::Upsert,
             },
         );
-        for (q, v) in fields {
+        // M1: a non-numeric creation value starts a generation, as in `insert`.
+        let starts_gen = !self.opts.creation_without_generation();
+        let mut cells: Vec<(&str, &Value, bool)> = Vec::new();
+        cells.extend(fields.iter().map(|(q, v)| (*q, v, true)));
+        cells.extend(sets.iter().map(|(q, v)| (*q, v, false)));
+        for (q, v, soi) in cells {
+            let generation = (starts_gen && !v.is_numeric()).then(|| {
+                let mut vv = s.vv.clone();
+                vv.insert(st.writer, st.hlc);
+                Gen { stamp: st, vv, seen: BTreeMap::new() }
+            });
             s.regs.insert(
                 (st, q.to_string()),
-                Reg {
-                    stamp: st,
-                    value: v.clone(),
-                    obs: BTreeMap::new(),
-                    generation: None,
-                    soi: true,
-                },
+                Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi },
             );
-        }
-        for (q, v) in sets {
-            s.regs.insert(
-                (st, q.to_string()),
-                Reg {
-                    stamp: st,
-                    value: v.clone(),
-                    obs: BTreeMap::new(),
-                    generation: None,
-                    soi: false,
-                },
-            );
+            if starts_gen && !v.is_numeric() {
+                s.gens.insert((st, q.to_string()), (st, BTreeMap::from([(st.writer, st.hlc)])));
+            }
         }
         let mut paths = Vec::new();
         let mut vals = BTreeMap::new();

@@ -917,6 +917,9 @@ fn golden_small() -> MergeState {
 /// release) and must be deliberate: do not "fix" these by regenerating them.
 ///
 /// Each entry is (state hash hex, canonical length, first 64 canonical bytes hex).
+///
+/// History: `mixed` was regenerated on purpose by the M1 fix (a non-numeric upsert creation value
+/// now starts a generation): f40dd813..de19 / 1349 became 928f2042..5f82 / 1557.
 fn check_golden(name: &str, st: &MergeState, want: (&str, usize, &str)) {
     let cb = st.canonical_bytes();
     assert_eq!(hex(&st.state_hash()), want.0, "{name}: state hash");
@@ -956,8 +959,8 @@ fn golden_vectors_mixed() {
         "mixed",
         &golden_mixed(),
         (
-            "f40dd8133d8d0ec21adb66bae867de19",
-            1349,
+            "928f20426ffe88fcc094541a25d75f82",
+            1557,
             "00000000000000030000000000000001000041414141414141414141414141414141000000000000000000000000000000000000000000000000000000000000",
         ),
     );
@@ -1125,4 +1128,71 @@ fn b1_mutant_is_visible_to_the_lib_tests() {
     w.write_inc("views", 1, 0).unwrap();
     w.write_inc("views", -1, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("n", s("a"))]));
+}
+
+// ---- M1: a non-numeric upsert creation value starts a generation ----------------------
+
+fn run_upsert_string_gen(o: &JoinOptions, soi: bool) -> Writer {
+    // No document. A: upsert {$set|$setOnInsert: {n: "s"}, $inc: {x: 1}}. B, concurrent:
+    // upsert {$inc: {n: 5}}. C pulls A only, then $set n 7. Then everyone joins everything.
+    let (mut a, mut b, mut c) = (
+        Writer::new(wid('A', 0), o.clone()),
+        Writer::new(wid('B', 0), o.clone()),
+        Writer::new(wid('C', 0), o.clone()),
+    );
+    let sv = [("n", s("s"))];
+    if soi {
+        a.upsert_soi(&sv, "x", 1, &[], 0).unwrap();
+    } else {
+        a.upsert_soi(&[], "x", 1, &sv, 0).unwrap();
+    }
+    b.upsert_inc("n", 5, 0).unwrap();
+    c.receive(&a.state);
+    c.write_set("n", i(7), 0).unwrap();
+    c.receive(&a.state);
+    c.receive(&b.state);
+    a.receive(&c.state);
+    b.receive(&c.state);
+    assert_eq!(a.state.state_hash(), c.state.state_hash());
+    assert_eq!(b.state.state_hash(), c.state.state_hash());
+    c
+}
+
+#[test]
+fn upsert_string_gen() {
+    for soi in [false, true] {
+        let c = run_upsert_string_gen(&opts(), soi);
+        let want = doc(&[("n", i(7)), ("x", i(1))]);
+        assert_eq!(c.visible(), want, "soi={soi}");
+        // B's +5 belongs to an older generation than C's set, which had not seen it.
+        assert_eq!(c.hidden_all(), BTreeMap::from([("n".to_string(), 5)]), "soi={soi}");
+    }
+}
+
+#[test]
+fn m1_mutant_is_visible_to_the_lib_tests() {
+    let o = JoinOptions { creation_without_generation: true, ..opts() };
+    for soi in [false, true] {
+        let c = run_upsert_string_gen(&o, soi);
+        assert_eq!(c.visible(), doc(&[("n", i(12)), ("x", i(1))]), "soi={soi}");
+        assert!(c.hidden_all().is_empty());
+    }
+}
+
+#[test]
+fn upsert_creation_generation_is_recorded_like_insert() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    let (c, _) =
+        w.upsert_soi(&[("t", s("dark"))], "v", 1, &[("l", f(1.5)), ("k", i(3))], 0).unwrap();
+    let st = c.stamp;
+    for p in ["t", "l"] {
+        let r = &w.state.regs[&(st, p.to_string())];
+        let g = r.generation.as_ref().expect("non-numeric creation value starts a generation");
+        assert_eq!(g.stamp, st);
+        assert_eq!(g.vv, BTreeMap::from([(st.writer, st.hlc)]));
+        assert!(g.seen.is_empty());
+        assert_eq!(w.state.gens[&(st, p.to_string())], (st, g.vv.clone()));
+    }
+    assert!(w.state.regs[&(st, "k".to_string())].generation.is_none());
+    assert!(!w.state.gens.contains_key(&(st, "k".to_string())));
 }

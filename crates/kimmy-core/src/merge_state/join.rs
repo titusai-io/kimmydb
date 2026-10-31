@@ -40,6 +40,10 @@ pub struct JoinOptions {
     /// counter whose increments net to 0 is absent again. Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
     pub value_ignores_slot_stamp: bool,
+    /// M1 mutant: an upsert creation with a non-numeric value starts no
+    /// generation (the model before the fix). Off in the design.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub creation_without_generation: bool,
     /// The model's `NORMALIZE_WRITES`: a writer normalises its own state through
     /// a join with the empty state after each write (off only to reproduce the
     /// un-normalised states of `model5.Member`).
@@ -65,6 +69,8 @@ impl Default for JoinOptions {
             v3_generation: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             value_ignores_slot_stamp: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            creation_without_generation: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             normalize_writes: true,
         }
@@ -118,6 +124,14 @@ impl JoinOptions {
     }
     #[cfg(not(any(test, feature = "merge-mutants")))]
     pub(super) fn value_ignores_slot_stamp(&self) -> bool {
+        false
+    }
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub(super) fn creation_without_generation(&self) -> bool {
+        self.creation_without_generation
+    }
+    #[cfg(not(any(test, feature = "merge-mutants")))]
+    pub(super) fn creation_without_generation(&self) -> bool {
         false
     }
     #[cfg(any(test, feature = "merge-mutants"))]
