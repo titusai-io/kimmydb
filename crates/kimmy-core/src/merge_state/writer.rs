@@ -30,8 +30,10 @@ pub struct WriteRecord {
     pub n: Option<i64>,
     /// The generation an increment belongs to (`Inc`).
     pub generation: Option<MStamp>,
-    /// An upsert that created the life (`Inc`).
+    /// An upsert that created the life (the `Inc` of `upsert_inc`, the creation write of `upsert_soi`).
     pub insert: bool,
+    /// The creation write of a `$setOnInsert` upsert: a life creation that is not an explicit insert.
+    pub upsert: bool,
     /// The `$setOnInsert` paths of an upsert.
     pub soi: Vec<String>,
 }
@@ -46,6 +48,7 @@ impl WriteRecord {
             n: None,
             generation: None,
             insert: false,
+            upsert: false,
             soi: Vec::new(),
         }
     }
@@ -196,9 +199,11 @@ impl Writer {
         Some(self.finish(st, rec))
     }
 
-    /// V6m2/V7m2: an upsert that creates the document with `$setOnInsert`
-    /// `fields`, applies `$set` `sets` and `$inc` `inc_path` by `n`. Only the
-    /// `$setOnInsert` cells are tagged and can be dropped.
+    /// V6m2/V7m2/V8: an upsert that creates the document with `$setOnInsert`
+    /// `fields`, applies `$set` `sets` and `$inc` `inc_path` by `n`. It is two
+    /// sequential local writes by one writer: the creation (the life and its
+    /// cells, the `$setOnInsert` cells tagged) and the increment, each with its
+    /// own stamp. Only the tagged cells can be dropped.
     pub fn upsert_soi(
         &mut self,
         fields: &[(&str, Value)],
@@ -206,7 +211,7 @@ impl Writer {
         n: i64,
         sets: &[(&str, Value)],
         skew: u64,
-    ) -> Option<Written> {
+    ) -> Option<(Written, Written)> {
         if !self.state.alive(&self.opts).is_empty() {
             return None;
         }
@@ -244,18 +249,32 @@ impl Writer {
                 },
             );
         }
-        s.slots.insert(
-            (st, inc_path.to_string(), self.id, None),
-            Slot { stamp: st, total: i128::from(n) },
-        );
-        let mut paths = vec![inc_path.to_string()];
-        paths.extend(fields.iter().map(|(p, _)| p.to_string()));
-        // NOTE(model): the model's record lists the `$setOnInsert` paths but not the `$set` paths.
-        let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), paths);
-        rec.n = Some(n);
+        let mut paths = Vec::new();
+        let mut vals = BTreeMap::new();
+        for (q, v) in fields.iter().chain(sets.iter()) {
+            if !paths.contains(&q.to_string()) {
+                paths.push(q.to_string());
+            }
+            vals.insert(q.to_string(), v.clone());
+        }
+        s.vv.insert(st.writer, st.hlc);
+        let mut rec = WriteRecord::new(WriteKind::Insert, Some(st), paths);
+        rec.vals = vals;
+        rec.upsert = true;
         rec.insert = true;
         rec.soi = fields.iter().map(|(p, _)| p.to_string()).collect();
-        Some(self.finish(st, rec))
+        let created = self.finish(st, rec);
+        let st2 = self.tick(skew);
+        // `finish` normalised the writer's state into a new value.
+        self.state.vv.insert(st2.writer, st2.hlc);
+        self.state.slots.insert(
+            (st, inc_path.to_string(), self.id, None),
+            Slot { stamp: st2, total: i128::from(n) },
+        );
+        let mut rec2 = WriteRecord::new(WriteKind::Inc, Some(st), vec![inc_path.to_string()]);
+        rec2.n = Some(n);
+        let incd = self.finish(st2, rec2);
+        Some((created, incd))
     }
 
     /// An upserting `$inc` that creates the document; refused while a life is alive.

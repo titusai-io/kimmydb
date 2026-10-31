@@ -90,15 +90,20 @@ impl Mem {
         let r = self.w.upsert_inc(p, n, 0);
         self.log(r)
     }
+    /// Returns `(life, inc stamp)`: the creation write and the increment write.
     fn upsert_soi(
         &mut self,
         f: &[(&str, Value)],
         p: &str,
         n: i64,
         sets: &[(&str, Value)],
-    ) -> Option<MStamp> {
-        let r = self.w.upsert_soi(f, p, n, sets, 0);
-        self.log(r)
+    ) -> Option<(MStamp, MStamp)> {
+        let (c, i) = self.w.upsert_soi(f, p, n, sets, 0)?;
+        let life = c.stamp;
+        let inc = i.stamp;
+        self.log(Some(c));
+        self.log(Some(i));
+        Some((life, inc))
     }
     fn set(&mut self, p: &str, v: Value, sk: u64) -> Option<MStamp> {
         let r = self.w.write_set(p, v, sk);
@@ -756,18 +761,18 @@ fn probe_v6m2_insert_vs_upsert() {
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
     let aa = a.ins(&[("name", s("A")), ("role", s("admin"))], 0).unwrap();
     b.w.clock = h(6);
-    let bb = b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
+    let (bl, bb) = b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
     for (p, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
         assert_eq!(
             m.visible(),
             doc(&[("name", s("A")), ("role", s("admin")), ("views", i(1))]),
             "{p:?}"
         );
-        assert!(m.loss_set().contains(&(LossKind::InsertLost, "theme".to_string(), bb)), "{p:?}");
+        assert!(m.loss_set().contains(&(LossKind::InsertLost, "theme".to_string(), bl)), "{p:?}");
     }
     // The same, the upsert older.
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
-    let bb = b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
+    let (_, bb) = b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
     a.w.clock = h(6);
     let aa = a.ins(&[("name", s("A"))], 0).unwrap();
     for (p, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
@@ -775,7 +780,7 @@ fn probe_v6m2_insert_vs_upsert() {
     }
     // Two upserts merge.
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
-    let x = a.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
+    let (_, x) = a.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
     let y = b.upsert_inc("views", 1).unwrap();
     let obs = fresh_observer(&o, &[a.ent(x), b.ent(y)]);
     assert_eq!(obs.visible().unwrap()["views"], i(2));
@@ -815,15 +820,45 @@ fn probe_v7m1_v7m2_reinsert_vs_upsert() {
         }
         let aa = a.ins(&[("name", s("A"))], 0).unwrap();
         b.w.clock = h(6);
-        let bb = b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[("lang", s("en"))]).unwrap();
+        let (bl, bb) =
+            b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[("lang", s("en"))]).unwrap();
         for (p, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &seed) {
             let want = doc(&[("name", s("A")), ("lang", s("en")), ("views", i(1))]);
             assert_eq!(m.visible(), want, "{after_delete} {p:?}");
             assert!(
-                m.loss_set().contains(&(LossKind::InsertLost, "theme".to_string(), bb)),
+                m.loss_set().contains(&(LossKind::InsertLost, "theme".to_string(), bl)),
                 "{after_delete} {p:?}"
             );
             assert!(!m.w.state.losses.keys().any(|k| k.path == "lang"));
         }
     }
+}
+
+#[test]
+fn upsert_soi_is_two_writes() {
+    let o = opts();
+    let id = wid('B', 0);
+    let mut w = Writer::new(id, o);
+    let (c, n) =
+        w.upsert_soi(&[("theme", s("dark"))], "views", 3, &[("lang", s("en"))], 0).unwrap();
+    assert!(c.stamp < n.stamp);
+    assert_eq!(c.record.kind, WriteKind::Insert);
+    assert!(c.record.upsert && c.record.insert);
+    assert_eq!(c.record.life, Some(c.stamp));
+    assert_eq!(c.record.paths, vec!["theme".to_string(), "lang".to_string()]);
+    assert_eq!(c.record.soi, vec!["theme".to_string()]);
+    assert_eq!(c.record.vals["lang"], s("en"));
+    assert_eq!(n.record.kind, WriteKind::Inc);
+    assert!(!n.record.upsert && !n.record.insert);
+    assert_eq!(n.record.life, Some(c.stamp));
+    assert_eq!(n.record.paths, vec!["views".to_string()]);
+    assert_eq!(n.record.n, Some(3));
+    let slot = &w.state.slots[&(c.stamp, "views".to_string(), id, None)];
+    assert_eq!(slot.stamp, n.stamp);
+    assert_eq!(w.state.vv[&id], n.stamp.hlc);
+    // no other write sets `upsert`
+    let x = w.write_set("lang", s("fr"), 0).unwrap();
+    assert!(!x.record.upsert);
+    assert_eq!(w.visible(), doc(&[("theme", s("dark")), ("lang", s("fr")), ("views", i(3))]));
+    assert!(w.upsert_soi(&[], "v", 1, &[], 0).is_none());
 }
