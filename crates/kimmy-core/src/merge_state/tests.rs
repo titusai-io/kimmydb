@@ -862,3 +862,120 @@ fn upsert_soi_is_two_writes() {
     assert_eq!(w.visible(), doc(&[("theme", s("dark")), ("lang", s("fr")), ("views", i(3))]));
     assert!(w.upsert_soi(&[], "v", 1, &[], 0).is_none());
 }
+
+// ---- golden vectors -------------------------------------------------------------
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn golden_empty() -> MergeState {
+    MergeState::default()
+}
+
+/// x=100 inserted by A, then +20 by B and +50 by C, all joined: x reads 170.
+fn golden_170() -> MergeState {
+    let o = opts();
+    let (mut a, mut b, mut c) = (Mem::new('A', &o), Mem::new('B', &o), Mem::new('C', &o));
+    let i0 = a.ins(&[("x", i(100))], 0).unwrap();
+    b.receive_entry(&a.ent(i0));
+    c.receive_entry(&a.ent(i0));
+    let bb = b.inc("x", 20, 0).unwrap();
+    let cc = c.inc("x", 50, 0).unwrap();
+    a.receive_entry(&b.ent(bb));
+    a.receive_entry(&c.ent(cc));
+    assert_eq!(a.visible(), doc(&[("x", i(170))]));
+    a.w.state.clone()
+}
+
+/// A superseded first insert (insertLost on the document), an upsert with $setOnInsert whose
+/// cell is dropped for the alive insert (insertLost on the cell), and a clash record.
+fn golden_mixed() -> MergeState {
+    let o = opts();
+    let (mut a, mut b, mut c) = (Mem::new('A', &o), Mem::new('B', &o), Mem::new('C', &o));
+    let aa = a.ins(&[("x", i(1)), ("n", s("a"))], 0).unwrap();
+    b.w.clock = h(5);
+    let bb = b.ins(&[("y", i(2)), ("n", s("b"))], 0).unwrap();
+    let (_, cc) = c.upsert_soi(&[("theme", s("dark"))], "views", 1, &[("lang", f(1.5))]).unwrap();
+    let mut obs = fresh_observer(&o, &[]);
+    for e in [a.ent(aa), b.ent(bb), c.ent(cc)] {
+        obs.receive_entry(&e);
+    }
+    let kinds: BTreeSet<LossKind> = obs.w.state.losses.keys().map(|k| k.kind).collect();
+    assert!(kinds.contains(&LossKind::InsertLost));
+    obs.w.state.clone()
+}
+
+fn golden_small() -> MergeState {
+    let mut w = Writer::new(wid('A', 7), opts());
+    w.insert(&[("x", i(1)), ("s", s("t"))], 0).unwrap();
+    w.state.clone()
+}
+
+/// GOLDEN VECTORS. The canonical bytes, the `encode()` bytes and the state hash are a persisted,
+/// cross-release, cross-architecture format. Changing any value below is a FORMAT CHANGE (a wipe
+/// release) and must be deliberate: do not "fix" these by regenerating them.
+///
+/// Each entry is (state hash hex, canonical length, first 64 canonical bytes hex).
+fn check_golden(name: &str, st: &MergeState, want: (&str, usize, &str)) {
+    let cb = st.canonical_bytes();
+    assert_eq!(hex(&st.state_hash()), want.0, "{name}: state hash");
+    assert_eq!(cb.len(), want.1, "{name}: canonical length");
+    assert_eq!(hex(&cb[..cb.len().min(64)]), want.2, "{name}: first 64 canonical bytes");
+}
+
+#[test]
+fn golden_vectors_empty() {
+    check_golden(
+        "empty",
+        &golden_empty(),
+        (
+            "f8d0ff0ab1a622e0a611a762fe2b45fb",
+            56,
+            "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+}
+
+#[test]
+fn golden_vectors_170() {
+    check_golden(
+        "170",
+        &golden_170(),
+        (
+            "42b0c20d1b0c26903625be81f0a105a0",
+            670,
+            "00000000000000010000000000000001000041414141414141414141414141414141000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+}
+
+#[test]
+fn golden_vectors_mixed() {
+    check_golden(
+        "mixed",
+        &golden_mixed(),
+        (
+            "f40dd8133d8d0ec21adb66bae867de19",
+            1349,
+            "00000000000000030000000000000001000041414141414141414141414141414141000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+}
+
+#[test]
+fn golden_encode_bytes_round_trip() {
+    const ENC: &str = "514d530100000000000000010000000000000001000041414141414141414141414141414141000000000000000000000000000000000007000000000000000000000000000000020000000000000001780000000000000001730000000000000000000000000000000000000000000000000200000000000000010000414141414141414141414141414141410000000000000000000000000000000000070000000000000001730000000000000001000041414141414141414141414141414141000000000000000000000000000000000007030000000000000001740000000000000000010000000000000001000041414141414141414141414141414141000000000000000000000000000000000007000000000000000141414141414141414141414141414141000000000000000000000000000000000007000000000000000100000000000000000000000000000000000001000041414141414141414141414141414141000000000000000000000000000000000007000000000000000178000000000000000100004141414141414141414141414141414100000000000000000000000000000000000701000000000000000100000000000000000000000000000000000000000000000000014141414141414141414141414141414100000000000000000000000000000000000700000000000000010000000000000000000000000000000000010000000000000001000041414141414141414141414141414141000000000000000000000000000000000007000000000000000173000000000000000100004141414141414141414141414141414100000000000000000000000000000000000700000000000000014141414141414141414141414141414100000000000000000000000000000000000700000000000000010000";
+    let st = golden_small();
+    assert_eq!(hex(&st.encode()), ENC);
+    let bytes: Vec<u8> = (0..ENC.len() / 2)
+        .map(|k| u8::from_str_radix(&ENC[2 * k..2 * k + 2], 16).unwrap())
+        .collect();
+    // The header: magic "QMS" and the format version byte.
+    assert_eq!(&bytes[..4], b"QMS\x01");
+    let back = MergeState::decode(&bytes).unwrap();
+    assert_eq!(back, st);
+    assert_eq!(back.encode(), bytes);
+    // Lengths are big-endian u64: the first count (lives = 1) follows the header.
+    assert_eq!(&bytes[4..12], &1u64.to_be_bytes());
+}

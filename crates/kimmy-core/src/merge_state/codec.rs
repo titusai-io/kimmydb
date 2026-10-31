@@ -1,9 +1,22 @@
 //! Canonical bytes, the state hash and the whole-state round trip.
 //!
 //! The encoding is total and deterministic: every map is written in key order
-//! (the `BTreeMap` order, itself total), every length is a big-endian `u32`,
-//! integers are fixed width big-endian, doubles are their IEEE bit pattern.
-//! It is the binary form of the model's `canon()`.
+//! (the `BTreeMap` order, itself total), every length is a big-endian `u64`,
+//! integers are fixed width big-endian, doubles are their IEEE bit pattern
+//! (`to_bits`, big-endian). It is the binary form of the model's `canon()`.
+//!
+//! Stability: the bytes of [`MergeState::canonical_bytes`], of
+//! [`MergeState::encode`] and the [`MergeState::state_hash`] do not depend on
+//! the architecture, the word size, `std::hash`, hash-map order or float
+//! formatting. Every multi-byte integer is BIG-ENDIAN (`to_be_bytes`), no
+//! `usize` is written (lengths are `u64`), the hash mix reads its input as
+//! big-endian `u64` words.
+//!
+//! Versions: [`MergeState::encode`] starts with the 3 bytes `QMS` and ONE format
+//! version byte (currently 1), then the canonical body, then the `gens`.
+//! [`MergeState::canonical_bytes`] is the body alone and carries no tag; the
+//! hash covers the body. The golden vectors in `tests.rs` pin all three: changing
+//! the bytes is a format change (a wipe release) and must be deliberate.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,7 +54,7 @@ impl W {
         self.0.push(v);
     }
     fn len(&mut self, n: usize) {
-        self.0.extend_from_slice(&(n as u32).to_be_bytes());
+        self.0.extend_from_slice(&(n as u64).to_be_bytes());
     }
     fn i64(&mut self, v: i64) {
         self.0.extend_from_slice(&v.to_be_bytes());
@@ -214,7 +227,7 @@ impl MergeState {
 
     /// A 128-bit digest of [`MergeState::canonical_bytes`]. Not cryptographic:
     /// it is a divergence detector. Two lanes of a multiply-rotate mix over
-    /// little-endian 8-byte words (the tail zero-padded, the length folded in at
+    /// big-endian 8-byte words (the tail zero-padded, the length folded in at
     /// the end), cross-fed, then each lane passed through the splitmix64
     /// finaliser.
     pub fn state_hash(&self) -> [u8; 16] {
@@ -323,14 +336,14 @@ impl R<'_> {
     fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.arr::<1>()?[0])
     }
-    /// A length. Each counted item takes at least one byte, so a length larger
-    /// than the rest of the input is refused before anything is allocated.
+    /// A length (`u64`). Each counted item takes at least one byte, so a length
+    /// larger than the rest of the input is refused before anything is allocated.
     fn len(&mut self) -> Result<usize, DecodeError> {
-        let n = u32::from_be_bytes(self.arr()?) as usize;
-        if n > self.0.len() {
+        let n = u64::from_be_bytes(self.arr()?);
+        if n > self.0.len() as u64 {
             return Err(DecodeError::Truncated);
         }
-        Ok(n)
+        Ok(n as usize)
     }
     fn i64(&mut self) -> Result<i64, DecodeError> {
         Ok(i64::from_be_bytes(self.arr()?))
@@ -441,7 +454,7 @@ fn hash128(data: &[u8]) -> [u8; 16] {
     for chunk in data.chunks(8) {
         let mut buf = [0u8; 8];
         buf[..chunk.len()].copy_from_slice(chunk);
-        let v = u64::from_le_bytes(buf);
+        let v = u64::from_be_bytes(buf);
         a = (a ^ v).wrapping_mul(P1).rotate_left(29);
         b = (b.rotate_left(31) ^ v).wrapping_mul(P2);
         a ^= b >> 17;
