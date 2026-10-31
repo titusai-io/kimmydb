@@ -238,6 +238,10 @@ default.
 
 ### `$unset`
 
+`$addFields`/`$set`, `$project`/`$unset` and `$replaceRoot`/`$replaceWith` are also
+the three stages an [update written as an array](query-language.md#pipeline-updates)
+may use, which run them over each document it updates.
+
 `{$unset: "secret"}` removes one field, `{$unset: ["a", "b.c", "items.price"]}` several;
 it is `{$project: {a: 0, "b.c": 0, ...}}` ([ADR-263](decisions.md)), so a dotted path
 removes the field in the embedded document and a path through an array removes it from

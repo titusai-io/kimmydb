@@ -374,7 +374,11 @@ pub struct UpdateArgs {
         deserialize_with = "kimmy_api::json::non_null_field"
     )]
     pub filter: Option<Value>,
-    /// Update operators, for example `{"$set": {"status": "closed"}}`.
+    /// Update operators, for example `{"$set": {"status": "closed"}}`, or an
+    /// array of pipeline stages that compute the new document from the old
+    /// one, for example `[{"$set": {"total": {"$add": ["$a", "$b"]}}}]`. Only
+    /// `$set`/`$addFields`, `$unset`/`$project` and `$replaceWith`/
+    /// `$replaceRoot` stages are allowed, and `arrayFilters` cannot be used.
     pub update: Value,
     /// Update every match rather than only the first.
     #[serde(default)]
@@ -701,7 +705,9 @@ impl KimmyMcp {
                        unless `multi` is true. A path may address array elements: \
                        `items.$[].qty` for every element, or `items.$[line].qty` for \
                        the elements an `arrayFilters` entry such as \
-                       `{\"line.sku\": \"b\"}` selects.")]
+                       `{\"line.sku\": \"b\"}` selects. `update` may instead be an array \
+                       of stages (`$set`, `$unset`, `$project`, `$replaceWith`) that \
+                       compute the new document from the old one.")]
     async fn update(
         &self,
         Parameters(args): Parameters<UpdateArgs>,

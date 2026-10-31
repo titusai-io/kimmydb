@@ -446,6 +446,24 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
 document, every identifier filtered and every filter used, and the `$` of the
 element the filter matched — are in [Query language](query-language.md#positional-updates).
 
+**A pipeline update.** An `update` that is an **array of stages** computes the new
+document from the old one ([ADR-265](decisions.md)); the same spelling serves
+`update` (`multi` or not) and `find_and_modify` (with `upsert` too):
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
+  "filter": { "status": "open" },
+  "update": [ { "$set": { "total": { "$add": ["$subtotal", "$tax"] } } }, { "$unset": "draft" } ],
+  "multi": true
+}'
+```
+
+Only `$addFields`/`$set`, `$project`/`$unset` and `$replaceRoot`/`$replaceWith` are
+allowed; the answer is the one an operator update gives (`matched`, `modified`,
+`commits`, `stamp`). `arrayFilters` with an array `update` is `400`, as is any
+stage that changes or removes `_id`. See
+[Pipeline updates](query-language.md#pipeline-updates).
+
 > **Sharp edge.** A `multi: true` request is atomic per chunk, not per
 > request. Once a chunk has committed, the later chunks wait for the writer
 > as long as it takes, so a busy writer does not split the request; but a

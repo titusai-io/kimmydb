@@ -17,6 +17,7 @@ use crate::expr::Expr;
 use crate::filter::{self, ArrayPosition, Filter, type_name_of as type_name};
 use crate::path;
 use crate::shape::{self, SortKey};
+use crate::update_pipeline::UpdatePipeline;
 
 /// What an update document asks for.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,8 @@ pub enum Update {
     Replace(Document),
     /// Apply operators in order.
     Operators(Vec<Operation>),
+    /// An array of aggregation stages run over the document (ADR-265).
+    Pipeline(UpdatePipeline),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +175,19 @@ const ID_FIELD: &str = "_id";
 // Parsing
 // ---------------------------------------------------------------------------
 
+/// Parse a pipeline update, `[{$set: ..}, {$unset: ..}, ..]`, together with the request's
+/// `arrayFilters`, which a pipeline update has no use for and which are refused
+/// (ADR-265). A positional `$` has nothing to name in one either.
+pub fn parse_pipeline(stages: &[Bson], array_filters: &[Document]) -> Result<Update> {
+    if !array_filters.is_empty() {
+        return Err(Error::InvalidUpdate(
+            "arrayFilters apply to update operators, not to a pipeline update: address array              elements with $map and $filter in an expression"
+                .into(),
+        ));
+    }
+    Ok(Update::Pipeline(UpdatePipeline::parse(stages)?))
+}
+
 pub fn parse(doc: &Document) -> Result<Update> {
     parse_with_filters(doc, &[])
 }
@@ -278,7 +294,7 @@ impl Update {
     /// element the filter matched ([`apply_matched`]).
     pub fn uses_matched_position(&self) -> bool {
         match self {
-            Update::Replace(_) => false,
+            Update::Replace(_) | Update::Pipeline(_) => false,
             Update::Operators(ops) => ops.iter().any(|op| has_matched_position(&op.path)),
         }
     }
@@ -297,6 +313,7 @@ impl Update {
     pub fn first_write_outside_matched(&self, array: &str) -> Option<String> {
         let ops = match self {
             Update::Replace(_) => return Some("the replacement document".to_string()),
+            Update::Pipeline(_) => return Some("the update pipeline".to_string()),
             Update::Operators(ops) => ops,
         };
         let array = path::segments(array);
@@ -960,6 +977,7 @@ fn apply_to_at(
             *doc = next;
             return Ok(());
         }
+        Update::Pipeline(pipeline) => return pipeline.apply(doc),
         Update::Operators(ops) => ops,
     };
 

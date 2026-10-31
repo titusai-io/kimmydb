@@ -92,6 +92,22 @@ Also recorded here, so they are not read as bugs:
 
 ---
 
+## 🟡 Pipeline updates: three stage families, `_id` never added, no `arrayFilters`
+
+**Raised 2026-10-31, with ADR-265.** An `update` that is an array of stages is built ([query-language.md](query-language.md#pipeline-updates)). Where it differs from the reference:
+
+- **Only `$addFields`/`$set`, `$project`/`$unset` and `$replaceRoot`/`$replaceWith` are allowed**, as in the reference; the refusal here is `400` at parse for every other stage.
+- **`$project: {_id: 0}` and `$unset: "_id"` are `400`**, `_id is immutable and cannot be updated`. The reference's replacement logic puts a missing `_id` back from the stored document; here only a `$replaceRoot`/`$replaceWith` result lacking `_id` is given the stored one, and an explicit removal by a stage is refused rather than silently undone. (Uncertain: marked in the probe script.)
+- **An upsert's pipeline cannot give the inserted document an `_id` the filter did not name**, `400`, as `$set: {_id: ...}` is refused for operators; the reference allows it on insert.
+- **`arrayFilters` with an array update is `400`**; the reference refuses them too, but its message differs. A positional projection with `returnDocument: "after"` on `find_and_modify` is `400` with a pipeline update.
+- **A path that is missing writes `null`**, not nothing: `{$set: {p: "$nope"}}` stores `p: null`, where the reference's `$addFields` leaves the field out. It is the aggregation expression layer's rule in this build (an expression always yields a value; see the missing-versus-null entry), and the update inherits it. `$$REMOVE` leaves a field out, as in `$addFields`.
+- **The result is stored whole.** A pipeline that leaves the document byte-equal (including key order and number types) is a no-op; one that changes a number's type (`1` to `1.0`) is a change, as for operators.
+- **Pipeline stages run on a copy and are checked after**, so an `_id` refusal is raised when the update runs, with the other write-time refusals, not when the body is parsed.
+
+**To close:** none planned.
+
+---
+
 ## 🟡 The small stages: `$sortByCount`, `$sample`, `$redact`, `$unset` and `$unionWith`
 
 **Raised 2026-10-31, with ADR-263.** `$sortByCount`, `$replaceWith`, `$unset`, `$sample`, `$redact` and `$unionWith` are built ([aggregation.md](aggregation.md#sortbycount)). Where they differ from, or rest on a reading of, the reference:

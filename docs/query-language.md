@@ -576,7 +576,9 @@ now deletes the documents holding a decimal, where it kept them.
 ## Update operators
 
 An update is **either** operators **or** a whole replacement document, never
-both — mixing them is rejected rather than guessed at.
+both — mixing them is rejected rather than guessed at. A third form, an
+**array of aggregation stages**, computes the new document from the old one:
+see [Pipeline updates](#pipeline-updates).
 
 | Operator | Behaviour |
 |---|---|
@@ -979,6 +981,47 @@ whole-document last-writer-wins, as they do for integers: the oplog carries the
 post-image, so the operator is evaluated once, by the member that took the
 request, and a peer stores the bytes it is sent.
 
+### Pipeline updates
+
+An `update` that is an **array** is a pipeline update ([ADR-265](decisions.md)): the
+stages run over each document the filter matched and the result is stored. It is how
+a new value is computed from other fields of the same document, which the operators
+cannot do.
+
+```javascript
+// POST /v1/db/shop/coll/orders/update
+{ "filter": { "status": "open" },
+  "update": [ { "$set": { "total": { "$add": ["$subtotal", "$tax"] }, "closedAt": "$$NOW" } },
+              { "$unset": "draft" } ],
+  "multi": true }
+```
+
+- **Three stage families only**: `$addFields` (`$set`), `$project` (`$unset`) and
+  `$replaceRoot` (`$replaceWith`). Any other stage, an empty array and an element
+  that is not a document are `400`, `invalid update: …`. They are the aggregation
+  stages, so an expression, `null` and missing propagation, `$$ROOT`, `$$CURRENT`
+  and `$$REMOVE` mean what they mean in an [aggregation](aggregation.md#expressions).
+  Each stage sees the document the one before it left.
+- **`$$NOW` is one date for the request**: every document and every stage of one
+  request sees the same instant.
+- **`arrayFilters` are `400` with a pipeline** (and a positional `$` has nothing to
+  name). Address elements with `$map` and `$filter` in an expression.
+- **`_id` does not move.** A stage that changes it, or takes it out
+  (`$project: {_id: 0}`, `$unset: "_id"`), is `400`, `_id is immutable and cannot be
+  updated`. A `$replaceWith` or `$replaceRoot` whose result has no `_id` keeps the
+  stored one, as a replacement does; one with another `_id` is `400`.
+- **It is an update like any other** once the stages have run: the result is held to
+  the document size and depth caps, the collection's [validator](validation.md), the
+  index keying checks and the unchanged-document rule (a result byte-equal to the
+  stored document is not written: `modified` stays `0`). It replicates as every
+  update does, the whole stored result.
+- **On `update` (one or many), `find_and_modify` (with `upsert` too) and the MCP
+  `update` tool.** An upsert seeds the document from the filter's equality fields
+  exactly as for operators, then runs the stages over it; there is no
+  `$setOnInsert`, and a pipeline cannot give the inserted document an `_id` of its
+  own. A positional projection on `find_and_modify` with `returnDocument: "after"` is
+  `400`.
+
 ### `_id` is immutable
 
 A replacement (`PUT`) stores `_id` as the document was keyed. An integer id in
@@ -995,6 +1038,8 @@ document:
 ```javascript
 // Rejected at parse time
 { "$set": { "_id": 2 } }
+// Rejected when the result is known (a pipeline update)
+[ { "$set": { "_id": 2 } } ]
 
 // Accepted, but the existing _id is preserved — the document is not relocated
 { "_id": 999, "item": "widget" }

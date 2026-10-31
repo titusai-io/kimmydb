@@ -21,6 +21,7 @@ pub mod plan;
 pub mod shape;
 pub mod stages;
 pub mod update;
+pub mod update_pipeline;
 
 #[cfg(test)]
 mod accumulator_tests;
@@ -46,6 +47,8 @@ mod sink_tests;
 mod sort_zip_tests;
 #[cfg(test)]
 mod stage_tests;
+#[cfg(test)]
+mod update_pipeline_tests;
 
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};

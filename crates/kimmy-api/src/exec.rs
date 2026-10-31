@@ -18,7 +18,7 @@ use kimmy_storage::CollectionMeta;
 use serde_json::{Value, json};
 
 use crate::error::ApiError;
-use crate::json::{document_to_json, json_to_document};
+use crate::json::{document_to_json, json_to_bson, json_to_document};
 use crate::state::{Auth, SharedState};
 
 /// Default page size, so an unbounded `find` cannot be used to pull an entire
@@ -1342,6 +1342,12 @@ pub fn update(
 /// against each other, so neither is meaningful alone.
 fn parse_update(update_json: &Value, array_filters: &[Value]) -> Result<update::Update, ApiError> {
     let filters = array_filters.iter().map(json_to_document).collect::<Result<Vec<_>, _>>()?;
+    // An array is a pipeline update, a list of aggregation stages (ADR-265); a document
+    // is operators or a replacement.
+    if let Value::Array(stages) = update_json {
+        let stages = stages.iter().map(json_to_bson).collect::<Result<Vec<_>, _>>()?;
+        return Ok(update::parse_pipeline(&stages, &filters)?);
+    }
     Ok(update::parse_with_filters(&json_to_document(update_json)?, &filters)?)
 }
 
@@ -1500,6 +1506,8 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         // `invalid query: invalid query: …`.
         update::apply_matched(update, self.filter, &mut next, self.now).map_err(|e| match e {
             kimmy_core::Error::InvalidQuery(reason) => reason,
+            // A pipeline update refuses a write to `_id` here, when its result is known.
+            kimmy_core::Error::InvalidUpdate(reason) => reason,
             other => other.to_string(),
         })?;
         let answered = match self.answer {

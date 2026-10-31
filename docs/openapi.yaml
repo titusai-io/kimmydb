@@ -1752,6 +1752,17 @@ paths:
         a `$` after a `$[]` or `$[<identifier>]` segment, or the request is an
         upsert that inserts (ADR-256).
 
+        **An `update` that is an array is a pipeline update** (ADR-265): its
+        stages run over each matched document and the result is stored, so a
+        value can be computed from the document's other fields. Only
+        `$addFields` (`$set`), `$project` (`$unset`) and `$replaceRoot`
+        (`$replaceWith`) are allowed; any other stage, an empty array and an
+        element that is not a document are `400` (`invalid update: …`), as is
+        `arrayFilters` and any stage that changes or removes `_id`. `$$NOW` is
+        one date for the request. The result goes through the same checks as
+        any update (size, validator, index keys) and a result equal to the
+        stored document is not written.
+
         An update writes each path once: two writes to one path, or to a
         path and a path inside it, are refused `400` and nothing is written,
         whichever operators carry them and in either order (ADR-205). Two
@@ -1783,8 +1794,10 @@ paths:
               properties:
                 filter: { $ref: "#/components/schemas/Document" }
                 update:
-                  $ref: "#/components/schemas/Document"
-                  description: Update operators, or a whole replacement document.
+                  $ref: "#/components/schemas/UpdateBody"
+                  description: |
+                    Update operators, a whole replacement document, or an array
+                    of aggregation stages (a pipeline update, ADR-265).
                 multi:
                   type: boolean
                   default: false
@@ -1897,7 +1910,7 @@ paths:
                   description: |
                     Chooses which document when several match. Without it the
                     choice is the scan's own order, which is unspecified.
-                update: { $ref: "#/components/schemas/Document" }
+                update: { $ref: "#/components/schemas/UpdateBody" }
                 remove:
                   type: boolean
                   default: false
@@ -3581,6 +3594,19 @@ components:
         the store is schemaless by design, and a schema inferred from a sample
         would make perfectly valid documents unrepresentable (ADR-055).
       additionalProperties: true
+
+    UpdateBody:
+      description: |
+        An update: a document of operators (`{"$set": {...}}`), a whole
+        replacement document, or an **array of aggregation stages** that
+        computes the new document from the old one — only `$addFields`
+        (`$set`), `$project` (`$unset`) and `$replaceRoot` (`$replaceWith`)
+        (ADR-265).
+      oneOf:
+        - $ref: "#/components/schemas/Document"
+        - type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/Document" }
 
     ArrayFilters:
       type: array
