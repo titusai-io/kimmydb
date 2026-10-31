@@ -1805,7 +1805,7 @@ mod tests {
 
     #[test]
     fn an_unknown_regex_flag_is_refused_naming_it() {
-        for flags in ["I", "g", "ix ", "u", "l"] {
+        for flags in ["I", "g", "ix ", "l"] {
             let message = refused(doc! { "s": { "$regex": "s", "$options": flags } });
             assert!(message.contains("flag"), "{message}");
         }
@@ -1817,12 +1817,20 @@ mod tests {
     }
 
     #[test]
-    fn the_four_regex_flags_and_none_are_accepted() {
+    fn the_five_regex_flags_and_none_are_accepted() {
         assert!(hits(doc! { "s": { "$regex": "^AB", "$options": "i" } }, doc! { "s": "abc" }));
         assert!(hits(doc! { "s": { "$regex": "a b", "$options": "x" } }, doc! { "s": "ab" }));
         assert!(hits(doc! { "s": { "$regex": "^b", "$options": "m" } }, doc! { "s": "a\nb" }));
         assert!(hits(doc! { "s": { "$regex": "a.b", "$options": "s" } }, doc! { "s": "a\nb" }));
         assert!(hits(doc! { "s": { "$regex": "^AB", "$options": "imsx" } }, doc! { "s": "abc" }));
+        // `u` is accepted, as the reference accepts it, and changes nothing.
+        assert!(hits(doc! { "s": { "$regex": "^ab", "$options": "u" } }, doc! { "s": "abc" }));
+        assert!(hits(doc! { "s": { "$regex": "^AB", "$options": "imsxu" } }, doc! { "s": "abc" }));
+        assert!(!hits(
+            doc! { "s": { "$regex": "^\\d$", "$options": "u" } },
+            doc! { "s": "\u{663}" }
+        ));
+        assert!(hits(doc! { "s": { "$regex": "^ab", "$options": "" } }, doc! { "s": "abc" }));
         assert!(hits(doc! { "s": { "$regex": "^ab", "$options": "" } }, doc! { "s": "abc" }));
     }
 
@@ -1832,6 +1840,24 @@ mod tests {
         assert!(!hits(doc! { "s": { "$regex": "^ab" } }, doc! { "s": "xabc" }));
         // A non-string can never match a regex.
         assert!(!hits(doc! { "s": { "$regex": "1" } }, doc! { "s": 1 }));
+    }
+
+    #[test]
+    fn regex_digit_word_and_space_classes_are_ascii() {
+        // The reference's: `\\w` is not `é`, `\\d` not an Arabic-Indic digit, `\\s` not a
+        // no-break space; case-insensitive matching is still Unicode.
+        let on = |pattern: &str, text: &str| {
+            hits(doc! { "s": { "$regex": pattern } }, doc! { "s": text })
+        };
+        assert!(on("^\\w+$", "cafe_9"));
+        assert!(!on("^\\w+$", "café"));
+        assert!(!on("^\\d$", "\u{663}"));
+        assert!(on("^\\D$", "\u{663}"));
+        assert!(!on("\\s", "\u{a0}"));
+        assert!(on("^\\S$", "\u{a0}"));
+        assert!(on("\\bx", "\u{e9}x"));
+        assert!(hits(doc! { "s": { "$regex": "É", "$options": "i" } }, doc! { "s": "é" }));
+        assert!(hits(doc! { "s": { "$regex": "k", "$options": "i" } }, doc! { "s": "\u{212a}" }));
     }
 
     #[test]
@@ -1983,11 +2009,11 @@ mod tests {
     fn the_pattern_itself_refuses_an_unknown_flag_naming_it() {
         // `RegexPattern::new` is the check a `$regex` meets, whether the flag
         // came from `$options` or a literal; a lone `$options` has its own.
-        for flag in ['z', 'I', 'g', 'u'] {
+        for flag in ['z', 'I', 'g'] {
             match RegexPattern::new("a", &format!("i{flag}")) {
                 Err(Error::InvalidQuery(message)) => assert_eq!(
                     message,
-                    format!("unknown $regex flag {flag:?}; the flags are i, m, s and x")
+                    format!("unknown $regex flag {flag:?}; the flags are i, m, s, x and u")
                 ),
                 other => panic!("flag {flag:?} must be refused, got {other:?}"),
             }
@@ -2003,20 +2029,27 @@ mod tests {
 
     #[test]
     fn a_pattern_compiling_past_the_one_pattern_limit_is_refused_naming_it() {
-        // `\w` is a Unicode class of some 55 KiB compiled; twenty of them fit
+        // A Unicode word class is some 55 KiB compiled; twenty of them fit
         // in 1 MiB and a hundred do not. `regex`'s own limit, 10 MiB, let
-        // `\w{209}` through at 11 MiB held for the life of the request.
-        for pattern in [r"\w{100}", r"\w{209}", r"(?i)\p{L}{30}"] {
-            let message = refused(doc! { "s": { "$regex": pattern } });
+        // two hundred and nine through at 11 MiB held for the life of the
+        // request. (`\w` itself is ASCII and compiles small.)
+        let w = kimmy_core::regex::UNICODE_WORD_CLASS;
+        for pattern in [format!("{w}{{100}}"), format!("{w}{{209}}"), r"(?i)\p{L}{30}".to_string()]
+        {
+            let message = refused(doc! { "s": { "$regex": pattern.as_str() } });
             assert!(
                 message.contains(&format!("$regex pattern {pattern:?} cannot be used"))
                     && message.contains("more than 1 MiB, the limit for one pattern"),
                 "{message}"
             );
         }
-        for pattern in [r"\w{20}", "[a-z]{50}", r"^\w+@\w+\.com$"] {
-            parse(&doc! { "s": { "$regex": pattern, "$options": "i" } }).unwrap();
+        for pattern in
+            [format!("{w}{{20}}"), "[a-z]{50}".to_string(), r"^\w+@\w+\.com$".to_string()]
+        {
+            parse(&doc! { "s": { "$regex": pattern.as_str(), "$options": "i" } }).unwrap();
         }
+        // `\w{209}` is 209 ASCII classes, a few kilobytes.
+        parse(&doc! { "s": { "$regex": r"\w{209}" } }).unwrap();
     }
 
     #[test]
@@ -2041,22 +2074,24 @@ mod tests {
 
     #[test]
     fn one_filter_holds_at_most_two_mib_of_compiled_patterns() {
-        // Each `\w{20}` compiles to just over 1 MiB: one fits, two do not.
-        // Each `\w{12}` is about 0.64 MiB: three fit, four do not.
-        let pattern = |i: usize| format!(r"\w{{20}}{i}");
+        // Each Unicode word class repeated 20 times compiles to just over 1 MiB:
+        // one fits, two do not. Repeated 12 times it is about 0.64 MiB: three
+        // fit, four do not.
+        let w = kimmy_core::regex::UNICODE_WORD_CLASS;
+        let pattern = |i: usize| format!("{w}{{20}}{i}");
         parse(&or_of(1, pattern)).unwrap();
         let message = refused(or_of(2, pattern));
         assert!(
             message.contains("compile to more than 2 MiB together, the limit for one filter")
-                && message.contains(r#""\\w{20}1" is the one past it"#),
+                && message.contains(&format!("{:?} is the one past it", pattern(1))),
             "{message}"
         );
-        let pattern = |i: usize| format!(r"\w{{12}}{i}");
+        let pattern = |i: usize| format!("{w}{{12}}{i}");
         parse(&or_of(3, pattern)).unwrap();
         refused(or_of(4, pattern));
         // The reviewer's shape: forty patterns of 11 MiB each, 446 MiB held,
         // from a 1.4 KB filter. Refused at the first.
-        refused(or_of(40, |_| r"\w{209}".to_string()));
+        refused(or_of(40, |_| format!("{w}{{209}}")));
     }
 
     #[test]

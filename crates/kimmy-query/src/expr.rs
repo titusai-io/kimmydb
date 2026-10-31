@@ -2713,19 +2713,51 @@ fn as_string_strict(value: &Bson, op: Op) -> Result<String> {
 }
 
 fn concat(args: &[Bson]) -> Result<Bson> {
-    let mut out = String::new();
+    concat_within(args, MAX_STRING_BYTES)
+}
+
+/// The longest string an expression may build: 16 MiB, the reference's limit
+/// (`Tried to create string longer than 16MB`). `$concat`, `$replaceOne` and
+/// `$replaceAll` check it before they build, so a `$reduce` that doubles a string
+/// at every step stops at the limit, and one `$replaceAll` cannot ask for a
+/// terabyte.
+pub(crate) const MAX_STRING_BYTES: usize = kimmy_core::limits::MAX_DOCUMENT_BYTES;
+
+/// Refuse a string of `bytes` bytes, over `max`, that `what` is about to build:
+/// an `AnswerTooLarge`, answered `413` as the other size caps are.
+pub(crate) fn check_string_len_within(what: &'static str, bytes: usize, max: usize) -> Result<()> {
+    if bytes > max {
+        return Err(Error::AnswerTooLarge {
+            what,
+            bytes,
+            max,
+            remedy: "build a shorter string, or $limit or $substrBytes the input",
+        });
+    }
+    Ok(())
+}
+
+fn concat_within(args: &[Bson], max: usize) -> Result<Bson> {
+    let mut len = 0usize;
     for arg in args {
         match arg {
             // One null makes the whole concatenation null, so a missing field
             // cannot silently vanish from the middle of a joined string.
             Bson::Null | Bson::Undefined => return Ok(Bson::Null),
-            Bson::String(s) => out.push_str(s),
+            Bson::String(s) => len = len.saturating_add(s.len()),
             other => {
                 return Err(Error::InvalidQuery(format!(
                     "$concat needs strings, found {}",
                     type_name(other)
                 )));
             }
+        }
+    }
+    check_string_len_within("string built by $concat", len, max)?;
+    let mut out = String::with_capacity(len);
+    for arg in args {
+        if let Bson::String(s) = arg {
+            out.push_str(s);
         }
     }
     Ok(Bson::String(out))

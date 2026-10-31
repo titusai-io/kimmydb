@@ -3,7 +3,7 @@
 //! cases against a server.
 
 use bson::{Bson, Document, doc};
-use kimmy_core::Result;
+use kimmy_core::{Error, Result};
 
 use super::Expr;
 
@@ -105,7 +105,11 @@ fn replace_one_and_all() {
     assert_eq!(f("$replaceOne", "abc", "", "-"), s("-abc"));
     assert_eq!(f("$replaceAll", "abc", "", "-"), s("-a-b-c-"));
     assert_eq!(f("$replaceAll", "", "", "-"), s("-"));
+    // The reference inserts between the bytes of a multi-byte character, and the
+    // result is invalid UTF-8 that its client cannot read; this inserts between
+    // code points.
     assert_eq!(f("$replaceAll", "éa", "", "-"), s("-é-a-"));
+    assert_eq!(f("$replaceOne", "éa", "", "-"), s("-éa"));
 }
 
 #[test]
@@ -295,14 +299,36 @@ fn regex_find_all_several_and_zero_width_matches() {
     };
     assert_eq!(idx("aaaa", "aa"), vec![0, 2]);
     // Zero-width: one per position, each search starting a code point past an
-    // empty match, and an empty match found where a non-empty one ended.
-    assert_eq!(idx("abc", ""), vec![0, 1, 2, 3]);
-    assert_eq!(idx("abc", "a*"), vec![0, 1, 2, 3]);
-    assert_eq!(idx("éa", "x*"), vec![0, 1, 2]);
+    // empty match, and an empty match found where a non-empty one ended. The
+    // loop stops when the next search would start at the end of the input, so
+    // there is no empty match at the end unless a search began before it.
+    // Every row is the reference's answer.
+    assert_eq!(idx("abc", ""), vec![0, 1, 2]);
+    assert_eq!(idx("abc", "a*"), vec![0, 1, 2]);
+    assert_eq!(idx("aaa", "a*"), vec![0]);
+    assert_eq!(idx("ab", "b*"), vec![0, 1]);
+    assert_eq!(idx("ab", "a|"), vec![0, 1]);
+    assert_eq!(idx("é", "x*"), vec![0]);
+    assert_eq!(idx("éa", "x*"), vec![0, 1]);
+    // An empty input still gets its one search.
+    assert_eq!(idx("", ""), vec![0]);
     assert_eq!(idx("", "x*"), vec![0]);
     // Anchors see the whole string, not just the rest of it.
     assert_eq!(idx("aaa", "^a"), vec![0]);
     assert_eq!(idx("ab cd", "\\b"), vec![0, 2, 3, 5]);
+    // The matches themselves, not only where they are.
+    assert_eq!(
+        ok(doc! {"$regexFindAll": {"input": "abc", "regex": "a*"}}),
+        Bson::Array(vec![
+            Bson::Document(doc! {"match": "a", "idx": 0i64, "captures": []}),
+            Bson::Document(doc! {"match": "", "idx": 1i64, "captures": []}),
+            Bson::Document(doc! {"match": "", "idx": 2i64, "captures": []}),
+        ])
+    );
+    assert_eq!(
+        ok(doc! {"$regexFindAll": {"input": "", "regex": ""}}),
+        Bson::Array(vec![Bson::Document(doc! {"match": "", "idx": 0i64, "captures": []})])
+    );
 }
 
 #[test]
@@ -343,13 +369,24 @@ fn index_of_cp_counts_code_points() {
     assert_eq!(f(vec![s("a🙂b"), s("b")]), Bson::Int64(2));
     assert_eq!(f(vec![s("abc"), s("z")]), Bson::Int64(-1));
     assert_eq!(f(vec![s("abcabc"), s("b"), Bson::Int32(2)]), Bson::Int64(4));
-    // `end` is exclusive and the substring must fit wholly before it.
-    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(2)]), Bson::Int64(-1));
+    // For code points `end` bounds where a match may start, so the substring may
+    // run past it (`$indexOfBytes` is the other way: see below).
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(2)]), Bson::Int64(1));
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(1)]), Bson::Int64(-1));
     assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(1));
     assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(2), Bson::Int32(6)]), Bson::Int64(4));
-    // Empty substring: found at `start` when that is within the string.
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(0), Bson::Int32(100)]), Bson::Int64(2));
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(5)]), Bson::Int64(-1));
+    // The same over multi-byte text: positions are code points.
+    assert_eq!(f(vec![s("éééab"), s("ab"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("éééab"), s("ab"), Bson::Int32(0), Bson::Int32(4)]), Bson::Int64(3));
+    // An empty substring is found at `start` only where a match may start: before
+    // the end of the string and before `end`.
     assert_eq!(f(vec![s("abc"), s("")]), Bson::Int64(0));
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(3)]), Bson::Int64(3));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(2)]), Bson::Int64(2));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(3)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(1), Bson::Int32(1)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(1), Bson::Int32(2)]), Bson::Int64(1));
     assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(4)]), Bson::Int64(-1));
     assert_eq!(f(vec![s(""), s("")]), Bson::Int64(0));
     assert_eq!(f(vec![s(""), s("a")]), Bson::Int64(-1));
@@ -368,6 +405,14 @@ fn index_of_bytes_counts_bytes() {
     assert_eq!(f(vec![s("héllo"), s("l"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(-1));
     assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(100)]), Bson::Int64(-1));
     assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(0), Bson::Int32(100)]), Bson::Int64(2));
+    // `end` truncates the haystack: the substring must lie wholly before it, where
+    // `$indexOfCP` lets it run past.
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(2)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(1));
+    // An empty substring is found at `start` up to the end of the string.
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(3)]), Bson::Int64(3));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(4)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s(""), s("")]), Bson::Int64(0));
 }
 
 #[test]
@@ -406,8 +451,45 @@ fn strcasecmp_folds_ascii_only() {
     assert_eq!(f(Bson::Null, s("a")), Bson::Int32(-1));
     assert_eq!(on(doc! {"$strcasecmp": ["$nope", "a"]}, doc! {}), Bson::Int32(-1));
     assert_eq!(f(Bson::Int32(12), s("12")), Bson::Int32(0));
+    // The fold is to upper case, so `_` and `[` (between `Z` and `a`) sort below
+    // a letter's lower-case form, not above (folding down would give -1).
+    assert_eq!(f(s("_"), s("a")), Bson::Int32(1));
+    assert_eq!(f(s("["), s("a")), Bson::Int32(1));
+    assert_eq!(f(s("a"), s("_")), Bson::Int32(-1));
+    assert_eq!(f(s("_"), s("A")), Bson::Int32(1));
+    assert_eq!(f(s("Z"), s("a")), Bson::Int32(1));
     refused(doc! {"$strcasecmp": [["a"], "a"]}, doc! {}, "$strcasecmp can't convert");
     refused(doc! {"$strcasecmp": ["a"]}, doc! {}, "takes exactly 2");
+}
+
+#[test]
+fn a_double_is_coerced_to_text_with_six_significant_digits() {
+    // The reference's `coerceToString` prints a double as `%g` does; `$toString`
+    // prints the shortest text that reads back.
+    let f = |a: Bson, b: &str| ok(doc! {"$strcasecmp": [a, b]});
+    assert_eq!(f(Bson::Double(1e21), "1e+21"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(0.1 + 0.2), "0.3"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(123456789012.0), "1.23457e+11"), Bson::Int32(0));
+    // "1.23457E+11" against "123456789012": '.' sorts below '2'.
+    assert_eq!(f(Bson::Double(123456789012.0), "123456789012"), Bson::Int32(-1));
+    assert_eq!(f(Bson::Double(f64::NAN), "nan"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(f64::INFINITY), "inf"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(f64::NEG_INFINITY), "-inf"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(2.5), "2.5"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(2.0), "2"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(-0.0), "-0"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(100_000.0), "100000"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(1_000_000.0), "1e+06"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(999_999.5), "1e+06"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(0.0001), "0.0001"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(0.00001), "1e-05"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(-1234.5678), "-1234.57"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(1.5e-7), "1.5e-07"), Bson::Int32(0));
+    assert_eq!(f(Bson::Double(f64::MAX), "1.79769e+308"), Bson::Int32(0));
+    // Integers print in full.
+    assert_eq!(f(Bson::Int64(123456789012), "123456789012"), Bson::Int32(0));
+    // `$substrBytes` coerces the same way.
+    assert_eq!(ok(doc! {"$substrBytes": [Bson::Double(123456789012.0), 0, 7]}), s("1.23457"));
 }
 
 #[test]
@@ -431,7 +513,6 @@ fn substr_bytes_lands_on_code_point_boundaries() {
     assert_eq!(f("abcdef", 10, 1), s(""));
     assert_eq!(f("abcdef", 2, 0), s(""));
     assert_eq!(f("abcdef", 2, -1), s("cdef"));
-    assert_eq!(f("abcdef", -1, 2), s(""));
     assert_eq!(f("", 0, 1), s(""));
     assert_eq!(f("éa", 0, 2), s("é"));
     assert_eq!(f("éa", 2, 1), s("a"));
@@ -449,6 +530,35 @@ fn substr_bytes_lands_on_code_point_boundaries() {
         "ending index is a UTF-8 continuation byte",
     );
     refused(doc! {"$substrBytes": ["🙂", 0, 3]}, d.clone(), "ending index");
+    // A negative start is refused, and so is a NaN or an infinity or an
+    // out-of-range number for start or length; -0.5 truncates to 0.
+    refused(
+        doc! {"$substrBytes": ["abcdef", -1, 2]},
+        d.clone(),
+        "starting index must be non-negative (got: -1)",
+    );
+    refused(doc! {"$substrBytes": ["abc", Bson::Int64(i64::MIN), 1]}, d.clone(), "non-negative");
+    refused(
+        doc! {"$substrBytes": ["abc", Bson::Double(f64::NAN), 1]},
+        d.clone(),
+        "Can't coerce out of range value nan to long",
+    );
+    refused(
+        doc! {"$substrBytes": ["abc", 1, Bson::Double(f64::NAN)]},
+        d.clone(),
+        "Can't coerce out of range value nan to long",
+    );
+    refused(
+        doc! {"$substrBytes": ["abc", 1, Bson::Double(f64::INFINITY)]},
+        d.clone(),
+        "out of range value inf",
+    );
+    refused(doc! {"$substrBytes": ["abc", Bson::Double(1e19), 1]}, d.clone(), "out of range");
+    assert_eq!(ok(doc! {"$substrBytes": ["abc", Bson::Double(-0.5), 1]}), s("a"));
+    assert_eq!(ok(doc! {"$substrBytes": ["abcdef", 1, Bson::Int64(i64::MIN)]}), s("bcdef"));
+    assert_eq!(ok(doc! {"$substrBytes": ["abcdef", Bson::Int64(i64::MAX), 1]}), s(""));
+    // A negative length after a multi-byte character reads to the end.
+    assert_eq!(f("éa", 2, -1), s("a"));
     // A start beyond the string is "" before the end is looked at.
     assert_eq!(f("é", 5, 1), s(""));
     // Null is the empty string; numbers are their text; doubles truncate.
@@ -466,6 +576,193 @@ fn substr_bytes_lands_on_code_point_boundaries() {
         "length must be a numeric type",
     );
     refused(doc! {"$substrBytes": [["a"], 0, 1]}, d, "can't convert");
+}
+
+// -- the regex operators' classes and flags ---------------------------------
+
+#[test]
+fn regex_classes_are_ascii_and_the_u_flag_is_accepted() {
+    // Each row is the reference's answer for `$regexMatch`.
+    let m = |input: &str, re: &str, opts: &str| {
+        ok(doc! {"$regexMatch": {"input": input, "regex": re, "options": opts}})
+    };
+    let (yes, no) = (Bson::Boolean(true), Bson::Boolean(false));
+    assert_eq!(m("\u{663}", "\\d", ""), no);
+    assert_eq!(m("\u{663}", "\\D", ""), yes);
+    assert_eq!(m("é", "\\w", ""), no);
+    assert_eq!(m("é", "[\\w]", ""), no);
+    assert_eq!(m("\u{a0}", "\\s", ""), no);
+    assert_eq!(m("7", "\\d", ""), yes);
+    assert_eq!(m("a_9", "^\\w+$", ""), yes);
+    assert_eq!(m("\t\n ", "^\\s+$", ""), yes);
+    assert_eq!(m("é", "^.$", ""), yes);
+    // Case-insensitive matching is Unicode: É is é, and the Kelvin sign is k.
+    assert_eq!(m("É", "é", "i"), yes);
+    assert_eq!(m("\u{212a}", "k", "i"), yes);
+    // `u` is accepted and changes nothing.
+    assert_eq!(m("a", "a", "u"), yes);
+    assert_eq!(m("é", "\\w", "u"), no);
+    assert_eq!(ok(doc! {"$regexMatch": {"input": "xax", "regex": regex_value("a", "u")}}), yes);
+    // What the engine does not run is still refused.
+    for re in ["(a)\\1", "(?=a)", "(?<!a)b", "\\Qa\\E", "(?>a)"] {
+        refused(doc! {"$regexMatch": {"input": "a", "regex": re}}, doc! {}, "cannot be used");
+    }
+}
+
+// -- the string-length check and the cap on $regexFindAll ---------------------
+
+#[test]
+fn concat_refuses_a_string_over_the_limit_before_building_it() {
+    use super::concat_within;
+    let sized = |bytes: usize, max: usize| concat_within(&[s("aaaa"), s(&"b".repeat(bytes))], max);
+    assert_eq!(sized(4, 8).unwrap(), s("aaaabbbb"));
+    let err = sized(5, 8).unwrap_err();
+    assert!(
+        matches!(err, Error::AnswerTooLarge { bytes: 9, max: 8, .. }),
+        "{err:?}: the limit is exact, and the answer is the 413 kind"
+    );
+    // A null makes the result null whatever the sizes, and a type error comes in
+    // argument order, as before.
+    assert_eq!(concat_within(&[s("aaaa"), s("bbbbbbbb"), Bson::Null], 8).unwrap(), Bson::Null);
+    let err = concat_within(&[s("aaaa"), Bson::Int32(1), s("bbbbbbbb")], 8).unwrap_err();
+    assert!(err.to_string().contains("$concat needs strings"), "{err}");
+    assert_eq!(concat_within(&[], 0).unwrap(), s(""));
+}
+
+#[test]
+fn a_reduce_that_doubles_a_string_stops_at_16_mib() {
+    use kimmy_core::limits::MAX_DOCUMENT_BYTES;
+    let double = |steps: usize| {
+        ev(
+            doc! {"$reduce": {
+                "input": vec![Bson::Int32(0); steps],
+                "initialValue": "a",
+                "in": {"$concat": ["$$value", "$$value"]},
+            }},
+            &doc! {},
+        )
+    };
+    // 2^24 bytes is exactly the limit; one more doubling is over it.
+    let Bson::String(at_limit) = double(24).unwrap() else { panic!("a string") };
+    assert_eq!(at_limit.len(), MAX_DOCUMENT_BYTES);
+    drop(at_limit);
+    let err = double(25).unwrap_err();
+    assert!(
+        matches!(&err, Error::AnswerTooLarge { bytes, max, .. }
+            if *bytes == 2 * MAX_DOCUMENT_BYTES && *max == MAX_DOCUMENT_BYTES),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn replace_refuses_a_result_over_the_limit_before_building_it() {
+    use super::strings::replace;
+    let refused_at = |input: &str, find: &str, with: &str, all: bool, max: usize| -> usize {
+        match replace(input, find, with, all, max) {
+            Err(Error::AnswerTooLarge { bytes, max: m, .. }) if m == max => bytes,
+            other => panic!("expected AnswerTooLarge, got {other:?}"),
+        }
+    };
+    // The limit is exact: "-a-b-c-" is 7 bytes.
+    assert_eq!(replace("abc", "", "-", true, 7).unwrap(), "-a-b-c-");
+    assert_eq!(refused_at("abc", "", "-", true, 6), 7);
+    // $replaceOne: 3 - 1 + 4 = 6.
+    assert_eq!(replace("abc", "b", "xxxx", false, 6).unwrap(), "axxxxc");
+    assert_eq!(refused_at("abc", "b", "xxxx", false, 5), 6);
+    assert_eq!(replace("abc", "", "xx", false, 5).unwrap(), "xxabc");
+    assert_eq!(refused_at("abc", "", "xx", false, 4), 5);
+    // $replaceAll counts every occurrence: "aaa" with "a" -> "bb" is 6 bytes.
+    assert_eq!(replace("aaa", "a", "bb", true, 6).unwrap(), "bbbbbb");
+    assert_eq!(refused_at("aaa", "a", "bb", true, 5), 6);
+    // Non-overlapping occurrences, and a shrinking replacement is not refused.
+    assert_eq!(replace("aaaaa", "aa", "b", true, 3).unwrap(), "bba");
+    assert_eq!(replace("aaaaa", "aa", "", true, 1).unwrap(), "a");
+    assert_eq!(replace("é", "", "-", true, 5).unwrap(), "-é-");
+    // Nothing found: the input's own length.
+    assert_eq!(replace("abc", "z", "yyyyyyyy", true, 3).unwrap(), "abc");
+    assert_eq!(replace("abc", "z", "yyyyyyyy", false, 3).unwrap(), "abc");
+    // An empty `find` over a megabyte with a megabyte of replacement asks for a
+    // terabyte: refused at once, with the size it asked for.
+    let mib = "x".repeat(1 << 20);
+    let asked = refused_at(&mib, "", &mib, true, super::MAX_STRING_BYTES);
+    assert_eq!(asked, (mib.len() + 1) * mib.len() + mib.len());
+}
+
+#[test]
+fn the_operators_refuse_a_result_over_16_mib() {
+    let big = "x".repeat(1 << 20);
+    let d = doc! {"a": big.clone(), "b": big};
+    for op in ["$replaceAll", "$replaceOne"] {
+        let err = ev(doc! {op: {"input": "$a", "find": "", "replacement": "$b"}}, &d);
+        // $replaceOne asks for 2 MiB and is fine.
+        if op == "$replaceAll" {
+            assert!(matches!(err, Err(Error::AnswerTooLarge { .. })), "{err:?}");
+        } else {
+            assert!(matches!(err, Ok(Bson::String(ref r)) if r.len() == 2 << 20), "{op}");
+        }
+    }
+}
+
+#[test]
+fn regex_find_all_counts_idx_from_the_previous_match() {
+    // Two-byte and four-byte characters: idx counts code points, and the count
+    // carries from one match to the next.
+    let text = format!("{}x{}x{}", "é".repeat(3), "🙂".repeat(2), "ab");
+    let Bson::Array(found) = ok(doc! {"$regexFindAll": {"input": text, "regex": "x|b"}}) else {
+        panic!("an array")
+    };
+    let at: Vec<(&str, i64)> = found
+        .iter()
+        .map(|m| {
+            let m = m.as_document().unwrap();
+            (m.get_str("match").unwrap(), m.get_i64("idx").unwrap())
+        })
+        .collect();
+    assert_eq!(at, vec![("x", 3), ("x", 6), ("b", 8)]);
+
+    // An empty pattern over many two-byte characters: one match per character,
+    // each with its own index.
+    let n = 20_000;
+    let Bson::Array(found) = ok(doc! {"$regexFindAll": {"input": "é".repeat(n), "regex": ""}})
+    else {
+        panic!("an array")
+    };
+    assert_eq!(found.len(), n);
+    for i in [0, 1, 777, n - 1] {
+        assert_eq!(found[i].as_document().unwrap().get_i64("idx").unwrap(), i as i64);
+    }
+}
+
+#[test]
+fn regex_find_all_is_bounded_by_the_bytes_of_its_answer() {
+    use super::strings::{find_all_documents, match_bytes, match_document};
+    use kimmy_core::regex::RegexPattern;
+
+    // The count is the BSON size of each element of the answer's array.
+    let text = "éa🙂bc";
+    for (pattern, index) in [("a", 0usize), ("(a)(x)?(🙂)", 9), ("b|c", 123), ("", 1000)] {
+        let p = RegexPattern::new(pattern, "").unwrap();
+        for m in p.find_all(text) {
+            let doc = match_document(text, &m, 0);
+            let Bson::Document(doc) = doc else { panic!("a document") };
+            let element =
+                1 + index.to_string().len() + 1 + bson::serialize_to_vec(&doc).unwrap().len();
+            assert_eq!(match_bytes(text, &m, index), element, "{pattern:?} at {index}");
+        }
+    }
+
+    let p = RegexPattern::new("a", "").unwrap();
+    let one = match_bytes("a", &p.find_all("a")[0], 0);
+    let refusal = |text: &str, max: usize| match find_all_documents(&p, text, max) {
+        Err(Error::AnswerTooLarge { bytes, max: m, .. }) if m == max => bytes,
+        other => panic!("expected AnswerTooLarge, got {other:?}"),
+    };
+    // Exactly at the limit is answered; one byte under refuses at the match that
+    // passes it, naming the bytes counted by then.
+    let Bson::Array(three) = find_all_documents(&p, "aaa", 3 * one).unwrap() else { panic!() };
+    assert_eq!(three.len(), 3);
+    assert_eq!(refusal("aaa", 3 * one - 1), 3 * one);
+    assert_eq!(refusal("aaaa", 3 * one), 4 * one);
 }
 
 // -- $mergeObjects -----------------------------------------------------------
@@ -560,7 +857,7 @@ fn merge_objects_as_an_accumulator() {
 
 #[test]
 fn get_field_shorthand_and_named() {
-    let d = doc! {"a": 1, "x.y": 2, "$price": 3, "o": {"k": 4}, "n": null};
+    let d = doc! {"a": 1, "x.y": 2, "$price": 3, "o": {"k": 4}, "n": null, "s": "Hello"};
     assert_eq!(on(doc! {"$getField": "a"}, d.clone()), Bson::Int32(1));
     // A dotted name is a name, not a path.
     assert_eq!(on(doc! {"$getField": "x.y"}, d.clone()), Bson::Int32(2));
@@ -568,38 +865,122 @@ fn get_field_shorthand_and_named() {
         on(doc! {"$getField": {"field": "x.y", "input": "$$ROOT"}}, d.clone()),
         Bson::Int32(2)
     );
+    assert_eq!(on(doc! {"$getField": {"field": "s", "input": "$$CURRENT"}}, d.clone()), s("Hello"));
     // A `$`-prefixed name needs $literal.
     assert_eq!(on(doc! {"$getField": {"$literal": "$price"}}, d.clone()), Bson::Int32(3));
     assert_eq!(
-        on(doc! {"$getField": {"field": {"$literal": "$price"}}}, d.clone()),
+        on(doc! {"$getField": {"field": {"$literal": "$price"}, "input": "$$ROOT"}}, d.clone()),
         Bson::Int32(3)
     );
     assert_eq!(on(doc! {"$getField": {"field": "k", "input": "$o"}}, d.clone()), Bson::Int32(4));
-    // A computed field name.
-    assert_eq!(
-        on(doc! {"$getField": {"field": {"$concat": ["x", ".", "y"]}}}, d.clone()),
-        Bson::Int32(2)
-    );
     // An absent field is missing: null where a value is needed, $type "missing".
     assert_eq!(on(doc! {"$getField": "zz"}, d.clone()), Bson::Null);
     assert_eq!(on(doc! {"$type": {"$getField": "zz"}}, d.clone()), s("missing"));
     assert_eq!(on(doc! {"$type": {"$getField": "n"}}, d.clone()), s("null"));
-    // Null input is null.
+    // A null input is null.
     assert_eq!(on(doc! {"$getField": {"field": "k", "input": "$n"}}, d.clone()), Bson::Null);
-    assert_eq!(on(doc! {"$getField": {"field": "k", "input": "$nope"}}, d.clone()), Bson::Null);
+    assert_eq!(
+        on(doc! {"$type": {"$getField": {"field": "k", "input": "$n"}}}, d.clone()),
+        s("null")
+    );
+}
+
+#[test]
+fn get_field_of_an_input_that_is_missing_or_not_a_document_is_missing() {
+    let d = doc! {"o": {"a": 1}, "arr": [1, 2], "str": "x", "num": 7};
+    for input in ["$nope", "$arr", "$str", "$num"] {
+        let got = on(doc! {"$getField": {"field": "a", "input": input}}, d.clone());
+        assert_eq!(got, Bson::Null, "{input}");
+        let kind = on(doc! {"$type": {"$getField": {"field": "a", "input": input}}}, d.clone());
+        assert_eq!(kind, s("missing"), "{input}");
+    }
+    // A literal that is not a document too.
+    assert_eq!(ok(doc! {"$type": {"$getField": {"field": "a", "input": "str"}}}), s("missing"));
+    assert_eq!(ok(doc! {"$type": {"$getField": {"field": "a", "input": 5}}}), s("missing"));
+    // And it is left out of a projection rather than failing the pipeline.
+    use crate::aggregate::{Limits, apply, parse};
+    let stages = parse(&[doc! {"$addFields": {
+        "g": {"$getField": {"field": "a", "input": "$v"}},
+    }}])
+    .unwrap();
+    let rows = vec![doc! {"v": {"a": 1}}, doc! {"v": "text"}, doc! {"v": [1]}, doc! {}];
+    let out = apply(&stages[0], rows, &Limits::default()).unwrap();
+    assert_eq!(
+        out,
+        vec![doc! {"v": {"a": 1}, "g": 1}, doc! {"v": "text"}, doc! {"v": [1]}, doc! {}]
+    );
+}
+
+#[test]
+fn field_names_are_constants() {
+    let d = doc! {"a": 1, "o": {"a": 1}, "p": "a"};
+    // The reference's refusals (5654600, 5654601, 5654602 / 4161106, 4161107, 4161108).
+    // The named form has no default input.
+    refused(doc! {"$getField": {"field": "a"}}, d.clone(), "needs `input`");
+    // A computed name, even one that could be folded.
     refused(
-        doc! {"$getField": {"field": "k", "input": 5}},
+        doc! {"$getField": {"field": {"$concat": ["a"]}, "input": "$o"}},
         d.clone(),
-        "'input' to evaluate to type Object",
+        "$getField requires 'field' to evaluate to a constant, but got a non-constant argument",
     );
     refused(
-        doc! {"$getField": {"field": 5}},
+        doc! {"$getField": {"$concat": ["x", ".", "y"]}},
         d.clone(),
-        "'field' to evaluate to type String, but got int",
+        "to evaluate to a constant",
     );
-    refused(doc! {"$getField": {"field": "$nope"}}, d.clone(), "but got missing");
+    // A field path, in either form.
+    refused(
+        doc! {"$getField": "$p"},
+        d.clone(),
+        "'$p' is a field path reference which is not allowed in this context",
+    );
+    refused(
+        doc! {"$getField": {"field": "$p", "input": "$o"}},
+        d.clone(),
+        "Did you mean {$literal: '$p'}?",
+    );
+    refused(doc! {"$getField": "$$CURRENT.a"}, d.clone(), "is a field path reference");
+    // Not a string.
+    refused(
+        doc! {"$getField": {"field": 5, "input": "$o"}},
+        d.clone(),
+        "$getField requires 'field' to evaluate to type String, but got int",
+    );
+    refused(
+        doc! {"$getField": {"field": Bson::Null, "input": "$o"}},
+        d.clone(),
+        "to evaluate to type String, but got null",
+    );
+    refused(doc! {"$getField": 5}, d.clone(), "but got int");
     refused(doc! {"$getField": {"input": "$o"}}, d.clone(), "needs `field`");
-    refused(doc! {"$getField": {"field": "a", "x": 1}}, d, "does not take `x`");
+    refused(doc! {"$getField": {"field": "a", "x": 1}}, d.clone(), "does not take `x`");
+    refused(doc! {"$getField": ["a"]}, d.clone(), "not an array");
+    // The same for $setField and $unsetField.
+    refused(
+        doc! {"$setField": {"field": {"$concat": ["a", "b"]}, "input": "$o", "value": 1}},
+        d.clone(),
+        "$setField requires 'field' to evaluate to a constant",
+    );
+    refused(
+        doc! {"$unsetField": {"field": {"$concat": ["a"]}, "input": "$o"}},
+        d.clone(),
+        "$unsetField requires 'field' to evaluate to a constant",
+    );
+    refused(
+        doc! {"$setField": {"field": "$p", "input": "$o", "value": 1}},
+        d.clone(),
+        "$setField: '$p' is a field path reference",
+    );
+    refused(
+        doc! {"$setField": {"field": Bson::Null, "input": "$o", "value": 1}},
+        d.clone(),
+        "$setField requires 'field' to evaluate to type String, but got null",
+    );
+    refused(
+        doc! {"$unsetField": {"field": 5, "input": "$o"}},
+        d,
+        "$unsetField requires 'field' to evaluate to type String, but got int",
+    );
 }
 
 #[test]

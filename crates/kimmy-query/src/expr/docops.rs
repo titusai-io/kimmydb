@@ -6,9 +6,13 @@
 //! Everywhere else an expression reads a missing field as null (the array
 //! operators' entry in `deviations.md`); here `$type` answers `"missing"`,
 //! `$setField` with a missing value removes the field, and `$getField` of a
-//! field the document lacks is missing, which a `$project`/`$addFields`
-//! leaves out. [`eval_opt`] is the evaluation that keeps the distinction:
-//! `None` is a missing value.
+//! field the document lacks, or of an `input` that is missing or is not a
+//! document, is missing, which a `$project`/`$addFields` leaves out. [`eval_opt`]
+//! is the evaluation that keeps the distinction: `None` is a missing value.
+//!
+//! The field name of `$getField`, `$setField` and `$unsetField` is a constant,
+//! read when the expression is parsed, as the reference reads it: a string or a
+//! `$literal` of one. A field path or a computed name is refused.
 
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result};
@@ -18,12 +22,12 @@ use super::{Declared, Expr, Op, Scope, field_path, truthy, value_path};
 /// A document or type operator.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DocExpr {
-    /// `{$getField: <field>}` or `{$getField: {field, input}}`; `input` is
-    /// `$$CURRENT` when absent.
-    GetField { field: Expr, input: Option<Expr> },
+    /// `{$getField: <name>}` or `{$getField: {field, input}}`; the shorthand reads
+    /// `$$CURRENT`, which is `input: None`, and the named form must give `input`.
+    GetField { field: String, input: Option<Expr> },
     /// `{$setField: {field, input, value}}`, and `$unsetField`, which is the same
-    /// with `$$REMOVE` for the value (`remove`).
-    SetField { field: Expr, input: Expr, value: Option<Expr> },
+    /// without a value (`value: None`).
+    SetField { field: String, input: Expr, value: Option<Expr> },
     /// `{$type: <expr>}`.
     Type(Expr),
 }
@@ -63,11 +67,9 @@ pub(super) fn bson_type_name(v: Option<&Bson>) -> &'static str {
 impl DocExpr {
     pub(super) fn children(&self) -> Vec<&Expr> {
         match self {
-            DocExpr::GetField { field, input } => {
-                std::iter::once(field).chain(input.as_ref()).collect()
-            }
-            DocExpr::SetField { field, input, value } => {
-                [field, input].into_iter().chain(value.as_ref()).collect()
+            DocExpr::GetField { input, .. } => input.iter().collect(),
+            DocExpr::SetField { input, value, .. } => {
+                std::iter::once(input).chain(value.as_ref()).collect()
             }
             DocExpr::Type(e) => vec![e],
         }
@@ -99,12 +101,12 @@ impl DocExpr {
                 // key is an operator (`{$literal: "$x"}`) is the field itself.
                 Bson::Document(d) if d.keys().next().is_some_and(|k| !k.starts_with('$')) => {
                     let spec = Expr::named_spec(name, raw, &["field", "input"])?;
+                    let field = Expr::required(name, spec, "field")?;
+                    // The reference has no default for `input`.
+                    let input = Expr::required(name, spec, "input")?;
                     DocExpr::GetField {
-                        field: Expr::parse_in(Expr::required(name, spec, "field")?, declared)?,
-                        input: spec
-                            .get("input")
-                            .map(|i| Expr::parse_in(i, declared))
-                            .transpose()?,
+                        field: constant_field(name, field, declared)?,
+                        input: Some(Expr::parse_in(input, declared)?),
                     }
                 }
                 Bson::Array(_) => {
@@ -112,21 +114,24 @@ impl DocExpr {
                         "$getField takes a field name or {field, input}, not an array".into(),
                     ));
                 }
-                shorthand => {
-                    DocExpr::GetField { field: Expr::parse_in(shorthand, declared)?, input: None }
-                }
+                shorthand => DocExpr::GetField {
+                    field: constant_field(name, shorthand, declared)?,
+                    input: None,
+                },
             },
             "$setField" | "$unsetField" => {
                 let set = name == "$setField";
                 let allowed: &[&str] =
                     if set { &["field", "input", "value"] } else { &["field", "input"] };
                 let spec = Expr::named_spec(name, raw, allowed)?;
-                let mut get = |key: &str| -> Result<Expr> {
-                    Expr::parse_in(Expr::required(name, spec, key)?, declared)
+                let field = Expr::required(name, spec, "field")?;
+                let input = Expr::parse_in(Expr::required(name, spec, "input")?, declared)?;
+                let value = if set {
+                    Some(Expr::parse_in(Expr::required(name, spec, "value")?, declared)?)
+                } else {
+                    None
                 };
-                let (field, input) = (get("field")?, get("input")?);
-                let value = if set { Some(get("value")?) } else { None };
-                DocExpr::SetField { field, input, value }
+                DocExpr::SetField { field: constant_field(name, field, declared)?, input, value }
             }
             _ => unreachable!("dispatched by name"),
         };
@@ -140,28 +145,18 @@ impl DocExpr {
                 let v = eval_opt(e, scope)?;
                 Ok(Some(Bson::String(bson_type_name(v.as_ref()).to_string())))
             }
-            DocExpr::GetField { field, input } => {
-                let name = field_name("$getField", eval_opt(field, scope)?)?;
-                let doc = match input {
-                    None => scope.root().clone(),
-                    Some(i) => match eval_opt(i, scope)? {
-                        // Null and a missing input answer null.
-                        None => return Ok(Some(Bson::Null)),
-                        Some(v) if nullish(&v) => return Ok(Some(Bson::Null)),
-                        Some(Bson::Document(d)) => d,
-                        Some(other) => {
-                            return Err(Error::InvalidQuery(format!(
-                                "$getField requires 'input' to evaluate to type Object, but got {}",
-                                bson_type_name(Some(&other))
-                            )));
-                        }
-                    },
-                };
-                Ok(doc.get(&name).cloned())
-            }
+            DocExpr::GetField { field, input } => Ok(match input {
+                None => scope.root().get(field).cloned(),
+                Some(i) => match eval_opt(i, scope)? {
+                    Some(Bson::Document(d)) => d.get(field).cloned(),
+                    // Null answers null.
+                    Some(v) if nullish(&v) => Some(Bson::Null),
+                    // A missing input and one that is not a document are missing.
+                    _ => None,
+                },
+            }),
             DocExpr::SetField { field, input, value } => {
                 let op = if value.is_some() { "$setField" } else { "$unsetField" };
-                let name = field_name(op, eval_opt(field, scope)?)?;
                 let mut doc = match eval_opt(input, scope)? {
                     None => return Ok(Some(Bson::Null)),
                     Some(v) if nullish(&v) => return Ok(Some(Bson::Null)),
@@ -180,10 +175,10 @@ impl DocExpr {
                 match value {
                     // A new field goes last; an existing one keeps its place.
                     Some(v) => {
-                        doc.insert(name, v);
+                        doc.insert(field.clone(), v);
                     }
                     None => {
-                        doc.remove(&name);
+                        doc.remove(field);
                     }
                 }
                 Ok(Some(Bson::Document(doc)))
@@ -192,12 +187,36 @@ impl DocExpr {
     }
 }
 
-fn field_name(op: &str, v: Option<Bson>) -> Result<String> {
-    match v {
-        Some(Bson::String(s)) => Ok(s),
+/// The field name of `$getField`, `$setField` or `$unsetField`, which must be a
+/// constant string. A field path, a computed name and a value of another type
+/// are refused as the reference refuses them.
+fn constant_field(op: &str, raw: &Bson, declared: &mut Declared) -> Result<String> {
+    if let Bson::String(path) = raw
+        && path.starts_with('$')
+        && path.len() > 1
+    {
+        return Err(Error::InvalidQuery(format!(
+            "{op}: '{path}' is a field path reference which is not allowed in this context. \
+             Did you mean {{$literal: '{path}'}}?"
+        )));
+    }
+    let constant = match Expr::parse_in(raw, declared)? {
+        Expr::Literal(v) => v,
+        Expr::Op(Op::Literal, args) => match args.as_slice() {
+            [Expr::Literal(v)] => v.clone(),
+            _ => unreachable!("$literal holds one constant"),
+        },
+        _ => {
+            return Err(Error::InvalidQuery(format!(
+                "{op} requires 'field' to evaluate to a constant, but got a non-constant argument"
+            )));
+        }
+    };
+    match constant {
+        Bson::String(name) => Ok(name),
         other => Err(Error::InvalidQuery(format!(
             "{op} requires 'field' to evaluate to type String, but got {}",
-            bson_type_name(other.as_ref())
+            bson_type_name(Some(&other))
         ))),
     }
 }
