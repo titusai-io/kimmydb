@@ -239,13 +239,10 @@ fn replaced_len(input: &str, find: &str, with: &str, all: bool) -> Option<usize>
     } else {
         usize::from(input.contains(find))
     };
-    // Each match swaps `find` for `with`; the input is the base, so the sum is
-    // formed before `find` is taken off.
-    input.len().checked_add(matches.checked_mul(with.len())?)?.checked_sub(if find.is_empty() {
-        0
-    } else {
-        matches * find.len()
-    })
+    // Each match swaps `find` for `with`. The matches are disjoint, so what they
+    // remove (`matches * find.len()`) is at most the input and cannot overflow.
+    let removed = if find.is_empty() { 0 } else { matches * find.len() };
+    input.len().checked_add(matches.checked_mul(with.len())?)?.checked_sub(removed)
 }
 
 /// `$replaceOne` and `$replaceAll`, refused (`AnswerTooLarge`) when the result

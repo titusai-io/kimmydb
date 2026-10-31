@@ -1067,10 +1067,19 @@ edge uses **Extended JSON v2**:
 | Int64 | `{"$numberLong": "9007199254740993"}` |
 | Decimal128 | `{"$numberDecimal": "1.25"}` |
 | Binary | `{"$binary": {"base64": "…", "subType": "00"}}` |
+| Regular expression | `{"$regularExpression": {"pattern": "ab+c", "options": "i"}}` |
+| Timestamp | `{"$timestamp": {"t": 1700000000, "i": 1}}` |
 | MinKey / MaxKey | `{"$minKey": 1}` / `{"$maxKey": 1}` |
 
 Plain JSON keeps working for anything expressible in it — you only meet this
 when you need a type JSON lacks.
+
+**A regular expression and a timestamp are read as well as written** (from
+0.59.0; before, they were written in these forms and arrived as nested
+documents). A regular expression is how `$regexMatch`, `$regexFind` and
+`$regexFindAll` take a `regex` value, and `$type` of either answers `regex` or
+`timestamp`. `options` is sorted as BSON keeps it; a NUL in either string, a
+missing or extra key, and a `t` or `i` outside `0` to `4294967295` are a `400`.
 
 **A Decimal128 is stored and returned as sent, and compared by its exact
 value.** `$numberDecimal` is read on input and written on output, and the
