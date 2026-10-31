@@ -61,10 +61,22 @@ impl Value {
     }
 }
 
-// NOTE(model): Python's `==` makes `2 == 2.0`; here values of different types
-// are never equal, and doubles compare by bit pattern (so the encoding and
-// equality agree, and NaN equals itself). The only observable difference is a
-// `$set` of `2` over a stored `2.0`, which is now a write instead of a no-op.
+impl Value {
+    /// The model's `same(a, b)` (Q4, ruled): the write diff compares value AND type,
+    /// so `$set 2` over a stored `2.0` is a write. A missing field (`None`) is
+    /// the same as `Null`. Doubles compare as numbers (`==`: `0.0` is `-0.0`,
+    /// NaN is not NaN), as Python does.
+    pub fn same(current: Option<&Value>, new: &Value) -> bool {
+        match (current.unwrap_or(&Value::Null), new) {
+            (Value::Double(a), Value::Double(b)) => a == b,
+            (a, b) => a == b,
+        }
+    }
+}
+
+// Structural equality of states: values of different types are never equal and
+// doubles compare by bit pattern, so that equality agrees with the encoding.
+// (The write diff uses `Value::same`, which follows the model.)
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

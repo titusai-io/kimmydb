@@ -979,3 +979,53 @@ fn golden_encode_bytes_round_trip() {
     // Lengths are big-endian u64: the first count (lives = 1) follows the header.
     assert_eq!(&bytes[4..12], &1u64.to_be_bytes());
 }
+
+// ---- Q4: the write diff compares value and type ------------------------------------
+
+#[test]
+fn q4_same_helper() {
+    assert!(Value::same(None, &Value::Null), "missing is Null");
+    assert!(Value::same(Some(&Value::Null), &Value::Null));
+    assert!(!Value::same(None, &i(0)));
+    assert!(!Value::same(Some(&i(2)), &f(2.0)), "2 is not 2.0");
+    assert!(!Value::same(Some(&f(2.0)), &i(2)));
+    assert!(Value::same(Some(&f(2.0)), &f(2.0)));
+    assert!(Value::same(Some(&f(0.0)), &f(-0.0)), "doubles compare as numbers");
+    assert!(!Value::same(Some(&f(f64::NAN)), &f(f64::NAN)));
+    assert!(!Value::same(Some(&s("2")), &i(2)));
+}
+
+#[test]
+fn q4_set_compares_value_and_type() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("x", f(2.0)), ("k", i(1))], 0).unwrap();
+    assert!(w.write_set("x", i(2), 0).is_some(), "$set 2 over a stored 2.0 is a write");
+    assert_eq!(w.visible().unwrap()["x"], i(2));
+    assert!(w.write_set("x", i(2), 0).is_none(), "same type and value is a no-op");
+    assert!(w.write_set("x", f(2.0), 0).is_some(), "and back");
+    assert!(w.write_set("k", s("1"), 0).is_some());
+    // Null versus missing: setting a missing path to Null is a no-op, a stored value to Null is a write.
+    assert!(w.write_set("absent", Value::Null, 0).is_none());
+    assert!(w.write_set("k", Value::Null, 0).is_some());
+    assert!(!w.visible().unwrap().contains_key("k"));
+    assert!(w.write_set("k", Value::Null, 0).is_none(), "now missing again");
+    assert!(w.write_unset("k", 0).is_none());
+}
+
+#[test]
+fn q4_replace_compares_value_and_type() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("x", f(2.0)), ("y", s("t"))], 0).unwrap();
+    assert!(w.write_replace(&[("x", f(2.0)), ("y", s("t"))], 0).is_none());
+    let r = w.write_replace(&[("x", i(2)), ("y", s("t"))], 0).unwrap();
+    assert_eq!(r.record.paths, vec!["x".to_string()], "only the retyped field changes");
+    // A Null in the new document over a missing path is not a change; over a stored one it is.
+    assert!(w.write_replace(&[("x", i(2)), ("y", s("t")), ("z", Value::Null)], 0).is_none());
+    let r = w.write_replace(&[("x", i(2)), ("y", Value::Null)], 0).unwrap();
+    assert_eq!(r.record.paths, vec!["y".to_string()]);
+    assert_eq!(w.visible(), doc(&[("x", i(2))]));
+    // Fields absent from the new document are dropped.
+    let r = w.write_replace(&[("q", i(1))], 0).unwrap();
+    assert_eq!(r.record.paths, vec!["q".to_string(), "x".to_string()]);
+    assert_eq!(w.visible(), doc(&[("q", i(1))]));
+}

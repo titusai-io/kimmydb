@@ -305,11 +305,7 @@ impl Writer {
     /// `$set path = v`; `None` when no life is alive or the value is unchanged.
     pub fn write_set(&mut self, path: &str, v: Value, skew: u64) -> Option<Written> {
         let vis = self.visible()?;
-        let same = match vis.get(path) {
-            None => v == Value::Null,
-            Some(c) => *c == v,
-        };
-        if same {
+        if Value::same(vis.get(path), &v) {
             return None;
         }
         self.write_reg_unchecked(path, v, skew)
@@ -372,7 +368,7 @@ impl Writer {
         let vis = self.visible()?;
         let changes: Vec<(&str, &Value)> = doc
             .iter()
-            .filter(|(q, v)| vis.get(*q).unwrap_or(&Value::Null) != v)
+            .filter(|(q, v)| !Value::same(vis.get(*q), v))
             .map(|(q, v)| (*q, v))
             .collect();
         let drops: Vec<&String> = vis.keys().filter(|q| !doc.iter().any(|(d, _)| d == q)).collect();
