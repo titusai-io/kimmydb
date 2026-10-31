@@ -19,6 +19,7 @@ pub use kimmy_core::json_schema;
 pub use kimmy_core::path;
 pub mod plan;
 pub mod shape;
+pub mod stages;
 pub mod update;
 
 #[cfg(test)]
@@ -43,6 +44,8 @@ mod positional_tests;
 mod sink_tests;
 #[cfg(test)]
 mod sort_zip_tests;
+#[cfg(test)]
+mod stage_tests;
 
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};

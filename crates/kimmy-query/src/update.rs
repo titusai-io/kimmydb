@@ -2580,8 +2580,13 @@ mod tests {
         // An unbound uppercase name is a system variable this build does not
         // have, never a second identifier, while the entry's names are collected.
         refused(
-            doc! { "$expr": { "$gt": ["$$short.qty", "$$DESCEND"] } },
+            doc! { "$expr": { "$gt": ["$$short.qty", "$$CLUSTER_TIME"] } },
             "a system variable this build does not have",
+        );
+        // `$$DESCEND` and its two are variables only inside `$redact`.
+        refused(
+            doc! { "$expr": { "$gt": ["$$short.qty", "$$DESCEND"] } },
+            "valid only inside a $redact expression",
         );
         // Under an `$elemMatch` the entry's name is not bound: that body is a
         // filter over the elements of another array.

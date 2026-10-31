@@ -92,6 +92,22 @@ Also recorded here, so they are not read as bugs:
 
 ---
 
+## 🟡 The small stages: `$sortByCount`, `$sample`, `$redact`, `$unset` and `$unionWith`
+
+**Raised 2026-10-31, with ADR-263.** `$sortByCount`, `$replaceWith`, `$unset`, `$sample`, `$redact` and `$unionWith` are built ([aggregation.md](aggregation.md#sortbycount)). Where they differ from, or rest on a reading of, the reference:
+
+- **`$unionWith` of the `$merge`/`$out` target is refused here at parse, whereas the reference accepts it and fails later with a duplicate-key error.** A pipeline that reads what it writes has no answer here (each stage reads storage when it runs), so the `$lookup` and `$graphLookup` rule is applied: `400` before anything is read, at any depth of sub-pipeline.
+- **`$unionWith` reads the collection whole**, refused past the pipeline's document limit (100,000) and past 16 MiB of documents read or output by its sub-pipeline (`413`). The reference streams it with no such limit. The sub-pipeline refuses `$facet` as well as `$out`, `$merge` and `$vectorSearch`; where the reference accepts a `$facet` in a `$unionWith` sub-pipeline, this does not. The pipeline-only form (`coll` left out, for a `$documents` source) is `400`: there is no `$documents` stage.
+- **`$sample` is bounded.** `size` over the pipeline's document limit is `400` even when the input is smaller, and the reservoir passing 16 MiB is `413`. The reference accepts any size. When `size` is at least the input's size the whole input comes back in input order; the reference's order is unspecified.
+- **`$sortByCount` orders ties by first appearance** of the value; the reference leaves ties unspecified. **Its `count` is a long**, as the `$sum: 1` of `$group` is in this build; the reference gives an int. An empty document `{}` as operand is `400` (it is an empty object expression there, which groups every document under one key).
+- **`$$DESCEND`, `$$PRUNE` and `$$KEEP` are variables only inside a `$redact` expression**; the reference reads them in any expression, where each is the string `"descend"`, `"prune"` or `"keep"`. Here anywhere else is `400`, `valid only inside a $redact expression`. Inside `$redact` they have those string values, and so a string of that spelling has the effect of the variable, as in the reference. `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META` are refused by name everywhere; the reference has them.
+- **`$unset` refuses the same path twice and a path inside another** (`["a", "a.b"]`), and a path part that starts with `$` or is empty, `400`. The reference refuses the collision as a `$project` does; its handling of a repeated identical path is not verified here.
+- **`$cond` also takes its named form** `{if, then, else}` (all three required), which a `$redact` expression is usually written in; it was not accepted before.
+
+**To close:** none planned. The 16 MiB and document-limit bounds on `$unionWith` and `$sample` are the standing rule that anything that buffers documents is held to a cap.
+
+---
+
 ## 🟡 `$graphLookup` requires `maxDepth`, caps it at 1000, holds its collection against the document limit and orders its result
 
 **Raised 2026-10-26, with ADR-254.** `$graphLookup` is built

@@ -569,6 +569,9 @@ pub type Binding<'a> = (&'a str, &'a Bson);
 #[derive(Clone, Copy, Debug)]
 pub struct Scope<'a> {
     root: &'a Document,
+    /// What `$$ROOT` names when it is not `root`: inside a `$redact`, `root` is the
+    /// document of the level being decided (`$$CURRENT`) and this is the top one.
+    top: Option<&'a Document>,
     bindings: Frame<'a>,
     /// Whether `bindings` is a `$let`'s frame in name order, so a lookup in it can
     /// bisect: a frame of more than [`BISECT_FRAME`] names is built that way, and
@@ -608,7 +611,7 @@ impl<'a> Scope<'a> {
     /// A scope over a document with nothing bound beyond `$$ROOT` and
     /// `$$CURRENT` — what every stage outside a `$lookup` sub-pipeline wants.
     pub fn new(root: &'a Document) -> Self {
-        Self { root, bindings: Frame::Values(&[]), sorted: false, parent: None }
+        Self { root, top: None, bindings: Frame::Values(&[]), sorted: false, parent: None }
     }
 
     /// A scope over a document with variables already in place — what a
@@ -617,7 +620,19 @@ impl<'a> Scope<'a> {
     /// A later binding shadows an earlier one of the same name, so a caller
     /// layering an inner set over an outer one appends rather than prepends.
     pub fn with_bindings(root: &'a Document, bindings: &'a [Binding<'a>]) -> Self {
-        Self { root, bindings: Frame::Values(bindings), sorted: false, parent: None }
+        Self { root, top: None, bindings: Frame::Values(bindings), sorted: false, parent: None }
+    }
+
+    /// A scope over `current` in which `$$ROOT` is `top`, not `current`: a `$redact`
+    /// level below the top one.
+    pub fn with_top(current: &'a Document, top: &'a Document, bindings: &'a [Binding<'a>]) -> Self {
+        Self {
+            root: current,
+            top: Some(top),
+            bindings: Frame::Values(bindings),
+            sorted: false,
+            parent: None,
+        }
     }
 
     /// The document `$$ROOT` names.
@@ -628,6 +643,7 @@ impl<'a> Scope<'a> {
     fn nested<'b>(&'b self, bindings: &'b [Binding<'b>]) -> Scope<'b> {
         Scope {
             root: self.root,
+            top: self.top,
             bindings: Frame::Values(bindings),
             sorted: false,
             parent: Some(self),
@@ -638,6 +654,7 @@ impl<'a> Scope<'a> {
     fn nested_needed<'b>(&'b self, needed: &'b [Needed<'b>]) -> Scope<'b> {
         Scope {
             root: self.root,
+            top: self.top,
             bindings: Frame::Needed(needed),
             sorted: false,
             parent: Some(self),
@@ -647,7 +664,13 @@ impl<'a> Scope<'a> {
     /// [`Self::nested_needed`] over a frame already in name order, which a lookup
     /// in it bisects. Names in a frame are distinct, so the order is a total one.
     fn nested_needed_sorted<'b>(&'b self, needed: &'b [Needed<'b>]) -> Scope<'b> {
-        Scope { root: self.root, bindings: Frame::Needed(needed), sorted: true, parent: Some(self) }
+        Scope {
+            root: self.root,
+            top: self.top,
+            bindings: Frame::Needed(needed),
+            sorted: true,
+            parent: Some(self),
+        }
     }
 
     /// The value of `name`, searching the innermost frame first. `None` when no
@@ -718,6 +741,16 @@ const NEEDED_STACK_SEGMENT: usize = 8 * 1024 * 1024;
 /// The variables bound without being asked. `$$CURRENT` is `$$ROOT`: nothing
 /// here rebinds it, because `$map` and its relatives bind `$$this` instead.
 const SYSTEM_VARIABLES: [&str; 2] = ["ROOT", "CURRENT"];
+
+/// The `$redact` answers: `$$DESCEND`, `$$PRUNE`, `$$KEEP` and the value each has.
+const REDACT_VARIABLES: [(&str, &str); 3] =
+    [("DESCEND", REDACT_DESCEND), ("PRUNE", REDACT_PRUNE), ("KEEP", REDACT_KEEP)];
+/// The value of `$$DESCEND`.
+pub const REDACT_DESCEND: &str = "descend";
+/// The value of `$$PRUNE`.
+pub const REDACT_PRUNE: &str = "prune";
+/// The value of `$$KEEP`.
+pub const REDACT_KEEP: &str = "keep";
 
 /// A user variable is a lowercase ASCII letter followed by letters, digits
 /// and underscores. MongoDB's rule, kept so a pipeline written for it parses
@@ -881,6 +914,8 @@ impl Drop for RequestClock {
 struct Declared {
     stack: Vec<std::rc::Rc<str>>,
     bound: BoundNames,
+    /// Parsing a `$redact` expression, where `$$DESCEND`, `$$PRUNE` and `$$KEEP` exist.
+    redact: bool,
 }
 
 /// How many enclosing bindings each name has; the one thing a lookup consults.
@@ -898,7 +933,8 @@ impl BoundNames {
 
 impl Declared {
     fn new(vars: &[String]) -> Self {
-        let mut declared = Declared { stack: Vec::new(), bound: BoundNames::default() };
+        let mut declared =
+            Declared { stack: Vec::new(), bound: BoundNames::default(), redact: false };
         for name in vars {
             declared.push(name);
         }
@@ -950,6 +986,17 @@ impl Expr {
         PARSES.with(|n| n.set(n.get() + 1));
         let _clock = RequestClock::open();
         let mut declared = Declared::new(vars);
+        Self::parse_in(value, &mut declared)
+    }
+
+    /// Parse the expression of a `$redact`, where `$$DESCEND`, `$$PRUNE` and `$$KEEP`
+    /// are variables (ADR-263). Anywhere else they are refused.
+    pub fn parse_redact(value: &Bson, vars: &[String]) -> Result<Self> {
+        #[cfg(test)]
+        PARSES.with(|n| n.set(n.get() + 1));
+        let _clock = RequestClock::open();
+        let mut declared = Declared::new(vars);
+        declared.redact = true;
         Self::parse_in(value, &mut declared)
     }
 
@@ -1154,6 +1201,25 @@ impl Expr {
                 Expr::Var { name: name.to_string(), path: None }
             });
         }
+        // `$$DESCEND`, `$$PRUNE` and `$$KEEP` are the three answers a `$redact`
+        // expression gives. Their values are the strings the reference gives them,
+        // `"descend"`, `"prune"` and `"keep"`, so a `$redact` reads them back by value.
+        if let Some(answer) = REDACT_VARIABLES.iter().find(|(n, _)| *n == name).map(|(_, a)| *a) {
+            if !declared.redact {
+                return Err(Error::UnsupportedOperator {
+                    operator: format!("$${name}"),
+                    reason: Some(
+                        "valid only inside a $redact expression; elsewhere $$ROOT, $$CURRENT, \
+                         $$NOW and $$REMOVE are the system variables"
+                            .into(),
+                    ),
+                });
+            }
+            if path.is_some() {
+                return Err(Error::InvalidQuery(format!("$${name} has no fields to read into")));
+            }
+            return Ok(Expr::Literal(Bson::String(answer.to_string())));
+        }
         if !SYSTEM_VARIABLES.contains(&name) && !declared.binds(name) {
             // Collecting free variables: a lowercase name nothing binds is the
             // answer, not an error. An uppercase one is a system variable this
@@ -1170,7 +1236,9 @@ impl Expr {
                     operator: format!("$${name}"),
                     reason: Some(
                         "a system variable this build does not have; $$ROOT, $$CURRENT, $$NOW \
-                         and $$REMOVE are the ones it does"
+                         and $$REMOVE are the ones it does, and $$DESCEND, $$PRUNE and $$KEEP \
+                         inside $redact ($$CLUSTER_TIME, $$USER_ROLES and $$SEARCH_META are \
+                         refused)"
                             .into(),
                     ),
                 });
@@ -1282,6 +1350,16 @@ impl Expr {
                 };
                 if op == Op::Literal {
                     return Ok(Expr::Op(op, vec![Expr::Literal(raw.clone())]));
+                }
+                // `{$cond: {if: .., then: .., else: ..}}`, the named form of the three
+                // positional arguments, all three required.
+                if op == Op::Cond && matches!(raw, Bson::Document(_)) {
+                    let spec = Self::named_spec("$cond", raw, &["if", "then", "else"])?;
+                    let mut args = Vec::with_capacity(3);
+                    for key in ["if", "then", "else"] {
+                        args.push(Self::parse_in(Self::required("$cond", spec, key)?, declared)?);
+                    }
+                    return Ok(Expr::Op(op, args));
                 }
                 let args = Self::parse_args(op, raw, declared)?;
                 Ok(Expr::Op(op, args))
@@ -1860,10 +1938,13 @@ fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bs
         return Ok(Bson::Null);
     }
     if SYSTEM_VARIABLES.contains(&name) {
+        // `$$ROOT` is the top document inside a `$redact` level below the top; every
+        // other place it is the document, as `$$CURRENT` always is.
+        let doc = if name == "ROOT" { scope.top.unwrap_or(scope.root) } else { scope.root };
         return Ok(match path {
-            None => Bson::Document(scope.root.clone()),
+            None => Bson::Document(doc.clone()),
             // `$$ROOT.items.sku` is `$items.sku` spelled out.
-            Some(p) => field_path(scope.root, p).unwrap_or(Bson::Null),
+            Some(p) => field_path(doc, p).unwrap_or(Bson::Null),
         });
     }
     let Some(value) = scope.get(name) else {

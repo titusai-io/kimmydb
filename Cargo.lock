@@ -2616,6 +2616,7 @@ dependencies = [
  "jiff-tzdb",
  "kimmy-core",
  "proptest",
+ "rand 0.10.3",
  "serde",
  "stacker",
  "thiserror 2.0.21",

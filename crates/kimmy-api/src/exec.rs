@@ -2376,6 +2376,9 @@ fn run_stages(
             aggregate::Stage::GraphLookup(spec) => {
                 graph_lookup(state, auth, db, spec, docs, limits, vars)?
             }
+            aggregate::Stage::UnionWith(spec) => {
+                union_with(state, auth, db, spec, docs, limits, vars)?
+            }
             aggregate::Stage::Facet(facets) => {
                 let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
                     run_stages(state, auth, db, sub, input, limits, vars)
@@ -2402,7 +2405,7 @@ pub(crate) struct SinkPlan {
 /// target. Writes nothing, so `explain` asks it too.
 ///
 /// Refused: a target the pipeline reads, which is the source and every
-/// `$lookup` and `$graphLookup` collection however deeply nested. A pipeline
+/// `$lookup`, `$graphLookup` and `$unionWith` collection however deeply nested. A pipeline
 /// that reads what it writes has no defined answer, because each stage reads
 /// storage when it runs (see [`aggregate`]), and the chunked write is already
 /// under way while a later chunk is read. Then the caller needs `write` on the
@@ -2430,8 +2433,8 @@ pub(crate) fn plan_sink(
     if reads_it {
         return Err(ApiError::bad_request(format!(
             "{name} cannot write `{target_db}`.`{target_coll}`: the pipeline reads it, as its \
-             source or in a $lookup or $graphLookup. Write to a collection the pipeline does not \
-             read"
+             source or in a $lookup, $graphLookup or $unionWith. Write to a collection the \
+             pipeline does not read"
         )));
     }
     auth.require(Action::Write, target_db, Some(target_coll))?;
@@ -2740,6 +2743,99 @@ fn lookup_pipeline(
         out.push(doc);
     }
     Ok(out)
+}
+
+/// `$unionWith`: the input documents, then the other collection's, run through the
+/// stage's sub-pipeline (ADR-263).
+///
+/// The second authorization point is `read` on the named collection, checked first, so a
+/// denied caller learns nothing about whether it exists; a collection that does not exist
+/// reads as empty. Unlike a join, the stage has something to answer when its input is
+/// empty, so it reads either way. The collection is walked once and refused at the first
+/// document past the pipeline's document limit (a leading `$match` of the sub-pipeline is
+/// applied as it is read, so what it declines is not held or counted); the bytes read are
+/// held to the cap `$facet`'s answer is, refused as soon as it is passed, and so are the
+/// bytes the sub-pipeline outputs. The input plus what is appended counts against the
+/// document limit.
+fn union_with(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    spec: &aggregate::UnionWith,
+    mut input: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    vars: &[Binding<'_>],
+) -> Result<Vec<bson::Document>, ApiError> {
+    let name = spec.coll.as_str();
+    kimmy_core::Error::validate_name(name)?;
+    auth.require(Action::Read, db, Some(name))?;
+    let meta = match state.engine.get_collection(db, name) {
+        Ok(meta) => Some(meta),
+        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+            ..
+        })) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let (lead, rest) = match aggregate::leading_match(&spec.stages) {
+        Some((filter, consumed)) => (Some(filter), &spec.stages[consumed..]),
+        None => (None, &spec.stages[..]),
+    };
+    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
+    let charge = |bytes: &mut usize, doc: &bson::Document, what: &'static str| {
+        let encoded = bson::serialize_to_vec(doc).map_err(|e| {
+            kimmy_core::Error::Internal(format!("$unionWith could not encode: {e}"))
+        })?;
+        *bytes += encoded.len();
+        if *bytes > cap {
+            return Err(ApiError::from(kimmy_core::Error::AnswerTooLarge {
+                what,
+                bytes: *bytes,
+                max: cap,
+                remedy: "narrow the sub-pipeline with a $match and $project, or $limit it",
+            }));
+        }
+        Ok(())
+    };
+    let foreign = match &meta {
+        None => Vec::new(),
+        Some(meta) => {
+            let mut bytes = 0usize;
+            read_foreign(
+                state,
+                meta,
+                limits,
+                |doc| {
+                    if let Some(lead) = &lead
+                        && !filter::matches_with(lead, doc, vars)?
+                    {
+                        return Ok(false);
+                    }
+                    charge(&mut bytes, doc, "$unionWith collection read")?;
+                    Ok(true)
+                },
+                |max| {
+                    format!(
+                        "$unionWith reads `{name}` whole, which has more than {max} documents \
+                         that reach the sub-pipeline, the pipeline limit. Narrow it with a \
+                         leading $match in the sub-pipeline"
+                    )
+                },
+            )?
+        }
+    };
+    let appended = if rest.is_empty() {
+        foreign
+    } else {
+        let out = run_stages(state, auth, db, rest, foreign, limits, vars)?;
+        let mut bytes = 0usize;
+        for doc in &out {
+            charge(&mut bytes, doc, "$unionWith output")?;
+        }
+        out
+    };
+    aggregate::check_limit("$unionWith", input.len() + appended.len(), limits)?;
+    input.extend(appended);
+    Ok(input)
 }
 
 /// `$graphLookup`: for each input document, the foreign documents reachable from
@@ -4660,6 +4756,9 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod union_tests;
 
 #[cfg(test)]
 mod positional_answer {

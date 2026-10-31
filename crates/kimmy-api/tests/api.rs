@@ -17941,6 +17941,111 @@ async fn a_document_without_an_id_is_inserted_or_discarded_never_matched() {
 }
 
 #[tokio::test]
+async fn union_with_needs_read_on_both_collections_and_reads_a_missing_one_as_empty() {
+    // ADR-263: `$unionWith` reads a second collection, so it is authorized against it as
+    // `$lookup` is; a caller that may not read it learns nothing of whether it exists.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "archive"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 1, "k": "o"})).await;
+    server
+        .post("/v1/db/shop/coll/archive/docs", Some(&token), json!({"_id": 2, "k": "secret"}))
+        .await;
+    let union = |coll: &str| json!({"pipeline": [{"$unionWith": coll}]});
+
+    let res =
+        server.post("/v1/db/shop/coll/orders/aggregate", Some(&token), union("archive")).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1, "k": "o"}, {"_id": 2, "k": "secret"}]));
+
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({"user": "limited", "password": "limited-password",
+                   "grants": [{"db": "shop", "collection": "orders", "actions": ["read"]}]}),
+        )
+        .await;
+    let limited = server.login("limited", "limited-password").await;
+    for coll in ["archive", "never_created"] {
+        let res =
+            server.post("/v1/db/shop/coll/orders/aggregate", Some(&limited), union(coll)).await;
+        assert_eq!(res.status, 403, "{coll}: {:?}", res.body);
+        assert!(!format!("{:?}", res.body).contains("secret"));
+        // The plan is refused the same way.
+        let res = server
+            .post(
+                "/v1/db/shop/coll/orders/aggregate",
+                Some(&limited),
+                json!({"pipeline": [{"$unionWith": coll}], "explain": true}),
+            )
+            .await;
+        assert_eq!(res.status, 403, "explain {coll}: {:?}", res.body);
+    }
+    // Nested in a sub-pipeline the collection is checked just the same.
+    let nested = json!({"pipeline": [{"$unionWith": {"coll": "orders", "pipeline": [
+        {"$unionWith": "archive"}]}}]});
+    let res = server.post("/v1/db/shop/coll/orders/aggregate", Some(&limited), nested).await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
+
+    // Allowed to read it, a collection that is not there is empty.
+    let res = server
+        .post("/v1/db/shop/coll/orders/aggregate", Some(&token), union("never_created"))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1, "k": "o"}]));
+}
+
+#[tokio::test]
+async fn the_small_stages_run_end_to_end() {
+    // ADR-263: `$sortByCount`, `$replaceWith`, `$unset`, `$sample`, `$redact`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "docs"})).await;
+    for doc in [
+        json!({"_id": 1, "k": "a", "level": 1, "sub": {"level": 5, "x": 1}, "keep": {"level": 1}}),
+        json!({"_id": 2, "k": "b", "level": 1, "sub": {"level": 1, "x": 2}}),
+        json!({"_id": 3, "k": "a", "level": 5}),
+    ] {
+        server.post("/v1/db/shop/coll/docs/docs", Some(&token), doc).await;
+    }
+    let run = |pipeline: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server
+                .post("/v1/db/shop/coll/docs/aggregate", Some(token), json!({"pipeline": pipeline}))
+                .await
+        }
+    };
+    let res = run(json!([{"$sortByCount": "$k"}])).await;
+    assert_eq!(res.body["documents"], json!([{"_id": "a", "count": 2}, {"_id": "b", "count": 1}]));
+    let res = run(json!([{"$match": {"_id": 1}}, {"$replaceWith": "$sub"}])).await;
+    assert_eq!(res.body["documents"], json!([{"level": 5, "x": 1}]));
+    let res = run(json!([{"$match": {"_id": 1}}, {"$unset": ["sub.x", "keep", "k"]}])).await;
+    assert_eq!(res.body["documents"], json!([{"_id": 1, "level": 1, "sub": {"level": 5}}]));
+    let res = run(json!([{"$sample": {"size": 2}}])).await;
+    assert_eq!(res.body["count"], 2, "{:?}", res.body);
+    let res = run(json!([{"$sample": {"size": 10}}])).await;
+    assert_eq!(res.body["count"], 3);
+    let res = run(json!([{"$sample": {"size": 0}}])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let redact = json!({"$redact": {"$cond": {"if": {"$eq": ["$level", 5]},
+                                              "then": "$$PRUNE", "else": "$$DESCEND"}}});
+    let res = run(json!([redact, {"$sort": {"_id": 1}}])).await;
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            {"_id": 1, "k": "a", "level": 1, "keep": {"level": 1}},
+            {"_id": 2, "k": "b", "level": 1, "sub": {"level": 1, "x": 2}},
+        ])
+    );
+    let res = run(json!([{"$redact": "$$DESCEND"}, {"$project": {"x": "$$PRUNE"}}])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("valid only inside a $redact"));
+}
+
+#[tokio::test]
 async fn a_merge_may_not_write_what_the_pipeline_reads() {
     let server = Server::start().await;
     let token = server.root().await;
@@ -17965,6 +18070,31 @@ async fn a_merge_may_not_write_what_the_pipeline_reads() {
         ),
         ("$graphLookup", json!([graph.clone(), {"$merge": {"into": "other"}}])),
         ("$graphLookup out", json!([graph, {"$out": "other"}])),
+        ("$unionWith", json!([{"$unionWith": "other"}, {"$merge": {"into": "other"}}])),
+        ("$unionWith out", json!([{"$unionWith": "other"}, {"$out": "other"}])),
+        (
+            "$unionWith pipeline",
+            json!([
+                {"$unionWith": {"coll": "t", "pipeline": [{"$unionWith": "other"}]}},
+                {"$merge": {"into": "other"}},
+            ]),
+        ),
+        (
+            "$unionWith in a $lookup",
+            json!([
+                {"$lookup": {"from": "t", "as": "j", "pipeline": [{"$unionWith": "other"}]}},
+                {"$merge": {"into": "other"}},
+            ]),
+        ),
+        (
+            "$unionWith in a $facet",
+            json!([
+                {"$facet": {"f": [{"$unionWith": "other"}]}},
+                {"$unwind": "$f"},
+                {"$replaceRoot": {"newRoot": "$f"}},
+                {"$merge": {"into": "other"}},
+            ]),
+        ),
         (
             "$facet",
             json!([

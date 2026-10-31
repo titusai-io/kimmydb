@@ -570,6 +570,10 @@ impl KimmyMcp {
                        $lookup (join; you need read access to the joined collection too), \
                        $facet (several sub-pipelines over one input, answered as one \
                        document of arrays), $bucket and $bucketAuto (histograms), \
+                       $sortByCount, $sample (size N, random), $redact (per-document and \
+                       per-embedded-document access control with $$KEEP, $$PRUNE, $$DESCEND), \
+                       $unionWith (append another collection, optionally through a \
+                       pipeline; you need read access to it), $replaceWith and $unset, \
                        $graphLookup (walk a collection link by link; maxDepth is required, \
                        restrictSearchWithMatch narrows the collection it reads whole; you \
                        need read access to it), and $vectorSearch (semantic search as the \
