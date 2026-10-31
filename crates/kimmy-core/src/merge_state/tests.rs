@@ -694,6 +694,48 @@ fn probe_q11_overflow() {
 }
 
 #[test]
+fn inc_landing_exactly_on_a_bound_is_accepted_one_past_is_refused() {
+    // The Int64 bound: -2^63 and 2^63-1 are legal totals, -2^63-1 and 2^63 are not.
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("x", i(0)), ("y", i(0)), ("n", s("a"))], 0).unwrap();
+    assert!(w.write_inc("x", i64::MAX, 0).is_some());
+    assert_eq!(w.visible().unwrap()["x"], i(i64::MAX));
+    assert!(w.write_inc("x", 1, 0).is_none(), "2^63 is one past the upper bound");
+    assert!(w.write_inc("x", 0, 0).is_some(), "still on the bound");
+    assert!(w.write_inc("y", i64::MIN, 0).is_some());
+    assert_eq!(w.visible().unwrap()["y"], i(i64::MIN));
+    assert!(w.write_inc("y", -1, 0).is_none(), "-2^63-1 is one past the lower bound");
+    assert!(w.write_inc("y", 1, 0).is_some());
+    // A field that does not exist yet starts from 0.
+    assert!(w.write_inc("a", i64::MAX, 0).is_some());
+    assert!(w.write_inc("b", i64::MIN, 0).is_some());
+    assert_eq!(w.visible().unwrap()["a"], i(i64::MAX));
+    assert_eq!(w.visible().unwrap()["b"], i(i64::MIN));
+    // The total is a base plus counted slots: 10 + (MAX - 10) lands on the bound.
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("x", i(10))], 0).unwrap();
+    assert!(w.write_inc("x", i64::MAX - 9, 0).is_none(), "one past");
+    assert!(w.write_inc("x", i64::MAX - 10, 0).is_some(), "exactly on");
+    assert!(w.write_inc("x", 1, 0).is_none());
+    assert!(w.write_inc("x", i64::MIN, 0).is_some(), "back down across the whole range");
+    assert_eq!(w.visible().unwrap()["x"], i(-1));
+}
+
+#[test]
+fn inc_landing_exactly_on_a_lowered_bound() {
+    let o = JoinOptions { int_bound: 1000, ..opts() };
+    let mut w = Writer::new(wid('A', 0), o);
+    w.insert(&[("x", i(0)), ("y", i(0))], 0).unwrap();
+    assert!(w.write_inc("x", 1001, 0).is_none());
+    assert!(w.write_inc("x", 1000, 0).is_some());
+    assert!(w.write_inc("x", 1, 0).is_none());
+    assert!(w.write_inc("y", -1002, 0).is_none());
+    assert!(w.write_inc("y", -1001, 0).is_some());
+    assert!(w.write_inc("y", -1, 0).is_none());
+    assert_eq!(w.visible().unwrap()["y"], i(-1001));
+}
+
+#[test]
 fn probe_v6m1_losing_writes() {
     // A inserts {x:1}; C writes $set note and $inc views into it (acknowledged); B, newer, never held
     // it, inserts {y:2}. Every delivery order: {y:2}, and C's two writes are reported.
@@ -906,6 +948,36 @@ fn golden_mixed() -> MergeState {
     obs.w.state.clone()
 }
 
+/// A delete and its `deleteWon` records: A inserts and then deletes; B and C took the insert
+/// first and write into it without having seen the delete (a $set and an $inc), so the document
+/// is dead and both writes are reported as lost to the delete.
+fn golden_delete() -> MergeState {
+    let o = opts();
+    let (mut a, mut b, mut c) = (Mem::new('A', &o), Mem::new('B', &o), Mem::new('C', &o));
+    let i0 = a.ins(&[("x", i(1)), ("n", s("a"))], 0).unwrap();
+    b.receive_entry(&a.ent(i0));
+    c.receive_entry(&a.ent(i0));
+    let dd = a.del().unwrap();
+    let bb = b.set("x", i(5), 0).unwrap();
+    let cc = c.inc("y", 2, 0).unwrap();
+    let mut obs = fresh_observer(&o, &[]);
+    for e in [a.ent(i0), a.ent(dd), b.ent(bb), c.ent(cc)] {
+        obs.receive_entry(&e);
+    }
+    let st = obs.w.state.clone();
+    assert!(!st.deletes.is_empty() && obs.visible().is_none());
+    let kinds: BTreeSet<(LossKind, String)> =
+        st.losses.keys().map(|k| (k.kind, k.path.clone())).collect();
+    assert_eq!(
+        kinds,
+        BTreeSet::from([
+            (LossKind::DeleteWon, "x".to_string()),
+            (LossKind::DeleteWon, "y".to_string())
+        ])
+    );
+    st
+}
+
 fn golden_small() -> MergeState {
     let mut w = Writer::new(wid('A', 7), opts());
     w.insert(&[("x", i(1)), ("s", s("t"))], 0).unwrap();
@@ -962,6 +1034,19 @@ fn golden_vectors_mixed() {
             "928f20426ffe88fcc094541a25d75f82",
             1557,
             "00000000000000030000000000000001000041414141414141414141414141414141000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+}
+
+#[test]
+fn golden_vectors_delete() {
+    check_golden(
+        "delete",
+        &golden_delete(),
+        (
+            "0b4d37ac9b577c417603e7c9bce83933",
+            542,
+            "00000000000000010000000000000001000041414141414141414141414141414141000000000000000000000000000000000000000000000000000000000000",
         ),
     );
 }
