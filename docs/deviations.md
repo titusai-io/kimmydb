@@ -22,31 +22,31 @@ Status meanings:
 **Raised 2026-10-31, with ADR-260.** `$trim`, `$ltrim`, `$rtrim`, `$indexOfCP`, `$indexOfBytes`, `$regexMatch`, `$regexFind`, `$regexFindAll`, `$replaceOne`, `$replaceAll`, `$strcasecmp`, `$strLenBytes`, `$substrBytes`, `$mergeObjects` (expression and accumulator), `$getField`, `$setField`, `$unsetField`, `$type` and `$isNumber` follow the reference; these are the differences.
 
 - **Integer results are `Int64`** (`$indexOfCP`, `$indexOfBytes`, `$strLenBytes`, `idx` of `$regexFind`), as the rest of the expression layer; the reference gives `Int32`. `$type` of a computed integer is therefore `"long"` where the reference says `"int"` (the entry on numbers above). `$strcasecmp` gives `Int32`, as `$cmp` does.
-- **The regex operators are not PCRE.** They use the `$regex` filter's engine: no backreferences or lookaround (a `400` when the pattern is parsed or evaluated), only the flags `i`, `m`, `s` and `x`, a size limit per pattern, and a count shared with the pipeline's other patterns (32). The reference accepts what PCRE does. `$` and `\Z` differ in the way the `$regex` filter's do. Matching is by code point, and `idx` counts code points.
+- **The regex operators are not PCRE.** They use the `$regex` filter's engine: no backreferences or lookaround (a `400` when the pattern is parsed or evaluated), no atomic groups (`(?>)`), no `\Q..\E`, no `\Z` or `\G`, a size limit per pattern, and a count shared with the pipeline's other patterns (32). **Possessive quantifiers** (`a*+`, `a++`) are accepted and read as a repetition of a repetition, so `a*+a` matches `aa` where the reference matches nothing. The flags are `i`, `m`, `s`, `x` and `u` (`u` is accepted and changes nothing). `\d`, `\w`, `\s` and `\b` are ASCII, as the reference's are; the rest is Unicode, and `i` folds `é` with `É`, as the reference does. Under `i`, a `\w` or `\W` written inside brackets (`[\w-]`) also takes in U+017F and U+212A, which the reference's `\w` does not. `$` and `\Z` differ in the way the `$regex` filter's do (`$` matches only at the very end, not before a final newline). Matching is by code point, and `idx` counts code points. The same engine now reads `\d`, `\w` and `\s` as ASCII in the `$regex` filter and in a validator's `pattern`, which is a change from 0.58.0 (CHANGELOG, "Breaking").
 - **A computed `regex` is compiled per document** (the last pattern is kept), outside the pipeline's budget; each pattern is still bounded by the per-pattern size limit.
-- **`$strcasecmp` and `$substrBytes` coerce only strings, null and numbers** to text. The reference also renders a date, a timestamp, code and a symbol; here those are a `400`.
-- **`$substrBytes` with a negative length** reads "to the end" and checks the end against the string's end. The reference computes the end as `start + length` in unsigned arithmetic, so a negative length after a non-zero start may check a byte before `start` and refuse a range this accepts.
-- **`$replaceAll` with an empty `find`** inserts between every code point and at both ends (`"abc"`, `""`, `"-"` gives `"-a-b-c-"`); the reference's handling of an empty `find` is not verified here.
+- **`$strcasecmp` and `$substrBytes` coerce only strings, null and numbers** to text, a double as `%g` prints it, as the reference does. The reference also renders a date, a timestamp, code and a symbol; here those are a `400`.
+- **`$regexFindAll`'s 64 MiB limit is counted as BSON bytes of the documents it would return**, which is this server's reading of the reference's output-buffer limit; the two counts agree to within the documents' framing, not byte for byte, so an answer within a few percent of 64 MiB may be refused by one and not the other. The error is the `413` `AnswerTooLarge`, where the reference's is `51151`. A string over 16 MiB built by `$concat`, `$replaceOne` or `$replaceAll` is the same `413`, where the reference's codes are `16493` and `13548`.
+- **`$replaceAll` with an empty `find`** inserts between every code point and at both ends (`"abc"`, `""`, `"-"` gives `"-a-b-c-"`). The reference inserts between the *bytes* of a multi-byte character and builds invalid UTF-8, which its own client refuses to read (`Invalid UTF-8 string in BSON document`); on ASCII text the two agree.
 - **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null.
-- **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document. The reference's behaviour for that form is not verified here.
-- **`$trim`'s default set** is the reference's documented list (see aggregation.md); a character outside it, such as U+0085 or U+3000, is not stripped.
+- **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document, as the reference refuses it (`40400`).
+- **`$trim`'s default set** is the reference's list (see aggregation.md): it does not strip U+0085, U+2028, U+202F or U+3000, and nor does this.
 
-**Why.** The first is the standing choice of the layer; the rest refuse or choose narrowly where the reference's behaviour could not be confirmed without a server. The `q8-probes/str.js` script of the review folder runs every case against a reference server, so the unverified ones are settled by a diff, not by a guess.
+**Why.** The first is the standing choice of the layer; the rest refuse or choose narrowly where the reference's behaviour cannot be honoured, or is not worth honouring (invalid UTF-8). Every case the review ran against a reference server is in `q8-probes/`, and the delta review re-runs it.
 
-**What it costs.** A pipeline ported from MongoDB that relies on a backreference, a date coerced to a string by `$strcasecmp`, or an `Int32` result type will be refused or differ in type.
+**What it costs.** A pipeline ported from the reference server that relies on a backreference, a possessive quantifier, a date coerced to a string by `$strcasecmp`, or an `Int32` result type will be refused or differ.
 
 ---
 
-## 🟡 The `$stdDev*`, `$top*`, `$bottom*`, `$firstN`, `$lastN`, `$maxN`, `$minN` and `$count` accumulators: decimal as double, tie order, and the `$sort` array key
+## 🟡 The `$stdDev*`, `$top*`, `$bottom*`, `$firstN`, `$lastN`, `$maxN`, `$minN` and `$count` accumulators: decimal as double, the cap on ranked buffers, and the array forms
 
-**Raised 2026-10-31, with ADR-262.** Where these differ from, or rest on a reading of, the reference:
+**Raised 2026-10-31, with ADR-262; revised after the review of PR #276.** Where these differ from, or rest on a reading of, the reference:
 
 - **`$stdDevPop`/`$stdDevSamp` convert a `Decimal128` to the nearest double** before accumulating, so a decimal with more than 15 significant digits can differ from the reference in the last printed digit of the double result.
-- **Ties in `$top`/`$bottom`/`$topN`/`$bottomN` keep arrival order** (the first of equal rows is first); the reference does not specify the order of rows that sort equal, so a tie may be answered differently.
-- **`$top*`/`$bottom*` pick the array element by direction**, as the reference sorts, whereas the `$sort` stage here uses the smallest element for both directions.
-- **`n` is one value for the group**, evaluated at parse or at first use; an `n` that reads a document field is refused, where the reference refuses it with a different message. An `n` over `Limits::max_documents`, and buffers over it in total, are refused (`Error::Limit`); the reference has a byte cap instead.
+- **The rows held by `$topN`/`$bottomN`/`$maxN`/`$minN` are counted against `Limits::max_documents`,** across all the groups of a stage, and a stage that holds more is refused (`Error::Limit`, a `400`). The reference has no such count. It answers a large `n` over a small group (`n: 1000000` over six documents answers the six, as here); the difference is a stage that keeps more than the limit's worth of ranked rows in all, which the reference answers and this server refuses. `$firstN`/`$lastN`, like `$push`, are not counted.
+- **`n` is one value for the group**, evaluated at parse or at first use. An `n` that reads a document field is refused, as the reference refuses it (it reads the group key, where the field is missing), with a different message.
 - **`$count` answers an int** (a long past 2^31-1), as `{$sum: 1}` does in the reference, whereas this server's `$sum: 1` answers a long.
-- **`$firstN`/`$lastN` include null and a missing value as `null`;** `$maxN`/`$minN` skip them. This is the reading of the reference documented in ADR-262 and marked uncertain in the probe script.
+- **The array forms of `$firstN`, `$lastN`, `$maxN`, `$minN`, `$stdDevPop` and `$stdDevSamp`** (as `$project` or `$addFields` expressions) answer the reference's cases (`{$maxN: {n: 2, input: [1, 3, 2, null]}}` is `[3, 2]`, `{$stdDevPop: [1, 2, 3, 4]}` is `1.118033988749895`). What was not checked against the reference: a `null` or missing `input` answers `null` here, and an `input` that is not an array is a `400`. `$stdDev*` reads a single operand that is an array as its elements and any other list as the operands.
+- **Not checked against the reference:** `$bottom`/`$bottomN` with an empty `sortBy` keep the first arrivals (the rule for equal rows), not the last; and an empty array nested inside a sort key (`[[]]`) is compared as any other array, only a key that is itself an empty array sorts below `null`.
 
 ---
 
@@ -573,9 +573,9 @@ still finds it, and `$in` still compares a document of any other shape, a
 `{"$regex": ..., "kind": ...}` among them. A filter written for MongoDB that
 uses a pattern inside `$in` must be rewritten as an `$or`.
 
-**Closing it** means matching a regex element as a pattern, as MongoDB does,
-and giving the JSON decoder a `$regularExpression` form so a regex can be sent
-as a value at all. Not planned until someone needs patterns in a list; the
+**Closing it** means matching a regex element as a pattern, as the reference does.
+The JSON decoder reads a `$regularExpression` form since 0.59.0, so a regex can
+be sent as a value. Not planned until someone needs patterns in a list; the
 `$or` says the same thing.
 
 ---
@@ -3532,11 +3532,48 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
   offset. Anything else is the conversion error (which `onError` takes). Give a
   `format` for another layout. Fractions of a second are cut to milliseconds.
 - **`$dateFromString` with a `format` reads fixed-width fields** (`%Y` four
-  digits, `%d` two, ...), which is what the reference documents; a field it
-  would read with fewer digits is an error here.
+  digits, `%d` two, `%L` three, ...). The reference also reads a shorter field:
+  `24-01-01` with `%Y-%m-%d` is the year 24 there, `5/03/2024` with `%d/%m/%Y` is
+  the 5th, and `.5` with `%L` is 500 ms. Here each is a conversion error (which
+  `onError` takes).
+- **`%Y` with `%G`/`%V`/`%u` in a `$dateFromString` format** is refused when the
+  format is checked, and `onError` does not take it. The reference reads the
+  string first and answers a conversion error, which `onError` does take.
 - **Dates outside the tz database's years** use the zone's earliest or latest
-  offset. The reference's own database has the same edges, but where exactly the
-  last rule applies can differ by a clock change in the far future.
+  offset. The reference applies a zone's daylight-saving rule through the year
+  2400 and answers garbage past it (an offset of -08 for New York in the year
+  12000); here the rule of the last year the database represents, 9999, applies
+  from then on. A date before the database's first year uses the zone's earliest
+  (local mean time) offset.
+- **The reference 6.0.5's own tz data is older than 2022f.** For a date after
+  the rule changes of 2022 to 2024 the two disagree: Mexico City in July 2024
+  (-05 there, -06 here), Nuuk, Almaty, Cairo and Asuncion. Nothing is done about
+  it here: the built-in database is current (2026e) on purpose.
+- **`$dateTrunc` bounds `binSize` by what the unit can count.** A year, quarter,
+  month, week or day bin larger than the number of those units in the whole range
+  of a date (a year bin over about 585 million, a day bin over about 2e11) is
+  `dateTrunc unsupported binSize value`, and a bin or result no 64-bit date can
+  hold is `dateTrunc overflowed`. The reference gives the same two refusals for the
+  cases probed (the largest long for every unit, a year bin of 2^31 - 1), but the
+  exact threshold it uses is not known, so a bin between those limits may answer
+  here where the reference refuses.
+- **Results past the 64-bit date range are refused here, and are garbage in the
+  reference.** `$dateDiff` in milliseconds between the smallest and largest date
+  (the reference answers 0), `$dateTrunc` of a date near the 64-bit limits (it
+  answers the date 0) and a `$dateFromParts` sum of that size are
+  `Overflow occurred` / `dateTrunc overflowed` here.
+- **Cut to a minute, the seconds of a local-mean-time offset are ignored**, as
+  the reference ignores them (`$dateTrunc` to the minute in New York in 1800 is
+  12:00:00Z for 12:00:30Z), and `$dateDiff` counts them, as the reference does.
+  Cut to an hour the seconds are kept; the reference was not probed for that.
+- **Offsets above 23:59 are accepted** (`+24:00`, `+05:60`, `+99`) because the
+  reference accepts them. How `%z` prints one (`+9900`) was not probed.
+- **The order of null and bad arguments** follows the reference for `$year` and
+  the other one-date operators, `$dateAdd`, `$dateSubtract`, `$dateDiff`,
+  `$dateTrunc`, `$dateFromParts` and `$dateToString`. Not probed, and set to the
+  nearest probed case: `$dateToParts` reads a bad zone before a null date, a null
+  `timezone` beside a null date in `$dateToString` answers `onNull`, and a
+  `startOfWeek` of null beside `unit: "week"` answers null.
 - **A format given as an expression** (`$dateToString`'s `format`) is accepted
   as the reference accepts it; a constant one is checked when the pipeline is
   parsed.
