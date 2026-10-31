@@ -1143,7 +1143,8 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_ttl_expired_total` | Documents deleted by a TTL index. Summed across members it counts one delete per expired document once membership and the members' blocks have settled. **More than one holder may delete the same expired document**, and the deletes converge ([ADR-201](decisions.md)): for about one sync interval after a TTL index is created (each holder counts only itself until the others' blocks arrive); for as long as a member's sync contacts fail while SWIM keeps it up (its peers' blocks go stale on it, and it counts only itself); and, permanently, for every collection past the 256 a member's block lists, which each holder owns. The last two show in `kimmy_ttl_collections` below |
 | `kimmy_ttl_skipped_total` | Expiry candidates the pass declined because the document was refreshed between the scan and the delete — a session heartbeat landing while the pass ran ([TTL indexes](indexes.md#ttl-indexes--expiring-documents)) |
 | `kimmy_ttl_skipped_filter_total` | Expiry candidates a TTL index held that its partial filter, read as `find` reads it, did not select when the delete re-read the document — so they were **not** deleted ([ADR-181](decisions.md)). Two causes: a document moved out of the filter while the pass ran, and a document the index held that the filter never selected. The second was a defect in partial-index membership, which compared across type brackets, so `{size: {$gt: 5}}` held strings, documents and booleans and expiry deleted them. That is fixed, and every partial index was rebuilt on the first start of the release carrying [ADR-183](decisions.md), so **on a migrated database only the first cause is left and this should read near zero**. A rate above that on such a database is a genuine race, not the old defect; a rate that stays high is worth reporting. Kept apart from `kimmy_ttl_skipped_total` so that fall can be seen |
-| `kimmy_index_unkeyed_total` | Documents stored under an index that could not key them — arrays at two of a compound index's paths, or more than 1,000 keys for one document — and are rechecked on every scan of that index instead ([Indexes](indexes.md#documents-an-index-cannot-key)). Local writes, replicated writes and backfills all count here; each is logged at warning naming the database, collection, index and document id. Rising steadily is a schema the index does not fit: reshape the documents, or split the index. The standing number per index is `unkeyed` on the index listing, which a collection's owner can read without this endpoint ([ADR-139](decisions.md)). A `Decimal128` at an indexed path was a third reason through 0.50.x; since 0.51.0 it has an exact key. **`kimmy_index_undecidable_total` is gone since 0.51.0** (and its OTLP instrument `kimmy.index.undecidable`): it counted the documents a partial index held because its filter could not decide them, a `Decimal128` at a filtered path, and a partial filter now decides a `Decimal128` by its exact value ([ADR-238](decisions.md)). Remove any dashboard or alert built on it |
+| `kimmy_index_unkeyed_total` | Documents stored under an index that could not key them — arrays at two of a compound index's paths, or more than 1,000 keys for one document — and are rechecked on every scan of that index instead ([Indexes](indexes.md#documents-an-index-cannot-key)). Replicated writes, the backfill of a replicated, restored or repaired definition, and a rewind that puts a document back count here; a local write is refused instead and counts in `kimmy_index_unkeyed_refusals_total`. Each filing is logged at warning naming the database, collection, index and document id. Rising steadily is a schema the index does not fit: reshape the documents, or split the index. The standing number per index is `unkeyed` on the index listing, which a collection's owner can read without this endpoint ([ADR-139](decisions.md)). A `Decimal128` at an indexed path was a third reason through 0.50.x; since 0.51.0 it has an exact key. **`kimmy_index_undecidable_total` is gone since 0.51.0** (and its OTLP instrument `kimmy.index.undecidable`): it counted the documents a partial index held because its filter could not decide them, a `Decimal128` at a filtered path, and a partial filter now decides a `Decimal128` by its exact value ([ADR-238](decisions.md)). Remove any dashboard or alert built on it |
+| `kimmy_index_unkeyed_refusals_total` | Local writes and local `createIndex` calls this member refused with `400` because an index on it could not key the document, unique indexes included: arrays at two of a compound index's paths, or more than 1,000 keys for one document ([Indexes](indexes.md#documents-an-index-cannot-key)). A rise is a client sending a shape the index cannot hold. A replicated write is never refused and counts in `kimmy_index_unkeyed_total`, so a document that reaches an index by replication moves that counter and this one stays. On the OTLP bridge, `kimmy.index.unkeyed_refusals` ([ADR-258](decisions.md)) |
 | `kimmy_webhook_deliveries_total{outcome}` | Webhook delivery attempts, `delivered` or `failed` |
 | `kimmy_webhook_events_total` | Change events pushed to endpoints |
 | `kimmy_webhook_subscriptions{state}` | Registered subscriptions, counted from this node's registry when the page is read: `active`, or `invalidated` after falling too far behind ([Webhooks](webhooks.md)), or `unreadable`. A record the dispatcher cannot load (one missing a field) is counted as `active`: it is registered, even though nothing delivers it. A record that does not decode at all is counted as `unreadable`, and should read 0: above 0, a record in the registry is damaged and nothing delivers it, and the rest of the page still reads. If the registry itself cannot be read, the scrape fails rather than reporting 0 ([ADR-187](decisions.md)) |
@@ -2557,12 +2558,12 @@ and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 ## Upgrades
 
 KimmyDB runs one version in a cluster, and an upgrade that changes data wipes the
-data. The on-disk **storage schema** is checked on open, and 0.53.0 opens only
-schema **6**:
+data. The on-disk **storage schema** is checked on open, and 0.58.0 opens only
+schema **7**:
 
 | Stored version | Behaviour |
 |---|---|
-| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.53.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
+| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.58.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
 | Equal | Opens normally |
 | Newer | **Refuses to start** |
 
@@ -2593,6 +2594,23 @@ There is no mixed-version cluster and no member-at-a-time roll across this
 release. **Rolling back:** stop every member, then start 0.52.x on the data
 directories moved aside at the upgrade, or wipe and reseed; 0.52 refuses a
 schema-6 store, and nothing a 0.53 store held crosses back.
+
+**Upgrading from 0.57.x to 0.58.0: stop all, wipe, start all, reseed.** 0.58.0
+derives index keys under a different rule ([ADR-259](decisions.md)): a
+compound index counts the arrays its paths go through, so a document such as
+`{x: [{a: 1}, {a: 2}], c: [1, 2]}` under `{x.a, c}` is no longer keyed. A 0.57.0
+store holds entries for documents the new rule files unkeyed, and a later write
+to one would leave them behind. **The storage schema is 7, so 0.58.0 refuses a 0.57 store and a 0.57 backup by name, and
+writes nothing to them: wipe first.** There is no migration code.
+1. Stop every member.
+2. Move each data directory aside (it is the rollback) and create an empty one
+   with the same owner.
+3. Start every member on 0.58.0, check `/readyz` on each and that `/v1/topology`
+   lists every member live, then reseed from your source of truth.
+
+A backup 0.57.0 wrote carries the old entries too, and `kimmyd restore` refuses it
+by the same rule; reseed instead. **Rolling back:** stop every member, then start 0.57.x on the
+data directories moved aside at the upgrade.
 
 ### Rolling back, and `kimmy.format`
 
@@ -2813,7 +2831,7 @@ node. How to read and consume it, and what it does not prove, is in
 |---|---|
 | `no root password configured` | Set `KIMMY_ROOT_PASSWORD` or pass `--insecure-no-auth` on loopback |
 | `insecure_no_auth is set but the server binds to 0.0.0.0` | Bind to `127.0.0.1` or configure auth |
-| `on-disk format version N is not supported` | Data directory written by a **newer** build, or by an older one: 0.53.0 refuses a store older than schema 6 by name ([Upgrades](#upgrades)) |
+| `on-disk format version N is not supported` | Data directory written by a **newer** build, or by an older one: 0.58.0 refuses a store older than schema 7 by name ([Upgrades](#upgrades)) |
 | 401 on a token that worked a moment ago | Token expired (1 h default), or the node has a different `jwt_secret` |
 | 403 where you expected 404 | Deliberate — authorization does not reveal existence |
 | `410 resume_token_expired` | Resume point passed out of the retained oplog; resubscribe |

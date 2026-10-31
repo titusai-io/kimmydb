@@ -202,30 +202,6 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
             // at all. So these carry a `k` above the bound as well. Without them
             // the `UNKEYED` run stayed empty and this file never exercised the
             // prepended range.
-            for extra in 0..3 {
-                engine
-                    .insert(
-                        &coll,
-                        doc! {
-                            "_id": (docs + extra) as i64,
-                            "name": [format!("arr{extra}"), "m".to_string()],
-                            "tag": [1, 2],
-                            // The value has to sit at the path *this* filter
-                            // constrains, or the document is not selected, never
-                            // reaches the keying step, and the run stays empty —
-                            // which is how the first version of this premise
-                            // failed.
-                            "k": if filter.contains_key("k") {
-                                Bson::Int32(9)
-                            } else {
-                                Bson::Document(doc! { "a": 9 })
-                            },
-                        },
-                    )
-                    .unwrap();
-            }
-            docs += 3;
-
             engine
                 .create_index_with(
                     "app",
@@ -238,6 +214,40 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
                     Some(filter.clone()),
                 )
                 .unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            for extra in 0..3 {
+                let body = doc! {
+                    "_id": (docs + extra) as i64,
+                    "name": [format!("arr{extra}"), "m".to_string()],
+                    "tag": [1, 2],
+                    // The value has to sit at the path *this* filter
+                    // constrains, or the document is not selected, never
+                    // reaches the keying step, and the run stays empty —
+                    // which is how the first version of this premise
+                    // failed.
+                    "k": if filter.contains_key("k") {
+                        Bson::Int32(9)
+                    } else {
+                        Bson::Document(doc! { "a": 9 })
+                    },
+                };
+                // As another member's write reaches this one: a local insert
+                // is refused when the index cannot key it (ADR-258), and a
+                // replicated one never is (ADR-139).
+                let entry = kimmy_core::OplogEntry {
+                    stamp: kimmy_core::Stamp::new(
+                        kimmy_core::Hlc::new(u64::MAX >> 20, extra as u16),
+                        kimmy_core::NodeId::generate(),
+                    ),
+                    kind: kimmy_core::OpKind::Insert,
+                    collection: coll.id,
+                    doc_id: Some(kimmy_core::DocId::Int64((docs + extra) as i64)),
+                    body: Some(bson::serialize_to_vec(&body).unwrap()),
+                };
+                assert!(engine.apply_remote(&coll, &entry).unwrap());
+            }
+            docs += 3;
+            // The replicated arrays made the index multikey; read it as it stands.
             let coll = engine.get_collection("app", "docs").unwrap();
 
             // Premise: the sentinel run holds something for the compound shape,

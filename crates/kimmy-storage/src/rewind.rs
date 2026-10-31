@@ -165,7 +165,7 @@ impl Engine {
 
                 match entry.kind {
                     // Not a mutation, and not something a rewind has to undo.
-                    OpKind::UniqueViolation => continue,
+                    OpKind::UniqueViolation | OpKind::UnkeyedDocument => continue,
                     OpKind::CreateCollection
                     | OpKind::DropCollection
                     | OpKind::CreateIndex
@@ -281,6 +281,7 @@ impl Engine {
         // Whether the rewind removed a document it holds no entry of at or below
         // the target: the vectors are then bounded by the horizon as well.
         let mut removed_any = false;
+        let mut unkeyed = Vec::new();
         let schema = Engine::schema_for_record(self.db())?;
         let txn = self.begin_write(WriterHolder::Rewind)?;
         {
@@ -363,11 +364,25 @@ impl Engine {
                 // Index entries follow the document, or an index-backed query
                 // would answer from the future the rewind just undid.
                 if let Some(meta) = collections.get(&collection_id) {
-                    let newly_multikey =
-                        index::maintain(self, &txn, meta, before.as_ref(), after.as_ref(), &key)?;
+                    let (newly_multikey, filings) = index::maintain_rewound(
+                        self,
+                        &txn,
+                        meta,
+                        before.as_ref(),
+                        after.as_ref(),
+                        &key,
+                    )?;
                     // A restored image can hold arrays the current one did not;
                     // the flag is one-way, so marking is the only safe answer.
                     index::mark_multikey(&txn, &meta.db, &meta.name, &newly_multikey)?;
+                    // Reported like every other filing, on the move into the
+                    // unkeyed run only; appended below, once the discarded
+                    // future has left the log, or the pass that removes
+                    // everything above the target would remove these too.
+                    if let Some(after) = after.as_ref().filter(|_| !filings.is_empty()) {
+                        let id = crate::docs::extract_id(after)?;
+                        unkeyed.extend(crate::docs::unkeyed_details(meta.id, &id, &filings));
+                    }
                 }
             }
 
@@ -401,9 +416,20 @@ impl Engine {
             let mut violations = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
             let mark_before = crate::live_count::mark_of(&arrival, &oplog)?;
             let mut discarded = VersionVector::new();
+            // The reports the trim removes: a document the rewind leaves alone
+            // can stand unkeyed with its only report above the target.
+            let mut trimmed_reports = Vec::new();
             for key in doomed {
                 if let Some(old) = oplog.remove(key.as_slice())? {
                     let header = codec::decode_oplog_kind_and_collection(old.value());
+                    if let Ok((kimmy_core::OpKind::UnkeyedDocument, collection)) = header {
+                        let report = codec::decode_oplog_entry(old.value())?;
+                        if let Some(body) = &report.body {
+                            let detail: kimmy_core::UnkeyedDocumentDetail =
+                                bson::deserialize_from_slice(body)?;
+                            trimmed_reports.push((collection, detail));
+                        }
+                    }
                     drop(old);
                     if let Ok((kimmy_core::OpKind::UniqueViolation, collection)) = header {
                         violations.remove(
@@ -417,6 +443,47 @@ impl Engine {
                 }
                 discarded.observe(codec::decode_oplog_key(&key)?);
                 outcome.oplog_discarded += 1;
+            }
+            // Re-announce the trimmed reports whose filing still stands: the
+            // document is stored, and its index still files it unkeyed, and the
+            // rewind has not announced it already. Without it a watcher that
+            // starts from the beginning never learns of a document that
+            // `GET .../unkeyed` lists. The reason is the one the index gives
+            // the stored document now, which is what the list shows; a trimmed
+            // report's own reason may be an older one (two reports of one
+            // document can differ).
+            let mut announced: std::collections::HashSet<(
+                kimmy_core::CollectionId,
+                String,
+                DocId,
+            )> = unkeyed.iter().map(|(c, d)| (*c, d.index.clone(), d.id.clone())).collect();
+            for (collection, detail) in trimmed_reports {
+                if announced.contains(&(collection, detail.index.clone(), detail.id.clone())) {
+                    continue;
+                }
+                let Some(meta) = collections.get(&collection.0) else { continue };
+                let Some(index) = meta.indexes.iter().find(|i| i.name == detail.index) else {
+                    continue;
+                };
+                let Some(raw) =
+                    docs.get((collection.0, crate::docs::doc_key(&detail.id)?.as_slice()))?
+                else {
+                    continue;
+                };
+                let Some(stored) = codec::decode_doc_record(raw.value())?.document()? else {
+                    continue;
+                };
+                drop(raw);
+                if let index::DocumentKeys::Unkeyed { cause, .. } =
+                    index::document_keys(index, &stored)?
+                {
+                    announced.insert((collection, detail.index.clone(), detail.id.clone()));
+                    let current = kimmy_core::UnkeyedDocumentDetail {
+                        reason: cause.as_str().to_string(),
+                        ..detail
+                    };
+                    unkeyed.push((collection, current));
+                }
             }
             if let Some(through) = crate::violations_table::through_of(&violations)? {
                 let tail = oplog.last()?.map(|(k, _)| k.value().to_vec());
@@ -462,7 +529,11 @@ impl Engine {
             restored_floor
         };
         Engine::lower_vectors_in(&txn, schema, until, floor)?;
+        // After the log lost everything above the target, so these survive it,
+        // and in the transaction that filed the documents.
+        let unkeyed_entries = self.append_unkeyed(&txn, unkeyed)?;
         txn.commit()?;
+        self.publish(unkeyed_entries);
 
         info!(
             reverted = outcome.reverted,

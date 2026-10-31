@@ -2439,6 +2439,13 @@ paths:
         provably fall inside the index" is a decision rather than a guess.
         Anything outside that language is refused here rather than producing an
         index that silently answers with a subset.
+
+        **A `400` when the index cannot key a document that is already stored**
+        (arrays at two of a compound index's paths, or more than 1,000 keys for
+        one document). The message counts them, lists the first ten `_id`s and
+        says how many more, and nothing is created. A definition that reaches a
+        member by replication is accepted over the same documents, which are
+        filed unkeyed there (ADR-139, ADR-258).
       x-kimmy-action: ddl
       requestBody:
         required: true
@@ -2544,6 +2551,68 @@ paths:
                     description: |
                       Present on a clustered node: what each live member
                       answered when the drop was pushed to it.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/indexes/{name}/unkeyed:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+      - $ref: "#/components/parameters/IndexName"
+    get:
+      tags: [indexes]
+      operationId: listUnkeyedDocuments
+      summary: The documents an index files unkeyed, and why.
+      description: |
+        Read from the unkeyed run the index keeps, in document-key order, one
+        bounded page at a time. These are documents the index could not key and
+        that this member holds anyway: one that arrived by replication, or by a
+        replicated definition built over it (ADR-139). A local write is refused
+        instead (ADR-258). The same documents are the `unkeyed` count on the
+        index listing, and each one's filing is an `unkeyedDocument` event.
+        `404` when the collection has no index of that name.
+      x-kimmy-action: read
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 100 }
+          description: The most documents to return. Clamped to 10,000.
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+          description: The `nextCursor` of the previous page.
+      responses:
+        "200":
+          description: One page of the unkeyed run.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [index, unkeyed, count]
+                properties:
+                  index: { type: string }
+                  unkeyed:
+                    type: array
+                    items:
+                      type: object
+                      required: [_id, reason]
+                      properties:
+                        _id: {}
+                        reason:
+                          type: string
+                          description: |
+                            Why the index cannot key the document. `unencodable`
+                            is kept for a key the encoder refuses; no current
+                            build files a document under it.
+                          enum: [parallel_arrays, too_many_keys, unencodable]
+                  count: { type: integer }
+                  nextCursor:
+                    type: string
+                    description: Present when the run holds more.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -4461,6 +4530,33 @@ components:
                 type: object
                 properties:
                   _id: {}
+        - type: object
+          title: unkeyedDocument
+          description: |
+            This member filed a document unkeyed under an index: a replicated
+            write the index could not key, a replicated definition built over
+            a document it could not key, or an update that made a keyed document
+            unkeyed. Reported on each member that does so, once for the move into
+            the unkeyed run and not again while the document stays there
+            (ADR-258). Not a document change; the document is unchanged.
+          required: [operationType, resumeToken, clusterTime, index, documentKey, reason]
+          properties:
+            operationType:
+              const: unkeyedDocument
+            resumeToken: { type: string }
+            clusterTime: { type: string }
+            index: { type: string }
+            documentKey:
+              type: object
+              properties:
+                _id: {}
+            reason:
+              type: string
+              description: |
+                Why the index cannot key the document. `unencodable` is kept
+                for a key the encoder refuses; no current build files a
+                document under it.
+              enum: [parallel_arrays, too_many_keys, unencodable]
         - type: object
           title: invalidate
           description: |

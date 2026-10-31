@@ -2017,6 +2017,44 @@ pub fn violations(
     Ok(json!({ "index": name, "count": groups.len(), "groups": groups }))
 }
 
+/// One page of the documents an index files unkeyed, each with why (ADR-258).
+///
+/// Read from the unkeyed run the index keeps, so it costs the page and not the
+/// collection. An index this collection does not have is a `404`.
+pub fn unkeyed_documents(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    index: &str,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+) -> Result<Value, ApiError> {
+    let _span = op_span("unkeyed_documents", db, Some(coll)).entered();
+    let meta = authorize(state, auth, Action::Read, db, coll)?;
+    let Some(definition) = meta.index(index) else {
+        return Err(ApiError::not_found(format!("no index named {index:?} on {db}.{coll}")));
+    };
+    let limit = crate::validator::violations_limit(limit)?;
+    let after = match cursor {
+        Some(raw) => Some(kimmy_core::Cursor::decode(raw)?),
+        None => None,
+    };
+    let page = kimmy_storage::blocking(|| {
+        state.engine.unkeyed_documents(&meta, definition, after.as_ref().map(|c| c.key()), limit)
+    })?;
+    let rows: Vec<Value> = page
+        .rows
+        .iter()
+        .map(|(id, reason)| json!({ "_id": crate::json::bson_to_json(id), "reason": reason }))
+        .collect();
+    let mut body = json!({ "index": index, "unkeyed": rows, "count": rows.len() });
+    if let Some(next) = page.next {
+        body["nextCursor"] = json!(kimmy_core::Cursor::from_key(next).encode());
+    }
+    Ok(body)
+}
+
 /// The `_id` the document `id` names is stored under, and the document.
 ///
 /// A violation names its documents by key, so the report reads each one's own
@@ -2427,6 +2465,22 @@ fn write_sink(
     if is_out {
         state.engine.check_unique_output_ids(&docs)?;
     }
+    // And so are the target's indexes: an output one of them cannot key is `400`
+    // with the target as it was. A target that does not exist has none.
+    let mode = match stage {
+        aggregate::Stage::Merge(spec) => kimmy_storage::SinkMode::Merge {
+            when_matched: match spec.when_matched {
+                aggregate::WhenMatched::Replace => kimmy_storage::WhenMatched::Replace,
+                aggregate::WhenMatched::Merge => kimmy_storage::WhenMatched::Merge,
+                aggregate::WhenMatched::KeepExisting => kimmy_storage::WhenMatched::KeepExisting,
+            },
+            insert_unmatched: spec.insert_unmatched,
+        },
+        _ => kimmy_storage::SinkMode::Insert,
+    };
+    if let Some(meta) = &existing {
+        kimmy_storage::blocking(|| state.engine.check_output_indexes(meta, &docs, mode))?;
+    }
     let not_empty = |meta: &CollectionMeta| -> Result<(), ApiError> {
         let mut holds = false;
         kimmy_storage::blocking(|| {
@@ -2465,17 +2519,6 @@ fn write_sink(
             }
             Err(e) => return Err(e.into()),
         },
-    };
-    let mode = match stage {
-        aggregate::Stage::Merge(spec) => kimmy_storage::SinkMode::Merge {
-            when_matched: match spec.when_matched {
-                aggregate::WhenMatched::Replace => kimmy_storage::WhenMatched::Replace,
-                aggregate::WhenMatched::Merge => kimmy_storage::WhenMatched::Merge,
-                aggregate::WhenMatched::KeepExisting => kimmy_storage::WhenMatched::KeepExisting,
-            },
-            insert_unmatched: spec.insert_unmatched,
-        },
-        _ => kimmy_storage::SinkMode::Insert,
     };
     let outcome = kimmy_storage::blocking(|| state.engine.write_documents(&meta, docs, mode))?;
     let counts = outcome.counts;

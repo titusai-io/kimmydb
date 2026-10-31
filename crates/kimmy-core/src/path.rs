@@ -70,6 +70,61 @@ fn descend<'a>(value: &'a Bson, segs: &[&str], out: &mut Vec<&'a Bson>) {
     }
 }
 
+/// The distinct arrays `path` goes through or ends in, each named by the
+/// dotted prefix it sits at (`x` for `x.a` over `x: [{a: 1}, {a: 2}]`, and `x.a`
+/// as well when those `a` are arrays themselves).
+///
+/// An array is named by its place in the path, not by its elements, so two
+/// paths through one array (`x.a` and `x.b` over `x`) share it, which is how the
+/// reference counts the arrays a compound index spans. An array of one element
+/// is an array: it is named although the path resolves to a single value.
+pub fn array_prefixes(doc: &Document, path: &str) -> Vec<String> {
+    let segs = segments(path);
+    let mut out = std::collections::BTreeSet::new();
+    if let Some(value) = doc.get(segs[0]) {
+        visit_arrays(value, &segs, 1, &mut out);
+    }
+    out.into_iter().collect()
+}
+
+fn visit_arrays(
+    value: &Bson,
+    segs: &[&str],
+    depth: usize,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    if let Bson::Array(_) = value {
+        out.insert(segs[..depth].join("."));
+    }
+    if depth == segs.len() {
+        return;
+    }
+    let head = segs[depth];
+    match value {
+        Bson::Document(doc) => {
+            if let Some(next) = doc.get(head) {
+                visit_arrays(next, segs, depth + 1, out);
+            }
+        }
+        Bson::Array(items) => {
+            // The same two readings of a segment as `descend`.
+            if let Ok(index) = head.parse::<usize>()
+                && let Some(item) = items.get(index)
+            {
+                visit_arrays(item, segs, depth + 1, out);
+            }
+            for item in items {
+                if let Bson::Document(doc) = item
+                    && let Some(next) = doc.get(head)
+                {
+                    visit_arrays(next, segs, depth + 1, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Set a value at a dot path, creating intermediate documents as needed.
 ///
 /// Traverses existing arrays only by numeric index; it will not fan a write out
@@ -157,6 +212,21 @@ mod tests {
     use bson::doc;
 
     use super::*;
+
+    #[test]
+    fn array_prefixes_name_each_array_by_its_place_in_the_path() {
+        let d =
+            doc! { "x": [{ "a": 1, "b": [1] }, { "a": 2 }], "c": [1, 2], "n": { "m": 1 }, "e": [] };
+        assert_eq!(array_prefixes(&d, "x.a"), vec!["x"], "the array of documents");
+        assert_eq!(array_prefixes(&d, "x.b"), vec!["x", "x.b"], "and the array inside it");
+        assert_eq!(array_prefixes(&d, "c"), vec!["c"]);
+        assert_eq!(array_prefixes(&d, "e"), vec!["e"], "an empty array is an array");
+        assert!(array_prefixes(&d, "n.m").is_empty());
+        assert!(array_prefixes(&d, "missing.a").is_empty());
+        let one = doc! { "x": [{ "a": 1 }] };
+        assert_eq!(array_prefixes(&one, "x.a"), vec!["x"], "one element is still an array");
+        assert_eq!(array_prefixes(&one, "x.0.a"), vec!["x"], "a position reads the same array");
+    }
 
     fn values(doc: &Document, path: &str) -> Vec<Bson> {
         resolve(doc, path).into_iter().cloned().collect()

@@ -657,6 +657,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.index.unkeyed_refusals",
+            "{write}",
+            "Local writes and index creates refused because an index on this member could not key a document.",
+            index_unkeyed_refusals
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.ttl.skipped",
             "{document}",
             "Expiry candidates refused because the document was refreshed first.",

@@ -123,11 +123,15 @@ that uses a field a node does not know is refused with `422` and `bad_request`,
 as every request body rejects unknown fields ([ADR-121](decisions.md)); a query
 string is held to the same rule at `400` ([ADR-124](decisions.md)).
 
+**Storage schema 7 since 0.58.0 ([ADR-259](decisions.md#adr-259--the-arrays-a-compound-index-spans-are-counted-by-their-place-in-the-path-and-0580-is-a-wipe-release)): 0.58.0 refuses a store or backup written by 0.57 or older, by name, and the upgrade is stop all, wipe, start all, reseed.**
+
 **Storage schema 6 and cluster protocol 2 (0.53.0, [ADR-251](decisions.md#adr-251--binary-_id-subtypes)) make 0.53.0 the release that does not upgrade a store.** A binary `_id` is keyed with its subtype, so a schema-5 store's keys mean something else. 0.53.0 refuses, by name, a data directory or a backup written by 0.52 or older, and a peer that speaks no cluster protocol 2, and the schema 1 to 5 migrations are removed. The upgrade is stop all, wipe, start all, reseed ([Upgrades](operations.md#upgrades)); there is no mixed-version cluster. 0.52 refuses a schema-6 store, so the way back is to start 0.52.x on the data directories moved aside.
 
-**There is no mixed-version cluster to test.** Since cluster protocol 2 a member
-refuses a peer of another release at the handshake, so a release that changes
-the cluster wire needs no mixed-version test and no default for a field an older
+**There is no mixed-version cluster to test.** A member refuses a peer that speaks
+another cluster protocol at the handshake (the protocol has been 2 since 0.53.0, so it does not tell 0.53 to 0.58
+apart); what keeps releases from mixing is the store, which a build of another
+storage schema refuses by name. A release that changes the cluster wire bumps the
+protocol, and then needs no mixed-version test and no default for a field an older
 member would omit: a new field is written by every member and required, and a
 frame without it is malformed. The tests beside the protocol hold that.
 

@@ -140,8 +140,23 @@ fn render(event: &ChangeEvent, full_document: bool) -> Option<Value> {
             // document events. They are omitted rather than rendered, which is
             // what collection create/drop already did before schema changes
             // replicated — clients see data, not DDL.
-            if !entry.kind.is_document() && entry.kind != kimmy_core::OpKind::UniqueViolation {
+            if !entry.kind.is_document() && !entry.kind.is_local_observation() {
                 return None;
+            }
+            // A document an index could not key, filed unkeyed on this member
+            // (ADR-258). The document is in the body: the entry names none.
+            if entry.kind == kimmy_core::OpKind::UnkeyedDocument {
+                let detail: Option<kimmy_core::UnkeyedDocumentDetail> =
+                    entry.body.as_ref().and_then(|b| bson::deserialize_from_slice(b).ok());
+                let detail = detail?;
+                return Some(json!({
+                    "operationType": "unkeyedDocument",
+                    "resumeToken": token.encode(),
+                    "clusterTime": entry.stamp.hlc.to_string(),
+                    "index": detail.index,
+                    "documentKey": { "_id": crate::json::bson_to_json(&detail.id.to_bson()) },
+                    "reason": detail.reason,
+                }));
             }
             // A violation is not a document change and has no documentKey; it
             // reports a constraint that a merge broke. See ADR-020.
@@ -202,6 +217,7 @@ fn operation_name(kind: kimmy_core::OpKind) -> &'static str {
         kimmy_core::OpKind::ConfigureVectors => "configureVectors",
         kimmy_core::OpKind::ConfigureValidator => "configureValidator",
         kimmy_core::OpKind::UniqueViolation => "uniqueViolation",
+        kimmy_core::OpKind::UnkeyedDocument => "unkeyedDocument",
     }
 }
 
@@ -261,5 +277,25 @@ mod tests {
         let subtypes: Vec<&Value> = keys.iter().map(|k| &k["_id"]["$binary"]["subType"]).collect();
         assert_eq!(subtypes, ["00", "04"], "{event}");
         assert_eq!(event["merged"]["$binary"]["subType"], "04", "{event}");
+    }
+
+    /// An `unkeyedDocument` event names the index, the document with its binary
+    /// subtype, and why, and carries the usual token and time.
+    #[test]
+    fn an_unkeyed_event_names_the_index_the_document_and_the_reason() {
+        let detail = kimmy_core::UnkeyedDocumentDetail {
+            index: "tags_1_sizes_1".into(),
+            id: binary(0x04),
+            reason: "parallel_arrays".into(),
+        };
+        let body = bson::serialize_to_vec(&detail).unwrap();
+        let mut unkeyed = entry(OpKind::UnkeyedDocument, binary(0x04), Some(body));
+        unkeyed.doc_id = None;
+        let event = rendered(unkeyed);
+        assert_eq!(event["operationType"], "unkeyedDocument", "{event}");
+        assert_eq!(event["index"], "tags_1_sizes_1", "{event}");
+        assert_eq!(event["reason"], "parallel_arrays", "{event}");
+        assert_eq!(event["documentKey"]["_id"]["$binary"]["subType"], "04", "{event}");
+        assert!(event["resumeToken"].is_string() && event["clusterTime"].is_string(), "{event}");
     }
 }

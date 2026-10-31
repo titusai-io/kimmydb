@@ -63,6 +63,14 @@ pub enum OpKind {
     /// A collection's validator was set, replaced or removed. Body:
     /// [`crate::ValidatorSet`].
     ConfigureValidator,
+    /// This member filed a document unkeyed under an index. Body:
+    /// [`crate::UnkeyedDocumentDetail`].
+    ///
+    /// Not a mutation, and local like [`OpKind::UniqueViolation`]: every
+    /// member that files the document unkeyed reports it under its own stamp,
+    /// so it **must not be replicated**. Carries no `doc_id`; the document is
+    /// named in the body.
+    UnkeyedDocument,
 }
 
 impl OpKind {
@@ -77,6 +85,12 @@ impl OpKind {
                 | Self::ConfigureVectors
                 | Self::ConfigureValidator
         )
+    }
+
+    /// Whether this entry is a member's own observation of its data, written
+    /// to the oplog so change streams carry it, and never shipped to a peer.
+    pub fn is_local_observation(self) -> bool {
+        matches!(self, Self::UniqueViolation | Self::UnkeyedDocument)
     }
 
     /// Whether this entry carries a document change to merge.

@@ -2276,100 +2276,227 @@ async fn indexed_count_on(client: &reqwest::Client, node: &Node, token: &str) ->
     (body["explain"]["strategy"] == "index").then(|| body["count"].as_u64()).flatten()
 }
 
-#[tokio::test]
-#[ignore = "boots a real three-node cluster; run with --ignored"]
-async fn every_member_files_an_unkeyable_document_the_same_way() {
-    // The finding on a live cluster: a Decimal128 document written to one
-    // member was filed under a real key there and unkeyed on both peers,
-    // because the member's JSON edge left `$numberDecimal` a nested
-    // document while every re-decode of the stored bytes held a Decimal128.
-    // A `Decimal128` has a key now, and is written beside the shapes an index
-    // still cannot key to keep the finding pinned: every node must report the
-    // same `unkeyed` (the two shapes that cannot be keyed, not the decimal) and
-    // count all three documents through the index — and again for the mirror
-    // order, an index created after the documents have replicated.
-    let client = reqwest::Client::new();
-    let (a, b, c) = three_nodes(&client).await;
-    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+/// Every `unkeyedDocument` event the stream carries until it has been quiet for `quiet`.
+async fn unkeyed_events_until_quiet(feed: &mut Feed, quiet: Duration) -> Vec<serde_json::Value> {
+    use futures::StreamExt;
+    let mut events = Vec::new();
+    while let Ok(Some(Ok(message))) = tokio::time::timeout(quiet, feed.next()).await {
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else { continue };
+        let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if event["operationType"] == "unkeyedDocument" {
+            events.push(event);
+        }
+    }
+    events
+}
 
-    let token = a.login(&client).await;
-    client
-        .post(a.url("/v1/db/shop/collections"))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({ "name": "ledger" }))
+/// The `_id`s an index lists as unkeyed on one node, if the node answers.
+async fn unkeyed_list_on(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    index: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let res = client
+        .get(node.url(&format!("/v1/db/shop/coll/ledger/indexes/{index}/unkeyed")))
+        .bearer_auth(token)
         .send()
         .await
-        .unwrap();
-    let created = client
-        .post(a.url("/v1/db/shop/coll/ledger/indexes"))
-        .bearer_auth(&token)
+        .ok()?;
+    let body = res.json::<serde_json::Value>().await.ok()?;
+    Some(body["unkeyed"].as_array()?.iter().map(|row| row["_id"].clone()).collect())
+}
+
+/// A cluster with `shop.ledger` on every member and C cut off from A and B.
+async fn ledger_with_c_cut_off(client: &reqwest::Client) -> (Node, Node, Node) {
+    let (mut a, mut b, mut c) = three_nodes(client).await;
+    eventually("gossip to form", || all_report(client, vec![&a, &b, &c], 2)).await;
+    let a_token = a.login(client).await;
+    create_collection_on(client, &a, &a_token, serde_json::json!({ "name": "ledger" })).await;
+    for node in [&b, &c] {
+        let token = node.login(client).await;
+        eventually("the collection to reach the member", || {
+            let (node, token) = (node, &token);
+            async move { validator_on(client, node, token, "ledger").await.is_some() }
+        })
+        .await;
+    }
+    let addr = |n: &Node| format!("127.0.0.1:{}", n.cluster);
+    c.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &format!("{},{}", addr(&a), addr(&b)))]);
+    a.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &addr(&c))]);
+    b.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &addr(&c))]);
+    for node in [&a, &b, &c] {
+        node.wait_ready(client).await;
+    }
+    (a, b, c)
+}
+
+async fn create_ab_index(client: &reqwest::Client, node: &Node, token: &str) -> u16 {
+    client
+        .post(node.url("/v1/db/shop/coll/ledger/indexes"))
+        .bearer_auth(token)
         .json(&serde_json::json!({ "name": "ab", "fields": [{ "path": "a" }, { "path": "b" }] }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(created.status(), 200);
+        .unwrap()
+        .status()
+        .as_u16()
+}
 
-    let shapes = [
-        serde_json::json!({ "_id": 1, "a": [1, 2], "b": [3, 4] }),
-        serde_json::json!({ "_id": 2, "a": (0..1_000).collect::<Vec<i32>>(), "b": 5 }),
-        serde_json::json!({ "_id": 3, "a": 1, "b": { "$numberDecimal": "1.5" } }),
-    ];
-    for shape in &shapes {
-        let res = client
-            .post(a.url("/v1/db/shop/coll/ledger/docs"))
-            .bearer_auth(&token)
-            .json(shape)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200, "stored, not refused: {}", res.text().await.unwrap());
-    }
-
-    let tokens = [a.login(&client).await, b.login(&client).await, c.login(&client).await];
-    let nodes = [&a, &b, &c];
-    eventually(
-        "every node to file the two unkeyable documents unkeyed and count all three",
-        || {
-            let client = &client;
-            let tokens = &tokens;
+/// Every member lists exactly document 7 as unkeyed under `ab`, counts it through the index,
+/// and has announced it exactly once on its own stream.
+async fn every_member_has_filed_and_announced_document_7(
+    client: &reqwest::Client,
+    members: [(&Node, &str, &mut Feed); 3],
+) {
+    for (node, token, feed) in members {
+        eventually("the member to file document 7 unkeyed", || {
+            let (client, node, token) = (client, node, token);
             async move {
-                for (node, token) in nodes.iter().zip(tokens) {
-                    if unkeyed_on(client, node, token, "ab").await != Some(2) {
-                        return false;
-                    }
-                    if indexed_count_on(client, node, token).await != Some(3) {
-                        return false;
-                    }
-                }
-                true
+                unkeyed_list_on(client, node, token, "ab").await == Some(vec![serde_json::json!(7)])
+                    && unkeyed_on(client, node, token, "ab").await == Some(1)
+                    && indexed_count_on(client, node, token).await == Some(1)
             }
-        },
-    )
-    .await;
+        })
+        .await;
+        let events = unkeyed_events_until_quiet(feed, Duration::from_secs(2)).await;
+        assert_eq!(events.len(), 1, "{}: one event for the one document: {events:?}", node.name);
+        assert_eq!(events[0]["index"], "ab", "{}", node.name);
+        assert_eq!(events[0]["documentKey"], serde_json::json!({ "_id": 7 }), "{}", node.name);
+        assert_eq!(events[0]["reason"], "parallel_arrays", "{}", node.name);
+    }
+}
 
-    // The mirror order: the documents are everywhere already, and a new
-    // index over them is backfilled on every node from the bytes it holds.
-    let created = client
-        .post(a.url("/v1/db/shop/coll/ledger/indexes"))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({ "name": "ba", "fields": [{ "path": "b" }, { "path": "a" }] }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(created.status(), 200);
-    eventually("every node to backfill the second index the same way", || {
-        let client = &client;
-        let tokens = &tokens;
-        async move {
-            for (node, token) in nodes.iter().zip(tokens) {
-                if unkeyed_on(client, node, token, "ba").await != Some(2) {
-                    return false;
-                }
-            }
-            true
-        }
+/// The member that took the write refuses it where it holds the index, and the one that does
+/// not hold the index yet accepts it. The document then reaches the member that holds the
+/// index by replication, which files it unkeyed and announces it; the member that took it
+/// receives the definition over a document it cannot key, and does the same.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_document_accepted_before_the_index_arrived_is_filed_unkeyed_and_announced_everywhere() {
+    let client = reqwest::Client::new();
+    let (mut a, mut b, mut c) = ledger_with_c_cut_off(&client).await;
+    let (a_token, b_token, c_token) =
+        (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+
+    assert_eq!(create_ab_index(&client, &a, &a_token).await, 200);
+    eventually("the index to reach B", || {
+        let (client, b, token) = (&client, &b, &b_token);
+        async move { unkeyed_on(client, b, token, "ab").await == Some(0) }
     })
     .await;
+    assert_eq!(unkeyed_on(&client, &c, &c_token, "ab").await, None, "C has not received it");
+
+    // The same document: refused where the index is, accepted where it has not arrived.
+    let bad = serde_json::json!({ "_id": 7, "a": [1, 2], "b": [3, 4] });
+    let docs = |node: &Node| node.url("/v1/db/shop/coll/ledger/docs");
+    let on_a = client.post(docs(&a)).bearer_auth(&a_token).json(&bad).send().await.unwrap();
+    assert_eq!(on_a.status(), 400);
+    let refusal: serde_json::Value = on_a.json().await.unwrap();
+    assert!(
+        refusal["message"].as_str().unwrap().contains("cannot index parallel arrays [b] [a]"),
+        "{refusal}"
+    );
+    assert_eq!(insert_status_at(&client, &docs(&b), &b_token, &bad).await, 400);
+    assert_eq!(insert_status_at(&client, &docs(&c), &c_token, &bad).await, 200);
+
+    // C rejoins.
+    for node in [&mut a, &mut b, &mut c] {
+        node.restart_with(&[]);
+    }
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    let (a_token, b_token, c_token) =
+        (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+    let (mut feed_a, mut feed_b, mut feed_c) = (
+        open_ledger_feed_from_start(&a, &a_token).await,
+        open_ledger_feed_from_start(&b, &b_token).await,
+        open_ledger_feed_from_start(&c, &c_token).await,
+    );
+    every_member_has_filed_and_announced_document_7(
+        &client,
+        [
+            (&a, a_token.as_str(), &mut feed_a),
+            (&b, b_token.as_str(), &mut feed_b),
+            (&c, c_token.as_str(), &mut feed_c),
+        ],
+    )
+    .await;
+}
+
+/// A definition that reaches a member holding a document it cannot key is built there, the
+/// document filed unkeyed and announced; the member that created the index never held it.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn an_index_that_arrives_over_a_document_it_cannot_key_is_built_and_announced() {
+    let client = reqwest::Client::new();
+    let (mut a, mut b, mut c) = ledger_with_c_cut_off(&client).await;
+    let (a_token, c_token) = (a.login(&client).await, c.login(&client).await);
+
+    // C takes the document while no index exists anywhere it can see, and A creates the index
+    // over a collection that does not hold it.
+    let bad = serde_json::json!({ "_id": 7, "a": [1, 2], "b": [3, 4] });
+    let url = c.url("/v1/db/shop/coll/ledger/docs");
+    assert_eq!(insert_status_at(&client, &url, &c_token, &bad).await, 200);
+    assert_eq!(create_ab_index(&client, &a, &a_token).await, 200);
+
+    for node in [&mut a, &mut b, &mut c] {
+        node.restart_with(&[]);
+    }
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    let (a_token, b_token, c_token) =
+        (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+    let (mut feed_a, mut feed_b, mut feed_c) = (
+        open_ledger_feed_from_start(&a, &a_token).await,
+        open_ledger_feed_from_start(&b, &b_token).await,
+        open_ledger_feed_from_start(&c, &c_token).await,
+    );
+    every_member_has_filed_and_announced_document_7(
+        &client,
+        [
+            (&a, a_token.as_str(), &mut feed_a),
+            (&b, b_token.as_str(), &mut feed_b),
+            (&c, c_token.as_str(), &mut feed_c),
+        ],
+    )
+    .await;
+}
+
+async fn insert_status_at(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    doc: &serde_json::Value,
+) -> u16 {
+    client.post(url).bearer_auth(token).json(doc).send().await.unwrap().status().as_u16()
+}
+
+/// A change stream on `shop.ledger` at `node` that replays the retained log.
+async fn open_ledger_feed_from_start(node: &Node, bearer: &str) -> Feed {
+    let (socket, _) = tokio_tungstenite::connect_async(
+        tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(format!(
+                "ws://127.0.0.1:{}/v1/db/shop/coll/ledger/watch?from_start=true",
+                node.http
+            ))
+            .header("Host", format!("127.0.0.1:{}", node.http))
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .body(())
+            .unwrap(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("opening a change stream on {}: {e}", node.name));
+    socket
 }
 
 // ---------------------------------------------------------------------------

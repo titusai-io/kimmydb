@@ -1429,11 +1429,13 @@ mod tests {
     #[test]
     fn a_first_open_stopped_after_any_of_its_commits_leaves_a_store_that_opens() {
         // After the tables: no schema in META, the sidecar still at schema 0.
-        // After the sidecar's schema: no schema in META, the sidecar at 6.
+        // After the sidecar's schema: no schema in META, the sidecar at the current schema.
         // And with no sidecar at all, for a store copied without it.
-        for (what, sidecar_schema) in
-            [("tables only", Some(0u8)), ("sidecar raised", Some(6)), ("no sidecar", None)]
-        {
+        for (what, sidecar_schema) in [
+            ("tables only", Some(0u8)),
+            ("sidecar raised", Some(crate::migrate::SCHEMA_VERSION)),
+            ("no sidecar", None),
+        ] {
             let (_dir, path) = a_store();
             without_a_schema(&path);
             match sidecar_schema {

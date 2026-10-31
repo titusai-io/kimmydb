@@ -38,6 +38,22 @@ impl UniqueViolationDetail {
     }
 }
 
+/// A document an index could not key, filed under the index's unkeyed run.
+///
+/// The payload of the `unkeyedDocument` event. A replicated write or a
+/// replicated definition is accepted whatever it holds (ADR-139), so this
+/// reports what the member did instead of refusing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UnkeyedDocumentDetail {
+    /// The index that could not key the document.
+    pub index: String,
+    /// The document filed unkeyed.
+    pub id: DocId,
+    /// Why, as a short stable name: `parallel_arrays`, `too_many_keys` or
+    /// `unencodable`.
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +67,18 @@ mod tests {
         );
         let bytes = bson::serialize_to_vec(&detail).unwrap();
         let back: UniqueViolationDetail = bson::deserialize_from_slice(&bytes).unwrap();
+        assert_eq!(back, detail);
+    }
+
+    #[test]
+    fn an_unkeyed_detail_round_trips_through_bson() {
+        let detail = UnkeyedDocumentDetail {
+            index: "tags_1_sizes_1".into(),
+            id: DocId::Int64(1),
+            reason: "parallel_arrays".into(),
+        };
+        let bytes = bson::serialize_to_vec(&detail).unwrap();
+        let back: UnkeyedDocumentDetail = bson::deserialize_from_slice(&bytes).unwrap();
         assert_eq!(back, detail);
     }
 

@@ -1192,7 +1192,7 @@ impl Engine {
             return Ok(false);
         }
         let txn = self.begin_write(WriterHolder::Replication)?;
-        let RemoteApplied::Applied { id, violations, .. } =
+        let RemoteApplied::Applied { id, violations, unkeyed, .. } =
             self.apply_remote_in_txn(&txn, coll, entry, Position::Raise)?
         else {
             // Nothing was written, so nothing is committed — a superseded
@@ -1201,8 +1201,14 @@ impl Engine {
             return Ok(false);
         };
         txn.commit()?;
-        let published =
-            self.report_remote_write(WriterHolder::Replication, coll, entry, &id, &violations)?;
+        let published = self.report_remote_write(
+            WriterHolder::Replication,
+            coll,
+            entry,
+            &id,
+            &violations,
+            &unkeyed,
+        )?;
         self.publish(published);
         Ok(true)
     }
@@ -1250,7 +1256,7 @@ impl Engine {
             None => DocRecord::tombstone(entry.stamp),
         };
 
-        let violations = {
+        let (violations, filings) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             let existing = match docs.get((coll.id.0, key.as_slice()))? {
                 Some(raw) => Some(codec::decode_doc_record(raw.value())?),
@@ -1293,7 +1299,12 @@ impl Engine {
                     // The entry joins this member's oplog.
                     let released = crate::engine::append_oplog_at(txn, entry, position)?;
                     self.witness(&entry.stamp);
-                    return Ok(RemoteApplied::Applied { id, violations: Vec::new(), released });
+                    return Ok(RemoteApplied::Applied {
+                        id,
+                        violations: Vec::new(),
+                        unkeyed: Vec::new(),
+                        released,
+                    });
                 }
                 // Superseded, but in a window contiguous from this node's
                 // position: an entry this node holds as state (ADR-160) has
@@ -1338,7 +1349,7 @@ impl Engine {
             // multikey flag an earlier entry set is seen by the next one even
             // though `coll` was resolved from the last committed state.
             let next = winner.document()?;
-            let (violations, newly_multikey) =
+            let (violations, newly_multikey, filings) =
                 index::maintain_remote(self, txn, coll, previous.as_ref(), next.as_ref(), &key)?;
             // A replicated array write makes this node's index multikey exactly
             // as a local one would — the planner here answers queries over the
@@ -1357,7 +1368,7 @@ impl Engine {
             {
                 crate::vectors::bump_vector_renames(txn, &[coll.id])?;
             }
-            violations
+            (violations, filings)
         };
 
         let released = crate::engine::append_oplog_at(txn, entry, position)?;
@@ -1366,7 +1377,13 @@ impl Engine {
         // local write is ordered after it.
         self.witness(&entry.stamp);
 
-        Ok(RemoteApplied::Applied { id, violations, released })
+        // This member's own report of the documents it filed unkeyed, after
+        // the write's entry so a stream reads the document before the news of
+        // it, and in the same transaction: the report and the filing commit
+        // together or not at all, and cost no commit of their own.
+        let unkeyed = self.append_unkeyed(txn, unkeyed_details(coll.id, &id, &filings))?;
+
+        Ok(RemoteApplied::Applied { id, violations, unkeyed, released })
     }
 
     /// The part of a replicated write that must follow its commit: count and
@@ -1402,6 +1419,7 @@ impl Engine {
         entry: &OplogEntry,
         id: &DocId,
         violations: &[index::UniqueViolation],
+        unkeyed: &[OplogEntry],
     ) -> Result<Vec<OplogEntry>> {
         // Ahead of the violation work, which can fail: a report that errors
         // out is still a write that landed, and the index must hear of it.
@@ -1420,6 +1438,7 @@ impl Engine {
             );
             published.push(self.log_unique_violation(holder, coll, id, violation)?);
         }
+        published.extend(unkeyed.iter().cloned());
         Ok(published)
     }
 
@@ -1491,6 +1510,26 @@ impl Engine {
     }
 }
 
+/// The `unkeyedDocument` details for one applied document: one per index it
+/// was moved into the unkeyed run of.
+pub(crate) fn unkeyed_details(
+    collection: CollectionId,
+    id: &DocId,
+    filings: &[index::UnkeyedFiling],
+) -> Vec<(CollectionId, kimmy_core::UnkeyedDocumentDetail)> {
+    filings
+        .iter()
+        .map(|filing| {
+            let detail = kimmy_core::UnkeyedDocumentDetail {
+                index: filing.index.clone(),
+                id: id.clone(),
+                reason: filing.cause.as_str().to_string(),
+            };
+            (collection, detail)
+        })
+        .collect()
+}
+
 /// What [`Engine::apply_remote_in_txn`] decided, and what it left for after
 /// the commit.
 #[derive(Debug)]
@@ -1505,6 +1544,10 @@ pub(crate) enum RemoteApplied {
         /// recorded yet: [`Engine::report_remote_write`] does both once the
         /// write is durable.
         violations: Vec<index::UniqueViolation>,
+        /// The `unkeyedDocument` entries the write appended, one per index it
+        /// moved the document into the unkeyed run of. Durable with the write;
+        /// [`Engine::report_remote_write`] publishes them once it commits.
+        unkeyed: Vec<OplogEntry>,
         /// Whether its append met the entry already in the oplog and released
         /// a held mark there (ADR-169), for the caller to count on commit.
         released: bool,
@@ -1840,6 +1883,37 @@ impl Engine {
         append_oplog(&txn, &entry)?;
         txn.commit()?;
         Ok(entry)
+    }
+
+    /// Append, into the caller's transaction, the oplog entries that carry
+    /// documents filed unkeyed to change streams, and return them for the
+    /// caller to publish once it commits.
+    ///
+    /// Local like a violation's entry: this member's own observation,
+    /// stamped under the writer, never shipped to a peer. Unlike a
+    /// violation's it goes in the transaction that filed the document, which
+    /// is the only place the transition into the unkeyed run is known, so a
+    /// crash cannot leave a document filed and never reported, and a
+    /// run of replicated writes does not pay a commit for it. Nothing is
+    /// counted here: the filing was counted when it was made.
+    pub(crate) fn append_unkeyed(
+        &self,
+        txn: &WriteTxn<'_>,
+        details: Vec<(CollectionId, kimmy_core::UnkeyedDocumentDetail)>,
+    ) -> Result<Vec<OplogEntry>> {
+        let mut entries = Vec::with_capacity(details.len());
+        for (collection, detail) in details {
+            let entry = OplogEntry {
+                stamp: self.next_stamp(),
+                kind: OpKind::UnkeyedDocument,
+                collection,
+                doc_id: None,
+                body: Some(bson::serialize_to_vec(&detail)?),
+            };
+            append_oplog(txn, &entry)?;
+            entries.push(entry);
+        }
+        Ok(entries)
     }
 
     /// The `_id` of the document stored under an encoded key.

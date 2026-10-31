@@ -1677,11 +1677,11 @@ impl EmbeddingWorker {
         // batch, which is the span that explains why a document's vectors
         // are minutes behind its write.
         //
-        // Not every oplog entry describes a mutation. A unique-violation entry
-        // reports something that happened *to* the data and has nothing to
-        // embed. It would be filtered by the `doc_id` check below anyway, but
-        // relying on that would make the safety incidental.
-        if entry.kind == OpKind::UniqueViolation {
+        // Not every oplog entry describes a mutation. A unique-violation or an
+        // unkeyed-document entry reports something that happened *to* the data
+        // and has nothing to embed. It would be filtered by the `doc_id` check
+        // below anyway, but relying on that would make the safety incidental.
+        if entry.kind.is_local_observation() {
             return Ok(Prepared::Done(Outcome::Skipped));
         }
 

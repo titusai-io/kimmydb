@@ -22,14 +22,19 @@ use crate::tables;
 /// is now the id's own. An older store's binary keys mean something else, and
 /// nothing rewrites them: this build refuses an older store by name and the
 /// operator wipes and reseeds.
-pub const SCHEMA_VERSION: u8 = 6;
+///
+/// **7 (ADR-259) changes how a compound index counts the arrays its paths go
+/// through.** A schema-6 store holds index entries for documents the new rule
+/// files unkeyed, and a later write to one would leave them behind. Nothing
+/// rewrites them: this build refuses a schema-6 store and backup by name.
+pub const SCHEMA_VERSION: u8 = 7;
 
 /// What a refusal of a store or backup of an older schema tells the operator.
 pub(crate) fn no_upgrade() -> String {
     format!(
         "{} does not upgrade stores; stop every member, wipe this data directory, start on an \
          empty one and reseed.",
-        kimmy_core::build::SCHEMA_6_RELEASE
+        kimmy_core::build::SCHEMA_7_RELEASE
     )
 }
 
@@ -283,6 +288,32 @@ mod tests {
         assert!(snapshot(&path) == before, "the store or its sidecar changed");
     }
 
+    /// The store 0.57.0 wrote (schema 6) holds index entries derived under the
+    /// old array rule (ADR-259): 0.58.0 refuses it by name and writes nothing.
+    #[test]
+    fn a_schema_6_store_is_refused_by_name_and_nothing_is_written() {
+        let (_dir, path) = a_schema_5_store();
+        {
+            let db = Database::create(&path).unwrap();
+            write_version(&db, 6).unwrap();
+        }
+        let mut sidecar = read_sidecar(&path).expect("a sidecar");
+        sidecar.schema = 6;
+        sidecar.written_by = "0.57.0".into();
+        write_sidecar(&path, &sidecar).unwrap();
+        let before = snapshot(&path);
+        match Engine::open(&path) {
+            Err(StorageError::RefusedStore { kind: RefusedKind::Older, why }) => {
+                assert!(why.contains("0.57.0"), "{why}");
+                assert!(why.contains("storage schema 6"), "{why}");
+                assert!(why.contains("0.58.0 does not upgrade stores"), "{why}");
+            }
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened a schema 6 store"),
+        }
+        assert!(snapshot(&path) == before, "the store or its sidecar changed");
+    }
+
     /// With no sidecar the read-only fallback reads META: the same refusal.
     #[test]
     fn a_schema_5_store_with_no_sidecar_is_refused_by_name_and_nothing_is_written() {
@@ -326,7 +357,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         drop(Engine::open(&path).unwrap());
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
         let db = Database::create(&path).unwrap();
         assert_eq!(stored_version(&db).unwrap(), Some(SCHEMA_VERSION));
     }

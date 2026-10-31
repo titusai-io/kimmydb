@@ -34,7 +34,7 @@ pub mod version;
 mod json_schema_tests;
 
 pub use cmp::{canonical_cmp, holds_decimal128};
-pub use conflict::UniqueViolationDetail;
+pub use conflict::{UniqueViolationDetail, UnkeyedDocumentDetail};
 pub use cursor::Cursor;
 pub use ddl::{
     CollectionCreate, CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, ValidatorSet,
