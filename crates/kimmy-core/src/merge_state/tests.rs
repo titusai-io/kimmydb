@@ -1058,6 +1058,28 @@ fn upsert_soi_is_create_then_inc() {
     assert!(parts.upsert_soi_create(&fields, &sets, 0).is_none());
 }
 
+#[test]
+fn upsert_with_conflicting_paths_is_refused_whole() {
+    // `$setOnInsert`, `$set` and `$inc` on one path conflict: nothing is written.
+    type Case<'a> = (&'a [(&'a str, Value)], &'a str, &'a [(&'a str, Value)]);
+    let cases: [Case; 3] = [
+        (&[("x", s("a"))], "x", &[]),            // $setOnInsert vs $inc
+        (&[], "x", &[("x", i(1))]),              // $set vs $inc
+        (&[("y", s("a"))], "x", &[("y", i(1))]), // $setOnInsert vs $set
+    ];
+    for (fields, inc, sets) in cases {
+        let mut w = Writer::new(wid('A', 0), opts());
+        assert!(w.upsert_soi(fields, inc, 1, sets, 0).is_none());
+        assert!(w.state.lives.is_empty() && w.state.regs.is_empty() && w.state.slots.is_empty());
+        assert_eq!(w.clock, Hlc::ZERO);
+    }
+    // The increment step alone also refuses a path the creation wrote.
+    let mut w = Writer::new(wid('A', 0), opts());
+    let c = w.upsert_soi_create(&[("x", s("a"))], &[], 0).unwrap();
+    assert!(w.upsert_inc_on(c.stamp, "x", 1, 0).is_none());
+    assert!(w.upsert_inc_on(c.stamp, "z", 1, 0).is_some());
+}
+
 // ---- B1: a counter that returns to exactly 0 stays in the document ---------------------
 
 #[test]

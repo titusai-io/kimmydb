@@ -204,7 +204,8 @@ impl Writer {
     }
 
     /// V6m2/V7m2/V8: an upsert that creates the document with `$setOnInsert`
-    /// `fields`, applies `$set` `sets` and `$inc` `inc_path` by `n`. It is two
+    /// `fields`, applies `$set` `sets` and `$inc` `inc_path` by `n`; the three path
+    /// lists must be disjoint (a conflicting update is refused, `None`). It is two
     /// sequential local writes by one writer: the creation (the life and its
     /// cells, the `$setOnInsert` cells tagged) and the increment, each with its
     /// own stamp. Only the tagged cells can be dropped.
@@ -216,6 +217,14 @@ impl Writer {
         sets: &[(&str, Value)],
         skew: u64,
     ) -> Option<(Written, Written)> {
+        // `$setOnInsert`, `$set` and `$inc` on one path conflict: the update is refused whole,
+        // before anything is written.
+        let mut paths: Vec<&str> =
+            fields.iter().chain(sets.iter()).map(|(q, _)| *q).chain([inc_path]).collect();
+        paths.sort_unstable();
+        if paths.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
         let created = self.upsert_soi_create(fields, sets, skew)?;
         let life = created.stamp;
         let incd = self.upsert_inc_on(life, inc_path, n, skew)?;
@@ -282,7 +291,7 @@ impl Writer {
 
     /// The increment write of an upsert on the life `life` (the stamp of its
     /// creation write): a slot of `path` for this writer, with the write's own
-    /// stamp. Refused (`None`) unless `life` is alive.
+    /// stamp. Refused (`None`) unless `life` is alive and its creation did not write `path`.
     pub fn upsert_inc_on(
         &mut self,
         life: MStamp,
@@ -291,6 +300,11 @@ impl Writer {
         skew: u64,
     ) -> Option<Written> {
         if !self.state.alive(&self.opts).contains(&life) {
+            return None;
+        }
+        // The creation wrote this path as a register: a counter slot beside it would belong to
+        // no generation of that base (the update conflicts and is refused).
+        if self.state.regs.contains_key(&(life, path.to_string())) {
             return None;
         }
         let st2 = self.tick(skew);
