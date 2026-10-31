@@ -2,9 +2,10 @@
 //! on the pull protocol and, where one exists, by its named probe. A mutant
 //! must be KILLED: failed by the random runs, or by its probe.
 //!
-//! The V3M3 and V4M1 mutants and the `$setOnInsert` suppression mutant use
-//! test-only switches (`JoinOptions::v3_generation`, `SimFlags::hidden_records`,
-//! `JoinOptions::suppress_soi`).
+//! The V3M3, V4M1, B1 and M1 mutants and the `$setOnInsert` suppression mutant use
+//! test-only switches (`JoinOptions::set_v3_generation`, `SimFlags::hidden_records`,
+//! `JoinOptions::set_value_ignores_slot_stamp`, `JoinOptions::set_creation_without_generation`,
+//! `JoinOptions::set_suppress_soi`).
 
 use std::time::Instant;
 
@@ -119,6 +120,18 @@ pub fn mutants() -> Vec<Mutant> {
         Mutant {
             name: "writes into a superseded first insert not reported  [V6M1]",
             apply: |c| c.opts.set_cells_reported(false),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "a counter that nets to zero is absent again  [B1]",
+            apply: |c| c.opts.set_value_ignores_slot_stamp(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "a non-numeric upsert creation value starts no generation  [M1]",
+            apply: |c| c.opts.set_creation_without_generation(true),
             grader: Random { restore: true },
             probe: None,
         },

@@ -239,6 +239,8 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
+    // The design mutants of section 17 (14) and the B1 and M1 rules (2): a removed one must be noticed.
+    assert_eq!(mutants::mutants().len(), 16, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
