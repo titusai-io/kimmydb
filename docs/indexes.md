@@ -203,7 +203,10 @@ answered from the index, and a unique index enforces on it; the storage schema 5
 migration rebuilds every index, and a decimal leaves the unkeyed run there.
 
 MongoDB refuses the first ("cannot index parallel arrays"), and so does
-KimmyDB, **on the member that takes the write**. A local insert, bulk insert,
+KimmyDB (the arrays are counted by where they sit in the path, as the reference
+counts them: `{x.a, c}` over `{x: [{a: 1}, {a: 2}], c: [1, 2]}` has an array at `x`
+and one at `c`, and is refused, even a one-element `x`; `{x.a, x.b}` over one
+array `x` is one array and is allowed; [ADR-259](decisions.md)), **on the member that takes the write**. A local insert, bulk insert,
 replace, upsert, update, `find_and_modify` or `$merge`/`$out` write that an index
 on that member cannot key is a `400 bad_request`, checked on the document the
 write would store, inside the transaction that stores it, so nothing is

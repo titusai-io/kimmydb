@@ -879,3 +879,77 @@ fn a_repeat_the_partial_filter_does_not_select_once_merged_is_accepted() {
     assert_eq!((counts.inserted, counts.merged), (1, 1));
     assert_eq!(e.unkeyed_count(&c, c.index("ab").unwrap().id).unwrap(), 0);
 }
+
+/// Arrays of documents at one indexed path and an array at the other: the
+/// reference's parallel arrays, which `x.a` resolving to scalars hid.
+fn fanned() -> Document {
+    doc! { "x": [{ "a": 1 }, { "a": 2 }], "c": [1, 2] }
+}
+
+fn nested_index(e: &Engine, unique: bool) -> CollectionMeta {
+    e.create_collection("shop", "c").unwrap();
+    e.create_index("shop", "c", fields(&["x.a", "c"]), unique, Some("ab".into())).unwrap();
+    e.get_collection("shop", "c").unwrap()
+}
+
+#[test]
+fn a_path_through_an_array_of_documents_and_an_array_are_parallel_arrays() {
+    let (e, _d) = open();
+    let c = nested_index(&e, false);
+    let message = refusal(e.insert(&c, with_id(1, fanned())).unwrap_err());
+    assert!(message.starts_with("cannot index parallel arrays [c] [x.a]"), "{message}");
+    // A single-element array of documents is an array too.
+    let message =
+        refusal(e.insert(&c, doc! { "_id": 2i64, "x": [{ "a": 1 }], "c": [1, 2] }).unwrap_err());
+    assert!(message.contains("cannot index parallel arrays"), "{message}");
+    // One array is accepted, and two paths through one array are accepted.
+    e.insert(&c, doc! { "_id": 3i64, "x": [{ "a": 1 }, { "a": 2 }], "c": 5 }).unwrap();
+    e.create_collection("shop", "d").unwrap();
+    e.create_index("shop", "d", fields(&["x.a", "x.b"]), false, Some("xy".into())).unwrap();
+    let d = e.get_collection("shop", "d").unwrap();
+    e.insert(&d, doc! { "_id": 1i64, "x": [{ "a": 1, "b": 2 }, { "a": 3, "b": 4 }] }).unwrap();
+}
+
+#[test]
+fn a_unique_index_refuses_the_nested_parallel_arrays_locally_and_counts_it() {
+    let (e, _d) = open();
+    let c = nested_index(&e, true);
+    let message = refusal(e.insert(&c, with_id(1, fanned())).unwrap_err());
+    assert!(message.contains("a unique index must be able to key every document"), "{message}");
+    assert_eq!(e.unkeyed_refusals(), 1);
+}
+
+#[test]
+fn a_local_create_over_nested_parallel_arrays_lists_them_and_creates_nothing() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    e.insert(&c, with_id(1, fanned())).unwrap();
+    let message = refusal(
+        e.create_index("shop", "c", fields(&["x.a", "c"]), false, Some("ab".into())).unwrap_err(),
+    );
+    assert!(message.contains("cannot index parallel arrays"), "{message}");
+    assert!(e.get_collection("shop", "c").unwrap().index("ab").is_none());
+    assert_eq!(e.unkeyed_refusals(), 1);
+}
+
+#[test]
+fn a_replicated_nested_parallel_arrays_document_is_filed_unkeyed_and_announced() {
+    let (e, _d) = open();
+    let c = nested_index(&e, false);
+    assert!(e.apply_remote(&c, &remote(&c, 5, now_ms(), fanned())).unwrap());
+    assert_eq!(unkeyed_of(&e, &c), 1);
+    let named: Vec<(DocId, String)> = events(&e).into_iter().map(|d| (d.id, d.reason)).collect();
+    assert_eq!(named, vec![(DocId::Int64(5), "parallel_arrays".to_string())]);
+}
+
+#[test]
+fn write_documents_refuses_nested_parallel_arrays_before_its_first_chunk() {
+    let (e, _d) = open();
+    let c = nested_index(&e, false);
+    let output = vec![doc! { "_id": 1i64, "x": [{ "a": 1 }], "c": 1 }, with_id(2, fanned())];
+    let message = refusal(e.write_documents(&c, output, SinkMode::Insert).unwrap_err());
+    assert!(message.contains("cannot index parallel arrays"), "{message}");
+    assert!(message.ends_with("output document 1"), "{message}");
+    assert_eq!(e.count(&c, crate::WalkScope::Request).unwrap(), 0, "nothing was written");
+}

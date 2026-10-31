@@ -200,12 +200,14 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
 
     // Per field, the set of values this document offers.
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(index.fields.len());
-    let mut array_fields = 0;
+    // The distinct arrays the indexed paths go through, by place in the path.
+    let mut arrays: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut multikey = false;
 
     for field in &index.fields {
         let resolved = path::resolve(doc, &field.path);
         let mut values: Vec<Bson> = Vec::new();
+        arrays.extend(path::array_prefixes(doc, &field.path));
 
         // A path that resolves to several values has fanned out through an
         // array of documents — multikey even though no value is itself an
@@ -219,7 +221,6 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
         } else {
             for value in resolved {
                 if let Bson::Array(items) = value {
-                    array_fields += 1;
                     multikey = true;
                     values.extend(items.iter().cloned());
                     // ...and the array itself, for whole-array equality.
@@ -243,7 +244,7 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
         })
     };
 
-    if array_fields > 1 && index.fields.len() > 1 {
+    if arrays.len() > 1 && index.fields.len() > 1 {
         return unkeyed(
             UnkeyedCause::ParallelArrays,
             "a compound index may span at most one array field".into(),
@@ -389,12 +390,12 @@ fn refusal_message(index: &IndexMeta, doc: &Document, cause: UnkeyedCause, reaso
     }
 }
 
-/// The indexed paths at which `doc` holds an array, in the index's order.
+/// The indexed paths that go through or end in an array of `doc`, in the index's order.
 fn array_paths(index: &IndexMeta, doc: &Document) -> Vec<String> {
     index
         .fields
         .iter()
-        .filter(|field| path::resolve(doc, &field.path).iter().any(|v| matches!(v, Bson::Array(_))))
+        .filter(|field| !path::array_prefixes(doc, &field.path).is_empty())
         .map(|field| field.path.clone())
         .collect()
 }
@@ -3231,6 +3232,42 @@ mod tests {
         assert!(err.to_string().contains("cannot key this document"), "{err}");
         // One array field is fine.
         assert_eq!(index_keys(&idx, &doc! { "a": [1, 2], "b": 3 }).unwrap().len(), 3);
+    }
+
+    /// The arrays a compound index spans are counted by where they sit in the
+    /// path, as the reference counts them: a path that fans out through an array
+    /// of documents is an array, however many values it resolves to.
+    #[test]
+    fn a_compound_index_counts_the_distinct_arrays_its_paths_go_through() {
+        let keyed = |idx: &IndexMeta, d: Document| match document_keys(idx, &d).unwrap() {
+            DocumentKeys::Keyed { keys, .. } => Some(keys.len()),
+            DocumentKeys::Unkeyed { cause, .. } => {
+                assert_eq!(cause, UnkeyedCause::ParallelArrays);
+                None
+            }
+        };
+        let xa_c = index(vec![IndexField::ascending("x.a"), IndexField::ascending("c")], false);
+        // The gap: an array of documents at x and an array at c.
+        assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": 1 }, { "a": 2 }], "c": [1, 2] }), None);
+        // A single-element array is still an array.
+        assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": 1 }], "c": [1, 2] }), None);
+        // One array is fine, at either path.
+        assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": 1 }, { "a": 2 }], "c": 3 }), Some(2));
+        assert_eq!(keyed(&xa_c, doc! { "x": { "a": 1 }, "c": [1, 2] }), Some(3));
+        // Nested arrays on one path: an array at x and an array at x.a.
+        assert_eq!(keyed(&xa_c, doc! { "x": [{ "a": [1, 2] }], "c": 1 }), None);
+        // Two paths through ONE array share it: allowed.
+        let xa_xb = index(vec![IndexField::ascending("x.a"), IndexField::ascending("x.b")], false);
+        assert_eq!(
+            keyed(&xa_xb, doc! { "x": [{ "a": 1, "b": 2 }, { "a": 3, "b": 4 }] }),
+            Some(4),
+            "x.a and x.b over one array x are the reference's allowed shape"
+        );
+        // ...but not when each also ends in an array of its own.
+        assert_eq!(keyed(&xa_xb, doc! { "x": [{ "a": [1, 2], "b": [3, 4] }] }), None);
+        // A single-field index has nothing to be parallel with.
+        let single = index(vec![IndexField::ascending("x.a")], false);
+        assert_eq!(keyed(&single, doc! { "x": [{ "a": [1, 2] }, { "a": [3] }] }), Some(5));
     }
 
     #[test]

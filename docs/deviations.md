@@ -353,7 +353,7 @@ doing nothing with it.
 
 ## 🟡 A compound index over two array fields is refused on the member that takes the write, as MongoDB does, but a document another member accepted is filed unkeyed
 
-**Raised 2026-09-06, with ADR-139; changed with ADR-258.** MongoDB refuses a write that would put
+**Raised 2026-09-06, with ADR-139; changed with ADR-258 and ADR-259.** MongoDB refuses a write that would put
 arrays at two of a compound index's paths ("cannot index parallel arrays"),
 and refuses to build such an index over existing documents. KimmyDB refused
 both from the start, then stopped for a while (ADR-139), and refuses them again
@@ -364,7 +364,10 @@ upsert, update, `find_and_modify` or `$merge`/`$out` write, and a local
 document that would produce more than 1,000 keys. The `createIndex` message
 counts the documents, lists the first ten `_id`s and says how many more; nothing
 is created. (Since 0.51.0 a `Decimal128` has an exact key and is indexed like any
-number, ADR-238.)
+number, ADR-238.) The arrays are counted by their place in the path, so a path that
+fans out through an array of documents (`x.a` over `x: [{a: 1}, {a: 2}]`) is an array
+beside an array at `c`, as in the reference; two paths through one array are not
+parallel (ADR-259).
 
 **What is left of the gap.** The refusal is made by the member that accepts the
 write against the indexes that member holds, which is all a leaderless store can

@@ -2595,6 +2595,24 @@ release. **Rolling back:** stop every member, then start 0.52.x on the data
 directories moved aside at the upgrade, or wipe and reseed; 0.52 refuses a
 schema-6 store, and nothing a 0.53 store held crosses back.
 
+**Upgrading from 0.57.x to 0.58.0: stop all, wipe, start all, reseed.** 0.58.0
+derives index keys under a different rule ([ADR-259](decisions.md)): a
+compound index counts the arrays its paths go through, so a document such as
+`{x: [{a: 1}, {a: 2}], c: [1, 2]}` under `{x.a, c}` is no longer keyed. A 0.57.0
+store holds entries for documents the new rule files unkeyed, and a later write
+to one would leave them behind. **The storage schema is still 6, so 0.58.0 does
+not refuse a 0.57 store on open: the wipe is a step you take, not one the build
+enforces.** There is no migration code.
+1. Stop every member.
+2. Move each data directory aside (it is the rollback) and create an empty one
+   with the same owner.
+3. Start every member on 0.58.0, check `/readyz` on each and that `/v1/topology`
+   lists every member live, then reseed from your source of truth.
+
+A backup 0.57.0 wrote carries the old entries too: do not restore it into 0.58.0
+(reseed instead). **Rolling back:** stop every member, then start 0.57.x on the
+data directories moved aside at the upgrade.
+
 ### Rolling back, and `kimmy.format`
 
 **A build that refuses a store writes nothing to it** (it does record the failed start in `kimmy.last-exit`, beside the store, and touches nothing else)
