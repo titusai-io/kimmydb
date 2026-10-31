@@ -40,7 +40,7 @@ pub fn grade(ms: &[Node], log: &Log) -> Vec<String> {
         errs.push(format!("diverged {}", names.join("+")));
         return errs;
     }
-    let (want, alive, dels) = oracle::oracle(log, ret);
+    let (want, alive, dels) = oracle::oracle_bounded(log, ret, ms[0].bound());
     if ms.iter().any(|m| m.visible() != want) {
         errs.push("visible".into());
     }
@@ -83,7 +83,7 @@ pub fn grade_bounded(ms: &[Node], log: &Log) -> Vec<String> {
         bad.push("diverged".into());
         return bad;
     }
-    let (want, alive, dels) = oracle::oracle(log, ret);
+    let (want, alive, dels) = oracle::oracle_bounded(log, ret, ms[0].bound());
     if ms.iter().any(|m| m.visible() != want) {
         bad.push("visible".into());
     }

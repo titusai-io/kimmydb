@@ -192,3 +192,67 @@ pub fn targeted_v3m2(design: &Cfg, mutant: &Cfg) -> Targeted {
 pub fn targeted_v3m1(design: &Cfg, mutant: &Cfg) -> Targeted {
     targeted("V3m1 snapshot-join loss entry", snapshot_loss_scenario, design, mutant)
 }
+
+/// Run a scenario on a cluster and grade it against the oracle.
+fn graded(cfg: &Cfg, names: &str, f: impl FnOnce(&mut Vec<Node>, &mut Log)) -> Vec<String> {
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = names.chars().map(|c| Node::new(c, cfg)).collect();
+    f(&mut ms, &mut log);
+    fixpoint(&mut ms, 40);
+    grade(&ms, &log)
+}
+
+/// The B1 and M1 scenarios of the review of #275, each with the problems the oracle finds.
+pub fn scenarios() -> Vec<(String, Vec<String>)> {
+    let cfg = Cfg::default_ret();
+    let s = |x: &str| Value::Str(x.into());
+    let mut out = Vec::new();
+    out.push((
+        "zero sum: insert {n:a}; +1; -1".to_string(),
+        graded(&cfg, "A", |ms, log| {
+            ms[0].insert(&[("n", s("a"))], log, 0);
+            ms[0].inc("views", 1, log, 0);
+            ms[0].inc("views", -1, log, 0);
+        }),
+    ));
+    out.push((
+        "zero sum: upsert +1; -1".to_string(),
+        graded(&cfg, "A", |ms, log| {
+            ms[0].upsert_inc("views", 1, log, 0);
+            ms[0].inc("views", -1, log, 0);
+        }),
+    ));
+    out.push((
+        "zero sum: $inc 0 on a missing field".to_string(),
+        graded(&cfg, "A", |ms, log| {
+            ms[0].insert(&[("n", s("a"))], log, 0);
+            ms[0].inc("views", 0, log, 0);
+        }),
+    ));
+    out.push((
+        "zero sum: {x:100}; $unset x; +5; -5".to_string(),
+        graded(&cfg, "A", |ms, log| {
+            ms[0].insert(&[("x", Value::Int(100))], log, 0);
+            ms[0].unset("x", log, 0);
+            ms[0].inc("x", 5, log, 0);
+            ms[0].inc("x", -5, log, 0);
+        }),
+    ));
+    for soi in [false, true] {
+        out.push((
+            format!("upsert string base ({})", if soi { "$setOnInsert" } else { "$set" }),
+            graded(&cfg, "ABC", |ms, log| {
+                let sv = [("n", s("s"))];
+                if soi {
+                    ms[0].upsert_soi(&sv, "x", 1, &[], log, 0);
+                } else {
+                    ms[0].upsert_soi(&[], "x", 1, &sv, log, 0);
+                }
+                ms[1].upsert_inc("n", 5, log, 0);
+                pull(ms, 2, 0, None);
+                ms[2].set("n", Value::Int(7), log, 0);
+            }),
+        ));
+    }
+    out
+}
