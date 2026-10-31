@@ -448,14 +448,17 @@ impl Engine {
             // document is stored, and its index still files it unkeyed, and the
             // rewind has not announced it already. Without it a watcher that
             // starts from the beginning never learns of a document that
-            // `GET .../unkeyed` lists.
+            // `GET .../unkeyed` lists. The reason is the one the index gives
+            // the stored document now, which is what the list shows; a trimmed
+            // report's own reason may be an older one (two reports of one
+            // document can differ).
+            let mut announced: std::collections::HashSet<(
+                kimmy_core::CollectionId,
+                String,
+                DocId,
+            )> = unkeyed.iter().map(|(c, d)| (*c, d.index.clone(), d.id.clone())).collect();
             for (collection, detail) in trimmed_reports {
-                let announced = unkeyed.iter().any(
-                    |(c, d): &(kimmy_core::CollectionId, kimmy_core::UnkeyedDocumentDetail)| {
-                        *c == collection && d.index == detail.index && d.id == detail.id
-                    },
-                );
-                if announced {
+                if announced.contains(&(collection, detail.index.clone(), detail.id.clone())) {
                     continue;
                 }
                 let Some(meta) = collections.get(&collection.0) else { continue };
@@ -471,8 +474,15 @@ impl Engine {
                     continue;
                 };
                 drop(raw);
-                if let index::DocumentKeys::Unkeyed { .. } = index::document_keys(index, &stored)? {
-                    unkeyed.push((collection, detail));
+                if let index::DocumentKeys::Unkeyed { cause, .. } =
+                    index::document_keys(index, &stored)?
+                {
+                    announced.insert((collection, detail.index.clone(), detail.id.clone()));
+                    let current = kimmy_core::UnkeyedDocumentDetail {
+                        reason: cause.as_str().to_string(),
+                        ..detail
+                    };
+                    unkeyed.push((collection, current));
                 }
             }
             if let Some(through) = crate::violations_table::through_of(&violations)? {

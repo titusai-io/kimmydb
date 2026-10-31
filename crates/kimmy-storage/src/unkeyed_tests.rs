@@ -725,3 +725,157 @@ fn a_unique_refusal_and_a_refused_create_are_counted() {
     e.create_index("shop", "w", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
     assert_eq!(e.unkeyed_refusals(), 3);
 }
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+fn remote_id(
+    c: &CollectionMeta,
+    id: &DocId,
+    wall: u64,
+    kind: OpKind,
+    mut body: Document,
+) -> OplogEntry {
+    body.insert("_id", id.to_bson());
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall, 0), NodeId::generate()),
+        kind,
+        collection: c.id,
+        doc_id: Some(id.clone()),
+        body: Some(bson::serialize_to_vec(&body).unwrap()),
+    }
+}
+
+/// More keys than one document may have in one index: `a` holds 1,000 values and
+/// the whole array is a key of its own.
+fn big() -> Document {
+    let values: Vec<Bson> = (0..1_000).map(Bson::Int32).collect();
+    doc! { "a": values, "b": 1 }
+}
+
+/// Two reports of one document can name different reasons. The re-announce
+/// names the one the index gives the stored document now, which is the one
+/// `GET .../unkeyed` lists.
+#[test]
+fn a_rewinds_re_announce_names_the_reason_the_list_shows() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    e.create_index("shop", "c", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    let t0 = now_ms();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Written elsewhere at t0 + 10, + 20 and + 30, arriving here 200 ms later:
+    // both reports are stamped above the target, the document's stamp below it.
+    let id = DocId::Int64(5);
+    assert!(e.apply_remote(&c, &remote_id(&c, &id, t0 + 10, OpKind::Insert, bad())).unwrap());
+    let keyed = doc! { "a": 1, "b": 1 };
+    assert!(e.apply_remote(&c, &remote_id(&c, &id, t0 + 20, OpKind::Replace, keyed)).unwrap());
+    assert!(e.apply_remote(&c, &remote_id(&c, &id, t0 + 30, OpKind::Replace, big())).unwrap());
+    let reasons: Vec<String> = events(&e).into_iter().map(|d| d.reason).collect();
+    assert_eq!(reasons, vec!["parallel_arrays", "too_many_keys"]);
+
+    e.rewind_to(Hlc::new(t0 + 50, 0)).unwrap();
+
+    let c = e.get_collection("shop", "c").unwrap();
+    let index = c.index("ab").unwrap();
+    let listed = e.unkeyed_documents(&c, index, None, 100).unwrap().rows;
+    assert_eq!(listed.len(), 1);
+    let named: Vec<(DocId, String)> = events(&e).into_iter().map(|d| (d.id, d.reason)).collect();
+    assert_eq!(named, vec![(DocId::Int64(5), "too_many_keys".to_string())]);
+}
+
+/// The rewind puts an unkeyed image back over a keyed one and announces it
+/// itself; the report of the original filing is above the target and trimmed.
+/// One event for one move, not two.
+#[test]
+fn a_rewind_that_announces_a_document_does_not_re_announce_its_trimmed_report() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    e.create_index("shop", "c", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "c").unwrap();
+    let t0 = now_ms();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let id = DocId::Int64(5);
+    assert!(e.apply_remote(&c, &remote_id(&c, &id, t0 + 10, OpKind::Insert, bad())).unwrap());
+    let keyed = doc! { "a": 1, "b": 1 };
+    assert!(e.apply_remote(&c, &remote_id(&c, &id, t0 + 100, OpKind::Replace, keyed)).unwrap());
+    assert_eq!(events(&e).len(), 1);
+
+    e.rewind_to(Hlc::new(t0 + 50, 0)).unwrap();
+
+    let named: Vec<(DocId, String)> = events(&e).into_iter().map(|d| (d.id, d.reason)).collect();
+    assert_eq!(named, vec![(DocId::Int64(5), "parallel_arrays".to_string())]);
+}
+
+/// A discarded document is not written, so under `replace` a later one with its
+/// `_id` is unmatched as well: `discarded 2`, not a refusal at output document 1.
+#[test]
+fn a_discarded_output_document_under_replace_does_not_match_a_later_one() {
+    let (e, _d) = open();
+    e.create_collection("shop", "t").unwrap();
+    e.create_index("shop", "t", fields(&["a", "b"]), false, Some("ab".into())).unwrap();
+    let c = e.get_collection("shop", "t").unwrap();
+    let discard = SinkMode::Merge { when_matched: WhenMatched::Replace, insert_unmatched: false };
+    let output = vec![with_id(7, doc! { "a": 1, "b": 1 }), with_id(7, bad())];
+    assert_eq!(e.write_documents(&c, output, discard).unwrap().counts.discarded, 2);
+}
+
+/// A rewind refused by a unique index that cannot key the image it puts back is
+/// not a client's refused write, and counts nothing.
+#[test]
+fn a_rewind_refused_by_a_unique_index_is_not_counted() {
+    let (e, _d) = open();
+    e.create_collection("shop", "u").unwrap();
+    e.create_index("shop", "u", fields(&["a", "b"]), true, Some("ab".into())).unwrap();
+    let u = e.get_collection("shop", "u").unwrap();
+    let t0 = now_ms();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let id = DocId::Int64(5);
+    assert!(e.apply_remote(&u, &remote_id(&u, &id, t0 + 10, OpKind::Insert, bad())).unwrap());
+    let keyed = doc! { "a": 1, "b": 1 };
+    assert!(e.apply_remote(&u, &remote_id(&u, &id, t0 + 100, OpKind::Replace, keyed)).unwrap());
+    assert!(e.rewind_to(Hlc::new(t0 + 50, 0)).is_err(), "the unique index cannot key the image");
+    assert_eq!(e.unkeyed_refusals(), 0);
+}
+
+/// The `$merge`/`$out` pre-check refuses an output a unique index cannot key
+/// before any chunk is written, and that is one refusal.
+#[test]
+fn a_prechecked_unique_refusal_is_counted_once() {
+    let (e, _d) = open();
+    e.create_collection("shop", "w").unwrap();
+    e.create_index("shop", "w", fields(&["a", "b"]), true, Some("ab".into())).unwrap();
+    let w = e.get_collection("shop", "w").unwrap();
+    let output = vec![with_id(1, bad())];
+    refusal(e.write_documents(&w, output, SinkMode::Insert).unwrap_err());
+    assert_eq!(e.unkeyed_refusals(), 1);
+}
+
+/// Bare equality to `null` selects a document that lacks the field, so a partial
+/// index can cover a `$merge` output whose merged form it does not select: the
+/// pre-check must leave the repeat to the write, which accepts it.
+#[test]
+fn a_repeat_the_partial_filter_does_not_select_once_merged_is_accepted() {
+    let (e, _d) = open();
+    e.create_collection("shop", "t").unwrap();
+    e.create_index_with(
+        "shop",
+        "t",
+        fields(&["a", "b"]),
+        false,
+        Enforcement::Local,
+        Some("ab".into()),
+        None,
+        Some(doc! { "k": Bson::Null }),
+    )
+    .unwrap();
+    let c = e.get_collection("shop", "t").unwrap();
+    // Alone, the second document is selected by the filter and cannot be keyed.
+    assert!(e.insert(&c, doc! { "_id": 8i64, "a": [1, 2], "b": [3, 4] }).is_err());
+    let merge = SinkMode::Merge { when_matched: WhenMatched::Merge, insert_unmatched: true };
+    let output = vec![doc! { "_id": 7i64, "k": 1 }, doc! { "_id": 7i64, "a": [1, 2], "b": [3, 4] }];
+    let counts = e.write_documents(&c, output, merge).unwrap().counts;
+    assert_eq!((counts.inserted, counts.merged), (1, 1));
+    assert_eq!(e.unkeyed_count(&c, c.index("ab").unwrap().id).unwrap(), 0);
+}

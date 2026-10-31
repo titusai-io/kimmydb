@@ -659,7 +659,7 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.index.unkeyed_refusals",
             "{write}",
-            "Local writes refused because an index on this member could not key the document.",
+            "Local writes and index creates refused because an index on this member could not key a document.",
             index_unkeyed_refusals
         );
         observe!(

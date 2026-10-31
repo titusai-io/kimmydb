@@ -1848,7 +1848,7 @@ impl Metrics {
              # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, or more than 1000 keys - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`.\n\
              # TYPE kimmy_index_unkeyed_total counter\n\
              kimmy_index_unkeyed_total {index_unkeyed}\n\
-             # HELP kimmy_index_unkeyed_refusals_total Local writes refused with 400 because an index on this member could not key the document - arrays at two of a compound index's paths, or more than 1000 keys. Counted on the member that refused the write, since start; a replicated write is never refused and counts in kimmy_index_unkeyed_total.\n\
+             # HELP kimmy_index_unkeyed_refusals_total Local writes and index creates refused with 400 because an index on this member could not key a document - arrays at two of a compound index's paths, or more than 1000 keys. Counted on the member that refused it, since start; a replicated write is never refused and counts in kimmy_index_unkeyed_total.\n\
              # TYPE kimmy_index_unkeyed_refusals_total counter\n\
              kimmy_index_unkeyed_refusals_total {index_unkeyed_refusals}\n\
              # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.\n\
@@ -3725,7 +3725,7 @@ kimmy_ttl_skipped_filter_total 93
 # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, or more than 1000 keys - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`.
 # TYPE kimmy_index_unkeyed_total counter
 kimmy_index_unkeyed_total 26
-# HELP kimmy_index_unkeyed_refusals_total Local writes refused with 400 because an index on this member could not key the document - arrays at two of a compound index's paths, or more than 1000 keys. Counted on the member that refused the write, since start; a replicated write is never refused and counts in kimmy_index_unkeyed_total.
+# HELP kimmy_index_unkeyed_refusals_total Local writes and index creates refused with 400 because an index on this member could not key a document - arrays at two of a compound index's paths, or more than 1000 keys. Counted on the member that refused it, since start; a replicated write is never refused and counts in kimmy_index_unkeyed_total.
 # TYPE kimmy_index_unkeyed_refusals_total counter
 kimmy_index_unkeyed_refusals_total 27
 # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.
