@@ -458,28 +458,60 @@ pub fn killed_superseded_any(log: &Log, ret: u64) -> Vec<BTreeSet<Head>> {
     out
 }
 
-pub fn sound_record(key: &LossKey, log: &Log, alive: &BTreeSet<MStamp>, dels: &[MStamp]) -> bool {
+/// The deletes that killed `life`: not in the causal past of its creator and inside its
+/// retention (the model's `_killers`). A delete older than `life - ret` never kills it.
+fn killers(log: &Log, life: &MStamp, dels: &[MStamp], ret: u64) -> Vec<MStamp> {
+    dels.iter()
+        .filter(|d| !log[life].0.contains(d) && t(d) >= t(life) - i128::from(ret))
+        .copied()
+        .collect()
+}
+
+/// Is a record sound: does the log contain what it claims? The write it names (`key.stamp`)
+/// must have written its path (`"_"` is the whole document, and only an `insertLost` of a
+/// lost first insert may name it), and the kind's own evidence must exist:
+///
+/// * a clash: a newer register write to the path that neither saw nor was seen by the loser;
+/// * an `insertLost`: the write is in a superseded first insert, or is a `$setOnInsert` cell;
+/// * a `deleteWon`: the write's life is not alive, and a delete that killed that life (inside
+///   its retention, unseen by its creator) had not seen the write.
+pub fn sound_record(
+    key: &LossKey,
+    log: &Log,
+    alive: &BTreeSet<MStamp>,
+    dels: &[MStamp],
+    ret: u64,
+) -> bool {
     let (kind, p, st) = (key.kind, &key.path, key.stamp);
     let Some((ctx, m)) = log.get(&st) else { return false };
     match kind {
-        LossKind::Clash => log.iter().any(|(w, (c2, m2))| {
-            *w != st
-                && *w > st
-                && !c2.contains(&st)
-                && !ctx.contains(w)
-                && m2.paths.contains(p)
-                && is_reg_kind(m2.kind)
-                && is_reg_kind(m.kind)
-        }),
+        LossKind::Clash => {
+            m.paths.contains(p)
+                && log.iter().any(|(w, (c2, m2))| {
+                    *w != st
+                        && *w > st
+                        && !c2.contains(&st)
+                        && !ctx.contains(w)
+                        && m2.paths.contains(p)
+                        && is_reg_kind(m2.kind)
+                        && is_reg_kind(m.kind)
+                })
+        }
         LossKind::InsertLost => {
             let sup = superseded_lives(log, None);
             if p == "_" {
                 return sup.contains(&st);
             }
-            in_set(&m.life, &sup) || (m.kind == WriteKind::Insert && m.soi.contains(p))
+            m.paths.contains(p)
+                && (in_set(&m.life, &sup) || (m.kind == WriteKind::Insert && m.soi.contains(p)))
         }
         LossKind::DeleteWon => {
-            !in_set(&m.life, alive) && dels.iter().any(|d| !log[d].0.contains(&st))
+            m.paths.contains(p)
+                && m.life.is_some_and(|l| {
+                    log.contains_key(&l)
+                        && !alive.contains(&l)
+                        && killers(log, &l, dels, ret).iter().any(|d| !log[d].0.contains(&st))
+                })
         }
         LossKind::RetiredWriter => false,
     }

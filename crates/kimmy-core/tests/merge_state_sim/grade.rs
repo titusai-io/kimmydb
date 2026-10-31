@@ -60,7 +60,7 @@ pub fn grade(ms: &[Node], log: &Log) -> Vec<String> {
     if !must.is_subset(&hv) {
         errs.push("record-missing".into());
     }
-    if have.iter().any(|k| !oracle::sound_record(k, log, &alive, &dels)) {
+    if have.iter().any(|k| !oracle::sound_record(k, log, &alive, &dels, ret)) {
         errs.push("record-unsound".into());
     }
     for m in ms {
@@ -96,7 +96,7 @@ pub fn grade_bounded(ms: &[Node], log: &Log) -> Vec<String> {
     if !must.is_subset(&heads(&have)) {
         bad.push("record-missing".into());
     }
-    if have.iter().any(|k| !oracle::sound_record(k, log, &alive, &dels)) {
+    if have.iter().any(|k| !oracle::sound_record(k, log, &alive, &dels, ret)) {
         bad.push("record-unsound".into());
     }
     if !oracle::stale_records(&have, log, ret).is_empty() {

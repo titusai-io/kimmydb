@@ -13,6 +13,7 @@
 mod grade;
 mod mutants;
 mod oracle;
+mod oracle_tests;
 mod probes;
 mod rng;
 mod sim;
