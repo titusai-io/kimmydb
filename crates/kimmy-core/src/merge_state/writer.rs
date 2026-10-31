@@ -141,11 +141,13 @@ impl Writer {
         let generation = if v.is_numeric() {
             self.state.gen_of(p, &self.opts).map(std::borrow::Cow::into_owned)
         } else {
-            Some(Gen { stamp: st, vv: self.state.vv.clone(), seen: self.seen(p) })
+            Some(Gen::start(st, &self.state.vv, self.seen(p)))
         };
         let obs = self.obs(p);
+        #[cfg(any(test, feature = "merge-mutants"))]
         if !v.is_numeric() {
-            self.state.gens.insert((l, p.to_string()), (st, self.state.vv.clone()));
+            let vv = self.state.vv.clone();
+            self.state.note_base((l, p.to_string()), st, &vv);
         }
         self.state
             .regs
@@ -183,14 +185,15 @@ impl Writer {
             let generation = (!v.is_numeric()).then(|| {
                 let mut vv = s.vv.clone();
                 vv.insert(st.writer, st.hlc);
-                Gen { stamp: st, vv, seen: BTreeMap::new() }
+                Gen::start(st, &vv, BTreeMap::new())
             });
             s.regs.insert(
                 (st, p.to_string()),
                 Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi: false },
             );
+            #[cfg(any(test, feature = "merge-mutants"))]
             if !v.is_numeric() {
-                s.gens.insert((st, p.to_string()), (st, BTreeMap::from([(st.writer, st.hlc)])));
+                s.note_base((st, p.to_string()), st, &BTreeMap::from([(st.writer, st.hlc)]));
             }
         }
         s.vv.insert(st.writer, st.hlc);
@@ -262,14 +265,15 @@ impl Writer {
             let generation = (starts_gen && !v.is_numeric()).then(|| {
                 let mut vv = s.vv.clone();
                 vv.insert(st.writer, st.hlc);
-                Gen { stamp: st, vv, seen: BTreeMap::new() }
+                Gen::start(st, &vv, BTreeMap::new())
             });
             s.regs.insert(
                 (st, q.to_string()),
                 Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi },
             );
+            #[cfg(any(test, feature = "merge-mutants"))]
             if starts_gen && !v.is_numeric() {
-                s.gens.insert((st, q.to_string()), (st, BTreeMap::from([(st.writer, st.hlc)])));
+                s.note_base((st, q.to_string()), st, &BTreeMap::from([(st.writer, st.hlc)]));
             }
         }
         let mut paths = Vec::new();

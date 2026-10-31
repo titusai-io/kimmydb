@@ -17,9 +17,9 @@
 //! increasing in key order (no duplicates), and a flag byte is 0 or 1.
 //!
 //! Versions: [`MergeState::encode`] starts with the 3 bytes `QMS` and ONE format
-//! version byte (currently 1), then the canonical body, then the `gens`.
+//! version byte (currently 1), then the canonical body.
 //! [`MergeState::canonical_bytes`] is the body alone and carries no tag; the
-//! hash covers the body. The golden vectors in `tests.rs` pin all three: changing
+//! hash covers the body. Mutant memory (`Gen::vv`, `MergeState::gens`) is in neither. The golden vectors in `tests.rs` pin all three: changing
 //! the bytes is a format change (a wipe release) and must be deliberate.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -143,7 +143,6 @@ impl W {
             Some(g) => {
                 self.u8(1);
                 self.stamp(&g.stamp);
-                self.vv(&g.vv);
                 self.obs(&g.seen);
             }
         }
@@ -235,8 +234,7 @@ impl MergeState {
 
     /// The deterministic encoding of the state: the model's `canon()` made
     /// binary (lives, dead, deletes, registers, slots, version vector, losses).
-    /// NOTE(model): `canon()` leaves the vestigial `gens` out, so this does too;
-    /// [`MergeState::encode`] carries them.
+    /// Mutant memory (`Gen::vv`, `gens`) is not part of it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
         self.write_body(&mut w);
@@ -252,19 +250,13 @@ impl MergeState {
         hash128(&self.canonical_bytes())
     }
 
-    /// The whole state, including `gens`, for a round trip with [`MergeState::decode`].
+    /// The whole state, for a round trip with [`MergeState::decode`]: the magic, the format
+    /// version, then [`MergeState::canonical_bytes`].
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
         w.0.extend_from_slice(&MAGIC);
         w.u8(VERSION);
         self.write_body(&mut w);
-        w.len(self.gens.len());
-        for ((l, p), (s, vv)) in &self.gens {
-            w.stamp(l);
-            w.str(p);
-            w.stamp(s);
-            w.vv(vv);
-        }
         w.0
     }
 
@@ -327,13 +319,6 @@ impl MergeState {
             let k = r.loss_key()?;
             let v = r.loss_value()?;
             put(&mut s.losses, k, v)?;
-        }
-        for _ in 0..r.len()? {
-            let l = r.stamp()?;
-            let p = r.str()?;
-            let st = r.stamp()?;
-            let vv = r.vv()?;
-            put(&mut s.gens, (l, p), (st, vv))?;
         }
         if !r.0.is_empty() {
             return Err(DecodeError::Trailing(r.0.len()));
@@ -465,8 +450,7 @@ impl R<'_> {
             0 => Ok(None),
             1 => {
                 let stamp = self.stamp()?;
-                let vv = self.vv()?;
-                Ok(Some(Gen { stamp, vv, seen: self.obs()? }))
+                Ok(Some(Gen { stamp, vv: Vv::new(), seen: self.obs()? }))
             }
             t => Err(DecodeError::BadTag(t)),
         }
@@ -565,7 +549,6 @@ mod tests {
             w.hlc(Hlc::new(*h, 0));
         }
         w.len(0); // losses
-        w.len(0); // gens
         w.0
     }
 

@@ -28,13 +28,42 @@ pub struct Life {
     pub kind: LifeKind,
 }
 
-/// The generation a base starts or belongs to: the starter's stamp, the
-/// starter's version vector, and the totals the starter had seen.
-#[derive(Clone, PartialEq, Debug)]
+/// The generation a base starts or belongs to: the starter's stamp and the totals the starter
+/// had seen.
+///
+/// `vv` (the starter's version vector) is memory for the V4M1 mutant of the test harness and
+/// nothing else: it is kept only in a test or `merge-mutants` build, is empty in a production
+/// build, and is not encoded, hashed or compared (two generations are equal when `stamp` and
+/// `seen` are).
+#[derive(Clone, Debug)]
 pub struct Gen {
     pub stamp: MStamp,
     pub vv: Vv,
     pub seen: BTreeMap<ObsKey, i128>,
+}
+
+impl Gen {
+    /// A generation started by the write `stamp`, with the totals it had seen.
+    pub(crate) fn start(stamp: MStamp, vv: &Vv, seen: BTreeMap<ObsKey, i128>) -> Self {
+        Gen { stamp, vv: mutant_vv(vv), seen }
+    }
+}
+
+impl PartialEq for Gen {
+    fn eq(&self, other: &Self) -> bool {
+        self.stamp == other.stamp && self.seen == other.seen
+    }
+}
+
+/// The version vector the mutants of the harness read (see [`Gen`] and
+/// [`MergeState::gens`]): kept in a test or `merge-mutants` build, empty otherwise.
+#[cfg(any(test, feature = "merge-mutants"))]
+fn mutant_vv(vv: &Vv) -> Vv {
+    vv.clone()
+}
+#[cfg(not(any(test, feature = "merge-mutants")))]
+fn mutant_vv(_: &Vv) -> Vv {
+    Vv::new()
 }
 
 /// A register cell: higher stamp wins. `obs` is what the writer had counted: for each
@@ -72,7 +101,7 @@ pub struct Slot {
 
 /// The replicated merge state. Grow-only components are joined by union, cells
 /// by the higher stamp, the version vector by max; see [`super::join()`].
-#[derive(Clone, PartialEq, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MergeState {
     pub lives: BTreeMap<MStamp, Life>,
     /// Delete stamp -> the version vector of the deleting writer.
@@ -81,12 +110,37 @@ pub struct MergeState {
     pub dead: BTreeSet<MStamp>,
     pub regs: BTreeMap<(MStamp, String), Reg>,
     pub slots: BTreeMap<(MStamp, String, WriterId, Option<MStamp>), Slot>,
-    /// Newest non-numeric base per cell. NOTE(model): vestigial in the model
-    /// (kept for its V3M3 mutant, read nowhere); joined and dropped like cells
-    /// and carried by `encode`, but absent from `canonical_bytes` like `canon()`.
+    /// Newest non-numeric base per cell, with its writer's version vector. NOTE(model):
+    /// vestigial in the model (kept for its V3M3 mutant, read nowhere else). Mutant memory,
+    /// like [`Gen::vv`]: filled only in a test or `merge-mutants` build, joined and dropped
+    /// like cells, but never encoded, hashed or compared.
     pub gens: BTreeMap<(MStamp, String), (MStamp, Vv)>,
     pub vv: Vv,
     pub losses: BTreeMap<LossKey, LossValue>,
+}
+
+impl PartialEq for MergeState {
+    /// Equality of the replicated state: everything that is encoded. `gens` (mutant memory)
+    /// is left out.
+    fn eq(&self, other: &Self) -> bool {
+        let MergeState { lives, deletes, dead, regs, slots, gens: _, vv, losses } = self;
+        *lives == other.lives
+            && *deletes == other.deletes
+            && *dead == other.dead
+            && *regs == other.regs
+            && *slots == other.slots
+            && *vv == other.vv
+            && *losses == other.losses
+    }
+}
+
+impl MergeState {
+    /// Record the newest non-numeric base of a cell for the V3M3 mutant. The callers are
+    /// compiled only in a test or `merge-mutants` build.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub(crate) fn note_base(&mut self, cell: (MStamp, String), stamp: MStamp, vv: &Vv) {
+        self.gens.insert(cell, (stamp, vv.clone()));
+    }
 }
 
 /// The model's `cov`: is `stamp` covered by `vv`?
@@ -189,7 +243,7 @@ impl MergeState {
             .filter(|((l, q), _)| q == p && al.contains(l))
             .map(|(_, g)| g)
             .max_by_key(|g| g.0)
-            .map(|(st, vv)| Cow::Owned(Gen { stamp: *st, vv: vv.clone(), seen: BTreeMap::new() }))
+            .map(|(st, vv)| Cow::Owned(Gen::start(*st, vv, BTreeMap::new())))
     }
 
     /// Slots of the winning base's generation and of NEWER generations (their
