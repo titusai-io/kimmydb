@@ -66,6 +66,7 @@
 //! 1]}` is an error because a string is not a number. Returning null for both
 //! would make a typo and a type error indistinguishable in the output.
 
+mod arrayacc;
 mod dates;
 mod docops;
 mod math;
@@ -542,6 +543,9 @@ pub enum Expr {
     Str(Box<strings::StrExpr>),
     /// `$getField`, `$setField`, `$unsetField` and `$type` (ADR-260).
     Doc(Box<docops::DocExpr>),
+    /// `$firstN`, `$lastN`, `$maxN`, `$minN` over an array, and `$stdDevPop` /
+    /// `$stdDevSamp` (ADR-262).
+    ArrayAcc(Box<arrayacc::ArrayAcc>),
     /// A document whose values are expressions.
     Object(Vec<(String, Expr)>),
     /// An array whose elements are expressions, evaluated in order to the
@@ -1007,6 +1011,7 @@ impl Expr {
             }
             Expr::Str(s) => s.children().into_iter().any(Expr::reads_document),
             Expr::Doc(d) => d.reads_current() || d.children().into_iter().any(Expr::reads_document),
+            Expr::ArrayAcc(a) => a.children().into_iter().any(Expr::reads_document),
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_document()),
             Expr::Array(items) => any(items),
         }
@@ -1032,6 +1037,7 @@ impl Expr {
             | Expr::Zip { .. }
             | Expr::Str(_)
             | Expr::Doc(_)
+            | Expr::ArrayAcc(_)
             | Expr::Object(_)
             | Expr::Array(_) => "an expression".to_string(),
         }
@@ -1089,6 +1095,7 @@ impl Expr {
                 (d.reads_current() && names.iter().any(|n| n == "CURRENT" || n == "ROOT"))
                     || d.children().into_iter().any(|e| e.reads_variable(names))
             }
+            Expr::ArrayAcc(a) => a.children().into_iter().any(|e| e.reads_variable(names)),
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_variable(names)),
             Expr::Array(items) => any(items),
         }
@@ -1270,6 +1277,7 @@ impl Expr {
             name @ ("$getField" | "$setField" | "$unsetField" | "$type") => {
                 docops::DocExpr::parse(name, raw, declared)
             }
+            name if arrayacc::handles(name) => arrayacc::ArrayAcc::parse(name, raw, declared),
             name if ConvertTo::from_shorthand(name).is_some() => {
                 Self::parse_convert_shorthand(name, raw, declared)
             }
@@ -1723,6 +1731,7 @@ impl Expr {
             }
             Expr::Str(s) => s.eval(scope),
             Expr::Doc(d) => Ok(d.eval_opt(scope)?.unwrap_or(Bson::Null)),
+            Expr::ArrayAcc(a) => a.eval(scope),
             Expr::Date(d) => d.eval(scope),
             Expr::Convert { input, to, on_error, on_null } => {
                 // An error in the input expression itself is not a conversion

@@ -2175,7 +2175,7 @@ fn group_keyed(
             }
         };
         for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
-            held += accumulate(state, acc, &scope, limits)?;
+            held += accumulate(state, acc, &scope)?;
         }
         check_held(stage, held, limits)?;
     }
@@ -2293,7 +2293,7 @@ fn bucket_auto(
         for (_, doc) in &keyed[start..end] {
             let scope = Scope::with_bindings(doc, vars);
             for (state, (_, acc)) in states.iter_mut().zip(fields) {
-                held += accumulate(state, acc, &scope, limits)?;
+                held += accumulate(state, acc, &scope)?;
             }
             check_held("$bucketAuto", held, limits)?;
         }
@@ -2328,15 +2328,10 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
 
 /// Feed one document to one accumulator. Returns how many rows a bounded
 /// accumulator grew by, which the caller totals and holds to the stage's cap.
-fn accumulate(
-    state: &mut AccState,
-    acc: &Accumulator,
-    scope: &Scope<'_>,
-    limits: &Limits,
-) -> Result<usize> {
+fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<usize> {
     match (state, acc) {
         (AccState::Ext(state), Accumulator::Ext(spec)) => {
-            return state.accumulate(spec, scope, limits);
+            return state.accumulate(spec, scope);
         }
         (AccState::Sum(total), Accumulator::Sum(e)) => {
             total.add(&e.eval_in(scope)?);
