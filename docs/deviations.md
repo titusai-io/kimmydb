@@ -17,6 +17,24 @@ Status meanings:
 
 ---
 
+## 🟡 `$setWindowFields`, `$densify` and `$fill`: covariance not built, partitions leave in first-seen order, and a few edges are read narrowly
+
+**Raised 2026-10-31, with ADR-264.** `$setWindowFields`, `$densify` and `$fill` are built ([aggregation.md](aggregation.md#setwindowfields)). Where they differ from the reference:
+
+- **`$covariancePop` and `$covarianceSamp` are not built.** They are refused by name (`400`). They share no code with the rest, and a refusal is better than a wrong covariance. `$mergeObjects` is refused too: it is not a window operator.
+- **Output order.** `$setWindowFields` answers partition by partition in the order the partitions were **first seen**, each by `sortBy`. The reference may order the partitions by their key (it sorts the input by the partition key before it windows), so a port that relies on the order of the partitions can see a different order; a `$sort` after the stage fixes it in both. `$densify` answers partitions in ascending order of their field values. `$fill` with a method leaves in `$setWindowFields`' order; with only `value` fields it keeps the input order.
+- **`Decimal128`.** `$derivative`, `$integral`, `$expMovingAvg` and the standard deviations read a `Decimal128` as a double and answer a double (the reference may answer a decimal). `$densify` refuses a `Decimal128` field or step. A `range` window compares sort values and bounds as doubles, so a long beyond 2^53 is compared by its nearest double.
+- **Strict inputs.** `$derivative` and `$integral` refuse (`400`) a document of the window whose input is not a number, `null` and missing included; a date input is refused (the reference reads a date as milliseconds). `$linearFill` refuses a non-number value. A `range` window refuses a document whose sort value is missing, null or neither a number nor a date.
+- **A date `unit` on `$derivative` and `$integral`** is `week`, `day`, `hour`, `minute`, `second` or `millisecond` (not a calendar unit), and the time axis is in milliseconds when it is absent.
+- **A window `range` fraction.** A fractional bound is accepted for the fixed-length date units (`week` to `millisecond`) and for numbers; `year`, `quarter` and `month` need whole numbers.
+- **`$densify` steps from the value the gap starts at** (`v + k step`), including off the grid: after a document at 4, the next generated value is 4 plus the step even if the generation before it started at 1. A calendar step does not drift. The generated documents hold the field and the partition fields, in that order.
+- **The window byte cap** is 256 MiB (413), counted as the buffer grows; the reference's own limit is a memory budget that spills to disk.
+- **Integers.** `$rank`, `$denseRank` and `$documentNumber` answer a long; `$count` over a window an int; `$sum` a long, as in `$group`.
+
+**To close:** the covariance operators would close the first point. The rest are choices; none planned.
+
+---
+
 ## 🟡 The string, document and type operators: integer results are `Int64`, a few edge cases are read narrowly, and a missing value is told apart only where the reference makes it matter
 
 **Raised 2026-10-31, with ADR-260.** `$trim`, `$ltrim`, `$rtrim`, `$indexOfCP`, `$indexOfBytes`, `$regexMatch`, `$regexFind`, `$regexFindAll`, `$replaceOne`, `$replaceAll`, `$strcasecmp`, `$strLenBytes`, `$substrBytes`, `$mergeObjects` (expression and accumulator), `$getField`, `$setField`, `$unsetField`, `$type` and `$isNumber` follow the reference; these are the differences.

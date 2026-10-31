@@ -308,7 +308,7 @@ impl Welford {
 /// A numeric operand as a double; anything else is not counted. A `Decimal128`
 /// is converted to the nearest double (documented deviation: the result is a
 /// double either way).
-fn numeric(value: &Bson) -> Option<f64> {
+pub(crate) fn numeric(value: &Bson) -> Option<f64> {
     match value {
         Bson::Int32(n) => Some(f64::from(*n)),
         Bson::Int64(n) => Some(*n as f64),

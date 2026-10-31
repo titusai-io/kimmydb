@@ -164,6 +164,12 @@ pub enum Stage {
     /// `$out`: the pipeline's output inserted into a collection that is new or empty
     /// (ADR-255). Only ever last. Executed by the caller.
     Out(Target),
+    /// `$setWindowFields` (ADR-264): per-document windows over sorted partitions.
+    SetWindowFields(Box<crate::window::WindowSpec>),
+    /// `$densify` (ADR-264): generated documents that close the gaps in a numeric or date field.
+    Densify(Box<crate::densify::DensifySpec>),
+    /// `$fill` (ADR-264): null and missing values filled from a value or its neighbours.
+    Fill(Box<crate::fill::FillSpec>),
 }
 
 /// A collection a write stage names: `"name"`, or `{db, coll}` for one in another
@@ -370,6 +376,9 @@ impl Stage {
             Stage::GraphLookup(_) => "$graphLookup",
             Stage::Merge(_) => "$merge",
             Stage::Out(_) => "$out",
+            Stage::SetWindowFields(_) => "$setWindowFields",
+            Stage::Densify(_) => "$densify",
+            Stage::Fill(_) => "$fill",
         }
     }
 
@@ -550,6 +559,12 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         "$graphLookup" => parse_graph_lookup(as_document(name, value)?, vars, at),
         "$bucket" => parse_bucket(as_document(name, value)?, vars),
         "$bucketAuto" => parse_bucket_auto(as_document(name, value)?, vars),
+        "$setWindowFields" => crate::window::parse(as_document(name, value)?, vars)
+            .map(|spec| Stage::SetWindowFields(Box::new(spec))),
+        "$densify" => crate::densify::parse(as_document(name, value)?)
+            .map(|spec| Stage::Densify(Box::new(spec))),
+        "$fill" => crate::fill::parse(as_document(name, value)?, vars)
+            .map(|spec| Stage::Fill(Box::new(spec))),
         "$vectorSearch" => {
             // The stage is the pipeline's source, in place of the collection
             // scan, so it can only be the first stage of the top-level
@@ -599,7 +614,8 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         other => Err(Error::InvalidQuery(format!(
             "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
              $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup, $facet, \
-             $bucket, $bucketAuto, $graphLookup, $vectorSearch, $merge, $out"
+             $bucket, $bucketAuto, $graphLookup, $setWindowFields, $densify, $fill, \
+             $vectorSearch, $merge, $out"
         ))),
     }
 }
@@ -1252,7 +1268,7 @@ fn parse_group(spec: &Document, vars: &[String]) -> Result<Stage> {
 /// The `{<name>: {<accumulator>: <expression>}}` fields of `$group`, `$bucket`
 /// and `$bucketAuto`. `skip_id` leaves out the `_id` key, which `$group` reads
 /// itself.
-fn parse_accumulators(
+pub(crate) fn parse_accumulators(
     stage: &str,
     spec: &Document,
     vars: &[String],
@@ -1851,6 +1867,9 @@ pub fn apply_with_vars(
         Stage::BucketAuto { group_by, buckets, fields } => {
             bucket_auto(input, group_by, *buckets, fields, limits, vars)?
         }
+        Stage::SetWindowFields(spec) => crate::window::apply(spec, input, limits, vars)?,
+        Stage::Densify(spec) => crate::densify::apply(spec, input, limits)?,
+        Stage::Fill(spec) => crate::fill::apply(spec, input, limits, vars)?,
         Stage::VectorSearch(_) => {
             return Err(Error::Unsupported(
                 "$vectorSearch is the pipeline's source and must be run by the executor that \
@@ -2105,7 +2124,7 @@ struct Bucket {
     values: Vec<AccState>,
 }
 
-enum AccState {
+pub(crate) enum AccState {
     /// Exact while every input is integral — see [`Total`]. The previous
     /// `(f64, bool)` accumulated in a double and cast back, so a total above
     /// 2^53 was silently wrong despite the flag saying it was an integer.
@@ -2312,7 +2331,7 @@ fn bucket_auto(
     Ok(out)
 }
 
-fn init((_, acc): &(String, Accumulator)) -> AccState {
+pub(crate) fn init((_, acc): &(String, Accumulator)) -> AccState {
     match acc {
         Accumulator::Sum(_) => AccState::Sum(Total::default()),
         Accumulator::Avg(_) => AccState::Avg(Mean::default()),
@@ -2328,7 +2347,7 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
 
 /// Feed one document to one accumulator. Returns how many rows a bounded
 /// accumulator grew by, which the caller totals and holds to the stage's cap.
-fn accumulate(
+pub(crate) fn accumulate(
     state: &mut AccState,
     acc: &Accumulator,
     scope: &Scope<'_>,
@@ -2398,7 +2417,7 @@ fn check_held(stage: &str, held: usize, limits: &Limits) -> Result<()> {
     Ok(())
 }
 
-fn finish(state: AccState) -> Result<Bson> {
+pub(crate) fn finish(state: AccState) -> Result<Bson> {
     Ok(match state {
         // An integer sum stays an integer, exactly rather than approximately:
         // `Total` accumulates in i64 and only widens when an operand is a

@@ -572,7 +572,10 @@ impl KimmyMcp {
                        document of arrays), $bucket and $bucketAuto (histograms), \
                        $graphLookup (walk a collection link by link; maxDepth is required, \
                        restrictSearchWithMatch narrows the collection it reads whole; you \
-                       need read access to it), and $vectorSearch (semantic search as the \
+                       need read access to it), $setWindowFields (running totals, moving \
+                       averages, ranks and shifts over sorted partitions), $densify (fill \
+                       gaps in a number or date field) and $fill (fill null or missing \
+                       values), and $vectorSearch (semantic search as the \
                        first stage, with query or vector, k, per_document, filter; needs \
                        read access), and the last-stage writes $merge (into a collection \
                        by _id: whenMatched replace, merge or keepExisting, whenNotMatched \

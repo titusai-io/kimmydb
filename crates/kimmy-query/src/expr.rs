@@ -72,6 +72,7 @@ mod math;
 mod strings;
 mod tz;
 
+pub(crate) use dates::{add_to_date, is_date_unit, unit_millis};
 pub(crate) use docops::merge_into;
 
 use std::cmp::Ordering;

@@ -885,6 +885,33 @@ fn add_units(start: i64, unit: Unit, amount: i64, zone: &Zone, op: &str) -> Resu
     Ok(zone.local_to_utc(local))
 }
 
+/// The UTC instant `amount` calendar or elapsed `unit`s after `start`, for the stages
+/// that step through dates (`$setWindowFields` range windows, `$densify`). `unit` is one
+/// of the nine unit names; the zone is UTC, so a day and a week are fixed lengths.
+pub(crate) fn add_to_date(start: i64, unit: &str, amount: i64, op: &str) -> Result<i64> {
+    let unit = Unit::read(&Bson::String(unit.to_string()), op)?;
+    add_units(start, unit, amount, &Zone::Utc, op)
+}
+
+/// Whether `unit` names one of the nine date units.
+pub(crate) fn is_date_unit(unit: &str) -> bool {
+    Unit::read(&Bson::String(unit.to_string()), "").is_ok()
+}
+
+/// The length of `unit` in milliseconds in UTC, or `None` for month, quarter and year,
+/// which have no fixed length.
+pub(crate) fn unit_millis(unit: &str) -> Option<i64> {
+    match unit {
+        "week" => Some(7 * DAY_MS),
+        "day" => Some(DAY_MS),
+        "hour" => Some(3_600_000),
+        "minute" => Some(60_000),
+        "second" => Some(1_000),
+        "millisecond" => Some(1),
+        _ => None,
+    }
+}
+
 /// The number of unit boundaries crossed going from `start` to `end`.
 fn diff_units(start: i64, end: i64, unit: Unit, zone: &Zone, week_start: i64) -> i64 {
     if let Some(len) = unit.fixed_ms() {
