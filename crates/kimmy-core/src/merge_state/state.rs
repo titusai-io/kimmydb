@@ -49,6 +49,20 @@ pub struct Reg {
     pub soi: bool,
 }
 
+/// The largest magnitude of a counter total (a slot's, or a copy of one kept in a register's
+/// `obs`, a generation's `seen` or a loss record): 2^80.
+///
+/// A visible value saturates at the Int64 bound, but the totals underneath are `i128` sums that a
+/// writer's own `$inc`s can drive past it (a refused `$inc` is judged on the saturated value, not
+/// on the sum). Every total is bounded so that the read side's sums cannot overflow `i128`:
+/// each term is below 2^81 in magnitude, so overflow would need about 2^46 slots in one state,
+/// and a slot takes over a hundred bytes. The bound is enforced where totals come from outside,
+/// in [`MergeState::decode`], which refuses a larger one, and where they grow, in
+/// [`super::Writer::write_inc`], which refuses an `$inc` that would pass it. (The read side also
+/// adds with saturation, as a backstop for a state assembled by hand through the public fields.)
+/// An honest writer reaches 2^80 only after about 2^17 maximal increments on one path.
+pub const MAX_TOTAL: i128 = 1 << 80;
+
 /// A counter slot: one writer's running total in one generation.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Slot {
@@ -227,9 +241,9 @@ impl MergeState {
                 q == p && al.contains(l) && generation.is_none_or(|x| x < g.stamp)
             })
             .map(|((l, _, w, generation), s)| {
-                s.total - g.seen.get(&(*l, *w, *generation)).copied().unwrap_or(0)
+                s.total.saturating_sub(g.seen.get(&(*l, *w, *generation)).copied().unwrap_or(0))
             })
-            .sum()
+            .fold(0i128, i128::saturating_add)
     }
 
     /// The hidden figure of every path that has a nonzero one.
@@ -265,11 +279,11 @@ impl MergeState {
         let mut seen = base.is_some();
         for (k, s) in self.counted_in(p, al, win, o) {
             let ob = win.and_then(|w| w.obs.get(&k));
-            let d = s.total - ob.map_or(0, |x| x.1);
+            let d = s.total.saturating_sub(ob.map_or(0, |x| x.1));
             // B1: the field is present when the slot moved since the base saw it,
             // even if its increments net to 0 (a counter back at 0 is still there).
             if d != 0 || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.0 != s.stamp)) {
-                total += d;
+                total = total.saturating_add(d);
                 seen = true;
             }
         }

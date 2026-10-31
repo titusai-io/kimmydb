@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::join::{JoinOptions, join};
-use super::state::{Gen, Life, LifeKind, MergeState, ObsKey, Reg, Slot};
+use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot};
 use super::types::{LossKey, LossValue, MStamp, Value, WriterId};
 use crate::hlc::Hlc;
 
@@ -359,9 +359,9 @@ impl Writer {
         self.write_reg_unchecked(path, Value::Null, skew)
     }
 
-    /// `$inc path by n`. A local increment past the bound is refused (Q11); on a
-    /// double base it is a register write that starts a generation (Nm5); on a
-    /// string it is refused.
+    /// `$inc path by n`. A local increment past the bound is refused (Q11), and so is one that
+    /// would carry the writer's slot past [`MAX_TOTAL`]; on a double base it is a register
+    /// write that starts a generation (Nm5); on a string it is refused.
     pub fn write_inc(&mut self, p: &str, n: i64, skew: u64) -> Option<Written> {
         let vis = self.visible()?;
         let cur = vis.get(p);
@@ -378,13 +378,19 @@ impl Writer {
             }
             _ => return None,
         }
-        let st = self.tick(skew);
-        self.state.vv.insert(st.writer, st.hlc);
         let l = self.write_life()?;
         let generation = self.state.gen_of(p, &self.opts).map(|g| g.stamp);
         let key = (l, p.to_string(), self.id, generation);
         let old = self.state.slots.get(&key).map_or(0, |s| s.total);
-        self.state.slots.insert(key, Slot { stamp: st, total: old + i128::from(n) });
+        // The slot is this writer's running sum, which the saturated check above does not
+        // bound; refuse the `$inc` that would carry it past `MAX_TOTAL`.
+        let total = old.saturating_add(i128::from(n));
+        if total.unsigned_abs() > MAX_TOTAL.unsigned_abs() {
+            return None;
+        }
+        let st = self.tick(skew);
+        self.state.vv.insert(st.writer, st.hlc);
+        self.state.slots.insert(key, Slot { stamp: st, total });
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(l), vec![p.to_string()]);
         rec.n = Some(n);
         rec.generation = generation;

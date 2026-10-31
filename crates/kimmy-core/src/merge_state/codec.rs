@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use super::state::{Gen, Life, LifeKind, MergeState, ObsKey, Reg, Slot, Vv};
+use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
@@ -43,6 +43,8 @@ pub enum DecodeError {
     BadString,
     #[error("merge state: {0} trailing bytes")]
     Trailing(usize),
+    #[error("merge state: a counter total is out of range")]
+    TotalOutOfRange,
 }
 
 // ---- writing ---------------------------------------------------------------
@@ -307,7 +309,7 @@ impl MergeState {
             let wr = r.wid()?;
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
-            let total = r.i128()?;
+            let total = r.total()?;
             s.slots.insert((l, p, wr, g), Slot { stamp, total });
         }
         s.vv = r.vv()?;
@@ -361,6 +363,14 @@ impl R<'_> {
     fn i128(&mut self) -> Result<i128, DecodeError> {
         Ok(i128::from_be_bytes(self.arr()?))
     }
+    /// A counter total: an `i128` of magnitude at most [`MAX_TOTAL`] (see there).
+    fn total(&mut self) -> Result<i128, DecodeError> {
+        let t = self.i128()?;
+        if t.unsigned_abs() > MAX_TOTAL.unsigned_abs() {
+            return Err(DecodeError::TotalOutOfRange);
+        }
+        Ok(t)
+    }
     fn str(&mut self) -> Result<String, DecodeError> {
         let n = self.len()?;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| DecodeError::BadString)
@@ -406,7 +416,7 @@ impl R<'_> {
             let l = self.stamp()?;
             let w = self.wid()?;
             let g = self.opt_stamp()?;
-            m.insert((l, w, g), self.i128()?);
+            m.insert((l, w, g), self.total()?);
         }
         Ok(m)
     }
@@ -417,7 +427,7 @@ impl R<'_> {
             let w = self.wid()?;
             let g = self.opt_stamp()?;
             let s = self.stamp()?;
-            m.insert((l, w, g), (s, self.i128()?));
+            m.insert((l, w, g), (s, self.total()?));
         }
         Ok(m)
     }
@@ -446,7 +456,7 @@ impl R<'_> {
     fn loss_value(&mut self) -> Result<LossValue, DecodeError> {
         match self.u8()? {
             0 => Ok(LossValue::Value(self.value()?)),
-            1 => Ok(LossValue::Total(self.i128()?)),
+            1 => Ok(LossValue::Total(self.total()?)),
             2 => {
                 let mut f = Vec::new();
                 for _ in 0..self.len()? {

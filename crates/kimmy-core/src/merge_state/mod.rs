@@ -36,7 +36,7 @@ mod tests;
 
 pub use codec::DecodeError;
 pub use join::{JoinOptions, join};
-pub use state::{Gen, Life, LifeKind, MergeState, ObsKey, Reg, Slot, Vv};
+pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 pub use types::{Epoch, LossKey, LossKind, LossValue, MStamp, Value, WriterId};
 pub use writer::{Received, WriteKind, WriteRecord, Writer, Written};
 

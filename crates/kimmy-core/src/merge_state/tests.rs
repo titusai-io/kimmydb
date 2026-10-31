@@ -1303,3 +1303,120 @@ fn upsert_creation_generation_is_recorded_like_insert() {
     assert!(w.state.regs[&(st, "k".to_string())].generation.is_none());
     assert!(!w.state.gens.contains_key(&(st, "k".to_string())));
 }
+
+// ---- m1: counter totals cannot overflow the read side ------------------------------------
+
+/// A state with one upserted life and a slot on `x` for writers B and C, set to `total` each.
+fn state_with_big_slots(total: i128) -> (MergeState, MStamp) {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.upsert_inc("x", 1, 0).unwrap();
+    let mut st = w.state.clone();
+    let life = *st.lives.keys().next().unwrap();
+    let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
+    for c in ['B', 'C'] {
+        st.slots.insert((life, "x".into(), wid(c, 0), None), Slot { stamp, total });
+    }
+    (st, life)
+}
+
+#[test]
+fn decode_refuses_totals_past_the_bound() {
+    // Two slots at i128::MAX would overflow a plain sum: the decoder refuses them.
+    let (st, _) = state_with_big_slots(i128::MAX);
+    assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
+    let (st, _) = state_with_big_slots(i128::MIN);
+    assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
+    // The bound itself is accepted, one past it (either sign) is not.
+    let (st, _) = state_with_big_slots(MAX_TOTAL);
+    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
+    let (st, _) = state_with_big_slots(-MAX_TOTAL);
+    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
+    let (st, _) = state_with_big_slots(MAX_TOTAL + 1);
+    assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
+    let (st, _) = state_with_big_slots(-MAX_TOTAL - 1);
+    assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
+    // The same copies elsewhere: a register's `obs`, a generation's `seen`, a loss record.
+    let o = opts();
+    let mut w = Writer::new(wid('A', 0), o.clone());
+    w.insert(&[("x", i(1))], 0).unwrap();
+    w.write_inc("x", 2, 0).unwrap();
+    w.write_set("x", s("t"), 0).unwrap();
+    let mut good = w.state.clone();
+    good.losses.insert(
+        LossKey {
+            kind: LossKind::Clash,
+            path: "x".into(),
+            stamp: *good.lives.keys().next().unwrap(),
+        },
+        LossValue::Total(5),
+    );
+    assert_eq!(MergeState::decode(&good.encode()).unwrap(), good);
+    let big = MAX_TOTAL + 1;
+    let mut bad = good.clone();
+    for r in bad.regs.values_mut() {
+        for v in r.obs.values_mut() {
+            v.1 = big;
+        }
+    }
+    let mut hit = 0;
+    let mut try_state = |st: &MergeState| {
+        hit += 1;
+        assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
+    };
+    if bad.regs.values().any(|r| !r.obs.is_empty()) {
+        try_state(&bad);
+    }
+    let mut bad = good.clone();
+    for r in bad.regs.values_mut() {
+        if let Some(g) = r.generation.as_mut() {
+            g.seen.insert((g.stamp, wid('A', 0), None), big);
+        }
+    }
+    try_state(&bad);
+    let mut bad = good.clone();
+    for v in bad.losses.values_mut() {
+        *v = LossValue::Total(big);
+    }
+    try_state(&bad);
+    assert_eq!(hit, 3, "each copy of a total was exercised");
+}
+
+#[test]
+fn read_side_cannot_overflow_on_a_hand_built_state() {
+    // The decoder keeps such totals out, but the fields are public: the read side must not
+    // panic (debug) or wrap (release) on a state assembled by hand.
+    let (st, _) = state_with_big_slots(i128::MAX);
+    let o = opts();
+    assert_eq!(st.value("x", &o), Some(i(i64::MAX)), "saturates at the bound");
+    assert_eq!(st.visible(&o).unwrap()["x"], i(i64::MAX));
+    let _ = st.hidden_all(&o);
+    let (st, _) = state_with_big_slots(i128::MIN);
+    assert_eq!(st.value("x", &o), Some(i(i64::MIN)));
+    let mut w = Writer::from_state(wid('A', 0), st, o);
+    assert!(w.write_inc("x", -1, 0).is_none(), "one past the lower bound");
+    assert!(w.write_inc("x", 1, 0).is_some());
+}
+
+#[test]
+fn write_inc_refuses_a_slot_past_the_total_bound() {
+    // A's own slot sits just under the bound, balanced by B's: the visible value is small, so
+    // the Int64 check passes, but the slot itself may not pass MAX_TOTAL.
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.upsert_inc("x", 1, 0).unwrap();
+    let life = *w.state.lives.keys().next().unwrap();
+    let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
+    w.state.slots.insert(
+        (life, "x".into(), wid('A', 0), None),
+        Slot { stamp: w.state.slots.values().next().unwrap().stamp, total: MAX_TOTAL - 2 },
+    );
+    w.state
+        .slots
+        .insert((life, "x".into(), wid('B', 0), None), Slot { stamp, total: -(MAX_TOTAL - 2) });
+    assert_eq!(w.visible().unwrap()["x"], i(0));
+    let clock = w.clock;
+    assert!(w.write_inc("x", 3, 0).is_none(), "MAX_TOTAL + 1");
+    assert_eq!(w.clock, clock, "a refused write does not tick");
+    assert!(w.write_inc("x", 2, 0).is_some(), "exactly MAX_TOTAL");
+    assert!(w.write_inc("x", 1, 0).is_none());
+    assert!(w.write_inc("x", -1, 0).is_some());
+}
