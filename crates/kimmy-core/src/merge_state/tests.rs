@@ -1029,3 +1029,28 @@ fn q4_replace_compares_value_and_type() {
     assert_eq!(r.record.paths, vec!["q".to_string(), "x".to_string()]);
     assert_eq!(w.visible(), doc(&[("q", i(1))]));
 }
+
+#[test]
+fn upsert_soi_is_create_then_inc() {
+    let fields = [("theme", s("dark"))];
+    let sets = [("lang", s("en"))];
+    let mut whole = Writer::new(wid('B', 0), opts());
+    let (c1, n1) = whole.upsert_soi(&fields, "views", 3, &sets, 2).unwrap();
+    let mut parts = Writer::new(wid('B', 0), opts());
+    let c2 = parts.upsert_soi_create(&fields, &sets, 2).unwrap();
+    // Between the two writes: the life and the cells, no slot, nothing visible yet but the cells.
+    assert!(parts.state.slots.is_empty());
+    assert!(parts.state.lives.contains_key(&c2.stamp));
+    assert_eq!(parts.state.regs.len(), 2);
+    assert_eq!(parts.visible(), doc(&[("theme", s("dark")), ("lang", s("en"))]));
+    // The increment needs an alive life.
+    assert!(
+        parts.upsert_inc_on(MStamp { hlc: h(99), writer: wid('Z', 0) }, "views", 3, 2).is_none()
+    );
+    let n2 = parts.upsert_inc_on(c2.stamp, "views", 3, 2).unwrap();
+    assert_eq!((c1, n1), (c2, n2));
+    assert_eq!(whole.state, parts.state);
+    assert_eq!(whole.clock, parts.clock);
+    // Not while a life is alive.
+    assert!(parts.upsert_soi_create(&fields, &sets, 0).is_none());
+}

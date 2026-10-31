@@ -212,6 +212,21 @@ impl Writer {
         sets: &[(&str, Value)],
         skew: u64,
     ) -> Option<(Written, Written)> {
+        let created = self.upsert_soi_create(fields, sets, skew)?;
+        let life = created.stamp;
+        let incd = self.upsert_inc_on(life, inc_path, n, skew)?;
+        Some((created, incd))
+    }
+
+    /// The creation write of a `$setOnInsert` upsert: the new life (kind upsert),
+    /// the `$setOnInsert` cells tagged and the `$set` cells untagged, no slot.
+    /// Refused while a life is alive.
+    pub fn upsert_soi_create(
+        &mut self,
+        fields: &[(&str, Value)],
+        sets: &[(&str, Value)],
+        skew: u64,
+    ) -> Option<Written> {
         if !self.state.alive(&self.opts).is_empty() {
             return None;
         }
@@ -263,18 +278,31 @@ impl Writer {
         rec.upsert = true;
         rec.insert = true;
         rec.soi = fields.iter().map(|(p, _)| p.to_string()).collect();
-        let created = self.finish(st, rec);
+        Some(self.finish(st, rec))
+    }
+
+    /// The increment write of an upsert on the life `life` (the stamp of its
+    /// creation write): a slot of `path` for this writer, with the write's own
+    /// stamp. Refused (`None`) unless `life` is alive.
+    pub fn upsert_inc_on(
+        &mut self,
+        life: MStamp,
+        path: &str,
+        n: i64,
+        skew: u64,
+    ) -> Option<Written> {
+        if !self.state.alive(&self.opts).contains(&life) {
+            return None;
+        }
         let st2 = self.tick(skew);
-        // `finish` normalised the writer's state into a new value.
         self.state.vv.insert(st2.writer, st2.hlc);
         self.state.slots.insert(
-            (st, inc_path.to_string(), self.id, None),
+            (life, path.to_string(), self.id, None),
             Slot { stamp: st2, total: i128::from(n) },
         );
-        let mut rec2 = WriteRecord::new(WriteKind::Inc, Some(st), vec![inc_path.to_string()]);
-        rec2.n = Some(n);
-        let incd = self.finish(st2, rec2);
-        Some((created, incd))
+        let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.to_string()]);
+        rec.n = Some(n);
+        Some(self.finish(st2, rec))
     }
 
     /// An upserting `$inc` that creates the document; refused while a life is alive.
