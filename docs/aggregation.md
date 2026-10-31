@@ -301,7 +301,7 @@ strings has the same effect. `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META
 
 outputs every input document, **then** the documents of `coll` in the pipeline's database,
 run through `pipeline` if there is one ([ADR-263](decisions.md)). It has an answer when the
-input is empty (the other collection's), and a `coll` that does not exist reads as empty.
+input is empty (the other collection's). A `coll` that does not exist reads as empty on a node with no peers; on a node in a cluster it is `404` with the retry hint `elsewhere`, as for `$lookup`, since another member may have just created it.
 The operand is a collection name or `{coll, pipeline}`; a missing `coll` (the reference's
 pipeline-only form, which needs a document source this build does not have), another
 key, a `pipeline` that is not an array of stage documents and an empty name are `400`.

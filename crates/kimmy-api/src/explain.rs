@@ -217,7 +217,7 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
                 json!(spec.stages.iter().map(|s| describe(s, false)).collect::<Vec<_>>());
             out["readsForeign"] = json!(
                 "once per execution of the stage, even when no document reaches it; a collection \
-                 that does not exist reads as empty"
+                 that does not exist reads as empty on a node with no peers"
             );
             "emits every document that reaches it, then the foreign collection's documents run \
              through the sub-pipeline; the collection is read whole, and what is read, what the \

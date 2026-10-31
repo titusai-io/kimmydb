@@ -281,3 +281,37 @@ fn a_union_with_is_planned_and_listed_by_explain() {
     assert_eq!(stage["runs"], "foreignScan");
     assert_eq!(stage["stages"][0]["stage"], "$match");
 }
+
+#[test]
+fn on_a_node_with_peers_a_missing_collection_is_the_lookup_404_with_the_retry_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir);
+    let members = kimmy_cluster::Members::default();
+    state.set_members(members.clone());
+    // No peer yet: nowhere else it could be, so empty.
+    let out = run(&state, json!([{"$unionWith": "nowhere"}])).unwrap();
+    assert_eq!(keys(&out), ["o1", "o2", "o3"]);
+    members.insert_for_test("127.0.0.1:7001".parse().unwrap(), kimmy_core::NodeId::generate());
+    // A peer may hold it: the same refusal `$lookup` gives, with its hint.
+    let union = run(&state, json!([{"$unionWith": "nowhere"}])).expect_err("a peer may have it");
+    let lookup = run(
+        &state,
+        json!([{"$lookup": {"from": "nowhere", "localField": "k", "foreignField": "k", "as": "j"}}]),
+    )
+    .expect_err("the lookup");
+    assert_eq!(union.status, 404, "{union:?}");
+    assert_eq!(union.status, lookup.status);
+    assert_eq!(union.message, lookup.message);
+    assert_eq!(union.retry_override, lookup.retry_override);
+    assert!(union.message.contains("not found on this member"), "{union:?}");
+    // One that exists is read as before.
+    let out = run(&state, json!([{"$unionWith": "archive"}])).unwrap();
+    assert_eq!(keys(&out).len(), 6);
+    // The same inside a nested sub-pipeline, and a denied caller still gets 403 first (api test).
+    let nested = run(
+        &state,
+        json!([{"$unionWith": {"coll": "archive", "pipeline": [{"$unionWith": "nowhere"}]}}]),
+    )
+    .expect_err("nested");
+    assert_eq!(nested.status, 404);
+}

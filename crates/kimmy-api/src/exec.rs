@@ -2750,7 +2750,8 @@ fn lookup_pipeline(
 ///
 /// The second authorization point is `read` on the named collection, checked first, so a
 /// denied caller learns nothing about whether it exists; a collection that does not exist
-/// reads as empty. Unlike a join, the stage has something to answer when its input is
+/// reads as empty on a node with no peers, and on a node with peers is `$lookup`'s `404`
+/// with the retry hint (it may be about to arrive from another member). Unlike a join, the stage has something to answer when its input is
 /// empty, so it reads either way. The collection is walked once and refused at the first
 /// document past the pipeline's document limit (a leading `$match` of the sub-pipeline is
 /// applied as it is read, so what it declines is not held or counted); the bytes read are
@@ -2769,12 +2770,15 @@ fn union_with(
     let name = spec.coll.as_str();
     kimmy_core::Error::validate_name(name)?;
     auth.require(Action::Read, db, Some(name))?;
-    let meta = match state.engine.get_collection(db, name) {
+    // Resolved the way `$lookup` resolves its foreign collection. On a node with peers a
+    // missing one may exist on another member and arrive within a sync round, so it is
+    // that `404` with its retry hint, not an empty read; on a node with none there is
+    // nowhere else it could be, and it reads as empty.
+    let has_peers = state.members().is_some_and(|m| !m.is_empty());
+    let meta = match collection(state, db, name) {
         Ok(meta) => Some(meta),
-        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
-            ..
-        })) => None,
-        Err(e) => return Err(e.into()),
+        Err(e) if !has_peers && e.status == axum::http::StatusCode::NOT_FOUND => None,
+        Err(e) => return Err(e),
     };
     let (lead, rest) = match aggregate::leading_match(&spec.stages) {
         Some((filter, consumed)) => (Some(filter), &spec.stages[consumed..]),
