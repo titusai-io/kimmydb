@@ -1054,3 +1054,75 @@ fn upsert_soi_is_create_then_inc() {
     // Not while a life is alive.
     assert!(parts.upsert_soi_create(&fields, &sets, 0).is_none());
 }
+
+// ---- B1: a counter that returns to exactly 0 stays in the document ---------------------
+
+#[test]
+fn zero_sum_counter_vanishes() {
+    // insert {n:"a"}; $inc views +1; $inc views -1  =>  {n:"a", views:0}
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("n", s("a"))], 0).unwrap();
+    w.write_inc("views", 1, 0).unwrap();
+    w.write_inc("views", -1, 0).unwrap();
+    assert_eq!(w.visible(), doc(&[("n", s("a")), ("views", i(0))]));
+
+    // upsert $inc views +1; $inc views -1  =>  {views:0}
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.upsert_inc("views", 1, 0).unwrap();
+    w.write_inc("views", -1, 0).unwrap();
+    assert_eq!(w.visible(), doc(&[("views", i(0))]));
+
+    // $inc 0 on a missing field creates it at 0.
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("n", s("a"))], 0).unwrap();
+    w.write_inc("x", 0, 0).unwrap();
+    assert_eq!(w.visible(), doc(&[("n", s("a")), ("x", i(0))]));
+
+    // {x:100}; $unset x; $inc x +5; $inc x -5  =>  {x:0}
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("x", i(100))], 0).unwrap();
+    w.write_unset("x", 0).unwrap();
+    w.write_inc("x", 5, 0).unwrap();
+    w.write_inc("x", -5, 0).unwrap();
+    assert_eq!(w.visible(), doc(&[("x", i(0))]));
+}
+
+#[test]
+fn zero_sum_counter_survives_the_join() {
+    // The same sequence on a replica that only receives the states, in either order.
+    let mut a = Writer::new(wid('A', 0), opts());
+    a.upsert_inc("views", 1, 0).unwrap();
+    let mid = a.state.clone();
+    a.write_inc("views", -1, 0).unwrap();
+    let mut b = Writer::new(wid('B', 0), opts());
+    b.receive(&a.state);
+    b.receive(&mid);
+    assert_eq!(b.visible(), doc(&[("views", i(0))]));
+    assert_eq!(b.state.state_hash(), a.state.state_hash());
+}
+
+#[test]
+fn register_obs_keeps_the_slot_stamp() {
+    // A base that observed a slot at total T, after which the slot moved and came back to T,
+    // still counts the field present, and the figure is T - T = 0 on top of the base.
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("x", i(10))], 0).unwrap();
+    w.write_inc("x", 3, 0).unwrap();
+    w.write_set("x", i(20), 0).unwrap();
+    let r = w.state.regs.values().find(|r| r.value == i(20)).unwrap();
+    assert!(!r.obs.is_empty() && r.obs.values().all(|(st, t)| *t == 3 && *st < r.stamp));
+    w.write_inc("x", 4, 0).unwrap();
+    w.write_inc("x", -4, 0).unwrap();
+    assert_eq!(w.visible(), doc(&[("x", i(20))]));
+}
+
+#[test]
+fn b1_mutant_is_visible_to_the_lib_tests() {
+    // With the slot stamp ignored the zero-sum counter is absent again: the mutant is killed.
+    let o = JoinOptions { value_ignores_slot_stamp: true, ..opts() };
+    let mut w = Writer::new(wid('A', 0), o);
+    w.insert(&[("n", s("a"))], 0).unwrap();
+    w.write_inc("views", 1, 0).unwrap();
+    w.write_inc("views", -1, 0).unwrap();
+    assert_eq!(w.visible(), doc(&[("n", s("a"))]));
+}

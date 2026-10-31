@@ -128,8 +128,12 @@ impl Writer {
             .collect()
     }
 
-    fn obs(&self, p: &str) -> BTreeMap<ObsKey, i128> {
-        self.state.counted(p, &self.opts).into_iter().map(|(k, v)| (k, v.total)).collect()
+    fn obs(&self, p: &str) -> BTreeMap<ObsKey, (MStamp, i128)> {
+        self.state
+            .counted(p, &self.opts)
+            .into_iter()
+            .map(|(k, v)| (k, (v.stamp, v.total)))
+            .collect()
     }
 
     fn setreg(&mut self, p: &str, v: Value, st: MStamp) {

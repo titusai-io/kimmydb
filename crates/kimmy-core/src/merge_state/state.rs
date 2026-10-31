@@ -37,13 +37,14 @@ pub struct Gen {
     pub seen: BTreeMap<ObsKey, i128>,
 }
 
-/// A register cell: higher stamp wins. `obs` is what the writer had counted,
-/// `generation` the generation of this base, `soi` marks `$setOnInsert` creation cells.
+/// A register cell: higher stamp wins. `obs` is what the writer had counted: for each
+/// counted slot the slot's stamp and total at that time (the stamp tells a slot that has
+/// not moved since from one that moved and came back to the same total). `generation` the generation of this base, `soi` marks `$setOnInsert` creation cells.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Reg {
     pub stamp: MStamp,
     pub value: Value,
-    pub obs: BTreeMap<ObsKey, i128>,
+    pub obs: BTreeMap<ObsKey, (MStamp, i128)>,
     pub generation: Option<Gen>,
     pub soi: bool,
 }
@@ -263,8 +264,11 @@ impl MergeState {
         let mut total = base.unwrap_or(0);
         let mut seen = base.is_some();
         for (k, s) in self.counted_in(p, al, win, o) {
-            let d = s.total - win.and_then(|w| w.obs.get(&k).copied()).unwrap_or(0);
-            if d != 0 {
+            let ob = win.and_then(|w| w.obs.get(&k));
+            let d = s.total - ob.map_or(0, |x| x.1);
+            // B1: the field is present when the slot moved since the base saw it,
+            // even if its increments net to 0 (a counter back at 0 is still there).
+            if d != 0 || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.0 != s.stamp)) {
                 total += d;
                 seen = true;
             }

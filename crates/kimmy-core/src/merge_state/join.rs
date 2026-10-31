@@ -36,6 +36,10 @@ pub struct JoinOptions {
     /// when it lost). Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
     pub v3_generation: bool,
+    /// B1 mutant: the read side ignores the slot stamp in a register's `obs`, so a
+    /// counter whose increments net to 0 is absent again. Off in the design.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub value_ignores_slot_stamp: bool,
     /// The model's `NORMALIZE_WRITES`: a writer normalises its own state through
     /// a join with the empty state after each write (off only to reproduce the
     /// un-normalised states of `model5.Member`).
@@ -59,6 +63,8 @@ impl Default for JoinOptions {
             suppress_soi: true,
             #[cfg(any(test, feature = "merge-mutants"))]
             v3_generation: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            value_ignores_slot_stamp: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             normalize_writes: true,
         }
@@ -104,6 +110,14 @@ impl JoinOptions {
     }
     #[cfg(not(any(test, feature = "merge-mutants")))]
     pub(super) fn v3_generation(&self) -> bool {
+        false
+    }
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub(super) fn value_ignores_slot_stamp(&self) -> bool {
+        self.value_ignores_slot_stamp
+    }
+    #[cfg(not(any(test, feature = "merge-mutants")))]
+    pub(super) fn value_ignores_slot_stamp(&self) -> bool {
         false
     }
     #[cfg(any(test, feature = "merge-mutants"))]

@@ -119,6 +119,16 @@ impl W {
             self.i128(*t);
         }
     }
+    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, i128)>) {
+        self.len(m.len());
+        for ((l, w, g), (s, t)) in m {
+            self.stamp(l);
+            self.wid(w);
+            self.opt_stamp(g);
+            self.stamp(s);
+            self.i128(*t);
+        }
+    }
     fn gen_(&mut self, g: &Option<Gen>) {
         match g {
             None => self.u8(0),
@@ -194,7 +204,7 @@ impl MergeState {
             w.str(p);
             w.stamp(&r.stamp);
             w.value(&r.value);
-            w.obs(&r.obs);
+            w.obs_stamped(&r.obs);
             w.gen_(&r.generation);
             w.u8(u8::from(r.soi));
         }
@@ -286,7 +296,7 @@ impl MergeState {
             let p = r.str()?;
             let stamp = r.stamp()?;
             let value = r.value()?;
-            let obs = r.obs()?;
+            let obs = r.obs_stamped()?;
             let generation = r.gen_()?;
             let soi = r.u8()? != 0;
             s.regs.insert((l, p), Reg { stamp, value, obs, generation, soi });
@@ -397,6 +407,17 @@ impl R<'_> {
             let w = self.wid()?;
             let g = self.opt_stamp()?;
             m.insert((l, w, g), self.i128()?);
+        }
+        Ok(m)
+    }
+    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, i128)>, DecodeError> {
+        let mut m = BTreeMap::new();
+        for _ in 0..self.len()? {
+            let l = self.stamp()?;
+            let w = self.wid()?;
+            let g = self.opt_stamp()?;
+            let s = self.stamp()?;
+            m.insert((l, w, g), (s, self.i128()?));
         }
         Ok(m)
     }
