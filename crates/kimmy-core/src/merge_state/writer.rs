@@ -135,7 +135,7 @@ impl Writer {
     fn setreg(&mut self, p: &str, v: Value, st: MStamp) {
         let l = self.write_life().expect("a register write needs an alive life");
         let generation = if v.is_numeric() {
-            self.state.gen_of(p, &self.opts).cloned()
+            self.state.gen_of(p, &self.opts).map(std::borrow::Cow::into_owned)
         } else {
             Some(Gen { stamp: st, vv: self.state.vv.clone(), seen: self.seen(p) })
         };

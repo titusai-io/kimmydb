@@ -1,5 +1,6 @@
 //! The merge state and its read side (the model's `State`).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::join::JoinOptions;
@@ -115,21 +116,27 @@ impl MergeState {
 
     /// V6m2: the creation cells of an upsert-created life are dropped when an
     /// explicit insert is alive (any insert, re-inserts included).
-    pub(crate) fn suppressed(&self, life: &MStamp, r: &Reg, al: &BTreeSet<MStamp>) -> bool {
+    pub(crate) fn suppressed(
+        &self,
+        life: &MStamp,
+        r: &Reg,
+        al: &BTreeSet<MStamp>,
+        o: &JoinOptions,
+    ) -> bool {
         match self.lives.get(life) {
-            Some(l) if l.kind == LifeKind::Upsert && r.soi => {
+            Some(l) if l.kind == LifeKind::Upsert && r.soi && o.suppress_soi() => {
                 al.iter().any(|a| self.lives.get(a).is_some_and(|v| v.kind == LifeKind::Insert))
             }
             _ => false,
         }
     }
 
-    fn winner_in(&self, p: &str, al: &BTreeSet<MStamp>) -> Option<&Reg> {
+    fn winner_in(&self, p: &str, al: &BTreeSet<MStamp>, o: &JoinOptions) -> Option<&Reg> {
         let mut best: Option<&Reg> = None;
         for ((l, q), r) in &self.regs {
             if q == p
                 && al.contains(l)
-                && !self.suppressed(l, r, al)
+                && !self.suppressed(l, r, al, o)
                 && best.is_none_or(|b| r.stamp > b.stamp)
             {
                 best = Some(r);
@@ -140,12 +147,34 @@ impl MergeState {
 
     /// The winning register of `p` among the alive lives.
     pub fn winner(&self, p: &str, o: &JoinOptions) -> Option<&Reg> {
-        self.winner_in(p, &self.alive_set(o.retention))
+        self.winner_in(p, &self.alive_set(o.retention), o)
     }
 
     /// V3M3: the generation of the winning base.
-    pub fn gen_of(&self, p: &str, o: &JoinOptions) -> Option<&Gen> {
-        self.winner(p, o).and_then(|w| w.generation.as_ref())
+    pub fn gen_of(&self, p: &str, o: &JoinOptions) -> Option<Cow<'_, Gen>> {
+        let al = self.alive_set(o.retention);
+        self.gen_in(p, &al, self.winner_in(p, &al, o), o)
+    }
+
+    /// The generation `win` (the winner of `p`) belongs to. Under the V3M3
+    /// mutant switch, the v3 rule instead: the newest non-numeric base among
+    /// the alive lives, even when it lost.
+    fn gen_in<'a>(
+        &'a self,
+        p: &str,
+        al: &BTreeSet<MStamp>,
+        win: Option<&'a Reg>,
+        o: &JoinOptions,
+    ) -> Option<Cow<'a, Gen>> {
+        if !o.v3_generation() {
+            return win.and_then(|w| w.generation.as_ref()).map(Cow::Borrowed);
+        }
+        self.gens
+            .iter()
+            .filter(|((l, q), _)| q == p && al.contains(l))
+            .map(|(_, g)| g)
+            .max_by_key(|g| g.0)
+            .map(|(st, vv)| Cow::Owned(Gen { stamp: *st, vv: vv.clone(), seen: BTreeMap::new() }))
     }
 
     /// Slots of the winning base's generation and of NEWER generations (their
@@ -153,8 +182,8 @@ impl MergeState {
     /// overwritten (hidden).
     pub fn counted(&self, p: &str, o: &JoinOptions) -> BTreeMap<ObsKey, &Slot> {
         let al = self.alive_set(o.retention);
-        let win = self.winner_in(p, &al);
-        self.counted_in(p, &al, win)
+        let win = self.winner_in(p, &al, o);
+        self.counted_in(p, &al, win, o)
     }
 
     fn counted_in(
@@ -162,8 +191,9 @@ impl MergeState {
         p: &str,
         al: &BTreeSet<MStamp>,
         win: Option<&Reg>,
+        o: &JoinOptions,
     ) -> BTreeMap<ObsKey, &Slot> {
-        let g = win.and_then(|w| w.generation.as_ref()).map(|g| g.stamp);
+        let g = self.gen_in(p, al, win, o).map(|g| g.stamp);
         self.slots
             .iter()
             .filter(|((l, q, _, generation), _)| {
@@ -182,11 +212,12 @@ impl MergeState {
     /// seen (slot total minus the total the starter saw).
     pub fn hidden(&self, p: &str, o: &JoinOptions) -> i128 {
         let al = self.alive_set(o.retention);
-        self.hidden_in(p, &al)
+        self.hidden_in(p, &al, o)
     }
 
-    fn hidden_in(&self, p: &str, al: &BTreeSet<MStamp>) -> i128 {
-        let Some(g) = self.winner_in(p, al).and_then(|w| w.generation.as_ref()) else {
+    fn hidden_in(&self, p: &str, al: &BTreeSet<MStamp>, o: &JoinOptions) -> i128 {
+        let win = self.winner_in(p, al, o);
+        let Some(g) = self.gen_in(p, al, win, o) else {
             return 0;
         };
         self.slots
@@ -208,7 +239,7 @@ impl MergeState {
         paths
             .into_iter()
             .filter_map(|p| {
-                let h = self.hidden_in(p, &al);
+                let h = self.hidden_in(p, &al, o);
                 (h != 0).then(|| (p.clone(), h))
             })
             .collect()
@@ -221,7 +252,7 @@ impl MergeState {
     }
 
     fn value_in(&self, p: &str, al: &BTreeSet<MStamp>, o: &JoinOptions) -> Option<Value> {
-        let win = self.winner_in(p, al);
+        let win = self.winner_in(p, al, o);
         if let Some(w) = win
             && !w.value.is_numeric()
         {
@@ -231,7 +262,7 @@ impl MergeState {
             win.and_then(|w| if let Value::Int(i) = w.value { Some(i128::from(i)) } else { None });
         let mut total = base.unwrap_or(0);
         let mut seen = base.is_some();
-        for (k, s) in self.counted_in(p, al, win) {
+        for (k, s) in self.counted_in(p, al, win, o) {
             let d = s.total - win.and_then(|w| w.obs.get(&k).copied()).unwrap_or(0);
             if d != 0 {
                 total += d;
@@ -251,7 +282,7 @@ impl MergeState {
         }
         let mut paths: BTreeSet<&str> = BTreeSet::new();
         for ((l, p), r) in &self.regs {
-            if al.contains(l) && !self.suppressed(l, r, &al) {
+            if al.contains(l) && !self.suppressed(l, r, &al, o) {
                 paths.insert(p);
             }
         }

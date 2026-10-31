@@ -28,6 +28,14 @@ pub struct JoinOptions {
     /// V6M1: writes into a superseded first insert are reported.
     #[cfg(any(test, feature = "merge-mutants"))]
     pub cells_reported: bool,
+    /// V6m2/V7m1: `$setOnInsert` creation cells of an upsert are dropped from
+    /// the read side while an explicit insert is alive.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub suppress_soi: bool,
+    /// V3M3: the v3 generation rule (the newest non-numeric base counts, even
+    /// when it lost). Off in the design.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub v3_generation: bool,
     /// The model's `NORMALIZE_WRITES`: a writer normalises its own state through
     /// a join with the empty state after each write (off only to reproduce the
     /// un-normalised states of `model5.Member`).
@@ -47,6 +55,10 @@ impl Default for JoinOptions {
             supersede: true,
             #[cfg(any(test, feature = "merge-mutants"))]
             cells_reported: true,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            suppress_soi: true,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            v3_generation: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             normalize_writes: true,
         }
@@ -77,6 +89,22 @@ impl JoinOptions {
     #[cfg(not(any(test, feature = "merge-mutants")))]
     fn cells_reported(&self) -> bool {
         true
+    }
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub(super) fn suppress_soi(&self) -> bool {
+        self.suppress_soi
+    }
+    #[cfg(not(any(test, feature = "merge-mutants")))]
+    pub(super) fn suppress_soi(&self) -> bool {
+        true
+    }
+    #[cfg(any(test, feature = "merge-mutants"))]
+    pub(super) fn v3_generation(&self) -> bool {
+        self.v3_generation
+    }
+    #[cfg(not(any(test, feature = "merge-mutants")))]
+    pub(super) fn v3_generation(&self) -> bool {
+        false
     }
     #[cfg(any(test, feature = "merge-mutants"))]
     pub(super) fn normalize_writes(&self) -> bool {
