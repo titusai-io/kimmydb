@@ -32,9 +32,11 @@ sha2 = "0.11"
 # from a crate that builds some C with `cc`.
 local-embeddings = []
 
-# Reproduces the Q7 merge model's mutants (horizon-first, supersession,
-# reported cells) through extra `JoinOptions` fields. Off by default; the
-# production code path is the same code with the switches at their correct values.
+# Reproduces the Q7 merge model's mutants (horizon-first, supersession, reported cells,
+# `$setOnInsert` suppression, the v3 generation rule, the B1 and M1 rules, write
+# normalisation) through `set_*` methods on `JoinOptions`, and the mutation memory the
+# V3M3 and V4M1 mutants read. Off by default; the production code path is the same code
+# with the switches at their correct values. It also builds the test harness below.
 merge-mutants = []
 
 # The Q7 P0 property-test harness (a port of the reviewed Python model): the

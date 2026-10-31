@@ -35,20 +35,24 @@ mod prop_tests;
 mod tests;
 
 pub use codec::DecodeError;
-pub use join::{JoinOptions, join};
+pub use join::{InvalidIntBound, JoinOptions, join};
 pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 pub use types::{Epoch, LossKey, LossKind, LossValue, MStamp, Value, WriterId};
 pub use writer::{Received, WriteKind, WriteRecord, Writer, Written};
 
 // Production signatures. These items compile in EVERY build (with and without the
-// `merge-mutants` feature, test or not): the mutation switches are fields of
-// `JoinOptions` read inside unchanged function bodies, never a different signature.
+// `merge-mutants` feature, test or not): the mutation switches are private fields of
+// `JoinOptions` read inside unchanged function bodies, never a different signature or a
+// different set of public fields.
 // A change to any of these types is a deliberate API change.
 #[allow(clippy::type_complexity)]
 const _: () = {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, BTreeSet};
     let _: fn(&MergeState, &MergeState, &JoinOptions) -> (MergeState, BTreeSet<LossKey>) = join;
+    let _: fn(u64, i64) -> Result<JoinOptions, InvalidIntBound> = JoinOptions::new;
+    let _: fn(&mut JoinOptions, i64) -> Result<(), InvalidIntBound> = JoinOptions::set_int_bound;
+    let _: fn(&JoinOptions) -> i64 = JoinOptions::int_bound;
     let _: for<'a> fn(&'a MergeState, &str, &JoinOptions) -> Option<Cow<'a, Gen>> =
         MergeState::gen_of;
     let _: for<'a> fn(&'a MergeState, &str, &JoinOptions) -> Option<&'a Reg> = MergeState::winner;

@@ -70,13 +70,13 @@ pub fn mutants() -> Vec<Mutant> {
         },
         Mutant {
             name: "horizon applied after aliveness  [V3M1]",
-            apply: |c| c.opts.horizon_first = false,
+            apply: |c| c.opts.set_horizon_first(false),
             grader: Horizon,
             probe: None,
         },
         Mutant {
             name: "v3 generation rule (newest non-numeric base)  [V3M3]",
-            apply: |c| c.opts.v3_generation = true,
+            apply: |c| c.opts.set_v3_generation(true),
             grader: Random { restore: true },
             probe: None,
         },
@@ -88,7 +88,7 @@ pub fn mutants() -> Vec<Mutant> {
         },
         Mutant {
             name: "$setOnInsert cells not suppressed under an explicit insert  [V6m2]",
-            apply: |c| c.opts.suppress_soi = false,
+            apply: |c| c.opts.set_suppress_soi(false),
             grader: Random { restore: true },
             probe: None,
         },
@@ -112,13 +112,13 @@ pub fn mutants() -> Vec<Mutant> {
         },
         Mutant {
             name: "concurrent first inserts merge field by field again (v5)  [Q2]",
-            apply: |c| c.opts.supersede = false,
+            apply: |c| c.opts.set_supersede(false),
             grader: Random { restore: true },
             probe: None,
         },
         Mutant {
             name: "writes into a superseded first insert not reported  [V6M1]",
-            apply: |c| c.opts.cells_reported = false,
+            apply: |c| c.opts.set_cells_reported(false),
             grader: Random { restore: true },
             probe: None,
         },

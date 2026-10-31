@@ -342,7 +342,7 @@ impl MergeState {
             }
         }
         // Q11: a merge that crosses either bound saturates.
-        let b = i128::from(o.int_bound);
+        let b = i128::from(o.int_bound());
         seen.then(|| Value::Int(total.clamp(-b - 1, b) as i64))
     }
 

@@ -35,7 +35,7 @@ fn opts() -> JoinOptions {
     JoinOptions::default()
 }
 fn ret(r: u64) -> JoinOptions {
-    JoinOptions { retention: r, ..JoinOptions::default() }
+    JoinOptions::new(r, i64::MAX).unwrap()
 }
 fn doc(kv: &[(&str, Value)]) -> Option<BTreeMap<String, Value>> {
     Some(kv.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
@@ -463,12 +463,9 @@ fn probe_restore_conservation() {
 
 fn flipflop(horizon_first: bool) -> Vec<String> {
     // The model5 `Member` does not normalise its writes; the mutant is only visible on such states.
-    let o = JoinOptions {
-        retention: 4,
-        horizon_first,
-        normalize_writes: false,
-        ..JoinOptions::default()
-    };
+    let mut o = ret(4);
+    o.set_horizon_first(horizon_first);
+    o.set_normalize_writes(false);
     let (mut ii, mut a, mut c) = (Mem::new('I', &o), Mem::new('A', &o), Mem::new('C', &o));
     let i0 = ii.ins(&[("x", i(1))], 0).unwrap();
     a.receive_entry(&ii.ent(i0));
@@ -682,7 +679,7 @@ fn probe_q2_upsert_still_merges() {
 fn probe_q11_overflow() {
     // A local $inc past the Int64 bound is refused; two members each within the bound that
     // together cross it saturate at the bound after the merge, on every member.
-    let o = JoinOptions { int_bound: 1000, ..JoinOptions::default() };
+    let o = JoinOptions::new(1_000_000_000, 1000).unwrap();
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
     let i0 = a.ins(&[("x", i(900))], 0).unwrap();
     b.receive_entry(&a.ent(i0));
@@ -723,7 +720,7 @@ fn inc_landing_exactly_on_a_bound_is_accepted_one_past_is_refused() {
 
 #[test]
 fn inc_landing_exactly_on_a_lowered_bound() {
-    let o = JoinOptions { int_bound: 1000, ..opts() };
+    let o = JoinOptions::new(1_000_000_000, 1000).unwrap();
     let mut w = Writer::new(wid('A', 0), o);
     w.insert(&[("x", i(0)), ("y", i(0))], 0).unwrap();
     assert!(w.write_inc("x", 1001, 0).is_none());
@@ -831,7 +828,7 @@ fn probe_v6m2_insert_vs_upsert() {
 #[test]
 fn probe_v6m3_lower_bound() {
     // Q11 symmetric: a local $inc below -2^63 is refused; a merge crossing it saturates.
-    let o = JoinOptions { int_bound: 1000, ..JoinOptions::default() };
+    let o = JoinOptions::new(1_000_000_000, 1000).unwrap();
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
     let i0 = a.ins(&[("x", i(-900))], 0).unwrap();
     b.receive_entry(&a.ent(i0));
@@ -1233,7 +1230,8 @@ fn register_obs_keeps_the_slot_stamp() {
 #[test]
 fn b1_mutant_is_visible_to_the_lib_tests() {
     // With the slot stamp ignored the zero-sum counter is absent again: the mutant is killed.
-    let o = JoinOptions { value_ignores_slot_stamp: true, ..opts() };
+    let mut o = opts();
+    o.set_value_ignores_slot_stamp(true);
     let mut w = Writer::new(wid('A', 0), o);
     w.insert(&[("n", s("a"))], 0).unwrap();
     w.write_inc("views", 1, 0).unwrap();
@@ -1282,7 +1280,8 @@ fn upsert_string_gen() {
 
 #[test]
 fn m1_mutant_is_visible_to_the_lib_tests() {
-    let o = JoinOptions { creation_without_generation: true, ..opts() };
+    let mut o = opts();
+    o.set_creation_without_generation(true);
     for soi in [false, true] {
         let c = run_upsert_string_gen(&o, soi);
         assert_eq!(c.visible(), doc(&[("n", i(12)), ("x", i(1))]), "soi={soi}");
@@ -1450,4 +1449,24 @@ fn generation_vv_and_gens_are_outside_bytes_hash_and_equality() {
     let back = MergeState::decode(&st.encode()).unwrap();
     assert!(back.gens.is_empty());
     assert_eq!(back, st);
+}
+
+// ---- m5/m6: the options -----------------------------------------------------------------
+
+#[test]
+fn a_negative_int_bound_is_refused_and_zero_is_usable() {
+    assert_eq!(JoinOptions::new(5, -1).unwrap_err(), InvalidIntBound(-1));
+    assert!(JoinOptions::new(5, i64::MIN).is_err());
+    let mut o = JoinOptions::new(5, 7).unwrap();
+    assert_eq!((o.retention, o.int_bound()), (5, 7));
+    assert_eq!(o.set_int_bound(-3), Err(InvalidIntBound(-3)));
+    assert_eq!(o.int_bound(), 7, "a refused bound changes nothing");
+    // The smallest valid bound clamps to [-1, 0] without panicking.
+    let o = JoinOptions::new(5, 0).unwrap();
+    let mut w = Writer::new(wid('A', 0), o);
+    w.insert(&[("x", i(0))], 0).unwrap();
+    assert!(w.write_inc("x", 1, 0).is_none());
+    assert!(w.write_inc("x", -1, 0).is_some());
+    assert_eq!(w.visible(), doc(&[("x", i(-1))]));
+    assert!(w.write_inc("x", -1, 0).is_none());
 }

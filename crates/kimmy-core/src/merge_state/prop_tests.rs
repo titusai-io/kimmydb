@@ -34,7 +34,7 @@ impl Rng {
 }
 
 fn opts(ret: u64) -> JoinOptions {
-    JoinOptions { retention: ret, ..JoinOptions::default() }
+    JoinOptions::new(ret, i64::MAX).unwrap()
 }
 
 /// A value from the wide pool: small and large integers, the Int64 bounds, strings (also empty
@@ -252,7 +252,7 @@ fn join_laws_large_retention() {
 #[test]
 fn join_laws_lowered_bound() {
     // The clamp of the read side is part of the state function: the laws hold with it exercised.
-    let o = JoinOptions { retention: 1_000_000_000, int_bound: 1000, ..JoinOptions::default() };
+    let o = JoinOptions::new(1_000_000_000, 1000).unwrap();
     check_laws(&o, true, 60, 24, 300);
 }
 
@@ -411,9 +411,13 @@ fn mutants_change_the_outcome() {
     };
     let good = run(&opts(1_000_000_000));
     assert_eq!(good.1, 2); // insertLost on the document and on c's note
-    let no_cells = run(&JoinOptions { cells_reported: false, ..opts(1_000_000_000) });
+    let mut o = opts(1_000_000_000);
+    o.set_cells_reported(false);
+    let no_cells = run(&o);
     assert!(no_cells.1 < good.1);
-    let no_sup = run(&JoinOptions { supersede: false, ..opts(1_000_000_000) });
+    let mut o = opts(1_000_000_000);
+    o.set_supersede(false);
+    let no_sup = run(&o);
     assert_ne!(no_sup.0, good.0);
 }
 

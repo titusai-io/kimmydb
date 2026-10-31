@@ -369,7 +369,7 @@ impl Writer {
     pub fn write_inc(&mut self, p: &str, n: i64, skew: u64) -> Option<Written> {
         let vis = self.visible()?;
         let cur = vis.get(p);
-        let b = i128::from(self.opts.int_bound);
+        let b = i128::from(self.opts.int_bound());
         match cur {
             None | Some(Value::Int(_)) => {
                 let c = if let Some(Value::Int(c)) = cur { i128::from(*c) } else { 0 };

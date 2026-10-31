@@ -6,49 +6,58 @@ use super::state::{LifeKind, MergeState, cov, sub_ret};
 use super::types::{LossKey, LossKind, LossValue, MStamp};
 use crate::hlc::Hlc;
 
+/// A refused integer bound: it must not be negative.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("merge state: the integer bound {0} is negative")]
+pub struct InvalidIntBound(pub i64);
+
 /// Parameters of the join and of the read side.
 ///
-/// The three mutation switches exist only under `cfg(test)` or the
-/// `merge-mutants` feature, so that the model's mutants can be reproduced; the
-/// production code path is the same code with the switches at their correct
-/// values.
+/// The fields are private so that the set of fields never depends on a build
+/// configuration: build one with [`JoinOptions::new`] or [`Default`], and change the
+/// retention through the public field. The mutation switches (horizon-first,
+/// supersession, reported cells, `$setOnInsert` suppression, the v3 generation rule, the
+/// two read and creation rules of the B1 and M1 fixes, and write normalisation) can be
+/// changed only in a test or `merge-mutants` build, through the `set_*` methods that exist
+/// there: they let the harness reproduce the model's mutants. The production code path is
+/// the same code with the switches at their correct values.
 #[derive(Clone, Debug)]
 pub struct JoinOptions {
     /// `R`: how far behind the newest known HLC (in wall milliseconds) deletes,
     /// dead lives and loss records are kept.
     pub retention: u64,
-    /// `BOUND` (Q11): an integer total saturates to `[-bound - 1, bound]`.
-    pub int_bound: i64,
+    /// `BOUND` (Q11): an integer total saturates to `[-bound - 1, bound]`. Never negative.
+    int_bound: i64,
     /// V3M1: filter by the JOINED horizon before the union.
     #[cfg(any(test, feature = "merge-mutants"))]
-    pub horizon_first: bool,
+    horizon_first: bool,
     /// Q2: concurrent first inserts, the newest whole document wins.
     #[cfg(any(test, feature = "merge-mutants"))]
-    pub supersede: bool,
+    supersede: bool,
     /// V6M1: writes into a superseded first insert are reported.
     #[cfg(any(test, feature = "merge-mutants"))]
-    pub cells_reported: bool,
+    cells_reported: bool,
     /// V6m2/V7m1: `$setOnInsert` creation cells of an upsert are dropped from
     /// the read side while an explicit insert is alive.
     #[cfg(any(test, feature = "merge-mutants"))]
-    pub suppress_soi: bool,
+    suppress_soi: bool,
     /// V3M3: the v3 generation rule (the newest non-numeric base counts, even
     /// when it lost). Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
-    pub v3_generation: bool,
+    v3_generation: bool,
     /// B1 mutant: the read side ignores the slot stamp in a register's `obs`, so a
     /// counter whose increments net to 0 is absent again. Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
-    pub value_ignores_slot_stamp: bool,
+    value_ignores_slot_stamp: bool,
     /// M1 mutant: an upsert creation with a non-numeric value starts no
     /// generation (the model before the fix). Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
-    pub creation_without_generation: bool,
+    creation_without_generation: bool,
     /// The model's `NORMALIZE_WRITES`: a writer normalises its own state through
     /// a join with the empty state after each write (off only to reproduce the
     /// un-normalised states of `model5.Member`).
     #[cfg(any(test, feature = "merge-mutants"))]
-    pub normalize_writes: bool,
+    normalize_writes: bool,
 }
 
 impl Default for JoinOptions {
@@ -77,71 +86,55 @@ impl Default for JoinOptions {
     }
 }
 
+/// One accessor per mutation switch: the field in a test or `merge-mutants` build, the
+/// correct value otherwise.
+macro_rules! switch {
+    ($name:ident, $setter:ident, $correct:expr) => {
+        #[cfg(any(test, feature = "merge-mutants"))]
+        pub(super) fn $name(&self) -> bool {
+            self.$name
+        }
+        #[cfg(not(any(test, feature = "merge-mutants")))]
+        pub(super) fn $name(&self) -> bool {
+            $correct
+        }
+        #[cfg(any(test, feature = "merge-mutants"))]
+        pub fn $setter(&mut self, on: bool) {
+            self.$name = on;
+        }
+    };
+}
+
 impl JoinOptions {
-    #[cfg(any(test, feature = "merge-mutants"))]
-    fn horizon_first(&self) -> bool {
-        self.horizon_first
+    /// Options with the given retention and integer bound. The bound must not be negative.
+    pub fn new(retention: u64, int_bound: i64) -> Result<Self, InvalidIntBound> {
+        let mut o = Self { retention, ..Self::default() };
+        o.set_int_bound(int_bound)?;
+        Ok(o)
     }
-    #[cfg(not(any(test, feature = "merge-mutants")))]
-    fn horizon_first(&self) -> bool {
-        true
+
+    /// The integer bound: totals saturate to `[-bound - 1, bound]`.
+    pub fn int_bound(&self) -> i64 {
+        self.int_bound
     }
-    #[cfg(any(test, feature = "merge-mutants"))]
-    fn supersede(&self) -> bool {
-        self.supersede
+
+    /// Change the integer bound; a negative one is refused and nothing changes.
+    pub fn set_int_bound(&mut self, bound: i64) -> Result<(), InvalidIntBound> {
+        if bound < 0 {
+            return Err(InvalidIntBound(bound));
+        }
+        self.int_bound = bound;
+        Ok(())
     }
-    #[cfg(not(any(test, feature = "merge-mutants")))]
-    fn supersede(&self) -> bool {
-        true
-    }
-    #[cfg(any(test, feature = "merge-mutants"))]
-    fn cells_reported(&self) -> bool {
-        self.cells_reported
-    }
-    #[cfg(not(any(test, feature = "merge-mutants")))]
-    fn cells_reported(&self) -> bool {
-        true
-    }
-    #[cfg(any(test, feature = "merge-mutants"))]
-    pub(super) fn suppress_soi(&self) -> bool {
-        self.suppress_soi
-    }
-    #[cfg(not(any(test, feature = "merge-mutants")))]
-    pub(super) fn suppress_soi(&self) -> bool {
-        true
-    }
-    #[cfg(any(test, feature = "merge-mutants"))]
-    pub(super) fn v3_generation(&self) -> bool {
-        self.v3_generation
-    }
-    #[cfg(not(any(test, feature = "merge-mutants")))]
-    pub(super) fn v3_generation(&self) -> bool {
-        false
-    }
-    #[cfg(any(test, feature = "merge-mutants"))]
-    pub(super) fn value_ignores_slot_stamp(&self) -> bool {
-        self.value_ignores_slot_stamp
-    }
-    #[cfg(not(any(test, feature = "merge-mutants")))]
-    pub(super) fn value_ignores_slot_stamp(&self) -> bool {
-        false
-    }
-    #[cfg(any(test, feature = "merge-mutants"))]
-    pub(super) fn creation_without_generation(&self) -> bool {
-        self.creation_without_generation
-    }
-    #[cfg(not(any(test, feature = "merge-mutants")))]
-    pub(super) fn creation_without_generation(&self) -> bool {
-        false
-    }
-    #[cfg(any(test, feature = "merge-mutants"))]
-    pub(super) fn normalize_writes(&self) -> bool {
-        self.normalize_writes
-    }
-    #[cfg(not(any(test, feature = "merge-mutants")))]
-    pub(super) fn normalize_writes(&self) -> bool {
-        true
-    }
+
+    switch!(horizon_first, set_horizon_first, true);
+    switch!(supersede, set_supersede, true);
+    switch!(cells_reported, set_cells_reported, true);
+    switch!(suppress_soi, set_suppress_soi, true);
+    switch!(v3_generation, set_v3_generation, false);
+    switch!(value_ignores_slot_stamp, set_value_ignores_slot_stamp, false);
+    switch!(creation_without_generation, set_creation_without_generation, false);
+    switch!(normalize_writes, set_normalize_writes, true);
 }
 
 /// The model's `_prefilter`: drop deletes and dead lives older than `h`.

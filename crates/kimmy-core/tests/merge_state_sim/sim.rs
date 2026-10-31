@@ -69,7 +69,7 @@ pub struct Cfg {
 impl Cfg {
     pub fn new(retention: u64) -> Self {
         Cfg {
-            opts: JoinOptions { retention, ..JoinOptions::default() },
+            opts: JoinOptions::new(retention, i64::MAX).expect("a valid bound"),
             flags: SimFlags::default(),
         }
     }
@@ -169,7 +169,7 @@ impl Node {
     }
 
     pub fn bound(&self) -> i64 {
-        self.w.opts.int_bound
+        self.w.opts.int_bound()
     }
 
     pub fn state(&self) -> &MergeState {
@@ -766,7 +766,7 @@ pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
     let mut cfg = cfg.clone();
     cfg.opts.retention = rc.retention.unwrap_or(1_000_000_000);
     if let Some(b) = rc.int_bound {
-        cfg.opts.int_bound = b;
+        cfg.opts.set_int_bound(b).expect("a valid bound");
     }
     let mut log = Log::new();
     let mut ms = new_cluster(&mut rnd, &cfg, &mut log);
