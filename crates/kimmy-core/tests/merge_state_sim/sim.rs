@@ -168,6 +168,10 @@ impl Node {
         self.w.opts.retention
     }
 
+    pub fn bound(&self) -> i64 {
+        self.w.opts.int_bound
+    }
+
     pub fn state(&self) -> &MergeState {
         &self.w.state
     }
@@ -570,11 +574,20 @@ pub struct RunConfig {
     /// `None`: the model's default (10^9, far beyond any horizon).
     pub retention: Option<u64>,
     pub sequential: bool,
+    /// `None`: the real Int64 bound. A small bound exercises the oracle's clamp.
+    pub int_bound: Option<i64>,
 }
 
 impl Default for RunConfig {
     fn default() -> Self {
-        RunConfig { steps: 18, snap_rate: 0.06, restore: true, retention: None, sequential: false }
+        RunConfig {
+            steps: 18,
+            snap_rate: 0.06,
+            restore: true,
+            retention: None,
+            sequential: false,
+            int_bound: None,
+        }
     }
 }
 
@@ -585,10 +598,11 @@ pub struct RunOut {
     pub settled: bool,
 }
 
-const OPS: [&str; 11] = [
+const OPS: [&str; 14] = [
     "inc",
     "inc",
     "inc",
+    "inc_zero_sum",
     "set",
     "set",
     "unset",
@@ -597,7 +611,65 @@ const OPS: [&str; 11] = [
     "replace",
     "upsert",
     "upsert_soi",
+    "upsert_soi",
+    "upsert",
 ];
+
+/// A value from the wide pool (M3): small and large integers, the Int64 bounds, strings
+/// (also empty and non-ASCII) and doubles (also `2.0`, `-0.0`, `0.0`, a huge one).
+fn pool_value(rnd: &mut Rng) -> Value {
+    match rnd.below(16) {
+        0 => Value::Int(0),
+        1 => Value::Int(7),
+        2 => Value::Int(8),
+        3 => Value::Int(500),
+        4 => Value::Int(-7),
+        5 => Value::Int(1 << 62),
+        6 => Value::Int(-(1 << 62)),
+        7 => Value::Int(i64::MAX),
+        8 => Value::Int(i64::MIN),
+        9 => Value::Str("s".into()),
+        10 => Value::Str(String::new()),
+        11 => Value::Str("\u{fc}".into()),
+        12 => Value::Double(2.5),
+        13 => Value::Double(2.0),
+        14 => Value::Double(-0.0),
+        _ => Value::Double(1e300),
+    }
+}
+
+/// An increment from the wide pool: small, zero, negative, and near the bounds.
+fn pool_inc(rnd: &mut Rng) -> i64 {
+    match rnd.below(14) {
+        0 => 1,
+        1 => 2,
+        2 => 5,
+        3 => 20,
+        4 => -3,
+        5 => -1,
+        6 => 0,
+        7 => 1 << 62,
+        8 => -(1 << 62),
+        9 => i64::MAX,
+        10 => i64::MIN,
+        11 => 900,
+        12 => 100,
+        _ => -100,
+    }
+}
+
+/// One to three distinct fields with pool values.
+fn pool_fields<'a>(rnd: &mut Rng, names: &[&'a str]) -> Vec<(&'a str, Value)> {
+    let n = 1 + rnd.below(3);
+    let mut out: Vec<(&str, Value)> = Vec::new();
+    for _ in 0..n {
+        let k = rnd.choice(names);
+        if !out.iter().any(|(q, _)| *q == k) {
+            out.push((k, pool_value(rnd)));
+        }
+    }
+    out
+}
 
 /// One random write on `m` (the op table of `run`).
 fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
@@ -605,42 +677,44 @@ fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
     let p = rnd.choice(&["x", "n", "y"]);
     match op {
         "insert" => {
-            let k = rnd.choice(&["x", "y"]);
-            m.insert(&[(k, Value::Int(rnd.choice(&[1, 2])))], log, skew);
+            let f = pool_fields(rnd, &["x", "y", "n"]);
+            m.insert(&f, log, skew);
         }
         "upsert" => {
-            let k = rnd.choice(&["x", "y"]);
-            m.upsert_inc(k, rnd.choice(&[1, 2]), log, skew);
+            let k = rnd.choice(&["x", "y", "n"]);
+            m.upsert_inc(k, pool_inc(rnd), log, skew);
         }
         "upsert_soi" => {
-            let f = rnd.choice(&["y", "z"]);
-            let v = rnd.choice(&[1, 2]);
-            let ip = rnd.choice(&["x", "y"]);
-            let n = rnd.choice(&[1, 2]);
-            let sets: Vec<(&str, Value)> =
-                if rnd.below(2) == 0 { vec![] } else { vec![("n", Value::Int(5))] };
-            m.upsert_soi(&[(f, Value::Int(v))], ip, n, &sets, log, skew);
+            let f = pool_fields(rnd, &["y", "z", "n"]);
+            let n = pool_inc(rnd);
+            // `$set`, `$setOnInsert` and `$inc` on one path conflict (the update is refused
+            // up front), so the three path lists are disjoint.
+            let mut sets: Vec<(&str, Value)> =
+                if rnd.below(2) == 0 { vec![] } else { pool_fields(rnd, &["n", "x", "w"]) };
+            sets.retain(|(q, _)| !f.iter().any(|(g, _)| g == q));
+            let free: Vec<&str> = ["x", "y", "n", "z", "u"]
+                .into_iter()
+                .filter(|q| !f.iter().chain(sets.iter()).any(|(g, _)| g == q))
+                .collect();
+            let ip = rnd.choice(&free);
+            m.upsert_soi(&f, ip, n, &sets, log, skew);
         }
         "replace" => {
-            let k = rnd.choice(&["x", "n", "y"]);
-            let v = match rnd.below(3) {
-                0 => Value::Int(7),
-                1 => Value::Int(8),
-                _ => Value::Str("s".into()),
-            };
-            m.replace(&[(k, v)], log, skew);
+            let d = pool_fields(rnd, &["x", "n", "y"]);
+            m.replace(&d, log, skew);
         }
         "inc" => {
-            m.inc(p, rnd.choice(&[1, 5, 20, -3]), log, skew);
+            m.inc(p, pool_inc(rnd), log, skew);
+        }
+        "inc_zero_sum" => {
+            // +n then -n on one writer: a counter that returns to its start.
+            let n = pool_inc(rnd);
+            if m.inc(p, n, log, skew).is_some() && n != i64::MIN {
+                m.inc(p, -n, log, skew);
+            }
         }
         "set" => {
-            let v = match rnd.below(5) {
-                0 => Value::Int(0),
-                1 => Value::Int(7),
-                2 => Value::Int(500),
-                3 => Value::Str("s".into()),
-                _ => Value::Double(2.5),
-            };
+            let v = pool_value(rnd);
             m.set(p, v, log, skew);
         }
         _ => {
@@ -691,6 +765,9 @@ pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
     let mut rnd = Rng::new(seed);
     let mut cfg = cfg.clone();
     cfg.opts.retention = rc.retention.unwrap_or(1_000_000_000);
+    if let Some(b) = rc.int_bound {
+        cfg.opts.int_bound = b;
+    }
     let mut log = Log::new();
     let mut ms = new_cluster(&mut rnd, &cfg, &mut log);
     let mut did_restore = false;

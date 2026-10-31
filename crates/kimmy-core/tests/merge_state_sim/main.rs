@@ -53,14 +53,15 @@ fn fmt_problems(c: &BTreeMap<String, (usize, u64)>) -> String {
     }
 }
 
-fn random_runs(rep: &mut Report, n: u64, label: &str, restore: bool) {
+fn random_runs(rep: &mut Report, n: u64, label: &str, restore: bool, bound: Option<i64>) {
     let t0 = Instant::now();
     let cfg = Cfg::default_ret();
     let mut c = BTreeMap::new();
     let (mut snaps, mut rest, mut records) = (0, 0, 0);
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     for seed in 0..n {
-        let o = run(seed, &RunConfig { restore, ..RunConfig::default() }, &cfg);
+        let rc = RunConfig { restore, int_bound: bound, ..RunConfig::default() };
+        let o = run(seed, &rc, &cfg);
         snaps += usize::from(o.nodes.iter().any(|m| m.snaps > 0));
         rest += usize::from(o.nodes.iter().any(|m| m.restored));
         if !o.settled {
@@ -193,6 +194,20 @@ fn named_probes(rep: &mut Report) {
     }
 }
 
+/// B1 and M1 scenarios, graded against the oracle (the reviewer's `zero_sum_counter_vanishes`
+/// and `upsert_string_base_starts_no_generation`).
+fn scenario_probes(rep: &mut Report) {
+    for (name, problems) in probes::scenarios() {
+        println!(
+            "[scenario {name}]: {}",
+            if problems.is_empty() { "ok".to_string() } else { format!("{problems:?}") }
+        );
+        if !problems.is_empty() {
+            rep.failures.push(format!("scenario {name}: {problems:?}"));
+        }
+    }
+}
+
 #[test]
 fn runner() {
     let t_all = Instant::now();
@@ -201,11 +216,14 @@ fn runner() {
     let mut rep = Report::default();
     println!("Q7 P0 runner: Q7_RUNS={n}, Q7_MUTANT_RUNS={mruns}");
 
-    random_runs(&mut rep, n, "no restore", false);
-    random_runs(&mut rep, n, "with restore", true);
+    random_runs(&mut rep, n, "no restore", false, None);
+    random_runs(&mut rep, n, "with restore", true, None);
+    // A lowered Int64 bound, so that saturation and the oracle's clamp are exercised.
+    random_runs(&mut rep, n, "with restore, bound 1000", true, Some(1000));
     sequential(&mut rep, 400);
     horizon(&mut rep, 300, 4, 24, "horizon");
     named_probes(&mut rep);
+    scenario_probes(&mut rep);
     bounded(&mut rep, 300, 40, 3, 80);
     horizon(&mut rep, 300, 40, 80, "beyond retention (no periodic pulls)");
     horizon(&mut rep, 300, 8, 30, "horizon");

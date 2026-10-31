@@ -16,9 +16,6 @@ pub type Doc = BTreeMap<String, Value>;
 /// A head that must be, or is, reported: `(path, stamp)`.
 pub type Head = (String, MStamp);
 
-/// The model's `BOUND` (Q11): the Int64 bound.
-const BOUND: i128 = i64::MAX as i128;
-
 /// `st[0]`: the sim only makes stamps with a zero counter.
 fn t(st: &MStamp) -> i128 {
     i128::from(st.hlc.wall_ms)
@@ -181,7 +178,11 @@ fn gen_counts(gi: Option<MStamp>, g_w: Option<MStamp>) -> bool {
 /// OLDER generation than the winner's, and not seen by the starter of the
 /// winner's generation). Increments made in a NEWER generation are kept even
 /// when its starter lost.
-pub fn oracle(log: &Log, ret: u64) -> (Option<Doc>, BTreeSet<MStamp>, Vec<MStamp>) {
+///
+/// `bound` is the integer bound of the run (`JoinOptions::int_bound`, the real Int64 bound unless
+/// a run lowers it so that the clamp is exercised): a total saturates to `[-bound - 1, bound]`.
+pub fn oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp>, Vec<MStamp>) {
+    let b = i128::from(bound);
     let ins = creators(log);
     let dels = deletes(log);
     let alive = _alive_lives(log, &ins, &dels, ret);
@@ -228,7 +229,7 @@ pub fn oracle(log: &Log, ret: u64) -> (Option<Doc>, BTreeSet<MStamp>, Vec<MStamp
             continue;
         }
         let total = base.unwrap_or(0) + extra.iter().map(|n| i128::from(*n)).sum::<i128>();
-        doc.insert(p, Value::Int(total.clamp(-BOUND - 1, BOUND) as i64));
+        doc.insert(p, Value::Int(total.clamp(-b - 1, b) as i64));
     }
     ((!alive.is_empty()).then_some(doc), alive, dels)
 }
