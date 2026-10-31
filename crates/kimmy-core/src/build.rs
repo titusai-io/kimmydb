@@ -19,6 +19,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// refusals name it, so they cannot disagree.
 pub const SCHEMA_6_RELEASE: &str = "0.53.0";
 
+/// The release that introduced storage schema 7, and with it the refusal of a
+/// store or backup an older build wrote. Schema 7 changes how index keys are
+/// derived for a compound index over arrays (ADR-259), so an older store holds
+/// entries the new rule would not write. The one place the storage refusals
+/// name it.
+pub const SCHEMA_7_RELEASE: &str = "0.58.0";
+
 /// Short commit hash, with no decoration; `unknown` without git.
 pub const COMMIT: &str = env!("KIMMY_BUILD_COMMIT");
 

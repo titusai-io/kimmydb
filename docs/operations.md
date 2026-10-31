@@ -2558,12 +2558,12 @@ and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 ## Upgrades
 
 KimmyDB runs one version in a cluster, and an upgrade that changes data wipes the
-data. The on-disk **storage schema** is checked on open, and 0.53.0 opens only
-schema **6**:
+data. The on-disk **storage schema** is checked on open, and 0.58.0 opens only
+schema **7**:
 
 | Stored version | Behaviour |
 |---|---|
-| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.53.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
+| Older than this build | **Refused to start**, by name: the message names the build that wrote the store and says `0.58.0 does not upgrade stores; stop every member, wipe this data directory, start on an empty one and reseed.` Nothing is written to the store |
 | Equal | Opens normally |
 | Newer | **Refuses to start** |
 
@@ -2600,17 +2600,16 @@ derives index keys under a different rule ([ADR-259](decisions.md)): a
 compound index counts the arrays its paths go through, so a document such as
 `{x: [{a: 1}, {a: 2}], c: [1, 2]}` under `{x.a, c}` is no longer keyed. A 0.57.0
 store holds entries for documents the new rule files unkeyed, and a later write
-to one would leave them behind. **The storage schema is still 6, so 0.58.0 does
-not refuse a 0.57 store on open: the wipe is a step you take, not one the build
-enforces.** There is no migration code.
+to one would leave them behind. **The storage schema is 7, so 0.58.0 refuses a 0.57 store and a 0.57 backup by name, and
+writes nothing to them: wipe first.** There is no migration code.
 1. Stop every member.
 2. Move each data directory aside (it is the rollback) and create an empty one
    with the same owner.
 3. Start every member on 0.58.0, check `/readyz` on each and that `/v1/topology`
    lists every member live, then reseed from your source of truth.
 
-A backup 0.57.0 wrote carries the old entries too: do not restore it into 0.58.0
-(reseed instead). **Rolling back:** stop every member, then start 0.57.x on the
+A backup 0.57.0 wrote carries the old entries too, and `kimmyd restore` refuses it
+by the same rule; reseed instead. **Rolling back:** stop every member, then start 0.57.x on the
 data directories moved aside at the upgrade.
 
 ### Rolling back, and `kimmy.format`
@@ -2832,7 +2831,7 @@ node. How to read and consume it, and what it does not prove, is in
 |---|---|
 | `no root password configured` | Set `KIMMY_ROOT_PASSWORD` or pass `--insecure-no-auth` on loopback |
 | `insecure_no_auth is set but the server binds to 0.0.0.0` | Bind to `127.0.0.1` or configure auth |
-| `on-disk format version N is not supported` | Data directory written by a **newer** build, or by an older one: 0.53.0 refuses a store older than schema 6 by name ([Upgrades](#upgrades)) |
+| `on-disk format version N is not supported` | Data directory written by a **newer** build, or by an older one: 0.58.0 refuses a store older than schema 7 by name ([Upgrades](#upgrades)) |
 | 401 on a token that worked a moment ago | Token expired (1 h default), or the node has a different `jwt_secret` |
 | 403 where you expected 404 | Deliberate — authorization does not reveal existence |
 | `410 resume_token_expired` | Resume point passed out of the retained oplog; resubscribe |
