@@ -184,6 +184,57 @@ impl RegexPattern {
     pub fn is_match(&self, s: &str) -> bool {
         self.compiled.is_match(s)
     }
+
+    /// The first match in `s`, with its capture groups, or none.
+    pub fn first_match(&self, s: &str) -> Option<RegexMatch> {
+        self.matches(s, true).pop()
+    }
+
+    /// Every match in `s`, left to right and not overlapping, with the capture
+    /// groups of each. This is the reference's `$regexFindAll` loop, not
+    /// `regex`'s iterator: each search starts where the previous match ended,
+    /// and after a match of no width it starts one code point past the match,
+    /// so an empty match is found at the end of a non-empty one (`a*` over
+    /// `"abc"` matches `"a"`, then `""` at 1, 2 and 3).
+    pub fn find_all(&self, s: &str) -> Vec<RegexMatch> {
+        self.matches(s, false)
+    }
+
+    fn matches(&self, s: &str, first_only: bool) -> Vec<RegexMatch> {
+        use regex_automata::Input;
+        let mut caps = self.compiled.create_captures();
+        let mut found = Vec::new();
+        let mut at = 0;
+        while at <= s.len() {
+            self.compiled.search_captures(&Input::new(s).span(at..s.len()), &mut caps);
+            let Some(whole) = caps.get_match() else { break };
+            let span = |g: usize| caps.get_group(g).map(|m| (m.start, m.end));
+            found.push(RegexMatch {
+                start: whole.start(),
+                end: whole.end(),
+                groups: (1..caps.group_len()).map(span).collect(),
+            });
+            if first_only {
+                break;
+            }
+            at = if whole.is_empty() {
+                // One code point past an empty match.
+                whole.end() + s[whole.end()..].chars().next().map_or(1, char::len_utf8)
+            } else {
+                whole.end()
+            };
+        }
+        found
+    }
+}
+
+/// One match of a [`RegexPattern`]: byte offsets into the searched string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegexMatch {
+    pub start: usize,
+    pub end: usize,
+    /// Capture groups 1.., `None` for one that took no part in the match.
+    pub groups: Vec<Option<(usize, usize)>>,
 }
 
 impl PartialEq for RegexPattern {

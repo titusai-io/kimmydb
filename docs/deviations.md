@@ -17,6 +17,26 @@ Status meanings:
 
 ---
 
+## 🟡 The string, document and type operators: integer results are `Int64`, a few edge cases are read narrowly, and a missing value is told apart only where the reference makes it matter
+
+**Raised 2026-10-31, with ADR-260.** `$trim`, `$ltrim`, `$rtrim`, `$indexOfCP`, `$indexOfBytes`, `$regexMatch`, `$regexFind`, `$regexFindAll`, `$replaceOne`, `$replaceAll`, `$strcasecmp`, `$strLenBytes`, `$substrBytes`, `$mergeObjects` (expression and accumulator), `$getField`, `$setField`, `$unsetField`, `$type` and `$isNumber` follow the reference; these are the differences.
+
+- **Integer results are `Int64`** (`$indexOfCP`, `$indexOfBytes`, `$strLenBytes`, `idx` of `$regexFind`), as the rest of the expression layer; the reference gives `Int32`. `$type` of a computed integer is therefore `"long"` where the reference says `"int"` (the entry on numbers above). `$strcasecmp` gives `Int32`, as `$cmp` does.
+- **The regex operators are not PCRE.** They use the `$regex` filter's engine: no backreferences or lookaround (a `400` when the pattern is parsed or evaluated), only the flags `i`, `m`, `s` and `x`, a size limit per pattern, and a count shared with the pipeline's other patterns (32). The reference accepts what PCRE does. `$` and `\Z` differ in the way the `$regex` filter's do. Matching is by code point, and `idx` counts code points.
+- **A computed `regex` is compiled per document** (the last pattern is kept), outside the pipeline's budget; each pattern is still bounded by the per-pattern size limit.
+- **`$strcasecmp` and `$substrBytes` coerce only strings, null and numbers** to text. The reference also renders a date, a timestamp, code and a symbol; here those are a `400`.
+- **`$substrBytes` with a negative length** reads "to the end" and checks the end against the string's end. The reference computes the end as `start + length` in unsigned arithmetic, so a negative length after a non-zero start may check a byte before `start` and refuse a range this accepts.
+- **`$replaceAll` with an empty `find`** inserts between every code point and at both ends (`"abc"`, `""`, `"-"` gives `"-a-b-c-"`); the reference's handling of an empty `find` is not verified here.
+- **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null.
+- **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document. The reference's behaviour for that form is not verified here.
+- **`$trim`'s default set** is the reference's documented list (see aggregation.md); a character outside it, such as U+0085 or U+3000, is not stripped.
+
+**Why.** The first is the standing choice of the layer; the rest refuse or choose narrowly where the reference's behaviour could not be confirmed without a server. The `q8-probes/str.js` script of the review folder runs every case against a reference server, so the unverified ones are settled by a diff, not by a guess.
+
+**What it costs.** A pipeline ported from MongoDB that relies on a backreference, a date coerced to a string by `$strcasecmp`, or an `Int32` result type will be refused or differ in type.
+
+---
+
 ## 🟡 A collection validator is enforced by the member that accepts the write, so a non-conforming document can be stored and kept
 
 **Raised 2026-10-29, with ADR-257 part 2.** A collection's validator ([validation.md](validation.md)) is replicated metadata and a guard on client writes. A leaderless cluster cannot make a schema change atomic, and a replicated write is never refused, so two gaps are accepted as the price:

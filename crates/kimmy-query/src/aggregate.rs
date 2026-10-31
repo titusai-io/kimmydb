@@ -87,6 +87,7 @@ pub enum Accumulator {
     Last(Expr),
     Push(Expr),
     AddToSet(Expr),
+    MergeObjects(Expr),
 }
 
 /// One pipeline stage.
@@ -1280,10 +1281,11 @@ fn parse_accumulators(
             "$last" => Accumulator::Last(expr),
             "$push" => Accumulator::Push(expr),
             "$addToSet" => Accumulator::AddToSet(expr),
+            "$mergeObjects" => Accumulator::MergeObjects(expr),
             other => {
                 return Err(Error::InvalidQuery(format!(
                     "{other} is not an accumulator; supported: $sum, $avg, $min, $max, $first, \
-                     $last, $push, $addToSet"
+                     $last, $push, $addToSet, $mergeObjects"
                 )));
             }
         };
@@ -2114,6 +2116,8 @@ enum AccState {
     /// The members in first-seen order, and the [`group_key`] of each, which
     /// is what makes two values one member (ADR-186).
     AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>),
+    /// The fields merged so far, a later document's value winning.
+    MergeObjects(Document),
 }
 
 fn group(
@@ -2303,6 +2307,7 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
         Accumulator::Last(_) => AccState::Last(None),
         Accumulator::Push(_) => AccState::Push(Vec::new()),
         Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default()),
+        Accumulator::MergeObjects(_) => AccState::MergeObjects(Document::new()),
     }
 }
 
@@ -2347,6 +2352,9 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
                 items.push(v);
             }
         }
+        (AccState::MergeObjects(merged), Accumulator::MergeObjects(e)) => {
+            crate::expr::merge_into(merged, &e.eval_in(scope)?)?;
+        }
         // Unreachable: `init` pairs each accumulator with its own state.
         _ => {}
     }
@@ -2363,6 +2371,7 @@ fn finish(state: AccState) -> Result<Bson> {
         AccState::MinMax(v) | AccState::First(v) => v.unwrap_or(Bson::Null),
         AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
         AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
+        AccState::MergeObjects(merged) => Bson::Document(merged),
     })
 }
 
