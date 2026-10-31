@@ -23,6 +23,8 @@ pub mod update;
 #[cfg(test)]
 mod bucket_tests;
 #[cfg(test)]
+mod date_tests;
+#[cfg(test)]
 mod decimal_arith_tests;
 #[cfg(test)]
 mod facet_tests;

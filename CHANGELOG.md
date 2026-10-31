@@ -10,6 +10,12 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- The date operators and named time zones ([ADR-261](docs/decisions.md#adr-261--the-date-operators-and-named-time-zones)): `$dateFromString`, `$dateFromParts`, `$dateToParts`, `$dateAdd`, `$dateSubtract`, `$dateDiff`, `$dateTrunc`, `$millisecond`, `$dayOfWeek`, `$dayOfYear`, `$week`, `$isoWeek`, `$isoWeekYear` and `$isoDayOfWeek`, and a `timezone` argument on every date operator, including `$year`, `$month`, `$dayOfMonth`, `$hour`, `$minute`, `$second` and `$dateToString` (which also gains `%j %w %u %U %V %G %z %Z` and `onNull`). A zone is an IANA name (the tz database 2026e is built in, nothing is read from the host, daylight saving included), a fixed offset such as `+05:30`, or `UTC`. A date operator also reads a Timestamp or an ObjectId. The documented differences are in [docs/deviations.md](docs/deviations.md#date-operators-and-time-zones-adr-261).
+
 ## 0.58.0 - 2026-10-31
 
 **Read before upgrading: 0.58.0 does not carry a 0.57.0 store forward. Stop every member, wipe the data, start on empty directories and reseed.** Index keys are now derived under a different rule ([ADR-259](docs/decisions.md#adr-259--the-arrays-a-compound-index-spans-are-counted-by-their-place-in-the-path-and-0580-is-a-wipe-release)): a compound index counts the arrays its paths meet, so a path that fans out through an array of documents is an array. A store 0.57.0 wrote holds index entries for documents the new rule files unkeyed, and a later write to one would leave them behind. The storage schema is now 7: 0.58.0 refuses a 0.57.0 store and backup by name and writes nothing to them. There is no migration, and every member runs one release.

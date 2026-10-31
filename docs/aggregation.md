@@ -515,7 +515,7 @@ field path.
 | Conditional | `$cond` `$ifNull` `$switch` |
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
 | Boolean | `$and` `$or` `$not` |
-| Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$dateToString` |
+| Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$millisecond` `$dayOfWeek` `$dayOfYear` `$week` `$isoWeek` `$isoWeekYear` `$isoDayOfWeek` `$dateToString` `$dateFromString` `$dateFromParts` `$dateToParts` `$dateAdd` `$dateSubtract` `$dateDiff` `$dateTrunc` — each takes a `timezone`; see [Dates and time zones](#dates-and-time-zones) |
 | Arrays | `$size` `$arrayElemAt` `$first` `$last` `$slice` `$concatArrays` `$in` `$indexOfArray` `$isArray` `$reverseArray` `$range` `$sortArray` `$zip` |
 | Sets | `$setUnion` `$setIntersection` `$setDifference` `$setEquals` `$setIsSubset` `$anyElementTrue` `$allElementsTrue` |
 | Documents | `$objectToArray` `$arrayToObject` |
@@ -650,10 +650,103 @@ number from a date shifts it back.
 there is no byte-oriented variant, because it can split a character and produce
 invalid UTF-8.
 
-**`$dateToString` supports `%Y %m %d %H %M %S %L %%`, all UTC.** An unknown
-specifier is an error rather than being copied through — a literal `%q` in every
-row of a report is the kind of wrong output nobody notices. BSON dates carry no
-zone, so there is nothing for `%z` to convert to.
+### Dates and time zones
+
+Every date operator takes a `timezone` (ADR-261), as a constant or an
+expression. The one-argument operators take `{$year: "$d"}`,
+`{$year: ["$d"]}` or `{$year: {date: "$d", timezone: "America/New_York"}}`; the
+rest take a document of named arguments, and a name an operator does not define
+is a `400`.
+
+| Operator | Arguments | Result |
+|---|---|---|
+| `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$millisecond` | `date`, `timezone` | int |
+| `$dayOfWeek` | | 1 (Sunday) to 7 |
+| `$isoDayOfWeek` | | 1 (Monday) to 7 |
+| `$dayOfYear` | | 1 to 366 |
+| `$week` | | 0 to 53; weeks begin on Sunday and days before the year's first Sunday are week 0 |
+| `$isoWeek` | | 1 to 53 |
+| `$isoWeekYear` | | long |
+| `$dateToString` | `date`, `format`, `timezone`, `onNull` | string |
+| `$dateFromString` | `dateString`, `format`, `timezone`, `onError`, `onNull` | date |
+| `$dateFromParts` | `year` `month` `day` `hour` `minute` `second` `millisecond`, or `isoWeekYear` `isoWeek` `isoDayOfWeek` with the time parts; `timezone` | date |
+| `$dateToParts` | `date`, `timezone`, `iso8601` | document |
+| `$dateAdd`, `$dateSubtract` | `startDate`, `unit`, `amount`, `timezone` | date |
+| `$dateDiff` | `startDate`, `endDate`, `unit`, `timezone`, `startOfWeek` | long |
+| `$dateTrunc` | `date`, `unit`, `binSize`, `timezone`, `startOfWeek` | date |
+
+A date argument may be a date, a Timestamp (its seconds) or an ObjectId (its
+creation time). A null or missing date, or a null `timezone`, gives `null`; any
+other type is a `400`. `unit` is one of `year quarter month week day hour minute
+second millisecond`, in lower case. `startOfWeek` is a day name (`monday`) or
+its three-letter form, in any case, and is read only when `unit` is `week`; the
+default is Sunday.
+
+**Time zones.** `timezone` is one of:
+
+- an IANA name from the tz database compiled into the binary (`America/New_York`,
+  `Asia/Kolkata`, `Etc/GMT+5`, the legacy links such as `US/Eastern`), matched
+  without regard to case;
+- `UTC`, `GMT` or `Z`;
+- a fixed offset `+hh`, `+hhmm` or `+hh:mm` (and `-`), up to 23:59.
+
+Anything else is a `400`, `unrecognized time zone identifier` for a name and
+`Invalid format for UTC offset` for something that starts with a sign; a
+constant zone is checked when the pipeline is parsed, a computed one when the
+row is evaluated (and then even beside a null date). No system tz database is
+read: the data is built in, so a name means the same on every host. It is
+**version 2026e** (`jiff-tzdb` 0.1.9, which `jiff` reads); it changes only when
+that dependency is bumped, which is a normal dependency update and is recorded in
+the changelog. A date in an old year uses the zone's historical offset, including
+the seconds of local mean time (`-04:56:02` for New York before 1883); `%z` and
+`%Z` print whole minutes. Past the years the tz library represents (before year -9999 or after 9999) the offset at the nearest edge applies.
+
+**Daylight saving.** The offset is looked up at each instant, so `$hour` and
+`$dateToString` follow the clock changes. Going the other way, from a wall clock
+to an instant (`$dateFromParts`, `$dateFromString`, and the wall-clock result of
+`$dateAdd` in days or longer), a local time that happens twice (clocks going
+back) takes its **first** occurrence, and one that never happens (clocks going
+forward) moves forward by the length of the gap: `02:30` on 2024-03-10 in
+`America/New_York` is `03:30 EDT`, and `01:30` on 2024-11-03 is `01:30 EDT`.
+
+**`$dateAdd` and `$dateSubtract`:** `year`, `quarter` and `month` clamp to the
+last day of a shorter month (31 January plus a month is 29 February 2024), `week`
+and `day` keep the wall-clock time across a clock change (a day can be 23 or 25
+hours), and `hour`, `minute`, `second` and `millisecond` are elapsed time.
+`amount` is an integer; a result outside what a date holds is a `400`.
+
+**`$dateDiff`** counts the unit **boundaries** crossed, not whole units
+elapsed: 23:59 on 31 December to 00:01 on 1 January is `1` year, `1` day, `1`
+hour and `2` minutes. A negative result means the end is earlier.
+
+**`$dateTrunc`** rounds down to the start of the unit in the zone. With `binSize`
+the bins are counted from 2000-01-01 00:00 local time (from the first
+`startOfWeek` day on or after it for `week`), so `{unit: "year", binSize: 5}`
+gives 2020 for 2024.
+
+**`$dateFromParts`** carries a part outside its range into the next unit, in
+both directions (`month: 14` is February of the next year, `day: 0` is the last
+day of the previous month); `year` and `isoWeekYear` must be 1 to 9999 and the
+other parts must fit a 16-bit integer.
+
+**`$dateToString` specifiers:** `%Y` (four digits, 0000 to 9999) `%G` (ISO
+year) `%m` `%d` `%H` `%M` `%S` `%L` (millisecond) `%j` (day of year, 001) `%w`
+(1 is Sunday) `%u` (1 is Monday) `%U` (week, 00) `%V` (ISO week, 01) `%z`
+(`+0530`) `%Z` (offset in minutes, `+330`) `%%`. The default is
+`%Y-%m-%dT%H:%M:%S.%LZ` in UTC and the same without the `Z` in any other zone. An
+unknown specifier is an error rather than being copied through.
+
+**`$dateFromString` specifiers:** `%Y` (four digits) `%m` `%d` `%H` `%M` `%S`
+(two digits) `%L` (three) `%j` (three, day of year) `%G` `%V` `%u` (ISO week
+date) `%z` (`+hh`, `+hhmm` or `+hh:mm`) `%Z` (offset in minutes) `%%`; every other
+character must match. A field the format omits defaults to 1970, January, the 1st
+and 00:00:00. With no `format` the string is `YYYY-MM-DD`, optionally followed
+by `T` or a space and `HH:MM[:SS[.fff]]`, optionally followed by `Z` or an
+offset. A string that carries its own offset beside a `timezone` argument is
+refused. A string that cannot be read is an error, or `onError` when it is given;
+`onError` does not catch a bad `format` or `timezone`. See
+[deviations](deviations.md#date-operators-and-time-zones-adr-261) for what is not
+read.
 
 ### Math
 
