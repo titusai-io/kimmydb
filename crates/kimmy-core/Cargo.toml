@@ -31,3 +31,8 @@ sha2 = "0.11"
 # toolchain-free anyway (ADR-016), but this is a different order of cost
 # from a crate that builds some C with `cc`.
 local-embeddings = []
+
+# Reproduces the Q7 merge model's mutants (horizon-first, supersession,
+# reported cells) through extra `JoinOptions` fields. Off by default; the
+# production code path is the same code with the switches at their correct values.
+merge-mutants = []

@@ -19,6 +19,7 @@ pub mod json_schema;
 pub mod keyenc;
 pub mod limits;
 pub mod matching;
+pub mod merge_state;
 pub mod oplog;
 pub mod partial;
 pub mod path;
