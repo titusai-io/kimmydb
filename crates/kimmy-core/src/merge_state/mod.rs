@@ -44,6 +44,7 @@ pub use writer::{Received, WriteKind, WriteRecord, Writer, Written};
 // `merge-mutants` feature, test or not): the mutation switches are fields of
 // `JoinOptions` read inside unchanged function bodies, never a different signature.
 // A change to any of these types is a deliberate API change.
+#[allow(clippy::type_complexity)]
 const _: () = {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, BTreeSet};
