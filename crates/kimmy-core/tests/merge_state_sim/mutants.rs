@@ -2,10 +2,9 @@
 //! on the pull protocol and, where one exists, by its named probe. A mutant
 //! must be KILLED: failed by the random runs, or by its probe.
 //!
-//! Not ported, because the Rust state has no equivalent switch:
-//! * V3M3 "v3 generation rule (newest non-numeric base)": no option on `gen_of`.
-//! * V4M1 "hidden increments as replicated records again": there is no
-//!   `hidden` loss kind to re-introduce; the hidden figure is state only.
+//! The V3M3 and V4M1 mutants and the `$setOnInsert` suppression mutant use
+//! test-only switches (`JoinOptions::v3_generation`, `SimFlags::hidden_records`,
+//! `JoinOptions::suppress_soi`).
 
 use std::time::Instant;
 
@@ -73,6 +72,24 @@ pub fn mutants() -> Vec<Mutant> {
             name: "horizon applied after aliveness  [V3M1]",
             apply: |c| c.opts.horizon_first = false,
             grader: Horizon,
+            probe: None,
+        },
+        Mutant {
+            name: "v3 generation rule (newest non-numeric base)  [V3M3]",
+            apply: |c| c.opts.v3_generation = true,
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "hidden increments as replicated records again  [V4M1]",
+            apply: |c| c.flags.hidden_records = true,
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "$setOnInsert cells not suppressed under an explicit insert  [V6m2]",
+            apply: |c| c.opts.suppress_soi = false,
+            grader: Random { restore: true },
             probe: None,
         },
         Mutant {

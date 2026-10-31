@@ -32,6 +32,17 @@ fn is_reg_kind(k: WriteKind) -> bool {
     matches!(k, WriteKind::Insert | WriteKind::Reg)
 }
 
+/// An explicit insert (insertOne/insertMany), not the creation write of an upsert.
+fn _explicit(m: &WriteRecord) -> bool {
+    m.kind == WriteKind::Insert && !m.upsert
+}
+
+/// V6m2/V7m1/V7m2: a `$setOnInsert` cell of an upsert creation is dropped when
+/// an explicit insert (a first insert or a re-insert after a delete) is alive.
+fn _supp(log: &Log, m: &WriteRecord, p: &str, alive: &BTreeSet<MStamp>) -> bool {
+    m.soi.iter().any(|q| q == p) && alive.iter().any(|l| _explicit(&log[l].1))
+}
+
 fn deletes(log: &Log) -> Vec<MStamp> {
     log.iter().filter(|(_, (_, m))| m.kind == WriteKind::Delete).map(|(st, _)| *st).collect()
 }
@@ -52,8 +63,7 @@ pub fn killed_lives(log: &Log, ret: u64) -> BTreeSet<MStamp> {
     let dels = deletes(log);
     log.iter()
         .filter(|(st, (ctx, m))| {
-            m.kind == WriteKind::Insert
-                && dels.iter().any(|d| !ctx.contains(d) && t(d) >= t(st) - i128::from(ret))
+            _explicit(m) && dels.iter().any(|d| !ctx.contains(d) && t(d) >= t(st) - i128::from(ret))
         })
         .map(|(st, _)| *st)
         .collect()
@@ -66,7 +76,7 @@ pub fn superseded_lives(log: &Log, within: Option<&BTreeSet<MStamp>>) -> BTreeSe
     let first: Vec<MStamp> = log
         .iter()
         .filter(|(st, (ctx, m))| {
-            m.kind == WriteKind::Insert
+            _explicit(m)
                 && !dels.iter().any(|d| ctx.contains(d))
                 && within.is_none_or(|w| w.contains(st))
         })
@@ -146,7 +156,10 @@ impl MakeGen<'_> {
             let al = _alive_at(self.log, ctx, &self.ins, &self.dels, self.ret);
             let cands = ctx.iter().filter(|w| {
                 let m2 = &self.log[*w].1;
-                is_reg_kind(m2.kind) && m2.paths.iter().any(|q| q == p) && in_set(&m2.life, &al)
+                is_reg_kind(m2.kind)
+                    && m2.paths.iter().any(|q| q == p)
+                    && in_set(&m2.life, &al)
+                    && !_supp(self.log, m2, p, &al)
             });
             cands.max().and_then(|w| self.of(*w, p))
         };
@@ -188,7 +201,7 @@ pub fn oracle(log: &Log, ret: u64) -> (Option<Doc>, BTreeSet<MStamp>, Vec<MStamp
     for p in all_paths(log) {
         let regs: Vec<_> = writes_on(&p, &[WriteKind::Insert, WriteKind::Reg])
             .into_iter()
-            .filter(|(_, _, m)| in_set(&m.life, &alive))
+            .filter(|(_, _, m)| in_set(&m.life, &alive) && !_supp(log, m, &p, &alive))
             .collect();
         let incs: Vec<_> = writes_on(&p, &[WriteKind::Inc])
             .into_iter()
@@ -252,11 +265,31 @@ pub fn loss_oracle(
             }
         }
     }
+    // V6m2: the dropped $setOnInsert cells are reported
+    for (st, (_, m)) in log {
+        for p in &m.soi {
+            if in_set(&m.life, alive) && _supp(log, m, p, alive) {
+                let later = log.values().any(|(c2, m2)| {
+                    c2.contains(st)
+                        && m2.paths.contains(p)
+                        && m2.life == m.life
+                        && is_reg_kind(m2.kind)
+                });
+                // a cell overwritten in sequence by its own life's writer is no longer a head
+                if !later {
+                    must.insert((p.clone(), *st));
+                }
+            }
+        }
+    }
     for p in all_paths(log) {
         let regs: Vec<(MStamp, &BTreeSet<MStamp>, &WriteRecord)> = log
             .iter()
             .filter(|(_, (_, m))| {
-                is_reg_kind(m.kind) && m.paths.contains(&p) && in_set(&m.life, alive)
+                is_reg_kind(m.kind)
+                    && m.paths.contains(&p)
+                    && in_set(&m.life, alive)
+                    && !_supp(log, m, &p, alive)
             })
             .map(|(st, (ctx, m))| (*st, ctx, m))
             .collect();
@@ -327,7 +360,10 @@ pub fn hidden_oracle(log: &Log, ret: u64) -> BTreeMap<String, i128> {
         let regs: Vec<MStamp> = log
             .iter()
             .filter(|(_, (_, m))| {
-                is_reg_kind(m.kind) && m.paths.contains(&p) && in_set(&m.life, &alive)
+                is_reg_kind(m.kind)
+                    && m.paths.contains(&p)
+                    && in_set(&m.life, &alive)
+                    && !_supp(log, m, &p, &alive)
             })
             .map(|(st, _)| *st)
             .collect();
@@ -378,7 +414,10 @@ pub fn stale_records(
         let regs: Vec<MStamp> = log
             .iter()
             .filter(|(_, (_, m2))| {
-                is_reg_kind(m2.kind) && m2.paths.contains(p) && in_set(&m2.life, &alive)
+                is_reg_kind(m2.kind)
+                    && m2.paths.contains(p)
+                    && in_set(&m2.life, &alive)
+                    && !_supp(log, m2, p, &alive)
             })
             .map(|(w, _)| *w)
             .collect();

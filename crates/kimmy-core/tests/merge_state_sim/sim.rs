@@ -38,6 +38,10 @@ pub struct SimFlags {
     pub drop_kind: Option<LossKind>,
     /// Mutant V7m4: a superseded and killed first insert is reported neither way.
     pub report_neither: bool,
+    /// Mutant V4M1: hidden increments are reported as once-only replicated records
+    /// again (v4's behaviour). `LossKind` has no hidden kind, so the stand-in is
+    /// `RetiredWriter`, which P0 never produces.
+    pub hidden_records: bool,
 }
 
 impl Default for SimFlags {
@@ -50,6 +54,7 @@ impl Default for SimFlags {
             no_loss_entries: false,
             drop_kind: None,
             report_neither: false,
+            hidden_records: false,
         }
     }
 }
@@ -194,7 +199,7 @@ impl Node {
     /// The join as this node's cluster runs it (a mutant may wrap it).
     fn receive(&mut self, other: &MergeState) -> Received {
         let f = self.flags;
-        if f.drop_kind.is_none() && !f.report_neither {
+        if f.drop_kind.is_none() && !f.report_neither && !f.hidden_records {
             return self.w.receive_report(other);
         }
         let ret = self.ret();
@@ -248,6 +253,34 @@ impl Node {
             for k in gone {
                 merged.losses.remove(&k);
                 fresh.remove(&k);
+            }
+        }
+        if f.hidden_records {
+            let h = merged.horizon(&self.w.opts);
+            let al: BTreeSet<MStamp> = merged.alive(&self.w.opts).into_iter().collect();
+            let mut add = Vec::new();
+            for src in [&self.w.state, other] {
+                for ((l, p, _, gn), v) in &src.slots {
+                    if !al.contains(l) {
+                        continue;
+                    }
+                    let Some(g) = merged.gen_of(p, &self.w.opts) else { continue };
+                    let older = *gn != Some(g.stamp) && gn.is_none_or(|x| x < g.stamp);
+                    let covered =
+                        g.vv.get(&v.stamp.writer).copied().unwrap_or(Hlc::ZERO) >= v.stamp.hlc;
+                    let key =
+                        LossKey { kind: LossKind::RetiredWriter, path: p.clone(), stamp: v.stamp };
+                    if older && !covered && key.stamp.hlc >= h && !merged.losses.contains_key(&key)
+                    {
+                        add.push((key, LossValue::Total(v.total)));
+                    }
+                }
+            }
+            for (key, val) in add {
+                if !self.w.state.losses.contains_key(&key) {
+                    fresh.insert(key.clone());
+                }
+                merged.losses.insert(key, val);
             }
         }
         self.w.clock = merged.vv.values().copied().chain([self.w.clock]).max().unwrap_or(Hlc::ZERO);
@@ -353,6 +386,30 @@ impl Node {
     pub fn upsert_inc(&mut self, p: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
         let r = self.w.upsert_inc(p, n, skew);
         self.logged(r, log)
+    }
+    /// A `$setOnInsert` upsert: two sequential writes by one writer (the creation
+    /// and the increment). The writer hands back only its final state, so both
+    /// oplog entries carry it, with both stamps contained.
+    pub fn upsert_soi(
+        &mut self,
+        fields: &[(&str, Value)],
+        inc_path: &str,
+        n: i64,
+        sets: &[(&str, Value)],
+        log: &mut Log,
+        skew: u64,
+    ) -> Option<MStamp> {
+        let (created, incd) = self.w.upsert_soi(fields, inc_path, n, sets, skew)?;
+        let (s1, s2) = (created.stamp, incd.stamp);
+        log.insert(s1, (self.contained.clone(), created.record));
+        self.contained.insert(s1);
+        log.insert(s2, (self.contained.clone(), incd.record));
+        self.contained.insert(s2);
+        for st in [s1, s2] {
+            let ent = Ent::W { st, state: self.w.state.clone(), contained: self.contained.clone() };
+            self.append(Rc::new(ent));
+        }
+        Some(s2)
     }
     pub fn set(&mut self, p: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
         let r = self.w.write_set(p, v, skew);
@@ -535,8 +592,19 @@ pub struct RunOut {
     pub settled: bool,
 }
 
-const OPS: [&str; 10] =
-    ["inc", "inc", "inc", "set", "set", "unset", "delete", "insert", "replace", "upsert"];
+const OPS: [&str; 11] = [
+    "inc",
+    "inc",
+    "inc",
+    "set",
+    "set",
+    "unset",
+    "delete",
+    "insert",
+    "replace",
+    "upsert",
+    "upsert_soi",
+];
 
 /// One random write on `m` (the op table of `run`).
 fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
@@ -550,6 +618,15 @@ fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
         "upsert" => {
             let k = rnd.choice(&["x", "y"]);
             m.upsert_inc(k, rnd.choice(&[1, 2]), log, skew);
+        }
+        "upsert_soi" => {
+            let f = rnd.choice(&["y", "z"]);
+            let v = rnd.choice(&[1, 2]);
+            let ip = rnd.choice(&["x", "y"]);
+            let n = rnd.choice(&[1, 2]);
+            let sets: Vec<(&str, Value)> =
+                if rnd.below(2) == 0 { vec![] } else { vec![("n", Value::Int(5))] };
+            m.upsert_soi(&[(f, Value::Int(v))], ip, n, &sets, log, skew);
         }
         "replace" => {
             let k = rnd.choice(&["x", "n", "y"]);
