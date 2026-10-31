@@ -12,6 +12,10 @@
 //! `usize` is written (lengths are `u64`), the hash mix reads its input as
 //! big-endian `u64` words.
 //!
+//! Canonical: [`MergeState::decode`] accepts only what [`MergeState::encode`] can write, so
+//! `encode(decode(b)) == b` for every accepted `b`: map and set entries must be strictly
+//! increasing in key order (no duplicates), and a flag byte is 0 or 1.
+//!
 //! Versions: [`MergeState::encode`] starts with the 3 bytes `QMS` and ONE format
 //! version byte (currently 1), then the canonical body, then the `gens`.
 //! [`MergeState::canonical_bytes`] is the body alone and carries no tag; the
@@ -45,6 +49,8 @@ pub enum DecodeError {
     Trailing(usize),
     #[error("merge state: a counter total is out of range")]
     TotalOutOfRange,
+    #[error("merge state: not canonical (map keys duplicated or out of order)")]
+    NotCanonical,
 }
 
 // ---- writing ---------------------------------------------------------------
@@ -273,7 +279,7 @@ impl MergeState {
             let l = r.stamp()?;
             let mut seen = BTreeSet::new();
             for _ in 0..r.len()? {
-                seen.insert(r.stamp()?);
+                put_set(&mut seen, r.stamp()?)?;
             }
             let mut order = Vec::new();
             for _ in 0..r.len()? {
@@ -284,14 +290,14 @@ impl MergeState {
                 1 => LifeKind::Upsert,
                 t => return Err(DecodeError::BadTag(t)),
             };
-            s.lives.insert(l, Life { seen, order, kind });
+            put(&mut s.lives, l, Life { seen, order, kind })?;
         }
         for _ in 0..r.len()? {
-            s.dead.insert(r.stamp()?);
+            put_set(&mut s.dead, r.stamp()?)?;
         }
         for _ in 0..r.len()? {
             let d = r.stamp()?;
-            s.deletes.insert(d, r.vv()?);
+            put(&mut s.deletes, d, r.vv()?)?;
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
@@ -300,8 +306,12 @@ impl MergeState {
             let value = r.value()?;
             let obs = r.obs_stamped()?;
             let generation = r.gen_()?;
-            let soi = r.u8()? != 0;
-            s.regs.insert((l, p), Reg { stamp, value, obs, generation, soi });
+            let soi = match r.u8()? {
+                0 => false,
+                1 => true,
+                t => return Err(DecodeError::BadTag(t)),
+            };
+            put(&mut s.regs, (l, p), Reg { stamp, value, obs, generation, soi })?;
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
@@ -310,20 +320,20 @@ impl MergeState {
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
             let total = r.total()?;
-            s.slots.insert((l, p, wr, g), Slot { stamp, total });
+            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total })?;
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
             let k = r.loss_key()?;
             let v = r.loss_value()?;
-            s.losses.insert(k, v);
+            put(&mut s.losses, k, v)?;
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
             let p = r.str()?;
             let st = r.stamp()?;
             let vv = r.vv()?;
-            s.gens.insert((l, p), (st, vv));
+            put(&mut s.gens, (l, p), (st, vv))?;
         }
         if !r.0.is_empty() {
             return Err(DecodeError::Trailing(r.0.len()));
@@ -333,6 +343,25 @@ impl MergeState {
 }
 
 // ---- reading ---------------------------------------------------------------
+
+/// Insert into a map that is written in key order: a key that is not strictly above the last
+/// one is a duplicate or out of order, and the input is not the encoding of any state.
+fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError> {
+    if m.last_key_value().is_some_and(|(last, _)| *last >= k) {
+        return Err(DecodeError::NotCanonical);
+    }
+    m.insert(k, v);
+    Ok(())
+}
+
+/// [`put`] for a set.
+fn put_set<K: Ord>(m: &mut BTreeSet<K>, k: K) -> Result<(), DecodeError> {
+    if m.last().is_some_and(|last| *last >= k) {
+        return Err(DecodeError::NotCanonical);
+    }
+    m.insert(k);
+    Ok(())
+}
 
 struct R<'a>(&'a [u8]);
 
@@ -406,7 +435,7 @@ impl R<'_> {
         let mut m = BTreeMap::new();
         for _ in 0..self.len()? {
             let w = self.wid()?;
-            m.insert(w, self.hlc()?);
+            put(&mut m, w, self.hlc()?)?;
         }
         Ok(m)
     }
@@ -416,7 +445,7 @@ impl R<'_> {
             let l = self.stamp()?;
             let w = self.wid()?;
             let g = self.opt_stamp()?;
-            m.insert((l, w, g), self.total()?);
+            put(&mut m, (l, w, g), self.total()?)?;
         }
         Ok(m)
     }
@@ -427,7 +456,7 @@ impl R<'_> {
             let w = self.wid()?;
             let g = self.opt_stamp()?;
             let s = self.stamp()?;
-            m.insert((l, w, g), (s, self.total()?));
+            put(&mut m, (l, w, g), (s, self.total()?))?;
         }
         Ok(m)
     }
@@ -498,4 +527,106 @@ fn hash128(data: &[u8]) -> [u8; 16] {
     out[..8].copy_from_slice(&x.to_be_bytes());
     out[8..].copy_from_slice(&y.to_be_bytes());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{JoinOptions, Writer};
+    use super::*;
+
+    fn stamp(n: u64, c: u8) -> MStamp {
+        MStamp {
+            hlc: Hlc::new(n, 0),
+            writer: WriterId { node: NodeId::from_bytes([c; 16]), epoch: Epoch::from_u64(0) },
+        }
+    }
+
+    /// A state's bytes with the sections written by hand: `dead`, `deletes` (stamp, empty
+    /// vv) and the state version vector, in the order given, everything else empty.
+    fn hand(dead: &[MStamp], deletes: &[MStamp], vv: &[(WriterId, u64)]) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.0.extend_from_slice(&MAGIC);
+        w.u8(VERSION);
+        w.len(0); // lives
+        w.len(dead.len());
+        for l in dead {
+            w.stamp(l);
+        }
+        w.len(deletes.len());
+        for d in deletes {
+            w.stamp(d);
+            w.len(0);
+        }
+        w.len(0); // regs
+        w.len(0); // slots
+        w.len(vv.len());
+        for (wr, h) in vv {
+            w.wid(wr);
+            w.hlc(Hlc::new(*h, 0));
+        }
+        w.len(0); // losses
+        w.len(0); // gens
+        w.0
+    }
+
+    #[test]
+    fn hand_built_bytes_decode_when_sorted() {
+        let (a, b) = (stamp(1, b'A'), stamp(2, b'A'));
+        let wa = WriterId { node: NodeId::from_bytes([b'A'; 16]), epoch: Epoch::from_u64(0) };
+        let wb = WriterId { node: NodeId::from_bytes([b'B'; 16]), epoch: Epoch::from_u64(0) };
+        let bytes = hand(&[a, b], &[a, b], &[(wa, 3), (wb, 4)]);
+        let st = MergeState::decode(&bytes).unwrap();
+        assert_eq!(st.encode(), bytes);
+        assert_eq!((st.dead.len(), st.deletes.len(), st.vv.len()), (2, 2, 2));
+    }
+
+    #[test]
+    fn duplicate_or_unsorted_entries_are_refused() {
+        let (a, b) = (stamp(1, b'A'), stamp(2, b'A'));
+        let wa = WriterId { node: NodeId::from_bytes([b'A'; 16]), epoch: Epoch::from_u64(0) };
+        let wb = WriterId { node: NodeId::from_bytes([b'B'; 16]), epoch: Epoch::from_u64(0) };
+        let no = Err(DecodeError::NotCanonical);
+        // a set: duplicate, and out of order
+        assert_eq!(MergeState::decode(&hand(&[a, a], &[], &[])), no);
+        assert_eq!(MergeState::decode(&hand(&[b, a], &[], &[])), no);
+        // a map keyed by stamp
+        assert_eq!(MergeState::decode(&hand(&[], &[a, a], &[])), no);
+        assert_eq!(MergeState::decode(&hand(&[], &[b, a], &[])), no);
+        // a version vector: duplicate writer, entries out of order
+        assert_eq!(MergeState::decode(&hand(&[], &[], &[(wa, 1), (wa, 2)])), no);
+        assert_eq!(MergeState::decode(&hand(&[], &[], &[(wb, 1), (wa, 2)])), no);
+        // and the sorted forms are fine
+        assert!(MergeState::decode(&hand(&[a, b], &[a, b], &[(wa, 1), (wb, 2)])).is_ok());
+    }
+
+    #[test]
+    fn a_flag_byte_other_than_0_or_1_is_refused() {
+        let mut w = Writer::new(
+            WriterId { node: NodeId::from_bytes([b'A'; 16]), epoch: Epoch::from_u64(0) },
+            JoinOptions::default(),
+        );
+        w.upsert_soi(&[("y", Value::Int(1))], "x", 1, &[], 0).unwrap();
+        let enc = w.state.encode();
+        let st = MergeState::decode(&enc).unwrap();
+        assert!(st.regs.values().any(|r| r.soi));
+        // Every position with a 0 or 1 byte, set to 2: whatever still decodes re-encodes to
+        // itself, and at least the flag (and the tags) are refused.
+        let (mut bad_tag, mut accepted) = (0, 0);
+        for i in 4..enc.len() {
+            if enc[i] <= 1 {
+                let mut b = enc.clone();
+                b[i] = 2;
+                match MergeState::decode(&b) {
+                    Ok(s) => {
+                        accepted += 1;
+                        assert_eq!(s.encode(), b, "byte {i}");
+                    }
+                    Err(DecodeError::BadTag(2)) => bad_tag += 1,
+                    Err(_) => {}
+                }
+            }
+        }
+        assert!(bad_tag >= 1, "the soi flag byte of 2 is refused");
+        assert!(accepted > 0 || bad_tag > 0);
+    }
 }

@@ -416,3 +416,75 @@ fn mutants_change_the_outcome() {
     let no_sup = run(&JoinOptions { supersede: false, ..opts(1_000_000_000) });
     assert_ne!(no_sup.0, good.0);
 }
+
+/// Mutation fuzz of `decode` (default 20,000 inputs; `Q7_DECODE_FUZZ=<n>` overrides): the
+/// encodings of states the writers build, damaged by bit flips, byte sets, truncations,
+/// insertions, deletions and rewritten length fields. `decode` must never panic; an accepted
+/// input must survive the read side, a join and a hash without a panic, and must be CANONICAL:
+/// it re-encodes to exactly the input.
+#[test]
+fn decode_mutation_fuzz() {
+    let n: u64 =
+        std::env::var("Q7_DECODE_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+    let o = opts(1_000_000_000);
+    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    for pool in pools(24, 24, &o) {
+        for st in pool.iter().step_by(5) {
+            corpus.push(st.encode());
+        }
+    }
+    let mut rng = Rng(0x00C0_FFEE_D00D_5EED);
+    let (mut accepted, mut refused) = (0u64, 0u64);
+    for k in 0..n {
+        let mut b = corpus[rng.below(corpus.len())].clone();
+        for _ in 0..1 + rng.below(4) {
+            let i = rng.below(b.len().max(1));
+            match rng.below(6) {
+                0 => b[i] ^= 1 << rng.below(8),
+                1 => b[i] = *rng.pick(&[0u8, 1, 2, 3, 0xff]),
+                2 => b.truncate(i),
+                3 => b.insert(i, rng.next() as u8),
+                4 if i + 8 <= b.len() => {
+                    // rewrite something that may be a u64 length
+                    let v = *rng.pick(&[0u64, 1, 2, 3, u64::MAX, (b.len() - i) as u64]);
+                    b[i..i + 8].copy_from_slice(&v.to_be_bytes());
+                }
+                _ => {
+                    if i < b.len() {
+                        b.remove(i);
+                    }
+                }
+            }
+            if b.is_empty() {
+                break;
+            }
+        }
+        let input = b.clone();
+        let verdict = std::panic::catch_unwind(move || match MergeState::decode(&b) {
+            Err(_) => false,
+            Ok(st) => {
+                let _ = st.visible(&o_default());
+                let _ = st.hidden_all(&o_default());
+                let _ = join(&st, &st, &o_default()).0.state_hash();
+                assert_eq!(st.encode(), b, "an accepted input must re-encode to itself");
+                true
+            }
+        });
+        match verdict {
+            Ok(true) => accepted += 1,
+            Ok(false) => refused += 1,
+            Err(_) => panic!(
+                "decode fuzz input {k} failed (bytes {})",
+                input.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            ),
+        }
+    }
+    eprintln!(
+        "decode_mutation_fuzz: {n} inputs, {accepted} accepted (all canonical), {refused} refused"
+    );
+    assert!(accepted > 0 && refused > 0, "the fuzz should reach both outcomes");
+}
+
+fn o_default() -> JoinOptions {
+    opts(1_000_000_000)
+}
