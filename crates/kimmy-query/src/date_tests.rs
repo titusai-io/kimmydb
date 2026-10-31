@@ -1453,6 +1453,25 @@ fn extreme_dates_and_bins_never_panic() {
 }
 
 #[test]
+fn a_truncation_below_the_smallest_date_is_refused() {
+    // The start of the unit that holds the smallest date lies below it, so no
+    // 64-bit date can answer; it must be a refusal and not a wrapped number.
+    for unit in ["year", "quarter", "month", "week", "day", "hour"] {
+        let e = refused(
+            doc! { "$dateTrunc": { "date": "$d", "unit": unit } },
+            doc! { "d": at(i64::MIN) },
+        );
+        assert!(e.contains("dateTrunc overflowed"), "{unit}: {e}");
+    }
+    // One day above the smallest date the start of the day fits.
+    let day = ev(
+        doc! { "$dateTrunc": { "date": "$d", "unit": "day" } },
+        doc! { "d": at(i64::MIN + 86_400_000 * 2) },
+    );
+    assert!(matches!(day, Bson::DateTime(_)), "{day:?}");
+}
+
+#[test]
 fn the_ends_of_the_reference_date_range() {
     // extra.out: the year of the largest and smallest dates mongosh can show.
     let year = |ms: i64| ev(doc! { "$year": "$d" }, doc! { "d": at(ms) });

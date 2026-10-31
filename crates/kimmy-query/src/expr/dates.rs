@@ -603,8 +603,9 @@ impl DateExpr {
         let unit = self.arg("unit", scope)?;
         let amount = self.arg("amount", scope)?;
         let zone = self.zone_arg(scope)?;
-        // Any null answers null before any type, unit or zone is judged.
-        if start.is_null() || unit.is_null() || amount.is_null() || zone.is_null() {
+        // Any null answers null before any type, unit or zone is judged: a null
+        // zone is caught here, a null date, unit or amount by the pattern below.
+        if zone.is_null() {
             return Ok(Bson::Null);
         }
         let (Arg::Val(start), Arg::Val(unit), Arg::Val(amount)) = (start, unit, amount) else {
@@ -634,7 +635,8 @@ impl DateExpr {
         let end = self.arg("endDate", scope)?;
         let unit = self.arg("unit", scope)?;
         let zone = self.zone_arg(scope)?;
-        if start.is_null() || end.is_null() || unit.is_null() || zone.is_null() {
+        // A null zone is caught here, a null date or unit by the pattern below.
+        if zone.is_null() {
             return Ok(Bson::Null);
         }
         let (Arg::Val(start), Arg::Val(end), Arg::Val(unit)) = (start, end, unit) else {
@@ -661,7 +663,9 @@ impl DateExpr {
         let unit = self.arg("unit", scope)?;
         let bin = self.arg("binSize", scope)?;
         let zone = self.zone_arg(scope)?;
-        if date.is_null() || unit.is_null() || bin.is_null() || zone.is_null() {
+        // A null `binSize` or zone is caught here, a null date or unit by the
+        // pattern below.
+        if bin.is_null() || zone.is_null() {
             return Ok(Bson::Null);
         }
         let (Arg::Val(date), Arg::Val(unit)) = (date, unit) else { return Ok(Bson::Null) };
