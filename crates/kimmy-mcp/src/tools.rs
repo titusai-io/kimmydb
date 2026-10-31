@@ -565,7 +565,8 @@ impl KimmyMcp {
                        the work in the database rather than returning rows for you to \
                        reduce. Stages: $match (filter, put it first so later stages see \
                        less), $group (with $sum, $avg, $min, $max, $first, $last, $push, \
-                       $addToSet), $unwind, $project, $sort, $skip, $limit, $count, \
+                       $addToSet, $count, $stdDevPop, $stdDevSamp, $top, $bottom, \
+                       $topN, $bottomN, $firstN, $lastN, $maxN, $minN), $unwind, $project, $sort, $skip, $limit, $count, \
                        $lookup (join; you need read access to the joined collection too), \
                        $facet (several sub-pipelines over one input, answered as one \
                        document of arrays), $bucket and $bucketAuto (histograms), \

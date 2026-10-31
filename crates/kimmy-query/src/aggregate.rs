@@ -88,6 +88,9 @@ pub enum Accumulator {
     Push(Expr),
     AddToSet(Expr),
     MergeObjects(Expr),
+    /// `$stdDevPop`, `$stdDevSamp`, `$top`, `$bottom`, `$topN`, `$bottomN`, `$firstN`,
+    /// `$lastN`, `$maxN`, `$minN` and `$count` (ADR-262).
+    Ext(crate::accumulators::Spec),
 }
 
 /// One pipeline stage.
@@ -1271,6 +1274,10 @@ fn parse_accumulators(
             )));
         }
         let (op, arg) = acc.iter().next().expect("length checked above");
+        if let Some(spec) = crate::accumulators::parse(op, arg, vars)? {
+            fields.push((name.clone(), Accumulator::Ext(spec)));
+            continue;
+        }
         let expr = Expr::parse_with_vars(arg, vars)?;
         let accumulator = match op.as_str() {
             "$sum" => Accumulator::Sum(expr),
@@ -1285,7 +1292,8 @@ fn parse_accumulators(
             other => {
                 return Err(Error::InvalidQuery(format!(
                     "{other} is not an accumulator; supported: $sum, $avg, $min, $max, $first, \
-                     $last, $push, $addToSet, $mergeObjects"
+                     $last, $push, $addToSet, $mergeObjects, $stdDevPop, $stdDevSamp, $top, \
+                     $bottom, $topN, $bottomN, $firstN, $lastN, $maxN, $minN, $count"
                 )));
             }
         };
@@ -2118,6 +2126,7 @@ enum AccState {
     AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>),
     /// The fields merged so far, a later document's value winning.
     MergeObjects(Document),
+    Ext(crate::accumulators::State),
 }
 
 fn group(
@@ -2146,6 +2155,8 @@ fn group_keyed(
 ) -> Result<Vec<Document>> {
     let mut order: Vec<Bucket> = Vec::new();
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    // Rows the bounded accumulators hold across every group of the stage.
+    let mut held = 0usize;
 
     for doc in &input {
         let scope = Scope::with_bindings(doc, vars);
@@ -2164,8 +2175,9 @@ fn group_keyed(
             }
         };
         for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
-            accumulate(state, acc, &scope)?;
+            held += accumulate(state, acc, &scope, limits)?;
         }
+        check_held(stage, held, limits)?;
     }
 
     order
@@ -2277,11 +2289,13 @@ fn bucket_auto(
             end += 1;
         }
         let mut states: Vec<AccState> = fields.iter().map(init).collect();
+        let mut held = 0usize;
         for (_, doc) in &keyed[start..end] {
             let scope = Scope::with_bindings(doc, vars);
             for (state, (_, acc)) in states.iter_mut().zip(fields) {
-                accumulate(state, acc, &scope)?;
+                held += accumulate(state, acc, &scope, limits)?;
             }
+            check_held("$bucketAuto", held, limits)?;
         }
         let max = if end < keyed.len() { keyed[end].0.clone() } else { keyed[end - 1].0.clone() };
         let mut answer = Document::new();
@@ -2308,11 +2322,22 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
         Accumulator::Push(_) => AccState::Push(Vec::new()),
         Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default()),
         Accumulator::MergeObjects(_) => AccState::MergeObjects(Document::new()),
+        Accumulator::Ext(spec) => AccState::Ext(spec.init()),
     }
 }
 
-fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
+/// Feed one document to one accumulator. Returns how many rows a bounded
+/// accumulator grew by, which the caller totals and holds to the stage's cap.
+fn accumulate(
+    state: &mut AccState,
+    acc: &Accumulator,
+    scope: &Scope<'_>,
+    limits: &Limits,
+) -> Result<usize> {
     match (state, acc) {
+        (AccState::Ext(state), Accumulator::Ext(spec)) => {
+            return state.accumulate(spec, scope, limits);
+        }
         (AccState::Sum(total), Accumulator::Sum(e)) => {
             total.add(&e.eval_in(scope)?);
         }
@@ -2358,6 +2383,18 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
         // Unreachable: `init` pairs each accumulator with its own state.
         _ => {}
     }
+    Ok(0)
+}
+
+/// Refuse a stage whose `$topN`/`$firstN`-style buffers hold more rows, across all
+/// its groups, than the pipeline limit (ADR-262).
+fn check_held(stage: &str, held: usize, limits: &Limits) -> Result<()> {
+    if held > limits.max_documents {
+        return Err(Error::Limit(format!(
+            "{stage} holds {held} accumulated values across its groups, over the pipeline limit              of {}. Use a smaller n, or narrow the pipeline with an earlier $match",
+            limits.max_documents
+        )));
+    }
     Ok(())
 }
 
@@ -2372,6 +2409,7 @@ fn finish(state: AccState) -> Result<Bson> {
         AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
         AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
         AccState::MergeObjects(merged) => Bson::Document(merged),
+        AccState::Ext(state) => state.finish(),
     })
 }
 
