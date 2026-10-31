@@ -36,3 +36,11 @@ local-embeddings = []
 # reported cells) through extra `JoinOptions` fields. Off by default; the
 # production code path is the same code with the switches at their correct values.
 merge-mutants = []
+
+# The Q7 P0 property-test harness (a port of the reviewed Python model): the
+# oracle, the cluster pull protocol, the random runs, the probes and the
+# mutants. It needs the mutation switches of `JoinOptions`.
+[[test]]
+name = "merge_state_sim"
+path = "tests/merge_state_sim/main.rs"
+required-features = ["merge-mutants"]
