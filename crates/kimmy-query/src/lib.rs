@@ -8,6 +8,10 @@
 
 pub mod accumulators;
 pub mod aggregate;
+/// Cooperative cancellation at the request's deadline. Lives in `kimmy-core` so that
+/// `kimmy-storage`, which does not depend on this crate, can check it too (ADR-266);
+/// re-exported here, where the executor's loops use it.
+pub use kimmy_core::deadline;
 pub mod expr;
 pub mod filter;
 /// The `$jsonSchema` engine. Lives in `kimmy-core` so that `kimmy-storage` can parse a

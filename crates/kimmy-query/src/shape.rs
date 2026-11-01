@@ -133,6 +133,83 @@ pub fn sort(keys: &[SortKey], docs: &mut [Document]) {
     docs.sort_by(|a, b| compare(keys, a, b));
 }
 
+/// The documents per run [`sort_until_deadline`] sorts between two looks at the clock.
+pub(crate) const SORT_RUN: usize = 4096;
+
+/// [`sort`] that can be stopped by the request's deadline (ADR-266): the same order,
+/// stable, and `Err(DeadlineExceeded)` once this thread's deadline has passed.
+///
+/// A comparison sort cannot be interrupted from its comparator (a comparator that
+/// changes its answer part way is not one, and the standard sort may panic on it), so
+/// the sort is done in steps with a look at the clock between them: the keys are read
+/// once per document ([`sort_keys`], which [`compare_keys`] orders exactly as [`compare`]
+/// does), the documents are sorted in runs of [`SORT_RUN`] with the standard stable
+/// sort, and the runs are merged pairwise, stably, a tick per document merged. A run
+/// takes milliseconds, so the deadline is seen within that.
+///
+/// Takes and returns the documents, because a stop leaves nothing worth keeping.
+pub fn sort_until_deadline(keys: &[SortKey], docs: Vec<Document>) -> Result<Vec<Document>> {
+    if keys.is_empty() {
+        return Ok(docs);
+    }
+    let mut ticker = kimmy_core::deadline::Ticker::new();
+    let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
+    for doc in docs {
+        ticker.tick()?;
+        keyed.push((sort_keys(keys, &doc), doc));
+    }
+    sort_runs(keys, &mut keyed)?;
+    Ok(merge_runs(keys, keyed, SORT_RUN)?.into_iter().map(|(_, doc)| doc).collect())
+}
+
+/// Sort `keyed` in runs of [`SORT_RUN`], a look at the clock before each.
+fn sort_runs(keys: &[SortKey], keyed: &mut [(Vec<Bson>, Document)]) -> Result<()> {
+    for run in keyed.chunks_mut(SORT_RUN) {
+        kimmy_core::deadline::check()?;
+        run.sort_by(|a, b| compare_keys(keys, &a.0, &b.0));
+    }
+    Ok(())
+}
+
+/// Merge the sorted runs of `width` documents that `keyed` is made of, pairwise and
+/// stably, until it is one run; a tick per document merged.
+fn merge_runs(
+    keys: &[SortKey],
+    mut keyed: Vec<(Vec<Bson>, Document)>,
+    mut width: usize,
+) -> Result<Vec<(Vec<Bson>, Document)>> {
+    let mut ticker = kimmy_core::deadline::Ticker::new();
+    let total = keyed.len();
+    while width < total {
+        let mut merged = Vec::with_capacity(total);
+        let mut rest = keyed.into_iter();
+        loop {
+            let left: Vec<_> = rest.by_ref().take(width).collect();
+            if left.is_empty() {
+                break;
+            }
+            let right: Vec<_> = rest.by_ref().take(width).collect();
+            let (mut left, mut right) = (left.into_iter().peekable(), right.into_iter().peekable());
+            loop {
+                ticker.tick()?;
+                // The right side goes first only when strictly less: ties keep the
+                // left (earlier) document first, which is what makes the sort stable.
+                let take_right = match (left.peek(), right.peek()) {
+                    (Some(l), Some(r)) => compare_keys(keys, &r.0, &l.0) == Ordering::Less,
+                    (None, Some(_)) => true,
+                    (Some(_), None) => false,
+                    (None, None) => break,
+                };
+                let next = if take_right { right.next() } else { left.next() };
+                merged.extend(next);
+            }
+        }
+        keyed = merged;
+        width = width.saturating_mul(2);
+    }
+    Ok(keyed)
+}
+
 // ---------------------------------------------------------------------------
 // Projection
 // ---------------------------------------------------------------------------
@@ -707,6 +784,43 @@ mod tests {
 
     fn keys(doc: &Document) -> Vec<&str> {
         doc.keys().map(String::as_str).collect()
+    }
+
+    // The two steps of `sort_until_deadline` after the keys are read, each held to the
+    // deadline on its own: the tests of the whole sort cannot say which step stopped.
+    fn keyed(n: i64) -> Vec<(Vec<Bson>, Document)> {
+        (0..n).rev().map(|i| (vec![Bson::Int64(i)], doc! { "_id": i })).collect()
+    }
+
+    fn by_v() -> Vec<SortKey> {
+        vec![SortKey { path: "v".into(), descending: false }]
+    }
+
+    #[test]
+    fn the_runs_of_a_sort_are_sorted_with_a_look_at_the_deadline_before_each() {
+        let mut rows = keyed(5);
+        sort_runs(&by_v(), &mut rows).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|(_, d)| d.get_i64("_id").unwrap()).collect();
+        assert_eq!(ids, [0, 1, 2, 3, 4]);
+        let _expired = kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO));
+        let mut rows = keyed(5);
+        assert!(matches!(sort_runs(&by_v(), &mut rows), Err(Error::DeadlineExceeded)));
+    }
+
+    #[test]
+    fn merging_runs_is_stable_and_ticks_the_deadline_per_document() {
+        // Two runs of width 2, already sorted inside: [1, 3] and [1, 2] by key, the
+        // equal keys told apart by `_id`; the left one's goes first.
+        let run = |pairs: &[(i64, i64)]| -> Vec<(Vec<Bson>, Document)> {
+            pairs.iter().map(|&(k, id)| (vec![Bson::Int64(k)], doc! { "_id": id })).collect()
+        };
+        let mut rows = run(&[(1, 10), (3, 11)]);
+        rows.extend(run(&[(1, 20), (2, 21)]));
+        let merged = merge_runs(&by_v(), rows.clone(), 2).unwrap();
+        let ids: Vec<i64> = merged.iter().map(|(_, d)| d.get_i64("_id").unwrap()).collect();
+        assert_eq!(ids, [10, 20, 21, 11]);
+        let _expired = kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO));
+        assert!(matches!(merge_runs(&by_v(), rows, 2), Err(Error::DeadlineExceeded)));
     }
 
     #[test]

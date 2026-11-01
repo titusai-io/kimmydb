@@ -31,6 +31,23 @@
 //! no caller could detect — a `$group` over 90% of the input looks exactly like
 //! a `$group` over all of it.
 //!
+//! # The request deadline (ADR-266)
+//!
+//! A pipeline runs on the worker thread without yielding, so the request timeout
+//! cannot end it. It ends itself: [`apply_with_vars`] looks at the thread's deadline
+//! ([`crate::deadline`]) as each stage starts, and every loop in a stage ticks a
+//! `deadline::Ticker`, which reads the clock on the first iteration and every 1,024th
+//! after it, and fails with `Error::DeadlineExceeded` once the deadline has passed.
+//! Outside a handler that set a deadline every call is a no-op.
+//!
+//! **A stage added to this module takes the same two lines**: `let mut ticker =
+//! Ticker::new();` before its loop and `ticker.tick()?;` as the loop's first statement
+//! (a stage that only calls other stages needs neither, `apply_with_vars` having
+//! checked on its entry). A loop that runs a few iterations but is entered many times
+//! (an expression operator) calls `deadline::tick()?`, which counts across calls. A
+//! stage the caller executes (`$lookup`, `$graphLookup`, `$merge`, `$out`) does the same
+//! in `kimmy-api`'s `exec.rs`; its reads of storage already tick per row.
+//!
 //! # Expressions live next door
 //!
 //! An accumulator argument, a `$group` key and a computed field are all
@@ -50,6 +67,7 @@ use std::collections::HashSet;
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
+use crate::deadline::{self, Ticker};
 use crate::expr::{Binding, Expr, Mean, Scope, Total, type_name};
 use crate::filter::{self, Filter};
 use crate::shape::{self, ID_FIELD, Projection, SortKey};
@@ -843,7 +861,10 @@ pub fn run_facet<E: From<Error>>(
         Ok(())
     };
     let mut input = Some(input);
+    let mut ticker = Ticker::new();
     for (at, (name, stages)) in facets.iter().enumerate() {
+        // Between facets, as well as inside each one's stages and below.
+        deadline::check()?;
         let docs = if at + 1 == facets.len() {
             input.take().unwrap_or_default()
         } else {
@@ -856,6 +877,7 @@ pub fn run_facet<E: From<Error>>(
         // and each document as an element of it (type byte, decimal index, terminator).
         charge(&mut bytes, 1 + name.len() + 1 + 4 + 1)?;
         for (index, doc) in out.iter().enumerate() {
+            ticker.tick()?;
             let encoded = bson::serialize_to_vec(doc)
                 .map_err(|e| Error::Internal(format!("$facet output could not be encoded: {e}")))?;
             // Refused as soon as it is over, so a later facet is never run for an answer
@@ -1775,12 +1797,19 @@ pub fn apply_with_vars(
     limits: &Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
+    // Every stage starts by looking at the request's deadline (ADR-266), and every
+    // loop below holds a `Ticker` and ticks first in its body. A stage added to this
+    // match does the same: `let mut ticker = Ticker::new();` before its loop and
+    // `ticker.tick()?;` as the loop's first statement. See `kimmy_core::deadline`.
+    deadline::check()?;
+    let mut ticker = Ticker::new();
     let out = match stage {
         // A `$expr` that cannot be evaluated against a document fails the
         // pipeline, as in a top-level filter (ADR-206).
         Stage::Match(f) => {
             let mut out = Vec::with_capacity(input.len());
             for doc in input {
+                ticker.tick()?;
                 if filter::matches_with(f, &doc, vars)? {
                     out.push(doc);
                 }
@@ -1790,6 +1819,7 @@ pub fn apply_with_vars(
         Stage::Project { projection, computed } => {
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
+                ticker.tick()?;
                 let mut projected = shape::project(projection.as_ref(), doc);
                 // Computed fields read the *input*, not the projection's
                 // output — otherwise `{$project: {a: 0, b: "$a"}}` would
@@ -1803,6 +1833,7 @@ pub fn apply_with_vars(
         Stage::AddFields(computed) => {
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
+                ticker.tick()?;
                 let mut with = doc.clone();
                 set_computed(&mut with, computed, &Scope::with_bindings(doc, vars))?;
                 out.push(with);
@@ -1812,6 +1843,7 @@ pub fn apply_with_vars(
         Stage::ReplaceRoot(expr) => {
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
+                ticker.tick()?;
                 match expr.eval_in(&Scope::with_bindings(doc, vars))? {
                     Bson::Document(new_root) => out.push(new_root),
                     // Refused rather than wrapped: a root that is not a
@@ -1831,9 +1863,8 @@ pub fn apply_with_vars(
             // A sort key is a field path, not an expression, and orders by
             // the same rules `find`'s sort does — an array sorts by its
             // elements, and a path that crosses one is not fanned out.
-            let mut docs = input;
-            shape::sort(keys, &mut docs);
-            docs
+            // In runs, with a look at the deadline between them (ADR-266).
+            shape::sort_until_deadline(keys, input)?
         }
         Stage::Limit(n) => input.into_iter().take(*n).collect(),
         Stage::Skip(n) => input.into_iter().skip(*n).collect(),
@@ -2041,7 +2072,9 @@ fn unwind(
     };
 
     let mut out = Vec::with_capacity(input.len());
+    let mut ticker = Ticker::new();
     for doc in input {
+        ticker.tick()?;
         // Refused uniformly, for every document, before anything at `field`
         // is read: `$unwind` names a place to write each element back to,
         // and a path that crosses an array has none, regardless of what is
@@ -2064,6 +2097,9 @@ fn unwind(
         match value_at(&doc, field) {
             Some(Bson::Array(items)) if !items.is_empty() => {
                 for (index, item) in items.clone().into_iter().enumerate() {
+                    // A document holding a huge array is many rows from one iteration
+                    // of the loop above.
+                    ticker.tick()?;
                     let mut copy = doc.clone();
                     path::set(&mut copy, field, item)
                         .map_err(|e| Error::InvalidQuery(format!("cannot set `{field}`: {e}")))?;
@@ -2156,7 +2192,9 @@ fn group_keyed(
     let mut order: Vec<Bucket> = Vec::new();
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
 
+    let mut ticker = Ticker::new();
     for doc in &input {
+        ticker.tick()?;
         let scope = Scope::with_bindings(doc, vars);
         let Some(key) = key_of(&scope)? else { continue };
         let encoded = group_key(&key);
@@ -2177,6 +2215,8 @@ fn group_keyed(
         }
     }
 
+    // Not ticked: one cheap step per bucket, and the buckets are no more than the
+    // documents that were.
     order
         .into_iter()
         .map(|bucket| {
@@ -2270,7 +2310,9 @@ fn bucket_auto(
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
     let mut keyed: Vec<(Bson, Document)> = Vec::with_capacity(input.len());
+    let mut ticker = Ticker::new();
     for doc in input {
+        ticker.tick()?;
         let key = group_by.eval_in(&Scope::with_bindings(&doc, vars))?;
         keyed.push((key, doc));
     }
@@ -2287,6 +2329,7 @@ fn bucket_auto(
         }
         let mut states: Vec<AccState> = fields.iter().map(init).collect();
         for (_, doc) in &keyed[start..end] {
+            ticker.tick()?;
             let scope = Scope::with_bindings(doc, vars);
             for (state, (_, acc)) in states.iter_mut().zip(fields) {
                 accumulate(state, acc, &scope)?;
@@ -2432,6 +2475,9 @@ pub fn lookup_keys(input: &[Document], local_field: &str) -> Vec<Bson> {
     }
     keys
 }
+
+#[cfg(test)]
+mod deadline_tests;
 
 #[cfg(test)]
 mod tests {

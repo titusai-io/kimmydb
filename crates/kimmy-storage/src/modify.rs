@@ -233,15 +233,26 @@ impl Engine {
             if continuing {
                 crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BetweenChunks);
             }
-            match self.modify_chunk(
-                holder,
-                continuing,
-                coll,
-                candidates,
-                spec,
-                budget,
-                after.as_deref(),
-            ) {
+            // The request's deadline (ADR-266) is looked at before each chunk and on every
+            // candidate a chunk's scan examines, until the first chunk has committed: a
+            // request that has written something keeps going (ADR-192), so from then on
+            // the deadline is set aside. A stop is a failure of the chunk it is in, which
+            // aborts that chunk whole and, with nothing committed, writes nothing.
+            let _suspended = continuing.then(kimmy_core::deadline::Deadline::suspend);
+            let chunked = kimmy_core::deadline::check()
+                .map_err(|e| (StorageError::from(e), 0))
+                .and_then(|()| {
+                    self.modify_chunk(
+                        holder,
+                        continuing,
+                        coll,
+                        candidates,
+                        spec,
+                        budget,
+                        after.as_deref(),
+                    )
+                });
+            match chunked {
                 Ok((examined, None)) => {
                     outcome.examined += examined;
                     break;
@@ -567,6 +578,8 @@ impl Engine {
         // `Ok(false)` asks the scan to stop: the limit is reached.
         let mut consider =
             |record: DocRecord, doc: Document, matches: &mut Vec<Match>| -> Result<bool> {
+                // Every candidate examined, whichever way it was found (ADR-266).
+                kimmy_core::deadline::tick()?;
                 examined += 1;
                 if !spec.matches(&doc).map_err(StorageError::Core)? {
                     return Ok(true);
@@ -1748,6 +1761,50 @@ mod tests {
             "{cause:?}"
         );
         assert_eq!(claimed(&engine, &coll), vec![0], "chunk one stands, and nothing after it");
+    }
+
+    fn expire_deadline_for_this_test() {
+        std::mem::forget(kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO)));
+    }
+
+    #[test]
+    fn a_request_deadline_that_has_passed_before_the_first_chunk_writes_nothing() {
+        let (engine, coll, _dir) = three_chunks();
+        expire_deadline_for_this_test();
+        let failed = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        assert!(claimed(&engine, &coll).is_empty());
+    }
+
+    #[test]
+    fn a_request_deadline_that_passes_after_the_first_commit_does_not_stop_the_request() {
+        // A request that has written something keeps going (ADR-192), so the deadline
+        // is set aside from the second chunk on: the three chunks all land.
+        let (engine, coll, _dir) = three_chunks();
+        crate::sync::race_hooks::at(
+            crate::sync::race_hooks::Race::BetweenChunks,
+            expire_deadline_for_this_test,
+        );
+        let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap();
+        assert_eq!((out.matched, out.commits), (3, 3));
+        assert_eq!(claimed(&engine, &coll), vec![0, 1, 2]);
+        // And the deadline is back once the request is over.
+        assert!(matches!(kimmy_core::deadline::check(), Err(kimmy_core::Error::DeadlineExceeded)));
+    }
+
+    #[test]
+    fn the_scan_of_a_find_and_modify_stops_at_a_passed_deadline_and_writes_nothing() {
+        let (engine, coll, _dir) = three_chunks();
+        expire_deadline_for_this_test();
+        let failed = engine.find_and_modify(&coll, &Candidates::Scan, &claim_all());
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        assert!(claimed(&engine, &coll).is_empty());
     }
 
     #[test]

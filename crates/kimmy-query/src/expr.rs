@@ -80,7 +80,7 @@ use std::cmp::Ordering;
 use bson::{Bson, Document};
 use kimmy_core::decimal::arith::{self, ExactSum};
 use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
-use kimmy_core::{Error, Result, canonical_cmp, path};
+use kimmy_core::{Error, Result, canonical_cmp, deadline, path};
 
 use crate::shape::{self, SortKey};
 
@@ -2054,6 +2054,9 @@ fn eval_filter(
         if limit.is_some_and(|n| out.len() >= n) {
             break;
         }
+        // The thread's shared count (ADR-266): an iteration operator is evaluated for
+        // each document, often over a few elements, and a nested one multiplies.
+        deadline::tick()?;
         let frame = [(as_name, item)];
         if truthy(&cond.eval_in(&scope.nested(&frame))?) {
             out.push(item.clone());
@@ -2068,6 +2071,7 @@ fn eval_map(input: &Expr, as_name: &str, body: &Expr, scope: &Scope<'_>) -> Resu
     };
     let mut out = Vec::with_capacity(items.len());
     for item in &items {
+        deadline::tick()?;
         let frame = [(as_name, item)];
         out.push(body.eval_in(&scope.nested(&frame))?);
     }
@@ -2082,6 +2086,7 @@ fn eval_reduce(input: &Expr, initial: &Expr, body: &Expr, scope: &Scope<'_>) -> 
     // refer to `$$this`, and there is no element for it to refer to.
     let mut acc = initial.eval_in(scope)?;
     for item in &items {
+        deadline::tick()?;
         let frame = [("value", &acc), ("this", item)];
         let next = body.eval_in(&scope.nested(&frame))?;
         acc = next;
