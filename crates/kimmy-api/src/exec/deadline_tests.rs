@@ -109,7 +109,14 @@ fn the_stages_after_the_source_run_under_the_deadline_the_aggregation_sets() {
         json!({ "$unionWith": "absent" }),
     ] {
         let stages = parse_pipeline(&json!([stage])).unwrap();
-        let docs = vec![doc! { "_id": 1, "k": 1, "v": 1 }];
+        // No input document for `$unionWith`: with none, no loop after the stage has a row
+        // to tick on (the answer is built from what it appended), so only the stage's own
+        // looks at the deadline can cut it.
+        let docs = if stage.get("$unionWith").is_some() {
+            Vec::new()
+        } else {
+            vec![doc! { "_id": 1, "k": 1, "v": 1 }]
+        };
         let run = |left: Duration| {
             in_a_request(left, || {
                 finish_pipeline(
