@@ -1861,6 +1861,24 @@ mod tests {
     }
 
     #[test]
+    fn a_possessive_quantifier_is_refused_in_every_place_a_pattern_is_written() {
+        // The reference never gives back what `a*+` took; this engine would, so the
+        // pattern is a `400` naming the construct, wherever it is written.
+        for pattern in ["a*+a", "^a++$", "x?+", "x{1,3}+"] {
+            let message = refused(doc! { "s": { "$regex": pattern } });
+            assert!(message.contains("possessive quantifiers"), "{pattern}: {message}");
+            assert!(message.contains(&format!("{pattern:?}")), "{message}");
+        }
+        refused(doc! { "s": { "$regex": literal("a*+a", "i") } });
+        refused(doc! { "s": { "$not": literal("a++", "") } });
+        refused(doc! { "$or": [{ "s": { "$regex": "ok" } }, { "t": { "$regex": "a*+" } }] });
+        refused(doc! { "$jsonSchema": { "properties": { "s": { "pattern": "a*+a" } } } });
+        // A group between the two quantifiers, and a lazy one, are patterns.
+        parse(&doc! { "s": { "$regex": "(?:a*)+a" } }).unwrap();
+        parse(&doc! { "s": { "$regex": "a+?a" } }).unwrap();
+    }
+
+    #[test]
     fn regex_honours_sibling_options() {
         // $options is a modifier on $regex, not an operator in its own right;
         // parsing them independently would silently drop the flags.

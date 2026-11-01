@@ -183,6 +183,27 @@ pub async fn validator_violations(
 mod tests {
     use super::*;
 
+    /// The body of a create and of `PUT .../validator` both go through `into_spec`,
+    /// which refuses a schema being set that the engine cannot honour.
+    #[test]
+    fn a_validator_pattern_with_a_possessive_quantifier_is_refused_when_it_is_set() {
+        let input = |pattern: &str| ValidatorInput {
+            validator: Some(json!({"$jsonSchema": {"properties": {"a": {"pattern": pattern}}}})),
+            ..Default::default()
+        };
+        let err = input("^a*+b$").into_spec().unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("possessive quantifiers"), "{}", err.message);
+        assert!(err.message.contains("\"pattern\""), "names the keyword: {}", err.message);
+        let nested = ValidatorInput {
+            validator: Some(json!({"$jsonSchema": {"patternProperties": {"^x++": {}}}})),
+            ..Default::default()
+        };
+        assert!(nested.into_spec().unwrap_err().message.contains("possessive"));
+        // The same pattern without the second `+` is a validator.
+        assert!(input("^a*b$").into_spec().unwrap().is_some());
+    }
+
     #[test]
     fn a_zero_limit_is_refused_and_a_large_one_is_clamped() {
         assert_eq!(violations_limit(None).unwrap(), DEFAULT_LIMIT);

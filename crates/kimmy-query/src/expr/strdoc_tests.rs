@@ -409,6 +409,12 @@ fn index_of_bytes_counts_bytes() {
     // `$indexOfCP` lets it run past.
     assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(2)]), Bson::Int64(-1));
     assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(1));
+    // A start past `end` (or past the string) finds nothing, an empty substring too.
+    assert_eq!(f(vec![s("abc"), s("a"), Bson::Int32(2), Bson::Int32(1)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(3), Bson::Int32(2)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(2), Bson::Int32(1)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abcabc"), s("b"), Bson::Int32(4), Bson::Int32(3)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abc"), s("a"), Bson::Int32(0), Bson::Int32(0)]), Bson::Int64(-1));
     // An empty substring is found at `start` up to the end of the string.
     assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(3)]), Bson::Int64(3));
     assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(4)]), Bson::Int64(-1));
@@ -603,9 +609,33 @@ fn regex_classes_are_ascii_and_the_u_flag_is_accepted() {
     assert_eq!(m("a", "a", "u"), yes);
     assert_eq!(m("é", "\\w", "u"), no);
     assert_eq!(ok(doc! {"$regexMatch": {"input": "xax", "regex": regex_value("a", "u")}}), yes);
-    // What the engine does not run is still refused.
-    for re in ["(a)\\1", "(?=a)", "(?<!a)b", "\\Qa\\E", "(?>a)"] {
+    // What the engine does not run is still refused, a possessive quantifier too.
+    for re in ["(a)\\1", "(?=a)", "(?<!a)b", "\\Qa\\E", "(?>a)", "\\h", "\\R"] {
         refused(doc! {"$regexMatch": {"input": "a", "regex": re}}, doc! {}, "cannot be used");
+    }
+}
+
+#[test]
+fn a_possessive_quantifier_is_refused_by_every_regex_operator() {
+    for op in ["$regexMatch", "$regexFind", "$regexFindAll"] {
+        // A constant pattern, when the expression is parsed.
+        let bad = Bson::Document(doc! {op: {"input": "$s", "regex": "a*+a"}});
+        let err = Expr::parse(&bad).unwrap_err().to_string();
+        assert!(err.contains("possessive quantifiers"), "{op}: {err}");
+        // The regex-value form, and `options`.
+        let bad = Bson::Document(doc! {op: {"input": "$s", "regex": regex_value("a++", "i")}});
+        assert!(Expr::parse(&bad).is_err(), "{op}");
+        // A pattern computed from the document, when it is evaluated.
+        refused(
+            doc! {op: {"input": "a", "regex": "$p"}},
+            doc! {"p": "x?+"},
+            "possessive quantifiers",
+        );
+        // Without the extra `+` it is a pattern.
+        assert!(
+            ev(doc! {op: {"input": "aa", "regex": "$p"}}, &doc! {"p": "(?:a*)+"}).is_ok(),
+            "{op}"
+        );
     }
 }
 
@@ -618,7 +648,7 @@ fn concat_refuses_a_string_over_the_limit_before_building_it() {
     assert_eq!(sized(4, 8).unwrap(), s("aaaabbbb"));
     let err = sized(5, 8).unwrap_err();
     assert!(
-        matches!(err, Error::AnswerTooLarge { bytes: 9, max: 8, .. }),
+        matches!(err, Error::ValueTooLarge { bytes: 9, max: 8, .. }),
         "{err:?}: the limit is exact, and the answer is the 413 kind"
     );
     // A null makes the result null whatever the sizes, and a type error comes in
@@ -627,6 +657,12 @@ fn concat_refuses_a_string_over_the_limit_before_building_it() {
     let err = concat_within(&[s("aaaa"), Bson::Int32(1), s("bbbbbbbb")], 8).unwrap_err();
     assert!(err.to_string().contains("$concat needs strings"), "{err}");
     assert_eq!(concat_within(&[], 0).unwrap(), s(""));
+    // The message names what hit which limit.
+    assert_eq!(
+        sized(5, 8).unwrap_err().to_string(),
+        "the string $concat builds is 9 bytes, over the 16 MiB string limit; build a shorter \
+         string, or $limit or $substrBytes the input"
+    );
 }
 
 #[test]
@@ -642,15 +678,54 @@ fn a_reduce_that_doubles_a_string_stops_at_16_mib() {
             &doc! {},
         )
     };
-    // 2^24 bytes is exactly the limit; one more doubling is over it.
-    let Bson::String(at_limit) = double(24).unwrap() else { panic!("a string") };
-    assert_eq!(at_limit.len(), MAX_DOCUMENT_BYTES);
-    drop(at_limit);
-    let err = double(25).unwrap_err();
+    // 2^23 bytes is within the limit. 2^24 bytes is exactly 16 MiB, which the
+    // reference refuses too (a string must be shorter), and so is anything past it.
+    let Bson::String(half) = double(23).unwrap() else { panic!("a string") };
+    assert_eq!(half.len(), MAX_DOCUMENT_BYTES / 2);
+    drop(half);
+    let err = double(24).unwrap_err();
     assert!(
-        matches!(&err, Error::AnswerTooLarge { bytes, max, .. }
-            if *bytes == 2 * MAX_DOCUMENT_BYTES && *max == MAX_DOCUMENT_BYTES),
+        matches!(&err, Error::ValueTooLarge { bytes, max, .. }
+            if *bytes == MAX_DOCUMENT_BYTES && *max == MAX_DOCUMENT_BYTES - 1),
         "{err:?}"
+    );
+    // More steps stop at the same doubling: nothing past the limit is built.
+    let err = double(26).unwrap_err();
+    assert!(
+        matches!(&err, Error::ValueTooLarge { bytes, .. } if *bytes == MAX_DOCUMENT_BYTES),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn the_string_limit_is_16_777_215_bytes() {
+    // The reference passes 16,777,215 bytes and refuses 16,777,216, for `$concat`
+    // and for `$replaceAll`.
+    let half = "x".repeat(1 << 23);
+    let d = doc! {"a": half.clone(), "b": &half[1..], "c": half.clone()};
+    match ev(doc! {"$concat": ["$a", "$b"]}, &d).unwrap() {
+        Bson::String(got) => assert_eq!(got.len(), 16_777_215),
+        other => panic!("{other:?}"),
+    }
+    let (bytes, text) = match ev(doc! {"$concat": ["$a", "$c"]}, &d) {
+        Err(err @ Error::ValueTooLarge { bytes, .. }) => (bytes, err.to_string()),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(bytes, 16_777_216);
+    assert!(text.contains("is 16777216 bytes, over the 16 MiB string limit"), "{text}");
+    // `$replaceAll` doubling a run of `x`: 2^23 - 1 of them make 16,777,214 bytes,
+    // 2^23 make exactly 16 MiB.
+    let d = doc! {"under": &half[1..], "at": half};
+    let replace_all = |field: &str| {
+        ev(doc! {"$replaceAll": {"input": field, "find": "x", "replacement": "xx"}}, &d)
+    };
+    match replace_all("$under").unwrap() {
+        Bson::String(got) => assert_eq!(got.len(), 16_777_214),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        matches!(replace_all("$at"), Err(Error::ValueTooLarge { bytes: 16_777_216, .. })),
+        "a result of exactly 16 MiB is refused"
     );
 }
 
@@ -659,8 +734,8 @@ fn replace_refuses_a_result_over_the_limit_before_building_it() {
     use super::strings::replace;
     let refused_at = |input: &str, find: &str, with: &str, all: bool, max: usize| -> usize {
         match replace(input, find, with, all, max) {
-            Err(Error::AnswerTooLarge { bytes, max: m, .. }) if m == max => bytes,
-            other => panic!("expected AnswerTooLarge, got {other:?}"),
+            Err(Error::ValueTooLarge { bytes, max: m, .. }) if m == max => bytes,
+            other => panic!("expected ValueTooLarge, got {other:?}"),
         }
     };
     // The limit is exact: "-a-b-c-" is 7 bytes.
@@ -696,7 +771,7 @@ fn the_operators_refuse_a_result_over_16_mib() {
         let err = ev(doc! {op: {"input": "$a", "find": "", "replacement": "$b"}}, &d);
         // $replaceOne asks for 2 MiB and is fine.
         if op == "$replaceAll" {
-            assert!(matches!(err, Err(Error::AnswerTooLarge { .. })), "{err:?}");
+            assert!(matches!(err, Err(Error::ValueTooLarge { .. })), "{err:?}");
         } else {
             assert!(matches!(err, Ok(Bson::String(ref r)) if r.len() == 2 << 20), "{op}");
         }
@@ -754,8 +829,8 @@ fn regex_find_all_is_bounded_by_the_bytes_of_its_answer() {
     let p = RegexPattern::new("a", "").unwrap();
     let one = match_bytes("a", &p.find_all("a")[0], 0);
     let refusal = |text: &str, max: usize| match find_all_documents(&p, text, max) {
-        Err(Error::AnswerTooLarge { bytes, max: m, .. }) if m == max => bytes,
-        other => panic!("expected AnswerTooLarge, got {other:?}"),
+        Err(Error::ValueTooLarge { bytes, max: m, .. }) if m == max => bytes,
+        other => panic!("expected ValueTooLarge, got {other:?}"),
     };
     // Exactly at the limit is answered; one byte under refuses at the match that
     // passes it, naming the bytes counted by then.

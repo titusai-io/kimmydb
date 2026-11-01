@@ -70,8 +70,14 @@ mod arrayacc;
 mod dates;
 mod docops;
 mod math;
+mod sizes;
 mod strings;
 mod tz;
+
+pub(crate) use sizes::{
+    ArrayBudget, MAX_ARRAY_BYTES, MAX_STRING_BYTES, bson_bytes, check_array_within,
+    check_string_len_within,
+};
 
 pub(crate) use docops::merge_into;
 
@@ -1714,7 +1720,14 @@ impl Expr {
             // that fails fails the array, with its own error, which is a
             // value error like any other and may be held by `$and`/`$or`.
             Expr::Array(items) => {
-                items.iter().map(|e| e.eval_in(scope)).collect::<Result<Vec<_>>>().map(Bson::Array)
+                let mut budget = ArrayBudget::new("the array literal", MAX_ARRAY_BYTES);
+                let mut out = Vec::with_capacity(items.len());
+                for e in items {
+                    let value = e.eval_in(scope)?;
+                    budget.add(&value)?;
+                    out.push(value);
+                }
+                Ok(Bson::Array(out))
             }
             Expr::Switch { branches, default } => {
                 for (case, then) in branches {
@@ -2067,9 +2080,12 @@ fn eval_map(input: &Expr, as_name: &str, body: &Expr, scope: &Scope<'_>) -> Resu
         return Ok(Bson::Null);
     };
     let mut out = Vec::with_capacity(items.len());
+    let mut budget = ArrayBudget::new("the array $map builds", MAX_ARRAY_BYTES);
     for item in &items {
         let frame = [(as_name, item)];
-        out.push(body.eval_in(&scope.nested(&frame))?);
+        let mapped = body.eval_in(&scope.nested(&frame))?;
+        budget.add(&mapped)?;
+        out.push(mapped);
     }
     Ok(Bson::Array(out))
 }
@@ -2179,17 +2195,15 @@ fn eval_zip(
             .collect::<Result<Vec<_>>>()?,
         _ => vec![Bson::Null; arrays.len()],
     };
-    let out = (0..rows)
-        .map(|i| {
-            Bson::Array(
-                arrays
-                    .iter()
-                    .zip(&padding)
-                    .map(|(array, pad)| array.get(i).unwrap_or(pad).clone())
-                    .collect(),
-            )
-        })
-        .collect();
+    let mut budget = ArrayBudget::new("the array $zip builds", MAX_ARRAY_BYTES);
+    let mut out = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let row = Bson::Array(
+            arrays.iter().zip(&padding).map(|(array, pad)| array.get(i).unwrap_or(pad).clone()).collect(),
+        );
+        budget.add(&row)?;
+        out.push(row);
+    }
     Ok(Bson::Array(out))
 }
 
@@ -2716,27 +2730,6 @@ fn concat(args: &[Bson]) -> Result<Bson> {
     concat_within(args, MAX_STRING_BYTES)
 }
 
-/// The longest string an expression may build: 16 MiB, the reference's limit
-/// (`Tried to create string longer than 16MB`). `$concat`, `$replaceOne` and
-/// `$replaceAll` check it before they build, so a `$reduce` that doubles a string
-/// at every step stops at the limit, and one `$replaceAll` cannot ask for a
-/// terabyte.
-pub(crate) const MAX_STRING_BYTES: usize = kimmy_core::limits::MAX_DOCUMENT_BYTES;
-
-/// Refuse a string of `bytes` bytes, over `max`, that `what` is about to build:
-/// an `AnswerTooLarge`, answered `413` as the other size caps are.
-pub(crate) fn check_string_len_within(what: &'static str, bytes: usize, max: usize) -> Result<()> {
-    if bytes > max {
-        return Err(Error::AnswerTooLarge {
-            what,
-            bytes,
-            max,
-            remedy: "build a shorter string, or $limit or $substrBytes the input",
-        });
-    }
-    Ok(())
-}
-
 fn concat_within(args: &[Bson], max: usize) -> Result<Bson> {
     let mut len = 0usize;
     for arg in args {
@@ -2753,7 +2746,7 @@ fn concat_within(args: &[Bson], max: usize) -> Result<Bson> {
             }
         }
     }
-    check_string_len_within("string built by $concat", len, max)?;
+    check_string_len_within("the string $concat builds", len, max)?;
     let mut out = String::with_capacity(len);
     for arg in args {
         if let Bson::String(s) = arg {
@@ -2823,7 +2816,19 @@ fn split(value: &Bson, delimiter: &Bson) -> Result<Bson> {
         // ends, which is never what a caller means and is a silent surprise.
         return Err(Error::InvalidQuery("$split needs a non-empty delimiter".into()));
     }
-    Ok(Bson::Array(s.split(d.as_str()).map(|part| Bson::String(part.to_string())).collect()))
+    split_within(&s, &d, MAX_ARRAY_BYTES)
+}
+
+/// The pieces are counted as they are cut, so a long string of delimiters (one
+/// empty string per byte) stops at the limit, not after it.
+fn split_within(s: &str, d: &str, max: usize) -> Result<Bson> {
+    let mut budget = ArrayBudget::new("the array $split builds", max);
+    let mut out = Vec::new();
+    for part in s.split(d) {
+        budget.add_payload(5 + part.len())?;
+        out.push(Bson::String(part.to_string()));
+    }
+    Ok(Bson::Array(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -2963,15 +2968,30 @@ fn array_slice(args: &[Bson]) -> Result<Bson> {
 }
 
 fn concat_arrays(args: &[Bson]) -> Result<Bson> {
-    let mut out = Vec::new();
+    concat_arrays_within(args, MAX_ARRAY_BYTES)
+}
+
+/// The elements are counted before any is copied, so a `$reduce` that doubles an
+/// array at every step stops at the limit, and the check costs one pass over
+/// what the result would hold.
+fn concat_arrays_within(args: &[Bson], max: usize) -> Result<Bson> {
+    let mut arrays = Vec::with_capacity(args.len());
     for arg in args {
         match as_array(Op::ConcatArrays, arg)? {
             // One null makes the whole result null, as `$concat` does: a
             // missing array must not silently vanish from the middle.
             None => return Ok(Bson::Null),
-            Some(items) => out.extend_from_slice(items),
+            Some(items) => arrays.push(items),
         }
     }
+    let mut budget = ArrayBudget::new("the array $concatArrays builds", max);
+    let mut len = 0usize;
+    for items in &arrays {
+        items.iter().try_for_each(|item| budget.add(item))?;
+        len += items.len();
+    }
+    let mut out = Vec::with_capacity(len);
+    arrays.iter().for_each(|items| out.extend_from_slice(items));
     Ok(Bson::Array(out))
 }
 
@@ -3218,22 +3238,28 @@ fn element_truth(op: Op, value: &Bson) -> Result<Bson> {
 fn object_to_array(value: &Bson) -> Result<Bson> {
     match value {
         Bson::Null | Bson::Undefined => Ok(Bson::Null),
-        Bson::Document(fields) => Ok(Bson::Array(
-            fields
-                .iter()
-                .map(|(k, v)| {
-                    let mut pair = Document::new();
-                    pair.insert("k", k.as_str());
-                    pair.insert("v", v.clone());
-                    Bson::Document(pair)
-                })
-                .collect(),
-        )),
+        Bson::Document(fields) => object_to_array_within(fields, MAX_ARRAY_BYTES),
         other => Err(Error::InvalidQuery(format!(
             "$objectToArray needs a document, found {}",
             type_name(other)
         ))),
     }
+}
+
+/// Each pair `{k, v}` is counted before it is built: a document of small fields
+/// turns into an array a few times its size.
+fn object_to_array_within(fields: &Document, max: usize) -> Result<Bson> {
+    let mut budget = ArrayBudget::new("the array $objectToArray builds", max);
+    let mut out = Vec::with_capacity(fields.len());
+    for (k, v) in fields {
+        // `{k: <string>, v: <value>}`: framing, then the two elements.
+        budget.add_payload(5 + (2 + 1 + 5 + k.len()) + (2 + 1 + bson_bytes(v)))?;
+        let mut pair = Document::new();
+        pair.insert("k", k.as_str());
+        pair.insert("v", v.clone());
+        out.push(Bson::Document(pair));
+    }
+    Ok(Bson::Array(out))
 }
 
 /// The two spellings of one key-value pair `$arrayToObject` reads.
@@ -3594,6 +3620,9 @@ pub(crate) fn type_name(value: &Bson) -> &'static str {
 
 #[cfg(test)]
 mod strdoc_tests;
+
+#[cfg(test)]
+mod size_tests;
 
 #[cfg(test)]
 mod tests {

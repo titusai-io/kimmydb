@@ -245,7 +245,7 @@ fn replaced_len(input: &str, find: &str, with: &str, all: bool) -> Option<usize>
     input.len().checked_add(matches.checked_mul(with.len())?)?.checked_sub(removed)
 }
 
-/// `$replaceOne` and `$replaceAll`, refused (`AnswerTooLarge`) when the result
+/// `$replaceOne` and `$replaceAll`, refused (`ValueTooLarge`) when the result
 /// would be longer than `max` bytes. The length is worked out first, with checked
 /// arithmetic, so that nothing is allocated for an answer that is refused: an
 /// empty `find` over a megabyte with a megabyte `replacement` asks for a terabyte.
@@ -258,7 +258,7 @@ pub(super) fn replace(
 ) -> Result<String> {
     let len = replaced_len(input, find, with, all).unwrap_or(usize::MAX);
     check_string_len_within(
-        if all { "$replaceAll result" } else { "$replaceOne result" },
+        if all { "the string $replaceAll builds" } else { "the string $replaceOne builds" },
         len,
         max,
     )?;
@@ -405,7 +405,7 @@ fn eval_regex(
 const FIND_ALL_MAX_BYTES: usize = 64 << 20;
 
 /// Every match of `pattern` in `text` as `{match, idx, captures}` documents, in an
-/// array, refused (`AnswerTooLarge`) as soon as the documents so far, counted as
+/// array, refused (`ValueTooLarge`) as soon as the documents so far, counted as
 /// BSON, pass `max_bytes`. The matches are read one at a time, so a refused
 /// answer never holds more than that, and `idx` is counted from the previous
 /// match rather than from the start, so the whole is linear in the text.
@@ -423,10 +423,11 @@ pub(super) fn find_all_documents(
         at_byte = m.start;
         bytes = bytes.saturating_add(match_bytes(text, m, found.len()));
         if bytes > max_bytes {
-            return Err(Error::AnswerTooLarge {
-                what: "$regexFindAll answer",
+            return Err(Error::ValueTooLarge {
+                what: "the $regexFindAll output",
                 bytes,
                 max: max_bytes,
+                limit: "64 MiB limit",
                 remedy: "match a narrower pattern, or $limit or $substrBytes the input",
             });
         }

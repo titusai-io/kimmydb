@@ -104,7 +104,17 @@ impl ArrayAcc {
                     }
                 };
                 let n = accumulators::read_n(name, &n.eval_in(scope)?)?;
-                Ok(accumulators::n_of_array(*kind, &items, n))
+                let picked = accumulators::n_of_array(*kind, &items, n);
+                // At most the input's elements, and the input is itself bounded; the
+                // check is one pass over the result, for the array limit to hold here too.
+                if let Bson::Array(picked) = &picked {
+                    super::check_array_within(
+                        "the array the N accumulator form builds",
+                        picked,
+                        super::MAX_ARRAY_BYTES,
+                    )?;
+                }
+                Ok(picked)
             }
         }
     }
