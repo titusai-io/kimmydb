@@ -54,6 +54,10 @@ pub enum ErrorCode {
     PayloadTooLarge,
     /// A write would store a document over the 16 MiB cap (ADR-250).
     DocumentTooLarge,
+    /// A query would build more than a cap allows: a `$facet` answer over 16 MiB, a string, array or
+    /// document an expression builds, or the bytes the blocking stages of a pipeline hold (ADR-264).
+    /// Narrowing the query changes the answer; the message names what and the limit.
+    AnswerTooLarge,
     /// A request names an `_id` over the 4 KiB cap (ADR-250).
     IdTooLarge,
     /// A write would store a document that fails the collection's validator, under
@@ -198,10 +202,11 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 29] = [
+    pub const ALL: [ErrorCode; 30] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::DocumentTooLarge,
+        Self::AnswerTooLarge,
         Self::IdTooLarge,
         Self::ValidationFailed,
         Self::UnsupportedMediaType,
@@ -236,6 +241,7 @@ impl ErrorCode {
             Self::BadRequest => "bad_request",
             Self::PayloadTooLarge => "payload_too_large",
             Self::DocumentTooLarge => "document_too_large",
+            Self::AnswerTooLarge => "answer_too_large",
             Self::IdTooLarge => "id_too_large",
             Self::ValidationFailed => "validation_failed",
             Self::UnsupportedMediaType => "unsupported_media_type",
@@ -273,6 +279,7 @@ impl ErrorCode {
             Self::BadRequest
             | Self::PayloadTooLarge
             | Self::DocumentTooLarge
+            | Self::AnswerTooLarge
             | Self::IdTooLarge
             | Self::ValidationFailed
             | Self::UnsupportedMediaType
@@ -378,6 +385,7 @@ impl ErrorCode {
             Self::BadRequest
             | Self::PayloadTooLarge
             | Self::DocumentTooLarge
+            | Self::AnswerTooLarge
             | Self::IdTooLarge
             | Self::ValidationFailed
             | Self::UnsupportedMediaType
@@ -1011,11 +1019,16 @@ impl From<CoreError> for ApiError {
             }
             // The same 413 as a body over the ceiling, for the same reason: what was
             // sent is too big, and sending it again changes nothing.
-            CoreError::DocumentTooLarge { .. }
-            | CoreError::AnswerTooLarge { .. }
-            | CoreError::ValueTooLarge { .. } => ApiError::new(
+            CoreError::DocumentTooLarge { .. } => ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorCode::DocumentTooLarge,
+                e.to_string(),
+            ),
+            // A query that builds more than a cap allows: its own code, since the document the
+            // client sent is not too large.
+            CoreError::AnswerTooLarge { .. } | CoreError::ValueTooLarge { .. } => ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorCode::AnswerTooLarge,
                 e.to_string(),
             ),
             CoreError::IdTooLarge { .. } => {
@@ -1224,11 +1237,12 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 29] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 30] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
             (DocumentTooLarge, None),
+            (AnswerTooLarge, None),
             (IdTooLarge, None),
             (ValidationFailed, None),
             (UnsupportedMediaType, None),
@@ -1724,8 +1738,26 @@ mod value_too_large_tests {
                 remedy: "trim it",
             });
             assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
-            assert_eq!(err.code, ErrorCode::DocumentTooLarge);
+            assert_eq!(err.code, ErrorCode::AnswerTooLarge);
             assert_eq!(err.message, text);
         }
+    }
+
+    #[test]
+    fn a_query_over_a_cap_is_answer_too_large_and_a_stored_document_over_its_cap_is_not() {
+        let answer: ApiError = CoreError::AnswerTooLarge {
+            what: "$facet answer",
+            bytes: 17_000_000,
+            max: 16 << 20,
+            remedy: "split the facets",
+        }
+        .into();
+        assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(answer.code, ErrorCode::AnswerTooLarge);
+        assert_eq!(answer.code.as_str(), "answer_too_large");
+        let document: ApiError =
+            CoreError::DocumentTooLarge { bytes: 17_000_000, max: 16 << 20 }.into();
+        assert_eq!(document.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(document.code, ErrorCode::DocumentTooLarge);
     }
 }

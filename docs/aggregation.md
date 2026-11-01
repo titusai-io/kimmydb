@@ -196,7 +196,7 @@ rows). Over an empty input every facet runs over nothing: `$count` still answers
 - **Bounded, and refused when over, never cut short.** The facets' outputs together
   count against the pipeline's document limit (100,000), because they are held while
   the next facet runs; and the answer is one document, so it may not encode to more
-  than a stored document may (16 MiB), `413`. The size is counted as each facet
+  than a stored document may (16 MiB), `413 answer_too_large`. The size is counted as each facet
   finishes and the request is refused at the first document that passes it, so a
   later facet does not run for an answer that cannot be returned (one document that
   holds a whole facet, a `$group` with `$push: "$$ROOT"`, counts for its bytes, not
@@ -517,7 +517,7 @@ removals (at once for a window of 16 or fewer) to bound the drift of subtracting
 what it holds: a `$push` over a window of `w` documents is an array of `w`. The stage holds every
 document of its input, every sort key it takes and every value it adds against **one byte budget of
 256 MiB for the whole request**, shared by the stages of the pipeline and the branches of a `$facet`,
-refused `413` as soon as the running total passes it (a cumulative `$push` whose output is quadratic is
+refused `413 answer_too_large` as soon as the running total passes it (a cumulative `$push` whose output is quadratic is
 refused while it is built). Inside a `$facet` and a `$lookup` sub-pipeline like any stage.
 
 ### `$densify`

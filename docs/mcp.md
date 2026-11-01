@@ -350,7 +350,8 @@ a REST client does:
 `retry_after_secs` is present where REST would send a `Retry-After` header.
 The size caps hold here too: a write that would store a document over 16 MiB, or
 name an `_id` over 4096 bytes, is `invalid_params` with `document_too_large` or
-`id_too_large` in `data`, retry `no` ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)).
+`id_too_large` in `data`, retry `no` ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)). A query
+that would build more than a cap allows is `answer_too_large` there and in REST.
 A write to a collection whose validator it fails is `invalid_params` with `validation_failed`
 in `data`, retry `no`, the message naming the keyword path ([Validators](validation.md)).
 
