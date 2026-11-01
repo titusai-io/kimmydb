@@ -2324,7 +2324,7 @@ fn the_refusal_names_the_stage_and_its_buffer_limit_not_one_document() {
     let err = window::apply(&spec, series(&[1]), &capped(1), &[]).unwrap_err();
     let text = err.to_string();
     assert!(text.contains("$setWindowFields"), "{text}");
-    assert!(text.contains("limit on the bytes"), "{text}");
+    assert!(text.contains("aggregate.memory_limit_bytes"), "{text}");
     assert!(!text.contains("of one document"), "{text}");
     let spec = match aggregate::parse(&[
         doc! {"$fill": {"sortBy": {"x": 1}, "output": {"v": {"method": "locf"}}}},
@@ -2372,7 +2372,9 @@ fn the_stages_of_one_pipeline_and_the_branches_of_a_facet_share_one_budget() {
     }
     assert_eq!(docs.len(), 5);
     assert_eq!(limits.buffer.used(), 0);
-    // Two branches of a `$facet` run in turn but are alive together, so they share the cap.
+    // A `$facet` holds its input while its first branch runs on a copy of it, and the
+    // branch's stage holds the copy and what it adds: all of it is charged to the one
+    // budget, so a cap that fits the stage alone does not fit the facet.
     let facet = aggregate::parse(&[doc! {"$facet": {
         "a": [stage.clone(), {"$count": "c"}],
         "b": [stage.clone(), {"$count": "c"}],

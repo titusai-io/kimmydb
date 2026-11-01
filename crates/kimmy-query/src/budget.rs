@@ -46,6 +46,16 @@ pub fn doc_bytes(doc: &Document) -> usize {
     crate::expr::sizes::document_bytes(doc)
 }
 
+/// The bytes an array of documents takes as a field's value, given each document's size:
+/// the array's framing and, for each element, its type byte, its decimal index and a
+/// terminator (as `expr::sizes` counts an array).
+pub fn array_of_docs_bytes(sizes: impl IntoIterator<Item = usize>) -> usize {
+    sizes.into_iter().enumerate().fold(5usize, |sum, (index, size)| {
+        let digits = index.checked_ilog10().map_or(1, |d| d as usize + 1);
+        sum.saturating_add(2 + digits).saturating_add(size)
+    })
+}
+
 /// The BSON size of a list of documents.
 pub fn docs_bytes(docs: &[Document]) -> usize {
     docs.iter().fold(0usize, |sum, doc| sum.saturating_add(doc_bytes(doc)))

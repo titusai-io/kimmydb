@@ -100,6 +100,54 @@ impl Default for RequestLimits {
     }
 }
 
+/// What aggregations may hold in memory (ADR-269): the bytes one request may hold at
+/// once (`aggregate.memory_limit_bytes`), and the pool all concurrent aggregations on
+/// the node draw on together (`aggregate.memory_pool_bytes`).
+///
+/// Held by the shared state, because the pool is the node's: a pool each request carried
+/// would bound nothing across requests. Each request makes its own budget from it with
+/// [`Self::limits`].
+#[derive(Clone, Debug)]
+pub struct AggregateMemory {
+    pool: kimmy_query::budget::MemoryPool,
+    limit: usize,
+}
+
+impl AggregateMemory {
+    /// A request limit of `limit` bytes and a pool of `pool` bytes.
+    pub fn new(limit: usize, pool: usize) -> Self {
+        Self { pool: kimmy_query::budget::MemoryPool::new(pool), limit }
+    }
+
+    /// The limits of one aggregation: the default document ceiling and a fresh budget of
+    /// the request limit, reserving what it holds from the pool.
+    pub fn limits(&self) -> kimmy_query::aggregate::Limits {
+        kimmy_query::aggregate::Limits {
+            buffer: kimmy_query::budget::BufferBudget::pooled(self.limit, &self.pool),
+            ..Default::default()
+        }
+    }
+
+    /// The bytes one request may hold.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The pool every aggregation draws on.
+    pub fn pool(&self) -> &kimmy_query::budget::MemoryPool {
+        &self.pool
+    }
+}
+
+impl Default for AggregateMemory {
+    fn default() -> Self {
+        Self::new(
+            kimmy_query::budget::DEFAULT_MEMORY_LIMIT_BYTES,
+            kimmy_query::budget::DEFAULT_MEMORY_POOL_BYTES,
+        )
+    }
+}
+
 tokio::task_local! {
     /// When the request this task serves must be answered by: set by
     /// [`enforce_timeout`] for the handler it wraps, or by

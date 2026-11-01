@@ -501,7 +501,9 @@ fn value_bytes(value: &Bson) -> usize {
 impl Row {
     /// The bytes this row takes in a group's state.
     fn bytes(&self) -> usize {
-        self.keys.iter().fold(value_bytes(&self.output), |sum, k| sum.saturating_add(value_bytes(k)))
+        self.keys
+            .iter()
+            .fold(value_bytes(&self.output), |sum, k| sum.saturating_add(value_bytes(k)))
     }
 }
 

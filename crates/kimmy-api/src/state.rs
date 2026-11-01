@@ -125,6 +125,10 @@ pub struct AppState {
     /// for `kimmy_ttl_collections`: without clustering there is no block to say
     /// it (ADR-201). Unset reads as on.
     pub(crate) expiry_off: std::sync::OnceLock<bool>,
+    /// What an aggregation may hold: the per-request limit and the node's pool
+    /// (ADR-269). Set once at startup from `aggregate.memory_limit_bytes` and
+    /// `aggregate.memory_pool_bytes`; unset reads as the defaults.
+    pub(crate) aggregate_memory: std::sync::OnceLock<crate::limits::AggregateMemory>,
 }
 
 /// A peer that has been away longer than tombstone retention.
@@ -349,6 +353,23 @@ impl AppState {
     /// second call is ignored.
     pub fn set_expiry_off(&self, off: bool) {
         let _ = self.expiry_off.set(off);
+    }
+
+    /// Choose what aggregations may hold (ADR-269). Called once, at startup; a second
+    /// call is ignored.
+    pub fn set_aggregate_memory(&self, memory: crate::limits::AggregateMemory) {
+        let _ = self.aggregate_memory.set(memory);
+    }
+
+    /// What aggregations may hold: the configured limit and pool, or the defaults.
+    pub fn aggregate_memory(&self) -> &crate::limits::AggregateMemory {
+        self.aggregate_memory.get_or_init(Default::default)
+    }
+
+    /// The limits of one aggregation request, with a fresh memory budget that draws on
+    /// the node's pool (ADR-269).
+    pub fn aggregate_limits(&self) -> kimmy_query::aggregate::Limits {
+        self.aggregate_memory().limits()
     }
 
     /// Who may expire what, from here: the live members and what they said,

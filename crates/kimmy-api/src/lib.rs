@@ -58,7 +58,7 @@ use kimmy_vector::IndexCache;
 pub use audit::AuditMode;
 pub use error::ApiError;
 pub use federation::Federation;
-pub use limits::RequestLimits;
+pub use limits::{AggregateMemory, RequestLimits};
 pub use local_login::LocalLogin;
 pub use metrics::Metrics;
 pub use ratelimit::{Limiter, RateLimit, RateLimits};
@@ -146,6 +146,7 @@ pub fn state_with_policies(
         stale_peers: Default::default(),
         local_login: std::sync::OnceLock::new(),
         expiry_off: std::sync::OnceLock::new(),
+        aggregate_memory: std::sync::OnceLock::new(),
     }))
 }
 

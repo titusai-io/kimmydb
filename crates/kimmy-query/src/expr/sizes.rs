@@ -78,9 +78,8 @@ pub(crate) fn bson_bytes(value: &Bson) -> usize {
 
 /// The BSON size of a document: what it encodes to, worked out without encoding it.
 pub(crate) fn document_bytes(doc: &bson::Document) -> usize {
-    doc.iter().fold(5usize, |sum, (k, v)| {
-        sum.saturating_add(2 + k.len()).saturating_add(bson_bytes(v))
-    })
+    doc.iter()
+        .fold(5usize, |sum, (k, v)| sum.saturating_add(2 + k.len()).saturating_add(bson_bytes(v)))
 }
 
 /// The bytes an array of an expression is growing to, element by element. `add`

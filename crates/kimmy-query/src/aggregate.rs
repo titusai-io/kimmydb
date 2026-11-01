@@ -1930,15 +1930,15 @@ pub(crate) fn group_key(value: &Bson) -> Vec<u8> {
 /// `$sample`) builds nothing, so its input is all it holds. `$setWindowFields`,
 /// `$densify` and `$fill` charge the documents they buffer themselves, and `$facet` its
 /// input and its branches, so none of those charges its input here as well.
-pub(crate) struct Held {
+pub struct Held {
     /// The documents the stage builds: its output, or its buckets.
-    pub(crate) output: Lease,
+    pub output: Lease,
     _input: Option<Lease>,
 }
 
 impl Held {
     /// Charge `input` to the request's budget for `stage`.
-    pub(crate) fn enter(stage: &Stage, input: &[Document], limits: &Limits) -> Result<Self> {
+    pub fn enter(stage: &Stage, input: &[Document], limits: &Limits) -> Result<Self> {
         let name = stage.name();
         let output = limits.buffer.lease(output_of(name));
         let charged = !matches!(
@@ -2045,29 +2045,25 @@ pub fn apply_with_vars(
             let n = input.len() as i64;
             vec![bson::doc! { field.as_str(): n }]
         }
-        Stage::Unwind { path: p, preserve_null_and_empty, include_array_index } => {
-            unwind(
-                input,
-                p,
-                *preserve_null_and_empty,
-                include_array_index.as_deref(),
-                limits,
-                &mut held.output,
-            )?
-        }
+        Stage::Unwind { path: p, preserve_null_and_empty, include_array_index } => unwind(
+            input,
+            p,
+            *preserve_null_and_empty,
+            include_array_index.as_deref(),
+            limits,
+            &mut held.output,
+        )?,
         Stage::Group { id, fields } => group(input, id, fields, limits, vars, &mut held.output)?,
-        Stage::Bucket { group_by, boundaries, default, fields } => {
-            bucket(
-                input,
-                group_by,
-                boundaries,
-                default.as_ref(),
-                fields,
-                limits,
-                vars,
-                &mut held.output,
-            )?
-        }
+        Stage::Bucket { group_by, boundaries, default, fields } => bucket(
+            input,
+            group_by,
+            boundaries,
+            default.as_ref(),
+            fields,
+            limits,
+            vars,
+            &mut held.output,
+        )?,
         Stage::BucketAuto { group_by, buckets, fields } => {
             bucket_auto(input, group_by, *buckets, fields, limits, vars, &mut held.output)?
         }
