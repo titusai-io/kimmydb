@@ -58,7 +58,8 @@ pub enum ErrorCode {
     /// A write would store a document over the 16 MiB cap (ADR-250).
     DocumentTooLarge,
     /// A query would build more than a cap allows: a `$facet` answer over 16 MiB, a string, array or
-    /// document an expression builds, or the bytes the blocking stages of a pipeline hold (ADR-264).
+    /// document an expression builds, or the bytes one aggregation holds past
+    /// `aggregate.memory_limit_bytes` (ADR-269, which widens ADR-264's budget).
     /// Narrowing the query changes the answer; the message names what and the limit.
     AnswerTooLarge,
     /// A request names an `_id` over the 4 KiB cap (ADR-250).
