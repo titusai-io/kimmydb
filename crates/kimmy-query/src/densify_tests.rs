@@ -842,7 +842,7 @@ fn the_stage_runs_inside_a_facet_and_a_lookup_sub_pipeline_parses() {
     ]}}])
     .unwrap();
     let out = aggregate::apply(&stages[0], a(&[1, 5]), &Limits::default()).unwrap();
-    assert_eq!(out, vec![doc! {"f": [{"n": 5i64}]}]);
+    assert_eq!(out, vec![doc! {"f": [{"n": 5}]}]);
     let stages = aggregate::parse(&[doc! {"$lookup": {
         "from": "x", "pipeline": [{"$densify": full(1)}], "as": "y"
     }}])

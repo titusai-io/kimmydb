@@ -62,12 +62,16 @@ fn double(value: &Bson) -> f64 {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn abs_keeps_the_type_and_falls_to_a_double_only_where_an_int64_cannot_hold_it() {
+fn abs_keeps_the_type_and_refuses_the_smallest_int64() {
     assert_eq!(val(one("$abs", Bson::Int32(-5)), none()), Bson::Int32(5));
     assert_eq!(val(one("$abs", Bson::Int64(7)), none()), Bson::Int64(7));
     assert_eq!(val(one("$abs", Bson::Double(-2.5)), none()), Bson::Double(2.5));
     assert_eq!(val(one("$abs", Bson::Double(-0.0)), none()), Bson::Double(0.0));
-    assert_eq!(val(one("$abs", Bson::Int64(i64::MIN)), none()), Bson::Double(2f64.powi(63)));
+    // The reference refuses it (28680), as it does `$round` past a long (51080).
+    assert_eq!(
+        err(one("$abs", Bson::Int64(i64::MIN)), none()),
+        "invalid query: can't take $abs of long long min"
+    );
     assert_eq!(val(one("$abs", Bson::String("$n".into())), doc! {"n": -3}), Bson::Int32(3));
     same(val(one("$abs", dec("-1.50")), none()), "1.50");
     same(val(one("$abs", dec("-0E+3")), none()), "0E+3");
@@ -220,8 +224,11 @@ fn round_of_an_integer_with_a_negative_place_rounds_half_to_even_and_stays_an_in
     assert_eq!(round(Bson::Int32(7), 0), Bson::Int32(7));
     assert_eq!(round(Bson::Int64(7), 5), Bson::Int64(7));
     assert_eq!(round(Bson::Int64(i64::MAX), -20), Bson::Int64(0));
-    // Rounding up to a multiple past Int64 is a double.
-    assert_eq!(round(Bson::Int64(i64::MAX), -1), Bson::Double(9223372036854775810.0));
+    // Rounding up to a multiple past Int64 is refused, as the reference refuses it (51080).
+    assert!(
+        err(op("$round", vec![Bson::Int64(i64::MAX), Bson::Int32(-1)]), none())
+            .contains("past the range of a long")
+    );
 }
 
 #[test]

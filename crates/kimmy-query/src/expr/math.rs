@@ -4,8 +4,9 @@
 //! An integer stays an integer where the result is one, in the width of its
 //! operand (ADR-268: `$ceil`, `$floor`, `$round`, `$trunc` and `$abs` of an
 //! `Int32` are an `Int32`, of an `Int64` an `Int64`), and falls to a double
-//! where it cannot be (`$abs` of the smallest `Int64`, `$pow` past `Int64`), as
-//! `$add` and `$multiply` do. `$abs` of the smallest `Int32` widens to `Int64`. A `Decimal128` argument gives a `Decimal128`
+//! where it cannot be (`$pow` past `Int64`), as
+//! `$add` and `$multiply` do. `$abs` of the smallest `Int32` widens to `Int64`, and of the smallest `Int64`
+//! is refused, as the reference refuses it (`28680`). A `Decimal128` argument gives a `Decimal128`
 //! result, computed in integers by `kimmy_core::decimal::arith::func` and
 //! rounded once to 34 digits (ADR-252's context). Null and a missing field give
 //! null; a value that is not a number, and a number outside the function's
@@ -58,11 +59,14 @@ fn plain_unary(op: Op, n: Num) -> Result<Bson> {
     Ok(match op {
         Op::Abs => match n {
             // The smallest `Int32` has no `Int32` absolute value and widens, as
-            // `$add` does; the smallest `Int64` has no `Int64` one and is a double.
+            // `$add` does; the smallest `Int64` has no `Int64` one and is refused.
             Num::Int32(i) => {
                 i.checked_abs().map_or(Num::Int64(-i64::from(i)), Num::Int32).to_bson()
             }
-            Num::Int64(i) => i.checked_abs().map_or(Num::Dbl(-(i as f64)), Num::Int64).to_bson(),
+            Num::Int64(i) => match i.checked_abs() {
+                Some(a) => Bson::Int64(a),
+                None => return Err(Error::InvalidQuery("can't take $abs of long long min".into())),
+            },
             Num::Dbl(d) => Bson::Double(d.abs()),
         },
         Op::Ceil => match n {
@@ -142,22 +146,22 @@ pub(super) fn round(op: Op, number: &Bson, place: Option<&Bson>) -> Result<Bson>
         }),
         Operand::Plain(Num::Int32(n)) => {
             // An `Int32` stays one while the rounded number fits.
-            match round_int(i64::from(n), place, mode) {
+            match round_int(op, i64::from(n), place, mode)? {
                 Num::Int64(rounded) => Num::narrowest(rounded).to_bson(),
                 other => other.to_bson(),
             }
         }
-        Operand::Plain(Num::Int64(n)) => round_int(n, place, mode).to_bson(),
+        Operand::Plain(Num::Int64(n)) => round_int(op, n, place, mode)?.to_bson(),
         Operand::Plain(Num::Dbl(d)) => Bson::Double(round_double(d, place, mode)),
     })
 }
 
 /// An integer rounded to a multiple of `10^-place` (a no-op for a place of zero
-/// or more); a result past `Int64` is a double, as every integer result is. The
-/// result is built at `Int64` width; the caller narrows an `Int32` operand's.
-fn round_int(n: i64, place: i32, mode: Mode) -> Num {
+/// or more). A result past `Int64` is refused, as the reference refuses it (`51080`).
+/// The result is built at `Int64` width; the caller narrows an `Int32` operand's.
+fn round_int(op: Op, n: i64, place: i32, mode: Mode) -> Result<Num> {
     if place >= 0 {
-        return Num::Int64(n);
+        return Ok(Num::Int64(n));
     }
     let unit = 10i128.pow(place.unsigned_abs());
     let wide = i128::from(n);
@@ -174,8 +178,11 @@ fn round_int(n: i64, place: i32, mode: Mode) -> Num {
         quotient += wide.signum();
     }
     match i64::try_from(quotient * unit) {
-        Ok(rounded) => Num::Int64(rounded),
-        Err(_) => Num::Dbl((quotient * unit) as f64),
+        Ok(rounded) => Ok(Num::Int64(rounded)),
+        Err(_) => Err(Error::InvalidQuery(format!(
+            "{} of {n} at place {place} is past the range of a long",
+            op.name()
+        ))),
     }
 }
 
@@ -278,6 +285,18 @@ pub(super) fn pow(base: &Bson, exponent: &Bson) -> Result<Bson> {
         return Ok(match (b, e) {
             (Num::Int32(_), Num::Int32(_)) => Num::narrowest(power).to_bson(),
             _ => Bson::Int64(power),
+        });
+    }
+    // One and minus one to a negative whole power are whole numbers, and the reference
+    // answers them as an `Int32`, not as the double the general case gives (ADR-268).
+    if let (Some(base @ (1 | -1)), Some(exponent)) = (b.integer(), e.integer())
+        && exponent < 0
+    {
+        let power = if base == -1 && exponent % 2 != 0 { -1 } else { 1 };
+        return Ok(if matches!((b, e), (Num::Int32(_), Num::Int32(_))) {
+            Bson::Int32(power)
+        } else {
+            Bson::Int64(i64::from(power))
         });
     }
     let (b, e) = (b.as_f64(), e.as_f64());

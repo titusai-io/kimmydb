@@ -420,8 +420,12 @@ impl Slider for SumSlider<'_, '_> {
             if self.avg {
                 p.ints as f64
             } else {
+                // The window sum is typed by its total alone, an `Int32` while it fits,
+                // whatever the width of what was added (the reference's windows.diag
+                // answers: `1L + 2L` is the int 3). The `$group` sum differs on purpose:
+                // it stays a long once a long was added (ADR-268).
                 return Ok(match i64::try_from(p.ints) {
-                    Ok(n) => Bson::Int64(n),
+                    Ok(n) => crate::expr::integer_bson(n),
                     Err(_) => Bson::Double(p.ints as f64),
                 });
             }

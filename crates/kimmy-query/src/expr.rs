@@ -2571,6 +2571,10 @@ impl Seen {
 #[derive(Clone, Debug, Default)]
 pub struct Total {
     plain: Option<Num>,
+    /// An `Int64` was added: the answer is then never narrower than an `Int64`.
+    long_seen: bool,
+    /// A double was added: the answer is a double.
+    double_seen: bool,
     seen: Seen,
 }
 
@@ -2587,29 +2591,40 @@ impl Total {
             return;
         };
         self.seen.add(value);
-        // The running total widens as `$add` does, `Int32` to `Int64` to a double;
-        // the width of the answer is decided once, at the end (see `to_bson`),
-        // from the exact total, so the order of the values cannot change it.
+        self.long_seen |= matches!(n, Num::Int64(_));
+        self.double_seen |= matches!(n, Num::Dbl(_));
+        // The running total is read only once a double was added; integers are typed
+        // at the end from `seen`'s exact total (see `to_bson`).
         self.plain = Some(match self.plain {
             Some(acc) => acc.add(n),
             None => n,
         });
     }
 
-    /// The sum, as the reference types it (ADR-268): an `Int32` while the exact
-    /// integer total fits one, an `Int64` past that, a double past `i64` or as
-    /// soon as a double was added, a `Decimal128` once one was. The width of the
-    /// inputs does not matter, only the size of the total: the sum of two `Int64`
-    /// 1 and 2 is the `Int32` 3, as the reference answers it. A group with
-    /// nothing to add is the `Int32` 0.
+    /// The sum, as the reference types it (ADR-268): an `Int32` while every integer
+    /// added was an `Int32` and the exact total fits one; an `Int64` once an `Int64`
+    /// was added or the total left `Int32`; a double past `i64` or as soon as a double
+    /// was added; a `Decimal128` once one was. So the sum of two `Int32`s `1` and `2`
+    /// is the `Int32` 3, and the sum of the `Int64`s `1` and `2` is the `Int64` 3
+    /// (`AccumulatorSum` returns a long whenever a long was summed). A group with
+    /// nothing to add is the `Int32` 0. The window sum is typed differently, on
+    /// purpose: see `window_acc`.
     pub fn to_bson(&self) -> Bson {
-        match &self.seen.exact {
-            Some(sum) => Bson::Decimal128(pack_raw(sum.finish_sum())),
-            None => match self.plain {
-                Some(Num::Int64(n)) => Num::narrowest(n).to_bson(),
-                Some(other) => other.to_bson(),
-                None => Bson::Int32(0),
-            },
+        if let Some(sum) = &self.seen.exact {
+            return Bson::Decimal128(pack_raw(sum.finish_sum()));
+        }
+        if self.double_seen {
+            return self.plain.map_or(Bson::Int32(0), Num::to_bson);
+        }
+        // Integers only: typed by the exact total, so the order of the values cannot
+        // change the answer (`[LMAX, 1, -1]` is the long LMAX in either order).
+        if self.seen.integer_count == 0 {
+            return Bson::Int32(0);
+        }
+        match i64::try_from(self.seen.integers) {
+            Ok(t) if !self.long_seen => integer_bson(t),
+            Ok(t) => Bson::Int64(t),
+            Err(_) => Bson::Double(self.seen.integers as f64),
         }
     }
 }
@@ -2745,10 +2760,37 @@ fn fold_numeric(op: Op, args: &[Bson], f: fn(Num, Num) -> Num) -> Result<Bson> {
             }
         }));
     }
-    let mut it = operands.into_iter().map(|o| match o {
+    let it = operands.into_iter().map(|o| match o {
         Operand::Plain(n) => n,
         Operand::Decimal(_) => unreachable!("no decimal operand"),
     });
+    let nums: Vec<Num> = it.collect();
+    // A chain of integers is typed by its final value, not widened at the step that
+    // leaves a width (ADR-268; the reference keeps a long total and types the answer at
+    // the end). `[2147483647, 1, -1]` is the `Int32` 2147483647 in any order, and
+    // `[LMAX, 1, -1]` the `Int64` LMAX. An `$add` is summed exactly (in an `i128`): an
+    // `Int32` while every operand was one and the total fits, an `Int64` while it fits
+    // one, a double past that. A `$multiply` of `Int32`s keeps its product in an `i64`
+    // and is a double past it; one with an `Int64` operand is the step-by-step fold.
+    if op == Op::Add && nums.iter().all(|n| n.integer().is_some()) {
+        let total: i128 = nums.iter().map(|n| i128::from(n.integer().expect("integer"))).sum();
+        let all_int32 = nums.iter().all(|n| matches!(n, Num::Int32(_)));
+        return Ok(match i64::try_from(total) {
+            Ok(t) if all_int32 => integer_bson(t),
+            Ok(t) => Bson::Int64(t),
+            Err(_) => Bson::Double(total as f64),
+        });
+    }
+    if op == Op::Multiply && nums.iter().all(|n| matches!(n, Num::Int32(_))) {
+        let mut total = nums[0].integer();
+        for n in &nums[1..] {
+            total = total.and_then(|t| t.checked_mul(n.integer().expect("an integer")));
+        }
+        if let Some(total) = total {
+            return Ok(integer_bson(total));
+        }
+    }
+    let mut it = nums.into_iter();
     let first = it.next().expect("arity checked at parse");
     Ok(it.fold(first, f).to_bson())
 }
@@ -2864,7 +2906,19 @@ fn modulo(a: &Bson, b: &Bson) -> Result<Bson> {
     };
     // `x % -1` is 0 for every `x`, the smallest integer included (where the
     // machine's remainder would trap), as the reference answers it.
-    match (*x, *y) {
+    // An integer dividend by a whole-number double is an integer remainder, in the
+    // dividend's width (`7 % 2.0` is the int 1, a long `7 % 2.0` the long 1); a double
+    // dividend, or a divisor with a fraction, is `fmod` (ADR-268).
+    let y = match (*x, *y) {
+        (Num::Int32(_), Num::Dbl(d)) if d.fract() == 0.0 && d.abs() < 9.2e18 => {
+            i32::try_from(d as i64).map_or(Num::Int64(d as i64), Num::Int32)
+        }
+        (Num::Int64(_), Num::Dbl(d)) if d.fract() == 0.0 && d.abs() < 9.2e18 => {
+            Num::Int64(d as i64)
+        }
+        (_, y) => y,
+    };
+    match (*x, y) {
         (_, Num::Int32(0) | Num::Int64(0)) => Err(Error::InvalidQuery("$mod by zero".into())),
         (Num::Int32(x), Num::Int32(y)) => Ok(Bson::Int32(x.wrapping_rem(y))),
         (x, y) => match (x.integer(), y.integer()) {
@@ -3232,6 +3286,15 @@ fn range(args: &[Bson]) -> Result<Bson> {
             Some(n) => nums.push(n),
         }
     }
+    // The reference takes 32-bit bounds and a 32-bit step, and refuses a long past them
+    // (`34445`, `34447`, `34449`); its elements are all `Int32` (ADR-268).
+    for (n, what) in nums.iter().zip(["a starting", "an ending", "a step"]) {
+        if i32::try_from(*n).is_err() {
+            return Err(Error::InvalidQuery(format!(
+                "$range requires {what} value that can be represented as a 32-bit integer, found {n}"
+            )));
+        }
+    }
     let (start, end) = (nums[0], nums[1]);
     let step = nums.get(2).copied().unwrap_or(1);
     if step == 0 {
@@ -3247,7 +3310,7 @@ fn range(args: &[Bson]) -> Result<Bson> {
             "$range would produce {count} elements, over the limit of {MAX_RANGE_LENGTH}"
         )));
     }
-    Ok(Bson::Array((0..count as i64).map(|i| integer_bson(start + i * step)).collect()))
+    Ok(Bson::Array((0..count as i64).map(|i| Bson::Int32((start + i * step) as i32)).collect()))
 }
 
 // ---------------------------------------------------------------------------
