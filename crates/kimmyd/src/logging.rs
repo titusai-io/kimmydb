@@ -959,7 +959,7 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_gauge,
-            "kimmy.aggregate.memory_pool_used",
+            "kimmy.aggregate.memory_pool_used_bytes",
             "By",
             "The BSON bytes of the pool of aggregation memory reserved by running aggregations now.",
             aggregate_pool_used_bytes
