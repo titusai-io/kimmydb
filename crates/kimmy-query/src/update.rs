@@ -1758,6 +1758,24 @@ mod tests {
     }
 
     #[test]
+    fn push_sort_by_a_field_through_an_array_takes_the_smallest_ascending_and_the_largest_descending()
+     {
+        let a = doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": 3 }, doc! { "s": [1, 2] }] };
+        // Ascending by 0, 1, 3; descending by 5, 3, 2.
+        let asc =
+            applied(doc! { "$push": { "a": { "$each": [], "$sort": { "s": 1 } } } }, a.clone());
+        assert_eq!(
+            asc,
+            doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": [1, 2] }, doc! { "s": 3 }] }
+        );
+        let desc = applied(doc! { "$push": { "a": { "$each": [], "$sort": { "s": -1 } } } }, a);
+        assert_eq!(
+            desc,
+            doc! { "a": [doc! { "s": [0, 5] }, doc! { "s": 3 }, doc! { "s": [1, 2] }] }
+        );
+    }
+
+    #[test]
     fn push_sort_orders_scalars_and_subdocuments() {
         assert_eq!(
             applied(doc! { "$push": { "a": { "$each": [2], "$sort": 1 } } }, doc! { "a": [3, 1] }),

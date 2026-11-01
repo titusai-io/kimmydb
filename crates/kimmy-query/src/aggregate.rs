@@ -60,9 +60,13 @@ use crate::stages;
 /// Deliberately a hard ceiling rather than a spill-to-disk: a pipeline that
 /// cannot run should say so immediately, not become slow in a way that is
 /// harder to diagnose than a refusal.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Limits {
     pub max_documents: usize,
+    /// The bytes the blocking stages of the request hold, one total for the whole
+    /// pipeline and its `$facet` branches (ADR-264). A fresh `Limits::default()` is a
+    /// fresh budget, so make one per request.
+    pub buffer: crate::budget::BufferBudget,
 }
 
 /// The default ceiling: ten times `find`'s page cap.
@@ -73,7 +77,10 @@ pub const DEFAULT_MAX_DOCUMENTS: usize = 100_000;
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_documents: DEFAULT_MAX_DOCUMENTS }
+        Self {
+            max_documents: DEFAULT_MAX_DOCUMENTS,
+            buffer: crate::budget::BufferBudget::default(),
+        }
     }
 }
 
@@ -165,6 +172,12 @@ pub enum Stage {
     /// `$out`: the pipeline's output inserted into a collection that is new or empty
     /// (ADR-255). Only ever last. Executed by the caller.
     Out(Target),
+    /// `$setWindowFields` (ADR-264): per-document windows over sorted partitions.
+    SetWindowFields(Box<crate::window::WindowSpec>),
+    /// `$densify` (ADR-264): generated documents that close the gaps in a numeric or date field.
+    Densify(Box<crate::densify::DensifySpec>),
+    /// `$fill` (ADR-264): null and missing values filled from a value or its neighbours.
+    Fill(Box<crate::fill::FillSpec>),
     /// `$sortByCount`: `$group` on the expression, counting, then `$sort` by the count,
     /// largest first (ADR-263).
     SortByCount(Expr),
@@ -395,6 +408,9 @@ impl Stage {
             Stage::GraphLookup(_) => "$graphLookup",
             Stage::Merge(_) => "$merge",
             Stage::Out(_) => "$out",
+            Stage::SetWindowFields(_) => "$setWindowFields",
+            Stage::Densify(_) => "$densify",
+            Stage::Fill(_) => "$fill",
             Stage::SortByCount(_) => "$sortByCount",
             Stage::Sample(_) => "$sample",
             Stage::Redact(_) => "$redact",
@@ -594,6 +610,12 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         "$unionWith" => parse_union_with(value, vars, at),
         "$bucket" => parse_bucket(as_document(name, value)?, vars),
         "$bucketAuto" => parse_bucket_auto(as_document(name, value)?, vars),
+        "$setWindowFields" => crate::window::parse(as_document(name, value)?, vars)
+            .map(|spec| Stage::SetWindowFields(Box::new(spec))),
+        "$densify" => crate::densify::parse(as_document(name, value)?)
+            .map(|spec| Stage::Densify(Box::new(spec))),
+        "$fill" => crate::fill::parse(as_document(name, value)?, vars)
+            .map(|spec| Stage::Fill(Box::new(spec))),
         "$vectorSearch" => {
             // The stage is the pipeline's source, in place of the collection
             // scan, so it can only be the first stage of the top-level
@@ -657,7 +679,7 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
             "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
              $replaceRoot, $replaceWith, $unset, $sort, $sortByCount, $limit, $skip, $sample, \
              $redact, $unwind, $group, $count, $lookup, $unionWith, $facet, $bucket, \
-             $bucketAuto, $graphLookup, $vectorSearch, $merge, $out"
+             $bucketAuto, $graphLookup, $setWindowFields, $densify, $fill, $vectorSearch, $merge, $out"
         ))),
     }
 }
@@ -880,6 +902,9 @@ pub fn run_facet<E: From<Error>>(
     limits: &Limits,
     mut run: impl FnMut(&[Stage], Vec<Document>) -> std::result::Result<Vec<Document>, E>,
 ) -> std::result::Result<Document, E> {
+    // The branches' outputs are alive together, so the bytes the blocking stages inside
+    // them charged stay charged until the whole `$facet` is done (ADR-264).
+    let _hold = limits.buffer.hold();
     let mut answer = Document::new();
     let mut held = 0usize;
     // The bytes the answer will encode to, kept as it grows: a document header and
@@ -1379,7 +1404,7 @@ fn parse_group(spec: &Document, vars: &[String]) -> Result<Stage> {
 /// The `{<name>: {<accumulator>: <expression>}}` fields of `$group`, `$bucket`
 /// and `$bucketAuto`. `skip_id` leaves out the `_id` key, which `$group` reads
 /// itself.
-fn parse_accumulators(
+pub(crate) fn parse_accumulators(
     stage: &str,
     spec: &Document,
     vars: &[String],
@@ -1979,6 +2004,9 @@ pub fn apply_with_vars(
         Stage::BucketAuto { group_by, buckets, fields } => {
             bucket_auto(input, group_by, *buckets, fields, limits, vars)?
         }
+        Stage::SetWindowFields(spec) => crate::window::apply(spec, input, limits, vars)?,
+        Stage::Densify(spec) => crate::densify::apply(spec, input, limits)?,
+        Stage::Fill(spec) => crate::fill::apply(spec, input, limits, vars)?,
         Stage::VectorSearch(_) => {
             return Err(Error::Unsupported(
                 "$vectorSearch is the pipeline's source and must be run by the executor that \
@@ -2398,7 +2426,7 @@ struct Bucket {
     values: Vec<AccState>,
 }
 
-enum AccState {
+pub(crate) enum AccState {
     /// Exact while every input is integral — see [`Total`]. The previous
     /// `(f64, bool)` accumulated in a double and cast back, so a total above
     /// 2^53 was silently wrong despite the flag saying it was an integer.
@@ -2600,7 +2628,7 @@ fn bucket_auto(
     Ok(out)
 }
 
-fn init(field: &(String, Accumulator)) -> AccState {
+pub(crate) fn init(field: &(String, Accumulator)) -> AccState {
     init_within(field, crate::expr::MAX_ARRAY_BYTES)
 }
 
@@ -2629,7 +2657,7 @@ fn init_within((_, acc): &(String, Accumulator), max: usize) -> AccState {
 }
 
 /// Feed one document to one accumulator.
-fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
+pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     match (state, acc) {
         (AccState::Ext(state), Accumulator::Ext(spec)) => state.accumulate(spec, scope)?,
         (AccState::Sum(total), Accumulator::Sum(e)) => {
@@ -2662,22 +2690,25 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
             Err(err) if !err.is_deferrable() => return Err(err),
             value => *current = Some(value),
         },
+        // A missing value is skipped, as the reference skips it; an explicit `null` is
+        // a value (ADR-264). A value is counted before it is kept: the group refuses at
+        // the value that takes its array over the limit.
         (AccState::Push(items, budget), Accumulator::Push(e)) => {
-            let v = e.eval_in(scope)?;
-            // Counted before it is kept: the group refuses at the value that takes
-            // its array over the limit.
-            budget.add(&v)?;
-            items.push(v);
+            if let Some(v) = e.eval_present(scope)? {
+                budget.add(&v)?;
+                items.push(v);
+            }
         }
         (AccState::AddToSet(items, keys, budget), Accumulator::AddToSet(e)) => {
-            let v = e.eval_in(scope)?;
-            // A member is identified the way `$group` identifies a bucket, and
-            // the first occurrence stays (ADR-186).
-            let key = group_key(&v);
-            if !keys.contains(&key) {
-                budget.add(&v)?;
-                keys.insert(key);
-                items.push(v);
+            if let Some(v) = e.eval_present(scope)? {
+                // A member is identified the way `$group` identifies a bucket, and
+                // the first occurrence stays (ADR-186).
+                let key = group_key(&v);
+                if !keys.contains(&key) {
+                    budget.add(&v)?;
+                    keys.insert(key);
+                    items.push(v);
+                }
             }
         }
         (AccState::MergeObjects(merged, budget), Accumulator::MergeObjects(e)) => {
@@ -2689,7 +2720,7 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
     Ok(())
 }
 
-fn finish(state: AccState) -> Result<Bson> {
+pub(crate) fn finish(state: AccState) -> Result<Bson> {
     Ok(match state {
         // An integer sum stays an integer, exactly rather than approximately:
         // `Total` accumulates in i64 and only widens when an operand is a
@@ -3078,6 +3109,31 @@ mod tests {
         )
         .unwrap();
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn push_and_add_to_set_skip_a_missing_value_and_keep_an_explicit_null() {
+        let input = docs(vec![
+            doc! { "a": 1 },
+            doc! {},
+            doc! { "a": Bson::Null },
+            doc! { "a": 1 },
+            doc! { "x": { "y": 2 } },
+        ]);
+        let out = run(
+            vec![doc! {"$group": {"_id": null,
+            "p": {"$push": "$a"}, "s": {"$addToSet": "$a"},
+            "n": {"$push": "$x.y"}, "r": {"$push": "$$REMOVE"}}}],
+            input,
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].get_array("p").unwrap(),
+            &vec![Bson::Int32(1), Bson::Null, Bson::Int32(1)]
+        );
+        assert_eq!(out[0].get_array("s").unwrap(), &vec![Bson::Int32(1), Bson::Null]);
+        assert_eq!(out[0].get_array("n").unwrap(), &vec![Bson::Int32(2)]);
+        assert!(out[0].get_array("r").unwrap().is_empty());
     }
 
     #[test]
@@ -3689,7 +3745,7 @@ mod tests {
         // Truncating would return a `$group` over part of the input that looks
         // exactly like one over all of it — undetectable by the caller.
         let input: Vec<Document> = (0..50).map(|i| doc! { "k": i }).collect();
-        let limits = Limits { max_documents: 10 };
+        let limits = Limits { max_documents: 10, ..Default::default() };
         let stages = parse(&[doc! {"$group": {"_id": "$k", "n": {"$sum": 1}}}]).unwrap();
 
         let err = apply(&stages[0], input, &limits).unwrap_err().to_string();
@@ -3702,7 +3758,7 @@ mod tests {
         // Worded and answered as before, but its own kind, so an `$and`,
         // `$or` or `$last` cannot hold it back (ADR-211).
         let input: Vec<Document> = (0..3).map(|i| doc! { "k": i }).collect();
-        let limits = Limits { max_documents: 2 };
+        let limits = Limits { max_documents: 2, ..Default::default() };
         let stages = parse(&[doc! {"$group": {"_id": "$k"}}]).unwrap();
         let err = apply(&stages[0], input, &limits).unwrap_err();
         assert!(matches!(err, Error::Limit(_)), "{err:?}");
@@ -3720,7 +3776,7 @@ mod tests {
         // outer loop ends; checking only at the end would allocate all of it.
         let input: Vec<Document> =
             (0..5).map(|_| doc! { "xs": (0..100).collect::<Vec<i32>>() }).collect();
-        let limits = Limits { max_documents: 50 };
+        let limits = Limits { max_documents: 50, ..Default::default() };
         let stages = parse(&[doc! {"$unwind": "$xs"}]).unwrap();
 
         let err = apply(&stages[0], input, &limits).unwrap_err().to_string();

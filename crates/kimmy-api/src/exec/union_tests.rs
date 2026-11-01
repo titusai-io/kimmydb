@@ -163,7 +163,7 @@ fn it_runs_inside_a_facet_and_a_lookup_sub_pipeline() {
 fn the_other_collection_is_held_to_the_pipeline_limit_as_it_is_read() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir);
-    let limits = |max_documents| aggregate::Limits { max_documents };
+    let limits = |max_documents| aggregate::Limits { max_documents, ..Default::default() };
     let pipeline = json!([{"$match": {"_id": 1}}, {"$unionWith": "archive"}]);
     // Three foreign documents fit a limit of three; four is one over.
     let ok = agg_limits(&state, &root(), "app", "orders", &pipeline, limits(4)).unwrap();
@@ -202,7 +202,7 @@ fn a_sub_pipeline_that_grows_its_input_is_held_to_the_limit_too() {
         "app",
         "orders",
         &pipeline,
-        aggregate::Limits { max_documents: 5 },
+        aggregate::Limits { max_documents: 5, ..Default::default() },
     )
     .expect_err("six unwound documents");
     assert!(format!("{err:?}").contains("$unwind produced 6"), "{err:?}");

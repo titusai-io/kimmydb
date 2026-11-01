@@ -17,6 +17,26 @@ Status meanings:
 
 ---
 
+## 🟡 `$setWindowFields`, `$densify` and `$fill`: Decimal128 read as doubles, a date `unit` that defaults, a sliding deviation that is NaN, and a few edges
+
+**Raised 2026-10-31, with ADR-264; revised after review.** `$setWindowFields`, `$densify` and `$fill` are built ([aggregation.md](aggregation.md#setwindowfields)). The order of the partitions, `"current"` in a range window, `$expMovingAvg`, `$locf` without a sort, a missing or null `$densify` field, the `$densify` grid and the months' drift, the covariance operators and the documents a window refuses all follow the reference. Where they differ:
+
+- **`Decimal128`.** `$derivative`, `$integral`, `$expMovingAvg`, the standard deviations and the covariances read a `Decimal128` as a double and answer a double, where the reference answers a `Decimal128` for a decimal input. `$densify` refuses a `Decimal128` field or step; the reference densifies it. A `range` window compares sort values and bounds as doubles, so a long beyond 2^53 is compared by its nearest double (the reference compares exactly). `$sum`, `$avg` and the interpolation of `$linearFill` and `$fill` `linear` are exact in decimal, as the reference's are.
+- **A date `unit` that is left out.** `$derivative` and `$integral` over a date `sortBy` with no `unit` are milliseconds here; the reference refuses them (error 5624901, 5423902). A date as the **input** of `$derivative` is refused here (`400`); the reference answers the difference in milliseconds.
+- **A sliding deviation with a NaN or an infinity in the window** answers NaN while it is in the window (null for one value of a sample) and the deviation of the rest after it has left. That is what `$group` answers over the same documents. The reference answers null while it is in the window and then a wrong constant (1.89 for every later row) until the end of the partition.
+- **Last digits.** A sliding `$stdDevPop`, `$stdDevSamp`, `$covariancePop` or `$covarianceSamp` is a running sum about the first value of the window that is rebuilt from the window every so many steps (at every step for a window of 16 or fewer), so a window of equal values is exactly `0` where the reference leaves `7e-9`, and a covariance is within a few units of the last digit of the reference's. A sliding `$sum` and `$avg` of doubles is the exact sum rounded once (the reference rounds a few sums wrongly: `0.7 + 0.1 + 3.3` is `4.0` there and `4.1` here). `$integral` is the exact sum of the trapezoids. The sum of the doubles of a window is the **exact** sum rounded once, with an infinity where it rounds past the largest double; a `$group` adds them one at a time, so over `[1.7e308, 1.7e308, -1.7e308]` it is infinite where a window's `$sum` is `1.7e308`.
+- **Integer sums are `Int64`.** `$sum` of integers in a window is a long here, as in `$group`; the reference answers an int that fits.
+- **`$addToSet` answers in the order its members first appear in the window.** The reference answers in sorted order once the window has dropped a document (and in the order of appearance before that); the order is unspecified in both.
+- **`$densify` after a `"full"` range** ends each partition's grid in ascending order of the partition values; the reference ends in a hash order. The generated count is held to the pipeline's 100,000 documents in all, with the input, where the reference holds the generated documents to 500,000; the bytes are held to the request's 256 MiB budget (`413`), where the reference has its own memory limit.
+- **The byte budget.** `$setWindowFields`, `$densify` and a `$fill` method hold what they buffer to one budget of 256 MiB for the whole request, shared by the stages of the pipeline and the branches of a `$facet` (a `$facet` keeps its stages' bytes charged until it is done), refused `413` as the total passes it. The reference spills to disk.
+- **Strictness.** A `documents` bound, a `$shift` `by` and a `range` bound with a `unit` must be whole numbers that fit 32 bits, as in the reference; a `range` bound of a date `unit` is refused for a fraction.
+
+- **`$fill` with `value` reading a field path that reaches nothing leaves the field out**, as an `$addFields` of a missing field does (the rule of ADR-263 for every stage value); it was `null` before. Unprobed against the reference for `$fill` itself: the delta checks it.
+
+**To close:** a `Decimal128` path through the deviations and the derivative family, and exact comparison of longs beyond 2^53 in a range window. Neither is planned.
+
+---
+
 ## 🟡 The string, document and type operators: integer results are `Int64`, a few edge cases are read narrowly, and a missing value is told apart only where the reference makes it matter
 
 **Raised 2026-10-31, with ADR-260.** `$trim`, `$ltrim`, `$rtrim`, `$indexOfCP`, `$indexOfBytes`, `$regexMatch`, `$regexFind`, `$regexFindAll`, `$replaceOne`, `$replaceAll`, `$strcasecmp`, `$strLenBytes`, `$substrBytes`, `$mergeObjects` (expression and accumulator), `$getField`, `$setField`, `$unsetField`, `$type` and `$isNumber` follow the reference; these are the differences.
@@ -370,15 +390,15 @@ systems use.
 
 ---
 
-## 🟡 `$sortArray` reads a sort-document path through an array by its smallest element, and `$zip` refuses an empty `inputs` and a result over a million values
+## 🟡 `$zip` refuses an empty `inputs` and a result over a million values
 
-**Raised 2026-10-28, with ADR-255.** `$sortArray` with a sort document orders by the `$sort` stage's own rule, so a key path that passes through an array in an element gives that element the **smallest** value the path reaches, in either direction. MongoDB takes the largest for a descending key. An element that is not a document, or lacks the key, sorts as null, lowest. `{$zip: {inputs: []}}` is a `400` here; MongoDB answers `[]`. A `$zip` whose result would hold more than 1,000,000 values (rows times inputs) is a `400` naming the limit, counted before anything is built.
+**Raised 2026-10-28, with ADR-255.** `{$zip: {inputs: []}}` is a `400` here; the reference answers `[]`. A `$zip` whose result would hold more than 1,000,000 values (rows times inputs) is a `400` naming the limit, counted before anything is built. (This entry also held `$sortArray`'s and `$sort`'s reading of a descending key through an array by its smallest element; that now takes the largest, as the reference does, since ADR-264.)
 
-**Why.** One order for every sort keeps a port's `$sort` and `$sortArray` agreeing with each other, and the `$sort` difference is already recorded. An empty `inputs` is nearly always a typo for a computed list, which `inputs` does not accept. The limit stops an expression from multiplying the size of the arrays it reads.
+**Why.** An empty `inputs` is nearly always a typo for a computed list, which `inputs` does not accept. The limit stops an expression from multiplying the size of the arrays it reads.
 
-**What it costs.** A port that sorts descending by a path through an array, or zips no arrays, or zips past the limit, gets a different answer or a `400`.
+**What it costs.** A port that zips no arrays, or zips past the limit, gets a `400`.
 
-**What closes it.** Taking the largest for a descending key, in `$sort` and `$sortArray` together. Not planned.
+**What closes it.** Answering `[]` for an empty `inputs`. Not planned.
 
 ---
 

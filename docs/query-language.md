@@ -1214,22 +1214,22 @@ renders every JSON number as a float produces. `1.5`, `2`, `true` and the
 string `"1"` are all refused. A missing field sorts as `null`, putting absent
 values at one end rather than in arbitrary positions.
 
-**Sorting by an array uses its elements, and the element it uses is the
-smallest — in both directions.** A sort key names a field rather than
-computing one, so a path that reaches several values is reduced to a single
-key before anything is compared, and that key is the least of them in
-[canonical order](#3-comparisons-do-not-cross-type-groups). The two ways of
-reaching several values behave alike: `{"tags": 1}` over `tags: ["c", "a"]`
-sorts by `"a"`, and `{"items.qty": 1}` over `items: [{qty: 9}, {qty: 1}]`
-sorts by `1`. **`-1` reverses the comparison, not the choice of element** — a
-descending sort still reduces each document to its smallest element and puts
-the largest of those first, so `[2, 3]` comes before `[1, 100]` and the `100`
-never enters it. An empty array has no element to use and is compared as the
-array itself, at the rank arrays hold in the [type
-ordering](key-encoding.md#type-ordering) — not at either end of it. One
-comparison serves `find`, `find_and_modify` and the pipeline's
-[`$sort`](aggregation.md#stages), so the three order a collection identically.
-It is not the rule `$lookup` follows for a join key, which reads the *first*
+**Sorting by an array uses its elements: the smallest ascending, the largest
+descending.** A sort key names a field rather than computing one, so a path
+that reaches several values is reduced to a single key before anything is
+compared. Ascending, that key is the least of them in [canonical
+order](#3-comparisons-do-not-cross-type-groups); descending, it is the
+greatest. The two ways of reaching several values behave alike: `{"tags": 1}`
+over `tags: ["c", "a"]` sorts by `"a"`, `{"tags": -1}` by `"c"`, and
+`{"items.qty": -1}` over `items: [{qty: 9}, {qty: 1}]` sorts by `9`. So
+`[0, 5]` sorts before `3` both ways (by its `0` ascending, by its `5`
+descending), and `[1, 100]` comes before `[2, 3]` descending. An empty array
+has no element to use and is compared as the array itself, at the rank arrays
+hold in the [type ordering](key-encoding.md#type-ordering) — not at either end
+of it. One comparison serves `find`, `find_and_modify`, `$sortArray` and the
+pipeline's [`$sort`](aggregation.md#stages), so they order a collection
+identically. ([ADR-264](decisions.md#adr-264--setwindowfields-densify-and-fill)
+changed the descending rule from the smallest element.) It is not the rule `$lookup` follows for a join key, which reads the *first*
 element of a path that crosses an array rather than the least
 ([Aggregation](aggregation.md#lookup)).
 

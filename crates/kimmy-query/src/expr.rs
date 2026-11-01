@@ -74,6 +74,7 @@ mod sizes;
 mod strings;
 mod tz;
 
+pub(crate) use dates::{add_to_date, is_date_unit, unit_millis};
 pub(crate) use sizes::{
     ArrayBudget, DocBudget, HeldArray, MAX_ARRAY_BYTES, MAX_STRING_BYTES, array_bytes, bson_bytes,
     check_array_bytes, check_array_within, check_document_bytes, check_string_len_within,
@@ -1783,6 +1784,17 @@ impl Expr {
             // An absent field read by `$getField` is left out, not written null.
             Expr::Doc(d) => d.eval_opt(scope),
             other => other.eval_in(scope).map(Some),
+        }
+    }
+
+    /// The value of the expression, or `None` when there is none: a field path that is
+    /// not in the document, `$$REMOVE`, or a `$cond`, `$switch` or `$let` that chooses one.
+    /// An explicit `null` is a value. This is how `$push`, `$addToSet`, `$first`, `$last`
+    /// and `$shift` tell a missing field from a null one.
+    pub fn eval_present(&self, scope: &Scope<'_>) -> Result<Option<Bson>> {
+        match self {
+            Expr::Field(p) => Ok(field_path(scope.root, p)),
+            other => other.eval_field(scope),
         }
     }
 
