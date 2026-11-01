@@ -2381,3 +2381,129 @@ fn the_stages_of_one_pipeline_and_the_branches_of_a_facet_share_one_budget() {
     assert_eq!(aggregate::apply(&facet[0], input, &limits).unwrap().len(), 1);
     assert_eq!(limits.buffer.used(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Pins for the states that the incremental check above cannot see
+// ---------------------------------------------------------------------------
+
+#[test]
+fn last_n_and_first_n_answer_the_edges_of_the_window() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "last2": {"$lastN": {"n": 2, "input": "$qty"}, "window": {"documents": ["unbounded", "current"]}},
+            "first2": {"$firstN": {"n": 2, "input": "$qty"}, "window": {"documents": [-2, 0]}},
+        }}),
+        series(&[10, 40, 20, 30]),
+    )
+    .unwrap();
+    let ints = |v: &[i32]| Bson::Array(v.iter().map(|x| Bson::Int32(*x)).collect());
+    assert_eq!(
+        col(&out, "last2"),
+        vec![ints(&[10]), ints(&[10, 40]), ints(&[40, 20]), ints(&[20, 30])]
+    );
+    assert_eq!(
+        col(&out, "first2"),
+        vec![ints(&[10]), ints(&[10, 40]), ints(&[10, 40]), ints(&[40, 20])]
+    );
+}
+
+#[test]
+fn two_adjacent_missing_sort_values_tie_for_a_rank() {
+    let out = run(
+        set(doc! {"sortBy": {"s": 1}, "output": {"rank": {"$rank": {}}, "dense": {"$denseRank": {}}}}),
+        vec![doc! {"_id": 1}, doc! {"_id": 2}, doc! {"_id": 3, "s": 5}],
+    )
+    .unwrap();
+    assert_eq!(col(&out, "rank"), ints(&[1, 1, 3]));
+    assert_eq!(col(&out, "dense"), ints(&[1, 1, 2]));
+}
+
+#[test]
+fn a_double_sum_rounds_half_to_even_and_keeps_a_bit_below_the_half() {
+    // 10^16 is a multiple of 2 in doubles. 10^16 + 1 is exactly half way between it and the
+    // next double, and goes to the even one; with a tiny positive term more it is above half
+    // way and goes up; with a tiny negative term it is below half way and stays.
+    let sum = |values: Vec<Bson>| {
+        let input: Vec<Document> =
+            values.into_iter().enumerate().map(|(i, v)| doc! {"_id": i as i32, "v": v}).collect();
+        let out = run(set(doc! {"output": {"s": {"$sum": "$v"}}}), input).unwrap();
+        out[0].get("s").cloned().unwrap()
+    };
+    let d = Bson::Double;
+    assert_eq!(sum(vec![d(1e16), d(1.0)]), d(1e16));
+    assert_eq!(sum(vec![d(1e16), d(1.0), d(1e-30)]), d(1e16 + 2.0));
+    assert_eq!(sum(vec![d(1e16), d(1.0), d(-1e-30)]), d(1e16));
+    assert_eq!(sum(vec![d(-1e16), d(-1.0), d(-1e-30)]), d(-1e16 - 2.0));
+}
+
+#[test]
+fn a_sum_of_integers_past_two_to_the_53_and_a_double_is_exact() {
+    let input = vec![doc! {"_id": 1, "v": (1_i64 << 53) + 1}, doc! {"_id": 2, "v": 0.5}];
+    let out = run(set(doc! {"output": {"s": {"$sum": "$v"}}}), input).unwrap();
+    // 2^53 + 1.5 is nearer 2^53 + 2 than 2^53.
+    assert_eq!(col(&out, "s")[0], Bson::Double(9007199254740994.0));
+}
+
+#[test]
+fn a_deviation_and_a_covariance_over_a_window_that_slides_without_a_rebuild_are_exact() {
+    // A window of 20 over 30 documents: ten removals, too few for a rebuild.
+    let n = 30usize;
+    let xs: Vec<f64> = (0..n).map(|i| ((i * 37) % 11) as f64 * 0.5 + (i as f64) * 0.1).collect();
+    let ys: Vec<f64> = (0..n).map(|i| ((i * 53) % 13) as f64 * 0.25 - (i as f64) * 0.2).collect();
+    let input: Vec<Document> =
+        (0..n).map(|i| doc! {"_id": i as i32, "x": xs[i], "y": ys[i]}).collect();
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "sd": {"$stdDevPop": "$x", "window": {"documents": [-19, 0]}},
+            "ss": {"$stdDevSamp": "$x", "window": {"documents": [-19, 0]}},
+            "cp": {"$covariancePop": ["$x", "$y"], "window": {"documents": [-19, 0]}},
+            "cs": {"$covarianceSamp": ["$x", "$y"], "window": {"documents": [-19, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    for i in 0..n {
+        let s = i.saturating_sub(19);
+        let (wx, wy) = (&xs[s..=i], &ys[s..=i]);
+        let k = wx.len() as f64;
+        let (mx, my) = (wx.iter().sum::<f64>() / k, wy.iter().sum::<f64>() / k);
+        let vx: f64 = wx.iter().map(|x| (x - mx) * (x - mx)).sum();
+        let c: f64 = wx.iter().zip(wy).map(|(x, y)| (x - mx) * (y - my)).sum();
+        let get = |name: &str| match out[i].get(name) {
+            Some(Bson::Double(v)) => Some(*v),
+            _ => None,
+        };
+        if wx.len() > 1 {
+            assert!((get("sd").unwrap() - (vx / k).sqrt()).abs() < 1e-9, "sd at {i}");
+            assert!((get("ss").unwrap() - (vx / (k - 1.0)).sqrt()).abs() < 1e-9, "ss at {i}");
+            assert!((get("cs").unwrap() - c / (k - 1.0)).abs() < 1e-9, "cs at {i}");
+        }
+        assert!((get("cp").unwrap() - c / k).abs() < 1e-9, "cp at {i}");
+    }
+}
+
+#[test]
+fn a_deviation_is_rebuilt_from_a_window_that_has_moved_far_from_where_it_started() {
+    // A hundred values near 10^12 and then values near 1, in a window of 20: the running
+    // sums about the first value would carry 10^12 for good and lose the spread; a rebuild
+    // starts again about a value in the window.
+    let n = 300usize;
+    let values: Vec<f64> = (0..n)
+        .map(|i| if i < 100 { 1e12 + (i % 7) as f64 } else { 1.0 + ((i * 13) % 9) as f64 * 0.1 })
+        .collect();
+    let input: Vec<Document> =
+        values.iter().enumerate().map(|(i, v)| doc! {"_id": i as i32, "v": *v}).collect();
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+        "sd": {"$stdDevPop": "$v", "window": {"documents": [-19, 0]}}}}),
+        input,
+    )
+    .unwrap();
+    for i in [250usize, 299] {
+        let w = &values[i - 19..=i];
+        let m = w.iter().sum::<f64>() / 20.0;
+        let sd = (w.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / 20.0).sqrt();
+        let Bson::Double(got) = out[i].get("sd").cloned().unwrap() else { panic!() };
+        assert!((got - sd).abs() < 1e-9, "row {i}: {got} vs {sd}");
+    }
+}

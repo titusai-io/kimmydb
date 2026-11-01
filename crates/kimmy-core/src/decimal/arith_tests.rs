@@ -1027,3 +1027,16 @@ fn a_running_sum_forgets_a_far_off_term_that_has_left() {
     running.remove(&d("1.5"));
     assert_eq!(running.count(), 0);
 }
+
+#[test]
+fn a_running_sum_of_negative_zeros_is_negative_zero_until_a_positive_term_is_in() {
+    let mut running = arith::RunningSum::new();
+    let negative = fin(true, 0, 0);
+    running.add(&negative);
+    running.add(&negative);
+    assert_eq!(show(&running.finish_sum()), "-0E0");
+    running.add(&fin(false, 0, 0));
+    assert_eq!(show(&running.finish_sum()), "0E0");
+    running.remove(&fin(false, 0, 0));
+    assert_eq!(show(&running.finish_sum()), "-0E0");
+}
