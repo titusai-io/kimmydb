@@ -14763,6 +14763,22 @@ async fn set_window_fields_densify_and_fill_run_over_http_and_refuse_what_they_c
     ]))
     .await;
     assert_eq!(res.body["documents"], json!([{ "_id": 5, "qty": 0 }]), "{:?}", res.body);
+    // Covariance is a window operator, and `locf` needs no sort.
+    let res = aggregate(json!([
+        { "$match": { "state": "CA" } },
+        { "$setWindowFields": { "sortBy": { "day": 1 }, "output": {
+            "c": { "$covariancePop": ["$day", "$qty"] },
+            "f": { "$locf": "$qty" }
+        } } },
+        { "$project": { "_id": 1, "c": 1, "f": 1 } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // Days 1, 2, 4 and quantities 10, 20, 40: the means 7/3 and 70/3, the products of the
+    // deviations 160/9, 10/9 and 250/9, and a third of their sum.
+    let c = res.body["documents"][0]["c"].as_f64().unwrap();
+    assert!((c - 420.0 / 27.0).abs() < 1e-9, "{c}");
+    assert_eq!(res.body["documents"][2]["f"], json!(40));
     // Inside a facet.
     let res = aggregate(json!([{ "$facet": { "f": [
         { "$setWindowFields": { "sortBy": { "_id": 1 }, "output": { "n": { "$documentNumber": {} } } } },
@@ -14778,14 +14794,14 @@ async fn set_window_fields_densify_and_fill_run_over_http_and_refuse_what_they_c
             "requires a `sortBy`",
         ),
         (
-            json!({ "$setWindowFields": { "output": { "x": { "$covariancePop": ["$a", "$b"] } } } }),
-            "not supported",
+            json!({ "$setWindowFields": { "output": { "x": { "$mergeObjects": "$a" } } } }),
+            "not a window operator",
         ),
         (
             json!({ "$densify": { "field": "day", "range": { "step": 0, "bounds": "full" } } }),
             "greater than 0",
         ),
-        (json!({ "$fill": { "output": { "x": { "method": "locf" } } } }), "requires a `sortBy`"),
+        (json!({ "$fill": { "output": { "x": { "method": "linear" } } } }), "exactly one field"),
     ] {
         let res = aggregate(json!([stage.clone()])).await;
         assert_eq!(res.status, 400, "{stage}: {:?}", res.body);
