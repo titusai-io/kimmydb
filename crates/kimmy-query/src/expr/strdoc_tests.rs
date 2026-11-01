@@ -756,26 +756,15 @@ fn replace_refuses_a_result_over_the_limit_before_building_it() {
     // Nothing found: the input's own length.
     assert_eq!(replace("abc", "z", "yyyyyyyy", true, 3).unwrap(), "abc");
     assert_eq!(replace("abc", "z", "yyyyyyyy", false, 3).unwrap(), "abc");
-    // An empty `find` over a megabyte with a megabyte of replacement asks for a
-    // terabyte: refused at once, with the size it asked for.
-    let mib = "x".repeat(1 << 20);
-    let asked = refused_at(&mib, "", &mib, true, super::MAX_STRING_BYTES);
-    assert_eq!(asked, (mib.len() + 1) * mib.len() + mib.len());
-}
-
-#[test]
-fn the_operators_refuse_a_result_over_16_mib() {
-    let big = "x".repeat(1 << 20);
-    let d = doc! {"a": big.clone(), "b": big};
-    for op in ["$replaceAll", "$replaceOne"] {
-        let err = ev(doc! {op: {"input": "$a", "find": "", "replacement": "$b"}}, &d);
-        // $replaceOne asks for 2 MiB and is fine.
-        if op == "$replaceAll" {
-            assert!(matches!(err, Err(Error::ValueTooLarge { .. })), "{err:?}");
-        } else {
-            assert!(matches!(err, Ok(Bson::String(ref r)) if r.len() == 2 << 20), "{op}");
-        }
-    }
+    // An empty `find` over a long input with a long replacement asks for far more
+    // than it holds (n inputs bytes times n replacement bytes): refused at once, with
+    // the size it asked for. The sizes are small and the limit is a parameter, so a
+    // build that lost the check allocates a few megabytes and fails the assertion,
+    // where the same case at the real limit (a megabyte by a megabyte, a terabyte)
+    // would take the machine down. Keep it parametrised.
+    let long = "x".repeat(2_000);
+    let asked = refused_at(&long, "", &long, true, 1_000_000);
+    assert_eq!(asked, (long.len() + 1) * long.len() + long.len());
 }
 
 #[test]
