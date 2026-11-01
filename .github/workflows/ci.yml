@@ -215,6 +215,13 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The `merge-mutants` feature of kimmy-core is off in every build above, so
+      # without this step the Q7 merge-state harness (tests/merge_state_sim) and the
+      # `merge-mutants` branches of the library are never compiled or linted here.
+      - name: Clippy, the merge-state harness (merge-mutants build)
+        if: needs.changes.outputs.docs_only != 'true'
+        run: cargo clippy -p kimmy-core --all-targets --features merge-mutants -- -D warnings
+
       # ADR-001 and ADR-016 both cite keeping the build free of a C toolchain.
       # That stopped being true in M2 and nobody noticed for two milestones,
       # because the claim lived in prose that nothing checked. This is the
@@ -295,6 +302,18 @@ jobs:
             --features kimmy-storage/cache-metrics,kimmy-api/storage-cache-metrics,kimmyd/storage-cache-metrics \
             -E 'package(kimmy-api) | (package(kimmy-storage) & test(/cache/)) | (package(kimmyd) & test(/bridge/))'
           cargo clippy -p kimmyd --all-targets --features storage-cache-metrics -- -D warnings
+
+      # The Q7 merge-state harness: the random runs, the probes and the 16 mutants
+      # of kimmy-core's `merge_state` module. Its target requires the
+      # `merge-mutants` feature, which the workspace run above does not enable, so
+      # it ran nowhere: a probe could start failing or a mutant start surviving and
+      # the change would merge green. The runner fails on either. (Its companion,
+      # the differential test against the Python reference model in
+      # `merge_state_diff`, needs no feature and runs in the workspace step above;
+      # it starts `python3`, which the runner image has.) About 5 minutes here.
+      - name: Test the merge-state harness
+        if: needs.changes.outputs.docs_only != 'true'
+        run: cargo test -p kimmy-core --features merge-mutants --test merge_state_sim
 
       # Every test that reads a documentation file lives in `kimmy-api`, which
       # `documentation_tests_live_in_this_crate` holds true, so this is the
