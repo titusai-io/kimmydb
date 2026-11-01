@@ -4433,6 +4433,59 @@ async fn json_schema_filters_every_route_that_takes_a_filter() {
     }
 }
 
+/// The `as` array of a join is held to 16 MiB like every array an expression
+/// builds (ADR-267): five matching documents of 4 MiB are a `413`, and one is not.
+#[tokio::test]
+async fn a_join_array_over_16_mib_is_refused_with_the_413() {
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        max_body_bytes: 8 << 20,
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "l"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "f"})).await;
+    server.post("/v1/db/shop/coll/l/docs", Some(&token), json!({"_id": 1, "k": 1})).await;
+    let pad = "x".repeat(4 << 20);
+    for id in 1..=5 {
+        let stored = server
+            .post("/v1/db/shop/coll/f/docs", Some(&token), json!({"_id": id, "k": 1, "pad": pad}))
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    let run = |stage: Value| {
+        server.post("/v1/db/shop/coll/l/aggregate", Some(&token), json!({"pipeline": [stage]}))
+    };
+    for (name, stage) in [
+        (
+            "$lookup",
+            json!({"$lookup": {"from": "f", "localField": "k", "foreignField": "k", "as": "j"}}),
+        ),
+        (
+            "$lookup",
+            json!({"$lookup": {"from": "f", "pipeline": [{"$match": {"k": 1}}], "as": "j"}}),
+        ),
+        (
+            "$graphLookup",
+            json!({"$graphLookup": {"from": "f", "startWith": "$k", "connectFromField": "z",
+                                    "connectToField": "k", "as": "j", "maxDepth": 0}}),
+        ),
+    ] {
+        let res = run(stage.clone()).await;
+        assert_eq!(res.status, 413, "{stage}: {:?}", res.body);
+        assert_eq!(res.body["error"], "document_too_large", "{:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains(&format!("the array {name} builds is")), "{message}");
+        assert!(message.contains("16 MiB array limit"), "{message}");
+    }
+    // One document of the five is within the limit.
+    let one = run(json!({"$lookup": {"from": "f",
+        "pipeline": [{"$match": {"_id": 1}}], "as": "j"}}))
+    .await;
+    assert_eq!(one.status, 200, "{:?}", one.body.to_string().len());
+    assert_eq!(one.body["documents"][0]["j"].as_array().map(Vec::len), Some(1));
+}
+
 /// A regex written as a field's value is a pattern in `find`, and a partial index
 /// filter has no patterns, so a bare one is refused at creation (ADR-267), while
 /// `$eq` of it, which compares it as a value, is not.
