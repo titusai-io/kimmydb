@@ -78,6 +78,21 @@ fn kind_of(op: &str) -> Option<Kind> {
     })
 }
 
+/// `$sum`, `$avg`, `$stdDevPop` and `$stdDevSamp` take one expression, not a
+/// list: given an array literal of any length but one, the reference refuses
+/// them (`The $sum accumulator is a unary operator`, error 40237). A list of one
+/// is not probed and stays an array expression. Every other name passes.
+pub fn check_unary(op: &str, arg: &Bson) -> Result<()> {
+    match (op, arg) {
+        ("$sum" | "$avg" | "$stdDevPop" | "$stdDevSamp", Bson::Array(items))
+            if items.len() != 1 =>
+        {
+            Err(Error::InvalidQuery(format!("The {op} accumulator is a unary operator")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Parse `{<op>: <arg>}` if `op` is one of ours.
 pub fn parse(op: &str, arg: &Bson, vars: &[String]) -> Result<Option<Spec>> {
     let Some(kind) = kind_of(op) else { return Ok(None) };
@@ -103,7 +118,7 @@ pub fn parse(op: &str, arg: &Bson, vars: &[String]) -> Result<Option<Spec>> {
             Spec {
                 kind,
                 value: Expr::parse_with_vars(&d["output"], vars)?,
-                n: parse_n(op, d, vars)?,
+                n: parse_n(d, vars)?,
                 sort: shape::parse_sort(sort_by)?,
             }
         }
@@ -112,7 +127,7 @@ pub fn parse(op: &str, arg: &Bson, vars: &[String]) -> Result<Option<Spec>> {
             Spec {
                 kind,
                 value: Expr::parse_with_vars(&d["input"], vars)?,
-                n: parse_n(op, d, vars)?,
+                n: parse_n(d, vars)?,
                 sort: Vec::new(),
             }
         }
@@ -148,18 +163,17 @@ fn argument<'a>(op: &str, arg: &'a Bson, with_n: bool, value: &str) -> Result<&'
     Ok(d)
 }
 
-fn parse_n(op: &str, d: &Document, vars: &[String]) -> Result<Option<Expr>> {
+fn parse_n(d: &Document, vars: &[String]) -> Result<Option<Expr>> {
     let Some(n) = d.get("n") else { return Ok(None) };
     let expr = Expr::parse_with_vars(n, vars)?;
-    // An expression that needs no document is read now, so a bad constant is a
-    // parse error. One that reads a variable is read at first use. A field path
-    // reads the empty document, is missing there, and is refused: `n` is one
-    // number for the whole group.
+    // An expression that needs no document is read now, to a constant. It is not
+    // checked now: a bad `n` is refused for a group, when its first document
+    // arrives, so over no input there is no group and no error (as the
+    // reference answers). One that reads a variable is read at first use. A
+    // field path reads the empty document, is missing there, and is refused then:
+    // `n` is one number for the whole group.
     match expr.eval_in(&Scope::new(&Document::new())) {
-        Ok(value) => {
-            read_n(op, &value)?;
-            Ok(Some(Expr::Literal(value)))
-        }
+        Ok(value) => Ok(Some(Expr::Literal(value))),
         Err(_) => Ok(Some(expr)),
     }
 }
