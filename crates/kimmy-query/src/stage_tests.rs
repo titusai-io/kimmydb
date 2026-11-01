@@ -46,7 +46,7 @@ fn sort_by_count_counts_each_value_and_puts_the_commonest_first() {
         ]
     );
     assert!(out.iter().all(|d| matches!(d.get("count"), Some(Bson::Int32(_)))), "{out:?}");
-    // `$group`'s own `{$sum: 1}` stays a long in this build.
+    // `$group`'s own `{$sum: 1}` is an int too (ADR-268).
     let grouped = run(doc! {"$group": {"_id": "$k", "count": {"$sum": 1}}}, kinds(&["a"])).unwrap();
     assert_eq!(grouped[0].get("count"), Some(&Bson::Int32(1)));
 }

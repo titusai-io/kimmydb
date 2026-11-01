@@ -19723,7 +19723,8 @@ async fn an_array_update_is_a_pipeline_update_on_update_and_find_and_modify() {
     }))
     .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
-    // Document 3 held `total: 2` as an int; the sum is a long, so every one changed.
+    // Document 3 held `total: 2` as an int and the sum is an int too (ADR-268), so its total
+    // is unchanged, but it gains `n`: every one changed.
     assert_eq!((res.body["matched"].as_u64(), res.body["modified"].as_u64()), (Some(3), Some(3)));
     assert_eq!(pu_doc(&server, &token, 1).await["total"], 5);
     assert_eq!(pu_doc(&server, &token, 1).await["n"], 2);
