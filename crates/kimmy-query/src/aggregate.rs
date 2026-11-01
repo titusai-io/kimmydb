@@ -64,9 +64,12 @@ use crate::stages;
 #[derive(Clone, Debug)]
 pub struct Limits {
     pub max_documents: usize,
-    /// The bytes the blocking stages of the request hold, one total for the whole
-    /// pipeline and its `$facet` branches (ADR-264). A fresh `Limits::default()` is a
-    /// fresh budget, so make one per request.
+    /// The bytes the request holds, in BSON: the source read, each stage's input and
+    /// output, the groups and joins it builds, what the window stages buffer and the
+    /// answer, one total for the whole pipeline and its `$facet` branches and
+    /// sub-pipelines (ADR-269, which widens ADR-264's). Drawing on the node's pool when it
+    /// was made from one. A fresh `Limits::default()` is a fresh budget of 1 GiB, so make
+    /// one per request.
     pub buffer: crate::budget::BufferBudget,
 }
 

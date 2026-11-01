@@ -277,3 +277,27 @@ fn a_facet_does_not_keep_every_lookup_runs_bytes_charged_until_it_ends() {
     assert_eq!(inside["documents"], json!([{"a": [{"n": 8}]}]));
     assert_eq!(limits.buffer.used(), 0);
 }
+
+#[test]
+fn a_request_the_deadline_drops_gives_its_bytes_back_to_the_pool() {
+    // The request deadline (ADR-266) cuts a request by dropping its future where it waits.
+    // Every holder owns a lease, so a dropped future returns what it held to the pool.
+    let pool = kimmy_query::budget::MemoryPool::new(1_000_000);
+    let limits =
+        aggregate::Limits { buffer: BufferBudget::pooled(500_000, &pool), ..Default::default() };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    let cut = runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_millis(20), async {
+            let mut source = limits.buffer.lease("the source read");
+            let mut stage = limits.buffer.lease("the output of $addFields (with its input)");
+            source.charge(200_000).unwrap();
+            stage.charge(100_000).unwrap();
+            assert_eq!(pool.used(), 300_000);
+            std::future::pending::<()>().await;
+        })
+        .await
+    });
+    assert!(cut.is_err(), "the deadline fired");
+    assert_eq!(pool.used(), 0);
+    assert_eq!(limits.buffer.used(), 0);
+}

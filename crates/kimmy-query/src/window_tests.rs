@@ -2741,6 +2741,24 @@ fn two_dates_more_than_two_to_the_sixty_three_milliseconds_apart_do_not_wrap() {
 }
 
 #[test]
+fn an_integral_over_dates_more_than_two_to_the_sixty_three_milliseconds_apart_does_not_wrap() {
+    // The trapezoid between the earliest and the latest date a `DateTime` holds is 2^64
+    // milliseconds wide and 1 high: in 64 bits the width wraps to -1.
+    let input = vec![
+        doc! {"t": bson::DateTime::from_millis(i64::MIN), "y": 0.0},
+        doc! {"t": bson::DateTime::from_millis(i64::MAX), "y": 2.0},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"t": 1}, "output": {
+            "i": {"$integral": {"input": "$y", "unit": "millisecond"}, "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    assert_eq!(col(&out, "i")[1], Bson::Double(2f64.powi(64)));
+}
+
+#[test]
 fn sort_by_nothing_is_accepted_by_shift_and_the_moving_average_in_arrival_order() {
     let input =
         vec![doc! {"_id": 1, "qty": 10}, doc! {"_id": 3, "qty": 30}, doc! {"_id": 2, "qty": 20}];
