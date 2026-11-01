@@ -232,6 +232,11 @@ fn null_propagates_and_other_types_keep_the_old_words() {
         (dec("10"), dec("-3"), "1"),
         (dec("1E+40"), Bson::Int32(7), "4"),
         (dec("5"), dec("1E+40"), "5"),
+        // An infinite divisor leaves the dividend as it is; an infinite dividend is NaN.
+        (dec("5"), dec("Infinity"), "5"),
+        (dec("-5.50"), dec("-Infinity"), "-5.50"),
+        (dec("Infinity"), Bson::Int32(2), "NaN"),
+        (dec("NaN"), Bson::Int32(2), "NaN"),
         (dec("123456789012345678901234567890.123"), dec("0.5"), "0.123"),
     ] {
         assert_eq!(val(op("$mod", vec![a.clone(), b.clone()]), none()), dec(want), "{a:?} % {b:?}");
