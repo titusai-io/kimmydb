@@ -70,7 +70,7 @@ const _: () = {
     let _: fn(&[u8]) -> Result<MergeState, DecodeError> = MergeState::decode;
     let _: fn(&mut Writer, &[(&str, Value)], u64) -> Option<Written> = Writer::insert;
     let _: fn(&mut Writer, &str, i64, u64) -> Option<Written> = Writer::upsert_inc;
-    let _: fn(&mut Writer, &[(&str, Value)], &[(&str, Value)], u64) -> Option<Written> =
+    let _: fn(&mut Writer, &[(&str, Value)], &str, &[(&str, Value)], u64) -> Option<Written> =
         Writer::upsert_soi_create;
     let _: fn(&mut Writer, MStamp, &str, i64, u64) -> Option<Written> = Writer::upsert_inc_on;
     let _: fn(

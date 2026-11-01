@@ -1126,7 +1126,7 @@ fn upsert_soi_is_create_then_inc() {
     let mut whole = Writer::new(wid('B', 0), opts());
     let (c1, n1) = whole.upsert_soi(&fields, "views", 3, &sets, 2).unwrap();
     let mut parts = Writer::new(wid('B', 0), opts());
-    let c2 = parts.upsert_soi_create(&fields, &sets, 2).unwrap();
+    let c2 = parts.upsert_soi_create(&fields, "views", &sets, 2).unwrap();
     // Between the two writes: the life and the cells, no slot, nothing visible yet but the cells.
     assert!(parts.state.slots.is_empty());
     assert!(parts.state.lives.contains_key(&c2.stamp));
@@ -1141,7 +1141,7 @@ fn upsert_soi_is_create_then_inc() {
     assert_eq!(whole.state, parts.state);
     assert_eq!(whole.clock, parts.clock);
     // Not while a life is alive.
-    assert!(parts.upsert_soi_create(&fields, &sets, 0).is_none());
+    assert!(parts.upsert_soi_create(&fields, "views", &sets, 0).is_none());
 }
 
 #[test]
@@ -1154,15 +1154,26 @@ fn upsert_with_conflicting_paths_is_refused_whole() {
         (&[("y", s("a"))], "x", &[("y", i(1))]), // $setOnInsert vs $set
     ];
     for (fields, inc, sets) in cases {
+        // The one-shot form, and the two-step form given the whole update: each refuses before
+        // it writes anything or moves the clock.
         let mut w = Writer::new(wid('A', 0), opts());
         assert!(w.upsert_soi(fields, inc, 1, sets, 0).is_none());
-        assert!(w.state.lives.is_empty() && w.state.regs.is_empty() && w.state.slots.is_empty());
+        let untouched = Writer::new(wid('A', 0), opts());
+        assert!(w.state == untouched.state && w.state.regs.is_empty());
         assert_eq!(w.clock, Hlc::ZERO);
+        assert!(w.upsert_soi_create(fields, inc, sets, 3).is_none());
+        assert!(w.state == untouched.state && w.state.lives.is_empty());
+        assert_eq!(w.clock, Hlc::ZERO, "a refused creation does not tick");
+        // and nothing is left behind that a later update could trip over
+        assert!(w.upsert_soi(&[("q", i(1))], "r", 1, &[], 0).is_some());
     }
-    // The increment step alone also refuses a path the creation wrote.
+    // Two-step, the other order: the increment step alone refuses a path the creation wrote
+    // (the creation was valid for the `$inc` it was told about), with no write and no tick.
     let mut w = Writer::new(wid('A', 0), opts());
-    let c = w.upsert_soi_create(&[("x", s("a"))], &[], 0).unwrap();
+    let c = w.upsert_soi_create(&[("x", s("a"))], "z", &[], 0).unwrap();
+    let (state, clock) = (w.state.clone(), w.clock);
     assert!(w.upsert_inc_on(c.stamp, "x", 1, 0).is_none());
+    assert!(w.state == state && w.clock == clock);
     assert!(w.upsert_inc_on(c.stamp, "z", 1, 0).is_some());
 }
 

@@ -220,15 +220,7 @@ impl Writer {
         sets: &[(&str, Value)],
         skew: u64,
     ) -> Option<(Written, Written)> {
-        // `$setOnInsert`, `$set` and `$inc` on one path conflict: the update is refused whole,
-        // before anything is written.
-        let mut paths: Vec<&str> =
-            fields.iter().chain(sets.iter()).map(|(q, _)| *q).chain([inc_path]).collect();
-        paths.sort_unstable();
-        if paths.windows(2).any(|w| w[0] == w[1]) {
-            return None;
-        }
-        let created = self.upsert_soi_create(fields, sets, skew)?;
+        let created = self.upsert_soi_create(fields, inc_path, sets, skew)?;
         let life = created.stamp;
         let incd = self.upsert_inc_on(life, inc_path, n, skew)?;
         Some((created, incd))
@@ -236,13 +228,23 @@ impl Writer {
 
     /// The creation write of a `$setOnInsert` upsert: the new life (kind upsert),
     /// the `$setOnInsert` cells tagged and the `$set` cells untagged, no slot.
-    /// Refused while a life is alive.
+    /// `inc_path` is the path of the `$inc` that [`Writer::upsert_inc_on`] applies next;
+    /// the whole update is validated here, before anything is written or the clock moves:
+    /// the `$setOnInsert`, `$set` and `$inc` paths must be pairwise distinct (a conflicting
+    /// update is refused, `None`). Refused too while a life is alive.
     pub fn upsert_soi_create(
         &mut self,
         fields: &[(&str, Value)],
+        inc_path: &str,
         sets: &[(&str, Value)],
         skew: u64,
     ) -> Option<Written> {
+        let mut paths: Vec<&str> =
+            fields.iter().chain(sets.iter()).map(|(q, _)| *q).chain([inc_path]).collect();
+        paths.sort_unstable();
+        if paths.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
         if !self.state.alive(&self.opts).is_empty() {
             return None;
         }

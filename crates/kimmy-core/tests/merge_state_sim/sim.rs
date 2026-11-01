@@ -403,7 +403,7 @@ impl Node {
         log: &mut Log,
         skew: u64,
     ) -> Option<MStamp> {
-        let created = self.w.upsert_soi_create(fields, sets, skew);
+        let created = self.w.upsert_soi_create(fields, inc_path, sets, skew);
         let s1 = self.logged(created, log)?;
         let incd = self.w.upsert_inc_on(s1, inc_path, n, skew);
         self.logged(incd, log)

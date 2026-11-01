@@ -203,7 +203,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
                     s.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                 let sk = op[6].as_u64().unwrap();
                 // as the harness does it: the creation, logged, then the increment, logged
-                let created = ms[m].w.upsert_soi_create(&fr, &sr, sk);
+                let created = ms[m].w.upsert_soi_create(&fr, op[3].as_str().unwrap(), &sr, sk);
                 match ms[m].logged(created, &mut log) {
                     None => J::Null,
                     Some(s1) => {
