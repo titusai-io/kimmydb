@@ -1139,3 +1139,135 @@ fn a_sort_key_path_through_an_array_keeps_only_the_documents_fields() {
     assert_eq!(top(doc! {"a.b": 1}), Bson::Int32(1));
     assert_eq!(top(doc! {"a.b": -1}), Bson::Int32(2));
 }
+
+// -- the array an accumulator answers is held to 16 MiB ------------------------
+
+/// A state for `{<op>: <arg>}` held to `max` bytes, and the spec that drives it.
+fn held(op: &str, arg: Document, max: usize) -> (accumulators::Spec, accumulators::State) {
+    let spec = accumulators::parse(op, &Bson::Document(arg), &[]).unwrap().unwrap();
+    let state = spec.init_within(max);
+    (spec, state)
+}
+
+fn feed(
+    spec: &accumulators::Spec,
+    state: &mut accumulators::State,
+    value: &str,
+) -> kimmy_core::Result<()> {
+    let row = doc! {"v": value, "k": value};
+    state.accumulate(spec, &crate::expr::Scope::new(&row))
+}
+
+/// An array of `count` strings of ten bytes: 5, then for each element its type
+/// byte, its index and terminator, and the string's 4 + 10 + 1.
+fn strings_bytes(count: usize) -> usize {
+    crate::expr::array_bytes(count, count * 15)
+}
+
+#[test]
+fn a_buffer_that_keeps_rows_is_refused_at_the_row_that_passes_the_limit() {
+    let args = |n: i32| -> [(&str, Document); 6] {
+        [
+            ("$firstN", doc! {"input": "$v", "n": n}),
+            ("$lastN", doc! {"input": "$v", "n": n}),
+            ("$maxN", doc! {"input": "$v", "n": n}),
+            ("$minN", doc! {"input": "$v", "n": n}),
+            ("$topN", doc! {"output": "$v", "sortBy": {"k": 1}, "n": n}),
+            ("$bottomN", doc! {"output": "$v", "sortBy": {"k": 1}, "n": n}),
+        ]
+    };
+    // Room for exactly 20 strings of ten bytes.
+    let max = strings_bytes(20);
+    for (op, arg) in args(1000) {
+        let (spec, mut state) = held(op, arg, max);
+        for i in 0..20 {
+            feed(&spec, &mut state, &format!("{i:010}"))
+                .unwrap_or_else(|e| panic!("{op} {i}: {e}"));
+        }
+        let err = feed(&spec, &mut state, &format!("{:010}", 20)).unwrap_err();
+        match err {
+            kimmy_core::Error::ValueTooLarge { bytes, max: m, what, .. } => {
+                assert_eq!((bytes, m), (strings_bytes(21), max), "{op}");
+                assert_eq!(what, format!("the array {op} builds"), "{op}");
+            }
+            other => panic!("{op}: {other:?}"),
+        }
+    }
+    // A buffer that gives rows back is counted for what it keeps: `n` of 20 never
+    // holds more, however many rows pass through it.
+    for (op, arg) in args(20) {
+        let (spec, mut state) = held(op, arg, max);
+        for i in 0..200 {
+            feed(&spec, &mut state, &format!("{i:010}"))
+                .unwrap_or_else(|e| panic!("{op} {i}: {e}"));
+        }
+        let Bson::Array(kept) = state.finish() else { panic!("{op}: an array") };
+        assert_eq!(kept.len(), 20, "{op}");
+    }
+    // One too few bytes, and the 20th row is the one refused.
+    let (spec, mut state) = held("$lastN", doc! {"input": "$v", "n": 20}, max - 1);
+    for i in 0..19 {
+        feed(&spec, &mut state, &format!("{i:010}")).unwrap();
+    }
+    assert!(feed(&spec, &mut state, &format!("{:010}", 19)).is_err());
+}
+
+#[test]
+fn a_ranked_buffer_counts_the_output_it_keeps_and_not_the_one_it_drops() {
+    // `$topN` keeps the best 3; each row's output is a ten-byte string.
+    let max = strings_bytes(3);
+    let (spec, mut state) = held("$topN", doc! {"output": "$v", "sortBy": {"k": 1}, "n": 3}, max);
+    // Descending input: every new row ranks first and pushes one out.
+    for i in (0..100).rev() {
+        feed(&spec, &mut state, &format!("{i:010}")).unwrap();
+    }
+    let Bson::Array(kept) = state.finish() else { panic!("an array") };
+    assert_eq!(kept.len(), 3);
+    // One byte less and the third row is over.
+    let (spec, mut state) =
+        held("$topN", doc! {"output": "$v", "sortBy": {"k": 1}, "n": 3}, max - 1);
+    feed(&spec, &mut state, "0000000000").unwrap();
+    feed(&spec, &mut state, "0000000001").unwrap();
+    assert!(feed(&spec, &mut state, "0000000002").is_err());
+}
+
+#[test]
+fn the_real_limit_reaches_the_group_and_the_bucket() {
+    // Three documents of 6 MiB: a `$push` of them is 18 MiB.
+    let big = "x".repeat(6 << 20);
+    let input: Vec<Document> = (0..3).map(|i| doc! {"_id": i, "s": big.clone()}).collect();
+    for acc in [
+        doc! {"$push": "$s"},
+        doc! {"$addToSet": "$s"},
+        doc! {"$firstN": {"input": "$s", "n": 5}},
+        doc! {"$lastN": {"input": "$s", "n": 5}},
+        doc! {"$maxN": {"input": "$s", "n": 5}},
+        doc! {"$topN": {"output": "$s", "sortBy": {"_id": 1}, "n": 5}},
+    ] {
+        // `$addToSet` of equal strings keeps one, so give it distinct ones.
+        let rows: Vec<Document> = input
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let mut d = d.clone();
+                d.insert("s", format!("{i}{}", &big[1..]));
+                d
+            })
+            .collect();
+        let stage = doc! {"$group": {"_id": null, "r": acc.clone()}};
+        let err = run_with(stage, rows.clone(), &Limits::default()).unwrap_err();
+        assert!(
+            matches!(err, kimmy_core::Error::ValueTooLarge { max, .. } if max == 16 << 20),
+            "{acc}: {err:?}"
+        );
+        // The same accumulator in a bucket's output.
+        let stage = doc! {"$bucket": {
+            "groupBy": "$_id", "boundaries": [0, 10], "output": {"r": acc.clone()},
+        }};
+        let err = run_with(stage, rows.clone(), &Limits::default()).unwrap_err();
+        assert!(matches!(err, kimmy_core::Error::ValueTooLarge { .. }), "{acc}: {err:?}");
+        // Two of the three are within the limit.
+        let stage = doc! {"$group": {"_id": null, "r": acc}};
+        assert!(run_with(stage, rows[..2].to_vec(), &Limits::default()).is_ok());
+    }
+}

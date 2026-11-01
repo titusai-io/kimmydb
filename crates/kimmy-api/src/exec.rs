@@ -2626,10 +2626,15 @@ fn lookup(
 
     let mut out = Vec::with_capacity(input.len());
     for (mut doc, at) in input.into_iter().zip(attached) {
-        let joined = at.into_iter().map(|i| bson::Bson::Document(foreign_docs[i].clone()));
+        // Counted before each copy, so a join whose array would pass 16 MiB is
+        // refused at the document that takes it there (a `413`).
+        let mut joined = aggregate::JoinedArray::new("the array $lookup builds");
+        for i in at {
+            joined.push_copy(&foreign_docs[i], None)?;
+        }
         // Always an array, even when empty: a field whose type depends on
         // whether anything matched forces every caller to handle two shapes.
-        doc.insert(as_field.to_string(), bson::Bson::Array(joined.collect()));
+        doc.insert(as_field.to_string(), joined.finish());
         out.push(doc);
     }
     Ok(out)
@@ -2733,10 +2738,9 @@ fn lookup_pipeline(
         // every input document is what the ceiling bounds.
         held += joined.len();
         aggregate::check_limit("$lookup", held, limits)?;
-        doc.insert(
-            as_field.to_string(),
-            bson::Bson::Array(joined.into_iter().map(bson::Bson::Document).collect()),
-        );
+        let mut array = aggregate::JoinedArray::new("the array $lookup builds");
+        array.push_all(joined)?;
+        doc.insert(as_field.to_string(), array.finish());
         out.push(doc);
     }
     Ok(out)
@@ -2854,15 +2858,13 @@ fn graph_lookup(
             frontier = next;
         }
         held += reached.len();
-        let joined = reached.into_iter().map(|(at, depth)| {
-            let mut copy = foreign[at].clone();
-            if let Some(field) = &spec.depth_field {
-                // A name of one field (a path is refused when the stage is parsed).
-                copy.insert(field.clone(), bson::Bson::Int64(depth as i64));
-            }
-            bson::Bson::Document(copy)
-        });
-        doc.insert(spec.as_field.clone(), bson::Bson::Array(joined.collect()));
+        let mut joined = aggregate::JoinedArray::new("the array $graphLookup builds");
+        for (at, depth) in reached {
+            // A name of one field (a path is refused when the stage is parsed).
+            let depth_field = spec.depth_field.as_deref().map(|field| (field, depth as i64));
+            joined.push_copy(&foreign[at], depth_field)?;
+        }
+        doc.insert(spec.as_field.clone(), joined.finish());
         out.push(doc);
     }
     Ok(out)

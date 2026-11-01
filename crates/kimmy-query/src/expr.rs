@@ -75,8 +75,9 @@ mod strings;
 mod tz;
 
 pub(crate) use sizes::{
-    ArrayBudget, DocBudget, MAX_ARRAY_BYTES, MAX_STRING_BYTES, bson_bytes, check_array_bytes,
-    check_array_within, check_string_len_within,
+    ArrayBudget, DocBudget, HeldArray, MAX_ARRAY_BYTES, MAX_STRING_BYTES, array_bytes, bson_bytes,
+    check_array_bytes, check_array_within, check_document_bytes, check_string_len_within,
+    document_bytes,
 };
 
 pub(crate) use docops::{merge_budget, merge_into};
@@ -3065,20 +3066,11 @@ fn range_within(args: &[Bson], max: usize) -> Result<Bson> {
 
 /// What an array of `count` `Int64`s encodes to: the framing, then for each
 /// element its type byte, its decimal index with a terminator, and eight bytes.
-/// Worked out by the number of digits the index has, so it takes twenty steps at
-/// the most whatever the count, and saturates.
 fn range_bytes(count: u64) -> usize {
-    let mut bytes = 5u128;
-    let mut low = 0u128;
-    let mut digits = 1u32;
-    let count = u128::from(count);
-    while low < count && digits <= 20 {
-        let high = 10u128.pow(digits).min(count);
-        bytes += (high - low) * (2 + u128::from(digits) + 8);
-        low = high;
-        digits += 1;
-    }
-    usize::try_from(bytes).unwrap_or(usize::MAX)
+    array_bytes(
+        usize::try_from(count).unwrap_or(usize::MAX),
+        8usize.saturating_mul(usize::try_from(count).unwrap_or(usize::MAX)),
+    )
 }
 
 // ---------------------------------------------------------------------------

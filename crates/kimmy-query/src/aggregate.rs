@@ -1918,9 +1918,15 @@ fn set_computed(
 
 /// [`set_computed`] with the document it writes held to `max` bytes. A computed
 /// value can hold a copy of the document it is added to (`{a: "$$ROOT"}`), so a
-/// stage that did only that, repeated, would double the document each time. The
-/// size is counted as the fields are written, from the document's own size, and a
-/// field that would take it over the limit is refused before it is stored.
+/// stage that did only that, repeated, would double the document each time.
+///
+/// The size is counted before a value is stored: from the document's own size,
+/// less the value a field replaces, plus the new one, and a field that would take
+/// it over the limit is refused with nothing stored. A value that is the whole
+/// input (`$$ROOT`, `$$CURRENT`) is counted from the input, before the copy is
+/// made. A name that is not a plain top-level one may add nested documents whose
+/// framing is not known until it is written; when the count cannot rule the
+/// write out nor in, the document is measured after it.
 fn set_computed_within(
     target: &mut Document,
     computed: &[(String, Expr)],
@@ -1931,24 +1937,36 @@ fn set_computed_within(
         return Ok(());
     }
     let what = "the document the stage builds";
-    let mut budget = crate::expr::DocBudget::of_document(what, max, target)?;
+    let mut size = crate::expr::document_bytes(target);
+    crate::expr::check_document_bytes(what, size, max)?;
     for (name, expr) in computed {
+        // The input as a whole is counted without copying it.
+        let known = match expr {
+            Expr::Var { name: var, path: None } if var == "ROOT" || var == "CURRENT" => {
+                Some(crate::expr::document_bytes(source.root()))
+            }
+            _ => None,
+        };
+        let replaced = replaced_bytes(target, name);
+        if let Some(payload) = known {
+            admit(what, size, name, replaced, payload, max)?;
+        }
         // `$$REMOVE` leaves the field out: not written, and removed if the stage
         // would otherwise carry it (ADR-253).
         match expr.eval_field(source)? {
             Some(value) => {
-                // The count adds the value without taking away what it replaces: it
-                // can only be too high. When it is over, the document's exact size
-                // decides, after the write.
-                let mut counted = budget.clone();
-                let fits = counted.set(name, None, &value).is_ok();
+                let payload = known.unwrap_or_else(|| crate::expr::bson_bytes(&value));
+                let exact = admit(what, size, name, replaced, payload, max)?;
                 path::set(target, name, value)
                     .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
-                if fits {
-                    budget = counted;
-                } else {
-                    budget = crate::expr::DocBudget::of_document(what, max, target)?;
-                }
+                size = match exact {
+                    Some(after) => after,
+                    None => {
+                        let after = crate::expr::document_bytes(target);
+                        crate::expr::check_document_bytes(what, after, max)?;
+                        after
+                    }
+                };
             }
             None => {
                 if !path::unset(target, name) && crossing_array(target, name).is_some() {
@@ -1961,10 +1979,116 @@ fn set_computed_within(
                         return Err(Error::InvalidQuery(format!("cannot set {name:?}: {e}")));
                     }
                 }
+                size = crate::expr::document_bytes(target);
             }
         }
     }
     Ok(())
+}
+
+/// The payload of the value at `name` in `target`, if the path runs through
+/// documents to it. A path through an array is not followed: nothing is known.
+fn replaced_bytes(target: &Document, name: &str) -> Option<usize> {
+    let mut segments = name.split('.');
+    let mut current = target.get(segments.next()?)?;
+    for segment in segments {
+        current = match current {
+            Bson::Document(d) => d.get(segment)?,
+            _ => return None,
+        };
+    }
+    Some(crate::expr::bson_bytes(current))
+}
+
+/// Whether a value of `payload` bytes may be written at `name` into a document of
+/// `size` bytes, within `max`; refused, with nothing stored, when even the
+/// smallest the document can become is over it. `Some(size)` is the size the
+/// document will be when that is known exactly (the field is replaced in place),
+/// `None` when the write may add nested documents and the document must be
+/// measured after it.
+fn admit(
+    what: &'static str,
+    size: usize,
+    name: &str,
+    replaced: Option<usize>,
+    payload: usize,
+    max: usize,
+) -> Result<Option<usize>> {
+    let leaf = name.rsplit('.').next().map_or(name.len(), str::len);
+    match replaced {
+        Some(old) => {
+            let after = size.saturating_sub(old).saturating_add(payload);
+            crate::expr::check_document_bytes(what, after, max)?;
+            Ok(Some(after))
+        }
+        None => {
+            let least = size.saturating_add(2 + leaf).saturating_add(payload);
+            crate::expr::check_document_bytes(what, least, max)?;
+            // Every segment is a field, and each one but the last holds a document of
+            // five bytes of framing: the most the write can add.
+            let segments = name.split('.').count();
+            let framing: usize =
+                name.split('.').map(|s| 2 + s.len()).sum::<usize>() + 5 * (segments - 1);
+            let most = size.saturating_add(framing).saturating_add(payload);
+            Ok((most <= max).then_some(most))
+        }
+    }
+}
+
+/// The `as` array of a join (`$lookup`, `$graphLookup`), held to 16 MiB of BSON
+/// like every array an expression builds, and counted as it grows: a document is
+/// counted before it is copied in, and the join is refused with the `413`
+/// `Error::ValueTooLarge` at the document that takes the array over the limit.
+/// The documents it joins are counted by the pipeline's document ceiling; this
+/// bounds their bytes.
+#[derive(Debug)]
+pub struct JoinedArray {
+    budget: crate::expr::ArrayBudget,
+    items: Vec<Bson>,
+}
+
+impl JoinedArray {
+    /// The array `what` builds ("the array $lookup builds"), within 16 MiB.
+    pub fn new(what: &'static str) -> Self {
+        Self::within(what, crate::expr::MAX_ARRAY_BYTES)
+    }
+
+    /// [`Self::new`] within `max` bytes.
+    pub fn within(what: &'static str, max: usize) -> Self {
+        Self { budget: crate::expr::ArrayBudget::new(what, max), items: Vec::new() }
+    }
+
+    /// Join a copy of `doc`, with `Int64` `depth` written at `depth_field` when
+    /// given. Counted before the copy is made.
+    pub fn push_copy(&mut self, doc: &Document, depth_field: Option<(&str, i64)>) -> Result<()> {
+        let mut payload = crate::expr::document_bytes(doc);
+        if let Some((field, _)) = depth_field {
+            // Counted as a new field: a field of that name already there is
+            // replaced, so this can only be high.
+            payload = payload.saturating_add(2 + field.len() + 8);
+        }
+        self.budget.add_payload(payload)?;
+        let mut copy = doc.clone();
+        if let Some((field, depth)) = depth_field {
+            copy.insert(field, Bson::Int64(depth));
+        }
+        self.items.push(Bson::Document(copy));
+        Ok(())
+    }
+
+    /// Join `docs`, which are already built, by moving them in.
+    pub fn push_all(&mut self, docs: Vec<Document>) -> Result<()> {
+        for doc in docs {
+            self.budget.add_payload(crate::expr::document_bytes(&doc))?;
+            self.items.push(Bson::Document(doc));
+        }
+        Ok(())
+    }
+
+    /// The array.
+    pub fn finish(self) -> Bson {
+        Bson::Array(self.items)
+    }
 }
 
 /// Refuse rather than truncate.
@@ -2152,10 +2276,10 @@ enum AccState {
     /// evaluated is replaced by the next, and fails the request only if no
     /// later document comes (ADR-211).
     Last(Option<Result<Bson>>),
-    Push(Vec<Bson>),
+    Push(Vec<Bson>, crate::expr::ArrayBudget),
     /// The members in first-seen order, and the [`group_key`] of each, which
     /// is what makes two values one member (ADR-186).
-    AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>),
+    AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>, crate::expr::ArrayBudget),
     /// The fields merged so far, a later document's value winning.
     MergeObjects(Document, crate::expr::DocBudget),
     Ext(crate::accumulators::State),
@@ -2339,20 +2463,31 @@ fn bucket_auto(
     Ok(out)
 }
 
-fn init((_, acc): &(String, Accumulator)) -> AccState {
+fn init(field: &(String, Accumulator)) -> AccState {
+    init_within(field, crate::expr::MAX_ARRAY_BYTES)
+}
+
+/// [`init`] with the arrays and documents an accumulator builds held to `max`
+/// bytes, counted as they grow.
+fn init_within((_, acc): &(String, Accumulator), max: usize) -> AccState {
     match acc {
         Accumulator::Sum(_) => AccState::Sum(Total::default()),
         Accumulator::Avg(_) => AccState::Avg(Mean::default()),
         Accumulator::Min(_) | Accumulator::Max(_) => AccState::MinMax(None),
         Accumulator::First(_) => AccState::First(None),
         Accumulator::Last(_) => AccState::Last(None),
-        Accumulator::Push(_) => AccState::Push(Vec::new()),
-        Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default()),
-        Accumulator::MergeObjects(_) => AccState::MergeObjects(
-            Document::new(),
-            crate::expr::merge_budget(crate::expr::MAX_ARRAY_BYTES),
+        Accumulator::Push(_) => {
+            AccState::Push(Vec::new(), crate::expr::ArrayBudget::new("the array $push builds", max))
+        }
+        Accumulator::AddToSet(_) => AccState::AddToSet(
+            Vec::new(),
+            Default::default(),
+            crate::expr::ArrayBudget::new("the array $addToSet builds", max),
         ),
-        Accumulator::Ext(spec) => AccState::Ext(spec.init()),
+        Accumulator::MergeObjects(_) => {
+            AccState::MergeObjects(Document::new(), crate::expr::merge_budget(max))
+        }
+        Accumulator::Ext(spec) => AccState::Ext(spec.init_within(max)),
     }
 }
 
@@ -2390,12 +2525,21 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
             Err(err) if !err.is_deferrable() => return Err(err),
             value => *current = Some(value),
         },
-        (AccState::Push(items), Accumulator::Push(e)) => items.push(e.eval_in(scope)?),
-        (AccState::AddToSet(items, keys), Accumulator::AddToSet(e)) => {
+        (AccState::Push(items, budget), Accumulator::Push(e)) => {
+            let v = e.eval_in(scope)?;
+            // Counted before it is kept: the group refuses at the value that takes
+            // its array over the limit.
+            budget.add(&v)?;
+            items.push(v);
+        }
+        (AccState::AddToSet(items, keys, budget), Accumulator::AddToSet(e)) => {
             let v = e.eval_in(scope)?;
             // A member is identified the way `$group` identifies a bucket, and
             // the first occurrence stays (ADR-186).
-            if keys.insert(group_key(&v)) {
+            let key = group_key(&v);
+            if !keys.contains(&key) {
+                budget.add(&v)?;
+                keys.insert(key);
                 items.push(v);
             }
         }
@@ -2417,7 +2561,7 @@ fn finish(state: AccState) -> Result<Bson> {
         AccState::Avg(mean) => mean.to_bson(),
         AccState::MinMax(v) | AccState::First(v) => v.unwrap_or(Bson::Null),
         AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
-        AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
+        AccState::Push(items, _) | AccState::AddToSet(items, ..) => Bson::Array(items),
         AccState::MergeObjects(merged, _) => Bson::Document(merged),
         AccState::Ext(state) => state.finish(),
     })
@@ -2535,6 +2679,118 @@ mod tests {
         assert!(one.is_ok(), "{one:?}");
         let beside = run(vec![doc! {"$addFields": {"n": 1}}], input);
         assert!(beside.is_ok(), "{beside:?}");
+    }
+
+    /// `$push` and `$addToSet` count the array as it grows and refuse at the value
+    /// that takes it over the limit; an `$addToSet` member already there is not
+    /// counted again.
+    #[test]
+    fn push_and_add_to_set_are_held_to_the_limit_as_they_grow() {
+        let fields = [
+            ("p".to_string(), Accumulator::Push(Expr::parse(&Bson::String("$v".into())).unwrap())),
+            (
+                "s".to_string(),
+                Accumulator::AddToSet(Expr::parse(&Bson::String("$v".into())).unwrap()),
+            ),
+        ];
+        // Room for three strings of ten bytes (5, then 2 + 1 + 15 each... counted
+        // as the array encodes: the index digits are one each below ten).
+        let max = crate::expr::array_bytes(3, 3 * 15);
+        for field in &fields {
+            let mut state = init_within(field, max);
+            for i in 0..3 {
+                let row = doc! {"v": format!("{i:010}")};
+                accumulate(&mut state, &field.1, &Scope::new(&row)).unwrap();
+            }
+            let row = doc! {"v": format!("{:010}", 3)};
+            let err = accumulate(&mut state, &field.1, &Scope::new(&row)).unwrap_err();
+            assert!(
+                matches!(err, Error::ValueTooLarge { bytes, max: m, .. }
+                    if bytes == crate::expr::array_bytes(4, 4 * 15) && m == max),
+                "{err:?}"
+            );
+        }
+        // A member that is already in the set costs nothing.
+        let mut state = init_within(&fields[1], max);
+        for i in 0..100 {
+            let row = doc! {"v": format!("{:010}", i % 3)};
+            accumulate(&mut state, &fields[1].1, &Scope::new(&row)).unwrap();
+        }
+        let Bson::Array(members) = finish(state).unwrap() else { panic!("an array") };
+        assert_eq!(members.len(), 3);
+    }
+
+    /// The `as` array of a join is counted before each copy.
+    #[test]
+    fn a_joined_array_is_counted_before_it_is_copied() {
+        let a = doc! {"_id": 1, "t": "x".repeat(100)};
+        let one = crate::expr::array_bytes(1, crate::expr::document_bytes(&a));
+        let mut joined = JoinedArray::within("the array $lookup builds", one);
+        joined.push_copy(&a, None).unwrap();
+        let err = joined.push_copy(&a, None).unwrap_err();
+        assert!(
+            matches!(&err, Error::ValueTooLarge { max, what, .. }
+                if *max == one && *what == "the array $lookup builds"),
+            "{err:?}"
+        );
+        // The refused document was not joined.
+        assert_eq!(joined.finish(), Bson::Array(vec![Bson::Document(a.clone())]));
+        // Exactly the limit is within it; one byte less is not.
+        let mut joined = JoinedArray::within("the array $lookup builds", one - 1);
+        assert!(joined.push_copy(&a, None).is_err());
+        // A depth field is counted, and written as an Int64.
+        let with_depth = doc! {"_id": 1, "t": "x".repeat(100), "d": 3i64};
+        let size = crate::expr::array_bytes(1, crate::expr::document_bytes(&with_depth));
+        let mut joined = JoinedArray::within("the array $graphLookup builds", size);
+        joined.push_copy(&a, Some(("d", 3))).unwrap();
+        assert_eq!(joined.finish(), Bson::Array(vec![Bson::Document(with_depth)]));
+        let mut joined = JoinedArray::within("the array $graphLookup builds", size - 1);
+        assert!(joined.push_copy(&a, Some(("d", 3))).is_err());
+        // Documents already built are moved in and counted the same way.
+        let mut joined = JoinedArray::within(
+            "the array $lookup builds",
+            crate::expr::array_bytes(2, 2 * crate::expr::document_bytes(&a)),
+        );
+        joined.push_all(vec![a.clone(), a.clone()]).unwrap();
+        assert!(joined.push_all(vec![a]).is_err());
+    }
+
+    /// A computed field is refused before it is stored, and `$$ROOT` is counted
+    /// without being copied.
+    #[test]
+    fn a_computed_field_is_counted_before_it_is_stored() {
+        let stage = vec![("a".to_string(), Expr::parse(&Bson::String("$big".into())).unwrap())];
+        let input = doc! {"big": "x".repeat(300), "b": 1};
+        let size = crate::expr::bson_bytes(&Bson::Document(input.clone()));
+        // A new field of 300 bytes: refused, and the target is as it was.
+        let mut target = input.clone();
+        let err =
+            set_computed_within(&mut target, &stage, &Scope::new(&input), size + 300).unwrap_err();
+        assert!(matches!(err, Error::ValueTooLarge { .. }), "{err:?}");
+        assert_eq!(target, input);
+        // A field replaced by a smaller value never counts what it replaced.
+        let mut target = doc! {"a": "y".repeat(1000), "big": "x".repeat(300), "b": 1};
+        let size = crate::expr::bson_bytes(&Bson::Document(target.clone()));
+        set_computed_within(&mut target, &stage, &Scope::new(&input), size).unwrap();
+        // A dotted name that adds nested documents is measured after the write.
+        let dotted =
+            vec![("p.q.r".to_string(), Expr::parse(&Bson::String("$big".into())).unwrap())];
+        let mut target = input.clone();
+        let least = crate::expr::bson_bytes(&Bson::Document(input.clone())) + 2 + 1 + 305;
+        let err =
+            set_computed_within(&mut target, &dotted, &Scope::new(&input), least + 5).unwrap_err();
+        assert!(matches!(err, Error::ValueTooLarge { .. }), "{err:?}");
+        let mut target = input.clone();
+        set_computed_within(&mut target, &dotted, &Scope::new(&input), 1 << 20).unwrap();
+        assert_eq!(target.get_document("p").unwrap().get_document("q").unwrap().len(), 1);
+        // `$$ROOT` is refused from the input's own size, before the copy.
+        let copy = vec![("c".to_string(), Expr::parse(&Bson::String("$$ROOT".into())).unwrap())];
+        let mut target = input.clone();
+        let own = crate::expr::bson_bytes(&Bson::Document(input.clone()));
+        let err = set_computed_within(&mut target, &copy, &Scope::new(&input), own + own - 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::ValueTooLarge { bytes, .. } if bytes >= own + own), "{err:?}");
+        assert_eq!(target, input);
     }
 
     /// A field that replaces another is counted for the difference, so a stage that

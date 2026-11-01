@@ -89,6 +89,7 @@ pub(crate) fn bson_bytes(value: &Bson) -> usize {
 
 /// The bytes an array of an expression is growing to, element by element. `add`
 /// counts an element and refuses at once when the array is over the limit.
+#[derive(Clone, Debug)]
 pub(crate) struct ArrayBudget {
     what: &'static str,
     max: usize,
@@ -189,16 +190,7 @@ impl DocBudget {
 
     /// Refuse a total of `bytes` bytes when it is over the limit.
     fn check(&self, bytes: usize) -> Result<()> {
-        if bytes > self.max {
-            return Err(Error::ValueTooLarge {
-                what: self.what,
-                bytes,
-                max: self.max,
-                limit: DOCUMENT_LIMIT,
-                remedy: "build a smaller document, or leave out the fields that make it large",
-            });
-        }
-        Ok(())
+        check_document_bytes(self.what, bytes, self.max)
     }
 
     /// Count the removal of the field `key`, whose value was `old` bytes.
@@ -212,4 +204,88 @@ impl DocBudget {
 /// until it is known.
 pub(crate) fn check_array_bytes(what: &'static str, bytes: usize, max: usize) -> Result<()> {
     ArrayBudget::new(what, max).check_total(bytes)
+}
+
+/// What the element names of an array of `count` elements take: for each, its
+/// type byte, its decimal index and a terminator. Worked out by the number of
+/// digits the index has, so it takes twenty steps at the most, and saturates.
+pub(crate) fn index_framing(count: u64) -> usize {
+    let mut bytes = 0u128;
+    let mut low = 0u128;
+    let mut digits = 1u32;
+    let count = u128::from(count);
+    while low < count && digits <= 20 {
+        let high = 10u128.pow(digits).min(count);
+        bytes += (high - low) * (2 + u128::from(digits));
+        low = high;
+        digits += 1;
+    }
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
+/// An array of `count` elements whose payloads total `payload` bytes, as BSON.
+pub(crate) fn array_bytes(count: usize, payload: usize) -> usize {
+    5usize.saturating_add(index_framing(count as u64)).saturating_add(payload)
+}
+
+/// The bytes of an array that gives elements back as well as taking them (the
+/// `n` best rows of a `$topN`, the last `n` values of a `$lastN`): the count and
+/// the payload total are kept, and the size is worked out from them, exactly as
+/// the array would encode. The size is checked once the group has kept what it
+/// keeps, so a row that is taken and dropped in the same step does not count.
+#[derive(Clone, Debug)]
+pub(crate) struct HeldArray {
+    what: &'static str,
+    max: usize,
+    count: usize,
+    payload: usize,
+}
+
+impl HeldArray {
+    /// A budget for the array `what` answers, within `max` bytes.
+    pub(crate) fn new(what: &'static str, max: usize) -> Self {
+        Self { what, max, count: 0, payload: 0 }
+    }
+
+    /// Take an element of `payload` bytes.
+    pub(crate) fn take(&mut self, payload: usize) {
+        self.count += 1;
+        self.payload = self.payload.saturating_add(payload);
+    }
+
+    /// Give back an element of `payload` bytes.
+    pub(crate) fn give_back(&mut self, payload: usize) {
+        self.count = self.count.saturating_sub(1);
+        self.payload = self.payload.saturating_sub(payload);
+    }
+
+    /// Refuse the array as it stands when it is over the limit.
+    pub(crate) fn check(&self) -> Result<()> {
+        let bytes = array_bytes(self.count, self.payload);
+        if bytes > self.max {
+            return Err(Error::ValueTooLarge {
+                what: self.what,
+                bytes,
+                max: self.max,
+                limit: ARRAY_LIMIT,
+                remedy: "build a smaller array, or lower n, or $limit or $project the input",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Refuse a document of `bytes` bytes, over `max`, that `what` is about to build or
+/// has just built.
+pub(crate) fn check_document_bytes(what: &'static str, bytes: usize, max: usize) -> Result<()> {
+    if bytes > max {
+        return Err(Error::ValueTooLarge {
+            what,
+            bytes,
+            max,
+            limit: DOCUMENT_LIMIT,
+            remedy: "build a smaller document, or leave out the fields that make it large",
+        });
+    }
+    Ok(())
 }
