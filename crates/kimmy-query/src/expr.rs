@@ -3847,7 +3847,7 @@ mod tests {
                 "{k} references, one probe each"
             );
             // And it still means what it said.
-            assert_eq!(parsed.eval(&doc! {}).unwrap(), Bson::Int64(k as i64));
+            assert_eq!(parsed.eval(&doc! {}).unwrap(), Bson::Int32(k as i32));
         }
         // A name nothing binds is one probe too, and refused.
         let before = LOOKUPS.with(std::cell::Cell::get);
@@ -3889,7 +3889,7 @@ mod tests {
         let shadow = Expr::parse(&Bson::Document(doc! { "$let": { "vars": vars, "in": {
         "$add": [ "$$v7", { "$let": { "vars": { "v7": 100 }, "in": "$$v7" } }, "$$v39" ] } } }))
         .unwrap();
-        assert_eq!(shadow.eval(&doc! {}).unwrap(), Bson::Int64(7 + 100 + 39));
+        assert_eq!(shadow.eval(&doc! {}).unwrap(), Bson::Int32(7 + 100 + 39));
         // A name only an enclosing frame binds is found through a big one.
         let mut vars = Document::new();
         for i in 0..40 {
@@ -3899,7 +3899,7 @@ mod tests {
             Expr::parse(&Bson::Document(doc! { "$let": { "vars": { "outer": 5 }, "in": {
             "$let": { "vars": vars, "in": { "$add": ["$$outer", "$$w3"] } } } } }))
             .unwrap();
-        assert_eq!(through.eval(&doc! {}).unwrap(), Bson::Int64(8));
+        assert_eq!(through.eval(&doc! {}).unwrap(), Bson::Int32(8));
     }
 
     /// The frame size at which a `$let`'s names stop being scanned and are
@@ -3954,7 +3954,7 @@ mod tests {
             { "$let": { "vars": { "x": 2 }, "in": "$$x" } },
             "$$x",
         ] } } };
-        assert_eq!(Expr::parse(&nested.into()).unwrap().eval(&doc! {}).unwrap(), Bson::Int64(3));
+        assert_eq!(Expr::parse(&nested.into()).unwrap().eval(&doc! {}).unwrap(), Bson::Int32(3));
         let leaked = doc! { "$add": [
             { "$let": { "vars": { "x": 2 }, "in": "$$x" } },
             "$$x",
@@ -4083,7 +4083,7 @@ mod tests {
     #[test]
     fn size_counts_a_fanned_path() {
         let d = doc! {"items": [{"sku": "a"}, {"sku": "b"}]};
-        assert_eq!(on(doc! {"$size": "$items.sku"}.into(), d), Bson::Int64(2));
+        assert_eq!(on(doc! {"$size": "$items.sku"}.into(), d), Bson::Int32(2));
     }
 
     #[test]
@@ -4117,7 +4117,7 @@ mod tests {
         // The same variable bound to the fanned path itself.
         let expr =
             doc! {"$let": {"vars": {"names": "$items.tags.name"}, "in": {"$size": "$$names"}}};
-        assert_eq!(on(expr.into(), d), Bson::Int64(3));
+        assert_eq!(on(expr.into(), d), Bson::Int32(3));
     }
 
     #[test]
@@ -4189,9 +4189,9 @@ mod tests {
 
     #[test]
     fn integer_arithmetic_stays_integral() {
-        assert_eq!(ok(doc! {"$add": [2, 3]}.into()), Bson::Int64(5));
-        assert_eq!(ok(doc! {"$subtract": [10, 3]}.into()), Bson::Int64(7));
-        assert_eq!(ok(doc! {"$multiply": [6, 7]}.into()), Bson::Int64(42));
+        assert_eq!(ok(doc! {"$add": [2, 3]}.into()), Bson::Int32(5));
+        assert_eq!(ok(doc! {"$subtract": [10, 3]}.into()), Bson::Int32(7));
+        assert_eq!(ok(doc! {"$multiply": [6, 7]}.into()), Bson::Int32(42));
     }
 
     #[test]
@@ -4234,7 +4234,7 @@ mod tests {
 
     #[test]
     fn mod_keeps_integers_integral() {
-        assert_eq!(ok(doc! {"$mod": [7, 3]}.into()), Bson::Int64(1));
+        assert_eq!(ok(doc! {"$mod": [7, 3]}.into()), Bson::Int32(1));
     }
 
     #[test]
@@ -4252,8 +4252,8 @@ mod tests {
 
     #[test]
     fn variadic_operators_take_more_than_two_arguments() {
-        assert_eq!(ok(doc! {"$add": [1, 2, 3, 4]}.into()), Bson::Int64(10));
-        assert_eq!(ok(doc! {"$multiply": [2, 3, 4]}.into()), Bson::Int64(24));
+        assert_eq!(ok(doc! {"$add": [1, 2, 3, 4]}.into()), Bson::Int32(10));
+        assert_eq!(ok(doc! {"$multiply": [2, 3, 4]}.into()), Bson::Int32(24));
     }
 
     // -- date arithmetic --------------------------------------------------
@@ -4350,7 +4350,7 @@ mod tests {
 
     #[test]
     fn strlen_counts_code_points() {
-        assert_eq!(on(doc! {"$strLenCP": "$s"}.into(), doc! {"s": "héllo"}), Bson::Int64(5));
+        assert_eq!(on(doc! {"$strLenCP": "$s"}.into(), doc! {"s": "héllo"}), Bson::Int32(5));
     }
 
     // -- conditionals -----------------------------------------------------
@@ -4627,7 +4627,7 @@ mod tests {
         let expr = doc! {"$let": {"vars": {"a": 1}, "in": {
             "$let": {"vars": {"b": {"$add": ["$$a", 1]}}, "in": "$$b"}
         }}};
-        assert_eq!(ok(expr.into()), Bson::Int64(2));
+        assert_eq!(ok(expr.into()), Bson::Int32(2));
     }
 
     #[test]
@@ -4707,7 +4707,7 @@ mod tests {
             "in": {"$add": ["$$a", "$$a", "$$a", "$$b"]},
         }};
         let (evaluated, answer) = counted(thrice, doc! {"qty": 2, "price": 5});
-        assert_eq!(answer.unwrap(), Bson::Int64(33));
+        assert_eq!(answer.unwrap(), Bson::Int32(33));
         assert_eq!(evaluated, 2, "one evaluation each for `a` and `b`");
     }
 
@@ -4732,7 +4732,7 @@ mod tests {
             "in": {"$add": ["$$y", "$$y"]},
         }}}};
         let (evaluated, answer) = counted(map, doc! {});
-        assert_eq!(answer.unwrap(), bson::bson!([20_i64, 40_i64, 60_i64]));
+        assert_eq!(answer.unwrap(), bson::bson!([20_i32, 40_i32, 60_i32]));
         assert_eq!(evaluated, 3, "one evaluation per element");
 
         let filter = doc! {"$filter": {"input": [1, 2, 3, 4], "as": "e", "cond": {"$let": {
@@ -4745,7 +4745,7 @@ mod tests {
             "vars": {"next": {"$add": ["$$value", "$$this"]}},
             "in": "$$next",
         }}}};
-        assert_eq!(on(reduce.into(), doc! {}), Bson::Int64(6));
+        assert_eq!(on(reduce.into(), doc! {}), Bson::Int32(6));
     }
 
     /// A variable is bound to the scope around the `$let`, and so reads an
@@ -4757,7 +4757,7 @@ mod tests {
             "vars": {"x": {"$add": ["$$x", 10]}, "z": {"$size": "$name"}},
             "in": "$$x",
         }}}};
-        assert_eq!(on(expr.into(), doc! {"name": "text"}), Bson::Int64(11));
+        assert_eq!(on(expr.into(), doc! {"name": "text"}), Bson::Int32(11));
     }
 
     /// `n` nested `$let`s, each variable's expression `depth` `$add`s deep over the
@@ -4809,7 +4809,7 @@ mod tests {
                 .unwrap()
                 .join()
                 .unwrap();
-            assert_eq!(answer.unwrap(), Bson::Int64((N * depth + 1) as i64));
+            assert_eq!(answer.unwrap(), Bson::Int32((N * depth + 1) as i32));
         };
         if std::env::var_os("KIMMY_STACK_PROBE").is_some() {
             run();
@@ -4840,7 +4840,7 @@ mod tests {
     /// variables read one after another are fine too.
     #[test]
     fn variables_read_through_each_other_are_not_limited() {
-        assert_eq!(ok(let_chain(40, 1)), Bson::Int64(41));
+        assert_eq!(ok(let_chain(40, 1)), Bson::Int32(41));
         let mut vars = Document::new();
         let mut sum = Vec::new();
         for i in 0..100 {
@@ -4848,7 +4848,7 @@ mod tests {
             sum.push(Bson::String(format!("$$w{i}")));
         }
         let wide = doc! {"$let": {"vars": vars, "in": {"$add": sum}}};
-        assert_eq!(ok(wide.into()), Bson::Int64((1..=100).sum::<i64>()));
+        assert_eq!(ok(wide.into()), Bson::Int32((1..=100).sum::<i32>()));
     }
 
     /// A `$let` outside a `$map` whose variable reads the document is evaluated
@@ -4860,7 +4860,7 @@ mod tests {
             "$map": {"input": [1, 2, 3], "in": {"$multiply": ["$$this", "$$t"]}}
         }}};
         let (evaluated, answer) = counted(expr, doc! {"a": 2, "b": 3});
-        assert_eq!(answer.unwrap(), bson::bson!([5_i64, 10_i64, 15_i64]));
+        assert_eq!(answer.unwrap(), bson::bson!([5_i32, 10_i32, 15_i32]));
         assert_eq!(evaluated, 1);
     }
 
@@ -4872,7 +4872,7 @@ mod tests {
             "vars": {"x": "$$this"},
             "in": {"$map": {"input": [1, 2], "in": {"$add": ["$$x", "$$this"]}}},
         }}}};
-        assert_eq!(on(expr.into(), doc! {}), bson::bson!([[11_i64, 12_i64], [21_i64, 22_i64]]));
+        assert_eq!(on(expr.into(), doc! {}), bson::bson!([[11_i32, 12_i32], [21_i32, 22_i32]]));
     }
 
     #[test]
@@ -4896,7 +4896,7 @@ mod tests {
         let bound = Bson::Int32(40);
         let frame = [("order_qty", &bound)];
         let d = doc! {"qty": 2};
-        assert_eq!(expr.eval_in(&Scope::with_bindings(&d, &frame)).unwrap(), Bson::Int64(42));
+        assert_eq!(expr.eval_in(&Scope::with_bindings(&d, &frame)).unwrap(), Bson::Int32(42));
         // Evaluating with fewer bindings than it was parsed with is an error,
         // not a null.
         assert!(expr.eval(&d).is_err());
@@ -4910,8 +4910,8 @@ mod tests {
 
     #[test]
     fn size_counts_elements_and_refuses_a_non_array() {
-        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": [1, 2, 3]}), Bson::Int64(3));
-        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": []}), Bson::Int64(0));
+        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": [1, 2, 3]}), Bson::Int32(3));
+        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": []}), Bson::Int32(0));
         assert_eq!(on(doc! {"$size": "$gone"}.into(), doc! {}), Bson::Null);
         assert!(ev(doc! {"$size": "text"}.into(), &Document::new()).is_err());
         assert!(ev(doc! {"$size": 5}.into(), &Document::new()).is_err());
@@ -4991,14 +4991,14 @@ mod tests {
     #[test]
     fn index_of_array_finds_the_first_match_within_a_window() {
         let d = doc! {"xs": ["a", "b", "a", "c"]};
-        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a"]}.into(), d.clone()), Bson::Int64(0));
-        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 1]}.into(), d.clone()), Bson::Int64(2));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a"]}.into(), d.clone()), Bson::Int32(0));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 1]}.into(), d.clone()), Bson::Int32(2));
         assert_eq!(
             on(doc! {"$indexOfArray": ["$xs", "c", 0, 3]}.into(), d.clone()),
-            Bson::Int64(-1)
+            Bson::Int32(-1)
         );
-        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "z"]}.into(), d.clone()), Bson::Int64(-1));
-        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 9]}.into(), d.clone()), Bson::Int64(-1));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "z"]}.into(), d.clone()), Bson::Int32(-1));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 9]}.into(), d.clone()), Bson::Int32(-1));
         assert_eq!(on(doc! {"$indexOfArray": ["$gone", "a"]}.into(), d.clone()), Bson::Null);
         assert!(ev(doc! {"$indexOfArray": ["$xs", "a", -1]}.into(), &d).is_err());
         assert!(ev(doc! {"$indexOfArray": ["text", "a"]}.into(), &d).is_err());
@@ -5022,8 +5022,8 @@ mod tests {
         assert!(ev(doc! {"$reverseArray": "abc"}.into(), &Document::new()).is_err());
     }
 
-    fn ints(items: Vec<i64>) -> Bson {
-        Bson::Array(items.into_iter().map(Bson::Int64).collect())
+    fn ints(items: Vec<i32>) -> Bson {
+        Bson::Array(items.into_iter().map(Bson::Int32).collect())
     }
 
     #[test]
@@ -5191,7 +5191,7 @@ mod tests {
                     .into(),
                 d.clone()
             ),
-            Bson::Int64(10)
+            Bson::Int32(10)
         );
         // Strings, to show the accumulator is any value.
         assert_eq!(
@@ -5236,7 +5236,7 @@ mod tests {
             "in": {"$add": ["$$value", "$$this.qty"]},
         }};
         let d = doc! {"items": [{"qty": 1}, {"qty": 2}, {"qty": 5}]};
-        assert_eq!(on(expr.into(), d), Bson::Int64(7));
+        assert_eq!(on(expr.into(), d), Bson::Int32(7));
     }
 
     // -- the $sum accumulator's exactness ---------------------------------
@@ -5264,9 +5264,9 @@ mod tests {
     fn total_ignores_non_numbers_and_starts_at_zero() {
         let mut t = Total::default();
         t.add(&Bson::String("nope".into()));
-        assert_eq!(t.to_bson(), Bson::Int64(0));
+        assert_eq!(t.to_bson(), Bson::Int32(0));
         t.add(&Bson::Int32(3));
-        assert_eq!(t.to_bson(), Bson::Int64(3));
+        assert_eq!(t.to_bson(), Bson::Int32(3));
     }
 
     #[test]
@@ -5481,8 +5481,8 @@ mod tests {
     fn a_conversion_composes_with_arithmetic() {
         // The motivating shape: a quantity stored as text on some rows.
         let expr = doc! {"$multiply": [{"$toInt": "$qty"}, 2]};
-        assert_eq!(on(expr.clone().into(), doc! {"qty": "21"}), Bson::Int64(42));
-        assert_eq!(on(expr.into(), doc! {"qty": 21}), Bson::Int64(42));
+        assert_eq!(on(expr.clone().into(), doc! {"qty": "21"}), Bson::Int32(42));
+        assert_eq!(on(expr.into(), doc! {"qty": 21}), Bson::Int32(42));
     }
 }
 
@@ -6120,11 +6120,11 @@ mod decimal128 {
         assert_eq!(at(bson!({ "$in": ["$v", "$xs"] }), b("0.1")), f);
         assert_eq!(at(bson!({ "$in": ["$v", "$xs"] }), Bson::Int32(5)), f);
         assert_eq!(at(bson!({ "$in": [b("2.50"), "$xs"] }), Bson::Null), t);
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("2.5")] }), Bson::Null), Bson::Int64(1));
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", 2.5] }), Bson::Null), Bson::Int64(1));
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("0.1")] }), Bson::Null), Bson::Int64(-1));
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("1")), Bson::Int64(0));
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("7")), Bson::Int64(-1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("2.5")] }), Bson::Null), Bson::Int32(1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", 2.5] }), Bson::Null), Bson::Int32(1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("0.1")] }), Bson::Null), Bson::Int32(-1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("1")), Bson::Int32(0));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("7")), Bson::Int32(-1));
     }
 
     fn dec(text: &str) -> bson::Decimal128 {
@@ -6880,13 +6880,13 @@ mod arrays {
         assert_eq!(ok(bson!({"$in": ["$b", ["$a", 3]]})), bson!(false));
         assert_eq!(
             ok(bson!({"$concatArrays": ["$xs", ["$a", {"$add": ["$b", 1]}]]})),
-            bson!([1, 2, 1, 3_i64])
+            bson!([1, 2, 1, 3_i32])
         );
-        assert_eq!(ok(bson!({"$size": [["$a", "$b", "$s"]]})), bson!(3_i64));
+        assert_eq!(ok(bson!({"$size": [["$a", "$b", "$s"]]})), bson!(3));
         // An operator, a document and a variable as elements.
         assert_eq!(
             ok(bson!([{"$add": ["$a", "$b"]}, {"k": "$s"}, "$$ROOT.a", "plain"])),
-            bson!([3_i64, {"k": "text"}, 1, "plain"])
+            bson!([3, {"k": "text"}, 1, "plain"])
         );
     }
 
@@ -6901,7 +6901,7 @@ mod arrays {
     fn a_missing_field_is_null_in_its_place() {
         assert_eq!(ok(bson!(["$a", "$missing", "$b"])), bson!([1, null, 2]));
         assert_eq!(ok(bson!({"$concatArrays": [["$missing"], [1]]})), bson!([null, 1]));
-        assert_eq!(ok(bson!({"$size": [["$missing", "$nope"]]})), bson!(2_i64));
+        assert_eq!(ok(bson!({"$size": [["$missing", "$nope"]]})), bson!(2_i32));
         assert_eq!(ok(bson!({"$arrayElemAt": [["$missing", "$b"], 1]})), bson!(2));
         // An array holding a null is an array, not a null: the operators that
         // propagate a null argument do not see one.
@@ -6922,7 +6922,7 @@ mod arrays {
     fn an_element_reads_the_variables_of_the_scope_it_sits_in() {
         let mapped =
             bson!({"$map": {"input": "$xs", "as": "x", "in": ["$$x", {"$multiply": ["$$x", 10]}]}});
-        assert_eq!(ok(mapped), bson!([[1, 10_i64], [2, 20_i64]]));
+        assert_eq!(ok(mapped), bson!([[1, 10_i32], [2, 20_i32]]));
         let filtered = bson!({"$filter": {"input": "$xs", "cond": {"$in": ["$$this", ["$a", 5]]}}});
         assert_eq!(ok(filtered), bson!([1]));
         let reduced = bson!({"$reduce": {
@@ -7107,7 +7107,7 @@ mod arrays {
         );
         assert_eq!(
             ok(bson!({"$map": {"input": ["$a", "$b"], "as": "x", "in": {"$add": ["$$x", 1]}}})),
-            bson!([2_i64, 3_i64])
+            bson!([2_i32, 3_i32])
         );
         assert_eq!(
             ok(bson!({"$filter": {"input": ["$a", "$b"], "cond": {"$gt": ["$$this", 1]}}})),
@@ -7152,7 +7152,7 @@ mod arrays {
             prop_assert_eq!(unfolded.eval(&row()).unwrap(), array.clone());
             // And through an operator that takes it as one operand.
             let sized = Expr::parse(&bson!({"$size": [array.clone()]})).unwrap();
-            prop_assert_eq!(sized.eval(&row()).unwrap(), Bson::Int64(items.len() as i64));
+            prop_assert_eq!(sized.eval(&row()).unwrap(), Bson::Int32(items.len() as i32));
         }
     }
 }

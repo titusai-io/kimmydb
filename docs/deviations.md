@@ -17,11 +17,10 @@ Status meanings:
 
 ---
 
-## 🟡 The string, document and type operators: integer results are `Int64`, a few edge cases are read narrowly, and a missing value is told apart only where the reference makes it matter
+## 🟡 The string, document and type operators: a few edge cases are read narrowly, and a missing value is told apart only where the reference makes it matter
 
 **Raised 2026-10-31, with ADR-260.** `$trim`, `$ltrim`, `$rtrim`, `$indexOfCP`, `$indexOfBytes`, `$regexMatch`, `$regexFind`, `$regexFindAll`, `$replaceOne`, `$replaceAll`, `$strcasecmp`, `$strLenBytes`, `$substrBytes`, `$mergeObjects` (expression and accumulator), `$getField`, `$setField`, `$unsetField`, `$type` and `$isNumber` follow the reference; these are the differences.
 
-- **Integer results are `Int64`** (`$indexOfCP`, `$indexOfBytes`, `$strLenBytes`, `idx` of `$regexFind`), as the rest of the expression layer; the reference gives `Int32`. `$type` of a computed integer is therefore `"long"` where the reference says `"int"` (the entry on numbers above). `$strcasecmp` gives `Int32`, as `$cmp` does.
 - **The regex operators are not PCRE.** They use the `$regex` filter's engine: no backreferences or lookaround (a `400` when the pattern is parsed or evaluated), no atomic groups (`(?>)`), no `\Q..\E`, no `\Z`, `\G`, `\h` or `\R` (and no other PCRE escape outside `regex`'s syntax: `\H`, `\X`, `\K`, `\C`), which work in the reference, **no possessive quantifiers** (`a*+`, `a++`, `a?+`, `a{n,m}+`: the engine would read them as a repetition of a repetition, so `a*+a` would match `aa` where the reference matches nothing), a size limit per pattern, and a count shared with the pipeline's other patterns (32). The two refusals of the engine's own kind are a `400` naming the construct, in the `$regex` filter, the three operators, a `$jsonSchema` filter and a validator being set; a validator **already stored** whose pattern holds a possessive quantifier still loads, read as the repetition of a repetition it was read as before, so it keeps validating until it is replaced. The flags are `i`, `m`, `s`, `x` and `u` (`u` is accepted and changes nothing). `\d`, `\w`, `\s` and `\b` are ASCII, as the reference's are; the rest is Unicode, and `i` folds `é` with `É`, as the reference does. Under `i`, a `\w` written inside brackets (`[\w-]`) also takes in U+017F, which the reference's does not (it takes in U+212A there, as this does; outside brackets neither takes in either, here and there). `$` and `\Z` differ in the way the `$regex` filter's do (`$` matches only at the very end, not before a final newline). Matching is by code point, and `idx` counts code points. The same engine now reads `\d`, `\w` and `\s` as ASCII in the `$regex` filter and in a validator's `pattern`, which is a change from 0.58.0 (CHANGELOG, "Breaking").
 - **A computed `regex` is compiled per document** (the last pattern is kept), outside the pipeline's budget; each pattern is still bounded by the per-pattern size limit.
 - **`$strcasecmp` and `$substrBytes` coerce only strings, null and numbers** to text, a double as `%g` prints it, as the reference does. The reference also renders a date, a timestamp, code and a symbol; here those are a `400`.
@@ -32,9 +31,9 @@ Status meanings:
 - **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document, as the reference refuses it (`40400`).
 - **`$trim`'s default set** is the reference's list (see aggregation.md): it does not strip U+0085, U+2028, U+202F or U+3000, and nor does this.
 
-**Why.** The first is the standing choice of the layer; the rest refuse or choose narrowly where the reference's behaviour cannot be honoured, or is not worth honouring (invalid UTF-8). Every case the review ran against a reference server is in `q8-probes/`, and the delta review re-runs it.
+**Why.** These refuse or choose narrowly where the reference's behaviour cannot be honoured, or is not worth honouring (invalid UTF-8). The integer results of `$indexOfCP`, `$indexOfBytes`, `$strLenBytes` and `idx` of `$regexFind` are `Int32`, as the reference's are ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)); they were `Int64` until 0.59.0. Every case the review ran against a reference server is in `q8-probes/`, and the delta review re-runs it.
 
-**What it costs.** A pipeline ported from the reference server that relies on a backreference, a possessive quantifier, a date coerced to a string by `$strcasecmp`, or an `Int32` result type will be refused or differ.
+**What it costs.** A pipeline ported from the reference server that relies on a backreference, a possessive quantifier or a date coerced to a string by `$strcasecmp` will be refused or differ.
 
 ---
 
@@ -262,9 +261,13 @@ differ from other systems' versions of the same names:
   is `2.67499999999999982…`, and `{$round: [0.125, 2]}` is `0.12`. A system that
   rounds a double through its shortest text answers `2.68` for the first. The
   rule is ADR-252's for a double meeting a decimal: its value is the exact one.
-- **An integer result is always `Int64`**, an `Int32` argument included, as in the rest of the arithmetic;
-  a result past `Int64` (`$pow: [2, 63]`, `$abs` of the
-  smallest `Int64`, `$round` rounding up past it) is a double.
+- **An integer result keeps the reference's width** (ADR-268): `$abs`, `$ceil`,
+  `$floor`, `$round` and `$trunc` of an `Int32` are an `Int32` (`$abs` of the
+  smallest `Int32` is an `Int64`), `$pow` of two `Int32`s is an `Int32` while it
+  fits. A result past `Int64` (`$pow: [2, 63]`, `$abs` of the
+  smallest `Int64`, `$round` rounding up past it) is a double. The reference
+  refuses `$abs` of the smallest `Int64` (`28680`); here it is a double, as an
+  overflowing `$add` is.
 - **A negative base to a power that is not a whole number is `400`**, where a
   math library answers `NaN`. So are `$sqrt` of a negative number and `$ln` and
   `$log10` of zero or less; a `NaN` argument gives `NaN`, and the refusal is for
@@ -895,8 +898,8 @@ follow the expression layer's standing rule — *null propagates, a type violati
 refuses* — and in six places that is a strict superset of MongoDB, which
 errors instead.
 
-**Ruled 2026-09-29, all five points in this entry kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).**
-The null leniency, the missing-versus-null difference, `$range`'s `Int64`,
+**Ruled 2026-09-29, four of the five points in this entry kept, and the fifth, `$range`'s `Int64`, superseded by [ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width) ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).**
+The null leniency, the missing-versus-null difference,
 the closed key sets and the refused combined `$lookup` each stay, and each is
 stated plainly in [aggregation.md](aggregation.md#arrays) and below. Nothing
 here is scheduled to change.
@@ -922,9 +925,7 @@ finds the documents whose `tags` is not an array, a missing one included.
 **Three smaller divergences, same entry.** `$arrayElemAt` out of range and
 `$first`/`$last` on an empty array are **null** rather than MongoDB's *missing*
 — an expression here always yields a value, and a projected field is therefore
-present with null rather than absent. `$range` produces `Int64` elements where
-MongoDB produces `Int32`, as every integer result of the expression layer does
-(see the module notes on numbers). And `$filter`, `$map`, `$reduce` and `$let`
+present with null rather than absent. And `$filter`, `$map`, `$reduce` and `$let`
 **refuse a key they do not know** (`condition` for `cond`), where MongoDB
 ignores it; that is stricter, and only turns a silently wrong pipeline into an
 error (`{"$filter": {"input": "$items", "condition": …}}` is a `400` naming
@@ -944,12 +945,11 @@ the following stage, which keeps the single pass. Closing this would mean
 combining the indexed pass with the per-document loop; not planned until
 someone needs it.
 
-**`$range` and the other integer results.** A result of the expression
-language that is an integer is an `Int64`, `$range`'s elements included, so
-`{$type: {$arrayElemAt: [{$range: [0, 3]}, 0]}}` is `"long"` here and `"int"`
-there. The numbers are the same; what differs is `$type`, a `$switch` on it,
-and a typed client that reads the element into a 32-bit field. Kept, with the
-rule it follows.
+**`$range` and the other integer results** are the reference's widths since
+ADR-268 (0.59.0): `$range`'s elements, `$size` and `$indexOfArray` are `Int32`,
+where they were `Int64` (the earlier ruling that kept `$range`'s `Int64` is
+superseded; nothing here differs from the reference any more). Nothing is
+migrated: a stored value keeps its own type.
 
 **Missing is null in an expression.** `{$addFields: {head: {$first:
 "$lines"}}}` over a document whose `lines` is `[]` writes `head: null`, where

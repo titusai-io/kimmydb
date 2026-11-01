@@ -63,19 +63,19 @@ fn double(value: &Bson) -> f64 {
 
 #[test]
 fn abs_keeps_the_type_and_falls_to_a_double_only_where_an_int64_cannot_hold_it() {
-    assert_eq!(val(one("$abs", Bson::Int32(-5)), none()), Bson::Int64(5));
+    assert_eq!(val(one("$abs", Bson::Int32(-5)), none()), Bson::Int32(5));
     assert_eq!(val(one("$abs", Bson::Int64(7)), none()), Bson::Int64(7));
     assert_eq!(val(one("$abs", Bson::Double(-2.5)), none()), Bson::Double(2.5));
     assert_eq!(val(one("$abs", Bson::Double(-0.0)), none()), Bson::Double(0.0));
     assert_eq!(val(one("$abs", Bson::Int64(i64::MIN)), none()), Bson::Double(2f64.powi(63)));
-    assert_eq!(val(one("$abs", Bson::String("$n".into())), doc! {"n": -3}), Bson::Int64(3));
+    assert_eq!(val(one("$abs", Bson::String("$n".into())), doc! {"n": -3}), Bson::Int32(3));
     same(val(one("$abs", dec("-1.50")), none()), "1.50");
     same(val(one("$abs", dec("-0E+3")), none()), "0E+3");
 }
 
 #[test]
 fn ceil_and_floor_leave_an_integer_alone_and_a_double_a_double() {
-    assert_eq!(val(one("$ceil", Bson::Int32(7)), none()), Bson::Int64(7));
+    assert_eq!(val(one("$ceil", Bson::Int32(7)), none()), Bson::Int32(7));
     assert_eq!(val(one("$ceil", Bson::Double(1.2)), none()), Bson::Double(2.0));
     assert_eq!(val(one("$floor", Bson::Double(-1.2)), none()), Bson::Double(-2.0));
     assert_eq!(val(one("$floor", Bson::Double(2.0)), none()), Bson::Double(2.0));
@@ -217,7 +217,7 @@ fn round_of_an_integer_with_a_negative_place_rounds_half_to_even_and_stays_an_in
     assert_eq!(round(Bson::Int64(15), -1), Bson::Int64(20));
     assert_eq!(round(Bson::Int64(-15), -1), Bson::Int64(-20));
     assert_eq!(round(Bson::Int64(-25), -1), Bson::Int64(-20));
-    assert_eq!(round(Bson::Int32(7), 0), Bson::Int64(7));
+    assert_eq!(round(Bson::Int32(7), 0), Bson::Int32(7));
     assert_eq!(round(Bson::Int64(7), 5), Bson::Int64(7));
     assert_eq!(round(Bson::Int64(i64::MAX), -20), Bson::Int64(0));
     // Rounding up to a multiple past Int64 is a double.
@@ -285,13 +285,13 @@ fn pow(base: Bson, exponent: Bson) -> Bson {
 
 #[test]
 fn pow_of_integers_is_an_integer_while_it_fits() {
-    assert_eq!(pow(Bson::Int32(2), Bson::Int32(10)), Bson::Int64(1024));
+    assert_eq!(pow(Bson::Int32(2), Bson::Int32(10)), Bson::Int32(1024));
     assert_eq!(pow(Bson::Int32(2), Bson::Int32(62)), Bson::Int64(1 << 62));
-    assert_eq!(pow(Bson::Int32(-2), Bson::Int32(3)), Bson::Int64(-8));
+    assert_eq!(pow(Bson::Int32(-2), Bson::Int32(3)), Bson::Int32(-8));
     assert_eq!(pow(Bson::Int32(-2), Bson::Int32(63)), Bson::Int64(i64::MIN));
-    assert_eq!(pow(Bson::Int32(7), Bson::Int32(0)), Bson::Int64(1));
-    assert_eq!(pow(Bson::Int32(0), Bson::Int32(0)), Bson::Int64(1));
-    assert_eq!(pow(Bson::Int32(0), Bson::Int32(5)), Bson::Int64(0));
+    assert_eq!(pow(Bson::Int32(7), Bson::Int32(0)), Bson::Int32(1));
+    assert_eq!(pow(Bson::Int32(0), Bson::Int32(0)), Bson::Int32(1));
+    assert_eq!(pow(Bson::Int32(0), Bson::Int32(5)), Bson::Int32(0));
     assert_eq!(pow(Bson::Int32(1), Bson::Int64(i64::MAX)), Bson::Int64(1));
     assert_eq!(pow(Bson::Int32(-1), Bson::Int64(i64::MAX)), Bson::Int64(-1));
     assert_eq!(pow(Bson::Int32(0), Bson::Int64(i64::MAX)), Bson::Int64(0));
@@ -307,7 +307,7 @@ fn pow_with_a_negative_or_fractional_power_is_a_double() {
     assert_eq!(pow(Bson::Double(2.0), Bson::Int32(3)), Bson::Double(8.0));
     assert_eq!(pow(Bson::Double(-2.0), Bson::Int32(3)), Bson::Double(-8.0));
     assert_eq!(pow(Bson::Double(-2.0), Bson::Double(2.0)), Bson::Double(4.0));
-    assert_eq!(pow(Bson::Int32(0), Bson::Int32(0)), Bson::Int64(1));
+    assert_eq!(pow(Bson::Int32(0), Bson::Int32(0)), Bson::Int32(1));
     assert_eq!(pow(Bson::Double(0.0), Bson::Double(2.0)), Bson::Double(0.0));
     assert_eq!(pow(Bson::Double(f64::INFINITY), Bson::Int32(2)), Bson::Double(f64::INFINITY));
     assert_eq!(pow(Bson::Double(10.0), Bson::Int32(400)), Bson::Double(f64::INFINITY));

@@ -451,7 +451,9 @@ pub(super) fn match_bytes(text: &str, m: &RegexMatch, index: usize) -> usize {
         .sum();
     let document = 4
         + (1 + "match".len() + 1 + string(m.end - m.start))
-        + (1 + "idx".len() + 1 + 8)
+        // `idx` is an `Int32`: a code point index in a string no document can hold
+        // more than 2^31 of.
+        + (1 + "idx".len() + 1 + 4)
         + (1 + "captures".len() + 1 + 4 + captures + 1)
         + 1;
     1 + digits(index) + 1 + document

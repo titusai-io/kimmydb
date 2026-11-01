@@ -31,9 +31,9 @@ fn bucket_counts_each_range_and_names_it_by_its_lower_boundary() {
     assert_eq!(
         out,
         vec![
-            doc! {"_id": 0, "count": 3i64},
-            doc! {"_id": 10, "count": 2i64},
-            doc! {"_id": 20, "count": 2i64},
+            doc! {"_id": 0, "count": 3},
+            doc! {"_id": 10, "count": 2},
+            doc! {"_id": 20, "count": 2},
         ]
     );
 }
@@ -66,7 +66,7 @@ fn only_buckets_that_received_a_document_are_answered_in_boundary_order() {
         prices(&[35, 5]),
     )
     .unwrap();
-    assert_eq!(out, vec![doc! {"_id": 0, "count": 1i64}, doc! {"_id": 30, "count": 1i64}]);
+    assert_eq!(out, vec![doc! {"_id": 0, "count": 1}, doc! {"_id": 30, "count": 1}]);
     assert_eq!(
         run(doc! {"$bucket": {"groupBy": "$price", "boundaries": [0, 10]}}, vec![]).unwrap(),
         Vec::<Document>::new()
@@ -84,7 +84,7 @@ fn the_default_bucket_takes_every_value_no_range_holds_and_comes_last() {
         input,
     )
     .unwrap();
-    assert_eq!(out, vec![doc! {"_id": 0, "count": 1i64}, doc! {"_id": "none", "count": 5i64}]);
+    assert_eq!(out, vec![doc! {"_id": 0, "count": 1}, doc! {"_id": "none", "count": 5}]);
 }
 
 #[test]
@@ -124,8 +124,8 @@ fn output_replaces_the_count_and_takes_any_accumulator() {
     assert_eq!(
         out,
         vec![
-            doc! {"_id": 0, "total": 3i64, "ids": [0, 1], "top": 2},
-            doc! {"_id": 10, "total": 50i64, "ids": [2], "top": 50},
+            doc! {"_id": 0, "total": 3, "ids": [0, 1], "top": 2},
+            doc! {"_id": 10, "total": 50, "ids": [2], "top": 50},
         ]
     );
 }
@@ -148,13 +148,13 @@ fn boundaries_of_any_one_kind_work_and_numbers_of_every_type_are_one_kind() {
         vec![doc! {"at": bson::DateTime::from_millis(1_500)}],
     )
     .unwrap();
-    assert_eq!(out, vec![doc! {"_id": a, "count": 1i64}]);
+    assert_eq!(out, vec![doc! {"_id": a, "count": 1}]);
     let out = run(
         doc! {"$bucket": {"groupBy": "$name", "boundaries": ["a", "m", "z"]}},
         vec![doc! {"name": "bob"}, doc! {"name": "tom"}],
     )
     .unwrap();
-    assert_eq!(out, vec![doc! {"_id": "a", "count": 1i64}, doc! {"_id": "m", "count": 1i64}]);
+    assert_eq!(out, vec![doc! {"_id": "a", "count": 1}, doc! {"_id": "m", "count": 1}]);
     // A value of another kind than the boundaries' is in no range.
     let err = run(doc! {"$bucket": {"groupBy": "$price", "boundaries": ["a", "z"]}}, prices(&[5]))
         .unwrap_err()
@@ -170,7 +170,7 @@ fn a_decimal_value_is_compared_by_its_value() {
         vec![doc! {"price": dec("9.99")}, doc! {"price": dec("0.00")}, doc! {"price": dec("10.0")}],
     )
     .unwrap();
-    assert_eq!(out, vec![doc! {"_id": 0, "count": 2i64}, doc! {"_id": "high", "count": 1i64}]);
+    assert_eq!(out, vec![doc! {"_id": 0, "count": 2}, doc! {"_id": "high", "count": 1}]);
 }
 
 #[test]
@@ -233,9 +233,9 @@ fn auto(buckets: i32, values: &[i32]) -> Vec<Document> {
     run(doc! {"$bucketAuto": {"groupBy": "$price", "buckets": buckets}}, prices(values)).unwrap()
 }
 
-fn range(out: &Document) -> (i32, i32, i64) {
+fn range(out: &Document) -> (i32, i32, i32) {
     let id = out.get_document("_id").unwrap();
-    (id.get_i32("min").unwrap(), id.get_i32("max").unwrap(), out.get_i64("count").unwrap())
+    (id.get_i32("min").unwrap(), id.get_i32("max").unwrap(), out.get_i32("count").unwrap())
 }
 
 #[test]

@@ -228,7 +228,7 @@ fn null_propagates_and_other_types_keep_the_old_words() {
         "invalid query: $mod needs numbers, found a Decimal128"
     );
     // Arithmetic with no decimal in it is what it always was.
-    assert_eq!(val(op("$add", vec![Bson::Int32(1), Bson::Int32(2)]), none()), Bson::Int64(3));
+    assert_eq!(val(op("$add", vec![Bson::Int32(1), Bson::Int32(2)]), none()), Bson::Int32(3));
     assert_eq!(val(op("$divide", vec![Bson::Int32(1), Bson::Int32(2)]), none()), Bson::Double(0.5));
     assert_eq!(val(op("$add", vec![Bson::Int32(1), Bson::Double(0.5)]), none()), Bson::Double(1.5));
 }
@@ -393,9 +393,9 @@ fn sum_is_exact_over_integers_doubles_and_decimals() {
         "18446744073709551614",
     );
     // A group with no decimal is what it was.
-    assert_eq!(group("$sum", vec![Bson::Int32(1), Bson::Int64(2)]), Bson::Int64(3));
+    assert_eq!(group("$sum", vec![Bson::Int32(1), Bson::Int32(2)]), Bson::Int32(3));
     assert_eq!(group("$sum", vec![Bson::Int32(1), Bson::Double(0.5)]), Bson::Double(1.5));
-    assert_eq!(group("$sum", vec![Bson::from("x")]), Bson::Int64(0));
+    assert_eq!(group("$sum", vec![Bson::from("x")]), Bson::Int32(0));
 }
 
 #[test]
