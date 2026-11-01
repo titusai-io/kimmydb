@@ -141,6 +141,20 @@ impl RegexPattern {
     /// the same as "no document matches". While a filter is being parsed the
     /// pattern is charged to its budget, and refused past it.
     pub fn new(pattern: &str, options: &str) -> Result<Self> {
+        Self::compile(pattern, options, false)
+    }
+
+    /// Compile a pattern that is already stored, which the build that stored it
+    /// accepted: it differs from [`Self::new`] only in letting a possessive
+    /// quantifier (`a*+`) through, read as a repetition of a repetition. A pattern
+    /// that enters now, in a filter, an expression or a validator being set, is
+    /// built with [`Self::new`] and refused if it holds one; a validator written
+    /// before that rule must still load (ADR-257), and this is how it does.
+    pub fn new_stored(pattern: &str, options: &str) -> Result<Self> {
+        Self::compile(pattern, options, true)
+    }
+
+    fn compile(pattern: &str, options: &str, stored: bool) -> Result<Self> {
         let spent = REGEX_SPEND.with(std::cell::Cell::get);
         // Counted before compiling, so a filter of many patterns stops at the
         // limit rather than compiling them all first.
@@ -152,7 +166,7 @@ impl RegexPattern {
                  as one pattern, as in \"^(abc|def)\""
             )));
         }
-        let compiled = build_regex(pattern, options)?;
+        let compiled = build_regex(pattern, options, stored)?;
         if let Some(spent) = spent {
             let bytes = spent.bytes + compiled.memory_usage();
             if bytes > REGEX_TOTAL_LIMIT_BYTES {
@@ -314,7 +328,7 @@ fn unknown_regex_flag(flag: char) -> Error {
 ///
 /// Called only from [`RegexPattern::new`]: once per `$regex` in a filter, when
 /// it is parsed, and never while matching.
-fn build_regex(pattern: &str, options: &str) -> Result<meta::Regex> {
+fn build_regex(pattern: &str, options: &str, stored: bool) -> Result<meta::Regex> {
     REGEX_COMPILATIONS.with(|n| n.set(n.get() + 1));
     let mut parser = ast::parse::ParserBuilder::new();
     let mut translator = hir::translate::TranslatorBuilder::new();
@@ -349,7 +363,7 @@ fn build_regex(pattern: &str, options: &str) -> Result<meta::Regex> {
         .build()
         .parse(pattern)
         .map_err(|e| cannot_be_used(last_line(regex_syntax::Error::from(e))))?;
-    let ast = ascii_classes(parsed);
+    let ast = ascii_classes(parsed, stored).map_err(cannot_be_used)?;
     let hir = translator
         .build()
         .translate(pattern, &ast)
@@ -384,9 +398,15 @@ fn build_regex(pattern: &str, options: &str) -> Result<meta::Regex> {
 /// off, so that `\w` under `i` does not take in `ſ` (U+017F) and `K`
 /// (U+212A), which fold to ASCII letters. Inside brackets no flag can be
 /// set, and under `i` a `[\w]` does match those two.
-fn ascii_classes(mut ast: Ast) -> Ast {
-    rewrite_node(&mut ast);
-    ast
+///
+/// The same walk finds a possessive quantifier, which `regex` reads as a
+/// repetition of a repetition (`a*+` is `(?:a*)+`), where the reference never
+/// gives back what it took: `a*+a` matches nothing there. The engine cannot
+/// honour that, so a pattern holding one is refused, unless `stored` says it was
+/// accepted before (a validator already set).
+fn ascii_classes(mut ast: Ast, stored: bool) -> std::result::Result<Ast, String> {
+    rewrite_node(&mut ast, stored)?;
+    Ok(ast)
 }
 
 fn snippet(pattern: &str) -> Ast {
@@ -424,7 +444,7 @@ fn is_word_assertion(kind: &ast::AssertionKind) -> bool {
     )
 }
 
-fn rewrite_node(node: &mut Ast) {
+fn rewrite_node(node: &mut Ast, stored: bool) -> std::result::Result<(), String> {
     match node {
         Ast::ClassPerl(class) => {
             let source = format!("(?-i:{})", ascii_class(&class.kind, class.negated));
@@ -447,12 +467,29 @@ fn rewrite_node(node: &mut Ast) {
             });
         }
         Ast::ClassBracketed(class) => rewrite_set(&mut class.kind),
-        Ast::Repetition(repetition) => rewrite_node(&mut repetition.ast),
-        Ast::Group(group) => rewrite_node(&mut group.ast),
-        Ast::Alternation(alternation) => alternation.asts.iter_mut().for_each(rewrite_node),
-        Ast::Concat(concat) => concat.asts.iter_mut().for_each(rewrite_node),
+        Ast::Repetition(repetition) => {
+            // `+` straight on another repetition: `*+`, `++`, `?+`, `{n,m}+`.
+            // (`(?:a*)+` has a group between, and `a+?` is one lazy repetition.)
+            if !stored
+                && matches!(repetition.op.kind, ast::RepetitionKind::OneOrMore)
+                && matches!(repetition.ast.as_ref(), Ast::Repetition(_))
+            {
+                return Err("possessive quantifiers (`*+`, `++`, `?+`, `{n,m}+`) are not \
+                            supported; write the repetition without the extra `+`"
+                    .to_string());
+            }
+            rewrite_node(&mut repetition.ast, stored)?;
+        }
+        Ast::Group(group) => rewrite_node(&mut group.ast, stored)?,
+        Ast::Alternation(alternation) => {
+            alternation.asts.iter_mut().try_for_each(|ast| rewrite_node(ast, stored))?;
+        }
+        Ast::Concat(concat) => {
+            concat.asts.iter_mut().try_for_each(|ast| rewrite_node(ast, stored))?;
+        }
         _ => {}
     }
+    Ok(())
 }
 
 fn rewrite_set(set: &mut ast::ClassSet) {
@@ -589,17 +626,42 @@ mod tests {
 
     #[test]
     fn still_refused_are_what_the_engine_cannot_run() {
-        for pattern in [r"\Qa.b\E", "(?>a)", r"(a)\1", "(?=a)", "(?<!a)b", r"\Z", r"\G"] {
+        for pattern in [
+            r"\Qa.b\E", "(?>a)", r"(a)\1", "(?=a)", "(?<!a)b", r"\Z", r"\G",
+            // PCRE escapes that work in the reference and are not in `regex`'s syntax.
+            r"\h", r"\H", r"\R", r"\X", r"\K", r"\C",
+        ] {
             assert!(RegexPattern::new(pattern, "").is_err(), "{pattern}");
         }
     }
 
     #[test]
-    fn a_possessive_quantifier_is_read_as_a_nested_greedy_repetition() {
-        // A documented difference: the reference never gives back what `a*+`
-        // took, so `a*+a` matches nothing there.
-        assert!(matches("a*+a", "", "aa"));
-        assert!(matches("a++", "", "aa"));
+    fn a_possessive_quantifier_is_refused_where_a_pattern_enters() {
+        // The reference never gives back what a possessive quantifier took, so
+        // `a*+a` matches nothing there; the engine cannot do that.
+        for pattern in
+            ["a*+a", "a++", "a?+", "a{1,2}+", "a{2}+", "(ab)*+", "[a-c]++x", "x(?:a|b++)"]
+        {
+            let err = RegexPattern::new(pattern, "").unwrap_err().to_string();
+            assert!(
+                err.contains("possessive quantifiers") && err.contains(&format!("{pattern:?}")),
+                "{pattern}: {err}"
+            );
+        }
+        // A group between the two, a lazy quantifier and a plain `+` are not possessive.
+        for pattern in ["(?:a*)+", "a+?", "a*?", "(a+)+", "a+", r"a\++", "[+]+", "a{2}", "a+b+"] {
+            RegexPattern::new(pattern, "").unwrap_or_else(|e| panic!("{pattern}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_stored_pattern_with_one_still_loads_as_a_nested_repetition() {
+        let p = RegexPattern::new_stored("a*+a", "").unwrap();
+        assert!(p.is_match("aa"));
+        assert!(RegexPattern::new_stored("a++", "").unwrap().is_match("aa"));
+        // Nothing else is let through.
+        assert!(RegexPattern::new_stored("(", "").is_err());
+        assert!(RegexPattern::new_stored(r"(a)\1", "").is_err());
     }
 
     #[test]

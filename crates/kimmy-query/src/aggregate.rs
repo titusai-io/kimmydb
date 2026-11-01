@@ -1296,6 +1296,7 @@ fn parse_accumulators(
             )));
         }
         let (op, arg) = acc.iter().next().expect("length checked above");
+        crate::accumulators::check_unary(op, arg)?;
         if let Some(spec) = crate::accumulators::parse(op, arg, vars)? {
             fields.push((name.clone(), Accumulator::Ext(spec)));
             continue;

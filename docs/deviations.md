@@ -22,10 +22,11 @@ Status meanings:
 **Raised 2026-10-31, with ADR-260.** `$trim`, `$ltrim`, `$rtrim`, `$indexOfCP`, `$indexOfBytes`, `$regexMatch`, `$regexFind`, `$regexFindAll`, `$replaceOne`, `$replaceAll`, `$strcasecmp`, `$strLenBytes`, `$substrBytes`, `$mergeObjects` (expression and accumulator), `$getField`, `$setField`, `$unsetField`, `$type` and `$isNumber` follow the reference; these are the differences.
 
 - **Integer results are `Int64`** (`$indexOfCP`, `$indexOfBytes`, `$strLenBytes`, `idx` of `$regexFind`), as the rest of the expression layer; the reference gives `Int32`. `$type` of a computed integer is therefore `"long"` where the reference says `"int"` (the entry on numbers above). `$strcasecmp` gives `Int32`, as `$cmp` does.
-- **The regex operators are not PCRE.** They use the `$regex` filter's engine: no backreferences or lookaround (a `400` when the pattern is parsed or evaluated), no atomic groups (`(?>)`), no `\Q..\E`, no `\Z` or `\G`, a size limit per pattern, and a count shared with the pipeline's other patterns (32). **Possessive quantifiers** (`a*+`, `a++`) are accepted and read as a repetition of a repetition, so `a*+a` matches `aa` where the reference matches nothing. The flags are `i`, `m`, `s`, `x` and `u` (`u` is accepted and changes nothing). `\d`, `\w`, `\s` and `\b` are ASCII, as the reference's are; the rest is Unicode, and `i` folds `é` with `É`, as the reference does. Under `i`, a `\w` or `\W` written inside brackets (`[\w-]`) also takes in U+017F and U+212A, which the reference's `\w` does not. `$` and `\Z` differ in the way the `$regex` filter's do (`$` matches only at the very end, not before a final newline). Matching is by code point, and `idx` counts code points. The same engine now reads `\d`, `\w` and `\s` as ASCII in the `$regex` filter and in a validator's `pattern`, which is a change from 0.58.0 (CHANGELOG, "Breaking").
+- **The regex operators are not PCRE.** They use the `$regex` filter's engine: no backreferences or lookaround (a `400` when the pattern is parsed or evaluated), no atomic groups (`(?>)`), no `\Q..\E`, no `\Z`, `\G`, `\h` or `\R` (and no other PCRE escape outside `regex`'s syntax: `\H`, `\X`, `\K`, `\C`), which work in the reference, **no possessive quantifiers** (`a*+`, `a++`, `a?+`, `a{n,m}+`: the engine would read them as a repetition of a repetition, so `a*+a` would match `aa` where the reference matches nothing), a size limit per pattern, and a count shared with the pipeline's other patterns (32). The two refusals of the engine's own kind are a `400` naming the construct, in the `$regex` filter, the three operators, a `$jsonSchema` filter and a validator being set; a validator **already stored** whose pattern holds a possessive quantifier still loads, read as the repetition of a repetition it was read as before, so it keeps validating until it is replaced. The flags are `i`, `m`, `s`, `x` and `u` (`u` is accepted and changes nothing). `\d`, `\w`, `\s` and `\b` are ASCII, as the reference's are; the rest is Unicode, and `i` folds `é` with `É`, as the reference does. Under `i`, a `\w` written inside brackets (`[\w-]`) also takes in U+017F, which the reference's does not (it takes in U+212A there, as this does; outside brackets neither takes in either, here and there). `$` and `\Z` differ in the way the `$regex` filter's do (`$` matches only at the very end, not before a final newline). Matching is by code point, and `idx` counts code points. The same engine now reads `\d`, `\w` and `\s` as ASCII in the `$regex` filter and in a validator's `pattern`, which is a change from 0.58.0 (CHANGELOG, "Breaking").
 - **A computed `regex` is compiled per document** (the last pattern is kept), outside the pipeline's budget; each pattern is still bounded by the per-pattern size limit.
 - **`$strcasecmp` and `$substrBytes` coerce only strings, null and numbers** to text, a double as `%g` prints it, as the reference does. The reference also renders a date, a timestamp, code and a symbol; here those are a `400`.
-- **`$regexFindAll`'s 64 MiB limit is counted as BSON bytes of the documents it would return**, which is this server's reading of the reference's output-buffer limit; the two counts agree to within the documents' framing, not byte for byte, so an answer within a few percent of 64 MiB may be refused by one and not the other. The error is the `413` `AnswerTooLarge`, where the reference's is `51151`. A string over 16 MiB built by `$concat`, `$replaceOne` or `$replaceAll` is the same `413`, where the reference's codes are `16493` and `13548`.
+- **`$regexFindAll`'s 64 MiB limit is counted as BSON bytes of the documents it would return**, which is this server's reading of the reference's output-buffer limit; the two counts agree to within the documents' framing, not byte for byte, so an answer within a few percent of 64 MiB may be refused by one and not the other. The error is the `413` `ValueTooLarge` (code `document_too_large`), where the reference's is `51151`; its message names the output and the limit. A string of 16 MiB or more built by `$concat`, `$replaceOne` or `$replaceAll` is the same `413` ("the string $concat builds is N bytes, over the 16 MiB string limit"), where the reference's codes are `16493` and `13548`.
+- **An array an expression builds is held to 16 MiB of BSON,** with the same `413`: `$concatArrays` (a `$reduce` that doubles an array stops there), `$map`, `$zip`, an array literal, `$split`, `$objectToArray` and the `N` forms of `$firstN`, `$lastN`, `$maxN` and `$minN`. The reference has no such limit short of the 16 MB document (and 64 MB buffer) it would hit when the value is stored or returned, so an intermediate array between 16 MiB and that is answered there and refused here. `$range` keeps its own limit of 100,000 elements and `$zip` its 1,000,000 cells, both a `400` raised before anything is built. A document built by `$mergeObjects`, `$setField` or an object literal is not counted.
 - **`$replaceAll` with an empty `find`** inserts between every code point and at both ends (`"abc"`, `""`, `"-"` gives `"-a-b-c-"`). The reference inserts between the *bytes* of a multi-byte character and builds invalid UTF-8, which its own client refuses to read (`Invalid UTF-8 string in BSON document`); on ASCII text the two agree.
 - **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null.
 - **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document, as the reference refuses it (`40400`).
@@ -42,10 +43,11 @@ Status meanings:
 **Raised 2026-10-31, with ADR-262; revised after the review of PR #276.** Where these differ from, or rest on a reading of, the reference:
 
 - **`$stdDevPop`/`$stdDevSamp` convert a `Decimal128` to the nearest double** before accumulating, so a decimal with more than 15 significant digits can differ from the reference in the last printed digit of the double result.
-- **`n` is one value for the group**, evaluated at parse or at first use. An `n` that reads a document field is refused, as the reference refuses it (it reads the group key, where the field is missing), with a different message.
+- **`n` is one value for the group.** An `n` that needs no document is read to a constant when the pipeline is parsed, and checked for a group when its first document arrives, so a bad constant `n` over no input answers `[]` and no error, as the reference does. An `n` that reads a document field reads it as missing and is refused for the group, as the reference refuses it. The messages differ.
 - **`$count` answers an int** (a long past 2^31-1), as `{$sum: 1}` does in the reference, whereas this server's `$sum: 1` answers a long.
-- **The array forms of `$firstN`, `$lastN`, `$maxN`, `$minN`, `$stdDevPop` and `$stdDevSamp`** (as `$project` or `$addFields` expressions) answer the reference's cases (`{$maxN: {n: 2, input: [1, 3, 2, null]}}` is `[3, 2]`, `{$stdDevPop: [1, 2, 3, 4]}` is `1.118033988749895`). What was not checked against the reference: a `null` or missing `input` answers `null` here, and an `input` that is not an array is a `400`. `$stdDev*` reads a single operand that is an array as its elements and any other list as the operands.
-- **Not checked against the reference:** `$bottom`/`$bottomN` with an empty `sortBy` keep the first arrivals (the rule for equal rows), not the last; and an empty array nested inside a sort key (`[[]]`) is compared as any other array, only a key that is itself an empty array sorts below `null`.
+- **The array forms of `$firstN`, `$lastN`, `$maxN`, `$minN`, `$stdDevPop` and `$stdDevSamp`** (as `$project` or `$addFields` expressions) answer as the reference does in every probed case (65 for the four `N` forms, 32 operand shapes for `$stdDev*`): an `input` that is not an array, `null` and missing included, is refused, `n` is read first, and `$stdDev*` reads a single operand that is an array as its elements and any other list as the operands. The error texts differ.
+- **`$sum`, `$avg`, `$stdDevPop` and `$stdDevSamp` in a `$group` refuse an array literal of any length but one** (`The $stdDevPop accumulator is a unary operator`, as the reference refuses `$stdDevPop: [1, 2]`). `$sum` and `$avg` answered `0` and `null` for a list before. A list of one element is not probed and stays an array expression. A breaking change for a pipeline that passed a list.
+- **An empty `sortBy`** in `$bottom`/`$bottomN` keeps the first arrivals, as `$top` does, and an empty array inside a sort key (`[[]]`) is an ordinary array below `[[1]]`: both are probed and match.
 
 ---
 
@@ -3535,9 +3537,6 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
   `24-01-01` with `%Y-%m-%d` is the year 24 there, `5/03/2024` with `%d/%m/%Y` is
   the 5th, and `.5` with `%L` is 500 ms. Here each is a conversion error (which
   `onError` takes).
-- **`%Y` with `%G`/`%V`/`%u` in a `$dateFromString` format** is refused when the
-  format is checked, and `onError` does not take it. The reference reads the
-  string first and answers a conversion error, which `onError` does take.
 - **Dates outside the tz database's years** use the zone's earliest or latest
   offset. The reference applies a zone's daylight-saving rule through the year
   2400 and answers garbage past it (an offset of -08 for New York in the year
@@ -3549,30 +3548,37 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
   (-05 there, -06 here), Nuuk, Almaty, Cairo and Asuncion. Nothing is done about
   it here: the built-in database is current (2026e) on purpose.
 - **`$dateTrunc` bounds `binSize` by what the unit can count.** A year, quarter,
-  month, week or day bin larger than the number of those units in the whole range
-  of a date (a year bin over about 585 million, a day bin over about 2e11) is
-  `dateTrunc unsupported binSize value`, and a bin or result no 64-bit date can
-  hold is `dateTrunc overflowed`. The reference gives the same two refusals for the
-  cases probed (the largest long for every unit, a year bin of 2^31 - 1), but the
-  exact threshold it uses is not known, so a bin between those limits may answer
-  here where the reference refuses.
+  month, week or day bin larger than the number of that unit (counted with its
+  shortest length) that 64 bits of milliseconds hold (292,471,208 years,
+  106,751,991,167 days) is `dateTrunc unsupported binSize value`, and a bin or a
+  result no 64-bit date can hold is `dateTrunc overflowed`. The reference
+  refuses the same bins in the same class at every probed size (year 1e8
+  answers, 3e8 does not; day 1e11 answers, 2e11 does not; the largest long for
+  every unit), but it words some refusals as `dateAdd overflowed` or `invalid
+  dateAdd 'amount' parameter value` and the exact threshold is not probed, so a
+  bin just beside the bound may differ.
 - **Results past the 64-bit date range are refused here, and are garbage in the
   reference.** `$dateDiff` in milliseconds between the smallest and largest date
   (the reference answers 0), `$dateTrunc` of a date near the 64-bit limits (it
   answers the date 0) and a `$dateFromParts` sum of that size are
-  `Overflow occurred` / `dateTrunc overflowed` here.
-- **Cut to a minute, the seconds of a local-mean-time offset are ignored**, as
-  the reference ignores them (`$dateTrunc` to the minute in New York in 1800 is
-  12:00:00Z for 12:00:30Z), and `$dateDiff` counts them, as the reference does.
-  Cut to an hour the seconds are kept; the reference was not probed for that.
+  `Overflow occurred` / `dateTrunc overflowed` here. A `$dateFromParts`
+  `millisecond` whose finer-unit count overflows is refused (`9e18` is
+  `DurationOverflow` in the reference; `1e9` and a `second` of `9e15` answer); the
+  exact threshold here, 9.2e15, is derived from that one probe.
+- **`$dateTrunc` of an hour, minute, second or millisecond bin** is cut from the
+  instant the zone's clock read 2000-01-01 00:00 (with the offset it had then),
+  as the reference does, so in New York in July a 2-hour bin starts on an odd
+  UTC hour. `$dateDiff` counts the clock's own boundaries at each instant, also
+  as the reference does.
 - **Offsets above 23:59 are accepted** (`+24:00`, `+05:60`, `+99`) because the
-  reference accepts them. How `%z` prints one (`+9900`) was not probed.
+  reference accepts them, and `%z`/`%Z` print them as it does (`+9900 5940`,
+  `+2400 1440`, `-9900 -5940`).
 - **The order of null and bad arguments** follows the reference for `$year` and
   the other one-date operators, `$dateAdd`, `$dateSubtract`, `$dateDiff`,
-  `$dateTrunc`, `$dateFromParts` and `$dateToString`. Not probed, and set to the
-  nearest probed case: `$dateToParts` reads a bad zone before a null date, a null
-  `timezone` beside a null date in `$dateToString` answers `onNull`, and a
-  `startOfWeek` of null beside `unit: "week"` answers null.
+  `$dateTrunc`, `$dateFromParts`, `$dateToParts` (a bad zone is read before a
+  null date) and `$dateToString` (a null `timezone` beside a null date answers
+  `onNull`, beside a date it is `null`); a null `startOfWeek` beside
+  `unit: "week"` is `null`.
 - **A format given as an expression** (`$dateToString`'s `format`) is accepted
   as the reference accepts it; a constant one is checked when the pipeline is
   parsed.

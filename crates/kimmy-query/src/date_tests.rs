@@ -522,6 +522,17 @@ fn date_from_parts_second_and_millisecond_have_no_range() {
         from(doc! { "year": 2024, "millisecond": -1_000_000_000_i64 }),
         at(1_704_067_200_000 - 1_000_000_000)
     );
+    // delta.out: a millisecond of 9e18 is refused (DurationOverflow), a second
+    // of 9e15 is not.
+    let e = refused(
+        doc! { "$dateFromParts": { "year": 2024, "millisecond": 9_000_000_000_000_000_000_i64 } },
+        doc! {},
+    );
+    assert!(e.contains("Overflow"), "{e}");
+    assert!(matches!(
+        from(doc! { "year": 2024, "second": 9_000_000_000_000_000_i64 }),
+        Bson::DateTime(_)
+    ));
     // A sum no date can hold is refused, and cannot wrap.
     for (part, v) in [("second", i64::MAX), ("millisecond", i64::MAX), ("second", i64::MIN)] {
         let e = refused(doc! { "$dateFromParts": { "year": 2024, part: v } }, doc! {});
@@ -1299,13 +1310,68 @@ fn date_trunc_to_a_repeated_or_skipped_midnight() {
 }
 
 #[test]
-fn date_trunc_to_the_minute_ignores_the_seconds_of_a_local_mean_offset() {
-    // extra.out: New York in 1800 is -04:56:02, and $dateTrunc to a minute
-    // answers 12:00:00Z for 12:00:30Z (the offset's seconds are ignored).
-    let ny = doc! { "timezone": "America/New_York" };
-    let noon = -5_364_619_200_000_i64;
-    assert_eq!(trunc(at(noon + 30_000), "minute", ny.clone()), at(noon));
-    assert_eq!(trunc(at(noon + 500), "second", ny), at(noon));
+fn date_trunc_cuts_fixed_bins_from_the_zones_2000_midnight() {
+    // delta/delta4.out, delta3.out and delta.out: the bins are cut in UTC from
+    // the instant the zone's clock read 2000-01-01 00:00, with the offset it had
+    // then, so a bin that does not divide the zone's offset change is shifted.
+    let t = |date: &str, unit: &str, bin: i64, tz: &str| {
+        let mut extra = doc! { "timezone": tz };
+        if bin != 0 {
+            extra.insert("binSize", bin);
+        }
+        trunc(from_string(doc! { "dateString": date }), unit, extra)
+    };
+    let cases: [(&str, &str, i64, &str, i64); 20] = [
+        ("2024-07-01T13:30:00Z", "hour", 2, "America/New_York", 1_719_838_800_000),
+        ("2024-07-01T13:30:00Z", "hour", 3, "America/New_York", 1_719_831_600_000),
+        ("2024-01-15T13:30:00Z", "hour", 2, "America/New_York", 1_705_323_600_000),
+        ("2024-07-01T13:30:00Z", "hour", 1, "America/New_York", 1_719_838_800_000),
+        ("2024-07-01T13:30:00Z", "hour", 2, "Europe/Berlin", 1_719_838_800_000),
+        ("2024-07-01T13:30:00Z", "hour", 6, "Europe/Berlin", 1_719_831_600_000),
+        ("2024-07-01T13:30:00Z", "minute", 90, "America/New_York", 1_719_837_000_000),
+        ("2024-07-01T13:30:00Z", "hour", 2, "Australia/Sydney", 1_719_838_800_000),
+        ("2024-07-01T13:30:00Z", "second", 7200, "America/New_York", 1_719_838_800_000),
+        // Lord Howe was +11 on 2000-01-01 and is +10:30 in July: whole UTC hours.
+        ("2024-07-01T02:45:00Z", "hour", 0, "Australia/Lord_Howe", 1_719_799_200_000),
+        ("2024-01-01T02:45:00Z", "hour", 0, "Australia/Lord_Howe", 1_704_074_400_000),
+        // Caracas was -4 in 2000 and -4:30 in 2010.
+        ("2010-06-01T12:45:00Z", "hour", 0, "America/Caracas", 1_275_393_600_000),
+        ("2010-06-01T12:45:00Z", "minute", 45, "America/Caracas", 1_275_394_500_000),
+        // Kathmandu was +5:30 in 1980 and +5:45 in 2000: quarter hours.
+        ("1980-06-01T12:45:00Z", "hour", 0, "Asia/Kathmandu", 328_709_700_000),
+        // Local mean time in 1800: the bins come from the 2000 origin.
+        ("1800-01-01T12:30:30Z", "hour", 0, "America/New_York", -5_364_619_200_000),
+        ("1800-01-01T12:30:30Z", "minute", 0, "America/New_York", -5_364_617_400_000),
+        ("1800-01-01T12:30:30Z", "minute", 0, "Asia/Kolkata", -5_364_617_400_000),
+        ("1800-01-01T12:30:30Z", "hour", 2, "Asia/Kolkata", -5_364_617_400_000),
+        ("1800-01-01T12:30:30Z", "hour", 0, "Asia/Kolkata", -5_364_617_400_000),
+        ("1800-01-01T12:30:30.500Z", "second", 0, "Asia/Kolkata", -5_364_617_370_000),
+    ];
+    for (date, unit, bin, tz, want) in cases {
+        assert_eq!(t(date, unit, bin, tz), at(want), "{date} {unit} {bin} {tz}");
+    }
+}
+
+#[test]
+fn date_diff_hours_use_each_instants_own_offset() {
+    // delta3.out: the boundaries a difference counts are the clock's, not the
+    // truncation's bins.
+    let diff_in = |a: &str, b: &str, tz: &str| {
+        diff(
+            from_string(doc! { "dateString": a }),
+            from_string(doc! { "dateString": b }),
+            "hour",
+            doc! { "timezone": tz },
+        )
+    };
+    assert_eq!(
+        diff_in("2024-07-01T02:20:00Z", "2024-07-01T02:40:00Z", "Australia/Lord_Howe"),
+        Bson::Int64(1)
+    );
+    assert_eq!(
+        diff_in("2010-06-01T12:20:00Z", "2010-06-01T12:40:00Z", "America/Caracas"),
+        Bson::Int64(1)
+    );
 }
 
 #[test]
@@ -1367,6 +1433,54 @@ fn date_trunc_refuses_a_bin_the_unit_cannot_count() {
     assert_eq!(
         t("1999-06-01T00:00:00Z", "millisecond", i64::MAX).expect("answers"),
         at(946_684_800_000 - i64::MAX)
+    );
+}
+
+#[test]
+fn date_trunc_bin_bound_sits_where_the_reference_puts_it() {
+    // delta.out: a day bin of 1e11 answers and 2e11 is `unsupported binSize`; a
+    // year bin of 1e8 answers and 3e8 is refused. The bound is the count of the
+    // unit that 64 bits of milliseconds hold: 106,751,991,167 days, 292,471,208
+    // years (counted with a 365-day year).
+    let t = |unit: &str, bin: i64| {
+        try_eval(
+            doc! { "$dateTrunc": { "date": { "$toDate": "2024-06-01T00:00:00Z" }, "unit": unit, "binSize": bin } },
+            doc! {},
+        )
+    };
+    let origin = at(946_684_800_000);
+    assert_eq!(t("day", 100_000_000_000).expect("answers"), origin);
+    assert_eq!(t("day", 106_751_991_167).expect("answers"), origin);
+    for bin in [106_751_991_168, 200_000_000_000] {
+        let e = t("day", bin).expect_err("refused").to_string();
+        assert!(e.contains("unsupported binSize"), "{bin}: {e}");
+    }
+    assert_eq!(t("year", 100_000_000).expect("answers"), origin);
+    assert_eq!(t("year", 292_471_208).expect("answers"), origin);
+    for bin in [292_471_209, 300_000_000, 600_000_000] {
+        let e = t("year", bin).expect_err("refused").to_string();
+        assert!(e.contains("unsupported binSize"), "{bin}: {e}");
+    }
+}
+
+#[test]
+fn date_from_string_mixed_fields_and_both_offsets() {
+    // delta.out: a format that mixes ISO week fields with calendar ones is a
+    // conversion error that onError takes; %z and %Z together are read.
+    for (t, f) in [("2021 2021", "%Y %G"), ("2021 05", "%Y %V"), ("05 1", "%m %u")] {
+        assert_eq!(
+            from_string(doc! { "dateString": t, "format": f, "onError": "caught" }),
+            s("caught"),
+            "{f}"
+        );
+        let e = refused(doc! { "$dateFromString": { "dateString": t, "format": f } }, doc! {});
+        assert!(e.contains("Mixing of ISO dates with natural dates"), "{f}: {e}");
+    }
+    assert_eq!(
+        from_string(doc! {
+            "dateString": "2021-01-01 +0100 +60", "format": "%Y-%m-%d %z %Z", "onError": "caught"
+        }),
+        at(1_609_455_600_000)
     );
 }
 

@@ -32,6 +32,13 @@ fn refused(acc: Document) -> String {
         .to_string()
 }
 
+/// A `$group` that must parse (a bad `n` is refused per group, at run time), run
+/// over `input`.
+fn run_group(acc: Document, input: Vec<Document>) -> kimmy_core::Result<Vec<Document>> {
+    let stages = aggregate::parse(&[doc! {"$group": {"_id": null, "r": acc}}])?;
+    aggregate::apply(&stages[0], input, &Limits::default())
+}
+
 fn xs(values: &[i32]) -> Vec<Document> {
     values.iter().enumerate().map(|(i, x)| doc! {"_id": i as i32, "x": *x}).collect()
 }
@@ -508,11 +515,19 @@ fn n_must_be_a_positive_integer() {
         (Bson::String("3".into()), "must be an integer"),
         (Bson::Null, "must be an integer"),
     ] {
-        let err = refused(doc! {"$firstN": {"n": n.clone(), "input": "$x"}});
+        // Refused for a group, when its first document arrives; over no input
+        // there is no group and so no error (delta.js `firstN n 0 on empty
+        // collection` and its three siblings, all `[]`).
+        let acc = doc! {"$firstN": {"n": n.clone(), "input": "$x"}};
+        let err = run_group(acc.clone(), xs(&[1])).expect_err("refused").to_string();
         assert!(err.contains(text), "{n:?}: {err}");
+        assert_eq!(run_group(acc, vec![]).unwrap(), Vec::<Document>::new(), "{n:?}");
     }
-    // A field path is missing for the whole group, so it is refused.
-    assert!(refused(doc! {"$maxN": {"n": "$k", "input": "$x"}}).contains("must be an integer"));
+    // A field path is missing for the whole group, so it is refused for a group.
+    let acc = doc! {"$maxN": {"n": "$k", "input": "$x"}};
+    let err = run_group(acc.clone(), xs(&[1])).expect_err("refused").to_string();
+    assert!(err.contains("must be an integer"), "{err}");
+    assert!(run_group(acc, vec![]).unwrap().is_empty());
     // A whole double and a computed constant are fine.
     let data = xs(&[1, 2, 3]);
     assert_eq!(
@@ -523,6 +538,16 @@ fn n_must_be_a_positive_integer() {
         one(doc! {"$firstN": {"n": {"$add": [1, 1]}, "input": "$x"}}, data),
         Bson::Array(vec![1.into(), 2.into()])
     );
+    // The other forms of the same refusal, over no input.
+    for acc in [
+        doc! {"$topN": {"n": "x", "sortBy": {"a": 1}, "output": "$x"}},
+        doc! {"$bottomN": {"n": 0, "sortBy": {"a": 1}, "output": "$x"}},
+        doc! {"$lastN": {"n": -1, "input": "$x"}},
+        doc! {"$minN": {"n": null, "input": "$x"}},
+    ] {
+        assert!(run_group(acc.clone(), xs(&[1])).is_err(), "{acc}");
+        assert!(run_group(acc.clone(), vec![]).unwrap().is_empty(), "{acc}");
+    }
     assert!(refused(doc! {"$firstN": {"input": "$x"}}).contains("`n`"));
     assert!(refused(doc! {"$firstN": {"n": 1}}).contains("`input`"));
     assert!(
@@ -790,16 +815,32 @@ fn the_n_operators_on_an_array_refuse_a_bad_n_or_input() {
     }
 }
 
+/// delta.js `<op> null input`, `missing input`, `string input`, `number input`,
+/// `object input` (error 5788200 for each of the four operators).
 #[test]
-fn the_n_operators_on_a_null_or_missing_input_answer_null() {
-    assert_eq!(
-        project_one(bson::bson!({"$firstN": {"n": 1, "input": "$nothing"}}), doc! {}).unwrap(),
-        Some(Bson::Null)
-    );
-    assert_eq!(
-        project_one(bson::bson!({"$maxN": {"n": 1, "input": null}}), doc! {}).unwrap(),
-        Some(Bson::Null)
-    );
+fn the_n_operators_refuse_an_input_that_is_not_an_array() {
+    let stored = doc! {"num": 3, "o": {"a": 1}};
+    for op in ["$firstN", "$lastN", "$maxN", "$minN"] {
+        for input in [Bson::Null, "$nothing".into(), "abc".into(), "$num".into(), "$o".into()] {
+            let expr = Bson::Document(doc! { op: {"n": 2, "input": input.clone()} });
+            let err = project_one(expr, stored.clone()).expect_err("refused").to_string();
+            assert!(err.contains("requires `input` to be an array"), "{op} {input}: {err}");
+        }
+    }
+}
+
+/// delta.js `n 0, null input` and `n string, missing input`: `n` is read before
+/// `input`, so a bad `n` is the error beside a bad `input`.
+#[test]
+fn n_is_read_before_input() {
+    for op in ["$firstN", "$lastN", "$maxN", "$minN"] {
+        let zero = Bson::Document(doc! { op: {"n": 0, "input": null} });
+        let err = project_one(zero, doc! {}).expect_err("refused").to_string();
+        assert!(err.contains("greater than 0"), "{op}: {err}");
+        let text = Bson::Document(doc! { op: {"n": "x", "input": "$nope"} });
+        let err = project_one(text, doc! {}).expect_err("refused").to_string();
+        assert!(err.contains("must be an integer"), "{op}: {err}");
+    }
 }
 
 #[test]
@@ -920,15 +961,11 @@ fn probe_the_n_forms() {
 fn probe_n_refusals_and_a_field_for_n() {
     for n in [Bson::Int32(0), Bson::Int32(-1), Bson::Double(2.5), "x".into(), Bson::Null] {
         let acc = doc! {"$firstN": {"n": n.clone(), "input": "$x"}};
-        let err = aggregate::parse(&[doc! {"$group": {"_id": null, "r": acc}}]);
-        let outcome = err.map(|stages| aggregate::apply(&stages[0], probe(), &Limits::default()));
-        assert!(matches!(outcome, Err(_) | Ok(Err(_))), "n = {n:?} must be refused");
+        assert!(run_group(acc, probe()).is_err(), "n = {n:?} must be refused");
     }
     // `n: '$s'` is missing for the group (error 5787902 in the reference).
-    let outcome = aggregate::parse(&[doc! {"$group": {"_id": null,
-    "r": {"$firstN": {"n": "$s", "input": "$x"}}}}])
-    .map(|stages| aggregate::apply(&stages[0], probe(), &Limits::default()));
-    assert!(matches!(outcome, Err(_) | Ok(Err(_))));
+    let acc = doc! {"$firstN": {"n": "$s", "input": "$x"}};
+    assert!(run_group(acc, probe()).is_err());
 }
 
 #[test]
@@ -959,4 +996,111 @@ fn max_n_and_min_n_skip_undefined() {
         Bson::Array(vec![5.into()])
     );
     assert_eq!(one(doc! {"$minN": {"n": 3, "input": "$x"}}, data), Bson::Array(vec![5.into()]));
+}
+
+// ---------------------------------------------------------------------------
+// The delta probes (reference-6.0.5/delta/delta.out, delta2.out)
+// ---------------------------------------------------------------------------
+
+/// delta.js `bottom empty sortBy` and its siblings: every row ties, the first
+/// arrivals win, `$bottom` of reverse arrival is the first of those.
+#[test]
+fn an_empty_sort_by_keeps_the_first_arrivals_for_bottom_too() {
+    let rows = |ids: &[i32]| -> Vec<Document> {
+        ids.iter()
+            .map(|i| {
+                let name = ["a", "b", "c"][*i as usize - 1];
+                doc! {"n": name}
+            })
+            .collect()
+    };
+    let r = group(
+        doc! {
+            "bottom": {"$bottom": {"sortBy": {}, "output": "$n"}},
+            "bottom2": {"$bottomN": {"n": 2, "sortBy": {}, "output": "$n"}},
+            "top": {"$top": {"sortBy": {}, "output": "$n"}},
+            "top2": {"$topN": {"n": 2, "sortBy": {}, "output": "$n"}},
+        },
+        rows(&[1, 2, 3]),
+    );
+    assert_eq!(
+        r,
+        doc! {"_id": null, "bottom": "a", "bottom2": ["a", "b"], "top": "a", "top2": ["a", "b"]}
+    );
+    assert_eq!(
+        one(doc! {"$bottom": {"sortBy": {}, "output": "$n"}}, rows(&[3, 2, 1])),
+        Bson::String("c".into())
+    );
+}
+
+/// delta.js `topN nested empty array asc` / `desc`: `[] < null < 0 < [null] <
+/// [[]] < [[1]]`, so only a key that is itself an empty array is lowest.
+#[test]
+fn an_empty_array_inside_a_key_is_an_ordinary_array() {
+    let data = vec![
+        doc! {"_id": 1, "v": [Bson::Array(vec![])]},
+        doc! {"_id": 2, "v": Vec::<Bson>::new()},
+        doc! {"_id": 3, "v": Bson::Null},
+        doc! {"_id": 4, "v": [Bson::Null]},
+        doc! {"_id": 5, "v": [Bson::Array(vec![1.into()])]},
+        doc! {"_id": 6, "v": 0},
+    ];
+    let ints = |v: &[i32]| Bson::Array(v.iter().map(|i| Bson::Int32(*i)).collect());
+    let top = |dir: i32| {
+        one(doc! {"$topN": {"n": 9, "sortBy": {"v": dir}, "output": "$_id"}}, data.clone())
+    };
+    assert_eq!(top(1), ints(&[2, 3, 6, 4, 1, 5]));
+    assert_eq!(top(-1), ints(&[5, 1, 4, 6, 3, 2]));
+}
+
+/// delta.js `topN a.b over docs missing b asc` / `desc`: a path through an array
+/// keeps the documents' values only, so `[1, {b: 0}]` is `[0]`, and an array
+/// with no document holding `b` is `[]`.
+#[test]
+fn a_path_through_an_array_skips_what_is_not_a_document() {
+    let data = vec![
+        doc! {"_id": 1, "a": [{"b": 1}, {"c": 1}]},
+        doc! {"_id": 2, "a": [{"c": 1}]},
+        doc! {"_id": 3, "a": Vec::<Bson>::new()},
+        doc! {"_id": 4, "a": [Bson::Int32(1), Bson::Document(doc! {"b": 0})]},
+        doc! {"_id": 5},
+    ];
+    let ints = |v: &[i32]| Bson::Array(v.iter().map(|i| Bson::Int32(*i)).collect());
+    let top = |dir: i32| {
+        one(doc! {"$topN": {"n": 9, "sortBy": {"a.b": dir}, "output": "$_id"}}, data.clone())
+    };
+    assert_eq!(top(1), ints(&[2, 3, 5, 4, 1]));
+    assert_eq!(top(-1), ints(&[1, 4, 5, 2, 3]));
+}
+
+/// delta2.out `stdDevPop group array field`: error 40237. `$sum` and `$avg` take
+/// the same refusal; a string operand is a unary operand and answers null.
+#[test]
+fn a_list_given_to_a_unary_accumulator_is_refused() {
+    for op in ["$stdDevPop", "$stdDevSamp", "$sum", "$avg"] {
+        for list in [bson::bson!([1, 2]), bson::bson!(["$x", "$y"]), bson::bson!([])] {
+            let err = refused(doc! { op: list.clone() });
+            assert!(err.contains(&format!("The {op} accumulator is a unary operator")), "{err}");
+        }
+    }
+    assert_eq!(one(doc! {"$stdDevPop": "x"}, xs(&[1, 2])), Bson::Null);
+    // The same stages with one operand are as before.
+    assert_eq!(one(doc! {"$sum": "$x"}, xs(&[1, 2])), Bson::Int64(3));
+    assert_eq!(one(doc! {"$avg": "$x"}, xs(&[1, 2])), Bson::Double(1.5));
+    // $push of a list is a list of expressions and stays valid.
+    assert_eq!(
+        one(doc! {"$push": ["$x", 0]}, xs(&[1])),
+        Bson::Array(vec![Bson::Array(vec![1.into(), 0.into()])])
+    );
+}
+
+#[test]
+fn a_sort_key_path_through_an_array_keeps_only_the_documents_fields() {
+    // `a.b` over `[1, {b: 0}]` is `[0]`: the scalar has no `b`, so it contributes
+    // nothing (it is not kept as itself). Ascending, `[0]` sorts before `[0.5]`;
+    // reading the key as `[1, 0]` would put the second row first.
+    let rows = vec![doc! {"_id": 1, "a": [1, {"b": 0}]}, doc! {"_id": 2, "a": [{"b": 0.5}]}];
+    let top = |sort: Document| one(doc! {"$top": {"sortBy": sort, "output": "$_id"}}, rows.clone());
+    assert_eq!(top(doc! {"a.b": 1}), Bson::Int32(1));
+    assert_eq!(top(doc! {"a.b": -1}), Bson::Int32(2));
 }

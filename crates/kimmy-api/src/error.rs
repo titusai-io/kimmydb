@@ -1013,7 +1013,9 @@ impl From<CoreError> for ApiError {
             }
             // The same 413 as a body over the ceiling, for the same reason: what was
             // sent is too big, and sending it again changes nothing.
-            CoreError::DocumentTooLarge { .. } | CoreError::AnswerTooLarge { .. } => ApiError::new(
+            CoreError::DocumentTooLarge { .. }
+            | CoreError::AnswerTooLarge { .. }
+            | CoreError::ValueTooLarge { .. } => ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorCode::DocumentTooLarge,
                 e.to_string(),
@@ -1708,5 +1710,44 @@ mod tests {
         assert_eq!(cause_of(&failed), "storage_failed");
         assert_eq!(failed.log_level(), Some(LogLevel::Error));
         assert!(!failed.message.contains("shutdown deadline"), "{}", failed.message);
+    }
+}
+
+#[cfg(test)]
+mod value_too_large_tests {
+    use super::*;
+
+    /// A string or an array an expression refuses to build is the same `413` and code
+    /// as a document over the cap, and the message names what hit which limit.
+    #[test]
+    fn a_value_an_expression_refuses_to_build_is_a_413_that_names_it() {
+        for (what, limit, text) in [
+            (
+                "the string $concat builds",
+                "16 MiB string limit",
+                "the string $concat builds is 20000000 bytes, over the 16 MiB string limit; trim it",
+            ),
+            (
+                "the $regexFindAll output",
+                "64 MiB limit",
+                "the $regexFindAll output is 20000000 bytes, over the 64 MiB limit; trim it",
+            ),
+            (
+                "the array $map builds",
+                "16 MiB array limit",
+                "the array $map builds is 20000000 bytes, over the 16 MiB array limit; trim it",
+            ),
+        ] {
+            let err = ApiError::from(CoreError::ValueTooLarge {
+                what,
+                bytes: 20_000_000,
+                max: 16 << 20,
+                limit,
+                remedy: "trim it",
+            });
+            assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(err.code, ErrorCode::DocumentTooLarge);
+            assert_eq!(err.message, text);
+        }
     }
 }

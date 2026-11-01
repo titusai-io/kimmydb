@@ -97,6 +97,11 @@ fn parse(schema: &Document) -> std::result::Result<Schema, CoreError> {
     Schema::parse(&Bson::Document(schema.clone()))
 }
 
+/// Parse the schema of a validator already stored, as the build that stored it did.
+fn parse_stored(schema: &Document) -> std::result::Result<Schema, CoreError> {
+    Schema::parse_stored(&Bson::Document(schema.clone()))
+}
+
 struct Cached {
     /// The encoding of the spec this was parsed from: what makes the entry the right
     /// one for the metadata in hand. Compared as bytes, not as trees, for the reason
@@ -249,7 +254,7 @@ impl crate::Engine {
         {
             return cached.compiled.clone();
         }
-        let compiled = match parse(&spec.schema) {
+        let compiled = match parse_stored(&spec.schema) {
             Ok(schema) => {
                 Some(Arc::new(Compiled { schema, action: spec.action, level: spec.level }))
             }

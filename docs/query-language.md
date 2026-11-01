@@ -1307,7 +1307,7 @@ compiled form is what every document is matched against.
 | | |
 |---|---|
 | ✅ Supported | Character classes, anchors, quantifiers, groups, alternation; flags `i` `m` `s` `x` `u` |
-| ⛔ Not supported | Backreferences (`\1`), lookahead/lookbehind (`(?=)`, `(?<=)`), atomic groups (`(?>)`), `\Q…\E`, `\Z` and `\G` |
+| ⛔ Not supported | Backreferences (`\1`), lookahead/lookbehind (`(?=)`, `(?<=)`), atomic groups (`(?>)`), possessive quantifiers (`a*+`, `a++`), `\Q…\E`, and the PCRE escapes `\Z`, `\G`, `\h`, `\R` and `\X` |
 
 The tradeoff is deliberate: `regex` guarantees linear-time matching, so a
 pathological pattern cannot become a denial of service against the database.
@@ -1320,8 +1320,10 @@ does not match U+00A0 (and `\D`, `\W` and `\S` match them), which is what the
 reference does. Before 0.59.0 these were Unicode classes. Everything else keeps
 its Unicode meaning: `.` is one code point, `\p{L}` and the other properties are
 Unicode, and the `i` flag folds `é` with `É` and the Kelvin sign with `k`. One
-edge: under `i`, a `\w` or `\W` written *inside* brackets (`[\w-]`) also takes in
-U+017F and U+212A, which fold to `s` and `k`; outside brackets it does not. The
+edge: under `i`, a `\w` written *inside* brackets (`[\w-]`) also takes in U+017F
+(which folds to `s`); the reference takes in U+212A (which folds to `k`) there, as
+this does, but not U+017F. Outside brackets neither takes in either, here and
+there. The
 same engine runs the `$regex` filter, the `$regexMatch`, `$regexFind` and
 `$regexFindAll` expression operators, and the `pattern` and `patternProperties`
 of a [collection validator](validation.md) and of the `$jsonSchema` filter, so a
@@ -1332,9 +1334,7 @@ documents on request, reports the ones a pattern now rejects. A pattern that
 needs the Unicode meaning writes it out: `\p{L}`, `\p{Nd}`, or
 `[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}]` for the old `\w`.
 
-**Possessive quantifiers** (`a*+`, `a++`) are not refused: the engine reads them as
-a repetition of a repetition, which never gives back what it took no differently
-from `a*`, so `a*+a` matches `aa` where the reference matches nothing.
+**Possessive quantifiers** (`a*+`, `a++`, `a?+`, `a{n,m}+`) are a **`400`** naming the construct, wherever a pattern is written: the filter, the expression operators, a `$jsonSchema` filter and a validator being set or created. The reference never gives back what such a quantifier took, so `a*+a` matches nothing there; this engine would read it as a repetition of a repetition and match `aa`. Write the pattern without the extra `+`, or a group (`(?:a*)+`) if the nested repetition is what you mean. A validator that is **already stored** with one still loads and is read as it was read before; replacing it applies the rule.
 
 A pattern the engine cannot use is a **`400`**, naming the pattern and what is
 wrong with it, before any document is read: an unclosed group, and also a

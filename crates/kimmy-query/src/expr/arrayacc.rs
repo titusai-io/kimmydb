@@ -8,10 +8,8 @@
 //! `$stdDev*` counts only the numbers and answers a double. `n` is read for each
 //! document, as any expression is.
 //!
-//! The reference's answers for these are confirmed for an array operand with
-//! numbers, a null, and (for `$stdDev*`) a string among them. A `null` or
-//! missing `input` is answered `null` here, and an `input` that is not an array
-//! is refused; neither was checked against the reference (deviations.md).
+//! An `input` that is not an array is refused, `null` and missing included, as
+//! the reference refuses it (error 5788200); `n` is read before `input`.
 
 use bson::Bson;
 use kimmy_core::{Error, Result};
@@ -93,9 +91,10 @@ impl ArrayAcc {
                     Kind::MaxN => "$maxN",
                     _ => "$minN",
                 };
+                // `n` is read first: a bad `n` is the error beside a bad `input`.
+                let n = accumulators::read_n(name, &n.eval_in(scope)?)?;
                 let items = match input.eval_in(scope)? {
                     Bson::Array(items) => items,
-                    Bson::Null | Bson::Undefined => return Ok(Bson::Null),
                     other => {
                         return Err(Error::InvalidQuery(format!(
                             "{name} requires `input` to be an array, found {}",
@@ -103,8 +102,17 @@ impl ArrayAcc {
                         )));
                     }
                 };
-                let n = accumulators::read_n(name, &n.eval_in(scope)?)?;
-                Ok(accumulators::n_of_array(*kind, &items, n))
+                let picked = accumulators::n_of_array(*kind, &items, n);
+                // At most the input's elements, and the input is itself bounded; the
+                // check is one pass over the result, for the array limit to hold here too.
+                if let Bson::Array(picked) = &picked {
+                    super::check_array_within(
+                        "the array the N accumulator form builds",
+                        picked,
+                        super::MAX_ARRAY_BYTES,
+                    )?;
+                }
+                Ok(picked)
             }
         }
     }

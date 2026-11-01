@@ -527,6 +527,15 @@ impl DateExpr {
         let Some(minute) = int("minute", 0, PART)? else { return Ok(Bson::Null) };
         let Some(second) = int("second", 0, None)? else { return Ok(Bson::Null) };
         let Some(milli) = int("millisecond", 0, None)? else { return Ok(Bson::Null) };
+        // The reference turns the millisecond into a finer unit before adding it
+        // and refuses one whose finer count overflows (`9e18` is an error, `1e9`
+        // and a second of `9e15` are not).
+        if milli.unsigned_abs() > i64::MAX as u64 / 1000 {
+            return err(
+                "Overflow casting from a lower-precision duration to a higher-precision duration"
+                    .to_string(),
+            );
+        }
         let Some(zone) = self.zone(scope)? else { return Ok(Bson::Null) };
         let (y_name, a_name, b_name) =
             if iso { ("isoWeekYear", "isoWeek", "isoDayOfWeek") } else { ("year", "month", "day") };
@@ -1001,8 +1010,8 @@ fn add_units(start: i64, unit: Unit, amount: i64, zone: &Zone, op: &str) -> Resu
 fn diff_units(start: i64, end: i64, unit: Unit, zone: &Zone, week_start: i64) -> Result<i64> {
     if let Some(len) = unit.fixed_ms() {
         // Boundaries of the zone's own hour, minute...: truncate both ends.
-        let a = trunc_fixed(start, len, 1, zone, false).ok_or_else(|| overflow("$dateDiff"))?;
-        let b = trunc_fixed(end, len, 1, zone, false).ok_or_else(|| overflow("$dateDiff"))?;
+        let a = floor_in_zone(start, len, zone).ok_or_else(|| overflow("$dateDiff"))?;
+        let b = floor_in_zone(end, len, zone).ok_or_else(|| overflow("$dateDiff"))?;
         return i64::try_from((i128::from(b) - i128::from(a)) / i128::from(len))
             .map_err(|_| overflow("$dateDiff"));
     }
@@ -1022,34 +1031,40 @@ fn week_start_day(days: i64, week_start: i64) -> i64 {
     days - (dow_sunday0(days) - week_start).rem_euclid(7)
 }
 
-/// Truncate to a bin of `bin` fixed-length units counted from local
-/// 2000-01-01T00:00:00, keeping the instant's own offset (so the second
-/// occurrence of a repeated hour truncates to the second). `None` when the
-/// bin, or the instant it starts at, does not fit a date.
-///
-/// `whole_minutes` reads the offset as whole minutes, dropping the seconds of a
-/// local-mean-time offset (`-04:56:02` is `-04:56`), which is what the reference
-/// does when it cuts to a minute; counting boundaries (`$dateDiff`) keeps them.
-fn trunc_fixed(utc: i64, len: i64, bin: i64, zone: &Zone, whole_minutes: bool) -> Option<i64> {
-    let mut offset = i128::from(zone.offset_at(utc)) * 1000;
-    if whole_minutes {
-        offset = offset / 60_000 * 60_000;
-    }
-    let local = i128::from(utc) + offset;
+/// The start of the zone's own `len`-millisecond unit that holds `utc`, read
+/// with the offset in force at that instant (so the second occurrence of a
+/// repeated hour truncates to the second, and a half-hour zone has half-hour
+/// hours). `$dateDiff` counts these boundaries. `None` when the start does not
+/// fit a date.
+fn floor_in_zone(utc: i64, len: i64, zone: &Zone) -> Option<i64> {
+    let local = i128::from(utc) + i128::from(zone.offset_at(utc)) * 1000;
     let origin = i128::from(DAYS_TO_2000) * i128::from(DAY_MS);
+    let into = (local - origin).rem_euclid(i128::from(len));
+    i64::try_from(i128::from(utc) - into).ok()
+}
+
+/// `$dateTrunc` to a bin of `bin` fixed-length units. The bins are cut in UTC
+/// from one origin: the instant at which the zone's clock read 2000-01-01
+/// 00:00:00, with the offset it had then. A zone whose offset has changed since
+/// (daylight saving, a new law) therefore has bins that are not aligned to the
+/// local hour unless the bin divides the change. `None` when the bin, or the
+/// instant it starts at, does not fit a date.
+fn trunc_bins(utc: i64, len: i64, bin: i64, zone: &Zone) -> Option<i64> {
     let size = i128::from(len) * i128::from(bin);
     if size > i128::from(i64::MAX) {
         return None;
     }
-    let into = (local - origin).rem_euclid(size);
+    let origin = zone.local_to_utc(DAYS_TO_2000 * DAY_MS);
+    let into = (i128::from(utc) - i128::from(origin)).rem_euclid(size);
     i64::try_from(i128::from(utc) - into).ok()
 }
 
-/// How many of a calendar unit the whole range of a date holds (counted with the
-/// shortest year, quarter, month and week). A bin larger than that cannot be
-/// meant, and the reference refuses it as an unsupported `binSize`.
+/// The largest `binSize` of a calendar unit: the number of the unit, counted
+/// with its shortest length, that a 64-bit millisecond count holds. The reference
+/// refuses a larger bin as an unsupported `binSize` (day bins of 1e11 answer and
+/// 2e11 are refused, and a year bin of 1e8 answers and 3e8 is refused).
 fn most_bins(unit: Unit) -> i128 {
-    let span: i128 = 1 << 64;
+    let span = i128::from(i64::MAX);
     let shortest_ms = match unit {
         Unit::Year => 365 * DAY_MS,
         Unit::Quarter => 90 * DAY_MS,
@@ -1057,13 +1072,13 @@ fn most_bins(unit: Unit) -> i128 {
         Unit::Week => 7 * DAY_MS,
         _ => DAY_MS,
     };
-    span / i128::from(shortest_ms) + 1
+    span / i128::from(shortest_ms)
 }
 
 fn trunc_units(date: i64, unit: Unit, bin: i64, zone: &Zone, week_start: i64) -> Result<i64> {
     let overflowed = || Error::InvalidQuery("dateTrunc overflowed".to_string());
     if let Some(len) = unit.fixed_ms() {
-        return trunc_fixed(date, len, bin, zone, unit == Unit::Minute).ok_or_else(overflowed);
+        return trunc_bins(date, len, bin, zone).ok_or_else(overflowed);
     }
     let unsupported = || Error::InvalidQuery("dateTrunc unsupported binSize value".to_string());
     let bin = i128::from(bin);
@@ -1113,28 +1128,16 @@ fn trunc_units(date: i64, unit: Unit, bin: i64, zone: &Zone, week_start: i64) ->
 
 /// Whether a specifier is one `$dateToString` / `$dateFromString` takes.
 fn check_format(kind: Kind, format: &str) -> Result<()> {
-    let op = kind.name();
     let allowed: &str = if kind == Kind::ToString { "YmdHMSLjwUVGuzZ%" } else { "dGHLmMSuVYzZ%" };
     let mut chars = format.chars();
-    let mut seen = String::new();
     while let Some(c) = chars.next() {
         if c != '%' {
             continue;
         }
         match chars.next() {
-            Some(s) if allowed.contains(s) => seen.push(s),
+            Some(s) if allowed.contains(s) => {}
             Some(s) => return err(format!("Invalid format character '%{s}' in format string")),
             None => return err("Unmatched '%' at end of format string".to_string()),
-        }
-    }
-    if kind == Kind::FromString {
-        if seen.contains(['G', 'V', 'u']) && seen.contains(['Y', 'm', 'd']) {
-            return err(format!(
-                "{op}: format cannot mix ISO week date and calendar date specifiers"
-            ));
-        }
-        if seen.contains('z') && seen.contains('Z') {
-            return err(format!("{op}: format cannot hold both %z and %Z"));
         }
     }
     Ok(())
@@ -1404,6 +1407,13 @@ fn parse_string(text: &str, format: Option<&str>, zone: &Zone, explicit_zone: bo
     if !iso_fields && !(r.year.is_some() && r.month.is_some() && r.day.is_some()) {
         return err(format!(
             "an incomplete date/time string has been found, with elements missing: \"{text}\""
+        ));
+    }
+    // ISO week-date fields and calendar ones do not mix. The reference finds this
+    // while reading the string, so it is a conversion error that `onError` takes.
+    if iso_fields && (r.year.is_some() || r.month.is_some() || r.day.is_some()) {
+        return err(format!(
+            "Error parsing date string '{text}'; Mixing of ISO dates with natural dates is not allowed"
         ));
     }
     if r.offset.is_some() && explicit_zone {
