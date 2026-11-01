@@ -503,9 +503,13 @@ impl Engine {
             return Err(StorageError::Stale { current: Some(found.stamp) });
         }
         let id = extract_id(&found.doc)?;
-        let next = spec
-            .apply(&found.doc)
-            .map_err(|e| StorageError::Core(kimmy_core::Error::InvalidQuery(e)))?;
+        let next = spec.apply(&found.doc).map_err(|e| match kimmy_core::deadline::check() {
+            // The spec reports its refusals as text, so a stop of the request's
+            // deadline inside it (a pipeline update's stage, ADR-266) arrives as one:
+            // if the deadline has passed, that is what it was.
+            Err(passed) => StorageError::Core(passed),
+            Ok(()) => StorageError::Core(kimmy_core::Error::InvalidQuery(e)),
+        })?;
         let entry = self.write_chosen(txn, coll, &id, found, next.as_ref())?;
         Ok((next, entry))
     }
@@ -1765,6 +1769,28 @@ mod tests {
 
     fn expire_deadline_for_this_test() {
         std::mem::forget(kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO)));
+    }
+
+    #[test]
+    fn a_stop_of_the_deadline_inside_the_specs_apply_is_a_timeout_not_an_invalid_query() {
+        // The spec reports its refusals as text (a pipeline update's stage stopped by the
+        // deadline included); the engine says what the text was.
+        let (engine, coll, _dir) = three_chunks();
+        let spec = TestSpec {
+            matches: |_: &Document| true,
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |_: &Document| {
+                expire_deadline_for_this_test();
+                Err("the request ran past its deadline and the work was stopped".to_string())
+            },
+            upsert: None,
+        };
+        let failed = engine.find_and_modify(&coll, &Candidates::Scan, &spec);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        assert!(claimed(&engine, &coll).is_empty());
     }
 
     #[test]

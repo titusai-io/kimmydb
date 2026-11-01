@@ -55,6 +55,12 @@ fn every_stage_looks_at_the_deadline_before_it_starts() {
         doc! { "$bucket": { "groupBy": "$v", "boundaries": [0, 10], "default": "other" } },
         doc! { "$bucketAuto": { "groupBy": "$v", "buckets": 2 } },
         doc! { "$facet": { "a": [{ "$limit": 1 }] } },
+        // The stages of ADR-263 that the pure pipeline runs: the generic entry covers them.
+        doc! { "$unset": "v" },
+        doc! { "$replaceWith": "$$ROOT" },
+        doc! { "$sortByCount": "$k" },
+        doc! { "$sample": { "size": 2 } },
+        doc! { "$redact": "$$KEEP" },
     ] {
         let name = spec.keys().next().unwrap().clone();
         let result = apply(&stage(spec), rows(3), &Limits::default());
@@ -276,4 +282,83 @@ fn short_arrays_in_many_documents_still_reach_the_cadence() {
         }
     }
     assert!(stopped, "five million evaluations ran under a 1 ms deadline");
+}
+
+fn redact_expr(spec: Bson) -> Expr {
+    Expr::parse_redact(&spec, &[]).expect("a $redact expression")
+}
+
+#[test]
+fn sample_stops_in_its_reservoir_loop_and_in_its_shuffle() {
+    let limits = Limits::default();
+    let first = |n: usize| n - 1;
+    {
+        let _deadline = expired();
+        let result = crate::stages::sample(rows(3), 2, &limits, &mut |n| first(n));
+        assert!(is_deadline(result), "the reservoir loop");
+    }
+    // The reservoir loop is over before the deadline is set: the position source is where
+    // it is set, on the first replacement, after the loop's only look at the clock. Only
+    // the shuffle that follows can see it.
+    let mut set = false;
+    let result = crate::stages::sample(rows(4), 2, &limits, &mut |n| {
+        if !set {
+            set = true;
+            std::mem::forget(Deadline::scope(Some(Duration::ZERO)));
+        }
+        first(n)
+    });
+    assert!(is_deadline(result), "the shuffle");
+}
+
+#[test]
+fn redact_stops_at_the_first_document_it_decides() {
+    let keep = redact_expr(Bson::String("$$DESCEND".into()));
+    assert!(crate::stages::redact(rows(2), &keep, &[]).is_ok());
+    {
+        let _deadline = expired();
+        assert!(is_deadline(crate::stages::redact(rows(1), &keep, &[])));
+    }
+    // Each scope restarts the shared count, so its first decision reads the clock. An
+    // embedded document is decided too: the descent into nested documents is stopped
+    // wherever the count reads the clock, the top document included.
+    let _deadline = expired();
+    let nested = vec![doc! { "a": { "b": { "c": 1 } } }];
+    assert!(is_deadline(crate::stages::redact(nested, &keep, &[])));
+}
+
+#[test]
+fn redact_stops_in_a_descent_through_many_embedded_documents() {
+    // One top document holding 60,000 small ones: the top decision passes (the deadline
+    // is still ahead), and the count reads the clock again at the 1,025th decision.
+    let mut wide = Document::new();
+    for i in 0..60_000 {
+        wide.insert(format!("k{i}"), doc! { "v": i });
+    }
+    let keep = redact_expr(Bson::String("$$DESCEND".into()));
+    let _deadline = soon();
+    assert!(is_deadline(crate::stages::redact(vec![wide], &keep, &[])));
+}
+
+#[test]
+fn sort_by_count_stops_in_its_group_loop() {
+    let expr = Expr::parse(&Bson::String("$k".into())).unwrap();
+    assert!(crate::stages::sort_by_count(rows(2), &expr, &Limits::default(), &[]).is_ok());
+    let _deadline = expired();
+    assert!(is_deadline(crate::stages::sort_by_count(rows(2), &expr, &Limits::default(), &[])));
+}
+
+#[test]
+fn a_pipeline_update_stops_at_the_first_stage_it_runs() {
+    let pipeline = crate::update_pipeline::UpdatePipeline::parse(&[
+        Bson::Document(doc! { "$set": { "w": { "$add": ["$v", 1] } } }),
+        Bson::Document(doc! { "$unset": "tags" }),
+    ])
+    .unwrap();
+    let mut seed = rows(1).remove(0);
+    pipeline.apply(&mut seed).unwrap();
+    assert_eq!(seed.get_i64("w").unwrap(), 1);
+    let _deadline = expired();
+    let mut again = rows(1).remove(0);
+    assert!(is_deadline(pipeline.apply(&mut again)));
 }

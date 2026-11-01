@@ -2839,6 +2839,7 @@ fn union_with(
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
+    deadline::check()?;
     let name = spec.coll.as_str();
     kimmy_core::Error::validate_name(name)?;
     // Resolved the way `$lookup` and `$graphLookup` resolve theirs (see
@@ -2857,9 +2858,14 @@ fn union_with(
             state,
             meta,
             limits,
-            |doc| match &lead {
-                Some(lead) => Ok(filter::matches_with(lead, doc, vars)?),
-                None => Ok(true),
+            |doc| {
+                // Per document read (ADR-266): the walk ticks per row too, but the
+                // leading `$match` can cost more than the row.
+                deadline::tick()?;
+                match &lead {
+                    Some(lead) => Ok(filter::matches_with(lead, doc, vars)?),
+                    None => Ok(true),
+                }
             },
             |max| {
                 format!(
@@ -2879,7 +2885,9 @@ fn union_with(
     // size a stored document may be, `413` at the document that passes it.
     let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
     let mut bytes = 0usize;
+    let mut ticker = deadline::Ticker::new();
     for doc in &appended {
+        ticker.tick()?;
         bytes += bson::serialize_to_vec(doc)
             .map_err(|e| kimmy_core::Error::Internal(format!("$unionWith could not encode: {e}")))?
             .len();
@@ -2894,6 +2902,8 @@ fn union_with(
         }
     }
     aggregate::check_limit("$unionWith", input.len() + appended.len(), limits)?;
+    // The look before the append, so that a stage cut by the deadline is cut whole.
+    deadline::check()?;
     input.extend(appended);
     Ok(input)
 }

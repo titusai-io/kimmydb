@@ -1997,7 +1997,11 @@ under the request's deadline, `server.request_timeout_secs` (30 s by default,
 loop in a stage looks at it every 1,024 iterations (`$map`, `$filter` and
 `$reduce` count their elements, and `$sort` is done in runs of 4,096 documents
 with a look between them), and the reads of other collections by `$lookup` and
-`$graphLookup` look at it per row. Past the deadline the pipeline stops and the
+`$graphLookup` look at it per row; `$unionWith` looks at it per document it
+reads and per document it appends, `$sample` in its reservoir and its shuffle,
+`$redact` for every document it decides at any depth, and `$sortByCount` as
+`$group` and `$sort` do. A pipeline-style update is checked at each of its
+stages for each document, until the update's first commit. Past the deadline the pipeline stops and the
 request is answered `503 timeout`, the answer the server gives a request it
 abandons while waiting, over REST and `/mcp`; its worker is free at once. A
 single operation that cannot be split, such as one regular expression over a

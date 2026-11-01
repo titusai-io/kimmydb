@@ -270,3 +270,62 @@ fn the_deadline_a_call_sets_is_removed_when_it_returns_even_by_an_error() {
     // And a call outside any request, on the same thread, is not cut.
     assert!(find(&state, &root(), "app", "orders", FindParams::default()).is_ok());
 }
+
+#[test]
+fn union_with_is_cut_at_a_passed_deadline_with_its_collection_present_or_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_data(&dir);
+    for from in ["items", "absent"] {
+        // A leading `$match` in the sub-pipeline is applied as the foreign side is read.
+        for sub in [json!([]), json!([{ "$match": { "k": 1 } }, { "$limit": 5 }])] {
+            let pipeline = json!([{ "$match": { "_id": { "$in": [] } } },
+                                  { "$unionWith": { "coll": from, "pipeline": sub } }]);
+            let late = aggregate_in_a_request(&state, &pipeline, PAST);
+            assert!(is_the_timeout(&late), "{pipeline}: {late:?}");
+            let on_time = aggregate_in_a_request(&state, &pipeline, PLENTY);
+            assert!(on_time.is_ok(), "{pipeline}: {on_time:?}");
+        }
+    }
+    // With the source read too.
+    let pipeline = json!([{ "$unionWith": "items" }, { "$sample": { "size": 3 } },
+                          { "$redact": "$$DESCEND" }, { "$sortByCount": "$k" }]);
+    assert!(is_the_timeout(&aggregate_in_a_request(&state, &pipeline, PAST)));
+    assert!(aggregate_in_a_request(&state, &pipeline, PLENTY).is_ok());
+}
+
+#[test]
+fn a_pipeline_update_is_cut_before_it_writes_and_runs_with_time_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_data(&dir);
+    let set = json!([{ "$set": { "touched": { "$add": ["$v", 1] } } }]);
+    let params =
+        |multi: bool| WriteParams { filter: Some(json!({ "k": 1 })), multi, ..Default::default() };
+    for multi in [false, true] {
+        let cut =
+            in_a_request(PAST, || update(&state, &root(), "app", "orders", &set, params(multi)));
+        assert!(is_the_timeout(&cut), "multi={multi}: {cut:?}");
+    }
+    let spec = FindAndModifySpec {
+        filter: Some(json!({ "k": 1 })),
+        sort: Some(json!({ "v": 1 })),
+        update: Some(set.clone()),
+        remove: false,
+        upsert: false,
+        return_document: ReturnDocument::After,
+        projection: None,
+        if_stamp: None,
+        array_filters: Vec::new(),
+    };
+    let cut = in_a_request(PAST, || find_and_modify(&state, &root(), "app", "orders", spec));
+    assert!(is_the_timeout(&cut), "find_and_modify: {cut:?}");
+    let meta = state.engine.get_collection("app", "orders").unwrap();
+    for id in 0..6 {
+        let stored = state.engine.get(&meta, &DocId::Int64(id)).unwrap().unwrap();
+        assert!(!stored.contains_key("touched"), "{id}: written by a request that was cut");
+    }
+    let done =
+        in_a_request(PLENTY, || update(&state, &root(), "app", "orders", &set, params(true)));
+    assert_eq!(done.unwrap()["modified"], 2);
+    let stored = state.engine.get(&meta, &DocId::Int64(1)).unwrap().unwrap();
+    assert_eq!(stored.get_i64("touched").unwrap(), 2);
+}
