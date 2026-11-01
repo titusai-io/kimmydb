@@ -1013,14 +1013,14 @@ update that stores one stores the reference's type.
 |---|---|
 | `$add`, `$subtract`, `$multiply` | `Int32` with `Int32` is an `Int32`, an `Int64` when the final total does not fit `Int32` (`[2147483647, 1, -1]` is an `Int32`, `[65536, 65536, 0]` an `Int32` `0`); any `Int64` operand gives an `Int64`, and a long `$add` chain is summed exactly (`[LMAX, 1, -1]` is the long `LMAX`); a total past `Int64`, or any double operand, gives a double; a decimal operand gives a decimal. `$subtract` of two dates is an `Int64` (milliseconds) |
 | `$divide` | A double (a decimal with a decimal operand) |
-| `$mod` | `Int32` with `Int32` is an `Int32` (`x % -1` is `0`, the smallest `Int32` included); an `Int64` operand gives an `Int64`; an integer by a whole-number double is an integer in the dividend's width (`7 % 2.0` is the `Int32` `1`); a double dividend, or a divisor with a fraction, gives a double |
+| `$mod` | `Int32` with `Int32` is an `Int32` (`x % -1` is `0`, the smallest `Int32` included); an `Int64` operand gives an `Int64`; an integer by a whole-number double that fits `Int32` is an integer in the dividend's width (`7 % 2.0` is the `Int32` `1`); a double dividend, a divisor with a fraction, or a whole divisor past `Int32` (`7 % 1e10`) gives a double |
 | `$abs` | The operand's width. `$abs` of the smallest `Int32` is the `Int64` `2147483648`; of the smallest `Int64`, `400` (the reference's `28680`) |
 | `$ceil`, `$floor` | The operand's width |
 | `$round`, `$trunc` | The operand's width (an `Int32` rounded up past `Int32` is an `Int64`; an `Int64` rounded up past `Int64` is `400`, the reference's `51080`) |
 | `$pow` | Two `Int32`s give an `Int32` while the power fits one, an `Int64` after; an `Int64` operand gives an `Int64`; past `Int64`, a double. `1` and `-1` to a negative whole power are an `Int32` (an `Int64` with an `Int64` operand), not a double |
 | `$size`, `$strLenCP`, `$strLenBytes`, `$indexOfArray`, `$indexOfCP`, `$indexOfBytes` | `Int32` (`-1` for no match is an `Int32`) |
 | `idx` of `$regexFind` and `$regexFindAll` | `Int32` |
-| `$range` | `Int32` elements; a bound or a step past `Int32` is `400` (the reference's `34445`, `34447`, `34449`) |
+| `$range` | `Int32` elements; a bound or a step past `Int32` is `400` (the reference's `34444`, `34446`, `34448`) |
 | `$cmp`, `$strcasecmp` | `Int32` |
 | `$year`, `$month`, `$dayOfMonth`, `$hour`, `$minute`, `$second`, `$millisecond`, `$dayOfWeek`, `$dayOfYear`, `$week`, `$isoWeek`, `$isoDayOfWeek` | `Int32` |
 | `$isoWeekYear`, `$dateDiff` | `Int64` |

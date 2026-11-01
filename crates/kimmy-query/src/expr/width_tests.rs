@@ -154,7 +154,12 @@ fn mod_of_an_integer_by_a_whole_number_double_is_an_integer() {
     assert_eq!(ok(doc! {"$mod": [7, 2.0]}), Bson::Int32(1));
     assert_eq!(ok(doc! {"$mod": [7i64, 2.0]}), Bson::Int64(1));
     assert_eq!(ok(doc! {"$mod": [-7, 2.0]}), Bson::Int32(-1));
-    assert_eq!(ok(doc! {"$mod": [7, 10_000_000_000.0]}), Bson::Int64(7));
+    // Past `Int32` the reference does not read the divisor as an integer: `fmod`, a double.
+    assert_eq!(ok(doc! {"$mod": [7, 10_000_000_000.0]}), Bson::Double(7.0));
+    assert_eq!(ok(doc! {"$mod": [7i64, 10_000_000_000.0]}), Bson::Double(7.0));
+    assert_eq!(ok(doc! {"$mod": [7, 2_147_483_647.0]}), Bson::Int32(7));
+    assert_eq!(ok(doc! {"$mod": [7, 2_147_483_648.0]}), Bson::Double(7.0));
+    assert_eq!(ok(doc! {"$mod": [7, -2_147_483_648.0]}), Bson::Int32(7));
     assert_eq!(ok(doc! {"$mod": [3.0, 2]}), Bson::Double(1.0));
     assert_eq!(ok(doc! {"$mod": [3.0, 2.0]}), Bson::Double(1.0));
     assert_eq!(ok(doc! {"$mod": [7, 2.5]}), Bson::Double(2.0));
@@ -282,7 +287,7 @@ fn range_elements_are_int32_and_a_bound_past_int32_is_refused() {
         ok(doc! {"$range": [MAX - 2, MAX]}),
         Bson::Array(vec![Bson::Int32(MAX - 2), Bson::Int32(MAX - 1)])
     );
-    // A bound or a step past `Int32` is refused (the reference's 34445, 34447, 34449).
+    // A bound or a step past `Int32` is refused (the reference's 34444, 34446, 34448).
     for expr in [
         doc! {"$range": [i64::from(MAX) + 1, i64::from(MAX) + 3]},
         doc! {"$range": [0, i64::from(MAX) + 1]},

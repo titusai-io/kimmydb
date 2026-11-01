@@ -2906,15 +2906,16 @@ fn modulo(a: &Bson, b: &Bson) -> Result<Bson> {
     };
     // `x % -1` is 0 for every `x`, the smallest integer included (where the
     // machine's remainder would trap), as the reference answers it.
-    // An integer dividend by a whole-number double is an integer remainder, in the
-    // dividend's width (`7 % 2.0` is the int 1, a long `7 % 2.0` the long 1); a double
-    // dividend, or a divisor with a fraction, is `fmod` (ADR-268).
+    // An integer dividend by a whole-number double that fits an `Int32` is an integer
+    // remainder, in the dividend's width (`7 % 2.0` is the int 1, a long `7 % 2.0` the
+    // long 1): the reference reads such a double as an integer (`Value::integral()` is
+    // 32-bit bounded). A double dividend, a divisor with a fraction and a whole divisor
+    // past `Int32` (`7 % 1e10`) are `fmod`, a double (ADR-268).
     let y = match (*x, *y) {
-        (Num::Int32(_), Num::Dbl(d)) if d.fract() == 0.0 && d.abs() < 9.2e18 => {
-            i32::try_from(d as i64).map_or(Num::Int64(d as i64), Num::Int32)
-        }
-        (Num::Int64(_), Num::Dbl(d)) if d.fract() == 0.0 && d.abs() < 9.2e18 => {
-            Num::Int64(d as i64)
+        (Num::Int32(_) | Num::Int64(_), Num::Dbl(d))
+            if d.fract() == 0.0 && d >= f64::from(i32::MIN) && d <= f64::from(i32::MAX) =>
+        {
+            Num::Int32(d as i32)
         }
         (_, y) => y,
     };
@@ -3287,7 +3288,7 @@ fn range(args: &[Bson]) -> Result<Bson> {
         }
     }
     // The reference takes 32-bit bounds and a 32-bit step, and refuses a long past them
-    // (`34445`, `34447`, `34449`); its elements are all `Int32` (ADR-268).
+    // (`34444`, `34446`, `34448`); its elements are all `Int32` (ADR-268).
     for (n, what) in nums.iter().zip(["a starting", "an ending", "a step"]) {
         if i32::try_from(*n).is_err() {
             return Err(Error::InvalidQuery(format!(

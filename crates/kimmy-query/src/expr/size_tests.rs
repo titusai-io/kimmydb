@@ -216,7 +216,7 @@ fn range_is_bounded_before_it_allocates() {
             "{err:?}"
         );
     }
-    // A bound past `Int32` is refused as a 32-bit bound, as the reference refuses it (34447).
+    // A bound past `Int32` is refused as a 32-bit bound, as the reference refuses it (34446).
     let err = ev(doc! {"$range": [Bson::Int64(0), Bson::Int64(i64::MAX)]}, &doc! {}).unwrap_err();
     assert!(matches!(&err, Error::InvalidQuery(m) if m.contains("32-bit integer")), "{err:?}");
     assert_eq!(
