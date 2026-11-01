@@ -492,7 +492,7 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
 
     // Partitions in ascending order of their values, by value within.
     let mut order: Vec<usize> = (0..parts.len()).collect();
-    order.sort_by(|&a, &b| compare_fields(&parts[a].rep, &parts[b].rep));
+    order.sort_by(|&a, &b| compare_fields(&parts[a].rep, &parts[b].rep, false));
     rows.sort_by(|a, b| canonical_cmp(&a.value, &b.value));
 
     let grid = Grid { step: &spec.step, unit: spec.unit.as_deref() };

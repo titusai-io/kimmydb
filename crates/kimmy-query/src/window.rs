@@ -92,6 +92,20 @@ pub enum Window {
     Range { lo: RangeBound, hi: RangeBound, unit: Option<String> },
 }
 
+impl Window {
+    /// Whether the window starts at the first document of the partition for every
+    /// document: the whole partition, or a lower bound that is `"unbounded"`. The reference
+    /// computes such a window with the plain accumulator and any other with one that can
+    /// take a document out, and the two answer a one-value deviation differently.
+    pub(crate) fn starts_unbounded(&self) -> bool {
+        match self {
+            Window::Whole | Window::Documents(None, _) => true,
+            Window::Range { lo, .. } => matches!(lo, RangeBound::Unbounded),
+            Window::Documents(Some(_), _) => false,
+        }
+    }
+}
+
 /// What one output field computes.
 #[derive(Clone, Debug)]
 pub enum Func {
@@ -299,8 +313,10 @@ fn parse_output(
     let Some((op, arg)) = op else {
         return bad(format!("$setWindowFields output `{name}` names no window operator"));
     };
+    // A `sortBy` is needed, and `sortBy: {}` is one: no order, so the documents are taken
+    // in the order they arrive, as the reference takes them.
     let need_sort = |why: &str| -> Result<()> {
-        if sort.is_empty() {
+        if !sort_given {
             return bad(format!("{op} requires a `sortBy`: {why}"));
         }
         Ok(())
@@ -716,15 +732,25 @@ pub(crate) enum Rep {
     Fields(Vec<Option<Bson>>),
 }
 
-/// Partitions order by their values in the canonical order, `null` before a missing field.
-pub(crate) fn compare_fields(a: &[Option<Bson>], b: &[Option<Bson>]) -> Ordering {
+/// Partitions order by their values in the canonical order. A field a document does not
+/// have sorts as a null: after a null that is there when `missing_first` is false
+/// (`$densify`), before it when it is true (`$fill`), as the reference orders each.
+pub(crate) fn compare_fields(
+    a: &[Option<Bson>],
+    b: &[Option<Bson>],
+    missing_first: bool,
+) -> Ordering {
+    let (before, after) = if missing_first {
+        (Ordering::Less, Ordering::Greater)
+    } else {
+        (Ordering::Greater, Ordering::Less)
+    };
     for (x, y) in a.iter().zip(b) {
         let o = match (x, y) {
             (Some(x), Some(y)) => canonical_cmp(x, y),
             (None, None) => Ordering::Equal,
-            // A missing field sorts as null, after a null that is there.
-            (None, Some(y)) => canonical_cmp(&Bson::Null, y).then(Ordering::Greater),
-            (Some(x), None) => canonical_cmp(x, &Bson::Null).then(Ordering::Less),
+            (None, Some(y)) => canonical_cmp(&Bson::Null, y).then(before),
+            (Some(x), None) => canonical_cmp(x, &Bson::Null).then(after),
         };
         if o.is_ne() {
             return o;
@@ -737,7 +763,7 @@ impl Rep {
     fn compare(&self, other: &Rep) -> Ordering {
         match (self, other) {
             (Rep::One(a), Rep::One(b)) => canonical_cmp(a, b),
-            (Rep::Fields(a), Rep::Fields(b)) => compare_fields(a, b),
+            (Rep::Fields(a), Rep::Fields(b)) => compare_fields(a, b, true),
             _ => Ordering::Equal,
         }
     }
@@ -858,7 +884,7 @@ fn compute(
     match func {
         Func::Acc { acc, window } => {
             let ends = endpoints(acc_name(acc), window, docs, sort)?;
-            accumulator(acc, docs, &ends, run, sink)
+            accumulator(acc, docs, &ends, run, sink, window.starts_unbounded())
         }
         Func::Covariance { exprs, sample, window } => {
             let op = if *sample { "$covarianceSamp" } else { "$covariancePop" };
@@ -1062,7 +1088,8 @@ impl Axis {
     fn delta(&self, a: usize, b: usize) -> f64 {
         match self {
             Axis::Num(v) => v[b] - v[a],
-            Axis::Date(v, per) => (v[b] - v[a]) as f64 / per,
+            // In 128 bits: two dates a span over 2^63 ms apart do not wrap.
+            Axis::Date(v, per) => (i128::from(v[b]) - i128::from(v[a])) as f64 / per,
         }
     }
 
@@ -1070,7 +1097,7 @@ impl Axis {
     fn raw_delta(&self, a: usize, b: usize) -> f64 {
         match self {
             Axis::Num(v) => v[b] - v[a],
-            Axis::Date(v, _) => (v[b] - v[a]) as f64,
+            Axis::Date(v, _) => (i128::from(v[b]) - i128::from(v[a])) as f64,
         }
     }
 
@@ -1199,6 +1226,7 @@ fn accumulator(
     ends: &[(usize, usize)],
     run: &Run<'_, '_>,
     sink: &mut Sink<'_>,
+    from_start: bool,
 ) -> Result<Cells> {
     let n = docs.len();
     let vars = run.vars;
@@ -1235,7 +1263,7 @@ fn accumulator(
         }
         _ => {}
     }
-    let mut slider = make_slider(acc, docs, vars)?;
+    let mut slider = make_slider(acc, docs, vars, from_start)?;
     slide(slider.as_mut(), docs, ends, sink)
 }
 
@@ -1244,6 +1272,7 @@ fn make_slider<'a, 'v>(
     acc: &'a Accumulator,
     docs: &[Document],
     vars: &'a [Binding<'v>],
+    from_start: bool,
 ) -> Result<Box<dyn Slider + 'a>> {
     Ok(match acc {
         Accumulator::Sum(e) => Box::new(SumSlider::new(e, false, vars)),
@@ -1253,8 +1282,8 @@ fn make_slider<'a, 'v>(
         Accumulator::Push(e) => Box::new(QueueSlider::new(e, Queue::Push, usize::MAX, vars)),
         Accumulator::AddToSet(e) => Box::new(SetSlider::new(e, vars)),
         Accumulator::Ext(spec) => match spec.kind {
-            Kind::StdDevPop => Box::new(StdDevSlider::new(&spec.value, false, vars)),
-            Kind::StdDevSamp => Box::new(StdDevSlider::new(&spec.value, true, vars)),
+            Kind::StdDevPop => Box::new(StdDevSlider::new(&spec.value, false, vars, from_start)),
+            Kind::StdDevSamp => Box::new(StdDevSlider::new(&spec.value, true, vars, from_start)),
             Kind::Top | Kind::Bottom | Kind::TopN | Kind::BottomN => {
                 Box::new(RankedSlider::new(spec, docs, vars)?)
             }

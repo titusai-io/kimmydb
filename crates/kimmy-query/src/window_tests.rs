@@ -2663,3 +2663,150 @@ fn an_integral_of_values_near_the_largest_slides_exactly_and_in_time() {
     assert_eq!(out[99_999].get("i2"), Some(&Bson::Double(1.0)));
     assert_eq!(out[99_999].get("i4"), Some(&Bson::Double(3.0)));
 }
+
+// ---------------------------------------------------------------------------
+// The #278 delta leftovers (d1 to d6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_decimal_running_sum_takes_a_value_out_when_it_leaves_the_window() {
+    // The sum is decimal once a `Decimal128` is in the window, and a number that leaves
+    // it, a decimal or not, comes off the running sum: 1.5, 3.5, 5.5, 7.75, 4.75.
+    let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+    let input = vec![
+        doc! {"_id": 1, "qty": dec("1.5")},
+        doc! {"_id": 2, "qty": 2},
+        doc! {"_id": 3, "qty": dec("3.5")},
+        doc! {"_id": 4, "qty": 4.25},
+        doc! {"_id": 5, "qty": dec("0.5")},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "s": {"$sum": "$qty", "window": {"documents": [-1, 0]}},
+            "a": {"$avg": "$qty", "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    let value = |b: &Bson| match b {
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap(),
+        other => panic!("{other:?} is not a decimal"),
+    };
+    let sums: Vec<f64> = col(&out, "s").iter().map(value).collect();
+    assert_eq!(sums, vec![1.5, 3.5, 5.5, 7.75, 4.75]);
+    let avgs: Vec<f64> = col(&out, "a").iter().map(value).collect();
+    assert_eq!(avgs, vec![1.5, 1.75, 2.75, 3.875, 2.375]);
+}
+
+#[test]
+fn a_derivative_over_dates_subtracts_the_dates_before_it_scales_them() {
+    // One second apart, in hours: the difference is worked out exactly in milliseconds and
+    // then scaled. Scaled first, each date is a number near 4.6e5 hours with an error of
+    // 6e-11, which is 2e-7 of the difference.
+    let input = vec![
+        doc! {"t": d("2023-01-01T00:00:00.001Z"), "y": 10},
+        doc! {"t": d("2023-01-01T00:00:01.001Z"), "y": 20},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"t": 1}, "output": {
+            "d": {"$derivative": {"input": "$y", "unit": "hour"}, "window": {"documents": [-1, 0]}},
+            "i": {"$integral": {"input": "$y", "unit": "hour"}, "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    let hours = 1000.0 / 3_600_000.0;
+    assert_eq!(col(&out, "d")[1], Bson::Double(10.0 / hours));
+    assert_eq!(col(&out, "i")[1], Bson::Double(hours * (10.0 + 20.0) / 2.0));
+}
+
+#[test]
+fn two_dates_more_than_two_to_the_sixty_three_milliseconds_apart_do_not_wrap() {
+    // The span of the earliest and the latest date a `DateTime` holds is 2^64 ms: in 64 bits
+    // it wraps to a small or negative number.
+    let input = vec![
+        doc! {"t": bson::DateTime::from_millis(i64::MIN), "y": 0.0},
+        doc! {"t": bson::DateTime::from_millis(i64::MAX), "y": 1.0},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"t": 1}, "output": {
+            "d": {"$derivative": {"input": "$y", "unit": "millisecond"}, "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    let Bson::Double(slope) = col(&out, "d")[1] else { panic!("{out:?}") };
+    let span = 2f64.powi(64);
+    assert!((slope - 1.0 / span).abs() < 1e-25, "{slope}");
+}
+
+#[test]
+fn sort_by_nothing_is_accepted_by_shift_and_the_moving_average_in_arrival_order() {
+    let input =
+        vec![doc! {"_id": 1, "qty": 10}, doc! {"_id": 3, "qty": 30}, doc! {"_id": 2, "qty": 20}];
+    let out = run(
+        set(doc! {"sortBy": {}, "output": {
+            "next": {"$shift": {"output": "$qty", "by": 1, "default": -1}},
+            "ema": {"$expMovingAvg": {"input": "$qty", "alpha": 0.5}},
+        }}),
+        input,
+    )
+    .unwrap();
+    // Arrival order: 1, 3, 2.
+    assert_eq!(ids(&out), vec![1, 3, 2]);
+    assert_eq!(col(&out, "next"), ints(&[30, 20, -1]));
+    assert_eq!(col(&out, "ema"), f64s(&[10.0, 20.0, 20.0]));
+    // With no `sortBy` at all they are still refused.
+    let e = refused(set(doc! {"output": {"n": {"$shift": {"output": "$qty", "by": 1}}}}));
+    assert!(e.contains("requires a `sortBy`"), "{e}");
+    let e =
+        refused(set(doc! {"output": {"n": {"$expMovingAvg": {"input": "$qty", "alpha": 0.5}}}}));
+    assert!(e.contains("requires a `sortBy`"), "{e}");
+}
+
+#[test]
+fn a_deviation_of_one_value_is_a_double_zero_over_the_whole_partition_and_an_int_in_a_window() {
+    // The reference computes a window that starts at the partition's first document with the
+    // plain accumulator, which answers a double zero for one value, and any other window with
+    // one that can take a document out, which answers an integer zero.
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "whole": {"$stdDevPop": "$qty"},
+            "all": {"$stdDevPop": "$qty", "window": {"documents": ["unbounded", "unbounded"]}},
+            "cumulative": {"$stdDevPop": "$qty", "window": {"documents": ["unbounded", "current"]}},
+            "sliding": {"$stdDevPop": "$qty", "window": {"documents": [-1, 0]}},
+            "alone": {"$stdDevPop": "$qty", "window": {"documents": [0, 0]}},
+        }}),
+        series(&[5]),
+    )
+    .unwrap();
+    for field in ["whole", "all", "cumulative"] {
+        assert_eq!(col(&out, field), vec![Bson::Double(0.0)], "{field}");
+    }
+    for field in ["sliding", "alone"] {
+        assert_eq!(col(&out, field), vec![Bson::Int32(0)], "{field}");
+    }
+}
+
+#[test]
+fn fill_orders_a_missing_partition_before_a_null_one() {
+    let input = vec![
+        doc! {"_id": 1, "g": Bson::Null, "v": 1},
+        doc! {"_id": 2, "v": 2},
+        doc! {"_id": 3, "g": 5, "v": 3},
+        doc! {"_id": 4, "g": Bson::Null, "v": Bson::Null},
+        doc! {"_id": 5, "v": Bson::Null},
+    ];
+    let stage = aggregate::parse(&[doc! {"$fill": {
+        "partitionByFields": ["g"], "sortBy": {"_id": 1}, "output": {"v": {"method": "locf"}},
+    }}])
+    .unwrap()
+    .remove(0);
+    let out = aggregate::apply(&stage, input, &Limits::default()).unwrap();
+    // The partitions leave in the reference's order: missing, null, 5.
+    assert_eq!(ids(&out), vec![2, 5, 1, 4, 3]);
+    assert_eq!(
+        col(&out, "v"),
+        vec![Bson::Int32(2), Bson::Int32(2), Bson::Int32(1), Bson::Int32(1), Bson::Int32(3)]
+    );
+}
