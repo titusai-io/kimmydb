@@ -33,6 +33,8 @@ mod accumulator_tests;
 #[cfg(test)]
 mod bucket_tests;
 #[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
 mod date_tests;
 #[cfg(test)]
 mod decimal_arith_tests;
