@@ -2799,11 +2799,10 @@ fn the_other_window_functions_have_the_references_widths() {
         vec![d(1.0), d(1.5)]
     );
     for rank in ["$rank", "$denseRank", "$documentNumber"] {
+        // Sorted by `_id`, so no ties: 1, 2, 3 as ints.
         assert_eq!(
-            widths(vec![i(1), i(1), i(2)], doc! {rank: {}})
-                .iter()
-                .all(|v| matches!(v, Bson::Int32(_))),
-            true,
+            widths(vec![i(1), i(1), i(2)], doc! {rank: {}}),
+            vec![i(1), i(2), i(3)],
             "{rank}"
         );
     }
