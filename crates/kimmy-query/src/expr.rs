@@ -2199,7 +2199,11 @@ fn eval_zip(
     let mut out = Vec::with_capacity(rows);
     for i in 0..rows {
         let row = Bson::Array(
-            arrays.iter().zip(&padding).map(|(array, pad)| array.get(i).unwrap_or(pad).clone()).collect(),
+            arrays
+                .iter()
+                .zip(&padding)
+                .map(|(array, pad)| array.get(i).unwrap_or(pad).clone())
+                .collect(),
         );
         budget.add(&row)?;
         out.push(row);

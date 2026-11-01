@@ -627,20 +627,9 @@ mod tests {
     #[test]
     fn still_refused_are_what_the_engine_cannot_run() {
         for pattern in [
-            r"\Qa.b\E",
-            "(?>a)",
-            r"(a)\1",
-            "(?=a)",
-            "(?<!a)b",
-            r"\Z",
-            r"\G",
+            r"\Qa.b\E", "(?>a)", r"(a)\1", "(?=a)", "(?<!a)b", r"\Z", r"\G",
             // PCRE escapes that work in the reference and are not in `regex`'s syntax.
-            r"\h",
-            r"\H",
-            r"\R",
-            r"\X",
-            r"\K",
-            r"\C",
+            r"\h", r"\H", r"\R", r"\X", r"\K", r"\C",
         ] {
             assert!(RegexPattern::new(pattern, "").is_err(), "{pattern}");
         }
