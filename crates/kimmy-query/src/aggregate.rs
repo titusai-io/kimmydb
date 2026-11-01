@@ -1156,8 +1156,8 @@ fn parse_replace_root(spec: &Document, vars: &[String]) -> Result<Stage> {
 ///
 /// The collection is in the database the pipeline runs in, as a `$lookup`'s `from` is.
 /// The sub-pipeline is parsed in the scope the stage sits in (so an enclosing
-/// `$lookup`'s `let` names are readable) with `$out`, `$merge`, `$vectorSearch` and
-/// `$facet` refused anywhere under it.
+/// `$lookup`'s `let` names are readable) with `$out`, `$merge` and `$vectorSearch`
+/// refused anywhere under it. A `$facet` is allowed in it, as the reference allows one.
 fn parse_union_with(value: &Bson, vars: &[String], at: Placement) -> Result<Stage> {
     let (coll, raw) = match value {
         Bson::String(coll) => (coll.clone(), None),
@@ -2957,9 +2957,10 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], doc! { "_id": 1, "skus": strings(&["a", "b"]), "n": 2i64 });
         assert_eq!(out[3], doc! { "_id": 4, "skus": [], "n": 0i64 });
-        // A missing path is null, as it always was; `$size` of null is null
-        // rather than an error, as the deviations register records.
-        assert_eq!(out[4], doc! { "_id": 5, "skus": Bson::Null, "n": Bson::Null });
+        // A missing path leaves the field out of `$addFields` (so there is no `skus` to
+        // project); `$size` of a missing field is null rather than an error, as the
+        // deviations register records.
+        assert_eq!(out[4], doc! { "_id": 5, "n": Bson::Null });
     }
 
     #[test]
@@ -5111,10 +5112,11 @@ mod identity {
             let out = run(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
             assert_eq!(out[0].get("r"), Some(&want), "{op}");
         }
+        // `$mod` takes a decimal too: the exact remainder.
         let mut expr = Document::new();
         expr.insert("$mod", vec![Bson::from("$v"), Bson::Int32(1)]);
-        let msg = refused(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
-        assert_eq!(msg, "invalid query: $mod needs numbers, found a Decimal128");
+        let out = run(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
+        assert_eq!(out[0].get("r"), Some(&dec("0.5")));
     }
 
     /// A number re-spelled as an equal value of another type, or a decimal as

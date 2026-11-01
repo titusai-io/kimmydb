@@ -1,7 +1,7 @@
 //! `$unionWith` (ADR-263), run by the caller: the order of its output, the sub-pipeline,
 //! a collection that is not there, and the document and byte limits it is held to.
 
-use bson::{Document, doc};
+use bson::doc;
 use serde_json::{Value, json};
 
 use super::tests::{agg, agg_limits, live_state, seed_docs};
@@ -208,59 +208,65 @@ fn a_sub_pipeline_that_grows_its_input_is_held_to_the_limit_too() {
     assert!(format!("{err:?}").contains("$unwind produced 6"), "{err:?}");
 }
 
-#[test]
-fn the_bytes_read_and_the_bytes_the_sub_pipeline_outputs_are_held_to_the_cap() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = live_state(&dir);
-    seed_docs(&state, "orders", vec![doc! {"_id": 1}]);
-    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
-    // Five documents of a quarter of the cap each: the fifth passes it.
-    let pad = "x".repeat(cap / 4);
-    let big: Vec<Document> = (0..5).map(|i| doc! {"_id": i, "pad": pad.clone()}).collect();
-    seed_docs(&state, "big", big);
-    let err = run(&state, json!([{"$unionWith": "big"}])).expect_err("over the cap");
-    assert_eq!(err.status, 413, "{err:?}");
-    assert!(err.message.contains("$unionWith collection read"), "{err:?}");
-    // Four fit.
-    let ok = run(
-        &state,
-        json!([{"$unionWith": {"coll": "big", "pipeline": [{"$match": {"_id": {"$lt": 3}}}]}}]),
-    )
-    .unwrap();
-    assert_eq!(ok["count"], 4);
-    // What the sub-pipeline outputs is held to the cap as well, though what it read was
-    // not over it: each document twice over.
-    let err = run(
-        &state,
-        json!([{"$unionWith": {"coll": "big", "pipeline": [
-            {"$match": {"_id": {"$lt": 3}}},
-            {"$addFields": {"again": "$pad"}}]}}]),
-    )
-    .expect_err("the output is over");
-    assert_eq!(err.status, 413, "{err:?}");
-    assert!(err.message.contains("$unionWith output"), "{err:?}");
+/// 100 documents of 200 KB: 20 MB, over what a stored document may be.
+fn fat(state: &SharedState) {
+    let pad = "x".repeat(200 * 1024);
+    seed_docs(state, "fat", (0..100).map(|i| doc! {"_id": i, "pad": pad.clone()}).collect());
 }
 
 #[test]
-fn the_read_of_a_collection_over_the_byte_cap_stops_at_the_document_that_passes_it() {
+fn a_collection_over_16_mib_that_the_sub_pipeline_projects_down_is_answered() {
+    // What is scanned is held to the document limit only, as a `$lookup`'s foreign read
+    // is; the byte cap is on what the stage appends.
     let dir = tempfile::tempdir().unwrap();
     let state = live_state(&dir);
-    seed_docs(&state, "orders", vec![doc! {"_id": 1}]);
-    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
-    let pad = "x".repeat(cap / 2);
-    seed_docs(&state, "big", (0..4).map(|i| doc! {"_id": i, "pad": pad.clone()}).collect());
-    let err = run(&state, json!([{"$unionWith": "big"}])).expect_err("over the cap");
-    // Two half-cap documents are over the cap with their keys: refused at the second, at
-    // roughly the cap, not after reading all four.
-    // "... answer of N bytes ..." is how AnswerTooLarge renders; the first number over a
-    // thousand is the bytes held when it was refused.
-    let bytes = err
-        .message
-        .split(|c: char| !c.is_ascii_digit())
-        .filter_map(|w| w.parse::<usize>().ok())
-        .find(|n| *n > 1000)
-        .unwrap_or(0);
-    assert!(bytes > cap && bytes < cap + cap / 2, "{bytes} for a cap of {cap}");
+    seed_docs(&state, "orders", vec![doc! {"_id": -1}]);
+    fat(&state);
+    for pipeline in [
+        json!([{"$project": {"_id": 1}}]),
+        json!([{"$match": {"_id": {"$lt": 3}}}, {"$project": {"_id": 1}}]),
+        json!([{"$sort": {"_id": -1}}, {"$limit": 5}, {"$project": {"_id": 1}}]),
+        json!([{"$group": {"_id": null, "n": {"$sum": 1}}}]),
+    ] {
+        let out =
+            run(&state, json!([{"$unionWith": {"coll": "fat", "pipeline": pipeline.clone()}}]))
+                .unwrap_or_else(|e| panic!("{pipeline}: {e:?}"));
+        assert!(out["count"].as_u64().unwrap() >= 2, "{pipeline}: {out}");
+    }
+    // The same collection through `$lookup` is answered, with the same read.
+    let out = run(
+        &state,
+        json!([{"$lookup": {"from": "fat", "pipeline": [{"$project": {"_id": 1}}], "as": "j"}}]),
+    )
+    .unwrap();
+    assert_eq!(out["documents"][0]["j"].as_array().unwrap().len(), 100);
+}
+
+#[test]
+fn what_the_stage_appends_is_held_to_the_byte_cap_with_a_remedy_that_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = live_state(&dir);
+    seed_docs(&state, "orders", vec![doc! {"_id": -1}]);
+    fat(&state);
+    // All 20 MB appended: refused, at the document that passes the cap.
+    let err = run(&state, json!([{"$unionWith": "fat"}])).expect_err("over the cap");
+    assert_eq!(err.status, 413, "{err:?}");
+    assert!(err.message.contains("$unionWith appended documents"), "{err:?}");
+    assert!(err.message.contains("end the sub-pipeline with a $project"), "{err:?}");
+    // The remedy the message names works: projected down, or limited.
+    for tail in [json!({"$project": {"_id": 1}}), json!({"$limit": 5})] {
+        let out =
+            run(&state, json!([{"$unionWith": {"coll": "fat", "pipeline": [tail]}}])).unwrap();
+        assert!(out["count"].as_u64().unwrap() >= 2);
+    }
+    // And a sub-pipeline that makes what it appends bigger than what it read is held too.
+    let err = run(
+        &state,
+        json!([{"$unionWith": {"coll": "fat", "pipeline": [
+            {"$match": {"_id": {"$lt": 50}}}, {"$addFields": {"again": "$pad"}}]}}]),
+    )
+    .expect_err("the output is over");
+    assert_eq!(err.status, 413, "{err:?}");
 }
 
 #[test]
@@ -412,4 +418,42 @@ fn the_references_answers_to_the_union_with_sections() {
         out[7],
         json!({"f": [{"_id": 10, "k": "u1", "n": 1}, {"_id": 11, "k": "u2", "n": 2}, {"_id": 12, "k": "u3", "n": 3}]})
     );
+}
+
+#[test]
+fn a_missing_collection_is_one_rule_for_lookup_graph_lookup_and_union_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir);
+    let lookup_eq = json!([{"$lookup": {"from": "nowhere", "localField": "k", "foreignField": "k", "as": "j"}}]);
+    let lookup_pipe =
+        json!([{"$lookup": {"from": "nowhere", "pipeline": [{"$match": {}}], "as": "j"}}]);
+    let graph = json!([{"$graphLookup": {"from": "nowhere", "startWith": "$k",
+        "connectFromField": "k", "connectToField": "k", "as": "j", "maxDepth": 2}}]);
+    let union = json!([{"$unionWith": "nowhere"}]);
+
+    // On a node with no peers there is nowhere else it could be: an empty read.
+    for pipeline in [&lookup_eq, &lookup_pipe, &graph] {
+        let out = run(&state, pipeline.clone()).unwrap_or_else(|e| panic!("{pipeline}: {e:?}"));
+        assert_eq!(out["count"], 3, "{pipeline}");
+        for doc in out["documents"].as_array().unwrap() {
+            assert_eq!(doc["j"], json!([]), "{pipeline}");
+        }
+    }
+    assert_eq!(run(&state, union.clone()).unwrap()["count"], 3);
+
+    // On a node with peers it may be about to arrive: the 404 with the retry hint, for each.
+    let members = kimmy_cluster::Members::default();
+    state.set_members(members.clone());
+    members.insert_for_test("127.0.0.1:7001".parse().unwrap(), kimmy_core::NodeId::generate());
+    let mut seen = Vec::new();
+    for pipeline in [&lookup_eq, &lookup_pipe, &graph, &union] {
+        let err = run(&state, pipeline.clone()).expect_err("a peer may have it");
+        assert_eq!(err.status, 404, "{pipeline}: {err:?}");
+        assert!(err.message.contains("not found on this member"), "{pipeline}: {err:?}");
+        seen.push((err.message.clone(), err.retry_override));
+    }
+    assert!(seen.windows(2).all(|w| w[0] == w[1]), "one message and hint for all: {seen:?}");
+    // A collection that is there is read as ever, and a denied one is the 403 first.
+    let out = run(&state, json!([{"$lookup": {"from": "archive", "localField": "k", "foreignField": "k", "as": "j"}}])).unwrap();
+    assert_eq!(out["count"], 3);
 }

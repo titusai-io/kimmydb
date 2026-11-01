@@ -132,9 +132,10 @@ pub(crate) fn parse_unset(value: &Bson) -> Result<Stage> {
 // $sample
 // ---------------------------------------------------------------------------
 
-/// `{$sample: {size: N}}`: `N` a number, truncated toward zero as the reference does
-/// (`1.5` is `1`); `0` is allowed and answers nothing. A negative, a non-number, a
-/// missing `size` and any other key are refused.
+/// `{$sample: {size: N}}`: `N` a number. A double truncates toward zero (`1.5` is `1`),
+/// a decimal rounds half to even (`2.5` is `2`, `3.5` is `4`), as the reference does; `0`
+/// and `NaN` answer nothing. A negative, a non-number, a missing `size` and any other
+/// key are refused.
 pub(crate) fn parse_sample(value: &Bson) -> Result<Stage> {
     let spec = as_document("$sample", value)?;
     for key in spec.keys() {
@@ -145,22 +146,16 @@ pub(crate) fn parse_sample(value: &Bson) -> Result<Stage> {
     let Some(size) = spec.get("size") else {
         return Err(Error::InvalidQuery("$sample stage must specify a size".into()));
     };
-    let truncated = |d: f64| -> Result<i64> {
-        if d.is_nan() {
-            return Err(Error::InvalidQuery(
-                "size argument to $sample must be a number, found NaN".into(),
-            ));
-        }
-        // `as` saturates, so an enormous size reaches the document limit's refusal.
-        Ok(d.trunc() as i64)
-    };
+    // `as` saturates, so an enormous size is every document, and NaN is 0.
     let n = match size {
         Bson::Int32(n) => i64::from(*n),
         Bson::Int64(n) => *n,
-        Bson::Double(d) => truncated(*d)?,
-        Bson::Decimal128(d) => truncated(d.to_string().parse::<f64>().map_err(|_| {
-            Error::InvalidQuery("size argument to $sample must be a number".into())
-        })?)?,
+        Bson::Double(d) => d.trunc() as i64,
+        Bson::Decimal128(d) => d
+            .to_string()
+            .parse::<f64>()
+            .map_err(|_| Error::InvalidQuery("size argument to $sample must be a number".into()))?
+            .round_ties_even() as i64,
         _ => {
             return Err(Error::InvalidQuery("size argument to $sample must be a number".into()));
         }
@@ -192,61 +187,39 @@ pub fn system_below() -> impl FnMut(usize) -> usize {
 /// then replaces a random slot with probability `size / (i + 1)`. Every subset of `size`
 /// documents is equally likely.
 ///
-/// **Order**: the reservoir's slot order, which is the input order for the documents that
-/// were never replaced. With `size >= input.len()` that is the whole input, in input
-/// order, as nothing is replaced.
+/// **Order**: random. The reservoir is shuffled once (Fisher-Yates over the same source
+/// of positions) before it is answered, so every order of the sample is equally likely,
+/// `size >= input.len()` included, which makes `{$sample: {size: <large>}}` a shuffle,
+/// as in the reference.
 ///
-/// **Bounds, refused and never cut short**: `size` over the pipeline's document limit is
-/// `Error::Limit`, and the reservoir's encoded bytes passing
-/// [`kimmy_core::limits::MAX_DOCUMENT_BYTES`] (the cap `$facet`'s answer is held to) is
-/// `Error::AnswerTooLarge`, raised the moment a document pushes it over.
+/// **Bounds**: a `size` over the input is the whole input (the input has already been
+/// held to the pipeline's document limit, so nothing here can hold more). The reservoir
+/// is documents the pipeline already holds and moves none in, so it is charged to no
+/// second budget.
 pub fn sample(
     input: Vec<Document>,
     size: usize,
-    limits: &Limits,
+    _limits: &Limits,
     below: Below<'_>,
 ) -> Result<Vec<Document>> {
     if size == 0 {
         return Ok(Vec::new());
     }
-    if size > limits.max_documents {
-        return Err(Error::Limit(format!(
-            "$sample size {size} is over the pipeline limit of {} documents",
-            limits.max_documents
-        )));
-    }
-    let mut reservoir: Vec<(Document, usize)> = Vec::with_capacity(size.min(input.len()));
-    let mut bytes = 0usize;
+    let mut reservoir: Vec<Document> = Vec::with_capacity(size.min(input.len()));
     for (seen, doc) in input.into_iter().enumerate() {
-        let slot = if seen < size {
-            reservoir.len()
+        if seen < size {
+            reservoir.push(doc);
         } else {
             let at = below(seen + 1);
-            if at >= size {
-                continue;
+            if at < size {
+                reservoir[at] = doc;
             }
-            at
-        };
-        let len = bson::serialize_to_vec(&doc)
-            .map_err(|e| Error::Internal(format!("$sample input could not be encoded: {e}")))?
-            .len();
-        if slot == reservoir.len() {
-            reservoir.push((doc, len));
-            bytes += len;
-        } else {
-            bytes = bytes - reservoir[slot].1 + len;
-            reservoir[slot] = (doc, len);
-        }
-        if bytes > kimmy_core::limits::MAX_DOCUMENT_BYTES {
-            return Err(Error::AnswerTooLarge {
-                what: "$sample reservoir",
-                bytes,
-                max: kimmy_core::limits::MAX_DOCUMENT_BYTES,
-                remedy: "lower the size, or $project the documents down before $sample",
-            });
         }
     }
-    Ok(reservoir.into_iter().map(|(doc, _)| doc).collect())
+    for i in (1..reservoir.len()).rev() {
+        reservoir.swap(i, below(i + 1));
+    }
+    Ok(reservoir)
 }
 
 // ---------------------------------------------------------------------------

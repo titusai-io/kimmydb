@@ -220,9 +220,11 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
                  that does not exist reads as empty on a node with no peers"
             );
             "emits every document that reaches it, then the foreign collection's documents run \
-             through the sub-pipeline; the collection is read whole, and what is read, what the \
-             sub-pipeline outputs and the combined output count against the pipeline's document \
-             limit and byte cap"
+             through the sub-pipeline; the collection is read whole and what is read counts \
+             against the pipeline's document limit, as a $lookup's does; what the stage appends \
+             (input plus appended, in documents) counts against it too, and the appended \
+             documents' bytes against the 16 MiB a stored document may be; the input's bytes \
+             are not charged"
                 .into()
         }
         Stage::SortByCount(_) => {
@@ -232,8 +234,8 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
         }
         Stage::Sample(n) => {
             out["size"] = json!(n);
-            "keeps this many documents chosen at random, in a reservoir held in memory against \
-             the document limit and byte cap; blocking"
+            "keeps this many documents chosen at random, in a random order; blocking, over the \
+             input the pipeline already holds (the pipeline's document limit applies to it)"
                 .into()
         }
         Stage::Redact(_) => {

@@ -118,7 +118,8 @@ equality join.
   foreign scan. (Other systems leave the order unspecified; sort the array if you rely
   on it.) A key not listed above is `400`.
 - Run inside a `$facet` and a `$lookup` sub-pipeline like any stage. `from` needs read
-  access, like a `$lookup`'s.
+  access, like a `$lookup`'s. A `from` that does not exist reads as empty on a node with no peers, and
+  is a `404` with a retry hint on a node with peers, as for `$lookup`.
 
 ### `$bucket` and `$bucketAuto`
 
@@ -261,16 +262,19 @@ another (`"a"` with `"a.b"`).
 ```
 
 returns `size` documents chosen at random from the input, each document at most once and
-every set of `size` equally likely ([ADR-263](decisions.md)). `size` is a number,
-**truncated toward zero** as the reference does (`1.5` is `1`); **`0` answers no
-documents**. A negative (`size argument to $sample must not be negative`), a value that is
-not a number (`must be a number`), a missing `size` and any other key (there is no seed)
-are `400`. **When `size` is at least
-the input's size the whole input is returned, in input order**; otherwise the order of the
-sample is not defined. It is a reservoir over the stream, held in memory: **`size` over the
-pipeline's document limit is `400`, and the reservoir's encoded size passing 16 MiB is
-`413`**, raised the moment the document that passes it arrives. The random source is the
-operating system's, seeded afresh for every run.
+every set of `size` equally likely ([ADR-263](decisions.md)). `size` is a number: a double
+**truncates toward zero** (`1.5` is `1`), a decimal **rounds half to even** (`2.5` is `2`),
+**`0` and `NaN` answer no documents**, and a `size` over the input is the whole input. A
+negative (`size argument to $sample must not be negative`), a value that is not a number
+(`must be a number`), a missing `size` and any other key (there is no seed) are `400`.
+**The answer is in a random order**, `size` over the input included, so `{$sample: {size:
+<large>}}` shuffles, and a `$limit` after it picks at random.
+
+`$sample` takes the documents the pipeline holds, a reservoir over them, so **a collection
+of more than 100,000 documents cannot be sampled**: that is the pipeline's document limit,
+which holds on the input of every pipeline, `$sample` included, and is `400` naming the
+source (narrow it with a leading `$match`). It has no byte cap of its own. The random source
+is the operating system's, seeded afresh for every run.
 
 ### `$redact`
 
@@ -312,7 +316,7 @@ strings has the same effect. `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META
 
 outputs every input document, **then** the documents of `coll` in the pipeline's database,
 run through `pipeline` if there is one ([ADR-263](decisions.md)). It has an answer when the
-input is empty (the other collection's). A `coll` that does not exist reads as empty on a node with no peers; on a node in a cluster it is `404` with the retry hint `elsewhere`, as for `$lookup`, since another member may have just created it.
+input is empty (the other collection's). A `coll` that does not exist reads as empty on a node with no peers; on a node in a cluster it is `404` with the retry hint `elsewhere`, since another member may have just created it. `$lookup` and `$graphLookup` follow the same rule (the [deviations register](deviations.md)).
 The operand is a collection name or `{coll, pipeline}`; a missing `coll` (the reference's
 pipeline-only form, which needs a document source this build does not have), another
 key, a `pipeline` that is not an array of stage documents and an empty name are `400`.
@@ -326,12 +330,14 @@ key, a `pipeline` that is not an array of stage documents and an empty name are 
   in it are fine, a `$facet` inside that `$facet` is not. A `$lookup` `let` name is
   readable in it.
 - **Bounded, and refused when over, never cut short.** The collection is read whole, in
-  one walk. A leading `$match` of the sub-pipeline is applied as it is read, so what it
-  declines is not held or counted. The documents that reach the sub-pipeline are refused
-  past the pipeline's document limit (100,000), `400`, at the first one over, and the
-  input plus what is appended counts against it too. The bytes read, and then the bytes
-  the sub-pipeline outputs, are each held to 16 MiB, `413`, at the document that passes
-  it.
+  one walk, as a `$lookup`'s foreign collection is. A leading `$match` of the sub-pipeline
+  is applied as it is read, so what it declines is not held or counted. The documents that
+  reach the sub-pipeline are refused past the pipeline's document limit (100,000), `400`,
+  at the first one over, and the input plus what is appended counts against it too. **What
+  is scanned is not charged in bytes**: a 20 MB collection that its sub-pipeline projects
+  down to a few KB is answered. The documents the stage **appends** (what it holds and
+  answers) are held to 16 MiB, `413`, at the document that passes it; end the sub-pipeline
+  with a `$project` or a `$limit` to answer less.
 - **It may not read what the pipeline writes**: a `$unionWith` of the `$merge` or `$out`
   target, at any depth of sub-pipeline, is `400` before anything is read.
 - Run inside a `$facet`, a `$lookup` sub-pipeline and another `$unionWith` like any stage.
@@ -1069,6 +1075,15 @@ fields. `$$NOW` is a value in an expression; a `$match` takes it through
 `$expr`, `{$expr: {$lt: ["$expires", "$$NOW"]}}`, because the filter language
 has no variables.
 
+**A missing field path leaves a field out too.** As the value of a field in
+`$project`, `$addFields`/`$set` or an object expression, a path that finds nothing
+(`"$nope"`, `"$$ROOT.nope"`, `"$o.nope"`) is a missing value, not `null`: the field is
+not added, and an existing field of that name is removed (`{$set: {p: "$nope"}}` over
+`{p: 5}` gives `{}`), as in the reference. Inside an array it is `null`
+(`["$nope", 2]` is `[null, 2]`), and every operator reads it as `null`
+(`{$ifNull: ["$nope", 1]}` is `1`); a field that is there and holds `null` is stored as
+`null`.
+
 **`$$REMOVE` leaves a field out.** As the value of a field in `$project` or
 `$addFields`, or in a document an expression builds, it drops that field, and in
 `$addFields` it removes a field the document already had:
@@ -1645,6 +1660,12 @@ denial, so a pipeline cannot be used to probe which collections exist. Without
 that check a join would be a privilege escalation shaped like a query, routing
 around the single authorization point ([ADR-024](decisions.md)).
 
+**A `from` that does not exist reads as empty** (`as` is `[]` for every document) on a node
+with no peers, as the reference answers. On a node **with peers** it is a `404` with the
+retry hint `elsewhere`, since the collection may have been created through another member
+and not have arrived yet; the check for `read` comes first in both cases. `$graphLookup` and
+`$unionWith` follow the same rule ([deviations register](deviations.md)).
+
 **The foreign collection is scanned once**, not once per input document. A
 per-document join is O(n·m), which on any real pair of collections is the
 difference between a query and an outage.
@@ -1975,7 +1996,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$CLUSTER_TIME`, `$$USER_ROLES`, `$$SEARCH_META`; and `$$DESCEND`, `$$PRUNE`, `$$KEEP` outside a `$redact` | Not built, or valid only inside `$redact`. Refused with a message saying so, rather than as an unknown name |
 | `$unionWith` without a `coll`, and `$out`, `$merge` and `$vectorSearch` inside its sub-pipeline | Refused, `400`. See [`$unionWith`](#unionwith) |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
-| `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |
+| Date arithmetic with a `Decimal128` | Refused, `400` (`$add needs numbers or one date, found a Decimal128`) |
 | `$merge` with `on` other than `_id`, `whenMatched`/`whenNotMatched: "fail"`, a pipeline `whenMatched`, `let`; `$out` into a collection that holds documents, `$out` with `timeseries` | Refused, `400`, each naming what and why. [`$merge`](#merge), [`$out`](#out), and the [deviations register](deviations.md) |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |

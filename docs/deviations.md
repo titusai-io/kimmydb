@@ -28,7 +28,7 @@ Status meanings:
 - **`$regexFindAll`'s 64 MiB limit is counted as BSON bytes of the documents it would return**, which is this server's reading of the reference's output-buffer limit; the two counts agree to within the documents' framing, not byte for byte, so an answer within a few percent of 64 MiB may be refused by one and not the other. The error is the `413` `ValueTooLarge` (code `document_too_large`), where the reference's is `51151`; its message names the output and the limit. A string of 16 MiB or more built by `$concat`, `$replaceOne` or `$replaceAll` is the same `413` ("the string $concat builds is N bytes, over the 16 MiB string limit"), where the reference's codes are `16493` and `13548`.
 - **An array an expression builds is held to 16 MiB of BSON,** with the same `413`: `$concatArrays` (a `$reduce` that doubles an array stops there), `$map`, `$zip`, an array literal, `$split`, `$objectToArray` and the `N` forms of `$firstN`, `$lastN`, `$maxN` and `$minN`. The reference has no such limit short of the 16 MB document (and 64 MB buffer) it would hit when the value is stored or returned, so an intermediate array between 16 MiB and that is answered there and refused here. `$range` keeps its own limit of 100,000 elements and `$zip` its 1,000,000 cells, both a `400` raised before anything is built. A document built by `$mergeObjects`, `$setField` or an object literal is not counted.
 - **`$replaceAll` with an empty `find`** inserts between every code point and at both ends (`"abc"`, `""`, `"-"` gives `"-a-b-c-"`). The reference inserts between the *bytes* of a multi-byte character and builds invalid UTF-8, which its own client refuses to read (`Invalid UTF-8 string in BSON document`); on ASCII text the two agree.
-- **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null.
+- **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null. As the value of a field in `$addFields`/`$set`, `$project` or an object expression a missing path leaves the field out, as there (see the small stages' entry).
 - **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document, as the reference refuses it (`40400`).
 - **`$trim`'s default set** is the reference's list (see aggregation.md): it does not strip U+0085, U+2028, U+202F or U+3000, and nor does this.
 
@@ -93,36 +93,52 @@ Also recorded here, so they are not read as bugs:
 
 ---
 
-## 🟡 Pipeline updates: three stage families, `_id` never added, no `arrayFilters`
+## 🟡 Pipeline updates: an upsert may not give the inserted document an `_id`, and the expression layer's integer width
 
-**Raised 2026-10-31, with ADR-265.** An `update` that is an array of stages is built ([query-language.md](query-language.md#pipeline-updates)). Where it differs from the reference:
+**Raised 2026-10-31, with ADR-265; revised 2026-11-01 after the reference's answers.** An `update` that is an array of stages is built ([query-language.md](query-language.md#pipeline-updates)). Where it differs from the reference:
 
-- **Only `$addFields`/`$set`, `$project`/`$unset` and `$replaceRoot`/`$replaceWith` are allowed**, as in the reference; the refusal here is `400` at parse for every other stage.
-- **`$project: {_id: 0}` and `$unset: "_id"` are `400`**, `_id is immutable and cannot be updated`. The reference's replacement logic puts a missing `_id` back from the stored document; here only a `$replaceRoot`/`$replaceWith` result lacking `_id` is given the stored one, and an explicit removal by a stage is refused rather than silently undone. (Uncertain: marked in the probe script.)
-- **An upsert's pipeline cannot give the inserted document an `_id` the filter did not name**, `400`, as `$set: {_id: ...}` is refused for operators; the reference allows it on insert.
-- **`arrayFilters` with an array update is `400`**; the reference refuses them too, but its message differs. A positional projection with `returnDocument: "after"` on `find_and_modify` is `400` with a pipeline update.
-- **A path that is missing writes `null`**, not nothing: `{$set: {p: "$nope"}}` stores `p: null`, where the reference's `$addFields` leaves the field out. It is the aggregation expression layer's rule in this build (an expression always yields a value; see the missing-versus-null entry), and the update inherits it. `$$REMOVE` leaves a field out, as in `$addFields`.
+- **`_id` is judged on the final result, as in the reference** (settled by its answers): a pipeline that removes it (`$unset: "_id"`, `$project` without it, `$set: {_id: "$$REMOVE"}`) is accepted and the stored `_id` is put back, first; a result with another document's `_id` is `400`; between stages `_id` is whatever the stages made it (after `$replaceWith: {a: "$a"}` a later stage reads no `_id`). An `_id` changed to the same id of another type (`Int32` to `Int64`, an integral `Decimal128`) is stored as written; a **double** `_id` is refused, since this build has no double document id (the reference stores it).
+- **An upsert's pipeline cannot give the inserted document an `_id` the filter did not name**, `400`, as `$set: {_id: ...}` is refused for operators; the reference inserts it with that `_id`.
+- **A positional projection with `returnDocument: "after"` on `find_and_modify` is `400` with a pipeline update**; the reference refuses it too (`cannot use a positional projection and return the new document`), in its own words. `arrayFilters` with an array update is `400`, as there; an empty list is accepted, as there.
+- **A path that is missing leaves the field out**, as in the reference: `{$set: {p: "$nope"}}` adds nothing when `p` is absent and **removes** an existing `p`; `{"o.p": "$nope"}` leaves `o: {}`; the same for computed fields of `$project` and `$replaceWith`, and for a key of an embedded object expression. Inside an array it is `null`, as there. (Before this release it stored `null`.)
+- **Integer arithmetic stores an `Int64`.** The expression layer's integer results are `Int64` (the entry on numbers), so `$set: {n: {$add: ["$n", 1]}}` over an `Int32` field stores a long, and `{$set: {total: {$add: ["$a", "$b"]}}}` over an equal `Int32` `total` counts as a change (`modified` counts it); the reference keeps `Int32` and counts nothing. Moving the expression layer to the reference's result widths is a separate piece of work.
 - **The result is stored whole.** A pipeline that leaves the document byte-equal (including key order and number types) is a no-op; one that changes a number's type (`1` to `1.0`) is a change, as for operators.
-- **Pipeline stages run on a copy and are checked after**, so an `_id` refusal is raised when the update runs, with the other write-time refusals, not when the body is parsed.
+- **An `_id` refusal is raised when the update runs** (the result is known only then), with the other write-time refusals, not when the body is parsed.
 
-**To close:** none planned.
+**To close:** none planned beyond the integer width.
 
 ---
 
 ## 🟡 The small stages: `$sortByCount`, `$sample`, `$redact`, `$unset` and `$unionWith`
 
-**Raised 2026-10-31, with ADR-263.** `$sortByCount`, `$replaceWith`, `$unset`, `$sample`, `$redact` and `$unionWith` are built ([aggregation.md](aggregation.md#sortbycount)). Where they differ from, or rest on a reading of, the reference:
+**Raised 2026-10-31, with ADR-263; revised 2026-11-01 after the reference's answers.** `$sortByCount`, `$replaceWith`, `$unset`, `$sample`, `$redact` and `$unionWith` are built ([aggregation.md](aggregation.md#sortbycount)). Where they differ from, or rest on a reading of, the reference:
 
-- **`$unionWith` of the `$merge`/`$out` target (self-read refusal) is refused here at parse, whereas the reference accepts the pipeline and fails at run time** (`E11000 duplicate key error`, or `Cursor is exhausted`, in the reference's answers to the probe). A pipeline that reads what it writes has no answer here (each stage reads storage when it runs), so the `$lookup` and `$graphLookup` self-read rule is applied: `400` before anything is read or written, at any depth of sub-pipeline.
-- **`$unionWith` reads the collection whole**, refused past the pipeline's document limit (100,000) and past 16 MiB of documents read or output by its sub-pipeline (`413`). The reference streams it with no such limit. The sub-pipeline refuses `$out`, `$merge` and `$vectorSearch`, as the reference does (it accepts a `$facet`, and so does this). The pipeline-only form (`coll` left out, for a `$documents` source) is `400`: there is no `$documents` stage.
-- **`$sample` is bounded.** `size` over the pipeline's document limit is `400` even when the input is smaller, and the reservoir passing 16 MiB is `413`. The reference accepts any size. `size` is truncated toward zero and `0` answers no documents, as there. When `size` is at least the input's size the whole input comes back in input order; the reference's order is unspecified.
-- **`$sortByCount` orders ties by first appearance** of the value; the reference leaves ties unspecified (two of its runs differ), and so does this build's documentation. Its `count` is an int, as the reference's; `$group`'s `{$sum: 1}` is a long here and an int there (the entry on numbers).
-- **Refusal wording differs** from the reference's in the stages' errors (`$replaceWith` of a non-document says `$replaceRoot needs a document`, the reference `'replacement document' must evaluate to an object ...`; `$unset`'s path collisions and bad paths are named in this build's words; `$$PRUNE` outside `$redact` begins with the reference's `Use of undefined variable: PRUNE` and goes on to say where the variable is valid). The set of refusals is the reference's.
-- **`$$DESCEND`, `$$PRUNE` and `$$KEEP` are variables only inside a `$redact` expression**; the reference reads them in any expression, where each is the string `"descend"`, `"prune"` or `"keep"`. Here anywhere else is `400`, `valid only inside a $redact expression`. Inside `$redact` they have those string values, and so a string of that spelling has the effect of the variable, as in the reference. `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META` are refused by name everywhere; the reference has them.
+- **`$unionWith` of the `$merge`/`$out` target (self-read refusal) is refused here at parse; the reference runs it to completion** (`$merge` merges the union into the target, `$out` replaces it; the `Cursor is exhausted` an earlier probe showed was the shell's message after the server had finished). A pipeline that reads what it writes has no answer here (each stage reads storage when it runs), so the `$lookup` and `$graphLookup` self-read rule is applied: `400` before anything is read or written, at any depth of sub-pipeline. This is a pure deviation, not a difference in when the same failure happens.
+- **`$unionWith` is held to the pipeline's document limit on what it reads** (100,000, `400` at the first document over, as `$lookup`'s foreign read is; a leading `$match` of the sub-pipeline is applied as it is read), and **the documents it appends are held to 16 MiB** (`413`), a cap the reference does not have; what is scanned is never charged in bytes. The sub-pipeline refuses `$out`, `$merge` and `$vectorSearch`, as the reference does (it accepts a `$facet`, and so does this). The pipeline-only form (`coll` left out, for a `$documents` source) is `400`: there is no `$documents` stage.
+- **`$sample` samples what the pipeline already holds.** The input of every pipeline is held to the document limit (100,000 documents; a leading `$match` is applied first), so a collection over that cannot be sampled (`400`, `the source collection admits more than 100000 documents`); the reference serves it with a random cursor. This is the general pipeline limit and applies to every pipeline's input, `$sample` included. A `size` over the input is the whole input, in a random order (the reference's answer too). `size` is truncated toward zero for a double, rounded half to even for a decimal, `0` and `NaN` answer nothing, and a negative is `400`, as there. The order of the sample is random, as there; it has no byte cap of its own.
+- **`$sortByCount` orders ties by first appearance** of the value; the reference's order of equal counts is unspecified (two of its runs differ), and so is this build's. Its `count` is an int, as the reference's; `$group`'s `{$sum: 1}` is a long here and an int there (the entry on numbers).
+- **Refusal wording differs** from the reference's in the stages' errors (`$replaceWith` of a non-document says `$replaceRoot needs a document`, the reference `'replacement document' must evaluate to an object ...`; `$unset`'s path collisions and bad paths are named in this build's words). The set of refusals is the reference's, including `$$DESCEND`, `$$PRUNE` and `$$KEEP` outside `$redact` (`Use of undefined variable: PRUNE`, which this build's message begins with) and `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META` on a single server. Inside `$redact` the three are the strings `"descend"`, `"prune"` and `"keep"`, so a string of that spelling has the effect of the variable, as there.
 - **`$unset` refuses the same path twice and a path inside another** (`["a", "a.b"]`), and a path part that starts with `$` or is empty, `400`, as the reference does (`Path collision at a`).
 - **`$cond` also takes its named form** `{if, then, else}` (all three required), which a `$redact` expression is usually written in; it was not accepted before.
+- **`$set: {p: "$nope"}` removes an existing `p` and adds nothing** in `$addFields`/`$set`, as the reference does; before this release it stored `null`. A missing path as the value of a `$project` computed field or of a key of an object expression is left out too; inside an array it is `null`.
 
-**To close:** none planned. The 16 MiB and document-limit bounds on `$unionWith` and `$sample` are the standing rule that anything that buffers documents is held to a cap.
+**To close:** none planned.
+
+---
+
+## 🟡 A collection another stage reads that is not there: empty on a single node, a `404` with a retry hint on a node with peers
+
+**Raised 2026-11-01, with ADR-263.** `$lookup`, `$graphLookup` and `$unionWith` follow one rule for a `from`/`coll` that does not exist. The reference reads it as empty. **On a node with no peers this build does too.** On a node **with peers** it cannot tell "does not exist" from "has not arrived from another member yet" (a collection created through one member reaches the others a sync round later), so it answers the `404` with the `elsewhere` retry hint any read of a missing collection gets there, and the same request can succeed a moment later. `read` on the collection is checked first in every case, so a caller who may not read it gets the uniform `403` and learns nothing about whether it exists.
+
+**To close:** none planned; it ends when collection definitions reach every member before a write is acknowledged.
+
+---
+
+## 🟡 A document `_id` is refused at insert
+
+**Recorded 2026-11-01.** Only an ObjectId, string, integer, `Decimal128` and binary value can be a document `_id`; an embedded document, an array, a double, a boolean, a date or `null` is refused at insert (`400 invalid document id`), where the reference stores any type but an array. A pipeline update that sets `_id` to a double is refused for the same reason (see the pipeline-update entry). An existing design decision on the key type; not changed by the query-language work.
+
+**To close:** none planned.
 
 ---
 
@@ -778,9 +794,9 @@ on 2026-10-16, except the n-ary `$add`, which is by reading):
 Also decided with it: a zero divisor of any spelling is a `400` for a decimal as
 for every number (IEEE would give an infinity or a NaN), an overflow in `$inc` and
 `$mul` is a `400` as an `Int64` overflow is (the double path still stores
-`Infinity`), and every NaN result is the one quiet NaN. `$mod` with
-a decimal, and date arithmetic with one, stay refused (`$mod needs numbers, found
-a Decimal128`). `$round`, `$trunc`, `$abs`, `$ceil`, `$floor`, `$pow`, `$sqrt`, `$exp`,
+`Infinity`), and every NaN result is the one quiet NaN. Date
+arithmetic with a decimal stays refused (`$add needs numbers or one date, found a
+Decimal128`); `$mod` takes a decimal and answers the exact remainder as a decimal. `$round`, `$trunc`, `$abs`, `$ceil`, `$floor`, `$pow`, `$sqrt`, `$exp`,
 `$ln` and `$log10` take a decimal since 0.56.0 ([ADR-253](decisions.md)); a decimal
 mean or quotient shows 34 digits until the pipeline rounds it.
 

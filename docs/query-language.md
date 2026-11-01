@@ -997,8 +997,8 @@ cannot do.
 ```
 
 - **Three stage families only**: `$addFields` (`$set`), `$project` (`$unset`) and
-  `$replaceRoot` (`$replaceWith`). Any other stage, an empty array and an element
-  that is not a document are `400`, `invalid update: …`. They are the aggregation
+  `$replaceRoot` (`$replaceWith`). Any other stage and an element that is not a
+  document are `400`, `invalid update: …`. They are the aggregation
   stages, so an expression, `null` and missing propagation, `$$ROOT`, `$$CURRENT`
   and `$$REMOVE` mean what they mean in an [aggregation](aggregation.md#expressions).
   Each stage sees the document the one before it left.
@@ -1006,10 +1006,20 @@ cannot do.
   request sees the same instant.
 - **`arrayFilters` are `400` with a pipeline** (and a positional `$` has nothing to
   name). Address elements with `$map` and `$filter` in an expression.
-- **`_id` does not move.** A stage that changes it, or takes it out
-  (`$project: {_id: 0}`, `$unset: "_id"`), is `400`, `_id is immutable and cannot be
-  updated`. A `$replaceWith` or `$replaceRoot` whose result has no `_id` keeps the
-  stored one, as a replacement does; one with another `_id` is `400`.
+- **`_id` does not move, and is judged on the final result.** A pipeline whose result
+  has no `_id` (`$unset: "_id"`, a `$project` without it, `$set: {_id: "$$REMOVE"}`,
+  a `$replaceWith` of a document without one) gets the stored `_id` back, first; a
+  result with another document's `_id` is `400`, `_id is immutable and cannot be
+  updated`. Between stages `_id` is whatever the stages made it: after
+  `$replaceWith: {a: "$a"}` a later stage reads no `_id`. The same id as another type
+  (`Int32` to `Int64`) is stored as written. An empty array `[]` is an update that
+  changes nothing.
+- **A missing field path as a stage value leaves the field out**, as in an aggregation's
+  `$addFields`: `{$set: {p: "$nope"}}` adds nothing when `p` is absent and **removes** an
+  existing `p`.
+- **Integer arithmetic stores an `Int64`**: `{$set: {n: {$add: ["$n", 1]}}}` over an
+  `Int32` field stores a long, and counts as a change even where the value is equal
+  (see [Deviations](deviations.md)).
 - **It is an update like any other** once the stages have run: the result is held to
   the document size and depth caps, the collection's [validator](validation.md), the
   index keying checks and the unchanged-document rule (a result byte-equal to the
@@ -1017,7 +1027,8 @@ cannot do.
   update does, the whole stored result.
 - **On `update` (one or many), `find_and_modify` (with `upsert` too) and the MCP
   `update` tool.** An upsert seeds the document from the filter's equality fields
-  exactly as for operators, then runs the stages over it; there is no
+  exactly as for operators, then runs the stages over it only if it inserts (a document
+  that matches is updated, whatever the seed would have done); there is no
   `$setOnInsert`, and a pipeline cannot give the inserted document an `_id` of its
   own. A positional projection on `find_and_modify` with `returnDocument: "after"` is
   `400`.

@@ -645,7 +645,9 @@ impl<'a> Scope<'a> {
         }
     }
 
-    /// The document `$$ROOT` names.
+    /// The document field paths and `$$CURRENT` read: the document being evaluated, or
+    /// inside a `$redact` the level being decided. `$$ROOT` is this unless the scope was
+    /// made by [`Scope::with_top`], when it is the top document.
     pub fn root(&self) -> &'a Document {
         self.root
     }
@@ -1740,12 +1742,17 @@ impl Expr {
     }
 
     /// [`Self::eval_in`] for a value that becomes a field: `None` when the
-    /// expression is `$$REMOVE`, or an `$cond`, `$switch` or `$let` whose chosen
-    /// result is, and the field is then left out (ADR-253). Anywhere else
-    /// `$$REMOVE` reads as null, as a missing field path does.
+    /// expression is `$$REMOVE`, a field path or a path into a variable that finds
+    /// nothing, or an `$cond`, `$switch` or `$let` whose chosen result is, and the field
+    /// is then left out (ADR-253, ADR-263). Anywhere else a missing value reads as null.
     pub fn eval_field(&self, scope: &Scope<'_>) -> Result<Option<Bson>> {
         match self {
-            Expr::Var { name, .. } if name == "REMOVE" => Ok(None),
+            Expr::Var { name, path } => eval_variable_opt(name, path.as_deref(), scope),
+            // A field path that finds nothing is a missing value, so the field is left out
+            // (and an existing one removed), as the reference's `$addFields` does. It is
+            // only the value of a field: inside an array it is `null` and an operator
+            // reads it as `null`, whatever reaches [`Self::eval_in`].
+            Expr::Field(p) => Ok(field_path(scope.root, p)),
             Expr::Op(Op::Cond, args) => match args.as_slice() {
                 [cond, then, otherwise] => {
                     if truthy(&cond.eval_in(scope)?) {
@@ -1956,17 +1963,23 @@ fn value_path(value: &Bson, p: &str) -> Option<Bson> {
 fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bson> {
     // Read where a value is wanted, `$$REMOVE` is a missing value, which here
     // is null like a missing field; `Expr::eval_field` is where it drops one.
+    Ok(eval_variable_opt(name, path, scope)?.unwrap_or(Bson::Null))
+}
+
+/// [`eval_variable`], `None` for a path into the variable that finds nothing (and for
+/// `$$REMOVE`), which [`Expr::eval_field`] leaves a field out for.
+fn eval_variable_opt(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Option<Bson>> {
     if name == "REMOVE" {
-        return Ok(Bson::Null);
+        return Ok(None);
     }
     if SYSTEM_VARIABLES.contains(&name) {
         // `$$ROOT` is the top document inside a `$redact` level below the top; every
         // other place it is the document, as `$$CURRENT` always is.
         let doc = if name == "ROOT" { scope.top.unwrap_or(scope.root) } else { scope.root };
         return Ok(match path {
-            None => Bson::Document(doc.clone()),
+            None => Some(Bson::Document(doc.clone())),
             // `$$ROOT.items.sku` is `$items.sku` spelled out.
-            Some(p) => field_path(doc, p).unwrap_or(Bson::Null),
+            Some(p) => field_path(doc, p),
         });
     }
     let Some(value) = scope.get(name) else {
@@ -1977,8 +1990,8 @@ fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bs
     };
     let value = value?;
     Ok(match path {
-        None => value.clone(),
-        Some(p) => value_path(value, p).unwrap_or(Bson::Null),
+        None => Some(value.clone()),
+        Some(p) => value_path(value, p),
     })
 }
 
@@ -2768,12 +2781,21 @@ fn divide(a: &Bson, b: &Bson) -> Result<Bson> {
 }
 
 fn modulo(a: &Bson, b: &Bson) -> Result<Bson> {
-    let Some(nums) = numbers(Op::Mod, &[a.clone(), b.clone()])? else {
+    let Some(operands) = operands(Op::Mod, &[a.clone(), b.clone()])? else {
         return Ok(Bson::Null);
     };
-    match (nums[0], nums[1]) {
+    // A `Decimal128` on either side makes the remainder a `Decimal128`, exactly.
+    if any_decimal(&operands) {
+        return arith::rem(&operands[0].widen(), &operands[1].widen())
+            .map(decimal_result)
+            .map_err(|_| Error::InvalidQuery("$mod by zero".into()));
+    }
+    let [Operand::Plain(x), Operand::Plain(y)] = operands.as_slice() else {
+        unreachable!("two plain operands");
+    };
+    match (*x, *y) {
         (_, Num::Int(0)) => Err(Error::InvalidQuery("$mod by zero".into())),
-        (Num::Int(x), Num::Int(y)) => Ok(Bson::Int64(x % y)),
+        (Num::Int(x), Num::Int(y)) => Ok(Bson::Int64(x.wrapping_rem(y))),
         (x, y) if y.as_f64() == 0.0 => {
             let _ = x;
             Err(Error::InvalidQuery("$mod by zero".into()))

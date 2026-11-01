@@ -316,7 +316,15 @@ fn sample_parses_a_size_of_any_number_type_truncated_toward_zero() {
         (Bson::Double(-0.5), 0),
         (Bson::Int32(0), 0),
         (Bson::Decimal128("3".parse().unwrap()), 3),
-        (Bson::Decimal128("3.7".parse().unwrap()), 3),
+        // A decimal rounds half to even, as the reference does.
+        (Bson::Decimal128("2.5".parse().unwrap()), 2),
+        (Bson::Decimal128("3.5".parse().unwrap()), 4),
+        (Bson::Decimal128("2.9".parse().unwrap()), 3),
+        (Bson::Decimal128("2.1".parse().unwrap()), 2),
+        (Bson::Decimal128("0.5".parse().unwrap()), 0),
+        // NaN is 0 documents; an enormous size is every document.
+        (Bson::Double(f64::NAN), 0),
+        (Bson::Decimal128("NaN".parse().unwrap()), 0),
     ] {
         let stages = aggregate::parse(&[doc! {"$sample": {"size": size.clone()}}]).unwrap();
         assert_eq!(size_of(&stages[0]), want, "{size:?}");
@@ -344,15 +352,25 @@ fn sample_refuses_a_bad_size_in_the_references_words() {
         (Bson::Boolean(true), "size argument to $sample must be a number"),
         (Bson::Document(doc! {}), "size argument to $sample must be a number"),
         (Bson::Array(vec![Bson::Int32(3)]), "size argument to $sample must be a number"),
-        (Bson::Double(f64::NAN), "must be a number, found NaN"),
     ] {
         let message = refused(doc! {"$sample": {"size": size.clone()}});
         assert!(message.contains(want), "{size:?}: {message}");
     }
-    // An enormous size is the pipeline limit's refusal when it runs.
-    for size in [Bson::Double(f64::INFINITY), Bson::Double(1e300), Bson::Int64(i64::MAX)] {
-        let err = run(doc! {"$sample": {"size": size.clone()}}, numbered(3)).unwrap_err();
-        assert!(matches!(err, Error::Limit(_)), "{size:?}: {err:?}");
+}
+
+#[test]
+fn an_enormous_sample_size_is_every_document_in_a_random_order() {
+    // The reference answers every document for 1e6, 100001 and a decimal Infinity.
+    for size in [
+        Bson::Double(f64::INFINITY),
+        Bson::Double(1e300),
+        Bson::Int64(i64::MAX),
+        Bson::Decimal128("Infinity".parse().unwrap()),
+    ] {
+        let out = run(doc! {"$sample": {"size": size.clone()}}, numbered(30)).unwrap();
+        let mut ids: Vec<i64> = out.iter().map(|d| i64::from(d.get_i32("_id").unwrap())).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..30).collect::<Vec<_>>(), "{size:?}");
     }
 }
 
@@ -371,15 +389,22 @@ fn sample_refuses_a_missing_size_an_extra_field_and_a_non_document() {
 }
 
 #[test]
-fn sample_returns_the_whole_input_in_input_order_when_the_size_covers_it() {
+fn sample_of_a_size_that_covers_the_input_is_the_whole_input_in_a_random_order() {
     let input = numbered(5);
     for size in [5, 6, 100] {
         let out = stages::sample(input.clone(), size, &Limits::default(), &mut seeded(9)).unwrap();
-        assert_eq!(out, input, "size {size}");
+        let mut sorted = out.clone();
+        sorted.sort_by_key(|d| d.get_i32("_id").unwrap());
+        assert_eq!(sorted, input, "size {size}: every document once");
     }
-    // Through the stage, too, whatever the system's source gives.
-    let out = run(doc! {"$sample": {"size": 10}}, input.clone()).unwrap();
-    assert_eq!(out, input);
+    // Through the stage with the system's source: not the input order, run after run (a
+    // permutation of 20 documents is the input order once in 20!).
+    let input = numbered(20);
+    for _ in 0..3 {
+        let out = run(doc! {"$sample": {"size": 100}}, input.clone()).unwrap();
+        assert_eq!(out.len(), 20);
+        assert_ne!(out, input);
+    }
 }
 
 #[test]
@@ -415,14 +440,16 @@ fn sample_replaces_a_slot_exactly_as_algorithm_r_does() {
     // draws below(4), 4 draws below(5); a draw under 2 replaces that slot.
     let mut draws = vec![1usize, 5 - 1, 0].into_iter();
     let mut asked = Vec::new();
+    // The three draws of the reservoir, then the shuffle's one (`below(2)`), which this
+    // script answers with the last position, leaving the order as it is.
     let mut below = |n: usize| {
         asked.push(n);
-        draws.next().unwrap()
+        draws.next().unwrap_or(n - 1)
     };
     let out = stages::sample(numbered(5), 2, &Limits::default(), &mut below).unwrap();
     // 2 -> slot 1; 3 -> 3 is not below 2, skipped; 4 -> slot 0.
     assert_eq!(out, vec![doc! {"_id": 4}, doc! {"_id": 2}]);
-    assert_eq!(asked, [3, 4, 5]);
+    assert_eq!(asked, [3, 4, 5, 2]);
 }
 
 #[test]
@@ -454,70 +481,45 @@ fn the_systems_source_gives_different_samples() {
 }
 
 #[test]
-fn sample_refuses_a_size_over_the_pipeline_limit() {
-    let err = run_with(doc! {"$sample": {"size": 4}}, numbered(2), &Limits { max_documents: 3 })
-        .expect_err("a size over the limit");
-    assert!(matches!(&err, Error::Limit(m) if m.contains("$sample size 4")), "{err:?}");
-    // At the limit is fine.
-    assert!(
-        run_with(doc! {"$sample": {"size": 3}}, numbered(2), &Limits { max_documents: 3 }).is_ok()
-    );
+fn sample_orders_its_answer_at_random_so_a_limit_after_it_reaches_every_document() {
+    // The reference: `[{$sample: {size: 3}}, {$limit: 1}]` over 10 documents answers each
+    // one a tenth of the time. 20000 runs: 2000 expected each, a standard deviation of
+    // 42; bounds 1700 to 2300 are about 7 sigma.
+    let mut rng: rand::rngs::StdRng = rand::SeedableRng::seed_from_u64(0x0dd5);
+    let mut below = |n: usize| rand::RngExt::random_range(&mut rng, 0..n);
+    let mut first = [0usize; 10];
+    let mut ascending = 0usize;
+    for _ in 0..20_000 {
+        let out = stages::sample(numbered(10), 3, &Limits::default(), &mut below).unwrap();
+        let ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+        first[ids[0] as usize] += 1;
+        ascending += usize::from(ids.windows(2).all(|w| w[0] < w[1]));
+    }
+    for (id, n) in first.iter().enumerate() {
+        assert!((1700..=2300).contains(n), "document {id} came first {n} times: {first:?}");
+    }
+    // Three chosen documents are in ascending order one time in six (3333 expected, a
+    // standard deviation of 52), not the 21% a reservoir's slot order gives.
+    assert!((3000..=3700).contains(&ascending), "{ascending} ascending");
+    // And a size that covers the input is a shuffle: every document first about equally.
+    let mut first = [0usize; 5];
+    for _ in 0..10_000 {
+        let out = stages::sample(numbered(5), 9, &Limits::default(), &mut below).unwrap();
+        first[out[0].get_i32("_id").unwrap() as usize] += 1;
+    }
+    for (id, n) in first.iter().enumerate() {
+        assert!((1700..=2300).contains(n), "document {id} came first {n} times: {first:?}");
+    }
 }
 
 #[test]
-fn sample_holds_its_reservoir_to_the_byte_cap_and_refuses_at_once() {
-    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
-    // Documents of about a quarter of the cap: the fifth in the reservoir passes it.
-    let pad = "x".repeat(cap / 4 - 100);
-    let big: Vec<Document> = (0..8).map(|i| doc! {"_id": i, "pad": pad.clone()}).collect();
-    let one = bson::serialize_to_vec(&big[0]).unwrap().len();
-    assert!(one * 4 <= cap && one * 5 > cap);
-    // Four fit, exactly under the cap.
-    let ok = stages::sample(big.clone(), 4, &Limits::default(), &mut seeded(1)).unwrap();
-    assert_eq!(ok.len(), 4);
-    // Five do not: refused when the fifth arrives, with the bytes then held.
-    let err = stages::sample(big, 5, &Limits::default(), &mut seeded(1)).expect_err("over the cap");
-    assert!(
-        matches!(&err, Error::AnswerTooLarge { what, bytes, max, .. }
-            if what.contains("$sample") && *bytes == one * 5 && *max == cap),
-        "{err:?}"
-    );
-}
-
-#[test]
-fn sample_allows_a_reservoir_of_exactly_the_cap_and_refuses_one_byte_more() {
-    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
-    let empty = bson::serialize_to_vec(&doc! {"_id": 0, "pad": ""}).unwrap().len();
-    let exact = vec![doc! {"_id": 0, "pad": "x".repeat(cap - empty)}];
-    assert_eq!(bson::serialize_to_vec(&exact[0]).unwrap().len(), cap);
-    let ok = stages::sample(exact, 1, &Limits::default(), &mut seeded(1)).unwrap();
-    assert_eq!(ok.len(), 1);
-    let over = vec![doc! {"_id": 0, "pad": "x".repeat(cap - empty + 1)}];
-    let err = stages::sample(over, 1, &Limits::default(), &mut seeded(1)).expect_err("a byte over");
-    assert!(matches!(err, Error::AnswerTooLarge { bytes, .. } if bytes == cap + 1), "{err:?}");
-}
-
-#[test]
-fn sample_counts_a_replaced_document_by_its_own_size_not_the_old_one() {
-    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
-    let pad = "x".repeat(cap / 2 - 100);
-    // One small slot, one half-cap slot; every replacement of the small slot by a
-    // half-cap document would put the reservoir over the cap, and must be refused.
-    let input = vec![
-        doc! {"_id": 0},
-        doc! {"_id": 1, "pad": pad.clone()},
-        doc! {"_id": 2, "pad": pad.clone()},
-    ];
-    // Document 2 is drawn into slot 0: the reservoir would be two half-cap documents
-    // (just under the cap), which is fine.
-    let mut below = |_| 0usize;
-    let out = stages::sample(input.clone(), 2, &Limits::default(), &mut below).unwrap();
-    assert_eq!(out.len(), 2);
-    // Three half-cap documents' worth can never be held at once, whatever is drawn.
-    let mut input = input;
-    input.push(doc! {"_id": 3, "pad": pad});
-    let mut below = |_| 0usize;
-    assert!(stages::sample(input, 3, &Limits::default(), &mut below).is_err());
+fn sample_has_no_byte_cap_of_its_own() {
+    // The input is documents the pipeline already holds (held to the document limit); the
+    // reservoir moves some of them and holds none more. Documents of 5 MiB, four of them.
+    let pad = "x".repeat(5 * 1024 * 1024);
+    let big: Vec<Document> = (0..4).map(|i| doc! {"_id": i, "pad": pad.clone()}).collect();
+    let out = stages::sample(big, 4, &Limits::default(), &mut seeded(1)).unwrap();
+    assert_eq!(out.len(), 4);
 }
 
 // ---------------------------------------------------------------------------

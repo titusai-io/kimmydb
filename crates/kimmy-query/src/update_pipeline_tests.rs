@@ -110,12 +110,53 @@ fn null_and_missing_propagate_as_in_an_aggregation() {
         doc! {"_id": 1, "a": 1},
     )
     .unwrap();
-    // A missing field in `$add` is null; a field set from a missing path is null, too,
-    // as `$addFields` does.
+    // A missing field in `$add` is null; a field set from a missing path is left out, as
+    // the reference's `$addFields` does: `path` is not added.
+    assert_eq!(out, doc! {"_id": 1, "a": 1, "sum": Bson::Null, "up": "", "dflt": "d"});
+}
+
+#[test]
+fn a_missing_path_removes_an_existing_field_and_adds_nothing() {
+    // Reference 6.0.5: `$set: {p: "$nope"}` over `{p: 5, q: 1}` is `{q: 1}`.
+    let stored = doc! {"_id": 1, "p": 5, "q": 1, "o": {"p": 9, "r": 1}, "items": [1, 2]};
     assert_eq!(
-        out,
-        doc! {"_id": 1, "a": 1, "sum": Bson::Null, "up": "", "dflt": "d", "path": Bson::Null}
+        apply(vec![doc! {"$set": {"p": "$nope"}}], stored.clone()).unwrap(),
+        doc! {"_id": 1, "q": 1, "o": {"p": 9, "r": 1}, "items": [1, 2]}
     );
+    // A dotted target leaves the embedded document without the field.
+    assert_eq!(
+        apply(vec![doc! {"$set": {"o.p": "$nope"}}], stored.clone()).unwrap(),
+        doc! {"_id": 1, "p": 5, "q": 1, "o": {"r": 1}, "items": [1, 2]}
+    );
+    // Through `$$ROOT` and `$$CURRENT` paths, and a variable's path.
+    for expr in ["$$ROOT.nope", "$$CURRENT.nope", "$nope.deeper", "$o.nope"] {
+        assert_eq!(
+            apply(vec![doc! {"$set": {"p": expr}}], stored.clone()).unwrap(),
+            doc! {"_id": 1, "q": 1, "o": {"p": 9, "r": 1}, "items": [1, 2]},
+            "{expr}"
+        );
+    }
+    let out = apply(
+        vec![doc! {"$set": {"p": {"$let": {"vars": {"v": {"a": 1}}, "in": "$$v.nope"}}}}],
+        stored.clone(),
+    )
+    .unwrap();
+    assert!(out.get("p").is_none(), "{out:?}");
+    // A missing value in an object expression omits the key, in an array it is null.
+    let out = apply(
+        vec![doc! {"$set": {"obj": {"a": "$nope", "b": 1}, "arr": ["$nope", 2]}}],
+        stored.clone(),
+    )
+    .unwrap();
+    assert_eq!(out.get_document("obj").unwrap(), &doc! {"b": 1});
+    assert_eq!(out.get_array("arr").unwrap(), &vec![Bson::Null, Bson::Int32(2)]);
+    // Null is a value: it is stored.
+    let nulled = apply(vec![doc! {"$set": {"p": Bson::Null}}], stored.clone()).unwrap();
+    assert_eq!(nulled.get("p"), Some(&Bson::Null));
+    // A field that exists with a null value is not missing.
+    let stored = doc! {"_id": 1, "n": Bson::Null};
+    let out = apply(vec![doc! {"$set": {"copy": "$n"}}], stored).unwrap();
+    assert_eq!(out.get("copy"), Some(&Bson::Null));
 }
 
 #[test]
@@ -199,18 +240,16 @@ fn a_replace_with_later_stages_keeps_working_on_the_new_document() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn id_cannot_be_changed_or_removed() {
+fn id_cannot_be_changed_to_another_documents_id() {
     let stored = doc! {"_id": 1, "a": 1};
     for pipeline in [
         vec![doc! {"$set": {"_id": 2}}],
-        vec![doc! {"$set": {"_id": "$$REMOVE"}}],
-        vec![doc! {"$unset": "_id"}],
-        vec![doc! {"$project": {"_id": 0, "a": 1}}],
-        vec![doc! {"$project": {"_id": 0}}],
         vec![doc! {"$replaceWith": {"_id": 2, "a": 1}}],
         vec![doc! {"$set": {"_id": "1"}}],
-        vec![doc! {"$set": {"_id": 1i64}}],
+        vec![doc! {"$set": {"_id": Bson::Null}}],
         vec![doc! {"$set": {"x": 1}}, doc! {"$set": {"_id": 9}}],
+        // A double is not an id, whatever its value.
+        vec![doc! {"$set": {"_id": 1.0}}],
     ] {
         let err = apply(pipeline.clone(), stored.clone()).expect_err("must be refused");
         assert!(
@@ -223,6 +262,74 @@ fn id_cannot_be_changed_or_removed() {
         apply(vec![doc! {"$set": {"_id": "$_id", "a": 2}}], stored).unwrap(),
         doc! {"_id": 1, "a": 2}
     );
+}
+
+#[test]
+fn a_pipeline_that_removes_id_gets_the_stored_one_back_first() {
+    // The reference judges the final result: a result without `_id` is given the stored one.
+    let stored = doc! {"_id": 1, "a": 2, "b": 3};
+    for (pipeline, want) in [
+        (vec![doc! {"$unset": "_id"}], doc! {"_id": 1, "a": 2, "b": 3}),
+        (vec![doc! {"$project": {"_id": 0, "a": 1}}], doc! {"_id": 1, "a": 2}),
+        (vec![doc! {"$project": {"_id": 0}}], doc! {"_id": 1, "a": 2, "b": 3}),
+        (vec![doc! {"$set": {"_id": "$$REMOVE", "c": 4}}], doc! {"_id": 1, "a": 2, "b": 3, "c": 4}),
+        (vec![doc! {"$replaceWith": {"z": 1}}], doc! {"_id": 1, "z": 1}),
+        // Taken out and put back last: the same document, `_id` first.
+        (
+            vec![
+                doc! {"$set": {"keep": "$_id"}},
+                doc! {"$unset": "_id"},
+                doc! {"$set": {"_id": "$keep"}},
+                doc! {"$unset": "keep"},
+            ],
+            doc! {"_id": 1, "a": 2, "b": 3},
+        ),
+    ] {
+        assert_eq!(apply(pipeline.clone(), stored.clone()).unwrap(), want, "{pipeline:?}");
+    }
+}
+
+#[test]
+fn between_stages_id_is_whatever_the_stages_made_it() {
+    // After `$replaceWith {a: "$a"}` there is no `_id` for the next stage to read.
+    let out = apply(
+        vec![
+            doc! {"$replaceWith": {"a": "$a"}},
+            doc! {"$set": {"x": "$_id", "t": {"$type": "$_id"}}},
+        ],
+        doc! {"_id": 1, "a": 2, "b": 3},
+    )
+    .unwrap();
+    // `x` is not set from a missing field and `$type` says so; `_id` is restored at the end.
+    assert_eq!(out, doc! {"_id": 1, "a": 2, "t": "missing"});
+    let out = apply(
+        vec![doc! {"$unset": "_id"}, doc! {"$set": {"seen": {"$type": "$_id"}}}],
+        doc! {"_id": 1},
+    )
+    .unwrap();
+    assert_eq!(out, doc! {"_id": 1, "seen": "missing"});
+}
+
+#[test]
+fn id_changed_to_the_same_id_of_another_type_is_stored_as_it_is() {
+    let out =
+        apply(vec![doc! {"$set": {"_id": {"$toLong": "$_id"}}}], doc! {"_id": 1, "a": 1}).unwrap();
+    assert_eq!(out.get("_id"), Some(&Bson::Int64(1)));
+    let out =
+        apply(vec![doc! {"$set": {"_id": {"$toDecimal": "$_id"}}}], doc! {"_id": 1i64, "a": 1})
+            .unwrap();
+    assert!(matches!(out.get("_id"), Some(Bson::Decimal128(_))));
+    assert_eq!(out.keys().next().map(String::as_str), Some("_id"));
+}
+
+#[test]
+fn an_empty_pipeline_is_a_no_op() {
+    let stored = doc! {"_id": 1, "a": 1};
+    assert_eq!(apply(vec![], stored.clone()).unwrap(), stored);
+    let mut seed = doc! {"k": "e"};
+    let update = update::parse_pipeline(&[], &[]).unwrap();
+    update::apply_on_insert(&update, &mut seed, 0).unwrap();
+    assert_eq!(seed, doc! {"k": "e"});
 }
 
 #[test]
@@ -280,12 +387,7 @@ fn only_the_three_stage_families_are_allowed() {
 }
 
 #[test]
-fn an_empty_array_a_non_document_and_a_bad_stage_shape_are_refused() {
-    let message = UpdatePipeline::parse(&[]).unwrap_err().to_string();
-    assert_eq!(
-        message,
-        "invalid update: a pipeline update needs at least one stage; an empty array is not an update"
-    );
+fn a_non_document_and_a_bad_stage_shape_are_refused() {
     for element in [Bson::Int32(1), Bson::String("$set".into()), Bson::Null, Bson::Array(vec![])] {
         let message =
             UpdatePipeline::parse(std::slice::from_ref(&element)).unwrap_err().to_string();

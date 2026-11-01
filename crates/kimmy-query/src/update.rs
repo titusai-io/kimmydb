@@ -181,7 +181,8 @@ const ID_FIELD: &str = "_id";
 pub fn parse_pipeline(stages: &[Bson], array_filters: &[Document]) -> Result<Update> {
     if !array_filters.is_empty() {
         return Err(Error::InvalidUpdate(
-            "arrayFilters apply to update operators, not to a pipeline update: address array              elements with $map and $filter in an expression"
+            "arrayFilters apply to update operators, not to a pipeline update: address array \
+             elements with $map and $filter in an expression"
                 .into(),
         ));
     }

@@ -462,7 +462,11 @@ Only `$addFields`/`$set`, `$project`/`$unset` and `$replaceRoot`/`$replaceWith` 
 allowed; the answer is the one an operator update gives (`matched`, `modified`,
 `commits`, `stamp`; `find_and_modify` answers `document`, `matched`, `modified` as
 for operators). On `find_and_modify`, `"upsert": true` seeds the inserted document from
-the filter's equality fields and runs the stages over it:
+the filter's equality fields and runs the stages over it (only if nothing matches; a
+document that does is updated). An empty array is an update that changes nothing. A
+result without `_id` gets the stored one back, and a missing field path as a stage value
+(`{"$set": {"p": "$nope"}}`) removes an existing `p` and adds nothing, as in an
+aggregation:
 
 ```bash
 curl -XPOST localhost:7878/v1/db/shop/coll/orders/find_and_modify -H "$A" -d '{
@@ -476,11 +480,10 @@ Every refusal is `400` with these message prefixes, and nothing is written:
 
 | Cause | Message begins |
 |---|---|
-| Empty array | `invalid update: a pipeline update needs at least one stage` |
 | Element that is not a document | `invalid update: each stage of a pipeline update is a document` |
 | Any stage but the six allowed | `invalid update: a pipeline update allows only $addFields (or $set), $project (or $unset) and $replaceRoot (or $replaceWith), found <stage>` |
 | `arrayFilters` given | `invalid update: arrayFilters apply to update operators, not to a pipeline update` |
-| A stage that changes or removes `_id` (or gives an upserted document one) | `invalid query: invalid update: _id is immutable and cannot be updated` |
+| A result with another document's `_id` (or an upserted document given one) | `invalid query: invalid update: _id is immutable and cannot be updated` |
 | A bad stage operand or expression | the aggregation's own, e.g. `invalid query: $set takes a document`, `unsupported operator "$nope"` |
 | A positional projection with `returnDocument: "after"` | `invalid query: the positional projection ... after a pipeline update` |
 
