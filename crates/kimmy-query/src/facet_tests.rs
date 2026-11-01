@@ -168,7 +168,7 @@ fn a_facet_cannot_hold_a_facet_or_a_vector_search() {
 
 #[test]
 fn the_outputs_together_may_not_pass_the_document_limit() {
-    let limits = Limits { max_documents: 5 };
+    let limits = Limits { max_documents: 5, ..Default::default() };
     // Three and three: each is under the ceiling and together they are over.
     let err = run_with(
         &[doc! {"$facet": {"a": [{"$limit": 3}], "b": [{"$limit": 3}]}}],

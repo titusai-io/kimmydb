@@ -3121,6 +3121,60 @@ async fn a_sort_document_keeps_the_precedence_it_was_written_in() {
     assert_eq!(order(&server, &token, r#"{"b":1,"a":1}"#).await, vec![2, 1]);
 }
 
+/// A descending sort orders a document with an array at the sort path by its largest
+/// element, an ascending one by its smallest, in a full sort and in a bounded one (ADR-264).
+#[tokio::test]
+async fn a_descending_sort_orders_an_array_by_its_largest_element() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for (id, a) in [(1, json!([0, 5])), (2, json!(3)), (3, json!([1, 2]))] {
+        let res =
+            server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "a": a})).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    async fn order(server: &Server, token: &str, body: Value) -> Vec<i64> {
+        let res = server.post("/v1/db/shop/coll/c/find", Some(token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    }
+    // Ascending by 0, 1, 3; descending by 5, 3, 2.
+    assert_eq!(order(&server, &token, json!({"sort": {"a": 1}})).await, vec![1, 3, 2]);
+    assert_eq!(order(&server, &token, json!({"sort": {"a": -1}})).await, vec![1, 2, 3]);
+    // A bounded window agrees with the full sort.
+    assert_eq!(order(&server, &token, json!({"sort": {"a": -1}, "limit": 2})).await, vec![1, 2]);
+    assert_eq!(
+        order(&server, &token, json!({"sort": {"a": -1}, "skip": 1, "limit": 2})).await,
+        vec![2, 3]
+    );
+    // The pipeline's `$sort` and a `$push` followed by `$sortArray` agree.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$sort": {"a": -1}}, {"$project": {"_id": 1}}]}),
+        )
+        .await;
+    assert_eq!(
+        res.body["documents"],
+        json!([{"_id": 1}, {"_id": 2}, {"_id": 3}]),
+        "{:?}",
+        res.body
+    );
+    let res = server
+        .post("/v1/db/shop/coll/c/aggregate", Some(&token), json!({"pipeline": [
+            {"$group": {"_id": null, "all": {"$push": {"id": "$_id", "a": "$a"}}}},
+            {"$project": {"_id": 0, "ids": {"$map": {"input": {"$sortArray": {"input": "$all", "sortBy": {"a": -1}}}, "as": "d", "in": "$$d.id"}}}}
+        ]}))
+        .await;
+    assert_eq!(res.body["documents"], json!([{"ids": [1, 2, 3]}]), "{:?}", res.body);
+}
+
 /// A stored document's fields come back in the order they were written, as
 /// BSON keeps them and MongoDB returns them. The test client parses the body
 /// into a `serde_json::Value`, which since ADR-120 keeps the text's key order,
@@ -7949,7 +8003,7 @@ async fn vector_search_stage_hits_are_held_to_the_pipeline_ceiling() {
     let auth = kimmy_api::state::Auth(kimmy_auth::Principal::superuser("test"));
     let pipeline = json!([{ "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 3 } }]);
 
-    let tight = kimmy_query::aggregate::Limits { max_documents: 2 };
+    let tight = kimmy_query::aggregate::Limits { max_documents: 2, ..Default::default() };
     let err = kimmy_api::exec::aggregate_with_limits(
         &server.state,
         &auth,
@@ -7964,7 +8018,7 @@ async fn vector_search_stage_hits_are_held_to_the_pipeline_ceiling() {
     assert!(text.contains("$vectorSearch produced 3 documents"), "{text}");
     assert!(text.contains("pipeline limit of 2"), "{text}");
 
-    let roomy = kimmy_query::aggregate::Limits { max_documents: 3 };
+    let roomy = kimmy_query::aggregate::Limits { max_documents: 3, ..Default::default() };
     let out = kimmy_api::exec::aggregate_with_limits(
         &server.state,
         &auth,
@@ -14630,6 +14684,168 @@ async fn bucket_and_bucket_auto_build_histograms_and_refuse_what_they_cannot_pla
 }
 
 #[tokio::test]
+async fn set_window_fields_densify_and_fill_run_over_http_and_refuse_what_they_cannot() {
+    // ADR-264: windows over sorted partitions, gaps closed, nulls filled.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "w" })).await;
+    for (id, state, day, qty) in
+        [(1, "CA", 1, 10), (2, "CA", 2, 20), (3, "WA", 1, 5), (4, "CA", 4, 40)]
+    {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/w/docs",
+                Some(&token),
+                json!({ "_id": id, "state": state, "day": day, "qty": qty }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    server
+        .post("/v1/db/shop/coll/w/docs", Some(&token), json!({ "_id": 5, "state": "WA", "day": 3 }))
+        .await;
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/w/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    let res = aggregate(json!([
+        { "$setWindowFields": { "partitionBy": "$state", "sortBy": { "day": 1 }, "output": {
+            "running": { "$sum": "$qty", "window": { "documents": ["unbounded", "current"] } },
+            "rank": { "$rank": {} }
+        } } },
+        { "$project": { "_id": 1, "running": 1, "rank": 1 } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            { "_id": 1, "running": 10, "rank": 1 },
+            { "_id": 2, "running": 30, "rank": 2 },
+            { "_id": 4, "running": 70, "rank": 3 },
+            { "_id": 3, "running": 5, "rank": 1 },
+            { "_id": 5, "running": 5, "rank": 2 }
+        ])
+    );
+    let res = aggregate(json!([
+        { "$match": { "state": "CA" } },
+        { "$densify": { "field": "day", "range": { "step": 1, "bounds": "full" } } },
+        { "$project": { "_id": 0, "day": 1, "qty": 1 } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            { "day": 1, "qty": 10 },
+            { "day": 2, "qty": 20 },
+            { "day": 3 },
+            { "day": 4, "qty": 40 }
+        ])
+    );
+    let res = aggregate(json!([
+        { "$match": { "state": "WA" } },
+        { "$fill": { "sortBy": { "day": 1 }, "output": { "qty": { "method": "linear" } } } },
+        { "$project": { "_id": 1, "qty": 1 } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // The second WA document has no later value to interpolate to.
+    assert_eq!(res.body["documents"], json!([{ "_id": 3, "qty": 5 }, { "_id": 5, "qty": null }]));
+    let res = aggregate(json!([
+        { "$fill": { "output": { "qty": { "value": 0 } } } },
+        { "$match": { "_id": 5 } },
+        { "$project": { "qty": 1 } }
+    ]))
+    .await;
+    assert_eq!(res.body["documents"], json!([{ "_id": 5, "qty": 0 }]), "{:?}", res.body);
+    // Covariance is a window operator, and `locf` needs no sort.
+    let res = aggregate(json!([
+        { "$match": { "state": "CA" } },
+        { "$setWindowFields": { "sortBy": { "day": 1 }, "output": {
+            "c": { "$covariancePop": ["$day", "$qty"] },
+            "f": { "$locf": "$qty" }
+        } } },
+        { "$project": { "_id": 1, "c": 1, "f": 1 } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // Days 1, 2, 4 and quantities 10, 20, 40: the means 7/3 and 70/3, the products of the
+    // deviations 160/9, 10/9 and 250/9, and a third of their sum.
+    let c = res.body["documents"][0]["c"].as_f64().unwrap();
+    assert!((c - 420.0 / 27.0).abs() < 1e-9, "{c}");
+    assert_eq!(res.body["documents"][2]["f"], json!(40));
+    // Inside a facet.
+    let res = aggregate(json!([{ "$facet": { "f": [
+        { "$setWindowFields": { "sortBy": { "_id": 1 }, "output": { "n": { "$documentNumber": {} } } } },
+        { "$count": "c" }
+    ] } }]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{ "f": [{ "c": 5 }] }]));
+    // Refusals are 400s that say why.
+    for (stage, needle) in [
+        (
+            json!({ "$setWindowFields": { "output": { "x": { "$rank": {} } } } }),
+            "requires a `sortBy`",
+        ),
+        (
+            json!({ "$setWindowFields": { "output": { "x": { "$mergeObjects": "$a" } } } }),
+            "not a window operator",
+        ),
+        (
+            json!({ "$densify": { "field": "day", "range": { "step": 0, "bounds": "full" } } }),
+            "greater than 0",
+        ),
+        (json!({ "$fill": { "output": { "x": { "method": "linear" } } } }), "exactly one field"),
+    ] {
+        let res = aggregate(json!([stage.clone()])).await;
+        assert_eq!(res.status, 400, "{stage}: {:?}", res.body);
+        assert!(res.body["message"].as_str().unwrap().contains(needle), "{stage}: {:?}", res.body);
+    }
+    // A range that would make more documents than the pipeline holds is refused before any are.
+    server
+        .post(
+            "/v1/db/shop/coll/w/docs",
+            Some(&token),
+            json!({ "_id": 6, "state": "CA", "day": 2000000000 }),
+        )
+        .await;
+    let res = aggregate(json!([
+        { "$densify": { "field": "day", "range": { "step": 1, "bounds": "full" } } }
+    ]))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(
+        res.body["message"].as_str().unwrap().contains("$densify would produce"),
+        "{:?}",
+        res.body
+    );
+    // The plan names the stages.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/w/aggregate",
+            Some(&token),
+            json!({ "explain": true, "pipeline": [
+                { "$setWindowFields": { "sortBy": { "day": 1 }, "output": { "n": { "$rank": {} } } } },
+                { "$densify": { "field": "day", "range": { "step": 1, "bounds": "full" } } },
+                { "$fill": { "output": { "qty": { "value": 0 } } } }
+            ] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let text = res.body.to_string();
+    for name in ["$setWindowFields", "$densify", "$fill"] {
+        assert!(text.contains(name), "{name}: {text}");
+    }
+}
+
+#[tokio::test]
 async fn graph_lookup_walks_a_collection_and_requires_a_depth() {
     // ADR-254: the walk follows connectFromField into connectToField, each document
     // once, to the caller's `maxDepth`; the depth is required, and the foreign
@@ -18682,7 +18898,10 @@ async fn sort_array_orders_documents_as_the_sort_stage_does() {
         json!({"_id": 8, "k": null}),
     ];
     sink_seed(&server, &token, "src", docs).await;
-    let expected = [(1, json!([4, 8, 1, 3, 5, 2, 6, 7])), (-1, json!([7, 6, 2, 5, 3, 1, 4, 8]))];
+    // Ascending takes the smallest element of an array (1 for id 1, 2 for id 3), descending the
+    // largest (5 and 4): so id 1 comes before id 3 and id 2 (a 3) both ways round, and after
+    // `{x: 1}` and "s", which sort above every number.
+    let expected = [(1, json!([4, 8, 1, 3, 5, 2, 6, 7])), (-1, json!([7, 6, 1, 3, 2, 5, 4, 8]))];
     for (dir, expected) in expected {
         let stage = sink_run(
             &server,

@@ -976,3 +976,67 @@ mod against_the_comparator {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// RunningSum: a sum that terms can leave
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// After any run of adds and removes the sum is what an `ExactSum` over the terms
+    /// still held gives, the sum and the mean, the specials, the exponent and the
+    /// sign of zero included.
+    #[test]
+    fn a_running_sum_equals_the_exact_sum_of_what_it_holds(
+        terms in proptest::collection::vec(
+            prop_oneof![
+                8 => (any::<bool>(), 0u128..10u128.pow(20), -30i16..30).prop_map(|(n, c, e)| fin(n, c, e)),
+                1 => Just(Raw::Nan),
+                1 => any::<bool>().prop_map(|negative| Raw::Inf { negative }),
+                1 => Just(fin(true, 0, 0)),
+            ],
+            1..24,
+        ),
+        window in 1usize..8,
+    ) {
+        let mut running = arith::RunningSum::new();
+        for (i, term) in terms.iter().enumerate() {
+            running.add(term);
+            if i >= window {
+                running.remove(&terms[i - window]);
+            }
+            let from = (i + 1).saturating_sub(window);
+            let mut exact = ExactSum::new();
+            for held in &terms[from..=i] {
+                exact.add(held);
+            }
+            prop_assert_eq!(running.count(), exact.count());
+            prop_assert_eq!(show(&running.finish_sum()), show(&exact.finish_sum()), "sum after {}", i);
+            prop_assert_eq!(show(&running.finish_avg()), show(&exact.finish_avg()), "mean after {}", i);
+        }
+    }
+}
+
+#[test]
+fn a_running_sum_forgets_a_far_off_term_that_has_left() {
+    let mut running = arith::RunningSum::new();
+    let big = d("1E+6000");
+    running.add(&d("1.5"));
+    running.add(&big);
+    running.remove(&big);
+    assert_eq!(show(&running.finish_sum()), "15E-1");
+    running.remove(&d("1.5"));
+    assert_eq!(running.count(), 0);
+}
+
+#[test]
+fn a_running_sum_of_negative_zeros_is_negative_zero_until_a_positive_term_is_in() {
+    let mut running = arith::RunningSum::new();
+    let negative = fin(true, 0, 0);
+    running.add(&negative);
+    running.add(&negative);
+    assert_eq!(show(&running.finish_sum()), "-0E0");
+    running.add(&fin(false, 0, 0));
+    assert_eq!(show(&running.finish_sum()), "0E0");
+    running.remove(&fin(false, 0, 0));
+    assert_eq!(show(&running.finish_sum()), "-0E0");
+}

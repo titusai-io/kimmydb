@@ -43,7 +43,7 @@ fn run_mode(state: &SharedState, pipeline: &Value, mode: Mode, max_documents: us
     BUILDS.with(|n| n.set(0));
     PROBES.with(|n| n.set(0));
     HOISTS.with(|n| n.set(0));
-    let limits = aggregate::Limits { max_documents };
+    let limits = aggregate::Limits { max_documents, ..Default::default() };
     let outcome =
         agg_limits(state, &root(), "app", "orders", pipeline, limits).map_err(|e| format!("{e:?}"));
     let run = Run {
