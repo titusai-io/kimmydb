@@ -2853,7 +2853,11 @@ fn lookup_pipeline(
     };
     let mut plan = LeadPlan::default();
     let base = match (first, lead) {
-        (Some(first), None) => aggregate::apply(first, foreign, limits)?,
+        (Some(first), None) => {
+            // The stage charges what it is given, so the read's charge is handed back for it.
+            foreign_held.release(foreign_held.bytes());
+            aggregate::apply(first, foreign, limits)?
+        }
         (Some(aggregate::Stage::Match(_)), Some(lead)) => {
             match hoist_independent(&lead.independent, &foreign) {
                 Some(kept) => {
@@ -2866,6 +2870,10 @@ fn lookup_pipeline(
         _ => foreign,
     };
 
+    // What the loop holds, however it was made: the foreign documents, or those the leading
+    // `$match` kept.
+    foreign_held.release(foreign_held.bytes());
+    foreign_held.charge_docs(&base)?;
     let mut joined_count = 0usize;
     let mut out = Vec::with_capacity(input.len());
     for (n, mut doc) in input.into_iter().enumerate() {
@@ -4941,6 +4949,9 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod memory_tests;
 
 #[cfg(test)]
 mod union_tests;
