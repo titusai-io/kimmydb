@@ -2477,6 +2477,7 @@ pub(crate) fn group_keyed(
 /// outside every range or is not of the boundaries' kind; and a document with
 /// neither is **refused**, naming the value. Only buckets that received a
 /// document are answered, in boundary order and the `default` bucket last.
+#[allow(clippy::too_many_arguments)]
 fn bucket(
     input: Vec<Document>,
     group_by: &Expr,

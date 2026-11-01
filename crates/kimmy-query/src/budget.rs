@@ -261,19 +261,19 @@ impl Lease {
             });
         }
         let want = inner.used - inner.reserved;
-        if let Some(pool) = inner.pool.clone() {
-            if want > 0 {
-                if !pool.try_reserve(want) {
-                    pool.0.pool_refusals.fetch_add(1, Ordering::Relaxed);
-                    return Err(Error::MemoryBusy {
-                        what: self.what,
-                        bytes: want,
-                        pool: pool.cap(),
-                        in_use: pool.used(),
-                    });
-                }
-                inner.reserved += want;
+        if let Some(pool) = inner.pool.clone()
+            && want > 0
+        {
+            if !pool.try_reserve(want) {
+                pool.0.pool_refusals.fetch_add(1, Ordering::Relaxed);
+                return Err(Error::MemoryBusy {
+                    what: self.what,
+                    bytes: want,
+                    pool: pool.cap(),
+                    in_use: pool.used(),
+                });
             }
+            inner.reserved += want;
         }
         Ok(())
     }

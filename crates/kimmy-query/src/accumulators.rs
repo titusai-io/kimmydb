@@ -536,10 +536,10 @@ impl State {
                 self.held = self.held.saturating_add(row.bytes());
                 rows.push(row);
                 self.seq += 1;
-                if rows.len() > limit {
-                    if let Some(dropped) = rows.pop() {
-                        self.held = self.held.saturating_sub(dropped.bytes());
-                    }
+                if rows.len() > limit
+                    && let Some(dropped) = rows.pop()
+                {
+                    self.held = self.held.saturating_sub(dropped.bytes());
                 }
             }
             Body::Best(_) | Body::Values(_) => {
@@ -563,10 +563,10 @@ impl State {
                 } else {
                     self.held = self.held.saturating_add(value_bytes(&value));
                     values.push_back(value);
-                    if values.len() > limit {
-                        if let Some(dropped) = values.pop_front() {
-                            self.held = self.held.saturating_sub(value_bytes(&dropped));
-                        }
+                    if values.len() > limit
+                        && let Some(dropped) = values.pop_front()
+                    {
+                        self.held = self.held.saturating_sub(value_bytes(&dropped));
                     }
                 }
             }
@@ -575,10 +575,10 @@ impl State {
                 self.held = self.held.saturating_add(value_bytes(&value));
                 heap.push(Best { value, seq: self.seq, max: self.kind == Kind::MaxN });
                 self.seq += 1;
-                if heap.len() > limit {
-                    if let Some(dropped) = heap.pop() {
-                        self.held = self.held.saturating_sub(value_bytes(&dropped.value));
-                    }
+                if heap.len() > limit
+                    && let Some(dropped) = heap.pop()
+                {
+                    self.held = self.held.saturating_sub(value_bytes(&dropped.value));
                 }
             }
             _ => {}
