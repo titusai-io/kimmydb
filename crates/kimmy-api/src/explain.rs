@@ -210,6 +210,39 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
              the pipeline's document limit"
                 .into()
         }
+        Stage::UnionWith(spec) => {
+            out["from"] = json!(spec.coll);
+            out["runs"] = json!("foreignScan");
+            out["stages"] =
+                json!(spec.stages.iter().map(|s| describe(s, false)).collect::<Vec<_>>());
+            out["readsForeign"] = json!(
+                "once per execution of the stage, even when no document reaches it; a collection \
+                 that does not exist reads as empty on a node with no peers"
+            );
+            "emits every document that reaches it, then the foreign collection's documents run \
+             through the sub-pipeline; the collection is read whole and what is read counts \
+             against the pipeline's document limit, as a $lookup's does; what the stage appends \
+             (input plus appended, in documents) counts against it too, and the appended \
+             documents' bytes against the 16 MiB a stored document may be; the input's bytes \
+             are not charged"
+                .into()
+        }
+        Stage::SortByCount(_) => {
+            "groups everything that reaches it in memory by the expression, counts each group and \
+             sorts the groups by count, largest first; blocking"
+                .into()
+        }
+        Stage::Sample(n) => {
+            out["size"] = json!(n);
+            "keeps this many documents chosen at random, in a random order; blocking, over the \
+             input the pipeline already holds (the pipeline's document limit applies to it)"
+                .into()
+        }
+        Stage::Redact(_) => {
+            "decides each document, and each embedded document below one that descends, by the \
+             expression's answer: keep it whole, prune it, or descend into it"
+                .into()
+        }
         Stage::Bucket { boundaries, default, .. } => {
             out["boundaries"] = json!(boundaries.len());
             out["default"] = json!(default.is_some());

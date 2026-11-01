@@ -374,7 +374,11 @@ pub struct UpdateArgs {
         deserialize_with = "kimmy_api::json::non_null_field"
     )]
     pub filter: Option<Value>,
-    /// Update operators, for example `{"$set": {"status": "closed"}}`.
+    /// Update operators, for example `{"$set": {"status": "closed"}}`, or an
+    /// array of pipeline stages that compute the new document from the old
+    /// one, for example `[{"$set": {"total": {"$add": ["$a", "$b"]}}}]`. Only
+    /// `$set`/`$addFields`, `$unset`/`$project` and `$replaceWith`/
+    /// `$replaceRoot` stages are allowed, and `arrayFilters` cannot be used.
     pub update: Value,
     /// Update every match rather than only the first.
     #[serde(default)]
@@ -571,6 +575,10 @@ impl KimmyMcp {
                        $lookup (join; you need read access to the joined collection too), \
                        $facet (several sub-pipelines over one input, answered as one \
                        document of arrays), $bucket and $bucketAuto (histograms), \
+                       $sortByCount, $sample (size N, random), $redact (per-document and \
+                       per-embedded-document access control with $$KEEP, $$PRUNE, $$DESCEND), \
+                       $unionWith (append another collection, optionally through a \
+                       pipeline; you need read access to it), $replaceWith and $unset, \
                        $graphLookup (walk a collection link by link; maxDepth is required, \
                        restrictSearchWithMatch narrows the collection it reads whole; you \
                        need read access to it), $setWindowFields (running totals, moving \
@@ -701,7 +709,9 @@ impl KimmyMcp {
                        unless `multi` is true. A path may address array elements: \
                        `items.$[].qty` for every element, or `items.$[line].qty` for \
                        the elements an `arrayFilters` entry such as \
-                       `{\"line.sku\": \"b\"}` selects.")]
+                       `{\"line.sku\": \"b\"}` selects. `update` may instead be an array \
+                       of stages (`$set`, `$unset`, `$project`, `$replaceWith`) that \
+                       compute the new document from the old one.")]
     async fn update(
         &self,
         Parameters(args): Parameters<UpdateArgs>,

@@ -18,7 +18,7 @@ use kimmy_storage::CollectionMeta;
 use serde_json::{Value, json};
 
 use crate::error::ApiError;
-use crate::json::{document_to_json, json_to_document};
+use crate::json::{document_to_json, json_to_bson, json_to_document};
 use crate::state::{Auth, SharedState};
 
 /// Default page size, so an unbounded `find` cannot be used to pull an entire
@@ -1342,6 +1342,12 @@ pub fn update(
 /// against each other, so neither is meaningful alone.
 fn parse_update(update_json: &Value, array_filters: &[Value]) -> Result<update::Update, ApiError> {
     let filters = array_filters.iter().map(json_to_document).collect::<Result<Vec<_>, _>>()?;
+    // An array is a pipeline update, a list of aggregation stages (ADR-265); a document
+    // is operators or a replacement.
+    if let Value::Array(stages) = update_json {
+        let stages = stages.iter().map(json_to_bson).collect::<Result<Vec<_>, _>>()?;
+        return Ok(update::parse_pipeline(&stages, &filters)?);
+    }
     Ok(update::parse_with_filters(&json_to_document(update_json)?, &filters)?)
 }
 
@@ -1619,20 +1625,18 @@ pub fn find_and_modify(
         let mut seed = Document::new();
         implied_equalities(&filter, &mut seed);
         match &update {
-            // A `$` has no matched element in a document that is inserted.
-            // It is said only if nothing matches: a document that does is
-            // updated, and the position is its own.
-            Some(update) if update.uses_matched_position() => {
+            // The seed is run through the update only to be inserted, so a refusal
+            // (a `$` with no matched element, a pipeline that cannot read the seed, an
+            // `_id` it would change) is said only if nothing matches: a document that
+            // does is updated on its own terms.
+            Some(update) => {
                 Some(update::apply_on_insert(update, &mut seed, now).map(|()| seed).map_err(|e| {
                     match e {
-                        kimmy_core::Error::InvalidUpdate(reason) => reason,
+                        kimmy_core::Error::InvalidUpdate(reason)
+                        | kimmy_core::Error::InvalidQuery(reason) => reason,
                         other => other.to_string(),
                     }
                 }))
-            }
-            Some(update) => {
-                update::apply_on_insert(update, &mut seed, now)?;
-                Some(Ok(seed))
             }
             None => Some(Ok(seed)),
         }
@@ -2376,6 +2380,9 @@ fn run_stages(
             aggregate::Stage::GraphLookup(spec) => {
                 graph_lookup(state, auth, db, spec, docs, limits, vars)?
             }
+            aggregate::Stage::UnionWith(spec) => {
+                union_with(state, auth, db, spec, docs, limits, vars)?
+            }
             aggregate::Stage::Facet(facets) => {
                 let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
                     run_stages(state, auth, db, sub, input, limits, vars)
@@ -2402,7 +2409,7 @@ pub(crate) struct SinkPlan {
 /// target. Writes nothing, so `explain` asks it too.
 ///
 /// Refused: a target the pipeline reads, which is the source and every
-/// `$lookup` and `$graphLookup` collection however deeply nested. A pipeline
+/// `$lookup`, `$graphLookup` and `$unionWith` collection however deeply nested. A pipeline
 /// that reads what it writes has no defined answer, because each stage reads
 /// storage when it runs (see [`aggregate`]), and the chunked write is already
 /// under way while a later chunk is read. Then the caller needs `write` on the
@@ -2430,8 +2437,8 @@ pub(crate) fn plan_sink(
     if reads_it {
         return Err(ApiError::bad_request(format!(
             "{name} cannot write `{target_db}`.`{target_coll}`: the pipeline reads it, as its \
-             source or in a $lookup or $graphLookup. Write to a collection the pipeline does not \
-             read"
+             source or in a $lookup, $graphLookup or $unionWith. Write to a collection the \
+             pipeline does not read"
         )));
     }
     auth.require(Action::Write, target_db, Some(target_coll))?;
@@ -2549,6 +2556,29 @@ pub(crate) fn parse_pipeline(pipeline: &Value) -> Result<Vec<aggregate::Stage>, 
     Ok(aggregate::parse(&stages)?)
 }
 
+/// The second authorization point of a stage that reads another collection (`$lookup`,
+/// `$graphLookup`, `$unionWith`): `read` on it, checked first so a denied caller learns
+/// nothing about whether it exists, then the collection.
+///
+/// **One rule for a collection that is not there.** On a node with peers it is the `404`
+/// with the retry hint [`collection`] gives, because the node cannot tell "not arrived
+/// yet" from "does not exist"; on a node with none it is `None`, an empty read, as the
+/// reference answers.
+fn foreign_collection(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    name: &str,
+) -> Result<Option<CollectionMeta>, ApiError> {
+    auth.require(Action::Read, db, Some(name))?;
+    let has_peers = state.members().is_some_and(|m| !m.is_empty());
+    match collection(state, db, name) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if !has_peers && e.status == axum::http::StatusCode::NOT_FOUND => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Join against another collection, in one pass over it.
 ///
 /// The foreign side is scanned **once** and indexed in memory by the join key,
@@ -2568,7 +2598,7 @@ fn lookup(
     limits: &aggregate::Limits,
 ) -> Result<Vec<bson::Document>, ApiError> {
     // The second authorization point. See this function's caller.
-    let foreign = authorize(state, auth, Action::Read, db, from)?;
+    let foreign = foreign_collection(state, auth, db, from)?;
 
     let wanted: std::collections::HashSet<Vec<u8>> =
         aggregate::lookup_keys(&input, local_field).iter().filter_map(encode_key).collect();
@@ -2578,26 +2608,28 @@ fn lookup(
     let mut foreign_docs: Vec<bson::Document> = Vec::new();
     let mut buckets: std::collections::HashMap<Vec<u8>, Vec<usize>> =
         std::collections::HashMap::new();
-    // The whole foreign collection, so a walk (ADR-153).
-    kimmy_storage::blocking(|| {
-        state.engine.for_each_doc(&foreign, kimmy_storage::WalkScope::Request, |_id, doc| {
-            // `foreignField` and `localField` are field paths, not expressions:
-            // they name the keys on each side, read the same way here and in
-            // `aggregate::lookup_keys`: every value the path yields is a key,
-            // so a path that crosses an array joins under each element's.
-            let mut keys = join_keys(&doc, foreign_field);
-            keys.retain(|key| wanted.contains(key));
-            if keys.is_empty() {
-                return Ok(true);
-            }
-            let at = foreign_docs.len();
-            for key in keys {
-                buckets.entry(key).or_default().push(at);
-            }
-            foreign_docs.push(doc);
-            Ok(true)
-        })
-    })?;
+    // The whole foreign collection, so a walk (ADR-153); one that is not there is empty.
+    if let Some(foreign) = &foreign {
+        kimmy_storage::blocking(|| {
+            state.engine.for_each_doc(foreign, kimmy_storage::WalkScope::Request, |_id, doc| {
+                // `foreignField` and `localField` are field paths, not expressions:
+                // they name the keys on each side, read the same way here and in
+                // `aggregate::lookup_keys`: every value the path yields is a key,
+                // so a path that crosses an array joins under each element's.
+                let mut keys = join_keys(&doc, foreign_field);
+                keys.retain(|key| wanted.contains(key));
+                if keys.is_empty() {
+                    return Ok(true);
+                }
+                let at = foreign_docs.len();
+                for key in keys {
+                    buckets.entry(key).or_default().push(at);
+                }
+                foreign_docs.push(doc);
+                Ok(true)
+            })
+        })?;
+    }
     // The joined documents are held in memory alongside the input, so they are
     // subject to the same ceiling. A document filed under several keys is held
     // once, and counted once; what is attached is counted below.
@@ -2668,7 +2700,7 @@ fn lookup_pipeline(
     outer: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
     // The second authorization point, exactly as for the equality form.
-    let foreign_meta = authorize(state, auth, Action::Read, db, from)?;
+    let foreign_meta = foreign_collection(state, auth, db, from)?;
     // Nothing to join, so nothing of the foreign collection is part of the
     // answer: reading it would cost a walk, and its leading `$match` could
     // fail the request over a document no output depends on (ADR-206).
@@ -2678,19 +2710,22 @@ fn lookup_pipeline(
 
     // The whole foreign collection, held for the loop: refused at the first document past
     // the ceiling, not after the collection has been read.
-    let foreign = read_foreign(
-        state,
-        &foreign_meta,
-        limits,
-        |_| Ok(true),
-        |max| {
-            format!(
-                "$lookup's pipeline form holds the whole of `{from}`, which has more than {max} \
-             documents, the pipeline limit. Join on a key with localField and foreignField, \
-             which holds only the documents the input names"
-            )
-        },
-    )?;
+    let foreign = match &foreign_meta {
+        Some(meta) => read_foreign(
+            state,
+            meta,
+            limits,
+            |_| Ok(true),
+            |max| {
+                format!(
+                    "$lookup's pipeline form holds the whole of `{from}`, which has more than \
+                     {max} documents, the pipeline limit. Join on a key with localField and \
+                     foreignField, which holds only the documents the input names"
+                )
+            },
+        )?,
+        None => Vec::new(),
+    };
 
     // A leading `$match` that reads no `let` variable is applied once, before the
     // loop, and its errors are the request's, as they always were. One that does
@@ -2742,6 +2777,87 @@ fn lookup_pipeline(
     Ok(out)
 }
 
+/// `$unionWith`: the input documents, then the other collection's, run through the
+/// stage's sub-pipeline (ADR-263).
+///
+/// The second authorization point is `read` on the named collection, checked first, so a
+/// denied caller learns nothing about whether it exists; a collection that does not exist
+/// reads as empty on a node with no peers, and on a node with peers is `$lookup`'s `404`
+/// with the retry hint (it may be about to arrive from another member). Unlike a join, the stage has something to answer when its input is
+/// empty, so it reads either way. The collection is walked once and refused at the first
+/// document past the pipeline's document limit (a leading `$match` of the sub-pipeline is
+/// applied as it is read, so what it declines is not held or counted); the bytes read are
+/// held to the cap `$facet`'s answer is, refused as soon as it is passed, and so are the
+/// bytes the sub-pipeline outputs. The input plus what is appended counts against the
+/// document limit.
+fn union_with(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    spec: &aggregate::UnionWith,
+    mut input: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    vars: &[Binding<'_>],
+) -> Result<Vec<bson::Document>, ApiError> {
+    let name = spec.coll.as_str();
+    kimmy_core::Error::validate_name(name)?;
+    // Resolved the way `$lookup` and `$graphLookup` resolve theirs (see
+    // [`foreign_collection`]): the `404` with the retry hint on a node with peers, an
+    // empty read on one with none.
+    let meta = foreign_collection(state, auth, db, name)?;
+    let (lead, rest) = match aggregate::leading_match(&spec.stages) {
+        Some((filter, consumed)) => (Some(filter), &spec.stages[consumed..]),
+        None => (None, &spec.stages[..]),
+    };
+    // What is read is held to the document limit, as `$lookup`'s foreign read is, and to
+    // nothing in bytes: a scan is not what the pipeline holds.
+    let foreign = match &meta {
+        None => Vec::new(),
+        Some(meta) => read_foreign(
+            state,
+            meta,
+            limits,
+            |doc| match &lead {
+                Some(lead) => Ok(filter::matches_with(lead, doc, vars)?),
+                None => Ok(true),
+            },
+            |max| {
+                format!(
+                    "$unionWith reads `{name}` whole, which has more than {max} documents that \
+                     reach the sub-pipeline, the pipeline limit. Narrow it with a leading \
+                     $match in the sub-pipeline"
+                )
+            },
+        )?,
+    };
+    let appended = if rest.is_empty() {
+        foreign
+    } else {
+        run_stages(state, auth, db, rest, foreign, limits, vars)?
+    };
+    // What the stage appends is what the pipeline then holds and answers: held to the
+    // size a stored document may be, `413` at the document that passes it.
+    let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
+    let mut bytes = 0usize;
+    for doc in &appended {
+        bytes += bson::serialize_to_vec(doc)
+            .map_err(|e| kimmy_core::Error::Internal(format!("$unionWith could not encode: {e}")))?
+            .len();
+        if bytes > cap {
+            return Err(ApiError::from(kimmy_core::Error::AnswerTooLarge {
+                what: "$unionWith appended documents",
+                bytes,
+                max: cap,
+                remedy: "end the sub-pipeline with a $project that keeps less, or a $limit, so \
+                         that what it answers is smaller",
+            }));
+        }
+    }
+    aggregate::check_limit("$unionWith", input.len() + appended.len(), limits)?;
+    input.extend(appended);
+    Ok(input)
+}
+
 /// `$graphLookup`: for each input document, the foreign documents reachable from
 /// `startWith` by following `connectFromField` into `connectToField`, at most
 /// `maxDepth` steps after the first match (ADR-254).
@@ -2768,7 +2884,7 @@ fn graph_lookup(
     limits: &aggregate::Limits,
     outer: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
-    let foreign_meta = authorize(state, auth, Action::Read, db, &spec.from)?;
+    let foreign_meta = foreign_collection(state, auth, db, &spec.from)?;
     // Nothing to walk from: reading the collection would cost a walk for no answer.
     if input.is_empty() {
         return Ok(input);
@@ -2776,22 +2892,25 @@ fn graph_lookup(
     // The foreign side, narrowed by `restrictSearchWithMatch` as it is read, and refused
     // at the first admitted document past the ceiling: a restriction that would raise
     // further on is never reached.
-    let foreign = read_foreign(
-        state,
-        &foreign_meta,
-        limits,
-        |doc| match &spec.restrict {
-            Some(restrict) => Ok(filter::matches(restrict, doc)?),
-            None => Ok(true),
-        },
-        |max| {
-            format!(
-                "$graphLookup reads `{}` whole, and the search can reach more than {max} of its \
-                 documents, the pipeline limit. Narrow it with restrictSearchWithMatch",
-                spec.from
-            )
-        },
-    )?;
+    let foreign = match &foreign_meta {
+        Some(meta) => read_foreign(
+            state,
+            meta,
+            limits,
+            |doc| match &spec.restrict {
+                Some(restrict) => Ok(filter::matches(restrict, doc)?),
+                None => Ok(true),
+            },
+            |max| {
+                format!(
+                    "$graphLookup reads `{}` whole, and the search can reach more than {max} of \
+                     its documents, the pipeline limit. Narrow it with restrictSearchWithMatch",
+                    spec.from
+                )
+            },
+        )?,
+        None => Vec::new(),
+    };
     let mut table: std::collections::HashMap<Vec<u8>, Vec<usize>> =
         std::collections::HashMap::new();
     for (at, doc) in foreign.iter().enumerate() {
@@ -4666,6 +4785,9 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod union_tests;
 
 #[cfg(test)]
 mod positional_answer {

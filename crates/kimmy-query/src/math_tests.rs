@@ -530,12 +530,21 @@ fn now_and_remove_have_no_fields_to_read_into() {
 
 #[test]
 fn other_system_variables_are_still_refused_by_name() {
-    for name in ["$$DESCEND", "$$PRUNE", "$$KEEP", "$$SEARCH_META"] {
+    for name in ["$$CLUSTER_TIME", "$$USER_ROLES", "$$SEARCH_META"] {
         let message = Expr::parse(&Bson::String(name.into())).expect_err(name).to_string();
         assert!(
             message.contains(name) && message.contains("$$NOW") && message.contains("$$REMOVE"),
             "{message}"
         );
+    }
+    // `$$DESCEND`, `$$PRUNE` and `$$KEEP` exist only inside `$redact` (ADR-263).
+    for name in ["$$DESCEND", "$$PRUNE", "$$KEEP"] {
+        let message = Expr::parse(&Bson::String(name.into())).expect_err(name).to_string();
+        assert!(
+            message.contains(name) && message.contains("valid only inside a $redact"),
+            "{message}"
+        );
+        assert!(Expr::parse_redact(&Bson::String(name.into()), &[]).is_ok(), "{name}");
     }
     // A user variable cannot take either name: names start with a lowercase letter.
     let bound = Expr::parse(&Bson::Document(doc! {"$let": {"vars": {"NOW": 1}, "in": "$$NOW"}}));
