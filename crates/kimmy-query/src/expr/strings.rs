@@ -10,7 +10,7 @@
 //!
 //! The regex operators use the engine, the pattern budget and the documented
 //! differences of the `$regex` filter (`kimmy_core::regex`): no backreferences
-//! or lookaround, the flags `i`, `m`, `s` and `x`. A pattern that is a constant
+//! or lookaround, the flags `i`, `m`, `s`, `x` and `u`. A pattern that is a constant
 //! is compiled once, when the expression is parsed, and charged to the
 //! enclosing pipeline's budget; one computed from the document is compiled
 //! when it is evaluated, the last one kept for the next document.
@@ -21,7 +21,7 @@ use bson::{Bson, Document};
 use kimmy_core::regex::{RegexMatch, RegexPattern};
 use kimmy_core::{Error, Result};
 
-use super::{Declared, Expr, Op, Scope, type_name};
+use super::{Declared, Expr, MAX_STRING_BYTES, Op, Scope, check_string_len_within, type_name};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -193,7 +193,7 @@ impl StrExpr {
                 else {
                     return Ok(Bson::Null);
                 };
-                Ok(Bson::String(replace(input, find, with, *all)))
+                replace(input, find, with, *all, MAX_STRING_BYTES).map(Bson::String)
             }
         }
     }
@@ -227,22 +227,57 @@ fn trim<'a>(s: &'a str, chars: Option<&str>, side: Side) -> &'a str {
 // $replaceOne / $replaceAll
 // ---------------------------------------------------------------------------
 
-fn replace(input: &str, find: &str, with: &str, all: bool) -> String {
+/// The length in bytes of what [`replace`] builds, `None` when it does not fit a
+/// `usize`. Counted from the match count, before anything is built.
+fn replaced_len(input: &str, find: &str, with: &str, all: bool) -> Option<usize> {
+    let matches = if find.is_empty() {
+        // Before every code point and at the end: "abc" has four places, and
+        // `$replaceOne` takes the first.
+        if all { input.chars().count().checked_add(1)? } else { 1 }
+    } else if all {
+        input.matches(find).count()
+    } else {
+        usize::from(input.contains(find))
+    };
+    // Each match swaps `find` for `with`. The matches are disjoint, so what they
+    // remove (`matches * find.len()`) is at most the input and cannot overflow.
+    let removed = if find.is_empty() { 0 } else { matches * find.len() };
+    input.len().checked_add(matches.checked_mul(with.len())?)?.checked_sub(removed)
+}
+
+/// `$replaceOne` and `$replaceAll`, refused (`ValueTooLarge`) when the result
+/// would be longer than `max` bytes. The length is worked out first, with checked
+/// arithmetic, so that nothing is allocated for an answer that is refused: an
+/// empty `find` over a megabyte with a megabyte `replacement` asks for a terabyte.
+pub(super) fn replace(
+    input: &str,
+    find: &str,
+    with: &str,
+    all: bool,
+    max: usize,
+) -> Result<String> {
+    let len = replaced_len(input, find, with, all).unwrap_or(usize::MAX);
+    check_string_len_within(
+        if all { "the string $replaceAll builds" } else { "the string $replaceOne builds" },
+        len,
+        max,
+    )?;
     if !all {
-        return input.replacen(find, with, 1);
+        return Ok(input.replacen(find, with, 1));
     }
     if find.is_empty() {
         // Matches between every code point and at both ends: "abc" with "-"
-        // gives "-a-b-c-".
-        let mut out = String::with_capacity(input.len() + with.len());
+        // gives "-a-b-c-". The reference matches between bytes and so builds
+        // invalid UTF-8 from non-ASCII text, which it cannot return.
+        let mut out = String::with_capacity(len);
         out.push_str(with);
         for c in input.chars() {
             out.push(c);
             out.push_str(with);
         }
-        return out;
+        return Ok(out);
     }
-    input.replace(find, with)
+    Ok(input.replace(find, with))
 }
 
 // ---------------------------------------------------------------------------
@@ -357,23 +392,78 @@ fn eval_regex(
     Ok(match kind {
         RegexKind::Match => Bson::Boolean(pattern.is_match(text)),
         RegexKind::Find => match pattern.first_match(text) {
-            Some(m) => match_document(text, &m),
+            Some(m) => match_document(text, &m, text[..m.start].chars().count()),
             None => Bson::Null,
         },
-        RegexKind::FindAll => {
-            // Code point indexes for every match in one pass over the string.
-            Bson::Array(pattern.find_all(text).iter().map(|m| match_document(text, m)).collect())
-        }
+        RegexKind::FindAll => find_all_documents(pattern, text, FIND_ALL_MAX_BYTES)?,
     })
 }
 
-/// `{match, idx, captures}`: `idx` counts code points, `captures` holds one
-/// string per group, null for a group that took no part.
-fn match_document(text: &str, m: &RegexMatch) -> Bson {
+/// The most a `$regexFindAll` answer may hold, as BSON: 64 MiB, the reference's
+/// limit on its output buffer. A pattern that matches everywhere over a long
+/// string would otherwise build one document per code point.
+const FIND_ALL_MAX_BYTES: usize = 64 << 20;
+
+/// Every match of `pattern` in `text` as `{match, idx, captures}` documents, in an
+/// array, refused (`ValueTooLarge`) as soon as the documents so far, counted as
+/// BSON, pass `max_bytes`. The matches are read one at a time, so a refused
+/// answer never holds more than that, and `idx` is counted from the previous
+/// match rather than from the start, so the whole is linear in the text.
+pub(super) fn find_all_documents(
+    pattern: &RegexPattern,
+    text: &str,
+    max_bytes: usize,
+) -> Result<Bson> {
+    let mut found = Vec::new();
+    let mut bytes = 0usize;
+    // The match last seen: its byte offset and its code point index.
+    let (mut at_byte, mut at_cp) = (0usize, 0usize);
+    pattern.try_for_each_match(text, |m| {
+        at_cp += text[at_byte..m.start].chars().count();
+        at_byte = m.start;
+        bytes = bytes.saturating_add(match_bytes(text, m, found.len()));
+        if bytes > max_bytes {
+            return Err(Error::ValueTooLarge {
+                what: "the $regexFindAll output",
+                bytes,
+                max: max_bytes,
+                limit: "64 MiB limit",
+                remedy: "match a narrower pattern, or $limit or $substrBytes the input",
+            });
+        }
+        found.push(match_document(text, m, at_cp));
+        Ok(())
+    })?;
+    Ok(Bson::Array(found))
+}
+
+/// What the match is as an element of the answer's array, in BSON bytes: the
+/// element's type byte, its decimal index and terminator, then the document
+/// `{match, idx, captures}`.
+pub(super) fn match_bytes(text: &str, m: &RegexMatch, index: usize) -> usize {
+    let string = |len: usize| 4 + len + 1;
+    let digits = |n: usize| n.checked_ilog10().map_or(1, |d| d as usize + 1);
+    let captures: usize = m
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| 1 + digits(i) + 1 + g.map_or(0, |(a, b)| string(text[a..b].len())))
+        .sum();
+    let document = 4
+        + (1 + "match".len() + 1 + string(m.end - m.start))
+        + (1 + "idx".len() + 1 + 8)
+        + (1 + "captures".len() + 1 + 4 + captures + 1)
+        + 1;
+    1 + digits(index) + 1 + document
+}
+
+/// `{match, idx, captures}`: `idx` is the code point index `cp` of the match,
+/// `captures` holds one string per group, null for a group that took no part.
+pub(super) fn match_document(text: &str, m: &RegexMatch, cp: usize) -> Bson {
     let slice = |(a, b): (usize, usize)| Bson::String(text[a..b].to_string());
     let mut doc = Document::new();
     doc.insert("match", slice((m.start, m.end)));
-    doc.insert("idx", Bson::Int64(text[..m.start].chars().count() as i64));
+    doc.insert("idx", Bson::Int64(cp as i64));
     doc.insert(
         "captures",
         Bson::Array(m.groups.iter().map(|g| g.map_or(Bson::Null, slice)).collect()),
@@ -387,13 +477,16 @@ fn match_document(text: &str, m: &RegexMatch) -> Bson {
 
 /// The reference's `coerceToString`, which `$strcasecmp` and `$substrBytes` apply
 /// to their string arguments: a string as it is, null and a missing field as the
-/// empty string, a number as its decimal rendering. Every other type is refused
-/// here, where the reference also renders a date, a timestamp, code and a symbol.
+/// empty string, a number as its rendering. An integer is its digits; a double is
+/// printed as C's `%g` does, with six significant digits (see [`format_g`]), which
+/// is not what `$toString` prints. Every other type is refused here, where the
+/// reference also renders a date, a timestamp, code and a symbol.
 fn coerce(op: Op, v: &Bson) -> Result<String> {
     match v {
         Bson::String(s) => Ok(s.clone()),
         v if nullish(v) => Ok(String::new()),
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+        Bson::Double(d) => Ok(format_g(*d)),
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => {
             match super::convert(v, super::ConvertTo::String)? {
                 Bson::String(s) => Ok(s),
                 _ => unreachable!("converting to a string gives a string"),
@@ -404,6 +497,38 @@ fn coerce(op: Op, v: &Bson) -> Result<String> {
             op.name(),
             type_name(other)
         ))),
+    }
+}
+
+/// A double as C's `printf("%g")` prints it: six significant digits, no trailing
+/// zeros, an exponent when it is below -4 or at least 6 (`1e+21`, `1.23457e+11`,
+/// `1e-05`), and `nan`, `inf` and `-inf`.
+fn format_g(d: f64) -> String {
+    if d.is_nan() {
+        return "nan".to_string();
+    }
+    if d.is_infinite() {
+        return if d < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    if d == 0.0 {
+        return if d.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+    let trim = |s: &str| -> String {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    // The exponent is that of the value rounded to six digits, as `%e` has it.
+    let scientific = format!("{d:.5e}");
+    let (mantissa, exponent) = scientific.split_once('e').expect("`e` notation has an exponent");
+    let exponent: i32 = exponent.parse().expect("an integer exponent");
+    if (-4..6).contains(&exponent) {
+        trim(&format!("{d:.*}", (5 - exponent) as usize))
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(mantissa), exponent.abs())
     }
 }
 
@@ -428,19 +553,29 @@ pub(super) fn strcasecmp(a: &Bson, b: &Bson) -> Result<Bson> {
     }))
 }
 
-/// `$substrBytes`: byte offsets that must fall between code points.
+/// `$substrBytes`: byte offsets that must fall between code points. A start below
+/// zero is refused, and so is a start or length that is not a number that fits a
+/// 64-bit integer (a NaN, an infinity, a double or decimal out of range); a
+/// negative length reads to the end of the string.
 pub(super) fn substr_bytes(args: &[Bson]) -> Result<Bson> {
     let op = Op::SubstrBytes;
     let s = coerce(op, &args[0])?;
+    let out_of_range = |shown: String| {
+        Error::InvalidQuery(format!(
+            "$substrBytes: Can't coerce out of range value {shown} to long"
+        ))
+    };
     let number = |v: &Bson, what: &str| -> Result<i64> {
         match v {
             Bson::Int32(n) => Ok(i64::from(*n)),
             Bson::Int64(n) => Ok(*n),
-            // Truncated toward zero; a NaN is 0.
-            Bson::Double(d) => Ok(*d as i64),
-            Bson::Decimal128(d) => {
-                Ok(kimmy_core::decimal::integer_part(d).map_or(0, |part| part.value))
-            }
+            // Truncated toward zero.
+            Bson::Double(d) if (i64::MIN as f64..-(i64::MIN as f64)).contains(d) => Ok(*d as i64),
+            Bson::Double(d) => Err(out_of_range(format_g(*d))),
+            Bson::Decimal128(d) => match kimmy_core::decimal::integer_part(d) {
+                Some(part) if part.in_range => Ok(part.value),
+                _ => Err(out_of_range(d.to_string().to_lowercase())),
+            },
             other => Err(Error::InvalidQuery(format!(
                 "$substrBytes: {what} must be a numeric type (is BSON type {})",
                 type_name(other)
@@ -449,11 +584,12 @@ pub(super) fn substr_bytes(args: &[Bson]) -> Result<Bson> {
     };
     let start = number(&args[1], "starting index")?;
     let length = number(&args[2], "length")?;
-    let bytes = s.as_bytes();
-    // A negative start is past the end (the reference reads it as unsigned).
     let Ok(start) = usize::try_from(start) else {
-        return Ok(Bson::String(String::new()));
+        return Err(Error::InvalidQuery(format!(
+            "$substrBytes: starting index must be non-negative (got: {start})"
+        )));
     };
+    let bytes = s.as_bytes();
     // A negative length is "to the end".
     let end = match usize::try_from(length) {
         Ok(n) => start.saturating_add(n),
@@ -500,9 +636,18 @@ fn bound(op: Op, v: Option<&Bson>, what: &str, default: usize) -> Result<usize> 
     })
 }
 
-/// `$indexOfCP` and `$indexOfBytes`: `[string, substring, start?, end?]`. The
-/// search covers `[start, end)` and returns -1 when the substring is not wholly
-/// inside it. A null or missing string is null; a substring must be a string.
+/// `$indexOfCP` and `$indexOfBytes`: `[string, substring, start?, end?]`. A null
+/// or missing string is null; a substring must be a string.
+///
+/// The two read `end` differently, as the reference does. `$indexOfBytes` searches
+/// the bytes `[start, end)` and finds the substring only when it lies wholly
+/// inside them. `$indexOfCP` bounds where a match may *start*: it tries each
+/// position from `start` up to, but not including, `end` or the end of the
+/// string, and the substring may run on past `end`. So `['abcabc', 'bc', 0, 2]`
+/// is -1 for bytes and 1 for code points, and an empty substring is found at
+/// `start` only if `start` is such a position: `['abc', '', 2]` is 2 and
+/// `['abc', '', 3]` and `['abc', '', 1, 1]` are -1 (the empty string finds the
+/// empty substring at 0, the one exception).
 pub(super) fn index_of(op: Op, args: &[Bson]) -> Result<Bson> {
     let name = op.name();
     let s = match &args[0] {
@@ -524,29 +669,30 @@ pub(super) fn index_of(op: Op, args: &[Bson]) -> Result<Bson> {
     let start = bound(op, args.get(2), "starting", 0)?;
     let end = bound(op, args.get(3), "ending", usize::MAX)?;
 
-    // Work in bytes; for code points, translate the bounds in and the answer out.
-    let cp = op == Op::IndexOfCp;
-    let to_byte = |i: usize| -> usize {
-        if !cp {
-            return i.min(s.len());
+    if op == Op::IndexOfBytes {
+        // A start past the end (or past `end`) finds nothing, even for "".
+        if start > s.len() || start > end.min(s.len()) {
+            return Ok(Bson::Int64(-1));
         }
-        s.char_indices().nth(i).map_or(s.len(), |(b, _)| b)
-    };
-    let (lo, hi) = (to_byte(start), to_byte(end));
-    // A start past the end (or past `end`) finds nothing, even for "".
-    let past = if cp { start > s.chars().count() } else { start > s.len() };
-    if past || lo > hi {
+        let hay = &s.as_bytes()[start..end.min(s.len())];
+        let found = if token.is_empty() {
+            Some(0)
+        } else {
+            hay.windows(token.len()).position(|w| w == token.as_bytes())
+        };
+        return Ok(Bson::Int64(found.map_or(-1, |at| (start + at) as i64)));
+    }
+
+    // Code points: translate the bounds to bytes, search, translate the answer back.
+    let to_byte = |i: usize| s.char_indices().nth(i).map_or(s.len(), |(b, _)| b);
+    if start > s.chars().count() {
         return Ok(Bson::Int64(-1));
     }
-    let hay = &s.as_bytes()[lo..hi];
-    let found = if token.is_empty() {
-        Some(0)
+    let (lo, hi) = (to_byte(start), to_byte(end));
+    let at = if token.is_empty() {
+        (lo < hi || (s.is_empty() && start == 0)).then_some(lo)
     } else {
-        hay.windows(token.len()).position(|w| w == token.as_bytes())
+        s[lo..].find(token.as_str()).map(|at| lo + at).filter(|at| *at < hi)
     };
-    Ok(Bson::Int64(match found {
-        None => -1,
-        Some(at) if cp => s[..lo + at].chars().count() as i64,
-        Some(at) => (lo + at) as i64,
-    }))
+    Ok(Bson::Int64(at.map_or(-1, |at| s[..at].chars().count() as i64)))
 }

@@ -66,13 +66,20 @@
 //! 1]}` is an error because a string is not a number. Returning null for both
 //! would make a typo and a type error indistinguishable in the output.
 
+mod arrayacc;
 mod dates;
 mod docops;
 mod math;
+mod sizes;
 mod strings;
 mod tz;
 
 pub(crate) use dates::{add_to_date, is_date_unit, unit_millis};
+pub(crate) use sizes::{
+    ArrayBudget, MAX_ARRAY_BYTES, MAX_STRING_BYTES, bson_bytes, check_array_within,
+    check_string_len_within,
+};
+
 pub(crate) use docops::merge_into;
 
 use std::cmp::Ordering;
@@ -543,6 +550,9 @@ pub enum Expr {
     Str(Box<strings::StrExpr>),
     /// `$getField`, `$setField`, `$unsetField` and `$type` (ADR-260).
     Doc(Box<docops::DocExpr>),
+    /// `$firstN`, `$lastN`, `$maxN`, `$minN` over an array, and `$stdDevPop` /
+    /// `$stdDevSamp` (ADR-262).
+    ArrayAcc(Box<arrayacc::ArrayAcc>),
     /// A document whose values are expressions.
     Object(Vec<(String, Expr)>),
     /// An array whose elements are expressions, evaluated in order to the
@@ -1008,6 +1018,7 @@ impl Expr {
             }
             Expr::Str(s) => s.children().into_iter().any(Expr::reads_document),
             Expr::Doc(d) => d.reads_current() || d.children().into_iter().any(Expr::reads_document),
+            Expr::ArrayAcc(a) => a.children().into_iter().any(Expr::reads_document),
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_document()),
             Expr::Array(items) => any(items),
         }
@@ -1033,6 +1044,7 @@ impl Expr {
             | Expr::Zip { .. }
             | Expr::Str(_)
             | Expr::Doc(_)
+            | Expr::ArrayAcc(_)
             | Expr::Object(_)
             | Expr::Array(_) => "an expression".to_string(),
         }
@@ -1090,6 +1102,7 @@ impl Expr {
                 (d.reads_current() && names.iter().any(|n| n == "CURRENT" || n == "ROOT"))
                     || d.children().into_iter().any(|e| e.reads_variable(names))
             }
+            Expr::ArrayAcc(a) => a.children().into_iter().any(|e| e.reads_variable(names)),
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_variable(names)),
             Expr::Array(items) => any(items),
         }
@@ -1271,6 +1284,7 @@ impl Expr {
             name @ ("$getField" | "$setField" | "$unsetField" | "$type") => {
                 docops::DocExpr::parse(name, raw, declared)
             }
+            name if arrayacc::handles(name) => arrayacc::ArrayAcc::parse(name, raw, declared),
             name if ConvertTo::from_shorthand(name).is_some() => {
                 Self::parse_convert_shorthand(name, raw, declared)
             }
@@ -1707,7 +1721,14 @@ impl Expr {
             // that fails fails the array, with its own error, which is a
             // value error like any other and may be held by `$and`/`$or`.
             Expr::Array(items) => {
-                items.iter().map(|e| e.eval_in(scope)).collect::<Result<Vec<_>>>().map(Bson::Array)
+                let mut budget = ArrayBudget::new("the array literal", MAX_ARRAY_BYTES);
+                let mut out = Vec::with_capacity(items.len());
+                for e in items {
+                    let value = e.eval_in(scope)?;
+                    budget.add(&value)?;
+                    out.push(value);
+                }
+                Ok(Bson::Array(out))
             }
             Expr::Switch { branches, default } => {
                 for (case, then) in branches {
@@ -1724,6 +1745,7 @@ impl Expr {
             }
             Expr::Str(s) => s.eval(scope),
             Expr::Doc(d) => Ok(d.eval_opt(scope)?.unwrap_or(Bson::Null)),
+            Expr::ArrayAcc(a) => a.eval(scope),
             Expr::Date(d) => d.eval(scope),
             Expr::Convert { input, to, on_error, on_null } => {
                 // An error in the input expression itself is not a conversion
@@ -2059,9 +2081,12 @@ fn eval_map(input: &Expr, as_name: &str, body: &Expr, scope: &Scope<'_>) -> Resu
         return Ok(Bson::Null);
     };
     let mut out = Vec::with_capacity(items.len());
+    let mut budget = ArrayBudget::new("the array $map builds", MAX_ARRAY_BYTES);
     for item in &items {
         let frame = [(as_name, item)];
-        out.push(body.eval_in(&scope.nested(&frame))?);
+        let mapped = body.eval_in(&scope.nested(&frame))?;
+        budget.add(&mapped)?;
+        out.push(mapped);
     }
     Ok(Bson::Array(out))
 }
@@ -2171,17 +2196,19 @@ fn eval_zip(
             .collect::<Result<Vec<_>>>()?,
         _ => vec![Bson::Null; arrays.len()],
     };
-    let out = (0..rows)
-        .map(|i| {
-            Bson::Array(
-                arrays
-                    .iter()
-                    .zip(&padding)
-                    .map(|(array, pad)| array.get(i).unwrap_or(pad).clone())
-                    .collect(),
-            )
-        })
-        .collect();
+    let mut budget = ArrayBudget::new("the array $zip builds", MAX_ARRAY_BYTES);
+    let mut out = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let row = Bson::Array(
+            arrays
+                .iter()
+                .zip(&padding)
+                .map(|(array, pad)| array.get(i).unwrap_or(pad).clone())
+                .collect(),
+        );
+        budget.add(&row)?;
+        out.push(row);
+    }
     Ok(Bson::Array(out))
 }
 
@@ -2705,19 +2732,30 @@ fn as_string_strict(value: &Bson, op: Op) -> Result<String> {
 }
 
 fn concat(args: &[Bson]) -> Result<Bson> {
-    let mut out = String::new();
+    concat_within(args, MAX_STRING_BYTES)
+}
+
+fn concat_within(args: &[Bson], max: usize) -> Result<Bson> {
+    let mut len = 0usize;
     for arg in args {
         match arg {
             // One null makes the whole concatenation null, so a missing field
             // cannot silently vanish from the middle of a joined string.
             Bson::Null | Bson::Undefined => return Ok(Bson::Null),
-            Bson::String(s) => out.push_str(s),
+            Bson::String(s) => len = len.saturating_add(s.len()),
             other => {
                 return Err(Error::InvalidQuery(format!(
                     "$concat needs strings, found {}",
                     type_name(other)
                 )));
             }
+        }
+    }
+    check_string_len_within("the string $concat builds", len, max)?;
+    let mut out = String::with_capacity(len);
+    for arg in args {
+        if let Bson::String(s) = arg {
+            out.push_str(s);
         }
     }
     Ok(Bson::String(out))
@@ -2783,7 +2821,19 @@ fn split(value: &Bson, delimiter: &Bson) -> Result<Bson> {
         // ends, which is never what a caller means and is a silent surprise.
         return Err(Error::InvalidQuery("$split needs a non-empty delimiter".into()));
     }
-    Ok(Bson::Array(s.split(d.as_str()).map(|part| Bson::String(part.to_string())).collect()))
+    split_within(&s, &d, MAX_ARRAY_BYTES)
+}
+
+/// The pieces are counted as they are cut, so a long string of delimiters (one
+/// empty string per byte) stops at the limit, not after it.
+fn split_within(s: &str, d: &str, max: usize) -> Result<Bson> {
+    let mut budget = ArrayBudget::new("the array $split builds", max);
+    let mut out = Vec::new();
+    for part in s.split(d) {
+        budget.add_payload(5 + part.len())?;
+        out.push(Bson::String(part.to_string()));
+    }
+    Ok(Bson::Array(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -2923,15 +2973,30 @@ fn array_slice(args: &[Bson]) -> Result<Bson> {
 }
 
 fn concat_arrays(args: &[Bson]) -> Result<Bson> {
-    let mut out = Vec::new();
+    concat_arrays_within(args, MAX_ARRAY_BYTES)
+}
+
+/// The elements are counted before any is copied, so a `$reduce` that doubles an
+/// array at every step stops at the limit, and the check costs one pass over
+/// what the result would hold.
+fn concat_arrays_within(args: &[Bson], max: usize) -> Result<Bson> {
+    let mut arrays = Vec::with_capacity(args.len());
     for arg in args {
         match as_array(Op::ConcatArrays, arg)? {
             // One null makes the whole result null, as `$concat` does: a
             // missing array must not silently vanish from the middle.
             None => return Ok(Bson::Null),
-            Some(items) => out.extend_from_slice(items),
+            Some(items) => arrays.push(items),
         }
     }
+    let mut budget = ArrayBudget::new("the array $concatArrays builds", max);
+    let mut len = 0usize;
+    for items in &arrays {
+        items.iter().try_for_each(|item| budget.add(item))?;
+        len += items.len();
+    }
+    let mut out = Vec::with_capacity(len);
+    arrays.iter().for_each(|items| out.extend_from_slice(items));
     Ok(Bson::Array(out))
 }
 
@@ -3178,22 +3243,28 @@ fn element_truth(op: Op, value: &Bson) -> Result<Bson> {
 fn object_to_array(value: &Bson) -> Result<Bson> {
     match value {
         Bson::Null | Bson::Undefined => Ok(Bson::Null),
-        Bson::Document(fields) => Ok(Bson::Array(
-            fields
-                .iter()
-                .map(|(k, v)| {
-                    let mut pair = Document::new();
-                    pair.insert("k", k.as_str());
-                    pair.insert("v", v.clone());
-                    Bson::Document(pair)
-                })
-                .collect(),
-        )),
+        Bson::Document(fields) => object_to_array_within(fields, MAX_ARRAY_BYTES),
         other => Err(Error::InvalidQuery(format!(
             "$objectToArray needs a document, found {}",
             type_name(other)
         ))),
     }
+}
+
+/// Each pair `{k, v}` is counted before it is built: a document of small fields
+/// turns into an array a few times its size.
+fn object_to_array_within(fields: &Document, max: usize) -> Result<Bson> {
+    let mut budget = ArrayBudget::new("the array $objectToArray builds", max);
+    let mut out = Vec::with_capacity(fields.len());
+    for (k, v) in fields {
+        // `{k: <string>, v: <value>}`: framing, then the two elements.
+        budget.add_payload(5 + (2 + 1 + 5 + k.len()) + (2 + 1 + bson_bytes(v)))?;
+        let mut pair = Document::new();
+        pair.insert("k", k.as_str());
+        pair.insert("v", v.clone());
+        out.push(Bson::Document(pair));
+    }
+    Ok(Bson::Array(out))
 }
 
 /// The two spellings of one key-value pair `$arrayToObject` reads.
@@ -3554,6 +3625,9 @@ pub(crate) fn type_name(value: &Bson) -> &'static str {
 
 #[cfg(test)]
 mod strdoc_tests;
+
+#[cfg(test)]
+mod size_tests;
 
 #[cfg(test)]
 mod tests {

@@ -2550,6 +2550,7 @@ dependencies = [
  "num-bigint 0.5.1",
  "proptest",
  "regex-automata",
+ "regex-syntax",
  "serde",
  "serde_bytes",
  "serde_json",

@@ -464,6 +464,27 @@ fn pattern_is_a_search_not_a_full_match() {
     check(p("^[a-c]+$"), &[doc! {"v": "abc"}], &[doc! {"v": "abd"}, doc! {"v": ""}]);
 }
 
+#[test]
+fn pattern_reads_digit_word_and_space_classes_as_ascii() {
+    // The reference's classes: `\w` is not `é`, `\d` is not an Arabic-Indic
+    // digit, `\s` is not a no-break space. A validator that says `^\w+$` refuses
+    // a word with an accent, and `^\S+$` accepts a value holding U+00A0.
+    let p = |pat: &str| doc! {"properties": {"v": {"pattern": pat}}};
+    check(p("^\\w+$"), &[doc! {"v": "cafe_9"}], &[doc! {"v": "café"}]);
+    check(p("^\\d{3}$"), &[doc! {"v": "123"}], &[doc! {"v": "\u{661}\u{662}\u{663}"}]);
+    check(p("^\\S+$"), &[doc! {"v": "a\u{a0}b"}], &[doc! {"v": "a b"}]);
+    check(p("\\bx"), &[doc! {"v": "\u{e9}x"}], &[doc! {"v": "ax"}]);
+    // And in `patternProperties`.
+    check(
+        doc! {"patternProperties": {"^\\w+$": {"bsonType": "int"}}},
+        &[doc! {"caf": 1, "café": "text"}],
+        &[doc! {"caf": "text"}],
+    );
+    // Case-insensitive matching is not available to a schema (no flags), and a
+    // Unicode property still reads Unicode.
+    check(p("^\\p{L}+$"), &[doc! {"v": "café"}], &[doc! {"v": "caf9"}]);
+}
+
 // -- arrays ------------------------------------------------------------------
 
 #[test]
@@ -939,7 +960,8 @@ fn a_document_nested_deeper_than_the_schema_is_not_walked() {
 #[test]
 fn patterns_share_the_regex_limits() {
     // One pattern over the size limit.
-    let big = "\\w{209}";
+    let big = format!("{}{{209}}", crate::regex::UNICODE_WORD_CLASS);
+    let big = big.as_str();
     let m = refusal(doc! {"pattern": big});
     assert!(m.contains("pattern") && m.contains("MiB"), "{m}");
     let m = refusal(doc! {"patternProperties": {big: {}}});

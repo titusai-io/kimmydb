@@ -1181,7 +1181,7 @@ fn rebuild(acc: &Accumulator, docs: &[Document], run: &Run<'_, '_>) -> Result<Bs
     let field = (String::new(), acc.clone());
     let mut state = init(&field);
     for doc in docs {
-        accumulate(&mut state, acc, &Scope::with_bindings(doc, run.vars), run.limits)?;
+        accumulate(&mut state, acc, &Scope::with_bindings(doc, run.vars))?;
     }
     peek(&state)
 }
@@ -1328,7 +1328,7 @@ impl Slider for GenericSlider<'_, '_> {
     fn add(&mut self, i: usize, docs: &[Document]) -> Result<()> {
         if !self.dirty {
             let scope = Scope::with_bindings(&docs[i], self.run.vars);
-            accumulate(&mut self.state, self.acc, &scope, self.run.limits)?;
+            accumulate(&mut self.state, self.acc, &scope)?;
         }
         Ok(())
     }
@@ -1364,7 +1364,7 @@ impl Slider for GenericSlider<'_, '_> {
             self.reset();
             for doc in &docs[s..e] {
                 let scope = Scope::with_bindings(doc, self.run.vars);
-                accumulate(&mut self.state, self.acc, &scope, self.run.limits)?;
+                accumulate(&mut self.state, self.acc, &scope)?;
             }
         }
         peek(&self.state)

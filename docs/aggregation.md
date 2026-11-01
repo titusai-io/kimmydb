@@ -689,16 +689,40 @@ for a pipeline ported from elsewhere.)
 | `$firstN`, `$lastN` | `{n, input}` | The first / last `n` values in input order; `null` and missing are values (a missing one is `null`) |
 | `$maxN`, `$minN` | `{n, input}` | The `n` largest, largest first / the `n` smallest, smallest first, in the canonical type order; `null` and missing are skipped. Fewer than `n` values give all of them, and none gives `[]` |
 
-`sortBy` is a `$sort` document over the group's input documents; a missing key
-sorts as `null`, a key that meets an array uses its smallest element ascending
-and its largest descending, and rows that sort equal stay in input order. A
-missing `output` is `null`. `n` is a positive integer constant (or an expression
-that needs no document, or a variable): `0`, a negative, a fraction, a string,
-`null` or a field path is `400`. Every buffer `n` bounds is held to the pipeline
-document limit: an `n` over it is refused when the first document arrives, and
-the rows held across all the groups of the stage are counted against it as they
-are buffered. Where this differs from the reference see
-[deviations.md](deviations.md).
+`sortBy` is a `$sort` document over the group's input documents, and may be
+empty (every row then ties and the rows keep their order of arrival). The
+**whole value** at each key's path is compared in the canonical order, an array
+element by element, so an array sorts after a string and `[2, 9]` before `[3, 1]`
+whichever way the key runs; one exception, an empty array sorts below `null`
+(and `MinKey` below it). A path through an array of documents is the array of
+what each holds. A missing key sorts as `null`. Rows that sort equal stay in
+input order, and **the first of them wins**: `$top` and `$bottom` of three equal
+rows `a`, `b`, `c` are both `a`, and `$bottomN` with `n: 2` is `["a", "b"]`.
+`$bottomN` answers its rows in `sortBy` order. A missing `output` is `null`.
+(The `$sort` stage reads an array key differently; see
+[deviations.md](deviations.md).)
+
+`n` is a positive integer constant (or an expression that needs no document, or
+a variable), refused for a group when its first document arrives, so no input
+means no group and no error: `0`, a negative, a fraction, a string, `null` or a
+field path is then a `400`. No `n` is refused for its size: `n: 1000000` over six documents answers
+the six. A buffer grows with the rows it receives, and a row costs O(log n). Like
+`$push`, the buffers are not counted against the pipeline document limit: each
+holds at most the rows of its group, which the stage's input already bounds.
+Where this differs from the reference see [deviations.md](deviations.md).
+
+**As expressions.** `$firstN`, `$lastN`, `$maxN` and `$minN` also work in
+`$project`, `$addFields` and any other expression over an array,
+`{$maxN: {n: 2, input: [1, 3, 2, null]}}` being `[3, 2]` (`n` is read for each
+document), and `$stdDevPop` / `$stdDevSamp` take one array,
+`{$stdDevPop: [1, 2, 3, 4]}` being `1.118033988749895`, or a list of operands;
+non-numbers among them are ignored. An `input` that is not an array, `null` and
+missing included, is `400`, and `n` is read before it. `$top`, `$bottom`, `$topN`,
+`$bottomN` and `$count` are accumulators only.
+
+In a `$group`, `$sum`, `$avg`, `$stdDevPop` and `$stdDevSamp` take one
+expression: an array literal of two or more elements, or none, is `400` (`The
+$stdDevPop accumulator is a unary operator`).
 
 ### How a value is read
 
@@ -834,8 +858,25 @@ is a `400`.
 | `$dateTrunc` | `date`, `unit`, `binSize`, `timezone`, `startOfWeek` | date |
 
 A date argument may be a date, a Timestamp (its seconds) or an ObjectId (its
-creation time). A null or missing date, or a null `timezone`, gives `null`; any
-other type is a `400`. `unit` is one of `year quarter month week day hour minute
+creation time). A null or missing argument gives `null`; any other type is a
+`400`. What an error beside a null does follows the reference's order of
+reading the arguments:
+
+- `$year`, `$month`, `$hour` and the other one-date operators read the date
+  first. A null date is `null` whatever the zone is (a bad zone beside it is not
+  looked at), a date of the wrong type is a `400` even beside a null `timezone`,
+  and only then is the zone read (null is `null`, a bad name or a non-string is a
+  `400`).
+- `$dateAdd`, `$dateSubtract`, `$dateDiff`, `$dateTrunc` and `$dateFromParts`
+  answer `null` as soon as any argument is null, before any type, unit, range
+  or zone is judged (`{startDate: "x", unit: null}` is `null`). `$dateFromParts`
+  reads `hour`, `minute`, `second` and `millisecond`, then the zone, then the
+  year, month and day, and the first null answers.
+- `$dateToString` reads the zone and a given `format` even beside a null date (a
+  bad one is a `400`) and then a null date answers `onNull`, also when the
+  `format` is null.
+
+`unit` is one of `year quarter month week day hour minute
 second millisecond`, in lower case. `startOfWeek` is a day name (`monday`) or
 its three-letter form, in any case, and is read only when `unit` is `week`; the
 default is Sunday.
@@ -843,15 +884,18 @@ default is Sunday.
 **Time zones.** `timezone` is one of:
 
 - an IANA name from the tz database compiled into the binary (`America/New_York`,
-  `Asia/Kolkata`, `Etc/GMT+5`, the legacy links such as `US/Eastern`), matched
-  without regard to case;
-- `UTC`, `GMT` or `Z`;
-- a fixed offset `+hh`, `+hhmm` or `+hh:mm` (and `-`), up to 23:59.
+  `Asia/Kolkata`, `Etc/GMT+5`, the legacy links such as `US/Eastern`), spelt in
+  the database's own case (`america/new_york`, `Utc` and `Gmt` are refused, as
+  the reference refuses them);
+- `UTC` or `GMT` (`Z` is not a zone);
+- a fixed offset `+hh`, `+hhmm` or `+hh:mm` (and `-`) with any two digits for
+  each field, as the reference reads them: `+24:00` is 24 hours, `+05:60` is 6
+  hours, `+99` is 99 hours.
 
-Anything else is a `400`, `unrecognized time zone identifier` for a name and
-`Invalid format for UTC offset` for something that starts with a sign; a
-constant zone is checked when the pipeline is parsed, a computed one when the
-row is evaluated (and then even beside a null date). No system tz database is
+Anything else, a name or an offset alike, is a `400`, `unrecognized time zone
+identifier`. A constant zone is read when the operator reaches it, like a
+computed one, so a bad constant beside a null date is `null`, as in the
+reference. No system tz database is
 read: the data is built in, so a name means the same on every host. It is
 **version 2026e** (`jiff-tzdb` 0.1.9, which `jiff` reads); it changes only when
 that dependency is bumped, which is a normal dependency update and is recorded in
@@ -863,9 +907,14 @@ the seconds of local mean time (`-04:56:02` for New York before 1883); `%z` and
 `$dateToString` follow the clock changes. Going the other way, from a wall clock
 to an instant (`$dateFromParts`, `$dateFromString`, and the wall-clock result of
 `$dateAdd` in days or longer), a local time that happens twice (clocks going
-back) takes its **first** occurrence, and one that never happens (clocks going
-forward) moves forward by the length of the gap: `02:30` on 2024-03-10 in
-`America/New_York` is `03:30 EDT`, and `01:30` on 2024-11-03 is `01:30 EDT`.
+back) takes its **later** occurrence, standard time, and one that never happens
+(clocks going forward) moves forward by the length of the gap: `02:30` on
+2024-03-10 in `America/New_York` is `03:30 EDT`, and `01:30` on 2024-11-03 is
+`01:30 EST` (06:30Z). Two operators differ on the repeated time: `$dateAdd` and
+`$dateSubtract` land in a repeated hour with the **start date's offset** (a day
+added to an EDT date gives the EDT occurrence, to an EST date the EST one), and
+`$dateTrunc` to a day whose midnight repeats (Havana on 2024-11-03) answers the
+later midnight.
 
 **`$dateAdd` and `$dateSubtract`:** `year`, `quarter` and `month` clamp to the
 last day of a shorter month (31 January plus a month is 29 February 2024), `week`
@@ -880,27 +929,43 @@ hour and `2` minutes. A negative result means the end is earlier.
 **`$dateTrunc`** rounds down to the start of the unit in the zone. With `binSize`
 the bins are counted from 2000-01-01 00:00 local time (from the first
 `startOfWeek` day on or after it for `week`), so `{unit: "year", binSize: 5}`
-gives 2020 for 2024.
+gives 2020 for 2024. For `hour`, `minute`, `second` and `millisecond` the bins
+are fixed lengths cut in UTC from the instant the zone's clock read 2000-01-01
+00:00 with the offset it had then; in New York in July (EDT, where 2000-01-01
+was EST) a `binSize` of 2 hours therefore starts on an odd UTC hour (13:00Z for
+13:30Z), and a zone whose offset changed since 2000 (Lord Howe, Caracas,
+Kathmandu) has bins that are not on its local hour. `$dateDiff` counts the clock's
+own boundaries at each instant instead. A `binSize` larger than the unit can count
+in the whole range of a date (292,471,208 years, 106,751,991,167 days) is `400`
+`dateTrunc unsupported binSize value`, a bin or a result no date can hold in
+`hour`, `minute`, `second` or `millisecond` is `dateTrunc overflowed`.
 
 **`$dateFromParts`** carries a part outside its range into the next unit, in
 both directions (`month: 14` is February of the next year, `day: 0` is the last
-day of the previous month); `year` and `isoWeekYear` must be 1 to 9999 and the
-other parts must fit a 16-bit integer.
+day of the previous month); `year` and `isoWeekYear` must be 1 to 9999 and
+`month`, `day`, `hour`, `minute`, `isoWeek` and `isoDayOfWeek` must fit a 16-bit
+integer. `second` and `millisecond` have no range (`millisecond: 40000` is 40
+seconds); a sum no date can hold is a `400`.
 
 **`$dateToString` specifiers:** `%Y` (four digits, 0000 to 9999) `%G` (ISO
 year) `%m` `%d` `%H` `%M` `%S` `%L` (millisecond) `%j` (day of year, 001) `%w`
 (1 is Sunday) `%u` (1 is Monday) `%U` (week, 00) `%V` (ISO week, 01) `%z`
-(`+0530`) `%Z` (offset in minutes, `+330`) `%%`. The default is
-`%Y-%m-%dT%H:%M:%S.%LZ` in UTC and the same without the `Z` in any other zone. An
-unknown specifier is an error rather than being copied through.
+(`+0530`) `%Z` (the offset as signed minutes with no `+`: `330`, `0`, `-240`)
+`%%`. The default is `%Y-%m-%dT%H:%M:%S.%LZ` **in every zone**: the fields are
+the zone's local time and the `Z` is printed all the same, as the reference does
+(`2024-03-15T09:45:07.250Z` for 13:45:07Z in New York). An unknown specifier is an
+error rather than being copied through.
 
 **`$dateFromString` specifiers:** `%Y` (four digits) `%m` `%d` `%H` `%M` `%S`
-(two digits) `%L` (three) `%j` (three, day of year) `%G` `%V` `%u` (ISO week
-date) `%z` (`+hh`, `+hhmm` or `+hh:mm`) `%Z` (offset in minutes) `%%`; every other
-character must match. A field the format omits defaults to 1970, January, the 1st
-and 00:00:00. With no `format` the string is `YYYY-MM-DD`, optionally followed
-by `T` or a space and `HH:MM[:SS[.fff]]`, optionally followed by `Z` or an
-offset. A string that carries its own offset beside a `timezone` argument is
+(two digits) `%L` (three) `%G` `%V` `%u` (ISO week date) `%z` (`+hh`, `+hhmm` or
+`+hh:mm`) `%Z` (offset in minutes) `%%`; every other character must match (`%j`
+is not a specifier here, as in the reference). The format has to give a whole
+date: `%Y`, `%m` and `%d` together, or `%G` (the week and the day default to 1);
+`%Y`, `%Y-%m`, `%m-%d` and `%H:%M` alone are `an incomplete date/time string`,
+which `onError` takes, as it takes a format that mixes ISO week fields (`%G` `%V` `%u`) with calendar ones. `%z` and `%Z` may both appear. The time fields the format omits are 00:00:00. With no
+`format` the string is `YYYY-MM-DD`, optionally followed
+by `T` or a space and `HH:MM[:SS[.fff]]` (a point, not a comma), optionally
+followed by `Z` or an offset. A string that carries its own offset beside a `timezone` argument is
 refused. A string that cannot be read is an error, or `onError` when it is given;
 `onError` does not catch a bad `format` or `timezone`. See
 [deviations](deviations.md#date-operators-and-time-zones-adr-261) for what is not
@@ -1216,8 +1281,9 @@ array, so a literal is written inside the argument list:
 false]}`, which is two arguments and refused.
 
 **No cap of their own.** None of these builds more than its inputs already
-hold, so the only expression-level size limit, `$range`'s, does not apply;
-the pipeline's document ceiling still does.
+hold, so the 16 MiB limit on what an expression builds (see
+[Strings](#strings)) is not checked here, and the pipeline's document ceiling
+still applies.
 
 ### Documents as pairs
 
@@ -1267,24 +1333,38 @@ line says otherwise; a value of the wrong type is a `400` naming the operator.
 | Operator | Form | Notes |
 |---|---|---|
 | `$trim` `$ltrim` `$rtrim` | `{input, chars}` | `chars` is a **set of code points** to strip, not a prefix. Without it: NUL, space, U+0009 to U+000D, U+00A0, U+1680 and U+2000 to U+200A (not U+0085, U+2028, U+2029, U+202F, U+205F, U+3000). `chars: ""` strips nothing; a null `chars` gives null |
-| `$indexOfCP` `$indexOfBytes` | `[string, substring, start?, end?]` | Position of the first match inside `[start, end)`, or `-1`; counted in code points or in bytes. `start` and `end` must be non-negative whole numbers. A null string is null; the substring must be a string |
+| `$indexOfCP` `$indexOfBytes` | `[string, substring, start?, end?]` | Position of the first match, or `-1`; counted in code points or in bytes. `start` and `end` must be non-negative whole numbers. A null string is null; the substring must be a string. **`end` means different things.** `$indexOfBytes` searches the bytes `[start, end)` and finds the substring only when it lies wholly inside them. `$indexOfCP` bounds where a match may *start*: it tries each position from `start` up to, not including, `end` or the end of the string, and the match may run past `end`. So `["abcabc", "bc", 0, 2]` is `1` for `$indexOfCP` and `-1` for `$indexOfBytes`. An empty substring is found at `start` only while `start` is before `end` and before the end of the string for `$indexOfCP` (`["abc", "", 2]` is `2`, `["abc", "", 3]` and `["abc", "", 1, 1]` are `-1`), and up to the end for `$indexOfBytes` (`["abc", "", 3]` is `3`); `["", ""]` is `0` for both |
 | `$regexMatch` | `{input, regex, options}` | `true`/`false`; null input or regex is `false` |
 | `$regexFind` | same | `{match, idx, captures}` or null; `idx` in **code points**, `captures` one string per group (null for a group that took no part) |
-| `$regexFindAll` | same | An array of those documents, left to right, not overlapping; null input or regex is `[]`. After an empty match the search resumes one code point on, so `a*` over `"abc"` finds `"a"` and then empty matches at 1, 2 and 3 |
-| `$replaceOne` `$replaceAll` | `{input, find, replacement}` | `find` is literal text, not a pattern. Any of the three null gives null; an empty `find` matches before the first code point (`$replaceAll`: between every one and at both ends) |
-| `$strcasecmp` | `[a, b]` | `-1`, `0` or `1`. **Folds ASCII only**: `é` and `É` differ. Null is `""`; a number is read as its text |
+| `$regexFindAll` | same | An array of those documents, left to right, not overlapping; null input or regex is `[]`. After an empty match the search resumes one code point on, and the search stops when the next one would start at the end of the input, so an empty match at the end is found only when the search that found it began earlier: `a*` over `"abc"` finds `"a"` at 0 and empty matches at 1 and 2 (not 3), `a*` over `"aaa"` finds `"aaa"` only, `b*` over `"ab"` finds empty at 0 and `"b"` at 1, `\b` over `"ab cd"` is 0, 2, 3 and 5, and an empty pattern over `""` finds one empty match. The answer is refused (`413`) when its documents pass 64 MiB as BSON |
+| `$replaceOne` `$replaceAll` | `{input, find, replacement}` | `find` is literal text, not a pattern. Any of the three null gives null; an empty `find` matches before the first code point (`$replaceAll`: between every one and at both ends). A result of 16 MiB or more is refused (`413`), worked out before anything is built |
+| `$strcasecmp` | `[a, b]` | `-1`, `0` or `1`. **Folds ASCII only**, to upper case: `é` and `É` differ, and `_` sorts above `a`. Null is `""`; a number is read as its text, an integer in full and a double with **six significant digits** as C's `%g` prints it (`1e+21`, `0.3` for `0.1 + 0.2`, `1.23457e+11`, `nan`, `inf`), which is not what `$toString` prints |
 | `$strLenBytes` | `string` | UTF-8 length. Null is refused, as `$strLenCP` refuses it |
-| `$substrBytes` | `[string, start, length]` | Byte offsets that must fall **between** code points: one inside a character is a `400` (starting or ending index is a UTF-8 continuation byte). A start past the end, or negative, is `""`; a negative length is "to the end"; a null string is `""` |
+| `$substrBytes` | `[string, start, length]` | Byte offsets that must fall **between** code points: one inside a character is a `400` (starting or ending index is a UTF-8 continuation byte). A start past the end is `""`; a negative start, and a NaN, infinite or out-of-range start or length, is a `400`; a negative length is "to the end"; a null string is `""`; a number is read as its text, as for `$strcasecmp` |
 
 The regex operators run the engine of the `$regex` filter ([regex
 compatibility](query-language.md#regex-compatibility)): no backreferences or
-lookaround, the flags `i`, `m`, `s` and `x`, a size limit per pattern, and the
-patterns of one pipeline counted against the filter budget of 32. `regex` is a
+lookaround, the flags `i`, `m`, `s`, `x` and `u` (accepted, and changing
+nothing), `\d`, `\w`, `\s` and `\b` read as ASCII, a size limit per pattern, and
+the patterns of one pipeline counted against the filter budget of 32. `regex` is a
 string (with `options`) or a regex value; flags given in both places are a
 `400`. A `regex` that is a constant is compiled, and refused if it is bad, when
 the pipeline is parsed; one computed from the document is compiled when it is
 evaluated. All three type-check `input`, `regex` and `options` before they
-answer null, as the reference does.
+answer null, as the reference does. A regex value can be sent over HTTP as the
+Extended JSON `{"$regularExpression": {"pattern": "ab+c", "options": "i"}}`.
+
+**No expression builds a string of 16 MiB or more, or an array over 16 MiB of
+BSON.** `$concat`, `$replaceOne` and `$replaceAll` work out the length of their
+result first and answer `413` when it is 16,777,216 bytes or more (a string of
+16,777,215 passes, as the reference's does), so a `$reduce` that doubles a
+string at each step stops at the limit. `$concatArrays` (and so a `$reduce` that
+doubles an array), `$map`, `$zip`, an array literal, `$split` and `$objectToArray`
+count what they collect and answer the same `413` past 16 MiB. `$regexFindAll`
+answers `413` past 64 MiB of match documents (counted as BSON), the reference's
+own limit. The message names what hit which limit, for example `the array $map
+builds is 20971520 bytes, over the 16 MiB array limit`. `$range` is bounded by its
+element count (100,000), `$zip` also by its cells (1,000,000), both a `400`.
 
 ### Getting, setting and merging fields
 
@@ -1296,17 +1376,23 @@ answer null, as the reference does.
     "all":    { "$mergeObjects": ["$defaults", "$overrides"] } } }
 ```
 
-**`$getField`** takes a field name (`{"$getField": "a"}`) or `{field, input}`,
-`input` defaulting to `$$CURRENT`. The name is a **name**, never a path: `"x.y"`
-is a field called `x.y`, and a name that starts with `$` is written
-`{"$literal": "$price"}`. A field the document lacks is *missing*: `$type` says
-`"missing"` and `$addFields`/`$project` leave the field out. A null or missing
-`input` is null; a non-document `input` or a non-string `field` is a `400`.
+**`$getField`** takes a field name (`{"$getField": "a"}`, which reads
+`$$CURRENT`) or `{field, input}`, where `input` is required. The name is a
+**name**, never a path: `"x.y"` is a field called `x.y`, and a name that starts
+with `$` is written `{"$literal": "$price"}`. It is also a **constant**, as it is
+for `$setField` and `$unsetField`: a field path (`{"$getField": "$s"}`), a
+computed name (`{"$concat": [...]}`) and a value that is not a string are a `400`
+when the pipeline is parsed. A field the document lacks is *missing*: `$type`
+says `"missing"` and `$addFields`/`$project` leave the field out. An `input` that
+is **missing or is not a document** (a string, an array, a number) is missing, with
+no error, so a field that is sometimes a document does not fail the pipeline; a
+null `input` is null.
 
 **`$setField`** `{field, input, value}` returns `input` with `field` set: an
 existing field keeps its place, a new one goes last. `value` as `$$REMOVE` (or a
 missing field path) removes it; null is stored. **`$unsetField`** `{field,
-input}` removes. Both give null for a null or missing `input`.
+input}` removes. Both give null for a null or missing `input`, and refuse an
+`input` that is not a document.
 
 **`$mergeObjects`** merges documents left to right: a later value wins, a key
 keeps the place it first had, a nested document is replaced whole, and null and

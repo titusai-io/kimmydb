@@ -17,6 +17,7 @@ thiserror.workspace = true
 uuid.workspace = true
 base64.workspace = true
 regex-automata = "0.4"
+regex-syntax = "0.8"
 
 [dev-dependencies]
 proptest.workspace = true

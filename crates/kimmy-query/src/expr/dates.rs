@@ -19,10 +19,21 @@
 //!
 //! # Null, missing and wrong types
 //!
-//! A null or missing date, and a null or missing `timezone`, give null; a value
-//! of the wrong type is an error. A `timezone` that names no zone is an error
-//! even beside a null date. Every operator that takes a date also takes a
-//! Timestamp (its seconds) and an ObjectId (its creation time).
+//! A null or missing argument gives null, and the reference reads the arguments
+//! in a fixed order that decides what an error beside a null is:
+//!
+//! - `$year` and the other one-date operators look at the date first: a null
+//!   date is null whatever the zone is (a bad zone beside it is not read), a
+//!   date of the wrong type is an error, and only then is the zone read (null
+//!   gives null, a bad name or a non-string is an error);
+//! - `$dateAdd`, `$dateSubtract`, `$dateDiff`, `$dateTrunc` and
+//!   `$dateFromParts` answer null as soon as any argument is null, before any
+//!   type, unit, range or zone check;
+//! - `$dateToString` reads the zone and a given format even beside a null date
+//!   (a bad one is an error), then a null date answers `onNull`.
+//!
+//! Every operator that takes a date also takes a Timestamp (its seconds) and an
+//! ObjectId (its creation time).
 
 use bson::Bson;
 use kimmy_core::{Error, Result};
@@ -159,9 +170,10 @@ impl Kind {
 pub struct DateExpr {
     kind: Kind,
     args: Vec<(&'static str, Expr)>,
-    /// The `timezone` when it is a constant, resolved once at parse time so a
-    /// bad name fails the pipeline and not the millionth row.
-    zone: Option<Zone>,
+    /// The `timezone` when it is a constant, resolved once at parse time. A bad
+    /// constant keeps its message and fails only when the operator gets as far
+    /// as reading the zone, as the reference does (a null date comes first).
+    zone: Option<std::result::Result<Zone, String>>,
 }
 
 impl PartialEq for Zone {
@@ -180,6 +192,50 @@ enum Arg {
     Absent,
     Null,
     Val(Bson),
+}
+
+impl Arg {
+    fn is_null(&self) -> bool {
+        matches!(self, Arg::Null)
+    }
+}
+
+/// A `timezone` as evaluated.
+enum ZoneArg {
+    Absent,
+    Null,
+    Zone(Zone),
+    /// A name or type the reference refuses, with its message.
+    Bad(String),
+}
+
+impl ZoneArg {
+    fn is_null(&self) -> bool {
+        matches!(self, ZoneArg::Null)
+    }
+
+    /// `Ok(None)` for a null zone; a bad one is the error.
+    fn into_zone(self) -> Result<Option<Zone>> {
+        match self {
+            ZoneArg::Absent => Ok(Some(Zone::Utc)),
+            ZoneArg::Null => Ok(None),
+            ZoneArg::Zone(z) => Ok(Some(z)),
+            ZoneArg::Bad(message) => err(message),
+        }
+    }
+}
+
+/// A zone name read, or its refusal kept as a message.
+fn read_zone(name: &str) -> Result<std::result::Result<Zone, String>> {
+    match Zone::parse(name) {
+        Ok(z) => Ok(Ok(z)),
+        Err(Error::InvalidQuery(message)) => Ok(Err(message)),
+        Err(other) => Err(other),
+    }
+}
+
+fn not_a_string(v: &Bson) -> String {
+    format!("timezone must evaluate to a string, found {}", type_name(v))
 }
 
 fn nullish(v: &Bson) -> bool {
@@ -239,14 +295,9 @@ impl DateExpr {
         let mut zone = None;
         if let Some((_, Expr::Literal(v))) = args.iter().find(|(k, _)| *k == "timezone") {
             match v {
-                Bson::String(s) => zone = Some(Zone::parse(s)?),
+                Bson::String(s) => zone = Some(read_zone(s)?),
                 Bson::Null | Bson::Undefined => {}
-                other => {
-                    return err(format!(
-                        "timezone must evaluate to a string, found {}",
-                        type_name(other)
-                    ));
-                }
+                other => zone = Some(Err(not_a_string(other))),
             }
         }
         let this = DateExpr { kind, args, zone };
@@ -277,19 +328,29 @@ impl DateExpr {
         }
     }
 
+    /// The `timezone` as given, not yet judged: a bad name is kept as a message
+    /// so that an operator which answers null for another reason never reads it.
+    fn zone_arg(&self, scope: &Scope<'_>) -> Result<ZoneArg> {
+        if let Some(z) = &self.zone {
+            return Ok(match z {
+                Ok(z) => ZoneArg::Zone(z.clone()),
+                Err(message) => ZoneArg::Bad(message.clone()),
+            });
+        }
+        Ok(match self.arg("timezone", scope)? {
+            Arg::Absent => ZoneArg::Absent,
+            Arg::Null => ZoneArg::Null,
+            Arg::Val(Bson::String(s)) => match read_zone(&s)? {
+                Ok(z) => ZoneArg::Zone(z),
+                Err(message) => ZoneArg::Bad(message),
+            },
+            Arg::Val(other) => ZoneArg::Bad(not_a_string(&other)),
+        })
+    }
+
     /// The zone: `Ok(None)` is a null `timezone`, which makes the result null.
     fn zone(&self, scope: &Scope<'_>) -> Result<Option<Zone>> {
-        if let Some(z) = &self.zone {
-            return Ok(Some(z.clone()));
-        }
-        match self.arg("timezone", scope)? {
-            Arg::Absent => Ok(Some(Zone::Utc)),
-            Arg::Null => Ok(None),
-            Arg::Val(Bson::String(s)) => Zone::parse(&s).map(Some),
-            Arg::Val(other) => {
-                err(format!("timezone must evaluate to a string, found {}", type_name(&other)))
-            }
-        }
+        self.zone_arg(scope)?.into_zone()
     }
 
     pub(super) fn eval(&self, scope: &Scope<'_>) -> Result<Bson> {
@@ -303,10 +364,11 @@ impl DateExpr {
             Kind::Diff => self.eval_diff(scope),
             Kind::Trunc => self.eval_trunc(scope),
             _ => {
-                let date = self.arg("date", scope)?;
-                let Some(zone) = self.zone(scope)? else { return Ok(Bson::Null) };
-                let Arg::Val(date) = date else { return Ok(Bson::Null) };
+                // The date is read first: a null one is null whatever the zone is, a
+                // wrong type is an error even beside a null zone.
+                let Arg::Val(date) = self.arg("date", scope)? else { return Ok(Bson::Null) };
                 let ms = date_ms(&date, op)?;
+                let Some(zone) = self.zone(scope)? else { return Ok(Bson::Null) };
                 let p = Parts::of(&zone, ms);
                 Ok(match self.kind {
                     Kind::Year => Bson::Int32(p.year as i32),
@@ -331,9 +393,17 @@ impl DateExpr {
     // -- $dateToString -------------------------------------------------
 
     fn eval_to_string(&self, scope: &Scope<'_>) -> Result<Bson> {
+        let date = self.arg("date", scope)?;
+        // The zone and a given format are read (and a bad one refused) even
+        // beside a null date; the date comes after them.
+        let zone = self.zone(scope)?;
+        let mut null_format = false;
         let format = match self.arg("format", scope)? {
             Arg::Absent => None,
-            Arg::Null => return Ok(Bson::Null),
+            Arg::Null => {
+                null_format = true;
+                None
+            }
             Arg::Val(Bson::String(f)) => {
                 if !matches!(self.get("format"), Some(Expr::Literal(_))) {
                     check_format(Kind::ToString, &f)?;
@@ -347,18 +417,21 @@ impl DateExpr {
                 ));
             }
         };
-        let date = self.arg("date", scope)?;
-        let Some(zone) = self.zone(scope)? else { return Ok(Bson::Null) };
         let Arg::Val(date) = date else {
             return match self.get("onNull") {
                 Some(e) => e.eval_in(scope),
                 None => Ok(Bson::Null),
             };
         };
+        let Some(zone) = zone else { return Ok(Bson::Null) };
+        if null_format {
+            return Ok(Bson::Null);
+        }
         let ms = date_ms(&date, "$dateToString")?;
         let p = Parts::of(&zone, ms);
-        let default = if zone.is_utc() { "%Y-%m-%dT%H:%M:%S.%LZ" } else { "%Y-%m-%dT%H:%M:%S.%L" };
-        Ok(Bson::String(format_parts(format.as_deref().unwrap_or(default), &p)?))
+        // The default always ends in Z, whatever the zone: the fields are the
+        // zone's, and the reference prints the letter all the same.
+        Ok(Bson::String(format_parts(format.as_deref().unwrap_or("%Y-%m-%dT%H:%M:%S.%LZ"), &p)?))
     }
 
     // -- $dateFromString -----------------------------------------------
@@ -419,8 +492,10 @@ impl DateExpr {
         let op = "$dateFromParts";
         let iso = self.get("isoWeekYear").is_some();
 
-        // `Ok(None)` is a null part: the result is null.
-        let int = |name: &str, default: i64, min: i64, max: i64| -> Result<Option<i64>> {
+        // `Ok(None)` is a null part: the result is null. The type is checked as
+        // the part is read; `bounds` is the range check of the parts that have
+        // one (the second and the millisecond have none).
+        let int = |name: &str, default: i64, bounds: Option<(i64, i64)>| -> Result<Option<i64>> {
             match self.arg(name, scope)? {
                 Arg::Absent => Ok(Some(default)),
                 Arg::Null => Ok(None),
@@ -432,51 +507,62 @@ impl DateExpr {
                             short(&v)
                         ))
                     })?;
-                    if n < min || n > max {
-                        return err(if name == "year" || name == "isoWeekYear" {
-                            format!(
-                                "'{name}' must evaluate to an integer in the range 1 to 9999, found {n}"
-                            )
-                        } else {
-                            format!(
-                                "'{name}' must evaluate to a value in the range [{min}, {max}]; value {n} is not in range"
-                            )
-                        });
+                    if let Some((min, max)) = bounds
+                        && (n < min || n > max)
+                    {
+                        return err(format!(
+                            "'{name}' must evaluate to a value in the range [{min}, {max}]; value {n} is not in range"
+                        ));
                     }
                     Ok(Some(n))
                 }
             }
         };
-        const PART: (i64, i64) = (-32_768, 32_767);
+        const PART: Option<(i64, i64)> = Some((-32_768, 32_767));
 
-        let mut vals = [0i64; 8];
-        let y_name = if iso { "isoWeekYear" } else { "year" };
-        let Some(year) = int(y_name, 1970, 1, 9999)? else { return Ok(Bson::Null) };
-        if iso {
-            let Some(w) = int("isoWeek", 1, PART.0, PART.1)? else { return Ok(Bson::Null) };
-            let Some(d) = int("isoDayOfWeek", 1, PART.0, PART.1)? else { return Ok(Bson::Null) };
-            vals[0] = w;
-            vals[1] = d;
-        } else {
-            let Some(m) = int("month", 1, PART.0, PART.1)? else { return Ok(Bson::Null) };
-            let Some(d) = int("day", 1, PART.0, PART.1)? else { return Ok(Bson::Null) };
-            vals[0] = m;
-            vals[1] = d;
-        }
-        for (i, name) in ["hour", "minute", "second", "millisecond"].into_iter().enumerate() {
-            let Some(v) = int(name, 0, PART.0, PART.1)? else { return Ok(Bson::Null) };
-            vals[2 + i] = v;
+        // The reference's order: hour, minute, second, millisecond, the zone,
+        // then year, month and day (or the ISO trio); the first null answers
+        // null, so a part that would be refused after it is never looked at.
+        let Some(hour) = int("hour", 0, PART)? else { return Ok(Bson::Null) };
+        let Some(minute) = int("minute", 0, PART)? else { return Ok(Bson::Null) };
+        let Some(second) = int("second", 0, None)? else { return Ok(Bson::Null) };
+        let Some(milli) = int("millisecond", 0, None)? else { return Ok(Bson::Null) };
+        // The reference turns the millisecond into a finer unit before adding it
+        // and refuses one whose finer count overflows (`9e18` is an error, `1e9`
+        // and a second of `9e15` are not).
+        if milli.unsigned_abs() > i64::MAX as u64 / 1000 {
+            return err(
+                "Overflow casting from a lower-precision duration to a higher-precision duration"
+                    .to_string(),
+            );
         }
         let Some(zone) = self.zone(scope)? else { return Ok(Bson::Null) };
+        let (y_name, a_name, b_name) =
+            if iso { ("isoWeekYear", "isoWeek", "isoDayOfWeek") } else { ("year", "month", "day") };
+        let Some(year) = int(y_name, 1970, None)? else { return Ok(Bson::Null) };
+        let Some(a) = int(a_name, 1, PART)? else { return Ok(Bson::Null) };
+        let Some(b) = int(b_name, 1, PART)? else { return Ok(Bson::Null) };
+        if !(1..=9999).contains(&year) {
+            return err(format!(
+                "'{y_name}' must evaluate to an integer in the range 1 to 9999, found {year}"
+            ));
+        }
 
-        let days = if iso {
-            iso_week1_monday(year) + (vals[0] - 1) * 7 + (vals[1] - 1)
+        let days: i128 = if iso {
+            i128::from(iso_week1_monday(year)) + i128::from((a - 1) * 7 + (b - 1))
         } else {
-            let months = year * 12 + (vals[0] - 1);
-            days_from_civil(months.div_euclid(12), months.rem_euclid(12) + 1, 1) + (vals[1] - 1)
+            let months = year * 12 + (a - 1);
+            i128::from(days_from_civil(months.div_euclid(12), months.rem_euclid(12) + 1, 1))
+                + i128::from(b - 1)
         };
-        let local =
-            days * DAY_MS + vals[2] * 3_600_000 + vals[3] * 60_000 + vals[4] * 1_000 + vals[5];
+        // A second or millisecond may be any 64-bit integer, so the sum is made
+        // wide and must then fit a date.
+        let local = days * i128::from(DAY_MS)
+            + i128::from(hour) * 3_600_000
+            + i128::from(minute) * 60_000
+            + i128::from(second) * 1_000
+            + i128::from(milli);
+        let local = i64::try_from(local).map_err(|_| overflow(op))?;
         Ok(Bson::DateTime(bson::DateTime::from_millis(zone.local_to_utc(local))))
     }
 
@@ -522,16 +608,25 @@ impl DateExpr {
 
     fn eval_add(&self, scope: &Scope<'_>) -> Result<Bson> {
         let op = self.kind.name();
-        let Arg::Val(start) = self.arg("startDate", scope)? else { return Ok(Bson::Null) };
+        let start = self.arg("startDate", scope)?;
+        let unit = self.arg("unit", scope)?;
+        let amount = self.arg("amount", scope)?;
+        let zone = self.zone_arg(scope)?;
+        // Any null answers null before any type, unit or zone is judged: a null
+        // zone is caught here, a null date, unit or amount by the pattern below.
+        if zone.is_null() {
+            return Ok(Bson::Null);
+        }
+        let (Arg::Val(start), Arg::Val(unit), Arg::Val(amount)) = (start, unit, amount) else {
+            return Ok(Bson::Null);
+        };
         let start =
             date_like(&start, &format!("{op} requires startDate to be convertible to a date"))?;
-        let Arg::Val(unit) = self.arg("unit", scope)? else { return Ok(Bson::Null) };
         let unit = Unit::read(&unit, op)?;
-        let Arg::Val(amount) = self.arg("amount", scope)? else { return Ok(Bson::Null) };
         let amount = as_integer(&amount, "amount").map_err(|_| {
             Error::InvalidQuery(format!("{op} expects integer amount of time units"))
         })?;
-        let Some(zone) = self.zone(scope)? else { return Ok(Bson::Null) };
+        let Some(zone) = zone.into_zone()? else { return Ok(Bson::Null) };
         let amount = if self.kind == Kind::Subtract {
             amount.checked_neg().ok_or_else(|| overflow(op))?
         } else {
@@ -545,19 +640,27 @@ impl DateExpr {
 
     fn eval_diff(&self, scope: &Scope<'_>) -> Result<Bson> {
         let op = "$dateDiff";
-        let Arg::Val(start) = self.arg("startDate", scope)? else { return Ok(Bson::Null) };
+        let start = self.arg("startDate", scope)?;
+        let end = self.arg("endDate", scope)?;
+        let unit = self.arg("unit", scope)?;
+        let zone = self.zone_arg(scope)?;
+        // A null zone is caught here, a null date or unit by the pattern below.
+        if zone.is_null() {
+            return Ok(Bson::Null);
+        }
+        let (Arg::Val(start), Arg::Val(end), Arg::Val(unit)) = (start, end, unit) else {
+            return Ok(Bson::Null);
+        };
         let start = date_like(&start, "$dateDiff requires startDate to be convertible to a date")?;
-        let Arg::Val(end) = self.arg("endDate", scope)? else { return Ok(Bson::Null) };
         let end = date_like(&end, "$dateDiff requires endDate to be convertible to a date")?;
-        let Arg::Val(unit) = self.arg("unit", scope)? else { return Ok(Bson::Null) };
         let unit = Unit::read(&unit, op)?;
-        let Some(zone) = self.zone(scope)? else { return Ok(Bson::Null) };
+        let Some(zone) = zone.into_zone()? else { return Ok(Bson::Null) };
         let week_start = match self.arg("startOfWeek", scope)? {
             Arg::Val(v) if unit == Unit::Week => Some(read_week_day(&v, op)?),
             Arg::Null if unit == Unit::Week => return Ok(Bson::Null),
             _ => None,
         };
-        let n = diff_units(start, end, unit, &zone, week_start.unwrap_or(0));
+        let n = diff_units(start, end, unit, &zone, week_start.unwrap_or(0))?;
         Ok(Bson::Int64(n))
     }
 
@@ -565,13 +668,19 @@ impl DateExpr {
 
     fn eval_trunc(&self, scope: &Scope<'_>) -> Result<Bson> {
         let op = "$dateTrunc";
-        let Arg::Val(date) = self.arg("date", scope)? else { return Ok(Bson::Null) };
+        let date = self.arg("date", scope)?;
+        let unit = self.arg("unit", scope)?;
+        let bin = self.arg("binSize", scope)?;
+        let zone = self.zone_arg(scope)?;
+        // A null `binSize` or zone is caught here, a null date or unit by the
+        // pattern below.
+        if bin.is_null() || zone.is_null() {
+            return Ok(Bson::Null);
+        }
+        let (Arg::Val(date), Arg::Val(unit)) = (date, unit) else { return Ok(Bson::Null) };
         let date = date_like(&date, "$dateTrunc requires date to be convertible to a date")?;
-        let Arg::Val(unit) = self.arg("unit", scope)? else { return Ok(Bson::Null) };
         let unit = Unit::read(&unit, op)?;
-        let bin = match self.arg("binSize", scope)? {
-            Arg::Absent => 1,
-            Arg::Null => return Ok(Bson::Null),
+        let bin = match bin {
             Arg::Val(v) => {
                 let n = as_integer(&v, "binSize").map_err(|_| {
                     Error::InvalidQuery(
@@ -583,8 +692,9 @@ impl DateExpr {
                 }
                 n
             }
+            _ => 1,
         };
-        let Some(zone) = self.zone(scope)? else { return Ok(Bson::Null) };
+        let Some(zone) = zone.into_zone()? else { return Ok(Bson::Null) };
         let week_start = match self.arg("startOfWeek", scope)? {
             Arg::Val(v) if unit == Unit::Week => read_week_day(&v, op)?,
             Arg::Null if unit == Unit::Week => return Ok(Bson::Null),
@@ -592,7 +702,7 @@ impl DateExpr {
         };
         Ok(Bson::DateTime(bson::DateTime::from_millis(trunc_units(
             date, unit, bin, &zone, week_start,
-        ))))
+        )?)))
     }
 }
 
@@ -660,15 +770,24 @@ pub(super) fn format_iso_utc(ms: i64) -> Result<String> {
 // The calendar
 // ---------------------------------------------------------------------------
 
-/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
+/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's algorithm),
+/// exact for any year an `i64` holds: the sums are made in `i128`, so no year
+/// can overflow them.
+fn days_from_civil_wide(y: i64, m: i64, d: i64) -> i128 {
+    let y = i128::from(y) - i128::from(m <= 2);
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
+    let mp = (i128::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i128::from(d) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// [`days_from_civil_wide`] for a year that came from a date or a bounded
+/// argument, where the count fits an `i64`; one that does not is clamped.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let days = days_from_civil_wide(y, m, d);
+    i64::try_from(days).unwrap_or(if days < 0 { i64::MIN } else { i64::MAX })
 }
 
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
@@ -851,7 +970,9 @@ fn read_week_day(v: &Bson, op: &str) -> Result<i64> {
 ///
 /// The calendar units work on the wall clock: a month from 31 January is the
 /// last day of February, and a day across a clock change keeps its wall time.
-/// An hour, minute, second or millisecond is elapsed time.
+/// An hour, minute, second or millisecond is elapsed time. A wall clock that
+/// happens twice (the hour the clocks go back) resolves to the occurrence with
+/// the start's offset.
 fn add_units(start: i64, unit: Unit, amount: i64, zone: &Zone, op: &str) -> Result<i64> {
     let amount = i128::from(amount);
     if let Some(len) = unit.fixed_ms() {
@@ -877,12 +998,12 @@ fn add_units(start: i64, unit: Unit, amount: i64, zone: &Zone, op: &str) -> Resu
                 return Err(overflow(op));
             }
             let day = p.day.min(days_in_month(year, month));
-            i128::from(days_from_civil(year, month, day))
+            days_from_civil_wide(year, month, day)
         }
     };
     let local = local_days * i128::from(DAY_MS) + i128::from(tod);
     let local = i64::try_from(local).map_err(|_| overflow(op))?;
-    Ok(zone.local_to_utc(local))
+    Ok(zone.local_to_utc_keeping(local, p.offset))
 }
 
 /// The UTC instant `amount` calendar or elapsed `unit`s after `start`, for the stages
@@ -913,22 +1034,23 @@ pub(crate) fn unit_millis(unit: &str) -> Option<i64> {
 }
 
 /// The number of unit boundaries crossed going from `start` to `end`.
-fn diff_units(start: i64, end: i64, unit: Unit, zone: &Zone, week_start: i64) -> i64 {
+fn diff_units(start: i64, end: i64, unit: Unit, zone: &Zone, week_start: i64) -> Result<i64> {
     if let Some(len) = unit.fixed_ms() {
         // Boundaries of the zone's own hour, minute...: truncate both ends.
-        let a = trunc_fixed(start, len, 1, zone);
-        let b = trunc_fixed(end, len, 1, zone);
-        return (b - a) / len;
+        let a = floor_in_zone(start, len, zone).ok_or_else(|| overflow("$dateDiff"))?;
+        let b = floor_in_zone(end, len, zone).ok_or_else(|| overflow("$dateDiff"))?;
+        return i64::try_from((i128::from(b) - i128::from(a)) / i128::from(len))
+            .map_err(|_| overflow("$dateDiff"));
     }
     let a = Parts::of(zone, start);
     let b = Parts::of(zone, end);
-    match unit {
+    Ok(match unit {
         Unit::Year => b.year - a.year,
         Unit::Quarter => (b.year - a.year) * 4 + (b.month - 1) / 3 - (a.month - 1) / 3,
         Unit::Month => (b.year - a.year) * 12 + b.month - a.month,
         Unit::Week => (week_start_day(b.days, week_start) - week_start_day(a.days, week_start)) / 7,
         _ => b.days - a.days,
-    }
+    })
 }
 
 /// The day number of the start of the week containing `days`.
@@ -936,43 +1058,95 @@ fn week_start_day(days: i64, week_start: i64) -> i64 {
     days - (dow_sunday0(days) - week_start).rem_euclid(7)
 }
 
-/// Truncate to a bin of `bin` fixed-length units counted from local
-/// 2000-01-01T00:00:00, keeping the instant's own offset (so the second
-/// occurrence of a repeated hour truncates to the second).
-fn trunc_fixed(utc: i64, len: i64, bin: i64, zone: &Zone) -> i64 {
-    let offset = i64::from(zone.offset_at(utc)) * 1000;
-    let local = utc.saturating_add(offset);
-    let origin = DAYS_TO_2000 * DAY_MS;
-    let size = len.saturating_mul(bin);
-    let into = (local - origin).rem_euclid(size);
-    utc - into
+/// The start of the zone's own `len`-millisecond unit that holds `utc`, read
+/// with the offset in force at that instant (so the second occurrence of a
+/// repeated hour truncates to the second, and a half-hour zone has half-hour
+/// hours). `$dateDiff` counts these boundaries. `None` when the start does not
+/// fit a date.
+fn floor_in_zone(utc: i64, len: i64, zone: &Zone) -> Option<i64> {
+    let local = i128::from(utc) + i128::from(zone.offset_at(utc)) * 1000;
+    let origin = i128::from(DAYS_TO_2000) * i128::from(DAY_MS);
+    let into = (local - origin).rem_euclid(i128::from(len));
+    i64::try_from(i128::from(utc) - into).ok()
 }
 
-fn trunc_units(date: i64, unit: Unit, bin: i64, zone: &Zone, week_start: i64) -> i64 {
+/// `$dateTrunc` to a bin of `bin` fixed-length units. The bins are cut in UTC
+/// from one origin: the instant at which the zone's clock read 2000-01-01
+/// 00:00:00, with the offset it had then. A zone whose offset has changed since
+/// (daylight saving, a new law) therefore has bins that are not aligned to the
+/// local hour unless the bin divides the change. `None` when the bin, or the
+/// instant it starts at, does not fit a date.
+fn trunc_bins(utc: i64, len: i64, bin: i64, zone: &Zone) -> Option<i64> {
+    let size = i128::from(len) * i128::from(bin);
+    if size > i128::from(i64::MAX) {
+        return None;
+    }
+    let origin = zone.local_to_utc(DAYS_TO_2000 * DAY_MS);
+    let into = (i128::from(utc) - i128::from(origin)).rem_euclid(size);
+    i64::try_from(i128::from(utc) - into).ok()
+}
+
+/// The largest `binSize` of a calendar unit: the number of the unit, counted
+/// with its shortest length, that a 64-bit millisecond count holds. The reference
+/// refuses a larger bin as an unsupported `binSize` (day bins of 1e11 answer and
+/// 2e11 are refused, and a year bin of 1e8 answers and 3e8 is refused).
+fn most_bins(unit: Unit) -> i128 {
+    let span = i128::from(i64::MAX);
+    let shortest_ms = match unit {
+        Unit::Year => 365 * DAY_MS,
+        Unit::Quarter => 90 * DAY_MS,
+        Unit::Month => 28 * DAY_MS,
+        Unit::Week => 7 * DAY_MS,
+        _ => DAY_MS,
+    };
+    span / i128::from(shortest_ms)
+}
+
+fn trunc_units(date: i64, unit: Unit, bin: i64, zone: &Zone, week_start: i64) -> Result<i64> {
+    let overflowed = || Error::InvalidQuery("dateTrunc overflowed".to_string());
     if let Some(len) = unit.fixed_ms() {
-        return trunc_fixed(date, len, bin, zone);
+        return trunc_bins(date, len, bin, zone).ok_or_else(overflowed);
+    }
+    let unsupported = || Error::InvalidQuery("dateTrunc unsupported binSize value".to_string());
+    let bin = i128::from(bin);
+    if bin > most_bins(unit) {
+        return Err(unsupported());
     }
     let p = Parts::of(zone, date);
-    let floor_bin = |n: i64| n.div_euclid(bin) * bin;
-    let days = match unit {
-        Unit::Year => days_from_civil(floor_bin(p.year - 2000) + 2000, 1, 1),
+    // Every figure below is bounded by the check above (a year is within 3e8 of
+    // 2000 and a bin within 2e11), so the wide sums cannot overflow.
+    let floor_bin = |n: i128| n.div_euclid(bin) * bin;
+    let year_of = |n: i128| i64::try_from(n).map_err(|_| unsupported());
+    let days: i128 = match unit {
+        Unit::Year => {
+            let y = 2000 + floor_bin(i128::from(p.year) - 2000);
+            days_from_civil_wide(year_of(y)?, 1, 1)
+        }
         Unit::Quarter => {
-            let q = floor_bin((p.year - 2000) * 4 + (p.month - 1) / 3);
-            days_from_civil(2000 + q.div_euclid(4), q.rem_euclid(4) * 3 + 1, 1)
+            let q = floor_bin((i128::from(p.year) - 2000) * 4 + i128::from((p.month - 1) / 3));
+            let y = 2000 + q.div_euclid(4);
+            days_from_civil_wide(year_of(y)?, (q.rem_euclid(4) * 3 + 1) as i64, 1)
         }
         Unit::Month => {
-            let m = floor_bin((p.year - 2000) * 12 + p.month - 1);
-            days_from_civil(2000 + m.div_euclid(12), m.rem_euclid(12) + 1, 1)
+            let m = floor_bin((i128::from(p.year) - 2000) * 12 + i128::from(p.month - 1));
+            let y = 2000 + m.div_euclid(12);
+            days_from_civil_wide(year_of(y)?, (m.rem_euclid(12) + 1) as i64, 1)
         }
         Unit::Week => {
             // Bins count from the first `startOfWeek` day on or after 2000-01-01.
-            let origin = DAYS_TO_2000 + (week_start - dow_sunday0(DAYS_TO_2000)).rem_euclid(7);
-            let start = week_start_day(p.days, week_start);
-            origin + (start - origin).div_euclid(7 * bin) * 7 * bin
+            let origin =
+                i128::from(DAYS_TO_2000 + (week_start - dow_sunday0(DAYS_TO_2000)).rem_euclid(7));
+            let start = i128::from(week_start_day(p.days, week_start));
+            let width = 7 * bin;
+            origin + (start - origin).div_euclid(width) * width
         }
-        _ => DAYS_TO_2000 + (p.days - DAYS_TO_2000).div_euclid(bin) * bin,
+        _ => {
+            let origin = i128::from(DAYS_TO_2000);
+            origin + (i128::from(p.days) - origin).div_euclid(bin) * bin
+        }
     };
-    zone.local_to_utc(days.saturating_mul(DAY_MS))
+    let local = i64::try_from(days * i128::from(DAY_MS)).map_err(|_| overflowed())?;
+    Ok(zone.local_to_utc(local))
 }
 
 // ---------------------------------------------------------------------------
@@ -981,31 +1155,16 @@ fn trunc_units(date: i64, unit: Unit, bin: i64, zone: &Zone, week_start: i64) ->
 
 /// Whether a specifier is one `$dateToString` / `$dateFromString` takes.
 fn check_format(kind: Kind, format: &str) -> Result<()> {
-    let op = kind.name();
-    let allowed: &str = if kind == Kind::ToString { "YmdHMSLjwUVGuzZ%" } else { "dGHjLmMSuVYzZ%" };
+    let allowed: &str = if kind == Kind::ToString { "YmdHMSLjwUVGuzZ%" } else { "dGHLmMSuVYzZ%" };
     let mut chars = format.chars();
-    let mut seen = String::new();
     while let Some(c) = chars.next() {
         if c != '%' {
             continue;
         }
         match chars.next() {
-            Some(s) if allowed.contains(s) => seen.push(s),
+            Some(s) if allowed.contains(s) => {}
             Some(s) => return err(format!("Invalid format character '%{s}' in format string")),
             None => return err("Unmatched '%' at end of format string".to_string()),
-        }
-    }
-    if kind == Kind::FromString {
-        if seen.contains(['G', 'V', 'u']) && seen.contains(['Y', 'm', 'd', 'j']) {
-            return err(format!(
-                "{op}: format cannot mix ISO week date and calendar date specifiers"
-            ));
-        }
-        if seen.contains('z') && seen.contains('Z') {
-            return err(format!("{op}: format cannot hold both %z and %Z"));
-        }
-        if seen.contains('j') && seen.contains(['m', 'd']) {
-            return err(format!("{op}: format cannot hold %j with %m or %d"));
         }
     }
     Ok(())
@@ -1054,10 +1213,9 @@ fn format_parts(format: &str, p: &Parts) -> Result<String> {
                     mins % 60
                 )
             }
-            Some('Z') => {
-                let mins = i64::from(p.offset.abs()) / 60;
-                write!(out, "{}{}", if p.offset < 0 { '-' } else { '+' }, mins)
-            }
+            // Signed whole minutes, with no `+` for an offset east of UTC or none:
+            // `330`, `0`, `-240`.
+            Some('Z') => write!(out, "{}", p.offset / 60),
             Some('%') => {
                 out.push('%');
                 Ok(())
@@ -1080,7 +1238,6 @@ struct Read {
     year: Option<i64>,
     month: Option<i64>,
     day: Option<i64>,
-    yday: Option<i64>,
     iso_year: Option<i64>,
     iso_week: Option<i64>,
     iso_dow: Option<i64>,
@@ -1163,7 +1320,6 @@ fn parse_with_format(text: &str, format: &str) -> Result<Read> {
             Some('d') => r.day = Some(cur.digits(2, "day of month")?),
             Some('G') => r.iso_year = Some(cur.digits(4, "ISO week year")?),
             Some('H') => r.hour = Some(cur.digits(2, "hour")?),
-            Some('j') => r.yday = Some(cur.digits(3, "day of year")?),
             Some('L') => r.milli = Some(cur.digits(3, "millisecond")?),
             Some('m') => r.month = Some(cur.digits(2, "month")?),
             Some('M') => r.minute = Some(cur.digits(2, "minute")?),
@@ -1228,7 +1384,7 @@ fn parse_iso_text(text: &str) -> Result<Read> {
         r.minute = Some(cur.digits(2, "minute")?);
         if cur.eat(b':') {
             r.second = Some(cur.digits(2, "second")?);
-            if cur.eat(b'.') || cur.eat(b',') {
+            if cur.eat(b'.') {
                 let start = cur.pos;
                 while cur.peek().is_some_and(|b| b.is_ascii_digit()) {
                     cur.pos += 1;
@@ -1270,6 +1426,23 @@ fn parse_string(text: &str, format: Option<&str>, zone: &Zone, explicit_zone: bo
         Some(f) => parse_with_format(text, f)?,
         None => parse_iso_text(text)?,
     };
+    // A format has to give a whole date: the natural fields need the year, the
+    // month and the day, the ISO ones the year (the week and the day default).
+    // Time fields alone, or a date missing a field, are the reference's
+    // "incomplete date/time string" and not a date at the epoch.
+    let iso_fields = r.iso_year.is_some() || r.iso_week.is_some() || r.iso_dow.is_some();
+    if !iso_fields && !(r.year.is_some() && r.month.is_some() && r.day.is_some()) {
+        return err(format!(
+            "an incomplete date/time string has been found, with elements missing: \"{text}\""
+        ));
+    }
+    // ISO week-date fields and calendar ones do not mix. The reference finds this
+    // while reading the string, so it is a conversion error that `onError` takes.
+    if iso_fields && (r.year.is_some() || r.month.is_some() || r.day.is_some()) {
+        return err(format!(
+            "Error parsing date string '{text}'; Mixing of ISO dates with natural dates is not allowed"
+        ));
+    }
     if r.offset.is_some() && explicit_zone {
         return err(format!(
             "you cannot pass in a date/time string with time zone information ('{text}') \
@@ -1286,8 +1459,7 @@ fn parse_string(text: &str, format: Option<&str>, zone: &Zone, explicit_zone: bo
         return bad("The parsed time was invalid");
     }
 
-    let iso_used = r.iso_year.is_some() || r.iso_week.is_some() || r.iso_dow.is_some();
-    let days = if iso_used {
+    let days = if iso_fields {
         let Some(iy) = r.iso_year else {
             return bad(
                 "an incomplete date/time string has been found, with elements missing: ISO week requires %G",
@@ -1303,17 +1475,9 @@ fn parse_string(text: &str, format: Option<&str>, zone: &Zone, explicit_zone: bo
             return bad("The parsed ISO week was invalid");
         }
         iso_week1_monday(iy) + (w - 1) * 7 + (d - 1)
-    } else if let Some(yd) = r.yday {
-        let y = r.year.unwrap_or(1970);
-        let n = if is_leap(y) { 366 } else { 365 };
-        if !(1..=n).contains(&yd) {
-            return bad("The parsed day of year was invalid");
-        }
-        days_from_civil(y, 1, 1) + yd - 1
     } else {
-        let y = r.year.unwrap_or(1970);
-        let m = r.month.unwrap_or(1);
-        let d = r.day.unwrap_or(1);
+        // The three are all present: the check above refused anything else.
+        let (y, m, d) = (r.year.unwrap_or(0), r.month.unwrap_or(0), r.day.unwrap_or(0));
         if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
             return bad("The parsed date was invalid");
         }
