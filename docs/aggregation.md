@@ -25,12 +25,18 @@ can answer it, which only a *leading* `$match` gets (see
 | `$project` | The same [projection language](query-language.md#sort-and-projection) as `find`, a path through an array included, **plus computed fields**. Below |
 | `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
+| `$replaceWith` | `{$replaceWith: <expression>}` — `$replaceRoot` with the expression given directly; same semantics and errors. [Below](#replacewith) |
+| `$unset` | `{$unset: "path"}` or `{$unset: ["a", "b.c"]}` — a `$project` that excludes those paths. [Below](#unset) |
 | `$sort` | The same [sort language](query-language.md#sort-and-projection), down to which element a key through an array reads. [Blocking](#the-memory-limit) |
 | `$skip`, `$limit` | Non-negative whole numbers |
 | `$unwind` | One output document per array element. Below |
 | `$group` | [Blocking](#the-memory-limit). **One row per distinct key**, so an empty input produces no rows at all. Accumulators below |
 | `$count` | `{$count: "name"}` — a document holding the count, **always**: over an empty input it is one document holding `0`, not no document. [Blocking](#the-memory-limit) |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
+| `$unionWith` | Append another collection's documents, through a sub-pipeline if given, after the input. **Authorized separately**. [Below](#unionwith) |
+| `$sortByCount` | `$group` by an expression, counting, then `$sort` by the count, largest first. [Blocking](#the-memory-limit). [Below](#sortbycount) |
+| `$sample` | `{$sample: {size: N}}` — `N` documents chosen at random. [Blocking](#the-memory-limit). [Below](#sample) |
+| `$redact` | Keep, prune or descend into each document and each embedded document by an expression that answers `$$KEEP`, `$$PRUNE` or `$$DESCEND`. [Below](#redact) |
 | `$bucket`, `$bucketAuto` | A histogram: documents counted into ranges you give, or into about equal parts. [Blocking](#the-memory-limit). Below |
 | `$facet` | Several sub-pipelines over the same input, answered as **one document** of arrays. Below |
 | `$graphLookup` | Walk another collection (or the same one) link by link from each document, to a depth you give. **Authorized separately**. Below |
@@ -112,7 +118,8 @@ equality join.
   foreign scan. (Other systems leave the order unspecified; sort the array if you rely
   on it.) A key not listed above is `400`.
 - Run inside a `$facet` and a `$lookup` sub-pipeline like any stage. `from` needs read
-  access, like a `$lookup`'s.
+  access, like a `$lookup`'s. A `from` that does not exist reads as empty on a node with no peers, and
+  is a `404` with a retry hint on a node with peers, as for `$lookup`.
 
 ### `$bucket` and `$bucketAuto`
 
@@ -206,6 +213,135 @@ rows). Over an empty input every facet runs over nothing: `$count` still answers
   finished are held, up to the limits above; put the `$match` that narrows the input
   before the `$facet`.
 
+### `$sortByCount`
+
+```json
+{ "$sortByCount": "$category" }
+```
+
+is `{$group: {_id: "$category", count: {$sum: 1}}}` followed by `{$sort: {count: -1}}`
+([ADR-263](decisions.md)): one document per distinct value, `{_id, count}`, the commonest
+first. The operand is a field path (`"$category"`, `"$$ROOT"`) or an expression document
+whose first key is an operator, such as `{$toUpper: "$category"}`. Refused, `400`, in the
+reference's words: a number, a boolean, an array or `null` (`the sortByCount field must be
+specified as a string or as an object`); a string that is not a path, an empty document and
+a document that is not an operator expression such as `{who: "$k"}` (`must be defined as a
+$-prefixed path or an expression inside an object`); and `"$"` alone. A missing field and
+`null` are one group, `_id: null`. **`count` is an int** (a long only past 2^31-1), as the
+reference's is, where `$group`'s `{$sum: 1}` is a long in this build. **The order of equal
+counts is unspecified**, as it is in the reference (two runs of it differ): this build
+happens to keep the order each value was first seen, and that is not a promise. Blocking, and one group per distinct value counts against the pipeline's
+document limit like `$group`.
+
+### `$replaceWith`
+
+`{$replaceWith: "$address"}` is `{$replaceRoot: {newRoot: "$address"}}`
+([ADR-263](decisions.md)): the expression's value becomes the document, and a value that
+is not a document (including a missing field) is `400`, `$replaceRoot needs a document`.
+`{$replaceWith: {$mergeObjects: [{country: "unknown"}, "$address"]}}` gives a document
+default.
+
+### `$unset`
+
+`$addFields`/`$set`, `$project`/`$unset` and `$replaceRoot`/`$replaceWith` are also
+the three stages an [update written as an array](query-language.md#pipeline-updates)
+may use, which run them over each document it updates.
+
+`{$unset: "secret"}` removes one field, `{$unset: ["a", "b.c", "items.price"]}` several;
+it is `{$project: {a: 0, "b.c": 0, ...}}` ([ADR-263](decisions.md)), so a dotted path
+removes the field in the embedded document and a path through an array removes it from
+every element that has it. `_id` may be unset. A path that is not there is nothing to do.
+Refused, `400`: an empty array, an element that is not a string, an empty path, a path
+with an empty part or a part starting with `$`, the same path twice, and a path inside
+another (`"a"` with `"a.b"`).
+
+### `$sample`
+
+```json
+{ "$sample": { "size": 5 } }
+```
+
+returns `size` documents chosen at random from the input, each document at most once and
+every set of `size` equally likely ([ADR-263](decisions.md)). `size` is a number: a double
+**truncates toward zero** (`1.5` is `1`), a decimal **rounds half to even** (`2.5` is `2`),
+**`0` and `NaN` answer no documents**, and a `size` over the input is the whole input. A
+negative (`size argument to $sample must not be negative`), a value that is not a number
+(`must be a number`), a missing `size` and any other key (there is no seed) are `400`.
+**The answer is in a random order**, `size` over the input included, so `{$sample: {size:
+<large>}}` shuffles, and a `$limit` after it picks at random.
+
+`$sample` takes the documents the pipeline holds, a reservoir over them, so **a collection
+of more than 100,000 documents cannot be sampled**: that is the pipeline's document limit,
+which holds on the input of every pipeline, `$sample` included, and is `400` naming the
+source (narrow it with a leading `$match`). It has no byte cap of its own. The random source
+is the operating system's, seeded afresh for every run.
+
+### `$redact`
+
+```json
+{ "$redact": { "$cond": { "if":   { "$gt": [ { "$size": { "$setIntersection": [ "$tags", ["STLW", "G"] ] } }, 0 ] },
+                          "then": "$$DESCEND",
+                          "else": "$$PRUNE" } } }
+```
+
+decides each document, and then each embedded document below it, by what the expression
+answers ([ADR-263](decisions.md)). Fields are read from the level being decided (`$$CURRENT`),
+and `$$ROOT` is always the top document.
+
+| Answer | Effect |
+|---|---|
+| `$$KEEP` | The level is kept whole; nothing below it is looked at |
+| `$$PRUNE` | The level is left out. At the top that drops the document |
+| `$$DESCEND` | The level is kept; each document among its fields, and among the elements of its arrays (an array inside an array included), is decided in turn |
+
+An array element that is not a document or an array is kept. A document pruned from an
+array is dropped from it, leaving the array empty if that was all it held. **Any other
+answer is `400`**: `$redact's expression must answer $$DESCEND, $$PRUNE or $$KEEP`.
+
+The three names are variables **only inside a `$redact` expression**; anywhere else
+(`$project`, `$match`'s `$expr`, ...) they are refused, `unsupported operator "$$PRUNE":
+Use of undefined variable: PRUNE ($$DESCEND, $$PRUNE and $$KEEP are valid only inside a
+$redact expression; ...)`, which starts with the reference's own words. Their values are the strings `"descend"`,
+`"prune"` and `"keep"`, as in the reference, so an expression that answers one of those
+strings has the same effect. `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META` are
+**refused** everywhere, by name. `$cond` takes both its forms, the array
+`[if, then, else]` and the named `{if, then, else}`.
+
+### `$unionWith`
+
+```json
+{ "$unionWith": "archive" }
+{ "$unionWith": { "coll": "archive", "pipeline": [ { "$match": { "year": { "$gte": 2020 } } } ] } }
+```
+
+outputs every input document, **then** the documents of `coll` in the pipeline's database,
+run through `pipeline` if there is one ([ADR-263](decisions.md)). It has an answer when the
+input is empty (the other collection's). A `coll` that does not exist reads as empty on a node with no peers; on a node in a cluster it is `404` with the retry hint `elsewhere`, since another member may have just created it. `$lookup` and `$graphLookup` follow the same rule (the [deviations register](deviations.md)).
+The operand is a collection name or `{coll, pipeline}`; a missing `coll` (the reference's
+pipeline-only form, which needs a document source this build does not have), another
+key, a `pipeline` that is not an array of stage documents and an empty name are `400`.
+
+- **Authorized separately**: `read` on the named collection, as for `$lookup`, checked
+  before the collection is looked at, so a denied caller learns nothing about whether it
+  exists (`403`). The plan (`explain`) is checked the same way.
+- **The sub-pipeline** may use any stage but `$out`, `$merge` and `$vectorSearch` (`400`
+  at parse, at any depth under it); a `$facet` (answering one document appended after the
+  input, `{f: [...]}`; its own caps apply), a `$unionWith`, `$lookup` and `$graphLookup`
+  in it are fine, a `$facet` inside that `$facet` is not. A `$lookup` `let` name is
+  readable in it.
+- **Bounded, and refused when over, never cut short.** The collection is read whole, in
+  one walk, as a `$lookup`'s foreign collection is. A leading `$match` of the sub-pipeline
+  is applied as it is read, so what it declines is not held or counted. The documents that
+  reach the sub-pipeline are refused past the pipeline's document limit (100,000), `400`,
+  at the first one over, and the input plus what is appended counts against it too. **What
+  is scanned is not charged in bytes**: a 20 MB collection that its sub-pipeline projects
+  down to a few KB is answered. The documents the stage **appends** (what it holds and
+  answers) are held to 16 MiB, `413`, at the document that passes it; end the sub-pipeline
+  with a `$project` or a `$limit` to answer less.
+- **It may not read what the pipeline writes**: a `$unionWith` of the `$merge` or `$out`
+  target, at any depth of sub-pipeline, is `400` before anything is read.
+- Run inside a `$facet`, a `$lookup` sub-pipeline and another `$unionWith` like any stage.
+
 ### `$merge`
 
 ```json
@@ -249,8 +385,8 @@ and writes nothing. `commits` is the write transactions that committed something
 - **Last stage only.** In any other position, and inside a `$facet` or a `$lookup`
   sub-pipeline, it is `400` at parse.
 - **It may not write a collection the pipeline reads**: the source, and every
-  `$lookup` and `$graphLookup` collection, nested sub-pipelines and `$facet` branches
-  included, compared by database and collection. `400`, before anything is read. A
+  `$lookup`, `$graphLookup` and `$unionWith` collection, nested sub-pipelines and `$facet`
+  branches included, compared by database and collection. `400`, before anything is read. A
   pipeline that reads what it writes has no answer, because every stage reads storage
   when it runs.
 - **Permissions.** `read` on the source and on every collection it joins, as for any
@@ -514,7 +650,7 @@ field path.
 | Arithmetic | `$add` `$subtract` `$multiply` `$divide` `$mod` |
 | Math | `$abs` `$ceil` `$floor` `$round` `$trunc` `$pow` `$sqrt` `$exp` `$ln` `$log10` — see [Math](#math) |
 | Strings | `$concat` `$toUpper` `$toLower` `$substr` (`$substrCP`) `$split` `$strLenCP` — and, see [Strings](#strings): `$trim` `$ltrim` `$rtrim` `$indexOfCP` `$indexOfBytes` `$regexMatch` `$regexFind` `$regexFindAll` `$replaceOne` `$replaceAll` `$strcasecmp` `$strLenBytes` `$substrBytes` |
-| Conditional | `$cond` `$ifNull` `$switch` |
+| Conditional | `$cond` (both `[if, then, else]` and `{if, then, else}`) `$ifNull` `$switch` |
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
 | Boolean | `$and` `$or` `$not` |
 | Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$millisecond` `$dayOfWeek` `$dayOfYear` `$week` `$isoWeek` `$isoWeekYear` `$isoDayOfWeek` `$dateToString` `$dateFromString` `$dateFromParts` `$dateToParts` `$dateAdd` `$dateSubtract` `$dateDiff` `$dateTrunc` — each takes a `timezone`; see [Dates and time zones](#dates-and-time-zones) |
@@ -926,9 +1062,11 @@ the same way, and the outer binding is back once the inner construct closes.
 **An unknown variable is a parse error, not null.** `$$this` outside anything
 that binds it, `$$order` where the `let` said `oid`, or a typo in either, is
 refused before a single document is read. Reading it as a field called `$this`
-would silently yield null in every row. MongoDB's other system variables —
-`$$DESCEND`, `$$PRUNE` and `$$KEEP` — are refused with a message that says they
-are unsupported rather than misspelled.
+would silently yield null in every row. The other
+system variables are refused with a message that says they are unsupported rather than
+misspelled: `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META` anywhere, and
+`$$DESCEND`, `$$PRUNE` and `$$KEEP` everywhere but inside a [`$redact`](#redact)
+expression, where they are the three answers it takes.
 
 **`$$NOW` is one date for the whole request.** The pipeline is parsed once, on
 the member that runs it, and every `$$NOW` in it is the wall-clock time of that
@@ -940,6 +1078,15 @@ apart disagree, as any two clocks do. `$$NOW.path` is refused: a date has no
 fields. `$$NOW` is a value in an expression; a `$match` takes it through
 `$expr`, `{$expr: {$lt: ["$expires", "$$NOW"]}}`, because the filter language
 has no variables.
+
+**A missing field path leaves a field out too.** As the value of a field in
+`$project`, `$addFields`/`$set` or an object expression, a path that finds nothing
+(`"$nope"`, `"$$ROOT.nope"`, `"$o.nope"`) is a missing value, not `null`: the field is
+not added, and an existing field of that name is removed (`{$set: {p: "$nope"}}` over
+`{p: 5}` gives `{}`), as in the reference. Inside an array it is `null`
+(`["$nope", 2]` is `[null, 2]`), and every operator reads it as `null`
+(`{$ifNull: ["$nope", 1]}` is `1`); a field that is there and holds `null` is stored as
+`null`.
 
 **`$$REMOVE` leaves a field out.** As the value of a field in `$project` or
 `$addFields`, or in a document an expression builds, it drops that field, and in
@@ -1530,6 +1677,12 @@ denial, so a pipeline cannot be used to probe which collections exist. Without
 that check a join would be a privilege escalation shaped like a query, routing
 around the single authorization point ([ADR-024](decisions.md)).
 
+**A `from` that does not exist reads as empty** (`as` is `[]` for every document) on a node
+with no peers, as the reference answers. On a node **with peers** it is a `404` with the
+retry hint `elsewhere`, since the collection may have been created through another member
+and not have arrived yet; the check for `read` comes first in both cases. `$graphLookup` and
+`$unionWith` follow the same rule ([deviations register](deviations.md)).
+
 **The foreign collection is scanned once**, not once per input document. A
 per-document join is O(n·m), which on any real pair of collections is the
 difference between a query and an outage.
@@ -1818,7 +1971,7 @@ examined or read.
 
 ## The memory limit
 
-`$group`, `$sort` and `$count` are **blocking**: none of them can emit anything
+`$group`, `$sort`, `$count`, `$sortByCount` and `$sample` are **blocking**: none of them can emit anything
 until it has consumed everything — a sort has no first element until the last
 is seen, a group has no totals until the last member arrives, and a count has
 no number until the last document has gone past. All three work on the whole
@@ -1857,9 +2010,10 @@ documents holding large arrays can exceed the cap long before the stage ends.
 
 | | Why |
 |---|---|
-| System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
+| System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$CLUSTER_TIME`, `$$USER_ROLES`, `$$SEARCH_META`; and `$$DESCEND`, `$$PRUNE`, `$$KEEP` outside a `$redact` | Not built, or valid only inside `$redact`. Refused with a message saying so, rather than as an unknown name |
+| `$unionWith` without a `coll`, and `$out`, `$merge` and `$vectorSearch` inside its sub-pipeline | Refused, `400`. See [`$unionWith`](#unionwith) |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
-| `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |
+| Date arithmetic with a `Decimal128` | Refused, `400` (`$add needs numbers or one date, found a Decimal128`) |
 | `$merge` with `on` other than `_id`, `whenMatched`/`whenNotMatched: "fail"`, a pipeline `whenMatched`, `let`; `$out` into a collection that holds documents, `$out` with `timeseries` | Refused, `400`, each naming what and why. [`$merge`](#merge), [`$out`](#out), and the [deviations register](deviations.md) |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
