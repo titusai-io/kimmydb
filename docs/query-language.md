@@ -919,6 +919,13 @@ silently widening to `f64` — widening loses precision quietly, which is worse
 than failing. So `$inc` and `$mul` do not change a field's type behind the
 caller: `$type: "int"` keeps finding a counter that stays small.
 
+**The aggregation expressions use the same widths** ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)):
+`{$add: ["$n", 1]}` over a 32-bit `n` is a 32-bit integer, widening to a 64-bit
+one on overflow, so a pipeline that stores its result (`$merge`, `$out`) stores
+what `$inc` would. The one difference is the end of the range: a 64-bit overflow
+in an expression is a double, where `$inc` and `$mul` refuse. The widths of every
+expression and accumulator are in [aggregation](aggregation.md#integer-result-widths).
+
 ### Decimal128 arithmetic in updates
 
 `$inc` and `$mul` take a `Decimal128` operand, and a stored `Decimal128`
