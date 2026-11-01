@@ -1373,7 +1373,7 @@ fn integral(ends: &[(usize, usize)], x: &Axis, y: &Inputs, sink: &mut Sink<'_>) 
     // the end, as the reference does: the epoch's milliseconds are never scaled and subtracted.
     let areas: Vec<f64> =
         (1..n).map(|k| x.raw_delta(k - 1, k) * (y.values[k - 1] + y.values[k]) / 2.0).collect();
-    let per = x.per();
+    let unit_len = x.per();
     let mut sum = ExactDoubles::default();
     let (mut a_lo, mut a_hi) = (0usize, 0usize);
     let mut out = Vec::with_capacity(n);
@@ -1399,7 +1399,7 @@ fn integral(ends: &[(usize, usize)], x: &Axis, y: &Inputs, sink: &mut Sink<'_>) 
                 a_lo += 1;
             }
             let total = if sum.overflowed { areas[lo..hi].iter().sum() } else { sum.value() };
-            Bson::Double(total / per)
+            Bson::Double(total / unit_len)
         };
         let v = Some(v);
         sink.charge(&v)?;

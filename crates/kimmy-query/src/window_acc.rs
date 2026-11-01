@@ -453,13 +453,14 @@ impl Slider for QueueSlider<'_, '_> {
     }
 
     fn value(&mut self, _: &[Document], _: usize, _: usize) -> Result<Bson> {
-        let values = self.live.iter().map(|(_, v)| v.clone());
+        // Skip before copying: a window of a hundred thousand is not copied to answer three.
+        let values = self.live.iter();
         Ok(Bson::Array(match self.kind {
-            Queue::Push => values.collect(),
-            Queue::First => values.take(self.n).collect(),
+            Queue::Push => values.map(|(_, v)| v.clone()).collect(),
+            Queue::First => values.take(self.n).map(|(_, v)| v.clone()).collect(),
             Queue::Last => {
                 let skip = self.live.len().saturating_sub(self.n);
-                values.skip(skip).collect()
+                values.skip(skip).map(|(_, v)| v.clone()).collect()
             }
         }))
     }
@@ -710,10 +711,20 @@ impl Slider for BestSlider<'_, '_> {
 // $stdDevPop, $stdDevSamp, $covariancePop, $covarianceSamp
 // ---------------------------------------------------------------------------
 
-/// Removals after which a subtracted deviation is rebuilt from the window, at least this
-/// many and at least as many as the window holds, so a rebuild costs a document per step
-/// on average and the drift of subtracting is bounded.
-const REBUILD_AFTER_REMOVALS: usize = 1024;
+/// Removals after which a subtracted deviation is rebuilt from the window: at least this many
+/// and at least as many as the window holds, so a rebuild costs about a document per step and
+/// the drift of subtracting is bounded to that many steps.
+const REBUILD_AFTER_REMOVALS: usize = 32;
+
+/// A window of this many documents or fewer is rebuilt at every step that removed one: it costs
+/// no more than this many, and a deviation of equal values is exactly zero.
+const SMALL_WINDOW: usize = 16;
+
+/// Whether a state that has taken `removals` documents out of a window of `held` should be
+/// rebuilt from it.
+fn rebuild_due(removals: usize, held: usize) -> bool {
+    removals > 0 && (held <= SMALL_WINDOW || removals >= REBUILD_AFTER_REMOVALS.max(held))
+}
 
 /// `$stdDevPop` and `$stdDevSamp`. A non-finite value is counted, not folded in, so none
 /// can leave a mean that is NaN for good behind it.
@@ -722,6 +733,9 @@ pub(crate) struct StdDevSlider<'a, 'v> {
     pub(crate) sample: bool,
     pub(crate) vars: &'a [Binding<'v>],
     w: Welford,
+    /// The first value taken since the state was last started, taken off every value so the
+    /// running sums are of the spread and not of the offset.
+    pivot: Option<f64>,
     nonfinite: usize,
     removals: usize,
     lo: usize,
@@ -735,6 +749,7 @@ impl<'a, 'v> StdDevSlider<'a, 'v> {
             sample,
             vars,
             w: Welford::default(),
+            pivot: None,
             nonfinite: 0,
             removals: 0,
             lo: 0,
@@ -750,7 +765,10 @@ impl<'a, 'v> StdDevSlider<'a, 'v> {
 impl Slider for StdDevSlider<'_, '_> {
     fn add(&mut self, i: usize, docs: &[Document]) -> Result<()> {
         match self.number(i, docs)? {
-            Some(x) if x.is_finite() => self.w.add(x),
+            Some(x) if x.is_finite() => {
+                let pivot = *self.pivot.get_or_insert(x);
+                self.w.add(x - pivot);
+            }
             Some(_) => self.nonfinite += 1,
             None => {}
         }
@@ -761,7 +779,7 @@ impl Slider for StdDevSlider<'_, '_> {
     fn remove(&mut self, i: usize, docs: &[Document]) -> Result<()> {
         match self.number(i, docs)? {
             Some(x) if x.is_finite() => {
-                self.w.remove(x);
+                self.w.remove(x - self.pivot.unwrap_or(x));
                 self.removals += 1;
             }
             Some(_) => self.nonfinite = self.nonfinite.saturating_sub(1),
@@ -773,6 +791,7 @@ impl Slider for StdDevSlider<'_, '_> {
 
     fn reset(&mut self, at: usize) {
         self.w = Welford::default();
+        self.pivot = None;
         self.nonfinite = 0;
         self.removals = 0;
         self.lo = at;
@@ -780,14 +799,16 @@ impl Slider for StdDevSlider<'_, '_> {
     }
 
     fn value(&mut self, docs: &[Document], _: usize, _: usize) -> Result<Bson> {
-        if self.removals >= REBUILD_AFTER_REMOVALS.max(self.hi - self.lo) {
+        if rebuild_due(self.removals, self.hi - self.lo) {
             // Subtracting drifts a little each time; start again from the window.
             self.w = Welford::default();
+            self.pivot = None;
             for i in self.lo..self.hi {
                 if let Some(x) = self.number(i, docs)?
                     && x.is_finite()
                 {
-                    self.w.add(x);
+                    let pivot = *self.pivot.get_or_insert(x);
+                    self.w.add(x - pivot);
                 }
             }
             self.removals = 0;
@@ -846,6 +867,7 @@ pub(crate) struct CovSlider<'a, 'v> {
     pub(crate) sample: bool,
     pub(crate) vars: &'a [Binding<'v>],
     m: CoMoment,
+    pivot: Option<(f64, f64)>,
     nonfinite: usize,
     removals: usize,
     lo: usize,
@@ -859,6 +881,7 @@ impl<'a, 'v> CovSlider<'a, 'v> {
             sample,
             vars,
             m: CoMoment::default(),
+            pivot: None,
             nonfinite: 0,
             removals: 0,
             lo: 0,
@@ -876,7 +899,10 @@ impl<'a, 'v> CovSlider<'a, 'v> {
 impl Slider for CovSlider<'_, '_> {
     fn add(&mut self, i: usize, docs: &[Document]) -> Result<()> {
         match self.pair(i, docs)? {
-            Some((x, y)) if x.is_finite() && y.is_finite() => self.m.add(x, y),
+            Some((x, y)) if x.is_finite() && y.is_finite() => {
+                let (px, py) = *self.pivot.get_or_insert((x, y));
+                self.m.add(x - px, y - py);
+            }
             Some(_) => self.nonfinite += 1,
             None => {}
         }
@@ -887,7 +913,8 @@ impl Slider for CovSlider<'_, '_> {
     fn remove(&mut self, i: usize, docs: &[Document]) -> Result<()> {
         match self.pair(i, docs)? {
             Some((x, y)) if x.is_finite() && y.is_finite() => {
-                self.m.remove(x, y);
+                let (px, py) = self.pivot.unwrap_or((x, y));
+                self.m.remove(x - px, y - py);
                 self.removals += 1;
             }
             Some(_) => self.nonfinite = self.nonfinite.saturating_sub(1),
@@ -899,6 +926,7 @@ impl Slider for CovSlider<'_, '_> {
 
     fn reset(&mut self, at: usize) {
         self.m = CoMoment::default();
+        self.pivot = None;
         self.nonfinite = 0;
         self.removals = 0;
         self.lo = at;
@@ -906,14 +934,16 @@ impl Slider for CovSlider<'_, '_> {
     }
 
     fn value(&mut self, docs: &[Document], _: usize, _: usize) -> Result<Bson> {
-        if self.removals >= REBUILD_AFTER_REMOVALS.max(self.hi - self.lo) {
+        if rebuild_due(self.removals, self.hi - self.lo) {
             self.m = CoMoment::default();
+            self.pivot = None;
             for i in self.lo..self.hi {
                 if let Some((x, y)) = self.pair(i, docs)?
                     && x.is_finite()
                     && y.is_finite()
                 {
-                    self.m.add(x, y);
+                    let (px, py) = *self.pivot.get_or_insert((x, y));
+                    self.m.add(x - px, y - py);
                 }
             }
             self.removals = 0;
