@@ -2518,7 +2518,6 @@ fn a_deviation_is_rebuilt_from_a_window_that_has_moved_far_from_where_it_started
 // ---------------------------------------------------------------------------
 
 mod exact_doubles {
-    use super::*;
     use crate::window_acc::ExactDoubles;
 
     fn sum(values: &[f64]) -> f64 {

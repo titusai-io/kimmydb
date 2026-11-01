@@ -189,7 +189,7 @@ fn round_to_double(limbs: &[u32; DIGITS]) -> f64 {
     let half = bits(guard, 1) == 1;
     let below = guard / 32;
     let sticky = limbs[..below].iter().any(|l| *l != 0)
-        || (guard % 32 != 0 && limbs[below] & ((1u32 << (guard % 32)) - 1) != 0);
+        || (!guard.is_multiple_of(32) && limbs[below] & ((1u32 << (guard % 32)) - 1) != 0);
     let mut exponent = highest;
     if half && (sticky || mantissa & 1 == 1) {
         mantissa += 1;
