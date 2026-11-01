@@ -3370,6 +3370,15 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
     }
 
     #[test]
+    fn the_example_file_shows_the_aggregate_defaults() {
+        let example = include_str!("../../../kimmy.example.toml");
+        let cfg: Config = toml::from_str(example).expect("the example parses");
+        assert_eq!(cfg.aggregate, AggregateConfig::default());
+        assert!(example.contains("memory_limit_bytes = 1073741824"));
+        assert!(example.contains("memory_pool_bytes = 2147483648"));
+    }
+
+    #[test]
     fn the_summary_shows_the_aggregate_memory_limits() {
         let summary = Config::default().summary();
         assert!(summary.contains("aggregate=[limit=1073741824B pool=2147483648B]"), "{summary}");

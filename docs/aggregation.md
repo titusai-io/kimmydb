@@ -652,8 +652,9 @@ queue; `$addToSet`, `$top` and its family, `$maxN` and `$minN` an ordered set, O
 values only, with the non-finite ones counted and the state rebuilt from the window every so many
 removals (at once for a window of 16 or fewer) to bound the drift of subtracting. What an answer costs is
 what it holds: a `$push` over a window of `w` documents is an array of `w`. The stage holds every
-document of its input, every sort key it takes and every value it adds against **one byte budget of
-256 MiB for the whole request**, shared by the stages of the pipeline and the branches of a `$facet`,
+document of its input, every sort key it takes and every value it adds against **the request's memory
+budget** (`aggregate.memory_limit_bytes`, 1 GiB; see [The memory limit](#the-memory-limit)), shared with everything
+else the request holds,
 refused `413 answer_too_large` as soon as the running total passes it (a cumulative `$push` whose output is quadratic is
 refused while it is built). Inside a `$facet` and a `$lookup` sub-pipeline like any stage.
 
@@ -2137,10 +2138,45 @@ difference, so a partial answer would be worse than none. It also does not spill
 to disk: a pipeline that cannot run should say so immediately rather than
 becoming slow in a way that is harder to diagnose than a refusal.
 
-`$setWindowFields`, `$densify` and a `$fill` with a method also hold the bytes they buffer to **one budget of
-256 MiB for the whole request**, shared by the stages of the pipeline and the branches of a `$facet` and
-counted as it grows, refused `413` at the first byte over, so a request that would build too much is
-stopped while it builds. `$densify` counts the documents its range would generate before it generates any.
+### What one request may hold, in bytes
+
+The document count above does not bound a pipeline's memory: a thousand documents each given
+an 8 MiB string by `$addFields` are a thousand legal documents and 8 GB. **Everything a request
+holds is charged, in BSON bytes, to one budget of `aggregate.memory_limit_bytes` (1 GiB by default)**
+as it grows, and the request is refused `413 answer_too_large` at the first byte over, naming what held the memory:
+
+| What | Charged | Until |
+|---|---|---|
+| **The source read** | each document the leading `$match` or the scan admits, as it is read; the read stops at the one that passes the limit | the first stage takes the documents (which charges them as its input) |
+| **A stage's input** | the documents it is given | the stage returns |
+| **A stage's output** | `$project`, `$addFields`, `$replaceRoot`, `$unwind`, `$redact` and `$sortByCount` as each document is built (so the peak is input plus output); `$match`, `$sort`, `$limit`, `$skip`, `$count` and `$sample` only move their input and charge nothing more | the stage returns |
+| **`$group`, `$bucket`, `$bucketAuto`** | each bucket when it is made, and what `$push`, `$addToSet`, `$firstN`, `$lastN`, `$top*`, `$bottom*`, `$maxN`, `$minN`, `$mergeObjects`, `$min`, `$max`, `$first` and `$last` keep, as it is kept (a `$top` that drops a row gives its bytes back) | the stage returns |
+| **`$lookup`, `$graphLookup`, `$unionWith`** | the foreign documents read (the read stops at the one that passes the limit), a copy of them for each run of a `$lookup` sub-pipeline (charged before it is made), the arrays attached and the documents appended | the stage returns |
+| **`$facet`** | its input, and a copy of it for each branch but the last (charged before the copy is made); the stages inside a branch charge as any stage does, and each run of a sub-pipeline gives its bytes back when it ends | the stage returns |
+| **`$setWindowFields`, `$densify`, `$fill`** | the documents they buffer, the sort keys they take and the values they add | the stage returns |
+| **The answer** | the output documents and the JSON each becomes (its serialised length), document by document, so an answer that would pass the limit is refused before the rest is built | the request ends |
+
+A stage's input stays charged until it returns, so `$addFields` over 400 MB of documents peaks at
+about 800 MB, and 100,000 documents of 4 KB run at the default. The `413` carries the total held
+and the limit, and says what to do: `add $match, $project or $limit early, or raise aggregate.memory_limit_bytes`.
+`$facet`'s own 16 MiB cap on its answer, and the 16 MiB bound on one string, array or document an
+expression builds, are unchanged: they are per value.
+
+**The node's pool.** Requests also draw on a pool shared by every aggregation on the node,
+`aggregate.memory_pool_bytes` (2 GiB by default): a request reserves from it as its own total
+grows and returns it when it ends, however it ends (an answer, a refusal, the request deadline,
+a panic). A request the pool cannot cover is refused `503 timeout` with `retry: wait` and
+`Retry-After: 1`: it is within its own limit, nothing was done, and the same request is answered when
+the others have finished. Both refusals are counted on `/metrics`
+(`kimmy_aggregate_memory_limit_refusals_total`, `kimmy_aggregate_memory_pool_refusals_total`), and
+the bytes the pool holds now are `kimmy_aggregate_memory_pool_used_bytes`.
+
+**The unit is BSON bytes.** A string is within a few bytes of the memory it takes; a document of
+many small fields takes 10 to 20 times its BSON size as a parsed document, so size the pool with
+that in mind ([Operations](operations.md#aggregation-memory)). The reference streams documents
+through a pipeline and spills its blocking stages to disk; this server holds a pipeline's documents and
+refuses what does not fit (see [Deviations](deviations.md)). Streaming the stages that do not block
+is planned.
 
 `$unwind` is checked *while* it expands, not after, because a handful of
 documents holding large arrays can exceed the cap long before the stage ends.

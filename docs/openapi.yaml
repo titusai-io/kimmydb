@@ -1721,7 +1721,32 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "413":
+          description: |
+            `answer_too_large`: the pipeline holds more than
+            `aggregate.memory_limit_bytes` (1 GiB of BSON by default; ADR-269). The
+            message names what held the memory (the source read, a stage's output, a
+            join, the answer), the bytes held and the limit, and says to add `$match`,
+            `$project` or `$limit` early or to raise the setting. The same code is
+            answered for a `$facet` answer over 16 MiB and for a string, array or
+            document an expression builds over 16 MiB. Nothing was written.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "500": { $ref: "#/components/responses/PartiallyApplied" }
+        "503":
+          description: |
+            `timeout`, `retry: wait`: the node's pool of aggregation memory
+            (`aggregate.memory_pool_bytes`, 2 GiB by default) is held by other
+            requests (ADR-269). The request is within its own limit and nothing was
+            done; the same request is answered when the others have finished.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/db/{db}/coll/{coll}/update:
     parameters:
@@ -3450,7 +3475,7 @@ components:
         | `bad_request` | 400, 422 | no | Malformed filter, update, projection or Extended JSON; a body of the wrong shape; a batch over the cap |
         | `payload_too_large` | 413 | no | Request body over the node's ceiling (`server.max_body_bytes`, 2 MiB by default) |
         | `document_too_large` | 413 | no | A write that would store a document encoding to more than 16 MiB, checked on the result of an insert, bulk, replace, upsert or update. A `multi` update over it in a later chunk is `500 partially_applied` with this code in `cause` |
-        | `answer_too_large` | 413 | no | A query that would build more than a cap allows, and is refused rather than cut short: a `$facet` answer over 16 MiB, a string, array or document an expression builds over its 16 MiB limit, or more than 256 MiB held by the `$setWindowFields`, `$densify` and `$fill` stages of one request. The message names what and the limit. Nothing is written; narrow the query |
+        | `answer_too_large` | 413 | no | A query that would build more than a cap allows, and is refused rather than cut short: a `$facet` answer over 16 MiB, a string, array or document an expression builds over its 16 MiB limit, or more than `aggregate.memory_limit_bytes` (1 GiB of BSON by default) held by one aggregation: the documents it reads, each stage's input and output, the groups and joins it builds, and its answer (ADR-269). The message names what held the memory, the bytes and the limit. Nothing is written; narrow the query |
         | `id_too_large` | 413 | no | An `_id` over 4096 bytes (a string or binary id), in a write or in the path of a route that names one |
         | `validation_failed` | 422 | no | A write that would store a document failing its collection's validator, under `validationAction: error` (ADR-257): insert, bulk (refused whole), replace, upsert, every update, `find_and_modify`, `$merge`, `$out`. The message names the keyword path that failed. Never returned for a replicated write |
         | `unsupported_media_type` | 415 | no | A JSON body without a JSON content type |
@@ -3470,7 +3495,7 @@ components:
         | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
         | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
         | `collection_purging` | 503 | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` |
-        | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster |
+        | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster. Also answered, with `Retry-After: 1`, to an aggregation the node's pool of aggregation memory (`aggregate.memory_pool_bytes`, 2 GiB by default) cannot cover while other requests hold it (ADR-269): the request is within its own limit, nothing was done, and the same request is answered when the others have finished |
         | `outcome_unknown` | 500 | verify | A write reached the storage engine's durability step and then failed: it **may or may not have been applied**, and if it was, it replicates. Read the target back before sending it again, unless the write is idempotent. Details are logged, never returned |
         | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |

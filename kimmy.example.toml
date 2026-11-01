@@ -238,6 +238,31 @@ multi_chunk_docs = 1000
 durability = "durable"
 commit_coalesce_ms = 5
 
+# ---------------------------------------------------------------------------
+# Aggregation memory
+# ---------------------------------------------------------------------------
+#
+# A pipeline holds its documents whole, so one aggregation can hold more than a
+# member has: a thousand documents each given an 8 MiB string by $addFields are
+# 8 GB. Everything a request holds is counted in bytes of BSON: the documents it
+# reads, each stage's input and output while the stage runs, the groups and
+# joined arrays it builds, and its answer.
+[aggregate]
+# The most bytes ONE request may hold at once. Over it the request is refused
+# 413 `answer_too_large`, naming what held the memory. At least 1 MiB.
+#
+# Counted in BSON bytes, which is the memory of a long string and a fraction of
+# the memory of a document of many small fields (10 to 20 times its size as a
+# parsed document): size the pool for that.
+memory_limit_bytes = 1073741824
+
+# The most bytes ALL aggregations on this node may hold together. A request takes
+# from it as it grows and returns it when it ends; one the pool cannot cover is
+# refused 503 `timeout` (`retry: wait`, `Retry-After: 1`) and is answered when
+# the others have finished. At least memory_limit_bytes.
+memory_pool_bytes = 2147483648
+
+
 [auth]
 # Run with no authentication at all. Only permitted when `server.bind` is a
 # loopback address; the server refuses to start otherwise.

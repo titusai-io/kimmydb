@@ -17,6 +17,14 @@ Status meanings:
 
 ---
 
+## 🟡 An aggregation holds its documents and is refused past a memory limit, where the reference streams them and spills to disk
+
+The reference streams documents through a pipeline into 16 MB cursor batches, holds each blocking stage (`$group`, `$sort`, `$bucket`, `$bucketAuto`, `$setWindowFields`) to 100 MB and, since 6.0, spills past it to disk; the same pipeline is constant-memory there. This server runs a stage over a vector of the documents it is given, builds a new vector, and answers one JSON body, so a pipeline holds its documents whole (ADR-269). It therefore **refuses** what does not fit, with `413 answer_too_large` past `aggregate.memory_limit_bytes` (1 GiB of BSON per request by default) and `503` (`retry: wait`) when the node's pool, `aggregate.memory_pool_bytes` (2 GiB), is held by other requests, where the reference answers. The 100,000-document ceiling on a source and a stage's output is unchanged. The unit is BSON bytes, which is the memory of a long string and a fraction of the memory of a document of many small fields, so the limits are bounds proportional to memory and not ceilings on it. The reference's `getMore` is not offered: the answer is one body.
+
+**To close:** stream the stages that do not block (`$match`, `$project`, `$addFields`, `$replaceRoot`, `$unwind`, `$limit`, `$skip`) so that only a blocking stage holds a collection, and answer in cursor batches. Planned for 0.60.0; then the limit applies to blocking stages and the answer's batch, and a pipeline over a large collection with a `$match` and a `$project` runs in constant memory.
+
+---
+
 ## 🟡 `$setWindowFields`, `$densify` and `$fill`: Decimal128 read as doubles, a date `unit` that defaults, a sliding deviation that is NaN, and a few edges
 
 **Raised 2026-10-31, with ADR-264; revised after review.** `$setWindowFields`, `$densify` and `$fill` are built ([aggregation.md](aggregation.md#setwindowfields)). The order of the partitions, `"current"` in a range window, `$expMovingAvg`, `$locf` without a sort, a missing or null `$densify` field, the `$densify` grid and the months' drift, the covariance operators and the documents a window refuses all follow the reference. Where they differ:

@@ -254,3 +254,26 @@ fn the_defaults_are_the_documented_ones_and_each_request_gets_its_own_budget() {
     assert_eq!((a.buffer.used(), b.buffer.used()), (100, 0), "budgets are per request");
     assert_eq!(memory.pool().used(), 100, "and the pool is shared");
 }
+
+#[test]
+fn a_facet_does_not_keep_every_lookup_runs_bytes_charged_until_it_ends() {
+    // The sub-pipeline of this `$lookup` runs once for each of 8 input documents, over the 4
+    // foreign documents of about 10 KB each, and its window stage buffers them each time. Each
+    // run gives its bytes back when it ends, in a `$facet` as outside one; if they were kept
+    // until the facet was done the 8 runs would hold 8 times what one does.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(8, 100), padded(4, 10_000));
+    let lookup = json!({"$lookup": {"from": "users", "pipeline": [
+        {"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"n": {"$documentNumber": {}}}}},
+        {"$project": {"_id": 1}},
+    ], "as": "u"}});
+    let foreign = docs_bytes(&padded(4, 10_000));
+    let cap = 5 * foreign;
+    let outside = run(&state, json!([lookup.clone(), {"$count": "n"}]), capped(cap)).unwrap();
+    assert_eq!(outside["documents"], json!([{"n": 8}]));
+    let facet = json!([{"$facet": {"a": [lookup.clone(), {"$count": "n"}]}}]);
+    let limits = capped(cap);
+    let inside = run(&state, facet.clone(), limits.clone()).unwrap();
+    assert_eq!(inside["documents"], json!([{"a": [{"n": 8}]}]));
+    assert_eq!(limits.buffer.used(), 0);
+}
