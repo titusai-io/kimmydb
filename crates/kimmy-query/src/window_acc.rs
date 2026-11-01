@@ -31,7 +31,7 @@ use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
 
 use crate::accumulators::{Best, Kind, Row, Spec, Welford, numeric, sort_key};
 use crate::aggregate::group_key;
-use crate::expr::{Binding, Expr, Mean, Scope, Total};
+use crate::expr::{Binding, Expr, Scope};
 
 /// Evaluate `expr` against `doc`; a missing field is `null`.
 pub(crate) fn eval(expr: &Expr, doc: &Document, vars: &[Binding<'_>]) -> Result<Bson> {
@@ -63,87 +63,194 @@ pub(crate) trait Slider {
 // An exact sum of doubles
 // ---------------------------------------------------------------------------
 
-/// The exact sum of finite doubles, in non-overlapping partials (Shewchuk), so that a
-/// double can leave by adding its negation, and the total is rounded once.
-#[derive(Clone, Debug, Default)]
+/// How many 32-bit digits the exact sum holds: the 2,098 bits from the smallest subnormal to
+/// past the largest double, and room for a hundred billion of the largest to pile up.
+const DIGITS: usize = 68;
+
+/// The exact sum of finite doubles and integers, as one integer in units of the smallest
+/// subnormal (2^-1074), in 68 digits of 32 bits that are not carried until the sum is read. A
+/// double enters by adding its mantissa to the digits at its exponent and leaves by subtracting
+/// it, so a step is a handful of additions whatever the window holds, however near the largest
+/// double the values are, and however far the sum goes past it and comes back. The sum is
+/// rounded once, to nearest even, when it is read; one that rounds past the largest double is
+/// an infinity.
+#[derive(Clone, Debug)]
 pub(crate) struct ExactDoubles {
-    partials: Vec<f64>,
-    /// A partial overflowed: the total is unreliable until the sum is emptied.
-    pub(crate) overflowed: bool,
+    digits: [i64; DIGITS],
+}
+
+impl Default for ExactDoubles {
+    fn default() -> Self {
+        ExactDoubles { digits: [0; DIGITS] }
+    }
 }
 
 impl ExactDoubles {
+    /// Add `x`, which is finite.
     pub(crate) fn add(&mut self, x: f64) {
-        let mut x = x;
-        let mut kept = 0;
-        for j in 0..self.partials.len() {
-            let mut y = self.partials[j];
-            if x.abs() < y.abs() {
-                std::mem::swap(&mut x, &mut y);
+        debug_assert!(x.is_finite());
+        let bits = x.to_bits();
+        let negative = bits >> 63 == 1;
+        let exponent = ((bits >> 52) & 0x7ff) as u32;
+        let fraction = bits & ((1 << 52) - 1);
+        // A normal number is (2^52 + fraction) * 2^(exponent - 1075); a subnormal is
+        // fraction * 2^-1074. In units of 2^-1074 the shift is `exponent - 1`, or 0.
+        let (mantissa, shift) =
+            if exponent == 0 { (fraction, 0) } else { (fraction | 1 << 52, exponent - 1) };
+        self.add_shifted(u128::from(mantissa), shift, negative);
+    }
+
+    /// Add the integer `n`.
+    fn add_integer(&mut self, n: i128) {
+        self.add_shifted(n.unsigned_abs(), 1074, n < 0);
+    }
+
+    /// Add (or, for `negative`, take away) `magnitude * 2^shift` units.
+    fn add_shifted(&mut self, magnitude: u128, shift: u32, negative: bool) {
+        let mut rest = magnitude;
+        let mut position = shift;
+        while rest != 0 {
+            let digit = (rest & 0xffff_ffff) as u64;
+            let (at, offset) = ((position / 32) as usize, position % 32);
+            let piece = digit << offset;
+            let (low, high) = ((piece & 0xffff_ffff) as i64, (piece >> 32) as i64);
+            if negative {
+                self.digits[at] -= low;
+                self.digits[at + 1] -= high;
+            } else {
+                self.digits[at] += low;
+                self.digits[at + 1] += high;
             }
-            let hi = x + y;
-            if !hi.is_finite() {
-                self.overflowed = true;
-                return;
-            }
-            let lo = y - (hi - x);
-            if lo != 0.0 {
-                self.partials[kept] = lo;
-                kept += 1;
-            }
-            x = hi;
+            rest >>= 32;
+            position += 32;
         }
-        self.partials.truncate(kept);
-        self.partials.push(x);
     }
 
     pub(crate) fn clear(&mut self) {
-        self.partials.clear();
-        self.overflowed = false;
+        self.digits = [0; DIGITS];
     }
 
-    /// The sum rounded once to the nearest double.
+    /// The sum rounded once to the nearest double (ties to even); an infinity past the largest.
     pub(crate) fn value(&self) -> f64 {
-        let p = &self.partials;
-        let mut n = p.len();
-        if n == 0 {
-            return 0.0;
+        // Carry the digits up, into 32-bit digits of the two's complement.
+        let mut limbs = [0u32; DIGITS];
+        let mut carry: i128 = 0;
+        for (limb, digit) in limbs.iter_mut().zip(&self.digits) {
+            let total = i128::from(*digit) + carry;
+            *limb = total.rem_euclid(1 << 32) as u32;
+            carry = total.div_euclid(1 << 32);
         }
-        n -= 1;
-        let mut hi = p[n];
-        let mut lo = 0.0;
-        while n > 0 {
-            let x = hi;
-            n -= 1;
-            let y = p[n];
-            hi = x + y;
-            let yr = hi - x;
-            lo = y - yr;
-            if lo != 0.0 {
-                break;
+        let negative = carry < 0;
+        if carry > 0 {
+            return f64::INFINITY;
+        }
+        if negative {
+            // The magnitude is the two's complement of the digits.
+            let mut up = 1u64;
+            for limb in &mut limbs {
+                let total = u64::from(!*limb) + up;
+                *limb = total as u32;
+                up = total >> 32;
             }
         }
-        // Round half to even when the dropped part is exactly half.
-        if n > 0 && ((lo < 0.0 && p[n - 1] < 0.0) || (lo > 0.0 && p[n - 1] > 0.0)) {
-            let y = lo * 2.0;
-            let x = hi + y;
-            let yr = x - hi;
-            if y == yr {
-                hi = x;
-            }
-        }
-        hi
+        let magnitude = round_to_double(&limbs);
+        if negative { -magnitude } else { magnitude }
     }
 
     /// The sum with the integer `ints` added, rounded once.
     pub(crate) fn value_with(&self, ints: i128) -> f64 {
         let mut all = self.clone();
-        // An integer of up to 2^127 as two doubles that add up to it exactly.
-        let hi = ints as f64;
-        let lo = (ints - hi as i128) as f64;
-        all.add(hi);
-        all.add(lo);
+        all.add_integer(ints);
         all.value()
+    }
+}
+
+/// The non-negative integer in `limbs` (units of 2^-1074) as a double, rounded to nearest even.
+fn round_to_double(limbs: &[u32; DIGITS]) -> f64 {
+    let Some(top) = limbs.iter().rposition(|l| *l != 0) else { return 0.0 };
+    let highest = top * 32 + 31 - limbs[top].leading_zeros() as usize;
+    // `len` bits from bit `from` up.
+    let bits = |from: usize, len: usize| -> u64 {
+        let first = from / 32;
+        let mut window: u128 = 0;
+        for k in 0..4 {
+            if let Some(limb) = limbs.get(first + k) {
+                window |= u128::from(*limb) << (32 * k);
+            }
+        }
+        ((window >> (from % 32)) & ((1u128 << len) - 1)) as u64
+    };
+    if highest < 53 {
+        // Fewer than 53 bits: a subnormal or the smallest normals, exactly.
+        return bits(0, 53) as f64 * f64::from_bits(1);
+    }
+    let mut mantissa = bits(highest - 52, 53);
+    let guard = highest - 53;
+    let half = bits(guard, 1) == 1;
+    let below = guard / 32;
+    let sticky = limbs[..below].iter().any(|l| *l != 0)
+        || (guard % 32 != 0 && limbs[below] & ((1u32 << (guard % 32)) - 1) != 0);
+    let mut exponent = highest;
+    if half && (sticky || mantissa & 1 == 1) {
+        mantissa += 1;
+        if mantissa == 1 << 53 {
+            mantissa >>= 1;
+            exponent += 1;
+        }
+    }
+    // The leading bit at position `p` is 2^(p - 1074): a biased exponent of `p - 51`.
+    let biased = exponent as i64 - 51;
+    if biased >= 2047 {
+        return f64::INFINITY;
+    }
+    f64::from_bits((biased as u64) << 52 | (mantissa & ((1 << 52) - 1)))
+}
+
+/// A sum of doubles that may be NaN or infinite, and that doubles can leave: the finite ones in
+/// an exact sum, the others counted. What `$sum` of the same doubles in a group answers, except
+/// that the finite part is the exact sum rounded once.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DoubleSum {
+    finite: ExactDoubles,
+    nan: usize,
+    pos_inf: usize,
+    neg_inf: usize,
+}
+
+impl DoubleSum {
+    pub(crate) fn apply(&mut self, x: f64, adding: bool) {
+        let step = |n: &mut usize| {
+            if adding {
+                *n += 1;
+            } else {
+                *n = n.saturating_sub(1);
+            }
+        };
+        if x.is_nan() {
+            step(&mut self.nan);
+        } else if x == f64::INFINITY {
+            step(&mut self.pos_inf);
+        } else if x == f64::NEG_INFINITY {
+            step(&mut self.neg_inf);
+        } else {
+            self.finite.add(if adding { x } else { -x });
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = DoubleSum::default();
+    }
+
+    pub(crate) fn value(&self) -> f64 {
+        if self.nan > 0 || (self.pos_inf > 0 && self.neg_inf > 0) {
+            f64::NAN
+        } else if self.pos_inf > 0 {
+            f64::INFINITY
+        } else if self.neg_inf > 0 {
+            f64::NEG_INFINITY
+        } else {
+            self.finite.value()
+        }
     }
 }
 
@@ -294,7 +401,7 @@ impl Slider for SumSlider<'_, '_> {
         self.hi = at;
     }
 
-    fn value(&mut self, docs: &[Document], s: usize, e: usize) -> Result<Bson> {
+    fn value(&mut self, _: &[Document], _: usize, _: usize) -> Result<Bson> {
         if self.dec_n > 0
             && let Some(sum) = &self.dec
         {
@@ -302,22 +409,6 @@ impl Slider for SumSlider<'_, '_> {
             return Ok(Bson::Decimal128(pack_raw(raw)));
         }
         let p = &self.plain;
-        if p.doubles.overflowed {
-            // A total past the range of a double: the group accumulator answers it.
-            return if self.avg {
-                let mut m = Mean::default();
-                for doc in &docs[s..e] {
-                    m.add(&eval(self.expr, doc, self.vars)?);
-                }
-                Ok(m.to_bson())
-            } else {
-                let mut t = Total::default();
-                for doc in &docs[s..e] {
-                    t.add(&eval(self.expr, doc, self.vars)?);
-                }
-                Ok(t.to_bson())
-            };
-        }
         let count = p.count();
         if self.avg && count == 0 {
             return Ok(Bson::Null);

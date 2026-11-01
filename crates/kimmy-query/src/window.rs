@@ -56,8 +56,8 @@ use crate::budget::Lease;
 use crate::expr::{Binding, Expr, add_to_date, as_integer, type_name, unit_millis};
 use crate::shape::{self, SortKey};
 use crate::window_acc::{
-    BestSlider, CovSlider, ExactDoubles, ExtremeSlider, Queue, QueueSlider, RankedSlider,
-    SetSlider, Slider, StdDevSlider, SumSlider, eval, eval_present,
+    BestSlider, CovSlider, DoubleSum, ExtremeSlider, Queue, QueueSlider, RankedSlider, SetSlider,
+    Slider, StdDevSlider, SumSlider, eval, eval_present,
 };
 
 pub use crate::budget::MAX_BUFFER_BYTES;
@@ -247,7 +247,11 @@ pub fn parse(spec: &Document, vars: &[String]) -> Result<WindowSpec> {
     let mut outputs = Vec::with_capacity(output.len());
     for (name, value) in output {
         check_output_name("$setWindowFields", name)?;
-        outputs.push(Output { name: name.clone(), func: parse_output(name, value, &sort, vars)? });
+        let sort_given = spec.contains_key("sortBy");
+        outputs.push(Output {
+            name: name.clone(),
+            func: parse_output(name, value, &sort, sort_given, vars)?,
+        });
     }
     Ok(WindowSpec { stage: "$setWindowFields", partition, sort, outputs })
 }
@@ -262,7 +266,13 @@ fn small_integer(value: &Bson, what: &str) -> Result<i64> {
     Ok(n)
 }
 
-fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> Result<Func> {
+fn parse_output(
+    name: &str,
+    value: &Bson,
+    sort: &[SortKey],
+    sort_given: bool,
+    vars: &[String],
+) -> Result<Func> {
     let Some(spec) = value.as_document() else {
         return bad(format!(
             "$setWindowFields output `{name}` must be a document naming a window operator, found {}",
@@ -370,7 +380,7 @@ fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> 
             let Some(window) = window else {
                 return bad(format!("{op} requires a `window`"));
             };
-            let window = parse_window(op, window, sort)?;
+            let window = parse_window(op, window, sort, sort_given)?;
             let input = Expr::parse_with_vars(&d["input"], vars)?;
             Ok(if op == "$derivative" {
                 Func::Derivative { input, unit, window }
@@ -431,7 +441,7 @@ fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> 
             };
             let window = match window {
                 None => Window::Whole,
-                Some(w) => parse_window(op, w, sort)?,
+                Some(w) => parse_window(op, w, sort, sort_given)?,
             };
             Ok(Func::Covariance { exprs: Box::new(exprs), sample: op == "$covarianceSamp", window })
         }
@@ -444,7 +454,7 @@ fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> 
             let acc = parsed.remove(0).1;
             let window = match window {
                 None => Window::Whole,
-                Some(w) => parse_window(op, w, sort)?,
+                Some(w) => parse_window(op, w, sort, sort_given)?,
             };
             Ok(Func::Acc { acc, window })
         }
@@ -480,7 +490,7 @@ fn argument<'a>(
     Ok(d)
 }
 
-fn parse_window(op: &str, value: &Bson, sort: &[SortKey]) -> Result<Window> {
+fn parse_window(op: &str, value: &Bson, sort: &[SortKey], sort_given: bool) -> Result<Window> {
     let Some(w) = value.as_document() else {
         return bad(format!("{op} `window` must be a document, found {}", type_name(value)));
     };
@@ -524,8 +534,10 @@ fn parse_window(op: &str, value: &Bson, sort: &[SortKey]) -> Result<Window> {
                     "{op} `window` lower bound {l} must not be above the upper bound {h}"
                 ));
             }
-            // A position needs an order to be a position in: only the whole partition does not.
-            if sort.is_empty() && (lo.is_some() || hi.is_some()) {
+            // A position needs an order to be a position in: only the whole partition does
+            // not. A `sortBy` that is there but empty is accepted, as the reference accepts
+            // it: it is no sort, and the positions are those of arrival.
+            if !sort_given && (lo.is_some() || hi.is_some()) {
                 return bad(format!("{op} with a documents window requires a `sortBy`"));
             }
             Ok(Window::Documents(lo, hi))
@@ -1374,7 +1386,7 @@ fn integral(ends: &[(usize, usize)], x: &Axis, y: &Inputs, sink: &mut Sink<'_>) 
     let areas: Vec<f64> =
         (1..n).map(|k| x.raw_delta(k - 1, k) * (y.values[k - 1] + y.values[k]) / 2.0).collect();
     let unit_len = x.per();
-    let mut sum = ExactDoubles::default();
+    let mut sum = DoubleSum::default();
     let (mut a_lo, mut a_hi) = (0usize, 0usize);
     let mut out = Vec::with_capacity(n);
     for &(s, e) in ends {
@@ -1391,15 +1403,14 @@ fn integral(ends: &[(usize, usize)], x: &Axis, y: &Inputs, sink: &mut Sink<'_>) 
                 a_hi = lo;
             }
             while a_hi < hi {
-                sum.add(areas[a_hi]);
+                sum.apply(areas[a_hi], true);
                 a_hi += 1;
             }
             while a_lo < lo {
-                sum.add(-areas[a_lo]);
+                sum.apply(areas[a_lo], false);
                 a_lo += 1;
             }
-            let total = if sum.overflowed { areas[lo..hi].iter().sum() } else { sum.value() };
-            Bson::Double(total / unit_len)
+            Bson::Double(sum.value() / unit_len)
         };
         let v = Some(v);
         sink.charge(&v)?;

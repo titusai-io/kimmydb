@@ -471,7 +471,8 @@ the upper (`400`).
 | `range` | distance in the one `sortBy` field | any number, `±Infinity` meaning unbounded; with `unit`, a whole number of it that fits 32 bits |
 
 - A `documents` window needs a `sortBy`, except `["unbounded", "unbounded"]`, which is the whole
-  partition (`400` otherwise).
+  partition (`400` otherwise). `sortBy: {}` counts as one: it is no sort, and the positions are those of
+  arrival, as the reference accepts it.
 - A `range` window needs a `sortBy` of **exactly one ascending field**, whose value is a number in every
   document, or a date in every document with a `unit` (`year`, `quarter`, `month`, `week`, `day`, `hour`,
   `minute`, `second`, `millisecond`). A descending `sortBy` is `400`, as the reference refuses it. A
@@ -508,7 +509,7 @@ is not a bound: all `400`, naming it.
 
 **Cost.** Both ends of a window only move forward, so every operator keeps a state that takes a document
 in once and out once, and no window is rebuilt: `$sum` and `$avg` keep an exact integer total, an exact
-sum of the doubles (rounded once) and, once a `Decimal128` has been seen, an exact decimal total, with
+sum of the doubles (a 68-digit integer accumulator, so a sum may pass the largest double and come back, and is rounded once when read) and, once a `Decimal128` has been seen, an exact decimal total, with
 counts of NaN and the infinities; `$min` and `$max` a monotone deque; `$push`, `$firstN`, `$lastN` a
 queue; `$addToSet`, `$top` and its family, `$maxN` and `$minN` an ordered set, O(log w) a step;
 `$stdDevPop`, `$stdDevSamp` and the covariances running moments about the first value, over finite

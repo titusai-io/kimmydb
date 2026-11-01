@@ -786,11 +786,16 @@ fn a_documents_window_needs_a_sort_unless_it_is_the_whole_partition() {
     // `{}` is the whole partition too, and `sortBy: {}` is no sort.
     let out = run(w(doc! {}), series(&[1, 2, 3])).unwrap();
     assert_eq!(col(&out, "s"), i64s(&[3, 3, 3]));
+    // `sortBy: {}` is no sort, and a documents window then counts in arrival order, as the
+    // reference accepts it; the same window with no `sortBy` at all is refused.
     let out = run(
-        set(doc! {"sortBy": {}, "output": {"s": {"$sum": 1, "window": {"documents": [0, 0]}}}}),
-        series(&[1, 2]),
-    );
-    assert!(out.is_err(), "an empty sortBy is no sort, and a position needs one");
+        set(doc! {"sortBy": {}, "output": {"s": {"$push": "$qty", "window": {"documents": [-1, 0]}}}}),
+        series(&[3, 1, 2]),
+    )
+    .unwrap();
+    let arr = |v: &[i32]| Bson::Array(v.iter().map(|x| Bson::Int32(*x)).collect());
+    assert_eq!(col(&out, "s"), vec![arr(&[3]), arr(&[3, 1]), arr(&[1, 2])]);
+    assert_eq!(ids(&out), vec![1, 2, 3]);
     let out = run(set(doc! {"sortBy": {}, "output": {"s": {"$sum": 1}}}), series(&[1, 2])).unwrap();
     assert_eq!(col(&out, "s"), i64s(&[2, 2]));
 }
@@ -2506,4 +2511,154 @@ fn a_deviation_is_rebuilt_from_a_window_that_has_moved_far_from_where_it_started
         let Bson::Double(got) = out[i].get("sd").cloned().unwrap() else { panic!() };
         assert!((got - sd).abs() < 1e-9, "row {i}: {got} vs {sd}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Doubles near the largest: an exact sum that can overflow and come back
+// ---------------------------------------------------------------------------
+
+mod exact_doubles {
+    use super::*;
+    use crate::window_acc::ExactDoubles;
+
+    fn sum(values: &[f64]) -> f64 {
+        let mut acc = ExactDoubles::default();
+        for v in values {
+            acc.add(*v);
+        }
+        acc.value()
+    }
+
+    #[test]
+    fn it_is_the_exact_sum_rounded_once_against_an_integer_oracle() {
+        // Multiples of 2^-20 below 2^40: their sum is an integer in i128, and rounding that once
+        // to a double and scaling by a power of two is the correctly rounded sum.
+        let mut x: u64 = 99;
+        let mut next = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 11
+        };
+        for round in 0..200 {
+            let mut acc = ExactDoubles::default();
+            let mut held: Vec<i64> = Vec::new();
+            let mut total: i128 = 0;
+            for step in 0..60 {
+                if step % 3 == 2 && !held.is_empty() {
+                    let k = held.remove(0);
+                    acc.add(-(k as f64) / 1048576.0);
+                    total -= i128::from(k);
+                } else {
+                    let k = (next() % (1 << 51)) as i64 - (1 << 50);
+                    acc.add(k as f64 / 1048576.0);
+                    held.push(k);
+                    total += i128::from(k);
+                }
+                assert_eq!(acc.value(), total as f64 / 1048576.0, "round {round} step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sum_past_the_largest_double_is_an_infinity_and_comes_back_exactly() {
+        let a = f64::MAX;
+        assert_eq!(sum(&[a, a]), f64::INFINITY);
+        assert_eq!(sum(&[-a, -a]), f64::NEG_INFINITY);
+        assert_eq!(sum(&[a, a, -a]), a);
+        assert_eq!(sum(&[a, a, -a, -a]), 0.0);
+        assert_eq!(sum(&[a, -a, 1.0]), 1.0);
+        // Half an ulp of the largest double goes to even, which is past it; less stays.
+        assert_eq!(sum(&[a, 2f64.powi(970)]), f64::INFINITY);
+        assert_eq!(sum(&[a, 2f64.powi(969)]), a);
+        // The same through adding and taking away.
+        let mut acc = ExactDoubles::default();
+        acc.add(a);
+        acc.add(a);
+        assert_eq!(acc.value(), f64::INFINITY);
+        acc.add(-a);
+        assert_eq!(acc.value(), a);
+    }
+
+    #[test]
+    fn subnormals_and_the_smallest_normals_are_exact() {
+        let tiny = f64::from_bits(1);
+        assert_eq!(sum(&[tiny, tiny, tiny]), 3.0 * tiny);
+        assert_eq!(sum(&[f64::MIN_POSITIVE, -tiny]), f64::MIN_POSITIVE - tiny);
+        assert_eq!(sum(&[tiny, -tiny]), 0.0);
+        // Two halves of the smallest normal.
+        assert_eq!(sum(&[f64::MIN_POSITIVE / 2.0, f64::MIN_POSITIVE / 2.0]), f64::MIN_POSITIVE);
+        // An integer added to doubles.
+        let mut acc = ExactDoubles::default();
+        acc.add(0.5);
+        assert_eq!(acc.value_with(i128::from(i64::MAX)), 9223372036854775808.0);
+        assert_eq!(acc.value_with(-3), -2.5);
+    }
+}
+
+fn big_pattern(n: i32, f: impl Fn(i32) -> f64) -> Vec<Document> {
+    (0..n).map(|i| doc! {"_id": i, "v": f(i)}).collect()
+}
+
+#[test]
+fn a_sum_and_an_average_of_doubles_near_the_largest_slide_exactly_and_in_time() {
+    let a = 1.7e308;
+    // A, -A, 1: any three neighbours sum to exactly 1, whatever order they come in.
+    let input = big_pattern(HUNDRED_THOUSAND, |i| match i % 3 {
+        0 => a,
+        1 => -a,
+        _ => 1.0,
+    });
+    let started = std::time::Instant::now();
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "s": {"$sum": "$v", "window": {"documents": [-2, 0]}},
+            "m": {"$avg": "$v", "window": {"documents": [-2, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    for i in [2usize, 3, 4, 5, 50_000, 99_999] {
+        assert_eq!(out[i].get("s"), Some(&Bson::Double(1.0)), "row {i}");
+        assert_eq!(out[i].get("m"), Some(&Bson::Double(1.0 / 3.0)), "row {i}");
+    }
+    // Past the largest and back: A, A, -A, -A in pairs.
+    let input = big_pattern(HUNDRED_THOUSAND, |i| if (i / 2) % 2 == 0 { a } else { -a });
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+        "s": {"$sum": "$v", "window": {"documents": [-1, 0]}}}}),
+        input,
+    )
+    .unwrap();
+    let s = col(&out, "s");
+    // Rows 1, 2, 3, 4: (A, A), (A, -A), (-A, -A), (-A, A).
+    assert_eq!(s[1], Bson::Double(f64::INFINITY));
+    assert_eq!(s[2], Bson::Double(0.0));
+    assert_eq!(s[3], Bson::Double(f64::NEG_INFINITY));
+    assert_eq!(s[4], Bson::Double(0.0));
+    assert_eq!(s[99_998], Bson::Double(0.0));
+    assert_eq!(s[99_999], Bson::Double(f64::NEG_INFINITY));
+}
+
+#[test]
+fn an_integral_of_values_near_the_largest_slides_exactly_and_in_time() {
+    // 8e307 for fifty thousand documents, then ones. Three areas of 8e307 are past the largest
+    // double, so a window of four documents is an infinity while they are in it and the exact
+    // sum once they have left.
+    let input: Vec<Document> = (0..HUNDRED_THOUSAND)
+        .map(|i| doc! {"_id": i, "x": i, "y": if i < 50_000 { 8e307 } else { 1.0 }})
+        .collect();
+    let started = std::time::Instant::now();
+    let out = run(
+        set(doc! {"sortBy": {"x": 1}, "output": {
+            "i2": {"$integral": {"input": "$y"}, "window": {"documents": [-1, 0]}},
+            "i4": {"$integral": {"input": "$y"}, "window": {"documents": [-3, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    assert_eq!(out[1000].get("i2"), Some(&Bson::Double(8e307)));
+    assert_eq!(out[1000].get("i4"), Some(&Bson::Double(f64::INFINITY)));
+    assert_eq!(out[99_999].get("i2"), Some(&Bson::Double(1.0)));
+    assert_eq!(out[99_999].get("i4"), Some(&Bson::Double(3.0)));
 }
