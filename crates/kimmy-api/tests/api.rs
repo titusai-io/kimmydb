@@ -4433,6 +4433,35 @@ async fn json_schema_filters_every_route_that_takes_a_filter() {
     }
 }
 
+/// A regex written as a field's value is a pattern in `find`, and a partial index
+/// filter has no patterns, so a bare one is refused at creation (ADR-267), while
+/// `$eq` of it, which compares it as a value, is not.
+#[tokio::test]
+async fn a_partial_index_filter_refuses_a_regex_as_a_fields_value() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "c"})).await;
+    let re = json!({"$regularExpression": {"pattern": "^a", "options": ""}});
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/indexes",
+            Some(&token),
+            json!({"name": "bare", "fields": [{"path": "email"}], "partialFilterExpression": {"s": re.clone()}}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("regular expression") && message.contains("$eq"), "{message}");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/indexes",
+            Some(&token),
+            json!({"name": "eq", "fields": [{"path": "email"}], "partialFilterExpression": {"s": {"$eq": re}}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
 /// `$pull` with an operator document removes the elements that satisfy it; a
 /// plain document still matches whole; a mixed one is a `400`.
 #[tokio::test]
@@ -18359,15 +18388,47 @@ async fn chunks_commit_once_each_and_the_boundary_is_exact() {
 }
 
 #[tokio::test]
-async fn a_written_document_over_the_size_cap_fails_its_chunk() {
+async fn a_written_document_the_target_refuses_fails_its_chunk() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    // The fourth document repeats the first one's `k`, which the target's unique
+    // index refuses. (A pipeline cannot build a document over the size cap any
+    // more: see the next test.)
+    let docs: Vec<Value> =
+        (1..=4).map(|i| json!({"_id": i, "k": if i == 4 { 1 } else { i }})).collect();
+    sink_seed(&server, &token, "src", docs).await;
+    sink_seed(&server, &token, "t", Vec::new()).await;
+    let index = server
+        .post(
+            "/v1/db/shop/coll/t/indexes",
+            Some(&token),
+            json!({"fields": [{"path": "k"}], "unique": true}),
+        )
+        .await;
+    assert_eq!(index.status, 200, "{:?}", index.body);
+    server.state.engine.set_multi_chunk_docs(2);
+    let res =
+        sink_run(&server, &token, "src", json!([{"$sort": {"_id": 1}}, {"$merge": {"into": "t"}}]))
+            .await;
+    assert!(res.status >= 400, "{:?}", res.body);
+    let ids: Vec<i64> = sink_dump(&server, &token, "shop", "t")
+        .await
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [1, 2], "the first chunk stands, the second did not land");
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_pipeline_cannot_build_a_document_over_the_size_cap() {
     let server = Server::start().await;
     let token = server.root().await;
     sink_seed(&server, &token, "src", (1..=4).map(|i| json!({"_id": i})).collect()).await;
-    server.state.engine.set_multi_chunk_docs(2);
-    // The documents are built in the pipeline: one per `_id`, the fourth too big
-    // to store, though none is big enough to be refused as a pipeline result. No
-    // expression builds a string of 16 MiB, so the fourth holds two of 8 MiB, which
-    // together pass the document cap.
+    sink_seed(&server, &token, "t", Vec::new()).await;
+    // The fourth document would hold two strings of 8 MiB, which together pass the
+    // 16 MiB a document may have: the stage that builds it is refused, with the
+    // `413` of the other limits on what an expression builds, and nothing is written.
     let big = json!({"$reduce": {
         "input": {"$range": [0, 20]},
         "initialValue": "xxxxxxxx",
@@ -18387,14 +18448,12 @@ async fn a_written_document_over_the_size_cap_fails_its_chunk() {
         ]),
     )
     .await;
-    assert!(res.status >= 400, "{:?}", res.body);
-    let ids: Vec<i64> = sink_dump(&server, &token, "shop", "t")
-        .await
-        .iter()
-        .map(|d| d["_id"].as_i64().unwrap())
-        .collect();
-    assert_eq!(ids, [1, 2], "the first chunk stands, the second did not land");
-    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "document_too_large", "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap();
+    assert!(message.contains("the document the stage builds is"), "{message}");
+    assert!(message.contains("16 MiB document limit"), "{message}");
+    assert!(sink_dump(&server, &token, "shop", "t").await.is_empty());
 }
 
 #[tokio::test]

@@ -555,7 +555,7 @@ regex literal and a literal under `$not`; it used to match nothing. A
 (`{"name": /^s/}`) was an equality match against a regex value, not a pattern
 match. That changed with ADR-267: it is a pattern, as `$regex` is, and `$eq` is
 the spelling that compares the regex as a value. It matches strings only, where
-the reference also matches a stored regex of the same pattern (not probed).
+the reference also matches a stored regex of the same pattern (not probed). A `partialFilterExpression` refuses a regex as a field's value at creation (it is a pattern, and the partial filter language has none, as it refuses `$regex`; `{$eq: <regex>}` is allowed), over HTTP and over MCP, which reads the same JSON; no stored definition can hold one.
 
 ---
 
