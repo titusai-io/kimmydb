@@ -3825,9 +3825,13 @@ async fn the_positional_dollar_updates_the_element_the_filter_matched() {
     .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
     assert!(res.body["message"].as_str().unwrap_or_default().contains("upsert"), "{:?}", res.body);
-    // Labelled as an update error, as the other `$` refusals are.
+    // Labelled as an update error, and worded as the same refusal on a document that
+    // matched is (the `$` with no element, on `update`), not as a message of its own.
     let msg = res.body["message"].as_str().unwrap_or_default();
-    assert!(msg.starts_with("invalid update:"), "{msg}");
+    assert!(msg.starts_with("invalid query: invalid update:"), "{msg}");
+    let matched = update(json!({"filter": {"_id": 3}, "update": {"$set": {"items.$.x": 1}}})).await;
+    let matched = matched.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(matched.starts_with("invalid query: invalid update:"), "{matched}");
     assert_eq!(server.get("/v1/db/shop/coll/c/docs/99", Some(&token)).await.status, 404);
 }
 

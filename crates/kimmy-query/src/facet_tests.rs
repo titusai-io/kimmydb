@@ -239,13 +239,14 @@ fn a_pipeline_with_facets_reads_the_clock_once() {
 
 #[test]
 fn an_answer_over_the_cap_is_refused_before_a_later_facet_runs() {
-    // One facet emits one document holding everything: a document count of 1 and
-    // 18 MiB. The facet after it would fail, and must never be reached.
+    // One facet emits the three documents: a count of 3 and 18 MiB. (A `$push` of
+    // them into one document is refused by the 16 MiB array limit first.) The facet
+    // after it would fail, and must never be reached.
     let big = "x".repeat(6 * 1024 * 1024);
     let input: Vec<Document> = (0..3).map(|i| doc! {"_id": i, "pad": big.clone()}).collect();
     let err = run(
         &[doc! {"$facet": {
-            "everything": [{"$group": {"_id": null, "all": {"$push": "$$ROOT"}}}],
+            "everything": [{"$match": {}}],
             "never": [{"$addFields": {"x": {"$add": ["$_id", "text"]}}}],
         }}],
         input,
@@ -257,7 +258,7 @@ fn an_answer_over_the_cap_is_refused_before_a_later_facet_runs() {
     let err = run(
         &[doc! {"$facet": {
             "first": [{"$addFields": {"x": {"$add": ["$_id", "text"]}}}],
-            "everything": [{"$group": {"_id": null, "all": {"$push": "$$ROOT"}}}],
+            "everything": [{"$match": {}}],
         }}],
         input,
     )
