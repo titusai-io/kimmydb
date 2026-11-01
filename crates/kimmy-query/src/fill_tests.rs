@@ -70,8 +70,10 @@ fn values_are_read_from_the_document_before_any_is_filled() {
     let out =
         run(doc! {"output": {"a": {"value": "$b"}, "b": {"value": 9}}}, vec![doc! {"_id": 1}])
             .unwrap();
-    // `a` takes `b` as it was (missing, so null), not as it is filled.
-    assert_eq!(out, vec![doc! {"_id": 1, "a": Bson::Null, "b": 9}]);
+    // `a` reads `b` as it was, not as it is filled: `b` was missing then, and a
+    // field path that reaches nothing leaves the field out (the rule of `$addFields`),
+    // so `a` stays absent while `b` is filled.
+    assert_eq!(out, vec![doc! {"_id": 1, "b": 9}]);
 }
 
 #[test]

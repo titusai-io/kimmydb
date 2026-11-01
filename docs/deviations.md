@@ -31,6 +31,8 @@ Status meanings:
 - **The byte budget.** `$setWindowFields`, `$densify` and a `$fill` method hold what they buffer to one budget of 256 MiB for the whole request, shared by the stages of the pipeline and the branches of a `$facet` (a `$facet` keeps its stages' bytes charged until it is done), refused `413` as the total passes it. The reference spills to disk.
 - **Strictness.** A `documents` bound, a `$shift` `by` and a `range` bound with a `unit` must be whole numbers that fit 32 bits, as in the reference; a `range` bound of a date `unit` is refused for a fraction.
 
+- **`$fill` with `value` reading a field path that reaches nothing leaves the field out**, as an `$addFields` of a missing field does (the rule of ADR-263 for every stage value); it was `null` before. Unprobed against the reference for `$fill` itself: the delta checks it.
+
 **To close:** a `Decimal128` path through the deviations and the derivative family, and exact comparison of longs beyond 2^53 in a range window. Neither is planned.
 
 ---
