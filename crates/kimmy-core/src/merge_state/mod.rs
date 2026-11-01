@@ -22,6 +22,13 @@
 //!
 //! Retention (`R`) and the integer bound are carried by [`JoinOptions`]; every
 //! read method that depends on them takes the options.
+//!
+//! Two bounds apply to a counter. The integer bound (Q11, [`JoinOptions::int_bound`], the Int64
+//! range unless lowered) is what a client sees: a total saturates there, and a local `$inc` that
+//! would pass it is refused. [`MAX_TOTAL`] (2^119) is a theoretical bound on the `i128` totals
+//! underneath, which keeps the read side's arithmetic exact for any 64 writers; it needs more
+//! than 2^56 maximal increments to reach, `decode` and `receive_loss` refuse a total past it,
+//! and `write_inc` refuses an `$inc` that would carry a writer's slot past it.
 
 mod codec;
 mod join;

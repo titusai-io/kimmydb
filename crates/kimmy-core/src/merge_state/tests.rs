@@ -1481,3 +1481,73 @@ fn a_negative_int_bound_is_refused_and_zero_is_usable() {
     assert_eq!(w.visible(), doc(&[("x", i(-1))]));
     assert!(w.write_inc("x", -1, 0).is_none());
 }
+
+// ---- m-c: the total bound is theoretical, and a member never stores what it cannot decode ----
+
+#[test]
+fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
+    // 2^119: each increment moves a slot by under 2^63, so reaching it takes over 2^56 of them.
+    assert_eq!(MAX_TOTAL, 1i128 << 119);
+    assert!(MAX_TOTAL / i128::from(i64::MAX) > 1i128 << 55);
+    // 64 writers' slots, all at the bound on one path: the exact sum fits in i128 (the terms are
+    // under 2^120, so 64 of them sum to under 2^126), and the visible value saturates.
+    let o = opts();
+    let mut w = Writer::new(wid('A', 0), o.clone());
+    w.upsert_inc("x", 1, 0).unwrap();
+    let mut st = w.state.clone();
+    let life = *st.lives.keys().next().unwrap();
+    st.slots.clear();
+    let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
+    for k in 0..64u8 {
+        let wr = WriterId { node: nid((b'a' + k) as char), epoch: Epoch::from_u64(0) };
+        st.slots.insert((life, "x".into(), wr, None), Slot { stamp, total: MAX_TOTAL });
+    }
+    assert_eq!(st.value("x", &o), Some(i(i64::MAX)));
+    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st, "a state at the bound decodes");
+    // Half at +bound, half at -bound: the exact sum is 0, which only exact arithmetic gives.
+    for (k, slot) in st.slots.values_mut().enumerate() {
+        slot.total = if k % 2 == 0 { MAX_TOTAL } else { -MAX_TOTAL };
+    }
+    assert_eq!(st.value("x", &o), Some(i(0)));
+    // The same terms through the hidden figure: a generation that saw nothing, over 64 slots of
+    // an older generation at the bound.
+    let gen_stamp = MStamp { hlc: h(5), writer: wid('B', 0) };
+    let mut st = st.clone();
+    for slot in st.slots.values_mut() {
+        slot.total = MAX_TOTAL;
+    }
+    st.regs.insert(
+        (life, "x".into()),
+        Reg {
+            stamp: gen_stamp,
+            value: s("t"),
+            obs: BTreeMap::new(),
+            generation: Some(Gen::start(gen_stamp, &BTreeMap::new(), BTreeMap::new())),
+            soi: false,
+        },
+    );
+    assert_eq!(st.hidden("x", &o), 64 * MAX_TOTAL, "exact, no saturation");
+}
+
+#[test]
+fn receive_loss_refuses_a_total_past_the_bound() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("x", i(1))], 0).unwrap();
+    let st = w.state.clone();
+    let life = *st.lives.keys().next().unwrap();
+    let key = |p: &str| LossKey { kind: LossKind::DeleteWon, path: p.into(), stamp: life };
+    for (p, t, added) in [
+        ("a", MAX_TOTAL, true),
+        ("b", -MAX_TOTAL, true),
+        ("c", MAX_TOTAL + 1, false),
+        ("d", -MAX_TOTAL - 1, false),
+        ("e", i128::MAX, false),
+        ("f", i128::MIN, false),
+    ] {
+        assert_eq!(w.receive_loss(key(p), LossValue::Total(t)), added, "{p}");
+    }
+    // Whatever was stored decodes.
+    assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state);
+    // Other loss values are unaffected.
+    assert!(w.receive_loss(key("g"), LossValue::Value(i(i64::MAX))));
+}

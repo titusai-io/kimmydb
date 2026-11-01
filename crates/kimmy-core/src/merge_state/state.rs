@@ -79,18 +79,26 @@ pub struct Reg {
 }
 
 /// The largest magnitude of a counter total (a slot's, or a copy of one kept in a register's
-/// `obs`, a generation's `seen` or a loss record): 2^80.
+/// `obs`, a generation's `seen` or a loss record): 2^119.
 ///
-/// A visible value saturates at the Int64 bound, but the totals underneath are `i128` sums that a
-/// writer's own `$inc`s can drive past it (a refused `$inc` is judged on the saturated value, not
-/// on the sum). Every total is bounded so that the read side's sums cannot overflow `i128`:
-/// each term is below 2^81 in magnitude, so overflow would need about 2^46 slots in one state,
-/// and a slot takes over a hundred bytes. The bound is enforced where totals come from outside,
-/// in [`MergeState::decode`], which refuses a larger one, and where they grow, in
-/// [`super::Writer::write_inc`], which refuses an `$inc` that would pass it. (The read side also
-/// adds with saturation, as a backstop for a state assembled by hand through the public fields.)
-/// An honest writer reaches 2^80 only after about 2^17 maximal increments on one path.
-pub const MAX_TOTAL: i128 = 1 << 80;
+/// A THEORETICAL bound, there only so that the `i128` arithmetic of the read side is exact.
+/// A visible value saturates at the Int64 bound, but the totals underneath are `i128` sums that
+/// a writer's own `$inc`s can drive past it (a refused `$inc` is judged on the saturated value,
+/// not on the sum). Each term the read side adds is a total minus the total a base observed, so
+/// under 2^120 in magnitude, and 64 writers' terms sum to under 2^126, inside `i128`. Each
+/// `$inc` moves a slot by less than 2^63, so an honest writer needs more than 2^56 maximal
+/// increments to reach the bound: it is not reachable in practice, and no client sees a refusal
+/// at it.
+///
+/// It is enforced where totals come from outside, in [`MergeState::decode`] (a slot, an `obs`
+/// or `seen` entry, a loss record) and [`super::Writer::receive_loss`], which refuse a larger
+/// one, so that a member never stores a state it cannot decode; and where they grow, in
+/// [`super::Writer::write_inc`], which refuses an `$inc` that would pass it. The read side also
+/// adds with saturation, as a backstop for a state assembled by hand through the public fields.
+pub const MAX_TOTAL: i128 = 1 << 119;
+
+// 64 writers' terms, each under twice the bound, sum inside i128.
+const _: () = assert!(MAX_TOTAL.checked_mul(128).is_some());
 
 /// A counter slot: one writer's running total in one generation.
 #[derive(Clone, PartialEq, Debug)]

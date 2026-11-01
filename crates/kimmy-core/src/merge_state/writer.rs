@@ -475,9 +475,14 @@ impl Writer {
     }
 
     /// A loss-record entry (the model's `receive_entry` for a loss): kept unless
-    /// it is already below the horizon or already known. True when added.
+    /// it is already below the horizon, already known, or a counter total past
+    /// [`MAX_TOTAL`]. True when added.
     pub fn receive_loss(&mut self, key: LossKey, val: LossValue) -> bool {
         if key.stamp.hlc < self.horizon() || self.state.losses.contains_key(&key) {
+            return false;
+        }
+        // A total past `MAX_TOTAL` is one `decode` refuses: never store a state that cannot be read back.
+        if matches!(val, LossValue::Total(t) if t.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
             return false;
         }
         self.state.losses.insert(key, val);
