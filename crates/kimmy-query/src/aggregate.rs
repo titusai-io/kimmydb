@@ -1839,7 +1839,8 @@ pub fn apply_with_vars(
         Stage::Limit(n) => input.into_iter().take(*n).collect(),
         Stage::Skip(n) => input.into_iter().skip(*n).collect(),
         Stage::Count(field) => {
-            let n = input.len() as i64;
+            // An `Int32` while it fits, as the reference counts (ADR-268).
+            let n = crate::expr::count_bson(input.len());
             vec![bson::doc! { field.as_str(): n }]
         }
         Stage::Unwind { path: p, preserve_null_and_empty, include_array_index } => {

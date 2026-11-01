@@ -55,9 +55,11 @@
 //! 2^53, which is the same reasoning as ADR-002 and as `number_to_bson` at the
 //! HTTP edge.
 //!
-//! **Integer results are always `Int64`.** MongoDB narrows to `Int32` when both
-//! operands were `Int32`; a third case buys accuracy on `$type` that nothing
-//! here needs, and `$sum` has always returned `Int64`.
+//! **Integer results keep the reference's width** (ADR-268). `Int32` with
+//! `Int32` is an `Int32` and widens to `Int64` only on overflow; an `Int64`
+//! operand gives an `Int64`; a double gives a double. The counting and indexing
+//! operators answer `Int32`, and `$sum` answers the narrowest width that holds
+//! the exact total. Before ADR-268 every integer result was an `Int64`.
 //!
 //! # Errors versus null
 //!
@@ -2211,6 +2213,17 @@ fn eval_zip(
     Ok(Bson::Array(out))
 }
 
+/// An integer result in the narrowest width that holds it: an `Int32`, or an
+/// `Int64` past `i32` (ADR-268).
+pub(crate) fn integer_bson(n: i64) -> Bson {
+    Num::narrowest(n).to_bson()
+}
+
+/// A count or an index as the reference types it: an `Int32` while it fits.
+pub(crate) fn count_bson(n: usize) -> Bson {
+    integer_bson(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
 fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
     match op {
         Op::Add => arithmetic_add(args),
@@ -2229,7 +2242,7 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::ToLower => Ok(Bson::String(as_string_lossy(&args[0], op)?.to_lowercase())),
         Op::Substr => substr(args),
         Op::Split => split(&args[0], &args[1]),
-        Op::StrLenCp => Ok(Bson::Int64(as_string_strict(&args[0], op)?.chars().count() as i64)),
+        Op::StrLenCp => Ok(count_bson(as_string_strict(&args[0], op)?.chars().count())),
         Op::IndexOfCp | Op::IndexOfBytes => strings::index_of(op, args),
         Op::Strcasecmp => strings::strcasecmp(&args[0], &args[1]),
         Op::StrLenBytes => strings::str_len_bytes(&args[0]),
@@ -2281,18 +2294,23 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
 // Numbers
 // ---------------------------------------------------------------------------
 
-/// A number that remembers whether it is still exact.
+/// A number that remembers whether it is still exact, and how wide it was.
+///
+/// The width is kept from the stored value (ADR-268): `Int32 op Int32` is an
+/// `Int32` and widens to `Int64` only when it overflows, any `Int64` operand
+/// gives an `Int64`, and a double stays a double.
 #[derive(Clone, Copy, Debug)]
 enum Num {
-    Int(i64),
+    Int32(i32),
+    Int64(i64),
     Dbl(f64),
 }
 
 impl Num {
     fn from_bson(value: &Bson) -> Option<Self> {
         match value {
-            Bson::Int32(n) => Some(Num::Int(i64::from(*n))),
-            Bson::Int64(n) => Some(Num::Int(*n)),
+            Bson::Int32(n) => Some(Num::Int32(*n)),
+            Bson::Int64(n) => Some(Num::Int64(*n)),
             Bson::Double(d) => Some(Num::Dbl(*d)),
             _ => None,
         }
@@ -2300,51 +2318,76 @@ impl Num {
 
     fn as_f64(self) -> f64 {
         match self {
-            Num::Int(n) => n as f64,
+            Num::Int32(n) => f64::from(n),
+            Num::Int64(n) => n as f64,
             Num::Dbl(d) => d,
+        }
+    }
+
+    /// The value of an integer of either width.
+    fn integer(self) -> Option<i64> {
+        match self {
+            Num::Int32(n) => Some(i64::from(n)),
+            Num::Int64(n) => Some(n),
+            Num::Dbl(_) => None,
         }
     }
 
     fn to_bson(self) -> Bson {
         match self {
-            Num::Int(n) => Bson::Int64(n),
+            Num::Int32(n) => Bson::Int32(n),
+            Num::Int64(n) => Bson::Int64(n),
             Num::Dbl(d) => Bson::Double(d),
         }
     }
 
+    /// An integer result of the narrowest width that holds it.
+    fn narrowest(n: i64) -> Self {
+        i32::try_from(n).map_or(Num::Int64(n), Num::Int32)
+    }
+
     /// Integer arithmetic stays integral until it cannot.
     ///
-    /// The overflow arm is why this is `checked_*` rather than a cast: falling
-    /// to `f64` loses precision, but wrapping would produce a number of the
-    /// wrong sign, which is worse than approximate.
-    fn add(self, other: Self) -> Self {
+    /// `Int32` with `Int32` is an `Int32` while it fits and an `Int64` when it
+    /// does not; any `Int64` operand makes an `Int64`, which falls to a double
+    /// only past `i64`. The overflow arm is why this is `checked_*` rather than
+    /// a cast: falling to `f64` loses precision, but wrapping would produce a
+    /// number of the wrong sign, which is worse than approximate.
+    fn apply(
+        self,
+        other: Self,
+        narrow: fn(i32, i32) -> Option<i32>,
+        wide: fn(i64, i64) -> Option<i64>,
+        double: fn(f64, f64) -> f64,
+    ) -> Self {
         match (self, other) {
-            (Num::Int(a), Num::Int(b)) => match a.checked_add(b) {
-                Some(n) => Num::Int(n),
-                None => Num::Dbl(a as f64 + b as f64),
+            (Num::Int32(a), Num::Int32(b)) => match narrow(a, b) {
+                Some(n) => Num::Int32(n),
+                None => match wide(i64::from(a), i64::from(b)) {
+                    Some(n) => Num::Int64(n),
+                    None => Num::Dbl(double(f64::from(a), f64::from(b))),
+                },
             },
-            _ => Num::Dbl(self.as_f64() + other.as_f64()),
+            _ => match (self.integer(), other.integer()) {
+                (Some(a), Some(b)) => match wide(a, b) {
+                    Some(n) => Num::Int64(n),
+                    None => Num::Dbl(double(a as f64, b as f64)),
+                },
+                _ => Num::Dbl(double(self.as_f64(), other.as_f64())),
+            },
         }
+    }
+
+    fn add(self, other: Self) -> Self {
+        self.apply(other, i32::checked_add, i64::checked_add, |a, b| a + b)
     }
 
     fn sub(self, other: Self) -> Self {
-        match (self, other) {
-            (Num::Int(a), Num::Int(b)) => match a.checked_sub(b) {
-                Some(n) => Num::Int(n),
-                None => Num::Dbl(a as f64 - b as f64),
-            },
-            _ => Num::Dbl(self.as_f64() - other.as_f64()),
-        }
+        self.apply(other, i32::checked_sub, i64::checked_sub, |a, b| a - b)
     }
 
     fn mul(self, other: Self) -> Self {
-        match (self, other) {
-            (Num::Int(a), Num::Int(b)) => match a.checked_mul(b) {
-                Some(n) => Num::Int(n),
-                None => Num::Dbl(a as f64 * b as f64),
-            },
-            _ => Num::Dbl(self.as_f64() * other.as_f64()),
-        }
+        self.apply(other, i32::checked_mul, i64::checked_mul, |a, b| a * b)
     }
 }
 
@@ -2438,16 +2481,33 @@ impl Total {
             return;
         };
         self.seen.add(value);
+        // The integers are added at `Int64` width whatever they were stored as:
+        // the width of the answer is decided once, at the end (see `to_bson`),
+        // from the exact total, so the order of the values cannot change it.
+        let n = match n {
+            Num::Int32(i) => Num::Int64(i64::from(i)),
+            other => other,
+        };
         self.plain = Some(match self.plain {
             Some(acc) => acc.add(n),
             None => n,
         });
     }
 
+    /// The sum, as the reference types it (ADR-268): an `Int32` while the exact
+    /// integer total fits one, an `Int64` past that, a double past `i64` or as
+    /// soon as a double was added, a `Decimal128` once one was. The width of the
+    /// inputs does not matter, only the size of the total: the sum of two `Int64`
+    /// 1 and 2 is the `Int32` 3, as the reference answers it. A group with
+    /// nothing to add is the `Int32` 0.
     pub fn to_bson(&self) -> Bson {
         match &self.seen.exact {
             Some(sum) => Bson::Decimal128(pack_raw(sum.finish_sum())),
-            None => self.plain.unwrap_or(Num::Int(0)).to_bson(),
+            None => match self.plain {
+                Some(Num::Int64(n)) => Num::narrowest(n).to_bson(),
+                Some(other) => other.to_bson(),
+                None => Bson::Int32(0),
+            },
         }
     }
 }
@@ -2520,7 +2580,8 @@ impl Operand {
     /// R1 (its exact binary value rounded once to 34 digits, ties to even).
     fn widen(&self) -> Raw {
         match self {
-            Operand::Plain(Num::Int(n)) => arith::from_i64(*n),
+            Operand::Plain(Num::Int32(n)) => arith::from_i64(i64::from(*n)),
+            Operand::Plain(Num::Int64(n)) => arith::from_i64(*n),
             Operand::Plain(Num::Dbl(d)) => arith::from_binary64(d.to_bits()).0,
             Operand::Decimal(raw) => *raw,
         }
@@ -2690,14 +2751,16 @@ fn modulo(a: &Bson, b: &Bson) -> Result<Bson> {
     let Some(nums) = numbers(Op::Mod, &[a.clone(), b.clone()])? else {
         return Ok(Bson::Null);
     };
+    // `x % -1` is 0 for every `x`, the smallest integer included (where the
+    // machine's remainder would trap), as the reference answers it.
     match (nums[0], nums[1]) {
-        (_, Num::Int(0)) => Err(Error::InvalidQuery("$mod by zero".into())),
-        (Num::Int(x), Num::Int(y)) => Ok(Bson::Int64(x % y)),
-        (x, y) if y.as_f64() == 0.0 => {
-            let _ = x;
-            Err(Error::InvalidQuery("$mod by zero".into()))
-        }
-        (x, y) => Ok(Bson::Double(x.as_f64() % y.as_f64())),
+        (_, Num::Int32(0) | Num::Int64(0)) => Err(Error::InvalidQuery("$mod by zero".into())),
+        (Num::Int32(x), Num::Int32(y)) => Ok(Bson::Int32(x.wrapping_rem(y))),
+        (x, y) => match (x.integer(), y.integer()) {
+            (Some(x), Some(y)) => Ok(Bson::Int64(x.wrapping_rem(y))),
+            _ if y.as_f64() == 0.0 => Err(Error::InvalidQuery("$mod by zero".into())),
+            _ => Ok(Bson::Double(x.as_f64() % y.as_f64())),
+        },
     }
 }
 
@@ -2899,7 +2962,7 @@ fn position(len: usize, index: i64) -> Option<usize> {
 fn array_size(value: &Bson) -> Result<Bson> {
     Ok(match as_array(Op::Size, value)? {
         None => Bson::Null,
-        Some(items) => Bson::Int64(items.len() as i64),
+        Some(items) => count_bson(items.len()),
     })
 }
 
@@ -3031,8 +3094,8 @@ fn index_of_array(args: &[Bson]) -> Result<Bson> {
         .take(end)
         .skip(start)
         .find(|(_, item)| canonical_cmp(item, needle) == Ordering::Equal)
-        .map(|(i, _)| i as i64);
-    Ok(Bson::Int64(found.unwrap_or(-1)))
+        .map(|(i, _)| i);
+    Ok(found.map_or(Bson::Int32(-1), count_bson))
 }
 
 fn reverse_array(value: &Bson) -> Result<Bson> {
@@ -3073,7 +3136,7 @@ fn range(args: &[Bson]) -> Result<Bson> {
             "$range would produce {count} elements, over the limit of {MAX_RANGE_LENGTH}"
         )));
     }
-    Ok(Bson::Array((0..count as i64).map(|i| Bson::Int64(start + i * step)).collect()))
+    Ok(Bson::Array((0..count as i64).map(|i| integer_bson(start + i * step)).collect()))
 }
 
 // ---------------------------------------------------------------------------
