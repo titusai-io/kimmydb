@@ -320,7 +320,7 @@ fn bucket_auto_refuses_granularity_and_a_malformed_spec() {
 
 #[test]
 fn the_bucket_count_is_held_to_the_pipeline_ceiling() {
-    let limits = Limits { max_documents: 3 };
+    let limits = Limits { max_documents: 3, ..Default::default() };
     let stages =
         aggregate::parse(&[doc! {"$bucketAuto": {"groupBy": "$price", "buckets": 10}}]).unwrap();
     let err =

@@ -8,7 +8,10 @@
 
 pub mod accumulators;
 pub mod aggregate;
+pub mod budget;
+pub mod densify;
 pub mod expr;
+pub mod fill;
 pub mod filter;
 /// The `$jsonSchema` engine. Lives in `kimmy-core` so that `kimmy-storage` can parse a
 /// validator without depending on this crate (ADR-181, ADR-257); re-exported here.
@@ -22,6 +25,8 @@ pub mod shape;
 pub mod stages;
 pub mod update;
 pub mod update_pipeline;
+pub mod window;
+pub mod window_acc;
 
 #[cfg(test)]
 mod accumulator_tests;
@@ -32,7 +37,11 @@ mod date_tests;
 #[cfg(test)]
 mod decimal_arith_tests;
 #[cfg(test)]
+mod densify_tests;
+#[cfg(test)]
 mod facet_tests;
+#[cfg(test)]
+mod fill_tests;
 #[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
@@ -51,6 +60,8 @@ mod stage_reference_tests;
 mod stage_tests;
 #[cfg(test)]
 mod update_pipeline_tests;
+#[cfg(test)]
+mod window_tests;
 
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};

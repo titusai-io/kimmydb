@@ -142,7 +142,7 @@ fn sort_by_count_is_held_to_the_group_limit() {
     let err = run_with(
         doc! {"$sortByCount": "$k"},
         kinds(&["a", "b", "c", "d"]),
-        &Limits { max_documents: 3 },
+        &Limits { max_documents: 3, ..Default::default() },
     )
     .expect_err("four groups over a limit of three");
     assert!(matches!(&err, Error::Limit(m) if m.contains("$sortByCount")), "{err:?}");

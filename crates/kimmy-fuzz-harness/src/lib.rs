@@ -278,7 +278,7 @@ pub fn aggregate_parse_run(data: &[u8]) {
     };
     let Ok(pipeline) = aggregate::parse(&stages) else { return };
 
-    let limits = aggregate::Limits { max_documents: 2_000 };
+    let limits = aggregate::Limits { max_documents: 2_000, ..Default::default() };
     let mut docs = PIPELINE_INPUT.clone();
     for stage in &pipeline {
         match aggregate::apply(stage, docs, &limits) {
