@@ -1191,10 +1191,12 @@ refused, `400`, on every such document, regardless of what `b` holds at any
 element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 
 **`$range`** is bounded as every array an expression builds is, to 16 MiB of
-BSON (about 900,000 integers): `{$range: [0, 1000000000]}` is a memory
+BSON, which is 1,052,254 integers: `{$range: [0, 1000000000]}` is a memory
 exhaustion written as an expression, and it is a `413` before anything is
 allocated, its size worked out from the two ends and the step. `[0, 200000]`
-answers, as in the reference. Its elements are 64-bit integers, as every integer result here is
+answers, as in the reference. The reference's own limit is 100 MB of memory, at
+16 bytes an element about 6.5 million integers, so `[0, 2000000]` answers there
+and is a `413` here. Its elements are 64-bit integers, as every integer result here is
 , so `$type` of an element is `"long"`
 ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).
 
