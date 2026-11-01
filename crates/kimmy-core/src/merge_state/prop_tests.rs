@@ -199,10 +199,16 @@ fn bare(mut s: MergeState) -> MergeState {
 /// horizon. The model does not claim convergence across a partition longer than retention
 /// (model5.main: "tiny-retention runs"), and the same holds here. `exact_assoc` is therefore set
 /// only for retentions that the generated runs do not outrun; for small ones the rate of
-/// differing triples is bounded instead (observed 0.5 percent at R from 2 to 10). The pool holds the
+/// differing triples is bounded instead (observed 0.5 percent at R from 2 to 10).
+///
+/// R = 10 is checked with the bound, not exactly, and that is deliberate. The pool holds the
 /// early states of every writer next to its late ones, so a triple can span more than R: a state
 /// whose life was killed by a delete older than the joined horizon, joined with one that never saw
-/// the delete, is alive again (a partition longer than retention, which the design does not cover).
+/// the delete, is alive again (a partition longer than retention, which the design does not
+/// cover). Measured: 1 of this test's 300 triples is not associative at R = 10, and 8 of 3,000 in
+/// a larger pool (seeds 1 to 200); every one of them has a version-vector spread of 11 to 26
+/// between its three states, more than R. At R = 20 and R = 40 none of 3,000 triples differs,
+/// and `join_laws_retention_beyond_the_spread` asserts exact associativity there.
 fn check_laws(o: &JoinOptions, exact_assoc: bool, seeds: u64, steps: usize, count: usize) {
     let ps = pools(seeds, steps, o);
     let mut assoc_loss_diff = 0;
@@ -262,6 +268,13 @@ fn join_laws_small_retention() {
     check_laws(&opts(6), false, 60, 24, 300);
     check_laws(&opts(3), false, 60, 30, 200);
     check_laws(&opts(10), false, 60, 30, 300);
+}
+
+#[test]
+fn join_laws_retention_beyond_the_spread() {
+    // Where R exceeds the clock spread of the pooled states, the join is exactly associative.
+    check_laws(&opts(20), true, 60, 30, 300);
+    check_laws(&opts(40), true, 60, 30, 300);
 }
 
 #[test]

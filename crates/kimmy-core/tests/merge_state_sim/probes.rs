@@ -202,7 +202,8 @@ fn graded(cfg: &Cfg, names: &str, f: impl FnOnce(&mut Vec<Node>, &mut Log)) -> V
     grade(&ms, &log)
 }
 
-/// The B1 and M1 scenarios of the review of #275, each with the problems the oracle finds.
+/// The B1 and M1 scenarios (a counter that nets to zero; a non-numeric upsert creation value),
+/// each with the problems the oracle finds.
 pub fn scenarios() -> Vec<(String, Vec<String>)> {
     let cfg = Cfg::default_ret();
     let s = |x: &str| Value::Str(x.into());

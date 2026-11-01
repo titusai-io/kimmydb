@@ -195,8 +195,8 @@ fn named_probes(rep: &mut Report) {
     }
 }
 
-/// B1 and M1 scenarios, graded against the oracle (the reviewer's `zero_sum_counter_vanishes`
-/// and `upsert_string_base_starts_no_generation`).
+/// B1 and M1 scenarios (a counter that nets to zero; a non-numeric upsert creation value),
+/// graded against the oracle.
 fn scenario_probes(rep: &mut Report) {
     for (name, problems) in probes::scenarios() {
         println!(
