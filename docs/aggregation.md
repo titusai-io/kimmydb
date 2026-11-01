@@ -1834,12 +1834,13 @@ abandons while waiting, over REST and `/mcp`; its worker is free at once. A
 single operation that cannot be split, such as one regular expression over a
 16 MiB string, ends at its next look, not at the deadline.
 
-A trailing `$merge` or `$out` is checked before each chunk it writes. Stopped
-before the first commit it writes nothing and creates nothing; stopped after, it
-is answered `500 partially_applied` with `timeout` as its cause and the counts
-of what landed, as any failure after a first commit is
-([`$merge`](#merge)): what was written stands and replicates, and no chunk is
-half written. A query that needs longer than 30 s needs the setting raised.
+A trailing `$merge` or `$out` follows ADR-192's rule for a write that commits
+more than once: the deadline cuts it only before its first commit. The pipeline
+that computes the output and the checks before the target is created are under
+the deadline, and a request cut there creates no target and writes nothing
+(`503 timeout`). Once the write has begun it goes to its end and is answered
+with its counts, even if the deadline has passed ([`$merge`](#merge)). A query
+that needs longer than 30 s needs the setting raised.
 
 ---
 

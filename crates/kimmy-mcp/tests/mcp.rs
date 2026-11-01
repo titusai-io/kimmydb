@@ -25,9 +25,19 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
+/// The limits a test that is not about the deadline serves under: a deadline an hour
+/// long, so a machine under load cannot turn a slow call into a `timeout` result
+/// (ADR-266). The tests of the deadline set their own.
+fn unhurried() -> kimmy_api::RequestLimits {
+    kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_secs(3600),
+        ..kimmy_api::RequestLimits::default()
+    }
+}
+
 impl Server {
     async fn start() -> Self {
-        Self::start_with(kimmy_api::RequestLimits::default()).await
+        Self::start_with(unhurried()).await
     }
 
     async fn start_with(limits: kimmy_api::RequestLimits) -> Self {
@@ -84,9 +94,10 @@ impl Server {
         // used to reproduce a defect instead of catching it: both sides said
         // `router(..).merge(..)`, which leaves `/mcp` outside the layer that
         // counts, times, traces and challenges.
-        let app = kimmy_api::router_with(
+        let app = kimmy_api::router_with_limits(
             Arc::clone(&state),
             Some(kimmy_mcp::mcp_router(Arc::clone(&state), Vec::new(), limits)),
+            limits,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

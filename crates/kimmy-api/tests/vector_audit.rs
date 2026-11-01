@@ -61,7 +61,14 @@ fn dropping_vectors_a_partial_disable_left_behind_is_audited() {
     let state =
         kimmy_api::state(Arc::clone(&engine), tokens, true, kimmy_api::RateLimits::disabled())
             .unwrap();
-    let app = kimmy_api::router(state);
+    let app = kimmy_api::router_with_limits(
+        state,
+        None,
+        kimmy_api::RequestLimits {
+            request_timeout: std::time::Duration::from_secs(3600),
+            ..kimmy_api::RequestLimits::default()
+        },
+    );
     let request = axum::http::Request::builder()
         .method("DELETE")
         .uri("/v1/db/shop/coll/docs/vector?drop_vectors=true")

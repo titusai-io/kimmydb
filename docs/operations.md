@@ -113,14 +113,15 @@ webhook's or provider's host has stalled, is abandoned with `503 timeout` at
 30 s. It is also a deadline on the synchronous work that checks it
 ([ADR-266](decisions.md)): an aggregation (every stage, the expression
 iteration operators, `$lookup`, `$graphLookup`, the reads of other collections
-and the chunks of a `$merge` or `$out`), the scan under a `find` or `count`,
+and the pipeline of a `$merge` or `$out`), the scan under a `find` or `count`,
 and an update, delete or find-and-modify until its first commit. Each looks at
 the clock every 1,024 iterations and, past the deadline, stops with the same
 `503 timeout`, freeing its worker; a read or a pure computation is simply
-abandoned. A `$merge` or `$out` cut after a chunk has committed is answered
-`500 partially_applied` with `timeout` as its cause and what landed, as any
-failure after a first commit is. A multi-document update or delete that has
-committed a chunk keeps going to its end (ADR-192). An index build, a bulk
+abandoned. A request that commits more than once follows ADR-192: the
+deadline cuts it only before its first commit. A `$merge` or `$out` is cut
+while its pipeline runs and before its target is created, and a multi-document
+update or delete before its first chunk commits; after that they keep going to
+their end and are answered with what landed. An index build, a bulk
 insert, a backup, a restore and a database drop are not cut: they run to
 completion and are answered however late. So a query that must run longer than
 30 s needs the setting raised; one that is merely forgotten no longer holds a

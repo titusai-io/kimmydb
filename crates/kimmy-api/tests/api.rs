@@ -137,6 +137,17 @@ impl Client {
     }
 }
 
+/// The limits a test that is not about the deadline serves under: a deadline an hour
+/// long, so a machine under load cannot turn a slow request into a `503 timeout`
+/// (ADR-266: work that checks the deadline is cut by wall-clock time). The tests of the
+/// deadline itself set their own.
+fn unhurried() -> kimmy_api::RequestLimits {
+    kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_secs(3600),
+        ..kimmy_api::RequestLimits::default()
+    }
+}
+
 impl Server {
     async fn start() -> Self {
         Self::start_with(false).await
@@ -280,7 +291,7 @@ impl Server {
     }
 
     async fn build(insecure_no_auth: bool, limits: kimmy_api::RateLimits) -> Self {
-        Self::build_with(insecure_no_auth, limits, kimmy_api::RequestLimits::default()).await
+        Self::build_with(insecure_no_auth, limits, unhurried()).await
     }
 
     /// A server whose requests are abandoned after `timeout`.
@@ -323,7 +334,7 @@ impl Server {
         let engine = Arc::clone(&self.state.engine);
         let state =
             kimmy_api::state(engine, tokens, false, kimmy_api::RateLimits::disabled()).unwrap();
-        Self::serve(state, Arc::clone(&self._dir), kimmy_api::RequestLimits::default()).await
+        Self::serve(state, Arc::clone(&self._dir), unhurried()).await
     }
 
     /// A server with a router merged beside the REST table, the way the daemon
@@ -338,8 +349,7 @@ impl Server {
         let state =
             kimmy_api::state(Arc::clone(&engine), tokens, false, kimmy_api::RateLimits::disabled())
                 .unwrap();
-        Self::serve_with(state, Arc::new(dir), kimmy_api::RequestLimits::default(), Some(extra))
-            .await
+        Self::serve_with(state, Arc::new(dir), unhurried(), Some(extra)).await
     }
 
     async fn serve(
@@ -430,8 +440,10 @@ impl Server {
         let mut request = request.body(axum::body::Body::from(payload)).expect("a request");
         request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
 
-        let response =
-            kimmy_api::router(Arc::clone(&self.state)).oneshot(request).await.expect("router");
+        let response = kimmy_api::router_with_limits(Arc::clone(&self.state), None, unhurried())
+            .oneshot(request)
+            .await
+            .expect("router");
         let status = response.status().as_u16();
         let head = format!("{:?}", response.headers());
         let bytes = response.into_body().collect().await.expect("body").to_bytes();
