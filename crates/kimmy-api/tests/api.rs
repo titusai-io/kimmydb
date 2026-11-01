@@ -20247,3 +20247,192 @@ async fn pipeline_coll_more(server: &Server, token: &str, doc: Value) {
     let res = server.post("/v1/db/shop/coll/pu/docs", Some(token), doc).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
 }
+
+// ---------------------------------------------------------------------------
+// The memory an aggregation may hold (ADR-269)
+// ---------------------------------------------------------------------------
+
+/// `app.zmem` holding `n` documents `{_id: 0..n}`, the reviewer's Z1 collection.
+async fn zmem_collection(server: &Server, token: &str, n: i64) {
+    let res = server.post("/v1/db/kx/collections", Some(token), json!({ "name": "zmem" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs: Vec<Value> = (0..n).map(|i| json!({ "_id": i })).collect();
+    let res = server.post("/v1/db/kx/coll/zmem/bulk", Some(token), Value::Array(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+/// The reviewer's pipeline: every document is given a string of `1024 * 2^steps` bytes, then
+/// `$count` makes the answer tiny, so what is measured is the pipeline alone.
+fn z1_pipeline(steps: i64) -> Value {
+    json!({ "pipeline": [
+        { "$addFields": { "big": { "$reduce": {
+            "input": { "$range": [0, steps] },
+            "initialValue": "x".repeat(1024),
+            "in": { "$concat": ["$$value", "$$value"] },
+        } } } },
+        { "$count": "n" },
+    ] })
+}
+
+/// A number from a message: the one after `marker`.
+fn number_after(text: &str, marker: &str) -> usize {
+    let tail = &text
+        [text.find(marker).unwrap_or_else(|| panic!("{marker:?} not in {text}")) + marker.len()..];
+    tail.chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap()
+}
+
+#[tokio::test]
+async fn an_aggregation_over_its_memory_limit_is_a_413_at_a_bounded_size() {
+    // Small parameters for the reviewer's Z1: strings of 1 MiB (1024 x 2^10), 40 documents,
+    // and a limit of 8 MiB. The real case, 1,000 documents of 8 MiB, is `z1-guard.sh`.
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(8 << 20, 64 << 20));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 40).await;
+
+    let refused = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), z1_pipeline(10)).await;
+    assert_eq!(refused.status, 413, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "answer_too_large", "{:?}", refused.body);
+    assert_eq!(refused.body["retry"], "no", "{:?}", refused.body);
+    let message = refused.body["message"].as_str().unwrap();
+    // It names what held the memory, the limit, and what to do.
+    assert!(message.contains("the output of $addFields"), "{message}");
+    assert!(message.contains("limit of 8388608 bytes"), "{message}");
+    assert!(message.contains("add $match, $project or $limit early"), "{message}");
+    assert!(message.contains("raise aggregate.memory_limit_bytes"), "{message}");
+    // Bounded: it was refused at the first document that passed the limit, with about
+    // eight of forty strings built, not after all of them.
+    let held = number_after(message, " is ");
+    assert!(held > 8 << 20 && held < 11 << 20, "refused at {held} bytes, not after 40 MiB");
+
+    // Within the limit the same pipeline runs, and the account is empty afterwards.
+    let ok = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), z1_pipeline(6)).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    assert_eq!(ok.body["documents"], json!([{ "n": 40 }]));
+    let pool = server.state.aggregate_memory().pool();
+    assert_eq!(pool.used(), 0, "every request returns what it reserved");
+    assert_eq!((pool.limit_refusals(), pool.pool_refusals()), (1, 0));
+}
+
+#[tokio::test]
+async fn the_source_read_stops_at_the_document_that_passes_the_limit() {
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(100 << 10, 8 << 20));
+    let token = server.root().await;
+    server.post("/v1/db/kx/collections", Some(&token), json!({ "name": "wide" })).await;
+    let docs: Vec<Value> = (0..60)
+        .map(|i| json!({ "_id": i, "pad": "p".repeat(20_000), "z": i32::from(i == 50) - 1 }))
+        .collect();
+    let res = server.post("/v1/db/kx/coll/wide/bulk", Some(&token), Value::Array(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // Document 50 would fail the leading `$match` with a division by zero if the read got
+    // there; it is refused at the sixth, about 100 KiB in.
+    let pipeline = json!({ "pipeline": [
+        { "$match": { "$expr": { "$gt": [{ "$divide": [1, "$z"] }, -100] } } },
+    ] });
+    let refused =
+        server.post("/v1/db/kx/coll/wide/aggregate", Some(&token), pipeline.clone()).await;
+    assert_eq!(refused.status, 413, "{:?}", refused.body);
+    let message = refused.body["message"].as_str().unwrap();
+    assert!(message.contains("the source read"), "{message}");
+    assert!(message.contains("aggregate.memory_limit_bytes"), "{message}");
+    // The same read under a limit that holds it runs into document 50.
+    let auth = kimmy_api::state::Auth(kimmy_auth::Principal::superuser("test"));
+    let reached = kimmy_api::exec::aggregate_with_limits(
+        &server.state,
+        &auth,
+        "kx",
+        "wide",
+        &pipeline["pipeline"],
+        kimmy_query::aggregate::Limits::default(),
+    )
+    .await
+    .expect_err("document 50 divides by zero");
+    assert_eq!(reached.status, 400, "{}", reached.message);
+}
+
+#[tokio::test]
+async fn an_aggregation_the_pool_cannot_cover_is_a_503_that_says_to_retry() {
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(8 << 20, 10 << 20));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 6).await;
+    let pool = server.state.aggregate_memory().pool().clone();
+
+    // Another big request holds 6 MiB of the 10 MiB pool, and keeps it until this one has
+    // been answered: a barrier on each side.
+    let before = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let after = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let other = {
+        let (pool, before, after) = (pool.clone(), before.clone(), after.clone());
+        std::thread::spawn(move || {
+            let budget = kimmy_query::budget::BufferBudget::pooled(8 << 20, &pool);
+            let mut lease = budget.lease("another request");
+            lease.charge(6 << 20).unwrap();
+            before.wait();
+            after.wait();
+        })
+    };
+    before.wait();
+    assert_eq!(pool.used(), 6 << 20);
+    // Six strings of 1 MiB are within the request's own limit and not within what is left.
+    let refused = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), z1_pipeline(10)).await;
+    after.wait();
+    other.join().unwrap();
+    assert_eq!(refused.status, 503, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "timeout", "{:?}", refused.body);
+    assert_eq!(refused.body["retry"], "wait", "{:?}", refused.body);
+    assert_eq!(refused.header("retry-after").as_deref(), Some("1"));
+    let message = refused.body["message"].as_str().unwrap();
+    assert!(message.contains("aggregate.memory_pool_bytes"), "{message}");
+    assert!(message.contains("retry later"), "{message}");
+    assert_eq!((pool.pool_refusals(), pool.limit_refusals()), (1, 0));
+
+    // When the other request has ended, the same request is answered.
+    assert_eq!(pool.used(), 0);
+    let ok = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), z1_pipeline(10)).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    assert_eq!(ok.body["documents"], json!([{ "n": 6 }]));
+    assert_eq!(pool.used(), 0);
+
+    // And both refusals are on /metrics.
+    let metrics = server.state.metrics.render_with(&server.state.storage_readings().unwrap());
+    assert!(metrics.contains("kimmy_aggregate_memory_pool_refusals_total 1"), "{metrics}");
+    assert!(metrics.contains("kimmy_aggregate_memory_limit_refusals_total 0"), "{metrics}");
+}
+
+#[tokio::test]
+async fn concurrent_aggregations_are_answered_or_told_to_retry_and_return_the_pool() {
+    // Eight requests at once, each holding about 3 MiB at its peak, against a pool of 8 MiB:
+    // every one is answered or refused with a 503, and the pool is empty when all are done.
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(8 << 20, 8 << 20));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 3).await;
+    let pool = server.state.aggregate_memory().pool().clone();
+    let base = server.base.clone();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (base, token, barrier) = (base.clone(), token.clone(), barrier.clone());
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            Client
+                .request(
+                    "POST",
+                    &format!("{base}/v1/db/kx/coll/zmem/aggregate"),
+                    Some(&token),
+                    Some(z1_pipeline(10)),
+                )
+                .await
+                .status
+        }));
+    }
+    let mut statuses = Vec::new();
+    for task in tasks {
+        statuses.push(task.await.unwrap());
+    }
+    assert!(statuses.iter().all(|s| *s == 200 || *s == 503), "{statuses:?}");
+    assert!(statuses.contains(&200), "{statuses:?}");
+    assert_eq!(pool.used(), 0);
+}
