@@ -16,15 +16,33 @@
 //! with `503 timeout`, and whatever was being waited for is no longer waited
 //! for.
 //!
-//! What it does **not** interrupt is synchronous work. A storage operation — a
-//! scan, a bulk commit, an index backfill, a database drop — runs to completion
-//! on the worker thread without yielding, and a future that never yields is
-//! never seen to be pending; the deadline cannot fire inside it, and a request
-//! that finishes late is still answered with its result rather than replaced
-//! with a refusal after the work was done. That is the right outcome for those
-//! operations, and it is stated here so nobody expects a 30-second query to be
-//! cut short by this setting. Cooperative cancellation inside the engine is a
-//! separate decision, deferred in ADR-099.
+//! What the future's timeout does **not** interrupt is synchronous work. A
+//! storage operation — a scan, a bulk commit, an index backfill, a database
+//! drop — runs to completion on the worker thread without yielding, and a
+//! future that never yields is never seen to be pending; the timeout cannot
+//! fire inside it. ADR-099 deferred cooperative cancellation inside the engine;
+//! ADR-266 supersedes that deferral for the work listed below.
+//!
+//! # Cooperative cancellation (ADR-266)
+//!
+//! A handler that runs synchronous work reads the time it has left
+//! ([`request_time_left`]) and sets it as a thread-local deadline for the
+//! duration of the call ([`deadline_scope`]). The loops under it call
+//! `kimmy_core::deadline` (a counter increment per iteration, a clock read
+//! every 1024th), and past the deadline they return
+//! `kimmy_core::Error::DeadlineExceeded`, which is answered with the same
+//! `503 timeout` this module's middleware gives, naming the configured
+//! timeout. The worker is freed at the next check instead of at the end of the
+//! work.
+//!
+//! Covered: an aggregation (every stage, the expression iteration operators,
+//! `$lookup`, `$graphLookup`, the foreign reads and the `$merge` / `$out`
+//! chunk loop), the reads under `find` and `count`, and an update, delete or
+//! find-and-modify until it has written. Not covered, and still answered with
+//! its result however late it finishes: an index build, a bulk insert, a
+//! backup, a restore and a database drop; ADR-266 gives the reason for each.
+//! A scope applies only to the thread that set it, so work moved to another
+//! thread sets its own inside that thread's closure.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -127,6 +145,16 @@ pub fn request_time_left() -> Option<Duration> {
     REQUEST_DEADLINE
         .try_with(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
         .ok()
+}
+
+/// Set what is left of this request's time as the thread's deadline for the
+/// synchronous work that follows, until the returned guard drops (ADR-266).
+///
+/// A no-op outside a request with a deadline, and inside another scope the earlier
+/// deadline holds. The guard belongs to the thread and is not `Send`: do not hold
+/// it across an `.await`, which is why a future that does is refused by the compiler.
+pub fn deadline_scope() -> kimmy_core::deadline::Deadline {
+    kimmy_core::deadline::Deadline::scope(request_time_left())
 }
 
 /// Run `handler` as [`enforce_timeout`] runs one: under a request deadline of

@@ -421,9 +421,11 @@ impl ErrorCode {
             Self::ProviderError => Some(LogLevel::Warn),
 
             // `WARN`, uniformly, and deliberately not split by cause. The
-            // deadline is only ever reached while the request is *waiting* —
-            // for the rest of its body, or for an upstream provider — and
-            // those have different owners: a slow client is the caller's, a
+            // deadline is reached while the request is *waiting* — for the
+            // rest of its body, or for an upstream provider — or, since
+            // ADR-266, while a query it asked for is running and stops itself
+            // (a slow query is the caller's, or an operator's limit set too
+            // low). The waits have different owners: a slow client is the caller's, a
             // slow provider is the operator's. But the deadline is enforced
             // by a middleware layer wrapping the whole handler
             // (`limits::enforce_timeout`), which learns only that the future
@@ -1039,6 +1041,11 @@ impl From<CoreError> for ApiError {
             CoreError::ResumeTokenExpired => {
                 ApiError::new(StatusCode::GONE, ErrorCode::ResumeTokenExpired, e.to_string())
             }
+            // Work that saw the request's deadline pass itself (ADR-266), where the
+            // timeout layer would have: the same answer, naming the configured number.
+            CoreError::DeadlineExceeded => ApiError::timeout(
+                crate::limits::request_timeout().unwrap_or(crate::limits::DEFAULT_REQUEST_TIMEOUT),
+            ),
             CoreError::Bson(_) | CoreError::Serialization(_) | CoreError::Internal(_) => {
                 ApiError::internal(e.to_string())
             }
@@ -1596,6 +1603,21 @@ mod tests {
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
         assert_eq!(e.code, ErrorCode::BadRequest);
         assert_eq!(e.message, "invalid query: $group produced 3 documents");
+    }
+
+    #[test]
+    fn work_that_saw_the_deadline_pass_answers_the_timeout_the_middleware_gives() {
+        // Through the storage error too, which is how a walk's row reports it.
+        let walk: ApiError = StorageError::Core(CoreError::DeadlineExceeded).into();
+        let work: ApiError = CoreError::DeadlineExceeded.into();
+        for e in [&walk, &work] {
+            assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(e.code, ErrorCode::Timeout);
+        }
+        // Outside a request the default is named, as a vector search's is.
+        let middleware = ApiError::timeout(crate::limits::DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(work.message, middleware.message);
+        assert_eq!(work.retry(), middleware.retry());
     }
 
     #[test]
