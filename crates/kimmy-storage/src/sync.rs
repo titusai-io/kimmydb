@@ -6630,6 +6630,43 @@ mod tests {
     }
 
     #[test]
+    fn a_definition_holding_a_regex_value_is_refused_rather_than_failing_the_round() {
+        // A bare regular expression as a field's value is a pattern in a filter
+        // (ADR-267) and the partial-filter language has no patterns, so this build
+        // refuses a definition that holds one, with `InvalidQuery`, which settles
+        // as a request refusal: skipped and counted, not a failed round. No
+        // released build stores one, so the entry is built by hand.
+        let node = kimmy_core::NodeId::from_bytes([7; 16]);
+        let stamp = Stamp::new(Hlc::new(1_000, 0), node);
+        let id = kimmy_core::CollectionId::derive("shop", "orders");
+        let mut index = definition("by_pattern", vec![field("size")], false, Some(stamp));
+        let filter = doc! {"size": bson::Bson::RegularExpression(bson::Regex {
+            pattern: "^a".try_into().unwrap(),
+            options: "".try_into().unwrap(),
+        })};
+        assert!(
+            matches!(
+                kimmy_core::PartialFilter::parse(&filter),
+                Err(kimmy_core::Error::InvalidQuery(_))
+            ),
+            "premise: refused as an invalid query: {:?}",
+            kimmy_core::PartialFilter::parse(&filter)
+        );
+        index.partial_filter = Some(filter);
+        let entry = create_index_entry(id, "shop", "orders", index, stamp);
+
+        let (m, _dm) = engine();
+        m.create_collection("shop", "orders").unwrap();
+        let outcome = m.apply_batch(&[entry]).expect("the round completes rather than failing");
+
+        assert_eq!(outcome.ddl_refused, 1, "the one index is skipped and counted: {outcome:?}");
+        assert!(
+            m.get_collection("shop", "orders").unwrap().index("by_pattern").is_none(),
+            "and it is not built"
+        );
+    }
+
+    #[test]
     fn concurrent_definitions_under_one_name_settle_on_the_later_stamp() {
         // Two members created one name with different definitions while they
         // could not see each other. ADR-123 left both standing, counted; a

@@ -3926,6 +3926,51 @@ mod tests {
         assert!(b.get(&cb, &DocId::String("a-1".into())).unwrap().is_some());
     }
 
+    #[test]
+    fn a_snapshot_index_holding_a_regex_value_is_skipped_and_the_documents_restore() {
+        // A bare regular expression as a field's value is a pattern in a filter
+        // (ADR-267), and the partial-filter language has no patterns, so this build
+        // refuses a definition that holds one -- `InvalidQuery`, a request
+        // refusal that `settle` skips and counts. No released build stores one (the
+        // boundary did not read `$regularExpression` before), so the page is
+        // doctored.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("size")], false, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "a-1", "size": 10 }).unwrap();
+        b.create_collection("shop", "orders").unwrap();
+
+        let filter = doc! {"size": bson::Bson::RegularExpression(bson::Regex {
+            pattern: "^a".try_into().unwrap(),
+            options: "".try_into().unwrap(),
+        })};
+        assert!(
+            matches!(
+                kimmy_core::PartialFilter::parse(&filter),
+                Err(kimmy_core::Error::InvalidQuery(_))
+            ),
+            "premise: refused as an invalid query: {:?}",
+            kimmy_core::PartialFilter::parse(&filter)
+        );
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            for index in &mut state.indexes {
+                index.partial_filter = Some(filter.clone());
+            }
+        }
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+            .expect("a refused index must not fail the page");
+
+        assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "the documents restore: {outcome:?}");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(cb.index("size_1").is_none(), "a definition this build refuses");
+        assert!(b.get(&cb, &DocId::String("a-1".into())).unwrap().is_some());
+    }
+
     /// Rewrite an index's creation stamp in place, so a test can put the
     /// receiver's definition in a known order against the snapshot's without
     /// racing the wall clock.
@@ -9154,22 +9199,42 @@ mod relog {
         assert_eq!(once, filter, "the encoding keeps every type of the filter as sent");
 
         // And `as_stored` is what the store does: the filter an index is
-        // created with reads back from the metadata as `as_stored` says.
-        let (e, _d) = engine();
-        e.create_collection("shop", "orders").unwrap();
-        e.create_index_with(
-            "shop",
-            "orders",
-            vec![field("f")],
-            false,
-            crate::meta::Enforcement::Local,
-            Some("f".into()),
-            None,
-            Some(filter.clone()),
-        )
-        .unwrap();
+        // created with reads back from the metadata as `as_stored` says. The
+        // regex is split out of this step. `as_stored` is an encoding and keeps
+        // it as sent (asserted above), but creating an index parses the filter,
+        // and a regular expression as a field's value is a pattern in a filter
+        // (ADR-267), which the partial-filter language does not have, so a
+        // create with it is refused. What this step protects (ADR-182: storing is
+        // the identity) holds for every other type.
+        let create = |f: &bson::Document| {
+            let (e, _d) = engine();
+            e.create_collection("shop", "orders").unwrap();
+            let created = e.create_index_with(
+                "shop",
+                "orders",
+                vec![field("f")],
+                false,
+                crate::meta::Enforcement::Local,
+                Some("f".into()),
+                None,
+                Some(f.clone()),
+            );
+            (e, created, _d)
+        };
+        let mut without_regex = filter.clone();
+        without_regex.remove("regex");
+        let kept = store(&without_regex);
+        let (e, created, _d) = create(&without_regex);
+        created.unwrap();
         let held = e.get_collection("shop", "orders").unwrap();
-        assert_eq!(held.index("f").unwrap().partial_filter.as_ref(), Some(&once));
+        assert_eq!(held.index("f").unwrap().partial_filter.as_ref(), Some(&kept));
+        let (_e, refused, _d) = create(&filter);
+        let err = refused.expect_err("a regular expression is not a partial-filter value");
+        assert!(
+            matches!(&err, crate::error::StorageError::Core(kimmy_core::Error::InvalidQuery(m))
+                if m.contains("regular expression")),
+            "{err:?}"
+        );
     }
 
     #[test]

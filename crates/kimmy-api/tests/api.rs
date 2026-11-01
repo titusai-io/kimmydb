@@ -19903,6 +19903,87 @@ async fn a_pipeline_upsert_runs_on_the_document_the_filter_seeds() {
     }))
     .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
+    // It is worded as the same refusal on a document that matched is: one prefix.
+    let matched = fam(json!({
+        "filter": { "_id": 1 }, "update": [{ "$set": { "_id": 5 } }]
+    }))
+    .await;
+    assert_eq!(matched.status, 400, "{:?}", matched.body);
+    let text = |res: &Res| res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        text(&res).starts_with("invalid query: invalid update: _id is immutable and cannot be"),
+        "{}",
+        text(&res)
+    );
+    assert_eq!(text(&res), text(&matched));
+}
+
+/// A value-size limit (a string an expression builds over 16 MiB) is the same
+/// answer on a write as on an aggregate: `413` and the code `ValueTooLarge` maps to,
+/// not the `400` of the string the refusal travels in. The code is read from the
+/// aggregate's answer, so the test follows the error type and not a spelling.
+#[tokio::test]
+async fn a_value_size_limit_is_a_413_on_every_write_path() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "a": 1 }), json!({ "_id": 2, "a": 2 })])
+        .await;
+    // 25 doublings of a byte: 2^24 is exactly 16 MiB, which no expression builds.
+    let big = json!({"$reduce": {
+        "input": {"$range": [0, 24]},
+        "initialValue": "x",
+        "in": {"$concat": ["$$value", "$$value"]},
+    }});
+    let reference = server
+        .post(
+            "/v1/db/shop/coll/pu/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$limit": 1}, {"$set": {"s": big.clone()}}]}),
+        )
+        .await;
+    assert_eq!(reference.status, 413, "{:?}", reference.body);
+    let code = reference.body["error"].clone();
+    let stages = json!([{ "$set": { "s": big } }]);
+    let before = pu_doc(&server, &token, 1).await;
+
+    let update = |multi: bool| {
+        server.post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": stages.clone(), "multi": multi }),
+        )
+    };
+    let fam = |body: Value| server.post("/v1/db/shop/coll/pu/find_and_modify", Some(&token), body);
+    let mut answers = vec![("update", update(false).await), ("update multi", update(true).await)];
+    answers.push((
+        "find_and_modify",
+        fam(json!({ "filter": { "_id": 1 }, "update": stages.clone() })).await,
+    ));
+    // The seed of an upsert that inserts: the refusal is deferred until it does.
+    answers.push((
+        "find_and_modify upsert",
+        fam(json!({ "filter": { "_id": 99 }, "update": stages.clone(), "upsert": true })).await,
+    ));
+    for (what, res) in &answers {
+        assert_eq!(res.status, 413, "{what}: {:?}", res.body);
+        assert_eq!(res.body["error"], code, "{what}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("builds is 16777216 bytes"), "{what}: {message}");
+    }
+    // Nothing was written, and an ordinary refusal on the same paths is still a 400.
+    assert_eq!(pu_doc(&server, &token, 1).await, before);
+    let missing = server.get("/v1/db/shop/coll/pu/docs/99", Some(&token)).await;
+    assert_eq!(missing.status, 404, "{:?}", missing.body);
+    let bad = update(false).await;
+    assert_eq!(bad.status, 413);
+    let plain = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "a": { "$add": ["$a", "x"] } } }] }),
+        )
+        .await;
+    assert_eq!(plain.status, 400, "{:?}", plain.body);
 }
 
 #[tokio::test]

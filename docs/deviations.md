@@ -116,6 +116,7 @@ Also recorded here, so they are not read as bugs:
 - **Integer arithmetic stores an `Int64`.** The expression layer's integer results are `Int64` (the entry on numbers), so `$set: {n: {$add: ["$n", 1]}}` over an `Int32` field stores a long, and `{$set: {total: {$add: ["$a", "$b"]}}}` over an equal `Int32` `total` counts as a change (`modified` counts it); the reference keeps `Int32` and counts nothing. Moving the expression layer to the reference's result widths is a separate piece of work.
 - **The result is stored whole.** A pipeline that leaves the document byte-equal (including key order and number types) is a no-op; one that changes a number's type (`1` to `1.0`) is a change, as for operators.
 - **An `_id` refusal is raised when the update runs** (the result is known only then), with the other write-time refusals, not when the body is parsed.
+- **A pipeline that removes `_id` and changes nothing else reports `modified: 0` and writes nothing.** The stored `_id` is put back first, so the result equals the stored document and is a no-op; the reference reports `modified: 1` for the same update. An upsert refused by its seed is worded as the same refusal on a matched document is (`invalid query: invalid update: _id is immutable and cannot be updated`).
 
 **To close:** none planned beyond the integer width.
 
@@ -604,7 +605,7 @@ regex literal and a literal under `$not`; it used to match nothing. A
 (`{"name": /^s/}`) was an equality match against a regex value, not a pattern
 match. That changed with ADR-267: it is a pattern, as `$regex` is, and `$eq` is
 the spelling that compares the regex as a value. It matches strings only, where
-the reference also matches a stored regex of the same pattern (not probed). A `partialFilterExpression` refuses a regex as a field's value at creation (it is a pattern, and the partial filter language has none, as it refuses `$regex`; `{$eq: <regex>}` is allowed), over HTTP and over MCP, which reads the same JSON; no stored definition can hold one.
+the reference also matches a stored regex of the same pattern (not probed). A `partialFilterExpression` refuses a regex as a field's value at creation (it is a pattern, and the partial filter language has none, as it refuses `$regex`; `{$eq: <regex>}` is allowed), over HTTP and over MCP, which reads the same JSON; no stored definition can hold one, and a replicated or snapshot definition that does is skipped and counted (`ddl_refused`) like any definition this build refuses.
 
 ---
 
