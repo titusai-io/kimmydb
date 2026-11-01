@@ -619,10 +619,9 @@ mod tests {
         // Over the ceiling a run refuses; a plan has nothing to count.
         let tight = aggregate::Limits { max_documents: 3, ..Default::default() };
         let pipeline = json!([{ "$match": {} }]);
-        let run = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(exec::aggregate_with_limits(&state, &root(), "app", "a", &pipeline, tight));
+        let run = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(
+            exec::aggregate_with_limits(&state, &root(), "app", "a", &pipeline, tight.clone()),
+        );
         assert!(run.is_err());
         let planned =
             aggregate_explain_with_limits(&state, &root(), "app", "a", &pipeline, tight).unwrap();

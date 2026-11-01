@@ -3548,12 +3548,12 @@ mod tests {
         let auth = superuser();
 
         let whole = json!([{ "$count": "c" }]);
-        let err = agg_limits(&state, &auth, "app", "docs", &whole, limits)
+        let err = agg_limits(&state, &auth, "app", "docs", &whole, limits.clone())
             .expect_err("the whole collection is over the ceiling");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
 
         let narrowed = json!([{ "$match": { "n": 3 } }, { "$count": "c" }]);
-        let out = agg_limits(&state, &auth, "app", "docs", &narrowed, limits).unwrap();
+        let out = agg_limits(&state, &auth, "app", "docs", &narrowed, limits.clone()).unwrap();
         assert_eq!(out["documents"][0]["c"], 6);
 
         // A leading `$match` that admits too many is refused too, and the
@@ -4010,9 +4010,15 @@ mod tests {
         assert!(format!("{err:?}").contains("$graphLookup reads `emp` whole"), "{err:?}");
         // What the walks reach, in all, is held to it too: 3 + 2 + 1 is six, and `e` adds two more.
         let six = aggregate::Limits { max_documents: 6, ..Default::default() };
-        let out =
-            agg_limits(&state, &superuser(), "app", "emp", &from(json!(["d", "c", "b"]), 10), six)
-                .unwrap();
+        let out = agg_limits(
+            &state,
+            &superuser(),
+            "app",
+            "emp",
+            &from(json!(["d", "c", "b"]), 10),
+            six.clone(),
+        )
+        .unwrap();
         assert_eq!(out["documents"].as_array().unwrap().len(), 3);
         let err = agg_limits(
             &state,
@@ -4020,7 +4026,7 @@ mod tests {
             "app",
             "emp",
             &from(json!(["d", "c", "b", "e"]), 10),
-            six,
+            six.clone(),
         )
         .expect_err("over six reached in all");
         let text = format!("{err:?}");
@@ -4119,7 +4125,7 @@ mod tests {
         let graph = json!([{ "$graphLookup": { "from": "big", "startWith": "$k",
             "connectFromField": "n", "connectToField": "n", "as": "up", "maxDepth": 1,
             "restrictSearchWithMatch": { "$expr": { "$gt": [{ "$add": ["$n", 1] }, 0] } } } }]);
-        let err = agg_limits(&state, &superuser(), "app", "one", &graph, three)
+        let err = agg_limits(&state, &superuser(), "app", "one", &graph, three.clone())
             .expect_err("eleven documents under a ceiling of three");
         let text = format!("{err:?}");
         assert!(
