@@ -222,11 +222,27 @@ fn null_propagates_and_other_types_keep_the_old_words() {
         err(op("$subtract", vec![date, dec("1")]), none()),
         "invalid query: $subtract needs a date or a number, found a Decimal128"
     );
-    // `$mod` refuses a decimal by name.
-    assert_eq!(
-        err(op("$mod", vec![dec("5"), Bson::Int32(2)]), none()),
-        "invalid query: $mod needs numbers, found a Decimal128"
-    );
+    // `$mod` takes a decimal: the exact remainder, a decimal, with the dividend's sign.
+    for (a, b, want) in [
+        (dec("5"), Bson::Int32(2), "1"),
+        (dec("5.5"), Bson::Int32(2), "1.5"),
+        (dec("-5"), Bson::Int32(3), "-2"),
+        (Bson::Int32(7), dec("2.5"), "2.0"),
+        (dec("0.3"), dec("0.1"), "0.0"),
+        (dec("10"), dec("-3"), "1"),
+        (dec("1E+40"), Bson::Int32(7), "4"),
+        (dec("5"), dec("1E+40"), "5"),
+        // An infinite divisor leaves the dividend as it is; an infinite dividend is NaN.
+        (dec("5"), dec("Infinity"), "5"),
+        (dec("-5.50"), dec("-Infinity"), "-5.50"),
+        (dec("Infinity"), Bson::Int32(2), "NaN"),
+        (dec("NaN"), Bson::Int32(2), "NaN"),
+        (dec("123456789012345678901234567890.123"), dec("0.5"), "0.123"),
+    ] {
+        assert_eq!(val(op("$mod", vec![a.clone(), b.clone()]), none()), dec(want), "{a:?} % {b:?}");
+    }
+    assert_eq!(err(op("$mod", vec![dec("5"), dec("0")]), none()), "invalid query: $mod by zero");
+    assert_eq!(val(op("$mod", vec![dec("5"), Bson::Null]), none()), Bson::Null);
     // Arithmetic with no decimal in it is what it always was.
     assert_eq!(val(op("$add", vec![Bson::Int32(1), Bson::Int32(2)]), none()), Bson::Int64(3));
     assert_eq!(val(op("$divide", vec![Bson::Int32(1), Bson::Int32(2)]), none()), Bson::Double(0.5));

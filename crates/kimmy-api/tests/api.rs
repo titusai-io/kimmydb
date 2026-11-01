@@ -14554,7 +14554,8 @@ async fn facet_answers_one_document_of_arrays_and_refuses_what_it_cannot_hold() 
     .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
     let res = aggregate(json!([{ "$facet": { "a": [ { "$lookup": { "from": "nope", "localField": "city", "foreignField": "city", "as": "g" } } ] } }])).await;
-    assert!(res.status == 404 || res.status == 403, "{:?}", res.body);
+    // A collection that is not there reads as empty on a node with no peers.
+    assert_eq!(res.status, 200, "{:?}", res.body);
 }
 
 #[tokio::test]
@@ -14691,8 +14692,10 @@ async fn graph_lookup_walks_a_collection_and_requires_a_depth() {
         res.body["message"],
         "invalid query: $graphLookup `maxDepth` is from 0 to 1000, found 1001"
     );
+    // A collection that is not there reads as empty on a node with no peers.
     let res = aggregate(walk(json!({ "maxDepth": 1, "from": "nope" }))).await;
-    assert!(res.status == 404 || res.status == 403, "{:?}", res.body);
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["up"], json!([]), "{:?}", res.body);
 }
 
 #[tokio::test]
@@ -17941,6 +17944,113 @@ async fn a_document_without_an_id_is_inserted_or_discarded_never_matched() {
 }
 
 #[tokio::test]
+async fn union_with_needs_read_on_both_collections_and_reads_a_missing_one_as_empty() {
+    // ADR-263: `$unionWith` reads a second collection, so it is authorized against it as
+    // `$lookup` is; a caller that may not read it learns nothing of whether it exists.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "archive"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 1, "k": "o"})).await;
+    server
+        .post("/v1/db/shop/coll/archive/docs", Some(&token), json!({"_id": 2, "k": "secret"}))
+        .await;
+    let union = |coll: &str| json!({"pipeline": [{"$unionWith": coll}]});
+
+    let res =
+        server.post("/v1/db/shop/coll/orders/aggregate", Some(&token), union("archive")).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1, "k": "o"}, {"_id": 2, "k": "secret"}]));
+
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({"user": "limited", "password": "limited-password",
+                   "grants": [{"db": "shop", "collection": "orders", "actions": ["read"]}]}),
+        )
+        .await;
+    let limited = server.login("limited", "limited-password").await;
+    for coll in ["archive", "never_created"] {
+        let res =
+            server.post("/v1/db/shop/coll/orders/aggregate", Some(&limited), union(coll)).await;
+        assert_eq!(res.status, 403, "{coll}: {:?}", res.body);
+        assert!(!format!("{:?}", res.body).contains("secret"));
+        // The plan is refused the same way.
+        let res = server
+            .post(
+                "/v1/db/shop/coll/orders/aggregate",
+                Some(&limited),
+                json!({"pipeline": [{"$unionWith": coll}], "explain": true}),
+            )
+            .await;
+        assert_eq!(res.status, 403, "explain {coll}: {:?}", res.body);
+    }
+    // Nested in a sub-pipeline the collection is checked just the same.
+    let nested = json!({"pipeline": [{"$unionWith": {"coll": "orders", "pipeline": [
+        {"$unionWith": "archive"}]}}]});
+    let res = server.post("/v1/db/shop/coll/orders/aggregate", Some(&limited), nested).await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
+
+    // Allowed to read it, a collection that is not there is empty.
+    let res = server
+        .post("/v1/db/shop/coll/orders/aggregate", Some(&token), union("never_created"))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1, "k": "o"}]));
+}
+
+#[tokio::test]
+async fn the_small_stages_run_end_to_end() {
+    // ADR-263: `$sortByCount`, `$replaceWith`, `$unset`, `$sample`, `$redact`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "docs"})).await;
+    for doc in [
+        json!({"_id": 1, "k": "a", "level": 1, "sub": {"level": 5, "x": 1}, "keep": {"level": 1}}),
+        json!({"_id": 2, "k": "b", "level": 1, "sub": {"level": 1, "x": 2}}),
+        json!({"_id": 3, "k": "a", "level": 5}),
+    ] {
+        server.post("/v1/db/shop/coll/docs/docs", Some(&token), doc).await;
+    }
+    let run = |pipeline: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server
+                .post("/v1/db/shop/coll/docs/aggregate", Some(token), json!({"pipeline": pipeline}))
+                .await
+        }
+    };
+    let res = run(json!([{"$sortByCount": "$k"}])).await;
+    assert_eq!(res.body["documents"], json!([{"_id": "a", "count": 2}, {"_id": "b", "count": 1}]));
+    let res = run(json!([{"$match": {"_id": 1}}, {"$replaceWith": "$sub"}])).await;
+    assert_eq!(res.body["documents"], json!([{"level": 5, "x": 1}]));
+    let res = run(json!([{"$match": {"_id": 1}}, {"$unset": ["sub.x", "keep", "k"]}])).await;
+    assert_eq!(res.body["documents"], json!([{"_id": 1, "level": 1, "sub": {"level": 5}}]));
+    let res = run(json!([{"$sample": {"size": 2}}])).await;
+    assert_eq!(res.body["count"], 2, "{:?}", res.body);
+    let res = run(json!([{"$sample": {"size": 10}}])).await;
+    assert_eq!(res.body["count"], 3);
+    let res = run(json!([{"$sample": {"size": 0}}])).await;
+    assert_eq!(res.body["count"], 0, "{:?}", res.body);
+    let res = run(json!([{"$sample": {"size": -1}}])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let redact = json!({"$redact": {"$cond": {"if": {"$eq": ["$level", 5]},
+                                              "then": "$$PRUNE", "else": "$$DESCEND"}}});
+    let res = run(json!([redact, {"$sort": {"_id": 1}}])).await;
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            {"_id": 1, "k": "a", "level": 1, "keep": {"level": 1}},
+            {"_id": 2, "k": "b", "level": 1, "sub": {"level": 1, "x": 2}},
+        ])
+    );
+    let res = run(json!([{"$redact": "$$DESCEND"}, {"$project": {"x": "$$PRUNE"}}])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("valid only inside a $redact"));
+}
+
+#[tokio::test]
 async fn a_merge_may_not_write_what_the_pipeline_reads() {
     let server = Server::start().await;
     let token = server.root().await;
@@ -17965,6 +18075,31 @@ async fn a_merge_may_not_write_what_the_pipeline_reads() {
         ),
         ("$graphLookup", json!([graph.clone(), {"$merge": {"into": "other"}}])),
         ("$graphLookup out", json!([graph, {"$out": "other"}])),
+        ("$unionWith", json!([{"$unionWith": "other"}, {"$merge": {"into": "other"}}])),
+        ("$unionWith out", json!([{"$unionWith": "other"}, {"$out": "other"}])),
+        (
+            "$unionWith pipeline",
+            json!([
+                {"$unionWith": {"coll": "t", "pipeline": [{"$unionWith": "other"}]}},
+                {"$merge": {"into": "other"}},
+            ]),
+        ),
+        (
+            "$unionWith in a $lookup",
+            json!([
+                {"$lookup": {"from": "t", "as": "j", "pipeline": [{"$unionWith": "other"}]}},
+                {"$merge": {"into": "other"}},
+            ]),
+        ),
+        (
+            "$unionWith in a $facet",
+            json!([
+                {"$facet": {"f": [{"$unionWith": "other"}]}},
+                {"$unwind": "$f"},
+                {"$replaceRoot": {"newRoot": "$f"}},
+                {"$merge": {"into": "other"}},
+            ]),
+        ),
         (
             "$facet",
             json!([
@@ -19437,4 +19572,456 @@ async fn a_bound_of_negative_infinity_keeps_the_rest_of_the_validator_in_force()
         .find(|l| l.starts_with("kimmy_validator_unparseable_total "))
         .unwrap_or_default();
     assert!(unparseable.ends_with(" 0"), "the stored schema parses: {unparseable}");
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline updates (ADR-265)
+// ---------------------------------------------------------------------------
+
+async fn pipeline_coll(server: &Server, token: &str, docs: Vec<Value>) {
+    server.post("/v1/db/shop/collections", Some(token), json!({ "name": "pu" })).await;
+    for doc in docs {
+        let res = server.post("/v1/db/shop/coll/pu/docs", Some(token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+}
+
+async fn pu_doc(server: &Server, token: &str, id: i64) -> Value {
+    let res = server.get(&format!("/v1/db/shop/coll/pu/docs/{id}"), Some(token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    res.body
+}
+
+#[tokio::test]
+async fn an_array_update_is_a_pipeline_update_on_update_and_find_and_modify() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(
+        &server,
+        &token,
+        vec![
+            json!({ "_id": 1, "a": 2, "b": 3, "scratch": true, "items": [{ "q": 1 }, { "q": 4 }] }),
+            json!({ "_id": 2, "a": 10, "b": 20, "items": [] }),
+            json!({ "_id": 3, "a": 1, "b": 1, "total": 2 }),
+        ],
+    )
+    .await;
+    let update = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/pu/update", Some(token), body).await }
+    };
+
+    // Many documents, a result of each one's own.
+    let res = update(json!({
+        "filter": {},
+        "update": [
+            { "$set": { "total": { "$add": ["$a", "$b"] }, "n": { "$size": { "$ifNull": ["$items", []] } } } },
+            { "$unset": "scratch" }
+        ],
+        "multi": true
+    }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // Document 3 held `total: 2` as an int; the sum is a long, so every one changed.
+    assert_eq!((res.body["matched"].as_u64(), res.body["modified"].as_u64()), (Some(3), Some(3)));
+    assert_eq!(pu_doc(&server, &token, 1).await["total"], 5);
+    assert_eq!(pu_doc(&server, &token, 1).await["n"], 2);
+    assert!(pu_doc(&server, &token, 1).await.get("scratch").is_none());
+    assert_eq!(pu_doc(&server, &token, 2).await["total"], 30);
+    assert_eq!(pu_doc(&server, &token, 3).await["n"], 0);
+
+    // The same again changes nothing: matched, not modified, no commit, no stamp.
+    let again = update(json!({
+        "filter": {},
+        "update": [
+            { "$set": { "total": { "$add": ["$a", "$b"] }, "n": { "$size": { "$ifNull": ["$items", []] } } } },
+            { "$unset": "scratch" }
+        ],
+        "multi": true
+    }))
+    .await;
+    assert_eq!(again.body["matched"], 3, "{:?}", again.body);
+    assert_eq!(again.body["modified"], 0, "{:?}", again.body);
+    assert_eq!(again.body["commits"], 0);
+    assert!(again.body.get("stamp").is_none(), "{:?}", again.body);
+
+    // One document: the first match only, and the stamp comes back.
+    let one = update(
+        json!({ "filter": { "a": { "$gte": 1 } }, "update": [{ "$set": { "flag": true } }] }),
+    )
+    .await;
+    assert_eq!(one.body["matched"], 1);
+    assert_eq!(one.body["modified"], 1);
+    assert!(one.body["stamp"].is_string(), "{:?}", one.body);
+
+    // project, replaceWith in turn.
+    let res = update(json!({
+        "filter": { "_id": 1 },
+        "update": [
+            { "$project": { "a": 1, "b": 1 } },
+            { "$replaceWith": { "$mergeObjects": ["$$ROOT", { "sum": { "$add": ["$a", "$b"] } }] } }
+        ]
+    }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "a": 2, "b": 3, "sum": 5 }));
+    // $replaceWith without an `_id` keeps the stored one.
+    let res =
+        update(json!({ "filter": { "_id": 2 }, "update": [{ "$replaceWith": { "only": "$a" } }] }))
+            .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 2).await, json!({ "_id": 2, "only": 10 }));
+
+    // find_and_modify: before and after images.
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/pu/find_and_modify", Some(token), body).await }
+    };
+    let res = fam(json!({
+        "filter": { "_id": 3 }, "update": [{ "$set": { "a": { "$multiply": ["$a", 7] } } }],
+        "returnDocument": "after"
+    }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"]["a"], 7);
+    let res = fam(json!({ "filter": { "_id": 3 }, "update": [{ "$set": { "a": 0 } }] })).await;
+    assert_eq!(res.body["document"]["a"], 7, "before is the default");
+    assert_eq!(pu_doc(&server, &token, 3).await["a"], 0);
+}
+
+#[tokio::test]
+async fn a_pipeline_upsert_runs_on_the_document_the_filter_seeds() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "k": "a", "n": 1 })]).await;
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/pu/find_and_modify", Some(token), body).await }
+    };
+    // Nothing matches: the document is `{_id: 9, k: "new"}` from the equalities, then the stages.
+    let res = fam(json!({
+        "filter": { "_id": 9, "k": "new" },
+        "update": [{ "$set": { "n": { "$add": [{ "$ifNull": ["$n", 0] }, 1] }, "label": { "$concat": ["$k", "!"] } } }],
+        "upsert": true, "returnDocument": "after"
+    }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 9, "k": "new", "n": 1, "label": "new!" }));
+    assert_eq!(
+        pu_doc(&server, &token, 9).await,
+        json!({ "_id": 9, "k": "new", "n": 1, "label": "new!" })
+    );
+    // A match is updated, not inserted.
+    let res = fam(json!({
+        "filter": { "k": "a" }, "update": [{ "$set": { "n": { "$add": ["$n", 10] } }}],
+        "upsert": true, "returnDocument": "after"
+    }))
+    .await;
+    assert_eq!(res.body["document"]["n"], 11, "{:?}", res.body);
+    // No `_id` in the filter: one is generated; the stages see the seed alone.
+    let res = fam(json!({
+        "filter": { "k": "fresh" }, "update": [{ "$replaceWith": { "k": "$k", "made": true } }],
+        "upsert": true, "returnDocument": "after"
+    }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"]["made"], true);
+    assert_eq!(res.body["document"]["k"], "fresh");
+    assert!(res.body["document"]["_id"].is_string() || res.body["document"]["_id"].is_object());
+    // A pipeline that would give the inserted document an `_id` of its own is refused.
+    let res = fam(json!({
+        "filter": { "k": "other" }, "update": [{ "$set": { "_id": 5 } }], "upsert": true
+    }))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_pipeline_update_is_refused_for_what_it_may_not_do_and_writes_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "a": 1, "items": [{ "q": 1 }] })]).await;
+    let path = "/v1/db/shop/coll/pu/update";
+    let try_update = |update: Value, extra: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            let mut body = json!({ "filter": { "_id": 1 }, "update": update });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            server.post(path, Some(token), body).await
+        }
+    };
+    let message = |res: &Res| res.body["message"].as_str().unwrap_or_default().to_string();
+
+    for (update, extra, prefix) in [
+        (json!([1]), json!({}), "invalid update: each stage of a pipeline update is a document"),
+        (
+            json!(["$set"]),
+            json!({}),
+            "invalid update: each stage of a pipeline update is a document",
+        ),
+        (
+            json!([{ "$match": { "a": 1 } }]),
+            json!({}),
+            "invalid update: a pipeline update allows only $addFields (or $set), $project (or $unset) and $replaceRoot (or $replaceWith), found $match",
+        ),
+        (
+            json!([{ "$set": { "a": 2 } }, { "$group": { "_id": null } }]),
+            json!({}),
+            "invalid update: a pipeline update allows only",
+        ),
+        (
+            json!([{ "$set": { "items.$[l].q": 5 } }]),
+            json!({ "arrayFilters": [{ "l.q": 1 }] }),
+            "invalid update: arrayFilters apply to update operators, not to a pipeline update",
+        ),
+        (
+            json!([{ "$set": { "a": 2 } }]),
+            json!({ "arrayFilters": [] }),
+            "", // an empty list is no filters
+        ),
+        (
+            json!([{ "$set": { "_id": 2 } }]),
+            json!({}),
+            "invalid query: invalid update: _id is immutable and cannot be updated",
+        ),
+        (
+            json!([{ "$replaceWith": { "_id": 7 } }]),
+            json!({}),
+            "invalid query: invalid update: _id is immutable and cannot be updated",
+        ),
+        (json!([{ "$set": { "a": { "$add": ["$items", 1] } } }]), json!({}), "invalid query:"),
+        (json!([{ "$set": { "a": { "$nope": 1 } } }]), json!({}), "unsupported operator \"$nope\""),
+        (
+            json!([{ "$replaceWith": "$a" }]),
+            json!({}),
+            "invalid query: $replaceRoot needs a document",
+        ),
+        (json!([{ "$set": 1 }]), json!({}), "invalid query: $set takes a document"),
+    ] {
+        let res = try_update(update.clone(), extra.clone()).await;
+        if prefix.is_empty() {
+            assert_eq!(res.status, 200, "{update} {extra}: {:?}", res.body);
+            continue;
+        }
+        assert_eq!(res.status, 400, "{update} {extra}: {:?}", res.body);
+        assert!(message(&res).starts_with(prefix), "{update} {extra}: {}", message(&res));
+    }
+    // Only the harmless one wrote anything (`a` went to 2).
+    assert_eq!(
+        pu_doc(&server, &token, 1).await,
+        json!({ "_id": 1, "a": 2, "items": [{ "q": 1 }] })
+    );
+
+    // A positional projection cannot name an element after a pipeline.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "items.q": 1 }, "update": [{ "$set": { "a": 3 } }],
+                    "projection": { "items.$": 1 }, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(message(&res).contains("after a pipeline update"), "{}", message(&res));
+
+    // `explain` plans an array update as it does any: nothing runs.
+    let res = try_update(json!([{ "$set": { "a": 99 } }]), json!({ "explain": true })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 1).await["a"], 2);
+
+    // A scalar or a null `update` stays what it was.
+    for bad in [json!(5), json!("x"), json!(null)] {
+        let res = try_update(bad.clone(), json!({})).await;
+        assert!(res.status == 400 || res.status == 422, "{bad}: {:?}", res.body);
+    }
+}
+
+#[tokio::test]
+async fn a_pipeline_result_is_held_to_the_validator_as_every_update_is() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    validated_items(&server, &token, "error", "strict").await;
+    let url = "/v1/db/shop/coll/items/update";
+    for (update, what) in [
+        (json!([{ "$set": { "qty": { "$subtract": ["$qty", 9] } } }]), "set below zero"),
+        (json!([{ "$unset": "qty" }]), "unset"),
+        (json!([{ "$replaceWith": { "note": "x" } }]), "replaceWith without qty"),
+        (json!([{ "$project": { "note": 1 } }]), "project without qty"),
+    ] {
+        for multi in [false, true] {
+            let res = server
+                .post(url, Some(&token), json!({ "filter": {}, "update": update, "multi": multi }))
+                .await;
+            refused(&res, &format!("{what} multi {multi}"));
+        }
+    }
+    let fam = server
+        .post(
+            "/v1/db/shop/coll/items/find_and_modify",
+            Some(&token),
+            json!({ "filter": { "_id": 77 }, "update": [{ "$set": { "qty": -1 } }], "upsert": true }),
+        )
+        .await;
+    refused(&fam, "upsert");
+    assert_eq!(count_of(&server, &token).await, 1);
+    assert_eq!(server.get("/v1/db/shop/coll/items/docs/1", Some(&token)).await.body["qty"], 5);
+    let ok = server
+        .post(
+            url,
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "qty": { "$add": ["$qty", 1] } } }] }),
+        )
+        .await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+
+    // Under warn the same writes are stored and counted.
+    let server = Server::start().await;
+    let token = server.root().await;
+    validated_items(&server, &token, "warn", "strict").await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/items/update",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": [{ "$set": { "qty": -5 } }] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(server.get("/v1/db/shop/coll/items/docs/1", Some(&token)).await.body["qty"], -5);
+    let metrics = metrics_text(&server).await;
+    assert!(metrics.contains("kimmy_validation_warnings_total 1"), "{metrics}");
+}
+
+#[tokio::test]
+async fn a_pipeline_result_over_the_document_cap_is_413_and_nothing_is_stored() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    // A 1 MiB string passes the body limit; seventeen copies of it, as fields, do not fit
+    // in a stored document.
+    let big = "x".repeat(1024 * 1024);
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "s": big })]).await;
+    let copies = |n: usize| {
+        let fields: serde_json::Map<String, Value> =
+            (0..n).map(|i| (format!("t{i}"), json!("$s"))).collect();
+        json!({ "filter": {}, "update": [{ "$set": fields }] })
+    };
+    let res = server.post("/v1/db/shop/coll/pu/update", Some(&token), copies(17)).await;
+    assert_eq!(res.status, 413, "{:?}", res.body.to_string().chars().take(300).collect::<String>());
+    assert!(pu_doc(&server, &token, 1).await.get("t0").is_none());
+    // Fourteen copies fit under the cap.
+    let res = server.post("/v1/db/shop/coll/pu/update", Some(&token), copies(14)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body.to_string().chars().take(300).collect::<String>());
+}
+
+#[tokio::test]
+async fn now_in_a_pipeline_update_is_one_date_for_the_request() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, (1..=5).map(|i| json!({ "_id": i })).collect()).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "at": "$$NOW", "again": "$$NOW" } }], "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let first = pu_doc(&server, &token, 1).await;
+    assert!(first["at"].is_object(), "{first}");
+    assert_eq!(first["at"], first["again"]);
+    for i in 2..=5 {
+        assert_eq!(pu_doc(&server, &token, i).await["at"], first["at"]);
+    }
+}
+
+#[tokio::test]
+async fn a_pipeline_update_judges_id_on_the_final_result_and_takes_an_empty_pipeline() {
+    // Reference 6.0.5: a result without `_id` gets the stored one back; a changed one is
+    // refused; an empty pipeline changes nothing.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "a": 2, "b": 3 })]).await;
+    let update = |update: Value, extra: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            let mut body = json!({ "filter": { "_id": 1 }, "update": update });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            server.post("/v1/db/shop/coll/pu/update", Some(token), body).await
+        }
+    };
+    let res = update(json!([]), json!({})).await;
+    assert_eq!(
+        (res.status, &res.body["matched"], &res.body["modified"]),
+        (200, &json!(1), &json!(0))
+    );
+    for stages in [
+        json!([{ "$unset": "_id" }]),
+        json!([{ "$set": { "_id": "$$REMOVE" } }]),
+        json!([{ "$project": { "_id": 0, "a": 1 } }, { "$set": { "u": 1 } }]),
+    ] {
+        let res = update(stages.clone(), json!({ "multi": true })).await;
+        assert_eq!(res.status, 200, "{stages}: {:?}", res.body);
+    }
+    // `$project: {_id: 0, a: 1}` kept `a` and, in the next stage, `u`; `_id` is back.
+    assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "a": 2, "u": 1 }));
+    let res = update(json!([{ "$set": { "_id": 2 } }]), json!({})).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    // The same `_id` as a long is the same `_id`.
+    let res = update(json!([{ "$set": { "_id": { "$toLong": "$_id" } } }]), json!({})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // A stage after `$replaceWith` reads no `_id`; it is back at the end.
+    let res =
+        update(json!([{ "$replaceWith": { "a": "$a" } }, { "$set": { "x": "$_id" } }]), json!({}))
+            .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(pu_doc(&server, &token, 1).await, json!({ "_id": 1, "a": 2 }));
+}
+
+#[tokio::test]
+async fn an_upsert_whose_pipeline_fails_on_the_seed_updates_the_document_that_matches() {
+    // The seed is run through the pipeline only if the upsert inserts.
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "sub": { "x": 1 } })]).await;
+    let fam = |body: Value| {
+        let (server, token) = (&server, &token);
+        async move { server.post("/v1/db/shop/coll/pu/find_and_modify", Some(token), body).await }
+    };
+    let res = fam(json!({
+        "filter": { "_id": 1 }, "update": [{ "$replaceWith": "$sub" }],
+        "upsert": true, "returnDocument": "after"
+    }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 1, "x": 1 }));
+    // Nothing matches and the pipeline cannot read the seed: now it is refused, nothing stored.
+    let res = fam(json!({
+        "filter": { "_id": 2 }, "update": [{ "$replaceWith": "$sub" }], "upsert": true
+    }))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(server.get("/v1/db/shop/coll/pu/docs/2", Some(&token)).await.status, 404);
+    // A seed with no `_id` and a pipeline that gives it `null` is refused only on insert
+    // (a missing path would leave the field out; `$ifNull` makes it a value).
+    let res = fam(json!({
+        "filter": { "k": "x" }, "update": [{ "$set": { "_id": { "$ifNull": ["$_id", null] }, "y": 2 } }], "upsert": true
+    }))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    pipeline_coll_more(&server, &token, json!({ "_id": 3, "k": "x" })).await;
+    let res = fam(json!({
+        "filter": { "k": "x" }, "update": [{ "$set": { "_id": { "$ifNull": ["$_id", null] }, "y": 2 } }], "upsert": true,
+        "returnDocument": "after"
+    }))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({ "_id": 3, "k": "x", "y": 2 }));
+}
+
+async fn pipeline_coll_more(server: &Server, token: &str, doc: Value) {
+    let res = server.post("/v1/db/shop/coll/pu/docs", Some(token), doc).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
 }

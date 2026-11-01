@@ -53,6 +53,7 @@ use kimmy_core::{Error, Result, path};
 use crate::expr::{Binding, Expr, Mean, Scope, Total, type_name};
 use crate::filter::{self, Filter};
 use crate::shape::{self, ID_FIELD, Projection, SortKey};
+use crate::stages;
 
 /// How many documents a single stage may hold or emit.
 ///
@@ -164,6 +165,26 @@ pub enum Stage {
     /// `$out`: the pipeline's output inserted into a collection that is new or empty
     /// (ADR-255). Only ever last. Executed by the caller.
     Out(Target),
+    /// `$sortByCount`: `$group` on the expression, counting, then `$sort` by the count,
+    /// largest first (ADR-263).
+    SortByCount(Expr),
+    /// `$sample`: this many documents, chosen at random (ADR-263).
+    Sample(usize),
+    /// `$redact`: each document and each embedded document kept, pruned or descended
+    /// into by what the expression answers (ADR-263).
+    Redact(Expr),
+    /// `$unionWith`: the input, then another collection's documents (ADR-263). Executed
+    /// by the caller, which holds a storage handle.
+    UnionWith(Box<UnionWith>),
+}
+
+/// The fields of a `$unionWith` stage.
+#[derive(Clone, Debug)]
+pub struct UnionWith {
+    /// The collection, in the database the pipeline runs in.
+    pub coll: String,
+    /// Run over that collection's documents before they are appended.
+    pub stages: Vec<Stage>,
 }
 
 /// A collection a write stage names: `"name"`, or `{db, coll}` for one in another
@@ -341,7 +362,11 @@ impl Stage {
     /// Whether running this stage needs a storage handle.
     pub fn needs_storage(&self) -> bool {
         match self {
-            Stage::Lookup { .. } | Stage::GraphLookup(_) | Stage::Merge(_) | Stage::Out(_) => true,
+            Stage::Lookup { .. }
+            | Stage::GraphLookup(_)
+            | Stage::Merge(_)
+            | Stage::Out(_)
+            | Stage::UnionWith(_) => true,
             Stage::Facet(facets) => {
                 facets.iter().any(|(_, stages)| stages.iter().any(Stage::needs_storage))
             }
@@ -370,6 +395,10 @@ impl Stage {
             Stage::GraphLookup(_) => "$graphLookup",
             Stage::Merge(_) => "$merge",
             Stage::Out(_) => "$out",
+            Stage::SortByCount(_) => "$sortByCount",
+            Stage::Sample(_) => "$sample",
+            Stage::Redact(_) => "$redact",
+            Stage::UnionWith(_) => "$unionWith",
         }
     }
 
@@ -379,7 +408,7 @@ impl Stage {
     }
 }
 
-/// The collections a pipeline's `$lookup` and `$graphLookup` stages read, nested
+/// The collections a pipeline's `$lookup`, `$graphLookup` and `$unionWith` stages read, nested
 /// sub-pipelines and `$facet` branches included, in the order a run reaches them,
 /// each once. All are in the database the pipeline runs in.
 pub fn foreign_collections(stages: &[Stage]) -> Vec<&str> {
@@ -396,6 +425,12 @@ pub fn foreign_collections(stages: &[Stage]) -> Vec<&str> {
                 }
                 Stage::GraphLookup(spec) if !out.contains(&spec.from.as_str()) => {
                     out.push(&spec.from);
+                }
+                Stage::UnionWith(spec) => {
+                    if !out.contains(&spec.coll.as_str()) {
+                        out.push(&spec.coll);
+                    }
+                    walk(&spec.stages, out);
                 }
                 Stage::Facet(facets) => facets.iter().for_each(|(_, sub)| walk(sub, out)),
                 _ => {}
@@ -447,10 +482,13 @@ struct Placement {
     /// Inside a `$lookup` sub-pipeline.
     sub: bool,
     in_facet: bool,
+    /// Anywhere under a `$unionWith` sub-pipeline, where `$out`, `$merge` and
+    /// `$vectorSearch` are refused.
+    in_union: bool,
 }
 
 impl Placement {
-    const TOP: Placement = Placement { sub: false, in_facet: false };
+    const TOP: Placement = Placement { sub: false, in_facet: false, in_union: false };
 }
 
 fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
@@ -548,6 +586,12 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
             parse_facet(as_document(name, value)?, vars, at)
         }
         "$graphLookup" => parse_graph_lookup(as_document(name, value)?, vars, at),
+        "$replaceWith" => Ok(Stage::ReplaceRoot(Expr::parse_with_vars(value, vars)?)),
+        "$sortByCount" => stages::parse_sort_by_count(value, vars),
+        "$unset" => stages::parse_unset(value),
+        "$sample" => stages::parse_sample(value),
+        "$redact" => Ok(Stage::Redact(Expr::parse_redact(value, vars)?)),
+        "$unionWith" => parse_union_with(value, vars, at),
         "$bucket" => parse_bucket(as_document(name, value)?, vars),
         "$bucketAuto" => parse_bucket_auto(as_document(name, value)?, vars),
         "$vectorSearch" => {
@@ -559,6 +603,13 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
                 return Err(Error::InvalidQuery(
                     "$vectorSearch cannot be used inside a $facet: it is a pipeline's source, \
                      and a facet's source is the stage's input"
+                        .into(),
+                ));
+            }
+            if at.in_union {
+                return Err(Error::InvalidQuery(
+                    "$vectorSearch cannot be used inside a $unionWith sub-pipeline: it is a \
+                     pipeline's source"
                         .into(),
                 ));
             }
@@ -579,11 +630,17 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
             parse_vector_search(as_document(name, value)?)
         }
         "$merge" | "$out" => {
-            if at.in_facet || at.sub {
+            if at.in_facet || at.sub || at.in_union {
                 return Err(Error::InvalidQuery(format!(
                     "{name} writes a collection, so it can only be the last stage of the \
                      top-level pipeline; it cannot run inside a {}",
-                    if at.in_facet { "$facet" } else { "$lookup sub-pipeline" }
+                    if at.in_facet {
+                        "$facet"
+                    } else if at.in_union {
+                        "$unionWith sub-pipeline"
+                    } else {
+                        "$lookup sub-pipeline"
+                    }
                 )));
             }
             if name == "$merge" {
@@ -598,8 +655,9 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         // message a caller actually reads.
         other => Err(Error::InvalidQuery(format!(
             "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
-             $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup, $facet, \
-             $bucket, $bucketAuto, $graphLookup, $vectorSearch, $merge, $out"
+             $replaceRoot, $replaceWith, $unset, $sort, $sortByCount, $limit, $skip, $sample, \
+             $redact, $unwind, $group, $count, $lookup, $unionWith, $facet, $bucket, \
+             $bucketAuto, $graphLookup, $vectorSearch, $merge, $out"
         ))),
     }
 }
@@ -1094,7 +1152,76 @@ fn parse_replace_root(spec: &Document, vars: &[String]) -> Result<Stage> {
     Ok(Stage::ReplaceRoot(Expr::parse_with_vars(new_root, vars)?))
 }
 
-fn as_document<'a>(stage: &str, value: &'a Bson) -> Result<&'a Document> {
+/// `{$unionWith: "coll"}` or `{$unionWith: {coll, pipeline}}` (ADR-263).
+///
+/// The collection is in the database the pipeline runs in, as a `$lookup`'s `from` is.
+/// The sub-pipeline is parsed in the scope the stage sits in (so an enclosing
+/// `$lookup`'s `let` names are readable) with `$out`, `$merge` and `$vectorSearch`
+/// refused anywhere under it. A `$facet` is allowed in it, as the reference allows one.
+fn parse_union_with(value: &Bson, vars: &[String], at: Placement) -> Result<Stage> {
+    let (coll, raw) = match value {
+        Bson::String(coll) => (coll.clone(), None),
+        Bson::Document(spec) => {
+            deny_unknown_keys("$unionWith", spec, &["coll", "pipeline"])?;
+            let coll = match spec.get("coll") {
+                Some(Bson::String(coll)) => coll.clone(),
+                Some(other) => {
+                    return Err(Error::InvalidQuery(format!(
+                        "$unionWith `coll` is a collection name, found {}",
+                        type_name(other)
+                    )));
+                }
+                None => {
+                    return Err(Error::InvalidQuery(
+                        "$unionWith needs `coll`, the collection to read: {$unionWith: {coll: \
+                         <name>, pipeline: [..]}}"
+                            .into(),
+                    ));
+                }
+            };
+            let raw = match spec.get("pipeline") {
+                None => None,
+                Some(Bson::Array(raw)) => Some(raw),
+                Some(other) => {
+                    return Err(Error::InvalidQuery(format!(
+                        "$unionWith `pipeline` is an array of stages, found {}",
+                        type_name(other)
+                    )));
+                }
+            };
+            (coll, raw)
+        }
+        other => {
+            return Err(Error::InvalidQuery(format!(
+                "$unionWith takes a collection name or {{coll, pipeline}}, found {}",
+                type_name(other)
+            )));
+        }
+    };
+    if coll.is_empty() {
+        return Err(Error::InvalidQuery("$unionWith needs a non-empty collection name".into()));
+    }
+    let stages = match raw {
+        None => Vec::new(),
+        Some(raw) => {
+            let raw = raw
+                .iter()
+                .map(|stage| {
+                    stage.as_document().cloned().ok_or_else(|| {
+                        Error::InvalidQuery(format!(
+                            "each $unionWith pipeline stage is a document, found {}",
+                            type_name(stage)
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            parse_pipeline(&raw, vars, Placement { in_union: true, ..at })?
+        }
+    };
+    Ok(Stage::UnionWith(Box::new(UnionWith { coll, stages })))
+}
+
+pub(crate) fn as_document<'a>(stage: &str, value: &'a Bson) -> Result<&'a Document> {
     value.as_document().ok_or_else(|| {
         Error::InvalidQuery(format!("{stage} takes a document, found {}", type_name(value)))
     })
@@ -1109,7 +1236,7 @@ fn as_document<'a>(stage: &str, value: &'a Bson) -> Result<&'a Document> {
 /// `$project` are field-path maps, not fixed-key documents — every key in
 /// them is data, not vocabulary — so they are never run through this and
 /// must stay open.
-fn deny_unknown_keys(stage: &str, doc: &Document, allowed: &[&str]) -> Result<()> {
+pub(crate) fn deny_unknown_keys(stage: &str, doc: &Document, allowed: &[&str]) -> Result<()> {
     for key in doc.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(Error::InvalidQuery(format!(
@@ -1888,6 +2015,16 @@ pub fn apply_with_vars(
                     .into(),
             ));
         }
+        Stage::SortByCount(expr) => stages::sort_by_count(input, expr, limits, vars)?,
+        Stage::Sample(size) => stages::sample(input, *size, limits, &mut stages::system_below())?,
+        Stage::Redact(expr) => stages::redact(input, expr, vars)?,
+        Stage::UnionWith(_) => {
+            return Err(Error::Unsupported(
+                "$unionWith reads another collection and must be run by the executor that \
+                 holds a storage handle, not by the pure pipeline"
+                    .into(),
+            ));
+        }
         Stage::Lookup { .. } => {
             // Not silently passed through: a join that returns its input
             // unchanged is a wrong answer wearing a right answer's shape.
@@ -2146,7 +2283,7 @@ fn group(
 /// Keyed by the *encoded* key rather than by `Bson`, because `Bson` is not `Hash`
 /// and because two numerically equal values of different types must land in the
 /// same bucket, the same rule indexes use.
-fn group_keyed(
+pub(crate) fn group_keyed(
     stage: &str,
     input: Vec<Document>,
     fields: &[(String, Accumulator)],
@@ -2820,9 +2957,10 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], doc! { "_id": 1, "skus": strings(&["a", "b"]), "n": 2i64 });
         assert_eq!(out[3], doc! { "_id": 4, "skus": [], "n": 0i64 });
-        // A missing path is null, as it always was; `$size` of null is null
-        // rather than an error, as the deviations register records.
-        assert_eq!(out[4], doc! { "_id": 5, "skus": Bson::Null, "n": Bson::Null });
+        // A missing path leaves the field out of `$addFields` (so there is no `skus` to
+        // project); `$size` of a missing field is null rather than an error, as the
+        // deviations register records.
+        assert_eq!(out[4], doc! { "_id": 5, "n": Bson::Null });
     }
 
     #[test]
@@ -4533,7 +4671,7 @@ mod lead {
     /// variables only.
     #[test]
     fn system_variables_other_than_root_and_current_stay_refused() {
-        for name in ["DESCEND", "CLUSTER_TIME", "PRUNE", "USER_ROLES"] {
+        for name in ["DESCEND", "CLUSTER_TIME", "PRUNE", "USER_ROLES", "KEEP", "SEARCH_META"] {
             let refused = parse(&[doc! {"$lookup": {
                 "from": "a", "let": {"v": "$v"},
                 "pipeline": [{"$match": {"$expr": {"$eq": ["$k", format!("$${name}")]}}}],
@@ -4974,10 +5112,11 @@ mod identity {
             let out = run(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
             assert_eq!(out[0].get("r"), Some(&want), "{op}");
         }
+        // `$mod` takes a decimal too: the exact remainder.
         let mut expr = Document::new();
         expr.insert("$mod", vec![Bson::from("$v"), Bson::Int32(1)]);
-        let msg = refused(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
-        assert_eq!(msg, "invalid query: $mod needs numbers, found a Decimal128");
+        let out = run(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
+        assert_eq!(out[0].get("r"), Some(&dec("0.5")));
     }
 
     /// A number re-spelled as an equal value of another type, or a decimal as
