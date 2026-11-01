@@ -597,6 +597,7 @@ fn golden_vectors_match_the_model() {
         "170": ["42b0c20d1b0c26903625be81f0a105a0", 670],
         "mixed": ["34ce6696c01c0c70255c54445944f39c", 1401],
         "delete": ["0b4d37ac9b577c417603e7c9bce83933", 542],
+        "obs": ["f96f244c2b3198f724fcea0eafec32c7", 1325],
     });
     assert_eq!(got, want);
 }

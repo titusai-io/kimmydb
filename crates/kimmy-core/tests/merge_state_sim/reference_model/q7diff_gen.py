@@ -576,6 +576,24 @@ def golden():
     for e in (e0, e1, e2, e3):
         o.absorb(e)
     h("delete", o.state, log)
+    # obs: bases written after counted increments (pins the layout of a register's obs and of a
+    # generation's seen totals): A inserts {x, y}; B adds 7 to y concurrently; A adds 3 to x and sets
+    # x to 20, adds 2 to y and sets y to a string
+    log = {}
+    a, b, o = D("A"), D("B"), D("O")
+    a.insert({"x": 10, "y": 5}, log)
+    e0 = a.state.copy()
+    b.absorb(e0.copy())
+    b.write("inc", "y", 7, log)
+    e1 = b.state.copy()
+    a.write("inc", "x", 3, log)
+    a.write("set", "x", 20, log)
+    a.write("inc", "y", 2, log)
+    a.write("set", "y", "t", log)
+    e2 = a.state.copy()
+    for e in (e0, e1, e2):
+        o.absorb(e)
+    h("obs", o.state, log)
     print(json.dumps(out))
 
 

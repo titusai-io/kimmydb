@@ -975,6 +975,36 @@ fn golden_delete() -> MergeState {
     st
 }
 
+/// A base written after counted increments: A inserts {x, y}; B, concurrently, adds 7 to y; A adds 3
+/// to x and then sets x to 20 (the register's `obs` holds x's slot with its stamp and total), adds
+/// 2 to y and then sets y to a string (the generation it starts has `seen` = A's y slot, and B's 7
+/// is the unseen part, hidden). Pins the layout of `Reg::obs` and `Gen::seen`.
+fn golden_obs() -> MergeState {
+    let o = opts();
+    let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
+    let i0 = a.ins(&[("x", i(10)), ("y", i(5))], 0).unwrap();
+    b.receive_entry(&a.ent(i0));
+    let bb = b.inc("y", 7, 0).unwrap();
+    a.inc("x", 3, 0).unwrap();
+    a.set("x", i(20), 0).unwrap();
+    a.inc("y", 2, 0).unwrap();
+    let aa = a.set("y", s("t"), 0).unwrap();
+    let mut obs = fresh_observer(&o, &[]);
+    for e in [a.ent(i0), b.ent(bb), a.ent(aa)] {
+        obs.receive_entry(&e);
+    }
+    let st = obs.w.state.clone();
+    let rx = &st.regs[&(i0, "x".to_string())];
+    assert_eq!(rx.obs.len(), 1, "x's base observed its one slot");
+    let (_, t) = rx.obs.values().next().unwrap();
+    assert_eq!(*t, 3);
+    let gy = st.regs[&(i0, "y".to_string())].generation.as_ref().unwrap();
+    assert_eq!(gy.seen.values().copied().collect::<Vec<_>>(), vec![2]);
+    assert_eq!(obs.visible(), doc(&[("x", i(20)), ("y", s("t"))]));
+    assert_eq!(obs.w.hidden_all(), BTreeMap::from([("y".to_string(), 7)]));
+    st
+}
+
 fn golden_small() -> MergeState {
     let mut w = Writer::new(wid('A', 7), opts());
     w.insert(&[("x", i(1)), ("s", s("t"))], 0).unwrap();
@@ -992,7 +1022,8 @@ fn golden_small() -> MergeState {
 /// removal of the starter's version vector from a generation, which only the V4M1 mutant read
 /// (`Gen::vv`; three registers of this state start a generation, 52 bytes each): 928f2042..5f82 /
 /// 1557 became 34ce6696..f39c / 1401. `empty`, `170` and `delete` hold no generation and did not
-/// change. `golden_encode_bytes_round_trip` lost the same vector and its `gens` section.
+/// change. `obs` was added later: no other vector has a register `obs` or a generation `seen`
+/// that is not empty, so reordering either layout left the other hashes unchanged. `golden_encode_bytes_round_trip` lost the same vector and its `gens` section.
 fn check_golden(name: &str, st: &MergeState, want: (&str, usize, &str)) {
     let cb = st.canonical_bytes();
     assert_eq!(hex(&st.state_hash()), want.0, "{name}: state hash");
@@ -1047,6 +1078,19 @@ fn golden_vectors_delete() {
         (
             "0b4d37ac9b577c417603e7c9bce83933",
             542,
+            "00000000000000010000000000000001000041414141414141414141414141414141000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+}
+
+#[test]
+fn golden_vectors_obs() {
+    check_golden(
+        "obs",
+        &golden_obs(),
+        (
+            "f96f244c2b3198f724fcea0eafec32c7",
+            1325,
             "00000000000000010000000000000001000041414141414141414141414141414141000000000000000000000000000000000000000000000000000000000000",
         ),
     );
