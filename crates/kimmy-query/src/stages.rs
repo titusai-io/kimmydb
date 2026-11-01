@@ -8,6 +8,7 @@ use bson::{Bson, Document};
 use kimmy_core::{Error, Result};
 
 use crate::aggregate::{Accumulator, Limits, Stage, as_document, group_keyed};
+use crate::budget::Lease;
 use crate::expr::{Binding, Expr, REDACT_DESCEND, REDACT_KEEP, REDACT_PRUNE, Scope, type_name};
 use crate::shape::{self, SortKey};
 
@@ -47,9 +48,10 @@ pub(crate) fn sort_by_count(
     expr: &Expr,
     limits: &Limits,
     vars: &[Binding<'_>],
+    held: &mut Lease,
 ) -> Result<Vec<Document>> {
     let fields = [("count".to_string(), Accumulator::Sum(Expr::Literal(Bson::Int32(1))))];
-    let mut groups = group_keyed("$sortByCount", input, &fields, limits, vars, |scope| {
+    let mut groups = group_keyed("$sortByCount", input, &fields, limits, vars, held, |scope| {
         expr.eval_in(scope).map(Some)
     })?;
     for group in &mut groups {
@@ -237,10 +239,12 @@ pub(crate) fn redact(
     input: Vec<Document>,
     expr: &Expr,
     vars: &[Binding<'_>],
+    held: &mut Lease,
 ) -> Result<Vec<Document>> {
     let mut out = Vec::with_capacity(input.len());
     for doc in &input {
         if let Some(kept) = redact_level(doc, doc, expr, vars)? {
+            held.charge_doc(&kept)?;
             out.push(kept);
         }
     }

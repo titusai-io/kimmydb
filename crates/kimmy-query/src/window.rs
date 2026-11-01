@@ -60,8 +60,6 @@ use crate::window_acc::{
     Slider, StdDevSlider, SumSlider, eval, eval_present,
 };
 
-pub use crate::budget::MAX_BUFFER_BYTES;
-
 /// How a stage splits its input.
 #[derive(Clone, Debug)]
 pub enum Partition {

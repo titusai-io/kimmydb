@@ -31,7 +31,7 @@ pub(crate) fn check_string_len_within(what: &'static str, bytes: usize, max: usi
             what,
             bytes,
             max,
-            limit: STRING_LIMIT,
+            limit: STRING_LIMIT.into(),
             remedy: "build a shorter string, or $limit or $substrBytes the input",
         });
     }
@@ -76,6 +76,13 @@ pub(crate) fn bson_bytes(value: &Bson) -> usize {
     }
 }
 
+/// The BSON size of a document: what it encodes to, worked out without encoding it.
+pub(crate) fn document_bytes(doc: &bson::Document) -> usize {
+    doc.iter().fold(5usize, |sum, (k, v)| {
+        sum.saturating_add(2 + k.len()).saturating_add(bson_bytes(v))
+    })
+}
+
 /// The bytes an array of an expression is growing to, element by element. `add`
 /// counts an element and refuses at once when the array is over the limit.
 pub(crate) struct ArrayBudget {
@@ -105,7 +112,7 @@ impl ArrayBudget {
                 what: self.what,
                 bytes: self.bytes,
                 max: self.max,
-                limit: ARRAY_LIMIT,
+                limit: ARRAY_LIMIT.into(),
                 remedy: "build a smaller array, or $slice, $filter or $limit the input",
             });
         }

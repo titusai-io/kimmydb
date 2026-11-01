@@ -427,7 +427,7 @@ pub(super) fn find_all_documents(
                 what: "the $regexFindAll output",
                 bytes,
                 max: max_bytes,
-                limit: "64 MiB limit",
+                limit: "64 MiB limit".into(),
                 remedy: "match a narrower pattern, or $limit or $substrBytes the input",
             });
         }

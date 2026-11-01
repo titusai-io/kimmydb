@@ -248,6 +248,7 @@ impl Spec {
             seq: 0,
             dirs: self.sort.iter().map(|k| k.descending != bottom).collect(),
             body,
+            held: 0,
         }
     }
 
@@ -277,6 +278,9 @@ pub struct State {
     /// Per sort key, whether a row ranks by the reverse of the key's order.
     dirs: Arc<[bool]>,
     body: Body,
+    /// The BSON bytes of the rows and values kept now, for the request's budget
+    /// (ADR-269): added when one is kept, taken off when one is dropped.
+    held: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -429,7 +433,7 @@ pub(crate) fn n_of_array(kind: Kind, items: &[Bson], n: usize) -> Bson {
         Kind::MaxN | Kind::MinN => Body::Best(BinaryHeap::new()),
         _ => Body::Values(VecDeque::new()),
     };
-    let mut state = State { kind, limit: Some(n), seq: 0, dirs: Arc::from([]), body };
+    let mut state = State { kind, limit: Some(n), seq: 0, dirs: Arc::from([]), body, held: 0 };
     for item in items {
         state.take(item.clone());
     }
@@ -489,7 +493,24 @@ fn key_cmp(a: &Bson, b: &Bson) -> Ordering {
     }
 }
 
+/// The bytes a value takes in a group's state: its BSON payload and a type byte.
+fn value_bytes(value: &Bson) -> usize {
+    1 + crate::expr::sizes::bson_bytes(value)
+}
+
+impl Row {
+    /// The bytes this row takes in a group's state.
+    fn bytes(&self) -> usize {
+        self.keys.iter().fold(value_bytes(&self.output), |sum, k| sum.saturating_add(value_bytes(k)))
+    }
+}
+
 impl State {
+    /// The BSON bytes of the rows and values this group keeps now (ADR-269).
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
     /// Take one document.
     pub fn accumulate(&mut self, spec: &Spec, scope: &Scope<'_>) -> Result<()> {
         if self.limit.is_none() && self.needs_limit() {
@@ -509,10 +530,14 @@ impl State {
                 // Evaluate before deciding, so a failing `output` fails the
                 // request whether or not the row would have been kept.
                 let output = spec.value.eval_in(scope)?;
-                rows.push(Row { keys, output, seq: self.seq, dirs: Arc::clone(&self.dirs) });
+                let row = Row { keys, output, seq: self.seq, dirs: Arc::clone(&self.dirs) };
+                self.held = self.held.saturating_add(row.bytes());
+                rows.push(row);
                 self.seq += 1;
                 if rows.len() > limit {
-                    rows.pop();
+                    if let Some(dropped) = rows.pop() {
+                        self.held = self.held.saturating_sub(dropped.bytes());
+                    }
                 }
             }
             Body::Best(_) | Body::Values(_) => {
@@ -530,21 +555,28 @@ impl State {
             Body::Values(values) => {
                 if self.kind == Kind::FirstN {
                     if values.len() < limit {
+                        self.held = self.held.saturating_add(value_bytes(&value));
                         values.push_back(value);
                     }
                 } else {
+                    self.held = self.held.saturating_add(value_bytes(&value));
                     values.push_back(value);
                     if values.len() > limit {
-                        values.pop_front();
+                        if let Some(dropped) = values.pop_front() {
+                            self.held = self.held.saturating_sub(value_bytes(&dropped));
+                        }
                     }
                 }
             }
             // `$maxN` and `$minN` skip null and missing.
             Body::Best(heap) if !matches!(value, Bson::Null | Bson::Undefined) => {
+                self.held = self.held.saturating_add(value_bytes(&value));
                 heap.push(Best { value, seq: self.seq, max: self.kind == Kind::MaxN });
                 self.seq += 1;
                 if heap.len() > limit {
-                    heap.pop();
+                    if let Some(dropped) = heap.pop() {
+                        self.held = self.held.saturating_sub(value_bytes(&dropped.value));
+                    }
                 }
             }
             _ => {}

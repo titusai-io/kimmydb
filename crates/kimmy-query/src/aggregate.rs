@@ -50,6 +50,7 @@ use std::collections::HashSet;
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
+use crate::budget::{Lease, input_of, output_of};
 use crate::expr::{Binding, Expr, Mean, Scope, Total, type_name};
 use crate::filter::{self, Filter};
 use crate::shape::{self, ID_FIELD, Projection, SortKey};
@@ -902,9 +903,12 @@ pub fn run_facet<E: From<Error>>(
     limits: &Limits,
     mut run: impl FnMut(&[Stage], Vec<Document>) -> std::result::Result<Vec<Document>, E>,
 ) -> std::result::Result<Document, E> {
-    // The branches' outputs are alive together, so the bytes the blocking stages inside
-    // them charged stay charged until the whole `$facet` is done (ADR-264).
-    let _hold = limits.buffer.hold();
+    // What the stage holds (ADR-269): its input until the last branch takes it, and a
+    // copy of it for each earlier branch, charged before the copy is made. The stages
+    // inside a branch charge what they hold, input included, to the same budget; the
+    // branches' outputs are alive together, but the answer is held to 16 MiB below.
+    let mut input_lease = limits.buffer.lease("the input of $facet");
+    input_lease.charge_docs(&input)?;
     let mut answer = Document::new();
     let mut held = 0usize;
     // The bytes the answer will encode to, kept as it grows: a document header and
@@ -928,9 +932,16 @@ pub fn run_facet<E: From<Error>>(
     let mut input = Some(input);
     for (at, (name, stages)) in facets.iter().enumerate() {
         let docs = if at + 1 == facets.len() {
+            input_lease.release(input_lease.bytes());
             input.take().unwrap_or_default()
         } else {
-            input.clone().unwrap_or_default()
+            // The copy is charged before it is made and the charge handed back as it is
+            // passed on: the branch's first stage charges it as its own input.
+            let mut copy_lease = limits.buffer.lease("a copy of the input of $facet");
+            copy_lease.charge_docs(input.as_deref().unwrap_or_default())?;
+            let copy = input.clone().unwrap_or_default();
+            drop(copy_lease);
+            copy
         };
         let out = run(stages, docs)?;
         held += out.len();
@@ -1912,6 +1923,37 @@ pub(crate) fn group_key(value: &Bson) -> Vec<u8> {
     kimmy_core::keyenc::encode(value).unwrap_or_else(|_| format!("raw:{value:?}").into_bytes())
 }
 
+/// What one stage holds while it runs (ADR-269): its input, until it returns, and the
+/// documents it builds. Dropped when the stage returns or fails, which gives both back.
+///
+/// A stage that only moves its input (`$match`, `$sort`, `$limit`, `$skip`, `$count`,
+/// `$sample`) builds nothing, so its input is all it holds. `$setWindowFields`,
+/// `$densify` and `$fill` charge the documents they buffer themselves, and `$facet` its
+/// input and its branches, so none of those charges its input here as well.
+pub(crate) struct Held {
+    /// The documents the stage builds: its output, or its buckets.
+    pub(crate) output: Lease,
+    _input: Option<Lease>,
+}
+
+impl Held {
+    /// Charge `input` to the request's budget for `stage`.
+    pub(crate) fn enter(stage: &Stage, input: &[Document], limits: &Limits) -> Result<Self> {
+        let name = stage.name();
+        let output = limits.buffer.lease(output_of(name));
+        let charged = !matches!(
+            stage,
+            Stage::SetWindowFields(_) | Stage::Densify(_) | Stage::Fill(_) | Stage::Facet(_)
+        );
+        if !charged {
+            return Ok(Held { output, _input: None });
+        }
+        let mut lease = limits.buffer.lease(input_of(name));
+        lease.charge_docs(input)?;
+        Ok(Held { output, _input: Some(lease) })
+    }
+}
+
 /// Run one stage.
 ///
 /// Every stage checks its **output** against the cap, so a stage that grows its
@@ -1928,6 +1970,10 @@ pub fn apply_with_vars(
     limits: &Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
+    // What the stage holds while it runs is charged to the request's budget (ADR-269): its
+    // input until it returns, and the documents it builds as it builds them. A blocking
+    // stage that buffers its own input, and `$facet`, charge for themselves.
+    let mut held = Held::enter(stage, &input, limits)?;
     let out = match stage {
         // A `$expr` that cannot be evaluated against a document fails the
         // pipeline, as in a top-level filter (ADR-206).
@@ -1949,6 +1995,7 @@ pub fn apply_with_vars(
                 // depend on key order, which BSON preserves and nobody
                 // reasons about.
                 set_computed(&mut projected, computed, &Scope::with_bindings(doc, vars))?;
+                held.output.charge_doc(&projected)?;
                 out.push(projected);
             }
             out
@@ -1958,6 +2005,7 @@ pub fn apply_with_vars(
             for doc in &input {
                 let mut with = doc.clone();
                 set_computed(&mut with, computed, &Scope::with_bindings(doc, vars))?;
+                held.output.charge_doc(&with)?;
                 out.push(with);
             }
             out
@@ -1966,7 +2014,10 @@ pub fn apply_with_vars(
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
                 match expr.eval_in(&Scope::with_bindings(doc, vars))? {
-                    Bson::Document(new_root) => out.push(new_root),
+                    Bson::Document(new_root) => {
+                        held.output.charge_doc(&new_root)?;
+                        out.push(new_root);
+                    }
                     // Refused rather than wrapped: a root that is not a
                     // document would have to be given a field name this stage
                     // has no business inventing.
@@ -1995,14 +2046,30 @@ pub fn apply_with_vars(
             vec![bson::doc! { field.as_str(): n }]
         }
         Stage::Unwind { path: p, preserve_null_and_empty, include_array_index } => {
-            unwind(input, p, *preserve_null_and_empty, include_array_index.as_deref(), limits)?
+            unwind(
+                input,
+                p,
+                *preserve_null_and_empty,
+                include_array_index.as_deref(),
+                limits,
+                &mut held.output,
+            )?
         }
-        Stage::Group { id, fields } => group(input, id, fields, limits, vars)?,
+        Stage::Group { id, fields } => group(input, id, fields, limits, vars, &mut held.output)?,
         Stage::Bucket { group_by, boundaries, default, fields } => {
-            bucket(input, group_by, boundaries, default.as_ref(), fields, limits, vars)?
+            bucket(
+                input,
+                group_by,
+                boundaries,
+                default.as_ref(),
+                fields,
+                limits,
+                vars,
+                &mut held.output,
+            )?
         }
         Stage::BucketAuto { group_by, buckets, fields } => {
-            bucket_auto(input, group_by, *buckets, fields, limits, vars)?
+            bucket_auto(input, group_by, *buckets, fields, limits, vars, &mut held.output)?
         }
         Stage::SetWindowFields(spec) => crate::window::apply(spec, input, limits, vars)?,
         Stage::Densify(spec) => crate::densify::apply(spec, input, limits)?,
@@ -2043,9 +2110,11 @@ pub fn apply_with_vars(
                     .into(),
             ));
         }
-        Stage::SortByCount(expr) => stages::sort_by_count(input, expr, limits, vars)?,
+        Stage::SortByCount(expr) => {
+            stages::sort_by_count(input, expr, limits, vars, &mut held.output)?
+        }
         Stage::Sample(size) => stages::sample(input, *size, limits, &mut stages::system_below())?,
-        Stage::Redact(expr) => stages::redact(input, expr, vars)?,
+        Stage::Redact(expr) => stages::redact(input, expr, vars, &mut held.output)?,
         Stage::UnionWith(_) => {
             return Err(Error::Unsupported(
                 "$unionWith reads another collection and must be run by the executor that \
@@ -2194,6 +2263,7 @@ fn unwind(
     preserve: bool,
     include_index: Option<&str>,
     limits: &Limits,
+    held: &mut Lease,
 ) -> Result<Vec<Document>> {
     // Write the index field alongside the unwound value, or `null` on a
     // document that passed through without being fanned out — MongoDB's rule,
@@ -2234,6 +2304,7 @@ fn unwind(
                     path::set(&mut copy, field, item)
                         .map_err(|e| Error::InvalidQuery(format!("cannot set `{field}`: {e}")))?;
                     set_index(&mut copy, Some(index as i64))?;
+                    held.charge_doc(&copy)?;
                     out.push(copy);
                 }
                 // Checked inside the loop as well as after: a handful of
@@ -2249,6 +2320,7 @@ fn unwind(
                     let mut copy = doc.clone();
                     path::unset(&mut copy, field);
                     set_index(&mut copy, None)?;
+                    held.charge_doc(&copy)?;
                     out.push(copy);
                 }
             }
@@ -2286,13 +2358,48 @@ pub(crate) enum AccState {
     /// evaluated is replaced by the next, and fails the request only if no
     /// later document comes (ADR-211).
     Last(Option<Result<Bson>>),
-    Push(Vec<Bson>),
+    /// The values, and the BSON bytes they hold (ADR-269).
+    Push(Vec<Bson>, usize),
     /// The members in first-seen order, and the [`group_key`] of each, which
-    /// is what makes two values one member (ADR-186).
-    AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>),
-    /// The fields merged so far, a later document's value winning.
-    MergeObjects(Document),
+    /// is what makes two values one member (ADR-186); and the bytes both hold.
+    AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>, usize),
+    /// The fields merged so far, a later document's value winning, and the BSON bytes
+    /// of the fields.
+    MergeObjects(Document, usize),
     Ext(crate::accumulators::State),
+}
+
+/// The bytes a value takes in a group's state: its type byte and its payload.
+fn state_bytes(value: &Bson) -> usize {
+    1 + crate::expr::sizes::bson_bytes(value)
+}
+
+impl AccState {
+    /// The BSON bytes this state holds now, for the request's budget (ADR-269). Constant
+    /// time for the states that grow with the group (`$push`, `$addToSet`,
+    /// `$mergeObjects`, the ranked accumulators); the others hold one value.
+    pub(crate) fn held(&self) -> usize {
+        match self {
+            AccState::Sum(_) | AccState::Avg(_) => 0,
+            AccState::MinMax(v) | AccState::First(v) => v.as_ref().map_or(0, state_bytes),
+            AccState::Last(v) => match v {
+                Some(Ok(v)) => state_bytes(v),
+                _ => 0,
+            },
+            AccState::Push(_, bytes)
+            | AccState::AddToSet(_, _, bytes)
+            | AccState::MergeObjects(_, bytes) => *bytes,
+            AccState::Ext(state) => state.held(),
+        }
+    }
+}
+
+/// The bytes a bucket takes before any accumulator has seen a document: the output
+/// document's framing, its `_id` and one element for each accumulator.
+fn bucket_base_bytes(key: &Bson, fields: &[(String, Accumulator)]) -> usize {
+    fields.iter().fold(5 + 1 + 3 + crate::expr::sizes::bson_bytes(key), |sum, (name, _)| {
+        sum.saturating_add(2 + name.len() + 16)
+    })
 }
 
 fn group(
@@ -2301,8 +2408,9 @@ fn group(
     fields: &[(String, Accumulator)],
     limits: &Limits,
     vars: &[Binding<'_>],
+    held: &mut Lease,
 ) -> Result<Vec<Document>> {
-    group_keyed("$group", input, fields, limits, vars, |scope| id.eval_in(scope).map(Some))
+    group_keyed("$group", input, fields, limits, vars, held, |scope| id.eval_in(scope).map(Some))
 }
 
 /// [`group`] with the key of each document given by `key`, which may decline a
@@ -2311,12 +2419,17 @@ fn group(
 /// Keyed by the *encoded* key rather than by `Bson`, because `Bson` is not `Hash`
 /// and because two numerically equal values of different types must land in the
 /// same bucket, the same rule indexes use.
+///
+/// What the buckets hold is charged to `held` as it grows (ADR-269): a bucket when it is
+/// made, and the values each accumulator keeps as they are taken, so a `$push` of large
+/// values is refused at the document that passes the limit.
 pub(crate) fn group_keyed(
     stage: &str,
     input: Vec<Document>,
     fields: &[(String, Accumulator)],
     limits: &Limits,
     vars: &[Binding<'_>],
+    held: &mut Lease,
     mut key_of: impl FnMut(&Scope<'_>) -> Result<Option<Bson>>,
 ) -> Result<Vec<Document>> {
     let mut order: Vec<Bucket> = Vec::new();
@@ -2330,6 +2443,8 @@ pub(crate) fn group_keyed(
             Some(&slot) => slot,
             None => {
                 let slot = order.len();
+                // The bucket, its key twice over (the bucket and the index).
+                held.charge(bucket_base_bytes(&key, fields).saturating_add(encoded.len()))?;
                 order.push(Bucket { key: key.clone(), values: fields.iter().map(init).collect() });
                 index.insert(encoded, slot);
                 // One bucket per distinct value, so a high-cardinality key is
@@ -2339,7 +2454,9 @@ pub(crate) fn group_keyed(
             }
         };
         for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
+            let before = state.held();
             accumulate(state, acc, &scope)?;
+            held.resize(before, state.held())?;
         }
     }
 
@@ -2369,9 +2486,10 @@ fn bucket(
     fields: &[(String, Accumulator)],
     limits: &Limits,
     vars: &[Binding<'_>],
+    held: &mut Lease,
 ) -> Result<Vec<Document>> {
     let kind = BoundaryKind::of(&boundaries[0]);
-    let mut out = group_keyed("$bucket", input, fields, limits, vars, |scope| {
+    let mut out = group_keyed("$bucket", input, fields, limits, vars, held, |scope| {
         let value = group_by.eval_in(scope)?;
         let inside = (BoundaryKind::of(&value) == kind && !is_nan(&value))
             .then(|| {
@@ -2434,10 +2552,13 @@ fn bucket_auto(
     fields: &[(String, Accumulator)],
     limits: &Limits,
     vars: &[Binding<'_>],
+    held: &mut Lease,
 ) -> Result<Vec<Document>> {
     let mut keyed: Vec<(Bson, Document)> = Vec::with_capacity(input.len());
     for doc in input {
         let key = group_by.eval_in(&Scope::with_bindings(&doc, vars))?;
+        // The keys are a second column beside the documents the stage was given.
+        held.charge(state_bytes(&key))?;
         keyed.push((key, doc));
     }
     keyed.sort_by(|a, b| kimmy_core::cmp::canonical_cmp(&a.0, &b.0));
@@ -2452,10 +2573,14 @@ fn bucket_auto(
             end += 1;
         }
         let mut states: Vec<AccState> = fields.iter().map(init).collect();
+        let first_key = &keyed[start].0;
+        held.charge(bucket_base_bytes(first_key, fields).saturating_mul(2))?;
         for (_, doc) in &keyed[start..end] {
             let scope = Scope::with_bindings(doc, vars);
             for (state, (_, acc)) in states.iter_mut().zip(fields) {
+                let before = state.held();
                 accumulate(state, acc, &scope)?;
+                held.resize(before, state.held())?;
             }
         }
         let max = if end < keyed.len() { keyed[end].0.clone() } else { keyed[end - 1].0.clone() };
@@ -2480,9 +2605,9 @@ pub(crate) fn init((_, acc): &(String, Accumulator)) -> AccState {
         Accumulator::Min(_) | Accumulator::Max(_) => AccState::MinMax(None),
         Accumulator::First(_) => AccState::First(None),
         Accumulator::Last(_) => AccState::Last(None),
-        Accumulator::Push(_) => AccState::Push(Vec::new()),
-        Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default()),
-        Accumulator::MergeObjects(_) => AccState::MergeObjects(Document::new()),
+        Accumulator::Push(_) => AccState::Push(Vec::new(), 0),
+        Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default(), 0),
+        Accumulator::MergeObjects(_) => AccState::MergeObjects(Document::new(), 0),
         Accumulator::Ext(spec) => AccState::Ext(spec.init()),
     }
 }
@@ -2523,22 +2648,39 @@ pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<
         },
         // A missing value is skipped, as the reference skips it; an explicit `null` is
         // a value (ADR-264).
-        (AccState::Push(items), Accumulator::Push(e)) => {
+        (AccState::Push(items, bytes), Accumulator::Push(e)) => {
             if let Some(v) = e.eval_present(scope)? {
+                *bytes = bytes.saturating_add(state_bytes(&v));
                 items.push(v);
             }
         }
-        (AccState::AddToSet(items, keys), Accumulator::AddToSet(e)) => {
+        (AccState::AddToSet(items, keys, bytes), Accumulator::AddToSet(e)) => {
             if let Some(v) = e.eval_present(scope)? {
                 // A member is identified the way `$group` identifies a bucket, and
                 // the first occurrence stays (ADR-186).
-                if keys.insert(group_key(&v)) {
+                let key = group_key(&v);
+                let key_bytes = key.len();
+                if keys.insert(key) {
+                    *bytes = bytes.saturating_add(state_bytes(&v)).saturating_add(key_bytes);
                     items.push(v);
                 }
             }
         }
-        (AccState::MergeObjects(merged), Accumulator::MergeObjects(e)) => {
-            crate::expr::merge_into(merged, &e.eval_in(scope)?)?;
+        (AccState::MergeObjects(merged, bytes), Accumulator::MergeObjects(e)) => {
+            let operand = e.eval_in(scope)?;
+            // What each top-level field the operand names takes now, to be replaced by
+            // what it takes after: the merge sets those fields and no others.
+            let field = |doc: &Document, name: &str| {
+                doc.get(name).map_or(0, |v| 2 + name.len() + crate::expr::sizes::bson_bytes(v))
+            };
+            let named: Vec<(String, usize)> = match &operand {
+                Bson::Document(d) => d.keys().map(|k| (k.clone(), field(merged, k))).collect(),
+                _ => Vec::new(),
+            };
+            crate::expr::merge_into(merged, &operand)?;
+            for (name, old) in named {
+                *bytes = bytes.saturating_sub(old).saturating_add(field(merged, &name));
+            }
         }
         // Unreachable: `init` pairs each accumulator with its own state.
         _ => {}
@@ -2555,8 +2697,8 @@ pub(crate) fn finish(state: AccState) -> Result<Bson> {
         AccState::Avg(mean) => mean.to_bson(),
         AccState::MinMax(v) | AccState::First(v) => v.unwrap_or(Bson::Null),
         AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
-        AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
-        AccState::MergeObjects(merged) => Bson::Document(merged),
+        AccState::Push(items, _) | AccState::AddToSet(items, _, _) => Bson::Array(items),
+        AccState::MergeObjects(merged, _) => Bson::Document(merged),
         AccState::Ext(state) => state.finish(),
     })
 }
