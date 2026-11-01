@@ -51,6 +51,7 @@ use kimmy_core::{Error, Result, path};
 
 use crate::aggregate::{Limits, check_limit, group_key};
 use crate::budget::Lease;
+use crate::deadline;
 use crate::expr::{add_to_date, is_date_unit, type_name};
 use crate::window::{buffer_name, compare_fields, fields_of};
 
@@ -386,6 +387,9 @@ fn catch_up(
     sink: &mut dyn Sink,
 ) -> Result<()> {
     while !cursor.done && span.contains(&cursor.next) {
+        // Once for each point generated (ADR-266): a range can make as many as the
+        // pipeline's document limit allows, in the counting pass and again in the build.
+        deadline::tick()?;
         if before.is_some_and(|v| canonical_cmp(&cursor.next, v).is_ge()) {
             break;
         }
@@ -401,6 +405,7 @@ fn catch_up(
 /// Take a document at `value` into the grid: the point it sits on is not generated.
 fn pass(grid: &Grid<'_>, cursor: &mut Cursor, value: &Bson) -> Result<()> {
     while !cursor.done && canonical_cmp(&cursor.next, value).is_eq() {
+        deadline::tick()?;
         match grid.after(&cursor.next)? {
             Some(next) => cursor.next = next,
             None => cursor.done = true,
@@ -422,6 +427,7 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
     let mut dates: Option<bool> = None;
     for doc in input {
+        deadline::tick()?;
         lease.charge_doc(&doc)?;
         let at = docs.len();
         let value = match path::resolve(&doc, &spec.field).into_iter().next() {
@@ -501,6 +507,7 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
     // First pass: how many documents the range makes, before any is made.
     let mut count = Count { total: input_len, limits };
     walk(spec, &grid, &rows, &order, &spans, &mut count)?;
+    deadline::check()?;
 
     // Second pass: the documents.
     let mut made = Build {
@@ -512,6 +519,7 @@ pub fn apply(spec: &DensifySpec, input: Vec<Document>, limits: &Limits) -> Resul
     };
     // Documents without a value lead, as they arrived.
     for &at in &passthrough {
+        deadline::tick()?;
         if let Some(doc) = made.docs[at].take() {
             made.out.push(doc);
         }
@@ -601,19 +609,23 @@ fn walk(
         Bounds::Full => {
             // One sequence in order of the field; the grids' tails after it.
             for row in rows {
+                deadline::tick()?;
                 take(grid, spans, &mut cursors, row, sink)?;
             }
             for &p in order {
+                deadline::tick()?;
                 finish(grid, spans, &mut cursors, p, sink)?;
             }
         }
         Bounds::Partition | Bounds::Explicit(_) => {
             let mut by_part: Vec<Vec<usize>> = vec![Vec::new(); spans.len()];
             for (i, r) in rows.iter().enumerate() {
+                deadline::tick()?;
                 by_part[r.part].push(i);
             }
             for &p in order {
                 for &i in &by_part[p] {
+                    deadline::tick()?;
                     take(grid, spans, &mut cursors, &rows[i], sink)?;
                 }
                 finish(grid, spans, &mut cursors, p, sink)?;

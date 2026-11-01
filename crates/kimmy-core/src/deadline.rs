@@ -70,8 +70,7 @@ thread_local! {
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The ticks [`tick`] has counted since the deadline was last set.
     static TICKS: Cell<u32> = const { Cell::new(0) };
-    /// Reads of the clock [`check`] has made on this thread, for the cadence tests.
-    #[cfg(test)]
+    /// Reads of the clock [`check`] has made on this thread, for tests that count looks.
     static CLOCK_READS: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -127,6 +126,15 @@ impl Drop for Deadline {
     }
 }
 
+/// How many times [`check`] has read the clock on this thread (only a check made while a
+/// deadline is set reads it). For a test that wants to know a loop ticks without waiting
+/// for a deadline to pass: with a deadline far away, run the loop over `n` iterations and
+/// compare the reads with what `n` ticks make, one on the first tick and one on every
+/// [`CADENCE`]-th after it.
+pub fn clock_reads() -> u64 {
+    CLOCK_READS.get()
+}
+
 /// `Ok` unless this thread's deadline has passed, in which case
 /// [`Error::DeadlineExceeded`]. A read of the clock only when a deadline is set.
 #[inline]
@@ -134,7 +142,6 @@ pub fn check() -> Result<()> {
     match DEADLINE.get() {
         None => Ok(()),
         Some(deadline) => {
-            #[cfg(test)]
             CLOCK_READS.set(CLOCK_READS.get() + 1);
             if Instant::now() >= deadline { Err(Error::DeadlineExceeded) } else { Ok(()) }
         }
@@ -183,7 +190,7 @@ mod tests {
     use super::*;
 
     fn reads() -> u64 {
-        CLOCK_READS.get()
+        clock_reads()
     }
 
     #[test]

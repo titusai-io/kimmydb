@@ -2157,8 +2157,10 @@ loop in a stage looks at it every 1,024 iterations (`$map`, `$filter` and
 with a look between them), and the reads of other collections by `$lookup` and
 `$graphLookup` look at it per row; `$unionWith` looks at it per document it
 reads and per document it appends, `$sample` in its reservoir and its shuffle,
-`$redact` for every document it decides at any depth, and `$sortByCount` as
-`$group` and `$sort` do. A pipeline-style update is checked at each of its
+`$redact` for every document it decides at any depth, `$sortByCount` as
+`$group` and `$sort` do, `$setWindowFields` in every loop that walks a partition,
+`$densify` for each document read and each point it generates (the count of
+points it makes before it makes any included), and `$fill` for each document. A pipeline-style update is checked at each of its
 stages for each document, until the update's first commit. Past the deadline the pipeline stops and the
 request is answered `503 timeout`, the answer the server gives a request it
 abandons while waiting, over REST and `/mcp`; its worker is free at once. A

@@ -65,6 +65,8 @@ mod stage_tests;
 #[cfg(test)]
 mod update_pipeline_tests;
 #[cfg(test)]
+mod window_deadline_tests;
+#[cfg(test)]
 mod window_tests;
 
 pub use aggregate::{Accumulator, Limits, Stage};
