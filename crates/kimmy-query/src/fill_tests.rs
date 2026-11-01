@@ -171,11 +171,11 @@ fn locf_restarts_in_each_partition() {
         doc! {"_id": 4, "g": "b", "day": 2, "v": 4},
         doc! {"_id": 5, "g": "b", "day": 3},
     ];
-    for partition in [doc! {"partitionBy": "$g"}, doc! {"partitionByFields": ["g"]}] {
+    for partition in [doc! {"partitionBy": {"g": "$g"}}, doc! {"partitionByFields": ["g"]}] {
         let mut spec = doc! {"sortBy": {"day": 1}, "output": {"v": {"method": "locf"}}};
         spec.extend(partition);
         let out = run(spec, input.clone()).unwrap();
-        // Partition a (first seen), then b.
+        // Partition a, then b.
         assert_eq!(
             col(&out, "_id"),
             vec![Bson::Int32(1), Bson::Int32(3), Bson::Int32(2), Bson::Int32(4), Bson::Int32(5)]
@@ -185,6 +185,56 @@ fn locf_restarts_in_each_partition() {
             vec![Bson::Int32(1), Bson::Int32(1), Bson::Null, Bson::Int32(4), Bson::Int32(4)]
         );
     }
+}
+
+#[test]
+fn the_partitions_leave_in_ascending_order_of_their_values_not_in_the_order_they_arrive() {
+    let input = vec![
+        doc! {"_id": 1, "g": "y", "day": 1, "v": 1},
+        doc! {"_id": 2, "g": "x", "day": 1, "v": 2},
+        doc! {"_id": 3, "g": "y", "day": 2},
+        doc! {"_id": 4, "g": "x", "day": 2},
+    ];
+    for partition in [doc! {"partitionBy": {"g": "$g"}}, doc! {"partitionByFields": ["g"]}] {
+        let mut spec = doc! {"sortBy": {"day": 1}, "output": {"v": {"method": "locf"}}};
+        spec.extend(partition);
+        let out = run(spec, input.clone()).unwrap();
+        assert_eq!(
+            col(&out, "_id"),
+            vec![Bson::Int32(2), Bson::Int32(4), Bson::Int32(1), Bson::Int32(3)]
+        );
+        assert_eq!(
+            col(&out, "v"),
+            vec![Bson::Int32(2), Bson::Int32(2), Bson::Int32(1), Bson::Int32(1)]
+        );
+    }
+}
+
+#[test]
+fn locf_without_a_sort_runs_in_the_order_the_documents_arrive() {
+    let out = run(
+        doc! {"output": {"v": {"method": "locf"}}},
+        vec![
+            doc! {"_id": 1, "v": 1},
+            doc! {"_id": 2},
+            doc! {"_id": 3, "v": 5},
+            doc! {"_id": 4, "v": Bson::Null},
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        col(&out, "_id"),
+        vec![Bson::Int32(1), Bson::Int32(2), Bson::Int32(3), Bson::Int32(4)]
+    );
+    assert_eq!(
+        col(&out, "v"),
+        vec![Bson::Int32(1), Bson::Int32(1), Bson::Int32(5), Bson::Int32(5)]
+    );
+    // An empty `sortBy` is no sort.
+    let out =
+        run(doc! {"sortBy": {}, "output": {"v": {"method": "locf"}}}, vec![doc! {"v": 1}, doc! {}])
+            .unwrap();
+    assert_eq!(col(&out, "v"), vec![Bson::Int32(1), Bson::Int32(1)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,9 +335,11 @@ fn methods_and_values_mix_across_fields() {
 #[test]
 fn a_sort_by_and_a_partition_with_only_values_change_nothing_about_the_order() {
     let input = vec![doc! {"_id": 2, "g": 1}, doc! {"_id": 1, "g": 2}];
-    let out =
-        run(doc! {"partitionBy": "$g", "sortBy": {"_id": 1}, "output": {"v": {"value": 0}}}, input)
-            .unwrap();
+    let out = run(
+        doc! {"partitionBy": {"g": "$g"}, "sortBy": {"_id": 1}, "output": {"v": {"value": 0}}},
+        input,
+    )
+    .unwrap();
     assert_eq!(col(&out, "_id"), vec![Bson::Int32(2), Bson::Int32(1)]);
 }
 
@@ -316,13 +368,14 @@ fn the_stage_refuses_what_it_does_not_know() {
         refused(doc! {"sortBy": {"d": 1}, "output": {"v": {"method": 1}}})
             .contains("\"locf\" or \"linear\"")
     );
-    for method in ["locf", "linear"] {
-        let e = refused(doc! {"output": {"v": {"method": method}}});
-        assert!(e.contains("requires a `sortBy`"), "{method}: {e}");
-    }
+    let e = refused(doc! {"output": {"v": {"method": "linear"}}});
+    assert!(e.contains("exactly one field"), "{e}");
+    // The reference wants an object for `partitionBy`, not a field name.
+    let e = refused(doc! {"partitionBy": "$g", "output": {"v": {"value": 0}}});
+    assert!(e.contains("object expression"), "{e}");
     assert!(
         refused(
-            doc! {"partitionBy": "$g", "partitionByFields": ["g"], "output": {"v": {"value": 0}}}
+            doc! {"partitionBy": {"g": "$g"}, "partitionByFields": ["g"], "output": {"v": {"value": 0}}}
         )
         .contains("one of `partitionBy` and `partitionByFields`")
     );
@@ -341,9 +394,6 @@ fn the_stage_refuses_what_it_does_not_know() {
     assert!(
         refused(doc! {"sortBy": {"d": 3}, "output": {"v": {"value": 0}}})
             .contains("must be 1 or -1")
-    );
-    assert!(
-        refused(doc! {"sortBy": {}, "output": {"v": {"value": 0}}}).contains("at least one field")
     );
     assert!(
         refused(doc! {"output": {"$v": {"value": 0}}}).contains("cannot be empty, start with `$`")

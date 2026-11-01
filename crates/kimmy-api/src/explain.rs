@@ -617,7 +617,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{pipeline}: {e:?}"));
         }
         // Over the ceiling a run refuses; a plan has nothing to count.
-        let tight = aggregate::Limits { max_documents: 3 };
+        let tight = aggregate::Limits { max_documents: 3, ..Default::default() };
         let pipeline = json!([{ "$match": {} }]);
         let run = tokio::runtime::Builder::new_current_thread()
             .build()

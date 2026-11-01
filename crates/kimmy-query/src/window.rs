@@ -17,54 +17,50 @@
 //! by `sortBy` (stable, the order `$sort` uses); then every output is computed for every
 //! document of the partition from the **original** documents, so an output cannot read
 //! another output of the same stage, and written into the document at the end. Documents leave
-//! partition by partition in the order the partitions were first seen, and within a partition in
+//! partition by partition, the partitions in ascending order of the value of `partitionBy`
+//! (null and missing are one partition; `1` and `1.0` are one), and within a partition in
 //! `sortBy` order (arrival order when there is no `sortBy`).
 //!
 //! # Windows
 //!
 //! A window is a pair of bounds, each `"unbounded"`, `"current"` or a number, and the documents
 //! of the partition between them, ends included. A `documents` window counts positions from the
-//! current document; a `range` window counts distance in the `sortBy` value (a number, or a date
-//! with a `unit`), so every document tied with the current one is in it. With a descending
-//! `sortBy` the bounds follow the sort order, not the number line: `[-1, 0]` is the previous
-//! document in the sort and the current one, whichever way the numbers run.
+//! current document. A `range` window counts distance in the one ascending `sortBy` field (a
+//! number, or a date with a `unit`): a numeric bound includes every document tied with the
+//! current one at that distance, and `"current"` is the current document itself, so
+//! `[unbounded, current]` takes the tied documents that come before it and not those after.
 //!
 //! Because the bounds are relative to the current document, both ends of the window only ever
 //! move forward as the current document does, so each document is added to the running state once
-//! and removed once. `$sum`, `$avg` and `$count`, `$stdDevPop`, `$stdDevSamp` have an inverse
-//! and slide in constant time per document; `$min` and `$max` keep a monotone deque; `$first` and
-//! `$last` read one document; the window `[unbounded, current]` only ever adds, so it needs no
-//! inverse at all. The rest (`$push`, `$addToSet`, `$top`, ...) are rebuilt from the documents of
-//! the window when it loses one.
+//! and removed once ([`crate::window_acc`] holds the states). The loops that walk a partition
+//! are the places a request-deadline tick belongs.
 //!
 //! # Memory
 //!
-//! Every document buffered, and every value produced, is charged to a byte total that is checked as
-//! it grows ([`MAX_BUFFER_BYTES`], an [`Error::AnswerTooLarge`] the API answers `413` to). A cumulative
-//! `$push` over a large partition, whose output is quadratic, is refused when its output passes the
-//! cap and not after it has been built.
+//! Every document buffered, every sort key taken and every value produced is charged to the
+//! request's byte budget ([`crate::budget`]), as it grows, and the stage is refused `413` at
+//! the first byte over. A cumulative `$push` over a large partition, whose output is
+//! quadratic, is refused while it is made and not after.
 
-use std::collections::VecDeque;
+use std::cmp::Ordering;
 
 use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
+use kimmy_core::decimal::arith;
+use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
 use kimmy_core::{Error, Result, path};
 
-use crate::accumulators;
-use crate::aggregate::{
-    AccState, Accumulator, Limits, accumulate, group_key, init, parse_accumulators,
-};
-use crate::expr::{Binding, Expr, Scope, Total, add_to_date, as_integer, type_name, unit_millis};
+use crate::accumulators::{self, Kind};
+use crate::aggregate::{Accumulator, Limits, group_key, parse_accumulators};
+use crate::budget::Lease;
+use crate::expr::{Binding, Expr, add_to_date, as_integer, type_name, unit_millis};
 use crate::shape::{self, SortKey};
+use crate::window_acc::{
+    BestSlider, CovSlider, ExactDoubles, ExtremeSlider, Queue, QueueSlider, RankedSlider,
+    SetSlider, Slider, StdDevSlider, SumSlider, eval, eval_present,
+};
 
-/// The most bytes one `$setWindowFields`, `$densify` or `$fill` holds: the documents it buffers
-/// plus what it adds to them. A request over it is refused with a `413` as soon as the total passes
-/// it, not after the work is done.
-pub const MAX_BUFFER_BYTES: usize = 256 * 1024 * 1024;
-
-/// The most removals an incrementally maintained standard deviation takes before its state is
-/// rebuilt from the documents of the window, which bounds the drift that subtracting accumulates.
-const REBUILD_AFTER_REMOVALS: usize = 1024;
+pub use crate::budget::MAX_BUFFER_BYTES;
 
 /// How a stage splits its input.
 #[derive(Clone, Debug)]
@@ -77,6 +73,16 @@ pub enum Partition {
     Fields(Vec<String>),
 }
 
+/// One end of a `range` window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RangeBound {
+    Unbounded,
+    /// The current document itself.
+    Current,
+    /// A distance from the current document's sort value.
+    Offset(f64),
+}
+
 /// The bounds of a window, in the units of the window kind.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Window {
@@ -84,8 +90,8 @@ pub enum Window {
     Whole,
     /// Positions around the current document; `None` is `"unbounded"`.
     Documents(Option<i64>, Option<i64>),
-    /// Distances in the `sortBy` value; `None` is `"unbounded"`. `unit` is set for a date.
-    Range { lo: Option<f64>, hi: Option<f64>, unit: Option<String> },
+    /// Distances in the `sortBy` value. `unit` is set for a date.
+    Range { lo: RangeBound, hi: RangeBound, unit: Option<String> },
 }
 
 /// What one output field computes.
@@ -94,6 +100,12 @@ pub enum Func {
     /// A `$group` accumulator over a window.
     Acc {
         acc: Accumulator,
+        window: Window,
+    },
+    /// `$covariancePop` and `$covarianceSamp` over a window.
+    Covariance {
+        exprs: Box<[Expr; 2]>,
+        sample: bool,
         window: Window,
     },
     Rank,
@@ -132,6 +144,8 @@ pub struct Output {
 /// A parsed `$setWindowFields`.
 #[derive(Clone, Debug)]
 pub struct WindowSpec {
+    /// The stage that runs it: `$setWindowFields`, or `$fill` for a `$fill` with a method.
+    pub stage: &'static str,
     pub partition: Partition,
     pub sort: Vec<SortKey>,
     pub outputs: Vec<Output>,
@@ -145,7 +159,8 @@ fn bad<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::InvalidQuery(message.into()))
 }
 
-/// The window accumulators: the `$group` ones without `$mergeObjects`.
+/// The window accumulators: the `$group` ones without `$mergeObjects`, which the reference
+/// refuses too.
 const ACCUMULATORS: [&str; 19] = [
     "$sum",
     "$avg",
@@ -168,14 +183,11 @@ const ACCUMULATORS: [&str; 19] = [
     "$minN",
 ];
 
-/// Parse `sortBy`: a non-empty document of `1` and `-1`.
+/// Parse `sortBy`: a document of `1` and `-1`; `{}` is no sort.
 pub(crate) fn parse_sort_by(stage: &str, value: &Bson) -> Result<Vec<SortKey>> {
     let Some(doc) = value.as_document() else {
         return bad(format!("{stage} `sortBy` must be a document, found {}", type_name(value)));
     };
-    if doc.is_empty() {
-        return bad(format!("{stage} `sortBy` must name at least one field"));
-    }
     for (field, direction) in doc {
         if field.is_empty() || field.starts_with('$') {
             return bad(format!("{stage} `sortBy` names a field, not {field:?}"));
@@ -237,7 +249,17 @@ pub fn parse(spec: &Document, vars: &[String]) -> Result<WindowSpec> {
         check_output_name("$setWindowFields", name)?;
         outputs.push(Output { name: name.clone(), func: parse_output(name, value, &sort, vars)? });
     }
-    Ok(WindowSpec { partition, sort, outputs })
+    Ok(WindowSpec { stage: "$setWindowFields", partition, sort, outputs })
+}
+
+/// A whole number that fits an `Int32`: how far a `documents` bound, a `$shift` and a date
+/// `range` bound may reach.
+fn small_integer(value: &Bson, what: &str) -> Result<i64> {
+    let n = as_integer(value, what)?;
+    if i32::try_from(n).is_err() {
+        return bad(format!("{what} must be an integer that fits 32 bits, found {n}"));
+    }
+    Ok(n)
 }
 
 fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> Result<Func> {
@@ -295,7 +317,7 @@ fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> 
                 return bad(format!("{op} takes no arguments, i.e. {op}: {{}}"));
             }
             refuse_window()?;
-            need_sort("it ranks the documents by their sort values")?;
+            single_sort()?;
             Ok(match op.as_str() {
                 "$rank" => Func::Rank,
                 "$denseRank" => Func::DenseRank,
@@ -306,7 +328,7 @@ fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> 
             let d = argument(op, arg, &["output", "by", "default"], &["output", "by"])?;
             refuse_window()?;
             need_sort("it counts documents in the sort order")?;
-            let by = as_integer(&d["by"], "$shift `by`")?;
+            let by = small_integer(&d["by"], "$shift `by`")?;
             let default = match d.get("default") {
                 None => None,
                 Some(v) => {
@@ -391,16 +413,28 @@ fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> 
         }
         "$locf" | "$linearFill" => {
             refuse_window()?;
-            need_sort("it fills from the neighbours in the sort order")?;
+            // `$locf` carries a value forward in the order the documents arrive when there
+            // is no `sortBy`; `$linearFill` needs the one field to interpolate along.
             if op == "$linearFill" {
                 single_sort()?;
             }
             let expr = Expr::parse_with_vars(arg, vars)?;
             Ok(if op == "$locf" { Func::Locf(expr) } else { Func::LinearFill(expr) })
         }
-        "$covariancePop" | "$covarianceSamp" => bad(format!(
-            "{op} is not supported: it is not built in this version (see docs/deviations.md)"
-        )),
+        "$covariancePop" | "$covarianceSamp" => {
+            let exprs = match arg {
+                Bson::Array(items) if items.len() == 2 => [
+                    Expr::parse_with_vars(&items[0], vars)?,
+                    Expr::parse_with_vars(&items[1], vars)?,
+                ],
+                _ => return bad(format!("{op} takes an array of two expressions, [x, y]")),
+            };
+            let window = match window {
+                None => Window::Whole,
+                Some(w) => parse_window(op, w, sort)?,
+            };
+            Ok(Func::Covariance { exprs: Box::new(exprs), sample: op == "$covarianceSamp", window })
+        }
         op if ACCUMULATORS.contains(&op) => {
             let mut call = Document::new();
             call.insert(op, arg.clone());
@@ -415,8 +449,9 @@ fn parse_output(name: &str, value: &Bson, sort: &[SortKey], vars: &[String]) -> 
             Ok(Func::Acc { acc, window })
         }
         other => bad(format!(
-            "{other} is not a window operator; supported: {}, $rank, $denseRank, $documentNumber, \
-             $shift, $derivative, $integral, $expMovingAvg, $locf, $linearFill",
+            "{other} is not a window operator; supported: {}, $covariancePop, $covarianceSamp, \
+             $rank, $denseRank, $documentNumber, $shift, $derivative, $integral, \
+             $expMovingAvg, $locf, $linearFill",
             ACCUMULATORS.join(", ")
         )),
     }
@@ -460,6 +495,8 @@ fn parse_window(op: &str, value: &Bson, sort: &[SortKey]) -> Result<Window> {
         (Some(_), Some(_)) => {
             bad(format!("{op} `window` takes one of `documents` and `range`, found both"))
         }
+        // An empty window is the whole partition, as the reference reads it.
+        (None, None) if w.is_empty() => Ok(Window::Whole),
         (None, None) => bad(format!("{op} `window` needs `documents` or `range`")),
         (Some(docs), None) => {
             if w.contains_key("unit") {
@@ -474,7 +511,9 @@ fn parse_window(op: &str, value: &Bson, sort: &[SortKey]) -> Result<Window> {
                         "{op} `window` bound must be \"unbounded\", \"current\" or a whole \
                          number, found {s:?}"
                     )),
-                    other => as_integer(other, &format!("{op} `window` documents bound")).map(Some),
+                    other => {
+                        small_integer(other, &format!("{op} `window` documents bound")).map(Some)
+                    }
                 }
             };
             let (lo, hi) = (one(lo)?, one(hi)?);
@@ -484,6 +523,10 @@ fn parse_window(op: &str, value: &Bson, sort: &[SortKey]) -> Result<Window> {
                 return bad(format!(
                     "{op} `window` lower bound {l} must not be above the upper bound {h}"
                 ));
+            }
+            // A position needs an order to be a position in: only the whole partition does not.
+            if sort.is_empty() && (lo.is_some() || hi.is_some()) {
+                return bad(format!("{op} with a documents window requires a `sortBy`"));
             }
             Ok(Window::Documents(lo, hi))
         }
@@ -507,26 +550,29 @@ fn parse_window(op: &str, value: &Bson, sort: &[SortKey]) -> Result<Window> {
                     "{op} with a range window requires a `sortBy` of exactly one field"
                 ));
             }
+            if sort[0].descending {
+                return bad(format!(
+                    "{op} with a range window requires an ascending `sortBy`; the reference \
+                     refuses a range window over a descending one"
+                ));
+            }
             let [lo, hi] = bound_pair(op, "range", range)?;
-            let whole_unit = matches!(unit.as_deref(), Some("year" | "quarter" | "month"));
-            let one = |b: &Bson| -> Result<Option<f64>> {
+            let one = |b: &Bson| -> Result<RangeBound> {
                 match b {
-                    Bson::String(s) if s == "unbounded" => Ok(None),
-                    Bson::String(s) if s == "current" => Ok(Some(0.0)),
+                    Bson::String(s) if s == "unbounded" => Ok(RangeBound::Unbounded),
+                    Bson::String(s) if s == "current" => Ok(RangeBound::Current),
                     Bson::String(s) => bad(format!(
                         "{op} `window` bound must be \"unbounded\", \"current\" or a number, \
                          found {s:?}"
                     )),
                     other => match accumulators::numeric(other) {
+                        // An infinite bound is no bound.
+                        Some(x) if x.is_infinite() => Ok(RangeBound::Unbounded),
                         Some(x) if x.is_finite() => {
-                            if whole_unit && x.fract() != 0.0 {
-                                return bad(format!(
-                                    "{op} `window` range bounds in {} must be whole numbers, \
-                                     found {x}",
-                                    unit.as_deref().unwrap_or("")
-                                ));
+                            if unit.is_some() {
+                                small_integer(other, &format!("{op} `window` range bound"))?;
                             }
-                            Ok(Some(x))
+                            Ok(RangeBound::Offset(x))
                         }
                         _ => bad(format!(
                             "{op} `window` range bound must be \"unbounded\", \"current\" or a \
@@ -537,9 +583,13 @@ fn parse_window(op: &str, value: &Bson, sort: &[SortKey]) -> Result<Window> {
                 }
             };
             let (lo, hi) = (one(lo)?, one(hi)?);
-            if let (Some(l), Some(h)) = (lo, hi)
-                && l > h
-            {
+            let value = |b: RangeBound, unbounded: f64| match b {
+                RangeBound::Unbounded => unbounded,
+                RangeBound::Current => 0.0,
+                RangeBound::Offset(x) => x,
+            };
+            let (l, h) = (value(lo, f64::NEG_INFINITY), value(hi, f64::INFINITY));
+            if l > h {
                 return bad(format!(
                     "{op} `window` lower bound {l} must not be above the upper bound {h}"
                 ));
@@ -560,42 +610,17 @@ fn bound_pair<'a>(op: &str, kind: &str, value: &'a Bson) -> Result<[&'a Bson; 2]
 // The byte budget
 // ---------------------------------------------------------------------------
 
-/// A running total of the bytes a stage holds, checked as it grows.
-pub(crate) struct Budget {
-    used: usize,
-    cap: usize,
-    stage: &'static str,
-}
-
-impl Budget {
-    pub(crate) fn new(stage: &'static str, cap: usize) -> Self {
-        Self { used: 0, cap, stage }
-    }
-
-    pub(crate) fn charge(&mut self, bytes: usize) -> Result<()> {
-        self.used = self.used.saturating_add(bytes);
-        if self.used > self.cap {
-            return Err(Error::AnswerTooLarge {
-                what: self.stage,
-                bytes: self.used,
-                max: self.cap,
-                remedy: "narrow the pipeline with an earlier $match or $project, or partition \
-                         the input into smaller pieces",
-            });
-        }
-        Ok(())
-    }
-
-    pub(crate) fn charge_doc(&mut self, doc: &Document) -> Result<()> {
-        let bytes = bson::serialize_to_vec(doc)
-            .map_err(|e| Error::Internal(format!("{} could not size a document: {e}", self.stage)))?
-            .len();
-        self.charge(bytes)
+/// What a stage names itself in a refusal for its buffer.
+pub(crate) fn buffer_name(stage: &str) -> &'static str {
+    match stage {
+        "$fill" => "the documents $fill buffers",
+        "$densify" => "the documents $densify buffers and generates",
+        _ => "the documents $setWindowFields buffers",
     }
 }
 
 /// The bytes a field adds to a document: type byte, name, terminator, value.
-fn element_bytes(name: &str, value: &Bson) -> usize {
+pub(crate) fn element_bytes(name: &str, value: &Bson) -> usize {
     let body = match value {
         Bson::Null | Bson::Undefined | Bson::MinKey | Bson::MaxKey => 0,
         Bson::Boolean(_) => 1,
@@ -614,52 +639,98 @@ fn element_bytes(name: &str, value: &Bson) -> usize {
 // Running
 // ---------------------------------------------------------------------------
 
-/// The values one output takes, a document each.
+/// The values one output takes, a document each; `None` leaves the field out.
 enum Cells {
-    Same(Bson),
-    Per(Vec<Bson>),
+    Same(Option<Bson>),
+    Per(Vec<Option<Bson>>),
 }
 
 impl Cells {
-    fn at(&self, i: usize) -> &Bson {
+    fn at(&self, i: usize) -> Option<&Bson> {
         match self {
-            Cells::Same(v) => v,
-            Cells::Per(v) => &v[i],
+            Cells::Same(v) => v.as_ref(),
+            Cells::Per(v) => v[i].as_ref(),
         }
     }
 }
 
 struct Sink<'a> {
-    budget: &'a mut Budget,
+    lease: &'a mut Lease,
     name: &'a str,
 }
 
 impl Sink<'_> {
-    fn charge(&mut self, value: &Bson) -> Result<()> {
-        self.budget.charge(element_bytes(self.name, value))
+    fn charge(&mut self, value: &Option<Bson>) -> Result<()> {
+        match value {
+            Some(v) => self.lease.charge(element_bytes(self.name, v)),
+            None => Ok(()),
+        }
     }
 }
 
 struct Run<'a, 'v> {
     vars: &'a [Binding<'v>],
-    limits: &'a Limits,
 }
 
-fn eval(expr: &Expr, doc: &Document, vars: &[Binding<'_>]) -> Result<Bson> {
-    expr.eval_in(&Scope::with_bindings(doc, vars))
-}
-
-/// The partition key of a document.
+/// The partition key of a document: its encoded bytes, and the value it stands for.
 pub(crate) fn partition_key(
     partition: &Partition,
     doc: &Document,
     vars: &[Binding<'_>],
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Rep)> {
     Ok(match partition {
-        Partition::Whole => Vec::new(),
-        Partition::Expr(e) => group_key(&eval(e, doc, vars)?),
-        Partition::Fields(fields) => group_key(&Bson::Document(fields_of(doc, fields))),
+        Partition::Whole => (Vec::new(), Rep::One(Bson::Null)),
+        Partition::Expr(e) => {
+            let value = eval(e, doc, vars)?;
+            if matches!(value, Bson::Array(_)) {
+                return bad("an expression used to partition cannot evaluate to an array");
+            }
+            (group_key(&value), Rep::One(value))
+        }
+        Partition::Fields(fields) => {
+            let held = fields_of(doc, fields);
+            let values = fields.iter().map(|f| held_value(&held, f)).collect();
+            (group_key(&Bson::Document(held)), Rep::Fields(values))
+        }
     })
+}
+
+fn held_value(held: &Document, field: &str) -> Option<Bson> {
+    path::resolve(held, field).into_iter().next().cloned()
+}
+
+/// What a partition stands for, for ordering partitions.
+pub(crate) enum Rep {
+    One(Bson),
+    /// The value of each partition field, `None` where the document has none.
+    Fields(Vec<Option<Bson>>),
+}
+
+/// Partitions order by their values in the canonical order, `null` before a missing field.
+pub(crate) fn compare_fields(a: &[Option<Bson>], b: &[Option<Bson>]) -> Ordering {
+    for (x, y) in a.iter().zip(b) {
+        let o = match (x, y) {
+            (Some(x), Some(y)) => canonical_cmp(x, y),
+            (None, None) => Ordering::Equal,
+            // A missing field sorts as null, after a null that is there.
+            (None, Some(y)) => canonical_cmp(&Bson::Null, y).then(Ordering::Greater),
+            (Some(x), None) => canonical_cmp(x, &Bson::Null).then(Ordering::Less),
+        };
+        if o.is_ne() {
+            return o;
+        }
+    }
+    Ordering::Equal
+}
+
+impl Rep {
+    fn compare(&self, other: &Rep) -> Ordering {
+        match (self, other) {
+            (Rep::One(a), Rep::One(b)) => canonical_cmp(a, b),
+            (Rep::Fields(a), Rep::Fields(b)) => compare_fields(a, b),
+            _ => Ordering::Equal,
+        }
+    }
 }
 
 /// The partition fields a document has, as a document of them (nested for a dotted name).
@@ -682,87 +753,93 @@ pub fn apply(
     limits: &Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
-    apply_capped(spec, input, limits, vars, MAX_BUFFER_BYTES)
-}
-
-/// [`apply`] with the byte cap given, for tests.
-pub fn apply_capped(
-    spec: &WindowSpec,
-    input: Vec<Document>,
-    limits: &Limits,
-    vars: &[Binding<'_>],
-    cap: usize,
-) -> Result<Vec<Document>> {
-    let mut budget = Budget::new("$setWindowFields", cap);
-    let partitions = partitions(&spec.partition, input, vars, &mut budget)?;
-    let run = Run { vars, limits };
+    let mut lease = limits.buffer.lease(buffer_name(spec.stage));
+    let partitions = partitions(&spec.partition, input, vars, &mut lease)?;
+    let run = Run { vars };
     let mut out = Vec::new();
     for docs in partitions {
-        out.extend(run_partition(spec, docs, &run, &mut budget)?);
+        out.extend(run_partition(spec, docs, &run, &mut lease)?);
     }
     Ok(out)
 }
 
-/// The input filed under its partitions in first-seen order, each charged to the budget.
-pub(crate) fn partitions(
+/// The input filed under its partitions, each charged to the budget, the partitions in
+/// ascending order of their values (stably: equal partitions cannot be two).
+fn partitions(
     partition: &Partition,
     input: Vec<Document>,
     vars: &[Binding<'_>],
-    budget: &mut Budget,
+    lease: &mut Lease,
 ) -> Result<Vec<Vec<Document>>> {
-    let mut order: Vec<Vec<Document>> = Vec::new();
+    let mut order: Vec<(Rep, Vec<Document>)> = Vec::new();
+    if matches!(partition, Partition::Whole) {
+        for doc in &input {
+            lease.charge_doc(doc)?;
+        }
+        return Ok(if input.is_empty() { Vec::new() } else { vec![input] });
+    }
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
     for doc in input {
-        budget.charge_doc(&doc)?;
-        let slot = if matches!(partition, Partition::Whole) {
-            if order.is_empty() {
-                order.push(Vec::new());
-            }
-            0
-        } else {
-            let key = partition_key(partition, &doc, vars)?;
-            *index.entry(key).or_insert_with(|| {
-                order.push(Vec::new());
-                order.len() - 1
-            })
-        };
-        order[slot].push(doc);
+        lease.charge_doc(&doc)?;
+        let (key, rep) = partition_key(partition, &doc, vars)?;
+        let slot = *index.entry(key).or_insert_with(|| {
+            order.push((rep, Vec::new()));
+            order.len() - 1
+        });
+        order[slot].1.push(doc);
     }
-    Ok(order)
+    order.sort_by(|a, b| a.0.compare(&b.0));
+    Ok(order.into_iter().map(|(_, docs)| docs).collect())
+}
+
+/// The value at `path` as the document holds it: `None` when it is missing.
+fn raw(doc: &Document, path: &str) -> Option<Bson> {
+    path::resolve(doc, path).into_iter().next().cloned()
 }
 
 fn run_partition(
     spec: &WindowSpec,
     docs: Vec<Document>,
     run: &Run<'_, '_>,
-    budget: &mut Budget,
+    lease: &mut Lease,
 ) -> Result<Vec<Document>> {
-    // Sorted once, on the values taken once.
-    let mut keyed: Vec<(Vec<Bson>, Document)> =
-        docs.into_iter().map(|d| (shape::sort_keys(&spec.sort, &d), d)).collect();
+    let mut docs = docs;
     if !spec.sort.is_empty() {
+        // Sorted once, on the values taken once, which are charged while they are held.
+        let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let keys = shape::sort_keys(&spec.sort, &doc);
+            lease.charge(keys.iter().map(|k| element_bytes("", k)).sum())?;
+            keyed.push((keys, doc));
+        }
         keyed.sort_by(|a, b| shape::compare_keys(&spec.sort, &a.0, &b.0));
+        docs = keyed.into_iter().map(|(_, d)| d).collect();
     }
-    let (keys, mut docs): (Vec<Vec<Bson>>, Vec<Document>) = keyed.into_iter().unzip();
 
     let mut results: Vec<Cells> = Vec::with_capacity(spec.outputs.len());
     for output in &spec.outputs {
-        let mut sink = Sink { budget, name: &output.name };
-        results.push(compute(&output.func, &docs, &keys, &spec.sort, run, &mut sink)?);
+        let mut sink = Sink { lease, name: &output.name };
+        results.push(compute(&output.func, &docs, &spec.sort, run, &mut sink)?);
     }
     for (i, doc) in docs.iter_mut().enumerate() {
         for (output, cells) in spec.outputs.iter().zip(&results) {
-            path::set(doc, &output.name, cells.at(i).clone())
-                .map_err(|e| Error::InvalidQuery(format!("cannot set {:?}: {e}", output.name)))?;
+            if let Some(v) = cells.at(i) {
+                path::set(doc, &output.name, v.clone()).map_err(|e| {
+                    Error::InvalidQuery(format!("cannot set {:?}: {e}", output.name))
+                })?;
+            }
         }
     }
     Ok(docs)
 }
 
+fn per(out: Vec<Option<Bson>>) -> Result<Cells> {
+    Ok(Cells::Per(out))
+}
+
 fn compute(
     func: &Func,
     docs: &[Document],
-    keys: &[Vec<Bson>],
     sort: &[SortKey],
     run: &Run<'_, '_>,
     sink: &mut Sink<'_>,
@@ -770,48 +847,65 @@ fn compute(
     let n = docs.len();
     match func {
         Func::Acc { acc, window } => {
-            let ends = endpoints(acc_name(acc), window, n, keys, sort)?;
+            let ends = endpoints(acc_name(acc), window, docs, sort)?;
             accumulator(acc, docs, &ends, run, sink)
         }
+        Func::Covariance { exprs, sample, window } => {
+            let op = if *sample { "$covarianceSamp" } else { "$covariancePop" };
+            let ends = endpoints(op, window, docs, sort)?;
+            let mut slider = CovSlider::new(exprs, *sample, run.vars);
+            slide(&mut slider, docs, &ends, sink)
+        }
         Func::Rank | Func::DenseRank | Func::DocumentNumber => {
+            let path = &sort[0].path;
             let (mut rank, mut dense) = (0i64, 0i64);
+            let mut previous: Option<Option<Bson>> = None;
             let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                if i == 0 || shape::compare_keys(sort, &keys[i - 1], &keys[i]).is_ne() {
+            for (i, doc) in docs.iter().enumerate() {
+                // Documents tie when the value is the same; a missing one is not a null one.
+                let value = raw(doc, path);
+                let tie = match (&previous, &value) {
+                    (Some(None), None) => true,
+                    (Some(Some(a)), Some(b)) => canonical_cmp(a, b).is_eq(),
+                    _ => false,
+                };
+                if !tie {
                     rank = i as i64 + 1;
                     dense += 1;
                 }
-                let v = Bson::Int64(match func {
+                previous = Some(value);
+                let v = Some(Bson::Int32(clamp32(match func {
                     Func::Rank => rank,
                     Func::DenseRank => dense,
                     _ => i as i64 + 1,
-                });
+                })));
                 sink.charge(&v)?;
                 out.push(v);
             }
-            Ok(Cells::Per(out))
+            per(out)
         }
         Func::Shift { output, by, default } => {
             let default = match default {
-                Some(e) => eval(e, &docs[0], run.vars)?,
-                None => Bson::Null,
+                Some(e) => Some(eval(e, &docs[0], run.vars)?),
+                None => Some(Bson::Null),
             };
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
                 let at = i as i128 + i128::from(*by);
                 let v = if at >= 0 && (at as usize) < n {
-                    eval(output, &docs[at as usize], run.vars)?
+                    // A shifted document that has no value leaves the field out.
+                    eval_present(output, &docs[at as usize], run.vars)?
                 } else {
                     default.clone()
                 };
                 sink.charge(&v)?;
                 out.push(v);
             }
-            Ok(Cells::Per(out))
+            per(out)
         }
         Func::Derivative { input, unit, window } => {
-            let ends = endpoints("$derivative", window, n, keys, sort)?;
-            let x = axis_values("$derivative", keys, unit.as_deref())?;
+            let ends = endpoints("$derivative", window, docs, sort)?;
+            let x = Axis::of("$derivative", docs, &sort[0].path, unit.as_deref())?;
             let y = numeric_inputs(input, docs, run.vars)?;
             let mut out = Vec::with_capacity(n);
             for &(s, e) in &ends {
@@ -819,61 +913,41 @@ fn compute(
                     Bson::Null
                 } else {
                     y.check("$derivative", s, e)?;
-                    let dx = x[e - 1] - x[s];
+                    let dx = x.delta(s, e - 1);
                     if dx == 0.0 {
                         Bson::Null
                     } else {
                         Bson::Double((y.values[e - 1] - y.values[s]) / dx)
                     }
                 };
+                let v = Some(v);
                 sink.charge(&v)?;
                 out.push(v);
             }
-            Ok(Cells::Per(out))
+            per(out)
         }
         Func::Integral { input, unit, window } => {
-            let ends = endpoints("$integral", window, n, keys, sort)?;
-            let x = axis_values("$integral", keys, unit.as_deref())?;
+            let ends = endpoints("$integral", window, docs, sort)?;
+            let x = Axis::of("$integral", docs, &sort[0].path, unit.as_deref())?;
             let y = numeric_inputs(input, docs, run.vars)?;
-            // The area under the line through each neighbouring pair, summed from the start;
-            // a window is the difference of two sums.
-            let mut prefix = vec![0.0f64; n];
-            for k in 1..n {
-                prefix[k] =
-                    prefix[k - 1] + (x[k] - x[k - 1]) * (y.values[k - 1] + y.values[k]) / 2.0;
-            }
-            let mut out = Vec::with_capacity(n);
-            for &(s, e) in &ends {
-                let v = if e - s < 2 {
-                    Bson::Double(0.0)
-                } else {
-                    y.check("$integral", s, e)?;
-                    Bson::Double(prefix[e - 1] - prefix[s])
-                };
-                sink.charge(&v)?;
-                out.push(v);
-            }
-            Ok(Cells::Per(out))
+            integral(&ends, &x, &y, sink)
         }
         Func::ExpMovingAvg { input, alpha } => {
             let mut ema: Option<f64> = None;
             let mut out = Vec::with_capacity(n);
             for doc in docs {
-                let v = match accumulators::numeric(&eval(input, doc, run.vars)?) {
-                    Some(x) => {
-                        let next = match ema {
-                            None => x,
-                            Some(prev) => alpha * x + (1.0 - alpha) * prev,
-                        };
-                        ema = Some(next);
-                        Bson::Double(next)
-                    }
-                    None => Bson::Null,
-                };
+                // A value that is not a number leaves the average where it is.
+                if let Some(x) = accumulators::numeric(&eval(input, doc, run.vars)?) {
+                    ema = Some(match ema {
+                        None => x,
+                        Some(prev) => prev + alpha * (x - prev),
+                    });
+                }
+                let v = Some(ema.map_or(Bson::Null, Bson::Double));
                 sink.charge(&v)?;
                 out.push(v);
             }
-            Ok(Cells::Per(out))
+            per(out)
         }
         Func::Locf(expr) => {
             let mut last = Bson::Null;
@@ -881,64 +955,21 @@ fn compute(
             for doc in docs {
                 let v = eval(expr, doc, run.vars)?;
                 if !matches!(v, Bson::Null) {
-                    last = v.clone();
-                    sink.charge(&v)?;
-                    out.push(v);
-                } else {
-                    sink.charge(&last)?;
-                    out.push(last.clone());
+                    last = v;
                 }
-            }
-            Ok(Cells::Per(out))
-        }
-        Func::LinearFill(expr) => {
-            let x = axis_values("$linearFill", keys, None)?;
-            let mut values = Vec::with_capacity(n);
-            for doc in docs {
-                let v = eval(expr, doc, run.vars)?;
-                if !matches!(v, Bson::Null) && accumulators::numeric(&v).is_none() {
-                    return bad(format!("$linearFill needs numbers, found {}", type_name(&v)));
-                }
-                values.push(v);
-            }
-            // The nearest value before each position and after it.
-            let mut before: Vec<Option<usize>> = vec![None; n];
-            let mut last = None;
-            for i in 0..n {
-                if !matches!(values[i], Bson::Null) {
-                    last = Some(i);
-                }
-                before[i] = last;
-            }
-            let mut after: Vec<Option<usize>> = vec![None; n];
-            let mut next = None;
-            for i in (0..n).rev() {
-                if !matches!(values[i], Bson::Null) {
-                    next = Some(i);
-                }
-                after[i] = next;
-            }
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                let v = if !matches!(values[i], Bson::Null) {
-                    values[i].clone()
-                } else if let (Some(a), Some(b)) = (before[i], after[i]) {
-                    let num = |j: usize| accumulators::numeric(&values[j]).unwrap_or(f64::NAN);
-                    let (y0, y1) = (num(a), num(b));
-                    if x[b] == x[a] {
-                        Bson::Double(y0)
-                    } else {
-                        Bson::Double(y0 + (y1 - y0) * ((x[i] - x[a]) / (x[b] - x[a])))
-                    }
-                } else {
-                    Bson::Null
-                };
+                let v = Some(last.clone());
                 sink.charge(&v)?;
                 out.push(v);
             }
-            Ok(Cells::Per(out))
+            per(out)
         }
+        Func::LinearFill(expr) => linear_fill(expr, docs, sort, run, sink),
     }
+}
+
+/// A rank as an `Int32`, which the reference answers; a long past it.
+fn clamp32(n: i64) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
 }
 
 fn acc_name(acc: &Accumulator) -> &'static str {
@@ -957,67 +988,338 @@ fn acc_name(acc: &Accumulator) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Endpoints
+// The sort axis, and the endpoints of a window
 // ---------------------------------------------------------------------------
 
 /// The sort values of a partition as numbers on one axis.
 enum Axis {
+    /// Numbers.
     Num(Vec<f64>),
-    Date(Vec<i64>),
+    /// Dates, in milliseconds, and the milliseconds one unit of the axis is.
+    Date(Vec<i64>, f64),
 }
 
-fn axis(op: &str, keys: &[Vec<Bson>]) -> Result<Axis> {
-    let mut nums: Vec<f64> = Vec::with_capacity(keys.len());
-    let mut dates: Vec<i64> = Vec::new();
-    for key in keys {
-        match &key[0] {
-            Bson::DateTime(_) if !nums.is_empty() => {
-                return bad(format!(
-                    "{op} needs the sortBy field to be all numbers or all dates, found both"
-                ));
-            }
-            Bson::DateTime(d) => dates.push(d.timestamp_millis()),
-            other if dates.is_empty() => match accumulators::numeric(other) {
-                Some(x) if !x.is_nan() => nums.push(x),
-                _ => {
+impl Axis {
+    /// The one sort field of `docs` read as an axis: a number or a date in every document,
+    /// and not an array. A date takes `unit` (milliseconds when there is none).
+    fn of(op: &str, docs: &[Document], path: &str, unit: Option<&str>) -> Result<Axis> {
+        let mut nums: Vec<f64> = Vec::with_capacity(docs.len());
+        let mut dates: Vec<i64> = Vec::new();
+        for doc in docs {
+            let found = raw(doc, path);
+            match &found {
+                Some(Bson::DateTime(_)) if !nums.is_empty() => {
                     return bad(format!(
-                        "{op} needs the sortBy field to be a number or a date in every document, \
-                         found {}",
-                        match other {
-                            Bson::Null => "null or a missing value",
-                            other => type_name(other),
-                        }
+                        "{op} needs the sortBy field to be all numbers or all dates, found both"
                     ));
                 }
-            },
-            _ => {
-                return bad(format!(
-                    "{op} needs the sortBy field to be all numbers or all dates, found both"
-                ));
+                Some(Bson::DateTime(d)) => dates.push(d.timestamp_millis()),
+                other if dates.is_empty() => match other.as_ref().and_then(accumulators::numeric) {
+                    Some(x) if !x.is_nan() => nums.push(x),
+                    _ => {
+                        return bad(format!(
+                            "{op} needs the sortBy field to be a number or a date in every \
+                             document, found {}",
+                            match other {
+                                None | Some(Bson::Null) => "null or a missing value",
+                                Some(other) => type_name(other),
+                            }
+                        ));
+                    }
+                },
+                _ => {
+                    return bad(format!(
+                        "{op} needs the sortBy field to be all numbers or all dates, found both"
+                    ));
+                }
             }
         }
-    }
-    Ok(if dates.is_empty() { Axis::Num(nums) } else { Axis::Date(dates) })
-}
-
-/// The sort values as numbers for `$derivative`, `$integral` and `$linearFill`: a number as it
-/// is, a date in `unit`s (milliseconds when there is none).
-fn axis_values(op: &str, keys: &[Vec<Bson>], unit: Option<&str>) -> Result<Vec<f64>> {
-    Ok(match axis(op, keys)? {
-        Axis::Num(v) => {
+        if dates.is_empty() {
             if unit.is_some() {
                 return bad(format!(
                     "{op} `unit` is for a date sortBy field, and this one is numeric"
                 ));
             }
-            v
-        }
-        Axis::Date(v) => {
+            Ok(Axis::Num(nums))
+        } else {
             let per = unit.and_then(unit_millis).unwrap_or(1) as f64;
-            v.into_iter().map(|ms| ms as f64 / per).collect()
+            Ok(Axis::Date(dates, per))
+        }
+    }
+
+    /// How far `b` is from `a` along the axis: dates are subtracted in milliseconds first,
+    /// then scaled to the unit.
+    fn delta(&self, a: usize, b: usize) -> f64 {
+        match self {
+            Axis::Num(v) => v[b] - v[a],
+            Axis::Date(v, per) => (v[b] - v[a]) as f64 / per,
+        }
+    }
+
+    /// How far `b` is from `a` in the units of the values themselves: milliseconds for a date.
+    fn raw_delta(&self, a: usize, b: usize) -> f64 {
+        match self {
+            Axis::Num(v) => v[b] - v[a],
+            Axis::Date(v, _) => (v[b] - v[a]) as f64,
+        }
+    }
+
+    /// What one unit of the axis is in the values themselves: 1 for a number.
+    fn per(&self) -> f64 {
+        match self {
+            Axis::Num(_) => 1.0,
+            Axis::Date(_, per) => *per,
+        }
+    }
+
+    fn is_date(&self) -> bool {
+        matches!(self, Axis::Date(..))
+    }
+}
+
+/// For each position, the half-open run `[start, end)` of the partition its window covers.
+/// Both ends never decrease as the position moves on.
+fn endpoints(
+    op: &str,
+    window: &Window,
+    docs: &[Document],
+    sort: &[SortKey],
+) -> Result<Vec<(usize, usize)>> {
+    let n = docs.len();
+    match window {
+        Window::Whole => Ok(vec![(0, n); n]),
+        Window::Documents(lo, hi) => Ok((0..n)
+            .map(|i| {
+                let clamp = |v: i128| v.clamp(0, n as i128) as usize;
+                let s = lo.map_or(0, |l| clamp(i as i128 + i128::from(l)));
+                let e = hi.map_or(n, |h| clamp(i as i128 + i128::from(h) + 1));
+                (s, e.max(s))
+            })
+            .collect()),
+        Window::Range { lo, hi, unit } => {
+            let axis = range_axis(op, docs, &sort[0].path, unit.as_deref())?;
+            let mut out = Vec::with_capacity(n);
+            match &axis {
+                Axis::Num(v) => {
+                    for i in 0..n {
+                        let s = match lo {
+                            RangeBound::Unbounded => 0,
+                            RangeBound::Current => i,
+                            RangeBound::Offset(l) => {
+                                let t = v[i] + l;
+                                v.partition_point(|&x| x < t)
+                            }
+                        };
+                        let e = match hi {
+                            RangeBound::Unbounded => n,
+                            RangeBound::Current => i + 1,
+                            RangeBound::Offset(h) => {
+                                let t = v[i] + h;
+                                v.partition_point(|&x| x <= t)
+                            }
+                        };
+                        out.push((s, e.max(s)));
+                    }
+                }
+                Axis::Date(v, _) => {
+                    let Some(unit) = unit else {
+                        return bad(format!(
+                            "{op}: a range window over a date sortBy field needs a `unit`"
+                        ));
+                    };
+                    for i in 0..n {
+                        let s = match lo {
+                            RangeBound::Unbounded => 0,
+                            RangeBound::Current => i,
+                            RangeBound::Offset(l) => {
+                                let t = shift_date(v[i], *l, unit, op)?;
+                                v.partition_point(|&x| x < t)
+                            }
+                        };
+                        let e = match hi {
+                            RangeBound::Unbounded => n,
+                            RangeBound::Current => i + 1,
+                            RangeBound::Offset(h) => {
+                                let t = shift_date(v[i], *h, unit, op)?;
+                                v.partition_point(|&x| x <= t)
+                            }
+                        };
+                        out.push((s, e.max(s)));
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// The axis of a range window: numbers, or dates with the `unit`.
+fn range_axis(op: &str, docs: &[Document], path: &str, unit: Option<&str>) -> Result<Axis> {
+    // A date sort field takes a `unit` here; the check below tells which it is.
+    match Axis::of(op, docs, path, None) {
+        Ok(axis) => {
+            if unit.is_some() && !axis.is_date() {
+                return bad(format!(
+                    "{op}: a range window `unit` is for a date sortBy field, and this one is \
+                     numeric"
+                ));
+            }
+            Ok(axis)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `from` moved by `offset` units: a calendar step for a month, quarter or year, a length of
+/// time for the rest.
+fn shift_date(from: i64, offset: f64, unit: &str, op: &str) -> Result<i64> {
+    match unit_millis(unit) {
+        Some(len) => add_to_date(from, "millisecond", (offset * len as f64).round() as i64, op),
+        None => add_to_date(from, unit, offset as i64, op),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accumulators over windows
+// ---------------------------------------------------------------------------
+
+fn accumulator(
+    acc: &Accumulator,
+    docs: &[Document],
+    ends: &[(usize, usize)],
+    run: &Run<'_, '_>,
+    sink: &mut Sink<'_>,
+) -> Result<Cells> {
+    let n = docs.len();
+    let vars = run.vars;
+    let edge = |expr: &Expr, at: Option<usize>| -> Result<Option<Bson>> {
+        match at {
+            // A value that is missing leaves the field out; no document gives `null`.
+            Some(i) => eval_present(expr, &docs[i], vars),
+            None => Ok(Some(Bson::Null)),
+        }
+    };
+    let mut out: Vec<Option<Bson>> = Vec::with_capacity(n);
+    match acc {
+        Accumulator::First(expr) | Accumulator::Last(expr) => {
+            let first = matches!(acc, Accumulator::First(_));
+            for &(s, e) in ends {
+                let at = (s < e).then(|| if first { s } else { e - 1 });
+                let v = edge(expr, at)?;
+                sink.charge(&v)?;
+                out.push(v);
+            }
+            return per(out);
+        }
+        Accumulator::Ext(spec) if spec.kind == Kind::Count => {
+            for &(s, e) in ends {
+                let count = e - s;
+                let v = Some(match i32::try_from(count) {
+                    Ok(c) => Bson::Int32(c),
+                    Err(_) => Bson::Int64(count as i64),
+                });
+                sink.charge(&v)?;
+                out.push(v);
+            }
+            return per(out);
+        }
+        _ => {}
+    }
+    let mut slider = make_slider(acc, docs, vars)?;
+    slide(slider.as_mut(), docs, ends, sink)
+}
+
+/// The slider for an accumulator that is not a closed form of the ends.
+fn make_slider<'a, 'v>(
+    acc: &'a Accumulator,
+    docs: &[Document],
+    vars: &'a [Binding<'v>],
+) -> Result<Box<dyn Slider + 'a>> {
+    Ok(match acc {
+        Accumulator::Sum(e) => Box::new(SumSlider::new(e, false, vars)),
+        Accumulator::Avg(e) => Box::new(SumSlider::new(e, true, vars)),
+        Accumulator::Min(e) => Box::new(ExtremeSlider::new(e, false, vars)),
+        Accumulator::Max(e) => Box::new(ExtremeSlider::new(e, true, vars)),
+        Accumulator::Push(e) => Box::new(QueueSlider::new(e, Queue::Push, usize::MAX, vars)),
+        Accumulator::AddToSet(e) => Box::new(SetSlider::new(e, vars)),
+        Accumulator::Ext(spec) => match spec.kind {
+            Kind::StdDevPop => Box::new(StdDevSlider::new(&spec.value, false, vars)),
+            Kind::StdDevSamp => Box::new(StdDevSlider::new(&spec.value, true, vars)),
+            Kind::Top | Kind::Bottom | Kind::TopN | Kind::BottomN => {
+                Box::new(RankedSlider::new(spec, docs, vars)?)
+            }
+            Kind::MaxN | Kind::MinN => Box::new(BestSlider::new(spec, docs, vars)?),
+            Kind::FirstN | Kind::LastN => {
+                let n = spec.resolve(&crate::expr::Scope::with_bindings(&docs[0], vars))?;
+                let kind = if spec.kind == Kind::FirstN { Queue::First } else { Queue::Last };
+                Box::new(QueueSlider::new(&spec.value, kind, n, vars))
+            }
+            Kind::Count => {
+                return bad("$count is answered from the ends of the window and has no state");
+            }
+        },
+        Accumulator::First(_) | Accumulator::Last(_) | Accumulator::MergeObjects(_) => {
+            return bad(format!("{} is not a window operator", acc_name(acc)));
         }
     })
 }
+
+/// Drive a slider over the windows of a partition.
+fn slide(
+    slider: &mut dyn Slider,
+    docs: &[Document],
+    ends: &[(usize, usize)],
+    sink: &mut Sink<'_>,
+) -> Result<Cells> {
+    let n = docs.len();
+    if ends.iter().all(|&e| e == (0, n)) {
+        // The same answer for every document: computed once, charged for every copy.
+        for i in 0..n {
+            slider.add(i, docs)?;
+        }
+        let v = Some(slider.value(docs, 0, n)?);
+        if let Some(b) = &v {
+            sink.lease.charge(element_bytes(sink.name, b).saturating_mul(n))?;
+        }
+        return Ok(Cells::Same(v));
+    }
+    let mut out: Vec<Option<Bson>> = Vec::with_capacity(n);
+    let mut at = (0usize, 0usize);
+    let mut previous: Option<((usize, usize), Bson)> = None;
+    for &(s, e) in ends {
+        // A request-deadline tick goes here (ADR-266).
+        if let Some((window, v)) = &previous
+            && *window == (s, e)
+        {
+            let v = Some(v.clone());
+            sink.charge(&v)?;
+            out.push(v);
+            continue;
+        }
+        if s >= at.1 {
+            slider.reset(s);
+            at = (s, s);
+        }
+        while at.1 < e {
+            slider.add(at.1, docs)?;
+            at.1 += 1;
+        }
+        while at.0 < s {
+            slider.remove(at.0, docs)?;
+            at.0 += 1;
+        }
+        let v = slider.value(docs, s, e)?;
+        previous = Some(((s, e), v.clone()));
+        let v = Some(v);
+        sink.charge(&v)?;
+        out.push(v);
+    }
+    per(out)
+}
+
+// ---------------------------------------------------------------------------
+// $derivative, $integral, $linearFill
+// ---------------------------------------------------------------------------
 
 /// The numeric input of every document, and which are not numeric.
 struct Inputs {
@@ -1063,447 +1365,149 @@ fn numeric_inputs(input: &Expr, docs: &[Document], vars: &[Binding<'_>]) -> Resu
     Ok(Inputs { values, bad_before, first_bad })
 }
 
-/// For each position, the half-open run `[start, end)` of the partition its window covers.
-/// Both ends never decrease as the position moves on.
-fn endpoints(
-    op: &str,
-    window: &Window,
-    n: usize,
-    keys: &[Vec<Bson>],
-    sort: &[SortKey],
-) -> Result<Vec<(usize, usize)>> {
-    match window {
-        Window::Whole => Ok(vec![(0, n); n]),
-        Window::Documents(lo, hi) => Ok((0..n)
-            .map(|i| {
-                let clamp = |v: i128| v.clamp(0, n as i128) as usize;
-                let s = lo.map_or(0, |l| clamp(i as i128 + i128::from(l)));
-                let e = hi.map_or(n, |h| clamp(i as i128 + i128::from(h) + 1));
-                (s, e.max(s))
-            })
-            .collect()),
-        Window::Range { lo, hi, unit } => {
-            let desc = sort[0].descending;
-            let sign = if desc { -1.0 } else { 1.0 };
-            match axis(op, keys)? {
-                Axis::Num(v) => {
-                    if unit.is_some() {
-                        return bad(format!(
-                            "{op}: a range window `unit` is for a date sortBy field, and this one \
-                             is numeric"
-                        ));
-                    }
-                    // `before(x, t)`: x comes before t in the sort order.
-                    let before = |x: f64, t: f64| if desc { x > t } else { x < t };
-                    Ok((0..n)
-                        .map(|i| {
-                            let s = lo.map_or(0, |l| {
-                                let t = v[i] + sign * l;
-                                v.partition_point(|&x| before(x, t))
-                            });
-                            let e = hi.map_or(n, |h| {
-                                let t = v[i] + sign * h;
-                                v.partition_point(|&x| !before(t, x))
-                            });
-                            (s, e.max(s))
-                        })
-                        .collect())
-                }
-                Axis::Date(v) => {
-                    let Some(unit) = unit else {
-                        return bad(format!(
-                            "{op}: a range window over a date sortBy field needs a `unit`"
-                        ));
-                    };
-                    // The calendar units step by the calendar; the rest are lengths of time,
-                    // which may be fractional.
-                    let shift = |from: i64, off: f64| -> Result<i64> {
-                        let off = sign * off;
-                        match unit_millis(unit) {
-                            Some(len) => add_to_date(
-                                from,
-                                "millisecond",
-                                (off * len as f64).round() as i64,
-                                op,
-                            ),
-                            None => add_to_date(from, unit, off as i64, op),
-                        }
-                    };
-                    let before = |x: i64, t: i64| if desc { x > t } else { x < t };
-                    let mut out = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let s = match lo {
-                            None => 0,
-                            Some(l) => {
-                                let t = shift(v[i], *l)?;
-                                v.partition_point(|&x| before(x, t))
-                            }
-                        };
-                        let e = match hi {
-                            None => n,
-                            Some(h) => {
-                                let t = shift(v[i], *h)?;
-                                v.partition_point(|&x| !before(t, x))
-                            }
-                        };
-                        out.push((s, e.max(s)));
-                    }
-                    Ok(out)
-                }
+/// `$integral`: the area of each trapezoid between neighbours, summed exactly over the
+/// window so a large area that has left cannot take the small ones with it.
+fn integral(ends: &[(usize, usize)], x: &Axis, y: &Inputs, sink: &mut Sink<'_>) -> Result<Cells> {
+    let n = y.values.len();
+    // Each area in milliseconds times the value for a date, and divided into the unit once at
+    // the end, as the reference does: the epoch's milliseconds are never scaled and subtracted.
+    let areas: Vec<f64> =
+        (1..n).map(|k| x.raw_delta(k - 1, k) * (y.values[k - 1] + y.values[k]) / 2.0).collect();
+    let per = x.per();
+    let mut sum = ExactDoubles::default();
+    let (mut a_lo, mut a_hi) = (0usize, 0usize);
+    let mut out = Vec::with_capacity(n);
+    for &(s, e) in ends {
+        let v = if e - s < 2 {
+            // The reference answers an integer zero over a number line, a double over dates.
+            if x.is_date() { Bson::Double(0.0) } else { Bson::Int32(0) }
+        } else {
+            y.check("$integral", s, e)?;
+            // The areas between the documents of the window.
+            let (lo, hi) = (s, e - 1);
+            if lo >= a_hi {
+                sum.clear();
+                a_lo = lo;
+                a_hi = lo;
             }
-        }
+            while a_hi < hi {
+                sum.add(areas[a_hi]);
+                a_hi += 1;
+            }
+            while a_lo < lo {
+                sum.add(-areas[a_lo]);
+                a_lo += 1;
+            }
+            let total = if sum.overflowed { areas[lo..hi].iter().sum() } else { sum.value() };
+            Bson::Double(total / per)
+        };
+        let v = Some(v);
+        sink.charge(&v)?;
+        out.push(v);
     }
+    per(out)
 }
 
-// ---------------------------------------------------------------------------
-// Accumulators over windows
-// ---------------------------------------------------------------------------
-
-/// The accumulator's answer without consuming its state.
-fn peek(state: &AccState) -> Result<Bson> {
-    Ok(match state {
-        AccState::Sum(total) => total.to_bson(),
-        AccState::Avg(mean) => mean.to_bson(),
-        AccState::MinMax(v) | AccState::First(v) => v.clone().unwrap_or(Bson::Null),
-        AccState::Last(v) => match v {
-            Some(Ok(v)) => v.clone(),
-            Some(Err(e)) => return Err(Error::InvalidQuery(e.to_string())),
-            None => Bson::Null,
-        },
-        AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items.clone()),
-        AccState::MergeObjects(doc) => Bson::Document(doc.clone()),
-        AccState::Ext(state) => state.clone().finish(),
-    })
-}
-
-/// The accumulator over exactly the documents `docs`, from nothing.
-fn rebuild(acc: &Accumulator, docs: &[Document], run: &Run<'_, '_>) -> Result<Bson> {
-    let field = (String::new(), acc.clone());
-    let mut state = init(&field);
-    for doc in docs {
-        accumulate(&mut state, acc, &Scope::with_bindings(doc, run.vars))?;
-    }
-    peek(&state)
-}
-
-fn accumulator(
-    acc: &Accumulator,
+/// `$linearFill`: a null or missing value is the point on the line between the nearest
+/// numbers on either side of it along the one sort field; `Decimal128` endpoints are
+/// interpolated in decimal.
+fn linear_fill(
+    expr: &Expr,
     docs: &[Document],
-    ends: &[(usize, usize)],
+    sort: &[SortKey],
     run: &Run<'_, '_>,
     sink: &mut Sink<'_>,
 ) -> Result<Cells> {
     let n = docs.len();
-    if ends.iter().all(|&e| e == (0, n)) {
-        // The same answer for every document: computed once, charged for every copy.
-        let v = rebuild(acc, docs, run)?;
-        sink.budget.charge(element_bytes(sink.name, &v).saturating_mul(n))?;
-        return Ok(Cells::Same(v));
+    let x = Axis::of("$linearFill", docs, &sort[0].path, None)?;
+    // The value of the sort field at each position, as the decimal the line is drawn in.
+    let xs: Vec<f64> = match &x {
+        Axis::Num(v) => v.clone(),
+        Axis::Date(v, _) => v.iter().map(|&ms| ms as f64).collect(),
+    };
+    for pair in xs.windows(2) {
+        if pair[0] == pair[1] {
+            return bad("$linearFill: there can be no repeated values in the sort field");
+        }
     }
-    let edge = |expr: &Expr, at: Option<usize>| -> Result<Bson> {
-        match at {
-            Some(i) => eval(expr, &docs[i], run.vars),
-            None => Ok(Bson::Null),
+    let mut values = Vec::with_capacity(n);
+    for doc in docs {
+        let v = eval(expr, doc, run.vars)?;
+        if !matches!(v, Bson::Null) && accumulators::numeric(&v).is_none() {
+            return bad(format!("$linearFill needs numbers, found {}", type_name(&v)));
+        }
+        values.push(v);
+    }
+    // The nearest value before each position and after it.
+    let mut before: Vec<Option<usize>> = vec![None; n];
+    let mut last = None;
+    for i in 0..n {
+        if !matches!(values[i], Bson::Null) {
+            last = Some(i);
+        }
+        before[i] = last;
+    }
+    let mut after: Vec<Option<usize>> = vec![None; n];
+    let mut next = None;
+    for i in (0..n).rev() {
+        if !matches!(values[i], Bson::Null) {
+            next = Some(i);
+        }
+        after[i] = next;
+    }
+    let sort_decimal = |i: usize, docs: &[Document]| -> Option<Raw> {
+        match raw(&docs[i], &sort[0].path)? {
+            Bson::DateTime(d) => Some(arith::from_i64(d.timestamp_millis())),
+            other => decimal_of(&other),
         }
     };
-    let mut out: Vec<Bson> = Vec::with_capacity(n);
-    match acc {
-        Accumulator::First(expr) => {
-            for &(s, e) in ends {
-                let v = edge(expr, (s < e).then_some(s))?;
-                sink.charge(&v)?;
-                out.push(v);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = if !matches!(values[i], Bson::Null) {
+            values[i].clone()
+        } else if let (Some(a), Some(b)) = (before[i], after[i]) {
+            let decimal = matches!(values[a], Bson::Decimal128(_))
+                || matches!(values[b], Bson::Decimal128(_));
+            if decimal {
+                match (
+                    decimal_of(&values[a]),
+                    decimal_of(&values[b]),
+                    sort_decimal(a, docs),
+                    sort_decimal(b, docs),
+                    sort_decimal(i, docs),
+                ) {
+                    (Some(y0), Some(y1), Some(x0), Some(x1), Some(xi)) => {
+                        // y0 + (y1 - y0) (x - x0) / (x1 - x0): multiply, then divide once.
+                        let rise = arith::mul(&arith::sub(&y1, &y0), &arith::sub(&xi, &x0));
+                        match arith::div(&rise, &arith::sub(&x1, &x0)) {
+                            Ok(q) => Bson::Decimal128(pack_raw(arith::add(&y0, &q))),
+                            Err(_) => values[a].clone(),
+                        }
+                    }
+                    _ => Bson::Null,
+                }
+            } else {
+                let num = |j: usize| accumulators::numeric(&values[j]).unwrap_or(f64::NAN);
+                let (y0, y1) = (num(a), num(b));
+                Bson::Double(y0 + (y1 - y0) * (xs[i] - xs[a]) / (xs[b] - xs[a]))
             }
-        }
-        Accumulator::Last(expr) => {
-            for &(s, e) in ends {
-                let v = edge(expr, (s < e).then(|| e - 1))?;
-                sink.charge(&v)?;
-                out.push(v);
-            }
-        }
-        Accumulator::Sum(expr) | Accumulator::Avg(expr) => {
-            let mut slider = SumSlider {
-                acc,
-                expr,
-                avg: matches!(acc, Accumulator::Avg(_)),
-                st: NumState::default(),
-                run,
-            };
-            drive(&mut slider, docs, ends, sink, &mut out)?;
-        }
-        Accumulator::Min(expr) | Accumulator::Max(expr) => {
-            let mut slider = ExtremeSlider {
-                expr,
-                max: matches!(acc, Accumulator::Max(_)),
-                deque: VecDeque::new(),
-                run,
-            };
-            drive(&mut slider, docs, ends, sink, &mut out)?;
-        }
-        _ => {
-            let std_dev = matches!(
-                acc,
-                Accumulator::Ext(s) if matches!(
-                    s.kind,
-                    accumulators::Kind::StdDevPop | accumulators::Kind::StdDevSamp
-                )
-            );
-            let field = (String::new(), acc.clone());
-            let mut slider = GenericSlider {
-                acc,
-                state: init(&field),
-                field,
-                dirty: false,
-                removals: 0,
-                std_dev,
-                run,
-            };
-            drive(&mut slider, docs, ends, sink, &mut out)?;
-        }
-    }
-    Ok(Cells::Per(out))
-}
-
-/// A running state over a window that moves forward.
-trait Slider {
-    fn add(&mut self, i: usize, docs: &[Document]) -> Result<()>;
-    fn remove(&mut self, i: usize, docs: &[Document]) -> Result<()>;
-    fn reset(&mut self);
-    /// The answer for the window `[s, e)`, which the state holds.
-    fn value(&mut self, docs: &[Document], s: usize, e: usize) -> Result<Bson>;
-}
-
-fn drive(
-    slider: &mut dyn Slider,
-    docs: &[Document],
-    ends: &[(usize, usize)],
-    sink: &mut Sink<'_>,
-    out: &mut Vec<Bson>,
-) -> Result<()> {
-    let mut at = (0usize, 0usize);
-    let mut previous: Option<((usize, usize), Bson)> = None;
-    for &(s, e) in ends {
-        if let Some((window, v)) = &previous
-            && *window == (s, e)
-        {
-            let v = v.clone();
-            sink.charge(&v)?;
-            out.push(v);
-            continue;
-        }
-        if s >= at.1 {
-            slider.reset();
-            at = (s, s);
-        }
-        while at.1 < e {
-            slider.add(at.1, docs)?;
-            at.1 += 1;
-        }
-        while at.0 < s {
-            slider.remove(at.0, docs)?;
-            at.0 += 1;
-        }
-        let v = slider.value(docs, s, e)?;
+        } else {
+            Bson::Null
+        };
+        let v = Some(v);
         sink.charge(&v)?;
-        previous = Some(((s, e), v.clone()));
         out.push(v);
     }
-    Ok(())
+    per(out)
 }
 
-/// Any accumulator: added to as the window grows, rebuilt when it loses a document the state
-/// cannot give back.
-struct GenericSlider<'a, 'v> {
-    acc: &'a Accumulator,
-    field: (String, Accumulator),
-    state: AccState,
-    dirty: bool,
-    removals: usize,
-    std_dev: bool,
-    run: &'a Run<'a, 'v>,
-}
-
-impl Slider for GenericSlider<'_, '_> {
-    fn add(&mut self, i: usize, docs: &[Document]) -> Result<()> {
-        if !self.dirty {
-            let scope = Scope::with_bindings(&docs[i], self.run.vars);
-            accumulate(&mut self.state, self.acc, &scope)?;
-        }
-        Ok(())
-    }
-
-    fn remove(&mut self, i: usize, docs: &[Document]) -> Result<()> {
-        if self.dirty {
-            return Ok(());
-        }
-        let scope = Scope::with_bindings(&docs[i], self.run.vars);
-        let removed = match (&mut self.state, self.acc) {
-            (AccState::Ext(state), Accumulator::Ext(spec)) => state.remove(spec, &scope)?,
-            _ => false,
-        };
-        if removed {
-            self.removals += 1;
-            if self.std_dev && self.removals >= REBUILD_AFTER_REMOVALS {
-                self.dirty = true;
-            }
-        } else {
-            self.dirty = true;
-        }
-        Ok(())
-    }
-
-    fn reset(&mut self) {
-        self.state = init(&self.field);
-        self.dirty = false;
-        self.removals = 0;
-    }
-
-    fn value(&mut self, docs: &[Document], s: usize, e: usize) -> Result<Bson> {
-        if self.dirty {
-            self.reset();
-            for doc in &docs[s..e] {
-                let scope = Scope::with_bindings(doc, self.run.vars);
-                accumulate(&mut self.state, self.acc, &scope)?;
-            }
-        }
-        peek(&self.state)
-    }
-}
-
-/// `$sum` and `$avg`: exact integer and compensated double totals that give a document back. A
-/// window holding a `Decimal128`, a non-finite double, or a total beyond a 64-bit integer is
-/// rebuilt with the group accumulator, which handles those.
-#[derive(Default)]
-struct NumState {
-    ints: i128,
-    abs: i128,
-    n_int: usize,
-    sum: f64,
-    comp: f64,
-    n_dbl: usize,
-    special: usize,
-}
-
-impl NumState {
-    fn apply(&mut self, v: &Bson, sign: i64) {
-        let k = |sum: &mut f64, comp: &mut f64, x: f64| {
-            let t = *sum + x;
-            if sum.abs() >= x.abs() {
-                *comp += (*sum - t) + x;
-            } else {
-                *comp += (x - t) + *sum;
-            }
-            *sum = t;
-        };
-        let count = |n: &mut usize| {
-            if sign > 0 { *n += 1 } else { *n -= 1 }
-        };
-        match v {
-            Bson::Int32(_) | Bson::Int64(_) => {
-                let x = match v {
-                    Bson::Int32(n) => i128::from(*n),
-                    Bson::Int64(n) => i128::from(*n),
-                    _ => 0,
-                };
-                self.ints += x * i128::from(sign);
-                self.abs += x.abs() * i128::from(sign);
-                count(&mut self.n_int);
-            }
-            Bson::Double(d) if d.is_finite() => {
-                k(&mut self.sum, &mut self.comp, *d * sign as f64);
-                count(&mut self.n_dbl);
-            }
-            Bson::Double(_) | Bson::Decimal128(_) => count(&mut self.special),
-            _ => {}
-        }
-    }
-}
-
-struct SumSlider<'a, 'v> {
-    acc: &'a Accumulator,
-    expr: &'a Expr,
-    avg: bool,
-    st: NumState,
-    run: &'a Run<'a, 'v>,
-}
-
-impl Slider for SumSlider<'_, '_> {
-    fn add(&mut self, i: usize, docs: &[Document]) -> Result<()> {
-        let v = eval(self.expr, &docs[i], self.run.vars)?;
-        self.st.apply(&v, 1);
-        Ok(())
-    }
-
-    fn remove(&mut self, i: usize, docs: &[Document]) -> Result<()> {
-        let v = eval(self.expr, &docs[i], self.run.vars)?;
-        self.st.apply(&v, -1);
-        Ok(())
-    }
-
-    fn reset(&mut self) {
-        self.st = NumState::default();
-    }
-
-    fn value(&mut self, docs: &[Document], s: usize, e: usize) -> Result<Bson> {
-        let st = &self.st;
-        if st.special > 0 || st.abs > i128::from(i64::MAX) {
-            return rebuild(self.acc, &docs[s..e], self.run);
-        }
-        let count = st.n_int + st.n_dbl;
-        let total = st.ints as f64 + (st.sum + st.comp);
-        Ok(if self.avg {
-            if count == 0 { Bson::Null } else { Bson::Double(total / count as f64) }
-        } else if st.n_dbl > 0 {
-            Bson::Double(total)
-        } else {
-            let mut t = Total::default();
-            t.add(&Bson::Int64(st.ints as i64));
-            t.to_bson()
-        })
-    }
-}
-
-/// `$min` and `$max`: the candidates that could still be the answer, best first.
-struct ExtremeSlider<'a, 'v> {
-    expr: &'a Expr,
-    max: bool,
-    deque: VecDeque<(usize, Bson)>,
-    run: &'a Run<'a, 'v>,
-}
-
-impl Slider for ExtremeSlider<'_, '_> {
-    fn add(&mut self, i: usize, docs: &[Document]) -> Result<()> {
-        let v = eval(self.expr, &docs[i], self.run.vars)?;
-        if matches!(v, Bson::Null) {
-            return Ok(());
-        }
-        // A candidate the newcomer beats strictly can never be the answer again; an equal
-        // one stays, ahead of it, as the first of equals does in `$group`.
-        while let Some((_, back)) = self.deque.back() {
-            let o = canonical_cmp(back, &v);
-            if (self.max && o.is_lt()) || (!self.max && o.is_gt()) {
-                self.deque.pop_back();
-            } else {
-                break;
-            }
-        }
-        self.deque.push_back((i, v));
-        Ok(())
-    }
-
-    fn remove(&mut self, i: usize, _: &[Document]) -> Result<()> {
-        if self.deque.front().is_some_and(|(at, _)| *at == i) {
-            self.deque.pop_front();
-        }
-        Ok(())
-    }
-
-    fn reset(&mut self) {
-        self.deque.clear();
-    }
-
-    fn value(&mut self, _: &[Document], _: usize, _: usize) -> Result<Bson> {
-        Ok(self.deque.front().map_or(Bson::Null, |(_, v)| v.clone()))
+/// A number as a decimal operand: an integer exactly, a double by its exact binary value.
+fn decimal_of(v: &Bson) -> Option<Raw> {
+    match v {
+        Bson::Int32(n) => Some(arith::from_i64(i64::from(*n))),
+        Bson::Int64(n) => Some(arith::from_i64(*n)),
+        Bson::Double(d) => Some(arith::from_binary64(d.to_bits()).0),
+        Bson::Decimal128(d) => Some(decode_raw(d)),
+        _ => None,
     }
 }

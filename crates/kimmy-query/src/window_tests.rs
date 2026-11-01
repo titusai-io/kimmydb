@@ -39,6 +39,10 @@ fn i64s(values: &[i64]) -> Vec<Bson> {
     values.iter().map(|v| Bson::Int64(*v)).collect()
 }
 
+fn ints(values: &[i32]) -> Vec<Bson> {
+    values.iter().map(|v| Bson::Int32(*v)).collect()
+}
+
 fn f64s(values: &[f64]) -> Vec<Bson> {
     values.iter().map(|v| Bson::Double(*v)).collect()
 }
@@ -126,7 +130,7 @@ fn no_partition_and_no_sort_is_one_partition_in_arrival_order() {
 }
 
 #[test]
-fn documents_leave_partition_by_partition_in_first_seen_order_and_sorted_within() {
+fn documents_leave_partition_by_partition_in_ascending_order_of_the_key_and_sorted_within() {
     let input = vec![
         doc! {"_id": 1, "state": "WA", "day": 2},
         doc! {"_id": 2, "state": "CA", "day": 9},
@@ -138,15 +142,16 @@ fn documents_leave_partition_by_partition_in_first_seen_order_and_sorted_within(
         input.clone(),
     )
     .unwrap();
-    assert_eq!(ids(&out), vec![3, 1, 4, 2]);
-    assert_eq!(col(&out, "n"), i64s(&[1, 2, 1, 2]));
-    // Descending.
+    // CA before WA though WA arrived first: the partitions are in the order of their keys.
+    assert_eq!(ids(&out), vec![4, 2, 3, 1]);
+    assert_eq!(col(&out, "n"), ints(&[1, 2, 1, 2]));
+    // Descending within each.
     let out = run(
         set(doc! {"partitionBy": "$state", "sortBy": {"day": -1}, "output": {"n": {"$documentNumber": {}}}}),
         input,
     )
     .unwrap();
-    assert_eq!(ids(&out), vec![1, 3, 2, 4]);
+    assert_eq!(ids(&out), vec![2, 4, 1, 3]);
 }
 
 #[test]
@@ -169,9 +174,9 @@ fn a_partition_expression_may_compute_the_key() {
         series(&[1, 2, 3, 4, 5]),
     )
     .unwrap();
-    // Odd (1, 3, 5) first as the first seen, then the even.
-    assert_eq!(ids(&out), vec![1, 3, 5, 2, 4]);
-    assert_eq!(col(&out, "t"), i64s(&[1, 4, 9, 2, 6]));
+    // The even (key 0) before the odd (key 1), though an odd one arrived first.
+    assert_eq!(ids(&out), vec![2, 4, 1, 3, 5]);
+    assert_eq!(col(&out, "t"), i64s(&[2, 6, 1, 4, 9]));
 }
 
 #[test]
@@ -301,7 +306,9 @@ fn a_standard_deviation_slides_and_a_one_value_sample_is_null() {
         series(&[2, 4, 4, 4, 5, 5, 7, 9]),
     )
     .unwrap();
-    near(&col(&out, "pop"), &[0.0, 1.0, 0.0, 0.0, 0.5, 0.0, 1.0, 1.0]);
+    // One value is an integer zero, as the reference answers it.
+    assert_eq!(col(&out, "pop")[0], Bson::Int32(0));
+    near(&col(&out, "pop")[1..], &[1.0, 0.0, 0.0, 0.5, 0.0, 1.0, 1.0]);
     // The sample deviation of two values a and b is |a - b| / sqrt 2.
     let samp = col(&out, "samp");
     assert_eq!(samp[0], Bson::Null);
@@ -522,19 +529,88 @@ fn a_range_window_counts_distance_in_the_sort_value_not_positions() {
     assert_eq!(col(&out, "s"), i64s(&[1, 3, 6, 8]));
 }
 
+/// Days 1, 1, 2, 2, 3 with quantities 1, 2, 4, 8, 16, so each sum names the documents in its
+/// window. The expected sums are what the reference answers.
+fn tied_days() -> Vec<Document> {
+    [(1, 1), (1, 2), (2, 4), (2, 8), (3, 16)]
+        .iter()
+        .enumerate()
+        .map(|(i, (day, qty))| doc! {"_id": i as i32 + 1, "day": *day, "qty": *qty})
+        .collect()
+}
+
 #[test]
-fn a_range_window_includes_every_document_tied_with_the_current_one() {
-    let input = vec![
-        doc! {"_id": 1, "day": 1, "qty": 1},
-        doc! {"_id": 2, "day": 1, "qty": 2},
-        doc! {"_id": 3, "day": 2, "qty": 4},
-    ];
+fn a_numeric_range_bound_includes_the_documents_tied_with_the_current_one_and_current_does_not() {
+    let sums = |lo: Bson, hi: Bson| {
+        let out = run(
+            set(doc! {"sortBy": {"day": 1}, "output": {"s": {"$sum": "$qty", "window": {"range": [lo, hi]}}}}),
+            tied_days(),
+        )
+        .unwrap();
+        col(&out, "s")
+    };
+    let b = |s: &str| Bson::String(s.into());
+    let n = |x: i32| Bson::Int32(x);
+    // A distance of 0 takes every document of the same day.
+    assert_eq!(sums(n(0), n(0)), i64s(&[3, 3, 12, 12, 16]));
+    // The current document itself is the document, ties before it and after it left out.
+    assert_eq!(sums(b("current"), b("current")), i64s(&[1, 2, 4, 8, 16]));
+    assert_eq!(sums(b("unbounded"), b("current")), i64s(&[1, 3, 7, 15, 31]));
+    assert_eq!(sums(n(-1), b("current")), i64s(&[1, 3, 7, 15, 28]));
+    assert_eq!(sums(b("current"), b("unbounded")), i64s(&[31, 30, 28, 24, 16]));
+    assert_eq!(sums(b("current"), n(1)), i64s(&[15, 14, 28, 24, 16]));
+    assert_eq!(sums(b("current"), n(0)), i64s(&[3, 2, 12, 8, 16]));
+    assert_eq!(sums(n(0), b("current")), i64s(&[1, 3, 4, 12, 16]));
+    assert_eq!(sums(n(0), n(1)), i64s(&[15, 15, 28, 28, 16]));
+    assert_eq!(sums(n(-1), n(0)), i64s(&[3, 3, 15, 15, 28]));
+    assert_eq!(sums(b("unbounded"), n(0)), i64s(&[3, 3, 15, 15, 31]));
+    assert_eq!(sums(n(0), b("unbounded")), i64s(&[31, 31, 28, 28, 16]));
+}
+
+#[test]
+fn current_in_a_range_window_is_the_document_for_every_accumulator_and_for_dates() {
     let out = run(
-        set(doc! {"sortBy": {"day": 1}, "output": {"s": {"$sum": "$qty", "window": {"range": ["current", "current"]}}}}),
-        input,
+        set(doc! {"sortBy": {"day": 1}, "output": {
+            "p": {"$push": "$qty", "window": {"range": ["unbounded", "current"]}},
+            "c": {"$count": {}, "window": {"range": ["current", "current"]}},
+            "lo": {"$min": "$qty", "window": {"range": ["current", "current"]}},
+            "hi": {"$max": "$qty", "window": {"range": ["current", "current"]}},
+        }}),
+        tied_days(),
     )
     .unwrap();
-    assert_eq!(col(&out, "s"), i64s(&[3, 3, 4]));
+    let ints = |v: &[i32]| Bson::Array(v.iter().map(|x| Bson::Int32(*x)).collect());
+    assert_eq!(
+        col(&out, "p"),
+        vec![
+            ints(&[1]),
+            ints(&[1, 2]),
+            ints(&[1, 2, 4]),
+            ints(&[1, 2, 4, 8]),
+            ints(&[1, 2, 4, 8, 16])
+        ]
+    );
+    assert_eq!(col(&out, "c"), vec![Bson::Int32(1); 5]);
+    assert_eq!(col(&out, "lo"), col(&out, "hi"));
+    assert_eq!(col(&out, "hi"), ints_bson(&[1, 2, 4, 8, 16]));
+    // The same over dates: [-1 day, current] takes the ties before the current one only.
+    let dates: Vec<Document> = [(0, 1), (0, 2), (1, 4), (1, 8)]
+        .iter()
+        .enumerate()
+        .map(|(i, (day, qty))| {
+            doc! {"_id": i as i32 + 1, "t": d(&format!("2023-01-0{}T00:00:00Z", day + 1)), "qty": *qty}
+        })
+        .collect();
+    let out = run(
+        set(doc! {"sortBy": {"t": 1}, "output": {"s": {"$sum": "$qty", "window": {"range": [-1, "current"], "unit": "day"}}}}),
+        dates,
+    )
+    .unwrap();
+    assert_eq!(col(&out, "s"), i64s(&[1, 3, 7, 15]));
+}
+
+fn ints_bson(values: &[i32]) -> Vec<Bson> {
+    values.iter().map(|v| Bson::Int32(*v)).collect()
 }
 
 #[test]
@@ -554,15 +630,21 @@ fn a_range_window_unbounded_on_one_side() {
 }
 
 #[test]
-fn a_range_window_follows_the_sort_direction_when_descending() {
+fn a_range_window_over_a_descending_sort_is_refused_as_the_reference_refuses_it() {
+    for sort in [doc! {"day": -1}, doc! {"t": -1}] {
+        let e = refused(set(
+            doc! {"sortBy": sort, "output": {"s": {"$sum": 1, "window": {"range": [-3, 0]}}}},
+        ));
+        assert!(e.contains("ascending `sortBy`"), "{e}");
+    }
+    // A documents window over a descending sort is fine, and follows the sort.
     let out = run(
-        set(doc! {"sortBy": {"day": -1}, "output": {"s": {"$sum": "$day", "window": {"range": [-3, 0]}}}}),
-        vec![doc! {"day": 1}, doc! {"day": 2}, doc! {"day": 4}, doc! {"day": 7}],
+        set(doc! {"sortBy": {"day": -1}, "output": {"s": {"$push": "$day", "window": {"documents": [-1, 0]}}}}),
+        vec![doc! {"day": 1}, doc! {"day": 2}, doc! {"day": 4}],
     )
     .unwrap();
-    // Sorted 7, 4, 2, 1; the window reaches back (up the number line) by 3: 7 -> {7}, 4 -> {7, 4},
-    // 2 -> {4, 2}, 1 -> {4, 2, 1}.
-    assert_eq!(col(&out, "s"), i64s(&[7, 11, 6, 7]));
+    let ints = |v: &[i32]| Bson::Array(v.iter().map(|x| Bson::Int32(*x)).collect());
+    assert_eq!(col(&out, "s"), vec![ints(&[4]), ints(&[4, 2]), ints(&[2, 1])]);
 }
 
 #[test]
@@ -578,13 +660,21 @@ fn a_range_window_over_dates_steps_by_the_unit() {
     )
     .unwrap();
     assert_eq!(col(&out, "s"), i64s(&[1, 3, 4]));
-    // Fractions of a fixed-length unit.
+    // A bound with a unit is a whole number of it, small enough for 32 bits.
+    for bound in [Bson::Double(-0.5), Bson::Double(-1e12), Bson::Int64(1 << 40)] {
+        let e = refused(set(
+            doc! {"sortBy": {"t": 1}, "output": {"s": {"$sum": "$qty", "window": {"range": [bound, 0], "unit": "hour"}}}},
+        ));
+        assert!(e.contains("range bound"), "{e}");
+    }
+    // A bound without one may be a fraction.
     let out = run(
-        set(doc! {"sortBy": {"t": 1}, "output": {"s": {"$sum": "$qty", "window": {"range": [-0.5, 0], "unit": "hour"}}}}),
-        input,
+        set(doc! {"sortBy": {"qty": 1}, "output": {"s": {"$sum": "$qty", "window": {"range": [-0.5, 0]}}}}),
+        series(&[1, 2, 4]),
     )
     .unwrap();
     assert_eq!(col(&out, "s"), i64s(&[1, 2, 4]));
+    let _ = input;
 }
 
 #[test]
@@ -660,15 +750,63 @@ fn window_bounds_are_validated() {
     assert!(bounds(doc! {"documents": "unbounded"}).contains("two bounds"));
     assert!(bounds(doc! {"range": ["x", 1]}).contains("\"unbounded\", \"current\""));
     assert!(bounds(doc! {"range": [Bson::Null, 1]}).contains("number"));
-    assert!(bounds(doc! {}).contains("needs `documents` or `range`"));
+    assert!(bounds(doc! {"unit": "day"}).contains("needs `documents` or `range`"));
     assert!(bounds(doc! {"documents": [0, 1], "range": [0, 1]}).contains("one of"));
     assert!(bounds(doc! {"documents": [0, 1], "unit": "day"}).contains("goes with `range`"));
     assert!(bounds(doc! {"range": [0, 1], "unit": "fortnight"}).contains("`unit` must be one of"));
     assert!(bounds(doc! {"range": [0, 1], "unit": 5}).contains("`unit` must be one of"));
-    assert!(bounds(doc! {"range": [0.5, 1], "unit": "month"}).contains("whole numbers"));
+    assert!(bounds(doc! {"range": [0.5, 1], "unit": "month"}).contains("range bound"));
+    // A bound is a whole number of 32 bits: the reference refuses a long past that.
+    assert!(
+        bounds(doc! {"documents": [Bson::Int64(1 << 40), Bson::Int64(1 << 41)]})
+            .contains("fits 32 bits")
+    );
+    // No bound reaches below the lower one.
+    assert!(bounds(doc! {"range": ["current", -1]}).contains("must not be above"));
+    assert!(bounds(doc! {"range": [1, "current"]}).contains("must not be above"));
     assert!(bounds(doc! {"documents": [0, 1], "extra": 1}).contains("does not take `extra`"));
     let not_doc = refused(set(doc! {"output": {"s": {"$sum": 1, "window": [0, 1]}}}));
     assert!(not_doc.contains("`window` must be a document"), "{not_doc}");
+}
+
+#[test]
+fn a_documents_window_needs_a_sort_unless_it_is_the_whole_partition() {
+    let w = |spec: Document| set(doc! {"output": {"s": {"$sum": 1, "window": spec}}});
+    for window in [
+        doc! {"documents": [-1, 0]},
+        doc! {"documents": ["unbounded", "current"]},
+        doc! {"documents": ["current", "unbounded"]},
+        doc! {"documents": [0, 0]},
+    ] {
+        let e = refused(w(window.clone()));
+        assert!(e.contains("requires a `sortBy`"), "{window}: {e}");
+    }
+    // Both bounds unbounded is the whole partition, which needs no order.
+    run(w(doc! {"documents": ["unbounded", "unbounded"]}), series(&[1, 2])).unwrap();
+    // `{}` is the whole partition too, and `sortBy: {}` is no sort.
+    let out = run(w(doc! {}), series(&[1, 2, 3])).unwrap();
+    assert_eq!(col(&out, "s"), i64s(&[3, 3, 3]));
+    let out = run(
+        set(doc! {"sortBy": {}, "output": {"s": {"$sum": 1, "window": {"documents": [0, 0]}}}}),
+        series(&[1, 2]),
+    );
+    assert!(out.is_err(), "an empty sortBy is no sort, and a position needs one");
+    let out = run(set(doc! {"sortBy": {}, "output": {"s": {"$sum": 1}}}), series(&[1, 2])).unwrap();
+    assert_eq!(col(&out, "s"), i64s(&[2, 2]));
+}
+
+#[test]
+fn an_infinite_range_bound_is_no_bound() {
+    let out = run(
+        set(doc! {"sortBy": {"qty": 1}, "output": {
+            "lo": {"$sum": "$qty", "window": {"range": [f64::NEG_INFINITY, 0]}},
+            "hi": {"$sum": "$qty", "window": {"range": [0, f64::INFINITY]}},
+        }}),
+        series(&[1, 2, 4]),
+    )
+    .unwrap();
+    assert_eq!(col(&out, "lo"), i64s(&[1, 3, 7]));
+    assert_eq!(col(&out, "hi"), i64s(&[7, 6, 4]));
 }
 
 #[test]
@@ -718,38 +856,55 @@ fn rank_dense_rank_and_document_number_over_ties() {
         input,
     )
     .unwrap();
-    assert_eq!(col(&out, "rank"), i64s(&[1, 2, 2, 4]));
-    assert_eq!(col(&out, "dense"), i64s(&[1, 2, 2, 3]));
-    assert_eq!(col(&out, "n"), i64s(&[1, 2, 3, 4]));
+    // Int32, as the reference answers them.
+    assert_eq!(col(&out, "rank"), ints(&[1, 2, 2, 4]));
+    assert_eq!(col(&out, "dense"), ints(&[1, 2, 2, 3]));
+    assert_eq!(col(&out, "n"), ints(&[1, 2, 3, 4]));
 }
 
 #[test]
-fn rank_ties_are_decided_on_every_sort_key_and_restart_in_each_partition() {
+fn rank_restarts_in_each_partition() {
     let input = vec![
-        doc! {"_id": 1, "g": "a", "x": 1, "y": 1},
-        doc! {"_id": 2, "g": "a", "x": 1, "y": 2},
-        doc! {"_id": 3, "g": "a", "x": 1, "y": 2},
-        doc! {"_id": 4, "g": "b", "x": 1, "y": 1},
+        doc! {"_id": 1, "g": "a", "y": 1},
+        doc! {"_id": 2, "g": "a", "y": 2},
+        doc! {"_id": 3, "g": "a", "y": 2},
+        doc! {"_id": 4, "g": "b", "y": 1},
     ];
     let out = run(
-        set(doc! {"partitionBy": "$g", "sortBy": {"x": 1, "y": 1}, "output": {"rank": {"$rank": {}}, "dense": {"$denseRank": {}}}}),
+        set(doc! {"partitionBy": "$g", "sortBy": {"y": 1}, "output": {"rank": {"$rank": {}}, "dense": {"$denseRank": {}}}}),
         input,
     )
     .unwrap();
-    assert_eq!(col(&out, "rank"), i64s(&[1, 2, 2, 1]));
-    assert_eq!(col(&out, "dense"), i64s(&[1, 2, 2, 1]));
+    assert_eq!(col(&out, "rank"), ints(&[1, 2, 2, 1]));
+    assert_eq!(col(&out, "dense"), ints(&[1, 2, 2, 1]));
 }
 
 #[test]
-fn a_missing_sort_value_ranks_with_null() {
+fn the_rank_family_needs_a_sort_of_exactly_one_field() {
+    for op in ["$rank", "$denseRank", "$documentNumber"] {
+        let e = refused(set(doc! {"sortBy": {"x": 1, "y": 1}, "output": {"r": {op: {}}}}));
+        assert!(e.contains("exactly one field"), "{op}: {e}");
+    }
+}
+
+#[test]
+fn a_missing_sort_value_ranks_apart_from_a_null_one_and_a_one_from_a_one_point_zero() {
     let out = run(
-        set(doc! {"sortBy": {"s": 1}, "output": {"rank": {"$rank": {}}}}),
-        vec![doc! {"_id": 1, "s": 1}, doc! {"_id": 2}, doc! {"_id": 3, "s": Bson::Null}],
+        set(doc! {"sortBy": {"s": 1}, "output": {"rank": {"$rank": {}}, "dense": {"$denseRank": {}}}}),
+        vec![
+            doc! {"_id": 1, "s": 1},
+            doc! {"_id": 2},
+            doc! {"_id": 3, "s": Bson::Null},
+            doc! {"_id": 4, "s": 1.0},
+            doc! {"_id": 5},
+        ],
     )
     .unwrap();
-    // Null and missing sort first and tie.
-    assert_eq!(ids(&out), vec![2, 3, 1]);
-    assert_eq!(col(&out, "rank"), i64s(&[1, 1, 3]));
+    // Null and missing sort together, in arrival order, and rank apart: a missing value is
+    // not a null one, and only neighbours tie.
+    assert_eq!(ids(&out), vec![2, 3, 5, 1, 4]);
+    assert_eq!(col(&out, "rank"), ints(&[1, 2, 3, 4, 4]));
+    assert_eq!(col(&out, "dense"), ints(&[1, 2, 3, 4, 4]));
 }
 
 #[test]
@@ -894,14 +1049,15 @@ fn an_integral_is_the_trapezoid_sum_over_the_window() {
         xy(),
     )
     .unwrap();
-    // 0; (2-1)*(10+20)/2 = 15; 15 + (4-2)*(20+50)/2 = 85.
-    assert_eq!(col(&out, "i"), f64s(&[0.0, 15.0, 85.0]));
+    // An integer zero for one document, as the reference answers it; then
+    // (2-1)*(10+20)/2 = 15; 15 + (4-2)*(20+50)/2 = 85.
+    assert_eq!(col(&out, "i"), vec![Bson::Int32(0), Bson::Double(15.0), Bson::Double(85.0)]);
     let out = run(
         set(doc! {"sortBy": {"x": 1}, "output": {"i": {"$integral": {"input": "$y"}, "window": {"documents": [-1, 0]}}}}),
         xy(),
     )
     .unwrap();
-    assert_eq!(col(&out, "i"), f64s(&[0.0, 15.0, 70.0]));
+    assert_eq!(col(&out, "i"), vec![Bson::Int32(0), Bson::Double(15.0), Bson::Double(70.0)]);
 }
 
 #[test]
@@ -915,8 +1071,8 @@ fn an_integral_over_dates_is_in_the_unit() {
         input,
     )
     .unwrap();
-    // 2 hours at a mean of 15.
-    assert_eq!(col(&out, "i")[1], Bson::Double(30.0));
+    // 2 hours at a mean of 15; over dates a window of one document is a double zero.
+    assert_eq!(col(&out, "i"), vec![Bson::Double(0.0), Bson::Double(30.0)]);
 }
 
 #[test]
@@ -927,7 +1083,7 @@ fn derivative_and_integral_take_a_range_window() {
     )
     .unwrap();
     // x = 4 reaches back to x = 2: one trapezoid, (4-2)*(20+50)/2.
-    assert_eq!(col(&out, "i"), f64s(&[0.0, 15.0, 70.0]));
+    assert_eq!(col(&out, "i"), vec![Bson::Int32(0), Bson::Double(15.0), Bson::Double(70.0)]);
 }
 
 #[test]
@@ -1022,10 +1178,30 @@ fn a_moving_average_skips_a_non_numeric_value_and_restarts_in_each_partition() {
         ],
     )
     .unwrap();
+    // The document with no number answers the average it has, 10 here.
     assert_eq!(
         col(&out, "e"),
-        vec![Bson::Double(10.0), Bson::Null, Bson::Double(20.0), Bson::Double(6.0)]
+        vec![Bson::Double(10.0), Bson::Double(10.0), Bson::Double(20.0), Bson::Double(6.0)]
     );
+    // Before there is a number it is null.
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {"e": {"$expMovingAvg": {"input": "$v", "N": 3}}}}),
+        vec![doc! {"_id": 1}, doc! {"_id": 2, "v": "x"}, doc! {"_id": 3, "v": 4}],
+    )
+    .unwrap();
+    assert_eq!(col(&out, "e"), vec![Bson::Null, Bson::Null, Bson::Double(4.0)]);
+}
+
+#[test]
+fn a_moving_average_updates_as_the_reference_does_to_the_last_digit() {
+    // N = 2 is alpha 2/3; 10 + 2/3 * (30 - 10) is 23.333333333333332, where
+    // 2/3 * 30 + 1/3 * 10 is 23.333333333333336.
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {"e": {"$expMovingAvg": {"input": "$v", "N": 2}}}}),
+        vec![doc! {"_id": 1, "v": 10}, doc! {"_id": 2, "v": 30}],
+    )
+    .unwrap();
+    assert_eq!(col(&out, "e"), vec![Bson::Double(10.0), Bson::Double(23.333333333333332)]);
 }
 
 #[test]
@@ -1134,9 +1310,73 @@ fn linear_fill_over_dates_and_its_refusals() {
             doc! {"sortBy": {"x": 1}, "output": {"f": {op: "$v", "window": {"documents": [0, 1]}}}},
         ));
         assert!(w.contains("does not take a `window`"), "{op}: {w}");
-        let s = refused(set(doc! {"output": {"f": {op: "$v"}}}));
-        assert!(s.contains("requires a `sortBy`"), "{op}: {s}");
     }
+    let s = refused(set(doc! {"output": {"f": {"$linearFill": "$v"}}}));
+    assert!(s.contains("exactly one field"), "{s}");
+}
+
+#[test]
+fn locf_without_a_sort_carries_forward_in_the_order_the_documents_arrive() {
+    let out = run(
+        set(doc! {"output": {"f": {"$locf": "$v"}}}),
+        vec![
+            doc! {"_id": 1, "x": 3, "v": 1},
+            doc! {"_id": 2, "x": 1, "v": Bson::Null},
+            doc! {"_id": 3, "x": 2, "v": 5},
+            doc! {"_id": 4, "x": 0},
+        ],
+    )
+    .unwrap();
+    assert_eq!(ids(&out), vec![1, 2, 3, 4]);
+    assert_eq!(col(&out, "f"), ints(&[1, 1, 5, 5]));
+    // An empty sortBy is no sort.
+    let out = run(
+        set(doc! {"sortBy": {}, "output": {"f": {"$locf": "$v"}}}),
+        vec![doc! {"v": 1}, doc! {}],
+    )
+    .unwrap();
+    assert_eq!(col(&out, "f"), ints(&[1, 1]));
+}
+
+#[test]
+fn linear_fill_refuses_a_repeated_sort_value() {
+    let e = refused_run(
+        set(doc! {"sortBy": {"x": 1}, "output": {"f": {"$linearFill": "$v"}}}),
+        vec![
+            doc! {"x": 1, "v": 1},
+            doc! {"x": 2},
+            doc! {"x": 2, "v": 5},
+            doc! {"x": 3},
+            doc! {"x": 5, "v": 9},
+        ],
+    );
+    assert!(e.contains("no repeated values"), "{e}");
+}
+
+#[test]
+fn linear_fill_interpolates_in_decimal_when_an_end_is_a_decimal() {
+    let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+    let out = run(
+        set(doc! {"sortBy": {"x": 1}, "output": {"f": {"$linearFill": "$v"}}}),
+        vec![
+            doc! {"x": 1, "v": dec("1.1")},
+            doc! {"x": 2},
+            doc! {"x": 3, "v": dec("2.2")},
+            doc! {"x": 4},
+            doc! {"x": 6, "v": 10_i64},
+        ],
+    )
+    .unwrap();
+    // 1.1 + 1.1 * 1 / 2 and 2.2 + 7.8 * 1 / 3, the product taken before the division.
+    assert_eq!(col(&out, "f")[1], dec("1.65"));
+    assert_eq!(col(&out, "f")[3], dec("4.8"));
+    // Plain numbers are doubles.
+    let out = run(
+        set(doc! {"sortBy": {"x": 1}, "output": {"f": {"$linearFill": "$v"}}}),
+        vec![doc! {"x": 1, "v": 1}, doc! {"x": 2}, doc! {"x": 4, "v": 7}],
+    )
+    .unwrap();
+    assert_eq!(col(&out, "f")[1], Bson::Double(3.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,7 +1412,8 @@ fn the_stage_refuses_what_it_does_not_know() {
         refused(set(doc! {"output": {"a": {"$mergeObjects": "$x"}}}))
             .contains("not a window operator")
     );
-    assert!(refused(set(doc! {"sortBy": {}, "output": {}})).contains("at least one field"));
+    // `sortBy: {}` is no sort.
+    run(set(doc! {"sortBy": {}, "output": {}}), series(&[1])).unwrap();
     assert!(refused(set(doc! {"sortBy": {"a": 2}, "output": {}})).contains("must be 1 or -1"));
     assert!(refused(set(doc! {"sortBy": {"a": "asc"}, "output": {}})).contains("must be 1 or -1"));
     assert!(
@@ -1201,12 +1442,96 @@ fn the_stage_refuses_what_it_does_not_know() {
     );
 }
 
+fn pairs() -> Vec<Document> {
+    vec![
+        doc! {"_id": 1, "x": 1, "y": 2},
+        doc! {"_id": 2, "x": 2, "y": 4},
+        doc! {"_id": 3, "x": 4, "y": 5},
+        doc! {"_id": 4, "x": 5, "y": "z"},
+        doc! {"_id": 5, "x": 7, "y": 11},
+    ]
+}
+
 #[test]
-fn covariance_is_refused_by_name() {
+fn covariance_slides_over_pairs_and_skips_a_pair_with_a_member_that_is_not_a_number() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "p": {"$covariancePop": ["$x", "$y"], "window": {"documents": [-2, 0]}},
+            "s": {"$covarianceSamp": ["$x", "$y"], "window": {"documents": [-2, 0]}},
+        }}),
+        pairs(),
+    )
+    .unwrap();
+    // One pair: a sample is null and a population covariance is 0. Then (2,4),(4,5): the
+    // x mean 3 and y mean 4.5, so (-1 * -0.5 + 1 * 0.5) = 1 over 2 or 1. Row 4 skips (5, "z").
+    // Row 5: (4,5) and (7,11): means 5.5 and 8, (-1.5 * -3 + 1.5 * 3) = 9 over 2 or 1.
+    near(&col(&out, "p"), &[0.0, 0.5, 1.4444444444444444, 0.5, 4.5]);
+    let s = col(&out, "s");
+    assert_eq!(s[0], Bson::Null);
+    near(&s[1..], &[1.0, 2.1666666666666665, 1.0, 9.0]);
+}
+
+#[test]
+fn covariance_over_the_whole_partition_and_over_nothing() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "p": {"$covariancePop": ["$x", {"$multiply": ["$x", 2]}]},
+            "s": {"$covarianceSamp": ["$x", {"$multiply": ["$x", 2]}]},
+        }}),
+        vec![doc! {"x": 1}, doc! {"x": 2}, doc! {"x": 3}],
+    )
+    .unwrap();
+    // y = 2x: the covariance is twice the variance of x, 2/3 population and 1 sample, doubled.
+    near(&col(&out, "p")[..1], &[4.0 / 3.0]);
+    near(&col(&out, "s")[..1], &[2.0]);
+    // No pair at all: null.
+    let out = run(
+        set(doc! {"output": {"p": {"$covariancePop": ["$a", "$b"]}, "s": {"$covarianceSamp": ["$a", "$b"]}}}),
+        vec![doc! {"a": "x", "b": 1}, doc! {"b": 2}],
+    )
+    .unwrap();
+    assert_eq!(col(&out, "p"), vec![Bson::Null; 2]);
+    assert_eq!(col(&out, "s"), vec![Bson::Null; 2]);
+}
+
+#[test]
+fn covariance_with_a_non_finite_member_is_nan_while_it_is_in_the_window_and_not_after() {
+    let input = vec![
+        doc! {"_id": 1, "x": 1, "y": 1},
+        doc! {"_id": 2, "x": 2, "y": f64::INFINITY},
+        doc! {"_id": 3, "x": 3, "y": 3},
+        doc! {"_id": 4, "x": 4, "y": 5},
+        doc! {"_id": 5, "x": 5, "y": 4},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+        "p": {"$covariancePop": ["$x", "$y"], "window": {"documents": [-1, 0]}}}}),
+        input,
+    )
+    .unwrap();
+    let p = col(&out, "p");
+    assert!(matches!(p[1], Bson::Double(x) if x.is_nan()), "{p:?}");
+    assert!(matches!(p[2], Bson::Double(x) if x.is_nan()), "{p:?}");
+    // (3,3),(4,5) then (4,5),(5,4): never a stale NaN.
+    near(&p[3..], &[0.5, -0.25]);
+}
+
+#[test]
+fn covariance_refusals() {
     for op in ["$covariancePop", "$covarianceSamp"] {
-        let e = refused(set(doc! {"sortBy": {"a": 1}, "output": {"c": {op: ["$a", "$b"]}}}));
-        assert!(e.contains(op) && e.contains("not supported"), "{e}");
+        for arg in [
+            Bson::Array(vec![]),
+            Bson::Array(vec!["$a".into()]),
+            Bson::String("$a".into()),
+            Bson::Document(doc! {"a": 1}),
+        ] {
+            let e = refused(set(doc! {"sortBy": {"a": 1}, "output": {"c": {op: arg.clone()}}}));
+            assert!(e.contains("array of two expressions"), "{op} {arg}: {e}");
+        }
     }
+    // `$mergeObjects` is not a window operator, as the reference has it.
+    let e = refused(set(doc! {"output": {"a": {"$mergeObjects": "$x"}}}));
+    assert!(e.contains("not a window operator"), "{e}");
 }
 
 #[test]
@@ -1286,6 +1611,11 @@ fn spec_of(stage: Document) -> window::WindowSpec {
     }
 }
 
+/// Limits whose byte budget is `cap`.
+fn capped(cap: usize) -> Limits {
+    Limits { buffer: crate::budget::BufferBudget::new(cap), ..Default::default() }
+}
+
 fn size(doc: &Document) -> usize {
     bson::serialize_to_vec(doc).unwrap().len()
 }
@@ -1296,10 +1626,9 @@ fn buffered_documents_are_held_to_the_byte_cap_with_an_early_refusal() {
     let each = size(&input[0]);
     let spec = spec_of(set(doc! {"output": {"n": {"$count": {}}}}));
     // Room for three of four documents: refused at the fourth, before anything is computed.
-    let err = window::apply_capped(&spec, input.clone(), &Limits::default(), &[], each * 3 + 1)
-        .unwrap_err();
+    let err = window::apply(&spec, input.clone(), &capped(each * 3 + 1), &[]).unwrap_err();
     assert!(
-        matches!(err, Error::AnswerTooLarge { what: "$setWindowFields", bytes, .. } if bytes == each * 4),
+        matches!(err, Error::ValueTooLarge { what: "the documents $setWindowFields buffers", bytes, .. } if bytes == each * 4),
         "{err:?}"
     );
 }
@@ -1312,14 +1641,12 @@ fn the_values_the_stage_adds_are_held_to_the_byte_cap_exactly() {
     let cell = 1 + 1 + 1 + 4;
     let spec = spec_of(set(doc! {"output": {"n": {"$count": {}}}}));
     // The cap is exactly what the documents and three cells come to: allowed.
-    let out = window::apply_capped(&spec, input.clone(), &Limits::default(), &[], held + 3 * cell)
-        .unwrap();
+    let out = window::apply(&spec, input.clone(), &capped(held + 3 * cell), &[]).unwrap();
     assert_eq!(out.len(), 3);
     // One byte less: refused, with the total that passed.
-    let err = window::apply_capped(&spec, input, &Limits::default(), &[], held + 3 * cell - 1)
-        .unwrap_err();
+    let err = window::apply(&spec, input, &capped(held + 3 * cell - 1), &[]).unwrap_err();
     assert!(
-        matches!(err, Error::AnswerTooLarge { bytes, max, .. } if bytes == held + 3 * cell && max == held + 3 * cell - 1),
+        matches!(err, Error::ValueTooLarge { bytes, max, .. } if bytes == held + 3 * cell && max == held + 3 * cell - 1),
         "{err:?}"
     );
 }
@@ -1332,9 +1659,8 @@ fn a_quadratic_output_is_refused_while_it_is_made_not_after() {
         doc! {"sortBy": {"_id": 1}, "output": {"p": {"$push": "$v", "window": {"documents": ["unbounded", "current"]}}}},
     ));
     let started = std::time::Instant::now();
-    let err =
-        window::apply_capped(&spec, input, &Limits::default(), &[], 2 * 1024 * 1024).unwrap_err();
-    assert!(matches!(err, Error::AnswerTooLarge { .. }), "{err:?}");
+    let err = window::apply(&spec, input, &capped(2 * 1024 * 1024), &[]).unwrap_err();
+    assert!(matches!(err, Error::ValueTooLarge { .. }), "{err:?}");
     assert!(started.elapsed().as_secs() < 10);
 }
 
@@ -1344,9 +1670,8 @@ fn one_answer_given_to_every_document_is_charged_for_every_copy() {
     let held: usize = input.iter().map(size).sum();
     let spec = spec_of(set(doc! {"output": {"all": {"$push": "$v"}}}));
     // The array is ~10 KB and goes into 100 documents: a megabyte.
-    let err =
-        window::apply_capped(&spec, input, &Limits::default(), &[], held + 500_000).unwrap_err();
-    assert!(matches!(err, Error::AnswerTooLarge { .. }), "{err:?}");
+    let err = window::apply(&spec, input, &capped(held + 500_000), &[]).unwrap_err();
+    assert!(matches!(err, Error::ValueTooLarge { .. }), "{err:?}");
 }
 
 #[test]
@@ -1365,6 +1690,699 @@ fn a_run_inside_the_default_cap_is_not_refused() {
 fn the_cap_error_is_the_answer_too_large_the_api_maps_to_413() {
     // The API maps this core error to 413; pin the variant the stage raises.
     let spec = spec_of(set(doc! {"output": {"n": {"$count": {}}}}));
-    let err = window::apply_capped(&spec, series(&[1]), &Limits::default(), &[], 1).unwrap_err();
-    assert!(matches!(err, Error::AnswerTooLarge { .. }));
+    let err = window::apply(&spec, series(&[1]), &capped(1), &[]).unwrap_err();
+    assert!(matches!(err, Error::ValueTooLarge { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Partitions leave in order of their keys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partitions_leave_in_the_canonical_order_of_their_values_and_null_and_missing_are_one() {
+    let input = vec![
+        doc! {"_id": 1, "p": "b"},
+        doc! {"_id": 2, "p": 2},
+        doc! {"_id": 3, "p": Bson::Null},
+        doc! {"_id": 4},
+        doc! {"_id": 5, "p": "a"},
+        doc! {"_id": 6, "p": 1.0},
+        doc! {"_id": 7, "p": true},
+        doc! {"_id": 8, "p": 1},
+        doc! {"_id": 9, "p": {"x": 1}},
+        doc! {"_id": 10, "p": d("2023-01-01T00:00:00Z")},
+    ];
+    let out = run(set(doc! {"partitionBy": "$p", "output": {"n": {"$count": {}}}}), input).unwrap();
+    // null and missing together (in arrival order), then the numbers (1 and 1.0 together), the
+    // strings, the document, the bool, the date.
+    assert_eq!(ids(&out), vec![3, 4, 6, 8, 2, 5, 1, 9, 7, 10]);
+    assert_eq!(col(&out, "n")[..4], ints(&[2, 2, 2, 2])[..]);
+}
+
+#[test]
+fn a_partition_that_evaluates_to_an_array_is_refused() {
+    let e = refused_run(
+        set(doc! {"partitionBy": "$p", "output": {"n": {"$count": {}}}}),
+        vec![doc! {"p": 1}, doc! {"p": [1, 2]}],
+    );
+    assert!(e.contains("cannot evaluate to an array"), "{e}");
+}
+
+#[test]
+fn a_range_window_refuses_an_array_sort_value() {
+    let e = refused_run(
+        set(
+            doc! {"sortBy": {"day": 1}, "output": {"s": {"$sum": 1, "window": {"range": [-1, 0]}}}},
+        ),
+        vec![doc! {"day": 1}, doc! {"day": [2, 9]}],
+    );
+    assert!(e.contains("number or a date"), "{e}");
+}
+
+// ---------------------------------------------------------------------------
+// A missing value
+// ---------------------------------------------------------------------------
+
+#[test]
+fn first_last_and_shift_leave_the_field_out_for_a_missing_value_and_say_null_for_no_document() {
+    let input = vec![doc! {"_id": 1, "v": 1}, doc! {"_id": 2}, doc! {"_id": 3, "v": 3}];
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "f": {"$first": "$v", "window": {"documents": [1, 1]}},
+            "l": {"$last": "$v", "window": {"documents": [1, 1]}},
+            "sh": {"$shift": {"output": "$v", "by": 1}},
+        }}),
+        input,
+    )
+    .unwrap();
+    // Row 1 looks at the document with no `v`: no field. Row 2 at the one with 3. Row 3 at none.
+    assert_eq!(out[0], doc! {"_id": 1, "v": 1});
+    assert_eq!(out[1], doc! {"_id": 2, "f": 3, "l": 3, "sh": 3});
+    assert_eq!(out[2], doc! {"_id": 3, "v": 3, "f": Bson::Null, "l": Bson::Null, "sh": Bson::Null});
+}
+
+#[test]
+fn push_and_add_to_set_skip_a_missing_value_and_keep_a_null() {
+    let input = vec![
+        doc! {"_id": 1, "v": 1},
+        doc! {"_id": 2},
+        doc! {"_id": 3, "v": Bson::Null},
+        doc! {"_id": 4, "v": 1},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "p": {"$push": "$v", "window": {"documents": ["unbounded", "current"]}},
+            "u": {"$addToSet": "$v", "window": {"documents": ["unbounded", "current"]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    let arr = |v: Vec<Bson>| Bson::Array(v);
+    assert_eq!(col(&out, "p")[3], arr(vec![Bson::Int32(1), Bson::Null, Bson::Int32(1)]));
+    assert_eq!(col(&out, "u")[3], arr(vec![Bson::Int32(1), Bson::Null]));
+    assert_eq!(col(&out, "p")[1], arr(vec![Bson::Int32(1)]));
+}
+
+#[test]
+fn add_to_set_answers_in_the_order_each_member_first_appears_in_the_window() {
+    let ad = vec![3, 1, 3, 2, 1];
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "cum": {"$addToSet": "$qty", "window": {"documents": ["unbounded", "current"]}},
+            "slide": {"$addToSet": "$qty", "window": {"documents": [-2, 0]}},
+        }}),
+        series(&ad),
+    )
+    .unwrap();
+    let arr = |v: &[i32]| Bson::Array(v.iter().map(|x| Bson::Int32(*x)).collect());
+    assert_eq!(
+        col(&out, "cum"),
+        vec![arr(&[3]), arr(&[3, 1]), arr(&[3, 1]), arr(&[3, 1, 2]), arr(&[3, 1, 2])]
+    );
+    // The window [3, 1, 3] holds 3, 1; then [1, 3, 2]: 1 first now; then [3, 2, 1].
+    assert_eq!(
+        col(&out, "slide"),
+        vec![arr(&[3]), arr(&[3, 1]), arr(&[3, 1]), arr(&[1, 3, 2]), arr(&[3, 2, 1])]
+    );
+}
+
+/// The reference's mixed-type probe: 1, 1, 1L, "x", null, (missing), [3, 4], 2.5m, 7.
+fn mixed() -> Vec<Document> {
+    let dec = Bson::Decimal128("2.5".parse().unwrap());
+    vec![
+        doc! {"_id": 1, "v": 1},
+        doc! {"_id": 2, "v": 1},
+        doc! {"_id": 3, "v": 1_i64},
+        doc! {"_id": 4, "v": "x"},
+        doc! {"_id": 5, "v": Bson::Null},
+        doc! {"_id": 6},
+        doc! {"_id": 7, "v": [3, 4]},
+        doc! {"_id": 8, "v": dec},
+        doc! {"_id": 9, "v": 7},
+    ]
+}
+
+#[test]
+fn min_and_max_over_mixed_types_keep_the_first_of_equal_values_for_min_and_the_last_for_max() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "lo": {"$min": "$v", "window": {"documents": [-1, 1]}},
+            "hi": {"$max": "$v", "window": {"documents": [-1, 1]}},
+        }}),
+        mixed(),
+    )
+    .unwrap();
+    let dec = Bson::Decimal128("2.5".parse().unwrap());
+    let pair = Bson::Array(vec![Bson::Int32(3), Bson::Int32(4)]);
+    let x = || Bson::String("x".into());
+    assert_eq!(
+        col(&out, "lo"),
+        vec![
+            Bson::Int32(1),
+            Bson::Int32(1),
+            Bson::Int32(1),
+            Bson::Int64(1),
+            x(),
+            pair.clone(),
+            dec.clone(),
+            dec.clone(),
+            dec.clone()
+        ]
+    );
+    assert_eq!(
+        col(&out, "hi"),
+        vec![
+            Bson::Int32(1),
+            Bson::Int64(1),
+            x(),
+            x(),
+            x(),
+            pair.clone(),
+            pair.clone(),
+            pair,
+            Bson::Int32(7)
+        ]
+    );
+}
+
+#[test]
+fn first_and_last_over_mixed_types_omit_a_missing_value() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "f": {"$first": "$v", "window": {"documents": [0, 1]}},
+            "l": {"$last": "$v", "window": {"documents": [-1, 0]}},
+        }}),
+        mixed(),
+    )
+    .unwrap();
+    // Row 5's first document has a null; row 6's has no value.
+    assert_eq!(out[4].get("f"), Some(&Bson::Null));
+    assert_eq!(out[4].get("l"), Some(&Bson::Null));
+    assert!(!out[5].contains_key("f"), "{:?}", out[5]);
+    assert!(!out[5].contains_key("l"), "{:?}", out[5]);
+    assert_eq!(out[8].get("f"), Some(&Bson::Int32(7)));
+}
+
+#[test]
+fn sum_avg_and_count_over_mixed_types_as_the_reference_answers() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "s": {"$sum": "$v", "window": {"documents": [-2, 0]}},
+            "a": {"$avg": "$v", "window": {"documents": [-2, 0]}},
+            "c": {"$count": {}, "window": {"documents": [-2, 0]}},
+        }}),
+        mixed(),
+    )
+    .unwrap();
+    let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+    assert_eq!(
+        col(&out, "s"),
+        vec![
+            Bson::Int64(1),
+            Bson::Int64(2),
+            Bson::Int64(3),
+            Bson::Int64(2),
+            Bson::Int64(1),
+            Bson::Int64(0),
+            Bson::Int64(0),
+            dec("2.5"),
+            dec("9.5")
+        ]
+    );
+    assert_eq!(
+        col(&out, "a"),
+        vec![
+            Bson::Double(1.0),
+            Bson::Double(1.0),
+            Bson::Double(1.0),
+            Bson::Double(1.0),
+            Bson::Double(1.0),
+            Bson::Null,
+            Bson::Null,
+            dec("2.5"),
+            dec("4.75")
+        ]
+    );
+    assert_eq!(col(&out, "c")[..3], [Bson::Int32(1), Bson::Int32(2), Bson::Int32(3)]);
+}
+
+#[test]
+fn push_over_mixed_types_matches_the_reference_where_the_order_is_defined() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+        "p": {"$push": "$v", "window": {"documents": [-1, 1]}}}}),
+        mixed(),
+    )
+    .unwrap();
+    let x = || Bson::String("x".into());
+    let dec = Bson::Decimal128("2.5".parse().unwrap());
+    let pair = Bson::Array(vec![Bson::Int32(3), Bson::Int32(4)]);
+    let arr = |v: Vec<Bson>| Bson::Array(v);
+    assert_eq!(col(&out, "p")[0], arr(vec![Bson::Int32(1), Bson::Int32(1)]));
+    assert_eq!(col(&out, "p")[3], arr(vec![Bson::Int64(1), x(), Bson::Null]));
+    // The missing value of row 6 is skipped.
+    assert_eq!(col(&out, "p")[4], arr(vec![x(), Bson::Null]));
+    assert_eq!(col(&out, "p")[5], arr(vec![Bson::Null, pair.clone()]));
+    assert_eq!(col(&out, "p")[6], arr(vec![pair.clone(), dec.clone()]));
+    assert_eq!(col(&out, "p")[7], arr(vec![pair, dec, Bson::Int32(7)]));
+}
+
+// ---------------------------------------------------------------------------
+// Non-finite values, drift and exact sums
+// ---------------------------------------------------------------------------
+
+fn infinity_series() -> Vec<Document> {
+    [1.0, 2.0, f64::INFINITY, 3.0, 4.0, 5.0, 6.0]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| doc! {"_id": i as i32 + 1, "v": *v})
+        .collect()
+}
+
+fn is_nan(b: &Bson) -> bool {
+    matches!(b, Bson::Double(x) if x.is_nan())
+}
+
+#[test]
+fn a_sliding_deviation_answers_what_group_answers_over_the_same_window_never_a_stale_nan() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "pop": {"$stdDevPop": "$v", "window": {"documents": [-1, 0]}},
+            "samp": {"$stdDevSamp": "$v", "window": {"documents": [-1, 0]}},
+        }}),
+        infinity_series(),
+    )
+    .unwrap();
+    let pop = col(&out, "pop");
+    let samp = col(&out, "samp");
+    // While the Infinity is in the window (rows 3 and 4) it is NaN, as `$group` over the same
+    // two documents answers; after it has left, the deviation of the two in the window.
+    assert_eq!(pop[0], Bson::Int32(0));
+    assert_eq!(samp[0], Bson::Null);
+    assert!(is_nan(&pop[2]) && is_nan(&pop[3]) && is_nan(&samp[2]) && is_nan(&samp[3]), "{pop:?}");
+    near(&pop[4..], &[0.5, 0.5, 0.5]);
+    near(&samp[4..], &[2f64.sqrt() / 2.0; 3]);
+    // The reference answers null while it is in the window and then 1.89 for every later row.
+    // The same set of documents through `$group`:
+    let group = run(
+        doc! {"$group": {"_id": null, "pop": {"$stdDevPop": "$v"}}},
+        vec![doc! {"v": 2.0}, doc! {"v": f64::INFINITY}],
+    );
+    assert!(group.is_err(), "$group is not a window stage: {group:?}");
+    let g = aggregate::apply(
+        &aggregate::parse(&[doc! {"$group": {"_id": null, "pop": {"$stdDevPop": "$v"}}}]).unwrap()
+            [0],
+        vec![doc! {"v": 2.0}, doc! {"v": f64::INFINITY}],
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(is_nan(&g[0].get("pop").cloned().unwrap()));
+}
+
+#[test]
+fn a_whole_partition_deviation_with_a_nan_is_nan_and_a_lone_non_finite_sample_is_null() {
+    let out = run(
+        set(doc! {"output": {"pop": {"$stdDevPop": "$v"}, "samp": {"$stdDevSamp": "$v"}}}),
+        vec![doc! {"v": 1}, doc! {"v": f64::NAN}, doc! {"v": 3}],
+    )
+    .unwrap();
+    assert!(is_nan(&col(&out, "pop")[0]) && is_nan(&col(&out, "samp")[0]));
+    let out = run(
+        set(doc! {"output": {"samp": {"$stdDevSamp": "$v"}, "pop": {"$stdDevPop": "$v"}}}),
+        vec![doc! {"v": f64::INFINITY}],
+    )
+    .unwrap();
+    assert_eq!(col(&out, "samp"), vec![Bson::Null]);
+    assert!(is_nan(&col(&out, "pop")[0]));
+}
+
+#[test]
+fn a_sliding_deviation_after_thousands_of_steps_is_as_exact_as_one_over_just_the_window() {
+    // A common offset of a billion with a spread of a few: subtracting 3,000 times would leave
+    // a drift in the last digits that the periodic rebuild takes out.
+    let n = 3000usize;
+    let values: Vec<f64> = (0..n).map(|i| 1e9 + ((i * 37) % 11) as f64 * 0.3).collect();
+    let input: Vec<Document> =
+        values.iter().enumerate().map(|(i, v)| doc! {"_id": i as i32, "v": *v}).collect();
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+        "pop": {"$stdDevPop": "$v", "window": {"documents": [-2, 0]}}}}),
+        input,
+    )
+    .unwrap();
+    let pop = col(&out, "pop");
+    for i in [1500usize, 2047, 2048, 2049, 2999] {
+        let w = &values[i - 2..=i];
+        let mean = w.iter().sum::<f64>() / 3.0;
+        let var = w.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / 3.0;
+        let Bson::Double(got) = pop[i] else { panic!("{:?}", pop[i]) };
+        assert!((got - var.sqrt()).abs() < 1e-7, "row {i}: {got} vs {}", var.sqrt());
+    }
+}
+
+#[test]
+fn sum_and_avg_are_exact_across_a_non_finite_value_and_an_overflow_beyond_a_long() {
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "s": {"$sum": "$v", "window": {"documents": [-1, 0]}},
+            "a": {"$avg": "$v", "window": {"documents": [-1, 0]}},
+        }}),
+        infinity_series(),
+    )
+    .unwrap();
+    let s = col(&out, "s");
+    let a = col(&out, "a");
+    assert_eq!(s[1], Bson::Double(3.0));
+    assert_eq!(s[2], Bson::Double(f64::INFINITY));
+    assert_eq!(s[3], Bson::Double(f64::INFINITY));
+    assert_eq!(s[4], Bson::Double(7.0));
+    assert_eq!(a[2], Bson::Double(f64::INFINITY));
+    assert_eq!(a[4], Bson::Double(3.5));
+    // A NaN and an opposite infinity.
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {"s": {"$sum": "$v", "window": {"documents": [-1, 0]}}}}),
+        vec![
+            doc! {"_id": 1, "v": f64::INFINITY},
+            doc! {"_id": 2, "v": f64::NEG_INFINITY},
+            doc! {"_id": 3, "v": 1},
+            doc! {"_id": 4, "v": f64::NAN},
+            doc! {"_id": 5, "v": 2},
+            doc! {"_id": 6, "v": 3},
+        ],
+    )
+    .unwrap();
+    let s = col(&out, "s");
+    assert_eq!(s[0], Bson::Double(f64::INFINITY));
+    assert!(is_nan(&s[1]));
+    assert_eq!(s[2], Bson::Double(f64::NEG_INFINITY));
+    assert!(is_nan(&s[3]) && is_nan(&s[4]));
+    assert_eq!(s[5], Bson::Int64(5));
+}
+
+#[test]
+fn a_sliding_sum_of_doubles_is_the_exact_sum_rounded_once() {
+    let values = [0.1, 0.2, 0.3, 1e16, 1.0, -1e16, 0.7];
+    let input: Vec<Document> =
+        values.iter().enumerate().map(|(i, v)| doc! {"_id": i as i32, "v": *v}).collect();
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {"s": {"$sum": "$v", "window": {"documents": [-2, 0]}}}}),
+        input,
+    )
+    .unwrap();
+    // The exact sums of three neighbours, each rounded once: where adding the integer part and
+    // the double part separately, or one number at a time, loses the 0.3 or the 1.
+    assert_eq!(
+        col(&out, "s"),
+        f64s(&[0.1, 0.30000000000000004, 0.6, 1e16, 10000000000000002.0, 1.0, -9999999999999998.0])
+    );
+}
+
+#[test]
+fn a_sum_with_a_decimal_is_exact_however_the_window_slides() {
+    let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+    let input = vec![
+        doc! {"_id": 1, "v": dec("0.1")},
+        doc! {"_id": 2, "v": 1},
+        doc! {"_id": 3, "v": 2},
+        doc! {"_id": 4, "v": 0.5},
+        doc! {"_id": 5, "v": 3},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "s": {"$sum": "$v", "window": {"documents": [-1, 0]}},
+            "a": {"$avg": "$v", "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    assert_eq!(
+        col(&out, "s"),
+        vec![dec("0.1"), dec("1.1"), Bson::Int64(3), Bson::Double(2.5), Bson::Double(3.5)]
+    );
+    assert_eq!(
+        col(&out, "a"),
+        vec![dec("0.1"), dec("0.55"), Bson::Double(1.5), Bson::Double(1.25), Bson::Double(1.75)]
+    );
+}
+
+#[test]
+fn an_integral_does_not_lose_small_areas_to_a_large_one_that_has_left_the_window() {
+    // A hundred-quadrillion for fifty documents, then ones: windows past the big area are 1.
+    let input: Vec<Document> = (0..60)
+        .map(|i| doc! {"_id": i + 1, "x": i, "y": if i < 50 { 1e15 } else { 1.0 }})
+        .collect();
+    let out = run(
+        set(doc! {"sortBy": {"x": 1}, "output": {"i": {"$integral": {"input": "$y"}, "window": {"documents": [-1, 0]}}}}),
+        input,
+    )
+    .unwrap();
+    for row in &out[51..] {
+        assert_eq!(row.get("i"), Some(&Bson::Double(1.0)), "{row:?}");
+    }
+    assert_eq!(out[50].get("i"), Some(&Bson::Double(5e14 + 0.5)));
+}
+
+#[test]
+fn an_integral_and_a_derivative_over_dates_subtract_the_milliseconds_before_scaling() {
+    let input = vec![
+        doc! {"t": d("2023-01-01T00:00:00Z"), "y": 10},
+        doc! {"t": d("2023-01-01T02:00:00Z"), "y": 20},
+        doc! {"t": d("2023-01-01T03:00:00Z"), "y": 50},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"t": 1}, "output": {
+            "i": {"$integral": {"input": "$y", "unit": "day"}, "window": {"documents": ["unbounded", "current"]}}}}),
+        input,
+    )
+    .unwrap();
+    // Not 1.24999999998181: the epoch's 1.67e12 milliseconds are not divided into days first.
+    assert_eq!(
+        col(&out, "i"),
+        vec![Bson::Double(0.0), Bson::Double(1.25), Bson::Double(2.7083333333333335)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// No window is rebuilt: a hundred thousand documents
+// ---------------------------------------------------------------------------
+
+/// Tiny documents, `{_id, v}` with `v` cycling through a thousand values.
+fn tiny(n: i32) -> Vec<Document> {
+    (0..n).map(|i| doc! {"_id": i, "v": i % 1000}).collect()
+}
+
+/// The time to run `output` over `n` tiny documents with the window given, and the output.
+fn timed(n: i32, window: Bson, output: Document) -> (std::time::Duration, Vec<Document>) {
+    let stage = set(doc! {"sortBy": {"_id": 1}, "output": {"o": merge(output, window)}});
+    let input = tiny(n);
+    let started = std::time::Instant::now();
+    let out = run(stage, input).unwrap();
+    (started.elapsed(), out)
+}
+
+fn merge(mut op: Document, window: Bson) -> Document {
+    op.insert("window", window);
+    op
+}
+
+const HUNDRED_THOUSAND: i32 = 100_000;
+
+#[test]
+fn every_operator_slides_over_a_hundred_thousand_documents_without_rebuilding_the_window() {
+    // The shape that was quadratic: the window is half the partition on each side.
+    let wide = || Bson::Document(doc! {"documents": [-50_000, 50_000]});
+    // And a narrow one, for an operator whose answer is the window.
+    let narrow = || Bson::Document(doc! {"documents": [-3, 3]});
+    let ops: Vec<(&str, Document, Bson)> = vec![
+        ("$addToSet constant", doc! {"$addToSet": 1}, wide()),
+        ("$addToSet varied", doc! {"$addToSet": "$v"}, wide()),
+        ("$maxN 1", doc! {"$maxN": {"n": 1, "input": "$v"}}, wide()),
+        ("$minN 3", doc! {"$minN": {"n": 3, "input": "$v"}}, wide()),
+        ("$top", doc! {"$top": {"sortBy": {"v": -1}, "output": "$_id"}}, wide()),
+        ("$bottom", doc! {"$bottom": {"sortBy": {"v": -1}, "output": "$_id"}}, wide()),
+        ("$topN", doc! {"$topN": {"n": 3, "sortBy": {"v": 1}, "output": "$_id"}}, wide()),
+        ("$bottomN", doc! {"$bottomN": {"n": 3, "sortBy": {"v": 1}, "output": "$_id"}}, wide()),
+        ("$firstN", doc! {"$firstN": {"n": 3, "input": "$v"}}, wide()),
+        ("$lastN", doc! {"$lastN": {"n": 3, "input": "$v"}}, wide()),
+        ("$push narrow", doc! {"$push": "$v"}, narrow()),
+        ("$sum", doc! {"$sum": "$v"}, wide()),
+        ("$avg", doc! {"$avg": "$v"}, wide()),
+        ("$min", doc! {"$min": "$v"}, wide()),
+        ("$max", doc! {"$max": "$v"}, wide()),
+        ("$count", doc! {"$count": {}}, wide()),
+        ("$stdDevPop", doc! {"$stdDevPop": "$v"}, wide()),
+        ("$stdDevSamp", doc! {"$stdDevSamp": "$v"}, wide()),
+        ("$covariancePop", doc! {"$covariancePop": ["$v", "$_id"]}, wide()),
+        ("$covarianceSamp", doc! {"$covarianceSamp": ["$v", "$_id"]}, wide()),
+        ("$first", doc! {"$first": "$v"}, wide()),
+        ("$last", doc! {"$last": "$v"}, wide()),
+    ];
+    for (name, op, window) in ops {
+        let (took, out) = timed(HUNDRED_THOUSAND, window, op);
+        assert_eq!(out.len(), HUNDRED_THOUSAND as usize, "{name}");
+        // Rebuilt for each of 100,000 documents over windows of 50,000 this is billions of steps.
+        assert!(took.as_secs() < 30, "{name} took {took:?}");
+    }
+}
+
+#[test]
+fn a_sum_slides_in_time_whether_a_decimal_a_non_finite_value_or_an_overflow_is_in_the_window() {
+    let hundred = |value: Bson| -> Vec<Document> {
+        (0..HUNDRED_THOUSAND)
+            .map(|i| {
+                let v =
+                    if i % 5000 == 7 { value.clone() } else { Bson::Int64(i64::from(i % 1000)) };
+                doc! {"_id": i, "v": v}
+            })
+            .collect()
+    };
+    let cases: Vec<(&str, Bson)> = vec![
+        ("decimal", Bson::Decimal128("1.5".parse().unwrap())),
+        ("nan", Bson::Double(f64::NAN)),
+        ("infinity", Bson::Double(f64::INFINITY)),
+        ("beyond a long", Bson::Int64(i64::MAX)),
+    ];
+    for (name, value) in cases {
+        for op in ["$sum", "$avg"] {
+            let stage = set(doc! {"sortBy": {"_id": 1}, "output": {
+            "o": {op: "$v", "window": {"documents": [-50_000, 50_000]}}}});
+            let input = hundred(value.clone());
+            let started = std::time::Instant::now();
+            let out = run(stage, input).unwrap();
+            let took = started.elapsed();
+            assert_eq!(out.len(), HUNDRED_THOUSAND as usize, "{name} {op}");
+            assert!(took.as_secs() < 30, "{name} {op} took {took:?}");
+        }
+    }
+    // Cumulative, the shape that took 135 s at 40,000.
+    let stage = set(doc! {"sortBy": {"_id": 1}, "output": {
+    "o": {"$sum": "$v", "window": {"documents": ["unbounded", "current"]}}}});
+    let started = std::time::Instant::now();
+    let out = run(stage, hundred(Bson::Decimal128("1.5".parse().unwrap()))).unwrap();
+    assert_eq!(out.len(), HUNDRED_THOUSAND as usize);
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+}
+
+#[test]
+fn the_incremental_answers_are_the_answers_over_the_window_for_every_operator() {
+    // A window of 3 on each side over a small series, against the answer from the documents of
+    // each window computed on its own, with every operator that has a state.
+    let n = 40;
+    let input: Vec<Document> = (0..n)
+        .map(|i| doc! {"_id": i, "v": ((i * 7919) % 23) as i64 - 8, "w": (i * 31) % 5})
+        .collect();
+    let spec = |op: Document| {
+        set(
+            doc! {"sortBy": {"_id": 1}, "output": {"o": merge(op, Bson::Document(doc! {"documents": [-3, 2]}))}},
+        )
+    };
+    let whole = |op: Document, docs: &[Document]| -> Bson {
+        let out = run(set(doc! {"output": {"o": op}}), docs.to_vec()).unwrap();
+        out[0].get("o").cloned().unwrap_or(Bson::Null)
+    };
+    for op in [
+        doc! {"$push": "$v"},
+        doc! {"$addToSet": "$w"},
+        doc! {"$top": {"sortBy": {"w": 1}, "output": "$v"}},
+        doc! {"$bottom": {"sortBy": {"w": 1}, "output": "$v"}},
+        doc! {"$topN": {"n": 3, "sortBy": {"w": -1}, "output": "$_id"}},
+        doc! {"$bottomN": {"n": 3, "sortBy": {"w": -1}, "output": "$_id"}},
+        doc! {"$firstN": {"n": 2, "input": "$v"}},
+        doc! {"$lastN": {"n": 2, "input": "$v"}},
+        doc! {"$maxN": {"n": 3, "input": "$v"}},
+        doc! {"$minN": {"n": 3, "input": "$v"}},
+        doc! {"$min": "$v"},
+        doc! {"$max": "$v"},
+        doc! {"$sum": "$v"},
+    ] {
+        let out = run(spec(op.clone()), input.clone()).unwrap();
+        for (i, row) in out.iter().enumerate() {
+            let s = i.saturating_sub(3);
+            let e = (i + 3).min(n as usize);
+            let expected = whole(op.clone(), &input[s..e]);
+            let got = row.get("o").cloned().unwrap_or(Bson::Null);
+            // `$addToSet` has no defined order; compare as sets.
+            if op.contains_key("$addToSet") {
+                let (Bson::Array(mut a), Bson::Array(mut b)) = (got, expected) else { panic!() };
+                a.sort_by(kimmy_core::cmp::canonical_cmp);
+                b.sort_by(kimmy_core::cmp::canonical_cmp);
+                assert_eq!(a, b, "{op} row {i}");
+            } else {
+                assert_eq!(got, expected, "{op} row {i}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The byte budget
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_refusal_names_the_stage_and_its_buffer_limit_not_one_document() {
+    let spec = spec_of(set(doc! {"output": {"n": {"$count": {}}}}));
+    let err = window::apply(&spec, series(&[1]), &capped(1), &[]).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("$setWindowFields"), "{text}");
+    assert!(text.contains("limit on the bytes"), "{text}");
+    assert!(!text.contains("of one document"), "{text}");
+    let spec = match aggregate::parse(&[
+        doc! {"$fill": {"sortBy": {"x": 1}, "output": {"v": {"method": "locf"}}}},
+    ])
+    .unwrap()
+    .remove(0)
+    {
+        Stage::Fill(spec) => *spec,
+        other => panic!("{other:?}"),
+    };
+    let window = spec.window.expect("a method");
+    let err = window::apply(&window, vec![doc! {"x": 1}], &capped(1), &[]).unwrap_err();
+    assert!(err.to_string().contains("$fill"), "{err}");
+    assert!(!err.to_string().contains("$setWindowFields"), "{err}");
+}
+
+#[test]
+fn the_sort_keys_taken_are_charged() {
+    let input = series(&[1, 2, 3]);
+    let held: usize = input.iter().map(size).sum();
+    // Each Int32 key is a type byte, an empty name, a terminator and four bytes; and the
+    // `$documentNumber` output a document's cell takes 1 + 1 + 1 + 4 (an Int32 named `n`).
+    let key = 1 + 1 + 4;
+    let cell = 1 + 1 + 1 + 4;
+    let spec = spec_of(set(doc! {"sortBy": {"qty": 1}, "output": {"n": {"$documentNumber": {}}}}));
+    let exact = held + 3 * key + 3 * cell;
+    assert_eq!(window::apply(&spec, input.clone(), &capped(exact), &[]).unwrap().len(), 3);
+    let err = window::apply(&spec, input, &capped(exact - 1), &[]).unwrap_err();
+    assert!(matches!(err, Error::ValueTooLarge { bytes, .. } if bytes == exact), "{err:?}");
+}
+
+#[test]
+fn the_stages_of_one_pipeline_and_the_branches_of_a_facet_share_one_budget() {
+    let input = series(&[1, 2, 3, 4, 5]);
+    let held: usize = input.iter().map(size).sum();
+    let cell = 1 + 1 + 1 + 4;
+    let one = held + 5 * cell;
+    let stage = set(doc! {"output": {"n": {"$count": {}}}});
+    // One stage fits, and so do two in a row: the first gives its bytes back when it is done.
+    let limits = capped(one + 10);
+    let stages = aggregate::parse(&[stage.clone(), stage.clone()]).unwrap();
+    let mut docs = input.clone();
+    for s in &stages {
+        docs = aggregate::apply(s, docs, &limits).unwrap();
+    }
+    assert_eq!(docs.len(), 5);
+    assert_eq!(limits.buffer.used(), 0);
+    // Two branches of a `$facet` run in turn but are alive together, so they share the cap.
+    let facet = aggregate::parse(&[doc! {"$facet": {
+        "a": [stage.clone(), {"$count": "c"}],
+        "b": [stage.clone(), {"$count": "c"}],
+    }}])
+    .unwrap();
+    let limits = capped(one + 10);
+    let err = aggregate::apply(&facet[0], input.clone(), &limits).unwrap_err();
+    assert!(matches!(err, Error::ValueTooLarge { .. }), "{err:?}");
+    // With room for both they run.
+    let limits = capped(2 * one + 10);
+    assert_eq!(aggregate::apply(&facet[0], input, &limits).unwrap().len(), 1);
+    assert_eq!(limits.buffer.used(), 0);
 }

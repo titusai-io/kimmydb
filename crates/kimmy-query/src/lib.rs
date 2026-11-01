@@ -8,6 +8,7 @@
 
 pub mod accumulators;
 pub mod aggregate;
+pub mod budget;
 pub mod densify;
 pub mod expr;
 pub mod fill;
@@ -23,6 +24,7 @@ pub mod plan;
 pub mod shape;
 pub mod update;
 pub mod window;
+pub mod window_acc;
 
 #[cfg(test)]
 mod accumulator_tests;

@@ -391,7 +391,13 @@ impl Limbs {
                 }
             }
             Limbs::Sparse(map) => {
-                *map.entry(position).or_insert(0) += value;
+                let held = map.entry(position).or_insert(0);
+                *held += value;
+                // A limb a removal has emptied is not kept, so a window that once held a
+                // far-off term does not pay for its span.
+                if *held == 0 {
+                    map.remove(&position);
+                }
             }
         }
     }
@@ -472,23 +478,28 @@ impl ExactSum {
                 let exponent = i64::from(exponent);
                 self.min_exponent = self.min_exponent.min(exponent);
                 self.all_negative_zero &= coefficient == 0 && negative;
-                let (position, offset) = (
-                    exponent.div_euclid(i64::from(LIMB_DIGITS)),
-                    exponent.rem_euclid(i64::from(LIMB_DIGITS)) as u32,
-                );
-                // `coefficient · 10^offset`: below 10^53, three limbs.
-                let (low, high) = (coefficient % LIMB_WIDE, coefficient / LIMB_WIDE);
-                let scale = u128::from(10u64.pow(offset));
-                let l0 = low * scale;
-                let l1 = high * scale + l0 / LIMB_WIDE;
-                let limbs = [l0 % LIMB_WIDE, l1 % LIMB_WIDE, l1 / LIMB_WIDE];
-                for (i, limb) in limbs.into_iter().enumerate() {
-                    self.limbs.add(
-                        position + i as i64,
-                        if negative { -(limb as i128) } else { limb as i128 },
-                    );
-                }
+                self.add_limbs(negative, coefficient, exponent, false);
             }
+        }
+    }
+
+    /// Add (or, with `subtract`, take away) the limbs of `coefficient · 10^exponent`
+    /// with the sign of `negative`.
+    fn add_limbs(&mut self, negative: bool, coefficient: u128, exponent: i64, subtract: bool) {
+        let negative = negative != subtract;
+        let (position, offset) = (
+            exponent.div_euclid(i64::from(LIMB_DIGITS)),
+            exponent.rem_euclid(i64::from(LIMB_DIGITS)) as u32,
+        );
+        // `coefficient · 10^offset`: below 10^53, three limbs.
+        let (low, high) = (coefficient % LIMB_WIDE, coefficient / LIMB_WIDE);
+        let scale = u128::from(10u64.pow(offset));
+        let l0 = low * scale;
+        let l1 = high * scale + l0 / LIMB_WIDE;
+        let limbs = [l0 % LIMB_WIDE, l1 % LIMB_WIDE, l1 / LIMB_WIDE];
+        for (i, limb) in limbs.into_iter().enumerate() {
+            self.limbs
+                .add(position + i as i64, if negative { -(limb as i128) } else { limb as i128 });
         }
     }
 
@@ -626,6 +637,93 @@ impl ExactSum {
             remainder != 0 || !tail.is_zero(),
             self.min_exponent,
         )
+    }
+}
+
+/// An exact sum of decimals that terms can also leave: a sliding window's `$sum`
+/// and `$avg`. It answers what [`ExactSum`] would over the terms it holds now, the
+/// same bytes in any order of adding and removing.
+///
+/// The limbs are linear, so a term leaves by adding its negation. The flags
+/// `ExactSum` keeps as booleans or a minimum are kept here as counts and a
+/// multiset of exponents, so they can be undone, and written into the inner sum
+/// after each change.
+#[derive(Clone, Debug, Default)]
+pub struct RunningSum {
+    inner: ExactSum,
+    exponents: BTreeMap<i64, u64>,
+    negative_zeros: u64,
+    finite: u64,
+    nan: u64,
+    positive_infinity: u64,
+    negative_infinity: u64,
+}
+
+impl RunningSum {
+    pub fn new() -> Self {
+        RunningSum::default()
+    }
+
+    /// The number of terms held.
+    pub fn count(&self) -> u64 {
+        self.finite + self.nan + self.positive_infinity + self.negative_infinity
+    }
+
+    /// Take a term in.
+    pub fn add(&mut self, term: &Raw) {
+        self.change(term, true);
+    }
+
+    /// Take a term out that was added.
+    pub fn remove(&mut self, term: &Raw) {
+        self.change(term, false);
+    }
+
+    fn change(&mut self, term: &Raw, adding: bool) {
+        let step = |n: &mut u64| {
+            if adding {
+                *n += 1;
+            } else {
+                *n = n.saturating_sub(1);
+            }
+        };
+        match *term {
+            Raw::Nan => step(&mut self.nan),
+            Raw::Inf { negative: true } => step(&mut self.negative_infinity),
+            Raw::Inf { negative: false } => step(&mut self.positive_infinity),
+            Raw::Finite { negative, coefficient, exponent } => {
+                let exponent = i64::from(exponent);
+                step(&mut self.finite);
+                if coefficient == 0 && negative {
+                    step(&mut self.negative_zeros);
+                }
+                if adding {
+                    *self.exponents.entry(exponent).or_insert(0) += 1;
+                } else if let Some(held) = self.exponents.get_mut(&exponent) {
+                    *held -= 1;
+                    if *held == 0 {
+                        self.exponents.remove(&exponent);
+                    }
+                }
+                self.inner.add_limbs(negative, coefficient, exponent, !adding);
+            }
+        }
+        self.inner.nan = self.nan > 0;
+        self.inner.positive_infinity = self.positive_infinity > 0;
+        self.inner.negative_infinity = self.negative_infinity > 0;
+        self.inner.min_exponent = self.exponents.keys().next().copied().unwrap_or(i64::MAX);
+        self.inner.all_negative_zero = self.negative_zeros == self.finite;
+        self.inner.count = self.count();
+    }
+
+    /// The sum, rounded once.
+    pub fn finish_sum(&self) -> Raw {
+        self.inner.finish_sum()
+    }
+
+    /// The mean, rounded once.
+    pub fn finish_avg(&self) -> Raw {
+        self.inner.finish_avg()
     }
 }
 

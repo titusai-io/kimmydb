@@ -59,9 +59,13 @@ use crate::shape::{self, ID_FIELD, Projection, SortKey};
 /// Deliberately a hard ceiling rather than a spill-to-disk: a pipeline that
 /// cannot run should say so immediately, not become slow in a way that is
 /// harder to diagnose than a refusal.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Limits {
     pub max_documents: usize,
+    /// The bytes the blocking stages of the request hold, one total for the whole
+    /// pipeline and its `$facet` branches (ADR-264). A fresh `Limits::default()` is a
+    /// fresh budget, so make one per request.
+    pub buffer: crate::budget::BufferBudget,
 }
 
 /// The default ceiling: ten times `find`'s page cap.
@@ -72,7 +76,10 @@ pub const DEFAULT_MAX_DOCUMENTS: usize = 100_000;
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_documents: DEFAULT_MAX_DOCUMENTS }
+        Self {
+            max_documents: DEFAULT_MAX_DOCUMENTS,
+            buffer: crate::budget::BufferBudget::default(),
+        }
     }
 }
 
@@ -838,6 +845,9 @@ pub fn run_facet<E: From<Error>>(
     limits: &Limits,
     mut run: impl FnMut(&[Stage], Vec<Document>) -> std::result::Result<Vec<Document>, E>,
 ) -> std::result::Result<Document, E> {
+    // The branches' outputs are alive together, so the bytes the blocking stages inside
+    // them charged stay charged until the whole `$facet` is done (ADR-264).
+    let _hold = limits.buffer.hold();
     let mut answer = Document::new();
     let mut held = 0usize;
     // The bytes the answer will encode to, kept as it grows: a document header and
@@ -3230,7 +3240,7 @@ mod tests {
         // Truncating would return a `$group` over part of the input that looks
         // exactly like one over all of it — undetectable by the caller.
         let input: Vec<Document> = (0..50).map(|i| doc! { "k": i }).collect();
-        let limits = Limits { max_documents: 10 };
+        let limits = Limits { max_documents: 10, ..Default::default() };
         let stages = parse(&[doc! {"$group": {"_id": "$k", "n": {"$sum": 1}}}]).unwrap();
 
         let err = apply(&stages[0], input, &limits).unwrap_err().to_string();
@@ -3243,7 +3253,7 @@ mod tests {
         // Worded and answered as before, but its own kind, so an `$and`,
         // `$or` or `$last` cannot hold it back (ADR-211).
         let input: Vec<Document> = (0..3).map(|i| doc! { "k": i }).collect();
-        let limits = Limits { max_documents: 2 };
+        let limits = Limits { max_documents: 2, ..Default::default() };
         let stages = parse(&[doc! {"$group": {"_id": "$k"}}]).unwrap();
         let err = apply(&stages[0], input, &limits).unwrap_err();
         assert!(matches!(err, Error::Limit(_)), "{err:?}");
@@ -3261,7 +3271,7 @@ mod tests {
         // outer loop ends; checking only at the end would allocate all of it.
         let input: Vec<Document> =
             (0..5).map(|_| doc! { "xs": (0..100).collect::<Vec<i32>>() }).collect();
-        let limits = Limits { max_documents: 50 };
+        let limits = Limits { max_documents: 50, ..Default::default() };
         let stages = parse(&[doc! {"$unwind": "$xs"}]).unwrap();
 
         let err = apply(&stages[0], input, &limits).unwrap_err().to_string();

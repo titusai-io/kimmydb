@@ -8003,7 +8003,7 @@ async fn vector_search_stage_hits_are_held_to_the_pipeline_ceiling() {
     let auth = kimmy_api::state::Auth(kimmy_auth::Principal::superuser("test"));
     let pipeline = json!([{ "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 3 } }]);
 
-    let tight = kimmy_query::aggregate::Limits { max_documents: 2 };
+    let tight = kimmy_query::aggregate::Limits { max_documents: 2, ..Default::default() };
     let err = kimmy_api::exec::aggregate_with_limits(
         &server.state,
         &auth,
@@ -8018,7 +8018,7 @@ async fn vector_search_stage_hits_are_held_to_the_pipeline_ceiling() {
     assert!(text.contains("$vectorSearch produced 3 documents"), "{text}");
     assert!(text.contains("pipeline limit of 2"), "{text}");
 
-    let roomy = kimmy_query::aggregate::Limits { max_documents: 3 };
+    let roomy = kimmy_query::aggregate::Limits { max_documents: 3, ..Default::default() };
     let out = kimmy_api::exec::aggregate_with_limits(
         &server.state,
         &auth,

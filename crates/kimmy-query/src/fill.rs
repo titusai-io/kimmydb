@@ -50,12 +50,17 @@ pub fn parse(spec: &Document, vars: &[String]) -> Result<FillSpec> {
         return bad("$fill takes one of `partitionBy` and `partitionByFields`, found both");
     }
     let partition = if let Some(value) = spec.get("partitionBy") {
-        match value {
-            Bson::Null => Partition::Whole,
-            value => match Expr::parse_with_vars(value, vars)? {
-                Expr::Literal(_) => Partition::Whole,
-                expr => Partition::Expr(expr),
-            },
+        // The reference takes an expression object here, not a field name or a number.
+        if !matches!(value, Bson::Document(_)) {
+            return bad(format!(
+                "$fill `partitionBy` must be an object expression, found {}; to partition by a \
+                 field use `partitionByFields`",
+                type_name(value)
+            ));
+        }
+        match Expr::parse_with_vars(value, vars)? {
+            Expr::Literal(_) => Partition::Whole,
+            expr => Partition::Expr(expr),
         }
     } else if let Some(value) = spec.get("partitionByFields") {
         let Bson::Array(items) = value else {
@@ -129,11 +134,10 @@ pub fn parse(spec: &Document, vars: &[String]) -> Result<FillSpec> {
                 values.push((name.clone(), Expr::parse_with_vars(value, vars)?));
             }
             (None, Some(Bson::String(method))) => {
-                if sort.is_empty() {
-                    return bad(format!("$fill method \"{method}\" requires a `sortBy`"));
-                }
                 let field = Expr::parse_with_vars(&Bson::String(format!("${name}")), vars)?;
                 let func = match method.as_str() {
+                    // `locf` carries forward in the order the documents arrive when there is
+                    // no `sortBy`.
                     "locf" => Func::Locf(field),
                     "linear" => {
                         if sort.len() != 1 {
@@ -159,7 +163,12 @@ pub fn parse(spec: &Document, vars: &[String]) -> Result<FillSpec> {
             }
         }
     }
-    let window = (!methods.is_empty()).then_some(WindowSpec { partition, sort, outputs: methods });
+    let window = (!methods.is_empty()).then_some(WindowSpec {
+        stage: "$fill",
+        partition,
+        sort,
+        outputs: methods,
+    });
     Ok(FillSpec { window, values })
 }
 

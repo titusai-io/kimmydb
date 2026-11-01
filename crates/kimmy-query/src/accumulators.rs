@@ -210,7 +210,7 @@ pub(crate) fn read_n(op: &str, value: &Bson) -> Result<usize> {
 }
 
 impl Spec {
-    fn op(&self) -> &'static str {
+    pub(crate) fn op(&self) -> &'static str {
         match self.kind {
             Kind::StdDevPop => "$stdDevPop",
             Kind::StdDevSamp => "$stdDevSamp",
@@ -251,8 +251,15 @@ impl Spec {
         }
     }
 
+    /// Per sort key, whether a row ranks by the reverse of the key's order: the key's own
+    /// direction, reversed for `$bottom*`, which keeps the rows that rank last.
+    pub(crate) fn dirs(&self) -> Arc<[bool]> {
+        let bottom = matches!(self.kind, Kind::Bottom | Kind::BottomN);
+        self.sort.iter().map(|k| k.descending != bottom).collect()
+    }
+
     /// `n`, read the first time a document arrives.
-    fn resolve(&self, scope: &Scope<'_>) -> Result<usize> {
+    pub(crate) fn resolve(&self, scope: &Scope<'_>) -> Result<usize> {
         match &self.n {
             Some(expr) => read_n(self.op(), &expr.eval_in(scope)?),
             None => Ok(1),
@@ -286,17 +293,17 @@ enum Body {
 }
 
 #[derive(Clone, Debug)]
-struct Row {
-    keys: Vec<Bson>,
-    output: Bson,
-    seq: u64,
-    dirs: Arc<[bool]>,
+pub(crate) struct Row {
+    pub(crate) keys: Vec<Bson>,
+    pub(crate) output: Bson,
+    pub(crate) seq: u64,
+    pub(crate) dirs: Arc<[bool]>,
 }
 
 impl Row {
     /// Rank order, best first: key by key, then arrival. `flip` reads every
     /// direction the other way round.
-    fn cmp_rank(&self, other: &Self, flip: bool) -> Ordering {
+    pub(crate) fn cmp_rank(&self, other: &Self, flip: bool) -> Ordering {
         for (i, (a, b)) in self.keys.iter().zip(&other.keys).enumerate() {
             let o = key_cmp(a, b);
             let o = if self.dirs.get(i).is_some_and(|d| *d != flip) { o.reverse() } else { o };
@@ -326,11 +333,11 @@ impl Ord for Row {
 }
 
 #[derive(Clone, Debug)]
-struct Best {
-    value: Bson,
-    seq: u64,
+pub(crate) struct Best {
+    pub(crate) value: Bson,
+    pub(crate) seq: u64,
     /// `$maxN`: the larger value ranks first.
-    max: bool,
+    pub(crate) max: bool,
 }
 
 impl PartialEq for Best {
@@ -355,21 +362,21 @@ impl Ord for Best {
 /// Running mean and sum of squared deviations, updated one value at a time
 /// (Welford), so a large offset does not cost the digits the spread needs.
 #[derive(Clone, Debug, Default)]
-struct Welford {
-    n: u64,
+pub(crate) struct Welford {
+    pub(crate) n: u64,
     mean: f64,
     m2: f64,
 }
 
 impl Welford {
-    fn add(&mut self, x: f64) {
+    pub(crate) fn add(&mut self, x: f64) {
         self.n += 1;
         let delta = x - self.mean;
         self.mean += delta / self.n as f64;
         self.m2 += delta * (x - self.mean);
     }
 
-    fn remove(&mut self, x: f64) {
+    pub(crate) fn remove(&mut self, x: f64) {
         if self.n <= 1 {
             *self = Self::default();
             return;
@@ -383,7 +390,7 @@ impl Welford {
         }
     }
 
-    fn finish(&self, sample: bool) -> Bson {
+    pub(crate) fn finish(&self, sample: bool) -> Bson {
         match (self.n, sample) {
             (0, _) | (1, true) => Bson::Null,
             (n, true) => Bson::Double((self.m2 / (n - 1) as f64).sqrt()),
@@ -460,7 +467,7 @@ fn in_value(value: &Bson, segs: &[&str]) -> Option<Bson> {
 /// The value a document sorts by at `path`: the whole value, compared in the
 /// canonical order (an array element by element, after strings). A missing path
 /// is `null`.
-fn sort_key(doc: &Document, path: &str) -> Bson {
+pub(crate) fn sort_key(doc: &Document, path: &str) -> Bson {
     whole_value(doc, &path::segments(path)).unwrap_or(Bson::Null)
 }
 
