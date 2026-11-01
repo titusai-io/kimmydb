@@ -416,3 +416,26 @@ fn the_stage_runs_inside_a_facet() {
     assert_eq!(fill[0].name(), "$fill");
     assert!(!fill[0].needs_storage());
 }
+
+#[test]
+fn a_value_that_reaches_nothing_removes_an_explicit_null_and_leaves_a_missing_field_missing() {
+    // `"$nope"` finds no field and `$$REMOVE` is no value: nothing is filled, a field that
+    // holds `null` is removed, as the reference does, and one that is missing stays missing.
+    let out = run(
+        doc! {"output": {"a": {"value": "$nope"}, "b": {"value": "$$REMOVE"}, "p.q": {"value": "$nope"}}},
+        vec![
+            doc! {"_id": 1, "a": Bson::Null, "b": Bson::Null, "p": {"q": Bson::Null, "r": 2}},
+            doc! {"_id": 2},
+            doc! {"_id": 3, "a": 7, "b": 8, "p": {"q": 9}},
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            doc! {"_id": 1, "p": {"r": 2}},
+            doc! {"_id": 2},
+            doc! {"_id": 3, "a": 7, "b": 8, "p": {"q": 9}},
+        ]
+    );
+}

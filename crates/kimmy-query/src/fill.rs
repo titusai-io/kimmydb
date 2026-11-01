@@ -188,17 +188,30 @@ pub fn apply(
     }
     for doc in &mut docs {
         // Every value is read from the document before any is written, as `$addFields` does.
-        let mut fills: Vec<(&str, Bson)> = Vec::new();
+        let mut fills: Vec<(&str, Option<Bson>)> = Vec::new();
         for (name, expr) in &spec.values {
-            let empty =
-                matches!(path::resolve(doc, name).into_iter().next(), None | Some(Bson::Null));
-            if empty && let Some(value) = expr.eval_field(&Scope::with_bindings(doc, vars))? {
-                fills.push((name, value));
+            let current = path::resolve(doc, name).into_iter().next();
+            let is_null = matches!(current, Some(Bson::Null));
+            if !(current.is_none() || is_null) {
+                continue;
+            }
+            match expr.eval_field(&Scope::with_bindings(doc, vars))? {
+                Some(value) => fills.push((name, Some(value))),
+                // A value that reaches nothing fills nothing: a missing field stays
+                // missing, and a field that holds an explicit null is removed, as the
+                // reference does (`$$REMOVE`, or a path that finds no field).
+                None if is_null => fills.push((name, None)),
+                None => {}
             }
         }
         for (name, value) in fills {
-            path::set(doc, name, value)
-                .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
+            match value {
+                Some(value) => path::set(doc, name, value)
+                    .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?,
+                None => {
+                    path::unset(doc, name);
+                }
+            }
         }
     }
     Ok(docs)
