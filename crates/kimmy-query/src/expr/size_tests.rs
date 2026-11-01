@@ -331,37 +331,46 @@ fn doubling_an_object_is_refused_at_the_step_that_passes_the_limit() {
     assert!(bson_bytes(&value) * 2 > limit - 32, "{} {limit}", bson_bytes(&value));
 }
 
+/// `$reduce` over `$range: [0, steps]`, starting from `{a: "x"}`, with `body` as
+/// `in`. The body copies `$$value` twice a step, so the document doubles.
+fn doubling(body: Document, steps: i32) -> Result<Bson> {
+    ev(
+        doc! {"$reduce": {
+            "input": {"$range": [0, steps]},
+            "initialValue": {"a": "x"},
+            "in": body,
+        }},
+        &doc! {},
+    )
+}
+
+/// Twelve steps is a few kilobytes and answers. Thirty would be a billion times
+/// that: refused as the document passes 16 MiB, holding a few copies of it and
+/// not gigabytes (the reference shares the copies; this server cannot).
+fn doubling_is_refused_at_16_mib(body: Document) {
+    assert!(matches!(doubling(body.clone(), 12).unwrap(), Bson::Document(_)));
+    let (bytes, max, text) = refusal(doubling(body, 30));
+    assert_eq!(max, MAX_ARRAY_BYTES);
+    assert!(bytes > MAX_ARRAY_BYTES && bytes < 2 * MAX_ARRAY_BYTES + 1024, "{bytes}");
+    assert!(text.contains("builds is"), "{text}");
+    assert!(text.contains("16 MiB document limit"), "{text}");
+}
+
 #[test]
-fn a_reduce_that_doubles_a_document_stops_at_16_mib() {
-    // The literal copies `$$value` twice a step: the document doubles. 2^k steps of
-    // memory and time, as the string and the array already were, before this was
-    // refused. Thirty steps is `$range: [0, 30]`.
-    let literal = doc! {"l": "$$value", "r": "$$value"};
-    let merge = doc! {"$mergeObjects": [{"l": "$$value"}, {"r": "$$value"}]};
-    let set = doc! {"$setField": {"field": "r", "input": {"l": "$$value"}, "value": "$$value"}};
-    for body in [Bson::Document(literal), Bson::Document(merge), Bson::Document(set)] {
-        let doubling = |steps: i32| {
-            ev(
-                doc! {"$reduce": {
-                    "input": {"$range": [0, steps]},
-                    "initialValue": {"a": "x"},
-                    "in": body.clone(),
-                }},
-                &doc! {},
-            )
-        };
-        // Twelve steps is a few kilobytes and answers.
-        assert!(matches!(doubling(12).unwrap(), Bson::Document(_)));
-        // Thirty would be a billion times that: refused as the document passes
-        // 16 MiB, with a few tens of megabytes held, not gigabytes.
-        for steps in [30] {
-            let (bytes, max, text) = refusal(doubling(steps));
-            assert_eq!(max, MAX_ARRAY_BYTES, "{body}");
-            assert!(bytes > MAX_ARRAY_BYTES && bytes < 2 * MAX_ARRAY_BYTES + 1024, "{bytes}");
-            assert!(text.contains("builds is"), "{text}");
-            assert!(text.contains("16 MiB document limit"), "{text}");
-        }
-    }
+fn a_reduce_that_doubles_an_object_literal_stops_at_16_mib() {
+    doubling_is_refused_at_16_mib(doc! {"l": "$$value", "r": "$$value"});
+}
+
+#[test]
+fn a_reduce_that_doubles_with_merge_objects_stops_at_16_mib() {
+    doubling_is_refused_at_16_mib(doc! {"$mergeObjects": [{"l": "$$value"}, {"r": "$$value"}]});
+}
+
+#[test]
+fn a_reduce_that_doubles_with_set_field_stops_at_16_mib() {
+    doubling_is_refused_at_16_mib(
+        doc! {"$setField": {"field": "r", "input": {"l": "$$value"}, "value": "$$value"}},
+    );
 }
 
 #[test]

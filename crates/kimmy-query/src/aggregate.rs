@@ -2488,6 +2488,88 @@ mod tests {
         Ok(current)
     }
 
+    /// `$addFields: {a: "$$ROOT"}` copies the document into itself, so the stage
+    /// repeated doubles it. The document a stage writes is held to the limit, here
+    /// a few hundred bytes.
+    #[test]
+    fn computed_fields_are_held_to_the_document_limit() {
+        let copy = || Expr::parse(&Bson::String("$$ROOT".into())).unwrap();
+        let stage = vec![("a".to_string(), copy()), ("b".to_string(), copy())];
+        let mut doc = doc! {"x": "y"};
+        let mut steps = 0;
+        let refused = loop {
+            let mut with = doc.clone();
+            match set_computed_within(&mut with, &stage, &Scope::new(&doc), 512) {
+                Ok(()) => {
+                    doc = with;
+                    steps += 1;
+                }
+                Err(e) => break (e, with),
+            }
+        };
+        assert!((3..9).contains(&steps), "{steps}");
+        assert!(matches!(refused.0, Error::ValueTooLarge { max: 512, .. }), "{:?}", refused.0);
+        assert!(refused.0.to_string().contains("16 MiB document limit"));
+        assert!(crate::expr::document_bytes(&doc) <= 512);
+    }
+
+    /// The stages read the real limit: a copy of a nine-megabyte document in itself,
+    /// and nine megabytes merged beside nine, are 413s, not documents.
+    #[test]
+    fn the_stages_write_no_document_over_16_mib() {
+        let big = "x".repeat(9 << 20);
+        let input = vec![doc! {"_id": 1, "s": big.clone()}, doc! {"_id": 2, "t": big}];
+        for stage in [
+            doc! {"$addFields": {"copy": "$$ROOT"}},
+            doc! {"$project": {"a": "$$ROOT", "b": "$$ROOT"}},
+            doc! {"$group": {"_id": null, "all": {"$mergeObjects": "$$ROOT"}}},
+        ] {
+            let err = run(vec![stage.clone()], input.clone()).unwrap_err();
+            assert!(
+                matches!(err, Error::ValueTooLarge { max, .. } if max == 16 << 20),
+                "{stage}: {err:?}"
+            );
+        }
+        // One copy is within the limit, and so is a field beside the document.
+        let one = run(vec![doc! {"$project": {"copy": "$$ROOT"}}], input.clone());
+        assert!(one.is_ok(), "{one:?}");
+        let beside = run(vec![doc! {"$addFields": {"n": 1}}], input);
+        assert!(beside.is_ok(), "{beside:?}");
+    }
+
+    /// A field that replaces another is counted for the difference, so a stage that
+    /// rewrites a large field in place never meets the limit.
+    #[test]
+    fn a_computed_field_that_replaces_one_is_counted_once() {
+        let big = "z".repeat(300);
+        let doc = doc! {"a": big.clone(), "b": 1};
+        let size = crate::expr::document_bytes(&doc);
+        let same = vec![("a".to_string(), Expr::parse(&Bson::String("$a".into())).unwrap())];
+        let mut with = doc.clone();
+        set_computed_within(&mut with, &same, &Scope::new(&doc), size).unwrap();
+        assert_eq!(with, doc);
+        // Two fields that each replace it, the second of the first's size.
+        let twice = vec![
+            ("a".to_string(), Expr::parse(&Bson::String("$a".into())).unwrap()),
+            ("a".to_string(), Expr::parse(&Bson::String("$a".into())).unwrap()),
+        ];
+        let mut with = doc.clone();
+        set_computed_within(&mut with, &twice, &Scope::new(&doc), size).unwrap();
+        // A new field beside it is over by exactly its own bytes.
+        let beside = vec![("c".to_string(), Expr::parse(&Bson::String("$a".into())).unwrap())];
+        let mut with = doc.clone();
+        let err =
+            set_computed_within(&mut with, &beside, &Scope::new(&doc), size + 300).unwrap_err();
+        assert!(matches!(err, Error::ValueTooLarge { max, .. } if max == size + 300), "{err:?}");
+        // $$REMOVE and an empty list never refuse, even over the limit.
+        let mut with = doc.clone();
+        set_computed_within(&mut with, &[], &Scope::new(&doc), 1).unwrap();
+        let remove =
+            vec![("b".to_string(), Expr::parse(&Bson::String("$$REMOVE".into())).unwrap())];
+        set_computed_within(&mut with, &remove, &Scope::new(&doc), size).unwrap();
+        assert_eq!(with, doc! {"a": big});
+    }
+
     fn sample() -> Vec<Document> {
         docs(vec![
             doc! { "_id": 1, "city": "London", "qty": 5, "tags": ["a", "b"] },
