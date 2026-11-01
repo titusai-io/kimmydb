@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+pub mod accumulators;
 pub mod aggregate;
 pub mod expr;
 pub mod filter;
@@ -21,7 +22,11 @@ pub mod shape;
 pub mod update;
 
 #[cfg(test)]
+mod accumulator_tests;
+#[cfg(test)]
 mod bucket_tests;
+#[cfg(test)]
+mod date_tests;
 #[cfg(test)]
 mod decimal_arith_tests;
 #[cfg(test)]

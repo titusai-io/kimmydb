@@ -266,6 +266,42 @@ fn extended_json(map: &Map<String, Value>) -> Result<Option<Bson>, ApiError> {
             };
             Bson::Binary(bson::Binary { subtype, bytes })
         }
+        // The two other types the data model holds and `bson_to_json` writes.
+        // Left unread, a document read over HTTP and written back stored the
+        // wrapper as a nested document, and a regex could not be sent as a value
+        // at all, `$regexMatch`'s regex form included.
+        "$regularExpression" => {
+            let inner = value
+                .as_object()
+                .filter(|o| o.len() == 2)
+                .ok_or_else(|| bad("$regularExpression"))?;
+            let text = |key: &str| {
+                inner.get(key).and_then(Value::as_str).ok_or_else(|| bad("$regularExpression"))
+            };
+            let (pattern, options) = (text("pattern")?, text("options")?);
+            // BSON keeps the options in alphabetical order.
+            let mut options: Vec<char> = options.chars().collect();
+            options.sort_unstable();
+            // A NUL cannot be stored in either: the wire form ends each with one.
+            let cstring =
+                |s: String| bson::raw::CString::try_from(s).map_err(|_| bad("$regularExpression"));
+            Bson::RegularExpression(bson::Regex {
+                pattern: cstring(pattern.to_string())?,
+                options: cstring(options.into_iter().collect())?,
+            })
+        }
+        "$timestamp" => {
+            let inner =
+                value.as_object().filter(|o| o.len() == 2).ok_or_else(|| bad("$timestamp"))?;
+            let part = |key: &str| {
+                inner
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| bad("$timestamp"))
+            };
+            Bson::Timestamp(bson::Timestamp { time: part("t")?, increment: part("i")? })
+        }
         "$minKey" => Bson::MinKey,
         "$maxKey" => Bson::MaxKey,
         _ => return Ok(None),
@@ -406,6 +442,69 @@ mod tests {
         let value = json!({ "$oid": oid.to_hex() });
         assert_eq!(json_to_bson(&value).unwrap(), Bson::ObjectId(oid));
         assert_eq!(round_trip(value.clone()), value);
+    }
+
+    #[test]
+    fn regular_expressions_and_timestamps_use_extended_json_both_ways() {
+        let re = json!({ "$regularExpression": { "pattern": "ab+c", "options": "i" } });
+        let Bson::RegularExpression(parsed) = json_to_bson(&re).unwrap() else {
+            panic!("not a regex")
+        };
+        assert_eq!((parsed.pattern.as_str(), parsed.options.as_str()), ("ab+c", "i"));
+        assert_eq!(round_trip(re.clone()), re);
+        // BSON keeps the options in alphabetical order.
+        let Bson::RegularExpression(sorted) =
+            json_to_bson(&json!({ "$regularExpression": { "pattern": "a", "options": "xsi" } }))
+                .unwrap()
+        else {
+            panic!("not a regex")
+        };
+        assert_eq!(sorted.options.as_str(), "isx");
+
+        let ts = json!({ "$timestamp": { "t": 1_700_000_000u32, "i": 7 } });
+        assert_eq!(
+            json_to_bson(&ts).unwrap(),
+            Bson::Timestamp(bson::Timestamp { time: 1_700_000_000, increment: 7 })
+        );
+        assert_eq!(round_trip(ts.clone()), ts);
+        let max = json!({ "$timestamp": { "t": u32::MAX, "i": u32::MAX } });
+        assert_eq!(round_trip(max.clone()), max);
+
+        for bad in [
+            json!({ "$regularExpression": "a" }),
+            json!({ "$regularExpression": { "pattern": "a" } }),
+            json!({ "$regularExpression": { "pattern": 1, "options": "" } }),
+            json!({ "$regularExpression": { "pattern": "a\u{0}b", "options": "" } }),
+            json!({ "$regularExpression": { "pattern": "a", "options": "i\u{0}" } }),
+            json!({ "$regularExpression": { "pattern": "a", "options": "", "x": 1 } }),
+            json!({ "$timestamp": 5 }),
+            json!({ "$timestamp": { "t": 1 } }),
+            json!({ "$timestamp": { "t": -1, "i": 1 } }),
+            json!({ "$timestamp": { "t": 4_294_967_296u64, "i": 1 } }),
+            json!({ "$timestamp": { "t": "1", "i": 1 } }),
+            json!({ "$timestamp": { "t": 1.5, "i": 1 } }),
+        ] {
+            assert!(json_to_bson(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_regex_value_sent_over_json_reaches_regex_match() {
+        let expr = json_to_bson(&json!({
+            "$regexMatch": {
+                "input": "xabcx",
+                "regex": { "$regularExpression": { "pattern": "ABC", "options": "i" } }
+            }
+        }))
+        .unwrap();
+        let parsed = kimmy_query::expr::Expr::parse(&expr).expect("accepted");
+        assert_eq!(parsed.eval(&Document::new()).unwrap(), Bson::Boolean(true));
+        let ty = json_to_bson(&json!({
+            "$type": { "$regularExpression": { "pattern": "a", "options": "" } }
+        }))
+        .unwrap();
+        let ty = kimmy_query::expr::Expr::parse(&ty).expect("accepted");
+        assert_eq!(ty.eval(&Document::new()).unwrap(), Bson::String("regex".into()));
     }
 
     #[test]

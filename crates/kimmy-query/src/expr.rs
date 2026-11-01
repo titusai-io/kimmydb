@@ -66,7 +66,20 @@
 //! 1]}` is an error because a string is not a number. Returning null for both
 //! would make a typo and a type error indistinguishable in the output.
 
+mod arrayacc;
+mod dates;
+mod docops;
 mod math;
+mod sizes;
+mod strings;
+mod tz;
+
+pub(crate) use sizes::{
+    ArrayBudget, MAX_ARRAY_BYTES, MAX_STRING_BYTES, bson_bytes, check_array_within,
+    check_string_len_within,
+};
+
+pub(crate) use docops::merge_into;
 
 use std::cmp::Ordering;
 
@@ -111,6 +124,11 @@ pub enum Op {
     Substr,
     Split,
     StrLenCp,
+    IndexOfCp,
+    IndexOfBytes,
+    Strcasecmp,
+    StrLenBytes,
+    SubstrBytes,
     // Conditional
     Cond,
     IfNull,
@@ -126,13 +144,6 @@ pub enum Op {
     And,
     Or,
     Not,
-    // Dates
-    Year,
-    Month,
-    DayOfMonth,
-    Hour,
-    Minute,
-    Second,
     // Arrays
     Size,
     ArrayElemAt,
@@ -156,6 +167,9 @@ pub enum Op {
     // Documents and arrays of pairs
     ObjectToArray,
     ArrayToObject,
+    MergeObjects,
+    // Types
+    IsNumber,
     // Escape
     Literal,
 }
@@ -192,6 +206,11 @@ impl Op {
             "$substr" | "$substrCP" => Op::Substr,
             "$split" => Op::Split,
             "$strLenCP" => Op::StrLenCp,
+            "$indexOfCP" => Op::IndexOfCp,
+            "$indexOfBytes" => Op::IndexOfBytes,
+            "$strcasecmp" => Op::Strcasecmp,
+            "$strLenBytes" => Op::StrLenBytes,
+            "$substrBytes" => Op::SubstrBytes,
             "$cond" => Op::Cond,
             "$ifNull" => Op::IfNull,
             "$eq" => Op::Eq,
@@ -204,12 +223,6 @@ impl Op {
             "$and" => Op::And,
             "$or" => Op::Or,
             "$not" => Op::Not,
-            "$year" => Op::Year,
-            "$month" => Op::Month,
-            "$dayOfMonth" => Op::DayOfMonth,
-            "$hour" => Op::Hour,
-            "$minute" => Op::Minute,
-            "$second" => Op::Second,
             "$size" => Op::Size,
             "$arrayElemAt" => Op::ArrayElemAt,
             "$first" => Op::First,
@@ -230,6 +243,8 @@ impl Op {
             "$allElementsTrue" => Op::AllElementsTrue,
             "$objectToArray" => Op::ObjectToArray,
             "$arrayToObject" => Op::ArrayToObject,
+            "$mergeObjects" => Op::MergeObjects,
+            "$isNumber" => Op::IsNumber,
             "$literal" => Op::Literal,
             _ => return None,
         })
@@ -259,6 +274,11 @@ impl Op {
             Op::Substr => "$substr",
             Op::Split => "$split",
             Op::StrLenCp => "$strLenCP",
+            Op::IndexOfCp => "$indexOfCP",
+            Op::IndexOfBytes => "$indexOfBytes",
+            Op::Strcasecmp => "$strcasecmp",
+            Op::StrLenBytes => "$strLenBytes",
+            Op::SubstrBytes => "$substrBytes",
             Op::Cond => "$cond",
             Op::IfNull => "$ifNull",
             Op::Eq => "$eq",
@@ -271,12 +291,6 @@ impl Op {
             Op::And => "$and",
             Op::Or => "$or",
             Op::Not => "$not",
-            Op::Year => "$year",
-            Op::Month => "$month",
-            Op::DayOfMonth => "$dayOfMonth",
-            Op::Hour => "$hour",
-            Op::Minute => "$minute",
-            Op::Second => "$second",
             Op::Size => "$size",
             Op::ArrayElemAt => "$arrayElemAt",
             Op::First => "$first",
@@ -297,6 +311,8 @@ impl Op {
             Op::AllElementsTrue => "$allElementsTrue",
             Op::ObjectToArray => "$objectToArray",
             Op::ArrayToObject => "$arrayToObject",
+            Op::MergeObjects => "$mergeObjects",
+            Op::IsNumber => "$isNumber",
             Op::Literal => "$literal",
         }
     }
@@ -311,12 +327,14 @@ impl Op {
             | Op::ConcatArrays
             | Op::SetUnion
             | Op::SetIntersection => Arity::AtLeast(1),
+            Op::MergeObjects => Arity::AtLeast(0),
             Op::SetEquals => Arity::AtLeast(2),
             Op::Subtract
             | Op::Divide
             | Op::Mod
             | Op::Pow
             | Op::Split
+            | Op::Strcasecmp
             | Op::IfNull
             | Op::Eq
             | Op::Ne
@@ -329,7 +347,8 @@ impl Op {
             | Op::In
             | Op::SetDifference
             | Op::SetIsSubset => Arity::Exact(2),
-            Op::Substr => Arity::Exact(3),
+            Op::Substr | Op::SubstrBytes => Arity::Exact(3),
+            Op::IndexOfCp | Op::IndexOfBytes => Arity::Between(2, 4),
             Op::Cond => Arity::Exact(3),
             Op::Slice | Op::Range => Arity::Between(2, 3),
             Op::Round | Op::Trunc => Arity::Between(1, 2),
@@ -344,13 +363,9 @@ impl Op {
             | Op::ToUpper
             | Op::ToLower
             | Op::StrLenCp
+            | Op::StrLenBytes
+            | Op::IsNumber
             | Op::Not
-            | Op::Year
-            | Op::Month
-            | Op::DayOfMonth
-            | Op::Hour
-            | Op::Minute
-            | Op::Second
             | Op::Size
             | Op::First
             | Op::Last
@@ -501,8 +516,9 @@ pub enum Expr {
     Op(Op, Vec<Expr>),
     /// `{$switch: {branches: [{case, then}, ...], default: <expr>}}`.
     Switch { branches: Vec<(Expr, Expr)>, default: Option<Box<Expr>> },
-    /// `{$dateToString: {date: <expr>, format: "<fmt>"}}`.
-    DateToString { date: Box<Expr>, format: String },
+    /// A date operator, with its `timezone` (ADR-261): `$year` .. `$second`, `$dateToString`,
+    /// `$dateFromString`, `$dateAdd`, `$dateDiff`, and the rest of the family.
+    Date(Box<dates::DateExpr>),
     /// `{$convert: {input, to, onError?, onNull?}}`, and the `$toX` shorthands,
     /// which are the same node with no fallbacks.
     ///
@@ -528,6 +544,14 @@ pub enum Expr {
     SortArray { input: Box<Expr>, order: ArrayOrder },
     /// `{$zip: {inputs: [<expr>, ...], useLongestLength: <bool>, defaults: [<expr>, ...]}}`.
     Zip { inputs: Vec<Expr>, longest: bool, defaults: Option<Vec<Expr>> },
+    /// `$trim`, `$ltrim`, `$rtrim`, `$regexMatch`, `$regexFind`, `$regexFindAll`,
+    /// `$replaceOne` and `$replaceAll` (ADR-260).
+    Str(Box<strings::StrExpr>),
+    /// `$getField`, `$setField`, `$unsetField` and `$type` (ADR-260).
+    Doc(Box<docops::DocExpr>),
+    /// `$firstN`, `$lastN`, `$maxN`, `$minN` over an array, and `$stdDevPop` /
+    /// `$stdDevSamp` (ADR-262).
+    ArrayAcc(Box<arrayacc::ArrayAcc>),
     /// A document whose values are expressions.
     Object(Vec<(String, Expr)>),
     /// An array whose elements are expressions, evaluated in order to the
@@ -969,7 +993,7 @@ impl Expr {
                 branches.iter().any(|(case, then)| case.reads_document() || then.reads_document())
                     || default.as_ref().is_some_and(|d| d.reads_document())
             }
-            Expr::DateToString { date, .. } => date.reads_document(),
+            Expr::Date(d) => d.children().any(Expr::reads_document),
             Expr::Convert { input, on_error, on_null, .. } => {
                 input.reads_document()
                     || on_error.as_ref().is_some_and(|e| e.reads_document())
@@ -991,6 +1015,9 @@ impl Expr {
             Expr::Zip { inputs, defaults, .. } => {
                 any(inputs) || defaults.as_deref().is_some_and(any)
             }
+            Expr::Str(s) => s.children().into_iter().any(Expr::reads_document),
+            Expr::Doc(d) => d.reads_current() || d.children().into_iter().any(Expr::reads_document),
+            Expr::ArrayAcc(a) => a.children().into_iter().any(Expr::reads_document),
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_document()),
             Expr::Array(items) => any(items),
         }
@@ -1006,7 +1033,7 @@ impl Expr {
             Expr::Literal(_)
             | Expr::Op(..)
             | Expr::Switch { .. }
-            | Expr::DateToString { .. }
+            | Expr::Date(_)
             | Expr::Convert { .. }
             | Expr::Let { .. }
             | Expr::Filter { .. }
@@ -1014,6 +1041,9 @@ impl Expr {
             | Expr::Reduce { .. }
             | Expr::SortArray { .. }
             | Expr::Zip { .. }
+            | Expr::Str(_)
+            | Expr::Doc(_)
+            | Expr::ArrayAcc(_)
             | Expr::Object(_)
             | Expr::Array(_) => "an expression".to_string(),
         }
@@ -1040,7 +1070,7 @@ impl Expr {
                     .any(|(case, then)| case.reads_variable(names) || then.reads_variable(names))
                     || default.as_ref().is_some_and(|d| d.reads_variable(names))
             }
-            Expr::DateToString { date, .. } => date.reads_variable(names),
+            Expr::Date(d) => d.children().any(|e| e.reads_variable(names)),
             Expr::Convert { input, on_error, on_null, .. } => {
                 input.reads_variable(names)
                     || on_error.as_ref().is_some_and(|e| e.reads_variable(names))
@@ -1066,6 +1096,12 @@ impl Expr {
             Expr::Zip { inputs, defaults, .. } => {
                 any(inputs) || defaults.as_deref().is_some_and(any)
             }
+            Expr::Str(s) => s.children().into_iter().any(|e| e.reads_variable(names)),
+            Expr::Doc(d) => {
+                (d.reads_current() && names.iter().any(|n| n == "CURRENT" || n == "ROOT"))
+                    || d.children().into_iter().any(|e| e.reads_variable(names))
+            }
+            Expr::ArrayAcc(a) => a.children().into_iter().any(|e| e.reads_variable(names)),
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_variable(names)),
             Expr::Array(items) => any(items),
         }
@@ -1230,7 +1266,9 @@ impl Expr {
         let raw = doc.get(first).expect("key from the same document");
         match first.as_str() {
             "$switch" => Self::parse_switch(raw, declared),
-            "$dateToString" => Self::parse_date_to_string(raw, declared),
+            name if dates::Kind::from_name(name).is_some() => {
+                Ok(Expr::Date(Box::new(dates::DateExpr::parse(name, raw, declared)?)))
+            }
             "$let" => Self::parse_let(raw, declared),
             "$filter" => Self::parse_filter(raw, declared),
             "$map" => Self::parse_map(raw, declared),
@@ -1238,6 +1276,14 @@ impl Expr {
             "$sortArray" => Self::parse_sort_array(raw, declared),
             "$zip" => Self::parse_zip(raw, declared),
             "$convert" => Self::parse_convert(raw, declared),
+            name @ ("$trim" | "$ltrim" | "$rtrim" | "$regexMatch" | "$regexFind"
+            | "$regexFindAll" | "$replaceOne" | "$replaceAll") => {
+                strings::StrExpr::parse(name, raw, declared)
+            }
+            name @ ("$getField" | "$setField" | "$unsetField" | "$type") => {
+                docops::DocExpr::parse(name, raw, declared)
+            }
+            name if arrayacc::handles(name) => arrayacc::ArrayAcc::parse(name, raw, declared),
             name if ConvertTo::from_shorthand(name).is_some() => {
                 Self::parse_convert_shorthand(name, raw, declared)
             }
@@ -1314,27 +1360,6 @@ impl Expr {
             None => None,
         };
         Ok(Expr::Switch { branches, default })
-    }
-
-    fn parse_date_to_string(raw: &Bson, declared: &mut Declared) -> Result<Self> {
-        let spec = Self::named_spec("$dateToString", raw, &["date", "format"])?;
-        let Some(date) = spec.get("date") else {
-            return Err(Error::InvalidQuery("$dateToString needs a `date`".into()));
-        };
-        // The format is a constant rather than an expression. Making it
-        // computed would mean re-parsing the specifier string per document for
-        // a flexibility nobody has asked for.
-        let format = match spec.get("format") {
-            Some(Bson::String(f)) => f.clone(),
-            None => "%Y-%m-%dT%H:%M:%S.%LZ".to_string(),
-            Some(other) => {
-                return Err(Error::InvalidQuery(format!(
-                    "$dateToString `format` is a string, found {}",
-                    type_name(other)
-                )));
-            }
-        };
-        Ok(Expr::DateToString { date: Box::new(Self::parse_in(date, declared)?), format })
     }
 
     // -- the binding operators ------------------------------------------
@@ -1669,6 +1694,8 @@ impl Expr {
             Expr::Let { vars, body } => {
                 Self::with_let_frame(vars, body, scope, |body, scope| body.eval_field(scope))
             }
+            // An absent field read by `$getField` is left out, not written null.
+            Expr::Doc(d) => d.eval_opt(scope),
             other => other.eval_in(scope).map(Some),
         }
     }
@@ -1693,7 +1720,14 @@ impl Expr {
             // that fails fails the array, with its own error, which is a
             // value error like any other and may be held by `$and`/`$or`.
             Expr::Array(items) => {
-                items.iter().map(|e| e.eval_in(scope)).collect::<Result<Vec<_>>>().map(Bson::Array)
+                let mut budget = ArrayBudget::new("the array literal", MAX_ARRAY_BYTES);
+                let mut out = Vec::with_capacity(items.len());
+                for e in items {
+                    let value = e.eval_in(scope)?;
+                    budget.add(&value)?;
+                    out.push(value);
+                }
+                Ok(Bson::Array(out))
             }
             Expr::Switch { branches, default } => {
                 for (case, then) in branches {
@@ -1708,14 +1742,10 @@ impl Expr {
                     )),
                 }
             }
-            Expr::DateToString { date, format } => match date.eval_in(scope)? {
-                Bson::Null => Ok(Bson::Null),
-                Bson::DateTime(dt) => Ok(Bson::String(format_date(dt.timestamp_millis(), format)?)),
-                other => Err(Error::InvalidQuery(format!(
-                    "$dateToString needs a date, found {}",
-                    type_name(&other)
-                ))),
-            },
+            Expr::Str(s) => s.eval(scope),
+            Expr::Doc(d) => Ok(d.eval_opt(scope)?.unwrap_or(Bson::Null)),
+            Expr::ArrayAcc(a) => a.eval(scope),
+            Expr::Date(d) => d.eval(scope),
             Expr::Convert { input, to, on_error, on_null } => {
                 // An error in the input expression itself is not a conversion
                 // error and is not caught by `onError`: a fallback is for a
@@ -2050,9 +2080,12 @@ fn eval_map(input: &Expr, as_name: &str, body: &Expr, scope: &Scope<'_>) -> Resu
         return Ok(Bson::Null);
     };
     let mut out = Vec::with_capacity(items.len());
+    let mut budget = ArrayBudget::new("the array $map builds", MAX_ARRAY_BYTES);
     for item in &items {
         let frame = [(as_name, item)];
-        out.push(body.eval_in(&scope.nested(&frame))?);
+        let mapped = body.eval_in(&scope.nested(&frame))?;
+        budget.add(&mapped)?;
+        out.push(mapped);
     }
     Ok(Bson::Array(out))
 }
@@ -2162,17 +2195,19 @@ fn eval_zip(
             .collect::<Result<Vec<_>>>()?,
         _ => vec![Bson::Null; arrays.len()],
     };
-    let out = (0..rows)
-        .map(|i| {
-            Bson::Array(
-                arrays
-                    .iter()
-                    .zip(&padding)
-                    .map(|(array, pad)| array.get(i).unwrap_or(pad).clone())
-                    .collect(),
-            )
-        })
-        .collect();
+    let mut budget = ArrayBudget::new("the array $zip builds", MAX_ARRAY_BYTES);
+    let mut out = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let row = Bson::Array(
+            arrays
+                .iter()
+                .zip(&padding)
+                .map(|(array, pad)| array.get(i).unwrap_or(pad).clone())
+                .collect(),
+        );
+        budget.add(&row)?;
+        out.push(row);
+    }
     Ok(Bson::Array(out))
 }
 
@@ -2195,6 +2230,10 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::Substr => substr(args),
         Op::Split => split(&args[0], &args[1]),
         Op::StrLenCp => Ok(Bson::Int64(as_string_strict(&args[0], op)?.chars().count() as i64)),
+        Op::IndexOfCp | Op::IndexOfBytes => strings::index_of(op, args),
+        Op::Strcasecmp => strings::strcasecmp(&args[0], &args[1]),
+        Op::StrLenBytes => strings::str_len_bytes(&args[0]),
+        Op::SubstrBytes => strings::substr_bytes(args),
 
         Op::Eq => Ok(Bson::Boolean(canonical_cmp(&args[0], &args[1]) == Ordering::Equal)),
         Op::Ne => Ok(Bson::Boolean(canonical_cmp(&args[0], &args[1]) != Ordering::Equal)),
@@ -2209,10 +2248,6 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         })),
 
         Op::Not => Ok(Bson::Boolean(!truthy(&args[0]))),
-
-        Op::Year | Op::Month | Op::DayOfMonth | Op::Hour | Op::Minute | Op::Second => {
-            date_part(op, &args[0])
-        }
 
         Op::Size => array_size(&args[0]),
         Op::ArrayElemAt => array_elem_at(&args[0], &args[1]),
@@ -2233,6 +2268,8 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::AnyElementTrue | Op::AllElementsTrue => element_truth(op, &args[0]),
         Op::ObjectToArray => object_to_array(&args[0]),
         Op::ArrayToObject => array_to_object(&args[0]),
+        Op::MergeObjects => docops::merge_objects(args),
+        Op::IsNumber => Ok(docops::is_number(&args[0])),
 
         Op::Cond | Op::IfNull | Op::And | Op::Or | Op::Literal => {
             unreachable!("handled lazily")
@@ -2694,19 +2731,30 @@ fn as_string_strict(value: &Bson, op: Op) -> Result<String> {
 }
 
 fn concat(args: &[Bson]) -> Result<Bson> {
-    let mut out = String::new();
+    concat_within(args, MAX_STRING_BYTES)
+}
+
+fn concat_within(args: &[Bson], max: usize) -> Result<Bson> {
+    let mut len = 0usize;
     for arg in args {
         match arg {
             // One null makes the whole concatenation null, so a missing field
             // cannot silently vanish from the middle of a joined string.
             Bson::Null | Bson::Undefined => return Ok(Bson::Null),
-            Bson::String(s) => out.push_str(s),
+            Bson::String(s) => len = len.saturating_add(s.len()),
             other => {
                 return Err(Error::InvalidQuery(format!(
                     "$concat needs strings, found {}",
                     type_name(other)
                 )));
             }
+        }
+    }
+    check_string_len_within("the string $concat builds", len, max)?;
+    let mut out = String::with_capacity(len);
+    for arg in args {
+        if let Bson::String(s) = arg {
+            out.push_str(s);
         }
     }
     Ok(Bson::String(out))
@@ -2772,7 +2820,19 @@ fn split(value: &Bson, delimiter: &Bson) -> Result<Bson> {
         // ends, which is never what a caller means and is a silent surprise.
         return Err(Error::InvalidQuery("$split needs a non-empty delimiter".into()));
     }
-    Ok(Bson::Array(s.split(d.as_str()).map(|part| Bson::String(part.to_string())).collect()))
+    split_within(&s, &d, MAX_ARRAY_BYTES)
+}
+
+/// The pieces are counted as they are cut, so a long string of delimiters (one
+/// empty string per byte) stops at the limit, not after it.
+fn split_within(s: &str, d: &str, max: usize) -> Result<Bson> {
+    let mut budget = ArrayBudget::new("the array $split builds", max);
+    let mut out = Vec::new();
+    for part in s.split(d) {
+        budget.add_payload(5 + part.len())?;
+        out.push(Bson::String(part.to_string()));
+    }
+    Ok(Bson::Array(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -2912,15 +2972,30 @@ fn array_slice(args: &[Bson]) -> Result<Bson> {
 }
 
 fn concat_arrays(args: &[Bson]) -> Result<Bson> {
-    let mut out = Vec::new();
+    concat_arrays_within(args, MAX_ARRAY_BYTES)
+}
+
+/// The elements are counted before any is copied, so a `$reduce` that doubles an
+/// array at every step stops at the limit, and the check costs one pass over
+/// what the result would hold.
+fn concat_arrays_within(args: &[Bson], max: usize) -> Result<Bson> {
+    let mut arrays = Vec::with_capacity(args.len());
     for arg in args {
         match as_array(Op::ConcatArrays, arg)? {
             // One null makes the whole result null, as `$concat` does: a
             // missing array must not silently vanish from the middle.
             None => return Ok(Bson::Null),
-            Some(items) => out.extend_from_slice(items),
+            Some(items) => arrays.push(items),
         }
     }
+    let mut budget = ArrayBudget::new("the array $concatArrays builds", max);
+    let mut len = 0usize;
+    for items in &arrays {
+        items.iter().try_for_each(|item| budget.add(item))?;
+        len += items.len();
+    }
+    let mut out = Vec::with_capacity(len);
+    arrays.iter().for_each(|items| out.extend_from_slice(items));
     Ok(Bson::Array(out))
 }
 
@@ -3167,22 +3242,28 @@ fn element_truth(op: Op, value: &Bson) -> Result<Bson> {
 fn object_to_array(value: &Bson) -> Result<Bson> {
     match value {
         Bson::Null | Bson::Undefined => Ok(Bson::Null),
-        Bson::Document(fields) => Ok(Bson::Array(
-            fields
-                .iter()
-                .map(|(k, v)| {
-                    let mut pair = Document::new();
-                    pair.insert("k", k.as_str());
-                    pair.insert("v", v.clone());
-                    Bson::Document(pair)
-                })
-                .collect(),
-        )),
+        Bson::Document(fields) => object_to_array_within(fields, MAX_ARRAY_BYTES),
         other => Err(Error::InvalidQuery(format!(
             "$objectToArray needs a document, found {}",
             type_name(other)
         ))),
     }
+}
+
+/// Each pair `{k, v}` is counted before it is built: a document of small fields
+/// turns into an array a few times its size.
+fn object_to_array_within(fields: &Document, max: usize) -> Result<Bson> {
+    let mut budget = ArrayBudget::new("the array $objectToArray builds", max);
+    let mut out = Vec::with_capacity(fields.len());
+    for (k, v) in fields {
+        // `{k: <string>, v: <value>}`: framing, then the two elements.
+        budget.add_payload(5 + (2 + 1 + 5 + k.len()) + (2 + 1 + bson_bytes(v)))?;
+        let mut pair = Document::new();
+        pair.insert("k", k.as_str());
+        pair.insert("v", v.clone());
+        out.push(Bson::Document(pair));
+    }
+    Ok(Bson::Array(out))
 }
 
 /// The two spellings of one key-value pair `$arrayToObject` reads.
@@ -3284,117 +3365,6 @@ fn array_to_object(value: &Bson) -> Result<Bson> {
 // Dates
 // ---------------------------------------------------------------------------
 
-fn date_part(op: Op, value: &Bson) -> Result<Bson> {
-    let millis = match value {
-        Bson::Null | Bson::Undefined => return Ok(Bson::Null),
-        Bson::DateTime(dt) => dt.timestamp_millis(),
-        other => {
-            return Err(Error::InvalidQuery(format!(
-                "{} needs a date, found {}",
-                op.name(),
-                type_name(other)
-            )));
-        }
-    };
-    let parts = Civil::from_millis(millis);
-    Ok(Bson::Int32(match op {
-        Op::Year => parts.year,
-        Op::Month => parts.month,
-        Op::DayOfMonth => parts.day,
-        Op::Hour => parts.hour,
-        Op::Minute => parts.minute,
-        Op::Second => parts.second,
-        _ => unreachable!("only date operators reach here"),
-    }))
-}
-
-/// A UTC calendar date broken into parts.
-///
-/// Computed here rather than through `chrono` because the conversion is
-/// twenty lines of well-known arithmetic and the alternative is a new runtime
-/// dependency for it. Everything is UTC: BSON dates carry no zone, so there is
-/// nothing to convert to and offering `%z` would be inventing information.
-#[derive(Debug, PartialEq, Eq)]
-struct Civil {
-    year: i32,
-    month: i32,
-    day: i32,
-    hour: i32,
-    minute: i32,
-    second: i32,
-    milli: i32,
-}
-
-impl Civil {
-    fn from_millis(millis: i64) -> Self {
-        // Floor division, so dates before 1970 do not round towards zero and
-        // land a day late.
-        let days = millis.div_euclid(86_400_000);
-        let rem = millis.rem_euclid(86_400_000);
-
-        // Howard Hinnant's civil_from_days, shifted to a 1 March year start so
-        // the leap day falls at the end of the cycle.
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
-        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = doy - (153 * mp + 2) / 5 + 1;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = if month <= 2 { y + 1 } else { y };
-
-        Self {
-            year: year as i32,
-            month: month as i32,
-            day: day as i32,
-            hour: (rem / 3_600_000) as i32,
-            minute: (rem / 60_000 % 60) as i32,
-            second: (rem / 1_000 % 60) as i32,
-            milli: (rem % 1_000) as i32,
-        }
-    }
-}
-
-/// The `$dateToString` specifier subset.
-///
-/// `%Y %m %d %H %M %S %L %%` — the parts a date can actually be broken into
-/// here. A specifier this does not know is an **error** rather than being
-/// copied through: a silently literal `%q` in every row is the kind of wrong
-/// output nobody notices until it is in a report.
-fn format_date(millis: i64, format: &str) -> Result<String> {
-    let c = Civil::from_millis(millis);
-    let mut out = String::with_capacity(format.len() + 8);
-    let mut chars = format.chars();
-
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('Y') => out.push_str(&format!("{:04}", c.year)),
-            Some('m') => out.push_str(&format!("{:02}", c.month)),
-            Some('d') => out.push_str(&format!("{:02}", c.day)),
-            Some('H') => out.push_str(&format!("{:02}", c.hour)),
-            Some('M') => out.push_str(&format!("{:02}", c.minute)),
-            Some('S') => out.push_str(&format!("{:02}", c.second)),
-            Some('L') => out.push_str(&format!("{:03}", c.milli)),
-            Some('%') => out.push('%'),
-            Some(other) => {
-                return Err(Error::InvalidQuery(format!(
-                    "$dateToString does not support the specifier %{other}"
-                )));
-            }
-            None => {
-                return Err(Error::InvalidQuery("$dateToString format ends with a bare %".into()));
-            }
-        }
-    }
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // Type conversion
 // ---------------------------------------------------------------------------
@@ -3447,7 +3417,7 @@ fn convert(value: &Bson, to: ConvertTo) -> Result<Bson> {
             Bson::Decimal128(d) => d.to_string(),
             // ISO 8601 with milliseconds, which is `$dateToString`'s default
             // and what `$toDate` reads back.
-            Bson::DateTime(dt) => format_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?,
+            Bson::DateTime(dt) => dates::format_iso_utc(dt.timestamp_millis())?,
             Bson::ObjectId(oid) => oid.to_hex(),
             _ => return Err(unsupported()),
         })),
@@ -3651,6 +3621,12 @@ pub(crate) fn type_name(value: &Bson) -> &'static str {
         _ => "that type",
     }
 }
+
+#[cfg(test)]
+mod strdoc_tests;
+
+#[cfg(test)]
+mod size_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4457,26 +4433,6 @@ mod tests {
         assert_eq!(on(doc! {"$hour": "$t"}.into(), d.clone()), Bson::Int32(13));
         assert_eq!(on(doc! {"$minute": "$t"}.into(), d.clone()), Bson::Int32(45));
         assert_eq!(on(doc! {"$second": "$t"}.into(), d), Bson::Int32(7));
-    }
-
-    #[test]
-    fn the_epoch_and_a_leap_day_are_right() {
-        assert_eq!(Civil::from_millis(0).year, 1970);
-        assert_eq!(Civil::from_millis(0).month, 1);
-        assert_eq!(Civil::from_millis(0).day, 1);
-
-        // 2024-02-29T00:00:00Z — a leap day, the case the cycle arithmetic
-        // exists to get right.
-        let leap = Civil::from_millis(1_709_164_800_000);
-        assert_eq!((leap.year, leap.month, leap.day), (2024, 2, 29));
-    }
-
-    #[test]
-    fn dates_before_the_epoch_do_not_land_a_day_late() {
-        // Floor division rather than truncation: 1969-12-31T23:59:59Z.
-        let before = Civil::from_millis(-1_000);
-        assert_eq!((before.year, before.month, before.day), (1969, 12, 31));
-        assert_eq!((before.hour, before.minute, before.second), (23, 59, 59));
     }
 
     #[test]

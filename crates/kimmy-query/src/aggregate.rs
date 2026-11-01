@@ -87,6 +87,10 @@ pub enum Accumulator {
     Last(Expr),
     Push(Expr),
     AddToSet(Expr),
+    MergeObjects(Expr),
+    /// `$stdDevPop`, `$stdDevSamp`, `$top`, `$bottom`, `$topN`, `$bottomN`, `$firstN`,
+    /// `$lastN`, `$maxN`, `$minN` and `$count` (ADR-262).
+    Ext(crate::accumulators::Spec),
 }
 
 /// One pipeline stage.
@@ -1270,6 +1274,11 @@ fn parse_accumulators(
             )));
         }
         let (op, arg) = acc.iter().next().expect("length checked above");
+        crate::accumulators::check_unary(op, arg)?;
+        if let Some(spec) = crate::accumulators::parse(op, arg, vars)? {
+            fields.push((name.clone(), Accumulator::Ext(spec)));
+            continue;
+        }
         let expr = Expr::parse_with_vars(arg, vars)?;
         let accumulator = match op.as_str() {
             "$sum" => Accumulator::Sum(expr),
@@ -1280,10 +1289,12 @@ fn parse_accumulators(
             "$last" => Accumulator::Last(expr),
             "$push" => Accumulator::Push(expr),
             "$addToSet" => Accumulator::AddToSet(expr),
+            "$mergeObjects" => Accumulator::MergeObjects(expr),
             other => {
                 return Err(Error::InvalidQuery(format!(
                     "{other} is not an accumulator; supported: $sum, $avg, $min, $max, $first, \
-                     $last, $push, $addToSet"
+                     $last, $push, $addToSet, $mergeObjects, $stdDevPop, $stdDevSamp, $top, \
+                     $bottom, $topN, $bottomN, $firstN, $lastN, $maxN, $minN, $count"
                 )));
             }
         };
@@ -2114,6 +2125,9 @@ enum AccState {
     /// The members in first-seen order, and the [`group_key`] of each, which
     /// is what makes two values one member (ADR-186).
     AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>),
+    /// The fields merged so far, a later document's value winning.
+    MergeObjects(Document),
+    Ext(crate::accumulators::State),
 }
 
 fn group(
@@ -2303,11 +2317,15 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
         Accumulator::Last(_) => AccState::Last(None),
         Accumulator::Push(_) => AccState::Push(Vec::new()),
         Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default()),
+        Accumulator::MergeObjects(_) => AccState::MergeObjects(Document::new()),
+        Accumulator::Ext(spec) => AccState::Ext(spec.init()),
     }
 }
 
+/// Feed one document to one accumulator.
 fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     match (state, acc) {
+        (AccState::Ext(state), Accumulator::Ext(spec)) => state.accumulate(spec, scope)?,
         (AccState::Sum(total), Accumulator::Sum(e)) => {
             total.add(&e.eval_in(scope)?);
         }
@@ -2347,6 +2365,9 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
                 items.push(v);
             }
         }
+        (AccState::MergeObjects(merged), Accumulator::MergeObjects(e)) => {
+            crate::expr::merge_into(merged, &e.eval_in(scope)?)?;
+        }
         // Unreachable: `init` pairs each accumulator with its own state.
         _ => {}
     }
@@ -2363,6 +2384,8 @@ fn finish(state: AccState) -> Result<Bson> {
         AccState::MinMax(v) | AccState::First(v) => v.unwrap_or(Bson::Null),
         AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
         AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
+        AccState::MergeObjects(merged) => Bson::Document(merged),
+        AccState::Ext(state) => state.finish(),
     })
 }
 
@@ -2466,10 +2489,11 @@ mod tests {
 
     #[test]
     fn a_pipeline_holds_its_regex_patterns_under_one_budget() {
-        // One `\w{15}`, about 0.8 MiB, fits one filter's 2 MiB, and so do
-        // two stages of one; three stages do not, because every stage's
-        // patterns are held together.
-        let one = |n: usize| doc! {"$match": {"s": {"$regex": format!(r"\w{{15}}{n}")}}};
+        // One Unicode word class repeated 15 times, about 0.8 MiB, fits one
+        // filter's 2 MiB, and so do two stages of one; three stages do not,
+        // because every stage's patterns are held together.
+        let w = kimmy_core::regex::UNICODE_WORD_CLASS;
+        let one = |n: usize| doc! {"$match": {"s": {"$regex": format!("{w}{{15}}{n}")}}};
         parse(&[one(0), one(1)]).unwrap();
         let err = parse(&[one(0), doc! {"$limit": 5}, one(1), one(2)]).unwrap_err().to_string();
         assert!(err.contains("more than 2 MiB together"), "{err}");

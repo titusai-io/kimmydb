@@ -11,6 +11,8 @@ description = "MongoDB-style filter, update, and aggregation evaluation for Kimm
 [dependencies]
 kimmy-core.workspace = true
 bson.workspace = true
+jiff.workspace = true
+jiff-tzdb.workspace = true
 serde.workspace = true
 stacker.workspace = true
 thiserror.workspace = true
