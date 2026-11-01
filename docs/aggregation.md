@@ -1818,6 +1818,29 @@ becoming slow in a way that is harder to diagnose than a refusal.
 `$unwind` is checked *while* it expands, not after, because a handful of
 documents holding large arrays can exceed the cap long before the stage ends.
 
+## The request deadline
+
+The document cap bounds the memory a pipeline holds, not the time it takes: an
+expression that iterates (`$reduce` over `$range` inside a `$map`) can cost
+millions of evaluations a document within every cap. A pipeline therefore runs
+under the request's deadline, `server.request_timeout_secs` (30 s by default,
+[ADR-266](decisions.md)). Every stage looks at the clock as it starts, every
+loop in a stage looks at it every 1,024 iterations (`$map`, `$filter` and
+`$reduce` count their elements, and `$sort` is done in runs of 4,096 documents
+with a look between them), and the reads of other collections by `$lookup` and
+`$graphLookup` look at it per row. Past the deadline the pipeline stops and the
+request is answered `503 timeout`, the answer the server gives a request it
+abandons while waiting, over REST and `/mcp`; its worker is free at once. A
+single operation that cannot be split, such as one regular expression over a
+16 MiB string, ends at its next look, not at the deadline.
+
+A trailing `$merge` or `$out` is checked before each chunk it writes. Stopped
+before the first commit it writes nothing and creates nothing; stopped after, it
+is answered `500 partially_applied` with `timeout` as its cause and the counts
+of what landed, as any failure after a first commit is
+([`$merge`](#merge)): what was written stands and replicates, and no chunk is
+half written. A query that needs longer than 30 s needs the setting raised.
+
 ---
 
 ## Not supported
