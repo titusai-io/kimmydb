@@ -1401,6 +1401,7 @@ fn parse_accumulators(
             )));
         }
         let (op, arg) = acc.iter().next().expect("length checked above");
+        crate::accumulators::check_unary(op, arg)?;
         if let Some(spec) = crate::accumulators::parse(op, arg, vars)? {
             fields.push((name.clone(), Accumulator::Ext(spec)));
             continue;
@@ -2292,8 +2293,6 @@ pub(crate) fn group_keyed(
 ) -> Result<Vec<Document>> {
     let mut order: Vec<Bucket> = Vec::new();
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
-    // Rows the bounded accumulators hold across every group of the stage.
-    let mut held = 0usize;
 
     for doc in &input {
         let scope = Scope::with_bindings(doc, vars);
@@ -2312,9 +2311,8 @@ pub(crate) fn group_keyed(
             }
         };
         for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
-            held += accumulate(state, acc, &scope, limits)?;
+            accumulate(state, acc, &scope)?;
         }
-        check_held(stage, held, limits)?;
     }
 
     order
@@ -2426,13 +2424,11 @@ fn bucket_auto(
             end += 1;
         }
         let mut states: Vec<AccState> = fields.iter().map(init).collect();
-        let mut held = 0usize;
         for (_, doc) in &keyed[start..end] {
             let scope = Scope::with_bindings(doc, vars);
             for (state, (_, acc)) in states.iter_mut().zip(fields) {
-                held += accumulate(state, acc, &scope, limits)?;
+                accumulate(state, acc, &scope)?;
             }
-            check_held("$bucketAuto", held, limits)?;
         }
         let max = if end < keyed.len() { keyed[end].0.clone() } else { keyed[end - 1].0.clone() };
         let mut answer = Document::new();
@@ -2463,18 +2459,10 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
     }
 }
 
-/// Feed one document to one accumulator. Returns how many rows a bounded
-/// accumulator grew by, which the caller totals and holds to the stage's cap.
-fn accumulate(
-    state: &mut AccState,
-    acc: &Accumulator,
-    scope: &Scope<'_>,
-    limits: &Limits,
-) -> Result<usize> {
+/// Feed one document to one accumulator.
+fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     match (state, acc) {
-        (AccState::Ext(state), Accumulator::Ext(spec)) => {
-            return state.accumulate(spec, scope, limits);
-        }
+        (AccState::Ext(state), Accumulator::Ext(spec)) => state.accumulate(spec, scope)?,
         (AccState::Sum(total), Accumulator::Sum(e)) => {
             total.add(&e.eval_in(scope)?);
         }
@@ -2519,18 +2507,6 @@ fn accumulate(
         }
         // Unreachable: `init` pairs each accumulator with its own state.
         _ => {}
-    }
-    Ok(0)
-}
-
-/// Refuse a stage whose `$topN`/`$firstN`-style buffers hold more rows, across all
-/// its groups, than the pipeline limit (ADR-262).
-fn check_held(stage: &str, held: usize, limits: &Limits) -> Result<()> {
-    if held > limits.max_documents {
-        return Err(Error::Limit(format!(
-            "{stage} holds {held} accumulated values across its groups, over the pipeline limit              of {}. Use a smaller n, or narrow the pipeline with an earlier $match",
-            limits.max_documents
-        )));
     }
     Ok(())
 }
@@ -2650,10 +2626,11 @@ mod tests {
 
     #[test]
     fn a_pipeline_holds_its_regex_patterns_under_one_budget() {
-        // One `\w{15}`, about 0.8 MiB, fits one filter's 2 MiB, and so do
-        // two stages of one; three stages do not, because every stage's
-        // patterns are held together.
-        let one = |n: usize| doc! {"$match": {"s": {"$regex": format!(r"\w{{15}}{n}")}}};
+        // One Unicode word class repeated 15 times, about 0.8 MiB, fits one
+        // filter's 2 MiB, and so do two stages of one; three stages do not,
+        // because every stage's patterns are held together.
+        let w = kimmy_core::regex::UNICODE_WORD_CLASS;
+        let one = |n: usize| doc! {"$match": {"s": {"$regex": format!("{w}{{15}}{n}")}}};
         parse(&[one(0), one(1)]).unwrap();
         let err = parse(&[one(0), doc! {"$limit": 5}, one(1), one(2)]).unwrap_err().to_string();
         assert!(err.contains("more than 2 MiB together"), "{err}");

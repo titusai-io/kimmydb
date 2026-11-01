@@ -371,8 +371,8 @@ the list of names, and so on.
 - **Limits.** A schema nests at most 32 levels (the outermost is level 1), a `400`
   beyond. Evaluation follows the schema, so a deeply nested document costs no more
   depth. `pattern` and `patternProperties` use the same engine and the same limits
-  as [`$regex`](#regex-compatibility): a pattern with a backreference or a lookaround, or one over
-  the size limit, is a `400`, and a filter's patterns, `$regex` and schema together,
+  as [`$regex`](#regex-compatibility), `\d`, `\w` and `\s` read as ASCII included: a pattern
+  with a backreference or a lookaround, or one over the size limit, is a `400`, and a filter's patterns, `$regex` and schema together,
   are counted against its 32. `uniqueItems` sorts a reference to each element, so
   it takes time n log n and at most 8 bytes per element, bounded by the 16 MiB
   document limit.
@@ -428,7 +428,7 @@ are each refused too. An empty result therefore means that nothing is that
 type, and never that the spelling was wrong. The aliases are the names a
 stored value can report, which include `symbol` and `dbPointer`, plus
 `number`. [`$options`](#regex-compatibility) is checked the same way: a flag
-other than `i`, `m`, `s` and `x` is a `400`. Earlier releases accepted both,
+other than `i`, `m`, `s`, `x` and `u` is a `400`. Earlier releases accepted both,
 and matched nothing, or compiled without the flag.
 
 **The quoted slot in `unsupported operator "…"` holds the operator and nothing
@@ -1351,11 +1351,35 @@ compiled form is what every document is matched against.
 
 | | |
 |---|---|
-| ✅ Supported | Character classes, anchors, quantifiers, groups, alternation; flags `i` `m` `s` `x` |
-| ⛔ Not supported | Backreferences (`\1`), lookahead/lookbehind (`(?=)`, `(?<=)`) |
+| ✅ Supported | Character classes, anchors, quantifiers, groups, alternation; flags `i` `m` `s` `x` `u` |
+| ⛔ Not supported | Backreferences (`\1`), lookahead/lookbehind (`(?=)`, `(?<=)`), atomic groups (`(?>)`), possessive quantifiers (`a*+`, `a++`), `\Q…\E`, and the PCRE escapes `\Z`, `\G`, `\h`, `\R` and `\X` |
 
 The tradeoff is deliberate: `regex` guarantees linear-time matching, so a
 pathological pattern cannot become a denial of service against the database.
+
+**`\d`, `\w`, `\s` and the word boundaries `\b` and `\B` are ASCII.** `\d` is
+`[0-9]`, `\w` is `[0-9A-Za-z_]`, `\s` is space, tab, line feed, vertical tab,
+form feed and carriage return, and `\b` sits between an ASCII word character and
+anything else, so `\d` does not match `٣` (U+0663), `\w` does not match `é` and `\s`
+does not match U+00A0 (and `\D`, `\W` and `\S` match them), which is what the
+reference does. Before 0.59.0 these were Unicode classes. Everything else keeps
+its Unicode meaning: `.` is one code point, `\p{L}` and the other properties are
+Unicode, and the `i` flag folds `é` with `É` and the Kelvin sign with `k`. One
+edge: under `i`, a `\w` written *inside* brackets (`[\w-]`) also takes in U+017F
+(which folds to `s`); the reference takes in U+212A (which folds to `k`) there, as
+this does, but not U+017F. Outside brackets neither takes in either, here and
+there. The
+same engine runs the `$regex` filter, the `$regexMatch`, `$regexFind` and
+`$regexFindAll` expression operators, and the `pattern` and `patternProperties`
+of a [collection validator](validation.md) and of the `$jsonSchema` filter, so a
+pattern such as `^\w+$` or `^\d{3}$` in a validator now refuses a write holding
+`é` or Arabic-Indic digits where it accepted it. Documents already stored are not
+checked again, and the validator violations listing, which tests the stored
+documents on request, reports the ones a pattern now rejects. A pattern that
+needs the Unicode meaning writes it out: `\p{L}`, `\p{Nd}`, or
+`[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}]` for the old `\w`.
+
+**Possessive quantifiers** (`a*+`, `a++`, `a?+`, `a{n,m}+`) are a **`400`** naming the construct, wherever a pattern is written: the filter, the expression operators, a `$jsonSchema` filter and a validator being set or created. The reference never gives back what such a quantifier took, so `a*+a` matches nothing there; this engine would read it as a repetition of a repetition and match `aa`. Write the pattern without the extra `+`, or a group (`(?:a*)+`) if the nested repetition is what you mean. A validator that is **already stored** with one still loads and is read as it was read before; replacing it applies the rule.
 
 A pattern the engine cannot use is a **`400`**, naming the pattern and what is
 wrong with it, before any document is read: an unclosed group, and also a
@@ -1364,11 +1388,12 @@ string. Earlier releases let an invalid pattern match nothing, and ignored an
 `$options` that was not a string, so a bad pattern inside an `$or` returned a
 plausible result with one branch silently gone.
 
-**A flag other than `i`, `m`, `s` and `x` is refused.** The four above are the
-whole set, and any other character in `$options` — or in the flags of a regex
-literal, or in a lone `$options` — is a `400` naming it, before any document is
-read: `{"$regex": "S", "$options": "I"}` fails on the `I`, because `$options`
-is case-sensitive. Earlier releases dropped an unknown flag and the pattern
+**A flag other than `i`, `m`, `s`, `x` and `u` is refused.** `u` is accepted, as
+the reference accepts it, and changes nothing: a pattern is always matched as
+Unicode text. The five are the whole set, and any other character in `$options` —
+or in the flags of a regex literal, or in a lone `$options` — is a `400` naming
+it, before any document is read: `{"$regex": "S", "$options": "I"}` fails on the
+`I`, because `$options` is case-sensitive. Earlier releases dropped an unknown flag and the pattern
 compiled without it, so `"I"` returned a case-sensitive result and `"iz"`
 swallowed the `z`. This is the same rule as for an unknown
 [`$type` alias](#type).
@@ -1393,9 +1418,10 @@ the most measured for thirty-two patterns is 17.7 MiB after matching, about
 0.53 MiB per pattern; that is a measurement of the shapes that fill the caches
 most, not a guaranteed bound. Most
 patterns compile to a few kilobytes. What reaches the limits is a Unicode class
-repeated many times: `\w` alone compiles to some 55 KiB, so `\w{20}` is about
-1 MiB and `\w{100}` is refused, where `[A-Za-z0-9_]{100}` compiles to a few
-kilobytes. Many alternatives fit better as one pattern, `"^(abc|def|ghi)"`,
+repeated many times: the class `\w` was before it became ASCII,
+`[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\p{Join_Control}]`, compiles to some 55 KiB, so
+twenty of it are about 1 MiB and a hundred are refused, where `[A-Za-z0-9_]{100}`
+and `\w{100}` compile to a few kilobytes. Many alternatives fit better as one pattern, `"^(abc|def|ghi)"`,
 than as an `$or` of one `$regex` each.
 
 ---

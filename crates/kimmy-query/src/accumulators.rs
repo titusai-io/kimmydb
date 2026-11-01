@@ -8,20 +8,22 @@
 //! where the state can, which is the shape a sliding window needs. Only `$group`,
 //! `$bucket` and `$bucketAuto` drive them today.
 //!
-//! Every buffer an `n` bounds is charged to the cap `$group` already holds its
-//! buckets to (`Limits::max_documents`): [`State::accumulate`] reports how many
-//! rows the state grew by and the caller totals them across the groups of the
-//! stage. An `n` above the cap is refused the first time it is read.
+//! No `n` is refused for its size and nothing is allocated from it: a buffer
+//! grows with the rows it receives, so each accumulator holds at most the rows of
+//! its group, which the stage's input already bounds (as `$push` does).
+//!
+//! The ranked forms keep a heap and a sequence number, so a row costs
+//! O(log n) and equal rows keep their order of arrival.
 
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BinaryHeap, VecDeque};
+use std::sync::Arc;
 
 use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::decimal::{arith, decode_raw};
 use kimmy_core::{Error, Result, path};
 
-use crate::aggregate::Limits;
 use crate::expr::{Expr, Scope};
 use crate::shape::{self, SortKey};
 
@@ -76,6 +78,21 @@ fn kind_of(op: &str) -> Option<Kind> {
     })
 }
 
+/// `$sum`, `$avg`, `$stdDevPop` and `$stdDevSamp` take one expression, not a
+/// list: given an array literal of any length but one, the reference refuses
+/// them (`The $sum accumulator is a unary operator`, error 40237). A list of one
+/// is not probed and stays an array expression. Every other name passes.
+pub fn check_unary(op: &str, arg: &Bson) -> Result<()> {
+    match (op, arg) {
+        ("$sum" | "$avg" | "$stdDevPop" | "$stdDevSamp", Bson::Array(items))
+            if items.len() != 1 =>
+        {
+            Err(Error::InvalidQuery(format!("The {op} accumulator is a unary operator")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Parse `{<op>: <arg>}` if `op` is one of ours.
 pub fn parse(op: &str, arg: &Bson, vars: &[String]) -> Result<Option<Spec>> {
     let Some(kind) = kind_of(op) else { return Ok(None) };
@@ -98,15 +115,10 @@ pub fn parse(op: &str, arg: &Bson, vars: &[String]) -> Result<Option<Spec>> {
             let sort_by = d.get("sortBy").and_then(Bson::as_document).ok_or_else(|| {
                 Error::InvalidQuery(format!("{op} requires `sortBy` to be a document"))
             })?;
-            if sort_by.is_empty() {
-                return Err(Error::InvalidQuery(format!(
-                    "{op} requires `sortBy` to name at least one field"
-                )));
-            }
             Spec {
                 kind,
                 value: Expr::parse_with_vars(&d["output"], vars)?,
-                n: parse_n(op, d, vars)?,
+                n: parse_n(d, vars)?,
                 sort: shape::parse_sort(sort_by)?,
             }
         }
@@ -115,7 +127,7 @@ pub fn parse(op: &str, arg: &Bson, vars: &[String]) -> Result<Option<Spec>> {
             Spec {
                 kind,
                 value: Expr::parse_with_vars(&d["input"], vars)?,
-                n: parse_n(op, d, vars)?,
+                n: parse_n(d, vars)?,
                 sort: Vec::new(),
             }
         }
@@ -151,24 +163,23 @@ fn argument<'a>(op: &str, arg: &'a Bson, with_n: bool, value: &str) -> Result<&'
     Ok(d)
 }
 
-fn parse_n(op: &str, d: &Document, vars: &[String]) -> Result<Option<Expr>> {
+fn parse_n(d: &Document, vars: &[String]) -> Result<Option<Expr>> {
     let Some(n) = d.get("n") else { return Ok(None) };
     let expr = Expr::parse_with_vars(n, vars)?;
-    // An expression that needs no document is read now, so a bad constant is a
-    // parse error. One that reads a variable is read at first use. A field path
-    // reads the empty document, is missing there, and is refused: `n` is one
-    // number for the whole group.
+    // An expression that needs no document is read now, to a constant. It is not
+    // checked now: a bad `n` is refused for a group, when its first document
+    // arrives, so over no input there is no group and no error (as the
+    // reference answers). One that reads a variable is read at first use. A
+    // field path reads the empty document, is missing there, and is refused then:
+    // `n` is one number for the whole group.
     match expr.eval_in(&Scope::new(&Document::new())) {
-        Ok(value) => {
-            read_n(op, &value)?;
-            Ok(Some(Expr::Literal(value)))
-        }
+        Ok(value) => Ok(Some(Expr::Literal(value))),
         Err(_) => Ok(Some(expr)),
     }
 }
 
 /// `n` as a positive integer.
-fn read_n(op: &str, value: &Bson) -> Result<usize> {
+pub(crate) fn read_n(op: &str, value: &Bson) -> Result<usize> {
     let n: i64 = match value {
         Bson::Int32(n) => i64::from(*n),
         Bson::Int64(n) => *n,
@@ -220,32 +231,32 @@ impl Spec {
         let body = match self.kind {
             Kind::StdDevPop | Kind::StdDevSamp => Body::Welford(Welford::default()),
             Kind::Count => Body::Count(0),
-            Kind::Top | Kind::Bottom | Kind::TopN | Kind::BottomN => Body::Ranked(Vec::new()),
-            Kind::FirstN | Kind::LastN | Kind::MaxN | Kind::MinN => Body::Values(VecDeque::new()),
+            Kind::Top | Kind::Bottom | Kind::TopN | Kind::BottomN => {
+                Body::Ranked(BinaryHeap::new())
+            }
+            Kind::MaxN | Kind::MinN => Body::Best(BinaryHeap::new()),
+            Kind::FirstN | Kind::LastN => Body::Values(VecDeque::new()),
         };
+        // A row ranks by its keys in the direction asked for; `$bottom*` keeps
+        // the rows that rank last, so it ranks by the reverse direction and puts
+        // them back in order when it answers.
+        let bottom = matches!(self.kind, Kind::Bottom | Kind::BottomN);
         State {
             kind: self.kind,
             // `$top` and `$bottom` keep one row.
             limit: matches!(self.kind, Kind::Top | Kind::Bottom).then_some(1),
+            seq: 0,
+            dirs: self.sort.iter().map(|k| k.descending != bottom).collect(),
             body,
         }
     }
 
-    /// `n`, read the first time a document arrives and checked against the cap.
-    fn resolve(&self, scope: &Scope<'_>, limits: &Limits) -> Result<usize> {
-        let n = match &self.n {
-            Some(expr) => read_n(self.op(), &expr.eval_in(scope)?)?,
-            None => 1,
-        };
-        if n > limits.max_documents {
-            return Err(Error::Limit(format!(
-                "{}: n = {n} is over the pipeline limit of {} documents held per group. Use a \
-                 smaller n, or narrow the pipeline with an earlier $match",
-                self.op(),
-                limits.max_documents
-            )));
+    /// `n`, read the first time a document arrives.
+    fn resolve(&self, scope: &Scope<'_>) -> Result<usize> {
+        match &self.n {
+            Some(expr) => read_n(self.op(), &expr.eval_in(scope)?),
+            None => Ok(1),
         }
-        Ok(n)
     }
 }
 
@@ -254,6 +265,10 @@ impl Spec {
 pub struct State {
     kind: Kind,
     limit: Option<usize>,
+    /// Arrivals so far, the tie-break among rows that rank equal.
+    seq: u64,
+    /// Per sort key, whether a row ranks by the reverse of the key's order.
+    dirs: Arc<[bool]>,
     body: Body,
 }
 
@@ -261,9 +276,12 @@ pub struct State {
 enum Body {
     Welford(Welford),
     Count(u64),
-    /// Rows in rank order (sort key, then arrival).
-    Ranked(Vec<Row>),
-    /// `$firstN`/`$lastN` in arrival order; `$maxN`/`$minN` in rank order, best first.
+    /// `$top*` and `$bottom*`: the best `n` rows by rank, the worst at the top of
+    /// the heap.
+    Ranked(BinaryHeap<Row>),
+    /// `$maxN` and `$minN`: the best `n` values, the worst at the top of the heap.
+    Best(BinaryHeap<Best>),
+    /// `$firstN` and `$lastN`, in arrival order.
     Values(VecDeque<Bson>),
 }
 
@@ -271,6 +289,67 @@ enum Body {
 struct Row {
     keys: Vec<Bson>,
     output: Bson,
+    seq: u64,
+    dirs: Arc<[bool]>,
+}
+
+impl Row {
+    /// Rank order, best first: key by key, then arrival. `flip` reads every
+    /// direction the other way round.
+    fn cmp_rank(&self, other: &Self, flip: bool) -> Ordering {
+        for (i, (a, b)) in self.keys.iter().zip(&other.keys).enumerate() {
+            let o = key_cmp(a, b);
+            let o = if self.dirs.get(i).is_some_and(|d| *d != flip) { o.reverse() } else { o };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        self.seq.cmp(&other.seq)
+    }
+}
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp_rank(other, false) == Ordering::Equal
+    }
+}
+impl Eq for Row {}
+impl PartialOrd for Row {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Row {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cmp_rank(other, false)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Best {
+    value: Bson,
+    seq: u64,
+    /// `$maxN`: the larger value ranks first.
+    max: bool,
+}
+
+impl PartialEq for Best {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Best {}
+impl PartialOrd for Best {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Best {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let o = canonical_cmp(&self.value, &other.value);
+        let o = if self.max { o.reverse() } else { o };
+        o.then_with(|| self.seq.cmp(&other.seq))
+    }
 }
 
 /// Running mean and sum of squared deviations, updated one value at a time
@@ -303,6 +382,14 @@ impl Welford {
             self.m2 = 0.0;
         }
     }
+
+    fn finish(&self, sample: bool) -> Bson {
+        match (self.n, sample) {
+            (0, _) | (1, true) => Bson::Null,
+            (n, true) => Bson::Double((self.m2 / (n - 1) as f64).sqrt()),
+            (n, false) => Bson::Double((self.m2 / n as f64).sqrt()),
+        }
+    }
 }
 
 /// A numeric operand as a double; anything else is not counted. A `Decimal128`
@@ -318,45 +405,88 @@ fn numeric(value: &Bson) -> Option<f64> {
     }
 }
 
-/// The value a document sorts by at `path`, for a key of the given direction.
-/// A path that meets an array sorts by the array's smallest element ascending
-/// and its largest descending, as the reference's sort does.
-fn sort_value(doc: &Document, path: &str, descending: bool) -> Bson {
-    let values = path::resolve(doc, path);
-    if values.is_empty() {
-        return Bson::Null;
+/// The standard deviation of the numbers among `values`, as `$stdDevPop` /
+/// `$stdDevSamp` answer it for a group; the array form of the operators uses it.
+pub(crate) fn std_dev_of<'a>(values: impl IntoIterator<Item = &'a Bson>, sample: bool) -> Bson {
+    let mut w = Welford::default();
+    for x in values.into_iter().filter_map(numeric) {
+        w.add(x);
     }
-    let mut candidates: Vec<&Bson> = Vec::new();
-    for value in &values {
-        match value {
-            Bson::Array(items) if !items.is_empty() => candidates.extend(items.iter()),
-            other => candidates.push(other),
-        }
-    }
-    let pick = |a: &&Bson, b: &&Bson| canonical_cmp(a, b);
-    let best = if descending {
-        candidates.into_iter().max_by(pick)
-    } else {
-        candidates.into_iter().min_by(pick)
+    w.finish(sample)
+}
+
+/// `$firstN`, `$lastN`, `$maxN` or `$minN` over the items of an array, as the
+/// array form of the operators answers it.
+pub(crate) fn n_of_array(kind: Kind, items: &[Bson], n: usize) -> Bson {
+    let body = match kind {
+        Kind::MaxN | Kind::MinN => Body::Best(BinaryHeap::new()),
+        _ => Body::Values(VecDeque::new()),
     };
-    best.cloned().unwrap_or(Bson::Null)
+    let mut state = State { kind, limit: Some(n), seq: 0, dirs: Arc::from([]), body };
+    for item in items {
+        state.take(item.clone());
+    }
+    state.finish()
+}
+
+/// The value of `path` in `doc` as the reference's field path reads it: through
+/// a document by key, through an array by collecting what each document in it
+/// holds (the array of them, empty when none holds the path). A missing path is
+/// `None`.
+fn whole_value(doc: &Document, segs: &[&str]) -> Option<Bson> {
+    let (head, rest) = segs.split_first()?;
+    in_value(doc.get(*head)?, rest)
+}
+
+fn in_value(value: &Bson, segs: &[&str]) -> Option<Bson> {
+    if segs.is_empty() {
+        return Some(value.clone());
+    }
+    match value {
+        Bson::Document(d) => whole_value(d, segs),
+        Bson::Array(items) => Some(Bson::Array(
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    Bson::Document(d) => whole_value(d, segs),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+/// The value a document sorts by at `path`: the whole value, compared in the
+/// canonical order (an array element by element, after strings). A missing path
+/// is `null`.
+fn sort_key(doc: &Document, path: &str) -> Bson {
+    whole_value(doc, &path::segments(path)).unwrap_or(Bson::Null)
+}
+
+/// The canonical order, except that an empty array sorts below `null` (and above
+/// `MinKey`), as the reference orders sort keys.
+fn key_cmp(a: &Bson, b: &Bson) -> Ordering {
+    let empty = |v: &Bson| matches!(v, Bson::Array(items) if items.is_empty());
+    match (empty(a), empty(b)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if matches!(b, Bson::MinKey) {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, true) => key_cmp(b, a).reverse(),
+        (false, false) => canonical_cmp(a, b),
+    }
 }
 
 impl State {
-    /// Rows held, which the caller charges to the stage's cap.
-    pub fn held(&self) -> usize {
-        match &self.body {
-            Body::Ranked(rows) => rows.len(),
-            Body::Values(rows) => rows.len(),
-            _ => 0,
-        }
-    }
-
-    /// Take one document. Returns how many rows the state grew by.
-    pub fn accumulate(&mut self, spec: &Spec, scope: &Scope<'_>, limits: &Limits) -> Result<usize> {
-        let before = self.held();
+    /// Take one document.
+    pub fn accumulate(&mut self, spec: &Spec, scope: &Scope<'_>) -> Result<()> {
         if self.limit.is_none() && self.needs_limit() {
-            self.limit = Some(spec.resolve(scope, limits)?);
+            self.limit = Some(spec.resolve(scope)?);
         }
         let limit = self.limit.unwrap_or(usize::MAX);
         match &mut self.body {
@@ -367,62 +497,51 @@ impl State {
             }
             Body::Count(n) => *n += 1,
             Body::Ranked(rows) => {
-                let bottom = matches!(self.kind, Kind::Bottom | Kind::BottomN);
-                let keys: Vec<Bson> = spec
-                    .sort
-                    .iter()
-                    .map(|k| sort_value(scope.root(), &k.path, k.descending))
-                    .collect();
+                let keys: Vec<Bson> =
+                    spec.sort.iter().map(|k| sort_key(scope.root(), &k.path)).collect();
                 // Evaluate before deciding, so a failing `output` fails the
                 // request whether or not the row would have been kept.
                 let output = spec.value.eval_in(scope)?;
-                // After every row that ranks equal or earlier: arrival breaks ties.
-                let at = rows.partition_point(|r| {
-                    shape::compare_keys(&spec.sort, &r.keys, &keys) != Ordering::Greater
-                });
-                rows.insert(at, Row { keys, output });
+                rows.push(Row { keys, output, seq: self.seq, dirs: Arc::clone(&self.dirs) });
+                self.seq += 1;
                 if rows.len() > limit {
-                    if bottom {
-                        rows.remove(0);
-                    } else {
-                        rows.pop();
-                    }
+                    rows.pop();
                 }
             }
-            Body::Values(values) => {
+            Body::Best(_) | Body::Values(_) => {
                 let value = spec.value.eval_in(scope)?;
-                match self.kind {
-                    Kind::FirstN => {
-                        if values.len() < limit {
-                            values.push_back(value);
-                        }
-                    }
-                    Kind::LastN => {
-                        values.push_back(value);
-                        if values.len() > limit {
-                            values.pop_front();
-                        }
-                    }
-                    kind => {
-                        // `$maxN` and `$minN` skip null and missing.
-                        if !matches!(value, Bson::Null) {
-                            let max = kind == Kind::MaxN;
-                            // Best first; after equals, so the earlier of two equal
-                            // values stays.
-                            let at = values.partition_point(|v| {
-                                let o = canonical_cmp(v, &value);
-                                if max { o != Ordering::Less } else { o != Ordering::Greater }
-                            });
-                            values.insert(at, value);
-                            if values.len() > limit {
-                                values.pop_back();
-                            }
-                        }
-                    }
-                }
+                self.take(value);
             }
         }
-        Ok(self.held().saturating_sub(before))
+        Ok(())
+    }
+
+    /// Take one value into a `$firstN`, `$lastN`, `$maxN` or `$minN`.
+    fn take(&mut self, value: Bson) {
+        let limit = self.limit.unwrap_or(usize::MAX);
+        match &mut self.body {
+            Body::Values(values) => {
+                if self.kind == Kind::FirstN {
+                    if values.len() < limit {
+                        values.push_back(value);
+                    }
+                } else {
+                    values.push_back(value);
+                    if values.len() > limit {
+                        values.pop_front();
+                    }
+                }
+            }
+            // `$maxN` and `$minN` skip null and missing.
+            Body::Best(heap) if !matches!(value, Bson::Null | Bson::Undefined) => {
+                heap.push(Best { value, seq: self.seq, max: self.kind == Kind::MaxN });
+                self.seq += 1;
+                if heap.len() > limit {
+                    heap.pop();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn needs_limit(&self) -> bool {
@@ -455,25 +574,27 @@ impl State {
     /// The group's answer.
     pub fn finish(self) -> Bson {
         let single = matches!(self.kind, Kind::Top | Kind::Bottom);
+        let bottom = matches!(self.kind, Kind::Bottom | Kind::BottomN);
         match self.body {
-            Body::Welford(w) => {
-                let sample = self.kind == Kind::StdDevSamp;
-                match (w.n, sample) {
-                    (0, _) | (1, true) => Bson::Null,
-                    (n, true) => Bson::Double((w.m2 / (n - 1) as f64).sqrt()),
-                    (n, false) => Bson::Double((w.m2 / n as f64).sqrt()),
-                }
-            }
+            Body::Welford(w) => w.finish(self.kind == Kind::StdDevSamp),
             Body::Count(n) => match i32::try_from(n) {
                 Ok(n) => Bson::Int32(n),
                 Err(_) => Bson::Int64(i64::try_from(n).unwrap_or(i64::MAX)),
             },
             Body::Ranked(rows) => {
+                // `$bottom*` ranked by the reverse order to choose its rows and
+                // answers them in the order asked for; equal rows stay in arrival
+                // order either way.
+                let mut rows = rows.into_vec();
+                rows.sort_by(|a, b| a.cmp_rank(b, bottom));
                 if single {
                     rows.into_iter().next().map_or(Bson::Null, |r| r.output)
                 } else {
                     Bson::Array(rows.into_iter().map(|r| r.output).collect())
                 }
+            }
+            Body::Best(heap) => {
+                Bson::Array(heap.into_sorted_vec().into_iter().map(|b| b.value).collect())
             }
             Body::Values(values) => Bson::Array(values.into_iter().collect()),
         }

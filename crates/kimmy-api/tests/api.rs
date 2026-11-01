@@ -18440,9 +18440,11 @@ async fn a_written_document_over_the_size_cap_fails_its_chunk() {
     sink_seed(&server, &token, "src", (1..=4).map(|i| json!({"_id": i})).collect()).await;
     server.state.engine.set_multi_chunk_docs(2);
     // The documents are built in the pipeline: one per `_id`, the fourth too big
-    // to store, though none is big enough to be refused as a pipeline result.
+    // to store, though none is big enough to be refused as a pipeline result. No
+    // expression builds a string of 16 MiB, so the fourth holds two of 8 MiB, which
+    // together pass the document cap.
     let big = json!({"$reduce": {
-        "input": {"$range": [0, 22]},
+        "input": {"$range": [0, 20]},
         "initialValue": "xxxxxxxx",
         "in": {"$concat": ["$$value", "$$value"]},
     }});
@@ -18452,7 +18454,10 @@ async fn a_written_document_over_the_size_cap_fails_its_chunk() {
         "src",
         json!([
             {"$sort": {"_id": 1}},
-            {"$addFields": {"pad": {"$cond": [{"$eq": ["$_id", 4]}, big, "ok"]}}},
+            {"$addFields": {
+                "pad": {"$cond": [{"$eq": ["$_id", 4]}, big.clone(), "ok"]},
+                "pad2": {"$cond": [{"$eq": ["$_id", 4]}, big, "ok"]},
+            }},
             {"$merge": {"into": "t"}},
         ]),
     )

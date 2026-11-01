@@ -51,6 +51,14 @@ curl -XDELETE localhost:7878/v1/db/shop/coll/orders/validator -H "$A"
   parser's message and changes nothing. A schema holds at most 32 `pattern`s and
   2 MiB of compiled pattern; see [Query Language](query-language.md) for the
   keywords.
+- **`pattern` reads `\d`, `\w` and `\s` as ASCII** (from 0.59.0; they were Unicode
+  classes before), as the reference does: `^\w+$` refuses `é`, and `^\d{3}$`
+  refuses Arabic-Indic digits. A validator that is already set is not changed,
+  and a document already stored is not checked again; the writes it judges from
+  then on are judged by the new reading, and the
+  [violations listing](#finding-the-documents-that-fail-it), which tests the stored
+  documents when asked, lists the ones a pattern now rejects. See [regex
+  compatibility](query-language.md#regex-compatibility).
 - `PUT` replaces all three fields: a body naming no `validationAction` sets the
   default, not the one before. `PUT` needs `validator`; removing one is `DELETE`.
   Both need `ddl` on the collection. A collection that is not there is `404`.

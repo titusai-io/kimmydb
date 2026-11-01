@@ -82,6 +82,20 @@ pub enum Error {
     #[error("the {what} is {bytes} bytes, over the {max} byte limit of one document; {remedy}")]
     AnswerTooLarge { what: &'static str, bytes: usize, max: usize, remedy: &'static str },
 
+    /// A string or an array an expression would build, of `bytes` bytes, is over
+    /// the `max` an expression may build, and is refused rather than built. `what`
+    /// names the value ("the string `$concat` builds"), `limit` the limit it hit
+    /// ("16 MiB string limit") and `remedy` how to ask for less. Answered `413`,
+    /// as the other size caps are.
+    #[error("{what} is {bytes} bytes, over the {limit}; {remedy}")]
+    ValueTooLarge {
+        what: &'static str,
+        bytes: usize,
+        max: usize,
+        limit: &'static str,
+        remedy: &'static str,
+    },
+
     /// A client write names an `_id` of `bytes` bytes, over the `max` an `_id`
     /// may have (ADR-250). `kind` says which sort of id; the id itself is not
     /// repeated.
@@ -182,6 +196,7 @@ impl Error {
             | Error::DocumentTooLarge { .. }
             | Error::DocumentInvalid { .. }
             | Error::AnswerTooLarge { .. }
+            | Error::ValueTooLarge { .. }
             | Error::IdTooLarge { .. }
             | Error::ResumeTokenExpired
             | Error::MalformedResumeToken
@@ -237,6 +252,7 @@ impl Error {
             | Error::DocumentTooLarge { .. }
             | Error::DocumentInvalid { .. }
             | Error::AnswerTooLarge { .. }
+            | Error::ValueTooLarge { .. }
             | Error::IdTooLarge { .. }
             | Error::UnsupportedOperator { .. }
             | Error::ResumeTokenExpired

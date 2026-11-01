@@ -9,6 +9,7 @@ use kimmy_core::{
 };
 
 use crate::merge::{SinkMode, WhenMatched};
+use crate::validator::check_validator_spec;
 use crate::{Candidates, Engine, ModifySpec, StorageError};
 
 fn open() -> (Engine, tempfile::TempDir) {
@@ -130,6 +131,47 @@ fn a_schema_that_does_not_parse_is_refused_when_it_is_set() {
     let err = e.set_validator("shop", "c", Some(bad)).unwrap_err();
     assert!(matches!(err, StorageError::Core(CoreError::InvalidQuery(_))), "{err:?}");
     assert_eq!(e.get_collection("shop", "c").unwrap().validator, None);
+}
+
+fn possessive() -> ValidatorSpec {
+    plain(doc! { "properties": { "v": { "pattern": "^a*+a$" } } })
+}
+
+#[test]
+fn a_possessive_quantifier_is_refused_when_a_validator_is_set_or_created() {
+    let (e, _d) = open();
+    e.create_collection("shop", "c").unwrap();
+    // The metadata call, on the accepting member.
+    let err = e.set_validator("shop", "c", Some(possessive())).unwrap_err();
+    let StorageError::Core(CoreError::InvalidQuery(why)) = &err else { panic!("{err:?}") };
+    assert!(why.contains("possessive quantifiers") && why.contains("\"pattern\""), "{why}");
+    assert_eq!(e.get_collection("shop", "c").unwrap().validator, None);
+    // And at creation, which leaves nothing behind.
+    let err = e.create_collection_with_validator("shop", "d", possessive()).unwrap_err();
+    assert!(matches!(err, StorageError::Core(CoreError::InvalidQuery(_))), "{err:?}");
+    assert!(matches!(
+        e.get_collection("shop", "d"),
+        Err(StorageError::Core(CoreError::CollectionNotFound { .. }))
+    ));
+    assert!(check_validator_spec(&possessive()).is_err());
+    // A plain `+` over a group is not one.
+    let grouped = plain(doc! { "properties": { "v": { "pattern": "^(?:a*)+a$" } } });
+    e.set_validator("shop", "c", Some(grouped)).unwrap();
+}
+
+#[test]
+fn a_stored_validator_with_a_possessive_quantifier_still_loads() {
+    let (e, _d) = open();
+    let c = collection(&e, strict_error());
+    // Written by a build that accepted it, and set past the parse a client's change
+    // is held to: the collection keeps its validator, with the pattern read as the
+    // nested repetition that build read it as.
+    let mut meta = c.clone();
+    meta.validator = Some(possessive());
+    e.insert(&meta, doc! { "_id": 5i64, "v": "aa" }).expect("matches ^a*+a$ as ^(?:a*)+a$");
+    let err = e.insert(&meta, doc! { "_id": 6i64, "v": "b" }).unwrap_err();
+    assert!(matches!(err, StorageError::Core(CoreError::DocumentInvalid { .. })), "{err:?}");
+    assert_eq!(e.validators_unparseable(), 0, "it parsed; it was not skipped");
 }
 
 #[test]
