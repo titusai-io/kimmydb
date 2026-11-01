@@ -326,15 +326,15 @@ systems use.
 
 ---
 
-## 🟡 `$sortArray` reads a sort-document path through an array by its smallest element, and `$zip` refuses an empty `inputs` and a result over a million values
+## 🟡 `$zip` refuses an empty `inputs` and a result over a million values
 
-**Raised 2026-10-28, with ADR-255.** `$sortArray` with a sort document orders by the `$sort` stage's own rule, so a key path that passes through an array in an element gives that element the **smallest** value the path reaches, in either direction. MongoDB takes the largest for a descending key. An element that is not a document, or lacks the key, sorts as null, lowest. `{$zip: {inputs: []}}` is a `400` here; MongoDB answers `[]`. A `$zip` whose result would hold more than 1,000,000 values (rows times inputs) is a `400` naming the limit, counted before anything is built.
+**Raised 2026-10-28, with ADR-255.** `{$zip: {inputs: []}}` is a `400` here; the reference answers `[]`. A `$zip` whose result would hold more than 1,000,000 values (rows times inputs) is a `400` naming the limit, counted before anything is built. (This entry also held `$sortArray`'s and `$sort`'s reading of a descending key through an array by its smallest element; that now takes the largest, as the reference does, since ADR-264.)
 
-**Why.** One order for every sort keeps a port's `$sort` and `$sortArray` agreeing with each other, and the `$sort` difference is already recorded. An empty `inputs` is nearly always a typo for a computed list, which `inputs` does not accept. The limit stops an expression from multiplying the size of the arrays it reads.
+**Why.** An empty `inputs` is nearly always a typo for a computed list, which `inputs` does not accept. The limit stops an expression from multiplying the size of the arrays it reads.
 
-**What it costs.** A port that sorts descending by a path through an array, or zips no arrays, or zips past the limit, gets a different answer or a `400`.
+**What it costs.** A port that zips no arrays, or zips past the limit, gets a `400`.
 
-**What closes it.** Taking the largest for a descending key, in `$sort` and `$sortArray` together. Not planned.
+**What closes it.** Answering `[]` for an empty `inputs`. Not planned.
 
 ---
 

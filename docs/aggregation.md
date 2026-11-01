@@ -578,10 +578,10 @@ numeric or date `field` has a gap of more than `step`. A generated document hold
 
 `{"_id": null}` groups everything into one bucket.
 
-**A missing field is `null` to every accumulator**, not a value they never
-see — a missing field is null everywhere in this language — so what each one
-does with `null` is also what it does with a field half the collection lacks.
-That is where they differ, and the differences are the ones a report gets
+**A missing field is `null` to every accumulator but `$push` and `$addToSet`**,
+which skip it — a missing field is null everywhere else in this language — so
+what each one does with `null` is also what it does with a field half the
+collection lacks. That is where they differ, and the differences are the ones a report gets
 wrong quietly:
 
 | | Over non-numeric values | Over `null` and missing | When nothing was usable |
@@ -590,7 +590,7 @@ wrong quietly:
 | `$avg` | Ignored, in the numerator **and** the count — a field present on half the documents gives the mean of that half, not half the mean. **A group that holds a `Decimal128` is averaged exactly**: the exact sum divided by the count of numeric values, rounded once | Ignored | `null` |
 | `$min` `$max` | **Compared**, across types, in the [canonical order](key-encoding.md#type-ordering) — numbers below strings below documents below arrays below binary below ObjectIds below bools below dates | **Skipped**, both of them | `null` |
 | `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
-| `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them, and `undefined` is that same member | — nothing is unusable |
+| `$push` `$addToSet` | Taken as they are | An explicit `null` is appended (`$addToSet` keeps one of them, and `undefined` is that same member); **a missing field is skipped**, as the reference skips it | — nothing is unusable |
 
 `$first` evaluates its expression for the first document of a group only, and
 `$last` fails only when the last document's value cannot be evaluated: an

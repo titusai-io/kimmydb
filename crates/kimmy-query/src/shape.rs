@@ -58,8 +58,8 @@ pub fn direction_of(direction: &Bson) -> Option<bool> {
 /// what puts absent values at one end rather than in arbitrary positions.
 pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
     for key in keys {
-        let va = sort_value(a, &key.path);
-        let vb = sort_value(b, &key.path);
+        let va = sort_value(a, &key.path, key.descending);
+        let vb = sort_value(b, &key.path, key.descending);
         let ordering = canonical_cmp(&va, &vb);
         if ordering != Ordering::Equal {
             return if key.descending { ordering.reverse() } else { ordering };
@@ -76,7 +76,7 @@ pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
 /// the vector is always as long as `keys` and the two comparisons line up
 /// position for position.
 pub fn sort_keys(keys: &[SortKey], doc: &Document) -> Vec<Bson> {
-    keys.iter().map(|key| sort_value(doc, &key.path)).collect()
+    keys.iter().map(|key| sort_value(doc, &key.path, key.descending)).collect()
 }
 
 /// [`compare`], over values already taken by [`sort_keys`].
@@ -98,14 +98,11 @@ pub fn compare_keys(keys: &[SortKey], a: &[Bson], b: &[Bson]) -> Ordering {
 
 /// The value a document sorts by for one key.
 ///
-/// When a path resolves to several values — because it passes through an array
-/// — the smallest of them is the one the document sorts by, whichever
-/// direction was asked for. Direction is not visible here: [`compare`] applies
-/// `descending` by reversing the comparison of two minima that were already
-/// chosen, so a descending sort orders documents by their smallest element
-/// rather than their largest. Mongo takes the largest for a descending sort,
-/// so the two orderings differ where a sort key passes through an array.
-fn sort_value(doc: &Document, path: &str) -> Bson {
+/// When a path resolves to several values (because it passes through an array) the
+/// document sorts by one of them: the **smallest** for an ascending key and the
+/// **largest** for a descending one, as the reference's sort does. So `{a: [0, 5]}`
+/// sorts before `{a: 3}` ascending (by 0) and before it descending too (by 5).
+fn sort_value(doc: &Document, path: &str, descending: bool) -> Bson {
     let values = path::resolve(doc, path);
     if values.is_empty() {
         return Bson::Null;
@@ -119,7 +116,13 @@ fn sort_value(doc: &Document, path: &str) -> Bson {
             other => candidates.push(other),
         }
     }
-    candidates.into_iter().min_by(|a, b| canonical_cmp(a, b)).cloned().unwrap_or(Bson::Null)
+    let pick = |a: &&Bson, b: &&Bson| canonical_cmp(a, b);
+    let best = if descending {
+        candidates.into_iter().max_by(pick)
+    } else {
+        candidates.into_iter().min_by(pick)
+    };
+    best.cloned().unwrap_or(Bson::Null)
 }
 
 /// Sort documents in place.

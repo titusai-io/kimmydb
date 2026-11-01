@@ -237,6 +237,46 @@ fn a_missing_key_sorts_as_null_and_a_non_document_ties_with_it() {
 }
 
 #[test]
+fn a_descending_key_through_an_array_takes_the_largest_element() {
+    // `[0, 5]` sorts by 0 ascending and by 5 descending; `[1, 2]` by 1 and by 2.
+    let docs = bson!([{ "a": [0, 5] }, { "a": 3 }, { "a": [1, 2] }]);
+    assert_eq!(
+        sorted(docs.clone(), bson!({ "a": 1 })),
+        bson!([{ "a": [0, 5] }, { "a": [1, 2] }, { "a": 3 }])
+    );
+    assert_eq!(
+        sorted(docs, bson!({ "a": -1 })),
+        bson!([{ "a": [0, 5] }, { "a": 3 }, { "a": [1, 2] }])
+    );
+    // Through an array of documents.
+    let items = bson!([{ "i": [{ "q": 9 }, { "q": 1 }] }, { "i": [{ "q": 5 }] }]);
+    assert_eq!(sorted(items.clone(), bson!({ "i.q": -1 })), items);
+    assert_eq!(
+        sorted(items, bson!({ "i.q": 1 })),
+        bson!([{ "i": [{ "q": 9 }, { "q": 1 }] }, { "i": [{ "q": 5 }] }])
+    );
+}
+
+#[test]
+fn the_sort_stage_orders_a_descending_array_key_by_its_largest_element() {
+    let stages = aggregate::parse(&[doc! {"$sort": {"a": -1}}]).unwrap();
+    let input = vec![
+        doc! {"_id": 1, "a": [1, 100]},
+        doc! {"_id": 2, "a": [2, 3]},
+        doc! {"_id": 3, "a": 50},
+    ];
+    let out = aggregate::apply(&stages[0], input.clone(), &Limits::default()).unwrap();
+    let ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+    // 100, 50, 3.
+    assert_eq!(ids, vec![1, 3, 2]);
+    let stages = aggregate::parse(&[doc! {"$sort": {"a": 1}}]).unwrap();
+    let out = aggregate::apply(&stages[0], input, &Limits::default()).unwrap();
+    let ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+    // 1, 2, 50.
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[test]
 fn a_number_over_documents_compares_whole_documents() {
     let docs = bson!([{ "b": 1 }, { "a": 2 }, { "a": 1, "b": 0 }, { "a": 1 }]);
     // Field by field in order, as the total order compares documents.

@@ -2342,11 +2342,7 @@ pub(crate) fn init((_, acc): &(String, Accumulator)) -> AccState {
 }
 
 /// Feed one document to one accumulator.
-pub(crate) fn accumulate(
-    state: &mut AccState,
-    acc: &Accumulator,
-    scope: &Scope<'_>,
-) -> Result<()> {
+pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     match (state, acc) {
         (AccState::Ext(state), Accumulator::Ext(spec)) => state.accumulate(spec, scope)?,
         (AccState::Sum(total), Accumulator::Sum(e)) => {
@@ -2379,13 +2375,20 @@ pub(crate) fn accumulate(
             Err(err) if !err.is_deferrable() => return Err(err),
             value => *current = Some(value),
         },
-        (AccState::Push(items), Accumulator::Push(e)) => items.push(e.eval_in(scope)?),
-        (AccState::AddToSet(items, keys), Accumulator::AddToSet(e)) => {
-            let v = e.eval_in(scope)?;
-            // A member is identified the way `$group` identifies a bucket, and
-            // the first occurrence stays (ADR-186).
-            if keys.insert(group_key(&v)) {
+        // A missing value is skipped, as the reference skips it; an explicit `null` is
+        // a value (ADR-264).
+        (AccState::Push(items), Accumulator::Push(e)) => {
+            if let Some(v) = e.eval_present(scope)? {
                 items.push(v);
+            }
+        }
+        (AccState::AddToSet(items, keys), Accumulator::AddToSet(e)) => {
+            if let Some(v) = e.eval_present(scope)? {
+                // A member is identified the way `$group` identifies a bucket, and
+                // the first occurrence stays (ADR-186).
+                if keys.insert(group_key(&v)) {
+                    items.push(v);
+                }
             }
         }
         (AccState::MergeObjects(merged), Accumulator::MergeObjects(e)) => {
@@ -2592,6 +2595,31 @@ mod tests {
         )
         .unwrap();
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn push_and_add_to_set_skip_a_missing_value_and_keep_an_explicit_null() {
+        let input = docs(vec![
+            doc! { "a": 1 },
+            doc! {},
+            doc! { "a": Bson::Null },
+            doc! { "a": 1 },
+            doc! { "x": { "y": 2 } },
+        ]);
+        let out = run(
+            vec![doc! {"$group": {"_id": null,
+            "p": {"$push": "$a"}, "s": {"$addToSet": "$a"},
+            "n": {"$push": "$x.y"}, "r": {"$push": "$$REMOVE"}}}],
+            input,
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].get_array("p").unwrap(),
+            &vec![Bson::Int32(1), Bson::Null, Bson::Int32(1)]
+        );
+        assert_eq!(out[0].get_array("s").unwrap(), &vec![Bson::Int32(1), Bson::Null]);
+        assert_eq!(out[0].get_array("n").unwrap(), &vec![Bson::Int32(2)]);
+        assert!(out[0].get_array("r").unwrap().is_empty());
     }
 
     #[test]

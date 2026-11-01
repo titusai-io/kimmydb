@@ -3121,6 +3121,60 @@ async fn a_sort_document_keeps_the_precedence_it_was_written_in() {
     assert_eq!(order(&server, &token, r#"{"b":1,"a":1}"#).await, vec![2, 1]);
 }
 
+/// A descending sort orders a document with an array at the sort path by its largest
+/// element, an ascending one by its smallest, in a full sort and in a bounded one (ADR-264).
+#[tokio::test]
+async fn a_descending_sort_orders_an_array_by_its_largest_element() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for (id, a) in [(1, json!([0, 5])), (2, json!(3)), (3, json!([1, 2]))] {
+        let res =
+            server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "a": a})).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    async fn order(server: &Server, token: &str, body: Value) -> Vec<i64> {
+        let res = server.post("/v1/db/shop/coll/c/find", Some(token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    }
+    // Ascending by 0, 1, 3; descending by 5, 3, 2.
+    assert_eq!(order(&server, &token, json!({"sort": {"a": 1}})).await, vec![1, 3, 2]);
+    assert_eq!(order(&server, &token, json!({"sort": {"a": -1}})).await, vec![1, 2, 3]);
+    // A bounded window agrees with the full sort.
+    assert_eq!(order(&server, &token, json!({"sort": {"a": -1}, "limit": 2})).await, vec![1, 2]);
+    assert_eq!(
+        order(&server, &token, json!({"sort": {"a": -1}, "skip": 1, "limit": 2})).await,
+        vec![2, 3]
+    );
+    // The pipeline's `$sort` and a `$push` followed by `$sortArray` agree.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$sort": {"a": -1}}, {"$project": {"_id": 1}}]}),
+        )
+        .await;
+    assert_eq!(
+        res.body["documents"],
+        json!([{"_id": 1}, {"_id": 2}, {"_id": 3}]),
+        "{:?}",
+        res.body
+    );
+    let res = server
+        .post("/v1/db/shop/coll/c/aggregate", Some(&token), json!({"pipeline": [
+            {"$group": {"_id": null, "all": {"$push": {"id": "$_id", "a": "$a"}}}},
+            {"$project": {"_id": 0, "ids": {"$map": {"input": {"$sortArray": {"input": "$all", "sortBy": {"a": -1}}}, "as": "d", "in": "$$d.id"}}}}
+        ]}))
+        .await;
+    assert_eq!(res.body["documents"], json!([{"ids": [1, 2, 3]}]), "{:?}", res.body);
+}
+
 /// A stored document's fields come back in the order they were written, as
 /// BSON keeps them and MongoDB returns them. The test client parses the body
 /// into a `serde_json::Value`, which since ADR-120 keeps the text's key order,

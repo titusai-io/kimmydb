@@ -1701,6 +1701,17 @@ impl Expr {
         }
     }
 
+    /// The value of the expression, or `None` when there is none: a field path that is
+    /// not in the document, `$$REMOVE`, or a `$cond`, `$switch` or `$let` that chooses one.
+    /// An explicit `null` is a value. This is how `$push`, `$addToSet`, `$first`, `$last`
+    /// and `$shift` tell a missing field from a null one.
+    pub fn eval_present(&self, scope: &Scope<'_>) -> Result<Option<Bson>> {
+        match self {
+            Expr::Field(p) => Ok(field_path(scope.root, p)),
+            other => other.eval_field(scope),
+        }
+    }
+
     /// Resolve in a scope that may already bind variables.
     pub fn eval_in(&self, scope: &Scope<'_>) -> Result<Bson> {
         match self {
