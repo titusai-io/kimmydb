@@ -875,3 +875,29 @@ fn the_count_over_all_gaps_and_partitions_is_decided_before_any_document_is_gene
         densify::apply(&spec, input, &Limits { max_documents: 7, ..capped(held + 1) }).unwrap_err();
     assert!(matches!(err, Error::Limit(_)), "{err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Integer widths (ADR-268): the reference's recorded answers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_densified_value_is_a_long_or_a_double_by_its_step_and_keeps_the_field_otherwise() {
+    let field = |values: Vec<Bson>, step: Bson| -> Vec<Bson> {
+        let input: Vec<Document> = values.into_iter().map(|v| doc! {"v": v}).collect();
+        let mut out =
+            run(doc! {"field": "v", "range": {"step": step, "bounds": "full"}}, input).unwrap();
+        out.sort_by(|a, b| {
+            let key = |d: &Document| match d.get("v") {
+                Some(Bson::Int32(n)) => i64::from(*n),
+                Some(Bson::Int64(n)) => *n,
+                _ => 0,
+            };
+            key(a).cmp(&key(b))
+        });
+        out.iter().map(|d| d.get("v").cloned().unwrap()).collect()
+    };
+    let (i, l) = (Bson::Int32, Bson::Int64);
+    assert_eq!(field(vec![i(1), i(3)], i(1)), vec![i(1), i(2), i(3)]);
+    assert_eq!(field(vec![i(1), i(3)], l(1)), vec![i(1), l(2), i(3)]);
+    assert_eq!(field(vec![l(1), l(3)], i(1)), vec![l(1), l(2), l(3)]);
+}

@@ -28,6 +28,7 @@ Status meanings:
 - **Integer sums are `Int64`.** `$sum` of integers in a window is a long here, as in `$group`; the reference answers an int that fits.
 - **`$addToSet` answers in the order its members first appear in the window.** The reference answers in sorted order once the window has dropped a document (and in the order of appearance before that); the order is unspecified in both.
 - **`$densify` after a `"full"` range** ends each partition's grid in ascending order of the partition values; the reference ends in a hash order. The generated count is held to the pipeline's 100,000 documents in all, with the input, where the reference holds the generated documents to 500,000; the bytes are held to the request's 256 MiB budget (`413`), where the reference has its own memory limit.
+- **A sliding window `$sum` is typed by what the window holds now, not by its history** (ADR-268). The reference's `RemovableSum` remembers: `$sum` of the longs `[LMAX, 1, 2]` over `[-1, 0]` is the long `LMAX`, then a **double** `9223372036854775808.0`, then the int `3`, so integer inputs can turn into a double and an int. Here the third window holds the longs `1` and `2` and the answer is the long `3`; any long in the window makes a long, any double a double, ints alone the narrowest width that holds the total, and a total past `Int64` is a double. A cumulative or whole-partition window is typed as a `$group` sum is, as the reference types it.
 - **The byte budget.** `$setWindowFields`, `$densify` and a `$fill` method hold what they buffer to one budget of 256 MiB for the whole request, shared by the stages of the pipeline and the branches of a `$facet` (a `$facet` keeps its stages' bytes charged until it is done), refused `413` as the total passes it. The reference spills to disk.
 - **Strictness.** A `documents` bound, a `$shift` `by` and a `range` bound with a `unit` must be whole numbers that fit 32 bits, as in the reference; a `range` bound of a date `unit` is refused for a fraction.
 
@@ -124,7 +125,7 @@ Also recorded here, so they are not read as bugs:
 
 ---
 
-## 🟡 Pipeline updates: an upsert may not give the inserted document an `_id`, and the expression layer's integer width
+## 🟡 Pipeline updates: an upsert may not give the inserted document an `_id`
 
 **Raised 2026-10-31, with ADR-265; revised 2026-11-01 after the reference's answers.** An `update` that is an array of stages is built ([query-language.md](query-language.md#pipeline-updates)). Where it differs from the reference:
 
@@ -135,7 +136,7 @@ Also recorded here, so they are not read as bugs:
 - **The result is stored whole.** A pipeline that leaves the document byte-equal (including key order and number types) is a no-op; one that changes a number's type (`1` to `1.0`) is a change, as for operators.
 - **An `_id` refusal is raised when the update runs** (the result is known only then), with the other write-time refusals, not when the body is parsed.
 
-**To close:** none planned beyond the integer width.
+**To close:** none planned.
 
 ---
 
@@ -329,13 +330,12 @@ differ from other systems' versions of the same names:
   is `2.67499999999999982…`, and `{$round: [0.125, 2]}` is `0.12`. A system that
   rounds a double through its shortest text answers `2.68` for the first. The
   rule is ADR-252's for a double meeting a decimal: its value is the exact one.
-- **An integer result keeps the reference's width** (ADR-268): `$abs`, `$ceil`,
-  `$floor`, `$round` and `$trunc` of an `Int32` are an `Int32` (`$abs` of the
-  smallest `Int32` is an `Int64`), `$pow` of two `Int32`s is an `Int32` while it
-  fits. A result past `Int64` (`$pow: [2, 63]`, `$abs` of the
-  smallest `Int64`, `$round` rounding up past it) is a double. The reference
-  refuses `$abs` of the smallest `Int64` (`28680`); here it is a double, as an
-  overflowing `$add` is.
+- **`$round` of an `Int32` at the bottom of the range is the correct long.**
+  `{$round: [-2147483648, -1]}` is the long `-2147483650` here; the reference
+  answers the int `2147483646`, a `static_cast` wrap that checks only the top of
+  the range (ADR-268). The widths of every other integer result are the
+  reference's, and `$abs` of the smallest `Int64`, `$round` of an `Int64` rounded
+  up past `Int64` and a `$range` bound past `Int32` are `400`, as there.
 - **A negative base to a power that is not a whole number is `400`**, where a
   math library answers `NaN`. So are `$sqrt` of a negative number and `$ln` and
   `$log10` of zero or less; a `NaN` argument gives `NaN`, and the refusal is for
@@ -990,7 +990,7 @@ not get it. A pipeline that wants the error tests for the bad value instead,
 for example `{"$match": {"$expr": {"$eq": [{"$isArray": "$tags"}, false]}}}`
 finds the documents whose `tags` is not an array, a missing one included.
 
-**Three smaller divergences, same entry.** `$arrayElemAt` out of range and
+**Two smaller divergences, same entry.** `$arrayElemAt` out of range and
 `$first`/`$last` on an empty array are **null** rather than MongoDB's *missing*
 — an expression here always yields a value, and a projected field is therefore
 present with null rather than absent. And `$filter`, `$map`, `$reduce` and `$let`
@@ -1015,9 +1015,10 @@ someone needs it.
 
 **`$range` and the other integer results** are the reference's widths since
 ADR-268 (0.59.0): `$range`'s elements, `$size` and `$indexOfArray` are `Int32`,
-where they were `Int64` (the earlier ruling that kept `$range`'s `Int64` is
-superseded; nothing here differs from the reference any more). Nothing is
-migrated: a stored value keeps its own type.
+where they were `Int64`, and a `$range` bound or step past `Int32` is a `400`, as
+there (the earlier ruling that kept `$range`'s `Int64` is superseded; nothing here
+differs from the reference any more). Nothing is migrated: a stored value keeps its
+own type.
 
 **Missing is null in an expression.** `{$addFields: {head: {$first:
 "$lines"}}}` over a document whose `lines` is `[]` writes `head: null`, where

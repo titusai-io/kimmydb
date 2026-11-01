@@ -416,3 +416,13 @@ fn the_stage_runs_inside_a_facet() {
     assert_eq!(fill[0].name(), "$fill");
     assert!(!fill[0].needs_storage());
 }
+
+#[test]
+fn a_filled_long_value_stays_a_long() {
+    let out = run(
+        doc! {"output": {"v": {"value": Bson::Int64(5)}}},
+        vec![doc! {"_id": 1, "v": Bson::Null}],
+    )
+    .unwrap();
+    assert_eq!(out[0].get("v"), Some(&Bson::Int64(5)));
+}

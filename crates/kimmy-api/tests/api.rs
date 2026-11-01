@@ -14550,6 +14550,11 @@ async fn an_integer_result_has_the_references_width_through_the_aggregate_route(
             "add": { "$type": { "$add": ["$a", 1] } },
             "overflow": { "$type": { "$add": ["$big", 1] } },
             "overflow_value": { "$add": ["$big", 1] },
+            "chain": { "$type": { "$add": ["$big", 1, -1] } },
+            "chain_value": { "$add": ["$big", 1, -1] },
+            "lsum": { "$type": { "$add": ["$l", 1, -1] } },
+            "modw": { "$type": { "$mod": ["$a", 2.0] } },
+            "powone": { "$type": { "$pow": [1, -3] } },
             "mixed": { "$type": { "$add": ["$a", "$l"] } },
             "mul": { "$type": { "$multiply": ["$a", 2] } },
             "dbl": { "$type": { "$add": ["$a", 0.5] } },
@@ -14569,6 +14574,10 @@ async fn an_integer_result_has_the_references_width_through_the_aggregate_route(
         ("add", "int"),
         ("overflow", "long"),
         ("mixed", "long"),
+        ("chain", "int"),
+        ("lsum", "long"),
+        ("modw", "int"),
+        ("powone", "int"),
         ("mul", "int"),
         ("dbl", "double"),
         ("mod", "int"),
@@ -14582,6 +14591,7 @@ async fn an_integer_result_has_the_references_width_through_the_aggregate_route(
         assert_eq!(got[field], want, "{field}: {got:?}");
     }
     assert_eq!(got["overflow_value"], 2147483648i64);
+    assert_eq!(got["chain_value"], 2147483647);
 
     // `$sum` is typed by its total, `{$sum: 1}` and `$count` are ints, and `$avg` is a double.
     let res = aggregate(json!([
@@ -14600,7 +14610,7 @@ async fn an_integer_result_has_the_references_width_through_the_aggregate_route(
         ("n", "int"),
         ("t", "int"),
         ("wide", "long"),
-        ("longs", "int"),
+        ("longs", "long"),
         ("avg", "double"),
         ("c", "int"),
     ] {

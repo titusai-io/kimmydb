@@ -386,7 +386,7 @@ fn a_sum_past_the_range_of_a_long_widens_as_a_group_does_and_comes_back() {
     .unwrap();
     assert_eq!(
         col(&out, "s"),
-        vec![Bson::Int64(i64::MAX), Bson::Double(9223372036854775808.0), Bson::Int32(3)]
+        vec![Bson::Int64(i64::MAX), Bson::Double(9223372036854775808.0), Bson::Int64(3)]
     );
 }
 
@@ -440,7 +440,13 @@ fn a_sliding_sum_agrees_with_adding_up_each_window() {
             let window = &vals[s..e];
             assert_eq!(
                 o.get("s"),
-                Some(&crate::expr::integer_bson(window.iter().sum())),
+                // The values are longs: a window of them sums to a long, an empty one to
+                // the int 0.
+                Some(&if window.is_empty() {
+                    Bson::Int32(0)
+                } else {
+                    Bson::Int64(window.iter().sum())
+                }),
                 "[{lo},{hi}] at {i}"
             );
             assert_eq!(
@@ -480,6 +486,50 @@ fn a_sliding_window_over_a_large_partition_is_not_quadratic() {
     assert_eq!(out[0].get("s"), Some(&Bson::Int32(501)));
     assert_eq!(out[30_000].get("s"), Some(&Bson::Int32(1001)));
     assert_eq!(out[n as usize - 1].get("c"), Some(&Bson::Int32(501)));
+}
+
+#[test]
+fn a_sliding_sum_is_typed_by_its_current_contents_and_stays_cheap() {
+    // 100,000 documents and a window of 1,001, a long every 7,000th: a sum is a long
+    // exactly while a long is in its window, and an int otherwise, typed by counts as the
+    // window slides, not by adding the window up again. (The reference types a sliding sum
+    // by its history; see the deviations register.)
+    let n = 100_000;
+    let input: Vec<Document> = (0..n)
+        .map(|i| {
+            let v = if i % 7_000 == 0 { Bson::Int64(1) } else { Bson::Int32(1) };
+            doc! {"_id": i, "v": v}
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "s": {"$sum": "$v", "window": {"documents": [-500, 500]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+    let has_long = |i: usize| {
+        let (lo, hi) = (i.saturating_sub(500), (i + 500).min(n as usize - 1));
+        (lo..=hi).any(|j| j % 7_000 == 0)
+    };
+    for i in [
+        0usize, 499, 500, 501, 3_499, 3_500, 6_499, 6_500, 7_000, 7_500, 7_501, 50_000, 56_000,
+        99_999,
+    ] {
+        let want = if has_long(i) {
+            Bson::Int64(sum_len(i, n as usize))
+        } else {
+            Bson::Int32(sum_len(i, n as usize) as i32)
+        };
+        assert_eq!(out[i].get("s"), Some(&want), "at {i}");
+    }
+}
+
+/// The number of documents in the window `[i - 500, i + 500]` of `n`.
+fn sum_len(i: usize, n: usize) -> i64 {
+    (i.saturating_sub(500)..=(i + 500).min(n - 1)).count() as i64
 }
 
 #[test]
@@ -1905,12 +1955,14 @@ fn sum_avg_and_count_over_mixed_types_as_the_reference_answers() {
     let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
     assert_eq!(
         col(&out, "s"),
+        // The long in rows 3 to 5 makes those windows longs; the reference types a sliding
+        // sum by its history and answers the ints 3, 2, 1 here (deviations register).
         vec![
             Bson::Int32(1),
             Bson::Int32(2),
-            Bson::Int32(3),
-            Bson::Int32(2),
-            Bson::Int32(1),
+            Bson::Int64(3),
+            Bson::Int64(2),
+            Bson::Int64(1),
             Bson::Int32(0),
             Bson::Int32(0),
             dec("2.5"),
@@ -2663,4 +2715,125 @@ fn an_integral_of_values_near_the_largest_slides_exactly_and_in_time() {
     assert_eq!(out[1000].get("i4"), Some(&Bson::Double(f64::INFINITY)));
     assert_eq!(out[99_999].get("i2"), Some(&Bson::Double(1.0)));
     assert_eq!(out[99_999].get("i4"), Some(&Bson::Double(3.0)));
+}
+
+// ---------------------------------------------------------------------------
+// Integer widths (ADR-268): the reference's recorded answers, classic and SBE alike
+// ---------------------------------------------------------------------------
+
+const LMAX: i64 = i64::MAX;
+
+/// The `s` of each document of `values` under `spec`, in `_id` order.
+fn widths(values: Vec<Bson>, spec: Document) -> Vec<Bson> {
+    let input: Vec<Document> =
+        values.into_iter().enumerate().map(|(k, v)| doc! {"_id": k as i32 + 1, "v": v}).collect();
+    let out = run(set(doc! {"sortBy": {"_id": 1}, "output": {"s": spec}}), input).unwrap();
+    col(&out, "s")
+}
+
+fn cumulative() -> Document {
+    doc! {"documents": ["unbounded", "current"]}
+}
+
+#[test]
+fn a_cumulative_or_whole_partition_sum_is_typed_as_a_group_sum_is() {
+    let sum = |window: Option<Document>| match window {
+        Some(w) => doc! {"$sum": "$v", "window": w},
+        None => doc! {"$sum": "$v"},
+    };
+    let (i, l) = (Bson::Int32, Bson::Int64);
+    // Ints only: typed by the total (`1, 3, MAX + 3` is the int 1, the int 3, a long).
+    assert_eq!(
+        widths(vec![i(1), i(2), i(i32::MAX)], sum(Some(cumulative()))),
+        vec![i(1), i(3), l(2_147_483_650)]
+    );
+    // A sum that saw a long stays a long, whatever the total.
+    assert_eq!(widths(vec![l(1), l(2)], sum(Some(cumulative()))), vec![l(1), l(3)]);
+    assert_eq!(widths(vec![i(1), l(2)], sum(Some(cumulative()))), vec![i(1), l(3)]);
+    assert_eq!(widths(vec![i(1), i(2)], sum(None)), vec![i(3), i(3)]);
+    assert_eq!(widths(vec![l(1), l(2)], sum(None)), vec![l(3), l(3)]);
+    // With a double, a double.
+    assert_eq!(
+        widths(vec![i(1), Bson::Double(2.0)], sum(Some(cumulative()))),
+        vec![i(1), Bson::Double(3.0)]
+    );
+    assert_eq!(
+        widths(vec![i(i32::MAX)], doc! {"$sum": {"$add": ["$v", 1, -1]}}),
+        vec![i(i32::MAX)]
+    );
+    assert_eq!(
+        widths(vec![i(5), i(6)], doc! {"$sum": 1, "window": cumulative()}),
+        vec![i(1), i(2)]
+    );
+    assert_eq!(
+        widths(vec![i(5), i(6)], doc! {"$count": {}, "window": cumulative()}),
+        vec![i(1), i(2)]
+    );
+}
+
+#[test]
+fn a_sliding_sum_is_typed_by_what_the_window_holds_now() {
+    // The reference types a sliding sum by its history: `[LMAX, 1, 2]` over `[-1, 0]` is a
+    // long, a DOUBLE, then the int 3. That turns integer inputs into a double, and is not
+    // copied (deviations register): here the third window holds the longs 1 and 2, a long.
+    let (i, l) = (Bson::Int32, Bson::Int64);
+    let slide = doc! {"$sum": "$v", "window": {"documents": [-1, 0]}};
+    assert_eq!(
+        widths(vec![l(LMAX), l(1), l(2)], slide.clone()),
+        vec![l(LMAX), Bson::Double(9_223_372_036_854_775_808.0), l(3)]
+    );
+    // An int window after a long has left is typed by its total again.
+    assert_eq!(widths(vec![l(1), i(2), i(3)], slide.clone()), vec![l(1), l(3), i(5)]);
+    // A double leaving the window leaves ints.
+    assert_eq!(
+        widths(vec![Bson::Double(0.5), i(1), i(2)], slide),
+        vec![Bson::Double(0.5), Bson::Double(1.5), i(3)]
+    );
+}
+
+#[test]
+fn the_other_window_functions_have_the_references_widths() {
+    let (i, l, d) = (Bson::Int32, Bson::Int64, Bson::Double);
+    assert_eq!(
+        widths(vec![i(1), i(2)], doc! {"$avg": "$v", "window": cumulative()}),
+        vec![d(1.0), d(1.5)]
+    );
+    for rank in ["$rank", "$denseRank", "$documentNumber"] {
+        assert_eq!(
+            widths(vec![i(1), i(1), i(2)], doc! {rank: {}})
+                .iter()
+                .all(|v| matches!(v, Bson::Int32(_))),
+            true,
+            "{rank}"
+        );
+    }
+    assert_eq!(
+        widths(vec![l(7), l(8)], doc! {"$shift": {"output": "$v", "by": 1, "default": 0}}),
+        vec![l(8), i(0)]
+    );
+    assert_eq!(
+        widths(vec![l(7), l(8)], doc! {"$min": "$v", "window": cumulative()}),
+        vec![l(7), l(7)]
+    );
+    assert_eq!(
+        widths(vec![i(1), i(2), i(3)], doc! {"$integral": {"input": "$v"}, "window": cumulative()}),
+        vec![i(0), d(1.5), d(4.0)]
+    );
+    assert_eq!(
+        widths(
+            vec![i(1), i(2), i(4)],
+            doc! {"$derivative": {"input": "$v"}, "window": {"documents": [-1, 0]}}
+        ),
+        vec![Bson::Null, d(1.0), d(2.0)]
+    );
+    // Typed only: the last digit of the second value differs from the reference's (it
+    // answers 1.6666666666666667; this build 1.6666666666666665), which is `$expMovingAvg`'s
+    // own business and not a width.
+    let ema = widths(vec![i(1), i(2)], doc! {"$expMovingAvg": {"input": "$v", "N": 2}});
+    assert!(ema.iter().all(|v| matches!(v, Bson::Double(_))), "{ema:?}");
+    assert_eq!(
+        widths(vec![i(1), Bson::Null, i(3)], doc! {"$linearFill": "$v"}),
+        vec![i(1), d(2.0), i(3)]
+    );
+    assert_eq!(widths(vec![l(1), Bson::Null], doc! {"$locf": "$v"}), vec![l(1), l(1)]);
 }

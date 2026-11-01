@@ -263,6 +263,8 @@ impl DoubleSum {
 struct Plain {
     ints: i128,
     n_int: usize,
+    /// How many of the integers held are `Int64`s: a sum over any is a long.
+    n_long: usize,
     doubles: ExactDoubles,
     n_dbl: usize,
     nan: usize,
@@ -288,6 +290,9 @@ impl Plain {
                 });
                 self.ints += if adding { x } else { -x };
                 step(&mut self.n_int);
+                if matches!(v, Bson::Int64(_)) {
+                    step(&mut self.n_long);
+                }
             }
             Bson::Double(d) if d.is_nan() => step(&mut self.nan),
             Bson::Double(d) if *d == f64::INFINITY => step(&mut self.pos_inf),
@@ -420,11 +425,16 @@ impl Slider for SumSlider<'_, '_> {
             if self.avg {
                 p.ints as f64
             } else {
-                // The window sum is typed by its total alone, an `Int32` while it fits,
-                // whatever the width of what was added (the reference's windows.diag
-                // answers: `1L + 2L` is the int 3). The `$group` sum differs on purpose:
-                // it stays a long once a long was added (ADR-268).
+                // The window sum is typed by what the window holds NOW, by counts and
+                // not by a rescan: a long in the window makes a long, otherwise the
+                // narrowest width that holds the exact total (so `[1, 2, MAX]` run up
+                // is the int 1, the int 3, the long 2147483650; the longs `1` and `2`
+                // are the longs 1 and 3). A double is a double, above. The reference's
+                // sliding sum types by its history instead (`[LMAX, 1, 2]` over
+                // `[-1, 0]` is a long, a double, then an int 3), which turns integer
+                // inputs into a double; that quirk is not copied (ADR-268).
                 return Ok(match i64::try_from(p.ints) {
+                    Ok(n) if p.n_long > 0 => Bson::Int64(n),
                     Ok(n) => crate::expr::integer_bson(n),
                     Err(_) => Bson::Double(p.ints as f64),
                 });
