@@ -945,6 +945,27 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.aggregate.memory_limit_refusals",
+            "{request}",
+            "Aggregations refused with 413 because what they held passed aggregate.memory_limit_bytes.",
+            aggregate_limit_refusals
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.aggregate.memory_pool_refusals",
+            "{request}",
+            "Aggregations refused with 503 because the node's pool of aggregation memory was held by other requests.",
+            aggregate_pool_refusals
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.aggregate.memory_pool_used",
+            "By",
+            "The BSON bytes of the pool of aggregation memory reserved by running aggregations now.",
+            aggregate_pool_used_bytes
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.sync.serve_walk_path.serve.keys",
             "{window}",
             "Windows served by a peer pull that were read by the `keys` path.",

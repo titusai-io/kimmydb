@@ -12044,6 +12044,9 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_validation_warnings_total",
         "kimmy_validation_refusals_total",
         "kimmy_validator_unparseable_total",
+        "kimmy_aggregate_memory_limit_refusals_total",
+        "kimmy_aggregate_memory_pool_refusals_total",
+        "kimmy_aggregate_memory_pool_used_bytes",
     ])
     .chain(std::iter::repeat_n("kimmy_ownership_peers", kimmy_cluster::PeerState::ALL.len()))
     .chain(std::iter::repeat_n(

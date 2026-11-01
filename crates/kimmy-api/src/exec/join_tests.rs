@@ -878,6 +878,7 @@ fn data_can_raise(e: &kimmy_core::Error) -> bool {
         | E::DocumentInvalid { .. }
         | E::AnswerTooLarge { .. }
         | E::ValueTooLarge { .. }
+        | E::MemoryBusy { .. }
         | E::IdTooLarge { .. }
         | E::UnsupportedOperator { .. }
         | E::ResumeTokenExpired

@@ -100,6 +100,16 @@ impl Default for RequestLimits {
     }
 }
 
+/// The bytes one aggregation may hold at once unless `aggregate.memory_limit_bytes` says
+/// otherwise: 1 GiB.
+pub const DEFAULT_AGGREGATE_MEMORY_LIMIT_BYTES: usize =
+    kimmy_query::budget::DEFAULT_MEMORY_LIMIT_BYTES;
+
+/// The bytes all aggregations on a node may hold together unless
+/// `aggregate.memory_pool_bytes` says otherwise: 2 GiB.
+pub const DEFAULT_AGGREGATE_MEMORY_POOL_BYTES: usize =
+    kimmy_query::budget::DEFAULT_MEMORY_POOL_BYTES;
+
 /// What aggregations may hold in memory (ADR-269): the bytes one request may hold at
 /// once (`aggregate.memory_limit_bytes`), and the pool all concurrent aggregations on
 /// the node draw on together (`aggregate.memory_pool_bytes`).
@@ -141,10 +151,7 @@ impl AggregateMemory {
 
 impl Default for AggregateMemory {
     fn default() -> Self {
-        Self::new(
-            kimmy_query::budget::DEFAULT_MEMORY_LIMIT_BYTES,
-            kimmy_query::budget::DEFAULT_MEMORY_POOL_BYTES,
-        )
+        Self::new(DEFAULT_AGGREGATE_MEMORY_LIMIT_BYTES, DEFAULT_AGGREGATE_MEMORY_POOL_BYTES)
     }
 }
 

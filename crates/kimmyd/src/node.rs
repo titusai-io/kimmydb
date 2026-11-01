@@ -1158,6 +1158,8 @@ async fn start_and_serve(
     state.vectors.set_max_bytes(config.vector.index_cache.max_bytes);
     // How many graphs build at once, off the request path (ADR-245).
     state.vectors.set_build_concurrency(config.vector.index_cache.build_concurrency);
+    // What one aggregation may hold, and the pool they draw on together (ADR-269).
+    state.set_aggregate_memory(config.aggregate.memory());
 
     // The OTLP counters, reading the same atomics `/metrics` renders. Here
     // rather than in `logging::init` because the counters live in this state

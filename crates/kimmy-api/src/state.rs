@@ -266,6 +266,11 @@ impl AppState {
             validation_warnings: self.engine.validation_totals().0,
             validation_refusals: self.engine.validation_totals().1,
             validators_unparseable: self.engine.validators_unparseable(),
+            // What aggregations hold and were refused, from the pool the requests draw on
+            // (ADR-269).
+            aggregate_limit_refusals: self.aggregate_memory().pool().limit_refusals(),
+            aggregate_pool_refusals: self.aggregate_memory().pool().pool_refusals(),
+            aggregate_pool_used_bytes: self.aggregate_memory().pool().used() as u64,
             // Entries held as state that a window released (ADR-169's
             // addendum), counted by the engine on commit so a pulled and a
             // pushed window land on the same series.

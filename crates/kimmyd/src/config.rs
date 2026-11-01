@@ -32,6 +32,69 @@ pub struct Config {
     pub log: LogConfig,
     pub telemetry: TelemetryConfig,
     pub vector: VectorConfig,
+    pub aggregate: AggregateConfig,
+}
+
+/// What an aggregation may hold in memory (ADR-269).
+///
+/// The unit is the BSON size of the documents. A pipeline holds its documents whole, so
+/// without a bound one request can hold more than the member has: a thousand documents
+/// each given an 8 MiB string by `$addFields` hold 8 GB, every value of it legal. Both
+/// bounds refuse the request, rather than letting the member run out of memory, and both
+/// are counted in bytes of BSON, which for long strings is within a few bytes of the
+/// memory they take and for documents of many small fields is a fraction of it. Size the
+/// pool with room for that.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AggregateConfig {
+    /// The most bytes one aggregation may hold at once: the documents it reads, each
+    /// stage's input and output while the stage runs, the groups and joined arrays it
+    /// builds, and its answer. Over it, `413 answer_too_large` naming what held the
+    /// memory. 1 GiB by default. At least 1 MiB.
+    pub memory_limit_bytes: usize,
+    /// The most bytes all aggregations on this node may hold together. A request takes
+    /// from it as its own total grows and returns it when it ends; one that cannot be
+    /// covered is answered `503` with `retry: wait`. 2 GiB by default. At least
+    /// `memory_limit_bytes`, or a single request could never reach its own limit.
+    pub memory_pool_bytes: usize,
+}
+
+impl Default for AggregateConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit_bytes: kimmy_api::limits::DEFAULT_AGGREGATE_MEMORY_LIMIT_BYTES,
+            memory_pool_bytes: kimmy_api::limits::DEFAULT_AGGREGATE_MEMORY_POOL_BYTES,
+        }
+    }
+}
+
+impl AggregateConfig {
+    /// What the shared state is handed.
+    pub fn memory(&self) -> kimmy_api::AggregateMemory {
+        kimmy_api::AggregateMemory::new(self.memory_limit_bytes, self.memory_pool_bytes)
+    }
+
+    fn validate(&self) -> Result<()> {
+        const FLOOR: usize = 1024 * 1024;
+        if self.memory_limit_bytes < FLOOR {
+            anyhow::bail!(
+                "aggregate.memory_limit_bytes must be at least 1 MiB (1048576): a smaller \
+                 limit refuses pipelines over a few documents. The default is {}",
+                kimmy_api::limits::DEFAULT_AGGREGATE_MEMORY_LIMIT_BYTES
+            );
+        }
+        if self.memory_pool_bytes < self.memory_limit_bytes {
+            anyhow::bail!(
+                "aggregate.memory_pool_bytes ({}) must be at least aggregate.memory_limit_bytes \
+                 ({}): a pool smaller than one request's limit would refuse a request that \
+                 is within its own. The default is {}",
+                self.memory_pool_bytes,
+                self.memory_limit_bytes,
+                kimmy_api::limits::DEFAULT_AGGREGATE_MEMORY_POOL_BYTES
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Automatic-embedding settings.
@@ -1612,6 +1675,7 @@ impl Config {
                  rebuild one on every search"
             );
         }
+        self.aggregate.validate()?;
         if self.vector.index_cache.build_concurrency == 0 {
             anyhow::bail!(
                 "vector.index_cache.build_concurrency must be at least 1: with no builder, no \
@@ -1705,7 +1769,8 @@ impl Config {
         };
         format!(
             "bind={} scheme={} data_dir={} auth={} local_login={} jwt_previous_secret={} \
-             oidc={} mcp={} gc={} ratelimit=[{}] limits=[timeout={}s body={}B] audit={} \
+             oidc={} mcp={} gc={} ratelimit=[{}] limits=[timeout={}s body={}B] \
+             aggregate=[limit={}B pool={}B] audit={} \
              cluster={} seeds=[{}] log={}/{:?} otel={}",
             self.server.bind,
             if self.server.tls.is_enabled() { "https" } else { "http" },
@@ -1726,6 +1791,8 @@ impl Config {
             self.server.rate_limit.describe(),
             self.server.request_timeout_secs,
             self.server.max_body_bytes,
+            self.aggregate.memory_limit_bytes,
+            self.aggregate.memory_pool_bytes,
             self.audit.mode,
             if self.cluster.enabled { "enabled" } else { "single-node" },
             seeds,
@@ -3254,6 +3321,58 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
         assert_eq!(cfg.server.request_limits(), kimmy_api::RequestLimits::default());
         assert_eq!(cfg.server.rate_limit.per_principal, 0, "off unless an operator says so");
         assert!(cfg.server.rate_limit.build().per_principal.limit().is_disabled());
+    }
+
+    #[test]
+    fn aggregate_memory_defaults_are_one_gib_a_request_and_two_gib_a_node() {
+        let cfg = Config::default();
+        assert_eq!(cfg.aggregate.memory_limit_bytes, 1024 * 1024 * 1024);
+        assert_eq!(cfg.aggregate.memory_pool_bytes, 2 * 1024 * 1024 * 1024);
+        let memory = cfg.aggregate.memory();
+        assert_eq!(memory.limit(), 1 << 30);
+        assert_eq!(memory.pool().cap(), 2 << 30);
+        assert!(cfg.aggregate.validate().is_ok());
+    }
+
+    #[test]
+    fn aggregate_memory_is_read_from_its_section_and_unknown_keys_are_refused() {
+        let cfg: Config = toml::from_str(
+            "[aggregate]\nmemory_limit_bytes = 268435456\nmemory_pool_bytes = 536870912\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.aggregate.memory_limit_bytes, 256 << 20);
+        assert_eq!(cfg.aggregate.memory_pool_bytes, 512 << 20);
+        assert_eq!(cfg.aggregate.memory().limit(), 256 << 20);
+        let err = toml::from_str::<Config>("[aggregate]\nmemory_limit = 1\n").unwrap_err();
+        assert!(err.to_string().contains("memory_limit"), "{err}");
+    }
+
+    #[test]
+    fn aggregate_memory_limits_are_validated_and_name_the_setting() {
+        let mut cfg = Config::default();
+        cfg.aggregate.memory_limit_bytes = 1024 * 1024 - 1;
+        let err = cfg.aggregate.validate().unwrap_err().to_string();
+        assert!(err.contains("aggregate.memory_limit_bytes"), "{err}");
+        cfg.aggregate.memory_limit_bytes = 1024 * 1024;
+        cfg.aggregate.memory_pool_bytes = 1024 * 1024 - 1;
+        let err = cfg.aggregate.validate().unwrap_err().to_string();
+        assert!(err.contains("aggregate.memory_pool_bytes"), "{err}");
+        // A pool of exactly one request's limit is the smallest that can serve it.
+        cfg.aggregate.memory_pool_bytes = 1024 * 1024;
+        assert!(cfg.aggregate.validate().is_ok());
+        // And `Config::validate` runs it.
+        let mut cfg = Config::default();
+        cfg.auth.insecure_no_auth = true;
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.aggregate.memory_pool_bytes = cfg.aggregate.memory_limit_bytes - 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("aggregate.memory_pool_bytes"), "{err}");
+    }
+
+    #[test]
+    fn the_summary_shows_the_aggregate_memory_limits() {
+        let summary = Config::default().summary();
+        assert!(summary.contains("aggregate=[limit=1073741824B pool=2147483648B]"), "{summary}");
     }
 
     #[test]
