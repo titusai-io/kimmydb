@@ -3602,11 +3602,10 @@ components:
         replacement document, or an **array of aggregation stages** that
         computes the new document from the old one — only `$addFields`
         (`$set`), `$project` (`$unset`) and `$replaceRoot` (`$replaceWith`)
-        (ADR-265).
+        (ADR-265). An empty array is an update that changes nothing.
       oneOf:
         - $ref: "#/components/schemas/Document"
         - type: array
-          minItems: 1
           items: { $ref: "#/components/schemas/Document" }
 
     ArrayFilters:
