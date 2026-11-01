@@ -1073,12 +1073,33 @@ fn a_path_through_an_array_skips_what_is_not_a_document() {
     assert_eq!(top(-1), ints(&[1, 4, 5, 2, 3]));
 }
 
-/// delta2.out `stdDevPop group array field`: error 40237. `$sum` and `$avg` take
-/// the same refusal; a string operand is a unary operand and answers null.
+/// delta2.out `stdDevPop group array field`: error 40237. The reference
+/// (delta5.out, "unary accumulators") refuses a list of two, of one and of none for
+/// each of these, and `$sum: [[1,2]]`; a string operand is a unary operand and
+/// answers null.
 #[test]
 fn a_list_given_to_a_unary_accumulator_is_refused() {
-    for op in ["$stdDevPop", "$stdDevSamp", "$sum", "$avg"] {
-        for list in [bson::bson!([1, 2]), bson::bson!(["$x", "$y"]), bson::bson!([])] {
+    let ops = [
+        "$sum",
+        "$avg",
+        "$min",
+        "$max",
+        "$first",
+        "$last",
+        "$push",
+        "$addToSet",
+        "$stdDevPop",
+        "$stdDevSamp",
+        "$mergeObjects",
+    ];
+    for op in ops {
+        for list in [
+            bson::bson!([1, 2]),
+            bson::bson!([1]),
+            bson::bson!(["$x", "$y"]),
+            bson::bson!([[1, 2]]),
+            bson::bson!([]),
+        ] {
             let err = refused(doc! { op: list.clone() });
             assert!(err.contains(&format!("The {op} accumulator is a unary operator")), "{err}");
         }
@@ -1087,11 +1108,25 @@ fn a_list_given_to_a_unary_accumulator_is_refused() {
     // The same stages with one operand are as before.
     assert_eq!(one(doc! {"$sum": "$x"}, xs(&[1, 2])), Bson::Int64(3));
     assert_eq!(one(doc! {"$avg": "$x"}, xs(&[1, 2])), Bson::Double(1.5));
-    // $push of a list is a list of expressions and stays valid.
+    assert_eq!(one(doc! {"$push": "$x"}, xs(&[1, 2])), Bson::Array(vec![1.into(), 2.into()]));
+    // A list is pushed with $literal.
     assert_eq!(
-        one(doc! {"$push": ["$x", 0]}, xs(&[1])),
+        one(doc! {"$push": {"$literal": [1, 0]}}, xs(&[1])),
         Bson::Array(vec![Bson::Array(vec![1.into(), 0.into()])])
     );
+}
+
+/// The accumulators that name their fields take a document, so a list is refused
+/// for them too, of any length.
+#[test]
+fn a_list_given_to_a_document_accumulator_is_refused() {
+    for op in ["$top", "$bottom", "$topN", "$bottomN", "$firstN", "$lastN", "$maxN", "$minN"] {
+        for list in [bson::bson!([1]), bson::bson!([]), bson::bson!([1, 2])] {
+            refused(doc! { op: list.clone() });
+        }
+    }
+    refused(doc! {"$count": [1]});
+    refused(doc! {"$count": []});
 }
 
 #[test]

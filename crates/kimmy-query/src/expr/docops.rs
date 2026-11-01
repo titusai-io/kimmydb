@@ -17,7 +17,10 @@
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result};
 
-use super::{Declared, Expr, Op, Scope, field_path, truthy, value_path};
+use super::{
+    Declared, DocBudget, Expr, MAX_ARRAY_BYTES, Op, Scope, bson_bytes, field_path, truthy,
+    value_path,
+};
 
 /// A document or type operator.
 #[derive(Clone, Debug, PartialEq)]
@@ -172,19 +175,33 @@ impl DocExpr {
                     Some(v) => eval_opt(v, scope)?,
                     None => None,
                 };
-                match value {
-                    // A new field goes last; an existing one keeps its place.
-                    Some(v) => {
-                        doc.insert(field.clone(), v);
-                    }
-                    None => {
-                        doc.remove(field);
-                    }
-                }
+                set_field_within(&mut doc, field, value, MAX_ARRAY_BYTES)?;
                 Ok(Some(Bson::Document(doc)))
             }
         }
     }
+}
+
+/// Set `field` of `doc` to `value`, or remove it when `value` is missing. A new
+/// field goes last; an existing one keeps its place. The document `doc` becomes is
+/// counted before the value is stored, and refused when it passes `max` bytes.
+pub(super) fn set_field_within(
+    doc: &mut Document,
+    field: &str,
+    value: Option<Bson>,
+    max: usize,
+) -> Result<()> {
+    match value {
+        Some(v) => {
+            let mut budget = DocBudget::of_document("the document $setField builds", max, doc)?;
+            budget.set(field, doc.get(field).map(bson_bytes), &v)?;
+            doc.insert(field, v);
+        }
+        None => {
+            doc.remove(field);
+        }
+    }
+    Ok(())
 }
 
 /// The field name of `$getField`, `$setField` or `$unsetField`, which must be a
@@ -263,12 +280,14 @@ pub(super) fn eval_opt(expr: &Expr, scope: &Scope<'_>) -> Result<Option<Bson>> {
 
 /// Merge `value` into `into`: null and a missing field are skipped, a document's
 /// fields are set in turn, so a later value wins and an existing key keeps its
-/// place. Anything else is refused.
-pub(crate) fn merge_into(into: &mut Document, value: &Bson) -> Result<()> {
+/// place. Anything else is refused. `budget` counts `into` as it grows, and
+/// refuses a field before it is copied when the document would pass the limit.
+pub(crate) fn merge_into(into: &mut Document, budget: &mut DocBudget, value: &Bson) -> Result<()> {
     match value {
         v if nullish(v) => Ok(()),
         Bson::Document(d) => {
             for (k, v) in d {
+                budget.set(k, into.get(k).map(bson_bytes), v)?;
                 into.insert(k.clone(), v.clone());
             }
             Ok(())
@@ -280,10 +299,21 @@ pub(crate) fn merge_into(into: &mut Document, value: &Bson) -> Result<()> {
     }
 }
 
+/// The budget of the document `$mergeObjects` builds, empty.
+pub(crate) fn merge_budget(max: usize) -> DocBudget {
+    DocBudget::new("the document $mergeObjects builds", max)
+}
+
 pub(super) fn merge_objects(args: &[Bson]) -> Result<Bson> {
+    merge_objects_within(args, MAX_ARRAY_BYTES)
+}
+
+/// [`merge_objects`] within `max` bytes.
+pub(super) fn merge_objects_within(args: &[Bson], max: usize) -> Result<Bson> {
     let mut out = Document::new();
+    let mut budget = merge_budget(max);
     for a in args {
-        merge_into(&mut out, a)?;
+        merge_into(&mut out, &mut budget, a)?;
     }
     Ok(Bson::Document(out))
 }

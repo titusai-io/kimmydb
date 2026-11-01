@@ -1913,12 +1913,43 @@ fn set_computed(
     computed: &[(String, Expr)],
     source: &Scope<'_>,
 ) -> Result<()> {
+    set_computed_within(target, computed, source, crate::expr::MAX_ARRAY_BYTES)
+}
+
+/// [`set_computed`] with the document it writes held to `max` bytes. A computed
+/// value can hold a copy of the document it is added to (`{a: "$$ROOT"}`), so a
+/// stage that did only that, repeated, would double the document each time. The
+/// size is counted as the fields are written, from the document's own size, and a
+/// field that would take it over the limit is refused before it is stored.
+fn set_computed_within(
+    target: &mut Document,
+    computed: &[(String, Expr)],
+    source: &Scope<'_>,
+    max: usize,
+) -> Result<()> {
+    if computed.is_empty() {
+        return Ok(());
+    }
+    let what = "the document the stage builds";
+    let mut budget = crate::expr::DocBudget::of_document(what, max, target)?;
     for (name, expr) in computed {
         // `$$REMOVE` leaves the field out: not written, and removed if the stage
         // would otherwise carry it (ADR-253).
         match expr.eval_field(source)? {
-            Some(value) => path::set(target, name, value)
-                .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?,
+            Some(value) => {
+                // The count adds the value without taking away what it replaces: it
+                // can only be too high. When it is over, the document's exact size
+                // decides, after the write.
+                let mut counted = budget.clone();
+                let fits = counted.set(name, None, &value).is_ok();
+                path::set(target, name, value)
+                    .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
+                if fits {
+                    budget = counted;
+                } else {
+                    budget = crate::expr::DocBudget::of_document(what, max, target)?;
+                }
+            }
             None => {
                 if !path::unset(target, name) && crossing_array(target, name).is_some() {
                     // A path the write of a value would refuse is refused for the
@@ -2126,7 +2157,7 @@ enum AccState {
     /// is what makes two values one member (ADR-186).
     AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>),
     /// The fields merged so far, a later document's value winning.
-    MergeObjects(Document),
+    MergeObjects(Document, crate::expr::DocBudget),
     Ext(crate::accumulators::State),
 }
 
@@ -2317,7 +2348,10 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
         Accumulator::Last(_) => AccState::Last(None),
         Accumulator::Push(_) => AccState::Push(Vec::new()),
         Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default()),
-        Accumulator::MergeObjects(_) => AccState::MergeObjects(Document::new()),
+        Accumulator::MergeObjects(_) => AccState::MergeObjects(
+            Document::new(),
+            crate::expr::merge_budget(crate::expr::MAX_ARRAY_BYTES),
+        ),
         Accumulator::Ext(spec) => AccState::Ext(spec.init()),
     }
 }
@@ -2365,8 +2399,8 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
                 items.push(v);
             }
         }
-        (AccState::MergeObjects(merged), Accumulator::MergeObjects(e)) => {
-            crate::expr::merge_into(merged, &e.eval_in(scope)?)?;
+        (AccState::MergeObjects(merged, budget), Accumulator::MergeObjects(e)) => {
+            crate::expr::merge_into(merged, budget, &e.eval_in(scope)?)?;
         }
         // Unreachable: `init` pairs each accumulator with its own state.
         _ => {}
@@ -2384,7 +2418,7 @@ fn finish(state: AccState) -> Result<Bson> {
         AccState::MinMax(v) | AccState::First(v) => v.unwrap_or(Bson::Null),
         AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
         AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
-        AccState::MergeObjects(merged) => Bson::Document(merged),
+        AccState::MergeObjects(merged, _) => Bson::Document(merged),
         AccState::Ext(state) => state.finish(),
     })
 }
@@ -4284,7 +4318,7 @@ mod tests {
         // A group key that is an array groups by the values, not by one
         // constant: two buckets here, where the strings made one.
         let mut out = run(
-            vec![doc! {"$group": {"_id": ["$a", "$b"], "pairs": {"$push": ["$_id", "$extra"]}}}],
+            vec![doc! {"$group": {"_id": ["$a", "$b"], "pairs": {"$push": {"$concatArrays": [["$_id", "$extra"]]}}}}],
             input(),
         )
         .unwrap();

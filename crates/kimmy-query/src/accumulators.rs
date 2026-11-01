@@ -78,19 +78,32 @@ fn kind_of(op: &str) -> Option<Kind> {
     })
 }
 
-/// `$sum`, `$avg`, `$stdDevPop` and `$stdDevSamp` take one expression, not a
-/// list: given an array literal of any length but one, the reference refuses
-/// them (`The $sum accumulator is a unary operator`, error 40237). A list of one
-/// is not probed and stays an array expression. Every other name passes.
+/// The accumulators that take one expression, not a list. Given an array
+/// literal of any length (`[1, 2]`, `[1]` and `[]` alike), the reference refuses
+/// each of them (`The $sum accumulator is a unary operator`, error 40237), so
+/// `{$push: [1]}` is refused and `{$push: {$literal: [1]}}` is how to push a list.
+/// The accumulators that take a document (`$top`, `$firstN` and the rest) and
+/// `$count` refuse an array in their own way.
+const UNARY: [&str; 11] = [
+    "$sum",
+    "$avg",
+    "$min",
+    "$max",
+    "$first",
+    "$last",
+    "$push",
+    "$addToSet",
+    "$stdDevPop",
+    "$stdDevSamp",
+    "$mergeObjects",
+];
+
+/// Refuse an array literal given to an accumulator that is unary.
 pub fn check_unary(op: &str, arg: &Bson) -> Result<()> {
-    match (op, arg) {
-        ("$sum" | "$avg" | "$stdDevPop" | "$stdDevSamp", Bson::Array(items))
-            if items.len() != 1 =>
-        {
-            Err(Error::InvalidQuery(format!("The {op} accumulator is a unary operator")))
-        }
-        _ => Ok(()),
+    if matches!(arg, Bson::Array(_)) && UNARY.contains(&op) {
+        return Err(Error::InvalidQuery(format!("The {op} accumulator is a unary operator")));
     }
+    Ok(())
 }
 
 /// Parse `{<op>: <arg>}` if `op` is one of ours.
