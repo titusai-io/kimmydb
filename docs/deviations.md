@@ -26,7 +26,7 @@ Status meanings:
 - **A computed `regex` is compiled per document** (the last pattern is kept), outside the pipeline's budget; each pattern is still bounded by the per-pattern size limit.
 - **`$strcasecmp` and `$substrBytes` coerce only strings, null and numbers** to text, a double as `%g` prints it, as the reference does. The reference also renders a date, a timestamp, code and a symbol; here those are a `400`.
 - **`$regexFindAll`'s 64 MiB limit is counted as BSON bytes of the documents it would return**, which is this server's reading of the reference's output-buffer limit; the two counts agree to within the documents' framing, not byte for byte, so an answer within a few percent of 64 MiB may be refused by one and not the other. The error is the `413` `ValueTooLarge` (code `document_too_large`), where the reference's is `51151`; its message names the output and the limit. A string of 16 MiB or more built by `$concat`, `$replaceOne` or `$replaceAll` is the same `413` ("the string $concat builds is N bytes, over the 16 MiB string limit"), where the reference's codes are `16493` and `13548`.
-- **An array an expression builds is held to 16 MiB of BSON,** with the same `413`: `$concatArrays` (a `$reduce` that doubles an array stops there), `$map`, `$zip`, an array literal, `$split`, `$objectToArray` and the `N` forms of `$firstN`, `$lastN`, `$maxN` and `$minN`. The reference has no such limit short of the 16 MB document (and 64 MB buffer) it would hit when the value is stored or returned, so an intermediate array between 16 MiB and that is answered there and refused here. `$range` keeps its own limit of 100,000 elements and `$zip` its 1,000,000 cells, both a `400` raised before anything is built. A document built by `$mergeObjects`, `$setField` or an object literal is not counted.
+- **An array or a document an expression builds is held to 16 MiB of BSON,** with the same `413` ([ADR-267](decisions.md#adr-267--the-documents-an-expression-builds-are-held-to-16-mib-an-accumulator-takes-one-expression-a-regex-as-a-fields-value-is-a-pattern)). Arrays: `$concatArrays` (a `$reduce` that doubles an array stops there), `$map`, `$zip`, an array literal, `$split`, `$objectToArray`, `$range` and the `N` forms of `$firstN`, `$lastN`, `$maxN` and `$minN`. Documents: an object literal, `$mergeObjects` (the expression and the `$group` accumulator), `$setField`, `$arrayToObject`, and the fields `$addFields`, `$set` and `$project` write (a `{copy: "$$ROOT"}` repeated would double the document). A `$reduce` that doubles a document (`{l: "$$value", r: "$$value"}`, or a `$mergeObjects` of two copies) stops at the step that would pass the limit; before this it copied the document twice a step, reached 5.3 GiB in 21 steps and ended a member at `$range: [0, 30]`. The size is counted as the value is built and a field is refused before it is stored, so what is held is the limit and one element; counted as BSON, a document of many tiny nested documents takes several times its BSON size in memory, so a refused doubling still holds a few copies of a document just under the limit. The reference shares the values (the same pipeline at 40 steps answers in 15 ms) and refuses only when a document is written out, at 64 MB, so a document between 16 MiB and that is answered there and refused here. `$range` has no count cap of its own now: its bytes are worked out first, so `[0, 200000]` answers, as there, and `[0, 2147483647]` is a `413` before anything is allocated, where the reference's refusal is its own 100 MB memory limit (`ExceededMemoryLimit`). `$zip` keeps its 1,000,000 cells, a `400` raised before anything is built. `$group` and `$push`/`$addToSet` are bounded by their input, not by this limit.
 - **`$replaceAll` with an empty `find`** inserts between every code point and at both ends (`"abc"`, `""`, `"-"` gives `"-a-b-c-"`). The reference inserts between the *bytes* of a multi-byte character and builds invalid UTF-8, which its own client refuses to read (`Invalid UTF-8 string in BSON document`); on ASCII text the two agree.
 - **Missing versus null.** The expression layer reads a missing field as null (the array operators' entry). `$type`, `$setField`'s `value`, `$getField` and the `$cond`/`$switch`/`$let` that choose among them keep the difference, as the reference does; every other operator, `$ifNull` included, sees null.
 - **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document, as the reference refuses it (`40400`).
@@ -552,8 +552,10 @@ regex literal and a literal under `$not`; it used to match nothing. A
 `$options` that is not a string is a `400`; it used to be ignored.
 
 **Kept, and documented.** A regex literal written directly as a field's value
-(`{"name": /^s/}`) is an equality match against a regex value, not a pattern
-match; that has not changed.
+(`{"name": /^s/}`) was an equality match against a regex value, not a pattern
+match. That changed with ADR-267: it is a pattern, as `$regex` is, and `$eq` is
+the spelling that compares the regex as a value. It matches strings only, where
+the reference also matches a stored regex of the same pattern (not probed).
 
 ---
 
@@ -578,7 +580,7 @@ or in one pattern. The same shapes as the operand of `$ne` are refused too,
 pointing to `{"$not": {"$regex": ...}}`: `$ne` compared them as values, so
 `{"s": {"$ne": {"$regex": "abc"}}}` held for every string, the ones the pattern
 matches included (raised by the same review, a day later). `$eq` still compares
-a regex as a value, as a regex written directly as a field's value does.
+a regex as a value.
 
 **What that costs.** A stored document may hold `$`-prefixed keys, so a
 document shaped exactly `{"$regex": ...}` cannot be found through `$in`; `$eq`

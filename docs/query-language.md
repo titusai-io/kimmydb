@@ -54,6 +54,14 @@ pattern: `{"s": {"$regex": "^(abc|def)"}}`; to exclude what a pattern matches,
 `$`-prefixed keys included, is still compared as a value, and `$eq` compares a
 regex as a value too. See [Deviations](deviations.md).
 
+**A regular expression written as a field's value is a pattern.** `{"s": /ab/i}`,
+which over HTTP is `{"s": {"$regularExpression": {"pattern": "ab", "options":
+"i"}}}`, matches the strings `s` holds that match it, as `{"s": {"$regex": "ab",
+"$options": "i"}}` does, with the same refusals (an invalid pattern, a possessive
+quantifier, a construct the engine does not have: a `400`). It matches strings
+only; a stored regex value is not matched by it. Only `$eq` compares a regex as a
+value, `{"s": {"$eq": /ab/}}`.
+
 ### Logical
 
 | Operator | Meaning |
