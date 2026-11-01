@@ -3692,6 +3692,9 @@ mod strdoc_tests;
 mod size_tests;
 
 #[cfg(test)]
+mod width_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bson::doc;
