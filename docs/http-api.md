@@ -480,7 +480,7 @@ Every refusal is `400` with these message prefixes, and nothing is written:
 | Element that is not a document | `invalid update: each stage of a pipeline update is a document` |
 | Any stage but the six allowed | `invalid update: a pipeline update allows only $addFields (or $set), $project (or $unset) and $replaceRoot (or $replaceWith), found <stage>` |
 | `arrayFilters` given | `invalid update: arrayFilters apply to update operators, not to a pipeline update` |
-| A stage that changes or removes `_id` (or gives an upserted document one) | `invalid query: _id is immutable and cannot be updated` |
+| A stage that changes or removes `_id` (or gives an upserted document one) | `invalid query: invalid update: _id is immutable and cannot be updated` |
 | A bad stage operand or expression | the aggregation's own, e.g. `invalid query: $set takes a document`, `unsupported operator "$nope"` |
 | A positional projection with `returnDocument: "after"` | `invalid query: the positional projection ... after a pipeline update` |
 

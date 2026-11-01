@@ -18029,6 +18029,8 @@ async fn the_small_stages_run_end_to_end() {
     let res = run(json!([{"$sample": {"size": 10}}])).await;
     assert_eq!(res.body["count"], 3);
     let res = run(json!([{"$sample": {"size": 0}}])).await;
+    assert_eq!(res.body["count"], 0, "{:?}", res.body);
+    let res = run(json!([{"$sample": {"size": -1}}])).await;
     assert_eq!(res.status, 400, "{:?}", res.body);
     let redact = json!({"$redact": {"$cond": {"if": {"$eq": ["$level", 5]},
                                               "then": "$$PRUNE", "else": "$$DESCEND"}}});
@@ -19775,22 +19777,22 @@ async fn a_pipeline_update_is_refused_for_what_it_may_not_do_and_writes_nothing(
         (
             json!([{ "$set": { "_id": 2 } }]),
             json!({}),
-            "invalid query: _id is immutable and cannot be updated",
+            "invalid query: invalid update: _id is immutable and cannot be updated",
         ),
         (
             json!([{ "$unset": "_id" }]),
             json!({}),
-            "invalid query: _id is immutable and cannot be updated",
+            "invalid query: invalid update: _id is immutable and cannot be updated",
         ),
         (
             json!([{ "$project": { "_id": 0, "a": 1 } }]),
             json!({}),
-            "invalid query: _id is immutable and cannot be updated",
+            "invalid query: invalid update: _id is immutable and cannot be updated",
         ),
         (
             json!([{ "$replaceWith": { "_id": 7 } }]),
             json!({}),
-            "invalid query: _id is immutable and cannot be updated",
+            "invalid query: invalid update: _id is immutable and cannot be updated",
         ),
         (json!([{ "$set": { "a": { "$add": ["$items", 1] } } }]), json!({}), "invalid query:"),
         (json!([{ "$set": { "a": { "$nope": 1 } } }]), json!({}), "unsupported operator \"$nope\""),

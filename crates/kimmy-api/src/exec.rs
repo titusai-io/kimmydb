@@ -1506,8 +1506,6 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         // `invalid query: invalid query: …`.
         update::apply_matched(update, self.filter, &mut next, self.now).map_err(|e| match e {
             kimmy_core::Error::InvalidQuery(reason) => reason,
-            // A pipeline update refuses a write to `_id` here, when its result is known.
-            kimmy_core::Error::InvalidUpdate(reason) => reason,
             other => other.to_string(),
         })?;
         let answered = match self.answer {
