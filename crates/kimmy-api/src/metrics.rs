@@ -5034,6 +5034,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // Local writes an index refused because it could not key the
                 // document (ADR-258).
                 + 1
+                // The aggregations refused for their own limit and for the pool,
+                // and the pool's bytes in use (ADR-269).
+                + 3
                 // Peers by state, and the peers a yielding class waits on
                 // (ADR-201).
                 + kimmy_cluster::PeerState::ALL.len()
