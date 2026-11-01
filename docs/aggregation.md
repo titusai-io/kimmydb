@@ -221,11 +221,15 @@ rows). Over an empty input every facet runs over nothing: `$count` still answers
 is `{$group: {_id: "$category", count: {$sum: 1}}}` followed by `{$sort: {count: -1}}`
 ([ADR-263](decisions.md)): one document per distinct value, `{_id, count}`, the commonest
 first. The operand is a field path (`"$category"`, `"$$ROOT"`) or an expression document
-such as `{$toUpper: "$category"}`; a number, a boolean, an array, `null`, a string that is
-not a path and an empty document are `400`. A missing field and `null` are one group,
-`_id: null`. `count` has the type `$group`'s `{$sum: 1}` gives. **Ties** (equal counts)
-are left in the order each value was first seen, which the reference leaves
-unspecified. Blocking, and one group per distinct value counts against the pipeline's
+whose first key is an operator, such as `{$toUpper: "$category"}`. Refused, `400`, in the
+reference's words: a number, a boolean, an array or `null` (`the sortByCount field must be
+specified as a string or as an object`); a string that is not a path, an empty document and
+a document that is not an operator expression such as `{who: "$k"}` (`must be defined as a
+$-prefixed path or an expression inside an object`); and `"$"` alone. A missing field and
+`null` are one group, `_id: null`. **`count` is an int** (a long only past 2^31-1), as the
+reference's is, where `$group`'s `{$sum: 1}` is a long in this build. **The order of equal
+counts is unspecified**, as it is in the reference (two runs of it differ): this build
+happens to keep the order each value was first seen, and that is not a promise. Blocking, and one group per distinct value counts against the pipeline's
 document limit like `$group`.
 
 ### `$replaceWith`
@@ -257,9 +261,11 @@ another (`"a"` with `"a.b"`).
 ```
 
 returns `size` documents chosen at random from the input, each document at most once and
-every set of `size` equally likely ([ADR-263](decisions.md)). `size` is a positive whole
-number (a double or decimal with no fraction counts); `0`, a negative, a fraction, a
-missing `size` and any other key (there is no seed) are `400`. **When `size` is at least
+every set of `size` equally likely ([ADR-263](decisions.md)). `size` is a number,
+**truncated toward zero** as the reference does (`1.5` is `1`); **`0` answers no
+documents**. A negative (`size argument to $sample must not be negative`), a value that is
+not a number (`must be a number`), a missing `size` and any other key (there is no seed)
+are `400`. **When `size` is at least
 the input's size the whole input is returned, in input order**; otherwise the order of the
 sample is not defined. It is a reservoir over the stream, held in memory: **`size` over the
 pipeline's document limit is `400`, and the reservoir's encoded size passing 16 MiB is
@@ -290,7 +296,8 @@ answer is `400`**: `$redact's expression must answer $$DESCEND, $$PRUNE or $$KEE
 
 The three names are variables **only inside a `$redact` expression**; anywhere else
 (`$project`, `$match`'s `$expr`, ...) they are refused, `unsupported operator "$$PRUNE":
-valid only inside a $redact expression`. Their values are the strings `"descend"`,
+Use of undefined variable: PRUNE ($$DESCEND, $$PRUNE and $$KEEP are valid only inside a
+$redact expression; ...)`, which starts with the reference's own words. Their values are the strings `"descend"`,
 `"prune"` and `"keep"`, as in the reference, so an expression that answers one of those
 strings has the same effect. `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META` are
 **refused** everywhere, by name. `$cond` takes both its forms, the array
@@ -313,9 +320,11 @@ key, a `pipeline` that is not an array of stage documents and an empty name are 
 - **Authorized separately**: `read` on the named collection, as for `$lookup`, checked
   before the collection is looked at, so a denied caller learns nothing about whether it
   exists (`403`). The plan (`explain`) is checked the same way.
-- **The sub-pipeline** may use any stage but `$out`, `$merge`, `$vectorSearch` and
-  `$facet` (`400` at parse, at any depth under it); a `$unionWith`, `$lookup` and
-  `$graphLookup` in it are fine. A `$lookup` `let` name is readable in it.
+- **The sub-pipeline** may use any stage but `$out`, `$merge` and `$vectorSearch` (`400`
+  at parse, at any depth under it); a `$facet` (answering one document appended after the
+  input, `{f: [...]}`; its own caps apply), a `$unionWith`, `$lookup` and `$graphLookup`
+  in it are fine, a `$facet` inside that `$facet` is not. A `$lookup` `let` name is
+  readable in it.
 - **Bounded, and refused when over, never cut short.** The collection is read whole, in
   one walk. A leading `$match` of the sub-pipeline is applied as it is read, so what it
   declines is not held or counted. The documents that reach the sub-pipeline are refused
@@ -1878,7 +1887,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | | Why |
 |---|---|
 | System variables other than `$$ROOT`, `$$CURRENT`, `$$NOW` and `$$REMOVE` — `$$CLUSTER_TIME`, `$$USER_ROLES`, `$$SEARCH_META`; and `$$DESCEND`, `$$PRUNE`, `$$KEEP` outside a `$redact` | Not built, or valid only inside `$redact`. Refused with a message saying so, rather than as an unknown name |
-| `$unionWith` without a `coll`, and `$out`, `$merge`, `$vectorSearch` and `$facet` inside its sub-pipeline | Refused, `400`. See [`$unionWith`](#unionwith) |
+| `$unionWith` without a `coll`, and `$out`, `$merge` and `$vectorSearch` inside its sub-pipeline | Refused, `400`. See [`$unionWith`](#unionwith) |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$mod` with a `Decimal128` | Refused, `400`, `$mod needs numbers, found a Decimal128`. Date arithmetic with one is refused too (`$add needs numbers or one date, found a Decimal128`). |
 | `$merge` with `on` other than `_id`, `whenMatched`/`whenNotMatched: "fail"`, a pipeline `whenMatched`, `let`; `$out` into a collection that holds documents, `$out` with `timeseries` | Refused, `400`, each naming what and why. [`$merge`](#merge), [`$out`](#out), and the [deviations register](deviations.md) |

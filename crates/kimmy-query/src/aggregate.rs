@@ -482,8 +482,8 @@ struct Placement {
     /// Inside a `$lookup` sub-pipeline.
     sub: bool,
     in_facet: bool,
-    /// Anywhere under a `$unionWith` sub-pipeline, where `$out`, `$merge`,
-    /// `$vectorSearch` and `$facet` are refused.
+    /// Anywhere under a `$unionWith` sub-pipeline, where `$out`, `$merge` and
+    /// `$vectorSearch` are refused.
     in_union: bool,
 }
 
@@ -576,11 +576,6 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         "$group" => parse_group(as_document(name, value)?, vars),
         "$lookup" => parse_lookup(as_document(name, value)?, vars, at),
         "$facet" => {
-            if at.in_union {
-                return Err(Error::InvalidQuery(
-                    "$facet cannot be used inside a $unionWith sub-pipeline".into(),
-                ));
-            }
             if at.in_facet {
                 return Err(Error::InvalidQuery(
                     "$facet cannot be used inside a $facet, a $lookup sub-pipeline of one \

@@ -16,31 +16,32 @@ use crate::shape::{self, SortKey};
 // ---------------------------------------------------------------------------
 
 /// `{$sortByCount: <expression>}`: a field path (`"$a"`, `"$$ROOT"`) or an expression
-/// document that is not empty. A number, a boolean, an array, `null`, a string that is
-/// not a path and an empty document are refused.
+/// document (`{$mod: ["$n", 2]}`). The reference's refusals, in its words: a number,
+/// boolean, `null` or array is "must be specified as a string or as an object"; a string
+/// that is not a path, an empty document and an object that is not an operator expression
+/// (`{who: "$k"}`) are "must be defined as a $-prefixed path or an expression inside an
+/// object"; and `"$"` alone is not a field path.
 pub(crate) fn parse_sort_by_count(value: &Bson, vars: &[String]) -> Result<Stage> {
-    let ok = match value {
-        Bson::String(s) => s.len() > 1 && s.starts_with('$'),
-        Bson::Document(d) => !d.is_empty(),
-        _ => false,
-    };
-    if !ok {
-        return Err(Error::InvalidQuery(format!(
-            "$sortByCount takes a field path such as \"$field\" or an expression document, \
-             found {}",
-            match value {
-                Bson::String(s) => format!("the string {s:?}"),
-                Bson::Document(_) => "an empty document".to_string(),
-                other => type_name(other).to_string(),
-            }
-        )));
+    let refused = |what: &str| Error::InvalidQuery(format!("the sortByCount field must be {what}"));
+    match value {
+        Bson::String(s) if s == "$" => {
+            return Err(Error::InvalidQuery("'$' by itself is not a valid FieldPath".into()));
+        }
+        Bson::String(s) if s.starts_with('$') => {}
+        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => {}
+        Bson::String(_) | Bson::Document(_) => {
+            return Err(refused("defined as a $-prefixed path or an expression inside an object"));
+        }
+        _ => return Err(refused("specified as a string or as an object")),
     }
     Ok(Stage::SortByCount(Expr::parse_with_vars(value, vars)?))
 }
 
 /// Run `$sortByCount`: `{$group: {_id: <expr>, count: {$sum: 1}}}` then
 /// `{$sort: {count: -1}}`. The groups come out in the order their keys were first seen
-/// and the sort is stable, so groups with the same count stay in that order.
+/// and the sort is stable, so groups with the same count stay in that order (the
+/// reference leaves it unspecified). The `count` is an int, widening to a long past
+/// 2^31-1, as the reference's is; `$group`'s own `{$sum: 1}` is a long in this build.
 pub(crate) fn sort_by_count(
     input: Vec<Document>,
     expr: &Expr,
@@ -51,6 +52,11 @@ pub(crate) fn sort_by_count(
     let mut groups = group_keyed("$sortByCount", input, &fields, limits, vars, |scope| {
         expr.eval_in(scope).map(Some)
     })?;
+    for group in &mut groups {
+        if let Some(Bson::Int64(n)) = group.get("count") {
+            group.insert("count", int_count(*n));
+        }
+    }
     shape::sort(&[SortKey { path: "count".into(), descending: true }], &mut groups);
     Ok(groups)
 }
@@ -126,44 +132,48 @@ pub(crate) fn parse_unset(value: &Bson) -> Result<Stage> {
 // $sample
 // ---------------------------------------------------------------------------
 
-/// `{$sample: {size: N}}`: `N` a positive whole number (an int, a long, a double or
-/// decimal with no fraction). A missing `size`, any other key, `0`, a negative, a
-/// fraction and a non-number are refused.
+/// `{$sample: {size: N}}`: `N` a number, truncated toward zero as the reference does
+/// (`1.5` is `1`); `0` is allowed and answers nothing. A negative, a non-number, a
+/// missing `size` and any other key are refused.
 pub(crate) fn parse_sample(value: &Bson) -> Result<Stage> {
     let spec = as_document("$sample", value)?;
     for key in spec.keys() {
         if key != "size" {
-            return Err(Error::InvalidQuery(format!(
-                "$sample does not accept `{key}`; it takes: size"
-            )));
+            return Err(Error::InvalidQuery(format!("unrecognized option to $sample: {key}")));
         }
     }
     let Some(size) = spec.get("size") else {
-        return Err(Error::InvalidQuery("$sample needs a `size`: {$sample: {size: N}}".into()));
+        return Err(Error::InvalidQuery("$sample stage must specify a size".into()));
     };
-    let refused = || {
-        Error::InvalidQuery(format!(
-            "$sample `size` is a positive whole number, found {}",
-            match size {
-                Bson::Int32(n) => n.to_string(),
-                Bson::Int64(n) => n.to_string(),
-                Bson::Double(n) => n.to_string(),
-                other => type_name(other).to_string(),
-            }
-        ))
+    let truncated = |d: f64| -> Result<i64> {
+        if d.is_nan() {
+            return Err(Error::InvalidQuery(
+                "size argument to $sample must be a number, found NaN".into(),
+            ));
+        }
+        // `as` saturates, so an enormous size reaches the document limit's refusal.
+        Ok(d.trunc() as i64)
     };
     let n = match size {
         Bson::Int32(n) => i64::from(*n),
         Bson::Int64(n) => *n,
-        // Strictly inside the range an `i64` holds exactly, so the cast cannot saturate.
-        Bson::Double(d) if d.fract() == 0.0 && d.abs() < 9.0e18 => *d as i64,
-        Bson::Decimal128(d) => kimmy_core::decimal::whole_number(d).ok_or_else(refused)?,
-        _ => return Err(refused()),
+        Bson::Double(d) => truncated(*d)?,
+        Bson::Decimal128(d) => truncated(d.to_string().parse::<f64>().map_err(|_| {
+            Error::InvalidQuery("size argument to $sample must be a number".into())
+        })?)?,
+        _ => {
+            return Err(Error::InvalidQuery("size argument to $sample must be a number".into()));
+        }
     };
-    if n < 1 {
-        return Err(refused());
+    if n < 0 {
+        return Err(Error::InvalidQuery("size argument to $sample must not be negative".into()));
     }
     Ok(Stage::Sample(n as usize))
+}
+
+/// A count as the reference gives it: an int, a long only past the int range.
+pub(crate) fn int_count(n: i64) -> Bson {
+    i32::try_from(n).map_or(Bson::Int64(n), Bson::Int32)
 }
 
 /// A source of random positions: `below(n)` answers a number in `0..n`, `n > 0`.
@@ -196,6 +206,9 @@ pub fn sample(
     limits: &Limits,
     below: Below<'_>,
 ) -> Result<Vec<Document>> {
+    if size == 0 {
+        return Ok(Vec::new());
+    }
     if size > limits.max_documents {
         return Err(Error::Limit(format!(
             "$sample size {size} is over the pipeline limit of {} documents",

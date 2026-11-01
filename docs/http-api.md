@@ -460,9 +460,33 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
 
 Only `$addFields`/`$set`, `$project`/`$unset` and `$replaceRoot`/`$replaceWith` are
 allowed; the answer is the one an operator update gives (`matched`, `modified`,
-`commits`, `stamp`). `arrayFilters` with an array `update` is `400`, as is any
-stage that changes or removes `_id`. See
-[Pipeline updates](query-language.md#pipeline-updates).
+`commits`, `stamp`; `find_and_modify` answers `document`, `matched`, `modified` as
+for operators). On `find_and_modify`, `"upsert": true` seeds the inserted document from
+the filter's equality fields and runs the stages over it:
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/find_and_modify -H "$A" -d '{
+  "filter": { "_id": 9, "k": "new" },
+  "update": [ { "$set": { "label": { "$concat": ["$k", "!"] } } } ],
+  "upsert": true, "returnDocument": "after"
+}'
+```
+
+Every refusal is `400` with these message prefixes, and nothing is written:
+
+| Cause | Message begins |
+|---|---|
+| Empty array | `invalid update: a pipeline update needs at least one stage` |
+| Element that is not a document | `invalid update: each stage of a pipeline update is a document` |
+| Any stage but the six allowed | `invalid update: a pipeline update allows only $addFields (or $set), $project (or $unset) and $replaceRoot (or $replaceWith), found <stage>` |
+| `arrayFilters` given | `invalid update: arrayFilters apply to update operators, not to a pipeline update` |
+| A stage that changes or removes `_id` (or gives an upserted document one) | `invalid query: _id is immutable and cannot be updated` |
+| A bad stage operand or expression | the aggregation's own, e.g. `invalid query: $set takes a document`, `unsupported operator "$nope"` |
+| A positional projection with `returnDocument: "after"` | `invalid query: the positional projection ... after a pipeline update` |
+
+A result that fails the collection's validator is `422 validation_failed` (under
+`validationAction: "error"`), and one over 16 MiB is `413 document_too_large`, as for any
+update. See [Pipeline updates](query-language.md#pipeline-updates).
 
 > **Sharp edge.** A `multi: true` request is atomic per chunk, not per
 > request. Once a chunk has committed, the later chunks wait for the writer

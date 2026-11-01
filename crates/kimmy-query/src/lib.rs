@@ -46,6 +46,8 @@ mod sink_tests;
 #[cfg(test)]
 mod sort_zip_tests;
 #[cfg(test)]
+mod stage_reference_tests;
+#[cfg(test)]
 mod stage_tests;
 #[cfg(test)]
 mod update_pipeline_tests;

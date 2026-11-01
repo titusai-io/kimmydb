@@ -1208,11 +1208,11 @@ impl Expr {
             if !declared.redact {
                 return Err(Error::UnsupportedOperator {
                     operator: format!("$${name}"),
-                    reason: Some(
-                        "valid only inside a $redact expression; elsewhere $$ROOT, $$CURRENT, \
-                         $$NOW and $$REMOVE are the system variables"
-                            .into(),
-                    ),
+                    reason: Some(format!(
+                        "Use of undefined variable: {name} ($$DESCEND, $$PRUNE and $$KEEP are \
+                             valid only inside a $redact expression; elsewhere $$ROOT, \
+                             $$CURRENT, $$NOW and $$REMOVE are the system variables)"
+                    )),
                 });
             }
             if path.is_some() {

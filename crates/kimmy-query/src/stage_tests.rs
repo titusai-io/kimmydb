@@ -36,24 +36,26 @@ fn kinds(values: &[&str]) -> Vec<Document> {
 #[test]
 fn sort_by_count_counts_each_value_and_puts_the_commonest_first() {
     let out = run(doc! {"$sortByCount": "$k"}, kinds(&["b", "a", "c", "a", "a", "b"])).unwrap();
-    // a: 3, b: 2, c: 1. The count has the type `{$group: {n: {$sum: 1}}}` gives in this
-    // build, a long.
+    // a: 3, b: 2, c: 1. The count is an int, as the reference's is.
     assert_eq!(
         out,
         vec![
-            doc! {"_id": "a", "count": 3i64},
-            doc! {"_id": "b", "count": 2i64},
-            doc! {"_id": "c", "count": 1i64},
+            doc! {"_id": "a", "count": 3},
+            doc! {"_id": "b", "count": 2},
+            doc! {"_id": "c", "count": 1},
         ]
     );
+    assert!(out.iter().all(|d| matches!(d.get("count"), Some(Bson::Int32(_)))), "{out:?}");
+    // `$group`'s own `{$sum: 1}` stays a long in this build.
     let grouped = run(doc! {"$group": {"_id": "$k", "count": {"$sum": 1}}}, kinds(&["a"])).unwrap();
-    assert_eq!(grouped[0].get("count"), Some(&Bson::Int64(1)), "the same type as $group");
+    assert_eq!(grouped[0].get("count"), Some(&Bson::Int64(1)));
 }
 
 #[test]
 fn sort_by_count_keeps_first_seen_order_among_equal_counts() {
-    // The reference leaves ties undefined; here they stay in the order their value was
-    // first seen: z, y, x all once, then q twice -> q, z, y, x.
+    // The reference leaves ties unspecified (two runs of it differ); here they stay in the
+    // order their value was first seen, which is not a promise: z, y, x all once, then q
+    // twice -> q, z, y, x.
     let out = run(doc! {"$sortByCount": "$k"}, kinds(&["z", "y", "q", "x", "q"])).unwrap();
     let ids: Vec<&str> = out.iter().map(|d| d.get_str("_id").unwrap()).collect();
     assert_eq!(ids, ["q", "z", "y", "x"]);
@@ -63,22 +65,25 @@ fn sort_by_count_keeps_first_seen_order_among_equal_counts() {
 fn sort_by_count_groups_missing_and_null_together_under_null() {
     let input = vec![doc! {"_id": 1}, doc! {"_id": 2, "k": Bson::Null}, doc! {"_id": 3, "k": 1}];
     let out = run(doc! {"$sortByCount": "$k"}, input).unwrap();
-    assert_eq!(out, vec![doc! {"_id": Bson::Null, "count": 2i64}, doc! {"_id": 1, "count": 1i64}]);
+    assert_eq!(out, vec![doc! {"_id": Bson::Null, "count": 2}, doc! {"_id": 1, "count": 1}]);
 }
 
 #[test]
 fn sort_by_count_takes_an_expression_document() {
     let input = kinds(&["a", "b", "a", "a", "b"]);
     let out = run(doc! {"$sortByCount": {"$toUpper": "$k"}}, input).unwrap();
-    assert_eq!(out, vec![doc! {"_id": "A", "count": 3i64}, doc! {"_id": "B", "count": 2i64}]);
-    // An object expression groups by the whole object.
-    let input = vec![doc! {"a": 1, "b": 2}, doc! {"a": 1, "b": 2}, doc! {"a": 1, "b": 3}];
-    let out = run(doc! {"$sortByCount": {"a": "$a", "b": "$b"}}, input).unwrap();
+    assert_eq!(out, vec![doc! {"_id": "A", "count": 3}, doc! {"_id": "B", "count": 2}]);
+    // `$$ROOT` groups by the whole document: two distinct documents, one each.
+    let out = run(
+        doc! {"$sortByCount": "$$ROOT"},
+        vec![doc! {"_id": 1, "k": "a"}, doc! {"_id": 2, "k": "b"}, doc! {"_id": 1, "k": "a"}],
+    )
+    .unwrap();
     assert_eq!(
         out,
         vec![
-            doc! {"_id": {"a": 1, "b": 2}, "count": 2i64},
-            doc! {"_id": {"a": 1, "b": 3}, "count": 1i64},
+            doc! {"_id": {"_id": 1, "k": "a"}, "count": 2},
+            doc! {"_id": {"_id": 2, "k": "b"}, "count": 1},
         ]
     );
 }
@@ -88,8 +93,8 @@ fn sort_by_count_groups_numbers_of_every_type_by_value() {
     let input = vec![doc! {"k": 1}, doc! {"k": 1.0}, doc! {"k": 2i64}, doc! {"k": 1i64}];
     let out = run(doc! {"$sortByCount": "$k"}, input).unwrap();
     assert_eq!(out.len(), 2);
-    assert_eq!(out[0].get("count"), Some(&Bson::Int64(3)));
-    assert_eq!(out[1].get("count"), Some(&Bson::Int64(1)));
+    assert_eq!(out[0].get("count"), Some(&Bson::Int32(3)));
+    assert_eq!(out[1].get("count"), Some(&Bson::Int32(1)));
 }
 
 #[test]
@@ -98,23 +103,35 @@ fn sort_by_count_of_nothing_is_nothing() {
 }
 
 #[test]
-fn sort_by_count_refuses_what_is_not_a_path_or_an_expression() {
-    for operand in [
-        Bson::Int32(1),
-        Bson::Double(1.5),
-        Bson::Boolean(true),
-        Bson::Null,
-        Bson::Array(vec![Bson::String("$k".into())]),
-        Bson::Document(doc! {}),
-        Bson::String("k".into()),
-        Bson::String("".into()),
-        Bson::String("$".into()),
+fn sort_by_count_refuses_what_is_not_a_path_or_an_expression_with_the_references_words() {
+    // Reference 6.0.5, section by section.
+    let kind = "the sortByCount field must be specified as a string or as an object";
+    let path = "the sortByCount field must be defined as a $-prefixed path or an expression inside an object";
+    for (operand, want) in [
+        (Bson::Int32(1), kind),
+        (Bson::Double(1.5), kind),
+        (Bson::Boolean(true), kind),
+        (Bson::Null, kind),
+        (Bson::Array(vec![Bson::String("$k".into())]), kind),
+        (Bson::Document(doc! {}), path),
+        // An object that is not an operator expression is no expression here either.
+        (Bson::Document(doc! {"who": "$k"}), path),
+        (Bson::String("k".into()), path),
+        (Bson::String("".into()), path),
+        (Bson::String("$".into()), "'$' by itself is not a valid FieldPath"),
     ] {
         let message = refused(doc! {"$sortByCount": operand.clone()});
-        assert!(message.contains("$sortByCount takes a field path"), "{operand:?}: {message}");
+        assert_eq!(message, format!("invalid query: {want}"), "{operand:?}");
     }
     // A bad expression inside is that expression's error.
     assert!(aggregate::parse(&[doc! {"$sortByCount": {"$nope": 1}}]).is_err());
+}
+
+#[test]
+fn sort_by_count_widens_its_count_to_a_long_past_the_int_range() {
+    assert_eq!(stages::int_count(0), Bson::Int32(0));
+    assert_eq!(stages::int_count(i64::from(i32::MAX)), Bson::Int32(i32::MAX));
+    assert_eq!(stages::int_count(i64::from(i32::MAX) + 1), Bson::Int64(i64::from(i32::MAX) + 1));
 }
 
 #[test]
@@ -288,50 +305,67 @@ fn seeded(seed: u64) -> impl FnMut(usize) -> usize {
 }
 
 #[test]
-fn sample_parses_a_positive_whole_size_of_any_number_type() {
-    for size in [
-        Bson::Int32(3),
-        Bson::Int64(3),
-        Bson::Double(3.0),
-        Bson::Decimal128("3".parse().unwrap()),
-        Bson::Decimal128("3.0".parse().unwrap()),
+fn sample_parses_a_size_of_any_number_type_truncated_toward_zero() {
+    for (size, want) in [
+        (Bson::Int32(3), 3),
+        (Bson::Int64(3), 3),
+        (Bson::Double(3.0), 3),
+        (Bson::Double(1.5), 1),
+        (Bson::Double(2.999), 2),
+        (Bson::Double(0.5), 0),
+        (Bson::Double(-0.5), 0),
+        (Bson::Int32(0), 0),
+        (Bson::Decimal128("3".parse().unwrap()), 3),
+        (Bson::Decimal128("3.7".parse().unwrap()), 3),
     ] {
         let stages = aggregate::parse(&[doc! {"$sample": {"size": size.clone()}}]).unwrap();
-        assert_eq!(size_of(&stages[0]), 3, "{size:?}");
+        assert_eq!(size_of(&stages[0]), want, "{size:?}");
     }
 }
 
 #[test]
-fn sample_refuses_a_bad_size() {
-    for size in [
-        Bson::Int32(0),
-        Bson::Int32(-1),
-        Bson::Int64(-5),
-        Bson::Double(0.0),
-        Bson::Double(2.5),
-        Bson::Double(-1.0),
-        Bson::Double(f64::NAN),
-        Bson::Double(f64::INFINITY),
-        Bson::Double(1e300),
-        Bson::Decimal128("2.5".parse().unwrap()),
-        Bson::String("3".into()),
-        Bson::Null,
-        Bson::Boolean(true),
-        Bson::Array(vec![Bson::Int32(3)]),
+fn sample_of_size_zero_answers_nothing_and_of_a_fraction_that_many_documents() {
+    // Reference 6.0.5: size 0 answers [], size 1.5 answers one document.
+    assert!(run(doc! {"$sample": {"size": 0}}, numbered(5)).unwrap().is_empty());
+    assert!(run(doc! {"$sample": {"size": 0.5}}, numbered(5)).unwrap().is_empty());
+    assert_eq!(run(doc! {"$sample": {"size": 1.5}}, numbered(5)).unwrap().len(), 1);
+    assert_eq!(run(doc! {"$sample": {"size": 2.0}}, numbered(5)).unwrap().len(), 2);
+}
+
+#[test]
+fn sample_refuses_a_bad_size_in_the_references_words() {
+    for (size, want) in [
+        (Bson::Int32(-1), "size argument to $sample must not be negative"),
+        (Bson::Int64(-5), "size argument to $sample must not be negative"),
+        (Bson::Double(-1.0), "size argument to $sample must not be negative"),
+        (Bson::Double(-1.5), "size argument to $sample must not be negative"),
+        (Bson::String("3".into()), "size argument to $sample must be a number"),
+        (Bson::Null, "size argument to $sample must be a number"),
+        (Bson::Boolean(true), "size argument to $sample must be a number"),
+        (Bson::Document(doc! {}), "size argument to $sample must be a number"),
+        (Bson::Array(vec![Bson::Int32(3)]), "size argument to $sample must be a number"),
+        (Bson::Double(f64::NAN), "must be a number, found NaN"),
     ] {
         let message = refused(doc! {"$sample": {"size": size.clone()}});
-        assert!(
-            message.contains("$sample `size` is a positive whole number"),
-            "{size:?}: {message}"
-        );
+        assert!(message.contains(want), "{size:?}: {message}");
+    }
+    // An enormous size is the pipeline limit's refusal when it runs.
+    for size in [Bson::Double(f64::INFINITY), Bson::Double(1e300), Bson::Int64(i64::MAX)] {
+        let err = run(doc! {"$sample": {"size": size.clone()}}, numbered(3)).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)), "{size:?}: {err:?}");
     }
 }
 
 #[test]
 fn sample_refuses_a_missing_size_an_extra_field_and_a_non_document() {
-    assert!(refused(doc! {"$sample": {}}).contains("needs a `size`"));
-    assert!(refused(doc! {"$sample": {"size": 3, "seed": 1}}).contains("does not accept `seed`"));
-    assert!(refused(doc! {"$sample": {"seed": 1}}).contains("does not accept `seed`"));
+    assert!(refused(doc! {"$sample": {}}).contains("$sample stage must specify a size"));
+    assert!(
+        refused(doc! {"$sample": {"size": 3, "seed": 1}})
+            .contains("unrecognized option to $sample: seed")
+    );
+    assert!(
+        refused(doc! {"$sample": {"seed": 1}}).contains("unrecognized option to $sample: seed")
+    );
     assert!(refused(doc! {"$sample": 3}).contains("$sample takes a document"));
     assert!(refused(doc! {"$sample": Bson::Null}).contains("$sample takes a document"));
 }
@@ -723,7 +757,7 @@ fn redact_run_inside_a_facet_sees_the_facets_input() {
     assert_eq!(
         out,
         vec![doc! {
-            "kept": [{"_id": 1, "count": 2i64}],
+            "kept": [{"_id": 1, "count": 2}],
             "sampled": [{"n": 2i64}],
             "unset": [{"id": 1}, {"id": 2}, {"id": 3}],
         }]
@@ -779,13 +813,12 @@ fn union_with_refuses_what_it_cannot_honour() {
 }
 
 #[test]
-fn union_with_sub_pipeline_refuses_out_merge_vector_search_and_facet_at_any_depth() {
+fn union_with_sub_pipeline_refuses_out_merge_and_vector_search_at_any_depth() {
     let wrap = |stage: Document| doc! {"$unionWith": {"coll": "a", "pipeline": [stage]}};
     for (stage, name) in [
         (doc! {"$out": "t"}, "$out"),
         (doc! {"$merge": {"into": "t"}}, "$merge"),
         (doc! {"$vectorSearch": {"query": "q"}}, "$vectorSearch"),
-        (doc! {"$facet": {"f": [{"$match": {}}]}}, "$facet"),
     ] {
         let message = refused(wrap(stage.clone()));
         assert!(message.contains(name) && message.contains("$unionWith"), "{name}: {message}");
@@ -806,6 +839,24 @@ fn union_with_sub_pipeline_refuses_out_merge_vector_search_and_facet_at_any_dept
         {"$sortByCount": "$k"},
     ]}}]);
     assert!(ok.is_ok(), "{ok:?}");
+}
+
+#[test]
+fn union_with_sub_pipeline_accepts_a_facet_as_the_reference_does() {
+    let ok = aggregate::parse(&[doc! {"$unionWith": {"coll": "a", "pipeline": [
+        {"$facet": {"f": [{"$match": {"n": 1}}, {"$count": "n"}], "g": [{"$sortByCount": "$k"}]}},
+    ]}}]);
+    assert!(ok.is_ok(), "{ok:?}");
+    // And inside a nested union and a $lookup of it.
+    let nested = aggregate::parse(&[doc! {"$unionWith": {"coll": "a", "pipeline": [
+        {"$unionWith": {"coll": "b", "pipeline": [{"$facet": {"f": []}}]}},
+        {"$lookup": {"from": "c", "as": "j", "pipeline": [{"$facet": {"f": []}}]}},
+    ]}}]);
+    assert!(nested.is_ok(), "{nested:?}");
+    // A $facet inside a $facet is still refused, a union between them or not.
+    let message = refused(doc! {"$facet": {"f": [{"$unionWith": {"coll": "a", "pipeline": [
+    {"$facet": {"g": []}}]}}]}});
+    assert!(message.contains("$facet cannot be used inside a $facet"), "{message}");
 }
 
 #[test]

@@ -287,7 +287,8 @@ fn an_empty_array_a_non_document_and_a_bad_stage_shape_are_refused() {
         "invalid update: a pipeline update needs at least one stage; an empty array is not an update"
     );
     for element in [Bson::Int32(1), Bson::String("$set".into()), Bson::Null, Bson::Array(vec![])] {
-        let message = UpdatePipeline::parse(&[element.clone()]).unwrap_err().to_string();
+        let message =
+            UpdatePipeline::parse(std::slice::from_ref(&element)).unwrap_err().to_string();
         assert!(
             message.starts_with("invalid update: each stage of a pipeline update is a document"),
             "{element:?}: {message}"

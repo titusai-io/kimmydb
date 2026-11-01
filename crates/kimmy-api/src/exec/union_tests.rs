@@ -315,3 +315,101 @@ fn on_a_node_with_peers_a_missing_collection_is_the_lookup_404_with_the_retry_hi
     .expect_err("nested");
     assert_eq!(nested.status, 404);
 }
+
+/// The probe's own collections and the answers the reference (6.0.5) gave to
+/// `q8-probes/stages.js`, section by section.
+#[test]
+fn the_references_answers_to_the_union_with_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = live_state(&dir);
+    seed_docs(
+        &state,
+        "stg",
+        vec![
+            doc! {"_id": 1, "k": "a", "n": 1, "a": {"x": 1, "y": 2}, "items": [{"sku": 1, "q": 5}, {"sku": 2}, 7]},
+            doc! {"_id": 2, "k": "b", "n": 2, "a": {"x": 3, "y": 4}},
+            doc! {"_id": 3, "k": "a", "n": 3},
+            doc! {"_id": 4, "k": "c", "n": 4},
+            doc! {"_id": 5, "k": "a", "n": 5},
+            doc! {"_id": 6, "n": 6},
+            doc! {"_id": 7, "k": bson::Bson::Null, "n": 7},
+        ],
+    );
+    seed_docs(
+        &state,
+        "stg_other",
+        vec![
+            doc! {"_id": 10, "k": "u1", "n": 1},
+            doc! {"_id": 11, "k": "u2", "n": 2},
+            doc! {"_id": 12, "k": "u3", "n": 3},
+        ],
+    );
+    let go = |pipeline: Value| {
+        agg(&state, &root(), "app", "stg", &pipeline).unwrap()["documents"].clone()
+    };
+
+    assert_eq!(
+        go(
+            json!([{"$match": {"_id": {"$lte": 2}}}, {"$unionWith": "stg_other"}, {"$project": {"k": 1}}])
+        ),
+        json!([{"_id": 1, "k": "a"}, {"_id": 2, "k": "b"}, {"_id": 10, "k": "u1"}, {"_id": 11, "k": "u2"}, {"_id": 12, "k": "u3"}])
+    );
+    assert_eq!(
+        go(
+            json!([{"$match": {"_id": 1}}, {"$unionWith": {"coll": "stg_other"}}, {"$project": {"k": 1}}])
+        ),
+        json!([{"_id": 1, "k": "a"}, {"_id": 10, "k": "u1"}, {"_id": 11, "k": "u2"}, {"_id": 12, "k": "u3"}])
+    );
+    let out = go(json!([{"$match": {"_id": 1}}, {"$unionWith": {"coll": "stg_other", "pipeline": [
+        {"$match": {"n": {"$gte": 2}}}, {"$project": {"_id": 0, "k": 1}}]}}]));
+    assert_eq!(out[0]["_id"], 1);
+    assert_eq!(out[0]["items"], json!([{"sku": 1, "q": 5}, {"sku": 2}, 7]));
+    assert_eq!(out.as_array().unwrap()[1..], [json!({"k": "u2"}), json!({"k": "u3"})]);
+    assert_eq!(
+        go(json!([{"$match": {"_id": 999}}, {"$unionWith": "stg_other"}, {"$count": "n"}])),
+        json!([{"n": 3}])
+    );
+    assert_eq!(
+        go(json!([{"$match": {"_id": 1}}, {"$unionWith": "nowhere"}, {"$count": "n"}])),
+        json!([{"n": 1}])
+    );
+    assert_eq!(
+        go(json!([{"$match": {"_id": 1}}, {"$unionWith": "stg"}, {"$count": "n"}])),
+        json!([{"n": 8}])
+    );
+    assert_eq!(
+        go(json!([{"$match": {"_id": 1}}, {"$unionWith": {"coll": "stg_other", "pipeline": [
+            {"$match": {"n": 1}}, {"$unionWith": {"coll": "stg", "pipeline": [{"$match": {"_id": 2}}]}}]}},
+            {"$project": {"k": 1}}])),
+        json!([{"_id": 1, "k": "a"}, {"_id": 10, "k": "u1"}, {"_id": 2, "k": "b"}])
+    );
+    assert_eq!(
+        go(
+            json!([{"$match": {"_id": 1}}, {"$facet": {"f": [{"$unionWith": "stg_other"}, {"$count": "n"}]}}])
+        ),
+        json!([{"f": [{"n": 4}]}])
+    );
+    assert_eq!(
+        go(
+            json!([{"$match": {"_id": 1}}, {"$lookup": {"from": "stg_other", "as": "j", "pipeline": [
+            {"$unionWith": {"coll": "stg", "pipeline": [{"$match": {"_id": 2}}]}}, {"$project": {"k": 1}}]}},
+            {"$project": {"j": 1}}])
+        ),
+        json!([{"_id": 1, "j": [{"_id": 10, "k": "u1"}, {"_id": 11, "k": "u2"}, {"_id": 12, "k": "u3"}, {"_id": 2, "k": "b"}]}])
+    );
+    assert_eq!(
+        go(
+            json!([{"$match": {"_id": {"$in": [1, 2]}}}, {"$unionWith": "stg_other"}, {"$sort": {"n": -1, "_id": 1}}, {"$project": {"k": 1}}])
+        ),
+        json!([{"_id": 12, "k": "u3"}, {"_id": 2, "k": "b"}, {"_id": 11, "k": "u2"}, {"_id": 1, "k": "a"}, {"_id": 10, "k": "u1"}])
+    );
+    // "facet inside": the seven documents, then the one the facet makes of the other collection.
+    let out =
+        go(json!([{"$unionWith": {"coll": "stg_other", "pipeline": [{"$facet": {"f": []}}]}}]));
+    let out = out.as_array().unwrap();
+    assert_eq!(out.len(), 8);
+    assert_eq!(
+        out[7],
+        json!({"f": [{"_id": 10, "k": "u1", "n": 1}, {"_id": 11, "k": "u2", "n": 2}, {"_id": 12, "k": "u3", "n": 3}]})
+    );
+}
