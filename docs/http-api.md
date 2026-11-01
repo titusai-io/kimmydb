@@ -446,6 +446,51 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
 document, every identifier filtered and every filter used, and the `$` of the
 element the filter matched — are in [Query language](query-language.md#positional-updates).
 
+**A pipeline update.** An `update` that is an **array of stages** computes the new
+document from the old one ([ADR-265](decisions.md)); the same spelling serves
+`update` (`multi` or not) and `find_and_modify` (with `upsert` too):
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
+  "filter": { "status": "open" },
+  "update": [ { "$set": { "total": { "$add": ["$subtotal", "$tax"] } } }, { "$unset": "draft" } ],
+  "multi": true
+}'
+```
+
+Only `$addFields`/`$set`, `$project`/`$unset` and `$replaceRoot`/`$replaceWith` are
+allowed; the answer is the one an operator update gives (`matched`, `modified`,
+`commits`, `stamp`; `find_and_modify` answers `document`, `matched`, `modified` as
+for operators). On `find_and_modify`, `"upsert": true` seeds the inserted document from
+the filter's equality fields and runs the stages over it (only if nothing matches; a
+document that does is updated). An empty array is an update that changes nothing. A
+result without `_id` gets the stored one back, and a missing field path as a stage value
+(`{"$set": {"p": "$nope"}}`) removes an existing `p` and adds nothing, as in an
+aggregation:
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/find_and_modify -H "$A" -d '{
+  "filter": { "_id": 9, "k": "new" },
+  "update": [ { "$set": { "label": { "$concat": ["$k", "!"] } } } ],
+  "upsert": true, "returnDocument": "after"
+}'
+```
+
+Every refusal is `400` with these message prefixes, and nothing is written:
+
+| Cause | Message begins |
+|---|---|
+| Element that is not a document | `invalid update: each stage of a pipeline update is a document` |
+| Any stage but the six allowed | `invalid update: a pipeline update allows only $addFields (or $set), $project (or $unset) and $replaceRoot (or $replaceWith), found <stage>` |
+| `arrayFilters` given | `invalid update: arrayFilters apply to update operators, not to a pipeline update` |
+| A result with another document's `_id` (or an upserted document given one) | `invalid query: invalid update: _id is immutable and cannot be updated` |
+| A bad stage operand or expression | the aggregation's own, e.g. `invalid query: $set takes a document`, `unsupported operator "$nope"` |
+| A positional projection with `returnDocument: "after"` | `invalid query: the positional projection ... after a pipeline update` |
+
+A result that fails the collection's validator is `422 validation_failed` (under
+`validationAction: "error"`), and one over 16 MiB is `413 document_too_large`, as for any
+update. See [Pipeline updates](query-language.md#pipeline-updates).
+
 > **Sharp edge.** A `multi: true` request is atomic per chunk, not per
 > request. Once a chunk has committed, the later chunks wait for the writer
 > as long as it takes, so a busy writer does not split the request; but a

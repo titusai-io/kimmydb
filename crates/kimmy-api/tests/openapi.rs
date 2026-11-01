@@ -1675,6 +1675,43 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         .await;
     assert_eq!(unchanged, json!({ "matched": 1, "modified": 0, "commits": 0 }));
 
+    // A pipeline update, an array body (ADR-265), on both routes, against the schema the
+    // specification declares for the request and the answer.
+    let piped = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/update",
+            "/v1/db/shop/coll/orders/update",
+            Some(&root),
+            Some(json!({ "filter": { "_id": "a" },
+                         "update": [{ "$set": { "pnote": { "$concat": ["$status", "!"] } } }] })),
+            200,
+        )
+        .await;
+    assert_eq!((&piped["matched"], &piped["modified"]), (&json!(1), &json!(1)), "{piped}");
+    let piped = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/find_and_modify",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(&root),
+            Some(json!({ "filter": { "_id": "a" }, "update": [{ "$unset": "pnote" }],
+                         "returnDocument": "after" })),
+            200,
+        )
+        .await;
+    assert!(piped["document"].get("pnote").is_none(), "{piped}");
+    assert_eq!(piped["document"]["status"], "packed");
+    c.check(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/update",
+        "/v1/db/shop/coll/orders/update",
+        Some(&root),
+        Some(json!({ "filter": { "_id": "a" }, "update": [{ "$match": { "x": 1 } }] })),
+        400,
+    )
+    .await;
+
     // `arrayFilters` on both write routes, driven rather than only declared
     // (ADR-104): the update's `$[line]` needs the filter the request carries.
     c.check(

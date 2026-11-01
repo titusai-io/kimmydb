@@ -1873,6 +1873,16 @@ mod tests {
         fn new(update: Document) -> Self {
             Self { update: kimmy_query::update::parse(&update).unwrap(), now: 1, expected: None }
         }
+
+        /// A pipeline update, the stages of an array update body (ADR-265).
+        fn pipeline(stages: Vec<Document>) -> Self {
+            let stages: Vec<bson::Bson> = stages.into_iter().map(bson::Bson::Document).collect();
+            Self {
+                update: kimmy_query::update::parse_pipeline(&stages, &[]).unwrap(),
+                now: 1,
+                expected: None,
+            }
+        }
     }
 
     impl ModifySpec for Operators {
@@ -1948,6 +1958,79 @@ mod tests {
         assert_eq!(out.before, out.after);
         assert_eq!(out.after.unwrap().get_str("status").unwrap(), "paid");
         assert_eq!(footprint(&engine, &coll, &[1, 2]), before);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// A pipeline update replicates as every update does: one `Replace` entry per changed
+    /// document, carrying the whole stored result (ADR-265). A peer applies it by stamp
+    /// and overwrite; a later change to a field diff will diff the result against what the
+    /// writer saw.
+    #[test]
+    fn a_pipeline_update_logs_the_whole_result_as_one_replace_entry_per_changed_document() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64, "a": 1, "b": 10, "scratch": true}).unwrap();
+        engine.insert(&coll, doc! {"_id": 2_i64, "a": 2, "b": 20, "total": 22_i64}).unwrap();
+        let untouched = footprint(&engine, &coll, &[2]).records;
+        let oplog = engine.oplog_entries().unwrap();
+
+        let mut rx = engine.subscribe();
+        let spec = Operators::pipeline(vec![
+            doc! {"$set": {"total": {"$add": ["$a", "$b"]}}},
+            doc! {"$unset": "scratch"},
+        ]);
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        // Document 2 already holds exactly the result: it is not written.
+        assert_eq!((out.matched, out.modified, out.commits), (2, 1, 1));
+        assert_eq!(engine.oplog_entries().unwrap() - oplog, 1);
+        assert_eq!(footprint(&engine, &coll, &[2]).records, untouched);
+
+        let entries: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.kind, OpKind::Replace);
+        assert_eq!(entry.doc_id, Some(DocId::Int64(1)));
+        let body: Document = bson::deserialize_from_slice(entry.body.as_ref().unwrap()).unwrap();
+        assert_eq!(body, doc! {"_id": 1_i64, "a": 1, "b": 10, "total": 11_i64});
+        // The body is byte for byte the stored one, in the key order stored.
+        assert_eq!(
+            bson::serialize_to_vec(&engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap()).unwrap(),
+            entry.body.clone().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_pipeline_update_gives_each_document_its_own_result() {
+        let (engine, coll, _dir) = engine();
+        for (id, n) in [(1_i64, 1), (2, 2), (3, 3)] {
+            engine.insert(&coll, doc! {"_id": id, "n": n}).unwrap();
+        }
+        let spec = Operators::pipeline(vec![doc! {"$set": {"sq": {"$multiply": ["$n", "$n"]}}}]);
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        assert_eq!((out.matched, out.modified, out.commits), (3, 3, 1));
+        for (id, sq) in [(1_i64, 1_i64), (2, 4), (3, 9)] {
+            let stored = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
+            assert_eq!(stored.get_i64("sq").unwrap(), sq);
+        }
+    }
+
+    #[test]
+    fn a_pipeline_that_leaves_the_document_byte_equal_writes_nothing() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64, "status": "paid", "n": 1_i64}).unwrap();
+        let before = footprint(&engine, &coll, &[1]);
+        let mut rx = engine.subscribe();
+        for stages in [
+            vec![doc! {"$set": {"status": "paid"}}],
+            vec![doc! {"$set": {"n": {"$add": ["$n", 0]}}}],
+            vec![doc! {"$replaceWith": "$$ROOT"}],
+            vec![doc! {"$set": {"x": 1}}, doc! {"$unset": "x"}],
+            vec![doc! {"$project": {"status": 1, "n": 1}}],
+        ] {
+            let spec = Operators::pipeline(stages.clone());
+            let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+            assert_eq!((out.matched, out.modified, out.commits), (1, 0, 0), "{stages:?}");
+            assert_eq!(footprint(&engine, &coll, &[1]), before, "{stages:?}");
+        }
         assert!(drain(&mut rx).is_empty());
     }
 

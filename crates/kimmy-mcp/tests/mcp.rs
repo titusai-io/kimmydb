@@ -787,6 +787,35 @@ async fn every_write_tool_reports_the_stamp_it_produced() {
 }
 
 #[tokio::test]
+async fn update_takes_a_pipeline_of_stages_as_well_as_operators() {
+    // ADR-265: the same value the REST route takes, an array of stages.
+    let server = Server::start().await;
+    server.engine.create_collection("app", "calc").unwrap();
+    let root = server.root();
+    server
+        .call_ok(
+            &root,
+            "insert_many",
+            json!({"database":"app","collection":"calc",
+                   "documents":[{"_id":1,"a":2,"b":3},{"_id":2,"a":5,"b":7}]}),
+        )
+        .await;
+    let updated = server
+        .call_ok(
+            &root,
+            "update",
+            json!({"database":"app","collection":"calc","filter":{},"multi":true,
+                   "update":[{"$set":{"sum":{"$add":["$a","$b"]}}},{"$unset":"b"}]}),
+        )
+        .await;
+    assert_eq!(updated["modified"], 2, "{updated}");
+    let found = server.call_ok(&root, "find", json!({"database":"app","collection":"calc"})).await;
+    let docs = found["documents"].as_array().expect("documents");
+    assert_eq!(docs[0], json!({"_id":1,"a":2,"sum":5}));
+    assert_eq!(docs[1], json!({"_id":2,"a":5,"sum":12}));
+}
+
+#[tokio::test]
 async fn insert_and_insert_many_echo_the_id_they_stored() {
     // A binary `_id` keeps its subtype in the echo; a generated ObjectId and
     // an integer echo as they always did. Every subtype of a length holds the
