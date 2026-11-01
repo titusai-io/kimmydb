@@ -17,6 +17,18 @@ Status meanings:
 
 ---
 
+## 🟡 The field-level merge state keeps counter totals exact to 2^119, and refuses a total past it
+
+**Raised 2026-11-01, with the field-level merge state (Q7 phase 0).** The merge state is a pure module that nothing stores, replicates or serves yet. It keeps one total per writer for every `$inc` counter, in an `i128`. What a client sees of a counter is bounded by the 64-bit integer range: a read saturates, and a local `$inc` that would leave that range is refused. Underneath, a writer's total is bounded at 2^119, so that the sum over 64 writers stays exact in an `i128` (each read-side term is below 2^120, and 64 of them sum below 2^126).
+
+- **A total past 2^119 is refused where it enters:** a local `$inc` that would take the writer's own slot past it, a replicated loss record carrying a total past it, and a decode of any stored or received state holding one. A member therefore never stores a state it cannot decode.
+- **It is not reachable in practice.** Reaching 2^119 takes more than 2^56 increments of the largest size a client can send, and a client never sees a refusal at this bound, only at the 64-bit one. It is recorded here so that it is not read as a limit the design forgot.
+- **The read side saturates as a backstop** if a hand-built state ever holds more.
+
+**To close:** none planned. The bound is the price of exact arithmetic across 64 writers; raising it means a wider integer on every slot.
+
+---
+
 ## 🟡 A collection validator is enforced by the member that accepts the write, so a non-conforming document can be stored and kept
 
 **Raised 2026-10-29, with ADR-257 part 2.** A collection's validator ([validation.md](validation.md)) is replicated metadata and a guard on client writes. A leaderless cluster cannot make a schema change atomic, and a replicated write is never refused, so two gaps are accepted as the price:
