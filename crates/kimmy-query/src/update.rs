@@ -1596,9 +1596,11 @@ mod tests {
 
     #[test]
     fn the_array_filters_of_one_update_hold_their_regex_patterns_under_one_budget() {
-        // Three entries of one `\w{15}` each: about 2.4 MiB held for the whole
-        // update, past the 2 MiB one filter may hold; two fit.
-        let entry = |id: &str| doc! { format!("{id}.s"): { "$regex": format!(r"\w{{15}}{id}") } };
+        // Three entries of one Unicode word class repeated 15 times each: about
+        // 2.4 MiB held for the whole update, past the 2 MiB one filter may hold;
+        // two fit.
+        let w = kimmy_core::regex::UNICODE_WORD_CLASS;
+        let entry = |id: &str| doc! { format!("{id}.s"): { "$regex": format!("{w}{{15}}{id}") } };
         let two = doc! { "$set": { "a.$[x].s": 1, "b.$[y].s": 1 } };
         parse_with_filters(&two, &[entry("x"), entry("y")]).unwrap();
         let three = doc! { "$set": { "a.$[x].s": 1, "b.$[y].s": 1, "c.$[z].s": 1 } };
@@ -2717,7 +2719,8 @@ mod tests {
     /// `$regex` still counts that one.
     #[test]
     fn an_expr_entry_still_counts_its_regex_conditions_against_the_shared_budget() {
-        let entry = |id: &str| doc! { format!("{id}.s"): { "$regex": format!(r"\w{{15}}{id}") } };
+        let w = kimmy_core::regex::UNICODE_WORD_CLASS;
+        let entry = |id: &str| doc! { format!("{id}.s"): { "$regex": format!("{w}{{15}}{id}") } };
         let with_expr = |id: &str| {
             doc! { "$and": [
                 { "$expr": { "$gt": [format!("$${id}.n"), 0] } },

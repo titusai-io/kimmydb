@@ -2,7 +2,7 @@
 //!
 //! A filter keeps each pattern compiled, for the life of the request, so the
 //! compiled size is held rather than passed through. With `regex`'s own
-//! limits, one `{"$regex": "\\w{209}"}` held 11 MiB after parse and a 1.4 KB
+//! limits, one `$regex` of a Unicode word class repeated 209 times held 11 MiB after parse and a 1.4 KB
 //! `$or` of forty of them 446 MiB. This counts the heap through the global
 //! allocator and holds every filter the parser accepts — the largest ones it
 //! accepts included — under a bound, after parse and after matching. The
@@ -11,9 +11,11 @@
 //! each direction it searches in) and the smaller caches of the slower
 //! engines; the most measured is about 0.53 MiB per pattern. These are
 //! measurements, not a proof of the worst case: each ceiling sits just above
-//! the largest filter measured, 1.95 MiB after parse (three `\w{12}`) and
-//! 17.7 MiB after matching (a `\w{18}` and thirty-one reverse-anchored
-//! alternations, over the documents below).
+//! the largest filter measured, 1.95 MiB after parse (three word classes
+//! repeated 12 times) and 17.7 MiB after matching (one repeated 18 times and
+//! thirty-one reverse-anchored alternations, over the documents below). The
+//! word class is `UNICODE_WORD_CLASS`, spelled out: `\w` itself is ASCII and
+//! compiles small, so the cases named `\w{N}` below repeat that class.
 //!
 //! One test in this binary, because the count is process-wide: a second test
 //! running in parallel would allocate into it.
@@ -93,17 +95,18 @@ fn a_parsed_filter_holds_its_regex_patterns_within_a_bound() {
         docs.push(doc! { "s": random(&['a', 'b', 'é', ' '], len) });
     }
 
+    let w = kimmy_core::regex::UNICODE_WORD_CLASS;
     let cases: Vec<(String, Document)> = vec![
-        ("one \\w{209}".into(), or_of(1, |_| r"\w{209}".into())),
-        ("ten \\w{209}".into(), or_of(10, |_| r"\w{209}".into())),
-        ("forty \\w{209}".into(), or_of(40, |_| r"\w{209}".into())),
-        ("one \\w{20}".into(), or_of(1, |i| format!(r"\w{{20}}{i}"))),
-        ("two \\w{20}".into(), or_of(2, |i| format!(r"\w{{20}}{i}"))),
-        ("three \\w{20}".into(), or_of(3, |i| format!(r"\w{{20}}{i}"))),
-        ("thirty-two \\w{20}".into(), or_of(32, |i| format!(r"\w{{20}}{i}"))),
-        ("forty \\w{20}".into(), or_of(40, |i| format!(r"\w{{20}}{i}"))),
-        ("three \\w{12}".into(), or_of(3, |i| format!(r"\w{{12}}{i}"))),
-        ("four \\w{12}".into(), or_of(4, |i| format!(r"\w{{12}}{i}"))),
+        ("one \\w{209}".into(), or_of(1, |_| format!("{w}{{209}}"))),
+        ("ten \\w{209}".into(), or_of(10, |_| format!("{w}{{209}}"))),
+        ("forty \\w{209}".into(), or_of(40, |_| format!("{w}{{209}}"))),
+        ("one \\w{20}".into(), or_of(1, |i| format!("{w}{{20}}{i}"))),
+        ("two \\w{20}".into(), or_of(2, |i| format!("{w}{{20}}{i}"))),
+        ("three \\w{20}".into(), or_of(3, |i| format!("{w}{{20}}{i}"))),
+        ("thirty-two \\w{20}".into(), or_of(32, |i| format!("{w}{{20}}{i}"))),
+        ("forty \\w{20}".into(), or_of(40, |i| format!("{w}{{20}}{i}"))),
+        ("three \\w{12}".into(), or_of(3, |i| format!("{w}{{12}}{i}"))),
+        ("four \\w{12}".into(), or_of(4, |i| format!("{w}{{12}}{i}"))),
         ("thirty-two short".into(), or_of(32, |i| format!("^a{i}"))),
         ("thirty-three short".into(), or_of(33, |i| format!("^a{i}"))),
         ("a hundred short".into(), or_of(100, |i| format!("^a{i}"))),
@@ -123,12 +126,12 @@ fn a_parsed_filter_holds_its_regex_patterns_within_a_bound() {
         ("thirty-two word-bounded".into(), or_of(32, |i| format!(r"\b[ab]*a[ab]{{14}}\b|q{i}z"))),
         (
             "thirty-two \\w-led reverse-anchored".into(),
-            or_of(32, |i| format!(r"[\w--\d]?(a|b)*a(a|b){{13}}(a|b)*$|q{i}z")),
+            or_of(32, |i| format!(r"[{w}--\d]?(a|b)*a(a|b){{13}}(a|b)*$|q{i}z")),
         ),
         (
             "one \\w{18} and thirty-one reverse-anchored".into(),
             or_of(32, |i| match i {
-                0 => r"\w{18}(a|b)*$".to_string(),
+                0 => format!("{w}{{18}}(a|b)*$"),
                 _ => format!("(a|b)*a(a|b){{13}}(a|b)*$|q{i}z"),
             }),
         ),

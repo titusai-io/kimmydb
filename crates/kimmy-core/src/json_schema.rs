@@ -65,11 +65,23 @@ impl Schema {
     /// inside a filter, the filter's; otherwise one of its own, so a schema
     /// holds at most [`crate::regex::REGEX_CONDITIONS_LIMIT`] patterns.
     pub fn parse(schema: &Bson) -> Result<Schema> {
+        Self::parse_as(schema, false)
+    }
+
+    /// Parse the schema of a validator already stored, as a build that accepted it
+    /// read it: a pattern with a possessive quantifier, which [`Self::parse`]
+    /// refuses in a schema being set, still loads, so that the collection keeps its
+    /// validator across the upgrade (ADR-257).
+    pub fn parse_stored(schema: &Bson) -> Result<Schema> {
+        Self::parse_as(schema, true)
+    }
+
+    fn parse_as(schema: &Bson, stored: bool) -> Result<Schema> {
         let _budget = RegexBudget::open();
         let Bson::Document(source) = schema else {
             return Err(Error::InvalidQuery("$jsonSchema requires a schema document".into()));
         };
-        let root = Parser { path: Vec::new() }.node(schema, 1)?;
+        let root = Parser { path: Vec::new(), stored }.node(schema, 1)?;
         Ok(Schema { source: Arc::new(source.clone()), root: Arc::new(root) })
     }
 
@@ -226,6 +238,8 @@ const KEYWORDS: &str = "bsonType, type, required, properties, additionalProperti
 struct Parser {
     /// The keywords and names from the outermost schema to the one being read.
     path: Vec<String>,
+    /// Whether the schema is already stored, so its patterns load as they did.
+    stored: bool,
 }
 
 impl Parser {
@@ -551,7 +565,12 @@ impl Parser {
     }
 
     fn regex(&self, keyword: &str, pattern: &str) -> Result<RegexPattern> {
-        RegexPattern::new(pattern, "").map_err(|e| match e {
+        let compiled = if self.stored {
+            RegexPattern::new_stored(pattern, "")
+        } else {
+            RegexPattern::new(pattern, "")
+        };
+        compiled.map_err(|e| match e {
             Error::InvalidQuery(why) => {
                 self.refuse(keyword, &format!("holds a pattern that {why}"))
             }
