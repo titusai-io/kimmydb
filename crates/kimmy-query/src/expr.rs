@@ -2481,13 +2481,9 @@ impl Total {
             return;
         };
         self.seen.add(value);
-        // The integers are added at `Int64` width whatever they were stored as:
+        // The running total widens as `$add` does, `Int32` to `Int64` to a double;
         // the width of the answer is decided once, at the end (see `to_bson`),
         // from the exact total, so the order of the values cannot change it.
-        let n = match n {
-            Num::Int32(i) => Num::Int64(i64::from(i)),
-            other => other,
-        };
         self.plain = Some(match self.plain {
             Some(acc) => acc.add(n),
             None => n,
