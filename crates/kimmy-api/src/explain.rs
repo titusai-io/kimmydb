@@ -256,6 +256,44 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
              buckets of about equal size, never splitting a value"
                 .into()
         }
+        Stage::SetWindowFields(spec) => {
+            out["outputs"] = json!(spec.outputs.iter().map(|o| o.name.clone()).collect::<Vec<_>>());
+            out["sortBy"] = json!(
+                spec.sort
+                    .iter()
+                    .map(|k| format!("{}{}", if k.descending { "-" } else { "" }, k.path))
+                    .collect::<Vec<_>>()
+            );
+            "blocking, in memory: files the input by partition, sorts each partition and computes \
+             every output from a window of the documents around each one; the buffered documents \
+             and outputs are held to a byte limit"
+                .into()
+        }
+        Stage::Densify(spec) => {
+            out["field"] = json!(spec.field);
+            out["partitionByFields"] = json!(spec.partition_fields);
+            "blocking, in memory: sorts each partition by the field and generates documents for \
+             the gaps; the documents it would generate are counted against the pipeline's \
+             document limit before any is made"
+                .into()
+        }
+        Stage::Fill(spec) => {
+            out["valueFields"] =
+                json!(spec.values.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+            out["methodFields"] = json!(
+                spec.window
+                    .as_ref()
+                    .map(|w| w.outputs.iter().map(|o| o.name.clone()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            );
+            if spec.window.is_some() {
+                "blocking, in memory: fills by `locf` or `linear` over sorted partitions, and by \
+                 `value` where a field is null or missing"
+                    .into()
+            } else {
+                "fills a null or missing field from an expression, one document at a time".into()
+            }
+        }
         Stage::Facet(facets) => {
             out["facets"] = json!(
                 facets
@@ -612,12 +650,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{pipeline}: {e:?}"));
         }
         // Over the ceiling a run refuses; a plan has nothing to count.
-        let tight = aggregate::Limits { max_documents: 3 };
+        let tight = aggregate::Limits { max_documents: 3, ..Default::default() };
         let pipeline = json!([{ "$match": {} }]);
-        let run = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(exec::aggregate_with_limits(&state, &root(), "app", "a", &pipeline, tight));
+        let run = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(
+            exec::aggregate_with_limits(&state, &root(), "app", "a", &pipeline, tight.clone()),
+        );
         assert!(run.is_err());
         let planned =
             aggregate_explain_with_limits(&state, &root(), "app", "a", &pipeline, tight).unwrap();

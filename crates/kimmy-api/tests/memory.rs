@@ -105,8 +105,8 @@ fn decoded_bytes() -> usize {
 
 /// A document holding `DIM` doubles, whose smallest element is `i`.
 ///
-/// Distinct minima, because that is what the sort orders by: a path through an
-/// array sorts by its smallest element, in both directions.
+/// Distinct minima, because that is what an ascending sort orders by: a path through
+/// an array sorts by its smallest element ascending and its largest descending.
 fn wide_doc(i: i64) -> Document {
     let values: Vec<Bson> =
         (0..DIM).map(|k| Bson::Double(i as f64 + (k as f64) / (DIM as f64))).collect();

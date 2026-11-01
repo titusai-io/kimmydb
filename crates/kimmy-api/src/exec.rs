@@ -3748,16 +3748,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = live_state(&dir);
         seed_pipeline_source(&state, "docs", 30, true);
-        let limits = aggregate::Limits { max_documents: 10 };
+        let limits = aggregate::Limits { max_documents: 10, ..Default::default() };
         let auth = superuser();
 
         let whole = json!([{ "$count": "c" }]);
-        let err = agg_limits(&state, &auth, "app", "docs", &whole, limits)
+        let err = agg_limits(&state, &auth, "app", "docs", &whole, limits.clone())
             .expect_err("the whole collection is over the ceiling");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
 
         let narrowed = json!([{ "$match": { "n": 3 } }, { "$count": "c" }]);
-        let out = agg_limits(&state, &auth, "app", "docs", &narrowed, limits).unwrap();
+        let out = agg_limits(&state, &auth, "app", "docs", &narrowed, limits.clone()).unwrap();
         assert_eq!(out["documents"][0]["c"], 6);
 
         // A leading `$match` that admits too many is refused too, and the
@@ -4020,11 +4020,11 @@ mod tests {
         );
         let join = json!([{ "$lookup": { "from": "products", "localField": "items.sku",
                                         "foreignField": "_id", "as": "p" } }]);
-        let tight = aggregate::Limits { max_documents: 3 };
+        let tight = aggregate::Limits { max_documents: 3, ..Default::default() };
         let err = agg_limits(&state, &superuser(), "app", "orders", &join, tight)
             .expect_err("four products held under a ceiling of three");
         assert!(format!("{err:?}").contains("$lookup produced 4 documents"), "{err:?}");
-        let roomy = aggregate::Limits { max_documents: 4 };
+        let roomy = aggregate::Limits { max_documents: 4, ..Default::default() };
         let out = agg_limits(&state, &superuser(), "app", "orders", &join, roomy).unwrap();
         assert_eq!(out["documents"][0]["p"].as_array().unwrap().len(), 4);
 
@@ -4038,7 +4038,7 @@ mod tests {
         );
         let wide = json!([{ "$lookup": { "from": "wide", "localField": "items.sku",
                                         "foreignField": "covers.sku", "as": "p" } }]);
-        let one = aggregate::Limits { max_documents: 1 };
+        let one = aggregate::Limits { max_documents: 1, ..Default::default() };
         let out = agg_limits(&state, &superuser(), "app", "orders", &wide, one).unwrap();
         assert_eq!(out["documents"][0]["p"].as_array().unwrap().len(), 1);
     }
@@ -4208,15 +4208,21 @@ mod tests {
                                     "connectToField": "_id", "as": "up", "maxDepth": max_depth } }])
         };
         // The foreign collection is held whole, six documents, like a `$lookup`'s.
-        let small = aggregate::Limits { max_documents: 5 };
+        let small = aggregate::Limits { max_documents: 5, ..Default::default() };
         let err = agg_limits(&state, &superuser(), "app", "emp", &from(json!(["d"]), 10), small)
             .expect_err("six foreign documents under a ceiling of five");
         assert!(format!("{err:?}").contains("$graphLookup reads `emp` whole"), "{err:?}");
         // What the walks reach, in all, is held to it too: 3 + 2 + 1 is six, and `e` adds two more.
-        let six = aggregate::Limits { max_documents: 6 };
-        let out =
-            agg_limits(&state, &superuser(), "app", "emp", &from(json!(["d", "c", "b"]), 10), six)
-                .unwrap();
+        let six = aggregate::Limits { max_documents: 6, ..Default::default() };
+        let out = agg_limits(
+            &state,
+            &superuser(),
+            "app",
+            "emp",
+            &from(json!(["d", "c", "b"]), 10),
+            six.clone(),
+        )
+        .unwrap();
         assert_eq!(out["documents"].as_array().unwrap().len(), 3);
         let err = agg_limits(
             &state,
@@ -4224,7 +4230,7 @@ mod tests {
             "app",
             "emp",
             &from(json!(["d", "c", "b", "e"]), 10),
-            six,
+            six.clone(),
         )
         .expect_err("over six reached in all");
         let text = format!("{err:?}");
@@ -4319,11 +4325,11 @@ mod tests {
         docs.push(bson::doc! { "_id": 10, "n": "text" });
         seed_docs(&state, "big", docs);
         seed_docs(&state, "one", vec![bson::doc! { "_id": 1, "k": 1 }]);
-        let three = aggregate::Limits { max_documents: 3 };
+        let three = aggregate::Limits { max_documents: 3, ..Default::default() };
         let graph = json!([{ "$graphLookup": { "from": "big", "startWith": "$k",
             "connectFromField": "n", "connectToField": "n", "as": "up", "maxDepth": 1,
             "restrictSearchWithMatch": { "$expr": { "$gt": [{ "$add": ["$n", 1] }, 0] } } } }]);
-        let err = agg_limits(&state, &superuser(), "app", "one", &graph, three)
+        let err = agg_limits(&state, &superuser(), "app", "one", &graph, three.clone())
             .expect_err("eleven documents under a ceiling of three");
         let text = format!("{err:?}");
         assert!(
@@ -4343,7 +4349,7 @@ mod tests {
             "{text}"
         );
         // Under the ceiling both still run.
-        let roomy = aggregate::Limits { max_documents: 100 };
+        let roomy = aggregate::Limits { max_documents: 100, ..Default::default() };
         assert!(agg_limits(&state, &superuser(), "app", "one", &lookup, roomy).is_ok());
     }
 
@@ -4364,10 +4370,10 @@ mod tests {
         );
         let join = json!([{ "$lookup": { "from": "products", "localField": "items.sku",
                                         "foreignField": "_id", "as": "p" } }]);
-        let nine = aggregate::Limits { max_documents: 9 };
+        let nine = aggregate::Limits { max_documents: 9, ..Default::default() };
         let out = agg_limits(&state, &superuser(), "app", "orders", &join, nine).unwrap();
         assert_eq!(out["count"], 3);
-        let eight = aggregate::Limits { max_documents: 8 };
+        let eight = aggregate::Limits { max_documents: 8, ..Default::default() };
         let err = agg_limits(&state, &superuser(), "app", "orders", &join, eight)
             .expect_err("nine attached under a ceiling of eight, three held");
         assert!(format!("{err:?}").contains("$lookup would attach 9 documents in all"), "{err:?}");
@@ -4387,7 +4393,7 @@ mod tests {
             (0..3).map(|i| bson::doc! { "_id": i, "k": bson::Bson::Null }).collect(),
         );
         let join = json!([{ "$lookup": { "from": "nulls", "localField": "k", "foreignField": "k", "as": "p" } }]);
-        let two = aggregate::Limits { max_documents: 2 };
+        let two = aggregate::Limits { max_documents: 2, ..Default::default() };
         let out = agg_limits(&state, &superuser(), "app", "orders", &join, two).unwrap();
         assert_eq!(out["documents"][0]["p"], json!([]));
     }
@@ -4428,7 +4434,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = live_state(&dir);
         seed_pipeline_source(&state, "docs", 30, true);
-        let limits = aggregate::Limits { max_documents: 10 };
+        let limits = aggregate::Limits { max_documents: 10, ..Default::default() };
 
         let pipeline = json!([{ "$project": { "n": 1 } }, { "$match": { "n": 3 } }]);
         let err = agg_limits(&state, &superuser(), "app", "docs", &pipeline, limits)

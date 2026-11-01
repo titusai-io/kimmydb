@@ -564,7 +564,7 @@ fn n_must_be_a_positive_integer() {
 /// limit is.
 #[test]
 fn a_huge_n_answers_every_row_of_a_small_group() {
-    let limits = Limits { max_documents: 10 };
+    let limits = Limits { max_documents: 10, ..Default::default() };
     let data: Vec<Document> = (1..=6).map(|i| doc! {"_id": i, "x": i}).collect();
     let all: Vec<i32> = (1..=6).collect();
     let ints = |v: &[i32]| Bson::Array(v.iter().map(|i| Bson::Int32(*i)).collect());
@@ -588,7 +588,7 @@ fn a_huge_n_answers_every_row_of_a_small_group() {
 /// says about the rows held in all.
 #[test]
 fn buffers_across_many_groups_are_not_refused() {
-    let limits = Limits { max_documents: 10 };
+    let limits = Limits { max_documents: 10, ..Default::default() };
     let input: Vec<Document> = (0..12).map(|i| doc! {"g": i % 3, "x": i}).collect();
     for acc in [
         doc! {"$topN": {"n": 10, "sortBy": {"x": 1}, "output": "$x"}},
@@ -716,7 +716,7 @@ fn ranked_buffers_take_sixty_thousand_rows_with_n_of_sixty_thousand() {
     // not. Reverse order is the worst case for an insert at the front.
     let n = 60_000;
     let data: Vec<Document> = (0..n).rev().map(|i| doc! {"x": i}).collect();
-    let limits = Limits { max_documents: 200_000 };
+    let limits = Limits { max_documents: 200_000, ..Default::default() };
     for (acc, ascending) in [
         (doc! {"$topN": {"n": n, "sortBy": {"x": 1}, "output": "$x"}}, true),
         (doc! {"$bottomN": {"n": n, "sortBy": {"x": 1}, "output": "$x"}}, true),

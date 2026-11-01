@@ -526,7 +526,7 @@ a provider this member cannot build is one only an operator can.
 already read in full in the response body, so logging them would be an access
 log of nothing but the failures — half a record, and one this server has never
 kept. They are `bad_request`, `payload_too_large`, `document_too_large`,
-`id_too_large`, `validation_failed`, `unsupported_media_type`,
+`answer_too_large`, `id_too_large`, `validation_failed`, `unsupported_media_type`,
 `unauthorized`, `forbidden`, `not_found`, `conflict`, `duplicate_key`,
 `unique_violation`, `no_vectors`, `resume_token_expired`, `rate_limited`,
 `stale` and `collection_purging`. Count them with `kimmy_responses_total{class="4xx"}`,
