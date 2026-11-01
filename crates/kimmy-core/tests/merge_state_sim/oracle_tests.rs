@@ -86,3 +86,26 @@ fn deletewon_needs_a_delete_that_killed_the_life() {
     let ok = |k: LossKey| oracle::sound_record(&k, &log, &alive, &dels, 1_000_000_000);
     assert!(ok(key(LossKind::DeleteWon, "y", b)));
 }
+
+#[test]
+fn clash_must_name_a_path_the_write_wrote() {
+    // A inserts {x, y}, then sets x (A@2) and y (A@3); B, which had only the insert, sets y later
+    // by its clock (B@6). Only A's write of y clashes with B's: A's write of x never touched y.
+    let cfg = Cfg::default_ret();
+    let ret = cfg.opts.retention;
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "AB".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int(1)), ("y", Value::Int(1))], &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    let a_x = ms[0].set("x", Value::Int(5), &mut log, 0).unwrap();
+    let a_y = ms[0].set("y", Value::Int(2), &mut log, 0).unwrap();
+    let b_y = ms[1].set("y", Value::Int(9), &mut log, 4).unwrap();
+    assert!(a_y < b_y && a_x < b_y);
+    fixpoint(&mut ms, 40);
+    let (alive, dels) = facts(&log, ret);
+    let ok = |k: LossKey| oracle::sound_record(&k, &log, &alive, &dels, ret);
+    assert!(ok(key(LossKind::Clash, "y", a_y)), "the genuine clash");
+    assert!(ms[0].state().losses.contains_key(&key(LossKind::Clash, "y", a_y)));
+    assert!(!ok(key(LossKind::Clash, "y", a_x)), "A's write of x never wrote y");
+    assert!(!ok(key(LossKind::Clash, "nope", a_y)), "a path nobody wrote");
+}

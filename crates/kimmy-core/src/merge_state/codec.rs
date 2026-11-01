@@ -582,6 +582,65 @@ mod tests {
         assert!(MergeState::decode(&hand(&[a, b], &[a, b], &[(wa, 1), (wb, 2)])).is_ok());
     }
 
+    /// A state whose only register has the given `obs` entries and generation `seen` entries,
+    /// written by hand in the order given.
+    fn with_obs(obs: &[(MStamp, MStamp, i128)], seen: &[(MStamp, i128)]) -> Vec<u8> {
+        let life = stamp(1, b'A');
+        let wr = WriterId { node: NodeId::from_bytes([b'A'; 16]), epoch: Epoch::from_u64(0) };
+        let mut w = W(Vec::new());
+        w.0.extend_from_slice(&MAGIC);
+        w.u8(VERSION);
+        w.len(0); // lives
+        w.len(0); // dead
+        w.len(0); // deletes
+        w.len(1); // regs
+        w.stamp(&life);
+        w.str("x");
+        w.stamp(&life); // the register's stamp
+        w.value(&Value::Int(1));
+        w.len(obs.len());
+        for (slot_life, slot_stamp, total) in obs {
+            w.stamp(slot_life);
+            w.wid(&wr);
+            w.opt_stamp(&None);
+            w.stamp(slot_stamp);
+            w.i128(*total);
+        }
+        if seen.is_empty() {
+            w.u8(0); // no generation
+        } else {
+            w.u8(1);
+            w.stamp(&life);
+            w.len(seen.len());
+            for (slot_life, total) in seen {
+                w.stamp(slot_life);
+                w.wid(&wr);
+                w.opt_stamp(&None);
+                w.i128(*total);
+            }
+        }
+        w.u8(0); // soi
+        w.len(0); // slots
+        w.len(0); // vv
+        w.len(0); // losses
+        w.0
+    }
+
+    #[test]
+    fn unsorted_or_duplicate_obs_and_seen_entries_are_refused() {
+        let (a, b) = (stamp(1, b'A'), stamp(2, b'A'));
+        let no = Err(DecodeError::NotCanonical);
+        // sorted: fine, and canonical
+        let good = with_obs(&[(a, a, 1), (b, a, 2)], &[(a, 1), (b, 2)]);
+        assert_eq!(MergeState::decode(&good).unwrap().encode(), good);
+        // a register's obs: out of order, duplicate
+        assert_eq!(MergeState::decode(&with_obs(&[(b, a, 2), (a, a, 1)], &[])), no);
+        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1), (a, b, 2)], &[])), no);
+        // a generation's seen totals: out of order, duplicate
+        assert_eq!(MergeState::decode(&with_obs(&[], &[(b, 2), (a, 1)])), no);
+        assert_eq!(MergeState::decode(&with_obs(&[], &[(a, 1), (a, 2)])), no);
+    }
+
     #[test]
     fn a_flag_byte_other_than_0_or_1_is_refused() {
         let mut w = Writer::new(

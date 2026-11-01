@@ -1192,10 +1192,13 @@ fn upsert_soi_is_create_then_inc() {
 fn upsert_with_conflicting_paths_is_refused_whole() {
     // `$setOnInsert`, `$set` and `$inc` on one path conflict: nothing is written.
     type Case<'a> = (&'a [(&'a str, Value)], &'a str, &'a [(&'a str, Value)]);
-    let cases: [Case; 3] = [
+    let cases: [Case; 5] = [
         (&[("x", s("a"))], "x", &[]),            // $setOnInsert vs $inc
         (&[], "x", &[("x", i(1))]),              // $set vs $inc
         (&[("y", s("a"))], "x", &[("y", i(1))]), // $setOnInsert vs $set
+        // the repeated path is not next to its twin in the order the lists are given
+        (&[("a", s("a")), ("b", s("b"))], "a", &[]),
+        (&[("a", s("a")), ("b", s("b"))], "c", &[("a", i(1))]),
     ];
     for (fields, inc, sets) in cases {
         // The one-shot form, and the two-step form given the whole update: each refuses before
@@ -1594,4 +1597,39 @@ fn receive_loss_refuses_a_total_past_the_bound() {
     assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state);
     // Other loss values are unaffected.
     assert!(w.receive_loss(key("g"), LossValue::Value(i(i64::MAX))));
+}
+
+#[test]
+fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
+    // A generation over slots whose totals would overflow a plain i128 sum or difference: the
+    // figure saturates instead of panicking (the decoder keeps such totals out, the fields are
+    // public).
+    let o = opts();
+    let mut w = Writer::new(wid('A', 0), o.clone());
+    w.insert(&[("x", i(1))], 0).unwrap();
+    let mut st = w.state.clone();
+    let life = *st.lives.keys().next().unwrap();
+    let gen_stamp = MStamp { hlc: h(9), writer: wid('A', 0) };
+    let slot_stamp = MStamp { hlc: h(2), writer: wid('B', 0) };
+    for c in ['B', 'C'] {
+        st.slots.insert(
+            (life, "x".into(), wid(c, 0), None),
+            Slot { stamp: slot_stamp, total: i128::MAX },
+        );
+    }
+    let mut g = Gen::start(gen_stamp, &BTreeMap::new(), BTreeMap::new());
+    // B's slot was seen at -1: i128::MAX - (-1) overflows a plain subtraction
+    g.seen.insert((life, wid('B', 0), None), -1);
+    st.regs.insert(
+        (life, "x".into()),
+        Reg {
+            stamp: gen_stamp,
+            value: s("t"),
+            obs: BTreeMap::new(),
+            generation: Some(g),
+            soi: false,
+        },
+    );
+    assert_eq!(st.hidden("x", &o), i128::MAX);
+    assert_eq!(st.hidden_all(&o), BTreeMap::from([("x".to_string(), i128::MAX)]));
 }
