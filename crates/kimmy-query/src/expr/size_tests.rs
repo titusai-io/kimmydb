@@ -264,7 +264,8 @@ fn range_counts_its_bytes_exactly_at_a_small_limit() {
         assert_eq!(range_bytes(count), bson_bytes(&built), "{count}");
         assert_eq!(bson_bytes(&built), encoded(&built), "{count}");
     }
-    assert_eq!(range_bytes(u64::MAX).min(usize::MAX), range_bytes(u64::MAX));
+    // A count no array can hold saturates instead of overflowing.
+    assert!(range_bytes(u64::MAX) > 1 << 60);
 }
 
 fn text_of(bytes: usize) -> Bson {

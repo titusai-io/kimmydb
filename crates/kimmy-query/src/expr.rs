@@ -76,7 +76,7 @@ mod tz;
 
 pub(crate) use sizes::{
     ArrayBudget, DocBudget, MAX_ARRAY_BYTES, MAX_STRING_BYTES, bson_bytes, check_array_bytes,
-    check_array_within, check_string_len_within, document_bytes,
+    check_array_within, check_string_len_within,
 };
 
 pub(crate) use docops::{merge_budget, merge_into};

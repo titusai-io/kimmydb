@@ -14013,6 +14013,63 @@ async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
 }
 
 #[tokio::test]
+async fn a_regex_written_as_a_fields_value_matches_as_a_pattern_over_http() {
+    // `{s: /a/}` arrives as `{"$regularExpression": ...}` and matches "aaab" as a
+    // pattern, as `$regex` does; only `$eq` compares it as a value. An invalid or
+    // possessive pattern is a 400, as under `$regex`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "words" })).await;
+    for doc in [
+        json!({ "_id": 1, "s": "aaab" }),
+        json!({ "_id": 2, "s": "xyz" }),
+        json!({ "_id": 3, "s": 5 }),
+    ] {
+        let stored = server.post("/v1/db/shop/coll/words/docs", Some(&token), doc).await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    let find = |filter: Value| {
+        server.post("/v1/db/shop/coll/words/find", Some(&token), json!({ "filter": filter }))
+    };
+    let ids = |body: &Value| -> Vec<i64> {
+        let mut ids: Vec<i64> = body["documents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no documents in {body}"))
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let re = |pattern: &str, options: &str| json!({ "$regularExpression": { "pattern": pattern, "options": options } });
+    let hit = find(json!({ "s": re("a", "") })).await;
+    assert_eq!((hit.status, ids(&hit.body)), (200, vec![1]), "{:?}", hit.body);
+    let flags = find(json!({ "s": re("^AAA", "i") })).await;
+    assert_eq!(ids(&flags.body), [1], "{:?}", flags.body);
+    let none = find(json!({ "s": re("^b", "") })).await;
+    assert_eq!(ids(&none.body), Vec::<i64>::new(), "{:?}", none.body);
+    // It is `$regex`: the same documents.
+    let same = find(json!({ "s": { "$regex": "a" } })).await;
+    assert_eq!(ids(&same.body), [1]);
+    // `$eq` compares it as a value, which no stored document is.
+    let eq = find(json!({ "s": { "$eq": re("a", "") } })).await;
+    assert_eq!(ids(&eq.body), Vec::<i64>::new(), "{:?}", eq.body);
+    // The refusals of `$regex`.
+    for pattern in ["(", "a*+a", "a(?=b)"] {
+        let res = find(json!({ "s": re(pattern, "") })).await;
+        assert_eq!(res.status, 400, "{pattern}: {:?}", res.body);
+        let res = find(json!({ "$or": [{ "_id": 1 }, { "s": re(pattern, "") }] })).await;
+        assert_eq!(res.status, 400, "{pattern} under $or: {:?}", res.body);
+    }
+    let possessive = find(json!({ "s": re("a*+a", "") })).await;
+    assert!(
+        possessive.body["message"].as_str().unwrap().contains("possessive quantifiers"),
+        "{:?}",
+        possessive.body
+    );
+}
+
+#[tokio::test]
 async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
     // `{tags: {$all: []}}` held for every document whose `tags` is an array,
     // so a list a client emptied by mistake reached all of them, on a `multi`

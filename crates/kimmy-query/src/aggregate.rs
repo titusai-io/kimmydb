@@ -2510,7 +2510,7 @@ mod tests {
         assert!((3..9).contains(&steps), "{steps}");
         assert!(matches!(refused.0, Error::ValueTooLarge { max: 512, .. }), "{:?}", refused.0);
         assert!(refused.0.to_string().contains("16 MiB document limit"));
-        assert!(crate::expr::document_bytes(&doc) <= 512);
+        assert!(crate::expr::bson_bytes(&Bson::Document(doc.clone())) <= 512);
     }
 
     /// The stages read the real limit: a copy of a nine-megabyte document in itself,
@@ -2543,7 +2543,7 @@ mod tests {
     fn a_computed_field_that_replaces_one_is_counted_once() {
         let big = "z".repeat(300);
         let doc = doc! {"a": big.clone(), "b": 1};
-        let size = crate::expr::document_bytes(&doc);
+        let size = crate::expr::bson_bytes(&Bson::Document(doc.clone()));
         let same = vec![("a".to_string(), Expr::parse(&Bson::String("$a".into())).unwrap())];
         let mut with = doc.clone();
         set_computed_within(&mut with, &same, &Scope::new(&doc), size).unwrap();
