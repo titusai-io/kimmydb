@@ -294,6 +294,13 @@ impl FindProjection {
                  \"before\""
             )));
         }
+        if matches!(update, Update::Pipeline(_)) {
+            return Err(Error::InvalidQuery(format!(
+                "the positional projection {array:?}.$ cannot name an element of the document \
+                 after a pipeline update, which can rewrite every element. Use returnDocument \
+                 \"before\""
+            )));
+        }
         match update.first_write_outside_matched(array) {
             None => Ok(()),
             Some(written) => Err(Error::InvalidQuery(format!(

@@ -824,6 +824,46 @@ pub fn div(a: &Raw, b: &Raw) -> Result<Raw, DivisionByZero> {
     Ok(divide(negative, &Mag::from_u128(*c1), i64::from(*e1), *c2, i64::from(*e2)))
 }
 
+/// The remainder of `a` over `b`: the exact value left after the quotient is cut toward
+/// zero, with the sign of `a` and the smaller exponent of the two (`5.5 % 2` is `1.5`,
+/// `-5 % 3` is `-2`, `0.3 % 0.1` is `0.0`). Exact for every pair of finite numbers, however
+/// large the quotient. Any zero divisor is refused, as for [`div`]; a NaN, or an infinite
+/// `a`, is NaN; an infinite `b` leaves `a` as it is.
+pub fn rem(a: &Raw, b: &Raw) -> Result<Raw, DivisionByZero> {
+    if b.is_zero() {
+        return Err(DivisionByZero);
+    }
+    let (
+        Raw::Finite { negative, coefficient: cx, exponent: ex },
+        Raw::Finite { coefficient: cy, exponent: ey, .. },
+    ) = (a, b)
+    else {
+        return Ok(match (a, b) {
+            (Raw::Finite { .. }, Raw::Inf { .. }) => *a,
+            _ => Raw::Nan,
+        });
+    };
+    let remainder = if ex >= ey {
+        // `cx * 10^k mod cy`, one factor of ten at a time: `cy < 10^34`, so none overflows.
+        let mut r = cx % cy;
+        for _ in 0..(i32::from(*ex) - i32::from(*ey)) {
+            if r == 0 {
+                break;
+            }
+            r = r * 10 % cy;
+        }
+        r
+    } else {
+        // `cy` scaled up to `x`'s exponent; if that is beyond `u128` it is far past `cx`.
+        let k = (i32::from(*ey) - i32::from(*ex)) as u32;
+        match 10u128.checked_pow(k).and_then(|p| cy.checked_mul(p)) {
+            Some(m) => cx % m,
+            None => *cx,
+        }
+    };
+    Ok(Raw::Finite { negative: *negative, coefficient: remainder, exponent: *ex.min(ey) })
+}
+
 /// An integer, exactly, at exponent 0.
 pub fn from_i64(value: i64) -> Raw {
     Raw::Finite { negative: value < 0, coefficient: u128::from(value.unsigned_abs()), exponent: 0 }
