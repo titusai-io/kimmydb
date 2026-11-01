@@ -289,14 +289,16 @@ fn redact_expr(spec: Bson) -> Expr {
 }
 
 #[test]
-fn sample_stops_in_its_reservoir_loop_and_in_its_shuffle() {
+fn sample_stops_in_its_reservoir_loop() {
+    let _deadline = expired();
+    let result = crate::stages::sample(rows(3), 2, &Limits::default(), &mut |n| n - 1);
+    assert!(is_deadline(result));
+}
+
+#[test]
+fn sample_stops_in_its_shuffle() {
     let limits = Limits::default();
     let first = |n: usize| n - 1;
-    {
-        let _deadline = expired();
-        let result = crate::stages::sample(rows(3), 2, &limits, &mut |n| first(n));
-        assert!(is_deadline(result), "the reservoir loop");
-    }
     // The reservoir loop is over before the deadline is set: the position source is where
     // it is set, on the first replacement, after the loop's only look at the clock. Only
     // the shuffle that follows can see it.

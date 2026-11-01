@@ -2341,14 +2341,38 @@ pub(crate) async fn aggregate_run_stats(
         (docs, consumed, Some(stats))
     };
 
-    // The rest is synchronous, so the request's deadline is set for it (ADR-266). Set
-    // here, after the `$vectorSearch` await above and with none after it: the guard
-    // belongs to this thread, and a future may move to another across an await.
-    let _deadline = crate::limits::deadline_scope();
-    let docs = run_stages(state, auth, db, &stages[consumed..], docs, &limits, &[])?;
+    // The rest is synchronous: its own function, so that the guard of the request's
+    // deadline (ADR-266) cannot be alive across the `$vectorSearch` await above, which
+    // a future may leave on one thread and resume on another.
+    finish_pipeline(
+        state,
+        auth,
+        db,
+        &stages[consumed..],
+        docs,
+        &limits,
+        sink.map(|sink| (sink, all_stages.last().expect("a sink is a stage of the pipeline"))),
+        source_stats,
+    )
+}
 
-    if let Some(sink) = sink {
-        let last = all_stages.last().expect("a sink is a stage of the pipeline");
+/// Everything after the source of an aggregation, under the request's deadline: the
+/// stages, then the write of a sink or the answer.
+#[allow(clippy::too_many_arguments)]
+fn finish_pipeline(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    stages: &[aggregate::Stage],
+    docs: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    sink: Option<(SinkPlan, &aggregate::Stage)>,
+    source_stats: Option<QueryStats>,
+) -> Result<(Value, Option<QueryStats>), ApiError> {
+    let _deadline = crate::limits::deadline_scope();
+    let docs = run_stages(state, auth, db, stages, docs, limits, &[])?;
+
+    if let Some((sink, last)) = sink {
         return Ok((write_sink(state, sink, last, docs)?, source_stats));
     }
 

@@ -95,10 +95,10 @@ fn an_aggregation_reading_its_source_is_cut_at_a_passed_deadline_and_runs_with_t
 }
 
 #[test]
-fn an_aggregation_with_nothing_to_read_is_still_cut_by_the_deadline_its_stages_run_under() {
-    // The leading `$match` names no `_id` (a primary-key read of nothing), so the source
-    // has no row to tick on and the stages after it are the first thing to see the
-    // deadline: it is set for them, by the aggregation itself.
+fn the_stages_after_the_source_run_under_the_deadline_the_aggregation_sets() {
+    // `finish_pipeline` is called with the documents in hand, so no read of the source
+    // can be the thing that sees the deadline: the scope the aggregation sets for what
+    // follows its source is, and nothing else here sets one.
     let dir = tempfile::tempdir().unwrap();
     let state = state_with_data(&dir);
     for stage in [
@@ -106,11 +106,28 @@ fn an_aggregation_with_nothing_to_read_is_still_cut_by_the_deadline_its_stages_r
         json!({ "$group": { "_id": null, "n": { "$sum": 1 } } }),
         json!({ "$lookup": { "from": "items", "localField": "k", "foreignField": "k",
                               "as": "got" } }),
+        json!({ "$unionWith": "absent" }),
     ] {
-        let pipeline = json!([{ "$match": { "_id": { "$in": [] } } }, stage]);
-        let late = aggregate_in_a_request(&state, &pipeline, PAST);
-        assert!(is_the_timeout(&late), "{pipeline}: {late:?}");
-        assert!(aggregate_in_a_request(&state, &pipeline, PLENTY).is_ok(), "{pipeline}");
+        let stages = parse_pipeline(&json!([stage])).unwrap();
+        let docs = vec![doc! { "_id": 1, "k": 1, "v": 1 }];
+        let run = |left: Duration| {
+            in_a_request(left, || {
+                finish_pipeline(
+                    &state,
+                    &root(),
+                    "app",
+                    &stages,
+                    docs.clone(),
+                    &aggregate::Limits::default(),
+                    None,
+                    None,
+                )
+                .map(|(body, _)| body)
+            })
+        };
+        let late = run(PAST);
+        assert!(is_the_timeout(&late), "{stage}: {late:?}");
+        assert!(run(PLENTY).is_ok(), "{stage}");
     }
 }
 
