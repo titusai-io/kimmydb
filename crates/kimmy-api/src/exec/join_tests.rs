@@ -922,8 +922,10 @@ fn an_evaluation_error_is_always_deferrable() {
 }
 
 /// An empty input reads nothing of the foreign collection, but the stage is still
-/// authorized first: a missing foreign collection is a `404` and a forbidden one a
-/// `403` whether or not any document reaches the stage (ADR-206's note, ADR-222).
+/// authorized first: a forbidden foreign collection is a `403` whether or not any document
+/// reaches the stage (ADR-206's note, ADR-222). A missing one is read as empty on a node with
+/// no peers and is the `404` with the retry hint on a node with peers (one rule for
+/// `$lookup`, `$graphLookup` and `$unionWith`).
 #[test]
 fn an_empty_input_still_authorizes_the_foreign_collection() {
     let dir = tempfile::tempdir().unwrap();
@@ -940,11 +942,6 @@ fn an_empty_input_still_authorizes_the_foreign_collection() {
         Ok(_) => 200,
         Err(e) => e.status.as_u16(),
     };
-    // No such foreign collection: 404, with no input at all.
-    assert_eq!(status(&root(), &eq_on_k()), 404);
-    // It exists but the caller may not read it: 403.
-    seed_docs(&state, "items", vec![doc! { "_id": 1, "k": 1 }]);
-    assert_eq!(status(&root(), &eq_on_k()), 200);
     let reader = Auth(kimmy_auth::Principal::new(
         "reader",
         vec![kimmy_auth::Grant {
@@ -953,5 +950,18 @@ fn an_empty_input_still_authorizes_the_foreign_collection() {
             actions: vec![kimmy_auth::Action::Read],
         }],
     ));
+    // No such foreign collection: empty on a node with no peers, with no input at all; the
+    // caller who may not read it is refused first, whether or not it exists.
+    assert_eq!(status(&root(), &eq_on_k()), 200);
+    assert_eq!(status(&reader, &eq_on_k()), 403);
+    // On a node with peers it may be about to arrive: 404 and the retry hint.
+    let members = kimmy_cluster::Members::default();
+    state.set_members(members.clone());
+    members.insert_for_test("127.0.0.1:7001".parse().unwrap(), kimmy_core::NodeId::generate());
+    assert_eq!(status(&root(), &eq_on_k()), 404);
+    assert_eq!(status(&reader, &eq_on_k()), 403);
+    // It exists and the caller may read it: as ever; one who may not is refused.
+    seed_docs(&state, "items", vec![doc! { "_id": 1, "k": 1 }]);
+    assert_eq!(status(&root(), &eq_on_k()), 200);
     assert_eq!(status(&reader, &eq_on_k()), 403);
 }
