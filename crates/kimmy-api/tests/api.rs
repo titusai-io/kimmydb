@@ -18763,7 +18763,10 @@ async fn sort_array_orders_documents_as_the_sort_stage_does() {
         json!({"_id": 8, "k": null}),
     ];
     sink_seed(&server, &token, "src", docs).await;
-    let expected = [(1, json!([4, 8, 1, 3, 5, 2, 6, 7])), (-1, json!([7, 6, 2, 5, 3, 1, 4, 8]))];
+    // Ascending takes the smallest element of an array (1 for id 1, 2 for id 3), descending the
+    // largest (5 and 4): so id 1 comes before id 3 and id 2 (a 3) both ways round, and after
+    // `{x: 1}` and "s", which sort above every number.
+    let expected = [(1, json!([4, 8, 1, 3, 5, 2, 6, 7])), (-1, json!([7, 6, 1, 3, 2, 5, 4, 8]))];
     for (dir, expected) in expected {
         let stage = sink_run(
             &server,
