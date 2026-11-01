@@ -36,9 +36,10 @@
 //! work.
 //!
 //! Covered: an aggregation (every stage, the expression iteration operators,
-//! `$lookup`, `$graphLookup`, the foreign reads and the `$merge` / `$out`
-//! chunk loop), the reads under `find` and `count`, and an update, delete or
-//! find-and-modify until it has written. Not covered, and still answered with
+//! `$lookup`, `$graphLookup`, the foreign reads and the pipeline of a
+//! `$merge` / `$out`), the reads under `find` and `count`, and an update,
+//! delete or find-and-modify. A request that commits more than once is cut
+//! only before its first commit (ADR-192); after it, it goes to its end. Not covered, and still answered with
 //! its result however late it finishes: an index build, a bulk insert, a
 //! backup, a restore and a database drop; ADR-266 gives the reason for each.
 //! A scope applies only to the thread that set it, so work moved to another

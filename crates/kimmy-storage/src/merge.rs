@@ -125,10 +125,11 @@ impl Engine {
             if outcome.commits > 0 {
                 crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BetweenChunks);
             }
-            // The request's deadline (ADR-266) is looked at between chunks, and a stop
-            // there is a failure of the chunk it precedes: the arms below leave what
-            // they leave for any other failure, nothing before the first commit and
-            // `PartiallyApplied` after it. A chunk that has begun is never cut.
+            // The request's deadline (ADR-266) is looked at before the first chunk and
+            // not after it: a request that has written something keeps going (ADR-192),
+            // so from the second chunk on the deadline is set aside. A stop before the
+            // first commit is a failure of the first chunk and writes nothing.
+            let _suspended = (outcome.commits > 0).then(kimmy_core::deadline::Deadline::suspend);
             let written = kimmy_core::deadline::check()
                 .map_err(|e| (StorageError::from(e), 0))
                 .and_then(|()| self.write_chunk(outcome.commits > 0, coll, part, mode));
@@ -517,33 +518,21 @@ mod tests {
     }
 
     #[test]
-    fn a_deadline_that_passes_after_a_chunk_leaves_what_any_later_failure_leaves() {
+    fn a_deadline_that_passes_after_the_first_commit_does_not_stop_the_write() {
+        // ADR-192: once a chunk has committed the request goes to its end.
         let (engine, coll, _dir) = engine();
         engine.set_multi_chunk_docs(2);
         crate::sync::race_hooks::at(
             crate::sync::race_hooks::Race::BetweenChunks,
             expire_deadline_for_this_test,
         );
-        let failed = engine.write_documents(&coll, output(5), SinkMode::Insert).unwrap_err();
-        let StorageError::PartiallyApplied { applied, cause } = failed else {
-            panic!("a stop after a commit is partly applied: {failed:?}");
-        };
-        assert_eq!(
-            applied,
-            crate::Applied::Write {
-                counts: SinkCounts { inserted: 2, ..SinkCounts::default() },
-                commits: 1,
-                in_doubt: 0
-            }
-        );
-        assert!(
-            matches!(*cause, StorageError::Core(kimmy_core::Error::DeadlineExceeded)),
-            "{cause:?}"
-        );
-        // Chunk one stands whole, and nothing after it.
+        let out = engine.write_documents(&coll, output(5), SinkMode::Insert).unwrap();
+        assert_eq!((out.counts.inserted, out.commits), (5, 3));
         let held: Vec<bool> =
             (0..5).map(|id| engine.get(&coll, &DocId::Int64(id)).unwrap().is_some()).collect();
-        assert_eq!(held, vec![true, true, false, false, false]);
+        assert_eq!(held, vec![true; 5]);
+        // And the deadline is back once the write is over.
+        assert!(matches!(kimmy_core::deadline::check(), Err(kimmy_core::Error::DeadlineExceeded)));
     }
 
     #[test]

@@ -152,7 +152,32 @@ fn a_write_stage_is_cut_before_it_creates_or_writes_anything() {
             state.engine.get_collection("app", "dest").is_err(),
             "{name}: the target was created by a write that was cut"
         );
+        // An empty output has no row to tick on, so only the look immediately before the
+        // target is created can cut it: it is cut there, and creates nothing.
+        let plan = plan_sink(&state, &root(), "app", "orders", &stages).unwrap().unwrap();
+        let cut = {
+            let _deadline = Deadline::scope(Some(PAST));
+            write_sink(&state, plan, stages.last().unwrap(), Vec::new())
+        };
+        assert!(is_the_timeout(&cut), "{name}, empty: {cut:?}");
+        assert!(state.engine.get_collection("app", "dest").is_err(), "{name}, empty");
     }
+}
+
+#[test]
+fn a_write_stage_that_is_not_cut_before_its_target_exists_goes_to_its_end() {
+    // The deadline is set aside from the look before the target is created: a write that
+    // has begun is not cut (ADR-192, ADR-266). Here the deadline has not passed, and the
+    // stage writes whole, leaving the deadline as the caller had it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_data(&dir);
+    let stages = parse_pipeline(&json!([{ "$out": "dest" }])).unwrap();
+    let plan = plan_sink(&state, &root(), "app", "orders", &stages).unwrap().unwrap();
+    let docs = vec![doc! { "_id": 1 }, doc! { "_id": 2 }];
+    let _deadline = Deadline::scope(Some(PLENTY));
+    let written = write_sink(&state, plan, stages.last().unwrap(), docs).unwrap();
+    assert_eq!(written["out"]["inserted"], 2);
+    assert!(Deadline::is_set(), "the caller's deadline is back");
 }
 
 #[test]

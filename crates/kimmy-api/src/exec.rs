@@ -2526,6 +2526,11 @@ fn write_sink(
     if let (true, Some(meta)) = (is_out, &existing) {
         not_empty(meta)?;
     }
+    // The last look at the request's deadline: from here the target is created and
+    // written, and a write that has begun goes to its end (ADR-192, ADR-266), so a
+    // request cut by the deadline has created nothing and written nothing.
+    deadline::check()?;
+    let _suspended = deadline::Deadline::suspend();
     let meta = match existing {
         Some(meta) => meta,
         None => match kimmy_storage::blocking(|| state.engine.create_collection(&db, &coll)) {
