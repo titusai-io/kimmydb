@@ -449,60 +449,75 @@ row that was not produced by an array element has no index to report.
 ```
 
 ([ADR-264](decisions.md#adr-264--setwindowfields-densify-and-fill).) The input is split into
-**partitions** by `partitionBy` (an expression, compared as `$group` compares keys; absent, `null` or
-a constant is one partition), each partition is sorted by `sortBy` (the `$sort` language, `1` and
-`-1` only), and each `output` field is computed for every document from its **window**. Outputs are
-computed from the documents as they arrived, so one output cannot read another of the same stage.
-A field name may be a dotted path, written as `$addFields` writes it.
+**partitions** by `partitionBy` (an expression, compared as `$group` compares keys: `1` and `1.0` are
+one partition, `null` and a missing field are one; absent, `null` or a constant is one partition; a
+value that is an array is `400`), each partition is sorted by `sortBy` (the `$sort` language, `1` and
+`-1` only; `{}` is no sort), and each `output` field is computed for every document from its
+**window**. Outputs are computed from the documents as they arrived, so one output cannot read another
+of the same stage. A field name may be a dotted path, written as `$addFields` writes it.
 
-**The order of the answer.** Documents leave partition by partition, **partitions in the order they
-were first seen**, and within a partition in `sortBy` order (arrival order when there is no
-`sortBy`). A pipeline that needs another order puts a `$sort` after.
+**The order of the answer.** Documents leave partition by partition, the **partitions in ascending
+order of the value of `partitionBy`** in the [canonical order](key-encoding.md#type-ordering) (null
+and missing first, then numbers, strings, documents, booleans, dates), and within a partition in
+`sortBy` order (arrival order when there is no `sortBy`). That is the reference's order.
 
-**Windows.** `window` is `{documents: [lo, hi]}` or `{range: [lo, hi]}` (with `unit` for dates). Each
-bound is `"unbounded"`, `"current"` or a number, the lower not above the upper (`400`).
+**Windows.** `window` is `{documents: [lo, hi]}` or `{range: [lo, hi]}` (with `unit` for dates), and
+`{}` is the whole partition. Each bound is `"unbounded"`, `"current"` or a number, the lower not above
+the upper (`400`).
 
 | Window | Counts | Number |
 |---|---|---|
-| `documents` | positions around the current document in the sorted partition, clipped at its ends | a whole number; `-1` is the one before |
-| `range` | distance in the one `sortBy` field, so every document tied with the current one is in | any number; with `unit`, a number of that unit (whole for `year`, `quarter` and `month`) |
+| `documents` | positions around the current document in the sorted partition, clipped at its ends | a whole number that fits 32 bits; `-1` is the one before |
+| `range` | distance in the one `sortBy` field | any number, `±Infinity` meaning unbounded; with `unit`, a whole number of it that fits 32 bits |
 
-`range` needs a `sortBy` of **exactly one field**, whose value is a number in every document, or a
-date in every document with a `unit` (`year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`,
-`second`, `millisecond`). A month, quarter or year is a calendar step, clamped to the end of a shorter
-month (one month before 31 March is 28 February); the others are lengths of time; all in UTC. With a
-descending `sortBy` the bounds follow the sort order: `[-3, 0]` reaches back, up the number line, by 3.
-A document with a missing, null or other-typed sort value in a range window is `400`.
-With no `window`, an accumulator's window is the whole partition.
+- A `documents` window needs a `sortBy`, except `["unbounded", "unbounded"]`, which is the whole
+  partition (`400` otherwise).
+- A `range` window needs a `sortBy` of **exactly one ascending field**, whose value is a number in every
+  document, or a date in every document with a `unit` (`year`, `quarter`, `month`, `week`, `day`, `hour`,
+  `minute`, `second`, `millisecond`). A descending `sortBy` is `400`, as the reference refuses it. A
+  document whose sort value is missing, null, an array or of another type is `400`.
+- In a `range` window a **numeric bound takes in every document tied** at that distance, and
+  **`"current"` is the current document itself**: with days 1, 1, 2, 2, 3, `[0, 0]` takes both of day 1
+  for each of them, and `["current", "current"]` takes only the one. `["unbounded", "current"]` is the
+  documents up to and including this one, the tied ones after it left out.
+- A month, quarter or year is a calendar step, clamped to the end of a shorter month (one month before
+  31 March is 28 February); the others are lengths of time; all in UTC.
+- With no `window`, an accumulator's window is the whole partition.
 
 **Operators.**
 
 | Operator | Window | Answer |
 |---|---|---|
-| `$sum`, `$avg`, `$min`, `$max`, `$count` (`{}`), `$push`, `$addToSet`, `$first`, `$last`, `$stdDevPop`, `$stdDevSamp`, `$top`, `$bottom`, `$topN`, `$bottomN`, `$firstN`, `$lastN`, `$maxN`, `$minN` | optional, default the whole partition | what the same [accumulator](#accumulators) answers over the documents of the window; an empty window answers what an empty group does (`0` for `$sum` and `$count`, `[]` for `$push`, `null` for the rest) |
-| `$rank`, `$denseRank`, `$documentNumber` (`{}`) | none | a long: the rank with gaps after ties (`1, 2, 2, 4`), without (`1, 2, 2, 3`), the position (`1, 2, 3, 4`; ties in arrival order). Documents tie when **every** `sortBy` field is equal. Need `sortBy` |
-| `$shift` `{output, by, default}` | none | `output` evaluated on the document `by` places after the current one (`-1` before) in the partition, or `default` (a constant; `null` if absent) beyond its ends. Needs `sortBy` |
+| `$sum`, `$avg`, `$min`, `$max`, `$count` (`{}`), `$push`, `$addToSet`, `$first`, `$last`, `$stdDevPop`, `$stdDevSamp`, `$top`, `$bottom`, `$topN`, `$bottomN`, `$firstN`, `$lastN`, `$maxN`, `$minN` | optional, default the whole partition | what the same [accumulator](#accumulators) answers over the documents of the window; an empty window answers what an empty group does (`0` for `$sum` and `$count`, `[]` for `$push`, `null` for the rest). `$push` and `$addToSet` skip a missing value; `$first` and `$last` of a missing value **leave the field out**; `$max` of equal values keeps the last and `$min` the first. A deviation of one value is an integer `0` |
+| `$covariancePop`, `$covarianceSamp` `[x, y]` | optional | the covariance of the pairs of the window; a pair with a member that is not a number is skipped, one value is `0` (population, a double) or `null` (sample), none is `null` |
+| `$rank`, `$denseRank`, `$documentNumber` (`{}`) | none | an int: the rank with gaps after ties (`1, 2, 2, 4`), without (`1, 2, 2, 3`), the position (`1, 2, 3, 4`; ties in arrival order). Documents tie when the one `sortBy` value is the same (a missing value is not a null one). Need a `sortBy` of **exactly one field** |
+| `$shift` `{output, by, default}` | none | `output` evaluated on the document `by` places after the current one (`-1` before) in the partition, or `default` (a constant; `null` if absent) beyond its ends; a document with no value leaves the field out. `by` is a whole number that fits 32 bits. Needs `sortBy` |
 | `$derivative` `{input, unit}` | **required** | the slope between the first and the last document of the window: a double, `null` if the window has one document or the two sort values are equal. A date `sortBy` takes `unit` (`week` to `millisecond`) for the time axis, milliseconds if absent; a numeric `sortBy` refuses it |
-| `$integral` `{input, unit}` | **required** | the trapezoid-rule area under `input` over the window: a double, `0` for fewer than two documents |
-| `$expMovingAvg` `{input, N}` or `{input, alpha}` | none | the exponentially weighted mean to the current document, `alpha = 2/(N+1)`; exactly one of `N` (a whole number, at least 1) and `alpha` (above 0, below 1). A document whose input is not a number answers `null` and does not move the average |
-| `$locf` `<expression>`, `$linearFill` `<expression>` | none | the last non-null value so far (`null` before one); for a null or missing value, the straight line between the nearest non-null values on each side by the one numeric or date `sortBy` field (`null` outside them). Both are what [`$fill`](#fill) runs |
+| `$integral` `{input, unit}` | **required** | the trapezoid-rule area under `input` over the window, summed exactly: a double; over a number line, an integer `0` for fewer than two documents (a double `0.0` over dates) |
+| `$expMovingAvg` `{input, N}` or `{input, alpha}` | none | the exponentially weighted mean to the current document, `alpha = 2/(N+1)`; exactly one of `N` (a whole number, at least 1) and `alpha` (above 0, below 1). A document whose input is not a number answers the average it has (`null` before the first number) and does not move it |
+| `$locf` `<expression>`, `$linearFill` `<expression>` | none | `$locf`: the last non-null value so far (`null` before one), **in arrival order when there is no `sortBy`**. `$linearFill`: for a null or missing value, the straight line between the nearest non-null values on each side by the one numeric or date `sortBy` field (`null` outside them); `400` if two documents have the same sort value; a `Decimal128` end interpolates in decimal. Both are what [`$fill`](#fill) runs |
 
 `$derivative` and `$integral` need a `sortBy` of one field that is numeric or a date in every
 document, and a numeric `input` in every document of the window (`400` on anything else, `null` and
-missing included). `$derivative` and `$integral` read a `Decimal128` input as a double.
+missing included).
 
-**Not built:** `$covariancePop` and `$covarianceSamp` are refused by name; so is `$mergeObjects`, which
-is not a window operator. A key the stage does not define, two operators in one output, an operator that
-is not a window operator, an operator given a `window` it does not take, an operator that needs a
-`sortBy` without one, a bound that is not a bound: all `400`, naming it.
+**Not operators:** `$mergeObjects` is not a window operator (the reference refuses it too). A key the
+stage does not define, two operators in one output, an operator that is not a window operator, an
+operator given a `window` it does not take, an operator that needs a `sortBy` without one, a bound that
+is not a bound: all `400`, naming it.
 
-**Cost.** `$sum`, `$avg`, `$count`, `$stdDevPop` and `$stdDevSamp` slide over the window in constant time
-per document (a window holding a `Decimal128` or a total beyond a 64-bit integer is recomputed with the
-`$group` accumulator, so its answer is the group's); `$min` and `$max` keep a monotone deque; `$first`
-and `$last` read one document; a window that starts at `unbounded` never removes a document. `$push`,
-`$addToSet` and the `$top`/`N` family are rebuilt from the documents of the window when it loses one.
-The stage holds every document of its input and every value it adds against **256 MiB**, refused
-`413` as soon as the running total passes it (a cumulative `$push` whose output is quadratic is
+**Cost.** Both ends of a window only move forward, so every operator keeps a state that takes a document
+in once and out once, and no window is rebuilt: `$sum` and `$avg` keep an exact integer total, an exact
+sum of the doubles (rounded once) and, once a `Decimal128` has been seen, an exact decimal total, with
+counts of NaN and the infinities; `$min` and `$max` a monotone deque; `$push`, `$firstN`, `$lastN` a
+queue; `$addToSet`, `$top` and its family, `$maxN` and `$minN` an ordered set, O(log w) a step;
+`$stdDevPop`, `$stdDevSamp` and the covariances running moments about the first value, over finite
+values only, with the non-finite ones counted and the state rebuilt from the window every so many
+removals (at once for a window of 16 or fewer) to bound the drift of subtracting. What an answer costs is
+what it holds: a `$push` over a window of `w` documents is an array of `w`. The stage holds every
+document of its input, every sort key it takes and every value it adds against **one byte budget of
+256 MiB for the whole request**, shared by the stages of the pipeline and the branches of a `$facet`,
+refused `413` as soon as the running total passes it (a cumulative `$push` whose output is quadratic is
 refused while it is built). Inside a `$facet` and a `$lookup` sub-pipeline like any stage.
 
 ### `$densify`
@@ -513,29 +528,36 @@ refused while it is built). Inside a `$facet` and a `$lookup` sub-pipeline like 
 ```
 
 ([ADR-264](decisions.md#adr-264--setwindowfields-densify-and-fill).) Generates a document wherever a
-numeric or date `field` has a gap of more than `step`. A generated document holds `field` and the
-`partitionByFields` and **nothing else**.
+numeric or date `field` has a gap of more than `step`. A generated document holds the
+`partitionByFields` and then `field`, **and nothing else**.
 
-- In each partition the documents are taken in ascending order of `field`, wherever they arrived. Between
-  one and the next, from the start of the range to the first, and from the last to the end of the range,
-  a value is generated at `v + step`, `v + 2 step`, ... for each that falls before the next document's.
-  The generated values count from the value the gap starts at (`v + k step`), so a month step from the
-  31st stays on the month's end where it can.
-- `bounds`: `"full"` runs every partition from the lowest to the highest value of the **whole input**
-  (the highest included); `"partition"` (needs `partitionByFields`) each partition over its own;
-  `[lo, hi]` from `lo` **included** to `hi` **excluded**, with documents outside it passed through.
-- `unit` is required for dates and refused for numbers; with a `unit` the step is a whole number of it,
-  a calendar step for `month`, `quarter` and `year`. `step` is above zero. A generated number is an int
-  while the field and the step are ints and it fits, a long past that, a double otherwise.
-- A document whose `field` is missing, null, or neither a number nor a date is `400`, as is a field that
-  is a number in one document and a date in another; so are a `Decimal128` field or step (not built), a
-  `partitionByFields` entry that is `field` or begins with `$`, and a key the stage does not define.
-- **Order**: partition by partition, partitions in ascending order of their `partitionByFields` values
-  (a missing field sorts as null), each in ascending order of `field`; documents of the same value keep
-  their arrival order.
-- **Limits**: the number of documents the range would generate is counted **before any is made** and
-  held, with the input, to the pipeline's 100,000 (`400`, naming the stage); the bytes buffered and
-  generated are held to 256 MiB (`413`).
+- The range has a start, and from it a **grid**: the start, then the step added to the point before, and
+  so on. A document is generated at every grid point of the range that no document of the partition is at;
+  a document off the grid does not move it. The grid is built by adding, so a date stepped by months from
+  the 31st drifts: 31 Jan, 28 Feb, 28 Mar, 28 Apr, as the reference does, and a fractional step adds up as
+  doubles add.
+- `bounds`: `"full"` starts every partition at the lowest value of the **whole input** and ends it at the
+  highest (included); `"partition"` (needs `partitionByFields`) at each partition's own; `[lo, hi]` from
+  `lo` **included** to `hi` **excluded** (`[lo, lo]` is `lo`), with documents outside it passed through.
+- `unit` is required for dates and refused for numbers; with a `unit` the step is a whole number of it.
+  `step` is above zero. A generated number is of the type the start has added to the step: an int while
+  both are ints and it fits, a long if the step is a long or the start is, a double otherwise. With explicit
+  bounds the two bounds and the step are one numeric type (int, long or double), or `400`.
+- A document whose `field` is **missing or null is passed through**, ahead of all the others in the
+  order it arrived. A `field` that is a string, an array or another type is `400`, as is a field that is a
+  number in one document and a date in another; so are a `Decimal128` field or step (not built), a
+  `partitionByFields` entry that is `field` or begins with `$`, and a key the stage does not define. A field
+  named twice in `partitionByFields` is one field.
+- **Order**: with `"full"`, one sequence in ascending order of `field`, the partitions interleaved (before
+  each document, the grid points of its partition below it), then the rest of each partition's grid, partition
+  by partition in ascending order of the partition values (the reference ends in a hash order). With
+  `"partition"` and `[lo, hi]`, partition by partition in ascending order of the partition values (null
+  before a missing field), each in ascending order of `field`. Documents of one value keep the order they
+  arrived in.
+- **Limits**: the documents the range would generate are counted **before any is made** and held, with
+  the input, to the pipeline's 100,000 (`400`, naming the stage; the reference's own limit is 500,000
+  generated); a step too small to move the grid is `400`; the bytes buffered and generated are held to the
+  request's byte budget (`413`).
 
 ### `$fill`
 
@@ -546,18 +568,19 @@ numeric or date `field` has a gap of more than `step`. A generated document hold
 ```
 
 ([ADR-264](decisions.md#adr-264--setwindowfields-densify-and-fill).) Each `output` field is
-`{value: <expression>}` or `{method: "locf" | "linear"}`; at most one of `partitionBy` (an expression) and
-`partitionByFields` (field paths).
+`{value: <expression>}` or `{method: "locf" | "linear"}`; at most one of `partitionBy` (an **object**
+expression, as the reference needs) and `partitionByFields` (field paths).
 
 - `value` replaces a field that is **null or missing** with the expression, evaluated on the document.
   Values are read from the document as the `method` fields left it, all before any is written.
-- `locf` carries the last non-null value forward within the partition; `linear` interpolates between the
-  nearest non-null numbers on either side by the position in the one `sortBy` field (a number or a date).
-  Leading and trailing gaps stay `null`; a non-number in a `linear` field is `400`. Both need `sortBy`
-  (`400` without); `linear` exactly one field.
+- `locf` carries the last non-null value forward within the partition, **in arrival order when there is no
+  `sortBy`**; `linear` interpolates between the nearest non-null numbers on either side by the position in
+  the one `sortBy` field (a number or a date; `400` for two documents with the same value, or for a value
+  that is not a number; a `Decimal128` end interpolates in decimal). Leading and trailing gaps stay `null`.
+  `linear` needs `sortBy` of exactly one field; `sortBy: {}` is no sort.
 - Methods run as a [`$setWindowFields`](#setwindowfields) with `$locf` and `$linearFill`: the documents
-  leave sorted, partition by partition, as that stage leaves them. A `$fill` with only `value` fields
-  buffers nothing and **keeps the order of its input**.
+  leave partition by partition, the partitions in ascending order of their values, each sorted. A `$fill`
+  with only `value` fields buffers nothing and **keeps the order of its input**.
 - A field of neither kind, both kinds in one field, an unknown method or key, are `400`.
 
 ### Accumulators
@@ -1960,10 +1983,10 @@ difference, so a partial answer would be worse than none. It also does not spill
 to disk: a pipeline that cannot run should say so immediately rather than
 becoming slow in a way that is harder to diagnose than a refusal.
 
-`$setWindowFields`, `$densify` and a `$fill` with a method also hold the bytes they buffer to a cap
-of **256 MiB**, counted as they grow and refused `413` at the first byte over, so a request that
-would build too much is stopped while it builds. `$densify` counts the documents its range would
-generate before it generates any.
+`$setWindowFields`, `$densify` and a `$fill` with a method also hold the bytes they buffer to **one budget of
+256 MiB for the whole request**, shared by the stages of the pipeline and the branches of a `$facet` and
+counted as it grows, refused `413` at the first byte over, so a request that would build too much is
+stopped while it builds. `$densify` counts the documents its range would generate before it generates any.
 
 `$unwind` is checked *while* it expands, not after, because a handful of
 documents holding large arrays can exceed the cap long before the stage ends.
@@ -1980,7 +2003,6 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | `$merge` with `on` other than `_id`, `whenMatched`/`whenNotMatched: "fail"`, a pipeline `whenMatched`, `let`; `$out` into a collection that holds documents, `$out` with `timeseries` | Refused, `400`, each naming what and why. [`$merge`](#merge), [`$out`](#out), and the [deviations register](deviations.md) |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
-| `$covariancePop`, `$covarianceSamp` in `$setWindowFields` | Not built. Refused by name, `400` |
 | `Decimal128` in `$densify`'s field or step | Not built. Refused, `400`; `$setWindowFields` reads a `Decimal128` as a double in `$derivative` and `$integral` and in the standard deviations |
 | Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |
 
