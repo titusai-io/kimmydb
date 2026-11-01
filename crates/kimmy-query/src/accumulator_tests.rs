@@ -1100,9 +1100,7 @@ fn a_sort_key_path_through_an_array_keeps_only_the_documents_fields() {
     // nothing (it is not kept as itself). Ascending, `[0]` sorts before `[0.5]`;
     // reading the key as `[1, 0]` would put the second row first.
     let rows = vec![doc! {"_id": 1, "a": [1, {"b": 0}]}, doc! {"_id": 2, "a": [{"b": 0.5}]}];
-    let top = |sort: Document| {
-        one(doc! {"$top": {"sortBy": sort, "output": "$_id"}}, rows.clone())
-    };
+    let top = |sort: Document| one(doc! {"$top": {"sortBy": sort, "output": "$_id"}}, rows.clone());
     assert_eq!(top(doc! {"a.b": 1}), Bson::Int32(1));
     assert_eq!(top(doc! {"a.b": -1}), Bson::Int32(2));
 }
