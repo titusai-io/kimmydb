@@ -304,3 +304,126 @@ fn a_request_the_deadline_drops_gives_its_bytes_back_to_the_pool() {
     assert_eq!(pool.used(), 0);
     assert_eq!(limits.buffer.used(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// The answer is written once (the review's m2)
+// ---------------------------------------------------------------------------
+
+/// Documents of every kind of value the JSON conversion treats apart.
+fn mixed(n: i32) -> Vec<Document> {
+    (0..n)
+        .map(|i| {
+            doc! {
+                "_id": i,
+                "long": i64::MAX - i64::from(i),
+                "double": 0.1 + f64::from(i),
+                "nan": f64::NAN,
+                "date": bson::DateTime::from_millis(1_700_000_000_000 + i64::from(i)),
+                "oid": bson::oid::ObjectId::from_bytes([i as u8; 12]),
+                "bin": bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![i as u8; 5] },
+                "dec": bson::Decimal128::from_bytes([i as u8; 16]),
+                "ts": bson::Timestamp { time: 7, increment: i as u32 },
+                "text": format!("caf\u{e9} \"quoted\" \\ \n {}", "x".repeat(40)),
+                "nested": { "a": [1, 2.5, "three", { "deep": [true, bson::Bson::Null] }], "b": {} },
+                "empty": [],
+                "re": bson::Regex {
+                    pattern: bson::raw::CString::try_from("^a.b$".to_string()).unwrap(),
+                    options: bson::raw::CString::try_from("i".to_string()).unwrap(),
+                },
+            }
+        })
+        .collect()
+}
+
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+}
+
+#[test]
+fn the_body_the_route_sends_is_the_bytes_serde_json_gives_for_the_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, mixed(12), vec![]);
+    for pipeline in [
+        json!([]),
+        json!([{"$match": {"_id": {"$lt": 5}}}, {"$project": {"long": 1, "nested": 1}}]),
+        json!([{"$match": {"_id": 999}}]),
+        json!([{"$count": "n"}]),
+        json!([{"$group": {"_id": null, "all": {"$push": "$date"}}}]),
+    ] {
+        let value = block_on(aggregate(&state, &root(), "app", "orders", &pipeline)).unwrap();
+        let (answer, hold) =
+            block_on(aggregate_held(&state, &root(), "app", "orders", &pipeline)).unwrap();
+        let Answer::Body(body) = answer else { panic!("{pipeline}: documents are a body") };
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            serde_json::to_string(&value).unwrap(),
+            "{pipeline}"
+        );
+        // The hold is the JSON of the documents alone, and it is the same as for the value.
+        assert!(hold.bytes() > 0 || pipeline == json!([{"$match": {"_id": 999}}]));
+    }
+}
+
+#[test]
+fn the_body_is_charged_the_same_bytes_and_refused_at_the_same_one_as_the_value() {
+    // Over a sweep of limits around where the answer stops fitting, the body and the value
+    // agree on whether it is answered, and when it is not, on every word of the refusal
+    // (which includes the total held when it was refused). A state's limits are set once, so
+    // each limit is a state of its own.
+    let both = |limit: usize| {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(&dir, mixed(12), vec![]);
+        state.set_aggregate_memory(AggregateMemory::new(limit, 64 << 20));
+        let pipeline = json!([]);
+        let value = block_on(aggregate(&state, &root(), "app", "orders", &pipeline));
+        let body = block_on(aggregate_held(&state, &root(), "app", "orders", &pipeline));
+        (value, body)
+    };
+    // Where the answer stops fitting, found by halving.
+    let (mut lo, mut hi) = (1_000usize, 1_000_000usize);
+    assert!(both(lo).0.is_err() && both(hi).0.is_ok());
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if both(mid).0.is_ok() {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let (mut refused, mut answered) = (0, 0);
+    for limit in (hi - 600..hi + 600).step_by(50) {
+        let (value, body) = both(limit);
+        match (value, body) {
+            (Ok(value), Ok((Answer::Body(body), hold))) => {
+                answered += 1;
+                assert_eq!(
+                    String::from_utf8(body).unwrap(),
+                    serde_json::to_string(&value).unwrap()
+                );
+                drop(hold);
+            }
+            (Err(a), Err(b)) => {
+                refused += 1;
+                assert_eq!((a.status, &a.message), (b.status, &b.message), "limit {limit}");
+            }
+            (a, b) => panic!("limit {limit}: {:?} vs {:?}", a.is_ok(), b.is_ok()),
+        }
+    }
+    assert!(refused > 3 && answered > 3, "the sweep crosses the limit: {refused}/{answered}");
+    // And the exact boundary is the same for both: the smallest limit that answers.
+    let (value, body) = both(hi);
+    assert!(value.is_ok() && body.is_ok());
+    let (value, body) = both(hi - 1);
+    assert!(value.is_err() && body.is_err());
+}
+
+#[test]
+fn a_sink_answers_its_counts_as_a_value_and_documents_as_a_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(3, 10), vec![]);
+    let (answer, _) =
+        block_on(aggregate_held(&state, &root(), "app", "orders", &json!([{"$out": "copy"}])))
+            .unwrap();
+    let Answer::Json(counts) = answer else { panic!("a sink answers a value") };
+    assert_eq!(counts["out"]["inserted"], 3);
+}

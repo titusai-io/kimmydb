@@ -2324,23 +2324,60 @@ async fn aggregate_run(
     pipeline: &Value,
     limits: aggregate::Limits,
 ) -> Result<Value, ApiError> {
-    Ok(aggregate_run_held(state, auth, db, coll, pipeline, limits).await?.0)
+    Ok(aggregate_run_held(state, auth, db, coll, pipeline, limits, Shape::Value)
+        .await?
+        .0
+        .into_value())
+}
+
+/// What an aggregation answers, in the shape the caller asked for ([`Shape`]).
+pub enum Answer {
+    /// The answer as a value: a sink's counts, or documents for a caller that wants a value.
+    Json(Value),
+    /// The documents' answer already written as JSON, `{"documents":[..],"count":N}`, byte for
+    /// byte what serialising the value would give: the route sends it as it is.
+    Body(Vec<u8>),
+}
+
+impl Answer {
+    /// The answer as a value (parsed back, if it was written as a body: only a caller that
+    /// asked for a value is handed anything else, so this is for tests and the like).
+    pub fn into_value(self) -> Value {
+        match self {
+            Answer::Json(value) => value,
+            Answer::Body(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// The shape an aggregation's answer is built in. A route that writes the answer as it is
+/// wants the bytes ([`Shape::Body`]): the documents are written once, as JSON, and counted
+/// as they are written, with no value of the whole answer built beside them. A caller that
+/// needs a value (the MCP tool, which renders it its own way) asks for [`Shape::Value`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Value,
+    Body,
 }
 
 /// [`aggregate`], also handing back the lease that holds the answer's bytes in the request's
 /// memory budget and the node's pool (ADR-269). The route keeps it until the response body has
 /// been sent, so an answer still being written counts against the pool; dropping it gives the
 /// bytes back. Under [`aggregate`] it is dropped on return.
+///
+/// The answer is the body to send ([`Answer::Body`]) for a pipeline that answers documents,
+/// written once and sized as it was written; a pipeline that ends in a sink answers a small
+/// value.
 pub async fn aggregate_held(
     state: &SharedState,
     auth: &Auth,
     db: &str,
     coll: &str,
     pipeline: &Value,
-) -> Result<(Value, kimmy_query::budget::Lease), ApiError> {
+) -> Result<(Answer, kimmy_query::budget::Lease), ApiError> {
     use tracing::Instrument;
     let (answer, _, hold) =
-        aggregate_run_held(state, auth, db, coll, pipeline, state.aggregate_limits())
+        aggregate_run_held(state, auth, db, coll, pipeline, state.aggregate_limits(), Shape::Body)
             .instrument(op_span("aggregate", db, Some(coll)))
             .await?;
     Ok((answer, hold.unwrap_or_else(|| state.aggregate_limits().buffer.lease("the answer"))))
@@ -2357,8 +2394,9 @@ pub(crate) async fn aggregate_run_stats(
     pipeline: &Value,
     limits: aggregate::Limits,
 ) -> Result<(Value, Option<QueryStats>), ApiError> {
-    let (answer, stats, _) = aggregate_run_held(state, auth, db, coll, pipeline, limits).await?;
-    Ok((answer, stats))
+    let (answer, stats, _) =
+        aggregate_run_held(state, auth, db, coll, pipeline, limits, Shape::Value).await?;
+    Ok((answer.into_value(), stats))
 }
 
 /// [`aggregate_run_stats`], also answering the lease that holds the answer, for a pipeline that
@@ -2370,7 +2408,8 @@ async fn aggregate_run_held(
     coll: &str,
     pipeline: &Value,
     limits: aggregate::Limits,
-) -> Result<(Value, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
+    shape: Shape,
+) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
     let all_stages = parse_pipeline(pipeline)?;
@@ -2444,7 +2483,7 @@ async fn aggregate_run_held(
             lease.charge_docs(&docs)?;
             lease
         };
-        return Ok((write_sink(state, sink, last, docs)?, source_stats, None));
+        return Ok((Answer::Json(write_sink(state, sink, last, docs)?), source_stats, None));
     }
 
     // The answer (ADR-269). The output documents are held while it is built beside them,
@@ -2455,20 +2494,49 @@ async fn aggregate_run_held(
     let mut answer = limits.buffer.lease("the answer");
     answer.charge_docs(&docs)?;
     let mut json_total = 0usize;
-    let mut documents: Vec<Value> = Vec::with_capacity(docs.len());
-    for doc in &docs {
-        let value = document_to_json(doc);
-        let len = json_len(&value);
-        answer.charge(len)?;
-        json_total += len;
-        documents.push(value);
-    }
+    let count = docs.len();
+    let built = match shape {
+        Shape::Value => {
+            let mut documents: Vec<Value> = Vec::with_capacity(count);
+            for doc in &docs {
+                let value = document_to_json(doc);
+                let len = json_len(&value);
+                answer.charge(len)?;
+                json_total += len;
+                documents.push(value);
+            }
+            Answer::Json(json!({ "documents": documents, "count": count }))
+        }
+        Shape::Body => {
+            // The body is written once: each document straight into it, charged by the
+            // bytes it took, so the refusal comes at the same document and the same total
+            // as when each was counted apart, and nothing past the document that passes the
+            // limit is written. What is not a document's (the framing and the count) is
+            // under a hundred bytes and not charged, as it was not.
+            let mut body = Vec::new();
+            body.extend_from_slice(b"{\"documents\":[");
+            for (at, doc) in docs.iter().enumerate() {
+                if at > 0 {
+                    body.push(b',');
+                }
+                let start = body.len();
+                // Writing to a vector cannot fail; a value that could not be written is
+                // charged as it got, as `json_len` counts it.
+                let _ = serde_json::to_writer(&mut body, &document_to_json(doc));
+                let len = body.len() - start;
+                answer.charge(len)?;
+                json_total += len;
+            }
+            body.extend_from_slice(format!("],\"count\":{count}}}").as_bytes());
+            Answer::Body(body)
+        }
+    };
     drop(docs);
     // The documents are gone; what is left of the answer is its JSON, which is what a body
     // written from it takes.
     let doc_bytes = answer.bytes() - json_total;
     answer.release(doc_bytes);
-    Ok((json!({ "documents": documents, "count": documents.len() }), source_stats, Some(answer)))
+    Ok((built, source_stats, Some(answer)))
 }
 
 /// The bytes `value` takes as JSON, counted as it is written and never held.

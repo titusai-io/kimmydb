@@ -1188,12 +1188,16 @@ async fn aggregate_docs(
         return Ok(Json(plan).into_response());
     }
     // The answer's bytes stay charged to the node's pool until the body has been sent
-    // (ADR-269): the lease rides in the response body, and the `Value` is dropped as soon as
-    // it is serialised.
+    // (ADR-269): the lease rides in the response body. The answer is written once, as the body
+    // itself, and counted as it was written.
     let (answer, hold) = exec::aggregate_held(&state, &auth, &db, &coll, &body.pipeline).await?;
-    let bytes = serde_json::to_vec(&answer)
-        .map_err(|e| ApiError::internal(format!("could not write the answer: {e}")))?;
-    drop(answer);
+    // A pipeline that answers documents is already written, once, as the body; a sink's
+    // counts are a small value, written here.
+    let bytes = match answer {
+        exec::Answer::Body(bytes) => bytes,
+        exec::Answer::Json(value) => serde_json::to_vec(&value)
+            .map_err(|e| ApiError::internal(format!("could not write the answer: {e}")))?,
+    };
     let length = bytes.len();
     let mut response =
         Response::new(axum::body::Body::new(crate::limits::HeldBody::new(bytes.into(), hold)));
