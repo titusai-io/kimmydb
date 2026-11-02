@@ -133,8 +133,12 @@ fn stage() -> impl Strategy<Value = Document> {
     ]
 }
 
-fn pipeline_of(specs: &[Document]) -> Option<Vec<Stage>> {
-    aggregate::parse(specs).ok()
+fn pipeline_of(specs: &[Document]) -> Vec<Stage> {
+    // Every generated shape parses; a case that did not would pass by finding nothing, so
+    // a parse change that refuses one fails here rather than hiding.
+    aggregate::parse(specs).unwrap_or_else(|e| {
+        panic!("the generator made a pipeline that does not parse: {e:?}: {specs:?}")
+    })
 }
 
 proptest! {
@@ -145,7 +149,7 @@ proptest! {
         specs in prop::collection::vec(stage(), 0..7),
         docs in documents(),
     ) {
-        let Some(stages) = pipeline_of(&specs) else { return Ok(()); };
+        let stages = pipeline_of(&specs);
         let want = answer(old_loop(&stages, docs.clone()));
         prop_assert_eq!(&answer(chain_all(&stages, docs.clone())), &want, "pushed whole: {:?}", specs);
         prop_assert_eq!(

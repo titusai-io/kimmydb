@@ -2655,14 +2655,16 @@ fn run_stages(
     let run =
         |stage: &aggregate::Stage, docs| run_stage(state, auth, db, stage, docs, limits, vars);
     let mut chain = pipeline::build(stages, &run);
-    // The source is already in memory, whole, and goes in as it is: there is no scan to
-    // stop, so the answer of the push is not needed.
+    // The input is already in memory, whole (the source, a `$facet` branch's copy, a
+    // `$lookup` or `$unionWith` sub-pipeline's documents), and goes in as it is: there is no
+    // scan to stop, so the answer of the push is not needed.
     let _more = chain.push_all(docs)?;
     chain.finish()
 }
 
-/// One stage on all of its input: the two `$lookup` forms go to the functions here that
-/// hold a storage handle, everything else to the pure pipeline.
+/// One stage on all of its input: the stages that hold a storage handle (the two `$lookup`
+/// forms, `$graphLookup`, `$unionWith`) and `$facet` go to the functions here, everything
+/// else to the pure pipeline.
 fn run_stage(
     state: &SharedState,
     auth: &Auth,
