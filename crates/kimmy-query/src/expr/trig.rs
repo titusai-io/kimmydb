@@ -46,7 +46,7 @@ pub(super) fn print_g(value: f64) -> String {
         return "nan".into();
     }
     if value.is_infinite() {
-        return if value < 0.0 { "-inf" } else { "inf" }.into();
+        return if value.is_sign_negative() { "-inf" } else { "inf" }.into();
     }
     if value == 0.0 {
         return if value.is_sign_negative() { "-0" } else { "0" }.into();
@@ -60,7 +60,7 @@ pub(super) fn print_g(value: f64) -> String {
         } else {
             mantissa
         };
-        let sign = if exponent < 0 { '-' } else { '+' };
+        let sign = if exponent.is_negative() { '-' } else { '+' };
         return format!("{mantissa}e{sign}{:02}", exponent.abs());
     }
     let fixed = format!("{value:.*}", (5 - exponent) as usize);
@@ -352,7 +352,8 @@ pub(super) fn decimal_log(x: &Raw, base: &Raw) -> Raw {
         return func::log10(x).unwrap_or(Raw::Nan);
     }
     match (x, base) {
-        (Raw::Inf { .. }, Raw::Inf { .. }) => Raw::Nan,
+        // Beside an infinite base, `ln(base)` is an infinity and not a finite number, which is
+        // the `NaN` of an infinity over an infinity.
         (Raw::Inf { .. }, _) => match func::ln(base) {
             Ok(Raw::Finite { negative, .. }) => Raw::Inf { negative },
             _ => Raw::Nan,
