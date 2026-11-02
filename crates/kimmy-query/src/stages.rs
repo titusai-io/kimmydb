@@ -41,8 +41,8 @@ pub(crate) fn parse_sort_by_count(value: &Bson, vars: &[String]) -> Result<Stage
 /// Run `$sortByCount`: `{$group: {_id: <expr>, count: {$sum: 1}}}` then
 /// `{$sort: {count: -1}}`. The groups come out in the order their keys were first seen
 /// and the sort is stable, so groups with the same count stay in that order (the
-/// reference leaves it unspecified). The `count` is an int, widening to a long past
-/// 2^31-1, as the reference's is; `$group`'s own `{$sum: 1}` is a long in this build.
+/// reference leaves it unspecified). The `count` is `$group`'s own `{$sum: 1}`: an int,
+/// widening to a long past 2^31-1, as the reference's is (ADR-268).
 pub(crate) fn sort_by_count(
     input: Vec<Document>,
     expr: &Expr,
@@ -50,14 +50,9 @@ pub(crate) fn sort_by_count(
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
     let fields = [("count".to_string(), Accumulator::Sum(Expr::Literal(Bson::Int32(1))))];
-    let mut groups = group_keyed("$sortByCount", input, &fields, limits, vars, |scope| {
+    let groups = group_keyed("$sortByCount", input, &fields, limits, vars, |scope| {
         expr.eval_in(scope).map(Some)
     })?;
-    for group in &mut groups {
-        if let Some(Bson::Int64(n)) = group.get("count") {
-            group.insert("count", int_count(*n));
-        }
-    }
     let groups =
         shape::sort_until_deadline(&[SortKey { path: "count".into(), descending: true }], groups)?;
     Ok(groups)
@@ -166,11 +161,6 @@ pub(crate) fn parse_sample(value: &Bson) -> Result<Stage> {
         return Err(Error::InvalidQuery("size argument to $sample must not be negative".into()));
     }
     Ok(Stage::Sample(n as usize))
-}
-
-/// A count as the reference gives it: an int, a long only past the int range.
-pub(crate) fn int_count(n: i64) -> Bson {
-    i32::try_from(n).map_or(Bson::Int64(n), Bson::Int32)
 }
 
 /// A source of random positions: `below(n)` answers a number in `0..n`, `n > 0`.

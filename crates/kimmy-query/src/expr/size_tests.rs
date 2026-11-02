@@ -206,8 +206,8 @@ fn range_is_bounded_before_it_allocates() {
     // A span of two billion is refused by its count, not built (a 400, as it was).
     for args in [
         vec![Bson::Int32(0), Bson::Int32(i32::MAX)],
-        vec![Bson::Int64(0), Bson::Int64(i64::MAX)],
-        vec![Bson::Int64(i64::MIN), Bson::Int64(i64::MAX), Bson::Int32(1)],
+        vec![Bson::Int64(0), Bson::Int64(i64::from(i32::MAX))],
+        vec![Bson::Int64(i64::from(i32::MIN)), Bson::Int64(i64::from(i32::MAX)), Bson::Int32(1)],
         vec![Bson::Int32(0), Bson::Int32(i32::MAX), Bson::Int32(2)],
     ] {
         let err = ev(doc! {"$range": args}, &doc! {}).unwrap_err();
@@ -216,6 +216,9 @@ fn range_is_bounded_before_it_allocates() {
             "{err:?}"
         );
     }
+    // A bound past `Int32` is refused as a 32-bit bound, as the reference refuses it (34446).
+    let err = ev(doc! {"$range": [Bson::Int64(0), Bson::Int64(i64::MAX)]}, &doc! {}).unwrap_err();
+    assert!(matches!(&err, Error::InvalidQuery(m) if m.contains("32-bit integer")), "{err:?}");
     assert_eq!(
         ev(doc! {"$range": [0, 100_000]}, &doc! {}).unwrap().as_array().unwrap().len(),
         100_000

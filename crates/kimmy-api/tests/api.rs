@@ -14526,6 +14526,117 @@ async fn the_math_operators_now_and_remove_run_through_the_aggregate_route() {
 }
 
 #[tokio::test]
+async fn an_integer_result_has_the_references_width_through_the_aggregate_route() {
+    // ADR-268: `Int32` with `Int32` is an `int` and widens to a `long` on overflow, an
+    // `Int64` operand gives a `long`, the counting operators and `$sum` of small totals
+    // give an `int`, and a double stays a `double`. The JSON body carries a number
+    // either way, so the width is read with `$type`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "w" })).await;
+    for (id, doc) in [
+        (
+            1,
+            json!({ "a": 7, "big": 2147483647, "l": { "$numberLong": "7" }, "xs": [1, 2, 3], "s": "héllo" }),
+        ),
+        (2, json!({ "a": 8, "big": 2147483647, "l": { "$numberLong": "8" }, "xs": [], "s": "x" })),
+    ] {
+        let mut doc = doc;
+        doc["_id"] = json!(id);
+        let res = server.post("/v1/db/shop/coll/w/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/w/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    let res = aggregate(json!([
+        { "$sort": { "_id": 1 } },
+        { "$limit": 1 },
+        { "$project": { "_id": 0,
+            "add": { "$type": { "$add": ["$a", 1] } },
+            "overflow": { "$type": { "$add": ["$big", 1] } },
+            "overflow_value": { "$add": ["$big", 1] },
+            "chain": { "$type": { "$add": ["$big", 1, -1] } },
+            "chain_value": { "$add": ["$big", 1, -1] },
+            "lsum": { "$type": { "$add": ["$l", 1, -1] } },
+            "modw": { "$type": { "$mod": ["$a", 2.0] } },
+            "powone": { "$type": { "$pow": [1, -3] } },
+            "mixed": { "$type": { "$add": ["$a", "$l"] } },
+            "mul": { "$type": { "$multiply": ["$a", 2] } },
+            "dbl": { "$type": { "$add": ["$a", 0.5] } },
+            "mod": { "$type": { "$mod": ["$a", 3] } },
+            "abs": { "$type": { "$abs": "$a" } },
+            "size": { "$type": { "$size": "$xs" } },
+            "len": { "$type": { "$strLenCP": "$s" } },
+            "bytes": { "$type": { "$strLenBytes": "$s" } },
+            "at": { "$type": { "$indexOfArray": ["$xs", 3] } },
+            "range": { "$type": { "$arrayElemAt": [{ "$range": [0, 3] }, 1] } }
+        } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let got = &res.body["documents"][0];
+    for (field, want) in [
+        ("add", "int"),
+        ("overflow", "long"),
+        ("mixed", "long"),
+        ("chain", "int"),
+        ("lsum", "long"),
+        ("modw", "int"),
+        ("powone", "int"),
+        ("mul", "int"),
+        ("dbl", "double"),
+        ("mod", "int"),
+        ("abs", "int"),
+        ("size", "int"),
+        ("len", "int"),
+        ("bytes", "int"),
+        ("at", "int"),
+        ("range", "int"),
+    ] {
+        assert_eq!(got[field], want, "{field}: {got:?}");
+    }
+    assert_eq!(got["overflow_value"], 2147483648i64);
+    assert_eq!(got["chain_value"], 2147483647);
+
+    // `$sum` is typed by its total, `{$sum: 1}` and `$count` are ints, and `$avg` is a double.
+    let res = aggregate(json!([
+        { "$group": { "_id": null,
+            "n": { "$sum": 1 }, "t": { "$sum": "$a" }, "wide": { "$sum": "$big" },
+            "longs": { "$sum": "$l" }, "avg": { "$avg": "$a" }, "c": { "$count": {} } } },
+        { "$project": { "_id": 0,
+            "n": { "$type": "$n" }, "t": { "$type": "$t" }, "wide": { "$type": "$wide" },
+            "wide_value": "$wide", "longs": { "$type": "$longs" }, "avg": { "$type": "$avg" },
+            "c": { "$type": "$c" } } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let got = &res.body["documents"][0];
+    for (field, want) in [
+        ("n", "int"),
+        ("t", "int"),
+        ("wide", "long"),
+        ("longs", "long"),
+        ("avg", "double"),
+        ("c", "int"),
+    ] {
+        assert_eq!(got[field], want, "{field}: {got:?}");
+    }
+    assert_eq!(got["wide_value"], 4294967294i64);
+
+    let res =
+        aggregate(json!([{ "$count": "n" }, { "$project": { "t": { "$type": "$n" } } }])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["t"], "int");
+}
+
+#[tokio::test]
 async fn facet_answers_one_document_of_arrays_and_refuses_what_it_cannot_hold() {
     // ADR-254: every facet runs over the same input; a `$lookup` works inside one;
     // `$$NOW` is one date; what a facet cannot hold is a `400`, never ignored.
@@ -19909,7 +20020,8 @@ async fn an_array_update_is_a_pipeline_update_on_update_and_find_and_modify() {
     }))
     .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
-    // Document 3 held `total: 2` as an int; the sum is a long, so every one changed.
+    // Document 3 held `total: 2` as an int and the sum is an int too (ADR-268), so its total
+    // is unchanged, but it gains `n`: every one changed.
     assert_eq!((res.body["matched"].as_u64(), res.body["modified"].as_u64()), (Some(3), Some(3)));
     assert_eq!(pu_doc(&server, &token, 1).await["total"], 5);
     assert_eq!(pu_doc(&server, &token, 1).await["n"], 2);
