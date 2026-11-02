@@ -151,6 +151,24 @@ pub fn streams(stage: &Stage) -> bool {
     )
 }
 
+/// How many documents of the source a pipeline whose stages are `stages` will take, when that
+/// is known before it runs: the stages begin with a run of `$skip`s and a `$limit`, which take
+/// that many whatever the documents are (a `$limit` of 0 included, which takes none). `None`
+/// for any other beginning, which may need every document the source has.
+///
+/// Exact, never a guess: a source that stops there has delivered what the pipeline takes.
+pub fn source_bound(stages: &[Stage]) -> Option<usize> {
+    let mut skipped = 0usize;
+    for stage in stages {
+        match stage {
+            Stage::Skip(n) => skipped = skipped.saturating_add(*n),
+            Stage::Limit(n) => return Some(skipped.saturating_add(*n)),
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// A pipeline made into sinks, ready for documents. Push the source into it, then
 /// [`Chain::finish`] it for the output.
 pub struct Chain<'a, E: From<Error>> {
@@ -1389,5 +1407,26 @@ mod tests {
                 .expect("refused as the documents arrive");
             assert!(matches!(&err, Error::ValueTooLarge { what, .. } if *what == name), "{err:?}");
         }
+    }
+
+    #[test]
+    fn the_source_a_pipeline_takes_is_known_for_a_skip_and_a_limit_at_its_head_and_no_other() {
+        let bound = |specs: &[Document]| source_bound(&parsed(specs));
+        assert_eq!(bound(&[doc! {"$limit": 5}]), Some(5));
+        assert_eq!(bound(&[doc! {"$limit": 0}]), Some(0));
+        assert_eq!(bound(&[doc! {"$skip": 3}, doc! {"$limit": 5}]), Some(8));
+        assert_eq!(
+            bound(&[doc! {"$skip": 3}, doc! {"$skip": 4}, doc! {"$limit": 5}, doc! {"$limit": 1}]),
+            Some(12)
+        );
+        // Anything else before a limit, or no limit, may need every document.
+        assert_eq!(bound(&[]), None);
+        assert_eq!(bound(&[doc! {"$skip": 3}]), None);
+        assert_eq!(bound(&[doc! {"$match": {"a": 1}}, doc! {"$limit": 5}]), None);
+        assert_eq!(bound(&[doc! {"$sort": {"a": 1}}, doc! {"$limit": 5}]), None);
+        assert_eq!(
+            bound(&[doc! {"$project": {"a": 1}}, doc! {"$skip": 1}, doc! {"$limit": 5}]),
+            None
+        );
     }
 }

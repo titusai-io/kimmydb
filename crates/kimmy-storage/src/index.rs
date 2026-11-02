@@ -2369,6 +2369,19 @@ pub enum CandidateOrder<'a> {
     ById { after: Option<&'a [u8]>, want: Option<usize> },
 }
 
+/// Where the document keys an inexact range collects in `_id` order are charged, for a caller
+/// that budgets what a request holds (the aggregation's memory limit, ADR-269). The set is as
+/// large as the range when the caller wants every candidate, so it is held to a budget a key
+/// at a time and a refusal ends the scan.
+pub trait KeyHold {
+    /// One more key of `len` bytes is held. A refusal ends the scan with its error.
+    fn take(&self, len: usize) -> kimmy_core::Result<()>;
+    /// A key of `len` bytes is let go, because a smaller one took its place.
+    fn give(&self, len: usize);
+    /// Every key held is let go: a pass has offered its set, or the scan has ended.
+    fn give_all(&self);
+}
+
 /// What an index scan did.
 ///
 /// `entries` is the honest measure of how much of the index a query touched,
@@ -2414,6 +2427,9 @@ struct Walk<'t, F> {
     /// probe, and reads nothing extra when the run is empty.
     ranges: &'t [(Vec<u8>, Vec<u8>)],
     outcome: IndexScanOutcome,
+    /// Where the keys an inexact range holds are charged, if the caller budgets them (an
+    /// aggregation's streamed source, which has no count to bound the set by).
+    hold: Option<&'t dyn KeyHold>,
     visit: F,
 }
 
@@ -2613,6 +2629,24 @@ where
     /// number of passes is logarithmic in what the filter rejected rather
     /// than linear in it.
     fn in_key_order(&mut self, after: Option<&[u8]>, want: Option<usize>) -> Result<()> {
+        let done = self.in_key_order_held(after, want);
+        // Whatever ended the walk, the keys it held are gone with it.
+        if let Some(hold) = self.hold {
+            hold.give_all();
+        }
+        done
+    }
+
+    /// Charge one key to the hold, if there is one; a refusal is the request's (`413`,
+    /// `503`) and ends the walk.
+    fn take_key(&self, len: usize) -> Result<()> {
+        match self.hold {
+            Some(hold) => Ok(hold.take(len)?),
+            None => Ok(()),
+        }
+    }
+
+    fn in_key_order_held(&mut self, after: Option<&[u8]>, want: Option<usize>) -> Result<()> {
         use std::collections::BTreeSet;
         use std::ops::Bound;
 
@@ -2638,14 +2672,19 @@ where
                         continue;
                     }
                     if best.len() < batch {
-                        best.insert(doc_key.to_vec());
+                        if best.insert(doc_key.to_vec()) {
+                            self.take_key(doc_key.len())?;
+                        }
                     } else if best.last().is_some_and(|max| doc_key < max.as_slice())
                         && best.insert(doc_key.to_vec())
                     {
                         // Grew past the bound with a smaller key: the largest
                         // is no longer among the `batch` smallest. (A repeat
                         // of a key already held does not grow the set.)
-                        best.pop_last();
+                        self.take_key(doc_key.len())?;
+                        if let (Some(largest), Some(hold)) = (best.pop_last(), self.hold) {
+                            hold.give(largest.len());
+                        }
                     }
                 }
             }
@@ -2658,6 +2697,10 @@ where
                     return Ok(());
                 }
                 last = Some(key);
+            }
+            // The pass is done with its keys; the next collects its own.
+            if let Some(hold) = self.hold {
+                hold.give_all();
             }
             if exhausted {
                 return Ok(());
@@ -2699,6 +2742,26 @@ impl crate::Engine {
         scan: &IndexScan<'_>,
         order: CandidateOrder<'_>,
         scope: WalkScope,
+        visit: F,
+    ) -> Result<Option<IndexScanOutcome>>
+    where
+        F: FnMut(&[u8], kimmy_core::Stamp, Document) -> Result<bool>,
+    {
+        self.visit_index_candidates_held(coll, scan, order, scope, None, visit)
+    }
+
+    /// [`Engine::visit_index_candidates`], with the keys an inexact range holds in `_id`
+    /// order charged to `hold` as the set grows and given back as it is drained. For a
+    /// caller that cannot bound the set with a `want` (every candidate is wanted, in
+    /// order): a range that is too large is refused by the lease, and the request's
+    /// deadline is looked at for each entry read.
+    pub fn visit_index_candidates_held<F>(
+        &self,
+        coll: &crate::CollectionMeta,
+        scan: &IndexScan<'_>,
+        order: CandidateOrder<'_>,
+        scope: WalkScope,
+        hold: Option<&dyn KeyHold>,
         visit: F,
     ) -> Result<Option<IndexScanOutcome>>
     where
@@ -2756,6 +2819,7 @@ impl crate::Engine {
             docs: &docs,
             ranges: &ranges,
             outcome: IndexScanOutcome::default(),
+            hold,
             visit,
         };
         match order {

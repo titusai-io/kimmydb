@@ -280,6 +280,98 @@ fn a_pipeline_of_more_than_a_thousand_stages_is_a_400_that_names_the_count_and_t
     );
 }
 
+/// `n` documents `{_id: i, t: i}` under an index on `t`, so a range of `t` is an inexact
+/// index range, delivered in `_id` order.
+fn indexed(dir: &tempfile::TempDir, n: i32) -> SharedState {
+    let state = live_state(dir);
+    state.engine.create_collection("app", "orders").unwrap();
+    state
+        .engine
+        .create_index("app", "orders", vec![kimmy_storage::IndexField::ascending("t")], false, None)
+        .unwrap();
+    let meta = state.engine.get_collection("app", "orders").unwrap();
+    let docs: Vec<Document> = (0..n).map(|i| doc! {"_id": i, "t": i}).collect();
+    state.engine.insert_many(&meta, docs).unwrap();
+    state
+}
+
+/// The keys of an index range, as the budget counts one of the `_id`s of `indexed`.
+fn key_bytes(keys: usize) -> usize {
+    keys * kimmy_query::budget::held_set_key(5)
+}
+
+#[test]
+fn a_streamed_source_over_an_index_range_is_read_whole_and_never_cut_at_the_ceiling() {
+    // The source of a pipeline that streams has no ceiling, and the keys of the range are
+    // collected without a count to bound them: all 1,500 are delivered, in order, though the
+    // pipeline limit is a thousand. A cut at the limit would answer 1,001.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500);
+    let drop_most = json!({"$match": {"_id": {"$gte": 1_490}}});
+    let pipeline = json!([{"$match": {"t": {"$gte": 0}}}, {"$project": {"_id": 1}}, drop_most]);
+    let (answer, stats) = run_stats(&state, pipeline, with_ceiling(1_000));
+    assert_eq!(ids(&answer), (1_490..1_500).collect::<Vec<i64>>());
+    assert_eq!((stats.matched, stats.index.as_deref()), (1_500, Some("t_1")));
+    assert_eq!(stats.index_entries, Some(1_500));
+}
+
+#[test]
+fn the_keys_an_unbounded_index_range_collects_are_charged_and_refused_at_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500);
+    let pipeline =
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$project": {"_id": 1}}, {"$match": {"_id": 3}}]);
+    // Room for 100 keys of the 1,500: refused, naming the lease, near its cap.
+    let limits = capped(key_bytes(100));
+    let err = run(&state, pipeline.clone(), limits.clone()).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert!(err.message.contains("the index range of $match is "), "{}", err.message);
+    let held: usize =
+        err.message.split(" is ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+    assert!(held > key_bytes(100) && held <= key_bytes(100) + key_bytes(1), "stopped at {held}");
+    assert_eq!(limits.buffer.used(), 0, "gives everything back when refused");
+    // Room for all of them, and it is answered, with the keys given back.
+    let limits = capped(key_bytes(1_600));
+    let ok = run(&state, pipeline, limits.clone()).unwrap();
+    assert_eq!(ids(&ok), [3]);
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+#[test]
+fn a_skip_and_a_limit_at_the_head_bound_the_keys_a_range_holds_to_what_they_take() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500);
+    // The answer is empty, so the budget is the keys' alone. Room for four keys of 1,500:
+    // `[$match, $skip 1, $limit 2]` takes three, and the range is read whole to find them,
+    // holding the three smallest `_id`s and no more.
+    let none = json!({"$match": {"_id": -1}});
+    let limits = capped(key_bytes(4));
+    let (answer, stats) = run_stats(
+        &state,
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$skip": 1}, {"$limit": 2}, none.clone()]),
+        limits.clone(),
+    );
+    assert_eq!(ids(&answer), Vec::<i64>::new());
+    assert_eq!(stats.matched, 3, "three documents were taken from the range");
+    assert_eq!(stats.index_entries, Some(1_500), "a range in `_id` order is read whole");
+    assert_eq!(limits.buffer.used(), 0);
+    // A `$limit` of one holds one.
+    let (_, stats) = run_stats(
+        &state,
+        json!([{"$match": {"t": {"$gt": 0}}}, {"$limit": 1}, none.clone()]),
+        capped(key_bytes(2)),
+    );
+    assert_eq!(stats.matched, 1);
+    // Anything before the limit may need more, and is held to the budget instead.
+    let err = run(
+        &state,
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$project": {"_id": 1}}, {"$limit": 1}, none]),
+        capped(key_bytes(4)),
+    )
+    .unwrap_err();
+    assert!(err.message.contains("the index range of $match"), "{}", err.message);
+}
+
 /// A document of about a megabyte, with `levels` arrays of two numbers, `a0` to `a<levels-1>`.
 fn deep(levels: usize) -> Document {
     let mut doc = doc! {"_id": 1, "pad": "x".repeat(1 << 20)};

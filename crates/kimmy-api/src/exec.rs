@@ -974,6 +974,38 @@ pub(crate) fn visit_matching_until<F>(
 where
     F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>,
 {
+    let bounds = ScanBounds { stop_after, want: stop_after, hold: None };
+    visit_matching_bounded(state, meta, filter, order, bounds, visit)
+}
+
+/// What a read of the source is bounded by.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanBounds<'a> {
+    /// The scan ends once this many documents have matched.
+    pub(crate) stop_after: Option<usize>,
+    /// How many candidates the visitor expects to accept: what sizes the work of an inexact
+    /// index range per pass and the keys it holds (`None`: every one, in order). Not a limit,
+    /// a scan that wants more goes on.
+    pub(crate) want: Option<usize>,
+    /// Where the keys an inexact index range holds are charged when `want` does not bound
+    /// them (ADR-269).
+    pub(crate) hold: Option<&'a dyn kimmy_storage::KeyHold>,
+}
+
+/// [`visit_matching_until`], with the bounds of the read given apart: `stop_after` ends the
+/// scan, `want` sizes what an index range holds, and `hold` budgets it.
+pub(crate) fn visit_matching_bounded<F>(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    filter: &filter::Filter,
+    order: Order<'_>,
+    bounds: ScanBounds<'_>,
+    visit: F,
+) -> Result<QueryStats, ApiError>
+where
+    F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>,
+{
+    let ScanBounds { stop_after, want, hold } = bounds;
     // Every read of documents goes through here (find, count, an aggregate's source,
     // the vector filter's paging), so the request's deadline is set once for all of
     // them; the walks below tick it per row (ADR-266).
@@ -1052,17 +1084,16 @@ where
             exact: p.exact,
         };
         let delivery = match order {
-            Order::ById { after } => {
-                kimmy_storage::CandidateOrder::ById { after, want: stop_after }
-            }
+            Order::ById { after } => kimmy_storage::CandidateOrder::ById { after, want },
             Order::Any => kimmy_storage::CandidateOrder::Any,
         };
         let outcome = kimmy_storage::blocking(|| {
-            state.engine.visit_index_candidates(
+            state.engine.visit_index_candidates_held(
                 meta,
                 &scan,
                 delivery,
                 kimmy_storage::WalkScope::Request,
+                hold,
                 |_, stamp, doc| Ok(recheck.take(stamp, doc)?),
             )
         })?;
@@ -2506,6 +2537,36 @@ async fn aggregate_run_held(
     )
 }
 
+/// The keys of an index range, held to the request's budget while the scan collects them.
+struct IndexKeys {
+    lease: std::cell::RefCell<Lease>,
+    held: std::cell::Cell<usize>,
+}
+
+impl IndexKeys {
+    fn new(lease: Lease) -> Self {
+        IndexKeys { lease: std::cell::RefCell::new(lease), held: std::cell::Cell::new(0) }
+    }
+}
+
+impl kimmy_storage::KeyHold for IndexKeys {
+    fn take(&self, len: usize) -> kimmy_core::Result<()> {
+        let bytes = kimmy_query::budget::held_set_key(len);
+        self.held.set(self.held.get().saturating_add(bytes));
+        self.lease.borrow_mut().charge(bytes)
+    }
+
+    fn give(&self, len: usize) {
+        let bytes = kimmy_query::budget::held_set_key(len).min(self.held.get());
+        self.held.set(self.held.get() - bytes);
+        self.lease.borrow_mut().release(bytes);
+    }
+
+    fn give_all(&self) {
+        self.lease.borrow_mut().release(self.held.replace(0));
+    }
+}
+
 /// An aggregation over a collection, from the read of its source to the answer, under the
 /// request's deadline: `source` is the collection, the filter that narrows the read and what
 /// the filter is called in a refusal, and `stages` what follows the leading `$match`.
@@ -2542,12 +2603,19 @@ fn scan_pipeline(
         // The scan answers `core::Error`s and the chain the executor's, so a failure of the
         // chain ends the scan and is kept to be returned when it is over.
         let mut failed = None;
-        let stats = visit_matching_until(
+        // The source has no ceiling, so the keys of an index range taken in `_id` order are
+        // bounded by what the pipeline will take when that is known (a `$skip` and a
+        // `$limit` at its head), and otherwise held to the request's budget as they are
+        // collected: a range is read whole to find its smallest keys.
+        let keys = IndexKeys::new(limits.buffer.lease("the index range of $match"));
+        let bounds =
+            ScanBounds { stop_after, want: pipeline::source_bound(stages), hold: Some(&keys) };
+        let stats = visit_matching_bounded(
             state,
             meta,
             filter,
             Order::ById { after: None },
-            stop_after,
+            bounds,
             |_, doc| match chain.push(doc) {
                 Ok(flow) => Ok(flow == pipeline::Flow::More),
                 Err(e) => {

@@ -624,3 +624,38 @@ fn an_upsert_with_no_time_left_inserts_nothing_and_answers_503_in_both_forms() {
         assert!(state.engine.get(&meta, &DocId::Int64(id)).unwrap().is_some());
     }
 }
+
+#[test]
+fn an_index_range_collected_in_id_order_ticks_for_each_entry_it_reads() {
+    // `[$match range, $limit 1]` offers one document, but a range delivered in `_id` order is
+    // read whole to find its smallest key (ADR-270). The walk of the index looks at the
+    // deadline for each entry, so the collecting of the keys is cut by it, and a passed
+    // deadline ends it before the first document.
+    let state_of = |dir: &tempfile::TempDir, n: i64| {
+        let state = live_state(dir);
+        state.engine.create_collection("app", "orders").unwrap();
+        state
+            .engine
+            .create_index(
+                "app",
+                "orders",
+                vec![kimmy_storage::IndexField::ascending("t")],
+                false,
+                None,
+            )
+            .unwrap();
+        let meta = state.engine.get_collection("app", "orders").unwrap();
+        state
+            .engine
+            .insert_many(&meta, (0..n).map(|i| doc! { "_id": i, "t": i }).collect())
+            .unwrap();
+        state
+    };
+    let (small, big) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (state_of(&small, 100), state_of(&big, 1_100));
+    let pipeline = json!([{ "$match": { "t": { "$gte": 0 } } }, { "$limit": 1 }]);
+    let diff = aggregate_looks(&b, &pipeline) - aggregate_looks(&a, &pipeline);
+    assert_eq!(diff, 1_000, "{diff} looks for a thousand more entries");
+    let late = aggregate_in_a_request(&b, &pipeline, PAST);
+    assert!(is_the_timeout(&late), "{late:?}");
+}
