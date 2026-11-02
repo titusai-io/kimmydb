@@ -84,3 +84,42 @@ fn many_calls_across_widths_read_pi_once_and_build_none() {
     // The count is global to the process: whatever ran first read it, and it is read once.
     assert_eq!(PI_PARSES.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn reaching_is_the_standard_scale_and_one_limb_for_each_19_digits_of_the_exponent() {
+    // The width is `SL + ceil((max(a, 0) + 1) / 19)` limbs, worked out here by hand and not
+    // by the function: the first limb past the standard six holds the digit of an operand
+    // with an adjusted exponent of 0, and a further limb comes at 19, 38, 57, ...
+    for (adjusted, limbs) in [
+        (-5, 7),     // 1 digit: 1 limb
+        (-1, 7),     // 1
+        (0, 7),      // 1
+        (1, 7),      // 2 digits: 1 limb
+        (18, 7),     // 19 digits: 1 limb
+        (19, 8),     // 20 digits: 2 limbs
+        (37, 8),     // 38 digits: 2 limbs
+        (38, 9),     // 39 digits: 3 limbs
+        (56, 9),     // 57 digits: 3 limbs
+        (57, 10),    // 58 digits: 4 limbs
+        (100, 12),   // 101 digits: 6 limbs
+        (1000, 59),  // 1,001 digits: 53 limbs
+        (6143, 330), // 6,144 digits: 324 limbs (6,144 / 19 = 323.37)
+        (6144, 330), // 6,145 digits: 324 limbs
+    ] {
+        assert_eq!(Scale::reaching(adjusted).limbs, limbs, "adjusted {adjusted}");
+        assert_eq!(Scale::reaching(adjusted).places(), limbs as u32 * 19, "adjusted {adjusted}");
+    }
+    // Whatever the exponent, the scale holds the operand and 114 places beyond it, in whole
+    // limbs, and a larger exponent never gives a narrower scale.
+    let mut previous = 0;
+    for adjusted in 0..=6200i64 {
+        let places = i64::from(Scale::reaching(adjusted).places());
+        assert!(places >= adjusted + 1 + 114, "adjusted {adjusted}: {places} places");
+        assert!(
+            places < adjusted + 1 + 114 + 19,
+            "adjusted {adjusted}: {places} places is a limb too wide"
+        );
+        assert!(places >= previous, "adjusted {adjusted}");
+        previous = places;
+    }
+}
