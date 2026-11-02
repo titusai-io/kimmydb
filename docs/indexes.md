@@ -115,8 +115,9 @@ index, spans many keys whose document keys interleave; a read that needs
 `_id` order keeps only the `skip + limit` smallest document keys of one pass
 over the range, and goes back for more, twice as many each time, only if the
 recheck rejected enough of them; a filter that rejects most candidates holds a
-third to a half of the range in its largest pass, and those keys are charged to
-the node's memory pool and refused `413` past the request limit
+third to a half of a large range in its largest pass. The keys of a pass that
+stays within `skip + limit` (at most 10,000) are not charged; past that they are
+charged to the node's memory pool and refused `413` past the request limit
 ([Operations](operations.md#aggregation-memory)). `explain` reports the
 entries read as `indexEntriesRead`, beside the documents examined.
 
