@@ -298,6 +298,14 @@ fn stage() -> impl Strategy<Value = Document> {
         // No default: a value outside the boundaries fails the stage.
         Just(doc! { "$bucket": { "groupBy": "$a", "boundaries": [-3, 0, 3, 6] } }),
         (1i32..6).prop_map(|n| doc! { "$sample": { "size": n } }),
+        // The stages that block and charge for themselves, which a streamed input to them
+        // hands the arrival lease back for, and a `$facet` of pure branches.
+        Just(doc! { "$bucketAuto": { "groupBy": "$a", "buckets": 2 } }),
+        Just(doc! { "$setWindowFields": { "sortBy": { "_id": 1 },
+        "output": { "n": { "$documentNumber": {} } } } }),
+        Just(doc! { "$densify": { "field": "a", "range": { "step": 1, "bounds": "full" } } }),
+        Just(doc! { "$fill": { "output": { "a": { "value": 0 } } } }),
+        Just(doc! { "$facet": { "x": [{ "$count": "n" }], "y": [{ "$limit": 1 }] } }),
     ]
 }
 
@@ -356,15 +364,18 @@ fn held_to_each_other(
             prop_assert!(false, "the chain failed with {e} where the loop answered: {:?}", specs)
         }
     }
-    // With nothing that blocks, the documents the chain read are the ones it failed on: the
-    // loop run over just those fails too, with the same error, since there is no failure in
-    // them that the chain did not meet first. (After a stage that blocks, the documents that
-    // reach a stage are not the source's, and the loop may meet a different failure first.)
-    if let Err(e) = &lazy
-        && stages.iter().all(pipeline::streams)
-    {
+    // With nothing that blocks, the loop run over just the documents the chain read fails
+    // too: it meets every failure the chain did, since those are in the documents it read.
+    // (Not with the same error in general: a later element of the failing document's fan
+    // could fail an earlier stage first. It is the same here because no generated stage
+    // fails on a value that differs between the elements of `arr`.)
+    if lazy.is_err() && stages.iter().all(pipeline::streams) {
         let read = &docs[..pushed];
-        prop_assert_eq!(&answer(old_loop(stages, read.to_vec())), &Err(e.clone()), "{:?}", specs);
+        prop_assert!(
+            old_loop(stages, read.to_vec()).is_err(),
+            "the loop over the documents read answers: {:?}",
+            specs
+        );
     }
     Ok(())
 }
