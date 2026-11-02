@@ -219,3 +219,64 @@ fn each_takes_exactly_one_operand() {
         }
     }
 }
+
+/// Old-style binary (subtype 2) is written with a 4-byte length inside its payload, and the
+/// reference counts it: `BinData(2, "AAAAAQID")` is six bytes of payload and `$binarySize` 10
+/// (`q8d-size.out`). `$bsonSize` is the length the encoder writes, whatever the type.
+#[test]
+fn old_style_binary_counts_the_length_it_carries() {
+    let old =
+        Bson::Binary(Binary { subtype: BinarySubtype::BinaryOld, bytes: vec![0, 0, 0, 1, 2, 3] });
+    assert_eq!(val(doc! { "$binarySize": [old.clone()] }), Bson::Int32(10));
+    let document = doc! { "b": old.clone(), "g": bin(&[1, 2, 3]) };
+    let encoded = bson::serialize_to_vec(&document).unwrap().len();
+    assert_eq!(val(doc! { "$bsonSize": { "$literal": document } }), Bson::Int32(encoded as i32));
+    // Every binary subtype agrees with the encoder.
+    for subtype in [
+        BinarySubtype::Generic,
+        BinarySubtype::Function,
+        BinarySubtype::BinaryOld,
+        BinarySubtype::UuidOld,
+        BinarySubtype::Uuid,
+        BinarySubtype::Md5,
+        BinarySubtype::Encrypted,
+        BinarySubtype::Column,
+        BinarySubtype::Sensitive,
+        BinarySubtype::Vector,
+        BinarySubtype::UserDefined(0x90),
+    ] {
+        let bytes = if subtype == BinarySubtype::Uuid || subtype == BinarySubtype::UuidOld {
+            vec![7; 16]
+        } else {
+            vec![0, 0, 0, 1, 2, 3]
+        };
+        let document = doc! { "b": Bson::Binary(Binary { subtype, bytes }) };
+        let encoded = bson::serialize_to_vec(&document).unwrap().len();
+        assert_eq!(
+            val(doc! { "$bsonSize": { "$literal": document } }),
+            Bson::Int32(encoded as i32),
+            "{subtype:?}"
+        );
+    }
+}
+
+/// A DB pointer is counted with its namespace: the encoder's length, not a constant.
+#[test]
+fn a_db_pointer_is_counted_with_its_namespace() {
+    for namespace in ["", "a", "db.collection", "a-namespace-of-some-length"] {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0x0C, b'p', 0]);
+        bytes.extend_from_slice(&(namespace.len() as i32 + 1).to_le_bytes());
+        bytes.extend_from_slice(namespace.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&[9; 12]);
+        bytes.push(0);
+        let total = bytes.len() as i32;
+        bytes[..4].copy_from_slice(&total.to_le_bytes());
+        let document: Document = bson::deserialize_from_slice(&bytes).expect("a DB pointer");
+        assert!(matches!(document.get("p"), Some(Bson::DbPointer(_))));
+        let encoded = bson::serialize_to_vec(&document).unwrap().len();
+        assert_eq!(encoded, bytes.len(), "the encoder writes what was read");
+        assert_eq!(val(doc! { "$bsonSize": { "$literal": document } }), Bson::Int32(total));
+    }
+}

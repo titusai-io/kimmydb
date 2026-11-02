@@ -1,7 +1,8 @@
 //! `$binarySize`, `$bsonSize`, `$tsSecond` and `$tsIncrement`.
 //!
 //! The first two answer an `Int32`: the bytes of a string (as UTF-8, with no length prefix and
-//! no terminator) or of binary data, and the bytes the document takes encoded as BSON. The
+//! no terminator) or of binary data (old-style binary, subtype 2, counts the 4-byte length it
+//! carries inside its payload, as the reference does), and the bytes the document takes encoded as BSON. The
 //! last two answer an `Int64`, the seconds and the increment of a timestamp. A null or a
 //! missing operand is null; any other type is refused in the reference's words.
 
@@ -16,7 +17,7 @@ pub(super) fn binary_size(arg: &Bson) -> Result<Bson> {
     match arg {
         Bson::Null | Bson::Undefined => Ok(Bson::Null),
         Bson::String(s) => Ok(count_bson(s.len())),
-        Bson::Binary(b) => Ok(count_bson(b.bytes.len())),
+        Bson::Binary(b) => Ok(count_bson(sizes::binary_length(b))),
         other => Err(Error::InvalidQuery(format!(
             "$binarySize requires a string or BinData argument, found: {}",
             bson_type_name(Some(other))

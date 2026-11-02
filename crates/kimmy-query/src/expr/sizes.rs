@@ -56,6 +56,16 @@ pub(crate) fn document_bytes(d: &Document) -> usize {
     })
 }
 
+/// The bytes of binary data as the encoder writes them after its length: the payload, and for
+/// old-style binary (subtype 2) the inner length of 4 bytes the encoder puts before it.
+pub(crate) fn binary_length(b: &bson::Binary) -> usize {
+    if b.subtype == bson::spec::BinarySubtype::BinaryOld {
+        b.bytes.len().saturating_add(4)
+    } else {
+        b.bytes.len()
+    }
+}
+
 /// What the value is as the payload of a BSON element (its name and type byte
 /// excluded), saturating.
 pub(crate) fn bson_bytes(value: &Bson) -> usize {
@@ -69,11 +79,16 @@ pub(crate) fn bson_bytes(value: &Bson) -> usize {
         Bson::String(s) | Bson::Symbol(s) | Bson::JavaScriptCode(s) => {
             5usize.saturating_add(s.len())
         }
-        Bson::Binary(b) => 5usize.saturating_add(b.bytes.len()),
+        // Old-style binary (subtype 2) is written with a length of its own inside the payload.
+        Bson::Binary(b) => 5usize.saturating_add(binary_length(b)),
         Bson::RegularExpression(r) => {
             2usize.saturating_add(r.pattern.as_str().len()).saturating_add(r.options.as_str().len())
         }
-        Bson::DbPointer(_) => 17,
+        // The namespace is a private field: measured through the encoder, as the element
+        // `{a: <pointer>}` less its header (4), type byte (1), name `a` and its terminator (2)
+        // and the document's terminator (1).
+        Bson::DbPointer(_) => bson::serialize_to_vec(&bson::doc! { "a": value.clone() })
+            .map_or(17, |bytes| bytes.len().saturating_sub(8)),
         Bson::JavaScriptCodeWithScope(c) => {
             let scope = c.scope.iter().fold(5usize, |sum, (k, v)| {
                 sum.saturating_add(2 + k.len()).saturating_add(bson_bytes(v))
