@@ -660,8 +660,8 @@ fn concat_refuses_a_string_over_the_limit_before_building_it() {
     // The message names what hit which limit.
     assert_eq!(
         sized(5, 8).unwrap_err().to_string(),
-        "the string $concat builds is 9 bytes, over the 16 MiB string limit; build a shorter \
-         string, or $limit or $substrBytes the input"
+        "the string $concat builds is 9 bytes, over the string limit of 16777215 bytes (16 MiB less one); build a \
+         shorter string, or $limit or $substrBytes the input"
     );
 }
 
@@ -712,7 +712,12 @@ fn the_string_limit_is_16_777_215_bytes() {
         other => panic!("{other:?}"),
     };
     assert_eq!(bytes, 16_777_216);
-    assert!(text.contains("is 16777216 bytes, over the 16 MiB string limit"), "{text}");
+    assert!(
+        text.contains(
+            "is 16777216 bytes, over the string limit of 16777215 bytes (16 MiB less one)"
+        ),
+        "{text}"
+    );
     // `$replaceAll` doubling a run of `x`: 2^23 - 1 of them make 16,777,214 bytes,
     // 2^23 make exactly 16 MiB.
     let d = doc! {"under": &half[1..], "at": half};

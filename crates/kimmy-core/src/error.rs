@@ -82,10 +82,10 @@ pub enum Error {
     #[error("the {what} is {bytes} bytes, over the {max} byte limit of one document; {remedy}")]
     AnswerTooLarge { what: &'static str, bytes: usize, max: usize, remedy: &'static str },
 
-    /// A string or an array an expression would build, of `bytes` bytes, is over
+    /// A string, an array or a document an expression would build, of `bytes` bytes, is over
     /// the `max` an expression may build, and is refused rather than built. `what`
     /// names the value ("the string `$concat` builds"), `limit` the limit it hit
-    /// ("16 MiB string limit") and `remedy` how to ask for less. Answered `413`,
+    /// ("16 MiB array limit") and `remedy` how to ask for less. Answered `413`,
     /// as the other size caps are.
     #[error("{what} is {bytes} bytes, over the {limit}; {remedy}")]
     ValueTooLarge {

@@ -1318,6 +1318,7 @@ pub fn update(
         now: now_millis(),
         expected,
         answer: None,
+        failures: Default::default(),
     };
     // A scan's candidates, and a multikey range's fallback, are the whole
     // collection walked in the write transaction: off the async worker
@@ -1461,9 +1462,32 @@ struct Modify<'a> {
     /// A `findAndModify`'s positional projection and the image it answers
     /// with. Checked in `apply`, where a refusal writes nothing.
     answer: Option<(&'a shape::FindProjection, ReturnDocument)>,
+    /// The typed refusals behind the strings `apply` and the seed reported, so a
+    /// size limit (`ValueTooLarge`) reaches the client as the `413` it is, as on
+    /// an aggregate, and not as the `400` of the string it travelled in.
+    failures: std::sync::Mutex<Vec<(String, kimmy_core::Error)>>,
 }
 
 impl Modify<'_> {
+    /// The string an update's refusal is reported as; a refusal that is a size
+    /// limit is also kept, typed, for [`kimmy_storage::ModifySpec::refusal_for`].
+    fn reported(
+        failures: &std::sync::Mutex<Vec<(String, kimmy_core::Error)>>,
+        e: kimmy_core::Error,
+    ) -> String {
+        match e {
+            kimmy_core::Error::InvalidQuery(reason) => reason,
+            e @ kimmy_core::Error::ValueTooLarge { .. } => {
+                let text = e.to_string();
+                if let Ok(mut held) = failures.lock() {
+                    held.push((text.clone(), e));
+                }
+                text
+            }
+            other => other.to_string(),
+        }
+    }
+
     /// Refuse a positional projection that cannot name an element of
     /// `answered`, the image the request returns, before anything is written.
     fn check_answer(
@@ -1504,10 +1528,8 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         // The engine reports this string as an `InvalidQuery`, so a refusal
         // that already is one gives its reason alone, rather than
         // `invalid query: invalid query: …`.
-        update::apply_matched(update, self.filter, &mut next, self.now).map_err(|e| match e {
-            kimmy_core::Error::InvalidQuery(reason) => reason,
-            other => other.to_string(),
-        })?;
+        update::apply_matched(update, self.filter, &mut next, self.now)
+            .map_err(|e| Self::reported(&self.failures, e))?;
         let answered = match self.answer {
             Some((projection, ReturnDocument::After)) => {
                 projection.check_update(update).map_err(|e| match e {
@@ -1524,6 +1546,12 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
 
     fn upsert(&self) -> Option<std::result::Result<Document, String>> {
         self.upsert.clone()
+    }
+
+    fn refusal_for(&self, reported: &str) -> Option<kimmy_core::Error> {
+        let mut held = self.failures.lock().ok()?;
+        let at = held.iter().position(|(text, _)| text == reported)?;
+        Some(held.remove(at).1)
     }
 }
 
@@ -1621,6 +1649,7 @@ pub fn find_and_modify(
 
     // The upsert image is built here rather than in the engine, because it
     // needs the filter and the update operators — both query-language things.
+    let failures = std::sync::Mutex::new(Vec::new());
     let upsert_doc = if spec.upsert {
         let mut seed = Document::new();
         implied_equalities(&filter, &mut seed);
@@ -1630,13 +1659,13 @@ pub fn find_and_modify(
             // `_id` it would change) is said only if nothing matches: a document that
             // does is updated on its own terms.
             Some(update) => {
-                Some(update::apply_on_insert(update, &mut seed, now).map(|()| seed).map_err(|e| {
-                    match e {
-                        kimmy_core::Error::InvalidUpdate(reason)
-                        | kimmy_core::Error::InvalidQuery(reason) => reason,
-                        other => other.to_string(),
-                    }
-                }))
+                // Worded as the same refusal on a matched document is (`apply`'s
+                // mapping below), so a client reads one message for both.
+                Some(
+                    update::apply_on_insert(update, &mut seed, now)
+                        .map(|()| seed)
+                        .map_err(|e| Modify::reported(&failures, e)),
+                )
             }
             None => Some(Ok(seed)),
         }
@@ -1663,6 +1692,7 @@ pub fn find_and_modify(
         now,
         expected,
         answer: positional.map(|p| (p, spec.return_document)),
+        failures,
     };
 
     // As `update`'s: a scan walks the collection in the write transaction
@@ -1752,6 +1782,7 @@ pub fn delete(
         now: now_millis(),
         expected,
         answer: None,
+        failures: Default::default(),
     };
     // A scan's candidates, and a multikey range's fallback, are the whole
     // collection walked in the write transaction: off the async worker
@@ -2658,10 +2689,15 @@ fn lookup(
 
     let mut out = Vec::with_capacity(input.len());
     for (mut doc, at) in input.into_iter().zip(attached) {
-        let joined = at.into_iter().map(|i| bson::Bson::Document(foreign_docs[i].clone()));
+        // Counted before each copy, so a join whose array would pass 16 MiB is
+        // refused at the document that takes it there (a `413`).
+        let mut joined = aggregate::JoinedArray::new("the array $lookup builds");
+        for i in at {
+            joined.push_copy(&foreign_docs[i], None)?;
+        }
         // Always an array, even when empty: a field whose type depends on
         // whether anything matched forces every caller to handle two shapes.
-        doc.insert(as_field.to_string(), bson::Bson::Array(joined.collect()));
+        doc.insert(as_field.to_string(), joined.finish());
         out.push(doc);
     }
     Ok(out)
@@ -2768,10 +2804,9 @@ fn lookup_pipeline(
         // every input document is what the ceiling bounds.
         held += joined.len();
         aggregate::check_limit("$lookup", held, limits)?;
-        doc.insert(
-            as_field.to_string(),
-            bson::Bson::Array(joined.into_iter().map(bson::Bson::Document).collect()),
-        );
+        let mut array = aggregate::JoinedArray::new("the array $lookup builds");
+        array.push_all(joined)?;
+        doc.insert(as_field.to_string(), array.finish());
         out.push(doc);
     }
     Ok(out)
@@ -2973,15 +3008,13 @@ fn graph_lookup(
             frontier = next;
         }
         held += reached.len();
-        let joined = reached.into_iter().map(|(at, depth)| {
-            let mut copy = foreign[at].clone();
-            if let Some(field) = &spec.depth_field {
-                // A name of one field (a path is refused when the stage is parsed).
-                copy.insert(field.clone(), bson::Bson::Int64(depth as i64));
-            }
-            bson::Bson::Document(copy)
-        });
-        doc.insert(spec.as_field.clone(), bson::Bson::Array(joined.collect()));
+        let mut joined = aggregate::JoinedArray::new("the array $graphLookup builds");
+        for (at, depth) in reached {
+            // A name of one field (a path is refused when the stage is parsed).
+            let depth_field = spec.depth_field.as_deref().map(|field| (field, depth as i64));
+            joined.push_copy(&foreign[at], depth_field)?;
+        }
+        doc.insert(spec.as_field.clone(), joined.finish());
         out.push(doc);
     }
     Ok(out)
@@ -4817,6 +4850,7 @@ mod positional_answer {
             now: 0,
             expected: None,
             answer: Some((&projection, after)),
+            failures: Default::default(),
         };
         modify.apply(stored)
     }

@@ -78,11 +78,12 @@ mod tz;
 
 pub(crate) use dates::{add_to_date, is_date_unit, unit_millis};
 pub(crate) use sizes::{
-    ArrayBudget, MAX_ARRAY_BYTES, MAX_STRING_BYTES, bson_bytes, check_array_within,
-    check_string_len_within,
+    ArrayBudget, DocBudget, HeldArray, MAX_ARRAY_BYTES, MAX_STRING_BYTES, array_bytes, bson_bytes,
+    check_array_bytes, check_array_within, check_document_bytes, check_string_len_within,
+    document_bytes,
 };
 
-pub(crate) use docops::merge_into;
+pub(crate) use docops::{merge_budget, merge_into};
 
 use std::cmp::Ordering;
 
@@ -1805,15 +1806,7 @@ impl Expr {
             Expr::Field(p) => Ok(field_path(scope.root, p).unwrap_or(Bson::Null)),
             Expr::Var { name, path } => eval_variable(name, path.as_deref(), scope),
             Expr::Literal(v) => Ok(v.clone()),
-            Expr::Object(fields) => {
-                let mut out = Document::new();
-                for (key, expr) in fields {
-                    if let Some(value) = expr.eval_field(scope)? {
-                        out.insert(key.clone(), value);
-                    }
-                }
-                Ok(Bson::Document(out))
-            }
+            Expr::Object(fields) => eval_object(fields, scope, MAX_ARRAY_BYTES),
             // A missing field is null in its place, as everywhere else: the
             // element is kept, so positions do not shift. The first element
             // that fails fails the array, with its own error, which is a
@@ -3271,15 +3264,13 @@ fn reverse_array(value: &Bson) -> Result<Bson> {
     })
 }
 
-/// The most elements `$range` will build.
-///
-/// The same figure as the pipeline's document ceiling, for the same reason:
-/// `{$range: [0, 1000000000]}` is a memory exhaustion written as an
-/// expression, and refusing it is better than becoming slow.
-pub const MAX_RANGE_LENGTH: usize = 100_000;
-
 /// `[start, end, step?]` — integers from `start` up to but excluding `end`.
 fn range(args: &[Bson]) -> Result<Bson> {
+    range_within(args, MAX_ARRAY_BYTES)
+}
+
+/// [`range`] within `max` bytes.
+fn range_within(args: &[Bson], max: usize) -> Result<Bson> {
     let mut nums = Vec::with_capacity(3);
     for (arg, what) in args.iter().zip(["$range start", "$range end", "$range step"]) {
         match integer_or_null(arg, what)? {
@@ -3302,16 +3293,22 @@ fn range(args: &[Bson]) -> Result<Bson> {
         return Err(Error::InvalidQuery("$range step cannot be zero".into()));
     }
 
-    // The length is decided before anything is allocated: the point of the
-    // cap is to stop the allocation, not to report it afterwards.
+    // The length and the bytes it encodes to are decided before anything is
+    // allocated: the point of the limit is to stop the allocation, not to report
+    // it afterwards.
     let span = if step > 0 { end.saturating_sub(start) } else { start.saturating_sub(end) };
     let count = if span <= 0 { 0 } else { span.unsigned_abs().div_ceil(step.unsigned_abs()) };
-    if count > MAX_RANGE_LENGTH as u64 {
-        return Err(Error::InvalidQuery(format!(
-            "$range would produce {count} elements, over the limit of {MAX_RANGE_LENGTH}"
-        )));
-    }
+    check_array_bytes("the array $range builds", range_bytes(count), max)?;
     Ok(Bson::Array((0..count as i64).map(|i| Bson::Int32((start + i * step) as i32)).collect()))
+}
+
+/// What an array of `count` `Int32`s encodes to: the framing, then for each
+/// element its type byte, its decimal index with a terminator, and four bytes.
+fn range_bytes(count: u64) -> usize {
+    array_bytes(
+        usize::try_from(count).unwrap_or(usize::MAX),
+        4usize.saturating_mul(usize::try_from(count).unwrap_or(usize::MAX)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3475,6 +3472,22 @@ fn element_truth(op: Op, value: &Bson) -> Result<Bson> {
 // Documents and arrays of pairs
 // ---------------------------------------------------------------------------
 
+/// The document an object literal builds, within `max` bytes. The size is counted
+/// field by field, before each value is stored, so a literal that copies a large
+/// variable twice (`{l: "$$value", r: "$$value"}`) is refused at the field that
+/// takes it over the limit.
+fn eval_object(fields: &[(String, Expr)], scope: &Scope<'_>, max: usize) -> Result<Bson> {
+    let mut budget = DocBudget::new("the document an object literal builds", max);
+    let mut out = Document::new();
+    for (key, expr) in fields {
+        if let Some(value) = expr.eval_field(scope)? {
+            budget.set(key, None, &value)?;
+            out.insert(key.clone(), value);
+        }
+    }
+    Ok(Bson::Document(out))
+}
+
 /// A document as `[{k, v}, ...]`, in the document's field order. Only the top
 /// level is turned over; a value that is itself a document stays one.
 fn object_to_array(value: &Bson) -> Result<Bson> {
@@ -3533,10 +3546,17 @@ impl PairForm {
 /// value of its last. Anything else is refused, naming the element by its
 /// index.
 fn array_to_object(value: &Bson) -> Result<Bson> {
+    array_to_object_within(value, MAX_ARRAY_BYTES)
+}
+
+/// [`array_to_object`] within `max` bytes: the size of the document is counted
+/// pair by pair, before each value is stored.
+fn array_to_object_within(value: &Bson, max: usize) -> Result<Bson> {
     let Some(items) = as_array(Op::ArrayToObject, value)? else {
         return Ok(Bson::Null);
     };
     let mut out = Document::new();
+    let mut budget = DocBudget::new("the document $arrayToObject builds", max);
     let mut form = None;
     for (i, item) in items.iter().enumerate() {
         let (this, key, value) = match item {
@@ -3594,6 +3614,7 @@ fn array_to_object(value: &Bson) -> Result<Bson> {
                  name cannot"
             )));
         }
+        budget.set(key, out.get(key.as_str()).map(bson_bytes), value)?;
         out.insert(key.as_str(), value.clone());
     }
     Ok(Bson::Document(out))
@@ -5687,7 +5708,7 @@ mod and_or {
         vec![
             bson!({"$add": ["$qty", 1]}),
             bson!({"$divide": [1, "$n"]}),
-            bson!({"$range": [0, 200_000]}),
+            bson!({"$filter": {"input": [1], "cond": true, "limit": -7}}),
             bson!({"$switch": {"branches": [{"case": false, "then": 1}]}}),
         ]
     }
@@ -5916,8 +5937,10 @@ mod and_or {
             match *self {
                 Arg::True(i) => truthy_values()[i % truthy_values().len()].clone(),
                 Arg::False(i) => falsy()[i % falsy().len()].clone(),
-                // Each `k` names a different count in the refusal.
-                Arg::Error(k) => bson!({"$range": [0, 100_001 + k as i64]}),
+                // Each `k` names a different limit in the refusal.
+                Arg::Error(k) => {
+                    bson!({"$filter": {"input": [1], "cond": true, "limit": -(k as i64) - 1}})
+                }
             }
         }
     }
@@ -6010,7 +6033,9 @@ mod and_or_nested {
     fn to_bson(n: &Node) -> Bson {
         match n {
             Node::Lit(i) => values()[*i].clone(),
-            Node::Bad(k) => bson!({"$range": [0, 100_001 + *k as i64]}),
+            Node::Bad(k) => {
+                bson!({"$filter": {"input": [1], "cond": true, "limit": -(*k as i64) - 1}})
+            }
             Node::Unbound => bson!("$$x"),
             Node::And(a) => bson!({"$and": a.iter().map(to_bson).collect::<Vec<_>>()}),
             Node::Or(a) => bson!({"$or": a.iter().map(to_bson).collect::<Vec<_>>()}),
