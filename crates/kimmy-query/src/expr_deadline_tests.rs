@@ -222,3 +222,19 @@ fn without_a_deadline_nothing_is_counted_or_charged_and_every_form_runs_as_befor
     assert_eq!(value, Bson::Boolean(true));
     assert_eq!((clock_reads(), ticks_taken()), (reads, ticks));
 }
+
+#[test]
+fn the_iteration_operators_tick_for_each_element_even_when_the_body_is_not_an_operation() {
+    // A body that is a variable or a literal is no node, so it ticks nothing of its own: the
+    // tick of the iteration is what counts the elements (with an operator in the body, the
+    // body's nodes tick as well, which is why this is held with a body that has none).
+    let document = doc! { "a": (1..=700).collect::<Vec<i32>>() };
+    for (name, spec) in [
+        ("$map", doc! { "$map": { "input": "$a", "as": "n", "in": "$$n" } }),
+        ("$filter", doc! { "$filter": { "input": "$a", "as": "n", "cond": "$$n" } }),
+        ("$reduce", doc! { "$reduce": { "input": "$a", "initialValue": 0, "in": "$$this" } }),
+    ] {
+        // One tick for the node, one for each of the 700 elements.
+        assert_eq!(ticks_of(spec, &document), 701, "{name}");
+    }
+}
