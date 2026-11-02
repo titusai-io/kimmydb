@@ -20759,6 +20759,85 @@ async fn sample_rate_is_a_filter_clause_of_find_update_and_aggregate() {
         .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(res.body["documents"][0]["n"], 5);
+    // `count` and `delete` take it as a filter too: a rate of 0 counts and removes nothing, a
+    // rate of 1 everything.
+    let count = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server.post("/v1/db/shop/coll/pu/count", Some(token), json!({ "filter": filter })).await
+        }
+    };
+    assert_eq!(count(json!({ "$sampleRate": 0 })).await.body["count"], 0);
+    assert_eq!(count(json!({ "$sampleRate": 1 })).await.body["count"], 5);
+    assert_eq!(count(json!({ "$sampleRate": 1, "g": 1 })).await.body["count"], 3);
+    let delete = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/pu/delete",
+                    Some(token),
+                    json!({ "filter": filter, "multi": true }),
+                )
+                .await
+        }
+    };
+    let res = delete(json!({ "$sampleRate": 0 })).await;
+    assert_eq!((res.status, &res.body["deleted"]), (200, &json!(0)), "{:?}", res.body);
+    assert_eq!(count(json!({})).await.body["count"], 5);
+    let res = delete(json!({ "$sampleRate": 1, "g": 1 })).await;
+    assert_eq!((res.status, &res.body["deleted"]), (200, &json!(3)), "{:?}", res.body);
+    assert_eq!(count(json!({})).await.body["count"], 2);
+}
+
+/// A rate between 0 and 1 keeps about that share, through every path that takes a filter, and a
+/// share is not all-or-nothing (the source is the thread's own and cannot be scripted from
+/// here, so the check is statistical, to six standard deviations of a binomial of 1,000).
+#[tokio::test]
+async fn sample_rate_keeps_about_its_share_through_find_count_update_and_delete() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let res = server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "big" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs: Vec<Value> = (0..1000).map(|i| json!({ "_id": i, "g": i % 2 })).collect();
+    let res = server.post("/v1/db/shop/coll/big/bulk", Some(&token), Value::Array(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let within = |n: u64| (405..595).contains(&n);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/big/count",
+            Some(&token),
+            json!({ "filter": { "$sampleRate": 0.5 } }),
+        )
+        .await;
+    assert!(within(res.body["count"].as_u64().unwrap()), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/big/find",
+            Some(&token),
+            json!({ "filter": { "$sampleRate": 0.5 }, "limit": 5000 }),
+        )
+        .await;
+    assert!(within(res.body["documents"].as_array().unwrap().len() as u64), "{:?}", res.status);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/big/update",
+            Some(&token),
+            json!({ "filter": { "$sampleRate": 0.5 }, "update": { "$set": { "hit": true } }, "multi": true }),
+        )
+        .await;
+    assert!(within(res.body["matched"].as_u64().unwrap()), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/big/delete",
+            Some(&token),
+            json!({ "filter": { "$sampleRate": 0.5 }, "multi": true }),
+        )
+        .await;
+    let deleted = res.body["deleted"].as_u64().unwrap();
+    assert!(within(deleted), "{:?}", res.body);
+    let res = server.post("/v1/db/shop/coll/big/count", Some(&token), json!({})).await;
+    assert_eq!(res.body["count"].as_u64().unwrap(), 1000 - deleted);
 }
 
 #[tokio::test]

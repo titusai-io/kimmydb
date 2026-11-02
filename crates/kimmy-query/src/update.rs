@@ -914,7 +914,7 @@ pub fn apply(update: &Update, doc: &mut Document, now_ms: i64) -> Result<()> {
 }
 
 /// Apply an update to an existing document that `filter` matched, resolving a
-/// `$` segment to the element the filter matched ([`filter::matches_at`]).
+/// `$` segment to the element the filter matched ([`filter::position`]).
 ///
 /// The position is read from `doc` itself, so each document an update visits
 /// has its own. An update with no `$` segment is [`apply`] and the filter is
@@ -928,7 +928,7 @@ pub fn apply_matched(
     if !update.uses_matched_position() {
         return apply(update, doc, now_ms);
     }
-    let (_, at) = filter::matches_at(filter, doc)?;
+    let at = filter::position(filter, doc)?;
     apply_to_at(update, doc, now_ms, Target::Existing, at.as_ref())
 }
 

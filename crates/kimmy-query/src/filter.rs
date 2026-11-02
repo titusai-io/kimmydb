@@ -56,6 +56,34 @@ pub enum Filter {
     SampleRate(f64),
 }
 
+impl Filter {
+    /// Whether matching draws a random number anywhere in the filter: a `$sampleRate`, or an
+    /// `$expr` holding `$rand`. Such a filter is not a function of the document, so what it
+    /// decides for one document may not be reused for another (a `$lookup` sub-pipeline's
+    /// leading `$match` is applied once to the foreign documents when it is not).
+    pub fn draws_random(&self) -> bool {
+        match self {
+            Filter::SampleRate(_) => true,
+            Filter::AlwaysTrue | Filter::JsonSchema(_) => false,
+            Filter::And(branches) | Filter::Or(branches) => {
+                branches.iter().any(Filter::draws_random)
+            }
+            Filter::Nor(branches) => branches.iter().any(Filter::draws_random),
+            Filter::Field { conditions, .. } => conditions.iter().any(condition_draws_random),
+            Filter::Expr(e) => e.draws_random(),
+        }
+    }
+}
+
+fn condition_draws_random(condition: &Condition) -> bool {
+    match condition {
+        Condition::ElemMatch(inner) => inner.draws_random(),
+        Condition::Not(inner) => condition_draws_random(inner),
+        Condition::Both(a, b) => condition_draws_random(a) || condition_draws_random(b),
+        _ => false,
+    }
+}
+
 /// The clauses of an `$and` or `$or`, in the order they are evaluated, and
 /// where each was written.
 ///
@@ -948,9 +976,18 @@ pub fn matches_at(filter: &Filter, doc: &Document) -> Result<(bool, Option<Array
     if !matches(filter, doc)? {
         return Ok((false, None));
     }
+    Ok((true, position(filter, doc)?))
+}
+
+/// The element of an array that `filter` matched in `doc`, which it has matched already: the
+/// part of [`matches_at`] after the match. A caller that has matched the document (the
+/// positional `$` of an update, a positional projection) asks this and not `matches_at`, which
+/// would match again, and a `$sampleRate` or a `$rand` in the filter would draw again and
+/// could decide the other way.
+pub fn position(filter: &Filter, doc: &Document) -> Result<Option<ArrayPosition>> {
     let mut at = None;
     record_position(filter, doc, &mut at).map_err(|e| unevaluable(e, doc.get("_id"), ""))?;
-    Ok((true, at))
+    Ok(at)
 }
 
 fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPosition>) -> Result<()> {
@@ -970,8 +1007,9 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
             // evaluated for this document (an `$expr` that fails on it) did not decide the
             // match, as `matches` itself defers it, and the next is tried; an error that is
             // about the request and not the value (the deadline, the node's stop, the
-            // memory budget, a broken invariant) is not "did not decide" and goes up.
-            for branch in branches.in_written_order() {
+            // memory budget, a broken invariant) is not "did not decide" and goes up. A branch
+            // that draws a random number cannot be asked again, and is passed over.
+            for branch in branches.in_written_order().filter(|b| !b.draws_random()) {
                 match evaluate(branch, doc, &[]) {
                     Ok(true) => {
                         record_position(branch, doc, at)?;

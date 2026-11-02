@@ -1251,6 +1251,49 @@ impl Expr {
         }
     }
 
+    /// Whether evaluating this draws a random number (`$rand`) anywhere in the tree: its
+    /// value is then not a function of the document and the variables, so a caller may not
+    /// compute it once and share it (a `$lookup` sub-pipeline's leading `$match`). Exhaustive
+    /// on purpose, with no catch-all arm: a new expression form must say here what it reads.
+    pub fn draws_random(&self) -> bool {
+        let any = |exprs: &[Expr]| exprs.iter().any(Expr::draws_random);
+        match self {
+            Expr::Field(_) | Expr::Var { .. } | Expr::Literal(_) => false,
+            Expr::Op(op, args) => *op == Op::Rand || any(args),
+            Expr::Switch { branches, default } => {
+                branches.iter().any(|(case, then)| case.draws_random() || then.draws_random())
+                    || default.as_ref().is_some_and(|d| d.draws_random())
+            }
+            Expr::Date(d) => d.children().any(Expr::draws_random),
+            Expr::Convert { input, on_error, on_null, .. } => {
+                input.draws_random()
+                    || on_error.as_ref().is_some_and(|e| e.draws_random())
+                    || on_null.as_ref().is_some_and(|e| e.draws_random())
+            }
+            Expr::Let { vars, body } => {
+                vars.iter().any(|(_, e)| e.draws_random()) || body.draws_random()
+            }
+            Expr::Filter { input, cond, limit, .. } => {
+                input.draws_random()
+                    || cond.draws_random()
+                    || limit.as_ref().is_some_and(|l| l.draws_random())
+            }
+            Expr::Map { input, body, .. } => input.draws_random() || body.draws_random(),
+            Expr::Reduce { input, initial, body } => {
+                input.draws_random() || initial.draws_random() || body.draws_random()
+            }
+            Expr::SortArray { input, .. } => input.draws_random(),
+            Expr::Zip { inputs, defaults, .. } => {
+                any(inputs) || defaults.as_deref().is_some_and(any)
+            }
+            Expr::Str(s) => s.children().into_iter().any(Expr::draws_random),
+            Expr::Doc(d) => d.children().into_iter().any(Expr::draws_random),
+            Expr::ArrayAcc(a) => a.children().into_iter().any(Expr::draws_random),
+            Expr::Object(fields) => fields.iter().any(|(_, e)| e.draws_random()),
+            Expr::Array(items) => any(items),
+        }
+    }
+
     /// `{name: <expr>, ...}` — the `vars` of `$let` and the `let` of `$lookup`.
     ///
     /// The values are parsed against `vars`, the enclosing scope: one binding

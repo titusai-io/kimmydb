@@ -306,3 +306,45 @@ fn a_match_stage_decides_each_document_on_its_own_draw() {
     let ids: Vec<i32> = kept.iter().map(|d| d.get_i32("_id").unwrap()).collect();
     assert_eq!(ids, vec![1, 3, 4]);
 }
+
+// ---------------------------------------------------------------------------
+// A positional `$` reads the match it was given, and draws nothing (review q8d, M2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_positional_update_after_a_match_does_not_draw_again() {
+    let query = filter::parse(&doc! { "a": 2, "$sampleRate": 0.5 }).unwrap();
+    let update = crate::update::parse(&doc! { "$set": { "a.$": 20 } }).unwrap();
+    let mut d = doc! { "_id": 1, "a": [1, 2, 3] };
+    // The match draws 0.1 (below the rate: a hit); a second draw would be 0.9 and a miss.
+    let next = random::with_source(script(&[0.1, 0.9]), || {
+        assert!(filter::matches(&query, &d).unwrap());
+        crate::update::apply_matched(&update, &query, &mut d, 0).unwrap();
+        random::unit()
+    });
+    assert_eq!(d, doc! { "_id": 1, "a": [1, 20, 3] });
+    assert_eq!(next, 0.9, "the positional update drew a number");
+}
+
+#[test]
+fn a_positional_projection_after_a_match_does_not_draw_again() {
+    let query = filter::parse(&doc! { "a": 2, "$sampleRate": 0.5 }).unwrap();
+    let projection = crate::shape::parse_find_projection(&doc! { "a.$": 1 }).unwrap().unwrap();
+    let d = doc! { "_id": 1, "a": [1, 2, 3] };
+    let (shaped, next) = random::with_source(script(&[0.1, 0.9]), || {
+        assert!(filter::matches(&query, &d).unwrap());
+        let shaped = projection.project(&query, &d).unwrap();
+        (shaped, random::unit())
+    });
+    assert_eq!(shaped, doc! { "_id": 1, "a": [2] });
+    assert_eq!(next, 0.9, "the positional projection drew a number");
+}
+
+#[test]
+fn the_position_of_a_filter_with_a_random_branch_comes_from_the_branches_that_do_not_draw() {
+    // `$or`: the branch that decided is not asked again; the one that does not draw is.
+    let query = filter::parse(&doc! { "$or": [{ "$sampleRate": 1 }, { "a": 2 }] }).unwrap();
+    let d = doc! { "a": [1, 2, 3] };
+    let found = random::with_source(script(&[0.99]), || filter::position(&query, &d).unwrap());
+    assert_eq!(found, Some(filter::ArrayPosition { path: "a".into(), index: 1 }));
+}

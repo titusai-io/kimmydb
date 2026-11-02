@@ -84,7 +84,7 @@ mod window_tests;
 
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};
-pub use filter::{ArrayPosition, Condition, Filter, matches, matches_at};
+pub use filter::{ArrayPosition, Condition, Filter, matches, matches_at, position};
 pub use json_schema::Schema;
 pub use plan::{IndexPlan, choose};
 pub use shape::{FindProjection, Projection, ProjectionPaths, SortKey};
