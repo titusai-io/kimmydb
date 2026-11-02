@@ -2598,9 +2598,10 @@ fn scan_pipeline(
             run_stage(state, auth, db, stage, docs, arrived, limits, &[])
         };
         let mut chain = pipeline::build(stages, &run, limits, &[]);
-        // A chain that is full before it is pushed anything reads no document. The parser
-        // refuses `$limit: 0`, so no pipeline of a request is, but the scan asks.
-        let stop_after = chain.is_full().then_some(0);
+        // A chain that is full before it is pushed anything reads nothing: no index walk and no
+        // document. The parser refuses `$limit: 0`, but the reordering makes a window that
+        // takes nothing of `$limit 3, $skip 5`, so the scan asks.
+        let full = chain.is_full();
         // The scan answers `core::Error`s and the chain the executor's, so a failure of the
         // chain ends the scan and is kept to be returned when it is over.
         let mut failed = None;
@@ -2609,22 +2610,29 @@ fn scan_pipeline(
         // `$limit` at its head), and otherwise held to the request's budget as they are
         // collected: a range is read whole to find its smallest keys.
         let keys = IndexKeys::new(limits.buffer.lease("the index range of $match"));
-        let bounds =
-            ScanBounds { stop_after, want: pipeline::source_bound(stages), hold: Some(&keys) };
-        let stats = visit_matching_bounded(
-            state,
-            meta,
-            filter,
-            Order::ById { after: None },
-            bounds,
-            |_, doc| match chain.push(doc) {
-                Ok(flow) => Ok(flow == pipeline::Flow::More),
-                Err(e) => {
-                    failed = Some(e);
-                    Ok(false)
-                }
-            },
-        )?;
+        let bounds = ScanBounds {
+            stop_after: None,
+            want: pipeline::source_bound(stages),
+            hold: Some(&keys),
+        };
+        let stats = if full {
+            QueryStats::planned(&plan_access(filter, &meta.indexes))
+        } else {
+            visit_matching_bounded(
+                state,
+                meta,
+                filter,
+                Order::ById { after: None },
+                bounds,
+                |_, doc| match chain.push(doc) {
+                    Ok(flow) => Ok(flow == pipeline::Flow::More),
+                    Err(e) => {
+                        failed = Some(e);
+                        Ok(false)
+                    }
+                },
+            )?
+        };
         if let Some(e) = failed {
             return Err(e);
         }

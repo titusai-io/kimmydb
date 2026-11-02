@@ -235,6 +235,49 @@ fn a_window_that_has_moved_to_the_head_ends_the_scan_and_bounds_the_range_it_rea
 }
 
 #[test]
+fn a_window_that_takes_nothing_reads_nothing_from_the_source() {
+    // `$limit 3` then `$skip 5` takes nothing, which no request can write as a `$limit` (it is a
+    // `400`): the rewrite makes it `$skip 3, $limit 0`. The chain is full before any document, so
+    // the scan reads none, whether it is a collection scan or an index.
+    let nothing = |pipeline: Value, state: &SharedState| {
+        let (answer, stats) = run_stats(state, pipeline.clone(), aggregate::Limits::default());
+        assert_eq!(answer["documents"], json!([]), "{pipeline}");
+        assert_eq!((stats.examined, stats.matched), (0, 0), "{pipeline}");
+        assert!(
+            stats.index_entries.is_none_or(|entries| entries == 0),
+            "{pipeline}: {:?}",
+            stats.index_entries
+        );
+    };
+    let window = || [json!({"$limit": 3}), json!({"$skip": 5})];
+    // A collection scan, with stages the window passes in front of it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, numbered(50, &[]));
+    nothing(json!(window()), &state);
+    let mut behind = vec![json!({"$addFields": {"x": 1}})];
+    behind.extend(window());
+    nothing(json!(behind), &state);
+    // An index: an exact probe, an inexact range (read whole in `_id` order when it is wanted),
+    // and the sort of the result.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500);
+    for filter in [json!({"t": 7}), json!({"t": {"$gte": 0}}), json!({"t": {"$gt": 1_000}})] {
+        let mut pipeline = vec![json!({"$match": filter})];
+        pipeline.extend(window());
+        nothing(json!(pipeline), &state);
+    }
+    // Where the same window takes something, the source is read, so the zeros above are the
+    // window's and not the collection's.
+    let (answer, stats) = run_stats(
+        &state,
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$limit": 8}, {"$skip": 5}]),
+        aggregate::Limits::default(),
+    );
+    assert_eq!(ids(&answer), [5, 6, 7]);
+    assert!(stats.examined > 0 && stats.index_entries.is_some_and(|entries| entries > 0));
+}
+
+#[test]
 fn the_source_of_a_pipeline_that_streams_has_no_ceiling_and_one_that_blocks_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, numbered(30, &[]));
