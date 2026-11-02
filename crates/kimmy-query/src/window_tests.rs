@@ -1003,6 +1003,55 @@ fn shift_reads_a_document_ahead_or_behind_and_defaults_beyond_the_ends() {
     assert_eq!(col(&out, "far"), vec![Bson::String("none".into()); 3]);
 }
 
+/// The default of `$shift` is any constant expression, as the reference accepts (phase B,
+/// `q8d-m3.out`: `0` and `{$add: [1, 2]}` answered; a field path and `$rand` refused with
+/// "expression must yield a constant value"): it is evaluated with no document in reach.
+#[test]
+fn shift_takes_any_constant_expression_as_its_default() {
+    let defaults = |default: Bson| {
+        let out = run(
+            set(doc! {"sortBy": {"_id": 1}, "output": {
+                "prev": {"$shift": {"output": "$qty", "by": -1, "default": default}},
+            }}),
+            series(&[10, 20]),
+        )
+        .unwrap();
+        col(&out, "prev")[0].clone()
+    };
+    assert_eq!(defaults(Bson::Document(doc! {"$add": [1, 2]})), Bson::Int32(3));
+    assert_eq!(defaults(Bson::Document(doc! {"$multiply": [2, {"$add": [1, 2]}]})), Bson::Int32(6));
+    assert_eq!(defaults(Bson::Document(doc! {"$concat": ["a", "b"]})), Bson::String("ab".into()));
+    assert_eq!(defaults(Bson::Document(doc! {"$literal": "$qty"})), Bson::String("$qty".into()));
+    assert_eq!(
+        defaults(Bson::Document(doc! {"$cond": [true, "yes", "no"]})),
+        Bson::String("yes".into())
+    );
+    assert_eq!(defaults(Bson::Null), Bson::Null);
+    assert_eq!(defaults(Bson::String("none".into())), Bson::String("none".into()));
+    assert_eq!(defaults(Bson::Int32(0)), Bson::Int32(0));
+    assert_eq!(
+        defaults(Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])),
+        Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])
+    );
+    // A default that reads the document, or draws, is refused.
+    let r = |default: Bson| {
+        refused(set(doc! {"sortBy": {"a": 1}, "output": {
+            "s": {"$shift": {"output": "$a", "by": 1, "default": default}},
+        }}))
+    };
+    for default in [
+        Bson::String("$b".into()),
+        Bson::String("$$ROOT".into()),
+        Bson::String("$$CURRENT.b".into()),
+        Bson::Document(doc! {"$add": ["$b", 1]}),
+        Bson::Document(doc! {"$concat": ["a", "$b"]}),
+        Bson::Document(doc! {"$rand": {}}),
+        Bson::Document(doc! {"$add": [1, {"$rand": {}}]}),
+    ] {
+        assert!(r(default.clone()).contains("constant"), "{default}");
+    }
+}
+
 #[test]
 fn shift_stays_inside_its_partition() {
     let out = run(
