@@ -963,6 +963,17 @@ fn fill_and_set_window_fields_hold_a_completed_document_to_the_limit_whole() {
         Some(doc! {"$fill": {"output": {"a": {"value": "$pad"}}}}),
         &input,
     );
+    // `$fill` with values, one of which removes a field that holds a null: the document is
+    // checked all the same.
+    let nulled: Vec<Document> =
+        (0..3).map(|i| doc! {"_id": i, "pad": "p".repeat(1_000), "b": Bson::Null}).collect();
+    assert_built_document_is_held_whole(
+        "$fill value and a removal",
+        doc! {"$fill": {"output": {"a": {"value": "$pad"}, "b": {"value": "$nowhere"},
+        "c": {"value": "$pad"}}}},
+        Some(doc! {"$fill": {"output": {"a": {"value": "$pad"}, "b": {"value": "$nowhere"}}}}),
+        &nulled,
+    );
     // `$fill` with methods: the third document is given what the first two carried.
     let carried = vec![
         doc! {"_id": 0, "a": "a".repeat(1_200)},
