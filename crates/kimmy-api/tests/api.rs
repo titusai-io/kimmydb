@@ -137,6 +137,17 @@ impl Client {
     }
 }
 
+/// The limits a test that is not about the deadline serves under: a deadline an hour
+/// long, so a machine under load cannot turn a slow request into a `503 timeout`
+/// (ADR-266: work that checks the deadline is cut by wall-clock time). The tests of the
+/// deadline itself set their own.
+fn unhurried() -> kimmy_api::RequestLimits {
+    kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_secs(3600),
+        ..kimmy_api::RequestLimits::default()
+    }
+}
+
 impl Server {
     async fn start() -> Self {
         Self::start_with(false).await
@@ -280,7 +291,7 @@ impl Server {
     }
 
     async fn build(insecure_no_auth: bool, limits: kimmy_api::RateLimits) -> Self {
-        Self::build_with(insecure_no_auth, limits, kimmy_api::RequestLimits::default()).await
+        Self::build_with(insecure_no_auth, limits, unhurried()).await
     }
 
     /// A server whose requests are abandoned after `timeout`.
@@ -323,7 +334,7 @@ impl Server {
         let engine = Arc::clone(&self.state.engine);
         let state =
             kimmy_api::state(engine, tokens, false, kimmy_api::RateLimits::disabled()).unwrap();
-        Self::serve(state, Arc::clone(&self._dir), kimmy_api::RequestLimits::default()).await
+        Self::serve(state, Arc::clone(&self._dir), unhurried()).await
     }
 
     /// A server with a router merged beside the REST table, the way the daemon
@@ -338,8 +349,7 @@ impl Server {
         let state =
             kimmy_api::state(Arc::clone(&engine), tokens, false, kimmy_api::RateLimits::disabled())
                 .unwrap();
-        Self::serve_with(state, Arc::new(dir), kimmy_api::RequestLimits::default(), Some(extra))
-            .await
+        Self::serve_with(state, Arc::new(dir), unhurried(), Some(extra)).await
     }
 
     async fn serve(
@@ -430,8 +440,10 @@ impl Server {
         let mut request = request.body(axum::body::Body::from(payload)).expect("a request");
         request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
 
-        let response =
-            kimmy_api::router(Arc::clone(&self.state)).oneshot(request).await.expect("router");
+        let response = kimmy_api::router_with_limits(Arc::clone(&self.state), None, unhurried())
+            .oneshot(request)
+            .await
+            .expect("router");
         let status = response.status().as_u16();
         let head = format!("{:?}", response.headers());
         let bytes = response.into_body().collect().await.expect("body").to_bytes();
@@ -16874,6 +16886,62 @@ async fn a_write_that_cannot_get_the_writer_in_time_is_a_503_timeout() {
         "the same write lands once the writer is free: {:?}",
         written.body
     );
+}
+
+/// **A slow aggregation is cut at the deadline and frees its worker** (ADR-266). The
+/// pipeline is a few lines and costs ten million evaluations a document: it never yields,
+/// so the future's timeout could not end it (ADR-099), and it used to hold a worker for as
+/// long as it ran and answer 200 afterwards. It now stops itself at the first look at the
+/// clock after the deadline and answers the `503 timeout` the middleware gives; the same
+/// server answers the next request at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_aggregation_is_cut_at_the_deadline_with_the_timeout_answer() {
+    let timeout = std::time::Duration::from_secs(1);
+    let server = Server::start_with_request_timeout(timeout).await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    let documents: Vec<Value> = (0..50).map(|i| json!({"_id": i, "n": i})).collect();
+    let seeded = server.post("/v1/db/shop/coll/orders/bulk", Some(&token), json!(documents)).await;
+    assert_eq!(seeded.status, 200, "{:?}", seeded.body);
+
+    let inner = json!({ "$reduce": { "input": { "$range": [0, 100_000] }, "initialValue": 0,
+                                       "in": { "$add": ["$$value", 1] } } });
+    let pipeline = json!([{ "$project": { "s": { "$reduce": {
+        "input": { "$range": [0, 100] }, "initialValue": 0,
+        "in": { "$add": ["$$value", inner] } } } } }]);
+    let started = std::time::Instant::now();
+    let cut = server
+        .post("/v1/db/shop/coll/orders/aggregate", Some(&token), json!({ "pipeline": pipeline }))
+        .await;
+    let took = started.elapsed();
+    assert_eq!(cut.status, 503, "{:?}", cut.body);
+    assert_eq!(cut.body["error"], "timeout", "{:?}", cut.body);
+    assert_eq!(cut.body["retry"], "wait", "{:?}", cut.body);
+    assert_eq!(
+        cut.body["message"],
+        kimmy_api::ApiError::timeout(timeout).message,
+        "the middleware's own wording, naming the configured timeout"
+    );
+    assert!(took >= timeout, "not before the deadline: {took:?}");
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "cut promptly, not run to its end: {took:?}"
+    );
+
+    // The worker is free: the next request is served at once, on the same server.
+    let next_started = std::time::Instant::now();
+    let next = server.get("/v1/db/shop/coll/orders/docs/7", Some(&token)).await;
+    assert_eq!(next.status, 200, "{:?}", next.body);
+    assert!(next_started.elapsed() < std::time::Duration::from_secs(1));
+    let cheap = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$group": { "_id": null, "n": { "$sum": 1 } } }] }),
+        )
+        .await;
+    assert_eq!(cheap.status, 200, "{:?}", cheap.body);
+    assert_eq!(cheap.body["documents"][0]["n"], 50);
 }
 
 /// **One deadline over a request's body and its write.** A body that takes most of the

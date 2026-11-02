@@ -82,6 +82,13 @@ pub enum Error {
     #[error("the {what} is {bytes} bytes, over the {max} byte limit of one document; {remedy}")]
     AnswerTooLarge { what: &'static str, bytes: usize, max: usize, remedy: &'static str },
 
+    /// The request ran past its deadline while this node was working on it, and the work
+    /// stopped itself at the next check (ADR-266). Answered `503 timeout`, as the request
+    /// timeout's own refusal is (ADR-099). Not a refusal of what was asked and not
+    /// deferrable: see [`Error::is_a_request_refusal`] and [`Error::is_deferrable`].
+    #[error("the request ran past its deadline and the work was stopped")]
+    DeadlineExceeded,
+
     /// A string, an array or a document an expression would build, of `bytes` bytes, is over
     /// the `max` an expression may build, and is refused rather than built. `what`
     /// names the value ("the string `$concat` builds"), `limit` the limit it hit
@@ -203,6 +210,10 @@ impl Error {
             | Error::MalformedCursor
             | Error::MalformedStamp => false,
 
+            // A fact about how long this node took, not about what was asked: a
+            // retry may finish in time.
+            Error::DeadlineExceeded => false,
+
             // A value that will not decode or encode. Indistinguishable here
             // from corruption, which must never be skipped quietly.
             Error::Bson(_) | Error::Serialization(_) => false,
@@ -254,6 +265,7 @@ impl Error {
             | Error::AnswerTooLarge { .. }
             | Error::ValueTooLarge { .. }
             | Error::IdTooLarge { .. }
+            | Error::DeadlineExceeded
             | Error::UnsupportedOperator { .. }
             | Error::ResumeTokenExpired
             | Error::MalformedResumeToken
@@ -316,6 +328,13 @@ mod tests {
         assert!(!limit.is_deferrable());
         assert!(limit.is_a_request_refusal());
         assert_eq!(limit.to_string(), "invalid query: $group produced 3 documents");
+    }
+
+    #[test]
+    fn a_deadline_is_neither_a_refusal_nor_something_an_argument_may_hide() {
+        let deadline = Error::DeadlineExceeded;
+        assert!(!deadline.is_deferrable(), "an `$or` must not hold a deadline back");
+        assert!(!deadline.is_a_request_refusal(), "replication must not skip it");
     }
 
     #[test]

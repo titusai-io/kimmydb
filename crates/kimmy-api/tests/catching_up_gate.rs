@@ -54,7 +54,10 @@ async fn member(reason: Option<CatchUpReason>, wait: Duration) -> Member {
     let app = kimmy_api::router_with_limits(
         Arc::clone(&state),
         Some(mcp),
-        kimmy_api::RequestLimits::default(),
+        kimmy_api::RequestLimits {
+            request_timeout: std::time::Duration::from_secs(3600),
+            ..kimmy_api::RequestLimits::default()
+        },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -19,6 +19,7 @@ use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
 use crate::aggregate::Limits;
+use crate::deadline;
 use crate::expr::{Binding, Expr, Scope, type_name};
 use crate::window::{
     Func, Output, Partition, WindowSpec, apply as apply_window, check_output_name, parse_sort_by,
@@ -187,6 +188,7 @@ pub fn apply(
         return Ok(docs);
     }
     for doc in &mut docs {
+        deadline::tick()?;
         // Every value is read from the document before any is written, as `$addFields` does.
         let mut fills: Vec<(&str, Bson)> = Vec::new();
         for (name, expr) in &spec.values {

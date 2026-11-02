@@ -12,6 +12,7 @@
 use bson::Document;
 use kimmy_auth::Action;
 use kimmy_core::DocId;
+use kimmy_query::deadline;
 use kimmy_query::expr::Binding;
 use kimmy_query::{aggregate, filter, plan, shape, update};
 use kimmy_storage::CollectionMeta;
@@ -948,6 +949,10 @@ pub fn visit_matching<F>(
 where
     F: FnMut(kimmy_core::Stamp, bson::Document),
 {
+    // Every read of documents goes through here (find, count, an aggregate's source,
+    // the vector filter's paging), so the request's deadline is set once for all of
+    // them; the walks below tick it per row (ADR-266).
+    let _deadline = crate::limits::deadline_scope();
     let after = match order {
         Order::ById { after } => after,
         Order::Any => None,
@@ -961,7 +966,9 @@ where
     // each exactly as it is there.
     let access = plan_access(filter, &meta.indexes);
     if let Access::IdLookup(pk) = &access {
+        let mut ticker = deadline::Ticker::new();
         for key in &pk.keys {
+            ticker.tick()?;
             if after.is_some_and(|bound| key.as_slice() <= bound) {
                 continue;
             }
@@ -1277,6 +1284,8 @@ pub fn update(
     // One date for every `$$NOW` of the request's filter, update and `arrayFilters`.
     let _clock = kimmy_query::expr::RequestClock::open();
     let _span = op_span("update", db, Some(coll)).entered();
+    // Until its first commit (the engine sets the deadline aside from then on: ADR-266).
+    let _deadline = crate::limits::deadline_scope();
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
@@ -1326,6 +1335,8 @@ pub fn update(
     let outcome = kimmy_storage::blocking(|| {
         state.engine.modify_where(&meta, &candidates, &modify, stop_after)
     })?;
+    // The answer is built from counts, but nothing after the engine's commits may be cut.
+    let _written = deadline::Deadline::suspend();
 
     let mut body = json!({
         "matched": outcome.matched,
@@ -1581,6 +1592,14 @@ fn implied_equalities(filter: &filter::Filter, out: &mut Document) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A step a test runs between the engine's commit and the answer of `find_and_modify`,
+    /// where a deadline passes in the case it pins (ADR-266).
+    static AFTER_ENGINE: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub fn find_and_modify(
     state: &SharedState,
     auth: &Auth,
@@ -1591,6 +1610,9 @@ pub fn find_and_modify(
     // One date for every `$$NOW` of the request's filter, update and `arrayFilters`.
     let _clock = kimmy_query::expr::RequestClock::open();
     let _span = op_span("find_and_modify", db, Some(coll)).entered();
+    // The match is found, and sorted, in the write transaction before anything is
+    // written, so a stop there writes nothing (ADR-266).
+    let _deadline = crate::limits::deadline_scope();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
 
     // Mutually exclusive rather than silently preferring one: a request that
@@ -1660,12 +1682,15 @@ pub fn find_and_modify(
             // does is updated on its own terms.
             Some(update) => {
                 // Worded as the same refusal on a matched document is (`apply`'s
-                // mapping below), so a client reads one message for both.
-                Some(
-                    update::apply_on_insert(update, &mut seed, now)
-                        .map(|()| seed)
-                        .map_err(|e| Modify::reported(&failures, e)),
-                )
+                // mapping below), so a client reads one message for both. A stop of the
+                // deadline inside the seed's stages is not a refusal to insert, which would
+                // be answered `400` and held for a request that is told not to retry: it is
+                // the timeout (review q8d3, m1).
+                Some(match update::apply_on_insert(update, &mut seed, now) {
+                    Ok(()) => Ok(seed),
+                    Err(e @ kimmy_core::Error::DeadlineExceeded) => return Err(e.into()),
+                    Err(e) => Err(Modify::reported(&failures, e)),
+                })
             }
             None => Some(Ok(seed)),
         }
@@ -1695,10 +1720,22 @@ pub fn find_and_modify(
         failures,
     };
 
+    // The last look before the transaction: an upsert on a primary key that is not there
+    // examines no document, so nothing in the engine would tick, and a request with no time
+    // left would insert (review q8d3, m1, m6). From the engine's first read the scan ticks.
+    deadline::check()?;
     // As `update`'s: a scan walks the collection in the write transaction
     // (ADR-199).
     let outcome =
         kimmy_storage::blocking(|| state.engine.find_and_modify(&meta, &candidates, &modify))?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_ENGINE.take() {
+        hook();
+    }
+    // The write has happened (or there was none): from here nothing may answer `503 timeout`
+    // (ADR-192, ADR-266). The answer below re-evaluates the filter for a positional
+    // projection, which reads the deadline; it is built whatever the clock says.
+    let _written = deadline::Deadline::suspend();
 
     let returned = match spec.return_document {
         ReturnDocument::Before => outcome.before.clone(),
@@ -1758,6 +1795,8 @@ pub fn delete(
     params: WriteParams,
 ) -> Result<Value, ApiError> {
     let _span = op_span("delete", db, Some(coll)).entered();
+    // Until its first commit (the engine sets the deadline aside from then on: ADR-266).
+    let _deadline = crate::limits::deadline_scope();
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
@@ -1790,6 +1829,8 @@ pub fn delete(
     let outcome = kimmy_storage::blocking(|| {
         state.engine.modify_where(&meta, &candidates, &modify, stop_after)
     })?;
+    // The answer is built from counts, but nothing after the engine's commits may be cut.
+    let _written = deadline::Deadline::suspend();
 
     let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
     if let Some(stamp) = single_stamp(multi, &outcome) {
@@ -2015,6 +2056,7 @@ pub fn violations(
     index: Option<&str>,
 ) -> Result<Value, ApiError> {
     let _span = op_span("violations", db, Some(coll)).entered();
+    let _deadline = crate::limits::deadline_scope();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
     // A pass over the retained oplog, as long as retention makes it, and so a
     // walk like any other (ADR-153). Skipped by the engine when no unique index
@@ -2357,14 +2399,47 @@ pub(crate) async fn aggregate_run_stats(
         (docs, consumed, Some(stats))
     };
 
-    let docs = run_stages(state, auth, db, &stages[consumed..], docs, &limits, &[])?;
+    // The rest is synchronous: its own function, so that the guard of the request's
+    // deadline (ADR-266) cannot be alive across the `$vectorSearch` await above, which
+    // a future may leave on one thread and resume on another.
+    finish_pipeline(
+        state,
+        auth,
+        db,
+        &stages[consumed..],
+        docs,
+        &limits,
+        sink.map(|sink| (sink, all_stages.last().expect("a sink is a stage of the pipeline"))),
+        source_stats,
+    )
+}
 
-    if let Some(sink) = sink {
-        let last = all_stages.last().expect("a sink is a stage of the pipeline");
+/// Everything after the source of an aggregation, under the request's deadline: the
+/// stages, then the write of a sink or the answer.
+#[allow(clippy::too_many_arguments)]
+fn finish_pipeline(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    stages: &[aggregate::Stage],
+    docs: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    sink: Option<(SinkPlan, &aggregate::Stage)>,
+    source_stats: Option<QueryStats>,
+) -> Result<(Value, Option<QueryStats>), ApiError> {
+    let _deadline = crate::limits::deadline_scope();
+    let docs = run_stages(state, auth, db, stages, docs, limits, &[])?;
+
+    if let Some((sink, last)) = sink {
         return Ok((write_sink(state, sink, last, docs)?, source_stats));
     }
 
-    let documents: Vec<Value> = docs.iter().map(document_to_json).collect();
+    let mut ticker = deadline::Ticker::new();
+    let mut documents: Vec<Value> = Vec::with_capacity(docs.len());
+    for doc in &docs {
+        ticker.tick()?;
+        documents.push(document_to_json(doc));
+    }
     Ok((json!({ "documents": documents, "count": documents.len() }), source_stats))
 }
 
@@ -2540,6 +2615,11 @@ fn write_sink(
     if let (true, Some(meta)) = (is_out, &existing) {
         not_empty(meta)?;
     }
+    // The last look at the request's deadline: from here the target is created and
+    // written, and a write that has begun goes to its end (ADR-192, ADR-266), so a
+    // request cut by the deadline has created nothing and written nothing.
+    deadline::check()?;
+    let _suspended = deadline::Deadline::suspend();
     let meta = match existing {
         Some(meta) => meta,
         None => match kimmy_storage::blocking(|| state.engine.create_collection(&db, &coll)) {
@@ -2631,6 +2711,9 @@ fn lookup(
     // The second authorization point. See this function's caller.
     let foreign = foreign_collection(state, auth, db, from)?;
 
+    // The foreign walk below ticks the request's deadline per row (ADR-266); the
+    // loops over the input in memory take a `Ticker` each.
+    deadline::check()?;
     let wanted: std::collections::HashSet<Vec<u8>> =
         aggregate::lookup_keys(&input, local_field).iter().filter_map(encode_key).collect();
 
@@ -2668,20 +2751,20 @@ fn lookup(
 
     // The union of the buckets of every key each input document yields, each
     // foreign document once however many of its keys met, in scan order.
-    let attached: Vec<Vec<usize>> = input
-        .iter()
-        .map(|doc| {
-            let mut at: Vec<usize> = join_keys(doc, local_field)
-                .iter()
-                .filter_map(|key| buckets.get(key))
-                .flatten()
-                .copied()
-                .collect();
-            at.sort_unstable();
-            at.dedup();
-            at
-        })
-        .collect();
+    let mut ticker = deadline::Ticker::new();
+    let mut attached: Vec<Vec<usize>> = Vec::with_capacity(input.len());
+    for doc in &input {
+        ticker.tick()?;
+        let mut at: Vec<usize> = join_keys(doc, local_field)
+            .iter()
+            .filter_map(|key| buckets.get(key))
+            .flatten()
+            .copied()
+            .collect();
+        at.sort_unstable();
+        at.dedup();
+        attached.push(at);
+    }
     // Each attachment is a copy, so the ceiling counts them too, before any is
     // made: a fan-out can attach one foreign document to every element of every
     // input document, and held once is not attached once.
@@ -2689,6 +2772,7 @@ fn lookup(
 
     let mut out = Vec::with_capacity(input.len());
     for (mut doc, at) in input.into_iter().zip(attached) {
+        ticker.tick()?;
         // Counted before each copy, so a join whose array would pass 16 MiB is
         // refused at the document that takes it there (a `413`).
         let mut joined = aggregate::JoinedArray::new("the array $lookup builds");
@@ -2775,6 +2859,9 @@ fn lookup_pipeline(
     let base = match (first, lead) {
         (Some(first), None) => aggregate::apply(first, foreign, limits)?,
         (Some(aggregate::Stage::Match(_)), Some(lead)) => {
+            // Once over the foreign side, which declines on any error (including a
+            // stop), so the deadline is looked at before it and by the loop after.
+            deadline::check()?;
             match hoist_independent(&lead.independent, &foreign) {
                 Some(kept) => {
                     plan.hoisted = true;
@@ -2788,7 +2875,11 @@ fn lookup_pipeline(
 
     let mut held = 0usize;
     let mut out = Vec::with_capacity(input.len());
+    let mut ticker = deadline::Ticker::new();
     for (n, mut doc) in input.into_iter().enumerate() {
+        // Per input document: each is a pass over the foreign side, the nested loop
+        // this form is (and a cut here is a cut between two of those passes).
+        ticker.tick()?;
         let bound = aggregate::bind_let(let_vars, &doc, outer)?;
         // Inner bindings after outer ones, so a name rebound here shadows.
         let vars: Vec<Binding<'_>> =
@@ -2834,6 +2925,7 @@ fn union_with(
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
+    deadline::check()?;
     let name = spec.coll.as_str();
     kimmy_core::Error::validate_name(name)?;
     // Resolved the way `$lookup` and `$graphLookup` resolve theirs (see
@@ -2852,9 +2944,14 @@ fn union_with(
             state,
             meta,
             limits,
-            |doc| match &lead {
-                Some(lead) => Ok(filter::matches_with(lead, doc, vars)?),
-                None => Ok(true),
+            |doc| {
+                // Per document read (ADR-266): the walk ticks per row too, but the
+                // leading `$match` can cost more than the row.
+                deadline::tick()?;
+                match &lead {
+                    Some(lead) => Ok(filter::matches_with(lead, doc, vars)?),
+                    None => Ok(true),
+                }
             },
             |max| {
                 format!(
@@ -2874,7 +2971,9 @@ fn union_with(
     // size a stored document may be, `413` at the document that passes it.
     let cap = kimmy_core::limits::MAX_DOCUMENT_BYTES;
     let mut bytes = 0usize;
+    let mut ticker = deadline::Ticker::new();
     for doc in &appended {
+        ticker.tick()?;
         bytes += bson::serialize_to_vec(doc)
             .map_err(|e| kimmy_core::Error::Internal(format!("$unionWith could not encode: {e}")))?
             .len();
@@ -2889,6 +2988,8 @@ fn union_with(
         }
     }
     aggregate::check_limit("$unionWith", input.len() + appended.len(), limits)?;
+    // The look before the append, so that a stage cut by the deadline is cut whole.
+    deadline::check()?;
     input.extend(appended);
     Ok(input)
 }
@@ -2948,7 +3049,9 @@ fn graph_lookup(
     };
     let mut table: std::collections::HashMap<Vec<u8>, Vec<usize>> =
         std::collections::HashMap::new();
+    let mut ticker = deadline::Ticker::new();
     for (at, doc) in foreign.iter().enumerate() {
+        ticker.tick()?;
         for key in link_keys(doc, &spec.connect_to) {
             table.entry(key).or_default().push(at);
         }
@@ -2957,6 +3060,7 @@ fn graph_lookup(
     let mut held = 0usize;
     let mut out = Vec::with_capacity(input.len());
     for mut doc in input {
+        ticker.tick()?;
         let start =
             spec.start_with.eval_in(&kimmy_query::expr::Scope::with_bindings(&doc, outer))?;
         let mut frontier: Vec<Vec<u8>> = Vec::new();
@@ -2979,6 +3083,8 @@ fn graph_lookup(
         let mut reached: Vec<(usize, usize)> = Vec::new();
         let mut depth = 0usize;
         while !frontier.is_empty() {
+            // A step of the walk, whose frontier may be the whole collection.
+            ticker.tick()?;
             let mut found: Vec<usize> = frontier
                 .iter()
                 .filter_map(|key| table.get(key))
@@ -2990,6 +3096,7 @@ fn graph_lookup(
             found.dedup();
             let mut next: Vec<Vec<u8>> = Vec::new();
             for &at in &found {
+                ticker.tick()?;
                 visited.insert(at);
                 reached.push((at, depth));
                 for key in link_keys(&foreign[at], &spec.connect_from) {
@@ -3160,6 +3267,9 @@ fn matched_for_input(
         && !join_disabled_for_test()
     {
         if matches!(plan.table, JoinTable::NotBuilt) {
+            // Once over the foreign side, which declines on any error (including a
+            // stop): looked at before it, and by the loop below if it declines.
+            deadline::check()?;
             plan.table = build_table(key, base);
         }
         if let JoinTable::Built(table) = &plan.table
@@ -3172,7 +3282,9 @@ fn matched_for_input(
     // conjunction decides a pair; otherwise the whole filter does.
     let deciding = if plan.hoisted { &lead.variable } else { whole };
     let mut kept = Vec::new();
+    let mut ticker = deadline::Ticker::new();
     for doc in base {
+        ticker.tick()?;
         if filter::matches_with(deciding, doc, vars)? {
             kept.push(doc.clone());
         }
@@ -4819,6 +4931,8 @@ mod join_differential {
 #[cfg(test)]
 mod join_tests;
 
+#[cfg(test)]
+mod deadline_tests;
 #[cfg(test)]
 mod union_tests;
 

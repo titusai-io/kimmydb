@@ -1043,7 +1043,9 @@ async fn knn_joined(
             index.search_until(&state.engine, shadow, query, options, set, deadline)
         }),
         // Every stored vector scored: a walk, off the async worker (ADR-199).
+        // The walk's rows tick the request's deadline (ADR-266), which this scope sets.
         Access::Exact => kimmy_storage::blocking(|| {
+            let _deadline = crate::limits::deadline_scope();
             search::vector_search(&state.engine, shadow, query, options, set)
         }),
         // No graph yet, and one is being built (ADR-245): every stored vector
@@ -1105,7 +1107,9 @@ pub async fn run_hybrid_search(
     // Every stored chunk's text tokenized: a walk, off the async worker
     // (ADR-199).
     let set = allowed.as_ref().map(|a| &a.set);
+    // The rows of the walk tick the request's deadline (ADR-266), which this scope sets.
     let lexical = kimmy_storage::blocking(|| {
+        let _deadline = crate::limits::deadline_scope();
         search::keyword_search(&state.engine, &shadow, &text, &wide, min_overlap, set)
     })
     .map_err(vector_error)?;
@@ -1608,6 +1612,99 @@ mod tests {
         assert_eq!(ids(&inside), ids(&exact));
     }
 
+    fn dot_config() -> VectorConfig {
+        VectorConfig { metric: Metric::Dot, ..config() }
+    }
+
+    fn passed_deadline() -> (std::time::Instant, std::time::Duration) {
+        (std::time::Instant::now(), std::time::Duration::from_secs(7))
+    }
+
+    /// The exact scan (a metric with no graph) walks every stored vector and reads the
+    /// request's deadline: past it, `503 timeout` (ADR-266, review q8d3, m2); with time left,
+    /// the exact answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exact_scan_past_the_request_deadline_answers_503_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (_, shadow) = fixture_with(&state, 20, dot_config());
+        let config = dot_config();
+        let query = [1.0f32, 0.0];
+        let options = SearchOptions { k: 5, metric: config.metric, per_document: 1 };
+        assert!(matches!(
+            state.vectors.access(&state.engine, &shadow, config.metric, config.dim),
+            Access::Exact
+        ));
+        let (deadline, timeout) = passed_deadline();
+        let late = crate::limits::as_a_request(deadline, timeout, async {
+            knn_joined(&state, &shadow, &config, &query, &options, None).await
+        })
+        .await
+        .expect_err("an exact scan past the request's deadline must not answer");
+        assert_eq!(late.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(late.code, ErrorCode::Timeout);
+        assert!(late.message.contains("within 7 seconds"), "{}", late.message);
+
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let hits = crate::limits::as_a_request(far, timeout, async {
+            knn_joined(&state, &shadow, &config, &query, &options, None).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 5);
+        assert!(!kimmy_core::deadline::Deadline::is_set(), "no deadline outlives the search");
+    }
+
+    /// A hybrid search past the request's deadline answers `503 timeout`, and its keyword
+    /// half is under the deadline itself: the clock is read for the walk of that half as it is
+    /// for the dense half's, which a search of the dense half alone does not account for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hybrid_search_past_the_request_deadline_answers_503_timeout_and_its_keyword_walk_reads_it()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (_, shadow) = fixture_with(&state, 40, dot_config());
+        let config = dot_config();
+        let auth = Auth(kimmy_auth::Principal::superuser("test"));
+        let body = SearchRequest {
+            query: Some("d1 d2 d3".into()),
+            vector: Some(vec![1.0, 0.0]),
+            k: Some(3),
+            ..Default::default()
+        };
+        let (deadline, timeout) = passed_deadline();
+        let late = crate::limits::as_a_request(deadline, timeout, async {
+            run_hybrid_search(&state, &auth, "app", "docs", &body).await
+        })
+        .await
+        .expect_err("a hybrid search past the request's deadline must not answer");
+        assert_eq!(late.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(late.code, ErrorCode::Timeout);
+
+        // With time left, the reads of the clock the dense half makes alone, and then the whole
+        // search's: the keyword half's walk adds its own.
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let query = [1.0f32, 0.0];
+        let options = SearchOptions { k: 12, metric: config.metric, per_document: 1 };
+        let before = kimmy_core::deadline::clock_reads();
+        crate::limits::as_a_request(far, timeout, async {
+            knn_joined(&state, &shadow, &config, &query, &options, None).await
+        })
+        .await
+        .unwrap();
+        let dense = kimmy_core::deadline::clock_reads() - before;
+        let before = kimmy_core::deadline::clock_reads();
+        let found = crate::limits::as_a_request(far, timeout, async {
+            run_hybrid_search(&state, &auth, "app", "docs", &body).await
+        })
+        .await
+        .unwrap();
+        let whole = kimmy_core::deadline::clock_reads() - before;
+        assert!(!found["matches"].as_array().unwrap().is_empty(), "{found}");
+        assert!(dense >= 1, "the dense half reads the clock");
+        assert!(whole > dense, "{whole} reads for the whole search, {dense} for the dense half");
+    }
+
     /// A search run to its end from a synchronous test.
     fn ran<T>(search: impl std::future::Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(search)
@@ -1832,8 +1929,18 @@ mod tests {
         state: &SharedState,
         n: i64,
     ) -> (kimmy_storage::CollectionMeta, kimmy_storage::CollectionMeta) {
+        fixture_with(state, n, config())
+    }
+
+    /// [`fixture`] under `config`: the inner product has no graph, so a collection of that
+    /// metric is searched by the exact scan whatever its size.
+    fn fixture_with(
+        state: &SharedState,
+        n: i64,
+        config: VectorConfig,
+    ) -> (kimmy_storage::CollectionMeta, kimmy_storage::CollectionMeta) {
         state.engine.create_collection("app", "docs").unwrap();
-        state.engine.configure_vectors("app", "docs", config()).unwrap();
+        state.engine.configure_vectors("app", "docs", config).unwrap();
         let source = state.engine.get_collection("app", "docs").unwrap();
         let shadow = state.engine.vector_collection("app", "docs").unwrap().unwrap();
         for i in 0..n {

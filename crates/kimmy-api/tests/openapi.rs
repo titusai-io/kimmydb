@@ -54,6 +54,15 @@ const METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "
 // The specification
 // ---------------------------------------------------------------------------
 
+/// The limits a test that is not about the deadline serves under: a deadline an hour
+/// long, so a machine under load cannot turn a slow request into a `503 timeout` (ADR-266).
+fn unhurried() -> kimmy_api::RequestLimits {
+    kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_secs(3600),
+        ..kimmy_api::RequestLimits::default()
+    }
+}
+
 fn spec() -> &'static Value {
     static SPEC: OnceLock<Value> = OnceLock::new();
     SPEC.get_or_init(|| {
@@ -1099,7 +1108,7 @@ impl Server {
             ),
         )
         .unwrap();
-        let app = kimmy_api::router(Arc::clone(&state));
+        let app = kimmy_api::router_with_limits(Arc::clone(&state), None, unhurried());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1139,8 +1148,10 @@ impl Server {
         let mut request = request.body(axum::body::Body::from(body)).unwrap();
         request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
 
-        let response =
-            kimmy_api::router(Arc::clone(&self.state)).oneshot(request).await.expect("router");
+        let response = kimmy_api::router_with_limits(Arc::clone(&self.state), None, unhurried())
+            .oneshot(request)
+            .await
+            .expect("router");
         let status = response.status().as_u16();
         let bytes = response.into_body().collect().await.expect("body").to_bytes();
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
