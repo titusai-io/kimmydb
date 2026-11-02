@@ -824,6 +824,10 @@ field path.
 |---|---|
 | Arithmetic | `$add` `$subtract` `$multiply` `$divide` `$mod` |
 | Math | `$abs` `$ceil` `$floor` `$round` `$trunc` `$pow` `$sqrt` `$exp` `$ln` `$log10` — see [Math](#math) |
+| Trigonometry and logarithms | `$sin` `$cos` `$tan` `$asin` `$acos` `$atan` `$atan2` `$sinh` `$cosh` `$tanh` `$asinh` `$acosh` `$atanh` `$degreesToRadians` `$radiansToDegrees` `$log` — see [Trigonometry and logarithms](#trigonometry-and-logarithms) |
+| Totals and extremes | `$sum` `$avg` `$min` `$max` — over an array or a list of operands; see [Totals and extremes](#totals-and-extremes) |
+| Sizes and timestamps | `$binarySize` `$bsonSize` `$tsSecond` `$tsIncrement` — see [Sizes and timestamps](#sizes-and-timestamps) |
+| Random | `$rand` — see [Random numbers and `$sampleRate`](#random-numbers-and-samplerate) |
 | Strings | `$concat` `$toUpper` `$toLower` `$substr` (`$substrCP`) `$split` `$strLenCP` — and, see [Strings](#strings): `$trim` `$ltrim` `$rtrim` `$indexOfCP` `$indexOfBytes` `$regexMatch` `$regexFind` `$regexFindAll` `$replaceOne` `$replaceAll` `$strcasecmp` `$strLenBytes` `$substrBytes` |
 | Conditional | `$cond` (both `[if, then, else]` and `{if, then, else}`) `$ifNull` `$switch` |
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
@@ -900,7 +904,7 @@ document), and `$stdDevPop` / `$stdDevSamp` take one array,
 `{$stdDevPop: [1, 2, 3, 4]}` being `1.118033988749895`, or a list of operands;
 non-numbers among them are ignored. An `input` that is not an array, `null` and
 missing included, is `400`, and `n` is read before it. `$top`, `$bottom`, `$topN`,
-`$bottomN` and `$count` are accumulators only.
+`$bottomN` and `$count` are accumulators only. `$sum`, `$avg`, `$min` and `$max` are both: as expressions they take an array or a list of operands ([Totals and extremes](#totals-and-extremes)).
 
 In a `$group` (and `$bucket`, `$bucketAuto`), `$sum`, `$avg`, `$min`, `$max`,
 `$first`, `$last`, `$push`, `$addToSet`, `$stdDevPop`, `$stdDevSamp` and
@@ -1211,6 +1215,7 @@ that is not a number is `400`.
 | `{$pow: [base, exponent]}` | An integer base and a non-negative integer exponent give an integer while it fits `Int64` (an `Int32` when both are `Int32` and the power fits one), a double after; otherwise a double, or a decimal with a decimal operand. `0` to a negative power, and a negative base to a power that is not a whole number, are `400` (not an infinity or a `NaN`) |
 | `{$sqrt: x}` | The square root. A negative argument is `400` |
 | `{$exp: x}`, `{$ln: x}`, `{$log10: x}` | `e^x`, the natural logarithm and the base-10 logarithm. `$ln` and `$log10` of zero or a negative are `400`; `$log10` of an exact power of ten is exact |
+| `{$log: [x, base]}` | The logarithm of `x` in `base`; see [Trigonometry and logarithms](#trigonometry-and-logarithms) |
 
 An integer or a double argument to `$sqrt`, `$exp`, `$ln` and `$log10` gives a
 double; a `Decimal128` gives a `Decimal128`. A `NaN` is a `NaN` out, and `$exp`,
@@ -1240,6 +1245,60 @@ where the digits must agree.
     "growth": { "$pow": [ 1.07, "$years" ] },
     "decibel": { "$multiply": [ 10, { "$log10": "$ratio" } ] } } }
 ```
+
+### Trigonometry and logarithms
+
+`$sin`, `$cos`, `$tan`, `$asin`, `$acos`, `$atan`, `$atan2`, `$sinh`, `$cosh`, `$tanh`, `$asinh`, `$acosh`, `$atanh`, `$degreesToRadians` and `$radiansToDegrees` take an `Int32`, `Int64`, double or `Decimal128`, and `$log` takes a number and a base. Each answers what the reference answers for every operand type: a `null` or missing operand is `null`, a value that is not a number is `400` (`$sin only supports numeric types, not string`), and an operand outside the function's domain is `400`, never a `NaN` or an infinity made out of it. Any integer width or a double gives a **double**; a `Decimal128` gives a `Decimal128`; a `NaN` is a `NaN`. A list of operands or the one operand bare, `{$sin: [x]}` or `{$sin: x}`, is the same; the number of operands is checked when the expression is parsed.
+
+| Operator | Result |
+|---|---|
+| `{$sin: x}`, `{$cos: x}`, `{$tan: x}` | `x` in radians. An infinity is `400` (`cannot apply $sin to inf, value must be in (-inf,inf)`) |
+| `{$asin: x}`, `{$acos: x}` | The arcsine and arccosine, in radians; `x` outside `[-1, 1]`, an infinity included, is `400` (`cannot apply $asin to 2, value must be in [-1,1]`) |
+| `{$atan: x}` | The arctangent; `±Infinity` is `±π/2` |
+| `{$atan2: [y, x]}` | The angle of the point `(x, y)` in `(-π, π]`. A `null` or missing `y` is `null` before `x` is read, and a `y` that is not a number is `400` before a `null` `x` is `null`; a double and a decimal make both decimals. A zero `y` keeps its sign |
+| `{$sinh: x}`, `{$cosh: x}`, `{$tanh: x}`, `{$asinh: x}` | Defined for every number; an infinity gives the infinity or, for `$tanh`, `±1` |
+| `{$acosh: x}` | `x` below 1 is `400` (`value must be in [1,inf]`); `+Infinity` is `Infinity` |
+| `{$atanh: x}` | `x` outside `[-1, 1]` is `400`; `1` is `Infinity` and `-1` is `-Infinity` |
+| `{$degreesToRadians: x}`, `{$radiansToDegrees: x}` | `x` times π/180, or 180/π |
+| `{$log: [x, base]}` | The logarithm of `x` in `base`. See below |
+
+**A refusal names the number as the reference prints it**: six significant digits, `1e+30`, `1.23457e+08`, `-inf`, `2` for an integer of any width; a `Decimal128` as a decimal prints (`1E+30`). The doubles are the platform's math library's and can differ in the last digit between architectures, as `$exp` and `$ln` can.
+
+**A `Decimal128` operand is computed in integers to 34 digits** (`kimmy-core`, the same machinery as `$exp`, `$ln` and `$pow`): rounded once, half to even, so the same bytes on every member. `$sin`, `$cos` and `$tan` reduce the operand modulo π/2 at a width that follows its exponent, so `1E+6000` is reduced exactly. The reference's own decimal library is within a unit of the last place but is not always the nearest: of 1,478 recorded calls 1,253 are identical to the last digit and the rest are within three units of it, and the exact points (`0`, `-0`, `0E+3`, `NaN`, the infinities) answer the reference's cohort (`$sin` of `0E+3` is `0E+3`, `$tan` of it `0E-37`, `$asinh` of it `0E-6176`). The register has the cases ([deviations.md](deviations.md)). `$degreesToRadians` and `$radiansToDegrees` multiply by the constant to 34 digits, as the reference does.
+
+**`$log`** checks, in the reference's order: a `null` or missing number or base is `null` before anything else; then both types (`$log's argument must be numeric, not string`, and the same for `base`); then the number (`$log's argument must be a positive number, but is -1`; zero, a negative and `-Infinity` are refused); then the base (`must be a positive number not equal to 1`). A `NaN` gives a double `NaN`. Doubles give `ln(x) / ln(base)`, so `{$log: [1000, 10]}` is `2.9999999999999996`, as there. With a `Decimal128` in either operand both become decimals (a double is read to 15 significant digits: `0.1` is `0.1`) and the answer is a decimal: base 2 and base 10 are the decimal `log2` and `log10` (exact for a power: `{$log: [Decimal128("1000"), Decimal128("10")]}` is `3`), and **any other base divides `ln(x)` by the base itself, not by its logarithm**: `{$log: [Decimal128("2"), Decimal128("3")]}` is `0.2310490601866484364724107071527255`, which is `ln 2 / 3`. That is what the reference answers (probed for eleven decimal bases), and it is matched rather than corrected; [deviations.md](deviations.md) records it.
+
+### Totals and extremes
+
+`$sum`, `$avg`, `$min` and `$max` are expressions as well as accumulators. The argument is one array, `{$sum: "$prices"}` or `{$sum: [[1, 2, 3]]}`, or a list of operands, `{$sum: ["$a", "$b", 10]}`, or one value. One operand that is an array is its elements; an element that is itself an array is a value (not a number, so not summed; ordered by `$min` and `$max` as an array); any other single operand is itself. They run the same code as the `$group` accumulators, so the answers are the accumulators':
+
+| Operator | Answer |
+|---|---|
+| `$sum` | The total of the numbers; anything else (a string, `null`, a date, a boolean) adds nothing. The width of ADR-268: an `Int32` while every number was an `Int32` and the total fits one, an `Int64` once an `Int64` was added or the total left `Int32`, a double once a double was added or the total passed `Int64`, a `Decimal128` once a decimal was. Nothing to add is the `Int32` `0` |
+| `$avg` | The mean of the numbers, a double (a `Decimal128` when one was among them); `null` when there was nothing to average |
+| `$min`, `$max` | The least / greatest value in the canonical order across types (`null` and a missing value skipped; a string above a number for `$max`, a number above a string for `$min`); `null` when there is none. Of two equal values the first stays, in whatever type it was (`{$max: [1, 1.0]}` is the `Int32` `1`); a `NaN` is below every number |
+
+```json
+{ "$project": { "total": { "$sum": ["$net", "$tax"] }, "best": { "$max": "$scores" }, "mean": { "$avg": "$scores" } } }
+```
+
+Recorded against the reference for 392 calls, every width and type among them. The differences are the accumulators' own: a double sum adds the values one at a time where the reference keeps a double-double, so `{$sum: [Long(2^53 + 1), 1.0]}` is `9007199254740992.0` and not `…994.0`, and a decimal sum is exact and rounded once where the reference rounds each partial sum to 34 digits ([deviations.md](deviations.md)). In a `$group` an array literal for these four is still `400` (the accumulators are unary).
+
+### Sizes and timestamps
+
+| Operator | Answer |
+|---|---|
+| `{$binarySize: x}` | An `Int32`: the length in bytes of a string (its UTF-8 bytes: `"é"` is 2, `"😀"` 4) or of binary data. `null` and missing are `null`; any other type is `400` (`$binarySize requires a string or BinData argument, found: int`) |
+| `{$bsonSize: x}` | An `Int32`: the bytes of a document encoded as BSON (`{}` is 5). `null` and missing are `null`; any other type is `400` (`$bsonSize requires a document input, found: string`). `{$bsonSize: "$$ROOT"}` is the size of the document being read |
+| `{$tsSecond: x}`, `{$tsIncrement: x}` | An `Int64`: the seconds and the increment of a timestamp, each up to 4,294,967,295. `null` and missing are `null`; any other type is `400` (`Argument to $tsSecond must be a timestamp, but is date`) |
+
+### Random numbers and `$sampleRate`
+
+`{$rand: {}}` is a double in `[0, 1)`, drawn afresh each time it is evaluated: twice in one document are two draws, and each document of a stage has its own. Its argument is an empty document or an empty array; any other is `400` (`$rand does not currently accept arguments`, or `invalid parameter: expected an object ($rand)`). There is no seed to give and none to read: the source is the operating system's, one generator for each thread.
+
+`$rand` in a pipeline-style update is evaluated once, for each document, on the member that accepts the write, and the number is stored: it is a value of the document like any other, the same on every read, and what replicates is the document that resulted (the oplog entry carries the post-image), exactly as `$$NOW` does. It is not drawn again on another member, on a read, or when a later update rewrites other fields.
+
+`{$match: {$sampleRate: 0.33}}` is the filter form: a clause of a document filter that matches when a draw from `[0, 1)` is below the rate, so about that share of the documents it is tried on. It is documented with the other [filter operators](query-language.md#samplerate).
 
 ### Variables
 

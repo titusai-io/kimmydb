@@ -72,6 +72,7 @@ regex as a value, `{"s": {"$eq": /ab/}}`.
 | `$not` | Applied to a **field's** operators, not at the top level. Its document must hold at least one operator: `{"$not": {"score": 8}}` is a `400`: write `$ne` for an equality, `{"$not": {"$elemMatch": {...}}}` for an array of documents (or inside `$pull`), and a dotted path for one embedded document, `{"r.score": {"$ne": 8}}` (`$elemMatch` matches arrays only, so over a single document `{"$not": {"$elemMatch": ...}}` matches it) |
 | `$expr` | Top-level, takes an [aggregation expression](aggregation.md#expressions); matches when it is truthy |
 | `$jsonSchema` | Top-level, takes a schema document; matches the documents the schema accepts — see [`$jsonSchema`](#jsonschema) |
+| `$sampleRate` | Top-level, takes a number from 0 to 1; matches a document when a random draw is below it — see [`$sampleRate`](#samplerate) |
 
 ```javascript
 { "$or": [ { "qty": { "$lt": 5 } }, { "status": "urgent" } ] }
@@ -395,6 +396,16 @@ the list of names, and so on.
   (`{"e": {"$jsonSchema": ...}}`): an entry takes field conditions, `$expr` and
   `$and`/`$or`/`$nor`, and a schema under a field is the field-level use that is
   a `400` everywhere. Filter the elements with `$elemMatch` in the query filter.
+
+### `$sampleRate`
+
+```javascript
+{ "$sampleRate": 0.33 }
+```
+
+Matches a document when a draw from `[0, 1)` is below the rate, so about a third of the documents it is tried on here: a different third each time. A rate of `0` matches nothing and `1` everything. The rate is an int, long, double or decimal from 0 to 1 (a decimal is read as its nearest double); a number outside it, a `NaN`, and anything that is not a number are `400` (`numeric argument to $sampleRate must be in [0, 1]`, `argument to $sampleRate must be a numeric type`).
+
+It stands at the **top** of a filter, alone or beside other conditions, and inside `$and`, `$or` and `$nor`, in `find`, `count`, `update`, `delete`, a `$match` and a `$lookup` sub-pipeline. It is a clause on the whole document, not on a field: `{"g": {"$sampleRate": 0.5}}` is a `400`, as is one inside an `$elemMatch` (`$sampleRate can only be applied to the top-level document`), in `$expr` (it is a filter operator; the expression is [`$rand`](aggregation.md#random-numbers-and-samplerate)) and in an `arrayFilters` entry. The draw is taken for each document each time the filter is tried on it, from the same source as `$rand`; there is no seed. It is never index-eligible and cannot appear in a partial index's filter.
 
 ### `$type`
 
@@ -1465,12 +1476,12 @@ than as an `$or` of one `$regex` each.
 | `$jsonSchema` | ✅ Built as a filter operator — see [`$jsonSchema`](#jsonschema) |
 | Geospatial operators | ⛔ Not planned |
 | Text indexes / `$text` | ⛔ Superseded by [vector and hybrid search](vectors.md) |
-| The trigonometric expression operators `$sin`, `$cos`, `$tan`, `$asin`, `$acos`, `$atan`, `$atan2`, `$sinh`, `$cosh`, `$tanh`, `$asinh`, `$acosh`, `$atanh`, `$degreesToRadians` and `$radiansToDegrees` | ⏳ Not built |
-| `$log` (a number and a base); `$ln` and `$log10` are built | ⏳ Not built |
-| `$sum`, `$avg`, `$min` and `$max` as expression operators (over an array, or over several arguments); the `$group`, `$bucket`, `$bucketAuto` and window forms are built, and `$stdDevPop`, `$stdDevSamp`, `$firstN`, `$lastN`, `$maxN` and `$minN` already take an array | ⏳ Not built |
-| `$binarySize`, `$bsonSize` | ⏳ Not built |
-| `$tsSecond`, `$tsIncrement` | ⏳ Not built |
-| `$rand`, `$sampleRate` | ⏳ Not built |
+| The trigonometric expression operators `$sin`, `$cos`, `$tan`, `$asin`, `$acos`, `$atan`, `$atan2`, `$sinh`, `$cosh`, `$tanh`, `$asinh`, `$acosh`, `$atanh`, `$degreesToRadians` and `$radiansToDegrees` | ✅ Built — see [Trigonometry and logarithms](aggregation.md#trigonometry-and-logarithms) |
+| `$log` (a number and a base); `$ln` and `$log10` are built | ✅ Built — see [Trigonometry and logarithms](aggregation.md#trigonometry-and-logarithms) |
+| `$sum`, `$avg`, `$min` and `$max` as expression operators (over an array, or over several arguments); the `$group`, `$bucket`, `$bucketAuto` and window forms are built, and `$stdDevPop`, `$stdDevSamp`, `$firstN`, `$lastN`, `$maxN` and `$minN` already take an array | ✅ Built — see [Totals and extremes](aggregation.md#totals-and-extremes) |
+| `$binarySize`, `$bsonSize` | ✅ Built — see [Sizes and timestamps](aggregation.md#sizes-and-timestamps) |
+| `$tsSecond`, `$tsIncrement` | ✅ Built — see [Sizes and timestamps](aggregation.md#sizes-and-timestamps) |
+| `$rand`, `$sampleRate` | ✅ Built — see [Random numbers and `$sampleRate`](aggregation.md#random-numbers-and-samplerate) and [`$sampleRate`](#samplerate) |
 | `$documents` (a pipeline that starts from literal documents, with no collection) | ⏳ Not built |
 | `$collStats`, `$indexStats` | ⏳ Not built |
 | `$accumulator`, `$function` | ⛔ Never — JavaScript execution, as `$where` |
