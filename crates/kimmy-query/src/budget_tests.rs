@@ -339,6 +339,35 @@ fn a_waiting_request_is_ended_by_its_deadline_and_the_pool_comes_back() {
 }
 
 #[test]
+fn a_waiting_request_is_ended_by_the_deadline_scope_it_runs_under() {
+    // The wait is a synchronous sleep, so the request's deadline fires inside it: under a
+    // scope of 80 ms the older request's wait ends there with the deadline's own error, not
+    // the pool's refusal and not at the (much later) bound of its own budget.
+    let pool = MemoryPool::new(100);
+    let (budget, mut older) = holder(&pool, 10);
+    budget.wait_until(Instant::now() + Duration::from_secs(30));
+    let (_a, younger) = holder(&pool, 80);
+    let started = Instant::now();
+    let err = {
+        let _scope = kimmy_core::deadline::Deadline::scope(Some(Duration::from_millis(80)));
+        older.charge(50).unwrap_err()
+    };
+    let waited = started.elapsed();
+    assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+    assert!(waited >= Duration::from_millis(60) && waited < Duration::from_secs(5), "{waited:?}");
+    assert_eq!(pool.pool_refusals(), 0, "a deadline is not a refusal of the pool");
+    drop(older);
+    drop(budget);
+    drop(younger);
+    assert_eq!((pool.used(), pool.holders()), (0, 0));
+    // With no scope the wait runs to the bound of its own budget, as before.
+    let (budget, mut older) = holder(&pool, 10);
+    budget.wait_until(Instant::now() + Duration::from_millis(80));
+    let (_a, _younger) = holder(&pool, 80);
+    assert!(is_busy(&older.charge(50).unwrap_err()));
+}
+
+#[test]
 fn a_request_that_alone_would_pass_the_whole_pool_is_refused_at_once() {
     let pool = MemoryPool::new(100);
     let budget = BufferBudget::pooled(1_000, &pool);

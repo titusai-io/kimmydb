@@ -526,6 +526,15 @@ impl Lease {
                         in_use: pool.used(),
                     });
                 }
+                // The wait is a synchronous sleep, which the request's deadline cannot cut
+                // from outside: it looks at the deadline itself at every wake-up, and at the
+                // node's stop (which `check` sees under a deadline scope, and this sees
+                // without one). Either ends it with the error those answer, not as a refusal
+                // of the pool: `503 timeout` or `503 node_stopping`.
+                if kimmy_core::deadline::requests_are_stopped() {
+                    return Err(Error::DeadlineExceeded);
+                }
+                kimmy_core::deadline::check()?;
                 pool.wait_for_release(POOL_WAIT_SLICE.min(give_up - now));
             }
             if inner.reserved == 0 {
