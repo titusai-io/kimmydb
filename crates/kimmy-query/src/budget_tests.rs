@@ -1033,7 +1033,7 @@ fn the_reviewers_wide_documents_are_refused_at_the_source_read_at_the_derived_li
     let wide = ints_doc(400);
     let mut hundred = doc! {"_id": 1_i32};
     for i in 0..50 {
-        hundred.insert(format!("n{i}"), i as i32);
+        hundred.insert(format!("n{i}"), i);
         hundred.insert(format!("s{i}"), "y".repeat(60));
     }
     for (name, doc, count, bson_total_mb) in

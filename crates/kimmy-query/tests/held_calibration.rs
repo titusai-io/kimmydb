@@ -99,7 +99,7 @@ fn shapes() -> Vec<(&'static str, Document)> {
     let mut reviewer100 = Document::new();
     reviewer100.insert("_id", 1_i32);
     for i in 0..50 {
-        reviewer100.insert(format!("n{i}"), i as i32);
+        reviewer100.insert(format!("n{i}"), i);
         reviewer100.insert(format!("s{i}"), "y".repeat(60));
     }
     let mut mixed = Document::new();
