@@ -124,7 +124,7 @@ fn chain_one_by_one(
     let run = Run::new();
     let vars = run.vars();
     let runner = |stage: &Stage, input, arrived| run.stage(stage, input, arrived);
-    let mut chain = build.chain(stages, &runner, &run.limits, &vars);
+    let mut chain = build.chain(stages, &runner, &run, &vars);
     let mut pushed = 0;
     for doc in docs {
         pushed += 1;
@@ -142,7 +142,7 @@ fn chain_all(build: Build, stages: &[Stage], docs: Vec<Document>) -> Result<Vec<
     let run = Run::new();
     let vars = run.vars();
     let runner = |stage: &Stage, input, arrived| run.stage(stage, input, arrived);
-    let mut chain = build.chain(stages, &runner, &run.limits, &vars);
+    let mut chain = build.chain(stages, &runner, &run, &vars);
     let _more = chain.push_all(docs)?;
     chain.finish()
 }
@@ -155,16 +155,25 @@ enum Build {
 }
 
 impl Build {
+    /// The chain, with the positions a `$sample` draws from the run's seeded source, as the
+    /// barrier draws them.
     fn chain<'a>(
         self,
         stages: &'a [Stage],
-        run: pipeline::Runner<'a, Error>,
-        limits: &'a Limits,
+        runner: pipeline::Runner<'a, Error>,
+        run: &'a Run,
         vars: &'a [kimmy_query::expr::Binding<'a>],
     ) -> pipeline::Chain<'a, Error> {
         match self {
-            Build::Streaming => pipeline::build(stages, run, limits, vars),
-            Build::Barriers => pipeline::build_barriers(stages, run, limits, vars),
+            Build::Streaming => {
+                // Leaked: the chain borrows it for as long as it lives, and a test is short.
+                let below: &'a dyn Fn() -> Box<dyn FnMut(usize) -> usize + 'a> =
+                    Box::leak(Box::new(move || -> Box<dyn FnMut(usize) -> usize + 'a> {
+                        Box::new(move |n| run.seed.borrow_mut().below(n))
+                    }));
+                pipeline::build_with(stages, runner, &run.limits, vars, below)
+            }
+            Build::Barriers => pipeline::build_barriers(stages, runner, &run.limits, vars),
         }
     }
 }
@@ -620,6 +629,90 @@ proptest! {
             answer(Ok(want)),
             "the loop: {:?}", specs
         );
+    }
+}
+
+/// A source of positions that is the same for the same seed and keeps what it was asked and
+/// what it answered.
+fn logged(seed: u64) -> (RefCell<Seeded>, RefCell<Vec<(usize, usize)>>) {
+    (RefCell::new(Seeded(seed)), RefCell::new(Vec::new()))
+}
+
+/// `stages::sample` as it was before the reservoir was taken a document at a time: the loop
+/// that fills the reservoir from the input, replaces slots at random, and shuffles it.
+fn loop_sample(
+    input: Vec<Document>,
+    size: usize,
+    below: &mut dyn FnMut(usize) -> usize,
+) -> Vec<Document> {
+    if size == 0 {
+        return Vec::new();
+    }
+    let mut reservoir: Vec<Document> = Vec::with_capacity(size.min(input.len()));
+    for (seen, doc) in input.into_iter().enumerate() {
+        if seen < size {
+            reservoir.push(doc);
+        } else {
+            let at = below(seen + 1);
+            if at < size {
+                reservoir[at] = doc;
+            }
+        }
+    }
+    for i in (1..reservoir.len()).rev() {
+        reservoir.swap(i, below(i + 1));
+    }
+    reservoir
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1500, ..ProptestConfig::default() })]
+
+    /// The reservoir asks `below` for the same positions, in the same order, as the loop did,
+    /// whether it is driven by `stages::sample` over the whole input or by a chain a document
+    /// at a time, and answers the same sample: every seeded test keeps its numbers.
+    #[test]
+    fn the_reservoir_draws_the_positions_the_loop_drew(
+        n in 0usize..40,
+        size in 0usize..14,
+        seed in any::<u64>(),
+    ) {
+        let docs: Vec<Document> = (0..n as i32).map(|id| doc! { "_id": id }).collect();
+        let (source, log) = logged(seed);
+        let mut below = |n| { let at = source.borrow_mut().below(n); log.borrow_mut().push((n, at)); at };
+        let want = loop_sample(docs.clone(), size, &mut below);
+        let want_log = log.borrow().clone();
+        // A draw for each document past the first `size`, and one for each step of the shuffle.
+        let drawn = if size == 0 { 0 } else { n.saturating_sub(size) + want.len().saturating_sub(1) };
+        prop_assert_eq!(want_log.len(), drawn);
+
+        let (source, log) = logged(seed);
+        let mut below = |n| { let at = source.borrow_mut().below(n); log.borrow_mut().push((n, at)); at };
+        let got = stages::sample(docs.clone(), size, &Limits::default(), &mut below).unwrap();
+        prop_assert_eq!(&got, &want);
+        prop_assert_eq!(&*log.borrow(), &want_log);
+
+        // The chain, a document at a time: the draws for the documents past the first `size`
+        // are made as they arrive and the shuffle's when the input ends.
+        let (source, log) = logged(seed);
+        let counting = || -> Box<dyn FnMut(usize) -> usize + '_> {
+            Box::new(|n| { let at = source.borrow_mut().below(n); log.borrow_mut().push((n, at)); at })
+        };
+        let stages = [Stage::Sample(size)];
+        let limits = Limits::default();
+        let never = |_: &Stage, _: Vec<Document>, _: Option<Lease>| -> Result<Vec<Document>, Error> {
+            panic!("a $sample is a reservoir, not a stage run by the runner")
+        };
+        let mut chain = pipeline::build_with(&stages, &never, &limits, &[], &counting);
+        for doc in &docs {
+            prop_assert_eq!(chain.push(doc.clone()).unwrap(), Flow::More);
+        }
+        let before_the_end = log.borrow().len();
+        let expected = if size == 0 { 0 } else { n.saturating_sub(size) };
+        prop_assert_eq!(before_the_end, expected, "a draw for each document past the first {}", size);
+        let got = chain.finish().unwrap();
+        prop_assert_eq!(&got, &want);
+        prop_assert_eq!(&*log.borrow(), &want_log);
     }
 }
 

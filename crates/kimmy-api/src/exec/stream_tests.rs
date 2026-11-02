@@ -330,7 +330,8 @@ fn a_pipeline_of_more_than_a_thousand_stages_is_a_400_that_names_the_count_and_t
 }
 
 #[test]
-fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_a_few_groups_or_a_heap() {
+fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_groups_a_heap_or_a_sample()
+{
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, padded(40, 10_000));
     let all = held_docs_bytes(&padded(40, 10_000));
@@ -370,6 +371,15 @@ fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_a_few_gr
             json!([{"n": 40, "m": 1}]),
         ),
     ];
+    // A `$sample` holds its sample and not the collection: its size is what it answers.
+    let limits = capped(cap);
+    let sampled = run(&state, json!([{"$sample": {"size": 4}}]), limits.clone()).unwrap();
+    assert_eq!(sampled["count"], 4);
+    let mut chosen = ids(&sampled);
+    chosen.sort_unstable();
+    chosen.dedup();
+    assert_eq!(chosen.len(), 4, "four different documents of the forty");
+    assert_eq!(limits.buffer.used(), 0);
     for (pipeline, answer) in cases {
         let limits = capped(cap);
         let ok = run(&state, pipeline.clone(), limits.clone());

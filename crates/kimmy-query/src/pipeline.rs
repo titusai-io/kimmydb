@@ -182,6 +182,7 @@ pub fn streams_source(stages: &[Stage]) -> bool {
                     | Stage::Group { .. }
                     | Stage::Bucket { .. }
                     | Stage::SortByCount(_)
+                    | Stage::Sample(_)
             )
     }) || matches!(
         stages,
@@ -225,7 +226,28 @@ pub fn build<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, true)
+    build_by(stages, run, limits, vars, true, &system_below)
+}
+
+/// A source of random positions for each `$sample` of a chain ([`stages::Below`]): a function
+/// that makes one.
+pub type BelowSource<'a> = &'a dyn Fn() -> Box<dyn FnMut(usize) -> usize + 'a>;
+
+/// The positions the system draws ([`stages::system_below`]).
+fn system_below<'a>() -> Box<dyn FnMut(usize) -> usize + 'a> {
+    Box::new(stages::system_below())
+}
+
+/// [`build`], with the positions a `$sample` draws given by `below` and not by the system, so
+/// that a test can script them.
+pub fn build_with<'a, E: From<Error> + 'a>(
+    stages: &'a [Stage],
+    run: Runner<'a, E>,
+    limits: &'a Limits,
+    vars: &'a [Binding<'a>],
+    below: BelowSource<'a>,
+) -> Chain<'a, E> {
+    build_by(stages, run, limits, vars, true, below)
 }
 
 /// [`build`] with every stage a [`Barrier`], as the chain was first built (ADR-270, P0): it
@@ -237,7 +259,7 @@ pub fn build_barriers<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, false)
+    build_by(stages, run, limits, vars, false, &system_below)
 }
 
 /// [`build`] when `streaming`, and [`build_barriers`] when not.
@@ -247,6 +269,7 @@ fn build_by<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
     streaming: bool,
+    below: BelowSource<'a>,
 ) -> Chain<'a, E> {
     let last = stages.last().map_or("the source", Stage::name);
     let out = Rc::new(RefCell::new(Collected::new("the output of the pipeline", last, limits)));
@@ -254,7 +277,8 @@ fn build_by<'a, E: From<Error> + 'a>(
     let mut end = stages.len();
     while end > 0 {
         // The stages that hold their state and not their input end here.
-        if let Some(fusion) = streaming.then(|| fuse(&stages[..end], vars, limits)).flatten() {
+        if let Some(fusion) = streaming.then(|| fuse(&stages[..end], vars, limits, below)).flatten()
+        {
             let held = limits.buffer.lease(state_of(fusion.name));
             head = Box::new(Fused {
                 name: fusion.name,
@@ -692,6 +716,33 @@ impl State for Heap<'_> {
     }
 }
 
+/// `$sample`: the reservoir of the sample, and the positions it draws.
+struct Sampling<'a> {
+    reservoir: stages::Reservoir,
+    below: Box<dyn FnMut(usize) -> usize + 'a>,
+    limits: &'a Limits,
+    ticker: Ticker,
+}
+
+impl State for Sampling<'_> {
+    fn add(&mut self, doc: Document, held: &mut Lease) -> Result<(), Error> {
+        self.ticker.tick()?;
+        let Some(slot) = self.reservoir.place(&mut *self.below) else { return Ok(()) };
+        if slot == stages::Slot::Fill {
+            aggregate::check_limit("$sample", self.reservoir.len() + 1, self.limits)?;
+        }
+        held.charge(held_bytes(&doc))?;
+        if let Some(turned_out) = self.reservoir.put(slot, doc) {
+            held.release(held_bytes(&turned_out));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<Vec<Document>, Error> {
+        self.reservoir.finish(&mut *self.below)
+    }
+}
+
 impl State for aggregate::GroupState<'_> {
     fn add(&mut self, doc: Document, held: &mut Lease) -> Result<(), Error> {
         aggregate::GroupState::add(self, &doc, held)
@@ -724,11 +775,12 @@ fn heap_len(stages: &[Stage]) -> Option<usize> {
 
 /// The stages at the end of `stages` that hold a state and not their input, if there are
 /// any: `$count` and the groups hold a counter or their buckets, `$sort` with a `$limit` a heap
-/// of the first documents.
+/// of the first documents, and `$sample` its reservoir.
 fn fuse<'a>(
     stages: &'a [Stage],
     vars: &'a [Binding<'a>],
     limits: &'a Limits,
+    below: BelowSource<'a>,
 ) -> Option<Fusion<'a>> {
     let state: Box<dyn State + 'a> = match stages {
         [.., Stage::Sort(keys), Stage::Skip(skip), Stage::Limit(limit)] => {
@@ -746,6 +798,12 @@ fn fuse<'a>(
             });
         }
         [.., Stage::Count(field)] => Box::new(Counter { field, seen: 0, ticker: Ticker::new() }),
+        [.., Stage::Sample(size)] => Box::new(Sampling {
+            reservoir: stages::Reservoir::new(*size),
+            below: below(),
+            limits,
+            ticker: Ticker::new(),
+        }),
         [.., stage @ (Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_))] => {
             Box::new(aggregate::GroupState::new(stage, limits, vars)?)
         }
@@ -912,16 +970,26 @@ mod tests {
     }
 
     /// A runner that records which stage ran on which input, and passes the input through
-    /// but for `$sample`, which keeps the first `n`. It stands in for stages that block.
+    /// but for `$bucketAuto`, which keeps the first `n` buckets. It stands in for stages that block.
     fn recording(
         calls: &Calls,
     ) -> impl Fn(&Stage, Vec<Document>, Option<Lease>) -> Result<Vec<Document>, Error> {
         move |stage, input, _| {
             calls.borrow_mut().push((stage.name(), ids(&input)));
             Ok(match stage {
-                Stage::Sample(n) => input.into_iter().take(*n).collect(),
+                Stage::BucketAuto { buckets, .. } => input.into_iter().take(*buckets).collect(),
                 _ => input,
             })
+        }
+    }
+
+    /// A stage that blocks and that nothing here holds a state for, which the recording runner
+    /// answers the first `n` of its input for (`$bucketAuto`).
+    fn blocker(n: usize) -> Stage {
+        Stage::BucketAuto {
+            group_by: crate::expr::Expr::Literal(Bson::Null),
+            buckets: n,
+            fields: Vec::new(),
         }
     }
 
@@ -932,7 +1000,7 @@ mod tests {
 
     /// Three stages that block.
     fn pipeline() -> Vec<Stage> {
-        vec![Stage::Sample(3), Stage::Sample(2), sort()]
+        vec![blocker(3), blocker(2), sort()]
     }
 
     fn parsed(specs: &[Document]) -> Vec<Stage> {
@@ -964,7 +1032,11 @@ mod tests {
         assert_eq!(ids(&out), [1, 2]);
         assert_eq!(
             *calls.borrow(),
-            [("$sample", vec![1, 2, 3, 4]), ("$sample", vec![1, 2, 3]), ("$sort", vec![1, 2])]
+            [
+                ("$bucketAuto", vec![1, 2, 3, 4]),
+                ("$bucketAuto", vec![1, 2, 3]),
+                ("$sort", vec![1, 2])
+            ]
         );
     }
 
@@ -987,7 +1059,7 @@ mod tests {
     fn documents_pushed_one_by_one_and_all_at_once_arrive_in_order() {
         let calls = Calls::default();
         let run = recording(&calls);
-        let stages = [Stage::Sample(10)];
+        let stages = [blocker(10)];
         let limits = Limits::default();
         let mut chain = build(&stages, &run, &limits, &[]);
         let _ = chain.push(doc! {"_id": 5}).unwrap();
@@ -1008,7 +1080,7 @@ mod tests {
             assert!(arrived.is_none(), "a Vec pushed whole was charged on arrival");
             Ok::<_, Error>(input)
         };
-        let stages = [Stage::Sample(5), Stage::Sample(10)];
+        let stages = [blocker(5), blocker(10)];
         let limits = Limits::default();
         let mut chain = build(&stages, &run, &limits, &[]);
         let _ = chain.push_all(source).unwrap();
@@ -1022,7 +1094,9 @@ mod tests {
         let run = |stage: &Stage, input: Vec<Document>, _: Option<Lease>| {
             calls.borrow_mut().push((stage.name(), ids(&input)));
             match stage {
-                Stage::Sample(2) => Err(Error::InvalidQuery("the sample failed".into())),
+                Stage::BucketAuto { buckets: 2, .. } => {
+                    Err(Error::InvalidQuery("the sample failed".into()))
+                }
                 _ => Ok(input),
             }
         };
@@ -1033,7 +1107,7 @@ mod tests {
         let err = chain.finish().unwrap_err();
         assert_eq!(err.to_string(), "invalid query: the sample failed");
         let names: Vec<_> = calls.borrow().iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["$sample", "$sample"]);
+        assert_eq!(names, ["$bucketAuto", "$bucketAuto"]);
     }
 
     #[test]
@@ -1051,7 +1125,7 @@ mod tests {
         let run = |_: &Stage, _: Vec<Document>, _: Option<Lease>| -> Result<Vec<Document>, Mine> {
             Err(Mine::Stage("mine"))
         };
-        let stages = [Stage::Sample(1)];
+        let stages = [blocker(1)];
         let limits = Limits::default();
         let mut chain = build(&stages, &run, &limits, &[]);
         let _ = chain.push_all(docs(&[1])).unwrap();
@@ -1071,7 +1145,7 @@ mod tests {
     #[test]
     fn a_pipeline_of_many_stages_that_block_is_neither_a_deep_call_nor_a_deep_drop() {
         let run = |_: &Stage, input: Vec<Document>, _: Option<Lease>| Ok::<_, Error>(input);
-        let stages = vec![Stage::Sample(10); 300_000];
+        let stages = vec![blocker(10); 300_000];
         let limits = Limits::default();
         let mut chain = build(&stages, &run, &limits, &[]);
         let _ = chain.push_all(docs(&[1, 2])).unwrap();
@@ -1086,9 +1160,8 @@ mod tests {
         // A sink of each kind a hundred thousand times over: the drop of the chain takes the
         // sinks apart one by one whichever kind it meets, and a document goes through the lot.
         let run = |_: &Stage, input: Vec<Document>, _: Option<Lease>| Ok::<_, Error>(input);
-        let stages: Vec<Stage> = (0..200_000)
-            .map(|at| if at % 2 == 0 { Stage::Skip(0) } else { Stage::Sample(10) })
-            .collect();
+        let stages: Vec<Stage> =
+            (0..200_000).map(|at| if at % 2 == 0 { Stage::Skip(0) } else { blocker(10) }).collect();
         let limits = Limits::default();
         let mut chain = build(&stages, &run, &limits, &[]);
         let _ = chain.push_all(docs(&[1, 2])).unwrap();
@@ -1290,8 +1363,8 @@ mod tests {
             (vec![Stage::Limit(0)], true),
             (vec![Stage::Skip(0), Stage::Limit(0)], true),
             // Behind a stage that blocks, a limit does not stop the source.
-            (vec![Stage::Sample(1), Stage::Limit(0)], false),
-            (vec![Stage::Skip(0), Stage::Sample(1), Stage::Limit(0)], false),
+            (vec![blocker(1), Stage::Limit(0)], false),
+            (vec![Stage::Skip(0), blocker(1), Stage::Limit(0)], false),
         ] {
             let chain = build(&stages, &run, &limits, &[]);
             assert_eq!(chain.is_full(), full, "{stages:?}");
@@ -1304,14 +1377,14 @@ mod tests {
         let calls = Calls::default();
         let run = recording(&calls);
         // A run of stages that stream ends with the limit's last document.
-        let stages = [Stage::Skip(1), Stage::Limit(2), Stage::Sample(9)];
+        let stages = [Stage::Skip(1), Stage::Limit(2), blocker(9)];
         let mut chain = build(&stages, &run, &limits, &[]);
         assert_eq!(chain.push(doc! {"_id": 1}).unwrap(), Flow::More);
         assert_eq!(chain.push(doc! {"_id": 2}).unwrap(), Flow::More);
         assert_eq!(chain.push(doc! {"_id": 3}).unwrap(), Flow::Done);
         assert_eq!(ids(&chain.finish().unwrap()), [2, 3]);
         // A stage that blocks wants all of its input, whatever follows it.
-        let stages = [Stage::Sample(9), Stage::Limit(1)];
+        let stages = [blocker(9), Stage::Limit(1)];
         let mut chain = build(&stages, &run, &limits, &[]);
         for id in 1..=5 {
             assert_eq!(chain.push(doc! {"_id": id}).unwrap(), Flow::More);
@@ -1528,7 +1601,7 @@ mod tests {
             *seen.borrow_mut() = Some(arrived.map(|l| l.bytes()));
             Ok::<_, Error>(input)
         };
-        let stages = [Stage::Sample(100)];
+        let stages = [blocker(100)];
         let mut chain = build(&stages, &run, &limits, &[]);
         let _ = chain.push_all(padded(3, 100)).unwrap();
         assert_eq!(limits.buffer.used(), 0);
@@ -1570,7 +1643,7 @@ mod tests {
              the pipeline with an earlier $match"
         );
         // A `Vec` is not counted on arrival: the stage that built it counted it.
-        let stages = [Stage::Sample(100)];
+        let stages = [blocker(100)];
         let mut chain = build(&stages, &run, &limits, &[]);
         let _ = chain.push_all(docs(&[1, 2, 3, 4, 5])).unwrap();
         assert_eq!(chain.finish().unwrap().len(), 5);
@@ -1745,7 +1818,7 @@ mod tests {
         ]);
         for spec in all {
             let stages = parsed(std::slice::from_ref(&spec));
-            let fused = fuse(&stages, &[], &Limits::default()).is_some();
+            let fused = fuse(&stages, &[], &Limits::default(), &system_below).is_some();
             assert_eq!(streams_source(&stages), fused || streams(&stages[0]), "{spec}");
         }
         assert!(!streams_source(&[]));
@@ -2010,5 +2083,81 @@ mod tests {
         assert_eq!(limits.buffer.used(), seen[2]);
         assert_eq!(ids(&chain.finish().unwrap()), [0, 1, 2]);
         assert_eq!(limits.buffer.used(), 0);
+    }
+
+    #[test]
+    fn a_sample_is_a_reservoir_of_its_size_and_never_reaches_the_runner() {
+        let limits = Limits::default();
+        let stages = parsed(&[doc! {"$sample": {"size": 4}}]);
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        for doc in grouped(50, 10) {
+            assert_eq!(chain.push(doc).unwrap(), Flow::More, "never Done");
+        }
+        let out = chain.finish().unwrap();
+        assert_eq!(out.len(), 4);
+        let mut seen = ids(&out);
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "four different documents of the fifty");
+        // A size past the input is the input, shuffled; a size of 0 is nothing.
+        for (size, len) in [(80, 50), (0, 0)] {
+            let stages = parsed(&[doc! {"$sample": {"size": size}}]);
+            let mut chain = build(&stages, &unused, &limits, &[]);
+            let _ = chain.push_all(grouped(50, 10)).unwrap();
+            assert_eq!(chain.finish().unwrap().len(), len, "size {size}");
+        }
+    }
+
+    #[test]
+    fn the_reservoir_of_a_sample_is_charged_as_it_fills_and_turns_out_what_it_replaces() {
+        let one = held_docs_bytes(&grouped(1, 300));
+        let limits = Limits { buffer: BufferBudget::new(usize::MAX / 2), ..Limits::default() };
+        let stages = parsed(&[doc! {"$sample": {"size": 3}}]);
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        let mut seen = Vec::new();
+        for doc in grouped(200, 300) {
+            let _ = chain.push(doc).unwrap();
+            seen.push(limits.buffer.used());
+        }
+        // Three documents of 300 bytes and no more, though the input is two hundred.
+        assert!(seen[0] >= one && seen[0] < 2 * one, "{seen:?}");
+        assert!(seen[2] >= 3 * one && seen[2] < 4 * one, "{seen:?}");
+        let most = *seen.iter().max().unwrap();
+        assert!(most < 4 * one, "never more than the three it keeps: {most}");
+        // A document that replaces another is charged and the other given back, so the sizes
+        // stay within a few bytes of each other (the ids differ in width).
+        assert!(seen[3..].iter().all(|&used| used.abs_diff(seen[2]) < one / 4), "{seen:?}");
+        assert_eq!(chain.finish().unwrap().len(), 3);
+        assert_eq!(limits.buffer.used(), 0, "given back at the finish");
+    }
+
+    #[test]
+    fn the_reservoir_of_a_sample_is_refused_at_the_byte_and_at_the_pipeline_limit() {
+        let one = held_docs_bytes(&grouped(1, 300));
+        let stages = parsed(&[doc! {"$sample": {"size": 10}}]);
+        // Room for three of the ten it would keep: refused as the fourth arrives.
+        let limits = Limits { buffer: BufferBudget::new(3 * one + one / 2), ..Limits::default() };
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        let err =
+            grouped(10, 300).into_iter().find_map(|doc| chain.push(doc).err()).expect("refused");
+        assert!(
+            matches!(&err, Error::ValueTooLarge { what: "the reservoir of $sample", .. }),
+            "{err:?}"
+        );
+        drop(chain);
+        assert_eq!(limits.buffer.used(), 0);
+        // And a sample larger than the documents the pipeline may hold is refused when the
+        // reservoir would hold more, which is not when it is asked for.
+        let limits = Limits { max_documents: 3, ..Limits::default() };
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        for doc in grouped(3, 10) {
+            let _ = chain.push(doc).unwrap();
+        }
+        let err = chain.push(grouped(4, 10).remove(3)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid query: $sample produced 4 documents, over the pipeline limit of 3. Narrow \
+             the pipeline with an earlier $match"
+        );
     }
 }

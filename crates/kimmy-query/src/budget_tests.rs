@@ -1870,3 +1870,37 @@ fn the_heap_of_a_sort_holds_the_documents_it_keeps_and_not_the_input() {
     drop(chain);
     assert_eq!((limits.buffer.used(), pool.used()), (0, 0), "gives it all back when refused");
 }
+
+#[test]
+fn the_reservoir_of_a_sample_holds_the_documents_it_keeps_and_gives_them_back() {
+    let input = padded(200, 300);
+    let pool = MemoryPool::new(1 << 30);
+    let limits = pooled(1 << 30, &pool);
+    let stages = aggregate::parse(&[doc! {"$sample": {"size": 5}}]).unwrap();
+    let one = {
+        let mut chain = chain_of(&stages, &limits);
+        let _ = chain.push(input[0].clone()).unwrap();
+        limits.buffer.used()
+    };
+    // Room for the five it keeps and nothing else: two hundred documents go through it, the
+    // ones that replace another are charged and the ones they replace given back one for one.
+    let limits = pooled(6 * one, &pool);
+    let mut chain = chain_of(&stages, &limits);
+    let mut most = 0;
+    for doc in &input {
+        let _ = chain.push(doc.clone()).unwrap();
+        most = most.max(limits.buffer.used());
+        assert_eq!(pool.used(), limits.buffer.used());
+    }
+    assert!(most > 4 * one && most < 6 * one, "held {most}, a document is {one}");
+    assert_eq!(chain.finish().unwrap().len(), 5);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
+    // One document less of room and the sixth is refused at its byte.
+    let limits = pooled(4 * one + one / 2, &pool);
+    let mut chain = chain_of(&stages, &limits);
+    let err = input.iter().find_map(|doc| chain.push(doc.clone()).err()).expect("refused");
+    let Error::ValueTooLarge { what, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!((*what, *max), ("the reservoir of $sample", 4 * one + one / 2));
+    drop(chain);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0), "gives it all back when refused");
+}
