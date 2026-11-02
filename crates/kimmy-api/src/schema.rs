@@ -84,6 +84,8 @@ pub fn describe_collection(
     // The sample stops at `limit`, but the total is every document decoded,
     // so the two run as one walk off the worker (ADR-153).
     let total = kimmy_storage::blocking(|| {
+        // Both walks tick the request's deadline (ADR-266), which this scope sets.
+        let _deadline = crate::limits::deadline_scope();
         state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_, doc| {
             observe_document(&doc, &mut fields);
             sampled += 1;

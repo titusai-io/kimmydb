@@ -223,6 +223,20 @@ fn find_and_count_are_cut_at_a_passed_deadline_and_work_with_time_left() {
 }
 
 #[test]
+fn describe_collection_is_cut_at_a_passed_deadline_and_works_with_time_left() {
+    // The sample and the document count both walk the collection (review q8d3, m2).
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_data(&dir);
+    let describe =
+        || crate::schema::describe_collection(&state, &root(), "app", "orders", None, false);
+    let late = in_a_request(PAST, describe);
+    assert!(is_the_timeout(&late), "{late:?}");
+    let body = in_a_request(PLENTY, describe).unwrap();
+    assert_eq!(body["documentCount"], 6);
+    assert!(!Deadline::is_set(), "no deadline outlives the call that set it");
+}
+
+#[test]
 fn a_primary_key_read_of_many_ids_is_cut_too() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with_data(&dir);
