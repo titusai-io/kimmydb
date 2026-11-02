@@ -166,6 +166,10 @@ fn pi_constant() -> &'static Mag {
 #[path = "trig_tests.rs"]
 mod trig_tests;
 
+#[cfg(test)]
+#[path = "trig_hard_tests.rs"]
+mod trig_hard_tests;
+
 /// The scale the series of `sin` and `cos` run at, once the operand is reduced: the standard
 /// scale and a limb. The reduction leaves an absolute error of about `10^-115`, and a result
 /// is never below about `10^-40` (the operand is a 34-digit decimal), so 133 places keep
