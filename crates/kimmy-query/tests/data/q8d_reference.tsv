@@ -1,0 +1,1572 @@
+$sin	null	null
+$sin	missing	null
+$sin	i0	d0.0
+$sin	i1	d0.8414709848078965
+$sin	i2	d0.9092974268256817
+$sin	i-1	d-0.8414709848078965
+$sin	l1	d0.8414709848078965
+$sin	l2	d0.9092974268256817
+$sin	d0	d0.0
+$sin	d-0	d-0.0
+$sin	d0.5	d0.479425538604203
+$sin	d-0.5	d-0.479425538604203
+$sin	d1	d0.8414709848078965
+$sin	d-1	d-0.8414709848078965
+$sin	d2	d0.9092974268256817
+$sin	d1.5	d0.9974949866040544
+$sin	d10	d-0.5440211108893698
+$sin	dNaN	dNaN
+$sin	dInfinity	Ecannot apply $sin to inf, value must be in (-inf,inf)
+$sin	d-Infinity	Ecannot apply $sin to -inf, value must be in (-inf,inf)
+$sin	D0	D0
+$sin	D0.5	D0.4794255386042030002732879352155714
+$sin	D1	D0.8414709848078965066525023216302991
+$sin	D2	D0.9092974268256816953960198659117449
+$sin	D-1	D-0.8414709848078965066525023216302991
+$sin	D-0.5	D-0.4794255386042030002732879352155714
+$sin	DNaN	DNaN
+$sin	DInfinity	Ecannot apply $sin to Infinity, value must be in (-inf,inf)
+$sin	D-Infinity	Ecannot apply $sin to -Infinity, value must be in (-inf,inf)
+$sin	D1.5	D0.9974949866040544309417233711414873
+$sin	sabc	E$sin only supports numeric types, not string
+$sin	arr	E$sin only supports numeric types, not array
+$sin	bool	E$sin only supports numeric types, not bool
+$sin	date0	E$sin only supports numeric types, not date
+$sin	obj	E$sin only supports numeric types, not object
+$cos	null	null
+$cos	missing	null
+$cos	i0	d1.0
+$cos	i1	d0.5403023058681398
+$cos	i2	d-0.4161468365471424
+$cos	i-1	d0.5403023058681398
+$cos	l1	d0.5403023058681398
+$cos	l2	d-0.4161468365471424
+$cos	d0	d1.0
+$cos	d-0	d1.0
+$cos	d0.5	d0.8775825618903728
+$cos	d-0.5	d0.8775825618903728
+$cos	d1	d0.5403023058681398
+$cos	d-1	d0.5403023058681398
+$cos	d2	d-0.4161468365471424
+$cos	d1.5	d0.0707372016677029
+$cos	d10	d-0.8390715290764524
+$cos	dNaN	dNaN
+$cos	dInfinity	Ecannot apply $cos to inf, value must be in (-inf,inf)
+$cos	d-Infinity	Ecannot apply $cos to -inf, value must be in (-inf,inf)
+$cos	D0	D1.000000000000000000000000000000000
+$cos	D0.5	D0.8775825618903727161162815826038297
+$cos	D1	D0.5403023058681397174009366074429766
+$cos	D2	D-0.4161468365471423869975682295007621
+$cos	D-1	D0.5403023058681397174009366074429766
+$cos	D-0.5	D0.8775825618903727161162815826038297
+$cos	DNaN	DNaN
+$cos	DInfinity	Ecannot apply $cos to Infinity, value must be in (-inf,inf)
+$cos	D-Infinity	Ecannot apply $cos to -Infinity, value must be in (-inf,inf)
+$cos	D1.5	D0.07073720166770291008818985143426870
+$cos	sabc	E$cos only supports numeric types, not string
+$cos	arr	E$cos only supports numeric types, not array
+$cos	bool	E$cos only supports numeric types, not bool
+$cos	date0	E$cos only supports numeric types, not date
+$cos	obj	E$cos only supports numeric types, not object
+$tan	null	null
+$tan	missing	null
+$tan	i0	d0.0
+$tan	i1	d1.5574077246549023
+$tan	i2	d-2.185039863261519
+$tan	i-1	d-1.5574077246549023
+$tan	l1	d1.5574077246549023
+$tan	l2	d-2.185039863261519
+$tan	d0	d0.0
+$tan	d-0	d-0.0
+$tan	d0.5	d0.5463024898437905
+$tan	d-0.5	d-0.5463024898437905
+$tan	d1	d1.5574077246549023
+$tan	d-1	d-1.5574077246549023
+$tan	d2	d-2.185039863261519
+$tan	d1.5	d14.101419947171719
+$tan	d10	d0.6483608274590866
+$tan	dNaN	dNaN
+$tan	dInfinity	Ecannot apply $tan to inf, value must be in (-inf,inf)
+$tan	d-Infinity	Ecannot apply $tan to -inf, value must be in (-inf,inf)
+$tan	D0	D0E-40
+$tan	D0.5	D0.5463024898437905132551794657802854
+$tan	D1	D1.557407724654902230506974807458360
+$tan	D2	D-2.185039863261518991643306102313683
+$tan	D-1	D-1.557407724654902230506974807458360
+$tan	D-0.5	D-0.5463024898437905132551794657802854
+$tan	DNaN	DNaN
+$tan	DInfinity	Ecannot apply $tan to Infinity, value must be in (-inf,inf)
+$tan	D-Infinity	Ecannot apply $tan to -Infinity, value must be in (-inf,inf)
+$tan	D1.5	D14.10141994717171938764608365198776
+$tan	sabc	E$tan only supports numeric types, not string
+$tan	arr	E$tan only supports numeric types, not array
+$tan	bool	E$tan only supports numeric types, not bool
+$tan	date0	E$tan only supports numeric types, not date
+$tan	obj	E$tan only supports numeric types, not object
+$asin	null	null
+$asin	missing	null
+$asin	i0	d0.0
+$asin	i1	d1.5707963267948966
+$asin	i2	Ecannot apply $asin to 2, value must be in [-1,1]
+$asin	i-1	d-1.5707963267948966
+$asin	l1	d1.5707963267948966
+$asin	l2	Ecannot apply $asin to 2, value must be in [-1,1]
+$asin	d0	d0.0
+$asin	d-0	d-0.0
+$asin	d0.5	d0.5235987755982989
+$asin	d-0.5	d-0.5235987755982989
+$asin	d1	d1.5707963267948966
+$asin	d-1	d-1.5707963267948966
+$asin	d2	Ecannot apply $asin to 2, value must be in [-1,1]
+$asin	d1.5	Ecannot apply $asin to 1.5, value must be in [-1,1]
+$asin	d10	Ecannot apply $asin to 10, value must be in [-1,1]
+$asin	dNaN	dNaN
+$asin	dInfinity	Ecannot apply $asin to inf, value must be in [-1,1]
+$asin	d-Infinity	Ecannot apply $asin to -inf, value must be in [-1,1]
+$asin	D0	D0E-40
+$asin	D0.5	D0.5235987755982988730771072305465838
+$asin	D1	D1.570796326794896619231321691639751
+$asin	D2	Ecannot apply $asin to 2, value must be in [-1,1]
+$asin	D-1	D-1.570796326794896619231321691639751
+$asin	D-0.5	D-0.5235987755982988730771072305465838
+$asin	DNaN	DNaN
+$asin	DInfinity	Ecannot apply $asin to Infinity, value must be in [-1,1]
+$asin	D-Infinity	Ecannot apply $asin to -Infinity, value must be in [-1,1]
+$asin	D1.5	Ecannot apply $asin to 1.5, value must be in [-1,1]
+$asin	sabc	E$asin only supports numeric types, not string
+$asin	arr	E$asin only supports numeric types, not array
+$asin	bool	E$asin only supports numeric types, not bool
+$asin	date0	E$asin only supports numeric types, not date
+$asin	obj	E$asin only supports numeric types, not object
+$acos	null	null
+$acos	missing	null
+$acos	i0	d1.5707963267948966
+$acos	i1	d0.0
+$acos	i2	Ecannot apply $acos to 2, value must be in [-1,1]
+$acos	i-1	d3.141592653589793
+$acos	l1	d0.0
+$acos	l2	Ecannot apply $acos to 2, value must be in [-1,1]
+$acos	d0	d1.5707963267948966
+$acos	d-0	d1.5707963267948966
+$acos	d0.5	d1.0471975511965979
+$acos	d-0.5	d2.0943951023931957
+$acos	d1	d0.0
+$acos	d-1	d3.141592653589793
+$acos	d2	Ecannot apply $acos to 2, value must be in [-1,1]
+$acos	d1.5	Ecannot apply $acos to 1.5, value must be in [-1,1]
+$acos	d10	Ecannot apply $acos to 10, value must be in [-1,1]
+$acos	dNaN	dNaN
+$acos	dInfinity	Ecannot apply $acos to inf, value must be in [-1,1]
+$acos	d-Infinity	Ecannot apply $acos to -inf, value must be in [-1,1]
+$acos	D0	D1.570796326794896619231321691639751
+$acos	D0.5	D1.047197551196597746154214461093168
+$acos	D1	D0E-6176
+$acos	D2	Ecannot apply $acos to 2, value must be in [-1,1]
+$acos	D-1	D3.141592653589793238462643383279503
+$acos	D-0.5	D2.094395102393195492308428922186335
+$acos	DNaN	DNaN
+$acos	DInfinity	Ecannot apply $acos to Infinity, value must be in [-1,1]
+$acos	D-Infinity	Ecannot apply $acos to -Infinity, value must be in [-1,1]
+$acos	D1.5	Ecannot apply $acos to 1.5, value must be in [-1,1]
+$acos	sabc	E$acos only supports numeric types, not string
+$acos	arr	E$acos only supports numeric types, not array
+$acos	bool	E$acos only supports numeric types, not bool
+$acos	date0	E$acos only supports numeric types, not date
+$acos	obj	E$acos only supports numeric types, not object
+$atan	null	null
+$atan	missing	null
+$atan	i0	d0.0
+$atan	i1	d0.7853981633974483
+$atan	i2	d1.1071487177940904
+$atan	i-1	d-0.7853981633974483
+$atan	l1	d0.7853981633974483
+$atan	l2	d1.1071487177940904
+$atan	d0	d0.0
+$atan	d-0	d-0.0
+$atan	d0.5	d0.4636476090008061
+$atan	d-0.5	d-0.4636476090008061
+$atan	d1	d0.7853981633974483
+$atan	d-1	d-0.7853981633974483
+$atan	d2	d1.1071487177940904
+$atan	d1.5	d0.982793723247329
+$atan	d10	d1.4711276743037347
+$atan	dNaN	dNaN
+$atan	dInfinity	d1.5707963267948966
+$atan	d-Infinity	d-1.5707963267948966
+$atan	D0	D0
+$atan	D0.5	D0.4636476090008061162142562314612144
+$atan	D1	D0.7853981633974483096156608458198757
+$atan	D2	D1.107148717794090503017065460178537
+$atan	D-1	D-0.7853981633974483096156608458198757
+$atan	D-0.5	D-0.4636476090008061162142562314612144
+$atan	DNaN	DNaN
+$atan	DInfinity	D1.570796326794896619231321691639751
+$atan	D-Infinity	D-1.570796326794896619231321691639751
+$atan	D1.5	D0.9827937232473290679857106110146660
+$atan	sabc	E$atan only supports numeric types, not string
+$atan	arr	E$atan only supports numeric types, not array
+$atan	bool	E$atan only supports numeric types, not bool
+$atan	date0	E$atan only supports numeric types, not date
+$atan	obj	E$atan only supports numeric types, not object
+$sinh	null	null
+$sinh	missing	null
+$sinh	i0	d0.0
+$sinh	i1	d1.1752011936438014
+$sinh	i2	d3.626860407847019
+$sinh	i-1	d-1.1752011936438014
+$sinh	l1	d1.1752011936438014
+$sinh	l2	d3.626860407847019
+$sinh	d0	d0.0
+$sinh	d-0	d-0.0
+$sinh	d0.5	d0.5210953054937474
+$sinh	d-0.5	d-0.5210953054937474
+$sinh	d1	d1.1752011936438014
+$sinh	d-1	d-1.1752011936438014
+$sinh	d2	d3.626860407847019
+$sinh	d1.5	d2.1292794550948173
+$sinh	d10	d11013.232874703393
+$sinh	dNaN	dNaN
+$sinh	dInfinity	dInfinity
+$sinh	d-Infinity	d-Infinity
+$sinh	D0	D0E-40
+$sinh	D0.5	D0.5210953054937473616224256264114915
+$sinh	D1	D1.175201193643801456882381850595601
+$sinh	D2	D3.626860407847018767668213982801262
+$sinh	D-1	D-1.175201193643801456882381850595601
+$sinh	D-0.5	D-0.5210953054937473616224256264114915
+$sinh	DNaN	DNaN
+$sinh	DInfinity	DInfinity
+$sinh	D-Infinity	D-Infinity
+$sinh	D1.5	D2.129279455094817496834387494677632
+$sinh	sabc	E$sinh only supports numeric types, not string
+$sinh	arr	E$sinh only supports numeric types, not array
+$sinh	bool	E$sinh only supports numeric types, not bool
+$sinh	date0	E$sinh only supports numeric types, not date
+$sinh	obj	E$sinh only supports numeric types, not object
+$cosh	null	null
+$cosh	missing	null
+$cosh	i0	d1.0
+$cosh	i1	d1.5430806348152437
+$cosh	i2	d3.7621956910836314
+$cosh	i-1	d1.5430806348152437
+$cosh	l1	d1.5430806348152437
+$cosh	l2	d3.7621956910836314
+$cosh	d0	d1.0
+$cosh	d-0	d1.0
+$cosh	d0.5	d1.1276259652063807
+$cosh	d-0.5	d1.1276259652063807
+$cosh	d1	d1.5430806348152437
+$cosh	d-1	d1.5430806348152437
+$cosh	d2	d3.7621956910836314
+$cosh	d1.5	d2.352409615243247
+$cosh	d10	d11013.232920103324
+$cosh	dNaN	dNaN
+$cosh	dInfinity	dInfinity
+$cosh	d-Infinity	dInfinity
+$cosh	D0	D1.000000000000000000000000000000000
+$cosh	D0.5	D1.127625965206380785226225161402672
+$cosh	D1	D1.543080634815243778477905620757062
+$cosh	D2	D3.762195691083631459562213477773746
+$cosh	D-1	D1.543080634815243778477905620757062
+$cosh	D-0.5	D1.127625965206380785226225161402672
+$cosh	DNaN	DNaN
+$cosh	DInfinity	DInfinity
+$cosh	D-Infinity	DInfinity
+$cosh	D1.5	D2.352409615243247325767667965441644
+$cosh	sabc	E$cosh only supports numeric types, not string
+$cosh	arr	E$cosh only supports numeric types, not array
+$cosh	bool	E$cosh only supports numeric types, not bool
+$cosh	date0	E$cosh only supports numeric types, not date
+$cosh	obj	E$cosh only supports numeric types, not object
+$tanh	null	null
+$tanh	missing	null
+$tanh	i0	d0.0
+$tanh	i1	d0.7615941559557649
+$tanh	i2	d0.9640275800758169
+$tanh	i-1	d-0.7615941559557649
+$tanh	l1	d0.7615941559557649
+$tanh	l2	d0.9640275800758169
+$tanh	d0	d0.0
+$tanh	d-0	d-0.0
+$tanh	d0.5	d0.46211715726000974
+$tanh	d-0.5	d-0.46211715726000974
+$tanh	d1	d0.7615941559557649
+$tanh	d-1	d-0.7615941559557649
+$tanh	d2	d0.9640275800758169
+$tanh	d1.5	d0.9051482536448664
+$tanh	d10	d0.9999999958776927
+$tanh	dNaN	dNaN
+$tanh	dInfinity	d1.0
+$tanh	d-Infinity	d-1.0
+$tanh	D0	D0
+$tanh	D0.5	D0.4621171572600097585023184836436726
+$tanh	D1	D0.7615941559557648881194582826047936
+$tanh	D2	D0.9640275800758168839464137241009232
+$tanh	D-1	D-0.7615941559557648881194582826047936
+$tanh	D-0.5	D-0.4621171572600097585023184836436726
+$tanh	DNaN	DNaN
+$tanh	DInfinity	D1
+$tanh	D-Infinity	D-1
+$tanh	D1.5	D0.9051482536448664382423036964564956
+$tanh	sabc	E$tanh only supports numeric types, not string
+$tanh	arr	E$tanh only supports numeric types, not array
+$tanh	bool	E$tanh only supports numeric types, not bool
+$tanh	date0	E$tanh only supports numeric types, not date
+$tanh	obj	E$tanh only supports numeric types, not object
+$asinh	null	null
+$asinh	missing	null
+$asinh	i0	d0.0
+$asinh	i1	d0.881373587019543
+$asinh	i2	d1.4436354751788103
+$asinh	i-1	d-0.881373587019543
+$asinh	l1	d0.881373587019543
+$asinh	l2	d1.4436354751788103
+$asinh	d0	d0.0
+$asinh	d-0	d-0.0
+$asinh	d0.5	d0.48121182505960347
+$asinh	d-0.5	d-0.48121182505960347
+$asinh	d1	d0.881373587019543
+$asinh	d-1	d-0.881373587019543
+$asinh	d2	d1.4436354751788103
+$asinh	d1.5	d1.1947632172871094
+$asinh	d10	d2.99822295029797
+$asinh	dNaN	dNaN
+$asinh	dInfinity	dInfinity
+$asinh	d-Infinity	d-Infinity
+$asinh	D0	D0E-6176
+$asinh	D0.5	D0.4812118250596034474977589134243684
+$asinh	D1	D0.8813735870195430252326093249797923
+$asinh	D2	D1.443635475178810342493276740273105
+$asinh	D-1	D-0.8813735870195430252326093249797923
+$asinh	D-0.5	D-0.4812118250596034474977589134243684
+$asinh	DNaN	DNaN
+$asinh	DInfinity	DInfinity
+$asinh	D-Infinity	D-Infinity
+$asinh	D1.5	D1.194763217287109304111930828519091
+$asinh	sabc	E$asinh only supports numeric types, not string
+$asinh	arr	E$asinh only supports numeric types, not array
+$asinh	bool	E$asinh only supports numeric types, not bool
+$asinh	date0	E$asinh only supports numeric types, not date
+$asinh	obj	E$asinh only supports numeric types, not object
+$acosh	null	null
+$acosh	missing	null
+$acosh	i0	Ecannot apply $acosh to 0, value must be in [1,inf]
+$acosh	i1	d0.0
+$acosh	i2	d1.3169578969248166
+$acosh	i-1	Ecannot apply $acosh to -1, value must be in [1,inf]
+$acosh	l1	d0.0
+$acosh	l2	d1.3169578969248166
+$acosh	d0	Ecannot apply $acosh to 0, value must be in [1,inf]
+$acosh	d-0	Ecannot apply $acosh to -0, value must be in [1,inf]
+$acosh	d0.5	Ecannot apply $acosh to 0.5, value must be in [1,inf]
+$acosh	d-0.5	Ecannot apply $acosh to -0.5, value must be in [1,inf]
+$acosh	d1	d0.0
+$acosh	d-1	Ecannot apply $acosh to -1, value must be in [1,inf]
+$acosh	d2	d1.3169578969248166
+$acosh	d1.5	d0.9624236501192069
+$acosh	d10	d2.993222846126381
+$acosh	dNaN	dNaN
+$acosh	dInfinity	dInfinity
+$acosh	d-Infinity	Ecannot apply $acosh to -inf, value must be in [1,inf]
+$acosh	D0	Ecannot apply $acosh to 0, value must be in [1,inf]
+$acosh	D0.5	Ecannot apply $acosh to 0.5, value must be in [1,inf]
+$acosh	D1	D0
+$acosh	D2	D1.316957896924816708625046347307968
+$acosh	D-1	Ecannot apply $acosh to -1, value must be in [1,inf]
+$acosh	D-0.5	Ecannot apply $acosh to -0.5, value must be in [1,inf]
+$acosh	DNaN	DNaN
+$acosh	DInfinity	DInfinity
+$acosh	D-Infinity	Ecannot apply $acosh to -Infinity, value must be in [1,inf]
+$acosh	D1.5	D0.9624236501192068949955178268487368
+$acosh	sabc	E$acosh only supports numeric types, not string
+$acosh	arr	E$acosh only supports numeric types, not array
+$acosh	bool	E$acosh only supports numeric types, not bool
+$acosh	date0	E$acosh only supports numeric types, not date
+$acosh	obj	E$acosh only supports numeric types, not object
+$atanh	null	null
+$atanh	missing	null
+$atanh	i0	d0.0
+$atanh	i1	dInfinity
+$atanh	i2	Ecannot apply $atanh to 2, value must be in [-1,1]
+$atanh	i-1	d-Infinity
+$atanh	l1	dInfinity
+$atanh	l2	Ecannot apply $atanh to 2, value must be in [-1,1]
+$atanh	d0	d0.0
+$atanh	d-0	d-0.0
+$atanh	d0.5	d0.5493061443340548
+$atanh	d-0.5	d-0.5493061443340548
+$atanh	d1	dInfinity
+$atanh	d-1	d-Infinity
+$atanh	d2	Ecannot apply $atanh to 2, value must be in [-1,1]
+$atanh	d1.5	Ecannot apply $atanh to 1.5, value must be in [-1,1]
+$atanh	d10	Ecannot apply $atanh to 10, value must be in [-1,1]
+$atanh	dNaN	dNaN
+$atanh	dInfinity	Ecannot apply $atanh to inf, value must be in [-1,1]
+$atanh	d-Infinity	Ecannot apply $atanh to -inf, value must be in [-1,1]
+$atanh	D0	D0E-6176
+$atanh	D0.5	D0.5493061443340548456976226184612628
+$atanh	D1	DInfinity
+$atanh	D2	Ecannot apply $atanh to 2, value must be in [-1,1]
+$atanh	D-1	D-Infinity
+$atanh	D-0.5	D-0.5493061443340548456976226184612628
+$atanh	DNaN	DNaN
+$atanh	DInfinity	Ecannot apply $atanh to Infinity, value must be in [-1,1]
+$atanh	D-Infinity	Ecannot apply $atanh to -Infinity, value must be in [-1,1]
+$atanh	D1.5	Ecannot apply $atanh to 1.5, value must be in [-1,1]
+$atanh	sabc	E$atanh only supports numeric types, not string
+$atanh	arr	E$atanh only supports numeric types, not array
+$atanh	bool	E$atanh only supports numeric types, not bool
+$atanh	date0	E$atanh only supports numeric types, not date
+$atanh	obj	E$atanh only supports numeric types, not object
+$degreesToRadians	null	null
+$degreesToRadians	missing	null
+$degreesToRadians	i0	d0.0
+$degreesToRadians	i1	d0.017453292519943295
+$degreesToRadians	i2	d0.03490658503988659
+$degreesToRadians	i-1	d-0.017453292519943295
+$degreesToRadians	l1	d0.017453292519943295
+$degreesToRadians	l2	d0.03490658503988659
+$degreesToRadians	d0	d0.0
+$degreesToRadians	d-0	d-0.0
+$degreesToRadians	d0.5	d0.008726646259971648
+$degreesToRadians	d-0.5	d-0.008726646259971648
+$degreesToRadians	d1	d0.017453292519943295
+$degreesToRadians	d-1	d-0.017453292519943295
+$degreesToRadians	d2	d0.03490658503988659
+$degreesToRadians	d1.5	d0.026179938779914945
+$degreesToRadians	d10	d0.17453292519943295
+$degreesToRadians	dNaN	dNaN
+$degreesToRadians	dInfinity	dInfinity
+$degreesToRadians	d-Infinity	d-Infinity
+$degreesToRadians	D0	D0E-35
+$degreesToRadians	D0.5	D0.008726646259971647884618453842443065
+$degreesToRadians	D1	D0.01745329251994329576923690768488613
+$degreesToRadians	D2	D0.03490658503988659153847381536977226
+$degreesToRadians	D-1	D-0.01745329251994329576923690768488613
+$degreesToRadians	D-0.5	D-0.008726646259971647884618453842443065
+$degreesToRadians	DNaN	DNaN
+$degreesToRadians	DInfinity	DInfinity
+$degreesToRadians	D-Infinity	D-Infinity
+$degreesToRadians	D1.5	D0.02617993877991494365385536152732920
+$degreesToRadians	sabc	E$degreesToRadians only supports numeric types, not string
+$degreesToRadians	arr	E$degreesToRadians only supports numeric types, not array
+$degreesToRadians	bool	E$degreesToRadians only supports numeric types, not bool
+$degreesToRadians	date0	E$degreesToRadians only supports numeric types, not date
+$degreesToRadians	obj	E$degreesToRadians only supports numeric types, not object
+$radiansToDegrees	null	null
+$radiansToDegrees	missing	null
+$radiansToDegrees	i0	d0.0
+$radiansToDegrees	i1	d57.29577951308232
+$radiansToDegrees	i2	d114.59155902616465
+$radiansToDegrees	i-1	d-57.29577951308232
+$radiansToDegrees	l1	d57.29577951308232
+$radiansToDegrees	l2	d114.59155902616465
+$radiansToDegrees	d0	d0.0
+$radiansToDegrees	d-0	d-0.0
+$radiansToDegrees	d0.5	d28.64788975654116
+$radiansToDegrees	d-0.5	d-28.64788975654116
+$radiansToDegrees	d1	d57.29577951308232
+$radiansToDegrees	d-1	d-57.29577951308232
+$radiansToDegrees	d2	d114.59155902616465
+$radiansToDegrees	d1.5	d85.94366926962348
+$radiansToDegrees	d10	d572.9577951308232
+$radiansToDegrees	dNaN	dNaN
+$radiansToDegrees	dInfinity	dInfinity
+$radiansToDegrees	d-Infinity	d-Infinity
+$radiansToDegrees	D0	D0E-32
+$radiansToDegrees	D0.5	D28.64788975654116043839907740705258
+$radiansToDegrees	D1	D57.29577951308232087679815481410517
+$radiansToDegrees	D2	D114.5915590261646417535963096282103
+$radiansToDegrees	D-1	D-57.29577951308232087679815481410517
+$radiansToDegrees	D-0.5	D-28.64788975654116043839907740705258
+$radiansToDegrees	DNaN	DNaN
+$radiansToDegrees	DInfinity	DInfinity
+$radiansToDegrees	D-Infinity	D-Infinity
+$radiansToDegrees	D1.5	D85.94366926962348131519723222115776
+$radiansToDegrees	sabc	E$radiansToDegrees only supports numeric types, not string
+$radiansToDegrees	arr	E$radiansToDegrees only supports numeric types, not array
+$radiansToDegrees	bool	E$radiansToDegrees only supports numeric types, not bool
+$radiansToDegrees	date0	E$radiansToDegrees only supports numeric types, not date
+$radiansToDegrees	obj	E$radiansToDegrees only supports numeric types, not object
+$atan2	null|null	null
+$atan2	null|missing	null
+$atan2	null|i1	null
+$atan2	null|l2	null
+$atan2	null|d0	null
+$atan2	null|d-0	null
+$atan2	null|d-1	null
+$atan2	null|dNaN	null
+$atan2	null|dInfinity	null
+$atan2	null|d-Infinity	null
+$atan2	null|D0	null
+$atan2	null|D1	null
+$atan2	null|DNaN	null
+$atan2	null|DInfinity	null
+$atan2	null|D-Infinity	null
+$atan2	null|sabc	null
+$atan2	missing|null	null
+$atan2	missing|missing	null
+$atan2	missing|i1	null
+$atan2	missing|l2	null
+$atan2	missing|d0	null
+$atan2	missing|d-0	null
+$atan2	missing|d-1	null
+$atan2	missing|dNaN	null
+$atan2	missing|dInfinity	null
+$atan2	missing|d-Infinity	null
+$atan2	missing|D0	null
+$atan2	missing|D1	null
+$atan2	missing|DNaN	null
+$atan2	missing|DInfinity	null
+$atan2	missing|D-Infinity	null
+$atan2	missing|sabc	null
+$atan2	i1|null	null
+$atan2	i1|missing	null
+$atan2	i1|i1	d0.7853981633974483
+$atan2	i1|l2	d0.4636476090008061
+$atan2	i1|d0	d1.5707963267948966
+$atan2	i1|d-0	d1.5707963267948966
+$atan2	i1|d-1	d2.356194490192345
+$atan2	i1|dNaN	dNaN
+$atan2	i1|dInfinity	d0.0
+$atan2	i1|d-Infinity	d3.141592653589793
+$atan2	i1|D0	D1.570796326794896619231321691639751
+$atan2	i1|D1	D0.7853981633974483096156608458198757
+$atan2	i1|DNaN	DNaN
+$atan2	i1|DInfinity	D0E-6176
+$atan2	i1|D-Infinity	D3.141592653589793238462643383279503
+$atan2	i1|sabc	E$atan2 only supports numeric types, not string
+$atan2	l2|null	null
+$atan2	l2|missing	null
+$atan2	l2|i1	d1.1071487177940904
+$atan2	l2|l2	d0.7853981633974483
+$atan2	l2|d0	d1.5707963267948966
+$atan2	l2|d-0	d1.5707963267948966
+$atan2	l2|d-1	d2.0344439357957027
+$atan2	l2|dNaN	dNaN
+$atan2	l2|dInfinity	d0.0
+$atan2	l2|d-Infinity	d3.141592653589793
+$atan2	l2|D0	D1.570796326794896619231321691639751
+$atan2	l2|D1	D1.107148717794090503017065460178537
+$atan2	l2|DNaN	DNaN
+$atan2	l2|DInfinity	D0E-6176
+$atan2	l2|D-Infinity	D3.141592653589793238462643383279503
+$atan2	l2|sabc	E$atan2 only supports numeric types, not string
+$atan2	d0|null	null
+$atan2	d0|missing	null
+$atan2	d0|i1	d0.0
+$atan2	d0|l2	d0.0
+$atan2	d0|d0	d0.0
+$atan2	d0|d-0	d3.141592653589793
+$atan2	d0|d-1	d3.141592653589793
+$atan2	d0|dNaN	dNaN
+$atan2	d0|dInfinity	d0.0
+$atan2	d0|d-Infinity	d3.141592653589793
+$atan2	d0|D0	D0E-6176
+$atan2	d0|D1	D0E-6176
+$atan2	d0|DNaN	DNaN
+$atan2	d0|DInfinity	D0E-6176
+$atan2	d0|D-Infinity	D3.141592653589793238462643383279503
+$atan2	d0|sabc	E$atan2 only supports numeric types, not string
+$atan2	d-0|null	null
+$atan2	d-0|missing	null
+$atan2	d-0|i1	d-0.0
+$atan2	d-0|l2	d-0.0
+$atan2	d-0|d0	d-0.0
+$atan2	d-0|d-0	d-3.141592653589793
+$atan2	d-0|d-1	d-3.141592653589793
+$atan2	d-0|dNaN	dNaN
+$atan2	d-0|dInfinity	d-0.0
+$atan2	d-0|d-Infinity	d-3.141592653589793
+$atan2	d-0|D0	D-0E-6176
+$atan2	d-0|D1	D-0E-6176
+$atan2	d-0|DNaN	DNaN
+$atan2	d-0|DInfinity	D-0E-6176
+$atan2	d-0|D-Infinity	D-3.141592653589793238462643383279503
+$atan2	d-0|sabc	E$atan2 only supports numeric types, not string
+$atan2	d0.5|null	null
+$atan2	d0.5|missing	null
+$atan2	d0.5|i1	d0.4636476090008061
+$atan2	d0.5|l2	d0.24497866312686414
+$atan2	d0.5|d0	d1.5707963267948966
+$atan2	d0.5|d-0	d1.5707963267948966
+$atan2	d0.5|d-1	d2.677945044588987
+$atan2	d0.5|dNaN	dNaN
+$atan2	d0.5|dInfinity	d0.0
+$atan2	d0.5|d-Infinity	d3.141592653589793
+$atan2	d0.5|D0	D1.570796326794896619231321691639751
+$atan2	d0.5|D1	D0.4636476090008061162142562314612144
+$atan2	d0.5|DNaN	DNaN
+$atan2	d0.5|DInfinity	D0E-6176
+$atan2	d0.5|D-Infinity	D3.141592653589793238462643383279503
+$atan2	d0.5|sabc	E$atan2 only supports numeric types, not string
+$atan2	dNaN|null	null
+$atan2	dNaN|missing	null
+$atan2	dNaN|i1	dNaN
+$atan2	dNaN|l2	dNaN
+$atan2	dNaN|d0	dNaN
+$atan2	dNaN|d-0	dNaN
+$atan2	dNaN|d-1	dNaN
+$atan2	dNaN|dNaN	dNaN
+$atan2	dNaN|dInfinity	dNaN
+$atan2	dNaN|d-Infinity	dNaN
+$atan2	dNaN|D0	DNaN
+$atan2	dNaN|D1	DNaN
+$atan2	dNaN|DNaN	DNaN
+$atan2	dNaN|DInfinity	DNaN
+$atan2	dNaN|D-Infinity	DNaN
+$atan2	dNaN|sabc	E$atan2 only supports numeric types, not string
+$atan2	dInfinity|null	null
+$atan2	dInfinity|missing	null
+$atan2	dInfinity|i1	d1.5707963267948966
+$atan2	dInfinity|l2	d1.5707963267948966
+$atan2	dInfinity|d0	d1.5707963267948966
+$atan2	dInfinity|d-0	d1.5707963267948966
+$atan2	dInfinity|d-1	d1.5707963267948966
+$atan2	dInfinity|dNaN	dNaN
+$atan2	dInfinity|dInfinity	d0.7853981633974483
+$atan2	dInfinity|d-Infinity	d2.356194490192345
+$atan2	dInfinity|D0	D1.570796326794896619231321691639751
+$atan2	dInfinity|D1	D1.570796326794896619231321691639751
+$atan2	dInfinity|DNaN	DNaN
+$atan2	dInfinity|DInfinity	D0.785398163397448309615660845819876
+$atan2	dInfinity|D-Infinity	D2.356194490192344928846982537459627
+$atan2	dInfinity|sabc	E$atan2 only supports numeric types, not string
+$atan2	d-Infinity|null	null
+$atan2	d-Infinity|missing	null
+$atan2	d-Infinity|i1	d-1.5707963267948966
+$atan2	d-Infinity|l2	d-1.5707963267948966
+$atan2	d-Infinity|d0	d-1.5707963267948966
+$atan2	d-Infinity|d-0	d-1.5707963267948966
+$atan2	d-Infinity|d-1	d-1.5707963267948966
+$atan2	d-Infinity|dNaN	dNaN
+$atan2	d-Infinity|dInfinity	d-0.7853981633974483
+$atan2	d-Infinity|d-Infinity	d-2.356194490192345
+$atan2	d-Infinity|D0	D-1.570796326794896619231321691639751
+$atan2	d-Infinity|D1	D-1.570796326794896619231321691639751
+$atan2	d-Infinity|DNaN	DNaN
+$atan2	d-Infinity|DInfinity	D-0.785398163397448309615660845819876
+$atan2	d-Infinity|D-Infinity	D-2.356194490192344928846982537459627
+$atan2	d-Infinity|sabc	E$atan2 only supports numeric types, not string
+$atan2	D0|null	null
+$atan2	D0|missing	null
+$atan2	D0|i1	D0E-6176
+$atan2	D0|l2	D0E-6176
+$atan2	D0|d0	D0E-6176
+$atan2	D0|d-0	D3.141592653589793238462643383279503
+$atan2	D0|d-1	D3.141592653589793238462643383279503
+$atan2	D0|dNaN	DNaN
+$atan2	D0|dInfinity	D0E-6176
+$atan2	D0|d-Infinity	D3.141592653589793238462643383279503
+$atan2	D0|D0	D0E-6176
+$atan2	D0|D1	D0E-6176
+$atan2	D0|DNaN	DNaN
+$atan2	D0|DInfinity	D0E-6176
+$atan2	D0|D-Infinity	D3.141592653589793238462643383279503
+$atan2	D0|sabc	E$atan2 only supports numeric types, not string
+$atan2	D1|null	null
+$atan2	D1|missing	null
+$atan2	D1|i1	D0.7853981633974483096156608458198757
+$atan2	D1|l2	D0.4636476090008061162142562314612144
+$atan2	D1|d0	D1.570796326794896619231321691639751
+$atan2	D1|d-0	D1.570796326794896619231321691639751
+$atan2	D1|d-1	D2.356194490192344928846982537459627
+$atan2	D1|dNaN	DNaN
+$atan2	D1|dInfinity	D0E-6176
+$atan2	D1|d-Infinity	D3.141592653589793238462643383279503
+$atan2	D1|D0	D1.570796326794896619231321691639751
+$atan2	D1|D1	D0.7853981633974483096156608458198757
+$atan2	D1|DNaN	DNaN
+$atan2	D1|DInfinity	D0E-6176
+$atan2	D1|D-Infinity	D3.141592653589793238462643383279503
+$atan2	D1|sabc	E$atan2 only supports numeric types, not string
+$atan2	DNaN|null	null
+$atan2	DNaN|missing	null
+$atan2	DNaN|i1	DNaN
+$atan2	DNaN|l2	DNaN
+$atan2	DNaN|d0	DNaN
+$atan2	DNaN|d-0	DNaN
+$atan2	DNaN|d-1	DNaN
+$atan2	DNaN|dNaN	DNaN
+$atan2	DNaN|dInfinity	DNaN
+$atan2	DNaN|d-Infinity	DNaN
+$atan2	DNaN|D0	DNaN
+$atan2	DNaN|D1	DNaN
+$atan2	DNaN|DNaN	DNaN
+$atan2	DNaN|DInfinity	DNaN
+$atan2	DNaN|D-Infinity	DNaN
+$atan2	DNaN|sabc	E$atan2 only supports numeric types, not string
+$atan2	DInfinity|null	null
+$atan2	DInfinity|missing	null
+$atan2	DInfinity|i1	D1.570796326794896619231321691639751
+$atan2	DInfinity|l2	D1.570796326794896619231321691639751
+$atan2	DInfinity|d0	D1.570796326794896619231321691639751
+$atan2	DInfinity|d-0	D1.570796326794896619231321691639751
+$atan2	DInfinity|d-1	D1.570796326794896619231321691639751
+$atan2	DInfinity|dNaN	DNaN
+$atan2	DInfinity|dInfinity	D0.785398163397448309615660845819876
+$atan2	DInfinity|d-Infinity	D2.356194490192344928846982537459627
+$atan2	DInfinity|D0	D1.570796326794896619231321691639751
+$atan2	DInfinity|D1	D1.570796326794896619231321691639751
+$atan2	DInfinity|DNaN	DNaN
+$atan2	DInfinity|DInfinity	D0.785398163397448309615660845819876
+$atan2	DInfinity|D-Infinity	D2.356194490192344928846982537459627
+$atan2	DInfinity|sabc	E$atan2 only supports numeric types, not string
+$atan2	D-Infinity|null	null
+$atan2	D-Infinity|missing	null
+$atan2	D-Infinity|i1	D-1.570796326794896619231321691639751
+$atan2	D-Infinity|l2	D-1.570796326794896619231321691639751
+$atan2	D-Infinity|d0	D-1.570796326794896619231321691639751
+$atan2	D-Infinity|d-0	D-1.570796326794896619231321691639751
+$atan2	D-Infinity|d-1	D-1.570796326794896619231321691639751
+$atan2	D-Infinity|dNaN	DNaN
+$atan2	D-Infinity|dInfinity	D-0.785398163397448309615660845819876
+$atan2	D-Infinity|d-Infinity	D-2.356194490192344928846982537459627
+$atan2	D-Infinity|D0	D-1.570796326794896619231321691639751
+$atan2	D-Infinity|D1	D-1.570796326794896619231321691639751
+$atan2	D-Infinity|DNaN	DNaN
+$atan2	D-Infinity|DInfinity	D-0.785398163397448309615660845819876
+$atan2	D-Infinity|D-Infinity	D-2.356194490192344928846982537459627
+$atan2	D-Infinity|sabc	E$atan2 only supports numeric types, not string
+$atan2	sabc|null	E$atan2 only supports numeric types, not string
+$atan2	sabc|missing	E$atan2 only supports numeric types, not string
+$atan2	sabc|i1	E$atan2 only supports numeric types, not string
+$atan2	sabc|l2	E$atan2 only supports numeric types, not string
+$atan2	sabc|d0	E$atan2 only supports numeric types, not string
+$atan2	sabc|d-0	E$atan2 only supports numeric types, not string
+$atan2	sabc|d-1	E$atan2 only supports numeric types, not string
+$atan2	sabc|dNaN	E$atan2 only supports numeric types, not string
+$atan2	sabc|dInfinity	E$atan2 only supports numeric types, not string
+$atan2	sabc|d-Infinity	E$atan2 only supports numeric types, not string
+$atan2	sabc|D0	E$atan2 only supports numeric types, not string
+$atan2	sabc|D1	E$atan2 only supports numeric types, not string
+$atan2	sabc|DNaN	E$atan2 only supports numeric types, not string
+$atan2	sabc|DInfinity	E$atan2 only supports numeric types, not string
+$atan2	sabc|D-Infinity	E$atan2 only supports numeric types, not string
+$atan2	sabc|sabc	E$atan2 only supports numeric types, not string
+$log	null|null	null
+$log	null|missing	null
+$log	null|i0	null
+$log	null|i1	null
+$log	null|i2	null
+$log	null|i-1	null
+$log	null|l2	null
+$log	null|d0	null
+$log	null|d0.5	null
+$log	null|d1	null
+$log	null|d2	null
+$log	null|d10	null
+$log	null|d-1	null
+$log	null|dNaN	null
+$log	null|dInfinity	null
+$log	null|d-Infinity	null
+$log	null|D0	null
+$log	null|D1	null
+$log	null|D2	null
+$log	null|D-1	null
+$log	null|D0.5	null
+$log	null|DNaN	null
+$log	null|DInfinity	null
+$log	null|sabc	null
+$log	missing|null	null
+$log	missing|missing	null
+$log	missing|i0	null
+$log	missing|i1	null
+$log	missing|i2	null
+$log	missing|i-1	null
+$log	missing|l2	null
+$log	missing|d0	null
+$log	missing|d0.5	null
+$log	missing|d1	null
+$log	missing|d2	null
+$log	missing|d10	null
+$log	missing|d-1	null
+$log	missing|dNaN	null
+$log	missing|dInfinity	null
+$log	missing|d-Infinity	null
+$log	missing|D0	null
+$log	missing|D1	null
+$log	missing|D2	null
+$log	missing|D-1	null
+$log	missing|D0.5	null
+$log	missing|DNaN	null
+$log	missing|DInfinity	null
+$log	missing|sabc	null
+$log	i1|null	null
+$log	i1|missing	null
+$log	i1|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	i1|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	i1|i2	d0.0
+$log	i1|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	i1|l2	d0.0
+$log	i1|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	i1|d0.5	d-0.0
+$log	i1|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	i1|d2	d0.0
+$log	i1|d10	d0.0
+$log	i1|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	i1|dNaN	dNaN
+$log	i1|dInfinity	d0.0
+$log	i1|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	i1|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	i1|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	i1|D2	D0
+$log	i1|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	i1|D0.5	D0E+1
+$log	i1|DNaN	dNaN
+$log	i1|DInfinity	D0E-6176
+$log	i1|sabc	E$log's base must be numeric, not string
+$log	i2|null	null
+$log	i2|missing	null
+$log	i2|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	i2|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	i2|i2	d1.0
+$log	i2|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	i2|l2	d1.0
+$log	i2|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	i2|d0.5	d-1.0
+$log	i2|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	i2|d2	d1.0
+$log	i2|d10	d0.30102999566398114
+$log	i2|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	i2|dNaN	dNaN
+$log	i2|dInfinity	d0.0
+$log	i2|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	i2|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	i2|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	i2|D2	D1
+$log	i2|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	i2|D0.5	D1.386294361119890618834464242916353
+$log	i2|DNaN	dNaN
+$log	i2|DInfinity	D0E-6176
+$log	i2|sabc	E$log's base must be numeric, not string
+$log	i-1|null	null
+$log	i-1|missing	null
+$log	i-1|i0	E$log's argument must be a positive number, but is -1
+$log	i-1|i1	E$log's argument must be a positive number, but is -1
+$log	i-1|i2	E$log's argument must be a positive number, but is -1
+$log	i-1|i-1	E$log's argument must be a positive number, but is -1
+$log	i-1|l2	E$log's argument must be a positive number, but is -1
+$log	i-1|d0	E$log's argument must be a positive number, but is -1
+$log	i-1|d0.5	E$log's argument must be a positive number, but is -1
+$log	i-1|d1	E$log's argument must be a positive number, but is -1
+$log	i-1|d2	E$log's argument must be a positive number, but is -1
+$log	i-1|d10	E$log's argument must be a positive number, but is -1
+$log	i-1|d-1	E$log's argument must be a positive number, but is -1
+$log	i-1|dNaN	E$log's argument must be a positive number, but is -1
+$log	i-1|dInfinity	E$log's argument must be a positive number, but is -1
+$log	i-1|d-Infinity	E$log's argument must be a positive number, but is -1
+$log	i-1|D0	E$log's argument must be a positive number, but is -1
+$log	i-1|D1	E$log's argument must be a positive number, but is -1
+$log	i-1|D2	E$log's argument must be a positive number, but is -1
+$log	i-1|D-1	E$log's argument must be a positive number, but is -1
+$log	i-1|D0.5	E$log's argument must be a positive number, but is -1
+$log	i-1|DNaN	E$log's argument must be a positive number, but is -1
+$log	i-1|DInfinity	E$log's argument must be a positive number, but is -1
+$log	i-1|sabc	E$log's base must be numeric, not string
+$log	i0|null	null
+$log	i0|missing	null
+$log	i0|i0	E$log's argument must be a positive number, but is 0
+$log	i0|i1	E$log's argument must be a positive number, but is 0
+$log	i0|i2	E$log's argument must be a positive number, but is 0
+$log	i0|i-1	E$log's argument must be a positive number, but is 0
+$log	i0|l2	E$log's argument must be a positive number, but is 0
+$log	i0|d0	E$log's argument must be a positive number, but is 0
+$log	i0|d0.5	E$log's argument must be a positive number, but is 0
+$log	i0|d1	E$log's argument must be a positive number, but is 0
+$log	i0|d2	E$log's argument must be a positive number, but is 0
+$log	i0|d10	E$log's argument must be a positive number, but is 0
+$log	i0|d-1	E$log's argument must be a positive number, but is 0
+$log	i0|dNaN	E$log's argument must be a positive number, but is 0
+$log	i0|dInfinity	E$log's argument must be a positive number, but is 0
+$log	i0|d-Infinity	E$log's argument must be a positive number, but is 0
+$log	i0|D0	E$log's argument must be a positive number, but is 0
+$log	i0|D1	E$log's argument must be a positive number, but is 0
+$log	i0|D2	E$log's argument must be a positive number, but is 0
+$log	i0|D-1	E$log's argument must be a positive number, but is 0
+$log	i0|D0.5	E$log's argument must be a positive number, but is 0
+$log	i0|DNaN	E$log's argument must be a positive number, but is 0
+$log	i0|DInfinity	E$log's argument must be a positive number, but is 0
+$log	i0|sabc	E$log's base must be numeric, not string
+$log	l2|null	null
+$log	l2|missing	null
+$log	l2|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	l2|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	l2|i2	d1.0
+$log	l2|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	l2|l2	d1.0
+$log	l2|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	l2|d0.5	d-1.0
+$log	l2|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	l2|d2	d1.0
+$log	l2|d10	d0.30102999566398114
+$log	l2|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	l2|dNaN	dNaN
+$log	l2|dInfinity	d0.0
+$log	l2|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	l2|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	l2|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	l2|D2	D1
+$log	l2|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	l2|D0.5	D1.386294361119890618834464242916353
+$log	l2|DNaN	dNaN
+$log	l2|DInfinity	D0E-6176
+$log	l2|sabc	E$log's base must be numeric, not string
+$log	d0|null	null
+$log	d0|missing	null
+$log	d0|i0	E$log's argument must be a positive number, but is 0
+$log	d0|i1	E$log's argument must be a positive number, but is 0
+$log	d0|i2	E$log's argument must be a positive number, but is 0
+$log	d0|i-1	E$log's argument must be a positive number, but is 0
+$log	d0|l2	E$log's argument must be a positive number, but is 0
+$log	d0|d0	E$log's argument must be a positive number, but is 0
+$log	d0|d0.5	E$log's argument must be a positive number, but is 0
+$log	d0|d1	E$log's argument must be a positive number, but is 0
+$log	d0|d2	E$log's argument must be a positive number, but is 0
+$log	d0|d10	E$log's argument must be a positive number, but is 0
+$log	d0|d-1	E$log's argument must be a positive number, but is 0
+$log	d0|dNaN	E$log's argument must be a positive number, but is 0
+$log	d0|dInfinity	E$log's argument must be a positive number, but is 0
+$log	d0|d-Infinity	E$log's argument must be a positive number, but is 0
+$log	d0|D0	E$log's argument must be a positive number, but is 0
+$log	d0|D1	E$log's argument must be a positive number, but is 0
+$log	d0|D2	E$log's argument must be a positive number, but is 0
+$log	d0|D-1	E$log's argument must be a positive number, but is 0
+$log	d0|D0.5	E$log's argument must be a positive number, but is 0
+$log	d0|DNaN	E$log's argument must be a positive number, but is 0
+$log	d0|DInfinity	E$log's argument must be a positive number, but is 0
+$log	d0|sabc	E$log's base must be numeric, not string
+$log	d-0|null	null
+$log	d-0|missing	null
+$log	d-0|i0	E$log's argument must be a positive number, but is -0
+$log	d-0|i1	E$log's argument must be a positive number, but is -0
+$log	d-0|i2	E$log's argument must be a positive number, but is -0
+$log	d-0|i-1	E$log's argument must be a positive number, but is -0
+$log	d-0|l2	E$log's argument must be a positive number, but is -0
+$log	d-0|d0	E$log's argument must be a positive number, but is -0
+$log	d-0|d0.5	E$log's argument must be a positive number, but is -0
+$log	d-0|d1	E$log's argument must be a positive number, but is -0
+$log	d-0|d2	E$log's argument must be a positive number, but is -0
+$log	d-0|d10	E$log's argument must be a positive number, but is -0
+$log	d-0|d-1	E$log's argument must be a positive number, but is -0
+$log	d-0|dNaN	E$log's argument must be a positive number, but is -0
+$log	d-0|dInfinity	E$log's argument must be a positive number, but is -0
+$log	d-0|d-Infinity	E$log's argument must be a positive number, but is -0
+$log	d-0|D0	E$log's argument must be a positive number, but is -0
+$log	d-0|D1	E$log's argument must be a positive number, but is -0
+$log	d-0|D2	E$log's argument must be a positive number, but is -0
+$log	d-0|D-1	E$log's argument must be a positive number, but is -0
+$log	d-0|D0.5	E$log's argument must be a positive number, but is -0
+$log	d-0|DNaN	E$log's argument must be a positive number, but is -0
+$log	d-0|DInfinity	E$log's argument must be a positive number, but is -0
+$log	d-0|sabc	E$log's base must be numeric, not string
+$log	d0.5|null	null
+$log	d0.5|missing	null
+$log	d0.5|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d0.5|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d0.5|i2	d-1.0
+$log	d0.5|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d0.5|l2	d-1.0
+$log	d0.5|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d0.5|d0.5	d1.0
+$log	d0.5|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d0.5|d2	d-1.0
+$log	d0.5|d10	d-0.30102999566398114
+$log	d0.5|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d0.5|dNaN	dNaN
+$log	d0.5|dInfinity	d-0.0
+$log	d0.5|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	d0.5|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d0.5|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d0.5|D2	D-1
+$log	d0.5|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d0.5|D0.5	D-1.386294361119890618834464242916353
+$log	d0.5|DNaN	dNaN
+$log	d0.5|DInfinity	D-0E-6176
+$log	d0.5|sabc	E$log's base must be numeric, not string
+$log	d1|null	null
+$log	d1|missing	null
+$log	d1|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d1|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d1|i2	d0.0
+$log	d1|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d1|l2	d0.0
+$log	d1|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d1|d0.5	d-0.0
+$log	d1|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d1|d2	d0.0
+$log	d1|d10	d0.0
+$log	d1|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d1|dNaN	dNaN
+$log	d1|dInfinity	d0.0
+$log	d1|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	d1|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d1|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d1|D2	D0
+$log	d1|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d1|D0.5	D0E+1
+$log	d1|DNaN	dNaN
+$log	d1|DInfinity	D0E-6176
+$log	d1|sabc	E$log's base must be numeric, not string
+$log	d2|null	null
+$log	d2|missing	null
+$log	d2|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d2|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d2|i2	d1.0
+$log	d2|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d2|l2	d1.0
+$log	d2|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d2|d0.5	d-1.0
+$log	d2|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d2|d2	d1.0
+$log	d2|d10	d0.30102999566398114
+$log	d2|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d2|dNaN	dNaN
+$log	d2|dInfinity	d0.0
+$log	d2|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	d2|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d2|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d2|D2	D1
+$log	d2|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d2|D0.5	D1.386294361119890618834464242916353
+$log	d2|DNaN	dNaN
+$log	d2|DInfinity	D0E-6176
+$log	d2|sabc	E$log's base must be numeric, not string
+$log	d10|null	null
+$log	d10|missing	null
+$log	d10|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d10|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d10|i2	d3.3219280948873626
+$log	d10|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d10|l2	d3.3219280948873626
+$log	d10|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d10|d0.5	d-3.3219280948873626
+$log	d10|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d10|d2	d3.3219280948873626
+$log	d10|d10	d1.0
+$log	d10|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d10|dNaN	dNaN
+$log	d10|dInfinity	d0.0
+$log	d10|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	d10|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	d10|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	d10|D2	D3.321928094887362347870319429489390
+$log	d10|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	d10|D0.5	D4.605170185988091368035982909368728
+$log	d10|DNaN	dNaN
+$log	d10|DInfinity	D0E-6176
+$log	d10|sabc	E$log's base must be numeric, not string
+$log	d-1|null	null
+$log	d-1|missing	null
+$log	d-1|i0	E$log's argument must be a positive number, but is -1
+$log	d-1|i1	E$log's argument must be a positive number, but is -1
+$log	d-1|i2	E$log's argument must be a positive number, but is -1
+$log	d-1|i-1	E$log's argument must be a positive number, but is -1
+$log	d-1|l2	E$log's argument must be a positive number, but is -1
+$log	d-1|d0	E$log's argument must be a positive number, but is -1
+$log	d-1|d0.5	E$log's argument must be a positive number, but is -1
+$log	d-1|d1	E$log's argument must be a positive number, but is -1
+$log	d-1|d2	E$log's argument must be a positive number, but is -1
+$log	d-1|d10	E$log's argument must be a positive number, but is -1
+$log	d-1|d-1	E$log's argument must be a positive number, but is -1
+$log	d-1|dNaN	E$log's argument must be a positive number, but is -1
+$log	d-1|dInfinity	E$log's argument must be a positive number, but is -1
+$log	d-1|d-Infinity	E$log's argument must be a positive number, but is -1
+$log	d-1|D0	E$log's argument must be a positive number, but is -1
+$log	d-1|D1	E$log's argument must be a positive number, but is -1
+$log	d-1|D2	E$log's argument must be a positive number, but is -1
+$log	d-1|D-1	E$log's argument must be a positive number, but is -1
+$log	d-1|D0.5	E$log's argument must be a positive number, but is -1
+$log	d-1|DNaN	E$log's argument must be a positive number, but is -1
+$log	d-1|DInfinity	E$log's argument must be a positive number, but is -1
+$log	d-1|sabc	E$log's base must be numeric, not string
+$log	dNaN|null	null
+$log	dNaN|missing	null
+$log	dNaN|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	dNaN|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	dNaN|i2	dNaN
+$log	dNaN|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	dNaN|l2	dNaN
+$log	dNaN|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	dNaN|d0.5	dNaN
+$log	dNaN|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	dNaN|d2	dNaN
+$log	dNaN|d10	dNaN
+$log	dNaN|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	dNaN|dNaN	dNaN
+$log	dNaN|dInfinity	dNaN
+$log	dNaN|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	dNaN|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	dNaN|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	dNaN|D2	dNaN
+$log	dNaN|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	dNaN|D0.5	dNaN
+$log	dNaN|DNaN	dNaN
+$log	dNaN|DInfinity	dNaN
+$log	dNaN|sabc	E$log's base must be numeric, not string
+$log	dInfinity|null	null
+$log	dInfinity|missing	null
+$log	dInfinity|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	dInfinity|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	dInfinity|i2	dInfinity
+$log	dInfinity|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	dInfinity|l2	dInfinity
+$log	dInfinity|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	dInfinity|d0.5	d-Infinity
+$log	dInfinity|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	dInfinity|d2	dInfinity
+$log	dInfinity|d10	dInfinity
+$log	dInfinity|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	dInfinity|dNaN	dNaN
+$log	dInfinity|dInfinity	dNaN
+$log	dInfinity|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	dInfinity|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	dInfinity|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	dInfinity|D2	DInfinity
+$log	dInfinity|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	dInfinity|D0.5	DInfinity
+$log	dInfinity|DNaN	dNaN
+$log	dInfinity|DInfinity	DNaN
+$log	dInfinity|sabc	E$log's base must be numeric, not string
+$log	d-Infinity|null	null
+$log	d-Infinity|missing	null
+$log	d-Infinity|i0	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|i1	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|i2	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|i-1	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|l2	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|d0	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|d0.5	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|d1	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|d2	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|d10	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|d-1	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|dNaN	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|dInfinity	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|d-Infinity	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|D0	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|D1	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|D2	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|D-1	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|D0.5	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|DNaN	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|DInfinity	E$log's argument must be a positive number, but is -inf
+$log	d-Infinity|sabc	E$log's base must be numeric, not string
+$log	D0|null	null
+$log	D0|missing	null
+$log	D0|i0	E$log's argument must be a positive number, but is 0
+$log	D0|i1	E$log's argument must be a positive number, but is 0
+$log	D0|i2	E$log's argument must be a positive number, but is 0
+$log	D0|i-1	E$log's argument must be a positive number, but is 0
+$log	D0|l2	E$log's argument must be a positive number, but is 0
+$log	D0|d0	E$log's argument must be a positive number, but is 0
+$log	D0|d0.5	E$log's argument must be a positive number, but is 0
+$log	D0|d1	E$log's argument must be a positive number, but is 0
+$log	D0|d2	E$log's argument must be a positive number, but is 0
+$log	D0|d10	E$log's argument must be a positive number, but is 0
+$log	D0|d-1	E$log's argument must be a positive number, but is 0
+$log	D0|dNaN	E$log's argument must be a positive number, but is 0
+$log	D0|dInfinity	E$log's argument must be a positive number, but is 0
+$log	D0|d-Infinity	E$log's argument must be a positive number, but is 0
+$log	D0|D0	E$log's argument must be a positive number, but is 0
+$log	D0|D1	E$log's argument must be a positive number, but is 0
+$log	D0|D2	E$log's argument must be a positive number, but is 0
+$log	D0|D-1	E$log's argument must be a positive number, but is 0
+$log	D0|D0.5	E$log's argument must be a positive number, but is 0
+$log	D0|DNaN	E$log's argument must be a positive number, but is 0
+$log	D0|DInfinity	E$log's argument must be a positive number, but is 0
+$log	D0|sabc	E$log's base must be numeric, not string
+$log	D1|null	null
+$log	D1|missing	null
+$log	D1|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	D1|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	D1|i2	D0
+$log	D1|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	D1|l2	D0
+$log	D1|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	D1|d0.5	D0E+15
+$log	D1|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	D1|d2	D0
+$log	D1|d10	D0
+$log	D1|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	D1|dNaN	dNaN
+$log	D1|dInfinity	D0E-6176
+$log	D1|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	D1|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	D1|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	D1|D2	D0
+$log	D1|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	D1|D0.5	D0E+1
+$log	D1|DNaN	dNaN
+$log	D1|DInfinity	D0E-6176
+$log	D1|sabc	E$log's base must be numeric, not string
+$log	D2|null	null
+$log	D2|missing	null
+$log	D2|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	D2|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	D2|i2	D1
+$log	D2|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	D2|l2	D1
+$log	D2|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	D2|d0.5	D1.386294361119890618834464242916353
+$log	D2|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	D2|d2	D1
+$log	D2|d10	D0.3010299956639811952137388947244930
+$log	D2|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	D2|dNaN	dNaN
+$log	D2|dInfinity	D0E-6176
+$log	D2|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	D2|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	D2|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	D2|D2	D1
+$log	D2|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	D2|D0.5	D1.386294361119890618834464242916353
+$log	D2|DNaN	dNaN
+$log	D2|DInfinity	D0E-6176
+$log	D2|sabc	E$log's base must be numeric, not string
+$log	D-1|null	null
+$log	D-1|missing	null
+$log	D-1|i0	E$log's argument must be a positive number, but is -1
+$log	D-1|i1	E$log's argument must be a positive number, but is -1
+$log	D-1|i2	E$log's argument must be a positive number, but is -1
+$log	D-1|i-1	E$log's argument must be a positive number, but is -1
+$log	D-1|l2	E$log's argument must be a positive number, but is -1
+$log	D-1|d0	E$log's argument must be a positive number, but is -1
+$log	D-1|d0.5	E$log's argument must be a positive number, but is -1
+$log	D-1|d1	E$log's argument must be a positive number, but is -1
+$log	D-1|d2	E$log's argument must be a positive number, but is -1
+$log	D-1|d10	E$log's argument must be a positive number, but is -1
+$log	D-1|d-1	E$log's argument must be a positive number, but is -1
+$log	D-1|dNaN	E$log's argument must be a positive number, but is -1
+$log	D-1|dInfinity	E$log's argument must be a positive number, but is -1
+$log	D-1|d-Infinity	E$log's argument must be a positive number, but is -1
+$log	D-1|D0	E$log's argument must be a positive number, but is -1
+$log	D-1|D1	E$log's argument must be a positive number, but is -1
+$log	D-1|D2	E$log's argument must be a positive number, but is -1
+$log	D-1|D-1	E$log's argument must be a positive number, but is -1
+$log	D-1|D0.5	E$log's argument must be a positive number, but is -1
+$log	D-1|DNaN	E$log's argument must be a positive number, but is -1
+$log	D-1|DInfinity	E$log's argument must be a positive number, but is -1
+$log	D-1|sabc	E$log's base must be numeric, not string
+$log	DNaN|null	null
+$log	DNaN|missing	null
+$log	DNaN|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	DNaN|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	DNaN|i2	dNaN
+$log	DNaN|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	DNaN|l2	dNaN
+$log	DNaN|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	DNaN|d0.5	dNaN
+$log	DNaN|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	DNaN|d2	dNaN
+$log	DNaN|d10	dNaN
+$log	DNaN|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	DNaN|dNaN	dNaN
+$log	DNaN|dInfinity	dNaN
+$log	DNaN|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	DNaN|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	DNaN|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	DNaN|D2	dNaN
+$log	DNaN|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	DNaN|D0.5	dNaN
+$log	DNaN|DNaN	dNaN
+$log	DNaN|DInfinity	dNaN
+$log	DNaN|sabc	E$log's base must be numeric, not string
+$log	DInfinity|null	null
+$log	DInfinity|missing	null
+$log	DInfinity|i0	E$log's base must be a positive number not equal to 1, but is 0
+$log	DInfinity|i1	E$log's base must be a positive number not equal to 1, but is 1
+$log	DInfinity|i2	DInfinity
+$log	DInfinity|i-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	DInfinity|l2	DInfinity
+$log	DInfinity|d0	E$log's base must be a positive number not equal to 1, but is 0
+$log	DInfinity|d0.5	DInfinity
+$log	DInfinity|d1	E$log's base must be a positive number not equal to 1, but is 1
+$log	DInfinity|d2	DInfinity
+$log	DInfinity|d10	DInfinity
+$log	DInfinity|d-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	DInfinity|dNaN	dNaN
+$log	DInfinity|dInfinity	DNaN
+$log	DInfinity|d-Infinity	E$log's base must be a positive number not equal to 1, but is -inf
+$log	DInfinity|D0	E$log's base must be a positive number not equal to 1, but is 0
+$log	DInfinity|D1	E$log's base must be a positive number not equal to 1, but is 1
+$log	DInfinity|D2	DInfinity
+$log	DInfinity|D-1	E$log's base must be a positive number not equal to 1, but is -1
+$log	DInfinity|D0.5	DInfinity
+$log	DInfinity|DNaN	dNaN
+$log	DInfinity|DInfinity	DNaN
+$log	DInfinity|sabc	E$log's base must be numeric, not string
+$log	D-Infinity|null	null
+$log	D-Infinity|missing	null
+$log	D-Infinity|i0	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|i1	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|i2	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|i-1	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|l2	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|d0	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|d0.5	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|d1	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|d2	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|d10	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|d-1	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|dNaN	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|dInfinity	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|d-Infinity	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|D0	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|D1	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|D2	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|D-1	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|D0.5	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|DNaN	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|DInfinity	E$log's argument must be a positive number, but is -inf
+$log	D-Infinity|sabc	E$log's base must be numeric, not string
+$log	sabc|null	null
+$log	sabc|missing	null
+$log	sabc|i0	E$log's argument must be numeric, not string
+$log	sabc|i1	E$log's argument must be numeric, not string
+$log	sabc|i2	E$log's argument must be numeric, not string
+$log	sabc|i-1	E$log's argument must be numeric, not string
+$log	sabc|l2	E$log's argument must be numeric, not string
+$log	sabc|d0	E$log's argument must be numeric, not string
+$log	sabc|d0.5	E$log's argument must be numeric, not string
+$log	sabc|d1	E$log's argument must be numeric, not string
+$log	sabc|d2	E$log's argument must be numeric, not string
+$log	sabc|d10	E$log's argument must be numeric, not string
+$log	sabc|d-1	E$log's argument must be numeric, not string
+$log	sabc|dNaN	E$log's argument must be numeric, not string
+$log	sabc|dInfinity	E$log's argument must be numeric, not string
+$log	sabc|d-Infinity	E$log's argument must be numeric, not string
+$log	sabc|D0	E$log's argument must be numeric, not string
+$log	sabc|D1	E$log's argument must be numeric, not string
+$log	sabc|D2	E$log's argument must be numeric, not string
+$log	sabc|D-1	E$log's argument must be numeric, not string
+$log	sabc|D0.5	E$log's argument must be numeric, not string
+$log	sabc|DNaN	E$log's argument must be numeric, not string
+$log	sabc|DInfinity	E$log's argument must be numeric, not string
+$log	sabc|sabc	E$log's argument must be numeric, not string
+$log	arr|null	null
+$log	arr|missing	null
+$log	arr|i0	E$log's argument must be numeric, not array
+$log	arr|i1	E$log's argument must be numeric, not array
+$log	arr|i2	E$log's argument must be numeric, not array
+$log	arr|i-1	E$log's argument must be numeric, not array
+$log	arr|l2	E$log's argument must be numeric, not array
+$log	arr|d0	E$log's argument must be numeric, not array
+$log	arr|d0.5	E$log's argument must be numeric, not array
+$log	arr|d1	E$log's argument must be numeric, not array
+$log	arr|d2	E$log's argument must be numeric, not array
+$log	arr|d10	E$log's argument must be numeric, not array
+$log	arr|d-1	E$log's argument must be numeric, not array
+$log	arr|dNaN	E$log's argument must be numeric, not array
+$log	arr|dInfinity	E$log's argument must be numeric, not array
+$log	arr|d-Infinity	E$log's argument must be numeric, not array
+$log	arr|D0	E$log's argument must be numeric, not array
+$log	arr|D1	E$log's argument must be numeric, not array
+$log	arr|D2	E$log's argument must be numeric, not array
+$log	arr|D-1	E$log's argument must be numeric, not array
+$log	arr|D0.5	E$log's argument must be numeric, not array
+$log	arr|DNaN	E$log's argument must be numeric, not array
+$log	arr|DInfinity	E$log's argument must be numeric, not array
+$log	arr|sabc	E$log's argument must be numeric, not array
+$log	bool|null	null
+$log	bool|missing	null
+$log	bool|i0	E$log's argument must be numeric, not bool
+$log	bool|i1	E$log's argument must be numeric, not bool
+$log	bool|i2	E$log's argument must be numeric, not bool
+$log	bool|i-1	E$log's argument must be numeric, not bool
+$log	bool|l2	E$log's argument must be numeric, not bool
+$log	bool|d0	E$log's argument must be numeric, not bool
+$log	bool|d0.5	E$log's argument must be numeric, not bool
+$log	bool|d1	E$log's argument must be numeric, not bool
+$log	bool|d2	E$log's argument must be numeric, not bool
+$log	bool|d10	E$log's argument must be numeric, not bool
+$log	bool|d-1	E$log's argument must be numeric, not bool
+$log	bool|dNaN	E$log's argument must be numeric, not bool
+$log	bool|dInfinity	E$log's argument must be numeric, not bool
+$log	bool|d-Infinity	E$log's argument must be numeric, not bool
+$log	bool|D0	E$log's argument must be numeric, not bool
+$log	bool|D1	E$log's argument must be numeric, not bool
+$log	bool|D2	E$log's argument must be numeric, not bool
+$log	bool|D-1	E$log's argument must be numeric, not bool
+$log	bool|D0.5	E$log's argument must be numeric, not bool
+$log	bool|DNaN	E$log's argument must be numeric, not bool
+$log	bool|DInfinity	E$log's argument must be numeric, not bool
+$log	bool|sabc	E$log's argument must be numeric, not bool
+$log	D1|D0.5	D0E+1
+$log	D2|D0.5	D1.386294361119890618834464242916353
+$log	D8|D0.5	D4.15888308335967185650339272874906
+$log	D0.5|D0.5	D-1.386294361119890618834464242916353
+$log	D10|D0.5	D4.605170185988091368035982909368728
+$log	D100|D0.5	D9.210340371976182736071965818737456
+$log	D0.01|D0.5	D-9.210340371976182736071965818737456
+$log	D1000|D0.5	D13.81551055796427410410794872810619
+$log	D1|D0.25	D0E+2
+$log	D2|D0.25	D2.772588722239781237668928485832706
+$log	D8|D0.25	D8.31776616671934371300678545749812
+$log	D0.5|D0.25	D-2.772588722239781237668928485832706
+$log	D10|D0.25	D9.210340371976182736071965818737456
+$log	D100|D0.25	D18.42068074395236547214393163747491
+$log	D0.01|D0.25	D-18.42068074395236547214393163747491
+$log	D1000|D0.25	D27.63102111592854820821589745621237
+$log	D1|D0.1	D0E+1
+$log	D2|D0.1	D6.931471805599453094172321214581766
+$log	D8|D0.1	D20.79441541679835928251696364374530
+$log	D0.5|D0.1	D-6.931471805599453094172321214581766
+$log	D10|D0.1	D23.02585092994045684017991454684364
+$log	D100|D0.1	D46.05170185988091368035982909368728
+$log	D0.01|D0.1	D-46.05170185988091368035982909368728
+$log	D1000|D0.1	D69.07755278982137052053974364053093
+$log	D1|D0.9	D0E+1
+$log	D2|D0.9	D0.7701635339554947882413690238424184
+$log	D8|D0.9	D2.310490601866484364724107071527256
+$log	D0.5|D0.9	D-0.7701635339554947882413690238424184
+$log	D10|D0.9	D2.558427881104495204464434949649293
+$log	D100|D0.9	D5.116855762208990408928869899298587
+$log	D0.01|D0.9	D-5.116855762208990408928869899298587
+$log	D1000|D0.9	D7.675283643313485613393304848947881
+$log	D1|D3	D0
+$log	D2|D3	D0.2310490601866484364724107071527255
+$log	D8|D3	D0.6931471805599453094172321214581767
+$log	D0.5|D3	D-0.2310490601866484364724107071527255
+$log	D10|D3	D0.767528364331348561339330484894788
+$log	D100|D3	D1.535056728662697122678660969789576
+$log	D0.01|D3	D-1.535056728662697122678660969789576
+$log	D1000|D3	D2.302585092994045684017991454684364
+$log	D1|D10	D0
+$log	D2|D10	D0.3010299956639811952137388947244930
+$log	D8|D10	D0.9030899869919435856412166841734790
+$log	D0.5|D10	D-0.3010299956639811952137388947244930
+$log	D10|D10	D1
+$log	D100|D10	D2
+$log	D0.01|D10	D-2
+$log	D1000|D10	D3
+$log	D1|D100	D0
+$log	D2|D100	D0.006931471805599453094172321214581766
+$log	D8|D100	D0.0207944154167983592825169636437453
+$log	D0.5|D100	D-0.006931471805599453094172321214581766
+$log	D10|D100	D0.02302585092994045684017991454684364
+$log	D100|D100	D0.04605170185988091368035982909368728
+$log	D0.01|D100	D-0.04605170185988091368035982909368728
+$log	D1000|D100	D0.06907755278982137052053974364053093
+$log	D1|D1.5	D0E+1
+$log	D2|D1.5	D0.4620981203732968729448214143054511
+$log	D8|D1.5	D1.386294361119890618834464242916353
+$log	D0.5|D1.5	D-0.4620981203732968729448214143054511
+$log	D10|D1.5	D1.535056728662697122678660969789576
+$log	D100|D1.5	D3.070113457325394245357321939579152
+$log	D0.01|D1.5	D-3.070113457325394245357321939579152
+$log	D1000|D1.5	D4.605170185988091368035982909368729
+$log	D1|D7	D0
+$log	D2|D7	D0.09902102579427790134531887449402523
+$log	D8|D7	D0.2970630773828337040359566234820757
+$log	D0.5|D7	D-0.09902102579427790134531887449402523
+$log	D10|D7	D0.3289407275705779548597130649549091
+$log	D100|D7	D0.6578814551411559097194261299098183
+$log	D0.01|D7	D-0.6578814551411559097194261299098183
+$log	D1000|D7	D0.9868221827117338645791391948647276
+$log	D1|D1E+6	D0.000000
+$log	D2|D1E+6	D6.931471805599453094172321214581766E-7
+$log	D8|D1E+6	D0.000002079441541679835928251696364374530
+$log	D0.5|D1E+6	D-6.931471805599453094172321214581766E-7
+$log	D10|D1E+6	D0.000002302585092994045684017991454684364
+$log	D100|D1E+6	D0.000004605170185988091368035982909368728
+$log	D0.01|D1E+6	D-0.000004605170185988091368035982909368728
+$log	D1000|D1E+6	D0.000006907755278982137052053974364053093
+$log	D1|D1E-6	D0E+6
+$log	D2|D1E-6	D693147.1805599453094172321214581766
+$log	D8|D1E-6	D2079441.541679835928251696364374530
+$log	D0.5|D1E-6	D-693147.1805599453094172321214581766
+$log	D10|D1E-6	D2302585.092994045684017991454684364
+$log	D100|D1E-6	D4605170.185988091368035982909368728
+$log	D0.01|D1E-6	D-4605170.185988091368035982909368728
+$log	D1000|D1E-6	D6907755.278982137052053974364053093
+$log	D2|d0.5	D1.386294361119890618834464242916353
+$log	d2|D0.5	D1.386294361119890618834464242916353
+$log	d2|d0.5	d-1.0
+$log	D8|d0.5	D4.15888308335967185650339272874906
+$log	d8|D0.5	D4.15888308335967185650339272874906
+$log	d8|d0.5	d-3.0
+$log	D0.5|d0.5	D-1.386294361119890618834464242916353
+$log	d0.5|D0.5	D-1.386294361119890618834464242916353
+$log	d0.5|d0.5	d1.0
+$log	D10|d0.5	D4.605170185988091368035982909368728
+$log	d10|D0.5	D4.605170185988091368035982909368728
+$log	d10|d0.5	d-3.3219280948873626
+$log	D100|d0.5	D9.210340371976182736071965818737456
+$log	d100|D0.5	D9.210340371976182736071965818737456
+$log	d100|d0.5	d-6.643856189774725
+$log	D2|d0.25	D2.772588722239781237668928485832706
+$log	d2|D0.25	D2.772588722239781237668928485832706
+$log	d2|d0.25	d-0.5
+$log	D8|d0.25	D8.31776616671934371300678545749812
+$log	d8|D0.25	D8.31776616671934371300678545749812
+$log	d8|d0.25	d-1.5
+$log	D0.5|d0.25	D-2.772588722239781237668928485832706
+$log	d0.5|D0.25	D-2.772588722239781237668928485832706
+$log	d0.5|d0.25	d0.5
+$log	D10|d0.25	D9.210340371976182736071965818737456
+$log	d10|D0.25	D9.210340371976182736071965818737456
+$log	d10|d0.25	d-1.6609640474436813
+$log	D100|d0.25	D18.42068074395236547214393163747491
+$log	d100|D0.25	D18.42068074395236547214393163747491
+$log	d100|d0.25	d-3.3219280948873626
+$log	D2|d0.1	D6.931471805599453094172321214581766
+$log	d2|D0.1	D6.931471805599453094172321214581766
+$log	d2|d0.1	d-0.3010299956639812
+$log	D8|d0.1	D20.7944154167983592825169636437453
+$log	d8|D0.1	D20.79441541679835928251696364374530
+$log	d8|d0.1	d-0.9030899869919436
+$log	D0.5|d0.1	D-6.931471805599453094172321214581766
+$log	d0.5|D0.1	D-6.931471805599453094172321214581766
+$log	d0.5|d0.1	d0.3010299956639812
+$log	D10|d0.1	D23.02585092994045684017991454684364
+$log	d10|D0.1	D23.02585092994045684017991454684364
+$log	d10|d0.1	d-1.0000000000000002
+$log	D100|d0.1	D46.05170185988091368035982909368728
+$log	d100|D0.1	D46.05170185988091368035982909368728
+$log	d100|d0.1	d-2.0000000000000004
+$log	D2|d3	D0.2310490601866484364724107071527255
+$log	d2|D3	D0.2310490601866484364724107071527255
+$log	d2|d3	d0.6309297535714574
+$log	D8|d3	D0.6931471805599453094172321214581767
+$log	d8|D3	D0.6931471805599453094172321214581767
+$log	d8|d3	d1.892789260714372
+$log	D0.5|d3	D-0.2310490601866484364724107071527255
+$log	d0.5|D3	D-0.2310490601866484364724107071527255
+$log	d0.5|d3	d-0.6309297535714574
+$log	D10|d3	D0.767528364331348561339330484894788
+$log	d10|D3	D0.767528364331348561339330484894788
+$log	d10|d3	d2.095903274289385
+$log	D100|d3	D1.535056728662697122678660969789576
+$log	d100|D3	D1.535056728662697122678660969789576
+$log	d100|d3	d4.19180654857877
+$log	D2|d10	D0.3010299956639811952137388947244930
+$log	d2|D10	D0.3010299956639811952137388947244930
+$log	d2|d10	d0.30102999566398114
+$log	D8|d10	D0.9030899869919435856412166841734790
+$log	d8|D10	D0.9030899869919435856412166841734790
+$log	d8|d10	d0.9030899869919434
+$log	D0.5|d10	D-0.3010299956639811952137388947244930
+$log	d0.5|D10	D-0.3010299956639811952137388947244930
+$log	d0.5|d10	d-0.30102999566398114
+$log	D10|d10	D1
+$log	d10|D10	D1
+$log	d10|d10	d1.0
+$log	D100|d10	D2
+$log	d100|D10	D2
+$log	d100|d10	d2.0
+$log	D2|d100	D0.006931471805599453094172321214581766
+$log	d2|D100	D0.006931471805599453094172321214581766
+$log	d2|d100	d0.15051499783199057
+$log	D8|d100	D0.0207944154167983592825169636437453
+$log	d8|D100	D0.0207944154167983592825169636437453
+$log	d8|d100	d0.4515449934959717
+$log	D0.5|d100	D-0.006931471805599453094172321214581766
+$log	d0.5|D100	D-0.006931471805599453094172321214581766
+$log	d0.5|d100	d-0.15051499783199057
+$log	D10|d100	D0.02302585092994045684017991454684364
+$log	d10|D100	D0.02302585092994045684017991454684364
+$log	d10|d100	d0.5
+$log	D100|d100	D0.04605170185988091368035982909368728
+$log	d100|D100	D0.04605170185988091368035982909368728
+$log	d100|d100	d1.0

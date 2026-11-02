@@ -68,6 +68,9 @@ mod stage_reference_tests;
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]
+mod trig_tests;
+
+#[cfg(test)]
 mod update_pipeline_tests;
 #[cfg(test)]
 mod window_deadline_tests;

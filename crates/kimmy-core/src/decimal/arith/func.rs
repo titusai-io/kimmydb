@@ -86,6 +86,9 @@ use crate::decimal::{MAX_EXPONENT, Raw};
 #[path = "func_tests.rs"]
 mod func_tests;
 
+mod trig;
+pub use trig::{acos, acosh, asin, asinh, atan, atan2, atanh, cos, cosh, sin, sinh, tan, tanh};
+
 /// An argument outside the function's domain: the square root or logarithm of
 /// a negative number, the logarithm of zero, zero to a negative power, a
 /// negative base to a power that is not a whole number.
@@ -587,6 +590,12 @@ fn ln_fx(coefficient: u128, exponent: i64) -> Fx {
     let mut m = Mag::from_u128(coefficient);
     // `exponent - q >= -digits`, so the shift is at least `S - 34`: exact.
     m.mul_pow10((exponent - q + i64::from(S)) as u32);
+    ln_scaled(m, q)
+}
+
+/// `ln (m · 10^q)` for a fixed-point `m` in `[0.316, 3.16)`, as a fixed point of the same
+/// error as [`ln_fx`].
+fn ln_scaled(mut m: Mag, q: i64) -> Fx {
     // `m = m' · 2^a` with `m'` in [0.707, 1.414).
     let (mut hi, mut lo) = (Mag::from_u64(14142), Mag::from_u64(7071));
     hi.mul_pow10(S - 4);
@@ -799,6 +808,20 @@ pub fn log10(x: &Raw) -> Result<Raw, Domain> {
     }
     let l = ln_fx(coefficient, exponent);
     Ok(finish(l.neg, fx_div(&l.mag, &consts().ln10), -i64::from(S)))
+}
+
+/// The base-2 logarithm, with `ln`'s domain. An exact power of two `2^k` gives exactly `k`
+/// (the fixed point rounds the sticky approximation of it to the integer).
+pub fn log2(x: &Raw) -> Result<Raw, Domain> {
+    let (coefficient, exponent) = match log_argument(x) {
+        Ok(argument) => argument,
+        Err(answer) => return answer,
+    };
+    if strip(coefficient, exponent) == (1, 0) {
+        return Ok(ZERO);
+    }
+    let l = ln_fx(coefficient, exponent);
+    Ok(finish(l.neg, fx_div(&l.mag, &consts().ln2), -i64::from(S)))
 }
 
 // ---------------------------------------------------------------------------

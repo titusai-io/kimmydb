@@ -72,9 +72,12 @@ mod arrayacc;
 mod dates;
 mod docops;
 mod math;
+mod random;
 pub(crate) mod sizes;
 mod strings;
+mod trig;
 mod tz;
+mod values;
 
 pub(crate) use dates::{add_to_date, is_date_unit, unit_millis};
 pub(crate) use sizes::{
@@ -121,6 +124,23 @@ pub enum Op {
     Exp,
     Ln,
     Log10,
+    Log,
+    // Trigonometry
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    DegreesToRadians,
+    RadiansToDegrees,
     // Strings
     Concat,
     ToUpper,
@@ -174,6 +194,13 @@ pub enum Op {
     MergeObjects,
     // Types
     IsNumber,
+    // Sizes and timestamps
+    BinarySize,
+    BsonSize,
+    TsSecond,
+    TsIncrement,
+    // Random
+    Rand,
     // Escape
     Literal,
 }
@@ -204,6 +231,22 @@ impl Op {
             "$exp" => Op::Exp,
             "$ln" => Op::Ln,
             "$log10" => Op::Log10,
+            "$log" => Op::Log,
+            "$sin" => Op::Sin,
+            "$cos" => Op::Cos,
+            "$tan" => Op::Tan,
+            "$asin" => Op::Asin,
+            "$acos" => Op::Acos,
+            "$atan" => Op::Atan,
+            "$atan2" => Op::Atan2,
+            "$sinh" => Op::Sinh,
+            "$cosh" => Op::Cosh,
+            "$tanh" => Op::Tanh,
+            "$asinh" => Op::Asinh,
+            "$acosh" => Op::Acosh,
+            "$atanh" => Op::Atanh,
+            "$degreesToRadians" => Op::DegreesToRadians,
+            "$radiansToDegrees" => Op::RadiansToDegrees,
             "$concat" => Op::Concat,
             "$toUpper" => Op::ToUpper,
             "$toLower" => Op::ToLower,
@@ -249,6 +292,11 @@ impl Op {
             "$arrayToObject" => Op::ArrayToObject,
             "$mergeObjects" => Op::MergeObjects,
             "$isNumber" => Op::IsNumber,
+            "$binarySize" => Op::BinarySize,
+            "$bsonSize" => Op::BsonSize,
+            "$tsSecond" => Op::TsSecond,
+            "$tsIncrement" => Op::TsIncrement,
+            "$rand" => Op::Rand,
             "$literal" => Op::Literal,
             _ => return None,
         })
@@ -272,6 +320,22 @@ impl Op {
             Op::Exp => "$exp",
             Op::Ln => "$ln",
             Op::Log10 => "$log10",
+            Op::Log => "$log",
+            Op::Sin => "$sin",
+            Op::Cos => "$cos",
+            Op::Tan => "$tan",
+            Op::Asin => "$asin",
+            Op::Acos => "$acos",
+            Op::Atan => "$atan",
+            Op::Atan2 => "$atan2",
+            Op::Sinh => "$sinh",
+            Op::Cosh => "$cosh",
+            Op::Tanh => "$tanh",
+            Op::Asinh => "$asinh",
+            Op::Acosh => "$acosh",
+            Op::Atanh => "$atanh",
+            Op::DegreesToRadians => "$degreesToRadians",
+            Op::RadiansToDegrees => "$radiansToDegrees",
             Op::Concat => "$concat",
             Op::ToUpper => "$toUpper",
             Op::ToLower => "$toLower",
@@ -317,6 +381,11 @@ impl Op {
             Op::ArrayToObject => "$arrayToObject",
             Op::MergeObjects => "$mergeObjects",
             Op::IsNumber => "$isNumber",
+            Op::BinarySize => "$binarySize",
+            Op::BsonSize => "$bsonSize",
+            Op::TsSecond => "$tsSecond",
+            Op::TsIncrement => "$tsIncrement",
+            Op::Rand => "$rand",
             Op::Literal => "$literal",
         }
     }
@@ -347,6 +416,8 @@ impl Op {
             | Op::Lt
             | Op::Lte
             | Op::Cmp
+            | Op::Log
+            | Op::Atan2
             | Op::ArrayElemAt
             | Op::In
             | Op::SetDifference
@@ -364,6 +435,24 @@ impl Op {
             | Op::Exp
             | Op::Ln
             | Op::Log10
+            | Op::Sin
+            | Op::Cos
+            | Op::Tan
+            | Op::Asin
+            | Op::Acos
+            | Op::Atan
+            | Op::Sinh
+            | Op::Cosh
+            | Op::Tanh
+            | Op::Asinh
+            | Op::Acosh
+            | Op::Atanh
+            | Op::DegreesToRadians
+            | Op::RadiansToDegrees
+            | Op::BinarySize
+            | Op::BsonSize
+            | Op::TsSecond
+            | Op::TsIncrement
             | Op::ToUpper
             | Op::ToLower
             | Op::StrLenCp
@@ -380,6 +469,7 @@ impl Op {
             | Op::ObjectToArray
             | Op::ArrayToObject
             | Op::Literal => Arity::Exact(1),
+            Op::Rand => Arity::Exact(0),
         }
     }
 
@@ -1370,6 +1460,10 @@ impl Expr {
                 };
                 if op == Op::Literal {
                     return Ok(Expr::Op(op, vec![Expr::Literal(raw.clone())]));
+                }
+                if op == Op::Rand {
+                    random::check_argument(raw)?;
+                    return Ok(Expr::Op(op, Vec::new()));
                 }
                 // `{$cond: {if: .., then: .., else: ..}}`, the named form of the three
                 // positional arguments, all three required.
@@ -2471,6 +2565,22 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         }
         Op::Round | Op::Trunc => math::round(op, &args[0], args.get(1)),
         Op::Pow => math::pow(&args[0], &args[1]),
+        Op::Log => trig::log(&args[0], &args[1]),
+        Op::Atan2 => trig::atan2(&args[0], &args[1]),
+        Op::Sin
+        | Op::Cos
+        | Op::Tan
+        | Op::Asin
+        | Op::Acos
+        | Op::Atan
+        | Op::Sinh
+        | Op::Cosh
+        | Op::Tanh
+        | Op::Asinh
+        | Op::Acosh
+        | Op::Atanh
+        | Op::DegreesToRadians
+        | Op::RadiansToDegrees => trig::unary(op, &args[0]),
 
         Op::Concat => concat(args),
         Op::ToUpper => Ok(Bson::String(as_string_lossy(&args[0], op)?.to_uppercase())),
@@ -2518,6 +2628,10 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::ArrayToObject => array_to_object(&args[0]),
         Op::MergeObjects => docops::merge_objects(args),
         Op::IsNumber => Ok(docops::is_number(&args[0])),
+        Op::BinarySize => values::binary_size(&args[0]),
+        Op::BsonSize => values::bson_size(&args[0]),
+        Op::TsSecond | Op::TsIncrement => values::timestamp_part(op, &args[0]),
+        Op::Rand => Ok(Bson::Double(random::unit())),
 
         Op::Cond | Op::IfNull | Op::And | Op::Or | Op::Literal => {
             unreachable!("handled lazily")
