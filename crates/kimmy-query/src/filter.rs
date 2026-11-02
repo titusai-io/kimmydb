@@ -910,24 +910,34 @@ pub fn matches_at(filter: &Filter, doc: &Document) -> Result<(bool, Option<Array
         return Ok((false, None));
     }
     let mut at = None;
-    record_position(filter, doc, &mut at);
+    record_position(filter, doc, &mut at).map_err(|e| unevaluable(e, doc.get("_id"), ""))?;
     Ok((true, at))
 }
 
-fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPosition>) {
+fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPosition>) -> Result<()> {
     match filter {
         Filter::AlwaysTrue | Filter::Nor(_) | Filter::Expr(_) | Filter::JsonSchema(_) => {}
         Filter::And(branches) => {
             for branch in branches.in_written_order() {
-                record_position(branch, doc, at);
+                record_position(branch, doc, at)?;
             }
         }
         Filter::Or(branches) => {
-            // A branch that cannot be evaluated did not decide the match.
-            if let Some(branch) =
-                branches.in_written_order().find(|b| matches!(evaluate(b, doc, &[]), Ok(true)))
-            {
-                record_position(branch, doc, at);
+            // The first branch, in the order written, that holds. A branch that cannot be
+            // evaluated for this document (an `$expr` that fails on it) did not decide the
+            // match, as `matches` itself defers it, and the next is tried; an error that is
+            // about the request and not the value (the deadline, the node's stop, the
+            // memory budget, a broken invariant) is not "did not decide" and goes up.
+            for branch in branches.in_written_order() {
+                match evaluate(branch, doc, &[]) {
+                    Ok(true) => {
+                        record_position(branch, doc, at)?;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(e) if e.is_deferrable() => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         Filter::Field { path, conditions } => {
@@ -938,6 +948,7 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
             }
         }
     }
+    Ok(())
 }
 
 /// The first element of the outermost array on `path` that satisfies
