@@ -1169,10 +1169,21 @@ fn type_holds(names: &[String], value: &Bson) -> bool {
     names.iter().any(|n| n == type_name_of(value))
 }
 
-/// `$regex` on one value; only a string can match.
+/// `$regex` on one value (and a regex written as a field's value, which is the same
+/// condition): a string that matches the pattern, or a stored regex value of the same
+/// pattern and flags, as the reference matches it. Any other type does not match.
 fn regex_holds(re: &RegexPattern, value: &Bson) -> bool {
     match value {
         Bson::String(s) => re.is_match(s),
+        Bson::RegularExpression(stored) => {
+            let flags = |text: &str| {
+                let mut chars: Vec<char> = text.chars().collect();
+                chars.sort_unstable();
+                chars
+            };
+            stored.pattern.as_str() == re.pattern()
+                && flags(stored.options.as_str()) == flags(re.options())
+        }
         _ => false,
     }
 }
@@ -1646,6 +1657,33 @@ mod tests {
             pattern: pattern.to_string().try_into().expect("valid pattern"),
             options: options.to_string().try_into().expect("valid options"),
         })
+    }
+
+    #[test]
+    fn a_regex_as_a_field_value_also_matches_a_stored_regex_of_the_same_pattern_and_flags() {
+        let hits =
+            |query: Document, stored: Document| matches(&parse(&query).unwrap(), &stored).unwrap();
+        // The pattern form and the `$regex` form are one condition; both match a string that
+        // the pattern matches and a stored regex equal to it, flags in any order.
+        for query in
+            [doc! { "s": literal("ab", "im") }, doc! { "s": { "$regex": "ab", "$options": "im" } }]
+        {
+            assert!(hits(query.clone(), doc! { "s": "xABx" }), "{query}");
+            assert!(hits(query.clone(), doc! { "s": literal("ab", "im") }), "{query}");
+            assert!(hits(query.clone(), doc! { "s": literal("ab", "mi") }), "{query}");
+            // Another pattern, other flags, and any other type do not match.
+            assert!(!hits(query.clone(), doc! { "s": literal("abc", "im") }), "{query}");
+            assert!(!hits(query.clone(), doc! { "s": literal("ab", "i") }), "{query}");
+            assert!(!hits(query.clone(), doc! { "s": 5 }), "{query}");
+        }
+        // In an array, an element that is the regex matches.
+        assert!(hits(doc! { "s": literal("ab", "") }, doc! { "s": [1, literal("ab", "")] }));
+        assert!(!hits(doc! { "s": literal("ab", "") }, doc! { "s": [1, literal("ba", "")] }));
+        // `$not` and `$ne` read it the same way round.
+        assert!(!hits(
+            doc! { "s": { "$not": { "$regex": "ab" } } },
+            doc! { "s": literal("ab", "") }
+        ));
     }
 
     fn refused(query: Document) -> String {

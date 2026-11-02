@@ -58,9 +58,10 @@ regex as a value too. See [Deviations](deviations.md).
 which over HTTP is `{"s": {"$regularExpression": {"pattern": "ab", "options":
 "i"}}}`, matches the strings `s` holds that match it, as `{"s": {"$regex": "ab",
 "$options": "i"}}` does, with the same refusals (an invalid pattern, a possessive
-quantifier, a construct the engine does not have: a `400`). It matches strings
-only; a stored regex value is not matched by it. Only `$eq` compares a regex as a
-value, `{"s": {"$eq": /ab/}}`.
+quantifier, a construct the engine does not have: a `400`). Like `$regex`, it matches
+the strings that match the pattern and also a stored regex value of the same pattern
+and flags (in any order), as the reference does; no other type matches. `$eq` compares a
+regex as a value, `{"s": {"$eq": /ab/}}`.
 
 ### Logical
 
