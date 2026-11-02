@@ -999,7 +999,7 @@ under [Positional updates](query-language.md#positional-updates) and
   document that matched only through a random branch gives none, so the
   positional `$` is a `400` for it (`{$or: [{a: 2, $sampleRate: 0.9}, {b: 1}]}`
   over `{a: [1, 2, 3]}` with no `b`). That is not recorded against the
-  reference either (`q8-probes/q8d-m3.js`, not run). MongoDB's `$or` does
+  reference either (`q8-probes/q8d-m3.js`, not run). The reference's `$or` does
   not pass match details to its branches, so an update that uses `$` under
   `$or` fails there (*the positional operator did not find the match needed
   from the query*). A filter written for this engine that relies on it does not
