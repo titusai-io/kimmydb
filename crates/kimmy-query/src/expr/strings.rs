@@ -168,6 +168,8 @@ impl StrExpr {
                         }
                     },
                 };
+                // The scan is a pass over the text, a test against the set for each character.
+                super::charge_text(input.len())?;
                 Ok(Bson::String(trim(input, chars.as_deref(), *side).to_string()))
             }
             StrExpr::Regex { kind, input, regex, options, compiled } => {
@@ -194,6 +196,8 @@ impl StrExpr {
                 else {
                     return Ok(Bson::Null);
                 };
+                // The scan for `find` is a pass over the text, and each match writes `with`.
+                super::charge_text(input.len().saturating_add(with.len()))?;
                 replace(input, find, with, *all, MAX_STRING_BYTES).map(Bson::String)
             }
         }

@@ -43,6 +43,8 @@ mod decimal_arith_tests;
 #[cfg(test)]
 mod densify_tests;
 #[cfg(test)]
+mod expr_deadline_tests;
+#[cfg(test)]
 mod facet_tests;
 #[cfg(test)]
 mod fill_tests;
