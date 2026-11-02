@@ -551,3 +551,69 @@ fn two_requests_at_the_default_limit_fill_the_default_pool_and_a_third_waits() {
     let mut lc2 = c.lease("c");
     lc2.charge(1).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// A group's output document, and the value bounds beside the budget (ADR-267, ADR-269)
+// ---------------------------------------------------------------------------
+
+fn with_document_limit(max_document_bytes: usize) -> Limits {
+    Limits { max_document_bytes, ..Default::default() }
+}
+
+#[test]
+fn a_group_document_is_held_to_its_limit_as_a_whole_not_per_accumulator() {
+    // Each array is within the limit on its own (about 2.1 KB against 3,000); the two
+    // together make a document of about 4.2 KB, which is refused at 3,000.
+    let input = padded(10, 200);
+    let one = doc! {"$group": {"_id": null, "a": {"$push": "$pad"}}};
+    let two = doc! {"$group": {"_id": null, "a": {"$push": "$pad"}, "b": {"$push": "$pad"}}};
+    let limits = with_document_limit(3_000);
+    assert_eq!(run(one, input.clone(), &limits).unwrap().len(), 1);
+    let err = run(two.clone(), input.clone(), &limits).unwrap_err();
+    let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!((*what, *max), ("the document $group builds", 3_000));
+    assert!(*bytes > 4_000 && *bytes < 4_500, "{bytes}");
+    // Exactly at the limit it is built, one byte under it is refused.
+    let built = run(two.clone(), input.clone(), &with_document_limit(usize::MAX)).unwrap();
+    let size = doc_bytes(&built[0]);
+    assert!(run(two.clone(), input.clone(), &with_document_limit(size)).is_ok());
+    assert!(is_too_large(&run(two, input, &with_document_limit(size - 1)).unwrap_err()));
+}
+
+#[test]
+fn a_bucket_and_a_bucket_auto_output_document_are_held_to_the_limit_as_a_whole() {
+    let input = padded(30, 200);
+    for stage in [
+        doc! {"$bucket": {"groupBy": "$_id", "boundaries": [0, 30],
+        "output": {"a": {"$push": "$pad"}, "b": {"$push": "$pad"}}}},
+        doc! {"$bucketAuto": {"groupBy": "$_id", "buckets": 1,
+        "output": {"a": {"$push": "$pad"}, "b": {"$push": "$pad"}}}},
+    ] {
+        let name = if stage.contains_key("$bucket") { "$bucket" } else { "$bucketAuto" };
+        let built = run(stage.clone(), input.clone(), &with_document_limit(usize::MAX)).unwrap();
+        let size = doc_bytes(&built[0]);
+        assert!(run(stage.clone(), input.clone(), &with_document_limit(size)).is_ok(), "{name}");
+        let err = run(stage, input.clone(), &with_document_limit(size - 1)).unwrap_err();
+        assert!(
+            matches!(&err, Error::ValueTooLarge { what, .. } if what.contains(name)),
+            "{name}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn the_value_bound_and_the_budget_each_refuse_alone_and_count_the_same_bytes_once() {
+    let input = padded(40, 1_000);
+    let held_in = docs_bytes(&input);
+    let stage = doc! {"$group": {"_id": null, "all": {"$push": "$pad"}}};
+    // The array of 40 strings is 40 KB. The budget is what holds it: charged once beside the
+    // input (the array's own size plus the bucket), not twice.
+    let smallest = smallest_cap(&stage, &input, 4 * held_in);
+    let array = 5 + 40 * (1 + 2 + 5 + 1_000);
+    assert!(smallest >= held_in + array && smallest < held_in + array + 400, "{smallest}");
+    // A budget that fits is refused by nothing; a budget one byte short names the buckets.
+    let err = run(stage, input, &capped(smallest - 1)).unwrap_err();
+    assert!(
+        matches!(&err, Error::ValueTooLarge { what, .. } if what.starts_with("the buckets of $group"))
+    );
+}
