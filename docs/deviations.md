@@ -39,6 +39,16 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 
 ---
 
+<a id="skipped-documents-adr-270"></a>
+
+## 🟡 An error from a document that a later `$skip` or `$limit` would drop is raised here, where the reference answers
+
+**Raised 2026-11-02, with ADR-270; closed by P2.** A stage that streams takes each document through the whole run of them, so a `$limit` that is full ends the scan and an error in a document past it is not raised, as in the reference. A `$skip` before the failing stage does not do the same: `[{$addFields: {x: {$divide: [1, "$d"]}}}, {$skip: 5}, {$limit: 2}]` over documents of which a skipped one has `d: 0` is a `400` (`can't $divide by zero`) here, where the reference answers the two documents after the skip. The reference's optimizer moves a `$skip` and a `$limit` ahead of the stages that neither filter nor change the number of documents (`$project`, `$unset`, `$addFields`, `$set`), so the skipped documents are never evaluated; this build evaluates every document that reaches the skip. Measured on the reference (`q8-probes/adr270-p1.js`, rows 3c and 3d, `q8-probes/reference-6.0.5/phaseB-q8d/20261102T1809Z/adr270-p1.out`): `[$addFields (divide), $skip 8, $limit 2]` with the zero at document 6 answers `[8,9]`, and with the zero at document 3 and `$skip 5, $limit 2` answers `[5,6]`; here both are `400`. An error inside the window is raised by both (row 3b). A `$skip` or `$limit` after a stage that filters or fans out (`$match`, `$unwind`) is not moved by the reference, and the two agree.
+
+**To close:** P2 builds the reference's reordering (a `$skip` and a `$limit` move ahead of the count-preserving, non-filtering stages), which closes this entry.
+
+---
+
 ## 🟡 `$setWindowFields`, `$densify` and `$fill`: Decimal128 read as doubles, a date `unit` that defaults, a sliding deviation that is NaN, and a few edges
 
 **Raised 2026-10-31, with ADR-264; revised after review.** `$setWindowFields`, `$densify` and `$fill` are built ([aggregation.md](aggregation.md#setwindowfields)). The order of the partitions, `"current"` in a range window, `$expMovingAvg`, `$locf` without a sort, a missing or null `$densify` field, the `$densify` grid and the months' drift, the covariance operators and the documents a window refuses all follow the reference. Where they differ:

@@ -117,6 +117,29 @@ fn an_error_in_a_document_past_a_full_limit_is_not_raised() {
 }
 
 #[test]
+fn an_error_in_a_document_a_skip_drops_is_still_raised_until_the_skip_is_moved_ahead() {
+    // Registered in `docs/deviations.md` (skipped-documents-adr-270): the reference moves a
+    // `$skip` and a `$limit` ahead of `$addFields`, and answers `[5, 6]` here; a stage that
+    // streams evaluates every document that reaches the skip. P2 builds the reordering and
+    // this becomes an answer.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, numbered(40, &[3]));
+    let divide = json!({"$addFields": {"x": {"$divide": [1, "$d"]}}});
+    let err = run(
+        &state,
+        json!([divide.clone(), {"$skip": 5}, {"$limit": 2}]),
+        aggregate::Limits::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(err.message.contains("$divide"), "{}", err.message);
+    // A skip that is first drops the document before the stage sees it.
+    let ok =
+        run(&state, json!([{"$skip": 5}, divide, {"$limit": 2}]), aggregate::Limits::default());
+    assert_eq!(ids(&ok.unwrap()), [5, 6]);
+}
+
+#[test]
 fn the_source_of_a_pipeline_that_streams_has_no_ceiling_and_one_that_blocks_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, numbered(30, &[]));
