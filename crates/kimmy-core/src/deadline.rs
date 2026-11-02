@@ -411,6 +411,17 @@ pub fn tick_n(n: usize) -> Result<()> {
     shared_look(n)
 }
 
+/// How many more ticks the shared count takes before it reads the clock, or `None` when no
+/// deadline is set (and nothing is counted). A charge made with [`tick_n`] of at least this
+/// reads the clock, whatever else it is: a caller that works out how much to charge by
+/// walking something can stop walking once it has reached this, and the charge it makes is
+/// the same in effect (one read, and the same cadence after it; only the ticks it reports to
+/// [`ticks_taken`] are the truncated sum). It is a thread-local read, and costs nothing else.
+#[inline]
+pub fn remaining_stride() -> Option<usize> {
+    if DEADLINE.get().is_some() { Some(SHARED_LEFT.get() as usize) } else { None }
+}
+
 #[cold]
 fn shared_look(n: u32) -> Result<()> {
     // What the window took before this call, and this call's ticks in full.
@@ -431,6 +442,29 @@ mod tests {
 
     fn reads() -> u64 {
         clock_reads()
+    }
+
+    #[test]
+    fn the_remaining_stride_is_none_without_a_deadline_and_what_is_left_with_one() {
+        assert_eq!(remaining_stride(), None);
+        {
+            let _scope = Deadline::scope(Some(Duration::from_secs(3600)));
+            // A fresh scope has a stride of one, all of it to go.
+            assert_eq!(remaining_stride(), Some(1));
+            tick_n(0).unwrap();
+            assert_eq!(remaining_stride(), Some(1));
+            // The first tick reads the clock and the count starts again at the stride it learns.
+            tick().unwrap();
+            let after = remaining_stride().unwrap();
+            assert!(after >= 1);
+            if after > 1 {
+                tick().unwrap();
+                assert_eq!(remaining_stride(), Some(after - 1));
+            }
+        }
+        assert_eq!(remaining_stride(), None, "the scope is gone");
+        let _suspended = Deadline::suspend();
+        assert_eq!(remaining_stride(), None);
     }
 
     #[test]
