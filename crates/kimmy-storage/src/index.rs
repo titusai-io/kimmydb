@@ -4402,6 +4402,18 @@ mod tests {
         stop_after: usize,
         fail_at: Option<usize>,
     ) -> Result<(Vec<i64>, IndexScanOutcome)> {
+        walk_held_under(order, hold, stop_after, fail_at, false)
+    }
+
+    /// [`walk_held`], with the request's deadline already passed when the scan starts if
+    /// `expired` (and not while the documents are written).
+    fn walk_held_under(
+        order: CandidateOrder<'_>,
+        hold: &StubHold,
+        stop_after: usize,
+        fail_at: Option<usize>,
+        expired: bool,
+    ) -> Result<(Vec<i64>, IndexScanOutcome)> {
         let (engine, coll, _dir) = engine();
         for i in 0..200i64 {
             engine.insert(&coll, doc! { "_id": i, "n": i }).unwrap();
@@ -4417,6 +4429,8 @@ mod tests {
             exact: plan.exact,
         };
         let mut ids = Vec::new();
+        let _expired =
+            expired.then(|| kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO)));
         let outcome = engine.visit_index_candidates_held(
             &coll,
             &scan,
@@ -4476,9 +4490,13 @@ mod tests {
         // included: a passed deadline ends it with the deadline's error before one key is
         // held and before the first document is offered, and the hold is empty.
         let hold = StubHold::with_room(usize::MAX);
-        let _expired = kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO));
-        let ended =
-            walk_held(CandidateOrder::ById { after: None, want: None }, &hold, usize::MAX, None);
+        let ended = walk_held_under(
+            CandidateOrder::ById { after: None, want: None },
+            &hold,
+            usize::MAX,
+            None,
+            true,
+        );
         assert!(
             matches!(&ended, Err(StorageError::Core(CoreError::DeadlineExceeded))),
             "{:?}",
