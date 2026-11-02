@@ -20840,6 +20840,48 @@ async fn sample_rate_keeps_about_its_share_through_find_count_update_and_delete(
     assert_eq!(res.body["count"].as_u64().unwrap(), 1000 - deleted);
 }
 
+/// A `$lookup` sub-pipeline's leading `$sampleRate` (or `$expr` with `$rand`) is drawn for each
+/// outer document: two outer documents get two different samples of the foreign ones (review
+/// q8d, M3). Applied once to the foreign documents and shared, they would get one.
+#[tokio::test]
+async fn a_lookup_samples_the_foreign_documents_again_for_each_outer_document() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, (1..=2).map(|i| json!({ "_id": i })).collect()).await;
+    let res =
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "foreign" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs: Vec<Value> = (0..1000).map(|i| json!({ "_id": i })).collect();
+    let res = server.post("/v1/db/shop/coll/foreign/bulk", Some(&token), Value::Array(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    for leading in [
+        json!({ "$match": { "$sampleRate": 0.5 } }),
+        json!({ "$match": { "$expr": { "$lt": [{ "$rand": {} }, 0.5] } } }),
+    ] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/pu/aggregate",
+                Some(&token),
+                json!({ "pipeline": [
+                    { "$sort": { "_id": 1 } },
+                    { "$lookup": {
+                        "from": "foreign",
+                        "pipeline": [leading.clone(), { "$project": { "_id": 1 } }],
+                        "as": "s" } },
+                    { "$project": { "_id": 0, "s": "$s._id" } } ] }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{leading}: {:?}", res.body);
+        let samples = res.body["documents"].as_array().expect("documents");
+        assert_eq!(samples.len(), 2);
+        let (first, second) = (&samples[0]["s"], &samples[1]["s"]);
+        for s in [first, second] {
+            assert!((405..595).contains(&s.as_array().unwrap().len()), "{leading}");
+        }
+        assert_ne!(first, second, "{leading}: one sample shared by both outer documents");
+    }
+}
+
 #[tokio::test]
 async fn a_pipeline_update_judges_id_on_the_final_result_and_takes_an_empty_pipeline() {
     // Reference 6.0.5: a result without `_id` gets the stored one back; a changed one is

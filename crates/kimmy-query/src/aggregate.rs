@@ -325,9 +325,9 @@ pub enum Join {
 /// decline: see `docs/decisions.md`, ADR-222.
 #[derive(Clone, Debug)]
 pub struct Lead {
-    /// The leaves that read no variable, applied once to the foreign set.
+    /// The leaves that read no variable and draw no random number, applied once to the foreign set.
     pub independent: Filter,
-    /// The leaves that read a variable, evaluated per input document.
+    /// The leaves that read a variable or draw a random number, evaluated per input document.
     pub variable: Filter,
     /// A variable leaf `{$expr: {$eq: [A, B]}}` that the executor may hash on.
     pub key: Option<JoinKey>,
@@ -359,6 +359,10 @@ impl Lead {
             let Filter::Expr(e) = leaf else { return None };
             let Expr::Op(crate::expr::Op::Eq, args) = e.as_ref() else { return None };
             let [a, b] = args.as_slice() else { return None };
+            // A side that draws a random number is drawn for each pair, not once for a key.
+            if a.draws_random() || b.draws_random() {
+                return None;
+            }
             let foreign_side = |x: &Expr, y: &Expr| {
                 x.reads_document() && !x.reads_variable(names) && !y.reads_document()
             };
@@ -372,8 +376,12 @@ impl Lead {
         }
         let mut leaves = Vec::new();
         flatten(filter, &mut leaves);
-        let (variable, independent): (Vec<&Filter>, Vec<&Filter>) =
-            leaves.into_iter().partition(|leaf| filter::reads_variable(leaf, names));
+        // A leaf that draws a random number (`$sampleRate`, `$expr` with `$rand`) is not a
+        // function of the foreign document alone, so it is decided for each input document
+        // like one that reads a variable, and not once for all of them.
+        let (variable, independent): (Vec<&Filter>, Vec<&Filter>) = leaves
+            .into_iter()
+            .partition(|leaf| filter::reads_variable(leaf, names) || leaf.draws_random());
         if variable.is_empty() {
             return None;
         }
@@ -5261,6 +5269,31 @@ mod lead {
     #[test]
     fn a_match_that_reads_no_variable_has_no_lead() {
         assert!(lead_of(doc! {"$match": {"kind": "x", "$expr": {"$gt": ["$q", 1]}}}).is_none());
+    }
+
+    /// A leaf that draws a random number is decided for each input document, as one that reads
+    /// a variable is, and not once for all of them (review q8d, M3): the sample of the foreign
+    /// documents one outer document gets is not another's.
+    #[test]
+    fn a_leaf_that_draws_a_random_number_is_decided_for_each_input_document() {
+        for stage in [
+            doc! {"$match": {"$sampleRate": 0.5}},
+            doc! {"$match": {"$expr": {"$lt": [{"$rand": {}}, 0.5]}}},
+            doc! {"$match": {"$or": [{"$sampleRate": 0.5}, {"kind": "x"}]}},
+            doc! {"$match": {"$expr": {"$lt": ["$q", {"$multiply": [{"$rand": {}}, 10]}]}}},
+        ] {
+            let lead = lead_of(stage.clone()).unwrap_or_else(|| panic!("a lead for {stage}"));
+            assert_eq!(clauses(&lead.independent), 0, "{stage}");
+            assert_eq!(clauses(&lead.variable), 1, "{stage}");
+            assert!(lead.key.is_none(), "{stage}");
+        }
+        // Beside an independent clause, only the random one is held back; and a `$rand` is not
+        // a key for the join to hash on.
+        let lead = lead_of(doc! {"$match": {"kind": "x", "$sampleRate": 0.5}}).unwrap();
+        assert_eq!((clauses(&lead.independent), clauses(&lead.variable)), (1, 1));
+        let lead = lead_of(doc! {"$match": {"$expr": {"$eq": ["$k", {"$rand": {}}]}}}).unwrap();
+        assert!(lead.key.is_none());
+        assert_eq!(clauses(&lead.variable), 1);
     }
 
     #[test]
