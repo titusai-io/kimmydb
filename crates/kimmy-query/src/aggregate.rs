@@ -101,6 +101,13 @@ pub struct Limits {
 /// small enough that a hostile pipeline cannot exhaust a node.
 pub const DEFAULT_MAX_DOCUMENTS: usize = 100_000;
 
+/// The most stages one pipeline may have, a `$facet` branch and a `$lookup` or `$unionWith`
+/// sub-pipeline each counted on its own. The reference's limit is believed to be the same
+/// number; that is not yet probed (see `docs/deviations.md`). It is a bound on the body a
+/// client can send, not what keeps the stack safe: [`crate::pipeline`] runs a run of stages
+/// that stream in one loop, whatever its length.
+pub const MAX_PIPELINE_STAGES: usize = 1_000;
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -535,6 +542,13 @@ impl Placement {
 }
 
 fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
+    if pipeline.len() > MAX_PIPELINE_STAGES {
+        return Err(Error::InvalidQuery(format!(
+            "a pipeline has {} stages, over the limit of {MAX_PIPELINE_STAGES}. A $facet branch \
+             and a $lookup or $unionWith sub-pipeline are each counted on their own",
+            pipeline.len()
+        )));
+    }
     let stages = pipeline
         .iter()
         .enumerate()
@@ -3423,6 +3437,38 @@ mod tests {
         assert!(err.contains("more than 2 MiB together"), "{err}");
         // And each pipeline has its own.
         parse(&[one(0), one(1)]).unwrap();
+    }
+
+    #[test]
+    fn a_pipeline_is_held_to_a_thousand_stages_wherever_it_is() {
+        let skips = |n: usize| vec![doc! {"$skip": 0}; n];
+        assert_eq!(MAX_PIPELINE_STAGES, 1_000);
+        assert_eq!(parse(&skips(1_000)).unwrap().len(), 1_000);
+        let refused = "a pipeline has 1001 stages, over the limit of 1000. A $facet branch and a \
+                       $lookup or $unionWith sub-pipeline are each counted on their own";
+        let err = parse(&skips(1_001)).unwrap_err();
+        assert_eq!(err.to_string(), format!("invalid query: {refused}"));
+        // A trailing `$out` is one of the stages counted.
+        let mut with_out = skips(1_000);
+        with_out.push(doc! {"$out": "o"});
+        assert!(parse(&with_out).unwrap_err().to_string().contains(refused));
+        // A `$facet` branch, a `$lookup` sub-pipeline and a `$unionWith` sub-pipeline are each
+        // counted on their own, so each takes a thousand and the pipeline around them is
+        // not counted with them, and each is refused at one more.
+        let bson = |stages: Vec<Document>| -> Vec<Bson> {
+            stages.into_iter().map(Bson::Document).collect()
+        };
+        let wrappers: [fn(Vec<Bson>) -> Document; 3] = [
+            |stages| doc! {"$facet": {"a": stages}},
+            |stages| doc! {"$lookup": {"from": "items", "pipeline": stages, "as": "items"}},
+            |stages| doc! {"$unionWith": {"coll": "items", "pipeline": stages}},
+        ];
+        for wrap in wrappers {
+            let whole = vec![wrap(bson(skips(1_000))), doc! {"$skip": 0}];
+            assert_eq!(parse(&whole).unwrap().len(), 2);
+            let err = parse(&[wrap(bson(skips(1_001)))]).unwrap_err().to_string();
+            assert!(err.contains(refused), "{err}");
+        }
     }
 
     #[test]

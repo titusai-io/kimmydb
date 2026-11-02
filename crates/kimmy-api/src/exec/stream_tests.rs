@@ -263,3 +263,19 @@ fn a_streamed_pipeline_ending_in_a_sink_writes_what_the_stages_left() {
 fn run_on(state: &SharedState, coll: &str, pipeline: Value) -> Value {
     agg_limits(state, &root(), "app", coll, &pipeline, aggregate::Limits::default()).unwrap()
 }
+
+#[test]
+fn a_pipeline_of_more_than_a_thousand_stages_is_a_400_that_names_the_count_and_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, numbered(3, &[]));
+    let skips = |n: usize| Value::Array(vec![json!({"$skip": 0}); n]);
+    let ok = run(&state, skips(1_000), aggregate::Limits::default()).unwrap();
+    assert_eq!(ok["count"], 3);
+    let err = run(&state, skips(1_001), aggregate::Limits::default()).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(
+        err.message.contains("a pipeline has 1001 stages, over the limit of 1000"),
+        "{}",
+        err.message
+    );
+}

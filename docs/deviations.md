@@ -25,6 +25,20 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 
 ---
 
+<a id="pipeline-stage-limit-adr-270"></a>
+
+## 🟡 A pipeline is held to 1,000 stages, where the reference's limit is believed to be the same number
+
+**Raised 2026-11-02, with ADR-270.** An aggregation is refused with `400` (`a pipeline has 1001 stages, over the limit of 1000. A $facet branch and a $lookup or $unionWith sub-pipeline are each counted on their own`) when its stages number more than `MAX_PIPELINE_STAGES` (1,000). Any length was accepted before: the 2 MiB body limit allows about 170,000 stages of `{"$skip": 0}`, and the stages of a run now take each document through a loop that does not grow the stack with them (ADR-270), so the bound is a limit on what a client may send, not what keeps a worker standing.
+
+**What is counted.** The elements of the array a client sends, each as one: a trailing `$merge` or `$out` is one of them, `$set` and `$addFields` are one each, and so are `$unset`, `$replaceWith` and `$sortByCount`. Every pipeline is counted on its own: the top level, each `$facet` branch, and the sub-pipeline of a `$lookup` or a `$unionWith`, so a pipeline of 1,000 stages may hold a `$facet` whose branches have 1,000 each. A pipeline-style update (an array of `$set`, `$unset` and `$replaceRoot` stages) is not an aggregation and has no such limit.
+
+**What could differ.** The number 1,000 is the reference's limit as it is believed to be, and has not been probed. The reference may count after it has expanded a stage into the stages it is made of (`$sortByCount` into a group and a sort, `$bucket` into a group and a sort, `$count` into a group and a project), may count a view's pipeline with the query's, or may count a sub-pipeline with the pipeline around it; a pipeline near the limit can be accepted by one and refused by the other. The probe is `q8-probes/adr270-p1.js`.
+
+**To close:** record the limit and what it counts on the reference, and make the count agree.
+
+---
+
 ## 🟡 `$setWindowFields`, `$densify` and `$fill`: Decimal128 read as doubles, a date `unit` that defaults, a sliding deviation that is NaN, and a few edges
 
 **Raised 2026-10-31, with ADR-264; revised after review.** `$setWindowFields`, `$densify` and `$fill` are built ([aggregation.md](aggregation.md#setwindowfields)). The order of the partitions, `"current"` in a range window, `$expMovingAvg`, `$locf` without a sort, a missing or null `$densify` field, the `$densify` grid and the months' drift, the covariance operators and the documents a window refuses all follow the reference. Where they differ:
