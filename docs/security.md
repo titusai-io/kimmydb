@@ -1314,12 +1314,14 @@ free, and both are cut off with `503 timeout` (`retry: wait`). Synchronous work
 never yields, so the future's timeout cannot end it; the work that can be
 cancelled cooperatively ends itself instead ([ADR-266](decisions.md)): an
 aggregation, a `find` or `count` scan and an update, delete or find-and-modify
-that has not yet written read the deadline every 1,024 iterations and stop with
+that has not yet written read the deadline every millisecond or so of work and stop with
 the same `503 timeout`, freeing the worker. An index build, a bulk insert, a
 backup, a restore and a database drop are not cut and are answered with their
 result however long they took. The
-change-stream upgrade (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` answer with
-a connection rather than a document and carry no deadline at all.
+change-stream upgrade (`/v1/db/{db}/coll/{coll}/watch`) answers with a
+connection rather than a document and carries no deadline; an `/mcp` tool call
+carries the same deadline as a REST request, and an aggregation it runs is cut
+at it.
 
 **The body ceiling is the one that was always there.** 2 MiB is what axum
 enforced on its own before the setting existed; it is a setting now so an

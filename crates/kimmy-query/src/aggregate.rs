@@ -36,8 +36,8 @@
 //! A pipeline runs on the worker thread without yielding, so the request timeout
 //! cannot end it. It ends itself: [`apply_with_vars`] looks at the thread's deadline
 //! ([`crate::deadline`]) as each stage starts, and every loop in a stage ticks a
-//! `deadline::Ticker`, which reads the clock on the first iteration and every 1,024th
-//! after it, and fails with `Error::DeadlineExceeded` once the deadline has passed.
+//! `deadline::Ticker`, which reads the clock on the first iteration and then at a
+//! stride that follows the cost of an iteration (about every 1 to 10 ms of work), and fails with `Error::DeadlineExceeded` once the deadline has passed.
 //! Outside a handler that set a deadline every call is a no-op.
 //!
 //! **A stage added to this module takes the same two lines**: `let mut ticker =

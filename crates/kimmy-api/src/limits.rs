@@ -28,8 +28,8 @@
 //! A handler that runs synchronous work reads the time it has left
 //! ([`request_time_left`]) and sets it as a thread-local deadline for the
 //! duration of the call ([`deadline_scope`]). The loops under it call
-//! `kimmy_core::deadline` (a counter increment per iteration, a clock read
-//! every 1024th), and past the deadline they return
+//! `kimmy_core::deadline` (a counter decrement per iteration, a clock read about
+//! every 1 to 10 ms of work, whatever an iteration costs), and past the deadline they return
 //! `kimmy_core::Error::DeadlineExceeded`, which is answered with the same
 //! `503 timeout` this module's middleware gives, naming the configured
 //! timeout. The worker is freed at the next check instead of at the end of the

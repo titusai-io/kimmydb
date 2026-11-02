@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 
 /// The most ticks between two reads of the clock.
-pub const MAX_STRIDE: u32 = 1024;
+pub const MAX_STRIDE: u32 = 512;
 
 /// A gap between two reads shorter than this doubles the stride.
 pub const FAST: Duration = Duration::from_millis(1);
@@ -467,7 +467,7 @@ mod tests {
         let (base, mut now, mut c) = (Instant::now(), Duration::ZERO, Cadence::new());
         let reads = simulate(&mut c, base, &mut now, Duration::from_nanos(100), 20_000);
         let at: Vec<u32> = reads.iter().map(|r| r.0).collect();
-        // The first tick, then the stride doubles: ticks 1, 2, 4, 8, ... 1024 ...
+        // The first tick, then the stride doubles: ticks 1, 2, 4, 8, ... 512 ...
         assert_eq!(&at[..5], &[1, 2, 4, 8, 16]);
         assert_eq!(c.stride, MAX_STRIDE);
         // And from there on one read in `MAX_STRIDE` ticks.

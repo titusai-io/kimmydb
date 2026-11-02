@@ -2226,8 +2226,11 @@ expression that iterates (`$reduce` over `$range` inside a `$map`) can cost
 millions of evaluations a document within every cap. A pipeline therefore runs
 under the request's deadline, `server.request_timeout_secs` (30 s by default,
 [ADR-266](decisions.md)). Every stage looks at the clock as it starts, every
-loop in a stage looks at it every 1,024 iterations (`$map`, `$filter` and
-`$reduce` count their elements, and `$sort` is done in runs of 4,096 documents
+loop in a stage looks at it about every 1 to 10 milliseconds of work, whatever an
+iteration costs (the interval adapts: it reads at every iteration that is dear
+and every few hundred that are cheap; `$map`, `$filter` and `$reduce` count their
+elements, the bulk array and string operators and `$range` count what they are
+about to touch, and `$sort` is done in runs of 4,096 documents
 with a look between them), and the reads of other collections by `$lookup` and
 `$graphLookup` look at it per row; `$unionWith` looks at it per document it
 reads and per document it appends, `$sample` in its reservoir and its shuffle,

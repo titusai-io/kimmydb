@@ -115,7 +115,7 @@ webhook's or provider's host has stalled, is abandoned with `503 timeout` at
 iteration operators, `$lookup`, `$graphLookup`, the reads of other collections
 and the pipeline of a `$merge` or `$out`), the scan under a `find` or `count`,
 and an update, delete or find-and-modify until its first commit. Each looks at
-the clock every 1,024 iterations and, past the deadline, stops with the same
+the clock every millisecond or so of work and, past the deadline, stops with the same
 `503 timeout`, freeing its worker; a read or a pure computation is simply
 abandoned. A request that commits more than once follows ADR-192: the
 deadline cuts it only before its first commit. A `$merge` or `$out` is cut
