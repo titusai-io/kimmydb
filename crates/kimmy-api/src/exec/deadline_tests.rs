@@ -75,6 +75,10 @@ fn an_aggregation_reading_its_source_is_cut_at_a_passed_deadline_and_runs_with_t
         json!([{ "$group": { "_id": "$k", "n": { "$sum": 1 } } }]),
         json!([{ "$sort": { "v": -1 } }]),
         json!([{ "$match": { "k": 1 } }]),
+        // Stages that stream take the scan into the same scope (ADR-270).
+        json!([{ "$addFields": { "w": 1 } }, { "$limit": 5 }]),
+        json!([{ "$project": { "v": 1 } }]),
+        json!([{ "$unwind": "$tags" }, { "$match": { "tags": "a" } }]),
         json!([{ "$lookup": { "from": "items", "localField": "k", "foreignField": "k",
                                "as": "got" } }]),
         json!([{ "$lookup": { "from": "items", "let": { "k": "$k" },
