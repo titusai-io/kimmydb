@@ -509,6 +509,17 @@ impl Lease {
             // alone would pass the whole pool is refused at once: waiting cannot help it.
             let give_up = inner.wait_until.unwrap_or_else(|| Instant::now() + POOL_WAIT_DEFAULT);
             while !pool.try_reserve(want) {
+                // The wait is a synchronous sleep, which the request's deadline cannot cut
+                // from outside: it looks at the deadline itself at every wake-up, and at the
+                // node's stop (which `check` sees under a deadline scope, and this sees
+                // without one). Either ends it with the error those answer, not as a refusal
+                // of the pool: `503 timeout` or `503 node_stopping`. It is asked **before** the
+                // bound of the budget is, since that bound is the request's own deadline when
+                // there is one: a wait that reaches it is the deadline's answer.
+                if kimmy_core::deadline::requests_are_stopped() {
+                    return Err(Error::DeadlineExceeded);
+                }
+                kimmy_core::deadline::check()?;
                 let now = Instant::now();
                 if inner.used > pool.cap() || pool.is_youngest(seq) || now >= give_up {
                     // A holder that was younger may have been refused, and given its bytes

@@ -339,6 +339,64 @@ fn a_waiting_request_is_ended_by_its_deadline_and_the_pool_comes_back() {
 }
 
 #[test]
+fn a_waiting_request_is_ended_by_the_deadline_scope_it_runs_under() {
+    // The wait is a synchronous sleep, so the request's deadline fires inside it: under a
+    // scope of 80 ms the older request's wait ends there with the deadline's own error, not
+    // the pool's refusal and not at the (much later) bound of its own budget.
+    let pool = MemoryPool::new(100);
+    let (budget, mut older) = holder(&pool, 10);
+    budget.wait_until(Instant::now() + Duration::from_secs(30));
+    let (_a, younger) = holder(&pool, 80);
+    let started = Instant::now();
+    let err = {
+        let _scope = kimmy_core::deadline::Deadline::scope(Some(Duration::from_millis(80)));
+        older.charge(50).unwrap_err()
+    };
+    let waited = started.elapsed();
+    assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+    assert!(waited >= Duration::from_millis(60) && waited < Duration::from_secs(5), "{waited:?}");
+    assert_eq!(pool.pool_refusals(), 0, "a deadline is not a refusal of the pool");
+    drop(older);
+    drop(budget);
+    drop(younger);
+    assert_eq!((pool.used(), pool.holders()), (0, 0));
+    // With no scope the wait runs to the bound of its own budget, as before.
+    let (budget, mut older) = holder(&pool, 10);
+    budget.wait_until(Instant::now() + Duration::from_millis(80));
+    let (_a, _younger) = holder(&pool, 80);
+    assert!(is_busy(&older.charge(50).unwrap_err()));
+}
+
+#[test]
+fn a_wait_that_reaches_the_request_deadline_is_the_deadlines_answer_not_the_pools() {
+    // `AggregateMemory::limits` sets the budget's own bound to the request's deadline, so the
+    // two coincide: the bound is the deadline's, and must not be tested first.
+    for lead in [Duration::from_millis(100), Duration::ZERO] {
+        let pool = MemoryPool::new(100);
+        let (budget, mut older) = holder(&pool, 10);
+        let (_a, younger) = holder(&pool, 80);
+        let end = Instant::now() + lead;
+        budget.wait_until(end);
+        let scope = kimmy_core::deadline::Deadline::scope(Some(lead));
+        let err = older.charge(50).unwrap_err();
+        drop(scope);
+        assert!(matches!(err, Error::DeadlineExceeded), "lead {lead:?}: {err:?}");
+        assert_eq!(pool.pool_refusals(), 0, "the deadline is not a refusal of the pool");
+        drop(older);
+        drop(budget);
+        drop(younger);
+        assert_eq!((pool.used(), pool.holders()), (0, 0));
+    }
+    // The bound of the budget with no deadline in scope is still the pool's own refusal.
+    let pool = MemoryPool::new(100);
+    let (budget, mut older) = holder(&pool, 10);
+    budget.wait_until(Instant::now() + Duration::from_millis(60));
+    let (_a, _younger) = holder(&pool, 80);
+    assert!(is_busy(&older.charge(50).unwrap_err()));
+    assert_eq!(pool.pool_refusals(), 1);
+}
+
+#[test]
 fn a_request_that_alone_would_pass_the_whole_pool_is_refused_at_once() {
     let pool = MemoryPool::new(100);
     let budget = BufferBudget::pooled(1_000, &pool);
@@ -932,46 +990,59 @@ fn the_library_default_is_a_fresh_fallback_budget_and_not_what_a_member_runs_on(
     assert!(derived(2 << 30).0 < DEFAULT_MEMORY_LIMIT_BYTES / 9);
 }
 
-#[test]
-fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_an_explicit_limit_of_two_gib()
-{
-    // 100,000 documents of 4 KiB are 412 MB of BSON and are charged 537 MB parsed (1.30 times:
-    // the cost of being a document is about 1.2 KB beside the string); `$addFields` holds them
-    // and its output, about 1.08 GB: over an explicit limit of 1 GiB, under one of 2 GiB, which
-    // is what this check needs (the derived limit of a container under about 20 GiB refuses
-    // it; see the next test). Worked out from real documents, charged through the real
-    // accounts, with nothing allocated.
-    let n = 100_000usize;
-    let one = doc! {"_id": 1_i32, "pad": "x".repeat(4_096)};
+/// `{_id, pad}` with a string of `pad` characters, and the same with one boolean field added by
+/// `$addFields`: the two sizes a document is charged at, input and output.
+fn add_fields_pair(pad: usize) -> (Document, Document) {
+    let one = doc! {"_id": 1_i32, "pad": "x".repeat(pad)};
     let mut grown = one.clone();
     grown.insert("flag", true);
-    let (size_in, size_out) = (held_bytes(&one), held_bytes(&grown));
-    let limits = Limits { buffer: BufferBudget::new(2 << 30), ..Default::default() };
-    let mut input = limits.buffer.lease("the input of $addFields");
-    let mut output = limits.buffer.lease("the output of $addFields");
-    for _ in 0..n {
-        input.charge(size_in).unwrap();
+    (one, grown)
+}
+
+/// The most `$addFields` holds over 100,000 of them: every input and every output.
+fn add_fields_peak(pad: usize) -> usize {
+    let (one, grown) = add_fields_pair(pad);
+    100_000 * (held_bytes(&one) + held_bytes(&grown))
+}
+
+#[test]
+fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_an_explicit_limit() {
+    // The review's acceptance check 3: 100,000 documents of 4 KiB through `$addFields`. The
+    // documents of 4,094 bytes of BSON (a string of 4,070 characters) are charged 5,336 each and
+    // 5,372 with the field added: a peak of 1,070,800,000, under 1 GiB (1,073,741,824) by 0.3%.
+    // With a string of 4,096 characters (4,120 bytes) they are charged 5,372 and 5,408: a peak
+    // of 1,078,000,000, over 1 GiB and under 2 GiB. Worked out from real documents, charged
+    // through the real accounts, with nothing allocated.
+    let n = 100_000usize;
+    for (pad, peak_expected, runs_at_one_gib) in
+        [(4_070usize, 1_070_800_000usize, true), (4_096, 1_078_000_000, false)]
+    {
+        let (one, grown) = add_fields_pair(pad);
+        let (size_in, size_out) = (held_bytes(&one), held_bytes(&grown));
+        assert_eq!(n * (size_in + size_out), peak_expected, "pad {pad}");
+        for (cap, runs) in [(1usize << 30, runs_at_one_gib), (2 << 30, true)] {
+            let limits = Limits { buffer: BufferBudget::new(cap), ..Default::default() };
+            let mut input = limits.buffer.lease("the input of $addFields");
+            let mut output = limits.buffer.lease("the output of $addFields");
+            let ran = (0..n).all(|_| input.charge(size_in).is_ok())
+                && (0..n).all(|_| output.charge(size_out).is_ok());
+            assert_eq!(ran, runs, "pad {pad} under {cap}: peak {peak_expected}");
+            if ran {
+                assert_eq!(limits.buffer.used(), peak_expected);
+                // The answer is then the documents and their JSON: still under the limit.
+                drop(input);
+                let json = format!(r#"{{"_id":1,"pad":"{}","flag":true}}"#, "x".repeat(pad)).len();
+                let mut answer = limits.buffer.lease("the answer");
+                for _ in 0..n {
+                    answer.charge(json).unwrap();
+                }
+                assert!(limits.buffer.used() < cap, "{}", limits.buffer.used());
+            }
+        }
+        // The plain BSON bytes of the same would have fit 1 GiB either way: the estimate is
+        // what makes the second not.
+        assert!(n * (doc_bytes(&one) + doc_bytes(&grown)) < 1 << 30);
     }
-    for _ in 0..n {
-        output.charge(size_out).unwrap();
-    }
-    let peak = limits.buffer.used();
-    assert_eq!(peak, n * (size_in + size_out));
-    assert!(peak > 1_050_000_000 && peak < 1_110_000_000, "{peak}");
-    assert!(peak < limits.buffer.cap(), "{peak} runs under {}", limits.buffer.cap());
-    // And the plain BSON bytes of the same would have fit a limit of 1 GiB: the estimate is
-    // what makes it not.
-    assert!(n * (doc_bytes(&one) + doc_bytes(&grown)) < 1 << 30);
-    assert!(peak > 1 << 30);
-    // The answer is then the documents and their JSON: still under it.
-    drop(input);
-    // `{"_id":1,"pad":"<4096 bytes>","flag":true}`
-    let json = r#"{"_id":1,"pad":""#.len() + 4_096 + r#"","flag":true}"#.len();
-    let mut answer = limits.buffer.lease("the answer");
-    for _ in 0..n {
-        answer.charge(json).unwrap();
-    }
-    assert!(limits.buffer.used() < limits.buffer.cap(), "{}", limits.buffer.used());
 }
 
 #[test]
@@ -979,17 +1050,20 @@ fn a_hundred_thousand_documents_of_four_kib_are_refused_at_the_derived_limits() 
     // The same 100,000 documents against the limit a member derives. The source read is
     // charged whole before any stage runs and stops at the document that passes the limit;
     // `$addFields` holds input plus output, so it needs twice the source.
-    let one = doc! {"_id": 1_i32, "pad": "x".repeat(4_096)};
-    let mut grown = one.clone();
-    grown.insert("flag", true);
+    let (one, grown) = add_fields_pair(4_096);
     let (size, size_out) = (held_bytes(&one), held_bytes(&grown));
     assert_eq!((size, size_out), (5_372, 5_408));
     let n = 100_000usize;
-    // About 1.08 GB are held at the peak, so `$addFields` runs from a container of about
-    // 20 GiB (1.08 GB x 20), and not in 2, 8 or 16 GiB.
-    for (memory, runs) in
-        [(2usize << 30, false), (8 << 30, false), (16 << 30, false), (24 << 30, true)]
-    {
+    // The peak is 1,078,000,000 (1,070,800,000 for the 4,094-byte documents): `$addFields`
+    // runs from a limit that high, a container 20 times it: 20.1 GiB (19.95).
+    for (memory, runs) in [
+        (2usize << 30, false),
+        (8 << 30, false),
+        (16 << 30, false),
+        (20 << 30, false),
+        (21 << 30, true),
+        (24 << 30, true),
+    ] {
         let (limit, pool) = derived(memory);
         let budget = BufferBudget::pooled(limit, &MemoryPool::new(pool));
         // The source read: the document that passes the limit is the first refused.
@@ -1011,6 +1085,10 @@ fn a_hundred_thousand_documents_of_four_kib_are_refused_at_the_derived_limits() 
             assert_eq!(i, limit / size + 1, "{} GiB", memory >> 30);
         }
     }
+    // The review's documents (4,094 bytes) run in a container of 20 GiB, where these do not.
+    let peak = add_fields_peak(4_070);
+    assert!(peak <= derived(20 << 30).0 && peak > derived(19 << 30).0, "{peak}");
+    assert!(add_fields_peak(4_096) > derived(20 << 30).0);
     // A 2 GiB member refuses the read itself, at the 19,988th document of the 100,000.
     assert_eq!(derived(2 << 30).0 / size + 1, 19_988);
 }

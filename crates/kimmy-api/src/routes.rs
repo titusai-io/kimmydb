@@ -1193,14 +1193,18 @@ async fn aggregate_docs(
     let (answer, hold) = exec::aggregate_held(&state, &auth, &db, &coll, &body.pipeline).await?;
     // A pipeline that answers documents is already written, once, as the body; a sink's
     // counts are a small value, written here.
-    let bytes = match answer {
-        exec::Answer::Body(bytes) => bytes,
-        exec::Answer::Json(value) => serde_json::to_vec(&value)
-            .map_err(|e| ApiError::internal(format!("could not write the answer: {e}")))?,
+    let payload = match answer {
+        exec::Answer::Body(chunked) => chunked,
+        exec::Answer::Json(value) => crate::limits::ChunkedBody::from_vec(
+            serde_json::to_vec(&value)
+                .map_err(|e| ApiError::internal(format!("could not write the answer: {e}")))?,
+        ),
     };
-    let length = bytes.len();
-    let mut response =
-        Response::new(axum::body::Body::new(crate::limits::HeldBody::new(bytes.into(), hold)));
+    let length = payload.len();
+    let mut response = Response::new(axum::body::Body::new(crate::limits::HeldBody::from_chunks(
+        payload.into_chunks(),
+        hold,
+    )));
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/json"),

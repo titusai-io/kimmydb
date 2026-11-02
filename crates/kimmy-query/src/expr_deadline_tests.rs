@@ -10,7 +10,7 @@ use bson::{Bson, Document, doc};
 use kimmy_core::Error;
 use kimmy_core::deadline::{self, Deadline, clock_reads, ticks_taken};
 
-use crate::expr::{Expr, logic_arguments};
+use crate::expr::{Expr, logic_arguments, weigh_within};
 
 fn parse(spec: Document) -> Expr {
     Expr::parse(&Bson::Document(spec)).expect("a valid expression")
@@ -70,10 +70,16 @@ fn an_and_of_many_comparisons_of_a_big_value_ticks_at_least_once_for_each_node()
     let eqs: Vec<Bson> = (0..50).map(|_| Bson::Document(doc! { "$eq": ["$p", "$p"] })).collect();
     let ticks = ticks_of(doc! { "$and": eqs }, &document);
     // At least one for each of the fifty-one nodes, and each `$eq` is charged its two
-    // arguments (3,000 elements and two framing fields each).
+    // arguments: the weight of 3,000 elements is walked only as far as the stride that is
+    // left (a charge of that much reads the clock whatever else it holds), and no less than
+    // the floor of 32, so each of the fifty `$eq` makes a charge of at least 32.
     eprintln!("case 1: {ticks} ticks for 51 nodes ({} a node)", ticks / 51);
     assert!(ticks >= 51, "{ticks} ticks");
-    assert!(ticks >= 50 * 2 * 3_000, "{ticks} ticks: the nested size of each argument is charged");
+    assert!(ticks >= 51 + 50 * 32, "{ticks} ticks: the nested size of each argument is charged");
+    // The whole weight of the value, walked with no bound, is what the old charge was: the
+    // fields and elements at every level.
+    let value = Bson::Document(doc! { "q": (0..3_000).collect::<Vec<i32>>() });
+    assert_eq!(weigh_within(&value, 0, usize::MAX, 0), 1 + 3_000);
 }
 
 #[test]
@@ -86,7 +92,12 @@ fn a_big_value_is_charged_for_what_is_inside_it_at_every_depth() {
     // One argument, nothing else to pay for; the weight is the elements and fields at every
     // level, at least the leaves.
     let ticks = ticks_of(doc! { "$size": ["$t"] }, &document);
-    assert!(ticks >= 8_000, "{ticks} ticks");
+    assert!(ticks >= 33, "{ticks} ticks: charged, and cut at the stride that was left");
+    // Walked with no bound, the weight is every level of it: 20 documents, each with 20
+    // `m` documents, each with 20 elements in `v` (the framing fields and the leaves).
+    let weight = weigh_within(&document.get("t").unwrap().clone(), 0, usize::MAX, 0);
+    assert_eq!(weight, 20 + 20 * (1 + 20 + 20 * (1 + 20)), "{weight}");
+    assert!(weight >= 8_000);
 }
 
 #[test]
@@ -169,9 +180,13 @@ fn the_special_forms_charge_the_size_of_what_they_read() {
     let big: Vec<i32> = (0..4_000).collect();
     let words = "ab ".repeat(8_000);
     let document = doc! { "big": big, "words": words, "n": 5 };
-    let at_least = |spec: Document, floor: u64| {
+    // The charge is the weight walked as far as the stride that was left: a fresh scope has
+    // a stride of one, so the walk goes on to the floor of 32 and one charge of at least that
+    // is made. What each form is charged in full is held by `a_charge_at_least_the_stride...`
+    // below: the clock is read for the big value, and not for a small one.
+    let at_least = |spec: Document, _weight: u64| {
         let ticks = ticks_of(spec.clone(), &document);
-        assert!(ticks >= floor, "{spec}: {ticks} ticks, wanted {floor}");
+        assert!(ticks >= 33, "{spec}: {ticks} ticks, wanted a charge of at least the floor");
     };
     at_least(doc! { "$sortArray": { "input": "$big", "sortBy": -1 } }, 4_000);
     at_least(doc! { "$zip": { "inputs": ["$big", "$big"] } }, 8_000);
@@ -207,6 +222,134 @@ fn the_special_forms_are_cut_by_their_own_charge_under_a_passed_deadline() {
         let before = clock_reads();
         assert!(is_deadline(expr.eval(&document)), "{spec} ran past the deadline");
         assert!(clock_reads() > before);
+    }
+}
+
+/// A deadline an hour away, with the stride at its most: after a cheap phase the shared count
+/// is full, and 512 ticks are to go before the clock is read again.
+fn cheap_phase_under_an_hour() -> Deadline {
+    let deadline = Deadline::scope(Some(Duration::from_secs(3600)));
+    for _ in 0..100_000 {
+        deadline::tick().unwrap();
+    }
+    let reads = clock_reads();
+    while clock_reads() == reads {
+        deadline::tick().unwrap();
+    }
+    assert_eq!(deadline::remaining_stride(), Some(512));
+    deadline
+}
+
+#[test]
+fn weighing_is_exact_below_the_bound_and_stops_at_it() {
+    let value = Bson::Document(doc! { "a": (0..100).collect::<Vec<i32>>(), "b": "x".repeat(160) });
+    // 2 fields, 100 elements and 160 / 16 of text.
+    let full = 2 + 100 + 10;
+    assert_eq!(weigh_within(&value, 0, usize::MAX, 0), full);
+    assert_eq!(weigh_within(&value, 0, full + 1, 0), full, "below the bound: exact");
+    for bound in [1, 2, 3, 50, 102, 103, full] {
+        let walked = weigh_within(&value, 0, bound, 0);
+        assert!(walked >= bound && walked <= full, "bound {bound}: walked {walked}");
+    }
+    // Deeper than the depth cap, a value counts as the length of the level it stops at.
+    let mut deep = Bson::Array(vec![Bson::Int32(1); 5]);
+    for _ in 0..80 {
+        deep = Bson::Array(vec![deep]);
+    }
+    assert_eq!(weigh_within(&deep, 0, usize::MAX, 0), 65);
+}
+
+#[test]
+fn a_charge_at_least_what_is_left_of_the_stride_reads_the_clock_once_and_a_smaller_one_does_not() {
+    // A document of three arrays: 3 fields and the elements, 1,203 in all when walked in full.
+    let arrays = |n: i32| {
+        let one = || (0..n).collect::<Vec<i32>>();
+        doc! { "x": { "a": one(), "b": one(), "c": one() } }
+    };
+    let (small, big) = (arrays(33), arrays(400));
+    let size = parse(doc! { "$objectToArray": "$x" });
+    // A weight of 102 is under the 512 ticks that are left: it is charged, and the clock is not
+    // read; the stride that is left is 410 less one for the node.
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let before = clock_reads();
+        size.eval(&small).unwrap();
+        assert_eq!(clock_reads() - before, 0);
+        let left = deadline::remaining_stride().unwrap();
+        assert!(left < 512 - 102 && left > 512 - 108, "{left} left");
+    }
+    // A weight of 1,203 is over it: the clock is read once, by the charge, and the walk
+    // stopped at the stride (after the second array: 803), so the ticks taken are that and
+    // not 1,203.
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let (before, taken) = (clock_reads(), ticks_taken());
+        size.eval(&big).unwrap();
+        assert_eq!(clock_reads() - before, 1, "one read, made by the charge");
+        let charged = ticks_taken() - taken;
+        assert!((512..1_203).contains(&charged), "{charged} ticks taken: truncated at the stride");
+    }
+}
+
+#[test]
+fn the_charge_is_made_from_a_weight_of_32_and_reads_the_clock_from_the_stride_exactly() {
+    // `$objectToArray` of a document of one array: the weight is the field and the elements.
+    let with = |elements: i32| doc! { "x": { "a": (0..elements).collect::<Vec<i32>>() } };
+    let op = parse(doc! { "$objectToArray": "$x" });
+    // 31 is under the floor and is not charged: the node's own tick is all the count takes.
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let before = deadline::remaining_stride().unwrap();
+        op.eval(&with(30)).unwrap();
+        assert_eq!(before - deadline::remaining_stride().unwrap(), 1);
+    }
+    // 32 is the floor and is charged (and the node's tick).
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let before = deadline::remaining_stride().unwrap();
+        op.eval(&with(31)).unwrap();
+        assert_eq!(before - deadline::remaining_stride().unwrap(), 33);
+    }
+    // The node's own tick takes one of the 512 before its arguments are charged, so 511 are
+    // left: a weight of 511 (the field and 510 elements) reads the clock, one of 510 does not.
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let reads = clock_reads();
+        op.eval(&with(509)).unwrap();
+        assert_eq!(clock_reads() - reads, 0, "510 of the 511 that are left: one short");
+    }
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let reads = clock_reads();
+        op.eval(&with(510)).unwrap();
+        assert_eq!(clock_reads() - reads, 1, "a charge of at least the stride reads once");
+    }
+    // The walk is not cut a unit short: a weight of 511 whose last unit is the text after two
+    // arrays that came to 510 (3 fields, 254 and 253 elements, 16 bytes of text) still reads.
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let reads = clock_reads();
+        let last_unit = doc! { "x": {
+            "a": (0..254).collect::<Vec<i32>>(),
+            "b": (0..253).collect::<Vec<i32>>(),
+            "c": "x".repeat(16),
+        } };
+        op.eval(&last_unit).unwrap();
+        assert_eq!(clock_reads() - reads, 1, "510 and the text's one");
+    }
+    // A text is weighed by sixteen bytes, as the argument of an operator that reads it whole.
+    let split = parse(doc! { "$split": ["$s", ","] });
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let reads = clock_reads();
+        split.eval(&doc! { "s": "a,".repeat(5_000) }).unwrap();
+        assert_eq!(clock_reads() - reads, 1, "10,000 bytes weigh 625");
+    }
+    {
+        let _deadline = cheap_phase_under_an_hour();
+        let reads = clock_reads();
+        split.eval(&doc! { "s": "a,".repeat(200) }).unwrap();
+        assert_eq!(clock_reads() - reads, 0, "400 bytes weigh 25");
     }
 }
 

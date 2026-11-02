@@ -740,3 +740,168 @@ fn a_whole_array_operand_equals_a_nested_array_element_as_a_whole() {
     let d = doc! { "a": [ [1, 2], 3 ] };
     assert_eq!(at(doc! { "a": [1, 2] }, &d), Some(("a".to_string(), 0)));
 }
+
+// ---------------------------------------------------------------------------
+// An `$or`'s position and the errors that are not "this branch did not decide"
+// ---------------------------------------------------------------------------
+
+/// A filter whose `$expr` branch comes first in the order written and a field branch second:
+/// `matches` evaluates the field branch first and decides without the expression, and the
+/// recording of the position walks the branches in the order written and meets the `$expr`.
+fn or_with_a_leading_expr(expr: Document) -> Filter {
+    filt(doc! { "$or": [ { "$expr": expr }, { "items": { "$gt": 1 } } ] })
+}
+
+#[test]
+fn an_or_whose_expr_branch_hits_an_expired_deadline_answers_the_deadline() {
+    use kimmy_core::Error;
+    use kimmy_core::deadline::Deadline;
+    use std::time::Duration;
+
+    let d = doc! { "_id": 7, "flag": 1, "items": [1, 2, 3] };
+    let filter = or_with_a_leading_expr(doc! { "$eq": ["$flag", 2] });
+    // With no deadline the `$expr` is false and the field branch is the one that holds: the
+    // element it found is the position, as before.
+    let (hit, found) = filter::matches_at(&filter, &d).unwrap();
+    assert!(hit);
+    assert_eq!(found, Some(ArrayPosition { path: "items".into(), index: 1 }));
+    // With the deadline passed, `matches` decides on the field branch and the recording meets
+    // the `$expr`: the stop goes up and is not read as "did not decide", which would have gone
+    // on to another branch's element.
+    {
+        let _expired = Deadline::scope(Some(Duration::ZERO));
+        assert!(filter::matches(&filter, &d).unwrap(), "decided without the expression");
+        let err = filter::matches_at(&filter, &d).unwrap_err();
+        assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+    }
+    // The same through the paths that read the position: a find's positional projection
+    // and a `find_and_modify`'s positional update.
+    let projection = projection(doc! { "items.$": 1 });
+    {
+        let _expired = Deadline::scope(Some(Duration::ZERO));
+        let err = projection.project(&filter, &d).unwrap_err();
+        assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+        let parsed = update::parse(&doc! { "$set": { "items.$": 9 } }).unwrap();
+        let mut out = d.clone();
+        let err = update::apply_matched(&parsed, &filter, &mut out, NOW).unwrap_err();
+        assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+        assert_eq!(out, d, "nothing was changed");
+    }
+    // And with no deadline they pick the element, as before.
+    assert_eq!(projection.project(&filter, &d).unwrap(), doc! { "_id": 7, "items": [2] });
+}
+
+#[test]
+fn an_or_still_passes_over_a_branch_that_cannot_be_evaluated_and_goes_up_with_a_budget_refusal() {
+    use kimmy_core::Error;
+
+    let d = doc! { "_id": 8, "s": "text", "items": [1, 2, 3] };
+    // An `$expr` that fails on this document (a string plus one) did not decide: `matches`
+    // defers it, and the recording goes on to the field branch.
+    let failing = or_with_a_leading_expr(doc! { "$gt": [{ "$add": ["$s", 1] }, 0] });
+    let (hit, found) = filter::matches_at(&failing, &d).unwrap();
+    assert!(hit);
+    assert_eq!(found, Some(ArrayPosition { path: "items".into(), index: 1 }));
+    // A refusal for the size of a value is about the request, not the value: it goes up.
+    let too_large =
+        or_with_a_leading_expr(doc! { "$gt": [{ "$size": { "$range": [0, 1_000_000_000] } }, 0] });
+    assert!(filter::matches(&too_large, &d).unwrap());
+    let err = filter::matches_at(&too_large, &d).unwrap_err();
+    assert!(matches!(err, Error::ValueTooLarge { .. }), "{err:?}");
+}
+
+#[test]
+fn an_or_goes_on_to_no_branch_after_the_first_that_holds_and_a_nested_one_goes_up() {
+    use kimmy_core::Error;
+    use kimmy_core::deadline::Deadline;
+    use std::time::Duration;
+
+    // Two field branches hold, on two arrays: the first, in the order written, is the position.
+    let d = doc! { "_id": 9, "flag": 1, "items": [1, 2, 3], "other": [5, 6] };
+    let filter = filt(doc! { "$or": [
+        { "$expr": { "$eq": ["$flag", 2] } },
+        { "items": { "$gt": 1 } },
+        { "other": { "$gt": 0 } },
+    ] });
+    let (_, found) = filter::matches_at(&filter, &d).unwrap();
+    assert_eq!(found, Some(ArrayPosition { path: "items".into(), index: 1 }));
+    // An `$or` inside an `$and`: the stop in its `$expr` goes up through the `$and` too.
+    let nested = filt(doc! { "$and": [
+        { "$or": [ { "$expr": { "$eq": ["$flag", 2] } }, { "items": { "$gt": 1 } } ] },
+        { "other": { "$gt": 0 } },
+    ] });
+    let (_, found) = filter::matches_at(&nested, &d).unwrap();
+    assert_eq!(found, Some(ArrayPosition { path: "other".into(), index: 0 }));
+    let _expired = Deadline::scope(Some(Duration::ZERO));
+    assert!(filter::matches(&nested, &d).unwrap());
+    let err = filter::matches_at(&nested, &d).unwrap_err();
+    assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// An `$elemMatch` body's errors that are not "this element did not satisfy it"
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_elem_match_with_an_expr_that_hits_an_expired_deadline_answers_the_deadline() {
+    use kimmy_core::Error;
+    use kimmy_core::deadline::Deadline;
+    use std::time::Duration;
+
+    // The `$elemMatch` decides the match without the expression (`n` is 2 for the second
+    // element, a field condition), and the recording of the position tries each element with
+    // the whole body, `$expr` included.
+    let d =
+        doc! { "_id": 5, "items": [ { "n": 1, "k": 0 }, { "n": 2, "k": 1 }, { "n": 3, "k": 1 } ] };
+    let filter = filt(doc! { "items": { "$elemMatch": {
+        "n": { "$gte": 2 }, "$expr": { "$eq": ["$k", 1] },
+    } } });
+    // No deadline: the first element that satisfies both, as before.
+    let (hit, found) = filter::matches_at(&filter, &d).unwrap();
+    assert!(hit);
+    assert_eq!(found, Some(ArrayPosition { path: "items".into(), index: 1 }));
+    let projection = projection(doc! { "items.$": 1 });
+    assert_eq!(
+        projection.project(&filter, &d).unwrap(),
+        doc! { "_id": 5, "items": [ { "n": 2, "k": 1 } ] }
+    );
+    // With the deadline passed the stop goes up from every path that reads the position.
+    let _expired = Deadline::scope(Some(Duration::ZERO));
+    let err = filter::matches_at(&filter, &d).unwrap_err();
+    assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+    let err = projection.project(&filter, &d).unwrap_err();
+    assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+    let parsed = update::parse(&doc! { "$set": { "items.$.k": 9 } }).unwrap();
+    let mut out = d.clone();
+    let err = update::apply_matched(&parsed, &filter, &mut out, NOW).unwrap_err();
+    assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
+    assert_eq!(out, d, "nothing was changed");
+}
+
+#[test]
+fn an_elem_match_still_passes_over_an_element_it_cannot_evaluate_and_goes_up_with_a_size_refusal() {
+    use kimmy_core::Error;
+
+    // An `$expr` that fails on the first element (a string plus one) did not satisfy the body.
+    let d = doc! { "_id": 6, "items": [ { "n": 2, "s": "x" }, { "n": 3, "s": 4 } ] };
+    let failing = filt(doc! { "items": { "$elemMatch": {
+        "n": { "$gte": 2 }, "$expr": { "$gt": [{ "$add": ["$s", 1] }, 0] },
+    } } });
+    let (hit, found) = filter::matches_at(&failing, &d).unwrap();
+    assert!(hit);
+    assert_eq!(found, Some(ArrayPosition { path: "items".into(), index: 1 }));
+    // A refusal for the size of a value is about the request, not the element: it goes up.
+    let too_large = filt(doc! { "items": { "$elemMatch": {
+        "n": { "$gte": 2 }, "$expr": { "$gt": [{ "$size": { "$range": [0, 1_000_000_000] } }, 0] },
+    } } });
+    let ok = doc! { "_id": 7, "items": [ { "n": 2 } ] };
+    // `matches` decides on the field condition and the body's `$expr`; where it cannot, it errs.
+    match filter::matches(&too_large, &ok) {
+        Err(Error::ValueTooLarge { .. }) => {}
+        Ok(_) => {
+            let err = filter::matches_at(&too_large, &ok).unwrap_err();
+            assert!(matches!(err, Error::ValueTooLarge { .. }), "{err:?}");
+        }
+        Err(other) => panic!("{other:?}"),
+    }
+}

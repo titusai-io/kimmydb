@@ -2342,60 +2342,110 @@ pub(crate) fn count_bson(n: usize) -> Bson {
     integer_bson(i64::try_from(n).unwrap_or(i64::MAX))
 }
 
-/// The deepest level of nesting [`weigh`] counts into; a value nested deeper than this is
-/// weighed as if its inner part held one element.
+/// The deepest level of nesting [`weigh_within`] counts into; a value nested deeper than this
+/// is weighed as if its inner part held one element.
 const WEIGH_DEPTH: u32 = 64;
 
-/// What a value asks of an operator that reads all of it, in elements and characters: the
-/// elements of an array and the fields of a document **at every level of nesting**, and a
-/// string's length over sixteen. A value is walked once, and the walk is bounded by the
-/// value, which is already in memory (the argument was cloned out of the document to get
-/// here), so it costs no more than that copy did. It is what lets a single operator over a
-/// document that holds a megabyte in one field be charged its megabyte (ADR-266, review
-/// q8d3, M4): a top-level count weighed that document as one field.
-fn weigh(value: &Bson, depth: u32) -> usize {
+/// The weight below which a charge is not made at all: a few elements are not worth a tick.
+const CHARGE_FLOOR: usize = 32;
+
+/// What a value asks of an operator that reads all of it, in elements and characters, added
+/// to `sum`: the elements of an array and the fields of a document **at every level of
+/// nesting**, and a string's length over sixteen. A value is walked once, and the walk is
+/// bounded by the value, which is already in memory (the argument was cloned out of the
+/// document to get here). It is what lets a single operator over a document that holds a
+/// megabyte in one field be charged its megabyte (ADR-266, review q8d3, M4): a top-level
+/// count weighed that document as one field.
+///
+/// The walk **stops once the sum has reached `bound`** and returns it: a charge of at least
+/// what is left of the deadline's stride reads the clock whatever else it holds, so counting
+/// further changes nothing (the delta review's m7). Below `bound` the sum is exact.
+pub(crate) fn weigh_within(value: &Bson, depth: u32, bound: usize, sum: usize) -> usize {
     match value {
-        Bson::Array(items) => {
-            if depth >= WEIGH_DEPTH {
-                return items.len();
-            }
-            items.iter().fold(items.len(), |sum, item| sum.saturating_add(weigh(item, depth + 1)))
-        }
-        Bson::Document(doc) => {
-            if depth >= WEIGH_DEPTH {
-                return doc.len();
-            }
-            doc.iter().fold(doc.len(), |sum, (_, item)| sum.saturating_add(weigh(item, depth + 1)))
-        }
-        Bson::String(text) => text.len() / 16,
-        _ => 0,
+        Bson::Array(items) => weigh_level(items.len(), items.iter(), depth, bound, sum),
+        Bson::Document(doc) => weigh_level(doc.len(), doc.values(), depth, bound, sum),
+        Bson::String(text) => sum.saturating_add(text.len() / 16),
+        _ => sum,
     }
+}
+
+/// One level of [`weigh_within`]: its `len` elements, and what is inside those that hold
+/// anything (a scalar weighs nothing of its own and is passed over without a call).
+#[inline]
+fn weigh_level<'a>(
+    len: usize,
+    items: impl Iterator<Item = &'a Bson>,
+    depth: u32,
+    bound: usize,
+    sum: usize,
+) -> usize {
+    let mut sum = sum.saturating_add(len);
+    if sum >= bound || depth >= WEIGH_DEPTH {
+        return sum;
+    }
+    for item in items {
+        if matches!(item, Bson::Array(_) | Bson::Document(_) | Bson::String(_)) {
+            sum = weigh_within(item, depth + 1, bound, sum);
+            if sum >= bound {
+                break;
+            }
+        }
+    }
+    sum
+}
+
+/// Charge `weight` to the deadline's count if it is worth a charge: a weight under
+/// [`CHARGE_FLOOR`] is not made, and one of at least that reads the clock if it runs the
+/// stride out.
+fn charge_weight(weight: usize) -> Result<()> {
+    if weight >= CHARGE_FLOOR { deadline::tick_n(weight) } else { Ok(()) }
 }
 
 /// What the values ask of the operator that is about to read them, charged to the
 /// deadline's count before it runs (ADR-266): every element, field and sixteen bytes of text
-/// in them, nested or not ([`weigh`]). A bulk operator (a set operator, `$sortArray`,
+/// in them, nested or not ([`weigh_within`]). A bulk operator (a set operator, `$sortArray`,
 /// `$concatArrays`, `$zip`, `$in`, `$split`, `$replaceAll`, `$objectToArray`, an array
 /// `$sum`) and a comparison of two big documents do work in proportion to this, without a
 /// loop of their own that ticks, so an operator over a big value reads the clock at once
 /// however it is nested, and a charge of 32 or more is made in one call. Nothing is weighed
-/// when no deadline is set.
+/// when no deadline is set, and the weighing stops at the larger of the stride that is left
+/// and the floor: past it the charge would read the clock anyway.
 fn charge_values<'a>(values: impl IntoIterator<Item = &'a Bson>) -> Result<()> {
-    if !deadline::Deadline::is_set() {
-        return Ok(());
+    let mut bound = 0usize;
+    let mut weight = 0usize;
+    for value in values {
+        // A scalar weighs nothing: only a value that holds something is walked, and only then
+        // is the deadline asked what is left of the stride (no deadline, nothing is walked).
+        if !matches!(value, Bson::Array(_) | Bson::Document(_) | Bson::String(_)) {
+            continue;
+        }
+        if bound == 0 {
+            let Some(left) = deadline::remaining_stride() else { return Ok(()) };
+            bound = left.max(CHARGE_FLOOR);
+        }
+        weight = weigh_within(value, 0, bound, weight);
+        if weight >= bound {
+            break;
+        }
     }
-    let weight = values.into_iter().fold(0usize, |sum, v| sum.saturating_add(weigh(v, 0)));
-    if weight >= 32 { deadline::tick_n(weight) } else { Ok(()) }
+    charge_weight(weight)
 }
 
 /// [`charge_values`] for the elements of an array the operator is about to walk: each
 /// element counts as one, and so does everything inside it.
 fn charge_elements(items: &[Bson]) -> Result<()> {
-    if !deadline::Deadline::is_set() {
-        return Ok(());
+    let Some(left) = deadline::remaining_stride() else { return Ok(()) };
+    let bound = left.max(CHARGE_FLOOR);
+    let mut weight = items.len();
+    for item in items {
+        if weight >= bound {
+            break;
+        }
+        if matches!(item, Bson::Array(_) | Bson::Document(_) | Bson::String(_)) {
+            weight = weigh_within(item, 1, bound, weight);
+        }
     }
-    let weight = items.iter().fold(items.len(), |sum, v| sum.saturating_add(weigh(v, 1)));
-    if weight >= 32 { deadline::tick_n(weight) } else { Ok(()) }
+    charge_weight(weight)
 }
 
 fn charge_bulk(args: &[Bson]) -> Result<()> {

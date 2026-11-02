@@ -355,10 +355,20 @@ fn the_body_the_route_sends_is_the_bytes_serde_json_gives_for_the_value() {
             block_on(aggregate_held(&state, &root(), "app", "orders", &pipeline)).unwrap();
         let Answer::Body(body) = answer else { panic!("{pipeline}: documents are a body") };
         assert_eq!(
-            String::from_utf8(body.clone()).unwrap(),
+            String::from_utf8(body.to_vec()).unwrap(),
             serde_json::to_string(&value).unwrap(),
             "{pipeline}"
         );
+        // The chunks are the body, in order, none empty and none over 64 KiB, and all but the
+        // last full (they are what is handed to hyper as they are).
+        let chunks = body.chunks();
+        assert_eq!(chunks.concat(), body.to_vec(), "{pipeline}");
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), body.len(), "{pipeline}");
+        assert!(chunks.iter().all(|c| !c.is_empty()), "{pipeline}");
+        for chunk in chunks.iter().take(chunks.len().saturating_sub(1)) {
+            assert_eq!(chunk.len(), crate::limits::ANSWER_CHUNK_BYTES, "{pipeline}");
+        }
+        assert!(chunks.last().is_none_or(|c| c.len() <= crate::limits::ANSWER_CHUNK_BYTES));
         // The hold is the JSON of the documents alone, not the framing around them: the body
         // less `{"documents":[`, a comma between documents and `],"count":N}`.
         let count = value["count"].as_u64().unwrap() as usize;
@@ -402,7 +412,7 @@ fn the_body_is_charged_the_same_bytes_and_refused_at_the_same_one_as_the_value()
             (Ok(value), Ok((Answer::Body(body), hold))) => {
                 answered += 1;
                 assert_eq!(
-                    String::from_utf8(body).unwrap(),
+                    String::from_utf8(body.to_vec()).unwrap(),
                     serde_json::to_string(&value).unwrap()
                 );
                 drop(hold);
@@ -512,4 +522,30 @@ fn a_lookup_charges_the_attached_documents_at_the_parsed_estimate() {
     counted.push(json!({"$count": "n"}));
     let ok = run(&state, json!(counted), capped(input + foreign + 2 * foreign + 20_000)).unwrap();
     assert_eq!(ok["documents"], json!([{"n": 2}]));
+}
+
+#[test]
+fn a_big_answer_is_written_in_full_chunks_that_concatenate_to_the_value() {
+    // About 3 MB of JSON: forty-odd chunks of 64 KiB, the last one what is left.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(300, 10_000), vec![]);
+    let pipeline = json!([]);
+    let value = block_on(aggregate(&state, &root(), "app", "orders", &pipeline)).unwrap();
+    let (answer, hold) =
+        block_on(aggregate_held(&state, &root(), "app", "orders", &pipeline)).unwrap();
+    let Answer::Body(body) = answer else { panic!("documents are a body") };
+    let expected = serde_json::to_string(&value).unwrap();
+    assert!(expected.len() > 40 * crate::limits::ANSWER_CHUNK_BYTES);
+    assert_eq!(body.len(), expected.len());
+    assert_eq!(String::from_utf8(body.to_vec()).unwrap(), expected);
+    let chunks = body.chunks();
+    assert_eq!(chunks.len(), expected.len().div_ceil(crate::limits::ANSWER_CHUNK_BYTES));
+    for chunk in &chunks[..chunks.len() - 1] {
+        assert_eq!(chunk.len(), crate::limits::ANSWER_CHUNK_BYTES);
+    }
+    assert_eq!(
+        chunks.last().unwrap().len(),
+        expected.len() - (chunks.len() - 1) * crate::limits::ANSWER_CHUNK_BYTES
+    );
+    drop(hold);
 }

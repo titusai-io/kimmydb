@@ -2247,11 +2247,12 @@ as it grows, and the request is refused `413 answer_too_large` at the first byte
 | **The answer** | the output documents and the JSON each becomes (its serialised length), document by document, so an answer that would pass the limit is refused before the rest is built; once built, the documents' bytes are given back and the JSON's are kept | the response body has been written or dropped (the client went away) |
 
 A stage's input stays charged until it returns, so `$addFields` over 100,000 documents of 4 KB
-peaks at about 1.08 GB charged (input and output, each at the estimate of the parsed size: 1.3 times
-the BSON of a 4 KB string document).
-100,000 documents of 4 KB (412 MB of BSON) therefore run through `$addFields` under an
-explicit limit of 2 GiB, and under the derived limit only in a container of about 20 GiB or more:
-a 2 GiB member refuses them at the source read, an 8 GiB one at `$addFields`. **The source read is
+peaks at about 1.07 GB charged (input and output, each at the estimate of the parsed size: 1.3 times
+the BSON of a 4 KB string document). Exactly, for documents of 4,094 bytes of BSON with one boolean field
+added the peak is 1,070,800,000, so they run through `$addFields` under an explicit limit of 1 GiB
+(1,073,741,824) and under the derived limit from a container of 19.95 GiB; with a string of 4,096
+characters (4,120 bytes) the peak is 1,078,000,000, over 1 GiB, and they need an explicit limit of 2 GiB or
+a container of 20.1 GiB. A 2 GiB member refuses them at the source read, an 8 GiB one at `$addFields`. **The source read is
 charged whole before any stage runs**, and only a leading `$match` narrows it, so `[{$count}]`,
 `[{$limit: 5}]`, `[{$sort}, {$limit}]` and `[{$group}]` over a collection above the limit (about 102 MiB
 of BSON on a 2 GiB member) are refused too; [Operations](operations.md#aggregation-memory) has the

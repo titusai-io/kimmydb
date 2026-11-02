@@ -223,8 +223,13 @@ member (a collection of 100 MB of 4 KB documents of 400 integer fields is 2.3 GB
 after 1,163 of 25,000 documents), and more than 410 MiB on an 8 GiB one. The reference streams every
 one of them. A stage that builds holds its input beside its output, so `$addFields` (and `$project`,
 `$replaceRoot`, `$unwind`) over more than about half the limit is refused as well: 100,000 documents of
-4 KiB (412 MB of BSON, charged 537 MB, about 1.08 GB held at the peak) run only in a container of about
-20 GiB or more, or under an explicit `aggregate.memory_limit_bytes` of 2 GiB.
+4 KiB peak at about 1.07 GB charged, input and output together. Exactly: the review's documents
+(`{_id, pad}` of 4,094 bytes of BSON, charged 5,336 each, 5,372 with one boolean field added) peak at
+1,070,800,000, which **runs under an explicit `aggregate.memory_limit_bytes` of 1 GiB** (1,073,741,824,
+with 0.3% to spare) and under the derived limit from a container of 19.95 GiB; the same with a string
+of 4,096 characters (4,120 bytes, charged 5,372 and 5,408) peak at 1,078,000,000, which is over 1 GiB
+(refused at `$addFields`) and runs under 2 GiB, or from a container of 20.1 GiB. Under the derived
+limit of a 16 GiB member (858,993,459) neither runs.
 
 What to do about a `413` from the limit:
 
