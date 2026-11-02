@@ -12,7 +12,9 @@
 //! the heading's rendered text, lowercased, with every character that is not a
 //! letter, a digit, a space, a hyphen or an underscore removed, and each space
 //! turned into a hyphen. So an em-dash between two spaces becomes `--`, and a
-//! repeated heading is numbered `-1`, `-2` after the first.
+//! repeated heading is numbered `-1`, `-2` after the first. An explicit
+//! `<a id="...">` or `<a name="...">` is an anchor too, because GitHub renders
+//! it; a heading that gains a marker keeps the anchor its old links use.
 //!
 //! **It refuses to pass by finding nothing.** The real-tree test asserts how
 //! much it read before it asserts that nothing was broken, and the fixture
@@ -270,6 +272,47 @@ fn add_anchor(anchors: &mut BTreeSet<String>, taken: &mut BTreeMap<String, usize
     anchors.insert(slug);
 }
 
+/// The `id` and `name` of every `<a ...>` tag on a line (code spans already removed):
+/// the anchors GitHub renders for an explicit one, spelled as written.
+fn explicit_anchors(line: &str) -> Vec<String> {
+    let lower = line.to_ascii_lowercase();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find("<a") {
+        let start = from + at + 2;
+        from = start;
+        if !lower[start..].starts_with(|c: char| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let Some(end) = lower[start..].find('>') else { break };
+        let tag = &line[start..start + end];
+        let tag_lower = &lower[start..start + end];
+        for attr in ["id", "name"] {
+            let mut search = 0;
+            while let Some(hit) = tag_lower[search..].find(attr) {
+                let at = search + hit;
+                search = at + attr.len();
+                if !tag_lower[..at].ends_with(|c: char| c.is_ascii_whitespace()) {
+                    continue;
+                }
+                let Some(rest) = tag[at + attr.len()..].trim_start().strip_prefix('=') else {
+                    continue;
+                };
+                let rest = rest.trim_start();
+                let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                    continue;
+                };
+                if let Some(value) = rest[1..].split(quote).next()
+                    && !value.is_empty()
+                {
+                    found.push(value.to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
 fn parse(text: &str) -> Parsed {
     let mut out = Parsed::default();
     let mut taken = BTreeMap::new();
@@ -296,6 +339,7 @@ fn parse(text: &str) -> Parsed {
             paragraph.clear();
             continue;
         }
+        out.anchors.extend(explicit_anchors(&without_code_spans(line)));
         if body.trim().is_empty() {
             paragraph.clear();
             continue;
@@ -546,6 +590,34 @@ fn a_repeated_heading_is_numbered_after_the_first() {
     assert_eq!(
         doc.anchors,
         ["notes", "notes-1", "notes-2", "notes-1-1"].into_iter().map(String::from).collect()
+    );
+}
+
+#[test]
+fn an_explicit_anchor_is_a_target_and_one_in_code_is_not() {
+    let doc = parse(
+        "<a id=\"kept\"></a>\n\n## 🟡 Moved\n\n<a name='old'></a> and `<a id=\"code\">`\n\n\
+         ```html\n<a id=\"fenced\"></a>\n```\n",
+    );
+    assert!(doc.anchors.contains("kept") && doc.anchors.contains("old"));
+    assert!(doc.anchors.contains("-moved"), "the heading keeps its own anchor");
+    assert!(!doc.anchors.contains("code") && !doc.anchors.contains("fenced"));
+    // A tag that is not an anchor does not make one: `<abbr>` and `data-id`.
+    let other = parse("<abbr id=\"x\">a</abbr> <a href=\"y\" data-id=\"z\">l</a>\n");
+    assert!(other.anchors.is_empty(), "{:?}", other.anchors);
+}
+
+#[test]
+fn an_explicit_anchor_resolves_across_files_and_an_unknown_one_still_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("docs")).unwrap();
+    std::fs::write(root.join("docs/a.md"), "[ok](b.md#kept) [bad](b.md#not-there)\n").unwrap();
+    std::fs::write(root.join("docs/b.md"), "<a id=\"kept\"></a>\n\n## 🟡 Moved\n").unwrap();
+    let report = check(root, &markdown_files(root));
+    assert_eq!(
+        report.broken,
+        ["docs/a.md:1: b.md#not-there: no heading in docs/b.md makes the anchor #not-there"]
     );
 }
 

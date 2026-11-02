@@ -19,7 +19,7 @@ Status meanings:
 
 ## 🟡 An aggregation holds its documents and is refused past a memory limit, where the reference streams them and spills to disk
 
-The reference streams documents through a pipeline into 16 MB cursor batches, holds each blocking stage (`$group`, `$sort`, `$bucket`, `$bucketAuto`, `$setWindowFields`) to 100 MB and, since 6.0, spills past it to disk; the same pipeline is constant-memory there. This server runs a stage over a vector of the documents it is given, builds a new vector, and answers one JSON body, so a pipeline holds its documents whole (ADR-269). It therefore **refuses** what does not fit, with `413 answer_too_large` past `aggregate.memory_limit_bytes` (derived from the memory the member runs under: half of a pool that is a tenth of the container's memory limit or the RAM, about 100 MiB in a 2 GiB container) and `503` (`retry: wait`) when the node's pool, `aggregate.memory_pool_bytes`, is held by other requests, where the reference answers. The 100,000-document ceiling on a source and a stage's output is unchanged. The unit is BSON bytes, which is the memory of a long string and a fraction of the memory of a document of many small fields, so the limits are bounds proportional to memory and not ceilings on it. The reference's `getMore` is not offered: the answer is one body. **Everyday pipelines a 2 GiB member refuses:** the source read is charged whole before any stage runs and only a leading `$match` narrows it, so `[{$count: "n"}]`, `[{$limit: 5}]`, `[{$sort: ..}, {$limit: 10}]` and `[{$group: {_id: "$k", n: {$sum: 1}}}]` over a collection above the per-request limit (about 102 MiB of BSON in a 2 GiB container, about 200,000 documents of 550 bytes; 410 MiB in an 8 GiB one) are `413` at "the source read", where the reference answers each in constant memory; and `$addFields`, `$project`, `$replaceRoot` or `$unwind` over more than about half the limit are refused because they hold input and output (and the budget counts what a parsed document costs, so a document of 400 integer fields counts about 24 times its BSON size and a 2 GiB member reads about 1,160 of them), so 100,000 documents of 4 KB through `$addFields` need a container of about 20 GiB or an explicit `aggregate.memory_limit_bytes` (`docs/operations.md#what-the-limit-refuses-today` has the figures and the remedies).
+The reference streams documents through a pipeline into 16 MB cursor batches, holds each blocking stage (`$group`, `$sort`, `$bucket`, `$bucketAuto`, `$setWindowFields`) to 100 MB and, since 6.0, spills past it to disk; the same pipeline is constant-memory there. This server runs a stage over a vector of the documents it is given, builds a new vector, and answers one JSON body, so a pipeline holds its documents whole (ADR-269). It therefore **refuses** what does not fit, with `413 answer_too_large` past `aggregate.memory_limit_bytes` (derived from the memory the member runs under: half of a pool that is a tenth of the container's memory limit or the RAM, about 100 MiB in a 2 GiB container) and `503` (`retry: wait`) when the node's pool, `aggregate.memory_pool_bytes`, is held by other requests, where the reference answers. The 100,000-document ceiling on a source and a stage's output is unchanged. The unit is an estimate of the memory a parsed document takes (ADR-269), not its BSON size: about the BSON size for a long string, and many times it for a document of many small fields (400 integer fields: about 24 times), so the limits are bounds proportional to memory and not ceilings on it. The reference's `getMore` is not offered: the answer is one body. **Everyday pipelines a 2 GiB member refuses:** the source read is charged whole before any stage runs and only a leading `$match` narrows it, so `[{$count: "n"}]`, `[{$limit: 5}]`, `[{$sort: ..}, {$limit: 10}]` and `[{$group: {_id: "$k", n: {$sum: 1}}}]` over a collection above the per-request limit (about 102 MiB of BSON in a 2 GiB container, about 200,000 documents of 550 bytes; 410 MiB in an 8 GiB one) are `413` at "the source read", where the reference answers each in constant memory; and `$addFields`, `$project`, `$replaceRoot` or `$unwind` over more than about half the limit are refused because they hold input and output (and the budget counts what a parsed document costs, so a document of 400 integer fields counts about 24 times its BSON size and a 2 GiB member reads about 1,160 of them), so 100,000 documents of 4 KB through `$addFields` need a container of about 20 GiB or an explicit `aggregate.memory_limit_bytes` (`docs/operations.md#what-the-limit-refuses-today` has the figures and the remedies).
 
 **To close:** stream the stages that do not block (`$match`, `$project`, `$addFields`, `$replaceRoot`, `$unwind`, `$limit`, `$skip`) so that only a blocking stage holds a collection, and answer in cursor batches. Planned for 0.60.0; then the limit applies to blocking stages and the answer's batch, and a pipeline over a large collection with a `$match` and a `$project` runs in constant memory.
 
@@ -36,9 +36,9 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 - **Covariance with an infinite pair.** A pair with an infinity in a sliding window answers NaN here while the pair is in the window (as `$group` would over the same documents); the reference skips the pair in a sliding window (its answers are `0.0, 0.0, 0.5` where this build's are NaN) and answers Infinity over the whole partition.
 - **Sums and integrals near the double maximum.** `$sum`, `$avg` and `$integral` are exact here and rounded once: over `[1.7e308, -1.7e308]` a sliding `$sum` is `0.0` and a later window holds its own sum. The reference answers Infinity for every later window once a partial sum has passed the largest double (and `0.0` for an area of 1.5 after it).
 - **A deviation of one value.** `$stdDevPop` of one value is a **double** `0.0` over the whole partition (no `window`, or a lower bound of `"unbounded"`) and an **integer** `0` in a window that can lose a document (`[-1, 0]`, `[0, 0]`), as the reference answers each; a window with an `"unbounded"` lower bound and an upper bound at the current document (a cumulative deviation) is answered as the whole partition is, which is the reference's accumulator for it by its source and was not probed.
-- **Integer sums are `Int64`.** `$sum` of integers in a window is a long here, as in `$group`; the reference answers an int that fits.
+- **Integer sums are as wide as their total needs, as in the reference** (ADR-268). `$sum` of integers in a window is an `Int32` while ints are added and the total fits, and an `Int64` once a long is added or the total leaves `Int32`. Only a sliding window differs, in the bullet below.
 - **`$addToSet` answers in the order its members first appear in the window.** The reference answers in sorted order once the window has dropped a document (and in the order of appearance before that); the order is unspecified in both.
-- **`$densify` after a `"full"` range** ends each partition's grid in ascending order of the partition values; the reference ends in a hash order. The generated count is held to the pipeline's 100,000 documents in all, with the input, where the reference holds the generated documents to 500,000; the bytes are held to the request's 256 MiB budget (`413`), where the reference has its own memory limit.
+- **`$densify` after a `"full"` range** ends each partition's grid in ascending order of the partition values; the reference ends in a hash order. The generated count is held to the pipeline's 100,000 documents in all, with the input, where the reference holds the generated documents to 500,000; the bytes are held to the request's memory budget (`aggregate.memory_limit_bytes`, ADR-269), `413` past it, where the reference has its own memory limit.
 - **A sliding window `$sum` is typed by what the window holds now, not by its history** (ADR-268). The reference's `RemovableSum` remembers: `$sum` of the longs `[LMAX, 1, 2]` over `[-1, 0]` is the long `LMAX`, then a **double** `9223372036854775808.0`, then the int `3`, so integer inputs can turn into a double and an int. Here the third window holds the longs `1` and `2` and the answer is the long `3`; any long in the window makes a long, any double a double, ints alone the narrowest width that holds the total, and a total past `Int64` is a double. A cumulative or whole-partition window is typed as a `$group` sum is, as the reference types it.
 - **The byte budget.** `$setWindowFields`, `$densify` and a `$fill` method hold what they buffer to the request's memory budget (`aggregate.memory_limit_bytes`, derived from the memory the member runs under: about 100 MiB of BSON in a 2 GiB container, ADR-269), shared with everything else the request holds, refused `413` as the total passes it. The reference spills to disk.
 - **Strictness.** A `documents` bound, a `$shift` `by` and a `range` bound with a `unit` must be whole numbers that fit 32 bits, as in the reference; a `range` bound of a date `unit` is refused for a fraction.
@@ -69,6 +69,76 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 
 ---
 
+<a id="date-operators-and-time-zones-adr-261"></a>
+
+## 🟡 Date operators and time zones (ADR-261)
+
+Where these differ from the reference (MongoDB 6.0), they differ on purpose:
+
+- **`$dateFromString` reads fewer shapes without a `format`.** The reference
+  hands the string to a general date parser that also reads `Jan 1 2018`,
+  `2018/02/08`, week dates and the like. Here it is `YYYY-MM-DD` with an optional
+  `T` or space and `HH:MM[:SS[.fff]]` and an optional `Z`, `UTC`, `GMT` or
+  offset. Anything else is the conversion error (which `onError` takes). Give a
+  `format` for another layout. Fractions of a second are cut to milliseconds.
+- **`$dateFromString` with a `format` reads fixed-width fields** (`%Y` four
+  digits, `%d` two, `%L` three, ...). The reference also reads a shorter field:
+  `24-01-01` with `%Y-%m-%d` is the year 24 there, `5/03/2024` with `%d/%m/%Y` is
+  the 5th, and `.5` with `%L` is 500 ms. Here each is a conversion error (which
+  `onError` takes).
+- **Dates outside the tz database's years** use the zone's earliest or latest
+  offset. The reference applies a zone's daylight-saving rule through the year
+  2400 and answers garbage past it (an offset of -08 for New York in the year
+  12000); here the rule of the last year the database represents, 9999, applies
+  from then on. A date before the database's first year uses the zone's earliest
+  (local mean time) offset.
+- **The reference 6.0.5's own tz data is older than 2022f.** For a date after
+  the rule changes of 2022 to 2024 the two disagree: Mexico City in July 2024
+  (-05 there, -06 here), Nuuk, Almaty, Cairo and Asuncion. Nothing is done about
+  it here: the built-in database is current (2026e) on purpose.
+- **`$dateTrunc` bounds `binSize` by what the unit can count.** A year, quarter,
+  month, week or day bin larger than the number of that unit (counted with its
+  shortest length) that 64 bits of milliseconds hold (292,471,208 years,
+  106,751,991,167 days) is `dateTrunc unsupported binSize value`, and a bin or a
+  result no 64-bit date can hold is `dateTrunc overflowed`. The reference
+  refuses the same bins in the same class at every probed size (year 1e8
+  answers, 3e8 does not; day 1e11 answers, 2e11 does not; the largest long for
+  every unit), but it words some refusals as `dateAdd overflowed` or `invalid
+  dateAdd 'amount' parameter value` and the exact threshold is not probed, so a
+  bin just beside the bound may differ.
+- **Results past the 64-bit date range are refused here, and are garbage in the
+  reference.** `$dateDiff` in milliseconds between the smallest and largest date
+  (the reference answers 0), `$dateTrunc` of a date near the 64-bit limits (it
+  answers the date 0) and a `$dateFromParts` sum of that size are
+  `Overflow occurred` / `dateTrunc overflowed` here. A `$dateFromParts`
+  `millisecond` whose finer-unit count overflows is refused (`9e18` is
+  `DurationOverflow` in the reference; `1e9` and a `second` of `9e15` answer); the
+  exact threshold here, 9.2e15, is derived from that one probe.
+- **`$dateTrunc` of an hour, minute, second or millisecond bin** is cut from the
+  instant the zone's clock read 2000-01-01 00:00 (with the offset it had then),
+  as the reference does, so in New York in July a 2-hour bin starts on an odd
+  UTC hour. `$dateDiff` counts the clock's own boundaries at each instant, also
+  as the reference does.
+- **Offsets above 23:59 are accepted** (`+24:00`, `+05:60`, `+99`) because the
+  reference accepts them, and `%z`/`%Z` print them as it does (`+9900 5940`,
+  `+2400 1440`, `-9900 -5940`).
+- **The order of null and bad arguments** follows the reference for `$year` and
+  the other one-date operators, `$dateAdd`, `$dateSubtract`, `$dateDiff`,
+  `$dateTrunc`, `$dateFromParts`, `$dateToParts` (a bad zone is read before a
+  null date) and `$dateToString` (a null `timezone` beside a null date answers
+  `onNull`, beside a date it is `null`); a null `startOfWeek` beside
+  `unit: "week"` is `null`.
+- **A format given as an expression** (`$dateToString`'s `format`) is accepted
+  as the reference accepts it; a constant one is checked when the pipeline is
+  parsed.
+- **Error messages** carry the reference's wording where it is known, without
+  its numeric codes, and every date error is a `400`.
+- **The tz database is the one built in** (2026e), not the host's. A zone whose
+  rules changed after the build keeps the old rules until the dependency is
+  bumped.
+
+---
+
 ## 🟡 The `$stdDev*`, `$top*`, `$bottom*`, `$firstN`, `$lastN`, `$maxN`, `$minN` and `$count` accumulators: decimal as double and the array forms
 
 **Raised 2026-10-31, with ADR-262; revised after the review of PR #276.** Where these differ from, or rest on a reading of, the reference:
@@ -84,7 +154,7 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 
 ## 🟡 The field-level merge state keeps counter totals exact to 2^119, and refuses a total past it
 
-**Raised 2026-11-01, with the field-level merge state (Q7 phase 0).** The merge state is a pure module that nothing stores, replicates or serves yet. It keeps one total per writer for every `$inc` counter, in an `i128`. What a client sees of a counter is bounded by the 64-bit integer range: a read saturates, and a local `$inc` that would leave that range is refused. Underneath, a writer's total is bounded at 2^119, so that the sum over 64 writers stays exact in an `i128` (each read-side term is below 2^120, and 64 of them sum below 2^126).
+**Raised 2026-11-01, with the field-level merge state (Q7 phase 0). Nothing in 0.59.0 stores, replicates or serves it, so no answer of 0.59.0 depends on this bound; it is recorded now, as this register asks, so that the release that wires the state does not have to remember it.** The merge state is a pure module that nothing stores, replicates or serves yet. It keeps one total per writer for every `$inc` counter, in an `i128`. What a client sees of a counter is bounded by the 64-bit integer range: a read saturates, and a local `$inc` that would leave that range is refused. Underneath, a writer's total is bounded at 2^119, so that the sum over 64 writers stays exact in an `i128` (each read-side term is below 2^120, and 64 of them sum below 2^126).
 
 - **A total past 2^119 is refused where it enters:** a local `$inc` that would take the writer's own slot past it, a replicated loss record carrying a total past it, and a decode of any stored or received state holding one. A member therefore never stores a state it cannot decode.
 - **It is not reachable in practice.** Reaching 2^119 takes more than 2^56 increments of the largest size a client can send, and a client never sees a refusal at this bound, only at the 64-bit one. It is recorded here so that it is not read as a limit the design forgot.
@@ -3616,72 +3686,6 @@ keys per chunk and is unchanged here.
 [ADR-098](decisions.md) and in [Compatibility](compatibility.md).
 
 ---
-
-## Date operators and time zones (ADR-261)
-
-Where these differ from the reference (MongoDB 6.0), they differ on purpose:
-
-- **`$dateFromString` reads fewer shapes without a `format`.** The reference
-  hands the string to a general date parser that also reads `Jan 1 2018`,
-  `2018/02/08`, week dates and the like. Here it is `YYYY-MM-DD` with an optional
-  `T` or space and `HH:MM[:SS[.fff]]` and an optional `Z`, `UTC`, `GMT` or
-  offset. Anything else is the conversion error (which `onError` takes). Give a
-  `format` for another layout. Fractions of a second are cut to milliseconds.
-- **`$dateFromString` with a `format` reads fixed-width fields** (`%Y` four
-  digits, `%d` two, `%L` three, ...). The reference also reads a shorter field:
-  `24-01-01` with `%Y-%m-%d` is the year 24 there, `5/03/2024` with `%d/%m/%Y` is
-  the 5th, and `.5` with `%L` is 500 ms. Here each is a conversion error (which
-  `onError` takes).
-- **Dates outside the tz database's years** use the zone's earliest or latest
-  offset. The reference applies a zone's daylight-saving rule through the year
-  2400 and answers garbage past it (an offset of -08 for New York in the year
-  12000); here the rule of the last year the database represents, 9999, applies
-  from then on. A date before the database's first year uses the zone's earliest
-  (local mean time) offset.
-- **The reference 6.0.5's own tz data is older than 2022f.** For a date after
-  the rule changes of 2022 to 2024 the two disagree: Mexico City in July 2024
-  (-05 there, -06 here), Nuuk, Almaty, Cairo and Asuncion. Nothing is done about
-  it here: the built-in database is current (2026e) on purpose.
-- **`$dateTrunc` bounds `binSize` by what the unit can count.** A year, quarter,
-  month, week or day bin larger than the number of that unit (counted with its
-  shortest length) that 64 bits of milliseconds hold (292,471,208 years,
-  106,751,991,167 days) is `dateTrunc unsupported binSize value`, and a bin or a
-  result no 64-bit date can hold is `dateTrunc overflowed`. The reference
-  refuses the same bins in the same class at every probed size (year 1e8
-  answers, 3e8 does not; day 1e11 answers, 2e11 does not; the largest long for
-  every unit), but it words some refusals as `dateAdd overflowed` or `invalid
-  dateAdd 'amount' parameter value` and the exact threshold is not probed, so a
-  bin just beside the bound may differ.
-- **Results past the 64-bit date range are refused here, and are garbage in the
-  reference.** `$dateDiff` in milliseconds between the smallest and largest date
-  (the reference answers 0), `$dateTrunc` of a date near the 64-bit limits (it
-  answers the date 0) and a `$dateFromParts` sum of that size are
-  `Overflow occurred` / `dateTrunc overflowed` here. A `$dateFromParts`
-  `millisecond` whose finer-unit count overflows is refused (`9e18` is
-  `DurationOverflow` in the reference; `1e9` and a `second` of `9e15` answer); the
-  exact threshold here, 9.2e15, is derived from that one probe.
-- **`$dateTrunc` of an hour, minute, second or millisecond bin** is cut from the
-  instant the zone's clock read 2000-01-01 00:00 (with the offset it had then),
-  as the reference does, so in New York in July a 2-hour bin starts on an odd
-  UTC hour. `$dateDiff` counts the clock's own boundaries at each instant, also
-  as the reference does.
-- **Offsets above 23:59 are accepted** (`+24:00`, `+05:60`, `+99`) because the
-  reference accepts them, and `%z`/`%Z` print them as it does (`+9900 5940`,
-  `+2400 1440`, `-9900 -5940`).
-- **The order of null and bad arguments** follows the reference for `$year` and
-  the other one-date operators, `$dateAdd`, `$dateSubtract`, `$dateDiff`,
-  `$dateTrunc`, `$dateFromParts`, `$dateToParts` (a bad zone is read before a
-  null date) and `$dateToString` (a null `timezone` beside a null date answers
-  `onNull`, beside a date it is `null`); a null `startOfWeek` beside
-  `unit: "week"` is `null`.
-- **A format given as an expression** (`$dateToString`'s `format`) is accepted
-  as the reference accepts it; a constant one is checked when the pipeline is
-  parsed.
-- **Error messages** carry the reference's wording where it is known, without
-  its numeric codes, and every date error is a `400`.
-- **The tz database is the one built in** (2026e), not the host's. A zone whose
-  rules changed after the build keeps the old rules until the dependency is
-  bumped.
 
 ## How to use this document
 
