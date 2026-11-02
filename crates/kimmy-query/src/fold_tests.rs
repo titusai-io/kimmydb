@@ -1,5 +1,5 @@
 //! `$sum`, `$avg`, `$min` and `$max` as expressions: the reference's answers for 392 calls
-//! (`tests/data/q8d_fold.tsv`, recorded from MongoDB 6.0.5 by `q8-probes/q8d-agg.js`), which
+//! (`tests/data/q8d_fold.tsv`, recorded from the reference (6.0.5) by `q8-probes/q8d-agg.js`), which
 //! cover every width and type of operand, the single-expression form and the list form, the
 //! order across types, NaN, the infinities, null and missing values and `Decimal128` sums.
 //! Types are compared exactly (`Int32` beside `Int64` beside a double), a double bit for bit.

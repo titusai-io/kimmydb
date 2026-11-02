@@ -1,5 +1,5 @@
 //! `$binarySize`, `$bsonSize`, `$tsSecond` and `$tsIncrement`: the reference's answers
-//! (recorded from MongoDB 6.0.5 by `q8-probes/q8d-size.js`) for every type of operand, the
+//! (recorded from the reference (6.0.5) by `q8-probes/q8d-size.js`) for every type of operand, the
 //! type of the answer, and the words each refusal is in.
 
 use bson::spec::BinarySubtype;

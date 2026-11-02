@@ -1,7 +1,7 @@
 //! `$rand` and `$sampleRate`: the draw is a double in `[0, 1)` from a source a test replaces
 //! (`expr::random::with_source`, as `stages::sample` takes its `below`), a fresh one each
 //! time it is read, and the filter matches when the draw is below the rate. The reference's
-//! refusals (recorded from MongoDB 6.0.5 by `q8-probes/q8d-rand.js` and `q8d-rand2.js`) are
+//! refusals (recorded from the reference (6.0.5) by `q8-probes/q8d-rand.js` and `q8d-rand2.js`) are
 //! pinned in its words, and the system's source is held to be spread over `[0, 1)`, a
 //! statistical check with room of six standard deviations.
 

@@ -1,5 +1,5 @@
 //! The trigonometric operators, `$atan2` and the two-argument `$log` (the reference's answers
-//! for every operand type: `tests/data/q8d_reference.tsv`, recorded from MongoDB 6.0.5 by
+//! for every operand type: `tests/data/q8d_reference.tsv`, recorded from the reference (6.0.5) by
 //! `q8-probes/q8d.js` and `q8d-log.js`), which operand gives which type, and in whose words
 //! each is refused.
 //!

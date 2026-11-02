@@ -1,5 +1,5 @@
 //! The `Decimal128` trigonometric and hyperbolic functions against the reference's answers
-//! (MongoDB 6.0.5), `data/trig_reference.tsv`: operator, operand and expected answer, one
+//! (the reference, 6.0.5), `data/trig_reference.tsv`: operator, operand and expected answer, one
 //! tab-separated row per call, `ERR` for a refusal. 1478 calls: random 34-digit operands at
 //! many magnitudes, the exact points, the infinities and the very small and very large.
 //!
