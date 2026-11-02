@@ -46,9 +46,9 @@ fn sort_by_count_counts_each_value_and_puts_the_commonest_first() {
         ]
     );
     assert!(out.iter().all(|d| matches!(d.get("count"), Some(Bson::Int32(_)))), "{out:?}");
-    // `$group`'s own `{$sum: 1}` stays a long in this build.
+    // `$group`'s own `{$sum: 1}` is an int too (ADR-268).
     let grouped = run(doc! {"$group": {"_id": "$k", "count": {"$sum": 1}}}, kinds(&["a"])).unwrap();
-    assert_eq!(grouped[0].get("count"), Some(&Bson::Int64(1)));
+    assert_eq!(grouped[0].get("count"), Some(&Bson::Int32(1)));
 }
 
 #[test]
@@ -129,9 +129,12 @@ fn sort_by_count_refuses_what_is_not_a_path_or_an_expression_with_the_references
 
 #[test]
 fn sort_by_count_widens_its_count_to_a_long_past_the_int_range() {
-    assert_eq!(stages::int_count(0), Bson::Int32(0));
-    assert_eq!(stages::int_count(i64::from(i32::MAX)), Bson::Int32(i32::MAX));
-    assert_eq!(stages::int_count(i64::from(i32::MAX) + 1), Bson::Int64(i64::from(i32::MAX) + 1));
+    // The count is `$group`'s `{$sum: 1}`, typed by its total (ADR-268).
+    let mut total = crate::expr::Total::default();
+    total.add(&Bson::Int32(i32::MAX));
+    assert_eq!(total.to_bson(), Bson::Int32(i32::MAX));
+    total.add(&Bson::Int32(1));
+    assert_eq!(total.to_bson(), Bson::Int64(i64::from(i32::MAX) + 1));
 }
 
 #[test]
@@ -760,7 +763,7 @@ fn redact_run_inside_a_facet_sees_the_facets_input() {
         out,
         vec![doc! {
             "kept": [{"_id": 1, "count": 2}],
-            "sampled": [{"n": 2i64}],
+            "sampled": [{"n": 2}],
             "unset": [{"id": 1}, {"id": 2}, {"id": 3}],
         }]
     );

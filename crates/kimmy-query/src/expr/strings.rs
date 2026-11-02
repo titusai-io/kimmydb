@@ -451,7 +451,9 @@ pub(super) fn match_bytes(text: &str, m: &RegexMatch, index: usize) -> usize {
         .sum();
     let document = 4
         + (1 + "match".len() + 1 + string(m.end - m.start))
-        + (1 + "idx".len() + 1 + 8)
+        // `idx` is an `Int32`: a code point index in a string no document can hold
+        // more than 2^31 of.
+        + (1 + "idx".len() + 1 + 4)
         + (1 + "captures".len() + 1 + 4 + captures + 1)
         + 1;
     1 + digits(index) + 1 + document
@@ -463,7 +465,7 @@ pub(super) fn match_document(text: &str, m: &RegexMatch, cp: usize) -> Bson {
     let slice = |(a, b): (usize, usize)| Bson::String(text[a..b].to_string());
     let mut doc = Document::new();
     doc.insert("match", slice((m.start, m.end)));
-    doc.insert("idx", Bson::Int64(cp as i64));
+    doc.insert("idx", super::count_bson(cp));
     doc.insert(
         "captures",
         Bson::Array(m.groups.iter().map(|g| g.map_or(Bson::Null, slice)).collect()),
@@ -534,7 +536,7 @@ fn format_g(d: f64) -> String {
 
 pub(super) fn str_len_bytes(arg: &Bson) -> Result<Bson> {
     match arg {
-        Bson::String(s) => Ok(Bson::Int64(s.len() as i64)),
+        Bson::String(s) => Ok(super::count_bson(s.len())),
         other => Err(Error::InvalidQuery(format!(
             "$strLenBytes requires a string argument, found: {}",
             type_name(other)
@@ -672,7 +674,7 @@ pub(super) fn index_of(op: Op, args: &[Bson]) -> Result<Bson> {
     if op == Op::IndexOfBytes {
         // A start past the end (or past `end`) finds nothing, even for "".
         if start > s.len() || start > end.min(s.len()) {
-            return Ok(Bson::Int64(-1));
+            return Ok(Bson::Int32(-1));
         }
         let hay = &s.as_bytes()[start..end.min(s.len())];
         let found = if token.is_empty() {
@@ -680,13 +682,13 @@ pub(super) fn index_of(op: Op, args: &[Bson]) -> Result<Bson> {
         } else {
             hay.windows(token.len()).position(|w| w == token.as_bytes())
         };
-        return Ok(Bson::Int64(found.map_or(-1, |at| (start + at) as i64)));
+        return Ok(found.map_or(Bson::Int32(-1), |at| super::count_bson(start + at)));
     }
 
     // Code points: translate the bounds to bytes, search, translate the answer back.
     let to_byte = |i: usize| s.char_indices().nth(i).map_or(s.len(), |(b, _)| b);
     if start > s.chars().count() {
-        return Ok(Bson::Int64(-1));
+        return Ok(Bson::Int32(-1));
     }
     let (lo, hi) = (to_byte(start), to_byte(end));
     let at = if token.is_empty() {
@@ -694,5 +696,5 @@ pub(super) fn index_of(op: Op, args: &[Bson]) -> Result<Bson> {
     } else {
         s[lo..].find(token.as_str()).map(|at| lo + at).filter(|at| *at < hi)
     };
-    Ok(Bson::Int64(at.map_or(-1, |at| s[..at].chars().count() as i64)))
+    Ok(at.map_or(Bson::Int32(-1), |at| super::count_bson(s[..at].chars().count())))
 }

@@ -31,7 +31,7 @@ fn set_computes_a_field_from_others_and_keeps_the_rest() {
         doc! {"_id": 1, "a": 2, "b": 3, "k": "x"},
     )
     .unwrap();
-    assert_eq!(out, doc! {"_id": 1, "a": 2, "b": 3, "k": "x", "total": 5i64, "label": "nx"});
+    assert_eq!(out, doc! {"_id": 1, "a": 2, "b": 3, "k": "x", "total": 5, "label": "nx"});
     // `$addFields` is the same stage under its other name.
     let again = apply(
         vec![doc! {"$addFields": {"total": {"$add": ["$a", "$b"]}, "label": {"$concat": ["n", "$k"]}}}],
@@ -39,6 +39,31 @@ fn set_computes_a_field_from_others_and_keeps_the_rest() {
     )
     .unwrap();
     assert_eq!(out, again);
+}
+
+#[test]
+fn a_stored_integer_result_has_the_references_width() {
+    // ADR-268: the width of an expression's integer result is the type that is stored.
+    let stored = || doc! {"_id": 1, "a": 2, "b": 3, "big": i32::MAX, "l": 5i64};
+    let n = |expr: Bson| {
+        apply(vec![doc! {"$set": {"n": expr}}], stored()).unwrap().get("n").cloned().unwrap()
+    };
+    assert_eq!(n(bson::bson!({"$add": ["$a", "$b"]})), Bson::Int32(5));
+    assert_eq!(n(bson::bson!({"$multiply": ["$a", "$b"]})), Bson::Int32(6));
+    assert_eq!(n(bson::bson!({"$add": ["$big", 1]})), Bson::Int64(2_147_483_648));
+    assert_eq!(n(bson::bson!({"$add": ["$a", "$l"]})), Bson::Int64(7));
+    assert_eq!(n(bson::bson!({"$add": ["$a", 0.5]})), Bson::Double(2.5));
+    assert_eq!(n(bson::bson!({"$mod": ["$b", "$a"]})), Bson::Int32(1));
+    assert_eq!(n(bson::bson!({"$size": [["$a", "$b"]]})), Bson::Int32(2));
+}
+
+#[test]
+fn a_result_equal_to_the_stored_int32_leaves_the_document_byte_equal() {
+    // The reference keeps the `Int32` and counts no change; an `Int64` would be written.
+    let stored = doc! {"_id": 1, "a": 2, "b": 3, "total": 5};
+    let out =
+        apply(vec![doc! {"$set": {"total": {"$add": ["$a", "$b"]}}}], stored.clone()).unwrap();
+    assert_eq!(bson::serialize_to_vec(&out).unwrap(), bson::serialize_to_vec(&stored).unwrap());
 }
 
 #[test]
@@ -52,7 +77,7 @@ fn stages_run_in_order_and_each_sees_the_one_before() {
         doc! {"_id": 1, "a": 4},
     )
     .unwrap();
-    assert_eq!(out, doc! {"_id": 1, "b": 50i64});
+    assert_eq!(out, doc! {"_id": 1, "b": 50});
 }
 
 #[test]
@@ -69,14 +94,11 @@ fn array_fields_can_be_computed_over() {
     .unwrap();
     assert_eq!(
         out.get_array("items").unwrap(),
-        &vec![
-            Bson::Document(doc! {"sku": "a", "q": 6i64}),
-            Bson::Document(doc! {"sku": "b", "q": 3i64}),
-        ]
+        &vec![Bson::Document(doc! {"sku": "a", "q": 6}), Bson::Document(doc! {"sku": "b", "q": 3}),]
     );
     // `n`, `sum` and `big` were computed from the array as it was before this stage.
-    assert_eq!(out.get("n"), Some(&Bson::Int64(2)));
-    assert_eq!(out.get("sum"), Some(&Bson::Int64(7)));
+    assert_eq!(out.get("n"), Some(&Bson::Int32(2)));
+    assert_eq!(out.get("sum"), Some(&Bson::Int32(7)));
     assert_eq!(out.get_array("big").unwrap(), &vec![Bson::Document(doc! {"sku": "a", "q": 5})]);
 }
 
@@ -198,7 +220,7 @@ fn unset_removes_paths_and_project_includes_or_excludes() {
     assert_eq!(
         apply(vec![doc! {"$project": {"a": 1, "twice": {"$multiply": ["$a", 2]}}}], stored)
             .unwrap(),
-        doc! {"_id": 1, "a": 1, "twice": 2i64}
+        doc! {"_id": 1, "a": 1, "twice": 2}
     );
 }
 
@@ -211,7 +233,7 @@ fn replace_with_and_replace_root_replace_the_document_and_keep_the_id() {
     }
     assert_eq!(
         apply(vec![doc! {"$replaceWith": {"n": {"$add": ["$b", 1]}}}], stored.clone()).unwrap(),
-        doc! {"_id": 7, "n": 3i64}
+        doc! {"_id": 7, "n": 3}
     );
     // With the same `_id`, in any position, the document is stored with `_id` first.
     assert_eq!(
@@ -232,7 +254,7 @@ fn a_replace_with_later_stages_keeps_working_on_the_new_document() {
         doc! {"_id": 1, "a": 1},
     )
     .unwrap();
-    assert_eq!(out, doc! {"_id": 1, "v": 1, "w": 2i64});
+    assert_eq!(out, doc! {"_id": 1, "v": 1, "w": 2});
 }
 
 // ---------------------------------------------------------------------------

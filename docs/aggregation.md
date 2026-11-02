@@ -231,7 +231,7 @@ specified as a string or as an object`); a string that is not a path, an empty d
 a document that is not an operator expression such as `{who: "$k"}` (`must be defined as a
 $-prefixed path or an expression inside an object`); and `"$"` alone. A missing field and
 `null` are one group, `_id: null`. **`count` is an int** (a long only past 2^31-1), as the
-reference's is, where `$group`'s `{$sum: 1}` is a long in this build. **The order of equal
+reference's is, and as `$group`'s `{$sum: 1}` is ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)). **The order of equal
 counts is unspecified**, as it is in the reference (two runs of it differ): this build
 happens to keep the order each value was first seen, and that is not a promise. Blocking, and one group per distinct value counts against the pipeline's
 document limit like `$group`.
@@ -752,6 +752,21 @@ wrong quietly:
 | `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
 | `$push` `$addToSet` | Taken as they are | An explicit `null` is appended (`$addToSet` keeps one of them, and `undefined` is that same member); **a missing field is skipped**, as the reference skips it | — nothing is unusable |
 
+**`$sum` of integers is typed by its exact total and by whether a long was added, as the
+reference types it.** `{$sum: 1}` counts as an `Int32` and widens to an `Int64` past
+2^31-1. A sum of `Int32`s is an `Int32` while the exact total fits one and an `Int64`
+past that. A sum that added an `Int64` is an `Int64` whatever the total (the longs
+`1` and `2` sum to the long `3`; `{$sum: NumberLong(1)}` counts as a long). A total
+past `Int64`, or any double, is a double, and the total is exact, so the order of the
+values cannot change the answer (`[LMAX, 1, -1]` is the long `LMAX` either way). **A
+`$setWindowFields` `$sum` follows the same rule** over a cumulative or whole-partition window,
+and over a sliding window is typed by what the window holds now: any long in it makes a
+long, any double a double, ints alone the narrowest width that holds the total. (The
+reference types a sliding sum by its history, so `[LMAX, 1, 2]` over `[-1, 0]` is a long,
+a double, then the `Int32` `3`; see [deviations](deviations.md).)
+[ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width).
+See [the width table](#integer-result-widths).
+
 `$first` evaluates its expression for the first document of a group only, and
 `$last` fails only when the last document's value cannot be evaluated: an
 earlier document's value is not part of the answer, so its failure is not
@@ -978,10 +993,49 @@ The same holds for a `$match` stage's `$expr`: a document it cannot be
 evaluated against fails the pipeline, it is not dropped
 ([ADR-206](decisions.md)).
 
-**Integer arithmetic is exact.** `$add`, `$subtract` and `$multiply` compute in
-64-bit integers whenever every operand is integral, promoting to a double only
-on overflow or when a double is involved. `$divide` is always a double — an
-integer result would make `{$divide: [1, 2]}` zero.
+**Integer arithmetic is exact, and keeps the width it was given.** `$add`,
+`$subtract` and `$multiply` compute in integers whenever every operand is
+integral: an `Int32` with an `Int32` is an `Int32` and widens to an `Int64` only
+when the total does not fit (a chain is typed by its **final** total, so
+`[2147483647, 1, -1]` is an `Int32` in any order), an `Int64` operand makes an
+`Int64`, and the result becomes a double only past `Int64` or when a double is involved
+([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)).
+`$divide` is always a double — an integer result would make `{$divide: [1, 2]}`
+zero.
+
+#### Integer result widths
+
+The width of an integer result is the reference's, so `$type` of a computed
+integer says `"int"` or `"long"` where the reference does, and a pipeline-style
+update that stores one stores the reference's type.
+
+| Operator | Result |
+|---|---|
+| `$add`, `$subtract`, `$multiply` | `Int32` with `Int32` is an `Int32`, an `Int64` when the final total does not fit `Int32` (`[2147483647, 1, -1]` is an `Int32`, `[65536, 65536, 0]` an `Int32` `0`); any `Int64` operand gives an `Int64`, and a long `$add` chain is summed exactly (`[LMAX, 1, -1]` is the long `LMAX`); a total past `Int64`, or any double operand, gives a double; a decimal operand gives a decimal. `$subtract` of two dates is an `Int64` (milliseconds) |
+| `$divide` | A double (a decimal with a decimal operand) |
+| `$mod` | `Int32` with `Int32` is an `Int32` (`x % -1` is `0`, the smallest `Int32` included); an `Int64` operand gives an `Int64`; an integer by a whole-number double that fits `Int32` is an integer in the dividend's width (`7 % 2.0` is the `Int32` `1`); a double dividend, a divisor with a fraction, or a whole divisor past `Int32` (`7 % 1e10`) gives a double |
+| `$abs` | The operand's width. `$abs` of the smallest `Int32` is the `Int64` `2147483648`; of the smallest `Int64`, `400` (the reference's `28680`) |
+| `$ceil`, `$floor` | The operand's width |
+| `$round`, `$trunc` | The operand's width (an `Int32` rounded up past `Int32` is an `Int64`; an `Int64` rounded up past `Int64` is `400`, the reference's `51080`) |
+| `$pow` | Two `Int32`s give an `Int32` while the power fits one, an `Int64` after; an `Int64` operand gives an `Int64`; past `Int64`, a double. `1` and `-1` to a negative whole power are an `Int32` (an `Int64` with an `Int64` operand), not a double |
+| `$size`, `$strLenCP`, `$strLenBytes`, `$indexOfArray`, `$indexOfCP`, `$indexOfBytes` | `Int32` (`-1` for no match is an `Int32`) |
+| `idx` of `$regexFind` and `$regexFindAll` | `Int32` |
+| `$range` | `Int32` elements; a bound or a step past `Int32` is `400` (the reference's `34444`, `34446`, `34448`) |
+| `$cmp`, `$strcasecmp` | `Int32` |
+| `$year`, `$month`, `$dayOfMonth`, `$hour`, `$minute`, `$second`, `$millisecond`, `$dayOfWeek`, `$dayOfYear`, `$week`, `$isoWeek`, `$isoDayOfWeek` | `Int32` |
+| `$isoWeekYear`, `$dateDiff` | `Int64` |
+| `$toInt`, `$toLong` | `Int32`, `Int64` |
+| `$sum` (`$group`, `$bucket`, `$bucketAuto`) | By the exact total and whether a long was added: an `Int32` while every integer was an `Int32` and the total fits; an `Int64` once an `Int64` was added or the total left `Int32`; a double past `Int64` or once a double is added; a decimal once a decimal is. A group with nothing numeric is the `Int32` `0` |
+| `$sum` (`$setWindowFields`) | As a group sum over a cumulative or whole-partition window (`[1, 2, 2147483647]` run up is `1`, `3`, the `Int64` `2147483650`; the longs `1`, `2` the longs `1`, `3`); over a sliding window by what the window holds now: a long in it, an `Int64`; a double, a double; ints alone, the narrowest width that holds the total |
+| `$rank`, `$denseRank`, `$documentNumber`, `$count` and `{$sum: 1}` in a window | `Int32` |
+| `$avg`, `$derivative`, `$expMovingAvg` in a window; `$integral` after the first document; `$linearFill` between two ints | A double (`$integral` of fewer than two documents over numbers is the `Int32` `0`) |
+| `$densify` | A generated value is the field's width for an `Int32` step on an `Int32` field and an `Int64` for an `Int64` step or field; a double step gives a double; the existing documents are untouched |
+| `{$sum: 1}`, `$count` (accumulator), the `$count` stage, the default `count` of `$bucket` and `$bucketAuto` | `Int32`, an `Int64` past 2^31-1 |
+| `$avg` | A double (a decimal with a decimal in the group) |
+| `includeArrayIndex` of `$unwind`, `depthField` of `$graphLookup` | `Int64` |
+
+Stored values are never rewritten: a document keeps the types it was written
+with, and the rule applies to what an expression computes from now on.
 
 **Date arithmetic works.** `$add` shifts a date by milliseconds, `$subtract`
 between two dates gives the interval in milliseconds, and `$subtract` of a
@@ -1140,10 +1194,10 @@ that is not a number is `400`.
 
 | Operator | Result |
 |---|---|
-| `{$abs: x}` | The absolute value; an integer gives an `Int64`, as every integer result of an expression does (an `Int32` becomes an `Int64`). `$abs` of the smallest `Int64` is a double, as an overflowing `$add` is. A decimal keeps its exponent: `$abs` of `-1.50` is `1.50` |
-| `{$ceil: x}`, `{$floor: x}` | The integer nearest toward `+∞` or `-∞`. An integer is itself, as an `Int64`; a double stays a double; a decimal has exponent 0 (`$ceil` of `1.20` is `2`) |
-| `{$round: [x, place]}`, `{$trunc: [x, place]}` | `place` digits after the point, default 0. **`$round` rounds half to even** (`$round: [2.5]` is `2`, `[3.5]` is `4`, `[-2.5]` is `-2`); `$trunc` cuts toward zero. A negative `place` rounds to tens, hundreds, and so on (`$round: [1250, -2]` is `1200`, an integer). `place` is a whole number from `-20` to `100`, a `null` place gives `null`, and any other is `400`. An integer is exact, and a decimal result has exponent `-place` (`$round: [2.5, 2]` over `Decimal128("2.5")` is `2.50`), unless that needs more than 34 digits, when it is returned as it was. A double is rounded on its **exact binary value**: `$round: [2.675, 2]` is `2.67`, because the double nearest 2.675 is below it, and `$round: [0.125, 2]` is `0.12`, an exact tie |
-| `{$pow: [base, exponent]}` | An integer base and a non-negative integer exponent give an integer while it fits `Int64`, a double after; otherwise a double, or a decimal with a decimal operand. `0` to a negative power, and a negative base to a power that is not a whole number, are `400` (not an infinity or a `NaN`) |
+| `{$abs: x}` | The absolute value; an integer keeps its width, except that `$abs` of the smallest `Int32` is an `Int64` and of the smallest `Int64` is `400`, as in the reference. A decimal keeps its exponent: `$abs` of `-1.50` is `1.50` |
+| `{$ceil: x}`, `{$floor: x}` | The integer nearest toward `+∞` or `-∞`. An integer is itself, in its own width; a double stays a double; a decimal has exponent 0 (`$ceil` of `1.20` is `2`) |
+| `{$round: [x, place]}`, `{$trunc: [x, place]}` | `place` digits after the point, default 0. **`$round` rounds half to even** (`$round: [2.5]` is `2`, `[3.5]` is `4`, `[-2.5]` is `-2`); `$trunc` cuts toward zero. A negative `place` rounds to tens, hundreds, and so on (`$round: [1250, -2]` is `1200`, an integer of the operand's width). `place` is a whole number from `-20` to `100`, a `null` place gives `null`, and any other is `400`. An integer is exact, and a decimal result has exponent `-place` (`$round: [2.5, 2]` over `Decimal128("2.5")` is `2.50`), unless that needs more than 34 digits, when it is returned as it was. A double is rounded on its **exact binary value**: `$round: [2.675, 2]` is `2.67`, because the double nearest 2.675 is below it, and `$round: [0.125, 2]` is `0.12`, an exact tie |
+| `{$pow: [base, exponent]}` | An integer base and a non-negative integer exponent give an integer while it fits `Int64` (an `Int32` when both are `Int32` and the power fits one), a double after; otherwise a double, or a decimal with a decimal operand. `0` to a negative power, and a negative base to a power that is not a whole number, are `400` (not an infinity or a `NaN`) |
 | `{$sqrt: x}` | The square root. A negative argument is `400` |
 | `{$exp: x}`, `{$ln: x}`, `{$log10: x}` | `e^x`, the natural logarithm and the base-10 logarithm. `$ln` and `$log10` of zero or a negative are `400`; `$log10` of an exact power of ten is exact |
 
@@ -1342,9 +1396,9 @@ element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 **`$range`** produces at most 100,000 integers — the same ceiling as the
 pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
 exhaustion written as an expression, and it is refused before anything is
-allocated. Its elements are 64-bit integers, as every integer result here is
-, so `$type` of an element is `"long"`
-([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).
+allocated. Its elements are `Int32`, as the reference's are, so `$type` of an
+element is `"int"`; a bound or a step past `Int32` is a `400`, as there
+([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)).
 
 ### Sorting and zipping arrays
 
@@ -1731,7 +1785,8 @@ operand, every result is what it always was.
 - **`$sum` and `$avg` over a group with a decimal give the same bytes under any
   document order, plan and member.** Integers and doubles in such a group are
   converted as above and joined to the exact sum. A group with no decimal sums as
-  it always did: `Int64` with a widening to double on overflow, or a double.
+  it always did, in the width of the total: an `Int32` while it fits, an `Int64` past that,
+  a double on overflow of `Int64`, or a double.
 - Values that are not numbers are skipped, as ever, and an array or a document is
   not read inside.
 

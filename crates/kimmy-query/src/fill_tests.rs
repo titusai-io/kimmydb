@@ -62,7 +62,7 @@ fn a_value_is_an_expression_over_the_document_and_needs_no_order() {
     let out = run(doc! {"output": {"b": {"value": {"$multiply": ["$a", 10]}}}}, input).unwrap();
     // The order of the input is kept.
     assert_eq!(col(&out, "_id"), vec![Bson::Int32(3), Bson::Int32(1), Bson::Int32(2)]);
-    assert_eq!(col(&out, "b"), vec![Bson::Int64(40), Bson::Int32(7), Bson::Int64(20)]);
+    assert_eq!(col(&out, "b"), vec![Bson::Int32(40), Bson::Int32(7), Bson::Int32(20)]);
 }
 
 #[test]
@@ -415,4 +415,14 @@ fn the_stage_runs_inside_a_facet() {
     let fill = aggregate::parse(&[doc! {"$fill": {"output": {"v": {"value": 0}}}}]).unwrap();
     assert_eq!(fill[0].name(), "$fill");
     assert!(!fill[0].needs_storage());
+}
+
+#[test]
+fn a_filled_long_value_stays_a_long() {
+    let out = run(
+        doc! {"output": {"v": {"value": Bson::Int64(5)}}},
+        vec![doc! {"_id": 1, "v": Bson::Null}],
+    )
+    .unwrap();
+    assert_eq!(out[0].get("v"), Some(&Bson::Int64(5)));
 }
