@@ -119,6 +119,14 @@ pub trait ModifySpec {
     /// The document to insert when nothing matched, if this is an upsert.
     fn upsert(&self) -> Option<std::result::Result<Document, String>>;
 
+    /// The typed refusal behind a string that [`Self::apply`] or [`Self::upsert`]
+    /// reported, when it has one that must reach the caller as itself and not as an
+    /// `InvalidQuery`: a size limit keeps its status (`413`), whichever door writes.
+    /// `None` for a string that is only a message.
+    fn refusal_for(&self, _reported: &str) -> Option<kimmy_core::Error> {
+        None
+    }
+
     /// The version the caller expects the matched document to be at.
     ///
     /// `Some` makes the write conditional: a match at any other stamp — or
@@ -406,9 +414,12 @@ impl Engine {
                 Ok(doc) => doc,
                 Err(e) => {
                     txn.abort()?;
-                    // The caller's reason for refusing to insert, an update's
-                    // as much as a query's: it keeps the label it was given.
-                    return Err(StorageError::Core(kimmy_core::Error::InvalidUpdate(e)));
+                    // The caller's reason for refusing to insert, worded as the same
+                    // refusal on a matched document is: the engine reports `apply`'s
+                    // string as an `InvalidQuery`, and this is the same string.
+                    return Err(StorageError::Core(
+                        spec.refusal_for(&e).unwrap_or(kimmy_core::Error::InvalidQuery(e)),
+                    ));
                 }
             };
             let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
@@ -492,9 +503,9 @@ impl Engine {
             return Err(StorageError::Stale { current: Some(found.stamp) });
         }
         let id = extract_id(&found.doc)?;
-        let next = spec
-            .apply(&found.doc)
-            .map_err(|e| StorageError::Core(kimmy_core::Error::InvalidQuery(e)))?;
+        let next = spec.apply(&found.doc).map_err(|e| {
+            StorageError::Core(spec.refusal_for(&e).unwrap_or(kimmy_core::Error::InvalidQuery(e)))
+        })?;
         let entry = self.write_chosen(txn, coll, &id, found, next.as_ref())?;
         Ok((next, entry))
     }

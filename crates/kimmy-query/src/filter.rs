@@ -341,6 +341,12 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
 fn parse_conditions(path: &str, value: &Bson, scope: Scope<'_>) -> Result<Vec<Condition>> {
     let equality =
         |value: &Bson| -> Result<Vec<Condition>> { Ok(vec![Condition::Eq(value.clone())]) };
+    // A regular expression written as a field's value is a pattern the field is
+    // matched against, as `$regex` is, with the same refusals (an invalid pattern,
+    // a possessive quantifier). `{$eq: /re/}` still compares it as a value.
+    if let Bson::RegularExpression(re) = value {
+        return Ok(vec![regex_condition(re.pattern.as_str(), re.options.as_str())?]);
+    }
     let Bson::Document(doc) = value else {
         return equality(value);
     };
@@ -1876,6 +1882,45 @@ mod tests {
         // A group between the two quantifiers, and a lazy one, are patterns.
         parse(&doc! { "s": { "$regex": "(?:a*)+a" } }).unwrap();
         parse(&doc! { "s": { "$regex": "a+?a" } }).unwrap();
+    }
+
+    #[test]
+    fn a_regex_written_as_a_fields_value_matches_as_a_pattern() {
+        // The reference matches `{s: /a/}` against "aaab" as `$regex` does; only
+        // `{s: {$eq: /a/}}` compares the regex as a value.
+        let implicit = |re: Bson| doc! { "s": re };
+        assert!(hits(implicit(literal("a", "")), doc! { "s": "aaab" }));
+        assert!(hits(implicit(literal("^a+b$", "")), doc! { "s": "aaab" }));
+        assert!(!hits(implicit(literal("^b", "")), doc! { "s": "aaab" }));
+        assert!(!hits(implicit(literal("a", "")), doc! { "s": 5 }));
+        assert!(!hits(implicit(literal("a", "")), doc! {}));
+        // Its flags are the pattern's.
+        assert!(hits(implicit(literal("^AAA", "i")), doc! { "s": "aaab" }));
+        assert!(!hits(implicit(literal("^AAA", "")), doc! { "s": "aaab" }));
+        // Over an array, any element matches, as `$regex` does.
+        assert!(hits(implicit(literal("^c", "")), doc! { "s": ["a", "cat"] }));
+        // The same under a dotted path, a nested `$and`, and an `$elemMatch`.
+        assert!(hits(doc! { "a.s": literal("b", "") }, doc! { "a": { "s": "abc" } }));
+        assert!(hits(doc! { "$and": [{ "s": literal("b", "") }] }, doc! { "s": "abc" }));
+        assert!(hits(
+            doc! { "xs": { "$elemMatch": { "s": literal("b", "") } } },
+            doc! { "xs": [{ "s": "abc" }] }
+        ));
+        // `$eq` compares it as a value, so it is not a string match.
+        assert!(!hits(doc! { "s": { "$eq": literal("a", "") } }, doc! { "s": "aaab" }));
+        // The pattern is the same as `$regex` writes: one parse, one answer.
+        assert_eq!(
+            parse(&implicit(literal("^a", "i"))).unwrap(),
+            parse(&doc! { "s": { "$regex": literal("^a", "i") } }).unwrap()
+        );
+        // The refusals are `$regex`'s: an invalid pattern, a possessive
+        // quantifier and an unsupported construct.
+        for pattern in ["(unclosed", "a*+a", "^a++$", r"(a)\1", "a(?=b)"] {
+            refused(implicit(literal(pattern, "")));
+            refused(doc! { "$or": [{ "t": 1 }, { "s": literal(pattern, "") }] });
+        }
+        // `$in` keeps its documented refusal of a regex.
+        refused(doc! { "s": { "$in": [literal("a", "")] } });
     }
 
     #[test]
