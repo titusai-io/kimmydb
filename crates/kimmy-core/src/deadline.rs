@@ -561,11 +561,14 @@ mod tests {
         tick_n(700).unwrap();
         tick_n(3).unwrap();
         assert_eq!(ticks_taken() - before, 5703);
-        // A check restarts the stride at 1, so the next tick reads the clock.
+        // The count has learned that ticks are cheap and reads once in many. A check restarts
+        // it at a stride of 1, so the next few hundred ticks read at 1, 2, 4, 8, ... 256.
         check().unwrap();
         let reads_before = reads();
-        tick().unwrap();
-        assert_eq!(reads() - reads_before, 1);
+        for _ in 0..600 {
+            tick().unwrap();
+        }
+        assert!(reads() - reads_before >= 8, "{} reads", reads() - reads_before);
     }
 
     #[test]
@@ -601,9 +604,10 @@ mod tests {
 
     #[test]
     fn a_ticker_notices_a_deadline_that_passes_in_the_middle_of_a_loop() {
+        // The start is taken before the scope, so the deadline cannot come before 30 ms of it.
+        let started = Instant::now();
         let _guard = Deadline::scope(Some(Duration::from_millis(30)));
         let mut ticker = Ticker::new();
-        let started = Instant::now();
         let mut iterations = 0u64;
         let outcome = loop {
             if let Err(e) = ticker.tick() {
