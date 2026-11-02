@@ -37,12 +37,13 @@ impl UpdatePipeline {
     /// stage that is wrong inside is refused as it is in an aggregation. `$$NOW` is the
     /// request's one date (the parse joins the clock the request already opened).
     pub fn parse(stages: &[Bson]) -> Result<Self> {
-        // The same bound an aggregation has (`aggregate::MAX_PIPELINE_STAGES`), in the words
-        // of an update: refused before any stage is read.
-        if stages.len() > aggregate::MAX_PIPELINE_STAGES {
+        // The same bound an aggregation has (`aggregate::MAX_PIPELINE_STAGES`), counted the same
+        // way, in the words of an update: refused before any stage is read.
+        let weight = aggregate::pipeline_weight(stages.iter().filter_map(Bson::as_document));
+        let weight = weight + stages.iter().filter(|stage| stage.as_document().is_none()).count();
+        if weight > aggregate::MAX_PIPELINE_STAGES {
             return Err(Error::InvalidUpdate(format!(
-                "an update pipeline has {} stages, over the limit of {}",
-                stages.len(),
+                "an update pipeline has {weight} stages, over the limit of {}",
                 aggregate::MAX_PIPELINE_STAGES
             )));
         }

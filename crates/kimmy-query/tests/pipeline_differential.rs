@@ -285,7 +285,7 @@ fn stage() -> impl Strategy<Value = Document> {
             "path": "$arr", "preserveNullAndEmptyArrays": true, "includeArrayIndex": "i"
         } }),
         (0i32..6).prop_map(|n| doc! { "$skip": n }),
-        (0i32..6).prop_map(|n| doc! { "$limit": n }),
+        (1i32..6).prop_map(|n| doc! { "$limit": n }),
         (1i32..4).prop_map(|n| doc! { "$limit": n }),
         Just(doc! { "$sort": { "a": 1 } }),
         Just(doc! { "$sort": { "b": -1, "_id": 1 } }),
@@ -545,12 +545,14 @@ fn an_unwind_stops_before_the_element_that_fails() {
     assert_eq!(answer(got), answer(old_loop(&stages, docs)));
 }
 
-/// `$limit 0` takes nothing and the chain says so before it is pushed anything.
+/// A limit of nothing takes nothing and the chain says so before it is pushed anything. The
+/// parser refuses `$limit: 0`, as the reference does, so the stage is made by hand: this is
+/// what a chain does for a limit that is full before any document.
 #[test]
-fn a_limit_of_zero_wants_no_document() {
+fn a_limit_that_is_full_before_any_document_wants_none() {
     let docs: Vec<Document> = (0..5).map(|id| doc! { "_id": id }).collect();
-    let stages =
-        aggregate::parse(&[doc! { "$addFields": { "x": 1 } }, doc! { "$limit": 0 }]).unwrap();
+    let mut stages = aggregate::parse(&[doc! { "$addFields": { "x": 1 } }]).unwrap();
+    stages.push(Stage::Limit(0));
     let run = Run::new();
     let runner = |stage: &Stage, input, arrived| run.stage(stage, input, arrived);
     let vars = run.vars();

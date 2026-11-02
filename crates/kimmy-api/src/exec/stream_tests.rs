@@ -82,9 +82,12 @@ fn a_full_limit_ends_the_scan_and_the_stats_say_how_far_it_read() {
     assert_eq!(read(json!([{"$sort": {"_id": -1}}, {"$limit": 2}])), (vec![49, 48], 50, 50));
     // A limit that never fills reads the whole collection.
     assert_eq!(read(json!([{"$limit": 500}])).1, 50);
-    // `$limit 0` reads no document.
-    assert_eq!(read(json!([{"$limit": 0}])), (vec![], 0, 0));
-    assert_eq!(read(json!([{"$addFields": {"x": 1}}, {"$limit": 0}, {"$count": "n"}])).1, 0);
+    // `$limit 0` is refused, as the reference refuses it, so no pipeline reads nothing.
+    for pipeline in [json!([{"$limit": 0}]), json!([{"$addFields": {"x": 1}}, {"$limit": 0}])] {
+        let err = run(&state, pipeline, aggregate::Limits::default()).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("$limit must be positive, found 0"), "{}", err.message);
+    }
 }
 
 #[test]
@@ -278,6 +281,16 @@ fn a_pipeline_of_more_than_a_thousand_stages_is_a_400_that_names_the_count_and_t
         "{}",
         err.message
     );
+    // A stage the reference expands into two counts as two: a `$count` after 999 is the 1,001st.
+    let counted = |n: usize| {
+        let mut stages = vec![json!({"$skip": 0}); n];
+        stages.push(json!({"$count": "n"}));
+        Value::Array(stages)
+    };
+    let err = run(&state, counted(999), aggregate::Limits::default()).unwrap_err();
+    assert!(err.message.contains("a pipeline has 1001 stages"), "{}", err.message);
+    let ok = run(&state, counted(998), aggregate::Limits::default()).unwrap();
+    assert_eq!(ok["documents"], json!([{"n": 3}]));
 }
 
 /// `n` documents `{_id: i, t: i}` under an index on `t`, so a range of `t` is an inexact

@@ -589,7 +589,6 @@ mod tests {
                 2,
                 "index",
             ),
-            (json!([{ "$limit": 0 }]), 0, "collectionScan"),
         ];
         for (pipeline, needs, strategy) in cases {
             let (answer, stats) = run_stats(&state, "a", &pipeline).unwrap();

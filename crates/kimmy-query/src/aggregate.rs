@@ -102,11 +102,44 @@ pub struct Limits {
 pub const DEFAULT_MAX_DOCUMENTS: usize = 100_000;
 
 /// The most stages one pipeline may have, a `$facet` branch and a `$lookup` or `$unionWith`
-/// sub-pipeline each counted on its own. The reference's limit is believed to be the same
-/// number; that is not yet probed (see `docs/deviations.md`). It is a bound on the body a
-/// client can send, not what keeps the stack safe: [`crate::pipeline`] runs a run of stages
-/// that stream in one loop, whatever its length.
+/// sub-pipeline each counted on its own, and a stage that the reference expands into two
+/// counted as two ([`stage_weight`]). It is the reference's limit, measured (see
+/// `docs/deviations.md`). It is a bound on the body a client can send, not what keeps the stack
+/// safe: [`crate::pipeline`] runs a run of stages that stream in one loop, whatever its length.
 pub const MAX_PIPELINE_STAGES: usize = 1_000;
+
+/// What a stage counts for against [`MAX_PIPELINE_STAGES`]: the stages it is made of in the
+/// reference, which counts what a stage expands to. `$count`, `$sortByCount`, `$bucket`,
+/// `$setWindowFields` and `$densify` are two; every other stage probed is one, and one that
+/// was not (a `$fill` with a method, a `$densify` variant, `$geoNear`) is counted as one here.
+pub fn stage_weight(name: &str) -> usize {
+    match name {
+        "$count" | "$sortByCount" | "$bucket" | "$setWindowFields" | "$densify" => 2,
+        _ => 1,
+    }
+}
+
+/// What the stages of a pipeline count for, as they are written: the name of a stage is its
+/// one key, and a stage that has not one is counted as one (it is refused when it is parsed).
+pub fn pipeline_weight<'a>(stages: impl IntoIterator<Item = &'a Document>) -> usize {
+    stages
+        .into_iter()
+        .map(|stage| match (stage.len(), stage.keys().next()) {
+            (1, Some(name)) => stage_weight(name),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// The refusal of a pipeline that weighs `weight`, in the words of `what` ("a pipeline", or
+/// "an update pipeline", which has no `$facet` or sub-pipelines to say).
+pub(crate) fn too_many_stages(what: &str, weight: usize) -> Error {
+    Error::InvalidQuery(format!(
+        "{what} has {weight} stages, over the limit of {MAX_PIPELINE_STAGES} (a stage that \
+         expands, such as $count, counts as two). A $facet branch and a $lookup or $unionWith \
+         sub-pipeline are each counted on their own"
+    ))
+}
 
 impl Default for Limits {
     fn default() -> Self {
@@ -542,12 +575,9 @@ impl Placement {
 }
 
 fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
-    if pipeline.len() > MAX_PIPELINE_STAGES {
-        return Err(Error::InvalidQuery(format!(
-            "a pipeline has {} stages, over the limit of {MAX_PIPELINE_STAGES}. A $facet branch \
-             and a $lookup or $unionWith sub-pipeline are each counted on their own",
-            pipeline.len()
-        )));
+    let weight = pipeline_weight(pipeline);
+    if weight > MAX_PIPELINE_STAGES {
+        return Err(too_many_stages("a pipeline", weight));
     }
     let stages = pipeline
         .iter()
@@ -621,7 +651,12 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         }
         "$replaceRoot" => parse_replace_root(as_document(name, value)?, vars),
         "$sort" => Ok(Stage::Sort(shape::parse_sort(as_document(name, value)?)?)),
-        "$limit" => Ok(Stage::Limit(as_count(name, value)?)),
+        "$limit" => match as_count(name, value)? {
+            // As the reference refuses it: a limit of nothing is not a window, and `$skip` past
+            // the end or a `$match` that selects nothing say it.
+            0 => Err(Error::InvalidQuery("$limit must be positive, found 0".into())),
+            n => Ok(Stage::Limit(n)),
+        },
         "$skip" => Ok(Stage::Skip(as_count(name, value)?)),
         "$count" => match value {
             Bson::String(field) if !field.is_empty() => Ok(Stage::Count(field.clone())),
@@ -3464,8 +3499,9 @@ mod tests {
         let skips = |n: usize| vec![doc! {"$skip": 0}; n];
         assert_eq!(MAX_PIPELINE_STAGES, 1_000);
         assert_eq!(parse(&skips(1_000)).unwrap().len(), 1_000);
-        let refused = "a pipeline has 1001 stages, over the limit of 1000. A $facet branch and a \
-                       $lookup or $unionWith sub-pipeline are each counted on their own";
+        let refused = "a pipeline has 1001 stages, over the limit of 1000 (a stage that expands, \
+                       such as $count, counts as two). A $facet branch and a $lookup or \
+                       $unionWith sub-pipeline are each counted on their own";
         let err = parse(&skips(1_001)).unwrap_err();
         assert_eq!(err.to_string(), format!("invalid query: {refused}"));
         // A trailing `$out` is one of the stages counted.
@@ -3489,6 +3525,71 @@ mod tests {
             let err = parse(&[wrap(bson(skips(1_001)))]).unwrap_err().to_string();
             assert!(err.contains(refused), "{err}");
         }
+    }
+
+    #[test]
+    fn a_stage_that_expands_counts_as_two_against_the_limit_as_the_reference_counts_it() {
+        // Measured on the reference: with 999 stages, `$count`, `$sortByCount`, `$bucket`,
+        // `$setWindowFields` and `$densify` are refused and with 998 they are accepted; every
+        // other stage probed is accepted with 999.
+        let skips = |n: usize| vec![doc! {"$skip": 0}; n];
+        let doubles = [
+            doc! {"$count": "n"},
+            doc! {"$sortByCount": "$a"},
+            doc! {"$bucket": {"groupBy": "$a", "boundaries": [0, 1]}},
+            doc! {"$setWindowFields": {"output": {"n": {"$documentNumber": {}}}, "sortBy": {"a": 1}}},
+            doc! {"$densify": {"field": "a", "range": {"step": 1, "bounds": "full"}}},
+        ];
+        for stage in doubles {
+            let name = stage.keys().next().unwrap().clone();
+            assert_eq!(stage_weight(&name), 2, "{name}");
+            let mut at_999 = skips(999);
+            at_999.push(stage.clone());
+            let err = parse(&at_999).unwrap_err().to_string();
+            assert!(
+                err.contains("a pipeline has 1001 stages, over the limit of 1000"),
+                "{name}: {err}"
+            );
+            let mut at_998 = skips(998);
+            at_998.push(stage);
+            assert_eq!(parse(&at_998).unwrap().len(), 999, "{name}");
+        }
+        // The rest are one each.
+        for stage in [
+            doc! {"$project": {"a": 1}},
+            doc! {"$group": {"_id": "$a"}},
+            doc! {"$bucketAuto": {"groupBy": "$a", "buckets": 2}},
+            doc! {"$unset": "a"},
+            doc! {"$set": {"a": 1}},
+            doc! {"$replaceWith": "$a"},
+            doc! {"$sort": {"a": 1}},
+            doc! {"$sample": {"size": 1}},
+            doc! {"$redact": "$$KEEP"},
+            doc! {"$unwind": "$a"},
+            doc! {"$fill": {"output": {"a": {"value": 0}}}},
+            doc! {"$facet": {"x": []}},
+            doc! {"$lookup": {"from": "b", "localField": "a", "foreignField": "a", "as": "j"}},
+            doc! {"$unionWith": "b"},
+            doc! {"$out": "o"},
+        ] {
+            let name = stage.keys().next().unwrap().clone();
+            assert_eq!(stage_weight(&name), 1, "{name}");
+            let mut at_999 = skips(999);
+            at_999.push(stage);
+            assert_eq!(parse(&at_999).unwrap().len(), 1_000, "{name}");
+        }
+        // A sub-pipeline weighs its own stages the same way.
+        let branch = |stages: Vec<Document>| {
+            parse(&[
+                doc! {"$facet": {"a": stages.into_iter().map(Bson::Document).collect::<Vec<_>>()}},
+            ])
+        };
+        let mut over = skips(999);
+        over.push(doc! {"$count": "n"});
+        assert!(branch(over).unwrap_err().to_string().contains("a pipeline has 1001 stages"));
+        let mut under = skips(998);
+        under.push(doc! {"$count": "n"});
+        assert!(branch(under).is_ok());
     }
 
     #[test]
@@ -3529,9 +3630,10 @@ mod tests {
     fn count_over_an_empty_stream_is_one_document_holding_zero() {
         // The count of nothing is defined, and it is 0. Emitting no document
         // would make every caller spell a defensive read for a value the stage
-        // always knows. Four differently-shaped ways of emptying the stream —
+        // always knows. Three differently-shaped ways of emptying the stream —
         // a filter matching nothing, a fan-out dropping every row, a `$skip`
-        // past the end, an explicit `$limit: 0` — and one answer for all.
+        // past the end — and one answer for all. (A `$limit: 0` is a `400`, as it is in the
+        // reference.)
 
         // The unwind case needs pinning beyond "the prefix came out empty":
         // if `_id: 3` ever left `sample()`, `$match` would select nothing,
@@ -3547,7 +3649,6 @@ mod tests {
             vec![doc! {"$match": {"city": "Berlin"}}],
             vec![doc! {"$match": {"_id": 3}}, doc! {"$unwind": "$tags"}],
             vec![doc! {"$skip": 999}],
-            vec![doc! {"$limit": 0}],
         ] {
             // Each prefix must really empty the stream, or the count below
             // would be the count of a non-empty one — this catches `$skip:
@@ -4296,6 +4397,24 @@ mod tests {
         assert!(parse(&[doc! {"$limit": 2.5}]).is_err());
         assert!(parse(&[doc! {"$limit": "ten"}]).is_err());
         assert!(parse(&[doc! {"$limit": 10}]).is_ok());
+    }
+
+    #[test]
+    fn a_limit_of_zero_is_refused_wherever_it_is_as_the_reference_refuses_it() {
+        let refused = "invalid query: $limit must be positive, found 0";
+        assert_eq!(parse(&[doc! {"$limit": 0}]).unwrap_err().to_string(), refused);
+        // However it is spelled, and after other stages.
+        assert!(parse(&[doc! {"$skip": 1}, doc! {"$limit": 0.0}]).is_err());
+        assert!(parse(&[doc! {"$limit": 1}]).is_ok());
+        let zero = vec![Bson::Document(doc! {"$limit": 0})];
+        for wrapped in [
+            doc! {"$facet": {"a": zero.clone()}},
+            doc! {"$lookup": {"from": "items", "pipeline": zero.clone(), "as": "items"}},
+            doc! {"$unionWith": {"coll": "items", "pipeline": zero.clone()}},
+        ] {
+            let err = parse(&[wrapped]).unwrap_err().to_string();
+            assert_eq!(err, refused);
+        }
     }
 
     #[test]

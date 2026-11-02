@@ -2598,7 +2598,8 @@ fn scan_pipeline(
             run_stage(state, auth, db, stage, docs, arrived, limits, &[])
         };
         let mut chain = pipeline::build(stages, &run, limits, &[]);
-        // A pipeline that takes no document (a `$limit` of 0) reads none.
+        // A chain that is full before it is pushed anything reads no document. The parser
+        // refuses `$limit: 0`, so no pipeline of a request is, but the scan asks.
         let stop_after = chain.is_full().then_some(0);
         // The scan answers `core::Error`s and the chain the executor's, so a failure of the
         // chain ends the scan and is kept to be returned when it is over.

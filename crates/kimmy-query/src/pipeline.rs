@@ -1003,7 +1003,9 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_of_nothing_wants_no_document() {
+    fn a_limit_that_is_full_before_any_document_wants_none() {
+        // The parser refuses `$limit: 0`, as the reference does, so these are stages made by
+        // hand: what a chain does for a limit that is full before it is pushed anything.
         let limits = Limits::default();
         let stage = Stage::Limit(0);
         let (mut run, got) = run_of(&stage, &limits, 10);
@@ -1413,7 +1415,8 @@ mod tests {
     fn the_source_a_pipeline_takes_is_known_for_a_skip_and_a_limit_at_its_head_and_no_other() {
         let bound = |specs: &[Document]| source_bound(&parsed(specs));
         assert_eq!(bound(&[doc! {"$limit": 5}]), Some(5));
-        assert_eq!(bound(&[doc! {"$limit": 0}]), Some(0));
+        // A limit of 0 cannot be parsed, but a stage made by hand takes none.
+        assert_eq!(source_bound(&[Stage::Skip(2), Stage::Limit(0)]), Some(2));
         assert_eq!(bound(&[doc! {"$skip": 3}, doc! {"$limit": 5}]), Some(8));
         assert_eq!(
             bound(&[doc! {"$skip": 3}, doc! {"$skip": 4}, doc! {"$limit": 5}, doc! {"$limit": 1}]),
