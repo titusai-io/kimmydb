@@ -20840,6 +20840,75 @@ async fn sample_rate_keeps_about_its_share_through_find_count_update_and_delete(
     assert_eq!(res.body["count"].as_u64().unwrap(), 1000 - deleted);
 }
 
+/// The positional `$` reads the element a filter matched, and a `$sampleRate` in the filter is
+/// drawn once for a document, not again to find the element (review q8d, M2): a second draw
+/// at or above the rate made a valid request a `400`. The source cannot be scripted from here,
+/// so the test makes the old failure near-certain instead: over 200 documents each of the
+/// three paths would fail with probability 1 - 0.75^100 or more, and none may.
+#[tokio::test]
+async fn a_positional_path_with_a_sample_rate_is_never_refused() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let res = server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "pos" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs: Vec<Value> = (0..200).map(|i| json!({ "_id": i, "a": [1, 2, 3] })).collect();
+    let res = server.post("/v1/db/shop/coll/pos/bulk", Some(&token), Value::Array(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let filter = json!({ "a": 2, "$sampleRate": 0.5 });
+
+    // The positional find projection: each document it keeps is the matched element.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pos/find",
+            Some(&token),
+            json!({ "filter": filter, "projection": { "a.$": 1 }, "limit": 1000 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let found = res.body["documents"].as_array().expect("documents");
+    assert!((55..145).contains(&found.len()), "{}", found.len());
+    assert!(found.iter().all(|d| d["a"] == json!([2])), "{found:?}");
+
+    // About a hundred find-and-modify calls with a positional projection, each on one document.
+    let mut answered = 0;
+    for i in 0..100 {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/pos/find_and_modify",
+                Some(&token),
+                json!({
+                    "filter": { "_id": i, "a": 2, "$sampleRate": 0.5 },
+                    "update": { "$set": { "touched": true } },
+                    "projection": { "a.$": 1 },
+                    "returnDocument": "after",
+                }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{i}: {:?}", res.body);
+        if !res.body["document"].is_null() {
+            answered += 1;
+            assert_eq!(res.body["document"]["a"], json!([2]), "{i}");
+        }
+    }
+    assert!((20..80).contains(&answered), "{answered}");
+
+    // The positional multi-update: the matched element is the one rewritten.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pos/update",
+            Some(&token),
+            json!({ "filter": filter, "update": { "$set": { "a.$": 20 } }, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let matched = res.body["matched"].as_u64().unwrap();
+    assert!((55..145).contains(&matched), "{matched}");
+    let res = server
+        .post("/v1/db/shop/coll/pos/count", Some(&token), json!({ "filter": { "a": [1, 20, 3] } }))
+        .await;
+    assert_eq!(res.body["count"].as_u64().unwrap(), matched, "{:?}", res.body);
+}
+
 /// A `$lookup` sub-pipeline's leading `$sampleRate` (or `$expr` with `$rand`) is drawn for each
 /// outer document: two outer documents get two different samples of the foreign ones (review
 /// q8d, M3). Applied once to the foreign documents and shared, they would get one.

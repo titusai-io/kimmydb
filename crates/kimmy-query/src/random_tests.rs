@@ -341,6 +341,25 @@ fn a_positional_projection_after_a_match_does_not_draw_again() {
 }
 
 #[test]
+fn the_answer_of_a_find_and_modify_reads_the_position_without_drawing_again() {
+    // `project_returned` runs twice in a find-and-modify with a positional projection: as
+    // `check_answer` before the write and as the answer after it. Neither may draw.
+    let query = filter::parse(&doc! { "a": 2, "$sampleRate": 0.5 }).unwrap();
+    let projection = crate::shape::parse_find_projection(&doc! { "a.$": 1 }).unwrap().unwrap();
+    let before = doc! { "_id": 1, "a": [1, 2, 3] };
+    let after = doc! { "_id": 1, "a": [1, 20, 3] };
+    let (answers, next) = random::with_source(script(&[0.1, 0.9]), || {
+        assert!(filter::matches(&query, &before).unwrap());
+        let checked = projection.project_returned(&query, &before, &after).unwrap();
+        let answered = projection.project_returned(&query, &before, &after).unwrap();
+        ((checked, answered), random::unit())
+    });
+    assert_eq!(answers.0, doc! { "_id": 1, "a": [20] });
+    assert_eq!(answers.1, answers.0);
+    assert_eq!(next, 0.9, "a positional answer drew a number");
+}
+
+#[test]
 fn the_position_of_a_filter_with_a_random_branch_comes_from_the_branches_that_do_not_draw() {
     // `$or`: the branch that decided is not asked again; the one that does not draw is.
     let query = filter::parse(&doc! { "$or": [{ "$sampleRate": 1 }, { "a": 2 }] }).unwrap();
