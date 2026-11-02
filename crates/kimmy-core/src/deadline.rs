@@ -32,13 +32,25 @@
 //! reads stays under [`FAST`] (1 ms) and **halving** when it passes [`SLOW`] (10 ms).
 //! Cheap ticks settle at about a read a millisecond (so the cost is a decrement per
 //! tick and a 25 ns read per [`MAX_STRIDE`]), expensive ones at a read per tick, and
-//! in between a read about every 1 to 10 ms of work, whatever a tick costs. What is
-//! not covered is the first stretch after the cost jumps: a read a thousand cheap
-//! ticks apart is followed by that many expensive ones before the next read, so a
-//! new phase of work should start with [`check`] (which also restarts the shared
-//! count at 1), as every pipeline stage does on entry.
+//! in between a read about every 1 to 10 ms of work, whatever a tick costs. What the
+//! cadence alone cannot see is the first stretch after the cost jumps: a read
+//! [`MAX_STRIDE`] cheap ticks apart is followed by that many expensive ones before the
+//! next read. Two things close it. Work that is dear for its size charges the size
+//! before it runs ([`tick_n`]: a charge larger than what is left reads the clock at
+//! once), which is what every operator node of an expression does for the values it
+//! reads, nested ones included; and a new phase of work starts with [`check`] (which
+//! also restarts the shared count at 1), as every pipeline stage does on entry.
 //!
 //! Outside a scope there is no deadline and every call here is a no-op.
+//!
+//! # The node stopping
+//!
+//! [`stop_requests`], called by the shutdown path at the drain deadline, ends every
+//! scope at its next look at the clock, with the same [`Error::DeadlineExceeded`]: a
+//! request thread running synchronous work lets go of the storage engine within the
+//! stop's budget instead of holding it open. [`requests_are_stopped`] tells the API to
+//! answer that error as the node stopping. A step under [`Deadline::suspend`] has no
+//! deadline and is not stopped.
 //!
 //! # Adding a check to a loop
 //!
@@ -70,9 +82,19 @@
 //!
 //! It is thread-local, so it holds for the thread that set it. A call that moves
 //! work to another thread must set the scope inside that thread's closure. It
-//! ends work only at a check: a single operation that itself runs long without
-//! ticking (one regular expression over a 16 MiB string) is not cut, and the bulk
-//! array and string operators charge their size with [`tick_n`] before they run.
+//! ends work only at a check, so a request is late by the work between two checks:
+//! one operation that cannot be interrupted once begun (one regular expression over a
+//! 16 MiB string, a sort) runs to its end. Every operator node of an expression ticks
+//! and charges the size of what it reads, nested values included ([`tick_n`]) before it
+//! runs, so the bound is that one operation and not the number of nodes or the size of
+//! the request's body.
+//!
+//! # For tests
+//!
+//! [`ticks_taken`] counts the shared ticks exactly; [`clock_reads`] counts the looks
+//! at the clock; [`look_at_every_tick`] and [`looks_of`] make every tick a look, so that
+//! the looks of a piece of work (the ticks and checks of every loop in it, a [`Ticker`]'s
+//! included) are counted exactly whatever the stride.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
