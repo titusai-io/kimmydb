@@ -2616,6 +2616,15 @@ where
         Ok(())
     }
 
+    /// Charge one key to the hold, if there is one; a refusal is the request's (`413`,
+    /// `503`) and ends the walk.
+    fn take_key(&self, len: usize) -> Result<()> {
+        match self.hold {
+            Some(hold) => Ok(hold.take(len)?),
+            None => Ok(()),
+        }
+    }
+
     /// An inexact range, in document-key order, holding at most `want` keys.
     ///
     /// Entries under a range of keys are ordered by key first, so their
@@ -2629,24 +2638,6 @@ where
     /// number of passes is logarithmic in what the filter rejected rather
     /// than linear in it.
     fn in_key_order(&mut self, after: Option<&[u8]>, want: Option<usize>) -> Result<()> {
-        let done = self.in_key_order_held(after, want);
-        // Whatever ended the walk, the keys it held are gone with it.
-        if let Some(hold) = self.hold {
-            hold.give_all();
-        }
-        done
-    }
-
-    /// Charge one key to the hold, if there is one; a refusal is the request's (`413`,
-    /// `503`) and ends the walk.
-    fn take_key(&self, len: usize) -> Result<()> {
-        match self.hold {
-            Some(hold) => Ok(hold.take(len)?),
-            None => Ok(()),
-        }
-    }
-
-    fn in_key_order_held(&mut self, after: Option<&[u8]>, want: Option<usize>) -> Result<()> {
         use std::collections::BTreeSet;
         use std::ops::Bound;
 
@@ -2828,7 +2819,14 @@ impl crate::Engine {
                 walk.one_run(after)?;
             }
             CandidateOrder::ById { after, .. } if scan.exact => walk.merged_runs(after)?,
-            CandidateOrder::ById { after, want } => walk.in_key_order(after, want)?,
+            CandidateOrder::ById { after, want } => {
+                let done = walk.in_key_order(after, want);
+                // Whatever ended the walk, the keys it held are gone with it.
+                if let Some(hold) = walk.hold {
+                    hold.give_all();
+                }
+                done?;
+            }
         }
         Ok(Some(walk.outcome))
     }
@@ -4470,6 +4468,23 @@ mod tests {
             matches!(&failed, Err(StorageError::Core(CoreError::Limit(m))) if m == "the visitor failed")
         );
         assert_eq!(hold.held.get(), 0);
+    }
+
+    #[test]
+    fn collecting_the_keys_of_a_range_stops_at_a_passed_deadline_and_gives_them_back() {
+        // The walk of the entries looks at the deadline for each entry it reads, collecting
+        // included: a passed deadline ends it with the deadline's error before one key is
+        // held and before the first document is offered, and the hold is empty.
+        let hold = StubHold::with_room(usize::MAX);
+        let _expired = kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO));
+        let ended =
+            walk_held(CandidateOrder::ById { after: None, want: None }, &hold, usize::MAX, None);
+        assert!(
+            matches!(&ended, Err(StorageError::Core(CoreError::DeadlineExceeded))),
+            "{:?}",
+            ended.as_ref().map(|_| ())
+        );
+        assert_eq!((hold.takes.get(), hold.held.get()), (0, 0));
     }
 
     #[test]
