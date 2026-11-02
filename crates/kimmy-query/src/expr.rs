@@ -2788,8 +2788,10 @@ impl Num {
 /// turn them into one exact sum (ADR-252).
 ///
 /// Before a decimal, nothing is rounded and nothing is lost: the integers
-/// add as one exact `i128` and each double is kept as its 64 bits (at most 100,000
-/// of them, the pipeline's own ceiling on documents). At the first decimal an
+/// add as one exact `i128` and each double is kept as its 64 bits: one for each document of
+/// a group, which the pipeline's ceiling on documents bounds, and for the expression forms
+/// one for each double of the array, which the 16 MiB bound of an array does (about 1.4
+/// million). At the first decimal an
 /// [`ExactSum`] takes the integers exactly and every buffered double by R1, and
 /// from then on each number goes straight in. The sum is rounded once, at the
 /// end, so it is the same bytes in any document order.
