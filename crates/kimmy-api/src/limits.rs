@@ -45,6 +45,7 @@
 //! A scope applies only to the thread that set it, so work moved to another
 //! thread sets its own inside that thread's closure.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -370,7 +371,7 @@ async fn drain(mut body: Body, bound: usize) {
 }
 
 /// The size of the pieces an answer is handed to hyper in.
-pub(crate) const ANSWER_CHUNK_BYTES: usize = 64 * 1024;
+pub const ANSWER_CHUNK_BYTES: usize = 64 * 1024;
 
 /// A response body that holds `hold` until the body has been sent or is dropped.
 ///
@@ -388,14 +389,29 @@ pub(crate) const ANSWER_CHUNK_BYTES: usize = 64 * 1024;
 /// ones before. What is left uncounted at the end is what hyper holds then: its write
 /// buffer (400 KiB by default) and the last piece.
 pub(crate) struct HeldBody<H> {
-    rest: Bytes,
+    /// What is left to hand over, front first.
+    chunks: VecDeque<Bytes>,
+    /// Its length, kept so the size hint is exact without a walk.
+    left: usize,
     hold: Option<H>,
 }
 
 impl<H> HeldBody<H> {
     /// `bytes` as a response body that keeps `hold` until it is done with.
     pub(crate) fn new(bytes: Bytes, hold: H) -> Self {
-        Self { rest: bytes, hold: Some(hold) }
+        Self::from_chunks(vec![bytes], hold)
+    }
+
+    /// `chunks`, in order, as a response body that keeps `hold` until it is done with. Each
+    /// is handed to hyper as it is (a chunk over [`ANSWER_CHUNK_BYTES`] is cut into slices of
+    /// that size): nothing is concatenated or copied.
+    pub(crate) fn from_chunks(chunks: Vec<Bytes>, hold: H) -> Self {
+        let left = chunks.iter().map(Bytes::len).sum();
+        Self {
+            chunks: chunks.into_iter().filter(|c| !c.is_empty()).collect(),
+            left,
+            hold: Some(hold),
+        }
     }
 }
 
@@ -408,21 +424,129 @@ impl<H: Unpin> HttpBody for HeldBody<H> {
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        if this.rest.is_empty() {
+        let Some(front) = this.chunks.front_mut() else {
             // Everything has been handed over: nothing is held any more.
             this.hold = None;
             return Poll::Ready(None);
-        }
-        let piece = this.rest.split_to(this.rest.len().min(ANSWER_CHUNK_BYTES));
+        };
+        let piece = if front.len() > ANSWER_CHUNK_BYTES {
+            front.split_to(ANSWER_CHUNK_BYTES)
+        } else {
+            this.chunks.pop_front().unwrap_or_default()
+        };
+        this.left -= piece.len();
         Poll::Ready(Some(Ok(Frame::data(piece))))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.rest.is_empty()
+        self.chunks.is_empty()
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.rest.len() as u64)
+        SizeHint::with_exact(self.left as u64)
+    }
+}
+
+/// An answer's body held as chunks of [`ANSWER_CHUNK_BYTES`], each allocated once at its full
+/// size, and not as one vector that doubles as it fills: while the answer is written, the
+/// memory beyond what has been written (and charged) is at most one chunk, where a vector
+/// holds up to as much again, and twice over for the moment it grows. The chunks are handed
+/// to hyper as they are ([`HeldBody::from_chunks`]).
+#[derive(Debug, Default)]
+pub struct ChunkedBody {
+    chunks: Vec<Bytes>,
+    len: usize,
+}
+
+impl ChunkedBody {
+    /// The bytes in all.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether it holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The chunks, in order: all of [`ANSWER_CHUNK_BYTES`] but the last, which is what is left.
+    pub fn chunks(&self) -> &[Bytes] {
+        &self.chunks
+    }
+
+    /// The whole body in one vector (a copy: for a caller that wants a value, and for tests).
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len);
+        self.chunks.iter().for_each(|c| out.extend_from_slice(c));
+        out
+    }
+
+    /// A body of one chunk, `bytes` as they are.
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self { chunks: vec![Bytes::from(bytes)], len }
+    }
+
+    pub(crate) fn into_chunks(self) -> Vec<Bytes> {
+        self.chunks
+    }
+}
+
+/// Writes into a [`ChunkedBody`]: a [`std::io::Write`] that fills a chunk allocated at its full
+/// size, then starts the next.
+#[derive(Debug, Default)]
+pub struct ChunkWriter {
+    done: ChunkedBody,
+    current: Vec<u8>,
+}
+
+impl ChunkWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The bytes written so far.
+    pub fn len(&self) -> usize {
+        self.done.len + self.current.len()
+    }
+
+    /// Whether nothing has been written.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// End the body: the last chunk is cut to what it holds.
+    pub fn finish(mut self) -> ChunkedBody {
+        if !self.current.is_empty() {
+            self.current.shrink_to_fit();
+            self.done.len += self.current.len();
+            self.done.chunks.push(Bytes::from(std::mem::take(&mut self.current)));
+        }
+        self.done
+    }
+}
+
+impl std::io::Write for ChunkWriter {
+    fn write(&mut self, mut buf: &[u8]) -> std::io::Result<usize> {
+        let written = buf.len();
+        while !buf.is_empty() {
+            if self.current.capacity() == 0 {
+                self.current = Vec::with_capacity(ANSWER_CHUNK_BYTES);
+            }
+            let room = ANSWER_CHUNK_BYTES - self.current.len();
+            let (now, later) = buf.split_at(room.min(buf.len()));
+            self.current.extend_from_slice(now);
+            buf = later;
+            if self.current.len() == ANSWER_CHUNK_BYTES {
+                self.done.len += ANSWER_CHUNK_BYTES;
+                self.done.chunks.push(Bytes::from(std::mem::take(&mut self.current)));
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -803,6 +927,70 @@ mod tests {
         drop(body);
         assert_eq!(pool.used(), 0);
         assert_eq!(taken.iter().map(Bytes::len).sum::<usize>(), whole.len());
+    }
+
+    /// A body kept as chunks is handed over as they are, in order, with the hold kept to the
+    /// last and an exact size hint (ADR-269).
+    #[tokio::test]
+    async fn a_body_of_chunks_is_handed_over_as_they_are() {
+        let pool = kimmy_query::budget::MemoryPool::new(1_000);
+        let budget = kimmy_query::budget::BufferBudget::pooled(1_000, &pool);
+        let mut lease = budget.lease("the answer");
+        lease.charge(700).unwrap();
+
+        let chunks: Vec<Bytes> = vec![
+            Bytes::from(vec![1u8; ANSWER_CHUNK_BYTES]),
+            Bytes::new(),
+            Bytes::from(vec![2u8; ANSWER_CHUNK_BYTES]),
+            Bytes::from(vec![3u8; 10]),
+        ];
+        let pointers: Vec<usize> = chunks.iter().map(|c| c.as_ptr() as usize).collect();
+        let mut body = Body::new(HeldBody::from_chunks(chunks, lease));
+        assert_eq!(body.size_hint().exact(), Some(2 * ANSWER_CHUNK_BYTES as u64 + 10));
+        let mut got = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let data = frame.unwrap().into_data().unwrap();
+            got.push((data.len(), data.as_ptr() as usize, data[0]));
+            if got.len() < 3 {
+                assert_eq!(pool.used(), 700, "held until the last chunk is taken");
+            }
+        }
+        // The same memory, not a copy; the empty one is skipped.
+        assert_eq!(
+            got,
+            [
+                (ANSWER_CHUNK_BYTES, pointers[0], 1),
+                (ANSWER_CHUNK_BYTES, pointers[2], 2),
+                (10, pointers[3], 3)
+            ]
+        );
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn the_chunk_writer_fills_each_chunk_to_its_size_and_cuts_the_last() {
+        use std::io::Write as _;
+        let mut writer = ChunkWriter::new();
+        assert!(writer.is_empty());
+        // Writes that end exactly at, inside and across a boundary.
+        let data: Vec<u8> = (0..(3 * ANSWER_CHUNK_BYTES + 77)).map(|i| (i % 251) as u8).collect();
+        let mut at = 0;
+        for size in [1, ANSWER_CHUNK_BYTES - 1, 5, ANSWER_CHUNK_BYTES, ANSWER_CHUNK_BYTES - 5] {
+            writer.write_all(&data[at..at + size]).unwrap();
+            at += size;
+            assert_eq!(writer.len(), at);
+        }
+        writer.write_all(&data[at..]).unwrap();
+        let body = writer.finish();
+        assert_eq!(body.len(), data.len());
+        assert_eq!(body.to_vec(), data);
+        let sizes: Vec<usize> = body.chunks().iter().map(Bytes::len).collect();
+        assert_eq!(sizes, [ANSWER_CHUNK_BYTES, ANSWER_CHUNK_BYTES, ANSWER_CHUNK_BYTES, 77]);
+        // A body that ends on a boundary has no empty chunk after it, and an empty one none.
+        let mut exact = ChunkWriter::new();
+        exact.write_all(&vec![9u8; 2 * ANSWER_CHUNK_BYTES]).unwrap();
+        assert_eq!(exact.finish().chunks().len(), 2);
+        assert!(ChunkWriter::new().finish().chunks().is_empty());
     }
 
     #[test]

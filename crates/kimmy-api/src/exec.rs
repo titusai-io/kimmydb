@@ -2377,8 +2377,9 @@ pub enum Answer {
     /// The answer as a value: a sink's counts, or documents for a caller that wants a value.
     Json(Value),
     /// The documents' answer already written as JSON, `{"documents":[..],"count":N}`, byte for
-    /// byte what serialising the value would give: the route sends it as it is.
-    Body(Vec<u8>),
+    /// byte what serialising the value would give: the route sends it as it is, in the chunks
+    /// it was written in.
+    Body(crate::limits::ChunkedBody),
 }
 
 impl Answer {
@@ -2387,7 +2388,7 @@ impl Answer {
     pub fn into_value(self) -> Value {
         match self {
             Answer::Json(value) => value,
-            Answer::Body(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            Answer::Body(body) => serde_json::from_slice(&body.to_vec()).unwrap_or(Value::Null),
         }
     }
 }
@@ -2587,23 +2588,24 @@ fn finish_pipeline(
             // as when each was counted apart, and nothing past the document that passes the
             // limit is written. What is not a document's (the framing and the count) is
             // under a hundred bytes and not charged, as it was not.
-            let mut body = Vec::new();
-            body.extend_from_slice(b"{\"documents\":[");
+            use std::io::Write as _;
+            let mut body = crate::limits::ChunkWriter::new();
+            // Writing to memory cannot fail; a value that could not be written is charged as
+            // it got, as `json_len` counts it.
+            let _ = body.write_all(b"{\"documents\":[");
             for (at, doc) in docs.iter().enumerate() {
                 ticker.tick()?;
                 if at > 0 {
-                    body.push(b',');
+                    let _ = body.write_all(b",");
                 }
                 let start = body.len();
-                // Writing to a vector cannot fail; a value that could not be written is
-                // charged as it got, as `json_len` counts it.
                 let _ = serde_json::to_writer(&mut body, &document_to_json(doc));
                 let len = body.len() - start;
                 answer.charge(len)?;
                 json_total += len;
             }
-            body.extend_from_slice(format!("],\"count\":{count}}}").as_bytes());
-            Answer::Body(body)
+            let _ = write!(body, "],\"count\":{count}}}");
+            Answer::Body(body.finish())
         }
     };
     drop(docs);
