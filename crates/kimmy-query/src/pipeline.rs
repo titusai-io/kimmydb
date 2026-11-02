@@ -458,18 +458,25 @@ impl<'a, E: From<Error>> Streaming<'a, E> {
     /// The next document of the innermost fan that is still needed, and the step to take it
     /// on from.
     fn resume(&mut self) -> Result<Option<(Document, usize)>, Error> {
-        while let Some((at, fan, bytes)) = self.fans.last_mut() {
-            let (at, bytes) = (*at, *bytes);
+        while let Some((at, fan, charged)) = self.fans.last_mut() {
+            let at = *at;
             if self.full.is_some_and(|full| at < full) {
-                self.held.release(bytes);
+                self.held.release(*charged);
                 self.fans.pop();
                 continue;
             }
             let spec = unwind_spec(self.steps[at].stage, self.limits);
             match fan.next(&spec, &mut self.ticker)? {
-                Some((doc, _built)) => return Ok(Some((doc, at + 1))),
+                Some((doc, _built)) => {
+                    // What the fan still holds is what it is charged: the element that was
+                    // handed out is the caller's now, and the last takes the document with it.
+                    let now = fan.held_bytes().min(*charged);
+                    self.held.release(*charged - now);
+                    *charged = now;
+                    return Ok(Some((doc, at + 1)));
+                }
                 None => {
-                    self.held.release(bytes);
+                    self.held.release(*charged);
                     self.fans.pop();
                 }
             }

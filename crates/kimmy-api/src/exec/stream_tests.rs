@@ -479,7 +479,10 @@ fn smallest_budget(state: &SharedState, pipeline: &Value, mut hi: usize) -> (usi
 }
 
 #[test]
-fn what_a_stage_that_blocks_hands_to_a_stage_that_streams_is_held_while_it_drains() {
+fn what_a_stage_that_blocks_hands_to_a_stage_that_streams_is_released_as_it_drains() {
+    // What this pins is that the drain is charged and given back: a drain charged and never
+    // released would need the documents twice. That the drain is charged at all is pinned by
+    // the unit tests that read the budget at each push (`pipeline::tests`, `budget_tests`).
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, padded(20, 10_000));
     let input = held_docs_bytes(&padded(20, 10_000));
@@ -502,4 +505,25 @@ fn what_a_stage_that_blocks_hands_to_a_stage_that_streams_is_held_while_it_drain
         "{}",
         err.message
     );
+}
+
+#[test]
+fn a_descent_of_single_element_unwinds_is_answered_within_the_budget_the_loop_needed() {
+    // Thirty arrays of one element, thirty `$unwind`s, over a megabyte document: the loop held
+    // two documents at a time. A fan that kept a copy for each level was refused at the
+    // twenty-third on a 100 MiB budget with four megabytes; here it is the budget of the
+    // answer and a few documents.
+    let mut doc = deep(0);
+    for level in 0..30 {
+        doc.insert(format!("a{level}"), vec![1]);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, vec![doc]);
+    let one = held_docs_bytes(&[deep(0)]);
+    let pipeline: Vec<Value> =
+        (0..30).map(|level| json!({"$unwind": format!("$a{level}")})).collect();
+    let limits = capped(8 * one);
+    let ok = run(&state, Value::Array(pipeline), limits.clone()).unwrap();
+    assert_eq!(ok["count"], 1);
+    assert_eq!(limits.buffer.used(), 0);
 }

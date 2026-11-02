@@ -1636,3 +1636,48 @@ fn unwinds_that_do_not_fan_out_hold_nothing_however_many_there_are() {
     assert_eq!(chain.finish().unwrap().len(), 1);
     assert_eq!(limits.buffer.used(), 0);
 }
+
+#[test]
+fn a_descent_of_single_element_unwinds_holds_one_document_as_the_loop_did() {
+    // Fifty arrays of one element each, fifty `$unwind`s: each fan hands its one element out
+    // with the document itself, and keeps nothing, so the descent holds the document once
+    // (the loop held it twice, as a stage's input and its output, and so did not hold fifty).
+    let mut doc = deep(0);
+    for level in 0..50 {
+        doc.insert(format!("a{level}"), vec![1]);
+    }
+    let one = held_bytes(&doc);
+    let mut specs: Vec<Document> =
+        (0..50).map(|level| doc! {"$unwind": format!("$a{level}")}).collect();
+    specs.push(doc! {"$limit": 1});
+    let stages = aggregate::parse(&specs).unwrap();
+    // Room for the document in flight, and the one the answer holds: a few documents' worth.
+    let limits = capped(3 * one);
+    let mut chain = chain_of(&stages, &limits);
+    assert_eq!(chain.push(doc).unwrap(), crate::pipeline::Flow::Done);
+    assert_eq!(chain.finish().unwrap().len(), 1);
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+#[test]
+fn a_fan_is_charged_for_what_it_still_holds_and_nothing_after_its_elements_are_out() {
+    // Two elements: the fan keeps the document for the second and is charged for it and the
+    // element still to come; once the second is out, the document went with it. A deeper
+    // fan's descent is therefore charged one document, not one for each level.
+    let mut doc = deep(0);
+    for level in 0..50 {
+        doc.insert(format!("a{level}"), vec![1, 2]);
+    }
+    let one = held_bytes(&doc);
+    let mut specs: Vec<Document> =
+        (0..50).map(|level| doc! {"$unwind": format!("$a{level}")}).collect();
+    specs.push(doc! {"$limit": 2});
+    let stages = aggregate::parse(&specs).unwrap();
+    // Fifty fans stand during the first descent (each is on its first of two elements), and
+    // only the last element of each hands the document on: 60 documents is room for it.
+    let limits = capped(60 * one);
+    let mut chain = chain_of(&stages, &limits);
+    assert_eq!(chain.push(doc).unwrap(), crate::pipeline::Flow::Done);
+    assert_eq!(chain.finish().unwrap().len(), 2);
+    assert_eq!(limits.buffer.used(), 0);
+}

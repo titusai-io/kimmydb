@@ -131,11 +131,11 @@ pub fn pipeline_weight<'a>(stages: impl IntoIterator<Item = &'a Document>) -> us
         .sum()
 }
 
-/// The refusal of a pipeline that weighs `weight`, in the words of `what` ("a pipeline", or
-/// "an update pipeline", which has no `$facet` or sub-pipelines to say).
-pub(crate) fn too_many_stages(what: &str, weight: usize) -> Error {
+/// The refusal of a pipeline that weighs `weight`. An update pipeline has its own words
+/// ([`crate::update_pipeline`]): it has no `$facet` or sub-pipeline to name.
+pub(crate) fn too_many_stages(weight: usize) -> Error {
     Error::InvalidQuery(format!(
-        "{what} has {weight} stages, over the limit of {MAX_PIPELINE_STAGES} (a stage that \
+        "a pipeline has {weight} stages, over the limit of {MAX_PIPELINE_STAGES} (a stage that \
          expands, such as $count, counts as two). A $facet branch and a $lookup or $unionWith \
          sub-pipeline are each counted on their own"
     ))
@@ -577,7 +577,7 @@ impl Placement {
 fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
     let weight = pipeline_weight(pipeline);
     if weight > MAX_PIPELINE_STAGES {
-        return Err(too_many_stages("a pipeline", weight));
+        return Err(too_many_stages(weight));
     }
     let stages = pipeline
         .iter()
@@ -2674,17 +2674,17 @@ impl Fan {
     }
 
     /// What the fan holds while it hands its documents out, as the budget counts it (ADR-269):
-    /// the document and the elements still to come. A document that is not fanned out is
-    /// handed on whole and held by nobody.
+    /// the document it keeps, if it keeps one, and the elements still to come. It shrinks as
+    /// the elements are handed out, and is nothing once the last has taken the document. A
+    /// document that is not fanned out is handed on whole and held by nobody.
     pub(crate) fn held_bytes(&self) -> usize {
-        match &self.elements {
-            Some((rest, _)) => crate::budget::held_bytes(&self.doc).saturating_add(
-                rest.as_slice().iter().fold(0usize, |sum, item| {
-                    sum.saturating_add(crate::budget::held_bytes_bson(item))
-                }),
-            ),
-            None => 0,
-        }
+        let kept = if self.doc.is_empty() { 0 } else { crate::budget::held_bytes(&self.doc) };
+        let rest = self.elements.as_ref().map_or(0, |(rest, _)| {
+            rest.as_slice()
+                .iter()
+                .fold(0usize, |sum, item| sum.saturating_add(crate::budget::held_bytes_bson(item)))
+        });
+        kept.saturating_add(rest)
     }
 
     /// Whether the document is expanded from an array, as against dropped or passed on.
@@ -2703,7 +2703,13 @@ impl Fan {
             // A document holding a huge array is many rows from one iteration
             // of the loop that drives this.
             ticker.tick()?;
-            let mut copy = self.doc.clone();
+            // The last element takes the document itself, so that a fan over a single-element
+            // array, and the last of any, keeps nothing once its element is handed out.
+            let mut copy = if elements.as_slice().is_empty() {
+                std::mem::take(&mut self.doc)
+            } else {
+                self.doc.clone()
+            };
             path::set(&mut copy, spec.field, item)
                 .map_err(|e| Error::InvalidQuery(format!("cannot set `{}`: {e}", spec.field)))?;
             spec.set_index(&mut copy, Some(*index))?;
