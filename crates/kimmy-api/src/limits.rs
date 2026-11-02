@@ -659,6 +659,13 @@ mod tests {
         assert_eq!(&sent[..], b"{\"documents\":[]}");
         assert_eq!(pool.used(), 0, "a body that was sent gives its bytes back");
 
+        // Read to its end but still alive (a connection kept open): nothing is held any more.
+        let mut body = Body::new(HeldBody::new(Bytes::from_static(b"abc"), held(500)));
+        assert_eq!(pool.used(), 500);
+        while body.frame().await.is_some() {}
+        assert_eq!(pool.used(), 0, "a body whose last frame went out holds nothing");
+        drop(body);
+
         // Partly read, then abandoned (the client went away): given back on drop.
         let mut body = Body::new(HeldBody::new(Bytes::from_static(b"abc"), held(700)));
         assert_eq!(pool.used(), 700);
