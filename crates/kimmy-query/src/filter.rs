@@ -966,8 +966,11 @@ pub struct ArrayPosition {
 /// filter evaluates them) leave the first element
 /// that satisfies the last of them. An element is tested as [`matches`] tests
 /// it, one level into the array. An `$or` records from the first branch, in
-/// the order written, that holds; the reference passes no match details to the
-/// branches of an `$or`, so this is an extension (deviations register). `$nor`,
+/// the order written, that holds and does not draw a random number (a branch
+/// that does cannot be asked again after the match, and is passed over, so a
+/// document that matched only through it gives no position); the reference
+/// passes no match details to the branches of an `$or`, so this is an
+/// extension (deviations register). `$nor`,
 /// `$not`, `$ne`, `$nin`, `$exists`, `$size`, `$all` and `$expr` record
 /// nothing, because what they report is not an element that satisfied
 /// anything. `None` means the document matched without an array element being
