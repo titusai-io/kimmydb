@@ -152,13 +152,20 @@ impl AggregateMemory {
     /// The limits of one aggregation: the default document ceiling and a fresh budget of
     /// the request limit, reserving what it holds from the pool.
     pub fn limits(&self) -> kimmy_query::aggregate::Limits {
+        kimmy_query::aggregate::Limits { buffer: self.budget(), ..Default::default() }
+    }
+
+    /// A fresh budget of the request limit, reserving what it holds from the pool: the
+    /// account of a request that holds memory and is not an aggregation (a `find` holding the
+    /// keys of an index range).
+    pub fn budget(&self) -> kimmy_query::budget::BufferBudget {
         let buffer = kimmy_query::budget::BufferBudget::pooled(self.limit, &self.pool);
         // A request that waits for the pool (it is older than another that holds bytes)
         // waits no longer than the request has left: at the deadline it is refused, `503`.
         if let Some(left) = request_time_left() {
             buffer.wait_until(std::time::Instant::now() + left);
         }
-        kimmy_query::aggregate::Limits { buffer, ..Default::default() }
+        buffer
     }
 
     /// The bytes one request may hold.

@@ -45,13 +45,34 @@ pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 /// same fallback, not what a member runs on.
 pub const DEFAULT_MEMORY_POOL_BYTES: usize = 2 * DEFAULT_MEMORY_LIMIT_BYTES;
 
-/// What a refusal tells the caller to do about a request over its limit.
+/// How a lease words its refusals: whose limit it is, and what the caller can do about a
+/// request over it (`413`) or one the pool cannot cover (`503`).
+///
+/// An aggregation's is [`AGGREGATION`], which a lease from [`BufferBudget::lease`] uses. A
+/// holder that is not an aggregation (a `find`'s index range) gives its own with
+/// [`BufferBudget::lease_worded`], since the remedies of an aggregation are not its.
+#[derive(Clone, Copy, Debug)]
+pub struct Wording {
+    /// Who holds the memory, in "the limit of N bytes {holder} may hold at once".
+    pub holder: &'static str,
+    /// What to do about a request over its limit.
+    pub over_limit: &'static str,
+    /// What to do about a request the pool cannot cover.
+    pub pool_busy: &'static str,
+}
+
+/// The wording of an aggregation's refusals.
 ///
 /// Only a leading `$match` narrows what the source reads (the executor reads the whole
 /// collection otherwise, and charges it before any stage runs); a `$project`, `$limit` or
 /// `$match` after it reduces what the later stages hold.
-const REMEDY: &str = "a leading $match narrows what is read; $project, $limit or $match after it \
-                      reduce what later stages hold; or raise aggregate.memory_limit_bytes";
+pub const AGGREGATION: Wording = Wording {
+    holder: "one aggregation",
+    over_limit: "a leading $match narrows what is read; $project, $limit or $match after it \
+                 reduce what later stages hold; or raise aggregate.memory_limit_bytes",
+    pool_busy: "a leading $match narrows what is read, and $project, $limit or $match after it \
+                reduce what later stages hold",
+};
 
 /// The BSON size of `doc`, worked out without encoding it. What the 16 MiB per-value bounds
 /// are held in; the budget charges [`held_bytes`].
@@ -460,7 +481,12 @@ impl BufferBudget {
 
     /// An account on this budget, named `what` in a refusal.
     pub fn lease(&self, what: &'static str) -> Lease {
-        Lease { budget: self.clone(), what, own: 0 }
+        self.lease_worded(what, AGGREGATION)
+    }
+
+    /// [`Self::lease`], whose refusals are worded by `wording` rather than an aggregation's.
+    pub fn lease_worded(&self, what: &'static str, wording: Wording) -> Lease {
+        Lease { budget: self.clone(), what, own: 0, wording }
     }
 }
 
@@ -470,6 +496,7 @@ pub struct Lease {
     budget: BufferBudget,
     what: &'static str,
     own: usize,
+    wording: Wording,
 }
 
 impl Lease {
@@ -492,11 +519,10 @@ impl Lease {
                 bytes: inner.used,
                 max: inner.cap,
                 limit: format!(
-                    "limit of {} bytes one aggregation may hold at once \
-                     (aggregate.memory_limit_bytes)",
-                    inner.cap
+                    "limit of {} bytes {} may hold at once (aggregate.memory_limit_bytes)",
+                    inner.cap, self.wording.holder
                 ),
-                remedy: REMEDY,
+                remedy: self.wording.over_limit,
             });
         }
         let want = inner.used - inner.reserved;
@@ -535,6 +561,7 @@ impl Lease {
                         bytes: want,
                         pool: pool.cap(),
                         in_use: pool.used(),
+                        remedy: self.wording.pool_busy,
                     });
                 }
                 pool.wait_for_release(POOL_WAIT_SLICE.min(give_up - now));
