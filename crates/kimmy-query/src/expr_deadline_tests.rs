@@ -4,6 +4,7 @@
 //! seconds: they count ticks (`deadline::ticks_taken`) under a deadline an hour away, or use
 //! a deadline of a few tens of milliseconds over work that would take many times that.
 
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use bson::{Bson, Document, doc};
@@ -380,4 +381,47 @@ fn the_iteration_operators_tick_for_each_element_even_when_the_body_is_not_an_op
         // One tick for the node, one for each of the 700 elements.
         assert_eq!(ticks_of(spec, &document), 701, "{name}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// A decimal $sin of a huge operand (review q8d, M1)
+// ---------------------------------------------------------------------------
+
+/// `{$cond: [{$lt: ["$n", switch]}, 0, {$sin: 1E+6144}]}`: cheap for `switch` documents and then a
+/// sine whose operand is reduced modulo `pi/2` with numbers of some 12,000 digits.
+fn late_sine() -> Document {
+    doc! { "$cond": [
+        { "$lt": ["$n", 5000] },
+        0,
+        { "$sin": { "$literal": bson::Decimal128::from_str("1E+6144").unwrap() } }
+    ] }
+}
+
+#[test]
+fn a_decimal_sine_of_a_huge_operand_is_charged_its_reduction_before_it_runs() {
+    // The exponent is the charge: 6,144 ticks, past the stride, so the clock is read.
+    let sine = doc! { "$sin": { "$literal": bson::Decimal128::from_str("1E+6144").unwrap() } };
+    assert!(ticks_of(sine, &doc! {}) >= 6144);
+    let small = doc! { "$sin": { "$literal": bson::Decimal128::from_str("1.5").unwrap() } };
+    // The `$sin` and its `$literal` are a tick each, and an operand of exponent 0 is charged none.
+    assert_eq!(ticks_of(small, &doc! {}), 2);
+}
+
+#[test]
+fn a_switch_to_a_huge_decimal_sine_after_thousands_of_cheap_documents_ends_at_the_deadline() {
+    use crate::aggregate::{self, Limits};
+    let expr = parse(late_sine());
+    // `pi` is built once for the process, by the first sine of an operand this large.
+    expr.eval(&doc! { "n": 9999 }).expect("a sine");
+
+    let docs: Vec<Document> = (0..12_000).map(|n| doc! { "_id": n, "n": n }).collect();
+    let stages = aggregate::parse(&[doc! { "$project": { "x": late_sine() } }]).unwrap();
+    let _deadline = Deadline::scope(Some(Duration::from_millis(30)));
+    let start = Instant::now();
+    let result = aggregate::apply(&stages[0], docs, &Limits::default());
+    let took = start.elapsed();
+    assert!(is_deadline(result), "the request must end at its deadline");
+    // The 5,000 cheap documents take a few milliseconds and the sines the rest of the 30: it
+    // ends within about one sine of the deadline, not minutes after it.
+    assert!(took < Duration::from_secs(5), "{took:?}");
 }

@@ -187,7 +187,24 @@ fn plain(op: Op, n: Num) -> Result<Bson> {
     Ok(Bson::Double(out))
 }
 
+/// The ticks of the request deadline a decimal `$sin`, `$cos` or `$tan` is charged before it
+/// runs: its adjusted exponent, since an operand of `1E+6000` is reduced modulo `pi/2` with a
+/// division of numbers some thousands of digits long. A charge past the stride reads the clock
+/// at once (ADR-266), so a late switch to such an operand ends at the deadline.
+fn reduction_ticks(x: &Raw) -> usize {
+    match x {
+        Raw::Finite { coefficient, exponent, .. } if *coefficient != 0 => {
+            let digits = coefficient.ilog10() as i64 + 1;
+            usize::try_from(digits - 1 + i64::from(*exponent)).unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
 fn decimal(op: Op, x: &Raw, arg: &Bson) -> Result<Bson> {
+    if matches!(op, Op::Sin | Op::Cos | Op::Tan) {
+        kimmy_core::deadline::tick_n(reduction_ticks(x))?;
+    }
     let answer = match op {
         Op::Sin => func::sin(x),
         Op::Cos => func::cos(x),

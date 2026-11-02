@@ -112,19 +112,37 @@ impl Scale {
         }
     }
 
-    /// `pi`, correctly to the last place but a few units.
+    /// `pi`, correct to the last place but a few units. It is built once for each of the
+    /// widths in [`PI_LIMBS`] (the widest holds the operand of the largest exponent the
+    /// format has) and cut to this scale, so that no call computes it.
     fn pi(self) -> Mag {
-        if self.limbs == SL {
-            static PI: OnceLock<Mag> = OnceLock::new();
-            return PI.get_or_init(|| pi_places(S)).clone();
-        }
-        pi_places(self.places())
+        static PI: [OnceLock<Mag>; PI_LIMBS.len()] = [const { OnceLock::new() }; PI_LIMBS.len()];
+        let Some(tier) = PI_LIMBS.iter().position(|&limbs| limbs >= self.limbs) else {
+            return pi_places(self.places());
+        };
+        let wide = PI[tier].get_or_init(|| pi_places(PI_LIMBS[tier] as u32 * LIMB_DIGITS));
+        let cut = (PI_LIMBS[tier] - self.limbs) as u32 * LIMB_DIGITS;
+        if cut == 0 { wide.clone() } else { wide.split_digits(cut).0 }
     }
 
     fn half_pi(self) -> Mag {
         m_div_small(&self.pi(), 2).0
     }
 }
+
+/// The widths `pi` is kept at, in limbs: the standard scale, and doublings up to 330 limbs
+/// (6,270 places), which holds an operand of adjusted exponent 6,144 and 114 places beyond.
+const PI_LIMBS: [usize; 8] = [SL, SL + 2, 16, 32, 64, 128, 256, 330];
+
+/// The scale the series of `sin` and `cos` run at, once the operand is reduced: the standard
+/// scale and a limb. The reduction leaves an absolute error of about `10^-115`, and a result
+/// is never below about `10^-40` (the operand is a 34-digit decimal), so 133 places keep
+/// every digit that rounding to 34 needs.
+const SERIES: Scale = Scale { limbs: SL + 1 };
+
+/// The ratio of two operands, in adjusted exponent, from which `atan2` answers `y / x` (or
+/// `pi` less it) directly: `atan(r) = r - r^3/3`, and `r^2` is below `10^-158`.
+const DIRECT_RATIO: i64 = 80;
 
 /// `atan(1/n)` to `places` places, truncated: `Σ (-1)^k / ((2k + 1) n^(2k+1))`.
 fn atan_inverse(n: u64, places: u32) -> Mag {
@@ -379,7 +397,13 @@ fn reduce(coefficient: u128, exponent: i64, adjusted: i64) -> (Scale, u8, Mag) {
     let (quotient, remainder) = m_div_rem(&x, &s.half_pi());
     // `10^19` is a multiple of 4: the low limb decides the quadrant.
     let quadrant = quotient.0.first().map_or(0, |&limb| (limb % 4) as u8);
-    (s, quadrant, remainder)
+    // The remainder is the operand's distance from a multiple of `pi/2`, wherever the operand
+    // is, so the series on it is the one a small operand has: cut to its scale.
+    if s.limbs <= SERIES.limbs {
+        return (s, quadrant, remainder);
+    }
+    let cut = (s.limbs - SERIES.limbs) as u32 * LIMB_DIGITS;
+    (SERIES, quadrant, remainder.split_digits(cut).0)
 }
 
 /// `(sin x, cos x)` as signed fixed points, for `x = coefficient · 10^exponent > 0`.
@@ -835,8 +859,12 @@ pub fn atan2(y: &Raw, x: &Raw) -> Raw {
             Class::Number { coefficient: cx, exponent: ex, adjusted: ax, .. },
         ) => {
             // `atan(|y| / |x|)`, in a scale wide enough for a ratio as small as the operands
-            // make it, and `pi/2` when the ratio is past 120 digits.
-            let s = Scale::reaching((ax - ay).max(0));
+            // make it (up to 80 digits), `pi/2` when the ratio is past 120 digits, and for a
+            // smaller ratio and a positive `x` the ratio itself, rounded once.
+            if ax - ay > DIRECT_RATIO && !x_negative {
+                return small_ratio(y_negative, (cy, ey), (cx, ex));
+            }
+            let s = Scale::reaching((ax - ay).clamp(0, DIRECT_RATIO));
             let angle = if ay - ax >= 120 {
                 s.half_pi()
             } else {
@@ -854,4 +882,20 @@ pub fn atan2(y: &Raw, x: &Raw) -> Raw {
             fx_result(Fx::new(y_negative, angle), s.places())
         }
     }
+}
+
+/// `±|y| / |x|` for operands whose ratio is below `10^-79`, rounded once: the arctangent of it
+/// is the ratio less a part below `10^-158` of it, so the answer is the ratio's nearest
+/// 34 digits, the part counting only as the hair below an exact one. The quotient is taken to
+/// 40 digits or more, and a division with no remainder is one unit short and sticky.
+fn small_ratio(negative: bool, (cy, ey): (u128, i64), (cx, ex): (u128, i64)) -> Raw {
+    let lift = (40 + i64::from(digits_u128(cx)) - i64::from(digits_u128(cy))).max(0);
+    let mut numerator = Mag::from_u128(cy);
+    numerator.mul_pow10(lift as u32);
+    let (mut quotient, remainder) = m_div_rem(&numerator, &Mag::from_u128(cx));
+    if remainder.is_zero() {
+        quotient = m_sub(&quotient, &Mag::from_u64(1));
+    }
+    let exponent = ey - ex - lift;
+    rounded(negative, quotient, exponent, true, exponent)
 }
