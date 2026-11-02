@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, Path, State};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use opentelemetry_semantic_conventions::attribute as semconv;
@@ -1182,17 +1182,25 @@ async fn aggregate_docs(
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
     JsonBody(body): JsonBody<AggregateRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     if body.explain {
-        return Ok(Json(crate::explain::aggregate_explain(
-            &state,
-            &auth,
-            &db,
-            &coll,
-            &body.pipeline,
-        )?));
+        let plan = crate::explain::aggregate_explain(&state, &auth, &db, &coll, &body.pipeline)?;
+        return Ok(Json(plan).into_response());
     }
-    Ok(Json(exec::aggregate(&state, &auth, &db, &coll, &body.pipeline).await?))
+    // The answer's bytes stay charged to the node's pool until the body has been sent
+    // (ADR-269): the lease rides in the response body, and the `Value` is dropped as soon as
+    // it is serialised.
+    let (answer, hold) = exec::aggregate_held(&state, &auth, &db, &coll, &body.pipeline).await?;
+    let bytes = serde_json::to_vec(&answer)
+        .map_err(|e| ApiError::internal(format!("could not write the answer: {e}")))?;
+    drop(answer);
+    let mut response =
+        Response::new(axum::body::Body::new(crate::limits::HeldBody::new(bytes.into(), hold)));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------

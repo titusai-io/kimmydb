@@ -922,14 +922,18 @@ the scan, not the memory of the result.
 
 **On `aggregate`, `explain: true` plans and runs nothing**
 ([ADR-221](decisions.md), [Aggregation](aggregation.md#performance)). It answers
-`{"explain": {"executed": false, "source": ..., "stages": [...]}}` with no
+`{"explain": {"executed": false, "source": ..., "stages": [...], "memory": {...}}}` with no
 `documents` and no `count`, and without `documentsExamined`, `documentsMatched` or
 `indexEntriesRead`, which are what a scan found. It is the one `explain` that does
 not execute the read it describes. `source` carries the same `strategy`, `index`,
 `indexFieldsUsed` and `probes` as a `find` over the leading `$match`. A
 non-boolean `explain`, `null` included, is `422`, and so is any other field the
 route does not define; `?explain=true` is `400`, as on any route with no query
-string. It needs the access a run needs, `$lookup` collections included.
+string. It needs the access a run needs, `$lookup` collections included. `memory` is one
+line of the request's memory limit and the node's pool: `limitBytes`
+(`aggregate.memory_limit_bytes`), `poolBytes` (`aggregate.memory_pool_bytes`) and
+`poolUsedBytes`, what running aggregations have reserved now
+([ADR-269](decisions.md#adr-269--one-memory-budget-for-an-aggregation-and-a-pool-for-the-node)).
 
 **An `aggregate` whose last stage is `$merge` or `$out` writes**
 ([ADR-255](decisions.md), [Aggregation](aggregation.md#merge)). It answers
@@ -1496,7 +1500,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 410 | `resume_token_expired` | no | Resume point collected from the oplog. Resubscribe — retrying the token loops forever |
 | 429 | `rate_limited` | wait | Too many failed logins from this caller, or an authenticated principal over its request budget (`server.rate_limit.per_principal`). Carries `Retry-After` in seconds |
 | 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
-| 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)). **An index create or drop is never answered this way once it has committed**, even when building the index took the whole deadline: members that have not confirmed it by then are reported as pending instead ([ADR-140](decisions.md), and ADR-099's addendum). Also answered, with `Retry-After: 1`, to an aggregation the node's pool of aggregation memory (`aggregate.memory_pool_bytes`) cannot cover while other requests hold it ([ADR-269](decisions.md#adr-269--one-memory-budget-for-an-aggregation-and-a-pool-for-the-node)): the request is within its own limit and nothing was done |
+| 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)). **An index create or drop is never answered this way once it has committed**, even when building the index took the whole deadline: members that have not confirmed it by then are reported as pending instead ([ADR-140](decisions.md), and ADR-099's addendum). Also answered, with `Retry-After: 1`, when the node's aggregation memory pool is in use (`aggregate.memory_pool_bytes`) and cannot cover an aggregation ([ADR-269](decisions.md#adr-269--one-memory-budget-for-an-aggregation-and-a-pool-for-the-node)): the request is within its own limit and nothing was done |
 | 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
 | 500 | `partially_applied` | verify | A request that commits in more than one transaction — a `multi: true` update or delete, a database drop — failed after its first commit. **What landed stands and replicates**, and `applied` says how much; `cause` says why the rest did not. Read back, or resend a request built to skip what is done: see [a request that was partly applied](#a-request-that-was-partly-applied). Never resend it blindly |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |

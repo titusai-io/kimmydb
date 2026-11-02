@@ -41,7 +41,7 @@ the envelope precisely so that a client does not need a table
 `answer_too_large` (`413`, retry `no`) refuses a query that would build more than a cap
 allows (a `$facet` answer over 16 MiB, a string, array or document over 16 MiB, or more than
 `aggregate.memory_limit_bytes` held by one aggregation); narrow the query. An aggregation the
-node's memory pool cannot cover is `timeout` (`503`, retry `wait`, with `Retry-After`).
+node's aggregation memory pool is in use for is `timeout` (`503`, retry `wait`, with `Retry-After: 1`).
 `document_too_large` and `id_too_large` (`413`, retry `no`) refuse a write whose
 document encodes to more than 16 MiB or whose `_id` is over 4096 bytes; resending
 it fails the same way ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)).

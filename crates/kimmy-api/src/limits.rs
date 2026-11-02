@@ -337,6 +337,51 @@ async fn drain(mut body: Body, bound: usize) {
     }
 }
 
+/// A response body that holds `hold` until the body has been sent or is dropped.
+///
+/// An aggregation's answer is built, serialised and then written to the client, and the
+/// client may be slow: the bytes of the answer are alive until the last of them is sent.
+/// The memory lease of the answer (ADR-269) rides in this wrapper, so a big answer still
+/// being sent counts against the node's pool, and is given back when the body ends, when
+/// the response is dropped unsent, and when the client disconnects (hyper drops the body).
+pub(crate) struct HeldBody<H> {
+    inner: Body,
+    hold: Option<H>,
+}
+
+impl<H> HeldBody<H> {
+    /// `bytes` as a response body that keeps `hold` until it is done with.
+    pub(crate) fn new(bytes: Bytes, hold: H) -> Self {
+        Self { inner: Body::from(bytes), hold: Some(hold) }
+    }
+}
+
+impl<H: Unpin> HttpBody for HeldBody<H> {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        // Everything has been handed over (or the body failed): nothing is held any more.
+        if matches!(polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            this.hold = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// A request body that comes back to the layer that wrapped it when whoever
 /// was reading it lets go.
 ///
@@ -593,6 +638,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    /// The answer's bytes stay in the pool until the body has been sent (ADR-269).
+    #[tokio::test]
+    async fn a_response_body_keeps_its_hold_until_it_is_sent_or_dropped() {
+        let pool = kimmy_query::budget::MemoryPool::new(1_000);
+        let held = |bytes: usize| {
+            let budget = kimmy_query::budget::BufferBudget::pooled(1_000, &pool);
+            let mut lease = budget.lease("the answer");
+            lease.charge(bytes).unwrap();
+            lease
+        };
+
+        // Unread: still charged. Read to the end: given back.
+        let body = Body::new(HeldBody::new(Bytes::from_static(b"{\"documents\":[]}"), held(600)));
+        assert_eq!(pool.used(), 600);
+        assert_eq!(body.size_hint().exact(), Some(16));
+        let sent = body.collect().await.unwrap().to_bytes();
+        assert_eq!(&sent[..], b"{\"documents\":[]}");
+        assert_eq!(pool.used(), 0, "a body that was sent gives its bytes back");
+
+        // Partly read, then abandoned (the client went away): given back on drop.
+        let mut body = Body::new(HeldBody::new(Bytes::from_static(b"abc"), held(700)));
+        assert_eq!(pool.used(), 700);
+        let first = body.frame().await;
+        assert!(first.is_some());
+        drop(body);
+        assert_eq!(pool.used(), 0, "a body dropped before the end gives its bytes back");
+
+        // Never polled at all: a second request is refused meanwhile, and answered after.
+        let unsent = Body::new(HeldBody::new(Bytes::from_static(b"abc"), held(600)));
+        let other = kimmy_query::budget::BufferBudget::pooled(1_000, &pool);
+        assert!(other.lease("another answer").charge(600).is_err());
+        drop(unsent);
+        other.lease("another answer").charge(600).unwrap();
     }
 
     #[test]

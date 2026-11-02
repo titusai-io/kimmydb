@@ -2293,7 +2293,26 @@ async fn aggregate_run(
     pipeline: &Value,
     limits: aggregate::Limits,
 ) -> Result<Value, ApiError> {
-    Ok(aggregate_run_stats(state, auth, db, coll, pipeline, limits).await?.0)
+    Ok(aggregate_run_held(state, auth, db, coll, pipeline, limits).await?.0)
+}
+
+/// [`aggregate`], also handing back the lease that holds the answer's bytes in the request's
+/// memory budget and the node's pool (ADR-269). The route keeps it until the response body has
+/// been sent, so an answer still being written counts against the pool; dropping it gives the
+/// bytes back. Under [`aggregate`] it is dropped on return.
+pub async fn aggregate_held(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    pipeline: &Value,
+) -> Result<(Value, kimmy_query::budget::Lease), ApiError> {
+    use tracing::Instrument;
+    let (answer, _, hold) =
+        aggregate_run_held(state, auth, db, coll, pipeline, state.aggregate_limits())
+            .instrument(op_span("aggregate", db, Some(coll)))
+            .await?;
+    Ok((answer, hold.unwrap_or_else(|| state.aggregate_limits().buffer.lease("the answer"))))
 }
 
 /// [`aggregate_run`], also answering how the source read was done, which `explain`
@@ -2307,6 +2326,20 @@ pub(crate) async fn aggregate_run_stats(
     pipeline: &Value,
     limits: aggregate::Limits,
 ) -> Result<(Value, Option<QueryStats>), ApiError> {
+    let (answer, stats, _) = aggregate_run_held(state, auth, db, coll, pipeline, limits).await?;
+    Ok((answer, stats))
+}
+
+/// [`aggregate_run_stats`], also answering the lease that holds the answer, for a pipeline that
+/// answers documents (a sink answers counts and holds nothing).
+async fn aggregate_run_held(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    pipeline: &Value,
+    limits: aggregate::Limits,
+) -> Result<(Value, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
     let all_stages = parse_pipeline(pipeline)?;
@@ -2380,7 +2413,7 @@ pub(crate) async fn aggregate_run_stats(
             lease.charge_docs(&docs)?;
             lease
         };
-        return Ok((write_sink(state, sink, last, docs)?, source_stats));
+        return Ok((write_sink(state, sink, last, docs)?, source_stats, None));
     }
 
     // The answer (ADR-269). The output documents are held while it is built beside them,
@@ -2390,14 +2423,21 @@ pub(crate) async fn aggregate_run_stats(
     // before the body is written from it, so the two never coexist with a third copy.
     let mut answer = limits.buffer.lease("the answer");
     answer.charge_docs(&docs)?;
+    let mut json_total = 0usize;
     let mut documents: Vec<Value> = Vec::with_capacity(docs.len());
     for doc in &docs {
         let value = document_to_json(doc);
-        answer.charge(json_len(&value))?;
+        let len = json_len(&value);
+        answer.charge(len)?;
+        json_total += len;
         documents.push(value);
     }
     drop(docs);
-    Ok((json!({ "documents": documents, "count": documents.len() }), source_stats))
+    // The documents are gone; what is left of the answer is its JSON, which is what a body
+    // written from it takes.
+    let doc_bytes = answer.bytes() - json_total;
+    answer.release(doc_bytes);
+    Ok((json!({ "documents": documents, "count": documents.len() }), source_stats, Some(answer)))
 }
 
 /// The bytes `value` takes as JSON, counted as it is written and never held.

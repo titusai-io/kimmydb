@@ -20436,3 +20436,71 @@ async fn concurrent_aggregations_are_answered_or_told_to_retry_and_return_the_po
     assert!(statuses.contains(&200), "{statuses:?}");
     assert_eq!(pool.used(), 0);
 }
+
+#[tokio::test]
+async fn an_aggregate_answer_keeps_the_pool_charged_until_its_body_is_sent_or_dropped() {
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(8 << 20, 16 << 20));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 30).await;
+    let pool = server.state.aggregate_memory().pool().clone();
+    let call = |pipeline: Value| {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/db/kx/coll/zmem/aggregate")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(pipeline.to_string()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+        kimmy_api::router(Arc::clone(&server.state)).oneshot(request)
+    };
+    // 30 documents of about 1 KiB each, answered whole.
+    let big = json!({ "pipeline": [{ "$addFields": { "pad": "p".repeat(1024) } }] });
+
+    // The response is in hand and its body unread: the answer is still charged.
+    let response = call(big.clone()).await.unwrap();
+    assert_eq!(response.status(), 200);
+    // The JSON of the answer (about 31 KB), not the documents beside it as well.
+    assert!(
+        (30 * 1024..40_000).contains(&pool.used()),
+        "the unsent answer holds {} bytes",
+        pool.used()
+    );
+    // Read to the end: given back.
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let answer: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(answer["count"], 30);
+    assert_eq!(pool.used(), 0, "a sent answer gives its bytes back");
+
+    // Abandoned unread (the client went away): given back as well.
+    let response = call(big).await.unwrap();
+    assert!(pool.used() > 0);
+    drop(response);
+    assert_eq!(pool.used(), 0, "an abandoned answer gives its bytes back");
+}
+
+#[tokio::test]
+async fn an_aggregate_explain_reports_the_limit_and_the_pool() {
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(4 << 20, 6 << 20));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 2).await;
+    let res = server
+        .post(
+            "/v1/db/kx/coll/zmem/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$match": {} }], "explain": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["explain"]["memory"],
+        json!({ "limitBytes": 4 << 20, "poolBytes": 6 << 20, "poolUsedBytes": 0 })
+    );
+}

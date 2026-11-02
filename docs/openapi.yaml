@@ -1736,10 +1736,11 @@ paths:
         "500": { $ref: "#/components/responses/PartiallyApplied" }
         "503":
           description: |
-            `timeout`, `retry: wait`: the node's pool of aggregation memory
-            (`aggregate.memory_pool_bytes`, 2 GiB by default) is held by other
-            requests (ADR-269). The request is within its own limit and nothing was
-            done; the same request is answered when the others have finished.
+            `timeout`, `retry: wait`, `Retry-After: 1`: the node's aggregation memory
+            pool is in use (`aggregate.memory_pool_bytes`, 2 GiB by default; ADR-269).
+            The request is within its own limit and nothing was done; the same request
+            is answered when the others have finished. An answer still being sent holds
+            its bytes in the pool until the last of them is written.
           headers:
             Retry-After:
               schema: { type: integer }
@@ -3495,7 +3496,7 @@ components:
         | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
         | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
         | `collection_purging` | 503 | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` |
-        | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster. Also answered, with `Retry-After: 1`, to an aggregation the node's pool of aggregation memory (`aggregate.memory_pool_bytes`, 2 GiB by default) cannot cover while other requests hold it (ADR-269): the request is within its own limit, nothing was done, and the same request is answered when the others have finished |
+        | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster. Also answered, with `Retry-After: 1`, when the node's aggregation memory pool is in use (`aggregate.memory_pool_bytes`, 2 GiB by default) and cannot cover an aggregation (ADR-269): the request is within its own limit, nothing was done, and the same request is answered when the others have finished |
         | `outcome_unknown` | 500 | verify | A write reached the storage engine's durability step and then failed: it **may or may not have been applied**, and if it was, it replicates. Read the target back before sending it again, unless the write is idempotent. Details are logged, never returned |
         | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |
@@ -3863,6 +3864,18 @@ components:
               description: |
                 An unrecognized value is an access path this client does not know
                 about; new names are additive.
+        memory:
+          type: object
+          description: |
+            What a run may hold in memory and how much of the node's pool is in use now
+            (ADR-269): `limitBytes` (`aggregate.memory_limit_bytes`), `poolBytes`
+            (`aggregate.memory_pool_bytes`) and `poolUsedBytes`, the bytes running
+            aggregations have reserved. A plan reserves nothing.
+          required: [limitBytes, poolBytes, poolUsedBytes]
+          properties:
+            limitBytes: { type: integer }
+            poolBytes: { type: integer }
+            poolUsedBytes: { type: integer }
         stages:
           type: array
           description: |

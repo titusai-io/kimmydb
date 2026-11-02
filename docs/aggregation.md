@@ -2069,8 +2069,12 @@ examined or read.
     "source": { "strategy": "index", "index": "city_1", "indexFieldsUsed": 1,
                 "stages": 1, "maxDocuments": 100000 },
     "stages": [ { "stage": "$group", "runs": "inMemory",
-                  "detail": "groups everything that reaches it in memory; blocking, ..." } ] } }
+                  "detail": "groups everything that reaches it in memory; blocking, ..." } ],
+    "memory": { "limitBytes": 1073741824, "poolBytes": 2147483648, "poolUsedBytes": 0 } } }
 ```
+
+`memory` is what a run may hold (`aggregate.memory_limit_bytes`) and how much of the node's pool
+(`aggregate.memory_pool_bytes`) running aggregations have reserved now; a plan reserves nothing.
 
 - **`source`** is the plan `find` would make for the leading `$match` (the same
   planner: `strategy`, `index`, `indexFieldsUsed`, `probes`), with `stages` saying
@@ -2154,7 +2158,7 @@ as it grows, and the request is refused `413 answer_too_large` at the first byte
 | **`$lookup`, `$graphLookup`, `$unionWith`** | the foreign documents read (the read stops at the one that passes the limit), a copy of them for each run of a `$lookup` sub-pipeline (charged before it is made), the arrays attached and the documents appended | the stage returns |
 | **`$facet`** | its input, and a copy of it for each branch but the last (charged before the copy is made); the stages inside a branch charge as any stage does, and each run of a sub-pipeline gives its bytes back when it ends | the stage returns |
 | **`$setWindowFields`, `$densify`, `$fill`** | the documents they buffer, the sort keys they take and the values they add | the stage returns |
-| **The answer** | the output documents and the JSON each becomes (its serialised length), document by document, so an answer that would pass the limit is refused before the rest is built | the request ends |
+| **The answer** | the output documents and the JSON each becomes (its serialised length), document by document, so an answer that would pass the limit is refused before the rest is built; once built, the documents' bytes are given back and the JSON's are kept | the response body has been written or dropped (the client went away) |
 
 A stage's input stays charged until it returns, so `$addFields` over 400 MB of documents peaks at
 about 800 MB, and 100,000 documents of 4 KB run at the default. The `413` carries the total held
@@ -2165,7 +2169,7 @@ expression builds, are unchanged: they are per value.
 **The node's pool.** Requests also draw on a pool shared by every aggregation on the node,
 `aggregate.memory_pool_bytes` (2 GiB by default): a request reserves from it as its own total
 grows and returns it when it ends, however it ends (an answer, a refusal, the request deadline,
-a panic). A request the pool cannot cover is refused `503 timeout` with `retry: wait` and
+a panic). A request the pool cannot cover (the node's aggregation memory pool is in use) is refused `503 timeout` with `retry: wait` and
 `Retry-After: 1`: it is within its own limit, nothing was done, and the same request is answered when
 the others have finished. Both refusals are counted on `/metrics`
 (`kimmy_aggregate_memory_limit_refusals_total`, `kimmy_aggregate_memory_pool_refusals_total`), and
