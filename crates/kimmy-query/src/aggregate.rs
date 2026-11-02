@@ -307,16 +307,18 @@ pub enum Join {
     /// for the sub-pipeline to read as `$$name`. A nested loop by construction;
     /// see `docs/aggregation.md` for when to prefer the other form.
     ///
-    /// `lead` is set when the leading `$match` reads a `let` variable, and says how
-    /// to split it (see [`Lead`]); `None` for a sub-pipeline whose leading `$match`,
-    /// if any, reads none (it is applied once, before the loop).
+    /// `lead` is set when the leading `$match` reads a `let` variable or draws a random
+    /// number (`$sampleRate`, `$rand`), and says how to split it (see [`Lead`]); `None` for
+    /// a sub-pipeline whose leading `$match`, if any, reads none and draws none (it is
+    /// applied once, before the loop).
     Pipeline { vars: Vec<(String, Expr)>, stages: Vec<Stage>, lead: Option<Box<Lead>> },
 }
 
-/// A sub-pipeline's leading `$match` that reads `let` variables, taken apart at
-/// parse time. The conjunction is flattened through `$and` only (never `$or`,
+/// A sub-pipeline's leading `$match` that reads `let` variables or draws a random number,
+/// taken apart at parse time. The conjunction is flattened through `$and` only (never `$or`,
 /// `$nor` or an `$expr`'s own `$and`) into its leaf clauses **in evaluation
-/// order**, and each leaf is independent (reads no variable) or variable-reading.
+/// order**, and each leaf is independent (reads no variable and draws no random number) or
+/// variable-reading (reads one, or draws).
 ///
 /// Both halves are `And` of their leaves in that order, so evaluating `variable`
 /// over a pair that `independent` accepts decides it exactly as the whole

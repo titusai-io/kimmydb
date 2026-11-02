@@ -80,7 +80,24 @@ fn condition_draws_random(condition: &Condition) -> bool {
         Condition::ElemMatch(inner) => inner.draws_random(),
         Condition::Not(inner) => condition_draws_random(inner),
         Condition::Both(a, b) => condition_draws_random(a) || condition_draws_random(b),
-        _ => false,
+        // Written out, so that a condition that holds a filter or an expression must say here
+        // whether it draws.
+        Condition::AlwaysTrue
+        | Condition::Eq(_)
+        | Condition::Ne(_)
+        | Condition::Gt(_)
+        | Condition::Gte(_)
+        | Condition::Lt(_)
+        | Condition::Lte(_)
+        | Condition::In(_)
+        | Condition::Nin(_)
+        | Condition::Exists(_)
+        | Condition::Type(_)
+        | Condition::Regex(_)
+        | Condition::All(_)
+        | Condition::Size(_)
+        | Condition::Mod { .. }
+        | Condition::Bits { .. } => false,
     }
 }
 
