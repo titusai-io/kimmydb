@@ -285,35 +285,57 @@ pub(super) fn log(number: &Bson, base: &Bson) -> Result<Bson> {
             bson_type_name(Some(base))
         ))
     })?;
-    // `x <= 0` as a refusal, whatever the type; a NaN is neither.
-    let shown = value.double();
-    if shown <= 0.0 {
-        return Err(Error::InvalidQuery(format!(
+    // `x <= 0` and a base that is not positive or is 1 are refused; a NaN is neither. With a
+    // decimal among the operands the decision is made on the decimals the logarithm is taken
+    // of (`1E-400` is positive and `1.000000000000000000000000000000001` is not 1, whatever
+    // doubles they convert to); the double is kept for the words of the refusal.
+    let refuse_number = |shown: f64| {
+        Error::InvalidQuery(format!(
             "$log's argument must be a positive number, but is {}",
             print_g(shown)
-        )));
-    }
-    let shown = base.double();
-    if shown <= 0.0 || shown == 1.0 {
-        return Err(Error::InvalidQuery(format!(
+        ))
+    };
+    let refuse_base = |shown: f64| {
+        Error::InvalidQuery(format!(
             "$log's base must be a positive number not equal to 1, but is {}",
             print_g(shown)
-        )));
-    }
-    match (&value, &base) {
-        (Number::Plain(x), Number::Plain(b)) => Ok(Bson::Double(x.as_f64().ln() / b.as_f64().ln())),
-        _ => {
-            let (x, b) = (value.widen(), base.widen());
-            if matches!(x, Raw::Nan)
-                || matches!(b, Raw::Nan)
-                || value.double().is_nan()
-                || shown.is_nan()
-            {
-                return Ok(Bson::Double(f64::NAN));
-            }
-            Ok(Bson::Decimal128(pack_raw(decimal_log(&x, &b))))
+        ))
+    };
+    let (Number::Plain(plain_x), Number::Plain(plain_b)) = (&value, &base) else {
+        let (x, b) = (value.widen(), base.widen());
+        if non_positive(&x) {
+            return Err(refuse_number(value.double()));
         }
+        if non_positive(&b) || is_one(&b) {
+            return Err(refuse_base(base.double()));
+        }
+        if matches!(x, Raw::Nan) || matches!(b, Raw::Nan) {
+            return Ok(Bson::Double(f64::NAN));
+        }
+        return Ok(Bson::Decimal128(pack_raw(decimal_log(&x, &b))));
+    };
+    let (x, b) = (plain_x.as_f64(), plain_b.as_f64());
+    if x <= 0.0 {
+        return Err(refuse_number(x));
     }
+    if b <= 0.0 || b == 1.0 {
+        return Err(refuse_base(b));
+    }
+    Ok(Bson::Double(x.ln() / b.ln()))
+}
+
+/// Whether a decimal is zero or below it (a NaN is neither).
+fn non_positive(x: &Raw) -> bool {
+    match x {
+        Raw::Nan => false,
+        Raw::Inf { negative } => *negative,
+        Raw::Finite { negative, coefficient, .. } => *negative || *coefficient == 0,
+    }
+}
+
+/// Whether a decimal is one, in any cohort (`1.00` is).
+fn is_one(x: &Raw) -> bool {
+    matches!(x, Raw::Finite { .. }) && arith::sub(x, &arith::from_i64(1)).is_zero()
 }
 
 /// The decimal logarithm: `ln(x) / ln(base)`, rounded once, with the base 2 and the base 10 as

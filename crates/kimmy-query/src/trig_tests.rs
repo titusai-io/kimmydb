@@ -369,6 +369,34 @@ fn a_decimal_log_is_the_logarithm_where_the_reference_divides_by_the_base() {
     assert_eq!(double(&val(op("$log", vec![Bson::Int32(8), Bson::Int32(2)]))), 3.0);
 }
 
+/// The domain of a decimal `$log` is decided on the decimals, not on the doubles they convert
+/// to (review q8d, m2): under `ln(x) / ln(base)` all of these are defined.
+#[test]
+fn the_domain_of_a_decimal_log_is_decided_on_the_decimals() {
+    // `1E-400` is the double 0, and a decimal logarithm of it is -400.
+    assert!(same_value(&val(op("$log", vec![dec("1E-400"), Bson::Int32(10)])), "D-400"));
+    assert!(same_value(&val(op("$log", vec![dec("1E-400"), dec("10")])), "D-400"));
+    // A base that converts to the double 1 and is not 1: finite answers, to 34 digits (the
+    // logarithms of 2 and of the base are taken in one fixed point and divided).
+    assert!(same_value(
+        &val(op("$log", vec![Bson::Int32(2), dec("1.000000000000000000000000000000001")])),
+        "D693147180559945309417232121458176.9"
+    ));
+    assert!(same_value(
+        &val(op("$log", vec![dec("2"), dec("0.9999999999999999999999999999999999")])),
+        "D-6931471805599453094172321214581765"
+    ));
+    // The refusals are still the reference's: a decimal 1 in any cohort, zero, a negative.
+    for base in ["1", "1.00", "1.000000000000000000000000000000000"] {
+        assert_eq!(
+            err(op("$log", vec![dec("2"), dec(base)])),
+            "$log's base must be a positive number not equal to 1, but is 1"
+        );
+    }
+    assert!(err(op("$log", vec![dec("-1E-400"), Bson::Int32(10)])).contains("positive number"));
+    assert!(err(op("$log", vec![dec("0E-6000"), Bson::Int32(10)])).contains("positive number"));
+}
+
 #[test]
 fn degrees_and_radians_of_a_decimal_multiply_by_the_constant_to_34_digits() {
     assert_eq!(
