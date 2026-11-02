@@ -18,7 +18,7 @@
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
-use crate::aggregate::Limits;
+use crate::aggregate::{Limits, check_built_document};
 use crate::expr::{Binding, Expr, Scope, type_name};
 use crate::window::{
     Func, Output, Partition, WindowSpec, apply_in, buffer_name, check_output_name, element_bytes,
@@ -186,7 +186,7 @@ pub fn apply(
     // whichever way the stage runs.
     let mut lease = limits.buffer.lease(buffer_name("$fill"));
     let mut docs = match &spec.window {
-        Some(window) => apply_in(window, input, vars, &mut lease)?,
+        Some(window) => apply_in(window, input, limits.max_document_bytes, vars, &mut lease)?,
         None => {
             lease.charge_docs(&input)?;
             input
@@ -213,6 +213,7 @@ pub fn apply(
                 None => {}
             }
         }
+        let wrote = fills.iter().any(|(_, value)| value.is_some());
         for (name, value) in fills {
             match value {
                 Some(value) => {
@@ -227,6 +228,10 @@ pub fn apply(
                     path::unset(doc, name);
                 }
             }
+        }
+        // Each value is held to 16 MiB on its own; the document they make together is not.
+        if wrote {
+            check_built_document(doc, limits.max_document_bytes)?;
         }
     }
     Ok(docs)

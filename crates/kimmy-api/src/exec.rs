@@ -2916,6 +2916,9 @@ fn lookup(
         // Always an array, even when empty: a field whose type depends on
         // whether anything matched forces every caller to handle two shapes.
         doc.insert(as_field.to_string(), joined.finish());
+        // The array is held to 16 MiB as a value; the document it makes with the input's
+        // fields is held to the limit of a document as a whole.
+        aggregate::check_built_document(&doc, limits.max_document_bytes)?;
         out.push(doc);
     }
     Ok(out)
@@ -3049,6 +3052,7 @@ fn lookup_pipeline(
         array.push_all(joined)?;
         held.charge(array.bytes())?;
         doc.insert(as_field.to_string(), array.finish());
+        aggregate::check_built_document(&doc, limits.max_document_bytes)?;
         out.push(doc);
     }
     Ok(out)
@@ -3275,6 +3279,7 @@ fn graph_lookup(
         // 16 MiB as a value while it is built.
         held_bytes.charge(joined.bytes())?;
         doc.insert(spec.as_field.clone(), joined.finish());
+        aggregate::check_built_document(&doc, limits.max_document_bytes)?;
         out.push(doc);
     }
     Ok(out)

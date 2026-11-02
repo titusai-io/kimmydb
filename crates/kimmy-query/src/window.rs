@@ -704,6 +704,8 @@ impl Sink<'_> {
 
 struct Run<'a, 'v> {
     vars: &'a [Binding<'v>],
+    /// The most bytes a document the stage completes may take.
+    max_document_bytes: usize,
 }
 
 /// The partition key of a document: its encoded bytes, and the value it stands for.
@@ -798,19 +800,23 @@ pub fn apply(
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
     let mut lease = limits.buffer.lease(buffer_name(spec.stage));
-    apply_in(spec, input, vars, &mut lease)
+    apply_in(spec, input, limits.max_document_bytes, vars, &mut lease)
 }
 
 /// [`apply`], charging to a lease the caller keeps: `$fill` goes on to write its `value`
 /// fields into the documents this returns, and they stay charged until it is done.
+///
+/// A document the stage adds fields to is held to `max_document_bytes` as a whole, as it is
+/// completed (`the document the stage builds`, as `$addFields` refuses it).
 pub(crate) fn apply_in(
     spec: &WindowSpec,
     input: Vec<Document>,
+    max_document_bytes: usize,
     vars: &[Binding<'_>],
     lease: &mut Lease,
 ) -> Result<Vec<Document>> {
     let partitions = partitions(&spec.partition, input, vars, lease)?;
-    let run = Run { vars };
+    let run = Run { vars, max_document_bytes };
     let mut out = Vec::new();
     for docs in partitions {
         out.extend(run_partition(spec, docs, &run, lease)?);
@@ -877,12 +883,18 @@ fn run_partition(
         results.push(compute(&output.func, &docs, &spec.sort, run, &mut sink)?);
     }
     for (i, doc) in docs.iter_mut().enumerate() {
+        let mut added = false;
         for (output, cells) in spec.outputs.iter().zip(&results) {
             if let Some(v) = cells.at(i) {
                 path::set(doc, &output.name, v.clone()).map_err(|e| {
                     Error::InvalidQuery(format!("cannot set {:?}: {e}", output.name))
                 })?;
+                added = true;
             }
+        }
+        // Each value is held to 16 MiB on its own; the document they make together is not.
+        if added {
+            crate::aggregate::check_built_document(doc, run.max_document_bytes)?;
         }
     }
     Ok(docs)

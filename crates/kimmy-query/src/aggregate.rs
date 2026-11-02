@@ -2613,6 +2613,19 @@ fn check_group_document(stage: &str, doc: &Document, max: usize) -> Result<()> {
     )
 }
 
+/// Refuse a document a stage built by adding fields to its input when it is over `max`
+/// bytes as a whole, with the refusal `$addFields` gives (`the document the stage builds`).
+/// `$fill`, `$setWindowFields`, `$lookup` and `$graphLookup` add values that are each held
+/// to 16 MiB on their own, and two of them in one document make one that no collection could
+/// hold and no answer could carry; the document is checked as it is completed.
+pub fn check_built_document(doc: &Document, max: usize) -> Result<()> {
+    crate::expr::check_document_bytes(
+        "the document the stage builds",
+        crate::expr::document_bytes(doc),
+        max,
+    )
+}
+
 pub(crate) fn group_keyed(
     stage: &str,
     input: Vec<Document>,

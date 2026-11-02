@@ -1617,6 +1617,12 @@ stops at the step that would pass the limit. The reference shares the copies and
 refuses a document only when it is written out; here the copies are real, so the
 limit is earlier (see [Deviations](deviations.md)).
 
+**A document a stage completes by adding fields is held to 16 MiB as a whole.** Each value a
+`$fill` (values and methods), a `$setWindowFields`, a `$lookup` or a `$graphLookup` adds is held to
+16 MiB on its own; two together can make a document no collection could hold. The document is checked
+as it is completed and refused `413` at the one that passes the limit, as `$addFields` refuses it:
+`the document the stage builds is N bytes, over the 16 MiB document limit`.
+
 ### Getting, setting and merging fields
 
 ```json

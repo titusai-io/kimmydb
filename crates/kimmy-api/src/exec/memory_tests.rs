@@ -355,12 +355,17 @@ fn the_body_the_route_sends_is_the_bytes_serde_json_gives_for_the_value() {
             block_on(aggregate_held(&state, &root(), "app", "orders", &pipeline)).unwrap();
         let Answer::Body(body) = answer else { panic!("{pipeline}: documents are a body") };
         assert_eq!(
-            String::from_utf8(body).unwrap(),
+            String::from_utf8(body.clone()).unwrap(),
             serde_json::to_string(&value).unwrap(),
             "{pipeline}"
         );
-        // The hold is the JSON of the documents alone, and it is the same as for the value.
-        assert!(hold.bytes() > 0 || pipeline == json!([{"$match": {"_id": 999}}]));
+        // The hold is the JSON of the documents alone, not the framing around them: the body
+        // less `{"documents":[`, a comma between documents and `],"count":N}`.
+        let count = value["count"].as_u64().unwrap() as usize;
+        let framing = r#"{"documents":["#.len()
+            + count.saturating_sub(1)
+            + format!(r#"],"count":{count}}}"#).len();
+        assert_eq!(hold.bytes(), body.len() - framing, "{pipeline}");
     }
 }
 
@@ -426,4 +431,35 @@ fn a_sink_answers_its_counts_as_a_value_and_documents_as_a_body() {
             .unwrap();
     let Answer::Json(counts) = answer else { panic!("a sink answers a value") };
     assert_eq!(counts["out"]["inserted"], 3);
+}
+
+#[test]
+fn a_joined_document_is_held_to_the_limit_of_a_document_as_a_whole() {
+    // Local documents of 2 KB, each joined to three foreign documents of 1.5 KB: the array
+    // is 4.6 KB and fits a 5,000-byte document limit on its own (the array bound is 16 MiB),
+    // the document it makes with the local fields is 6.6 KB and does not.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(2, 2_000), padded(3, 1_500));
+    let limits =
+        |max_document_bytes: usize| aggregate::Limits { max_document_bytes, ..Default::default() };
+    for pipeline in [
+        json!([{"$lookup": {"from": "users", "localField": "k", "foreignField": "k", "as": "u"}}]),
+        json!([{"$lookup": {"from": "users", "let": {"k": "$k"},
+        "pipeline": [{"$match": {"$expr": {"$eq": ["$k", "$$k"]}}}], "as": "u"}}]),
+        json!([{"$graphLookup": {"from": "users", "startWith": "$k", "connectFromField": "k",
+        "connectToField": "k", "maxDepth": 0, "as": "u"}}]),
+    ] {
+        let err = run(&state, pipeline.clone(), limits(5_000)).expect_err("a 6.6 KB document");
+        assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{pipeline}");
+        assert!(
+            err.message.contains("the document the stage builds"),
+            "{pipeline}: {}",
+            err.message
+        );
+        assert!(err.message.contains("limit"), "{}", err.message);
+        // Under a limit the document fits, the same stage answers.
+        let ok = run(&state, pipeline.clone(), limits(8_000)).unwrap();
+        assert_eq!(ok["count"], 2, "{pipeline}");
+        assert_eq!(state.aggregate_memory().pool().used(), 0);
+    }
 }

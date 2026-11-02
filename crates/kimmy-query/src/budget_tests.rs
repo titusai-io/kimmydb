@@ -925,6 +925,82 @@ fn a_bucket_and_a_bucket_auto_output_document_are_held_to_the_limit_as_a_whole()
     }
 }
 
+/// The stage adds fields that each fit and together make a document over the bound: the
+/// document the stage completes is refused as a whole, as `$addFields` refuses it, at the
+/// byte (`size` passes, `size - 1` is refused naming `the document the stage builds` and
+/// the total), while one of the fields alone passes under the same bound.
+fn assert_built_document_is_held_whole(
+    name: &str,
+    stage: Document,
+    one: Option<Document>,
+    input: &[Document],
+) {
+    let built = run(stage.clone(), input.to_vec(), &with_document_limit(usize::MAX)).unwrap();
+    let size = built.iter().map(doc_bytes).max().unwrap();
+    assert!(run(stage.clone(), input.to_vec(), &with_document_limit(size)).is_ok(), "{name}");
+    let err = run(stage, input.to_vec(), &with_document_limit(size - 1)).unwrap_err();
+    let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{name}: {err:?}") };
+    assert_eq!(
+        (*what, *bytes, *max),
+        ("the document the stage builds", size, size - 1),
+        "{name}: {err:?}"
+    );
+    // Each value fits alone: the same bound lets the stage with one of them through.
+    if let Some(one) = one {
+        assert!(run(one, input.to_vec(), &with_document_limit(size - 1)).is_ok(), "{name}: one");
+    }
+}
+
+#[test]
+fn fill_and_set_window_fields_hold_a_completed_document_to_the_limit_whole() {
+    let input = padded(3, 1_000);
+    // (`$addFields` is the reference for the refusal: the same helper and words, held to the
+    // 16 MiB constant, which `aggregate.rs`'s own tests drive through `set_computed_within`.)
+    // `$fill` with values.
+    assert_built_document_is_held_whole(
+        "$fill value",
+        doc! {"$fill": {"output": {"a": {"value": "$pad"}, "b": {"value": "$pad"}}}},
+        Some(doc! {"$fill": {"output": {"a": {"value": "$pad"}}}}),
+        &input,
+    );
+    // `$fill` with methods: the third document is given what the first two carried.
+    let carried = vec![
+        doc! {"_id": 0, "a": "a".repeat(1_200)},
+        doc! {"_id": 1, "b": "b".repeat(1_200)},
+        doc! {"_id": 2},
+    ];
+    assert_built_document_is_held_whole(
+        "$fill locf",
+        doc! {"$fill": {"sortBy": {"_id": 1},
+        "output": {"a": {"method": "locf"}, "b": {"method": "locf"}}}},
+        // (No one-field variant: the second document is given the first's value and holds
+        // its own, as large as the third with both.)
+        None,
+        &carried,
+    );
+    // `$fill` with both kinds in one stage: the values come after the methods.
+    assert_built_document_is_held_whole(
+        "$fill locf and value",
+        doc! {"$fill": {"sortBy": {"_id": 1},
+        "output": {"a": {"method": "locf"}, "c": {"value": "$pad"}}}},
+        Some(doc! {"$fill": {"sortBy": {"_id": 1}, "output": {"a": {"method": "locf"}}}}),
+        &[
+            doc! {"_id": 0, "a": "a".repeat(1_200), "pad": "p".repeat(1_000)},
+            doc! {"_id": 1, "pad": "p".repeat(1_000)},
+        ],
+    );
+    // `$setWindowFields`.
+    assert_built_document_is_held_whole(
+        "$setWindowFields",
+        doc! {"$setWindowFields": {"sortBy": {"_id": 1},
+        "output": {"a": {"$first": "$pad"}, "b": {"$first": "$pad"}}}},
+        Some(
+            doc! {"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"a": {"$first": "$pad"}}}},
+        ),
+        &input,
+    );
+}
+
 #[test]
 fn the_value_bound_and_the_budget_each_refuse_alone_and_count_the_same_bytes_once() {
     let input = padded(40, 1_000);
