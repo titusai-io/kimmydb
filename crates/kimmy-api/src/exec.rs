@@ -15,7 +15,7 @@ use kimmy_core::DocId;
 use kimmy_query::budget::Lease;
 use kimmy_query::deadline;
 use kimmy_query::expr::Binding;
-use kimmy_query::{aggregate, filter, plan, shape, update};
+use kimmy_query::{aggregate, filter, pipeline, plan, shape, update};
 use kimmy_storage::CollectionMeta;
 use serde_json::{Value, json};
 
@@ -2635,8 +2635,9 @@ fn json_len(value: &Value) -> usize {
     count.0
 }
 
-/// Run stages in order: the two `$lookup` forms go to the functions here that
-/// hold a storage handle, everything else to the pure pipeline.
+/// Run stages in order, as a chain of sinks (ADR-270): the stages that read storage go
+/// to the functions here that hold a storage handle, everything else to the pure pipeline,
+/// each through [`run_stage`].
 ///
 /// `vars` is what an enclosing `$lookup` `let` bound — empty at the top level,
 /// and the reason this is a function rather than a loop in `aggregate`: a
@@ -2647,70 +2648,89 @@ fn run_stages(
     auth: &Auth,
     db: &str,
     stages: &[aggregate::Stage],
-    mut docs: Vec<bson::Document>,
+    docs: Vec<bson::Document>,
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
-    for stage in stages {
-        docs = match stage {
-            aggregate::Stage::Lookup {
+    let run =
+        |stage: &aggregate::Stage, docs| run_stage(state, auth, db, stage, docs, limits, vars);
+    let mut chain = pipeline::build(stages, &run);
+    // The input is already in memory, whole (the source, a `$facet` branch's copy, a
+    // `$lookup` or `$unionWith` sub-pipeline's documents), and goes in as it is: there is no
+    // scan to stop, so the answer of the push is not needed.
+    let _more = chain.push_all(docs)?;
+    chain.finish()
+}
+
+/// One stage on all of its input: the stages that hold a storage handle (the two `$lookup`
+/// forms, `$graphLookup`, `$unionWith`) and `$facet` go to the functions here, everything
+/// else to the pure pipeline.
+fn run_stage(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    stage: &aggregate::Stage,
+    docs: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    vars: &[Binding<'_>],
+) -> Result<Vec<bson::Document>, ApiError> {
+    Ok(match stage {
+        aggregate::Stage::Lookup {
+            from,
+            as_field,
+            join: aggregate::Join::Equality { local_field, foreign_field },
+        } => {
+            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            lookup(
+                state,
+                auth,
+                db,
                 from,
+                local_field,
+                foreign_field,
                 as_field,
-                join: aggregate::Join::Equality { local_field, foreign_field },
-            } => {
-                let mut held = aggregate::Held::enter(stage, &docs, limits)?;
-                lookup(
-                    state,
-                    auth,
-                    db,
-                    from,
-                    local_field,
-                    foreign_field,
-                    as_field,
-                    docs,
-                    limits,
-                    &mut held.output,
-                )?
-            }
-            aggregate::Stage::Lookup {
+                docs,
+                limits,
+                &mut held.output,
+            )?
+        }
+        aggregate::Stage::Lookup {
+            from,
+            as_field,
+            join: aggregate::Join::Pipeline { vars: let_vars, stages: sub, lead },
+        } => {
+            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            lookup_pipeline(
+                state,
+                auth,
+                db,
                 from,
+                let_vars,
+                sub,
+                lead.as_deref(),
                 as_field,
-                join: aggregate::Join::Pipeline { vars: let_vars, stages: sub, lead },
-            } => {
-                let mut held = aggregate::Held::enter(stage, &docs, limits)?;
-                lookup_pipeline(
-                    state,
-                    auth,
-                    db,
-                    from,
-                    let_vars,
-                    sub,
-                    lead.as_deref(),
-                    as_field,
-                    docs,
-                    limits,
-                    vars,
-                    &mut held.output,
-                )?
-            }
-            aggregate::Stage::GraphLookup(spec) => {
-                let mut held = aggregate::Held::enter(stage, &docs, limits)?;
-                graph_lookup(state, auth, db, spec, docs, limits, vars, &mut held.output)?
-            }
-            aggregate::Stage::UnionWith(spec) => {
-                let mut held = aggregate::Held::enter(stage, &docs, limits)?;
-                union_with(state, auth, db, spec, docs, limits, vars, &mut held.output)?
-            }
-            aggregate::Stage::Facet(facets) => {
-                let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
-                    run_stages(state, auth, db, sub, input, limits, vars)
-                })?;
-                vec![answer]
-            }
-            other => aggregate::apply_with_vars(other, docs, limits, vars)?,
-        };
-    }
-    Ok(docs)
+                docs,
+                limits,
+                vars,
+                &mut held.output,
+            )?
+        }
+        aggregate::Stage::GraphLookup(spec) => {
+            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            graph_lookup(state, auth, db, spec, docs, limits, vars, &mut held.output)?
+        }
+        aggregate::Stage::UnionWith(spec) => {
+            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            union_with(state, auth, db, spec, docs, limits, vars, &mut held.output)?
+        }
+        aggregate::Stage::Facet(facets) => {
+            let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
+                run_stages(state, auth, db, sub, input, limits, vars)
+            })?;
+            vec![answer]
+        }
+        other => aggregate::apply_with_vars(other, docs, limits, vars)?,
+    })
 }
 
 /// Where a trailing `$merge` or `$out` writes, once the request is known to be
