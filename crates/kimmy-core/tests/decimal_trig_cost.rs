@@ -4,19 +4,20 @@
 //! The reduction of `1E+6144` modulo `pi/2` divides numbers of some 12,000 digits by one of
 //! 6,300, and the series that follows runs at the standard width and not at the operand's
 //! (review q8d, M1: it ran at 6,270 places, recomputed `pi` on every call, and took seconds).
-//! `pi` is built once for each width it is wanted at, so the first call of a process pays for it
-//! and the rest do not; the two are bounded apart.
+//! What this file bounds is that a call is milliseconds. That `pi` is read once and never built
+//! is not a matter of time and is held exactly, by a count, in `func/trig_tests.rs`.
 //!
-//! Run it in release, as CI's `decimal` job runs the other cost files:
+//! The tests are `#[ignore]`d and run in release by CI's "Cost ceilings" step, as the other cost
+//! files are:
 //!
 //! ```text
-//! cargo test --release -p kimmy-core --test decimal_trig_cost -- --nocapture
+//! cargo test --release -p kimmy-core --test decimal_trig_cost -- --ignored --test-threads 1
 //! ```
 //!
-//! The ceilings are loose multiples of the figures measured in release (a few milliseconds a
-//! call, tens of milliseconds for the first), and bind only in an optimised build; a debug
-//! build runs the same calls for the panics and asserts nothing about time, so the ordinary
-//! test run is not slowed.
+//! The ceiling is an absolute 250 ms for a call, some two hundred times the 0.5 to 1.4 ms
+//! measured in release: a shared runner does not reach it, and the seconds the work once took
+//! do. It is deliberately not tight, because a tight one flakes on a runner and a flaky required
+//! job costs more than it protects.
 
 use std::time::{Duration, Instant};
 
@@ -50,19 +51,21 @@ fn timed<T>(each: impl FnOnce() -> T) -> (T, Duration) {
     (value, start.elapsed())
 }
 
-fn check(name: &str, took: Duration, ceiling: Duration) {
-    eprintln!("{name}: {took:?} (ceiling {ceiling:?})");
-    if !cfg!(debug_assertions) {
-        assert!(took < ceiling, "{name}: {took:?}");
-    }
+/// A call must end inside this; see the file's doc for why it is loose.
+const CEILING: Duration = Duration::from_millis(250);
+
+fn check(name: &str, took: Duration) {
+    eprintln!("{name}: {took:?} (ceiling {CEILING:?})");
+    assert!(took < CEILING, "{name}: {took:?}");
 }
 
 #[test]
+#[ignore = "time; run in release by CI's Cost ceilings step"]
 fn a_huge_operand_costs_milliseconds_not_seconds() {
-    // The first call builds `pi` at the widest width; it is bounded apart from the rest.
+    // The first call of the process reads `pi`'s digits into limbs and is held to the same.
     let (first, took) = timed(|| func::sin(&fin(false, 1, 6144)).expect("a sine"));
     assert!(matches!(first, Raw::Finite { .. }));
-    check("sin 1E+6144, first call (builds pi)", took, Duration::from_millis(1500));
+    check("sin 1E+6144, first call", took);
 
     for (name, x) in operands() {
         for (op, run) in [
@@ -72,12 +75,13 @@ fn a_huge_operand_costs_milliseconds_not_seconds() {
         ] {
             let (answer, took) = timed(|| run(&x).expect("a finite answer"));
             assert!(matches!(answer, Raw::Finite { .. }), "{op} {name}");
-            check(&format!("{op} {name}"), took, Duration::from_millis(250));
+            check(&format!("{op} {name}"), took);
         }
     }
 }
 
 #[test]
+#[ignore = "time; run in release by CI's Cost ceilings step"]
 fn atan2_of_a_tiny_ratio_costs_milliseconds_not_seconds() {
     let smallest = fin(false, 1, -6176);
     let biggest = fin(false, 9, 6144);
@@ -92,11 +96,12 @@ fn atan2_of_a_tiny_ratio_costs_milliseconds_not_seconds() {
     ] {
         let (answer, took) = timed(|| func::atan2(&y, &x));
         assert!(matches!(answer, Raw::Finite { .. }), "{name}");
-        check(name, took, Duration::from_millis(250));
+        check(name, took);
     }
 }
 
 #[test]
+#[ignore = "run in release with the other two by CI's Cost ceilings step"]
 fn the_answers_for_a_tiny_ratio_are_the_ratio_and_the_complement() {
     let atan2 = |y: Raw, x: Raw| func::atan2(&y, &x);
     // y/x = 1E-6176 / 9E+6144 = 1.111...E-12321, below the smallest number: the nearest

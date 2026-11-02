@@ -663,6 +663,9 @@ jobs:
           cargo test -p kimmy-query --release --test decimal_cost -- \
             --ignored --test-threads 1 2>&1 | tee cost-query.log
           grep -q 'test result: ok. 2 passed' cost-query.log
+          cargo test -p kimmy-core --release --test decimal_trig_cost -- \
+            --ignored --test-threads 1 2>&1 | tee cost-trig.log
+          grep -q 'test result: ok. 3 passed' cost-trig.log
 
       # The golden corpus and the R1 properties, in release: the shipped
       # profile wraps on integer overflow, and the test profile panics, so the
