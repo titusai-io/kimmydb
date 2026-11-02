@@ -2911,16 +2911,32 @@ fn init_within((_, acc): &(String, Accumulator), max: usize) -> AccState {
     }
 }
 
-/// `$min` (or, with `max`, `$max`) taking one value: a null is skipped, a value replaces the
-/// current one only when it orders strictly before (after) it, so the first of two equal
-/// values stays. The `$group` accumulators and the expression forms of the operators share it.
-pub(crate) fn keep_extreme(current: &mut Option<Bson>, value: Bson, max: bool) {
+/// Which of two values that compare equal `$min` and `$max` keep (`1` and `1.0`, `0.0` and
+/// `-0.0`, `1.0` and `1.00`, a double `NaN` and a decimal one differ in type or cohort only).
+/// The reference's `$group` accumulators keep the **last**; its expression forms, over a list
+/// of operands, the **first** (probed in `q8d-agg.js`, line for line: `[1, 1.0]` is `1` as an
+/// expression and `1.0` in a group).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ties {
+    First,
+    Last,
+}
+
+/// `$min` (or, with `max`, `$max`) taking one value: a null is skipped, and a value replaces
+/// the current one when it orders before (after) it, or equal to it under [`Ties::Last`]. The
+/// `$group` accumulators and the expression forms of the operators share it.
+pub(crate) fn keep_extreme(current: &mut Option<Bson>, value: Bson, max: bool, ties: Ties) {
     if matches!(value, Bson::Null) {
         return;
     }
     let ahead = |c: &Bson| {
         let order = kimmy_core::cmp::canonical_cmp(&value, c);
-        if max { order.is_gt() } else { order.is_lt() }
+        match (max, ties) {
+            (true, Ties::First) => order.is_gt(),
+            (true, Ties::Last) => order.is_ge(),
+            (false, Ties::First) => order.is_lt(),
+            (false, Ties::Last) => order.is_le(),
+        }
     };
     if current.as_ref().is_none_or(ahead) {
         *current = Some(value);
@@ -2939,10 +2955,10 @@ pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<
         }
         (AccState::Avg(mean), Accumulator::Avg(e)) => mean.add(&e.eval_in(scope)?),
         (AccState::MinMax(current), Accumulator::Min(e)) => {
-            keep_extreme(current, e.eval_in(scope)?, false);
+            keep_extreme(current, e.eval_in(scope)?, false, Ties::Last);
         }
         (AccState::MinMax(current), Accumulator::Max(e)) => {
-            keep_extreme(current, e.eval_in(scope)?, true);
+            keep_extreme(current, e.eval_in(scope)?, true, Ties::Last);
         }
         (AccState::First(current), Accumulator::First(e)) => {
             if current.is_none() {
@@ -5665,8 +5681,10 @@ mod identity {
             extremes(vec![Bson::Double(0.1), dec("0.1"), dec("1E+400"), Bson::Double(f64::MAX)]),
             (dec("1E+400"), dec("0.1"))
         );
-        // Equal values keep the first seen, whatever its type.
-        assert_eq!(extremes(vec![dec("2.0"), Bson::Int32(2)]), (dec("2.0"), dec("2.0")));
+        // Equal values keep the last seen, whatever its type, as the reference's `$group` does
+        // (its expression forms keep the first: see `fold_tests`).
+        assert_eq!(extremes(vec![dec("2.0"), Bson::Int32(2)]), (Bson::Int32(2), Bson::Int32(2)));
+        assert_eq!(extremes(vec![Bson::Int32(2), dec("2.0")]), (dec("2.0"), dec("2.0")));
     }
 
     /// The error a pipeline gives, which must fail.
@@ -5788,7 +5806,8 @@ mod identity {
             decimals.clone(),
         );
         assert_eq!(out[0].get("lo"), Some(&Bson::Int32(1)));
-        assert_eq!(out[0].get("hi"), Some(&dec("2.5")));
+        // `2.5` and `2.50` are equal: the later one is kept.
+        assert_eq!(out[0].get("hi"), Some(&dec("2.50")));
         assert_eq!(out[0].get("first"), Some(&dec("2.5")));
         assert_eq!(out[0].get("last"), Some(&dec("2.50")));
         assert_eq!(

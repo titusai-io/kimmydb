@@ -23,7 +23,7 @@ use kimmy_core::{Error, Result};
 
 use super::{Declared, Expr, Mean, Scope, Total, type_name};
 use crate::accumulators::{self, Kind};
-use crate::aggregate::keep_extreme;
+use crate::aggregate::{Ties, keep_extreme};
 
 /// One of the array forms.
 #[derive(Clone, Debug, PartialEq)]
@@ -195,7 +195,7 @@ fn fold_of(fold: Fold, values: Vec<Bson>) -> Bson {
         Fold::Min | Fold::Max => {
             let mut current = None;
             for v in values {
-                keep_extreme(&mut current, v, fold == Fold::Max);
+                keep_extreme(&mut current, v, fold == Fold::Max, Ties::First);
             }
             current.unwrap_or(Bson::Null)
         }

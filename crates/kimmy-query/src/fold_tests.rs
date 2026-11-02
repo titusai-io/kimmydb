@@ -250,3 +250,54 @@ fn the_operators_read_the_documents_fields_and_variables() {
         Bson::Int32(7)
     );
 }
+
+/// The `$group` accumulators over the same values, as the reference answers them
+/// (`tests/data/q8d_group.tsv`: the label, the values, the recorded `$min` and `$max`). The
+/// accumulator keeps the **last** of equal values where the expression keeps the first, and
+/// the table is where the two are told apart: `[1, 1.0]` is `1.0` here and `1` in
+/// `every_recorded_answer_is_the_references`.
+#[test]
+fn every_recorded_group_answer_is_the_references() {
+    use crate::aggregate::{self, Limits};
+    let table = include_str!("../tests/data/q8d_group.tsv");
+    let mut wrong = Vec::new();
+    let mut checked = 0;
+    let mut told_apart = 0;
+    for line in table.lines() {
+        let mut cols = line.split('\t');
+        let (label, operands, min, max) = (
+            cols.next().unwrap(),
+            cols.next().unwrap(),
+            cols.next().unwrap(),
+            cols.next().unwrap(),
+        );
+        let docs: Vec<Document> = operands
+            .split('|')
+            .enumerate()
+            .map(|(i, v)| doc! { "_id": i as i32, "v": value(v) })
+            .collect();
+        let stages = aggregate::parse(&[
+            doc! { "$group": { "_id": null, "lo": { "$min": "$v" }, "hi": { "$max": "$v" } } },
+        ])
+        .unwrap();
+        let out = aggregate::apply(&stages[0], docs, &Limits::default()).unwrap();
+        checked += 1;
+        for (name, got, want) in
+            [("$min", out[0].get("lo").unwrap(), min), ("$max", out[0].get("hi").unwrap(), max)]
+        {
+            if !same(got, &value(want)) {
+                wrong.push(format!("{name} {label}: want {want}, got {got:?}"));
+            }
+        }
+        // The expression over the same list keeps the first: it differs from the group on a tie.
+        let as_expression = |name: &str| run(name, operands);
+        told_apart += usize::from(
+            !same(&as_expression("$min"), &value(min))
+                || !same(&as_expression("$max"), &value(max)),
+        );
+    }
+    assert!(wrong.is_empty(), "{} of {checked}:\n{}", wrong.len(), wrong.join("\n"));
+    assert!(checked >= 70, "{checked}");
+    // The tie rows (`equal …`, `-0 vs 0`, `dec vs dec scale`, `long small in long`, NaNs).
+    assert!(told_apart >= 12, "{told_apart}");
+}

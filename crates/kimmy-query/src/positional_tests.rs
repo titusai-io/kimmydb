@@ -866,7 +866,10 @@ fn an_elem_match_with_an_expr_that_hits_an_expired_deadline_answers_the_deadline
         doc! { "_id": 5, "items": [ { "n": 2, "k": 1 } ] }
     );
     // With the deadline passed the stop goes up from every path that reads the position.
+    // Every tick reads the clock: the position is read from a document that was matched, so the
+    // paths below no longer match first and tick less than they did.
     let _expired = Deadline::scope(Some(Duration::ZERO));
+    let _every = kimmy_core::deadline::look_at_every_tick();
     let err = filter::matches_at(&filter, &d).unwrap_err();
     assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
     let err = projection.project(&filter, &d).unwrap_err();
