@@ -1840,6 +1840,43 @@ mod tests {
     }
 
     #[test]
+    fn an_upsert_seed_stopped_by_the_deadline_is_a_timeout_when_no_candidate_is_examined() {
+        // The upsert of an absent primary key (the usual shape) examines no document, so
+        // no tick of the scan answers before the engine reaches the seed: only the look made
+        // when the seed is refused can say that the refusal was the deadline (review q8d3, m1).
+        struct Seed;
+        impl ModifySpec for Seed {
+            fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+                Ok(false)
+            }
+            fn compare(&self, _: &Document, _: &Document) -> Ordering {
+                Ordering::Equal
+            }
+            fn apply(&self, d: &Document) -> std::result::Result<Option<Document>, String> {
+                Ok(Some(d.clone()))
+            }
+            fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+                Some(Err("the request ran past its deadline and the work was stopped".into()))
+            }
+        }
+        let (bare, empty, _bare_dir) = engine();
+        let (engine, coll, _dir) = three_chunks();
+        let absent = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(99)).unwrap()]);
+        expire_deadline_for_this_test();
+        let failed = engine.find_and_modify(&coll, &absent, &Seed);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        // An empty collection, scanned: nothing to tick on either.
+        let failed = bare.find_and_modify(&empty, &Candidates::Scan, &Seed);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+    }
+
+    #[test]
     fn a_request_deadline_that_has_passed_before_the_first_chunk_writes_nothing() {
         let (engine, coll, _dir) = three_chunks();
         expire_deadline_for_this_test();

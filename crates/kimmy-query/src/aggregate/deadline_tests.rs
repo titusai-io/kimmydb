@@ -440,3 +440,77 @@ fn each_accumulator_step_ticks() {
     // Two accumulators over 500 documents.
     assert!(ticks_taken() - before >= 1_000, "{} ticks", ticks_taken() - before);
 }
+
+/// What `work` costs in looks at the clock when every tick reads it: its ticks and checks,
+/// exactly (`deadline::looks_of`). A loop that stopped ticking is found by running the work over
+/// two inputs that differ in the one thing the loop walks, and holding the difference to what
+/// each item costs.
+fn looks<T>(work: impl FnOnce() -> T) -> u64 {
+    kimmy_core::deadline::looks_of(work).1
+}
+
+#[test]
+fn facet_looks_between_facets_and_ticks_for_each_document_it_measures() {
+    let limits = Limits::default();
+    let facets = |n: usize| -> Vec<(String, Vec<Stage>)> {
+        (0..n).map(|i| (format!("f{i}"), vec![])).collect()
+    };
+    let reads = |facet_count: usize, docs: i64| {
+        looks(|| {
+            run_facet(&facets(facet_count), rows(docs), &limits, |_, d| Ok::<_, Error>(d)).unwrap()
+        })
+    };
+    // No documents: the look between facets is the only one, and a facet makes one.
+    let diff = reads(9, 0) - reads(2, 0);
+    assert_eq!(diff, 7, "{diff} looks for seven more facets");
+    // One facet: the byte count ticks for each document it measures.
+    let diff = reads(1, 70) - reads(1, 10);
+    assert_eq!(diff, 60, "{diff} looks for sixty more documents");
+}
+
+#[test]
+fn unwind_ticks_for_each_document_it_reads_and_each_row_it_makes() {
+    let limits = Limits::default();
+    let empty = |n: i64| -> Vec<Document> {
+        (0..n).map(|i| doc! { "_id": i, "tags": Vec::<i32>::new() }).collect()
+    };
+    let reads = |n: i64| looks(|| unwind(empty(n), "tags", false, None, &limits).unwrap());
+    // An empty array makes no row, so only the outer loop ticks, once for each document.
+    let diff = reads(60) - reads(10);
+    assert_eq!(diff, 50, "{diff} looks for fifty more documents");
+    // Two rows each: the outer loop and the rows.
+    let full = |n: i64| -> Vec<Document> {
+        (0..n).map(|i| doc! { "_id": i, "tags": ["a", "b"] }).collect()
+    };
+    let reads = |n: i64| looks(|| unwind(full(n), "tags", false, None, &limits).unwrap());
+    let diff = reads(60) - reads(10);
+    assert_eq!(diff, 3 * 50, "{diff} looks for fifty more documents of two rows");
+}
+
+#[test]
+fn bucket_auto_ticks_in_each_of_its_loops() {
+    let Stage::BucketAuto { group_by, buckets, fields } =
+        stage(doc! { "$bucketAuto": { "groupBy": "$v", "buckets": 4 } })
+    else {
+        unreachable!()
+    };
+    let limits = Limits::default();
+    let reads =
+        |n: i64| looks(|| bucket_auto(rows(n), &group_by, buckets, &fields, &limits, &[]).unwrap());
+    // The loop that keys each document, the one that accumulates each bucket's, and the one that
+    // writes the buckets out: three looks for a document.
+    let diff = reads(80) - reads(20);
+    assert_eq!(diff, 3 * 60, "{diff} looks for sixty more documents");
+}
+
+#[test]
+fn redact_ticks_for_each_element_of_an_array_it_walks() {
+    let keep = redact_expr(Bson::String("$$DESCEND".into()));
+    // Integers are decided by no one: only the walk of the array ticks, once for each.
+    let reads = |m: i32| {
+        let wide = doc! { "a": (0..m).collect::<Vec<i32>>() };
+        looks(|| crate::stages::redact(vec![wide], &keep, &[]).unwrap())
+    };
+    let diff = reads(80) - reads(20);
+    assert_eq!(diff, 60, "{diff} looks for sixty more elements");
+}

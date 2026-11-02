@@ -168,3 +168,27 @@ fn fill_ticks_for_each_document_it_fills() {
     });
     assert!(ticks >= floor(4 * N), "{ticks} ticks for locf");
 }
+
+#[test]
+fn linear_fill_ticks_for_each_document_in_each_of_its_loops() {
+    // The partition loop, the sort-key loop, the three passes of the fill and the write-back:
+    // what each costs per document, so that the loop that fills the last cells is counted.
+    let spec = doc! { "sortBy": { "v": 1 }, "output": { "l": { "$linearFill": "$gap" } } };
+    let (out, ticks) = ticks_of(|| window(spec, rows(N)).unwrap());
+    assert_eq!(out.len(), N);
+    // Nine looks for a document, less the first tick of the scope, which the count does not keep.
+    assert!(ticks + 1 >= floor(9 * N), "{ticks} ticks for {N} documents");
+}
+
+#[test]
+fn the_window_looks_at_the_deadline_between_partitions() {
+    // One document in each partition: the look before a partition, and the loops over its one
+    // document, six looks in all. Without the look between partitions there are five.
+    let partitions = |p: usize| -> Vec<Document> {
+        (0..p as i64).map(|i| doc! { "_id": i, "k": i, "v": i }).collect()
+    };
+    let reads =
+        |p: usize| kimmy_core::deadline::looks_of(|| window(sum_spec(), partitions(p)).unwrap()).1;
+    let diff = reads(80) - reads(20);
+    assert_eq!(diff, 6 * 60, "{diff} looks for sixty more partitions");
+}

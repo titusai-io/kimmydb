@@ -155,6 +155,9 @@ impl Cadence {
                 self.stride = (self.stride / 2).max(1);
             }
         }
+        if EVERY_TICK.get() {
+            self.stride = 1;
+        }
         self.last = Some(now);
         self.left = self.stride;
     }
@@ -174,6 +177,44 @@ thread_local! {
     static SHARED_SET: Cell<u32> = const { Cell::new(1) };
     /// Reads of the clock [`check`] has made on this thread, for tests that count looks.
     static CLOCK_READS: Cell<u64> = const { Cell::new(0) };
+    /// Whether every tick reads the clock: see [`look_at_every_tick`].
+    static EVERY_TICK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes every tick on this thread read the clock until the guard drops, so that the number
+/// of reads ([`clock_reads`]) is the number of ticks and checks, exactly. For a test that wants
+/// to know that a loop ticks: the adaptive stride makes the count of reads depend on how fast
+/// the loop runs, and a loop with a [`Ticker`] of its own has no other count (the shared
+/// count's is [`ticks_taken`]). Compare the reads of two runs that differ only in the size of
+/// the thing the loop walks, under a deadline that is far away.
+#[must_use = "the stride is restored when the guard drops"]
+pub fn look_at_every_tick() -> EveryTick {
+    EveryTick { previous: EVERY_TICK.replace(true), _thread_bound: PhantomData }
+}
+
+/// Run `work` under a deadline an hour away with every tick reading the clock
+/// ([`look_at_every_tick`]), and say how many reads of the clock it made: the number of ticks and
+/// checks it took, exactly. A test that wants to know a loop ticks runs the work over two inputs
+/// that differ in the one thing the loop walks, and holds the difference in reads to what each
+/// walked item costs, which removing the loop's tick lowers.
+pub fn looks_of<T>(work: impl FnOnce() -> T) -> (T, u64) {
+    let _deadline = Deadline::scope(Some(Duration::from_secs(3600)));
+    let _exact = look_at_every_tick();
+    let before = clock_reads();
+    let out = work();
+    (out, clock_reads() - before)
+}
+
+/// The guard of [`look_at_every_tick`].
+pub struct EveryTick {
+    previous: bool,
+    _thread_bound: PhantomData<*const ()>,
+}
+
+impl Drop for EveryTick {
+    fn drop(&mut self) {
+        EVERY_TICK.set(self.previous);
+    }
 }
 
 fn restart_shared() {
@@ -624,6 +665,33 @@ mod tests {
         assert_eq!(reads() - before, 1);
         let _expired = Deadline::scope(Some(Duration::ZERO));
         assert!(matches!(tick_n(1_000_000), Err(Error::DeadlineExceeded)));
+    }
+
+    #[test]
+    fn under_the_exact_guard_every_tick_reads_the_clock_and_the_stride_is_back_after_it() {
+        let _guard = Deadline::scope(Some(Duration::from_secs(3600)));
+        {
+            let _exact = look_at_every_tick();
+            let before = reads();
+            let mut ticker = Ticker::new();
+            for _ in 0..1_000 {
+                ticker.tick().unwrap();
+            }
+            for _ in 0..1_000 {
+                tick().unwrap();
+            }
+            assert_eq!(reads() - before, 2_000, "a read for every tick");
+            // A bulk charge is one look, as ever.
+            let before = reads();
+            tick_n(5_000).unwrap();
+            assert_eq!(reads() - before, 1);
+        }
+        let before = reads();
+        let mut ticker = Ticker::new();
+        for _ in 0..1_000 {
+            ticker.tick().unwrap();
+        }
+        assert!(reads() - before < 100, "{} reads once the guard is gone", reads() - before);
     }
 
     #[test]

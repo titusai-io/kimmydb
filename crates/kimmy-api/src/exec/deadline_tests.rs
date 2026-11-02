@@ -408,3 +408,166 @@ fn a_find_and_modify_that_has_committed_answers_whatever_the_deadline_says() {
     let stored = state.engine.get(&meta, &DocId::Int64(1)).unwrap().unwrap();
     assert_eq!(stored.get_i32("n").unwrap(), 1, "what the answer says landed");
 }
+
+// ---- Loops that tick, held by their count of looks (review q8d3, m5) ----
+
+/// The looks at the clock `work` makes when every tick reads it: its ticks and checks, exactly.
+fn looks<T>(work: impl FnOnce() -> T) -> u64 {
+    kimmy_core::deadline::looks_of(work).1
+}
+
+/// A state with `orders` orders `{_id, k, v, next}` and `items` items `{_id, k, next}` that
+/// chain to the following item.
+fn sized_state(dir: &tempfile::TempDir, orders: i64, items: i64) -> SharedState {
+    let state = live_state(dir);
+    seed_docs(
+        &state,
+        "orders",
+        (0..orders).map(|i| doc! { "_id": i, "k": i % 3, "v": i, "next": 0 }).collect(),
+    );
+    seed_docs(
+        &state,
+        "items",
+        (0..items)
+            .map(|i| doc! { "_id": i, "k": i % 3, "next": if i + 1 < items { Some(i + 1) } else { None } })
+            .collect(),
+    );
+    state
+}
+
+fn aggregate_looks(state: &SharedState, pipeline: &Value) -> u64 {
+    looks(|| aggregate_in_a_request(state, pipeline, PLENTY).unwrap())
+}
+
+#[test]
+fn a_lookup_ticks_in_its_walk_its_attach_loop_its_copy_loop_and_the_answer() {
+    // Four looks for each input document: the source walk's row, the loop that finds what each
+    // document joins, the loop that attaches it, and the loop that builds the answer.
+    let (small, big) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (sized_state(&small, 10, 5), sized_state(&big, 50, 5));
+    let equality = json!([{ "$lookup": { "from": "items", "localField": "k",
+                                          "foreignField": "k", "as": "got" } }]);
+    let diff = aggregate_looks(&b, &equality) - aggregate_looks(&a, &equality);
+    assert_eq!(diff, 4 * 40, "{diff} looks for forty more orders");
+}
+
+#[test]
+fn a_lookup_with_a_pipeline_ticks_for_each_input_document_it_runs_the_pipeline_for() {
+    // Three looks for each input document: the source walk's row, the pass over the foreign
+    // side that the document costs, and the answer.
+    let (small, big) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (sized_state(&small, 10, 5), sized_state(&big, 50, 5));
+    let piped = json!([{ "$lookup": { "from": "items", "let": { "k": "$k" },
+        "pipeline": [{ "$match": { "$expr": { "$eq": ["$k", "$$k"] } } }], "as": "got" } }]);
+    let diff = aggregate_looks(&b, &piped) - aggregate_looks(&a, &piped);
+    assert_eq!(diff, 3 * 40, "{diff} looks for forty more orders");
+}
+
+#[test]
+fn a_union_with_ticks_for_each_document_it_reads_measures_and_answers() {
+    // Four looks for each document appended: the foreign walk's row, the loop that measures
+    // what is appended, and the two that carry it on to the answer.
+    let (small, big) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (sized_state(&small, 1, 10), sized_state(&big, 1, 50));
+    let union = json!([{ "$unionWith": "items" }]);
+    let diff = aggregate_looks(&b, &union) - aggregate_looks(&a, &union);
+    assert_eq!(diff, 4 * 40, "{diff} looks for forty more documents");
+}
+
+#[test]
+fn a_graph_lookup_ticks_for_each_foreign_document_and_each_step_of_the_walk() {
+    let (small, big) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (sized_state(&small, 1, 10), sized_state(&big, 1, 50));
+    let graph = |depth: i64| {
+        json!([{ "$graphLookup": { "from": "items", "startWith": "$next",
+            "connectFromField": "next", "connectToField": "_id", "maxDepth": depth, "as": "g" } }])
+    };
+    // No steps beyond the first: what grows is the foreign side, whose row the walk ticks and
+    // whose entry in the table is ticked again.
+    let diff = aggregate_looks(&b, &graph(0)) - aggregate_looks(&a, &graph(0));
+    assert_eq!(diff, 2 * 40, "{diff} looks for forty more foreign documents");
+    // The same foreign side, a longer walk down a chain: each step is one look, and each
+    // document it reaches is another.
+    let diff = aggregate_looks(&b, &graph(40)) - aggregate_looks(&b, &graph(10));
+    assert_eq!(diff, 2 * 30, "{diff} looks for thirty more steps");
+}
+
+#[test]
+fn the_answer_of_an_aggregation_ticks_for_each_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_data(&dir);
+    let reads = |n: i64| {
+        let docs: Vec<bson::Document> = (0..n).map(|i| doc! { "_id": i }).collect();
+        looks(|| {
+            finish_pipeline(
+                &state,
+                &root(),
+                "app",
+                &[],
+                docs,
+                &aggregate::Limits::default(),
+                None,
+                None,
+            )
+            .unwrap()
+        })
+    };
+    let diff = reads(70) - reads(10);
+    assert_eq!(diff, 60, "{diff} looks for sixty more documents");
+}
+
+#[test]
+fn a_write_stage_sets_the_deadline_aside_for_the_whole_of_its_write() {
+    // The checks of the output's `_id`s before the target is created tick for each row (two
+    // looks each); from the look before the target is created no tick of the write reads the
+    // clock, so the write's own checks and chunks add none. Without the set-aside they do.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_data(&dir);
+    let mut next = 0;
+    let mut reads = |n: i64| {
+        next += 1;
+        let stages = parse_pipeline(&json!([{ "$out": format!("dest{next}") }])).unwrap();
+        let plan = plan_sink(&state, &root(), "app", "orders", &stages).unwrap().unwrap();
+        let docs: Vec<bson::Document> = (0..n).map(|i| doc! { "_id": i }).collect();
+        looks(|| write_sink(&state, plan, stages.last().unwrap(), docs).unwrap())
+    };
+    let (few, many) = (reads(5), reads(60));
+    assert_eq!(many - few, 2 * 55, "{few} looks for 5 documents, {many} for 60");
+}
+
+#[test]
+fn violations_is_cut_at_a_passed_deadline_and_runs_with_time_left() {
+    // Two members' documents that collide on a unique key: the report reads the records of the
+    // collision, a walk that ticks the request's deadline.
+    use kimmy_core::{DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp};
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_data(&dir);
+    state.engine.create_collection("app", "people").unwrap();
+    state
+        .engine
+        .create_index(
+            "app",
+            "people",
+            vec![kimmy_storage::meta::IndexField { path: "email".into(), descending: false }],
+            true,
+            None,
+        )
+        .unwrap();
+    let meta = state.engine.get_collection("app", "people").unwrap();
+    state.engine.insert(&meta, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+    let remote = OplogEntry {
+        stamp: Stamp::new(Hlc::new(kimmy_storage::physical_now_ms(), 0), NodeId::generate()),
+        kind: OpKind::Insert,
+        collection: meta.id,
+        doc_id: Some(DocId::String("remote".into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap()),
+    };
+    state.engine.apply_remote(&meta, &remote).unwrap();
+
+    let report = || violations(&state, &root(), "app", "people", None);
+    let late = in_a_request(PAST, report);
+    assert!(is_the_timeout(&late), "{late:?}");
+    let found = in_a_request(PLENTY, report).unwrap();
+    assert_eq!(found["count"], 1, "{found}");
+    assert!(!Deadline::is_set());
+}
