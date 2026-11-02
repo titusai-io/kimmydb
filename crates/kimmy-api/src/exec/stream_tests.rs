@@ -161,9 +161,13 @@ fn the_source_of_a_pipeline_that_streams_has_no_ceiling_and_one_that_blocks_keep
         err.message
     );
     // So is a stage that blocks, at the document that passes the limit and not before.
-    let err = run(&state, json!([{"$addFields": {"x": 1}}, {"$count": "n"}]), with_ceiling(10))
-        .unwrap_err();
+    let err =
+        run(&state, json!([{"$addFields": {"x": 1}}, {"$sort": {"_id": 1}}]), with_ceiling(10))
+            .unwrap_err();
     assert!(err.message.contains("$addFields produced 11 documents"), "{}", err.message);
+    // A `$count` holds a counter and not its input, so it has no ceiling to refuse at.
+    let ok = run(&state, json!([{"$addFields": {"x": 1}}, {"$count": "n"}]), with_ceiling(10));
+    assert_eq!(ok.unwrap()["documents"], json!([{"n": 30}]));
     // A pipeline that begins with a stage that blocks, or with none, reads its source whole
     // and refuses it as it always did.
     for pipeline in [json!([]), json!([{"$sort": {"_id": 1}}, {"$addFields": {"x": 1}}])] {
@@ -229,14 +233,23 @@ fn a_stage_that_blocks_is_charged_as_the_documents_stream_to_it() {
         err.message.split(" is ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
     assert!((50_000..70_000).contains(&held), "stopped at {held}, not after the whole 400 KB");
     assert_eq!(limits.buffer.used(), 0, "gave back what it had");
-    // The same for a `$group`, which charges its input as a stage does.
-    let err = run(
+    // A `$group` holds its buckets and not its input (ADR-270): one bucket is answered, and
+    // a `$push` of the padding is refused as the buckets pass the limit.
+    let ok = run(
         &state,
         json!([{"$project": {"pad": 1}}, {"$group": {"_id": null, "n": {"$sum": 1}}}]),
         capped(50_000),
     )
+    .unwrap();
+    assert_eq!(ok["documents"], json!([{"_id": null, "n": 40}]));
+    let err = run(
+        &state,
+        json!([{"$project": {"pad": 1}}, {"$group": {"_id": null, "p": {"$push": "$pad"}}}]),
+        capped(50_000),
+    )
     .unwrap_err();
-    assert!(err.message.contains("the input of $group is "), "{}", err.message);
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert!(err.message.contains("the buckets of $group is "), "{}", err.message);
     // What arrived is the stage's input and is not charged again when it runs: a budget of
     // the input and a little over holds a `$sort` and a `$count`, where twice the input would
     // be needed if the stage charged it as its own as well.
@@ -314,6 +327,77 @@ fn a_pipeline_of_more_than_a_thousand_stages_is_a_400_that_names_the_count_and_t
     assert!(err.message.contains("a pipeline has 1001 stages"), "{}", err.message);
     let ok = run(&state, counted(998), aggregate::Limits::default()).unwrap();
     assert_eq!(ok["documents"], json!([{"n": 3}]));
+}
+
+#[test]
+fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_or_a_few_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(40, 10_000));
+    let all = held_docs_bytes(&padded(40, 10_000));
+    // The collection is eight times the budget: read whole, it is refused at the source.
+    let cap = all / 8;
+    let err = run(&state, json!([{"$sort": {"_id": 1}}]), capped(cap)).unwrap_err();
+    assert!(err.message.contains("the source read"), "{}", err.message);
+    // And a pipeline that begins with a stage that keeps a counter or its groups is answered, in
+    // the memory of its state, whatever it is streamed over.
+    let cases = [
+        (json!([{"$count": "n"}]), json!([{"n": 40}])),
+        (json!([{"$group": {"_id": null, "n": {"$sum": 1}}}]), json!([{"_id": null, "n": 40}])),
+        (
+            json!([{"$group": {"_id": {"$mod": ["$_id", 2]}, "n": {"$sum": 1}}}]),
+            json!([{"_id": 0, "n": 20}, {"_id": 1, "n": 20}]),
+        ),
+        (
+            json!([{"$bucket": {"groupBy": "$_id", "boundaries": [0, 20, 40],
+                "output": {"n": {"$sum": 1}}}}]),
+            json!([{"_id": 0, "n": 20}, {"_id": 20, "n": 20}]),
+        ),
+        (
+            json!([{"$sortByCount": {"$mod": ["$_id", 3]}}]),
+            json!([{"_id": 0, "count": 14}, {"_id": 1, "count": 13}, {"_id": 2, "count": 13}]),
+        ),
+        // Behind a stage that streams, and followed by one.
+        (
+            json!([{"$addFields": {"c": "$pad"}}, {"$count": "n"}, {"$addFields": {"m": 1}}]),
+            json!([{"n": 40, "m": 1}]),
+        ),
+    ];
+    for (pipeline, answer) in cases {
+        let limits = capped(cap);
+        let ok = run(&state, pipeline.clone(), limits.clone());
+        assert_eq!(
+            ok.unwrap_or_else(|e| panic!("{pipeline}: {e:?}"))["documents"],
+            answer,
+            "{pipeline}"
+        );
+        assert_eq!(limits.buffer.used(), 0, "{pipeline}");
+    }
+}
+
+#[test]
+fn a_group_over_keys_that_never_repeat_is_refused_at_the_bytes_of_its_buckets() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(40, 10_000));
+    // One bucket for each document, each keeping its padding: nothing streaming can help.
+    let pipeline = json!([{"$group": {"_id": "$_id", "p": {"$push": "$pad"}}}]);
+    let limits = capped(50_000);
+    let err = run(&state, pipeline, limits.clone()).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert!(err.message.contains("the buckets of $group is "), "{}", err.message);
+    let held: usize =
+        err.message.split(" is ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+    assert!((50_000..70_000).contains(&held), "stopped at {held}, not after the whole 400 KB");
+    assert_eq!(limits.buffer.used(), 0);
+    // And at the pipeline limit when the buckets are small: a source of thirty, a ceiling of ten.
+    let state = state_with(&tempfile::tempdir().unwrap(), numbered(30, &[]));
+    let err = run(&state, json!([{"$group": {"_id": "$_id"}}]), with_ceiling(10)).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(err.message.contains("$group produced 11 documents"), "{}", err.message);
+    // A few groups over the same source and ceiling are answered: the ceiling is on the groups.
+    let ok = run(&state, json!([{"$group": {"_id": "$k", "n": {"$sum": 1}}}]), with_ceiling(10));
+    assert_eq!(ok.unwrap()["count"], 5);
+    let ok = run(&state, json!([{"$count": "n"}]), with_ceiling(10));
+    assert_eq!(ok.unwrap()["documents"], json!([{"n": 30}]));
 }
 
 /// `n` documents `{_id: i, t: i}` under an index on `t`, so a range of `t` is an inexact
@@ -487,24 +571,24 @@ fn what_a_stage_that_blocks_hands_to_a_stage_that_streams_is_released_as_it_drai
     let state = state_with(&dir, padded(20, 10_000));
     let input = held_docs_bytes(&padded(20, 10_000));
     // The `$sort` holds its input; its output is the same documents, which the second
-    // `$project` takes as its input and the `$group` collects as it gets them. Each is given
-    // back as it is taken, so the documents once is held, and not twice as they drain
-    // beside what has arrived.
+    // `$project` takes as its input and the `$group` keeps the padding of as it gets them.
+    // Each is given back as it is taken, so the documents once is held, and not twice as
+    // they drain beside what has arrived.
     let pipeline = json!([
         {"$project": {"pad": 1}},
         {"$sort": {"_id": -1}},
         {"$project": {"pad": 1}},
-        {"$group": {"_id": null, "n": {"$sum": 1}}},
+        {"$group": {"_id": null, "p": {"$push": "$pad"}}},
+        {"$project": {"n": {"$size": "$p"}}},
     ]);
     let (least, err) = smallest_budget(&state, &pipeline, 4 * input);
-    assert!(least > input && least < 2 * input, "answered under {least}, documents {input}");
-    // What is full is the `$group`, which holds its input (the documents once) and its
-    // buckets: the second `$project` held nothing of what it had taken.
     assert!(
-        err.message.contains("the buckets of $group (with its input, still held) is "),
-        "{}",
-        err.message
+        least >= input && least < input + input / 10,
+        "answered under {least}, documents {input}"
     );
+    // What is full is the `$group`, which holds the padding it was given and not the input:
+    // the second `$project` held nothing of what it had taken.
+    assert!(err.message.contains("the buckets of $group is "), "{}", err.message);
 }
 
 #[test]

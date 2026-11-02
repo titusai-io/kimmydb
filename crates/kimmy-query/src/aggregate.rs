@@ -2158,17 +2158,9 @@ pub fn apply_charged(
             limits,
             &mut held.output,
         )?,
-        Stage::Group { id, fields } => group(input, id, fields, limits, vars, &mut held.output)?,
-        Stage::Bucket { group_by, boundaries, default, fields } => bucket(
-            input,
-            group_by,
-            boundaries,
-            default.as_ref(),
-            fields,
-            limits,
-            vars,
-            &mut held.output,
-        )?,
+        Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_) => {
+            group_all(stage, &input, limits, vars, &mut held.output)?
+        }
         Stage::BucketAuto { group_by, buckets, fields } => {
             bucket_auto(input, group_by, *buckets, fields, limits, vars, &mut held.output)?
         }
@@ -2210,9 +2202,6 @@ pub fn apply_charged(
                  holds a storage handle, not by the pure pipeline"
                     .into(),
             ));
-        }
-        Stage::SortByCount(expr) => {
-            stages::sort_by_count(input, expr, limits, vars, &mut held.output)?
         }
         Stage::Sample(size) => stages::sample(input, *size, limits, &mut stages::system_below())?,
         Stage::Redact(expr) => stages::redact(input, expr, vars, &mut held.output)?,
@@ -2830,27 +2819,6 @@ fn bucket_base_bytes(key: &Bson, fields: &[(String, Accumulator)]) -> usize {
     )
 }
 
-fn group(
-    input: Vec<Document>,
-    id: &Expr,
-    fields: &[(String, Accumulator)],
-    limits: &Limits,
-    vars: &[Binding<'_>],
-    held: &mut Lease,
-) -> Result<Vec<Document>> {
-    group_keyed("$group", input, fields, limits, vars, held, |scope| id.eval_in(scope).map(Some))
-}
-
-/// [`group`] with the key of each document given by `key`, which may decline a
-/// document by answering `None` (it is then in no group and is left out).
-///
-/// Keyed by the *encoded* key rather than by `Bson`, because `Bson` is not `Hash`
-/// and because two numerically equal values of different types must land in the
-/// same bucket, the same rule indexes use.
-///
-/// What the buckets hold is charged to `held` as it grows (ADR-269): a bucket when it is
-/// made, and the values each accumulator keeps as they are taken, so a `$push` of large
-/// values is refused at the document that passes the limit.
 /// The name of a group's output document in a refusal for its size.
 fn group_document_name(stage: &str) -> &'static str {
     match stage {
@@ -2886,105 +2854,198 @@ pub fn check_built_document(doc: &Document, max: usize) -> Result<()> {
     )
 }
 
-pub(crate) fn group_keyed(
-    stage: &str,
-    input: Vec<Document>,
-    fields: &[(String, Accumulator)],
+/// Run a grouping stage over a whole input: the documents through a [`GroupState`] one after
+/// the other, then its answer. The state is charged to `held` as it grows (ADR-269).
+fn group_all(
+    stage: &Stage,
+    input: &[Document],
     limits: &Limits,
     vars: &[Binding<'_>],
     held: &mut Lease,
-    mut key_of: impl FnMut(&Scope<'_>) -> Result<Option<Bson>>,
 ) -> Result<Vec<Document>> {
-    let mut order: Vec<Bucket> = Vec::new();
-    let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    let mut state = GroupState::new(stage, limits, vars).expect("the stage groups");
+    for doc in input {
+        state.add(doc, held)?;
+    }
+    state.finish()
+}
 
-    let mut ticker = Ticker::new();
-    for doc in &input {
-        ticker.tick()?;
-        let scope = Scope::with_bindings(doc, vars);
-        let Some(key) = key_of(&scope)? else { continue };
+/// How a grouping stage reads the bucket a document belongs to.
+enum GroupKind<'a> {
+    /// `$group`: the value of `_id`.
+    Group(&'a Expr),
+    /// `$sortByCount`: the value of the expression, counted, and the groups sorted by count.
+    SortByCount(&'a Expr),
+    /// `$bucket`: the range of `boundaries` the value of `group_by` falls in, `[b_i, b_i+1)`,
+    /// whose key is `b_i` as written; `default` if the value is outside every range or is not
+    /// of the boundaries' kind; and a document with neither is **refused**, naming the value.
+    /// Only buckets that received a document are answered, in boundary order and the
+    /// `default` bucket last.
+    Bucket {
+        group_by: &'a Expr,
+        boundaries: &'a [Bson],
+        default: Option<&'a Bson>,
+        kind: Option<BoundaryKind>,
+    },
+}
+
+/// What `$group`, `$bucket` and `$sortByCount` hold while they take their input one document
+/// at a time (ADR-270): the buckets and what each accumulator keeps, and not the documents.
+/// [`apply`] runs a whole input through one, and the chain of sinks feeds it as the source
+/// reads, so there is one implementation of each stage.
+///
+/// Keyed by the *encoded* key rather than by `Bson`, because `Bson` is not `Hash` and because
+/// two numerically equal values of different types must land in the same bucket, the same
+/// rule indexes use.
+pub struct GroupState<'a> {
+    stage: &'static str,
+    kind: GroupKind<'a>,
+    fields: std::borrow::Cow<'a, [(String, Accumulator)]>,
+    limits: &'a Limits,
+    vars: &'a [Binding<'a>],
+    order: Vec<Bucket>,
+    index: std::collections::HashMap<Vec<u8>, usize>,
+    ticker: Ticker,
+}
+
+impl<'a> GroupState<'a> {
+    /// The state of `stage`, or `None` if it is not a stage that groups.
+    pub fn new(stage: &'a Stage, limits: &'a Limits, vars: &'a [Binding<'a>]) -> Option<Self> {
+        let (kind, fields) = match stage {
+            Stage::Group { id, fields } => {
+                (GroupKind::Group(id), std::borrow::Cow::Borrowed(&fields[..]))
+            }
+            Stage::SortByCount(expr) => {
+                // The count is `$group`'s own `{$sum: 1}`: an int, widening to a long past
+                // 2^31-1, as the reference's is (ADR-268).
+                let count = ("count".to_string(), Accumulator::Sum(Expr::Literal(Bson::Int32(1))));
+                (GroupKind::SortByCount(expr), std::borrow::Cow::Owned(vec![count]))
+            }
+            Stage::Bucket { group_by, boundaries, default, fields } => (
+                GroupKind::Bucket {
+                    group_by,
+                    boundaries,
+                    default: default.as_ref(),
+                    kind: BoundaryKind::of(&boundaries[0]),
+                },
+                std::borrow::Cow::Borrowed(&fields[..]),
+            ),
+            _ => return None,
+        };
+        Some(GroupState {
+            stage: stage.name(),
+            kind,
+            fields,
+            limits,
+            vars,
+            order: Vec::new(),
+            index: std::collections::HashMap::new(),
+            ticker: Ticker::new(),
+        })
+    }
+
+    /// The key of the bucket `scope`'s document belongs to.
+    fn key(&self, scope: &Scope<'_>) -> Result<Bson> {
+        match &self.kind {
+            GroupKind::Group(expr) | GroupKind::SortByCount(expr) => expr.eval_in(scope),
+            GroupKind::Bucket { group_by, boundaries, default, kind } => {
+                let value = group_by.eval_in(scope)?;
+                let inside = (BoundaryKind::of(&value) == *kind && !is_nan(&value))
+                    .then(|| {
+                        boundaries
+                            .partition_point(|b| kimmy_core::cmp::canonical_cmp(b, &value).is_le())
+                    })
+                    .filter(|&above| above > 0 && above < boundaries.len());
+                match (inside, default) {
+                    (Some(above), _) => Ok(boundaries[above - 1].clone()),
+                    (None, Some(default)) => Ok((*default).clone()),
+                    (None, None) => Err(Error::InvalidQuery(format!(
+                        "$bucket: {} falls in no bucket and there is no `default`; add a \
+                         `default`, or a boundary below and above it",
+                        describe_value(&value)
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// One more document. What the buckets hold is charged to `held` as it grows
+    /// (ADR-269): a bucket when it is made, and the values each accumulator keeps as they are
+    /// taken, so a `$push` of large values is refused at the document that passes the limit.
+    /// One bucket per distinct value, so a high-cardinality key is exactly the shape that
+    /// exhausts memory: the buckets are held to the pipeline's document limit.
+    pub fn add(&mut self, doc: &Document, held: &mut Lease) -> Result<()> {
+        self.ticker.tick()?;
+        let scope = Scope::with_bindings(doc, self.vars);
+        let key = self.key(&scope)?;
         let encoded = group_key(&key);
-        let slot = match index.get(&encoded) {
+        let slot = match self.index.get(&encoded) {
             Some(&slot) => slot,
             None => {
-                let slot = order.len();
+                let slot = self.order.len();
                 // The bucket, its key twice over (the bucket and the index).
                 held.charge(
-                    bucket_base_bytes(&key, fields)
+                    bucket_base_bytes(&key, &self.fields)
                         .saturating_add(crate::budget::held_set_key(encoded.len())),
                 )?;
-                order.push(Bucket { key: key.clone(), values: fields.iter().map(init).collect() });
-                index.insert(encoded, slot);
-                // One bucket per distinct value, so a high-cardinality key is
-                // exactly the shape that exhausts memory.
-                check_limit(stage, order.len(), limits)?;
+                self.order.push(Bucket {
+                    key: key.clone(),
+                    values: self.fields.iter().map(init).collect(),
+                });
+                self.index.insert(encoded, slot);
+                check_limit(self.stage, self.order.len(), self.limits)?;
                 slot
             }
         };
-        for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
+        for (state, (_, acc)) in self.order[slot].values.iter_mut().zip(self.fields.iter()) {
             let before = state.held();
             accumulate(state, acc, &scope)?;
             held.resize(before, state.held())?;
         }
+        Ok(())
     }
 
-    // Not ticked: one cheap step per bucket, and the buckets are no more than the
-    // documents that were.
-    order
-        .into_iter()
-        .map(|bucket| {
-            let mut out = Document::new();
-            out.insert("_id", bucket.key);
-            for (state, (name, _)) in bucket.values.into_iter().zip(fields) {
-                out.insert(name.clone(), finish(state)?);
-            }
-            check_group_document(stage, &out, limits.max_document_bytes)?;
-            Ok(out)
-        })
-        .collect()
-}
-
-/// Run a `$bucket`: each document goes to the range its `groupBy` value falls in,
-/// `[b_i, b_i+1)`, whose key is `b_i` as written; to `default` if the value is
-/// outside every range or is not of the boundaries' kind; and a document with
-/// neither is **refused**, naming the value. Only buckets that received a
-/// document are answered, in boundary order and the `default` bucket last.
-#[allow(clippy::too_many_arguments)]
-fn bucket(
-    input: Vec<Document>,
-    group_by: &Expr,
-    boundaries: &[Bson],
-    default: Option<&Bson>,
-    fields: &[(String, Accumulator)],
-    limits: &Limits,
-    vars: &[Binding<'_>],
-    held: &mut Lease,
-) -> Result<Vec<Document>> {
-    let kind = BoundaryKind::of(&boundaries[0]);
-    let mut out = group_keyed("$bucket", input, fields, limits, vars, held, |scope| {
-        let value = group_by.eval_in(scope)?;
-        let inside = (BoundaryKind::of(&value) == kind && !is_nan(&value))
-            .then(|| {
-                boundaries.partition_point(|b| kimmy_core::cmp::canonical_cmp(b, &value).is_le())
+    /// The input is complete: the groups, in the order their keys were first seen, but for
+    /// `$bucket`'s, which are in boundary order and the `default` last, and `$sortByCount`'s,
+    /// which are sorted by count, largest first, the sort stable so that groups with the same
+    /// count stay in first-seen order (the reference leaves it unspecified).
+    pub fn finish(self) -> Result<Vec<Document>> {
+        // Not ticked: one cheap step per bucket, and the buckets are no more than the
+        // documents that were.
+        let mut out = self
+            .order
+            .into_iter()
+            .map(|bucket| {
+                let mut out = Document::new();
+                out.insert("_id", bucket.key);
+                for (state, (name, _)) in bucket.values.into_iter().zip(self.fields.iter()) {
+                    out.insert(name.clone(), finish(state)?);
+                }
+                check_group_document(self.stage, &out, self.limits.max_document_bytes)?;
+                Ok(out)
             })
-            .filter(|&above| above > 0 && above < boundaries.len());
-        match (inside, default) {
-            (Some(above), _) => Ok(Some(boundaries[above - 1].clone())),
-            (None, Some(default)) => Ok(Some(default.clone())),
-            (None, None) => Err(Error::InvalidQuery(format!(
-                "$bucket: {} falls in no bucket and there is no `default`; add a `default`, \
-                 or a boundary below and above it",
-                describe_value(&value)
-            ))),
+            .collect::<Result<Vec<_>>>()?;
+        match self.kind {
+            GroupKind::Group(_) => Ok(out),
+            GroupKind::SortByCount(_) => shape::sort_until_deadline(
+                &[SortKey { path: "count".into(), descending: true }],
+                out,
+            ),
+            GroupKind::Bucket { default, .. } => {
+                let default_key = default.map(group_key);
+                out.sort_by(|a, b| {
+                    let (ka, kb) =
+                        (a.get("_id").unwrap_or(&Bson::Null), b.get("_id").unwrap_or(&Bson::Null));
+                    let is_default =
+                        |k: &Bson| default_key.as_ref().is_some_and(|d| *d == group_key(k));
+                    is_default(ka)
+                        .cmp(&is_default(kb))
+                        .then_with(|| kimmy_core::cmp::canonical_cmp(ka, kb))
+                });
+                Ok(out)
+            }
         }
-    })?;
-    let default_key = default.map(group_key);
-    out.sort_by(|a, b| {
-        let (ka, kb) = (a.get("_id").unwrap_or(&Bson::Null), b.get("_id").unwrap_or(&Bson::Null));
-        let is_default = |k: &Bson| default_key.as_ref().is_some_and(|d| *d == group_key(k));
-        is_default(ka).cmp(&is_default(kb)).then_with(|| kimmy_core::cmp::canonical_cmp(ka, kb))
-    });
-    Ok(out)
+    }
 }
 
 /// A value in an error message: its text if it is short, its type if not.

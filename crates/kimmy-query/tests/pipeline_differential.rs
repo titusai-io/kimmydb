@@ -194,6 +194,28 @@ fn lazy_model(stages: &[Stage], docs: Vec<Document>) -> Result<Vec<Document>, Er
                     }
                 }))
             }
+            // A stage that holds a state and not its input takes its documents one at a time,
+            // so the first failure in document order is the pipeline's, whether it is the
+            // stage's own or an earlier stage's on a later document. (The state's per-document
+            // body is the stage's own, which the old loop runs too.)
+            Stage::Count(field) => {
+                let mut seen = 0;
+                for item in input {
+                    item?;
+                    seen += 1;
+                }
+                Box::new(std::iter::once(Ok(doc! { field.as_str(): seen })))
+            }
+            Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_) => {
+                let vars = run.vars();
+                let mut state = aggregate::GroupState::new(stage, &run.limits, &vars)
+                    .expect("the stage groups");
+                let mut lease = run.limits.buffer.lease("the model");
+                for item in input {
+                    state.add(&item?, &mut lease)?;
+                }
+                Box::new(state.finish()?.into_iter().map(Ok))
+            }
             // A stage that blocks runs whatever follows it, so its failure, or the failure of
             // what it pulled, is the pipeline's: a `$limit` of 0 after it pulls nothing, and
             // must not make it unread.

@@ -8,7 +8,7 @@
 //! what comes out. A stage that holds nothing between documents is a step of a sink that
 //! passes each document on, and a full `$limit` tells the source to stop reading ([`Flow`]).
 //!
-//! # Two kinds of stage
+//! # Three kinds of stage
 //!
 //! A stage that [streams](streams) (`$match`, `$project`, `$addFields`, `$replaceRoot`,
 //! `$redact`, `$unwind`, `$skip`, `$limit`) holds one document at a time. A run of them is
@@ -20,6 +20,14 @@
 //! [`crate::aggregate`], the one [`crate::aggregate::apply`] loops over, so there is one
 //! copy of each stage and the differential test (`tests/pipeline_differential.rs`) compares
 //! one implementation with itself run in two orders.
+//!
+//! A stage that needs all of its input but not to keep it (`$count`, `$group`, `$bucket`,
+//! `$sortByCount`) is a [`Fused`] sink: it holds a state, a counter or its buckets, takes each
+//! document into the state as it arrives, and at [`Sink::finish`] pushes its answer on. It
+//! never answers `Done`, since it has not seen its input until the end, and it holds what the
+//! stage's state holds and not what it was given. The state is the stage's own code
+//! ([`crate::aggregate::GroupState`]) which [`crate::aggregate::apply`] runs a whole input
+//! through, so there is one implementation of each.
 //!
 //! Every other stage is a [`Barrier`]: it collects its input, and when the input is complete
 //! ([`Sink::finish`]) runs the stage as it always ran, through the runner the caller
@@ -37,18 +45,27 @@
 //! beside it: the fans of `$unwind` that keep their input (the document and the elements still
 //! to come, one fan to a level, charged while the fan stands), and a `Vec` pushed whole to it,
 //! which it charges on arrival as the input of its first stage and gives back as it takes each
-//! document. A barrier, and the collector that ends the chain, charge **as the documents
-//! arrive** one at a time: the
-//! lease grows by a document's estimate when it is pushed, and a document that takes the
-//! request over its limit is refused at once, so a streamed `$addFields` feeding a `$group`
-//! is held to the limit as it goes and not when it ends. The barrier hands the lease to the
-//! stage as the hold on its input, and the stage does not charge the same bytes again. A
-//! `Vec` pushed whole ([`Sink::push_all`]) is not charged on arrival: it was built by a
+//! document.
+//!
+//! A fused sink charges what its state holds as it grows, to a lease named for the state
+//! ([`crate::budget::state_of`]): the buckets of a `$group` and the values they keep, and a
+//! `$count` nothing. It gives it back when it finishes, as the barrier it replaces gave back its
+//! buckets before its output was pushed on, and the sink that takes the output charges it. It
+//! charges a `Vec` pushed whole as a streaming sink does.
+//!
+//! A barrier, and the collector that ends the chain, charge **as the documents arrive** one
+//! at a time: the lease grows by a document's estimate when it is pushed, and a document that
+//! takes the request over its limit is refused at once, so a streamed `$addFields` feeding a
+//! `$sort` is held to the limit as it goes and not when it ends. The barrier hands the lease
+//! to the stage as the hold on its input, and the stage does not charge the same bytes again.
+//! A `Vec` pushed whole ([`Sink::push_all`]) is not charged on arrival: it was built by a
 //! stage that charged it as it built it, and the stage that takes it charges it as its
-//! input, as the loop did (a barrier at its run, a streaming sink on arrival).
+//! input, as the loop did (a barrier at its run, a streaming or fused sink on arrival).
 //!
 //! A barrier, and the collector, also refuse when they would hold more than the pipeline's
-//! `max_documents`, where the stages that stream have no such ceiling.
+//! `max_documents`, where the stages that stream have no such ceiling; a fused sink refuses
+//! when its state would hold more groups than that ([`crate::aggregate::check_limit`]), which
+//! is what the number of documents is a bound on.
 //!
 //! # The request deadline (ADR-266)
 //!
@@ -63,7 +80,7 @@ use bson::Document;
 use kimmy_core::Error;
 
 use crate::aggregate::{self, Fan, Limits, Stage, UnwindSpec};
-use crate::budget::{Lease, held_bytes, input_of};
+use crate::budget::{Lease, held_bytes, input_of, state_of};
 use crate::deadline::Ticker;
 use crate::expr::Binding;
 use crate::filter;
@@ -151,6 +168,23 @@ pub fn streams(stage: &Stage) -> bool {
     )
 }
 
+/// Whether a pipeline whose stages are `stages` takes its source a document at a time, and
+/// holds none of it: the first stage streams, or holds a state in place of its input
+/// ([`fuse`]). Any other pipeline begins with a stage that needs the source whole, and the
+/// executor reads it whole.
+pub fn streams_source(stages: &[Stage]) -> bool {
+    stages.first().is_some_and(|first| {
+        streams(first)
+            || matches!(
+                first,
+                Stage::Count(_)
+                    | Stage::Group { .. }
+                    | Stage::Bucket { .. }
+                    | Stage::SortByCount(_)
+            )
+    })
+}
+
 /// How many documents of the source a pipeline whose stages are `stages` will take, when that
 /// is known before it runs: the stages begin with a run of `$skip`s and a `$limit`, which take
 /// that many whatever the documents are (a `$limit` of 0 included, which takes none). `None`
@@ -186,7 +220,7 @@ pub fn build<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, streams)
+    build_by(stages, run, limits, vars, true)
 }
 
 /// [`build`] with every stage a [`Barrier`], as the chain was first built (ADR-270, P0): it
@@ -198,24 +232,38 @@ pub fn build_barriers<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, |_| false)
+    build_by(stages, run, limits, vars, false)
 }
 
+/// [`build`] when `streaming`, and [`build_barriers`] when not.
 fn build_by<'a, E: From<Error> + 'a>(
     stages: &'a [Stage],
     run: Runner<'a, E>,
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
-    by: fn(&Stage) -> bool,
+    streaming: bool,
 ) -> Chain<'a, E> {
     let last = stages.last().map_or("the source", Stage::name);
     let out = Rc::new(RefCell::new(Collected::new("the output of the pipeline", last, limits)));
     let mut head: Link<'a, E> = Box::new(Collector { out: Rc::clone(&out) });
     let mut end = stages.len();
     while end > 0 {
+        // The stages that hold their state and not their input end here.
+        if let Some(fusion) = streaming.then(|| fuse(&stages[..end], vars, limits)).flatten() {
+            let held = limits.buffer.lease(state_of(fusion.name));
+            head = Box::new(Fused {
+                name: fusion.name,
+                limits,
+                state: Some(fusion.state),
+                held,
+                next: Some(head),
+            });
+            end -= fusion.len;
+            continue;
+        }
         // The run of stages that stream that ends at `end`, if the stage there is one.
         let mut start = end;
-        while start > 0 && by(&stages[start - 1]) {
+        while streaming && start > 0 && streams(&stages[start - 1]) {
             start -= 1;
         }
         if start < end {
@@ -526,22 +574,10 @@ impl<'a, E: From<Error>> Sink<'a, E> for Streaming<'a, E> {
     }
 
     fn push_all(&mut self, docs: Vec<Document>) -> Result<Flow, E> {
-        // The documents are in memory, whole, and nothing has charged them: the stage that
-        // built them has given its hold back, and the caller of a sub-pipeline leaves them to
-        // the first stage. They are charged as the input of the first stage of the run, as
-        // that stage charged them when it held its input, and each is given back as it is
-        // taken, so that what is left to drain is held to the request's budget (ADR-269).
-        let first = self.steps.first().map_or("a stage", |step| step.stage.name());
-        let mut arrived = self.limits.buffer.lease(input_of(first));
-        arrived.charge_docs(&docs)?;
         // `push` ticks; a tick of its own would count each document twice.
-        for doc in docs {
-            arrived.release(held_bytes(&doc));
-            if self.push(doc)? == Flow::Done {
-                return Ok(Flow::Done);
-            }
-        }
-        Ok(Flow::More)
+        let first = self.steps.first().map_or("a stage", |step| step.stage.name());
+        let limits = self.limits;
+        drain(limits, first, docs, |doc| self.push(doc))
     }
 
     fn is_full(&self) -> bool {
@@ -549,6 +585,149 @@ impl<'a, E: From<Error>> Sink<'a, E> for Streaming<'a, E> {
     }
 
     fn finish(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn next_mut(&mut self) -> Option<&mut dyn Sink<'a, E>> {
+        match &mut self.next {
+            Some(next) => Some(&mut **next),
+            None => None,
+        }
+    }
+
+    fn detach(&mut self) -> Option<Link<'a, E>> {
+        self.next.take()
+    }
+}
+
+/// Take `docs`, which are in memory whole and which nothing has charged (the stage that built
+/// them has given its hold back, and the caller of a sub-pipeline leaves them to the first
+/// stage), through `push` one at a time. They are charged on arrival as the input of `first`,
+/// the stage that takes them, as that stage charged them when it held its input, and each is
+/// given back as it is taken, so that what is left to drain is held to the request's budget
+/// (ADR-269).
+fn drain<E: From<Error>>(
+    limits: &Limits,
+    first: &str,
+    docs: Vec<Document>,
+    mut push: impl FnMut(Document) -> Result<Flow, E>,
+) -> Result<Flow, E> {
+    let mut arrived = limits.buffer.lease(input_of(first));
+    arrived.charge_docs(&docs)?;
+    for doc in docs {
+        arrived.release(held_bytes(&doc));
+        if push(doc)? == Flow::Done {
+            return Ok(Flow::Done);
+        }
+    }
+    Ok(Flow::More)
+}
+
+/// What a stage that does not need its input holds in place of it (ADR-270): a counter, the
+/// buckets of a `$group`. It takes one document at a time, charges what it keeps to the lease
+/// it is given, and at the end of the input answers what the stage answers.
+trait State {
+    /// One more document. A state that loops ticks the request's deadline.
+    fn add(&mut self, doc: Document, held: &mut Lease) -> Result<(), Error>;
+
+    /// The input is complete: the stage's output.
+    fn finish(self: Box<Self>) -> Result<Vec<Document>, Error>;
+}
+
+/// `$count`: one number, and nothing charged.
+struct Counter<'a> {
+    field: &'a str,
+    seen: usize,
+    ticker: Ticker,
+}
+
+impl State for Counter<'_> {
+    fn add(&mut self, _: Document, _: &mut Lease) -> Result<(), Error> {
+        self.ticker.tick()?;
+        self.seen += 1;
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<Vec<Document>, Error> {
+        // An `Int32` while it fits, as the reference counts (ADR-268).
+        Ok(vec![bson::doc! { self.field: crate::expr::count_bson(self.seen) }])
+    }
+}
+
+impl State for aggregate::GroupState<'_> {
+    fn add(&mut self, doc: Document, held: &mut Lease) -> Result<(), Error> {
+        aggregate::GroupState::add(self, &doc, held)
+    }
+
+    fn finish(self: Box<Self>) -> Result<Vec<Document>, Error> {
+        aggregate::GroupState::finish(*self)
+    }
+}
+
+/// The stages that a [`Fused`] sink stands for, and the state it holds.
+struct Fusion<'a> {
+    /// How many stages, counted back from the end of those given to [`fuse`].
+    len: usize,
+    /// The name its lease is given by ([`state_of`]).
+    name: &'static str,
+    state: Box<dyn State + 'a>,
+}
+
+/// The stages at the end of `stages` that hold a state and not their input, if there are
+/// any: `$count`, `$group`, `$bucket` and `$sortByCount` hold a counter or their buckets.
+fn fuse<'a>(
+    stages: &'a [Stage],
+    vars: &'a [Binding<'a>],
+    limits: &'a Limits,
+) -> Option<Fusion<'a>> {
+    let stage = stages.last()?;
+    let state: Box<dyn State + 'a> = match stage {
+        Stage::Count(field) => Box::new(Counter { field, seen: 0, ticker: Ticker::new() }),
+        Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_) => {
+            Box::new(aggregate::GroupState::new(stage, limits, vars)?)
+        }
+        _ => return None,
+    };
+    Some(Fusion { len: 1, name: stage.name(), state })
+}
+
+/// A stage that holds a state and not its input: it takes the documents as they arrive and
+/// keeps what the stage needs of them, and at [`Sink::finish`] pushes its answer on. It
+/// needs all of its input, so it never answers `Done` to the source.
+struct Fused<'a, E: From<Error>> {
+    name: &'static str,
+    limits: &'a Limits,
+    /// `None` once it has finished.
+    state: Option<Box<dyn State + 'a>>,
+    /// What the state holds, named for it ([`state_of`]).
+    held: Lease,
+    /// `None` only once [`Sink::detach`] has taken it.
+    next: Option<Link<'a, E>>,
+}
+
+impl<'a, E: From<Error>> Sink<'a, E> for Fused<'a, E> {
+    fn push(&mut self, doc: Document) -> Result<Flow, E> {
+        if let Some(state) = self.state.as_mut() {
+            state.add(doc, &mut self.held)?;
+        }
+        Ok(Flow::More)
+    }
+
+    fn push_all(&mut self, docs: Vec<Document>) -> Result<Flow, E> {
+        let (limits, name) = (self.limits, self.name);
+        drain(limits, name, docs, |doc| self.push(doc))
+    }
+
+    fn finish(&mut self) -> Result<(), E> {
+        let Some(state) = self.state.take() else { return Ok(()) };
+        let output = state.finish()?;
+        // The state is built into the output, which the next sink charges as it takes it.
+        self.held.release(self.held.bytes());
+        let _ = self
+            .next
+            .as_mut()
+            .expect("a sink is attached until its chain is dropped")
+            .push_all(output)?;
         Ok(())
     }
 
@@ -682,9 +861,14 @@ mod tests {
         }
     }
 
+    /// A `$sort` with no `$limit` after it, which blocks.
+    fn sort() -> Stage {
+        Stage::Sort(vec![crate::shape::SortKey { path: "_id".into(), descending: false }])
+    }
+
     /// Three stages that block.
     fn pipeline() -> Vec<Stage> {
-        vec![Stage::Sample(3), Stage::Sample(2), Stage::Count("n".into())]
+        vec![Stage::Sample(3), Stage::Sample(2), sort()]
     }
 
     fn parsed(specs: &[Document]) -> Vec<Stage> {
@@ -716,7 +900,7 @@ mod tests {
         assert_eq!(ids(&out), [1, 2]);
         assert_eq!(
             *calls.borrow(),
-            [("$sample", vec![1, 2, 3, 4]), ("$sample", vec![1, 2, 3]), ("$count", vec![1, 2])]
+            [("$sample", vec![1, 2, 3, 4]), ("$sample", vec![1, 2, 3]), ("$sort", vec![1, 2])]
         );
     }
 
@@ -1021,14 +1205,14 @@ mod tests {
         assert_eq!(run.push(doc! {"_id": 1}).unwrap(), Flow::Done);
         assert!(got.borrow().is_empty());
         // Behind a stage that streams, and at the head of a chain.
-        let stages = [Stage::Skip(1), Stage::Limit(0), Stage::Count("n".into())];
+        let stages = [Stage::Skip(1), Stage::Limit(0), sort()];
         let calls = Calls::default();
         let counting = recording(&calls);
         let mut chain = build(&stages, &counting, &limits, &[]);
         assert!(chain.is_full());
         assert_eq!(chain.push(doc! {"_id": 1}).unwrap(), Flow::Done);
         assert_eq!(ids(&chain.finish().unwrap()), Vec::<i32>::new());
-        assert_eq!(*calls.borrow(), [("$count", Vec::<i32>::new())]);
+        assert_eq!(*calls.borrow(), [("$sort", Vec::<i32>::new())]);
     }
 
     #[test]
@@ -1438,5 +1622,204 @@ mod tests {
             bound(&[doc! {"$project": {"a": 1}}, doc! {"$skip": 1}, doc! {"$limit": 5}]),
             None
         );
+    }
+    /// The stages that hold a state and not their input, with a `$limit` after them that the
+    /// stage does not stand for.
+    fn fused_specs() -> Vec<Document> {
+        vec![
+            doc! {"$count": "n"},
+            doc! {"$group": {"_id": "$g", "n": {"$sum": 1}, "p": {"$push": "$pad"}}},
+            doc! {"$bucket": {"groupBy": "$g", "boundaries": [0, 2, 4], "default": "other",
+            "output": {"p": {"$push": "$pad"}}}},
+            doc! {"$sortByCount": "$g"},
+        ]
+    }
+
+    /// `n` documents `{_id, g: i % 3, pad}`.
+    fn grouped(n: i32, pad: usize) -> Vec<Document> {
+        (0..n).map(|i| doc! {"_id": i, "g": i % 3, "pad": "x".repeat(pad)}).collect()
+    }
+
+    #[test]
+    fn a_stage_that_holds_a_state_and_not_its_input_never_reaches_the_runner() {
+        // A runner that is never called: the stages are sinks of their own.
+        for spec in fused_specs() {
+            let stages = parsed(std::slice::from_ref(&spec));
+            let limits = Limits::default();
+            let mut chain = build(&stages, &unused, &limits, &[]);
+            for doc in grouped(7, 10) {
+                assert_eq!(chain.push(doc).unwrap(), Flow::More, "{spec}");
+            }
+            assert!(!chain.finish().unwrap().is_empty(), "{spec}");
+            // The same stage as a barrier is run by the runner, and answers the same.
+            let calls = Calls::default();
+            let run = |stage: &Stage, input: Vec<Document>, _: Option<Lease>| {
+                calls.borrow_mut().push((stage.name(), ids(&input)));
+                aggregate::apply(stage, input, &Limits::default())
+            };
+            let mut barrier = build_barriers(&stages, &run, &limits, &[]);
+            let _ = barrier.push_all(grouped(7, 10)).unwrap();
+            assert_eq!(calls.borrow().len(), 0, "nothing runs until the chain is finished");
+            let mut sink = build(&stages, &unused, &limits, &[]);
+            let _ = sink.push_all(grouped(7, 10)).unwrap();
+            assert_eq!(barrier.finish().unwrap(), sink.finish().unwrap(), "{spec}");
+            assert_eq!(calls.borrow().len(), 1, "{spec}");
+        }
+    }
+
+    #[test]
+    fn the_stages_that_hold_a_state_are_those_a_source_streams_into() {
+        // `streams_source` and `fuse` agree on every stage, each at the head of a pipeline.
+        let mut all = fused_specs();
+        all.extend([
+            doc! {"$sort": {"a": 1}},
+            doc! {"$sample": {"size": 1}},
+            doc! {"$bucketAuto": {"groupBy": "$a", "buckets": 2}},
+            doc! {"$facet": {"x": []}},
+            doc! {"$match": {}},
+            doc! {"$limit": 1},
+        ]);
+        for spec in all {
+            let stages = parsed(std::slice::from_ref(&spec));
+            let fused = fuse(&stages, &[], &Limits::default()).is_some();
+            assert_eq!(streams_source(&stages), fused || streams(&stages[0]), "{spec}");
+        }
+        assert!(!streams_source(&[]));
+    }
+
+    #[test]
+    fn a_count_holds_a_counter_and_charges_nothing_however_many_documents_reach_it() {
+        let limits = Limits { buffer: BufferBudget::new(0), ..Limits::default() };
+        let stages = parsed(&[doc! {"$count": "n"}]);
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        for doc in grouped(300, 200) {
+            assert_eq!(chain.push(doc).unwrap(), Flow::More);
+            assert_eq!(limits.buffer.used(), 0);
+        }
+        assert_eq!(chain.finish().unwrap(), [doc! {"n": 300}]);
+    }
+
+    #[test]
+    fn the_state_of_a_group_is_charged_as_it_grows_and_given_back_when_it_finishes() {
+        let limits = Limits { buffer: BufferBudget::new(usize::MAX / 2), ..Limits::default() };
+        let stages = parsed(&[doc! {"$group": {"_id": "$g", "p": {"$push": "$pad"}}}]);
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        let mut seen = Vec::new();
+        for doc in grouped(9, 400) {
+            let _ = chain.push(doc).unwrap();
+            seen.push(limits.buffer.used());
+        }
+        // Each new bucket and each value kept is charged, and nothing held from the input: the
+        // charge grows with the buckets and the padding they keep, a document at a time.
+        assert!(seen[0] > 400, "the first bucket and its value: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[1] > w[0] + 400), "{seen:?}");
+        assert!(seen[8] < 9 * held_docs_bytes(&grouped(1, 400)), "the input is not held: {seen:?}");
+        let out = chain.finish().unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(limits.buffer.used(), 0, "given back at the finish");
+    }
+
+    #[test]
+    fn the_state_of_a_stage_is_refused_at_the_byte_past_the_limit_and_named() {
+        let specs = [
+            fused_specs().remove(1),
+            fused_specs().remove(2),
+            // A bucket for each document.
+            doc! {"$sortByCount": "$_id"},
+        ];
+        for spec in specs {
+            let stage = parsed(std::slice::from_ref(&spec)).remove(0);
+            let name = state_of(stage.name());
+            // Room for a few documents' padding: refused where the buckets pass it.
+            let cap = 5 * held_docs_bytes(&grouped(1, 400));
+            let limits = Limits { buffer: BufferBudget::new(cap), ..Limits::default() };
+            let stages = [stage];
+            let mut chain = build(&stages, &unused, &limits, &[]);
+            let mut pushed = 0;
+            let err = grouped(200, 400)
+                .into_iter()
+                .find_map(|doc| {
+                    pushed += 1;
+                    chain.push(doc).err()
+                })
+                .unwrap_or_else(|| panic!("{spec}: never refused"));
+            let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+            assert_eq!((*what, *max), (name, cap), "{spec}");
+            assert!(*bytes > cap && *bytes < 2 * cap, "{spec}: refused at {bytes} of {cap}");
+            assert!(pushed < 20, "{spec}: refused after {pushed}, not after the whole stream");
+            drop(chain);
+            assert_eq!(limits.buffer.used(), 0, "{spec}: gives everything back when refused");
+        }
+    }
+
+    #[test]
+    fn the_buckets_of_a_group_are_held_to_the_pipeline_limit_and_its_input_is_not() {
+        // Two thousand documents of two keys through a limit of ten documents: answered.
+        let limits = Limits { max_documents: 10, ..Limits::default() };
+        let stages = parsed(&[doc! {"$group": {"_id": {"$mod": ["$_id", 2]}, "n": {"$sum": 1}}}]);
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        for id in 0..2000 {
+            assert_eq!(chain.push(doc! {"_id": id}).unwrap(), Flow::More);
+        }
+        assert_eq!(chain.finish().unwrap().len(), 2);
+        // The eleventh bucket is refused, naming the stage that made it.
+        let stages = parsed(&[doc! {"$group": {"_id": "$_id"}}]);
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        for id in 0..10 {
+            let _ = chain.push(doc! {"_id": id}).unwrap();
+        }
+        let err = chain.push(doc! {"_id": 10}).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid query: $group produced 11 documents, over the pipeline limit of 10. Narrow \
+             the pipeline with an earlier $match"
+        );
+    }
+
+    #[test]
+    fn a_vec_pushed_whole_to_a_stage_that_holds_a_state_is_charged_and_given_back_as_it_is_taken() {
+        let input = grouped(20, 200);
+        let held_in = held_docs_bytes(&input);
+        for spec in fused_specs() {
+            let stages = parsed(std::slice::from_ref(&spec));
+            let name = input_of(stages[0].name());
+            // The input and the buckets it makes do not fit together (a `$group` that keeps the
+            // padding holds as much as it was given), but the input given back as it is taken
+            // leaves room for them.
+            let room = held_in + held_in / 10;
+            let limits = Limits { buffer: BufferBudget::new(room), ..Limits::default() };
+            let mut chain = build(&stages, &unused, &limits, &[]);
+            let pushed = chain.push_all(input.clone());
+            assert!(pushed.is_ok(), "{spec}: {pushed:?}");
+            drop(chain);
+            assert_eq!(limits.buffer.used(), 0, "{spec}");
+            let limits = Limits { buffer: BufferBudget::new(held_in - 1), ..Limits::default() };
+            let err = build(&stages, &unused, &limits, &[]).push_all(input.clone()).unwrap_err();
+            assert!(
+                matches!(&err, Error::ValueTooLarge { what, bytes, .. }
+                    if *what == name && *bytes == held_in),
+                "{spec}: {err:?}"
+            );
+            assert_eq!(limits.buffer.used(), 0, "{spec}");
+        }
+    }
+
+    #[test]
+    fn a_stage_that_holds_a_state_ticks_the_deadline_for_each_document() {
+        for spec in fused_specs() {
+            let stages = parsed(std::slice::from_ref(&spec));
+            let limits = Limits::default();
+            let (_, looks) = crate::deadline::looks_of(|| {
+                let mut chain = build(&stages, &unused, &limits, &[]);
+                for doc in grouped(1000, 1) {
+                    let _ = chain.push(doc).unwrap();
+                }
+            });
+            // A group looks again for each accumulator, so it is not exactly one a document.
+            assert!(looks >= 1000, "{spec}: {looks} looks for 1,000 documents");
+            if stages[0].name() == "$count" {
+                assert_eq!(looks, 1000);
+            }
+        }
     }
 }

@@ -2593,7 +2593,7 @@ fn scan_pipeline(
     // earlier of two scopes holds, and both are the request's, so they are the one instant.
     let _deadline = crate::limits::deadline_scope();
 
-    let (docs, stats) = if stages.first().is_some_and(pipeline::streams) {
+    let (docs, stats) = if pipeline::streams_source(stages) {
         let run = |stage: &aggregate::Stage, docs, arrived| {
             run_stage(state, auth, db, stage, docs, arrived, limits, &[])
         };
@@ -4258,18 +4258,20 @@ mod tests {
         let limits = aggregate::Limits { max_documents: 10, ..Default::default() };
         let auth = superuser();
 
-        let whole = json!([{ "$count": "c" }]);
+        // A `$sort` first needs the source whole (a `$count` first would stream it).
+        let whole = json!([{ "$sort": { "n": 1 } }, { "$count": "c" }]);
         let err = agg_limits(&state, &auth, "app", "docs", &whole, limits.clone())
             .expect_err("the whole collection is over the ceiling");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
 
-        let narrowed = json!([{ "$match": { "n": 3 } }, { "$count": "c" }]);
+        let narrowed =
+            json!([{ "$match": { "n": 3 } }, { "$sort": { "n": 1 } }, { "$count": "c" }]);
         let out = agg_limits(&state, &auth, "app", "docs", &narrowed, limits.clone()).unwrap();
         assert_eq!(out["documents"][0]["c"], 6);
 
         // A leading `$match` that admits too many is refused too, and the
         // refusal names it rather than the collection.
-        let wide = json!([{ "$match": { "n": { "$gte": 0 } } }, { "$count": "c" }]);
+        let wide = json!([{ "$match": { "n": { "$gte": 0 } } }, { "$sort": { "n": 1 } }, { "$count": "c" }]);
         let err = agg_limits(&state, &auth, "app", "docs", &wide, limits)
             .expect_err("the match admits thirty");
         assert!(format!("{err:?}").contains("leading $match"), "{err:?}");

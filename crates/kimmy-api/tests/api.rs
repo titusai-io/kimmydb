@@ -20696,7 +20696,11 @@ async fn zmem_collection(server: &Server, token: &str, n: i64) {
 }
 
 /// The reviewer's pipeline: every document is given a string of `1024 * 2^steps` bytes, then
-/// `$count` makes the answer tiny, so what is measured is the pipeline alone.
+/// a `$group` keeps each one (a bucket for each `_id`, holding its string) and `$count` makes
+/// the answer tiny, so what is measured is the pipeline alone. It was `$addFields` then
+/// `$count`, until `$count` held a counter and not its input (ADR-270): that pipeline is
+/// answered in constant memory (`a_count_over_documents_it_cannot_hold_is_answered...`), so
+/// the guard is aimed at a stage that still has to hold what it is given.
 fn z1_pipeline(steps: i64) -> Value {
     json!({ "pipeline": [
         { "$addFields": { "big": { "$reduce": {
@@ -20704,6 +20708,7 @@ fn z1_pipeline(steps: i64) -> Value {
             "initialValue": "x".repeat(1024),
             "in": { "$concat": ["$$value", "$$value"] },
         } } } },
+        { "$group": { "_id": "$_id", "kept": { "$push": "$big" } } },
         { "$count": "n" },
     ] })
 }
@@ -20730,9 +20735,9 @@ async fn an_aggregation_over_its_memory_limit_is_a_413_at_a_bounded_size() {
     assert_eq!(refused.body["retry"], "no", "{:?}", refused.body);
     let message = refused.body["message"].as_str().unwrap();
     // It names what held the memory, the limit, and what to do. `$addFields` streams and
-    // holds one document; the `$count` it feeds is charged as the documents reach it, and is
-    // what is full (ADR-270).
-    assert!(message.contains("the input of $count is "), "{message}");
+    // holds one document; the `$group` it feeds is charged for the buckets it builds as the
+    // documents reach it, and is what is full (ADR-270).
+    assert!(message.contains("the buckets of $group is "), "{message}");
     assert!(message.contains("limit of 8388608 bytes"), "{message}");
     assert!(message.contains("a leading $match narrows what is read"), "{message}");
     assert!(message.contains("$project, $limit or $match after it reduce"), "{message}");
@@ -20749,6 +20754,34 @@ async fn an_aggregation_over_its_memory_limit_is_a_413_at_a_bounded_size() {
     let pool = server.state.aggregate_memory().pool();
     assert_eq!(pool.used(), 0, "every request returns what it reserved");
     assert_eq!((pool.limit_refusals(), pool.pool_refusals()), (1, 0));
+}
+
+#[tokio::test]
+async fn a_count_over_documents_it_cannot_hold_is_answered_in_constant_memory() {
+    // The pipeline Z1 was first aimed at: forty strings of 1 MiB, then `$count`. It held the
+    // whole input and was refused at the limit; the counter holds nothing, so it is answered
+    // under a limit of 64 KiB, which one of the strings is sixteen times over.
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(64 << 10, 64 << 20));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 40).await;
+    let big = json!({ "$addFields": { "big": { "$reduce": {
+        "input": { "$range": [0, 10] },
+        "initialValue": "x".repeat(1024),
+        "in": { "$concat": ["$$value", "$$value"] },
+    } } } });
+    let pipeline = json!({ "pipeline": [big.clone(), { "$count": "n" }] });
+    let ok = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), pipeline).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    assert_eq!(ok.body["documents"], json!([{ "n": 40 }]));
+    // Nothing was refused and nothing is held afterwards. A stage that keeps what it is given
+    // is still refused at the same limit.
+    let pool = server.state.aggregate_memory().pool();
+    assert_eq!((pool.used(), pool.limit_refusals(), pool.pool_refusals()), (0, 0, 0));
+    let sorted = json!({ "pipeline": [big, { "$sort": { "_id": -1 } }, { "$count": "n" }] });
+    let refused = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), sorted).await;
+    assert_eq!(refused.status, 413, "{:?}", refused.body);
+    assert!(refused.body["message"].as_str().unwrap().contains("the input of $sort is "));
 }
 
 /// A collection `name` of `n` documents `{_id, m: i % 3, k: i % 3, pad}` with `pad` bytes of
@@ -20895,10 +20928,11 @@ async fn the_hits_of_a_vector_search_are_not_held_beside_the_answer_of_a_stage_t
 #[tokio::test]
 async fn documents_of_many_small_fields_are_charged_at_what_they_cost_parsed() {
     // The review's B2, scaled down: 60 documents of 400 integer fields are 234 KB of BSON and
-    // about 5.5 MB once parsed. Under an explicit limit of 2 MiB a `$count` over them is refused
-    // at the source read, a few documents past the limit (each is charged about 92 KB), where
-    // the BSON bytes would have let all sixty through; and the same limit holds 40 times as many
-    // documents of one short field.
+    // about 5.5 MB once parsed. Under an explicit limit of 2 MiB a `$sort` and a `$count` over
+    // them are refused at the source read, a few documents past the limit (each is charged about
+    // 92 KB), where the BSON bytes would have let all sixty through; and the same limit holds 40
+    // times as many documents of one short field. (A `$count` alone holds a counter and not the
+    // source, and is answered over the sixty: ADR-270.)
     let server = Server::start().await;
     server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(2 << 20, 64 << 20));
     let token = server.root().await;
@@ -20923,7 +20957,7 @@ async fn documents_of_many_small_fields_are_charged_at_what_they_cost_parsed() {
             server.post(&format!("/v1/db/kx/coll/{name}/bulk"), Some(&token), json!(docs)).await;
         assert_eq!(res.status, 200, "{:?}", res.body);
     }
-    let count = json!({ "pipeline": [{ "$count": "n" }] });
+    let count = json!({ "pipeline": [{ "$sort": { "_id": 1 } }, { "$count": "n" }] });
     let refused = server.post("/v1/db/kx/coll/wide/aggregate", Some(&token), count.clone()).await;
     assert_eq!(refused.status, 413, "{:?}", refused.body);
     let message = refused.body["message"].as_str().unwrap();

@@ -2,16 +2,17 @@
 //!
 //! `$replaceWith` is `$replaceRoot` under another name and `$unionWith` is run by the
 //! caller (it reads a second collection), so both live in [`crate::aggregate`]. What is
-//! here is the parsing of the other four and the code that runs them.
+//! here is the parsing of the other four and the code that runs the last three (`$sortByCount`
+//! runs on [`crate::aggregate::GroupState`], with `$group`).
 
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result};
 
-use crate::aggregate::{Accumulator, Limits, Stage, as_document, group_keyed};
+use crate::aggregate::{Limits, Stage, as_document};
 use crate::budget::Lease;
 use crate::deadline::{self, Ticker};
 use crate::expr::{Binding, Expr, REDACT_DESCEND, REDACT_KEEP, REDACT_PRUNE, Scope, type_name};
-use crate::shape::{self, SortKey};
+use crate::shape;
 
 // ---------------------------------------------------------------------------
 // $sortByCount
@@ -37,27 +38,6 @@ pub(crate) fn parse_sort_by_count(value: &Bson, vars: &[String]) -> Result<Stage
         _ => return Err(refused("specified as a string or as an object")),
     }
     Ok(Stage::SortByCount(Expr::parse_with_vars(value, vars)?))
-}
-
-/// Run `$sortByCount`: `{$group: {_id: <expr>, count: {$sum: 1}}}` then
-/// `{$sort: {count: -1}}`. The groups come out in the order their keys were first seen
-/// and the sort is stable, so groups with the same count stay in that order (the
-/// reference leaves it unspecified). The `count` is `$group`'s own `{$sum: 1}`: an int,
-/// widening to a long past 2^31-1, as the reference's is (ADR-268).
-pub(crate) fn sort_by_count(
-    input: Vec<Document>,
-    expr: &Expr,
-    limits: &Limits,
-    vars: &[Binding<'_>],
-    held: &mut Lease,
-) -> Result<Vec<Document>> {
-    let fields = [("count".to_string(), Accumulator::Sum(Expr::Literal(Bson::Int32(1))))];
-    let groups = group_keyed("$sortByCount", input, &fields, limits, vars, held, |scope| {
-        expr.eval_in(scope).map(Some)
-    })?;
-    let groups =
-        shape::sort_until_deadline(&[SortKey { path: "count".into(), descending: true }], groups)?;
-    Ok(groups)
 }
 
 // ---------------------------------------------------------------------------
