@@ -527,3 +527,34 @@ fn a_descent_of_single_element_unwinds_is_answered_within_the_budget_the_loop_ne
     assert_eq!(ok["count"], 1);
     assert_eq!(limits.buffer.used(), 0);
 }
+
+#[test]
+fn the_keys_of_an_index_range_are_charged_for_a_pipeline_that_begins_with_a_stage_that_blocks() {
+    // The source of a pipeline that begins with a stage that blocks is read whole, with its
+    // ceiling and its `400` as they were; the keys the range holds to deliver it in `_id` order
+    // are charged to a lease of their own, and refused `413` past the budget.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500);
+    let pipeline = json!([{"$match": {"t": {"$gte": 0}}}, {"$sort": {"_id": -1}}, {"$limit": 1}]);
+    let limits = capped(key_bytes(100));
+    let err = run(&state, pipeline.clone(), limits.clone()).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert!(err.message.contains("the index range of $match is "), "{}", err.message);
+    assert_eq!(limits.buffer.used(), 0);
+    // Room for the keys and the documents, and it answers; the keys are given back.
+    let limits = capped(10_000_000);
+    assert_eq!(ids(&run(&state, pipeline, limits.clone()).unwrap()), [1_499]);
+    assert_eq!(limits.buffer.used(), 0);
+    // The ceiling and its text are as they were.
+    let err = run(
+        &state,
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$sort": {"_id": 1}}]),
+        with_ceiling(1_000),
+    )
+    .unwrap_err();
+    assert!(
+        err.message.contains("the leading $match admits more than 1000 documents"),
+        "{}",
+        err.message
+    );
+}

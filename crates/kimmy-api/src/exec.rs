@@ -2636,12 +2636,18 @@ fn scan_pipeline(
         // is charged as it is read, and the read ends at the one that passes the limit.
         let mut docs = Vec::new();
         let mut read = limits.buffer.lease("the source read");
-        let stats = visit_matching_until(
+        // The keys an inexact index range holds to deliver its documents in `_id` order are
+        // charged too: the `want` of one past the ceiling sizes the first pass, but a filter
+        // that rejects most candidates goes on to passes that double, up to the range.
+        let keys = IndexKeys::new(limits.buffer.lease("the index range of $match"));
+        let ceiling = Some(limits.max_documents + 1);
+        let bounds = ScanBounds { stop_after: ceiling, want: ceiling, hold: Some(&keys) };
+        let stats = visit_matching_bounded(
             state,
             meta,
             filter,
             Order::ById { after: None },
-            Some(limits.max_documents + 1),
+            bounds,
             |_, doc| {
                 read.charge_doc(&doc)?;
                 docs.push(doc);
