@@ -2641,7 +2641,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.58.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.59.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2661,7 +2661,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.58.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.59.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2687,7 +2687,7 @@ and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 ## Upgrades
 
 KimmyDB runs one version in a cluster, and an upgrade that changes data wipes the
-data. The on-disk **storage schema** is checked on open, and 0.58.0 opens only
+data. The on-disk **storage schema** is checked on open, and 0.58.0 and later open only
 schema **7**:
 
 | Stored version | Behaviour |
@@ -2740,6 +2740,17 @@ writes nothing to them: wipe first.** There is no migration code.
 A backup 0.57.0 wrote carries the old entries too, and `kimmyd restore` refuses it
 by the same rule; reseed instead. **Rolling back:** stop every member, then start 0.57.x on the
 data directories moved aside at the upgrade.
+
+**Upgrading from 0.58.x to 0.59.0: stop all, start all. No wipe.** The storage
+schema is still 7 and the cluster protocol still 2, so 0.59.0 opens a 0.58.0
+store and backup as they are. Run one release: stop every member, then start
+them all on 0.59.0. Two settings are new and derived from the memory a member runs
+under, `aggregate.memory_limit_bytes` and `aggregate.memory_pool_bytes` (see the
+settings table): check the startup line `aggregate memory: pool … per-request
+limit …` on each member, and raise them if a pipeline you run holds more.
+`server.request_timeout_secs` (30 s by default) now also ends a running query:
+raise it if one legitimately takes longer. **Rolling back:** stop every member,
+then start 0.58.0 on the same data directories.
 
 ### Rolling back, and `kimmy.format`
 
