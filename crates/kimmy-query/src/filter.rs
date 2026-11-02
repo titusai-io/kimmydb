@@ -47,6 +47,13 @@ pub enum Filter {
     /// Like `$expr` it is a clause on the whole document, and the planner
     /// never reads it: a schema names no key range an index could answer.
     JsonSchema(Schema),
+    /// `{$sampleRate: <rate>}` — matches a document when a draw from `[0, 1)` is below the
+    /// rate, so about that share of the documents it is tried on, a different share each time.
+    ///
+    /// A clause on the whole document at the top level of a filter only (not in an
+    /// `$elemMatch`, under a field or in an `arrayFilters` entry), as in the reference. The
+    /// planner never reads it. The draw is [`expr::random_draw`], the source `$rand` reads.
+    SampleRate(f64),
 }
 
 /// The clauses of an `$and` or `$or`, in the order they are evaluated, and
@@ -206,10 +213,13 @@ struct Scope<'a> {
     /// names are a `$lookup` sub-pipeline's `let` variables, which an expression
     /// reads beside the document.
     element: bool,
+    /// The filter is the body of an `$elemMatch`, or a clause under one: not the top level of
+    /// a document's filter, where `$sampleRate` may stand.
+    nested: bool,
 }
 
 impl Scope<'_> {
-    const NONE: Scope<'static> = Scope { vars: &[], element: false };
+    const NONE: Scope<'static> = Scope { vars: &[], element: false, nested: false };
 }
 
 /// [`parse`] for a `$match` in a `$lookup` sub-pipeline: the names in `vars` are the
@@ -218,7 +228,7 @@ impl Scope<'_> {
 /// beside the document's fields. A bare `"$$name"` string value is still a string
 /// here; the pipeline parser refuses it before this runs.
 pub fn parse_in_scope(doc: &Document, vars: &[String]) -> Result<Filter> {
-    parse_scoped(doc, Scope { vars, element: false })
+    parse_scoped(doc, Scope { vars, element: false, nested: false })
 }
 
 /// [`parse`] for an `arrayFilters` entry (ADR-209): the element is bound to
@@ -230,7 +240,7 @@ pub fn parse_in_scope(doc: &Document, vars: &[String]) -> Result<Filter> {
 /// document (a field, `$$ROOT`, `$$CURRENT`) is refused there, so that the
 /// element has one spelling.
 pub fn parse_with_vars(doc: &Document, vars: &[String]) -> Result<Filter> {
-    parse_scoped(doc, Scope { vars, element: true })
+    parse_scoped(doc, Scope { vars, element: true, nested: false })
 }
 
 fn parse_scoped(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
@@ -317,6 +327,20 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
             Filter::Expr(Box::new(expr))
         }
         "jsonSchema" => Filter::JsonSchema(Schema::parse(value)?),
+        "sampleRate" => {
+            if scope.element {
+                return Err(Error::InvalidQuery(
+                    "Cannot use an expression without a top-level field name in arrayFilters"
+                        .into(),
+                ));
+            }
+            if scope.nested {
+                return Err(Error::InvalidQuery(
+                    "$sampleRate can only be applied to the top-level document".into(),
+                ));
+            }
+            Filter::SampleRate(sample_rate(value)?)
+        }
         // `$not` is only meaningful applied to a field's operators; at the top
         // level Mongo rejects it too, and the clearer error is worth it.
         "not" => {
@@ -328,6 +352,20 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
             return Err(Error::UnsupportedOperator { operator: format!("${other}"), reason: None });
         }
     })
+}
+
+/// The rate of `$sampleRate`: a number from 0 to 1, a `Decimal128` as its nearest double.
+fn sample_rate(value: &Bson) -> Result<f64> {
+    let Some(rate) = crate::accumulators::numeric(value) else {
+        return Err(Error::InvalidQuery("argument to $sampleRate must be a numeric type".into()));
+    };
+    // A NaN is in no range.
+    if !(0.0..=1.0).contains(&rate) {
+        return Err(Error::InvalidQuery(
+            "numeric argument to $sampleRate must be in [0, 1]".into(),
+        ));
+    }
+    Ok(rate)
 }
 
 /// Decide whether a field's value is an operator document or a literal.
@@ -394,7 +432,8 @@ fn parse_conditions(path: &str, value: &Bson, scope: Scope<'_>) -> Result<Vec<Co
 /// fields of one element. MongoDB refuses `$expr` under `$elemMatch` outright;
 /// accepting it here is a strict superset, noted in `docs/deviations.md`.
 fn parse_elem_match(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
-    const DOCUMENT_LEVEL: [&str; 5] = ["$and", "$or", "$nor", "$expr", "$jsonSchema"];
+    const DOCUMENT_LEVEL: [&str; 6] =
+        ["$and", "$or", "$nor", "$expr", "$jsonSchema", "$sampleRate"];
     let scalar_form = !doc.is_empty()
         && doc.keys().all(|k| k.starts_with('$') && !DOCUMENT_LEVEL.contains(&k.as_str()));
 
@@ -406,7 +445,7 @@ fn parse_elem_match(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
             conditions: parse_conditions("", &Bson::Document(doc.clone()), scope)?,
         });
     }
-    parse_scoped(doc, scope)
+    parse_scoped(doc, Scope { nested: true, ..scope })
 }
 
 fn parse_condition(
@@ -916,7 +955,11 @@ pub fn matches_at(filter: &Filter, doc: &Document) -> Result<(bool, Option<Array
 
 fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPosition>) -> Result<()> {
     match filter {
-        Filter::AlwaysTrue | Filter::Nor(_) | Filter::Expr(_) | Filter::JsonSchema(_) => {}
+        Filter::AlwaysTrue
+        | Filter::Nor(_)
+        | Filter::Expr(_)
+        | Filter::JsonSchema(_)
+        | Filter::SampleRate(_) => {}
         Filter::And(branches) => {
             for branch in branches.in_written_order() {
                 record_position(branch, doc, at)?;
@@ -1106,7 +1149,7 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
         Filter::Nor(branches) => branches.iter().any(|f| reads_variable(f, names)),
         Filter::Field { conditions, .. } => conditions.iter().any(|c| condition(c, names)),
         Filter::Expr(e) => e.reads_variable(names),
-        Filter::JsonSchema(_) => false,
+        Filter::JsonSchema(_) | Filter::SampleRate(_) => false,
     }
 }
 
@@ -1118,7 +1161,7 @@ fn filter_has_expr(filter: &Filter) -> bool {
         Filter::Nor(branches) => branches.iter().any(filter_has_expr),
         Filter::Field { conditions, .. } => conditions.iter().any(condition_has_expr),
         Filter::Expr(_) => true,
-        Filter::JsonSchema(_) => false,
+        Filter::JsonSchema(_) | Filter::SampleRate(_) => false,
     }
 }
 
@@ -1149,6 +1192,7 @@ fn evaluate(filter: &Filter, doc: &Document, vars: &[expr::Binding<'_>]) -> Resu
         }
         Filter::Expr(e) => expr_matches(e, doc, vars),
         Filter::JsonSchema(schema) => Ok(schema.is_valid(doc)),
+        Filter::SampleRate(rate) => Ok(expr::random_draw() < *rate),
     }
 }
 
@@ -1373,6 +1417,8 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
         Filter::JsonSchema(schema) => {
             Ok(matches!(element, Bson::Document(d) if schema.is_valid(d)))
         }
+        // Refused when an `arrayFilters` entry is parsed, so never reached.
+        Filter::SampleRate(_) => Ok(false),
     }
 }
 
@@ -1448,6 +1494,8 @@ fn matches_scalar_against(
         Filter::Expr(_) => Ok(false),
         // A scalar is not a document, which is all a schema describes.
         Filter::JsonSchema(_) => Ok(false),
+        // Refused inside an `$elemMatch` when the filter is parsed, so never reached.
+        Filter::SampleRate(_) => Ok(false),
     }
 }
 

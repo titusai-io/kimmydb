@@ -20591,6 +20591,142 @@ async fn now_in_a_pipeline_update_is_one_date_for_the_request() {
     }
 }
 
+/// `$rand` in a pipeline update is drawn once, for each document, on the member that accepts the
+/// write, and the number is stored: it is a value of the document like any other. It is not
+/// drawn again when the document is read (a `find` or an aggregation reads the stored number),
+/// when the same update's other fields are rewritten, or when the write is replicated, since
+/// the oplog entry that replicates it carries the document that resulted (the post-image),
+/// which is how `$$NOW` is replicated too.
+#[tokio::test]
+async fn rand_in_a_pipeline_update_is_stored_as_a_fixed_value() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, (1..=5).map(|i| json!({ "_id": i })).collect()).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "r": { "$rand": {} } } }], "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 5);
+    let stored: Vec<f64> = {
+        let mut out = Vec::new();
+        for i in 1..=5 {
+            out.push(pu_doc(&server, &token, i).await["r"].as_f64().expect("a number"));
+        }
+        out
+    };
+    assert!(stored.iter().all(|r| (0.0..1.0).contains(r)), "{stored:?}");
+    // One draw for each document, not one for the request.
+    let mut distinct = stored.clone();
+    distinct.sort_by(f64::total_cmp);
+    distinct.dedup();
+    assert_eq!(distinct.len(), 5, "{stored:?}");
+    // Reading again, by `find` and by an aggregation, answers the stored numbers.
+    for i in 1..=5usize {
+        assert_eq!(pu_doc(&server, &token, i as i64).await["r"].as_f64(), Some(stored[i - 1]));
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$sort": { "_id": 1 } }, { "$project": { "_id": 0, "r": 1 } }] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let read: Vec<f64> = res.body["documents"]
+        .as_array()
+        .expect("documents")
+        .iter()
+        .map(|d| d["r"].as_f64().unwrap())
+        .collect();
+    assert_eq!(read, stored);
+    // A later update that does not name the field leaves it alone.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "n": 1 } }], "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    for i in 1..=5usize {
+        assert_eq!(pu_doc(&server, &token, i as i64).await["r"].as_f64(), Some(stored[i - 1]));
+    }
+    // What replicates is the post-image: the newest oplog entry of each document holds
+    // exactly the stored number.
+    let entries = server
+        .state
+        .engine
+        .read_oplog_from(kimmy_core::Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+        .expect("reading the oplog");
+    let mut seen = 0;
+    for entry in &entries {
+        let Some(doc) = entry.document().expect("a body") else { continue };
+        let (Ok(id), Ok(r)) = (doc.get_i32("_id"), doc.get_f64("r")) else { continue };
+        assert_eq!(r, stored[id as usize - 1], "the oplog holds the stored draw of {id}");
+        seen += 1;
+    }
+    // The first update and the second each wrote all five.
+    assert_eq!(seen, 10);
+}
+
+/// `$sampleRate` is a clause of a document filter wherever one is accepted: a rate of 0 matches
+/// nothing and a rate of 1 everything, in a find, an update and an aggregation, and a rate out
+/// of range is a `400`.
+#[tokio::test]
+async fn sample_rate_is_a_filter_clause_of_find_update_and_aggregate() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, (1..=5).map(|i| json!({ "_id": i, "g": i % 2 })).collect())
+        .await;
+    let find = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server.post("/v1/db/shop/coll/pu/find", Some(token), json!({ "filter": filter })).await
+        }
+    };
+    let res = find(json!({ "$sampleRate": 1 })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"].as_array().expect("documents").len(), 5);
+    let res = find(json!({ "$sampleRate": 0 })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(res.body["documents"].as_array().expect("documents").is_empty());
+    let res = find(json!({ "$sampleRate": 1, "g": 1 })).await;
+    assert_eq!(res.body["documents"].as_array().expect("documents").len(), 3);
+    for bad in [json!(1.5), json!(-0.5), json!("a"), json!(null)] {
+        let res = find(json!({ "$sampleRate": bad })).await;
+        assert_eq!(res.status, 400, "{bad}: {:?}", res.body);
+    }
+    let update = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/pu/update",
+                    Some(token),
+                    json!({ "filter": filter, "update": { "$set": { "hit": true } }, "multi": true }),
+                )
+                .await
+        }
+    };
+    let res = update(json!({ "$sampleRate": 0 })).await;
+    assert_eq!((res.status, &res.body["matched"]), (200, &json!(0)), "{:?}", res.body);
+    let res = update(json!({ "$sampleRate": 1 })).await;
+    assert_eq!((res.status, &res.body["matched"]), (200, &json!(5)), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$match": { "$sampleRate": 1 } }, { "$count": "n" }] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["n"], 5);
+}
+
 #[tokio::test]
 async fn a_pipeline_update_judges_id_on_the_final_result_and_takes_an_empty_pipeline() {
     // Reference 6.0.5: a result without `_id` gets the stored one back; a changed one is

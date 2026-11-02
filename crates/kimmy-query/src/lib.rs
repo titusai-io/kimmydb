@@ -63,6 +63,8 @@ mod math_tests;
 #[cfg(test)]
 mod positional_tests;
 #[cfg(test)]
+mod random_tests;
+#[cfg(test)]
 mod sink_tests;
 #[cfg(test)]
 mod sort_zip_tests;

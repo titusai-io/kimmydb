@@ -72,7 +72,7 @@ mod arrayacc;
 mod dates;
 mod docops;
 mod math;
-mod random;
+pub(crate) mod random;
 pub(crate) mod sizes;
 mod strings;
 mod trig;
@@ -87,6 +87,7 @@ pub(crate) use sizes::{
 };
 
 pub(crate) use docops::{merge_budget, merge_into};
+pub(crate) use random::unit as random_draw;
 
 use std::cmp::Ordering;
 
