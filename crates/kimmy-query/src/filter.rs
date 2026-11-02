@@ -995,7 +995,7 @@ fn condition_position(
     Ok(None)
 }
 
-/// Whether one element of the array, with `rest' of the path below it, makes
+/// Whether one element of the array, with `rest` of the path below it, makes
 /// `condition` hold, as the matcher decides it.
 ///
 /// With `rest` empty the matcher applies a condition to the array's value and

@@ -368,6 +368,35 @@ fn a_waiting_request_is_ended_by_the_deadline_scope_it_runs_under() {
 }
 
 #[test]
+fn a_wait_that_reaches_the_request_deadline_is_the_deadlines_answer_not_the_pools() {
+    // `AggregateMemory::limits` sets the budget's own bound to the request's deadline, so the
+    // two coincide: the bound is the deadline's, and must not be tested first.
+    for lead in [Duration::from_millis(100), Duration::ZERO] {
+        let pool = MemoryPool::new(100);
+        let (budget, mut older) = holder(&pool, 10);
+        let (_a, younger) = holder(&pool, 80);
+        let end = Instant::now() + lead;
+        budget.wait_until(end);
+        let scope = kimmy_core::deadline::Deadline::scope(Some(lead));
+        let err = older.charge(50).unwrap_err();
+        drop(scope);
+        assert!(matches!(err, Error::DeadlineExceeded), "lead {lead:?}: {err:?}");
+        assert_eq!(pool.pool_refusals(), 0, "the deadline is not a refusal of the pool");
+        drop(older);
+        drop(budget);
+        drop(younger);
+        assert_eq!((pool.used(), pool.holders()), (0, 0));
+    }
+    // The bound of the budget with no deadline in scope is still the pool's own refusal.
+    let pool = MemoryPool::new(100);
+    let (budget, mut older) = holder(&pool, 10);
+    budget.wait_until(Instant::now() + Duration::from_millis(60));
+    let (_a, _younger) = holder(&pool, 80);
+    assert!(is_busy(&older.charge(50).unwrap_err()));
+    assert_eq!(pool.pool_refusals(), 1);
+}
+
+#[test]
 fn a_request_that_alone_would_pass_the_whole_pool_is_refused_at_once() {
     let pool = MemoryPool::new(100);
     let budget = BufferBudget::pooled(1_000, &pool);
