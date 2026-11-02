@@ -42,7 +42,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - A `$group`, `$bucket`, `$bucketAuto` or `$sortByCount` output document is held to 16 MiB as a whole, `413 answer_too_large` naming the document: two `$push` accumulators of 15 MiB each, which were each within the bound, made a 30 MiB document ([ADR-269](docs/decisions.md#adr-269--one-memory-budget-for-an-aggregation-and-a-pool-for-the-node)).
 - A `$fill`, `$setWindowFields`, `$lookup` or `$graphLookup` document is held to 16 MiB as a whole as well, `413 answer_too_large` (`the document the stage builds`), as `$addFields` already refused it: two 10 MB values added to one document answered 20,000,030 bytes before.
 - **An aggregate answer counts against the pool until its last byte has been taken by the connection, and is written once.** The response body is handed to the server in 64 KiB slices of one buffer, with the pool's bytes held until the last is taken (a body yielded whole was taken at once, so a client that read nothing left a big answer uncounted), and the answer is serialised straight into the body, counted as it is written, where it was serialised twice.
-- A regular expression written as a field's value (`{"s": /ab/}`) or given as `$regex` also matches a stored regular-expression value of the same pattern and flags, as the reference does; it matched strings only.
+- A regular expression written as a field's value (`{"s": /ab/}`) or given as `$regex` also matches a stored regular-expression value of the same pattern and flags (flags compared as written, so `$options: "mi"` does not match a stored `/ab/im`), as the reference does; it matched strings only.
 
 ## 0.58.0 - 2026-10-31
 

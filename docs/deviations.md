@@ -638,7 +638,7 @@ regex literal and a literal under `$not`; it used to match nothing. A
 (`{"name": /^s/}`) was an equality match against a regex value, not a pattern
 match. That changed with ADR-267: it is a pattern, as `$regex` is, and `$eq` is
 the spelling that compares the regex as a value. Like `$regex`, it also matches a stored regex of the same
-pattern and flags, as the reference's regex match does. A `partialFilterExpression` refuses a regex as a field's value at creation (it is a pattern, and the partial filter language has none, as it refuses `$regex`; `{$eq: <regex>}` is allowed), over HTTP and over MCP, which reads the same JSON; no stored definition can hold one, and a replicated or snapshot definition that does is skipped and counted (`ddl_refused`) like any definition this build refuses.
+pattern and flags (the flags compared as written, as the reference compares them), as the reference's regex match does. A `partialFilterExpression` refuses a regex as a field's value at creation (it is a pattern, and the partial filter language has none, as it refuses `$regex`; `{$eq: <regex>}` is allowed), over HTTP and over MCP, which reads the same JSON; no stored definition can hold one, and a replicated or snapshot definition that does is skipped and counted (`ddl_refused`) like any definition this build refuses.
 
 ---
 

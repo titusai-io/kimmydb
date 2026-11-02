@@ -60,7 +60,8 @@ which over HTTP is `{"s": {"$regularExpression": {"pattern": "ab", "options":
 "$options": "i"}}` does, with the same refusals (an invalid pattern, a possessive
 quantifier, a construct the engine does not have: a `400`). Like `$regex`, it matches
 the strings that match the pattern and also a stored regex value of the same pattern
-and flags (in any order), as the reference does; no other type matches. `$eq` compares a
+and flags, **compared as written** (`{"$regex": "ab", "$options": "mi"}` does not match a stored `/ab/im`,
+as in the reference, which compares the two flag strings); no other type matches. `$eq` compares a
 regex as a value, `{"s": {"$eq": /ab/}}`.
 
 ### Logical

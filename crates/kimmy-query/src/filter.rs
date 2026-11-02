@@ -1171,18 +1171,13 @@ fn type_holds(names: &[String], value: &Bson) -> bool {
 
 /// `$regex` on one value (and a regex written as a field's value, which is the same
 /// condition): a string that matches the pattern, or a stored regex value of the same
-/// pattern and flags, as the reference matches it. Any other type does not match.
+/// pattern and flags, compared as the reference compares them: the pattern text equal and the
+/// flag strings equal **as written** (`mi` is not `im`). Any other type does not match.
 fn regex_holds(re: &RegexPattern, value: &Bson) -> bool {
     match value {
         Bson::String(s) => re.is_match(s),
         Bson::RegularExpression(stored) => {
-            let flags = |text: &str| {
-                let mut chars: Vec<char> = text.chars().collect();
-                chars.sort_unstable();
-                chars
-            };
-            stored.pattern.as_str() == re.pattern()
-                && flags(stored.options.as_str()) == flags(re.options())
+            stored.pattern.as_str() == re.pattern() && stored.options.as_str() == re.options()
         }
         _ => false,
     }
@@ -1664,13 +1659,14 @@ mod tests {
         let hits =
             |query: Document, stored: Document| matches(&parse(&query).unwrap(), &stored).unwrap();
         // The pattern form and the `$regex` form are one condition; both match a string that
-        // the pattern matches and a stored regex equal to it, flags in any order.
+        // the pattern matches and a stored regex equal to it, its flags written as the query's.
         for query in
             [doc! { "s": literal("ab", "im") }, doc! { "s": { "$regex": "ab", "$options": "im" } }]
         {
             assert!(hits(query.clone(), doc! { "s": "xABx" }), "{query}");
             assert!(hits(query.clone(), doc! { "s": literal("ab", "im") }), "{query}");
-            assert!(hits(query.clone(), doc! { "s": literal("ab", "mi") }), "{query}");
+            // The flags are compared as written: `mi` is not `im`, as in the reference.
+            assert!(!hits(query.clone(), doc! { "s": literal("ab", "mi") }), "{query}");
             // Another pattern, other flags, and any other type do not match.
             assert!(!hits(query.clone(), doc! { "s": literal("abc", "im") }), "{query}");
             assert!(!hits(query.clone(), doc! { "s": literal("ab", "i") }), "{query}");
@@ -1684,6 +1680,60 @@ mod tests {
             doc! { "s": { "$not": { "$regex": "ab" } } },
             doc! { "s": literal("ab", "") }
         ));
+    }
+
+    #[test]
+    fn a_regex_against_a_stored_regex_gives_the_references_recorded_answers() {
+        // The reference's (6.0.5) answers, recorded over this collection (`q8p-ref.rec`, P2).
+        // Id 11 was written `/ab/s` and the reference's shell stored it as `/ab/`, so that is
+        // what it is here; `$in`, `$nin` and `$ne` with a regex are refused here and are not
+        // in the table (a recorded deviation).
+        let docs = vec![
+            doc! { "_id": 1, "s": "aaab" },
+            doc! { "_id": 2, "s": literal("ab", "") },
+            doc! { "_id": 3, "s": literal("ab", "i") },
+            doc! { "_id": 4, "s": literal("ab", "im") },
+            doc! { "_id": 5, "s": literal("abc", "") },
+            doc! { "_id": 6, "s": ["x", literal("ab", "")] },
+            doc! { "_id": 7, "s": "zzz" },
+            doc! { "_id": 8, "s": "xABx" },
+            doc! { "_id": 9, "s": literal("^a", "") },
+            doc! { "_id": 10, "s": 5 },
+            doc! { "_id": 11, "s": literal("ab", "") },
+        ];
+        let ids = |condition: Bson| -> Vec<i32> {
+            let filter = parse(&doc! { "s": condition }).unwrap();
+            docs.iter()
+                .filter(|d| matches(&filter, d).unwrap())
+                .map(|d| d.get_i32("_id").unwrap())
+                .collect()
+        };
+        let cases: Vec<(&str, Bson, Vec<i32>)> = vec![
+            ("literal /ab/", literal("ab", ""), vec![1, 2, 6, 11]),
+            ("literal /ab/i", literal("ab", "i"), vec![1, 3, 8]),
+            ("literal /ab/im", literal("ab", "im"), vec![1, 4, 8]),
+            (
+                "$regex ab $options im",
+                doc! { "$regex": "ab", "$options": "im" }.into(),
+                vec![1, 4, 8],
+            ),
+            // The flags as written: `mi` is not the stored `im`.
+            ("$regex ab $options mi", doc! { "$regex": "ab", "$options": "mi" }.into(), vec![1, 8]),
+            ("$regex ab", doc! { "$regex": "ab" }.into(), vec![1, 2, 6, 11]),
+            ("$regex /ab/", doc! { "$regex": literal("ab", "") }.into(), vec![1, 2, 6, 11]),
+            (
+                "$regex /ab/ with $options i",
+                doc! { "$regex": literal("ab", ""), "$options": "i" }.into(),
+                vec![1, 3, 8],
+            ),
+            ("literal /^a/", literal("^a", ""), vec![1, 9]),
+            ("$not /ab/", doc! { "$not": literal("ab", "") }.into(), vec![3, 4, 5, 7, 8, 9, 10]),
+            ("$eq /ab/", doc! { "$eq": literal("ab", "") }.into(), vec![2, 6, 11]),
+            ("$regex ab $options si", doc! { "$regex": "ab", "$options": "si" }.into(), vec![1, 8]),
+        ];
+        for (label, condition, expected) in cases {
+            assert_eq!(ids(condition), expected, "{label}");
+        }
     }
 
     fn refused(query: Document) -> String {
