@@ -141,7 +141,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 # A lock-free published value: the yield evaluator reads the peer view with one
 # atomic load and no lock a runtime task takes (ADR-213). Already in the graph
 # through axum-server, so no new crate.
@@ -249,7 +249,7 @@ arbitrary = "1"
 # JSON for the spec itself because the document is written and reviewed by
 # hand, and a hand-written JSON document of that size stops being read.
 serde_norway = "0.9"
-jsonschema = { version = "0.59", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 # Benchmarks. `html_reports` off: the numbers get recorded in docs/benchmarks.md
 # by hand, and an untracked report directory is noise in a repo.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
