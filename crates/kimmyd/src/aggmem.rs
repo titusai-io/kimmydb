@@ -234,6 +234,9 @@ mod tests {
         let memory = detect(files(&[]));
         assert_eq!(memory, Memory { bytes: 2 * GIB, origin: Origin::Assumed });
         assert!(resolve(None, None, memory).describe().contains("assumed"));
+        // A cgroup v1 file that reports no limit, with no RAM to compare it with, is no limit.
+        let memory = detect(files(&[(CGROUP_V1, "9223372036854771712\n")]));
+        assert_eq!(memory.origin, Origin::Assumed);
         // A cgroup limit alone, with no /proc/meminfo, still counts.
         let memory = detect(files(&[(CGROUP_V2, "1073741824")]));
         assert_eq!(memory.origin, Origin::Cgroup(CGROUP_V2));
