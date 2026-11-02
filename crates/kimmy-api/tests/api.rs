@@ -20840,6 +20840,59 @@ async fn every_stage_the_executor_runs_is_held_to_the_memory_limit_and_stops_at_
 }
 
 #[tokio::test]
+async fn the_hits_of_a_vector_search_are_not_held_beside_the_answer_of_a_stage_that_streams() {
+    // The hits are charged as the input of the stage that takes them, and given back as it
+    // takes each one (ADR-270). A stage that streamed and held nothing left them charged
+    // through the rest of the request, beside the answer: the least budget a `$project` of the
+    // hits answers under must not be the hits plus the answer.
+    let hits = json!({ "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 10 } });
+    // A server of its own for each limit, which a node sets once.
+    async fn answers(limit: usize, pipeline: &Value) -> bool {
+        let shop = Server::start().await;
+        shop.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(limit, 64 << 20));
+        let token = products_collection(&shop).await;
+        let res = shop
+            .post(
+                "/v1/db/shop/coll/products/aggregate",
+                Some(&token),
+                json!({ "pipeline": pipeline }),
+            )
+            .await;
+        assert_eq!(shop.state.aggregate_memory().pool().used(), 0);
+        res.status == 200
+    }
+    async fn smallest(pipeline: Value) -> usize {
+        let (mut lo, mut hi) = (100usize, 1usize << 14);
+        assert!(!answers(lo, &pipeline).await, "a hundred bytes hold no hits");
+        assert!(answers(hi, &pipeline).await);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if answers(mid, &pipeline).await {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+    // The hits alone: taken by a stage that drops them all, with no answer to hold.
+    let hits_only = smallest(json!([hits.clone(), { "$match": { "nothing": 1 } }])).await;
+    // The answer is three documents `{_id}`, which the budget counts as the documents here.
+    let answer = kimmy_query::budget::held_docs_bytes(&[
+        bson::doc! { "_id": 1 },
+        bson::doc! { "_id": 2 },
+        bson::doc! { "_id": 3 },
+    ]);
+    // The `$project` of the same hits answers in less than the hits and the answer together,
+    // which is what it needed while the hits stayed charged beside it.
+    let projected = json!([hits, { "$project": { "_id": 1 } }]);
+    assert!(
+        answers(hits_only + answer - 1, &projected).await,
+        "the hits ({hits_only}) were held beside the answer ({answer})"
+    );
+}
+
+#[tokio::test]
 async fn documents_of_many_small_fields_are_charged_at_what_they_cost_parsed() {
     // The review's B2, scaled down: 60 documents of 400 integer fields are 234 KB of BSON and
     // about 5.5 MB once parsed. Under an explicit limit of 2 MiB a `$count` over them is refused

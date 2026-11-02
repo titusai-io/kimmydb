@@ -13,7 +13,8 @@
 //! A stage that [streams](streams) (`$match`, `$project`, `$addFields`, `$replaceRoot`,
 //! `$redact`, `$unwind`, `$skip`, `$limit`) holds one document at a time. A run of them is
 //! **one** sink, [`Streaming`], that takes each document through the run's steps in a loop:
-//! the depth of a `push` is the number of barriers in the chain, not the number of stages,
+//! the depth of a `push` is constant (a run pushes to a barrier that only stores, or to the
+//! collector), whatever the number of stages,
 //! and a pipeline of a hundred thousand `$skip` stages (the body limit allows about that
 //! many) is no deeper than one. Each step is the stage's own per-document body in
 //! [`crate::aggregate`], the one [`crate::aggregate::apply`] loops over, so there is one
@@ -32,15 +33,19 @@
 //!
 //! # What a sink holds, and what it is charged (ADR-269)
 //!
-//! A streaming sink holds one document, and charges nothing that lasts. A barrier, and the
-//! collector that ends the chain, charge **as the documents arrive** one at a time: the
+//! A streaming sink holds one document, and charges nothing that lasts but what it holds
+//! beside it: the fans of `$unwind` that keep their input (the document and the elements still
+//! to come, one fan to a level, charged while the fan stands), and a `Vec` pushed whole to it,
+//! which it charges on arrival as the input of its first stage and gives back as it takes each
+//! document. A barrier, and the collector that ends the chain, charge **as the documents
+//! arrive** one at a time: the
 //! lease grows by a document's estimate when it is pushed, and a document that takes the
 //! request over its limit is refused at once, so a streamed `$addFields` feeding a `$group`
 //! is held to the limit as it goes and not when it ends. The barrier hands the lease to the
 //! stage as the hold on its input, and the stage does not charge the same bytes again. A
 //! `Vec` pushed whole ([`Sink::push_all`]) is not charged on arrival: it was built by a
 //! stage that charged it as it built it, and the stage that takes it charges it as its
-//! input, as the loop did.
+//! input, as the loop did (a barrier at its run, a streaming sink on arrival).
 //!
 //! A barrier, and the collector, also refuse when they would hold more than the pipeline's
 //! `max_documents`, where the stages that stream have no such ceiling.
@@ -58,7 +63,7 @@ use bson::Document;
 use kimmy_core::Error;
 
 use crate::aggregate::{self, Fan, Limits, Stage, UnwindSpec};
-use crate::budget::{Lease, input_of};
+use crate::budget::{Lease, held_bytes, input_of};
 use crate::deadline::Ticker;
 use crate::expr::Binding;
 use crate::filter;
@@ -313,9 +318,13 @@ struct Streaming<'a, E: From<Error>> {
     vars: &'a [Binding<'a>],
     limits: &'a Limits,
     ticker: Ticker,
-    /// The `$unwind`s with documents still to hand out, by the index of the step; the last
-    /// is the innermost, and runs first.
-    fans: Vec<(usize, Fan)>,
+    /// The `$unwind`s with documents still to hand out, by the index of the step and with the
+    /// bytes each holds, which `held` is charged; the last is the innermost, and runs first.
+    fans: Vec<(usize, Fan, usize)>,
+    /// What the fans on `fans` hold: the document an array is unwound from and the elements
+    /// still to come, one fan to a level of `$unwind`, so that a run of them over a large
+    /// document is held to the request's budget (ADR-269) as it descends.
+    held: Lease,
     /// The index of the last step that is a `$limit` with none left to take: everything
     /// before it is no longer needed, and a fan made by a step before it is dropped.
     full: Option<usize>,
@@ -364,6 +373,7 @@ impl<'a, E: From<Error>> Streaming<'a, E> {
             limits,
             ticker: Ticker::new(),
             fans: Vec::new(),
+            held: limits.buffer.lease(input_of("$unwind")),
             full,
             next: Some(next),
         }
@@ -414,7 +424,10 @@ impl<'a, E: From<Error>> Streaming<'a, E> {
                 }
                 Stage::Unwind { .. } => {
                     let spec = unwind_spec(step.stage, self.limits);
-                    self.fans.push((at, Fan::start(&spec, doc)?));
+                    let fan = Fan::start(&spec, doc)?;
+                    let bytes = fan.held_bytes();
+                    self.held.charge(bytes)?;
+                    self.fans.push((at, fan, bytes));
                     return Ok(Walk::Fanned);
                 }
                 // `streams` is what puts a stage in a run.
@@ -427,9 +440,10 @@ impl<'a, E: From<Error>> Streaming<'a, E> {
     /// The next document of the innermost fan that is still needed, and the step to take it
     /// on from.
     fn resume(&mut self) -> Result<Option<(Document, usize)>, Error> {
-        while let Some((at, fan)) = self.fans.last_mut() {
-            let at = *at;
+        while let Some((at, fan, bytes)) = self.fans.last_mut() {
+            let (at, bytes) = (*at, *bytes);
             if self.full.is_some_and(|full| at < full) {
+                self.held.release(bytes);
                 self.fans.pop();
                 continue;
             }
@@ -437,6 +451,7 @@ impl<'a, E: From<Error>> Streaming<'a, E> {
             match fan.next(&spec, &mut self.ticker)? {
                 Some((doc, _built)) => return Ok(Some((doc, at + 1))),
                 None => {
+                    self.held.release(bytes);
                     self.fans.pop();
                 }
             }
@@ -477,6 +492,7 @@ impl<'a, E: From<Error>> Sink<'a, E> for Streaming<'a, E> {
                 // The fans end with the run: nothing is wanted past a `Done`.
                 if self.next_sink().push(doc)? == Flow::Done {
                     self.fans.clear();
+                    self.held.release(self.held.bytes());
                     return Ok(Flow::Done);
                 }
             }
@@ -485,8 +501,17 @@ impl<'a, E: From<Error>> Sink<'a, E> for Streaming<'a, E> {
     }
 
     fn push_all(&mut self, docs: Vec<Document>) -> Result<Flow, E> {
+        // The documents are in memory, whole, and nothing has charged them: the stage that
+        // built them has given its hold back, and the caller of a sub-pipeline leaves them to
+        // the first stage. They are charged as the input of the first stage of the run, as
+        // that stage charged them when it held its input, and each is given back as it is
+        // taken, so that what is left to drain is held to the request's budget (ADR-269).
+        let first = self.steps.first().map_or("a stage", |step| step.stage.name());
+        let mut arrived = self.limits.buffer.lease(input_of(first));
+        arrived.charge_docs(&docs)?;
         // `push` ticks; a tick of its own would count each document twice.
         for doc in docs {
+            arrived.release(held_bytes(&doc));
             if self.push(doc)? == Flow::Done {
                 return Ok(Flow::Done);
             }
@@ -1282,5 +1307,87 @@ mod tests {
             assert_eq!(chain.push(doc! {"_id": id}).unwrap(), Flow::More);
         }
         assert!(chain.finish().unwrap().is_empty());
+    }
+
+    /// A sink that records what the request's budget is charged each time it is pushed to.
+    struct Probe<'a> {
+        limits: &'a Limits,
+        used: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl<'a> Sink<'a, Error> for Probe<'a> {
+        fn push(&mut self, _: Document) -> Result<Flow, Error> {
+            self.used.borrow_mut().push(self.limits.buffer.used());
+            Ok(Flow::More)
+        }
+        fn finish(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+        fn next_mut(&mut self) -> Option<&mut dyn Sink<'a, Error>> {
+            None
+        }
+        fn detach(&mut self) -> Option<Link<'a, Error>> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_vec_drained_into_a_run_of_stages_that_stream_is_charged_and_given_back_as_it_is_taken() {
+        let input = padded(6, 1000);
+        let each: Vec<usize> = input.iter().map(held_bytes).collect();
+        let total: usize = each.iter().sum();
+        let limits = Limits { buffer: BufferBudget::new(total), ..Limits::default() };
+        let used = Rc::new(RefCell::new(Vec::new()));
+        let probe = Probe { limits: &limits, used: Rc::clone(&used) };
+        let stages = parsed(&[doc! {"$project": {"pad": 1}}]);
+        let mut run: Streaming<'_, Error> = Streaming::new(&stages, &[], &limits, Box::new(probe));
+        assert_eq!(run.push_all(input.clone()).unwrap(), Flow::More);
+        // When the first document reaches the sink, the others are still held, and each one
+        // taken is given back: the budget reads what is left to drain, to the byte.
+        let left: Vec<usize> =
+            (1..=6).map(|taken| total - each[..taken].iter().sum::<usize>()).collect();
+        assert_eq!(*used.borrow(), left);
+        assert_eq!(limits.buffer.used(), 0);
+        // A byte under what the Vec holds is refused on arrival, naming the stage, and
+        // nothing is pushed.
+        let limits = Limits { buffer: BufferBudget::new(total - 1), ..Limits::default() };
+        let used = Rc::new(RefCell::new(Vec::new()));
+        let probe = Probe { limits: &limits, used: Rc::clone(&used) };
+        let mut run: Streaming<'_, Error> = Streaming::new(&stages, &[], &limits, Box::new(probe));
+        let err = run.push_all(input).unwrap_err();
+        assert!(
+            matches!(&err, Error::ValueTooLarge { what: "the input of $project", bytes, .. }
+                if *bytes == total),
+            "{err:?}"
+        );
+        assert!(used.borrow().is_empty());
+        drop(run);
+        assert_eq!(limits.buffer.used(), 0);
+    }
+
+    #[test]
+    fn a_stage_streamed_documents_are_charged_to_is_named_whatever_it_is() {
+        // `input_of` names every stage that blocks, the windows and the fills included.
+        for (spec, name) in [
+            (
+                doc! {"$setWindowFields": {"sortBy": {"_id": 1},
+                "output": {"n": {"$documentNumber": {}}}}},
+                "the input of $setWindowFields",
+            ),
+            (
+                doc! {"$densify": {"field": "_id", "range": {"step": 1, "bounds": "full"}}},
+                "the input of $densify",
+            ),
+            (doc! {"$fill": {"output": {"x": {"value": 1}}}}, "the input of $fill"),
+        ] {
+            let stages = parsed(&[doc! {"$skip": 0}, spec]);
+            let limits = Limits { buffer: BufferBudget::new(2000), ..Limits::default() };
+            let mut chain = build(&stages, &unused, &limits, &[]);
+            let err = padded(10, 1000)
+                .into_iter()
+                .find_map(|doc| chain.push(doc).err())
+                .expect("refused as the documents arrive");
+            assert!(matches!(&err, Error::ValueTooLarge { what, .. } if *what == name), "{err:?}");
+        }
     }
 }

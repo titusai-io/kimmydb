@@ -1499,3 +1499,140 @@ fn merge_objects_is_charged_by_the_document_it_builds_not_by_the_documents_it_re
     let smallest = smallest_cap(&stage, &same, 4 * held_same);
     assert!(smallest < held_same + 3_000, "{smallest}");
 }
+
+// ---------------------------------------------------------------------------
+// The stages that stream (ADR-270): what a run of them holds
+// ---------------------------------------------------------------------------
+
+/// A chain over `stages`, each stage run as the pure pipeline runs it.
+fn chain_of<'a>(
+    stages: &'a [aggregate::Stage],
+    limits: &'a Limits,
+) -> crate::pipeline::Chain<'a, Error> {
+    // Boxed and leaked: the runner has to outlive the chain it is given to, and a test is short.
+    let run: crate::pipeline::Runner<'static, Error> = Box::leak(Box::new({
+        let limits = limits.clone();
+        move |stage: &aggregate::Stage, input, arrived| {
+            aggregate::apply_charged(stage, input, &limits, &[], arrived)
+        }
+    }));
+    crate::pipeline::build(stages, run, limits, &[])
+}
+
+/// The stages that stream, each one that keeps no field of its own the tail looks for, then a
+/// `$match` that drops every document, so that what a run holds is what is measured.
+fn streaming_stages() -> Vec<Document> {
+    vec![
+        doc! {"$match": {"g": {"$gte": 0}}},
+        doc! {"$project": {"p": "$pad", "g": 1}},
+        doc! {"$addFields": {"e": "$pad"}},
+        doc! {"$set": {"e": "$pad"}},
+        doc! {"$unset": "g"},
+        doc! {"$replaceRoot": {"newRoot": {"p": "$pad"}}},
+        doc! {"$replaceWith": {"p": "$pad"}},
+        doc! {"$redact": "$$KEEP"},
+        doc! {"$unwind": "$pad"},
+        doc! {"$skip": 0},
+        doc! {"$limit": 1_000_000},
+    ]
+}
+
+#[test]
+fn a_stage_that_streams_holds_one_document_and_charges_nothing_that_lasts() {
+    let nothing = doc! {"$match": {"nothing": 1}};
+    for stage in streaming_stages() {
+        let stages = aggregate::parse(&[stage.clone(), nothing.clone()]).unwrap();
+        // A budget of nothing: no document is held, so none is charged.
+        let limits = capped(0);
+        let mut chain = chain_of(&stages, &limits);
+        for doc in padded(200, 200) {
+            assert!(chain.push(doc).is_ok(), "{stage}");
+            assert_eq!(limits.buffer.used(), 0, "{stage}");
+        }
+        assert!(chain.finish().unwrap().is_empty(), "{stage}");
+    }
+}
+
+#[test]
+fn a_vec_given_to_a_stage_that_streams_is_charged_as_its_input_and_given_back_as_it_is_taken() {
+    let input = padded(20, 200);
+    let held_in = held_docs_bytes(&input);
+    let nothing = doc! {"$match": {"nothing": 1}};
+    for stage in streaming_stages() {
+        let stages = aggregate::parse(&[stage.clone(), nothing.clone()]).unwrap();
+        let name = crate::budget::input_of(stages[0].name());
+        // Room for the input and no more: it is drained and the budget is empty again.
+        let limits = capped(held_in);
+        assert!(chain_of(&stages, &limits).push_all(input.clone()).is_ok(), "{stage}");
+        assert_eq!(limits.buffer.used(), 0, "{stage}");
+        // A byte under it is refused on arrival, naming the stage the main loop named.
+        let limits = capped(held_in - 1);
+        let err = chain_of(&stages, &limits).push_all(input.clone()).unwrap_err();
+        let Error::ValueTooLarge { what, bytes, .. } = &err else { panic!("{stage}: {err:?}") };
+        assert_eq!((*what, *bytes), (name, held_in), "{stage}");
+        assert_eq!(limits.buffer.used(), 0, "{stage}: gives everything back when refused");
+    }
+}
+
+/// One document of about 1 MiB with `levels` arrays of two numbers, `a0` to `a<levels-1>`.
+fn deep(levels: usize) -> Document {
+    let mut doc = doc! {"_id": 1, "pad": "x".repeat(1 << 20)};
+    for level in 0..levels {
+        doc.insert(format!("a{level}"), vec![1, 2]);
+    }
+    doc
+}
+
+#[test]
+fn a_fan_of_unwind_holds_its_document_and_its_elements_and_is_charged_for_them() {
+    // Fifty `$unwind`s over fifty arrays: the first descent stands fifty fans, each holding
+    // the document its array is unwound from. Charged, they are refused at the budget; they
+    // were fifty uncounted copies, 50 MiB here and a member's memory with a larger document.
+    let doc = deep(50);
+    let one = held_bytes(&doc);
+    let mut specs: Vec<Document> =
+        (0..50).map(|level| doc! {"$unwind": format!("$a{level}")}).collect();
+    specs.push(doc! {"$limit": 1});
+    let stages = aggregate::parse(&specs).unwrap();
+    let cap = 10 * one;
+    let limits = capped(cap);
+    let mut chain = chain_of(&stages, &limits);
+    let err = chain.push(doc.clone()).unwrap_err();
+    let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!(*what, "the input of $unwind");
+    assert_eq!(*max, cap);
+    // Refused at the fan that took the hold over the cap: the eleventh, not the fiftieth.
+    assert!(*bytes > cap && *bytes <= cap + one, "held {bytes} of {cap}, a fan is {one}");
+    drop(chain);
+    assert_eq!(limits.buffer.used(), 0, "gives everything back when refused");
+    // Room for all fifty fans, and the same pipeline answers one document and holds nothing
+    // after it.
+    let limits = capped(60 * one);
+    let mut chain = chain_of(&stages, &limits);
+    assert_eq!(chain.push(doc).unwrap(), crate::pipeline::Flow::Done);
+    // What is held is the answer's one document, and no fan.
+    let held = limits.buffer.used();
+    let out = chain.finish().unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(held, held_bytes(&out[0]), "the fans are given back when the limit is full");
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+#[test]
+fn unwinds_that_do_not_fan_out_hold_nothing_however_many_there_are() {
+    // 998 `$unwind`s of a path the document does not have, keeping it: each hands the
+    // document on, and none holds a copy. The reviewer's shape, at a megabyte.
+    let doc = deep(0);
+    let one = held_bytes(&doc);
+    let mut specs: Vec<Document> = (0..998)
+        .map(|_| doc! {"$unwind": {"path": "$none", "preserveNullAndEmptyArrays": true}})
+        .collect();
+    specs.push(doc! {"$limit": 1});
+    let stages = aggregate::parse(&specs).unwrap();
+    // Room for the one document the answer holds, and no more.
+    let limits = capped(one);
+    let mut chain = chain_of(&stages, &limits);
+    assert_eq!(chain.push(doc).unwrap(), crate::pipeline::Flow::Done);
+    assert_eq!(chain.finish().unwrap().len(), 1);
+    assert_eq!(limits.buffer.used(), 0);
+}

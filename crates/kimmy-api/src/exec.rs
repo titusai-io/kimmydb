@@ -2471,12 +2471,9 @@ async fn aggregate_run_held(
     if let Some(aggregate::Stage::VectorSearch(spec)) = stages.first() {
         let docs = crate::vectors::stage_documents(state, auth, db, coll, spec, &limits).await?;
         // The hits are bounded by `k`, and are held like any source (ADR-269).
-        let mut read = limits.buffer.lease("the source read");
-        read.charge_docs(&docs)?;
-        // A stage that blocks charges what it is given as its own input, so the read gives its
-        // bytes back as the documents are handed over. A stage that streams charges nothing,
-        // and the hits, which stay in memory while they pass through it, stay charged.
-        let _hold = stages.get(1).is_some_and(pipeline::streams).then_some(read);
+        // The first stage charges what it is given as its own input, so the read gives its
+        // bytes back as the documents are handed over.
+        limits.buffer.lease("the source read").charge_docs(&docs)?;
         // The rest is synchronous: its own function, so that the guard of the request's
         // deadline (ADR-266) cannot be alive across the `$vectorSearch` await above, which
         // a future may leave on one thread and resume on another.

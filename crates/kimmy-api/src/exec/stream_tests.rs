@@ -279,3 +279,99 @@ fn a_pipeline_of_more_than_a_thousand_stages_is_a_400_that_names_the_count_and_t
         err.message
     );
 }
+
+/// A document of about a megabyte, with `levels` arrays of two numbers, `a0` to `a<levels-1>`.
+fn deep(levels: usize) -> Document {
+    let mut doc = doc! {"_id": 1, "pad": "x".repeat(1 << 20)};
+    for level in 0..levels {
+        doc.insert(format!("a{level}"), vec![1, 2]);
+    }
+    doc
+}
+
+#[test]
+fn unwinds_that_do_not_fan_out_hold_nothing_however_many_there_are() {
+    // The shape of the reviewer's pipeline: a big document, then a thousand `$unwind`s of a
+    // path it does not have, keeping it, then a limit. Each hands the document on; main
+    // answered it in the size of two documents, and so does this.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, vec![deep(0)]);
+    let one = held_docs_bytes(&[deep(0)]);
+    let mut pipeline: Vec<Value> = vec![json!({"$addFields": {"big": "$pad"}})];
+    pipeline.extend(
+        (0..998).map(|_| json!({"$unwind": {"path": "$none", "preserveNullAndEmptyArrays": true}})),
+    );
+    pipeline.push(json!({"$limit": 1}));
+    // Room for the document built, and the answer: documents and JSON, a few times over.
+    let limits = capped(8 * one);
+    let ok = run(&state, Value::Array(pipeline), limits.clone()).unwrap();
+    assert_eq!(ok["count"], 1);
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+#[test]
+fn nested_unwinds_over_a_large_document_are_refused_at_the_budget() {
+    // Fifty arrays, fifty `$unwind`s: each level of the descent holds the document it
+    // unwinds, so the descent is held to the budget at the level that passes it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, vec![deep(50)]);
+    let one = held_docs_bytes(&[deep(0)]);
+    let mut pipeline: Vec<Value> =
+        (0..50).map(|level| json!({"$unwind": format!("$a{level}")})).collect();
+    pipeline.push(json!({"$limit": 1}));
+    let limits = capped(10 * one);
+    let err = run(&state, Value::Array(pipeline.clone()), limits.clone()).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert!(err.message.contains("the input of $unwind is "), "{}", err.message);
+    let held: usize =
+        err.message.split(" is ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+    assert!(held > 10 * one && held <= 12 * one, "stopped at {held} of {}", 10 * one);
+    assert_eq!(limits.buffer.used(), 0);
+    // Room for the descent, and it answers one document.
+    let limits = capped(70 * one);
+    let ok = run(&state, Value::Array(pipeline), limits.clone()).unwrap();
+    assert_eq!(ok["count"], 1);
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+/// The smallest budget (in bytes) a pipeline over `orders` is answered under, found by halving
+/// between nothing and `hi`, and the refusal one byte under it.
+fn smallest_budget(state: &SharedState, pipeline: &Value, mut hi: usize) -> (usize, ApiError) {
+    let mut lo = 0usize;
+    assert!(run(state, pipeline.clone(), capped(hi)).is_ok(), "must run under {hi}");
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if run(state, pipeline.clone(), capped(mid)).is_ok() {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    (hi, run(state, pipeline.clone(), capped(hi - 1)).unwrap_err())
+}
+
+#[test]
+fn what_a_stage_that_blocks_hands_to_a_stage_that_streams_is_held_while_it_drains() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(20, 10_000));
+    let input = held_docs_bytes(&padded(20, 10_000));
+    // The `$sort` holds its input; its output is the same documents, which the second
+    // `$project` takes as its input and the `$group` collects as it gets them. Each is given
+    // back as it is taken, so the documents once is held, and not twice as they drain
+    // beside what has arrived.
+    let pipeline = json!([
+        {"$project": {"pad": 1}},
+        {"$sort": {"_id": -1}},
+        {"$project": {"pad": 1}},
+        {"$group": {"_id": null, "n": {"$sum": 1}}},
+    ]);
+    let (least, err) = smallest_budget(&state, &pipeline, 4 * input);
+    assert!(least > input && least < 2 * input, "answered under {least}, documents {input}");
+    // What is full is the `$group`, which holds its input (the documents once) and its
+    // buckets: the second `$project` held nothing of what it had taken.
+    assert!(
+        err.message.contains("the buckets of $group (with its input, still held) is "),
+        "{}",
+        err.message
+    );
+}

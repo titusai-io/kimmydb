@@ -2571,6 +2571,10 @@ impl UnwindSpec<'_> {
 /// a caller that needs no more can stop in the middle of an array (ADR-270). [`apply`] runs
 /// it to its end for each document; a chain of sinks stops at a `Done`.
 pub(crate) struct Fan {
+    /// The input document, kept only while an array is being handed out: each element is a
+    /// copy of it with the element in the array's place, which is `null` here, the array
+    /// itself being in `elements`. A document that is not fanned out is moved into `single`
+    /// and nothing is kept.
     doc: Document,
     /// The elements of the array, still to come, with the position of the next.
     elements: Option<(std::vec::IntoIter<Bson>, i64)>,
@@ -2582,7 +2586,7 @@ pub(crate) struct Fan {
 
 impl Fan {
     /// Look at `doc`, and decide what it becomes.
-    pub(crate) fn start(spec: &UnwindSpec<'_>, doc: Document) -> Result<Fan> {
+    pub(crate) fn start(spec: &UnwindSpec<'_>, mut doc: Document) -> Result<Fan> {
         let field = spec.field;
         // Refused uniformly, for every document, before anything at `field`
         // is read: `$unwind` names a place to write each element back to,
@@ -2605,30 +2609,46 @@ impl Fan {
         // not a reason to let a future change panic instead of refuse.
         match value_at(&doc, field) {
             Some(Bson::Array(items)) if !items.is_empty() => {
-                let elements = items.clone().into_iter();
-                Ok(Fan { doc, elements: Some((elements, 0)), single: None })
+                // The array moves out of the document, so that it is held once and each
+                // element's copy of the document does not carry it.
+                let items = items.clone();
+                path::set(&mut doc, field, Bson::Null)
+                    .map_err(|e| Error::InvalidQuery(format!("cannot set `{field}`: {e}")))?;
+                Ok(Fan { doc, elements: Some((items.into_iter(), 0)), single: None })
             }
-            // A missing field, an explicit null, or an empty array: MongoDB
+            // A missing field, an explicit null, or an empty array: the reference
             // drops the document unless asked to keep it.
             Some(Bson::Array(_)) | Some(Bson::Null) | None => {
                 let single = if spec.preserve {
-                    let mut copy = doc.clone();
-                    path::unset(&mut copy, field);
-                    spec.set_index(&mut copy, None)?;
-                    Some((copy, true))
+                    path::unset(&mut doc, field);
+                    spec.set_index(&mut doc, None)?;
+                    Some((doc, true))
                 } else {
                     None
                 };
-                Ok(Fan { doc, elements: None, single })
+                Ok(Fan { doc: Document::new(), elements: None, single })
             }
-            // A non-array value unwinds to itself, which is what MongoDB does
+            // A non-array value unwinds to itself, which is what the reference does
             // and saves callers a `$type` check for a field that is sometimes
             // scalar and sometimes an array.
             Some(_) => {
-                let mut copy = doc;
-                spec.set_index(&mut copy, None)?;
-                Ok(Fan { doc: Document::new(), elements: None, single: Some((copy, false)) })
+                spec.set_index(&mut doc, None)?;
+                Ok(Fan { doc: Document::new(), elements: None, single: Some((doc, false)) })
             }
+        }
+    }
+
+    /// What the fan holds while it hands its documents out, as the budget counts it (ADR-269):
+    /// the document and the elements still to come. A document that is not fanned out is
+    /// handed on whole and held by nobody.
+    pub(crate) fn held_bytes(&self) -> usize {
+        match &self.elements {
+            Some((rest, _)) => crate::budget::held_bytes(&self.doc).saturating_add(
+                rest.as_slice().iter().fold(0usize, |sum, item| {
+                    sum.saturating_add(crate::budget::held_bytes_bson(item))
+                }),
+            ),
+            None => 0,
         }
     }
 
