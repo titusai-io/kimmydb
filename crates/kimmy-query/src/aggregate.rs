@@ -2103,7 +2103,6 @@ fn set_computed_within(
     }
     let what = "the document the stage builds";
     let mut size = crate::expr::document_bytes(target);
-    crate::expr::check_document_bytes(what, size, max)?;
     for (name, expr) in computed {
         // The input as a whole is counted without copying it.
         let known = match expr {
