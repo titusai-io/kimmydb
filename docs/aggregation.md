@@ -895,9 +895,13 @@ non-numbers among them are ignored. An `input` that is not an array, `null` and
 missing included, is `400`, and `n` is read before it. `$top`, `$bottom`, `$topN`,
 `$bottomN` and `$count` are accumulators only.
 
-In a `$group`, `$sum`, `$avg`, `$stdDevPop` and `$stdDevSamp` take one
-expression: an array literal of two or more elements, or none, is `400` (`The
-$stdDevPop accumulator is a unary operator`).
+In a `$group` (and `$bucket`, `$bucketAuto`), `$sum`, `$avg`, `$min`, `$max`,
+`$first`, `$last`, `$push`, `$addToSet`, `$stdDevPop`, `$stdDevSamp` and
+`$mergeObjects` take one expression: an array literal of any length, `[1, 2]`,
+`[1]` and `[]` alike, is `400` (`The $stdDevPop accumulator is a unary operator`),
+as the reference's 40237. To push a list, write it as a `$literal`,
+`{$push: {$literal: [1, 2]}}`, or as an expression that builds one,
+`{$push: {$concatArrays: [["$a", "$b"]]}}`.
 
 ### How a value is read
 
@@ -1393,11 +1397,14 @@ place to write to — `$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is
 refused, `400`, on every such document, regardless of what `b` holds at any
 element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 
-**`$range`** produces at most 100,000 integers — the same ceiling as the
-pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
-exhaustion written as an expression, and it is refused before anything is
-allocated. Its elements are `Int32`, as the reference's are, so `$type` of an
-element is `"int"`; a bound or a step past `Int32` is a `400`, as there
+**`$range`** is bounded as every array an expression builds is, to 16 MiB of
+BSON, which is 1,376,024 integers: `{$range: [0, 1000000000]}` is a memory
+exhaustion written as an expression, and it is a `413` before anything is
+allocated, its size worked out from the two ends and the step. `[0, 200000]`
+answers, as in the reference. The reference's own limit is 100 MB of memory, at
+16 bytes an element about 6.5 million integers, so `[0, 2000000]` answers there
+and is a `413` here. Its elements are `Int32`, as the reference's are, so `$type` of an
+element is `"int"`, and a bound or a step past `Int32` is a `400`
 ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)).
 
 ### Sorting and zipping arrays
@@ -1582,14 +1589,26 @@ Extended JSON `{"$regularExpression": {"pattern": "ab+c", "options": "i"}}`.
 **No expression builds a string of 16 MiB or more, or an array over 16 MiB of
 BSON.** `$concat`, `$replaceOne` and `$replaceAll` work out the length of their
 result first and answer `413` when it is 16,777,216 bytes or more (a string of
-16,777,215 passes, as the reference's does), so a `$reduce` that doubles a
+16,777,215 passes, as the reference's does; the message names the limit as
+16777215 bytes), so a `$reduce` that doubles a
 string at each step stops at the limit. `$concatArrays` (and so a `$reduce` that
 doubles an array), `$map`, `$zip`, an array literal, `$split` and `$objectToArray`
 count what they collect and answer the same `413` past 16 MiB. `$regexFindAll`
 answers `413` past 64 MiB of match documents (counted as BSON), the reference's
 own limit. The message names what hit which limit, for example `the array $map
 builds is 20971520 bytes, over the 16 MiB array limit`. `$range` is bounded by its
-element count (100,000), `$zip` also by its cells (1,000,000), both a `400`.
+bytes, which are worked out before it builds anything; `$zip` is also bounded by
+its cells (1,000,000), a `400`.
+
+**No expression builds a document over 16 MiB either.** An object literal,
+`$mergeObjects` (also the accumulator), `$setField` and `$arrayToObject` count the
+document as they build it and answer `413` at the field that takes it past 16 MiB
+(`the document an object literal builds is 18874393 bytes, over the 16 MiB
+document limit`), and so do the fields `$addFields`, `$set` and `$project` write.
+A `$reduce` that doubles an object (`{l: "$$value", r: "$$value"}`) therefore
+stops at the step that would pass the limit. The reference shares the copies and
+refuses a document only when it is written out; here the copies are real, so the
+limit is earlier (see [Deviations](deviations.md)).
 
 ### Getting, setting and merging fields
 

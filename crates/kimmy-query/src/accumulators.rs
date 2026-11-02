@@ -24,7 +24,7 @@ use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::decimal::{arith, decode_raw};
 use kimmy_core::{Error, Result, path};
 
-use crate::expr::{Expr, Scope};
+use crate::expr::{Expr, HeldArray, MAX_ARRAY_BYTES, Scope, bson_bytes};
 use crate::shape::{self, SortKey};
 
 /// Which accumulator, without its arguments.
@@ -78,19 +78,32 @@ fn kind_of(op: &str) -> Option<Kind> {
     })
 }
 
-/// `$sum`, `$avg`, `$stdDevPop` and `$stdDevSamp` take one expression, not a
-/// list: given an array literal of any length but one, the reference refuses
-/// them (`The $sum accumulator is a unary operator`, error 40237). A list of one
-/// is not probed and stays an array expression. Every other name passes.
+/// The accumulators that take one expression, not a list. Given an array
+/// literal of any length (`[1, 2]`, `[1]` and `[]` alike), the reference refuses
+/// each of them (`The $sum accumulator is a unary operator`, error 40237), so
+/// `{$push: [1]}` is refused and `{$push: {$literal: [1]}}` is how to push a list.
+/// The accumulators that take a document (`$top`, `$firstN` and the rest) and
+/// `$count` refuse an array in their own way.
+const UNARY: [&str; 11] = [
+    "$sum",
+    "$avg",
+    "$min",
+    "$max",
+    "$first",
+    "$last",
+    "$push",
+    "$addToSet",
+    "$stdDevPop",
+    "$stdDevSamp",
+    "$mergeObjects",
+];
+
+/// Refuse an array literal given to an accumulator that is unary.
 pub fn check_unary(op: &str, arg: &Bson) -> Result<()> {
-    match (op, arg) {
-        ("$sum" | "$avg" | "$stdDevPop" | "$stdDevSamp", Bson::Array(items))
-            if items.len() != 1 =>
-        {
-            Err(Error::InvalidQuery(format!("The {op} accumulator is a unary operator")))
-        }
-        _ => Ok(()),
+    if matches!(arg, Bson::Array(_)) && UNARY.contains(&op) {
+        return Err(Error::InvalidQuery(format!("The {op} accumulator is a unary operator")));
     }
+    Ok(())
 }
 
 /// Parse `{<op>: <arg>}` if `op` is one of ours.
@@ -226,8 +239,30 @@ impl Spec {
         }
     }
 
-    /// A fresh state for one group.
+    /// A fresh state for one group, whose array is held to 16 MiB.
     pub fn init(&self) -> State {
+        self.init_within(MAX_ARRAY_BYTES)
+    }
+
+    /// The array a ranked or buffered accumulator answers, named for the refusal.
+    fn array_name(&self) -> &'static str {
+        match self.kind {
+            Kind::Top => "the value $top answers",
+            Kind::Bottom => "the value $bottom answers",
+            Kind::TopN => "the array $topN builds",
+            Kind::BottomN => "the array $bottomN builds",
+            Kind::FirstN => "the array $firstN builds",
+            Kind::LastN => "the array $lastN builds",
+            Kind::MaxN => "the array $maxN builds",
+            Kind::MinN => "the array $minN builds",
+            Kind::StdDevPop | Kind::StdDevSamp | Kind::Count => "the value the accumulator builds",
+        }
+    }
+
+    /// [`Self::init`] with the array held to `max` bytes. The `N` forms keep a
+    /// buffer of at most `n` rows, and its size is counted as rows come and go: a
+    /// group that keeps rows over `max` is refused at the row that takes it there.
+    pub fn init_within(&self, max: usize) -> State {
         let body = match self.kind {
             Kind::StdDevPop | Kind::StdDevSamp => Body::Welford(Welford::default()),
             Kind::Count => Body::Count(0),
@@ -247,6 +282,7 @@ impl Spec {
             limit: matches!(self.kind, Kind::Top | Kind::Bottom).then_some(1),
             seq: 0,
             dirs: self.sort.iter().map(|k| k.descending != bottom).collect(),
+            held: HeldArray::new(self.array_name(), max),
             body,
         }
     }
@@ -276,6 +312,9 @@ pub struct State {
     seq: u64,
     /// Per sort key, whether a row ranks by the reverse of the key's order.
     dirs: Arc<[bool]>,
+    /// The size of the array the buffer would answer with, for the kinds that keep
+    /// rows.
+    held: HeldArray,
     body: Body,
 }
 
@@ -429,9 +468,12 @@ pub(crate) fn n_of_array(kind: Kind, items: &[Bson], n: usize) -> Bson {
         Kind::MaxN | Kind::MinN => Body::Best(BinaryHeap::new()),
         _ => Body::Values(VecDeque::new()),
     };
-    let mut state = State { kind, limit: Some(n), seq: 0, dirs: Arc::from([]), body };
+    // The items come from an array already within the limit, and the answer holds
+    // some of them, so there is nothing to count.
+    let held = HeldArray::new("the array an array form builds", usize::MAX);
+    let mut state = State { kind, limit: Some(n), seq: 0, dirs: Arc::from([]), held, body };
     for item in items {
-        state.take(item.clone());
+        let _ = state.take(item.clone());
     }
     state.finish()
 }
@@ -509,46 +551,61 @@ impl State {
                 // Evaluate before deciding, so a failing `output` fails the
                 // request whether or not the row would have been kept.
                 let output = spec.value.eval_in(scope)?;
+                self.held.take(bson_bytes(&output));
                 rows.push(Row { keys, output, seq: self.seq, dirs: Arc::clone(&self.dirs) });
                 self.seq += 1;
-                if rows.len() > limit {
-                    rows.pop();
+                if rows.len() > limit
+                    && let Some(dropped) = rows.pop()
+                {
+                    self.held.give_back(bson_bytes(&dropped.output));
                 }
+                self.held.check()?;
             }
             Body::Best(_) | Body::Values(_) => {
                 let value = spec.value.eval_in(scope)?;
-                self.take(value);
+                self.take(value)?;
             }
         }
         Ok(())
     }
 
     /// Take one value into a `$firstN`, `$lastN`, `$maxN` or `$minN`.
-    fn take(&mut self, value: Bson) {
+    ///
+    /// The array's size is counted as values come and go, and refused (`413`) at
+    /// the value that takes what the group keeps over the limit.
+    fn take(&mut self, value: Bson) -> Result<()> {
         let limit = self.limit.unwrap_or(usize::MAX);
         match &mut self.body {
             Body::Values(values) => {
                 if self.kind == Kind::FirstN {
                     if values.len() < limit {
+                        self.held.take(bson_bytes(&value));
                         values.push_back(value);
                     }
                 } else {
+                    self.held.take(bson_bytes(&value));
                     values.push_back(value);
-                    if values.len() > limit {
-                        values.pop_front();
+                    if values.len() > limit
+                        && let Some(dropped) = values.pop_front()
+                    {
+                        self.held.give_back(bson_bytes(&dropped));
                     }
                 }
             }
             // `$maxN` and `$minN` skip null and missing.
             Body::Best(heap) if !matches!(value, Bson::Null | Bson::Undefined) => {
+                self.held.take(bson_bytes(&value));
                 heap.push(Best { value, seq: self.seq, max: self.kind == Kind::MaxN });
                 self.seq += 1;
-                if heap.len() > limit {
-                    heap.pop();
+                if heap.len() > limit
+                    && let Some(dropped) = heap.pop()
+                {
+                    self.held.give_back(bson_bytes(&dropped.value));
                 }
             }
             _ => {}
         }
+        self.held.check()
     }
 
     fn needs_limit(&self) -> bool {

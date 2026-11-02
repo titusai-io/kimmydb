@@ -1738,8 +1738,8 @@ mod value_too_large_tests {
         for (what, limit, text) in [
             (
                 "the string $concat builds",
-                "16 MiB string limit",
-                "the string $concat builds is 20000000 bytes, over the 16 MiB string limit; trim it",
+                "string limit of 16777215 bytes (16 MiB less one)",
+                "the string $concat builds is 20000000 bytes, over the string limit of 16777215 bytes (16 MiB less one); trim it",
             ),
             (
                 "the $regexFindAll output",

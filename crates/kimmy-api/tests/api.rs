@@ -3837,9 +3837,13 @@ async fn the_positional_dollar_updates_the_element_the_filter_matched() {
     .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
     assert!(res.body["message"].as_str().unwrap_or_default().contains("upsert"), "{:?}", res.body);
-    // Labelled as an update error, as the other `$` refusals are.
+    // Labelled as an update error, and worded as the same refusal on a document that
+    // matched is (the `$` with no element, on `update`), not as a message of its own.
     let msg = res.body["message"].as_str().unwrap_or_default();
-    assert!(msg.starts_with("invalid update:"), "{msg}");
+    assert!(msg.starts_with("invalid query: invalid update:"), "{msg}");
+    let matched = update(json!({"filter": {"_id": 3}, "update": {"$set": {"items.$.x": 1}}})).await;
+    let matched = matched.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(matched.starts_with("invalid query: invalid update:"), "{matched}");
     assert_eq!(server.get("/v1/db/shop/coll/c/docs/99", Some(&token)).await.status, 404);
 }
 
@@ -4497,6 +4501,88 @@ async fn json_schema_filters_every_route_that_takes_a_filter() {
             .await;
         assert_eq!(res.status, 400, "{bad}: {:?}", res.body);
     }
+}
+
+/// The `as` array of a join is held to 16 MiB like every array an expression
+/// builds (ADR-267): five matching documents of 4 MiB are a `413`, and one is not.
+#[tokio::test]
+async fn a_join_array_over_16_mib_is_refused_with_the_413() {
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        max_body_bytes: 8 << 20,
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "l"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "f"})).await;
+    server.post("/v1/db/shop/coll/l/docs", Some(&token), json!({"_id": 1, "k": 1})).await;
+    let pad = "x".repeat(4 << 20);
+    for id in 1..=5 {
+        let stored = server
+            .post("/v1/db/shop/coll/f/docs", Some(&token), json!({"_id": id, "k": 1, "pad": pad}))
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    let run = |stage: Value| {
+        server.post("/v1/db/shop/coll/l/aggregate", Some(&token), json!({"pipeline": [stage]}))
+    };
+    for (name, stage) in [
+        (
+            "$lookup",
+            json!({"$lookup": {"from": "f", "localField": "k", "foreignField": "k", "as": "j"}}),
+        ),
+        (
+            "$lookup",
+            json!({"$lookup": {"from": "f", "pipeline": [{"$match": {"k": 1}}], "as": "j"}}),
+        ),
+        (
+            "$graphLookup",
+            json!({"$graphLookup": {"from": "f", "startWith": "$k", "connectFromField": "z",
+                                    "connectToField": "k", "as": "j", "maxDepth": 0}}),
+        ),
+    ] {
+        let res = run(stage.clone()).await;
+        assert_eq!(res.status, 413, "{stage}: {:?}", res.body);
+        assert_eq!(res.body["error"], "answer_too_large", "{:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains(&format!("the array {name} builds is")), "{message}");
+        assert!(message.contains("16 MiB array limit"), "{message}");
+    }
+    // One document of the five is within the limit.
+    let one = run(json!({"$lookup": {"from": "f",
+        "pipeline": [{"$match": {"_id": 1}}], "as": "j"}}))
+    .await;
+    assert_eq!(one.status, 200, "{:?}", one.body.to_string().len());
+    assert_eq!(one.body["documents"][0]["j"].as_array().map(Vec::len), Some(1));
+}
+
+/// A regex written as a field's value is a pattern in `find`, and a partial index
+/// filter has no patterns, so a bare one is refused at creation (ADR-267), while
+/// `$eq` of it, which compares it as a value, is not.
+#[tokio::test]
+async fn a_partial_index_filter_refuses_a_regex_as_a_fields_value() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "c"})).await;
+    let re = json!({"$regularExpression": {"pattern": "^a", "options": ""}});
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/indexes",
+            Some(&token),
+            json!({"name": "bare", "fields": [{"path": "email"}], "partialFilterExpression": {"s": re.clone()}}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("regular expression") && message.contains("$eq"), "{message}");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/indexes",
+            Some(&token),
+            json!({"name": "eq", "fields": [{"path": "email"}], "partialFilterExpression": {"s": {"$eq": re}}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
 }
 
 /// `$pull` with an operator document removes the elements that satisfy it; a
@@ -14079,6 +14165,63 @@ async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
 }
 
 #[tokio::test]
+async fn a_regex_written_as_a_fields_value_matches_as_a_pattern_over_http() {
+    // `{s: /a/}` arrives as `{"$regularExpression": ...}` and matches "aaab" as a
+    // pattern, as `$regex` does; only `$eq` compares it as a value. An invalid or
+    // possessive pattern is a 400, as under `$regex`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "words" })).await;
+    for doc in [
+        json!({ "_id": 1, "s": "aaab" }),
+        json!({ "_id": 2, "s": "xyz" }),
+        json!({ "_id": 3, "s": 5 }),
+    ] {
+        let stored = server.post("/v1/db/shop/coll/words/docs", Some(&token), doc).await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    let find = |filter: Value| {
+        server.post("/v1/db/shop/coll/words/find", Some(&token), json!({ "filter": filter }))
+    };
+    let ids = |body: &Value| -> Vec<i64> {
+        let mut ids: Vec<i64> = body["documents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no documents in {body}"))
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let re = |pattern: &str, options: &str| json!({ "$regularExpression": { "pattern": pattern, "options": options } });
+    let hit = find(json!({ "s": re("a", "") })).await;
+    assert_eq!((hit.status, ids(&hit.body)), (200, vec![1]), "{:?}", hit.body);
+    let flags = find(json!({ "s": re("^AAA", "i") })).await;
+    assert_eq!(ids(&flags.body), [1], "{:?}", flags.body);
+    let none = find(json!({ "s": re("^b", "") })).await;
+    assert_eq!(ids(&none.body), Vec::<i64>::new(), "{:?}", none.body);
+    // It is `$regex`: the same documents.
+    let same = find(json!({ "s": { "$regex": "a" } })).await;
+    assert_eq!(ids(&same.body), [1]);
+    // `$eq` compares it as a value, which no stored document is.
+    let eq = find(json!({ "s": { "$eq": re("a", "") } })).await;
+    assert_eq!(ids(&eq.body), Vec::<i64>::new(), "{:?}", eq.body);
+    // The refusals of `$regex`.
+    for pattern in ["(", "a*+a", "a(?=b)"] {
+        let res = find(json!({ "s": re(pattern, "") })).await;
+        assert_eq!(res.status, 400, "{pattern}: {:?}", res.body);
+        let res = find(json!({ "$or": [{ "_id": 1 }, { "s": re(pattern, "") }] })).await;
+        assert_eq!(res.status, 400, "{pattern} under $or: {:?}", res.body);
+    }
+    let possessive = find(json!({ "s": re("a*+a", "") })).await;
+    assert!(
+        possessive.body["message"].as_str().unwrap().contains("possessive quantifiers"),
+        "{:?}",
+        possessive.body
+    );
+}
+
+#[tokio::test]
 async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
     // `{tags: {$all: []}}` held for every document whose `tags` is an array,
     // so a list a client emptied by mistake reached all of them, on a `multi`
@@ -18832,15 +18975,47 @@ async fn chunks_commit_once_each_and_the_boundary_is_exact() {
 }
 
 #[tokio::test]
-async fn a_written_document_over_the_size_cap_fails_its_chunk() {
+async fn a_written_document_the_target_refuses_fails_its_chunk() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    // The fourth document repeats the first one's `k`, which the target's unique
+    // index refuses. (A pipeline cannot build a document over the size cap any
+    // more: see the next test.)
+    let docs: Vec<Value> =
+        (1..=4).map(|i| json!({"_id": i, "k": if i == 4 { 1 } else { i }})).collect();
+    sink_seed(&server, &token, "src", docs).await;
+    sink_seed(&server, &token, "t", Vec::new()).await;
+    let index = server
+        .post(
+            "/v1/db/shop/coll/t/indexes",
+            Some(&token),
+            json!({"fields": [{"path": "k"}], "unique": true}),
+        )
+        .await;
+    assert_eq!(index.status, 200, "{:?}", index.body);
+    server.state.engine.set_multi_chunk_docs(2);
+    let res =
+        sink_run(&server, &token, "src", json!([{"$sort": {"_id": 1}}, {"$merge": {"into": "t"}}]))
+            .await;
+    assert!(res.status >= 400, "{:?}", res.body);
+    let ids: Vec<i64> = sink_dump(&server, &token, "shop", "t")
+        .await
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [1, 2], "the first chunk stands, the second did not land");
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_pipeline_cannot_build_a_document_over_the_size_cap() {
     let server = Server::start().await;
     let token = server.root().await;
     sink_seed(&server, &token, "src", (1..=4).map(|i| json!({"_id": i})).collect()).await;
-    server.state.engine.set_multi_chunk_docs(2);
-    // The documents are built in the pipeline: one per `_id`, the fourth too big
-    // to store, though none is big enough to be refused as a pipeline result. No
-    // expression builds a string of 16 MiB, so the fourth holds two of 8 MiB, which
-    // together pass the document cap.
+    sink_seed(&server, &token, "t", Vec::new()).await;
+    // The fourth document would hold two strings of 8 MiB, which together pass the
+    // 16 MiB a document may have: the stage that builds it is refused, with the
+    // `413` of the other limits on what an expression builds, and nothing is written.
     let big = json!({"$reduce": {
         "input": {"$range": [0, 20]},
         "initialValue": "xxxxxxxx",
@@ -18860,14 +19035,12 @@ async fn a_written_document_over_the_size_cap_fails_its_chunk() {
         ]),
     )
     .await;
-    assert!(res.status >= 400, "{:?}", res.body);
-    let ids: Vec<i64> = sink_dump(&server, &token, "shop", "t")
-        .await
-        .iter()
-        .map(|d| d["_id"].as_i64().unwrap())
-        .collect();
-    assert_eq!(ids, [1, 2], "the first chunk stands, the second did not land");
-    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert_eq!(res.body["error"], "answer_too_large", "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap();
+    assert!(message.contains("the document the stage builds is"), "{message}");
+    assert!(message.contains("16 MiB document limit"), "{message}");
+    assert!(sink_dump(&server, &token, "shop", "t").await.is_empty());
 }
 
 #[tokio::test]
@@ -20133,6 +20306,87 @@ async fn a_pipeline_upsert_runs_on_the_document_the_filter_seeds() {
     }))
     .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
+    // It is worded as the same refusal on a document that matched is: one prefix.
+    let matched = fam(json!({
+        "filter": { "_id": 1 }, "update": [{ "$set": { "_id": 5 } }]
+    }))
+    .await;
+    assert_eq!(matched.status, 400, "{:?}", matched.body);
+    let text = |res: &Res| res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        text(&res).starts_with("invalid query: invalid update: _id is immutable and cannot be"),
+        "{}",
+        text(&res)
+    );
+    assert_eq!(text(&res), text(&matched));
+}
+
+/// A value-size limit (a string an expression builds over 16 MiB) is the same
+/// answer on a write as on an aggregate: `413` and the code `ValueTooLarge` maps to,
+/// not the `400` of the string the refusal travels in. The code is read from the
+/// aggregate's answer, so the test follows the error type and not a spelling.
+#[tokio::test]
+async fn a_value_size_limit_is_a_413_on_every_write_path() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, vec![json!({ "_id": 1, "a": 1 }), json!({ "_id": 2, "a": 2 })])
+        .await;
+    // 25 doublings of a byte: 2^24 is exactly 16 MiB, which no expression builds.
+    let big = json!({"$reduce": {
+        "input": {"$range": [0, 24]},
+        "initialValue": "x",
+        "in": {"$concat": ["$$value", "$$value"]},
+    }});
+    let reference = server
+        .post(
+            "/v1/db/shop/coll/pu/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$limit": 1}, {"$set": {"s": big.clone()}}]}),
+        )
+        .await;
+    assert_eq!(reference.status, 413, "{:?}", reference.body);
+    let code = reference.body["error"].clone();
+    let stages = json!([{ "$set": { "s": big } }]);
+    let before = pu_doc(&server, &token, 1).await;
+
+    let update = |multi: bool| {
+        server.post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": stages.clone(), "multi": multi }),
+        )
+    };
+    let fam = |body: Value| server.post("/v1/db/shop/coll/pu/find_and_modify", Some(&token), body);
+    let mut answers = vec![("update", update(false).await), ("update multi", update(true).await)];
+    answers.push((
+        "find_and_modify",
+        fam(json!({ "filter": { "_id": 1 }, "update": stages.clone() })).await,
+    ));
+    // The seed of an upsert that inserts: the refusal is deferred until it does.
+    answers.push((
+        "find_and_modify upsert",
+        fam(json!({ "filter": { "_id": 99 }, "update": stages.clone(), "upsert": true })).await,
+    ));
+    for (what, res) in &answers {
+        assert_eq!(res.status, 413, "{what}: {:?}", res.body);
+        assert_eq!(res.body["error"], code, "{what}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("builds is 16777216 bytes"), "{what}: {message}");
+    }
+    // Nothing was written, and an ordinary refusal on the same paths is still a 400.
+    assert_eq!(pu_doc(&server, &token, 1).await, before);
+    let missing = server.get("/v1/db/shop/coll/pu/docs/99", Some(&token)).await;
+    assert_eq!(missing.status, 404, "{:?}", missing.body);
+    let bad = update(false).await;
+    assert_eq!(bad.status, 413);
+    let plain = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "a": { "$add": ["$a", "x"] } } }] }),
+        )
+        .await;
+    assert_eq!(plain.status, 400, "{:?}", plain.body);
 }
 
 #[tokio::test]

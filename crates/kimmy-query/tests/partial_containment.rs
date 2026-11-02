@@ -233,10 +233,12 @@ fn a_chosen_partial_index_holds_every_document_find_returns() {
     // documents; 2 paths x (1 + 58 x 5) filters, every one of which parses now
     // that a `Decimal128` bound does (ADR-238); 2 x (2 + 58 x 16) queries less
     // 20 refused (two regex operands among the values of `$in`, `$nin` or
-    // `$all`, or as the operand of `$ne`: five queries each, on two paths).
+    // `$all`, or as the operand of `$ne`: five queries each, on two paths), and
+    // 2 x (1 + 58 x 5) partial filters less 4 refused (a bare regex, two of the values, on two paths: it is a
+    // pattern in a filter and not in the partial language, on two paths).
     let has_decimal = |d: &Document| kimmy_core::holds_decimal128(&Bson::Document(d.clone()));
     assert_eq!(docs.len(), 531, "the document corpus");
-    assert_eq!(partials.len(), 582, "the partial filters that parse");
+    assert_eq!(partials.len(), 578, "the partial filters that parse");
     assert_eq!(queries.len(), 1_840, "the queries that parse");
     // Thirteen values hold a `Decimal128`.
     assert_eq!(

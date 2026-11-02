@@ -75,7 +75,8 @@ fn without_a_deadline_every_stage_runs_as_before() {
     // A deadline well in the future changes nothing either.
     let _deadline = Deadline::scope(Some(Duration::from_secs(3600)));
     let out = apply(&stage(doc! { "$count": "n" }), rows(3), &Limits::default()).unwrap();
-    assert_eq!(out, vec![doc! { "n": 3_i64 }]);
+    // A count is an `Int32`, as the reference answers it (ADR-268).
+    assert_eq!(out, vec![doc! { "n": 3_i32 }]);
 }
 
 #[test]

@@ -23,6 +23,7 @@
 //!                  any conjunction of the above
 //!
 //! refused          $or $ne $nin $regex $not $elemMatch $in
+//!                  a bare regex as the field's value (it is a pattern)
 //!                  $exists: false
 //! ```
 //!
@@ -287,6 +288,19 @@ fn parse_op(path: &str, value: &Bson) -> Result<PartialOp> {
     // places it by its exact value (ADR-238). Accepted here always, because
     // this parse is shared by a local create, a replicated or restored
     // definition and the migration's check of stored ones.
+    // A regular expression written as a field's value is a pattern in a filter
+    // (ADR-267), and a pattern is not in this language (`$regex` is refused), so it
+    // is refused here too, rather than kept as an equality that `find` no longer
+    // reads that way. `{$eq: /re/}` compares it as a value and stays allowed. No
+    // stored definition holds one: until the HTTP boundary learned the Extended
+    // JSON form (unreleased), a regex arrived as a nested document.
+    if matches!(value, Bson::RegularExpression(_)) {
+        return Err(Error::InvalidQuery(format!(
+            "partialFilterExpression for {path:?} cannot take a regular expression as the \
+             field's value: a bare regex is a pattern, and patterns are not part of this \
+             language (write {{$eq: <regex>}} to compare it as a value)"
+        )));
+    }
     let Bson::Document(spec) = value else {
         // A bare value is equality, as it is everywhere else in the filter
         // language.
@@ -370,6 +384,18 @@ mod tests {
         assert!(parse(doc! {"qty": {"$lte": 10}}).is_ok());
         // A conjunction of them.
         assert!(parse(doc! {"status": "active", "qty": {"$gte": 1}}).is_ok());
+    }
+
+    #[test]
+    fn a_bare_regex_is_a_pattern_and_is_refused_but_eq_compares_it() {
+        let re = Bson::RegularExpression(bson::Regex {
+            pattern: "^x".to_string().try_into().unwrap(),
+            options: String::new().try_into().unwrap(),
+        });
+        let err = parse(doc! {"a": re.clone()}).unwrap_err().to_string();
+        assert!(err.contains("regular expression") && err.contains("$eq"), "{err}");
+        assert!(parse(doc! {"b": 1, "a": re.clone()}).is_err());
+        assert!(parse(doc! {"a": {"$eq": re}}).is_ok());
     }
 
     #[test]
