@@ -25,9 +25,19 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
+/// The limits a test that is not about the deadline serves under: a deadline an hour
+/// long, so a machine under load cannot turn a slow call into a `timeout` result
+/// (ADR-266). The tests of the deadline set their own.
+fn unhurried() -> kimmy_api::RequestLimits {
+    kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_secs(3600),
+        ..kimmy_api::RequestLimits::default()
+    }
+}
+
 impl Server {
     async fn start() -> Self {
-        Self::start_with(kimmy_api::RequestLimits::default()).await
+        Self::start_with(unhurried()).await
     }
 
     async fn start_with(limits: kimmy_api::RequestLimits) -> Self {
@@ -84,9 +94,10 @@ impl Server {
         // used to reproduce a defect instead of catching it: both sides said
         // `router(..).merge(..)`, which leaves `/mcp` outside the layer that
         // counts, times, traces and challenges.
-        let app = kimmy_api::router_with(
+        let app = kimmy_api::router_with_limits(
             Arc::clone(&state),
             Some(kimmy_mcp::mcp_router(Arc::clone(&state), Vec::new(), limits)),
+            limits,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2024,6 +2035,53 @@ async fn the_timeout_answer_over_mcp_is_the_one_rest_gives() {
     let rest = kimmy_api::ApiError::writer_busy(std::time::Duration::from_secs(1));
     assert_eq!(message, rest.message, "one wording for both transports");
     assert_eq!(body["result"]["structuredContent"]["retry"], rest.retry().as_str());
+}
+
+/// **A slow aggregation over MCP is cut at the deadline** (ADR-266), as it is over REST:
+/// the pipeline never yields, so the future's timeout could not end it, and it holds a
+/// worker for as long as it runs. It now stops itself at the deadline and answers the same
+/// tool result, `503 timeout`'s envelope; the node serves the next call at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_aggregate_tool_call_is_cut_at_the_deadline_and_frees_its_worker() {
+    let server = Server::start_with(limits_of(1)).await;
+    seed(&server);
+    let root = server.root();
+    // Ten million steps a document, in a few loops none of which yields.
+    let inner = json!({ "$reduce": { "input": { "$range": [0, 100_000] }, "initialValue": 0,
+                                       "in": { "$add": ["$$value", 1] } } });
+    let pipeline = json!([{ "$project": { "s": { "$reduce": {
+        "input": { "$range": [0, 100] }, "initialValue": 0,
+        "in": { "$add": ["$$value", inner] } } } } }]);
+    let began = std::time::Instant::now();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        server.call(
+            &root,
+            "aggregate",
+            json!({"database":"sales","collection":"orders","pipeline":pipeline}),
+        ),
+    )
+    .await
+    .expect("the call ended at the deadline and did not run to its end");
+    let took = began.elapsed();
+    assert!(body["error"].is_null(), "a tool result, not a protocol error: {body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let envelope = &body["result"]["structuredContent"];
+    assert_eq!(envelope["error"], "timeout", "{body}");
+    assert_eq!(envelope["retry"], "wait");
+    assert_eq!(
+        envelope["message"],
+        kimmy_api::ApiError::timeout(std::time::Duration::from_secs(1)).message,
+        "the wording REST gives"
+    );
+    assert!(took < std::time::Duration::from_secs(15), "cut promptly: {took:?}");
+    let after = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.call_ok(&root, "count", json!({"database":"sales","collection":"orders"})),
+    )
+    .await
+    .expect("the next call is served");
+    assert_eq!(after["count"], 3);
 }
 
 /// What a raw exchange answered: the status line's code and the JSON body, if any.

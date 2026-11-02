@@ -880,6 +880,9 @@ fn data_can_raise(e: &kimmy_core::Error) -> bool {
         | E::ValueTooLarge { .. }
         | E::MemoryBusy { .. }
         | E::IdTooLarge { .. }
+        // The clock raises it, not a document (ADR-266): the hoist declines on it like on any
+        // error, and the loop that follows raises it again at its next check.
+        | E::DeadlineExceeded
         | E::UnsupportedOperator { .. }
         | E::ResumeTokenExpired
         | E::MalformedResumeToken

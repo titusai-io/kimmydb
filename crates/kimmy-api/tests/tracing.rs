@@ -75,7 +75,14 @@ async fn node() -> Node {
 
     let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
     let state = kimmy_api::state(engine, tokens, false, kimmy_api::RateLimits::disabled()).unwrap();
-    let app = kimmy_api::router(state);
+    let app = kimmy_api::router_with_limits(
+        state,
+        None,
+        kimmy_api::RequestLimits {
+            request_timeout: std::time::Duration::from_secs(3600),
+            ..kimmy_api::RequestLimits::default()
+        },
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -241,15 +241,26 @@ impl Engine {
             if continuing {
                 crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BetweenChunks);
             }
-            match self.modify_chunk(
-                holder,
-                continuing,
-                coll,
-                candidates,
-                spec,
-                budget,
-                after.as_deref(),
-            ) {
+            // The request's deadline (ADR-266) is looked at before each chunk and on every
+            // candidate a chunk's scan examines, until the first chunk has committed: a
+            // request that has written something keeps going (ADR-192), so from then on
+            // the deadline is set aside. A stop is a failure of the chunk it is in, which
+            // aborts that chunk whole and, with nothing committed, writes nothing.
+            let _suspended = continuing.then(kimmy_core::deadline::Deadline::suspend);
+            let chunked = kimmy_core::deadline::check()
+                .map_err(|e| (StorageError::from(e), 0))
+                .and_then(|()| {
+                    self.modify_chunk(
+                        holder,
+                        continuing,
+                        coll,
+                        candidates,
+                        spec,
+                        budget,
+                        after.as_deref(),
+                    )
+                });
+            match chunked {
                 Ok((examined, None)) => {
                     outcome.examined += examined;
                     break;
@@ -417,6 +428,9 @@ impl Engine {
                     // The caller's reason for refusing to insert, worded as the same
                     // refusal on a matched document is: the engine reports `apply`'s
                     // string as an `InvalidQuery`, and this is the same string.
+                    // A seed stopped by the request's deadline (a pipeline update's stage)
+                    // arrives as that string too: it is the timeout it was (ADR-266).
+                    kimmy_core::deadline::check().map_err(StorageError::Core)?;
                     return Err(StorageError::Core(
                         spec.refusal_for(&e).unwrap_or(kimmy_core::Error::InvalidQuery(e)),
                     ));
@@ -503,8 +517,16 @@ impl Engine {
             return Err(StorageError::Stale { current: Some(found.stamp) });
         }
         let id = extract_id(&found.doc)?;
-        let next = spec.apply(&found.doc).map_err(|e| {
-            StorageError::Core(spec.refusal_for(&e).unwrap_or(kimmy_core::Error::InvalidQuery(e)))
+        let next = spec.apply(&found.doc).map_err(|e| match kimmy_core::deadline::check() {
+            // The spec reports its refusals as text, so a stop of the request's
+            // deadline inside it (a pipeline update's stage, ADR-266) arrives as one:
+            // if the deadline has passed, that is what it was. A genuine refusal met after
+            // the deadline is answered `503` as well: nothing was written, and a retry
+            // gets the refusal.
+            Err(passed) => StorageError::Core(passed),
+            Ok(()) => StorageError::Core(
+                spec.refusal_for(&e).unwrap_or(kimmy_core::Error::InvalidQuery(e)),
+            ),
         })?;
         let entry = self.write_chosen(txn, coll, &id, found, next.as_ref())?;
         Ok((next, entry))
@@ -578,6 +600,8 @@ impl Engine {
         // `Ok(false)` asks the scan to stop: the limit is reached.
         let mut consider =
             |record: DocRecord, doc: Document, matches: &mut Vec<Match>| -> Result<bool> {
+                // Every candidate examined, whichever way it was found (ADR-266).
+                kimmy_core::deadline::tick()?;
                 examined += 1;
                 if !spec.matches(&doc).map_err(StorageError::Core)? {
                     return Ok(true);
@@ -1759,6 +1783,137 @@ mod tests {
             "{cause:?}"
         );
         assert_eq!(claimed(&engine, &coll), vec![0], "chunk one stands, and nothing after it");
+    }
+
+    fn expire_deadline_for_this_test() {
+        std::mem::forget(kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO)));
+    }
+
+    #[test]
+    fn a_stop_of_the_deadline_inside_the_specs_apply_is_a_timeout_not_an_invalid_query() {
+        // The spec reports its refusals as text (a pipeline update's stage stopped by the
+        // deadline included); the engine says what the text was.
+        let (engine, coll, _dir) = three_chunks();
+        let spec = TestSpec {
+            matches: |_: &Document| true,
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |_: &Document| {
+                expire_deadline_for_this_test();
+                Err("the request ran past its deadline and the work was stopped".to_string())
+            },
+            upsert: None,
+        };
+        let failed = engine.find_and_modify(&coll, &Candidates::Scan, &spec);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        assert!(claimed(&engine, &coll).is_empty());
+    }
+
+    #[test]
+    fn an_upsert_seed_stopped_by_the_deadline_is_a_timeout_not_an_invalid_update() {
+        // The seed's refusal is text too (a pipeline update's first stage, run before the
+        // engine is called), held until nothing matches.
+        struct Seed;
+        impl ModifySpec for Seed {
+            fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+                Ok(false)
+            }
+            fn compare(&self, _: &Document, _: &Document) -> Ordering {
+                Ordering::Equal
+            }
+            fn apply(&self, d: &Document) -> std::result::Result<Option<Document>, String> {
+                Ok(Some(d.clone()))
+            }
+            fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+                Some(Err("the request ran past its deadline and the work was stopped".into()))
+            }
+        }
+        let (engine, coll, _dir) = three_chunks();
+        expire_deadline_for_this_test();
+        let failed = engine.find_and_modify(&coll, &Candidates::Scan, &Seed);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+    }
+
+    #[test]
+    fn an_upsert_seed_stopped_by_the_deadline_is_a_timeout_when_no_candidate_is_examined() {
+        // The upsert of an absent primary key (the usual shape) examines no document, so
+        // no tick of the scan answers before the engine reaches the seed: only the look made
+        // when the seed is refused can say that the refusal was the deadline (review q8d3, m1).
+        struct Seed;
+        impl ModifySpec for Seed {
+            fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+                Ok(false)
+            }
+            fn compare(&self, _: &Document, _: &Document) -> Ordering {
+                Ordering::Equal
+            }
+            fn apply(&self, d: &Document) -> std::result::Result<Option<Document>, String> {
+                Ok(Some(d.clone()))
+            }
+            fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+                Some(Err("the request ran past its deadline and the work was stopped".into()))
+            }
+        }
+        let (bare, empty, _bare_dir) = engine();
+        let (engine, coll, _dir) = three_chunks();
+        let absent = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(99)).unwrap()]);
+        expire_deadline_for_this_test();
+        let failed = engine.find_and_modify(&coll, &absent, &Seed);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        // An empty collection, scanned: nothing to tick on either.
+        let failed = bare.find_and_modify(&empty, &Candidates::Scan, &Seed);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_deadline_that_has_passed_before_the_first_chunk_writes_nothing() {
+        let (engine, coll, _dir) = three_chunks();
+        expire_deadline_for_this_test();
+        let failed = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        assert!(claimed(&engine, &coll).is_empty());
+    }
+
+    #[test]
+    fn a_request_deadline_that_passes_after_the_first_commit_does_not_stop_the_request() {
+        // A request that has written something keeps going (ADR-192), so the deadline
+        // is set aside from the second chunk on: the three chunks all land.
+        let (engine, coll, _dir) = three_chunks();
+        crate::sync::race_hooks::at(
+            crate::sync::race_hooks::Race::BetweenChunks,
+            expire_deadline_for_this_test,
+        );
+        let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap();
+        assert_eq!((out.matched, out.commits), (3, 3));
+        assert_eq!(claimed(&engine, &coll), vec![0, 1, 2]);
+        // And the deadline is back once the request is over.
+        assert!(matches!(kimmy_core::deadline::check(), Err(kimmy_core::Error::DeadlineExceeded)));
+    }
+
+    #[test]
+    fn the_scan_of_a_find_and_modify_stops_at_a_passed_deadline_and_writes_nothing() {
+        let (engine, coll, _dir) = three_chunks();
+        expire_deadline_for_this_test();
+        let failed = engine.find_and_modify(&coll, &Candidates::Scan, &claim_all());
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        assert!(claimed(&engine, &coll).is_empty());
     }
 
     #[test]

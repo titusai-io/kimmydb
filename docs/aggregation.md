@@ -2289,6 +2289,45 @@ is planned.
 `$unwind` is checked *while* it expands, not after, because a handful of
 documents holding large arrays can exceed the cap long before the stage ends.
 
+## The request deadline
+
+The document cap bounds the memory a pipeline holds, not the time it takes: an
+expression that iterates (`$reduce` over `$range` inside a `$map`) can cost
+millions of evaluations a document within every cap. A pipeline therefore runs
+under the request's deadline, `server.request_timeout_secs` (30 s by default,
+[ADR-266](decisions.md)). Every stage looks at the clock as it starts, every
+loop in a stage looks at it about every 1 to 10 milliseconds of work, whatever an
+iteration costs (the interval adapts: it reads at every iteration that is dear
+and every few hundred that are cheap; `$map`, `$filter` and `$reduce` count their
+elements, every operator node of an expression counts one and charges what its
+arguments hold, nested values included (and so do `$sortArray`, `$zip`, `$trim`,
+`$replaceOne`, `$replaceAll` and the array forms of `$firstN`, `$maxN` and
+`$stdDevPop`), `$range` counts what it is about to make, and `$sort` is done in
+runs of 4,096 documents
+with a look between them), and the reads of other collections by `$lookup` and
+`$graphLookup` look at it per row; `$unionWith` looks at it per document it
+reads and per document it appends, `$sample` in its reservoir and its shuffle,
+`$redact` for every document it decides at any depth, `$sortByCount` as
+`$group` and `$sort` do, `$setWindowFields` in every loop that walks a partition,
+`$densify` for each document read and each point it generates (the count of
+points it makes before it makes any included), and `$fill` for each document. A pipeline-style update is checked at each of its
+stages for each document, until the update's first commit. Past the deadline the pipeline stops and the
+request is answered `503 timeout`, the answer the server gives a request it
+abandons while waiting, over REST and `/mcp`; its worker is free at once. A
+single operation that cannot be split, such as one regular expression over a
+16 MiB string, is charged by its size before it runs and then runs to its end,
+so a request is late by that one operation, never by the number of nodes in an
+expression or the size of its body. When the node is stopping, a request still
+running ends at the drain deadline's next look, answered `503 node_stopping`.
+
+A trailing `$merge` or `$out` follows ADR-192's rule for a write that commits
+more than once: the deadline cuts it only before its first commit. The pipeline
+that computes the output and the checks before the target is created are under
+the deadline, and a request cut there creates no target and writes nothing
+(`503 timeout`). Once the write has begun it goes to its end and is answered
+with its counts, even if the deadline has passed ([`$merge`](#merge)). A query
+that needs longer than 30 s needs the setting raised.
+
 ---
 
 ## Not supported

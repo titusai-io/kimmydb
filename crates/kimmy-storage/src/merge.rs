@@ -121,7 +121,19 @@ impl Engine {
             if part.is_empty() {
                 return Ok(outcome);
             }
-            match self.write_chunk(outcome.commits > 0, coll, part, mode) {
+            #[cfg(test)]
+            if outcome.commits > 0 {
+                crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BetweenChunks);
+            }
+            // The request's deadline (ADR-266) is looked at before the first chunk and
+            // not after it: a request that has written something keeps going (ADR-192),
+            // so from the second chunk on the deadline is set aside. A stop before the
+            // first commit is a failure of the first chunk and writes nothing.
+            let _suspended = (outcome.commits > 0).then(kimmy_core::deadline::Deadline::suspend);
+            let written = kimmy_core::deadline::check()
+                .map_err(|e| (StorageError::from(e), 0))
+                .and_then(|()| self.write_chunk(outcome.commits > 0, coll, part, mode));
+            match written {
                 Ok((counts, entries)) => {
                     outcome.counts.add(&counts);
                     if !entries.is_empty() {
@@ -152,7 +164,9 @@ impl Engine {
     /// output is answered as one, with nothing written and, when the caller asks
     /// first, nothing created. A document with no `_id` is given one on insert.
     pub fn check_output_ids(&self, docs: &[Document]) -> Result<()> {
+        let mut ticker = kimmy_core::deadline::Ticker::new();
         for doc in docs {
+            ticker.tick()?;
             if let Some(value) = doc.get(ID_FIELD) {
                 let id = DocId::try_from_bson(value)?;
                 if self.caps_apply() {
@@ -199,7 +213,9 @@ impl Engine {
         if !certain {
             return Ok(());
         }
+        let mut ticker = kimmy_core::deadline::Ticker::new();
         for doc in docs {
+            ticker.tick()?;
             if doc.contains_key(ID_FIELD) {
                 self.check_validation(coll, None, doc)?;
             } else {
@@ -245,7 +261,9 @@ impl Engine {
         // with one of them finds that insert in the same transaction, so it is
         // matched by it, as `stored_document` reads.
         let mut inserted = std::collections::HashSet::new();
+        let mut ticker = kimmy_core::deadline::Ticker::new();
         for (position, doc) in docs.iter().enumerate() {
+            ticker.tick()?;
             let certain = match mode {
                 SinkMode::Insert => true,
                 SinkMode::Merge { when_matched, insert_unmatched } => {
@@ -408,7 +426,9 @@ fn stored_document(
 /// chunk that holds the second would leave the first one's chunk written.
 fn refuse_duplicate_ids(docs: &[Document]) -> Result<()> {
     let mut seen = std::collections::HashSet::with_capacity(docs.len());
+    let mut ticker = kimmy_core::deadline::Ticker::new();
     for (index, doc) in docs.iter().enumerate() {
+        ticker.tick()?;
         if doc.get(ID_FIELD).is_none() {
             continue;
         }
@@ -467,6 +487,80 @@ mod tests {
                 assert_eq!(engine.commits(), before, "{mode:?} {bad:?}: nothing committed");
                 assert!(engine.get(&coll, &DocId::Int64(1)).unwrap().is_none());
             }
+        }
+    }
+
+    /// Set an expired deadline on this thread, for the rest of the test: the test's own
+    /// thread ends with it.
+    fn expire_deadline_for_this_test() {
+        std::mem::forget(kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO)));
+    }
+
+    fn output(n: i64) -> Vec<bson::Document> {
+        (0..n).map(|id| doc! { "_id": id, "n": id }).collect()
+    }
+
+    #[test]
+    fn a_deadline_that_has_passed_before_the_first_chunk_writes_nothing() {
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(2);
+        expire_deadline_for_this_test();
+        for mode in [SinkMode::Insert, MERGE] {
+            let before = engine.commits();
+            let err = engine.write_documents(&coll, output(5), mode).unwrap_err();
+            assert!(
+                matches!(err, StorageError::Core(kimmy_core::Error::DeadlineExceeded)),
+                "{mode:?}: {err:?}"
+            );
+            assert_eq!(engine.commits(), before, "{mode:?}: nothing committed");
+            assert!(engine.get(&coll, &DocId::Int64(0)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn a_deadline_that_passes_after_the_first_commit_does_not_stop_the_write() {
+        // ADR-192: once a chunk has committed the request goes to its end.
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(2);
+        crate::sync::race_hooks::at(
+            crate::sync::race_hooks::Race::BetweenChunks,
+            expire_deadline_for_this_test,
+        );
+        let out = engine.write_documents(&coll, output(5), SinkMode::Insert).unwrap();
+        assert_eq!((out.counts.inserted, out.commits), (5, 3));
+        let held: Vec<bool> =
+            (0..5).map(|id| engine.get(&coll, &DocId::Int64(id)).unwrap().is_some()).collect();
+        assert_eq!(held, vec![true; 5]);
+        // And the deadline is back once the write is over.
+        assert!(matches!(kimmy_core::deadline::check(), Err(kimmy_core::Error::DeadlineExceeded)));
+    }
+
+    #[test]
+    fn without_a_deadline_the_same_output_is_written_whole() {
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(2);
+        let out = engine.write_documents(&coll, output(5), SinkMode::Insert).unwrap();
+        assert_eq!((out.counts.inserted, out.commits), (5, 3));
+    }
+
+    #[test]
+    fn the_checks_before_the_first_write_stop_at_a_passed_deadline_too() {
+        let (engine, _coll, _dir) = engine();
+        engine
+            .create_index("app", "rollup", vec![crate::IndexField::ascending("n")], false, None)
+            .unwrap();
+        let indexed = engine.get_collection("app", "rollup").unwrap();
+        expire_deadline_for_this_test();
+        let docs = output(3);
+        for result in [
+            engine.check_output_ids(&docs),
+            engine.check_output_indexes(&indexed, &docs, SinkMode::Insert),
+            engine.check_unique_output_ids(&docs),
+        ] {
+            assert!(
+                matches!(result, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+                "{result:?}"
+            );
         }
     }
 

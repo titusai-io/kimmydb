@@ -82,6 +82,7 @@ impl ArrayAcc {
                     },
                     many => many.iter().map(|e| e.eval_in(scope)).collect::<Result<_>>()?,
                 };
+                super::charge_elements(&values)?;
                 Ok(accumulators::std_dev_of(&values, *sample))
             }
             ArrayAcc::N { kind, input, n } => {
@@ -102,6 +103,8 @@ impl ArrayAcc {
                         )));
                     }
                 };
+                // A pass over the input, and a comparison of its elements for `$maxN` and `$minN`.
+                super::charge_elements(&items)?;
                 let picked = accumulators::n_of_array(*kind, &items, n);
                 // At most the input's elements, and the input is itself bounded; the
                 // check is one pass over the result, for the array limit to hold here too.

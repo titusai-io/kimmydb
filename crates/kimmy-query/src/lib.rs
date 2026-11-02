@@ -8,6 +8,10 @@
 
 pub mod accumulators;
 pub mod aggregate;
+/// Cooperative cancellation at the request's deadline. Lives in `kimmy-core` so that
+/// `kimmy-storage`, which does not depend on this crate, can check it too (ADR-266);
+/// re-exported here, where the executor's loops use it.
+pub use kimmy_core::deadline;
 pub mod budget;
 pub mod densify;
 pub mod expr;
@@ -41,6 +45,8 @@ mod decimal_arith_tests;
 #[cfg(test)]
 mod densify_tests;
 #[cfg(test)]
+mod expr_deadline_tests;
+#[cfg(test)]
 mod facet_tests;
 #[cfg(test)]
 mod fill_tests;
@@ -62,6 +68,8 @@ mod stage_reference_tests;
 mod stage_tests;
 #[cfg(test)]
 mod update_pipeline_tests;
+#[cfg(test)]
+mod window_deadline_tests;
 #[cfg(test)]
 mod window_tests;
 

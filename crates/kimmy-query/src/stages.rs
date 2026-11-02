@@ -9,6 +9,7 @@ use kimmy_core::{Error, Result};
 
 use crate::aggregate::{Accumulator, Limits, Stage, as_document, group_keyed};
 use crate::budget::Lease;
+use crate::deadline::{self, Ticker};
 use crate::expr::{Binding, Expr, REDACT_DESCEND, REDACT_KEEP, REDACT_PRUNE, Scope, type_name};
 use crate::shape::{self, SortKey};
 
@@ -51,10 +52,11 @@ pub(crate) fn sort_by_count(
     held: &mut Lease,
 ) -> Result<Vec<Document>> {
     let fields = [("count".to_string(), Accumulator::Sum(Expr::Literal(Bson::Int32(1))))];
-    let mut groups = group_keyed("$sortByCount", input, &fields, limits, vars, held, |scope| {
+    let groups = group_keyed("$sortByCount", input, &fields, limits, vars, held, |scope| {
         expr.eval_in(scope).map(Some)
     })?;
-    shape::sort(&[SortKey { path: "count".into(), descending: true }], &mut groups);
+    let groups =
+        shape::sort_until_deadline(&[SortKey { path: "count".into(), descending: true }], groups)?;
     Ok(groups)
 }
 
@@ -198,7 +200,10 @@ pub fn sample(
         return Ok(Vec::new());
     }
     let mut reservoir: Vec<Document> = Vec::with_capacity(size.min(input.len()));
+    // A `Ticker` for each of the two loops (ADR-266), so that neither hides the other.
+    let mut ticker = Ticker::new();
     for (seen, doc) in input.into_iter().enumerate() {
+        ticker.tick()?;
         if seen < size {
             reservoir.push(doc);
         } else {
@@ -208,7 +213,9 @@ pub fn sample(
             }
         }
     }
+    let mut ticker = Ticker::new();
     for i in (1..reservoir.len()).rev() {
+        ticker.tick()?;
         reservoir.swap(i, below(i + 1));
     }
     Ok(reservoir)
@@ -247,6 +254,9 @@ fn redact_level(
     expr: &Expr,
     vars: &[Binding<'_>],
 ) -> Result<Option<Document>> {
+    // The thread's shared count (ADR-266): once for each document decided, the top one
+    // and every embedded one the descent reaches, whatever the depth.
+    deadline::tick()?;
     let scope = if std::ptr::eq(current, top) {
         Scope::with_bindings(current, vars)
     } else {
@@ -285,6 +295,7 @@ fn redact_value(
         Bson::Array(items) => {
             let mut kept = Vec::with_capacity(items.len());
             for item in items {
+                deadline::tick()?;
                 match item {
                     Bson::Document(_) | Bson::Array(_) => {
                         if let Some(item) = redact_value(item, top, expr, vars)? {

@@ -128,6 +128,17 @@ impl WalkStop<'_> {
             None => Ok(()),
         }
     }
+
+    /// The request's own deadline (ADR-266), for a row of a [`WalkScope::Request`]
+    /// walk: `Err(Core(DeadlineExceeded))` once the deadline the calling handler set
+    /// for this thread has passed. A walk that serves no client, or runs in a write
+    /// transaction, has no such deadline; neither has a thread whose handler set none.
+    fn deadline(&self) -> Result<()> {
+        match self.stop {
+            Some((_, WalkScope::Request)) => Ok(kimmy_core::deadline::tick()?),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// A table whose `range` and `iter` stop at the node's stop. Everything else
@@ -261,7 +272,7 @@ impl<I> Rows<'_, I> {
         }
         #[cfg(any(test, feature = "test-hooks"))]
         self.walk.count_row();
-        let stop = self.walk.check().err();
+        let stop = self.walk.check().err().or_else(|| self.walk.deadline().err());
         self.stopped = stop.is_some();
         stop
     }
@@ -506,6 +517,40 @@ mod tests {
         let docs = open_walk_table_in(&txn, crate::tables::DOCS, WalkStop::in_write()).unwrap();
         let rows = docs.range(crate::engine::doc_range(coll.id)).unwrap().count();
         assert_eq!(rows, 3);
+    }
+
+    /// A request's walk ends at the deadline the handler set for the thread (ADR-266),
+    /// at the first row it checks; one that serves no client, and one in a write, do not.
+    #[test]
+    fn a_request_walk_stops_at_the_requests_deadline_and_no_other_walk_does() {
+        use kimmy_core::deadline::Deadline;
+        let (engine, coll, _dir) = engine_with(5);
+        let count = |scope: WalkScope| {
+            let mut seen = 0;
+            let outcome = engine.for_each_doc(&coll, scope, |_, _| {
+                seen += 1;
+                Ok(true)
+            });
+            (outcome, seen)
+        };
+        // No deadline: the walk is read to its end.
+        assert_eq!(count(WalkScope::Request).1, 5);
+        let _expired = Deadline::scope(Some(std::time::Duration::ZERO));
+        let (outcome, seen) = count(WalkScope::Request);
+        assert!(
+            matches!(outcome, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{outcome:?}"
+        );
+        assert_eq!(seen, 0, "stopped at the first row it checks");
+        // A walk that serves no client is not the request's.
+        let (outcome, seen) = count(WalkScope::Background);
+        assert!(outcome.is_ok());
+        assert_eq!(seen, 5);
+        // Nor is a walk inside a write transaction.
+        let db = engine.db();
+        let txn = db.begin_write().unwrap();
+        let docs = open_walk_table_in(&txn, crate::tables::DOCS, WalkStop::in_write()).unwrap();
+        assert_eq!(docs.range(crate::engine::doc_range(coll.id)).unwrap().count(), 5);
     }
 
     /// Both ends of a walk stop, and a stopped walk yields its error once.

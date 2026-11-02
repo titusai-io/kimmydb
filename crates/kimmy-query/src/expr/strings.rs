@@ -18,6 +18,7 @@
 use std::cell::RefCell;
 
 use bson::{Bson, Document};
+use kimmy_core::deadline;
 use kimmy_core::regex::{RegexMatch, RegexPattern};
 use kimmy_core::{Error, Result};
 
@@ -167,6 +168,8 @@ impl StrExpr {
                         }
                     },
                 };
+                // The scan is a pass over the text, a test against the set for each character.
+                super::charge_text(input.len())?;
                 Ok(Bson::String(trim(input, chars.as_deref(), *side).to_string()))
             }
             StrExpr::Regex { kind, input, regex, options, compiled } => {
@@ -193,6 +196,8 @@ impl StrExpr {
                 else {
                     return Ok(Bson::Null);
                 };
+                // The scan for `find` is a pass over the text, and each match writes `with`.
+                super::charge_text(input.len().saturating_add(with.len()))?;
                 replace(input, find, with, *all, MAX_STRING_BYTES).map(Bson::String)
             }
         }
@@ -389,6 +394,9 @@ fn eval_regex(
             &owned
         }
     };
+    // The text the pattern is about to scan counts toward the deadline (ADR-266), by sixteens
+    // of bytes, before the scan: the regex engine cannot be interrupted from inside.
+    deadline::tick_n(text.len() / 16)?;
     Ok(match kind {
         RegexKind::Match => Bson::Boolean(pattern.is_match(text)),
         RegexKind::Find => match pattern.first_match(text) {
@@ -419,6 +427,9 @@ pub(super) fn find_all_documents(
     // The match last seen: its byte offset and its code point index.
     let (mut at_byte, mut at_cp) = (0usize, 0usize);
     pattern.try_for_each_match(text, |m| {
+        // Once for each match found (ADR-266): a pattern that matches everywhere over a
+        // long string is one match per code point.
+        deadline::tick()?;
         at_cp += text[at_byte..m.start].chars().count();
         at_byte = m.start;
         bytes = bytes.saturating_add(match_bytes(text, m, found.len()));

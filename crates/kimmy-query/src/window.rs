@@ -33,7 +33,9 @@
 //! Because the bounds are relative to the current document, both ends of the window only ever
 //! move forward as the current document does, so each document is added to the running state once
 //! and removed once ([`crate::window_acc`] holds the states). The loops that walk a partition
-//! are the places a request-deadline tick belongs.
+//! tick the request's deadline (ADR-266) once for each document they pass, on the count the
+//! thread shares (`deadline::tick`): the partition and sort-key build, each output's
+//! computation, and the write-back. A loop added here does the same.
 //!
 //! # Memory
 //!
@@ -53,6 +55,7 @@ use kimmy_core::{Error, Result, path};
 use crate::accumulators::{self, Kind};
 use crate::aggregate::{Accumulator, Limits, group_key, parse_accumulators};
 use crate::budget::Lease;
+use crate::deadline;
 use crate::expr::{Binding, Expr, add_to_date, as_integer, type_name, unit_millis};
 use crate::shape::{self, SortKey};
 use crate::window_acc::{
@@ -809,6 +812,7 @@ pub(crate) fn apply_in(
     let run = Run { vars, max_document_bytes };
     let mut out = Vec::new();
     for docs in partitions {
+        deadline::check()?;
         out.extend(run_partition(spec, docs, &run, lease)?);
     }
     Ok(out)
@@ -825,12 +829,14 @@ fn partitions(
     let mut order: Vec<(Rep, Vec<Document>)> = Vec::new();
     if matches!(partition, Partition::Whole) {
         for doc in &input {
+            deadline::tick()?;
             lease.charge_doc(doc)?;
         }
         return Ok(if input.is_empty() { Vec::new() } else { vec![input] });
     }
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
     for doc in input {
+        deadline::tick()?;
         lease.charge_doc(&doc)?;
         let (key, rep) = partition_key(partition, &doc, vars)?;
         let slot = *index.entry(key).or_insert_with(|| {
@@ -859,10 +865,14 @@ fn run_partition(
         // Sorted once, on the values taken once, which are charged while they are held.
         let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
         for doc in docs {
+            deadline::tick()?;
             let keys = shape::sort_keys(&spec.sort, &doc);
             lease.charge(keys.iter().map(crate::budget::held_bytes_bson).sum())?;
             keyed.push((keys, doc));
         }
+        // The partition is no longer than the pipeline's document limit and the keys are
+        // taken, so the comparison sort is bounded; the look before it is the last one.
+        deadline::check()?;
         keyed.sort_by(|a, b| shape::compare_keys(&spec.sort, &a.0, &b.0));
         docs = keyed.into_iter().map(|(_, d)| d).collect();
     }
@@ -873,6 +883,7 @@ fn run_partition(
         results.push(compute(&output.func, &docs, &spec.sort, run, &mut sink)?);
     }
     for (i, doc) in docs.iter_mut().enumerate() {
+        deadline::tick()?;
         let mut added = false;
         for (output, cells) in spec.outputs.iter().zip(&results) {
             if let Some(v) = cells.at(i) {
@@ -947,6 +958,7 @@ fn compute(
             let mut previous: Option<Option<Bson>> = None;
             let mut out = Vec::with_capacity(n);
             for (i, doc) in docs.iter().enumerate() {
+                deadline::tick()?;
                 // Documents tie when the value is the same; a missing one is not a null one.
                 let value = raw(doc, path);
                 let tie = match (&previous, &value) {
@@ -976,6 +988,7 @@ fn compute(
             };
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
+                deadline::tick()?;
                 let at = i as i128 + i128::from(*by);
                 let v = if at >= 0 && (at as usize) < n {
                     // A shifted document that has no value leaves the field out.
@@ -994,6 +1007,7 @@ fn compute(
             let y = numeric_inputs(input, docs, run.vars)?;
             let mut out = Vec::with_capacity(n);
             for &(s, e) in &ends {
+                deadline::tick()?;
                 let v = if e - s < 2 {
                     Bson::Null
                 } else {
@@ -1025,6 +1039,7 @@ fn compute(
             let mut ema: Option<Raw> = None;
             let mut out = Vec::with_capacity(n);
             for doc in docs {
+                deadline::tick()?;
                 // A value that is not a number leaves the average where it is.
                 let value = eval(input, doc, run.vars)?;
                 if let Some(x) = ema_term(&value) {
@@ -1048,6 +1063,7 @@ fn compute(
             let mut last = Bson::Null;
             let mut out = Vec::with_capacity(n);
             for doc in docs {
+                deadline::tick()?;
                 let v = eval(expr, doc, run.vars)?;
                 if !matches!(v, Bson::Null) {
                     last = v;
@@ -1101,6 +1117,7 @@ impl Axis {
         let mut nums: Vec<f64> = Vec::with_capacity(docs.len());
         let mut dates: Vec<i64> = Vec::new();
         for doc in docs {
+            deadline::tick()?;
             let found = raw(doc, path);
             match &found {
                 Some(Bson::DateTime(_)) if !nums.is_empty() => {
@@ -1198,6 +1215,7 @@ fn endpoints(
             match &axis {
                 Axis::Num(v) => {
                     for i in 0..n {
+                        deadline::tick()?;
                         let s = match lo {
                             RangeBound::Unbounded => 0,
                             RangeBound::Current => i,
@@ -1224,6 +1242,7 @@ fn endpoints(
                         ));
                     };
                     for i in 0..n {
+                        deadline::tick()?;
                         let s = match lo {
                             RangeBound::Unbounded => 0,
                             RangeBound::Current => i,
@@ -1301,6 +1320,7 @@ fn accumulator(
         Accumulator::First(expr) | Accumulator::Last(expr) => {
             let first = matches!(acc, Accumulator::First(_));
             for &(s, e) in ends {
+                deadline::tick()?;
                 let at = (s < e).then(|| if first { s } else { e - 1 });
                 let v = edge(expr, at)?;
                 sink.charge(&v)?;
@@ -1310,6 +1330,7 @@ fn accumulator(
         }
         Accumulator::Ext(spec) if spec.kind == Kind::Count => {
             for &(s, e) in ends {
+                deadline::tick()?;
                 let count = e - s;
                 let v = Some(match i32::try_from(count) {
                     Ok(c) => Bson::Int32(c),
@@ -1373,6 +1394,7 @@ fn slide(
     if ends.iter().all(|&e| e == (0, n)) {
         // The same answer for every document: computed once, charged for every copy.
         for i in 0..n {
+            deadline::tick()?;
             slider.add(i, docs)?;
         }
         let v = Some(slider.value(docs, 0, n)?);
@@ -1385,7 +1407,7 @@ fn slide(
     let mut at = (0usize, 0usize);
     let mut previous: Option<((usize, usize), Bson)> = None;
     for &(s, e) in ends {
-        // A request-deadline tick goes here (ADR-266).
+        deadline::tick()?;
         if let Some((window, v)) = &previous
             && *window == (s, e)
         {
@@ -1446,6 +1468,7 @@ fn numeric_inputs(input: &Expr, docs: &[Document], vars: &[Binding<'_>]) -> Resu
     let mut first_bad = None;
     let mut count = 0;
     for doc in docs {
+        deadline::tick()?;
         let v = eval(input, doc, vars)?;
         match accumulators::numeric(&v) {
             Some(x) => values.push(x),
@@ -1476,6 +1499,7 @@ fn integral(ends: &[(usize, usize)], x: &Axis, y: &Inputs, sink: &mut Sink<'_>) 
     let (mut a_lo, mut a_hi) = (0usize, 0usize);
     let mut out = Vec::with_capacity(n);
     for &(s, e) in ends {
+        deadline::tick()?;
         let v = if e - s < 2 {
             // The reference answers an integer zero over a number line, a double over dates.
             if x.is_date() { Bson::Double(0.0) } else { Bson::Int32(0) }
@@ -1523,12 +1547,14 @@ fn linear_fill(
         Axis::Date(v, _) => v.iter().map(|&ms| ms as f64).collect(),
     };
     for pair in xs.windows(2) {
+        deadline::tick()?;
         if pair[0] == pair[1] {
             return bad("$linearFill: there can be no repeated values in the sort field");
         }
     }
     let mut values = Vec::with_capacity(n);
     for doc in docs {
+        deadline::tick()?;
         let v = eval(expr, doc, run.vars)?;
         if !matches!(v, Bson::Null) && accumulators::numeric(&v).is_none() {
             return bad(format!("$linearFill needs numbers, found {}", type_name(&v)));
@@ -1539,6 +1565,7 @@ fn linear_fill(
     let mut before: Vec<Option<usize>> = vec![None; n];
     let mut last = None;
     for i in 0..n {
+        deadline::tick()?;
         if !matches!(values[i], Bson::Null) {
             last = Some(i);
         }
@@ -1547,6 +1574,7 @@ fn linear_fill(
     let mut after: Vec<Option<usize>> = vec![None; n];
     let mut next = None;
     for i in (0..n).rev() {
+        deadline::tick()?;
         if !matches!(values[i], Bson::Null) {
             next = Some(i);
         }
@@ -1560,6 +1588,7 @@ fn linear_fill(
     };
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
+        deadline::tick()?;
         let v = if !matches!(values[i], Bson::Null) {
             values[i].clone()
         } else if let (Some(a), Some(b)) = (before[i], after[i]) {

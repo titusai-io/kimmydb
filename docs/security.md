@@ -982,7 +982,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **Federated `admin`** | By design | `admin` is local-only, so a compromised identity provider cannot mint a superuser ([ADR-067](decisions.md)) |
 | **Rate limiting** | ✅ login · ✅ per principal, opt-in | See [Login rate limiting](#login-rate-limiting) and [Limits on authenticated requests](#limits-on-authenticated-requests). Per-*address* limiting of authenticated routes is still a proxy's job |
 | **A slow or oversized request from an authenticated caller** | ✅ Built | A request deadline and a body ceiling, both settings with defaults matching what the server always did — see [Limits on authenticated requests](#limits-on-authenticated-requests) |
-| **A slow query** | 📋 | The deadline does not interrupt storage work already running: a scan or a bulk commit runs to completion. There is no query timeout yet ([ADR-099](decisions.md)) |
+| **A slow query** | ✅ Built, in part | The request deadline ends an aggregation (every operator node of an expression ticks, and charges the size of what it reads, nested values included), a `find`, `count` or `describe` scan, the exact vector scan, the keyword half of `hybrid_search`, and an update, delete or find-and-modify that has not yet written, at the next look at the clock (`503 timeout`, [ADR-266](decisions.md)). A request is late by at most one operation that cannot be interrupted (one regular expression over a long text, one sort), not by the number of nodes in an expression or the size of its body. When the node stops, a request still running such work ends at the drain deadline (`503 node_stopping`) instead of holding the storage engine open. An index build, a bulk insert, a replace (`PUT`), a backup, a restore and a database drop still run to completion ([ADR-099](decisions.md)) |
 | **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |
 | **No document- or field-level security** | Not planned | Collection is the finest granularity — see [How far authorization goes](#how-far-authorization-goes) |
 | **No attribute-based access control** | By design | RBAC only. No policy engine, no OPA, no Cedar — see [How far authorization goes](#how-far-authorization-goes) |
@@ -1305,17 +1305,23 @@ per_principal = 0              # requests per principal per window; 0 disables
 per_principal_window_secs = 60
 ```
 
-**The deadline bounds waiting, not working.** It wraps every REST route that
-answers with a document and fires when the request is still *pending* at the
-deadline. In this server a request is pending in two places: while its body is
-still arriving, and while an embedding provider is being waited on. Both are
-where an authenticated caller can impose cost for free, and both are cut off
-with `503 timeout` (`retry: wait`). Storage work is synchronous and never
-yields, so a scan, a bulk insert, an index backfill or a database drop runs to
-completion and is answered with its result however long it took — which is why
-none of them needs an exemption, and why this is **not a query timeout**. The
-change-stream upgrade (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` answer with
-a connection rather than a document and carry no deadline at all.
+**The deadline bounds waiting, and the synchronous work that looks at it.** It
+wraps every REST route that answers with a document and fires when the request
+is still *pending* at the deadline. In this server a request is pending in two
+places: while its body is still arriving, and while an embedding provider is
+being waited on. Both are where an authenticated caller can impose cost for
+free, and both are cut off with `503 timeout` (`retry: wait`). Synchronous work
+never yields, so the future's timeout cannot end it; the work that can be
+cancelled cooperatively ends itself instead ([ADR-266](decisions.md)): an
+aggregation, a `find` or `count` scan and an update, delete or find-and-modify
+that has not yet written read the deadline every millisecond or so of work and stop with
+the same `503 timeout`, freeing the worker. An index build, a bulk insert, a
+backup, a restore and a database drop are not cut and are answered with their
+result however long they took. The
+change-stream upgrade (`/v1/db/{db}/coll/{coll}/watch`) answers with a
+connection rather than a document and carries no deadline; an `/mcp` tool call
+carries the same deadline as a REST request, and an aggregation it runs is cut
+at it.
 
 **The body ceiling is the one that was always there.** 2 MiB is what axum
 enforced on its own before the setting existed; it is a setting now so an

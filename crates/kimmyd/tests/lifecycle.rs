@@ -1861,6 +1861,62 @@ async fn a_backup_in_flight_at_the_stop_ends_at_the_drain_deadline() {
     .await;
 }
 
+/// A request running one long expression, which is synchronous work on a worker thread, ends
+/// at the drain's deadline (ADR-266): the stop is read at the deadline's next check, so the
+/// thread lets go of the engine and the store closes, rather than the thread running on to the
+/// request's own deadline (30 s here), past the stop's 22 s, and the node exiting 75 with the
+/// next start repairing the store. The expression is the review's: one `$and` of thousands of
+/// comparisons of a stored value of 100,000 elements, which cost seconds each hundred in this
+/// build and tick once for each node.
+#[tokio::test]
+async fn a_long_expression_in_flight_at_the_stop_ends_at_the_drain_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn(dir.path(), "long-expression");
+    run.wait_ready(&client).await;
+    let token = root_token(&run, &client).await;
+    for (path, body) in [
+        ("/v1/db/shop/collections", serde_json::json!({ "name": "orders" })),
+        (
+            "/v1/db/shop/coll/orders/bulk",
+            serde_json::json!([{ "_id": 1, "p": { "q": (0..100_000).collect::<Vec<i32>>() } }]),
+        ),
+    ] {
+        let res = client.post(format!("{}{path}", base(&run))).bearer_auth(&token).json(&body);
+        assert!(res.send().await.unwrap().status().is_success(), "{path}");
+    }
+    // Six thousand nodes: a minute in this build, if nothing ended them.
+    let comparisons: Vec<_> =
+        (0..6_000).map(|_| serde_json::json!({ "$eq": ["$p", "$p"] })).collect();
+    let pipeline =
+        serde_json::json!({ "pipeline": [{ "$project": { "x": { "$and": comparisons } } }] });
+    let url = format!("{}/v1/db/shop/coll/orders/aggregate", base(&run));
+    let asked = Instant::now();
+    let request = tokio::spawn({
+        let client = client.clone();
+        let token = token.clone();
+        async move { client.post(url).bearer_auth(token).json(&pipeline).send().await }
+    });
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let (status, took) = stop(&mut run);
+    let log = run.log();
+    assert!(status.success(), "{status:?}: {log}");
+    assert!(!log.contains("still held by a thread"), "{log}");
+    assert!(log.contains("engine closed"), "{log}");
+    // The drain is ten seconds, begun at the signal; the thread ends at its next check.
+    assert!(took < Duration::from_secs(16), "the expression held the stop: {took:?}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+    // The request did not get its answer: it was cut with its connection, or answered that the
+    // node is stopping. It was not left to run on, and it did not finish.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
+    assert!(asked.elapsed() < Duration::from_secs(25), "{:?}", asked.elapsed());
+    if let Ok(response) = outcome {
+        assert_eq!(response.status(), 503, "an answer to a cut request is a 503");
+    }
+    let next = next_start_log(dir.path(), "long-expression-next", &client).await;
+    assert!(!next.contains("repairing the database"), "{next}");
+}
+
 /// A search that builds its collection's vector graph is a client's
 /// request too: the walks that count and read the vectors end at the
 /// drain's deadline, and the build with them.

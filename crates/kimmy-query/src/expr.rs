@@ -90,7 +90,7 @@ use std::cmp::Ordering;
 use bson::{Bson, Document};
 use kimmy_core::decimal::arith::{self, ExactSum};
 use kimmy_core::decimal::{Raw, decode_raw, pack_raw};
-use kimmy_core::{Error, Result, canonical_cmp, path};
+use kimmy_core::{Error, Result, canonical_cmp, deadline, path};
 
 use crate::shape::{self, SortKey};
 
@@ -1802,6 +1802,16 @@ impl Expr {
 
     /// Resolve in a scope that may already bind variables.
     pub fn eval_in(&self, scope: &Scope<'_>) -> Result<Bson> {
+        // One tick for every node that is an operation: an operator (both arms, `$and`, `$or`
+        // and `$cond` among them, which are lazy), `$sortArray`, `$zip`, the string forms, the
+        // N accumulators, the dates, `$convert`, `$let`, the document operators and the
+        // literals that build an array or a document. A field read, a variable and a literal
+        // value do not tick. This is what bounds an expression of many nodes, each cheap or
+        // dear, by the number of nodes whatever it reads (ADR-266, review q8d3, M4); the big
+        // arguments of one node are charged on top (`charge_values`).
+        if !matches!(self, Expr::Field(_) | Expr::Var { .. } | Expr::Literal(_)) {
+            deadline::tick()?;
+        }
         match self {
             Expr::Field(p) => Ok(field_path(scope.root, p).unwrap_or(Bson::Null)),
             Expr::Var { name, path } => eval_variable(name, path.as_deref(), scope),
@@ -1869,6 +1879,8 @@ impl Expr {
                 let Some(items) = iteration_input("$sortArray", input.eval_in(scope)?)? else {
                     return Ok(Bson::Null);
                 };
+                // The sort is a comparison of every element, nested ones included.
+                charge_elements(&items)?;
                 Ok(Bson::Array(sort_array(items, order)))
             }
             Expr::Zip { inputs, longest, defaults } => {
@@ -2168,6 +2180,9 @@ fn eval_filter(
         if limit.is_some_and(|n| out.len() >= n) {
             break;
         }
+        // The thread's shared count (ADR-266): an iteration operator is evaluated for
+        // each document, often over a few elements, and a nested one multiplies.
+        deadline::tick()?;
         let frame = [(as_name, item)];
         if truthy(&cond.eval_in(&scope.nested(&frame))?) {
             out.push(item.clone());
@@ -2183,6 +2198,7 @@ fn eval_map(input: &Expr, as_name: &str, body: &Expr, scope: &Scope<'_>) -> Resu
     let mut out = Vec::with_capacity(items.len());
     let mut budget = ArrayBudget::new("the array $map builds", MAX_ARRAY_BYTES);
     for item in &items {
+        deadline::tick()?;
         let frame = [(as_name, item)];
         let mapped = body.eval_in(&scope.nested(&frame))?;
         budget.add(&mapped)?;
@@ -2199,6 +2215,7 @@ fn eval_reduce(input: &Expr, initial: &Expr, body: &Expr, scope: &Scope<'_>) -> 
     // refer to `$$this`, and there is no element for it to refer to.
     let mut acc = initial.eval_in(scope)?;
     for item in &items {
+        deadline::tick()?;
         let frame = [("value", &acc), ("this", item)];
         let next = body.eval_in(&scope.nested(&frame))?;
         acc = next;
@@ -2255,6 +2272,8 @@ fn eval_zip(
     // Every input's type is checked before a null is honoured, so a non-array
     // is refused wherever it stands.
     let values = inputs.iter().map(|e| e.eval_in(scope)).collect::<Result<Vec<_>>>()?;
+    // The rows are made from copies of every element of every input.
+    charge_values(&values)?;
     let mut arrays = Vec::with_capacity(values.len());
     let mut any_null = false;
     for value in &values {
@@ -2323,7 +2342,74 @@ pub(crate) fn count_bson(n: usize) -> Bson {
     integer_bson(i64::try_from(n).unwrap_or(i64::MAX))
 }
 
+/// The deepest level of nesting [`weigh`] counts into; a value nested deeper than this is
+/// weighed as if its inner part held one element.
+const WEIGH_DEPTH: u32 = 64;
+
+/// What a value asks of an operator that reads all of it, in elements and characters: the
+/// elements of an array and the fields of a document **at every level of nesting**, and a
+/// string's length over sixteen. A value is walked once, and the walk is bounded by the
+/// value, which is already in memory (the argument was cloned out of the document to get
+/// here), so it costs no more than that copy did. It is what lets a single operator over a
+/// document that holds a megabyte in one field be charged its megabyte (ADR-266, review
+/// q8d3, M4): a top-level count weighed that document as one field.
+fn weigh(value: &Bson, depth: u32) -> usize {
+    match value {
+        Bson::Array(items) => {
+            if depth >= WEIGH_DEPTH {
+                return items.len();
+            }
+            items.iter().fold(items.len(), |sum, item| sum.saturating_add(weigh(item, depth + 1)))
+        }
+        Bson::Document(doc) => {
+            if depth >= WEIGH_DEPTH {
+                return doc.len();
+            }
+            doc.iter().fold(doc.len(), |sum, (_, item)| sum.saturating_add(weigh(item, depth + 1)))
+        }
+        Bson::String(text) => text.len() / 16,
+        _ => 0,
+    }
+}
+
+/// What the values ask of the operator that is about to read them, charged to the
+/// deadline's count before it runs (ADR-266): every element, field and sixteen bytes of text
+/// in them, nested or not ([`weigh`]). A bulk operator (a set operator, `$sortArray`,
+/// `$concatArrays`, `$zip`, `$in`, `$split`, `$replaceAll`, `$objectToArray`, an array
+/// `$sum`) and a comparison of two big documents do work in proportion to this, without a
+/// loop of their own that ticks, so an operator over a big value reads the clock at once
+/// however it is nested, and a charge of 32 or more is made in one call. Nothing is weighed
+/// when no deadline is set.
+fn charge_values<'a>(values: impl IntoIterator<Item = &'a Bson>) -> Result<()> {
+    if !deadline::Deadline::is_set() {
+        return Ok(());
+    }
+    let weight = values.into_iter().fold(0usize, |sum, v| sum.saturating_add(weigh(v, 0)));
+    if weight >= 32 { deadline::tick_n(weight) } else { Ok(()) }
+}
+
+/// [`charge_values`] for the elements of an array the operator is about to walk: each
+/// element counts as one, and so does everything inside it.
+fn charge_elements(items: &[Bson]) -> Result<()> {
+    if !deadline::Deadline::is_set() {
+        return Ok(());
+    }
+    let weight = items.iter().fold(items.len(), |sum, v| sum.saturating_add(weigh(v, 1)));
+    if weight >= 32 { deadline::tick_n(weight) } else { Ok(()) }
+}
+
+fn charge_bulk(args: &[Bson]) -> Result<()> {
+    charge_values(args)
+}
+
+/// [`charge_values`] for a text of `bytes` bytes that is not held as a value.
+fn charge_text(bytes: usize) -> Result<()> {
+    let weight = bytes / 16;
+    if weight >= 32 && deadline::Deadline::is_set() { deadline::tick_n(weight) } else { Ok(()) }
+}
+
 fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
+    charge_bulk(args)?;
     match op {
         Op::Add => arithmetic_add(args),
         Op::Subtract => arithmetic_subtract(&args[0], &args[1]),
@@ -3299,6 +3385,8 @@ fn range_within(args: &[Bson], max: usize) -> Result<Bson> {
     let span = if step > 0 { end.saturating_sub(start) } else { start.saturating_sub(end) };
     let count = if span <= 0 { 0 } else { span.unsigned_abs().div_ceil(step.unsigned_abs()) };
     check_array_bytes("the array $range builds", range_bytes(count), max)?;
+    // The elements about to be made count as ticks (ADR-266): their number, not this call.
+    deadline::tick_n(usize::try_from(count).unwrap_or(usize::MAX))?;
     Ok(Bson::Array((0..count as i64).map(|i| Bson::Int32((start + i * step) as i32)).collect()))
 }
 

@@ -20,6 +20,7 @@ use kimmy_core::{Error, Result, path};
 
 use crate::aggregate::{Limits, check_built_document};
 use crate::budget::held_frame_growth;
+use crate::deadline;
 use crate::expr::{Binding, Expr, Scope, type_name};
 use crate::window::{
     Func, Output, Partition, WindowSpec, apply_in, buffer_name, check_output_name, element_bytes,
@@ -197,6 +198,7 @@ pub fn apply(
         return Ok(docs);
     }
     for doc in &mut docs {
+        deadline::tick()?;
         // Every value is read from the document before any is written, as `$addFields` does.
         let mut fills: Vec<(&str, Option<Bson>)> = Vec::new();
         for (name, expr) in &spec.values {
