@@ -123,3 +123,84 @@ fn reaching_is_the_standard_scale_and_one_limb_for_each_19_digits_of_the_exponen
         previous = places;
     }
 }
+
+/// A magnitude read from its decimal digits, in base-10^19 limbs from the right: independent of
+/// the code under test.
+fn mag(digits: &str) -> Mag {
+    let digits = digits.trim_start_matches('0').as_bytes();
+    let mut limbs = Vec::new();
+    let mut end = digits.len();
+    while end > 0 {
+        let start = end.saturating_sub(19);
+        limbs.push(digits[start..end].iter().fold(0u64, |n, d| n * 10 + u64::from(d - b'0')));
+        end = start;
+    }
+    Mag(limbs)
+}
+
+/// `coefficient · 10^exponent` truncated at `places` places, as digits, worked out on strings: the
+/// digits and `shift` zeros when the exponent is at or above `-places`; otherwise the digits with
+/// the last `-shift` cut off (nothing left is zero), and zero whatever the digits when more than
+/// `PREC + 1` (35) are to be cut, which is the contract for an operand of up to 34 digits.
+fn truncated(coefficient: &str, exponent: i64, places: i64) -> String {
+    let shift = exponent + places;
+    if shift >= 0 {
+        return format!("{coefficient}{}", "0".repeat(shift as usize));
+    }
+    let cut = (-shift) as usize;
+    if cut > 35 || cut >= coefficient.len() {
+        return "0".to_string();
+    }
+    coefficient[..coefficient.len() - cut].to_string()
+}
+
+#[test]
+fn of_decimal_is_the_coefficient_times_a_power_of_ten_cut_to_the_scale() {
+    // 36 digits, so that a cut of 1, 2, 19, 34 and 35 digits each leaves something to see; 37
+    // digits, for a cut of 36, which the function answers as zero.
+    const C36: &str = "123456789012345678901234567890123456";
+    const C37: &str = "1234567890123456789012345678901234567";
+    for limbs in [1usize, 2, 6] {
+        let places = limbs as i64 * 19;
+        let scale = Scale { limbs };
+        for coefficient in ["0", "5", "123", "1230", "9999999999999999999", C36, C37] {
+            let value: u128 = coefficient.parse().unwrap();
+            // From well above the scale (a shift of 25) down to cuts of 40 digits, every one:
+            // the shift of 0 exactly, the cuts of 1, 2 and 19, and the boundary 35 and 36 among.
+            for shift in -40..=25i64 {
+                let exponent = shift - places;
+                let got = scale.of_decimal(value, exponent);
+                let want = mag(&truncated(coefficient, exponent, places));
+                assert_eq!(
+                    got, want,
+                    "{coefficient} E{exponent} at {places} places (shift {shift})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn of_decimal_is_exact_at_the_named_cuts() {
+    // 19 places, `C36` cut by 1, 2 and 19 digits, to the digit.
+    const C36: &str = "123456789012345678901234567890123456";
+    let scale = Scale { limbs: 1 };
+    let at = |shift: i64| scale.of_decimal(C36.parse().unwrap(), shift - 19);
+    assert_eq!(at(0), mag(C36), "a shift of exactly 0 keeps every digit");
+    assert_eq!(at(1), mag("1234567890123456789012345678901234560"));
+    assert_eq!(at(-1), mag("12345678901234567890123456789012345"));
+    assert_eq!(at(-2), mag("1234567890123456789012345678901234"));
+    assert_eq!(at(-19), mag("12345678901234567"));
+    assert_eq!(at(-34), mag("12"));
+    // The boundary: 35 digits cut still leaves the first digit; 36 digits are cut to nothing.
+    assert_eq!(at(-35), mag("1"));
+    assert_eq!(at(-36), Mag::zero());
+    assert_eq!(at(-37), Mag::zero());
+    // Past the legal width of a coefficient (34 digits) a cut of more than `PREC + 1` is zero
+    // though digits remain: the 37-digit coefficient cut by 36.
+    let wide = |shift: i64| {
+        scale.of_decimal("1234567890123456789012345678901234567".parse().unwrap(), shift - 19)
+    };
+    assert_eq!(wide(-35), mag("12"));
+    assert_eq!(wide(-36), Mag::zero());
+}
