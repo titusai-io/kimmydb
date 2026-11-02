@@ -172,7 +172,12 @@ mod trig_tests;
 /// every digit that rounding to 34 needs.
 const SERIES: Scale = Scale { limbs: SL + 1 };
 
-/// The ratio of two operands, in adjusted exponent, from which `atan2` answers `y / x` directly: `atan(r) = r - r^3/3`, and `r^2` is below `10^-158`.
+/// The ratio of two operands, in adjusted exponent, beyond which `atan2` stops widening its
+/// scale for the ratio. For a positive `x` the answer is then `y / x` itself, rounded once
+/// (`atan(r) = r - r^3/3`, and `r^2` is below `10^-158`); for a negative `x` the angle is
+/// computed as ever, `pi` less the arctangent, at a scale capped at this many digits of ratio
+/// (11 limbs), which keeps the cost bounded and loses nothing: a ratio below `10^-80` does not
+/// reach the 34th digit of a result near `pi`.
 const DIRECT_RATIO: i64 = 80;
 
 fn negate(x: &Fx) -> Fx {
@@ -855,9 +860,11 @@ pub fn atan2(y: &Raw, x: &Raw) -> Raw {
             Class::Number { coefficient: cy, exponent: ey, adjusted: ay, .. },
             Class::Number { coefficient: cx, exponent: ex, adjusted: ax, .. },
         ) => {
-            // `atan(|y| / |x|)`, in a scale wide enough for a ratio as small as the operands
-            // make it (up to 80 digits), `pi/2` when the ratio is past 120 digits, and for a
-            // smaller ratio and a positive `x` the ratio itself, rounded once.
+            // `atan(|y| / |x|)` in a scale wide enough for a ratio as small as the operands
+            // make it, but no wider than 80 digits of ratio; `pi/2` when the ratio is past 120
+            // digits the other way; and a positive `x` with a ratio below that is answered by
+            // the ratio itself, rounded once. A negative `x` is `pi` less the angle, computed
+            // at the capped scale.
             if ax - ay > DIRECT_RATIO && !x_negative {
                 return small_ratio(y_negative, (cy, ey), (cx, ex));
             }
@@ -881,10 +888,11 @@ pub fn atan2(y: &Raw, x: &Raw) -> Raw {
     }
 }
 
-/// `±|y| / |x|` for operands whose ratio is below `10^-79`, rounded once: the arctangent of it
-/// is the ratio less a part below `10^-158` of it, so the answer is the ratio's nearest
-/// 34 digits, the part counting only as the hair below an exact one. The quotient is taken to
-/// 40 digits or more, and a division with no remainder is one unit short and sticky.
+/// `±|y| / |x|` for a positive `x` and operands whose ratio is below `10^-79`, rounded once:
+/// the arctangent of it is the ratio less a part below `10^-158` of it, so the answer is the
+/// ratio's nearest 34 digits, the part counting only as the hair below an exact one. The
+/// quotient is taken to 40 digits or more, and a division with no remainder is one unit short
+/// and sticky.
 fn small_ratio(negative: bool, (cy, ey): (u128, i64), (cx, ex): (u128, i64)) -> Raw {
     let lift = (40 + i64::from(digits_u128(cx)) - i64::from(digits_u128(cy))).max(0);
     let mut numerator = Mag::from_u128(cy);
