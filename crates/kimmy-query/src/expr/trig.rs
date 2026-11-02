@@ -191,7 +191,7 @@ fn plain(op: Op, n: Num) -> Result<Bson> {
 /// runs: its adjusted exponent, since an operand of `1E+6000` is reduced modulo `pi/2` with a
 /// division of numbers some thousands of digits long. A charge past the stride reads the clock
 /// at once (ADR-266), so a late switch to such an operand ends at the deadline.
-fn reduction_ticks(x: &Raw) -> usize {
+pub(super) fn reduction_ticks(x: &Raw) -> usize {
     match x {
         Raw::Finite { coefficient, exponent, .. } if *coefficient != 0 => {
             let digits = coefficient.ilog10() as i64 + 1;
@@ -343,7 +343,7 @@ fn is_one(x: &Raw) -> bool {
 /// the register); this is the logarithm, which is what its double form and its base-2 and
 /// base-10 forms answer. An infinite `x` is an infinity of the sign of `ln(base)`, an infinite
 /// base makes the answer a zero (or a `NaN` beside an infinite `x`).
-fn decimal_log(x: &Raw, base: &Raw) -> Raw {
+pub(super) fn decimal_log(x: &Raw, base: &Raw) -> Raw {
     let is = |n: i64| arith::sub(base, &arith::from_i64(n)).is_zero();
     if is(2) {
         return func::log2(x).unwrap_or(Raw::Nan);
