@@ -617,3 +617,19 @@ fn the_value_bound_and_the_budget_each_refuse_alone_and_count_the_same_bytes_onc
         matches!(&err, Error::ValueTooLarge { what, .. } if what.starts_with("the buckets of $group"))
     );
 }
+
+#[test]
+fn merge_objects_is_charged_by_the_document_it_builds_not_by_the_documents_it_reads() {
+    // Forty documents each with a field of its own: the merged document holds all forty.
+    let input: Vec<Document> = (0..40).map(|i| doc! {format!("f{i}"): "y".repeat(300)}).collect();
+    let held_in = docs_bytes(&input);
+    let stage = doc! {"$group": {"_id": null, "m": {"$mergeObjects": "$$ROOT"}}};
+    let smallest = smallest_cap(&stage, &input, 4 * held_in);
+    assert!(smallest >= held_in + 40 * 300, "the merged fields are charged: {smallest}");
+    assert!(smallest < held_in + 40 * 330 + 400, "and once: {smallest}");
+    // The same field set over and over is one field, however many documents set it.
+    let same: Vec<Document> = (0..40).map(|_| doc! {"f": "y".repeat(300)}).collect();
+    let held_same = docs_bytes(&same);
+    let smallest = smallest_cap(&stage, &same, 4 * held_same);
+    assert!(smallest < held_same + 600, "{smallest}");
+}
