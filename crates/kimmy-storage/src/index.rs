@@ -4355,6 +4355,148 @@ mod tests {
         assert_eq!(outcome.entries, 200);
     }
 
+    /// A hold that counts what it is given and refuses past `room` keys.
+    struct StubHold {
+        room: usize,
+        held: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+        takes: std::cell::Cell<usize>,
+        give_alls: std::cell::Cell<usize>,
+    }
+
+    impl StubHold {
+        fn with_room(room: usize) -> Self {
+            StubHold {
+                room,
+                held: Default::default(),
+                peak: Default::default(),
+                takes: Default::default(),
+                give_alls: Default::default(),
+            }
+        }
+    }
+
+    impl crate::KeyHold for StubHold {
+        fn take(&self, _len: usize) -> kimmy_core::Result<()> {
+            self.takes.set(self.takes.get() + 1);
+            self.held.set(self.held.get() + 1);
+            self.peak.set(self.peak.get().max(self.held.get()));
+            if self.held.get() > self.room {
+                return Err(CoreError::Limit("the stub is full".into()));
+            }
+            Ok(())
+        }
+        fn give(&self, _len: usize) {
+            self.held.set(self.held.get() - 1);
+        }
+        fn give_all(&self) {
+            self.give_alls.set(self.give_alls.get() + 1);
+            self.held.set(0);
+        }
+    }
+
+    /// An inexact range (`n >= 0` under an index on `n`, delivered in `_id` order) over 200
+    /// documents, walked with the keys charged to `hold`: the ids taken until `stop_after`,
+    /// and the outcome, or the error.
+    fn walk_held(
+        order: CandidateOrder<'_>,
+        hold: &StubHold,
+        stop_after: usize,
+        fail_at: Option<usize>,
+    ) -> Result<(Vec<i64>, IndexScanOutcome)> {
+        let (engine, coll, _dir) = engine();
+        for i in 0..200i64 {
+            engine.insert(&coll, doc! { "_id": i, "n": i }).unwrap();
+        }
+        engine.create_index("app", "docs", vec![IndexField::ascending("n")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let plan = plan_for(&coll, &doc! { "n": { "$gte": 0 } });
+        assert!(!plan.exact, "a range is delivered in `_id` order by collecting its keys");
+        let scan = IndexScan {
+            index_id: plan.index_id,
+            ranges: &plan.ranges,
+            both_bounds: plan.both_bounds,
+            exact: plan.exact,
+        };
+        let mut ids = Vec::new();
+        let outcome = engine.visit_index_candidates_held(
+            &coll,
+            &scan,
+            order,
+            crate::WalkScope::Request,
+            Some(hold),
+            |_, _, doc| {
+                ids.push(doc.get_i64("_id").unwrap());
+                if fail_at == Some(ids.len()) {
+                    return Err(StorageError::Core(CoreError::Limit("the visitor failed".into())));
+                }
+                Ok(ids.len() < stop_after)
+            },
+        )?;
+        Ok((ids, outcome.expect("the scan should not be refused")))
+    }
+
+    #[test]
+    fn the_keys_of_an_inexact_range_are_charged_as_they_are_collected_and_given_back() {
+        // No `want`: every key of the range is collected before the first document, so every
+        // key is taken, 200 held at the peak, and all are given back when the pass is done.
+        let hold = StubHold::with_room(usize::MAX);
+        let (ids, outcome) =
+            walk_held(CandidateOrder::ById { after: None, want: None }, &hold, usize::MAX, None)
+                .unwrap();
+        assert_eq!(ids, (0..200).collect::<Vec<_>>(), "the whole range, in `_id` order");
+        assert_eq!((hold.takes.get(), hold.peak.get(), hold.held.get()), (200, 200, 0));
+        assert_eq!(outcome.passes, 1);
+        assert!(hold.give_alls.get() >= 1);
+    }
+
+    #[test]
+    fn a_range_too_large_for_the_hold_is_refused_and_the_keys_are_given_back() {
+        let hold = StubHold::with_room(50);
+        let refused =
+            walk_held(CandidateOrder::ById { after: None, want: None }, &hold, usize::MAX, None);
+        assert!(
+            matches!(&refused, Err(StorageError::Core(CoreError::Limit(m))) if m == "the stub is full"),
+            "{:?}",
+            refused.as_ref().map(|_| ())
+        );
+        // Refused at the key that passes the room, with no document offered, and nothing held.
+        assert_eq!((hold.takes.get(), hold.held.get()), (51, 0));
+        // A visitor that fails after the keys are collected gives them back too.
+        let hold = StubHold::with_room(usize::MAX);
+        let failed =
+            walk_held(CandidateOrder::ById { after: None, want: None }, &hold, usize::MAX, Some(3));
+        assert!(
+            matches!(&failed, Err(StorageError::Core(CoreError::Limit(m))) if m == "the visitor failed")
+        );
+        assert_eq!(hold.held.get(), 0);
+    }
+
+    #[test]
+    fn a_want_bounds_the_keys_held_and_never_truncates_the_range() {
+        // A pure `$skip` and `$limit` head wants `skip + limit` (here 3): the range is read
+        // whole to find the three smallest keys and only those are held, and the walk stops
+        // when the visitor does.
+        let hold = StubHold::with_room(usize::MAX);
+        let (ids, outcome) =
+            walk_held(CandidateOrder::ById { after: None, want: Some(3) }, &hold, 3, None).unwrap();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(outcome.entries, 200, "a range in `_id` order is read whole");
+        assert_eq!(outcome.passes, 1);
+        assert!(hold.peak.get() <= 4, "three held and the one that replaces the largest");
+        assert_eq!(hold.held.get(), 0);
+        // A `want` is a size and not a limit: a visitor that goes on past it gets the rest
+        // of the range, in passes that double, with the keys held a pass at a time.
+        let hold = StubHold::with_room(usize::MAX);
+        let (ids, outcome) =
+            walk_held(CandidateOrder::ById { after: None, want: Some(3) }, &hold, usize::MAX, None)
+                .unwrap();
+        assert_eq!(ids, (0..200).collect::<Vec<_>>(), "never cut at the want");
+        assert!(outcome.passes > 1);
+        assert!(hold.peak.get() < 200, "the keys of one pass, not the range: {}", hold.peak.get());
+        assert_eq!(hold.held.get(), 0);
+    }
+
     #[test]
     fn a_union_of_probes_names_each_document_once_in_id_order() {
         // An array holding two of the listed values files the document under
