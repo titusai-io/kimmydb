@@ -76,9 +76,39 @@
 
 use std::cell::Cell;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+
+/// Whether the node is stopping and its requests must end (ADR-266): set once by the
+/// shutdown path at the drain deadline, read by every look at the clock.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// The node is stopping: from now on every look at the clock made under a deadline fails
+/// with [`Error::DeadlineExceeded`], so that a request thread running synchronous work ends
+/// at its next check instead of holding the storage engine past the drain. Called by the
+/// shutdown path at the drain deadline (the same moment `Engine::set_stopping` is, ADR-192),
+/// not at the signal: a request that can finish inside the drain is let finish. Irreversible
+/// for the life of the process. A step run under [`Deadline::suspend`] (a write that has
+/// committed, ADR-192) has no deadline and is not stopped by this either.
+pub fn stop_requests() {
+    STOPPING.store(true, Ordering::SeqCst);
+}
+
+/// Whether [`stop_requests`] has been called: the reason a [`Error::DeadlineExceeded`]
+/// is a shutdown and not a deadline that passed, for the API to answer it as the node
+/// stopping.
+pub fn requests_are_stopped() -> bool {
+    STOPPING.load(Ordering::Relaxed)
+}
+
+/// Whether the work that looked at the clock at `now` must end: its deadline has come, or
+/// the node is stopping.
+#[inline]
+fn over(now: Instant, deadline: Instant) -> bool {
+    now >= deadline || STOPPING.load(Ordering::Relaxed)
+}
 
 /// The most ticks between two reads of the clock.
 pub const MAX_STRIDE: u32 = 512;
@@ -232,7 +262,7 @@ fn look(cadence: &mut Cadence) -> Result<()> {
             CLOCK_READS.set(CLOCK_READS.get() + 1);
             let now = Instant::now();
             cadence.read(now);
-            if now >= deadline { Err(Error::DeadlineExceeded) } else { Ok(()) }
+            if over(now, deadline) { Err(Error::DeadlineExceeded) } else { Ok(()) }
         }
     }
 }
@@ -249,7 +279,7 @@ pub fn check() -> Result<()> {
             CLOCK_READS.set(CLOCK_READS.get() + 1);
             SHARED_TAKEN.set(SHARED_TAKEN.get() + u64::from(SHARED_SET.get() - SHARED_LEFT.get()));
             restart_shared();
-            if Instant::now() >= deadline { Err(Error::DeadlineExceeded) } else { Ok(()) }
+            if over(Instant::now(), deadline) { Err(Error::DeadlineExceeded) } else { Ok(()) }
         }
     }
 }

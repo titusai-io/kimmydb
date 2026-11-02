@@ -1058,6 +1058,13 @@ impl From<CoreError> for ApiError {
             }
             // Work that saw the request's deadline pass itself (ADR-266), where the
             // timeout layer would have: the same answer, naming the configured number.
+            //
+            // The same error is how work ends when the node is stopping (the check reads the
+            // stop at the drain deadline too): then it is answered as the shutdown answers
+            // any request it cut, `503 node_stopping`, which sends the client elsewhere.
+            CoreError::DeadlineExceeded if kimmy_core::deadline::requests_are_stopped() => {
+                ApiError::node_stopping(kimmy_storage::StopReason::DrainDeadline)
+            }
             CoreError::DeadlineExceeded => ApiError::timeout(
                 crate::limits::request_timeout().unwrap_or(crate::limits::DEFAULT_REQUEST_TIMEOUT),
             ),

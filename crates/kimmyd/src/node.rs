@@ -695,8 +695,12 @@ async fn start_and_serve(
             let engine_slot = Arc::clone(&engine_slot);
             // At the drain deadline, a request that commits in more than one
             // transaction stops before its next one (ADR-192): not at the
-            // signal, so one that can finish inside the drain does.
+            // signal, so one that can finish inside the drain does. A request
+            // running synchronous work (a pipeline, a scan) under the request
+            // deadline ends at its next check too (ADR-266), so that no thread
+            // holds the engine past the drain and the close finds it free.
             move || {
+                kimmy_core::deadline::stop_requests();
                 if let Some(engine) = engine_slot.get() {
                     engine.set_stopping();
                 }
