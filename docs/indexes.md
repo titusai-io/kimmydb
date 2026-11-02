@@ -104,17 +104,21 @@ before it is returned. Skipping that recheck is how index-backed queries start
 returning documents that do not match.
 
 Candidates are **streamed, not gathered.** A read walks the index range and
-rechecks each document as it arrives, so a `limit` bounds the work and nothing
-proportional to the range is held ([ADR-098](decisions.md)). An equality that
+rechecks each document as it arrives, so a `limit` bounds the work and, but for
+the keys of an inexact range read in `_id` order (below), nothing proportional
+to the range is held ([ADR-098](decisions.md)). An equality that
 pins a complete key — every field of the index, or a `$in` on its last field
 behind equalities on the rest — is one run of entries already in `_id` order,
 read in place and stopped where the caller stops. A `$in` is those runs
 merged, one head per probe. A range, or an equality on a prefix of a compound
 index, spans many keys whose document keys interleave; a read that needs
 `_id` order keeps only the `skip + limit` smallest document keys of one pass
-over the range, and goes back for more only if the recheck rejected enough of
-them. `explain` reports the entries read as `indexEntriesRead`, beside the
-documents examined.
+over the range, and goes back for more, twice as many each time, only if the
+recheck rejected enough of them; a filter that rejects most candidates holds a
+third to a half of the range in its largest pass, and those keys are charged to
+the node's memory pool and refused `413` past the request limit
+([Operations](operations.md#aggregation-memory)). `explain` reports the
+entries read as `indexEntriesRead`, beside the documents examined.
 
 It follows that a computed key range may be **too wide, but never too narrow**.
 A wide range costs time; a narrow one silently drops matching documents. Every

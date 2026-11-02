@@ -157,6 +157,39 @@ it is legal. Two settings bound it ([ADR-269](decisions.md)), both in an estimat
   and refuse the youngest; a wait is not counted as a refusal in
   `kimmy_aggregate_memory_pool_refusals_total`.
 
+**A `find` over an index range draws on the same pool.** A `find` whose filter uses an index for
+a range (`{t: {$gt: x}}`, anything that is not one complete key or a union of them) and that is
+not sorted, or is sorted by `{_id: 1}`, returns its page in `_id` order, which the index does not
+give: it reads the range and keeps the smallest document keys of it, and while the rest of the
+filter rejects what it finds it goes back for twice as many, so with a filter that rejects most
+candidates a pass holds a third to a half of the range. Those keys are charged to a lease named
+`the index range of the filter` on the pool, under the same per-request limit
+(`aggregate.memory_limit_bytes`), at about 82 bytes a key for an `_id` of up to 24 bytes (an integer
+or an ObjectId) and 100 for one of up to 40. Past the limit the answer is `413 answer_too_large`
+naming the lease, the bytes and the limit; the pool's `503` is as above (the youngest holder is
+refused, an older one waits up to the deadline). The keys are given back when the `find` ends, however it ends. What a member's limit holds:
+
+| Container memory | One request | Keys of one pass | A range that is always answered / always refused (a filter that rejects every candidate) |
+|---|---|---|---|
+| 2 GiB | 107,374,182 | 1,309,441 | up to about 2.6 million entries / over about 3.9 million |
+| 8 GiB | 429,496,729 | 5,237,764 | up to about 10.5 million / over about 15.6 million |
+| 16 GiB | 858,993,459 | 10,475,529 | up to about 21 million / over about 31 million |
+
+Between the two it depends on the window (`skip + limit`, the first pass's size), and a `skip` of
+more than the keys of a pass is refused at its first pass whatever the filter. A `find` that
+accepts most of what it reads holds about `skip + limit` keys and is never near the limit. **Any
+other path of a `find` holds no keys and never asks the pool**: an exact probe of one key or of
+several (`{t: 5}`, `{t: {$in: [..]}}`), a lookup by `_id`, a scan of the collection, and a `find`
+sorted by another field (which reads the range in index order and holds `skip + limit` documents);
+so does `count`. To avoid the `413`: narrow the filter on the indexed field so
+that its range is smaller, sort by a field other than `_id`, page with `cursor` rather than a
+large `skip`, or raise `aggregate.memory_limit_bytes`. (Sorting by `{_id: 1}` and paging does not
+help: the first page is the one that reads the range.) The refusals count in the same series as the
+aggregations' (`kimmy_aggregate_memory_limit_refusals_total`, `kimmy_aggregate_memory_pool_refusals_total`,
+`kimmy_aggregate_memory_pool_used_bytes`). A `find` over a range this large still reads the whole
+range for every page, which is slow; a paged walk that holds no keys is planned
+([ADR-270](decisions.md), "For later").
+
 **The defaults are derived, not fixed.** The budget counts an estimate of the memory the
 held documents take parsed (a document of many small fields is charged many times its BSON size),
 and a request takes a little more than that while it builds its answer, so a
