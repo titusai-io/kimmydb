@@ -942,7 +942,7 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
         }
         Filter::Field { path, conditions } => {
             for condition in conditions {
-                if let Some(found) = condition_position(condition, doc, path) {
+                if let Some(found) = condition_position(condition, doc, path)? {
                     *at = Some(found);
                 }
             }
@@ -952,8 +952,13 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
 }
 
 /// The first element of the outermost array on `path` that satisfies
-/// `condition`, for a condition that is about elements.
-fn condition_position(condition: &Condition, doc: &Document, path: &str) -> Option<ArrayPosition> {
+/// `condition`, for a condition that is about elements. An error that is about the request and
+/// not the element (the deadline, the node's stop, a size refusal) goes up, as `$or`'s does.
+fn condition_position(
+    condition: &Condition,
+    doc: &Document,
+    path: &str,
+) -> Result<Option<ArrayPosition>> {
     if !matches!(
         condition,
         Condition::Eq(_)
@@ -968,7 +973,7 @@ fn condition_position(condition: &Condition, doc: &Document, path: &str) -> Opti
             | Condition::Mod { .. }
             | Condition::Bits { .. }
     ) {
-        return None;
+        return Ok(None);
     }
     let segments = path::segments(path);
     let mut current = doc;
@@ -977,17 +982,20 @@ fn condition_position(condition: &Condition, doc: &Document, path: &str) -> Opti
             Some(Bson::Document(inner)) => current = inner,
             Some(Bson::Array(items)) => {
                 let rest = segments[at + 1..].join(".");
-                let index =
-                    items.iter().position(|item| element_satisfies(condition, item, &rest))?;
-                return Some(ArrayPosition { path: segments[..=at].join("."), index });
+                for (index, item) in items.iter().enumerate() {
+                    if element_satisfies(condition, item, &rest)? {
+                        return Ok(Some(ArrayPosition { path: segments[..=at].join("."), index }));
+                    }
+                }
+                return Ok(None);
             }
-            _ => return None,
+            _ => return Ok(None),
         }
     }
-    None
+    Ok(None)
 }
 
-/// Whether one element of the array, with `rest` of the path below it, makes
+/// Whether one element of the array, with `rest' of the path below it, makes
 /// `condition` hold, as the matcher decides it.
 ///
 /// With `rest` empty the matcher applies a condition to the array's value and
@@ -996,16 +1004,22 @@ fn condition_position(condition: &Condition, doc: &Document, path: &str) -> Opti
 /// per-element step, from the predicates [`condition_matches`] applies. With a
 /// path below the element, the values under it are the matcher's own
 /// ([`path::resolve`]) and the condition is evaluated over them whole.
-fn element_satisfies(condition: &Condition, item: &Bson, rest: &str) -> bool {
+///
+/// An element that cannot be evaluated (an `$expr` in an `$elemMatch` body that fails on it) did
+/// not satisfy the condition, as `matches` defers it; any other error goes up.
+fn element_satisfies(condition: &Condition, item: &Bson, rest: &str) -> Result<bool> {
     let held = if rest.is_empty() {
         item_holds(condition, item)
     } else {
         match item {
             Bson::Document(inner) => condition_matches(condition, &path::resolve(inner, rest), &[]),
-            _ => return false,
+            _ => return Ok(false),
         }
     };
-    matches!(held, Ok(true))
+    match held {
+        Err(e) if e.is_deferrable() => Ok(false),
+        other => other,
+    }
 }
 
 /// Whether `condition` holds for one array element standing for the array,
@@ -1691,6 +1705,36 @@ mod tests {
             doc! { "s": { "$not": { "$regex": "ab" } } },
             doc! { "s": literal("ab", "") }
         ));
+    }
+
+    /// What the recording of a position alone does with the errors of an `$elemMatch` body
+    /// (`record_position` is private and `matches_at` runs `matches` first, which meets the same
+    /// errors in the same order, so only a call to it shows what the recording does with them).
+    #[test]
+    fn the_recording_of_an_elem_match_passes_up_every_error_but_a_deferrable_one() {
+        let d = doc! { "_id": 5, "items": [ { "n": 1, "s": "x" }, { "n": 2, "s": 4 } ] };
+        let record = |query: Document| -> Result<Option<ArrayPosition>> {
+            let filter = parse(&query).unwrap();
+            let mut at = None;
+            record_position(&filter, &d, &mut at)?;
+            Ok(at)
+        };
+        let body = |expr: Document| doc! { "items": { "$elemMatch": { "n": { "$gte": 1 }, "$expr": expr } } };
+        // An `$expr` that holds: the first element.
+        let found = record(body(doc! { "$gte": ["$n", 1] })).unwrap();
+        assert_eq!(found, Some(ArrayPosition { path: "items".into(), index: 0 }));
+        // One that cannot be evaluated for the first element (a string plus one) did not
+        // decide: the second element is the position.
+        let found = record(body(doc! { "$gt": [{ "$add": ["$s", 1] }, 0] })).unwrap();
+        assert_eq!(found, Some(ArrayPosition { path: "items".into(), index: 1 }));
+        // A refusal for the size of a value is not about the element: it goes up.
+        let err = record(body(doc! { "$gt": [{ "$size": { "$range": [0, 1_000_000_000] } }, 0] }))
+            .unwrap_err();
+        assert!(matches!(err, Error::ValueTooLarge { .. }), "{err:?}");
+        // And so does the deadline.
+        let _expired = kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::ZERO));
+        let err = record(body(doc! { "$gte": ["$n", 1] })).unwrap_err();
+        assert!(matches!(err, Error::DeadlineExceeded), "{err:?}");
     }
 
     #[test]
