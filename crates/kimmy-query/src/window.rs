@@ -798,11 +798,22 @@ pub fn apply(
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
     let mut lease = limits.buffer.lease(buffer_name(spec.stage));
-    let partitions = partitions(&spec.partition, input, vars, &mut lease)?;
+    apply_in(spec, input, vars, &mut lease)
+}
+
+/// [`apply`], charging to a lease the caller keeps: `$fill` goes on to write its `value`
+/// fields into the documents this returns, and they stay charged until it is done.
+pub(crate) fn apply_in(
+    spec: &WindowSpec,
+    input: Vec<Document>,
+    vars: &[Binding<'_>],
+    lease: &mut Lease,
+) -> Result<Vec<Document>> {
+    let partitions = partitions(&spec.partition, input, vars, lease)?;
     let run = Run { vars };
     let mut out = Vec::new();
     for docs in partitions {
-        out.extend(run_partition(spec, docs, &run, &mut lease)?);
+        out.extend(run_partition(spec, docs, &run, lease)?);
     }
     Ok(out)
 }

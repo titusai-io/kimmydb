@@ -21,7 +21,8 @@ use kimmy_core::{Error, Result, path};
 use crate::aggregate::Limits;
 use crate::expr::{Binding, Expr, Scope, type_name};
 use crate::window::{
-    Func, Output, Partition, WindowSpec, apply as apply_window, check_output_name, parse_sort_by,
+    Func, Output, Partition, WindowSpec, apply_in, buffer_name, check_output_name, element_bytes,
+    parse_sort_by,
 };
 
 fn bad<T>(message: impl Into<String>) -> Result<T> {
@@ -179,9 +180,17 @@ pub fn apply(
     limits: &Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
+    // One lease for the whole stage (ADR-269): the documents it buffers, the values the
+    // fill methods add, and every `value` written below, all held until it returns. The
+    // input is charged here and nowhere else (`Held::enter` leaves `$fill` out), once
+    // whichever way the stage runs.
+    let mut lease = limits.buffer.lease(buffer_name("$fill"));
     let mut docs = match &spec.window {
-        Some(window) => apply_window(window, input, limits, vars)?,
-        None => input,
+        Some(window) => apply_in(window, input, vars, &mut lease)?,
+        None => {
+            lease.charge_docs(&input)?;
+            input
+        }
     };
     if spec.values.is_empty() {
         return Ok(docs);
@@ -206,8 +215,14 @@ pub fn apply(
         }
         for (name, value) in fills {
             match value {
-                Some(value) => path::set(doc, name, value)
-                    .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?,
+                Some(value) => {
+                    // Charged before it is written, so a value that passes the limit stops
+                    // the stage at this document. The whole element is counted, which
+                    // over-counts by the few bytes of a null it replaces.
+                    lease.charge(element_bytes(name, &value))?;
+                    path::set(doc, name, value)
+                        .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
+                }
                 None => {
                     path::unset(doc, name);
                 }

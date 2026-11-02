@@ -20680,6 +20680,93 @@ async fn an_aggregation_over_its_memory_limit_is_a_413_at_a_bounded_size() {
     assert_eq!((pool.limit_refusals(), pool.pool_refusals()), (1, 0));
 }
 
+/// A collection `name` of `n` documents `{_id, m: i % 3, k: i % 3, pad}` with `pad` bytes of
+/// padding each.
+async fn padded_collection(server: &Server, token: &str, name: &str, n: i64, pad: usize) {
+    let res = server.post("/v1/db/kx/collections", Some(token), json!({ "name": name })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs: Vec<Value> = (0..n)
+        .map(|i| json!({ "_id": i, "m": i % 3, "k": i % 3, "pad": "p".repeat(pad) }))
+        .collect();
+    let res = server.post(&format!("/v1/db/kx/coll/{name}/bulk"), Some(token), json!(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn every_stage_the_executor_runs_is_held_to_the_memory_limit_and_stops_at_the_byte() {
+    // The stages `exec::run_stages` runs itself (they need a storage handle): both forms of
+    // `$lookup`, `$graphLookup`, `$unionWith`, inside a `$facet` as well, then a sink. The
+    // local side is 30 small documents; the foreign side is 30 documents of 20 KB (600 KB).
+    // Each stage's input fits in the 800 KB limit, and what it builds does not: the joins
+    // would attach ten foreign documents (200 KB) to each of the thirty, 6 MB, and the
+    // union would append 600 KB to 600 KB.
+    let limit = 800 << 10;
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(limit, 64 << 20));
+    let token = server.root().await;
+    padded_collection(&server, &token, "local", 30, 0).await;
+    padded_collection(&server, &token, "foreign", 30, 20_000).await;
+    let pool = server.state.aggregate_memory().pool().clone();
+
+    let eq = json!({ "$lookup": { "from": "foreign", "localField": "m", "foreignField": "k",
+        "as": "j" } });
+    let sub = json!({ "$lookup": { "from": "foreign", "let": { "m": "$m" },
+        "pipeline": [{ "$match": { "$expr": { "$eq": ["$k", "$$m"] } } }], "as": "j" } });
+    let graph = json!({ "$graphLookup": { "from": "foreign", "startWith": "$m",
+        "connectFromField": "k", "connectToField": "k", "maxDepth": 0, "as": "j" } });
+    // The union appends a collection of its own, 1 MB, which does not fit beside the rest.
+    padded_collection(&server, &token, "wide", 50, 20_000).await;
+    let union = json!({ "$unionWith": "wide" });
+    let cases = [
+        ("$lookup", json!([eq.clone()])),
+        ("$lookup", json!([sub.clone()])),
+        ("$graphLookup", json!([graph.clone()])),
+        ("$unionWith", json!([union.clone()])),
+        ("$unionWith", json!([{ "$unionWith": { "coll": "wide", "pipeline": [] } }])),
+        // The same stages inside a `$facet` branch, which `run_stages` runs as well.
+        ("$lookup", json!([{ "$facet": { "a": [eq.clone()], "b": [{ "$count": "n" }] } }])),
+        ("$graphLookup", json!([{ "$facet": { "a": [graph] } }])),
+        // A sink after a stage that builds is refused before anything is written.
+        (
+            "$addFields",
+            json!([{ "$addFields": { "big": "q".repeat(40_000) } }, { "$out": "dest" }]),
+        ),
+        ("$lookup", json!([sub, { "$merge": { "into": "dest" } }])),
+    ];
+    for (stage, pipeline) in cases {
+        let res = server
+            .post("/v1/db/kx/coll/local/aggregate", Some(&token), json!({ "pipeline": pipeline }))
+            .await;
+        assert_eq!(res.status, 413, "{pipeline}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains(stage), "{pipeline}: {message}");
+        assert!(message.contains(&format!("limit of {limit} bytes")), "{message}");
+        // Refused where it passed the limit: within one attached array (200 KB) or one
+        // appended document of it, not after the 6 MB it would have built.
+        let held = number_after(message, " is ");
+        assert!(held > limit && held < limit + (250 << 10), "{pipeline}: stopped at {held}");
+        assert_eq!(pool.used(), 0, "{pipeline}: gives the pool back");
+    }
+    // A sink that is refused creates nothing.
+    let listed = server.get("/v1/db/kx/collections", Some(&token)).await;
+    assert!(!listed.body.to_string().contains("dest"), "{:?}", listed.body);
+
+    // And the vector search's hits are the source, held like any: a limit under the hits.
+    let shop = Server::start().await;
+    shop.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(100, 64 << 20));
+    let shop_token = products_collection(&shop).await;
+    let res = shop
+        .post(
+            "/v1/db/shop/coll/products/aggregate",
+            Some(&shop_token),
+            json!({ "pipeline": [{ "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 10 } }] }),
+        )
+        .await;
+    assert_eq!(res.status, 413, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("the source read"), "{:?}", res.body);
+    assert_eq!(shop.state.aggregate_memory().pool().used(), 0);
+}
+
 #[tokio::test]
 async fn the_source_read_stops_at_the_document_that_passes_the_limit() {
     let server = Server::start().await;

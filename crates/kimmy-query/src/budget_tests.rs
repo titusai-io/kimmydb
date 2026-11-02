@@ -472,6 +472,220 @@ fn the_branches_of_a_facet_share_one_budget_with_the_stages_inside_them() {
 }
 
 // ---------------------------------------------------------------------------
+// $fill (the review's B1) and the sweep of every stage
+// ---------------------------------------------------------------------------
+
+/// The element a `big` field of `size` bytes adds to a document.
+fn big_element(size: usize) -> usize {
+    crate::window::element_bytes("big", &Bson::String("x".repeat(size)))
+}
+
+#[test]
+fn fill_value_charges_its_input_once_and_each_value_it_writes() {
+    let input = padded(50, 200);
+    let held_in = docs_bytes(&input);
+    let stage = doc! {"$fill": {"output": {"big": {"value": "y".repeat(2_000)}}}};
+    let out = run(stage.clone(), input.clone(), &capped(usize::MAX / 4)).unwrap();
+    let held_out = docs_bytes(&out);
+    let one = big_element(2_000);
+    assert_eq!(held_out, held_in + 50 * one);
+    // The stage holds exactly its input and the values it wrote: a budget of that passes and
+    // gives everything back; a budget of one byte less is refused at the last byte. A
+    // charge of the input twice would have refused the first.
+    let limits = capped(held_out);
+    assert_eq!(run(stage.clone(), input.clone(), &limits).unwrap(), out);
+    assert_eq!(limits.buffer.used(), 0);
+    let err = run(stage.clone(), input.clone(), &capped(held_out - 1)).unwrap_err();
+    let Error::ValueTooLarge { what, bytes, .. } = &err else { panic!("{err:?}") };
+    assert_eq!((*what, *bytes), ("the documents $fill buffers", held_out));
+    // And it stops at the document whose value passes the limit, not after the fiftieth:
+    // room for the input and three values refuses at the fourth.
+    let err = run(stage, input, &capped(held_in + 3 * one + one / 2)).unwrap_err();
+    let Error::ValueTooLarge { bytes, .. } = &err else { panic!("{err:?}") };
+    assert_eq!(*bytes, held_in + 4 * one);
+}
+
+#[test]
+fn fill_with_a_method_and_with_both_charges_its_input_once_and_every_value() {
+    // Even documents hold `v`; the odd ones are filled from the one before.
+    let input: Vec<Document> = (0..50)
+        .map(|i| {
+            if i % 2 == 0 {
+                doc! {"_id": i, "v": i, "pad": "x".repeat(200)}
+            } else {
+                doc! {"_id": i, "pad": "x".repeat(200)}
+            }
+        })
+        .collect();
+    let held_in = docs_bytes(&input);
+    let int_v = crate::window::element_bytes("v", &Bson::Int32(0));
+    let one = big_element(2_000);
+    let locf = doc! {"v": {"method": "locf"}};
+    let both = doc! {"v": {"method": "locf"}, "big": {"value": "y".repeat(2_000)}};
+    for (name, output, added) in [("locf", locf, 25 * int_v), ("both", both, 25 * int_v + 50 * one)]
+    {
+        let stage = doc! {"$fill": {"sortBy": {"_id": 1}, "output": output}};
+        let out = run(stage.clone(), input.clone(), &capped(usize::MAX / 4)).unwrap();
+        assert_eq!(docs_bytes(&out), held_in + added, "{name}");
+        // The input once, the values written, and the window's sort keys and cells (under
+        // 1 KB for these 50 documents): a second charge of the input would be 11 KB more.
+        let smallest = smallest_cap(&stage, &input, 10 * held_in);
+        assert!(smallest >= held_in + added, "{name}: {smallest}");
+        assert!(smallest < held_in + added + 1_000, "{name}: {smallest}");
+        let limits = capped(smallest);
+        assert!(run(stage.clone(), input.clone(), &limits).is_ok(), "{name}");
+        assert_eq!(limits.buffer.used(), 0, "{name}");
+        let err = run(stage, input.clone(), &capped(smallest - 1)).unwrap_err();
+        assert!(is_too_large(&err), "{name}: {err:?}");
+    }
+}
+
+#[test]
+fn the_reviewers_fill_shapes_are_refused_in_the_budget_they_were_not_in() {
+    // 50 documents and a 1 MiB budget, as the review measured, with a value of 100 KB: the
+    // output is 5 MB, five times the budget. Each shape was answered; each is refused now.
+    let input: Vec<Document> = (0..50).map(|i| doc! {"_id": i, "v": i}).collect();
+    let big = "z".repeat(100_000);
+    let budget = capped(1 << 20);
+    let value = doc! {"$fill": {"output": {"big": {"value": big.as_str()}}}};
+    let with_locf = doc! {"$fill": {"sortBy": {"_id": 1},
+    "output": {"big": {"value": big.as_str()}, "v": {"method": "locf"}}}};
+    for stage in [value.clone(), with_locf] {
+        let err = run(stage.clone(), input.clone(), &budget).unwrap_err();
+        let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+        assert_eq!(*what, "the documents $fill buffers", "{stage}");
+        // Refused at the eleventh value (10 x 100 KB fits in 1 MiB), not after all fifty.
+        assert!(*bytes > *max && *bytes < *max + 100_100, "{stage}: {bytes}");
+        assert_eq!(budget.buffer.used(), 0, "{stage}");
+    }
+    // `$fill` and then `$count`: the fill is what is refused, before it built 5 MB.
+    let pipeline = [value, doc! {"$count": "n"}];
+    let stages = aggregate::parse(&pipeline).unwrap();
+    let mut docs = input;
+    let mut seen = Vec::new();
+    for stage in &stages {
+        match aggregate::apply(stage, docs.clone(), &budget) {
+            Ok(out) => docs = out,
+            Err(e) => {
+                seen.push((stage.name(), e));
+                break;
+            }
+        }
+    }
+    let (name, err) = seen.pop().expect("refused");
+    assert_eq!(name, "$fill");
+    assert!(matches!(&err, Error::ValueTooLarge { what, .. } if what.contains("$fill")), "{err:?}");
+}
+
+/// A stage of every kind the pure pipeline runs, over documents of `padded(20, 200)`.
+fn every_pure_stage() -> Vec<Document> {
+    vec![
+        doc! {"$match": {"g": 1}},
+        doc! {"$project": {"p": "$pad"}},
+        doc! {"$addFields": {"e": "$pad"}},
+        doc! {"$set": {"e": "$pad"}},
+        doc! {"$unset": "pad"},
+        doc! {"$replaceRoot": {"newRoot": {"p": "$pad"}}},
+        doc! {"$replaceWith": {"p": "$pad"}},
+        doc! {"$group": {"_id": "$g", "n": {"$sum": 1}}},
+        doc! {"$bucket": {"groupBy": "$_id", "boundaries": [0, 10, 100]}},
+        doc! {"$bucketAuto": {"groupBy": "$_id", "buckets": 3}},
+        doc! {"$sort": {"g": -1}},
+        doc! {"$sortByCount": "$g"},
+        doc! {"$limit": 5},
+        doc! {"$skip": 5},
+        doc! {"$count": "n"},
+        doc! {"$unwind": "$pad"},
+        doc! {"$facet": {"a": [{"$count": "n"}]}},
+        doc! {"$redact": "$$KEEP"},
+        doc! {"$sample": {"size": 4}},
+        doc! {"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"n": {"$documentNumber": {}}}}},
+        doc! {"$densify": {"field": "_id", "range": {"step": 1, "bounds": "full"}}},
+        doc! {"$fill": {"output": {"x": {"value": 1}}}},
+        doc! {"$fill": {"sortBy": {"_id": 1}, "output": {"pad": {"method": "locf"}}}},
+    ]
+}
+
+#[test]
+fn every_stage_is_refused_with_a_413_when_its_input_is_over_the_budget() {
+    let input = padded(20, 200);
+    let held_in = docs_bytes(&input);
+    for stage in every_pure_stage() {
+        let name = stage.keys().next().unwrap().clone();
+        // The stage runs with room for its input and is refused one byte under it.
+        let err = run(stage.clone(), input.clone(), &capped(held_in - 1)).unwrap_err();
+        assert!(is_too_large(&err), "{name} ({stage}): {err:?}");
+        let limits = capped(held_in - 1);
+        let _ = run(stage.clone(), input.clone(), &limits);
+        assert_eq!(limits.buffer.used(), 0, "{name}: gives everything back when refused");
+        // A budget of nothing refuses it too, whatever it is.
+        assert!(is_too_large(&run(stage, input.clone(), &capped(0)).unwrap_err()), "{name}");
+    }
+}
+
+#[test]
+fn every_stage_that_builds_is_refused_at_the_document_that_passes_the_budget() {
+    // Each input fits with room for two built values and no more; the stage would build 40
+    // of 1 KB or more, so a stage that finished would end far over the cap. The refusal's
+    // total says where it stopped: within one built value of the cap.
+    let big = "q".repeat(1_000);
+    let input: Vec<Document> =
+        (0..40).map(|i| doc! {"_id": i * 10, "g": i, "tags": [1, 2, 3], "pad": "x"}).collect();
+    let held_in = docs_bytes(&input);
+    let value = Bson::String(big.clone());
+    let cases: Vec<(&str, Document, usize)> = vec![
+        ("$addFields", doc! {"$addFields": {"big": big.as_str()}}, big_element(1_000)),
+        ("$project", doc! {"$project": {"big": big.as_str()}}, big_element(1_000)),
+        ("$replaceRoot", doc! {"$replaceRoot": {"newRoot": {"big": big.as_str()}}}, 1_040),
+        ("$fill", doc! {"$fill": {"output": {"big": {"value": big.as_str()}}}}, big_element(1_000)),
+        (
+            "$setWindowFields",
+            doc! {"$setWindowFields": {"sortBy": {"_id": 1},
+            "output": {"all": {"$push": "$pad", "window": {"documents": ["unbounded", "current"]}},
+            "big": {"$first": value.clone()}}}},
+            // The largest value it adds to one document: the last one's array.
+            big_element(1_000),
+        ),
+        (
+            "$densify",
+            doc! {"$densify": {"field": "_id", "range": {"step": 1, "bounds": "full"}}},
+            // A generated document: `_id` only, but there are 391 of them, 5 bytes in an
+            // input charged beside them.
+            40,
+        ),
+        (
+            "$unwind",
+            doc! {"$unwind": {"path": "$tags"}},
+            // One copy of a document.
+            120,
+        ),
+        ("$group", doc! {"$group": {"_id": null, "all": {"$push": big.as_str()}}}, 1_050),
+        (
+            "$bucket",
+            doc! {"$bucket": {"groupBy": "$_id", "boundaries": [0, 1000],
+            "output": {"all": {"$push": big.as_str()}}}},
+            1_050,
+        ),
+        (
+            "$facet",
+            doc! {"$facet": {"a": [{"$addFields": {"big": big.as_str()}}], "b": [{"$count": "n"}]}},
+            big_element(1_000),
+        ),
+    ];
+    for (name, stage, unit) in cases {
+        // Room for the input, the stage's own copy of it, and two built values.
+        let cap = 2 * held_in + 2 * unit;
+        let limits = capped(cap);
+        let err = run(stage.clone(), input.clone(), &limits)
+            .expect_err(&format!("{name} finished inside {cap} bytes"));
+        let Error::ValueTooLarge { bytes, max, .. } = &err else { panic!("{name}: {err:?}") };
+        assert_eq!(*max, cap, "{name}");
+        assert!(*bytes > cap && *bytes <= cap + 3 * unit, "{name}: stopped at {bytes} of {cap}");
+        assert_eq!(limits.buffer.used(), 0, "{name}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The numbers at the default limits, without allocating them
 // ---------------------------------------------------------------------------
 
