@@ -430,14 +430,11 @@ pub fn find(
             // A range that is inexact is read whole to put its documents in `_id` order, and
             // the keys it holds while it does are held to the node's memory pool (ADR-269),
             // under the request's limit: a filter that rejects most candidates makes the walk
-            // go on to passes that double, up to the whole range. The lease is made when the
-            // first key is held, so a read that takes another path never touches the pool.
-            let keys = IndexKeys::lazy(|| {
-                state
-                    .aggregate_memory()
-                    .budget()
-                    .lease_worded("the index range of the filter", FIND_RANGE_KEYS)
-            });
+            // go on to passes that double, up to the whole range. A pass that stays within
+            // the window, as the page of documents does, is not charged, so a `find` that
+            // accepts what it reads never asks the pool; the first pass that goes past it
+            // makes the lease, and a read that takes another path never does.
+            let keys = IndexKeys::of_a_find(state.aggregate_memory(), window);
             let bounds =
                 ScanBounds { stop_after: Some(window), want: Some(window), hold: Some(&keys) };
             let stats = visit_matching_bounded(
@@ -2554,27 +2551,46 @@ async fn aggregate_run_held(
 /// The keys of an index range, held to the request's budget while the scan collects them.
 struct IndexKeys<'a> {
     account: std::cell::RefCell<Account<'a>>,
+    /// The bytes of the keys held now, charged to the lease or not (see [`Account::Later`]).
     held: std::cell::Cell<usize>,
+    /// How many keys are held now.
+    keys: std::cell::Cell<usize>,
 }
 
-/// The lease the keys are charged to: made already, or made when the first key is held.
+/// The lease the keys are charged to.
 enum Account<'a> {
     Open(Lease),
-    Later(Box<dyn Fn() -> Lease + 'a>),
+    /// No lease yet: the keys held are not charged until there are more than `free` of them,
+    /// and then the lease is made, from `memory`, and charged for all of them. A read whose
+    /// keys stay within what its page may hold, or that holds none (every path of a `find` but
+    /// one), has no lease, no budget and no pool to touch.
+    Later {
+        memory: &'a crate::limits::AggregateMemory,
+        free: usize,
+    },
 }
 
 impl<'a> IndexKeys<'a> {
     fn new(lease: Lease) -> Self {
-        IndexKeys { account: std::cell::RefCell::new(Account::Open(lease)), held: 0.into() }
+        IndexKeys {
+            account: std::cell::RefCell::new(Account::Open(lease)),
+            held: 0.into(),
+            keys: 0.into(),
+        }
     }
 
-    /// Keys that make their lease with `open` at the first key they hold, and none before:
-    /// a read that never collects keys (every path of a `find` but one) has no lease, no
-    /// budget and no pool to touch.
-    fn lazy(open: impl Fn() -> Lease + 'a) -> Self {
+    /// Keys of a `find` with a window of `window` documents (`skip + limit`). The first pass
+    /// wants that many, a pass holds one more than it wants for the moment a smaller key
+    /// replaces the largest, and a page holds at most `MAX_LIMIT` documents unpooled: so the
+    /// keys of a pass that fits the window, to that many, are not charged. The one that goes
+    /// past it makes the lease on the node's pool, under the request's limit, and is charged
+    /// for every key held from then on.
+    fn of_a_find(memory: &'a crate::limits::AggregateMemory, window: usize) -> Self {
+        let free = window.min(MAX_LIMIT).saturating_add(1);
         IndexKeys {
-            account: std::cell::RefCell::new(Account::Later(Box::new(open))),
+            account: std::cell::RefCell::new(Account::Later { memory, free }),
             held: 0.into(),
+            keys: 0.into(),
         }
     }
 }
@@ -2583,14 +2599,20 @@ impl kimmy_storage::KeyHold for IndexKeys<'_> {
     fn take(&self, len: usize) -> kimmy_core::Result<()> {
         let bytes = kimmy_query::budget::held_set_key(len);
         self.held.set(self.held.get().saturating_add(bytes));
+        self.keys.set(self.keys.get() + 1);
         let mut account = self.account.borrow_mut();
-        if let Account::Later(open) = &*account {
-            let lease = open();
+        let mut charge = bytes;
+        if let Account::Later { memory, free } = &*account
+            && self.keys.get() > *free
+        {
+            let lease =
+                memory.budget().lease_worded("the index range of the filter", FIND_RANGE_KEYS);
             *account = Account::Open(lease);
+            charge = self.held.get();
         }
         let charged = match &mut *account {
-            Account::Open(lease) => lease.charge(bytes),
-            Account::Later(_) => Ok(()),
+            Account::Open(lease) => lease.charge(charge),
+            Account::Later { .. } => Ok(()),
         };
         #[cfg(test)]
         if charged.is_ok() {
@@ -2602,6 +2624,7 @@ impl kimmy_storage::KeyHold for IndexKeys<'_> {
     fn give(&self, len: usize) {
         let bytes = kimmy_query::budget::held_set_key(len).min(self.held.get());
         self.held.set(self.held.get() - bytes);
+        self.keys.set(self.keys.get().saturating_sub(1));
         if let Account::Open(lease) = &mut *self.account.borrow_mut() {
             lease.release(bytes);
         }
@@ -2609,6 +2632,7 @@ impl kimmy_storage::KeyHold for IndexKeys<'_> {
 
     fn give_all(&self) {
         let bytes = self.held.replace(0);
+        self.keys.set(0);
         if let Account::Open(lease) = &mut *self.account.borrow_mut() {
             lease.release(bytes);
         }
@@ -2641,16 +2665,18 @@ pub(crate) mod key_hooks {
 
 /// How a `find` over an index range words a refusal for the keys it holds. The remedies of an
 /// aggregation are not its: the range is read to put the page in `_id` order, and what makes
-/// it smaller is the filter, what avoids it is a sort on another field (a sorted `find` reads
-/// the range in index order and holds only `skip + limit` documents), and a large `skip` is
-/// what a `cursor` replaces.
+/// it smaller is the filter; what avoids it is a sort other than `{_id: 1}` (a sorted `find`
+/// reads the range in index order and holds only `skip + limit` documents, which it refuses
+/// past [`MAX_SORT_WINDOW`], so a sort is not offered to a client that cannot page with it);
+/// and a large `skip` is what a `cursor` replaces.
 const FIND_RANGE_KEYS: kimmy_query::budget::Wording = kimmy_query::budget::Wording {
     holder: "one find",
-    over_limit: "narrow the filter on the indexed field so that its range is smaller; sort by a \
-                 field other than _id (a sorted find reads the range in index order and holds \
-                 only skip + limit documents); page with `cursor` rather than a large `skip`; \
-                 or raise aggregate.memory_limit_bytes",
-    pool_busy: "narrow the filter on the indexed field, or sort by a field other than _id",
+    over_limit: "narrow the filter on the indexed field so that its range is smaller; sort by \
+                 anything but {_id: 1} ({_id: -1} included) when skip + limit is at most 10000, \
+                 which reads the range in index order and holds only the page; use a smaller \
+                 skip, paging with `cursor`; or raise aggregate.memory_limit_bytes",
+    pool_busy: "narrow the filter on the indexed field, sort by anything but {_id: 1} when \
+                skip + limit is at most 10000, or use a smaller skip",
 };
 
 /// An aggregation over a collection, from the read of its source to the answer, under the

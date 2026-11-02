@@ -4,6 +4,7 @@
 //! on every exit.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -109,10 +110,16 @@ fn a_pass_of_n_keys_is_answered_and_one_of_n_plus_one_is_refused_at_the_limit_by
     );
     assert!(err.message.starts_with(&text), "{}", err.message);
     // And says what to do: the remedies of this path, not an aggregation's.
-    for remedy in ["narrow the filter on the indexed field", "sort by a field other than _id"] {
+    for remedy in [
+        "narrow the filter on the indexed field",
+        "sort by anything but {_id: 1} ({_id: -1} included)",
+        "use a smaller skip, paging with `cursor`",
+    ] {
         assert!(err.message.contains(remedy), "{}", err.message);
     }
-    assert!(err.message.contains("`cursor` rather than a large `skip`"), "{}", err.message);
+    // The sort it offers is one the find accepts: its window is the sorted find's ceiling.
+    let ceiling = format!("when skip + limit is at most {MAX_SORT_WINDOW}");
+    assert!(err.message.contains(&ceiling), "{}", err.message);
     assert!(!err.message.contains("$match"), "{}", err.message);
     assert_eq!(pool_of(&state).used(), 0, "and given back when it is refused");
     assert_eq!((pool_of(&state).limit_refusals(), pool_of(&state).pool_refusals()), (1, 0));
@@ -151,16 +158,24 @@ fn the_remedies_it_names_answer_the_same_range_under_the_same_limit() {
 
 #[test]
 fn a_large_skip_holds_a_window_of_keys_and_a_cursor_in_its_place_does_not() {
-    // `skip + limit` is the first pass's `want`, so a `skip` of 1,400 over a range every
-    // document of which matches holds 1,410 keys; the page after a cursor holds ten.
+    // `skip + limit` is the first pass's `want`, so a `skip` of 11,000 over a range every
+    // document of which matches holds 11,010 keys; the page after a cursor holds ten. The
+    // window is not charged up to what a page may hold (10,000 keys and the one a
+    // replacement holds for a moment), and past that every key held is: the lease is made
+    // at the 10,002nd key, charged for all of them, and refused at the 10,501st.
     let dir = tempfile::tempdir().unwrap();
-    let state = indexed(&dir, 1_500, key_bytes(1_000), 64 << 20);
+    let state = indexed(&dir, 12_000, key_bytes(10_500), 64 << 20);
     let all = json!({ "t": { "$gte": 0 } });
-    let skipping = FindParams { skip: Some(1_400), limit: Some(10), ..rejected(all.clone()) };
+    let skipping = FindParams { skip: Some(11_000), limit: Some(10), ..rejected(all.clone()) };
     let err = find_of(&state, skipping).unwrap_err();
     assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
-    assert!(err.message.contains("`cursor` rather than a large `skip`"), "{}", err.message);
-    let key = kimmy_core::keyenc::encode(&bson::Bson::Int64(1_399)).unwrap();
+    assert_eq!(held_in(&err), key_bytes(10_501));
+    assert!(err.message.contains("use a smaller skip, paging with `cursor`"), "{}", err.message);
+    assert_eq!(pool_of(&state).used(), 0);
+    // A skip that fits what a page may hold is answered under the same limit, uncharged.
+    let skipping = FindParams { skip: Some(9_000), limit: Some(10), ..rejected(all.clone()) };
+    assert_eq!(find_of(&state, skipping).unwrap()["count"], 10);
+    let key = kimmy_core::keyenc::encode(&bson::Bson::Int64(10_999)).unwrap();
     let paged = FindParams {
         cursor: Some(kimmy_core::Cursor::from_key(key).encode()),
         limit: Some(10),
@@ -192,7 +207,11 @@ fn what_a_find_holds_is_the_pool_and_a_full_pool_refuses_the_youngest() {
     assert_eq!(err.retry_after_secs, Some(crate::error::AGGREGATE_POOL_RETRY_AFTER_SECS));
     assert!(err.message.starts_with("the index range of the filter needed "), "{}", err.message);
     assert!(err.message.contains("aggregate.memory_pool_bytes"), "{}", err.message);
-    assert!(err.message.contains("sort by a field other than _id"), "{}", err.message);
+    assert!(
+        err.message.contains("sort by anything but {_id: 1} when skip + limit"),
+        "{}",
+        err.message
+    );
     assert!(!err.message.contains("$match"), "{}", err.message);
     assert_eq!(pool.used(), key_bytes(n), "only the other request's bytes are left");
     assert_eq!((pool.pool_refusals(), pool.limit_refusals()), (1, 0));
@@ -388,11 +407,11 @@ fn the_other_paths_of_a_find_take_no_lease_and_touch_no_pool() {
     assert_eq!((pool.used(), pool.limit_refusals(), pool.pool_refusals()), (0, 0, 0));
     assert_eq!(pool.holders(), 0);
 
-    // The path that does hold keys is refused at the first of them under the same limit, so
-    // the test is not vacuous.
-    let err = find_of(&state, rejected(json!({ "t": { "$gte": 100 } }))).unwrap_err();
+    // The path that does hold keys is refused under the same limit, at the key that passes
+    // its window, so the test is not vacuous.
+    let err = find_of(&state, rejected(json!({ "t": { "$gte": 0 }, "missing": 1 }))).unwrap_err();
     assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
-    assert_eq!(held_in(&err), key_bytes(1));
+    assert_eq!(held_in(&err), key_bytes(102));
     assert_eq!(pool.limit_refusals(), 1);
 }
 
@@ -409,10 +428,18 @@ fn a_find_that_ends_early_or_fails_gives_its_keys_back() {
     assert_eq!(found.unwrap()["count"], 5);
     assert_eq!(pool.used(), 0);
 
-    // A recheck that fails on a candidate, with a pass of keys held.
-    let failing = rejected(json!({ "t": { "$gte": 0 }, "$expr": { "$divide": ["$t", 0] } }));
+    // A recheck that fails on a candidate, with a pass of keys held and charged: the first
+    // 300 are rejected, in passes of 100 and 200, and the 301st fails in the pass of 400.
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (seen, watched) = (Arc::clone(&peak), pool.clone());
+    key_hooks::after_each_key(move |_| {
+        seen.fetch_max(watched.used(), std::sync::atomic::Ordering::SeqCst);
+    });
+    let divide = json!({ "$cond": [{ "$gte": ["$t", 300] }, { "$divide": ["$t", 0] }, false] });
+    let failing = rejected(json!({ "t": { "$gte": 0 }, "$expr": divide }));
     let err = find_of(&state, failing).unwrap_err();
     assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST, "{}", err.message);
+    assert!(peak.load(std::sync::atomic::Ordering::SeqCst) >= key_bytes(300), "charged");
     assert_eq!(pool.used(), 0);
 
     // A projection that fails on a document of the page.
@@ -480,4 +507,127 @@ fn the_pool_peak_of_a_find_over_a_range_is_the_keys_of_its_largest_pass() {
     assert_eq!(peak, key_bytes(7_300), "{peak} bytes for {n} entries");
     assert_eq!(largest_pass(n as usize), 7_300);
     assert_eq!(pool.used(), 0);
+}
+
+#[test]
+fn a_find_whose_keys_stay_within_its_window_is_answered_with_the_pool_full() {
+    // The commonest range query is a small page: `find {t: {$gte: x}} limit 20`. Its keys are
+    // the size of its page and are not charged, so it does not ask the pool, and a pool that
+    // aggregations have filled does not refuse it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500, 0, 0);
+    let pool = pool_of(&state);
+    let all = json!({ "t": { "$gte": 0 } });
+    // Accepting what it reads: 20 keys for a page of 20.
+    let page = find_of(&state, FindParams { limit: Some(20), ..rejected(all.clone()) });
+    assert_eq!(page.unwrap()["count"], 20);
+    // Rejecting everything of a range that fits the window (the default 100).
+    let narrow = json!({ "t": { "$gte": 1_450 }, "missing": 1 });
+    assert_eq!(find_of(&state, rejected(narrow)).unwrap()["count"], 0);
+    // The largest window a page may have, over a range that fits it.
+    let wide = FindParams { limit: Some(MAX_LIMIT), ..rejected(all.clone()) };
+    assert_eq!(find_of(&state, wide).unwrap()["count"], 1_500);
+    assert_eq!((pool.limit_refusals(), pool.pool_refusals(), pool.holders()), (0, 0, 0));
+
+    // The same with a pool another request has filled: it is answered and takes nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500, 64 << 20, 1 << 20);
+    let pool = pool_of(&state);
+    let other = state.aggregate_memory().limits();
+    let mut held = other.buffer.lease("another request");
+    held.charge(pool.cap()).unwrap();
+    let page = find_of(&state, FindParams { limit: Some(20), ..rejected(all.clone()) });
+    assert_eq!(page.unwrap()["count"], 20);
+    assert_eq!((pool.used(), pool.pool_refusals(), pool.holders()), (pool.cap(), 0, 1));
+
+    // A pass that goes past the window does take the lease: a rejecting filter over the whole
+    // range wants 200 keys in its second pass, and the full pool refuses it there.
+    let err = find_of(&state, rejected(rejecting())).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{}", err.message);
+    assert_eq!(pool.pool_refusals(), 1);
+    drop(held);
+    assert_eq!(pool.used(), 0);
+}
+
+#[test]
+fn the_first_key_past_the_window_makes_the_lease_and_is_charged_with_the_ones_before_it() {
+    // A window of 100 holds 101 keys unpooled. The 102nd, in the second pass, makes the lease
+    // and charges all 102; a limit of 101 keys refuses it there, and one of 102 does not.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 300, key_bytes(101), 64 << 20);
+    // What the pool shows while the keys held are 101 or fewer.
+    let within = Arc::new(AtomicUsize::new(0));
+    let (seen, watched) = (within.clone(), pool_of(&state));
+    key_hooks::after_each_key(move |held| {
+        if held <= key_bytes(101) {
+            seen.fetch_max(watched.used(), Ordering::SeqCst);
+        }
+    });
+    let err = find_of(&state, rejected(rejecting())).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert_eq!(held_in(&err), key_bytes(102));
+    assert_eq!(within.load(Ordering::SeqCst), 0, "the pool is not asked within the window");
+    assert_eq!(pool_of(&state).used(), 0);
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 300, key_bytes(200), 64 << 20);
+    assert_eq!(find_of(&state, rejected(rejecting())).unwrap()["count"], 0);
+}
+
+#[test]
+fn a_find_sorted_by_id_ascending_takes_the_hold_as_one_with_no_sort_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500, key_bytes(100), 64 << 20);
+    let by_id = FindParams { sort: Some(json!({ "_id": 1 })), ..rejected(rejecting()) };
+    let err = find_of(&state, by_id).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert!(err.message.starts_with("the index range of the filter is "), "{}", err.message);
+}
+
+/// `n` documents `{_id: i, t: i * 7919 % n}` under an index on `t`, so the range arrives in `t`
+/// order and the `_id`s in it are scattered, as they are when the indexed field does not
+/// follow `_id`: a pass that is full meets keys smaller than the largest it holds.
+fn scattered(dir: &tempfile::TempDir, n: i64, limit: usize) -> SharedState {
+    let state = live_state(dir);
+    state.set_aggregate_memory(AggregateMemory::new(limit, 64 << 20));
+    state.engine.create_collection("app", "orders").unwrap();
+    let index = vec![kimmy_storage::IndexField::ascending("t")];
+    state.engine.create_index("app", "orders", index, false, None).unwrap();
+    let meta = state.engine.get_collection("app", "orders").unwrap();
+    let docs: Vec<Document> = (0..n).map(|i| doc! { "_id": i, "t": i * 7919 % n }).collect();
+    state.engine.insert_many(&meta, docs).unwrap();
+    state
+}
+
+#[test]
+fn a_full_pass_that_meets_smaller_keys_holds_one_more_than_it_keeps_for_a_moment() {
+    // Over 2,000 entries the fourth pass wants 800 and is full, and a smaller key takes the
+    // place of the largest, which is held beside it until it is put back: 801 keys at the
+    // most, and the walk charges them. A limit of 800 keys refuses at the 801st; 801 answers.
+    let dir = tempfile::tempdir().unwrap();
+    let state = scattered(&dir, 2_000, key_bytes(800));
+    let err = find_of(&state, rejected(rejecting())).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert_eq!(held_in(&err), key_bytes(801));
+    assert_eq!(pool_of(&state).used(), 0);
+    let dir = tempfile::tempdir().unwrap();
+    let state = scattered(&dir, 2_000, key_bytes(801));
+    assert_eq!(find_of(&state, rejected(rejecting())).unwrap()["count"], 0);
+    assert_eq!(pool_of(&state).used(), 0);
+}
+
+#[test]
+fn the_sort_the_refusal_offers_is_one_a_find_accepts() {
+    // The text offers a sort "when skip + limit is at most {MAX_SORT_WINDOW}", and the sorted
+    // find refuses a window over that: the two agree.
+    assert!(FIND_RANGE_KEYS.over_limit.contains(&format!("at most {MAX_SORT_WINDOW},")));
+    assert!(FIND_RANGE_KEYS.pool_busy.contains(&format!("at most {MAX_SORT_WINDOW},")));
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 10, 64 << 20, 64 << 20);
+    let sorted = |limit| FindParams {
+        sort: Some(json!({ "_id": -1 })),
+        limit: Some(limit),
+        ..Default::default()
+    };
+    assert!(find_of(&state, sorted(MAX_SORT_WINDOW)).is_ok());
+    assert!(find_of(&state, FindParams { skip: Some(1), ..sorted(MAX_SORT_WINDOW) }).is_err());
 }
