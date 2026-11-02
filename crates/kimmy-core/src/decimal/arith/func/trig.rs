@@ -16,7 +16,8 @@
 //!
 //! **Large operands.** `sin`, `cos` and `tan` reduce the operand modulo `pi / 2` in a fixed
 //! point as wide as the operand is large (`pi` to 114 digits more than the operand's
-//! exponent, by Machin's formula), so an operand of `1E+6000` is reduced exactly. The other
+//! exponent, cut from the 6,400 places that are embedded: see [`pi_constant`]), so an operand
+//! of `1E+6000` is reduced exactly. The other
 //! functions work at [`S`] places, and the large operands of `asinh` and `acosh` are
 //! `ln(2x)`, to which the correction `1 / 4x²` cannot reach the 34th digit.
 //!
@@ -112,16 +113,13 @@ impl Scale {
         }
     }
 
-    /// `pi`, correct to the last place but a few units. It is built once for each of the
-    /// widths in [`PI_LIMBS`] (the widest holds the operand of the largest exponent the
-    /// format has) and cut to this scale, so that no call computes it.
+    /// `pi` cut to this scale, from the embedded digits: it is computed by no call, and the
+    /// widest scale a Decimal128 operand reaches (6,270 places) is inside them. Correct to the
+    /// last place, below it by less than a unit.
     fn pi(self) -> Mag {
-        static PI: [OnceLock<Mag>; PI_LIMBS.len()] = [const { OnceLock::new() }; PI_LIMBS.len()];
-        let Some(tier) = PI_LIMBS.iter().position(|&limbs| limbs >= self.limbs) else {
-            return pi_places(self.places());
-        };
-        let wide = PI[tier].get_or_init(|| pi_places(PI_LIMBS[tier] as u32 * LIMB_DIGITS));
-        let cut = (PI_LIMBS[tier] - self.limbs) as u32 * LIMB_DIGITS;
+        debug_assert!(self.places() <= PI_PLACES, "a scale wider than the embedded pi");
+        let wide = pi_constant();
+        let cut = PI_PLACES.saturating_sub(self.places());
         if cut == 0 { wide.clone() } else { wide.split_digits(cut).0 }
     }
 
@@ -130,9 +128,43 @@ impl Scale {
     }
 }
 
-/// The widths `pi` is kept at, in limbs: the standard scale, and doublings up to 330 limbs
-/// (6,270 places), which holds an operand of adjusted exponent 6,144 and 114 places beyond.
-const PI_LIMBS: [usize; 8] = [SL, SL + 2, 16, 32, 64, 128, 256, 330];
+/// `pi` to [`PI_PLACES`] places: the digits `3` and the 6,400 after the point, generated
+/// off-line by `gen_pi.py` (the Chudnovsky series, integer binary splitting) and checked by a
+/// test against a fresh Machin build at the widest width. That is more than the 6,270 places
+/// the operand of the largest exponent needs (`Scale::reaching(6144)` is 330 limbs), so no
+/// call builds `pi`, and none stalls where the request deadline cannot see it.
+const PI_DIGITS: &str = include_str!("pi.txt");
+
+/// The places of [`PI_DIGITS`] after the point.
+const PI_PLACES: u32 = 6400;
+
+/// Times the embedded `pi` was read into limbs, which a test holds to one for the process.
+#[cfg(test)]
+static PI_PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `floor(pi · 10^PI_PLACES)` as limbs, read from [`PI_DIGITS`] once.
+fn pi_constant() -> &'static Mag {
+    static PI: OnceLock<Mag> = OnceLock::new();
+    PI.get_or_init(|| {
+        #[cfg(test)]
+        PI_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let digits: Vec<u8> = PI_DIGITS.bytes().filter(u8::is_ascii_digit).collect();
+        let mut limbs = Vec::with_capacity(digits.len() / LIMB_DIGITS as usize + 1);
+        let mut end = digits.len();
+        while end > 0 {
+            let start = end.saturating_sub(LIMB_DIGITS as usize);
+            limbs.push(digits[start..end].iter().fold(0u64, |n, d| n * 10 + u64::from(d - b'0')));
+            end = start;
+        }
+        let mut pi = Mag(limbs);
+        pi.trim();
+        pi
+    })
+}
+
+#[cfg(test)]
+#[path = "trig_tests.rs"]
+mod trig_tests;
 
 /// The scale the series of `sin` and `cos` run at, once the operand is reduced: the standard
 /// scale and a limb. The reduction leaves an absolute error of about `10^-115`, and a result
@@ -140,43 +172,8 @@ const PI_LIMBS: [usize; 8] = [SL, SL + 2, 16, 32, 64, 128, 256, 330];
 /// every digit that rounding to 34 needs.
 const SERIES: Scale = Scale { limbs: SL + 1 };
 
-/// The ratio of two operands, in adjusted exponent, from which `atan2` answers `y / x` (or
-/// `pi` less it) directly: `atan(r) = r - r^3/3`, and `r^2` is below `10^-158`.
+/// The ratio of two operands, in adjusted exponent, from which `atan2` answers `y / x` directly: `atan(r) = r - r^3/3`, and `r^2` is below `10^-158`.
 const DIRECT_RATIO: i64 = 80;
-
-/// `atan(1/n)` to `places` places, truncated: `Σ (-1)^k / ((2k + 1) n^(2k+1))`.
-fn atan_inverse(n: u64, places: u32) -> Mag {
-    let mut power = m_div_small(&pow10(places), n).0;
-    let n2 = n * n;
-    let (mut plus, mut minus) = (Mag::zero(), Mag::zero());
-    let (mut k, mut add) = (1u64, true);
-    while !power.is_zero() {
-        let term = m_div_small(&power, k).0;
-        if add {
-            plus = m_add(&plus, &term);
-        } else {
-            minus = m_add(&minus, &term);
-        }
-        power = m_div_small(&power, n2).0;
-        k += 2;
-        add = !add;
-    }
-    m_sub(&plus, &minus)
-}
-
-/// `pi = 16 atan(1/5) - 4 atan(1/239)` (Machin), to `places` places: computed 19 places
-/// wider, where the few thousand truncations of the series are 19 digits below the last
-/// place kept, and cut back with the half-up rounding of a limb.
-fn pi_places(places: u32) -> Mag {
-    let wide = places + LIMB_DIGITS;
-    let mut a = atan_inverse(5, wide);
-    a.mul_small(16);
-    let mut b = atan_inverse(239, wide);
-    b.mul_small(4);
-    let pi = m_sub(&a, &b);
-    let (q, tail) = pi.split_digits(LIMB_DIGITS);
-    if tail.digit >= 5 { m_add(&q, &Mag::from_u64(1)) } else { q }
-}
 
 fn negate(x: &Fx) -> Fx {
     Fx { neg: !x.neg && !x.mag.is_zero(), mag: x.mag.clone() }
