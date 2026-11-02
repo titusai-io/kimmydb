@@ -132,10 +132,13 @@ impl AggregateMemory {
     /// The limits of one aggregation: the default document ceiling and a fresh budget of
     /// the request limit, reserving what it holds from the pool.
     pub fn limits(&self) -> kimmy_query::aggregate::Limits {
-        kimmy_query::aggregate::Limits {
-            buffer: kimmy_query::budget::BufferBudget::pooled(self.limit, &self.pool),
-            ..Default::default()
+        let buffer = kimmy_query::budget::BufferBudget::pooled(self.limit, &self.pool);
+        // A request that waits for the pool (it is older than another that holds bytes)
+        // waits no longer than the request has left: at the deadline it is refused, `503`.
+        if let Some(left) = request_time_left() {
+            buffer.wait_until(std::time::Instant::now() + left);
         }
+        kimmy_query::aggregate::Limits { buffer, ..Default::default() }
     }
 
     /// The bytes one request may hold.
@@ -650,6 +653,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    /// A request that waits for the pool (it is older than another that holds bytes) waits no
+    /// longer than the request has left, and is then refused `503` (ADR-269).
+    #[tokio::test]
+    async fn a_request_waiting_for_the_pool_gives_up_at_its_deadline() {
+        let memory = AggregateMemory::new(100, 100);
+        let pool = memory.pool().clone();
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let err = as_a_request(deadline, Duration::from_millis(200), async {
+            let older = memory.limits();
+            let mut lease = older.buffer.lease("the source read");
+            lease.charge(10).unwrap();
+            // A younger request takes most of what is left, and keeps it.
+            let younger = memory.limits();
+            let mut held = younger.buffer.lease("the source read");
+            held.charge(85).unwrap();
+            let err = lease.charge(50).unwrap_err();
+            (err, held)
+        })
+        .await;
+        let (err, held) = err;
+        assert!(matches!(err, kimmy_core::Error::MemoryBusy { .. }), "{err:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(150) && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        drop(held);
+        assert_eq!((pool.used(), pool.holders()), (0, 0));
     }
 
     /// The answer's bytes stay in the pool until the body has been sent (ADR-269).

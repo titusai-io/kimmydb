@@ -2,6 +2,7 @@
 //! and the pool the budgets draw on.
 
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use bson::{Bson, Document, doc};
 use kimmy_core::Error;
@@ -235,6 +236,8 @@ fn two_requests_cannot_both_take_the_last_of_the_pool() {
                 let (pool, barrier) = (pool.clone(), Arc::clone(&barrier));
                 std::thread::spawn(move || {
                     let budget = BufferBudget::pooled(100, &pool);
+                    // Whichever loses may be the older, which would wait: not for this.
+                    budget.wait_until(Instant::now());
                     let mut lease = budget.lease("x");
                     barrier.wait();
                     let won = lease.charge(60).is_ok();
@@ -249,6 +252,185 @@ fn two_requests_cannot_both_take_the_last_of_the_pool() {
         assert_eq!(pool.used(), 0, "and both give it back");
         assert_eq!(pool.pool_refusals(), 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The pool is granted oldest first (ADR-269, the review's m6)
+// ---------------------------------------------------------------------------
+
+/// A request on `pool` that holds `bytes` now: its budget and the lease that holds them.
+fn holder(pool: &MemoryPool, bytes: usize) -> (BufferBudget, crate::budget::Lease) {
+    let budget = BufferBudget::pooled(pool.cap(), pool);
+    let mut lease = budget.lease("a request");
+    lease.charge(bytes).unwrap();
+    (budget, lease)
+}
+
+fn is_busy(err: &Error) -> bool {
+    matches!(err, Error::MemoryBusy { .. })
+}
+
+#[test]
+fn an_older_request_waits_for_the_pool_and_is_woken_by_a_release() {
+    let pool = MemoryPool::new(100);
+    let (_b, mut older) = holder(&pool, 10);
+    let (_a, younger) = holder(&pool, 60);
+    // The older asks for 50 more: the pool has 30. It waits, and the younger's release wakes it.
+    let started = Instant::now();
+    let waiter = std::thread::spawn(move || {
+        let result = older.charge(50);
+        (result, older, started.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!waiter.is_finished(), "the older request is waiting, not refused");
+    assert_eq!(pool.pool_refusals(), 0);
+    drop(younger);
+    let (result, older, waited) = waiter.join().unwrap();
+    result.unwrap();
+    assert!(waited >= Duration::from_millis(100), "it waited for the release: {waited:?}");
+    assert_eq!(pool.used(), 60, "its 10 and the 50 it waited for");
+    assert_eq!((pool.pool_refusals(), pool.holders()), (0, 1));
+    drop(older);
+    assert_eq!((pool.used(), pool.holders()), (0, 0));
+}
+
+#[test]
+fn the_younger_request_is_refused_while_the_older_waits_and_the_older_then_completes() {
+    let pool = MemoryPool::new(100);
+    let (_b, mut older) = holder(&pool, 10);
+    let (_a, mut younger) = holder(&pool, 60);
+    let waiter = std::thread::spawn(move || {
+        let result = older.charge(50);
+        (result, older)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    // The younger finds the pool full too and is the one refused, at once; dropping its lease
+    // (the stage unwinding) gives its 60 back, which is what the older was waiting for.
+    let started = Instant::now();
+    let err = younger.charge(40).unwrap_err();
+    assert!(is_busy(&err), "{err:?}");
+    assert!(started.elapsed() < Duration::from_millis(50), "refused at once");
+    drop(younger);
+    let (result, older) = waiter.join().unwrap();
+    result.unwrap();
+    assert_eq!(pool.used(), 60);
+    assert_eq!(pool.pool_refusals(), 1, "only the refusal is counted, not the wait");
+    drop(older);
+    assert_eq!((pool.used(), pool.holders()), (0, 0));
+}
+
+#[test]
+fn a_waiting_request_is_ended_by_its_deadline_and_the_pool_comes_back() {
+    let pool = MemoryPool::new(100);
+    let (budget, mut older) = holder(&pool, 10);
+    let (_a, younger) = holder(&pool, 80);
+    budget.wait_until(Instant::now() + Duration::from_millis(120));
+    let started = Instant::now();
+    let err = older.charge(50).unwrap_err();
+    let waited = started.elapsed();
+    assert!(is_busy(&err), "{err:?}: the deadline's 503");
+    assert!(waited >= Duration::from_millis(100) && waited < Duration::from_secs(2), "{waited:?}");
+    assert_eq!(pool.pool_refusals(), 1);
+    drop(older);
+    drop(budget);
+    assert_eq!(pool.used(), 80, "only the younger holds now");
+    drop(younger);
+    assert_eq!((pool.used(), pool.holders()), (0, 0));
+}
+
+#[test]
+fn a_request_that_alone_would_pass_the_whole_pool_is_refused_at_once() {
+    let pool = MemoryPool::new(100);
+    let budget = BufferBudget::pooled(1_000, &pool);
+    budget.wait_until(Instant::now() + Duration::from_secs(30));
+    let mut lease = budget.lease("a request");
+    lease.charge(10).unwrap();
+    // A younger request holds bytes, so this one, the older, would wait for the pool...
+    let (_other, _held) = holder(&pool, 40);
+    let started = Instant::now();
+    // ...but 150 bytes would pass the whole pool of 100 whatever is freed: refused at once.
+    let err = lease.charge(150).unwrap_err();
+    assert!(is_busy(&err), "{err:?}");
+    assert!(started.elapsed() < Duration::from_millis(500), "waiting cannot help it");
+    assert_eq!(pool.pool_refusals(), 1);
+}
+
+#[test]
+fn the_order_is_cleaned_when_a_request_errors_drops_or_panics() {
+    let pool = MemoryPool::new(100);
+    // Dropped.
+    let (budget, lease) = holder(&pool, 10);
+    assert_eq!(pool.holders(), 1);
+    drop(lease);
+    assert_eq!(pool.holders(), 0, "a lease that gave everything back is no holder");
+    drop(budget);
+    // Refused: the stage unwinds with its leases.
+    let (_other, _held) = holder(&pool, 80);
+    {
+        let budget = BufferBudget::pooled(100, &pool);
+        let mut lease = budget.lease("refused");
+        assert!(is_busy(&lease.charge(50).unwrap_err()));
+        assert_eq!(pool.holders(), 1, "the refused one never became a holder");
+    }
+    assert_eq!((pool.used(), pool.holders()), (80, 1));
+    // Panic with a lease held: the unwinding drops it.
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (_budget, _lease) = holder(&pool, 10);
+        assert_eq!(pool.holders(), 2);
+        panic!("a stage panicked");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!((pool.used(), pool.holders()), (80, 1));
+    // A partial release leaves the holder; releasing all of it does not.
+    let budget = BufferBudget::pooled(100, &pool);
+    let mut lease = budget.lease("partial");
+    lease.charge(10).unwrap();
+    lease.release(4);
+    assert_eq!(pool.holders(), 2);
+    lease.release(6);
+    assert_eq!(pool.holders(), 1);
+}
+
+#[test]
+fn three_requests_ramping_together_two_are_answered_and_the_youngest_is_refused() {
+    // The review's m6: three equal requests ramping up together against a pool that holds two
+    // all got `503`, each refused while holding a share. A pool of 900, each request going to
+    // 400 in steps of 100 with a barrier at each step: at the last step the pool is full, the
+    // youngest is refused and gives its 300 back, and the two older ones are answered.
+    let pool = MemoryPool::new(900);
+    let budgets: Vec<_> = (0..3).map(|_| BufferBudget::pooled(900, &pool)).collect();
+    let mut leases: Vec<_> = budgets.iter().map(|b| b.lease("a request")).collect();
+    // The first step, in order, so the requests are born in the order they are numbered.
+    for lease in &mut leases {
+        lease.charge(100).unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(3));
+    let handles: Vec<_> = leases
+        .into_iter()
+        .map(|mut lease| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                for _ in 0..3 {
+                    barrier.wait();
+                    lease.charge(100)?;
+                }
+                // Answered: the bytes are held until the test has looked at the pool.
+                Ok(lease)
+            })
+        })
+        .collect();
+    let mut results: Vec<Result<crate::budget::Lease, Error>> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(
+        results.iter().map(|r| r.is_ok()).collect::<Vec<_>>(),
+        [true, true, false],
+        "{results:?}"
+    );
+    assert!(matches!(&results[2], Err(Error::MemoryBusy { .. })));
+    assert_eq!(results[0].as_ref().unwrap().bytes(), 400);
+    assert_eq!((pool.used(), pool.holders(), pool.pool_refusals()), (800, 2, 1));
+    results.clear();
+    assert_eq!((pool.used(), pool.holders()), (0, 0));
 }
 
 // ---------------------------------------------------------------------------

@@ -2264,9 +2264,14 @@ expression builds, are unchanged: they are per value.
 **The node's pool.** Requests also draw on a pool shared by every aggregation on the node,
 `aggregate.memory_pool_bytes` (a tenth of the container's memory limit, or of the RAM, by default): a request reserves from it as its own total
 grows and returns it when it ends, however it ends (an answer, a refusal, the request deadline,
-a panic). A request the pool cannot cover (the node's aggregation memory pool is in use) is refused `503 timeout` with `retry: wait` and
-`Retry-After: 1`: it is within its own limit, nothing was done, and the same request is answered when
-the others have finished. Both refusals are counted on `/metrics`
+a panic). A request the pool cannot cover (the node's aggregation memory pool is in use) is **granted
+oldest first**: if another request that holds bytes is younger, it waits for bytes to be freed, until its
+request deadline; if it is the youngest holder, or its deadline comes first, it is refused `503 timeout` with
+`retry: wait` and `Retry-After: 1`. A request that alone would pass the whole pool is refused at once.
+The refusal is the same either way: the request is within its own limit, nothing was done, and the same
+request is answered when the others have finished. (So three equal requests ramping up against a pool
+that holds two answer two and refuse the youngest, where each refused while holding a share could
+refuse all three.) Both refusals are counted on `/metrics`
 (`kimmy_aggregate_memory_limit_refusals_total`, `kimmy_aggregate_memory_pool_refusals_total`), and
 the bytes the pool holds now are `kimmy_aggregate_memory_pool_used_bytes`.
 

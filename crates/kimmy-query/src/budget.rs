@@ -27,8 +27,10 @@
 //! memory (the transient copies of an answer being built are beyond it), only a bound
 //! proportional to it.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result};
@@ -205,10 +207,28 @@ pub fn docs_bytes(docs: &[Document]) -> usize {
     docs.iter().fold(0usize, |sum, doc| sum.saturating_add(doc_bytes(doc)))
 }
 
+/// How long a request that is not at the youngest end waits for the pool when nothing gives
+/// it a deadline (a request served over HTTP always has one: `BufferBudget::wait_until`).
+pub const POOL_WAIT_DEFAULT: Duration = Duration::from_secs(5);
+
+/// The longest a waiting request sleeps before it looks at the pool again; a release wakes
+/// it sooner.
+const POOL_WAIT_SLICE: Duration = Duration::from_millis(5);
+
+/// The requests that hold a reservation, in the order they first reserved (ADR-269).
+#[derive(Debug, Default)]
+struct Order {
+    next: u64,
+    holders: BTreeSet<u64>,
+}
+
 #[derive(Debug)]
 struct PoolInner {
     cap: usize,
     used: AtomicUsize,
+    /// Who holds a reservation, oldest first, and the wake-up for a request that waits.
+    order: Mutex<Order>,
+    freed: Condvar,
     /// Charges refused for taking one request over its own limit, and charges refused
     /// because the pool was empty: what `/metrics` counts.
     limit_refusals: AtomicU64,
@@ -225,6 +245,8 @@ impl MemoryPool {
         MemoryPool(Arc::new(PoolInner {
             cap,
             used: AtomicUsize::new(0),
+            order: Mutex::new(Order::default()),
+            freed: Condvar::new(),
             limit_refusals: AtomicU64::new(0),
             pool_refusals: AtomicU64::new(0),
         }))
@@ -281,10 +303,50 @@ impl MemoryPool {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => break,
                 Err(now) => used = now,
             }
         }
+        self.0.freed.notify_all();
+    }
+
+    fn order(&self) -> MutexGuard<'_, Order> {
+        self.0.order.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A place in the order for a request that is about to reserve for the first time.
+    fn register(&self) -> u64 {
+        let mut order = self.order();
+        order.next += 1;
+        order.next
+    }
+
+    /// `seq` holds a reservation now.
+    fn hold(&self, seq: u64) {
+        self.order().holders.insert(seq);
+    }
+
+    /// `seq` holds nothing now.
+    fn unhold(&self, seq: u64) {
+        self.order().holders.remove(&seq);
+        self.0.freed.notify_all();
+    }
+
+    /// Whether no request that holds a reservation is younger than `seq`: the one that is
+    /// refused when the pool is full, where an older one waits.
+    fn is_youngest(&self, seq: u64) -> bool {
+        self.order().holders.last().is_none_or(|youngest| *youngest <= seq)
+    }
+
+    /// The requests that hold a reservation now.
+    pub fn holders(&self) -> usize {
+        self.order().holders.len()
+    }
+
+    /// Sleep until a release, or `slice` at the most.
+    fn wait_for_release(&self, slice: Duration) {
+        let order = self.order();
+        let _ = self.0.freed.wait_timeout(order, slice);
     }
 }
 
@@ -296,6 +358,10 @@ struct Inner {
     /// How much of `used` the pool has been asked for and gave. Never over `used`: a
     /// charge the pool refused is in `used` (its lease gives it back) and not here.
     reserved: usize,
+    /// This request's place in the pool's order, taken when it first asks the pool for bytes.
+    seq: Option<u64>,
+    /// When a request that waits for the pool gives up.
+    wait_until: Option<Instant>,
 }
 
 impl Inner {
@@ -306,6 +372,16 @@ impl Inner {
                 pool.release(self.reserved - self.used);
             }
             self.reserved = self.used;
+            self.leave_if_empty();
+        }
+    }
+
+    /// A request that holds nothing is no holder.
+    fn leave_if_empty(&self) {
+        if self.reserved == 0
+            && let (Some(pool), Some(seq)) = (&self.pool, self.seq)
+        {
+            pool.unhold(seq);
         }
     }
 }
@@ -314,6 +390,9 @@ impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(pool) = &self.pool {
             pool.release(self.reserved);
+            if let Some(seq) = self.seq {
+                pool.unhold(seq);
+            }
         }
     }
 }
@@ -331,7 +410,14 @@ impl Default for BufferBudget {
 impl BufferBudget {
     /// A budget of `cap` bytes, not yet charged, drawing on no pool.
     pub fn new(cap: usize) -> Self {
-        BufferBudget(Arc::new(Mutex::new(Inner { cap, used: 0, pool: None, reserved: 0 })))
+        BufferBudget(Arc::new(Mutex::new(Inner {
+            cap,
+            used: 0,
+            pool: None,
+            reserved: 0,
+            seq: None,
+            wait_until: None,
+        })))
     }
 
     /// A budget of `cap` bytes that reserves what it holds from `pool`.
@@ -341,7 +427,16 @@ impl BufferBudget {
             used: 0,
             pool: Some(pool.clone()),
             reserved: 0,
+            seq: None,
+            wait_until: None,
         })))
+    }
+
+    /// Where a request of this budget that finds the pool full and is not the youngest holder
+    /// gives up waiting for it, and is refused (`503`). A request served over HTTP sets its
+    /// own deadline here; without one the wait is [`POOL_WAIT_DEFAULT`].
+    pub fn wait_until(&self, at: Instant) {
+        self.inner().wait_until = Some(at);
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
@@ -408,14 +503,33 @@ impl Lease {
         if let Some(pool) = inner.pool.clone()
             && want > 0
         {
-            if !pool.try_reserve(want) {
-                pool.0.pool_refusals.fetch_add(1, Ordering::Relaxed);
-                return Err(Error::MemoryBusy {
-                    what: self.what,
-                    bytes: want,
-                    pool: pool.cap(),
-                    in_use: pool.used(),
-                });
+            let seq = *inner.seq.get_or_insert_with(|| pool.register());
+            // Oldest first (ADR-269): when the pool is full, the youngest holder is refused,
+            // and an older one waits for bytes to be freed, until its deadline. A request that
+            // alone would pass the whole pool is refused at once: waiting cannot help it.
+            let give_up = inner.wait_until.unwrap_or_else(|| Instant::now() + POOL_WAIT_DEFAULT);
+            while !pool.try_reserve(want) {
+                let now = Instant::now();
+                if inner.used > pool.cap() || pool.is_youngest(seq) || now >= give_up {
+                    // A holder that was younger may have been refused, and given its bytes
+                    // back, since the pool was looked at: it is looked at once more (a
+                    // release is made before its holder leaves the order, so one that made
+                    // this request the youngest is seen here).
+                    if inner.used <= pool.cap() && pool.try_reserve(want) {
+                        break;
+                    }
+                    pool.0.pool_refusals.fetch_add(1, Ordering::Relaxed);
+                    return Err(Error::MemoryBusy {
+                        what: self.what,
+                        bytes: want,
+                        pool: pool.cap(),
+                        in_use: pool.used(),
+                    });
+                }
+                pool.wait_for_release(POOL_WAIT_SLICE.min(give_up - now));
+            }
+            if inner.reserved == 0 {
+                pool.hold(seq);
             }
             inner.reserved += want;
         }

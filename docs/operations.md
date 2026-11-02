@@ -136,9 +136,14 @@ it is legal. Two settings bound it ([ADR-269](decisions.md)), both in BSON bytes
   again changes nothing until the pipeline asks for less (a leading `$match` narrows what is read;
   `$project`, `$limit` or `$match` after it reduce what later stages hold) or the limit is raised.
 - **`aggregate.memory_pool_bytes`** is what **all aggregations on the node** may hold together.
-  A request takes from it as it grows and returns it however it ends; an answer still being sent keeps its bytes until the last of them is written. One that finds it empty is
-  refused `503 timeout`, `retry: wait`, `Retry-After: 1`: nothing was done, and the same request
-  is answered when the others have finished.
+  A request takes from it as it grows and returns it however it ends; an answer still being sent keeps its bytes until the last of them is written. One that finds it full is
+  **granted oldest first**: it waits for bytes to be freed, up to its request deadline
+  (`server.request_timeout_secs`), when another request that holds bytes is younger, and is refused
+  `503 timeout`, `retry: wait`, `Retry-After: 1` when it is the youngest holder, when its deadline comes,
+  or when it alone would pass the whole pool: nothing was done, and the same request is answered when
+  the others have finished. Equal requests ramping up together against a pool that holds two answer two
+  and refuse the youngest; a wait is not counted as a refusal in
+  `kimmy_aggregate_memory_pool_refusals_total`.
 
 **The defaults are derived, not fixed.** The budget counts an estimate of the memory the
 held documents take parsed (a document of many small fields is charged many times its BSON size),

@@ -20942,6 +20942,53 @@ async fn with_the_derived_ratio_a_third_request_is_the_first_the_pool_refuses() 
 }
 
 #[tokio::test]
+async fn three_requests_ramping_into_a_pool_that_holds_two_are_never_all_refused() {
+    // The review's m6 over HTTP, with an explicit small pool: each request needs about 6 MiB
+    // of a 10 MiB pool, so two cannot be held together, and three start at once. The pool is
+    // granted oldest first: a request that finds it full waits for a holder to finish
+    // unless it is the youngest, which is refused. Whatever the interleaving, some request is
+    // answered, every refusal is the `503` that says to retry, and the pool and its order
+    // are empty afterwards. (Before, three could all be refused.)
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(8 << 20, 10 << 20));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 6).await;
+    let pool = server.state.aggregate_memory().pool().clone();
+    for round in 0..4 {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let (base, token, barrier) = (server.base.clone(), token.clone(), barrier.clone());
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let res = Client
+                    .request(
+                        "POST",
+                        &format!("{base}/v1/db/kx/coll/zmem/aggregate"),
+                        Some(&token),
+                        Some(z1_pipeline(10)),
+                    )
+                    .await;
+                (res.status, res.body["retry"].clone(), res.header("retry-after"))
+            }));
+        }
+        let mut answered = 0;
+        for task in tasks {
+            let (status, retry, retry_after) = task.await.unwrap();
+            assert!(status == 200 || status == 503, "round {round}: {status}");
+            if status == 503 {
+                assert_eq!(retry, "wait");
+                assert_eq!(retry_after.as_deref(), Some("1"));
+            } else {
+                answered += 1;
+            }
+        }
+        assert!(answered >= 1, "round {round}: all three were refused");
+        wait_for("the pool is empty", || pool.used() == 0 && pool.holders() == 0).await;
+    }
+}
+
+#[tokio::test]
 async fn concurrent_aggregations_are_answered_or_told_to_retry_and_return_the_pool() {
     // Eight requests at once, each holding about 3 MiB at its peak, against a pool of 8 MiB:
     // every one is answered or refused with a 503, and the pool is empty when all are done.

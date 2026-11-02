@@ -1740,7 +1740,9 @@ paths:
             `timeout`, `retry: wait`, `Retry-After: 1`: the node's aggregation memory
             pool is in use (`aggregate.memory_pool_bytes`, by default a tenth of the container's memory; ADR-269).
             The request is within its own limit and nothing was done; the same request
-            is answered when the others have finished. An answer still being sent holds
+            is answered when the others have finished. The pool is granted oldest first: a
+            request that is not the youngest holder waits for it, up to its request deadline,
+            and the youngest is refused. An answer still being sent holds
             its bytes in the pool until the last of them is written.
           headers:
             Retry-After:
