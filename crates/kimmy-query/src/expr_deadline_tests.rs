@@ -407,21 +407,37 @@ fn a_decimal_sine_of_a_huge_operand_is_charged_its_reduction_before_it_runs() {
     assert_eq!(ticks_of(small, &doc! {}), 2);
 }
 
+/// A switch to a huge sine after thousands of cheap documents ends within a few sines of the
+/// deadline. The deadline is a multiple of one warm sine measured here, so the bound is in the
+/// same units whatever the profile and the machine: without the exponent charge the stride is
+/// at its 512 and up to about 128 sines (four ticks a document) would run past the deadline,
+/// which is 100 sines or so beyond this bound; the charge makes the first sine past it read the
+/// clock. It discriminates when a sine costs about a quarter of a millisecond or more, which it
+/// does in the dev profile and in release.
 #[test]
-fn a_switch_to_a_huge_decimal_sine_after_thousands_of_cheap_documents_ends_at_the_deadline() {
+fn a_switch_to_a_huge_decimal_sine_after_cheap_documents_ends_within_a_few_sines_of_the_deadline() {
     use crate::aggregate::{self, Limits};
     let expr = parse(late_sine());
-    // `pi` is built once for the process, by the first sine of an operand this large.
+    // One warm sine: the first only reads `pi`'s digits into limbs, the second is timed.
     expr.eval(&doc! { "n": 9999 }).expect("a sine");
+    let start = Instant::now();
+    expr.eval(&doc! { "n": 9999 }).expect("a sine");
+    let one = start.elapsed();
 
+    let remaining = (one * 20).max(Duration::from_millis(60));
     let docs: Vec<Document> = (0..12_000).map(|n| doc! { "_id": n, "n": n }).collect();
     let stages = aggregate::parse(&[doc! { "$project": { "x": late_sine() } }]).unwrap();
-    let _deadline = Deadline::scope(Some(Duration::from_millis(30)));
+    let _deadline = Deadline::scope(Some(remaining));
+    let ticks = ticks_taken();
     let start = Instant::now();
     let result = aggregate::apply(&stages[0], docs, &Limits::default());
     let took = start.elapsed();
     assert!(is_deadline(result), "the request must end at its deadline");
-    // The 5,000 cheap documents take a few milliseconds and the sines the rest of the 30: it
-    // ends within about one sine of the deadline, not minutes after it.
-    assert!(took < Duration::from_secs(5), "{took:?}");
+    // At least one huge sine ran (each is charged its 6,144 ticks), so the test reached the
+    // switch before the deadline and did not pass on the cheap documents alone.
+    assert!(ticks_taken() - ticks >= 6144, "no huge sine ran: {} ticks", ticks_taken() - ticks);
+    assert!(
+        took < remaining + one * 4 + Duration::from_millis(25),
+        "{took:?} for a deadline of {remaining:?} and a sine of {one:?}"
+    );
 }
