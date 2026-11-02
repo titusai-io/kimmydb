@@ -49,8 +49,8 @@ fn every_facet_runs_over_the_same_input_and_the_answer_is_one_document() {
     assert_eq!(
         out,
         vec![doc! {
-            "total": [{"n": 3i64}],
-            "byCity": [{"_id": "oslo", "n": 2i64}, {"_id": "rome", "n": 1i64}],
+            "total": [{"n": 3}],
+            "byCity": [{"_id": "oslo", "n": 2}, {"_id": "rome", "n": 1}],
             "oldest": [{"_id": 3, "age": 50}],
         }]
     );
@@ -64,7 +64,7 @@ fn a_facet_does_not_change_what_the_next_one_sees() {
     )
     .unwrap();
     assert_eq!(out[0].get_array("one").unwrap().len(), 1);
-    assert_eq!(out[0].get_array("all").unwrap(), &vec![Bson::Document(doc! {"n": 3i64})]);
+    assert_eq!(out[0].get_array("all").unwrap(), &vec![Bson::Document(doc! {"n": 3})]);
     assert!(out[0].get_array("none").unwrap().is_empty());
 }
 
@@ -74,7 +74,7 @@ fn an_empty_facet_pipeline_answers_the_input_and_an_empty_input_still_answers_a_
     assert_eq!(out[0].get_array("same").unwrap().len(), 3);
     let out = run(&[doc! {"$facet": {"a": [{"$count": "n"}], "b": []}}], vec![]).unwrap();
     // `$count` of nothing is a zero, as it is outside a facet.
-    assert_eq!(out, vec![doc! {"a": [{"n": 0i64}], "b": []}]);
+    assert_eq!(out, vec![doc! {"a": [{"n": 0}], "b": []}]);
 }
 
 #[test]
@@ -89,14 +89,14 @@ fn stages_after_a_facet_read_its_one_document() {
         people(),
     )
     .unwrap();
-    assert_eq!(out, vec![doc! {"_id": "oslo", "n": 2i64}, doc! {"_id": "rome", "n": 1i64}]);
+    assert_eq!(out, vec![doc! {"_id": "oslo", "n": 2}, doc! {"_id": "rome", "n": 1}]);
     // And a facet is a stage like any other in the middle of a pipeline.
     let out = run(
         &[doc! {"$match": {"city": "oslo"}}, doc! {"$facet": {"n": [{"$count": "n"}]}}],
         people(),
     )
     .unwrap();
-    assert_eq!(out, vec![doc! {"n": [{"n": 2i64}]}]);
+    assert_eq!(out, vec![doc! {"n": [{"n": 2}]}]);
 }
 
 #[test]

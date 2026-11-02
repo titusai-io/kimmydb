@@ -254,27 +254,27 @@ fn regex_null_missing_and_wrong_types() {
 #[test]
 fn regex_find_gives_match_idx_and_captures() {
     let got = ok(doc! {"$regexFind": {"input": "ab12cd", "regex": "([a-z])(\\d+)"}});
-    assert_eq!(got, Bson::Document(doc! {"match": "b12", "idx": 1i64, "captures": ["b", "12"]}));
+    assert_eq!(got, Bson::Document(doc! {"match": "b12", "idx": 1, "captures": ["b", "12"]}));
     // No groups: an empty captures array. No match: null.
     assert_eq!(
         ok(doc! {"$regexFind": {"input": "xay", "regex": "a"}}),
-        Bson::Document(doc! {"match": "a", "idx": 1i64, "captures": []})
+        Bson::Document(doc! {"match": "a", "idx": 1, "captures": []})
     );
     assert_eq!(ok(doc! {"$regexFind": {"input": "xay", "regex": "z"}}), Bson::Null);
     // A group that took no part is null.
     assert_eq!(
         ok(doc! {"$regexFind": {"input": "b", "regex": "(a)?(b)"}}),
-        Bson::Document(doc! {"match": "b", "idx": 0i64, "captures": [Bson::Null, "b"]})
+        Bson::Document(doc! {"match": "b", "idx": 0, "captures": [Bson::Null, "b"]})
     );
     // idx counts code points, not bytes.
     assert_eq!(
         ok(doc! {"$regexFind": {"input": "éé🙂x", "regex": "x"}}),
-        Bson::Document(doc! {"match": "x", "idx": 3i64, "captures": []})
+        Bson::Document(doc! {"match": "x", "idx": 3, "captures": []})
     );
     // The leftmost match, greedy.
     assert_eq!(
         ok(doc! {"$regexFind": {"input": "aaa", "regex": "a+"}}),
-        Bson::Document(doc! {"match": "aaa", "idx": 0i64, "captures": []})
+        Bson::Document(doc! {"match": "aaa", "idx": 0, "captures": []})
     );
 }
 
@@ -284,18 +284,18 @@ fn regex_find_all_several_and_zero_width_matches() {
     assert_eq!(
         all,
         Bson::Array(vec![
-            Bson::Document(doc! {"match": "1", "idx": 1i64, "captures": ["1"]}),
-            Bson::Document(doc! {"match": "22", "idx": 3i64, "captures": ["22"]}),
-            Bson::Document(doc! {"match": "333", "idx": 6i64, "captures": ["333"]}),
+            Bson::Document(doc! {"match": "1", "idx": 1, "captures": ["1"]}),
+            Bson::Document(doc! {"match": "22", "idx": 3, "captures": ["22"]}),
+            Bson::Document(doc! {"match": "333", "idx": 6, "captures": ["333"]}),
         ])
     );
     assert_eq!(ok(doc! {"$regexFindAll": {"input": "abc", "regex": "z"}}), Bson::Array(vec![]));
     // Matches do not overlap.
-    let idx = |input: &str, re: &str| -> Vec<i64> {
+    let idx = |input: &str, re: &str| -> Vec<i32> {
         let Bson::Array(items) = ok(doc! {"$regexFindAll": {"input": input, "regex": re}}) else {
             panic!("an array")
         };
-        items.iter().map(|m| m.as_document().unwrap().get_i64("idx").unwrap()).collect()
+        items.iter().map(|m| m.as_document().unwrap().get_i32("idx").unwrap()).collect()
     };
     assert_eq!(idx("aaaa", "aa"), vec![0, 2]);
     // Zero-width: one per position, each search starting a code point past an
@@ -320,14 +320,14 @@ fn regex_find_all_several_and_zero_width_matches() {
     assert_eq!(
         ok(doc! {"$regexFindAll": {"input": "abc", "regex": "a*"}}),
         Bson::Array(vec![
-            Bson::Document(doc! {"match": "a", "idx": 0i64, "captures": []}),
-            Bson::Document(doc! {"match": "", "idx": 1i64, "captures": []}),
-            Bson::Document(doc! {"match": "", "idx": 2i64, "captures": []}),
+            Bson::Document(doc! {"match": "a", "idx": 0, "captures": []}),
+            Bson::Document(doc! {"match": "", "idx": 1, "captures": []}),
+            Bson::Document(doc! {"match": "", "idx": 2, "captures": []}),
         ])
     );
     assert_eq!(
         ok(doc! {"$regexFindAll": {"input": "", "regex": ""}}),
-        Bson::Array(vec![Bson::Document(doc! {"match": "", "idx": 0i64, "captures": []})])
+        Bson::Array(vec![Bson::Document(doc! {"match": "", "idx": 0, "captures": []})])
     );
 }
 
@@ -337,16 +337,16 @@ fn regex_computed_from_the_document() {
     let find = doc! {"$regexFind": {"input": "$s", "regex": "$p", "options": "$o"}};
     assert_eq!(
         on(find.clone(), d.clone()),
-        Bson::Document(doc! {"match": "ll", "idx": 2i64, "captures": []})
+        Bson::Document(doc! {"match": "ll", "idx": 2, "captures": []})
     );
     // The same expression over other rows compiles its pattern again.
     assert_eq!(
         on(find.clone(), doc! {"s": "xx", "p": "x"}),
-        Bson::Document(doc! {"match": "x", "idx": 0i64, "captures": []})
+        Bson::Document(doc! {"match": "x", "idx": 0, "captures": []})
     );
     assert_eq!(
         on(find, doc! {"s": "xX", "p": "X"}),
-        Bson::Document(doc! {"match": "X", "idx": 1i64, "captures": []})
+        Bson::Document(doc! {"match": "X", "idx": 1, "captures": []})
     );
     assert_eq!(on(doc! {"$regexMatch": {"input": "$s", "regex": "$re"}}, d), Bson::Boolean(false));
 }
@@ -364,61 +364,61 @@ fn a_constant_bad_regex_is_refused_at_parse() {
 #[test]
 fn index_of_cp_counts_code_points() {
     let f = |args: Vec<Bson>| ok(doc! {"$indexOfCP": args});
-    assert_eq!(f(vec![s("cafétéria"), s("t")]), Bson::Int64(4));
-    assert_eq!(f(vec![s("cafétéria"), s("é"), Bson::Int32(4)]), Bson::Int64(5));
-    assert_eq!(f(vec![s("a🙂b"), s("b")]), Bson::Int64(2));
-    assert_eq!(f(vec![s("abc"), s("z")]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abcabc"), s("b"), Bson::Int32(2)]), Bson::Int64(4));
+    assert_eq!(f(vec![s("cafétéria"), s("t")]), Bson::Int32(4));
+    assert_eq!(f(vec![s("cafétéria"), s("é"), Bson::Int32(4)]), Bson::Int32(5));
+    assert_eq!(f(vec![s("a🙂b"), s("b")]), Bson::Int32(2));
+    assert_eq!(f(vec![s("abc"), s("z")]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abcabc"), s("b"), Bson::Int32(2)]), Bson::Int32(4));
     // For code points `end` bounds where a match may start, so the substring may
     // run past it (`$indexOfBytes` is the other way: see below).
-    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(2)]), Bson::Int64(1));
-    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(1)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(1));
-    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(2), Bson::Int32(6)]), Bson::Int64(4));
-    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(0), Bson::Int32(100)]), Bson::Int64(2));
-    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(5)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(2)]), Bson::Int32(1));
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(1)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int32(1));
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(2), Bson::Int32(6)]), Bson::Int32(4));
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(0), Bson::Int32(100)]), Bson::Int32(2));
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(5)]), Bson::Int32(-1));
     // The same over multi-byte text: positions are code points.
-    assert_eq!(f(vec![s("éééab"), s("ab"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("éééab"), s("ab"), Bson::Int32(0), Bson::Int32(4)]), Bson::Int64(3));
+    assert_eq!(f(vec![s("éééab"), s("ab"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("éééab"), s("ab"), Bson::Int32(0), Bson::Int32(4)]), Bson::Int32(3));
     // An empty substring is found at `start` only where a match may start: before
     // the end of the string and before `end`.
-    assert_eq!(f(vec![s("abc"), s("")]), Bson::Int64(0));
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(2)]), Bson::Int64(2));
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(3)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(1), Bson::Int32(1)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(1), Bson::Int32(2)]), Bson::Int64(1));
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(4)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s(""), s("")]), Bson::Int64(0));
-    assert_eq!(f(vec![s(""), s("a")]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abc"), s("")]), Bson::Int32(0));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(2)]), Bson::Int32(2));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(3)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(1), Bson::Int32(1)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(1), Bson::Int32(2)]), Bson::Int32(1));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(4)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s(""), s("")]), Bson::Int32(0));
+    assert_eq!(f(vec![s(""), s("a")]), Bson::Int32(-1));
     // start > end finds nothing.
-    assert_eq!(f(vec![s("abc"), s("a"), Bson::Int32(2), Bson::Int32(1)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abc"), s("a"), Bson::Int32(2), Bson::Int32(1)]), Bson::Int32(-1));
     // Integral doubles are accepted.
-    assert_eq!(f(vec![s("abc"), s("c"), Bson::Double(1.0)]), Bson::Int64(2));
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Double(1.0)]), Bson::Int32(2));
 }
 
 #[test]
 fn index_of_bytes_counts_bytes() {
     let f = |args: Vec<Bson>| ok(doc! {"$indexOfBytes": args});
-    assert_eq!(f(vec![s("cafétéria"), s("t")]), Bson::Int64(5));
-    assert_eq!(f(vec![s("a🙂b"), s("b")]), Bson::Int64(5));
-    assert_eq!(f(vec![s("héllo"), s("llo"), Bson::Int32(2)]), Bson::Int64(3));
-    assert_eq!(f(vec![s("héllo"), s("l"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(100)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(0), Bson::Int32(100)]), Bson::Int64(2));
+    assert_eq!(f(vec![s("cafétéria"), s("t")]), Bson::Int32(5));
+    assert_eq!(f(vec![s("a🙂b"), s("b")]), Bson::Int32(5));
+    assert_eq!(f(vec![s("héllo"), s("llo"), Bson::Int32(2)]), Bson::Int32(3));
+    assert_eq!(f(vec![s("héllo"), s("l"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(100)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(0), Bson::Int32(100)]), Bson::Int32(2));
     // `end` truncates the haystack: the substring must lie wholly before it, where
     // `$indexOfCP` lets it run past.
-    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(2)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int64(1));
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(2)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abcabc"), s("bc"), Bson::Int32(0), Bson::Int32(3)]), Bson::Int32(1));
     // A start past `end` (or past the string) finds nothing, an empty substring too.
-    assert_eq!(f(vec![s("abc"), s("a"), Bson::Int32(2), Bson::Int32(1)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(3), Bson::Int32(2)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(2), Bson::Int32(1)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abcabc"), s("b"), Bson::Int32(4), Bson::Int32(3)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s("abc"), s("a"), Bson::Int32(0), Bson::Int32(0)]), Bson::Int64(-1));
+    assert_eq!(f(vec![s("abc"), s("a"), Bson::Int32(2), Bson::Int32(1)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abc"), s("c"), Bson::Int32(3), Bson::Int32(2)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(2), Bson::Int32(1)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abcabc"), s("b"), Bson::Int32(4), Bson::Int32(3)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s("abc"), s("a"), Bson::Int32(0), Bson::Int32(0)]), Bson::Int32(-1));
     // An empty substring is found at `start` up to the end of the string.
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(3)]), Bson::Int64(3));
-    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(4)]), Bson::Int64(-1));
-    assert_eq!(f(vec![s(""), s("")]), Bson::Int64(0));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(3)]), Bson::Int32(3));
+    assert_eq!(f(vec![s("abc"), s(""), Bson::Int32(4)]), Bson::Int32(-1));
+    assert_eq!(f(vec![s(""), s("")]), Bson::Int32(0));
 }
 
 #[test]
@@ -500,10 +500,10 @@ fn a_double_is_coerced_to_text_with_six_significant_digits() {
 
 #[test]
 fn str_len_bytes() {
-    assert_eq!(ok(doc! {"$strLenBytes": "abc"}), Bson::Int64(3));
-    assert_eq!(ok(doc! {"$strLenBytes": "é"}), Bson::Int64(2));
-    assert_eq!(ok(doc! {"$strLenBytes": "🙂"}), Bson::Int64(4));
-    assert_eq!(ok(doc! {"$strLenBytes": ""}), Bson::Int64(0));
+    assert_eq!(ok(doc! {"$strLenBytes": "abc"}), Bson::Int32(3));
+    assert_eq!(ok(doc! {"$strLenBytes": "é"}), Bson::Int32(2));
+    assert_eq!(ok(doc! {"$strLenBytes": "🙂"}), Bson::Int32(4));
+    assert_eq!(ok(doc! {"$strLenBytes": ""}), Bson::Int32(0));
     // Null is refused, as $strLenCP refuses it.
     refused(doc! {"$strLenBytes": Bson::Null}, doc! {}, "$strLenBytes requires a string");
     refused(doc! {"$strLenBytes": "$nope"}, doc! {}, "$strLenBytes requires a string");
@@ -780,11 +780,11 @@ fn regex_find_all_counts_idx_from_the_previous_match() {
     let Bson::Array(found) = ok(doc! {"$regexFindAll": {"input": text, "regex": "x|b"}}) else {
         panic!("an array")
     };
-    let at: Vec<(&str, i64)> = found
+    let at: Vec<(&str, i32)> = found
         .iter()
         .map(|m| {
             let m = m.as_document().unwrap();
-            (m.get_str("match").unwrap(), m.get_i64("idx").unwrap())
+            (m.get_str("match").unwrap(), m.get_i32("idx").unwrap())
         })
         .collect();
     assert_eq!(at, vec![("x", 3), ("x", 6), ("b", 8)]);
@@ -798,7 +798,7 @@ fn regex_find_all_counts_idx_from_the_previous_match() {
     };
     assert_eq!(found.len(), n);
     for i in [0, 1, 777, n - 1] {
-        assert_eq!(found[i].as_document().unwrap().get_i64("idx").unwrap(), i as i64);
+        assert_eq!(found[i].as_document().unwrap().get_i32("idx").unwrap(), i as i32);
     }
 }
 
@@ -1080,7 +1080,7 @@ fn set_field_adds_replaces_and_removes() {
             doc! {"$setField": {"field": "t", "input": "$$ROOT", "value": {"$add": [1, 2]}}},
             doc! {"q": 1}
         ),
-        Bson::Document(doc! {"q": 1, "t": 3i64})
+        Bson::Document(doc! {"q": 1, "t": 3})
     );
     // Null input is null; a non-document is refused.
     assert_eq!(

@@ -211,8 +211,8 @@ fn range_is_bounded_before_it_allocates() {
     // bytes are worked out first. A 413, as every other builder's refusal.
     for args in [
         vec![Bson::Int32(0), Bson::Int32(i32::MAX)],
-        vec![Bson::Int64(0), Bson::Int64(i64::MAX)],
-        vec![Bson::Int64(i64::MIN), Bson::Int64(i64::MAX), Bson::Int32(1)],
+        vec![Bson::Int64(0), Bson::Int64(i64::from(i32::MAX))],
+        vec![Bson::Int64(i64::from(i32::MIN)), Bson::Int64(i64::from(i32::MAX)), Bson::Int32(1)],
         vec![Bson::Int32(0), Bson::Int32(i32::MAX), Bson::Int32(2)],
         vec![Bson::Int32(0), Bson::Int32(1_000_000_000)],
     ] {
@@ -222,6 +222,9 @@ fn range_is_bounded_before_it_allocates() {
         assert!(text.starts_with("the array $range builds is "), "{text}");
         assert!(text.contains("16 MiB array limit"), "{text}");
     }
+    // A bound past `Int32` is refused as a 32-bit bound, as the reference refuses it (34446).
+    let err = ev(doc! {"$range": [Bson::Int64(0), Bson::Int64(i64::MAX)]}, &doc! {}).unwrap_err();
+    assert!(matches!(&err, Error::InvalidQuery(m) if m.contains("32-bit integer")), "{err:?}");
     // The count that is refused is a count of bytes, not of elements: the old cap of
     // 100,000 elements is gone, and the reference answers 200,000.
     for n in [100_000, 100_001, 200_000] {
@@ -234,16 +237,16 @@ fn range_is_bounded_before_it_allocates() {
     // Down, and empty.
     assert_eq!(
         ev(doc! {"$range": [3, 0, -1]}, &doc! {}).unwrap(),
-        Bson::Array(vec![Bson::Int64(3), Bson::Int64(2), Bson::Int64(1)])
+        Bson::Array(vec![Bson::Int32(3), Bson::Int32(2), Bson::Int32(1)])
     );
     assert_eq!(ev(doc! {"$range": [3, 0]}, &doc! {}).unwrap(), Bson::Array(vec![]));
 }
 
 #[test]
 fn range_counts_its_bytes_exactly_at_a_small_limit() {
-    // Three Int64s: 5 bytes of framing, then 2 + 1 + 8 for each.
+    // Three Int32s: 5 bytes of framing, then 1 (type) + 1 (index) + 1 (terminator) + 4 for each.
     let args = [Bson::Int32(0), Bson::Int32(3)];
-    let size = 5 + 3 * 11;
+    let size = 5 + 3 * 7;
     assert_eq!(bson_bytes(&range_within(&args, size).unwrap()), size);
     let (bytes, max, text) = refusal(range_within(&args, size - 1));
     assert_eq!((bytes, max), (size, size - 1));

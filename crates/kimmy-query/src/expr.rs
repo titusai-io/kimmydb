@@ -55,9 +55,11 @@
 //! 2^53, which is the same reasoning as ADR-002 and as `number_to_bson` at the
 //! HTTP edge.
 //!
-//! **Integer results are always `Int64`.** MongoDB narrows to `Int32` when both
-//! operands were `Int32`; a third case buys accuracy on `$type` that nothing
-//! here needs, and `$sum` has always returned `Int64`.
+//! **Integer results keep the reference's width** (ADR-268). `Int32` with
+//! `Int32` is an `Int32` and widens to `Int64` only on overflow; an `Int64`
+//! operand gives an `Int64`; a double gives a double. The counting and indexing
+//! operators answer `Int32`, and `$sum` answers the narrowest width that holds
+//! the exact total. Before ADR-268 every integer result was an `Int64`.
 //!
 //! # Errors versus null
 //!
@@ -2310,6 +2312,17 @@ fn eval_zip(
     Ok(Bson::Array(out))
 }
 
+/// An integer result in the narrowest width that holds it: an `Int32`, or an
+/// `Int64` past `i32` (ADR-268).
+pub(crate) fn integer_bson(n: i64) -> Bson {
+    Num::narrowest(n).to_bson()
+}
+
+/// A count or an index as the reference types it: an `Int32` while it fits.
+pub(crate) fn count_bson(n: usize) -> Bson {
+    integer_bson(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
 fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
     match op {
         Op::Add => arithmetic_add(args),
@@ -2328,7 +2341,7 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::ToLower => Ok(Bson::String(as_string_lossy(&args[0], op)?.to_lowercase())),
         Op::Substr => substr(args),
         Op::Split => split(&args[0], &args[1]),
-        Op::StrLenCp => Ok(Bson::Int64(as_string_strict(&args[0], op)?.chars().count() as i64)),
+        Op::StrLenCp => Ok(count_bson(as_string_strict(&args[0], op)?.chars().count())),
         Op::IndexOfCp | Op::IndexOfBytes => strings::index_of(op, args),
         Op::Strcasecmp => strings::strcasecmp(&args[0], &args[1]),
         Op::StrLenBytes => strings::str_len_bytes(&args[0]),
@@ -2380,18 +2393,23 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
 // Numbers
 // ---------------------------------------------------------------------------
 
-/// A number that remembers whether it is still exact.
+/// A number that remembers whether it is still exact, and how wide it was.
+///
+/// The width is kept from the stored value (ADR-268): `Int32 op Int32` is an
+/// `Int32` and widens to `Int64` only when it overflows, any `Int64` operand
+/// gives an `Int64`, and a double stays a double.
 #[derive(Clone, Copy, Debug)]
 enum Num {
-    Int(i64),
+    Int32(i32),
+    Int64(i64),
     Dbl(f64),
 }
 
 impl Num {
     fn from_bson(value: &Bson) -> Option<Self> {
         match value {
-            Bson::Int32(n) => Some(Num::Int(i64::from(*n))),
-            Bson::Int64(n) => Some(Num::Int(*n)),
+            Bson::Int32(n) => Some(Num::Int32(*n)),
+            Bson::Int64(n) => Some(Num::Int64(*n)),
             Bson::Double(d) => Some(Num::Dbl(*d)),
             _ => None,
         }
@@ -2399,51 +2417,76 @@ impl Num {
 
     fn as_f64(self) -> f64 {
         match self {
-            Num::Int(n) => n as f64,
+            Num::Int32(n) => f64::from(n),
+            Num::Int64(n) => n as f64,
             Num::Dbl(d) => d,
+        }
+    }
+
+    /// The value of an integer of either width.
+    fn integer(self) -> Option<i64> {
+        match self {
+            Num::Int32(n) => Some(i64::from(n)),
+            Num::Int64(n) => Some(n),
+            Num::Dbl(_) => None,
         }
     }
 
     fn to_bson(self) -> Bson {
         match self {
-            Num::Int(n) => Bson::Int64(n),
+            Num::Int32(n) => Bson::Int32(n),
+            Num::Int64(n) => Bson::Int64(n),
             Num::Dbl(d) => Bson::Double(d),
         }
     }
 
+    /// An integer result of the narrowest width that holds it.
+    fn narrowest(n: i64) -> Self {
+        i32::try_from(n).map_or(Num::Int64(n), Num::Int32)
+    }
+
     /// Integer arithmetic stays integral until it cannot.
     ///
-    /// The overflow arm is why this is `checked_*` rather than a cast: falling
-    /// to `f64` loses precision, but wrapping would produce a number of the
-    /// wrong sign, which is worse than approximate.
-    fn add(self, other: Self) -> Self {
+    /// `Int32` with `Int32` is an `Int32` while it fits and an `Int64` when it
+    /// does not; any `Int64` operand makes an `Int64`, which falls to a double
+    /// only past `i64`. The overflow arm is why this is `checked_*` rather than
+    /// a cast: falling to `f64` loses precision, but wrapping would produce a
+    /// number of the wrong sign, which is worse than approximate.
+    fn apply(
+        self,
+        other: Self,
+        narrow: fn(i32, i32) -> Option<i32>,
+        wide: fn(i64, i64) -> Option<i64>,
+        double: fn(f64, f64) -> f64,
+    ) -> Self {
         match (self, other) {
-            (Num::Int(a), Num::Int(b)) => match a.checked_add(b) {
-                Some(n) => Num::Int(n),
-                None => Num::Dbl(a as f64 + b as f64),
+            (Num::Int32(a), Num::Int32(b)) => match narrow(a, b) {
+                Some(n) => Num::Int32(n),
+                None => match wide(i64::from(a), i64::from(b)) {
+                    Some(n) => Num::Int64(n),
+                    None => Num::Dbl(double(f64::from(a), f64::from(b))),
+                },
             },
-            _ => Num::Dbl(self.as_f64() + other.as_f64()),
+            _ => match (self.integer(), other.integer()) {
+                (Some(a), Some(b)) => match wide(a, b) {
+                    Some(n) => Num::Int64(n),
+                    None => Num::Dbl(double(a as f64, b as f64)),
+                },
+                _ => Num::Dbl(double(self.as_f64(), other.as_f64())),
+            },
         }
+    }
+
+    fn add(self, other: Self) -> Self {
+        self.apply(other, i32::checked_add, i64::checked_add, |a, b| a + b)
     }
 
     fn sub(self, other: Self) -> Self {
-        match (self, other) {
-            (Num::Int(a), Num::Int(b)) => match a.checked_sub(b) {
-                Some(n) => Num::Int(n),
-                None => Num::Dbl(a as f64 - b as f64),
-            },
-            _ => Num::Dbl(self.as_f64() - other.as_f64()),
-        }
+        self.apply(other, i32::checked_sub, i64::checked_sub, |a, b| a - b)
     }
 
     fn mul(self, other: Self) -> Self {
-        match (self, other) {
-            (Num::Int(a), Num::Int(b)) => match a.checked_mul(b) {
-                Some(n) => Num::Int(n),
-                None => Num::Dbl(a as f64 * b as f64),
-            },
-            _ => Num::Dbl(self.as_f64() * other.as_f64()),
-        }
+        self.apply(other, i32::checked_mul, i64::checked_mul, |a, b| a * b)
     }
 }
 
@@ -2521,6 +2564,10 @@ impl Seen {
 #[derive(Clone, Debug, Default)]
 pub struct Total {
     plain: Option<Num>,
+    /// An `Int64` was added: the answer is then never narrower than an `Int64`.
+    long_seen: bool,
+    /// A double was added: the answer is a double.
+    double_seen: bool,
     seen: Seen,
 }
 
@@ -2537,16 +2584,40 @@ impl Total {
             return;
         };
         self.seen.add(value);
+        self.long_seen |= matches!(n, Num::Int64(_));
+        self.double_seen |= matches!(n, Num::Dbl(_));
+        // The running total is read only once a double was added; integers are typed
+        // at the end from `seen`'s exact total (see `to_bson`).
         self.plain = Some(match self.plain {
             Some(acc) => acc.add(n),
             None => n,
         });
     }
 
+    /// The sum, as the reference types it (ADR-268): an `Int32` while every integer
+    /// added was an `Int32` and the exact total fits one; an `Int64` once an `Int64`
+    /// was added or the total left `Int32`; a double past `i64` or as soon as a double
+    /// was added; a `Decimal128` once one was. So the sum of two `Int32`s `1` and `2`
+    /// is the `Int32` 3, and the sum of the `Int64`s `1` and `2` is the `Int64` 3
+    /// (`AccumulatorSum` returns a long whenever a long was summed). A group with
+    /// nothing to add is the `Int32` 0. The window sum is typed differently, on
+    /// purpose: see `window_acc`.
     pub fn to_bson(&self) -> Bson {
-        match &self.seen.exact {
-            Some(sum) => Bson::Decimal128(pack_raw(sum.finish_sum())),
-            None => self.plain.unwrap_or(Num::Int(0)).to_bson(),
+        if let Some(sum) = &self.seen.exact {
+            return Bson::Decimal128(pack_raw(sum.finish_sum()));
+        }
+        if self.double_seen {
+            return self.plain.map_or(Bson::Int32(0), Num::to_bson);
+        }
+        // Integers only: typed by the exact total, so the order of the values cannot
+        // change the answer (`[LMAX, 1, -1]` is the long LMAX in either order).
+        if self.seen.integer_count == 0 {
+            return Bson::Int32(0);
+        }
+        match i64::try_from(self.seen.integers) {
+            Ok(t) if !self.long_seen => integer_bson(t),
+            Ok(t) => Bson::Int64(t),
+            Err(_) => Bson::Double(self.seen.integers as f64),
         }
     }
 }
@@ -2619,7 +2690,8 @@ impl Operand {
     /// R1 (its exact binary value rounded once to 34 digits, ties to even).
     fn widen(&self) -> Raw {
         match self {
-            Operand::Plain(Num::Int(n)) => arith::from_i64(*n),
+            Operand::Plain(Num::Int32(n)) => arith::from_i64(i64::from(*n)),
+            Operand::Plain(Num::Int64(n)) => arith::from_i64(*n),
             Operand::Plain(Num::Dbl(d)) => arith::from_binary64(d.to_bits()).0,
             Operand::Decimal(raw) => *raw,
         }
@@ -2681,10 +2753,37 @@ fn fold_numeric(op: Op, args: &[Bson], f: fn(Num, Num) -> Num) -> Result<Bson> {
             }
         }));
     }
-    let mut it = operands.into_iter().map(|o| match o {
+    let it = operands.into_iter().map(|o| match o {
         Operand::Plain(n) => n,
         Operand::Decimal(_) => unreachable!("no decimal operand"),
     });
+    let nums: Vec<Num> = it.collect();
+    // A chain of integers is typed by its final value, not widened at the step that
+    // leaves a width (ADR-268; the reference keeps a long total and types the answer at
+    // the end). `[2147483647, 1, -1]` is the `Int32` 2147483647 in any order, and
+    // `[LMAX, 1, -1]` the `Int64` LMAX. An `$add` is summed exactly (in an `i128`): an
+    // `Int32` while every operand was one and the total fits, an `Int64` while it fits
+    // one, a double past that. A `$multiply` of `Int32`s keeps its product in an `i64`
+    // and is a double past it; one with an `Int64` operand is the step-by-step fold.
+    if op == Op::Add && nums.iter().all(|n| n.integer().is_some()) {
+        let total: i128 = nums.iter().map(|n| i128::from(n.integer().expect("integer"))).sum();
+        let all_int32 = nums.iter().all(|n| matches!(n, Num::Int32(_)));
+        return Ok(match i64::try_from(total) {
+            Ok(t) if all_int32 => integer_bson(t),
+            Ok(t) => Bson::Int64(t),
+            Err(_) => Bson::Double(total as f64),
+        });
+    }
+    if op == Op::Multiply && nums.iter().all(|n| matches!(n, Num::Int32(_))) {
+        let mut total = nums[0].integer();
+        for n in &nums[1..] {
+            total = total.and_then(|t| t.checked_mul(n.integer().expect("an integer")));
+        }
+        if let Some(total) = total {
+            return Ok(integer_bson(total));
+        }
+    }
+    let mut it = nums.into_iter();
     let first = it.next().expect("arity checked at parse");
     Ok(it.fold(first, f).to_bson())
 }
@@ -2798,14 +2897,29 @@ fn modulo(a: &Bson, b: &Bson) -> Result<Bson> {
     let [Operand::Plain(x), Operand::Plain(y)] = operands.as_slice() else {
         unreachable!("two plain operands");
     };
-    match (*x, *y) {
-        (_, Num::Int(0)) => Err(Error::InvalidQuery("$mod by zero".into())),
-        (Num::Int(x), Num::Int(y)) => Ok(Bson::Int64(x.wrapping_rem(y))),
-        (x, y) if y.as_f64() == 0.0 => {
-            let _ = x;
-            Err(Error::InvalidQuery("$mod by zero".into()))
+    // `x % -1` is 0 for every `x`, the smallest integer included (where the
+    // machine's remainder would trap), as the reference answers it.
+    // An integer dividend by a whole-number double that fits an `Int32` is an integer
+    // remainder, in the dividend's width (`7 % 2.0` is the int 1, a long `7 % 2.0` the
+    // long 1): the reference reads such a double as an integer (`Value::integral()` is
+    // 32-bit bounded). A double dividend, a divisor with a fraction and a whole divisor
+    // past `Int32` (`7 % 1e10`) are `fmod`, a double (ADR-268).
+    let y = match (*x, *y) {
+        (Num::Int32(_) | Num::Int64(_), Num::Dbl(d))
+            if d.fract() == 0.0 && d >= f64::from(i32::MIN) && d <= f64::from(i32::MAX) =>
+        {
+            Num::Int32(d as i32)
         }
-        (x, y) => Ok(Bson::Double(x.as_f64() % y.as_f64())),
+        (_, y) => y,
+    };
+    match (*x, y) {
+        (_, Num::Int32(0) | Num::Int64(0)) => Err(Error::InvalidQuery("$mod by zero".into())),
+        (Num::Int32(x), Num::Int32(y)) => Ok(Bson::Int32(x.wrapping_rem(y))),
+        (x, y) => match (x.integer(), y.integer()) {
+            (Some(x), Some(y)) => Ok(Bson::Int64(x.wrapping_rem(y))),
+            _ if y.as_f64() == 0.0 => Err(Error::InvalidQuery("$mod by zero".into())),
+            _ => Ok(Bson::Double(x.as_f64() % y.as_f64())),
+        },
     }
 }
 
@@ -3007,7 +3121,7 @@ fn position(len: usize, index: i64) -> Option<usize> {
 fn array_size(value: &Bson) -> Result<Bson> {
     Ok(match as_array(Op::Size, value)? {
         None => Bson::Null,
-        Some(items) => Bson::Int64(items.len() as i64),
+        Some(items) => count_bson(items.len()),
     })
 }
 
@@ -3139,8 +3253,8 @@ fn index_of_array(args: &[Bson]) -> Result<Bson> {
         .take(end)
         .skip(start)
         .find(|(_, item)| canonical_cmp(item, needle) == Ordering::Equal)
-        .map(|(i, _)| i as i64);
-    Ok(Bson::Int64(found.unwrap_or(-1)))
+        .map(|(i, _)| i);
+    Ok(found.map_or(Bson::Int32(-1), count_bson))
 }
 
 fn reverse_array(value: &Bson) -> Result<Bson> {
@@ -3164,6 +3278,15 @@ fn range_within(args: &[Bson], max: usize) -> Result<Bson> {
             Some(n) => nums.push(n),
         }
     }
+    // The reference takes 32-bit bounds and a 32-bit step, and refuses a long past them
+    // (`34444`, `34446`, `34448`); its elements are all `Int32` (ADR-268).
+    for (n, what) in nums.iter().zip(["a starting", "an ending", "a step"]) {
+        if i32::try_from(*n).is_err() {
+            return Err(Error::InvalidQuery(format!(
+                "$range requires {what} value that can be represented as a 32-bit integer, found {n}"
+            )));
+        }
+    }
     let (start, end) = (nums[0], nums[1]);
     let step = nums.get(2).copied().unwrap_or(1);
     if step == 0 {
@@ -3176,15 +3299,15 @@ fn range_within(args: &[Bson], max: usize) -> Result<Bson> {
     let span = if step > 0 { end.saturating_sub(start) } else { start.saturating_sub(end) };
     let count = if span <= 0 { 0 } else { span.unsigned_abs().div_ceil(step.unsigned_abs()) };
     check_array_bytes("the array $range builds", range_bytes(count), max)?;
-    Ok(Bson::Array((0..count as i64).map(|i| Bson::Int64(start + i * step)).collect()))
+    Ok(Bson::Array((0..count as i64).map(|i| Bson::Int32((start + i * step) as i32)).collect()))
 }
 
-/// What an array of `count` `Int64`s encodes to: the framing, then for each
-/// element its type byte, its decimal index with a terminator, and eight bytes.
+/// What an array of `count` `Int32`s encodes to: the framing, then for each
+/// element its type byte, its decimal index with a terminator, and four bytes.
 fn range_bytes(count: u64) -> usize {
     array_bytes(
         usize::try_from(count).unwrap_or(usize::MAX),
-        8usize.saturating_mul(usize::try_from(count).unwrap_or(usize::MAX)),
+        4usize.saturating_mul(usize::try_from(count).unwrap_or(usize::MAX)),
     )
 }
 
@@ -3765,6 +3888,9 @@ mod strdoc_tests;
 mod size_tests;
 
 #[cfg(test)]
+mod width_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bson::doc;
@@ -3920,7 +4046,7 @@ mod tests {
                 "{k} references, one probe each"
             );
             // And it still means what it said.
-            assert_eq!(parsed.eval(&doc! {}).unwrap(), Bson::Int64(k as i64));
+            assert_eq!(parsed.eval(&doc! {}).unwrap(), Bson::Int32(k as i32));
         }
         // A name nothing binds is one probe too, and refused.
         let before = LOOKUPS.with(std::cell::Cell::get);
@@ -3962,7 +4088,7 @@ mod tests {
         let shadow = Expr::parse(&Bson::Document(doc! { "$let": { "vars": vars, "in": {
         "$add": [ "$$v7", { "$let": { "vars": { "v7": 100 }, "in": "$$v7" } }, "$$v39" ] } } }))
         .unwrap();
-        assert_eq!(shadow.eval(&doc! {}).unwrap(), Bson::Int64(7 + 100 + 39));
+        assert_eq!(shadow.eval(&doc! {}).unwrap(), Bson::Int32(7 + 100 + 39));
         // A name only an enclosing frame binds is found through a big one.
         let mut vars = Document::new();
         for i in 0..40 {
@@ -3972,7 +4098,7 @@ mod tests {
             Expr::parse(&Bson::Document(doc! { "$let": { "vars": { "outer": 5 }, "in": {
             "$let": { "vars": vars, "in": { "$add": ["$$outer", "$$w3"] } } } } }))
             .unwrap();
-        assert_eq!(through.eval(&doc! {}).unwrap(), Bson::Int64(8));
+        assert_eq!(through.eval(&doc! {}).unwrap(), Bson::Int32(8));
     }
 
     /// The frame size at which a `$let`'s names stop being scanned and are
@@ -4027,7 +4153,7 @@ mod tests {
             { "$let": { "vars": { "x": 2 }, "in": "$$x" } },
             "$$x",
         ] } } };
-        assert_eq!(Expr::parse(&nested.into()).unwrap().eval(&doc! {}).unwrap(), Bson::Int64(3));
+        assert_eq!(Expr::parse(&nested.into()).unwrap().eval(&doc! {}).unwrap(), Bson::Int32(3));
         let leaked = doc! { "$add": [
             { "$let": { "vars": { "x": 2 }, "in": "$$x" } },
             "$$x",
@@ -4156,7 +4282,7 @@ mod tests {
     #[test]
     fn size_counts_a_fanned_path() {
         let d = doc! {"items": [{"sku": "a"}, {"sku": "b"}]};
-        assert_eq!(on(doc! {"$size": "$items.sku"}.into(), d), Bson::Int64(2));
+        assert_eq!(on(doc! {"$size": "$items.sku"}.into(), d), Bson::Int32(2));
     }
 
     #[test]
@@ -4190,7 +4316,7 @@ mod tests {
         // The same variable bound to the fanned path itself.
         let expr =
             doc! {"$let": {"vars": {"names": "$items.tags.name"}, "in": {"$size": "$$names"}}};
-        assert_eq!(on(expr.into(), d), Bson::Int64(3));
+        assert_eq!(on(expr.into(), d), Bson::Int32(3));
     }
 
     #[test]
@@ -4262,9 +4388,9 @@ mod tests {
 
     #[test]
     fn integer_arithmetic_stays_integral() {
-        assert_eq!(ok(doc! {"$add": [2, 3]}.into()), Bson::Int64(5));
-        assert_eq!(ok(doc! {"$subtract": [10, 3]}.into()), Bson::Int64(7));
-        assert_eq!(ok(doc! {"$multiply": [6, 7]}.into()), Bson::Int64(42));
+        assert_eq!(ok(doc! {"$add": [2, 3]}.into()), Bson::Int32(5));
+        assert_eq!(ok(doc! {"$subtract": [10, 3]}.into()), Bson::Int32(7));
+        assert_eq!(ok(doc! {"$multiply": [6, 7]}.into()), Bson::Int32(42));
     }
 
     #[test]
@@ -4307,7 +4433,7 @@ mod tests {
 
     #[test]
     fn mod_keeps_integers_integral() {
-        assert_eq!(ok(doc! {"$mod": [7, 3]}.into()), Bson::Int64(1));
+        assert_eq!(ok(doc! {"$mod": [7, 3]}.into()), Bson::Int32(1));
     }
 
     #[test]
@@ -4325,8 +4451,8 @@ mod tests {
 
     #[test]
     fn variadic_operators_take_more_than_two_arguments() {
-        assert_eq!(ok(doc! {"$add": [1, 2, 3, 4]}.into()), Bson::Int64(10));
-        assert_eq!(ok(doc! {"$multiply": [2, 3, 4]}.into()), Bson::Int64(24));
+        assert_eq!(ok(doc! {"$add": [1, 2, 3, 4]}.into()), Bson::Int32(10));
+        assert_eq!(ok(doc! {"$multiply": [2, 3, 4]}.into()), Bson::Int32(24));
     }
 
     // -- date arithmetic --------------------------------------------------
@@ -4423,7 +4549,7 @@ mod tests {
 
     #[test]
     fn strlen_counts_code_points() {
-        assert_eq!(on(doc! {"$strLenCP": "$s"}.into(), doc! {"s": "héllo"}), Bson::Int64(5));
+        assert_eq!(on(doc! {"$strLenCP": "$s"}.into(), doc! {"s": "héllo"}), Bson::Int32(5));
     }
 
     // -- conditionals -----------------------------------------------------
@@ -4700,7 +4826,7 @@ mod tests {
         let expr = doc! {"$let": {"vars": {"a": 1}, "in": {
             "$let": {"vars": {"b": {"$add": ["$$a", 1]}}, "in": "$$b"}
         }}};
-        assert_eq!(ok(expr.into()), Bson::Int64(2));
+        assert_eq!(ok(expr.into()), Bson::Int32(2));
     }
 
     #[test]
@@ -4780,7 +4906,7 @@ mod tests {
             "in": {"$add": ["$$a", "$$a", "$$a", "$$b"]},
         }};
         let (evaluated, answer) = counted(thrice, doc! {"qty": 2, "price": 5});
-        assert_eq!(answer.unwrap(), Bson::Int64(33));
+        assert_eq!(answer.unwrap(), Bson::Int32(33));
         assert_eq!(evaluated, 2, "one evaluation each for `a` and `b`");
     }
 
@@ -4805,7 +4931,7 @@ mod tests {
             "in": {"$add": ["$$y", "$$y"]},
         }}}};
         let (evaluated, answer) = counted(map, doc! {});
-        assert_eq!(answer.unwrap(), bson::bson!([20_i64, 40_i64, 60_i64]));
+        assert_eq!(answer.unwrap(), bson::bson!([20_i32, 40_i32, 60_i32]));
         assert_eq!(evaluated, 3, "one evaluation per element");
 
         let filter = doc! {"$filter": {"input": [1, 2, 3, 4], "as": "e", "cond": {"$let": {
@@ -4818,7 +4944,7 @@ mod tests {
             "vars": {"next": {"$add": ["$$value", "$$this"]}},
             "in": "$$next",
         }}}};
-        assert_eq!(on(reduce.into(), doc! {}), Bson::Int64(6));
+        assert_eq!(on(reduce.into(), doc! {}), Bson::Int32(6));
     }
 
     /// A variable is bound to the scope around the `$let`, and so reads an
@@ -4830,7 +4956,7 @@ mod tests {
             "vars": {"x": {"$add": ["$$x", 10]}, "z": {"$size": "$name"}},
             "in": "$$x",
         }}}};
-        assert_eq!(on(expr.into(), doc! {"name": "text"}), Bson::Int64(11));
+        assert_eq!(on(expr.into(), doc! {"name": "text"}), Bson::Int32(11));
     }
 
     /// `n` nested `$let`s, each variable's expression `depth` `$add`s deep over the
@@ -4882,7 +5008,7 @@ mod tests {
                 .unwrap()
                 .join()
                 .unwrap();
-            assert_eq!(answer.unwrap(), Bson::Int64((N * depth + 1) as i64));
+            assert_eq!(answer.unwrap(), Bson::Int32((N * depth + 1) as i32));
         };
         if std::env::var_os("KIMMY_STACK_PROBE").is_some() {
             run();
@@ -4913,7 +5039,7 @@ mod tests {
     /// variables read one after another are fine too.
     #[test]
     fn variables_read_through_each_other_are_not_limited() {
-        assert_eq!(ok(let_chain(40, 1)), Bson::Int64(41));
+        assert_eq!(ok(let_chain(40, 1)), Bson::Int32(41));
         let mut vars = Document::new();
         let mut sum = Vec::new();
         for i in 0..100 {
@@ -4921,7 +5047,7 @@ mod tests {
             sum.push(Bson::String(format!("$$w{i}")));
         }
         let wide = doc! {"$let": {"vars": vars, "in": {"$add": sum}}};
-        assert_eq!(ok(wide.into()), Bson::Int64((1..=100).sum::<i64>()));
+        assert_eq!(ok(wide.into()), Bson::Int32((1..=100).sum::<i32>()));
     }
 
     /// A `$let` outside a `$map` whose variable reads the document is evaluated
@@ -4933,7 +5059,7 @@ mod tests {
             "$map": {"input": [1, 2, 3], "in": {"$multiply": ["$$this", "$$t"]}}
         }}};
         let (evaluated, answer) = counted(expr, doc! {"a": 2, "b": 3});
-        assert_eq!(answer.unwrap(), bson::bson!([5_i64, 10_i64, 15_i64]));
+        assert_eq!(answer.unwrap(), bson::bson!([5_i32, 10_i32, 15_i32]));
         assert_eq!(evaluated, 1);
     }
 
@@ -4945,7 +5071,7 @@ mod tests {
             "vars": {"x": "$$this"},
             "in": {"$map": {"input": [1, 2], "in": {"$add": ["$$x", "$$this"]}}},
         }}}};
-        assert_eq!(on(expr.into(), doc! {}), bson::bson!([[11_i64, 12_i64], [21_i64, 22_i64]]));
+        assert_eq!(on(expr.into(), doc! {}), bson::bson!([[11_i32, 12_i32], [21_i32, 22_i32]]));
     }
 
     #[test]
@@ -4969,7 +5095,7 @@ mod tests {
         let bound = Bson::Int32(40);
         let frame = [("order_qty", &bound)];
         let d = doc! {"qty": 2};
-        assert_eq!(expr.eval_in(&Scope::with_bindings(&d, &frame)).unwrap(), Bson::Int64(42));
+        assert_eq!(expr.eval_in(&Scope::with_bindings(&d, &frame)).unwrap(), Bson::Int32(42));
         // Evaluating with fewer bindings than it was parsed with is an error,
         // not a null.
         assert!(expr.eval(&d).is_err());
@@ -4983,8 +5109,8 @@ mod tests {
 
     #[test]
     fn size_counts_elements_and_refuses_a_non_array() {
-        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": [1, 2, 3]}), Bson::Int64(3));
-        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": []}), Bson::Int64(0));
+        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": [1, 2, 3]}), Bson::Int32(3));
+        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": []}), Bson::Int32(0));
         assert_eq!(on(doc! {"$size": "$gone"}.into(), doc! {}), Bson::Null);
         assert!(ev(doc! {"$size": "text"}.into(), &Document::new()).is_err());
         assert!(ev(doc! {"$size": 5}.into(), &Document::new()).is_err());
@@ -5064,14 +5190,14 @@ mod tests {
     #[test]
     fn index_of_array_finds_the_first_match_within_a_window() {
         let d = doc! {"xs": ["a", "b", "a", "c"]};
-        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a"]}.into(), d.clone()), Bson::Int64(0));
-        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 1]}.into(), d.clone()), Bson::Int64(2));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a"]}.into(), d.clone()), Bson::Int32(0));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 1]}.into(), d.clone()), Bson::Int32(2));
         assert_eq!(
             on(doc! {"$indexOfArray": ["$xs", "c", 0, 3]}.into(), d.clone()),
-            Bson::Int64(-1)
+            Bson::Int32(-1)
         );
-        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "z"]}.into(), d.clone()), Bson::Int64(-1));
-        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 9]}.into(), d.clone()), Bson::Int64(-1));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "z"]}.into(), d.clone()), Bson::Int32(-1));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 9]}.into(), d.clone()), Bson::Int32(-1));
         assert_eq!(on(doc! {"$indexOfArray": ["$gone", "a"]}.into(), d.clone()), Bson::Null);
         assert!(ev(doc! {"$indexOfArray": ["$xs", "a", -1]}.into(), &d).is_err());
         assert!(ev(doc! {"$indexOfArray": ["text", "a"]}.into(), &d).is_err());
@@ -5095,8 +5221,8 @@ mod tests {
         assert!(ev(doc! {"$reverseArray": "abc"}.into(), &Document::new()).is_err());
     }
 
-    fn ints(items: Vec<i64>) -> Bson {
-        Bson::Array(items.into_iter().map(Bson::Int64).collect())
+    fn ints(items: Vec<i32>) -> Bson {
+        Bson::Array(items.into_iter().map(Bson::Int32).collect())
     }
 
     #[test]
@@ -5264,7 +5390,7 @@ mod tests {
                     .into(),
                 d.clone()
             ),
-            Bson::Int64(10)
+            Bson::Int32(10)
         );
         // Strings, to show the accumulator is any value.
         assert_eq!(
@@ -5309,7 +5435,7 @@ mod tests {
             "in": {"$add": ["$$value", "$$this.qty"]},
         }};
         let d = doc! {"items": [{"qty": 1}, {"qty": 2}, {"qty": 5}]};
-        assert_eq!(on(expr.into(), d), Bson::Int64(7));
+        assert_eq!(on(expr.into(), d), Bson::Int32(7));
     }
 
     // -- the $sum accumulator's exactness ---------------------------------
@@ -5337,9 +5463,9 @@ mod tests {
     fn total_ignores_non_numbers_and_starts_at_zero() {
         let mut t = Total::default();
         t.add(&Bson::String("nope".into()));
-        assert_eq!(t.to_bson(), Bson::Int64(0));
+        assert_eq!(t.to_bson(), Bson::Int32(0));
         t.add(&Bson::Int32(3));
-        assert_eq!(t.to_bson(), Bson::Int64(3));
+        assert_eq!(t.to_bson(), Bson::Int32(3));
     }
 
     #[test]
@@ -5554,8 +5680,8 @@ mod tests {
     fn a_conversion_composes_with_arithmetic() {
         // The motivating shape: a quantity stored as text on some rows.
         let expr = doc! {"$multiply": [{"$toInt": "$qty"}, 2]};
-        assert_eq!(on(expr.clone().into(), doc! {"qty": "21"}), Bson::Int64(42));
-        assert_eq!(on(expr.into(), doc! {"qty": 21}), Bson::Int64(42));
+        assert_eq!(on(expr.clone().into(), doc! {"qty": "21"}), Bson::Int32(42));
+        assert_eq!(on(expr.into(), doc! {"qty": 21}), Bson::Int32(42));
     }
 }
 
@@ -6197,11 +6323,11 @@ mod decimal128 {
         assert_eq!(at(bson!({ "$in": ["$v", "$xs"] }), b("0.1")), f);
         assert_eq!(at(bson!({ "$in": ["$v", "$xs"] }), Bson::Int32(5)), f);
         assert_eq!(at(bson!({ "$in": [b("2.50"), "$xs"] }), Bson::Null), t);
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("2.5")] }), Bson::Null), Bson::Int64(1));
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", 2.5] }), Bson::Null), Bson::Int64(1));
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("0.1")] }), Bson::Null), Bson::Int64(-1));
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("1")), Bson::Int64(0));
-        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("7")), Bson::Int64(-1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("2.5")] }), Bson::Null), Bson::Int32(1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", 2.5] }), Bson::Null), Bson::Int32(1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("0.1")] }), Bson::Null), Bson::Int32(-1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("1")), Bson::Int32(0));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("7")), Bson::Int32(-1));
     }
 
     fn dec(text: &str) -> bson::Decimal128 {
@@ -6957,13 +7083,13 @@ mod arrays {
         assert_eq!(ok(bson!({"$in": ["$b", ["$a", 3]]})), bson!(false));
         assert_eq!(
             ok(bson!({"$concatArrays": ["$xs", ["$a", {"$add": ["$b", 1]}]]})),
-            bson!([1, 2, 1, 3_i64])
+            bson!([1, 2, 1, 3_i32])
         );
-        assert_eq!(ok(bson!({"$size": [["$a", "$b", "$s"]]})), bson!(3_i64));
+        assert_eq!(ok(bson!({"$size": [["$a", "$b", "$s"]]})), bson!(3));
         // An operator, a document and a variable as elements.
         assert_eq!(
             ok(bson!([{"$add": ["$a", "$b"]}, {"k": "$s"}, "$$ROOT.a", "plain"])),
-            bson!([3_i64, {"k": "text"}, 1, "plain"])
+            bson!([3, {"k": "text"}, 1, "plain"])
         );
     }
 
@@ -6978,7 +7104,7 @@ mod arrays {
     fn a_missing_field_is_null_in_its_place() {
         assert_eq!(ok(bson!(["$a", "$missing", "$b"])), bson!([1, null, 2]));
         assert_eq!(ok(bson!({"$concatArrays": [["$missing"], [1]]})), bson!([null, 1]));
-        assert_eq!(ok(bson!({"$size": [["$missing", "$nope"]]})), bson!(2_i64));
+        assert_eq!(ok(bson!({"$size": [["$missing", "$nope"]]})), bson!(2_i32));
         assert_eq!(ok(bson!({"$arrayElemAt": [["$missing", "$b"], 1]})), bson!(2));
         // An array holding a null is an array, not a null: the operators that
         // propagate a null argument do not see one.
@@ -6999,7 +7125,7 @@ mod arrays {
     fn an_element_reads_the_variables_of_the_scope_it_sits_in() {
         let mapped =
             bson!({"$map": {"input": "$xs", "as": "x", "in": ["$$x", {"$multiply": ["$$x", 10]}]}});
-        assert_eq!(ok(mapped), bson!([[1, 10_i64], [2, 20_i64]]));
+        assert_eq!(ok(mapped), bson!([[1, 10_i32], [2, 20_i32]]));
         let filtered = bson!({"$filter": {"input": "$xs", "cond": {"$in": ["$$this", ["$a", 5]]}}});
         assert_eq!(ok(filtered), bson!([1]));
         let reduced = bson!({"$reduce": {
@@ -7184,7 +7310,7 @@ mod arrays {
         );
         assert_eq!(
             ok(bson!({"$map": {"input": ["$a", "$b"], "as": "x", "in": {"$add": ["$$x", 1]}}})),
-            bson!([2_i64, 3_i64])
+            bson!([2_i32, 3_i32])
         );
         assert_eq!(
             ok(bson!({"$filter": {"input": ["$a", "$b"], "cond": {"$gt": ["$$this", 1]}}})),
@@ -7229,7 +7355,7 @@ mod arrays {
             prop_assert_eq!(unfolded.eval(&row()).unwrap(), array.clone());
             // And through an operator that takes it as one operand.
             let sized = Expr::parse(&bson!({"$size": [array.clone()]})).unwrap();
-            prop_assert_eq!(sized.eval(&row()).unwrap(), Bson::Int64(items.len() as i64));
+            prop_assert_eq!(sized.eval(&row()).unwrap(), Bson::Int32(items.len() as i32));
         }
     }
 }

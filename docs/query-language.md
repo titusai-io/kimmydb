@@ -929,6 +929,13 @@ silently widening to `f64` — widening loses precision quietly, which is worse
 than failing. So `$inc` and `$mul` do not change a field's type behind the
 caller: `$type: "int"` keeps finding a counter that stays small.
 
+**The aggregation expressions use the same widths** ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)):
+`{$add: ["$n", 1]}` over a 32-bit `n` is a 32-bit integer, widening to a 64-bit
+one on overflow, so a pipeline that stores its result (`$merge`, `$out`) stores
+what `$inc` would. The one difference is the end of the range: a 64-bit overflow
+in an expression is a double, where `$inc` and `$mul` refuse. The widths of every
+expression and accumulator are in [aggregation](aggregation.md#integer-result-widths).
+
 ### Decimal128 arithmetic in updates
 
 `$inc` and `$mul` take a `Decimal128` operand, and a stored `Decimal128`
@@ -1025,9 +1032,10 @@ cannot do.
 - **A missing field path as a stage value leaves the field out**, as in an aggregation's
   `$addFields`: `{$set: {p: "$nope"}}` adds nothing when `p` is absent and **removes** an
   existing `p`.
-- **Integer arithmetic stores an `Int64`**: `{$set: {n: {$add: ["$n", 1]}}}` over an
-  `Int32` field stores a long, and counts as a change even where the value is equal
-  (see [Deviations](deviations.md)).
+- **Integer arithmetic stores the reference's width** ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)):
+  `{$set: {n: {$add: ["$n", 1]}}}` over an `Int32` field stores an `Int32` (an `Int64` only
+  when it overflows `Int32`), so a result equal to the stored value is byte-equal and
+  is not a change.
 - **It is an update like any other** once the stages have run: the result is held to
   the document size and depth caps, the collection's [validator](validation.md), the
   index keying checks and the unchanged-document rule (a result byte-equal to the

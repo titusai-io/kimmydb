@@ -674,7 +674,7 @@ fn several_accumulators_in_one_group_with_keys() {
     let p = &out[0];
     assert_eq!(p.get("_id"), Some(&Bson::String("p".into())));
     assert_eq!(p.get("n"), Some(&Bson::Int32(3)));
-    assert_eq!(p.get("sum"), Some(&Bson::Int64(12)));
+    assert_eq!(p.get("sum"), Some(&Bson::Int32(12)));
     close(f(p.get("sd").unwrap()), (8.0f64 / 3.0).sqrt());
     assert_eq!(p.get("top"), Some(&Bson::String("d".into())));
     assert_eq!(p.get("low"), Some(&Bson::Array(vec![2.into(), 4.into()])));
@@ -1106,7 +1106,7 @@ fn a_list_given_to_a_unary_accumulator_is_refused() {
     }
     assert_eq!(one(doc! {"$stdDevPop": "x"}, xs(&[1, 2])), Bson::Null);
     // The same stages with one operand are as before.
-    assert_eq!(one(doc! {"$sum": "$x"}, xs(&[1, 2])), Bson::Int64(3));
+    assert_eq!(one(doc! {"$sum": "$x"}, xs(&[1, 2])), Bson::Int32(3));
     assert_eq!(one(doc! {"$avg": "$x"}, xs(&[1, 2])), Bson::Double(1.5));
     assert_eq!(one(doc! {"$push": "$x"}, xs(&[1, 2])), Bson::Array(vec![1.into(), 2.into()]));
     // A list is pushed with $literal.

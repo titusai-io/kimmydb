@@ -1991,7 +1991,8 @@ pub fn apply_with_vars(
         Stage::Limit(n) => input.into_iter().take(*n).collect(),
         Stage::Skip(n) => input.into_iter().skip(*n).collect(),
         Stage::Count(field) => {
-            let n = input.len() as i64;
+            // An `Int32` while it fits, as the reference counts (ADR-268).
+            let n = crate::expr::count_bson(input.len());
             vec![bson::doc! { field.as_str(): n }]
         }
         Stage::Unwind { path: p, preserve_null_and_empty, include_array_index } => {
@@ -3049,7 +3050,7 @@ mod tests {
     fn match_then_count() {
         let out =
             run(vec![doc! {"$match": {"city": "London"}}, doc! {"$count": "n"}], sample()).unwrap();
-        assert_eq!(out, vec![doc! { "n": 2i64 }]);
+        assert_eq!(out, vec![doc! { "n": 2 }]);
     }
 
     #[test]
@@ -3085,7 +3086,7 @@ mod tests {
             let mut pipeline = prefix.clone();
             pipeline.push(doc! {"$count": "n"});
             let out = run(pipeline, sample()).unwrap();
-            assert_eq!(out, vec![doc! { "n": 0i64 }], "{prefix:?}");
+            assert_eq!(out, vec![doc! { "n": 0 }], "{prefix:?}");
         }
     }
 
@@ -3147,7 +3148,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            vec![doc! { "_id": "London", "total": 20i64 }, doc! { "_id": "Paris", "total": 10i64 }]
+            vec![doc! { "_id": "London", "total": 20 }, doc! { "_id": "Paris", "total": 10 }]
         );
     }
 
@@ -3156,7 +3157,7 @@ mod tests {
         // Widening to double would lose precision above 2^53 and change what
         // `$type` reports — the same reason documents keep their integer types.
         let out = run(vec![doc! {"$group": {"_id": null, "n": {"$sum": 1}}}], sample()).unwrap();
-        assert_eq!(out[0].get_i64("n").unwrap(), 3);
+        assert_eq!(out[0].get_i32("n").unwrap(), 3);
     }
 
     #[test]
@@ -3174,7 +3175,7 @@ mod tests {
         let input = docs(vec![doc! { "k": 5i32 }, doc! { "k": 5.0 }, doc! { "k": 5i64 }]);
         let out = run(vec![doc! {"$group": {"_id": "$k", "n": {"$sum": 1}}}], input).unwrap();
         assert_eq!(out.len(), 1, "5, 5.0 and 5i64 must share a bucket: {out:?}");
-        assert_eq!(out[0].get_i64("n").unwrap(), 3);
+        assert_eq!(out[0].get_i32("n").unwrap(), 3);
     }
 
     #[test]
@@ -3365,7 +3366,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.len(), 4, "{out:?}");
-        assert_eq!(out[0], doc! { "_id": strings(&["a", "b"]), "n": 2i64 });
+        assert_eq!(out[0], doc! { "_id": strings(&["a", "b"]), "n": 2 });
         let keys: Vec<&Bson> = out.iter().map(|d| d.get("_id").unwrap()).collect();
         assert!(keys.contains(&&strings(&["c"])), "{keys:?}");
         assert!(keys.contains(&&Bson::Array(vec![])), "{keys:?}");
@@ -3382,8 +3383,8 @@ mod tests {
             orders(),
         )
         .unwrap();
-        assert_eq!(out[0], doc! { "_id": 1, "skus": strings(&["a", "b"]), "n": 2i64 });
-        assert_eq!(out[3], doc! { "_id": 4, "skus": [], "n": 0i64 });
+        assert_eq!(out[0], doc! { "_id": 1, "skus": strings(&["a", "b"]), "n": 2 });
+        assert_eq!(out[3], doc! { "_id": 4, "skus": [], "n": 0 });
         // A missing path leaves the field out of `$addFields` (so there is no `skus` to
         // project); `$size` of a missing field is null rather than an error, as the
         // deviations register records.
@@ -3846,7 +3847,7 @@ mod tests {
             vec![doc! {"_id": 1, "city": "London", "qty": 5}],
         )
         .unwrap();
-        assert_eq!(out, vec![doc! {"_id": 1, "city": "London", "qty": 5, "double": 10i64}]);
+        assert_eq!(out, vec![doc! {"_id": 1, "city": "London", "qty": 5, "double": 10}]);
     }
 
     #[test]
@@ -3864,7 +3865,7 @@ mod tests {
             vec![doc! {"_id": 1, "qty": 5}],
         )
         .unwrap();
-        assert_eq!(out, vec![doc! {"_id": 1, "qty": 50i64}]);
+        assert_eq!(out, vec![doc! {"_id": 1, "qty": 50}]);
     }
 
     #[test]
@@ -3874,7 +3875,7 @@ mod tests {
             vec![doc! {"_id": 1, "qty": 5}],
         )
         .unwrap();
-        assert_eq!(out, vec![doc! {"_id": 1, "qty": 5, "totals": {"doubled": 10i64}}]);
+        assert_eq!(out, vec![doc! {"_id": 1, "qty": 5, "totals": {"doubled": 10}}]);
     }
 
     #[test]
@@ -3885,7 +3886,7 @@ mod tests {
         )
         .unwrap();
         // `_id` rides along by default, exactly as an ordinary projection.
-        assert_eq!(out, vec![doc! {"city": "London", "_id": 1, "double": 10i64}]);
+        assert_eq!(out, vec![doc! {"city": "London", "_id": 1, "double": 10}]);
     }
 
     #[test]
@@ -3895,7 +3896,7 @@ mod tests {
             vec![doc! {"_id": 1, "qty": 5}],
         )
         .unwrap();
-        assert_eq!(out, vec![doc! {"double": 10i64}]);
+        assert_eq!(out, vec![doc! {"double": 10}]);
     }
 
     #[test]
@@ -3955,7 +3956,7 @@ mod tests {
             vec![doc! {"_id": 1, "city": "London", "qty": 5}],
         )
         .unwrap();
-        assert_eq!(out[0].get("double"), Some(&Bson::Int64(10)));
+        assert_eq!(out[0].get("double"), Some(&Bson::Int32(10)));
     }
 
     #[test]
@@ -3996,7 +3997,7 @@ mod tests {
         let out =
             run(vec![doc! {"$group": {"_id": {"$toUpper": "$city"}, "n": {"$sum": 1}}}], sample())
                 .unwrap();
-        assert_eq!(out, vec![doc! {"_id": "LONDON", "n": 2i64}, doc! {"_id": "PARIS", "n": 1i64}]);
+        assert_eq!(out, vec![doc! {"_id": "LONDON", "n": 2}, doc! {"_id": "PARIS", "n": 1}]);
     }
 
     #[test]
@@ -4010,7 +4011,7 @@ mod tests {
             sample(),
         )
         .unwrap();
-        assert_eq!(out, vec![doc! {"_id": Bson::Null, "total": 60i64}]);
+        assert_eq!(out, vec![doc! {"_id": Bson::Null, "total": 60}]);
     }
 
     #[test]
@@ -4021,7 +4022,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             out,
-            vec![doc! {"_id": {"c": "London"}, "n": 2i64}, doc! {"_id": {"c": "Paris"}, "n": 1i64},]
+            vec![doc! {"_id": {"c": "London"}, "n": 2}, doc! {"_id": {"c": "Paris"}, "n": 1},]
         );
     }
 
@@ -4204,7 +4205,7 @@ mod tests {
             input,
         )
         .unwrap();
-        assert_eq!(out, vec![doc! {"_id": 8, "total": 3i64}, doc! {"_id": 9, "total": 4i64}]);
+        assert_eq!(out, vec![doc! {"_id": 8, "total": 3}, doc! {"_id": 9, "total": 4}]);
     }
 
     #[test]
@@ -4254,7 +4255,7 @@ mod tests {
             bad_row(),
         )
         .unwrap();
-        assert_eq!(out, vec![doc! { "_id": Bson::Null, "n": 0_i64 }]);
+        assert_eq!(out, vec![doc! { "_id": Bson::Null, "n": 0_i32 }]);
 
         // `$filter`'s `cond`, per element.
         let out = run(
@@ -4311,10 +4312,10 @@ mod tests {
         let bad = |k: &str| doc! { "k": k, "qty": "twelve" };
         let good = |k: &str, q: i32| doc! { "k": k, "qty": q };
         let out = run(vec![stage()], vec![bad("a"), good("a", 5), good("b", 1)]).unwrap();
-        assert_eq!(out, vec![doc! { "_id": "a", "v": 6_i64 }, doc! { "_id": "b", "v": 2_i64 }]);
+        assert_eq!(out, vec![doc! { "_id": "a", "v": 6_i32 }, doc! { "_id": "b", "v": 2_i32 }]);
         // Another group's bad value does not touch this one's.
         let out = run(vec![stage()], vec![good("a", 5), bad("b"), good("b", 1)]).unwrap();
-        assert_eq!(out[1], doc! { "_id": "b", "v": 2_i64 });
+        assert_eq!(out[1], doc! { "_id": "b", "v": 2_i32 });
         // The last value fails, so the request does, whatever came before.
         for input in
             [vec![good("a", 5), bad("a")], vec![bad("a"), good("a", 5), bad("a")], vec![bad("a")]]
@@ -4325,7 +4326,7 @@ mod tests {
         // `$first` reads only the first document, as before.
         let first = doc! {"$group": {"_id": null, "v": {"$first": {"$add": ["$qty", 1]}}}};
         let out = run(vec![first], vec![good("a", 5), bad("a")]).unwrap();
-        assert_eq!(out[0].get("v"), Some(&Bson::Int64(6)));
+        assert_eq!(out[0].get("v"), Some(&Bson::Int32(6)));
     }
 
     #[test]
@@ -4408,9 +4409,9 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                doc! {"_id": 0i64, "ids": [3]},
-                doc! {"_id": 1i64, "ids": [2]},
-                doc! {"_id": 2i64, "ids": [1]},
+                doc! {"_id": 0, "ids": [3]},
+                doc! {"_id": 1, "ids": [2]},
+                doc! {"_id": 2, "ids": [1]},
             ]
         );
     }
@@ -4774,7 +4775,7 @@ mod tests {
         );
         assert_eq!(
             out[0].get_array("summary").unwrap(),
-            &vec![Bson::Document(doc! {"label": "x", "count": 2i64, "skus": ["a", "b"]})]
+            &vec![Bson::Document(doc! {"label": "x", "count": 2, "skus": ["a", "b"]})]
         );
     }
 
@@ -5326,8 +5327,8 @@ mod identity {
             let id = bucket.get("_id").unwrap();
             let first = corpus.iter().find(|v| equal(v, id)).unwrap();
             assert_eq!(format!("{id:?}"), format!("{first:?}"), "the first member seen");
-            let members = corpus.iter().filter(|v| equal(v, id)).count() as i64;
-            assert_eq!(bucket.get_i64("n").unwrap(), members, "{id:?}");
+            let members = corpus.iter().filter(|v| equal(v, id)).count() as i32;
+            assert_eq!(bucket.get_i32("n").unwrap(), members, "{id:?}");
         }
         let set = run(vec![doc! { "$group": { "_id": null, "s": { "$addToSet": "$v" } } }], input);
         let members = set[0].get_array("s").unwrap();
@@ -5440,7 +5441,7 @@ mod identity {
             ],
             grouped,
         );
-        assert_eq!(out[0].get("s"), Some(&Bson::Int64(3)));
+        assert_eq!(out[0].get("s"), Some(&Bson::Int32(3)));
         assert_eq!(out[0].get("m"), Some(&Bson::Double(1.5)));
         assert_eq!(out[1].get("s"), Some(&dec("0.10")));
         assert_eq!(out[1].get("m"), Some(&dec("0.10")));
@@ -5474,13 +5475,13 @@ mod identity {
             } }],
             input,
         );
-        assert_eq!(out[0].get("s"), Some(&Bson::Int64(3)));
+        assert_eq!(out[0].get("s"), Some(&Bson::Int32(3)));
         assert_eq!(out[0].get("m"), Some(&Bson::Double(1.5)));
-        assert_eq!(out[0].get("sa"), Some(&Bson::Int64(0)), "an array is not summed");
+        assert_eq!(out[0].get("sa"), Some(&Bson::Int32(0)), "an array is not summed");
         assert_eq!(out[0].get("ma"), Some(&Bson::Null));
-        assert_eq!(out[0].get("sd"), Some(&Bson::Int64(0)), "nor a document");
+        assert_eq!(out[0].get("sd"), Some(&Bson::Int32(0)), "nor a document");
         assert_eq!(out[0].get("md"), Some(&Bson::Null));
-        assert_eq!(out[0].get("n"), Some(&Bson::Int64(4)), "`$sum: 1` counts as ever");
+        assert_eq!(out[0].get("n"), Some(&Bson::Int32(4)), "`$sum: 1` counts as ever");
 
         let decimals = vec![doc! { "v": dec("2.5") }, doc! { "v": 1 }, doc! { "v": dec("2.50") }];
         let out = run(
@@ -5502,9 +5503,9 @@ mod identity {
             &vec![dec("2.5"), Bson::Int32(1), dec("2.50")]
         );
         assert_eq!(out[0].get_array("set").unwrap(), &vec![dec("2.5"), Bson::Int32(1)]);
-        assert_eq!(out[0].get("n"), Some(&Bson::Int64(3)));
+        assert_eq!(out[0].get("n"), Some(&Bson::Int32(3)));
         let counted = run(vec![doc! { "$count": "n" }], decimals);
-        assert_eq!(counted, vec![doc! { "n": 3_i64 }]);
+        assert_eq!(counted, vec![doc! { "n": 3_i32 }]);
     }
 
     /// `$sum` and `$avg` are accumulators only: as expression operators, in

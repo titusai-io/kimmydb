@@ -35,8 +35,10 @@ fn ids(out: &[Document]) -> Vec<i32> {
     out.iter().map(|d| d.get_i32("_id").unwrap()).collect()
 }
 
-fn i64s(values: &[i64]) -> Vec<Bson> {
-    values.iter().map(|v| Bson::Int64(*v)).collect()
+/// Integers as a window `$sum` answers them: the narrowest width that holds each, an
+/// `Int32` while it fits (the reference's windows.diag; the `$group` sum differs, ADR-268).
+fn sum_ints(values: &[i64]) -> Vec<Bson> {
+    values.iter().map(|v| crate::expr::integer_bson(*v)).collect()
 }
 
 fn ints(values: &[i32]) -> Vec<Bson> {
@@ -91,7 +93,7 @@ fn a_cumulative_sum_runs_from_the_start_of_each_partition() {
     )
     .unwrap();
     assert_eq!(ids(&out), vec![1, 2, 3, 4, 5, 6]);
-    assert_eq!(col(&out, "total"), i64s(&[10, 30, 60, 100, 5, 20]));
+    assert_eq!(col(&out, "total"), sum_ints(&[10, 30, 60, 100, 5, 20]));
 }
 
 #[test]
@@ -111,7 +113,7 @@ fn with_no_window_the_whole_partition_is_the_window() {
     let out =
         run(set(doc! {"partitionBy": "$state", "output": {"total": {"$sum": "$qty"}}}), sales())
             .unwrap();
-    assert_eq!(col(&out, "total"), i64s(&[100, 100, 100, 100, 20, 20]));
+    assert_eq!(col(&out, "total"), sum_ints(&[100, 100, 100, 100, 20, 20]));
 }
 
 #[test]
@@ -163,7 +165,7 @@ fn partitions_are_keyed_as_group_keys_are_so_one_and_one_point_zero_are_together
     ];
     let out =
         run(set(doc! {"partitionBy": "$k", "output": {"t": {"$sum": "$qty"}}}), input).unwrap();
-    assert_eq!(col(&out, "t"), i64s(&[3, 3, 4]));
+    assert_eq!(col(&out, "t"), sum_ints(&[3, 3, 4]));
 }
 
 #[test]
@@ -176,7 +178,7 @@ fn a_partition_expression_may_compute_the_key() {
     .unwrap();
     // The even (key 0) before the odd (key 1), though an odd one arrived first.
     assert_eq!(ids(&out), vec![2, 4, 1, 3, 5]);
-    assert_eq!(col(&out, "t"), i64s(&[2, 6, 1, 4, 9]));
+    assert_eq!(col(&out, "t"), sum_ints(&[2, 6, 1, 4, 9]));
 }
 
 #[test]
@@ -199,7 +201,7 @@ fn a_window_beyond_the_partition_is_empty_and_answers_what_an_empty_group_does()
     .unwrap();
     // The last document has nothing after it.
     let last = &out[2];
-    assert_eq!(last.get("sum"), Some(&Bson::Int64(0)));
+    assert_eq!(last.get("sum"), Some(&Bson::Int32(0)));
     for field in ["avg", "min", "max", "first", "last", "sd"] {
         assert_eq!(last.get(field), Some(&Bson::Null), "{field}");
     }
@@ -207,7 +209,7 @@ fn a_window_beyond_the_partition_is_empty_and_answers_what_an_empty_group_does()
     assert_eq!(last.get("set"), Some(&Bson::Array(vec![])));
     assert_eq!(last.get("n"), Some(&Bson::Int32(0)));
     // The first document sees the two after it.
-    assert_eq!(out[0].get("sum"), Some(&Bson::Int64(5)));
+    assert_eq!(out[0].get("sum"), Some(&Bson::Int32(5)));
     assert_eq!(out[0].get("push"), Some(&Bson::Array(vec![Bson::Int32(2), Bson::Int32(3)])));
     assert_eq!(out[1].get("first"), Some(&Bson::Int32(3)));
     assert_eq!(out[0].get("last"), Some(&Bson::Int32(3)));
@@ -221,7 +223,7 @@ fn a_window_wholly_behind_the_current_document_works() {
         series(&[1, 2, 4, 8, 16]),
     )
     .unwrap();
-    assert_eq!(col(&out, "prev2"), i64s(&[0, 1, 3, 7, 14]));
+    assert_eq!(col(&out, "prev2"), sum_ints(&[0, 1, 3, 7, 14]));
 }
 
 #[test]
@@ -367,7 +369,7 @@ fn a_sum_with_a_decimal_in_the_window_is_decimal_and_exact_again_once_it_leaves(
         input,
     )
     .unwrap();
-    assert_eq!(col(&out, "s"), vec![dec("1.5"), dec("3.5"), Bson::Int64(5)]);
+    assert_eq!(col(&out, "s"), vec![dec("1.5"), dec("3.5"), Bson::Int32(5)]);
 }
 
 #[test]
@@ -406,7 +408,7 @@ fn a_sum_mixing_ints_and_doubles_is_a_double_and_skips_other_types() {
     .unwrap();
     assert_eq!(
         col(&out, "s"),
-        vec![Bson::Int64(1), Bson::Double(1.5), Bson::Double(0.5), Bson::Int64(4)]
+        vec![Bson::Int32(1), Bson::Double(1.5), Bson::Double(0.5), Bson::Int32(4)]
     );
     assert_eq!(col(&out, "a"), f64s(&[1.0, 0.75, 0.5, 4.0]));
 }
@@ -436,7 +438,17 @@ fn a_sliding_sum_agrees_with_adding_up_each_window() {
             let s = ((i as i64 + lo).max(0) as usize).min(vals.len());
             let e = ((i as i64 + hi + 1).max(0) as usize).min(vals.len()).max(s);
             let window = &vals[s..e];
-            assert_eq!(o.get("s"), Some(&Bson::Int64(window.iter().sum())), "[{lo},{hi}] at {i}");
+            assert_eq!(
+                o.get("s"),
+                // The values are longs: a window of them sums to a long, an empty one to
+                // the int 0.
+                Some(&if window.is_empty() {
+                    Bson::Int32(0)
+                } else {
+                    Bson::Int64(window.iter().sum())
+                }),
+                "[{lo},{hi}] at {i}"
+            );
             assert_eq!(
                 o.get("m"),
                 Some(&window.iter().min().map_or(Bson::Null, |m| Bson::Int64(*m))),
@@ -471,9 +483,53 @@ fn a_sliding_window_over_a_large_partition_is_not_quadratic() {
     )
     .unwrap();
     assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
-    assert_eq!(out[0].get("s"), Some(&Bson::Int64(501)));
-    assert_eq!(out[30_000].get("s"), Some(&Bson::Int64(1001)));
+    assert_eq!(out[0].get("s"), Some(&Bson::Int32(501)));
+    assert_eq!(out[30_000].get("s"), Some(&Bson::Int32(1001)));
     assert_eq!(out[n as usize - 1].get("c"), Some(&Bson::Int32(501)));
+}
+
+#[test]
+fn a_sliding_sum_is_typed_by_its_current_contents_and_stays_cheap() {
+    // 100,000 documents and a window of 1,001, a long every 7,000th: a sum is a long
+    // exactly while a long is in its window, and an int otherwise, typed by counts as the
+    // window slides, not by adding the window up again. (The reference types a sliding sum
+    // by its history; see the deviations register.)
+    let n = 100_000;
+    let input: Vec<Document> = (0..n)
+        .map(|i| {
+            let v = if i % 7_000 == 0 { Bson::Int64(1) } else { Bson::Int32(1) };
+            doc! {"_id": i, "v": v}
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "s": {"$sum": "$v", "window": {"documents": [-500, 500]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+    let has_long = |i: usize| {
+        let (lo, hi) = (i.saturating_sub(500), (i + 500).min(n as usize - 1));
+        (lo..=hi).any(|j| j % 7_000 == 0)
+    };
+    for i in [
+        0usize, 499, 500, 501, 3_499, 3_500, 6_499, 6_500, 7_000, 7_500, 7_501, 50_000, 56_000,
+        99_999,
+    ] {
+        let want = if has_long(i) {
+            Bson::Int64(sum_len(i, n as usize))
+        } else {
+            Bson::Int32(sum_len(i, n as usize) as i32)
+        };
+        assert_eq!(out[i].get("s"), Some(&want), "at {i}");
+    }
+}
+
+/// The number of documents in the window `[i - 500, i + 500]` of `n`.
+fn sum_len(i: usize, n: usize) -> i64 {
+    (i.saturating_sub(500)..=(i + 500).min(n - 1)).count() as i64
 }
 
 #[test]
@@ -486,8 +542,8 @@ fn outputs_read_the_original_documents_never_each_other() {
         series(&[1, 2, 3]),
     )
     .unwrap();
-    assert_eq!(col(&out, "qty"), i64s(&[1, 3, 6]));
-    assert_eq!(col(&out, "again"), i64s(&[1, 3, 6]));
+    assert_eq!(col(&out, "qty"), sum_ints(&[1, 3, 6]));
+    assert_eq!(col(&out, "again"), sum_ints(&[1, 3, 6]));
 }
 
 #[test]
@@ -497,8 +553,8 @@ fn an_output_may_be_a_dotted_path() {
         vec![doc! {"_id": 1, "qty": 4, "stats": {"keep": true}}, doc! {"_id": 2, "qty": 5}],
     )
     .unwrap();
-    assert_eq!(out[0].get_document("stats").unwrap(), &doc! {"keep": true, "running": 4i64});
-    assert_eq!(out[1].get_document("stats").unwrap(), &doc! {"running": 9i64});
+    assert_eq!(out[0].get_document("stats").unwrap(), &doc! {"keep": true, "running": 4});
+    assert_eq!(out[1].get_document("stats").unwrap(), &doc! {"running": 9});
 }
 
 #[test]
@@ -526,7 +582,7 @@ fn a_range_window_counts_distance_in_the_sort_value_not_positions() {
     )
     .unwrap();
     // Day 1: {1}; day 2: {1, 2}; day 4: {2, 4}; day 7: {7}.
-    assert_eq!(col(&out, "s"), i64s(&[1, 3, 6, 8]));
+    assert_eq!(col(&out, "s"), sum_ints(&[1, 3, 6, 8]));
 }
 
 /// Days 1, 1, 2, 2, 3 with quantities 1, 2, 4, 8, 16, so each sum names the documents in its
@@ -552,19 +608,19 @@ fn a_numeric_range_bound_includes_the_documents_tied_with_the_current_one_and_cu
     let b = |s: &str| Bson::String(s.into());
     let n = |x: i32| Bson::Int32(x);
     // A distance of 0 takes every document of the same day.
-    assert_eq!(sums(n(0), n(0)), i64s(&[3, 3, 12, 12, 16]));
+    assert_eq!(sums(n(0), n(0)), sum_ints(&[3, 3, 12, 12, 16]));
     // The current document itself is the document, ties before it and after it left out.
-    assert_eq!(sums(b("current"), b("current")), i64s(&[1, 2, 4, 8, 16]));
-    assert_eq!(sums(b("unbounded"), b("current")), i64s(&[1, 3, 7, 15, 31]));
-    assert_eq!(sums(n(-1), b("current")), i64s(&[1, 3, 7, 15, 28]));
-    assert_eq!(sums(b("current"), b("unbounded")), i64s(&[31, 30, 28, 24, 16]));
-    assert_eq!(sums(b("current"), n(1)), i64s(&[15, 14, 28, 24, 16]));
-    assert_eq!(sums(b("current"), n(0)), i64s(&[3, 2, 12, 8, 16]));
-    assert_eq!(sums(n(0), b("current")), i64s(&[1, 3, 4, 12, 16]));
-    assert_eq!(sums(n(0), n(1)), i64s(&[15, 15, 28, 28, 16]));
-    assert_eq!(sums(n(-1), n(0)), i64s(&[3, 3, 15, 15, 28]));
-    assert_eq!(sums(b("unbounded"), n(0)), i64s(&[3, 3, 15, 15, 31]));
-    assert_eq!(sums(n(0), b("unbounded")), i64s(&[31, 31, 28, 28, 16]));
+    assert_eq!(sums(b("current"), b("current")), sum_ints(&[1, 2, 4, 8, 16]));
+    assert_eq!(sums(b("unbounded"), b("current")), sum_ints(&[1, 3, 7, 15, 31]));
+    assert_eq!(sums(n(-1), b("current")), sum_ints(&[1, 3, 7, 15, 28]));
+    assert_eq!(sums(b("current"), b("unbounded")), sum_ints(&[31, 30, 28, 24, 16]));
+    assert_eq!(sums(b("current"), n(1)), sum_ints(&[15, 14, 28, 24, 16]));
+    assert_eq!(sums(b("current"), n(0)), sum_ints(&[3, 2, 12, 8, 16]));
+    assert_eq!(sums(n(0), b("current")), sum_ints(&[1, 3, 4, 12, 16]));
+    assert_eq!(sums(n(0), n(1)), sum_ints(&[15, 15, 28, 28, 16]));
+    assert_eq!(sums(n(-1), n(0)), sum_ints(&[3, 3, 15, 15, 28]));
+    assert_eq!(sums(b("unbounded"), n(0)), sum_ints(&[3, 3, 15, 15, 31]));
+    assert_eq!(sums(n(0), b("unbounded")), sum_ints(&[31, 31, 28, 28, 16]));
 }
 
 #[test]
@@ -606,7 +662,7 @@ fn current_in_a_range_window_is_the_document_for_every_accumulator_and_for_dates
         dates,
     )
     .unwrap();
-    assert_eq!(col(&out, "s"), i64s(&[1, 3, 7, 15]));
+    assert_eq!(col(&out, "s"), sum_ints(&[1, 3, 7, 15]));
 }
 
 fn ints_bson(values: &[i32]) -> Vec<Bson> {
@@ -624,9 +680,9 @@ fn a_range_window_unbounded_on_one_side() {
     )
     .unwrap();
     // qty 1: values up to 2 = 3; qty 2: up to 3 = 3; qty 4: up to 5 = 12; qty 5: 12.
-    assert_eq!(col(&out, "up"), i64s(&[3, 3, 12, 12]));
+    assert_eq!(col(&out, "up"), sum_ints(&[3, 3, 12, 12]));
     // qty 1: from 0 = 12; qty 2: from 1 = 12; qty 4: from 3 = 9; qty 5: from 4 = 9.
-    assert_eq!(col(&out, "down"), i64s(&[12, 12, 9, 9]));
+    assert_eq!(col(&out, "down"), sum_ints(&[12, 12, 9, 9]));
 }
 
 #[test]
@@ -659,7 +715,7 @@ fn a_range_window_over_dates_steps_by_the_unit() {
         input.clone(),
     )
     .unwrap();
-    assert_eq!(col(&out, "s"), i64s(&[1, 3, 4]));
+    assert_eq!(col(&out, "s"), sum_ints(&[1, 3, 4]));
     // A bound with a unit is a whole number of it, small enough for 32 bits.
     for bound in [Bson::Double(-0.5), Bson::Double(-1e12), Bson::Int64(1 << 40)] {
         let e = refused(set(
@@ -673,7 +729,7 @@ fn a_range_window_over_dates_steps_by_the_unit() {
         series(&[1, 2, 4]),
     )
     .unwrap();
-    assert_eq!(col(&out, "s"), i64s(&[1, 2, 4]));
+    assert_eq!(col(&out, "s"), sum_ints(&[1, 2, 4]));
     let _ = input;
 }
 
@@ -691,7 +747,7 @@ fn a_range_window_in_months_is_a_calendar_step_clamped_to_the_month_end() {
     .unwrap();
     // One month before 28 February is 28 January, which takes in 31 January; one month before
     // 31 March is 28 February (the month's end), which takes in 28 February.
-    assert_eq!(col(&out, "s"), i64s(&[1, 3, 6]));
+    assert_eq!(col(&out, "s"), sum_ints(&[1, 3, 6]));
 }
 
 #[test]
@@ -785,7 +841,7 @@ fn a_documents_window_needs_a_sort_unless_it_is_the_whole_partition() {
     run(w(doc! {"documents": ["unbounded", "unbounded"]}), series(&[1, 2])).unwrap();
     // `{}` is the whole partition too, and `sortBy: {}` is no sort.
     let out = run(w(doc! {}), series(&[1, 2, 3])).unwrap();
-    assert_eq!(col(&out, "s"), i64s(&[3, 3, 3]));
+    assert_eq!(col(&out, "s"), sum_ints(&[3, 3, 3]));
     // `sortBy: {}` is no sort, and a documents window then counts in arrival order, as the
     // reference accepts it; the same window with no `sortBy` at all is refused.
     let out = run(
@@ -797,7 +853,7 @@ fn a_documents_window_needs_a_sort_unless_it_is_the_whole_partition() {
     assert_eq!(col(&out, "s"), vec![arr(&[3]), arr(&[3, 1]), arr(&[1, 2])]);
     assert_eq!(ids(&out), vec![1, 2, 3]);
     let out = run(set(doc! {"sortBy": {}, "output": {"s": {"$sum": 1}}}), series(&[1, 2])).unwrap();
-    assert_eq!(col(&out, "s"), i64s(&[2, 2]));
+    assert_eq!(col(&out, "s"), sum_ints(&[2, 2]));
 }
 
 #[test]
@@ -810,8 +866,8 @@ fn an_infinite_range_bound_is_no_bound() {
         series(&[1, 2, 4]),
     )
     .unwrap();
-    assert_eq!(col(&out, "lo"), i64s(&[1, 3, 7]));
-    assert_eq!(col(&out, "hi"), i64s(&[7, 6, 4]));
+    assert_eq!(col(&out, "lo"), sum_ints(&[1, 3, 7]));
+    assert_eq!(col(&out, "hi"), sum_ints(&[7, 6, 4]));
 }
 
 #[test]
@@ -1577,10 +1633,7 @@ fn the_stage_runs_inside_a_facet_and_after_other_stages() {
     for stage in &stages {
         docs = aggregate::apply(stage, docs, &Limits::default()).unwrap();
     }
-    assert_eq!(
-        docs,
-        vec![doc! {"running": [{"t": 10i64}, {"t": 30i64}, {"t": 60i64}, {"t": 100i64}]}]
-    );
+    assert_eq!(docs, vec![doc! {"running": [{"t": 10}, {"t": 30}, {"t": 60}, {"t": 100}]}]);
 }
 
 #[test]
@@ -1602,7 +1655,7 @@ fn the_stage_parses_in_a_lookup_sub_pipeline_and_reads_its_let_variables() {
     let vars = [("scale", &scale)];
     let out = aggregate::apply_with_vars(&inner[0], series(&[1, 2, 3]), &Limits::default(), &vars)
         .unwrap();
-    assert_eq!(col(&out, "t"), i64s(&[10, 30, 60]));
+    assert_eq!(col(&out, "t"), sum_ints(&[10, 30, 60]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,14 +1955,16 @@ fn sum_avg_and_count_over_mixed_types_as_the_reference_answers() {
     let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
     assert_eq!(
         col(&out, "s"),
+        // The long in rows 3 to 5 makes those windows longs; the reference types a sliding
+        // sum by its history and answers the ints 3, 2, 1 here (deviations register).
         vec![
-            Bson::Int64(1),
-            Bson::Int64(2),
+            Bson::Int32(1),
+            Bson::Int32(2),
             Bson::Int64(3),
             Bson::Int64(2),
             Bson::Int64(1),
-            Bson::Int64(0),
-            Bson::Int64(0),
+            Bson::Int32(0),
+            Bson::Int32(0),
             dec("2.5"),
             dec("9.5")
         ]
@@ -2076,7 +2131,7 @@ fn sum_and_avg_are_exact_across_a_non_finite_value_and_an_overflow_beyond_a_long
     assert!(is_nan(&s[1]));
     assert_eq!(s[2], Bson::Double(f64::NEG_INFINITY));
     assert!(is_nan(&s[3]) && is_nan(&s[4]));
-    assert_eq!(s[5], Bson::Int64(5));
+    assert_eq!(s[5], Bson::Int32(5));
 }
 
 #[test]
@@ -2117,7 +2172,7 @@ fn a_sum_with_a_decimal_is_exact_however_the_window_slides() {
     .unwrap();
     assert_eq!(
         col(&out, "s"),
-        vec![dec("0.1"), dec("1.1"), Bson::Int64(3), Bson::Double(2.5), Bson::Double(3.5)]
+        vec![dec("0.1"), dec("1.1"), Bson::Int32(3), Bson::Double(2.5), Bson::Double(3.5)]
     );
     assert_eq!(
         col(&out, "a"),
@@ -2660,4 +2715,124 @@ fn an_integral_of_values_near_the_largest_slides_exactly_and_in_time() {
     assert_eq!(out[1000].get("i4"), Some(&Bson::Double(f64::INFINITY)));
     assert_eq!(out[99_999].get("i2"), Some(&Bson::Double(1.0)));
     assert_eq!(out[99_999].get("i4"), Some(&Bson::Double(3.0)));
+}
+
+// ---------------------------------------------------------------------------
+// Integer widths (ADR-268): the reference's recorded answers, classic and SBE alike
+// ---------------------------------------------------------------------------
+
+const LMAX: i64 = i64::MAX;
+
+/// The `s` of each document of `values` under `spec`, in `_id` order.
+fn widths(values: Vec<Bson>, spec: Document) -> Vec<Bson> {
+    let input: Vec<Document> =
+        values.into_iter().enumerate().map(|(k, v)| doc! {"_id": k as i32 + 1, "v": v}).collect();
+    let out = run(set(doc! {"sortBy": {"_id": 1}, "output": {"s": spec}}), input).unwrap();
+    col(&out, "s")
+}
+
+fn cumulative() -> Document {
+    doc! {"documents": ["unbounded", "current"]}
+}
+
+#[test]
+fn a_cumulative_or_whole_partition_sum_is_typed_as_a_group_sum_is() {
+    let sum = |window: Option<Document>| match window {
+        Some(w) => doc! {"$sum": "$v", "window": w},
+        None => doc! {"$sum": "$v"},
+    };
+    let (i, l) = (Bson::Int32, Bson::Int64);
+    // Ints only: typed by the total (`1, 3, MAX + 3` is the int 1, the int 3, a long).
+    assert_eq!(
+        widths(vec![i(1), i(2), i(i32::MAX)], sum(Some(cumulative()))),
+        vec![i(1), i(3), l(2_147_483_650)]
+    );
+    // A sum that saw a long stays a long, whatever the total.
+    assert_eq!(widths(vec![l(1), l(2)], sum(Some(cumulative()))), vec![l(1), l(3)]);
+    assert_eq!(widths(vec![i(1), l(2)], sum(Some(cumulative()))), vec![i(1), l(3)]);
+    assert_eq!(widths(vec![i(1), i(2)], sum(None)), vec![i(3), i(3)]);
+    assert_eq!(widths(vec![l(1), l(2)], sum(None)), vec![l(3), l(3)]);
+    // With a double, a double.
+    assert_eq!(
+        widths(vec![i(1), Bson::Double(2.0)], sum(Some(cumulative()))),
+        vec![i(1), Bson::Double(3.0)]
+    );
+    assert_eq!(
+        widths(vec![i(i32::MAX)], doc! {"$sum": {"$add": ["$v", 1, -1]}}),
+        vec![i(i32::MAX)]
+    );
+    assert_eq!(
+        widths(vec![i(5), i(6)], doc! {"$sum": 1, "window": cumulative()}),
+        vec![i(1), i(2)]
+    );
+    assert_eq!(
+        widths(vec![i(5), i(6)], doc! {"$count": {}, "window": cumulative()}),
+        vec![i(1), i(2)]
+    );
+}
+
+#[test]
+fn a_sliding_sum_is_typed_by_what_the_window_holds_now() {
+    // The reference types a sliding sum by its history: `[LMAX, 1, 2]` over `[-1, 0]` is a
+    // long, a DOUBLE, then the int 3. That turns integer inputs into a double, and is not
+    // copied (deviations register): here the third window holds the longs 1 and 2, a long.
+    let (i, l) = (Bson::Int32, Bson::Int64);
+    let slide = doc! {"$sum": "$v", "window": {"documents": [-1, 0]}};
+    assert_eq!(
+        widths(vec![l(LMAX), l(1), l(2)], slide.clone()),
+        vec![l(LMAX), Bson::Double(9_223_372_036_854_775_808.0), l(3)]
+    );
+    // An int window after a long has left is typed by its total again.
+    assert_eq!(widths(vec![l(1), i(2), i(3)], slide.clone()), vec![l(1), l(3), i(5)]);
+    // A double leaving the window leaves ints.
+    assert_eq!(
+        widths(vec![Bson::Double(0.5), i(1), i(2)], slide),
+        vec![Bson::Double(0.5), Bson::Double(1.5), i(3)]
+    );
+}
+
+#[test]
+fn the_other_window_functions_have_the_references_widths() {
+    let (i, l, d) = (Bson::Int32, Bson::Int64, Bson::Double);
+    assert_eq!(
+        widths(vec![i(1), i(2)], doc! {"$avg": "$v", "window": cumulative()}),
+        vec![d(1.0), d(1.5)]
+    );
+    for rank in ["$rank", "$denseRank", "$documentNumber"] {
+        // Sorted by `_id`, so no ties: 1, 2, 3 as ints.
+        assert_eq!(
+            widths(vec![i(1), i(1), i(2)], doc! {rank: {}}),
+            vec![i(1), i(2), i(3)],
+            "{rank}"
+        );
+    }
+    assert_eq!(
+        widths(vec![l(7), l(8)], doc! {"$shift": {"output": "$v", "by": 1, "default": 0}}),
+        vec![l(8), i(0)]
+    );
+    assert_eq!(
+        widths(vec![l(7), l(8)], doc! {"$min": "$v", "window": cumulative()}),
+        vec![l(7), l(7)]
+    );
+    assert_eq!(
+        widths(vec![i(1), i(2), i(3)], doc! {"$integral": {"input": "$v"}, "window": cumulative()}),
+        vec![i(0), d(1.5), d(4.0)]
+    );
+    assert_eq!(
+        widths(
+            vec![i(1), i(2), i(4)],
+            doc! {"$derivative": {"input": "$v"}, "window": {"documents": [-1, 0]}}
+        ),
+        vec![Bson::Null, d(1.0), d(2.0)]
+    );
+    // Typed only: the last digit of the second value differs from the reference's (it
+    // answers 1.6666666666666667; this build 1.6666666666666665), which is `$expMovingAvg`'s
+    // own business and not a width.
+    let ema = widths(vec![i(1), i(2)], doc! {"$expMovingAvg": {"input": "$v", "N": 2}});
+    assert!(ema.iter().all(|v| matches!(v, Bson::Double(_))), "{ema:?}");
+    assert_eq!(
+        widths(vec![i(1), Bson::Null, i(3)], doc! {"$linearFill": "$v"}),
+        vec![i(1), d(2.0), i(3)]
+    );
+    assert_eq!(widths(vec![l(1), Bson::Null], doc! {"$locf": "$v"}), vec![l(1), l(1)]);
 }
