@@ -178,6 +178,15 @@ Where these differ from the reference (MongoDB 6.0), they differ on purpose:
 
 ---
 
+## 🟡 A `$group` `$min` and `$max` keep the last of equal values, where the reference keeps the first when its group is not pushed down
+
+**Raised 2026-11-02, from the phase B probe on the reference.** Of values that compare equal (`1` and `1.0`, `0.0` and `-0.0`, `1.0` and `1.00`, an int and a long, a double `NaN` and a decimal one) the reference's `$min` and `$max` expressions keep the **first** in every form: a list of operands, an array and one value (all 13 tie pairs of `q8-probes/q8d-ties2.js`, outputs in `reference-6.0.5/phaseB-q8d/20261102T1809Z/q8d-ties.out`). Its `$group` accumulator keeps the **last** when the group runs straight over a collection or after a `$sort` (`q8d-agg.out`), and the **first** when the group is not pushed down: after `$addFields`, with `$_internalInhibitOptimization`, or over `$documents` (`q8d-ties.out`). That is the reference's two execution engines. Here the `$group`, `$bucket` and `$bucketAuto` accumulators keep the **last** always, because that is the common shape, and the expression forms keep the first.
+
+- **What differs:** a group that the reference does not push down (a pipeline with `$addFields` before the `$group`, say) answers the first of equal values and this build the last. The values are numerically equal; only their type (int against double against long, or the scale of a decimal) or the sign of a zero differs: `{v: 1}` then `{v: 1.0}` under `{$min: "$v"}` is the int `1` there after an `$addFields` and the double `1.0` here (the double `1.0` in both when the group runs straight over the collection).
+- **Why it stays:** matching the straight shape matches the reference where a collection is grouped directly, and following the other would need an engine switch with no counterpart here.
+
+---
+
 ## 🟡 The field-level merge state keeps counter totals exact to 2^119, and refuses a total past it
 
 **Raised 2026-11-01, with the field-level merge state (Q7 phase 0). Nothing in 0.59.0 stores, replicates or serves it, so no answer of 0.59.0 depends on this bound; it is recorded now, as this register asks, so that the release that wires the state does not have to remember it.** The merge state is a pure module that nothing stores, replicates or serves yet. It keeps one total per writer for every `$inc` counter, in an `i128`. What a client sees of a counter is bounded by the 64-bit integer range: a read saturates, and a local `$inc` that would leave that range is refused. Underneath, a writer's total is bounded at 2^119, so that the sum over 64 writers stays exact in an `i128` (each read-side term is below 2^120, and 64 of them sum below 2^126).

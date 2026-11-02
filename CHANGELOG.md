@@ -21,7 +21,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
-- **`$min` and `$max` in a `$group` (and `$bucket`, `$bucketAuto`) keep the last of values that compare equal, as the reference's do; they kept the first.** With `{v: 1}` and then `{v: 1.0}`, `{$group: {_id: null, m: {$min: "$v"}}}` is now `1.0`, a double, where it was the int `1`; likewise `0.0` and `-0.0`, `1.0` and `1.00` as decimals, an int and a long, and a double `NaN` and a decimal one. The expression forms keep the first (recorded for a list of operands).
+- **`$min` and `$max` in a `$group` (and `$bucket`, `$bucketAuto`) keep the last of values that compare equal, as the reference's do when its group runs straight over a collection or after a `$sort` (it keeps the first elsewhere: see the register); they kept the first.** With `{v: 1}` and then `{v: 1.0}` in a collection, `{$group: {_id: null, m: {$min: "$v"}}}` is now `1.0`, a double, where it was the int `1`; likewise `0.0` and `-0.0`, `1.0` and `1.00` as decimals, an int and a long, and a double `NaN` and a decimal one. The expression forms keep the first, in every form (recorded for a list of operands, an array and one value).
 - **The sum of a lone `-0.0` is now `0.0` in a `$group`, `$bucket` and `$bucketAuto`**, as the reference answers; it was `-0.0`.
 
 ### Fixed
