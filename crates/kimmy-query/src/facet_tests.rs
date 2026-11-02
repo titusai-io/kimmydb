@@ -317,7 +317,7 @@ fn an_empty_facet_with_a_long_name_is_charged_for_its_header() {
     let long = "n".repeat(200);
     let mut facets = Document::new();
     facets.insert("a", Bson::Array(vec![]));
-    facets.insert(long.clone(), Bson::Array(vec![Bson::Document(doc! {"$limit": 0})]));
+    facets.insert(long.clone(), Bson::Array(vec![Bson::Document(doc! {"$skip": 5})]));
     let err = run(&[doc! {"$facet": facets}], vec![doc! {"p": "x".repeat(padding)}])
         .expect_err("the second facet's header passes the cap");
     assert!(
@@ -327,6 +327,6 @@ fn an_empty_facet_with_a_long_name_is_charged_for_its_header() {
     // A name that fits under the cap is accepted.
     let mut facets = Document::new();
     facets.insert("a", Bson::Array(vec![]));
-    facets.insert("short", Bson::Array(vec![Bson::Document(doc! {"$limit": 0})]));
+    facets.insert("short", Bson::Array(vec![Bson::Document(doc! {"$skip": 5})]));
     assert!(run(&[doc! {"$facet": facets}], vec![doc! {"p": "x".repeat(padding)}]).is_ok());
 }

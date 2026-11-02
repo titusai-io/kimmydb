@@ -201,7 +201,9 @@ fn a_sink_is_charged_for_the_documents_it_writes() {
         json!([{"$addFields": {"c": "$pad"}}, {"$out": "copy2"}]),
         capped(docs + 1_000),
     ));
-    names(&err, "the output of $addFields");
+    // `$addFields` streams: nothing holds its output but the answer's collector, which is
+    // what is full, and it is named instead of the stage (ADR-270).
+    names(&err, "the output of the pipeline is ");
 }
 
 #[test]

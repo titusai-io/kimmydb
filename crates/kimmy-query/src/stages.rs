@@ -240,12 +240,23 @@ pub(crate) fn redact(
 ) -> Result<Vec<Document>> {
     let mut out = Vec::with_capacity(input.len());
     for doc in &input {
-        if let Some(kept) = redact_level(doc, doc, expr, vars)? {
+        if let Some(kept) = redact_doc(doc, expr, vars)? {
             held.charge_doc(&kept)?;
             out.push(kept);
         }
     }
     Ok(out)
+}
+
+/// One document through `$redact`: what is left of it, or `None` when it is pruned (ADR-270:
+/// the body of the stage for one document, which [`redact`] loops over and the chain of sinks
+/// calls as each document arrives).
+pub(crate) fn redact_doc(
+    doc: &Document,
+    expr: &Expr,
+    vars: &[Binding<'_>],
+) -> Result<Option<Document>> {
+    redact_level(doc, doc, expr, vars)
 }
 
 fn redact_level(

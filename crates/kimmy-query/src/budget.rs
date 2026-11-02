@@ -639,6 +639,9 @@ pub(crate) fn input_of(stage: &str) -> &'static str {
         "$sample" => "the input of $sample",
         "$redact" => "the input of $redact",
         "$unionWith" => "the input of $unionWith",
+        "$setWindowFields" => "the input of $setWindowFields",
+        "$densify" => "the input of $densify",
+        "$fill" => "the input of $fill",
         _ => "the input of a stage",
     }
 }

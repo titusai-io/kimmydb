@@ -25,6 +25,30 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 
 ---
 
+<a id="pipeline-stage-limit-adr-270"></a>
+
+## 🟡 A pipeline is held to 1,000 stages, counted as the reference counts the stages it measured
+
+**Raised 2026-11-02, with ADR-270; counting measured on the reference the same day.** An aggregation is refused with `400` (`a pipeline has 1001 stages, over the limit of 1000 (a stage that expands, such as $count, counts as two). A $facet branch and a $lookup or $unionWith sub-pipeline are each counted on their own`) when its stages weigh more than `MAX_PIPELINE_STAGES` (1,000), and a pipeline-style update likewise (`an update pipeline has 1001 stages, over the limit of 1000`). Any length was accepted before: the 2 MiB body limit allows about 170,000 stages of `{"$skip": 0}`, and the stages of a run now take each document through a loop that does not grow the stack with them (ADR-270), so the bound is a limit on what a client may send, not what keeps a worker standing. The reference refuses with "Pipeline length must be no longer than 1000 stages".
+
+**What is counted.** The elements of the array a client sends, each as one, with five that weigh two because the reference counts what they expand to (`aggregate::stage_weight`): `$count`, `$sortByCount`, `$bucket`, `$setWindowFields` and `$densify`. Measured: with 999 `$skip` stages those five are refused and with 998 they are accepted. Everything else probed weighs one: `$bucketAuto`, `$group`, `$unset`, `$set`, `$addFields`, `$replaceWith`, `$replaceRoot`, `$project`, `$match`, `$sort`, `$limit`, `$unwind`, `$sample`, `$redact`, `$lookup`, `$unionWith`, `$facet`, `$fill`, `$graphLookup`, and a `$merge` or `$out` as the last stage. Every pipeline is counted on its own: the top level, each `$facet` branch, and the sub-pipeline of a `$lookup` or a `$unionWith`, so a pipeline of 1,000 stages may hold a `$facet` whose branches have 1,000 each, as in the reference. A pipeline-style update (an array of `$set`, `$unset` and `$replaceRoot` stages) is counted in the same way; all its stages weigh one.
+
+**What could differ.** A stage that was not probed counts one here: a `$fill` with a method, the variants of `$densify`, `$geoNear` (not built). If the reference expands any of them, a pipeline of 999 other stages and one of those is accepted here and refused there. The probes are `q8-probes/q8d-weights.js` and `q8-probes/adr270-p1.js`.
+
+**To close:** probe the remaining stage variants and give each its weight.
+
+---
+
+<a id="skipped-documents-adr-270"></a>
+
+## 🟡 An error from a document that a later `$skip` or `$limit` would drop is raised here, where the reference answers
+
+**Raised 2026-11-02, with ADR-270; closed by P2.** A stage that streams takes each document through the whole run of them, so a `$limit` that is full ends the scan and an error in a document past it is not raised, as in the reference. A `$skip` before the failing stage does not do the same: `[{$addFields: {x: {$divide: [1, "$d"]}}}, {$skip: 5}, {$limit: 2}]` over documents of which a skipped one has `d: 0` is a `400` (`can't $divide by zero`) here, where the reference answers the two documents after the skip. The reference's optimizer moves a `$skip` and a `$limit` ahead of the stages that neither filter nor change the number of documents (`$project`, `$unset`, `$addFields`, `$set`), so the skipped documents are never evaluated; this build evaluates every document that reaches the skip. Measured on the reference (`q8-probes/adr270-p1.js`, rows 3c and 3d, `q8-probes/reference-6.0.5/phaseB-q8d/20261102T1809Z/adr270-p1.out`): `[$addFields (divide), $skip 8, $limit 2]` with the zero at document 6 answers `[8,9]`, and with the zero at document 3 and `$skip 5, $limit 2` answers `[5,6]`; here both are `400`. An error inside the window is raised by both (row 3b). A `$skip` or `$limit` after a stage that filters or fans out (`$match`, `$unwind`) is not moved by the reference, and the two agree.
+
+**To close:** P2 builds the reference's reordering (a `$skip` and a `$limit` move ahead of the count-preserving, non-filtering stages), which closes this entry.
+
+---
+
 ## 🟡 `$setWindowFields`, `$densify` and `$fill`: Decimal128 read as doubles, a date `unit` that defaults, a sliding deviation that is NaN, and a few edges
 
 **Raised 2026-10-31, with ADR-264; revised after review.** `$setWindowFields`, `$densify` and `$fill` are built ([aggregation.md](aggregation.md#setwindowfields)). The order of the partitions, `"current"` in a range window, `$expMovingAvg`, `$locf` without a sort, a missing or null `$densify` field, the `$densify` grid and the months' drift, the covariance operators and the documents a window refuses all follow the reference. Where they differ:

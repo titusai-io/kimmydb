@@ -20729,8 +20729,10 @@ async fn an_aggregation_over_its_memory_limit_is_a_413_at_a_bounded_size() {
     assert_eq!(refused.body["error"], "answer_too_large", "{:?}", refused.body);
     assert_eq!(refused.body["retry"], "no", "{:?}", refused.body);
     let message = refused.body["message"].as_str().unwrap();
-    // It names what held the memory, the limit, and what to do.
-    assert!(message.contains("the output of $addFields"), "{message}");
+    // It names what held the memory, the limit, and what to do. `$addFields` streams and
+    // holds one document; the `$count` it feeds is charged as the documents reach it, and is
+    // what is full (ADR-270).
+    assert!(message.contains("the input of $count is "), "{message}");
     assert!(message.contains("limit of 8388608 bytes"), "{message}");
     assert!(message.contains("a leading $match narrows what is read"), "{message}");
     assert!(message.contains("$project, $limit or $match after it reduce"), "{message}");
@@ -20796,8 +20798,9 @@ async fn every_stage_the_executor_runs_is_held_to_the_memory_limit_and_stops_at_
         ("$lookup", json!([{ "$facet": { "a": [eq.clone()], "b": [{ "$count": "n" }] } }])),
         ("$graphLookup", json!([{ "$facet": { "a": [graph] } }])),
         // A sink after a stage that builds is refused before anything is written.
+        // (`$addFields` streams, so what is full is the output it feeds the sink: ADR-270.)
         (
-            "$addFields",
+            "the output of the pipeline is ",
             json!([{ "$addFields": { "big": "q".repeat(40_000) } }, { "$out": "dest" }]),
         ),
         ("$lookup", json!([sub, { "$merge": { "into": "dest" } }])),
@@ -20834,6 +20837,59 @@ async fn every_stage_the_executor_runs_is_held_to_the_memory_limit_and_stops_at_
     assert_eq!(res.status, 413, "{:?}", res.body);
     assert!(res.body["message"].as_str().unwrap().contains("the source read"), "{:?}", res.body);
     assert_eq!(shop.state.aggregate_memory().pool().used(), 0);
+}
+
+#[tokio::test]
+async fn the_hits_of_a_vector_search_are_not_held_beside_the_answer_of_a_stage_that_streams() {
+    // The hits are charged as the input of the stage that takes them, and given back as it
+    // takes each one (ADR-270). A stage that streamed and held nothing left them charged
+    // through the rest of the request, beside the answer: the least budget a `$project` of the
+    // hits answers under must not be the hits plus the answer.
+    let hits = json!({ "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 10 } });
+    // A server of its own for each limit, which a node sets once.
+    async fn answers(limit: usize, pipeline: &Value) -> bool {
+        let shop = Server::start().await;
+        shop.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(limit, 64 << 20));
+        let token = products_collection(&shop).await;
+        let res = shop
+            .post(
+                "/v1/db/shop/coll/products/aggregate",
+                Some(&token),
+                json!({ "pipeline": pipeline }),
+            )
+            .await;
+        assert_eq!(shop.state.aggregate_memory().pool().used(), 0);
+        res.status == 200
+    }
+    async fn smallest(pipeline: Value) -> usize {
+        let (mut lo, mut hi) = (100usize, 1usize << 14);
+        assert!(!answers(lo, &pipeline).await, "a hundred bytes hold no hits");
+        assert!(answers(hi, &pipeline).await);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if answers(mid, &pipeline).await {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+    // The hits alone: taken by a stage that drops them all, with no answer to hold.
+    let hits_only = smallest(json!([hits.clone(), { "$match": { "nothing": 1 } }])).await;
+    // The answer is three documents `{_id}`, which the budget counts as the documents here.
+    let answer = kimmy_query::budget::held_docs_bytes(&[
+        bson::doc! { "_id": 1 },
+        bson::doc! { "_id": 2 },
+        bson::doc! { "_id": 3 },
+    ]);
+    // The `$project` of the same hits answers in less than the hits and the answer together,
+    // which is what it needed while the hits stayed charged beside it.
+    let projected = json!([hits, { "$project": { "_id": 1 } }]);
+    assert!(
+        answers(hits_only + answer - 1, &projected).await,
+        "the hits ({hits_only}) were held beside the answer ({answer})"
+    );
 }
 
 #[tokio::test]

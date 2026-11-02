@@ -170,7 +170,7 @@ pub use hold_meter::{
     Component as HoldComponent, HoldDecomposition, Phase as HoldPhase, SERVE_WALK_BUCKETS_US,
     ServeSnapshot, ServeWalk, WalkPath,
 };
-pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome, UnkeyedPage};
+pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome, KeyHold, UnkeyedPage};
 pub use merge::{SinkCounts, SinkMode, SinkOutcome, WhenMatched};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
