@@ -5,14 +5,24 @@ and hyperbolic function at a table of operands, for `tests/decimal_trig_oracle.r
     python3 -I gen_trig_oracle.py > trig_oracle.tsv      (about 20 seconds)
 
 The values come from Python's `decimal` at 250 digits (more for an operand of large exponent),
-with `sin`/`cos` reduced modulo pi/2 against pi from Machin's formula (itself checked against
-the Brent-Salamin iteration), the arctangent by argument halving and a series, and the
-hyperbolic functions from `decimal`'s own correctly rounded `exp` and `ln`. Each is checked by a
-second, independent route before it is written: `sin`/`cos` against the double-angle build-up
-from a eighth of the angle, `atan` against Newton's iteration on `tan`, and the inverse
-functions by sending the answer back through their forward function (to 200 digits). An operand
-whose true value is within 1e-40 of a rounding midpoint is dropped, so the 34-digit answer is
-not in doubt.
+with `sin`/`cos` reduced modulo pi/2 against pi from Machin's formula, the arctangent by
+argument halving and a series, and the hyperbolic functions from `decimal`'s own correctly
+rounded `exp` and `ln`. Each is checked by a second route before it is written, and the routes
+share no algorithm with the first:
+
+- pi, to the full width any row uses (about 6,500 digits), by the Chudnovsky series with integer
+  binary splitting, against Machin's formula;
+- `sin`, `cos` and `tan` by reduction modulo 2 pi (not pi/2, so no quadrant table) with that
+  independent pi, the series on r/3^25 and 25 triple-angle steps;
+- `atan` by Newton's iteration on `tan`; the inverse functions by sending the answer back
+  through their forward function (to 150 digits);
+- `sinh` and `tanh` by the series for a small operand and `exp` otherwise, `cosh` by its own
+  series, `asinh`, `acosh` and `atanh` by the round trip;
+- `atan2` by the sine and cosine of the angle over the hypotenuse, or the first-order form for a
+  ratio past 1e100.
+
+An operand whose true value is within 1e-40 of a rounding midpoint is dropped, so the 34-digit
+answer is not in doubt.
 
 Columns: function, operand (for atan2, `y x` apart), the 34-digit answer, the true value to 50
 digits (truncated). The random generator is seeded, so the file is the same on every run.
@@ -52,19 +62,44 @@ def pi_to(prec):
     return _PI[prec]
 
 
+def chudnovsky_pi(digits):
+    """pi by the Chudnovsky series with integer binary splitting: nothing shared with Machin."""
+    from math import isqrt
+
+    def split(a, b):
+        if b - a == 1:
+            if a == 0:
+                pab = qab = 1
+            else:
+                pab = (6 * a - 5) * (2 * a - 1) * (6 * a - 1)
+                qab = a * a * a * 10939058860032000
+            tab = pab * (545140134 * a + 13591409)
+            return pab, qab, -tab if a % 2 else tab
+        m = (a + b) // 2
+        pam, qam, tam = split(a, m)
+        pmb, qmb, tmb = split(m, b)
+        return pam * pmb, qam * qmb, qmb * tam + pam * tmb
+
+    sys.setrecursionlimit(10000)
+    sys.set_int_max_str_digits(0)
+    guard = 30
+    terms = (digits + guard) // 14 + 2
+    _, q, t = split(0, terms)
+    scale = 10 ** (digits + guard)
+    return D((426880 * isqrt(10005 * scale * scale) * q) // t).scaleb(-(digits + guard))
+
+
+# The widest pi any row uses: the reduction of 5E+6143 at 250 digits and 40 guard digits.
+PI_WIDTH = 6500
+
+
 def pi_check():
-    """Brent-Salamin (Gauss-Legendre) against Machin, at 300 digits."""
+    """Machin's pi against Chudnovsky's, over the whole width the rows use."""
     with localcontext() as c:
-        c.prec = 330
-        a, b, t, p = D(1), D(1) / D(2).sqrt(), D(1) / 4, D(1)
-        for _ in range(12):
-            a_next = (a + b) / 2
-            b = (a * b).sqrt()
-            t -= p * (a - a_next) ** 2
-            a, p = a_next, 2 * p
-        gl = (a + b) ** 2 / (4 * t)
-        machin = pi_to(300)
-        assert abs(gl - machin) < D(10) ** -295, "pi disagrees"
+        c.prec = PI_WIDTH + 100
+        machin = pi_to(PI_WIDTH + 40)
+        chudnovsky = chudnovsky_pi(PI_WIDTH + 40)
+        assert abs(machin - chudnovsky) < D(10) ** -(PI_WIDTH + 30), "pi disagrees"
 
 
 def taylor_sincos(r, prec):
@@ -91,7 +126,9 @@ def sincos(x, prec=P):
     if x == 0:
         return D(0), D(1)
     adj = max(0, x.adjusted())
-    wide = prec + adj + 40
+    # a tiny operand below zero reduces to a hair under pi/2 (or 2 pi): its distance from the
+    # multiple needs the digits of the smallness as well
+    wide = prec + adj + 40 + max(0, -x.adjusted())
     with localcontext() as c:
         c.prec = wide
         half = pi_to(wide) / 2
@@ -105,25 +142,26 @@ def sincos(x, prec=P):
         return [(s, cs), (cs, -s), (-s, -cs), (-cs, s)][quadrant]
 
 
-def sincos_by_doubling(x, prec=P):
-    """The same by a different route: the series on r/256 and eight doublings."""
+def sincos_by_tripling(x, prec=P):
+    """The same by a route that shares neither the reduction nor the quadrants: reduced modulo
+    2 pi with the Chudnovsky pi, the series on r / 3^25, and 25 triple-angle steps."""
     if x == 0:
         return D(0), D(1)
     adj = max(0, x.adjusted())
-    wide = prec + adj + 40
+    extra = max(0, -x.adjusted())
+    wide = prec + adj + 60 + extra
     with localcontext() as c:
         c.prec = wide
-        half = pi_to(wide) / 2
-        q = (x / half).to_integral_value(rounding=ROUND_FLOOR)
-        r = x - q * half
-        quadrant = int(q % 4)
-    extra = max(0, -x.adjusted())
-    s, cs = taylor_sincos(r / 256, prec + 20 + extra)
+        two_pi = 2 * chudnovsky_pi(wide + 10)
+        q = (x / two_pi).to_integral_value(rounding=ROUND_FLOOR)
+        r = x - q * two_pi
+    steps = 25
+    s, cs = taylor_sincos(r / D(3) ** steps, prec + 40 + extra)
     with localcontext() as c:
-        c.prec = prec + 20 + extra
-        for _ in range(8):
-            s, cs = 2 * s * cs, cs * cs - s * s
-        return [(s, cs), (cs, -s), (-s, -cs), (-cs, s)][quadrant]
+        c.prec = prec + 60 + extra
+        for _ in range(steps):
+            s, cs = 3 * s - 4 * s ** 3, 4 * cs ** 3 - 3 * cs
+        return s, cs
 
 
 def atan(x, prec=P):
@@ -251,11 +289,11 @@ def checked(name, x, value):
     with localcontext() as c:
         c.prec = P + 60
         if name == "sin":
-            ok = close(value, sincos_by_doubling(x)[0])
+            ok = close(value, sincos_by_tripling(x)[0])
         elif name == "cos":
-            ok = close(value, sincos_by_doubling(x)[1])
+            ok = close(value, sincos_by_tripling(x)[1])
         elif name == "tan":
-            s, cs = sincos_by_doubling(x)
+            s, cs = sincos_by_tripling(x)
             ok = close(value, s / cs)
         elif name == "atan":
             ok = close(value, atan_by_newton(x))
@@ -276,8 +314,17 @@ def checked(name, x, value):
             else:
                 ok = close(value, (e - 1 / e) / 2, 150)
         elif name == "cosh":
-            e = x.exp()
-            ok = close(value, (e + 1 / e) / 2, 150)
+            # its own series
+            c.prec = max(c.prec, P + 60 + int(abs(x) / D("2.3")) + 40)
+            total, term, k = D(1), D(1), 0
+            limit = D(10) ** -(P + 60)
+            while True:
+                k += 1
+                term = term * x * x / ((2 * k - 1) * (2 * k))
+                total += term
+                if abs(term) < limit * total and k > abs(x):
+                    break
+            ok = close(value, total, 150)
         elif name == "tanh":
             ok = close(value, sinh(x) / cosh(x), 150)
         elif name == "asinh":
