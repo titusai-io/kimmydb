@@ -534,7 +534,11 @@ impl std::io::Write for ChunkWriter {
                 self.current = Vec::with_capacity(ANSWER_CHUNK_BYTES);
             }
             let room = ANSWER_CHUNK_BYTES - self.current.len();
-            let (now, later) = buf.split_at(room.min(buf.len()));
+            let take = room.min(buf.len());
+            // A chunk with no room left is pushed below before the next pass: if it is not, this
+            // fails rather than loops for ever.
+            assert!(take > 0, "the chunk writer made no progress");
+            let (now, later) = buf.split_at(take);
             self.current.extend_from_slice(now);
             buf = later;
             if self.current.len() == ANSWER_CHUNK_BYTES {
@@ -861,7 +865,11 @@ mod tests {
         // Read to its end but still alive (a connection kept open): nothing is held any more.
         let mut body = Body::new(HeldBody::new(Bytes::from_static(b"abc"), held(500)));
         assert_eq!(pool.used(), 500);
-        while body.frame().await.is_some() {}
+        let mut polls = 0;
+        while body.frame().await.is_some() {
+            polls += 1;
+            assert!(polls < 1_000, "a body of one piece does not end");
+        }
         assert_eq!(pool.used(), 0, "a body whose last frame went out holds nothing");
         drop(body);
 
@@ -902,6 +910,7 @@ mod tests {
             assert_eq!(data.as_ptr() as usize, start + offset);
             offset += data.len();
             sizes.push(data.len());
+            assert!(sizes.len() < 1_000, "a body of four pieces does not end");
             if offset < whole.len() {
                 assert_eq!(pool.used(), 900, "held while pieces are still to be taken");
                 assert!(!body.is_end_stream());
@@ -922,6 +931,7 @@ mod tests {
         let mut taken = Vec::new();
         while !body.is_end_stream() {
             taken.push(body.frame().await.unwrap().unwrap().into_data().unwrap());
+            assert!(taken.len() < 1_000, "a body of four pieces does not end");
         }
         assert_eq!(taken.len(), 4);
         drop(body);
@@ -951,6 +961,7 @@ mod tests {
         while let Some(frame) = body.frame().await {
             let data = frame.unwrap().into_data().unwrap();
             got.push((data.len(), data.as_ptr() as usize, data[0]));
+            assert!(got.len() < 1_000, "a body of three chunks does not end");
             if got.len() < 3 {
                 assert_eq!(pool.used(), 700, "held until the last chunk is taken");
             }
