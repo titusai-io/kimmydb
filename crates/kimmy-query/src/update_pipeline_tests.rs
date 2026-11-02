@@ -485,3 +485,16 @@ fn a_pipeline_update_is_not_a_replacement_or_operators() {
         update::parse_pipeline(&stages(vec![doc! {"$set": {"a": 2}}]), &[]).unwrap()
     );
 }
+
+#[test]
+fn an_update_pipeline_is_held_to_a_thousand_stages() {
+    let sets = |n: usize| vec![doc! {"$set": {"a": 1}}; n];
+    // A thousand apply; one more is refused before any stage is read, in the words of an
+    // update (the aggregation's say "a pipeline", and name `$facet` and sub-pipelines).
+    let out = apply(sets(1_000), doc! {"_id": 1}).unwrap();
+    assert_eq!(out, doc! {"_id": 1, "a": 1});
+    assert_eq!(
+        refused(sets(1_001)),
+        "invalid update: an update pipeline has 1001 stages, over the limit of 1000"
+    );
+}

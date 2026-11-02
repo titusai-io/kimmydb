@@ -37,6 +37,15 @@ impl UpdatePipeline {
     /// stage that is wrong inside is refused as it is in an aggregation. `$$NOW` is the
     /// request's one date (the parse joins the clock the request already opened).
     pub fn parse(stages: &[Bson]) -> Result<Self> {
+        // The same bound an aggregation has (`aggregate::MAX_PIPELINE_STAGES`), in the words
+        // of an update: refused before any stage is read.
+        if stages.len() > aggregate::MAX_PIPELINE_STAGES {
+            return Err(Error::InvalidUpdate(format!(
+                "an update pipeline has {} stages, over the limit of {}",
+                stages.len(),
+                aggregate::MAX_PIPELINE_STAGES
+            )));
+        }
         let _clock = crate::expr::RequestClock::open();
         let mut source = Vec::with_capacity(stages.len());
         for stage in stages {
