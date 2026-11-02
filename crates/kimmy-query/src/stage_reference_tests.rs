@@ -172,7 +172,7 @@ fn reference_sample_sections() {
         vec![doc! {"$sample": {"size": 5}}, doc! {"$group": {"_id": "$_id"}}, doc! {"$count": "n"}],
         stg(),
     );
-    assert_eq!(out[0].get("n").map(|n| n.as_i64().unwrap_or_default()), Some(5));
+    assert_eq!(out[0].get("n"), Some(&Bson::Int32(5)));
 }
 
 // --- $redact ----------------------------------------------------------------

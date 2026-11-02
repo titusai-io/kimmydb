@@ -1912,7 +1912,7 @@ mod tests {
     fn a_pipeline_update_logs_the_whole_result_as_one_replace_entry_per_changed_document() {
         let (engine, coll, _dir) = engine();
         engine.insert(&coll, doc! {"_id": 1_i64, "a": 1, "b": 10, "scratch": true}).unwrap();
-        engine.insert(&coll, doc! {"_id": 2_i64, "a": 2, "b": 20, "total": 22_i64}).unwrap();
+        engine.insert(&coll, doc! {"_id": 2_i64, "a": 2, "b": 20, "total": 22}).unwrap();
         let untouched = footprint(&engine, &coll, &[2]).records;
         let oplog = engine.oplog_entries().unwrap();
 
@@ -1922,7 +1922,8 @@ mod tests {
             doc! {"$unset": "scratch"},
         ]);
         let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
-        // Document 2 already holds exactly the result: it is not written.
+        // Document 2 already holds exactly the result, value and type (the sum of two ints
+        // is an int, ADR-268): it is not written. A `total` stored as a long would be.
         assert_eq!((out.matched, out.modified, out.commits), (2, 1, 1));
         assert_eq!(engine.oplog_entries().unwrap() - oplog, 1);
         assert_eq!(footprint(&engine, &coll, &[2]).records, untouched);
@@ -1933,7 +1934,7 @@ mod tests {
         assert_eq!(entry.kind, OpKind::Replace);
         assert_eq!(entry.doc_id, Some(DocId::Int64(1)));
         let body: Document = bson::deserialize_from_slice(entry.body.as_ref().unwrap()).unwrap();
-        assert_eq!(body, doc! {"_id": 1_i64, "a": 1, "b": 10, "total": 11_i64});
+        assert_eq!(body, doc! {"_id": 1_i64, "a": 1, "b": 10, "total": 11});
         // The body is byte for byte the stored one, in the key order stored.
         assert_eq!(
             bson::serialize_to_vec(&engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap()).unwrap(),
@@ -1950,9 +1951,10 @@ mod tests {
         let spec = Operators::pipeline(vec![doc! {"$set": {"sq": {"$multiply": ["$n", "$n"]}}}]);
         let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
         assert_eq!((out.matched, out.modified, out.commits), (3, 3, 1));
-        for (id, sq) in [(1_i64, 1_i64), (2, 4), (3, 9)] {
+        for (id, sq) in [(1_i64, 1), (2, 4), (3, 9)] {
             let stored = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
-            assert_eq!(stored.get_i64("sq").unwrap(), sq);
+            // The product of two ints is an int.
+            assert_eq!(stored.get_i32("sq").unwrap(), sq);
         }
     }
 
@@ -1975,6 +1977,32 @@ mod tests {
             assert_eq!(footprint(&engine, &coll, &[1]), before, "{stages:?}");
         }
         assert!(drain(&mut rx).is_empty());
+    }
+
+    /// The reference's rule (ADR-268): a document whose only change is a numeric width
+    /// IS modified, and the same value in the same type is not.
+    #[test]
+    fn a_change_of_numeric_width_alone_is_a_modification_and_the_same_type_is_not() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64, "n": 2_i64}).unwrap();
+        engine.insert(&coll, doc! {"_id": 2_i64, "n": 2}).unwrap();
+        engine.insert(&coll, doc! {"_id": 3_i64, "n": i32::MAX}).unwrap();
+        // `$toInt`: an int stays an int (not modified); a stored long 2 becomes the int 2.
+        let spec = Operators::pipeline(vec![doc! {"$set": {"n": {"$toInt": "$n"}}}]);
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        assert_eq!((out.matched, out.modified), (3, 1));
+        // The reference's pipeline-update cases: the chain over the int maximum is an int
+        // and writes nothing; `MAX + 1` is a long and writes.
+        let chain = Operators::pipeline(vec![doc! {"$set": {"n": {"$add": ["$n", 1, -1]}}}]);
+        let out = engine.modify_where(&coll, &Candidates::Scan, &chain, None).unwrap();
+        assert_eq!((out.matched, out.modified), (3, 0));
+        let grow = Operators::pipeline(vec![doc! {"$set": {"n": {"$add": ["$n", 1]}}}]);
+        let out = engine.modify_where(&coll, &Candidates::Scan, &grow, None).unwrap();
+        assert_eq!((out.matched, out.modified), (3, 3));
+        let stored = engine.get(&coll, &DocId::Int64(3)).unwrap().unwrap();
+        assert_eq!(stored.get_i64("n").unwrap(), i64::from(i32::MAX) + 1);
+        let stored = engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap();
+        assert_eq!(stored.get_i32("n").unwrap(), 3);
     }
 
     #[test]

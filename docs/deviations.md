@@ -39,6 +39,7 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 - **Integer sums are `Int64`.** `$sum` of integers in a window is a long here, as in `$group`; the reference answers an int that fits.
 - **`$addToSet` answers in the order its members first appear in the window.** The reference answers in sorted order once the window has dropped a document (and in the order of appearance before that); the order is unspecified in both.
 - **`$densify` after a `"full"` range** ends each partition's grid in ascending order of the partition values; the reference ends in a hash order. The generated count is held to the pipeline's 100,000 documents in all, with the input, where the reference holds the generated documents to 500,000; the bytes are held to the request's 256 MiB budget (`413`), where the reference has its own memory limit.
+- **A sliding window `$sum` is typed by what the window holds now, not by its history** (ADR-268). The reference's `RemovableSum` remembers: `$sum` of the longs `[LMAX, 1, 2]` over `[-1, 0]` is the long `LMAX`, then a **double** `9223372036854775808.0`, then the int `3`, so integer inputs can turn into a double and an int. Here the third window holds the longs `1` and `2` and the answer is the long `3`; any long in the window makes a long, any double a double, ints alone the narrowest width that holds the total, and a total past `Int64` is a double. A cumulative or whole-partition window is typed as a `$group` sum is, as the reference types it.
 - **The byte budget.** `$setWindowFields`, `$densify` and a `$fill` method hold what they buffer to the request's memory budget (`aggregate.memory_limit_bytes`, 1 GiB of BSON by default, ADR-269), shared with everything else the request holds, refused `413` as the total passes it. The reference spills to disk.
 - **Strictness.** A `documents` bound, a `$shift` `by` and a `range` bound with a `unit` must be whole numbers that fit 32 bits, as in the reference; a `range` bound of a date `unit` is refused for a fraction.
 
@@ -48,11 +49,10 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 
 ---
 
-## 🟡 The string, document and type operators: integer results are `Int64`, a few edge cases are read narrowly, and a missing value is told apart only where the reference makes it matter
+## 🟡 The string, document and type operators: a few edge cases are read narrowly, and a missing value is told apart only where the reference makes it matter
 
 **Raised 2026-10-31, with ADR-260.** `$trim`, `$ltrim`, `$rtrim`, `$indexOfCP`, `$indexOfBytes`, `$regexMatch`, `$regexFind`, `$regexFindAll`, `$replaceOne`, `$replaceAll`, `$strcasecmp`, `$strLenBytes`, `$substrBytes`, `$mergeObjects` (expression and accumulator), `$getField`, `$setField`, `$unsetField`, `$type` and `$isNumber` follow the reference; these are the differences.
 
-- **Integer results are `Int64`** (`$indexOfCP`, `$indexOfBytes`, `$strLenBytes`, `idx` of `$regexFind`), as the rest of the expression layer; the reference gives `Int32`. `$type` of a computed integer is therefore `"long"` where the reference says `"int"` (the entry on numbers above). `$strcasecmp` gives `Int32`, as `$cmp` does.
 - **The regex operators are not PCRE.** They use the `$regex` filter's engine: no backreferences or lookaround (a `400` when the pattern is parsed or evaluated), no atomic groups (`(?>)`), no `\Q..\E`, no `\Z`, `\G`, `\h` or `\R` (and no other PCRE escape outside `regex`'s syntax: `\H`, `\X`, `\K`, `\C`), which work in the reference, **no possessive quantifiers** (`a*+`, `a++`, `a?+`, `a{n,m}+`: the engine would read them as a repetition of a repetition, so `a*+a` would match `aa` where the reference matches nothing), a size limit per pattern, and a count shared with the pipeline's other patterns (32). The two refusals of the engine's own kind are a `400` naming the construct, in the `$regex` filter, the three operators, a `$jsonSchema` filter and a validator being set; a validator **already stored** whose pattern holds a possessive quantifier still loads, read as the repetition of a repetition it was read as before, so it keeps validating until it is replaced. The flags are `i`, `m`, `s`, `x` and `u` (`u` is accepted and changes nothing). `\d`, `\w`, `\s` and `\b` are ASCII, as the reference's are; the rest is Unicode, and `i` folds `é` with `É`, as the reference does. Under `i`, a `\w` written inside brackets (`[\w-]`) also takes in U+017F, which the reference's does not (it takes in U+212A there, as this does; outside brackets neither takes in either, here and there). `$` and `\Z` differ in the way the `$regex` filter's do (`$` matches only at the very end, not before a final newline). Matching is by code point, and `idx` counts code points. The same engine now reads `\d`, `\w` and `\s` as ASCII in the `$regex` filter and in a validator's `pattern`, which is a change from 0.58.0 (CHANGELOG, "Breaking").
 - **A computed `regex` is compiled per document** (the last pattern is kept), outside the pipeline's budget; each pattern is still bounded by the per-pattern size limit.
 - **`$strcasecmp` and `$substrBytes` coerce only strings, null and numbers** to text, a double as `%g` prints it, as the reference does. The reference also renders a date, a timestamp, code and a symbol; here those are a `400`.
@@ -63,9 +63,9 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 - **`$mergeObjects` with a single array operand** (`{"$mergeObjects": "$arr"}`) is a `400`, because an array is not a document, as the reference refuses it (`40400`).
 - **`$trim`'s default set** is the reference's list (see aggregation.md): it does not strip U+0085, U+2028, U+202F or U+3000, and nor does this.
 
-**Why.** The first is the standing choice of the layer; the rest refuse or choose narrowly where the reference's behaviour cannot be honoured, or is not worth honouring (invalid UTF-8). Every case the review ran against a reference server is in `q8-probes/`, and the delta review re-runs it.
+**Why.** These refuse or choose narrowly where the reference's behaviour cannot be honoured, or is not worth honouring (invalid UTF-8). The integer results of `$indexOfCP`, `$indexOfBytes`, `$strLenBytes` and `idx` of `$regexFind` are `Int32`, as the reference's are ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)); they were `Int64` until 0.59.0. Every case the review ran against a reference server is in `q8-probes/`, and the delta review re-runs it.
 
-**What it costs.** A pipeline ported from the reference server that relies on a backreference, a possessive quantifier, a date coerced to a string by `$strcasecmp`, or an `Int32` result type will be refused or differ.
+**What it costs.** A pipeline ported from the reference server that relies on a backreference, a possessive quantifier or a date coerced to a string by `$strcasecmp` will be refused or differ.
 
 ---
 
@@ -75,7 +75,7 @@ The reference streams documents through a pipeline into 16 MB cursor batches, ho
 
 - **`$stdDevPop`/`$stdDevSamp` convert a `Decimal128` to the nearest double** before accumulating, so a decimal with more than 15 significant digits can differ from the reference in the last printed digit of the double result.
 - **`n` is one value for the group.** An `n` that needs no document is read to a constant when the pipeline is parsed, and checked for a group when its first document arrives, so a bad constant `n` over no input answers `[]` and no error, as the reference does. An `n` that reads a document field reads it as missing and is refused for the group, as the reference refuses it. The messages differ.
-- **`$count` answers an int** (a long past 2^31-1), as `{$sum: 1}` does in the reference, whereas this server's `$sum: 1` answers a long.
+- **`$count` answers an int** (a long past 2^31-1), as `{$sum: 1}` does in the reference and in this server since ADR-268.
 - **The array forms of `$firstN`, `$lastN`, `$maxN`, `$minN`, `$stdDevPop` and `$stdDevSamp`** (as `$project` or `$addFields` expressions) answer as the reference does in every probed case (65 for the four `N` forms, 32 operand shapes for `$stdDev*`): an `input` that is not an array, `null` and missing included, is refused, `n` is read first, and `$stdDev*` reads a single operand that is an array as its elements and any other list as the operands. The error texts differ.
 - **`$sum`, `$avg`, `$stdDevPop` and `$stdDevSamp` in a `$group` refuse an array literal of any length but one** (`The $stdDevPop accumulator is a unary operator`, as the reference refuses `$stdDevPop: [1, 2]`). `$sum` and `$avg` answered `0` and `null` for a list before. A list of one element is not probed and stays an array expression. A breaking change for a pipeline that passed a list.
 - **An empty `sortBy`** in `$bottom`/`$bottomN` keeps the first arrivals, as `$top` does, and an empty array inside a sort key (`[[]]`) is an ordinary array below `[[1]]`: both are probed and match.
@@ -136,7 +136,7 @@ Also recorded here, so they are not read as bugs:
 
 ---
 
-## 🟡 Pipeline updates: an upsert may not give the inserted document an `_id`, and the expression layer's integer width
+## 🟡 Pipeline updates: an upsert may not give the inserted document an `_id`
 
 **Raised 2026-10-31, with ADR-265; revised 2026-11-01 after the reference's answers.** An `update` that is an array of stages is built ([query-language.md](query-language.md#pipeline-updates)). Where it differs from the reference:
 
@@ -144,11 +144,10 @@ Also recorded here, so they are not read as bugs:
 - **An upsert's pipeline cannot give the inserted document an `_id` the filter did not name**, `400`, as `$set: {_id: ...}` is refused for operators; the reference inserts it with that `_id`.
 - **A positional projection with `returnDocument: "after"` on `find_and_modify` is `400` with a pipeline update**; the reference refuses it too (`cannot use a positional projection and return the new document`), in its own words. `arrayFilters` with an array update is `400`, as there; an empty list is accepted, as there.
 - **A path that is missing leaves the field out**, as in the reference: `{$set: {p: "$nope"}}` adds nothing when `p` is absent and **removes** an existing `p`; `{"o.p": "$nope"}` leaves `o: {}`; the same for computed fields of `$project` and `$replaceWith`, and for a key of an embedded object expression. Inside an array it is `null`, as there. (Before this release it stored `null`.)
-- **Integer arithmetic stores an `Int64`.** The expression layer's integer results are `Int64` (the entry on numbers), so `$set: {n: {$add: ["$n", 1]}}` over an `Int32` field stores a long, and `{$set: {total: {$add: ["$a", "$b"]}}}` over an equal `Int32` `total` counts as a change (`modified` counts it); the reference keeps `Int32` and counts nothing. Moving the expression layer to the reference's result widths is a separate piece of work.
 - **The result is stored whole.** A pipeline that leaves the document byte-equal (including key order and number types) is a no-op; one that changes a number's type (`1` to `1.0`) is a change, as for operators.
 - **An `_id` refusal is raised when the update runs** (the result is known only then), with the other write-time refusals, not when the body is parsed.
 
-**To close:** none planned beyond the integer width.
+**To close:** none planned.
 
 ---
 
@@ -159,7 +158,7 @@ Also recorded here, so they are not read as bugs:
 - **`$unionWith` of the `$merge`/`$out` target (self-read refusal) is refused here at parse; the reference runs it to completion** (`$merge` merges the union into the target, `$out` replaces it; the `Cursor is exhausted` an earlier probe showed was the shell's message after the server had finished). A pipeline that reads what it writes has no answer here (each stage reads storage when it runs), so the `$lookup` and `$graphLookup` self-read rule is applied: `400` before anything is read or written, at any depth of sub-pipeline. This is a pure deviation, not a difference in when the same failure happens.
 - **`$unionWith` is held to the pipeline's document limit on what it reads** (100,000, `400` at the first document over, as `$lookup`'s foreign read is; a leading `$match` of the sub-pipeline is applied as it is read), and **the documents it appends are held to 16 MiB** (`413`), a cap the reference does not have; what is scanned is never charged in bytes. The sub-pipeline refuses `$out`, `$merge` and `$vectorSearch`, as the reference does (it accepts a `$facet`, and so does this). The pipeline-only form (`coll` left out, for a `$documents` source) is `400`: there is no `$documents` stage.
 - **`$sample` samples what the pipeline already holds.** The input of every pipeline is held to the document limit (100,000 documents; a leading `$match` is applied first), so a collection over that cannot be sampled (`400`, `the source collection admits more than 100000 documents`); the reference serves it with a random cursor. This is the general pipeline limit and applies to every pipeline's input, `$sample` included. A `size` over the input is the whole input, in a random order (the reference's answer too). `size` is truncated toward zero for a double, rounded half to even for a decimal, `0` and `NaN` answer nothing, and a negative is `400`, as there. The order of the sample is random, as there; it has no byte cap of its own.
-- **`$sortByCount` orders ties by first appearance** of the value; the reference's order of equal counts is unspecified (two of its runs differ), and so is this build's. Its `count` is an int, as the reference's; `$group`'s `{$sum: 1}` is a long here and an int there (the entry on numbers).
+- **`$sortByCount` orders ties by first appearance** of the value; the reference's order of equal counts is unspecified (two of its runs differ), and so is this build's. Its `count` is an int, as the reference's, and as `$group`'s `{$sum: 1}` is since ADR-268.
 - **Refusal wording differs** from the reference's in the stages' errors (`$replaceWith` of a non-document says `$replaceRoot needs a document`, the reference `'replacement document' must evaluate to an object ...`; `$unset`'s path collisions and bad paths are named in this build's words). The set of refusals is the reference's, including `$$DESCEND`, `$$PRUNE` and `$$KEEP` outside `$redact` (`Use of undefined variable: PRUNE`, which this build's message begins with) and `$$CLUSTER_TIME`, `$$USER_ROLES` and `$$SEARCH_META` on a single server. Inside `$redact` the three are the strings `"descend"`, `"prune"` and `"keep"`, so a string of that spelling has the effect of the variable, as there.
 - **`$unset` refuses the same path twice and a path inside another** (`["a", "a.b"]`), and a path part that starts with `$` or is empty, `400`, as the reference does (`Path collision at a`).
 - **`$cond` also takes its named form** `{if, then, else}` (all three required), which a `$redact` expression is usually written in; it was not accepted before.
@@ -342,9 +341,12 @@ differ from other systems' versions of the same names:
   is `2.67499999999999982…`, and `{$round: [0.125, 2]}` is `0.12`. A system that
   rounds a double through its shortest text answers `2.68` for the first. The
   rule is ADR-252's for a double meeting a decimal: its value is the exact one.
-- **An integer result is always `Int64`**, an `Int32` argument included, as in the rest of the arithmetic;
-  a result past `Int64` (`$pow: [2, 63]`, `$abs` of the
-  smallest `Int64`, `$round` rounding up past it) is a double.
+- **`$round` of an `Int32` at the bottom of the range is the correct long.**
+  `{$round: [-2147483648, -1]}` is the long `-2147483650` here; the reference
+  answers the int `2147483646`, a `static_cast` wrap that checks only the top of
+  the range (ADR-268). The widths of every other integer result are the
+  reference's, and `$abs` of the smallest `Int64`, `$round` of an `Int64` rounded
+  up past `Int64` and a `$range` bound past `Int32` are `400`, as there.
 - **A negative base to a power that is not a whole number is `400`**, where a
   math library answers `NaN`. So are `$sqrt` of a negative number and `$ln` and
   `$log10` of zero or less; a `NaN` argument gives `NaN`, and the refusal is for
@@ -975,8 +977,8 @@ follow the expression layer's standing rule — *null propagates, a type violati
 refuses* — and in six places that is a strict superset of MongoDB, which
 errors instead.
 
-**Ruled 2026-09-29, all five points in this entry kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).**
-The null leniency, the missing-versus-null difference, `$range`'s `Int64`,
+**Ruled 2026-09-29, four of the five points in this entry kept, and the fifth, `$range`'s `Int64`, superseded by [ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width) ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).**
+The null leniency, the missing-versus-null difference,
 the closed key sets and the refused combined `$lookup` each stay, and each is
 stated plainly in [aggregation.md](aggregation.md#arrays) and below. Nothing
 here is scheduled to change.
@@ -999,12 +1001,10 @@ not get it. A pipeline that wants the error tests for the bad value instead,
 for example `{"$match": {"$expr": {"$eq": [{"$isArray": "$tags"}, false]}}}`
 finds the documents whose `tags` is not an array, a missing one included.
 
-**Three smaller divergences, same entry.** `$arrayElemAt` out of range and
+**Two smaller divergences, same entry.** `$arrayElemAt` out of range and
 `$first`/`$last` on an empty array are **null** rather than MongoDB's *missing*
 — an expression here always yields a value, and a projected field is therefore
-present with null rather than absent. `$range` produces `Int64` elements where
-MongoDB produces `Int32`, as every integer result of the expression layer does
-(see the module notes on numbers). And `$filter`, `$map`, `$reduce` and `$let`
+present with null rather than absent. And `$filter`, `$map`, `$reduce` and `$let`
 **refuse a key they do not know** (`condition` for `cond`), where MongoDB
 ignores it; that is stricter, and only turns a silently wrong pipeline into an
 error (`{"$filter": {"input": "$items", "condition": …}}` is a `400` naming
@@ -1024,12 +1024,12 @@ the following stage, which keeps the single pass. Closing this would mean
 combining the indexed pass with the per-document loop; not planned until
 someone needs it.
 
-**`$range` and the other integer results.** A result of the expression
-language that is an integer is an `Int64`, `$range`'s elements included, so
-`{$type: {$arrayElemAt: [{$range: [0, 3]}, 0]}}` is `"long"` here and `"int"`
-there. The numbers are the same; what differs is `$type`, a `$switch` on it,
-and a typed client that reads the element into a 32-bit field. Kept, with the
-rule it follows.
+**`$range` and the other integer results** are the reference's widths since
+ADR-268 (0.59.0): `$range`'s elements, `$size` and `$indexOfArray` are `Int32`,
+where they were `Int64`, and a `$range` bound or step past `Int32` is a `400`, as
+there (the earlier ruling that kept `$range`'s `Int64` is superseded; nothing here
+differs from the reference any more). Nothing is migrated: a stored value keeps its
+own type.
 
 **Missing is null in an expression.** `{$addFields: {head: {$first:
 "$lines"}}}` over a document whose `lines` is `[]` writes `head: null`, where
