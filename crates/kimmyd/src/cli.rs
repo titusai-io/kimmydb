@@ -360,10 +360,10 @@ impl Overrides {
             cfg.server.max_body_bytes = bytes;
         }
         if let Some(bytes) = self.aggregate_memory_limit_bytes {
-            cfg.aggregate.memory_limit_bytes = bytes;
+            cfg.aggregate.memory_limit_bytes = Some(bytes);
         }
         if let Some(bytes) = self.aggregate_memory_pool_bytes {
-            cfg.aggregate.memory_pool_bytes = bytes;
+            cfg.aggregate.memory_pool_bytes = Some(bytes);
         }
         if let Some(burst) = self.rate_limit_per_principal {
             cfg.server.rate_limit.per_principal = burst;
@@ -658,16 +658,20 @@ mod tests {
         ]);
         let mut cfg = Config::default();
         cli.overrides.apply(&mut cfg).unwrap();
-        assert_eq!(cfg.aggregate.memory_limit_bytes, 128 << 20);
-        assert_eq!(cfg.aggregate.memory_pool_bytes, 256 << 20);
+        assert_eq!(cfg.aggregate.memory_limit_bytes, Some(128 << 20));
+        assert_eq!(cfg.aggregate.memory_pool_bytes, Some(256 << 20));
 
         let cli = parse(&[]);
         let mut cfg = Config::default();
-        cfg.aggregate.memory_limit_bytes = 64 << 20;
-        cfg.aggregate.memory_pool_bytes = 96 << 20;
+        cfg.aggregate.memory_limit_bytes = Some(64 << 20);
+        cfg.aggregate.memory_pool_bytes = Some(96 << 20);
         cli.overrides.apply(&mut cfg).unwrap();
-        assert_eq!(cfg.aggregate.memory_limit_bytes, 64 << 20);
-        assert_eq!(cfg.aggregate.memory_pool_bytes, 96 << 20);
+        assert_eq!(cfg.aggregate.memory_limit_bytes, Some(64 << 20));
+        assert_eq!(cfg.aggregate.memory_pool_bytes, Some(96 << 20));
+        // Unset on both sides stays unset: the figures are derived at startup.
+        let mut cfg = Config::default();
+        parse(&[]).overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.aggregate, Default::default());
     }
 
     #[test]

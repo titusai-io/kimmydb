@@ -65,8 +65,8 @@ fails fast on a bad volume mount.
 | `server.rate_limit.per_principal_window_secs` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS` | `60` | |
 | `server.request_timeout_secs` | `KIMMY_REQUEST_TIMEOUT_SECS` | `30` | Deadline for a request still waiting for its body, for an embedding provider, or for the lookup of a webhook's or provider's host; `503 timeout` past it. Not a query timeout — storage work already running completes. Change streams and `GET /v1/admin/backup` are exempt. An `/mcp` tool call has the same deadline (a write that cannot take the storage writer in time is answered as a tool result, `isError: true` with `error: timeout`, `retry: wait`, nothing written), and it covers the request body and the call together (a call gets what the body left; a body still arriving at the deadline is answered `503 timeout`) |
 | `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced. Decided first, while the body is read: a document that a small body would grow past 16 MiB is refused after it, `413 document_too_large` ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)) |
-| `aggregate.memory_limit_bytes` | `KIMMY_AGGREGATE_MEMORY_LIMIT_BYTES` | `1073741824` | The most BSON bytes one aggregation may hold at once: the documents it reads, each stage's input and output while the stage runs, the groups and joined arrays it builds, and its answer ([Aggregation](aggregation.md#what-one-request-may-hold-in-bytes)). Over it, `413 answer_too_large` naming what held the memory, at the first byte over. At least 1 MiB. **Breaking in 0.59.0**: a pipeline whose held bytes pass 1 GiB ran before and is refused now |
-| `aggregate.memory_pool_bytes` | `KIMMY_AGGREGATE_MEMORY_POOL_BYTES` | `2147483648` | The most BSON bytes all aggregations on this node may hold together. A request reserves from it as its own total grows and returns it when it ends; one the pool cannot cover is answered `503 timeout` with `retry: wait` and `Retry-After: 1`. At least `aggregate.memory_limit_bytes`. See [Aggregation memory](#aggregation-memory) for sizing |
+| `aggregate.memory_limit_bytes` | `KIMMY_AGGREGATE_MEMORY_LIMIT_BYTES` | half the pool | The most BSON bytes one aggregation may hold at once: the documents it reads, each stage's input and output while the stage runs, the groups and joined arrays it builds, and its answer ([Aggregation](aggregation.md#what-one-request-may-hold-in-bytes)). Over it, `413 answer_too_large` naming what held the memory, at the first byte over. At least 1 MiB. **Unset, it is derived** (see [Aggregation memory](#aggregation-memory)); an explicit value wins. **Breaking in 0.59.0**: a pipeline whose held bytes pass the limit ran before and is refused now |
+| `aggregate.memory_pool_bytes` | `KIMMY_AGGREGATE_MEMORY_POOL_BYTES` | a tenth of the memory | The most BSON bytes all aggregations on this node may hold together. A request reserves from it as its own total grows and returns it when it ends; one the pool cannot cover is answered `503 timeout` with `retry: wait` and `Retry-After: 1`. At least `aggregate.memory_limit_bytes`. **Unset, it is a tenth of the container's memory limit** (cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`) **or, with none, of the machine's RAM**; the startup log says which. See [Aggregation memory](#aggregation-memory) |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
 | `vector.index_cache.max_bytes` | — | `536870912` | Bound on the HNSW graphs kept in memory across vector collections, least recently searched evicted first. About `dim × 4 + 5,000` bytes per chunk (6.5 KB at 384 dimensions, 11 KB at 1,536); size it so the routinely searched collections fit, or their searches pay a rebuild. A single graph over the whole bound is held anyway. `0` lifts the bound (ADR-103) |
 | `vector.index_cache.build_concurrency` | — | `1` | How many HNSW graphs are built at once, on builder threads off the request path (ADR-245). A search of a collection whose graph is being built is answered by the graph it had, or by an exact scan under `server.request_timeout_secs`. A build is CPU and memory bound (a 100,000 × 384 graph peaks at about 1.3 GiB), and the first start of 0.52.0 asks for every collection's, so they queue. At least `1`. 0.51.x refuses a configuration that names it: remove it before rolling back |
@@ -130,24 +130,37 @@ A pipeline holds its documents whole, so one aggregation can hold more than a me
 thousand documents each given an 8 MiB string by `$addFields` are 8 GB, and every value of
 it is legal. Two settings bound it ([ADR-269](decisions.md)), both in BSON bytes:
 
-- **`aggregate.memory_limit_bytes`** (1 GiB) is what **one request** may hold at once. Over it the
+- **`aggregate.memory_limit_bytes`** is what **one request** may hold at once. Over it the
   request is refused `413 answer_too_large`, naming what held the memory (the source read, a stage's
   output, a join, the answer), the bytes and the limit. It is a fact about the request: sending it
   again changes nothing until the pipeline asks for less (`$match`, `$project` or `$limit` early) or
   the limit is raised.
-- **`aggregate.memory_pool_bytes`** (2 GiB) is what **all aggregations on the node** may hold together.
+- **`aggregate.memory_pool_bytes`** is what **all aggregations on the node** may hold together.
   A request takes from it as it grows and returns it however it ends; an answer still being sent keeps its bytes until the last of them is written. One that finds it empty is
   refused `503 timeout`, `retry: wait`, `Retry-After: 1`: nothing was done, and the same request
   is answered when the others have finished.
 
-**Sizing.** The unit is BSON bytes, which is the memory of a long string to within a few bytes and
-a fraction of the memory of a document of many small fields (a parsed document takes 10 to 20 times
-its encoded size). Take the memory you can give aggregations, divide by about 4 for the parsed
-overhead and by the two copies a stage holds, and that is the pool; the request limit is the share of
-it you are willing to give one caller, usually a half or a quarter. The default pool of 2 GiB is
-for a member with 8 GiB or more: `storage.cache_bytes` (256 MiB) and `vector.index_cache.max_bytes`
-(512 MiB) are separate. A member with less should lower both; **the pool must be at least the limit**.
-`kimmy_aggregate_memory_pool_used_bytes` is the pool in use now, and a rise in
+**The defaults are derived, not fixed.** The budget counts encoded BSON while the memory a
+request really takes is 2.5 to 5 times that (and more for documents of many small fields), so a
+fixed 1 GiB a request would end a member in a 2 GiB container. Unset, the settings are worked out at
+startup from the memory the process may use: the container's memory limit (cgroup v2
+`/sys/fs/cgroup/memory.max`, else cgroup v1 `/sys/fs/cgroup/memory/memory.limit_in_bytes`; `max`, an
+unreadable value and a limit above the machine's RAM are no limit), else the machine's RAM
+(`MemTotal`), else 2 GiB assumed. **The pool is a tenth of it and one request may hold half the pool**
+(at least 2 MiB and 1 MiB). A 2 GiB container gets a pool of 214,748,364 bytes (about 200 MiB) and
+107,374,182 a request; a member with 8 GiB of RAM and no limit, about 820 MiB and 410 MiB. The startup
+log has the summary (`aggregate=[limit=..B pool=..B]`) and an `INFO` line, `aggregate memory: pool ..
+bytes (derived from the cgroup memory limit in ..), per-request limit .. bytes (..)`, that says where
+each figure came from: the cgroup file, the RAM, or set explicitly. **An explicit value always wins**
+(the file, the environment or a flag); set alone, a limit raises the derived pool to at least that
+limit, and a pool alone gives half of it to a request. A limit under 1 MiB, a pool under 1 MiB, or a
+pool under an explicit limit is refused at startup.
+
+**Sizing.** Raise them only knowing what a request costs: take the memory you can give
+aggregations, divide by about 4 for the parsed overhead and by the two copies a stage holds, and that
+is the pool; the request limit is the share of it you are willing to give one caller, usually a half
+or a quarter. `storage.cache_bytes` (256 MiB) and `vector.index_cache.max_bytes` (512 MiB) are
+separate. `kimmy_aggregate_memory_pool_used_bytes` is the pool in use now, and a rise in
 `kimmy_aggregate_memory_pool_refusals_total` is more concurrent large aggregations than the pool
 holds; `kimmy_aggregate_memory_limit_refusals_total` is pipelines that need more than a request may
 have. A pipeline that ran under 0.58 and holds more than the limit is refused now: that is the
@@ -182,8 +195,8 @@ runtime confusion:
 | `max_tracked_keys = 0` | A limiter that can remember nothing cannot limit anything |
 | `request_timeout_secs = 0` | A deadline of zero would abandon every request that has to wait for its own body |
 | `max_body_bytes = 0` | A ceiling of zero refuses every request that carries a body, login included |
-| `aggregate.memory_limit_bytes` under 1 MiB | A limit that small refuses a pipeline of a few documents |
-| `aggregate.memory_pool_bytes` under `aggregate.memory_limit_bytes` | A pool smaller than one request's limit would refuse a request that is within its own |
+| `aggregate.memory_limit_bytes` | `KIMMY_AGGREGATE_MEMORY_LIMIT_BYTES` | half the pool | The most BSON bytes one aggregation may hold at once: the documents it reads, each stage's input and output while the stage runs, the groups and joined arrays it builds, and its answer ([Aggregation](aggregation.md#what-one-request-may-hold-in-bytes)). Over it, `413 answer_too_large` naming what held the memory, at the first byte over. At least 1 MiB. **Unset, it is derived** (see [Aggregation memory](#aggregation-memory)); an explicit value wins. **Breaking in 0.59.0**: a pipeline whose held bytes pass the limit ran before and is refused now |
+| `aggregate.memory_pool_bytes` | `KIMMY_AGGREGATE_MEMORY_POOL_BYTES` | a tenth of the memory | The most BSON bytes all aggregations on this node may hold together. A request reserves from it as its own total grows and returns it when it ends; one the pool cannot cover is answered `503 timeout` with `retry: wait` and `Retry-After: 1`. At least `aggregate.memory_limit_bytes`. **Unset, it is a tenth of the container's memory limit** (cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`) **or, with none, of the machine's RAM**; the startup log says which. See [Aggregation memory](#aggregation-memory) |
 | Exactly one of `server.tls.cert_file` / `key_file` | The node would start and serve plaintext on a port an operator believes is encrypted |
 | A TLS certificate or key that is missing or unreadable | The failure would otherwise land on the first client to connect, not on the operator watching the boot |
 | An empty `trusted_proxy_header` | Reads as a header whose name is empty, so it never matches — an operator would believe forwarding was configured when it was not |

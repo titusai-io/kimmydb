@@ -653,7 +653,7 @@ values only, with the non-finite ones counted and the state rebuilt from the win
 removals (at once for a window of 16 or fewer) to bound the drift of subtracting. What an answer costs is
 what it holds: a `$push` over a window of `w` documents is an array of `w`. The stage holds every
 document of its input, every sort key it takes and every value it adds against **the request's memory
-budget** (`aggregate.memory_limit_bytes`, 1 GiB; see [The memory limit](#the-memory-limit)), shared with everything
+budget** (`aggregate.memory_limit_bytes`, derived from the container's memory; see [The memory limit](#the-memory-limit)), shared with everything
 else the request holds,
 refused `413 answer_too_large` as soon as the running total passes it (a cumulative `$push` whose output is quadratic is
 refused while it is built). Inside a `$facet` and a `$lookup` sub-pipeline like any stage.
@@ -2144,7 +2144,7 @@ examined or read.
                 "stages": 1, "maxDocuments": 100000 },
     "stages": [ { "stage": "$group", "runs": "inMemory",
                   "detail": "groups everything that reaches it in memory; blocking, ..." } ],
-    "memory": { "limitBytes": 1073741824, "poolBytes": 2147483648, "poolUsedBytes": 0 } } }
+    "memory": { "limitBytes": 107374182, "poolBytes": 214748364, "poolUsedBytes": 0 } } }
 ```
 
 `memory` is what a run may hold (`aggregate.memory_limit_bytes`) and how much of the node's pool
@@ -2220,7 +2220,7 @@ becoming slow in a way that is harder to diagnose than a refusal.
 
 The document count above does not bound a pipeline's memory: a thousand documents each given
 an 8 MiB string by `$addFields` are a thousand legal documents and 8 GB. **Everything a request
-holds is charged, in BSON bytes, to one budget of `aggregate.memory_limit_bytes` (1 GiB by default)**
+holds is charged, in BSON bytes, to one budget of `aggregate.memory_limit_bytes` (half the pool by default; about 100 MiB in a 2 GiB container)**
 as it grows, and the request is refused `413 answer_too_large` at the first byte over, naming what held the memory:
 
 | What | Charged | Until |
@@ -2241,7 +2241,7 @@ and the limit, and says what to do: `add $match, $project or $limit early, or ra
 expression builds, are unchanged: they are per value.
 
 **The node's pool.** Requests also draw on a pool shared by every aggregation on the node,
-`aggregate.memory_pool_bytes` (2 GiB by default): a request reserves from it as its own total
+`aggregate.memory_pool_bytes` (a tenth of the container's memory limit, or of the RAM, by default): a request reserves from it as its own total
 grows and returns it when it ends, however it ends (an answer, a refusal, the request deadline,
 a panic). A request the pool cannot cover (the node's aggregation memory pool is in use) is refused `503 timeout` with `retry: wait` and
 `Retry-After: 1`: it is within its own limit, nothing was done, and the same request is answered when

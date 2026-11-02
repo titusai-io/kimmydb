@@ -248,19 +248,23 @@ commit_coalesce_ms = 5
 # reads, each stage's input and output while the stage runs, the groups and
 # joined arrays it builds, and its answer.
 [aggregate]
+# Neither setting has a fixed default: unset, both are worked out at startup from the
+# memory the process may use (the container's memory limit, cgroup v2 `memory.max` or v1
+# `memory.limit_in_bytes`, else the machine's RAM), and the startup log says from what.
+# The budget counts encoded BSON while the memory a request really takes is 2.5 to 5
+# times that, so the pool is a tenth of the memory and a request may hold half the pool:
+# a 2 GiB container gets a pool of about 200 MiB and about 100 MiB a request. Setting
+# either (here, KIMMY_AGGREGATE_MEMORY_* or the flags) overrides it.
+
 # The most bytes ONE request may hold at once. Over it the request is refused
-# 413 `answer_too_large`, naming what held the memory. At least 1 MiB.
-#
-# Counted in BSON bytes, which is the memory of a long string and a fraction of
-# the memory of a document of many small fields (10 to 20 times its size as a
-# parsed document): size the pool for that.
-memory_limit_bytes = 1073741824
+# 413 `answer_too_large`, naming what held the memory. At least 1 MiB. Unset: half the pool.
+# memory_limit_bytes = 104857600
 
 # The most bytes ALL aggregations on this node may hold together. A request takes
 # from it as it grows and returns it when it ends; one the pool cannot cover is
 # refused 503 `timeout` (`retry: wait`, `Retry-After: 1`) and is answered when
-# the others have finished. At least memory_limit_bytes.
-memory_pool_bytes = 2147483648
+# the others have finished. At least memory_limit_bytes. Unset: a tenth of the memory.
+# memory_pool_bytes = 209715200
 
 
 [auth]
