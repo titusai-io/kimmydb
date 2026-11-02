@@ -2652,9 +2652,10 @@ fn run_stages(
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
-    let run =
-        |stage: &aggregate::Stage, docs| run_stage(state, auth, db, stage, docs, limits, vars);
-    let mut chain = pipeline::build(stages, &run);
+    let run = |stage: &aggregate::Stage, docs, arrived| {
+        run_stage(state, auth, db, stage, docs, arrived, limits, vars)
+    };
+    let mut chain = pipeline::build(stages, &run, limits, vars);
     // The input is already in memory, whole (the source, a `$facet` branch's copy, a
     // `$lookup` or `$unionWith` sub-pipeline's documents), and goes in as it is: there is no
     // scan to stop, so the answer of the push is not needed.
@@ -2664,13 +2665,17 @@ fn run_stages(
 
 /// One stage on all of its input: the stages that hold a storage handle (the two `$lookup`
 /// forms, `$graphLookup`, `$unionWith`) and `$facet` go to the functions here, everything
-/// else to the pure pipeline.
+/// else to the pure pipeline. `arrived` is the lease that charged the input as it was
+/// collected one document at a time, if it was (ADR-270): the stage takes it as the hold on
+/// its input and does not charge the same bytes again.
+#[allow(clippy::too_many_arguments)]
 fn run_stage(
     state: &SharedState,
     auth: &Auth,
     db: &str,
     stage: &aggregate::Stage,
     docs: Vec<bson::Document>,
+    arrived: Option<Lease>,
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
@@ -2680,7 +2685,7 @@ fn run_stage(
             as_field,
             join: aggregate::Join::Equality { local_field, foreign_field },
         } => {
-            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            let mut held = aggregate::Held::enter_with(stage, &docs, limits, arrived)?;
             lookup(
                 state,
                 auth,
@@ -2699,7 +2704,7 @@ fn run_stage(
             as_field,
             join: aggregate::Join::Pipeline { vars: let_vars, stages: sub, lead },
         } => {
-            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            let mut held = aggregate::Held::enter_with(stage, &docs, limits, arrived)?;
             lookup_pipeline(
                 state,
                 auth,
@@ -2716,20 +2721,22 @@ fn run_stage(
             )?
         }
         aggregate::Stage::GraphLookup(spec) => {
-            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            let mut held = aggregate::Held::enter_with(stage, &docs, limits, arrived)?;
             graph_lookup(state, auth, db, spec, docs, limits, vars, &mut held.output)?
         }
         aggregate::Stage::UnionWith(spec) => {
-            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            let mut held = aggregate::Held::enter_with(stage, &docs, limits, arrived)?;
             union_with(state, auth, db, spec, docs, limits, vars, &mut held.output)?
         }
         aggregate::Stage::Facet(facets) => {
+            // `$facet` charges its input itself.
+            drop(arrived);
             let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
                 run_stages(state, auth, db, sub, input, limits, vars)
             })?;
             vec![answer]
         }
-        other => aggregate::apply_with_vars(other, docs, limits, vars)?,
+        other => aggregate::apply_charged(other, docs, limits, vars, arrived)?,
     })
 }
 

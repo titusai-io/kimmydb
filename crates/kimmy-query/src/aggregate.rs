@@ -3426,6 +3426,33 @@ mod tests {
     }
 
     #[test]
+    fn a_long_run_of_stages_that_stream_answers_what_the_loop_answers() {
+        // The order the stages run in is not visible in the answer of a pipeline that cannot
+        // fail: a long run of them is the same documents.
+        let mut specs = Vec::new();
+        for at in 0..400 {
+            specs.push(match at % 4 {
+                0 => doc! {"$addFields": {format!("f{at}"): at}},
+                1 => doc! {"$skip": 0},
+                2 => doc! {"$match": {"qty": {"$gte": 0}}},
+                _ => doc! {"$unset": format!("f{}", at - 3)},
+            });
+        }
+        let stages = parse(&specs).unwrap();
+        let run = |stage: &Stage, input, arrived| {
+            apply_charged(stage, input, &Limits::default(), &[], arrived)
+        };
+        let limits = Limits::default();
+        let mut chain = crate::pipeline::build(&stages, &run, &limits, &[]);
+        let _more = chain.push_all(sample()).unwrap();
+        let mut want = sample();
+        for stage in &stages {
+            want = apply(stage, want, &Limits::default()).unwrap();
+        }
+        assert_eq!(chain.finish().unwrap(), want);
+    }
+
+    #[test]
     fn match_then_count() {
         let out =
             run(vec![doc! {"$match": {"city": "London"}}, doc! {"$count": "n"}], sample()).unwrap();

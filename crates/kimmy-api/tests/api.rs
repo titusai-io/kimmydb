@@ -20729,8 +20729,10 @@ async fn an_aggregation_over_its_memory_limit_is_a_413_at_a_bounded_size() {
     assert_eq!(refused.body["error"], "answer_too_large", "{:?}", refused.body);
     assert_eq!(refused.body["retry"], "no", "{:?}", refused.body);
     let message = refused.body["message"].as_str().unwrap();
-    // It names what held the memory, the limit, and what to do.
-    assert!(message.contains("the output of $addFields"), "{message}");
+    // It names what held the memory, the limit, and what to do. `$addFields` streams and
+    // holds one document; the `$count` it feeds is charged as the documents reach it, and is
+    // what is full (ADR-270).
+    assert!(message.contains("the input of $count is "), "{message}");
     assert!(message.contains("limit of 8388608 bytes"), "{message}");
     assert!(message.contains("a leading $match narrows what is read"), "{message}");
     assert!(message.contains("$project, $limit or $match after it reduce"), "{message}");
@@ -20796,8 +20798,9 @@ async fn every_stage_the_executor_runs_is_held_to_the_memory_limit_and_stops_at_
         ("$lookup", json!([{ "$facet": { "a": [eq.clone()], "b": [{ "$count": "n" }] } }])),
         ("$graphLookup", json!([{ "$facet": { "a": [graph] } }])),
         // A sink after a stage that builds is refused before anything is written.
+        // (`$addFields` streams, so what is full is the output it feeds the sink: ADR-270.)
         (
-            "$addFields",
+            "the output of the pipeline is ",
             json!([{ "$addFields": { "big": "q".repeat(40_000) } }, { "$out": "dest" }]),
         ),
         ("$lookup", json!([sub, { "$merge": { "into": "dest" } }])),
