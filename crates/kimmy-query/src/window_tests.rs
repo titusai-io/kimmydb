@@ -2740,6 +2740,66 @@ fn two_dates_more_than_two_to_the_sixty_three_milliseconds_apart_do_not_wrap() {
     assert!((slope - 1.0 / span).abs() < 1e-25, "{slope}");
 }
 
+/// The moving average as the reference answers it (q8a2 n6): kept in decimal, to 34 digits, so
+/// that `N: 2` over `[1, 2]` is `1.6666666666666667` where a double's
+/// `prev + alpha * (x - prev)` is `1.6666666666666665`. Every answer below is a recorded one.
+#[test]
+fn the_moving_average_is_worked_in_decimal_as_the_reference_works_it() {
+    let ema = |arg: Document, input: Vec<Document>| {
+        let out =
+            run(set(doc! {"sortBy": {"_id": 1}, "output": {"e": {"$expMovingAvg": arg}}}), input)
+                .unwrap();
+        col(&out, "e")
+    };
+    let v = |values: &[i32]| -> Vec<Document> {
+        values.iter().enumerate().map(|(i, x)| doc! {"_id": i as i32 + 1, "v": *x}).collect()
+    };
+    // N: 2 over [1, 2].
+    assert_eq!(ema(doc! {"input": "$v", "N": 2}, v(&[1, 2])), f64s(&[1.0, 1.6666666666666667]));
+    // A longer series, N: 2 over 1, 2, 3, 4 (wextra3, "sortBy {} with $expMovingAvg").
+    assert_eq!(
+        ema(doc! {"input": "$v", "N": 2}, v(&[1, 2, 3, 4])),
+        f64s(&[1.0, 1.6666666666666667, 2.5555555555555554, 3.5185185185185186])
+    );
+    // A missing value and a string leave the average where it is, and a leading missing
+    // value answers null; N given as a whole double (wextra, "ema N 2.0 double").
+    let sparse = vec![
+        doc! {"_id": 1},
+        doc! {"_id": 2, "v": 10},
+        doc! {"_id": 3, "v": "x"},
+        doc! {"_id": 4, "v": 30},
+    ];
+    assert_eq!(
+        ema(doc! {"input": "$v", "N": 2.0}, sparse.clone()),
+        vec![Bson::Null, Bson::Double(10.0), Bson::Double(10.0), Bson::Double(23.333333333333332)]
+    );
+    // The alpha form (wextra, "ema leading missing, string, decimal", and windows, "ema alpha").
+    assert_eq!(
+        ema(doc! {"input": "$v", "alpha": 0.5}, sparse),
+        vec![Bson::Null, Bson::Double(10.0), Bson::Double(10.0), Bson::Double(20.0)]
+    );
+    assert_eq!(
+        ema(doc! {"input": "$v", "alpha": 0.25}, v(&[10, 20, 30])),
+        f64s(&[10.0, 12.5, 16.875])
+    );
+    assert_eq!(ema(doc! {"input": "$v", "N": 3}, v(&[10, 20, 30])), f64s(&[10.0, 15.0, 22.5]));
+    // A long series is the same decimal walk: N: 4 (alpha 0.4) over a ramp, checked against
+    // the same arithmetic done on exact decimals here.
+    let ramp: Vec<i32> = (1..=40).collect();
+    let got = ema(doc! {"input": "$v", "N": 4}, v(&ramp));
+    let mut want = Vec::new();
+    let mut prev = 0i128; // exact, in units of 1e-30; alpha = 2/5
+    for (i, x) in ramp.iter().enumerate() {
+        let x = i128::from(*x) * 10i128.pow(30);
+        prev = if i == 0 { x } else { (x * 2 + prev * 3) / 5 };
+        want.push(Bson::Double(prev as f64 / 1e30));
+    }
+    for (g, w) in got.iter().zip(&want) {
+        let (Bson::Double(g), Bson::Double(w)) = (g, w) else { panic!("{got:?}") };
+        assert!((g - w).abs() <= 1e-12 * w.abs().max(1.0), "{g} vs {w}");
+    }
+}
+
 #[test]
 fn an_integral_over_dates_more_than_two_to_the_sixty_three_milliseconds_apart_does_not_wrap() {
     // The trapezoid between the earliest and the latest date a `DateTime` holds is 2^64

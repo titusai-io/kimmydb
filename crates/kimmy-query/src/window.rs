@@ -140,7 +140,10 @@ pub enum Func {
     },
     ExpMovingAvg {
         input: Expr,
-        alpha: f64,
+        /// The weight of the newest value, as a `Decimal128`: the reference works the
+        /// average in decimal, which is why `N: 2` over `[1, 2]` is `1.6666666666666667`
+        /// and not the `...65` that a double's `prev + alpha * (x - prev)` gives.
+        alpha: Raw,
     },
     Locf(Expr),
     LinearFill(Expr),
@@ -416,10 +419,15 @@ fn parse_output(
                     if n < 1 {
                         return bad(format!("$expMovingAvg `N` must be at least 1, found {n}"));
                     }
-                    2.0 / (n as f64 + 1.0)
+                    // 2 / (N + 1) in decimal, to 34 digits, as the reference computes it.
+                    arith::div(&arith::from_i64(2), &arith::from_i64(n.saturating_add(1)))
+                        .map_err(|_| Error::Internal("N + 1 is zero".into()))?
                 }
                 (None, Some(a)) => match accumulators::numeric(a) {
-                    Some(a) if a > 0.0 && a < 1.0 => a,
+                    Some(x) if x > 0.0 && x < 1.0 => match a {
+                        Bson::Decimal128(d) => decode_raw(d),
+                        _ => ema_decimal(x),
+                    },
                     Some(a) => {
                         return bad(format!(
                             "$expMovingAvg `alpha` must be greater than 0 and less than 1, found {a}"
@@ -869,6 +877,29 @@ fn run_partition(
     Ok(docs)
 }
 
+/// A double as the reference reads it into a `Decimal128`: rounded to 15 significant digits
+/// (`0.5` is `0.500000000000000`). An infinity and a NaN stay what they are.
+fn ema_decimal(x: f64) -> Raw {
+    if !x.is_finite() {
+        return arith::from_binary64(x.to_bits()).0;
+    }
+    match kimmy_core::decimal::parse(&format!("{x:.14e}")) {
+        Ok(d) => decode_raw(&d),
+        Err(_) => arith::from_binary64(x.to_bits()).0,
+    }
+}
+
+/// The number `$expMovingAvg` takes from a value, or `None` for anything that is not a
+/// number: an integer exactly, a double to 15 digits, a `Decimal128` read as the double of
+/// its value (the deviation of every window operator over decimals).
+fn ema_term(value: &Bson) -> Option<Raw> {
+    match value {
+        Bson::Int32(n) => Some(arith::from_i64(i64::from(*n))),
+        Bson::Int64(n) => Some(arith::from_i64(*n)),
+        other => accumulators::numeric(other).map(ema_decimal),
+    }
+}
+
 fn per(out: Vec<Option<Bson>>) -> Result<Cells> {
     Ok(Cells::Per(out))
 }
@@ -969,17 +1000,27 @@ fn compute(
             integral(&ends, &x, &y, sink)
         }
         Func::ExpMovingAvg { input, alpha } => {
-            let mut ema: Option<f64> = None;
+            // The average is kept in decimal, to 34 digits, as the reference keeps it, and
+            // each update is `x * alpha + (1 - alpha) * prev`; it is answered as the nearest
+            // double.
+            let one_minus = arith::sub(&arith::from_i64(1), alpha);
+            let mut ema: Option<Raw> = None;
             let mut out = Vec::with_capacity(n);
             for doc in docs {
                 // A value that is not a number leaves the average where it is.
-                if let Some(x) = accumulators::numeric(&eval(input, doc, run.vars)?) {
-                    ema = Some(match ema {
+                let value = eval(input, doc, run.vars)?;
+                if let Some(x) = ema_term(&value) {
+                    ema = Some(match &ema {
                         None => x,
-                        Some(prev) => prev + alpha * (x - prev),
+                        Some(prev) => {
+                            arith::add(&arith::mul(&x, alpha), &arith::mul(&one_minus, prev))
+                        }
                     });
                 }
-                let v = Some(ema.map_or(Bson::Null, Bson::Double));
+                let v =
+                    Some(ema.as_ref().map_or(Bson::Null, |e| {
+                        Bson::Double(f64::from_bits(arith::to_binary64(e)))
+                    }));
                 sink.charge(&v)?;
                 out.push(v);
             }
