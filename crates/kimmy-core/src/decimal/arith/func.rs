@@ -810,6 +810,29 @@ pub fn log10(x: &Raw) -> Result<Raw, Domain> {
     Ok(finish(l.neg, fx_div(&l.mag, &consts().ln10), -i64::from(S)))
 }
 
+/// The logarithm of `x` in `base`, `ln x / ln base`, rounded once: both logarithms are kept
+/// in the fixed point and divided there, not rounded to 34 digits first. Both must be positive
+/// and finite, and `base` is not 1 (outside, [`Domain`]); `x` of 1 is exactly `0` and `x` equal
+/// to `base` exactly `1`.
+pub fn log(x: &Raw, base: &Raw) -> Result<Raw, Domain> {
+    let (xc, xe) = match log_argument(x) {
+        Ok(argument) => argument,
+        Err(answer) => return answer,
+    };
+    let (bc, be) = match log_argument(base) {
+        Ok(argument) => argument,
+        Err(answer) => return answer,
+    };
+    if strip(bc, be) == (1, 0) {
+        return Err(Domain);
+    }
+    if strip(xc, xe) == (1, 0) {
+        return Ok(ZERO);
+    }
+    let (lx, lb) = (ln_fx(xc, xe), ln_fx(bc, be));
+    Ok(finish(lx.neg != lb.neg, fx_div(&lx.mag, &lb.mag), -i64::from(S)))
+}
+
 /// The base-2 logarithm, with `ln`'s domain. An exact power of two `2^k` gives exactly `k`
 /// (the fixed point rounds the sticky approximation of it to the integer).
 pub fn log2(x: &Raw) -> Result<Raw, Domain> {

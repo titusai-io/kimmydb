@@ -366,6 +366,61 @@ fn log10_agrees_with_decnumber() {
     report("log10", count, &failures);
 }
 
+/// `ln(x) / ln(base)` in decNumber at 120 digits, rounded here to 34: the logarithm of `x` in
+/// `base`, which `func::log` computes in one fixed point and rounds once.
+fn log_in_base(ctx: &mut Context<Wide>, x: &Raw, base: &Raw) -> Wide {
+    let mut numerator = wide(ctx, x);
+    ctx.ln(&mut numerator);
+    let mut denominator = wide(ctx, base);
+    ctx.ln(&mut denominator);
+    ctx.div(&mut numerator, &denominator);
+    numerator
+}
+
+#[test]
+fn log_agrees_with_decnumber() {
+    let mut ctx = context();
+    let mut state = 5u64;
+    let mut failures = Vec::new();
+    let mut count = 0;
+    for i in 0..4200 {
+        let x = log_input(&mut state, i);
+        let base = log_input(&mut state, i / 3 + 1);
+        // A base of one has no logarithm; a quotient of two logarithms that both vanish is
+        // not a case (the oracle's 120 digits are for quotients of ordinary size).
+        if matches!(func::ln(&base), Ok(r) if r.is_zero()) {
+            continue;
+        }
+        let w = log_in_base(&mut ctx, &x, &base);
+        compare(
+            "log",
+            &[text(&x), text(&base)],
+            func::log(&x, &base),
+            expected(read(&w)),
+            &mut failures,
+        );
+        count += 1;
+    }
+    assert!(count > 3500, "{count}");
+    report("log", count, &failures);
+}
+
+#[test]
+fn log2_agrees_with_decnumber() {
+    let mut ctx = context();
+    let mut state = 6u64;
+    let mut failures = Vec::new();
+    let mut count = 0;
+    let two = fin(false, 2, 0);
+    for i in 0..4200 {
+        let x = log_input(&mut state, i);
+        let w = log_in_base(&mut ctx, &x, &two);
+        compare("log2", &[text(&x)], func::log2(&x), expected(read(&w)), &mut failures);
+        count += 1;
+    }
+    report("log2", count, &failures);
+}
+
 /// A random decimal `y`, `1 <= |y| < limit`, with up to 6 fractional digits.
 fn random_y(state: &mut u64, limit: u64) -> Raw {
     let k = (splitmix(state) % 7) as u32;

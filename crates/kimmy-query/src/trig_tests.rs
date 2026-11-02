@@ -7,6 +7,11 @@
 //! within three units of its last place, and the exact points (zeros, infinities, NaN) to the
 //! same digits and cohort: the decimal functions are correctly rounded, and the reference's
 //! library is not (see `kimmy-core`'s `decimal_trig_reference` test).
+//!
+//! A row of the fixture with a fourth column is a call whose answer here is **not** the
+//! reference's: a decimal `$log` with a base other than 2 and 10, where the reference divides
+//! `ln(x)` by the base. The third column is the logarithm (computed independently, rounded to
+//! 34 digits, and held to the same value here) and the fourth is what the reference recorded.
 
 use bson::{Bson, doc};
 use kimmy_core::decimal::{Raw, decode_raw, parse};
@@ -125,6 +130,7 @@ fn every_recorded_answer_is_the_references() {
     for line in table.lines() {
         let mut cols = line.split('\t');
         let (name, args, want) = (cols.next().unwrap(), cols.next().unwrap(), cols.next().unwrap());
+        let reference_differs = cols.next().is_some();
         let call = op(name, args.split('|').map(operand).collect());
         let got = eval(call);
         checked += 1;
@@ -135,7 +141,11 @@ fn every_recorded_answer_is_the_references() {
                 }
             }
             (Ok(value), None) => {
-                if !agrees(value, want) {
+                if reference_differs {
+                    if !same_value(value, want) {
+                        wrong.push(format!("{name} {args}: want {want}, got {value:?}"));
+                    }
+                } else if !agrees(value, want) {
                     wrong.push(format!("{name} {args}: want {want}, got {value:?}"));
                 } else if matches!(value, Bson::Decimal128(_)) {
                     exact += usize::from(agrees_exactly(value, want));
@@ -147,6 +157,21 @@ fn every_recorded_answer_is_the_references() {
     assert!(wrong.is_empty(), "{} of {checked}:\n{}", wrong.len(), wrong.join("\n"));
     assert!(checked > 1500, "{checked}");
     assert!(exact > 50, "{exact}");
+}
+
+/// Whether a decimal answer is the decimal `want` to the last digit, whatever its cohort.
+fn same_value(got: &Bson, want: &str) -> bool {
+    match (got, dec(&want[1..])) {
+        (Bson::Decimal128(g), Bson::Decimal128(w)) => {
+            let (g, w) = (widened(&decode_raw(g)), widened(&decode_raw(&w)));
+            g == w
+                || matches!(
+                    (g, w),
+                    (Raw::Finite { coefficient: 0, .. }, Raw::Finite { coefficient: 0, .. })
+                )
+        }
+        _ => false,
+    }
 }
 
 fn agrees_exactly(got: &Bson, want: &str) -> bool {
@@ -296,19 +321,46 @@ fn log_checks_in_the_references_order() {
 }
 
 #[test]
-fn a_decimal_base_other_than_two_and_ten_divides_by_the_base_as_the_reference_does() {
-    // `ln 2 / 3`, not `ln 2 / ln 3`: the reference's answer, matched.
+fn a_decimal_log_is_the_logarithm_where_the_reference_divides_by_the_base() {
+    // The reference answers `ln 2 / 3`, `0.2310490601866484364724107071527255`; the logarithm
+    // is `ln 2 / ln 3`, rounded once.
     assert_eq!(
         val(op("$log", vec![dec("2"), dec("3")])),
-        dec("0.2310490601866484364724107071527255")
+        dec("0.6309297535714574370995271143427609")
     );
+    assert_eq!(
+        val(op("$log", vec![dec("100"), dec("7")])),
+        dec("2.366589324909876653635857123293718")
+    );
+    // A base below one, and a double beside a decimal read to 15 digits (`0.1`, not its binary
+    // value): the reference answers `6.93…` and `-1.386…`.
+    assert!(same_value(
+        &val(op("$log", vec![dec("2"), Bson::Double(0.1)])),
+        "D-0.3010299956639811952137388947244930"
+    ));
+    assert_eq!(val(op("$log", vec![dec("8"), dec("0.5")])), dec("-3"));
+    // The base 2 and the base 10 are the reference's, and exact for a power.
     assert_eq!(val(op("$log", vec![dec("8"), dec("2")])), dec("3"));
     assert_eq!(val(op("$log", vec![dec("1000"), dec("10")])), dec("3"));
-    // A double beside a decimal is read to 15 digits: `0.1`, not its binary value.
-    assert_eq!(
-        val(op("$log", vec![dec("2"), Bson::Double(0.1)])),
-        dec("6.931471805599453094172321214581766")
-    );
+    assert_eq!(val(op("$log", vec![dec("27"), dec("3")])), dec("3"));
+    assert_eq!(val(op("$log", vec![dec("5"), dec("5")])), dec("1"));
+    assert_eq!(val(op("$log", vec![dec("1"), dec("3")])), dec("0"));
+    // An infinite number is an infinity of the sign of `ln(base)`, an infinite base a zero.
+    assert_eq!(val(op("$log", vec![dec("Infinity"), dec("0.5")])), dec("-Infinity"));
+    assert_eq!(val(op("$log", vec![dec("Infinity"), dec("3")])), dec("Infinity"));
+    // A decimal agrees with the double of the same call, which the reference gets right.
+    for (x, b) in [(2.0, 3.0), (100.0, 7.0), (0.25, 0.5), (5.0, 1.5), (1e6, 100.0), (3.0, 0.1)] {
+        let double_form = double(&val(op("$log", vec![Bson::Double(x), Bson::Double(b)])));
+        let Bson::Decimal128(d) = val(op("$log", vec![dec(&x.to_string()), dec(&b.to_string())]))
+        else {
+            panic!("not a decimal")
+        };
+        let decimal_form: f64 = d.to_string().parse().unwrap();
+        assert!(
+            (decimal_form - double_form).abs() <= 1e-14 * double_form.abs().max(1.0),
+            "{x} {b}: {decimal_form} vs {double_form}"
+        );
+    }
     // Doubles are the quotient of the natural logarithms, which is not always exact.
     assert_eq!(
         double(&val(op("$log", vec![Bson::Int32(1000), Bson::Int32(10)]))),

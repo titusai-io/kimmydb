@@ -13,11 +13,11 @@
 //! `$ln` can, see `math.rs`).
 //!
 //! `$log` is `ln(number) / ln(base)` for doubles. A `Decimal128` in either operand makes both
-//! decimals and the answer one, by the rules the reference follows and which are not the
-//! plain change of base: the base 2 and the base 10 are the decimal logarithms of those
-//! bases, and any other base **divides** `ln(number)` by the base, not by its logarithm
-//! (`{$log: [NumberDecimal("2"), NumberDecimal("3")]}` is `0.2310490601866484364724107071527255`,
-//! `ln 2 / 3`). That is matched, not corrected; `docs/deviations.md` records it.
+//! decimals and the answer one. The reference does not change base there: it divides `ln(number)` by the base itself for any base but
+//! 2 and 10 (`{$log: [NumberDecimal("2"), NumberDecimal("3")]}` is `0.2310490601866484364724107071527255`,
+//! `ln 2 / 3`), a defect. A decimal here is the logarithm, `ln(number) / ln(base)` rounded once
+//! (`0.6309297535714574370995271143427…` for that call), as the reference's own double form answers;
+//! `docs/deviations.md` records the difference.
 
 use bson::Bson;
 use kimmy_core::decimal::arith::{self, func};
@@ -299,8 +299,11 @@ pub(super) fn log(number: &Bson, base: &Bson) -> Result<Bson> {
     }
 }
 
-/// The decimal logarithm the reference computes: base 2 and base 10 as themselves, any other
-/// base as `ln(x) / base`.
+/// The decimal logarithm: `ln(x) / ln(base)`, rounded once, with the base 2 and the base 10 as
+/// `log2` and `log10`. The reference computes any other base as `ln(x) / base` (a defect, see
+/// the register); this is the logarithm, which is what its double form and its base-2 and
+/// base-10 forms answer. An infinite `x` is an infinity of the sign of `ln(base)`, an infinite
+/// base makes the answer a zero (or a `NaN` beside an infinite `x`).
 fn decimal_log(x: &Raw, base: &Raw) -> Raw {
     let is = |n: i64| arith::sub(base, &arith::from_i64(n)).is_zero();
     if is(2) {
@@ -309,8 +312,16 @@ fn decimal_log(x: &Raw, base: &Raw) -> Raw {
     if is(10) {
         return func::log10(x).unwrap_or(Raw::Nan);
     }
-    match func::ln(x) {
-        Ok(ln) => arith::div(&ln, base).unwrap_or(Raw::Nan),
-        Err(func::Domain) => Raw::Nan,
+    match (x, base) {
+        (Raw::Inf { .. }, Raw::Inf { .. }) => Raw::Nan,
+        (Raw::Inf { .. }, _) => match func::ln(base) {
+            Ok(Raw::Finite { negative, .. }) => Raw::Inf { negative },
+            _ => Raw::Nan,
+        },
+        (_, Raw::Inf { .. }) => match func::ln(x) {
+            Ok(ln) => arith::div(&ln, base).unwrap_or(Raw::Nan),
+            Err(func::Domain) => Raw::Nan,
+        },
+        _ => func::log(x, base).unwrap_or(Raw::Nan),
     }
 }

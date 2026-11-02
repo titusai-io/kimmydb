@@ -20673,6 +20673,40 @@ async fn rand_in_a_pipeline_update_is_stored_as_a_fixed_value() {
     assert_eq!(seen, 10);
 }
 
+/// What replicates is the document a `$rand` produced, not the pipeline: a second member,
+/// brought level by the sync transport, holds the very numbers the accepting member stored.
+#[tokio::test]
+async fn a_rand_written_on_one_member_is_the_same_number_on_the_other() {
+    let members = [Server::start().await, Server::start().await];
+    let token = members[0].root().await;
+    pipeline_coll(&members[0], &token, (1..=3).map(|i| json!({ "_id": i })).collect()).await;
+    converge_members(&members);
+    let res = members[0]
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "r": { "$rand": {} } } }], "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    converge_members(&members);
+    let read = |member: &Server, id: i64| {
+        let engine = &member.state.engine;
+        let coll = engine.get_collection("shop", "pu").unwrap();
+        engine
+            .get(&coll, &kimmy_core::DocId::try_from_bson(&bson::Bson::Int64(id)).unwrap())
+            .unwrap()
+            .expect("replicated")
+            .get_f64("r")
+            .expect("a stored number")
+    };
+    for id in 1..=3 {
+        let (here, there) = (read(&members[0], id), read(&members[1], id));
+        assert!((0.0..1.0).contains(&here));
+        assert_eq!(here.to_bits(), there.to_bits(), "document {id}");
+    }
+}
+
 /// `$sampleRate` is a clause of a document filter wherever one is accepted: a rate of 0 matches
 /// nothing and a rate of 1 everything, in a find, an update and an aggregation, and a rate out
 /// of range is a `400`.
