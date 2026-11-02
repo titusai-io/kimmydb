@@ -337,6 +337,9 @@ async fn drain(mut body: Body, bound: usize) {
     }
 }
 
+/// The size of the pieces an answer is handed to hyper in.
+pub(crate) const ANSWER_CHUNK_BYTES: usize = 64 * 1024;
+
 /// A response body that holds `hold` until the body has been sent or is dropped.
 ///
 /// An aggregation's answer is built, serialised and then written to the client, and the
@@ -344,15 +347,23 @@ async fn drain(mut body: Body, bound: usize) {
 /// The memory lease of the answer (ADR-269) rides in this wrapper, so a big answer still
 /// being sent counts against the node's pool, and is given back when the body ends, when
 /// the response is dropped unsent, and when the client disconnects (hyper drops the body).
+///
+/// The answer is handed over in pieces of [`ANSWER_CHUNK_BYTES`], slices of the one
+/// buffer (nothing is copied), and the hold goes back only when the last piece has been
+/// taken. A body yielded whole would be taken by hyper at the first poll, and the hold
+/// would go back while the bytes still sat in hyper's write queue; hyper polls the next
+/// piece only when its write buffer has room, that is when the socket has taken the
+/// ones before. What is left uncounted at the end is what hyper holds then: its write
+/// buffer (400 KiB by default) and the last piece.
 pub(crate) struct HeldBody<H> {
-    inner: Body,
+    rest: Bytes,
     hold: Option<H>,
 }
 
 impl<H> HeldBody<H> {
     /// `bytes` as a response body that keeps `hold` until it is done with.
     pub(crate) fn new(bytes: Bytes, hold: H) -> Self {
-        Self { inner: Body::from(bytes), hold: Some(hold) }
+        Self { rest: bytes, hold: Some(hold) }
     }
 }
 
@@ -362,23 +373,24 @@ impl<H: Unpin> HttpBody for HeldBody<H> {
 
     fn poll_frame(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        let polled = Pin::new(&mut this.inner).poll_frame(cx);
-        // Everything has been handed over (or the body failed): nothing is held any more.
-        if matches!(polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+        if this.rest.is_empty() {
+            // Everything has been handed over: nothing is held any more.
             this.hold = None;
+            return Poll::Ready(None);
         }
-        polled
+        let piece = this.rest.split_to(this.rest.len().min(ANSWER_CHUNK_BYTES));
+        Poll::Ready(Some(Ok(Frame::data(piece))))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.rest.is_empty()
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        SizeHint::with_exact(self.rest.len() as u64)
     }
 }
 
@@ -680,6 +692,54 @@ mod tests {
         assert!(other.lease("another answer").charge(600).is_err());
         drop(unsent);
         other.lease("another answer").charge(600).unwrap();
+    }
+
+    /// The answer goes to hyper in pieces of one buffer, and its hold goes back with the
+    /// last of them (ADR-269).
+    #[tokio::test]
+    async fn an_answer_is_handed_over_in_slices_of_one_buffer_and_held_to_the_last() {
+        let pool = kimmy_query::budget::MemoryPool::new(1_000);
+        let budget = kimmy_query::budget::BufferBudget::pooled(1_000, &pool);
+        let mut lease = budget.lease("the answer");
+        lease.charge(900).unwrap();
+
+        let whole = Bytes::from(vec![7u8; 3 * ANSWER_CHUNK_BYTES + 10]);
+        let start = whole.as_ptr() as usize;
+        let mut body = Body::new(HeldBody::new(whole.clone(), lease));
+        assert_eq!(body.size_hint().exact(), Some(3 * ANSWER_CHUNK_BYTES as u64 + 10));
+        let mut sizes = Vec::new();
+        let mut offset = 0usize;
+        while let Some(frame) = body.frame().await {
+            let data = frame.unwrap().into_data().unwrap();
+            // A slice of the answer's own buffer, not a copy of it.
+            assert_eq!(data.as_ptr() as usize, start + offset);
+            offset += data.len();
+            sizes.push(data.len());
+            if offset < whole.len() {
+                assert_eq!(pool.used(), 900, "held while pieces are still to be taken");
+                assert!(!body.is_end_stream());
+            }
+        }
+        assert_eq!(sizes, [ANSWER_CHUNK_BYTES, ANSWER_CHUNK_BYTES, ANSWER_CHUNK_BYTES, 10]);
+        assert_eq!(pool.used(), 0);
+
+        // The last piece is taken and the body is dropped (hyper does, at the end of a body
+        // it knows to be done): given back, with the pieces still alive in the write queue
+        // they were taken into.
+        let lease = {
+            let mut lease = budget.lease("the answer");
+            lease.charge(900).unwrap();
+            lease
+        };
+        let mut body = Body::new(HeldBody::new(whole.clone(), lease));
+        let mut taken = Vec::new();
+        while !body.is_end_stream() {
+            taken.push(body.frame().await.unwrap().unwrap().into_data().unwrap());
+        }
+        assert_eq!(taken.len(), 4);
+        drop(body);
+        assert_eq!(pool.used(), 0);
+        assert_eq!(taken.iter().map(Bytes::len).sum::<usize>(), whole.len());
     }
 
     #[test]

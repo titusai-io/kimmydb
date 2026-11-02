@@ -1194,12 +1194,15 @@ async fn aggregate_docs(
     let bytes = serde_json::to_vec(&answer)
         .map_err(|e| ApiError::internal(format!("could not write the answer: {e}")))?;
     drop(answer);
+    let length = bytes.len();
     let mut response =
         Response::new(axum::body::Body::new(crate::limits::HeldBody::new(bytes.into(), hold)));
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/json"),
     );
+    // The body is sent in pieces; its length is known and said, not chunked.
+    response.headers_mut().insert(axum::http::header::CONTENT_LENGTH, length.into());
     Ok(response)
 }
 

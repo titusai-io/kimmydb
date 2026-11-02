@@ -20938,6 +20938,135 @@ async fn an_aggregate_answer_keeps_the_pool_charged_until_its_body_is_sent_or_dr
     assert_eq!(pool.used(), 0, "an abandoned answer gives its bytes back");
 }
 
+/// An aggregate over `zmem` whose answer is `n` documents of about 1 MiB each.
+fn mebibyte_answers() -> Value {
+    json!({ "pipeline": [
+        { "$addFields": { "big": { "$reduce": {
+            "input": { "$range": [0, 10] },
+            "initialValue": "x".repeat(1024),
+            "in": { "$concat": ["$$value", "$$value"] },
+        } } } },
+    ] })
+}
+
+/// Wait, at most 20 seconds, until `ready` holds.
+async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "gave up waiting until {what}");
+}
+
+/// Send the aggregate request over a real connection whose receive buffer is as small as the
+/// kernel allows, and return the connection without reading any of the answer.
+async fn send_and_stop_reading(
+    server: &Server,
+    token: &str,
+    body: &Value,
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt as _;
+    let addr: SocketAddr = server.base.strip_prefix("http://").unwrap().parse().unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(10), socket.connect(addr))
+        .await
+        .expect("connect in time")
+        .unwrap();
+    let payload = body.to_string();
+    let request = format!(
+        "POST /v1/db/kx/coll/zmem/aggregate HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nAuthorization: Bearer {token}\r\n\
+         Content-Length: {}\r\n\r\n{payload}",
+        payload.len()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), stream.write_all(request.as_bytes()))
+        .await
+        .expect("write in time")
+        .unwrap();
+    stream
+}
+
+const ANSWER_BYTES: usize = 12 << 20;
+
+/// 12 MiB of answer in a pool of 128 MiB, with a client that has asked and reads nothing.
+async fn a_stalled_answer() -> (Server, String, tokio::net::TcpStream) {
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(64 << 20, 128 << 20));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 12).await;
+    let stream = send_and_stop_reading(&server, &token, &mebibyte_answers()).await;
+    let pool = server.state.aggregate_memory().pool().clone();
+    wait_for("the answer is built and charged", || pool.used() >= ANSWER_BYTES).await;
+    // The server has written what the sockets take (the kernel's send buffer is at most
+    // 4 MiB, the client's receive buffer 4 KiB, hyper's write buffer 400 KiB) and stopped:
+    // 12 MiB cannot have been taken by them, so the answer is still counted whole.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    (server, token, stream)
+}
+
+#[tokio::test]
+async fn an_answer_a_client_has_not_read_stays_in_the_pool_over_a_real_connection() {
+    use tokio::io::AsyncReadExt as _;
+    let (server, _token, mut stream) = a_stalled_answer().await;
+    let pool = server.state.aggregate_memory().pool().clone();
+    let held = pool.used();
+    assert!(
+        (ANSWER_BYTES..ANSWER_BYTES + (1 << 20)).contains(&held),
+        "the unread answer is charged as its JSON, once: {held}"
+    );
+    assert_eq!(pool.used(), held, "and it is still charged a moment later");
+
+    // The client reads it all: head, then exactly `content-length` bytes of body.
+    let mut received = Vec::new();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut chunk = vec![0u8; 256 << 10];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await;
+    assert!(read.is_ok(), "the client reads the answer in time");
+    let split = received.windows(4).position(|w| w == b"\r\n\r\n").expect("a head") + 4;
+    let head = String::from_utf8_lossy(&received[..split]).to_ascii_lowercase();
+    let length: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .expect("a content-length, the body is sent in pieces but its length is known")
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(received.len() - split, length, "{head}");
+    assert!(!head.contains("transfer-encoding"), "{head}");
+    let answer: Value = serde_json::from_slice(&received[split..]).unwrap();
+    assert_eq!(answer["count"], 12);
+    // And it is given back once it has gone out.
+    wait_for("the sent answer is given back", || pool.used() == 0).await;
+}
+
+#[tokio::test]
+async fn a_client_that_disconnects_mid_answer_gives_its_bytes_back() {
+    use tokio::io::AsyncReadExt as _;
+    let (server, _token, mut stream) = a_stalled_answer().await;
+    let pool = server.state.aggregate_memory().pool().clone();
+    assert!(pool.used() >= ANSWER_BYTES);
+    // A little of it is read, and the client goes away with the rest unread.
+    let mut first = vec![0u8; 100_000];
+    tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_exact(&mut first))
+        .await
+        .expect("the head and the start of the body arrive")
+        .unwrap();
+    assert!(pool.used() >= ANSWER_BYTES, "a client that has read 100 KB has not read 12 MiB");
+    drop(stream);
+    wait_for("the abandoned answer is given back", || pool.used() == 0).await;
+}
+
 #[tokio::test]
 async fn an_aggregate_explain_reports_the_limit_and_the_pool() {
     let server = Server::start().await;
