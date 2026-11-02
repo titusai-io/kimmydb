@@ -3,7 +3,7 @@
 //!
 //! Every aggregation request carries **one** [`BufferBudget`], in
 //! [`crate::aggregate::Limits`]. What the request holds is charged to it as it grows,
-//! in BSON bytes, by whoever holds it:
+//! in an estimate of the bytes it takes parsed ([`held_bytes`]), by whoever holds it:
 //!
 //! - the source read, document by document, so a read that passes the limit stops at
 //!   the document that passes it;
@@ -21,14 +21,16 @@
 //! its bytes back to the pool as they are released, and all of them when it is dropped,
 //! so a request that fails, is cut by its deadline or panics returns them as well.
 //!
-//! The unit is the BSON size of a document. A document of many small fields costs more
-//! than that in memory, so the limit is not a ceiling on resident memory, only a bound
+//! The unit is the estimate of a parsed document's memory ([`held_bytes`]), not its BSON
+//! size: a long string is charged about its BSON size, and a document of many small fields
+//! what it costs (400 integer fields: 23 times their BSON). It is not a ceiling on resident
+//! memory (the transient copies of an answer being built are beyond it), only a bound
 //! proportional to it.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use bson::Document;
+use bson::{Bson, Document};
 use kimmy_core::{Error, Result};
 
 /// What a `Default` budget may hold at once: 1 GiB. A fallback for tests and for code that
@@ -49,9 +51,143 @@ pub const DEFAULT_MEMORY_POOL_BYTES: usize = 2 * DEFAULT_MEMORY_LIMIT_BYTES;
 const REMEDY: &str = "a leading $match narrows what is read; $project, $limit or $match after it \
                       reduce what later stages hold; or raise aggregate.memory_limit_bytes";
 
-/// The BSON size of `doc`, worked out without encoding it.
+/// The BSON size of `doc`, worked out without encoding it. What the 16 MiB per-value bounds
+/// are held in; the budget charges [`held_bytes`].
 pub fn doc_bytes(doc: &Document) -> usize {
     crate::expr::sizes::document_bytes(doc)
+}
+
+// ---------------------------------------------------------------------------------------
+// The estimate of a parsed document's memory (ADR-269, the review's B2)
+// ---------------------------------------------------------------------------------------
+//
+// The budget charges an estimate of what a document costs **parsed**, not its BSON size. A
+// parsed `Document` is an `IndexMap<String, Bson>`: each field costs a bucket (hash, key
+// `String`, a `Bson` slot as large as the largest variant), a share of the hash table, the
+// key's heap block and whatever the value holds on the heap, and the tables grow by
+// doubling. For a long string that is about its BSON size; for 400 integer fields it is 19
+// times it. The estimate mirrors that layout from the types' own sizes (`size_of`), so it
+// follows the `bson` crate if its layout changes, and `tests/held_calibration.rs` measures
+// real documents with a counting allocator and fails when the estimate is below what they
+// hold or more than 1.5 times it.
+
+/// What the allocator really takes for a request of `n` bytes (glibc's rule: an 8-byte
+/// header and 16-byte rounding, 32 bytes at least; a large block is mapped in whole pages).
+fn heap_block(n: usize) -> usize {
+    match n {
+        0 => 0,
+        1..=131_071 => ((n + 8 + 15) & !15).max(32),
+        _ => n.saturating_add(16 + 4095) & !4095,
+    }
+}
+
+/// The buckets a hash table of `n` entries is made of, as `hashbrown` sizes it.
+fn table_buckets(n: usize) -> usize {
+    match n {
+        0 => 0,
+        1..=3 => 4,
+        4..=7 => 8,
+        _ => (n.saturating_mul(8) / 7 + 1).next_power_of_two(),
+    }
+}
+
+/// The entries a table of `buckets` buckets holds before it grows (7/8 of them).
+fn table_capacity(buckets: usize) -> usize {
+    if buckets <= 8 { buckets.saturating_sub(1) } else { buckets / 8 * 7 }
+}
+
+/// The heap a document of `n` fields takes for its table and its entries, whatever the
+/// fields hold: `indices` (a `usize` and a control byte for each bucket, and a group of
+/// control bytes) and the entries, reserved up to the table's capacity.
+fn doc_frame(n: usize) -> usize {
+    let buckets = table_buckets(n);
+    if buckets == 0 {
+        return 0;
+    }
+    let entry = 8 + std::mem::size_of::<String>() + std::mem::size_of::<Bson>();
+    heap_block(buckets * 9 + 16) + heap_block(table_capacity(buckets) * entry)
+}
+
+/// The heap a value holds, beyond its slot (a `Bson` is as large as its largest variant,
+/// and every value sits in one: a field's, an array element's).
+fn value_heap(value: &Bson) -> usize {
+    match value {
+        Bson::String(s) | Bson::JavaScriptCode(s) | Bson::Symbol(s) => heap_block(s.len()),
+        Bson::Binary(b) => heap_block(b.bytes.len()),
+        Bson::Document(d) => doc_heap(d),
+        Bson::Array(items) => array_heap(items),
+        Bson::RegularExpression(r) => {
+            heap_block(r.pattern.as_str().len()) + heap_block(r.options.as_str().len())
+        }
+        Bson::JavaScriptCodeWithScope(c) => heap_block(c.code.len()) + doc_heap(&c.scope),
+        _ => 0,
+    }
+}
+
+/// The heap an array of `items` takes: its elements' slots (a `Vec` grown by doubling, four
+/// at the least) and what they hold.
+fn array_heap(items: &[Bson]) -> usize {
+    let slots = match items.len() {
+        0 => 0,
+        n => n.next_power_of_two().max(4),
+    };
+    heap_block(slots * std::mem::size_of::<Bson>())
+        + items.iter().fold(0usize, |sum, v| sum.saturating_add(value_heap(v)))
+}
+
+/// The heap a document takes, its own struct excluded: the frame, and for each field its
+/// key and its value.
+fn doc_heap(doc: &Document) -> usize {
+    doc.iter().fold(doc_frame(doc.len()), |sum, (key, value)| {
+        sum.saturating_add(heap_block(key.len())).saturating_add(value_heap(value))
+    })
+}
+
+/// A safety margin over the layout above, in sixteenths: the allocator's fragmentation and
+/// the slack of the tables of documents that were built field by field.
+const HELD_MARGIN_SIXTEENTHS: usize = 2;
+
+fn with_margin(bytes: usize) -> usize {
+    bytes.saturating_add(bytes / 16 * HELD_MARGIN_SIXTEENTHS)
+}
+
+/// The estimate of the memory a parsed document holds: the document itself and everything
+/// it points to, in one walk over its fields and their values, recursively over arrays and
+/// nested documents. No serialisation. This is what the budget charges for a document.
+pub fn held_bytes(doc: &Document) -> usize {
+    with_margin(std::mem::size_of::<Document>().saturating_add(doc_heap(doc)))
+}
+
+/// The estimate for a value held on its own (an array element, a bucket key, a kept
+/// accumulator value): its slot and what it holds.
+pub fn held_bytes_bson(value: &Bson) -> usize {
+    with_margin(std::mem::size_of::<Bson>().saturating_add(value_heap(value)))
+}
+
+/// The estimate of the heap a field `name` holding `value` adds to a document: its key and
+/// what its value holds. Its bucket is in the document's table, which is
+/// [`held_frame_growth`]'s.
+pub fn held_element(name: &str, value: &Bson) -> usize {
+    with_margin(heap_block(name.len()).saturating_add(value_heap(value)))
+}
+
+/// The estimate of what the table of a document of `len` fields grows by when `added` fields
+/// are put into it: nothing while the capacity it already has holds them, and a doubling
+/// when it does not (which is as much as the table already holds). Worked out from the
+/// document's length alone.
+pub fn held_frame_growth(len: usize, added: usize) -> usize {
+    with_margin(doc_frame(len.saturating_add(added)).saturating_sub(doc_frame(len)))
+}
+
+/// The estimate for a key kept in a hash set of byte keys (a `$group` index, an
+/// `$addToSet` member's identity): the `Vec` header, its table share and its block.
+pub fn held_set_key(len: usize) -> usize {
+    with_margin(std::mem::size_of::<Vec<u8>>() + 2 * 9 + heap_block(len))
+}
+
+/// The estimate of a list of documents.
+pub fn held_docs_bytes(docs: &[Document]) -> usize {
+    docs.iter().fold(0usize, |sum, doc| sum.saturating_add(held_bytes(doc)))
 }
 
 /// The bytes an array of documents takes as a field's value, given each document's size:
@@ -286,12 +422,12 @@ impl Lease {
         Ok(())
     }
 
-    /// Charge the encoded size of `doc`.
+    /// Charge the estimate of the memory `doc` holds parsed ([`held_bytes`]).
     pub fn charge_doc(&mut self, doc: &Document) -> Result<()> {
-        self.charge(doc_bytes(doc))
+        self.charge(held_bytes(doc))
     }
 
-    /// Charge the encoded size of each document in `docs`, stopping at the first
+    /// Charge the estimate of each document in `docs`, stopping at the first
     /// refusal: the walk is as far as the budget goes, not the whole list.
     pub fn charge_docs(&mut self, docs: &[Document]) -> Result<()> {
         docs.iter().try_for_each(|doc| self.charge_doc(doc))

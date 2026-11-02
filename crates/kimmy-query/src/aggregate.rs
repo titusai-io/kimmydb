@@ -2306,7 +2306,12 @@ impl JoinedArray {
             // replaced, so this can only be high.
             payload = payload.saturating_add(2 + field.len() + 8);
         }
-        self.budget.add_payload(payload)?;
+        let held =
+            crate::budget::held_bytes(doc).saturating_add(depth_field.map_or(0, |(f, _)| {
+                crate::budget::held_element(f, &Bson::Int64(0))
+                    + crate::budget::held_frame_growth(doc.len(), 1)
+            }));
+        self.budget.add_payload_held(payload, held)?;
         let mut copy = doc.clone();
         if let Some((field, depth)) = depth_field {
             copy.insert(field, Bson::Int64(depth));
@@ -2318,7 +2323,10 @@ impl JoinedArray {
     /// Join `docs`, which are already built, by moving them in.
     pub fn push_all(&mut self, docs: Vec<Document>) -> Result<()> {
         for doc in docs {
-            self.budget.add_payload(crate::expr::document_bytes(&doc))?;
+            self.budget.add_payload_held(
+                crate::expr::document_bytes(&doc),
+                crate::budget::held_bytes(&doc),
+            )?;
             self.items.push(Bson::Document(doc));
         }
         Ok(())
@@ -2327,6 +2335,12 @@ impl JoinedArray {
     /// The size of the array as BSON, as counted so far.
     pub fn bytes(&self) -> usize {
         self.budget.bytes()
+    }
+
+    /// The estimate of the memory the array holds parsed (ADR-269): what the request's budget
+    /// is charged for it.
+    pub fn held_bytes(&self) -> usize {
+        self.budget.held()
     }
 
     /// The array.
@@ -2539,14 +2553,15 @@ pub(crate) enum AccState {
     Ext(crate::accumulators::State),
 }
 
-/// The bytes a value takes in a group's state: its type byte and its payload.
+/// The estimate of the memory a value takes in a group's state (ADR-269): its slot and what
+/// it holds parsed.
 fn state_bytes(value: &Bson) -> usize {
-    1 + crate::expr::sizes::bson_bytes(value)
+    crate::budget::held_bytes_bson(value)
 }
 
 impl AccState {
-    /// The BSON bytes this state holds now, for the request's budget (ADR-269). Constant
-    /// time for the states that grow with the group (`$push`, `$addToSet`,
+    /// The estimate of the memory this state holds now, for the request's budget (ADR-269).
+    /// Constant time for the states that grow with the group (`$push`, `$addToSet`,
     /// `$mergeObjects`, the ranked accumulators); the others hold one value.
     pub(crate) fn held(&self) -> usize {
         match self {
@@ -2556,22 +2571,27 @@ impl AccState {
                 Some(Ok(v)) => state_bytes(v),
                 _ => 0,
             },
-            // The size the value bound (ADR-267) already keeps; the lease reads it, so the
-            // same bytes are counted once and the 16 MiB bound is not touched.
-            AccState::Push(_, budget) => budget.bytes(),
-            AccState::AddToSet(_, _, budget, keys) => budget.bytes().saturating_add(*keys),
-            AccState::MergeObjects(_, budget) => budget.bytes(),
+            // The estimate the array's budget keeps beside the size the value bound
+            // (ADR-267) holds it to; the lease reads it, so the 16 MiB bound is not touched.
+            AccState::Push(_, budget) => budget.held(),
+            AccState::AddToSet(_, _, budget, keys) => budget.held().saturating_add(*keys),
+            AccState::MergeObjects(_, budget) => budget.held(),
             AccState::Ext(state) => state.held(),
         }
     }
 }
 
-/// The bytes a bucket takes before any accumulator has seen a document: the output
-/// document's framing, its `_id` and one element for each accumulator.
+/// The estimate of what a bucket takes before any accumulator has seen a document: the
+/// output document, its `_id` (and the key the bucket keeps) and one element for each
+/// accumulator.
 fn bucket_base_bytes(key: &Bson, fields: &[(String, Accumulator)]) -> usize {
-    fields.iter().fold(5 + 1 + 3 + crate::expr::sizes::bson_bytes(key), |sum, (name, _)| {
-        sum.saturating_add(2 + name.len() + 16)
-    })
+    fields.iter().fold(
+        std::mem::size_of::<Document>()
+            .saturating_add(crate::budget::held_frame_growth(0, fields.len() + 1))
+            .saturating_add(crate::budget::held_element("_id", key))
+            .saturating_add(crate::budget::held_bytes_bson(key)),
+        |sum, (name, _)| sum.saturating_add(crate::budget::held_element(name, &Bson::Null)),
+    )
 }
 
 fn group(
@@ -2651,7 +2671,10 @@ pub(crate) fn group_keyed(
             None => {
                 let slot = order.len();
                 // The bucket, its key twice over (the bucket and the index).
-                held.charge(bucket_base_bytes(&key, fields).saturating_add(encoded.len()))?;
+                held.charge(
+                    bucket_base_bytes(&key, fields)
+                        .saturating_add(crate::budget::held_set_key(encoded.len())),
+                )?;
                 order.push(Bucket { key: key.clone(), values: fields.iter().map(init).collect() });
                 index.insert(encoded, slot);
                 // One bucket per distinct value, so a high-cardinality key is
@@ -2876,7 +2899,7 @@ pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<
         // the value that takes its array over the limit.
         (AccState::Push(items, budget), Accumulator::Push(e)) => {
             if let Some(v) = e.eval_present(scope)? {
-                budget.add(&v)?;
+                budget.add_tracked(&v)?;
                 items.push(v);
             }
         }
@@ -2886,8 +2909,8 @@ pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<
                 // the first occurrence stays (ADR-186).
                 let key = group_key(&v);
                 if !keys.contains(&key) {
-                    budget.add(&v)?;
-                    *key_bytes = key_bytes.saturating_add(key.len());
+                    budget.add_tracked(&v)?;
+                    *key_bytes = key_bytes.saturating_add(crate::budget::held_set_key(key.len()));
                     keys.insert(key);
                     items.push(v);
                 }

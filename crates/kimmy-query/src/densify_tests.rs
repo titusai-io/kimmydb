@@ -653,7 +653,7 @@ fn the_bytes_buffered_and_generated_are_held_to_the_byte_budget() {
         Stage::Densify(spec) => *spec,
         other => panic!("{other:?}"),
     };
-    let size = |d: &Document| bson::serialize_to_vec(d).unwrap().len();
+    let size = |d: &Document| crate::budget::held_bytes(d);
     let input = a(&[0, 10]);
     let held: usize = input.iter().map(size).sum();
     // Room for the input and the nine documents it makes (each the size of an input).
@@ -870,7 +870,7 @@ fn the_count_over_all_gaps_and_partitions_is_decided_before_any_document_is_gene
         other => panic!("{other:?}"),
     };
     let input = vec![doc! {"v": 1, "a": 1}, doc! {"v": 2, "a": 4}];
-    let held: usize = input.iter().map(|d| bson::serialize_to_vec(d).unwrap().len()).sum();
+    let held: usize = input.iter().map(crate::budget::held_bytes).sum();
     let err =
         densify::apply(&spec, input, &Limits { max_documents: 7, ..capped(held + 1) }).unwrap_err();
     assert!(matches!(err, Error::Limit(_)), "{err:?}");

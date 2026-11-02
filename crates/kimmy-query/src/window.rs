@@ -653,20 +653,10 @@ pub(crate) fn buffer_name(stage: &str) -> &'static str {
     }
 }
 
-/// The bytes a field adds to a document: type byte, name, terminator, value.
+/// What a field adds to a document: the estimate of the memory it holds parsed
+/// ([`crate::budget::held_element`]).
 pub(crate) fn element_bytes(name: &str, value: &Bson) -> usize {
-    let body = match value {
-        Bson::Null | Bson::Undefined | Bson::MinKey | Bson::MaxKey => 0,
-        Bson::Boolean(_) => 1,
-        Bson::Int32(_) => 4,
-        Bson::Int64(_) | Bson::Double(_) | Bson::DateTime(_) | Bson::Timestamp(_) => 8,
-        Bson::ObjectId(_) => 12,
-        Bson::Decimal128(_) => 16,
-        Bson::String(s) => 4 + s.len() + 1,
-        other => bson::serialize_to_vec(&bson::doc! { "": other.clone() })
-            .map_or(16, |v| v.len().saturating_sub(5 + 1)),
-    };
-    1 + name.len() + 1 + body
+    crate::budget::held_element(name, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -870,7 +860,7 @@ fn run_partition(
         let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
         for doc in docs {
             let keys = shape::sort_keys(&spec.sort, &doc);
-            lease.charge(keys.iter().map(|k| element_bytes("", k)).sum())?;
+            lease.charge(keys.iter().map(crate::budget::held_bytes_bson).sum())?;
             keyed.push((keys, doc));
         }
         keyed.sort_by(|a, b| shape::compare_keys(&spec.sort, &a.0, &b.0));
@@ -886,6 +876,11 @@ fn run_partition(
         let mut added = false;
         for (output, cells) in spec.outputs.iter().zip(&results) {
             if let Some(v) = cells.at(i) {
+                // The values were charged as they were computed; what the document's table
+                // grows by to hold the field is charged as it is written.
+                if path::resolve(doc, &output.name).is_empty() {
+                    lease.charge(crate::budget::held_frame_growth(doc.len(), 1))?;
+                }
                 path::set(doc, &output.name, v.clone()).map_err(|e| {
                     Error::InvalidQuery(format!("cannot set {:?}: {e}", output.name))
                 })?;

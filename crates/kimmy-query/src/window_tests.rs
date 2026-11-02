@@ -1674,8 +1674,15 @@ fn capped(cap: usize) -> Limits {
     Limits { buffer: crate::budget::BufferBudget::new(cap), ..Default::default() }
 }
 
+/// What a document is charged: the estimate of the memory it holds parsed.
 fn size(doc: &Document) -> usize {
-    bson::serialize_to_vec(doc).unwrap().len()
+    crate::budget::held_bytes(doc)
+}
+
+/// What a cell `n`, an `Int32`, written into a document of the two fields `series` makes
+/// is charged: its key, and no growth of the table (three fields fit its capacity).
+fn n_cell() -> usize {
+    crate::budget::held_element("n", &Bson::Int32(0)) + crate::budget::held_frame_growth(2, 1)
 }
 
 #[test]
@@ -1695,8 +1702,8 @@ fn buffered_documents_are_held_to_the_byte_cap_with_an_early_refusal() {
 fn the_values_the_stage_adds_are_held_to_the_byte_cap_exactly() {
     let input = series(&[1, 2, 3]);
     let held: usize = input.iter().map(size).sum();
-    // `n` is an Int32 count: type byte, "n", terminator, four bytes.
-    let cell = 1 + 1 + 1 + 4;
+    // `n` is an Int32 count: the heap of its key.
+    let cell = n_cell();
     let spec = spec_of(set(doc! {"output": {"n": {"$count": {}}}}));
     // The cap is exactly what the documents and three cells come to: allowed.
     let out = window::apply(&spec, input.clone(), &capped(held + 3 * cell), &[]).unwrap();
@@ -2399,10 +2406,10 @@ fn the_refusal_names_the_stage_and_its_buffer_limit_not_one_document() {
 fn the_sort_keys_taken_are_charged() {
     let input = series(&[1, 2, 3]);
     let held: usize = input.iter().map(size).sum();
-    // Each Int32 key is a type byte, an empty name, a terminator and four bytes; and the
-    // `$documentNumber` output a document's cell takes 1 + 1 + 1 + 4 (an Int32 named `n`).
-    let key = 1 + 1 + 4;
-    let cell = 1 + 1 + 1 + 4;
+    // Each Int32 key is a slot of its own; and the `$documentNumber` output is a cell, an
+    // Int32 named `n`.
+    let key = crate::budget::held_bytes_bson(&Bson::Int32(0));
+    let cell = n_cell();
     let spec = spec_of(set(doc! {"sortBy": {"qty": 1}, "output": {"n": {"$documentNumber": {}}}}));
     let exact = held + 3 * key + 3 * cell;
     assert_eq!(window::apply(&spec, input.clone(), &capped(exact), &[]).unwrap().len(), 3);
@@ -2414,7 +2421,7 @@ fn the_sort_keys_taken_are_charged() {
 fn the_stages_of_one_pipeline_and_the_branches_of_a_facet_share_one_budget() {
     let input = series(&[1, 2, 3, 4, 5]);
     let held: usize = input.iter().map(size).sum();
-    let cell = 1 + 1 + 1 + 4;
+    let cell = n_cell();
     let one = held + 5 * cell;
     let stage = set(doc! {"output": {"n": {"$count": {}}}});
     // One stage fits, and so do two in a row: the first gives its bytes back when it is done.

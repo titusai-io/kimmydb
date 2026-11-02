@@ -20769,6 +20769,51 @@ async fn every_stage_the_executor_runs_is_held_to_the_memory_limit_and_stops_at_
 }
 
 #[tokio::test]
+async fn documents_of_many_small_fields_are_charged_at_what_they_cost_parsed() {
+    // The review's B2, scaled down: 60 documents of 400 integer fields are 234 KB of BSON and
+    // about 5.5 MB once parsed. Under an explicit limit of 2 MiB a `$count` over them is refused
+    // at the source read, a few documents past the limit (each is charged about 92 KB), where
+    // the BSON bytes would have let all sixty through; and the same limit holds 40 times as many
+    // documents of one short field.
+    let server = Server::start().await;
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(2 << 20, 64 << 20));
+    let token = server.root().await;
+    for (name, docs) in [
+        (
+            "wide",
+            (0..60)
+                .map(|i| {
+                    let mut doc = serde_json::Map::new();
+                    doc.insert("_id".into(), json!(i));
+                    for f in 0..400 {
+                        doc.insert(format!("f{f}"), json!(f));
+                    }
+                    Value::Object(doc)
+                })
+                .collect::<Vec<_>>(),
+        ),
+        ("narrow", (0..900).map(|i| json!({ "_id": i })).collect::<Vec<_>>()),
+    ] {
+        server.post("/v1/db/kx/collections", Some(&token), json!({ "name": name })).await;
+        let res =
+            server.post(&format!("/v1/db/kx/coll/{name}/bulk"), Some(&token), json!(docs)).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let count = json!({ "pipeline": [{ "$count": "n" }] });
+    let refused = server.post("/v1/db/kx/coll/wide/aggregate", Some(&token), count.clone()).await;
+    assert_eq!(refused.status, 413, "{:?}", refused.body);
+    let message = refused.body["message"].as_str().unwrap();
+    assert!(message.contains("the source read"), "{message}");
+    // Refused after about 22 documents (2 MiB / 92 KB), not after all sixty.
+    let held = number_after(message, " is ");
+    assert!(held > 2 << 20 && held < (2 << 20) + 100_000, "refused at {held}");
+    let ok = server.post("/v1/db/kx/coll/narrow/aggregate", Some(&token), count).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    assert_eq!(ok.body["documents"], json!([{ "n": 900 }]));
+    assert_eq!(server.state.aggregate_memory().pool().used(), 0);
+}
+
+#[tokio::test]
 async fn the_source_read_stops_at_the_document_that_passes_the_limit() {
     let server = Server::start().await;
     server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(100 << 10, 8 << 20));

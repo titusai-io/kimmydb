@@ -2616,6 +2616,7 @@ dependencies = [
  "jiff",
  "jiff-tzdb",
  "kimmy-core",
+ "libc",
  "proptest",
  "rand 0.10.3",
  "serde",

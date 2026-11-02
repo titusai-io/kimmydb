@@ -2865,8 +2865,7 @@ fn lookup(
                 if keys.is_empty() {
                     return Ok(true);
                 }
-                let size = kimmy_query::budget::doc_bytes(&doc);
-                foreign_held.charge(size)?;
+                foreign_held.charge(kimmy_query::budget::held_bytes(&doc))?;
                 let at = foreign_docs.len();
                 for key in keys {
                     buckets.entry(key).or_default().push(at);
@@ -2912,7 +2911,7 @@ fn lookup(
         for i in at {
             joined.push_copy(&foreign_docs[i], None)?;
         }
-        held.charge(joined.bytes())?;
+        held.charge(joined.held_bytes())?;
         // Always an array, even when empty: a field whose type depends on
         // whether anything matched forces every caller to handle two shapes.
         doc.insert(as_field.to_string(), joined.finish());
@@ -3050,7 +3049,7 @@ fn lookup_pipeline(
         // 16 MiB as a value, and charged to the request's budget as part of the output.
         let mut array = aggregate::JoinedArray::new("the array $lookup builds");
         array.push_all(joined)?;
-        held.charge(array.bytes())?;
+        held.charge(array.held_bytes())?;
         doc.insert(as_field.to_string(), array.finish());
         aggregate::check_built_document(&doc, limits.max_document_bytes)?;
         out.push(doc);
@@ -3142,8 +3141,9 @@ fn union_with(
                          that what it answers is smaller",
             }));
         }
-        // They join the output, and are held as part of it (ADR-269).
-        held.charge(size)?;
+        // They join the output, and are held as part of it, at the estimate of what they
+        // hold parsed (ADR-269); the 16 MiB cap above stays on their BSON size.
+        held.charge(kimmy_query::budget::held_bytes(doc))?;
     }
     aggregate::check_limit("$unionWith", input.len() + appended.len(), limits)?;
     input.extend(appended);
@@ -3277,7 +3277,7 @@ fn graph_lookup(
         }
         // What is attached is part of the output (ADR-269); the array itself is held to
         // 16 MiB as a value while it is built.
-        held_bytes.charge(joined.bytes())?;
+        held_bytes.charge(joined.held_bytes())?;
         doc.insert(spec.as_field.clone(), joined.finish());
         aggregate::check_built_document(&doc, limits.max_document_bytes)?;
         out.push(doc);

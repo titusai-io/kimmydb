@@ -536,9 +536,10 @@ fn key_cmp(a: &Bson, b: &Bson) -> Ordering {
     }
 }
 
-/// The bytes a value takes in a group's state: its BSON payload and a type byte.
+/// The estimate of the memory a value takes in a group's state: its slot and what it holds
+/// parsed (ADR-269).
 fn value_bytes(value: &Bson) -> usize {
-    1 + crate::expr::sizes::bson_bytes(value)
+    crate::budget::held_bytes_bson(value)
 }
 
 impl Row {
@@ -551,7 +552,7 @@ impl Row {
 }
 
 impl State {
-    /// The BSON bytes of the rows and values this group keeps now (ADR-269).
+    /// The estimate of the memory of the rows and values this group keeps now (ADR-269).
     pub fn held(&self) -> usize {
         self.charged
     }

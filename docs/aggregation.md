@@ -2232,7 +2232,7 @@ becoming slow in a way that is harder to diagnose than a refusal.
 
 The document count above does not bound a pipeline's memory: a thousand documents each given
 an 8 MiB string by `$addFields` are a thousand legal documents and 8 GB. **Everything a request
-holds is charged, in BSON bytes, to one budget of `aggregate.memory_limit_bytes` (half the pool by default; about 100 MiB in a 2 GiB container)**
+holds is charged, as an estimate of the bytes it takes parsed, to one budget of `aggregate.memory_limit_bytes` (half the pool by default; about 100 MiB in a 2 GiB container)**
 as it grows, and the request is refused `413 answer_too_large` at the first byte over, naming what held the memory:
 
 | What | Charged | Until |
@@ -2246,9 +2246,11 @@ as it grows, and the request is refused `413 answer_too_large` at the first byte
 | **`$setWindowFields`, `$densify`, `$fill`** | the documents they buffer, the sort keys they take and the values they add | the stage returns |
 | **The answer** | the output documents and the JSON each becomes (its serialised length), document by document, so an answer that would pass the limit is refused before the rest is built; once built, the documents' bytes are given back and the JSON's are kept | the response body has been written or dropped (the client went away) |
 
-A stage's input stays charged until it returns, so `$addFields` over 400 MB of documents peaks at
-about 800 MB. 100,000 documents of 4 KB (410 MB) therefore run through `$addFields` under an
-explicit limit of 1 GiB, and under the derived limit only in a container of about 15.4 GiB or more:
+A stage's input stays charged until it returns, so `$addFields` over 100,000 documents of 4 KB
+peaks at about 1.08 GB charged (input and output, each at the estimate of the parsed size: 1.3 times
+the BSON of a 4 KB string document).
+100,000 documents of 4 KB (412 MB of BSON) therefore run through `$addFields` under an
+explicit limit of 2 GiB, and under the derived limit only in a container of about 20 GiB or more:
 a 2 GiB member refuses them at the source read, an 8 GiB one at `$addFields`. **The source read is
 charged whole before any stage runs**, and only a leading `$match` narrows it, so `[{$count}]`,
 `[{$limit: 5}]`, `[{$sort}, {$limit}]` and `[{$group}]` over a collection above the limit (about 102 MiB
@@ -2268,9 +2270,13 @@ the others have finished. Both refusals are counted on `/metrics`
 (`kimmy_aggregate_memory_limit_refusals_total`, `kimmy_aggregate_memory_pool_refusals_total`), and
 the bytes the pool holds now are `kimmy_aggregate_memory_pool_used_bytes`.
 
-**The unit is BSON bytes.** A string is within a few bytes of the memory it takes; a document of
-many small fields takes 10 to 20 times its BSON size as a parsed document, so size the pool with
-that in mind ([Operations](operations.md#aggregation-memory)). The reference streams documents
+**The unit is an estimate of the memory a parsed document takes, not its BSON size.** A long
+string is charged about its BSON size (a 4 KiB string document, 1.3 times); a document of many small
+fields is charged what it costs parsed: 100 fields (50 integers and 50 strings of 60 bytes) about 7
+times its BSON, **400 integer fields about 24 times**, because each field costs a table bucket, a key
+and a value slot whatever the value. So a 2 GiB member (a limit of about 102 MiB) reads about 1,160
+such 400-field documents (4 KB of BSON each), not 25,000 ([Operations](operations.md#what-the-limit-refuses-today)).
+Per-value limits (16 MiB for a string, an array or a document) stay in BSON bytes. The reference streams documents
 through a pipeline and spills its blocking stages to disk; this server holds a pipeline's documents and
 refuses what does not fit (see [Deviations](deviations.md)). Streaming the stages that do not block
 is planned.

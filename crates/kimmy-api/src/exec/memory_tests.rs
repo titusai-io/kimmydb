@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::tests::{agg_limits, live_state, seed_docs};
 use super::*;
 use crate::limits::AggregateMemory;
-use kimmy_query::budget::{BufferBudget, docs_bytes};
+use kimmy_query::budget::{BufferBudget, held_docs_bytes};
 
 fn root() -> Auth {
     Auth(kimmy_auth::Principal::superuser("test"))
@@ -107,8 +107,8 @@ fn a_lookup_charges_the_foreign_documents_it_holds_and_the_arrays_it_attaches() 
     let state = state_with(&dir, padded(4, 100), padded(5, 10_000));
     let lookup =
         json!([{"$lookup": {"from": "users", "localField": "k", "foreignField": "k", "as": "u"}}]);
-    let input = docs_bytes(&padded(4, 100));
-    let foreign = docs_bytes(&padded(5, 10_000));
+    let input = held_docs_bytes(&padded(4, 100));
+    let foreign = held_docs_bytes(&padded(5, 10_000));
     // Refused while the foreign side is read.
     let err = refusal(run(&state, lookup.clone(), capped(input + foreign / 2)));
     names(&err, "the foreign documents $lookup holds");
@@ -130,8 +130,8 @@ fn a_lookup_with_a_pipeline_charges_its_foreign_read_its_copies_and_what_it_atta
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, padded(3, 100), padded(4, 10_000));
     let lookup = json!([{"$lookup": {"from": "users", "pipeline": [{"$match": {}}], "as": "u"}}]);
-    let input = docs_bytes(&padded(3, 100));
-    let foreign = docs_bytes(&padded(4, 10_000));
+    let input = held_docs_bytes(&padded(3, 100));
+    let foreign = held_docs_bytes(&padded(4, 10_000));
     let err = refusal(run(&state, lookup.clone(), capped(input + foreign / 2)));
     names(&err, "the foreign documents $lookup holds");
     // Each input document runs the sub-pipeline over a copy of the foreign side: the input,
@@ -150,8 +150,8 @@ fn a_union_charges_what_it_reads_and_what_it_appends() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, padded(3, 100), padded(5, 10_000));
     let union = json!([{"$unionWith": "users"}]);
-    let input = docs_bytes(&padded(3, 100));
-    let foreign = docs_bytes(&padded(5, 10_000));
+    let input = held_docs_bytes(&padded(3, 100));
+    let foreign = held_docs_bytes(&padded(5, 10_000));
     let err = refusal(run(&state, union.clone(), capped(input + foreign / 2)));
     names(&err, "the foreign documents $unionWith reads");
     // The input is held beside what is read, and what is read is then what is appended: the
@@ -178,7 +178,7 @@ fn a_graph_lookup_charges_the_copies_it_attaches() {
     }}]);
     let ok = run(&state, walk.clone(), capped(10_000_000)).unwrap();
     assert_eq!(ok["documents"][0]["reached"].as_array().unwrap().len(), 5);
-    let foreign = docs_bytes(
+    let foreign = held_docs_bytes(
         &(0..5)
             .map(|i| doc! {"_id": i, "next": i + 1, "pad": "y".repeat(10_000)})
             .collect::<Vec<_>>(),
@@ -192,7 +192,7 @@ fn a_graph_lookup_charges_the_copies_it_attaches() {
 fn a_sink_is_charged_for_the_documents_it_writes() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, padded(10, 10_000), vec![]);
-    let docs = docs_bytes(&padded(10, 10_000));
+    let docs = held_docs_bytes(&padded(10, 10_000));
     // The read holds ~100 KB and is handed on; the sink holds the output while writing.
     let ok = run(&state, json!([{"$out": "copy"}]), capped(docs + 1_000)).unwrap();
     assert_eq!(ok["out"]["inserted"], 10);
@@ -270,7 +270,7 @@ fn a_facet_does_not_keep_every_lookup_runs_bytes_charged_until_it_ends() {
         {"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"n": {"$documentNumber": {}}}}},
         {"$project": {"_id": 1}},
     ], "as": "u"}});
-    let foreign = docs_bytes(&padded(4, 10_000));
+    let foreign = held_docs_bytes(&padded(4, 10_000));
     let cap = 5 * foreign;
     let outside = run(&state, json!([lookup.clone(), {"$count": "n"}]), capped(cap)).unwrap();
     assert_eq!(outside["documents"], json!([{"n": 8}]));
@@ -462,4 +462,54 @@ fn a_joined_document_is_held_to_the_limit_of_a_document_as_a_whole() {
         assert_eq!(ok["count"], 2, "{pipeline}");
         assert_eq!(state.aggregate_memory().pool().used(), 0);
     }
+}
+
+/// `n` documents of 400 integer fields: 3.9 KB of BSON and about 92 KB parsed each.
+fn wide(n: i32) -> Vec<Document> {
+    (0..n)
+        .map(|i| {
+            let mut d = doc! {"_id": i, "k": 1};
+            for f in 0..400 {
+                d.insert(format!("f{f}"), f);
+            }
+            d
+        })
+        .collect()
+}
+
+#[test]
+fn the_answer_charges_its_documents_at_the_parsed_estimate_beside_their_json() {
+    // 12 documents of 400 integer fields: 47 KB of BSON, 1.1 MB parsed. A limit that holds
+    // the source read (at the estimate) and not the answer (the documents again and their
+    // JSON) refuses the answer; the BSON bytes of the documents and the JSON together would
+    // have fitted a tenth of it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, wide(12), vec![]);
+    let parsed = held_docs_bytes(&wide(12));
+    let err = refusal(run(&state, json!([]), capped(parsed + 1_000)));
+    names(&err, "the answer");
+    let ok = run(&state, json!([]), capped(parsed + 500_000)).unwrap();
+    assert_eq!(ok["count"], 12);
+    // The documents and their JSON (about 53 KB of it) are what the answer holds at its peak.
+    let err = refusal(run(&state, json!([]), capped(parsed + 20_000)));
+    names(&err, "the answer");
+}
+
+#[test]
+fn a_lookup_charges_the_attached_documents_at_the_parsed_estimate() {
+    // Two local documents each joined to three wide foreign ones (3.9 KB of BSON, 92 KB
+    // parsed each): the read holds the three, the output holds two arrays of copies.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(2, 10), wide(3));
+    let lookup =
+        json!([{"$lookup": {"from": "users", "localField": "k", "foreignField": "k", "as": "u"}}]);
+    let input = held_docs_bytes(&padded(2, 10));
+    let foreign = held_docs_bytes(&wide(3));
+    // The input, the foreign documents and one array of copies fit; two arrays do not.
+    let err = refusal(run(&state, lookup.clone(), capped(input + foreign + foreign + foreign / 2)));
+    names(&err, "the output of $lookup");
+    let mut counted = lookup.as_array().unwrap().clone();
+    counted.push(json!({"$count": "n"}));
+    let ok = run(&state, json!(counted), capped(input + foreign + 2 * foreign + 20_000)).unwrap();
+    assert_eq!(ok["documents"], json!([{"n": 2}]));
 }

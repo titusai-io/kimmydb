@@ -1,8 +1,9 @@
 //! The memory an aggregation may hold, derived from the memory kimmyd runs under (ADR-269).
 //!
-//! The budget counts encoded BSON, and the memory a request really takes is 2.5 to 5 times
-//! that. A fixed default (1 GiB a request) would therefore let one request end a member in a
-//! 2 GiB container. The defaults are instead worked out from what the process may use: the
+//! The budget counts an estimate of the memory the held documents take parsed, and the
+//! memory a request really takes is that and the transient copies of an answer being built.
+//! A fixed default (1 GiB a request) would let one request end a member in a 2 GiB
+//! container. The defaults are instead worked out from what the process may use: the
 //! memory limit of the cgroup it runs in, else the machine's RAM (`MemTotal`). The pool is a
 //! tenth of it, and one request may hold half the pool. An explicit setting always wins.
 //!

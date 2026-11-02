@@ -21,3 +21,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# The calibration test asks the allocator how much a block really takes.
+libc.workspace = true

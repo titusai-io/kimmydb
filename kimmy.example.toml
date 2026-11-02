@@ -244,17 +244,18 @@ commit_coalesce_ms = 5
 #
 # A pipeline holds its documents whole, so one aggregation can hold more than a
 # member has: a thousand documents each given an 8 MiB string by $addFields are
-# 8 GB. Everything a request holds is counted in bytes of BSON: the documents it
-# reads, each stage's input and output while the stage runs, the groups and
-# joined arrays it builds, and its answer.
+# 8 GB. Everything a request holds is counted in an estimate of the bytes it takes
+# parsed (a long string about its BSON size, a document of many small fields many
+# times it): the documents it reads, each stage's input and output while the stage
+# runs, the groups and joined arrays it builds, and its answer.
 [aggregate]
 # Neither setting has a fixed default: unset, both are worked out at startup from the
 # memory the process may use (the memory limit of the cgroup it runs in: the tightest
 # `memory.max` (v2) or `memory.limit_in_bytes` (v1) from its own cgroup, the path in
 # /proc/self/cgroup, up to the root, else the machine's RAM), and the startup log says
 # from which file.
-# The budget counts encoded BSON while the memory a request really takes is 2.5 to 5
-# times that, so the pool is a tenth of the memory and a request may hold half the pool:
+# The budget counts the parsed size of what a request holds, and a request takes more than
+# that while it builds its answer, so the pool is a tenth of the memory and a request may hold half the pool:
 # a 2 GiB container gets a pool of about 200 MiB and about 100 MiB a request. Setting
 # either (here, KIMMY_AGGREGATE_MEMORY_* or the flags) overrides it.
 

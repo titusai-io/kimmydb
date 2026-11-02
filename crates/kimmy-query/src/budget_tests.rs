@@ -9,7 +9,7 @@ use kimmy_core::Error;
 use crate::aggregate::{self, Limits};
 use crate::budget::{
     BufferBudget, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_MEMORY_POOL_BYTES, MemoryPool, doc_bytes,
-    docs_bytes,
+    docs_bytes, held_bytes, held_bytes_bson, held_docs_bytes,
 };
 
 fn capped(cap: usize) -> Limits {
@@ -200,9 +200,9 @@ fn a_request_over_its_own_limit_is_counted_apart_and_takes_nothing_from_the_pool
 
 #[test]
 fn the_pool_gets_everything_back_when_a_request_fails_or_panics() {
-    let pool = MemoryPool::new(1_000);
+    let pool = MemoryPool::new(1_000_000);
     // A stage that fails with the budget partly charged.
-    let limits = pooled(1_000, &pool);
+    let limits = pooled(1_000_000, &pool);
     let err =
         run(doc! {"$addFields": {"x": {"$divide": [1, 0]}}}, padded(3, 100), &limits).unwrap_err();
     assert!(matches!(err, Error::InvalidQuery(_)), "{err:?}");
@@ -214,7 +214,7 @@ fn the_pool_gets_everything_back_when_a_request_fails_or_panics() {
     ));
     assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
     // One that panics with a lease held: the unwinding drops it.
-    let budget = BufferBudget::pooled(1_000, &pool);
+    let budget = BufferBudget::pooled(1_000_000, &pool);
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut lease = budget.lease("x");
         lease.charge(500).unwrap();
@@ -258,7 +258,7 @@ fn two_requests_cannot_both_take_the_last_of_the_pool() {
 #[test]
 fn a_stage_that_builds_documents_holds_its_input_and_its_output_at_once() {
     let input = padded(20, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     for stage in [
         doc! {"$addFields": {"extra": "$pad"}},
         doc! {"$set": {"extra": "$pad"}},
@@ -267,7 +267,7 @@ fn a_stage_that_builds_documents_holds_its_input_and_its_output_at_once() {
         doc! {"$replaceWith": {"p": "$pad"}},
     ] {
         let out = run(stage.clone(), input.clone(), &capped(usize::MAX / 4)).unwrap();
-        let held_out = docs_bytes(&out);
+        let held_out = held_docs_bytes(&out);
         // The stage runs with exactly its input and its output, and not a byte fewer.
         let limits = capped(held_in + held_out);
         assert_eq!(run(stage.clone(), input.clone(), &limits).unwrap(), out, "{stage}");
@@ -282,7 +282,7 @@ fn a_stage_that_builds_documents_holds_its_input_and_its_output_at_once() {
 #[test]
 fn a_stage_that_only_moves_its_input_holds_the_input_and_builds_nothing() {
     let input = padded(20, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     for stage in [
         doc! {"$match": {"g": 1}},
         doc! {"$sort": {"g": -1}},
@@ -305,11 +305,11 @@ fn a_stage_that_only_moves_its_input_holds_the_input_and_builds_nothing() {
 fn unwind_charges_each_copy_it_makes() {
     let input: Vec<Document> =
         (0..10).map(|i| doc! {"_id": i, "tags": vec!["aaaaaaaaaaaaaaaaaaaaaaaa"; 8]}).collect();
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let stage = doc! {"$unwind": "$tags"};
     let out = run(stage.clone(), input.clone(), &capped(usize::MAX / 4)).unwrap();
     assert_eq!(out.len(), 80);
-    let both = held_in + docs_bytes(&out);
+    let both = held_in + held_docs_bytes(&out);
     assert!(run(stage.clone(), input.clone(), &capped(both)).is_ok());
     let err = run(stage, input, &capped(both - 1)).unwrap_err();
     assert!(
@@ -322,14 +322,14 @@ fn unwind_charges_each_copy_it_makes() {
 #[test]
 fn group_holds_its_buckets_and_what_push_collects_beside_its_input() {
     let input = padded(30, 300);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let stage = doc! {"$group": {"_id": "$g", "all": {"$push": "$pad"}}};
-    // The pushed values are most of what the buckets hold: a 305-byte string and a type byte
-    // each, and a little for each of the three buckets.
-    let pushed = 30 * (1 + 5 + 300);
+    // The pushed values are most of what the buckets hold: the estimate of a 300-byte string
+    // in its slot each, and a little for each of the three buckets.
+    let pushed = 30 * held_bytes_bson(&Bson::String("x".repeat(300)));
     let smallest = smallest_cap(&stage, &input, held_in + 4 * pushed);
     assert!(smallest >= held_in + pushed, "the pushed values are charged: {smallest}");
-    assert!(smallest <= held_in + pushed + 3 * 200, "and little else is: {smallest}");
+    assert!(smallest <= held_in + pushed + 3 * 1_200, "and little else is: {smallest}");
     // Refused at the value that passes the limit, naming the buckets.
     let err = run(stage, input, &capped(smallest - 1)).unwrap_err();
     assert!(
@@ -342,7 +342,7 @@ fn group_holds_its_buckets_and_what_push_collects_beside_its_input() {
 fn the_accumulators_that_keep_values_are_charged_as_they_keep_them() {
     // One group, so the state is the whole of what is kept beyond the input.
     let input = padded(50, 400);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let keeps = |acc: Document| doc! {"$group": {"_id": null, "k": acc}};
     for (acc, kept_all) in [
         (doc! {"$push": "$pad"}, true),
@@ -372,17 +372,18 @@ fn the_accumulators_that_keep_values_are_charged_as_they_keep_them() {
 #[test]
 fn top_n_charges_the_rows_it_keeps_and_not_the_rows_it_reads() {
     let input = padded(200, 500);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let stage = doc! {"$group": {"_id": null, "k": {"$topN": {"output": "$pad", "sortBy": {"_id": 1}, "n": 2}}}};
     let smallest = smallest_cap(&stage, &input, held_in + 100_000);
-    // Two rows of 500 bytes are kept at a time, however many are read.
-    assert!(smallest - held_in < 4 * 600, "{}", smallest - held_in);
+    // Two rows of 500 bytes are kept at a time, however many are read: a few KB, where the
+    // 200 rows read would be over 100 KB.
+    assert!(smallest - held_in < 6_000, "{}", smallest - held_in);
 }
 
 #[test]
 fn bucket_and_bucket_auto_and_sort_by_count_hold_their_buckets() {
     let input = padded(60, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     for stage in [
         doc! {"$bucket": {"groupBy": "$_id", "boundaries": [0, 20, 40, 60], "output": {"all": {"$push": "$pad"}}}},
         doc! {"$bucketAuto": {"groupBy": "$_id", "buckets": 3, "output": {"all": {"$push": "$pad"}}}},
@@ -405,10 +406,10 @@ fn bucket_and_bucket_auto_and_sort_by_count_hold_their_buckets() {
 #[test]
 fn redact_charges_the_copies_it_keeps() {
     let input = padded(20, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let stage = doc! {"$redact": "$$KEEP"};
     let out = run(stage.clone(), input.clone(), &capped(usize::MAX / 4)).unwrap();
-    let both = held_in + docs_bytes(&out);
+    let both = held_in + held_docs_bytes(&out);
     assert!(run(stage.clone(), input.clone(), &capped(both)).is_ok());
     assert!(is_too_large(&run(stage, input, &capped(both - 1)).unwrap_err()));
 }
@@ -419,7 +420,7 @@ fn the_blocking_stages_charge_their_buffers_once_not_twice() {
     // is not charged a second time.
     let input: Vec<Document> =
         (0..20).map(|i| doc! {"_id": i, "g": i % 2, "pad": "x".repeat(100)}).collect();
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let stage =
         doc! {"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"n": {"$documentNumber": {}}}}};
     let smallest = smallest_cap(&stage, &input, 10 * held_in);
@@ -437,7 +438,8 @@ fn an_early_refusal_ends_a_stage_at_the_document_that_passes_the_limit() {
     input[2].insert("z", 0);
     let stage =
         doc! {"$addFields": {"q": {"$divide": [1, {"$ifNull": ["$z", 1]}]}, "copy": "$pad"}};
-    let err = run(stage.clone(), input.clone(), &capped(docs_bytes(&input) + 1_500)).unwrap_err();
+    let err =
+        run(stage.clone(), input.clone(), &capped(held_docs_bytes(&input) + 1_500)).unwrap_err();
     assert!(is_too_large(&err), "{err:?}");
     // With room, the stage does reach it.
     let err = run(stage, input, &capped(usize::MAX / 4)).unwrap_err();
@@ -451,7 +453,7 @@ fn an_early_refusal_ends_a_stage_at_the_document_that_passes_the_limit() {
 #[test]
 fn a_facet_holds_its_input_and_a_copy_for_each_branch_but_the_last() {
     let input = padded(20, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let two = doc! {"$facet": {"a": [{"$count": "n"}], "b": [{"$count": "n"}]}};
     // The input, and the first branch's copy of it as that branch's first stage holds it.
     let limits = capped(2 * held_in);
@@ -467,7 +469,7 @@ fn a_facet_holds_its_input_and_a_copy_for_each_branch_but_the_last() {
 #[test]
 fn the_copy_a_facet_makes_is_charged_before_it_is_made() {
     let input = padded(20, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let two = doc! {"$facet": {"a": [{"$count": "n"}], "b": [{"$count": "n"}]}};
     // Room for the input and not for a copy: refused naming the copy.
     let err = run(two, input, &capped(held_in + held_in / 2)).unwrap_err();
@@ -480,13 +482,13 @@ fn the_copy_a_facet_makes_is_charged_before_it_is_made() {
 #[test]
 fn the_branches_of_a_facet_share_one_budget_with_the_stages_inside_them() {
     let input = padded(20, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let branch = doc! {"$facet": {"a": [{"$addFields": {"e": "$pad"}}, {"$count": "n"}]}};
     // The branch's `$addFields` holds its input and its output, and the facet nothing more
     // (it hands over its only copy).
     let out =
         run(doc! {"$addFields": {"e": "$pad"}}, input.clone(), &capped(usize::MAX / 4)).unwrap();
-    let need = held_in + docs_bytes(&out);
+    let need = held_in + held_docs_bytes(&out);
     assert!(run(branch.clone(), input.clone(), &capped(need)).is_ok());
     assert!(is_too_large(&run(branch, input, &capped(need - 1)).unwrap_err()));
 }
@@ -503,12 +505,15 @@ fn big_element(size: usize) -> usize {
 #[test]
 fn fill_value_charges_its_input_once_and_each_value_it_writes() {
     let input = padded(50, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let stage = doc! {"$fill": {"output": {"big": {"value": "y".repeat(2_000)}}}};
     let out = run(stage.clone(), input.clone(), &capped(usize::MAX / 4)).unwrap();
-    let held_out = docs_bytes(&out);
-    let one = big_element(2_000);
-    assert_eq!(held_out, held_in + 50 * one);
+    // The documents have three fields, so the fourth takes the table a doubling.
+    let one = big_element(2_000) + crate::budget::held_frame_growth(3, 1);
+    // What the stage charges: its input once and, for each document, the element it writes
+    // (the estimate of what the field adds, not the difference of two whole documents).
+    let held_out = held_in + 50 * one;
+    assert!(held_docs_bytes(&out) <= held_out + 50 * 64, "the estimate covers what was built");
     // The stage holds exactly its input and the values it wrote: a budget of that passes and
     // gives everything back; a budget of one byte less is refused at the last byte. A
     // charge of the input twice would have refused the first.
@@ -537,21 +542,25 @@ fn fill_with_a_method_and_with_both_charges_its_input_once_and_every_value() {
             }
         })
         .collect();
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let int_v = crate::window::element_bytes("v", &Bson::Int32(0));
-    let one = big_element(2_000);
+    // The big value is a fourth field of a three-field document: its table doubles.
+    let growth = crate::budget::held_frame_growth(3, 1);
+    let one = big_element(2_000) + growth;
     let locf = doc! {"v": {"method": "locf"}};
     let both = doc! {"v": {"method": "locf"}, "big": {"value": "y".repeat(2_000)}};
     for (name, output, added) in [("locf", locf, 25 * int_v), ("both", both, 25 * int_v + 50 * one)]
     {
         let stage = doc! {"$fill": {"sortBy": {"_id": 1}, "output": output}};
         let out = run(stage.clone(), input.clone(), &capped(usize::MAX / 4)).unwrap();
-        assert_eq!(docs_bytes(&out), held_in + added, "{name}");
-        // The input once, the values written, and the window's sort keys and cells (under
-        // 1 KB for these 50 documents): a second charge of the input would be 11 KB more.
+        assert!(held_docs_bytes(&out) <= held_in + added + 50 * 64, "{name}");
+        let slack = 10_000 + if name == "both" { 50 * growth } else { 0 };
+        // The input once, the values written, and the window's sort keys and cells (a slot
+        // and a key for each of the 50 documents, under 10 KB): a second charge of the input
+        // would be 50 KB more.
         let smallest = smallest_cap(&stage, &input, 10 * held_in);
         assert!(smallest >= held_in + added, "{name}: {smallest}");
-        assert!(smallest < held_in + added + 1_000, "{name}: {smallest}");
+        assert!(smallest < held_in + added + slack, "{name}: {smallest}");
         let limits = capped(smallest);
         assert!(run(stage.clone(), input.clone(), &limits).is_ok(), "{name}");
         assert_eq!(limits.buffer.used(), 0, "{name}");
@@ -629,7 +638,7 @@ fn every_pure_stage() -> Vec<Document> {
 #[test]
 fn every_stage_is_refused_with_a_413_when_its_input_is_over_the_budget() {
     let input = padded(20, 200);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     for stage in every_pure_stage() {
         let name = stage.keys().next().unwrap().clone();
         // The stage runs with room for its input and is refused one byte under it.
@@ -648,51 +657,56 @@ fn every_stage_that_builds_is_refused_at_the_document_that_passes_the_budget() {
     // Each input fits with room for two built values and no more; the stage would build 40
     // of 1 KB or more, so a stage that finished would end far over the cap. The refusal's
     // total says where it stopped: within one built value of the cap.
-    let big = "q".repeat(1_000);
+    let big = "q".repeat(20_000);
     let input: Vec<Document> =
         (0..40).map(|i| doc! {"_id": i * 10, "g": i, "tags": [1, 2, 3], "pad": "x"}).collect();
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let value = Bson::String(big.clone());
-    let cases: Vec<(&str, Document, usize)> = vec![
-        ("$addFields", doc! {"$addFields": {"big": big.as_str()}}, big_element(1_000)),
-        ("$project", doc! {"$project": {"big": big.as_str()}}, big_element(1_000)),
-        ("$replaceRoot", doc! {"$replaceRoot": {"newRoot": {"big": big.as_str()}}}, 1_040),
-        ("$fill", doc! {"$fill": {"output": {"big": {"value": big.as_str()}}}}, big_element(1_000)),
+    // The unit of each: what one built value or document is charged. A stage that builds a
+    // document per input document is charged that document whole (its estimate, found by
+    // running the stage once without a cap); one that collects a value is charged the value.
+    let pushed = Some(held_bytes_bson(&value));
+    let cases: Vec<(&str, Document, Option<usize>)> = vec![
+        ("$addFields", doc! {"$addFields": {"big": big.as_str()}}, None),
+        ("$project", doc! {"$project": {"big": big.as_str()}}, None),
+        ("$replaceRoot", doc! {"$replaceRoot": {"newRoot": {"big": big.as_str()}}}, None),
+        ("$fill", doc! {"$fill": {"output": {"big": {"value": big.as_str()}}}}, None),
         (
             "$setWindowFields",
             doc! {"$setWindowFields": {"sortBy": {"_id": 1},
             "output": {"all": {"$push": "$pad", "window": {"documents": ["unbounded", "current"]}},
             "big": {"$first": value.clone()}}}},
-            // The largest value it adds to one document: the last one's array.
-            big_element(1_000),
+            None,
         ),
         (
             "$densify",
             doc! {"$densify": {"field": "_id", "range": {"step": 1, "bounds": "full"}}},
-            // A generated document: `_id` only, but there are 391 of them, 5 bytes in an
-            // input charged beside them.
-            40,
+            None,
         ),
-        (
-            "$unwind",
-            doc! {"$unwind": {"path": "$tags"}},
-            // One copy of a document.
-            120,
-        ),
-        ("$group", doc! {"$group": {"_id": null, "all": {"$push": big.as_str()}}}, 1_050),
+        ("$unwind", doc! {"$unwind": {"path": "$tags"}}, None),
+        ("$group", doc! {"$group": {"_id": null, "all": {"$push": big.as_str()}}}, pushed),
         (
             "$bucket",
             doc! {"$bucket": {"groupBy": "$_id", "boundaries": [0, 1000],
             "output": {"all": {"$push": big.as_str()}}}},
-            1_050,
+            pushed,
         ),
         (
             "$facet",
             doc! {"$facet": {"a": [{"$addFields": {"big": big.as_str()}}], "b": [{"$count": "n"}]}},
-            big_element(1_000),
+            None,
         ),
     ];
     for (name, stage, unit) in cases {
+        let unit = unit.unwrap_or_else(|| {
+            let out = run(stage.clone(), input.clone(), &capped(usize::MAX / 4)).unwrap();
+            // A `$facet` answers one document holding its branches' documents.
+            let docs: Vec<Document> = match out.first().and_then(|d| d.get_array("a").ok()) {
+                Some(a) => a.iter().filter_map(|d| d.as_document().cloned()).collect(),
+                None => out,
+            };
+            docs.iter().map(held_bytes).max().unwrap()
+        });
         // Room for the input, the stage's own copy of it, and two built values.
         let cap = 2 * held_in + 2 * unit;
         let limits = capped(cap);
@@ -737,18 +751,20 @@ fn the_library_default_is_a_fresh_fallback_budget_and_not_what_a_member_runs_on(
 }
 
 #[test]
-fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_an_explicit_limit_of_one_gib()
+fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_an_explicit_limit_of_two_gib()
 {
-    // 100,000 documents of 4 KiB are about 400 MB; `$addFields` holds them and its output,
-    // about 800 MB: under an explicit limit of 1 GiB, which is what this check needs (the
-    // derived limit of a container under about 15.4 GiB refuses it; see the next test). Worked out
-    // from real documents, charged through the real accounts, with nothing allocated.
+    // 100,000 documents of 4 KiB are 412 MB of BSON and are charged 537 MB parsed (1.30 times:
+    // the cost of being a document is about 1.2 KB beside the string); `$addFields` holds them
+    // and its output, about 1.08 GB: over an explicit limit of 1 GiB, under one of 2 GiB, which
+    // is what this check needs (the derived limit of a container under about 20 GiB refuses
+    // it; see the next test). Worked out from real documents, charged through the real
+    // accounts, with nothing allocated.
     let n = 100_000usize;
     let one = doc! {"_id": 1_i32, "pad": "x".repeat(4_096)};
     let mut grown = one.clone();
     grown.insert("flag", true);
-    let (size_in, size_out) = (doc_bytes(&one), doc_bytes(&grown));
-    let limits = Limits { buffer: BufferBudget::new(1 << 30), ..Default::default() };
+    let (size_in, size_out) = (held_bytes(&one), held_bytes(&grown));
+    let limits = Limits { buffer: BufferBudget::new(2 << 30), ..Default::default() };
     let mut input = limits.buffer.lease("the input of $addFields");
     let mut output = limits.buffer.lease("the output of $addFields");
     for _ in 0..n {
@@ -759,8 +775,12 @@ fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_an_explici
     }
     let peak = limits.buffer.used();
     assert_eq!(peak, n * (size_in + size_out));
-    assert!(peak > 800_000_000 && peak < 840_000_000, "{peak}");
+    assert!(peak > 1_050_000_000 && peak < 1_110_000_000, "{peak}");
     assert!(peak < limits.buffer.cap(), "{peak} runs under {}", limits.buffer.cap());
+    // And the plain BSON bytes of the same would have fit a limit of 1 GiB: the estimate is
+    // what makes it not.
+    assert!(n * (doc_bytes(&one) + doc_bytes(&grown)) < 1 << 30);
+    assert!(peak > 1 << 30);
     // The answer is then the documents and their JSON: still under it.
     drop(input);
     // `{"_id":1,"pad":"<4096 bytes>","flag":true}`
@@ -774,19 +794,19 @@ fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_an_explici
 
 #[test]
 fn a_hundred_thousand_documents_of_four_kib_are_refused_at_the_derived_limits() {
-    // The same 100,000 documents, 410 MB of BSON, against the limit a member derives. The
-    // source read is charged whole before any stage runs and stops at the document that
-    // passes the limit; `$addFields` holds input plus output, so it needs twice the source.
+    // The same 100,000 documents against the limit a member derives. The source read is
+    // charged whole before any stage runs and stops at the document that passes the limit;
+    // `$addFields` holds input plus output, so it needs twice the source.
     let one = doc! {"_id": 1_i32, "pad": "x".repeat(4_096)};
     let mut grown = one.clone();
     grown.insert("flag", true);
-    let (size, size_out) = (doc_bytes(&one), doc_bytes(&grown));
-    assert_eq!((size, size_out), (4_120, 4_127));
+    let (size, size_out) = (held_bytes(&one), held_bytes(&grown));
+    assert_eq!((size, size_out), (5_372, 5_408));
     let n = 100_000usize;
-    // About 824 MB are held at the peak, so `$addFields` runs from a container of about
-    // 15.4 GiB (824 MB x 20), and not in 2 or 8 GiB.
+    // About 1.08 GB are held at the peak, so `$addFields` runs from a container of about
+    // 20 GiB (1.08 GB x 20), and not in 2, 8 or 16 GiB.
     for (memory, runs) in
-        [(2usize << 30, false), (8 << 30, false), (15 << 30, false), (16 << 30, true)]
+        [(2usize << 30, false), (8 << 30, false), (16 << 30, false), (24 << 30, true)]
     {
         let (limit, pool) = derived(memory);
         let budget = BufferBudget::pooled(limit, &MemoryPool::new(pool));
@@ -800,8 +820,8 @@ fn a_hundred_thousand_documents_of_four_kib_are_refused_at_the_derived_limits() 
             }
         }
         let read_fits = at.is_none();
-        // `$addFields` then holds the input again beside what it builds (7 bytes a document
-        // more: the `flag` field). The read is the stage's input here.
+        // `$addFields` then holds the input again beside what it builds. The read is the
+        // stage's input here.
         let mut built = budget.lease("the output of $addFields");
         let output_fits = read_fits && (0..n).all(|_| built.charge(size_out).is_ok());
         assert_eq!(output_fits, runs, "{} GiB: read refused at {at:?}", memory >> 30);
@@ -809,8 +829,75 @@ fn a_hundred_thousand_documents_of_four_kib_are_refused_at_the_derived_limits() 
             assert_eq!(i, limit / size + 1, "{} GiB", memory >> 30);
         }
     }
-    // A 2 GiB member refuses the read itself, at the 26,062nd document of the 100,000.
-    assert_eq!(derived(2 << 30).0 / size + 1, 26_062);
+    // A 2 GiB member refuses the read itself, at the 19,988th document of the 100,000.
+    assert_eq!(derived(2 << 30).0 / size + 1, 19_988);
+}
+
+/// The estimate of a document of `n` integer fields, as the reviewer's wide shape.
+fn ints_doc(n: usize) -> Document {
+    let mut d = doc! {"_id": 1_i32};
+    for i in 0..n {
+        d.insert(format!("f{i}"), i as i32);
+    }
+    d
+}
+
+#[test]
+fn the_reviewers_wide_documents_are_refused_at_the_source_read_at_the_derived_limits() {
+    // The review's B2: 400 integer fields take 19 times their BSON, so 25,000 of them (100 MB
+    // of BSON, inside the old 102 MiB limit) ended a 2 GiB member. Charged at the estimate,
+    // the read stops after about a thousand. Worked out from one representative document and
+    // the limit arithmetic, with nothing allocated.
+    let wide = ints_doc(400);
+    let mut hundred = doc! {"_id": 1_i32};
+    for i in 0..50 {
+        hundred.insert(format!("n{i}"), i as i32);
+        hundred.insert(format!("s{i}"), "y".repeat(60));
+    }
+    for (name, doc, count, bson_total_mb) in
+        [("400 int fields", &wide, 25_000usize, 97usize), ("100 fields", &hundred, 100_000, 394)]
+    {
+        let (bson, charged) = (doc_bytes(doc), held_bytes(doc));
+        // The charge is what the document costs parsed: 5 to 24 times its BSON.
+        assert!(charged > 5 * bson, "{name}: {charged} for {bson}");
+        assert!(count * bson / 1_000_000 >= bson_total_mb, "{name}");
+        for memory in [2usize << 30, 8 << 30] {
+            let (limit, pool) = derived(memory);
+            let budget = BufferBudget::pooled(limit, &MemoryPool::new(pool));
+            let mut read = budget.lease("the source read");
+            let refused = (1..=count).find(|_| read.charge(charged).is_err());
+            // Refused at the first document past the limit, long before the read ends.
+            assert_eq!(refused, Some(limit / charged + 1), "{name} in {} GiB", memory >> 30);
+            assert!(refused.unwrap() < count / 4, "{name} in {} GiB", memory >> 30);
+            // The BSON bytes of what was read before the refusal are far under the limit: the
+            // old accounting would have gone on to read all of it.
+            assert!(refused.unwrap() * bson < limit / 4, "{name} in {} GiB", memory >> 30);
+        }
+    }
+    // The figures the review used: 400 int fields refused after 1,162 documents in 2 GiB and
+    // 4,650 in 8 GiB.
+    assert_eq!(derived(2 << 30).0 / held_bytes(&wide) + 1, 1_163);
+    assert_eq!(derived(8 << 30).0 / held_bytes(&wide) + 1, 4_651);
+}
+
+#[test]
+fn wide_documents_are_refused_end_to_end_under_a_small_limit_they_would_have_fit_as_bson() {
+    // The same shape scaled down: 60 documents of 400 integer fields are 234 KB of BSON and
+    // 5.5 MB parsed. Under a limit of 2 MiB the old accounting let `$count` through; the
+    // estimate refuses it at the input, a few documents past the limit, having allocated what
+    // the documents hold and no more.
+    let input: Vec<Document> = (0..60).map(|_| ints_doc(400)).collect();
+    assert!(docs_bytes(&input) < 300_000);
+    let limits = capped(2 << 20);
+    let err = run(doc! {"$count": "n"}, input.clone(), &limits).unwrap_err();
+    let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!((*what, *max), ("the input of $count", 2 << 20));
+    let each = held_bytes(&input[0]);
+    assert_eq!(*bytes, (2 << 20) / each * each + each, "refused at the document that passes it");
+    assert_eq!(limits.buffer.used(), 0);
+    // Under a limit that holds them as parsed it runs.
+    assert!(run(doc! {"$count": "n"}, input.clone(), &capped(60 * each)).is_ok());
+    assert!(run(doc! {"$count": "n"}, input, &capped(60 * each - 1)).is_err());
 }
 
 #[test]
@@ -1055,13 +1142,13 @@ fn unwind_with_an_index_field_holds_the_document_it_completes_to_the_limit_whole
 #[test]
 fn the_value_bound_and_the_budget_each_refuse_alone_and_count_the_same_bytes_once() {
     let input = padded(40, 1_000);
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let stage = doc! {"$group": {"_id": null, "all": {"$push": "$pad"}}};
     // The array of 40 strings is 40 KB. The budget is what holds it: charged once beside the
     // input (the array's own size plus the bucket), not twice.
     let smallest = smallest_cap(&stage, &input, 4 * held_in);
-    let array = 5 + 40 * (1 + 2 + 5 + 1_000);
-    assert!(smallest >= held_in + array && smallest < held_in + array + 400, "{smallest}");
+    let array = 40 * held_bytes_bson(&Bson::String("x".repeat(1_000)));
+    assert!(smallest >= held_in + array && smallest < held_in + array + 1_500, "{smallest}");
     // A budget that fits is refused by nothing; a budget one byte short names the buckets.
     let err = run(stage, input, &capped(smallest - 1)).unwrap_err();
     assert!(
@@ -1070,17 +1157,85 @@ fn the_value_bound_and_the_budget_each_refuse_alone_and_count_the_same_bytes_onc
 }
 
 #[test]
+fn a_window_output_that_makes_a_documents_table_grow_is_charged_the_growth() {
+    // Documents of three fields have a table that holds three: the fourth, `n`, takes it to
+    // seven. Each document is charged its input, the sort key taken, the cell and the growth.
+    let input: Vec<Document> = (0..10).map(|i| doc! {"_id": i, "a": 1, "b": 2}).collect();
+    let held_in = held_docs_bytes(&input);
+    let stage = doc! {"$setWindowFields": {"sortBy": {"_id": 1},
+    "output": {"n": {"$documentNumber": {}}}}};
+    let key = held_bytes_bson(&Bson::Int32(0));
+    let cell = crate::budget::held_element("n", &Bson::Int32(0));
+    let growth = crate::budget::held_frame_growth(3, 1);
+    assert!(growth > 200, "a doubling of a small table is a few hundred bytes: {growth}");
+    let exact = held_in + 10 * (key + cell + growth);
+    let smallest = smallest_cap(&stage, &input, 4 * held_in);
+    assert_eq!(smallest, exact);
+}
+
+#[test]
+fn a_group_of_many_small_buckets_is_charged_at_what_a_bucket_costs_parsed() {
+    // A bucket is an output document, its key twice over and an index entry: 400 distinct
+    // keys with nothing collected still cost what 400 parsed documents of two fields do, about
+    // a KB each, where their BSON is twenty bytes.
+    let input: Vec<Document> = (0..400).map(|i| doc! {"_id": i}).collect();
+    let held_in = held_docs_bytes(&input);
+    let stage = doc! {"$group": {"_id": "$_id", "n": {"$sum": 1}}};
+    let smallest = smallest_cap(&stage, &input, 4 * held_in + 4_000_000);
+    let buckets = smallest - held_in;
+    let bucket = buckets / 400;
+    assert!((900..3_000).contains(&bucket), "{bucket} a bucket");
+    assert!(bucket > 20 * 20, "far over the 20 bytes of BSON an output document is");
+}
+
+#[test]
+fn what_a_group_collects_is_charged_at_what_the_values_cost_parsed() {
+    // `$push: "$$ROOT"` of documents of 100 integer fields keeps each whole: a document that
+    // is 904 bytes of BSON and about 23 KB parsed. The bucket is charged the parsed size of
+    // every value it collects, beside the input (which is charged the same, once).
+    let input: Vec<Document> = (0..10)
+        .map(|i| {
+            let mut d = ints_doc(100);
+            d.insert("_id", i);
+            d
+        })
+        .collect();
+    let held_in = held_docs_bytes(&input);
+    let each = held_bytes_bson(&Bson::Document(input[0].clone()));
+    for (name, stage) in [
+        ("$push", doc! {"$group": {"_id": null, "all": {"$push": "$$ROOT"}}}),
+        ("$addToSet", doc! {"$group": {"_id": null, "all": {"$addToSet": "$$ROOT"}}}),
+        (
+            "$firstN",
+            doc! {"$group": {"_id": null, "all": {"$firstN": {"input": "$$ROOT", "n": 10}}}},
+        ),
+        ("$last", doc! {"$group": {"_id": null, "last": {"$last": "$$ROOT"}}}),
+    ] {
+        let collected = if name == "$last" { each } else { 10 * each };
+        let smallest = smallest_cap(&stage, &input, 4 * held_in + 4 * collected);
+        assert!(smallest >= held_in + collected, "{name}: {smallest} for {collected} collected");
+        // (An `$addToSet` also keeps the identity of each member: about 1 KB a member.)
+        assert!(smallest < held_in + collected + 20_000, "{name}: {smallest}");
+    }
+    // The BSON bytes of the same would be a twenty-fifth of it.
+    assert!(10 * doc_bytes(&input[0]) * 20 < 10 * each);
+}
+
+#[test]
 fn merge_objects_is_charged_by_the_document_it_builds_not_by_the_documents_it_reads() {
     // Forty documents each with a field of its own: the merged document holds all forty.
     let input: Vec<Document> = (0..40).map(|i| doc! {format!("f{i}"): "y".repeat(300)}).collect();
-    let held_in = docs_bytes(&input);
+    let held_in = held_docs_bytes(&input);
     let stage = doc! {"$group": {"_id": null, "m": {"$mergeObjects": "$$ROOT"}}};
     let smallest = smallest_cap(&stage, &input, 4 * held_in);
-    assert!(smallest >= held_in + 40 * 300, "the merged fields are charged: {smallest}");
-    assert!(smallest < held_in + 40 * 330 + 400, "and once: {smallest}");
+    // What the merged document holds: forty fields of a 300-byte string, and its table.
+    let merged = 40 * crate::budget::held_element("f00", &Bson::String("y".repeat(300)))
+        + crate::budget::held_frame_growth(0, 40);
+    assert!(smallest >= held_in + merged, "the merged fields are charged: {smallest}");
+    assert!(smallest < held_in + merged + 2_500, "and once: {smallest}");
     // The same field set over and over is one field, however many documents set it.
     let same: Vec<Document> = (0..40).map(|_| doc! {"f": "y".repeat(300)}).collect();
-    let held_same = docs_bytes(&same);
+    let held_same = held_docs_bytes(&same);
     let smallest = smallest_cap(&stage, &same, 4 * held_same);
-    assert!(smallest < held_same + 600, "{smallest}");
+    assert!(smallest < held_same + 3_000, "{smallest}");
 }

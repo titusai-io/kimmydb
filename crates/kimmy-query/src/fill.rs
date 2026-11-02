@@ -19,6 +19,7 @@ use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
 use crate::aggregate::{Limits, check_built_document};
+use crate::budget::held_frame_growth;
 use crate::expr::{Binding, Expr, Scope, type_name};
 use crate::window::{
     Func, Output, Partition, WindowSpec, apply_in, buffer_name, check_output_name, element_bytes,
@@ -220,7 +221,9 @@ pub fn apply(
                     // Charged before it is written, so a value that passes the limit stops
                     // the stage at this document. The whole element is counted, which
                     // over-counts by the few bytes of a null it replaces.
-                    lease.charge(element_bytes(name, &value))?;
+                    lease.charge(
+                        element_bytes(name, &value).saturating_add(held_frame_growth(doc.len(), 1)),
+                    )?;
                     path::set(doc, name, value)
                         .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
                 }

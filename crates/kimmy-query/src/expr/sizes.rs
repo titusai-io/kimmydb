@@ -95,12 +95,34 @@ pub(crate) struct ArrayBudget {
     max: usize,
     count: usize,
     bytes: usize,
+    /// The estimate of the memory the elements counted with [`Self::add_tracked`] hold
+    /// parsed (ADR-269); what the request's budget is charged, where `bytes` is the
+    /// BSON size the 16 MiB bound is held to.
+    held: usize,
 }
 
 impl ArrayBudget {
     /// A budget for the array `what` builds, within `max` bytes.
     pub(crate) fn new(what: &'static str, max: usize) -> Self {
-        Self { what, max, count: 0, bytes: 5 }
+        Self { what, max, count: 0, bytes: 5, held: 0 }
+    }
+
+    /// The estimate of the memory the array holds parsed: the elements counted with
+    /// [`Self::add_tracked`] and [`Self::add_payload_held`], and the array's own header.
+    pub(crate) fn held(&self) -> usize {
+        self.held.saturating_add(std::mem::size_of::<Vec<Bson>>())
+    }
+
+    /// [`Self::add`], also counting the estimate of what the element holds parsed.
+    pub(crate) fn add_tracked(&mut self, value: &Bson) -> Result<()> {
+        self.held = self.held.saturating_add(crate::budget::held_bytes_bson(value));
+        self.add(value)
+    }
+
+    /// [`Self::add_payload`], also counting `held` bytes of parsed memory for the element.
+    pub(crate) fn add_payload_held(&mut self, payload: usize, held: usize) -> Result<()> {
+        self.held = self.held.saturating_add(held);
+        self.add_payload(payload)
     }
 
     /// The size of the array as counted so far.
@@ -151,6 +173,9 @@ pub(crate) struct DocBudget {
     what: &'static str,
     max: usize,
     bytes: usize,
+    /// The estimate of the memory the fields counted with [`Self::account_held`] hold
+    /// parsed (ADR-269); `bytes` is the BSON size the 16 MiB bound is held to.
+    held: usize,
 }
 
 impl DocBudget {
@@ -161,7 +186,31 @@ impl DocBudget {
 
     /// A budget for the document `what` builds, which already holds `bytes` bytes.
     pub(crate) fn starting_at(what: &'static str, max: usize, bytes: usize) -> Self {
-        Self { what, max, bytes }
+        Self { what, max, bytes, held: 0 }
+    }
+
+    /// Count the estimate of the memory the field `key` set to `value` holds, which
+    /// replaces `old` if the document had the key.
+    pub(crate) fn account_held(
+        &mut self,
+        doc_len: usize,
+        key: &str,
+        old: Option<&Bson>,
+        value: &Bson,
+    ) {
+        let gone = old.map_or(0, |o| crate::budget::held_element(key, o));
+        let growth = if old.is_none() { crate::budget::held_frame_growth(doc_len, 1) } else { 0 };
+        self.held = self
+            .held
+            .saturating_sub(gone)
+            .saturating_add(crate::budget::held_element(key, value))
+            .saturating_add(growth);
+    }
+
+    /// The estimate of the memory the document holds parsed, for the fields counted with
+    /// [`Self::account_held`], and the document's own struct.
+    pub(crate) fn held(&self) -> usize {
+        self.held.saturating_add(std::mem::size_of::<Document>())
     }
 
     /// A budget for the document `what` builds, which is `doc` so far. Refuses

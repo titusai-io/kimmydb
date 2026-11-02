@@ -37,12 +37,12 @@ pub struct Config {
 
 /// What an aggregation may hold in memory (ADR-269).
 ///
-/// The unit is the BSON size of the documents. A pipeline holds its documents whole, so
+/// The unit is an estimate of the memory the documents take parsed. A pipeline holds its documents whole, so
 /// without a bound one request can hold more than the member has: a thousand documents
 /// each given an 8 MiB string by `$addFields` hold 8 GB, every value of it legal. Both
 /// bounds refuse the request, rather than letting the member run out of memory. The
-/// memory a request really takes is 2.5 to 5 times its BSON, and more for documents of
-/// many small fields, so **neither has a fixed default**: unset, they are worked out from
+/// memory a request really takes is a little more than that estimate (the copies of an
+/// answer being built), so **neither has a fixed default**: unset, they are worked out from
 /// the memory the process runs under (`crate::aggmem`): the pool is a tenth of the
 /// memory limit of the cgroup it runs in (the tightest cgroup v2 `memory.max` from its own
 /// cgroup up to the root, else v1 `memory.limit_in_bytes`) or,
