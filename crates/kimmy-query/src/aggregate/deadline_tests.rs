@@ -365,3 +365,78 @@ fn a_pipeline_update_stops_at_the_first_stage_it_runs() {
     let mut again = rows(1).remove(0);
     assert!(is_deadline(pipeline.apply(&mut again)));
 }
+
+/// An element that costs tens of milliseconds and ticks nowhere inside: two big ranges
+/// merged into one set (ADR-266: the cost of the work, not the number of iterations, is
+/// what the cadence has to follow).
+fn expensive() -> Bson {
+    Bson::Document(doc! { "$size": { "$setUnion": [
+        { "$range": [0, 60_000] },
+        { "$range": [30_000, 90_000] },
+    ] } })
+}
+
+#[test]
+fn a_project_over_a_thousand_documents_each_dearer_than_the_deadline_is_cut_within_a_bound() {
+    // Under a count-based cadence the clock was read at document 1 and next at document
+    // 1,025, so a stage of fewer than a thousand and twenty-four documents was never cut:
+    // it ran for as long as the sum of its documents. Now it is read at every document
+    // that costs more than ten milliseconds.
+    let stage = stage(doc! { "$project": { "s": expensive() } });
+    let input: Vec<Document> = (0..1_000).map(|i| doc! { "_id": i }).collect();
+    let started = std::time::Instant::now();
+    let _deadline = Deadline::scope(Some(Duration::from_millis(30)));
+    assert!(is_deadline(apply(&stage, input, &Limits::default())));
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(10), "cut after {took:?}");
+}
+
+#[test]
+fn a_map_whose_every_element_is_dearer_than_the_deadline_is_cut_within_a_bound() {
+    let inner = expensive();
+    let map = doc! { "$map": { "input": { "$range": [0, 3_000] }, "as": "n", "in": inner } };
+    let parsed = Expr::parse(&Bson::Document(map)).unwrap();
+    let started = std::time::Instant::now();
+    let _deadline = Deadline::scope(Some(Duration::from_millis(30)));
+    assert!(is_deadline(parsed.eval(&doc! {})));
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(10), "cut after {took:?}");
+}
+
+#[test]
+fn the_bulk_operators_charge_what_they_are_about_to_touch() {
+    use kimmy_core::deadline::ticks_taken;
+    let parsed = Expr::parse(&Bson::Document(doc! { "$size": { "$setUnion": [
+        { "$range": [0, 5_000] }, { "$range": [0, 5_000] },
+    ] } }))
+    .unwrap();
+    let _deadline = Deadline::scope(Some(Duration::from_secs(3600)));
+    let before = ticks_taken();
+    parsed.eval(&doc! {}).unwrap();
+    // Two ranges of 5,000 are made (10,000), and the set operator is charged its two
+    // arrays (10,000 more).
+    assert!(ticks_taken() - before >= 20_000, "{} ticks", ticks_taken() - before);
+    // A regex over a long string is charged by the sixteen bytes before it runs.
+    let long = "ab".repeat(8_000);
+    let regex =
+        Expr::parse(&Bson::Document(doc! { "$regexMatch": { "input": long, "regex": "b+c" } }))
+            .unwrap();
+    let before = ticks_taken();
+    regex.eval(&doc! {}).unwrap();
+    assert!(ticks_taken() - before >= 1_000, "{} ticks", ticks_taken() - before);
+}
+
+#[test]
+fn each_accumulator_step_ticks() {
+    use kimmy_core::deadline::ticks_taken;
+    let Stage::Group { id, fields } =
+        stage(doc! { "$group": { "_id": null, "s": { "$sum": "$v" }, "p": { "$push": "$v" } } })
+    else {
+        unreachable!()
+    };
+    let _deadline = Deadline::scope(Some(Duration::from_secs(3600)));
+    let before = ticks_taken();
+    group(rows(500), &id, &fields, &Limits::default(), &[]).unwrap();
+    // Two accumulators over 500 documents.
+    assert!(ticks_taken() - before >= 1_000, "{} ticks", ticks_taken() - before);
+}

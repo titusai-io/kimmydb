@@ -2328,7 +2328,27 @@ pub(crate) fn count_bson(n: usize) -> Bson {
     integer_bson(i64::try_from(n).unwrap_or(i64::MAX))
 }
 
+/// What an operator's arguments ask of it in elements and characters, charged to the
+/// deadline's count before it runs (ADR-266): an array's length, a string's length over
+/// sixteen, a document's fields. A bulk operator (a set operator, `$sortArray`,
+/// `$concatArrays`, `$zip`, `$in`, `$split`, `$replaceAll`, `$objectToArray`, an array
+/// `$sum`) does work in proportion to this, without a loop of its own that ticks, so an
+/// operator over a big array reads the clock at once however it is nested.
+fn charge_bulk(args: &[Bson]) -> Result<()> {
+    let mut weight = 0usize;
+    for arg in args {
+        weight += match arg {
+            Bson::Array(items) => items.len(),
+            Bson::String(text) => text.len() / 16,
+            Bson::Document(doc) => doc.len(),
+            _ => 0,
+        };
+    }
+    if weight >= 32 { deadline::tick_n(weight) } else { Ok(()) }
+}
+
 fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
+    charge_bulk(args)?;
     match op {
         Op::Add => arithmetic_add(args),
         Op::Subtract => arithmetic_subtract(&args[0], &args[1]),
@@ -3304,6 +3324,8 @@ fn range_within(args: &[Bson], max: usize) -> Result<Bson> {
     let span = if step > 0 { end.saturating_sub(start) } else { start.saturating_sub(end) };
     let count = if span <= 0 { 0 } else { span.unsigned_abs().div_ceil(step.unsigned_abs()) };
     check_array_bytes("the array $range builds", range_bytes(count), max)?;
+    // The elements about to be made count as ticks (ADR-266): their number, not this call.
+    deadline::tick_n(usize::try_from(count).unwrap_or(usize::MAX))?;
     Ok(Bson::Array((0..count as i64).map(|i| Bson::Int32((start + i * step) as i32)).collect()))
 }
 

@@ -2,17 +2,17 @@
 //!
 //! Two kinds of test. With a deadline that has already passed, each stage's own entry point
 //! (not `aggregate::apply`, whose stage entry would answer first) stops at the first
-//! iteration of its first loop. And with a deadline an hour away, a count of the looks at the
-//! clock proves that each loop ticks: `n` ticks read the clock `1 + (n - 1) / 1024` times,
-//! so a loop that stopped ticking would take its share off the count. The floors below are
-//! the loops that tick once for each document or point, added up, and are checked against the
-//! reads the real run made.
+//! iteration of its first loop. And with a deadline an hour away, the exact count of ticks
+//! the shared count has taken (`deadline::ticks_taken`) proves that each loop ticks: a loop
+//! that stopped ticking would take its share off the count, even when the loop before it
+//! would still stop the stage. The floors below are the loops that tick once for each
+//! document or point, added up.
 
 use std::time::Duration;
 
 use bson::{Bson, Document, doc};
 use kimmy_core::Error;
-use kimmy_core::deadline::{Deadline, clock_reads};
+use kimmy_core::deadline::{Deadline, ticks_taken};
 
 use crate::aggregate::{self, Limits, Stage};
 
@@ -26,17 +26,16 @@ fn rows(n: usize) -> Vec<Document> {
     (0..n as i64).map(|i| doc! { "_id": i, "k": i % 3, "v": i, "gap": if i % 2 == 0 { Bson::Int64(i) } else { Bson::Null } }).collect()
 }
 
-/// Run `f` under a deadline an hour away and say how often it looked at the clock.
-fn reads_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+/// Run `f` under a deadline an hour away and say how many ticks it took.
+fn ticks_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let _deadline = Deadline::scope(Some(Duration::from_secs(3600)));
-    let before = clock_reads();
+    let before = ticks_taken();
     let out = f();
-    (out, clock_reads() - before)
+    (out, ticks_taken() - before)
 }
 
-/// The reads `ticks` ticks of the shared count make, the first included.
 fn floor(ticks: usize) -> u64 {
-    1 + (ticks as u64 - 1) / 1024
+    ticks as u64
 }
 
 fn window(spec: Document, input: Vec<Document>) -> kimmy_core::Result<Vec<Document>> {
@@ -120,9 +119,9 @@ fn densify_and_fill_stop_on_their_first_iteration() {
 fn a_window_over_a_partitioned_sorted_input_ticks_for_each_loop_over_its_documents() {
     // The partition loop, the sort-key loop, the slide of the accumulator and the
     // write-back: four loops over the documents.
-    let (out, reads) = reads_of(|| window(sum_spec(), rows(N)).unwrap());
+    let (out, ticks) = ticks_of(|| window(sum_spec(), rows(N)).unwrap());
     assert_eq!(out.len(), N);
-    assert!(reads >= floor(4 * N), "{reads} reads for {N} documents");
+    assert!(ticks >= floor(4 * N), "{ticks} ticks for {N} documents");
 }
 
 #[test]
@@ -140,9 +139,9 @@ fn the_ranking_and_filling_functions_tick_for_each_document() {
         ),
     ] {
         let name = format!("{spec}");
-        let (out, reads) = reads_of(|| window(spec, rows(N)).unwrap());
+        let (out, ticks) = ticks_of(|| window(spec, rows(N)).unwrap());
         assert_eq!(out.len(), N);
-        assert!(reads >= floor(loops * N), "{name}: {reads} reads");
+        assert!(ticks >= floor(loops * N), "{name}: {ticks} ticks");
     }
 }
 
@@ -152,20 +151,20 @@ fn densify_ticks_while_it_counts_and_while_it_generates() {
     // in the pass that makes them, and the documents are read once.
     let input = vec![doc! { "_id": 0, "v": 0 }, doc! { "_id": 1, "v": 6000 }];
     let spec = doc! { "field": "v", "range": { "step": 1, "bounds": "full" } };
-    let (out, reads) = reads_of(|| densify(spec, input).unwrap());
+    let (out, ticks) = ticks_of(|| densify(spec, input).unwrap());
     assert_eq!(out.len(), 6001);
-    assert!(reads >= floor(2 * 5999), "{reads} reads");
+    assert!(ticks >= floor(2 * 5999), "{ticks} ticks");
 }
 
 #[test]
 fn fill_ticks_for_each_document_it_fills() {
-    let (out, reads) =
-        reads_of(|| fill(doc! { "output": { "gap": { "value": 0 } } }, rows(N)).unwrap());
+    let (out, ticks) =
+        ticks_of(|| fill(doc! { "output": { "gap": { "value": 0 } } }, rows(N)).unwrap());
     assert_eq!(out.len(), N);
-    assert!(reads >= floor(N), "{reads} reads");
-    let (_, reads) = reads_of(|| {
+    assert!(ticks >= floor(N), "{ticks} ticks");
+    let (_, ticks) = ticks_of(|| {
         fill(doc! { "sortBy": { "v": 1 }, "output": { "gap": { "method": "locf" } } }, rows(N))
             .unwrap()
     });
-    assert!(reads >= floor(4 * N), "{reads} reads for locf");
+    assert!(ticks >= floor(4 * N), "{ticks} ticks for locf");
 }

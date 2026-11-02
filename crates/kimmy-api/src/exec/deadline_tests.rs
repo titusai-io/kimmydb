@@ -353,3 +353,44 @@ fn a_pipeline_update_is_cut_before_it_writes_and_runs_with_time_left() {
     let stored = state.engine.get(&meta, &DocId::Int64(1)).unwrap().unwrap();
     assert_eq!(stored.get_i64("touched").unwrap(), 2);
 }
+
+#[test]
+fn a_find_and_modify_that_has_committed_answers_whatever_the_deadline_says() {
+    // ADR-192: after the first commit nothing may answer `503 timeout`. A positional
+    // projection re-evaluates the filter for the answer, and an `$expr` over an array
+    // ticks the deadline, which passes between the commit and the answer here.
+    let dir = tempfile::tempdir().unwrap();
+    let state = live_state(&dir);
+    seed_docs(
+        &state,
+        "orders",
+        vec![doc! { "_id": 1, "n": 0, "items": [{ "q": 0 }, { "q": 5 }, { "q": 7 }] }],
+    );
+    let filter = json!({
+        "items.q": { "$gt": 2 },
+        "$expr": { "$gt": [{ "$size": { "$filter": {
+            "input": "$items", "as": "i", "cond": { "$gt": ["$$i.q", 0] } } } }, 0] },
+    });
+    let spec = || FindAndModifySpec {
+        filter: Some(filter.clone()),
+        sort: None,
+        update: Some(json!({ "$inc": { "n": 1 } })),
+        remove: false,
+        upsert: false,
+        return_document: ReturnDocument::After,
+        projection: Some(json!({ "items.$": 1 })),
+        if_stamp: None,
+        array_filters: Vec::new(),
+    };
+    AFTER_ENGINE.set(Some(Box::new(|| {
+        std::mem::forget(Deadline::scope(Some(PAST)));
+    })));
+    let answered =
+        in_a_request(PLENTY, || find_and_modify(&state, &root(), "app", "orders", spec()));
+    let body = answered.expect("a committed write is answered, not timed out");
+    assert_eq!(body["modified"], 1);
+    assert_eq!(body["document"]["items"], json!([{ "q": 5 }]));
+    let meta = state.engine.get_collection("app", "orders").unwrap();
+    let stored = state.engine.get(&meta, &DocId::Int64(1)).unwrap().unwrap();
+    assert_eq!(stored.get_i32("n").unwrap(), 1, "what the answer says landed");
+}

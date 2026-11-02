@@ -1335,6 +1335,8 @@ pub fn update(
     let outcome = kimmy_storage::blocking(|| {
         state.engine.modify_where(&meta, &candidates, &modify, stop_after)
     })?;
+    // The answer is built from counts, but nothing after the engine's commits may be cut.
+    let _written = deadline::Deadline::suspend();
 
     let mut body = json!({
         "matched": outcome.matched,
@@ -1590,6 +1592,14 @@ fn implied_equalities(filter: &filter::Filter, out: &mut Document) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A step a test runs between the engine's commit and the answer of `find_and_modify`,
+    /// where a deadline passes in the case it pins (ADR-266).
+    static AFTER_ENGINE: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub fn find_and_modify(
     state: &SharedState,
     auth: &Auth,
@@ -1711,6 +1721,14 @@ pub fn find_and_modify(
     // (ADR-199).
     let outcome =
         kimmy_storage::blocking(|| state.engine.find_and_modify(&meta, &candidates, &modify))?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_ENGINE.take() {
+        hook();
+    }
+    // The write has happened (or there was none): from here nothing may answer `503 timeout`
+    // (ADR-192, ADR-266). The answer below re-evaluates the filter for a positional
+    // projection, which reads the deadline; it is built whatever the clock says.
+    let _written = deadline::Deadline::suspend();
 
     let returned = match spec.return_document {
         ReturnDocument::Before => outcome.before.clone(),
@@ -1804,6 +1822,8 @@ pub fn delete(
     let outcome = kimmy_storage::blocking(|| {
         state.engine.modify_where(&meta, &candidates, &modify, stop_after)
     })?;
+    // The answer is built from counts, but nothing after the engine's commits may be cut.
+    let _written = deadline::Deadline::suspend();
 
     let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
     if let Some(stamp) = single_stamp(multi, &outcome) {

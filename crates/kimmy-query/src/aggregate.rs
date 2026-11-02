@@ -2701,6 +2701,9 @@ fn init_within((_, acc): &(String, Accumulator), max: usize) -> AccState {
 
 /// Feed one document to one accumulator.
 pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
+    // One tick for each accumulator step (ADR-266): the argument can be an expression of any
+    // cost, and the stage's own ticker counts documents, not steps.
+    deadline::tick()?;
     match (state, acc) {
         (AccState::Ext(state), Accumulator::Ext(spec)) => state.accumulate(spec, scope)?,
         (AccState::Sum(total), Accumulator::Sum(e)) => {
