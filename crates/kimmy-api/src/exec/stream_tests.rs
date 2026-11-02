@@ -330,7 +330,7 @@ fn a_pipeline_of_more_than_a_thousand_stages_is_a_400_that_names_the_count_and_t
 }
 
 #[test]
-fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_or_a_few_groups() {
+fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_a_few_groups_or_a_heap() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, padded(40, 10_000));
     let all = held_docs_bytes(&padded(40, 10_000));
@@ -356,6 +356,14 @@ fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_or_a_few
             json!([{"$sortByCount": {"$mod": ["$_id", 3]}}]),
             json!([{"_id": 0, "count": 14}, {"_id": 1, "count": 13}, {"_id": 2, "count": 13}]),
         ),
+        (
+            json!([{"$sort": {"_id": -1}}, {"$limit": 3}, {"$project": {"_id": 1}}]),
+            json!([{"_id": 39}, {"_id": 38}, {"_id": 37}]),
+        ),
+        (
+            json!([{"$sort": {"_id": -1}}, {"$skip": 1}, {"$limit": 2}, {"$project": {"_id": 1}}]),
+            json!([{"_id": 38}, {"_id": 37}]),
+        ),
         // Behind a stage that streams, and followed by one.
         (
             json!([{"$addFields": {"c": "$pad"}}, {"$count": "n"}, {"$addFields": {"m": 1}}]),
@@ -375,7 +383,7 @@ fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_or_a_few
 }
 
 #[test]
-fn a_group_over_keys_that_never_repeat_is_refused_at_the_bytes_of_its_buckets() {
+fn a_state_that_grows_with_the_input_is_refused_at_its_bytes_or_its_documents() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, padded(40, 10_000));
     // One bucket for each document, each keeping its padding: nothing streaming can help.
@@ -393,6 +401,13 @@ fn a_group_over_keys_that_never_repeat_is_refused_at_the_bytes_of_its_buckets() 
     let err = run(&state, json!([{"$group": {"_id": "$_id"}}]), with_ceiling(10)).unwrap_err();
     assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
     assert!(err.message.contains("$group produced 11 documents"), "{}", err.message);
+    // A `$sort` with a `$limit` holds that many documents, and the ceiling is on those: a heap
+    // of ten is answered over thirty, a heap of eleven is not.
+    let sorted = |limit: i64| json!([{"$sort": {"_id": -1}}, {"$limit": limit}]);
+    let ok = run(&state, sorted(10), with_ceiling(10)).unwrap();
+    assert_eq!(ok["count"], 10);
+    let err = run(&state, sorted(11), with_ceiling(10)).unwrap_err();
+    assert!(err.message.contains("$sort produced 11 documents"), "{}", err.message);
     // A few groups over the same source and ceiling are answered: the ceiling is on the groups.
     let ok = run(&state, json!([{"$group": {"_id": "$k", "n": {"$sum": 1}}}]), with_ceiling(10));
     assert_eq!(ok.unwrap()["count"], 5);

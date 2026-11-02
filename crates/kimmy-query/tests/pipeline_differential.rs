@@ -25,6 +25,13 @@
 //!
 //! `limit_stops_the_source_scan` holds the chain to the other thing a source needs: that it
 //! says `Done` when the last document that is wanted has been pushed.
+//!
+//! The stages that hold a state and not their input (`$count`, `$group`, `$bucket`,
+//! `$sortByCount`, a `$sort` with a `$limit` after it) take their documents one at a time, so
+//! the first failure in document order is the pipeline's, whether it is the stage's own or an
+//! earlier stage's on a later document: the lazy model runs them that way. The heap that
+//! stands for a `$sort` and a `$limit` is held to a naive sort-then-take, written out below
+//! and sharing nothing with it but the comparison of two documents.
 
 use std::cell::RefCell;
 
@@ -33,6 +40,7 @@ use kimmy_core::Error;
 use kimmy_query::aggregate::{self, Held, Limits, Stage};
 use kimmy_query::budget::Lease;
 use kimmy_query::pipeline::{self, Flow};
+use kimmy_query::shape::{self, SortKey};
 use kimmy_query::stages;
 use proptest::prelude::*;
 
@@ -311,6 +319,10 @@ fn stage() -> impl Strategy<Value = Document> {
         (1i32..4).prop_map(|n| doc! { "$limit": n }),
         Just(doc! { "$sort": { "a": 1 } }),
         Just(doc! { "$sort": { "b": -1, "_id": 1 } }),
+        // Keys that tie: most documents share a value, and an array sorts by an element.
+        Just(doc! { "$sort": { "a": -1 } }),
+        Just(doc! { "$sort": { "arr": 1 } }),
+        Just(doc! { "$sort": { "b": 1, "a": -1 } }),
         Just(doc! { "$group": { "_id": "$a", "n": { "$sum": 1 }, "m": { "$max": "$b" } } }),
         Just(doc! { "$group": { "_id": null, "total": { "$sum": "$b" } } }),
         Just(doc! { "$count": "n" }),
@@ -460,6 +472,154 @@ proptest! {
         ];
         let stages = pipeline_of(&specs);
         held_to_each_other(&stages, &docs, &specs)?;
+    }
+}
+
+/// Keys that tie a lot, over documents that share most of their values.
+fn tie_keys() -> impl Strategy<Value = Vec<SortKey>> {
+    let key = |path: &str, descending: bool| SortKey { path: path.to_string(), descending };
+    prop_oneof![
+        Just(vec![key("a", false)]),
+        Just(vec![key("a", true)]),
+        Just(vec![key("b", false), key("a", true)]),
+        Just(vec![key("b", true), key("a", false), key("c", false)]),
+        Just(vec![key("arr", false)]),
+        Just(vec![key("arr", true), key("sub.k", false)]),
+        Just(vec![key("missing", false)]),
+    ]
+}
+
+/// Documents with few distinct values, so that most keys tie: a number in two types that
+/// compare equal, a string, a missing field and a null.
+fn tie_documents() -> impl Strategy<Value = Vec<Document>> {
+    let value = prop_oneof![
+        Just(Some(Bson::Int32(0))),
+        Just(Some(Bson::Int64(0))),
+        Just(Some(Bson::Double(0.0))),
+        Just(Some(Bson::Int32(1))),
+        Just(Some(Bson::Double(1.0))),
+        Just(Some(Bson::String("x".into()))),
+        Just(Some(Bson::Null)),
+        Just(None),
+    ];
+    let one = (value.clone(), value.clone(), value, prop::collection::vec(0i32..2, 0..3)).prop_map(
+        |(a, b, c, arr)| {
+            let mut d = Document::new();
+            for (name, v) in [("a", a), ("b", b), ("c", c)] {
+                if let Some(v) = v {
+                    d.insert(name, v);
+                }
+            }
+            d.insert("arr", arr);
+            d.insert("sub", doc! { "k": d.get("a").cloned().unwrap_or(Bson::Null) });
+            d
+        },
+    );
+    prop::collection::vec(one, 0..40).prop_map(|docs| {
+        docs.into_iter()
+            .enumerate()
+            .map(|(id, mut d)| {
+                // The arrival order is in the document, so a tie shows which came first.
+                let mut with_id = doc! { "_id": id as i32 };
+                with_id.extend(std::mem::take(&mut d));
+                with_id
+            })
+            .collect()
+    })
+}
+
+/// The first `skip + limit` documents of a stable sort, `skip` of them dropped, written out:
+/// each document goes in after the last one held that does not sort after it, so that equal
+/// documents stay in arrival order. It shares with the heap only `shape::compare`, the order of
+/// two documents, and not the keys taken once, the comparison of keys, the merge of runs or
+/// the heap.
+fn naive_sort_then_take(
+    keys: &[SortKey],
+    docs: &[Document],
+    skip: usize,
+    limit: usize,
+) -> Vec<Document> {
+    let mut sorted: Vec<&Document> = Vec::new();
+    for doc in docs {
+        let mut at = sorted.len();
+        while at > 0 && shape::compare(keys, doc, sorted[at - 1]) == std::cmp::Ordering::Less {
+            at -= 1;
+        }
+        sorted.insert(at, doc);
+    }
+    sorted.into_iter().skip(skip).take(limit).cloned().collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 3000, ..ProptestConfig::default() })]
+
+    /// The heap of `keep` documents is the naive sort-then-take, ties in arrival order, and it
+    /// never holds more than it keeps.
+    #[test]
+    fn the_heap_of_a_sort_is_a_naive_sort_then_take(
+        keys in tie_keys(),
+        docs in tie_documents(),
+        skip in 0usize..6,
+        limit in 1usize..9,
+    ) {
+        let limits = Limits::default();
+        let mut lease = limits.buffer.lease("the heap");
+        let keep = skip + limit;
+        let mut top = shape::TopK::new(&keys, keep);
+        for doc in &docs {
+            top.offer(doc.clone(), &mut lease, &limits).unwrap();
+            prop_assert!(top.len() <= keep, "{} held of {keep}", top.len());
+        }
+        prop_assert!(top.peak() <= keep);
+        prop_assert_eq!(top.peak(), docs.len().min(keep), "it fills to the most it keeps");
+        let got: Vec<Document> = top.into_sorted().into_iter().skip(skip).take(limit).collect();
+        let want = naive_sort_then_take(&keys, &docs, skip, limit);
+        prop_assert_eq!(format!("{got:?}"), format!("{want:?}"), "{:?}", keys);
+        // And what it held is what the sort of everything gives, as `sort_until_deadline` does.
+        let sorted = shape::sort_until_deadline(&keys, docs.clone()).unwrap();
+        let sorted: Vec<Document> = sorted.into_iter().skip(skip).take(limit).collect();
+        prop_assert_eq!(format!("{sorted:?}"), format!("{want:?}"), "{:?}", keys);
+    }
+
+    /// A `$sort` with its `$skip` and `$limit` through the chain is the same naive answer,
+    /// with stages before and after, and the chain pushed whole and one at a time.
+    #[test]
+    fn a_sort_and_its_window_through_the_chain_are_a_naive_sort_then_take(
+        keys in tie_keys(),
+        docs in tie_documents(),
+        skip in prop::option::of(0usize..6),
+        limit in 1usize..9,
+    ) {
+        let mut sort = Document::new();
+        for key in &keys {
+            sort.insert(key.path.clone(), if key.descending { -1 } else { 1 });
+        }
+        let mut specs = vec![doc! { "$sort": sort }];
+        if let Some(skip) = skip {
+            specs.push(doc! { "$skip": skip as i32 });
+        }
+        specs.push(doc! { "$limit": limit as i32 });
+        let stages = pipeline_of(&specs);
+        let want = naive_sort_then_take(&keys, &docs, skip.unwrap_or(0), limit);
+        let run = Run::new();
+        let vars = run.vars();
+        let never = |_: &Stage, _: Vec<Document>, _: Option<Lease>| -> Result<Vec<Document>, Error> {
+            panic!("the sort and its window are a heap, not a stage run by the runner")
+        };
+        let mut chain = pipeline::build(&stages, &never, &run.limits, &vars);
+        let _more = chain.push_all(docs.clone()).unwrap();
+        prop_assert_eq!(format!("{:?}", chain.finish().unwrap()), format!("{want:?}"));
+        let mut chain = pipeline::build(&stages, &never, &run.limits, &vars);
+        for doc in &docs {
+            prop_assert_eq!(chain.push(doc.clone()).unwrap(), Flow::More);
+        }
+        prop_assert_eq!(format!("{:?}", chain.finish().unwrap()), format!("{want:?}"));
+        // The loop agrees too.
+        prop_assert_eq!(
+            answer(old_loop(&stages, docs.clone())),
+            answer(Ok(want)),
+            "the loop: {:?}", specs
+        );
     }
 }
 

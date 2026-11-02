@@ -1823,3 +1823,50 @@ fn the_buckets_of_a_group_are_refused_at_the_byte_past_the_limit_and_the_pool_is
         assert_eq!((limits.buffer.used(), pool.used()), (0, 0), "{spec}: gives it all back");
     }
 }
+
+#[test]
+fn the_heap_of_a_sort_holds_the_documents_it_keeps_and_not_the_input() {
+    let input = padded(100, 300);
+    let sort = doc! {"$sort": {"g": -1, "_id": 1}};
+    let pool = MemoryPool::new(1 << 30);
+    // What one document costs the heap: itself and its two keys.
+    let entry = {
+        let limits = pooled(1 << 30, &pool);
+        let stages = aggregate::parse(&[sort.clone(), doc! {"$limit": 4}]).unwrap();
+        let mut chain = chain_of(&stages, &limits);
+        let _ = chain.push(input[0].clone()).unwrap();
+        limits.buffer.used()
+    };
+    assert!(entry > held_docs_bytes(&input[..1]), "the keys are charged with the document");
+    // Room for five: the four it keeps and the one it takes before it turns another out. A
+    // `$sort` of the hundred and a `$limit` of four is answered, and the budget and the pool
+    // are empty afterwards.
+    let limits = pooled(5 * entry + entry / 2, &pool);
+    let stages = aggregate::parse(&[sort.clone(), doc! {"$limit": 4}]).unwrap();
+    let mut chain = chain_of(&stages, &limits);
+    let mut most = 0;
+    for doc in &input {
+        let _ = chain.push(doc.clone()).unwrap();
+        most = most.max(limits.buffer.used());
+        assert_eq!(pool.used(), limits.buffer.used());
+    }
+    // Four held, each with its keys: not the hundred, which no budget here holds.
+    assert!(most > 3 * entry && most <= 4 * entry + entry / 2, "held {most}, an entry is {entry}");
+    let out = chain.finish().unwrap();
+    assert_eq!(out.iter().map(|d| d.get_i32("_id").unwrap()).collect::<Vec<_>>(), [2, 5, 8, 11]);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
+    // The same sort with a `$skip` holds the documents it skips as well: seven, and a budget of
+    // six is refused at the byte of the seventh.
+    let limits = pooled(6 * entry, &pool);
+    let stages = aggregate::parse(&[sort, doc! {"$skip": 3}, doc! {"$limit": 4}]).unwrap();
+    let mut chain = chain_of(&stages, &limits);
+    let err = input
+        .iter()
+        .find_map(|doc| chain.push(doc.clone()).err())
+        .expect("seven documents do not fit in six");
+    let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!((*what, *max), ("the heap of $sort", 6 * entry));
+    assert!(*bytes > 6 * entry && *bytes < 7 * entry + entry / 2, "refused at {bytes}");
+    drop(chain);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0), "gives it all back when refused");
+}

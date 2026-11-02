@@ -84,6 +84,7 @@ use crate::budget::{Lease, held_bytes, input_of, state_of};
 use crate::deadline::Ticker;
 use crate::expr::Binding;
 use crate::filter;
+use crate::shape;
 use crate::stages;
 
 /// What a sink answers to a document it was pushed.
@@ -182,7 +183,11 @@ pub fn streams_source(stages: &[Stage]) -> bool {
                     | Stage::Bucket { .. }
                     | Stage::SortByCount(_)
             )
-    })
+    }) || matches!(
+        stages,
+        [Stage::Sort(_), Stage::Limit(_), ..]
+            | [Stage::Sort(_), Stage::Skip(_), Stage::Limit(_), ..]
+    )
 }
 
 /// How many documents of the source a pipeline whose stages are `stages` will take, when that
@@ -263,7 +268,12 @@ fn build_by<'a, E: From<Error> + 'a>(
         }
         // The run of stages that stream that ends at `end`, if the stage there is one.
         let mut start = end;
-        while streaming && start > 0 && streams(&stages[start - 1]) {
+        // (A `$limit` that ends a `$sort` held as a heap is not in the run.)
+        while streaming
+            && start > 0
+            && streams(&stages[start - 1])
+            && heap_len(&stages[..start]).is_none()
+        {
             start -= 1;
         }
         if start < end {
@@ -654,6 +664,34 @@ impl State for Counter<'_> {
     }
 }
 
+/// `$sort` and `$limit n` with `$skip m` between them, if there is one: the first `m + n`
+/// documents of the sort ([`shape::TopK`]), of which the answer is the last `n`.
+struct Heap<'a> {
+    top: shape::TopK<'a>,
+    skip: usize,
+    limit: usize,
+    limits: &'a Limits,
+    ticker: Ticker,
+}
+
+impl<'a> Heap<'a> {
+    fn new(keys: &'a [shape::SortKey], skip: usize, limit: usize, limits: &'a Limits) -> Self {
+        let top = shape::TopK::new(keys, skip.saturating_add(limit));
+        Heap { top, skip, limit, limits, ticker: Ticker::new() }
+    }
+}
+
+impl State for Heap<'_> {
+    fn add(&mut self, doc: Document, held: &mut Lease) -> Result<(), Error> {
+        self.ticker.tick()?;
+        self.top.offer(doc, held, self.limits)
+    }
+
+    fn finish(self: Box<Self>) -> Result<Vec<Document>, Error> {
+        Ok(self.top.into_sorted().into_iter().skip(self.skip).take(self.limit).collect())
+    }
+}
+
 impl State for aggregate::GroupState<'_> {
     fn add(&mut self, doc: Document, held: &mut Lease) -> Result<(), Error> {
         aggregate::GroupState::add(self, &doc, held)
@@ -673,22 +711,48 @@ struct Fusion<'a> {
     state: Box<dyn State + 'a>,
 }
 
+/// `$sort` and the `$limit` after it (and the `$skip` between them, if there is one) that end
+/// `stages`, which hold the first documents of the sort and not the whole input, and how many
+/// stages they are. A `$sort` that is not followed at once by a `$limit` needs all of its input.
+fn heap_len(stages: &[Stage]) -> Option<usize> {
+    match stages {
+        [.., Stage::Sort(_), Stage::Skip(_), Stage::Limit(_)] => Some(3),
+        [.., Stage::Sort(_), Stage::Limit(_)] => Some(2),
+        _ => None,
+    }
+}
+
 /// The stages at the end of `stages` that hold a state and not their input, if there are
-/// any: `$count`, `$group`, `$bucket` and `$sortByCount` hold a counter or their buckets.
+/// any: `$count` and the groups hold a counter or their buckets, `$sort` with a `$limit` a heap
+/// of the first documents.
 fn fuse<'a>(
     stages: &'a [Stage],
     vars: &'a [Binding<'a>],
     limits: &'a Limits,
 ) -> Option<Fusion<'a>> {
-    let stage = stages.last()?;
-    let state: Box<dyn State + 'a> = match stage {
-        Stage::Count(field) => Box::new(Counter { field, seen: 0, ticker: Ticker::new() }),
-        Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_) => {
+    let state: Box<dyn State + 'a> = match stages {
+        [.., Stage::Sort(keys), Stage::Skip(skip), Stage::Limit(limit)] => {
+            return Some(Fusion {
+                len: 3,
+                name: "$sort",
+                state: Box::new(Heap::new(keys, *skip, *limit, limits)),
+            });
+        }
+        [.., Stage::Sort(keys), Stage::Limit(limit)] => {
+            return Some(Fusion {
+                len: 2,
+                name: "$sort",
+                state: Box::new(Heap::new(keys, 0, *limit, limits)),
+            });
+        }
+        [.., Stage::Count(field)] => Box::new(Counter { field, seen: 0, ticker: Ticker::new() }),
+        [.., stage @ (Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_))] => {
             Box::new(aggregate::GroupState::new(stage, limits, vars)?)
         }
         _ => return None,
     };
-    Some(Fusion { len: 1, name: stage.name(), state })
+    let name = stages.last()?.name();
+    Some(Fusion { len: 1, name, state })
 }
 
 /// A stage that holds a state and not its input: it takes the documents as they arrive and
@@ -1821,5 +1885,130 @@ mod tests {
                 assert_eq!(looks, 1000);
             }
         }
+    }
+
+    /// `n` documents `{_id, g: i % 3, pad}`, in an order that is not the sort order of `g`.
+    fn heap_docs(n: i32) -> Vec<Document> {
+        (0..n).map(|i| doc! {"_id": i, "g": (i * 7) % 5, "pad": "x".repeat(300)}).collect()
+    }
+
+    #[test]
+    fn a_sort_with_a_limit_after_it_is_a_heap_and_never_reaches_the_runner() {
+        let limits = Limits::default();
+        for specs in [
+            vec![doc! {"$sort": {"g": 1}}, doc! {"$limit": 4}],
+            vec![doc! {"$sort": {"g": -1}}, doc! {"$skip": 2}, doc! {"$limit": 4}],
+        ] {
+            let stages = parsed(&specs);
+            let mut chain = build(&stages, &unused, &limits, &[]);
+            for doc in heap_docs(12) {
+                assert_eq!(chain.push(doc).unwrap(), Flow::More, "never Done");
+            }
+            let out = chain.finish().unwrap();
+            assert_eq!(out.len(), 4, "{specs:?}");
+            // The same answer as the barriers: the sort, then the window.
+            let mut barriers = build_barriers(&stages, &aggregate_runner, &limits, &[]);
+            let _ = barriers.push_all(heap_docs(12)).unwrap();
+            assert_eq!(out, barriers.finish().unwrap(), "{specs:?}");
+        }
+    }
+
+    /// A runner that runs the stage as the pure pipeline does.
+    fn aggregate_runner(
+        stage: &Stage,
+        input: Vec<Document>,
+        arrived: Option<Lease>,
+    ) -> Result<Vec<Document>, Error> {
+        aggregate::apply_charged(stage, input, &Limits::default(), &[], arrived)
+    }
+
+    #[test]
+    fn a_sort_that_is_not_followed_at_once_by_a_limit_is_a_barrier() {
+        let limits = Limits::default();
+        let calls = Calls::default();
+        let run = recording(&calls);
+        // Nothing after it, a stage that streams between it and the limit, and a limit that
+        // the sort does not end.
+        for specs in [
+            vec![doc! {"$sort": {"g": 1}}],
+            vec![doc! {"$sort": {"g": 1}}, doc! {"$project": {"g": 1}}, doc! {"$limit": 4}],
+            vec![doc! {"$sort": {"g": 1}}, doc! {"$skip": 1}],
+            vec![
+                doc! {"$sort": {"g": 1}},
+                doc! {"$skip": 1},
+                doc! {"$match": {}},
+                doc! {"$limit": 2},
+            ],
+        ] {
+            calls.borrow_mut().clear();
+            let stages = parsed(&specs);
+            let mut chain = build(&stages, &run, &limits, &[]);
+            let _ = chain.push_all(heap_docs(6)).unwrap();
+            let _ = chain.finish().unwrap();
+            assert_eq!(calls.borrow().len(), 1, "{specs:?}: the sort runs as a barrier");
+            assert_eq!(calls.borrow()[0].0, "$sort", "{specs:?}");
+        }
+    }
+
+    #[test]
+    fn the_stages_after_a_heap_are_a_run_and_the_limit_that_ends_it_is_not() {
+        let limits = Limits::default();
+        let stages = parsed(&[
+            doc! {"$sort": {"g": 1}},
+            doc! {"$limit": 5},
+            doc! {"$project": {"g": 1}},
+            doc! {"$limit": 2},
+        ]);
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        for doc in heap_docs(12) {
+            let _ = chain.push(doc).unwrap();
+        }
+        let out = chain.finish().unwrap();
+        // The five least by `g`, in arrival order among equals, and then two of them.
+        assert_eq!(out, [doc! {"_id": 0, "g": 0}, doc! {"_id": 5, "g": 0}]);
+        // A heap before a `$limit` it does not stand for: the `$skip` and `$limit` of a run
+        // that begins after a `$project` are the run's.
+        assert_eq!(heap_len(&stages[..2]), Some(2));
+        assert_eq!(heap_len(&stages[..3]), None);
+        assert_eq!(heap_len(&stages), None);
+        assert_eq!(heap_len(&parsed(&[doc! {"$sort": {"a": 1}}, doc! {"$skip": 1}])), None);
+    }
+
+    #[test]
+    fn a_heap_streams_its_source_and_a_sort_alone_does_not() {
+        for (specs, streams) in [
+            (vec![doc! {"$sort": {"a": 1}}, doc! {"$limit": 3}], true),
+            (vec![doc! {"$sort": {"a": 1}}, doc! {"$skip": 2}, doc! {"$limit": 3}], true),
+            (vec![doc! {"$sort": {"a": 1}}], false),
+            (vec![doc! {"$sort": {"a": 1}}, doc! {"$skip": 2}], false),
+            (
+                vec![doc! {"$sort": {"a": 1}}, doc! {"$project": {"a": 1}}, doc! {"$limit": 3}],
+                false,
+            ),
+        ] {
+            assert_eq!(streams_source(&parsed(&specs)), streams, "{specs:?}");
+        }
+    }
+
+    #[test]
+    fn the_heap_of_a_sort_is_charged_as_it_fills_and_turns_out_what_it_replaces() {
+        let one = held_docs_bytes(&heap_docs(1));
+        let limits = Limits { buffer: BufferBudget::new(usize::MAX / 2), ..Limits::default() };
+        let stages = parsed(&[doc! {"$sort": {"g": 1}}, doc! {"$limit": 3}]);
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        let mut seen = Vec::new();
+        // Documents that arrive in falling order of `g`: each is kept and turns one out.
+        for g in (0..10).rev() {
+            let _ = chain.push(doc! {"_id": g, "g": g, "pad": "x".repeat(300)}).unwrap();
+            seen.push(limits.buffer.used());
+        }
+        assert!(seen[0] > one && seen[0] < 2 * one, "one document and its key: {seen:?}");
+        assert!(seen[2] > 2 * seen[0] && seen[2] < 4 * seen[0], "three held: {seen:?}");
+        assert!(seen[3..].iter().all(|&used| used == seen[2]), "no more than three: {seen:?}");
+        // A document the heap does not keep is not charged.
+        let _ = chain.push(doc! {"_id": 99, "g": 99, "pad": "x".repeat(300)}).unwrap();
+        assert_eq!(limits.buffer.used(), seen[2]);
+        assert_eq!(ids(&chain.finish().unwrap()), [0, 1, 2]);
+        assert_eq!(limits.buffer.used(), 0);
     }
 }
