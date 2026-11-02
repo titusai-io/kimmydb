@@ -1682,12 +1682,15 @@ pub fn find_and_modify(
             // does is updated on its own terms.
             Some(update) => {
                 // Worded as the same refusal on a matched document is (`apply`'s
-                // mapping below), so a client reads one message for both.
-                Some(
-                    update::apply_on_insert(update, &mut seed, now)
-                        .map(|()| seed)
-                        .map_err(|e| Modify::reported(&failures, e)),
-                )
+                // mapping below), so a client reads one message for both. A stop of the
+                // deadline inside the seed's stages is not a refusal to insert, which would
+                // be answered `400` and held for a request that is told not to retry: it is
+                // the timeout (review q8d3, m1).
+                Some(match update::apply_on_insert(update, &mut seed, now) {
+                    Ok(()) => Ok(seed),
+                    Err(e @ kimmy_core::Error::DeadlineExceeded) => return Err(e.into()),
+                    Err(e) => Err(Modify::reported(&failures, e)),
+                })
             }
             None => Some(Ok(seed)),
         }
@@ -1717,6 +1720,10 @@ pub fn find_and_modify(
         failures,
     };
 
+    // The last look before the transaction: an upsert on a primary key that is not there
+    // examines no document, so nothing in the engine would tick, and a request with no time
+    // left would insert (review q8d3, m1, m6). From the engine's first read the scan ticks.
+    deadline::check()?;
     // As `update`'s: a scan walks the collection in the write transaction
     // (ADR-199).
     let outcome =

@@ -571,3 +571,47 @@ fn violations_is_cut_at_a_passed_deadline_and_runs_with_time_left() {
     assert_eq!(found["count"], 1, "{found}");
     assert!(!Deadline::is_set());
 }
+
+#[test]
+fn an_upsert_with_no_time_left_inserts_nothing_and_answers_503_in_both_forms() {
+    // The upsert of a primary key that is not there examines no document, so no tick of a scan
+    // answers: the look before the engine's transaction does, for an operator update (which
+    // would otherwise insert and answer `200`) and for a pipeline update (whose seed is cut
+    // by the deadline, and which answered `400 invalid_update` when only the engine looked).
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_data(&dir);
+    let meta = state.engine.get_collection("app", "orders").unwrap();
+    let spec = |update: Value, id: i64| FindAndModifySpec {
+        filter: Some(json!({ "_id": id })),
+        sort: None,
+        update: Some(update),
+        remove: false,
+        upsert: true,
+        return_document: ReturnDocument::After,
+        projection: None,
+        if_stamp: None,
+        array_filters: Vec::new(),
+    };
+    for (n, update) in
+        [json!({ "$set": { "a": 1 } }), json!([{ "$set": { "a": { "$add": [1, 1] } } }])]
+            .into_iter()
+            .enumerate()
+    {
+        let id = 900 + n as i64;
+        let cut = in_a_request(PAST, || {
+            find_and_modify(&state, &root(), "app", "orders", spec(update.clone(), id))
+        });
+        assert!(is_the_timeout(&cut), "{update}: {cut:?}");
+        assert!(
+            state.engine.get(&meta, &DocId::Int64(id)).unwrap().is_none(),
+            "{update}: inserted by a request with no time left"
+        );
+        // With time left it inserts.
+        let done = in_a_request(PLENTY, || {
+            find_and_modify(&state, &root(), "app", "orders", spec(update.clone(), id))
+        })
+        .unwrap();
+        assert_eq!(done["upserted"], true, "{update}: {done}");
+        assert!(state.engine.get(&meta, &DocId::Int64(id)).unwrap().is_some());
+    }
+}
