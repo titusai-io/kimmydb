@@ -116,27 +116,122 @@ fn an_error_in_a_document_past_a_full_limit_is_not_raised() {
     assert!(err.message.contains("$divide"), "{}", err.message);
 }
 
+/// `div` is a `$divide` by the document's `d`, which is 0 in the document that fails.
+fn div() -> Value {
+    json!({"$divide": [1, "$d"]})
+}
+
 #[test]
-fn an_error_in_a_document_a_skip_drops_is_still_raised_until_the_skip_is_moved_ahead() {
-    // Registered in `docs/deviations.md` (skipped-documents-adr-270): the reference moves a
-    // `$skip` and a `$limit` ahead of `$addFields`, and answers `[5, 6]` here; a stage that
-    // streams evaluates every document that reaches the skip. P2 builds the reordering and
-    // this becomes an answer.
+fn a_skip_and_a_limit_move_ahead_of_the_stages_the_references_optimizer_moves_them_ahead_of() {
+    // The reference's rows (`adr270-reorder.js`, `adr270-reorder2.js`): 20 documents, the
+    // failing one is number 3, and a `$skip: 5` and a `$limit: 2` that drop it answer `[5, 6]`.
     let dir = tempfile::tempdir().unwrap();
-    let state = state_with(&dir, numbered(40, &[3]));
-    let divide = json!({"$addFields": {"x": {"$divide": [1, "$d"]}}});
-    let err = run(
-        &state,
-        json!([divide.clone(), {"$skip": 5}, {"$limit": 2}]),
-        aggregate::Limits::default(),
-    )
-    .unwrap_err();
-    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    let state = state_with(&dir, numbered(20, &[3]));
+    let window = || vec![json!({"$skip": 5}), json!({"$limit": 2})];
+    let pipeline = |stages: Vec<Value>| {
+        let mut stages = stages;
+        stages.extend(window());
+        Value::Array(stages)
+    };
+    let answers = |stages: Vec<Value>| {
+        ids(&run(&state, pipeline(stages), aggregate::Limits::default()).unwrap())
+    };
+    let fails = |stages: Vec<Value>| {
+        let err = run(&state, pipeline(stages), aggregate::Limits::default()).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST, "{}", err.message);
+        assert!(err.message.contains("$divide"), "{}", err.message);
+    };
+    // The stages a window moves ahead of.
+    let merged = json!({"$mergeObjects": ["$$ROOT", {"x": div()}]});
+    for stage in [
+        json!({"$addFields": {"x": div()}}),
+        json!({"$set": {"x": div()}}),
+        json!({"$project": {"x": div()}}),
+        json!({"$replaceRoot": {"newRoot": merged.clone()}}),
+        json!({"$replaceWith": merged}),
+        json!({"$lookup": {"from": "orders", "let": {"d": "$d"}, "pipeline": [
+            {"$match": {"$expr": {"$gt": [{"$divide": [1, "$$d"]}, 0]}}}, {"$limit": 1}],
+            "as": "l"}}),
+    ] {
+        assert_eq!(answers(vec![stage.clone()]), [5, 6], "{stage}");
+    }
+    // The stages it does not: the window stays behind them, and the failure is raised.
+    let redact = json!({"$redact": {"$cond": [{"$gt": [div(), 0]}, "$$KEEP", "$$PRUNE"]}});
+    let filter = json!({"$match": {"$expr": {"$gt": [div(), 0]}}});
+    let group = json!({"$group": {"_id": "$k", "x": {"$first": div()}}});
+    let windows =
+        json!({"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"x": {"$sum": div()}}}});
+    let graph = json!({"$graphLookup": {"from": "orders", "startWith": div(),
+        "connectFromField": "k", "connectToField": "k", "as": "g", "maxDepth": 0}});
+    for stage in [redact, filter, group, windows, graph] {
+        fails(vec![stage]);
+    }
+    // A stage that fails, then one a window stays behind, then the window.
+    for blocker in [json!({"$sort": {"k": 1}}), json!({"$unwind": "$k"})] {
+        fails(vec![json!({"$addFields": {"x": div()}}), blocker]);
+    }
+    // A window of several `$skip`s and `$limit`s is one, and moves as one.
+    let add = json!({"$addFields": {"x": div()}});
+    let run_window = |window: Vec<Value>| {
+        let mut stages = vec![add.clone()];
+        stages.extend(window);
+        ids(&run(&state, Value::Array(stages), aggregate::Limits::default()).unwrap())
+    };
+    assert_eq!(run_window(vec![json!({"$limit": 8}), json!({"$skip": 5})]), [5, 6, 7]);
+    assert_eq!(
+        run_window(vec![json!({"$limit": 10}), json!({"$limit": 3}), json!({"$skip": 5})]),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        run_window(vec![json!({"$skip": 2}), json!({"$skip": 3}), json!({"$limit": 4})]),
+        [5, 6, 7, 8]
+    );
+    // Two stages it passes, an empty `$match` the reference drops, and a stage between the
+    // skip and the limit.
+    assert_eq!(answers(vec![add.clone(), json!({"$project": {"_id": 1}})]), [5, 6]);
+    assert_eq!(answers(vec![add.clone(), json!({"$match": {}})]), [5, 6]);
+    assert_eq!(
+        run_window(vec![json!({"$skip": 5}), json!({"$project": {"k": 1}}), json!({"$limit": 2})]),
+        [5, 6]
+    );
+    // A failure inside the window is raised.
+    let inside =
+        json!({"$addFields": {"x": {"$divide": [1, {"$cond": [{"$eq": ["$_id", 6]}, 0, 1]}]}}});
+    let err =
+        run(&state, json!([inside, {"$skip": 5}, {"$limit": 3}]), aggregate::Limits::default())
+            .unwrap_err();
     assert!(err.message.contains("$divide"), "{}", err.message);
-    // A skip that is first drops the document before the stage sees it.
-    let ok =
-        run(&state, json!([{"$skip": 5}, divide, {"$limit": 2}]), aggregate::Limits::default());
+    // A skip that is first drops the document before the stage sees it, as it always did.
+    let ok = run(&state, json!([{"$skip": 5}, add, {"$limit": 2}]), aggregate::Limits::default());
     assert_eq!(ids(&ok.unwrap()), [5, 6]);
+}
+
+#[test]
+fn a_window_that_has_moved_to_the_head_ends_the_scan_and_bounds_the_range_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, numbered(50, &[]));
+    let (answer, stats) = run_stats(
+        &state,
+        json!([{"$project": {"k": 1}}, {"$addFields": {"x": 1}}, {"$skip": 2}, {"$limit": 3}]),
+        aggregate::Limits::default(),
+    );
+    assert_eq!(ids(&answer), [2, 3, 4]);
+    assert_eq!((stats.examined, stats.matched), (5, 5));
+    // The keys of an inexact range are bounded by what the window takes, though stages that
+    // neither filter nor change the count are written before it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500);
+    let none = json!({"$match": {"_id": -1}});
+    let limits = capped(key_bytes(4));
+    let (answer, stats) = run_stats(
+        &state,
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$project": {"_id": 1}}, {"$skip": 1},
+            {"$limit": 2}, none]),
+        limits.clone(),
+    );
+    assert_eq!(ids(&answer), Vec::<i64>::new());
+    assert_eq!(stats.matched, 3, "three documents were taken from the range");
+    assert_eq!(limits.buffer.used(), 0);
 }
 
 #[test]
@@ -373,7 +468,9 @@ fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_groups_a
     ];
     // A `$sample` holds its sample and not the collection: its size is what it answers.
     let limits = capped(cap);
-    let sampled = run(&state, json!([{"$sample": {"size": 4}}]), limits.clone()).unwrap();
+    let sampled =
+        run(&state, json!([{"$sample": {"size": 4}}, {"$project": {"_id": 1}}]), limits.clone())
+            .unwrap();
     assert_eq!(sampled["count"], 4);
     let mut chosen = ids(&sampled);
     chosen.sort_unstable();
@@ -507,10 +604,11 @@ fn a_skip_and_a_limit_at_the_head_bound_the_keys_a_range_holds_to_what_they_take
         capped(key_bytes(2)),
     );
     assert_eq!(stats.matched, 1);
-    // Anything before the limit may need more, and is held to the budget instead.
+    // Anything that may drop a document before the limit (a `$redact` may) may need more, and
+    // is held to the budget instead. (A `$project` is not one: the limit is moved ahead of it, and is the head.)
     let err = run(
         &state,
-        json!([{"$match": {"t": {"$gte": 0}}}, {"$project": {"_id": 1}}, {"$limit": 1}, none]),
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$redact": "$$KEEP"}, {"$limit": 1}, none]),
         capped(key_bytes(4)),
     )
     .unwrap_err();

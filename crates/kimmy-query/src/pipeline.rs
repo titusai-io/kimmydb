@@ -1746,17 +1746,39 @@ mod tests {
         // A limit of 0 cannot be parsed, but a stage made by hand takes none.
         assert_eq!(source_bound(&[Stage::Skip(2), Stage::Limit(0)]), Some(2));
         assert_eq!(bound(&[doc! {"$skip": 3}, doc! {"$limit": 5}]), Some(8));
+        // Made by hand, a run of them adds up and the first limit ends it.
+        assert_eq!(
+            source_bound(&[Stage::Skip(3), Stage::Skip(4), Stage::Limit(5), Stage::Limit(1)]),
+            Some(12)
+        );
+        // Parsed, a run of them is one window: skip 7 and a limit of 1.
         assert_eq!(
             bound(&[doc! {"$skip": 3}, doc! {"$skip": 4}, doc! {"$limit": 5}, doc! {"$limit": 1}]),
-            Some(12)
+            Some(8)
+        );
+        // A window that has moved ahead of the stages that neither filter nor change the count
+        // is at the head: `[$project, $skip 1, $limit 5]` takes six documents of the source.
+        assert_eq!(
+            bound(&[doc! {"$project": {"a": 1}}, doc! {"$skip": 1}, doc! {"$limit": 5}]),
+            Some(6)
+        );
+        assert_eq!(
+            bound(&[
+                doc! {"$addFields": {"a": 1}},
+                doc! {"$unset": "b"},
+                doc! {"$replaceWith": "$$ROOT"},
+                doc! {"$limit": 5},
+            ]),
+            Some(5)
         );
         // Anything else before a limit, or no limit, may need every document.
         assert_eq!(bound(&[]), None);
         assert_eq!(bound(&[doc! {"$skip": 3}]), None);
         assert_eq!(bound(&[doc! {"$match": {"a": 1}}, doc! {"$limit": 5}]), None);
         assert_eq!(bound(&[doc! {"$sort": {"a": 1}}, doc! {"$limit": 5}]), None);
+        assert_eq!(bound(&[doc! {"$unwind": "$a"}, doc! {"$limit": 5}]), None);
         assert_eq!(
-            bound(&[doc! {"$project": {"a": 1}}, doc! {"$skip": 1}, doc! {"$limit": 5}]),
+            bound(&[doc! {"$redact": "$$KEEP"}, doc! {"$skip": 1}, doc! {"$limit": 5}]),
             None
         );
     }
@@ -2004,12 +2026,12 @@ mod tests {
         // the sort does not end.
         for specs in [
             vec![doc! {"$sort": {"g": 1}}],
-            vec![doc! {"$sort": {"g": 1}}, doc! {"$project": {"g": 1}}, doc! {"$limit": 4}],
+            vec![doc! {"$sort": {"g": 1}}, doc! {"$match": {"g": {"$gte": 0}}}, doc! {"$limit": 4}],
             vec![doc! {"$sort": {"g": 1}}, doc! {"$skip": 1}],
             vec![
                 doc! {"$sort": {"g": 1}},
                 doc! {"$skip": 1},
-                doc! {"$match": {}},
+                doc! {"$match": {"g": {"$gte": 0}}},
                 doc! {"$limit": 2},
             ],
         ] {
@@ -2054,10 +2076,12 @@ mod tests {
             (vec![doc! {"$sort": {"a": 1}}, doc! {"$skip": 2}, doc! {"$limit": 3}], true),
             (vec![doc! {"$sort": {"a": 1}}], false),
             (vec![doc! {"$sort": {"a": 1}}, doc! {"$skip": 2}], false),
-            (
-                vec![doc! {"$sort": {"a": 1}}, doc! {"$project": {"a": 1}}, doc! {"$limit": 3}],
-                false,
-            ),
+            // A stage that blocks or filters between them: the limit is not the sort's.
+            (vec![doc! {"$sort": {"a": 1}}, doc! {"$match": {"a": 1}}, doc! {"$limit": 3}], false),
+            (vec![doc! {"$sort": {"a": 1}}, doc! {"$unwind": "$a"}, doc! {"$limit": 3}], false),
+            // A stage that neither filters nor changes the count is passed by the limit when the
+            // pipeline is parsed (the window is moved ahead of it), so the two are together.
+            (vec![doc! {"$sort": {"a": 1}}, doc! {"$project": {"a": 1}}, doc! {"$limit": 3}], true),
         ] {
             assert_eq!(streams_source(&parsed(&specs)), streams, "{specs:?}");
         }

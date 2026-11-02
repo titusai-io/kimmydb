@@ -819,6 +819,53 @@ mod tests {
         assert!(stages[7]["detail"].as_str().unwrap().contains("blocking"));
     }
 
+    /// The stages a plan lists are the stages that run: a `$skip` and a `$limit` that are moved
+    /// ahead of the stages that neither filter nor change the count (ADR-270) are listed there,
+    /// coalesced, and a window behind a stage that blocks is listed behind it.
+    #[test]
+    fn a_window_is_listed_where_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed(&state, "a", 10, true);
+        let names = |pipeline: Value| -> Vec<String> {
+            let out = explain(&state, &root(), "a", pipeline).unwrap();
+            out["explain"]["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| match (s["skip"].as_i64(), s["limit"].as_i64()) {
+                    (Some(n), _) => format!("$skip {n}"),
+                    (_, Some(n)) => format!("$limit {n}"),
+                    _ => s["stage"].as_str().unwrap().to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(json!([
+                { "$addFields": { "x": 1 } },
+                { "$limit": 8 },
+                { "$skip": 5 },
+                { "$project": { "x": 1 } },
+                { "$skip": 1 },
+            ])),
+            ["$skip 6", "$limit 2", "$addFields", "$project"]
+        );
+        assert_eq!(
+            names(
+                json!([{ "$group": { "_id": "$n" } }, { "$project": { "n": 1 } }, { "$limit": 3 }])
+            ),
+            ["$group", "$limit 3", "$project"]
+        );
+        assert_eq!(
+            names(json!([{ "$sort": { "n": 1 } }, { "$project": { "n": 1 } }, { "$limit": 3 }])),
+            ["$sort", "$limit 3", "$project"]
+        );
+        assert_eq!(
+            names(json!([{ "$match": { "n": 1 } }, { "$limit": 3 }, { "$unwind": "$n" }])),
+            ["$limit 3", "$unwind"]
+        );
+    }
+
     /// The two `$lookup` forms say what the executor does, including where it reads
     /// nothing, and what is hoisted.
     #[test]

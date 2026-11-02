@@ -7825,6 +7825,45 @@ async fn a_vector_search_stage_feeds_the_rest_of_the_pipeline() {
     assert_eq!(res.body["documents"], json!([{ "_id": "acme", "n": 1 }]), "{:?}", res.body);
 }
 
+/// A `$skip` and a `$limit` after a stage that neither filters nor changes the count are moved
+/// ahead of it (ADR-270), also behind the source a `$vectorSearch` is: the window is taken of the
+/// hits in rank order and the stage runs on what it leaves.
+#[tokio::test]
+async fn a_window_after_a_stage_behind_a_vector_search_takes_the_hits_in_rank_order() {
+    let server = Server::start().await;
+    let token = products_collection(&server).await;
+    let post = |pipeline: Value| {
+        let token = token.clone();
+        let server = &server;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/products/aggregate",
+                    Some(&token),
+                    json!({ "pipeline": pipeline }),
+                )
+                .await
+        }
+    };
+    let search = json!({ "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 10 } });
+    let all = post(json!([search.clone()])).await;
+    assert_eq!(all.status, 200, "{:?}", all.body);
+    let ranked: Vec<Value> =
+        all.body["documents"].as_array().unwrap().iter().map(|d| d["_id"].clone()).collect();
+    assert!(ranked.len() >= 3, "{ranked:?}");
+    let res = post(json!([
+        search,
+        { "$project": { "name": 1 } },
+        { "$skip": 1 },
+        { "$limit": 2 },
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().unwrap();
+    assert_eq!(docs.iter().map(|d| d["_id"].clone()).collect::<Vec<_>>(), ranked[1..3]);
+    assert!(docs.iter().all(|d| d.get("name").is_some() && d.get("price").is_none()), "{docs:?}");
+}
+
 /// Each hit enters as its source document plus `_score` and `_chunk`, in rank
 /// order, and `k` bounds how many enter.
 #[tokio::test]

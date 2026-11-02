@@ -475,12 +475,171 @@ proptest! {
             .collect();
         let specs = [
             doc! { "$unwind": { "path": "$arr", "preserveNullAndEmptyArrays": preserve } },
-            // A zero divides.
-            doc! { "$addFields": { "q": { "$divide": [1, "$arr"] } } },
+            // A zero divides. (A `$match` and not an `$addFields`, which the `$limit` would
+            // be moved ahead of when the pipeline is parsed.)
+            doc! { "$match": { "$expr": { "$gt": [{ "$divide": [1, "$arr"] }, -10] } } },
             doc! { "$limit": limit },
         ];
         let stages = pipeline_of(&specs);
         held_to_each_other(&stages, &docs, &specs)?;
+    }
+}
+
+/// The reference's reordering of `$skip` and `$limit`, written as rules over the stages as they
+/// are written and applied until none applies, which shares nothing with the rewrite at the
+/// parse but the rules themselves (ADR-270): a window moves ahead of a stage that neither
+/// filters nor changes the count; two `$skip`s are one, two `$limit`s are one, and a `$limit`
+/// then a `$skip` is a `$skip` then a `$limit`; a `$skip` of nothing is not a stage.
+fn model_reorder(mut specs: Vec<Document>) -> Vec<(String, i64)> {
+    fn name(spec: &Document) -> &str {
+        spec.keys().next().map(String::as_str).unwrap()
+    }
+    fn count(spec: &Document) -> i64 {
+        spec.values()
+            .next()
+            .and_then(Bson::as_i64)
+            .or_else(|| spec.values().next().and_then(|v| v.as_i32().map(i64::from)))
+            .unwrap()
+    }
+    // `before` is what comes before the stage: a `$match` of nothing is passed unless it is one
+    // of the `$match` stages the pipeline begins with, the filter of its source.
+    fn passes(spec: &Document, before: &[Document]) -> bool {
+        matches!(
+            name(spec),
+            "$project"
+                | "$unset"
+                | "$addFields"
+                | "$set"
+                | "$replaceRoot"
+                | "$replaceWith"
+                | "$lookup"
+        ) || (name(spec) == "$match"
+            && spec.get_document("$match").is_ok_and(Document::is_empty)
+            && before.iter().any(|spec| name(spec) != "$match"))
+    }
+    let window = |n: &str, v: i64| doc! { n: v };
+    'again: loop {
+        for at in 0..specs.len() {
+            if name(&specs[at]) == "$skip" && count(&specs[at]) == 0 {
+                specs.remove(at);
+                continue 'again;
+            }
+            let Some(next) = specs.get(at + 1) else { continue };
+            let (a, b) = (&specs[at], next);
+            let rewritten = match (name(a), name(b)) {
+                ("$skip", "$skip") => Some(vec![window("$skip", count(a) + count(b))]),
+                ("$limit", "$limit") => Some(vec![window("$limit", count(a).min(count(b)))]),
+                ("$limit", "$skip") => {
+                    let dropped = count(a).min(count(b));
+                    Some(vec![window("$skip", dropped), window("$limit", count(a) - dropped)])
+                }
+                (_, "$skip" | "$limit") if passes(a, &specs[..at]) => {
+                    Some(vec![b.clone(), a.clone()])
+                }
+                _ => None,
+            };
+            if let Some(rewritten) = rewritten {
+                specs.splice(at..at + 2, rewritten);
+                continue 'again;
+            }
+        }
+        break;
+    }
+    // What the parse calls a stage: `$set`, `$unset` and `$replaceWith` are the stages they are
+    // another name for.
+    specs
+        .iter()
+        .map(|spec| {
+            let name = match name(spec) {
+                "$set" => "$addFields",
+                "$unset" => "$project",
+                "$replaceWith" => "$replaceRoot",
+                other => other,
+            };
+            let n = if matches!(name, "$skip" | "$limit") { count(spec) } else { -1 };
+            (name.to_string(), n)
+        })
+        .collect()
+}
+
+/// The stages a pipeline parses to, as the name and, for a window, the number.
+fn parsed_shape(specs: &[Document]) -> Vec<(String, i64)> {
+    pipeline_of(specs)
+        .iter()
+        .map(|stage| match stage {
+            Stage::Skip(n) | Stage::Limit(n) => (stage.name().to_string(), *n as i64),
+            other => (other.name().to_string(), -1),
+        })
+        .collect()
+}
+
+/// Stages a window moves ahead of, and stages it stays behind, as they are written (the
+/// stages that need a collection are not run, only parsed).
+fn window_stage() -> impl Strategy<Value = Document> {
+    prop_oneof![
+        6 => (0i32..7).prop_map(|n| doc! { "$skip": n }),
+        6 => (1i32..9).prop_map(|n| doc! { "$limit": n }),
+        1 => Just(doc! { "$project": { "a": 1 } }),
+        1 => Just(doc! { "$unset": "b" }),
+        1 => Just(doc! { "$addFields": { "c": 1 } }),
+        1 => Just(doc! { "$set": { "c": 1 } }),
+        1 => Just(doc! { "$replaceRoot": { "newRoot": "$$ROOT" } }),
+        1 => Just(doc! { "$replaceWith": "$$ROOT" }),
+        1 => Just(doc! { "$match": {} }),
+        1 => Just(doc! { "$lookup": { "from": "c", "localField": "a", "foreignField": "a", "as": "l" } }),
+        1 => Just(doc! { "$match": { "a": 1 } }),
+        1 => Just(doc! { "$redact": "$$KEEP" }),
+        1 => Just(doc! { "$sort": { "a": 1 } }),
+        1 => Just(doc! { "$unwind": "$arr" }),
+        1 => Just(doc! { "$group": { "_id": "$a" } }),
+        1 => Just(doc! { "$sample": { "size": 3 } }),
+        1 => Just(doc! { "$count": "n" }),
+        1 => Just(doc! { "$sortByCount": "$a" }),
+        1 => Just(doc! { "$facet": { "x": [{ "$count": "n" }] } }),
+        1 => Just(doc! { "$unionWith": "c" }),
+    ]
+}
+
+/// The stages of a pipeline as each is written, each parsed alone: no run of them is there to
+/// reorder. (A `$skip` of nothing is no stage.)
+fn as_written(specs: &[Document]) -> Vec<Stage> {
+    specs.iter().flat_map(|spec| pipeline_of(std::slice::from_ref(spec))).collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 4000, ..ProptestConfig::default() })]
+
+    /// The stages that come out of the parse are the stages the rules give.
+    #[test]
+    fn the_parse_reorders_a_window_as_the_rules_do(
+        specs in prop::collection::vec(window_stage(), 0..9),
+    ) {
+        prop_assert_eq!(parsed_shape(&specs), model_reorder(specs.clone()), "{:?}", specs);
+    }
+
+    /// Moving a window never changes an answer: where the pipeline as it is written answers,
+    /// the reordered one answers the same, and where it fails the reordered one may answer
+    /// (the documents the window drops are not evaluated) but never answers something else.
+    #[test]
+    fn the_reordering_does_not_change_an_answer_that_was_there(
+        specs in prop::collection::vec(
+            prop_oneof![
+                3 => window_stage().prop_filter("runs here", |s| {
+                    !matches!(s.keys().next().map(String::as_str), Some("$lookup" | "$unionWith"))
+                }),
+                1 => stage(),
+            ],
+            0..8,
+        ),
+        docs in documents(),
+    ) {
+        let written = as_written(&specs);
+        let reordered = pipeline_of(&specs);
+        let before = answer(old_loop(&written, docs.clone()));
+        let after = answer(old_loop(&reordered, docs.clone()));
+        if let Ok(before) = &before {
+            prop_assert_eq!(after, Ok(before.clone()), "{:?}", specs);
+        }
     }
 }
 
@@ -768,13 +927,16 @@ proptest! {
     }
 }
 
-/// `[$addFields .. $divide, $limit 5]` over documents of which the eighth divides by zero:
+/// `[$match .. $divide, $limit 5]` over documents of which the eighth divides by zero:
 /// the loop fails at the eighth document, and the chain stops after the fifth and answers.
+/// (A `$match` and not an `$addFields`, which the `$limit` is moved ahead of at the parse: the
+/// loop would then answer as well.)
 #[test]
 fn an_error_past_a_full_limit_is_not_raised() {
     let docs: Vec<Document> =
         (0..12).map(|id| doc! { "_id": id, "d": if id == 7 { 0 } else { 1 } }).collect();
-    let specs = [doc! { "$addFields": { "x": { "$divide": [1, "$d"] } } }, doc! { "$limit": 5 }];
+    let divides = doc! { "$match": { "$expr": { "$gt": [{ "$divide": [1, "$d"] }, 0] } } };
+    let specs = [divides.clone(), doc! { "$limit": 5 }];
     let stages = aggregate::parse(&specs).unwrap();
     let loop_says = answer(old_loop(&stages, docs.clone()));
     assert!(loop_says.as_ref().is_err_and(|e| e.contains("divide")), "{loop_says:?}");
@@ -791,7 +953,7 @@ fn an_error_past_a_full_limit_is_not_raised() {
     assert_eq!(pushed, 4);
     assert_eq!(answer(got), loop_says);
     // A failure past the window that follows a `$limit` is raised: the limit does not hide it.
-    let specs = [doc! { "$limit": 5 }, doc! { "$addFields": { "x": { "$divide": [1, "$d"] } } }];
+    let specs = [doc! { "$limit": 5 }, divides];
     let stages = aggregate::parse(&specs).unwrap();
     let (got, _) = chain_one_by_one(Build::Streaming, &stages, &docs);
     assert_eq!(answer(got), answer(old_loop(&stages, docs.clone())));
@@ -802,17 +964,18 @@ fn an_error_past_a_full_limit_is_not_raised() {
 #[test]
 fn an_unwind_stops_before_the_element_that_fails() {
     let docs = vec![doc! { "_id": 1, "arr": [4, 2, 1, 0] }, doc! { "_id": 2, "arr": [0] }];
+    // (A `$match` and not an `$addFields`, which the `$limit` is moved ahead of at the parse.)
     let specs = [
         doc! { "$unwind": "$arr" },
-        doc! { "$addFields": { "q": { "$divide": [8, "$arr"] } } },
+        doc! { "$match": { "$expr": { "$gt": [{ "$divide": [8, "$arr"] }, 0] } } },
         doc! { "$limit": 3 },
     ];
     let stages = aggregate::parse(&specs).unwrap();
     assert!(old_loop(&stages, docs.clone()).is_err());
     let (got, pushed) = chain_one_by_one(Build::Streaming, &stages, &docs);
     assert_eq!(pushed, 1);
-    let quotients: Vec<_> = got.unwrap().iter().map(|d| d.get_f64("q").unwrap()).collect();
-    assert_eq!(quotients, [2.0, 4.0, 8.0]);
+    let elements: Vec<_> = got.unwrap().iter().map(|d| d.get_i32("arr").unwrap()).collect();
+    assert_eq!(elements, [4, 2, 1]);
     // With a fourth the failure is inside, and raised.
     let stages =
         aggregate::parse(&[specs[0].clone(), specs[1].clone(), doc! { "$limit": 4 }]).unwrap();

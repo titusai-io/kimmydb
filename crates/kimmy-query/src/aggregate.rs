@@ -594,7 +594,111 @@ fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Resu
             stages.len()
         )));
     }
-    Ok(stages)
+    Ok(move_windows(stages))
+}
+
+/// Whether a `$skip` and a `$limit` are moved ahead of the stage at `at` in `stages` (ADR-270),
+/// as the reference's optimizer moves them: it neither filters nor changes the number of
+/// documents, so the documents the window drops need not go through it. That is `$project`
+/// (and `$unset`, which is one), `$addFields`/`$set`, `$replaceRoot`/`$replaceWith` and
+/// `$lookup` (measured: `q8-probes/adr270-reorder.js` and `adr270-reorder2.js`), and a `$match`
+/// of nothing, which the reference drops, unless it is one of the `$match` stages the
+/// pipeline begins with, which are the filter of its source ([`leading_match`]). It is not
+/// `$match`, `$redact`, `$group`, `$sort`, `$unwind`, `$sample`, `$sortByCount`,
+/// `$setWindowFields`, `$graphLookup`, `$unionWith`, `$facet`, `$merge` or `$out`: a window
+/// stays behind each of those.
+fn lets_a_window_pass(stages: &[Stage], at: usize) -> bool {
+    match &stages[at] {
+        Stage::Project { .. }
+        | Stage::AddFields(_)
+        | Stage::ReplaceRoot(_)
+        | Stage::Lookup { .. } => true,
+        Stage::Match(filter) => {
+            matches!(**filter, Filter::AlwaysTrue)
+                && stages[..at].iter().any(|stage| !matches!(stage, Stage::Match(_)))
+        }
+        _ => false,
+    }
+}
+
+/// A run of `$skip` and `$limit` as the one window it is: the first `skip` documents dropped,
+/// then `limit` taken (all the rest if there is none).
+#[derive(Clone, Copy, Default)]
+struct Window {
+    skip: usize,
+    limit: Option<usize>,
+}
+
+impl Window {
+    /// The window of this one followed by a `$skip` of `n`: it drops what the window takes
+    /// first, and what is dropped is no longer taken.
+    fn then_skip(self, n: usize) -> Window {
+        match self.limit {
+            None => Window { skip: self.skip.saturating_add(n), limit: None },
+            Some(limit) => {
+                let dropped = n.min(limit);
+                Window { skip: self.skip.saturating_add(dropped), limit: Some(limit - dropped) }
+            }
+        }
+    }
+
+    /// The window of this one followed by a `$limit` of `n`.
+    fn then_limit(self, n: usize) -> Window {
+        Window { skip: self.skip, limit: Some(self.limit.map_or(n, |limit| limit.min(n))) }
+    }
+
+    /// The stages that are this window: a `$skip` if it drops any, then a `$limit` if it takes
+    /// a number. A `$limit` of 0 is a window that takes nothing, which no request can write
+    /// (it is a `400`) and `$limit: 5` then `$skip: 5` makes.
+    fn stages(self) -> impl Iterator<Item = Stage> {
+        (self.skip > 0)
+            .then_some(Stage::Skip(self.skip))
+            .into_iter()
+            .chain(self.limit.map(Stage::Limit))
+    }
+}
+
+/// The reference's reordering of `$skip` and `$limit` (ADR-270): each run of them is one
+/// window ([`Window`]: `$skip: 2, $skip: 3` is `$skip: 5`, `$limit: 10, $limit: 3` is
+/// `$limit: 3`, `$limit: 8, $skip: 5` is `$skip: 5, $limit: 3`) and the window is moved ahead of
+/// the stages it [passes](lets_a_window_pass), repeatedly, so that it meets the window that is already
+/// there and the two are one. The documents a window drops are then never evaluated by the
+/// stages it passed, so an error in one is not raised, as in the reference.
+///
+/// A rewrite of the stages and not a change to how they run: the pipeline that is run, and
+/// that `explain` reports, is the one written here.
+fn move_windows(stages: Vec<Stage>) -> Vec<Stage> {
+    let mut out: Vec<Stage> = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let (skip, limit) = match stage {
+            Stage::Skip(n) => (n, None),
+            Stage::Limit(n) => (0, Some(n)),
+            other => {
+                out.push(other);
+                continue;
+            }
+        };
+        // Past the stages it passes, to the window that ends there, if one does.
+        let mut end = out.len();
+        while end > 0 && lets_a_window_pass(&out, end - 1) {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && matches!(out[start - 1], Stage::Skip(_) | Stage::Limit(_)) {
+            start -= 1;
+        }
+        let window = out[start..end].iter().fold(Window::default(), |window, stage| match stage {
+            Stage::Skip(n) => window.then_skip(*n),
+            Stage::Limit(n) => window.then_limit(*n),
+            _ => window,
+        });
+        let window = match limit {
+            Some(n) => window.then_limit(n),
+            None => window.then_skip(skip),
+        };
+        out.splice(start..end, window.stages());
+    }
+    out
 }
 
 /// The `$match` stages a pipeline *begins* with, merged into one filter, and
@@ -3296,6 +3400,9 @@ pub fn lookup_keys(input: &[Document], local_field: &str) -> Vec<Bson> {
 mod deadline_tests;
 
 #[cfg(test)]
+mod reorder_tests;
+
+#[cfg(test)]
 mod tests {
     use bson::doc;
 
@@ -3563,16 +3670,18 @@ mod tests {
 
     #[test]
     fn a_pipeline_is_held_to_a_thousand_stages_wherever_it_is() {
-        let skips = |n: usize| vec![doc! {"$skip": 0}; n];
+        // (Not `$skip`, which a window of nothing is no stage: the parse is of the stages as
+        // they are counted, and a run of `$skip`s is one.)
+        let fillers = |n: usize| vec![doc! {"$redact": "$$KEEP"}; n];
         assert_eq!(MAX_PIPELINE_STAGES, 1_000);
-        assert_eq!(parse(&skips(1_000)).unwrap().len(), 1_000);
+        assert_eq!(parse(&fillers(1_000)).unwrap().len(), 1_000);
         let refused = "a pipeline has 1001 stages, over the limit of 1000 (a stage that expands, \
                        such as $count, counts as two). A $facet branch and a $lookup or \
                        $unionWith sub-pipeline are each counted on their own";
-        let err = parse(&skips(1_001)).unwrap_err();
+        let err = parse(&fillers(1_001)).unwrap_err();
         assert_eq!(err.to_string(), format!("invalid query: {refused}"));
         // A trailing `$out` is one of the stages counted.
-        let mut with_out = skips(1_000);
+        let mut with_out = fillers(1_000);
         with_out.push(doc! {"$out": "o"});
         assert!(parse(&with_out).unwrap_err().to_string().contains(refused));
         // A `$facet` branch, a `$lookup` sub-pipeline and a `$unionWith` sub-pipeline are each
@@ -3587,9 +3696,9 @@ mod tests {
             |stages| doc! {"$unionWith": {"coll": "items", "pipeline": stages}},
         ];
         for wrap in wrappers {
-            let whole = vec![wrap(bson(skips(1_000))), doc! {"$skip": 0}];
+            let whole = vec![wrap(bson(fillers(1_000))), doc! {"$redact": "$$KEEP"}];
             assert_eq!(parse(&whole).unwrap().len(), 2);
-            let err = parse(&[wrap(bson(skips(1_001)))]).unwrap_err().to_string();
+            let err = parse(&[wrap(bson(fillers(1_001)))]).unwrap_err().to_string();
             assert!(err.contains(refused), "{err}");
         }
     }
@@ -3599,7 +3708,9 @@ mod tests {
         // Measured on the reference: with 999 stages, `$count`, `$sortByCount`, `$bucket`,
         // `$setWindowFields` and `$densify` are refused and with 998 they are accepted; every
         // other stage probed is accepted with 999.
-        let skips = |n: usize| vec![doc! {"$skip": 0}; n];
+        // (Not `$skip`, which a window of nothing is no stage: the parse is of the stages as
+        // they are counted, and a run of `$skip`s is one.)
+        let fillers = |n: usize| vec![doc! {"$redact": "$$KEEP"}; n];
         let doubles = [
             doc! {"$count": "n"},
             doc! {"$sortByCount": "$a"},
@@ -3610,14 +3721,14 @@ mod tests {
         for stage in doubles {
             let name = stage.keys().next().unwrap().clone();
             assert_eq!(stage_weight(&name), 2, "{name}");
-            let mut at_999 = skips(999);
+            let mut at_999 = fillers(999);
             at_999.push(stage.clone());
             let err = parse(&at_999).unwrap_err().to_string();
             assert!(
                 err.contains("a pipeline has 1001 stages, over the limit of 1000"),
                 "{name}: {err}"
             );
-            let mut at_998 = skips(998);
+            let mut at_998 = fillers(998);
             at_998.push(stage);
             assert_eq!(parse(&at_998).unwrap().len(), 999, "{name}");
         }
@@ -3641,7 +3752,7 @@ mod tests {
         ] {
             let name = stage.keys().next().unwrap().clone();
             assert_eq!(stage_weight(&name), 1, "{name}");
-            let mut at_999 = skips(999);
+            let mut at_999 = fillers(999);
             at_999.push(stage);
             assert_eq!(parse(&at_999).unwrap().len(), 1_000, "{name}");
         }
@@ -3651,10 +3762,10 @@ mod tests {
                 doc! {"$facet": {"a": stages.into_iter().map(Bson::Document).collect::<Vec<_>>()}},
             ])
         };
-        let mut over = skips(999);
+        let mut over = fillers(999);
         over.push(doc! {"$count": "n"});
         assert!(branch(over).unwrap_err().to_string().contains("a pipeline has 1001 stages"));
-        let mut under = skips(998);
+        let mut under = fillers(998);
         under.push(doc! {"$count": "n"});
         assert!(branch(under).is_ok());
     }
