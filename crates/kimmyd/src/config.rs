@@ -44,7 +44,8 @@ pub struct Config {
 /// memory a request really takes is 2.5 to 5 times its BSON, and more for documents of
 /// many small fields, so **neither has a fixed default**: unset, they are worked out from
 /// the memory the process runs under (`crate::aggmem`): the pool is a tenth of the
-/// container's memory limit (cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`) or,
+/// memory limit of the cgroup it runs in (the tightest cgroup v2 `memory.max` from its own
+/// cgroup up to the root, else v1 `memory.limit_in_bytes`) or,
 /// with none, of the machine's RAM, and one request may hold half the pool. A 2 GiB
 /// container gets a pool of about 200 MiB and 100 MiB a request. An explicit value
 /// (file, environment or flag) always wins.

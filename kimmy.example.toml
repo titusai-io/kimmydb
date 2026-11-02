@@ -249,8 +249,10 @@ commit_coalesce_ms = 5
 # joined arrays it builds, and its answer.
 [aggregate]
 # Neither setting has a fixed default: unset, both are worked out at startup from the
-# memory the process may use (the container's memory limit, cgroup v2 `memory.max` or v1
-# `memory.limit_in_bytes`, else the machine's RAM), and the startup log says from what.
+# memory the process may use (the memory limit of the cgroup it runs in: the tightest
+# `memory.max` (v2) or `memory.limit_in_bytes` (v1) from its own cgroup, the path in
+# /proc/self/cgroup, up to the root, else the machine's RAM), and the startup log says
+# from which file.
 # The budget counts encoded BSON while the memory a request really takes is 2.5 to 5
 # times that, so the pool is a tenth of the memory and a request may hold half the pool:
 # a 2 GiB container gets a pool of about 200 MiB and about 100 MiB a request. Setting
