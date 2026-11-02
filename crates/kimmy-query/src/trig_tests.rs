@@ -432,18 +432,19 @@ fn atan2_reads_y_then_x() {
 
 #[test]
 fn the_decimal_functions_reach_a_large_operand() {
-    // `sin` and `cos` of 1E+6000 are reduced exactly (`pi` to 6000 digits): the reference's.
-    assert!(close_dec(
+    // `sin` of 1E+6000 is reduced exactly (`pi` to 6000 digits), and is the reference's.
+    assert!(same_value(
         &val(op("$sin", vec![dec("1E+6000")])),
-        "-0.7249266534376325863453460198136025"
+        "D-0.7249266534376325863453460198136025"
     ));
-    assert!(close_dec(
+    // `cos` of 1E+100 is the correctly rounded value; the reference ends 9560 (one unit off).
+    assert!(same_value(
         &val(op("$cos", vec![dec("1E+100")])),
-        "-0.9280819050746553434561946437769560"
+        "D-0.9280819050746553434561946437769559"
     ));
-}
-
-fn close_dec(got: &Bson, want: &str) -> bool {
-    let (Bson::Decimal128(g), Bson::Decimal128(w)) = (got, dec(want)) else { return false };
-    close(&decode_raw(g), &decode_raw(&w))
+    // `tan` of 1E+6000 ends 600; the reference's is 601.
+    assert!(same_value(
+        &val(op("$tan", vec![dec("1E+6000")])),
+        "D1.052408860229401513505574301283600"
+    ));
 }

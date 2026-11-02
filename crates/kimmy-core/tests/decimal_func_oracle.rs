@@ -421,6 +421,190 @@ fn log2_agrees_with_decnumber() {
     report("log2", count, &failures);
 }
 
+// ---------------------------------------------------------------------------
+// The hyperbolic functions, from decNumber's `exp` and `ln` at 120 digits
+// ---------------------------------------------------------------------------
+
+/// A decimal of 1 to 34 digits whose adjusted exponent is in `[low, high]`, of either sign when
+/// `signed`.
+fn in_magnitude(state: &mut u64, low: i64, high: i64, signed: bool) -> Raw {
+    let digits = 1 + splitmix(state) % 34;
+    let wide = u128::from(splitmix(state)) << 64 | u128::from(splitmix(state));
+    let c = (wide % 10u128.pow(digits as u32)).max(10u128.pow(digits as u32 - 1));
+    let adjusted = low + (splitmix(state) % (high - low + 1) as u64) as i64;
+    let e = adjusted - (digits as i64 - 1);
+    fin(signed && splitmix(state).is_multiple_of(2), c, e)
+}
+
+fn lit(ctx: &mut Context<Wide>, text: &str) -> Wide {
+    ctx.parse(text).expect("a literal")
+}
+
+/// `e^x` and `e^-x`.
+fn exps(ctx: &mut Context<Wide>, x: &Raw) -> (Wide, Wide) {
+    let mut up = wide(ctx, x);
+    ctx.exp(&mut up);
+    let mut down = lit(ctx, "1");
+    ctx.div(&mut down, &up);
+    (up, down)
+}
+
+fn hyperbolic(ctx: &mut Context<Wide>, name: &str, x: &Raw) -> Wide {
+    let two = lit(ctx, "2");
+    let one = lit(ctx, "1");
+    match name {
+        "sinh" | "cosh" => {
+            let (mut up, down) = exps(ctx, x);
+            if name == "sinh" {
+                ctx.sub(&mut up, &down);
+            } else {
+                ctx.add(&mut up, &down);
+            }
+            ctx.div(&mut up, &two);
+            up
+        }
+        "tanh" => {
+            let mut doubled = wide(ctx, x);
+            ctx.mul(&mut doubled, &two);
+            ctx.exp(&mut doubled);
+            let mut top = doubled;
+            ctx.sub(&mut top, &one);
+            let mut bottom = doubled;
+            ctx.add(&mut bottom, &one);
+            ctx.div(&mut top, &bottom);
+            top
+        }
+        "asinh" | "acosh" => {
+            // ln(|x| + sqrt(x^2 +- 1)), and the sign of x for asinh.
+            let mut magnitude = wide(ctx, x);
+            if magnitude.is_negative() {
+                ctx.minus(&mut magnitude);
+            }
+            let mut square = magnitude;
+            ctx.mul(&mut square, &magnitude);
+            if name == "asinh" {
+                ctx.add(&mut square, &one);
+            } else {
+                ctx.sub(&mut square, &one);
+            }
+            ctx.sqrt(&mut square);
+            ctx.add(&mut magnitude, &square);
+            ctx.ln(&mut magnitude);
+            if name == "asinh" && matches!(x, Raw::Finite { negative: true, .. }) {
+                ctx.minus(&mut magnitude);
+            }
+            magnitude
+        }
+        "atanh" => {
+            let mut top = one;
+            let x_wide = wide(ctx, x);
+            ctx.add(&mut top, &x_wide);
+            let mut bottom = one;
+            ctx.sub(&mut bottom, &x_wide);
+            ctx.div(&mut top, &bottom);
+            ctx.ln(&mut top);
+            ctx.div(&mut top, &two);
+            top
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// An answer's value with its trailing zeros off, so `1` and `1.000` are one.
+fn trimmed(raw: &Raw) -> Raw {
+    match *raw {
+        Raw::Finite { coefficient: 0, .. } => ZERO_RAW,
+        Raw::Finite { negative, mut coefficient, mut exponent } => {
+            while coefficient.is_multiple_of(10) {
+                coefficient /= 10;
+                exponent += 1;
+            }
+            Raw::Finite { negative, coefficient, exponent }
+        }
+        other => other,
+    }
+}
+
+const ZERO_RAW: Raw = Raw::Finite { negative: false, coefficient: 0, exponent: 0 };
+
+fn hyperbolic_agrees(
+    name: &str,
+    seed: u64,
+    input: impl Fn(&mut u64, usize) -> Raw,
+    call: fn(&Raw) -> Result<Raw, func::Domain>,
+) {
+    let mut ctx = context();
+    let mut state = seed;
+    let mut failures = Vec::new();
+    let mut count = 0;
+    for i in 0..3000 {
+        let x = input(&mut state, i);
+        let w = hyperbolic(&mut ctx, name, &x);
+        let want = expected(read(&w)).map(|r| trimmed(&r));
+        compare(name, &[text(&x)], call(&x).map(|r| trimmed(&r)), want, &mut failures);
+        count += 1;
+    }
+    report(name, count, &failures);
+}
+
+#[test]
+fn sinh_agrees_with_decnumber() {
+    hyperbolic_agrees("sinh", 11, |s, _| in_magnitude(s, -30, 3, true), func::sinh);
+}
+
+#[test]
+fn cosh_agrees_with_decnumber() {
+    hyperbolic_agrees("cosh", 12, |s, _| in_magnitude(s, -40, 3, true), func::cosh);
+}
+
+#[test]
+fn tanh_agrees_with_decnumber() {
+    hyperbolic_agrees("tanh", 13, |s, _| in_magnitude(s, -30, 1, true), func::tanh);
+}
+
+#[test]
+fn asinh_agrees_with_decnumber() {
+    hyperbolic_agrees("asinh", 14, |s, _| in_magnitude(s, -30, 60, true), func::asinh);
+}
+
+#[test]
+fn acosh_agrees_with_decnumber() {
+    // From one to 1E+60, and a little above one, where the square root is small.
+    hyperbolic_agrees(
+        "acosh",
+        15,
+        |s, i| if i % 3 == 0 { one_plus_or_minus(s, true) } else { in_magnitude(s, 0, 60, false) },
+        func::acosh,
+    );
+}
+
+#[test]
+fn atanh_agrees_with_decnumber() {
+    hyperbolic_agrees(
+        "atanh",
+        16,
+        |s, i| {
+            if i % 4 == 0 {
+                let Raw::Finite { coefficient, exponent, .. } = one_plus_or_minus(s, false) else {
+                    unreachable!()
+                };
+                fin(splitmix(s).is_multiple_of(2), coefficient, i64::from(exponent))
+            } else {
+                in_magnitude(s, -30, -1, true)
+            }
+        },
+        func::atanh,
+    );
+}
+
+/// `1 + m 10^-k` (above) or `1 - m 10^-k` for a digit `m` and `k` from 1 to 33.
+fn one_plus_or_minus(state: &mut u64, above: bool) -> Raw {
+    let k = 1 + splitmix(state) % 33;
+    let m = u128::from(1 + splitmix(state) % 9);
+    let unit = 10u128.pow(k as u32);
+    fin(false, if above { unit + m } else { unit - m }, -(k as i64))
+}
+
 /// A random decimal `y`, `1 <= |y| < limit`, with up to 6 fractional digits.
 fn random_y(state: &mut u64, limit: u64) -> Raw {
     let k = (splitmix(state) % 7) as u32;

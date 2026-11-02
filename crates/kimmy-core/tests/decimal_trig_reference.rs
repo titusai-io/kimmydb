@@ -114,5 +114,9 @@ fn the_decimal_functions_answer_what_the_reference_answers() {
     }
     assert!(exact_wrong.is_empty());
     assert!(far.is_empty(), "{far:#?}");
-    assert!(same * 100 >= total * 80, "only {same} of {total} identical");
+    // The count of identical answers is exact, so that a kernel that slips a unit shows. It moves
+    // only if a function changes its last digit: then the figure here, in the register and in
+    // `docs/aggregation.md` are changed together, after `decimal_trig_oracle` has held the
+    // answers to the true values.
+    assert_eq!((total, same), (1478, 1253), "{same} of {total} identical");
 }
