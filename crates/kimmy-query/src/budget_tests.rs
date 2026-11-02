@@ -1013,6 +1013,46 @@ fn fill_and_set_window_fields_hold_a_completed_document_to_the_limit_whole() {
 }
 
 #[test]
+fn unwind_with_an_index_field_holds_the_document_it_completes_to_the_limit_whole() {
+    // A document at the bound before the index field is added: `$unwind` without the index
+    // passes it, and with it the document is over by the field, refused at the byte.
+    let docs = [
+        // An array to fan out, a scalar that unwinds to itself, and the empty and null cases
+        // that `preserveNullAndEmptyArrays` keeps (the null index is added to those too).
+        ("array", doc! {"_id": 1, "tags": ["a"], "pad": "p".repeat(300)}, false),
+        ("scalar", doc! {"_id": 1, "tags": "a", "pad": "p".repeat(300)}, false),
+        ("empty", doc! {"_id": 1, "tags": Bson::Array(vec![]), "pad": "p".repeat(300)}, true),
+        ("null", doc! {"_id": 1, "tags": Bson::Null, "pad": "p".repeat(300)}, true),
+        ("missing", doc! {"_id": 1, "pad": "p".repeat(300)}, true),
+    ];
+    for (name, input, preserve) in docs {
+        let plain = doc! {"$unwind": {"path": "$tags", "preserveNullAndEmptyArrays": preserve}};
+        let indexed = doc! {"$unwind": {"path": "$tags", "preserveNullAndEmptyArrays": preserve,
+        "includeArrayIndex": "idx"}};
+        let without =
+            run(plain.clone(), vec![input.clone()], &with_document_limit(usize::MAX)).unwrap();
+        let with =
+            run(indexed.clone(), vec![input.clone()], &with_document_limit(usize::MAX)).unwrap();
+        let (before, size) = (doc_bytes(&without[0]), doc_bytes(&with[0]));
+        assert!(size > before, "{name}: the index adds a field");
+        // The document at the limit before the index passes without it; size passes with it,
+        // and size + 1 over refuses at the byte.
+        assert!(run(plain, vec![input.clone()], &with_document_limit(before)).is_ok(), "{name}");
+        assert!(run(indexed.clone(), vec![input.clone()], &with_document_limit(size)).is_ok());
+        let err =
+            run(indexed.clone(), vec![input.clone()], &with_document_limit(size - 1)).unwrap_err();
+        let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{name}: {err:?}") };
+        assert_eq!(
+            (*what, *bytes, *max),
+            ("the document the stage builds", size, size - 1),
+            "{name}"
+        );
+        // Under a bound the document before the index fits and the index does not.
+        assert!(run(indexed, vec![input], &with_document_limit(before)).is_err(), "{name}");
+    }
+}
+
+#[test]
 fn the_value_bound_and_the_budget_each_refuse_alone_and_count_the_same_bytes_once() {
     let input = padded(40, 1_000);
     let held_in = docs_bytes(&input);

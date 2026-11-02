@@ -2438,7 +2438,11 @@ fn unwind(
         let Some(name) = include_index else { return Ok(()) };
         let value = index.map_or(Bson::Null, Bson::Int64);
         path::set(copy, name, value)
-            .map_err(|e| Error::InvalidQuery(format!("cannot set `{name}`: {e}")))
+            .map_err(|e| Error::InvalidQuery(format!("cannot set `{name}`: {e}")))?;
+        // The element in place of the array is no larger than the input, but the index field
+        // is added to it: a document at the limit goes over it by the field. Held to the
+        // limit as a whole, as the other stages that add fields are.
+        check_built_document(copy, limits.max_document_bytes)
     };
 
     let mut out = Vec::with_capacity(input.len());
