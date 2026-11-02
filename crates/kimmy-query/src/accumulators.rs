@@ -284,6 +284,7 @@ impl Spec {
             dirs: self.sort.iter().map(|k| k.descending != bottom).collect(),
             held: HeldArray::new(self.array_name(), max),
             body,
+            charged: 0,
         }
     }
 
@@ -316,6 +317,9 @@ pub struct State {
     /// rows.
     held: HeldArray,
     body: Body,
+    /// The BSON bytes of the rows and values kept now, for the request's budget
+    /// (ADR-269): added when one is kept, taken off when one is dropped.
+    charged: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -471,7 +475,8 @@ pub(crate) fn n_of_array(kind: Kind, items: &[Bson], n: usize) -> Bson {
     // The items come from an array already within the limit, and the answer holds
     // some of them, so there is nothing to count.
     let held = HeldArray::new("the array an array form builds", usize::MAX);
-    let mut state = State { kind, limit: Some(n), seq: 0, dirs: Arc::from([]), held, body };
+    let mut state =
+        State { kind, limit: Some(n), seq: 0, dirs: Arc::from([]), held, charged: 0, body };
     for item in items {
         let _ = state.take(item.clone());
     }
@@ -531,7 +536,27 @@ fn key_cmp(a: &Bson, b: &Bson) -> Ordering {
     }
 }
 
+/// The estimate of the memory a value takes in a group's state: its slot and what it holds
+/// parsed (ADR-269).
+fn value_bytes(value: &Bson) -> usize {
+    crate::budget::held_bytes_bson(value)
+}
+
+impl Row {
+    /// The bytes this row takes in a group's state.
+    fn bytes(&self) -> usize {
+        self.keys
+            .iter()
+            .fold(value_bytes(&self.output), |sum, k| sum.saturating_add(value_bytes(k)))
+    }
+}
+
 impl State {
+    /// The estimate of the memory of the rows and values this group keeps now (ADR-269).
+    pub fn held(&self) -> usize {
+        self.charged
+    }
+
     /// Take one document.
     pub fn accumulate(&mut self, spec: &Spec, scope: &Scope<'_>) -> Result<()> {
         if self.limit.is_none() && self.needs_limit() {
@@ -552,11 +577,14 @@ impl State {
                 // request whether or not the row would have been kept.
                 let output = spec.value.eval_in(scope)?;
                 self.held.take(bson_bytes(&output));
-                rows.push(Row { keys, output, seq: self.seq, dirs: Arc::clone(&self.dirs) });
+                let row = Row { keys, output, seq: self.seq, dirs: Arc::clone(&self.dirs) };
+                self.charged = self.charged.saturating_add(row.bytes());
+                rows.push(row);
                 self.seq += 1;
                 if rows.len() > limit
                     && let Some(dropped) = rows.pop()
                 {
+                    self.charged = self.charged.saturating_sub(dropped.bytes());
                     self.held.give_back(bson_bytes(&dropped.output));
                 }
                 self.held.check()?;
@@ -580,14 +608,17 @@ impl State {
                 if self.kind == Kind::FirstN {
                     if values.len() < limit {
                         self.held.take(bson_bytes(&value));
+                        self.charged = self.charged.saturating_add(value_bytes(&value));
                         values.push_back(value);
                     }
                 } else {
                     self.held.take(bson_bytes(&value));
+                    self.charged = self.charged.saturating_add(value_bytes(&value));
                     values.push_back(value);
                     if values.len() > limit
                         && let Some(dropped) = values.pop_front()
                     {
+                        self.charged = self.charged.saturating_sub(value_bytes(&dropped));
                         self.held.give_back(bson_bytes(&dropped));
                     }
                 }
@@ -595,11 +626,13 @@ impl State {
             // `$maxN` and `$minN` skip null and missing.
             Body::Best(heap) if !matches!(value, Bson::Null | Bson::Undefined) => {
                 self.held.take(bson_bytes(&value));
+                self.charged = self.charged.saturating_add(value_bytes(&value));
                 heap.push(Best { value, seq: self.seq, max: self.kind == Kind::MaxN });
                 self.seq += 1;
                 if heap.len() > limit
                     && let Some(dropped) = heap.pop()
                 {
+                    self.charged = self.charged.saturating_sub(value_bytes(&dropped.value));
                     self.held.give_back(bson_bytes(&dropped.value));
                 }
             }

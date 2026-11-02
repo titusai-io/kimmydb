@@ -26,6 +26,11 @@ fn soon() -> Deadline {
     Deadline::scope(Some(Duration::from_millis(15)))
 }
 
+/// A lease on a budget of its own, for the stages that charge what they hold (ADR-269).
+fn lease() -> crate::budget::Lease {
+    Limits::default().buffer.lease("a test")
+}
+
 fn is_deadline<T: std::fmt::Debug>(result: Result<T>) -> bool {
     matches!(result, Err(Error::DeadlineExceeded))
 }
@@ -100,7 +105,7 @@ fn unwind_stops_in_its_outer_loop_and_in_the_array_it_fans_out() {
     // Directly, expired: the first document's tick.
     {
         let _deadline = expired();
-        let result = unwind(rows(1), "tags", false, None, &Limits::default());
+        let result = unwind(rows(1), "tags", false, None, &Limits::default(), &mut lease());
         assert!(is_deadline(result));
     }
     // One document holding a long array: one iteration of the outer loop, many rows. Each
@@ -109,7 +114,7 @@ fn unwind_stops_in_its_outer_loop_and_in_the_array_it_fans_out() {
     // pass the 1,024th tick. A deadline of a millisecond is passed long before they are made.
     let big = vec![doc! { "_id": 1, "tags": (0..2_500_i64).collect::<Vec<_>>() }];
     let _deadline = Deadline::scope(Some(Duration::from_millis(1)));
-    assert!(is_deadline(unwind(big, "tags", false, None, &Limits::default())));
+    assert!(is_deadline(unwind(big, "tags", false, None, &Limits::default(), &mut lease())));
 }
 
 #[test]
@@ -121,11 +126,11 @@ fn group_stops_in_its_loop() {
     };
     {
         let _deadline = expired();
-        assert!(is_deadline(group(rows(1), &id, &fields, &Limits::default(), &[])));
+        assert!(is_deadline(group(rows(1), &id, &fields, &Limits::default(), &[], &mut lease())));
     }
     // The per-document loop, with the deadline passing while it runs.
     let _deadline = soon();
-    assert!(is_deadline(group(rows(100_000), &id, &fields, &Limits::default(), &[])));
+    assert!(is_deadline(group(rows(100_000), &id, &fields, &Limits::default(), &[], &mut lease())));
 }
 
 #[test]
@@ -145,6 +150,7 @@ fn bucket_and_bucket_auto_stop_in_their_loops() {
             &fields,
             &Limits::default(),
             &[],
+            &mut lease(),
         );
         assert!(is_deadline(result));
     }
@@ -155,11 +161,27 @@ fn bucket_and_bucket_auto_stop_in_their_loops() {
     };
     {
         let _deadline = expired();
-        let result = bucket_auto(rows(1), &group_by, buckets, &fields, &Limits::default(), &[]);
+        let result = bucket_auto(
+            rows(1),
+            &group_by,
+            buckets,
+            &fields,
+            &Limits::default(),
+            &[],
+            &mut lease(),
+        );
         assert!(is_deadline(result));
     }
     let _deadline = soon();
-    let result = bucket_auto(rows(100_000), &group_by, buckets, &fields, &Limits::default(), &[]);
+    let result = bucket_auto(
+        rows(100_000),
+        &group_by,
+        buckets,
+        &fields,
+        &Limits::default(),
+        &[],
+        &mut lease(),
+    );
     assert!(is_deadline(result));
 }
 
@@ -317,17 +339,17 @@ fn sample_stops_in_its_shuffle() {
 #[test]
 fn redact_stops_at_the_first_document_it_decides() {
     let keep = redact_expr(Bson::String("$$DESCEND".into()));
-    assert!(crate::stages::redact(rows(2), &keep, &[]).is_ok());
+    assert!(crate::stages::redact(rows(2), &keep, &[], &mut lease()).is_ok());
     {
         let _deadline = expired();
-        assert!(is_deadline(crate::stages::redact(rows(1), &keep, &[])));
+        assert!(is_deadline(crate::stages::redact(rows(1), &keep, &[], &mut lease())));
     }
     // Each scope restarts the shared count, so its first decision reads the clock. An
     // embedded document is decided too: the descent into nested documents is stopped
     // wherever the count reads the clock, the top document included.
     let _deadline = expired();
     let nested = vec![doc! { "a": { "b": { "c": 1 } } }];
-    assert!(is_deadline(crate::stages::redact(nested, &keep, &[])));
+    assert!(is_deadline(crate::stages::redact(nested, &keep, &[], &mut lease())));
 }
 
 #[test]
@@ -340,15 +362,23 @@ fn redact_stops_in_a_descent_through_many_embedded_documents() {
     }
     let keep = redact_expr(Bson::String("$$DESCEND".into()));
     let _deadline = soon();
-    assert!(is_deadline(crate::stages::redact(vec![wide], &keep, &[])));
+    assert!(is_deadline(crate::stages::redact(vec![wide], &keep, &[], &mut lease())));
 }
 
 #[test]
 fn sort_by_count_stops_in_its_group_loop() {
     let expr = Expr::parse(&Bson::String("$k".into())).unwrap();
-    assert!(crate::stages::sort_by_count(rows(2), &expr, &Limits::default(), &[]).is_ok());
+    assert!(
+        crate::stages::sort_by_count(rows(2), &expr, &Limits::default(), &[], &mut lease()).is_ok()
+    );
     let _deadline = expired();
-    assert!(is_deadline(crate::stages::sort_by_count(rows(2), &expr, &Limits::default(), &[])));
+    assert!(is_deadline(crate::stages::sort_by_count(
+        rows(2),
+        &expr,
+        &Limits::default(),
+        &[],
+        &mut lease()
+    )));
 }
 
 #[test]
@@ -436,7 +466,7 @@ fn each_accumulator_step_ticks() {
     };
     let _deadline = Deadline::scope(Some(Duration::from_secs(3600)));
     let before = ticks_taken();
-    group(rows(500), &id, &fields, &Limits::default(), &[]).unwrap();
+    group(rows(500), &id, &fields, &Limits::default(), &[], &mut lease()).unwrap();
     // Two accumulators over 500 documents.
     assert!(ticks_taken() - before >= 1_000, "{} ticks", ticks_taken() - before);
 }
@@ -474,7 +504,8 @@ fn unwind_ticks_for_each_document_it_reads_and_each_row_it_makes() {
     let empty = |n: i64| -> Vec<Document> {
         (0..n).map(|i| doc! { "_id": i, "tags": Vec::<i32>::new() }).collect()
     };
-    let reads = |n: i64| looks(|| unwind(empty(n), "tags", false, None, &limits).unwrap());
+    let reads =
+        |n: i64| looks(|| unwind(empty(n), "tags", false, None, &limits, &mut lease()).unwrap());
     // An empty array makes no row, so only the outer loop ticks, once for each document.
     let diff = reads(60) - reads(10);
     assert_eq!(diff, 50, "{diff} looks for fifty more documents");
@@ -482,7 +513,8 @@ fn unwind_ticks_for_each_document_it_reads_and_each_row_it_makes() {
     let full = |n: i64| -> Vec<Document> {
         (0..n).map(|i| doc! { "_id": i, "tags": ["a", "b"] }).collect()
     };
-    let reads = |n: i64| looks(|| unwind(full(n), "tags", false, None, &limits).unwrap());
+    let reads =
+        |n: i64| looks(|| unwind(full(n), "tags", false, None, &limits, &mut lease()).unwrap());
     let diff = reads(60) - reads(10);
     assert_eq!(diff, 3 * 50, "{diff} looks for fifty more documents of two rows");
 }
@@ -495,8 +527,11 @@ fn bucket_auto_ticks_in_each_of_its_loops() {
         unreachable!()
     };
     let limits = Limits::default();
-    let reads =
-        |n: i64| looks(|| bucket_auto(rows(n), &group_by, buckets, &fields, &limits, &[]).unwrap());
+    let reads = |n: i64| {
+        looks(|| {
+            bucket_auto(rows(n), &group_by, buckets, &fields, &limits, &[], &mut lease()).unwrap()
+        })
+    };
     // The loop that keys each document, the one that accumulates each bucket's, and the one that
     // writes the buckets out: three looks for a document.
     let diff = reads(80) - reads(20);
@@ -509,7 +544,7 @@ fn redact_ticks_for_each_element_of_an_array_it_walks() {
     // Integers are decided by no one: only the walk of the array ticks, once for each.
     let reads = |m: i32| {
         let wide = doc! { "a": (0..m).collect::<Vec<i32>>() };
-        looks(|| crate::stages::redact(vec![wide], &keep, &[]).unwrap())
+        looks(|| crate::stages::redact(vec![wide], &keep, &[], &mut lease()).unwrap())
     };
     let diff = reads(80) - reads(20);
     assert_eq!(diff, 60, "{diff} looks for sixty more elements");

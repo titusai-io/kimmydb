@@ -125,6 +125,10 @@ pub struct AppState {
     /// for `kimmy_ttl_collections`: without clustering there is no block to say
     /// it (ADR-201). Unset reads as on.
     pub(crate) expiry_off: std::sync::OnceLock<bool>,
+    /// What an aggregation may hold: the per-request limit and the node's pool
+    /// (ADR-269). Set once at startup from `aggregate.memory_limit_bytes` and
+    /// `aggregate.memory_pool_bytes`; unset reads as the defaults.
+    pub(crate) aggregate_memory: std::sync::OnceLock<crate::limits::AggregateMemory>,
 }
 
 /// A peer that has been away longer than tombstone retention.
@@ -262,6 +266,11 @@ impl AppState {
             validation_warnings: self.engine.validation_totals().0,
             validation_refusals: self.engine.validation_totals().1,
             validators_unparseable: self.engine.validators_unparseable(),
+            // What aggregations hold and were refused, from the pool the requests draw on
+            // (ADR-269).
+            aggregate_limit_refusals: self.aggregate_memory().pool().limit_refusals(),
+            aggregate_pool_refusals: self.aggregate_memory().pool().pool_refusals(),
+            aggregate_pool_used_bytes: self.aggregate_memory().pool().used() as u64,
             // Entries held as state that a window released (ADR-169's
             // addendum), counted by the engine on commit so a pulled and a
             // pushed window land on the same series.
@@ -349,6 +358,23 @@ impl AppState {
     /// second call is ignored.
     pub fn set_expiry_off(&self, off: bool) {
         let _ = self.expiry_off.set(off);
+    }
+
+    /// Choose what aggregations may hold (ADR-269). Called once, at startup; a second
+    /// call is ignored.
+    pub fn set_aggregate_memory(&self, memory: crate::limits::AggregateMemory) {
+        let _ = self.aggregate_memory.set(memory);
+    }
+
+    /// What aggregations may hold: the configured limit and pool, or the defaults.
+    pub fn aggregate_memory(&self) -> &crate::limits::AggregateMemory {
+        self.aggregate_memory.get_or_init(Default::default)
+    }
+
+    /// The limits of one aggregation request, with a fresh memory budget that draws on
+    /// the node's pool (ADR-269).
+    pub fn aggregate_limits(&self) -> kimmy_query::aggregate::Limits {
+        self.aggregate_memory().limits()
     }
 
     /// Who may expire what, from here: the live members and what they said,

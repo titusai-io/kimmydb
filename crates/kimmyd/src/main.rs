@@ -1,5 +1,6 @@
 //! `kimmyd` — the KimmyDB server.
 
+mod aggmem;
 mod cli;
 mod config;
 mod facts;

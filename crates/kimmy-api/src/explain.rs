@@ -35,7 +35,7 @@ pub fn aggregate_explain(
     coll: &str,
     pipeline: &Value,
 ) -> Result<Value, ApiError> {
-    aggregate_explain_with_limits(state, auth, db, coll, pipeline, aggregate::Limits::default())
+    aggregate_explain_with_limits(state, auth, db, coll, pipeline, state.aggregate_limits())
 }
 
 /// [`aggregate_explain`] under an explicit ceiling, which it reports.
@@ -94,6 +94,13 @@ pub fn aggregate_explain_with_limits(
                         names; no document, index entry or provider was touched",
             "source": source,
             "stages": rest,
+            // What a run may hold, and how much of the node's pool is in use now
+            // (ADR-269): a plan reads these, it reserves nothing.
+            "memory": {
+                "limitBytes": limits.buffer.cap(),
+                "poolBytes": state.aggregate_memory().pool().cap(),
+                "poolUsedBytes": state.aggregate_memory().pool().used(),
+            },
         }
     }))
 }
@@ -632,6 +639,29 @@ mod tests {
             assert!(!text.contains(measured), "{measured} in {text}");
         }
         assert_eq!(out["explain"]["source"]["maxDocuments"], aggregate::DEFAULT_MAX_DOCUMENTS);
+    }
+
+    /// A plan reports what a run may hold and the state of the node's pool (ADR-269), and
+    /// reserves nothing.
+    #[test]
+    fn a_plan_reports_the_memory_limit_and_the_pools_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed(&state, "a", 5, true);
+        state.set_aggregate_memory(crate::AggregateMemory::new(5_000_000, 8_000_000));
+        let pipeline = json!([{ "$match": { "n": 2 } }]);
+        let out = explain(&state, &root(), "a", pipeline.clone()).unwrap();
+        assert_eq!(
+            out["explain"]["memory"],
+            json!({ "limitBytes": 5_000_000, "poolBytes": 8_000_000, "poolUsedBytes": 0 })
+        );
+        // Another request holds 3 MB of the pool: the plan says so, and reserves none itself.
+        let other = state.aggregate_limits();
+        let mut lease = other.buffer.lease("another request");
+        lease.charge(3_000_000).unwrap();
+        let out = explain(&state, &root(), "a", pipeline).unwrap();
+        assert_eq!(out["explain"]["memory"]["poolUsedBytes"], 3_000_000);
+        assert_eq!(state.aggregate_memory().pool().used(), 3_000_000);
     }
 
     /// Nothing runs: pipelines that a run refuses or fails on data are planned.

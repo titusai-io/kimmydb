@@ -99,9 +99,24 @@ pub enum Error {
         what: &'static str,
         bytes: usize,
         max: usize,
-        limit: &'static str,
+        limit: String,
         remedy: &'static str,
     },
+
+    /// An aggregation needed `bytes` more bytes of the node's shared pool of aggregation
+    /// memory (`aggregate.memory_pool_bytes`, `pool` bytes in all) while `in_use` of it was
+    /// reserved (by every request, the one refused included: what it had reserved so far is
+    /// in that total), and was refused rather than left to take memory the node does not
+    /// have (ADR-269). `what` names the holder that asked. The request itself is not too
+    /// large: it is answered `503`, and the same request is retried when the others have
+    /// finished.
+    #[error(
+        "{what} needed {bytes} more bytes of the node's pool of aggregation memory \
+         (aggregate.memory_pool_bytes, {pool} bytes, {in_use} reserved now by all requests, \
+         this one's included); retry later, or hold less: a leading $match narrows what is \
+         read, and $project, $limit or $match after it reduce what later stages hold"
+    )]
+    MemoryBusy { what: &'static str, bytes: usize, pool: usize, in_use: usize },
 
     /// A client write names an `_id` of `bytes` bytes, over the `max` an `_id`
     /// may have (ADR-250). `kind` says which sort of id; the id itself is not
@@ -204,6 +219,7 @@ impl Error {
             | Error::DocumentInvalid { .. }
             | Error::AnswerTooLarge { .. }
             | Error::ValueTooLarge { .. }
+            | Error::MemoryBusy { .. }
             | Error::IdTooLarge { .. }
             | Error::ResumeTokenExpired
             | Error::MalformedResumeToken
@@ -264,6 +280,7 @@ impl Error {
             | Error::DocumentInvalid { .. }
             | Error::AnswerTooLarge { .. }
             | Error::ValueTooLarge { .. }
+            | Error::MemoryBusy { .. }
             | Error::IdTooLarge { .. }
             | Error::DeadlineExceeded
             | Error::UnsupportedOperator { .. }

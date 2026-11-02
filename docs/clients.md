@@ -39,8 +39,9 @@ server newer than the client will use ones it has never heard of. `retry` is in
 the envelope precisely so that a client does not need a table
 ([ADR-057](decisions.md)).
 `answer_too_large` (`413`, retry `no`) refuses a query that would build more than a cap
-allows (a `$facet` answer over 16 MiB, a string, array or document over 16 MiB, or 256 MiB
-held by the window, densify and fill stages of one request); narrow the query.
+allows (a `$facet` answer over 16 MiB, a string, array or document over 16 MiB, or more than
+`aggregate.memory_limit_bytes` held by one aggregation); narrow the query. An aggregation the
+node's aggregation memory pool is in use for is `timeout` (`503`, retry `wait`, with `Retry-After: 1`).
 `document_too_large` and `id_too_large` (`413`, retry `no`) refuse a write whose
 document encodes to more than 16 MiB or whose `_id` is over 4096 bytes; resending
 it fails the same way ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)).

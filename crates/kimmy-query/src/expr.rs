@@ -72,7 +72,7 @@ mod arrayacc;
 mod dates;
 mod docops;
 mod math;
-mod sizes;
+pub(crate) mod sizes;
 mod strings;
 mod tz;
 

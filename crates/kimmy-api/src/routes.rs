@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, Path, State};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use opentelemetry_semantic_conventions::attribute as semconv;
@@ -1182,17 +1182,32 @@ async fn aggregate_docs(
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
     JsonBody(body): JsonBody<AggregateRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     if body.explain {
-        return Ok(Json(crate::explain::aggregate_explain(
-            &state,
-            &auth,
-            &db,
-            &coll,
-            &body.pipeline,
-        )?));
+        let plan = crate::explain::aggregate_explain(&state, &auth, &db, &coll, &body.pipeline)?;
+        return Ok(Json(plan).into_response());
     }
-    Ok(Json(exec::aggregate(&state, &auth, &db, &coll, &body.pipeline).await?))
+    // The answer's bytes stay charged to the node's pool until the body has been sent
+    // (ADR-269): the lease rides in the response body. The answer is written once, as the body
+    // itself, and counted as it was written.
+    let (answer, hold) = exec::aggregate_held(&state, &auth, &db, &coll, &body.pipeline).await?;
+    // A pipeline that answers documents is already written, once, as the body; a sink's
+    // counts are a small value, written here.
+    let bytes = match answer {
+        exec::Answer::Body(bytes) => bytes,
+        exec::Answer::Json(value) => serde_json::to_vec(&value)
+            .map_err(|e| ApiError::internal(format!("could not write the answer: {e}")))?,
+    };
+    let length = bytes.len();
+    let mut response =
+        Response::new(axum::body::Body::new(crate::limits::HeldBody::new(bytes.into(), hold)));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    // The body is sent in pieces; its length is known and said, not chunked.
+    response.headers_mut().insert(axum::http::header::CONTENT_LENGTH, length.into());
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------

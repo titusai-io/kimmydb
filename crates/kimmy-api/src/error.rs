@@ -32,6 +32,9 @@ use tracing::{Level, error, info, warn};
 /// The `Retry-After` a `collection_purging` refusal carries, in seconds.
 pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
 
+/// The `Retry-After` an aggregation refused by the node's memory pool carries, in seconds.
+pub const AGGREGATE_POOL_RETRY_AFTER_SECS: u64 = 1;
+
 /// Every code the API can return, and nothing else.
 ///
 /// **Adding a variant here also means a change in the client libraries**, which
@@ -55,7 +58,8 @@ pub enum ErrorCode {
     /// A write would store a document over the 16 MiB cap (ADR-250).
     DocumentTooLarge,
     /// A query would build more than a cap allows: a `$facet` answer over 16 MiB, a string, array or
-    /// document an expression builds, or the bytes the blocking stages of a pipeline hold (ADR-264).
+    /// document an expression builds, or the bytes one aggregation holds past
+    /// `aggregate.memory_limit_bytes` (ADR-269, which widens ADR-264's budget).
     /// Narrowing the query changes the answer; the message names what and the limit.
     AnswerTooLarge,
     /// A request names an `_id` over the 4 KiB cap (ADR-250).
@@ -710,6 +714,20 @@ impl ApiError {
         })
     }
 
+    /// An aggregation refused because the node's shared pool of aggregation memory
+    /// (`aggregate.memory_pool_bytes`) is held by other requests (ADR-269).
+    ///
+    /// The same code, status and `retry: wait` as [`Self::timeout`] and
+    /// [`Self::writer_busy`]: the request did not run, nothing was done, and the same
+    /// request succeeds when the others have finished. Unlike the deadline it carries a
+    /// `Retry-After`, because a pool is returned when a request ends, which is soon.
+    pub fn memory_busy(message: impl Into<String>) -> Self {
+        Self {
+            retry_after_secs: Some(AGGREGATE_POOL_RETRY_AFTER_SECS),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Timeout, message)
+        }
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::BadRequest, message)
     }
@@ -1033,6 +1051,9 @@ impl From<CoreError> for ApiError {
                 ErrorCode::AnswerTooLarge,
                 e.to_string(),
             ),
+            // The node's pool of aggregation memory is held by other requests: not this
+            // request's fault, and the same request is answered when they finish (ADR-269).
+            CoreError::MemoryBusy { .. } => ApiError::memory_busy(e.to_string()),
             CoreError::IdTooLarge { .. } => {
                 ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::IdTooLarge, e.to_string())
             }
@@ -1763,7 +1784,7 @@ mod value_too_large_tests {
                 what,
                 bytes: 20_000_000,
                 max: 16 << 20,
-                limit,
+                limit: limit.into(),
                 remedy: "trim it",
             });
             assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);

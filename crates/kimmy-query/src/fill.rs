@@ -18,11 +18,13 @@
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
-use crate::aggregate::Limits;
+use crate::aggregate::{Limits, check_built_document};
+use crate::budget::held_frame_growth;
 use crate::deadline;
 use crate::expr::{Binding, Expr, Scope, type_name};
 use crate::window::{
-    Func, Output, Partition, WindowSpec, apply as apply_window, check_output_name, parse_sort_by,
+    Func, Output, Partition, WindowSpec, apply_in, buffer_name, check_output_name, element_bytes,
+    parse_sort_by,
 };
 
 fn bad<T>(message: impl Into<String>) -> Result<T> {
@@ -180,9 +182,17 @@ pub fn apply(
     limits: &Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
+    // One lease for the whole stage (ADR-269): the documents it buffers, the values the
+    // fill methods add, and every `value` written below, all held until it returns. The
+    // input is charged here and nowhere else (`Held::enter` leaves `$fill` out), once
+    // whichever way the stage runs.
+    let mut lease = limits.buffer.lease(buffer_name("$fill"));
     let mut docs = match &spec.window {
-        Some(window) => apply_window(window, input, limits, vars)?,
-        None => input,
+        Some(window) => apply_in(window, input, limits.max_document_bytes, vars, &mut lease)?,
+        None => {
+            lease.charge_docs(&input)?;
+            input
+        }
     };
     if spec.values.is_empty() {
         return Ok(docs);
@@ -190,17 +200,43 @@ pub fn apply(
     for doc in &mut docs {
         deadline::tick()?;
         // Every value is read from the document before any is written, as `$addFields` does.
-        let mut fills: Vec<(&str, Bson)> = Vec::new();
+        let mut fills: Vec<(&str, Option<Bson>)> = Vec::new();
         for (name, expr) in &spec.values {
-            let empty =
-                matches!(path::resolve(doc, name).into_iter().next(), None | Some(Bson::Null));
-            if empty && let Some(value) = expr.eval_field(&Scope::with_bindings(doc, vars))? {
-                fills.push((name, value));
+            let current = path::resolve(doc, name).into_iter().next();
+            let is_null = matches!(current, Some(Bson::Null));
+            if !(current.is_none() || is_null) {
+                continue;
+            }
+            match expr.eval_field(&Scope::with_bindings(doc, vars))? {
+                Some(value) => fills.push((name, Some(value))),
+                // A value that reaches nothing fills nothing: a missing field stays
+                // missing, and a field that holds an explicit null is removed, as the
+                // reference does (`$$REMOVE`, or a path that finds no field).
+                None if is_null => fills.push((name, None)),
+                None => {}
             }
         }
+        let wrote = fills.iter().any(|(_, value)| value.is_some());
         for (name, value) in fills {
-            path::set(doc, name, value)
-                .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
+            match value {
+                Some(value) => {
+                    // Charged before it is written, so a value that passes the limit stops
+                    // the stage at this document. The whole element is counted, which
+                    // over-counts by the few bytes of a null it replaces.
+                    lease.charge(
+                        element_bytes(name, &value).saturating_add(held_frame_growth(doc.len(), 1)),
+                    )?;
+                    path::set(doc, name, value)
+                        .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
+                }
+                None => {
+                    path::unset(doc, name);
+                }
+            }
+        }
+        // Each value is held to 16 MiB on its own; the document they make together is not.
+        if wrote {
+            check_built_document(doc, limits.max_document_bytes)?;
         }
     }
     Ok(docs)

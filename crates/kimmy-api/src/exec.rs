@@ -12,6 +12,7 @@
 use bson::Document;
 use kimmy_auth::Action;
 use kimmy_core::DocId;
+use kimmy_query::budget::Lease;
 use kimmy_query::deadline;
 use kimmy_query::expr::Binding;
 use kimmy_query::{aggregate, filter, plan, shape, update};
@@ -824,7 +825,7 @@ struct Recheck<'a, F> {
     visit: F,
 }
 
-impl<F: FnMut(kimmy_core::Stamp, bson::Document)> Recheck<'_, F> {
+impl<F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>> Recheck<'_, F> {
     /// Examine one candidate; whether the scan should go on.
     ///
     /// The bound is checked **before** a candidate is considered, not after
@@ -843,7 +844,11 @@ impl<F: FnMut(kimmy_core::Stamp, bson::Document)> Recheck<'_, F> {
         self.examined += 1;
         if filter::matches(self.filter, &doc)? {
             self.matched += 1;
-            (self.visit)(stamp, doc);
+            // The visitor may end the scan, or fail it (the memory an aggregation's source
+            // read holds, ADR-269): the document that passes the limit is the last read.
+            if !(self.visit)(stamp, doc)? {
+                return Ok(false);
+            }
         }
         Ok(!self.stop_after.is_some_and(|n| self.matched >= n))
     }
@@ -944,10 +949,30 @@ pub fn visit_matching<F>(
     filter: &filter::Filter,
     order: Order<'_>,
     stop_after: Option<usize>,
-    visit: F,
+    mut visit: F,
 ) -> Result<QueryStats, ApiError>
 where
     F: FnMut(kimmy_core::Stamp, bson::Document),
+{
+    visit_matching_until(state, meta, filter, order, stop_after, |stamp, doc| {
+        visit(stamp, doc);
+        Ok(true)
+    })
+}
+
+/// [`visit_matching`] with a visitor that answers whether the scan goes on, or fails it:
+/// the read stops at the document the visitor refuses, which is how a read charged to a
+/// memory budget ends at the first document over it rather than after collecting them all.
+pub(crate) fn visit_matching_until<F>(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    filter: &filter::Filter,
+    order: Order<'_>,
+    stop_after: Option<usize>,
+    visit: F,
+) -> Result<QueryStats, ApiError>
+where
+    F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>,
 {
     // Every read of documents goes through here (find, count, an aggregate's source,
     // the vector filter's paging), so the request's deadline is set once for all of
@@ -2309,7 +2334,7 @@ pub async fn aggregate(
     coll: &str,
     pipeline: &Value,
 ) -> Result<Value, ApiError> {
-    aggregate_with_limits(state, auth, db, coll, pipeline, aggregate::Limits::default()).await
+    aggregate_with_limits(state, auth, db, coll, pipeline, state.aggregate_limits()).await
 }
 
 /// [`aggregate`] under an explicit ceiling.
@@ -2341,7 +2366,63 @@ async fn aggregate_run(
     pipeline: &Value,
     limits: aggregate::Limits,
 ) -> Result<Value, ApiError> {
-    Ok(aggregate_run_stats(state, auth, db, coll, pipeline, limits).await?.0)
+    Ok(aggregate_run_held(state, auth, db, coll, pipeline, limits, Shape::Value)
+        .await?
+        .0
+        .into_value())
+}
+
+/// What an aggregation answers, in the shape the caller asked for ([`Shape`]).
+pub enum Answer {
+    /// The answer as a value: a sink's counts, or documents for a caller that wants a value.
+    Json(Value),
+    /// The documents' answer already written as JSON, `{"documents":[..],"count":N}`, byte for
+    /// byte what serialising the value would give: the route sends it as it is.
+    Body(Vec<u8>),
+}
+
+impl Answer {
+    /// The answer as a value (parsed back, if it was written as a body: only a caller that
+    /// asked for a value is handed anything else, so this is for tests and the like).
+    pub fn into_value(self) -> Value {
+        match self {
+            Answer::Json(value) => value,
+            Answer::Body(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// The shape an aggregation's answer is built in. A route that writes the answer as it is
+/// wants the bytes ([`Shape::Body`]): the documents are written once, as JSON, and counted
+/// as they are written, with no value of the whole answer built beside them. A caller that
+/// needs a value (the MCP tool, which renders it its own way) asks for [`Shape::Value`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Value,
+    Body,
+}
+
+/// [`aggregate`], also handing back the lease that holds the answer's bytes in the request's
+/// memory budget and the node's pool (ADR-269). The route keeps it until the response body has
+/// been sent, so an answer still being written counts against the pool; dropping it gives the
+/// bytes back. Under [`aggregate`] it is dropped on return.
+///
+/// The answer is the body to send ([`Answer::Body`]) for a pipeline that answers documents,
+/// written once and sized as it was written; a pipeline that ends in a sink answers a small
+/// value.
+pub async fn aggregate_held(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    pipeline: &Value,
+) -> Result<(Answer, kimmy_query::budget::Lease), ApiError> {
+    use tracing::Instrument;
+    let (answer, _, hold) =
+        aggregate_run_held(state, auth, db, coll, pipeline, state.aggregate_limits(), Shape::Body)
+            .instrument(op_span("aggregate", db, Some(coll)))
+            .await?;
+    Ok((answer, hold.unwrap_or_else(|| state.aggregate_limits().buffer.lease("the answer"))))
 }
 
 /// [`aggregate_run`], also answering how the source read was done, which `explain`
@@ -2355,6 +2436,22 @@ pub(crate) async fn aggregate_run_stats(
     pipeline: &Value,
     limits: aggregate::Limits,
 ) -> Result<(Value, Option<QueryStats>), ApiError> {
+    let (answer, stats, _) =
+        aggregate_run_held(state, auth, db, coll, pipeline, limits, Shape::Value).await?;
+    Ok((answer.into_value(), stats))
+}
+
+/// [`aggregate_run_stats`], also answering the lease that holds the answer, for a pipeline that
+/// answers documents (a sink answers counts and holds nothing).
+async fn aggregate_run_held(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    pipeline: &Value,
+    limits: aggregate::Limits,
+    shape: Shape,
+) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
     let all_stages = parse_pipeline(pipeline)?;
@@ -2371,6 +2468,8 @@ pub(crate) async fn aggregate_run_stats(
         stages.first()
     {
         let docs = crate::vectors::stage_documents(state, auth, db, coll, spec, &limits).await?;
+        // The hits are bounded by `k`, and are held like any source (ADR-269).
+        limits.buffer.lease("the source read").charge_docs(&docs)?;
         (docs, 1, None)
     } else {
         // The source. A pipeline that begins with `$match` is read the way `find`
@@ -2386,9 +2485,26 @@ pub(crate) async fn aggregate_run_stats(
             None => (filter::Filter::AlwaysTrue, 0, "the source collection"),
         };
         // One past the ceiling: the scan stops as soon as it is over, rather than
-        // materialising everything the filter admits in order to refuse it.
-        let (docs, stats) =
-            collect_matching(state, &meta, &filter, Some(limits.max_documents + 1))?;
+        // materialising everything the filter admits in order to refuse it. The bytes
+        // are held to the request's memory limit the same way (ADR-269): each document
+        // is charged as it is read, and the read ends at the one that passes the limit.
+        let mut docs = Vec::new();
+        let mut read = limits.buffer.lease("the source read");
+        let stats = visit_matching_until(
+            state,
+            &meta,
+            &filter,
+            Order::ById { after: None },
+            Some(limits.max_documents + 1),
+            |_, doc| {
+                read.charge_doc(&doc)?;
+                docs.push(doc);
+                Ok(true)
+            },
+        )?;
+        // The first stage charges what it is given as its own input, so the read gives
+        // its bytes back as the documents are handed over.
+        drop(read);
         if docs.len() > limits.max_documents {
             return Err(ApiError::bad_request(format!(
                 "{what} admits more than {} documents, the pipeline limit. Narrow it with a more \
@@ -2411,6 +2527,7 @@ pub(crate) async fn aggregate_run_stats(
         &limits,
         sink.map(|sink| (sink, all_stages.last().expect("a sink is a stage of the pipeline"))),
         source_stats,
+        shape,
     )
 }
 
@@ -2426,21 +2543,94 @@ fn finish_pipeline(
     limits: &aggregate::Limits,
     sink: Option<(SinkPlan, &aggregate::Stage)>,
     source_stats: Option<QueryStats>,
-) -> Result<(Value, Option<QueryStats>), ApiError> {
+    shape: Shape,
+) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
     let _deadline = crate::limits::deadline_scope();
     let docs = run_stages(state, auth, db, stages, docs, limits, &[])?;
 
     if let Some((sink, last)) = sink {
-        return Ok((write_sink(state, sink, last, docs)?, source_stats));
+        // The documents are held while the sink writes them, in the engine's chunks.
+        let _writing = {
+            let mut lease = limits.buffer.lease("the documents the sink writes");
+            lease.charge_docs(&docs)?;
+            lease
+        };
+        return Ok((Answer::Json(write_sink(state, sink, last, docs)?), source_stats, None));
     }
 
+    // The answer (ADR-269). The output documents are held while it is built beside them,
+    // so it is charged for both: the documents, and the JSON each becomes, by its
+    // serialised length, document by document, so an answer that would pass the limit is
+    // refused before the rest of it is built. The documents are dropped when it is built,
+    // before the body is written from it, so the two never coexist with a third copy.
+    let mut answer = limits.buffer.lease("the answer");
+    answer.charge_docs(&docs)?;
+    let mut json_total = 0usize;
     let mut ticker = deadline::Ticker::new();
-    let mut documents: Vec<Value> = Vec::with_capacity(docs.len());
-    for doc in &docs {
-        ticker.tick()?;
-        documents.push(document_to_json(doc));
+    let count = docs.len();
+    let built = match shape {
+        Shape::Value => {
+            let mut documents: Vec<Value> = Vec::with_capacity(count);
+            for doc in &docs {
+                ticker.tick()?;
+                let value = document_to_json(doc);
+                let len = json_len(&value);
+                answer.charge(len)?;
+                json_total += len;
+                documents.push(value);
+            }
+            Answer::Json(json!({ "documents": documents, "count": count }))
+        }
+        Shape::Body => {
+            // The body is written once: each document straight into it, charged by the
+            // bytes it took, so the refusal comes at the same document and the same total
+            // as when each was counted apart, and nothing past the document that passes the
+            // limit is written. What is not a document's (the framing and the count) is
+            // under a hundred bytes and not charged, as it was not.
+            let mut body = Vec::new();
+            body.extend_from_slice(b"{\"documents\":[");
+            for (at, doc) in docs.iter().enumerate() {
+                ticker.tick()?;
+                if at > 0 {
+                    body.push(b',');
+                }
+                let start = body.len();
+                // Writing to a vector cannot fail; a value that could not be written is
+                // charged as it got, as `json_len` counts it.
+                let _ = serde_json::to_writer(&mut body, &document_to_json(doc));
+                let len = body.len() - start;
+                answer.charge(len)?;
+                json_total += len;
+            }
+            body.extend_from_slice(format!("],\"count\":{count}}}").as_bytes());
+            Answer::Body(body)
+        }
+    };
+    drop(docs);
+    // The documents are gone; what is left of the answer is its JSON, which is what a body
+    // written from it takes.
+    let doc_bytes = answer.bytes() - json_total;
+    answer.release(doc_bytes);
+    Ok((built, source_stats, Some(answer)))
+}
+
+/// The bytes `value` takes as JSON, counted as it is written and never held.
+fn json_len(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    Ok((json!({ "documents": documents, "count": documents.len() }), source_stats))
+    let mut count = Count(0);
+    // Writing to a counter cannot fail; a value that cannot be written is counted as it
+    // got.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
 }
 
 /// Run stages in order: the two `$lookup` forms go to the functions here that
@@ -2465,29 +2655,49 @@ fn run_stages(
                 from,
                 as_field,
                 join: aggregate::Join::Equality { local_field, foreign_field },
-            } => lookup(state, auth, db, from, local_field, foreign_field, as_field, docs, limits)?,
+            } => {
+                let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+                lookup(
+                    state,
+                    auth,
+                    db,
+                    from,
+                    local_field,
+                    foreign_field,
+                    as_field,
+                    docs,
+                    limits,
+                    &mut held.output,
+                )?
+            }
             aggregate::Stage::Lookup {
                 from,
                 as_field,
                 join: aggregate::Join::Pipeline { vars: let_vars, stages: sub, lead },
-            } => lookup_pipeline(
-                state,
-                auth,
-                db,
-                from,
-                let_vars,
-                sub,
-                lead.as_deref(),
-                as_field,
-                docs,
-                limits,
-                vars,
-            )?,
+            } => {
+                let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+                lookup_pipeline(
+                    state,
+                    auth,
+                    db,
+                    from,
+                    let_vars,
+                    sub,
+                    lead.as_deref(),
+                    as_field,
+                    docs,
+                    limits,
+                    vars,
+                    &mut held.output,
+                )?
+            }
             aggregate::Stage::GraphLookup(spec) => {
-                graph_lookup(state, auth, db, spec, docs, limits, vars)?
+                let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+                graph_lookup(state, auth, db, spec, docs, limits, vars, &mut held.output)?
             }
             aggregate::Stage::UnionWith(spec) => {
-                union_with(state, auth, db, spec, docs, limits, vars)?
+                let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+                union_with(state, auth, db, spec, docs, limits, vars, &mut held.output)?
             }
             aggregate::Stage::Facet(facets) => {
                 let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
@@ -2707,6 +2917,7 @@ fn lookup(
     as_field: &str,
     input: Vec<bson::Document>,
     limits: &aggregate::Limits,
+    held: &mut Lease,
 ) -> Result<Vec<bson::Document>, ApiError> {
     // The second authorization point. See this function's caller.
     let foreign = foreign_collection(state, auth, db, from)?;
@@ -2720,6 +2931,8 @@ fn lookup(
     // Each matching foreign document is held once, in scan order, and filed
     // under every wanted key its `foreignField` yields (ADR-210).
     let mut foreign_docs: Vec<bson::Document> = Vec::new();
+    // The request's account of the documents held (ADR-269).
+    let mut foreign_held = limits.buffer.lease("the foreign documents $lookup holds");
     let mut buckets: std::collections::HashMap<Vec<u8>, Vec<usize>> =
         std::collections::HashMap::new();
     // The whole foreign collection, so a walk (ADR-153); one that is not there is empty.
@@ -2735,6 +2948,7 @@ fn lookup(
                 if keys.is_empty() {
                     return Ok(true);
                 }
+                foreign_held.charge(kimmy_query::budget::held_bytes(&doc))?;
                 let at = foreign_docs.len();
                 for key in keys {
                     buckets.entry(key).or_default().push(at);
@@ -2774,14 +2988,20 @@ fn lookup(
     for (mut doc, at) in input.into_iter().zip(attached) {
         ticker.tick()?;
         // Counted before each copy, so a join whose array would pass 16 MiB is
-        // refused at the document that takes it there (a `413`).
+        // refused at the document that takes it there (a `413`); the array, once built,
+        // is what this stage holds for the document, charged to the request's budget
+        // (ADR-269), so it is bounded by the value bound plus one array at a time.
         let mut joined = aggregate::JoinedArray::new("the array $lookup builds");
         for i in at {
             joined.push_copy(&foreign_docs[i], None)?;
         }
+        held.charge(joined.held_bytes())?;
         // Always an array, even when empty: a field whose type depends on
         // whether anything matched forces every caller to handle two shapes.
         doc.insert(as_field.to_string(), joined.finish());
+        // The array is held to 16 MiB as a value; the document it makes with the input's
+        // fields is held to the limit of a document as a whole.
+        aggregate::check_built_document(&doc, limits.max_document_bytes)?;
         out.push(doc);
     }
     Ok(out)
@@ -2818,6 +3038,7 @@ fn lookup_pipeline(
     input: Vec<bson::Document>,
     limits: &aggregate::Limits,
     outer: &[Binding<'_>],
+    held: &mut Lease,
 ) -> Result<Vec<bson::Document>, ApiError> {
     // The second authorization point, exactly as for the equality form.
     let foreign_meta = foreign_collection(state, auth, db, from)?;
@@ -2830,11 +3051,13 @@ fn lookup_pipeline(
 
     // The whole foreign collection, held for the loop: refused at the first document past
     // the ceiling, not after the collection has been read.
+    let mut foreign_held = limits.buffer.lease("the foreign documents $lookup holds");
     let foreign = match &foreign_meta {
         Some(meta) => read_foreign(
             state,
             meta,
             limits,
+            &mut foreign_held,
             |_| Ok(true),
             |max| {
                 format!(
@@ -2857,7 +3080,11 @@ fn lookup_pipeline(
     };
     let mut plan = LeadPlan::default();
     let base = match (first, lead) {
-        (Some(first), None) => aggregate::apply(first, foreign, limits)?,
+        (Some(first), None) => {
+            // The stage charges what it is given, so the read's charge is handed back for it.
+            foreign_held.release(foreign_held.bytes());
+            aggregate::apply(first, foreign, limits)?
+        }
         (Some(aggregate::Stage::Match(_)), Some(lead)) => {
             // Once over the foreign side, which declines on any error (including a
             // stop), so the deadline is looked at before it and by the loop after.
@@ -2873,7 +3100,11 @@ fn lookup_pipeline(
         _ => foreign,
     };
 
-    let mut held = 0usize;
+    // What the loop holds, however it was made: the foreign documents, or those the leading
+    // `$match` kept.
+    foreign_held.release(foreign_held.bytes());
+    foreign_held.charge_docs(&base)?;
+    let mut joined_count = 0usize;
     let mut out = Vec::with_capacity(input.len());
     let mut ticker = deadline::Ticker::new();
     for (n, mut doc) in input.into_iter().enumerate() {
@@ -2889,15 +3120,29 @@ fn lookup_pipeline(
                 let matched = matched_for_input(&mut plan, n, whole, lead, &base, &vars)?;
                 run_stages(state, auth, db, rest, matched, limits, &vars)?
             }
-            _ => run_stages(state, auth, db, rest, base.clone(), limits, &vars)?,
+            _ => {
+                // A copy for this input document, charged before it is made and handed on
+                // as the sub-pipeline's first stage charges it for itself.
+                let copy = {
+                    let mut pre =
+                        limits.buffer.lease("a copy of the foreign documents $lookup reads");
+                    pre.charge_docs(&base)?;
+                    base.clone()
+                };
+                run_stages(state, auth, db, rest, copy, limits, &vars)?
+            }
         };
         // Joined documents are held alongside the input, so the total across
         // every input document is what the ceiling bounds.
-        held += joined.len();
-        aggregate::check_limit("$lookup", held, limits)?;
+        joined_count += joined.len();
+        aggregate::check_limit("$lookup", joined_count, limits)?;
+        // And what is attached is part of the output, in bytes: the array is held to
+        // 16 MiB as a value, and charged to the request's budget as part of the output.
         let mut array = aggregate::JoinedArray::new("the array $lookup builds");
         array.push_all(joined)?;
+        held.charge(array.held_bytes())?;
         doc.insert(as_field.to_string(), array.finish());
+        aggregate::check_built_document(&doc, limits.max_document_bytes)?;
         out.push(doc);
     }
     Ok(out)
@@ -2916,6 +3161,7 @@ fn lookup_pipeline(
 /// held to the cap `$facet`'s answer is, refused as soon as it is passed, and so are the
 /// bytes the sub-pipeline outputs. The input plus what is appended counts against the
 /// document limit.
+#[allow(clippy::too_many_arguments)]
 fn union_with(
     state: &SharedState,
     auth: &Auth,
@@ -2924,6 +3170,7 @@ fn union_with(
     mut input: Vec<bson::Document>,
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
+    held: &mut Lease,
 ) -> Result<Vec<bson::Document>, ApiError> {
     deadline::check()?;
     let name = spec.coll.as_str();
@@ -2938,12 +3185,14 @@ fn union_with(
     };
     // What is read is held to the document limit, as `$lookup`'s foreign read is, and to
     // nothing in bytes: a scan is not what the pipeline holds.
+    let mut foreign_held = limits.buffer.lease("the foreign documents $unionWith reads");
     let foreign = match &meta {
         None => Vec::new(),
         Some(meta) => read_foreign(
             state,
             meta,
             limits,
+            &mut foreign_held,
             |doc| {
                 // Per document read (ADR-266): the walk ticks per row too, but the
                 // leading `$match` can cost more than the row.
@@ -2962,6 +3211,10 @@ fn union_with(
             },
         )?,
     };
+    // The sub-pipeline's first stage charges what it is given, and what is appended is
+    // charged below as part of the output, so the read gives its bytes back as the
+    // documents are handed on.
+    foreign_held.release(foreign_held.bytes());
     let appended = if rest.is_empty() {
         foreign
     } else {
@@ -2974,9 +3227,10 @@ fn union_with(
     let mut ticker = deadline::Ticker::new();
     for doc in &appended {
         ticker.tick()?;
-        bytes += bson::serialize_to_vec(doc)
+        let size = bson::serialize_to_vec(doc)
             .map_err(|e| kimmy_core::Error::Internal(format!("$unionWith could not encode: {e}")))?
             .len();
+        bytes += size;
         if bytes > cap {
             return Err(ApiError::from(kimmy_core::Error::AnswerTooLarge {
                 what: "$unionWith appended documents",
@@ -2986,6 +3240,9 @@ fn union_with(
                          that what it answers is smaller",
             }));
         }
+        // They join the output, and are held as part of it, at the estimate of what they
+        // hold parsed (ADR-269); the 16 MiB cap above stays on their BSON size.
+        held.charge(kimmy_query::budget::held_bytes(doc))?;
     }
     aggregate::check_limit("$unionWith", input.len() + appended.len(), limits)?;
     // The look before the append, so that a stage cut by the deadline is cut whole.
@@ -3011,6 +3268,7 @@ fn union_with(
 /// order of the foreign scan. A `null`, a missing `startWith` and a start value
 /// the key encoding cannot hold begin nothing. The matching rule is the equality
 /// join's (numbers of every type by value, an array by its elements).
+#[allow(clippy::too_many_arguments)]
 fn graph_lookup(
     state: &SharedState,
     auth: &Auth,
@@ -3019,6 +3277,7 @@ fn graph_lookup(
     input: Vec<bson::Document>,
     limits: &aggregate::Limits,
     outer: &[Binding<'_>],
+    held_bytes: &mut Lease,
 ) -> Result<Vec<bson::Document>, ApiError> {
     let foreign_meta = foreign_collection(state, auth, db, &spec.from)?;
     // Nothing to walk from: reading the collection would cost a walk for no answer.
@@ -3028,11 +3287,13 @@ fn graph_lookup(
     // The foreign side, narrowed by `restrictSearchWithMatch` as it is read, and refused
     // at the first admitted document past the ceiling: a restriction that would raise
     // further on is never reached.
+    let mut foreign_held = limits.buffer.lease("the foreign documents $graphLookup holds");
     let foreign = match &foreign_meta {
         Some(meta) => read_foreign(
             state,
             meta,
             limits,
+            &mut foreign_held,
             |doc| match &spec.restrict {
                 Some(restrict) => Ok(filter::matches(restrict, doc)?),
                 None => Ok(true),
@@ -3121,7 +3382,11 @@ fn graph_lookup(
             let depth_field = spec.depth_field.as_deref().map(|field| (field, depth as i64));
             joined.push_copy(&foreign[at], depth_field)?;
         }
+        // What is attached is part of the output (ADR-269); the array itself is held to
+        // 16 MiB as a value while it is built.
+        held_bytes.charge(joined.held_bytes())?;
         doc.insert(spec.as_field.clone(), joined.finish());
+        aggregate::check_built_document(&doc, limits.max_document_bytes)?;
         out.push(doc);
     }
     Ok(out)
@@ -3138,6 +3403,7 @@ fn read_foreign(
     state: &SharedState,
     meta: &CollectionMeta,
     limits: &aggregate::Limits,
+    held: &mut Lease,
     mut admit: impl FnMut(&bson::Document) -> Result<bool, ApiError>,
     refused: impl FnOnce(usize) -> String,
 ) -> Result<Vec<bson::Document>, ApiError> {
@@ -3159,6 +3425,9 @@ fn read_foreign(
                 over = true;
                 return Ok(false);
             }
+            // What is held is charged as it is read (ADR-269), so a collection that does
+            // not fit the request's memory is refused at the document that passes it.
+            held.charge_doc(&doc)?;
             foreign.push(doc);
             Ok(true)
         })
@@ -4930,6 +5199,9 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod memory_tests;
 
 #[cfg(test)]
 mod deadline_tests;

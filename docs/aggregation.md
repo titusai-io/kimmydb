@@ -628,10 +628,10 @@ the upper (`400`).
 | `$sum`, `$avg`, `$min`, `$max`, `$count` (`{}`), `$push`, `$addToSet`, `$first`, `$last`, `$stdDevPop`, `$stdDevSamp`, `$top`, `$bottom`, `$topN`, `$bottomN`, `$firstN`, `$lastN`, `$maxN`, `$minN` | optional, default the whole partition | what the same [accumulator](#accumulators) answers over the documents of the window; an empty window answers what an empty group does (`0` for `$sum` and `$count`, `[]` for `$push`, `null` for the rest). `$push` and `$addToSet` skip a missing value; `$first` and `$last` of a missing value **leave the field out**; `$max` of equal values keeps the last and `$min` the first. A deviation of one value is an integer `0` |
 | `$covariancePop`, `$covarianceSamp` `[x, y]` | optional | the covariance of the pairs of the window; a pair with a member that is not a number is skipped, one value is `0` (population, a double) or `null` (sample), none is `null` |
 | `$rank`, `$denseRank`, `$documentNumber` (`{}`) | none | an int: the rank with gaps after ties (`1, 2, 2, 4`), without (`1, 2, 2, 3`), the position (`1, 2, 3, 4`; ties in arrival order). Documents tie when the one `sortBy` value is the same (a missing value is not a null one). Need a `sortBy` of **exactly one field** |
-| `$shift` `{output, by, default}` | none | `output` evaluated on the document `by` places after the current one (`-1` before) in the partition, or `default` (a constant; `null` if absent) beyond its ends; a document with no value leaves the field out. `by` is a whole number that fits 32 bits. Needs `sortBy` |
+| `$shift` `{output, by, default}` | none | `output` evaluated on the document `by` places after the current one (`-1` before) in the partition, or `default` (a constant; `null` if absent) beyond its ends; a document with no value leaves the field out. `by` is a whole number that fits 32 bits. Needs `sortBy`, and `sortBy: {}` is one (the documents are taken in the order they arrive) |
 | `$derivative` `{input, unit}` | **required** | the slope between the first and the last document of the window: a double, `null` if the window has one document or the two sort values are equal. A date `sortBy` takes `unit` (`week` to `millisecond`) for the time axis, milliseconds if absent; a numeric `sortBy` refuses it |
 | `$integral` `{input, unit}` | **required** | the trapezoid-rule area under `input` over the window, summed exactly: a double; over a number line, an integer `0` for fewer than two documents (a double `0.0` over dates) |
-| `$expMovingAvg` `{input, N}` or `{input, alpha}` | none | the exponentially weighted mean to the current document, `alpha = 2/(N+1)`; exactly one of `N` (a whole number, at least 1) and `alpha` (above 0, below 1). A document whose input is not a number answers the average it has (`null` before the first number) and does not move it |
+| `$expMovingAvg` `{input, N}` or `{input, alpha}` | none | the exponentially weighted mean to the current document, `alpha = 2/(N+1)`, worked in `Decimal128` to 34 digits as `x * alpha + (1 - alpha) * previous` and answered as the nearest double (a double read as a decimal is rounded to 15 digits, as the reference reads it), so `N: 2` over `[1, 2]` is `1.6666666666666667`; exactly one of `N` (a whole number, at least 1) and `alpha` (above 0, below 1). `sortBy: {}` is accepted and the documents are taken in the order they arrive. A document whose input is not a number answers the average it has (`null` before the first number) and does not move it |
 | `$locf` `<expression>`, `$linearFill` `<expression>` | none | `$locf`: the last non-null value so far (`null` before one), **in arrival order when there is no `sortBy`**. `$linearFill`: for a null or missing value, the straight line between the nearest non-null values on each side by the one numeric or date `sortBy` field (`null` outside them); `400` if two documents have the same sort value; a `Decimal128` end interpolates in decimal. Both are what [`$fill`](#fill) runs |
 
 `$derivative` and `$integral` need a `sortBy` of one field that is numeric or a date in every
@@ -652,8 +652,9 @@ queue; `$addToSet`, `$top` and its family, `$maxN` and `$minN` an ordered set, O
 values only, with the non-finite ones counted and the state rebuilt from the window every so many
 removals (at once for a window of 16 or fewer) to bound the drift of subtracting. What an answer costs is
 what it holds: a `$push` over a window of `w` documents is an array of `w`. The stage holds every
-document of its input, every sort key it takes and every value it adds against **one byte budget of
-256 MiB for the whole request**, shared by the stages of the pipeline and the branches of a `$facet`,
+document of its input, every sort key it takes and every value it adds against **the request's memory
+budget** (`aggregate.memory_limit_bytes`, derived from the container's memory; see [The memory limit](#the-memory-limit)), shared with everything
+else the request holds,
 refused `413 answer_too_large` as soon as the running total passes it (a cumulative `$push` whose output is quadratic is
 refused while it is built). Inside a `$facet` and a `$lookup` sub-pipeline like any stage.
 
@@ -715,6 +716,12 @@ expression, as the reference needs) and `partitionByFields` (field paths).
   the one `sortBy` field (a number or a date; `400` for two documents with the same value, or for a value
   that is not a number; a `Decimal128` end interpolates in decimal). Leading and trailing gaps stay `null`.
   `linear` needs `sortBy` of exactly one field; `sortBy: {}` is no sort.
+- A `value` that **reaches nothing** (a field path to a field the document lacks, or `$$REMOVE`) fills
+  nothing: a **missing** field stays missing, and a field that holds an explicit **`null` is removed**, as
+  the reference does.
+- With `partitionByFields`, a document that **lacks** a partition field is in a different partition from
+  one that holds `null` there, and the missing partition leaves **first**, then the null one (the
+  reference's order). [`$densify`](#densify) keeps `null` first.
 - Methods run as a [`$setWindowFields`](#setwindowfields) with `$locf` and `$linearFill`: the documents
   leave partition by partition, the partitions in ascending order of their values, each sorted. A `$fill`
   with only `value` fields buffers nothing and **keeps the order of its input**.
@@ -1610,6 +1617,12 @@ stops at the step that would pass the limit. The reference shares the copies and
 refuses a document only when it is written out; here the copies are real, so the
 limit is earlier (see [Deviations](deviations.md)).
 
+**A document a stage completes by adding fields is held to 16 MiB as a whole.** Each value a
+`$fill` (values and methods), a `$setWindowFields`, a `$lookup` or a `$graphLookup` adds is held to
+16 MiB on its own; two together can make a document no collection could hold. The document is checked
+as it is completed and refused `413` at the one that passes the limit, as `$addFields` refuses it:
+`the document the stage builds is N bytes, over the 16 MiB document limit`.
+
 ### Getting, setting and merging fields
 
 ```json
@@ -2142,8 +2155,12 @@ examined or read.
     "source": { "strategy": "index", "index": "city_1", "indexFieldsUsed": 1,
                 "stages": 1, "maxDocuments": 100000 },
     "stages": [ { "stage": "$group", "runs": "inMemory",
-                  "detail": "groups everything that reaches it in memory; blocking, ..." } ] } }
+                  "detail": "groups everything that reaches it in memory; blocking, ..." } ],
+    "memory": { "limitBytes": 107374182, "poolBytes": 214748364, "poolUsedBytes": 0 } } }
 ```
+
+`memory` is what a run may hold (`aggregate.memory_limit_bytes`) and how much of the node's pool
+(`aggregate.memory_pool_bytes`) running aggregations have reserved now; a plan reserves nothing.
 
 - **`source`** is the plan `find` would make for the leading `$match` (the same
   planner: `strategy`, `index`, `indexFieldsUsed`, `probes`), with `stages` saying
@@ -2211,10 +2228,63 @@ difference, so a partial answer would be worse than none. It also does not spill
 to disk: a pipeline that cannot run should say so immediately rather than
 becoming slow in a way that is harder to diagnose than a refusal.
 
-`$setWindowFields`, `$densify` and a `$fill` with a method also hold the bytes they buffer to **one budget of
-256 MiB for the whole request**, shared by the stages of the pipeline and the branches of a `$facet` and
-counted as it grows, refused `413` at the first byte over, so a request that would build too much is
-stopped while it builds. `$densify` counts the documents its range would generate before it generates any.
+### What one request may hold, in bytes
+
+The document count above does not bound a pipeline's memory: a thousand documents each given
+an 8 MiB string by `$addFields` are a thousand legal documents and 8 GB. **Everything a request
+holds is charged, as an estimate of the bytes it takes parsed, to one budget of `aggregate.memory_limit_bytes` (half the pool by default; about 100 MiB in a 2 GiB container)**
+as it grows, and the request is refused `413 answer_too_large` at the first byte over, naming what held the memory:
+
+| What | Charged | Until |
+|---|---|---|
+| **The source read** | each document the leading `$match` or the scan admits, as it is read; the read stops at the one that passes the limit | the first stage takes the documents (which charges them as its input) |
+| **A stage's input** | the documents it is given | the stage returns |
+| **A stage's output** | `$project`, `$addFields`, `$replaceRoot`, `$unwind`, `$redact` and `$sortByCount` as each document is built (so the peak is input plus output); `$match`, `$sort`, `$limit`, `$skip`, `$count` and `$sample` only move their input and charge nothing more | the stage returns |
+| **`$group`, `$bucket`, `$bucketAuto`** | each bucket when it is made, and what `$push`, `$addToSet`, `$firstN`, `$lastN`, `$top*`, `$bottom*`, `$maxN`, `$minN`, `$mergeObjects`, `$min`, `$max`, `$first` and `$last` keep, as it is kept (a `$top` that drops a row gives its bytes back) | the stage returns |
+| **`$lookup`, `$graphLookup`, `$unionWith`** | the foreign documents read (the read stops at the one that passes the limit), a copy of them for each run of a `$lookup` sub-pipeline (charged before it is made), the arrays attached and the documents appended | the stage returns |
+| **`$facet`** | its input, and a copy of it for each branch but the last (charged before the copy is made); the stages inside a branch charge as any stage does, and each run of a sub-pipeline gives its bytes back when it ends | the stage returns |
+| **`$setWindowFields`, `$densify`, `$fill`** | the documents they buffer, the sort keys they take and the values they add | the stage returns |
+| **The answer** | the output documents and the JSON each becomes (its serialised length), document by document, so an answer that would pass the limit is refused before the rest is built; once built, the documents' bytes are given back and the JSON's are kept | the response body has been written or dropped (the client went away) |
+
+A stage's input stays charged until it returns, so `$addFields` over 100,000 documents of 4 KB
+peaks at about 1.08 GB charged (input and output, each at the estimate of the parsed size: 1.3 times
+the BSON of a 4 KB string document).
+100,000 documents of 4 KB (412 MB of BSON) therefore run through `$addFields` under an
+explicit limit of 2 GiB, and under the derived limit only in a container of about 20 GiB or more:
+a 2 GiB member refuses them at the source read, an 8 GiB one at `$addFields`. **The source read is
+charged whole before any stage runs**, and only a leading `$match` narrows it, so `[{$count}]`,
+`[{$limit: 5}]`, `[{$sort}, {$limit}]` and `[{$group}]` over a collection above the limit (about 102 MiB
+of BSON on a 2 GiB member) are refused too; [Operations](operations.md#aggregation-memory) has the
+figures and what to do, and [Deviations](deviations.md) the reference's behaviour. The `413` carries
+the total held and the limit, and says what to do: `a leading $match narrows what is read;
+$project, $limit or $match after it reduce what later stages hold; or raise aggregate.memory_limit_bytes`.
+`$facet`'s own 16 MiB cap on its answer, and the 16 MiB bound on one string, array or document an
+expression builds, are unchanged: they are per value.
+
+**The node's pool.** Requests also draw on a pool shared by every aggregation on the node,
+`aggregate.memory_pool_bytes` (a tenth of the container's memory limit, or of the RAM, by default): a request reserves from it as its own total
+grows and returns it when it ends, however it ends (an answer, a refusal, the request deadline,
+a panic). A request the pool cannot cover (the node's aggregation memory pool is in use) is **granted
+oldest first**: if another request that holds bytes is younger, it waits for bytes to be freed, until its
+request deadline; if it is the youngest holder, or its deadline comes first, it is refused `503 timeout` with
+`retry: wait` and `Retry-After: 1`. A request that alone would pass the whole pool is refused at once.
+The refusal is the same either way: the request is within its own limit, nothing was done, and the same
+request is answered when the others have finished. (So three equal requests ramping up against a pool
+that holds two answer two and refuse the youngest, where each refused while holding a share could
+refuse all three.) Both refusals are counted on `/metrics`
+(`kimmy_aggregate_memory_limit_refusals_total`, `kimmy_aggregate_memory_pool_refusals_total`), and
+the bytes the pool holds now are `kimmy_aggregate_memory_pool_used_bytes`.
+
+**The unit is an estimate of the memory a parsed document takes, not its BSON size.** A long
+string is charged about its BSON size (a 4 KiB string document, 1.3 times); a document of many small
+fields is charged what it costs parsed: 100 fields (50 integers and 50 strings of 60 bytes) about 7
+times its BSON, **400 integer fields about 24 times**, because each field costs a table bucket, a key
+and a value slot whatever the value. So a 2 GiB member (a limit of about 102 MiB) reads about 1,160
+such 400-field documents (4 KB of BSON each), not 25,000 ([Operations](operations.md#what-the-limit-refuses-today)).
+Per-value limits (16 MiB for a string, an array or a document) stay in BSON bytes. The reference streams documents
+through a pipeline and spills its blocking stages to disk; this server holds a pipeline's documents and
+refuses what does not fit (see [Deviations](deviations.md)). Streaming the stages that do not block
+is planned.
 
 `$unwind` is checked *while* it expands, not after, because a handful of
 documents holding large arrays can exceed the cap long before the stage ends.

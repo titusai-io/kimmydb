@@ -117,6 +117,14 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_MAX_BODY_BYTES")]
     pub max_body_bytes: Option<usize>,
 
+    /// The most bytes one aggregation may hold at once. Over it, 413.
+    #[arg(long, env = "KIMMY_AGGREGATE_MEMORY_LIMIT_BYTES")]
+    pub aggregate_memory_limit_bytes: Option<usize>,
+
+    /// The most bytes all aggregations on this node may hold together. Past it, 503.
+    #[arg(long, env = "KIMMY_AGGREGATE_MEMORY_POOL_BYTES")]
+    pub aggregate_memory_pool_bytes: Option<usize>,
+
     /// Requests allowed per authenticated principal per window. 0 disables it.
     #[arg(long, env = "KIMMY_RATE_LIMIT_PER_PRINCIPAL")]
     pub rate_limit_per_principal: Option<u32>,
@@ -350,6 +358,12 @@ impl Overrides {
         }
         if let Some(bytes) = self.max_body_bytes {
             cfg.server.max_body_bytes = bytes;
+        }
+        if let Some(bytes) = self.aggregate_memory_limit_bytes {
+            cfg.aggregate.memory_limit_bytes = Some(bytes);
+        }
+        if let Some(bytes) = self.aggregate_memory_pool_bytes {
+            cfg.aggregate.memory_pool_bytes = Some(bytes);
         }
         if let Some(burst) = self.rate_limit_per_principal {
             cfg.server.rate_limit.per_principal = burst;
@@ -632,6 +646,32 @@ mod tests {
         assert_eq!(cfg.server.request_timeout_secs, 7);
         assert_eq!(cfg.server.max_body_bytes, 512);
         assert_eq!(cfg.server.rate_limit.per_principal, 5);
+    }
+
+    #[test]
+    fn aggregate_memory_flags_override_the_file_and_absent_ones_do_not() {
+        let cli = parse(&[
+            "--aggregate-memory-limit-bytes",
+            "134217728",
+            "--aggregate-memory-pool-bytes",
+            "268435456",
+        ]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.aggregate.memory_limit_bytes, Some(128 << 20));
+        assert_eq!(cfg.aggregate.memory_pool_bytes, Some(256 << 20));
+
+        let cli = parse(&[]);
+        let mut cfg = Config::default();
+        cfg.aggregate.memory_limit_bytes = Some(64 << 20);
+        cfg.aggregate.memory_pool_bytes = Some(96 << 20);
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.aggregate.memory_limit_bytes, Some(64 << 20));
+        assert_eq!(cfg.aggregate.memory_pool_bytes, Some(96 << 20));
+        // Unset on both sides stays unset: the figures are derived at startup.
+        let mut cfg = Config::default();
+        parse(&[]).overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.aggregate, Default::default());
     }
 
     #[test]

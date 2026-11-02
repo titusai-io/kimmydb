@@ -32,6 +32,81 @@ pub struct Config {
     pub log: LogConfig,
     pub telemetry: TelemetryConfig,
     pub vector: VectorConfig,
+    pub aggregate: AggregateConfig,
+}
+
+/// What an aggregation may hold in memory (ADR-269).
+///
+/// The unit is an estimate of the memory the documents take parsed. A pipeline holds its documents whole, so
+/// without a bound one request can hold more than the member has: a thousand documents
+/// each given an 8 MiB string by `$addFields` hold 8 GB, every value of it legal. Both
+/// bounds refuse the request, rather than letting the member run out of memory. The
+/// memory a request really takes is a little more than that estimate (the copies of an
+/// answer being built), so **neither has a fixed default**: unset, they are worked out from
+/// the memory the process runs under (`crate::aggmem`): the pool is a tenth of the
+/// memory limit of the cgroup it runs in (the tightest cgroup v2 `memory.max` from its own
+/// cgroup up to the root, else v1 `memory.limit_in_bytes`) or,
+/// with none, of the machine's RAM, and one request may hold half the pool. A 2 GiB
+/// container gets a pool of about 200 MiB and 100 MiB a request. An explicit value
+/// (file, environment or flag) always wins.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AggregateConfig {
+    /// The most bytes one aggregation may hold at once: the documents it reads, each
+    /// stage's input and output while the stage runs, the groups and joined arrays it
+    /// builds, and its answer. Over it, `413 answer_too_large` naming what held the
+    /// memory. Unset: half the pool. At least 1 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<usize>,
+    /// The most bytes all aggregations on this node may hold together. A request takes
+    /// from it as its own total grows and returns it when it ends; one that cannot be
+    /// covered is answered `503` with `retry: wait`. Unset: a tenth of the memory the
+    /// process may use. At least `memory_limit_bytes`, or a single request could never
+    /// reach its own limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pool_bytes: Option<usize>,
+}
+
+impl AggregateConfig {
+    /// The limit and the pool, with what is unset worked out from `memory`.
+    pub fn resolve(&self, memory: crate::aggmem::Memory) -> crate::aggmem::Resolved {
+        crate::aggmem::resolve(self.memory_limit_bytes, self.memory_pool_bytes, memory)
+    }
+
+    /// What the shared state is handed, for the memory this machine has.
+    pub fn memory(&self) -> (kimmy_api::AggregateMemory, crate::aggmem::Resolved) {
+        let resolved = self.resolve(crate::aggmem::detect_system());
+        (kimmy_api::AggregateMemory::new(resolved.limit, resolved.pool), resolved)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(limit) = self.memory_limit_bytes
+            && limit < crate::aggmem::MIN_LIMIT_BYTES
+        {
+            anyhow::bail!(
+                "aggregate.memory_limit_bytes must be at least 1 MiB (1048576): a smaller \
+                 limit refuses pipelines over a few documents. Unset, it is half the pool"
+            );
+        }
+        if let Some(pool) = self.memory_pool_bytes {
+            if pool < crate::aggmem::MIN_LIMIT_BYTES {
+                anyhow::bail!(
+                    "aggregate.memory_pool_bytes must be at least 1 MiB (1048576). Unset, it \
+                     is a tenth of the memory the process may use"
+                );
+            }
+            if let Some(limit) = self.memory_limit_bytes
+                && pool < limit
+            {
+                anyhow::bail!(
+                    "aggregate.memory_pool_bytes ({pool}) must be at least \
+                     aggregate.memory_limit_bytes ({limit}): a pool smaller than one request's \
+                     limit would refuse a request that is within its own"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Automatic-embedding settings.
@@ -1612,6 +1687,7 @@ impl Config {
                  rebuild one on every search"
             );
         }
+        self.aggregate.validate()?;
         if self.vector.index_cache.build_concurrency == 0 {
             anyhow::bail!(
                 "vector.index_cache.build_concurrency must be at least 1: with no builder, no \
@@ -1693,6 +1769,13 @@ impl Config {
 
     /// Redacted form, safe to log at startup.
     pub fn summary(&self) -> String {
+        self.summary_for(crate::aggmem::detect_system())
+    }
+
+    /// [`Self::summary`] for a process that may use `memory`, which is what the aggregate
+    /// limits unset in the configuration are worked out from.
+    pub fn summary_for(&self, memory: crate::aggmem::Memory) -> String {
+        let aggregate = self.aggregate.resolve(memory);
         let seeds = if self.cluster.seeds.is_empty() {
             "none".to_string()
         } else {
@@ -1705,7 +1788,8 @@ impl Config {
         };
         format!(
             "bind={} scheme={} data_dir={} auth={} local_login={} jwt_previous_secret={} \
-             oidc={} mcp={} gc={} ratelimit=[{}] limits=[timeout={}s body={}B] audit={} \
+             oidc={} mcp={} gc={} ratelimit=[{}] limits=[timeout={}s body={}B] \
+             aggregate=[limit={}B pool={}B] audit={} \
              cluster={} seeds=[{}] log={}/{:?} otel={}",
             self.server.bind,
             if self.server.tls.is_enabled() { "https" } else { "http" },
@@ -1726,6 +1810,8 @@ impl Config {
             self.server.rate_limit.describe(),
             self.server.request_timeout_secs,
             self.server.max_body_bytes,
+            aggregate.limit,
+            aggregate.pool,
             self.audit.mode,
             if self.cluster.enabled { "enabled" } else { "single-node" },
             seeds,
@@ -3254,6 +3340,90 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
         assert_eq!(cfg.server.request_limits(), kimmy_api::RequestLimits::default());
         assert_eq!(cfg.server.rate_limit.per_principal, 0, "off unless an operator says so");
         assert!(cfg.server.rate_limit.build().per_principal.limit().is_disabled());
+    }
+
+    fn fake_memory(bytes: u64) -> crate::aggmem::Memory {
+        crate::aggmem::Memory { bytes, origin: crate::aggmem::Origin::Ram }
+    }
+
+    #[test]
+    fn aggregate_memory_unset_is_derived_from_the_memory_the_process_has() {
+        let cfg = Config::default();
+        assert_eq!(cfg.aggregate, AggregateConfig::default());
+        assert_eq!(cfg.aggregate.memory_limit_bytes, None);
+        assert_eq!(cfg.aggregate.memory_pool_bytes, None);
+        // A tenth for the pool and half the pool for a request.
+        let r = cfg.aggregate.resolve(fake_memory(2 << 30));
+        assert_eq!(r.pool, (2usize << 30) / 10);
+        assert_eq!(r.limit, r.pool / 2);
+        assert!(cfg.aggregate.validate().is_ok());
+    }
+
+    #[test]
+    fn aggregate_memory_is_read_from_its_section_and_unknown_keys_are_refused() {
+        let cfg: Config = toml::from_str(
+            "[aggregate]\nmemory_limit_bytes = 268435456\nmemory_pool_bytes = 536870912\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.aggregate.memory_limit_bytes, Some(256 << 20));
+        assert_eq!(cfg.aggregate.memory_pool_bytes, Some(512 << 20));
+        // An explicit value wins over whatever the machine has.
+        let r = cfg.aggregate.resolve(fake_memory(2 << 30));
+        assert_eq!((r.limit, r.pool), (256 << 20, 512 << 20));
+        assert_eq!(r.limit_source, crate::aggmem::Source::Explicit);
+        let err = toml::from_str::<Config>("[aggregate]\nmemory_limit = 1\n").unwrap_err();
+        assert!(err.to_string().contains("memory_limit"), "{err}");
+    }
+
+    #[test]
+    fn aggregate_memory_limits_are_validated_and_name_the_setting() {
+        let mut cfg = Config::default();
+        cfg.aggregate.memory_limit_bytes = Some(1024 * 1024 - 1);
+        let err = cfg.aggregate.validate().unwrap_err().to_string();
+        assert!(err.contains("aggregate.memory_limit_bytes"), "{err}");
+        cfg.aggregate.memory_limit_bytes = Some(1024 * 1024);
+        cfg.aggregate.memory_pool_bytes = Some(1024 * 1024 - 1);
+        let err = cfg.aggregate.validate().unwrap_err().to_string();
+        assert!(err.contains("aggregate.memory_pool_bytes"), "{err}");
+        // A pool of exactly one request's limit is the smallest that can serve it.
+        cfg.aggregate.memory_pool_bytes = Some(1024 * 1024);
+        assert!(cfg.aggregate.validate().is_ok());
+        // A pool under an explicit limit is refused, and `Config::validate` runs it.
+        let mut cfg = Config::default();
+        cfg.auth.insecure_no_auth = true;
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.aggregate.memory_limit_bytes = Some(8 << 20);
+        cfg.aggregate.memory_pool_bytes = Some(4 << 20);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("aggregate.memory_pool_bytes"), "{err}");
+        // Only one set is checked against nothing: the other is derived to fit.
+        cfg.aggregate.memory_limit_bytes = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn the_example_file_leaves_the_aggregate_memory_to_be_derived() {
+        let example = include_str!("../../../kimmy.example.toml");
+        let cfg: Config = toml::from_str(example).expect("the example parses");
+        assert_eq!(cfg.aggregate, AggregateConfig::default());
+        assert!(example.contains("# memory_limit_bytes ="));
+        assert!(example.contains("# memory_pool_bytes ="));
+    }
+
+    #[test]
+    fn the_summary_shows_the_aggregate_memory_it_resolves() {
+        let cfg = Config::default();
+        let summary = cfg.summary_for(fake_memory(2 << 30));
+        let pool = (2usize << 30) / 10;
+        assert!(
+            summary.contains(&format!("aggregate=[limit={}B pool={pool}B]", pool / 2)),
+            "{summary}"
+        );
+        // An explicit value is what the summary shows.
+        let mut cfg = Config::default();
+        cfg.aggregate.memory_pool_bytes = Some(64 << 20);
+        let summary = cfg.summary_for(fake_memory(2 << 30));
+        assert!(summary.contains("aggregate=[limit=33554432B pool=67108864B]"), "{summary}");
     }
 
     #[test]

@@ -845,14 +845,22 @@ pub(crate) struct StdDevSlider<'a, 'v> {
     removals: usize,
     lo: usize,
     hi: usize,
+    /// The window starts at the first document of the partition for every document.
+    from_start: bool,
 }
 
 impl<'a, 'v> StdDevSlider<'a, 'v> {
-    pub(crate) fn new(expr: &'a Expr, sample: bool, vars: &'a [Binding<'v>]) -> Self {
+    pub(crate) fn new(
+        expr: &'a Expr,
+        sample: bool,
+        vars: &'a [Binding<'v>],
+        from_start: bool,
+    ) -> Self {
         StdDevSlider {
             expr,
             sample,
             vars,
+            from_start,
             w: Welford::default(),
             pivot: None,
             nonfinite: 0,
@@ -926,7 +934,10 @@ impl Slider for StdDevSlider<'_, '_> {
         }
         Ok(match (n, self.sample) {
             (0, _) => Bson::Null,
-            // The reference answers an integer zero for one value.
+            // The reference answers an integer zero for one value in a window that can take
+            // a document out, and a double zero in one that starts at the partition's
+            // first document (the whole partition, or a lower bound of "unbounded").
+            (1, false) if self.from_start => Bson::Double(0.0),
             (1, false) => Bson::Int32(0),
             _ => self.w.finish(self.sample),
         })

@@ -63,8 +63,6 @@ use crate::window_acc::{
     Slider, StdDevSlider, SumSlider, eval, eval_present,
 };
 
-pub use crate::budget::MAX_BUFFER_BYTES;
-
 /// How a stage splits its input.
 #[derive(Clone, Debug)]
 pub enum Partition {
@@ -95,6 +93,20 @@ pub enum Window {
     Documents(Option<i64>, Option<i64>),
     /// Distances in the `sortBy` value. `unit` is set for a date.
     Range { lo: RangeBound, hi: RangeBound, unit: Option<String> },
+}
+
+impl Window {
+    /// Whether the window starts at the first document of the partition for every
+    /// document: the whole partition, or a lower bound that is `"unbounded"`. The reference
+    /// computes such a window with the plain accumulator and any other with one that can
+    /// take a document out, and the two answer a one-value deviation differently.
+    pub(crate) fn starts_unbounded(&self) -> bool {
+        match self {
+            Window::Whole | Window::Documents(None, _) => true,
+            Window::Range { lo, .. } => matches!(lo, RangeBound::Unbounded),
+            Window::Documents(Some(_), _) => false,
+        }
+    }
 }
 
 /// What one output field computes.
@@ -131,7 +143,10 @@ pub enum Func {
     },
     ExpMovingAvg {
         input: Expr,
-        alpha: f64,
+        /// The weight of the newest value, as a `Decimal128`: the reference works the
+        /// average in decimal, which is why `N: 2` over `[1, 2]` is `1.6666666666666667`
+        /// and not the `...65` that a double's `prev + alpha * (x - prev)` gives.
+        alpha: Raw,
     },
     Locf(Expr),
     LinearFill(Expr),
@@ -304,8 +319,10 @@ fn parse_output(
     let Some((op, arg)) = op else {
         return bad(format!("$setWindowFields output `{name}` names no window operator"));
     };
+    // A `sortBy` is needed, and `sortBy: {}` is one: no order, so the documents are taken
+    // in the order they arrive, as the reference takes them.
     let need_sort = |why: &str| -> Result<()> {
-        if sort.is_empty() {
+        if !sort_given {
             return bad(format!("{op} requires a `sortBy`: {why}"));
         }
         Ok(())
@@ -405,10 +422,15 @@ fn parse_output(
                     if n < 1 {
                         return bad(format!("$expMovingAvg `N` must be at least 1, found {n}"));
                     }
-                    2.0 / (n as f64 + 1.0)
+                    // 2 / (N + 1) in decimal, to 34 digits, as the reference computes it.
+                    arith::div(&arith::from_i64(2), &arith::from_i64(n.saturating_add(1)))
+                        .map_err(|_| Error::Internal("N + 1 is zero".into()))?
                 }
                 (None, Some(a)) => match accumulators::numeric(a) {
-                    Some(a) if a > 0.0 && a < 1.0 => a,
+                    Some(x) if x > 0.0 && x < 1.0 => match a {
+                        Bson::Decimal128(d) => decode_raw(d),
+                        _ => ema_decimal(x),
+                    },
                     Some(a) => {
                         return bad(format!(
                             "$expMovingAvg `alpha` must be greater than 0 and less than 1, found {a}"
@@ -634,20 +656,10 @@ pub(crate) fn buffer_name(stage: &str) -> &'static str {
     }
 }
 
-/// The bytes a field adds to a document: type byte, name, terminator, value.
+/// What a field adds to a document: the estimate of the memory it holds parsed
+/// ([`crate::budget::held_element`]).
 pub(crate) fn element_bytes(name: &str, value: &Bson) -> usize {
-    let body = match value {
-        Bson::Null | Bson::Undefined | Bson::MinKey | Bson::MaxKey => 0,
-        Bson::Boolean(_) => 1,
-        Bson::Int32(_) => 4,
-        Bson::Int64(_) | Bson::Double(_) | Bson::DateTime(_) | Bson::Timestamp(_) => 8,
-        Bson::ObjectId(_) => 12,
-        Bson::Decimal128(_) => 16,
-        Bson::String(s) => 4 + s.len() + 1,
-        other => bson::serialize_to_vec(&bson::doc! { "": other.clone() })
-            .map_or(16, |v| v.len().saturating_sub(5 + 1)),
-    };
-    1 + name.len() + 1 + body
+    crate::budget::held_element(name, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +697,8 @@ impl Sink<'_> {
 
 struct Run<'a, 'v> {
     vars: &'a [Binding<'v>],
+    /// The most bytes a document the stage completes may take.
+    max_document_bytes: usize,
 }
 
 /// The partition key of a document: its encoded bytes, and the value it stands for.
@@ -721,15 +735,25 @@ pub(crate) enum Rep {
     Fields(Vec<Option<Bson>>),
 }
 
-/// Partitions order by their values in the canonical order, `null` before a missing field.
-pub(crate) fn compare_fields(a: &[Option<Bson>], b: &[Option<Bson>]) -> Ordering {
+/// Partitions order by their values in the canonical order. A field a document does not
+/// have sorts as a null: after a null that is there when `missing_first` is false
+/// (`$densify`), before it when it is true (`$fill`), as the reference orders each.
+pub(crate) fn compare_fields(
+    a: &[Option<Bson>],
+    b: &[Option<Bson>],
+    missing_first: bool,
+) -> Ordering {
+    let (before, after) = if missing_first {
+        (Ordering::Less, Ordering::Greater)
+    } else {
+        (Ordering::Greater, Ordering::Less)
+    };
     for (x, y) in a.iter().zip(b) {
         let o = match (x, y) {
             (Some(x), Some(y)) => canonical_cmp(x, y),
             (None, None) => Ordering::Equal,
-            // A missing field sorts as null, after a null that is there.
-            (None, Some(y)) => canonical_cmp(&Bson::Null, y).then(Ordering::Greater),
-            (Some(x), None) => canonical_cmp(x, &Bson::Null).then(Ordering::Less),
+            (None, Some(y)) => canonical_cmp(&Bson::Null, y).then(before),
+            (Some(x), None) => canonical_cmp(x, &Bson::Null).then(after),
         };
         if o.is_ne() {
             return o;
@@ -742,7 +766,7 @@ impl Rep {
     fn compare(&self, other: &Rep) -> Ordering {
         match (self, other) {
             (Rep::One(a), Rep::One(b)) => canonical_cmp(a, b),
-            (Rep::Fields(a), Rep::Fields(b)) => compare_fields(a, b),
+            (Rep::Fields(a), Rep::Fields(b)) => compare_fields(a, b, true),
             _ => Ordering::Equal,
         }
     }
@@ -769,12 +793,27 @@ pub fn apply(
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
     let mut lease = limits.buffer.lease(buffer_name(spec.stage));
-    let partitions = partitions(&spec.partition, input, vars, &mut lease)?;
-    let run = Run { vars };
+    apply_in(spec, input, limits.max_document_bytes, vars, &mut lease)
+}
+
+/// [`apply`], charging to a lease the caller keeps: `$fill` goes on to write its `value`
+/// fields into the documents this returns, and they stay charged until it is done.
+///
+/// A document the stage adds fields to is held to `max_document_bytes` as a whole, as it is
+/// completed (`the document the stage builds`, as `$addFields` refuses it).
+pub(crate) fn apply_in(
+    spec: &WindowSpec,
+    input: Vec<Document>,
+    max_document_bytes: usize,
+    vars: &[Binding<'_>],
+    lease: &mut Lease,
+) -> Result<Vec<Document>> {
+    let partitions = partitions(&spec.partition, input, vars, lease)?;
+    let run = Run { vars, max_document_bytes };
     let mut out = Vec::new();
     for docs in partitions {
         deadline::check()?;
-        out.extend(run_partition(spec, docs, &run, &mut lease)?);
+        out.extend(run_partition(spec, docs, &run, lease)?);
     }
     Ok(out)
 }
@@ -828,7 +867,7 @@ fn run_partition(
         for doc in docs {
             deadline::tick()?;
             let keys = shape::sort_keys(&spec.sort, &doc);
-            lease.charge(keys.iter().map(|k| element_bytes("", k)).sum())?;
+            lease.charge(keys.iter().map(crate::budget::held_bytes_bson).sum())?;
             keyed.push((keys, doc));
         }
         // The partition is no longer than the pipeline's document limit and the keys are
@@ -845,15 +884,49 @@ fn run_partition(
     }
     for (i, doc) in docs.iter_mut().enumerate() {
         deadline::tick()?;
+        let mut added = false;
         for (output, cells) in spec.outputs.iter().zip(&results) {
             if let Some(v) = cells.at(i) {
+                // The values were charged as they were computed; what the document's table
+                // grows by to hold the field is charged as it is written.
+                if path::resolve(doc, &output.name).is_empty() {
+                    lease.charge(crate::budget::held_frame_growth(doc.len(), 1))?;
+                }
                 path::set(doc, &output.name, v.clone()).map_err(|e| {
                     Error::InvalidQuery(format!("cannot set {:?}: {e}", output.name))
                 })?;
+                added = true;
             }
+        }
+        // Each value is held to 16 MiB on its own; the document they make together is not.
+        if added {
+            crate::aggregate::check_built_document(doc, run.max_document_bytes)?;
         }
     }
     Ok(docs)
+}
+
+/// A double as the reference reads it into a `Decimal128`: rounded to 15 significant digits
+/// (`0.5` is `0.500000000000000`). An infinity and a NaN stay what they are.
+fn ema_decimal(x: f64) -> Raw {
+    if !x.is_finite() {
+        return arith::from_binary64(x.to_bits()).0;
+    }
+    match kimmy_core::decimal::parse(&format!("{x:.14e}")) {
+        Ok(d) => decode_raw(&d),
+        Err(_) => arith::from_binary64(x.to_bits()).0,
+    }
+}
+
+/// The number `$expMovingAvg` takes from a value, or `None` for anything that is not a
+/// number: an integer exactly, a double to 15 digits, a `Decimal128` read as the double of
+/// its value (the deviation of every window operator over decimals).
+fn ema_term(value: &Bson) -> Option<Raw> {
+    match value {
+        Bson::Int32(n) => Some(arith::from_i64(i64::from(*n))),
+        Bson::Int64(n) => Some(arith::from_i64(*n)),
+        other => accumulators::numeric(other).map(ema_decimal),
+    }
 }
 
 fn per(out: Vec<Option<Bson>>) -> Result<Cells> {
@@ -871,7 +944,7 @@ fn compute(
     match func {
         Func::Acc { acc, window } => {
             let ends = endpoints(acc_name(acc), window, docs, sort)?;
-            accumulator(acc, docs, &ends, run, sink)
+            accumulator(acc, docs, &ends, run, sink, window.starts_unbounded())
         }
         Func::Covariance { exprs, sample, window } => {
             let op = if *sample { "$covarianceSamp" } else { "$covariancePop" };
@@ -959,18 +1032,28 @@ fn compute(
             integral(&ends, &x, &y, sink)
         }
         Func::ExpMovingAvg { input, alpha } => {
-            let mut ema: Option<f64> = None;
+            // The average is kept in decimal, to 34 digits, as the reference keeps it, and
+            // each update is `x * alpha + (1 - alpha) * prev`; it is answered as the nearest
+            // double.
+            let one_minus = arith::sub(&arith::from_i64(1), alpha);
+            let mut ema: Option<Raw> = None;
             let mut out = Vec::with_capacity(n);
             for doc in docs {
                 deadline::tick()?;
                 // A value that is not a number leaves the average where it is.
-                if let Some(x) = accumulators::numeric(&eval(input, doc, run.vars)?) {
-                    ema = Some(match ema {
+                let value = eval(input, doc, run.vars)?;
+                if let Some(x) = ema_term(&value) {
+                    ema = Some(match &ema {
                         None => x,
-                        Some(prev) => prev + alpha * (x - prev),
+                        Some(prev) => {
+                            arith::add(&arith::mul(&x, alpha), &arith::mul(&one_minus, prev))
+                        }
                     });
                 }
-                let v = Some(ema.map_or(Bson::Null, Bson::Double));
+                let v =
+                    Some(ema.as_ref().map_or(Bson::Null, |e| {
+                        Bson::Double(f64::from_bits(arith::to_binary64(e)))
+                    }));
                 sink.charge(&v)?;
                 out.push(v);
             }
@@ -1081,7 +1164,8 @@ impl Axis {
     fn delta(&self, a: usize, b: usize) -> f64 {
         match self {
             Axis::Num(v) => v[b] - v[a],
-            Axis::Date(v, per) => (v[b] - v[a]) as f64 / per,
+            // In 128 bits: two dates a span over 2^63 ms apart do not wrap.
+            Axis::Date(v, per) => (i128::from(v[b]) - i128::from(v[a])) as f64 / per,
         }
     }
 
@@ -1089,7 +1173,7 @@ impl Axis {
     fn raw_delta(&self, a: usize, b: usize) -> f64 {
         match self {
             Axis::Num(v) => v[b] - v[a],
-            Axis::Date(v, _) => (v[b] - v[a]) as f64,
+            Axis::Date(v, _) => (i128::from(v[b]) - i128::from(v[a])) as f64,
         }
     }
 
@@ -1220,6 +1304,7 @@ fn accumulator(
     ends: &[(usize, usize)],
     run: &Run<'_, '_>,
     sink: &mut Sink<'_>,
+    from_start: bool,
 ) -> Result<Cells> {
     let n = docs.len();
     let vars = run.vars;
@@ -1258,7 +1343,7 @@ fn accumulator(
         }
         _ => {}
     }
-    let mut slider = make_slider(acc, docs, vars)?;
+    let mut slider = make_slider(acc, docs, vars, from_start)?;
     slide(slider.as_mut(), docs, ends, sink)
 }
 
@@ -1267,6 +1352,7 @@ fn make_slider<'a, 'v>(
     acc: &'a Accumulator,
     docs: &[Document],
     vars: &'a [Binding<'v>],
+    from_start: bool,
 ) -> Result<Box<dyn Slider + 'a>> {
     Ok(match acc {
         Accumulator::Sum(e) => Box::new(SumSlider::new(e, false, vars)),
@@ -1276,8 +1362,8 @@ fn make_slider<'a, 'v>(
         Accumulator::Push(e) => Box::new(QueueSlider::new(e, Queue::Push, usize::MAX, vars)),
         Accumulator::AddToSet(e) => Box::new(SetSlider::new(e, vars)),
         Accumulator::Ext(spec) => match spec.kind {
-            Kind::StdDevPop => Box::new(StdDevSlider::new(&spec.value, false, vars)),
-            Kind::StdDevSamp => Box::new(StdDevSlider::new(&spec.value, true, vars)),
+            Kind::StdDevPop => Box::new(StdDevSlider::new(&spec.value, false, vars, from_start)),
+            Kind::StdDevSamp => Box::new(StdDevSlider::new(&spec.value, true, vars, from_start)),
             Kind::Top | Kind::Bottom | Kind::TopN | Kind::BottomN => {
                 Box::new(RankedSlider::new(spec, docs, vars)?)
             }

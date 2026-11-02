@@ -1674,8 +1674,15 @@ fn capped(cap: usize) -> Limits {
     Limits { buffer: crate::budget::BufferBudget::new(cap), ..Default::default() }
 }
 
+/// What a document is charged: the estimate of the memory it holds parsed.
 fn size(doc: &Document) -> usize {
-    bson::serialize_to_vec(doc).unwrap().len()
+    crate::budget::held_bytes(doc)
+}
+
+/// What a cell `n`, an `Int32`, written into a document of the two fields `series` makes
+/// is charged: its key, and no growth of the table (three fields fit its capacity).
+fn n_cell() -> usize {
+    crate::budget::held_element("n", &Bson::Int32(0)) + crate::budget::held_frame_growth(2, 1)
 }
 
 #[test]
@@ -1695,8 +1702,8 @@ fn buffered_documents_are_held_to_the_byte_cap_with_an_early_refusal() {
 fn the_values_the_stage_adds_are_held_to_the_byte_cap_exactly() {
     let input = series(&[1, 2, 3]);
     let held: usize = input.iter().map(size).sum();
-    // `n` is an Int32 count: type byte, "n", terminator, four bytes.
-    let cell = 1 + 1 + 1 + 4;
+    // `n` is an Int32 count: the heap of its key.
+    let cell = n_cell();
     let spec = spec_of(set(doc! {"output": {"n": {"$count": {}}}}));
     // The cap is exactly what the documents and three cells come to: allowed.
     let out = window::apply(&spec, input.clone(), &capped(held + 3 * cell), &[]).unwrap();
@@ -2379,7 +2386,7 @@ fn the_refusal_names_the_stage_and_its_buffer_limit_not_one_document() {
     let err = window::apply(&spec, series(&[1]), &capped(1), &[]).unwrap_err();
     let text = err.to_string();
     assert!(text.contains("$setWindowFields"), "{text}");
-    assert!(text.contains("limit on the bytes"), "{text}");
+    assert!(text.contains("aggregate.memory_limit_bytes"), "{text}");
     assert!(!text.contains("of one document"), "{text}");
     let spec = match aggregate::parse(&[
         doc! {"$fill": {"sortBy": {"x": 1}, "output": {"v": {"method": "locf"}}}},
@@ -2399,10 +2406,10 @@ fn the_refusal_names_the_stage_and_its_buffer_limit_not_one_document() {
 fn the_sort_keys_taken_are_charged() {
     let input = series(&[1, 2, 3]);
     let held: usize = input.iter().map(size).sum();
-    // Each Int32 key is a type byte, an empty name, a terminator and four bytes; and the
-    // `$documentNumber` output a document's cell takes 1 + 1 + 1 + 4 (an Int32 named `n`).
-    let key = 1 + 1 + 4;
-    let cell = 1 + 1 + 1 + 4;
+    // Each Int32 key is a slot of its own; and the `$documentNumber` output is a cell, an
+    // Int32 named `n`.
+    let key = crate::budget::held_bytes_bson(&Bson::Int32(0));
+    let cell = n_cell();
     let spec = spec_of(set(doc! {"sortBy": {"qty": 1}, "output": {"n": {"$documentNumber": {}}}}));
     let exact = held + 3 * key + 3 * cell;
     assert_eq!(window::apply(&spec, input.clone(), &capped(exact), &[]).unwrap().len(), 3);
@@ -2414,7 +2421,7 @@ fn the_sort_keys_taken_are_charged() {
 fn the_stages_of_one_pipeline_and_the_branches_of_a_facet_share_one_budget() {
     let input = series(&[1, 2, 3, 4, 5]);
     let held: usize = input.iter().map(size).sum();
-    let cell = 1 + 1 + 1 + 4;
+    let cell = n_cell();
     let one = held + 5 * cell;
     let stage = set(doc! {"output": {"n": {"$count": {}}}});
     // One stage fits, and so do two in a row: the first gives its bytes back when it is done.
@@ -2427,7 +2434,9 @@ fn the_stages_of_one_pipeline_and_the_branches_of_a_facet_share_one_budget() {
     }
     assert_eq!(docs.len(), 5);
     assert_eq!(limits.buffer.used(), 0);
-    // Two branches of a `$facet` run in turn but are alive together, so they share the cap.
+    // A `$facet` holds its input while its first branch runs on a copy of it, and the
+    // branch's stage holds the copy and what it adds: all of it is charged to the one
+    // budget, so a cap that fits the stage alone does not fit the facet.
     let facet = aggregate::parse(&[doc! {"$facet": {
         "a": [stage.clone(), {"$count": "c"}],
         "b": [stage.clone(), {"$count": "c"}],
@@ -2715,6 +2724,231 @@ fn an_integral_of_values_near_the_largest_slides_exactly_and_in_time() {
     assert_eq!(out[1000].get("i4"), Some(&Bson::Double(f64::INFINITY)));
     assert_eq!(out[99_999].get("i2"), Some(&Bson::Double(1.0)));
     assert_eq!(out[99_999].get("i4"), Some(&Bson::Double(3.0)));
+}
+
+// ---------------------------------------------------------------------------
+// The #278 delta leftovers (d1 to d6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_decimal_running_sum_takes_a_value_out_when_it_leaves_the_window() {
+    // The sum is decimal once a `Decimal128` is in the window, and a number that leaves
+    // it, a decimal or not, comes off the running sum: 1.5, 3.5, 5.5, 7.75, 4.75.
+    let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+    let input = vec![
+        doc! {"_id": 1, "qty": dec("1.5")},
+        doc! {"_id": 2, "qty": 2},
+        doc! {"_id": 3, "qty": dec("3.5")},
+        doc! {"_id": 4, "qty": 4.25},
+        doc! {"_id": 5, "qty": dec("0.5")},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "s": {"$sum": "$qty", "window": {"documents": [-1, 0]}},
+            "a": {"$avg": "$qty", "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    let value = |b: &Bson| match b {
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap(),
+        other => panic!("{other:?} is not a decimal"),
+    };
+    let sums: Vec<f64> = col(&out, "s").iter().map(value).collect();
+    assert_eq!(sums, vec![1.5, 3.5, 5.5, 7.75, 4.75]);
+    let avgs: Vec<f64> = col(&out, "a").iter().map(value).collect();
+    assert_eq!(avgs, vec![1.5, 1.75, 2.75, 3.875, 2.375]);
+}
+
+#[test]
+fn a_derivative_over_dates_subtracts_the_dates_before_it_scales_them() {
+    // One second apart, in hours: the difference is worked out exactly in milliseconds and
+    // then scaled. Scaled first, each date is a number near 4.6e5 hours with an error of
+    // 6e-11, which is 2e-7 of the difference.
+    let input = vec![
+        doc! {"t": d("2023-01-01T00:00:00.001Z"), "y": 10},
+        doc! {"t": d("2023-01-01T00:00:01.001Z"), "y": 20},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"t": 1}, "output": {
+            "d": {"$derivative": {"input": "$y", "unit": "hour"}, "window": {"documents": [-1, 0]}},
+            "i": {"$integral": {"input": "$y", "unit": "hour"}, "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    let hours = 1000.0 / 3_600_000.0;
+    assert_eq!(col(&out, "d")[1], Bson::Double(10.0 / hours));
+    assert_eq!(col(&out, "i")[1], Bson::Double(hours * (10.0 + 20.0) / 2.0));
+}
+
+#[test]
+fn two_dates_more_than_two_to_the_sixty_three_milliseconds_apart_do_not_wrap() {
+    // The span of the earliest and the latest date a `DateTime` holds is 2^64 ms: in 64 bits
+    // it wraps to a small or negative number.
+    let input = vec![
+        doc! {"t": bson::DateTime::from_millis(i64::MIN), "y": 0.0},
+        doc! {"t": bson::DateTime::from_millis(i64::MAX), "y": 1.0},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"t": 1}, "output": {
+            "d": {"$derivative": {"input": "$y", "unit": "millisecond"}, "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    let Bson::Double(slope) = col(&out, "d")[1] else { panic!("{out:?}") };
+    let span = 2f64.powi(64);
+    assert!((slope - 1.0 / span).abs() < 1e-25, "{slope}");
+}
+
+/// The moving average as the reference answers it (q8a2 n6): kept in decimal, to 34 digits, so
+/// that `N: 2` over `[1, 2]` is `1.6666666666666667` where a double's
+/// `prev + alpha * (x - prev)` is `1.6666666666666665`. Every answer below is a recorded one.
+#[test]
+fn the_moving_average_is_worked_in_decimal_as_the_reference_works_it() {
+    let ema = |arg: Document, input: Vec<Document>| {
+        let out =
+            run(set(doc! {"sortBy": {"_id": 1}, "output": {"e": {"$expMovingAvg": arg}}}), input)
+                .unwrap();
+        col(&out, "e")
+    };
+    let v = |values: &[i32]| -> Vec<Document> {
+        values.iter().enumerate().map(|(i, x)| doc! {"_id": i as i32 + 1, "v": *x}).collect()
+    };
+    // N: 2 over [1, 2].
+    assert_eq!(ema(doc! {"input": "$v", "N": 2}, v(&[1, 2])), f64s(&[1.0, 1.6666666666666667]));
+    // A longer series, N: 2 over 1, 2, 3, 4 (wextra3, "sortBy {} with $expMovingAvg").
+    assert_eq!(
+        ema(doc! {"input": "$v", "N": 2}, v(&[1, 2, 3, 4])),
+        f64s(&[1.0, 1.6666666666666667, 2.5555555555555554, 3.5185185185185186])
+    );
+    // A missing value and a string leave the average where it is, and a leading missing
+    // value answers null; N given as a whole double (wextra, "ema N 2.0 double").
+    let sparse = vec![
+        doc! {"_id": 1},
+        doc! {"_id": 2, "v": 10},
+        doc! {"_id": 3, "v": "x"},
+        doc! {"_id": 4, "v": 30},
+    ];
+    assert_eq!(
+        ema(doc! {"input": "$v", "N": 2.0}, sparse.clone()),
+        vec![Bson::Null, Bson::Double(10.0), Bson::Double(10.0), Bson::Double(23.333333333333332)]
+    );
+    // The alpha form (wextra, "ema leading missing, string, decimal", and windows, "ema alpha").
+    assert_eq!(
+        ema(doc! {"input": "$v", "alpha": 0.5}, sparse),
+        vec![Bson::Null, Bson::Double(10.0), Bson::Double(10.0), Bson::Double(20.0)]
+    );
+    assert_eq!(
+        ema(doc! {"input": "$v", "alpha": 0.25}, v(&[10, 20, 30])),
+        f64s(&[10.0, 12.5, 16.875])
+    );
+    assert_eq!(ema(doc! {"input": "$v", "N": 3}, v(&[10, 20, 30])), f64s(&[10.0, 15.0, 22.5]));
+    // A long series is the same decimal walk: N: 4 (alpha 0.4) over a ramp, checked against
+    // the same arithmetic done on exact decimals here.
+    let ramp: Vec<i32> = (1..=40).collect();
+    let got = ema(doc! {"input": "$v", "N": 4}, v(&ramp));
+    let mut want = Vec::new();
+    let mut prev = 0i128; // exact, in units of 1e-30; alpha = 2/5
+    for (i, x) in ramp.iter().enumerate() {
+        let x = i128::from(*x) * 10i128.pow(30);
+        prev = if i == 0 { x } else { (x * 2 + prev * 3) / 5 };
+        want.push(Bson::Double(prev as f64 / 1e30));
+    }
+    for (g, w) in got.iter().zip(&want) {
+        let (Bson::Double(g), Bson::Double(w)) = (g, w) else { panic!("{got:?}") };
+        assert!((g - w).abs() <= 1e-12 * w.abs().max(1.0), "{g} vs {w}");
+    }
+}
+
+#[test]
+fn an_integral_over_dates_more_than_two_to_the_sixty_three_milliseconds_apart_does_not_wrap() {
+    // The trapezoid between the earliest and the latest date a `DateTime` holds is 2^64
+    // milliseconds wide and 1 high: in 64 bits the width wraps to -1.
+    let input = vec![
+        doc! {"t": bson::DateTime::from_millis(i64::MIN), "y": 0.0},
+        doc! {"t": bson::DateTime::from_millis(i64::MAX), "y": 2.0},
+    ];
+    let out = run(
+        set(doc! {"sortBy": {"t": 1}, "output": {
+            "i": {"$integral": {"input": "$y", "unit": "millisecond"}, "window": {"documents": [-1, 0]}},
+        }}),
+        input,
+    )
+    .unwrap();
+    assert_eq!(col(&out, "i")[1], Bson::Double(2f64.powi(64)));
+}
+
+#[test]
+fn sort_by_nothing_is_accepted_by_shift_and_the_moving_average_in_arrival_order() {
+    let input =
+        vec![doc! {"_id": 1, "qty": 10}, doc! {"_id": 3, "qty": 30}, doc! {"_id": 2, "qty": 20}];
+    let out = run(
+        set(doc! {"sortBy": {}, "output": {
+            "next": {"$shift": {"output": "$qty", "by": 1, "default": -1}},
+            "ema": {"$expMovingAvg": {"input": "$qty", "alpha": 0.5}},
+        }}),
+        input,
+    )
+    .unwrap();
+    // Arrival order: 1, 3, 2.
+    assert_eq!(ids(&out), vec![1, 3, 2]);
+    assert_eq!(col(&out, "next"), ints(&[30, 20, -1]));
+    assert_eq!(col(&out, "ema"), f64s(&[10.0, 20.0, 20.0]));
+    // With no `sortBy` at all they are still refused.
+    let e = refused(set(doc! {"output": {"n": {"$shift": {"output": "$qty", "by": 1}}}}));
+    assert!(e.contains("requires a `sortBy`"), "{e}");
+    let e =
+        refused(set(doc! {"output": {"n": {"$expMovingAvg": {"input": "$qty", "alpha": 0.5}}}}));
+    assert!(e.contains("requires a `sortBy`"), "{e}");
+}
+
+#[test]
+fn a_deviation_of_one_value_is_a_double_zero_over_the_whole_partition_and_an_int_in_a_window() {
+    // The reference computes a window that starts at the partition's first document with the
+    // plain accumulator, which answers a double zero for one value, and any other window with
+    // one that can take a document out, which answers an integer zero.
+    let out = run(
+        set(doc! {"sortBy": {"_id": 1}, "output": {
+            "whole": {"$stdDevPop": "$qty"},
+            "all": {"$stdDevPop": "$qty", "window": {"documents": ["unbounded", "unbounded"]}},
+            "cumulative": {"$stdDevPop": "$qty", "window": {"documents": ["unbounded", "current"]}},
+            "sliding": {"$stdDevPop": "$qty", "window": {"documents": [-1, 0]}},
+            "alone": {"$stdDevPop": "$qty", "window": {"documents": [0, 0]}},
+        }}),
+        series(&[5]),
+    )
+    .unwrap();
+    for field in ["whole", "all", "cumulative"] {
+        assert_eq!(col(&out, field), vec![Bson::Double(0.0)], "{field}");
+    }
+    for field in ["sliding", "alone"] {
+        assert_eq!(col(&out, field), vec![Bson::Int32(0)], "{field}");
+    }
+}
+
+#[test]
+fn fill_orders_a_missing_partition_before_a_null_one() {
+    let input = vec![
+        doc! {"_id": 1, "g": Bson::Null, "v": 1},
+        doc! {"_id": 2, "v": 2},
+        doc! {"_id": 3, "g": 5, "v": 3},
+        doc! {"_id": 4, "g": Bson::Null, "v": Bson::Null},
+        doc! {"_id": 5, "v": Bson::Null},
+    ];
+    let stage = aggregate::parse(&[doc! {"$fill": {
+        "partitionByFields": ["g"], "sortBy": {"_id": 1}, "output": {"v": {"method": "locf"}},
+    }}])
+    .unwrap()
+    .remove(0);
+    let out = aggregate::apply(&stage, input, &Limits::default()).unwrap();
+    // The partitions leave in the reference's order: missing, null, 5.
+    assert_eq!(ids(&out), vec![2, 5, 1, 4, 3]);
+    assert_eq!(
+        col(&out, "v"),
+        vec![Bson::Int32(2), Bson::Int32(2), Bson::Int32(1), Bson::Int32(1), Bson::Int32(3)]
+    );
 }
 
 // ---------------------------------------------------------------------------

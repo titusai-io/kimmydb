@@ -128,8 +128,12 @@ fn the_stages_after_the_source_run_under_the_deadline_the_aggregation_sets() {
                     &aggregate::Limits::default(),
                     None,
                     None,
+                    Shape::Value,
                 )
-                .map(|(body, _)| body)
+                .map(|(answer, _, _)| match answer {
+                    Answer::Json(body) => body,
+                    Answer::Body(_) => unreachable!("Shape::Value answers a value"),
+                })
             })
         };
         let late = run(PAST);
@@ -508,6 +512,7 @@ fn the_answer_of_an_aggregation_ticks_for_each_document() {
                 &aggregate::Limits::default(),
                 None,
                 None,
+                Shape::Value,
             )
             .unwrap()
         })

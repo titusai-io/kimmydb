@@ -145,6 +145,12 @@ pub struct StorageReadings {
     pub validation_warnings: u64,
     pub validation_refusals: u64,
     pub validators_unparseable: u64,
+    /// Aggregations refused for passing their own memory limit (`413`) and for finding the
+    /// node's pool of aggregation memory held by others (`503`), since start, and the
+    /// bytes of that pool reserved now (ADR-269). Totals for the member.
+    pub aggregate_limit_refusals: u64,
+    pub aggregate_pool_refusals: u64,
+    pub aggregate_pool_used_bytes: u64,
     /// Entries held as state that a sync window released, since start
     /// (`Engine::held_marks_released`, ADR-169's addendum).
     pub held_marks_released: u64,
@@ -419,6 +425,10 @@ pub struct MetricsSnapshot {
     pub validation_warnings: u64,
     pub validation_refusals: u64,
     pub validators_unparseable: u64,
+    /// As [`StorageReadings::aggregate_limit_refusals`] and its two neighbours (ADR-269).
+    pub aggregate_limit_refusals: u64,
+    pub aggregate_pool_refusals: u64,
+    pub aggregate_pool_used_bytes: u64,
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
     pub webhook_events: u64,
@@ -1453,6 +1463,9 @@ impl Metrics {
             validation_warnings: readings.validation_warnings,
             validation_refusals: readings.validation_refusals,
             validators_unparseable: readings.validators_unparseable,
+            aggregate_limit_refusals: readings.aggregate_limit_refusals,
+            aggregate_pool_refusals: readings.aggregate_pool_refusals,
+            aggregate_pool_used_bytes: readings.aggregate_pool_used_bytes,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -2234,6 +2247,7 @@ impl Metrics {
         render_sync_serve(&mut out, &readings.serve);
         render_violations(&mut out, &readings.violations);
         render_validation(&mut out, readings);
+        render_aggregate_memory(&mut out, readings);
         render_ownership(&mut out, &readings.ownership);
         out
     }
@@ -2535,6 +2549,29 @@ fn render_validation(out: &mut String, readings: &StorageReadings) {
          # TYPE kimmy_validator_unparseable_total counter\n\
          kimmy_validator_unparseable_total {}\n",
         readings.validation_warnings, readings.validation_refusals, readings.validators_unparseable,
+    );
+}
+
+/// What aggregations hold (ADR-269): the requests refused for passing their own memory
+/// limit and for finding the node's pool held by others, and the pool's bytes reserved now.
+/// Totals for the member, with nothing named.
+fn render_aggregate_memory(out: &mut String, readings: &StorageReadings) {
+    use std::fmt::Write;
+
+    let _ = write!(
+        out,
+        "# HELP kimmy_aggregate_memory_limit_refusals_total Aggregations refused with 413 because what they held passed aggregate.memory_limit_bytes. The message names what held the memory. Counted on the member that refused, since start.\n\
+         # TYPE kimmy_aggregate_memory_limit_refusals_total counter\n\
+         kimmy_aggregate_memory_limit_refusals_total {}\n\
+         # HELP kimmy_aggregate_memory_pool_refusals_total Aggregations refused with 503 because the node's pool of aggregation memory (aggregate.memory_pool_bytes) was held by other requests. Counted on the member that refused, since start.\n\
+         # TYPE kimmy_aggregate_memory_pool_refusals_total counter\n\
+         kimmy_aggregate_memory_pool_refusals_total {}\n\
+         # HELP kimmy_aggregate_memory_pool_used_bytes The BSON bytes of the pool of aggregation memory reserved by running aggregations now.\n\
+         # TYPE kimmy_aggregate_memory_pool_used_bytes gauge\n\
+         kimmy_aggregate_memory_pool_used_bytes {}\n",
+        readings.aggregate_limit_refusals,
+        readings.aggregate_pool_refusals,
+        readings.aggregate_pool_used_bytes,
     );
 }
 
@@ -3216,6 +3253,9 @@ mod tests {
             validation_warnings: 1_601,
             validation_refusals: 1_602,
             validators_unparseable: 1_603,
+            aggregate_limit_refusals: 1_611,
+            aggregate_pool_refusals: 1_612,
+            aggregate_pool_used_bytes: 1_613,
         }
     }
 
@@ -4162,6 +4202,15 @@ kimmy_validation_refusals_total 1602
 # HELP kimmy_validator_unparseable_total Stored validators this build could not parse, each counted when first read. The collection is not validated until its validator is replaced or removed, and the cause is logged at error: a build that changed the $jsonSchema dialect under a stored validator.
 # TYPE kimmy_validator_unparseable_total counter
 kimmy_validator_unparseable_total 1603
+# HELP kimmy_aggregate_memory_limit_refusals_total Aggregations refused with 413 because what they held passed aggregate.memory_limit_bytes. The message names what held the memory. Counted on the member that refused, since start.
+# TYPE kimmy_aggregate_memory_limit_refusals_total counter
+kimmy_aggregate_memory_limit_refusals_total 1611
+# HELP kimmy_aggregate_memory_pool_refusals_total Aggregations refused with 503 because the node's pool of aggregation memory (aggregate.memory_pool_bytes) was held by other requests. Counted on the member that refused, since start.
+# TYPE kimmy_aggregate_memory_pool_refusals_total counter
+kimmy_aggregate_memory_pool_refusals_total 1612
+# HELP kimmy_aggregate_memory_pool_used_bytes The BSON bytes of the pool of aggregation memory reserved by running aggregations now.
+# TYPE kimmy_aggregate_memory_pool_used_bytes gauge
+kimmy_aggregate_memory_pool_used_bytes 1613
 # HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block held from the peer's current process: an older version, one not yet heard, or one this member dropped on SWIM down or its own rejoin; an unknown peer is no longer a candidate for webhooks or embeddings); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.
 # TYPE kimmy_ownership_peers gauge
 kimmy_ownership_peers{state=\"eligible\"} 1501
@@ -4639,6 +4688,18 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         expect(&format!("kimmy_validation_warnings_total {}\n", s.validation_warnings));
         expect(&format!("kimmy_validation_refusals_total {}\n", s.validation_refusals));
         expect(&format!("kimmy_validator_unparseable_total {}\n", s.validators_unparseable));
+        expect(&format!(
+            "kimmy_aggregate_memory_limit_refusals_total {}\n",
+            s.aggregate_limit_refusals
+        ));
+        expect(&format!(
+            "kimmy_aggregate_memory_pool_refusals_total {}\n",
+            s.aggregate_pool_refusals
+        ));
+        expect(&format!(
+            "kimmy_aggregate_memory_pool_used_bytes {}\n",
+            s.aggregate_pool_used_bytes
+        ));
 
         expect(&format!("kimmy_embed_documents_total {}\n", s.embed_documents_embedded));
         expect(&format!("kimmy_embed_chunks_total {}\n", s.embed_chunks_embedded));
@@ -4973,6 +5034,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // Local writes an index refused because it could not key the
                 // document (ADR-258).
                 + 1
+                // The aggregations refused for their own limit and for the pool,
+                // and the pool's bytes in use (ADR-269).
+                + 3
                 // Peers by state, and the peers a yielding class waits on
                 // (ADR-201).
                 + kimmy_cluster::PeerState::ALL.len()

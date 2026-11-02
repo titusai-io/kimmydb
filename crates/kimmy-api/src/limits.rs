@@ -119,6 +119,64 @@ impl Default for RequestLimits {
     }
 }
 
+/// The bytes one aggregation may hold at once in a state nobody has given limits to (tests and
+/// embedders): 1 GiB. A member sets the figures `kimmyd` derives from its memory instead.
+pub const DEFAULT_AGGREGATE_MEMORY_LIMIT_BYTES: usize =
+    kimmy_query::budget::DEFAULT_MEMORY_LIMIT_BYTES;
+
+/// The bytes all aggregations on a node may hold together in a state nobody has given limits
+/// to: 2 GiB. A member sets the figures `kimmyd` derives from its memory instead.
+pub const DEFAULT_AGGREGATE_MEMORY_POOL_BYTES: usize =
+    kimmy_query::budget::DEFAULT_MEMORY_POOL_BYTES;
+
+/// What aggregations may hold in memory (ADR-269): the bytes one request may hold at
+/// once (`aggregate.memory_limit_bytes`), and the pool all concurrent aggregations on
+/// the node draw on together (`aggregate.memory_pool_bytes`).
+///
+/// Held by the shared state, because the pool is the node's: a pool each request carried
+/// would bound nothing across requests. Each request makes its own budget from it with
+/// [`Self::limits`].
+#[derive(Clone, Debug)]
+pub struct AggregateMemory {
+    pool: kimmy_query::budget::MemoryPool,
+    limit: usize,
+}
+
+impl AggregateMemory {
+    /// A request limit of `limit` bytes and a pool of `pool` bytes.
+    pub fn new(limit: usize, pool: usize) -> Self {
+        Self { pool: kimmy_query::budget::MemoryPool::new(pool), limit }
+    }
+
+    /// The limits of one aggregation: the default document ceiling and a fresh budget of
+    /// the request limit, reserving what it holds from the pool.
+    pub fn limits(&self) -> kimmy_query::aggregate::Limits {
+        let buffer = kimmy_query::budget::BufferBudget::pooled(self.limit, &self.pool);
+        // A request that waits for the pool (it is older than another that holds bytes)
+        // waits no longer than the request has left: at the deadline it is refused, `503`.
+        if let Some(left) = request_time_left() {
+            buffer.wait_until(std::time::Instant::now() + left);
+        }
+        kimmy_query::aggregate::Limits { buffer, ..Default::default() }
+    }
+
+    /// The bytes one request may hold.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The pool every aggregation draws on.
+    pub fn pool(&self) -> &kimmy_query::budget::MemoryPool {
+        &self.pool
+    }
+}
+
+impl Default for AggregateMemory {
+    fn default() -> Self {
+        Self::new(DEFAULT_AGGREGATE_MEMORY_LIMIT_BYTES, DEFAULT_AGGREGATE_MEMORY_POOL_BYTES)
+    }
+}
+
 tokio::task_local! {
     /// When the request this task serves must be answered by: set by
     /// [`enforce_timeout`] for the handler it wraps, or by
@@ -308,6 +366,63 @@ async fn drain(mut body: Body, bound: usize) {
         debug!(drained, bound, "request body drain hit its deadline before the 413 was sent");
     } else if drained >= bound && !body.is_end_stream() {
         debug!(drained, bound, "request body drain hit its cap before the 413 was sent");
+    }
+}
+
+/// The size of the pieces an answer is handed to hyper in.
+pub(crate) const ANSWER_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A response body that holds `hold` until the body has been sent or is dropped.
+///
+/// An aggregation's answer is built, serialised and then written to the client, and the
+/// client may be slow: the bytes of the answer are alive until the last of them is sent.
+/// The memory lease of the answer (ADR-269) rides in this wrapper, so a big answer still
+/// being sent counts against the node's pool, and is given back when the body ends, when
+/// the response is dropped unsent, and when the client disconnects (hyper drops the body).
+///
+/// The answer is handed over in pieces of [`ANSWER_CHUNK_BYTES`], slices of the one
+/// buffer (nothing is copied), and the hold goes back only when the last piece has been
+/// taken. A body yielded whole would be taken by hyper at the first poll, and the hold
+/// would go back while the bytes still sat in hyper's write queue; hyper polls the next
+/// piece only when its write buffer has room, that is when the socket has taken the
+/// ones before. What is left uncounted at the end is what hyper holds then: its write
+/// buffer (400 KiB by default) and the last piece.
+pub(crate) struct HeldBody<H> {
+    rest: Bytes,
+    hold: Option<H>,
+}
+
+impl<H> HeldBody<H> {
+    /// `bytes` as a response body that keeps `hold` until it is done with.
+    pub(crate) fn new(bytes: Bytes, hold: H) -> Self {
+        Self { rest: bytes, hold: Some(hold) }
+    }
+}
+
+impl<H: Unpin> HttpBody for HeldBody<H> {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.rest.is_empty() {
+            // Everything has been handed over: nothing is held any more.
+            this.hold = None;
+            return Poll::Ready(None);
+        }
+        let piece = this.rest.split_to(this.rest.len().min(ANSWER_CHUNK_BYTES));
+        Poll::Ready(Some(Ok(Frame::data(piece))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.rest.len() as u64)
     }
 }
 
@@ -567,6 +682,127 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    /// A request that waits for the pool (it is older than another that holds bytes) waits no
+    /// longer than the request has left, and is then refused `503` (ADR-269).
+    #[tokio::test]
+    async fn a_request_waiting_for_the_pool_gives_up_at_its_deadline() {
+        let memory = AggregateMemory::new(100, 100);
+        let pool = memory.pool().clone();
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let err = as_a_request(deadline, Duration::from_millis(200), async {
+            let older = memory.limits();
+            let mut lease = older.buffer.lease("the source read");
+            lease.charge(10).unwrap();
+            // A younger request takes most of what is left, and keeps it.
+            let younger = memory.limits();
+            let mut held = younger.buffer.lease("the source read");
+            held.charge(85).unwrap();
+            let err = lease.charge(50).unwrap_err();
+            (err, held)
+        })
+        .await;
+        let (err, held) = err;
+        assert!(matches!(err, kimmy_core::Error::MemoryBusy { .. }), "{err:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(150) && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        drop(held);
+        assert_eq!((pool.used(), pool.holders()), (0, 0));
+    }
+
+    /// The answer's bytes stay in the pool until the body has been sent (ADR-269).
+    #[tokio::test]
+    async fn a_response_body_keeps_its_hold_until_it_is_sent_or_dropped() {
+        let pool = kimmy_query::budget::MemoryPool::new(1_000);
+        let held = |bytes: usize| {
+            let budget = kimmy_query::budget::BufferBudget::pooled(1_000, &pool);
+            let mut lease = budget.lease("the answer");
+            lease.charge(bytes).unwrap();
+            lease
+        };
+
+        // Unread: still charged. Read to the end: given back.
+        let body = Body::new(HeldBody::new(Bytes::from_static(b"{\"documents\":[]}"), held(600)));
+        assert_eq!(pool.used(), 600);
+        assert_eq!(body.size_hint().exact(), Some(16));
+        let sent = body.collect().await.unwrap().to_bytes();
+        assert_eq!(&sent[..], b"{\"documents\":[]}");
+        assert_eq!(pool.used(), 0, "a body that was sent gives its bytes back");
+
+        // Read to its end but still alive (a connection kept open): nothing is held any more.
+        let mut body = Body::new(HeldBody::new(Bytes::from_static(b"abc"), held(500)));
+        assert_eq!(pool.used(), 500);
+        while body.frame().await.is_some() {}
+        assert_eq!(pool.used(), 0, "a body whose last frame went out holds nothing");
+        drop(body);
+
+        // Partly read, then abandoned (the client went away): given back on drop.
+        let mut body = Body::new(HeldBody::new(Bytes::from_static(b"abc"), held(700)));
+        assert_eq!(pool.used(), 700);
+        let first = body.frame().await;
+        assert!(first.is_some());
+        drop(body);
+        assert_eq!(pool.used(), 0, "a body dropped before the end gives its bytes back");
+
+        // Never polled at all: a second request is refused meanwhile, and answered after.
+        let unsent = Body::new(HeldBody::new(Bytes::from_static(b"abc"), held(600)));
+        let other = kimmy_query::budget::BufferBudget::pooled(1_000, &pool);
+        assert!(other.lease("another answer").charge(600).is_err());
+        drop(unsent);
+        other.lease("another answer").charge(600).unwrap();
+    }
+
+    /// The answer goes to hyper in pieces of one buffer, and its hold goes back with the
+    /// last of them (ADR-269).
+    #[tokio::test]
+    async fn an_answer_is_handed_over_in_slices_of_one_buffer_and_held_to_the_last() {
+        let pool = kimmy_query::budget::MemoryPool::new(1_000);
+        let budget = kimmy_query::budget::BufferBudget::pooled(1_000, &pool);
+        let mut lease = budget.lease("the answer");
+        lease.charge(900).unwrap();
+
+        let whole = Bytes::from(vec![7u8; 3 * ANSWER_CHUNK_BYTES + 10]);
+        let start = whole.as_ptr() as usize;
+        let mut body = Body::new(HeldBody::new(whole.clone(), lease));
+        assert_eq!(body.size_hint().exact(), Some(3 * ANSWER_CHUNK_BYTES as u64 + 10));
+        let mut sizes = Vec::new();
+        let mut offset = 0usize;
+        while let Some(frame) = body.frame().await {
+            let data = frame.unwrap().into_data().unwrap();
+            // A slice of the answer's own buffer, not a copy of it.
+            assert_eq!(data.as_ptr() as usize, start + offset);
+            offset += data.len();
+            sizes.push(data.len());
+            if offset < whole.len() {
+                assert_eq!(pool.used(), 900, "held while pieces are still to be taken");
+                assert!(!body.is_end_stream());
+            }
+        }
+        assert_eq!(sizes, [ANSWER_CHUNK_BYTES, ANSWER_CHUNK_BYTES, ANSWER_CHUNK_BYTES, 10]);
+        assert_eq!(pool.used(), 0);
+
+        // The last piece is taken and the body is dropped (hyper does, at the end of a body
+        // it knows to be done): given back, with the pieces still alive in the write queue
+        // they were taken into.
+        let lease = {
+            let mut lease = budget.lease("the answer");
+            lease.charge(900).unwrap();
+            lease
+        };
+        let mut body = Body::new(HeldBody::new(whole.clone(), lease));
+        let mut taken = Vec::new();
+        while !body.is_end_stream() {
+            taken.push(body.frame().await.unwrap().unwrap().into_data().unwrap());
+        }
+        assert_eq!(taken.len(), 4);
+        drop(body);
+        assert_eq!(pool.used(), 0);
+        assert_eq!(taken.iter().map(Bytes::len).sum::<usize>(), whole.len());
     }
 
     #[test]

@@ -288,6 +288,7 @@ pub(crate) fn merge_into(into: &mut Document, budget: &mut DocBudget, value: &Bs
         Bson::Document(d) => {
             for (k, v) in d {
                 budget.set(k, into.get(k).map(bson_bytes), v)?;
+                budget.account_held(into.len(), k, into.get(k), v);
                 into.insert(k.clone(), v.clone());
             }
             Ok(())
