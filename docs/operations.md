@@ -133,8 +133,8 @@ it is legal. Two settings bound it ([ADR-269](decisions.md)), both in BSON bytes
 - **`aggregate.memory_limit_bytes`** is what **one request** may hold at once. Over it the
   request is refused `413 answer_too_large`, naming what held the memory (the source read, a stage's
   output, a join, the answer), the bytes and the limit. It is a fact about the request: sending it
-  again changes nothing until the pipeline asks for less (`$match`, `$project` or `$limit` early) or
-  the limit is raised.
+  again changes nothing until the pipeline asks for less (a leading `$match` narrows what is read;
+  `$project`, `$limit` or `$match` after it reduce what later stages hold) or the limit is raised.
 - **`aggregate.memory_pool_bytes`** is what **all aggregations on the node** may hold together.
   A request takes from it as it grows and returns it however it ends; an answer still being sent keeps its bytes until the last of them is written. One that finds it empty is
   refused `503 timeout`, `retry: wait`, `Retry-After: 1`: nothing was done, and the same request
@@ -166,6 +166,43 @@ holds; `kimmy_aggregate_memory_limit_refusals_total` is pipelines that need more
 have. A pipeline that ran under 0.58 and holds more than the limit is refused now: that is the
 breaking line in the CHANGELOG.
 
+#### What the limit refuses today
+
+What the derived figures are, for the usual container sizes:
+
+| Container memory | Pool (`aggregate.memory_pool_bytes`) | One request (`aggregate.memory_limit_bytes`) |
+|---|---|---|
+| 2 GiB | 214,748,364 (205 MiB) | 107,374,182 (102 MiB) |
+| 8 GiB | 858,993,459 (819 MiB) | 429,496,729 (410 MiB) |
+| 16 GiB | 1,717,986,918 (1.6 GiB) | 858,993,459 (819 MiB) |
+
+**The source read is charged whole, before any stage runs.** Only a leading `$match` narrows it (an
+indexed equality or range reads its candidates and not the collection); the executor reads
+everything else, then runs the stages over it. So a stage that would only have counted, limited or
+grouped what it read still cannot run if the collection is above the per-request limit: `[{$count:
+"n"}]`, `[{$limit: 5}]`, `[{$sort: ..}, {$limit: 10}]` and `[{$group: {_id: "$k", n: {$sum: 1}}}]`
+are `413` at "the source read" over a collection above about 102 MiB of BSON on a 2 GiB member (about
+200,000 documents of 550 bytes), and above 410 MiB on an 8 GiB one. The reference streams every one
+of them. A stage that builds holds its input beside its output, so `$addFields` (and `$project`,
+`$replaceRoot`, `$unwind`) over more than about half the limit is refused as well: 100,000 documents of
+4 KiB (410 MB, about 824 MB held at the peak) run only in a container of about 15.4 GiB or more, or
+under an explicit `aggregate.memory_limit_bytes` of 1 GiB.
+
+What to do about a `413` from the limit:
+
+- **Narrow the source with a leading `$match`** (`{_id: {$gte: .., $lt: ..}}` or an indexed field).
+  Only the leading run of `$match` stages narrows the read; a `$match`, `$project` or `$limit` after
+  another stage reduces what the **later** stages hold and not what was read. To process a large
+  collection, run the pipeline over `_id` ranges and combine the answers in the client.
+- **Reduce what the later stages hold**: a `$project` that drops large fields before a `$group`,
+  `$sort` or `$lookup`, a `$limit` before a stage that builds.
+- **Raise `aggregate.memory_limit_bytes`** (and `aggregate.memory_pool_bytes` with it, which must be at
+  least the limit), knowing what a request really costs: 2.5 to 5 times its BSON, as above.
+
+The streaming executor planned for 0.60.0 removes the limitation: the stages that do not block
+stream, so a source is not charged whole and `[{$count}]` or `[{$limit: 5}]` over a large collection
+run in constant memory ([Deviations](deviations.md)).
+
 ### Refused at startup
 
 These are configuration errors, caught before serving rather than surfacing as
@@ -195,8 +232,8 @@ runtime confusion:
 | `max_tracked_keys = 0` | A limiter that can remember nothing cannot limit anything |
 | `request_timeout_secs = 0` | A deadline of zero would abandon every request that has to wait for its own body |
 | `max_body_bytes = 0` | A ceiling of zero refuses every request that carries a body, login included |
-| `aggregate.memory_limit_bytes` | `KIMMY_AGGREGATE_MEMORY_LIMIT_BYTES` | half the pool | The most BSON bytes one aggregation may hold at once: the documents it reads, each stage's input and output while the stage runs, the groups and joined arrays it builds, and its answer ([Aggregation](aggregation.md#what-one-request-may-hold-in-bytes)). Over it, `413 answer_too_large` naming what held the memory, at the first byte over. At least 1 MiB. **Unset, it is derived** (see [Aggregation memory](#aggregation-memory)); an explicit value wins. **Breaking in 0.59.0**: a pipeline whose held bytes pass the limit ran before and is refused now |
-| `aggregate.memory_pool_bytes` | `KIMMY_AGGREGATE_MEMORY_POOL_BYTES` | a tenth of the memory | The most BSON bytes all aggregations on this node may hold together. A request reserves from it as its own total grows and returns it when it ends; one the pool cannot cover is answered `503 timeout` with `retry: wait` and `Retry-After: 1`. At least `aggregate.memory_limit_bytes`. **Unset, it is a tenth of the container's memory limit** (cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`) **or, with none, of the machine's RAM**; the startup log says which. See [Aggregation memory](#aggregation-memory) |
+| `aggregate.memory_limit_bytes` or `aggregate.memory_pool_bytes` under 1 MiB | A request that may hold less than a megabyte, or a pool that cannot hold one, refuses every aggregation that reads a document |
+| `aggregate.memory_pool_bytes` under an explicitly set `aggregate.memory_limit_bytes` | A request could be within its limit and never fit the pool |
 | Exactly one of `server.tls.cert_file` / `key_file` | The node would start and serve plaintext on a port an operator believes is encrypted |
 | A TLS certificate or key that is missing or unreadable | The failure would otherwise land on the first client to connect, not on the operator watching the boot |
 | An empty `trusted_proxy_header` | Reads as a header whose name is empty, so it never matches — an operator would believe forwarding was configured when it was not |
@@ -1251,7 +1288,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_validation_warnings_total` | Writes this member accepted although they fail their collection's validator, because its `validationAction` is `warn` ([ADR-257](decisions.md), [Validators](validation.md)). A total with no collection named, as every series here is; each is also logged at `WARN` with the collection and the reason, at most one line a second per collection. Nonzero is data that no longer matches what its owner wrote down; find it with `GET …/validator/violations`. On the OTLP bridge, `kimmy.validation.warnings` |
 | `kimmy_validation_refusals_total` | Writes this member refused with `422 validation_failed` because they fail their collection's validator and its `validationAction` is `error`. A rise after a deploy is a client sending what the schema forbids; the refusal itself is not logged, as no refusal the caller can read in full is. On the OTLP bridge, `kimmy.validation.refusals` |
 | `kimmy_validator_unparseable_total` | Stored validators this build could not parse, each counted when first read. Always 0 unless a build changed the `$jsonSchema` dialect under a stored validator. The collection is then **not validated** (it stays writable) until its validator is replaced or removed, and the cause is logged at `ERROR`. On the OTLP bridge, `kimmy.validator.unparseable` |
-| `kimmy_aggregate_memory_limit_refusals_total` | Aggregations this member refused with `413 answer_too_large` because what they held (the documents read, each stage's input and output, groups and joined arrays, the answer) passed `aggregate.memory_limit_bytes`. The refusal names what held the memory. A rise is pipelines that read or build more than a request may hold: ask for less with `$match`, `$project` or `$limit` early, or raise the setting. On the OTLP bridge, `kimmy.aggregate.memory_limit_refusals` |
+| `kimmy_aggregate_memory_limit_refusals_total` | Aggregations this member refused with `413 answer_too_large` because what they held (the documents read, each stage's input and output, groups and joined arrays, the answer) passed `aggregate.memory_limit_bytes`. The refusal names what held the memory. A rise is pipelines that read or build more than a request may hold: narrow the source with a leading `$match`, reduce what later stages hold with `$project`, `$limit` or `$match` after it, or raise the setting. On the OTLP bridge, `kimmy.aggregate.memory_limit_refusals` |
 | `kimmy_aggregate_memory_pool_refusals_total` | Aggregations this member refused with `503 timeout` (`retry: wait`, `Retry-After: 1`) because the node's aggregation memory pool is in use (`aggregate.memory_pool_bytes`, held by other requests). The request was within its own limit and nothing was done; the same request is answered when the others have finished. A rise is more concurrent large aggregations than the pool is sized for. On the OTLP bridge, `kimmy.aggregate.memory_pool_refusals` |
 | `kimmy_aggregate_memory_pool_used_bytes` | The BSON bytes of the pool reserved by running aggregations now (a gauge, 0 when none runs); compare it with `aggregate.memory_pool_bytes`. On the OTLP bridge, `kimmy.aggregate.memory_pool_used_bytes` |
 | `kimmy_ownership_peers{state}` | Live peers as **this member** sees them by the block each last sent on the replication contact ([ADR-201](decisions.md)): `eligible`, `ineligible_catching_up` (the catching-up marker is set; no class overrides it), `ineligible_yielding` (at least one class given up), `unknown` (no block yet: an older version, or not yet heard; after a member comes up or restarts, or this member rejoins, about one contact, since each side asks the other for its block at once, at most once per member per sync interval, and at the interval's end for one that came within it, [ADR-247](decisions.md)) and `stale` (a block past its lease, which keeps saying what it last said: not hearing from a member is not evidence that it recovered). Every state is always present. Views differ while blocks converge, so compare members after a lease, never a single scrape. The lease is `ceil(peers / cluster.fanout) + 2` sync intervals. On the OTLP bridge, `kimmy.ownership.peers.<state>` |

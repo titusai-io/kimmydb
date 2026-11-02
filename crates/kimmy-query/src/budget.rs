@@ -31,15 +31,23 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bson::Document;
 use kimmy_core::{Error, Result};
 
-/// The default bytes one aggregation may hold at once: 1 GiB (`aggregate.memory_limit_bytes`).
+/// What a `Default` budget may hold at once: 1 GiB. A fallback for tests and for code that
+/// embeds the library; **a member does not run on it**: `kimmyd` derives
+/// `aggregate.memory_limit_bytes` and `aggregate.memory_pool_bytes` from the memory it runs
+/// under (a pool of a tenth of it, a request half of the pool) and sets them at startup.
 pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 
-/// The default bytes all concurrent aggregations on a node may hold together: 2 GiB
-/// (`aggregate.memory_pool_bytes`).
+/// What a `Default` node-wide pool holds: 2 GiB, twice [`DEFAULT_MEMORY_LIMIT_BYTES`]. The
+/// same fallback, not what a member runs on.
 pub const DEFAULT_MEMORY_POOL_BYTES: usize = 2 * DEFAULT_MEMORY_LIMIT_BYTES;
 
 /// What a refusal tells the caller to do about a request over its limit.
-const REMEDY: &str = "add $match, $project or $limit early, or raise aggregate.memory_limit_bytes";
+///
+/// Only a leading `$match` narrows what the source reads (the executor reads the whole
+/// collection otherwise, and charges it before any stage runs); a `$project`, `$limit` or
+/// `$match` after it reduces what the later stages hold.
+const REMEDY: &str = "a leading $match narrows what is read; $project, $limit or $match after it \
+                      reduce what later stages hold; or raise aggregate.memory_limit_bytes";
 
 /// The BSON size of `doc`, worked out without encoding it.
 pub fn doc_bytes(doc: &Document) -> usize {

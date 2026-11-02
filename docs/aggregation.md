@@ -628,10 +628,10 @@ the upper (`400`).
 | `$sum`, `$avg`, `$min`, `$max`, `$count` (`{}`), `$push`, `$addToSet`, `$first`, `$last`, `$stdDevPop`, `$stdDevSamp`, `$top`, `$bottom`, `$topN`, `$bottomN`, `$firstN`, `$lastN`, `$maxN`, `$minN` | optional, default the whole partition | what the same [accumulator](#accumulators) answers over the documents of the window; an empty window answers what an empty group does (`0` for `$sum` and `$count`, `[]` for `$push`, `null` for the rest). `$push` and `$addToSet` skip a missing value; `$first` and `$last` of a missing value **leave the field out**; `$max` of equal values keeps the last and `$min` the first. A deviation of one value is an integer `0` |
 | `$covariancePop`, `$covarianceSamp` `[x, y]` | optional | the covariance of the pairs of the window; a pair with a member that is not a number is skipped, one value is `0` (population, a double) or `null` (sample), none is `null` |
 | `$rank`, `$denseRank`, `$documentNumber` (`{}`) | none | an int: the rank with gaps after ties (`1, 2, 2, 4`), without (`1, 2, 2, 3`), the position (`1, 2, 3, 4`; ties in arrival order). Documents tie when the one `sortBy` value is the same (a missing value is not a null one). Need a `sortBy` of **exactly one field** |
-| `$shift` `{output, by, default}` | none | `output` evaluated on the document `by` places after the current one (`-1` before) in the partition, or `default` (a constant; `null` if absent) beyond its ends; a document with no value leaves the field out. `by` is a whole number that fits 32 bits. Needs `sortBy` |
+| `$shift` `{output, by, default}` | none | `output` evaluated on the document `by` places after the current one (`-1` before) in the partition, or `default` (a constant; `null` if absent) beyond its ends; a document with no value leaves the field out. `by` is a whole number that fits 32 bits. Needs `sortBy`, and `sortBy: {}` is one (the documents are taken in the order they arrive) |
 | `$derivative` `{input, unit}` | **required** | the slope between the first and the last document of the window: a double, `null` if the window has one document or the two sort values are equal. A date `sortBy` takes `unit` (`week` to `millisecond`) for the time axis, milliseconds if absent; a numeric `sortBy` refuses it |
 | `$integral` `{input, unit}` | **required** | the trapezoid-rule area under `input` over the window, summed exactly: a double; over a number line, an integer `0` for fewer than two documents (a double `0.0` over dates) |
-| `$expMovingAvg` `{input, N}` or `{input, alpha}` | none | the exponentially weighted mean to the current document, `alpha = 2/(N+1)`, worked in `Decimal128` to 34 digits as `x * alpha + (1 - alpha) * previous` and answered as the nearest double (a double read as a decimal is rounded to 15 digits, as the reference reads it), so `N: 2` over `[1, 2]` is `1.6666666666666667`; exactly one of `N` (a whole number, at least 1) and `alpha` (above 0, below 1). A document whose input is not a number answers the average it has (`null` before the first number) and does not move it |
+| `$expMovingAvg` `{input, N}` or `{input, alpha}` | none | the exponentially weighted mean to the current document, `alpha = 2/(N+1)`, worked in `Decimal128` to 34 digits as `x * alpha + (1 - alpha) * previous` and answered as the nearest double (a double read as a decimal is rounded to 15 digits, as the reference reads it), so `N: 2` over `[1, 2]` is `1.6666666666666667`; exactly one of `N` (a whole number, at least 1) and `alpha` (above 0, below 1). `sortBy: {}` is accepted and the documents are taken in the order they arrive. A document whose input is not a number answers the average it has (`null` before the first number) and does not move it |
 | `$locf` `<expression>`, `$linearFill` `<expression>` | none | `$locf`: the last non-null value so far (`null` before one), **in arrival order when there is no `sortBy`**. `$linearFill`: for a null or missing value, the straight line between the nearest non-null values on each side by the one numeric or date `sortBy` field (`null` outside them); `400` if two documents have the same sort value; a `Decimal128` end interpolates in decimal. Both are what [`$fill`](#fill) runs |
 
 `$derivative` and `$integral` need a `sortBy` of one field that is numeric or a date in every
@@ -716,6 +716,12 @@ expression, as the reference needs) and `partitionByFields` (field paths).
   the one `sortBy` field (a number or a date; `400` for two documents with the same value, or for a value
   that is not a number; a `Decimal128` end interpolates in decimal). Leading and trailing gaps stay `null`.
   `linear` needs `sortBy` of exactly one field; `sortBy: {}` is no sort.
+- A `value` that **reaches nothing** (a field path to a field the document lacks, or `$$REMOVE`) fills
+  nothing: a **missing** field stays missing, and a field that holds an explicit **`null` is removed**, as
+  the reference does.
+- With `partitionByFields`, a document that **lacks** a partition field is in a different partition from
+  one that holds `null` there, and the missing partition leaves **first**, then the null one (the
+  reference's order). [`$densify`](#densify) keeps `null` first.
 - Methods run as a [`$setWindowFields`](#setwindowfields) with `$locf` and `$linearFill`: the documents
   leave partition by partition, the partitions in ascending order of their values, each sorted. A `$fill`
   with only `value` fields buffers nothing and **keeps the order of its input**.
@@ -2235,8 +2241,15 @@ as it grows, and the request is refused `413 answer_too_large` at the first byte
 | **The answer** | the output documents and the JSON each becomes (its serialised length), document by document, so an answer that would pass the limit is refused before the rest is built; once built, the documents' bytes are given back and the JSON's are kept | the response body has been written or dropped (the client went away) |
 
 A stage's input stays charged until it returns, so `$addFields` over 400 MB of documents peaks at
-about 800 MB, and 100,000 documents of 4 KB run at the default. The `413` carries the total held
-and the limit, and says what to do: `add $match, $project or $limit early, or raise aggregate.memory_limit_bytes`.
+about 800 MB. 100,000 documents of 4 KB (410 MB) therefore run through `$addFields` under an
+explicit limit of 1 GiB, and under the derived limit only in a container of about 15.4 GiB or more:
+a 2 GiB member refuses them at the source read, an 8 GiB one at `$addFields`. **The source read is
+charged whole before any stage runs**, and only a leading `$match` narrows it, so `[{$count}]`,
+`[{$limit: 5}]`, `[{$sort}, {$limit}]` and `[{$group}]` over a collection above the limit (about 102 MiB
+of BSON on a 2 GiB member) are refused too; [Operations](operations.md#aggregation-memory) has the
+figures and what to do, and [Deviations](deviations.md) the reference's behaviour. The `413` carries
+the total held and the limit, and says what to do: `a leading $match narrows what is read;
+$project, $limit or $match after it reduce what later stages hold; or raise aggregate.memory_limit_bytes`.
 `$facet`'s own 16 MiB cap on its answer, and the 16 MiB bound on one string, array or document an
 expression builds, are unchanged: they are per value.
 

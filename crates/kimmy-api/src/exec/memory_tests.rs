@@ -207,7 +207,10 @@ fn a_sink_is_charged_for_the_documents_it_writes() {
 #[test]
 fn a_request_draws_on_the_nodes_pool_and_gives_it_back() {
     let dir = tempfile::tempdir().unwrap();
-    // About 1 MB of documents, a request limit of 3 MB (documents and JSON) and a pool of 3.5 MB.
+    // About 1 MB of documents, a request limit of 3 MB (documents and JSON) and a pool of 3.5
+    // MB: an explicit pool under twice the limit, so one other request can fill what is left.
+    // (At the derived ratio, a pool of twice the limit, it takes two others: the HTTP test
+    // `with_the_derived_ratio_a_third_request_is_the_first_the_pool_refuses`.)
     let state = state_with(&dir, padded(10, 100_000), vec![]);
     state.set_aggregate_memory(AggregateMemory::new(3_000_000, 3_500_000));
     let pool = state.aggregate_memory().pool().clone();

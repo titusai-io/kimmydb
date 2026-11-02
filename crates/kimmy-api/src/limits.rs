@@ -100,13 +100,13 @@ impl Default for RequestLimits {
     }
 }
 
-/// The bytes one aggregation may hold at once unless `aggregate.memory_limit_bytes` says
-/// otherwise: 1 GiB.
+/// The bytes one aggregation may hold at once in a state nobody has given limits to (tests and
+/// embedders): 1 GiB. A member sets the figures `kimmyd` derives from its memory instead.
 pub const DEFAULT_AGGREGATE_MEMORY_LIMIT_BYTES: usize =
     kimmy_query::budget::DEFAULT_MEMORY_LIMIT_BYTES;
 
-/// The bytes all aggregations on a node may hold together unless
-/// `aggregate.memory_pool_bytes` says otherwise: 2 GiB.
+/// The bytes all aggregations on a node may hold together in a state nobody has given limits
+/// to: 2 GiB. A member sets the figures `kimmyd` derives from its memory instead.
 pub const DEFAULT_AGGREGATE_MEMORY_POOL_BYTES: usize =
     kimmy_query::budget::DEFAULT_MEMORY_POOL_BYTES;
 

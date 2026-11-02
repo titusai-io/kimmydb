@@ -20664,7 +20664,8 @@ async fn an_aggregation_over_its_memory_limit_is_a_413_at_a_bounded_size() {
     // It names what held the memory, the limit, and what to do.
     assert!(message.contains("the output of $addFields"), "{message}");
     assert!(message.contains("limit of 8388608 bytes"), "{message}");
-    assert!(message.contains("add $match, $project or $limit early"), "{message}");
+    assert!(message.contains("a leading $match narrows what is read"), "{message}");
+    assert!(message.contains("$project, $limit or $match after it reduce"), "{message}");
     assert!(message.contains("raise aggregate.memory_limit_bytes"), "{message}");
     // Bounded: it was refused at the first document that passed the limit, with about
     // eight of forty strings built, not after all of them.
@@ -20804,8 +20805,11 @@ async fn the_source_read_stops_at_the_document_that_passes_the_limit() {
     assert_eq!(reached.status, 400, "{}", reached.message);
 }
 
+// The pool here is an explicit 10 MiB under twice the 8 MiB limit, so one other request that
+// holds 6 MiB is enough to meet it. At the derived ratio (a pool of twice the limit) it takes
+// two others: see `with_the_derived_ratio_a_third_request_is_the_first_the_pool_refuses`.
 #[tokio::test]
-async fn an_aggregation_the_pool_cannot_cover_is_a_503_that_says_to_retry() {
+async fn an_aggregation_the_pool_cannot_cover_with_an_explicit_pool_is_a_503_that_says_to_retry() {
     let server = Server::start().await;
     server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(8 << 20, 10 << 20));
     let token = server.root().await;
@@ -20852,6 +20856,44 @@ async fn an_aggregation_the_pool_cannot_cover_is_a_503_that_says_to_retry() {
     let metrics = server.state.metrics.render_with(&server.state.storage_readings().unwrap());
     assert!(metrics.contains("kimmy_aggregate_memory_pool_refusals_total 1"), "{metrics}");
     assert!(metrics.contains("kimmy_aggregate_memory_limit_refusals_total 0"), "{metrics}");
+}
+
+#[tokio::test]
+async fn with_the_derived_ratio_a_third_request_is_the_first_the_pool_refuses() {
+    // The derived defaults give a request half the pool, so two requests at their limit fill
+    // the pool exactly and never meet it: the pool refuses the third. Two other requests hold
+    // 8 MiB each of a 16 MiB pool (limit 8 MiB), and this one, within its own limit, is a 503.
+    let server = Server::start().await;
+    let (limit, pool_bytes) = (8usize << 20, 16usize << 20);
+    server.state.set_aggregate_memory(kimmy_api::AggregateMemory::new(limit, pool_bytes));
+    let token = server.root().await;
+    zmem_collection(&server, &token, 6).await;
+    let pool = server.state.aggregate_memory().pool().clone();
+
+    let one = server.state.aggregate_memory().limits();
+    let two = server.state.aggregate_memory().limits();
+    let mut first = one.buffer.lease("another request");
+    first.charge(limit).unwrap();
+    // One other request at its limit leaves half the pool: this request is answered.
+    let ok = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), z1_pipeline(10)).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    // Two others at their limits fill it, and the third is told to wait.
+    let mut second = two.buffer.lease("another request");
+    second.charge(limit).unwrap();
+    assert_eq!(pool.used(), pool_bytes);
+    let refused = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), z1_pipeline(10)).await;
+    assert_eq!(refused.status, 503, "{:?}", refused.body);
+    assert_eq!(refused.body["retry"], "wait", "{:?}", refused.body);
+    assert_eq!((pool.pool_refusals(), pool.limit_refusals()), (1, 0));
+    // And the message does not call the pool's whole total what other requests hold.
+    let message = refused.body["message"].as_str().unwrap();
+    assert!(message.contains("reserved now by all requests, this one's included"), "{message}");
+    assert!(!message.contains("other requests hold"), "{message}");
+    drop(first);
+    let ok = server.post("/v1/db/kx/coll/zmem/aggregate", Some(&token), z1_pipeline(10)).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    drop(second);
+    assert_eq!(pool.used(), 0);
 }
 
 #[tokio::test]

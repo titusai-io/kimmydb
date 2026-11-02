@@ -66,7 +66,9 @@ fn a_charge_over_the_cap_is_refused_at_the_byte_and_named() {
     let err = lease.charge(1).unwrap_err();
     let Error::ValueTooLarge { what, bytes, max, remedy, .. } = &err else { panic!("{err:?}") };
     assert_eq!((*what, *bytes, *max), ("the source read", 101, 100));
-    assert!(remedy.contains("add $match, $project or $limit early"), "{remedy}");
+    assert!(remedy.contains("a leading $match narrows what is read"), "{remedy}");
+    assert!(remedy.contains("$project, $limit or $match after it reduce what later stages hold"));
+    assert!(!remedy.contains("early"), "{remedy}");
     assert!(remedy.contains("raise aggregate.memory_limit_bytes"), "{remedy}");
     let text = err.to_string();
     assert!(text.contains("the source read is 101 bytes"), "{text}");
@@ -152,6 +154,10 @@ fn a_request_the_pool_cannot_cover_is_refused_with_a_retry_and_reserves_nothing(
     let text = err.to_string();
     assert!(text.contains("aggregate.memory_pool_bytes"), "{text}");
     assert!(text.contains("retry later"), "{text}");
+    // `in_use` is the pool's total, the refused request's own reservation included, and the
+    // message says so rather than calling it what other requests hold.
+    assert!(text.contains("60 reserved now by all requests, this one's included"), "{text}");
+    assert!(!text.contains("other requests hold"), "{text}");
     assert_eq!((pool.pool_refusals(), pool.limit_refusals()), (1, 0));
     // The refused bytes were not reserved, and the first request still holds its own.
     assert_eq!((second.reserved(), pool.used()), (0, 60));
@@ -163,6 +169,20 @@ fn a_request_the_pool_cannot_cover_is_refused_with_a_retry_and_reserves_nothing(
     let mut again = second.lease("the source read");
     again.charge(50).unwrap();
     assert_eq!(pool.used(), 50);
+}
+
+#[test]
+fn the_pool_total_in_a_refusal_includes_what_the_refused_request_holds() {
+    let pool = MemoryPool::new(100);
+    let other = BufferBudget::pooled(100, &pool);
+    let mut theirs = other.lease("other");
+    theirs.charge(40).unwrap();
+    let mine = BufferBudget::pooled(100, &pool);
+    let mut lease = mine.lease("the input of $sort");
+    lease.charge(30).unwrap();
+    // Another 50 does not fit: 70 are reserved, 30 of them this request's own.
+    let err = lease.charge(50).unwrap_err();
+    assert!(matches!(&err, Error::MemoryBusy { bytes: 50, pool: 100, in_use: 70, .. }), "{err:?}");
 }
 
 #[test]
@@ -686,27 +706,49 @@ fn every_stage_that_builds_is_refused_at_the_document_that_passes_the_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// The numbers at the default limits, without allocating them
+// The numbers at the limits a member runs under, without allocating them
+//
+// A member derives its limits from the memory it runs under (a pool of a tenth of it, a
+// request may hold half the pool: `kimmyd`'s `aggmem`), so the figures below are those of a
+// 2, an 8 and a 16 GiB container. The constants in `budget.rs` are only what a `Limits`
+// made with `Default` falls back on, for tests and embedders.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn the_defaults_are_one_gib_a_request_and_two_gib_a_node() {
-    assert_eq!(DEFAULT_MEMORY_LIMIT_BYTES, 1 << 30);
-    assert_eq!(DEFAULT_MEMORY_POOL_BYTES, 2 << 30);
-    assert_eq!(Limits::default().buffer.cap(), 1 << 30);
+/// The per-request limit and the pool of a container of `memory` bytes, as `aggmem` derives
+/// them: a pool of a tenth, a request a half of the pool.
+fn derived(memory: usize) -> (usize, usize) {
+    let pool = memory / 10;
+    (pool / 2, pool)
 }
 
 #[test]
-fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_the_default_limit() {
+fn the_library_default_is_a_fresh_fallback_budget_and_not_what_a_member_runs_on() {
+    // `Default` is for tests and embedders: a budget of the fallback constant, new each time.
+    assert_eq!(Limits::default().buffer.cap(), DEFAULT_MEMORY_LIMIT_BYTES);
+    assert_eq!(DEFAULT_MEMORY_POOL_BYTES, 2 * DEFAULT_MEMORY_LIMIT_BYTES);
+    let (a, b) = (Limits::default(), Limits::default());
+    let mut held = a.buffer.lease("a");
+    held.charge(10).unwrap();
+    assert_eq!((a.buffer.used(), b.buffer.used()), (10, 0), "each default is its own budget");
+    // The figures a member gets are not the fallback: 2 GiB of memory is a tenth for the pool
+    // and half of that for a request.
+    assert_eq!(derived(2 << 30), (107_374_182, 214_748_364));
+    assert!(derived(2 << 30).0 < DEFAULT_MEMORY_LIMIT_BYTES / 9);
+}
+
+#[test]
+fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_an_explicit_limit_of_one_gib()
+{
     // 100,000 documents of 4 KiB are about 400 MB; `$addFields` holds them and its output,
-    // about 800 MB: under the 1 GiB default. Worked out from real documents, charged
-    // through the real accounts, with nothing allocated.
+    // about 800 MB: under an explicit limit of 1 GiB, which is what this check needs (the
+    // derived limit of a container under about 15.4 GiB refuses it; see the next test). Worked out
+    // from real documents, charged through the real accounts, with nothing allocated.
     let n = 100_000usize;
     let one = doc! {"_id": 1_i32, "pad": "x".repeat(4_096)};
     let mut grown = one.clone();
     grown.insert("flag", true);
     let (size_in, size_out) = (doc_bytes(&one), doc_bytes(&grown));
-    let limits = Limits::default();
+    let limits = Limits { buffer: BufferBudget::new(1 << 30), ..Default::default() };
     let mut input = limits.buffer.lease("the input of $addFields");
     let mut output = limits.buffer.lease("the output of $addFields");
     for _ in 0..n {
@@ -731,39 +773,107 @@ fn a_hundred_thousand_documents_of_four_kib_run_through_add_fields_at_the_defaul
 }
 
 #[test]
-fn a_thousand_documents_of_eight_mib_are_refused_after_a_hundred_and_twenty_eight() {
-    // The reviewer's Z1: 1,000 documents each given an 8 MiB string. The input is small; the
-    // output passes the 1 GiB default at the 128th document, long before 8 GB.
-    let size = 8 * 1024 * 1024 + 20;
-    let limits = Limits::default();
-    let mut output = limits.buffer.lease("the output of $addFields (with its input, still held)");
-    let mut built = 0usize;
-    let err = loop {
-        built += 1;
-        if let Err(e) = output.charge(size) {
-            break e;
+fn a_hundred_thousand_documents_of_four_kib_are_refused_at_the_derived_limits() {
+    // The same 100,000 documents, 410 MB of BSON, against the limit a member derives. The
+    // source read is charged whole before any stage runs and stops at the document that
+    // passes the limit; `$addFields` holds input plus output, so it needs twice the source.
+    let one = doc! {"_id": 1_i32, "pad": "x".repeat(4_096)};
+    let mut grown = one.clone();
+    grown.insert("flag", true);
+    let (size, size_out) = (doc_bytes(&one), doc_bytes(&grown));
+    assert_eq!((size, size_out), (4_120, 4_127));
+    let n = 100_000usize;
+    // About 824 MB are held at the peak, so `$addFields` runs from a container of about
+    // 15.4 GiB (824 MB x 20), and not in 2 or 8 GiB.
+    for (memory, runs) in
+        [(2usize << 30, false), (8 << 30, false), (15 << 30, false), (16 << 30, true)]
+    {
+        let (limit, pool) = derived(memory);
+        let budget = BufferBudget::pooled(limit, &MemoryPool::new(pool));
+        // The source read: the document that passes the limit is the first refused.
+        let mut read = budget.lease("the source read");
+        let mut at = None;
+        for i in 1..=n {
+            if read.charge(size).is_err() {
+                at = Some(i);
+                break;
+            }
         }
-        assert!(built < 1_000, "never refused");
-    };
-    assert_eq!(built, 128, "the 128th document passes 1 GiB");
-    assert!(is_too_large(&err), "{err:?}");
+        let read_fits = at.is_none();
+        // `$addFields` then holds the input again beside what it builds (7 bytes a document
+        // more: the `flag` field). The read is the stage's input here.
+        let mut built = budget.lease("the output of $addFields");
+        let output_fits = read_fits && (0..n).all(|_| built.charge(size_out).is_ok());
+        assert_eq!(output_fits, runs, "{} GiB: read refused at {at:?}", memory >> 30);
+        if let Some(i) = at {
+            assert_eq!(i, limit / size + 1, "{} GiB", memory >> 30);
+        }
+    }
+    // A 2 GiB member refuses the read itself, at the 26,062nd document of the 100,000.
+    assert_eq!(derived(2 << 30).0 / size + 1, 26_062);
 }
 
 #[test]
-fn two_requests_at_the_default_limit_fill_the_default_pool_and_a_third_waits() {
-    let pool = MemoryPool::new(DEFAULT_MEMORY_POOL_BYTES);
-    let a = BufferBudget::pooled(DEFAULT_MEMORY_LIMIT_BYTES, &pool);
-    let b = BufferBudget::pooled(DEFAULT_MEMORY_LIMIT_BYTES, &pool);
-    let c = BufferBudget::pooled(DEFAULT_MEMORY_LIMIT_BYTES, &pool);
+fn a_thousand_documents_of_eight_mib_are_refused_at_the_limit_whichever_it_is() {
+    // The reviewer's Z1: 1,000 documents each given an 8 MiB string. The input is small; the
+    // output passes the limit long before 8 GB. The first document refused, for the explicit
+    // 1 GiB of the first design and for the limits a 2 GiB and an 8 GiB member derive.
+    let size = 8 * 1024 * 1024 + 20;
+    for (limit, expected) in
+        [(1usize << 30, 128), (derived(2 << 30).0, 13), (derived(8 << 30).0, 52)]
+    {
+        let limits = Limits { buffer: BufferBudget::new(limit), ..Default::default() };
+        let mut output =
+            limits.buffer.lease("the output of $addFields (with its input, still held)");
+        let mut built = 0usize;
+        let err = loop {
+            built += 1;
+            if let Err(e) = output.charge(size) {
+                break e;
+            }
+            assert!(built < 1_000, "never refused");
+        };
+        assert_eq!(built, expected, "the document that passes {limit}");
+        assert!(is_too_large(&err), "{err:?}");
+    }
+}
+
+#[test]
+fn at_the_derived_ratio_two_requests_cannot_exhaust_the_pool_and_a_third_waits() {
+    // A 2 GiB container: a pool of 214,748,364 and a request limit of half of it. Two requests
+    // each at their limit fill the pool exactly, so one more request, a third, is the first to
+    // be told to wait; with only two, no request ever meets the pool.
+    let (limit, pool_bytes) = derived(2 << 30);
+    assert_eq!(2 * limit, pool_bytes);
+    let pool = MemoryPool::new(pool_bytes);
+    let a = BufferBudget::pooled(limit, &pool);
+    let b = BufferBudget::pooled(limit, &pool);
+    let c = BufferBudget::pooled(limit, &pool);
     let (mut la, mut lb, mut lc) = (a.lease("a"), b.lease("b"), c.lease("c"));
-    la.charge(DEFAULT_MEMORY_LIMIT_BYTES).unwrap();
-    lb.charge(DEFAULT_MEMORY_LIMIT_BYTES).unwrap();
-    assert_eq!(pool.used(), DEFAULT_MEMORY_POOL_BYTES);
+    la.charge(limit).unwrap();
+    lb.charge(limit).unwrap();
+    assert_eq!(pool.used(), pool_bytes);
+    // Two requests are within the pool, and a request cannot go over its own limit to meet it.
+    assert!(is_too_large(&la.charge(1).unwrap_err()));
+    assert_eq!(pool.pool_refusals(), 0);
+    // The third is refused with a retry and nothing reserved, and is answered when one ends.
     assert!(matches!(lc.charge(1).unwrap_err(), Error::MemoryBusy { .. }));
-    // And it is answered when one ends.
+    assert_eq!((pool.pool_refusals(), c.reserved()), (1, 0));
     drop(la);
     let mut lc2 = c.lease("c");
     lc2.charge(1).unwrap();
+}
+
+#[test]
+fn with_an_explicit_pool_under_twice_the_limit_two_requests_meet_the_pool() {
+    // An explicit pool of one and a half limits: the second request is the one told to wait.
+    let limit = 1_000_000usize;
+    let pool = MemoryPool::new(limit + limit / 2);
+    let (a, b) = (BufferBudget::pooled(limit, &pool), BufferBudget::pooled(limit, &pool));
+    let (mut la, mut lb) = (a.lease("a"), b.lease("b"));
+    la.charge(limit).unwrap();
+    assert!(matches!(lb.charge(limit).unwrap_err(), Error::MemoryBusy { .. }));
+    assert_eq!(pool.pool_refusals(), 1);
 }
 
 // ---------------------------------------------------------------------------

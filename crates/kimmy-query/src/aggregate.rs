@@ -72,8 +72,8 @@ pub struct Limits {
     /// output, the groups and joins it builds, what the window stages buffer and the
     /// answer, one total for the whole pipeline and its `$facet` branches and
     /// sub-pipelines (ADR-269, which widens ADR-264's). Drawing on the node's pool when it
-    /// was made from one. A fresh `Limits::default()` is a fresh budget of 1 GiB, so make
-    /// one per request.
+    /// was made from one. A fresh `Limits::default()` is a fresh budget of the library's
+    /// fallback (1 GiB, see `budget::DEFAULT_MEMORY_LIMIT_BYTES`), so make one per request.
     pub buffer: crate::budget::BufferBudget,
 }
 
@@ -1936,8 +1936,9 @@ pub(crate) fn group_key(value: &Bson) -> Vec<u8> {
 ///
 /// A stage that only moves its input (`$match`, `$sort`, `$limit`, `$skip`, `$count`,
 /// `$sample`) builds nothing, so its input is all it holds. `$setWindowFields`,
-/// `$densify` and `$fill` charge the documents they buffer themselves, and `$facet` its
-/// input and its branches, so none of those charges its input here as well.
+/// `$densify` and `$fill` charge the documents they buffer themselves (`$fill` also every
+/// `value` it writes, on every path), and `$facet` its input and its branches, so none of
+/// those charges its input here as well.
 pub struct Held {
     /// The documents the stage builds: its output, or its buckets.
     pub output: Lease,

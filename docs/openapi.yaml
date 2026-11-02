@@ -1726,8 +1726,9 @@ paths:
             `answer_too_large`: the pipeline holds more than
             `aggregate.memory_limit_bytes` (half the pool, by default about 100 MiB of BSON in a 2 GiB container; ADR-269). The
             message names what held the memory (the source read, a stage's output, a
-            join, the answer), the bytes held and the limit, and says to add `$match`,
-            `$project` or `$limit` early or to raise the setting. The same code is
+            join, the answer), the bytes held and the limit, and says that a leading
+            `$match` narrows what is read, that `$project`, `$limit` or `$match` after it
+            reduce what later stages hold, or to raise the setting. The same code is
             answered for a `$facet` answer over 16 MiB and for a string, array or
             document an expression builds over 16 MiB. Nothing was written.
           content:

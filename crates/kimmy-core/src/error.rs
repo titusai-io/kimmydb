@@ -97,15 +97,17 @@ pub enum Error {
     },
 
     /// An aggregation needed `bytes` more bytes of the node's shared pool of aggregation
-    /// memory (`aggregate.memory_pool_bytes`, `pool` bytes in all) while other requests held
-    /// `in_use` of it, and was refused rather than left to take memory the node does not
+    /// memory (`aggregate.memory_pool_bytes`, `pool` bytes in all) while `in_use` of it was
+    /// reserved (by every request, the one refused included: what it had reserved so far is
+    /// in that total), and was refused rather than left to take memory the node does not
     /// have (ADR-269). `what` names the holder that asked. The request itself is not too
     /// large: it is answered `503`, and the same request is retried when the others have
     /// finished.
     #[error(
         "{what} needed {bytes} more bytes of the node's pool of aggregation memory \
-         (aggregate.memory_pool_bytes, {pool} bytes), of which other requests hold {in_use}; \
-         retry later, or add $match, $project or $limit early so the pipeline holds less"
+         (aggregate.memory_pool_bytes, {pool} bytes, {in_use} reserved now by all requests, \
+         this one's included); retry later, or hold less: a leading $match narrows what is \
+         read, and $project, $limit or $match after it reduce what later stages hold"
     )]
     MemoryBusy { what: &'static str, bytes: usize, pool: usize, in_use: usize },
 
