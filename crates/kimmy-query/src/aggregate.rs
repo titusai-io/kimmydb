@@ -1970,6 +1970,20 @@ pub struct Held {
 impl Held {
     /// Charge `input` to the request's budget for `stage`.
     pub fn enter(stage: &Stage, input: &[Document], limits: &Limits) -> Result<Self> {
+        Self::enter_with(stage, input, limits, None)
+    }
+
+    /// [`Held::enter`], for an input whose bytes are already charged: `arrived` is the lease
+    /// that charged `input` document by document as a stage before this one handed them over
+    /// (ADR-270). It becomes the stage's hold on its input, and nothing is charged again. A
+    /// stage that charges its own input is given back its bytes first, so that it does not
+    /// hold them twice.
+    pub fn enter_with(
+        stage: &Stage,
+        input: &[Document],
+        limits: &Limits,
+        arrived: Option<Lease>,
+    ) -> Result<Self> {
         let name = stage.name();
         let output = limits.buffer.lease(output_of(name));
         let charged = !matches!(
@@ -1977,10 +1991,17 @@ impl Held {
             Stage::SetWindowFields(_) | Stage::Densify(_) | Stage::Fill(_) | Stage::Facet(_)
         );
         if !charged {
+            drop(arrived);
             return Ok(Held { output, _input: None });
         }
-        let mut lease = limits.buffer.lease(input_of(name));
-        lease.charge_docs(input)?;
+        let lease = match arrived {
+            Some(lease) => lease,
+            None => {
+                let mut lease = limits.buffer.lease(input_of(name));
+                lease.charge_docs(input)?;
+                lease
+            }
+        };
         Ok(Held { output, _input: Some(lease) })
     }
 }
@@ -2001,6 +2022,18 @@ pub fn apply_with_vars(
     limits: &Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
+    apply_charged(stage, input, limits, vars, None)
+}
+
+/// [`apply_with_vars`] for an input already charged to the request's budget by `arrived`, the
+/// lease of the sink that collected it document by document (ADR-270, [`Held::enter_with`]).
+pub fn apply_charged(
+    stage: &Stage,
+    input: Vec<Document>,
+    limits: &Limits,
+    vars: &[Binding<'_>],
+    arrived: Option<Lease>,
+) -> Result<Vec<Document>> {
     // Every stage starts by looking at the request's deadline (ADR-266), and every
     // loop below holds a `Ticker` and ticks first in its body. A stage added to this
     // match does the same: `let mut ticker = Ticker::new();` before its loop and
@@ -2010,7 +2043,7 @@ pub fn apply_with_vars(
     // What the stage holds while it runs is charged to the request's budget (ADR-269): its
     // input until it returns, and the documents it builds as it builds them. A blocking
     // stage that buffers its own input, and `$facet`, charge for themselves.
-    let mut held = Held::enter(stage, &input, limits)?;
+    let mut held = Held::enter_with(stage, &input, limits, arrived)?;
     let out = match stage {
         // A `$expr` that cannot be evaluated against a document fails the
         // pipeline, as in a top-level filter (ADR-206).
@@ -2028,12 +2061,7 @@ pub fn apply_with_vars(
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
                 ticker.tick()?;
-                let mut projected = shape::project(projection.as_ref(), doc);
-                // Computed fields read the *input*, not the projection's
-                // output — otherwise `{$project: {a: 0, b: "$a"}}` would
-                // depend on key order, which BSON preserves and nobody
-                // reasons about.
-                set_computed(&mut projected, computed, &Scope::with_bindings(doc, vars))?;
+                let projected = project_doc(projection.as_ref(), computed, doc, vars)?;
                 held.output.charge_doc(&projected)?;
                 out.push(projected);
             }
@@ -2043,8 +2071,7 @@ pub fn apply_with_vars(
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
                 ticker.tick()?;
-                let mut with = doc.clone();
-                set_computed(&mut with, computed, &Scope::with_bindings(doc, vars))?;
+                let with = add_fields_doc(computed, doc, vars)?;
                 held.output.charge_doc(&with)?;
                 out.push(with);
             }
@@ -2054,21 +2081,9 @@ pub fn apply_with_vars(
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
                 ticker.tick()?;
-                match expr.eval_in(&Scope::with_bindings(doc, vars))? {
-                    Bson::Document(new_root) => {
-                        held.output.charge_doc(&new_root)?;
-                        out.push(new_root);
-                    }
-                    // Refused rather than wrapped: a root that is not a
-                    // document would have to be given a field name this stage
-                    // has no business inventing.
-                    other => {
-                        return Err(Error::InvalidQuery(format!(
-                            "$replaceRoot needs a document, found {}",
-                            type_name(&other)
-                        )));
-                    }
-                }
+                let new_root = replace_root_doc(expr, doc, vars)?;
+                held.output.charge_doc(&new_root)?;
+                out.push(new_root);
             }
             out
         }
@@ -2171,6 +2186,52 @@ pub fn apply_with_vars(
     };
     check_limit(stage.name(), out.len(), limits)?;
     Ok(out)
+}
+
+/// One document through `$project` (ADR-270: the body of the stage for one document, which
+/// [`apply`] loops over and the chain of sinks calls as each document arrives).
+pub(crate) fn project_doc(
+    projection: Option<&Projection>,
+    computed: &[(String, Expr)],
+    doc: &Document,
+    vars: &[Binding<'_>],
+) -> Result<Document> {
+    let mut projected = shape::project(projection, doc);
+    // Computed fields read the *input*, not the projection's
+    // output — otherwise `{$project: {a: 0, b: "$a"}}` would
+    // depend on key order, which BSON preserves and nobody
+    // reasons about.
+    set_computed(&mut projected, computed, &Scope::with_bindings(doc, vars))?;
+    Ok(projected)
+}
+
+/// One document through `$addFields` (see [`project_doc`]).
+pub(crate) fn add_fields_doc(
+    computed: &[(String, Expr)],
+    doc: &Document,
+    vars: &[Binding<'_>],
+) -> Result<Document> {
+    let mut with = doc.clone();
+    set_computed(&mut with, computed, &Scope::with_bindings(doc, vars))?;
+    Ok(with)
+}
+
+/// One document through `$replaceRoot` (see [`project_doc`]).
+pub(crate) fn replace_root_doc(
+    expr: &Expr,
+    doc: &Document,
+    vars: &[Binding<'_>],
+) -> Result<Document> {
+    match expr.eval_in(&Scope::with_bindings(doc, vars))? {
+        Bson::Document(new_root) => Ok(new_root),
+        // Refused rather than wrapped: a root that is not a
+        // document would have to be given a field name this stage
+        // has no business inventing.
+        other => Err(Error::InvalidQuery(format!(
+            "$replaceRoot needs a document, found {}",
+            type_name(&other)
+        ))),
+    }
 }
 
 /// Write computed fields into `target`, evaluating each in `source`.
@@ -2467,33 +2528,48 @@ fn crossing_array(doc: &Document, field: &str) -> Option<(String, String)> {
     None
 }
 
-fn unwind(
-    input: Vec<Document>,
-    field: &str,
-    preserve: bool,
-    include_index: Option<&str>,
-    limits: &Limits,
-    held: &mut Lease,
-) -> Result<Vec<Document>> {
-    // Write the index field alongside the unwound value, or `null` on a
-    // document that passed through without being fanned out — MongoDB's rule,
-    // and the only sane reading of "which element produced this row" for a
-    // row that was not produced by one.
-    let set_index = |copy: &mut Document, index: Option<i64>| -> Result<()> {
-        let Some(name) = include_index else { return Ok(()) };
+/// What `$unwind` does, whatever runs it.
+pub(crate) struct UnwindSpec<'a> {
+    pub(crate) field: &'a str,
+    pub(crate) preserve: bool,
+    pub(crate) include_index: Option<&'a str>,
+    /// Held to the limit as a whole, as the other stages that add fields are.
+    pub(crate) max_document_bytes: usize,
+}
+
+impl UnwindSpec<'_> {
+    /// Write the index field alongside the unwound value, or `null` on a document that
+    /// passed through without being fanned out — the reference's rule, and the only sane reading
+    /// of "which element produced this row" for a row that was not produced by one.
+    fn set_index(&self, copy: &mut Document, index: Option<i64>) -> Result<()> {
+        let Some(name) = self.include_index else { return Ok(()) };
         let value = index.map_or(Bson::Null, Bson::Int64);
         path::set(copy, name, value)
             .map_err(|e| Error::InvalidQuery(format!("cannot set `{name}`: {e}")))?;
         // The element in place of the array is no larger than the input, but the index field
         // is added to it: a document at the limit goes over it by the field. Held to the
         // limit as a whole, as the other stages that add fields are.
-        check_built_document(copy, limits.max_document_bytes)
-    };
+        check_built_document(copy, self.max_document_bytes)
+    }
+}
 
-    let mut out = Vec::with_capacity(input.len());
-    let mut ticker = Ticker::new();
-    for doc in input {
-        ticker.tick()?;
+/// The documents one document of `$unwind`'s input becomes, handed out one at a time so that
+/// a caller that needs no more can stop in the middle of an array (ADR-270). [`apply`] runs
+/// it to its end for each document; a chain of sinks stops at a `Done`.
+pub(crate) struct Fan {
+    doc: Document,
+    /// The elements of the array, still to come, with the position of the next.
+    elements: Option<(std::vec::IntoIter<Bson>, i64)>,
+    /// A document that is not fanned out: what it becomes, and whether the stage built it
+    /// (it is then charged to the request's budget; the input that is passed on unchanged
+    /// was charged as an input).
+    single: Option<(Document, bool)>,
+}
+
+impl Fan {
+    /// Look at `doc`, and decide what it becomes.
+    pub(crate) fn start(spec: &UnwindSpec<'_>, doc: Document) -> Result<Fan> {
+        let field = spec.field;
         // Refused uniformly, for every document, before anything at `field`
         // is read: `$unwind` names a place to write each element back to,
         // and a path that crosses an array has none, regardless of what is
@@ -2515,42 +2591,91 @@ fn unwind(
         // not a reason to let a future change panic instead of refuse.
         match value_at(&doc, field) {
             Some(Bson::Array(items)) if !items.is_empty() => {
-                for (index, item) in items.clone().into_iter().enumerate() {
-                    // A document holding a huge array is many rows from one iteration
-                    // of the loop above.
-                    ticker.tick()?;
-                    let mut copy = doc.clone();
-                    path::set(&mut copy, field, item)
-                        .map_err(|e| Error::InvalidQuery(format!("cannot set `{field}`: {e}")))?;
-                    set_index(&mut copy, Some(index as i64))?;
-                    held.charge_doc(&copy)?;
-                    out.push(copy);
-                }
-                // Checked inside the loop as well as after: a handful of
-                // documents each holding a huge array can exceed the cap long
-                // before the outer loop ends, and the point of the cap is to
-                // stop allocating, not to report afterwards.
-                check_limit("$unwind", out.len(), limits)?;
+                let elements = items.clone().into_iter();
+                Ok(Fan { doc, elements: Some((elements, 0)), single: None })
             }
             // A missing field, an explicit null, or an empty array: MongoDB
             // drops the document unless asked to keep it.
             Some(Bson::Array(_)) | Some(Bson::Null) | None => {
-                if preserve {
+                let single = if spec.preserve {
                     let mut copy = doc.clone();
                     path::unset(&mut copy, field);
-                    set_index(&mut copy, None)?;
-                    held.charge_doc(&copy)?;
-                    out.push(copy);
-                }
+                    spec.set_index(&mut copy, None)?;
+                    Some((copy, true))
+                } else {
+                    None
+                };
+                Ok(Fan { doc, elements: None, single })
             }
             // A non-array value unwinds to itself, which is what MongoDB does
             // and saves callers a `$type` check for a field that is sometimes
             // scalar and sometimes an array.
             Some(_) => {
                 let mut copy = doc;
-                set_index(&mut copy, None)?;
-                out.push(copy);
+                spec.set_index(&mut copy, None)?;
+                Ok(Fan { doc: Document::new(), elements: None, single: Some((copy, false)) })
             }
+        }
+    }
+
+    /// Whether the document is expanded from an array, as against dropped or passed on.
+    pub(crate) fn is_array(&self) -> bool {
+        self.elements.is_some()
+    }
+
+    /// The next document, and whether the stage built it, or `None` when there are no more.
+    pub(crate) fn next(
+        &mut self,
+        spec: &UnwindSpec<'_>,
+        ticker: &mut Ticker,
+    ) -> Result<Option<(Document, bool)>> {
+        if let Some((elements, index)) = &mut self.elements {
+            let Some(item) = elements.next() else { return Ok(None) };
+            // A document holding a huge array is many rows from one iteration
+            // of the loop that drives this.
+            ticker.tick()?;
+            let mut copy = self.doc.clone();
+            path::set(&mut copy, spec.field, item)
+                .map_err(|e| Error::InvalidQuery(format!("cannot set `{}`: {e}", spec.field)))?;
+            spec.set_index(&mut copy, Some(*index))?;
+            *index += 1;
+            return Ok(Some((copy, true)));
+        }
+        Ok(self.single.take())
+    }
+}
+
+fn unwind(
+    input: Vec<Document>,
+    field: &str,
+    preserve: bool,
+    include_index: Option<&str>,
+    limits: &Limits,
+    held: &mut Lease,
+) -> Result<Vec<Document>> {
+    let spec = &UnwindSpec {
+        field,
+        preserve,
+        include_index,
+        max_document_bytes: limits.max_document_bytes,
+    };
+    let mut out = Vec::with_capacity(input.len());
+    let mut ticker = Ticker::new();
+    for doc in input {
+        ticker.tick()?;
+        let mut fan = Fan::start(spec, doc)?;
+        while let Some((copy, built)) = fan.next(spec, &mut ticker)? {
+            if built {
+                held.charge_doc(&copy)?;
+            }
+            out.push(copy);
+        }
+        if fan.is_array() {
+            // Checked after each document's fan-out as well as at the end of the stage: a
+            // handful of documents each holding a huge array can exceed the cap long
+            // before the outer loop ends, and the point of the cap is to
+            // stop allocating, not to report afterwards.
+            check_limit("$unwind", out.len(), limits)?;
         }
     }
     Ok(out)
