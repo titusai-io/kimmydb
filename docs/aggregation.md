@@ -835,7 +835,7 @@ field path.
 | Types | `$type` `$isNumber` — see [Types](#types) |
 | Iteration | `$filter` `$map` `$reduce` — each binds a variable per element |
 | Variables | `$$ROOT` `$$CURRENT` `$$NOW` `$$REMOVE` `$let` |
-| Type conversion | `$convert` `$toString` `$toInt` `$toLong` `$toDouble` `$toBool` `$toDate` `$toObjectId` |
+| Type conversion | `$convert` `$toString` `$toInt` `$toLong` `$toDouble` `$toDecimal` `$toBool` `$toDate` `$toObjectId` |
 | Escape | `$literal` |
 
 ```json
@@ -1663,7 +1663,7 @@ with the same rules; a group with nothing to merge gives `{}`.
 `binData`, `undefined`, `objectId`, `bool`, `date`, `null`, `regex`, `dbPointer`,
 `javascript`, `symbol`, `javascriptWithScope`, `int`, `timestamp`, `long`,
 `decimal`, `minKey`, `maxKey`, and `missing` for a field path that reaches
-nothing (or `$$REMOVE`). Integers computed here are `long` (see [Numbers](#behaviours-worth-knowing)).
+nothing (or `$$REMOVE`). An integer computed here keeps the reference's width, an `int` or a `long` (see [Integer result widths](#integer-result-widths)).
 **`$isNumber`** is true for an `int`, `long`, `double` or `decimal`, and false
 for anything else, null and missing included.
 
@@ -2201,7 +2201,7 @@ examined or read.
 `$group`, `$sort`, `$count`, `$sortByCount` and `$sample` are **blocking**: none of them can emit anything
 until it has consumed everything — a sort has no first element until the last
 is seen, a group has no totals until the last member arrives, and a count has
-no number until the last document has gone past. All three work on the whole
+no number until the last document has gone past. All five work on the whole
 materialised input, and `$count` emits a single document however large that
 input is. `$unwind` and `$lookup` can *grow* their input, which is the other
 way a stage can cost more than it was given. `find` is bounded by `MAX_LIMIT`,

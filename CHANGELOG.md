@@ -10,6 +10,12 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **0.59.0's notes said a `$sample` `size` over the document limit is a `400`. It is not.** `$sample` has no cap of its own: the reservoir holds documents the pipeline already holds, and a `size` over the input, however large, answers the whole input in a random order, as the reference does ([ADR-263](docs/decisions.md#adr-263--the-sortbycount-replacewith-unset-sample-redact-and-unionwith-stages)). Nothing in the build changes; the 0.59.0 section below is left as it was released.
+
 ## 0.59.0 - 2026-11-02
 
 **Read before upgrading: 0.59.0 opens a store and a backup 0.58.0 wrote, with no wipe. Stop every member and start them all on 0.59.0.** Nothing stored changes, but a good deal of what the query layer answers does, and some queries that ran are now refused; the **Breaking** lines below are the list. Read these first: integer results keep the reference's widths (`int` where there was `long`); an aggregation is held to a memory limit derived from the memory the member runs under (a 2 GiB container: about 100 MiB a request and 200 MiB for the node, `413` or `503` past them); `server.request_timeout_secs` (30 s by default) now ends a running query; `\d`, `\w`, `\s` and `\b` match ASCII only.

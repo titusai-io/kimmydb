@@ -140,7 +140,7 @@ across many addresses is limited once. Details and the reasoning are in
 
 A pipeline holds its documents whole, so one aggregation can hold more than a member has: a
 thousand documents each given an 8 MiB string by `$addFields` are 8 GB, and every value of
-it is legal. Two settings bound it ([ADR-269](decisions.md)), both in BSON bytes:
+it is legal. Two settings bound it ([ADR-269](decisions.md)), both in an estimate of the memory the held documents take parsed, not in their BSON size (see below):
 
 - **`aggregate.memory_limit_bytes`** is what **one request** may hold at once. Over it the
   request is refused `413 answer_too_large`, naming what held the memory (the source read, a stage's
