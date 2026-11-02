@@ -487,6 +487,12 @@ mod tests {
         assert_eq!(machine.detect().origin, cgroup_origin("/sys/fs/cgroup/memory.max"));
         machine.file("sys/fs/cgroup/memory.max", "68719476736\n");
         assert_eq!(machine.detect().origin, Origin::Ram);
+        // A limit of exactly the RAM is no limit either; one byte under it is one.
+        machine.file("sys/fs/cgroup/memory.max", "17179869184\n");
+        machine.file("sys/fs/cgroup/a/memory.max", "max\n");
+        assert_eq!(machine.detect().origin, Origin::Ram);
+        machine.file("sys/fs/cgroup/memory.max", "17179869183\n");
+        assert_eq!(machine.detect().bytes, 17_179_869_183);
     }
 
     #[test]
@@ -519,9 +525,17 @@ mod tests {
         assert_eq!(cgroup_limit("lots"), None);
         assert_eq!(cgroup_limit("0"), None);
         assert_eq!(cgroup_limit("9223372036854771712"), None);
+        // The largest that still counts is under 2^60; 2^60 itself is "no limit".
+        assert_eq!(cgroup_limit("1152921504606846975"), Some((1 << 60) - 1));
+        assert_eq!(cgroup_limit("1152921504606846976"), None);
         let own = parse_self_cgroup("0::/a/b\n5:memory:/c\n7:cpu:/d\n");
         assert_eq!(own.v2, ["a", "b"]);
         assert_eq!(own.v1_memory, ["c"]);
+        // The v2 line is hierarchy 0 with no controllers; neither alone is it, and a line of
+        // another controller is not the memory controller's.
+        assert_eq!(parse_self_cgroup("5::/x\n"), SelfCgroup::default());
+        assert_eq!(parse_self_cgroup("0:cpu:/y\n"), SelfCgroup::default());
+        assert_eq!(parse_self_cgroup("3:cpu,cpuacct:/z\n"), SelfCgroup::default());
         assert_eq!(parse_self_cgroup("0::/\n"), SelfCgroup::default());
         assert_eq!(parse_self_cgroup(""), SelfCgroup::default());
         assert_eq!(mem_total("MemTotal:  1024 kB\n"), Some(1 << 20));
