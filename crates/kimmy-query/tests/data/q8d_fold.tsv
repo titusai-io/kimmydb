@@ -1,0 +1,392 @@
+$sum	empty		i0
+$sum	one int	i5	i5
+$sum	ints	i1|i2|i3	i6
+$sum	longs	l1|l2	l3
+$sum	int+long	i1|l2	l3
+$sum	int+double	i1|d2.5	d3.5
+$sum	doubles	d1.5|d2.5	d4.0
+$sum	int+dec	i1|D2.5	D3.5
+$sum	dbl+dec	d0.1|D0.2	D0.3000000000000000055511151231257827
+$sum	long+dec	l9223372036854775807|D1	D9223372036854775808
+$sum	dec+dec	D0.1|D0.2	D0.3
+$sum	int max+1	i2147483647|i1	l2147483648
+$sum	int max+1-1	i2147483647|i1|i-1	i2147483647
+$sum	int min-1	i-2147483648|i-1	l-2147483649
+$sum	long max+1	l9223372036854775807|i1	d9223372036854775808.0
+$sum	long max+1-1	l9223372036854775807|i1|i-1	l9223372036854775807
+$sum	long min-1	l-9223372036854775808|i-1	d-9223372036854775808.0
+$sum	long max+long max	l9223372036854775807|l9223372036854775807	d18446744073709551616.0
+$sum	long small in long	l1|i1|i-2	l0
+$sum	long result fits int	l5|i-3	l2
+$sum	null	null	i0
+$sum	null+1	null|i1	i1
+$sum	missing+1	s$nope|i1	i1
+$sum	str+1	sa|i1	i1
+$sum	bool+1	T|i1	i1
+$sum	date+1	t5|i1	i1
+$sum	arr in arr	A[i1,i2]|i3	i3
+$sum	all non numeric	sa|null|T	i0
+$sum	NaN	dNaN|i1	dNaN
+$sum	+Inf	dInfinity|i1	dInfinity
+$sum	+Inf-Inf	dInfinity|d-Infinity	dNaN
+$sum	-0	d-0.0	d0.0
+$sum	-0 + -0	d-0.0|d-0.0	d0.0
+$sum	dec NaN	DNaN|i1	DNaN
+$sum	dec Inf	DInfinity|i1	DInfinity
+$sum	dbl big	d1e+308|d1e+308	dInfinity
+$sum	dec big	D9.999999999999999999999999999999999E+6144|D9.999999999999999999999999999999999E+6144	DInfinity
+$sum	2^53	l9007199254740993|d1.0	d9007199254740994.0
+$sum	dec exact	D1E+6000|D1|D-1E+6000	D0
+$sum	two arrays	A[i1,i2]|A[i3]	i0
+$sum	mixed order	i3|sa|i1|null|d2.0	d6.0
+$sum	strings	sb|sa|sc	i0
+$sum	dates	t5|t3	i0
+$sum	str vs num	sa|i5	i5
+$sum	bool vs num	T|i5	i5
+$sum	null vs 1	null|i1	i1
+$sum	equal int dbl	i1|d1.0	d2.0
+$sum	equal dbl int	d1.0|i1	d2.0
+$sum	equal int long	i1|l1	l2
+$sum	equal long int	l1|i1	l2
+$sum	equal dec dbl	D1.0|d1.0	D2.0
+$sum	equal dbl dec	d1.0|D1.0	D2.0
+$sum	equal dec int	D1|i1	D2
+$sum	dec vs dec scale	D1.0|D1.00	D2.00
+$sum	dec vs dec scale rev	D1.00|D1.0	D2.00
+$sum	-0 vs 0	d-0.0|d0.0	d0.0
+$sum	0 vs -0	d0.0|d-0.0	d0.0
+$sum	NaN vs 1	dNaN|i1	dNaN
+$sum	1 vs NaN	i1|dNaN	dNaN
+$sum	NaN vs null	dNaN|null	dNaN
+$sum	NaN vs NaN	dNaN|dNaN	dNaN
+$sum	dec NaN vs 1	DNaN|i1	DNaN
+$sum	dbl NaN vs dec NaN	dNaN|DNaN	DNaN
+$sum	Inf vs big	dInfinity|l9223372036854775807	dInfinity
+$sum	objects	QO{a=i2}|QO{a=i1}	i0
+$sum	arrays as operands	QA[i1,i2]|QA[i1,i3]	i0
+$sum	array vs scalar	QA[i1,i2]|i5	i5
+$sum	objectids	oid000000000000000000000002|oid000000000000000000000001	i0
+$sum	bin	binAQ==|binAg==	i0
+$sum	minkey	minkey|i1	i1
+$sum	maxkey	maxkey|i1	i1
+$sum	regex	rxa|rxb	i0
+$sum	ts	ts1:2|ts1:3	i0
+$sum	one null many	null|null	i0
+$sum	fields	s$i|s$d|s$dec	D8.0
+$sum	field arr	s$arr	i6
+$sum	field str	s$s	i0
+$sum	max nested single array of arrays	A[A[i1,i5],A[i2]]	i0
+$sum	strings in single array	A[sb,sa]	i0
+$avg	empty		null
+$avg	one int	i5	d5.0
+$avg	ints	i1|i2|i3	d2.0
+$avg	longs	l1|l2	d1.5
+$avg	int+long	i1|l2	d1.5
+$avg	int+double	i1|d2.5	d1.75
+$avg	doubles	d1.5|d2.5	d2.0
+$avg	int+dec	i1|D2.5	D1.75
+$avg	dbl+dec	d0.1|D0.2	D0.1500000000000000027755575615628914
+$avg	long+dec	l9223372036854775807|D1	D4611686018427387904
+$avg	dec+dec	D0.1|D0.2	D0.15
+$avg	int max+1	i2147483647|i1	d1073741824.0
+$avg	int max+1-1	i2147483647|i1|i-1	d715827882.3333334
+$avg	int min-1	i-2147483648|i-1	d-1073741824.5
+$avg	long max+1	l9223372036854775807|i1	d4611686018427387904.0
+$avg	long max+1-1	l9223372036854775807|i1|i-1	d3074457345618258432.0
+$avg	long min-1	l-9223372036854775808|i-1	d-4611686018427387904.0
+$avg	long max+long max	l9223372036854775807|l9223372036854775807	d9223372036854775808.0
+$avg	long small in long	l1|i1|i-2	d0.0
+$avg	long result fits int	l5|i-3	d1.0
+$avg	null	null	null
+$avg	null+1	null|i1	d1.0
+$avg	missing+1	s$nope|i1	d1.0
+$avg	str+1	sa|i1	d1.0
+$avg	bool+1	T|i1	d1.0
+$avg	date+1	t5|i1	d1.0
+$avg	arr in arr	A[i1,i2]|i3	d3.0
+$avg	all non numeric	sa|null|T	null
+$avg	NaN	dNaN|i1	dNaN
+$avg	+Inf	dInfinity|i1	dInfinity
+$avg	+Inf-Inf	dInfinity|d-Infinity	dNaN
+$avg	-0	d-0.0	d0.0
+$avg	-0 + -0	d-0.0|d-0.0	d0.0
+$avg	dec NaN	DNaN|i1	DNaN
+$avg	dec Inf	DInfinity|i1	DInfinity
+$avg	dbl big	d1e+308|d1e+308	dInfinity
+$avg	dec big	D9.999999999999999999999999999999999E+6144|D9.999999999999999999999999999999999E+6144	DInfinity
+$avg	2^53	l9007199254740993|d1.0	d4503599627370497.0
+$avg	dec exact	D1E+6000|D1|D-1E+6000	D0
+$avg	two arrays	A[i1,i2]|A[i3]	null
+$avg	mixed order	i3|sa|i1|null|d2.0	d2.0
+$avg	strings	sb|sa|sc	null
+$avg	dates	t5|t3	null
+$avg	str vs num	sa|i5	d5.0
+$avg	bool vs num	T|i5	d5.0
+$avg	null vs 1	null|i1	d1.0
+$avg	equal int dbl	i1|d1.0	d1.0
+$avg	equal dbl int	d1.0|i1	d1.0
+$avg	equal int long	i1|l1	d1.0
+$avg	equal long int	l1|i1	d1.0
+$avg	equal dec dbl	D1.0|d1.0	D1.0
+$avg	equal dbl dec	d1.0|D1.0	D1.0
+$avg	equal dec int	D1|i1	D1
+$avg	dec vs dec scale	D1.0|D1.00	D1.00
+$avg	dec vs dec scale rev	D1.00|D1.0	D1.00
+$avg	-0 vs 0	d-0.0|d0.0	d0.0
+$avg	0 vs -0	d0.0|d-0.0	d0.0
+$avg	NaN vs 1	dNaN|i1	dNaN
+$avg	1 vs NaN	i1|dNaN	dNaN
+$avg	NaN vs null	dNaN|null	dNaN
+$avg	NaN vs NaN	dNaN|dNaN	dNaN
+$avg	dec NaN vs 1	DNaN|i1	DNaN
+$avg	dbl NaN vs dec NaN	dNaN|DNaN	DNaN
+$avg	Inf vs big	dInfinity|l9223372036854775807	dInfinity
+$avg	objects	QO{a=i2}|QO{a=i1}	null
+$avg	arrays as operands	QA[i1,i2]|QA[i1,i3]	null
+$avg	array vs scalar	QA[i1,i2]|i5	d5.0
+$avg	objectids	oid000000000000000000000002|oid000000000000000000000001	null
+$avg	bin	binAQ==|binAg==	null
+$avg	minkey	minkey|i1	d1.0
+$avg	maxkey	maxkey|i1	d1.0
+$avg	regex	rxa|rxb	null
+$avg	ts	ts1:2|ts1:3	null
+$avg	one null many	null|null	null
+$avg	fields	s$i|s$d|s$dec	D2.666666666666666666666666666666667
+$avg	field arr	s$arr	d2.0
+$avg	field str	s$s	null
+$avg	max nested single array of arrays	A[A[i1,i5],A[i2]]	null
+$avg	strings in single array	A[sb,sa]	null
+$min	empty		null
+$min	one int	i5	i5
+$min	ints	i1|i2|i3	i1
+$min	longs	l1|l2	l1
+$min	int+long	i1|l2	i1
+$min	int+double	i1|d2.5	i1
+$min	doubles	d1.5|d2.5	d1.5
+$min	int+dec	i1|D2.5	i1
+$min	dbl+dec	d0.1|D0.2	d0.1
+$min	long+dec	l9223372036854775807|D1	D1
+$min	dec+dec	D0.1|D0.2	D0.1
+$min	int max+1	i2147483647|i1	i1
+$min	int max+1-1	i2147483647|i1|i-1	i-1
+$min	int min-1	i-2147483648|i-1	i-2147483648
+$min	long max+1	l9223372036854775807|i1	i1
+$min	long max+1-1	l9223372036854775807|i1|i-1	i-1
+$min	long min-1	l-9223372036854775808|i-1	l-9223372036854775808
+$min	long max+long max	l9223372036854775807|l9223372036854775807	l9223372036854775807
+$min	long small in long	l1|i1|i-2	i-2
+$min	long result fits int	l5|i-3	i-3
+$min	null	null	null
+$min	null+1	null|i1	i1
+$min	missing+1	s$nope|i1	i1
+$min	str+1	sa|i1	i1
+$min	bool+1	T|i1	i1
+$min	date+1	t5|i1	i1
+$min	arr in arr	A[i1,i2]|i3	i3
+$min	all non numeric	sa|null|T	sa
+$min	NaN	dNaN|i1	dNaN
+$min	+Inf	dInfinity|i1	i1
+$min	+Inf-Inf	dInfinity|d-Infinity	d-Infinity
+$min	-0	d-0.0	d-0.0
+$min	-0 + -0	d-0.0|d-0.0	d-0.0
+$min	dec NaN	DNaN|i1	DNaN
+$min	dec Inf	DInfinity|i1	i1
+$min	dbl big	d1e+308|d1e+308	d1e+308
+$min	dec big	D9.999999999999999999999999999999999E+6144|D9.999999999999999999999999999999999E+6144	D9.999999999999999999999999999999999E+6144
+$min	2^53	l9007199254740993|d1.0	d1.0
+$min	dec exact	D1E+6000|D1|D-1E+6000	D-1E+6000
+$min	two arrays	A[i1,i2]|A[i3]	A[i1,i2]
+$min	mixed order	i3|sa|i1|null|d2.0	i1
+$min	strings	sb|sa|sc	sa
+$min	dates	t5|t3	t3
+$min	str vs num	sa|i5	i5
+$min	bool vs num	T|i5	i5
+$min	null vs 1	null|i1	i1
+$min	equal int dbl	i1|d1.0	i1
+$min	equal dbl int	d1.0|i1	d1.0
+$min	equal int long	i1|l1	i1
+$min	equal long int	l1|i1	l1
+$min	equal dec dbl	D1.0|d1.0	D1.0
+$min	equal dbl dec	d1.0|D1.0	d1.0
+$min	equal dec int	D1|i1	D1
+$min	dec vs dec scale	D1.0|D1.00	D1.0
+$min	dec vs dec scale rev	D1.00|D1.0	D1.00
+$min	-0 vs 0	d-0.0|d0.0	d-0.0
+$min	0 vs -0	d0.0|d-0.0	d0.0
+$min	NaN vs 1	dNaN|i1	dNaN
+$min	1 vs NaN	i1|dNaN	dNaN
+$min	NaN vs null	dNaN|null	dNaN
+$min	NaN vs NaN	dNaN|dNaN	dNaN
+$min	dec NaN vs 1	DNaN|i1	DNaN
+$min	dbl NaN vs dec NaN	dNaN|DNaN	dNaN
+$min	Inf vs big	dInfinity|l9223372036854775807	l9223372036854775807
+$min	objects	QO{a=i2}|QO{a=i1}	O{a=i1}
+$min	arrays as operands	QA[i1,i2]|QA[i1,i3]	A[i1,i2]
+$min	array vs scalar	QA[i1,i2]|i5	i5
+$min	objectids	oid000000000000000000000002|oid000000000000000000000001	oid000000000000000000000001
+$min	bin	binAQ==|binAg==	binAQ==
+$min	minkey	minkey|i1	minkey
+$min	maxkey	maxkey|i1	i1
+$min	regex	rxa|rxb	rxa
+$min	ts	ts1:2|ts1:3	ts1:2
+$min	one null many	null|null	null
+$min	fields	s$i|s$d|s$dec	d0.5
+$min	field arr	s$arr	i1
+$min	field str	s$s	sstr
+$min	max nested single array of arrays	A[A[i1,i5],A[i2]]	A[i1,i5]
+$min	strings in single array	A[sb,sa]	sa
+$max	empty		null
+$max	one int	i5	i5
+$max	ints	i1|i2|i3	i3
+$max	longs	l1|l2	l2
+$max	int+long	i1|l2	l2
+$max	int+double	i1|d2.5	d2.5
+$max	doubles	d1.5|d2.5	d2.5
+$max	int+dec	i1|D2.5	D2.5
+$max	dbl+dec	d0.1|D0.2	D0.2
+$max	long+dec	l9223372036854775807|D1	l9223372036854775807
+$max	dec+dec	D0.1|D0.2	D0.2
+$max	int max+1	i2147483647|i1	i2147483647
+$max	int max+1-1	i2147483647|i1|i-1	i2147483647
+$max	int min-1	i-2147483648|i-1	i-1
+$max	long max+1	l9223372036854775807|i1	l9223372036854775807
+$max	long max+1-1	l9223372036854775807|i1|i-1	l9223372036854775807
+$max	long min-1	l-9223372036854775808|i-1	i-1
+$max	long max+long max	l9223372036854775807|l9223372036854775807	l9223372036854775807
+$max	long small in long	l1|i1|i-2	l1
+$max	long result fits int	l5|i-3	l5
+$max	null	null	null
+$max	null+1	null|i1	i1
+$max	missing+1	s$nope|i1	i1
+$max	str+1	sa|i1	sa
+$max	bool+1	T|i1	T
+$max	date+1	t5|i1	t5
+$max	arr in arr	A[i1,i2]|i3	A[i1,i2]
+$max	all non numeric	sa|null|T	T
+$max	NaN	dNaN|i1	i1
+$max	+Inf	dInfinity|i1	dInfinity
+$max	+Inf-Inf	dInfinity|d-Infinity	dInfinity
+$max	-0	d-0.0	d-0.0
+$max	-0 + -0	d-0.0|d-0.0	d-0.0
+$max	dec NaN	DNaN|i1	i1
+$max	dec Inf	DInfinity|i1	DInfinity
+$max	dbl big	d1e+308|d1e+308	d1e+308
+$max	dec big	D9.999999999999999999999999999999999E+6144|D9.999999999999999999999999999999999E+6144	D9.999999999999999999999999999999999E+6144
+$max	2^53	l9007199254740993|d1.0	l9007199254740993
+$max	dec exact	D1E+6000|D1|D-1E+6000	D1E+6000
+$max	two arrays	A[i1,i2]|A[i3]	A[i3]
+$max	mixed order	i3|sa|i1|null|d2.0	sa
+$max	strings	sb|sa|sc	sc
+$max	dates	t5|t3	t5
+$max	str vs num	sa|i5	sa
+$max	bool vs num	T|i5	T
+$max	null vs 1	null|i1	i1
+$max	equal int dbl	i1|d1.0	i1
+$max	equal dbl int	d1.0|i1	d1.0
+$max	equal int long	i1|l1	i1
+$max	equal long int	l1|i1	l1
+$max	equal dec dbl	D1.0|d1.0	D1.0
+$max	equal dbl dec	d1.0|D1.0	d1.0
+$max	equal dec int	D1|i1	D1
+$max	dec vs dec scale	D1.0|D1.00	D1.0
+$max	dec vs dec scale rev	D1.00|D1.0	D1.00
+$max	-0 vs 0	d-0.0|d0.0	d-0.0
+$max	0 vs -0	d0.0|d-0.0	d0.0
+$max	NaN vs 1	dNaN|i1	i1
+$max	1 vs NaN	i1|dNaN	i1
+$max	NaN vs null	dNaN|null	dNaN
+$max	NaN vs NaN	dNaN|dNaN	dNaN
+$max	dec NaN vs 1	DNaN|i1	i1
+$max	dbl NaN vs dec NaN	dNaN|DNaN	dNaN
+$max	Inf vs big	dInfinity|l9223372036854775807	dInfinity
+$max	objects	QO{a=i2}|QO{a=i1}	O{a=i2}
+$max	arrays as operands	QA[i1,i2]|QA[i1,i3]	A[i1,i3]
+$max	array vs scalar	QA[i1,i2]|i5	A[i1,i2]
+$max	objectids	oid000000000000000000000002|oid000000000000000000000001	oid000000000000000000000002
+$max	bin	binAQ==|binAg==	binAg==
+$max	minkey	minkey|i1	i1
+$max	maxkey	maxkey|i1	maxkey
+$max	regex	rxa|rxb	rxb
+$max	ts	ts1:2|ts1:3	ts1:3
+$max	one null many	null|null	null
+$max	fields	s$i|s$d|s$dec	i7
+$max	field arr	s$arr	i3
+$max	field str	s$s	sstr
+$max	max nested single array of arrays	A[A[i1,i5],A[i2]]	A[i2]
+$max	strings in single array	A[sb,sa]	sb
+$sum	single str	=sabc	i0
+$sum	single null	=null	i0
+$sum	single missing	=s$nope	i0
+$avg	single str	=sabc	null
+$avg	single null	=null	null
+$avg	single missing	=s$nope	null
+$min	single str	=sabc	sabc
+$min	single null	=null	null
+$min	single missing	=s$nope	null
+$max	single str	=sabc	sabc
+$max	single null	=null	null
+$max	single missing	=s$nope	null
+$sum	single field arr	=s$arr	i6
+$sum	single field int	=s$i	i7
+$sum	single field null	=s$nul	i0
+$sum	single field str	=s$s	i0
+$sum	single int	=i5	i5
+$sum	single double	=d2.5	d2.5
+$sum	single dec	=D2.5	D2.5
+$sum	single bool	=T	i0
+$sum	single obj	=O{a=i1}	i0
+$sum	single $literal arr	=QA[i1,i2,i3]	i6
+$sum	single $literal arr junk	=QA[i1,sa,null]	i1
+$sum	single $literal nested	=QA[A[i1],i2]	i2
+$sum	single $literal empty	=QA[]	i0
+$sum	single date	=t5	i0
+$sum	single ts field	=s$ts	i0
+$sum	single bin field	=s$bin	i0
+$avg	single field arr	=s$arr	d2.0
+$avg	single field int	=s$i	d7.0
+$avg	single field null	=s$nul	null
+$avg	single field str	=s$s	null
+$avg	single int	=i5	d5.0
+$avg	single double	=d2.5	d2.5
+$avg	single dec	=D2.5	D2.5
+$avg	single bool	=T	null
+$avg	single obj	=O{a=i1}	null
+$avg	single $literal arr	=QA[i1,i2,i3]	d2.0
+$avg	single $literal arr junk	=QA[i1,sa,null]	d1.0
+$avg	single $literal nested	=QA[A[i1],i2]	d2.0
+$avg	single $literal empty	=QA[]	null
+$avg	single date	=t5	null
+$avg	single ts field	=s$ts	null
+$avg	single bin field	=s$bin	null
+$min	single field arr	=s$arr	i1
+$min	single field int	=s$i	i7
+$min	single field null	=s$nul	null
+$min	single field str	=s$s	sstr
+$min	single int	=i5	i5
+$min	single double	=d2.5	d2.5
+$min	single dec	=D2.5	D2.5
+$min	single bool	=T	T
+$min	single obj	=O{a=i1}	O{a=i1}
+$min	single $literal arr	=QA[i1,i2,i3]	i1
+$min	single $literal arr junk	=QA[i1,sa,null]	i1
+$min	single $literal nested	=QA[A[i1],i2]	i2
+$min	single $literal empty	=QA[]	null
+$min	single date	=t5	t5
+$min	single ts field	=s$ts	ts1700000000:5
+$min	single bin field	=s$bin	binAQID
+$max	single field arr	=s$arr	i3
+$max	single field int	=s$i	i7
+$max	single field null	=s$nul	null
+$max	single field str	=s$s	sstr
+$max	single int	=i5	i5
+$max	single double	=d2.5	d2.5
+$max	single dec	=D2.5	D2.5
+$max	single bool	=T	T
+$max	single obj	=O{a=i1}	O{a=i1}
+$max	single $literal arr	=QA[i1,i2,i3]	i3
+$max	single $literal arr junk	=QA[i1,sa,null]	sa
+$max	single $literal nested	=QA[A[i1],i2]	A[i1]
+$max	single $literal empty	=QA[]	null
+$max	single date	=t5	t5
+$max	single ts field	=s$ts	ts1700000000:5
+$max	single bin field	=s$bin	binAQID

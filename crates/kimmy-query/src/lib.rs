@@ -52,6 +52,9 @@ mod facet_tests;
 #[cfg(test)]
 mod fill_tests;
 #[cfg(test)]
+mod fold_tests;
+
+#[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
 mod json_schema_filter_tests;

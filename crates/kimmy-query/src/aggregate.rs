@@ -2903,6 +2903,22 @@ fn init_within((_, acc): &(String, Accumulator), max: usize) -> AccState {
     }
 }
 
+/// `$min` (or, with `max`, `$max`) taking one value: a null is skipped, a value replaces the
+/// current one only when it orders strictly before (after) it, so the first of two equal
+/// values stays. The `$group` accumulators and the expression forms of the operators share it.
+pub(crate) fn keep_extreme(current: &mut Option<Bson>, value: Bson, max: bool) {
+    if matches!(value, Bson::Null) {
+        return;
+    }
+    let ahead = |c: &Bson| {
+        let order = kimmy_core::cmp::canonical_cmp(&value, c);
+        if max { order.is_gt() } else { order.is_lt() }
+    };
+    if current.as_ref().is_none_or(ahead) {
+        *current = Some(value);
+    }
+}
+
 /// Feed one document to one accumulator.
 pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     // One tick for each accumulator step (ADR-266): the argument can be an expression of any
@@ -2915,20 +2931,10 @@ pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<
         }
         (AccState::Avg(mean), Accumulator::Avg(e)) => mean.add(&e.eval_in(scope)?),
         (AccState::MinMax(current), Accumulator::Min(e)) => {
-            let v = e.eval_in(scope)?;
-            if !matches!(v, Bson::Null)
-                && current.as_ref().is_none_or(|c| kimmy_core::cmp::canonical_cmp(&v, c).is_lt())
-            {
-                *current = Some(v);
-            }
+            keep_extreme(current, e.eval_in(scope)?, false);
         }
         (AccState::MinMax(current), Accumulator::Max(e)) => {
-            let v = e.eval_in(scope)?;
-            if !matches!(v, Bson::Null)
-                && current.as_ref().is_none_or(|c| kimmy_core::cmp::canonical_cmp(&v, c).is_gt())
-            {
-                *current = Some(v);
-            }
+            keep_extreme(current, e.eval_in(scope)?, true);
         }
         (AccState::First(current), Accumulator::First(e)) => {
             if current.is_none() {
@@ -5762,24 +5768,24 @@ mod identity {
         assert_eq!(counted, vec![doc! { "n": 3_i32 }]);
     }
 
-    /// `$sum` and `$avg` are accumulators only: as expression operators, in
-    /// `$project` or anywhere an expression is parsed, they are not built and
-    /// are refused at parse whatever their operands, a decimal or an array
-    /// holding one included. So there is no expression form to refuse a
-    /// decimal in, and no array an expression sums.
+    /// `$sum` and `$avg` are expression operators as well as accumulators: in `$project`
+    /// they total a list of operands or the array an operand is, and a decimal among them
+    /// makes the answer a decimal, as it does in a group (ADR-252). Refusing them, as the
+    /// build once did, was the only way an expression could not take a decimal.
     #[test]
-    fn sum_and_avg_are_not_expression_operators() {
-        for op in ["$sum", "$avg"] {
-            for arg in [
-                Bson::Array(vec![Bson::Int32(1), dec("2.5")]),
-                Bson::String("$a".into()),
-                Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]),
-            ] {
-                let mut expr = Document::new();
-                expr.insert(op, arg.clone());
-                let err = parse(&[doc! { "$project": { "r": expr } }]).unwrap_err().to_string();
-                assert!(err.contains(op) && err.contains("not an expression operator"), "{err}");
-            }
+    fn sum_and_avg_are_expression_operators() {
+        for (op, arg, want) in [
+            ("$sum", Bson::Array(vec![Bson::Int32(1), dec("2.5")]), dec("3.5")),
+            ("$sum", Bson::String("$a".into()), Bson::Int32(6)),
+            ("$sum", Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]), Bson::Int32(3)),
+            ("$avg", Bson::Array(vec![Bson::Int32(1), dec("2.5")]), dec("1.75")),
+            ("$avg", Bson::String("$a".into()), Bson::Double(2.0)),
+            ("$avg", Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]), Bson::Double(1.5)),
+        ] {
+            let mut expr = Document::new();
+            expr.insert(op, arg.clone());
+            let out = run(vec![doc! { "$project": { "r": expr } }], vec![doc! { "a": [1, 2, 3] }]);
+            assert_eq!(out[0].get("r"), Some(&want), "{op} {arg}");
         }
         // The other arithmetic takes a decimal when it evaluates (ADR-252),
         // except `$mod`, which refuses one by name.

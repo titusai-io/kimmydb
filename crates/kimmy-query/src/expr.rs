@@ -2838,10 +2838,9 @@ impl Total {
         self.double_seen |= matches!(n, Num::Dbl(_));
         // The running total is read only once a double was added; integers are typed
         // at the end from `seen`'s exact total (see `to_bson`).
-        self.plain = Some(match self.plain {
-            Some(acc) => acc.add(n),
-            None => n,
-        });
+        // The sum starts at the `Int32` zero, so that the sum of a lone `-0.0` is `0.0`, as the
+        // reference's is.
+        self.plain = Some(self.plain.unwrap_or(Num::Int32(0)).add(n));
     }
 
     /// The sum, as the reference types it (ADR-268): an `Int32` while every integer
