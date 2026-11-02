@@ -368,6 +368,13 @@ fn parse_output(
                             "$shift `default` must be a constant: it cannot read the document",
                         );
                     }
+                    // A `$rand` reads no document but is not a constant either: it would be
+                    // drawn for each document that needs the default.
+                    if expr.draws_random() {
+                        return bad(
+                            "$shift `default` must be a constant: it cannot draw a random number",
+                        );
+                    }
                     Some(expr)
                 }
             };

@@ -1024,6 +1024,15 @@ fn shift_refusals() {
     assert!(
         r(Bson::Document(doc! {"output": "$a", "by": 1, "default": "$b"})).contains("constant")
     );
+    // A `$rand` reads no document and is still no constant.
+    assert!(
+        r(Bson::Document(doc! {"output": "$a", "by": 1, "default": {"$rand": {}}}))
+            .contains("random")
+    );
+    assert!(
+        r(Bson::Document(doc! {"output": "$a", "by": 1, "default": {"$add": [1, {"$rand": {}}]}}))
+            .contains("constant")
+    );
     assert!(
         r(Bson::Document(doc! {"output": "$a", "by": 1, "other": 1}))
             .contains("unknown argument: other")
