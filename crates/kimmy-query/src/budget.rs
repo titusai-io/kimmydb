@@ -250,6 +250,10 @@ struct PoolInner {
     /// Who holds a reservation, oldest first, and the wake-up for a request that waits.
     order: Mutex<Order>,
     freed: Condvar,
+    /// Requests asleep in [`MemoryPool::wait_for_release`]: a release wakes them only when
+    /// there are some, since waking is a system call that most releases (every key a `find`
+    /// puts back) have nobody to answer.
+    waiters: AtomicUsize,
     /// Charges refused for taking one request over its own limit, and charges refused
     /// because the pool was empty: what `/metrics` counts.
     limit_refusals: AtomicU64,
@@ -268,6 +272,7 @@ impl MemoryPool {
             used: AtomicUsize::new(0),
             order: Mutex::new(Order::default()),
             freed: Condvar::new(),
+            waiters: AtomicUsize::new(0),
             limit_refusals: AtomicU64::new(0),
             pool_refusals: AtomicU64::new(0),
         }))
@@ -328,7 +333,20 @@ impl MemoryPool {
                 Err(now) => used = now,
             }
         }
-        self.0.freed.notify_all();
+        self.wake();
+    }
+
+    /// The requests asleep in the wait now.
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> usize {
+        self.0.waiters.load(Ordering::SeqCst)
+    }
+
+    /// Wake the requests that wait for the pool, if there are any.
+    fn wake(&self) {
+        if self.0.waiters.load(Ordering::SeqCst) > 0 {
+            self.0.freed.notify_all();
+        }
     }
 
     fn order(&self) -> MutexGuard<'_, Order> {
@@ -350,7 +368,7 @@ impl MemoryPool {
     /// `seq` holds nothing now.
     fn unhold(&self, seq: u64) {
         self.order().holders.remove(&seq);
-        self.0.freed.notify_all();
+        self.wake();
     }
 
     /// Whether no request that holds a reservation is younger than `seq`: the one that is
@@ -365,9 +383,15 @@ impl MemoryPool {
     }
 
     /// Sleep until a release, or `slice` at the most.
+    ///
+    /// The count is raised before the wait begins, so a release after it is seen wakes the
+    /// request; one that came between the request's look at the pool and the count is
+    /// missed, and the slice is what bounds that.
     fn wait_for_release(&self, slice: Duration) {
+        self.0.waiters.fetch_add(1, Ordering::SeqCst);
         let order = self.order();
         let _ = self.0.freed.wait_timeout(order, slice);
+        self.0.waiters.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

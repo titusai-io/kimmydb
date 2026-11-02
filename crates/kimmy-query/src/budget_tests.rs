@@ -338,6 +338,37 @@ fn an_older_request_waits_for_the_pool_and_is_woken_by_a_release() {
 }
 
 #[test]
+fn the_pool_counts_the_requests_that_sleep_in_its_wait_and_a_release_wakes_them() {
+    // A release wakes the requests that wait only when there are some (it is a system call,
+    // and most releases have nobody to answer). While the older waits it is counted, a release
+    // wakes it at once and not at the end of its slice, and none is counted after.
+    let pool = MemoryPool::new(100);
+    let (_b, mut older) = holder(&pool, 10);
+    let (_a, younger) = holder(&pool, 80);
+    assert_eq!(pool.waiters(), 0);
+    let waiter = std::thread::spawn(move || {
+        let result = older.charge(50);
+        (result, older)
+    });
+    let started = Instant::now();
+    while pool.waiters() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "the older request never waited");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(pool.waiters(), 1);
+    drop(younger);
+    let (result, older) = waiter.join().unwrap();
+    result.unwrap();
+    assert_eq!(pool.waiters(), 0);
+    drop(older);
+    assert_eq!((pool.used(), pool.holders(), pool.waiters()), (0, 0, 0));
+    // With nobody waiting, releases and leaves are not wakes: they still return the bytes.
+    let (_c, held) = holder(&pool, 40);
+    drop(held);
+    assert_eq!((pool.used(), pool.waiters()), (0, 0));
+}
+
+#[test]
 fn the_younger_request_is_refused_while_the_older_waits_and_the_older_then_completes() {
     let pool = MemoryPool::new(100);
     let (_b, mut older) = holder(&pool, 10);
