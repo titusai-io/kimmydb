@@ -24,6 +24,7 @@ pub use kimmy_core::json_schema;
 /// Dot-path resolution. Lives in `kimmy-core` because index maintenance in
 /// `kimmy-storage` needs it too; re-exported here for convenience.
 pub use kimmy_core::path;
+pub mod pipeline;
 pub mod plan;
 pub mod shape;
 pub mod stages;
