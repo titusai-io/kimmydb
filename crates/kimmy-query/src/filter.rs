@@ -3608,3 +3608,201 @@ mod scoped {
         assert!(!read(doc! {}));
     }
 }
+
+#[cfg(test)]
+mod draws_random_and_branch_equality_tests {
+    use bson::doc;
+
+    use super::*;
+
+    fn parsed(query: Document) -> Filter {
+        parse(&query).unwrap_or_else(|e| panic!("{query}: {e}"))
+    }
+
+    /// A condition that draws, held in each way a condition can hold a filter or an expression.
+    fn drawing() -> Vec<(&'static str, Condition)> {
+        let sample = Filter::SampleRate(0.5);
+        let rand = parsed(doc! { "$expr": { "$lt": [{ "$rand": {} }, 0.5] } });
+        vec![
+            ("an $elemMatch holding a $sampleRate", Condition::ElemMatch(Box::new(sample.clone()))),
+            ("an $elemMatch holding an $expr with $rand", Condition::ElemMatch(Box::new(rand))),
+            (
+                "a $not of an $elemMatch that draws",
+                Condition::Not(Box::new(Condition::ElemMatch(Box::new(sample.clone())))),
+            ),
+        ]
+    }
+
+    fn plain() -> Vec<(&'static str, Condition)> {
+        let plain = parsed(doc! { "$expr": { "$lt": ["$q", 5] } });
+        vec![
+            (
+                "an $elemMatch holding an $expr that does not draw",
+                Condition::ElemMatch(Box::new(plain)),
+            ),
+            (
+                "an $elemMatch holding a field",
+                Condition::ElemMatch(Box::new(parsed(doc! { "q": 1 }))),
+            ),
+            ("a $not of one", Condition::Not(Box::new(Condition::Eq(Bson::Int32(1))))),
+            ("an equality", Condition::Eq(Bson::Int32(1))),
+        ]
+    }
+
+    #[test]
+    fn a_condition_that_holds_a_filter_or_an_expression_that_draws_draws() {
+        for (what, condition) in drawing() {
+            assert!(condition_draws_random(&condition), "{what}");
+            // And so does the filter that holds it, in a field's conditions and under `$and`.
+            let field = Filter::Field { path: "a".into(), conditions: vec![condition.clone()] };
+            assert!(field.draws_random(), "{what}, in a field");
+            assert!(
+                conjunction(vec![parsed(doc! { "b": 1 }), field]).draws_random(),
+                "{what}, under $and"
+            );
+        }
+        for (what, condition) in plain() {
+            assert!(!condition_draws_random(&condition), "{what}");
+            let field = Filter::Field { path: "a".into(), conditions: vec![condition] };
+            assert!(!field.draws_random(), "{what}, in a field");
+        }
+    }
+
+    #[test]
+    fn both_needs_only_one_of_its_two_conditions_to_draw() {
+        let both = |a: Condition, b: Condition| Condition::Both(Box::new(a), Box::new(b));
+        for (what, drawn) in drawing() {
+            for (other, quiet) in plain() {
+                assert!(
+                    condition_draws_random(&both(drawn.clone(), quiet.clone())),
+                    "{what}, then {other}"
+                );
+                assert!(
+                    condition_draws_random(&both(quiet, drawn.clone())),
+                    "{other}, then {what}"
+                );
+            }
+            // Drawing in both, and in a nested `Both`.
+            assert!(condition_draws_random(&both(drawn.clone(), drawn.clone())));
+            let nested = both(Condition::Eq(Bson::Null), both(Condition::AlwaysTrue, drawn));
+            assert!(condition_draws_random(&nested), "{what}, nested");
+        }
+        for (a, first) in plain() {
+            for (b, second) in plain() {
+                assert!(!condition_draws_random(&both(first.clone(), second)), "{a}, then {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_other_kind_of_condition_draws() {
+        // One filter for every operator a condition is made of, parsed, so each variant that
+        // `condition_draws_random` lists is held to false through the filter that holds it.
+        for query in [
+            doc! { "a": 1 },
+            doc! { "a": { "$ne": 1 } },
+            doc! { "a": { "$gt": 1, "$lt": 9 } },
+            doc! { "a": { "$gte": 1, "$lte": 9 } },
+            doc! { "a": { "$in": [1, 2] } },
+            doc! { "a": { "$nin": [1, 2] } },
+            doc! { "a": { "$exists": true } },
+            doc! { "a": { "$type": "int" } },
+            doc! { "a": { "$regex": "x" } },
+            doc! { "a": { "$all": [1, 2] } },
+            doc! { "a": { "$size": 2 } },
+            doc! { "a": { "$mod": [2, 1] } },
+            doc! { "a": { "$bitsAllSet": 3 } },
+            doc! { "a": { "$not": { "$gt": 1, "$lt": 5 } } },
+            doc! { "a": { "$elemMatch": { "b": 1 } } },
+            doc! { "$and": [{ "a": 1 }, { "$or": [{ "b": 2 }, { "c": 3 }] }] },
+            doc! { "$nor": [{ "a": 1 }] },
+        ] {
+            assert!(!parsed(query.clone()).draws_random(), "{query}");
+        }
+        for condition in [Condition::AlwaysTrue, Condition::Size(2), Condition::Exists(true)] {
+            assert!(!condition_draws_random(&condition), "{condition:?}");
+        }
+        // And the ones that do, through the parser: an `$expr` holding `$rand`, under an
+        // `$elemMatch`, a `$not`, an `$or`, an `$and` and a `$nor`.
+        let rand = doc! { "$expr": { "$lt": [{ "$rand": {} }, 0.5] } };
+        for query in [
+            rand.clone(),
+            doc! { "a": { "$elemMatch": rand.clone() } },
+            doc! { "a": { "$not": { "$elemMatch": rand.clone() } } },
+            doc! { "$or": [{ "b": 1 }, rand.clone()] },
+            doc! { "$and": [{ "b": 1 }, rand.clone()] },
+            doc! { "$nor": [rand.clone()] },
+            doc! { "$sampleRate": 0.5 },
+        ] {
+            assert!(parsed(query.clone()).draws_random(), "{query}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `Branches` equality: the same clauses in the same evaluation order
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_parses_of_a_query_are_equal_and_two_different_queries_are_not() {
+        let and = |clauses: Vec<Document>| {
+            parsed(doc! { "$and": clauses.into_iter().map(Bson::Document).collect::<Vec<_>>() })
+        };
+        let or = |clauses: Vec<Document>| {
+            parsed(doc! { "$or": clauses.into_iter().map(Bson::Document).collect::<Vec<_>>() })
+        };
+        let (a, b, c) = (doc! { "a": 1 }, doc! { "b": 2 }, doc! { "c": 3 });
+        // Equal: the same text twice, for an `$and` and an `$or`.
+        assert_eq!(and(vec![a.clone(), b.clone()]), and(vec![a.clone(), b.clone()]));
+        assert!(and(vec![a.clone(), b.clone()]) == and(vec![a.clone(), b.clone()]));
+        assert_eq!(or(vec![a.clone(), b.clone()]), or(vec![a.clone(), b.clone()]));
+        // Different: another clause, another number of clauses, another order of evaluation,
+        // and an `$and` against an `$or` of the same clauses.
+        assert!(and(vec![a.clone(), b.clone()]) != and(vec![a.clone(), c.clone()]));
+        assert!(and(vec![a.clone(), b.clone()]) != and(vec![a.clone(), b.clone(), c.clone()]));
+        assert!(and(vec![a.clone(), b.clone()]) != and(vec![b.clone(), a.clone()]));
+        assert!(and(vec![a.clone(), b.clone()]) != or(vec![a.clone(), b.clone()]));
+        assert!(or(vec![a.clone()]) != or(vec![doc! { "a": 2 }]));
+    }
+
+    #[test]
+    fn branches_are_equal_by_evaluation_order_and_not_by_the_order_written() {
+        // `cheap_first` puts the clause holding an `$expr` after the others, so the two written
+        // orders are one list in evaluation order: equal, though they were written apart, and
+        // `in_written_order` still tells them apart.
+        let expr = doc! { "$expr": { "$gt": ["$a", "$b"] } };
+        let plain = doc! { "c": 1 };
+        let written_expr_first = parsed(doc! { "$and": [expr.clone(), plain.clone()] });
+        let written_plain_first = parsed(doc! { "$and": [plain.clone(), expr.clone()] });
+        assert_eq!(written_expr_first, written_plain_first);
+        let (Filter::And(first), Filter::And(second)) = (&written_expr_first, &written_plain_first)
+        else {
+            panic!("an $and");
+        };
+        assert!(first == second);
+        let order = |branches: &Branches| {
+            branches.in_written_order().map(|f| matches!(f, Filter::Expr(_))).collect::<Vec<_>>()
+        };
+        assert_eq!(order(first), vec![true, false]);
+        assert_eq!(order(second), vec![false, true]);
+        // And a list that differs in a clause is not equal to either.
+        let other = parsed(doc! { "$and": [expr, doc! { "c": 2 }] });
+        assert_ne!(other, written_expr_first);
+        let Filter::And(third) = &other else { panic!("an $and") };
+        assert!(third != first);
+        assert!(!(third == second));
+    }
+
+    #[test]
+    fn branches_made_of_the_same_clauses_compare_by_those_clauses() {
+        let clauses = || vec![Filter::SampleRate(0.5), parsed(doc! { "a": 1 })];
+        let one: Branches = clauses().into();
+        let same: Branches = clauses().into();
+        let different: Branches = vec![Filter::SampleRate(0.25), parsed(doc! { "a": 1 })].into();
+        let shorter: Branches = vec![Filter::SampleRate(0.5)].into();
+        assert!(one == same);
+        assert!(!(one != same));
+        assert!(one != different);
+        assert!(one != shorter);
+        assert!(shorter != one);
+    }
+}
