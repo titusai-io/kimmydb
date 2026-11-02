@@ -1465,6 +1465,20 @@ than as an `$or` of one `$regex` each.
 | `$jsonSchema` | ✅ Built as a filter operator — see [`$jsonSchema`](#jsonschema) |
 | Geospatial operators | ⛔ Not planned |
 | Text indexes / `$text` | ⛔ Superseded by [vector and hybrid search](vectors.md) |
+| The trigonometric expression operators `$sin`, `$cos`, `$tan`, `$asin`, `$acos`, `$atan`, `$atan2`, `$sinh`, `$cosh`, `$tanh`, `$asinh`, `$acosh`, `$atanh`, `$degreesToRadians` and `$radiansToDegrees` | ⏳ Not built |
+| `$log` (a number and a base); `$ln` and `$log10` are built | ⏳ Not built |
+| `$sum`, `$avg`, `$min` and `$max` as expression operators (over an array, or over several arguments); the `$group`, `$bucket`, `$bucketAuto` and window forms are built, and `$stdDevPop`, `$stdDevSamp`, `$firstN`, `$lastN`, `$maxN` and `$minN` already take an array | ⏳ Not built |
+| `$binarySize`, `$bsonSize` | ⏳ Not built |
+| `$tsSecond`, `$tsIncrement` | ⏳ Not built |
+| `$rand`, `$sampleRate` | ⏳ Not built |
+| `$documents` (a pipeline that starts from literal documents, with no collection) | ⏳ Not built |
+| `$collStats`, `$indexStats` | ⏳ Not built |
+| `$accumulator`, `$function` | ⛔ Never — JavaScript execution, as `$where` |
+| `$meta` | ⛔ Not applicable — there is no text or Atlas Search score to read; see [vector and hybrid search](vectors.md) |
+| `$search`, `$searchMeta` | ⛔ Superseded by [vector and hybrid search](vectors.md) |
+| `$geoNear` | ⛔ Not planned, with the geospatial operators |
+| `$changeStream` | ⛔ Not a stage — see [Change streams](change-streams.md) |
+| `$currentOp`, `$listSessions`, `$listLocalSessions`, `$planCacheStats`, `$shardedDataDistribution` | ⛔ Not planned — administration stages of a sharded MongoDB |
 
 ---
 
