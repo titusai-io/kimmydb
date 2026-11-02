@@ -427,12 +427,25 @@ pub fn find(
             let mut seen = 0usize;
             let mut refused: Option<ApiError> = None;
             let (mut stamps, mut docs) = (Vec::new(), Vec::new());
-            let stats = visit_matching(
+            // A range that is inexact is read whole to put its documents in `_id` order, and
+            // the keys it holds while it does are held to the node's memory pool (ADR-269),
+            // under the request's limit: a filter that rejects most candidates makes the walk
+            // go on to passes that double, up to the whole range. The lease is made when the
+            // first key is held, so a read that takes another path never touches the pool.
+            let keys = IndexKeys::lazy(|| {
+                state
+                    .aggregate_memory()
+                    .budget()
+                    .lease_worded("the index range of the filter", FIND_RANGE_KEYS)
+            });
+            let bounds =
+                ScanBounds { stop_after: Some(window), want: Some(window), hold: Some(&keys) };
+            let stats = visit_matching_bounded(
                 state,
                 &meta,
                 &filter,
                 Order::ById { after: cursor.as_ref().map(|c| c.key()) },
-                Some(window),
+                bounds,
                 |stamp, doc| {
                     seen += 1;
                     if seen > skip {
@@ -457,6 +470,7 @@ pub fn find(
                             }
                         }
                     }
+                    Ok(true)
                 },
             )?;
             if let Some(e) = refused {
@@ -2538,34 +2552,106 @@ async fn aggregate_run_held(
 }
 
 /// The keys of an index range, held to the request's budget while the scan collects them.
-struct IndexKeys {
-    lease: std::cell::RefCell<Lease>,
+struct IndexKeys<'a> {
+    account: std::cell::RefCell<Account<'a>>,
     held: std::cell::Cell<usize>,
 }
 
-impl IndexKeys {
+/// The lease the keys are charged to: made already, or made when the first key is held.
+enum Account<'a> {
+    Open(Lease),
+    Later(Box<dyn Fn() -> Lease + 'a>),
+}
+
+impl<'a> IndexKeys<'a> {
     fn new(lease: Lease) -> Self {
-        IndexKeys { lease: std::cell::RefCell::new(lease), held: std::cell::Cell::new(0) }
+        IndexKeys { account: std::cell::RefCell::new(Account::Open(lease)), held: 0.into() }
+    }
+
+    /// Keys that make their lease with `open` at the first key they hold, and none before:
+    /// a read that never collects keys (every path of a `find` but one) has no lease, no
+    /// budget and no pool to touch.
+    fn lazy(open: impl Fn() -> Lease + 'a) -> Self {
+        IndexKeys {
+            account: std::cell::RefCell::new(Account::Later(Box::new(open))),
+            held: 0.into(),
+        }
     }
 }
 
-impl kimmy_storage::KeyHold for IndexKeys {
+impl kimmy_storage::KeyHold for IndexKeys<'_> {
     fn take(&self, len: usize) -> kimmy_core::Result<()> {
         let bytes = kimmy_query::budget::held_set_key(len);
         self.held.set(self.held.get().saturating_add(bytes));
-        self.lease.borrow_mut().charge(bytes)
+        let mut account = self.account.borrow_mut();
+        if let Account::Later(open) = &*account {
+            let lease = open();
+            *account = Account::Open(lease);
+        }
+        let charged = match &mut *account {
+            Account::Open(lease) => lease.charge(bytes),
+            Account::Later(_) => Ok(()),
+        };
+        #[cfg(test)]
+        if charged.is_ok() {
+            key_hooks::taken(self.held.get());
+        }
+        charged
     }
 
     fn give(&self, len: usize) {
         let bytes = kimmy_query::budget::held_set_key(len).min(self.held.get());
         self.held.set(self.held.get() - bytes);
-        self.lease.borrow_mut().release(bytes);
+        if let Account::Open(lease) = &mut *self.account.borrow_mut() {
+            lease.release(bytes);
+        }
     }
 
     fn give_all(&self) {
-        self.lease.borrow_mut().release(self.held.replace(0));
+        let bytes = self.held.replace(0);
+        if let Account::Open(lease) = &mut *self.account.borrow_mut() {
+            lease.release(bytes);
+        }
     }
 }
+
+/// Test-only: what the thread runs after each key its `IndexKeys` holds, with the bytes
+/// held then. A test that needs a read to be at a known place (holding some of the pool, and
+/// not yet done) stops it here.
+#[cfg(test)]
+pub(crate) mod key_hooks {
+    type Hook = Box<dyn FnMut(usize)>;
+
+    thread_local! {
+        static AFTER_KEY: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn after_each_key(hook: impl FnMut(usize) + 'static) {
+        AFTER_KEY.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn taken(held: usize) {
+        AFTER_KEY.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(held);
+            }
+        });
+    }
+}
+
+/// How a `find` over an index range words a refusal for the keys it holds. The remedies of an
+/// aggregation are not its: the range is read to put the page in `_id` order, and what makes
+/// it smaller is the filter, what avoids it is a sort on another field (a sorted `find` reads
+/// the range in index order and holds only `skip + limit` documents), and a large `skip` is
+/// what a `cursor` replaces.
+const FIND_RANGE_KEYS: kimmy_query::budget::Wording = kimmy_query::budget::Wording {
+    holder: "one find",
+    over_limit: "narrow the filter on the indexed field so that its range is smaller; sort by a \
+                 field other than _id (a sorted find reads the range in index order and holds \
+                 only skip + limit documents); page with `cursor` rather than a large `skip`; \
+                 or raise aggregate.memory_limit_bytes",
+    pool_busy: "narrow the filter on the indexed field, or sort by a field other than _id",
+};
 
 /// An aggregation over a collection, from the read of its source to the answer, under the
 /// request's deadline: `source` is the collection, the filter that narrows the read and what
@@ -5397,6 +5483,9 @@ mod memory_tests;
 
 #[cfg(test)]
 mod stream_tests;
+
+#[cfg(test)]
+mod find_hold_tests;
 
 #[cfg(test)]
 mod deadline_tests;
