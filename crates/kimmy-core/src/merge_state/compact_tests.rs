@@ -52,8 +52,8 @@ fn the_golden_states_round_trip_and_are_much_smaller() {
             assert!(enc.len() * 2 < verbose, "{name}: {} against {verbose}", enc.len());
         }
     }
-    // The empty state: nine counts and no table entry.
-    assert_eq!(golden_empty().compact_bytes(), vec![0; 9]);
+    // The empty state: ten counts (the last is section 10's) and no table entry.
+    assert_eq!(golden_empty().compact_bytes(), vec![0; 10]);
 }
 
 /// The compact hash and length of the five golden states, as the reference model's independent
@@ -64,11 +64,11 @@ fn the_golden_states_round_trip_and_are_much_smaller() {
 fn the_compact_golden_hashes_agree_with_the_reference_model() {
     let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     for (name, st, want) in [
-        ("empty", golden_empty(), ("e145d6a7daf371398c7b574cd9aa42d4", 9)),
-        ("170", golden_170(), ("45e14c7b5dd32f32f7cf6543335f3fb1", 213)),
-        ("mixed", golden_mixed(), ("855d32c60d7c369fb409ecf4d6b6331a", 340)),
-        ("delete", golden_delete(), ("95a3e75ef534ce08fd975b1224a8af76", 233)),
-        ("obs", golden_obs(), ("d785253ed2c10e27e148d2a7f2f251cd", 255)),
+        ("empty", golden_empty(), ("6a9f06d361f4fb8c789c079f6563280a", 10)),
+        ("170", golden_170(), ("9852c38d33bbede32993a047338b65f3", 214)),
+        ("mixed", golden_mixed(), ("220d1eaef3e4f5a85dc9516dc3f0edaa", 341)),
+        ("delete", golden_delete(), ("13a5a3379b963c8ee4ac35a7102437df", 234)),
+        ("obs", golden_obs(), ("f0a36fa50cacf322ad787f91a73c2a97", 256)),
     ] {
         assert_eq!((hex(st.compact_hash()).as_str(), st.compact_bytes().len()), want, "{name}");
     }
