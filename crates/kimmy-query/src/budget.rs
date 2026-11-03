@@ -688,6 +688,20 @@ pub(crate) fn output_of(stage: &str) -> &'static str {
     }
 }
 
+/// What the state of a stage that holds its groups and not its input is named in a refusal
+/// for the bytes it holds (ADR-270): the buckets of a `$group`, the heap of a `$sort` that
+/// keeps the first documents, the reservoir of a `$sample`.
+pub(crate) fn state_of(stage: &str) -> &'static str {
+    match stage {
+        "$group" => "the buckets of $group",
+        "$bucket" => "the buckets of $bucket",
+        "$sortByCount" => "the buckets of $sortByCount",
+        "$sort" => "the heap of $sort",
+        "$sample" => "the reservoir of $sample",
+        _ => "the state of a stage",
+    }
+}
+
 /// What a stage's input is named in a refusal for the bytes it holds.
 pub(crate) fn input_of(stage: &str) -> &'static str {
     match stage {

@@ -119,39 +119,22 @@ fn unwind_stops_in_its_outer_loop_and_in_the_array_it_fans_out() {
 
 #[test]
 fn group_stops_in_its_loop() {
-    let Stage::Group { id, fields } =
-        stage(doc! { "$group": { "_id": "$_id", "n": { "$sum": "$v" } } })
-    else {
-        unreachable!()
-    };
+    let group = stage(doc! { "$group": { "_id": "$_id", "n": { "$sum": "$v" } } });
     {
         let _deadline = expired();
-        assert!(is_deadline(group(rows(1), &id, &fields, &Limits::default(), &[], &mut lease())));
+        assert!(is_deadline(group_all(&group, &rows(1), &Limits::default(), &[], &mut lease())));
     }
     // The per-document loop, with the deadline passing while it runs.
     let _deadline = soon();
-    assert!(is_deadline(group(rows(100_000), &id, &fields, &Limits::default(), &[], &mut lease())));
+    assert!(is_deadline(group_all(&group, &rows(100_000), &Limits::default(), &[], &mut lease())));
 }
 
 #[test]
 fn bucket_and_bucket_auto_stop_in_their_loops() {
-    let Stage::Bucket { group_by, boundaries, default, fields } =
-        stage(doc! { "$bucket": { "groupBy": "$v", "boundaries": [0, 50_000, 100_000] } })
-    else {
-        unreachable!()
-    };
+    let bucket = stage(doc! { "$bucket": { "groupBy": "$v", "boundaries": [0, 50_000, 100_000] } });
     {
         let _deadline = expired();
-        let result = bucket(
-            rows(1),
-            &group_by,
-            &boundaries,
-            default.as_ref(),
-            &fields,
-            &Limits::default(),
-            &[],
-            &mut lease(),
-        );
+        let result = group_all(&bucket, &rows(1), &Limits::default(), &[], &mut lease());
         assert!(is_deadline(result));
     }
     let Stage::BucketAuto { group_by, buckets, fields } =
@@ -367,18 +350,10 @@ fn redact_stops_in_a_descent_through_many_embedded_documents() {
 
 #[test]
 fn sort_by_count_stops_in_its_group_loop() {
-    let expr = Expr::parse(&Bson::String("$k".into())).unwrap();
-    assert!(
-        crate::stages::sort_by_count(rows(2), &expr, &Limits::default(), &[], &mut lease()).is_ok()
-    );
+    let by_count = stage(doc! { "$sortByCount": "$k" });
+    assert!(group_all(&by_count, &rows(2), &Limits::default(), &[], &mut lease()).is_ok());
     let _deadline = expired();
-    assert!(is_deadline(crate::stages::sort_by_count(
-        rows(2),
-        &expr,
-        &Limits::default(),
-        &[],
-        &mut lease()
-    )));
+    assert!(is_deadline(group_all(&by_count, &rows(2), &Limits::default(), &[], &mut lease())));
 }
 
 #[test]
@@ -459,14 +434,11 @@ fn the_bulk_operators_charge_what_they_are_about_to_touch() {
 #[test]
 fn each_accumulator_step_ticks() {
     use kimmy_core::deadline::ticks_taken;
-    let Stage::Group { id, fields } =
-        stage(doc! { "$group": { "_id": null, "s": { "$sum": "$v" }, "p": { "$push": "$v" } } })
-    else {
-        unreachable!()
-    };
+    let group =
+        stage(doc! { "$group": { "_id": null, "s": { "$sum": "$v" }, "p": { "$push": "$v" } } });
     let _deadline = Deadline::scope(Some(Duration::from_secs(3600)));
     let before = ticks_taken();
-    group(rows(500), &id, &fields, &Limits::default(), &[], &mut lease()).unwrap();
+    group_all(&group, &rows(500), &Limits::default(), &[], &mut lease()).unwrap();
     // Two accumulators over 500 documents.
     assert!(ticks_taken() - before >= 1_000, "{} ticks", ticks_taken() - before);
 }

@@ -116,27 +116,185 @@ fn an_error_in_a_document_past_a_full_limit_is_not_raised() {
     assert!(err.message.contains("$divide"), "{}", err.message);
 }
 
+/// `div` is a `$divide` by the document's `d`, which is 0 in the document that fails.
+fn div() -> Value {
+    json!({"$divide": [1, "$d"]})
+}
+
 #[test]
-fn an_error_in_a_document_a_skip_drops_is_still_raised_until_the_skip_is_moved_ahead() {
-    // Registered in `docs/deviations.md` (skipped-documents-adr-270): the reference moves a
-    // `$skip` and a `$limit` ahead of `$addFields`, and answers `[5, 6]` here; a stage that
-    // streams evaluates every document that reaches the skip. P2 builds the reordering and
-    // this becomes an answer.
+fn a_skip_and_a_limit_move_ahead_of_the_stages_the_references_optimizer_moves_them_ahead_of() {
+    // The reference's rows (`adr270-reorder.js`, `adr270-reorder2.js`): 20 documents, the
+    // failing one is number 3, and a `$skip: 5` and a `$limit: 2` that drop it answer `[5, 6]`.
     let dir = tempfile::tempdir().unwrap();
-    let state = state_with(&dir, numbered(40, &[3]));
-    let divide = json!({"$addFields": {"x": {"$divide": [1, "$d"]}}});
-    let err = run(
-        &state,
-        json!([divide.clone(), {"$skip": 5}, {"$limit": 2}]),
-        aggregate::Limits::default(),
-    )
-    .unwrap_err();
-    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    let state = state_with(&dir, numbered(20, &[3]));
+    let window = || vec![json!({"$skip": 5}), json!({"$limit": 2})];
+    let pipeline = |stages: Vec<Value>| {
+        let mut stages = stages;
+        stages.extend(window());
+        Value::Array(stages)
+    };
+    let answers = |stages: Vec<Value>| {
+        ids(&run(&state, pipeline(stages), aggregate::Limits::default()).unwrap())
+    };
+    let fails = |stages: Vec<Value>| {
+        let err = run(&state, pipeline(stages), aggregate::Limits::default()).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST, "{}", err.message);
+        assert!(err.message.contains("$divide"), "{}", err.message);
+    };
+    // The stages a window moves ahead of.
+    let merged = json!({"$mergeObjects": ["$$ROOT", {"x": div()}]});
+    for stage in [
+        json!({"$addFields": {"x": div()}}),
+        json!({"$set": {"x": div()}}),
+        json!({"$project": {"x": div()}}),
+        json!({"$replaceRoot": {"newRoot": merged.clone()}}),
+        json!({"$replaceWith": merged}),
+        json!({"$lookup": {"from": "orders", "let": {"d": "$d"}, "pipeline": [
+            {"$match": {"$expr": {"$gt": [{"$divide": [1, "$$d"]}, 0]}}}, {"$limit": 1}],
+            "as": "l"}}),
+    ] {
+        assert_eq!(answers(vec![stage.clone()]), [5, 6], "{stage}");
+    }
+    // The stages it does not: the window stays behind them, and the failure is raised.
+    let redact = json!({"$redact": {"$cond": [{"$gt": [div(), 0]}, "$$KEEP", "$$PRUNE"]}});
+    let filter = json!({"$match": {"$expr": {"$gt": [div(), 0]}}});
+    let group = json!({"$group": {"_id": "$k", "x": {"$first": div()}}});
+    let windows =
+        json!({"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"x": {"$sum": div()}}}});
+    let graph = json!({"$graphLookup": {"from": "orders", "startWith": div(),
+        "connectFromField": "k", "connectToField": "k", "as": "g", "maxDepth": 0}});
+    for stage in [redact, filter, group, windows, graph] {
+        fails(vec![stage]);
+    }
+    // A stage that fails, then one a window stays behind, then the window.
+    for blocker in [json!({"$sort": {"k": 1}}), json!({"$unwind": "$k"})] {
+        fails(vec![json!({"$addFields": {"x": div()}}), blocker]);
+    }
+    // A window of several `$skip`s and `$limit`s is one, and moves as one.
+    let add = json!({"$addFields": {"x": div()}});
+    let run_window = |window: Vec<Value>| {
+        let mut stages = vec![add.clone()];
+        stages.extend(window);
+        ids(&run(&state, Value::Array(stages), aggregate::Limits::default()).unwrap())
+    };
+    assert_eq!(run_window(vec![json!({"$limit": 8}), json!({"$skip": 5})]), [5, 6, 7]);
+    assert_eq!(
+        run_window(vec![json!({"$limit": 10}), json!({"$limit": 3}), json!({"$skip": 5})]),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        run_window(vec![json!({"$skip": 2}), json!({"$skip": 3}), json!({"$limit": 4})]),
+        [5, 6, 7, 8]
+    );
+    // Two stages it passes, an empty `$match` the reference drops, and a stage between the
+    // skip and the limit.
+    assert_eq!(answers(vec![add.clone(), json!({"$project": {"_id": 1}})]), [5, 6]);
+    assert_eq!(answers(vec![add.clone(), json!({"$match": {}})]), [5, 6]);
+    assert_eq!(
+        run_window(vec![json!({"$skip": 5}), json!({"$project": {"k": 1}}), json!({"$limit": 2})]),
+        [5, 6]
+    );
+    // A failure inside the window is raised.
+    let inside =
+        json!({"$addFields": {"x": {"$divide": [1, {"$cond": [{"$eq": ["$_id", 6]}, 0, 1]}]}}});
+    let err =
+        run(&state, json!([inside, {"$skip": 5}, {"$limit": 3}]), aggregate::Limits::default())
+            .unwrap_err();
     assert!(err.message.contains("$divide"), "{}", err.message);
-    // A skip that is first drops the document before the stage sees it.
-    let ok =
-        run(&state, json!([{"$skip": 5}, divide, {"$limit": 2}]), aggregate::Limits::default());
+    // A skip that is first drops the document before the stage sees it, as it always did.
+    let ok = run(&state, json!([{"$skip": 5}, add, {"$limit": 2}]), aggregate::Limits::default());
     assert_eq!(ids(&ok.unwrap()), [5, 6]);
+}
+
+#[test]
+fn a_window_that_has_moved_to_the_head_bounds_the_range_it_reads() {
+    // The keys of an inexact range are bounded by what the window takes, though stages that
+    // neither filter nor change the count are written before it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500);
+    let none = json!({"$match": {"_id": -1}});
+    let limits = capped(key_bytes(4));
+    let (answer, stats) = run_stats(
+        &state,
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$project": {"_id": 1}}, {"$skip": 1},
+            {"$limit": 2}, none]),
+        limits.clone(),
+    );
+    assert_eq!(ids(&answer), Vec::<i64>::new());
+    assert_eq!(stats.matched, 3, "three documents were taken from the range");
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+#[test]
+fn a_window_that_takes_nothing_reads_nothing_from_the_source() {
+    // `$limit 3` then `$skip 5` takes nothing, which no request can write as a `$limit` (it is a
+    // `400`): the rewrite makes it `$skip 3, $limit 0`. The chain is full before any document, so
+    // the scan reads none, whether it is a collection scan or an index.
+    let nothing = |pipeline: Value, state: &SharedState| {
+        let (answer, stats) = run_stats(state, pipeline.clone(), aggregate::Limits::default());
+        assert_eq!(answer["documents"], json!([]), "{pipeline}");
+        assert_eq!((stats.examined, stats.matched), (0, 0), "{pipeline}");
+        assert!(
+            stats.index_entries.is_none_or(|entries| entries == 0),
+            "{pipeline}: {:?}",
+            stats.index_entries
+        );
+    };
+    let window = || [json!({"$limit": 3}), json!({"$skip": 5})];
+    // A collection scan, with stages the window passes in front of it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, numbered(50, &[]));
+    nothing(json!(window()), &state);
+    let mut behind = vec![json!({"$addFields": {"x": 1}})];
+    behind.extend(window());
+    nothing(json!(behind), &state);
+    // Behind a `$sort`, where the rewrite is a `$limit` of 0 alone and not a heap that keeps the
+    // documents of the `$skip` and reads the whole source: it examines none either.
+    for sorted in [
+        vec![json!({"$sort": {"k": 1}}), json!({"$limit": 30}), json!({"$skip": 40})],
+        vec![
+            json!({"$sort": {"k": 1}}),
+            json!({"$project": {"k": 1}}),
+            json!({"$limit": 30}),
+            json!({"$skip": 40}),
+        ],
+        vec![
+            json!({"$sort": {"k": 1}}),
+            json!({"$limit": 30}),
+            json!({"$skip": 40}),
+            json!({"$count": "n"}),
+        ],
+    ] {
+        let counted = sorted.last().is_some_and(|stage| stage.get("$count").is_some());
+        let (answer, stats) = run_stats(&state, json!(sorted), aggregate::Limits::default());
+        assert_eq!(
+            answer["documents"],
+            if counted { json!([{"n": 0}]) } else { json!([]) },
+            "{sorted:?}"
+        );
+        assert_eq!((stats.examined, stats.matched), (0, 0), "{sorted:?}");
+    }
+    // An index: an exact probe, an inexact range (read whole in `_id` order when it is wanted),
+    // and the sort of the result.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 1_500);
+    for filter in [json!({"t": 7}), json!({"t": {"$gte": 0}}), json!({"t": {"$gt": 1_000}})] {
+        let mut pipeline = vec![json!({"$match": filter.clone()})];
+        pipeline.extend(window());
+        nothing(json!(pipeline), &state);
+        let sorted =
+            json!([{"$match": filter}, {"$sort": {"t": -1}}, {"$limit": 30}, {"$skip": 40}]);
+        nothing(sorted, &state);
+    }
+    // Where the same window takes something, the source is read, so the zeros above are the
+    // window's and not the collection's.
+    let (answer, stats) = run_stats(
+        &state,
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$limit": 8}, {"$skip": 5}]),
+        aggregate::Limits::default(),
+    );
+    assert_eq!(ids(&answer), [5, 6, 7]);
+    assert!(stats.examined > 0 && stats.index_entries.is_some_and(|entries| entries > 0));
 }
 
 #[test]
@@ -161,9 +319,13 @@ fn the_source_of_a_pipeline_that_streams_has_no_ceiling_and_one_that_blocks_keep
         err.message
     );
     // So is a stage that blocks, at the document that passes the limit and not before.
-    let err = run(&state, json!([{"$addFields": {"x": 1}}, {"$count": "n"}]), with_ceiling(10))
-        .unwrap_err();
+    let err =
+        run(&state, json!([{"$addFields": {"x": 1}}, {"$sort": {"_id": 1}}]), with_ceiling(10))
+            .unwrap_err();
     assert!(err.message.contains("$addFields produced 11 documents"), "{}", err.message);
+    // A `$count` holds a counter and not its input, so it has no ceiling to refuse at.
+    let ok = run(&state, json!([{"$addFields": {"x": 1}}, {"$count": "n"}]), with_ceiling(10));
+    assert_eq!(ok.unwrap()["documents"], json!([{"n": 30}]));
     // A pipeline that begins with a stage that blocks, or with none, reads its source whole
     // and refuses it as it always did.
     for pipeline in [json!([]), json!([{"$sort": {"_id": 1}}, {"$addFields": {"x": 1}}])] {
@@ -229,14 +391,23 @@ fn a_stage_that_blocks_is_charged_as_the_documents_stream_to_it() {
         err.message.split(" is ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
     assert!((50_000..70_000).contains(&held), "stopped at {held}, not after the whole 400 KB");
     assert_eq!(limits.buffer.used(), 0, "gave back what it had");
-    // The same for a `$group`, which charges its input as a stage does.
-    let err = run(
+    // A `$group` holds its buckets and not its input (ADR-270): one bucket is answered, and
+    // a `$push` of the padding is refused as the buckets pass the limit.
+    let ok = run(
         &state,
         json!([{"$project": {"pad": 1}}, {"$group": {"_id": null, "n": {"$sum": 1}}}]),
         capped(50_000),
     )
+    .unwrap();
+    assert_eq!(ok["documents"], json!([{"_id": null, "n": 40}]));
+    let err = run(
+        &state,
+        json!([{"$project": {"pad": 1}}, {"$group": {"_id": null, "p": {"$push": "$pad"}}}]),
+        capped(50_000),
+    )
     .unwrap_err();
-    assert!(err.message.contains("the input of $group is "), "{}", err.message);
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert!(err.message.contains("the buckets of $group is "), "{}", err.message);
     // What arrived is the stage's input and is not charged again when it runs: a budget of
     // the input and a little over holds a `$sort` and a `$count`, where twice the input would
     // be needed if the stage charged it as its own as well.
@@ -314,6 +485,104 @@ fn a_pipeline_of_more_than_a_thousand_stages_is_a_400_that_names_the_count_and_t
     assert!(err.message.contains("a pipeline has 1001 stages"), "{}", err.message);
     let ok = run(&state, counted(998), aggregate::Limits::default()).unwrap();
     assert_eq!(ok["documents"], json!([{"n": 3}]));
+}
+
+#[test]
+fn a_source_above_the_limit_is_answered_by_a_stage_that_holds_a_counter_groups_a_heap_or_a_sample()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(40, 10_000));
+    let all = held_docs_bytes(&padded(40, 10_000));
+    // The collection is eight times the budget: read whole, it is refused at the source.
+    let cap = all / 8;
+    let err = run(&state, json!([{"$sort": {"_id": 1}}]), capped(cap)).unwrap_err();
+    assert!(err.message.contains("the source read"), "{}", err.message);
+    // And a pipeline that begins with a stage that keeps a counter or its groups is answered, in
+    // the memory of its state, whatever it is streamed over.
+    let cases = [
+        (json!([{"$count": "n"}]), json!([{"n": 40}])),
+        (json!([{"$group": {"_id": null, "n": {"$sum": 1}}}]), json!([{"_id": null, "n": 40}])),
+        (
+            json!([{"$group": {"_id": {"$mod": ["$_id", 2]}, "n": {"$sum": 1}}}]),
+            json!([{"_id": 0, "n": 20}, {"_id": 1, "n": 20}]),
+        ),
+        (
+            json!([{"$bucket": {"groupBy": "$_id", "boundaries": [0, 20, 40],
+                "output": {"n": {"$sum": 1}}}}]),
+            json!([{"_id": 0, "n": 20}, {"_id": 20, "n": 20}]),
+        ),
+        (
+            json!([{"$sortByCount": {"$mod": ["$_id", 3]}}]),
+            json!([{"_id": 0, "count": 14}, {"_id": 1, "count": 13}, {"_id": 2, "count": 13}]),
+        ),
+        (
+            json!([{"$sort": {"_id": -1}}, {"$limit": 3}, {"$project": {"_id": 1}}]),
+            json!([{"_id": 39}, {"_id": 38}, {"_id": 37}]),
+        ),
+        (
+            json!([{"$sort": {"_id": -1}}, {"$skip": 1}, {"$limit": 2}, {"$project": {"_id": 1}}]),
+            json!([{"_id": 38}, {"_id": 37}]),
+        ),
+        // Behind a stage that streams, and followed by one.
+        (
+            json!([{"$addFields": {"c": "$pad"}}, {"$count": "n"}, {"$addFields": {"m": 1}}]),
+            json!([{"n": 40, "m": 1}]),
+        ),
+    ];
+    // A `$sample` holds its sample and not the collection: its size is what it answers.
+    let limits = capped(cap);
+    let sampled =
+        run(&state, json!([{"$sample": {"size": 4}}, {"$project": {"_id": 1}}]), limits.clone())
+            .unwrap();
+    assert_eq!(sampled["count"], 4);
+    let mut chosen = ids(&sampled);
+    chosen.sort_unstable();
+    chosen.dedup();
+    assert_eq!(chosen.len(), 4, "four different documents of the forty");
+    assert_eq!(limits.buffer.used(), 0);
+    for (pipeline, answer) in cases {
+        let limits = capped(cap);
+        let ok = run(&state, pipeline.clone(), limits.clone());
+        assert_eq!(
+            ok.unwrap_or_else(|e| panic!("{pipeline}: {e:?}"))["documents"],
+            answer,
+            "{pipeline}"
+        );
+        assert_eq!(limits.buffer.used(), 0, "{pipeline}");
+    }
+}
+
+#[test]
+fn a_state_that_grows_with_the_input_is_refused_at_its_bytes_or_its_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, padded(40, 10_000));
+    // One bucket for each document, each keeping its padding: nothing streaming can help.
+    let pipeline = json!([{"$group": {"_id": "$_id", "p": {"$push": "$pad"}}}]);
+    let limits = capped(50_000);
+    let err = run(&state, pipeline, limits.clone()).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert!(err.message.contains("the buckets of $group is "), "{}", err.message);
+    let held: usize =
+        err.message.split(" is ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+    assert!((50_000..70_000).contains(&held), "stopped at {held}, not after the whole 400 KB");
+    assert_eq!(limits.buffer.used(), 0);
+    // And at the pipeline limit when the buckets are small: a source of thirty, a ceiling of ten.
+    let state = state_with(&tempfile::tempdir().unwrap(), numbered(30, &[]));
+    let err = run(&state, json!([{"$group": {"_id": "$_id"}}]), with_ceiling(10)).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(err.message.contains("$group produced 11 documents"), "{}", err.message);
+    // A `$sort` with a `$limit` holds that many documents, and the ceiling is on those: a heap
+    // of ten is answered over thirty, a heap of eleven is not.
+    let sorted = |limit: i64| json!([{"$sort": {"_id": -1}}, {"$limit": limit}]);
+    let ok = run(&state, sorted(10), with_ceiling(10)).unwrap();
+    assert_eq!(ok["count"], 10);
+    let err = run(&state, sorted(11), with_ceiling(10)).unwrap_err();
+    assert!(err.message.contains("$sort produced 11 documents"), "{}", err.message);
+    // A few groups over the same source and ceiling are answered: the ceiling is on the groups.
+    let ok = run(&state, json!([{"$group": {"_id": "$k", "n": {"$sum": 1}}}]), with_ceiling(10));
+    assert_eq!(ok.unwrap()["count"], 5);
+    let ok = run(&state, json!([{"$count": "n"}]), with_ceiling(10));
+    assert_eq!(ok.unwrap()["documents"], json!([{"n": 30}]));
 }
 
 /// `n` documents `{_id: i, t: i}` under an index on `t`, so a range of `t` is an inexact
@@ -398,10 +667,11 @@ fn a_skip_and_a_limit_at_the_head_bound_the_keys_a_range_holds_to_what_they_take
         capped(key_bytes(2)),
     );
     assert_eq!(stats.matched, 1);
-    // Anything before the limit may need more, and is held to the budget instead.
+    // Anything that may drop a document before the limit (a `$redact` may) may need more, and
+    // is held to the budget instead. (A `$project` is not one: the limit is moved ahead of it, and is the head.)
     let err = run(
         &state,
-        json!([{"$match": {"t": {"$gte": 0}}}, {"$project": {"_id": 1}}, {"$limit": 1}, none]),
+        json!([{"$match": {"t": {"$gte": 0}}}, {"$redact": "$$KEEP"}, {"$limit": 1}, none]),
         capped(key_bytes(4)),
     )
     .unwrap_err();
@@ -487,24 +757,24 @@ fn what_a_stage_that_blocks_hands_to_a_stage_that_streams_is_released_as_it_drai
     let state = state_with(&dir, padded(20, 10_000));
     let input = held_docs_bytes(&padded(20, 10_000));
     // The `$sort` holds its input; its output is the same documents, which the second
-    // `$project` takes as its input and the `$group` collects as it gets them. Each is given
-    // back as it is taken, so the documents once is held, and not twice as they drain
-    // beside what has arrived.
+    // `$project` takes as its input and the `$group` keeps the padding of as it gets them.
+    // Each is given back as it is taken, so the documents once is held, and not twice as
+    // they drain beside what has arrived.
     let pipeline = json!([
         {"$project": {"pad": 1}},
         {"$sort": {"_id": -1}},
         {"$project": {"pad": 1}},
-        {"$group": {"_id": null, "n": {"$sum": 1}}},
+        {"$group": {"_id": null, "p": {"$push": "$pad"}}},
+        {"$project": {"n": {"$size": "$p"}}},
     ]);
     let (least, err) = smallest_budget(&state, &pipeline, 4 * input);
-    assert!(least > input && least < 2 * input, "answered under {least}, documents {input}");
-    // What is full is the `$group`, which holds its input (the documents once) and its
-    // buckets: the second `$project` held nothing of what it had taken.
     assert!(
-        err.message.contains("the buckets of $group (with its input, still held) is "),
-        "{}",
-        err.message
+        least >= input && least < input + input / 10,
+        "answered under {least}, documents {input}"
     );
+    // What is full is the `$group`, which holds the padding it was given and not the input:
+    // the second `$project` held nothing of what it had taken.
+    assert!(err.message.contains("the buckets of $group is "), "{}", err.message);
 }
 
 #[test]

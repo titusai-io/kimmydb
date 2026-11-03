@@ -5,8 +5,10 @@ use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 
+use crate::aggregate::{self, Limits};
+use crate::budget::{Lease, held_bytes, held_bytes_bson};
 use crate::filter::{self, ArrayPosition, Filter};
 use crate::path;
 use crate::update::Update;
@@ -211,6 +213,124 @@ fn merge_runs(
         width = width.saturating_mul(2);
     }
     Ok(keyed)
+}
+
+/// The first documents of a sort, taken as the documents arrive (ADR-270): a `$sort` followed
+/// by `$limit n`, with an optional `$skip m` between, needs the first `m + n` documents in
+/// the order [`sort_until_deadline`] gives and no others, so it keeps those and not its input.
+///
+/// A heap of at most `keep` documents ordered by their sort keys and then by the order they
+/// arrived in, which is the order a stable sort leaves equal keys in: what it holds at the
+/// end, least first, is the first `keep` documents of the stable sort of everything offered,
+/// ties included. What it holds is charged to a lease as it grows (ADR-269): a document when
+/// it is kept and its keys with it, given back when the heap turns it out.
+pub struct TopK<'k> {
+    keys: &'k [SortKey],
+    keep: usize,
+    heap: BinaryHeap<Ranked<'k>>,
+    /// How many documents have been offered, which is the arrival index of the next.
+    arrived: usize,
+    /// The most documents the heap has held at once.
+    peak: usize,
+}
+
+/// One document the heap holds: what ranks it, and the bytes it is charged.
+struct Ranked<'k> {
+    keys: &'k [SortKey],
+    sort: Vec<Bson>,
+    /// The place it arrived in, which breaks a tie between equal keys.
+    at: usize,
+    bytes: usize,
+    doc: Document,
+}
+
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_keys(self.keys, &self.sort, &other.sort).then_with(|| self.at.cmp(&other.at))
+    }
+}
+
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Ranked<'_> {}
+
+impl<'k> TopK<'k> {
+    /// A heap that keeps the first `keep` documents of the order `keys` gives.
+    pub fn new(keys: &'k [SortKey], keep: usize) -> Self {
+        TopK { keys, keep, heap: BinaryHeap::new(), arrived: 0, peak: 0 }
+    }
+
+    /// The documents held now.
+    pub fn len(&self) -> usize {
+        self.heap.len()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
+    /// The most documents it has held at once: never more than `keep`.
+    pub fn peak(&self) -> usize {
+        self.peak
+    }
+
+    /// One more document, in arrival order. It is kept if it is before the last of the
+    /// `keep` the heap holds (one that sorts equal to it arrived earlier, and so stays before
+    /// it), and it then turns that one out; the bytes of the one kept are charged to `held`
+    /// and the one turned out given back. The heap never holds more than `keep`, and is held
+    /// to the pipeline's document limit as it fills.
+    pub fn offer(&mut self, doc: Document, held: &mut Lease, limits: &Limits) -> Result<()> {
+        let at = self.arrived;
+        self.arrived += 1;
+        if self.keep == 0 {
+            return Ok(());
+        }
+        let sort = sort_keys(self.keys, &doc);
+        let full = self.heap.len() == self.keep;
+        if full {
+            let last = self.heap.peek().expect("a heap that is full holds a document");
+            if compare_keys(self.keys, &sort, &last.sort) != Ordering::Less {
+                return Ok(());
+            }
+        } else {
+            aggregate::check_limit("$sort", self.heap.len() + 1, limits)?;
+        }
+        let bytes = sort
+            .iter()
+            .fold(held_bytes(&doc).saturating_add(std::mem::size_of::<Vec<Bson>>()), |sum, key| {
+                sum.saturating_add(held_bytes_bson(key))
+            });
+        held.charge(bytes)?;
+        let entry = Ranked { keys: self.keys, sort, at, bytes, doc };
+        if full {
+            let mut last = self.heap.peek_mut().expect("a heap that is full holds a document");
+            let turned_out = std::mem::replace(&mut *last, entry);
+            // Put back in its place when the guard drops.
+            drop(last);
+            held.release(turned_out.bytes);
+        } else {
+            self.heap.push(entry);
+            self.peak = self.peak.max(self.heap.len());
+        }
+        Ok(())
+    }
+
+    /// The documents held, least first: the first `keep` of the stable sort of every document
+    /// offered.
+    pub fn into_sorted(self) -> Vec<Document> {
+        self.heap.into_sorted_vec().into_iter().map(|ranked| ranked.doc).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

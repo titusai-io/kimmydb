@@ -2,16 +2,17 @@
 //!
 //! `$replaceWith` is `$replaceRoot` under another name and `$unionWith` is run by the
 //! caller (it reads a second collection), so both live in [`crate::aggregate`]. What is
-//! here is the parsing of the other four and the code that runs them.
+//! here is the parsing of the other four and the code that runs the last three (`$sortByCount`
+//! runs on [`crate::aggregate::GroupState`], with `$group`).
 
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result};
 
-use crate::aggregate::{Accumulator, Limits, Stage, as_document, group_keyed};
+use crate::aggregate::{Limits, Stage, as_document};
 use crate::budget::Lease;
 use crate::deadline::{self, Ticker};
 use crate::expr::{Binding, Expr, REDACT_DESCEND, REDACT_KEEP, REDACT_PRUNE, Scope, type_name};
-use crate::shape::{self, SortKey};
+use crate::shape;
 
 // ---------------------------------------------------------------------------
 // $sortByCount
@@ -37,27 +38,6 @@ pub(crate) fn parse_sort_by_count(value: &Bson, vars: &[String]) -> Result<Stage
         _ => return Err(refused("specified as a string or as an object")),
     }
     Ok(Stage::SortByCount(Expr::parse_with_vars(value, vars)?))
-}
-
-/// Run `$sortByCount`: `{$group: {_id: <expr>, count: {$sum: 1}}}` then
-/// `{$sort: {count: -1}}`. The groups come out in the order their keys were first seen
-/// and the sort is stable, so groups with the same count stay in that order (the
-/// reference leaves it unspecified). The `count` is `$group`'s own `{$sum: 1}`: an int,
-/// widening to a long past 2^31-1, as the reference's is (ADR-268).
-pub(crate) fn sort_by_count(
-    input: Vec<Document>,
-    expr: &Expr,
-    limits: &Limits,
-    vars: &[Binding<'_>],
-    held: &mut Lease,
-) -> Result<Vec<Document>> {
-    let fields = [("count".to_string(), Accumulator::Sum(Expr::Literal(Bson::Int32(1))))];
-    let groups = group_keyed("$sortByCount", input, &fields, limits, vars, held, |scope| {
-        expr.eval_in(scope).map(Some)
-    })?;
-    let groups =
-        shape::sort_until_deadline(&[SortKey { path: "count".into(), descending: true }], groups)?;
-    Ok(groups)
 }
 
 // ---------------------------------------------------------------------------
@@ -199,26 +179,91 @@ pub fn sample(
     if size == 0 {
         return Ok(Vec::new());
     }
-    let mut reservoir: Vec<Document> = Vec::with_capacity(size.min(input.len()));
+    let mut reservoir = Reservoir::new(size);
     // A `Ticker` for each of the two loops (ADR-266), so that neither hides the other.
     let mut ticker = Ticker::new();
-    for (seen, doc) in input.into_iter().enumerate() {
+    for doc in input {
         ticker.tick()?;
-        if seen < size {
-            reservoir.push(doc);
-        } else {
-            let at = below(seen + 1);
-            if at < size {
-                reservoir[at] = doc;
-            }
+        if let Some(slot) = reservoir.place(&mut *below) {
+            let _ = reservoir.put(slot, doc);
         }
     }
-    let mut ticker = Ticker::new();
-    for i in (1..reservoir.len()).rev() {
-        ticker.tick()?;
-        reservoir.swap(i, below(i + 1));
+    reservoir.finish(below)
+}
+
+/// Where the reservoir puts a document it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// A place of its own at the end: the reservoir is not yet full.
+    Fill,
+    /// The place of a document it turns out.
+    Replace(usize),
+}
+
+/// The reservoir of [`sample`] taken one document at a time (ADR-270): a `$sample` holds the
+/// `size` documents it will answer and not its input. [`Reservoir::place`] decides what the
+/// next document does, drawing from `below` exactly as the loop of `sample` always did, and
+/// [`Reservoir::put`] does it, so that whoever holds the reservoir can charge a document it
+/// keeps and give back one it turns out; [`Reservoir::finish`] shuffles it.
+pub struct Reservoir {
+    size: usize,
+    /// The documents seen, which is the position the next would have.
+    seen: usize,
+    held: Vec<Document>,
+}
+
+impl Reservoir {
+    /// A reservoir for a sample of `size`.
+    pub fn new(size: usize) -> Self {
+        Reservoir { size, seen: 0, held: Vec::new() }
     }
-    Ok(reservoir)
+
+    /// The documents held now: never more than `size`.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// What the next document does: `None` if the sample does not take it. The first `size`
+    /// are taken without a draw; document number `i` after them is drawn against with
+    /// `below(i + 1)`, once, and replaces the slot it names if that is one of the `size`.
+    pub fn place(&mut self, below: Below<'_>) -> Option<Slot> {
+        if self.size == 0 {
+            return None;
+        }
+        let seen = self.seen;
+        self.seen += 1;
+        if seen < self.size {
+            return Some(Slot::Fill);
+        }
+        let at = below(seen + 1);
+        (at < self.size).then_some(Slot::Replace(at))
+    }
+
+    /// Put `doc` where [`Reservoir::place`] said, answering the document it turns out.
+    pub fn put(&mut self, slot: Slot, doc: Document) -> Option<Document> {
+        match slot {
+            Slot::Fill => {
+                self.held.push(doc);
+                None
+            }
+            Slot::Replace(at) => Some(std::mem::replace(&mut self.held[at], doc)),
+        }
+    }
+
+    /// The input is complete: the sample, shuffled once with Fisher-Yates over `below`.
+    pub fn finish(mut self, below: Below<'_>) -> Result<Vec<Document>> {
+        let mut ticker = Ticker::new();
+        for i in (1..self.held.len()).rev() {
+            ticker.tick()?;
+            self.held.swap(i, below(i + 1));
+        }
+        Ok(self.held)
+    }
 }
 
 // ---------------------------------------------------------------------------

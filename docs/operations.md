@@ -256,23 +256,36 @@ table), and how many of each a request can read before the source read is refuse
 | 100 fields (50 integers, 50 strings of 60 bytes) | 3,944 | 27,728 (7 x) | 3,872 | 15,489 |
 | **400 integer fields** | 3,904 | 92,348 (24 x) | **1,162** | **4,650** |
 
-**The source read is charged whole, before any stage runs.** Only a leading `$match` narrows it (an
-indexed equality or range reads its candidates and not the collection); the executor reads
-everything else, then runs the stages over it. So a stage that would only have counted, limited or
-grouped what it read still cannot run if the collection is above the per-request limit: `[{$count:
-"n"}]`, `[{$limit: 5}]`, `[{$sort: ..}, {$limit: 10}]` and `[{$group: {_id: "$k", n: {$sum: 1}}}]`
-are `413` at "the source read" over a collection that is charged more than about 102 MiB on a 2 GiB
-member (a collection of 100 MB of 4 KB documents of 400 integer fields is 2.3 GB charged: it is refused
-after 1,163 of 25,000 documents), and more than 410 MiB on an 8 GiB one. The reference streams every
-one of them. A stage that builds holds its input beside its output, so `$addFields` (and `$project`,
-`$replaceRoot`, `$unwind`) over more than about half the limit is refused as well: 100,000 documents of
-4 KiB peak at about 1.07 GB charged, input and output together. Exactly: the review's documents
-(`{_id, pad}` of 4,094 bytes of BSON, charged 5,336 each, 5,372 with one boolean field added) peak at
-1,070,800,000, which **runs under an explicit `aggregate.memory_limit_bytes` of 1 GiB** (1,073,741,824,
-with 0.3% to spare) and under the derived limit from a container of 19.95 GiB; the same with a string
-of 4,096 characters (4,120 bytes, charged 5,372 and 5,408) peak at 1,078,000,000, which is over 1 GiB
-(refused at `$addFields`) and runs under 2 GiB, or from a container of 20.1 GiB. Under the derived
-limit of a 16 GiB member (858,993,459) neither runs.
+**What is charged is what a stage holds** (ADR-270). A pipeline takes its source a document at a
+time and each stage passes it on, so a stage that holds nothing between documents (`$match` after the
+first, `$project`, `$addFields`, `$replaceRoot`, `$unset`, `$redact`, `$unwind`, `$skip`, `$limit`)
+charges nothing that lasts, and the stages that keep a state charge the state as it grows:
+
+| Stage | Holds, and is refused as | Charged |
+|---|---|---|
+| `$count` | a counter | nothing |
+| `$group`, `$bucket`, `$sortByCount` | `the buckets of $group` (`$bucket`, `$sortByCount`): the groups and what each accumulator keeps | a group when it is made, a value when it is kept; held to the 100,000-document ceiling by the number of groups |
+| `$sort` followed by `$limit` (and a `$skip` between them) | `the heap of $sort`: the first `skip + limit` documents and their keys | a document when it is kept, given back when it is turned out |
+| `$sample` | `the reservoir of $sample`: the documents it will answer | a document when it is kept, given back when it is replaced |
+| `$sort` with no `$limit` after it, `$bucketAuto`, `$setWindowFields`, `$densify`, `$fill`, `$facet`, `$lookup`, `$graphLookup`, `$unionWith` | `the input of $sort` (and so on): all their input | each document as it reaches them |
+| the answer | `the output of the pipeline` as the documents arrive, then `the answer` | the documents, and the JSON built from them |
+
+So `[{$count: "n"}]`, `[{$limit: 5}]`, `[{$sort: ..}, {$limit: 10}]`, `[{$group: {_id: "$k", n:
+{$sum: 1}}}]` and `[{$sample: {size: 5}}]` over a collection above the per-request limit are answered,
+in the memory of what they keep, and so is `[{$addFields: ..}, {$match: ..}]`. Only a pipeline that
+**begins with a stage that blocks** (the last row but one) reads its source whole, charged as `the
+source read`, with the 100,000-document ceiling and its `400` (`the source collection admits more
+than 100000 documents`), and a pipeline whose first stage after a leading `$match` is one of them is
+held to the same. A leading `$match` narrows the source (an indexed equality or range reads its
+candidates and not the collection). A `$group` over keys that never repeat holds one bucket for each
+document, and a `$push` or `$addToSet` holds every value it is given: streaming does not help them and
+they are refused at the limit, as is a `$sort` with no `$limit`. A `$skip` and a `$limit` are moved
+ahead of the stages that neither filter nor change the number of documents, so `[{$project: ..},
+{$sort: ..}]` is held where it is and `[{$sort: ..}, {$project: ..}, {$limit: 10}]` is a heap of ten.
+
+The answer is one body. The documents it is made of and the JSON built from them are held until it is
+sent, so an answer of more than about half the limit is refused whatever built it (`the output of the
+pipeline`): `$project` the fields that are wanted, or `$limit`.
 
 What to do about a `413` from the limit:
 
@@ -285,9 +298,9 @@ What to do about a `413` from the limit:
 - **Raise `aggregate.memory_limit_bytes`** (and `aggregate.memory_pool_bytes` with it, which must be at
   least the limit), knowing that the figures are in estimated parsed bytes and a request takes a little more than it is charged while it builds its answer.
 
-The streaming executor planned for 0.60.0 removes the limitation: the stages that do not block
-stream, so a source is not charged whole and `[{$count}]` or `[{$limit: 5}]` over a large collection
-run in constant memory ([Deviations](deviations.md)).
+The stages that stream hold a source of any size, as the executor takes it one document at a time
+([Deviations](deviations.md#memory-limit-adr-269)
+keeps what is left: the stages that block, and the answer as one body).
 
 ### Refused at startup
 
