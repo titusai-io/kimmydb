@@ -440,9 +440,9 @@ impl MergeState {
         }
         // The canonical order (see `counter`): the base, then the slots by stamp and key.
         if o.sum_in_key_order() {
-            terms.sort_by(|a, b| a.1.cmp(&b.1));
+            terms.sort_by_key(|t| t.1);
         } else {
-            terms.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            terms.sort_by_key(|t| (t.0, t.1));
         }
         if base.is_none() && terms.is_empty() {
             return None;
