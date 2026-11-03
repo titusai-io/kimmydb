@@ -44,8 +44,12 @@ pub fn grade(ms: &[Node], log: &Log) -> Vec<String> {
     if ms.iter().any(|m| m.visible() != want) {
         errs.push("visible".into());
     }
-    let must = oracle::loss_oracle(log, &alive, &dels, ret);
+    let must = oracle::loss_oracle(log, &alive, &dels, want.as_ref(), ret);
     let have: BTreeSet<LossKey> = ms[0].state().losses.keys().cloned().collect();
+    // the leaf effects of every write, against the document its writer could see
+    if ms.iter().any(|m| !m.problems.is_empty()) {
+        errs.push("write-effects".into());
+    }
     let hid = oracle::hidden_oracle(log, ret);
     if ms.iter().any(|m| m.w.hidden_all() != hid) {
         errs.push("hidden-state".into());
@@ -88,7 +92,7 @@ pub fn grade_bounded(ms: &[Node], log: &Log) -> Vec<String> {
         bad.push("visible".into());
     }
     let h = ms[0].w.horizon();
-    let must: BTreeSet<Head> = oracle::loss_oracle(log, &alive, &dels, ret)
+    let must: BTreeSet<Head> = oracle::loss_oracle(log, &alive, &dels, want.as_ref(), ret)
         .into_iter()
         .filter(|(_, st): &(Path, MStamp)| st.hlc >= h)
         .collect();

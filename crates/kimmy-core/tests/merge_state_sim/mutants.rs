@@ -5,7 +5,9 @@
 //! The V3M3, V4M1, B1 and M1 mutants and the `$setOnInsert` suppression mutant use
 //! test-only switches (`JoinOptions::set_v3_generation`, `SimFlags::hidden_records`,
 //! `JoinOptions::set_value_ignores_slot_stamp`, `JoinOptions::set_creation_without_generation`,
-//! `JoinOptions::set_suppress_soi`).
+//! `JoinOptions::set_suppress_soi`); the nested mutants use the switches of the nested rules
+//! (`set_type_ignores_recency`, `set_marker_hides`, `set_no_type_clash`,
+//! `set_array_clash_as_clash`, `set_rewrite_unchanged`, `set_write_below_scalar`).
 
 use std::time::Instant;
 
@@ -138,6 +140,42 @@ pub fn mutants() -> Vec<Mutant> {
         Mutant {
             name: "a superseded and killed first insert reported neither way  [V7m4]",
             apply: |c| c.flags.report_neither = true,
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "a scalar hides every child, even a newer one  [D-13]",
+            apply: |c| c.opts.set_type_ignores_recency(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "a map marker hides its children",
+            apply: |c| c.opts.set_marker_hides(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "no typeClash is reported",
+            apply: |c| c.opts.set_no_type_clash(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "two arrays are a plain clash, not an arrayClash",
+            apply: |c| c.opts.set_array_clash_as_clash(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "a sub-document or replace write rewrites every leaf",
+            apply: |c| c.opts.set_rewrite_unchanged(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "a write below a scalar or an array is accepted",
+            apply: |c| c.opts.set_write_below_scalar(true),
             grader: Random { restore: true },
             probe: None,
         },

@@ -139,13 +139,13 @@ fn horizon(rep: &mut Report, n: u64, ret: u64, steps: usize, label: &str) {
     rep.check(&what, &c);
 }
 
-fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize) {
+fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize, nested: bool) {
     let t0 = Instant::now();
     let cfg = Cfg::default_ret();
     let mut c = BTreeMap::new();
     let mut gap_max = 0;
     for seed in 0..n {
-        let (o, gap) = run_bounded(seed, &cfg, ret, sync_every, steps);
+        let (o, gap) = run_bounded(seed, &cfg, ret, sync_every, steps, nested);
         gap_max = gap_max.max(gap);
         for e in grade_bounded(&o.nodes, &o.log) {
             bump(&mut c, e, seed);
@@ -154,7 +154,10 @@ fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize) 
     if gap_max >= ret {
         bump(&mut c, format!("clock advance {gap_max} not below RET"), 0);
     }
-    let what = format!("bounded RET={ret}, fixpoint every {sync_every} steps, {steps} steps");
+    let what = format!(
+        "bounded RET={ret}, fixpoint every {sync_every} steps, {steps} steps{}",
+        if nested { ", nested, no restore" } else { "" }
+    );
     println!(
         "[{what}] {n} runs, largest clock advance between fixpoints {gap_max} (< RET): problems {}; {:.2?}",
         fmt_problems(&c),
@@ -225,7 +228,8 @@ fn runner() {
     horizon(&mut rep, 300, 4, 24, "horizon");
     named_probes(&mut rep);
     scenario_probes(&mut rep);
-    bounded(&mut rep, 300, 40, 3, 80);
+    bounded(&mut rep, 300, 40, 3, 80, false);
+    bounded(&mut rep, 300, 40, 3, 80, true);
     horizon(&mut rep, 300, 40, 80, "beyond retention (no periodic pulls)");
     horizon(&mut rep, 300, 8, 30, "horizon");
 
@@ -239,8 +243,9 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14) and the B1 and M1 rules (2): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 16, "the mutant list changed");
+    // The design mutants of section 17 (14), the B1 and M1 rules (2) and the nested rules (6): a
+    // removed one must be noticed.
+    assert_eq!(mutants::mutants().len(), 22, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
