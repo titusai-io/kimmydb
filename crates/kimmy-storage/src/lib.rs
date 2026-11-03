@@ -173,7 +173,9 @@ pub use hold_meter::{
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome, KeyHold, UnkeyedPage};
 pub use merge::{SinkCounts, SinkMode, SinkOutcome, WhenMatched};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
-pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
+pub use modify::{
+    Candidates, MAX_CANDIDATES, MatchHold, ModifyManyOutcome, ModifyOutcome, ModifySpec,
+};
 pub use open_progress::{
     OpenPhase, OpenSnapshot, open_snapshot, open_stop_requested, request_open_stop, set_open_phase,
 };

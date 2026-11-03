@@ -168,6 +168,18 @@ impl AggregateMemory {
         buffer
     }
 
+    /// [`Self::budget`] for a request that holds a lock that others wait for, and so must
+    /// not wait for the pool: it takes what the pool has and is refused (`503`) at once
+    /// when it does not, whoever holds the rest. A write holds the node's single writer
+    /// while it gathers the keys of an index range; waiting for bytes there stalls every
+    /// other write, a replica's apply and the shutdown, and can wait on an aggregation that
+    /// holds those bytes while it waits for the writer.
+    pub fn budget_without_wait(&self) -> kimmy_query::budget::BufferBudget {
+        let buffer = kimmy_query::budget::BufferBudget::pooled(self.limit, &self.pool);
+        buffer.wait_until(std::time::Instant::now());
+        buffer
+    }
+
     /// The bytes one request may hold.
     pub fn limit(&self) -> usize {
         self.limit
