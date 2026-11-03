@@ -47,6 +47,13 @@
 //! states read byte-identical values whatever order the states arrived in. What a slot adds is
 //! `total - observed` in the slot's own type, then converted up to the cell's type (an integer
 //! to a `Decimal128` is exact up to 34 digits and rounded once above).
+//!
+//! # Step 2 checklist
+//!
+//! * `upsert_inc` takes an `i64` today. Extend it to `Decimal128` operands as production allows,
+//!   then add the multi-life Decimal case that discriminates the canonical order (writer
+//!   `(node, epoch)`, then life and generation) from the key order (life, writer, generation):
+//!   `decimal_order_scenario` has one life, so it cannot tell the two apart.
 
 use crate::decimal::arith;
 use crate::decimal::{MAX_COEFFICIENT, MAX_EXPONENT, Raw, decode_raw_bits, pack_raw};
