@@ -2705,14 +2705,15 @@ fn scan_pipeline(
     // earlier of two scopes holds, and both are the request's, so they are the one instant.
     let _deadline = crate::limits::deadline_scope();
 
-    let (docs, stats) = if stages.first().is_some_and(pipeline::streams) {
+    let (docs, stats) = if pipeline::streams_source(stages) {
         let run = |stage: &aggregate::Stage, docs, arrived| {
             run_stage(state, auth, db, stage, docs, arrived, limits, &[])
         };
         let mut chain = pipeline::build(stages, &run, limits, &[]);
-        // A chain that is full before it is pushed anything reads no document. The parser
-        // refuses `$limit: 0`, so no pipeline of a request is, but the scan asks.
-        let stop_after = chain.is_full().then_some(0);
+        // A chain that is full before it is pushed anything reads nothing: no index walk and no
+        // document. The parser refuses `$limit: 0`, but the reordering makes a window that
+        // takes nothing of `$limit 3, $skip 5`, so the scan asks.
+        let full = chain.is_full();
         // The scan answers `core::Error`s and the chain the executor's, so a failure of the
         // chain ends the scan and is kept to be returned when it is over.
         let mut failed = None;
@@ -2721,22 +2722,29 @@ fn scan_pipeline(
         // `$limit` at its head), and otherwise held to the request's budget as they are
         // collected: a range is read whole to find its smallest keys.
         let keys = IndexKeys::new(limits.buffer.lease("the index range of $match"));
-        let bounds =
-            ScanBounds { stop_after, want: pipeline::source_bound(stages), hold: Some(&keys) };
-        let stats = visit_matching_bounded(
-            state,
-            meta,
-            filter,
-            Order::ById { after: None },
-            bounds,
-            |_, doc| match chain.push(doc) {
-                Ok(flow) => Ok(flow == pipeline::Flow::More),
-                Err(e) => {
-                    failed = Some(e);
-                    Ok(false)
-                }
-            },
-        )?;
+        let bounds = ScanBounds {
+            stop_after: None,
+            want: pipeline::source_bound(stages),
+            hold: Some(&keys),
+        };
+        let stats = if full {
+            QueryStats::planned(&plan_access(filter, &meta.indexes))
+        } else {
+            visit_matching_bounded(
+                state,
+                meta,
+                filter,
+                Order::ById { after: None },
+                bounds,
+                |_, doc| match chain.push(doc) {
+                    Ok(flow) => Ok(flow == pipeline::Flow::More),
+                    Err(e) => {
+                        failed = Some(e);
+                        Ok(false)
+                    }
+                },
+            )?
+        };
         if let Some(e) = failed {
             return Err(e);
         }
@@ -4370,18 +4378,20 @@ mod tests {
         let limits = aggregate::Limits { max_documents: 10, ..Default::default() };
         let auth = superuser();
 
-        let whole = json!([{ "$count": "c" }]);
+        // A `$sort` first needs the source whole (a `$count` first would stream it).
+        let whole = json!([{ "$sort": { "n": 1 } }, { "$count": "c" }]);
         let err = agg_limits(&state, &auth, "app", "docs", &whole, limits.clone())
             .expect_err("the whole collection is over the ceiling");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
 
-        let narrowed = json!([{ "$match": { "n": 3 } }, { "$count": "c" }]);
+        let narrowed =
+            json!([{ "$match": { "n": 3 } }, { "$sort": { "n": 1 } }, { "$count": "c" }]);
         let out = agg_limits(&state, &auth, "app", "docs", &narrowed, limits.clone()).unwrap();
         assert_eq!(out["documents"][0]["c"], 6);
 
         // A leading `$match` that admits too many is refused too, and the
         // refusal names it rather than the collection.
-        let wide = json!([{ "$match": { "n": { "$gte": 0 } } }, { "$count": "c" }]);
+        let wide = json!([{ "$match": { "n": { "$gte": 0 } } }, { "$sort": { "n": 1 } }, { "$count": "c" }]);
         let err = agg_limits(&state, &auth, "app", "docs", &wide, limits)
             .expect_err("the match admits thirty");
         assert!(format!("{err:?}").contains("leading $match"), "{err:?}");
