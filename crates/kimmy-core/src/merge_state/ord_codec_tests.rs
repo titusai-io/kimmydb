@@ -374,7 +374,7 @@ fn entry_state(root: bool, x: FieldOrd) -> MergeState {
     let mut s = MergeState::default();
     s.lives.insert(life, Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert });
     for k in *b"ABC" {
-        s.vv.insert(w(k), Hlc::new(20, 0));
+        s.vv.insert(w(k), Hlc::new(40, 0));
     }
     let at_ = if root { OrdAt::Root } else { OrdAt::Field(Path::flat("x").unwrap()) };
     s.ords.insert((life, at_), x);
@@ -831,4 +831,39 @@ fn nothing_panics_on_a_decoded_state_and_version_one_refuses_an_order_state() {
         states.len()
     );
     assert!(with_ords > 1_000 && ops > 300, "{with_ords} {ops}");
+}
+
+/// O1-2 of the O1 review, the honest case beyond retention. The model's nested run seed 1421 (60 steps,
+/// retention 10, restore and snapshots on, the covered-entry skip off) reaches, at the key `((1, A),
+/// a.d.g)`, three entries that are each an honest state's and not associative: `{first of C at 3}`,
+/// `{first of C at 31}` and `{an unset of C at 8, prev 3}`. The trace: C writes the path at 3 and
+/// unsets it at 8; a delete kills the life (its entries go with it); a join jumps the receiver's
+/// horizon from -2 to 9, more than R ahead, which collects the delete and the dead mark, and an old
+/// entry that is re-sent brings the life back with no entry at the path; C writes the path again at 31, a
+/// first with no floor over its earlier one. This is the ADR-085 limit (the same mechanism makes the
+/// state itself non-associative at a small retention: the NOTE of `prop_tests::check_laws`), and decode
+/// cannot tell it from an honest state: each entry passes every check. The boundary of the order
+/// join's associativity is therefore "within retention", not "reachable by a causal history".
+/// `q7-logs/ord-goldens/o1_2_triple.py` (in the review files) prints the three entries from the model.
+#[test]
+fn an_honest_history_beyond_retention_reaches_the_non_associative_triple() {
+    let o = JoinOptions::default();
+    let c = b'C';
+    let first = |hlc: u64| FieldOrd {
+        firsts: [(w(c), (at(hlc, c), 0))].into(),
+        last: Some((at(hlc, c), 0)),
+        ..FieldOrd::default()
+    };
+    let (a, b) = (first(3), first(31));
+    let unset = FieldOrd { floor: Some(u(8, c, 3, false)), ..FieldOrd::default() };
+    for x in [&a, &b, &unset] {
+        assert!(
+            MergeState::decode_compact(&entry_state(false, x.clone()).encode_compact()).is_ok()
+        );
+    }
+    assert!(!states_agree(&a, &b, &o), "the pair no history within retention makes");
+    let left = ord_join(&ord_join(&a, &b, &o), &unset, &o);
+    let right = ord_join(&a, &ord_join(&b, &unset, &o), &o);
+    assert_ne!(left, right, "not associative");
+    assert!(left.firsts.is_empty() && right.firsts == [(w(c), (at(31, c), 0))].into());
 }

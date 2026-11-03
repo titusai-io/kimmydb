@@ -300,9 +300,10 @@ impl MergeState {
     ///     (A voided entry cannot become empty: voiding needs a floor, which stays.)
     ///
     /// THE REACHABILITY INVARIANT of an order entry. The join of order entries is commutative and
-    /// idempotent on any normal entries but associative only on entries a causal history can
-    /// reach (a test pins the counterexample). The clauses below say what an entry looks like in
-    /// any state a causal history reaches, derived from the model's rules (`_events`,
+    /// idempotent on any normal entries but associative only on entries of histories within
+    /// retention (ADR-085; a test pins the counterexample, and another the honest one beyond
+    /// retention). The clauses below say what an entry looks like in any state such a history
+    /// reaches, derived from the model's rules (`_events`,
     /// `_ord_apply`, `ord_join`) and held by every honest source in the tests: the model's
     /// runs (the 457 entries of its join-law probe and the 120 states of its scenarios), the
     /// causal simulation, and the property tests' runs with the feed. Each says whether one
@@ -346,7 +347,12 @@ impl MergeState {
     ///     did not. It is "one stamp is one write" for the order state (the second state denies
     ///     the write at stamp 5 that the first holds), guaranteed by honest stamping and by
     ///     the full-state transfer, and not closable by decode. The join groups such entries
-    ///     differently and does not agree with itself (`ord_tests`).
+    ///     differently and does not agree with itself (`ord_tests`). Beyond retention an HONEST
+    ///     history reaches the same pair (the model's seed 1421: a delete and its dead mark are
+    ///     collected when the horizon jumps by more than R, an old entry that is re-sent brings the
+    ///     life back without the entry of the path, and the writer then writes a first with no
+    ///     floor over its earlier one): the boundary of the claim is "within retention", the same as
+    ///     the state's own, not "a causal history" (`ord_codec_tests`).
     ///
     /// 23. NOT relied on, so NOT checked: nothing else is assumed of an entry: the join and the read
     ///     are defined for any values, and the laws hold as stated above.

@@ -222,8 +222,10 @@ impl FieldOrd {
 }
 
 /// The join of two order entries of one path (the model's `ord_join`): commutative and
-/// idempotent on any two entries that are normal, associative on those a state can carry (the
-/// join-law tests pin it on the entries of the model's own runs). The floor is the larger, each
+/// idempotent on any two entries that are normal, associative on the entries of histories within
+/// retention (ADR-085; the join-law tests pin it on the entries of the model's own runs). Beyond
+/// retention an honest history can reach a non-associative triple (`ord_codec_tests`, the seed 1421
+/// case), as the state itself is not associative there. The floor is the larger, each
 /// writer keeps the earlier of the candidates the joined floor lets stand, `last` is the later,
 /// `lvl` the newer; what the joined floor voids goes.
 pub fn ord_join(a: &FieldOrd, b: &FieldOrd, o: &JoinOptions) -> FieldOrd {

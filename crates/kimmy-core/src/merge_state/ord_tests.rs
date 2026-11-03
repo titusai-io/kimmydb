@@ -970,11 +970,13 @@ fn the_feed_only_moves_forward_the_floor_the_level_and_the_first() {
 }
 
 /// Where the associativity of the order join ends. Commutative and idempotent on any NORMAL
-/// entries, it is associative only on the entries a causal history reaches: one writer's earlier
-/// and later first for a path never both stand next to a floor between them (the later state has
-/// seen the floor, and carries it). Here are two firsts of one writer that no history keeps
-/// side by side and an unset between them: the groupings disagree. The model's probe and the
-/// simulation below pin the reachable side; the writer's feed (item O2) must keep to it.
+/// entries, it is associative only on the entries of histories WITHIN RETENTION (the ADR-085 limit):
+/// one writer's earlier and later first for a path never both stand next to a floor between them
+/// (the later state has seen the floor, and carries it). Here are two firsts of one writer that no
+/// such history keeps side by side and an unset between them: the groupings disagree. (Beyond
+/// retention an honest history reaches the same shape: `ord_codec_tests`, the seed 1421 case.) The
+/// model's probe and the simulation below pin the reachable side; the writer's feed (item O2) must
+/// keep to it.
 #[test]
 fn the_order_join_is_associative_only_on_the_entries_a_history_reaches() {
     let o = JoinOptions::default();
