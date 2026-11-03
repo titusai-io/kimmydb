@@ -767,3 +767,13 @@ fn a_document_in_an_array_is_equal_structurally_type_strict_and_in_field_order()
     assert!(w.write_set(&p("a"), a, 0).is_none(), "the same document is a no-op");
     assert!(w.write_set(&p("a"), swapped, 0).is_some());
 }
+
+#[test]
+fn receiving_a_state_with_a_document_in_an_array_works_and_reports_the_change() {
+    // The "changed" verdict does not go through the version 1 bytes, which cannot hold it.
+    let a = state_with(Value::Array(vec![d(&[("x", Value::Int64(1))])]));
+    let mut b = Writer::new(wid(b'B', 0), opts());
+    assert!(b.receive_report(&a).changed);
+    assert!(!b.receive_report(&a).changed);
+    assert_eq!(b.state, a);
+}

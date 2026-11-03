@@ -754,7 +754,7 @@ impl Writer {
     pub fn receive_report(&mut self, other: &MergeState) -> Received {
         let (merged, fresh) = join(&self.state, other, &self.opts);
         self.clock = merged.vv.values().copied().chain([self.clock]).max().unwrap_or(Hlc::ZERO);
-        let changed = merged.canonical_bytes() != self.state.canonical_bytes();
+        let changed = merged != self.state;
         self.state = merged;
         Received { changed, fresh: fresh.into_iter().collect() }
     }
