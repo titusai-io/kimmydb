@@ -1552,6 +1552,9 @@ mod tests {
     /// regression that laid a stage out as another kind (a `$project` as a barrier, a `$group`
     /// as a stage that keeps its input) moves the chain and `explain` together, so only a table
     /// of the expected answers can fail on it. `(pipeline, [(hold, state)] for each stage listed)`.
+    /// A pipeline and the `(hold, state)` of each stage `explain` lists for it.
+    type Row = (Vec<Value>, Vec<(&'static str, &'static str)>);
+
     #[test]
     fn what_each_stage_kind_holds_is_written_out() {
         let dir = tempfile::tempdir().unwrap();
@@ -1559,7 +1562,7 @@ mod tests {
         seed(&state, "a", 10, true);
         seed(&state, "b", 5, false);
         let sort = || json!({ "$sort": { "k": 1 } });
-        let table: Vec<(Vec<Value>, Vec<(&str, &str)>)> = vec![
+        let table: Vec<Row> = vec![
             // (A `$match` that begins the pipeline is the source's filter, so one follows a stage.)
             (
                 vec![
