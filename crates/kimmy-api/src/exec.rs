@@ -2793,8 +2793,7 @@ const WRITE_RANGE_KEYS: kimmy_query::budget::Wording = kimmy_query::budget::Word
     over_limit: "narrow the filter on the indexed field so that its range is smaller, which \
                  can be done in several writes, each over part of the range; or raise \
                  aggregate.memory_limit_bytes",
-    pool_busy: "retry later, or narrow the filter on the indexed field so that its range is \
-                smaller",
+    pool_busy: "narrow the filter on the indexed field so that its range is smaller",
 };
 
 /// An aggregation over a collection, from the read of its source to the answer, under the

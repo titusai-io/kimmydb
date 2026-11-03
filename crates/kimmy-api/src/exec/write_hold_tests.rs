@@ -246,7 +246,7 @@ fn a_full_pool_refuses_a_write_at_once_with_503_and_retry_wait() {
     assert!(err.message.starts_with("what the write holds needed "), "{}", err.message);
     assert!(err.message.contains("aggregate.memory_pool_bytes"), "{}", err.message);
     assert!(
-        err.message.contains("retry later, or narrow the filter on the indexed field"),
+        err.message.contains("retry later, or hold less: narrow the filter on the indexed field so that its range is smaller"),
         "{}",
         err.message
     );

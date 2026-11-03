@@ -915,7 +915,7 @@ const VECTOR_FILTER: kimmy_query::budget::Wording = kimmy_query::budget::Wording
     holder: "one filtered vector search",
     over_limit: "narrow the filter so that it admits fewer documents, or raise \
                  aggregate.memory_limit_bytes",
-    pool_busy: "retry later, or narrow the filter so that it admits fewer documents",
+    pool_busy: "narrow the filter so that it admits fewer documents",
 };
 
 pub async fn vector_search(
@@ -2425,11 +2425,9 @@ mod tests {
         assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.message);
         assert_eq!(refused.code.retry(), crate::error::Retry::Wait);
         assert!(refused.message.starts_with("the documents the filter admits needed "));
-        assert!(
-            refused
-                .message
-                .ends_with("retry later, or narrow the filter so that it admits fewer documents")
-        );
+        assert!(refused.message.ends_with(
+            "retry later, or hold less: narrow the filter so that it admits fewer documents"
+        ));
         assert_eq!(pool.used(), pool.cap(), "only the other request's bytes are left");
         drop(held);
 

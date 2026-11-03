@@ -593,7 +593,14 @@ fails a `find` ([Query language](query-language.md)).
 It is planned the way a `find` is: a filter that pins `_id` is a primary-key
 read, a filter on an indexed field uses the index, anything else scans the
 collection — every candidate rechecked against the full filter either way —
-and only the ids are kept, a page at a time. An index on a field that searches
+and only the ids are kept. The filter is read once, in the order the access path
+finds cheapest, so a filter that rejects most of a large index range does not hold
+its keys or read it again. The ids a filter admits are held in the node's
+aggregation memory pool past the first 10,000 (about 126 bytes an id for an integer
+or ObjectId `_id`): a filter that admits more than a request may hold is refused
+`413 answer_too_large`, and a full pool is waited for, up to the request's
+deadline, and then `503 timeout` ([Operations](operations.md#aggregation-memory)).
+Narrow the filter. An index on a field that searches
 filter by speeds the search up exactly as it speeds up `find`, and `find` with
 `explain: true` on the same filter shows which strategy the search will get
 ([Indexes](indexes.md#did-it-get-used)).

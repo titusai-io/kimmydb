@@ -121,6 +121,16 @@ charged to the node's memory pool and refused `413` past the request limit
 ([Operations](operations.md#aggregation-memory)). `explain` reports the
 entries read as `indexEntriesRead`, beside the documents examined.
 
+A **write** is the exception to "streamed": an `update`, `delete` or `find_and_modify`
+whose filter an index serves matches inside the write transaction, under the node's
+single writer, and gathers the document key of every entry of its range before it reads
+a document (a `multi` write again for each chunk). The first 10,000 keys are not
+charged; past that they, and the documents the write matches, are charged to the same
+pool and refused `413` past the request limit, or `503` at once when the pool is full
+(a write never waits for it). Narrow the filter on the indexed field, in several writes
+if need be ([Operations](operations.md#aggregation-memory)). A paged read that holds no
+keys is planned ([ADR-270](decisions.md), "For later").
+
 It follows that a computed key range may be **too wide, but never too narrow**.
 A wide range costs time; a narrow one silently drops matching documents. Every
 uncertain decision in the planner resolves toward "wider".
