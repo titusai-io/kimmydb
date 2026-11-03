@@ -5,7 +5,8 @@
 
 use super::super::{LIMB_DIGITS, Mag, SL, m_cmp, m_sub};
 use super::{
-    Fx, SERIES, Scale, at_least_large, fixed_ratio, ln_fixed, ratio_scale, reduce, result, tangent,
+    Fx, SERIES, Scale, at_least_large, fixed_ratio, ln_fixed, ratio_scale, reduce, result, sin_cos,
+    tangent,
 };
 use crate::decimal::arith::func;
 use crate::decimal::{Raw, decode_raw, parse};
@@ -379,5 +380,31 @@ fn the_scale_of_atan2_follows_the_gap_between_the_operands_to_80_digits() {
         (-100, 100, 7),
     ] {
         assert_eq!(ratio_scale(ax, ay).limbs, limbs, "ax {ax}, ay {ay}");
+    }
+}
+
+#[test]
+fn the_taylor_series_of_sine_and_cosine_are_exact_to_a_few_units_of_the_133rd_place() {
+    // `sin_cos(SERIES, r)` for `r` from a quarter to a hair under pi/2: every term of both series
+    // counts at the larger values (the 25th is still above the last place at 1.5), so a series
+    // that stops, repeats or reorders a term is wrong in the first digits. The truth is from the
+    // triple-angle route of `gen_trig_hard.py`, truncated.
+    const TOLERANCE: u128 = 100;
+    let rows = kernel_rows("sin_cos");
+    assert_eq!(rows.len(), 6);
+    for cols in rows {
+        let (sin, cos) = sin_cos(SERIES, &mag(cols[1]));
+        assert!(
+            distance(&sin, &mag(cols[2])) <= TOLERANCE,
+            "sin({}): {} off",
+            cols[1],
+            distance(&sin, &mag(cols[2]))
+        );
+        assert!(
+            distance(&cos, &mag(cols[3])) <= TOLERANCE,
+            "cos({}): {} off",
+            cols[1],
+            distance(&cos, &mag(cols[3]))
+        );
     }
 }

@@ -24,6 +24,7 @@ digit; those rows are rounded from the series to 500 digits, where the hair is i
     fixed_ratio limbs cy ey cx ex  N          floor(|y/x| * 10^(19 limbs))
     reduce     c e      quadrant R            c*10^e modulo pi/2: the quadrant, and the
                                               remainder at 133 places, truncated
+    sin_cos    N        SIN COS               sin and cos of N / 10^133, truncated at 133 places
 """
 import os
 import sys
@@ -256,6 +257,21 @@ def reduce_rows():
     return rows
 
 
+def sin_cos_rows():
+    """sin and cos of r at 133 places, truncated, by the triple-angle route (not the series)."""
+    rows = []
+    for text in ("0.25", "0.5", "1", "1.25", "1.5", "1.5707963267948966192313216916397514"):
+        r = D(text)
+        with localcontext() as c:
+            c.prec = 400
+            s, cs = g.sincos_by_tripling(r)
+            n = int(r.scaleb(133))
+            sin_n = int(s.scaleb(133).to_integral_value(rounding=ROUND_DOWN))
+            cos_n = int(cs.scaleb(133).to_integral_value(rounding=ROUND_DOWN))
+        rows.append(("sin_cos", str(n), str(sin_n), str(cos_n)))
+    return rows
+
+
 def main():
     getcontext().prec = g.P + 60
     g.pi_check()
@@ -263,7 +279,7 @@ def main():
     with open(os.path.join(HERE, "trig_hard.tsv"), "w") as f:
         f.write("\n".join("\t".join(r) for r in rows) + "\n")
     sys.stderr.write(f"{len(rows)} function rows\n")
-    kernels = ln_rows() + ratio_rows() + reduce_rows()
+    kernels = ln_rows() + ratio_rows() + reduce_rows() + sin_cos_rows()
     with open(os.path.join(HERE, "trig_kernels.tsv"), "w") as f:
         f.write("\n".join("\t".join(r) for r in kernels) + "\n")
     sys.stderr.write(f"{len(kernels)} kernel rows\n")
