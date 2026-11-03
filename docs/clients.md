@@ -40,10 +40,12 @@ the envelope precisely so that a client does not need a table
 ([ADR-057](decisions.md)).
 `answer_too_large` (`413`, retry `no`) refuses a query that would build more than a cap
 allows (a `$facet` answer over 16 MiB, a string, array or document over 16 MiB, or more than
-`aggregate.memory_limit_bytes` held by one aggregation, or by one `find` for the document keys
-of an inexact index range past the window of its page); narrow the query. An aggregation, or a
-`find` of that kind, that the node's aggregation memory pool is in use for is `timeout` (`503`,
-retry `wait`, with `Retry-After: 1`).
+`aggregate.memory_limit_bytes` held by one aggregation, by one `find` for the document keys
+of an inexact index range past the window of its page, by one `update`, `delete` or
+`find_and_modify` for the keys and documents it holds under the writer, or by one filtered vector
+search for the ids its filter admits); narrow the query. An aggregation, or a `find`, write or
+vector search of that kind, that the node's aggregation memory pool is in use for is `timeout`
+(`503`, retry `wait`, with `Retry-After: 1`; for a write, at once and with nothing written).
 `document_too_large` and `id_too_large` (`413`, retry `no`) refuse a write whose
 document encodes to more than 16 MiB or whose `_id` is over 4096 bytes; resending
 it fails the same way ([ADR-250](decisions.md#adr-250--size-caps-at-client-admission)).

@@ -18,10 +18,18 @@
 //! deadline, or when the storage has failed, which is when
 //! [`Engine::is_stopping`] turns.
 //!
-//! **A write transaction's walks never stop.** It holds the single writer,
-//! so `close_writes` bounds it: the stop waits for it up to its cap and
-//! refuses a clean exit past that (ADR-192). Its tables are opened with
-//! [`WalkStop::in_write`], and each place that does is listed in the guard.
+//! **A write transaction's walks do not stop**, with one exception. It holds
+//! the single writer, so `close_writes` bounds it: the stop waits for it up to
+//! its cap and refuses a clean exit past that (ADR-192). Its tables are opened
+//! with [`WalkStop::in_write`], and each place that does is listed in the
+//! guard. The exception is the gather of the keys of an index range that an
+//! `update`, a `delete` or a `find_and_modify` makes before it reads a document
+//! (`index::scan_range_in_write`), which is as long as the range and nothing
+//! else bounds: it is a [`WalkScope::Request`] walk, so it ends at the drain's
+//! deadline and at the request's own deadline, with nothing of the transaction
+//! written. Where the request has already committed a chunk the deadline is set
+//! aside (ADR-192) and only the engine's stop reaches it, which ends the
+//! request as ADR-192 says of any stop after a commit.
 //!
 //! The guard in `tests/walks_stop.rs` holds the storage crate to this: every
 //! function that iterates a table is listed as a stop-aware walk or as a
@@ -679,6 +687,26 @@ mod tests {
             e.visit_index_candidates(c, &scan, order, WalkScope::Request, |_, _, _| Ok(true))
                 .map(drop)
         }
+        // A filtered write's gather of the keys of an index range, inside the write
+        // transaction: it matches nothing, so the store is the same for the next stop.
+        struct MatchesNothing;
+        impl crate::ModifySpec for MatchesNothing {
+            fn matches(&self, _: &bson::Document) -> kimmy_core::Result<bool> {
+                Ok(false)
+            }
+            fn compare(&self, _: &bson::Document, _: &bson::Document) -> std::cmp::Ordering {
+                std::cmp::Ordering::Equal
+            }
+            fn apply(
+                &self,
+                doc: &bson::Document,
+            ) -> std::result::Result<Option<bson::Document>, String> {
+                Ok(Some(doc.clone()))
+            }
+            fn upsert(&self) -> Option<std::result::Result<bson::Document, String>> {
+                None
+            }
+        }
         let background: &[(&str, Walk)] = &[
             // covers: engine::Engine::warm_purge_chunk
             ("warm_purge_chunk", |e, c| e.warm_purge_chunk(c.id)),
@@ -776,6 +804,18 @@ mod tests {
             ("index_candidates", |e, c| {
                 let index = c.index("by_n").unwrap();
                 e.index_candidates(c, index.id, &[], &[0xFF; 8]).map(drop)
+            }),
+            // A write's gather ends at the stop with nothing written: its first transaction
+            // answers `Stopping`, as a read does.
+            // covers: index::scan_table, index::holders_of
+            ("a filtered write's gather", |e, c| {
+                let index = c.index("by_n").unwrap();
+                let candidates = crate::Candidates::Index {
+                    index_id: index.id,
+                    ranges: vec![(Vec::new(), vec![0xFF; 8])],
+                    both_bounds: false,
+                };
+                e.modify_where(c, &candidates, &MatchesNothing, None).map(drop)
             }),
             // covers: index::holders_of
             ("unkeyed_count", |e, c| e.unkeyed_count(c, c.index("ab").unwrap().id).map(drop)),

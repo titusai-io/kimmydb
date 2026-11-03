@@ -1930,6 +1930,39 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "413":
+          description: |
+            `answer_too_large`: the filter is served by an index, and what the write holds
+            under the writer passed `aggregate.memory_limit_bytes` (ADR-269, ADR-270): the
+            document key of every entry of the range it gathers before it reads a document
+            (about 82 bytes a key; the first 10,000 are not charged), and the documents it
+            matches. The message names `what the write holds`, the bytes held and the limit.
+            Nothing was written. Narrow the filter on the indexed field so that its range is
+            smaller, which can be done in several writes, each over part of the range, or
+            raise the setting. A write whose filter is served by no index, or by `_id`, holds
+            nothing that is charged. In a later chunk of a `multi` write (the range or the
+            documents grew past the limit between chunks) it is `500 partially_applied`
+            instead, with this code in `cause`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            `timeout`, `retry: wait`, `Retry-After: 1`: the keys above would be charged to the
+            node's aggregation memory pool (`aggregate.memory_pool_bytes`) and it is in use.
+            **A write never waits for the pool**, since it holds the node's single writer: it
+            is refused at once, whichever request is older, and nothing was written. The same
+            request is answered when the others have finished. Also answered when the request
+            deadline passes while the keys are gathered, or `node_stopping` when the node
+            stops: nothing was written. Also, with the same code, when the single writer
+            stayed busy for the request's whole budget: the request did not run.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "500": { $ref: "#/components/responses/PartiallyApplied" }
 
   /v1/db/{db}/coll/{coll}/find_and_modify:
@@ -2043,6 +2076,39 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "413":
+          description: |
+            `answer_too_large`: the filter is served by an index, and what the write holds
+            under the writer passed `aggregate.memory_limit_bytes` (ADR-269, ADR-270): the
+            document key of every entry of the range it gathers before it reads a document
+            (about 82 bytes a key; the first 10,000 are not charged), and the documents it
+            matches (every match, up to 10,000, when it sorts). The message names
+            `what the write holds`, the bytes held and the limit. Nothing was written. Narrow the filter on the indexed field so that its range is
+            smaller, which can be done in several writes, each over part of the range, or
+            raise the setting. A write whose filter is served by no index, or by `_id`, holds
+            nothing that is charged. A single-document write is one transaction, and is
+            refused whole. With `upsert`, a filter whose range passes the limit is refused,
+            not inserted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            `timeout`, `retry: wait`, `Retry-After: 1`: the keys above would be charged to the
+            node's aggregation memory pool (`aggregate.memory_pool_bytes`) and it is in use.
+            **A write never waits for the pool**, since it holds the node's single writer: it
+            is refused at once, whichever request is older, and nothing was written. The same
+            request is answered when the others have finished. Also answered when the request
+            deadline passes while the keys are gathered, or `node_stopping` when the node
+            stops: nothing was written. Also, with the same code, when the single writer
+            stayed busy for the request's whole budget: the request did not run.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/db/{db}/coll/{coll}/delete:
     parameters:
@@ -2124,6 +2190,39 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "413":
+          description: |
+            `answer_too_large`: the filter is served by an index, and what the write holds
+            under the writer passed `aggregate.memory_limit_bytes` (ADR-269, ADR-270): the
+            document key of every entry of the range it gathers before it reads a document
+            (about 82 bytes a key; the first 10,000 are not charged), and the documents it
+            matches. The message names `what the write holds`, the bytes held and the limit.
+            Nothing was written. Narrow the filter on the indexed field so that its range is
+            smaller, which can be done in several writes, each over part of the range, or
+            raise the setting. A write whose filter is served by no index, or by `_id`, holds
+            nothing that is charged. In a later chunk of a `multi` write (the range or the
+            documents grew past the limit between chunks) it is `500 partially_applied`
+            instead, with this code in `cause`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            `timeout`, `retry: wait`, `Retry-After: 1`: the keys above would be charged to the
+            node's aggregation memory pool (`aggregate.memory_pool_bytes`) and it is in use.
+            **A write never waits for the pool**, since it holds the node's single writer: it
+            is refused at once, whichever request is older, and nothing was written. The same
+            request is answered when the others have finished. Also answered when the request
+            deadline passes while the keys are gathered, or `node_stopping` when the node
+            stops: nothing was written. Also, with the same code, when the single writer
+            stayed busy for the request's whole budget: the request did not run.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "500": { $ref: "#/components/responses/PartiallyApplied" }
 
   /v1/db/{db}/coll/{coll}/docs/{id}:
@@ -2952,12 +3051,36 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/NoVectors" }
+        "413":
+          description: |
+            `answer_too_large`: the `filter` admits more documents than a request may hold the
+            ids of (ADR-269, ADR-270). The ids are charged to `aggregate.memory_limit_bytes` past
+            the first 10,000, at about 126 bytes for an integer or ObjectId `_id`. The message
+            names `the documents the filter admits`, the bytes held and the limit. Narrow the
+            filter so that it admits fewer documents, or raise the setting.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "502":
           description: An embedding provider failed. The upstream's fault, not the caller's.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
-        "503": { $ref: "#/components/responses/ResolverBusy" }
+        "503":
+          description: |
+            `timeout`, `retry: wait`, `Retry-After: 1`: the ids the `filter` admits, past the
+            first 10,000, would be charged to the node's aggregation memory pool
+            (`aggregate.memory_pool_bytes`) and it is in use; the request is granted oldest
+            first, as an aggregation is, and waits up to its deadline when it is not the
+            youngest holder. Nothing was done. Also `resolver_busy`, when a host this request
+            had to resolve (an embedding provider's) was not looked up.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/db/{db}/coll/{coll}/hybrid_search:
     parameters:
@@ -3010,12 +3133,36 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/NoVectors" }
+        "413":
+          description: |
+            `answer_too_large`: the `filter` admits more documents than a request may hold the
+            ids of (ADR-269, ADR-270). The ids are charged to `aggregate.memory_limit_bytes` past
+            the first 10,000, at about 126 bytes for an integer or ObjectId `_id`. The message
+            names `the documents the filter admits`, the bytes held and the limit. Narrow the
+            filter so that it admits fewer documents, or raise the setting.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "502":
           description: An embedding provider failed.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
-        "503": { $ref: "#/components/responses/ResolverBusy" }
+        "503":
+          description: |
+            `timeout`, `retry: wait`, `Retry-After: 1`: the ids the `filter` admits, past the
+            first 10,000, would be charged to the node's aggregation memory pool
+            (`aggregate.memory_pool_bytes`) and it is in use; the request is granted oldest
+            first, as an aggregation is, and waits up to its deadline when it is not the
+            youngest holder. Nothing was done. Also `resolver_busy`, when a host this request
+            had to resolve (an embedding provider's) was not looked up.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/db/{db}/coll/{coll}/webhooks:
     parameters:
@@ -3507,7 +3654,7 @@ components:
         | `bad_request` | 400, 422 | no | Malformed filter, update, projection or Extended JSON; a body of the wrong shape; a batch over the cap |
         | `payload_too_large` | 413 | no | Request body over the node's ceiling (`server.max_body_bytes`, 2 MiB by default) |
         | `document_too_large` | 413 | no | A write that would store a document encoding to more than 16 MiB, checked on the result of an insert, bulk, replace, upsert or update. A `multi` update over it in a later chunk is `500 partially_applied` with this code in `cause` |
-        | `answer_too_large` | 413 | no | A query that would build more than a cap allows, and is refused rather than cut short: a `$facet` answer over 16 MiB, a string, array or document an expression builds over its 16 MiB limit, or more than `aggregate.memory_limit_bytes` (derived from the container's memory by default) held by one aggregation (the documents it reads, each stage's input and output, the groups and joins it builds, and its answer; ADR-269) or by one `find` (the document keys of an inexact index range, past the window of its page; ADR-270). The message names what held the memory, the bytes and the limit. Nothing is written; narrow the query |
+        | `answer_too_large` | 413 | no | A query that would build more than a cap allows, and is refused rather than cut short: a `$facet` answer over 16 MiB, a string, array or document an expression builds over its 16 MiB limit, or more than `aggregate.memory_limit_bytes` (derived from the container's memory by default) held by one aggregation (the documents it reads, each stage's input and output, the groups and joins it builds, and its answer; ADR-269), by one `find` (the document keys of an inexact index range, past the window of its page), by one `update`, `delete` or `find_and_modify` (the keys of an index range it gathers under the writer and the documents it matches), or by one filtered `vector_search`, `hybrid_search` or `$vectorSearch` (the ids its filter admits; ADR-270). The message names what held the memory, the bytes and the limit. Nothing is written; narrow the query |
         | `id_too_large` | 413 | no | An `_id` over 4096 bytes (a string or binary id), in a write or in the path of a route that names one |
         | `validation_failed` | 422 | no | A write that would store a document failing its collection's validator, under `validationAction: error` (ADR-257): insert, bulk (refused whole), replace, upsert, every update, `find_and_modify`, `$merge`, `$out`. The message names the keyword path that failed. Never returned for a replicated write |
         | `unsupported_media_type` | 415 | no | A JSON body without a JSON content type |
@@ -3527,7 +3674,7 @@ components:
         | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
         | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
         | `collection_purging` | 503 | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` |
-        | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster. Also answered, with `Retry-After: 1`, when the node's aggregation memory pool is in use (`aggregate.memory_pool_bytes`, derived from the container's memory by default) and cannot cover an aggregation, or the index-range keys a `find` holds past its window (ADR-269, ADR-270): the request is within its own limit, nothing was done, and the same request is answered when the others have finished |
+        | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster. Also answered, with `Retry-After: 1`, when the node's aggregation memory pool is in use (`aggregate.memory_pool_bytes`, derived from the container's memory by default) and cannot cover an aggregation, the index-range keys a `find` holds past its window, the keys and documents an indexed write holds (which never waits for the pool, and is refused at once), or the ids a filtered vector search holds (ADR-269, ADR-270): the request is within its own limit, nothing was done, and the same request is answered when the others have finished |
         | `outcome_unknown` | 500 | verify | A write reached the storage engine's durability step and then failed: it **may or may not have been applied**, and if it was, it replicates. Read the target back before sending it again, unless the write is idempotent. Details are logged, never returned |
         | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |

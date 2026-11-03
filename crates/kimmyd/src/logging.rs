@@ -947,21 +947,21 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.aggregate.memory_limit_refusals",
             "{request}",
-            "Aggregations, and finds holding the keys of an index range, refused with 413 because what they held passed aggregate.memory_limit_bytes.",
+            "Aggregations, and the finds, updates, deletes, find-and-modifies and filtered vector searches that hold the keys of an index range or the ids a filter admits (one counter for all of them), refused with 413 because what they held passed aggregate.memory_limit_bytes.",
             aggregate_limit_refusals
         );
         observe!(
             u64_observable_counter,
             "kimmy.aggregate.memory_pool_refusals",
             "{request}",
-            "Aggregations, and finds holding the keys of an index range, refused with 503 because the node's pool of aggregation memory was held by other requests.",
+            "Aggregations, and the finds, updates, deletes, find-and-modifies and filtered vector searches that hold the keys of an index range or the ids a filter admits (one counter for all of them), refused with 503 because the node's pool of aggregation memory was held by other requests.",
             aggregate_pool_refusals
         );
         observe!(
             u64_observable_gauge,
             "kimmy.aggregate.memory_pool_used_bytes",
             "By",
-            "The BSON bytes of the pool of aggregation memory reserved by running aggregations and by the index-range keys finds hold now.",
+            "The BSON bytes of the pool of aggregation memory reserved by running aggregations and by what finds, writes and filtered vector searches hold now: the keys of an index range, the documents a write matches, the ids a filter admits.",
             aggregate_pool_used_bytes
         );
         observe!(
