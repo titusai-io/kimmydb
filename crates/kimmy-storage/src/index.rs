@@ -496,7 +496,7 @@ fn maintain_local(
                 continue;
             }
             for key in unique_keys(refuse.then_some(engine), index, new)? {
-                for holder in holders_of(&table, coll.id, index.id, &key)? {
+                for holder in holders_of(&table, coll.id, index.id, &key, None)? {
                     if holder != doc_key {
                         return Err(StorageError::Core(CoreError::UniqueViolation {
                             index: index.name.clone(),
@@ -591,7 +591,7 @@ pub(crate) fn maintain_remote(
                 continue;
             };
             for key in keys {
-                let mut holders: Vec<Vec<u8>> = holders_of(&table, coll.id, index.id, &key)?
+                let mut holders: Vec<Vec<u8>> = holders_of(&table, coll.id, index.id, &key, None)?
                     .into_iter()
                     .filter(|holder| holder != doc_key)
                     .collect();
@@ -796,12 +796,14 @@ pub(crate) fn mark_multikey(
 }
 
 /// Every document id currently filed under one exact index key: a unique
-/// key's holder, or a whole sentinel run.
+/// key's holder, or a whole sentinel run. Each key is charged to `hold`, if
+/// there is one, as it is collected.
 pub(crate) fn holders_of<T>(
     table: &WalkTable<'_, T>,
     coll: CollectionId,
     index_id: u32,
     key: &[u8],
+    hold: Option<&dyn KeyHold>,
 ) -> Result<Vec<Vec<u8>>>
 where
     T: ReadableTable<tables::IndexKey<'static>, ()>
@@ -820,6 +822,9 @@ where
             break;
         }
         out.push(doc_key.to_vec());
+        if let Some(hold) = hold {
+            hold.take(doc_key.len())?;
+        }
     }
     Ok(out)
 }
@@ -861,22 +866,30 @@ pub(crate) fn scan_range(
     )
 }
 
-/// [`scan_range`] inside a **write** transaction, which does not stop at the
-/// node's stop ([`Walk::in_write`]).
+/// [`scan_range`] inside a **write** transaction, which is how `find_and_modify`
+/// and the filtered writes match inside the write they are about to commit.
 ///
-/// Separate from the read-transaction twin because redb's two transaction
-/// types are distinct: `find_and_modify` matches inside the write it is about
-/// to commit, which is the whole reason it is atomic.
+/// The gather ends at the node's stop and the request's deadline like a read of a
+/// request: its walk is [`WalkScope::Request`], whose rows look at the engine's stop
+/// and at the deadline the calling handler set for the thread. A stop ends it with
+/// nothing of the transaction written. For the first transaction of a request that
+/// is the whole answer; a later one runs with its deadline set aside
+/// ([`kimmy_core::deadline::Deadline::suspend`], ADR-192), so only the engine's stop
+/// reaches it, and the request that the stop ends after a commit is answered as ADR-192
+/// says. Each key is charged to `hold`, if there is one, as it is collected.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_range_in_write(
+    engine: &crate::Engine,
     txn: &redb::WriteTransaction,
     coll: CollectionId,
     index_id: u32,
     lower: &[u8],
     upper: Option<&[u8]>,
     unkeyed: Unkeyed,
+    hold: Option<&dyn KeyHold>,
 ) -> Result<Vec<Vec<u8>>> {
-    let table = open_walk_table_in(txn, tables::INDEX_ENTRIES, WalkStop::in_write())?;
-    scan_table(&table, coll, index_id, lower, upper, unkeyed)
+    let table = open_walk_table_in(txn, tables::INDEX_ENTRIES, engine.walk(WalkScope::Request))?;
+    scan_table(&table, coll, index_id, lower, upper, unkeyed, hold)
 }
 
 /// [`scan_range`] inside a caller-held transaction, for scans that must share
@@ -892,10 +905,11 @@ fn scan_range_in(
     unkeyed: Unkeyed,
 ) -> Result<Vec<Vec<u8>>> {
     let table = open_walk_table(txn, tables::INDEX_ENTRIES, walk)?;
-    scan_table(&table, coll, index_id, lower, upper, unkeyed)
+    scan_table(&table, coll, index_id, lower, upper, unkeyed, None)
 }
 
-/// The body of [`scan_range`], over any readable view of the entries.
+/// The body of [`scan_range`], over any readable view of the entries. Each key collected
+/// is charged to `hold`, if there is one, and a refusal ends the scan at that key.
 fn scan_table<T>(
     table: &WalkTable<'_, T>,
     coll: CollectionId,
@@ -903,6 +917,7 @@ fn scan_table<T>(
     lower: &[u8],
     upper: Option<&[u8]>,
     unkeyed: Unkeyed,
+    hold: Option<&dyn KeyHold>,
 ) -> Result<Vec<Vec<u8>>>
 where
     T: ReadableTable<tables::IndexKey<'static>, ()>
@@ -924,13 +939,16 @@ where
             break;
         }
         out.push(doc_key.to_vec());
+        if let Some(hold) = hold {
+            hold.take(doc_key.len())?;
+        }
     }
     if unkeyed == Unkeyed::Include {
         // **Every sentinel run.** Each holds documents that are candidates for
         // every query and are rechecked in full; leaving one out would lose its
         // documents from this answer.
         for sentinel in SENTINELS {
-            out.extend(holders_of(table, coll, index_id, sentinel)?);
+            out.extend(holders_of(table, coll, index_id, sentinel, hold)?);
         }
     }
     out.sort();
@@ -2200,7 +2218,7 @@ impl crate::Engine {
     pub fn unkeyed_count(&self, coll: &crate::CollectionMeta, index_id: u32) -> Result<u64> {
         let txn = self.db().begin_read()?;
         let table = open_walk_table(&txn, tables::INDEX_ENTRIES, self.walk(WalkScope::Request))?;
-        Ok(holders_of(&table, coll.id, index_id, UNKEYED)?.len() as u64)
+        Ok(holders_of(&table, coll.id, index_id, UNKEYED, None)?.len() as u64)
     }
 
     /// One page of the documents an index files unkeyed, in document-key

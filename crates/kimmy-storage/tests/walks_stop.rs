@@ -284,7 +284,9 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     (
         "modify::scan_until",
-        "inside find_and_modify's write transaction: close_writes bounds it (ADR-192)",
+        "inside a filtered write's transaction (find_and_modify, update and delete when no index \
+         serves the filter, and a multikey range's fallback, in every chunk): close_writes \
+         bounds it (ADR-192), and each candidate it passes ticks the request's deadline",
     ),
     (
         "purge::Engine::owed_purges",
@@ -326,8 +328,10 @@ const WRITES: &[&str] = &[
     "drop_index_stamped",
     "configure_vectors",
     "disable_vectors",
-    // A filter's match, run inside the write transaction that commits it:
-    // with no usable index, the whole collection (`modify::scan_until`).
+    // A filter's match, run inside the write transaction that commits it: with an
+    // index, the gather of its range's keys is a stop-aware walk (`index::scan_table`,
+    // covered by the every-row test in `walk.rs`); with none, the whole collection
+    // (`modify::scan_until`).
     "modify_where",
     "find_and_modify",
 ];
@@ -372,8 +376,6 @@ const IN_WRITE_SITES: &[&str] = &[
     // rewind's form are one body, `maintain_local`.
     "index::maintain_local",
     "index::maintain_remote",
-    // find_and_modify's candidates, read in the write it commits.
-    "index::scan_range_in_write",
     // An index drop's removal of its entries, in the drop's write.
     "index::Engine::drop_index_inner",
 ];
