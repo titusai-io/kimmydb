@@ -1770,20 +1770,52 @@ mod tests {
 
     // --- T23 ---
 
+    /// Wait until every driver of the confirmer has dropped its handle on it:
+    /// each driver future holds clones of the confirmer's `Arc`, and drops
+    /// them as it ends, so `idle` strong references means no driver is left
+    /// running. Bounded: a driver that does not end is the answer, not a hang.
+    /// Nothing here joins a driver, so the set is left to prune itself.
+    async fn drivers_ended(confirmer: &Arc<Confirmer>, idle: usize) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(confirmer) > idle {
+            assert!(
+                Instant::now() < until,
+                "{} driver handle(s) still held 5 s after the answer",
+                Arc::strong_count(confirmer) - idle
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     /// The driver set holds live drivers, not every driver that ever ran.
+    ///
+    /// A driver answers its waiter before it ends, and the set joins a
+    /// finished driver only when the next request enqueues, so the count read
+    /// just after `confirm` returns may include the driver that answered it
+    /// and one that had yet to end: a loaded runner made a bound of 2 a race.
+    /// Each round waits for its driver to end before the next begins, so
+    /// what the set still holds at the next look is what the enqueue's own
+    /// prune left, and that is what is asserted: without the prune the set
+    /// grows by one per confirmation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_driver_set_stays_bounded() {
         let b = member().await;
         let a = pusher_for(&b, quick());
         let node = b.engine.node_id();
+        let idle = Arc::strong_count(&a.confirmer);
+        let mut peak = 0;
         for i in 0..200 {
             let resolution = a
                 .confirmer
                 .confirm(b.addr, node, create(&a.engine, &format!("f{i}")), DEADLINE)
                 .await;
             assert_eq!(resolution, Resolution::Confirmed);
-            assert!(a.confirmer.drivers_held() <= 2, "{} after {i}", a.confirmer.drivers_held());
+            drivers_ended(&a.confirmer, idle).await;
+            let held = a.confirmer.drivers_held();
+            assert!(held <= 2, "{held} after {i}");
+            peak = peak.max(held);
         }
+        assert!(peak <= 2, "the set peaked at {peak} drivers over 200 confirmations");
     }
 
     // --- T24 ---
