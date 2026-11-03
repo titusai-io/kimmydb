@@ -26,6 +26,14 @@
 //! Where the Rust side and the reference disagree OUTSIDE the restriction, the Rust side is checked
 //! against the oracle, and the disagreement is a finding.
 //!
+//! ODD FIELD NAMES. The sim and the join-law tests take the names no dotted spelling can carry (the
+//! empty name, `_`, a name with a dot); this differential takes only ONE of them, the empty name
+//! (at the top and below a map: `a.` is the path `a`, ""), because the model's paths are dotted
+//! strings and its whole-document record key is `_`: a dot in a name cannot be spelled, and `_`
+//! would share its loss key with the whole document. The reasons, and why the empty name is safe
+//! although the model keys the root's order state by "" too, are in
+//! `reference_model/q7diff_gen6.py`, at `ODD_LEAVES`.
+//!
 //! `Q7DIFF_NESTED_RUNS=<n>` sets the number of scripts (default 300). `python3` must be on the
 //! PATH: if it is not, the tests FAIL (they do not skip). No `merge-mutants` feature is needed
 //! for the replay; with it, the test `rust_mutants_are_caught_by_the_replay` turns each nested
@@ -317,7 +325,13 @@ fn opt_stamp_j(s: Option<MStamp>) -> J {
 }
 
 fn sorted_heads(h: impl IntoIterator<Item = (Path, MStamp)>) -> Vec<J> {
-    let mut v: Vec<(Path, MStamp)> = h.into_iter().collect();
+    // the model spells the whole document `_`; the oracle spells it so as never to be a field's name
+    let mut v: Vec<(Path, MStamp)> = h
+        .into_iter()
+        .map(|(p, st)| {
+            (if p == oracle::whole_document() { Path::flat("_").unwrap() } else { p }, st)
+        })
+        .collect();
     v.sort_by_key(|(p, st)| (p.to_string(), st.hlc.wall_ms, node_of(st), epoch_of(st)));
     v.iter().map(|(p, st)| json!([p.to_string(), js(st)])).collect()
 }
@@ -680,9 +694,12 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
     all
 }
 
-/// The fingerprint of the default 300 scripts, taken before the performance pass of Q7 step 0:
-/// a change to it is a change of behaviour, never to be re-pinned for speed.
-const PINNED_300: u64 = 0xdccd_abd2_57e7_f410;
+/// The fingerprint of the default 300 scripts. Taken before the performance pass of Q7 step 0 and
+/// re-pinned once, when the odd field names (the empty name, a name with a dot) joined the
+/// generator's pools: the pools grew, the code did not change. The old code (`8e36e8de`) gives this
+/// value on the new pools, as the new code does (`d7_equivalence_tests` pins the equivalence). Any
+/// other change to it is a change of behaviour, never to be re-pinned for speed.
+const PINNED_300: u64 = 0x3f91_3adc_6525_d23a;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)

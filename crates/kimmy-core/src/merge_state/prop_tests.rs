@@ -113,28 +113,28 @@ pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
             let st = ws[other].state.clone();
             ws[m].receive(&st);
         } else {
-            let path = p(rng.pick(&["x", "n", "y"]));
+            let path = p(rng.pick(&["x", "n", "y", "", "_", "a.b"]));
             let w = &mut ws[m];
             match rng.below(14) {
                 0 => {
-                    let f = pool_fields(&mut rng, &["x", "y", "n"]);
+                    let f = pool_fields(&mut rng, &["x", "y", "n", "", "_", "a.b"]);
                     w.insert(&fl(&f), skew);
                 }
                 1 => {
-                    let k = *rng.pick(&["x", "y", "n"]);
+                    let k = *rng.pick(&["x", "y", "n", "", "_", "a.b"]);
                     w.upsert_inc(&p(k), pool_inc(&mut rng), skew);
                 }
                 2 => {
                     // An upsert with $setOnInsert and $set (non-numeric values too) and an $inc,
                     // on three disjoint path lists.
-                    let f = pool_fields(&mut rng, &["y", "z", "n"]);
+                    let f = pool_fields(&mut rng, &["y", "z", "n", "", "_", "a.b"]);
                     let mut sets = if rng.below(2) == 0 {
                         Vec::new()
                     } else {
-                        pool_fields(&mut rng, &["n", "x", "w"])
+                        pool_fields(&mut rng, &["n", "x", "w", "", "_", "a.b"])
                     };
                     sets.retain(|(q, _)| !f.iter().any(|(g, _)| g == q));
-                    let free: Vec<&str> = ["x", "y", "n", "z", "u"]
+                    let free: Vec<&str> = ["x", "y", "n", "z", "u", "", "_", "a.b"]
                         .into_iter()
                         .filter(|q| !f.iter().chain(sets.iter()).any(|(g, _)| g == q))
                         .collect();
@@ -142,7 +142,7 @@ pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
                     w.upsert_soi(&fl(&f), &p(ip), pool_inc(&mut rng), &fl(&sets), skew);
                 }
                 3 => {
-                    let d = pool_fields(&mut rng, &["x", "n", "y"]);
+                    let d = pool_fields(&mut rng, &["x", "n", "y", "", "_", "a.b"]);
                     w.write_replace(&fl(&d), skew);
                 }
                 4..=6 => {
@@ -481,6 +481,41 @@ fn the_join_is_not_commutative_or_idempotent_where_decode_refuses() {
     assert!(join(&n, &n, &o).0 != n, "not idempotent");
 }
 
+/// The pools hold the names no dotted spelling can carry (the empty name, `_`, a name with a
+/// dot), as registers, counters and loss records, flat and below a map.
+#[test]
+fn the_pools_hold_odd_names() {
+    let o = opts(1_000_000_000);
+    let odd = |p: &Path| p.segments().iter().any(|s| s.is_empty() || s == "_" || s.contains('.'));
+    let sets: [(&str, Vec<Vec<MergeState>>); 3] = [
+        ("flat", pools(60, 24, &o)),
+        ("nested", nested_pools(60, 26, &o)),
+        ("counters", (1..=60).map(|s| run_counters(s, 30, &o)).collect()),
+    ];
+    for (name, ps) in sets {
+        let states: Vec<&MergeState> = ps.iter().flatten().collect();
+        let with_reg = states.iter().filter(|s| s.regs.keys().any(|k| odd(&k.1))).count();
+        let with_slot = states.iter().filter(|s| s.slots.keys().any(|k| odd(&k.1))).count();
+        let with_loss = states
+            .iter()
+            .filter(|s| s.losses.keys().any(|k| k.at.field().is_some_and(odd)))
+            .count();
+        eprintln!(
+            "{name}: odd names in {with_reg} states as registers, {with_slot} as slots, {with_loss} in records"
+        );
+        assert!(with_reg > 100 && with_slot > 50, "{name}: {with_reg} {with_slot}");
+        assert!(with_loss > 20 || name == "counters", "{name}: {with_loss}");
+    }
+    // the flat names `_` and the whole-document record side by side: the record key of a field
+    // named `_` is a different key from the whole document's
+    let ps = pools(60, 24, &o);
+    let both = ps.iter().flatten().any(|s| {
+        s.losses.keys().any(|k| k.at == LossAt::Document)
+            && s.losses.keys().any(|k| k.at.field().is_some_and(|f| f.segments() == ["_"]))
+    });
+    assert!(both, "no state holds a record about the document and one about a field `_`");
+}
+
 #[test]
 fn encode_decode_round_trip() {
     for o in [opts(1_000_000_000), opts(6)] {
@@ -741,7 +776,7 @@ fn nested_value(rng: &mut Rng, depth: usize) -> Value {
         3 => Value::Array(vec![Value::Document(vec![("k".into(), pool_value(rng))])]),
         4 => Value::Null,
         _ => {
-            let names = ["b", "c", "d"];
+            let names = ["b", "c", "d", "", "_", "b.c"];
             let n = rng.below(3);
             let mut f: Vec<(String, Value)> = Vec::new();
             for _ in 0..n {
@@ -776,8 +811,18 @@ pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeS
     let items = Value::Array(vec![Value::Int64(0)]);
     ws[0].insert(&[(p("x"), Value::Int64(100)), (p("a"), init), (p("items"), items)], 0);
     let mut pool = Vec::new();
-    let all =
-        ["x", "a", "a.b", "a.c", "a.c.d", "a.e", "m", "m.k", "items", "items", "items", "a.c.d.z"];
+    let mut all: Vec<Path> =
+        ["x", "a", "a.b", "a.c", "a.c.d", "a.e", "m", "m.k", "items", "items", "items", "a.c.d.z"]
+            .into_iter()
+            .map(np)
+            .collect();
+    // a name no dotted spelling can carry: empty, `_` (the version 1 name of the whole document in
+    // a record), or with a dot, at the top and below `a`
+    for odd in
+        [&[""][..], &["_"], &["a.b"], &["a", ""], &["a", "_"], &["a", "b.c"], &["a", "c", ""]]
+    {
+        all.push(Path::new(odd.iter().copied()).unwrap());
+    }
     for _ in 0..steps {
         let m = rng.below(n);
         let skew = *rng.pick(&[0, 0, 0, 4]);
@@ -789,7 +834,7 @@ pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeS
             let st = ws[other].state.clone();
             ws[m].receive(&st);
         } else {
-            let path = np(rng.pick(&all));
+            let path = rng.pick(&all).clone();
             let w = &mut ws[m];
             match rng.below(14) {
                 0..=3 => {
@@ -994,7 +1039,7 @@ pub(super) fn run_counters(seed: u64, steps: usize, o: &JoinOptions) -> Vec<Merg
             let st = ws[other].state.clone();
             ws[m].receive(&st);
         } else {
-            let path = p(rng.pick(&["x", "y"]));
+            let path = p(rng.pick(&["x", "y", "", "_", "a.b"]));
             let w = &mut ws[m];
             match rng.below(12) {
                 0..=6 => {

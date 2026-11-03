@@ -15,6 +15,12 @@
 //! form (`compact.rs`, written again in Python from its documentation: `ch` and `clen`);
 //! `golden_vectors_match_the_model` does the same for the golden vectors of `merge_state/tests.rs`.
 //!
+//! ODD FIELD NAMES. The sim and the join-law tests take the names no dotted spelling can carry (the
+//! empty name, `_`, a name with a dot); this differential takes the empty name and a name with a
+//! dot (the flat model keeps a name as one string), and not `_`, which the model uses for the
+//! whole document in a loss record, so that a field named `_` would share its record key with the
+//! document's (see `ODD` in `reference_model/q7diff_gen.py`).
+//!
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
 //!
@@ -94,10 +100,12 @@ fn jdoc(d: &Option<BTreeMap<Path, Value>>) -> J {
     }
 }
 
-/// The script names a path by a dotted string; its names contain no dot, so the segments are
-/// the parts (the reference model cannot represent a name with a dot).
+/// The script names a field of the flat model: one segment, whatever the name (it may be empty,
+/// or hold a dot: the flat model keeps a name as one string and never splits it). Not `_`: see
+/// `ODD` in `reference_model/q7diff_gen.py`, which names the names the flat model takes and why
+/// it cannot take `_` (the sim and the join-law tests have it).
 fn pth(s: &str) -> Path {
-    Path::new(s.split('.')).expect("a valid path")
+    Path::flat(s).expect("a valid name")
 }
 
 fn fields(v: &J) -> Vec<(Path, Value)> {
@@ -144,7 +152,13 @@ fn opt_stamp_j(s: Option<MStamp>) -> J {
 }
 
 fn sorted_heads(h: impl IntoIterator<Item = (Path, MStamp)>) -> Vec<J> {
-    let mut v: Vec<(Path, MStamp)> = h.into_iter().collect();
+    // the model spells the whole document `_`; the oracle spells it so as never to be a field's name
+    let mut v: Vec<(Path, MStamp)> = h
+        .into_iter()
+        .map(|(p, st)| {
+            (if p == oracle::whole_document() { Path::flat("_").unwrap() } else { p }, st)
+        })
+        .collect();
     v.sort();
     v.iter().map(|(p, st)| json!([p.to_string(), js(st)])).collect()
 }
@@ -550,9 +564,12 @@ fn replay(dir: &std::path::Path) -> Verdict {
     all
 }
 
-/// The fingerprint of the default 300 scripts, taken before the performance pass of Q7 step 0:
-/// a change to it is a change of behaviour, never to be re-pinned for speed.
-const PINNED_300: u64 = 0xde65_b98a_3c14_cab4;
+/// The fingerprint of the default 300 scripts. Taken before the performance pass of Q7 step 0 and
+/// re-pinned once, when the odd field names (the empty name, a name with a dot) joined the
+/// generator's pools: the pools grew, the code did not change. The old code (`8e36e8de`) gives this
+/// value on the new pools, as the new code does (`d7_equivalence_tests` pins the equivalence). Any
+/// other change to it is a change of behaviour, never to be re-pinned for speed.
+const PINNED_300: u64 = 0xe9e4_3cfc_7a1b_a621;
 
 #[test]
 fn differential_against_the_python_model() {

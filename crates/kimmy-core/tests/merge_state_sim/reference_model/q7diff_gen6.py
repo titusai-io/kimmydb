@@ -305,6 +305,38 @@ def trial_ok(m, apply):
     return True
 
 
+# Field names no dotted spelling can carry, and which of them this model takes. Paths here ARE dotted strings, so a
+# name with a dot cannot be spelled at all. `_` cannot be taken: the model names the whole document `_` in a loss
+# record (`("insertLost", "_", life)`), so a field `_` would share its record key with the document's. The EMPTY
+# name can: a top-level "" and a "" below a map ("a." is the path a, "") agree with the Rust side in every script
+# drawn (checked at 1000 scripts), though the model keys the root document's order state by "" too
+# (`parent_of(p) or ""`, `self.ords[(L, "")]` in `model6_stageA.py`): the scripts draw no order-only write and the
+# order of a level is not compared (see the restricted subset in `merge_state_diff_nested.rs`), so that key is never
+# read for a field named "". The sim and the join-law tests have all three names.
+ODD_LEAVES = ["", "a.", "a.d."]
+ODD_PARENTS = {"a": [{"": 1}, {"": 2, "b": 1}, {"d": {"": 5}}, {"b": 1, "": {"": 1}}],
+               "": [{"b": 1}, {"": 1}, {"b": {"c": 2}, "": 3}]}
+
+
+def draw_odd(rnd, m, ints, incs, sk):
+    """One write at an empty name (at the top or below a map), or of a sub-document that has one."""
+    k = rnd.choice(["set", "set", "inc", "unset", "setp"])
+    if k == "set":
+        p = rnd.choice(ODD_LEAVES)
+        v = rnd.choice(ints + SCALARS_DRAW)
+        return (["set", m, p, jv(v), sk], lambda t, log, p=p, v=v, sk=sk: t.write("set", p, v, log, sk))
+    if k == "inc":
+        p = rnd.choice(ODD_LEAVES)
+        n = rnd.choice(incs)
+        return (["inc", m, p, n, sk], lambda t, log, p=p, n=n, sk=sk: t.write("inc", p, n, log, sk))
+    if k == "unset":
+        p = rnd.choice(ODD_LEAVES + ["a"])
+        return (["unset", m, p, sk], lambda t, log, p=p, sk=sk: t.write("unset", p, None, log, sk))
+    p = rnd.choice(sorted(ODD_PARENTS))
+    v = copy.deepcopy(rnd.choice(ODD_PARENTS[p]))
+    return (["set", m, p, jv(v), sk], lambda t, log, p=p, v=v, sk=sk: t.write("set", p, v, log, sk))
+
+
 def draw_candidate(rnd, ms, m, ints, incs, nm):
     """One candidate op, as (script op, apply function) or None."""
     x = rnd.random()
@@ -319,6 +351,8 @@ def draw_candidate(rnd, ms, m, ints, incs, nm):
             return (["upsert", m, p, n, sk], lambda t, log, p=p, n=n, sk=sk: t.upsert_inc(p, n, log, sk))
         doc = PM.rand_doc(rnd) or {"x": rnd.choice(ints)}
         return (["insert", m, jv(doc), sk], lambda t, log, doc=doc, sk=sk: t.insert(doc, log, sk))
+    if rnd.random() < 1 / 8:          # one write in eight is at an empty name below a map
+        return draw_odd(rnd, m, ints, incs, sk)
     k = rnd.choice(["inc"] * 4 + ["set"] * 4 + ["setp"] * 3 + ["unset"] * 2 + ["unsetp", "replace", "replace",
                     "delete", "below", "insert", "array"])
     if k == "inc":
