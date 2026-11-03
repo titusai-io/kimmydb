@@ -2112,13 +2112,14 @@ pub(crate) fn group_key(value: &Bson) -> Vec<u8> {
 /// What one stage holds while it runs (ADR-269): its input, until it returns, and the
 /// documents it builds. Dropped when the stage returns or fails, which gives both back.
 ///
-/// A stage that only moves its input (`$match`, `$sort`, `$limit`, `$skip`, `$count`,
-/// `$sample`) builds nothing, so its input is all it holds. `$setWindowFields`,
+/// A stage that only moves its input (`$match`, `$limit`, `$skip`, `$count`, `$sample`)
+/// builds nothing, so its input is all it holds. `$sort` holds the sort keys it reads from
+/// each document as well, and charges them to `output`. `$setWindowFields`,
 /// `$densify` and `$fill` charge the documents they buffer themselves (`$fill` also every
 /// `value` it writes, on every path), and `$facet` its input and its branches, so none of
 /// those charges its input here as well.
 pub struct Held {
-    /// The documents the stage builds: its output, or its buckets.
+    /// The documents the stage builds: its output, or its buckets; the sort keys of `$sort`.
     pub output: Lease,
     _input: Option<Lease>,
 }
@@ -2247,8 +2248,9 @@ pub fn apply_charged(
             // A sort key is a field path, not an expression, and orders by
             // the same rules `find`'s sort does — an array sorts by its
             // elements, and a path that crosses one is not fanned out.
-            // In runs, with a look at the deadline between them (ADR-266).
-            shape::sort_until_deadline(keys, input)?
+            // In runs, with a look at the deadline between them (ADR-266). The keys it
+            // reads from each document are held to the end, and charged beside the input.
+            shape::sort_charging_keys(keys, input, &mut held.output)?
         }
         Stage::Limit(n) => input.into_iter().take(*n).collect(),
         Stage::Skip(n) => input.into_iter().skip(*n).collect(),

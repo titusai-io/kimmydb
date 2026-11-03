@@ -154,6 +154,27 @@ pub(crate) const SORT_RUN: usize = 4096;
 ///
 /// Takes and returns the documents, because a stop leaves nothing worth keeping.
 pub fn sort_until_deadline(keys: &[SortKey], docs: Vec<Document>) -> Result<Vec<Document>> {
+    sort_keyed(keys, docs, None)
+}
+
+/// [`sort_until_deadline`] that charges the sort keys it holds to `held` (ADR-269) as it reads
+/// them: the vector of each document and the values in it, as the heap of [`TopK`] charges
+/// them, so a `$sort` that keeps everything and one that keeps the first documents agree on
+/// what a key costs. The documents are not charged here; the stage that holds them has
+/// charged them. A refusal ends the sort at the document whose keys pass the limit.
+pub fn sort_charging_keys(
+    keys: &[SortKey],
+    docs: Vec<Document>,
+    held: &mut Lease,
+) -> Result<Vec<Document>> {
+    sort_keyed(keys, docs, Some(held))
+}
+
+fn sort_keyed(
+    keys: &[SortKey],
+    docs: Vec<Document>,
+    mut held: Option<&mut Lease>,
+) -> Result<Vec<Document>> {
     if keys.is_empty() {
         return Ok(docs);
     }
@@ -161,10 +182,20 @@ pub fn sort_until_deadline(keys: &[SortKey], docs: Vec<Document>) -> Result<Vec<
     let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for doc in docs {
         ticker.tick()?;
-        keyed.push((sort_keys(keys, &doc), doc));
+        let sort = sort_keys(keys, &doc);
+        if let Some(held) = held.as_deref_mut() {
+            held.charge(keys_bytes(&sort))?;
+        }
+        keyed.push((sort, doc));
     }
     sort_runs(keys, &mut keyed)?;
     Ok(merge_runs(keys, keyed, SORT_RUN)?.into_iter().map(|(_, doc)| doc).collect())
+}
+
+/// What the sort keys of one document are charged: the vector and the values in it.
+fn keys_bytes(sort: &[Bson]) -> usize {
+    sort.iter()
+        .fold(std::mem::size_of::<Vec<Bson>>(), |sum, key| sum.saturating_add(held_bytes_bson(key)))
 }
 
 /// Sort `keyed` in runs of [`SORT_RUN`], a look at the clock before each.
@@ -306,11 +337,7 @@ impl<'k> TopK<'k> {
         } else {
             aggregate::check_limit("$sort", self.heap.len() + 1, limits)?;
         }
-        let bytes = sort
-            .iter()
-            .fold(held_bytes(&doc).saturating_add(std::mem::size_of::<Vec<Bson>>()), |sum, key| {
-                sum.saturating_add(held_bytes_bson(key))
-            });
+        let bytes = held_bytes(&doc).saturating_add(keys_bytes(&sort));
         held.charge(bytes)?;
         let entry = Ranked { keys: self.keys, sort, at, bytes, doc };
         if full {
