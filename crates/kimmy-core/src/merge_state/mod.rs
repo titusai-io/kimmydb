@@ -21,7 +21,8 @@
 //!   the writer's own and above everything it has used or seen ([`StampError`]).
 //! * [`MergeState::canonical_bytes`] and [`MergeState::state_hash`] give a
 //!   deterministic encoding and a 128-bit digest; [`MergeState::encode`] and
-//!   [`MergeState::decode`] round-trip a whole state.
+//!   [`MergeState::decode`] round-trip a whole state. `compact.rs` is the compact
+//!   form (`QMS` version 2) that will replace them; nothing hashes or stores it yet.
 //!
 //! Retention (`R`) and the integer bound are carried by [`JoinOptions`]; every
 //! read method that depends on them takes the options.
@@ -34,11 +35,14 @@
 //! and `write_inc` refuses an `$inc` that would carry a writer's slot past it.
 
 mod codec;
+mod compact;
 mod join;
 mod state;
 mod types;
 mod writer;
 
+#[cfg(test)]
+mod compact_tests;
 #[cfg(test)]
 mod prop_tests;
 #[cfg(test)]
@@ -78,6 +82,10 @@ const _: () = {
     let _: fn(&MergeState, &JoinOptions) -> Vec<MStamp> = MergeState::alive;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::canonical_bytes;
+    let _: fn(&MergeState) -> Vec<u8> = MergeState::compact_bytes;
+    let _: fn(&MergeState) -> [u8; 16] = MergeState::compact_hash;
+    let _: fn(&MergeState) -> Vec<u8> = MergeState::encode_compact;
+    let _: fn(&[u8]) -> Result<MergeState, DecodeError> = MergeState::decode_compact;
     let _: fn(&MergeState) -> [u8; 16] = MergeState::state_hash;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::encode;
     let _: fn(&[u8]) -> Result<MergeState, DecodeError> = MergeState::decode;

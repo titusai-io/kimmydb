@@ -213,6 +213,12 @@ pub enum LossKind {
     InsertLost,
     /// Declared for the retired-writer rule; not produced in P0.
     RetiredWriter,
+    /// A scalar write against a map (or the reverse) at one path: declared for the nested
+    /// stage; nothing produces it yet.
+    TypeClash,
+    /// Two concurrent array registers at one path: declared for the nested stage; nothing
+    /// produces it yet.
+    ArrayClash,
 }
 
 /// The key of a loss record: kind, path (the one-segment path `_` for a whole document) and the

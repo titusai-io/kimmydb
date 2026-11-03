@@ -31,7 +31,7 @@ use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Path, Value, Wri
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-const MAGIC: [u8; 3] = *b"QMS";
+pub(super) const MAGIC: [u8; 3] = *b"QMS";
 const VERSION: u8 = 1;
 
 /// The deepest nesting of arrays inside a value that `decode` accepts (the BSON depth limit).
@@ -50,6 +50,8 @@ pub enum DecodeError {
     BadString,
     #[error("merge state: invalid path")]
     BadPath,
+    #[error("merge state: an index is outside its table")]
+    BadIndex,
     #[error("merge state: {0} trailing bytes")]
     Trailing(usize),
     #[error("merge state: a counter total is out of range")]
@@ -209,6 +211,8 @@ impl W {
             LossKind::DeleteWon => 1,
             LossKind::InsertLost => 2,
             LossKind::RetiredWriter => 3,
+            LossKind::TypeClash => 4,
+            LossKind::ArrayClash => 5,
         });
         self.path(&k.path);
         self.stamp(&k.stamp);
@@ -387,7 +391,7 @@ impl MergeState {
 
 /// Insert into a map that is written in key order: a key that is not strictly above the last
 /// one is a duplicate or out of order, and the input is not the encoding of any state.
-fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError> {
+pub(super) fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError> {
     if m.last_key_value().is_some_and(|(last, _)| *last >= k) {
         return Err(DecodeError::NotCanonical);
     }
@@ -396,7 +400,7 @@ fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError>
 }
 
 /// [`put`] for a set.
-fn put_set<K: Ord>(m: &mut BTreeSet<K>, k: K) -> Result<(), DecodeError> {
+pub(super) fn put_set<K: Ord>(m: &mut BTreeSet<K>, k: K) -> Result<(), DecodeError> {
     if m.last().is_some_and(|last| *last >= k) {
         return Err(DecodeError::NotCanonical);
     }
@@ -557,6 +561,8 @@ impl R<'_> {
             1 => LossKind::DeleteWon,
             2 => LossKind::InsertLost,
             3 => LossKind::RetiredWriter,
+            4 => LossKind::TypeClash,
+            5 => LossKind::ArrayClash,
             t => return Err(DecodeError::BadTag(t)),
         };
         let path = self.path()?;
@@ -586,7 +592,7 @@ fn splitmix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn hash128(data: &[u8]) -> [u8; 16] {
+pub(super) fn hash128(data: &[u8]) -> [u8; 16] {
     const P1: u64 = 0x9E37_79B1_85EB_CA87;
     const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
     let mut a: u64 = 0x243F_6A88_85A3_08D3;

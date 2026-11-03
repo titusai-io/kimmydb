@@ -913,12 +913,12 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn golden_empty() -> MergeState {
+pub(super) fn golden_empty() -> MergeState {
     MergeState::default()
 }
 
 /// x=100 inserted by A, then +20 by B and +50 by C, all joined: x reads 170.
-fn golden_170() -> MergeState {
+pub(super) fn golden_170() -> MergeState {
     let o = opts();
     let (mut a, mut b, mut c) = (Mem::new('A', &o), Mem::new('B', &o), Mem::new('C', &o));
     let i0 = a.ins(&[("x", i(100))], 0).unwrap();
@@ -934,7 +934,7 @@ fn golden_170() -> MergeState {
 
 /// A superseded first insert (insertLost on the document), an upsert with $setOnInsert whose
 /// cell is dropped for the alive insert (insertLost on the cell), and a clash record.
-fn golden_mixed() -> MergeState {
+pub(super) fn golden_mixed() -> MergeState {
     let o = opts();
     let (mut a, mut b, mut c) = (Mem::new('A', &o), Mem::new('B', &o), Mem::new('C', &o));
     let aa = a.ins(&[("x", i(1)), ("n", s("a"))], 0).unwrap();
@@ -953,7 +953,7 @@ fn golden_mixed() -> MergeState {
 /// A delete and its `deleteWon` records: A inserts and then deletes; B and C took the insert
 /// first and write into it without having seen the delete (a $set and an $inc), so the document
 /// is dead and both writes are reported as lost to the delete.
-fn golden_delete() -> MergeState {
+pub(super) fn golden_delete() -> MergeState {
     let o = opts();
     let (mut a, mut b, mut c) = (Mem::new('A', &o), Mem::new('B', &o), Mem::new('C', &o));
     let i0 = a.ins(&[("x", i(1)), ("n", s("a"))], 0).unwrap();
@@ -981,7 +981,7 @@ fn golden_delete() -> MergeState {
 /// to x and then sets x to 20 (the register's `obs` holds x's slot with its stamp and total), adds
 /// 2 to y and then sets y to a string (the generation it starts has `seen` = A's y slot, and B's 7
 /// is the unseen part, hidden). Pins the layout of `Reg::obs` and `Gen::seen`.
-fn golden_obs() -> MergeState {
+pub(super) fn golden_obs() -> MergeState {
     let o = opts();
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
     let i0 = a.ins(&[("x", i(10)), ("y", i(5))], 0).unwrap();
@@ -1007,7 +1007,7 @@ fn golden_obs() -> MergeState {
     st
 }
 
-fn golden_small() -> MergeState {
+pub(super) fn golden_small() -> MergeState {
     let mut w = Writer::new(wid('A', 7), opts());
     w.insert(&fl(&[("x", i(1)), ("s", s("t"))]), 0).unwrap();
     w.state.clone()

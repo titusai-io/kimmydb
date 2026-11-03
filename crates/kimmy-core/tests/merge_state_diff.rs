@@ -11,8 +11,9 @@
 //! (`merge_state_sim/oracle.rs`) on the Rust log against the model's oracle on the Python log.
 //!
 //! The Python side encodes its state in the Rust canonical format (`codec.rs` ported), so the
-//! hashes also pin the format against an independent implementation; `golden_vectors_match_the_model`
-//! does the same for the golden vectors of `merge_state/tests.rs`.
+//! hashes also pin the format against an independent implementation, and the same for the compact
+//! form (`compact.rs`, written again in Python from its documentation: `ch` and `clen`);
+//! `golden_vectors_match_the_model` does the same for the golden vectors of `merge_state/tests.rs`.
 //!
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
@@ -50,6 +51,8 @@ fn kind_s(k: LossKind) -> &'static str {
         LossKind::DeleteWon => "deleteWon",
         LossKind::InsertLost => "insertLost",
         LossKind::RetiredWriter => "retiredWriter",
+        LossKind::TypeClash => "typeClash",
+        LossKind::ArrayClash => "arrayClash",
     }
 }
 
@@ -125,6 +128,8 @@ fn snap(ms: &[Mem]) -> Vec<J> {
             json!({
                 "h": hex(&m.w.state.state_hash()),
                 "len": cb.len(),
+                "ch": hex(&m.w.state.compact_hash()),
+                "clen": m.w.state.compact_bytes().len(),
                 "v": jdoc(&m.w.visible()),
                 "hid": J::Object(m.w.hidden_all().iter().map(|(p, h)| (p.to_string(), J::String(h.to_string()))).collect()),
             })
@@ -593,6 +598,12 @@ fn golden_vectors_match_the_model() {
         "mixed": ["34ce6696c01c0c70255c54445944f39c", 1401],
         "delete": ["0b4d37ac9b577c417603e7c9bce83933", 542],
         "obs": ["f96f244c2b3198f724fcea0eafec32c7", 1325],
+        // the compact form (compact.rs), hashed with the same mix; compact_tests.rs pins the same
+        "empty-compact": ["e145d6a7daf371398c7b574cd9aa42d4", 9],
+        "170-compact": ["45e14c7b5dd32f32f7cf6543335f3fb1", 213],
+        "mixed-compact": ["f712215ec186fc7a782838f4f25fff6b", 341],
+        "delete-compact": ["1aace531f9c13dc54b5da4f77056e82a", 231],
+        "obs-compact": ["d785253ed2c10e27e148d2a7f2f251cd", 255],
     });
     assert_eq!(got, want);
 }

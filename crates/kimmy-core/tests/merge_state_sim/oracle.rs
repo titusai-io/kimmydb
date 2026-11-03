@@ -515,6 +515,7 @@ pub fn sound_record(
                         && killers(log, &l, dels, ret).iter().any(|d| !log[d].0.contains(&st))
                 })
         }
-        LossKind::RetiredWriter => false,
+        // Not produced by the flat workload: no record of these kinds is sound here.
+        LossKind::RetiredWriter | LossKind::TypeClash | LossKind::ArrayClash => false,
     }
 }
