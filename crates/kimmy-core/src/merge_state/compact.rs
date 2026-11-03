@@ -76,7 +76,11 @@
 //!   raised. Its candidate stamps use the same stamp and writer index primitives.
 //! * **Counter cell** (the rulings on the `absorbed` rule and the cell layout): replaces the
 //!   `obs` map of a register (section 6) and the layout of `slots` (section 7); until then both
-//!   are the version 1 data in compact spelling.
+//!   are the version 1 data in compact spelling. PROVISIONAL, from the typed counters (D6): a
+//!   total of any type but `Int64` (an `Int32`, a `Double`, a `Decimal128`) is written behind
+//!   the escape `ESCAPE` (an 18-byte marker varint) because a total has no room for a type;
+//!   every `Int64` total keeps its bytes. When the layout is ruled the type belongs in the slot
+//!   and in the `obs` entry, and the escape goes.
 //! * **Map markers and type clashes**: tag 5 (the explicit marker) is in use, with loss kinds 4
 //!   and 5 (`typeClash`, `arrayClash`); tag 6 (the implicit marker) is reserved for the write
 //!   rule the next model round decides, and nothing writes it.
