@@ -2253,7 +2253,7 @@ fn a_whole_document_loss_is_not_a_field_named_underscore() {
     let field_key = LossKey::field(LossKind::InsertLost, p("_"), life);
     assert_ne!(doc_key, field_key);
     // By the order of the version 1 bytes (the path), the document first among equals.
-    let mut keys = vec![
+    let mut keys = [
         LossKey::field(LossKind::InsertLost, p("a"), life),
         field_key.clone(),
         doc_key.clone(),

@@ -282,7 +282,10 @@ fn q3_replace_keeps_nested_increment(o: &JoinOptions) -> Result<(), String> {
     Ok(())
 }
 
-const PROBES: [(&str, fn(&JoinOptions) -> Result<(), String>); 8] = [
+/// A scenario: it holds, or says how it did not.
+type Scenario = fn(&JoinOptions) -> Result<(), String>;
+
+const PROBES: [(&str, Scenario); 8] = [
     ("marker_keeps_concurrent_child", q3_marker_keeps_concurrent_child),
     ("empty_map_reads_empty", q3_empty_map_reads_empty),
     ("replace_keeps_nested_increment", q3_replace_keeps_nested_increment),
@@ -548,7 +551,7 @@ fn np_or_two(name: &str) -> Path {
 #[test]
 fn mutants_are_caught() {
     type Switch = fn(&mut JoinOptions);
-    let cases: [(&str, Switch, fn(&JoinOptions) -> Result<(), String>); 8] = [
+    let cases: [(&str, Switch, Scenario); 8] = [
         (
             "a scalar hides every child, even a newer one",
             |o| o.set_type_ignores_recency(true),

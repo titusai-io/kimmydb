@@ -55,8 +55,9 @@ pub struct InvalidPath(pub &'static str);
 /// segment. Paths order by their segments, each compared as UTF-8 bytes, so a path sorts before
 /// every path it is a prefix of.
 ///
-/// In this stage a path is an opaque key of the state: no meaning is given to a path being
-/// below another. A flat field is the path of one segment.
+/// A path below another (`a.b` below `a`) is a field of the sub-document: the state's type rule
+/// gives that meaning (see [`MergeState::visible`](super::MergeState::visible)). A flat field is
+/// the path of one segment.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Path(Vec<String>);
 

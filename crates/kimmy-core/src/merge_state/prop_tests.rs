@@ -715,3 +715,30 @@ fn a_nested_writers_hash_equals_every_receivers() {
         }
     }
 }
+
+#[test]
+fn state_equality_is_the_equality_of_the_version_1_bytes() {
+    // `Writer::receive_report` decides "changed" by comparing states, where it once compared the
+    // version 1 canonical bytes: the two verdicts agree on every state version 1 can spell.
+    let o = opts(1_000_000_000);
+    let mut pools_ = pools(40, 24, &o);
+    pools_.extend(
+        nested_pools(40, 24, &o)
+            .into_iter()
+            .map(|p| p.into_iter().filter(MergeState::v1_can_hold).collect()),
+    );
+    let (mut same, mut differ) = (0, 0);
+    for (a, b, _) in triples(&pools_, 600) {
+        let merged = join(a, b, &o).0;
+        for (x, y) in [(a, b), (a, &merged), (b, &merged)] {
+            let by_state = x == y;
+            assert_eq!(by_state, x.canonical_bytes() == y.canonical_bytes());
+            if by_state {
+                same += 1;
+            } else {
+                differ += 1;
+            }
+        }
+    }
+    assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
+}

@@ -318,7 +318,9 @@ impl Writer {
         Written { stamp: st, record }
     }
 
-    /// An explicit insert; refused (`None`) while a life is alive.
+    /// An explicit insert; refused (`None`) while a life is alive. Each field is a one-segment
+    /// path (a sub-document is a `Value::Document` value, expanded into a map marker and its
+    /// leaves); a repeated name or a value that is not legal input refuses the insert.
     pub fn insert(&mut self, fields: &[(Path, Value)], skew: u64) -> Option<Written> {
         self.ticking(skew, |w, m| w.insert_m(fields, m))
     }
@@ -448,7 +450,10 @@ impl Writer {
         self.stamped(stamp, |w, m| w.upsert_inc_m(path, n, m))
     }
 
-    /// `$set path = v`; `None` when no life is alive or the value is unchanged.
+    /// `$set path = v`; `None` when no life is alive, the value is unchanged (a no-op is a write
+    /// that would leave the stored representation byte-identical) or the write is refused: below a
+    /// scalar or an array, or with a value that is not legal input ([`Value::check_input`]). A
+    /// `Value::Document` is a sub-document: only the leaves that changed are written.
     pub fn write_set(&mut self, path: &Path, v: Value, skew: u64) -> Option<Written> {
         self.ticking(skew, |w, m| w.write_set_m(path, v, m))
     }
@@ -503,7 +508,8 @@ impl Writer {
         self.stamped(stamp, |w, m| w.write_inc_m(p, n, m))
     }
 
-    /// Replace the whole document: changed fields are set, absent ones unset.
+    /// Replace the whole document: changed fields are set, absent ones unset. Each field is a
+    /// one-segment path; a `Value::Document` value is diffed against the map the writer sees.
     pub fn write_replace(&mut self, doc: &[(Path, Value)], skew: u64) -> Option<Written> {
         self.ticking(skew, |w, m| w.write_replace_m(doc, m))
     }

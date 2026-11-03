@@ -3,7 +3,7 @@
 //!
 //! This is a port of the reviewed reference model (`model5.py` and the
 //! `Node.finish` normalisation of `pullmodel5.py`). It is pure: no I/O, no
-//! async, no global state. Field paths are segment lists ([`Path`]), opaque keys at this stage. Nothing here is wired
+//! async, no global state. Field paths are segment lists ([`Path`]), never dotted strings. Nothing here is wired
 //! into storage, the API or the oplog.
 //!
 //! The pieces:
