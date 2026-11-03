@@ -147,7 +147,8 @@ it is legal. Two settings bound it ([ADR-269](decisions.md)), both in an estimat
   output, a join, the answer), the bytes and the limit. It is a fact about the request: sending it
   again changes nothing until the pipeline asks for less (a leading `$match` narrows what is read;
   `$project`, `$limit` or `$match` after it reduce what later stages hold) or the limit is raised.
-- **`aggregate.memory_pool_bytes`** is what **all aggregations on the node** may hold together.
+- **`aggregate.memory_pool_bytes`** is what **all aggregations on the node**, and the index-range keys
+  of the `find`s that hold them (below), may hold together.
   A request takes from it as it grows and returns it however it ends; an answer still being sent keeps its bytes until the last of them is written. One that finds it full is
   **granted oldest first**: it waits for bytes to be freed, up to its request deadline
   (`server.request_timeout_secs`), when another request that holds bytes is younger, and is refused
@@ -156,6 +157,48 @@ it is legal. Two settings bound it ([ADR-269](decisions.md)), both in an estimat
   the others have finished. Equal requests ramping up together against a pool that holds two answer two
   and refuse the youngest; a wait is not counted as a refusal in
   `kimmy_aggregate_memory_pool_refusals_total`.
+
+**A `find` over an index range draws on the same pool, past its window.** A `find` whose filter
+uses an index for a range (`{t: {$gt: x}}`, anything that is not one complete key or a union of
+them) and that is not sorted, or is sorted by `{_id: 1}`, returns its page in `_id` order, which
+the index does not give: it reads the range and keeps the smallest document keys of it, `skip +
+limit` of them at first, and while the rest of the filter rejects what it finds it goes back for
+twice as many. **The keys of a pass that stays within the window are not charged** (at most
+`skip + limit` of them, and no more than the 10,000 a page may hold, with the one a smaller key
+replaces for a moment), as the page of documents the `find` holds is not: a `find {created:
+{$gte: x}} limit 20` over a range its filter accepts holds 21 keys, never asks the pool, and is
+answered when aggregations have filled it. The first key past that makes a lease named `the index
+range of the filter` on the pool, charged for every key held from then on, under the same
+per-request limit (`aggregate.memory_limit_bytes`), at about 82 bytes a key for an `_id` of up to
+24 bytes (an integer or an ObjectId) and 100 for one of up to 40. Past the limit the answer is
+`413 answer_too_large` naming the lease, the bytes and the limit; the pool's `503` is as above
+(the youngest holder is refused, an older one waits up to the deadline). The keys are given back
+when the `find` ends, however it ends. What a member's limit holds:
+
+| Container memory | One request | Keys of one pass | A range that is always answered (a filter that rejects every candidate) | Always refused |
+|---|---|---|---|---|
+| 2 GiB | 107,374,182 | 1,309,441 | up to about 2.6 million entries, less the window | over about 3.9 million |
+| 8 GiB | 429,496,729 | 5,237,764 | up to about 10.5 million, less the window | over about 15.7 million |
+| 16 GiB | 858,993,459 | 10,475,529 | up to about 21 million, less the window | over about 31 million |
+
+The largest pass holds between a third and a half of a range that is many times the window; a
+pass can be larger when the window is large against the range, so between the two columns it
+depends on the window (`skip + limit`), and a `skip` of more than the keys of a pass is refused at
+its first pass whatever the filter, if the range holds that many entries past the cursor. **Any
+other path of a `find` holds no keys and never asks the pool**: an exact probe of one key or of
+several (`{t: 5}`, `{t: {$in: [..]}}`), a lookup by `_id`, a scan of the collection, and a `find`
+sorted by anything but `{_id: 1}` (which reads the range in index order and holds `skip + limit`
+documents); so does `count`. To avoid the `413`: narrow the filter on the indexed field so that
+its range is smaller; sort by anything but `{_id: 1}` (`{_id: -1}` included) when `skip + limit`
+is at most 10,000, the most a sorted `find` accepts; use a smaller `skip` and page with `cursor`;
+or raise `aggregate.memory_limit_bytes`. (Sorting by `{_id: 1}` and paging does not help: the
+first page is the one that reads the range.) A `find` that does hold keys is counted with the
+aggregations: its refusals in `kimmy_aggregate_memory_limit_refusals_total` and
+`kimmy_aggregate_memory_pool_refusals_total`, and its keys in
+`kimmy_aggregate_memory_pool_used_bytes`, and **it competes with them for the pool**, which bears
+on sizing `aggregate.memory_pool_bytes` for a node that serves large range queries. A `find` over
+a range this large still reads the whole range for every page, which is slow; a paged walk that
+holds no keys is planned ([ADR-270](decisions.md), "For later").
 
 **The defaults are derived, not fixed.** The budget counts an estimate of the memory the
 held documents take parsed (a document of many small fields is charged many times its BSON size),
@@ -1331,9 +1374,9 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_validation_warnings_total` | Writes this member accepted although they fail their collection's validator, because its `validationAction` is `warn` ([ADR-257](decisions.md), [Validators](validation.md)). A total with no collection named, as every series here is; each is also logged at `WARN` with the collection and the reason, at most one line a second per collection. Nonzero is data that no longer matches what its owner wrote down; find it with `GET …/validator/violations`. On the OTLP bridge, `kimmy.validation.warnings` |
 | `kimmy_validation_refusals_total` | Writes this member refused with `422 validation_failed` because they fail their collection's validator and its `validationAction` is `error`. A rise after a deploy is a client sending what the schema forbids; the refusal itself is not logged, as no refusal the caller can read in full is. On the OTLP bridge, `kimmy.validation.refusals` |
 | `kimmy_validator_unparseable_total` | Stored validators this build could not parse, each counted when first read. Always 0 unless a build changed the `$jsonSchema` dialect under a stored validator. The collection is then **not validated** (it stays writable) until its validator is replaced or removed, and the cause is logged at `ERROR`. On the OTLP bridge, `kimmy.validator.unparseable` |
-| `kimmy_aggregate_memory_limit_refusals_total` | Aggregations this member refused with `413 answer_too_large` because what they held (the documents read, each stage's input and output, groups and joined arrays, the answer) passed `aggregate.memory_limit_bytes`. The refusal names what held the memory. A rise is pipelines that read or build more than a request may hold: narrow the source with a leading `$match`, reduce what later stages hold with `$project`, `$limit` or `$match` after it, or raise the setting. On the OTLP bridge, `kimmy.aggregate.memory_limit_refusals` |
-| `kimmy_aggregate_memory_pool_refusals_total` | Aggregations this member refused with `503 timeout` (`retry: wait`, `Retry-After: 1`) because the node's aggregation memory pool is in use (`aggregate.memory_pool_bytes`, held by other requests). The request was within its own limit and nothing was done; the same request is answered when the others have finished. A rise is more concurrent large aggregations than the pool is sized for. On the OTLP bridge, `kimmy.aggregate.memory_pool_refusals` |
-| `kimmy_aggregate_memory_pool_used_bytes` | The estimated bytes of the pool reserved by running aggregations now (a gauge, 0 when none runs); compare it with `aggregate.memory_pool_bytes`. On the OTLP bridge, `kimmy.aggregate.memory_pool_used_bytes` |
+| `kimmy_aggregate_memory_limit_refusals_total` | Aggregations, and finds holding the keys of an inexact index range past their window, this member refused with `413 answer_too_large` because what they held (the documents read, each stage's input and output, groups and joined arrays, the answer) passed `aggregate.memory_limit_bytes`. The refusal names what held the memory. A rise is pipelines that read or build more than a request may hold: narrow the source with a leading `$match`, reduce what later stages hold with `$project`, `$limit` or `$match` after it, or raise the setting. On the OTLP bridge, `kimmy.aggregate.memory_limit_refusals` |
+| `kimmy_aggregate_memory_pool_refusals_total` | Aggregations, and finds holding the keys of an inexact index range past their window, this member refused with `503 timeout` (`retry: wait`, `Retry-After: 1`) because the node's aggregation memory pool is in use (`aggregate.memory_pool_bytes`, held by other requests). The request was within its own limit and nothing was done; the same request is answered when the others have finished. A rise is more concurrent large aggregations than the pool is sized for. On the OTLP bridge, `kimmy.aggregate.memory_pool_refusals` |
+| `kimmy_aggregate_memory_pool_used_bytes` | The estimated bytes of the pool reserved by running aggregations and by the index-range keys finds hold now (a gauge, 0 when none runs); compare it with `aggregate.memory_pool_bytes`. On the OTLP bridge, `kimmy.aggregate.memory_pool_used_bytes` |
 | `kimmy_ownership_peers{state}` | Live peers as **this member** sees them by the block each last sent on the replication contact ([ADR-201](decisions.md)): `eligible`, `ineligible_catching_up` (the catching-up marker is set; no class overrides it), `ineligible_yielding` (at least one class given up), `unknown` (no block yet: an older version, or not yet heard; after a member comes up or restarts, or this member rejoins, about one contact, since each side asks the other for its block at once, at most once per member per sync interval, and at the interval's end for one that came within it, [ADR-247](decisions.md)) and `stale` (a block past its lease, which keeps saying what it last said: not hearing from a member is not evidence that it recovered). Every state is always present. Views differ while blocks converge, so compare members after a lease, never a single scrape. The lease is `ceil(peers / cluster.fanout) + 2` sync intervals. On the OTLP bridge, `kimmy.ownership.peers.<state>` |
 | `kimmy_yield_unconfirmed_peers{class}` | Live peers that have not confirmed this member's yield of `class` (`ttl`, `webhooks`, `embeddings`): those that do not echo the block back and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and its live set has held still for a lease, so a peer that never does keeps it owning; alert on a value that stays above 0. 0 while no class yields. On the OTLP bridge, `kimmy.yield.unconfirmed_peers.<class>` |
 | `kimmy_owner_class_state{class,state,cause}` | How this member's own class of owned work stands, one-hot over `ok`, `idle`, `suspect` and `stalled`; only the `stalled` series carries a `cause` (`local`, `runtime`, `probation`). The state last decided, so read it beside `kimmy_task_progress_age_seconds{task="yield_evaluator"}`. On the OTLP bridge, `kimmy.owner.class_state.<class>.<state>` and `.stalled.<cause>` ([ADR-213](decisions.md)) |

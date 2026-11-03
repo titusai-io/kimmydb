@@ -9,8 +9,8 @@ use kimmy_core::Error;
 
 use crate::aggregate::{self, Limits};
 use crate::budget::{
-    BufferBudget, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_MEMORY_POOL_BYTES, MemoryPool, doc_bytes,
-    docs_bytes, held_bytes, held_bytes_bson, held_docs_bytes,
+    BufferBudget, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_MEMORY_POOL_BYTES, MemoryPool, Wording,
+    doc_bytes, docs_bytes, held_bytes, held_bytes_bson, held_docs_bytes,
 };
 
 fn capped(cap: usize) -> Limits {
@@ -148,7 +148,7 @@ fn a_request_the_pool_cannot_cover_is_refused_with_a_retry_and_reserves_nothing(
     assert!(
         matches!(
             &err,
-            Error::MemoryBusy { what: "the source read", bytes: 50, pool: 100, in_use: 60 }
+            Error::MemoryBusy { what: "the source read", bytes: 50, pool: 100, in_use: 60, .. }
         ),
         "{err:?}"
     );
@@ -184,6 +184,49 @@ fn the_pool_total_in_a_refusal_includes_what_the_refused_request_holds() {
     // Another 50 does not fit: 70 are reserved, 30 of them this request's own.
     let err = lease.charge(50).unwrap_err();
     assert!(matches!(&err, Error::MemoryBusy { bytes: 50, pool: 100, in_use: 70, .. }), "{err:?}");
+}
+
+#[test]
+fn a_lease_words_its_refusals_by_its_holder_and_an_aggregations_keep_the_text_they_had() {
+    let find = Wording {
+        holder: "one find",
+        over_limit: "narrow the filter",
+        pool_busy: "narrow it, or sort",
+    };
+    // Over the limit, `413`: the holder, the bytes, the limit and the remedy are the lease's.
+    let budget = BufferBudget::new(10);
+    let err = budget.lease_worded("the index range", find).charge(11).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the index range is 11 bytes, over the limit of 10 bytes one find may hold at once \
+         (aggregate.memory_limit_bytes); narrow the filter"
+    );
+    // A lease that is not given a wording is an aggregation's, to the word.
+    let err = budget.lease("the source read").charge(11).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the source read is 11 bytes, over the limit of 10 bytes one aggregation may hold at \
+         once (aggregate.memory_limit_bytes); a leading $match narrows what is read; $project, \
+         $limit or $match after it reduce what later stages hold; or raise \
+         aggregate.memory_limit_bytes"
+    );
+    // The pool is full, `503`.
+    let pool = MemoryPool::new(100);
+    let first = BufferBudget::pooled(100, &pool);
+    let mut held = first.lease("first");
+    held.charge(60).unwrap();
+    let second = BufferBudget::pooled(100, &pool);
+    let err = second.lease_worded("the index range", find).charge(50).unwrap_err();
+    assert!(err.to_string().ends_with("retry later, or hold less: narrow it, or sort"), "{err}");
+    let err = second.lease("the source read").charge(50).unwrap_err();
+    assert!(
+        err.to_string().ends_with(
+            "retry later, or hold less: a leading $match narrows what is read, and $project, \
+             $limit or $match after it reduce what later stages hold"
+        ),
+        "{err}"
+    );
+    held.release(60);
 }
 
 #[test]
@@ -292,6 +335,37 @@ fn an_older_request_waits_for_the_pool_and_is_woken_by_a_release() {
     assert_eq!((pool.pool_refusals(), pool.holders()), (0, 1));
     drop(older);
     assert_eq!((pool.used(), pool.holders()), (0, 0));
+}
+
+#[test]
+fn the_pool_counts_the_requests_that_sleep_in_its_wait_and_a_release_wakes_them() {
+    // A release wakes the requests that wait only when there are some (it is a system call,
+    // and most releases have nobody to answer). While the older waits it is counted, a release
+    // wakes it at once and not at the end of its slice, and none is counted after.
+    let pool = MemoryPool::new(100);
+    let (_b, mut older) = holder(&pool, 10);
+    let (_a, younger) = holder(&pool, 80);
+    assert_eq!(pool.waiters(), 0);
+    let waiter = std::thread::spawn(move || {
+        let result = older.charge(50);
+        (result, older)
+    });
+    let started = Instant::now();
+    while pool.waiters() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "the older request never waited");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(pool.waiters(), 1);
+    drop(younger);
+    let (result, older) = waiter.join().unwrap();
+    result.unwrap();
+    assert_eq!(pool.waiters(), 0);
+    drop(older);
+    assert_eq!((pool.used(), pool.holders(), pool.waiters()), (0, 0, 0));
+    // With nobody waiting, releases and leaves are not wakes: they still return the bytes.
+    let (_c, held) = holder(&pool, 40);
+    drop(held);
+    assert_eq!((pool.used(), pool.waiters()), (0, 0));
 }
 
 #[test]

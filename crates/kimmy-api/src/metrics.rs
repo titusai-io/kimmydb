@@ -145,9 +145,10 @@ pub struct StorageReadings {
     pub validation_warnings: u64,
     pub validation_refusals: u64,
     pub validators_unparseable: u64,
-    /// Aggregations refused for passing their own memory limit (`413`) and for finding the
-    /// node's pool of aggregation memory held by others (`503`), since start, and the
-    /// bytes of that pool reserved now (ADR-269). Totals for the member.
+    /// Aggregations, and finds holding the keys of an index range, refused for passing
+    /// their own memory limit (`413`) and for finding the node's pool of aggregation memory
+    /// held by others (`503`), since start, and the bytes of that pool reserved now
+    /// (ADR-269). Totals for the member.
     pub aggregate_limit_refusals: u64,
     pub aggregate_pool_refusals: u64,
     pub aggregate_pool_used_bytes: u64,
@@ -2560,13 +2561,13 @@ fn render_aggregate_memory(out: &mut String, readings: &StorageReadings) {
 
     let _ = write!(
         out,
-        "# HELP kimmy_aggregate_memory_limit_refusals_total Aggregations refused with 413 because what they held passed aggregate.memory_limit_bytes. The message names what held the memory. Counted on the member that refused, since start.\n\
+        "# HELP kimmy_aggregate_memory_limit_refusals_total Aggregations, and finds holding the keys of an index range, refused with 413 because what they held passed aggregate.memory_limit_bytes. The message names what held the memory. Counted on the member that refused, since start.\n\
          # TYPE kimmy_aggregate_memory_limit_refusals_total counter\n\
          kimmy_aggregate_memory_limit_refusals_total {}\n\
-         # HELP kimmy_aggregate_memory_pool_refusals_total Aggregations refused with 503 because the node's pool of aggregation memory (aggregate.memory_pool_bytes) was held by other requests. Counted on the member that refused, since start.\n\
+         # HELP kimmy_aggregate_memory_pool_refusals_total Aggregations, and finds holding the keys of an index range, refused with 503 because the node's pool of aggregation memory (aggregate.memory_pool_bytes) was held by other requests. Counted on the member that refused, since start.\n\
          # TYPE kimmy_aggregate_memory_pool_refusals_total counter\n\
          kimmy_aggregate_memory_pool_refusals_total {}\n\
-         # HELP kimmy_aggregate_memory_pool_used_bytes The BSON bytes of the pool of aggregation memory reserved by running aggregations now.\n\
+         # HELP kimmy_aggregate_memory_pool_used_bytes The BSON bytes of the pool of aggregation memory reserved by running aggregations and by the index-range keys finds hold now.\n\
          # TYPE kimmy_aggregate_memory_pool_used_bytes gauge\n\
          kimmy_aggregate_memory_pool_used_bytes {}\n",
         readings.aggregate_limit_refusals,
@@ -4202,13 +4203,13 @@ kimmy_validation_refusals_total 1602
 # HELP kimmy_validator_unparseable_total Stored validators this build could not parse, each counted when first read. The collection is not validated until its validator is replaced or removed, and the cause is logged at error: a build that changed the $jsonSchema dialect under a stored validator.
 # TYPE kimmy_validator_unparseable_total counter
 kimmy_validator_unparseable_total 1603
-# HELP kimmy_aggregate_memory_limit_refusals_total Aggregations refused with 413 because what they held passed aggregate.memory_limit_bytes. The message names what held the memory. Counted on the member that refused, since start.
+# HELP kimmy_aggregate_memory_limit_refusals_total Aggregations, and finds holding the keys of an index range, refused with 413 because what they held passed aggregate.memory_limit_bytes. The message names what held the memory. Counted on the member that refused, since start.
 # TYPE kimmy_aggregate_memory_limit_refusals_total counter
 kimmy_aggregate_memory_limit_refusals_total 1611
-# HELP kimmy_aggregate_memory_pool_refusals_total Aggregations refused with 503 because the node's pool of aggregation memory (aggregate.memory_pool_bytes) was held by other requests. Counted on the member that refused, since start.
+# HELP kimmy_aggregate_memory_pool_refusals_total Aggregations, and finds holding the keys of an index range, refused with 503 because the node's pool of aggregation memory (aggregate.memory_pool_bytes) was held by other requests. Counted on the member that refused, since start.
 # TYPE kimmy_aggregate_memory_pool_refusals_total counter
 kimmy_aggregate_memory_pool_refusals_total 1612
-# HELP kimmy_aggregate_memory_pool_used_bytes The BSON bytes of the pool of aggregation memory reserved by running aggregations now.
+# HELP kimmy_aggregate_memory_pool_used_bytes The BSON bytes of the pool of aggregation memory reserved by running aggregations and by the index-range keys finds hold now.
 # TYPE kimmy_aggregate_memory_pool_used_bytes gauge
 kimmy_aggregate_memory_pool_used_bytes 1613
 # HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block held from the peer's current process: an older version, one not yet heard, or one this member dropped on SWIM down or its own rejoin; an unknown peer is no longer a candidate for webhooks or embeddings); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.
