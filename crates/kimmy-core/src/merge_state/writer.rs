@@ -469,6 +469,9 @@ impl Writer {
 
     /// The body of [`Writer::insert`], with the stamp from `m`.
     fn insert_m(&mut self, fields: &[(Path, Value)], m: &mut Mint<'_>) -> Option<Written> {
+        if fields.iter().any(|(_, v)| v.check_register().is_err()) {
+            return None;
+        }
         if !self.state.alive(&self.opts).is_empty() {
             return None;
         }
@@ -530,6 +533,9 @@ impl Writer {
         sets: &[(Path, Value)],
         m: &mut Mint<'_>,
     ) -> Option<Written> {
+        if fields.iter().chain(sets).any(|(_, v)| v.check_register().is_err()) {
+            return None;
+        }
         let mut paths: Vec<&Path> =
             fields.iter().chain(sets.iter()).map(|(q, _)| q).chain([inc_path]).collect();
         paths.sort_unstable();
@@ -636,6 +642,7 @@ impl Writer {
 
     /// The body of [`Writer::write_set`], with the stamp from `m`.
     fn write_set_m(&mut self, path: &Path, v: Value, m: &mut Mint<'_>) -> Option<Written> {
+        v.check_register().ok()?;
         let vis = self.visible()?;
         if Value::same(vis.get(path), &v) {
             return None;
@@ -701,6 +708,9 @@ impl Writer {
 
     /// The body of [`Writer::write_replace`], with the stamp from `m`.
     fn write_replace_m(&mut self, doc: &[(Path, Value)], m: &mut Mint<'_>) -> Option<Written> {
+        if doc.iter().any(|(_, v)| v.check_register().is_err()) {
+            return None;
+        }
         let vis = self.visible()?;
         let changes: Vec<(&Path, &Value)> =
             doc.iter().filter(|(q, v)| !Value::same(vis.get(q), v)).map(|(q, v)| (q, v)).collect();

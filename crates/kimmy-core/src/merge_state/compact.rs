@@ -22,9 +22,11 @@
 //! * an `Int32`, `Int64` and `Date` and the parts of a `Timestamp` are fixed width big-endian, a
 //!   `Double` is its IEEE bit pattern (`to_bits`, big-endian);
 //! * a value is a tag byte and its payload: 0 `Unset`, 1 `Int64`, 2 `Double`, 3 `String`,
-//!   4 `Array` (a count and the values), **5 and 6 reserved for the explicit and the implicit map
-//!   marker**, 7 `Int32`, 8 `Decimal128`, 9 `Bool`, 10 `Date`, 11 `ObjectId`, 12 `Binary`,
-//!   13 `Timestamp`, 14 `Regex`, 15 `Null`;
+//!   4 `Array` (a count and the values), 5 the explicit map marker (a register value, never in
+//!   an array), **6 reserved for the implicit map marker**, 7 `Int32`, 8 `Decimal128`, 9 `Bool`, 10 `Date`, 11 `ObjectId`, 12 `Binary`,
+//!   13 `Timestamp`, 14 `Regex`, 15 `Null`, 16 `Document` (a count, then each field as a name and
+//!   a value; legal ONLY inside an array, at any depth, and refused as a register or a lost
+//!   value: a document outside an array is a map. The version 1 form has no tag for it);
 //! * an HLC is its 10 bytes (`Hlc::to_bytes`); a writer is 34 bytes (node 16, epoch 18) in the
 //!   writer table and a varint index into it everywhere else;
 //! * a stamp is an HLC and a writer index: 11 bytes for a table of up to 128 writers;
@@ -73,8 +75,9 @@
 //! * **Counter cell** (the rulings on the `absorbed` rule and the cell layout): replaces the
 //!   `obs` map of a register (section 6) and the layout of `slots` (section 7); until then both
 //!   are the version 1 data in compact spelling.
-//! * **Map markers and type clashes**: value tags 5 and 6 and loss kinds 4 and 5 are already
-//!   assigned.
+//! * **Map markers and type clashes**: tag 5 (the explicit marker) is in use, with loss kinds 4
+//!   and 5 (`typeClash`, `arrayClash`); tag 6 (the implicit marker) is reserved for the write
+//!   rule the next model round decides, and nothing writes it.
 //!
 //! # Canonicity
 //!
@@ -203,11 +206,22 @@ impl W {
                 self.u8(3);
                 self.str(s);
             }
-            // 4 is the array; 5 and 6 are kept for the map markers.
+            // 4 is the array; 5 the explicit map marker; 6 is kept for the implicit one.
+            Value::Map => self.u8(5),
             Value::Array(a) => {
                 self.u8(4);
                 self.len(a.len());
                 for x in a {
+                    self.value(x);
+                }
+            }
+            // 16: a document, legal only inside an array: a count, then each field as a name
+            // and a value.
+            Value::Document(f) => {
+                self.u8(16);
+                self.len(f.len());
+                for (name, x) in f {
+                    self.str(name);
                     self.value(x);
                 }
             }
@@ -695,6 +709,20 @@ impl R<'_> {
                     a.push(self.value_at(depth + 1)?);
                 }
                 Ok(Value::Array(a))
+            }
+            // The map marker is a register value, a document an array element: the other way
+            // round is refused (the depth is the number of arrays and documents above).
+            5 if depth == 0 => Ok(Value::Map),
+            16 if depth > 0 => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return Err(DecodeError::TooDeep);
+                }
+                let mut f = Vec::new();
+                for _ in 0..self.len()? {
+                    let name = self.str()?;
+                    f.push((name, self.value_at(depth + 1)?));
+                }
+                Ok(Value::Document(f))
             }
             7 => Ok(Value::Int32(i32::from_be_bytes(self.arr()?))),
             8 => Ok(Value::Decimal128(self.arr()?)),

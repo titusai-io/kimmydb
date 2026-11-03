@@ -1791,12 +1791,12 @@ fn decode_refuses_a_bad_bool_a_deep_array_and_a_cut_value() {
         }
         v
     };
-    let ok = nest(super::codec::MAX_VALUE_DEPTH);
+    // (the writers refuse a value this deep, so put it in a register by hand)
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&fl(&[("a", ok)]), 0).unwrap();
+    w.insert(&fl(&[("a", Value::Null)]), 0).unwrap();
+    w.state.regs.values_mut().next().unwrap().value = nest(super::codec::MAX_VALUE_DEPTH);
     assert!(MergeState::decode(&w.state.encode()).is_ok());
-    let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&fl(&[("a", nest(super::codec::MAX_VALUE_DEPTH + 1))]), 0).unwrap();
+    w.state.regs.values_mut().next().unwrap().value = nest(super::codec::MAX_VALUE_DEPTH + 1);
     assert_eq!(MergeState::decode(&w.state.encode()), Err(DecodeError::TooDeep));
     // Every proper prefix of a state with every type is refused as truncated or bad.
     let mut w = Writer::new(wid('A', 0), opts());

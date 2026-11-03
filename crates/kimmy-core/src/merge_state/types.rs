@@ -95,13 +95,26 @@ impl std::fmt::Display for Path {
     }
 }
 
-/// A cell value: a BSON value other than an embedded document, or `Unset`. `Null` is the BSON
+/// A cell value: a BSON value, a map marker, or `Unset`. `Null` is the BSON
 /// null, a value like any other: `$set x null` stores it and the field is present. `Unset` is
 /// the model's `None`: the absence of a value, what a register holds after an `$unset` (the
 /// field is not in the document). Numeric cells (`Unset`, `Int64`) take part in counting; every
-/// other variant is a base that starts a generation, so `$inc` on a null is refused. An array is
-/// ONE atomic value (a register); an embedded document is not a `Value` (it is a map path, a
-/// later stage).
+/// other variant is a base that starts a generation, so `$inc` on a null is refused.
+///
+/// Three variants are not plain scalars:
+///
+/// * An `Array` is ONE atomic value (a register): it is never merged element by element, and two
+///   concurrent arrays at one path are an `arrayClash`.
+/// * A `Document` is an ordered list of named fields and is legal ONLY inside an `Array` (at any
+///   depth; arrays in arrays are fine). There it is part of the atomic value: compared
+///   structurally, type for type, field order included. Outside an array a document is not a
+///   value of the state at all: it is a map, merged field by field, written as a [`Value::Map`]
+///   marker at its path and a cell for each leaf. So a `Document` handed to a write is expanded
+///   by the writer, and the state never holds one as a register ([`Value::check_register`]
+///   refuses it; so do `Reg::new` and both decoders).
+/// * `Map` is the explicit map marker (the model's `MAP`): the register value at a map path
+///   that a write of a sub-document puts there, beside the cells of its leaves. It is never a
+///   value a caller hands in, and never inside an array.
 ///
 /// The variants keep the BSON types apart: `Int32(2)`, `Int64(2)`, `Double(2.0)` and
 /// `Decimal128` of two are four different values. A `Decimal128` is its 16 bytes, as BSON
@@ -135,9 +148,87 @@ pub enum Value {
     },
     /// An array, atomic: the whole array is the register value.
     Array(Vec<Value>),
+    /// A document: named fields in order. Legal only inside an `Array`; see above.
+    Document(Vec<(String, Value)>),
+    /// The explicit map marker. See above.
+    Map,
+}
+
+/// A value that is not legal where it was put.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InvalidValue {
+    /// A document as a register: only inside an array is a document a value.
+    #[error("merge state: a document is a value only inside an array")]
+    DocumentAsRegister,
+    /// The map marker inside an array or a document, or handed to a write.
+    #[error("merge state: the map marker is not a value a caller can write or an array can hold")]
+    MapMarker,
+    /// Arrays and documents nested past the BSON depth limit.
+    #[error("merge state: a value is nested too deep")]
+    TooDeep,
+    /// A written document names a field twice, or a field name has a NUL byte.
+    #[error("merge state: a document field name is repeated or has a NUL byte")]
+    BadFieldName,
 }
 
 impl Value {
+    /// May this value be a register of the state? Not a top-level `Document`; an array's
+    /// elements may be anything but the map marker (documents among them, at any depth).
+    pub fn check_register(&self) -> Result<(), InvalidValue> {
+        match self {
+            Value::Document(_) => Err(InvalidValue::DocumentAsRegister),
+            Value::Map => Ok(()),
+            v => v.check_element(0),
+        }
+    }
+
+    /// May this value be inside an array (`depth` levels of arrays and documents down)?
+    fn check_element(&self, depth: usize) -> Result<(), InvalidValue> {
+        match self {
+            Value::Map => Err(InvalidValue::MapMarker),
+            Value::Array(a) => {
+                if depth >= super::codec::MAX_VALUE_DEPTH {
+                    return Err(InvalidValue::TooDeep);
+                }
+                a.iter().try_for_each(|x| x.check_element(depth + 1))
+            }
+            Value::Document(f) => {
+                if depth >= super::codec::MAX_VALUE_DEPTH {
+                    return Err(InvalidValue::TooDeep);
+                }
+                f.iter().try_for_each(|(_, x)| x.check_element(depth + 1))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// May a caller hand this value to a write? Anything `check_register` takes, and a
+    /// `Document` at any level of a sub-document (the writer expands it into a map): its field
+    /// names must be distinct and free of NUL bytes, and no map marker.
+    pub fn check_input(&self) -> Result<(), InvalidValue> {
+        match self {
+            Value::Document(f) => {
+                let mut names: Vec<&str> = f.iter().map(|(n, _)| n.as_str()).collect();
+                names.sort_unstable();
+                if names.iter().any(|n| n.contains('\0')) || names.windows(2).any(|w| w[0] == w[1])
+                {
+                    return Err(InvalidValue::BadFieldName);
+                }
+                f.iter().try_for_each(|(_, x)| x.check_input())
+            }
+            v => v.check_register(),
+        }
+    }
+
+    /// Does this value hold a `Document` anywhere? The version 1 form cannot spell one.
+    pub(super) fn contains_document(&self) -> bool {
+        match self {
+            Value::Document(_) => true,
+            Value::Array(a) => a.iter().any(Value::contains_document),
+            _ => false,
+        }
+    }
+
     /// The model's `numeric()`: `None` (`Unset`) or an integer. Only an `Int64` counts: `Int32`
     /// and `Decimal128` counters are not modelled yet, so they are plain register values.
     pub fn is_numeric(&self) -> bool {
@@ -161,6 +252,10 @@ impl Value {
             (Value::Double(a), Value::Double(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(a, b)| Self::same_value(a, b))
+            }
+            (Value::Document(a), Value::Document(b)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(a, b)| a.0 == b.0 && Self::same_value(&a.1, &b.1))
             }
             (a, b) => a == b,
         }
@@ -194,6 +289,8 @@ impl PartialEq for Value {
                 p == q && o == r
             }
             (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Document(a), Value::Document(b)) => a == b,
+            (Value::Map, Value::Map) => true,
             _ => false,
         }
     }

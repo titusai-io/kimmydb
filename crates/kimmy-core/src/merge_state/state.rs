@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::join::JoinOptions;
-use super::types::{LossKey, LossValue, MStamp, Path, Value, WriterId};
+use super::types::{InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 
 /// A version vector: the newest HLC seen per writer.
@@ -76,6 +76,21 @@ pub struct Reg {
     pub obs: BTreeMap<ObsKey, (MStamp, i128)>,
     pub generation: Option<Gen>,
     pub soi: bool,
+}
+
+impl Reg {
+    /// A register. The value must be one a register can hold: a top-level `Document` is refused
+    /// ([`Value::check_register`]).
+    pub fn new(
+        stamp: MStamp,
+        value: Value,
+        obs: BTreeMap<ObsKey, (MStamp, i128)>,
+        generation: Option<Gen>,
+        soi: bool,
+    ) -> Result<Self, InvalidValue> {
+        value.check_register()?;
+        Ok(Reg { stamp, value, obs, generation, soi })
+    }
 }
 
 /// The largest magnitude of a counter total (a slot's, or a copy of one kept in a register's

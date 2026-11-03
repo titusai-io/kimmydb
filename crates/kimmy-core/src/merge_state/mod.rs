@@ -48,11 +48,12 @@ mod prop_tests;
 #[cfg(test)]
 mod tests;
 
-pub use codec::DecodeError;
+pub use codec::{DecodeError, V1CannotHold};
 pub use join::{InvalidIntBound, JoinOptions, join};
 pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 pub use types::{
-    Epoch, InvalidPath, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId,
+    Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
+    WriterId,
 };
 pub use writer::{Received, StampError, WriteKind, WriteRecord, Writer, Written};
 
@@ -86,6 +87,18 @@ const _: () = {
     let _: fn(&MergeState, &JoinOptions) -> Vec<MStamp> = MergeState::alive;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::canonical_bytes;
+    let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_canonical_bytes;
+    let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_encode;
+    let _: fn(&MergeState) -> bool = MergeState::v1_can_hold;
+    let _: fn(
+        MStamp,
+        Value,
+        BTreeMap<ObsKey, (MStamp, i128)>,
+        Option<Gen>,
+        bool,
+    ) -> Result<Reg, InvalidValue> = Reg::new;
+    let _: fn(&Value) -> Result<(), InvalidValue> = Value::check_register;
+    let _: fn(&Value) -> Result<(), InvalidValue> = Value::check_input;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::compact_bytes;
     let _: fn(&MergeState) -> [u8; 16] = MergeState::compact_hash;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::encode_compact;
