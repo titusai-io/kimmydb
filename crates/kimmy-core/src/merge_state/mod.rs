@@ -16,6 +16,9 @@
 //!   writes to its own state, normalising the state through a join with the
 //!   empty state exactly as the model's `Node.finish` does, and absorbs other
 //!   states with [`Writer::receive`].
+//!   Each write takes its stamp from the writer's own clock (`write_set(.., skew)`) or, for
+//!   the engine, from outside (`write_set_stamped(.., &mut || stamp)`): the stamp must be
+//!   the writer's own and above everything it has used or seen ([`StampError`]).
 //! * [`MergeState::canonical_bytes`] and [`MergeState::state_hash`] give a
 //!   deterministic encoding and a 128-bit digest; [`MergeState::encode`] and
 //!   [`MergeState::decode`] round-trip a whole state.
@@ -45,7 +48,7 @@ pub use codec::DecodeError;
 pub use join::{InvalidIntBound, JoinOptions, join};
 pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 pub use types::{Epoch, InvalidPath, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
-pub use writer::{Received, WriteKind, WriteRecord, Writer, Written};
+pub use writer::{Received, StampError, WriteKind, WriteRecord, Writer, Written};
 
 // Production signatures. These items compile in EVERY build (with and without the
 // `merge-mutants` feature, test or not): the mutation switches are private fields of
@@ -96,6 +99,39 @@ const _: () = {
     let _: fn(&mut Writer, &Path, i64, u64) -> Option<Written> = Writer::write_inc;
     let _: fn(&mut Writer, &[(Path, Value)], u64) -> Option<Written> = Writer::write_replace;
     let _: fn(&mut Writer, u64) -> Option<Written> = Writer::write_delete;
+    let _: fn(&mut Writer, MStamp) -> Result<MStamp, StampError> = Writer::tick_to;
+    type Mint<'a> = &'a mut dyn FnMut() -> MStamp;
+    let _: fn(&mut Writer, &[(Path, Value)], Mint) -> Result<Option<Written>, StampError> =
+        Writer::insert_stamped;
+    let _: fn(&mut Writer, &Path, i64, Mint) -> Result<Option<Written>, StampError> =
+        Writer::upsert_inc_stamped;
+    let _: fn(
+        &mut Writer,
+        &[(Path, Value)],
+        &Path,
+        &[(Path, Value)],
+        Mint,
+    ) -> Result<Option<Written>, StampError> = Writer::upsert_soi_create_stamped;
+    let _: fn(&mut Writer, MStamp, &Path, i64, Mint) -> Result<Option<Written>, StampError> =
+        Writer::upsert_inc_on_stamped;
+    let _: fn(
+        &mut Writer,
+        &[(Path, Value)],
+        &Path,
+        i64,
+        &[(Path, Value)],
+        Mint,
+    ) -> Result<Option<(Written, Written)>, StampError> = Writer::upsert_soi_stamped;
+    let _: fn(&mut Writer, &Path, Value, Mint) -> Result<Option<Written>, StampError> =
+        Writer::write_set_stamped;
+    let _: fn(&mut Writer, &Path, Mint) -> Result<Option<Written>, StampError> =
+        Writer::write_unset_stamped;
+    let _: fn(&mut Writer, &Path, i64, Mint) -> Result<Option<Written>, StampError> =
+        Writer::write_inc_stamped;
+    let _: fn(&mut Writer, &[(Path, Value)], Mint) -> Result<Option<Written>, StampError> =
+        Writer::write_replace_stamped;
+    let _: fn(&mut Writer, Mint) -> Result<Option<Written>, StampError> =
+        Writer::write_delete_stamped;
     let _: fn(&mut Writer, &MergeState) -> Received = Writer::receive_report;
     let _: fn(&mut Writer, &MergeState) -> Vec<LossKey> = Writer::receive;
     let _: fn(&mut Writer, LossKey, LossValue) -> bool = Writer::receive_loss;

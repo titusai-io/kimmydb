@@ -1897,3 +1897,225 @@ fn decode_refuses_an_empty_path_or_segment() {
         assert_eq!(MergeState::decode(&bad), Err(DecodeError::BadPath), "{patch:?}");
     }
 }
+
+// ---- stamps minted outside the writer ---------------------------------------------------
+
+/// The stamp `Writer::tick(skew)` would mint next, built from outside as the engine would.
+fn next_stamp_of(w: &Writer, skew: u64) -> MStamp {
+    let top = w.state.vv.values().copied().chain([w.clock]).max().unwrap_or(Hlc::ZERO);
+    MStamp { hlc: Hlc::new(top.wall_ms + 1 + skew, 0), writer: w.id }
+}
+
+/// Each external-stamp entry point does what its self-ticking twin does when it is handed the
+/// stamp the twin would have minted: same stamps, same records, same state, same clock.
+#[test]
+fn stamped_writes_equal_self_ticking_writes() {
+    let mut own = Writer::new(wid('A', 0), opts());
+    let mut ext = Writer::new(wid('A', 0), opts());
+    // Both sides run the same step; `$e` is the self-ticking call, `$x` the stamped one given
+    // `st` (the stamp of `tick`) through a closure.
+    macro_rules! step {
+        ($skew:expr, $own:expr, $ext:expr) => {{
+            let st = next_stamp_of(&ext, $skew);
+            let a = $own(&mut own);
+            let mut calls = 0;
+            let b = $ext(&mut ext, &mut || {
+                calls += 1;
+                st
+            });
+            assert_eq!(a.is_some(), b.as_ref().unwrap().is_some());
+            assert_eq!(calls, usize::from(a.is_some()), "one stamp per accepted write");
+            assert_eq!(a.as_ref().map(|w: &Written| w.stamp), b.unwrap().map(|w| w.stamp));
+            assert_eq!(own.state, ext.state);
+            assert_eq!(own.clock, ext.clock);
+            assert_eq!(own.state.state_hash(), ext.state.state_hash());
+        }};
+    }
+    let (x, y, n) = (p("x"), p("y"), p("n"));
+    let f = fl(&[("x", i(1)), ("y", s("a"))]);
+    step!(0, |w: &mut Writer| w.insert(&f, 0), |w: &mut Writer, st| w.insert_stamped(&f, st));
+    step!(0, |w: &mut Writer| w.insert(&f, 0), |w: &mut Writer, st| w.insert_stamped(&f, st)); // refused: alive
+    step!(3, |w: &mut Writer| w.write_set(&x, Value::Int32(7), 3), |w: &mut Writer, st| w
+        .write_set_stamped(&x, Value::Int32(7), st));
+    step!(
+        0,
+        |w: &mut Writer| w.write_set(&x, Value::Int32(7), 0), // unchanged: no stamp is asked for
+        |w: &mut Writer, st| w.write_set_stamped(&x, Value::Int32(7), st)
+    );
+    step!(1, |w: &mut Writer| w.write_inc(&n, 5, 1), |w: &mut Writer, st| w
+        .write_inc_stamped(&n, 5, st));
+    step!(0, |w: &mut Writer| w.write_inc(&n, 5, 0), |w: &mut Writer, st| w
+        .write_inc_stamped(&n, 5, st));
+    step!(0, |w: &mut Writer| w.write_unset(&y, 0), |w: &mut Writer, st| w
+        .write_unset_stamped(&y, st));
+    let d = fl(&[("x", Value::Int32(9)), ("z", i(0))]);
+    step!(2, |w: &mut Writer| w.write_replace(&d, 2), |w: &mut Writer, st| w
+        .write_replace_stamped(&d, st));
+    step!(0, |w: &mut Writer| w.write_delete(0), |w: &mut Writer, st| w.write_delete_stamped(st));
+    step!(0, |w: &mut Writer| w.write_delete(0), |w: &mut Writer, st| w.write_delete_stamped(st));
+    step!(0, |w: &mut Writer| w.upsert_inc(&n, 4, 0), |w: &mut Writer, st| w
+        .upsert_inc_stamped(&n, 4, st));
+    step!(0, |w: &mut Writer| w.write_delete(0), |w: &mut Writer, st| w.write_delete_stamped(st));
+    // The two-step upsert, one stamp at a time.
+    let (sf, sets) = (fl(&[("t", s("dark"))]), fl(&[("l", s("en"))]));
+    let v = p("v");
+    let c1 = own.upsert_soi_create(&sf, &v, &sets, 1).unwrap();
+    let st = next_stamp_of(&ext, 1);
+    let c2 = ext.upsert_soi_create_stamped(&sf, &v, &sets, &mut || st).unwrap().unwrap();
+    assert_eq!((c1.stamp, &own.state), (c2.stamp, &ext.state));
+    let i1 = own.upsert_inc_on(c1.stamp, &v, 2, 1).unwrap();
+    let st = next_stamp_of(&ext, 1);
+    let i2 = ext.upsert_inc_on_stamped(c2.stamp, &v, 2, &mut || st).unwrap().unwrap();
+    assert_eq!((i1.stamp, &own.state), (i2.stamp, &ext.state));
+    // The whole upsert: two stamps, in order.
+    let (mut o2, mut e2) = (Writer::new(wid('B', 0), opts()), Writer::new(wid('B', 0), opts()));
+    let (a1, a2) = o2.upsert_soi(&sf, &v, 2, &sets, 4).unwrap();
+    // skew 4 on a fresh writer: wall 0 + 1 + 4 = 5, then 5 + 1 + 4 = 10
+    let mut mint = [5, 10].map(|wall| MStamp { hlc: Hlc::new(wall, 0), writer: e2.id }).into_iter();
+    let (b1, b2) =
+        e2.upsert_soi_stamped(&sf, &v, 2, &sets, &mut || mint.next().unwrap()).unwrap().unwrap();
+    assert_eq!((a1.stamp, a2.stamp), (b1.stamp, b2.stamp));
+    assert_eq!(o2.state, e2.state);
+}
+
+#[test]
+fn an_engine_shaped_stamp_with_a_counter_converges_like_any_other() {
+    // Stamps with HLC counters and a wall clock well ahead, as `Engine::next_stamp` gives them.
+    let mut a = Writer::new(wid('A', 3), opts());
+    let mut b = Writer::new(wid('B', 0), opts());
+    let st = |w: &Writer, wall, c| MStamp { hlc: Hlc::new(wall, c), writer: w.id };
+    let s1 = st(&a, 1_700_000_000_000, 4);
+    a.insert_stamped(&fl(&[("x", i(1))]), &mut || s1).unwrap().unwrap();
+    b.receive(&a.state);
+    let s2 = st(&a, 1_700_000_000_000, 5);
+    a.write_set_stamped(&p("x"), i(2), &mut || s2).unwrap().unwrap();
+    let s3 = st(&b, 1_700_000_000_000, 5);
+    assert!(s3 > s2, "same instant and counter: the node breaks the tie");
+    b.write_set_stamped(&p("x"), i(3), &mut || s3).unwrap().unwrap();
+    let (ab, ba) = (a.receive(&b.state), b.receive(&a.state));
+    assert_eq!(a.state.state_hash(), b.state.state_hash());
+    assert_eq!(a.visible(), doc(&[("x", i(3))]));
+    assert_eq!((ab.len(), ba.len()), (1, 1), "the loser s2 is reported on both sides");
+    // The self-ticking clock then continues above the supplied stamps.
+    let next = a.tick(0);
+    assert!(next.hlc > s3.hlc);
+    assert_eq!(a.state.state_hash(), a.state.join(&MergeState::default(), &a.opts).0.state_hash());
+}
+
+#[test]
+fn an_external_stamp_must_be_this_writers_and_above_everything_it_has_seen() {
+    let mut a = Writer::new(wid('A', 7), opts());
+    let mut b = Writer::new(wid('B', 0), opts());
+    a.insert(&fl(&[("x", i(1))]), 0).unwrap(); // stamp 1
+    b.receive(&a.state);
+    b.write_set(&p("x"), i(2), 10).unwrap(); // stamp 12 by B
+    a.receive(&b.state); // A has seen 12
+    let snapshot = (a.state.clone(), a.clock);
+    let unchanged = |a: &Writer| (a.state.clone(), a.clock) == snapshot;
+    let asked = std::cell::Cell::new(0);
+    let try_set = |a: &mut Writer, st: MStamp, v: i64| {
+        a.write_set_stamped(&p("x"), i(v), &mut || {
+            asked.set(asked.get() + 1);
+            st
+        })
+    };
+    let mine = |wall| MStamp { hlc: Hlc::new(wall, 0), writer: a.id };
+    // not above the writer's clock, nor the newest vv entry (B's 12), nor equal to it
+    let top = Hlc::new(12, 0);
+    for bad in [mine(0), mine(1), mine(11), mine(12)] {
+        assert_eq!(
+            try_set(&mut a, bad, 3),
+            Err(StampError::NotAbove { top, stamp: bad.hlc }),
+            "{bad:?}"
+        );
+        assert!(unchanged(&a));
+    }
+    // a counter above the same instant is above
+    let ok = MStamp { hlc: Hlc::new(12, 1), writer: a.id };
+    // another node, and the same node under another epoch
+    let other_node = MStamp { writer: wid('B', 0), ..ok };
+    let other_epoch = MStamp { writer: wid('A', 8), ..ok };
+    for bad in [other_node, other_epoch] {
+        assert_eq!(
+            try_set(&mut a, bad, 3),
+            Err(StampError::OtherWriter { writer: a.id, stamp: bad.writer })
+        );
+        assert!(unchanged(&a));
+    }
+    assert_eq!(asked.get(), 6, "each refused stamp was asked for once");
+    assert!(try_set(&mut a, ok, 3).unwrap().is_some());
+    assert_eq!(a.clock, ok.hlc);
+    // and a second write must go above the first
+    assert!(matches!(try_set(&mut a, ok, 4), Err(StampError::NotAbove { .. })));
+    // `tick_to` is the same check on its own
+    let mut c = Writer::new(wid('C', 0), opts());
+    assert!(c.tick_to(MStamp { hlc: Hlc::ZERO, writer: c.id }).is_err());
+    assert_eq!(c.clock, Hlc::ZERO);
+    let ok = MStamp { hlc: Hlc::new(0, 1), writer: c.id };
+    assert_eq!(c.tick_to(ok), Ok(ok));
+    assert_eq!(c.clock, ok.hlc);
+}
+
+#[test]
+fn a_refused_stamp_changes_nothing_for_every_entry_point() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    let (f, sets, x, n) =
+        (fl(&[("x", i(1)), ("y", s("a"))]), fl(&[("l", s("en"))]), p("x"), p("n"));
+    w.insert(&f, 5).unwrap();
+    let before = (w.state.clone(), w.clock);
+    let bad = MStamp { hlc: Hlc::new(1, 0), writer: w.id };
+    macro_rules! refused {
+        ($e:expr) => {{
+            let r = $e;
+            assert!(matches!(r, Err(StampError::NotAbove { .. })), "{r:?}");
+            assert_eq!((w.state.clone(), w.clock), before);
+        }};
+    }
+    refused!(w.write_set_stamped(&x, i(9), &mut || bad));
+    refused!(w.write_unset_stamped(&x, &mut || bad));
+    refused!(w.write_inc_stamped(&x, 1, &mut || bad));
+    refused!(w.write_replace_stamped(&fl(&[("x", i(9))]), &mut || bad));
+    refused!(w.write_delete_stamped(&mut || bad));
+    // the creating entry points need no alive life: a fresh writer
+    let mut v = Writer::new(wid('A', 1), opts());
+    v.tick_to(MStamp { hlc: Hlc::new(50, 0), writer: v.id }).unwrap();
+    let bad = MStamp { hlc: Hlc::new(50, 0), writer: v.id };
+    let before = (v.state.clone(), v.clock);
+    for r in [
+        v.insert_stamped(&f, &mut || bad),
+        v.upsert_inc_stamped(&n, 1, &mut || bad),
+        v.upsert_soi_create_stamped(&f, &n, &sets, &mut || bad),
+    ] {
+        assert!(matches!(r, Err(StampError::NotAbove { .. })), "{r:?}");
+        assert_eq!((v.state.clone(), v.clock), before);
+    }
+    let r = v.upsert_soi_stamped(&f, &n, 1, &sets, &mut || bad);
+    assert!(matches!(r, Err(StampError::NotAbove { .. })), "{r:?}");
+    assert_eq!((v.state.clone(), v.clock), before);
+    // the increment step of an upsert on a missing life asks for no stamp
+    let mut asked = 0;
+    let life = MStamp { hlc: Hlc::new(99, 0), writer: v.id };
+    let r = v.upsert_inc_on_stamped(life, &n, 1, &mut || {
+        asked += 1;
+        bad
+    });
+    assert_eq!((r, asked), (Ok(None), 0));
+}
+
+#[test]
+fn a_two_stamp_upsert_whose_second_stamp_is_refused_is_taken_back() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    let (f, sets, n) = (fl(&[("t", s("dark"))]), fl(&[("l", s("en"))]), p("v"));
+    let first = MStamp { hlc: Hlc::new(10, 0), writer: w.id };
+    let mut mint = [first, first].into_iter(); // the second is not above the first
+    let r = w.upsert_soi_stamped(&f, &n, 3, &sets, &mut || mint.next().unwrap());
+    assert!(matches!(r, Err(StampError::NotAbove { top, .. }) if top == first.hlc), "{r:?}");
+    assert_eq!(w.state, MergeState::default());
+    assert_eq!(w.clock, Hlc::ZERO);
+    // and the same call with a second stamp above the first goes through
+    let second = MStamp { hlc: Hlc::new(11, 0), writer: w.id };
+    let mut mint = [first, second].into_iter();
+    let (c, i) =
+        w.upsert_soi_stamped(&f, &n, 3, &sets, &mut || mint.next().unwrap()).unwrap().unwrap();
+    assert_eq!((c.stamp, i.stamp), (first, second));
+}
