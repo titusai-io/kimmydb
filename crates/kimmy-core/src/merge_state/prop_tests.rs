@@ -33,6 +33,15 @@ impl Rng {
     }
 }
 
+/// A one-segment path.
+fn p(x: &str) -> Path {
+    Path::flat(x).unwrap()
+}
+/// The fields of a flat document as paths.
+fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
+    f.iter().map(|(k, v)| (p(k), v.clone())).collect()
+}
+
 fn opts(ret: u64) -> JoinOptions {
     JoinOptions::new(ret, i64::MAX).unwrap()
 }
@@ -92,7 +101,7 @@ fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
         })
         .collect();
     let mut pool = Vec::new();
-    ws[0].insert(&[("x", Value::Int64(100)), ("n", Value::String("a".into()))], 0);
+    ws[0].insert(&fl(&[("x", Value::Int64(100)), ("n", Value::String("a".into()))]), 0);
     for _ in 0..steps {
         let m = rng.below(n);
         let skew = *rng.pick(&[0, 0, 0, 4]);
@@ -104,16 +113,16 @@ fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
             let st = ws[other].state.clone();
             ws[m].receive(&st);
         } else {
-            let p = *rng.pick(&["x", "n", "y"]);
+            let path = p(rng.pick(&["x", "n", "y"]));
             let w = &mut ws[m];
             match rng.below(14) {
                 0 => {
                     let f = pool_fields(&mut rng, &["x", "y", "n"]);
-                    w.insert(&f, skew);
+                    w.insert(&fl(&f), skew);
                 }
                 1 => {
                     let k = *rng.pick(&["x", "y", "n"]);
-                    w.upsert_inc(k, pool_inc(&mut rng), skew);
+                    w.upsert_inc(&p(k), pool_inc(&mut rng), skew);
                 }
                 2 => {
                     // An upsert with $setOnInsert and $set (non-numeric values too) and an $inc,
@@ -130,28 +139,28 @@ fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
                         .filter(|q| !f.iter().chain(sets.iter()).any(|(g, _)| g == q))
                         .collect();
                     let ip = *rng.pick(&free);
-                    w.upsert_soi(&f, ip, pool_inc(&mut rng), &sets, skew);
+                    w.upsert_soi(&fl(&f), &p(ip), pool_inc(&mut rng), &fl(&sets), skew);
                 }
                 3 => {
                     let d = pool_fields(&mut rng, &["x", "n", "y"]);
-                    w.write_replace(&d, skew);
+                    w.write_replace(&fl(&d), skew);
                 }
                 4..=6 => {
-                    w.write_inc(p, pool_inc(&mut rng), skew);
+                    w.write_inc(&path, pool_inc(&mut rng), skew);
                 }
                 7 => {
                     // +n then -n on one writer: a counter that returns to where it was.
                     let k = pool_inc(&mut rng);
-                    if w.write_inc(p, k, skew).is_some() && k != i64::MIN {
-                        w.write_inc(p, -k, skew);
+                    if w.write_inc(&path, k, skew).is_some() && k != i64::MIN {
+                        w.write_inc(&path, -k, skew);
                     }
                 }
                 8 | 9 => {
                     let v = pool_value(&mut rng);
-                    w.write_set(p, v, skew);
+                    w.write_set(&path, v, skew);
                 }
                 10 | 11 => {
-                    w.write_unset(p, skew);
+                    w.write_unset(&path, skew);
                 }
                 _ => {
                     w.write_delete(skew);
@@ -382,21 +391,22 @@ fn local_refusals_and_noops() {
         epoch: Epoch::new(Hlc::new(5, 1), [9; 8]),
     };
     let mut w = Writer::new(id, o);
-    assert!(w.write_set("x", Value::Int64(1), 0).is_none(), "no life");
+    assert!(w.write_set(&p("x"), Value::Int64(1), 0).is_none(), "no life");
     assert!(w.write_delete(0).is_none());
-    let a = w.insert(&[("x", Value::Int64(1))], 0).unwrap();
+    let a = w.insert(&fl(&[("x", Value::Int64(1))]), 0).unwrap();
     assert_eq!(a.record.kind, WriteKind::Insert);
-    assert!(w.insert(&[("y", Value::Int64(1))], 0).is_none(), "a life is alive");
-    assert!(w.write_set("x", Value::Int64(1), 0).is_none(), "unchanged");
-    assert!(w.write_unset("nope", 0).is_none());
-    assert!(w.write_inc("x", i64::MAX, 0).is_none(), "past the bound");
-    w.write_set("s", Value::String("t".into()), 0).unwrap();
-    assert!(w.write_inc("s", 1, 0).is_none(), "a string");
+    assert!(w.insert(&fl(&[("y", Value::Int64(1))]), 0).is_none(), "a life is alive");
+    assert!(w.write_set(&p("x"), Value::Int64(1), 0).is_none(), "unchanged");
+    assert!(w.write_unset(&p("nope"), 0).is_none());
+    assert!(w.write_inc(&p("x"), i64::MAX, 0).is_none(), "past the bound");
+    w.write_set(&p("s"), Value::String("t".into()), 0).unwrap();
+    assert!(w.write_inc(&p("s"), 1, 0).is_none(), "a string");
     assert!(
-        w.write_replace(&[("x", Value::Int64(1)), ("s", Value::String("t".into()))], 0).is_none()
+        w.write_replace(&fl(&[("x", Value::Int64(1)), ("s", Value::String("t".into()))]), 0)
+            .is_none()
     );
-    let r = w.write_replace(&[("x", Value::Int64(2))], 0).unwrap();
-    assert_eq!(r.record.paths, vec!["x".to_string(), "s".to_string()]);
+    let r = w.write_replace(&fl(&[("x", Value::Int64(2))]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![p("x"), p("s")]);
     assert_eq!(w.visible().unwrap().len(), 1);
     w.write_delete(0).unwrap();
     assert!(w.visible().is_none());
@@ -413,11 +423,11 @@ fn mutants_change_the_outcome() {
     };
     let run = |o: &JoinOptions| {
         let (mut a, mut b, mut c) = (mk(o, b'A'), mk(o, b'B'), mk(o, b'C'));
-        a.insert(&[("x", Value::Int64(1))], 0).unwrap();
+        a.insert(&fl(&[("x", Value::Int64(1))]), 0).unwrap();
         c.receive(&a.state.clone());
-        c.write_set("note", Value::String("c".into()), 0).unwrap();
+        c.write_set(&p("note"), Value::String("c".into()), 0).unwrap();
         b.clock = Hlc::new(8, 0);
-        b.insert(&[("y", Value::Int64(2))], 0).unwrap();
+        b.insert(&fl(&[("y", Value::Int64(2))]), 0).unwrap();
         let mut o1 = mk(o, b'O');
         o1.receive(&a.state.clone());
         o1.receive(&c.state.clone());

@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Value, WriterId};
+use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
@@ -48,6 +48,8 @@ pub enum DecodeError {
     BadTag(u8),
     #[error("merge state: invalid utf-8 string")]
     BadString,
+    #[error("merge state: invalid path")]
+    BadPath,
     #[error("merge state: {0} trailing bytes")]
     Trailing(usize),
     #[error("merge state: a counter total is out of range")]
@@ -78,6 +80,10 @@ impl W {
     fn str(&mut self, s: &str) {
         self.len(s.len());
         self.0.extend_from_slice(s.as_bytes());
+    }
+    /// A path: its segments joined by NUL (no segment contains one), as one string.
+    fn path(&mut self, p: &Path) {
+        self.str(&p.segments().join("\0"));
     }
     fn hlc(&mut self, h: Hlc) {
         self.0.extend_from_slice(&h.to_bytes());
@@ -203,7 +209,7 @@ impl W {
             LossKind::InsertLost => 2,
             LossKind::RetiredWriter => 3,
         });
-        self.str(&k.path);
+        self.path(&k.path);
         self.stamp(&k.stamp);
     }
     fn loss_value(&mut self, v: &LossValue) {
@@ -220,7 +226,7 @@ impl W {
                 self.u8(2);
                 self.len(f.len());
                 for p in f {
-                    self.str(p);
+                    self.path(p);
                 }
             }
         }
@@ -238,7 +244,7 @@ impl MergeState {
             }
             w.len(v.order.len());
             for p in &v.order {
-                w.str(p);
+                w.path(p);
             }
             w.u8(match v.kind {
                 LifeKind::Insert => 0,
@@ -257,7 +263,7 @@ impl MergeState {
         w.len(self.regs.len());
         for ((l, p), r) in &self.regs {
             w.stamp(l);
-            w.str(p);
+            w.path(p);
             w.stamp(&r.stamp);
             w.value(&r.value);
             w.obs_stamped(&r.obs);
@@ -267,7 +273,7 @@ impl MergeState {
         w.len(self.slots.len());
         for ((l, p, wr, g), s) in &self.slots {
             w.stamp(l);
-            w.str(p);
+            w.path(p);
             w.wid(wr);
             w.opt_stamp(g);
             w.stamp(&s.stamp);
@@ -324,7 +330,7 @@ impl MergeState {
             }
             let mut order = Vec::new();
             for _ in 0..r.len()? {
-                order.push(r.str()?);
+                order.push(r.path()?);
             }
             let kind = match r.u8()? {
                 0 => LifeKind::Insert,
@@ -342,7 +348,7 @@ impl MergeState {
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
-            let p = r.str()?;
+            let p = r.path()?;
             let stamp = r.stamp()?;
             let value = r.value()?;
             let obs = r.obs_stamped()?;
@@ -356,7 +362,7 @@ impl MergeState {
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
-            let p = r.str()?;
+            let p = r.path()?;
             let wr = r.wid()?;
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
@@ -437,6 +443,11 @@ impl R<'_> {
     fn str(&mut self) -> Result<String, DecodeError> {
         let n = self.len()?;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| DecodeError::BadString)
+    }
+    /// A path written by `W::path`: segments joined by NUL, none empty.
+    fn path(&mut self) -> Result<Path, DecodeError> {
+        let joined = self.str()?;
+        Path::new(joined.split('\0')).map_err(|_| DecodeError::BadPath)
     }
     fn hlc(&mut self) -> Result<Hlc, DecodeError> {
         Ok(Hlc::from_bytes(self.arr()?))
@@ -546,7 +557,7 @@ impl R<'_> {
             3 => LossKind::RetiredWriter,
             t => return Err(DecodeError::BadTag(t)),
         };
-        let path = self.str()?;
+        let path = self.path()?;
         Ok(LossKey { kind, path, stamp: self.stamp()? })
     }
     fn loss_value(&mut self) -> Result<LossValue, DecodeError> {
@@ -556,7 +567,7 @@ impl R<'_> {
             2 => {
                 let mut f = Vec::new();
                 for _ in 0..self.len()? {
-                    f.push(self.str()?);
+                    f.push(self.path()?);
                 }
                 Ok(LossValue::Fields(f))
             }
@@ -678,7 +689,7 @@ mod tests {
         w.len(0); // deletes
         w.len(1); // regs
         w.stamp(&life);
-        w.str("x");
+        w.str("x"); // the path
         w.stamp(&life); // the register's stamp
         w.value(&Value::Int64(1));
         w.len(obs.len());
@@ -730,7 +741,14 @@ mod tests {
             WriterId { node: NodeId::from_bytes([b'A'; 16]), epoch: Epoch::from_u64(0) },
             JoinOptions::default(),
         );
-        w.upsert_soi(&[("y", Value::Int64(1))], "x", 1, &[], 0).unwrap();
+        w.upsert_soi(
+            &[(Path::flat("y").unwrap(), Value::Int64(1))],
+            &Path::flat("x").unwrap(),
+            1,
+            &[],
+            0,
+        )
+        .unwrap();
         let enc = w.state.encode();
         let st = MergeState::decode(&enc).unwrap();
         assert!(st.regs.values().any(|r| r.soi));

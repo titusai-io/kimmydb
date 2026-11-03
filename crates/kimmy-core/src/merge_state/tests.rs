@@ -31,14 +31,22 @@ fn s(x: &str) -> Value {
 fn f(x: f64) -> Value {
     Value::Double(x)
 }
+/// A one-segment path.
+fn p(x: &str) -> Path {
+    Path::flat(x).unwrap()
+}
+/// The fields of a flat document as paths.
+fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
+    f.iter().map(|(k, v)| (p(k), v.clone())).collect()
+}
 fn opts() -> JoinOptions {
     JoinOptions::default()
 }
 fn ret(r: u64) -> JoinOptions {
     JoinOptions::new(r, i64::MAX).unwrap()
 }
-fn doc(kv: &[(&str, Value)]) -> Option<BTreeMap<String, Value>> {
-    Some(kv.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+fn doc(kv: &[(&str, Value)]) -> Option<BTreeMap<Path, Value>> {
+    Some(kv.iter().map(|(k, v)| (p(k), v.clone())).collect())
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,34 +91,34 @@ impl Mem {
         self.oplog[&OKey::W(st)].clone()
     }
     fn ins(&mut self, f: &[(&str, Value)], sk: u64) -> Option<MStamp> {
-        let r = self.w.insert(f, sk);
+        let r = self.w.insert(&fl(f), sk);
         self.log(r)
     }
-    fn upsert_inc(&mut self, p: &str, n: i64) -> Option<MStamp> {
-        let r = self.w.upsert_inc(p, n, 0);
+    fn upsert_inc(&mut self, path: &str, n: i64) -> Option<MStamp> {
+        let r = self.w.upsert_inc(&p(path), n, 0);
         self.log(r)
     }
     /// Returns `(life, inc stamp)`: the creation write and the increment write.
     fn upsert_soi(
         &mut self,
         f: &[(&str, Value)],
-        p: &str,
+        path: &str,
         n: i64,
         sets: &[(&str, Value)],
     ) -> Option<(MStamp, MStamp)> {
-        let (c, i) = self.w.upsert_soi(f, p, n, sets, 0)?;
+        let (c, i) = self.w.upsert_soi(&fl(f), &p(path), n, &fl(sets), 0)?;
         let life = c.stamp;
         let inc = i.stamp;
         self.log(Some(c));
         self.log(Some(i));
         Some((life, inc))
     }
-    fn set(&mut self, p: &str, v: Value, sk: u64) -> Option<MStamp> {
-        let r = self.w.write_set(p, v, sk);
+    fn set(&mut self, path: &str, v: Value, sk: u64) -> Option<MStamp> {
+        let r = self.w.write_set(&p(path), v, sk);
         self.log(r)
     }
-    fn inc(&mut self, p: &str, n: i64, sk: u64) -> Option<MStamp> {
-        let r = self.w.write_inc(p, n, sk);
+    fn inc(&mut self, path: &str, n: i64, sk: u64) -> Option<MStamp> {
+        let r = self.w.write_inc(&p(path), n, sk);
         self.log(r)
     }
     fn del(&mut self) -> Option<MStamp> {
@@ -153,13 +161,13 @@ impl Mem {
         self.epoch += 1;
         self.w.id = wid(self.name, self.epoch);
     }
-    fn visible(&self) -> Option<BTreeMap<String, Value>> {
+    fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.w.visible()
     }
     fn canon(&self) -> Vec<u8> {
         self.w.state.canonical_bytes()
     }
-    fn loss_set(&self) -> BTreeSet<(LossKind, String, MStamp)> {
+    fn loss_set(&self) -> BTreeSet<(LossKind, Path, MStamp)> {
         self.w.state.losses.keys().map(|k| (k.kind, k.path.clone(), k.stamp)).collect()
     }
 }
@@ -250,8 +258,8 @@ fn probe_p1_reinsert_same_field() {
     let r = a.ins(&[("x", i(2))], 0).unwrap();
     b.w.clock = h(5);
     let z = b.set("x", i(3), 0).unwrap();
-    for (p, m) in all_orders(&o, &[a.ent(d), a.ent(r), b.ent(z)], &[ii.ent(i0)]) {
-        assert_eq!(m.visible(), doc(&[("x", i(2))]), "{p:?}");
+    for (ord, m) in all_orders(&o, &[a.ent(d), a.ent(r), b.ent(z)], &[ii.ent(i0)]) {
+        assert_eq!(m.visible(), doc(&[("x", i(2))]), "{ord:?}");
     }
 }
 
@@ -266,8 +274,8 @@ fn probe_p1b_disjoint_fields() {
     let r = a.ins(&[("y", i(2))], 0).unwrap();
     b.w.clock = h(5);
     let z = b.set("z", i(3), 0).unwrap();
-    for (p, m) in all_orders(&o, &[a.ent(d), a.ent(r), b.ent(z)], &[ii.ent(i0)]) {
-        assert_eq!(m.visible(), doc(&[("y", i(2))]), "{p:?}");
+    for (ord, m) in all_orders(&o, &[a.ent(d), a.ent(r), b.ent(z)], &[ii.ent(i0)]) {
+        assert_eq!(m.visible(), doc(&[("y", i(2))]), "{ord:?}");
     }
 }
 
@@ -311,7 +319,7 @@ fn probe_p4_delete_vs_inc() {
     assert_eq!(res.len(), 1, "{res:?}");
     let (vis, losses) = res.into_iter().next().unwrap();
     assert_eq!(vis, "None");
-    assert!(losses.iter().any(|k| k.kind == LossKind::DeleteWon && k.path == "x"));
+    assert!(losses.iter().any(|k| k.kind == LossKind::DeleteWon && k.path == p("x")));
 }
 
 #[test]
@@ -355,8 +363,8 @@ fn probe3_concurrent_lives_then_delete() {
     let lb = b.ins(&[("b", i(20))], 0).unwrap();
     c.receive_entry(&b.ent(lb));
     let d1 = c.del().unwrap();
-    for (p, m) in all_orders(&o, &[a.ent(d0), a.ent(la), b.ent(lb), c.ent(d1)], &[ii.ent(i0)]) {
-        assert_eq!(m.visible(), None, "{p:?}");
+    for (ord, m) in all_orders(&o, &[a.ent(d0), a.ent(la), b.ent(lb), c.ent(d1)], &[ii.ent(i0)]) {
+        assert_eq!(m.visible(), None, "{ord:?}");
     }
 }
 
@@ -454,7 +462,7 @@ fn probe_restore_conservation() {
         b.inc("x", 5, 0).unwrap();
         let mut ms = [a, b, c];
         sync(&mut ms);
-        let v = ms[0].w.state.value("x", &o);
+        let v = ms[0].w.state.value(&p("x"), &o);
         assert_eq!(v, Some(i(if epochs { 135 } else { 105 })), "epochs={epochs}"); // 105: the silent loss epochs prevent
     }
 }
@@ -538,8 +546,8 @@ fn probe_v3m3_newer_generation_kept() {
     let a3 = a.inc("x", 3, 0).unwrap();
     b.w.clock = h(9);
     let b1 = b.set("x", i(7), 0).unwrap();
-    for (p, m) in all_orders(&o, &[a.ent(a1), a.ent(a2), a.ent(a3), b.ent(b1)], &[ii.ent(i0)]) {
-        assert_eq!(m.visible(), doc(&[("x", i(10))]), "{p:?}");
+    for (ord, m) in all_orders(&o, &[a.ent(a1), a.ent(a2), a.ent(a3), b.ent(b1)], &[ii.ent(i0)]) {
+        assert_eq!(m.visible(), doc(&[("x", i(10))]), "{ord:?}");
     }
 }
 
@@ -595,9 +603,9 @@ fn probe_v4m1_revive() {
     let a2 = a.set("x", i(10), 0).unwrap();
     b.w.clock = h(8);
     let bb = b.set("x", i(7), 0).unwrap();
-    for (p, m) in all_orders(&o, &[c.ent(cc), a.ent(a1), a.ent(a2), b.ent(bb)], &[ii.ent(i0)]) {
-        assert_eq!(m.visible(), doc(&[("x", i(8))]), "{p:?}");
-        assert!(m.w.hidden_all().is_empty(), "{p:?}");
+    for (ord, m) in all_orders(&o, &[c.ent(cc), a.ent(a1), a.ent(a2), b.ent(bb)], &[ii.ent(i0)]) {
+        assert_eq!(m.visible(), doc(&[("x", i(8))]), "{ord:?}");
+        assert!(m.w.hidden_all().is_empty(), "{ord:?}");
     }
 }
 
@@ -643,7 +651,7 @@ fn probe_v5m1_hidden_part() {
         seed.extend(ents);
         seed.push(a.ent(aa));
         let obs = fresh_observer(&o, &seed);
-        out.insert(label, obs.w.state.hidden("x", &o));
+        out.insert(label, obs.w.state.hidden(&p("x"), &o));
     }
     assert_eq!(out, BTreeMap::from([("saw 5 not 2", 2), ("+3 and -3", 0), ("lone -3", -3)]));
 }
@@ -657,10 +665,10 @@ fn probe_q2_first_inserts() {
     let aa = a.ins(&[("x", i(1)), ("y", i(1))], 0).unwrap();
     b.w.clock = h(5);
     let bb = b.ins(&[("x", i(2)), ("z", i(3))], 0).unwrap();
-    for (p, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
-        assert_eq!(m.visible(), doc(&[("x", i(2)), ("z", i(3))]), "{p:?}");
+    for (ord, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
+        assert_eq!(m.visible(), doc(&[("x", i(2)), ("z", i(3))]), "{ord:?}");
         let kinds: Vec<_> = m.w.state.losses.keys().map(|k| (k.kind, k.path.clone())).collect();
-        assert_eq!(kinds, vec![(LossKind::InsertLost, "_".to_string())], "{p:?}");
+        assert_eq!(kinds, vec![(LossKind::InsertLost, p("_"))], "{ord:?}");
     }
 }
 
@@ -694,42 +702,42 @@ fn probe_q11_overflow() {
 fn inc_landing_exactly_on_a_bound_is_accepted_one_past_is_refused() {
     // The Int64 bound: -2^63 and 2^63-1 are legal totals, -2^63-1 and 2^63 are not.
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("x", i(0)), ("y", i(0)), ("n", s("a"))], 0).unwrap();
-    assert!(w.write_inc("x", i64::MAX, 0).is_some());
-    assert_eq!(w.visible().unwrap()["x"], i(i64::MAX));
-    assert!(w.write_inc("x", 1, 0).is_none(), "2^63 is one past the upper bound");
-    assert!(w.write_inc("x", 0, 0).is_some(), "still on the bound");
-    assert!(w.write_inc("y", i64::MIN, 0).is_some());
-    assert_eq!(w.visible().unwrap()["y"], i(i64::MIN));
-    assert!(w.write_inc("y", -1, 0).is_none(), "-2^63-1 is one past the lower bound");
-    assert!(w.write_inc("y", 1, 0).is_some());
+    w.insert(&fl(&[("x", i(0)), ("y", i(0)), ("n", s("a"))]), 0).unwrap();
+    assert!(w.write_inc(&p("x"), i64::MAX, 0).is_some());
+    assert_eq!(w.visible().unwrap()[&p("x")], i(i64::MAX));
+    assert!(w.write_inc(&p("x"), 1, 0).is_none(), "2^63 is one past the upper bound");
+    assert!(w.write_inc(&p("x"), 0, 0).is_some(), "still on the bound");
+    assert!(w.write_inc(&p("y"), i64::MIN, 0).is_some());
+    assert_eq!(w.visible().unwrap()[&p("y")], i(i64::MIN));
+    assert!(w.write_inc(&p("y"), -1, 0).is_none(), "-2^63-1 is one past the lower bound");
+    assert!(w.write_inc(&p("y"), 1, 0).is_some());
     // A field that does not exist yet starts from 0.
-    assert!(w.write_inc("a", i64::MAX, 0).is_some());
-    assert!(w.write_inc("b", i64::MIN, 0).is_some());
-    assert_eq!(w.visible().unwrap()["a"], i(i64::MAX));
-    assert_eq!(w.visible().unwrap()["b"], i(i64::MIN));
+    assert!(w.write_inc(&p("a"), i64::MAX, 0).is_some());
+    assert!(w.write_inc(&p("b"), i64::MIN, 0).is_some());
+    assert_eq!(w.visible().unwrap()[&p("a")], i(i64::MAX));
+    assert_eq!(w.visible().unwrap()[&p("b")], i(i64::MIN));
     // The total is a base plus counted slots: 10 + (MAX - 10) lands on the bound.
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("x", i(10))], 0).unwrap();
-    assert!(w.write_inc("x", i64::MAX - 9, 0).is_none(), "one past");
-    assert!(w.write_inc("x", i64::MAX - 10, 0).is_some(), "exactly on");
-    assert!(w.write_inc("x", 1, 0).is_none());
-    assert!(w.write_inc("x", i64::MIN, 0).is_some(), "back down across the whole range");
-    assert_eq!(w.visible().unwrap()["x"], i(-1));
+    w.insert(&fl(&[("x", i(10))]), 0).unwrap();
+    assert!(w.write_inc(&p("x"), i64::MAX - 9, 0).is_none(), "one past");
+    assert!(w.write_inc(&p("x"), i64::MAX - 10, 0).is_some(), "exactly on");
+    assert!(w.write_inc(&p("x"), 1, 0).is_none());
+    assert!(w.write_inc(&p("x"), i64::MIN, 0).is_some(), "back down across the whole range");
+    assert_eq!(w.visible().unwrap()[&p("x")], i(-1));
 }
 
 #[test]
 fn inc_landing_exactly_on_a_lowered_bound() {
     let o = JoinOptions::new(1_000_000_000, 1000).unwrap();
     let mut w = Writer::new(wid('A', 0), o);
-    w.insert(&[("x", i(0)), ("y", i(0))], 0).unwrap();
-    assert!(w.write_inc("x", 1001, 0).is_none());
-    assert!(w.write_inc("x", 1000, 0).is_some());
-    assert!(w.write_inc("x", 1, 0).is_none());
-    assert!(w.write_inc("y", -1002, 0).is_none());
-    assert!(w.write_inc("y", -1001, 0).is_some());
-    assert!(w.write_inc("y", -1, 0).is_none());
-    assert_eq!(w.visible().unwrap()["y"], i(-1001));
+    w.insert(&fl(&[("x", i(0)), ("y", i(0))]), 0).unwrap();
+    assert!(w.write_inc(&p("x"), 1001, 0).is_none());
+    assert!(w.write_inc(&p("x"), 1000, 0).is_some());
+    assert!(w.write_inc(&p("x"), 1, 0).is_none());
+    assert!(w.write_inc(&p("y"), -1002, 0).is_none());
+    assert!(w.write_inc(&p("y"), -1001, 0).is_some());
+    assert!(w.write_inc(&p("y"), -1, 0).is_none());
+    assert_eq!(w.visible().unwrap()[&p("y")], i(-1001));
 }
 
 #[test]
@@ -747,13 +755,13 @@ fn probe_v6m1_losing_writes() {
     let ents = [a.ent(aa), c.ent(c1), c.ent(c2), b.ent(bb)];
     let orders = all_orders(&o, &ents, &[]);
     assert_eq!(orders.len(), 24);
-    for (p, m) in orders {
+    for (ord, m) in orders {
         assert_eq!(m.visible(), doc(&[("y", i(2))]));
-        let have: BTreeSet<(String, MStamp)> =
+        let have: BTreeSet<(Path, MStamp)> =
             m.w.state.losses.keys().map(|k| (k.path.clone(), k.stamp)).collect();
-        assert!(have.contains(&("note".to_string(), c1)), "{p:?}");
-        assert!(have.contains(&("views".to_string(), c2)), "{p:?}");
-        assert!(have.contains(&("_".to_string(), aa)), "{p:?}");
+        assert!(have.contains(&(p("note"), c1)), "{ord:?}");
+        assert!(have.contains(&(p("views"), c2)), "{ord:?}");
+        assert!(have.contains(&(Path::whole_document(), aa)), "{ord:?}");
     }
 }
 
@@ -775,18 +783,14 @@ fn probe_v6m1_killed_not_lost() {
     for e in &ents {
         m.receive_entry(e);
     }
-    assert!(
-        !m.loss_set().contains(&(LossKind::InsertLost, "_".to_string(), i0)),
-        "{:?}",
-        m.loss_set()
-    );
+    assert!(!m.loss_set().contains(&(LossKind::InsertLost, p("_"), i0)), "{:?}", m.loss_set());
     // Other orders may also hold the (true, sound) insertLost if the two first inserts met before the
     // delete did: an extra record, allowed by Q7; the document and the deleteWon are the same.
-    for (p, m) in all_orders(&o, &ents, &[]) {
-        assert_eq!(m.visible(), doc(&[("x", i(2))]), "{p:?}");
+    for (ord, m) in all_orders(&o, &ents, &[]) {
+        assert_eq!(m.visible(), doc(&[("x", i(2))]), "{ord:?}");
         assert!(
-            m.loss_set().contains(&(LossKind::DeleteWon, "y".to_string(), bb)),
-            "{p:?} {:?}",
+            m.loss_set().contains(&(LossKind::DeleteWon, p("y"), bb)),
+            "{ord:?} {:?}",
             m.loss_set()
         );
     }
@@ -801,28 +805,28 @@ fn probe_v6m2_insert_vs_upsert() {
     let aa = a.ins(&[("name", s("A")), ("role", s("admin"))], 0).unwrap();
     b.w.clock = h(6);
     let (bl, bb) = b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
-    for (p, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
+    for (ord, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
         assert_eq!(
             m.visible(),
             doc(&[("name", s("A")), ("role", s("admin")), ("views", i(1))]),
-            "{p:?}"
+            "{ord:?}"
         );
-        assert!(m.loss_set().contains(&(LossKind::InsertLost, "theme".to_string(), bl)), "{p:?}");
+        assert!(m.loss_set().contains(&(LossKind::InsertLost, p("theme"), bl)), "{ord:?}");
     }
     // The same, the upsert older.
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
     let (_, bb) = b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
     a.w.clock = h(6);
     let aa = a.ins(&[("name", s("A"))], 0).unwrap();
-    for (p, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
-        assert_eq!(m.visible(), doc(&[("name", s("A")), ("views", i(1))]), "{p:?}");
+    for (ord, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
+        assert_eq!(m.visible(), doc(&[("name", s("A")), ("views", i(1))]), "{ord:?}");
     }
     // Two upserts merge.
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
     let (_, x) = a.upsert_soi(&[("theme", s("dark"))], "views", 1, &[]).unwrap();
     let y = b.upsert_inc("views", 1).unwrap();
     let obs = fresh_observer(&o, &[a.ent(x), b.ent(y)]);
-    assert_eq!(obs.visible().unwrap()["views"], i(2));
+    assert_eq!(obs.visible().unwrap()[&p("views")], i(2));
 }
 
 #[test]
@@ -861,14 +865,14 @@ fn probe_v7m1_v7m2_reinsert_vs_upsert() {
         b.w.clock = h(6);
         let (bl, bb) =
             b.upsert_soi(&[("theme", s("dark"))], "views", 1, &[("lang", s("en"))]).unwrap();
-        for (p, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &seed) {
+        for (ord, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &seed) {
             let want = doc(&[("name", s("A")), ("lang", s("en")), ("views", i(1))]);
-            assert_eq!(m.visible(), want, "{after_delete} {p:?}");
+            assert_eq!(m.visible(), want, "{after_delete} {ord:?}");
             assert!(
-                m.loss_set().contains(&(LossKind::InsertLost, "theme".to_string(), bl)),
-                "{after_delete} {p:?}"
+                m.loss_set().contains(&(LossKind::InsertLost, p("theme"), bl)),
+                "{after_delete} {ord:?}"
             );
-            assert!(!m.w.state.losses.keys().any(|k| k.path == "lang"));
+            assert!(!m.w.state.losses.keys().any(|k| k.path == p("lang")));
         }
     }
 }
@@ -878,28 +882,29 @@ fn upsert_soi_is_two_writes() {
     let o = opts();
     let id = wid('B', 0);
     let mut w = Writer::new(id, o);
-    let (c, n) =
-        w.upsert_soi(&[("theme", s("dark"))], "views", 3, &[("lang", s("en"))], 0).unwrap();
+    let (c, n) = w
+        .upsert_soi(&fl(&[("theme", s("dark"))]), &p("views"), 3, &fl(&[("lang", s("en"))]), 0)
+        .unwrap();
     assert!(c.stamp < n.stamp);
     assert_eq!(c.record.kind, WriteKind::Insert);
     assert!(c.record.upsert && c.record.insert);
     assert_eq!(c.record.life, Some(c.stamp));
-    assert_eq!(c.record.paths, vec!["theme".to_string(), "lang".to_string()]);
-    assert_eq!(c.record.soi, vec!["theme".to_string()]);
-    assert_eq!(c.record.vals["lang"], s("en"));
+    assert_eq!(c.record.paths, vec![p("theme"), p("lang")]);
+    assert_eq!(c.record.soi, vec![p("theme")]);
+    assert_eq!(c.record.vals[&p("lang")], s("en"));
     assert_eq!(n.record.kind, WriteKind::Inc);
     assert!(!n.record.upsert && !n.record.insert);
     assert_eq!(n.record.life, Some(c.stamp));
-    assert_eq!(n.record.paths, vec!["views".to_string()]);
+    assert_eq!(n.record.paths, vec![p("views")]);
     assert_eq!(n.record.n, Some(3));
-    let slot = &w.state.slots[&(c.stamp, "views".to_string(), id, None)];
+    let slot = &w.state.slots[&(c.stamp, p("views"), id, None)];
     assert_eq!(slot.stamp, n.stamp);
     assert_eq!(w.state.vv[&id], n.stamp.hlc);
     // no other write sets `upsert`
-    let x = w.write_set("lang", s("fr"), 0).unwrap();
+    let x = w.write_set(&p("lang"), s("fr"), 0).unwrap();
     assert!(!x.record.upsert);
     assert_eq!(w.visible(), doc(&[("theme", s("dark")), ("lang", s("fr")), ("views", i(3))]));
-    assert!(w.upsert_soi(&[], "v", 1, &[], 0).is_none());
+    assert!(w.upsert_soi(&[], &p("v"), 1, &[], 0).is_none());
 }
 
 // ---- golden vectors -------------------------------------------------------------
@@ -963,14 +968,11 @@ fn golden_delete() -> MergeState {
     }
     let st = obs.w.state.clone();
     assert!(!st.deletes.is_empty() && obs.visible().is_none());
-    let kinds: BTreeSet<(LossKind, String)> =
+    let kinds: BTreeSet<(LossKind, Path)> =
         st.losses.keys().map(|k| (k.kind, k.path.clone())).collect();
     assert_eq!(
         kinds,
-        BTreeSet::from([
-            (LossKind::DeleteWon, "x".to_string()),
-            (LossKind::DeleteWon, "y".to_string())
-        ])
+        BTreeSet::from([(LossKind::DeleteWon, p("x")), (LossKind::DeleteWon, p("y"))])
     );
     st
 }
@@ -994,20 +996,20 @@ fn golden_obs() -> MergeState {
         obs.receive_entry(&e);
     }
     let st = obs.w.state.clone();
-    let rx = &st.regs[&(i0, "x".to_string())];
+    let rx = &st.regs[&(i0, p("x"))];
     assert_eq!(rx.obs.len(), 1, "x's base observed its one slot");
     let (_, t) = rx.obs.values().next().unwrap();
     assert_eq!(*t, 3);
-    let gy = st.regs[&(i0, "y".to_string())].generation.as_ref().unwrap();
+    let gy = st.regs[&(i0, p("y"))].generation.as_ref().unwrap();
     assert_eq!(gy.seen.values().copied().collect::<Vec<_>>(), vec![2]);
     assert_eq!(obs.visible(), doc(&[("x", i(20)), ("y", s("t"))]));
-    assert_eq!(obs.w.hidden_all(), BTreeMap::from([("y".to_string(), 7)]));
+    assert_eq!(obs.w.hidden_all(), BTreeMap::from([(p("y"), 7)]));
     st
 }
 
 fn golden_small() -> MergeState {
     let mut w = Writer::new(wid('A', 7), opts());
-    w.insert(&[("x", i(1)), ("s", s("t"))], 0).unwrap();
+    w.insert(&fl(&[("x", i(1)), ("s", s("t"))]), 0).unwrap();
     w.state.clone()
 }
 
@@ -1131,46 +1133,46 @@ fn q4_same_helper() {
 #[test]
 fn q4_set_compares_value_and_type() {
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("x", f(2.0)), ("k", i(1))], 0).unwrap();
-    assert!(w.write_set("x", i(2), 0).is_some(), "$set 2 over a stored 2.0 is a write");
-    assert_eq!(w.visible().unwrap()["x"], i(2));
-    assert!(w.write_set("x", i(2), 0).is_none(), "same type and value is a no-op");
-    assert!(w.write_set("x", f(2.0), 0).is_some(), "and back");
-    assert!(w.write_set("k", s("1"), 0).is_some());
+    w.insert(&fl(&[("x", f(2.0)), ("k", i(1))]), 0).unwrap();
+    assert!(w.write_set(&p("x"), i(2), 0).is_some(), "$set 2 over a stored 2.0 is a write");
+    assert_eq!(w.visible().unwrap()[&p("x")], i(2));
+    assert!(w.write_set(&p("x"), i(2), 0).is_none(), "same type and value is a no-op");
+    assert!(w.write_set(&p("x"), f(2.0), 0).is_some(), "and back");
+    assert!(w.write_set(&p("k"), s("1"), 0).is_some());
     // Null versus missing: setting a missing path to Null is a no-op, a stored value to Null is a write.
-    assert!(w.write_set("absent", Value::Null, 0).is_none());
-    assert!(w.write_set("k", Value::Null, 0).is_some());
-    assert!(!w.visible().unwrap().contains_key("k"));
-    assert!(w.write_set("k", Value::Null, 0).is_none(), "now missing again");
-    assert!(w.write_unset("k", 0).is_none());
+    assert!(w.write_set(&p("absent"), Value::Null, 0).is_none());
+    assert!(w.write_set(&p("k"), Value::Null, 0).is_some());
+    assert!(!w.visible().unwrap().contains_key(&p("k")));
+    assert!(w.write_set(&p("k"), Value::Null, 0).is_none(), "now missing again");
+    assert!(w.write_unset(&p("k"), 0).is_none());
 }
 
 #[test]
 fn q4_replace_compares_value_and_type() {
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("x", f(2.0)), ("y", s("t"))], 0).unwrap();
-    assert!(w.write_replace(&[("x", f(2.0)), ("y", s("t"))], 0).is_none());
-    let r = w.write_replace(&[("x", i(2)), ("y", s("t"))], 0).unwrap();
-    assert_eq!(r.record.paths, vec!["x".to_string()], "only the retyped field changes");
+    w.insert(&fl(&[("x", f(2.0)), ("y", s("t"))]), 0).unwrap();
+    assert!(w.write_replace(&fl(&[("x", f(2.0)), ("y", s("t"))]), 0).is_none());
+    let r = w.write_replace(&fl(&[("x", i(2)), ("y", s("t"))]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![p("x")], "only the retyped field changes");
     // A Null in the new document over a missing path is not a change; over a stored one it is.
-    assert!(w.write_replace(&[("x", i(2)), ("y", s("t")), ("z", Value::Null)], 0).is_none());
-    let r = w.write_replace(&[("x", i(2)), ("y", Value::Null)], 0).unwrap();
-    assert_eq!(r.record.paths, vec!["y".to_string()]);
+    assert!(w.write_replace(&fl(&[("x", i(2)), ("y", s("t")), ("z", Value::Null)]), 0).is_none());
+    let r = w.write_replace(&fl(&[("x", i(2)), ("y", Value::Null)]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![p("y")]);
     assert_eq!(w.visible(), doc(&[("x", i(2))]));
     // Fields absent from the new document are dropped.
-    let r = w.write_replace(&[("q", i(1))], 0).unwrap();
-    assert_eq!(r.record.paths, vec!["q".to_string(), "x".to_string()]);
+    let r = w.write_replace(&fl(&[("q", i(1))]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![p("q"), p("x")]);
     assert_eq!(w.visible(), doc(&[("q", i(1))]));
 }
 
 #[test]
 fn upsert_soi_is_create_then_inc() {
-    let fields = [("theme", s("dark"))];
-    let sets = [("lang", s("en"))];
+    let fields = fl(&[("theme", s("dark"))]);
+    let sets = fl(&[("lang", s("en"))]);
     let mut whole = Writer::new(wid('B', 0), opts());
-    let (c1, n1) = whole.upsert_soi(&fields, "views", 3, &sets, 2).unwrap();
+    let (c1, n1) = whole.upsert_soi(&fields, &p("views"), 3, &sets, 2).unwrap();
     let mut parts = Writer::new(wid('B', 0), opts());
-    let c2 = parts.upsert_soi_create(&fields, "views", &sets, 2).unwrap();
+    let c2 = parts.upsert_soi_create(&fields, &p("views"), &sets, 2).unwrap();
     // Between the two writes: the life and the cells, no slot, nothing visible yet but the cells.
     assert!(parts.state.slots.is_empty());
     assert!(parts.state.lives.contains_key(&c2.stamp));
@@ -1178,14 +1180,16 @@ fn upsert_soi_is_create_then_inc() {
     assert_eq!(parts.visible(), doc(&[("theme", s("dark")), ("lang", s("en"))]));
     // The increment needs an alive life.
     assert!(
-        parts.upsert_inc_on(MStamp { hlc: h(99), writer: wid('Z', 0) }, "views", 3, 2).is_none()
+        parts
+            .upsert_inc_on(MStamp { hlc: h(99), writer: wid('Z', 0) }, &p("views"), 3, 2)
+            .is_none()
     );
-    let n2 = parts.upsert_inc_on(c2.stamp, "views", 3, 2).unwrap();
+    let n2 = parts.upsert_inc_on(c2.stamp, &p("views"), 3, 2).unwrap();
     assert_eq!((c1, n1), (c2, n2));
     assert_eq!(whole.state, parts.state);
     assert_eq!(whole.clock, parts.clock);
     // Not while a life is alive.
-    assert!(parts.upsert_soi_create(&fields, "views", &sets, 0).is_none());
+    assert!(parts.upsert_soi_create(&fields, &p("views"), &sets, 0).is_none());
 }
 
 #[test]
@@ -1204,24 +1208,24 @@ fn upsert_with_conflicting_paths_is_refused_whole() {
         // The one-shot form, and the two-step form given the whole update: each refuses before
         // it writes anything or moves the clock.
         let mut w = Writer::new(wid('A', 0), opts());
-        assert!(w.upsert_soi(fields, inc, 1, sets, 0).is_none());
+        assert!(w.upsert_soi(&fl(fields), &p(inc), 1, &fl(sets), 0).is_none());
         let untouched = Writer::new(wid('A', 0), opts());
         assert!(w.state == untouched.state && w.state.regs.is_empty());
         assert_eq!(w.clock, Hlc::ZERO);
-        assert!(w.upsert_soi_create(fields, inc, sets, 3).is_none());
+        assert!(w.upsert_soi_create(&fl(fields), &p(inc), &fl(sets), 3).is_none());
         assert!(w.state == untouched.state && w.state.lives.is_empty());
         assert_eq!(w.clock, Hlc::ZERO, "a refused creation does not tick");
         // and nothing is left behind that a later update could trip over
-        assert!(w.upsert_soi(&[("q", i(1))], "r", 1, &[], 0).is_some());
+        assert!(w.upsert_soi(&fl(&[("q", i(1))]), &p("r"), 1, &[], 0).is_some());
     }
     // Two-step, the other order: the increment step alone refuses a path the creation wrote
     // (the creation was valid for the `$inc` it was told about), with no write and no tick.
     let mut w = Writer::new(wid('A', 0), opts());
-    let c = w.upsert_soi_create(&[("x", s("a"))], "z", &[], 0).unwrap();
+    let c = w.upsert_soi_create(&fl(&[("x", s("a"))]), &p("z"), &[], 0).unwrap();
     let (state, clock) = (w.state.clone(), w.clock);
-    assert!(w.upsert_inc_on(c.stamp, "x", 1, 0).is_none());
+    assert!(w.upsert_inc_on(c.stamp, &p("x"), 1, 0).is_none());
     assert!(w.state == state && w.clock == clock);
-    assert!(w.upsert_inc_on(c.stamp, "z", 1, 0).is_some());
+    assert!(w.upsert_inc_on(c.stamp, &p("z"), 1, 0).is_some());
 }
 
 // ---- B1: a counter that returns to exactly 0 stays in the document ---------------------
@@ -1230,29 +1234,29 @@ fn upsert_with_conflicting_paths_is_refused_whole() {
 fn zero_sum_counter_vanishes() {
     // insert {n:"a"}; $inc views +1; $inc views -1  =>  {n:"a", views:0}
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("n", s("a"))], 0).unwrap();
-    w.write_inc("views", 1, 0).unwrap();
-    w.write_inc("views", -1, 0).unwrap();
+    w.insert(&fl(&[("n", s("a"))]), 0).unwrap();
+    w.write_inc(&p("views"), 1, 0).unwrap();
+    w.write_inc(&p("views"), -1, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("n", s("a")), ("views", i(0))]));
 
     // upsert $inc views +1; $inc views -1  =>  {views:0}
     let mut w = Writer::new(wid('A', 0), opts());
-    w.upsert_inc("views", 1, 0).unwrap();
-    w.write_inc("views", -1, 0).unwrap();
+    w.upsert_inc(&p("views"), 1, 0).unwrap();
+    w.write_inc(&p("views"), -1, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("views", i(0))]));
 
     // $inc 0 on a missing field creates it at 0.
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("n", s("a"))], 0).unwrap();
-    w.write_inc("x", 0, 0).unwrap();
+    w.insert(&fl(&[("n", s("a"))]), 0).unwrap();
+    w.write_inc(&p("x"), 0, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("n", s("a")), ("x", i(0))]));
 
     // {x:100}; $unset x; $inc x +5; $inc x -5  =>  {x:0}
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("x", i(100))], 0).unwrap();
-    w.write_unset("x", 0).unwrap();
-    w.write_inc("x", 5, 0).unwrap();
-    w.write_inc("x", -5, 0).unwrap();
+    w.insert(&fl(&[("x", i(100))]), 0).unwrap();
+    w.write_unset(&p("x"), 0).unwrap();
+    w.write_inc(&p("x"), 5, 0).unwrap();
+    w.write_inc(&p("x"), -5, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("x", i(0))]));
 }
 
@@ -1260,9 +1264,9 @@ fn zero_sum_counter_vanishes() {
 fn zero_sum_counter_survives_the_join() {
     // The same sequence on a replica that only receives the states, in either order.
     let mut a = Writer::new(wid('A', 0), opts());
-    a.upsert_inc("views", 1, 0).unwrap();
+    a.upsert_inc(&p("views"), 1, 0).unwrap();
     let mid = a.state.clone();
-    a.write_inc("views", -1, 0).unwrap();
+    a.write_inc(&p("views"), -1, 0).unwrap();
     let mut b = Writer::new(wid('B', 0), opts());
     b.receive(&a.state);
     b.receive(&mid);
@@ -1275,13 +1279,13 @@ fn register_obs_keeps_the_slot_stamp() {
     // A base that observed a slot at total T, after which the slot moved and came back to T,
     // still counts the field present, and the figure is T - T = 0 on top of the base.
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("x", i(10))], 0).unwrap();
-    w.write_inc("x", 3, 0).unwrap();
-    w.write_set("x", i(20), 0).unwrap();
+    w.insert(&fl(&[("x", i(10))]), 0).unwrap();
+    w.write_inc(&p("x"), 3, 0).unwrap();
+    w.write_set(&p("x"), i(20), 0).unwrap();
     let r = w.state.regs.values().find(|r| r.value == i(20)).unwrap();
     assert!(!r.obs.is_empty() && r.obs.values().all(|(st, t)| *t == 3 && *st < r.stamp));
-    w.write_inc("x", 4, 0).unwrap();
-    w.write_inc("x", -4, 0).unwrap();
+    w.write_inc(&p("x"), 4, 0).unwrap();
+    w.write_inc(&p("x"), -4, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("x", i(20))]));
 }
 
@@ -1291,9 +1295,9 @@ fn b1_mutant_is_visible_to_the_lib_tests() {
     let mut o = opts();
     o.set_value_ignores_slot_stamp(true);
     let mut w = Writer::new(wid('A', 0), o);
-    w.insert(&[("n", s("a"))], 0).unwrap();
-    w.write_inc("views", 1, 0).unwrap();
-    w.write_inc("views", -1, 0).unwrap();
+    w.insert(&fl(&[("n", s("a"))]), 0).unwrap();
+    w.write_inc(&p("views"), 1, 0).unwrap();
+    w.write_inc(&p("views"), -1, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("n", s("a"))]));
 }
 
@@ -1309,13 +1313,13 @@ fn run_upsert_string_gen(o: &JoinOptions, soi: bool) -> Writer {
     );
     let sv = [("n", s("s"))];
     if soi {
-        a.upsert_soi(&sv, "x", 1, &[], 0).unwrap();
+        a.upsert_soi(&fl(&sv), &p("x"), 1, &[], 0).unwrap();
     } else {
-        a.upsert_soi(&[], "x", 1, &sv, 0).unwrap();
+        a.upsert_soi(&[], &p("x"), 1, &fl(&sv), 0).unwrap();
     }
-    b.upsert_inc("n", 5, 0).unwrap();
+    b.upsert_inc(&p("n"), 5, 0).unwrap();
     c.receive(&a.state);
-    c.write_set("n", i(7), 0).unwrap();
+    c.write_set(&p("n"), i(7), 0).unwrap();
     c.receive(&a.state);
     c.receive(&b.state);
     a.receive(&c.state);
@@ -1332,7 +1336,7 @@ fn upsert_string_gen() {
         let want = doc(&[("n", i(7)), ("x", i(1))]);
         assert_eq!(c.visible(), want, "soi={soi}");
         // B's +5 belongs to an older generation than C's set, which had not seen it.
-        assert_eq!(c.hidden_all(), BTreeMap::from([("n".to_string(), 5)]), "soi={soi}");
+        assert_eq!(c.hidden_all(), BTreeMap::from([(p("n"), 5)]), "soi={soi}");
     }
 }
 
@@ -1350,19 +1354,21 @@ fn m1_mutant_is_visible_to_the_lib_tests() {
 #[test]
 fn upsert_creation_generation_is_recorded_like_insert() {
     let mut w = Writer::new(wid('A', 0), opts());
-    let (c, _) =
-        w.upsert_soi(&[("t", s("dark"))], "v", 1, &[("l", f(1.5)), ("k", i(3))], 0).unwrap();
+    let (c, _) = w
+        .upsert_soi(&fl(&[("t", s("dark"))]), &p("v"), 1, &fl(&[("l", f(1.5)), ("k", i(3))]), 0)
+        .unwrap();
     let st = c.stamp;
-    for p in ["t", "l"] {
-        let r = &w.state.regs[&(st, p.to_string())];
+    for name in ["t", "l"] {
+        let p = p(name);
+        let r = &w.state.regs[&(st, p.clone())];
         let g = r.generation.as_ref().expect("non-numeric creation value starts a generation");
         assert_eq!(g.stamp, st);
         assert_eq!(g.vv, BTreeMap::from([(st.writer, st.hlc)]));
         assert!(g.seen.is_empty());
-        assert_eq!(w.state.gens[&(st, p.to_string())], (st, g.vv.clone()));
+        assert_eq!(w.state.gens[&(st, p.clone())], (st, g.vv.clone()));
     }
-    assert!(w.state.regs[&(st, "k".to_string())].generation.is_none());
-    assert!(!w.state.gens.contains_key(&(st, "k".to_string())));
+    assert!(w.state.regs[&(st, p("k"))].generation.is_none());
+    assert!(!w.state.gens.contains_key(&(st, p("k"))));
 }
 
 // ---- m1: counter totals cannot overflow the read side ------------------------------------
@@ -1370,12 +1376,12 @@ fn upsert_creation_generation_is_recorded_like_insert() {
 /// A state with one upserted life and a slot on `x` for writers B and C, set to `total` each.
 fn state_with_big_slots(total: i128) -> (MergeState, MStamp) {
     let mut w = Writer::new(wid('A', 0), opts());
-    w.upsert_inc("x", 1, 0).unwrap();
+    w.upsert_inc(&p("x"), 1, 0).unwrap();
     let mut st = w.state.clone();
     let life = *st.lives.keys().next().unwrap();
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     for c in ['B', 'C'] {
-        st.slots.insert((life, "x".into(), wid(c, 0), None), Slot { stamp, total });
+        st.slots.insert((life, p("x"), wid(c, 0), None), Slot { stamp, total });
     }
     (st, life)
 }
@@ -1399,16 +1405,12 @@ fn decode_refuses_totals_past_the_bound() {
     // The same copies elsewhere: a register's `obs`, a generation's `seen`, a loss record.
     let o = opts();
     let mut w = Writer::new(wid('A', 0), o.clone());
-    w.insert(&[("x", i(1))], 0).unwrap();
-    w.write_inc("x", 2, 0).unwrap();
-    w.write_set("x", s("t"), 0).unwrap();
+    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    w.write_inc(&p("x"), 2, 0).unwrap();
+    w.write_set(&p("x"), s("t"), 0).unwrap();
     let mut good = w.state.clone();
     good.losses.insert(
-        LossKey {
-            kind: LossKind::Clash,
-            path: "x".into(),
-            stamp: *good.lives.keys().next().unwrap(),
-        },
+        LossKey { kind: LossKind::Clash, path: p("x"), stamp: *good.lives.keys().next().unwrap() },
         LossValue::Total(5),
     );
     assert_eq!(MergeState::decode(&good.encode()).unwrap(), good);
@@ -1448,14 +1450,14 @@ fn read_side_cannot_overflow_on_a_hand_built_state() {
     // panic (debug) or wrap (release) on a state assembled by hand.
     let (st, _) = state_with_big_slots(i128::MAX);
     let o = opts();
-    assert_eq!(st.value("x", &o), Some(i(i64::MAX)), "saturates at the bound");
-    assert_eq!(st.visible(&o).unwrap()["x"], i(i64::MAX));
+    assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)), "saturates at the bound");
+    assert_eq!(st.visible(&o).unwrap()[&p("x")], i(i64::MAX));
     let _ = st.hidden_all(&o);
     let (st, _) = state_with_big_slots(i128::MIN);
-    assert_eq!(st.value("x", &o), Some(i(i64::MIN)));
+    assert_eq!(st.value(&p("x"), &o), Some(i(i64::MIN)));
     let mut w = Writer::from_state(wid('A', 0), st, o);
-    assert!(w.write_inc("x", -1, 0).is_none(), "one past the lower bound");
-    assert!(w.write_inc("x", 1, 0).is_some());
+    assert!(w.write_inc(&p("x"), -1, 0).is_none(), "one past the lower bound");
+    assert!(w.write_inc(&p("x"), 1, 0).is_some());
 }
 
 #[test]
@@ -1463,23 +1465,23 @@ fn write_inc_refuses_a_slot_past_the_total_bound() {
     // A's own slot sits just under the bound, balanced by B's: the visible value is small, so
     // the Int64 check passes, but the slot itself may not pass MAX_TOTAL.
     let mut w = Writer::new(wid('A', 0), opts());
-    w.upsert_inc("x", 1, 0).unwrap();
+    w.upsert_inc(&p("x"), 1, 0).unwrap();
     let life = *w.state.lives.keys().next().unwrap();
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     w.state.slots.insert(
-        (life, "x".into(), wid('A', 0), None),
+        (life, p("x"), wid('A', 0), None),
         Slot { stamp: w.state.slots.values().next().unwrap().stamp, total: MAX_TOTAL - 2 },
     );
     w.state
         .slots
-        .insert((life, "x".into(), wid('B', 0), None), Slot { stamp, total: -(MAX_TOTAL - 2) });
-    assert_eq!(w.visible().unwrap()["x"], i(0));
+        .insert((life, p("x"), wid('B', 0), None), Slot { stamp, total: -(MAX_TOTAL - 2) });
+    assert_eq!(w.visible().unwrap()[&p("x")], i(0));
     let clock = w.clock;
-    assert!(w.write_inc("x", 3, 0).is_none(), "MAX_TOTAL + 1");
+    assert!(w.write_inc(&p("x"), 3, 0).is_none(), "MAX_TOTAL + 1");
     assert_eq!(w.clock, clock, "a refused write does not tick");
-    assert!(w.write_inc("x", 2, 0).is_some(), "exactly MAX_TOTAL");
-    assert!(w.write_inc("x", 1, 0).is_none());
-    assert!(w.write_inc("x", -1, 0).is_some());
+    assert!(w.write_inc(&p("x"), 2, 0).is_some(), "exactly MAX_TOTAL");
+    assert!(w.write_inc(&p("x"), 1, 0).is_none());
+    assert!(w.write_inc(&p("x"), -1, 0).is_some());
 }
 
 // ---- m3: mutant memory is outside the format ------------------------------------------------
@@ -1487,8 +1489,8 @@ fn write_inc_refuses_a_slot_past_the_total_bound() {
 #[test]
 fn generation_vv_and_gens_are_outside_bytes_hash_and_equality() {
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("x", i(1)), ("t", s("a"))], 0).unwrap();
-    w.write_set("t", s("b"), 0).unwrap();
+    w.insert(&fl(&[("x", i(1)), ("t", s("a"))]), 0).unwrap();
+    w.write_set(&p("t"), s("b"), 0).unwrap();
     let st = w.state.clone();
     assert!(!st.gens.is_empty());
     assert!(st.regs.values().filter_map(|r| r.generation.as_ref()).any(|g| !g.vv.is_empty()));
@@ -1522,11 +1524,11 @@ fn a_negative_int_bound_is_refused_and_zero_is_usable() {
     // The smallest valid bound clamps to [-1, 0] without panicking.
     let o = JoinOptions::new(5, 0).unwrap();
     let mut w = Writer::new(wid('A', 0), o);
-    w.insert(&[("x", i(0))], 0).unwrap();
-    assert!(w.write_inc("x", 1, 0).is_none());
-    assert!(w.write_inc("x", -1, 0).is_some());
+    w.insert(&fl(&[("x", i(0))]), 0).unwrap();
+    assert!(w.write_inc(&p("x"), 1, 0).is_none());
+    assert!(w.write_inc(&p("x"), -1, 0).is_some());
     assert_eq!(w.visible(), doc(&[("x", i(-1))]));
-    assert!(w.write_inc("x", -1, 0).is_none());
+    assert!(w.write_inc(&p("x"), -1, 0).is_none());
 }
 
 // ---- m-c: the total bound is theoretical, and a member never stores what it cannot decode ----
@@ -1540,22 +1542,22 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
     // under 2^120, so 64 of them sum to under 2^126), and the visible value saturates.
     let o = opts();
     let mut w = Writer::new(wid('A', 0), o.clone());
-    w.upsert_inc("x", 1, 0).unwrap();
+    w.upsert_inc(&p("x"), 1, 0).unwrap();
     let mut st = w.state.clone();
     let life = *st.lives.keys().next().unwrap();
     st.slots.clear();
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     for k in 0..64u8 {
         let wr = WriterId { node: nid((b'a' + k) as char), epoch: Epoch::from_u64(0) };
-        st.slots.insert((life, "x".into(), wr, None), Slot { stamp, total: MAX_TOTAL });
+        st.slots.insert((life, p("x"), wr, None), Slot { stamp, total: MAX_TOTAL });
     }
-    assert_eq!(st.value("x", &o), Some(i(i64::MAX)));
+    assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)));
     assert_eq!(MergeState::decode(&st.encode()).unwrap(), st, "a state at the bound decodes");
     // Half at +bound, half at -bound: the exact sum is 0, which only exact arithmetic gives.
     for (k, slot) in st.slots.values_mut().enumerate() {
         slot.total = if k % 2 == 0 { MAX_TOTAL } else { -MAX_TOTAL };
     }
-    assert_eq!(st.value("x", &o), Some(i(0)));
+    assert_eq!(st.value(&p("x"), &o), Some(i(0)));
     // The same terms through the hidden figure: a generation that saw nothing, over 64 slots of
     // an older generation at the bound.
     let gen_stamp = MStamp { hlc: h(5), writer: wid('B', 0) };
@@ -1564,7 +1566,7 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
         slot.total = MAX_TOTAL;
     }
     st.regs.insert(
-        (life, "x".into()),
+        (life, p("x")),
         Reg {
             stamp: gen_stamp,
             value: s("t"),
@@ -1573,16 +1575,16 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
             soi: false,
         },
     );
-    assert_eq!(st.hidden("x", &o), 64 * MAX_TOTAL, "exact, no saturation");
+    assert_eq!(st.hidden(&p("x"), &o), 64 * MAX_TOTAL, "exact, no saturation");
 }
 
 #[test]
 fn receive_loss_refuses_a_total_past_the_bound() {
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("x", i(1))], 0).unwrap();
+    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
     let st = w.state.clone();
     let life = *st.lives.keys().next().unwrap();
-    let key = |p: &str| LossKey { kind: LossKind::DeleteWon, path: p.into(), stamp: life };
+    let key = |path: &str| LossKey { kind: LossKind::DeleteWon, path: p(path), stamp: life };
     for (p, t, added) in [
         ("a", MAX_TOTAL, true),
         ("b", -MAX_TOTAL, true),
@@ -1606,22 +1608,20 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
     // public).
     let o = opts();
     let mut w = Writer::new(wid('A', 0), o.clone());
-    w.insert(&[("x", i(1))], 0).unwrap();
+    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
     let mut st = w.state.clone();
     let life = *st.lives.keys().next().unwrap();
     let gen_stamp = MStamp { hlc: h(9), writer: wid('A', 0) };
     let slot_stamp = MStamp { hlc: h(2), writer: wid('B', 0) };
     for c in ['B', 'C'] {
-        st.slots.insert(
-            (life, "x".into(), wid(c, 0), None),
-            Slot { stamp: slot_stamp, total: i128::MAX },
-        );
+        st.slots
+            .insert((life, p("x"), wid(c, 0), None), Slot { stamp: slot_stamp, total: i128::MAX });
     }
     let mut g = Gen::start(gen_stamp, &BTreeMap::new(), BTreeMap::new());
     // B's slot was seen at -1: i128::MAX - (-1) overflows a plain subtraction
     g.seen.insert((life, wid('B', 0), None), -1);
     st.regs.insert(
-        (life, "x".into()),
+        (life, p("x")),
         Reg {
             stamp: gen_stamp,
             value: s("t"),
@@ -1630,8 +1630,8 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
             soi: false,
         },
     );
-    assert_eq!(st.hidden("x", &o), i128::MAX);
-    assert_eq!(st.hidden_all(&o), BTreeMap::from([("x".to_string(), i128::MAX)]));
+    assert_eq!(st.hidden(&p("x"), &o), i128::MAX);
+    assert_eq!(st.hidden_all(&o), BTreeMap::from([(p("x"), i128::MAX)]));
 }
 
 // ---- the BSON value set ----------------------------------------------------------------
@@ -1660,10 +1660,10 @@ fn every_bson_type_is_stored_read_back_and_round_trips() {
     let mut w = Writer::new(wid('A', 0), opts());
     let fields = every_type();
     let fields: Vec<(&str, Value)> = fields.into_iter().filter(|(k, _)| *k != "null").collect();
-    w.insert(&fields, 0).unwrap();
+    w.insert(&fl(&fields), 0).unwrap();
     let vis = w.visible().unwrap();
     for (k, v) in &fields {
-        assert_eq!(vis.get(*k), Some(v), "{k}");
+        assert_eq!(vis.get(&p(k)), Some(v), "{k}");
     }
     let enc = w.state.encode();
     let back = MergeState::decode(&enc).unwrap();
@@ -1675,7 +1675,7 @@ fn every_bson_type_is_stored_read_back_and_round_trips() {
         let mut st = MergeState::default();
         let key = LossKey {
             kind: LossKind::Clash,
-            path: "p".into(),
+            path: p("p"),
             stamp: MStamp { hlc: h(1), writer: wid('A', 0) },
         };
         st.losses.insert(key, LossValue::Value(v.clone()));
@@ -1739,28 +1739,28 @@ fn only_null_and_int64_are_numeric() {
 #[test]
 fn a_write_across_integer_widths_is_a_write() {
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("n", i(5))], 0).unwrap();
-    assert!(w.write_set("n", i(5), 0).is_none(), "same type, same number: a no-op");
-    assert!(w.write_set("n", Value::Int32(5), 0).is_some(), "Int32 over Int64 is a write");
-    assert!(w.write_set("n", Value::Int32(5), 0).is_none());
-    assert!(w.write_set("n", f(5.0), 0).is_some(), "a double over an Int32 is a write");
-    assert!(w.write_set("n", Value::Decimal128([1; 16]), 0).is_some());
-    assert_eq!(w.visible().unwrap()["n"], Value::Decimal128([1; 16]));
+    w.insert(&fl(&[("n", i(5))]), 0).unwrap();
+    assert!(w.write_set(&p("n"), i(5), 0).is_none(), "same type, same number: a no-op");
+    assert!(w.write_set(&p("n"), Value::Int32(5), 0).is_some(), "Int32 over Int64 is a write");
+    assert!(w.write_set(&p("n"), Value::Int32(5), 0).is_none());
+    assert!(w.write_set(&p("n"), f(5.0), 0).is_some(), "a double over an Int32 is a write");
+    assert!(w.write_set(&p("n"), Value::Decimal128([1; 16]), 0).is_some());
+    assert_eq!(w.visible().unwrap()[&p("n")], Value::Decimal128([1; 16]));
     // A string or an Int32 base refuses `$inc` like any non-counter.
-    assert!(w.write_inc("n", 1, 0).is_none());
+    assert!(w.write_inc(&p("n"), 1, 0).is_none());
 }
 
 #[test]
 fn a_concurrent_write_of_two_types_resolves_by_stamp_and_reports_the_loser() {
     let mut a = Writer::new(wid('A', 0), opts());
     let mut b = Writer::new(wid('B', 0), opts());
-    a.insert(&[("x", i(0))], 0).unwrap();
+    a.insert(&fl(&[("x", i(0))]), 0).unwrap();
     b.receive(&a.state);
-    a.write_set("x", Value::Int32(1), 0).unwrap();
-    b.write_set("x", Value::Date(2), 5).unwrap();
+    a.write_set(&p("x"), Value::Int32(1), 0).unwrap();
+    b.write_set(&p("x"), Value::Date(2), 5).unwrap();
     let (la, lb) = (a.receive(&b.state), b.receive(&a.state));
     assert_eq!(a.state.state_hash(), b.state.state_hash());
-    assert_eq!(a.visible().unwrap()["x"], Value::Date(2));
+    assert_eq!(a.visible().unwrap()[&p("x")], Value::Date(2));
     assert_eq!((la.len(), lb.len()), (1, 1));
     assert_eq!(a.state.losses.values().next(), Some(&LossValue::Value(Value::Int32(1))));
 }
@@ -1768,7 +1768,7 @@ fn a_concurrent_write_of_two_types_resolves_by_stamp_and_reports_the_loser() {
 #[test]
 fn decode_refuses_a_bad_bool_a_deep_array_and_a_cut_value() {
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("b", Value::Bool(true))], 0).unwrap();
+    w.insert(&fl(&[("b", Value::Bool(true))]), 0).unwrap();
     let enc = w.state.encode();
     // The bool's payload byte is the last value byte: find `[9, 1]` and set it to 2.
     let pos = enc.windows(2).rposition(|p| p == [9, 1]).unwrap();
@@ -1785,18 +1785,115 @@ fn decode_refuses_a_bad_bool_a_deep_array_and_a_cut_value() {
     };
     let ok = nest(super::codec::MAX_VALUE_DEPTH);
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("a", ok)], 0).unwrap();
+    w.insert(&fl(&[("a", ok)]), 0).unwrap();
     assert!(MergeState::decode(&w.state.encode()).is_ok());
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[("a", nest(super::codec::MAX_VALUE_DEPTH + 1))], 0).unwrap();
+    w.insert(&fl(&[("a", nest(super::codec::MAX_VALUE_DEPTH + 1))]), 0).unwrap();
     assert_eq!(MergeState::decode(&w.state.encode()), Err(DecodeError::TooDeep));
     // Every proper prefix of a state with every type is refused as truncated or bad.
     let mut w = Writer::new(wid('A', 0), opts());
     let fields: Vec<(&str, Value)> =
         every_type().into_iter().filter(|(k, _)| *k != "null").collect();
-    w.insert(&fields, 0).unwrap();
+    w.insert(&fl(&fields), 0).unwrap();
     let enc = w.state.encode();
     for n in 0..enc.len() {
         assert!(MergeState::decode(&enc[..n]).is_err(), "prefix {n}");
+    }
+}
+
+// ---- paths as segment lists --------------------------------------------------------------
+
+#[test]
+fn a_path_is_a_nonempty_list_of_nonempty_nul_free_segments() {
+    assert_eq!(Path::new(Vec::<String>::new()), Err(InvalidPath("no segments")));
+    assert_eq!(Path::new([""]), Err(InvalidPath("an empty segment")));
+    assert_eq!(Path::new(["a", ""]), Err(InvalidPath("an empty segment")));
+    assert_eq!(Path::new(["a\0b"]), Err(InvalidPath("a NUL byte in a segment")));
+    assert_eq!(Path::flat(""), Err(InvalidPath("an empty segment")));
+    // A dot is part of a name, not a separator.
+    let dotted = Path::flat("a.b").unwrap();
+    assert_eq!(dotted.segments(), ["a.b"]);
+    assert_ne!(dotted, Path::new(["a", "b"]).unwrap());
+    assert_eq!(Path::new(["a", "b"]).unwrap().segments(), ["a", "b"]);
+    assert_eq!(Path::new(["a", "b"]).unwrap().to_string(), "a.b");
+    assert_eq!(Path::whole_document(), p("_"));
+}
+
+#[test]
+fn paths_order_by_segments_and_a_prefix_sorts_first() {
+    let pp = |s: &[&str]| Path::new(s.iter().copied()).unwrap();
+    let sorted = [
+        pp(&["a"]),
+        pp(&["a", "b"]),
+        pp(&["a", "b", "c"]),
+        pp(&["a", "c"]),
+        pp(&["a\u{1}"]),
+        pp(&["a.b"]),
+        pp(&["b"]),
+        pp(&["é"]),
+    ];
+    for (x, y) in sorted.iter().zip(sorted.iter().skip(1)) {
+        assert!(x < y, "{x:?} < {y:?}");
+    }
+    let mut shuffled = [3, 7, 1, 0, 6, 2, 5, 4].map(|k| sorted[k].clone());
+    shuffled.sort();
+    assert_eq!(shuffled, sorted);
+}
+
+#[test]
+fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
+    let ab = Path::new(["a", "b"]).unwrap();
+    let a_b = Path::flat("a.b").unwrap();
+    let abc = Path::new(["a", "b", "c"]).unwrap();
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[(a_b.clone(), i(1)), (ab.clone(), i(2)), (abc.clone(), s("x"))], 0).unwrap();
+    let vis = w.visible().unwrap();
+    assert_eq!(vis.len(), 3);
+    assert_eq!((&vis[&a_b], &vis[&ab], &vis[&abc]), (&i(1), &i(2), &s("x")));
+    assert!(w.write_set(&ab, i(3), 0).is_some());
+    assert!(w.write_inc(&a_b, 4, 0).is_some());
+    assert!(w.write_unset(&abc, 0).is_some());
+    let vis = w.visible().unwrap();
+    assert_eq!((&vis[&a_b], &vis[&ab], vis.get(&abc)), (&i(5), &i(3), None));
+    // The state encodes, decodes and hashes with the paths intact.
+    let enc = w.state.encode();
+    let back = MergeState::decode(&enc).unwrap();
+    assert_eq!(back, w.state);
+    assert_eq!(back.encode(), enc);
+    // ... and the two spellings of "a.b" encode differently.
+    let mut x = Writer::new(wid('A', 0), opts());
+    let mut y = Writer::new(wid('A', 0), opts());
+    x.insert(&[(a_b, i(1))], 0).unwrap();
+    y.insert(&[(ab, i(1))], 0).unwrap();
+    assert_ne!(x.state.canonical_bytes(), y.state.canonical_bytes());
+    assert_ne!(x.state.state_hash(), y.state.state_hash());
+    // Two writers merge a nested path and its dotted twin without mixing them.
+    let mut b = Writer::new(wid('B', 0), opts());
+    b.receive(&x.state);
+    let ab = Path::new(["a", "b"]).unwrap();
+    b.write_set(&ab, s("nested"), 0).unwrap();
+    x.receive(&b.state);
+    let vis = x.visible().unwrap();
+    assert_eq!(
+        (vis.get(&Path::flat("a.b").unwrap()), vis.get(&ab)),
+        (Some(&i(1)), Some(&s("nested")))
+    );
+}
+
+#[test]
+fn decode_refuses_an_empty_path_or_segment() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[(Path::new(["a", "b"]).unwrap(), i(1))], 0).unwrap();
+    let enc = w.state.encode();
+    // The path is written as the segments joined by a NUL byte: `a 0 b`.
+    let at = enc.windows(3).position(|x| x == b"a\0b").expect("the path is in the bytes");
+    let mut ok = enc.clone();
+    ok[at + 2] = b'c';
+    assert!(MergeState::decode(&ok).is_ok(), "another name, same shape");
+    for patch in [[b'a', 0, 0], [0, 0, b'b'], [0, b'x', b'b']] {
+        let mut bad = enc.clone();
+        bad[at..at + 3].copy_from_slice(&patch);
+        // The life's field order names the path too, so the first path read fails.
+        assert_eq!(MergeState::decode(&bad), Err(DecodeError::BadPath), "{patch:?}");
     }
 }

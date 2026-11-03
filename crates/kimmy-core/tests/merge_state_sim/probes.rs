@@ -9,10 +9,10 @@ use kimmy_core::merge_state::Value;
 
 use crate::grade::grade;
 use crate::oracle::Log;
-use crate::sim::{Cfg, Node, fix_key, fixpoint, pull};
+use crate::sim::{Cfg, Node, fix_key, fixpoint, p, pull};
 
 fn x_of(n: &Node) -> Value {
-    n.visible().and_then(|d| d.get("x").cloned()).expect("x is visible")
+    n.visible().and_then(|d| d.get(&p("x")).cloned()).expect("x is visible")
 }
 
 /// Restoring the same backup twice. The epoch from the restore's start HLC plus

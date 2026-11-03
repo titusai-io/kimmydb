@@ -9,11 +9,20 @@ use std::rc::Rc;
 use kimmy_core::hlc::Hlc;
 use kimmy_core::ids::NodeId;
 use kimmy_core::merge_state::{
-    Epoch, JoinOptions, LifeKind, LossKey, LossKind, LossValue, MStamp, MergeState, Received,
+    Epoch, JoinOptions, LifeKind, LossKey, LossKind, LossValue, MStamp, MergeState, Path, Received,
     Value, Writer, WriterId, Written, join,
 };
 
 use crate::oracle::Log;
+
+/// A one-segment path: the sim's fields are flat.
+pub fn p(x: &str) -> Path {
+    Path::flat(x).expect("a valid field name")
+}
+/// The fields of a flat document as paths.
+pub fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
+    f.iter().map(|(k, v)| (p(k), v.clone())).collect()
+}
 use crate::rng::Rng;
 
 /// A vector keyed by origin: `(node, epoch)`, or `(node, 0)` when the
@@ -384,11 +393,11 @@ impl Node {
     // ---- local writes, logged ----------------------------------------------
 
     pub fn insert(&mut self, f: &[(&str, Value)], log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.insert(f, skew);
+        let r = self.w.insert(&fl(f), skew);
         self.logged(r, log)
     }
-    pub fn upsert_inc(&mut self, p: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.upsert_inc(p, n, skew);
+    pub fn upsert_inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r = self.w.upsert_inc(&p(path), n, skew);
         self.logged(r, log)
     }
     /// A `$setOnInsert` upsert: two sequential writes by one writer (the creation
@@ -403,32 +412,33 @@ impl Node {
         log: &mut Log,
         skew: u64,
     ) -> Option<MStamp> {
-        let created = self.w.upsert_soi_create(fields, inc_path, sets, skew);
+        let inc_path = p(inc_path);
+        let created = self.w.upsert_soi_create(&fl(fields), &inc_path, &fl(sets), skew);
         let s1 = self.logged(created, log)?;
-        let incd = self.w.upsert_inc_on(s1, inc_path, n, skew);
+        let incd = self.w.upsert_inc_on(s1, &inc_path, n, skew);
         self.logged(incd, log)
     }
-    pub fn set(&mut self, p: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_set(p, v, skew);
+    pub fn set(&mut self, path: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r = self.w.write_set(&p(path), v, skew);
         self.logged(r, log)
     }
-    pub fn unset(&mut self, p: &str, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_unset(p, skew);
+    pub fn unset(&mut self, path: &str, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r = self.w.write_unset(&p(path), skew);
         self.logged(r, log)
     }
-    pub fn inc(&mut self, p: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_inc(p, n, skew);
+    pub fn inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r = self.w.write_inc(&p(path), n, skew);
         self.logged(r, log)
     }
     pub fn replace(&mut self, d: &[(&str, Value)], log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_replace(d, skew);
+        let r = self.w.write_replace(&fl(d), skew);
         self.logged(r, log)
     }
     pub fn delete(&mut self, log: &mut Log, skew: u64) -> Option<MStamp> {
         let r = self.w.write_delete(skew);
         self.logged(r, log)
     }
-    pub fn visible(&self) -> Option<BTreeMap<String, Value>> {
+    pub fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.w.visible()
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use kimmy_core::merge_state::{LossKey, MStamp};
+use kimmy_core::merge_state::{LossKey, MStamp, Path};
 
 use crate::oracle::{self, Head, Log};
 use crate::sim::Node;
@@ -90,7 +90,7 @@ pub fn grade_bounded(ms: &[Node], log: &Log) -> Vec<String> {
     let h = ms[0].w.horizon();
     let must: BTreeSet<Head> = oracle::loss_oracle(log, &alive, &dels, ret)
         .into_iter()
-        .filter(|(_, st): &(String, MStamp)| st.hlc >= h)
+        .filter(|(_, st): &(Path, MStamp)| st.hlc >= h)
         .collect();
     let have: BTreeSet<LossKey> = ms[0].state().losses.keys().cloned().collect();
     if !must.is_subset(&heads(&have)) {

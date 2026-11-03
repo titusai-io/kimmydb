@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use super::join::{JoinOptions, join};
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot};
-use super::types::{LossKey, LossValue, MStamp, Value, WriterId};
+use super::types::{LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,9 +23,9 @@ pub struct WriteRecord {
     pub kind: WriteKind,
     /// The life written into (the new life for an insert or an upserting inc).
     pub life: Option<MStamp>,
-    pub paths: Vec<String>,
+    pub paths: Vec<Path>,
     /// Register values written (`Insert`, `Reg`).
-    pub vals: BTreeMap<String, Value>,
+    pub vals: BTreeMap<Path, Value>,
     /// The increment (`Inc`).
     pub n: Option<i64>,
     /// The generation an increment belongs to (`Inc`).
@@ -35,11 +35,11 @@ pub struct WriteRecord {
     /// The creation write of a `$setOnInsert` upsert: a life creation that is not an explicit insert.
     pub upsert: bool,
     /// The `$setOnInsert` paths of an upsert.
-    pub soi: Vec<String>,
+    pub soi: Vec<Path>,
 }
 
 impl WriteRecord {
-    fn new(kind: WriteKind, life: Option<MStamp>, paths: Vec<String>) -> Self {
+    fn new(kind: WriteKind, life: Option<MStamp>, paths: Vec<Path>) -> Self {
         Self {
             kind,
             life,
@@ -99,10 +99,10 @@ impl Writer {
         MStamp { hlc: self.clock, writer: self.id }
     }
 
-    pub fn visible(&self) -> Option<BTreeMap<String, Value>> {
+    pub fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.state.visible(&self.opts)
     }
-    pub fn hidden_all(&self) -> BTreeMap<String, i128> {
+    pub fn hidden_all(&self) -> BTreeMap<Path, i128> {
         self.state.hidden_all(&self.opts)
     }
     pub fn alive(&self) -> Vec<MStamp> {
@@ -118,7 +118,7 @@ impl Writer {
 
     /// V5m1: every slot total of `p` (any generation, alive lives) as this
     /// writer sees it, kept with a generation it starts.
-    fn seen(&self, p: &str) -> BTreeMap<ObsKey, i128> {
+    fn seen(&self, p: &Path) -> BTreeMap<ObsKey, i128> {
         let al = self.state.alive_set(self.opts.retention);
         self.state
             .slots
@@ -128,7 +128,7 @@ impl Writer {
             .collect()
     }
 
-    fn obs(&self, p: &str) -> BTreeMap<ObsKey, (MStamp, i128)> {
+    fn obs(&self, p: &Path) -> BTreeMap<ObsKey, (MStamp, i128)> {
         self.state
             .counted(p, &self.opts)
             .into_iter()
@@ -136,7 +136,7 @@ impl Writer {
             .collect()
     }
 
-    fn setreg(&mut self, p: &str, v: Value, st: MStamp) {
+    fn setreg(&mut self, p: &Path, v: Value, st: MStamp) {
         let l = self.write_life().expect("a register write needs an alive life");
         let generation = if v.is_numeric() {
             self.state.gen_of(p, &self.opts).map(std::borrow::Cow::into_owned)
@@ -147,11 +147,11 @@ impl Writer {
         #[cfg(any(test, feature = "merge-mutants"))]
         if !v.is_numeric() {
             let vv = self.state.vv.clone();
-            self.state.note_base((l, p.to_string()), st, &vv);
+            self.state.note_base((l, p.clone()), st, &vv);
         }
         self.state
             .regs
-            .insert((l, p.to_string()), Reg { stamp: st, value: v, obs, generation, soi: false });
+            .insert((l, p.clone()), Reg { stamp: st, value: v, obs, generation, soi: false });
     }
 
     /// The writer's own state, normalised as every receiver's join normalises
@@ -167,7 +167,7 @@ impl Writer {
     }
 
     /// An explicit insert; refused (`None`) while a life is alive.
-    pub fn insert(&mut self, fields: &[(&str, Value)], skew: u64) -> Option<Written> {
+    pub fn insert(&mut self, fields: &[(Path, Value)], skew: u64) -> Option<Written> {
         if !self.state.alive(&self.opts).is_empty() {
             return None;
         }
@@ -177,7 +177,7 @@ impl Writer {
             st,
             Life {
                 seen: s.deletes.keys().copied().collect(),
-                order: fields.iter().map(|(p, _)| p.to_string()).collect(),
+                order: fields.iter().map(|(p, _)| p.clone()).collect(),
                 kind: LifeKind::Insert,
             },
         );
@@ -188,21 +188,21 @@ impl Writer {
                 Gen::start(st, &vv, BTreeMap::new())
             });
             s.regs.insert(
-                (st, p.to_string()),
+                (st, p.clone()),
                 Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi: false },
             );
             #[cfg(any(test, feature = "merge-mutants"))]
             if !v.is_numeric() {
-                s.note_base((st, p.to_string()), st, &BTreeMap::from([(st.writer, st.hlc)]));
+                s.note_base((st, p.clone()), st, &BTreeMap::from([(st.writer, st.hlc)]));
             }
         }
         s.vv.insert(st.writer, st.hlc);
         let mut rec = WriteRecord::new(
             WriteKind::Insert,
             Some(st),
-            fields.iter().map(|(p, _)| p.to_string()).collect(),
+            fields.iter().map(|(p, _)| p.clone()).collect(),
         );
-        rec.vals = fields.iter().map(|(p, v)| (p.to_string(), v.clone())).collect();
+        rec.vals = fields.iter().map(|(p, v)| (p.clone(), v.clone())).collect();
         Some(self.finish(st, rec))
     }
 
@@ -214,10 +214,10 @@ impl Writer {
     /// own stamp. Only the tagged cells can be dropped.
     pub fn upsert_soi(
         &mut self,
-        fields: &[(&str, Value)],
-        inc_path: &str,
+        fields: &[(Path, Value)],
+        inc_path: &Path,
         n: i64,
-        sets: &[(&str, Value)],
+        sets: &[(Path, Value)],
         skew: u64,
     ) -> Option<(Written, Written)> {
         let created = self.upsert_soi_create(fields, inc_path, sets, skew)?;
@@ -234,13 +234,13 @@ impl Writer {
     /// update is refused, `None`). Refused too while a life is alive.
     pub fn upsert_soi_create(
         &mut self,
-        fields: &[(&str, Value)],
-        inc_path: &str,
-        sets: &[(&str, Value)],
+        fields: &[(Path, Value)],
+        inc_path: &Path,
+        sets: &[(Path, Value)],
         skew: u64,
     ) -> Option<Written> {
-        let mut paths: Vec<&str> =
-            fields.iter().chain(sets.iter()).map(|(q, _)| *q).chain([inc_path]).collect();
+        let mut paths: Vec<&Path> =
+            fields.iter().chain(sets.iter()).map(|(q, _)| q).chain([inc_path]).collect();
         paths.sort_unstable();
         if paths.windows(2).any(|w| w[0] == w[1]) {
             return None;
@@ -254,15 +254,15 @@ impl Writer {
             st,
             Life {
                 seen: s.deletes.keys().copied().collect(),
-                order: fields.iter().map(|(p, _)| p.to_string()).collect(),
+                order: fields.iter().map(|(p, _)| p.clone()).collect(),
                 kind: LifeKind::Upsert,
             },
         );
         // M1: a non-numeric creation value starts a generation, as in `insert`.
         let starts_gen = !self.opts.creation_without_generation();
-        let mut cells: Vec<(&str, &Value, bool)> = Vec::new();
-        cells.extend(fields.iter().map(|(q, v)| (*q, v, true)));
-        cells.extend(sets.iter().map(|(q, v)| (*q, v, false)));
+        let mut cells: Vec<(&Path, &Value, bool)> = Vec::new();
+        cells.extend(fields.iter().map(|(q, v)| (q, v, true)));
+        cells.extend(sets.iter().map(|(q, v)| (q, v, false)));
         for (q, v, soi) in cells {
             let generation = (starts_gen && !v.is_numeric()).then(|| {
                 let mut vv = s.vv.clone();
@@ -270,28 +270,28 @@ impl Writer {
                 Gen::start(st, &vv, BTreeMap::new())
             });
             s.regs.insert(
-                (st, q.to_string()),
+                (st, q.clone()),
                 Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi },
             );
             #[cfg(any(test, feature = "merge-mutants"))]
             if starts_gen && !v.is_numeric() {
-                s.note_base((st, q.to_string()), st, &BTreeMap::from([(st.writer, st.hlc)]));
+                s.note_base((st, q.clone()), st, &BTreeMap::from([(st.writer, st.hlc)]));
             }
         }
         let mut paths = Vec::new();
         let mut vals = BTreeMap::new();
         for (q, v) in fields.iter().chain(sets.iter()) {
-            if !paths.contains(&q.to_string()) {
-                paths.push(q.to_string());
+            if !paths.contains(q) {
+                paths.push(q.clone());
             }
-            vals.insert(q.to_string(), v.clone());
+            vals.insert(q.clone(), v.clone());
         }
         s.vv.insert(st.writer, st.hlc);
         let mut rec = WriteRecord::new(WriteKind::Insert, Some(st), paths);
         rec.vals = vals;
         rec.upsert = true;
         rec.insert = true;
-        rec.soi = fields.iter().map(|(p, _)| p.to_string()).collect();
+        rec.soi = fields.iter().map(|(p, _)| p.clone()).collect();
         Some(self.finish(st, rec))
     }
 
@@ -301,7 +301,7 @@ impl Writer {
     pub fn upsert_inc_on(
         &mut self,
         life: MStamp,
-        path: &str,
+        path: &Path,
         n: i64,
         skew: u64,
     ) -> Option<Written> {
@@ -310,22 +310,21 @@ impl Writer {
         }
         // The creation wrote this path as a register: a counter slot beside it would belong to
         // no generation of that base (the update conflicts and is refused).
-        if self.state.regs.contains_key(&(life, path.to_string())) {
+        if self.state.regs.contains_key(&(life, path.clone())) {
             return None;
         }
         let st2 = self.tick(skew);
         self.state.vv.insert(st2.writer, st2.hlc);
-        self.state.slots.insert(
-            (life, path.to_string(), self.id, None),
-            Slot { stamp: st2, total: i128::from(n) },
-        );
-        let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.to_string()]);
+        self.state
+            .slots
+            .insert((life, path.clone(), self.id, None), Slot { stamp: st2, total: i128::from(n) });
+        let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.clone()]);
         rec.n = Some(n);
         Some(self.finish(st2, rec))
     }
 
     /// An upserting `$inc` that creates the document; refused while a life is alive.
-    pub fn upsert_inc(&mut self, path: &str, n: i64, skew: u64) -> Option<Written> {
+    pub fn upsert_inc(&mut self, path: &Path, n: i64, skew: u64) -> Option<Written> {
         if !self.state.alive(&self.opts).is_empty() {
             return None;
         }
@@ -339,18 +338,15 @@ impl Writer {
                 kind: LifeKind::Upsert,
             },
         );
-        s.slots.insert(
-            (st, path.to_string(), self.id, None),
-            Slot { stamp: st, total: i128::from(n) },
-        );
-        let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), vec![path.to_string()]);
+        s.slots.insert((st, path.clone(), self.id, None), Slot { stamp: st, total: i128::from(n) });
+        let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), vec![path.clone()]);
         rec.n = Some(n);
         rec.insert = true;
         Some(self.finish(st, rec))
     }
 
     /// `$set path = v`; `None` when no life is alive or the value is unchanged.
-    pub fn write_set(&mut self, path: &str, v: Value, skew: u64) -> Option<Written> {
+    pub fn write_set(&mut self, path: &Path, v: Value, skew: u64) -> Option<Written> {
         let vis = self.visible()?;
         if Value::same(vis.get(path), &v) {
             return None;
@@ -359,7 +355,7 @@ impl Writer {
     }
 
     /// `$unset path`; `None` when no life is alive or the path is absent.
-    pub fn write_unset(&mut self, path: &str, skew: u64) -> Option<Written> {
+    pub fn write_unset(&mut self, path: &Path, skew: u64) -> Option<Written> {
         let vis = self.visible()?;
         vis.get(path)?;
         self.write_reg_unchecked(path, Value::Null, skew)
@@ -368,7 +364,7 @@ impl Writer {
     /// `$inc path by n`. A local increment past the bound is refused (Q11), and so is one that
     /// would carry the writer's slot past [`MAX_TOTAL`]; on a double base it is a register
     /// write that starts a generation (Nm5); on a string it is refused.
-    pub fn write_inc(&mut self, p: &str, n: i64, skew: u64) -> Option<Written> {
+    pub fn write_inc(&mut self, p: &Path, n: i64, skew: u64) -> Option<Written> {
         let vis = self.visible()?;
         let cur = vis.get(p);
         let b = i128::from(self.opts.int_bound());
@@ -386,7 +382,7 @@ impl Writer {
         }
         let l = self.write_life()?;
         let generation = self.state.gen_of(p, &self.opts).map(|g| g.stamp);
-        let key = (l, p.to_string(), self.id, generation);
+        let key = (l, p.clone(), self.id, generation);
         let old = self.state.slots.get(&key).map_or(0, |s| s.total);
         // The slot is this writer's running sum, which the saturated check above does not
         // bound; refuse the `$inc` that would carry it past `MAX_TOTAL`.
@@ -397,7 +393,7 @@ impl Writer {
         let st = self.tick(skew);
         self.state.vv.insert(st.writer, st.hlc);
         self.state.slots.insert(key, Slot { stamp: st, total });
-        let mut rec = WriteRecord::new(WriteKind::Inc, Some(l), vec![p.to_string()]);
+        let mut rec = WriteRecord::new(WriteKind::Inc, Some(l), vec![p.clone()]);
         rec.n = Some(n);
         rec.generation = generation;
         Some(self.finish(st, rec))
@@ -406,25 +402,22 @@ impl Writer {
     /// The register write an increment of a double base turns into: the model
     /// rewrites `op, arg = "set", cur + arg` and then runs the set path, whose
     /// "unchanged value" check has already been passed.
-    fn write_reg_unchecked(&mut self, p: &str, v: Value, skew: u64) -> Option<Written> {
+    fn write_reg_unchecked(&mut self, p: &Path, v: Value, skew: u64) -> Option<Written> {
         let st = self.tick(skew);
         self.state.vv.insert(st.writer, st.hlc);
         let l = self.write_life();
         self.setreg(p, v.clone(), st);
-        let mut rec = WriteRecord::new(WriteKind::Reg, l, vec![p.to_string()]);
-        rec.vals.insert(p.to_string(), v);
+        let mut rec = WriteRecord::new(WriteKind::Reg, l, vec![p.clone()]);
+        rec.vals.insert(p.clone(), v);
         Some(self.finish(st, rec))
     }
 
     /// Replace the whole document: changed fields are set, absent ones unset.
-    pub fn write_replace(&mut self, doc: &[(&str, Value)], skew: u64) -> Option<Written> {
+    pub fn write_replace(&mut self, doc: &[(Path, Value)], skew: u64) -> Option<Written> {
         let vis = self.visible()?;
-        let changes: Vec<(&str, &Value)> = doc
-            .iter()
-            .filter(|(q, v)| !Value::same(vis.get(*q), v))
-            .map(|(q, v)| (*q, v))
-            .collect();
-        let drops: Vec<&String> = vis.keys().filter(|q| !doc.iter().any(|(d, _)| d == q)).collect();
+        let changes: Vec<(&Path, &Value)> =
+            doc.iter().filter(|(q, v)| !Value::same(vis.get(q), v)).map(|(q, v)| (q, v)).collect();
+        let drops: Vec<&Path> = vis.keys().filter(|q| !doc.iter().any(|(d, _)| d == *q)).collect();
         if changes.is_empty() && drops.is_empty() {
             return None;
         }
@@ -435,8 +428,8 @@ impl Writer {
         let mut vals = BTreeMap::new();
         for (q, v) in changes {
             self.setreg(q, v.clone(), st);
-            paths.push(q.to_string());
-            vals.insert(q.to_string(), v.clone());
+            paths.push(q.clone());
+            vals.insert(q.clone(), v.clone());
         }
         for q in drops {
             self.setreg(q, Value::Null, st);

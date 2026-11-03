@@ -5,10 +5,10 @@
 use kimmy_core::merge_state::{LossKey, LossKind, MStamp, Value};
 
 use crate::oracle::{self, Log};
-use crate::sim::{Cfg, Node, fixpoint, pull};
+use crate::sim::{Cfg, Node, fixpoint, p, pull};
 
 fn key(kind: LossKind, path: &str, stamp: MStamp) -> LossKey {
-    LossKey { kind, path: path.to_string(), stamp }
+    LossKey { kind, path: p(path), stamp }
 }
 
 /// The oracle's `alive` and `dels` for a finished log.

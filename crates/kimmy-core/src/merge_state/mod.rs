@@ -3,7 +3,7 @@
 //!
 //! This is a port of the reviewed reference model (`model5.py` and the
 //! `Node.finish` normalisation of `pullmodel5.py`). It is pure: no I/O, no
-//! async, no global state. Field paths are flat strings. Nothing here is wired
+//! async, no global state. Field paths are segment lists ([`Path`]), opaque keys at this stage. Nothing here is wired
 //! into storage, the API or the oplog.
 //!
 //! The pieces:
@@ -44,7 +44,7 @@ mod tests;
 pub use codec::DecodeError;
 pub use join::{InvalidIntBound, JoinOptions, join};
 pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-pub use types::{Epoch, LossKey, LossKind, LossValue, MStamp, Value, WriterId};
+pub use types::{Epoch, InvalidPath, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 pub use writer::{Received, WriteKind, WriteRecord, Writer, Written};
 
 // Production signatures. These items compile in EVERY build (with and without the
@@ -56,46 +56,49 @@ pub use writer::{Received, WriteKind, WriteRecord, Writer, Written};
 const _: () = {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, BTreeSet};
+    let _: fn(&str) -> Result<Path, InvalidPath> = Path::flat;
+    let _: fn(&Path) -> &[String] = Path::segments;
+    let _: fn() -> Path = Path::whole_document;
     let _: fn(&MergeState, &MergeState, &JoinOptions) -> (MergeState, BTreeSet<LossKey>) = join;
     let _: fn(u64, i64) -> Result<JoinOptions, InvalidIntBound> = JoinOptions::new;
     let _: fn(&mut JoinOptions, i64) -> Result<(), InvalidIntBound> = JoinOptions::set_int_bound;
     let _: fn(&JoinOptions) -> i64 = JoinOptions::int_bound;
-    let _: for<'a> fn(&'a MergeState, &str, &JoinOptions) -> Option<Cow<'a, Gen>> =
+    let _: for<'a> fn(&'a MergeState, &Path, &JoinOptions) -> Option<Cow<'a, Gen>> =
         MergeState::gen_of;
-    let _: for<'a> fn(&'a MergeState, &str, &JoinOptions) -> Option<&'a Reg> = MergeState::winner;
-    let _: for<'a> fn(&'a MergeState, &str, &JoinOptions) -> BTreeMap<ObsKey, &'a Slot> =
+    let _: for<'a> fn(&'a MergeState, &Path, &JoinOptions) -> Option<&'a Reg> = MergeState::winner;
+    let _: for<'a> fn(&'a MergeState, &Path, &JoinOptions) -> BTreeMap<ObsKey, &'a Slot> =
         MergeState::counted;
-    let _: fn(&MergeState, &str, &JoinOptions) -> i128 = MergeState::hidden;
-    let _: fn(&MergeState, &JoinOptions) -> BTreeMap<String, i128> = MergeState::hidden_all;
-    let _: fn(&MergeState, &str, &JoinOptions) -> Option<Value> = MergeState::value;
-    let _: fn(&MergeState, &JoinOptions) -> Option<BTreeMap<String, Value>> = MergeState::visible;
+    let _: fn(&MergeState, &Path, &JoinOptions) -> i128 = MergeState::hidden;
+    let _: fn(&MergeState, &JoinOptions) -> BTreeMap<Path, i128> = MergeState::hidden_all;
+    let _: fn(&MergeState, &Path, &JoinOptions) -> Option<Value> = MergeState::value;
+    let _: fn(&MergeState, &JoinOptions) -> Option<BTreeMap<Path, Value>> = MergeState::visible;
     let _: fn(&MergeState, &JoinOptions) -> Vec<MStamp> = MergeState::alive;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::canonical_bytes;
     let _: fn(&MergeState) -> [u8; 16] = MergeState::state_hash;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::encode;
     let _: fn(&[u8]) -> Result<MergeState, DecodeError> = MergeState::decode;
-    let _: fn(&mut Writer, &[(&str, Value)], u64) -> Option<Written> = Writer::insert;
-    let _: fn(&mut Writer, &str, i64, u64) -> Option<Written> = Writer::upsert_inc;
-    let _: fn(&mut Writer, &[(&str, Value)], &str, &[(&str, Value)], u64) -> Option<Written> =
+    let _: fn(&mut Writer, &[(Path, Value)], u64) -> Option<Written> = Writer::insert;
+    let _: fn(&mut Writer, &Path, i64, u64) -> Option<Written> = Writer::upsert_inc;
+    let _: fn(&mut Writer, &[(Path, Value)], &Path, &[(Path, Value)], u64) -> Option<Written> =
         Writer::upsert_soi_create;
-    let _: fn(&mut Writer, MStamp, &str, i64, u64) -> Option<Written> = Writer::upsert_inc_on;
+    let _: fn(&mut Writer, MStamp, &Path, i64, u64) -> Option<Written> = Writer::upsert_inc_on;
     let _: fn(
         &mut Writer,
-        &[(&str, Value)],
-        &str,
+        &[(Path, Value)],
+        &Path,
         i64,
-        &[(&str, Value)],
+        &[(Path, Value)],
         u64,
     ) -> Option<(Written, Written)> = Writer::upsert_soi;
-    let _: fn(&mut Writer, &str, Value, u64) -> Option<Written> = Writer::write_set;
-    let _: fn(&mut Writer, &str, u64) -> Option<Written> = Writer::write_unset;
-    let _: fn(&mut Writer, &str, i64, u64) -> Option<Written> = Writer::write_inc;
-    let _: fn(&mut Writer, &[(&str, Value)], u64) -> Option<Written> = Writer::write_replace;
+    let _: fn(&mut Writer, &Path, Value, u64) -> Option<Written> = Writer::write_set;
+    let _: fn(&mut Writer, &Path, u64) -> Option<Written> = Writer::write_unset;
+    let _: fn(&mut Writer, &Path, i64, u64) -> Option<Written> = Writer::write_inc;
+    let _: fn(&mut Writer, &[(Path, Value)], u64) -> Option<Written> = Writer::write_replace;
     let _: fn(&mut Writer, u64) -> Option<Written> = Writer::write_delete;
     let _: fn(&mut Writer, &MergeState) -> Received = Writer::receive_report;
     let _: fn(&mut Writer, &MergeState) -> Vec<LossKey> = Writer::receive;
     let _: fn(&mut Writer, LossKey, LossValue) -> bool = Writer::receive_loss;
-    let _: fn(&Writer) -> Option<BTreeMap<String, Value>> = Writer::visible;
-    let _: fn(&Writer) -> BTreeMap<String, i128> = Writer::hidden_all;
+    let _: fn(&Writer) -> Option<BTreeMap<Path, Value>> = Writer::visible;
+    let _: fn(&Writer) -> BTreeMap<Path, i128> = Writer::hidden_all;
 };
