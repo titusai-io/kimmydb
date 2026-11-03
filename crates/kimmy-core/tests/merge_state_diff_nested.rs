@@ -41,8 +41,8 @@ use std::process::Command;
 
 use kimmy_core::ids::NodeId;
 use kimmy_core::merge_state::{
-    Epoch, JoinOptions, LifeKind, LossKey, LossKind, LossValue, MStamp, MergeState, Num,
-    Path, Value, Writer, WriterId, Written,
+    Epoch, JoinOptions, LifeKind, LossKey, LossKind, LossValue, MStamp, MergeState, Num, Path,
+    Value, Writer, WriterId, Written,
 };
 use serde_json::{Value as J, json};
 
@@ -90,7 +90,13 @@ fn jk(k: &LossKey) -> J {
 /// Loss keys in the generator's order: kind name, field, stamp.
 fn sort_keys(mut v: Vec<LossKey>) -> Vec<LossKey> {
     v.sort_by_key(|k| {
-        (kind_s(k.kind), k.at.to_string(), k.stamp.hlc.wall_ms, node_of(&k.stamp), epoch_of(&k.stamp))
+        (
+            kind_s(k.kind),
+            k.at.to_string(),
+            k.stamp.hlc.wall_ms,
+            node_of(&k.stamp),
+            epoch_of(&k.stamp),
+        )
     });
     v
 }
@@ -194,7 +200,8 @@ fn digest_lines(s: &MergeState) -> Vec<String> {
         out.push(format!("dead {}", fs(l)));
     }
     for (d, vv) in &s.deletes {
-        let mut v: Vec<String> = vv.iter().map(|(w, h)| format!("{}={}", fw(w), h.wall_ms)).collect();
+        let mut v: Vec<String> =
+            vv.iter().map(|(w, h)| format!("{}={}", fw(w), h.wall_ms)).collect();
         v.sort();
         out.push(format!("del {} vv[{}]", fs(d), v.join(",")));
     }
@@ -320,9 +327,8 @@ fn explain(sc: &J, i: usize, k: usize, rust: &[String]) -> String {
         return String::new();
     }
     let seed = sc["seed"].as_u64().unwrap().to_string();
-    let out = python(&["--explain".into(), seed, i.to_string()])
-        .wait_with_output()
-        .expect("python3 ran");
+    let out =
+        python(&["--explain".into(), seed, i.to_string()]).wait_with_output().expect("python3 ran");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut members = text.split("== member ").skip(1);
     let py: Vec<&str> = members.nth(k).map_or(Vec::new(), |m| m.lines().skip(1).collect());
@@ -391,9 +397,8 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
                 opt_stamp_j(ms[m(1)].logged(r, &mut log))
             }
             "unset" => {
-                let r = ms[m(1)]
-                    .w
-                    .write_unset(&pth(op[2].as_str().unwrap()), op[3].as_u64().unwrap());
+                let r =
+                    ms[m(1)].w.write_unset(&pth(op[2].as_str().unwrap()), op[3].as_u64().unwrap());
                 opt_stamp_j(ms[m(1)].logged(r, &mut log))
             }
             "delete" => {
@@ -464,10 +469,7 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
     let got = snap(&ms);
     if J::Array(got.clone()) != fin["after"] {
         let k = (0..nm).find(|k| got[*k] != fin["after"][*k]).unwrap();
-        rep.bad.push(format!(
-            "final sync, member {k}: rust {} python {}",
-            got[k], fin["after"][k]
-        ));
+        rep.bad.push(format!("final sync, member {k}: rust {} python {}", got[k], fin["after"][k]));
         return rep;
     }
     // the oracles: the harness's Rust port on the Rust log, against the model's on the Python log

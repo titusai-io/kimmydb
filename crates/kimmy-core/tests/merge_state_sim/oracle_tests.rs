@@ -130,9 +130,7 @@ fn scalar_against_a_deep_write(b_newer: bool) -> (Log, Vec<Node>, MStamp, MStamp
     let cfg = Cfg::default_ret();
     let mut log = Log::new();
     let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
-    ms[0]
-        .insert(&[("a", sub(&[("d", sub(&[("e", Value::Int64(1))]))]))], &mut log, 0)
-        .unwrap();
+    ms[0].insert(&[("a", sub(&[("d", sub(&[("e", Value::Int64(1))]))]))], &mut log, 0).unwrap();
     pull(&mut ms, 1, 0, None);
     pull(&mut ms, 2, 0, None);
     let (skew_b, skew_c) = if b_newer { (4, 0) } else { (0, 4) };

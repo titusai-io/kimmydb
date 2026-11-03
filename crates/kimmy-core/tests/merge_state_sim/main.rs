@@ -7,6 +7,12 @@
 //! runner FAILS if a probe fails, any random, sequential, horizon or bounded run
 //! reports a problem, or a mutant survives (section 17 / V5m3).
 //!
+//! The workload mixes in nested writes (`$set` and `$unset` at any depth, sub-documents,
+//! replaces, arrays, writes below a scalar), the oracle is recursive (the type rule of D4 at
+//! every depth), and every write's leaf effects are checked against it. The companion
+//! differential test `merge_state_diff_nested` replays scripts of the vendored stage A model.
+//! Each mutant is reported with the problems that killed it.
+//!
 //! The PRNG is a seeded xorshift, so the exact counts differ from the Python
 //! model's; what must hold is 0 problems for the design and every mutant killed.
 
