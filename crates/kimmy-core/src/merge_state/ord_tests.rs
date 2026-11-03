@@ -1014,6 +1014,13 @@ fn the_join_laws_hold_on_the_order_entries_of_the_models_runs() {
     let j: J = serde_json::from_str(JOIN_LAWS).unwrap();
     assert_eq!(j["model6_sha256"], MODEL6_SHA256);
     let pool: Vec<FieldOrd> = j["ords"].as_array().unwrap().iter().map(field_ord).collect();
+    // every entry of the model's runs satisfies the reachability clauses decode checks, at the key
+    // kind it was under (the root of a replace, or a path)
+    for (x, raw) in pool.iter().zip(j["ords"].as_array().unwrap()) {
+        let at =
+            if raw["root"] == true { OrdAt::Root } else { OrdAt::Field(Path::flat("f").unwrap()) };
+        assert_eq!(x.shape_error(&at), None, "{x:?}");
+    }
     let o = JoinOptions::default();
     let (mut keys, mut several, mut pairs, mut triples, mut mixed) = (0, 0, 0, 0, 0);
     let (mut u_bit, mut u_clear, mut r_floor, mut no_floor, mut with_lvl, mut with_prev) =
@@ -1097,7 +1104,7 @@ fn the_join_laws_hold_on_the_order_entries_of_the_models_runs() {
 /// fields), receive each other's whole states at random and take a snapshot after every step, as
 /// the model's oplog entries are. The states are reachable (every order entry is the work of the
 /// feed on the writer's own state and of joins), which is what the laws are claimed for.
-fn ord_sim(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+pub(super) fn ord_sim(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let ids = [w(b'A'), w(b'B'), w(b'C')];
     let life = MStamp { hlc: Hlc::new(1, 0), writer: ids[0] };

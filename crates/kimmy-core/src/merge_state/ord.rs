@@ -45,6 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::codec::DecodeError;
 use super::join::JoinOptions;
 use super::state::MergeState;
 use super::types::{Epoch, MStamp, Path, Value, WriterId};
@@ -139,6 +140,53 @@ impl FieldOrd {
     /// cannot void to nothing: voiding needs a floor, and the floor stays.)
     pub fn is_empty(&self) -> bool {
         self.floor.is_none() && self.firsts.is_empty() && self.last.is_none() && self.lvl.is_none()
+    }
+
+    /// The first clause of the reachability invariant (see `MergeState::check_decoded`, items 15 to
+    /// 20) that this entry breaks, judged from the entry alone and the key it is under; `None` when
+    /// it breaks none. Every clause is one a causal history cannot break, and none changes what the
+    /// join does: they are what makes an entry look like the work of the feed.
+    pub fn shape_error(&self, at: &OrdAt) -> Option<DecodeError> {
+        // the root of a replace keeps a level mark and nothing else
+        if *at == OrdAt::Root
+            && (self.floor.is_some() || !self.firsts.is_empty() || self.last.is_some())
+        {
+            return Some(DecodeError::OrdRootNotALevel);
+        }
+        // a writer's first is a write of that writer
+        if self.firsts.iter().any(|(w, c)| c.0.writer != *w) {
+            return Some(DecodeError::OrdFirstNotByItsWriter);
+        }
+        // an unsetter knew only what is below its own stamp
+        if let Some(Floor::U { stamp, prev, .. }) = self.floor
+            && prev >= stamp.hlc
+        {
+            return Some(DecodeError::OrdPrevNotBelowStamp);
+        }
+        // `last` is the newest write the entry knows: a standing first is never after it, and
+        // is never without it (what voids `last` voids every earlier first)
+        if !self.firsts.is_empty()
+            && self.last.is_none_or(|l| self.firsts.values().any(|c| c.0 > l.0))
+        {
+            return Some(DecodeError::OrdLastBehindAFirst);
+        }
+        // one write names a path once, so it has one position there
+        let mut seen: BTreeMap<MStamp, u64> = BTreeMap::new();
+        for c in self.firsts.values().copied().chain(self.last) {
+            if *seen.entry(c.0).or_insert(c.1) != c.1 {
+                return Some(DecodeError::OrdPositionsDisagree);
+            }
+        }
+        // a standing level mark at a path is a document-valued write there, which also named the
+        // path as a candidate: `last` is at or after it (the root has no candidates)
+        if let Some(l) = self.lvl
+            && *at != OrdAt::Root
+            && valid_under(&self.floor, &(l, 0), false)
+            && self.last.is_none_or(|c| c.0 < l)
+        {
+            return Some(DecodeError::OrdLevelWithoutLast);
+        }
+        None
     }
 
     /// Is `c` a candidate this entry's floor lets stand?

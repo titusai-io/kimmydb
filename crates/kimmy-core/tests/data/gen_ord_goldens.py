@@ -526,7 +526,8 @@ def join_law_fixture():
                     bad += 1
             idx = []
             for o in os_:
-                key = json.dumps(j_ord(o), sort_keys=True)
+                # the key kind is part of the entry: the root of a replace keeps a level mark and nothing else
+                key = json.dumps({**j_ord(o), "root": k[1] == ""}, sort_keys=True)
                 idx.append(pool.setdefault(key, len(pool)))
             per_path.append(idx)
     assert bad == 0

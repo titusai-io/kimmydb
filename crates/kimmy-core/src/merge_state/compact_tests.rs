@@ -935,7 +935,7 @@ use super::prop_tests::{nested_ord_pools, ord_pools};
 
 /// The encodings that carry an order state, for the damage fuzz: the writer entries of the
 /// reference model's scenarios and every fifth state of pooled runs with the order state fed.
-fn ord_corpus() -> Vec<Vec<u8>> {
+pub(super) fn ord_corpus() -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let g = goldens();
     for sc in g["scenarios"].as_object().unwrap().values() {
@@ -1009,23 +1009,22 @@ fn an_order_state_is_section_ten_after_the_losses() {
     assert_eq!(&e[..4], b"QMS\x02");
     assert!(h.0.starts_with(&e) && h.0.len() > e.len());
     // the root, a replace floor, no firsts, no last and no lvl: the shortest entry
-    let r = with_ords(&[(
-        (1, OrdAt::Root),
-        FieldOrd { floor: Some(Floor::R { stamp: st(5, a) }), ..FieldOrd::default() },
-    )]);
+    let r =
+        with_ords(&[((1, OrdAt::Root), FieldOrd { lvl: Some(st(5, a)), ..FieldOrd::default() })]);
     let mut h = Hand::new(&[a], &[(1, 0)]);
     h.n(1).n(0).n(0).n(0).n(1).n(0).n(0).n(0).n(0).n(1).n(0).hlc(5).n(0);
     h.n(1).n(0).n(0); // section 10: one entry, life 0, the root (a segment count of 0)
-    h.n(2).hlc(5).n(0); // the floor: r at (5, A), no bit and no prev
-    h.n(0).n(0); // no firsts, no last and no lvl
+    h.n(0).n(0); // no floor, no firsts
+    h.n(2).hlc(5).n(0); // no last, a lvl at (5, A)
     assert_eq!(r.encode_compact(), h.0);
     assert_eq!(MergeState::decode_compact(&h.0), Ok(r));
     // entries come in the key order of the map: the root before the paths, a path by its segments
     let level = FieldOrd { lvl: Some(st(2, a)), ..FieldOrd::default() };
+    let wrote = FieldOrd { last: Some((st(2, a), 0)), ..FieldOrd::default() };
     let both = with_ords(&[
-        ((1, OrdAt::Field(p("b"))), level.clone()),
-        ((1, OrdAt::Root), level.clone()),
-        ((1, OrdAt::Field(p("a"))), level),
+        ((1, OrdAt::Field(p("b"))), wrote.clone()),
+        ((1, OrdAt::Root), level),
+        ((1, OrdAt::Field(p("a"))), wrote),
     ]);
     round_trip(&both);
 }
@@ -1137,7 +1136,10 @@ fn section_ten_is_decoded_strictly() {
     let firsts = |w1: usize, w2: usize| {
         body(2, true, true, 5, &|h| {
             h.n(1).n(0).n(1).n(1).raw(b"x").n(0).n(2);
-            h.n(w1).hlc(5).n(0).n(0).n(w2).hlc(5).n(0).n(0).n(0);
+            // two firsts, each under a stamp of its writer (the key), at position 0; a last at
+            // (5, B) at position 0
+            h.n(w1).hlc(5).n(w1).n(0).n(w2).hlc(5).n(w2).n(0);
+            h.n(1).hlc(5).n(1).n(0);
         })
     };
     assert!(MergeState::decode_compact(&firsts(0, 1)).is_ok());
@@ -1171,7 +1173,7 @@ fn section_ten_is_decoded_strictly() {
             h.n(1).n(0).n(1).n(1).raw(b"x");
             h.n(1).hlc(2).n(0).hlc(0); // a `u` floor at (2, A)
             h.n(1).n(0).hlc(at).n(0).n(0); // one first at (at, A)
-            h.n(0);
+            h.n(1).hlc(at).n(0).n(0); // and the last, the same write
         })
     };
     assert_eq!(MergeState::decode_compact(&voided(2)), Err(DecodeError::OrdNotNormal));
@@ -1279,4 +1281,122 @@ fn the_models_scenario_states_round_trip_in_the_compact_form() {
         }
     }
     assert!(n > 90 && with_ords * 10 > n * 9, "{n} states, {with_ords} with an order state");
+}
+
+/// One order entry by hand under the life `(1, A)`, writers A and B, a version vector at 9 for both:
+/// `parts` spell the entry after its key (floor byte and parts, firsts, flags, last, lvl).
+fn one_entry(root: bool, parts: &dyn Fn(&mut Hand)) -> Vec<u8> {
+    let mut h = Hand::new(&[wid(b'A', 0), wid(b'B', 0)], &[(1, 0)]);
+    h.n(1).n(0).n(0).n(0).n(1); // lives: the life, nothing seen, no field order, an upsert
+    h.n(0).n(0).n(0).n(0); // dead, deletes, regs, slots
+    h.n(2).n(0).hlc(9).n(1).hlc(9); // the version vector
+    h.n(0); // losses
+    h.n(1).n(0); // section 10: one entry, life 0
+    if root {
+        h.n(0);
+    } else {
+        h.n(1).n(1).raw(b"x");
+    }
+    parts(&mut h);
+    h.0
+}
+
+/// The clauses of the reachability invariant that one state can show (items 15 to 20 of the
+/// inventory of `check_decoded`), refused with the bytes spelled out. Each refused entry is next
+/// to the nearest entry that is accepted.
+#[test]
+fn an_entry_no_history_makes_is_refused_by_the_clauses_one_state_can_show() {
+    let dec = |b: &[u8]| MergeState::decode_compact(b).map(|_| ());
+    // 15: a first under the key B with a stamp of A
+    let first = |key: usize, by: usize| {
+        one_entry(false, &|h| {
+            h.n(0).n(1).n(key).hlc(5).n(by).n(0); // no floor; one first: writer key, stamp (5, by), position 0
+            h.n(1).hlc(5).n(by).n(0); // last: the same write
+        })
+    };
+    assert_eq!(dec(&first(0, 0)), Ok(()));
+    assert_eq!(dec(&first(1, 1)), Ok(()));
+    assert_eq!(dec(&first(1, 0)), Err(DecodeError::OrdFirstNotByItsWriter));
+    assert_eq!(dec(&first(0, 1)), Err(DecodeError::OrdFirstNotByItsWriter));
+    // 16: a first with no last, a last before a first
+    let last = |last: Option<u64>| {
+        one_entry(false, &|h| {
+            h.n(0).n(1).n(0).hlc(5).n(0).n(0); // a first at (5, A)
+            match last {
+                None => h.n(0),
+                Some(w) => h.n(1).hlc(w).n(0).n(0),
+            };
+        })
+    };
+    assert_eq!(dec(&last(Some(5))), Ok(()));
+    assert_eq!(dec(&last(Some(6))), Ok(()));
+    assert_eq!(dec(&last(Some(4))), Err(DecodeError::OrdLastBehindAFirst));
+    assert_eq!(dec(&last(None)), Err(DecodeError::OrdLastBehindAFirst));
+    // 17: a `u` floor at (5, A) remembering an HLC that is not below 5
+    let prev = |prev: u64, bit: u8| {
+        one_entry(false, &|h| {
+            h.n(bit as usize).hlc(5).n(0).hlc(prev).n(0).n(0); // floor u (1, or 3 with the bit), no firsts, no flags
+        })
+    };
+    for bit in [1u8, 3] {
+        assert_eq!(dec(&prev(4, bit)), Ok(()));
+        assert_eq!(dec(&prev(5, bit)), Err(DecodeError::OrdPrevNotBelowStamp));
+        assert_eq!(dec(&prev(6, bit)), Err(DecodeError::OrdPrevNotBelowStamp));
+    }
+    // 18: the root keeps a level mark and nothing else
+    let root = |what: &str| {
+        one_entry(true, &|h| match what {
+            "lvl" => {
+                h.n(0).n(0).n(2).hlc(5).n(0);
+            }
+            "floor" => {
+                h.n(2).hlc(5).n(0).n(0).n(0);
+            }
+            "last" => {
+                h.n(0).n(0).n(1).hlc(5).n(0).n(0);
+            }
+            _ => {
+                h.n(0).n(1).n(0).hlc(5).n(0).n(0).n(3).hlc(5).n(0).n(0).hlc(5).n(0);
+            }
+        })
+    };
+    assert_eq!(dec(&root("lvl")), Ok(()));
+    for what in ["floor", "last", "first"] {
+        assert_eq!(dec(&root(what)), Err(DecodeError::OrdRootNotALevel), "{what}");
+    }
+    // 19: a first and the last of one write at two positions
+    let pos = |last_pos: usize| {
+        one_entry(false, &|h| {
+            h.n(0).n(1).n(0).hlc(5).n(0).n(0); // a first at (5, A), position 0
+            h.n(1).hlc(5).n(0).n(last_pos); // the last of the same write
+        })
+    };
+    assert_eq!(dec(&pos(0)), Ok(()));
+    assert_eq!(dec(&pos(1)), Err(DecodeError::OrdPositionsDisagree));
+    // 20: a level mark that stands (no floor over it) and no last at or after it; one that a floor
+    // voids needs none
+    let lvl = |floor: Option<u64>, last: Option<u64>| {
+        one_entry(false, &|h| {
+            match floor {
+                None => h.n(0),
+                Some(w) => h.n(2).hlc(w).n(1),
+            };
+            h.n(0); // no firsts
+            h.n(2 | usize::from(last.is_some()));
+            if let Some(w) = last {
+                h.hlc(w).n(0).n(0);
+            }
+            h.hlc(5).n(0); // lvl at (5, A)
+        })
+    };
+    assert_eq!(dec(&lvl(None, Some(5))), Ok(()));
+    assert_eq!(dec(&lvl(None, Some(7))), Ok(()));
+    assert_eq!(dec(&lvl(None, None)), Err(DecodeError::OrdLevelWithoutLast));
+    assert_eq!(dec(&lvl(None, Some(4))), Err(DecodeError::OrdLevelWithoutLast));
+    assert_eq!(dec(&lvl(Some(6), None)), Ok(()), "a floor over the mark voids it");
+    assert_eq!(
+        dec(&lvl(Some(5), None)),
+        Ok(()),
+        "a replace floor at (5, B) is above the mark at (5, A)"
+    );
 }
