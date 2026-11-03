@@ -14,10 +14,10 @@ use super::*;
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
@@ -25,24 +25,24 @@ impl Rng {
         self.0 = x;
         x
     }
-    fn below(&mut self, n: usize) -> usize {
+    pub(super) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+    pub(super) fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
         &xs[self.below(xs.len())]
     }
 }
 
 /// A one-segment path.
-fn p(x: &str) -> Path {
+pub(super) fn p(x: &str) -> Path {
     Path::flat(x).unwrap()
 }
 /// The fields of a flat document as paths.
-fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
+pub(super) fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
     f.iter().map(|(k, v)| (p(k), v.clone())).collect()
 }
 
-fn opts(ret: u64) -> JoinOptions {
+pub(super) fn opts(ret: u64) -> JoinOptions {
     JoinOptions::new(ret, i64::MAX).unwrap()
 }
 
@@ -88,7 +88,7 @@ fn pool_fields<'a>(rng: &mut Rng, names: &[&'a str]) -> Vec<(&'a str, Value)> {
 }
 
 /// One random run; returns every state any writer held along the way.
-fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let n = 3 + rng.below(2);
     let mut ws: Vec<Writer> = (0..n)
@@ -172,7 +172,7 @@ fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
     pool
 }
 
-fn pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+pub(super) fn pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
     (1..=seeds).map(|s| run(s, steps, o)).collect()
 }
 
@@ -453,6 +453,46 @@ fn mutants_change_the_outcome() {
     assert_ne!(no_sup.0, good.0);
 }
 
+/// The encodings the decode fuzz damages: every fifth state of the pools of 24 runs.
+pub(super) fn fuzz_corpus(o: &JoinOptions) -> Vec<Vec<u8>> {
+    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    for pool in pools(24, 24, o) {
+        for st in pool.iter().step_by(5) {
+            corpus.push(st.encode());
+        }
+    }
+    corpus
+}
+
+/// One damaged input: an encoding of the corpus with one to four bit flips, byte sets,
+/// truncations, insertions, deletions or rewritten length fields.
+pub(super) fn fuzz_mutate(rng: &mut Rng, corpus: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = corpus[rng.below(corpus.len())].clone();
+    for _ in 0..1 + rng.below(4) {
+        let i = rng.below(b.len().max(1));
+        match rng.below(6) {
+            0 => b[i] ^= 1 << rng.below(8),
+            1 => b[i] = *rng.pick(&[0u8, 1, 2, 3, 0xff]),
+            2 => b.truncate(i),
+            3 => b.insert(i, rng.next() as u8),
+            4 if i + 8 <= b.len() => {
+                // rewrite something that may be a u64 length
+                let v = *rng.pick(&[0u64, 1, 2, 3, u64::MAX, (b.len() - i) as u64]);
+                b[i..i + 8].copy_from_slice(&v.to_be_bytes());
+            }
+            _ => {
+                if i < b.len() {
+                    b.remove(i);
+                }
+            }
+        }
+        if b.is_empty() {
+            break;
+        }
+    }
+    b
+}
+
 /// Mutation fuzz of `decode` (default 20,000 inputs; `Q7_DECODE_FUZZ=<n>` overrides): the
 /// encodings of states the writers build, damaged by bit flips, byte sets, truncations,
 /// insertions, deletions and rewritten length fields. `decode` must never panic; an accepted
@@ -463,38 +503,11 @@ fn decode_mutation_fuzz() {
     let n: u64 =
         std::env::var("Q7_DECODE_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
     let o = opts(1_000_000_000);
-    let mut corpus: Vec<Vec<u8>> = Vec::new();
-    for pool in pools(24, 24, &o) {
-        for st in pool.iter().step_by(5) {
-            corpus.push(st.encode());
-        }
-    }
+    let corpus = fuzz_corpus(&o);
     let mut rng = Rng(0x00C0_FFEE_D00D_5EED);
     let (mut accepted, mut refused) = (0u64, 0u64);
     for k in 0..n {
-        let mut b = corpus[rng.below(corpus.len())].clone();
-        for _ in 0..1 + rng.below(4) {
-            let i = rng.below(b.len().max(1));
-            match rng.below(6) {
-                0 => b[i] ^= 1 << rng.below(8),
-                1 => b[i] = *rng.pick(&[0u8, 1, 2, 3, 0xff]),
-                2 => b.truncate(i),
-                3 => b.insert(i, rng.next() as u8),
-                4 if i + 8 <= b.len() => {
-                    // rewrite something that may be a u64 length
-                    let v = *rng.pick(&[0u64, 1, 2, 3, u64::MAX, (b.len() - i) as u64]);
-                    b[i..i + 8].copy_from_slice(&v.to_be_bytes());
-                }
-                _ => {
-                    if i < b.len() {
-                        b.remove(i);
-                    }
-                }
-            }
-            if b.is_empty() {
-                break;
-            }
-        }
+        let b = fuzz_mutate(&mut rng, &corpus);
         let input = b.clone();
         let verdict = std::panic::catch_unwind(move || match MergeState::decode(&b) {
             Err(_) => false,
@@ -521,7 +534,7 @@ fn decode_mutation_fuzz() {
     assert!(accepted > 0 && refused > 0, "the fuzz should reach both outcomes");
 }
 
-fn o_default() -> JoinOptions {
+pub(super) fn o_default() -> JoinOptions {
     opts(1_000_000_000)
 }
 
@@ -556,7 +569,7 @@ fn nested_value(rng: &mut Rng, depth: usize) -> Value {
 
 /// Like [`run`], but over nested documents: sub-documents set and replaced, scalars and arrays
 /// written over maps and the reverse, nested counters, unsets of whole sub-documents.
-fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let n = 3 + rng.below(2);
     let mut ws: Vec<Writer> = (0..n)
@@ -626,7 +639,7 @@ fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
     pool
 }
 
-fn nested_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+pub(super) fn nested_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
     (1..=seeds).map(|s| run_nested(s, steps, o)).collect()
 }
 
@@ -772,7 +785,7 @@ fn amount(rng: &mut Rng) -> Value {
 }
 
 /// Three writers on the counters `x` and `y`, whose bases and increments are of every type.
-fn run_counters(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+pub(super) fn run_counters(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut ws: Vec<Writer> = (0..3)
         .map(|k| {
