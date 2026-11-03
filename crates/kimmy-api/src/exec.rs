@@ -1395,6 +1395,7 @@ pub fn update(
         expected,
         answer: None,
         failures: Default::default(),
+        keys: Modify::keys_for(state, &candidates),
     };
     // A scan's candidates, and a multikey range's fallback, are the whole
     // collection walked in the write transaction: off the async worker
@@ -1544,6 +1545,22 @@ struct Modify<'a> {
     /// size limit (`ValueTooLarge`) reaches the client as the `413` it is, as on
     /// an aggregate, and not as the `400` of the string it travelled in.
     failures: std::sync::Mutex<Vec<(String, kimmy_core::Error)>>,
+    /// Where the keys the engine gathers from an index range are charged: `Some` for a plan
+    /// that is an index range, and `None` for every other (a scan, an `_id` lookup), which
+    /// gather none and never touch the pool. Owned by the spec, so the lease it makes is
+    /// given back when the request's spec is dropped, whichever way the request ends.
+    keys: Option<IndexKeys<'a>>,
+}
+
+impl<'a> Modify<'a> {
+    /// The hold for the keys `candidates` gathers.
+    fn keys_for(
+        state: &'a SharedState,
+        candidates: &kimmy_storage::Candidates,
+    ) -> Option<IndexKeys<'a>> {
+        matches!(candidates, kimmy_storage::Candidates::Index { .. })
+            .then(|| IndexKeys::of_a_write(state.aggregate_memory()))
+    }
 }
 
 impl Modify<'_> {
@@ -1630,6 +1647,10 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         let mut held = self.failures.lock().ok()?;
         let at = held.iter().position(|(text, _)| text == reported)?;
         Some(held.remove(at).1)
+    }
+
+    fn key_hold(&self) -> Option<&dyn kimmy_storage::KeyHold> {
+        self.keys.as_ref().map(|keys| keys as &dyn kimmy_storage::KeyHold)
     }
 }
 
@@ -1785,6 +1806,7 @@ pub fn find_and_modify(
         expected,
         answer: positional.map(|p| (p, spec.return_document)),
         failures,
+        keys: Modify::keys_for(state, &candidates),
     };
 
     // The last look before the transaction: an upsert on a primary key that is not there
@@ -1889,6 +1911,7 @@ pub fn delete(
         expected,
         answer: None,
         failures: Default::default(),
+        keys: Modify::keys_for(state, &candidates),
     };
     // A scan's candidates, and a multikey range's fallback, are the whole
     // collection walked in the write transaction: off the async worker
@@ -2555,18 +2578,24 @@ struct IndexKeys<'a> {
     held: std::cell::Cell<usize>,
     /// How many keys are held now.
     keys: std::cell::Cell<usize>,
+    /// Whether the lease stays at the most the request has held, and is charged for a
+    /// growth past it only, instead of being charged for each key and given back when the
+    /// keys are (a write that gathers its range again for each chunk, see
+    /// [`IndexKeys::of_a_write`]).
+    keep: bool,
 }
 
 /// The lease the keys are charged to.
 enum Account<'a> {
     Open(Lease),
     /// No lease yet: the keys held are not charged until there are more than `free` of them,
-    /// and then the lease is made, from `memory`, and charged for all of them. A read whose
-    /// keys stay within what its page may hold, or that holds none (every path of a `find` but
-    /// one), has no lease, no budget and no pool to touch.
+    /// and then the lease is made, by `lease` from `memory`, and charged for all of them. A
+    /// read whose keys stay within what its page may hold, or that holds none (every path of a
+    /// `find` but one), has no lease, no budget and no pool to touch.
     Later {
         memory: &'a crate::limits::AggregateMemory,
         free: usize,
+        lease: fn(&crate::limits::AggregateMemory) -> Lease,
     },
 }
 
@@ -2576,6 +2605,7 @@ impl<'a> IndexKeys<'a> {
             account: std::cell::RefCell::new(Account::Open(lease)),
             held: 0.into(),
             keys: 0.into(),
+            keep: false,
         }
     }
 
@@ -2586,11 +2616,46 @@ impl<'a> IndexKeys<'a> {
     /// past it makes the lease on the node's pool, under the request's limit, and is charged
     /// for every key held from then on.
     fn of_a_find(memory: &'a crate::limits::AggregateMemory, window: usize) -> Self {
+        fn lease(memory: &crate::limits::AggregateMemory) -> Lease {
+            memory.budget().lease_worded("the index range of the filter", FIND_RANGE_KEYS)
+        }
         let free = window.min(MAX_LIMIT).saturating_add(1);
         IndexKeys {
-            account: std::cell::RefCell::new(Account::Later { memory, free }),
+            account: std::cell::RefCell::new(Account::Later { memory, free, lease }),
             held: 0.into(),
             keys: 0.into(),
+            keep: false,
+        }
+    }
+
+    /// Keys of an `update`, `delete` or `find_and_modify` whose filter an index serves. The
+    /// engine gathers every key of the range under the writer before it reads a document,
+    /// and gathers it again for each chunk of a `multi` write. The first `MAX_CANDIDATES` keys
+    /// of a gather, what a write may match without a refusal, are not charged, so an ordinary
+    /// indexed write never touches the pool; the key past them makes the lease, charged for
+    /// every key held then and every one after.
+    ///
+    /// The lease never waits for the pool: a write holds the single writer, and a wait there
+    /// would stall every other write (see [`crate::limits::AggregateMemory::budget_without_wait`]).
+    /// And it is kept at the most the request has held, to the end of the request, since a
+    /// chunk after the first that found the pool full would be refused after a commit, which
+    /// is `500 partially_applied` (ADR-192): a later chunk asks the pool for what its range has
+    /// grown by since the largest gather, and for nothing when it has not.
+    fn of_a_write(memory: &'a crate::limits::AggregateMemory) -> Self {
+        fn lease(memory: &crate::limits::AggregateMemory) -> Lease {
+            memory
+                .budget_without_wait()
+                .lease_worded("the index range of the write", WRITE_RANGE_KEYS)
+        }
+        IndexKeys {
+            account: std::cell::RefCell::new(Account::Later {
+                memory,
+                free: kimmy_storage::MAX_CANDIDATES,
+                lease,
+            }),
+            held: 0.into(),
+            keys: 0.into(),
+            keep: true,
         }
     }
 }
@@ -2602,15 +2667,18 @@ impl kimmy_storage::KeyHold for IndexKeys<'_> {
         self.keys.set(self.keys.get() + 1);
         let mut account = self.account.borrow_mut();
         let mut charge = bytes;
-        if let Account::Later { memory, free } = &*account
+        if let Account::Later { memory, free, lease } = &*account
             && self.keys.get() > *free
         {
-            let lease =
-                memory.budget().lease_worded("the index range of the filter", FIND_RANGE_KEYS);
-            *account = Account::Open(lease);
+            *account = Account::Open(lease(memory));
             charge = self.held.get();
         }
         let charged = match &mut *account {
+            // A lease that is kept has what the request held at the most; what is held now
+            // is charged only past that.
+            Account::Open(lease) if self.keep => {
+                lease.charge(self.held.get().saturating_sub(lease.bytes()))
+            }
             Account::Open(lease) => lease.charge(charge),
             Account::Later { .. } => Ok(()),
         };
@@ -2633,7 +2701,9 @@ impl kimmy_storage::KeyHold for IndexKeys<'_> {
     fn give_all(&self) {
         let bytes = self.held.replace(0);
         self.keys.set(0);
-        if let Account::Open(lease) = &mut *self.account.borrow_mut() {
+        if !self.keep
+            && let Account::Open(lease) = &mut *self.account.borrow_mut()
+        {
             lease.release(bytes);
         }
     }
@@ -2677,6 +2747,19 @@ const FIND_RANGE_KEYS: kimmy_query::budget::Wording = kimmy_query::budget::Wordi
                  skip, paging with `cursor`; or raise aggregate.memory_limit_bytes",
     pool_busy: "narrow the filter on the indexed field, sort by anything but {_id: 1} when \
                 skip + limit is at most 10000, or use a smaller skip",
+};
+
+/// How an `update`, `delete` or `find_and_modify` over an index range words a refusal for the
+/// keys it gathers. The write has no `cursor` and no sort to offer, and the server does not
+/// split it: what makes the range smaller is the filter, and a range too large for one write
+/// can be written as several, each over part of it.
+const WRITE_RANGE_KEYS: kimmy_query::budget::Wording = kimmy_query::budget::Wording {
+    holder: "one write",
+    over_limit: "narrow the filter on the indexed field so that its range is smaller, which \
+                 can be done in several writes, each over part of the range; or raise \
+                 aggregate.memory_limit_bytes",
+    pool_busy: "retry later, or narrow the filter on the indexed field so that its range is \
+                smaller",
 };
 
 /// An aggregation over a collection, from the read of its source to the answer, under the
@@ -5514,6 +5597,9 @@ mod stream_tests;
 mod find_hold_tests;
 
 #[cfg(test)]
+mod write_hold_tests;
+
+#[cfg(test)]
 mod deadline_tests;
 #[cfg(test)]
 mod union_tests;
@@ -5547,6 +5633,7 @@ mod positional_answer {
             expected: None,
             answer: Some((&projection, after)),
             failures: Default::default(),
+            keys: None,
         };
         modify.apply(stored)
     }
