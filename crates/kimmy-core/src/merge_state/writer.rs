@@ -330,6 +330,10 @@ impl Writer {
     fn finish(&mut self, st: MStamp, record: WriteRecord) -> Written {
         self.state.vv.insert(st.writer, st.hlc);
         if self.opts.normalize_writes() {
+            // The state is moved out before the join (no copy of it), so a panic in `join_into`
+            // would leave this writer holding an empty state instead of the written one: the
+            // join must stay panic-free (today it indexes only keys drawn from the state itself,
+            // and `sub_ret` clamps).
             let (s, _) =
                 join_into(std::mem::take(&mut self.state), &MergeState::default(), &self.opts);
             self.state = s;
