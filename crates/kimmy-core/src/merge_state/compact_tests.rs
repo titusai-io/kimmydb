@@ -782,3 +782,83 @@ fn receiving_a_state_with_a_document_in_an_array_works_and_reports_the_change() 
     assert!(!b.receive_report(&a).changed);
     assert_eq!(b.state, a);
 }
+
+/// A table index is not a count: `decode_compact` once refused (`Truncated`) the encoding of a
+/// state whose last writer was index 12 or more, because it bounded the index by what was left of
+/// the input. Honest states of 12, 13 and 40 writers, built by writers.
+#[test]
+fn a_state_of_many_writers_round_trips_in_the_compact_form() {
+    let o = JoinOptions::new(1_000_000_000, i64::MAX).unwrap();
+    for n in [12u8, 13, 40] {
+        let mut ws: Vec<Writer> = (0..n)
+            .map(|k| {
+                let id =
+                    WriterId { node: NodeId::from_bytes([k + 1; 16]), epoch: Epoch::from_u64(0) };
+                Writer::new(id, o.clone())
+            })
+            .collect();
+        let x = Path::flat("x").unwrap();
+        ws[0].insert(&[(x.clone(), Value::Int64(1))], 0);
+        let first = ws[0].state.clone();
+        let mut all = first.clone();
+        for w in ws.iter_mut().skip(1) {
+            w.receive(&first);
+            w.write_inc(&x, 1, 0);
+            all = join(&all, &w.state, &o).0;
+        }
+        assert_eq!(MergeState::decode(&all.encode()).as_ref(), Ok(&all), "version 1, {n} writers");
+        let c = all.encode_compact();
+        assert_eq!(MergeState::decode_compact(&c).as_ref(), Ok(&all), "compact, {n} writers");
+    }
+}
+
+/// The same for every table size from 1 to 300 writers (past `MAX_WRITERS`: a received state past
+/// the cap is kept, so it must also decode), with a counter slot and a version vector entry per
+/// writer, in both forms, and the accepted bytes encode back to themselves.
+#[test]
+fn every_table_of_one_to_three_hundred_writers_round_trips() {
+    let life = MStamp { hlc: Hlc::new(1, 0), writer: wid(0, 0) };
+    for n in 1..=300usize {
+        let mut s = MergeState::default();
+        s.lives.insert(
+            life,
+            Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Upsert },
+        );
+        for k in 0..n {
+            let w = WriterId {
+                node: NodeId::from_bytes([
+                    (k / 250) as u8,
+                    (k % 250) as u8 + 1,
+                    7,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]),
+                epoch: Epoch::from_u64(0),
+            };
+            let at = MStamp { hlc: Hlc::new(2 + k as u64, 0), writer: w };
+            s.slots.insert(
+                (life, p("x"), w, None),
+                Slot { stamp: at, total: Num::Int64(k as i128 + 1) },
+            );
+            s.vv.insert(w, at.hlc);
+        }
+        s.vv.insert(life.writer, life.hlc);
+        assert_eq!(s.writers().len(), n + 1);
+        let c = s.encode_compact();
+        let back = MergeState::decode_compact(&c).unwrap_or_else(|e| panic!("{n} writers: {e:?}"));
+        assert_eq!(back, s, "compact, {n} writers");
+        assert_eq!(back.encode_compact(), c, "canonical, {n} writers");
+        assert_eq!(MergeState::decode(&s.encode()).as_ref(), Ok(&s), "version 1, {n} writers");
+    }
+}

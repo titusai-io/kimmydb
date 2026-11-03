@@ -711,8 +711,14 @@ impl R<'_> {
         }
         Ok(())
     }
+    /// An index into the writer or the life table: a `u64` varint like a count, but NOT a count, so
+    /// it is not bounded by what is left of the input (the last writer of a table of 13 is index 12,
+    /// and fewer than 12 bytes can follow it).
+    fn index(&mut self) -> Result<usize, DecodeError> {
+        usize::try_from(self.varint(10)?).map_err(|_| DecodeError::BadIndex)
+    }
     fn wid(&mut self) -> Result<WriterId, DecodeError> {
-        let i = self.len()?;
+        let i = self.index()?;
         let w = *self.writers.get(i).ok_or(DecodeError::BadIndex)?;
         // Once the tables are read `writer_used` is as long as `writers`; while the life
         // table itself is read it is, so the mark cannot miss.
@@ -720,7 +726,7 @@ impl R<'_> {
         Ok(w)
     }
     fn life(&mut self) -> Result<MStamp, DecodeError> {
-        let i = self.len()?;
+        let i = self.index()?;
         let l = *self.lives.get(i).ok_or(DecodeError::BadIndex)?;
         self.life_used[i] = true;
         Ok(l)
