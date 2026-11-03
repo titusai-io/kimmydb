@@ -269,9 +269,16 @@ fn atan_pos(s: Scale, x: &Mag) -> Mag {
 
 /// `ln v` for a positive fixed point `v` at [`S`] places. [`ln_scaled`] brings a magnitude of
 /// any size into `[0.707, 1.414)` by halving or doubling it, each step exact but for a unit of
-/// the last place, so a `v` of 40 digits costs about 135 of them and an error of as many units
-/// in the multiple of `ln 2`; the 34th digit of a result is 70 places above that. The callers
-/// pass a `v` of one or more (`(1 + x) / (1 - x)`, `x + √(x² + 1)`, `x + √(x² - 1)`).
+/// the last place, so a `v` of 40 digits costs about 135 of them and, at most, as many units of
+/// error in the multiple of `ln 2` (about 0.3 a halving in fact); the 34th digit of a result is
+/// 70 places above that. The callers pass a `v` of one or more (`(1 + x) / (1 - x)`,
+/// `x + √(x² + 1)`, `x + √(x² - 1)`).
+///
+/// The fixed point is not the one an earlier version gave, which took a power of ten out first
+/// to bring `v` into `[0.316, 3.16)`: above `√10` the two differ by up to about 150 units of
+/// `10^-114`. No 34-digit answer can change but one whose true value is within about `10^-78`
+/// ulp of a rounding midpoint, which the module already disclaims (`10^-75`); the tables of the
+/// tests hold the answers, and none moved.
 fn ln_fixed(v: &Mag) -> Fx {
     ln_scaled(v.clone(), 0)
 }
@@ -898,8 +905,8 @@ fn fixed_ratio(s: Scale, (cy, ey): (u128, i64), (cx, ex): (u128, i64)) -> Mag {
 /// `±|y| / |x|` for a positive `x` and operands whose ratio is below `10^-79`, rounded once:
 /// the arctangent of it is the ratio less a part below `10^-158` of it, so the answer is the
 /// ratio's nearest 34 digits, the part counting only as the hair below an exact one. The
-/// quotient is taken to 40 digits or more (`cy · 10^74 / cx` has 41 whatever the digits of the
-/// two, which are at most 34 and at least one), and a division with no remainder is one unit
+/// quotient is taken to 40 digits or more (`cy · 10^74 / cx` has 41 or more digits, whatever the
+/// digits of the two, which are at most 34 and at least one), and a division with no remainder is one unit
 /// short and sticky.
 fn small_ratio(negative: bool, (cy, ey): (u128, i64), (cx, ex): (u128, i64)) -> Raw {
     const LIFT: u32 = 40 + PREC;

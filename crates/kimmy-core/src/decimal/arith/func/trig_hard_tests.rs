@@ -138,9 +138,11 @@ fn kernel_rows(kind: &str) -> Vec<Vec<&'static str>> {
 fn ln_fixed_is_the_logarithm_to_within_a_few_units_of_the_last_place() {
     // `ln(N / 10^114)` for `N` from a hair above `10^114` (one) to a number of 40 digits, and for
     // the values below one that no caller passes: the value is the truth truncated at 114 places
-    // (Python's `decimal` at 400 digits), and the answer is within `TOLERANCE` units of it (the
-    // 40-digit values are the worst, at 143: a multiple of `ln 2` for each halving; the budget
-    // of `ln_fx` is a few hundred).
+    // (Python's `decimal` at 400 digits), and the answer is within `TOLERANCE` units of it. Of
+    // the rows, the worst for a value of one or more is the 40-digit `1.23...E+39`, 86 units;
+    // the values below one that no caller passes are worse, up to 143 for `1.23...E-100` (332 doublings) and 121 to 131 for `1E-90`
+    // and `1E-80`. Each halving or doubling adds about 0.3 unit of `ln 2`; the budget of `ln_fx`
+    // is a few hundred.
     const TOLERANCE: u128 = 200;
     let rows = kernel_rows("ln_fixed");
     assert_eq!(rows.len(), 29);
@@ -407,4 +409,40 @@ fn the_taylor_series_of_sine_and_cosine_are_exact_to_a_few_units_of_the_133rd_pl
             distance(&cos, &mag(cols[3]))
         );
     }
+}
+
+#[test]
+fn a_ratio_far_down_is_34_digits_in_the_cohort_of_a_rounded_result() {
+    // `small_ratio` through `atan2`, as exact `Raw`s (the tables compare values, which would not
+    // see a coefficient of fewer digits or another exponent): 34 digits whatever the digits of
+    // the operands, the exponent the ratio's less 33.
+    let fin = |negative, coefficient, exponent| Raw::Finite { negative, coefficient, exponent };
+    // 3E-100 / 1E-18 = 3E-82, exact: a hair under, rounded up to 3 and its zeros
+    assert_eq!(
+        func::atan2(&raw("3E-100"), &raw("1E-18")),
+        fin(false, 3_000_000_000_000_000_000_000_000_000_000_000, -115)
+    );
+    assert_eq!(
+        func::atan2(&raw("-3E-100"), &raw("1E-18")),
+        fin(true, 3_000_000_000_000_000_000_000_000_000_000_000, -115)
+    );
+    // 1E-100 / 3E-18, a repeating ratio
+    assert_eq!(
+        func::atan2(&raw("1E-100"), &raw("3E-18")),
+        fin(false, 3_333_333_333_333_333_333_333_333_333_333_333, -116)
+    );
+    // an odd 34-digit y over 2: the ratio is a midpoint, and the answer is the lower neighbour
+    assert_eq!(
+        func::atan2(&raw("9.876543210987654321098765432109875E-99"), &raw("2E-18")),
+        fin(false, 4_938_271_605_493_827_160_549_382_716_054_937, -114)
+    );
+    // 34 digits over 1 digit and 1 digit over 34 digits
+    assert_eq!(
+        func::atan2(&raw("1.234567890123456789012345678901234E-100"), &raw("2E-18")),
+        fin(false, 6_172_839_450_617_283_945_061_728_394_506_170, -116)
+    );
+    assert_eq!(
+        func::atan2(&raw("5E-100"), &raw("2.5E-18")),
+        fin(false, 2_000_000_000_000_000_000_000_000_000_000_000, -115)
+    );
 }

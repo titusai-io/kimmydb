@@ -7,8 +7,9 @@ run of the crate executes).
 
 `trig_hard.tsv` has the columns of `trig_oracle.tsv` (function, operand -- `y x` apart for
 atan2 --, the 34-digit answer, the true value to 50 digits) and the same method: Python's
-`decimal` at 250 digits through the functions of `gen_trig_oracle.py`, each checked by its
-second route, and an operand whose true value is within 1e-40 of a rounding midpoint dropped.
+`decimal` through the functions of `gen_trig_oracle.py` (at 250 digits, and more for an operand
+of large exponent or a ratio far down: the oracle's own widening), each checked by its second
+route, and an operand whose true value is within 1e-40 of a rounding midpoint dropped.
 The rows are the edges of the code and not a sample: either side of `LARGE` (50) and of the
 operand at which `sinh` and `cosh` overflow, of `TINY` and `HUGE` (1e-40, 1e+40), the operands
 that put `(1 + x) / (1 - x)`, `x + sqrt(x^2 - 1)` and `x + sqrt(x^2 + 1)` near one and at
@@ -16,9 +17,12 @@ their largest, and `atan2` with a ratio 79, 80 and 81 digits down or more, for a
 too. A few `atan2` rows are the exception to the midpoint rule, on purpose: a ratio that is
 exactly a midpoint of the 34-digit grid (35 digits, the last a 5) has an arctangent a hair below
 it (`r - r^3/3`), so the 34-digit answer is the lower neighbour whatever the evenness of its last
-digit; those rows are rounded from the series to 500 digits, where the hair is in the digits.
+digit; those rows are rounded from the series to `2 * gap + 700` digits (up to about 4,700, for a
+gap of 2,000), where the hair is in the digits.
 
-`trig_kernels.tsv` has the private kernels, one tab-separated row each:
+`trig_kernels.tsv` has the private kernels, one tab-separated row each. The precisions are 400
+digits for `ln_fixed`, exact rational arithmetic for `fixed_ratio`, `250 + adjusted + 200` digits
+(up to about 6,600) for `reduce`, whose pi is Machin's to that width, and 250 for `sin_cos` (the triple-angle route's own):
 
     ln_fixed   N        S                     ln(N / 10^114) at 114 places, truncated: sign, digits
     fixed_ratio limbs cy ey cx ex  N          floor(|y/x| * 10^(19 limbs))
