@@ -531,8 +531,13 @@ fn model_reorder(mut specs: Vec<Document>) -> Vec<(String, i64)> {
                 ("$limit", "$limit") => Some(vec![window("$limit", count(a).min(count(b)))]),
                 ("$limit", "$skip") => {
                     let dropped = count(a).min(count(b));
-                    Some(vec![window("$skip", dropped), window("$limit", count(a) - dropped)])
+                    // A window that takes nothing is a `$limit` of 0 alone.
+                    match count(a) - dropped {
+                        0 => Some(vec![window("$limit", 0)]),
+                        left => Some(vec![window("$skip", dropped), window("$limit", left)]),
+                    }
                 }
+                ("$skip", "$limit") if count(b) == 0 => Some(vec![b.clone()]),
                 (_, "$skip" | "$limit") if passes(a, &specs[..at]) => {
                     Some(vec![b.clone(), a.clone()])
                 }
@@ -750,7 +755,8 @@ proptest! {
     }
 
     /// A `$sort` with its `$skip` and `$limit` through the chain is the same naive answer,
-    /// with stages before and after, and the chain pushed whole and one at a time.
+    /// and the chain pushed whole and one at a time. (The boundary of a heap with the stages
+    /// around it is held by the unit tests in `pipeline.rs`; the generator's pipelines have it too.)
     #[test]
     fn a_sort_and_its_window_through_the_chain_are_a_naive_sort_then_take(
         keys in tie_keys(),

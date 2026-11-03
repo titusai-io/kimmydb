@@ -1895,7 +1895,7 @@ fn the_reservoir_of_a_sample_holds_the_documents_it_keeps_and_gives_them_back() 
     assert!(most > 4 * one && most < 6 * one, "held {most}, a document is {one}");
     assert_eq!(chain.finish().unwrap().len(), 5);
     assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
-    // One document less of room and the sixth is refused at its byte.
+    // One document less of room and the fifth is refused at its byte.
     let limits = pooled(4 * one + one / 2, &pool);
     let mut chain = chain_of(&stages, &limits);
     let err = input.iter().find_map(|doc| chain.push(doc.clone()).err()).expect("refused");

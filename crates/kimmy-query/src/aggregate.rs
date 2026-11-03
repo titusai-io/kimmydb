@@ -648,10 +648,13 @@ impl Window {
     }
 
     /// The stages that are this window: a `$skip` if it drops any, then a `$limit` if it takes
-    /// a number. A `$limit` of 0 is a window that takes nothing, which no request can write
-    /// (it is a `400`) and `$limit: 5` then `$skip: 5` makes.
+    /// a number. A window that takes nothing is a `$limit` of 0 alone, which no request can
+    /// write (it is a `400`) and `$limit: 5` then `$skip: 5` makes: what it drops is of no
+    /// account, and a `$skip` before it would only be a number of documents for a `$sort` to
+    /// keep.
     fn stages(self) -> impl Iterator<Item = Stage> {
-        (self.skip > 0)
+        let takes_nothing = self.limit == Some(0);
+        (self.skip > 0 && !takes_nothing)
             .then_some(Stage::Skip(self.skip))
             .into_iter()
             .chain(self.limit.map(Stage::Limit))

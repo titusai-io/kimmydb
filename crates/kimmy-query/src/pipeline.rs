@@ -664,6 +664,12 @@ trait State {
     /// One more document. A state that loops ticks the request's deadline.
     fn add(&mut self, doc: Document, held: &mut Lease) -> Result<(), Error>;
 
+    /// Whether the stage answers nothing whatever it is given (a heap that keeps no document),
+    /// so that a source need not read any.
+    fn is_full(&self) -> bool {
+        false
+    }
+
     /// The input is complete: the stage's output.
     fn finish(self: Box<Self>) -> Result<Vec<Document>, Error>;
 }
@@ -709,6 +715,10 @@ impl State for Heap<'_> {
     fn add(&mut self, doc: Document, held: &mut Lease) -> Result<(), Error> {
         self.ticker.tick()?;
         self.top.offer(doc, held, self.limits)
+    }
+
+    fn is_full(&self) -> bool {
+        self.limit == 0
     }
 
     fn finish(self: Box<Self>) -> Result<Vec<Document>, Error> {
@@ -828,6 +838,13 @@ struct Fused<'a, E: From<Error>> {
 }
 
 impl<'a, E: From<Error>> Sink<'a, E> for Fused<'a, E> {
+    /// A `$sort` with a `$limit` of 0 answers nothing, so a source that is asked reads none. (It
+    /// is asked of the head only, so nothing before it is left unrun: a stage that could fail
+    /// on a document runs on every one.)
+    fn is_full(&self) -> bool {
+        self.state.as_ref().is_some_and(|state| state.is_full())
+    }
+
     fn push(&mut self, doc: Document) -> Result<Flow, E> {
         if let Some(state) = self.state.as_mut() {
             state.add(doc, &mut self.held)?;
@@ -1844,6 +1861,57 @@ mod tests {
             assert_eq!(streams_source(&stages), fused || streams(&stages[0]), "{spec}");
         }
         assert!(!streams_source(&[]));
+    }
+
+    #[test]
+    fn a_source_streams_into_a_sort_exactly_when_its_limit_is_the_sorts() {
+        // The stages a `$sort` is followed by, as the parse leaves them: `fuse` says the head is
+        // one stage that keeps a state exactly when `streams_source` says the source streams, so
+        // that one cannot call a `$sort` fused while the other builds a barrier.
+        let sort = || doc! {"$sort": {"a": 1}};
+        for (specs, heap) in [
+            (vec![sort(), doc! {"$limit": 3}], true),
+            (vec![sort(), doc! {"$skip": 2}, doc! {"$limit": 3}], true),
+            // The limit is moved ahead of the `$project`, so it is the sort's.
+            (vec![sort(), doc! {"$project": {"a": 1}}, doc! {"$limit": 3}], true),
+            (vec![sort(), doc! {"$limit": 150_000}, doc! {"$skip": 200_000}], true),
+            (vec![sort(), doc! {"$skip": 2}], false),
+            (vec![sort()], false),
+            (vec![sort(), doc! {"$match": {"a": 1}}, doc! {"$limit": 3}], false),
+            (vec![sort(), doc! {"$unwind": "$a"}, doc! {"$limit": 3}], false),
+            (vec![sort(), doc! {"$sort": {"b": 1}}, doc! {"$limit": 3}], false),
+        ] {
+            let stages = parsed(&specs);
+            let at_the_head = (1..=stages.len()).any(|end| {
+                fuse(&stages[..end], &[], &Limits::default(), &system_below)
+                    .is_some_and(|fusion| fusion.len == end)
+            });
+            assert_eq!(at_the_head, heap, "{specs:?}");
+            assert_eq!(streams_source(&stages), heap, "{specs:?}");
+        }
+    }
+
+    #[test]
+    fn a_sort_that_keeps_no_document_is_full_before_any_is_pushed() {
+        let limits = Limits::default();
+        // A `$limit` of 0 behind a `$sort` is a window that takes nothing (the rewrite makes it of
+        // `$limit` then `$skip`); nothing is read for it, and the answer is empty.
+        let stages = parsed(&[sort_by_a(), doc! {"$limit": 5}, doc! {"$skip": 9}]);
+        let chain = build(&stages, &unused, &limits, &[]);
+        assert!(chain.is_full());
+        assert!(chain.finish().unwrap().is_empty());
+        // One that keeps something is not, and neither is a heap behind a stage that could fail.
+        for specs in [
+            vec![sort_by_a(), doc! {"$limit": 5}],
+            vec![doc! {"$match": {"a": 1}}, sort_by_a(), doc! {"$limit": 5}, doc! {"$skip": 9}],
+        ] {
+            let stages = parsed(&specs);
+            assert!(!build(&stages, &unused, &limits, &[]).is_full(), "{specs:?}");
+        }
+    }
+
+    fn sort_by_a() -> Document {
+        doc! {"$sort": {"a": 1}}
     }
 
     #[test]

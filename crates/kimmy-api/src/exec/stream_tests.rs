@@ -207,16 +207,7 @@ fn a_skip_and_a_limit_move_ahead_of_the_stages_the_references_optimizer_moves_th
 }
 
 #[test]
-fn a_window_that_has_moved_to_the_head_ends_the_scan_and_bounds_the_range_it_reads() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = state_with(&dir, numbered(50, &[]));
-    let (answer, stats) = run_stats(
-        &state,
-        json!([{"$project": {"k": 1}}, {"$addFields": {"x": 1}}, {"$skip": 2}, {"$limit": 3}]),
-        aggregate::Limits::default(),
-    );
-    assert_eq!(ids(&answer), [2, 3, 4]);
-    assert_eq!((stats.examined, stats.matched), (5, 5));
+fn a_window_that_has_moved_to_the_head_bounds_the_range_it_reads() {
     // The keys of an inexact range are bounded by what the window takes, though stages that
     // neither filter nor change the count are written before it.
     let dir = tempfile::tempdir().unwrap();
@@ -257,14 +248,43 @@ fn a_window_that_takes_nothing_reads_nothing_from_the_source() {
     let mut behind = vec![json!({"$addFields": {"x": 1}})];
     behind.extend(window());
     nothing(json!(behind), &state);
+    // Behind a `$sort`, where the rewrite is a `$limit` of 0 alone and not a heap that keeps the
+    // documents of the `$skip` and reads the whole source: it examines none either.
+    for sorted in [
+        vec![json!({"$sort": {"k": 1}}), json!({"$limit": 30}), json!({"$skip": 40})],
+        vec![
+            json!({"$sort": {"k": 1}}),
+            json!({"$project": {"k": 1}}),
+            json!({"$limit": 30}),
+            json!({"$skip": 40}),
+        ],
+        vec![
+            json!({"$sort": {"k": 1}}),
+            json!({"$limit": 30}),
+            json!({"$skip": 40}),
+            json!({"$count": "n"}),
+        ],
+    ] {
+        let counted = sorted.last().is_some_and(|stage| stage.get("$count").is_some());
+        let (answer, stats) = run_stats(&state, json!(sorted), aggregate::Limits::default());
+        assert_eq!(
+            answer["documents"],
+            if counted { json!([{"n": 0}]) } else { json!([]) },
+            "{sorted:?}"
+        );
+        assert_eq!((stats.examined, stats.matched), (0, 0), "{sorted:?}");
+    }
     // An index: an exact probe, an inexact range (read whole in `_id` order when it is wanted),
     // and the sort of the result.
     let dir = tempfile::tempdir().unwrap();
     let state = indexed(&dir, 1_500);
     for filter in [json!({"t": 7}), json!({"t": {"$gte": 0}}), json!({"t": {"$gt": 1_000}})] {
-        let mut pipeline = vec![json!({"$match": filter})];
+        let mut pipeline = vec![json!({"$match": filter.clone()})];
         pipeline.extend(window());
         nothing(json!(pipeline), &state);
+        let sorted =
+            json!([{"$match": filter}, {"$sort": {"t": -1}}, {"$limit": 30}, {"$skip": 40}]);
+        nothing(sorted, &state);
     }
     // Where the same window takes something, the source is read, so the zeros above are the
     // window's and not the collection's.

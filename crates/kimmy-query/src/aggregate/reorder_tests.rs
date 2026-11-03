@@ -201,10 +201,11 @@ fn a_run_of_skips_and_limits_is_one_window() {
         with(vec![doc! { "$skip": 2 }, doc! { "$skip": 3 }, doc! { "$limit": 4 }]),
         ["$skip 5", "$limit 4", "$addFields"]
     );
-    // limit 10 then limit 3 = limit 3; and limit 3 then skip 5 takes nothing (it drops the three).
+    // limit 10 then limit 3 = limit 3; and limit 3 then skip 5 takes nothing, which is a `$limit` of
+    // 0 alone: what it drops is of no account.
     assert_eq!(
         with(vec![doc! { "$limit": 10 }, doc! { "$limit": 3 }, doc! { "$skip": 5 }]),
-        ["$skip 3", "$limit 0", "$addFields"]
+        ["$limit 0", "$addFields"]
     );
     // limit 8 then skip 5 = skip 5, limit 3.
     assert_eq!(
@@ -245,6 +246,32 @@ fn a_run_of_skips_and_limits_is_one_window() {
             doc! { "$skip": i64::MAX }
         ]),
         [format!("$skip {}", usize::MAX)]
+    );
+}
+
+#[test]
+fn a_window_that_takes_nothing_is_a_limit_of_nothing_alone() {
+    // Behind a `$sort` too: a `$skip` before the `$limit 0` would be documents for the sort to keep.
+    assert_eq!(
+        shape(&[
+            doc! { "$sort": { "a": 1 } },
+            doc! { "$limit": 150_000 },
+            doc! { "$skip": 200_000 }
+        ]),
+        ["$sort", "$limit 0"]
+    );
+    assert_eq!(
+        shape(&[doc! { "$skip": 7 }, doc! { "$limit": 3 }, doc! { "$skip": 9 }]),
+        ["$limit 0"]
+    );
+    // Taking something is a skip and a limit.
+    assert_eq!(
+        shape(&[
+            doc! { "$sort": { "a": 1 } },
+            doc! { "$limit": 150_000 },
+            doc! { "$skip": 100_000 }
+        ]),
+        ["$sort", "$skip 100000", "$limit 50000"]
     );
 }
 
