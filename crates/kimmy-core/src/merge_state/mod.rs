@@ -19,7 +19,7 @@
 //! * The field order (`ord.rs`, option A): [`MergeState::ords`] holds, per `(life, path)`, a
 //!   [`FieldOrd`] (floor, per-writer firsts, last, level floor), joined with the cells by
 //!   [`ord_join`]; [`MergeState::ordered_document`] reads the document in that order. The state,
-//!   its join and the read are built (the compact codec does not spell it yet); the [`Writer`] does NOT
+//!   its join, the read and the compact codec's section 10 are built; the [`Writer`] does NOT
 //!   feed the order state yet (a state a writer builds has none), so the order of a document is
 //!   tested against the reference model on states assembled from its writes.
 //! * [`MergeState`] holds lives, deletes, dead lives, registers, counter slots,
@@ -74,6 +74,8 @@ mod counter_tests;
 mod hand_built;
 #[cfg(test)]
 mod nested_tests;
+#[cfg(test)]
+mod ord_codec_tests;
 #[cfg(test)]
 mod ord_tests;
 #[cfg(test)]

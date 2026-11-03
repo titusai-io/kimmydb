@@ -89,6 +89,14 @@ fn pool_fields<'a>(rng: &mut Rng, names: &[&'a str]) -> Vec<(&'a str, Value)> {
 
 /// One random run; returns every state any writer held along the way.
 pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    run_with(seed, steps, o, false)
+}
+
+/// [`run`], with the order state fed after every local write when `feed` (see
+/// [`super::ord_codec_tests::feed_orders`]): the run draws the same numbers either way, so the states
+/// are the same but for their `ords`.
+pub(super) fn run_with(seed: u64, steps: usize, o: &JoinOptions, feed: bool) -> Vec<MergeState> {
+    let mut frng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let n = 3 + rng.below(2);
     let mut ws: Vec<Writer> = (0..n)
@@ -114,6 +122,7 @@ pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
             ws[m].receive(&st);
         } else {
             let path = p(rng.pick(&["x", "n", "y", "", "_", "a.b"]));
+            let before = feed.then(|| ws[m].state.vv.clone());
             let w = &mut ws[m];
             match rng.below(14) {
                 0 => {
@@ -166,6 +175,9 @@ pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
                     w.write_delete(skew);
                 }
             }
+            if let Some(before) = before {
+                super::ord_codec_tests::feed_orders(&mut ws[m], &before, &mut frng, o);
+            }
         }
         pool.push(ws[m].state.clone());
     }
@@ -174,6 +186,11 @@ pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
 
 pub(super) fn pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
     (1..=seeds).map(|s| run(s, steps, o)).collect()
+}
+
+/// [`pools`] with the order state fed.
+pub(super) fn ord_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+    (1..=seeds).map(|s| run_with(s, steps, o, true)).collect()
 }
 
 fn triples(
@@ -798,6 +815,17 @@ fn nested_value(rng: &mut Rng, depth: usize) -> Value {
 /// Like [`run`], but over nested documents: sub-documents set and replaced, scalars and arrays
 /// written over maps and the reverse, nested counters, unsets of whole sub-documents.
 pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    run_nested_with(seed, steps, o, false)
+}
+
+/// [`run_nested`], with the order state fed after every local write when `feed`.
+pub(super) fn run_nested_with(
+    seed: u64,
+    steps: usize,
+    o: &JoinOptions,
+    feed: bool,
+) -> Vec<MergeState> {
+    let mut frng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let n = 3 + rng.below(2);
     let mut ws: Vec<Writer> = (0..n)
@@ -840,6 +868,7 @@ pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeS
             ws[m].receive(&st);
         } else {
             let path = rng.pick(&all).clone();
+            let before = feed.then(|| ws[m].state.vv.clone());
             let w = &mut ws[m];
             match rng.below(14) {
                 0..=3 => {
@@ -871,6 +900,9 @@ pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeS
                     w.insert(&[(p("x"), Value::Int64(100)), (p("a"), v)], skew);
                 }
             }
+            if let Some(before) = before {
+                super::ord_codec_tests::feed_orders(&mut ws[m], &before, &mut frng, o);
+            }
         }
         pool.push(ws[m].state.clone());
     }
@@ -879,6 +911,11 @@ pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeS
 
 pub(super) fn nested_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
     (1..=seeds).map(|s| run_nested(s, steps, o)).collect()
+}
+
+/// [`nested_pools`] with the order state fed.
+pub(super) fn nested_ord_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+    (1..=seeds).map(|s| run_nested_with(s, steps, o, true)).collect()
 }
 
 /// The visible document is well formed: every path above a visible path is a visible map, and
@@ -1152,6 +1189,9 @@ fn the_states_writers_build_satisfy_the_invariants_decode_checks() {
         let o = opts(ret);
         let mut sets = pools(20, 24, &o);
         sets.extend(nested_pools(20, 26, &o));
+        // and with the order state fed
+        sets.extend(ord_pools(20, 24, &o));
+        sets.extend(nested_ord_pools(20, 26, &o));
         sets.extend((1..=20).map(|s| run_counters(s, 30, &o)));
         for st in sets.iter().flatten() {
             assert!(st.check_decoded().is_ok());
