@@ -146,7 +146,8 @@ fn a_local_write_is_linear_in_the_cells() {
         w.write_inc(&p("c1"), 1, 0).unwrap();
         count(|| write(&mut w)).1.visits
     };
-    let ops: [(&str, &dyn Fn(&mut Writer)); 4] = [
+    type Op<'a> = &'a dyn Fn(&mut Writer);
+    let ops: [(&str, Op); 4] = [
         ("$set", &|w| drop(w.write_set(&p("f001"), s("z"), 0).unwrap())),
         ("$inc", &|w| drop(w.write_inc(&p("c1"), 1, 0).unwrap())),
         ("$unset", &|w| drop(w.write_unset(&p("f001"), 0).unwrap())),
@@ -164,4 +165,16 @@ fn a_local_write_is_linear_in_the_cells() {
         let (v100, v200, v400) = (on(100, write), on(200, write), on(400, write));
         assert_eq!(v400 - v200, 2 * (v200 - v100), "{name}: {v100} {v200} {v400}");
     }
+}
+
+#[test]
+fn a_join_of_a_state_the_receiver_has_seen_looks_for_no_clash() {
+    // a resend of a state the other side's version vector covers: no register of either side can
+    // clash, so no register is looked at for one
+    let (a, b, _) = two(200, 20);
+    let (_, c) = count(|| b.state.join(&a.state, &opts()));
+    // `b` has seen all of `a`: only the registers of `a` are tested, none grouped
+    assert_eq!(c.visits, a.state.regs.len());
+    let (_, c) = count(|| b.state.join(&b.state.clone(), &opts()));
+    assert_eq!(c.visits, b.state.regs.len());
 }

@@ -375,20 +375,28 @@ pub(super) fn join_into(
         // (1) same-path register clashes: a register of s against a register of t,
         // concurrent by the version vectors. Two arrays are an `arrayClash`. Only a register
         // that the other side's version vector does not cover can clash, so only those are
-        // grouped by path (each side in the order of its map, that is by life).
+        // grouped by path (each side in the order of its map, that is by life), and the
+        // registers of s only where t has one.
         let mut by_path: BTreeMap<&Path, (Vec<&Reg>, Vec<&Reg>)> = BTreeMap::new();
-        for ((l, p), r) in s.regs {
-            if alive.has(l) && !cov(t_side.vv, &r.stamp) {
-                by_path.entry(p).or_default().0.push(r);
-            }
-        }
+        #[cfg(test)]
+        super::work::bump(super::work::Counter::Visits, t_side.regs.len());
         for ((l, p), r) in t_side.regs {
             if alive.has(l) && !cov(s.vv, &r.stamp) {
                 by_path.entry(p).or_default().1.push(r);
             }
         }
-        #[cfg(test)]
-        super::work::bump(super::work::Counter::Visits, s.regs.len() + t_side.regs.len());
+        if !by_path.is_empty() {
+            #[cfg(test)]
+            super::work::bump(super::work::Counter::Visits, s.regs.len());
+            for ((l, p), r) in s.regs {
+                if alive.has(l)
+                    && !cov(t_side.vv, &r.stamp)
+                    && let Some(group) = by_path.get_mut(p)
+                {
+                    group.0.push(r);
+                }
+            }
+        }
         for (p, (rs, rt)) in by_path {
             for a in &rs {
                 for b in &rt {
@@ -416,6 +424,9 @@ pub(super) fn join_into(
             for (a_st, b_st) in [(&s, &t_side), (&t_side, &s)] {
                 // b's cells in path order, so that those below a path are one run; listed when
                 // the first register of a asks for them.
+                if b_st.regs.is_empty() && b_st.slots.is_empty() {
+                    continue;
+                }
                 let mut cells: Option<Vec<(&Path, MStamp, Held)>> = None;
                 for ((l, p), r) in a_st.regs {
                     if !alive.has(l) || !r.value.is_plain() || cov(b_st.vv, &r.stamp) {
