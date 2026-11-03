@@ -276,22 +276,25 @@ impl MergeState {
     ///    every `lives[l]` is over a key drawn from `lives`, `sub_ret` clamps, sums saturate.
     ///
     /// 10. The order state (`ords`). Every entry is NORMAL: no candidate (`firsts`, `last`) is
-    ///     one its floor voids. CHECKED here ([`DecodeError::OrdNotNormal`]): the join of an
-    ///     entry with itself drops what the floor voids, so a state that holds one is not
-    ///     idempotent under join, and two replicas that normalise at different times would
-    ///     differ. The join keeps an entry only one side has as it is, and normalises one only
-    ///     the other side has, so every state a writer or a join makes is normal.
+    ///     one its floor voids. CHECKED here ([`DecodeError::OrdNotNormal`]): it is needed for
+    ///     COMMUTATIVITY and idempotence, not only for the reads. The join keeps an entry only
+    ///     `s` has as it is and normalises one only `t` has, so `join(s, t)` differs from
+    ///     `join(t, s)` on a non-normal entry; and the join of an entry with itself drops what
+    ///     the floor voids, so a state that holds one is not idempotent either. Every state a
+    ///     writer or a join makes is normal.
     /// 11. An order entry belongs to a life `lives` lists. CHECKED here
     ///     ([`DecodeError::OrdLifeNotListed`]); every state a join leaves has it (the entries
     ///     of a life that is not alive go with it, and a life leaves `lives` only dead). The
     ///     reads would not notice (they take the alive lives first, and an unlisted life is not
     ///     alive), but the join drops the entry, so the state is not one it can produce; the
     ///     cells (item 5) are NOT checked the same way, because a hand-built state has them
-    ///     and no reader needs it of them.
+    ///     and no reader needs it of them. (Not needed for the laws either: the join drops the
+    ///     entries of a life that is not alive symmetrically; it is a check of the shape.)
     /// 12. The version vector covers the stamps an order entry holds (floor, `firsts`, `last`,
     ///     `lvl`), as item 2 does for cells: CHECKED ([`DecodeError::VersionVectorBehind`]).
-    ///     The join does not read the vector for the order, but a writer restored from the state
-    ///     mints above its vector, and a stamp it then reused would meet its own floor.
+    ///     The join does not read the vector for the order (not needed for the laws), but a
+    ///     writer restored from the state mints above its vector, and a stamp it then reused
+    ///     would meet its own floor.
     /// 13. No entry is EMPTY (no floor, no `firsts`, no `last`, no `lvl`). CHECKED here
     ///     ([`DecodeError::OrdEntryEmpty`]). An empty entry and no entry are the same state, so
     ///     the join removes an empty entry (of either side) and the constructors never make

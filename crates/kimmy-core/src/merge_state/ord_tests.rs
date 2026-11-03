@@ -1172,6 +1172,96 @@ fn the_read_equals_the_model_with_absorbed_on() {
     }
 }
 
+/// O1-11 of the O1 review. The model keys the root of a replace by `""` and conflates it with a
+/// top-level field named `""` (`parent_of(p) or ""`): there `$set "" = {...}` raises the ROOT's level
+/// floor. The Rust keeps `OrdAt::Root` and `OrdAt::Field("")` apart, which is right, and no differential
+/// can reach it (the model cannot name the field). Here: they are two keys with two encodings (a
+/// segment count of 0, and a count of 1 with an empty segment), in this order; and a replace (the root's
+/// level mark) and a `$set "" = {c}` (the level mark of the field `""`) joined in both orders leave each
+/// mark at its own key.
+#[test]
+fn the_root_and_a_top_level_field_named_empty_are_distinct_keys() {
+    let o = JoinOptions::default();
+    let (a, b, life) = (w(b'A'), w(b'B'), at(1, b'A'));
+    let empty = Path::flat("").unwrap();
+    let key_field = (life, OrdAt::Field(empty.clone()));
+    let key_root = (life, OrdAt::Root);
+    assert!(key_root < key_field, "the root sorts first");
+    let base = || {
+        let mut s = MergeState::default();
+        s.lives.insert(
+            life,
+            Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert },
+        );
+        s.vv.insert(a, Hlc::new(20, 0));
+        s.vv.insert(b, Hlc::new(20, 0));
+        s
+    };
+    // writer A replaces the document: the root's level mark; writer B sets "" to a document {c: 1}
+    let mut replace = base();
+    let items =
+        [(OrdAt::Root, OrdMode::Level), (OrdAt::Field(Path::flat("x").unwrap()), OrdMode::Reset)];
+    replace.ord_apply(life, at(5, b'A'), Hlc::new(4, 0), &ord_events(&items, &o), &o);
+    let mut set = base();
+    let c = Path::new(["", "c"]).unwrap();
+    let items = [
+        (OrdAt::Field(empty.clone()), OrdMode::Write),
+        (OrdAt::Field(empty.clone()), OrdMode::Level),
+        (OrdAt::Field(c), OrdMode::Reset),
+    ];
+    set.ord_apply(life, at(7, b'B'), Hlc::new(6, 0), &ord_events(&items, &o), &o);
+    assert_eq!(replace.ords[&key_root].lvl, Some(at(5, b'A')));
+    assert!(!replace.ords.contains_key(&key_field));
+    assert_eq!(set.ords[&key_field].lvl, Some(at(7, b'B')));
+    assert!(!set.ords.contains_key(&key_root));
+    // joined in both orders: each mark at its own key, and the same state
+    let (ab, ba) = (join(&replace, &set, &o).0, join(&set, &replace, &o).0);
+    assert_eq!(ab, ba);
+    assert_eq!(ab.ords[&key_root].lvl, Some(at(5, b'A')));
+    assert_eq!(ab.ords[&key_field].lvl, Some(at(7, b'B')));
+    // two keys, two encodings, and the state with both round trips with both
+    assert_ne!(replace.encode_compact(), set.encode_compact());
+    assert_eq!(ab.ords.keys().filter(|k| k.1 == OrdAt::Root).count(), 1);
+    let enc = ab.encode_compact();
+    assert_eq!(MergeState::decode_compact(&enc).as_ref(), Ok(&ab));
+    // the key bytes: life 0, then a segment count of 0 (the root) or a count of 1 and an empty segment
+    let root_only = {
+        let mut s = base();
+        s.ords.insert(key_root.clone(), FieldOrd { lvl: Some(at(5, b'A')), ..FieldOrd::default() });
+        s
+    };
+    let field_only = {
+        let mut s = base();
+        s.ords.insert(
+            key_field.clone(),
+            FieldOrd { last: Some((at(5, b'A'), 0)), ..FieldOrd::default() },
+        );
+        s
+    };
+    let (er, ef) = (root_only.encode_compact(), field_only.encode_compact());
+    let hlc5 = Hlc::new(5, 0).to_bytes();
+    let root_tail: Vec<u8> = [&[1u8, 0, 0, 0, 0, 2][..], &hlc5, &[0]].concat();
+    let field_tail: Vec<u8> = [&[1u8, 0, 1, 0, 0, 0, 1][..], &hlc5, &[0, 0]].concat();
+    assert!(
+        er.ends_with(&root_tail),
+        "count 1, life 0, segment count 0, no floor, no firsts, lvl only"
+    );
+    assert!(ef.ends_with(&field_tail), "count 1, life 0, one segment of length 0, then the entry");
+    assert!(MergeState::decode_compact(&er).is_ok() && MergeState::decode_compact(&ef).is_ok());
+    // the read: a top-level field named "" is an ordinary field, ordered by its own entry
+    let mut doc = ab.clone();
+    for (p, hlc, who) in [(empty.clone(), 7u64, b'B'), (Path::flat("x").unwrap(), 5, b'A')] {
+        let v = if p == empty { Value::Map } else { Value::Int64(1) };
+        let reg = Reg::new(at(hlc, who), v, BTreeMap::new(), None, false).unwrap();
+        doc.regs.insert((life, p), reg);
+    }
+    let reg = Reg::new(at(7, b'B'), Value::Int64(2), BTreeMap::new(), None, false).unwrap();
+    doc.regs.insert((life, Path::new(["", "c"]).unwrap()), reg);
+    let names: Vec<String> =
+        doc.ordered_document(&o).unwrap().iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names, ["x", ""], "the replace at 5 is before the set of \"\" at 7");
+}
+
 // ---- the laws on the entries of the model's own runs ----------------------------------
 
 /// `probe_ord_join_laws` of the model: the distinct order entries of the writer entries of 150 nested
