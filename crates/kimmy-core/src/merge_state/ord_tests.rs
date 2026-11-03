@@ -1262,6 +1262,102 @@ fn the_root_and_a_top_level_field_named_empty_are_distinct_keys() {
     assert_eq!(names, ["x", ""], "the replace at 5 is before the set of \"\" at 7");
 }
 
+/// n top-level fields, each a register older than its own unset floor (the reviewer's wide shape, D-1).
+fn wide_under_floors(n: usize) -> MergeState {
+    let (a, life) = (w(b'A'), at(1, b'A'));
+    let mut s = MergeState::default();
+    s.lives.insert(life, Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert });
+    s.vv.insert(a, Hlc::new(20, 0));
+    for i in 0..n {
+        let p = Path::flat(&format!("f{i:06}")).unwrap();
+        let reg = Reg::new(at(2, b'A'), Value::Int64(1), BTreeMap::new(), None, false).unwrap();
+        s.regs.insert((life, p.clone()), reg);
+        s.ords.insert(
+            (life, OrdAt::Field(p)),
+            FieldOrd { floor: Some(u(10, b'A', 9, false)), ..FieldOrd::default() },
+        );
+    }
+    s
+}
+
+/// A mixed shape: n/4 maps under unset floors, each with three children (two registers, one counter
+/// slot) older than the floor, in two alive lives.
+fn maps_under_floors(n: usize) -> MergeState {
+    let a = w(b'A');
+    let lives = [at(1, b'A'), at(2, b'A')];
+    let mut s = MergeState::default();
+    s.vv.insert(a, Hlc::new(20, 0));
+    for life in lives {
+        s.lives.insert(
+            life,
+            Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Upsert },
+        );
+    }
+    for i in 0..n / 4 {
+        let life = lives[i % 2];
+        let m = Path::flat(&format!("m{i:06}")).unwrap();
+        let reg = |v| Reg::new(at(3, b'A'), v, BTreeMap::new(), None, false).unwrap();
+        s.regs.insert((life, m.clone()), reg(Value::Map));
+        for (j, kid) in ["x", "y", "z"].iter().enumerate() {
+            let q = m.child(kid).unwrap();
+            if j < 2 {
+                s.regs.insert((life, q), reg(Value::Int64(1)));
+            } else {
+                s.slots
+                    .insert((life, q, a, None), Slot { stamp: at(3, b'A'), total: Num::Int64(5) });
+            }
+        }
+        s.ords.insert(
+            (life, OrdAt::Field(m)),
+            FieldOrd { floor: Some(u(10, b'A', 9, false)), ..FieldOrd::default() },
+        );
+    }
+    s
+}
+
+/// D-1 of the delta review: the memoised read was linear in evaluations but quadratic in the cells it
+/// visited, because each evaluation under an unset floor scanned every register and slot key for the
+/// descendants of its path (n fields under floors visited n^2 keys; 100,000 of them, a few megabytes
+/// that decode, about 10^10 per read). The descendants are now a contiguous run of the path-ordered
+/// maps, so the read costs the descendants it uses. Counted in cell visits (`work`), not wall time:
+///
+///  * n fields under floors: visits at n = 1,000 / 2,000 / 4,000 grow with n (the ratio of the last to
+///    the first is at most 4.4, a 10% tolerance over 4), and stay under 12 n;
+///  * a mixed shape (maps with children, in two lives): the same;
+///  * a chain of survivors of depth d: every path above has its own floor and looks at all below it, so
+///    the visits are the sum of the descendants (d(d - 1)/2 pairs, each costing a winner probe, a slot
+///    probe and a step of the key runs: about 4), bounded by 5 d^2, and d is at most 100 (the depth
+///    limit of paths): under 50,000 at the limit. (Linear in d would need the survivors of a
+///    path to be folded from its children's, which the clamp's `place` does not allow: it depends on
+///    the floor of the path itself.)
+#[test]
+fn the_read_visits_cells_in_proportion_to_the_work_not_to_the_state() {
+    let o = JoinOptions::default();
+    let visits = |s: &MergeState| {
+        let (doc, c) = super::work::count(|| s.ordered_document(&o));
+        assert!(doc.is_some());
+        c.visits
+    };
+    for (name, build) in [
+        ("wide", wide_under_floors as fn(usize) -> MergeState),
+        ("maps", maps_under_floors as fn(usize) -> MergeState),
+    ] {
+        let (v1, v2, v4) = (visits(&build(1_000)), visits(&build(2_000)), visits(&build(4_000)));
+        eprintln!("{name}: visits {v1} / {v2} / {v4} at 1,000 / 2,000 / 4,000 fields");
+        assert!(
+            v4 * 10 <= v1 * 44,
+            "{name}: {v1} {v4}: more than 4.4 times for 4 times the fields"
+        );
+        assert!(v2 * 10 <= v1 * 22, "{name}: {v1} {v2}");
+        assert!(v4 <= 12 * 4_000, "{name}: {v4} visits for 4,000 fields");
+    }
+    for d in [10usize, 40, 100] {
+        let v = visits(&survivor_chain(d));
+        eprintln!("chain of depth {d}: {v} visits");
+        assert!(v <= 5 * d * d, "chain {d}: {v}");
+    }
+}
+
 // ---- the laws on the entries of the model's own runs ----------------------------------
 
 /// `probe_ord_join_laws` of the model: the distinct order entries of the writer entries of 150 nested

@@ -45,6 +45,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use super::codec::DecodeError;
 use super::join::JoinOptions;
@@ -583,14 +584,7 @@ impl MergeState {
             // only reachable with a floor that no unset register backs (the no-op unset)
             out.push(place(Born::of((w.stamp, 0))));
         }
-        let below: BTreeSet<&Path> = self
-            .regs
-            .keys()
-            .map(|(l, q)| (l, q))
-            .chain(self.slots.keys().map(|(l, q, _, _)| (l, q)))
-            .filter(|(l, q)| al.contains(l) && q.is_below(p))
-            .map(|(_, q)| q)
-            .collect();
+        let below = self.paths_below(p, al);
         for q in below {
             if let Some(w) = self.winner_in(q, al, o)
                 && w.value.is_plain()
@@ -600,6 +594,40 @@ impl MergeState {
                 out.push(place(bq));
             }
             out.extend(slot_survivors(q));
+        }
+        out
+    }
+
+    /// The paths below `p` that have a register or a counter slot in an alive life (the model's
+    /// `{k[1] for k in regs + slots if k[0] in al and is_under(k[1], p)}`), without a scan of the maps:
+    /// the maps are ordered by (life, path) and a path sorts before every path it is a prefix of, so
+    /// the descendants of `p` in one life are the keys right after `p`, one contiguous run. The cost is
+    /// that of the descendants, not of the state (D-1 of the review: a scan made the read quadratic).
+    fn paths_below<'a>(&'a self, p: &Path, al: &BTreeSet<MStamp>) -> BTreeSet<&'a Path> {
+        let mut out = BTreeSet::new();
+        // the smallest writer, and no generation (which sorts first), as `slots_at` does
+        let least = WriterId { node: NodeId::from_bytes([0; 16]), epoch: Epoch([0; Epoch::LEN]) };
+        for l in al {
+            for ((kl, q), _) in
+                self.regs.range((Bound::Excluded((*l, p.clone())), Bound::Unbounded))
+            {
+                #[cfg(test)]
+                super::work::bump(super::work::Counter::Visits, 1);
+                if kl != l || !q.is_below(p) {
+                    break;
+                }
+                out.insert(q);
+            }
+            for ((kl, q, _, _), _) in self.slots.range((*l, p.clone(), least, None)..) {
+                #[cfg(test)]
+                super::work::bump(super::work::Counter::Visits, 1);
+                if kl != l || !(q == p || q.is_below(p)) {
+                    break;
+                }
+                if q != p {
+                    out.insert(q);
+                }
+            }
         }
         out
     }
