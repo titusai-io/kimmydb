@@ -457,7 +457,13 @@ impl MergeState {
         let mut terms: Vec<(MStamp, ObsKey, Num)> = Vec::new();
         for (k, s) in self.counted_in(p, al, win, o) {
             let ob = win.and_then(|w| w.obs.get(&k));
-            let d = ob.map_or(s.total, |x| s.total.sub_sat(&x.1, &mut cut));
+            let d = ob.map_or(s.total, |x| {
+                if o.no_decimal_saturation() {
+                    s.total.sub(&x.1)
+                } else {
+                    s.total.sub_sat(&x.1, &mut cut)
+                }
+            });
             if !d.is_zero() || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.0 != s.stamp))
             {
                 terms.push((s.stamp, k, d));
@@ -476,7 +482,11 @@ impl MergeState {
         let kind = terms.iter().map(|t| t.2.kind()).chain(base.map(|b| b.kind())).max()?;
         let mut acc = base.map_or(Num::zero(kind), |b| b.to_kind(kind));
         for (_, _, d) in &terms {
-            acc = acc.add_sat(&d.to_kind(kind), &mut cut);
+            acc = if o.no_decimal_saturation() {
+                acc.add(&d.to_kind(kind))
+            } else {
+                acc.add_sat(&d.to_kind(kind), &mut cut)
+            };
         }
         // Q11: a merge that crosses either bound saturates: an integer at the integer bound, a
         // decimal at the largest finite value of its sign.

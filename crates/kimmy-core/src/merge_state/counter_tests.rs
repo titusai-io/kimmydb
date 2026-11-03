@@ -439,7 +439,7 @@ fn a_decimal_operand_on_a_double_base_makes_a_decimal_register_that_later_counts
 fn the_counter_mutants_are_caught() {
     type Switch = fn(&mut JoinOptions);
     type Scenario = fn(&JoinOptions) -> Result<(), String>;
-    let cases: [(&str, Switch, Scenario); 4] = [
+    let cases: [(&str, Switch, Scenario); 5] = [
         (
             "slots are added in the order of their stamps, not of their writers",
             |o| o.set_sum_in_stamp_order(true),
@@ -459,6 +459,11 @@ fn the_counter_mutants_are_caught() {
             "an Int64 cell wraps instead of saturating",
             |o| o.set_no_saturation(true),
             int_saturation_scenario,
+        ),
+        (
+            "a Decimal128 cell overflows to an infinity instead of saturating",
+            |o| o.set_no_decimal_saturation(true),
+            decimal_saturation_scenario,
         ),
     ];
     for (what, mutate, scenario) in cases {

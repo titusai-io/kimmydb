@@ -193,6 +193,11 @@ impl Num {
         self.combine(other, false, None)
     }
 
+    /// `self - other` in the join of the two types, without saturation.
+    pub(super) fn sub(&self, other: &Num) -> Num {
+        self.combine(other, true, None)
+    }
+
     /// `self + other` for the read side: a decimal that overflows from finite inputs saturates
     /// at the largest finite value of its sign, and `saturated` holds that sign (`true`: negative).
     pub(super) fn add_sat(&self, other: &Num, saturated: &mut Option<bool>) -> Num {

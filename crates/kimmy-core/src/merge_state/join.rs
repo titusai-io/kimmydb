@@ -86,6 +86,10 @@ pub struct JoinOptions {
     /// An integer cell that crosses the integer bound wraps instead of saturating.
     #[cfg(any(test, feature = "merge-mutants"))]
     no_saturation: bool,
+    /// A `Decimal128` cell that overflows from finite parts becomes an infinity instead of
+    /// saturating at the largest finite value of its sign.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_decimal_saturation: bool,
     /// An `Int32` cell that outgrows the `i32` range saturates instead of becoming an `Int64`.
     #[cfg(any(test, feature = "merge-mutants"))]
     int32_saturates: bool,
@@ -139,6 +143,8 @@ impl Default for JoinOptions {
             sum_in_stamp_order: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             no_saturation: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_decimal_saturation: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             int32_saturates: false,
             #[cfg(any(test, feature = "merge-mutants"))]
@@ -208,6 +214,7 @@ impl JoinOptions {
     switch!(write_below_scalar, set_write_below_scalar, false);
     switch!(sum_in_stamp_order, set_sum_in_stamp_order, false);
     switch!(no_saturation, set_no_saturation, false);
+    switch!(no_decimal_saturation, set_no_decimal_saturation, false);
     switch!(int32_saturates, set_int32_saturates, false);
     switch!(slot_never_widens, set_slot_never_widens, false);
     switch!(no_contributor_cap, set_no_contributor_cap, false);
