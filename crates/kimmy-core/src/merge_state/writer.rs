@@ -128,8 +128,9 @@ fn expand(at: &Path, v: &Value, out: &mut Vec<(Path, Value)>) -> Result<(), Inva
 /// is a one-segment path, distinct, and each value legal input. `None` refuses the document.
 fn expand_document(fields: &[(Path, Value)]) -> Option<Vec<(Path, Value)>> {
     let mut out = Vec::new();
-    for (i, (p, v)) in fields.iter().enumerate() {
-        if p.segments().len() != 1 || fields[..i].iter().any(|(q, _)| q == p) {
+    let mut named = BTreeSet::new();
+    for (p, v) in fields {
+        if p.segments().len() != 1 || !named.insert(p) {
             return None;
         }
         v.check_input().ok()?;
@@ -701,10 +702,9 @@ impl Writer {
         let mut paths = Vec::new();
         let mut vals = BTreeMap::new();
         for (q, v) in soi_cells.iter().chain(set_cells.iter()) {
-            if !paths.contains(q) {
+            if vals.insert(q.clone(), v.clone()).is_none() {
                 paths.push(q.clone());
             }
-            vals.insert(q.clone(), v.clone());
         }
         s.vv.insert(st.writer, st.hlc);
         let mut rec = WriteRecord::new(WriteKind::Insert, Some(st), paths);
@@ -795,8 +795,9 @@ impl Writer {
                     .map(|(q, _)| q)
                     .filter(|q| q.segments().len() == path.segments().len() + 1)
                     .collect();
+                let named: BTreeSet<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
                 for q in old {
-                    if !fields.iter().any(|(name, _)| name == q.name()) {
+                    if !named.contains(q.name()) {
                         unset_subtree(vis, q, eff, &self.opts);
                     }
                 }
@@ -928,9 +929,10 @@ impl Writer {
         for (q, v) in doc {
             self.diff(&vis, q, v, &mut eff).ok()?;
         }
+        let kept: BTreeSet<&Path> = doc.iter().map(|(d, _)| d).collect();
         let tops: Vec<&Path> = vis.keys().filter(|q| q.segments().len() == 1).collect();
         for q in tops {
-            if !doc.iter().any(|(d, _)| d == q) {
+            if !kept.contains(q) {
                 unset_subtree(&vis, q, &mut eff, &self.opts);
             }
         }
