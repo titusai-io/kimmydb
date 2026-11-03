@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use super::join::{JoinOptions, join};
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot};
-use super::types::{LossKey, LossValue, MStamp, Path, Value, WriterId};
+use super::types::{InvalidPath, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,6 +84,75 @@ enum Source<'a> {
 struct Mint<'a> {
     source: Source<'a>,
     error: Option<StampError>,
+}
+
+/// The register effects of one write: the cells to set, in the order they were named.
+#[derive(Default)]
+struct Eff {
+    order: Vec<Path>,
+    vals: BTreeMap<Path, Value>,
+}
+
+impl Eff {
+    fn put(&mut self, p: Path, v: Value) {
+        if self.vals.insert(p.clone(), v).is_none() {
+            self.order.push(p);
+        }
+    }
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// The cells a value stands for at `at`: a `Document` is a map marker and the cells of its
+/// fields (the writer's expansion of a sub-document); anything else is its one cell.
+fn expand(at: &Path, v: &Value, out: &mut Vec<(Path, Value)>) -> Result<(), InvalidPath> {
+    if let Value::Document(fields) = v {
+        out.push((at.clone(), Value::Map));
+        for (name, x) in fields {
+            expand(&at.child(name)?, x, out)?;
+        }
+    } else {
+        out.push((at.clone(), v.clone()));
+    }
+    Ok(())
+}
+
+/// The fields of a whole document (insert, replace, creation of an upsert) as cells: each name
+/// is a one-segment path, distinct, and each value legal input. `None` refuses the document.
+fn expand_document(fields: &[(Path, Value)]) -> Option<Vec<(Path, Value)>> {
+    let mut out = Vec::new();
+    for (i, (p, v)) in fields.iter().enumerate() {
+        if p.segments().len() != 1 || fields[..i].iter().any(|(q, _)| q == p) {
+            return None;
+        }
+        v.check_input().ok()?;
+        expand(p, v, &mut out).ok()?;
+    }
+    Some(out)
+}
+
+/// The visible entries strictly below `p`, in path order.
+fn below<'a>(
+    vis: &'a BTreeMap<Path, Value>,
+    p: &Path,
+) -> impl Iterator<Item = (&'a Path, &'a Value)> {
+    let p = p.clone();
+    vis.range(p.clone()..).skip(1).take_while(move |(k, _)| k.is_below(&p))
+}
+
+/// The model's `_unset_subtree`: unset what the writer sees at `p` and below it.
+fn unset_subtree(vis: &BTreeMap<Path, Value>, p: &Path, eff: &mut Eff) {
+    for (q, _) in below(vis, p) {
+        eff.put(q.clone(), Value::Unset);
+    }
+    eff.put(p.clone(), Value::Unset);
+}
+
+/// The model's `getp` refusal (D-2): is some proper ancestor of `p` visible as a scalar or an
+/// array? The reference cannot create a field below one, so the write is refused.
+fn below_a_scalar(vis: &BTreeMap<Path, Value>, p: &Path) -> bool {
+    p.ancestors().any(|a| vis.get(&a).is_some_and(|v| *v != Value::Map))
 }
 
 /// The outcome of absorbing a state.
@@ -469,9 +538,7 @@ impl Writer {
 
     /// The body of [`Writer::insert`], with the stamp from `m`.
     fn insert_m(&mut self, fields: &[(Path, Value)], m: &mut Mint<'_>) -> Option<Written> {
-        if fields.iter().any(|(_, v)| v.check_register().is_err()) {
-            return None;
-        }
+        let cells = expand_document(fields)?;
         if !self.state.alive(&self.opts).is_empty() {
             return None;
         }
@@ -481,11 +548,11 @@ impl Writer {
             st,
             Life {
                 seen: s.deletes.keys().copied().collect(),
-                order: fields.iter().map(|(p, _)| p.clone()).collect(),
+                order: cells.iter().map(|(p, _)| p.clone()).collect(),
                 kind: LifeKind::Insert,
             },
         );
-        for (p, v) in fields {
+        for (p, v) in &cells {
             let generation = (!v.is_numeric()).then(|| {
                 let mut vv = s.vv.clone();
                 vv.insert(st.writer, st.hlc);
@@ -504,9 +571,9 @@ impl Writer {
         let mut rec = WriteRecord::new(
             WriteKind::Insert,
             Some(st),
-            fields.iter().map(|(p, _)| p.clone()).collect(),
+            cells.iter().map(|(p, _)| p.clone()).collect(),
         );
-        rec.vals = fields.iter().map(|(p, v)| (p.clone(), v.clone())).collect();
+        rec.vals = cells.iter().map(|(p, v)| (p.clone(), v.clone())).collect();
         Some(self.finish(st, rec))
     }
 
@@ -533,14 +600,23 @@ impl Writer {
         sets: &[(Path, Value)],
         m: &mut Mint<'_>,
     ) -> Option<Written> {
-        if fields.iter().chain(sets).any(|(_, v)| v.check_register().is_err()) {
+        if fields.iter().chain(sets).any(|(_, v)| v.check_input().is_err()) {
             return None;
         }
+        // The paths of one update must not meet: no path twice, none below another (the
+        // reference refuses a conflicting update).
         let mut paths: Vec<&Path> =
             fields.iter().chain(sets.iter()).map(|(q, _)| q).chain([inc_path]).collect();
         paths.sort_unstable();
-        if paths.windows(2).any(|w| w[0] == w[1]) {
+        if paths.windows(2).any(|w| w[0] == w[1] || w[1].is_below(w[0])) {
             return None;
+        }
+        let (mut soi_cells, mut set_cells) = (Vec::new(), Vec::new());
+        for (q, v) in fields {
+            expand(q, v, &mut soi_cells).ok()?;
+        }
+        for (q, v) in sets {
+            expand(q, v, &mut set_cells).ok()?;
         }
         if !self.state.alive(&self.opts).is_empty() {
             return None;
@@ -551,15 +627,15 @@ impl Writer {
             st,
             Life {
                 seen: s.deletes.keys().copied().collect(),
-                order: fields.iter().map(|(p, _)| p.clone()).collect(),
+                order: soi_cells.iter().map(|(p, _)| p.clone()).collect(),
                 kind: LifeKind::Upsert,
             },
         );
         // M1: a non-numeric creation value starts a generation, as in `insert`.
         let starts_gen = !self.opts.creation_without_generation();
         let mut cells: Vec<(&Path, &Value, bool)> = Vec::new();
-        cells.extend(fields.iter().map(|(q, v)| (q, v, true)));
-        cells.extend(sets.iter().map(|(q, v)| (q, v, false)));
+        cells.extend(soi_cells.iter().map(|(q, v)| (q, v, true)));
+        cells.extend(set_cells.iter().map(|(q, v)| (q, v, false)));
         for (q, v, soi) in cells {
             let generation = (starts_gen && !v.is_numeric()).then(|| {
                 let mut vv = s.vv.clone();
@@ -577,7 +653,7 @@ impl Writer {
         }
         let mut paths = Vec::new();
         let mut vals = BTreeMap::new();
-        for (q, v) in fields.iter().chain(sets.iter()) {
+        for (q, v) in soi_cells.iter().chain(set_cells.iter()) {
             if !paths.contains(q) {
                 paths.push(q.clone());
             }
@@ -588,7 +664,7 @@ impl Writer {
         rec.vals = vals;
         rec.upsert = true;
         rec.insert = true;
-        rec.soi = fields.iter().map(|(p, _)| p.clone()).collect();
+        rec.soi = soi_cells.iter().map(|(p, _)| p.clone()).collect();
         Some(self.finish(st, rec))
     }
 
@@ -640,26 +716,98 @@ impl Writer {
         Some(self.finish(st, rec))
     }
 
+    /// The model's `_diff`: the leaf effects of changing `path` from what the writer sees there
+    /// to `n`. Type-strict (Q4, ruled: only changed fields are written): a leaf is set when it
+    /// changed; a sub-document sets its changed leaves, unsets the old fields it lacks, and
+    /// writes its map marker when the path was not a map before or anything below it was
+    /// written. A scalar or an array over a map unsets what the writer saw below it. `Err`
+    /// when a field name cannot be a segment.
+    fn diff(
+        &self,
+        vis: &BTreeMap<Path, Value>,
+        path: &Path,
+        n: &Value,
+        eff: &mut Eff,
+    ) -> Result<(), InvalidPath> {
+        let o = vis.get(path);
+        let rewrite = self.opts.rewrite_unchanged();
+        let was_map = o == Some(&Value::Map);
+        if let Value::Document(fields) = n {
+            let n0 = eff.len();
+            for (name, v) in fields {
+                self.diff(vis, &path.child(name)?, v, eff)?;
+            }
+            if was_map {
+                let old: Vec<&Path> = below(vis, path)
+                    .map(|(q, _)| q)
+                    .filter(|q| q.segments().len() == path.segments().len() + 1)
+                    .collect();
+                for q in old {
+                    if !fields.iter().any(|(name, _)| name == q.name()) {
+                        unset_subtree(vis, q, eff);
+                    }
+                }
+            }
+            if !was_map || eff.len() > n0 || rewrite {
+                eff.put(path.clone(), Value::Map);
+            }
+        } else if was_map {
+            for (q, _) in below(vis, path) {
+                eff.put(q.clone(), Value::Unset);
+            }
+            eff.put(path.clone(), n.clone());
+        } else if rewrite || !Value::same(o, n) {
+            eff.put(path.clone(), n.clone());
+        }
+        Ok(())
+    }
+
+    /// Set the cells of `eff` in one write (one stamp), as the model's `_write_effects`.
+    fn commit(&mut self, eff: Eff, m: &mut Mint<'_>) -> Option<Written> {
+        let st = self.mint(m)?;
+        self.state.vv.insert(st.writer, st.hlc);
+        let l = self.write_life();
+        for q in &eff.order {
+            self.setreg(q, eff.vals[q].clone(), st);
+        }
+        let mut rec = WriteRecord::new(WriteKind::Reg, l, eff.order);
+        rec.vals = eff.vals;
+        Some(self.finish(st, rec))
+    }
+
     /// The body of [`Writer::write_set`], with the stamp from `m`.
     fn write_set_m(&mut self, path: &Path, v: Value, m: &mut Mint<'_>) -> Option<Written> {
-        v.check_register().ok()?;
+        v.check_input().ok()?;
         let vis = self.visible()?;
-        if Value::same(vis.get(path), &v) {
+        if !self.opts.write_below_scalar() && below_a_scalar(&vis, path) {
             return None;
         }
-        self.write_reg_unchecked(path, v, m)
+        let mut eff = Eff::default();
+        self.diff(&vis, path, &v, &mut eff).ok()?;
+        if eff.len() == 0 {
+            return None;
+        }
+        self.commit(eff, m)
     }
 
     /// The body of [`Writer::write_unset`], with the stamp from `m`.
     fn write_unset_m(&mut self, path: &Path, m: &mut Mint<'_>) -> Option<Written> {
         let vis = self.visible()?;
+        if !self.opts.write_below_scalar() && below_a_scalar(&vis, path) {
+            return None;
+        }
         vis.get(path)?;
-        self.write_reg_unchecked(path, Value::Unset, m)
+        let mut eff = Eff::default();
+        unset_subtree(&vis, path, &mut eff);
+        self.commit(eff, m)
     }
 
     /// The body of [`Writer::write_inc`], with the stamp from `m`.
     fn write_inc_m(&mut self, p: &Path, n: i64, m: &mut Mint<'_>) -> Option<Written> {
         let vis = self.visible()?;
+        if !self.opts.write_below_scalar() && below_a_scalar(&vis, p) {
+            return None;
+        }
         let cur = vis.get(p);
         let b = i128::from(self.opts.int_bound());
         match cur {
@@ -670,7 +818,9 @@ impl Writer {
                 }
             }
             Some(Value::Double(d)) => {
-                return self.write_reg_unchecked(p, Value::Double(d + n as f64), m);
+                let mut eff = Eff::default();
+                eff.put(p.clone(), Value::Double(d + n as f64));
+                return self.commit(eff, m);
             }
             _ => return None,
         }
@@ -693,49 +843,26 @@ impl Writer {
         Some(self.finish(st, rec))
     }
 
-    /// The register write an increment of a double base turns into: the model
-    /// rewrites `op, arg = "set", cur + arg` and then runs the set path, whose
-    /// "unchanged value" check has already been passed.
-    fn write_reg_unchecked(&mut self, p: &Path, v: Value, m: &mut Mint<'_>) -> Option<Written> {
-        let st = self.mint(m)?;
-        self.state.vv.insert(st.writer, st.hlc);
-        let l = self.write_life();
-        self.setreg(p, v.clone(), st);
-        let mut rec = WriteRecord::new(WriteKind::Reg, l, vec![p.clone()]);
-        rec.vals.insert(p.clone(), v);
-        Some(self.finish(st, rec))
-    }
-
-    /// The body of [`Writer::write_replace`], with the stamp from `m`.
+    /// The body of [`Writer::write_replace`], with the stamp from `m`. The document's fields
+    /// are one-segment paths; a field that is a `Document` is diffed against the map the writer
+    /// sees, so only the leaves that changed are written.
     fn write_replace_m(&mut self, doc: &[(Path, Value)], m: &mut Mint<'_>) -> Option<Written> {
-        if doc.iter().any(|(_, v)| v.check_register().is_err()) {
-            return None;
-        }
+        expand_document(doc)?;
         let vis = self.visible()?;
-        let changes: Vec<(&Path, &Value)> =
-            doc.iter().filter(|(q, v)| !Value::same(vis.get(q), v)).map(|(q, v)| (q, v)).collect();
-        let drops: Vec<&Path> = vis.keys().filter(|q| !doc.iter().any(|(d, _)| d == *q)).collect();
-        if changes.is_empty() && drops.is_empty() {
+        let mut eff = Eff::default();
+        for (q, v) in doc {
+            self.diff(&vis, q, v, &mut eff).ok()?;
+        }
+        let tops: Vec<&Path> = vis.keys().filter(|q| q.segments().len() == 1).collect();
+        for q in tops {
+            if !doc.iter().any(|(d, _)| d == q) {
+                unset_subtree(&vis, q, &mut eff);
+            }
+        }
+        if eff.len() == 0 {
             return None;
         }
-        let st = self.mint(m)?;
-        self.state.vv.insert(st.writer, st.hlc);
-        let l = self.write_life();
-        let mut paths = Vec::new();
-        let mut vals = BTreeMap::new();
-        for (q, v) in changes {
-            self.setreg(q, v.clone(), st);
-            paths.push(q.clone());
-            vals.insert(q.clone(), v.clone());
-        }
-        for q in drops {
-            self.setreg(q, Value::Unset, st);
-            paths.push(q.clone());
-            vals.insert(q.clone(), Value::Unset);
-        }
-        let mut rec = WriteRecord::new(WriteKind::Reg, l, paths);
-        rec.vals = vals;
-        Some(self.finish(st, rec))
+        self.commit(eff, m)
     }
 
     /// The body of [`Writer::write_delete`], with the stamp from `m`.

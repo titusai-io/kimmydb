@@ -8,6 +8,14 @@
 //!
 //! The pieces:
 //!
+//! * Nested documents: a cell is keyed by `(life, segment path)`. A sub-document is a [`Value::Map`]
+//!   marker at its path plus a cell for each leaf (an array is one atomic value). The read side
+//!   applies the recursive type rule ([`MergeState::visible`]); a write diffs a sub-document
+//!   against what the writer sees and writes only the leaves that changed; a write below a scalar
+//!   or an array is refused; the join reports `typeClash` and `arrayClash`. NOT built here, by
+//!   ruling: the implicit map marker a leaf write would leave on absent parents (so an emptied
+//!   implicit map vanishes), a map-creating `$inc`, the field-order state and the multi-operator
+//!   update, which the next model round revises.
 //! * [`MergeState`] holds lives, deletes, dead lives, registers, counter slots,
 //!   generation marks, the version vector and the loss records.
 //! * [`join()`] merges two states and reports the loss records that are new
@@ -44,6 +52,8 @@ mod writer;
 #[cfg(test)]
 mod compact_tests;
 #[cfg(test)]
+mod nested_tests;
+#[cfg(test)]
 mod prop_tests;
 #[cfg(test)]
 mod tests;
@@ -68,6 +78,11 @@ const _: () = {
     use std::collections::{BTreeMap, BTreeSet};
     let _: fn(&str) -> Result<Path, InvalidPath> = Path::flat;
     let _: fn(&Path) -> &[String] = Path::segments;
+    let _: fn(&Path, &str) -> Result<Path, InvalidPath> = Path::child;
+    let _: fn(&Path) -> Option<Path> = Path::parent;
+    let _: fn(&Path) -> &str = Path::name;
+    let _: fn(&Path, &Path) -> bool = Path::is_below;
+    let _: fn(&Value) -> bool = Value::is_plain;
     let _: fn(&LossAt) -> Option<&Path> = LossAt::field;
     let _: fn(LossKind, Path, MStamp) -> LossKey = LossKey::field;
     let _: fn(LossKind, MStamp) -> LossKey = LossKey::document;

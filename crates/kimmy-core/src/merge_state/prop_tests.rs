@@ -219,10 +219,14 @@ fn bare(mut s: MergeState) -> MergeState {
 /// between its three states, more than R. At R = 20 and R = 40 none of 3,000 triples differs,
 /// and `join_laws_retention_beyond_the_spread` asserts exact associativity there.
 fn check_laws(o: &JoinOptions, exact_assoc: bool, seeds: u64, steps: usize, count: usize) {
-    let ps = pools(seeds, steps, o);
+    check_laws_on(o, exact_assoc, &pools(seeds, steps, o), count);
+}
+
+/// [`check_laws`] over the given pools of states.
+fn check_laws_on(o: &JoinOptions, exact_assoc: bool, ps: &[Vec<MergeState>], count: usize) {
     let mut assoc_loss_diff = 0;
     let mut assoc_state_diff = 0;
-    for (k, (a, b, c)) in triples(&ps, count).into_iter().enumerate() {
+    for (k, (a, b, c)) in triples(ps, count).into_iter().enumerate() {
         let j = |x: &MergeState, y: &MergeState| join(x, y, o).0;
         let ab = j(a, b);
         let ba = j(b, a);
@@ -246,8 +250,11 @@ fn check_laws(o: &JoinOptions, exact_assoc: bool, seeds: u64, steps: usize, coun
             a.losses.keys().all(|k| ab.losses.contains_key(k) || k.stamp.hlc < hz),
             "monotone, triple {k}"
         );
-        // The hash does not depend on the join order.
-        assert_eq!(ab.state_hash(), ba.state_hash());
+        // The hash does not depend on the join order (version 1 where it can spell the state).
+        assert_eq!(ab.compact_hash(), ba.compact_hash());
+        if ab.v1_can_hold() {
+            assert_eq!(ab.state_hash(), ba.state_hash());
+        }
     }
     // Not a law: report-only, so the NOTE above stays honest.
     assert!(
@@ -516,4 +523,195 @@ fn decode_mutation_fuzz() {
 
 fn o_default() -> JoinOptions {
     opts(1_000_000_000)
+}
+
+// ---- nested documents ------------------------------------------------------------------
+
+/// A path of the nested workload, from dotted names (none holds a dot).
+fn np(dotted: &str) -> Path {
+    Path::new(dotted.split('.')).unwrap()
+}
+
+/// A scalar, an array (documents inside it too) or a sub-document, up to two levels deep.
+fn nested_value(rng: &mut Rng, depth: usize) -> Value {
+    match rng.below(if depth < 2 { 8 } else { 5 }) {
+        0 | 1 => pool_value(rng),
+        2 => Value::Array(vec![pool_value(rng), pool_value(rng)]),
+        3 => Value::Array(vec![Value::Document(vec![("k".into(), pool_value(rng))])]),
+        4 => Value::Null,
+        _ => {
+            let names = ["b", "c", "d"];
+            let n = rng.below(3);
+            let mut f: Vec<(String, Value)> = Vec::new();
+            for _ in 0..n {
+                let k = *rng.pick(&names);
+                if !f.iter().any(|(q, _)| q == k) {
+                    f.push((k.to_string(), nested_value(rng, depth + 1)));
+                }
+            }
+            Value::Document(f)
+        }
+    }
+}
+
+/// Like [`run`], but over nested documents: sub-documents set and replaced, scalars and arrays
+/// written over maps and the reverse, nested counters, unsets of whole sub-documents.
+fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let n = 3 + rng.below(2);
+    let mut ws: Vec<Writer> = (0..n)
+        .map(|k| {
+            let id = WriterId {
+                node: NodeId::from_bytes([b'A' + k as u8; 16]),
+                epoch: Epoch::from_u64(0),
+            };
+            Writer::new(id, o.clone())
+        })
+        .collect();
+    let init = Value::Document(vec![
+        ("b".into(), Value::Int64(1)),
+        ("c".into(), Value::Document(vec![("d".into(), Value::String("s".into()))])),
+    ]);
+    let items = Value::Array(vec![Value::Int64(0)]);
+    ws[0].insert(&[(p("x"), Value::Int64(100)), (p("a"), init), (p("items"), items)], 0);
+    let mut pool = Vec::new();
+    let all =
+        ["x", "a", "a.b", "a.c", "a.c.d", "a.e", "m", "m.k", "items", "items", "items", "a.c.d.z"];
+    for _ in 0..steps {
+        let m = rng.below(n);
+        let skew = *rng.pick(&[0, 0, 0, 4]);
+        if rng.below(100) < 45 {
+            let mut other = rng.below(n);
+            if other == m {
+                other = (m + 1) % n;
+            }
+            let st = ws[other].state.clone();
+            ws[m].receive(&st);
+        } else {
+            let path = np(rng.pick(&all));
+            let w = &mut ws[m];
+            match rng.below(14) {
+                0..=3 => {
+                    let v = if path == np("items") {
+                        Value::Array(
+                            (0..1 + rng.below(3)).map(|k| Value::Int64(k as i64)).collect(),
+                        )
+                    } else {
+                        nested_value(&mut rng, 0)
+                    };
+                    w.write_set(&path, v, skew);
+                }
+                4..=5 => {
+                    w.write_unset(&path, skew);
+                }
+                6..=8 => {
+                    w.write_inc(&path, pool_inc(&mut rng), skew);
+                }
+                9 => {
+                    let a = nested_value(&mut rng, 0);
+                    let doc = vec![(p("x"), pool_value(&mut rng)), (p("a"), a)];
+                    w.write_replace(&doc, skew);
+                }
+                10 => {
+                    w.write_delete(skew);
+                }
+                _ => {
+                    let v = nested_value(&mut rng, 0);
+                    w.insert(&[(p("x"), Value::Int64(100)), (p("a"), v)], skew);
+                }
+            }
+        }
+        pool.push(ws[m].state.clone());
+    }
+    pool
+}
+
+fn nested_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+    (1..=seeds).map(|s| run_nested(s, steps, o)).collect()
+}
+
+/// The visible document is well formed: every path above a visible path is a visible map, and
+/// only a map has anything below it.
+fn assert_well_formed(st: &MergeState, o: &JoinOptions) {
+    let Some(vis) = st.visible(o) else { return };
+    for (path, v) in &vis {
+        for a in path.ancestors() {
+            assert_eq!(vis.get(&a), Some(&Value::Map), "{a} above {path}");
+        }
+        assert!(!matches!(v, Value::Document(_) | Value::Unset), "{path}: {v:?}");
+    }
+    assert!(st.regs.values().all(|r| r.value.check_register().is_ok()));
+}
+
+#[test]
+fn nested_join_laws() {
+    for (o, exact) in [(opts(1_000_000_000), true), (opts(20), true), (opts(6), false)] {
+        let ps = nested_pools(60, 26, &o);
+        let (mut maps, mut type_clash, mut array_clash, mut docs) = (0, 0, 0, 0);
+        for st in ps.iter().flatten() {
+            maps += st.regs.values().filter(|r| r.value == Value::Map).count();
+            type_clash += st.losses.keys().filter(|k| k.kind == LossKind::TypeClash).count();
+            array_clash += st.losses.keys().filter(|k| k.kind == LossKind::ArrayClash).count();
+            docs += usize::from(!st.v1_can_hold());
+        }
+        assert!(
+            maps > 0 && type_clash > 0 && array_clash > 0 && docs > 0,
+            "the runs must exercise markers ({maps}), typeClash ({type_clash}), arrayClash ({array_clash}), documents in arrays ({docs})"
+        );
+        check_laws_on(&o, exact, &ps, 300);
+    }
+}
+
+#[test]
+fn nested_states_are_well_formed_and_round_trip_in_both_codecs() {
+    for o in [opts(1_000_000_000), opts(6)] {
+        for st in nested_pools(40, 26, &o).iter().flatten() {
+            assert_well_formed(st, &o);
+            let c = st.encode_compact();
+            let back = MergeState::decode_compact(&c).expect("decode_compact");
+            assert_eq!(&back, st);
+            assert_eq!(back.encode_compact(), c);
+            assert_eq!(back.compact_hash(), st.compact_hash());
+            if st.v1_can_hold() {
+                let v1 = MergeState::decode(&st.encode()).expect("decode");
+                assert_eq!(&v1, st);
+                assert_eq!(v1.state_hash(), st.state_hash());
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_hashes_are_a_function_of_the_state_not_of_the_join_order() {
+    let o = opts(1_000_000_000);
+    let ps = nested_pools(40, 26, &o);
+    let mut n = 0;
+    for (a, b, _) in triples(&ps, 300) {
+        let (ab, ba) = (join(a, b, &o).0, join(b, a, &o).0);
+        assert_eq!(ab.compact_hash(), ba.compact_hash());
+        assert_eq!(ab.compact_bytes(), ba.compact_bytes());
+        if ab.v1_can_hold() {
+            assert_eq!(ab.state_hash(), ba.state_hash());
+        }
+        assert_eq!(ab.visible(&o), ba.visible(&o));
+        n += 1;
+    }
+    assert_eq!(n, 300);
+}
+
+#[test]
+fn a_nested_writers_hash_equals_every_receivers() {
+    // The writer's own normalised state is what a receiver builds from it.
+    let o = opts(1_000_000_000);
+    for ps in nested_pools(30, 26, &o) {
+        for st in &ps {
+            let mut r = Writer::new(
+                WriterId { node: NodeId::from_bytes([b'Z'; 16]), epoch: Epoch::from_u64(0) },
+                o.clone(),
+            );
+            r.receive(st);
+            assert_eq!(r.state.compact_hash(), st.compact_hash());
+            assert_well_formed(&r.state, &o);
+        }
+    }
 }

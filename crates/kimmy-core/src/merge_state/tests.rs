@@ -16,63 +16,63 @@ use crate::ids::NodeId;
 fn nid(c: char) -> NodeId {
     NodeId::from_bytes([c as u8; 16])
 }
-fn wid(c: char, epoch: u64) -> WriterId {
+pub(super) fn wid(c: char, epoch: u64) -> WriterId {
     WriterId { node: nid(c), epoch: Epoch::from_u64(epoch) }
 }
-fn h(n: u64) -> Hlc {
+pub(super) fn h(n: u64) -> Hlc {
     Hlc::new(n, 0)
 }
-fn i(n: i64) -> Value {
+pub(super) fn i(n: i64) -> Value {
     Value::Int64(n)
 }
-fn s(x: &str) -> Value {
+pub(super) fn s(x: &str) -> Value {
     Value::String(x.to_string())
 }
-fn f(x: f64) -> Value {
+pub(super) fn f(x: f64) -> Value {
     Value::Double(x)
 }
 /// A one-segment path.
-fn p(x: &str) -> Path {
+pub(super) fn p(x: &str) -> Path {
     Path::flat(x).unwrap()
 }
 /// The fields of a flat document as paths.
-fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
+pub(super) fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
     f.iter().map(|(k, v)| (p(k), v.clone())).collect()
 }
-fn opts() -> JoinOptions {
+pub(super) fn opts() -> JoinOptions {
     JoinOptions::default()
 }
 fn ret(r: u64) -> JoinOptions {
     JoinOptions::new(r, i64::MAX).unwrap()
 }
-fn doc(kv: &[(&str, Value)]) -> Option<BTreeMap<Path, Value>> {
+pub(super) fn doc(kv: &[(&str, Value)]) -> Option<BTreeMap<Path, Value>> {
     Some(kv.iter().map(|(k, v)| (p(k), v.clone())).collect())
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum OKey {
+pub(super) enum OKey {
     W(MStamp),
     L(LossKey),
 }
 
 #[derive(Clone)]
-enum Ent {
+pub(super) enum Ent {
     W(MStamp, MergeState),
     L(LossKey, LossValue),
 }
 
 /// The model's `Member`: a writer with an oplog of entries and an event list.
-struct Mem {
-    name: char,
-    epoch: u64,
-    w: Writer,
-    oplog: BTreeMap<OKey, Ent>,
-    events: Vec<LossKey>,
-    saved: Vec<(MergeState, BTreeMap<OKey, Ent>)>,
+pub(super) struct Mem {
+    pub(super) name: char,
+    pub(super) epoch: u64,
+    pub(super) w: Writer,
+    pub(super) oplog: BTreeMap<OKey, Ent>,
+    pub(super) events: Vec<LossKey>,
+    pub(super) saved: Vec<(MergeState, BTreeMap<OKey, Ent>)>,
 }
 
 impl Mem {
-    fn new(name: char, o: &JoinOptions) -> Self {
+    pub(super) fn new(name: char, o: &JoinOptions) -> Self {
         Mem {
             name,
             epoch: 0,
@@ -82,24 +82,24 @@ impl Mem {
             saved: Vec::new(),
         }
     }
-    fn log(&mut self, wr: Option<Written>) -> Option<MStamp> {
+    pub(super) fn log(&mut self, wr: Option<Written>) -> Option<MStamp> {
         let wr = wr?;
         self.oplog.insert(OKey::W(wr.stamp), Ent::W(wr.stamp, self.w.state.clone()));
         Some(wr.stamp)
     }
-    fn ent(&self, st: MStamp) -> Ent {
+    pub(super) fn ent(&self, st: MStamp) -> Ent {
         self.oplog[&OKey::W(st)].clone()
     }
-    fn ins(&mut self, f: &[(&str, Value)], sk: u64) -> Option<MStamp> {
+    pub(super) fn ins(&mut self, f: &[(&str, Value)], sk: u64) -> Option<MStamp> {
         let r = self.w.insert(&fl(f), sk);
         self.log(r)
     }
-    fn upsert_inc(&mut self, path: &str, n: i64) -> Option<MStamp> {
+    pub(super) fn upsert_inc(&mut self, path: &str, n: i64) -> Option<MStamp> {
         let r = self.w.upsert_inc(&p(path), n, 0);
         self.log(r)
     }
     /// Returns `(life, inc stamp)`: the creation write and the increment write.
-    fn upsert_soi(
+    pub(super) fn upsert_soi(
         &mut self,
         f: &[(&str, Value)],
         path: &str,
@@ -113,19 +113,35 @@ impl Mem {
         self.log(Some(i));
         Some((life, inc))
     }
-    fn set(&mut self, path: &str, v: Value, sk: u64) -> Option<MStamp> {
+    pub(super) fn set(&mut self, path: &str, v: Value, sk: u64) -> Option<MStamp> {
         let r = self.w.write_set(&p(path), v, sk);
         self.log(r)
     }
-    fn inc(&mut self, path: &str, n: i64, sk: u64) -> Option<MStamp> {
+    pub(super) fn set_at(&mut self, path: &Path, v: Value, sk: u64) -> Option<MStamp> {
+        let r = self.w.write_set(path, v, sk);
+        self.log(r)
+    }
+    pub(super) fn unset_at(&mut self, path: &Path, sk: u64) -> Option<MStamp> {
+        let r = self.w.write_unset(path, sk);
+        self.log(r)
+    }
+    pub(super) fn inc_at(&mut self, path: &Path, n: i64, sk: u64) -> Option<MStamp> {
+        let r = self.w.write_inc(path, n, sk);
+        self.log(r)
+    }
+    pub(super) fn replace(&mut self, f: &[(&str, Value)], sk: u64) -> Option<MStamp> {
+        let r = self.w.write_replace(&fl(f), sk);
+        self.log(r)
+    }
+    pub(super) fn inc(&mut self, path: &str, n: i64, sk: u64) -> Option<MStamp> {
         let r = self.w.write_inc(&p(path), n, sk);
         self.log(r)
     }
-    fn del(&mut self) -> Option<MStamp> {
+    pub(super) fn del(&mut self) -> Option<MStamp> {
         let r = self.w.write_delete(0);
         self.log(r)
     }
-    fn absorb(&mut self, other: &MergeState, record: bool) -> bool {
+    pub(super) fn absorb(&mut self, other: &MergeState, record: bool) -> bool {
         let r = self.w.receive_report(other);
         for k in r.fresh {
             self.events.push(k.clone());
@@ -136,7 +152,7 @@ impl Mem {
         }
         r.changed
     }
-    fn receive_entry(&mut self, e: &Ent) {
+    pub(super) fn receive_entry(&mut self, e: &Ent) {
         match e {
             Ent::W(st, state) => {
                 if self.absorb(state, true) {
@@ -151,28 +167,28 @@ impl Mem {
             }
         }
     }
-    fn receive_snapshot(&mut self, other: &MergeState) {
+    pub(super) fn receive_snapshot(&mut self, other: &MergeState) {
         self.absorb(other, false);
     }
-    fn restore(&mut self) {
+    pub(super) fn restore(&mut self) {
         let (st, ol) = self.saved[0].clone();
         self.w.state = st;
         self.oplog = ol;
         self.epoch += 1;
         self.w.id = wid(self.name, self.epoch);
     }
-    fn visible(&self) -> Option<BTreeMap<Path, Value>> {
+    pub(super) fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.w.visible()
     }
-    fn canon(&self) -> Vec<u8> {
+    pub(super) fn canon(&self) -> Vec<u8> {
         self.w.state.canonical_bytes()
     }
-    fn loss_set(&self) -> BTreeSet<(LossKind, LossAt, MStamp)> {
+    pub(super) fn loss_set(&self) -> BTreeSet<(LossKind, LossAt, MStamp)> {
         self.w.state.losses.keys().map(|k| (k.kind, k.at.clone(), k.stamp)).collect()
     }
 }
 
-fn fresh_observer(o: &JoinOptions, seed: &[Ent]) -> Mem {
+pub(super) fn fresh_observer(o: &JoinOptions, seed: &[Ent]) -> Mem {
     let mut m = Mem::new('O', o);
     for e in seed {
         m.receive_entry(e);
@@ -180,7 +196,7 @@ fn fresh_observer(o: &JoinOptions, seed: &[Ent]) -> Mem {
     m
 }
 
-fn perms(n: usize) -> Vec<Vec<usize>> {
+pub(super) fn perms(n: usize) -> Vec<Vec<usize>> {
     fn go(cur: &mut Vec<usize>, used: &mut Vec<bool>, out: &mut Vec<Vec<usize>>) {
         if cur.len() == used.len() {
             out.push(cur.clone());
@@ -202,7 +218,7 @@ fn perms(n: usize) -> Vec<Vec<usize>> {
 }
 
 /// Every delivery order of `ents` into a fresh observer seeded with `seed`.
-fn all_orders(o: &JoinOptions, ents: &[Ent], seed: &[Ent]) -> Vec<(Vec<usize>, Mem)> {
+pub(super) fn all_orders(o: &JoinOptions, ents: &[Ent], seed: &[Ent]) -> Vec<(Vec<usize>, Mem)> {
     perms(ents.len())
         .into_iter()
         .map(|p| {
@@ -215,7 +231,7 @@ fn all_orders(o: &JoinOptions, ents: &[Ent], seed: &[Ent]) -> Vec<(Vec<usize>, M
         .collect()
 }
 
-fn sync(ms: &mut [Mem]) {
+pub(super) fn sync(ms: &mut [Mem]) {
     for _ in 0..12 {
         let before: Vec<_> = ms.iter().map(Mem::canon).collect();
         for r in 0..ms.len() {
@@ -234,7 +250,7 @@ fn sync(ms: &mut [Mem]) {
     }
 }
 
-fn pull_all(obs: &mut [Mem]) {
+pub(super) fn pull_all(obs: &mut [Mem]) {
     for a in 0..obs.len() {
         for b in 0..obs.len() {
             let es: Vec<Ent> = obs[b].oplog.values().cloned().collect();
@@ -1858,15 +1874,16 @@ fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
     let a_b = Path::flat("a.b").unwrap();
     let abc = Path::new(["a", "b", "c"]).unwrap();
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[(a_b.clone(), i(1)), (ab.clone(), i(2)), (abc.clone(), s("x"))], 0).unwrap();
+    w.insert(&[(a_b.clone(), i(1)), (p("a"), Value::Document(vec![("b".into(), doc_c("x"))]))], 0)
+        .unwrap();
     let vis = w.visible().unwrap();
-    assert_eq!(vis.len(), 3);
-    assert_eq!((&vis[&a_b], &vis[&ab], &vis[&abc]), (&i(1), &i(2), &s("x")));
-    assert!(w.write_set(&ab, i(3), 0).is_some());
+    assert_eq!(vis.len(), 4);
+    assert_eq!((&vis[&a_b], &vis[&ab], &vis[&abc]), (&i(1), &Value::Map, &s("x")));
+    assert!(w.write_set(&abc, i(3), 0).is_some());
     assert!(w.write_inc(&a_b, 4, 0).is_some());
-    assert!(w.write_unset(&abc, 0).is_some());
+    assert!(w.write_unset(&ab, 0).is_some());
     let vis = w.visible().unwrap();
-    assert_eq!((&vis[&a_b], &vis[&ab], vis.get(&abc)), (&i(5), &i(3), None));
+    assert_eq!((&vis[&a_b], vis.get(&ab), vis.get(&abc)), (&i(5), None, None));
     // The state encodes, decodes and hashes with the paths intact.
     let enc = w.state.encode();
     let back = MergeState::decode(&enc).unwrap();
@@ -1876,7 +1893,7 @@ fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
     let mut x = Writer::new(wid('A', 0), opts());
     let mut y = Writer::new(wid('A', 0), opts());
     x.insert(&[(a_b, i(1))], 0).unwrap();
-    y.insert(&[(ab, i(1))], 0).unwrap();
+    y.insert(&[(p("a"), Value::Document(vec![("b".into(), i(1))]))], 0).unwrap();
     assert_ne!(x.state.canonical_bytes(), y.state.canonical_bytes());
     assert_ne!(x.state.state_hash(), y.state.state_hash());
     // Two writers merge a nested path and its dotted twin without mixing them.
@@ -1892,6 +1909,11 @@ fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
     );
 }
 
+/// A sub-document with one field `c`.
+fn doc_c(v: &str) -> Value {
+    Value::Document(vec![("c".into(), s(v))])
+}
+
 #[test]
 fn odd_field_names_are_distinct_cells_and_round_trip() {
     // Empty, dotted, `$`-prefixed and nested names, each a different path, in the order the
@@ -1901,12 +1923,19 @@ fn odd_field_names_are_distinct_cells_and_round_trip() {
             .iter()
             .map(|s| Path::new(s.iter().copied()).unwrap())
             .collect();
+    let fields = vec![
+        (p(""), Value::Document(vec![("".into(), i(0))])),
+        (p("$set"), i(1)),
+        (p("a"), Value::Document(vec![("".into(), i(2)), ("b".into(), i(3))])),
+        (p("a\u{1}"), i(4)),
+        (p("a.b"), i(5)),
+    ];
     let mut w = Writer::new(wid('A', 0), opts());
-    let fields: Vec<(Path, Value)> =
-        paths.iter().enumerate().map(|(k, q)| (q.clone(), i(k as i64))).collect();
     w.insert(&fields, 0).unwrap();
     let vis = w.visible().unwrap();
     assert_eq!(vis.keys().cloned().collect::<Vec<_>>(), paths);
+    assert_eq!(vis[&p("")], Value::Map);
+    assert_eq!(vis[&Path::new(["a", "b"]).unwrap()], i(3));
     let enc = w.state.encode();
     let back = MergeState::decode(&enc).unwrap();
     assert_eq!(back, w.state);

@@ -85,6 +85,31 @@ impl Path {
     pub fn segments(&self) -> &[String] {
         &self.0
     }
+
+    /// The path one level down: this path and `name` as the last segment.
+    pub fn child(&self, name: &str) -> Result<Self, InvalidPath> {
+        Self::new(self.0.iter().map(String::as_str).chain([name]))
+    }
+
+    /// The path above this one, `None` for a top-level field.
+    pub fn parent(&self) -> Option<Path> {
+        (self.0.len() > 1).then(|| Path(self.0[..self.0.len() - 1].to_vec()))
+    }
+
+    /// The last segment: the field's own name.
+    pub fn name(&self) -> &str {
+        self.0.last().map_or("", String::as_str)
+    }
+
+    /// The paths above this one, outermost first (`a.b.c` gives `a` and `a.b`).
+    pub fn ancestors(&self) -> impl Iterator<Item = Path> + '_ {
+        (1..self.0.len()).map(|n| Path(self.0[..n].to_vec()))
+    }
+
+    /// Is this path strictly below `other` (a descendant, not the path itself)?
+    pub fn is_below(&self, other: &Path) -> bool {
+        self.0.len() > other.0.len() && self.0[..other.0.len()] == other.0[..]
+    }
 }
 
 /// The segments joined by `.`, for messages and for tools that name a path by a dotted string.
@@ -172,6 +197,11 @@ pub enum InvalidValue {
 }
 
 impl Value {
+    /// A plain value of a cell: not an unset and not the map marker (the model's `is_val`).
+    pub fn is_plain(&self) -> bool {
+        !matches!(self, Value::Unset | Value::Map)
+    }
+
     /// May this value be a register of the state? Not a top-level `Document`; an array's
     /// elements may be anything but the map marker (documents among them, at any depth).
     pub fn check_register(&self) -> Result<(), InvalidValue> {
@@ -216,6 +246,7 @@ impl Value {
                 }
                 f.iter().try_for_each(|(_, x)| x.check_input())
             }
+            Value::Map => Err(InvalidValue::MapMarker),
             v => v.check_register(),
         }
     }

@@ -97,8 +97,8 @@ fn every_bson_type_and_odd_names_round_trip_in_the_compact_form() {
     let mut fields: Vec<(Path, Value)> =
         vals.iter().enumerate().map(|(k, v)| (p(&format!("f{k:02}")), v.clone())).collect();
     fields.extend(names.iter().map(|n| (p(n), Value::Int64(1))));
-    fields.push((Path::new(["a", "b", ""]).unwrap(), Value::Int64(2)));
     w.insert(&fields, 0).unwrap();
+    w.write_set(&Path::new(["a", "b", ""]).unwrap(), Value::Int64(2), 0).unwrap();
     w.write_set(&p("f03"), Value::Double(f64::NAN), 0).unwrap();
     round_trip(&w.state);
     // loss records carry values and totals and field lists
@@ -702,10 +702,15 @@ fn a_document_is_refused_as_a_register_by_the_checks_and_the_decoder() {
     let reg = |v: Value| Reg::new(life, v, BTreeMap::new(), None, false);
     assert_eq!(reg(doc.clone()), Err(InvalidValue::DocumentAsRegister));
     assert!(reg(Value::Array(vec![doc.clone()])).is_ok());
-    // the writers refuse it too (nothing is written)
+    // a writer expands one (a sub-document is a map, never a register)
     let mut w = Writer::new(wid(b'A', 0), opts());
-    assert!(w.insert(&[(p("a"), doc.clone())], 0).is_none());
-    assert!(w.state.lives.is_empty());
+    w.insert(&[(p("a"), doc.clone())], 0).unwrap();
+    assert!(w.state.regs.values().all(|r| r.value.check_register().is_ok()));
+    assert_eq!(w.state.regs[&(*w.state.lives.keys().next().unwrap(), p("a"))].value, Value::Map);
+    // ... and refuses the marker itself, and a repeated field name
+    assert!(w.write_set(&p("m"), Value::Map, 0).is_none());
+    let twice = Value::Document(vec![("k".into(), Value::Null), ("k".into(), Value::Null)]);
+    assert!(w.write_set(&p("m"), twice, 0).is_none());
     // the decoder: turn the array tag of a register into the document tag, and a loss value
     let enc = state_with(Value::Array(vec![doc.clone()])).encode_compact();
     let at = find(&enc, &[4, 1, 16, 1, 1, b'x']);

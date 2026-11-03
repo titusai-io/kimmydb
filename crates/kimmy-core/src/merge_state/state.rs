@@ -223,7 +223,12 @@ impl MergeState {
         }
     }
 
-    fn winner_in(&self, p: &Path, al: &BTreeSet<MStamp>, o: &JoinOptions) -> Option<&Reg> {
+    pub(crate) fn winner_in(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        o: &JoinOptions,
+    ) -> Option<&Reg> {
         let mut best: Option<&Reg> = None;
         for ((l, q), r) in &self.regs {
             if q == p
@@ -343,7 +348,12 @@ impl MergeState {
         self.value_in(p, &al, o)
     }
 
-    fn value_in(&self, p: &Path, al: &BTreeSet<MStamp>, o: &JoinOptions) -> Option<Value> {
+    pub(crate) fn value_in(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        o: &JoinOptions,
+    ) -> Option<Value> {
         let win = self.winner_in(p, al, o);
         if let Some(w) = win
             && !w.value.is_numeric()
@@ -369,30 +379,144 @@ impl MergeState {
         seen.then(|| Value::Int64(total.clamp(-b - 1, b) as i64))
     }
 
-    /// The visible document, or `None` when no life is alive.
+    /// The visible document, or `None` when no life is alive: every present path, in path order
+    /// (a map before the paths below it), with the value of a leaf and [`Value::Map`] at a map.
+    /// A document with only flat fields has no map entry, so for it this is the map of its
+    /// fields.
+    ///
+    /// The TYPE RULE (D4), at every depth: a path is a map when a map marker is its winning
+    /// register, or when it has a visible child that is newer than its own scalar or array (a
+    /// path with no cell of its own is a map too, if a child is visible); otherwise it is its
+    /// register's value. Recency is decided per child: a scalar or array at `p` hides only the
+    /// children that are older than it, and a newer child makes `p` a map showing just the
+    /// newer children. A map marker never hides a child.
     pub fn visible(&self, o: &JoinOptions) -> Option<BTreeMap<Path, Value>> {
         let al = self.alive_set(o.retention);
         if al.is_empty() {
             return None;
         }
-        let mut paths: BTreeSet<&Path> = BTreeSet::new();
+        let mut newest: BTreeMap<Path, MStamp> = BTreeMap::new();
+        let mut note = |p: &Path, st: MStamp| {
+            let e = newest.entry(p.clone()).or_insert(st);
+            *e = (*e).max(st);
+        };
         for ((l, p), r) in &self.regs {
             if al.contains(l) && !self.suppressed(l, r, &al, o) {
-                paths.insert(p);
+                note(p, r.stamp);
             }
         }
-        for (l, p, _, _) in self.slots.keys() {
+        for ((l, p, _, _), s) in &self.slots {
             if al.contains(l) {
-                paths.insert(p);
+                note(p, s.stamp);
             }
         }
-        Some(
-            paths
-                .into_iter()
-                .filter_map(|p| {
-                    self.value_in(p, &al, o).filter(|v| *v != Value::Unset).map(|v| (p.clone(), v))
-                })
-                .collect(),
-        )
+        // every path with a cell, and every path above one
+        let mut all: BTreeSet<Path> = BTreeSet::new();
+        for p in newest.keys() {
+            all.extend(p.ancestors());
+            all.insert(p.clone());
+        }
+        let mut kids: BTreeMap<Path, Vec<Path>> = BTreeMap::new();
+        let mut tops = Vec::new();
+        for p in &all {
+            match p.parent() {
+                None => tops.push(p.clone()),
+                Some(par) => kids.entry(par).or_default().push(p.clone()),
+            }
+        }
+        let cx = Tree { st: self, al: &al, o, newest: &newest, kids: &kids };
+        let mut out = BTreeMap::new();
+        for t in &tops {
+            if let Some(n) = cx.node(t) {
+                n.emit(t, &mut out);
+            }
+        }
+        Some(out)
+    }
+}
+
+/// What the type rule decided for one path.
+struct Node {
+    /// The newest stamp among the cells of the visible subtree.
+    newest: MStamp,
+    shape: Shape,
+}
+
+enum Shape {
+    Leaf(Value),
+    Map(BTreeMap<Path, Node>),
+}
+
+impl Node {
+    fn emit(&self, at: &Path, out: &mut BTreeMap<Path, Value>) {
+        match &self.shape {
+            Shape::Leaf(v) => {
+                out.insert(at.clone(), v.clone());
+            }
+            Shape::Map(kids) => {
+                out.insert(at.clone(), Value::Map);
+                for (c, n) in kids {
+                    n.emit(c, out);
+                }
+            }
+        }
+    }
+}
+
+/// The inputs of the type rule, for the recursion of [`MergeState::visible`].
+struct Tree<'a> {
+    st: &'a MergeState,
+    al: &'a BTreeSet<MStamp>,
+    o: &'a JoinOptions,
+    newest: &'a BTreeMap<Path, MStamp>,
+    kids: &'a BTreeMap<Path, Vec<Path>>,
+}
+
+impl Tree<'_> {
+    /// The node of `q`, `None` when `q` is absent.
+    fn node(&self, q: &Path) -> Option<Node> {
+        let ks: BTreeMap<Path, Node> = self
+            .kids
+            .get(q)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| self.node(c).map(|n| (c.clone(), n)))
+            .collect();
+        let own = self.st.value_in(q, self.al, self.o);
+        let own_n = self.newest.get(q).copied();
+        let top = |v: &BTreeMap<Path, Node>| v.values().map(|n| n.newest).max();
+        if ks.is_empty() {
+            let v = own?;
+            let shape = if v == Value::Map { Shape::Map(BTreeMap::new()) } else { Shape::Leaf(v) };
+            return Some(Node { newest: own_n?, shape });
+        }
+        match own {
+            // a scalar, number or array at q: only the children newer than its register show
+            Some(v) if v != Value::Map => {
+                let reg = self.st.winner_in(q, self.al, self.o);
+                let rs = match reg {
+                    Some(r) if r.value.is_plain() => r.stamp,
+                    _ => own_n?,
+                };
+                let shown: BTreeMap<Path, Node> = if self.o.type_ignores_recency() {
+                    BTreeMap::new()
+                } else {
+                    ks.into_iter().filter(|(_, n)| n.newest > rs).collect()
+                };
+                if shown.is_empty() {
+                    return Some(Node { newest: own_n?, shape: Shape::Leaf(v) });
+                }
+                let newest = top(&shown).into_iter().chain(own_n).max()?;
+                Some(Node { newest, shape: Shape::Map(shown) })
+            }
+            Some(_) if self.o.marker_hides() => {
+                Some(Node { newest: own_n?, shape: Shape::Map(BTreeMap::new()) })
+            }
+            // a map marker, an unset or no cell at all: a map of every visible child
+            _ => {
+                let newest = top(&ks).into_iter().chain(own_n).max()?;
+                Some(Node { newest, shape: Shape::Map(ks) })
+            }
+        }
     }
 }
