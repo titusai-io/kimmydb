@@ -968,6 +968,41 @@ fn the_feed_only_moves_forward_the_floor_the_level_and_the_first() {
     assert_eq!(e.last, Some((at(11, b'A'), 0)));
 }
 
+/// Where the associativity of the order join ends. Commutative and idempotent on any NORMAL
+/// entries, it is associative only on the entries a causal history reaches: one writer's earlier
+/// and later first for a path never both stand next to a floor between them (the later state has
+/// seen the floor, and carries it). Here are two firsts of one writer that no history keeps
+/// side by side and an unset between them: the groupings disagree. The model's probe and the
+/// simulation below pin the reachable side; the writer's feed (item O2) must keep to it.
+#[test]
+fn the_order_join_is_associative_only_on_the_entries_a_history_reaches() {
+    let o = JoinOptions::default();
+    let early = FieldOrd {
+        firsts: [(w(1), (at(5, 1), 0))].into(),
+        last: Some((at(5, 1), 0)),
+        ..FieldOrd::default()
+    };
+    let late = FieldOrd {
+        firsts: [(w(1), (at(9, 1), 0))].into(),
+        last: Some((at(9, 1), 0)),
+        ..FieldOrd::default()
+    };
+    let unset = FieldOrd { floor: Some(u(7, 2, 6, false)), ..FieldOrd::default() };
+    let left = ord_join(&ord_join(&early, &late, &o), &unset, &o);
+    let right = ord_join(&early, &ord_join(&late, &unset, &o), &o);
+    assert_ne!(left, right, "the first at 5 is voided before the first at 9 can be asked");
+    assert!(left.firsts.is_empty() && right.firsts == [(w(1), (at(9, 1), 0))].into());
+    for (a, b) in [(&early, &late), (&late, &unset), (&early, &unset)] {
+        assert_eq!(ord_join(a, b, &o), ord_join(b, a, &o), "commutative all the same");
+        assert_eq!(ord_join(a, a, &o), *a, "idempotent all the same");
+    }
+    // the reachable form of the same history: the later state has seen the unset and carries it
+    let later_seen = ord_join(&late, &unset, &o);
+    let l = ord_join(&ord_join(&early, &later_seen, &o), &unset, &o);
+    let r = ord_join(&early, &ord_join(&later_seen, &unset, &o), &o);
+    assert_eq!(l, r);
+}
+
 // ---- the laws on the entries of the model's own runs ----------------------------------
 
 /// `probe_ord_join_laws` of the model: the distinct order entries of the writer entries of 150 nested
