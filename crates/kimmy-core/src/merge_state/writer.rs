@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 
 use super::counter::{self, Kind, Num};
 use super::join::{JoinOptions, join};
-use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot};
+use super::state::{
+    Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
+};
 use super::types::{InvalidPath, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 
@@ -221,6 +223,14 @@ impl Writer {
     /// Mint the stamp of one write from `m`. A refused stamp is kept in `m` and reported as
     /// `None`, which the write bodies treat as a refused write (before anything is written).
     fn mint(&mut self, m: &mut Mint<'_>) -> Option<MStamp> {
+        // The writer cap: a writer the document does not mention yet is refused at the cap (a
+        // write adds the writer to the version vector).
+        if !self.opts.no_writer_cap() {
+            let ws = self.state.writers();
+            if ws.len() >= MAX_WRITERS && !ws.contains(&self.id) {
+                return None;
+            }
+        }
         let r = match &mut m.source {
             Source::Skew(skew) => Ok(self.tick(*skew)),
             Source::Given(f) => {
@@ -870,6 +880,13 @@ impl Writer {
         };
         if total.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
             return None;
+        }
+        // The contributor cap: a writer the counter does not have yet is refused at the cap.
+        if !self.opts.no_contributor_cap() {
+            let cs = self.state.contributors(p, &self.opts);
+            if cs.len() >= MAX_CONTRIBUTORS && !cs.contains(&self.id) {
+                return None;
+            }
         }
         // The visible value became an Int64: the slot is an Int64 from now on, so a total that
         // later dips back under the i32 range does not narrow again.

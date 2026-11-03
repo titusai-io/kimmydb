@@ -466,6 +466,13 @@ impl MergeState {
         self.write_compact_body()
     }
 
+    /// Every writer the state mentions: the writer table of the compact form.
+    pub fn writers(&self) -> BTreeSet<WriterId> {
+        let mut scan = W::scanning();
+        self.write_sections(&mut scan);
+        scan.seen_writers
+    }
+
     /// A 128-bit digest of [`MergeState::compact_bytes`], with the same mix as
     /// [`MergeState::state_hash`]. Nothing uses it yet: the differential test pins it against
     /// the reference model's own encoder until the hash is switched to the compact form.

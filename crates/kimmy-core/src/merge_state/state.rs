@@ -116,6 +116,27 @@ pub const MAX_TOTAL: i128 = 1 << 119;
 // 64 writers' terms, each under twice the bound, sum inside i128.
 const _: () = assert!(MAX_TOTAL.checked_mul(128).is_some());
 
+/// The most writers that may contribute to one counter (design-ruled, Q9): a local `$inc` by a
+/// writer that is not one of them yet is refused (a `400`) at this many. A state received with
+/// more is kept and reported ([`MergeState::over_caps`]), never refused (Q8).
+pub const MAX_CONTRIBUTORS: usize = 64;
+
+/// The most writers (incarnations: a node and an epoch, so every restore adds one) a document
+/// may mention (design-ruled, Q8; the compact form's writer table indexes them in one byte): a
+/// local write by a writer the document does not mention yet is refused at this many. A state
+/// received with more is kept and reported ([`MergeState::over_caps`]), never refused.
+pub const MAX_WRITERS: usize = 256;
+
+/// What a state holds past the caps (Q8: an over-cap result is stored and reported, and a local
+/// write is refused only if it would add to what is over).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct OverCaps {
+    /// The number of writers the document mentions, when it is past [`MAX_WRITERS`].
+    pub writers: Option<usize>,
+    /// Each counter with more than [`MAX_CONTRIBUTORS`] contributors, and how many it has.
+    pub counters: BTreeMap<Path, usize>,
+}
+
 /// A counter slot: one writer's running total in one generation.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Slot {
@@ -357,6 +378,31 @@ impl MergeState {
                 (h != 0).then(|| (p.clone(), h))
             })
             .collect()
+    }
+
+    /// The writers that contribute to the counter at `p`: those with a slot the read side counts
+    /// (the winning base's generation and the newer ones), in the alive lives.
+    pub fn contributors(&self, p: &Path, o: &JoinOptions) -> BTreeSet<WriterId> {
+        self.counted(p, o).keys().map(|k| k.1).collect()
+    }
+
+    /// The caps the state is past, if any. Never an error: a merge can exceed a cap that each
+    /// side kept, and the state is stored whole.
+    pub fn over_caps(&self, o: &JoinOptions) -> OverCaps {
+        let writers = self.writers().len();
+        let al = self.alive_set(o.retention);
+        let paths: BTreeSet<&Path> =
+            self.slots.keys().filter(|k| al.contains(&k.0)).map(|k| &k.1).collect();
+        OverCaps {
+            writers: (writers > MAX_WRITERS).then_some(writers),
+            counters: paths
+                .into_iter()
+                .filter_map(|p| {
+                    let n = self.contributors(p, o).len();
+                    (n > MAX_CONTRIBUTORS).then(|| (p.clone(), n))
+                })
+                .collect(),
+        }
     }
 
     /// The visible value of one path (`None` when absent).

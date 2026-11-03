@@ -289,3 +289,167 @@ fn the_counter_mutants_are_caught() {
         assert!(scenario(&o).is_err(), "not caught: {what}");
     }
 }
+
+// ---- the caps --------------------------------------------------------------------------------
+
+fn nth(k: usize, o: &JoinOptions) -> Writer {
+    let node = crate::ids::NodeId::from_bytes([k as u8; 16]);
+    let id = WriterId { node, epoch: Epoch::from_u64((k / 256) as u64) };
+    Writer::new(id, o.clone())
+}
+
+/// A state in which writers `0..n` each `$inc` the Int64 counter `n` once, one after another,
+/// and the writer that made it.
+fn counter_of(n: usize, o: &JoinOptions) -> MergeState {
+    let mut state = MergeState::default();
+    for k in 0..n {
+        let mut w = nth(k, o);
+        w.receive(&state);
+        if k == 0 {
+            w.insert(&fl(&[("n", i64v(0))]), 0).unwrap();
+        }
+        w.write_inc(&p("n"), 1, 0).unwrap();
+        state = w.state;
+    }
+    state
+}
+
+fn contributor_cap(o: &JoinOptions) -> Result<(), String> {
+    let full = counter_of(MAX_CONTRIBUTORS, o);
+    let n = full.contributors(&p("n"), o).len();
+    if n != MAX_CONTRIBUTORS {
+        return Err(format!("{n} contributors"));
+    }
+    // the 65th is refused; a contributor is not
+    let mut newcomer = nth(200, o);
+    newcomer.receive(&full);
+    if newcomer.write_inc(&p("n"), 1, 0).is_some() {
+        return Err("the 65th contributor was accepted".into());
+    }
+    let mut old = nth(5, o);
+    old.receive(&full);
+    old.write_inc(&p("n"), 1, 0).ok_or("a contributor was refused")?;
+    Ok(())
+}
+
+#[test]
+fn a_65th_contributor_is_refused_and_an_existing_one_is_not() {
+    contributor_cap(&opts()).unwrap();
+}
+
+/// Two members each add the 64th contributor to a counter of 63: the merge has 65. It is kept
+/// and reported (Q8), a newcomer is still refused, and a write that brings the counter back
+/// under the cap lets the newcomer in.
+#[test]
+fn a_merge_past_the_contributor_cap_is_kept_and_reported_never_refused() {
+    let o = opts();
+    let s63 = counter_of(MAX_CONTRIBUTORS - 1, &o);
+    let (mut a, mut b) = (nth(100, &o), nth(101, &o));
+    a.receive(&s63);
+    b.receive(&s63);
+    a.write_inc(&p("n"), 1, 0).unwrap();
+    b.write_inc(&p("n"), 1, 3).unwrap();
+    assert_eq!(a.state.over_caps(&o), OverCaps::default());
+    let (ab, ba) = (join(&a.state, &b.state, &o).0, join(&b.state, &a.state, &o).0);
+    assert_eq!(ab, ba);
+    assert_eq!(ab.compact_hash(), ba.compact_hash());
+    assert_eq!(ab.visible(&o).unwrap()[&p("n")], i64v(65), "every increment counts");
+    assert_eq!(
+        ab.over_caps(&o),
+        OverCaps { writers: None, counters: [(p("n"), MAX_CONTRIBUTORS + 1)].into() }
+    );
+    // the receiving writer keeps the whole state
+    let mut c = nth(102, &o);
+    assert!(c.receive_report(&ab).changed);
+    assert_eq!(c.state.over_caps(&o).counters.len(), 1);
+    assert!(c.write_inc(&p("n"), 1, 0).is_none(), "a newcomer is still refused");
+    let mut old = nth(100, &o);
+    old.receive(&ab);
+    old.write_inc(&p("n"), 1, 0).expect("a contributor may go on");
+    // a string base and a number over it: the old slots are no longer counted
+    old.write_set(&p("n"), Value::String("s".into()), 0).unwrap();
+    old.write_set(&p("n"), i64v(0), 0).unwrap();
+    assert!(old.state.contributors(&p("n"), &o).is_empty());
+    c.receive(&old.state);
+    c.write_inc(&p("n"), 1, 0).expect("back under the cap: the newcomer is let in");
+}
+
+fn writer_cap(o: &JoinOptions) -> Result<(), String> {
+    let mut state = MergeState::default();
+    for k in 0..MAX_WRITERS {
+        let mut w = nth(k, o);
+        w.receive(&state);
+        if k == 0 {
+            w.insert(&fl(&[("n", i64v(0))]), 0).unwrap();
+        }
+        w.write_set(&p(&format!("f{k}")), i64v(k as i64), 0).ok_or("a write was refused early")?;
+        state = w.state;
+    }
+    let n = state.writers().len();
+    if n != MAX_WRITERS {
+        return Err(format!("{n} writers"));
+    }
+    let mut late = nth(MAX_WRITERS, o);
+    late.receive(&state);
+    if late.write_set(&p("late"), i64v(1), 0).is_some() {
+        return Err("the 257th writer was accepted".into());
+    }
+    let mut old = nth(7, o);
+    old.receive(&state);
+    old.write_set(&p("again"), i64v(1), 0).ok_or("a known writer was refused")?;
+    Ok(())
+}
+
+#[test]
+fn a_257th_writer_is_refused_and_a_known_one_is_not() {
+    writer_cap(&opts()).unwrap();
+}
+
+#[test]
+fn a_merge_past_the_writer_cap_is_kept_and_reported_never_refused() {
+    let o = opts();
+    let mut state = MergeState::default();
+    for k in 0..MAX_WRITERS - 1 {
+        let mut w = nth(k, &o);
+        w.receive(&state);
+        if k == 0 {
+            w.insert(&fl(&[("n", i64v(0))]), 0).unwrap();
+        }
+        w.write_set(&p(&format!("f{k}")), i64v(1), 0).unwrap();
+        state = w.state;
+    }
+    // 255 writers; two newcomers each make the 256th
+    let (mut a2, mut b2) = (nth(255, &o), nth(256, &o));
+    a2.receive(&state);
+    b2.receive(&state);
+    a2.write_set(&p("a"), i64v(1), 0).unwrap();
+    b2.write_set(&p("b"), i64v(1), 3).unwrap();
+    let ab = join(&a2.state, &b2.state, &o).0;
+    assert_eq!(ab.over_caps(&o).writers, Some(MAX_WRITERS + 1));
+    assert!(
+        ab.visible(&o).unwrap().contains_key(&p("a"))
+            && ab.visible(&o).unwrap().contains_key(&p("b"))
+    );
+    let mut late = nth(300, &o);
+    late.receive(&ab);
+    assert!(late.write_set(&p("c"), i64v(1), 0).is_none(), "a new writer is refused");
+    a2.receive(&ab);
+    assert!(a2.write_set(&p("c"), i64v(1), 0).is_some(), "a writer the document has may go on");
+}
+
+#[test]
+fn the_cap_mutants_are_caught() {
+    for (what, mutate, scenario) in [
+        (
+            "no contributor cap",
+            (|o: &mut JoinOptions| o.set_no_contributor_cap(true)) as fn(&mut JoinOptions),
+            contributor_cap as fn(&JoinOptions) -> Result<(), String>,
+        ),
+        ("no writer cap", |o| o.set_no_writer_cap(true), writer_cap),
+    ] {
+        assert_eq!(scenario(&opts()), Ok(()), "{what}");
+        let mut o = opts();
+        mutate(&mut o);
+        assert!(scenario(&o).is_err(), "not caught: {what}");
+    }
+}

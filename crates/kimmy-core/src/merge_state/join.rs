@@ -90,6 +90,12 @@ pub struct JoinOptions {
     /// `Int32`, so a total that dips back under the `i32` range narrows again.
     #[cfg(any(test, feature = "merge-mutants"))]
     slot_never_widens: bool,
+    /// A local `$inc` by a 65th contributor is accepted.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_contributor_cap: bool,
+    /// A local write by a 257th writer is accepted.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_writer_cap: bool,
 }
 
 impl Default for JoinOptions {
@@ -132,6 +138,10 @@ impl Default for JoinOptions {
             int32_saturates: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             slot_never_widens: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_contributor_cap: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_writer_cap: false,
         }
     }
 }
@@ -194,6 +204,8 @@ impl JoinOptions {
     switch!(sum_in_key_order, set_sum_in_key_order, false);
     switch!(int32_saturates, set_int32_saturates, false);
     switch!(slot_never_widens, set_slot_never_widens, false);
+    switch!(no_contributor_cap, set_no_contributor_cap, false);
+    switch!(no_writer_cap, set_no_writer_cap, false);
 }
 
 /// The model's `_prefilter`: drop deletes and dead lives older than `h`.

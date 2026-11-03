@@ -35,6 +35,12 @@
 //! Retention (`R`) and the integer bound are carried by [`JoinOptions`]; every
 //! read method that depends on them takes the options.
 //!
+//! Counters are typed (`counter.rs`): `Int32`, `Int64`, `Double` and `Decimal128` amounts merge,
+//! the type of a merged cell is the join of its parts, and the parts are added in a canonical
+//! order. A counter has at most [`MAX_CONTRIBUTORS`] contributing writers and a document at most
+//! [`MAX_WRITERS`] writers: a LOCAL write that would pass either is refused, a received state
+//! past either is kept and reported ([`MergeState::over_caps`]).
+//!
 //! Two bounds apply to a counter. The integer bound (Q11, [`JoinOptions::int_bound`], the Int64
 //! range unless lowered) is what a client sees: a total saturates there, and a local `$inc` that
 //! would pass it is refused. [`MAX_TOTAL`] (2^119) is a theoretical bound on the `i128` totals
@@ -64,7 +70,10 @@ mod tests;
 pub use codec::{DecodeError, V1CannotHold};
 pub use counter::Num;
 pub use join::{InvalidIntBound, JoinOptions, join};
-pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
+pub use state::{
+    Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, OverCaps,
+    Reg, Slot, Vv,
+};
 pub use types::{
     Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
     WriterId,
@@ -104,6 +113,9 @@ const _: () = {
     let _: fn(&MergeState, &Path, &JoinOptions) -> Option<Value> = MergeState::value;
     let _: fn(&MergeState, &JoinOptions) -> Option<BTreeMap<Path, Value>> = MergeState::visible;
     let _: fn(&MergeState, &JoinOptions) -> Vec<MStamp> = MergeState::alive;
+    let _: fn(&MergeState) -> BTreeSet<WriterId> = MergeState::writers;
+    let _: fn(&MergeState, &Path, &JoinOptions) -> BTreeSet<WriterId> = MergeState::contributors;
+    let _: fn(&MergeState, &JoinOptions) -> OverCaps = MergeState::over_caps;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::canonical_bytes;
     let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_canonical_bytes;
