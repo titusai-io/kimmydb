@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use super::counter::Num;
+use super::counter::{self, Kind, Num};
 use super::join::{JoinOptions, join};
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot};
 use super::types::{InvalidPath, LossKey, LossValue, MStamp, Path, Value, WriterId};
@@ -27,8 +27,10 @@ pub struct WriteRecord {
     pub paths: Vec<Path>,
     /// Register values written (`Insert`, `Reg`).
     pub vals: BTreeMap<Path, Value>,
-    /// The increment (`Inc`).
+    /// The increment (`Inc`), when it is an integer that fits an `i64`.
     pub n: Option<i64>,
+    /// The increment (`Inc`) with its type: an `Int32`, `Int64`, `Double` or `Decimal128`.
+    pub amount: Option<Num>,
     /// The generation an increment belongs to (`Inc`).
     pub generation: Option<MStamp>,
     /// An upsert that created the life (the `Inc` of `upsert_inc`, the creation write of `upsert_soi`).
@@ -47,6 +49,7 @@ impl WriteRecord {
             paths,
             vals: BTreeMap::new(),
             n: None,
+            amount: None,
             generation: None,
             insert: false,
             upsert: false,
@@ -489,11 +492,36 @@ impl Writer {
         self.stamped(stamp, |w, m| w.write_unset_m(path, m))
     }
 
-    /// `$inc path by n`. A local increment past the bound is refused (Q11), and so is one that
-    /// would carry the writer's slot past [`MAX_TOTAL`]; on a double base it is a register
-    /// write that starts a generation (Nm5); on a string it is refused.
+    /// `$inc path by n`, an `Int64` operand. A local increment past the bound is refused (Q11),
+    /// and so is one that would carry the writer's slot past [`MAX_TOTAL`]; on a string or a map
+    /// it is refused. See [`Writer::write_inc_value`] for the other operand types.
     pub fn write_inc(&mut self, p: &Path, n: i64, skew: u64) -> Option<Written> {
-        self.ticking(skew, |w, m| w.write_inc_m(p, n, m))
+        self.ticking(skew, |w, m| w.write_inc_m(p, Num::from(i128::from(n)), m))
+    }
+
+    /// `$inc path by by`, where `by` is an `Int32`, `Int64`, `Double` or `Decimal128` (anything
+    /// else is refused). The result type is production's (`counter`): two `Int32`s stay an
+    /// `Int32` while the total fits, any `Int64` makes it an `Int64`, a `Decimal128` a
+    /// `Decimal128` (a double that is not exactly a decimal is refused against a stored
+    /// decimal, and a decimal that overflows from finite inputs), and otherwise a `Double`.
+    /// Concurrent increments from other writers sum with this one in every type.
+    pub fn write_inc_value(&mut self, p: &Path, by: &Value, skew: u64) -> Option<Written> {
+        let op = Num::from_value(by)?;
+        self.ticking(skew, |w, m| w.write_inc_m(p, op, m))
+    }
+
+    /// [`Writer::write_inc_value`] with the stamp taken from `stamp` instead of the writer's own
+    /// clock: see [`Writer::tick_to`] for what a stamp must satisfy.
+    pub fn write_inc_value_stamped(
+        &mut self,
+        p: &Path,
+        by: &Value,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        let Some(op) = Num::from_value(by) else {
+            return Ok(None);
+        };
+        self.stamped(stamp, |w, m| w.write_inc_m(p, op, m))
     }
 
     /// [`Writer::write_inc`] with the stamp taken from `stamp` instead of the writer's own clock:
@@ -506,7 +534,7 @@ impl Writer {
         n: i64,
         stamp: &mut dyn FnMut() -> MStamp,
     ) -> Result<Option<Written>, StampError> {
-        self.stamped(stamp, |w, m| w.write_inc_m(p, n, m))
+        self.stamped(stamp, |w, m| w.write_inc_m(p, Num::from(i128::from(n)), m))
     }
 
     /// Replace the whole document: changed fields are set, absent ones unset. Each field is a
@@ -699,6 +727,7 @@ impl Writer {
         );
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.clone()]);
         rec.n = Some(n);
+        rec.amount = Some(Num::from(i128::from(n)));
         Some(self.finish(st2, rec))
     }
 
@@ -723,6 +752,7 @@ impl Writer {
         );
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), vec![path.clone()]);
         rec.n = Some(n);
+        rec.amount = Some(Num::from(i128::from(n)));
         rec.insert = true;
         Some(self.finish(st, rec))
     }
@@ -813,43 +843,45 @@ impl Writer {
         self.commit(eff, m)
     }
 
-    /// The body of [`Writer::write_inc`], with the stamp from `m`.
-    fn write_inc_m(&mut self, p: &Path, n: i64, m: &mut Mint<'_>) -> Option<Written> {
+    /// The body of [`Writer::write_inc`], with the stamp from `m`. `op` is the operand with its
+    /// type; the rules are in the module docs of `counter`.
+    fn write_inc_m(&mut self, p: &Path, op: Num, m: &mut Mint<'_>) -> Option<Written> {
         let vis = self.visible()?;
         if !self.opts.write_below_scalar() && below_a_scalar(&vis, p) {
             return None;
         }
-        let cur = vis.get(p);
-        let b = i128::from(self.opts.int_bound());
-        match cur {
-            None | Some(Value::Int64(_)) => {
-                let c = if let Some(Value::Int64(c)) = cur { i128::from(*c) } else { 0 };
-                if !(-b - 1..=b).contains(&(c + i128::from(n))) {
-                    return None;
-                }
-            }
-            Some(Value::Double(d)) => {
-                let mut eff = Eff::default();
-                eff.put(p.clone(), Value::Double(d + n as f64));
-                return self.commit(eff, m);
-            }
-            _ => return None,
-        }
+        // The visible value must be a counter amount (a string or a map is refused), and the
+        // production rule must accept the result (the integer bound, a decimal that overflows,
+        // an inexact double meeting a decimal).
+        let cur = match vis.get(p) {
+            None => None,
+            Some(v) => Some(Num::from_value(v)?),
+        };
+        let res = counter::inc_result(cur, &op, self.opts.int_bound())?;
         let l = self.write_life()?;
         let generation = self.state.gen_of(p, &self.opts).map(|g| g.stamp);
         let key = (l, p.clone(), self.id, generation);
-        let old = self.state.slots.get(&key).and_then(|s| s.total.int()).unwrap_or(0);
-        // The slot is this writer's running sum, which the saturated check above does not
-        // bound; refuse the `$inc` that would carry it past `MAX_TOTAL`.
-        let total = old.saturating_add(i128::from(n));
-        if total.unsigned_abs() > MAX_TOTAL.unsigned_abs() {
+        // The writer's slot is its running sum in the join of the types it has added. The
+        // `Int64` check above is on the saturated visible value, which does not bound the sum
+        // under it: refuse the `$inc` that would carry the slot past `MAX_TOTAL`.
+        let mut total = match self.state.slots.get(&key) {
+            None => op,
+            Some(s) => counter::sum_checked(&s.total, &op)?,
+        };
+        if total.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
             return None;
+        }
+        // The visible value became an Int64: the slot is an Int64 from now on, so a total that
+        // later dips back under the i32 range does not narrow again.
+        if res.kind() == Kind::Int64 && !self.opts.slot_never_widens() {
+            total = total.widened();
         }
         let st = self.mint(m)?;
         self.state.vv.insert(st.writer, st.hlc);
-        self.state.slots.insert(key, Slot { stamp: st, total: Num::from(total) });
+        self.state.slots.insert(key, Slot { stamp: st, total });
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(l), vec![p.clone()]);
-        rec.n = Some(n);
+        rec.n = op.int().and_then(|v| i64::try_from(v).ok());
+        rec.amount = Some(op);
         rec.generation = generation;
         Some(self.finish(st, rec))
     }

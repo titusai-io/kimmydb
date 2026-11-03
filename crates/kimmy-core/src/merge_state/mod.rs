@@ -53,6 +53,8 @@ mod writer;
 #[cfg(test)]
 mod compact_tests;
 #[cfg(test)]
+mod counter_tests;
+#[cfg(test)]
 mod nested_tests;
 #[cfg(test)]
 mod prop_tests;
@@ -139,6 +141,9 @@ const _: () = {
     let _: fn(&mut Writer, &Path, Value, u64) -> Option<Written> = Writer::write_set;
     let _: fn(&mut Writer, &Path, u64) -> Option<Written> = Writer::write_unset;
     let _: fn(&mut Writer, &Path, i64, u64) -> Option<Written> = Writer::write_inc;
+    let _: fn(&mut Writer, &Path, &Value, u64) -> Option<Written> = Writer::write_inc_value;
+    let _: fn(&Value) -> Option<Num> = Num::from_value;
+    let _: fn(&Num) -> Option<i128> = Num::int;
     let _: fn(&mut Writer, &[(Path, Value)], u64) -> Option<Written> = Writer::write_replace;
     let _: fn(&mut Writer, u64) -> Option<Written> = Writer::write_delete;
     let _: fn(&mut Writer, MStamp) -> Result<MStamp, StampError> = Writer::tick_to;
@@ -170,6 +175,8 @@ const _: () = {
         Writer::write_unset_stamped;
     let _: fn(&mut Writer, &Path, i64, Mint) -> Result<Option<Written>, StampError> =
         Writer::write_inc_stamped;
+    let _: fn(&mut Writer, &Path, &Value, Mint) -> Result<Option<Written>, StampError> =
+        Writer::write_inc_value_stamped;
     let _: fn(&mut Writer, &[(Path, Value)], Mint) -> Result<Option<Written>, StampError> =
         Writer::write_replace_stamped;
     let _: fn(&mut Writer, Mint) -> Result<Option<Written>, StampError> =

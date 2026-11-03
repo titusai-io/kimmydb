@@ -86,6 +86,10 @@ pub struct JoinOptions {
     /// An `Int32` cell that outgrows the `i32` range saturates instead of becoming an `Int64`.
     #[cfg(any(test, feature = "merge-mutants"))]
     int32_saturates: bool,
+    /// A writer whose increment made the visible value an `Int64` still leaves its slot an
+    /// `Int32`, so a total that dips back under the `i32` range narrows again.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    slot_never_widens: bool,
 }
 
 impl Default for JoinOptions {
@@ -126,6 +130,8 @@ impl Default for JoinOptions {
             sum_in_key_order: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             int32_saturates: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            slot_never_widens: false,
         }
     }
 }
@@ -187,6 +193,7 @@ impl JoinOptions {
     switch!(write_below_scalar, set_write_below_scalar, false);
     switch!(sum_in_key_order, set_sum_in_key_order, false);
     switch!(int32_saturates, set_int32_saturates, false);
+    switch!(slot_never_widens, set_slot_never_widens, false);
 }
 
 /// The model's `_prefilter`: drop deletes and dead lives older than `h`.
