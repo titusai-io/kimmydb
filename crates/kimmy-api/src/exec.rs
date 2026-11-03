@@ -1652,6 +1652,10 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
     fn key_hold(&self) -> Option<&dyn kimmy_storage::KeyHold> {
         self.keys.as_ref().map(|keys| keys as &dyn kimmy_storage::KeyHold)
     }
+
+    fn match_hold(&self) -> Option<&dyn kimmy_storage::MatchHold> {
+        self.keys.as_ref().map(|keys| keys as &dyn kimmy_storage::MatchHold)
+    }
 }
 
 /// Equality constraints a match necessarily satisfies, for seeding an upsert.
@@ -2578,6 +2582,9 @@ struct IndexKeys<'a> {
     held: std::cell::Cell<usize>,
     /// How many keys are held now.
     keys: std::cell::Cell<usize>,
+    /// The bytes of the matched documents a write holds now (see [`kimmy_storage::MatchHold`]);
+    /// none for a read.
+    documents: std::cell::Cell<usize>,
     /// Whether the lease stays at the most the request has held, and is charged for a
     /// growth past it only, instead of being charged for each key and given back when the
     /// keys are (a write that gathers its range again for each chunk, see
@@ -2600,11 +2607,18 @@ enum Account<'a> {
 }
 
 impl<'a> IndexKeys<'a> {
+    /// The bytes held now, keys and documents together: what a lease that is kept is charged
+    /// up to.
+    fn level(&self) -> usize {
+        self.held.get().saturating_add(self.documents.get())
+    }
+
     fn new(lease: Lease) -> Self {
         IndexKeys {
             account: std::cell::RefCell::new(Account::Open(lease)),
             held: 0.into(),
             keys: 0.into(),
+            documents: 0.into(),
             keep: false,
         }
     }
@@ -2624,6 +2638,7 @@ impl<'a> IndexKeys<'a> {
             account: std::cell::RefCell::new(Account::Later { memory, free, lease }),
             held: 0.into(),
             keys: 0.into(),
+            documents: 0.into(),
             keep: false,
         }
     }
@@ -2633,7 +2648,8 @@ impl<'a> IndexKeys<'a> {
     /// and gathers it again for each chunk of a `multi` write. The first `MAX_CANDIDATES` keys
     /// of a gather, what a write may match without a refusal, are not charged, so an ordinary
     /// indexed write never touches the pool; the key past them makes the lease, charged for
-    /// every key held then and every one after.
+    /// every key held then and every one after. The documents the write matches are charged
+    /// on the same lease once it is made (see [`kimmy_storage::MatchHold`]).
     ///
     /// The lease never waits for the pool: a write holds the single writer, and a wait there
     /// would stall every other write (see [`crate::limits::AggregateMemory::budget_without_wait`]).
@@ -2643,9 +2659,7 @@ impl<'a> IndexKeys<'a> {
     /// grown by since the largest gather, and for nothing when it has not.
     fn of_a_write(memory: &'a crate::limits::AggregateMemory) -> Self {
         fn lease(memory: &crate::limits::AggregateMemory) -> Lease {
-            memory
-                .budget_without_wait()
-                .lease_worded("the index range of the write", WRITE_RANGE_KEYS)
+            memory.budget_without_wait().lease_worded("what the write holds", WRITE_RANGE_KEYS)
         }
         IndexKeys {
             account: std::cell::RefCell::new(Account::Later {
@@ -2655,6 +2669,7 @@ impl<'a> IndexKeys<'a> {
             }),
             held: 0.into(),
             keys: 0.into(),
+            documents: 0.into(),
             keep: true,
         }
     }
@@ -2671,13 +2686,13 @@ impl kimmy_storage::KeyHold for IndexKeys<'_> {
             && self.keys.get() > *free
         {
             *account = Account::Open(lease(memory));
-            charge = self.held.get();
+            charge = self.level();
         }
         let charged = match &mut *account {
             // A lease that is kept has what the request held at the most; what is held now
             // is charged only past that.
             Account::Open(lease) if self.keep => {
-                lease.charge(self.held.get().saturating_sub(lease.bytes()))
+                lease.charge(self.level().saturating_sub(lease.bytes()))
             }
             Account::Open(lease) => lease.charge(charge),
             Account::Later { .. } => Ok(()),
@@ -2706,6 +2721,27 @@ impl kimmy_storage::KeyHold for IndexKeys<'_> {
         {
             lease.release(bytes);
         }
+    }
+}
+
+impl kimmy_storage::MatchHold for IndexKeys<'_> {
+    /// The document and its stored body, charged on the lease if the keys have made one. A
+    /// write that has not (its range is within what a write may match unpooled, or it is not an
+    /// index range) holds its documents as it always has, uncharged, and the estimate is not
+    /// worked out.
+    fn take(&self, doc: &Document, body: usize) -> kimmy_core::Result<()> {
+        let mut account = self.account.borrow_mut();
+        let Account::Open(lease) = &mut *account else {
+            return Ok(());
+        };
+        let bytes = kimmy_query::budget::held_bytes(doc)
+            .saturating_add(kimmy_query::budget::held_blob(body));
+        self.documents.set(self.documents.get().saturating_add(bytes));
+        lease.charge(self.level().saturating_sub(lease.bytes()))
+    }
+
+    fn give_all(&self) {
+        self.documents.set(0);
     }
 }
 
@@ -2749,10 +2785,10 @@ const FIND_RANGE_KEYS: kimmy_query::budget::Wording = kimmy_query::budget::Wordi
                 skip + limit is at most 10000, or use a smaller skip",
 };
 
-/// How an `update`, `delete` or `find_and_modify` over an index range words a refusal for the
-/// keys it gathers. The write has no `cursor` and no sort to offer, and the server does not
-/// split it: what makes the range smaller is the filter, and a range too large for one write
-/// can be written as several, each over part of it.
+/// How an `update`, `delete` or `find_and_modify` over an index range words a refusal for what
+/// it holds: the keys it gathers and the documents it matches. The write has no `cursor` and no
+/// sort to offer, and the server does not split it: what makes both smaller is the filter, and a
+/// range too large for one write can be written as several, each over part of it.
 const WRITE_RANGE_KEYS: kimmy_query::budget::Wording = kimmy_query::budget::Wording {
     holder: "one write",
     over_limit: "narrow the filter on the indexed field so that its range is smaller, which \

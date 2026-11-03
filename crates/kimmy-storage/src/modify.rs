@@ -150,6 +150,27 @@ pub trait ModifySpec {
     fn key_hold(&self) -> Option<&dyn crate::KeyHold> {
         None
     }
+
+    /// Where the documents the write matches are charged, if the caller budgets them.
+    ///
+    /// A chunk holds up to [`Engine::multi_chunk_docs`] matched documents, each with its
+    /// stored body, from the moment it matches until the chunk is written; a
+    /// `find_and_modify` that sorts holds up to [`MAX_CANDIDATES`] of them. Each is
+    /// [`MatchHold::take`]n as it matches, so a refusal ends the chunk before anything is
+    /// written, and [`MatchHold::give_all`] is called when the chunk ends, on every path.
+    /// `None`, the default, charges nothing.
+    fn match_hold(&self) -> Option<&dyn MatchHold> {
+        None
+    }
+}
+
+/// Where the documents a filtered write has matched are charged while it holds them.
+pub trait MatchHold {
+    /// One more document matched, and is held with `body` bytes of its stored image (none
+    /// when the write does not keep it). A refusal ends the write's chunk with its error.
+    fn take(&self, doc: &Document, body: usize) -> kimmy_core::Result<()>;
+    /// Every document held is let go: the chunk is written, or has ended.
+    fn give_all(&self);
 }
 
 /// What happened, and the images either side of it.
@@ -357,6 +378,8 @@ impl Engine {
         let txn =
             if continuing { self.begin_write_continuing(holder) } else { self.begin_write(holder) }
                 .map_err(none)?;
+        // The matches are let go of when the chunk is, the write of them included.
+        let _given_back = GivesBackMatches(spec.match_hold());
         let (matches, examined) =
             match self.collect_matches(&txn, coll, candidates, spec, Some(budget), after, true) {
                 Ok(found) => found,
@@ -413,6 +436,9 @@ impl Engine {
         spec: &dyn ModifySpec,
     ) -> Result<ModifyOutcome> {
         let txn = self.begin_write(WriterHolder::Write)?;
+        // Every match is held to sort them, and the chosen one to write it: let go of
+        // together, when the write is over.
+        let _given_back = GivesBackMatches(spec.match_hold());
 
         let chosen = match self.choose(&txn, coll, candidates, spec) {
             Ok(chosen) => chosen,
@@ -620,6 +646,9 @@ impl Engine {
                     return Ok(true);
                 }
                 let body = if keep_bodies { record.body } else { Vec::new() };
+                if let Some(hold) = spec.match_hold() {
+                    hold.take(&doc, body.len())?;
+                }
                 matches.push(Match { stamp: record.stamp, doc, body });
                 if limit.is_none() && matches.len() > MAX_CANDIDATES {
                     // Refused, not truncated: choosing from a prefix would return
@@ -790,6 +819,17 @@ impl Engine {
 struct GivesBack<'a>(Option<&'a dyn crate::KeyHold>);
 
 impl Drop for GivesBack<'_> {
+    fn drop(&mut self) {
+        if let Some(hold) = self.0 {
+            hold.give_all();
+        }
+    }
+}
+
+/// Lets go of the documents a chunk held when it goes out of scope, whichever way it ends.
+struct GivesBackMatches<'a>(Option<&'a dyn MatchHold>);
+
+impl Drop for GivesBackMatches<'_> {
     fn drop(&mut self) {
         if let Some(hold) = self.0 {
             hold.give_all();
@@ -2125,6 +2165,125 @@ mod tests {
                 doc.get_str("status").unwrap() == "pending"
             })
             .count()
+    }
+
+    /// What a test's hold of matched documents is told.
+    struct MatchLog {
+        /// Documents held now, and the most held at once.
+        held: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+        takes: std::cell::Cell<usize>,
+        give_alls: std::cell::Cell<usize>,
+        /// The bytes of stored body each document came with.
+        bodies: std::cell::RefCell<Vec<usize>>,
+        /// Refuse the `n`th `take` of the request, counting over its chunks.
+        refuse_at: Option<usize>,
+    }
+
+    impl MatchLog {
+        fn new(refuse_at: Option<usize>) -> Self {
+            MatchLog {
+                held: Default::default(),
+                peak: Default::default(),
+                takes: Default::default(),
+                give_alls: Default::default(),
+                bodies: Default::default(),
+                refuse_at,
+            }
+        }
+    }
+
+    impl MatchHold for MatchLog {
+        fn take(&self, _doc: &Document, body: usize) -> kimmy_core::Result<()> {
+            self.takes.set(self.takes.get() + 1);
+            self.held.set(self.held.get() + 1);
+            self.peak.set(self.peak.get().max(self.held.get()));
+            self.bodies.borrow_mut().push(body);
+            if self.refuse_at == Some(self.takes.get()) {
+                return Err(kimmy_core::Error::Limit("the documents are full".into()));
+            }
+            Ok(())
+        }
+
+        fn give_all(&self) {
+            self.give_alls.set(self.give_alls.get() + 1);
+            self.held.set(0);
+        }
+    }
+
+    /// A spec that offers `log` for the documents it matches, and is otherwise `inner`.
+    struct Matched<'a, S> {
+        inner: S,
+        log: &'a MatchLog,
+    }
+
+    impl<S: ModifySpec> ModifySpec for Matched<'_, S> {
+        fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
+            self.inner.matches(doc)
+        }
+        fn compare(&self, a: &Document, b: &Document) -> Ordering {
+            self.inner.compare(a, b)
+        }
+        fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+            self.inner.apply(doc)
+        }
+        fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+            self.inner.upsert()
+        }
+        fn match_hold(&self) -> Option<&dyn MatchHold> {
+            Some(self.log)
+        }
+    }
+
+    #[test]
+    fn the_documents_a_chunk_matches_are_held_for_the_chunk_and_let_go_when_it_ends() {
+        // 25 documents in chunks of 10: three chunks, each holding its matches with their
+        // stored bodies, and giving them back when it ends.
+        let (engine, coll, candidates, _dir) = indexed_jobs(25, 10);
+        let log = MatchLog::new(None);
+        let spec = Matched { inner: claim_all(), log: &log };
+        let out = engine.modify_where(&coll, &candidates, &spec, None).unwrap();
+        assert_eq!((out.matched, out.commits), (25, 3));
+        assert_eq!((log.takes.get(), log.peak.get(), log.held.get()), (25, 10, 0));
+        assert_eq!(log.give_alls.get(), 3, "once for each chunk; the fourth is never begun");
+        assert!(log.bodies.borrow().iter().all(|body| *body > 0), "the bodies are kept");
+    }
+
+    #[test]
+    fn a_sort_holds_every_match_and_none_of_their_bodies() {
+        // `find_and_modify` has to see every match to choose one, and reads the chosen one's
+        // body again; it keeps none of the others.
+        let (engine, coll, candidates, _dir) = indexed_jobs(40, 1_000);
+        let log = MatchLog::new(None);
+        let spec = Matched { inner: claim(), log: &log };
+        let out = engine.find_and_modify(&coll, &candidates, &spec).unwrap();
+        assert!(out.matched);
+        assert_eq!((log.takes.get(), log.held.get(), log.give_alls.get()), (40, 0, 1));
+        assert!(log.bodies.borrow().iter().all(|body| *body == 0));
+    }
+
+    #[test]
+    fn a_match_the_hold_refuses_writes_nothing() {
+        // The 7th of 40 matches is refused: the chunk ends there, before any of it is
+        // written, with the matches given back.
+        let (engine, coll, candidates, _dir) = indexed_jobs(40, 1_000);
+        let clock = engine.clock_last();
+        for verb in ["modify_where", "find_and_modify"] {
+            let log = MatchLog::new(Some(7));
+            let spec = Matched { inner: claim_all(), log: &log };
+            let refused = if verb == "modify_where" {
+                engine.modify_where(&coll, &candidates, &spec, None).map(drop)
+            } else {
+                engine.find_and_modify(&coll, &candidates, &spec).map(drop)
+            };
+            assert!(
+                matches!(&refused, Err(StorageError::Core(kimmy_core::Error::Limit(m))) if m == "the documents are full"),
+                "{verb}: {refused:?}"
+            );
+            assert_eq!((log.takes.get(), log.held.get(), log.give_alls.get()), (7, 0, 1), "{verb}");
+        }
+        assert_eq!(pending(&engine, &coll, 40), 40, "nothing was written");
+        assert_eq!(engine.clock_last(), clock);
     }
 
     #[test]

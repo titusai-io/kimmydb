@@ -1,8 +1,9 @@
 //! The keys an `update`, a `delete` or a `find_and_modify` gathers from an index range under the
-//! writer (ADR-270's second addendum): charged to a lease on the node's pool, named `the index
-//! range of the write`, under the request limit, never waiting for the pool; the first 10,000
-//! keys free; the lease kept at its high-water mark across the chunks of a `multi` write; the
-//! gather ended by the deadline and the stop, with nothing written before the first commit.
+//! writer, and the documents it matches (ADR-270's second addendum): charged to a lease on the
+//! node's pool, named `what the write holds`, under the request limit, never waiting for the
+//! pool; the first 10,000 keys free; the lease kept at its high-water mark across the chunks of a
+//! `multi` write; the gather ended by the deadline and the stop, with nothing written before the
+//! first commit.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -88,9 +89,9 @@ fn modified(state: &SharedState, filter: Value, sorted: bool) -> Result<Value, A
     find_and_modify(state, &root(), "app", "orders", spec)
 }
 
-/// The bytes a refusal says the lease held: "the index range of the write is N bytes".
+/// The bytes a refusal says the lease held: "what the write holds is N bytes".
 fn held_in(err: &ApiError) -> usize {
-    let tail = err.message.split("the index range of the write is ").nth(1).expect(&err.message);
+    let tail = err.message.split("what the write holds is ").nth(1).expect(&err.message);
     tail.split(' ').next().unwrap().parse().unwrap()
 }
 
@@ -166,7 +167,7 @@ fn a_write_over_n_keys_is_answered_and_over_n_plus_one_is_refused_at_the_limit_b
         assert_eq!(err.code.retry(), Retry::No);
         assert_eq!(held_in(&err), key_bytes(10_101), "{verb}: refused at the key past the limit");
         let text = format!(
-            "the index range of the write is {} bytes, over the limit of {limit} bytes one write \
+            "what the write holds is {} bytes, over the limit of {limit} bytes one write \
              may hold at once (aggregate.memory_limit_bytes); ",
             key_bytes(10_101)
         );
@@ -228,11 +229,12 @@ fn a_full_pool_refuses_a_write_at_once_with_503_and_retry_wait() {
     // Another request holds the whole pool. The write is the youngest holder, and is refused
     // at its 10,001st key, without a wait, with its own bytes given back.
     let dir = tempfile::tempdir().unwrap();
-    let state = indexed(&dir, 10_101, 64 << 20, key_bytes(10_101));
+    let pool_bytes = key_bytes(10_101) + 1_000 * document_bytes(true);
+    let state = indexed(&dir, 10_101, 64 << 20, pool_bytes);
     let pool = pool_of(&state);
     let other = state.aggregate_memory().limits();
     let mut held = other.buffer.lease("another request");
-    held.charge(key_bytes(10_101)).unwrap();
+    held.charge(pool_bytes).unwrap();
 
     let started = Instant::now();
     let err = updated(&state, matching(0)).unwrap_err();
@@ -241,7 +243,7 @@ fn a_full_pool_refuses_a_write_at_once_with_503_and_retry_wait() {
     assert_eq!(err.code, ErrorCode::Timeout);
     assert_eq!(err.code.retry(), Retry::Wait);
     assert_eq!(err.retry_after_secs, Some(crate::error::AGGREGATE_POOL_RETRY_AFTER_SECS));
-    assert!(err.message.starts_with("the index range of the write needed "), "{}", err.message);
+    assert!(err.message.starts_with("what the write holds needed "), "{}", err.message);
     assert!(err.message.contains("aggregate.memory_pool_bytes"), "{}", err.message);
     assert!(
         err.message.contains("retry later, or narrow the filter on the indexed field"),
@@ -249,7 +251,7 @@ fn a_full_pool_refuses_a_write_at_once_with_503_and_retry_wait() {
         err.message
     );
     assert!(!err.message.contains("$match"), "{}", err.message);
-    assert_eq!(pool.used(), key_bytes(10_101), "only the other request's bytes are left");
+    assert_eq!(pool.used(), pool_bytes, "only the other request's bytes are left");
     assert_eq!((pool.pool_refusals(), pool.limit_refusals()), (1, 0));
     assert_eq!(changed(&state), 0, "nothing was written");
     drop(held);
@@ -308,7 +310,7 @@ fn a_write_never_waits_for_the_pool_even_when_it_is_the_oldest_holder() {
     let err = result.unwrap_err();
     assert_eq!(err.status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{}", err.message);
     assert_eq!(err.code.retry(), Retry::Wait);
-    assert!(err.message.starts_with("the index range of the write needed "), "{}", err.message);
+    assert!(err.message.starts_with("what the write holds needed "), "{}", err.message);
     assert!(took < Duration::from_secs(4), "{took:?}: it did not wait for the pool");
     assert_eq!(pool.pool_refusals(), 1);
     assert_eq!(pool.used(), young.bytes(), "it gave back all it held");
@@ -327,11 +329,12 @@ fn in_a_request<T>(left: Duration, work: impl FnOnce() -> T) -> T {
 #[test]
 fn a_multi_write_keeps_its_lease_at_the_most_it_held_until_the_request_is_over() {
     // 10,101 entries in chunks of 4,000: the whole range is gathered for each of the three
-    // chunks. The pool is exactly what one gather needs. The lease is made in the first
+    // chunks. The pool is exactly what the first chunk needs: its keys and 4,000 documents. The lease is made in the first
     // chunk, stands at that between the chunks, is not asked for more by the second and
     // third, and goes back when the request is answered.
     let dir = tempfile::tempdir().unwrap();
-    let state = indexed(&dir, 10_101, key_bytes(10_101), key_bytes(10_101));
+    let most = key_bytes(10_101) + 4_000 * document_bytes(true);
+    let state = indexed(&dir, 10_101, most, most);
     state.engine.set_multi_chunk_docs(4_000);
     let pool = pool_of(&state);
     let between = Arc::new(AtomicUsize::new(usize::MAX));
@@ -346,7 +349,7 @@ fn a_multi_write_keeps_its_lease_at_the_most_it_held_until_the_request_is_over()
     );
     assert_eq!(
         between.load(Ordering::SeqCst),
-        key_bytes(10_101),
+        most,
         "between the chunks the lease stands at the most the request held"
     );
     assert_eq!(pool.used(), 0, "and it is given back at the end");
@@ -354,15 +357,81 @@ fn a_multi_write_keeps_its_lease_at_the_most_it_held_until_the_request_is_over()
     assert_eq!(changed(&state), 10_101);
 }
 
+/// What the budget counts for one document of `indexed` when a write keeps its stored body
+/// beside it (a chunk of `update` or `delete`), and when it does not (what a sort keeps).
+fn document_bytes(with_body: bool) -> usize {
+    let document = doc! { "_id": 5_i64, "t": 5_i64, "u": 5_i64 };
+    let body = if with_body { bson::serialize_to_vec(&document).unwrap().len() } else { 0 };
+    kimmy_query::budget::held_bytes(&document) + kimmy_query::budget::held_blob(body)
+}
+
+#[test]
+fn the_documents_a_chunk_matches_are_charged_on_the_lease_by_the_byte() {
+    // 10,101 entries in chunks of 1,000: the lease is made at the 10,001st key of the first
+    // gather, and the first chunk holds all the keys and, at the most, 1,000 matched documents
+    // with their bodies. A limit of exactly that answers the whole request, eleven chunks, since
+    // the lease stands at it; a byte under refuses the first chunk's 1,000th document.
+    let (keys, one) = (key_bytes(10_101), document_bytes(true));
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 10_101, keys + 1_000 * one, 64 << 20);
+    let answered = updated(&state, matching(0)).unwrap();
+    assert_eq!((&answered["matched"], &answered["commits"]), (&json!(10_101), &json!(11)));
+    assert_eq!(pool_of(&state).used(), 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 10_101, keys + 1_000 * one - 1, 64 << 20);
+    let log = oplog_len(&state);
+    let err = updated(&state, matching(0)).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert_eq!(held_in(&err), keys + 1_000 * one, "refused at the document that passes the limit");
+    assert_eq!((changed(&state), oplog_len(&state)), (0, log), "nothing was written");
+    assert_eq!(pool_of(&state).used(), 0);
+
+    // A delete holds the same.
+    let err = deleted(&state, matching(0)).unwrap_err();
+    assert_eq!(held_in(&err), keys + 1_000 * one);
+
+    // A range within what a write may match unpooled has no lease, and its documents are held
+    // as they always were, uncharged, under a limit of nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 10_101, 0, 0);
+    let answered = updated(&state, matching(101)).unwrap();
+    assert_eq!(answered["matched"], 10_000);
+    assert_eq!((pool_of(&state).limit_refusals(), pool_of(&state).holders()), (0, 0));
+}
+
+#[test]
+fn a_sort_charges_every_match_it_holds_and_not_their_bodies() {
+    // A `find_and_modify` that sorts holds every match to choose one: 9,045 of the 10,051 entries
+    // of the range here, without their stored bodies. The keys of the gather are held beside
+    // them while they are read.
+    let total = 10_051;
+    let wanted = json!({ "t": { "$gte": 50 }, "u": { "$ne": 0 } });
+    let matches = (50..10_101).filter(|i| i % 10 != 0).count();
+    assert_eq!(matches, 9_045);
+    let peak = key_bytes(total) + matches * document_bytes(false);
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 10_101, peak, 64 << 20);
+    assert_eq!(modified(&state, wanted.clone(), true).unwrap()["matched"], 1);
+    assert_eq!(pool_of(&state).used(), 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = indexed(&dir, 10_101, peak - 1, 64 << 20);
+    let err = modified(&state, wanted, true).unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{}", err.message);
+    assert_eq!(held_in(&err), peak, "refused at the last match");
+    assert_eq!(changed(&state), 0, "nothing was written");
+}
+
 #[test]
 fn a_pool_another_request_takes_between_the_chunks_does_not_refuse_the_later_ones() {
-    // The pool is what one gather needs. Between the first chunk and the second another request
+    // The pool is what the first chunk needs. Between the first chunk and the second another request
     // takes whatever the pool has free, and keeps it to the end. Were the lease given back
     // between the chunks that would be all of it, and the second chunk, after a commit, would be
     // refused (`500 partially_applied`) for a pool it had already been given; the lease stands,
     // so the second and third chunks ask for nothing.
     let dir = tempfile::tempdir().unwrap();
-    let state = indexed(&dir, 10_101, 64 << 20, key_bytes(10_101));
+    let state = indexed(&dir, 10_101, 64 << 20, key_bytes(10_101) + 4_000 * document_bytes(true));
     state.engine.set_multi_chunk_docs(4_000);
     let pool = pool_of(&state);
     let other = state.aggregate_memory().limits();
@@ -382,12 +451,13 @@ fn a_pool_another_request_takes_between_the_chunks_does_not_refuse_the_later_one
 
 #[test]
 fn a_later_chunk_whose_range_has_outgrown_the_lease_is_partly_applied_with_the_refusal_as_cause() {
-    // Between the first chunk and the second 100 documents enter the range. The second gather
-    // asks for the growth, over the limit, and the refusal is after a commit: `500
-    // partially_applied`, retry `verify`, with the first chunk counted and the refusal as the
-    // cause. A range that had not grown asked the pool for nothing (the test before).
+    // Between the first chunk and the second 100 documents enter the range. The lease stands at
+    // the keys and documents of the first chunk, and the second chunk's come to 100 keys more,
+    // which is over the limit; the refusal is after a commit: `500 partially_applied`, retry
+    // `verify`, with the first chunk counted and the refusal as the cause. A range that had not
+    // grown asked the pool for nothing (the test before).
     let dir = tempfile::tempdir().unwrap();
-    let state = indexed(&dir, 10_101, key_bytes(10_101), 64 << 20);
+    let state = indexed(&dir, 10_101, key_bytes(10_101) + 4_000 * document_bytes(true), 64 << 20);
     state.engine.set_multi_chunk_docs(4_000);
     let (engine, meta) = (Arc::clone(&state.engine), state.engine.get_collection("app", "orders"));
     let meta = meta.unwrap();
@@ -404,9 +474,7 @@ fn a_later_chunk_whose_range_has_outgrown_the_lease_is_partly_applied_with_the_r
     assert_eq!(extra["applied"]["matched"], 4_000);
     assert_eq!(extra["applied"]["commits"], 1);
     assert_eq!(extra["cause"]["code"], "answer_too_large");
-    assert!(
-        extra["cause"]["message"].as_str().unwrap().starts_with("the index range of the write is ")
-    );
+    assert!(extra["cause"]["message"].as_str().unwrap().starts_with("what the write holds is "));
     assert_eq!(changed(&state), 4_000, "the first chunk stands, and nothing after it");
     assert_eq!(pool_of(&state).used(), 0);
 }

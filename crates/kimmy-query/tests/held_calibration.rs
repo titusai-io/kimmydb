@@ -16,7 +16,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use bson::{Bson, Document, doc};
-use kimmy_query::budget::{doc_bytes, held_bytes, held_element, held_frame_growth};
+use kimmy_query::budget::{doc_bytes, held_blob, held_bytes, held_element, held_frame_growth};
 
 struct Counting;
 
@@ -237,6 +237,19 @@ fn the_estimate_is_at_least_what_documents_hold_and_at_most_one_and_a_half_times
                 failures.push(format!("{name}: {ratio:.2} x its BSON, not within 1.0 to 1.35"));
             }
         }
+    }
+    // The stored body a write keeps beside the document it matched: a `Vec<u8>` of the body's
+    // length, its header included.
+    for len in [0usize, 1, 24, 25, 100, 4_096, 100_000, 200_000, 1 << 20] {
+        let before = live();
+        let body = vec![7u8; len];
+        let held = (live() - before) as usize + std::mem::size_of::<Vec<u8>>();
+        let estimate = held_blob(len);
+        table.push_str(&format!("stored body of {len} bytes: holds {held}, estimate {estimate}\n"));
+        if estimate < held || estimate > held + held / 2 + 32 {
+            failures.push(format!("a body of {len} bytes holds {held}, estimated {estimate}"));
+        }
+        drop(body);
     }
     println!("{table}");
     assert!(failures.is_empty(), "{}\n{table}", failures.join("\n"));

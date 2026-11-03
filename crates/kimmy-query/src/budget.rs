@@ -208,6 +208,12 @@ pub fn held_set_key(len: usize) -> usize {
     with_margin(std::mem::size_of::<Vec<u8>>() + 2 * 9 + heap_block(len))
 }
 
+/// The estimate for a byte buffer of `len` bytes kept beside a document: the stored body a
+/// write holds with the document it decoded from it (the `Vec` header and its block).
+pub fn held_blob(len: usize) -> usize {
+    with_margin(std::mem::size_of::<Vec<u8>>() + heap_block(len))
+}
+
 /// The estimate of a list of documents.
 pub fn held_docs_bytes(docs: &[Document]) -> usize {
     docs.iter().fold(0usize, |sum, doc| sum.saturating_add(held_bytes(doc)))
