@@ -64,6 +64,8 @@ mod compact_tests;
 #[cfg(test)]
 mod counter_tests;
 #[cfg(test)]
+mod hand_built;
+#[cfg(test)]
 mod nested_tests;
 #[cfg(test)]
 mod prop_tests;

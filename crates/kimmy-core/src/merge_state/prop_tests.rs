@@ -293,6 +293,194 @@ fn join_laws_retention_beyond_the_spread() {
     check_laws(&opts(40), true, 60, 30, 300);
 }
 
+/// The laws of the join on hand-built states ([`super::hand_built`]), in the shapes the public
+/// fields allow and no writer makes: odd paths, cells of absent or dead lives, markers and
+/// scalars, arrays of documents, deletes across the horizon, totals at `MAX_TOTAL`.
+///
+/// The laws are claimed for CLOSED states ([`super::hand_built::Mode::Closed`]): what a stamp
+/// carries is a function of the stamp and the path, as in every state that honest writers build,
+/// and the state satisfies what `decode` requires of one (every dead life listed in `lives`, the
+/// version vector covering every life, delete, register and slot stamp). They are not claimed
+/// where two states disagree about what one stamp wrote: the join keeps its first argument's cell
+/// then, so it is not commutative there, by design (that is what the equivalence test of the D7
+/// pass feeds the join, to compare it with the code before the pass). And without the two
+/// invariants the laws FAIL: see `the_join_is_not_commutative_or_idempotent_where_decode_refuses`.
+///
+/// Two families. First the states as built, with the cells of absent and dead lives still in
+/// them: the join must be commutative and absorb its own result, and the hashes must not depend
+/// on the order; it is not idempotent on them, since it drops those cells. Then the same states
+/// normalised through a join with the empty state, as a writer's `finish` does: there all the
+/// laws of [`check_laws_on`] hold.
+#[test]
+fn join_laws_on_hand_built_shapes() {
+    hand_built_laws(super::hand_built::Mode::Closed);
+}
+
+fn hand_built_laws(mode: super::hand_built::Mode) {
+    use super::hand_built::{self, BUILDERS};
+    for (ret, exact) in [(1_000_000_000, true), (40, true), (10, false), (4, false)] {
+        let o = opts(ret);
+        let empty = MergeState::default();
+        let mut rng = Rng(0x4841_4E44_4255_494C ^ ret);
+        let mut raw: Vec<Vec<MergeState>> = Vec::new();
+        let mut normalised: Vec<Vec<MergeState>> = Vec::new();
+        let mut kinds = BTreeSet::new();
+        for builder in 0..BUILDERS.len() {
+            // a pool: the states of several cases of one builder, which share their lives and
+            // paths, so that triples of them meet
+            for _ in 0..if builder == BUILDERS.len() - 1 { 40 } else { 6 } {
+                let (mut r, mut n) = (Vec::new(), Vec::new());
+                for _ in 0..3 {
+                    let c = hand_built::case(&mut rng, mode, builder, ret);
+                    for x in [c.s, c.t] {
+                        let y = join(&x, &empty, &o).0;
+                        kinds.extend(y.losses.keys().map(|k| k.kind));
+                        r.push(x);
+                        n.push(y);
+                    }
+                }
+                raw.push(r);
+                normalised.push(n);
+            }
+        }
+        assert!(kinds.len() >= 4, "the cases must produce loss records: {kinds:?}");
+        check_laws_on(&o, exact, &normalised, 3000);
+        for (k, (a, b, _)) in triples(&raw, 3000).into_iter().enumerate() {
+            let (ab, ba) = (join(a, b, &o).0, join(b, a, &o).0);
+            assert!(ab == ba, "commutative (state and records), as built, R {ret}, triple {k}");
+            assert!(join(&ab, b, &o).0 == ab, "absorbing, as built, R {ret}, triple {k}");
+            assert_eq!(ab.compact_hash(), ba.compact_hash());
+        }
+    }
+}
+
+// ---- the states decode refuses ---------------------------------------------------------------
+
+/// A state's compact bytes, spelled in hex.
+fn unhex(h: &str) -> Vec<u8> {
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+}
+
+/// The states `A`, `B` and `C` of the first triple the hand-built law test failed on (its first
+/// version, before the generator closed its states: it is not in the tree), as the compact bytes
+/// of the states normalised by a join with the empty one, at the retention `10^9`. The join of `A`
+/// and `B` was not commutative: both have a dead life that `lives` does not list.
+const PINNED_A: &str = concat!(
+    "514d530203414141414141414141414141414141410000000000000000000000000000000000004242424242",
+    "4242424242424242424242000000000000000000000000000000000000434343434343434343434343434343",
+    "4300000000000000000000000000000000000003000000000000000100000000000000000000020000010000",
+    "00000000000300000201000000010102000300010000000000000000000b00000001fffffffffffffff90101",
+    "0100000000000000000b0000000000020161016201000000000000000b00000004011001000f020001000000",
+    "00000000000b000000ffffffffffffffffffffffffffffffffff01000200000000000000000b000000ffffff",
+    "ffffffffffffffffffffffffffff0101000000feffffffffffffffffffffffffffffffff0100010178010000",
+    "00000000000b0000000001010100000000000000000b000000d00f00030001000000000000000000000b0000",
+    "008080808080808080808080808080808080020002016101620000000000000000000b000000808080808080",
+    "808080808080808080808002000101780000000000000000000b000000feffffffffffffffffffffffffffff",
+    "ffff010100000000000000001400000901010100000000000000000c00000001828080808080808080808080",
+    "8080808080040100000000000000000000000000843001010100000000000000000d00000001feffffffffff",
+    "ffffffffffffffffffffff0101010100000000000000000f0000000182808080808080808080808080808080",
+    "80040100000000000000000000000000843001010201610162000000000000000c0000000180808080808080",
+    "80800101010201610162000000000000000d00000001d00f01010201610162000000000000000f0000000180",
+    "8080808080808080010101010178000000000000000c00000001818080808080808080808080808080808004",
+    "0e0101010178000000000000000d000000018180808080808080808080808080808080040e01010101780000",
+    "00000000000f00000001feffffffffffffffffffffffffffffffff01",
+);
+
+const PINNED_B: &str = concat!(
+    "514d530203414141414141414141414141414141410000000000000000000000000000000000004242424242",
+    "4242424242424242424242000000000000000000000000000000000000434343434343434343434343434343",
+    "4300000000000000000000000000000000000003000000000000000100000000000000000000020000010000",
+    "0000000000030000020201000101015f0102000102000161010100000601010005000000000000000d000001",
+    "010000000000000007000001020161016201000000000000000d000001050002000000feffffffffffffffff",
+    "ffffffffffffffff010002008080808080808080808080808080808080020101017801000000000000000d00",
+    "00010280000000000000000002000000090101000202010001000000000000000e0000010301730001010100",
+    "feffffffffffffffffffffffffffffffff0102020161016201000000000000000e0000010280000000000000",
+    "000001000100d00f0201017801000000000000000e000001070000000502000000000000000000000e000001",
+    "d00f000200000000000000000e0000010001010000d00f060101000100000000000000000d00000109010201",
+    "6101620100000000000000000d0000018180808080808080808080808080808080040e010101780100000000",
+    "000000000d000001ffffffffffffffffffffffffffffffffff010201000100000000000000000e0000018080",
+    "80808080808080010202016101620100000000000000000e0000018180808080808080808080808080808080",
+    "040e020101780100000000000000000e000001d00f0101000000000000001400000601010100000000000000",
+    "000c000001010901010100000000000000001000000101828080808080808080808080808080808004010000",
+    "0000000000000000000000843001010201610162000000000000000c00000101828080808080808080808080",
+    "8080808080040100000000000000000000000000843001010201610162000000000000001000000101808080",
+    "808080808080010101010178000000000000000c000001010201010101780000000000000010000001018080",
+    "80808080808080808080808080808002",
+);
+
+const PINNED_C: &str = concat!(
+    "514d530203414141414141414141414141414141410000000000000000000000000000000000004242424242",
+    "4242424242424242424242000000000000000000000000000000000000434343434343434343434343434343",
+    "4300000000000000000000000000000000000003000000000000000100000000000000000000020000010000",
+    "00000000000300000201000000010102000300010000000000000000000b00000001fffffffffffffff90101",
+    "0100000000000000000b0000000000020161016201000000000000000b00000004011001000f020001000000",
+    "00000000000b000000ffffffffffffffffffffffffffffffffff01000200000000000000000b000000ffffff",
+    "ffffffffffffffffffffffffffff0101000000feffffffffffffffffffffffffffffffff0100010178010000",
+    "00000000000b0000000001010100000000000000000b000000d00f00030001000000000000000000000b0000",
+    "008080808080808080808080808080808080020002016101620000000000000000000b000000808080808080",
+    "808080808080808080808002000101780000000000000000000b000000feffffffffffffffffffffffffffff",
+    "ffff010100000000000000001400000901010100000000000000000c00000001828080808080808080808080",
+    "8080808080040100000000000000000000000000843001010100000000000000000d00000001feffffffffff",
+    "ffffffffffffffffffffff0101010100000000000000000f0000000182808080808080808080808080808080",
+    "80040100000000000000000000000000843001010201610162000000000000000c0000000180808080808080",
+    "80800101010201610162000000000000000d00000001d00f01010201610162000000000000000f0000000180",
+    "8080808080808080010101010178000000000000000c00000001818080808080808080808080808080808004",
+    "0e0101010178000000000000000d000000018180808080808080808080808080808080040e01010101780000",
+    "00000000000f00000001feffffffffffffffffffffffffffffffff01",
+);
+
+/// `decode` refuses the exact states the hand-built law test first failed on (the join of two of
+/// them was not commutative), in the form they were pinned in: each has a dead life that `lives`
+/// does not list.
+#[test]
+fn decode_refuses_the_states_the_hand_built_law_test_first_failed_on() {
+    for hex in [PINNED_A, PINNED_B, PINNED_C] {
+        assert_eq!(MergeState::decode_compact(&unhex(hex)), Err(DecodeError::DeadLifeNotListed));
+    }
+}
+
+/// WHY decode refuses them: the join is not commutative on a state with a dead life that `lives`
+/// does not list (the result keeps the lives of its first argument), so two replicas that receive
+/// the same two such states in different orders would end in different states, with different
+/// hashes; and it is not idempotent on a state whose version vector does not cover its stamps
+/// (it finds a `typeClash` with itself). The join is not changed: no such state gets in.
+#[test]
+fn the_join_is_not_commutative_or_idempotent_where_decode_refuses() {
+    use super::tests::{dead_but_unlisted, vv_does_not_cover};
+    let o = opts(1_000_000_000);
+    let (a, b) = dead_but_unlisted();
+    for x in [&a, &b] {
+        assert_eq!(
+            MergeState::decode_compact(&x.encode_compact()),
+            Err(DecodeError::DeadLifeNotListed)
+        );
+        assert_eq!(MergeState::decode(&x.encode()), Err(DecodeError::DeadLifeNotListed));
+    }
+    assert!(join(&a, &b, &o).0 != join(&b, &a, &o).0, "not commutative");
+    let mut first = Writer::new(
+        WriterId { node: NodeId::from_bytes([7; 16]), epoch: Epoch::from_u64(0) },
+        o.clone(),
+    );
+    let mut second = Writer::new(
+        WriterId { node: NodeId::from_bytes([8; 16]), epoch: Epoch::from_u64(0) },
+        o.clone(),
+    );
+    first.receive(&a);
+    first.receive(&b);
+    second.receive(&b);
+    second.receive(&a);
+    assert_ne!(first.state.compact_hash(), second.state.compact_hash(), "the receive order shows");
+
+    let s = vv_does_not_cover();
+    assert_eq!(
+        MergeState::decode_compact(&s.encode_compact()),
+        Err(DecodeError::VersionVectorBehind)
+    );
+    assert_eq!(MergeState::decode(&s.encode()), Err(DecodeError::VersionVectorBehind));
+    let n = join(&s, &MergeState::default(), &o).0;
+    assert!(join(&n, &n, &o).0 != n, "not idempotent");
+}
+
 #[test]
 fn encode_decode_round_trip() {
     for o in [opts(1_000_000_000), opts(6)] {
