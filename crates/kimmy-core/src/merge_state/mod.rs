@@ -14,8 +14,14 @@
 //!   against what the writer sees and writes only the leaves that changed; a write below a scalar
 //!   or an array is refused; the join reports `typeClash` and `arrayClash`. NOT built here, by
 //!   ruling: the implicit map marker a leaf write would leave on absent parents (so an emptied
-//!   implicit map vanishes), a map-creating `$inc`, the field-order state and the multi-operator
-//!   update, which the next model round revises.
+//!   implicit map vanishes), a map-creating `$inc` and the multi-operator update, which the
+//!   next model round revises.
+//! * The field order (`ord.rs`, option A): [`MergeState::ords`] holds, per `(life, path)`, a
+//!   [`FieldOrd`] (floor, per-writer firsts, last, level floor), joined with the cells by
+//!   [`ord_join`]; [`MergeState::ordered_document`] reads the document in that order. The state,
+//!   its join and the read are built (the compact codec does not spell it yet); the [`Writer`] does NOT
+//!   feed the order state yet (a state a writer builds has none), so the order of a document is
+//!   tested against the reference model on states assembled from its writes.
 //! * [`MergeState`] holds lives, deletes, dead lives, registers, counter slots,
 //!   generation marks, the version vector and the loss records.
 //! * [`join()`] merges two states and reports the loss records that are new
@@ -53,6 +59,7 @@ mod codec;
 mod compact;
 mod counter;
 mod join;
+mod ord;
 mod state;
 mod types;
 #[cfg(test)]
@@ -64,11 +71,11 @@ mod compact_tests;
 #[cfg(test)]
 mod counter_tests;
 #[cfg(test)]
-mod d7_equivalence_tests;
-#[cfg(test)]
 mod hand_built;
 #[cfg(test)]
 mod nested_tests;
+#[cfg(test)]
+mod ord_tests;
 #[cfg(test)]
 mod prop_tests;
 #[cfg(test)]
@@ -79,6 +86,9 @@ mod work_tests;
 pub use codec::{DecodeError, V1CannotHold};
 pub use counter::Num;
 pub use join::{InvalidIntBound, JoinOptions, join};
+pub use ord::{
+    Cand, FieldOrd, Floor, OrdAt, OrdEvent, OrdMode, OrderedValue, ord_events, ord_join,
+};
 pub use state::{
     Excess, Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey,
     OverCaps, Reg, Slot, Vv,
@@ -121,6 +131,14 @@ const _: () = {
     let _: fn(&MergeState, &JoinOptions) -> BTreeMap<Path, i128> = MergeState::hidden_all;
     let _: fn(&MergeState, &Path, &JoinOptions) -> Option<Value> = MergeState::value;
     let _: fn(&MergeState, &JoinOptions) -> Option<BTreeMap<Path, Value>> = MergeState::visible;
+    let _: fn(&MergeState, &JoinOptions) -> Option<Vec<(String, OrderedValue)>> =
+        MergeState::ordered_document;
+    let _: fn(&[(String, OrderedValue)]) -> Vec<Path> = OrderedValue::paths;
+    let _: fn(&FieldOrd, &FieldOrd, &JoinOptions) -> FieldOrd = ord_join;
+    let _: fn(&[(OrdAt, OrdMode)], &JoinOptions) -> Vec<OrdEvent> = ord_events;
+    let _: fn(&Floor) -> MStamp = Floor::stamp;
+    let _: fn(&FieldOrd, &Cand, &JoinOptions) -> bool = FieldOrd::valid;
+    let _: fn(&FieldOrd, &JoinOptions) -> bool = FieldOrd::is_normal;
     let _: fn(&MergeState, &JoinOptions) -> Vec<MStamp> = MergeState::alive;
     let _: fn(&MergeState) -> BTreeSet<WriterId> = MergeState::writers;
     let _: fn(&MergeState, &Path, &JoinOptions) -> BTreeSet<WriterId> = MergeState::contributors;

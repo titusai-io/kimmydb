@@ -567,7 +567,7 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// The fingerprint of the default 300 scripts. Taken before the performance pass of Q7 step 0 and
 /// re-pinned once, when the odd field names (the empty name, a name with a dot) joined the
 /// generator's pools: the pools grew, the code did not change. The old code (`8e36e8de`) gives this
-/// value on the new pools, as the new code does (`d7_equivalence_tests` pins the equivalence). Any
+/// value on the new pools, as the new code does (the equivalence test of the D7 pass, retired when the order state changed the join, pinned it). Any
 /// other change to it is a change of behaviour, never to be re-pinned for speed.
 const PINNED_300: u64 = 0xe9e4_3cfc_7a1b_a621;
 

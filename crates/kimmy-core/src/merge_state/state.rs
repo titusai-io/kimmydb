@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::codec::DecodeError;
 use super::counter::Num;
 use super::join::JoinOptions;
+use super::ord::{FieldOrd, OrdAt};
 use super::types::{Epoch, InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
@@ -199,13 +200,18 @@ pub struct MergeState {
     pub gens: BTreeMap<(MStamp, Path), (MStamp, Vv)>,
     pub vv: Vv,
     pub losses: BTreeMap<LossKey, LossValue>,
+    /// The order state: for each `(life, path)` a write named, the writes that could give the
+    /// path its place in the document (see `ord.rs`). Empty for a state no order feed has
+    /// touched. A key is a life and a path, like a register's; the root of a replace is
+    /// [`OrdAt::Root`]. Joined like cells, dropped with a life that is not alive.
+    pub ords: BTreeMap<(MStamp, OrdAt), FieldOrd>,
 }
 
 impl PartialEq for MergeState {
     /// Equality of the replicated state: everything that is encoded. `gens` (mutant memory)
     /// is left out.
     fn eq(&self, other: &Self) -> bool {
-        let MergeState { lives, deletes, dead, regs, slots, gens: _, vv, losses } = self;
+        let MergeState { lives, deletes, dead, regs, slots, gens: _, vv, losses, ords } = self;
         *lives == other.lives
             && *deletes == other.deletes
             && *dead == other.dead
@@ -213,6 +219,7 @@ impl PartialEq for MergeState {
             && *slots == other.slots
             && *vv == other.vv
             && *losses == other.losses
+            && *ords == other.ords
     }
 }
 
@@ -268,6 +275,31 @@ impl MergeState {
     /// 9. No index or arithmetic in the join or the reads can fail on a state with 1 to 2:
     ///    every `lives[l]` is over a key drawn from `lives`, `sub_ret` clamps, sums saturate.
     ///
+    /// 10. The order state (`ords`). Every entry is NORMAL: no candidate (`firsts`, `last`) is
+    ///     one its floor voids. CHECKED here ([`DecodeError::OrdNotNormal`]): the join of an
+    ///     entry with itself drops what the floor voids, so a state that holds one is not
+    ///     idempotent under join, and two replicas that normalise at different times would
+    ///     differ. The join keeps an entry only one side has as it is, and normalises one only
+    ///     the other side has, so every state a writer or a join makes is normal.
+    /// 11. An order entry belongs to a life `lives` lists. CHECKED here
+    ///     ([`DecodeError::OrdLifeNotListed`]); every state a join leaves has it (the entries
+    ///     of a life that is not alive go with it, and a life leaves `lives` only dead). The
+    ///     reads would not notice (they take the alive lives first, and an unlisted life is not
+    ///     alive), but the join drops the entry, so the state is not one it can produce; the
+    ///     cells (item 5) are NOT checked the same way, because a hand-built state has them
+    ///     and no reader needs it of them.
+    /// 12. The version vector covers the stamps an order entry holds (floor, `firsts`, `last`,
+    ///     `lvl`), as item 2 does for cells: CHECKED ([`DecodeError::VersionVectorBehind`]).
+    ///     The join does not read the vector for the order, but a writer restored from the state
+    ///     mints above its vector, and a stamp it then reused would meet its own floor.
+    /// 13. NOT relied on, so NOT checked: that a `firsts` candidate is stamped by the writer
+    ///     that keys it, that `last` is not earlier than a first, that a `u` floor's `prev` is
+    ///     below its own stamp, that the positions are small, that an entry is not empty, that
+    ///     the root keeps only a level floor (`OrdAt::Root`), that the entries are for paths
+    ///     that have a cell. The join and the read are defined for any values of these (the
+    ///     laws hold on the entries of the model's runs and on any NORMAL entries for
+    ///     commutativity and idempotence); they are the model's own writer's habits.
+    ///
     /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
     pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {
         if self.dead.iter().any(|l| !self.lives.contains_key(l)) {
@@ -282,6 +314,25 @@ impl MergeState {
             .chain(self.slots.values().map(|s| &s.stamp));
         if stamps.into_iter().any(|st| !covered(st)) {
             return Err(DecodeError::VersionVectorBehind);
+        }
+        let o = JoinOptions::default();
+        for ((l, _), x) in &self.ords {
+            if !self.lives.contains_key(l) {
+                return Err(DecodeError::OrdLifeNotListed);
+            }
+            if !x.is_normal(&o) {
+                return Err(DecodeError::OrdNotNormal);
+            }
+            let held = x
+                .floor
+                .map(|f| f.stamp())
+                .into_iter()
+                .chain(x.firsts.values().map(|c| c.0))
+                .chain(x.last.map(|c| c.0))
+                .chain(x.lvl);
+            if held.into_iter().any(|st| !covered(&st)) {
+                return Err(DecodeError::VersionVectorBehind);
+            }
         }
         Ok(())
     }

@@ -223,7 +223,12 @@ fn check_laws(o: &JoinOptions, exact_assoc: bool, seeds: u64, steps: usize, coun
 }
 
 /// [`check_laws`] over the given pools of states.
-fn check_laws_on(o: &JoinOptions, exact_assoc: bool, ps: &[Vec<MergeState>], count: usize) {
+pub(super) fn check_laws_on(
+    o: &JoinOptions,
+    exact_assoc: bool,
+    ps: &[Vec<MergeState>],
+    count: usize,
+) {
     let mut assoc_loss_diff = 0;
     let mut assoc_state_diff = 0;
     for (k, (a, b, c)) in triples(ps, count).into_iter().enumerate() {
