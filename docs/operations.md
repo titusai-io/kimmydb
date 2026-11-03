@@ -225,7 +225,7 @@ charges nothing that lasts, and the stages that keep a state charge the state as
 | `$sort` followed by `$limit` (and a `$skip` between them) | `the heap of $sort`: the first `skip + limit` documents and their keys | a document when it is kept, given back when it is turned out |
 | `$sample` | `the reservoir of $sample`: the documents it will answer | a document when it is kept, given back when it is replaced |
 | `$sort` with no `$limit` after it, `$bucketAuto`, `$setWindowFields`, `$densify`, `$fill`, `$facet`, `$lookup`, `$graphLookup`, `$unionWith` | `the input of $sort` (and so on): all their input | each document as it reaches them |
-| the answer | `the output of the pipeline` | the documents and the JSON built from them |
+| the answer | `the output of the pipeline` as the documents arrive, then `the answer` | the documents, and the JSON built from them |
 
 So `[{$count: "n"}]`, `[{$limit: 5}]`, `[{$sort: ..}, {$limit: 10}]`, `[{$group: {_id: "$k", n:
 {$sum: 1}}}]` and `[{$sample: {size: 5}}]` over a collection above the per-request limit are answered,
