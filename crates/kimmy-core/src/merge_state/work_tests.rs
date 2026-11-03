@@ -37,3 +37,54 @@ fn a_writer_that_has_written_does_not_walk_the_state_for_the_writer_cap() {
     let (_, c) = count(|| b.write_set(&p("f005"), s("y"), 0).unwrap());
     assert_eq!(c.writer_scans, 0);
 }
+
+/// Two writers' copies of a document of `n` fields, where the second then `$set`s `changed` of
+/// them (and so differs from the first by that many registers).
+fn two(n: usize, changed: usize) -> (Writer, Writer, usize) {
+    let a = wide(n);
+    let mut b = Writer::new(wid('B', 0), opts());
+    b.receive(&a.state);
+    for k in 0..changed {
+        b.write_set(&p(&format!("f{k:03}")), s("new"), 0).unwrap();
+    }
+    let regs = a.state.regs.len();
+    (a, b, regs)
+}
+
+#[test]
+fn a_join_copies_the_first_state_once_and_the_registers_that_win() {
+    for n in [20, 200] {
+        let (a, b, regs) = two(n, n / 10);
+        let ((j, _), c) = count(|| a.state.join(&b.state, &opts()));
+        assert_eq!(j.regs.len(), regs);
+        // the copy of `a` (the result is built in it) and the `n / 10` registers of `b` that
+        // replace the ones in it; not a copy of each side before the union and another after
+        assert_eq!(c.reg_clones, regs + n / 10, "{n} fields");
+        // the joined-in state is the receiver's: one copy of it and the winners
+        let mut r = a.clone();
+        let (rec, c) = count(|| r.receive_report(&b.state));
+        assert!(rec.changed);
+        assert_eq!(c.reg_clones, regs + n / 10, "receive, {n} fields");
+    }
+}
+
+#[test]
+fn the_clash_search_of_a_join_is_linear_in_the_cells() {
+    let visits = |n: usize| {
+        let (a, mut b, regs) = two(n, 0);
+        // every field is changed by both: n concurrent registers
+        let mut a = a;
+        for k in 0..n {
+            a.write_set(&p(&format!("f{k:03}")), s("from a"), 0).unwrap();
+            b.write_set(&p(&format!("f{k:03}")), s("from b"), 0).unwrap();
+        }
+        let ((j, fresh), c) = count(|| a.state.join(&b.state, &opts()));
+        assert_eq!(fresh.len(), n, "a clash for every field");
+        assert_eq!(j.regs.len(), regs);
+        c.visits
+    };
+    let (v1, v2) = (visits(100), visits(200));
+    // the registers of both sides, once each (not once per path)
+    assert_eq!(v1, 2 * 102);
+    assert_eq!(v2, 2 * 202);
+}

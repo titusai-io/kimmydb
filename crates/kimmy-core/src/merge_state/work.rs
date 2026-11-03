@@ -7,10 +7,16 @@ use std::cell::Cell;
 pub(super) enum Counter {
     /// A walk over the whole state to list the writers it mentions.
     WriterScans,
+    /// A register cloned.
+    RegClones,
+    /// A register or counter slot looked at by a scan, a probe or an index build.
+    Visits,
 }
 
+const COUNTERS: usize = 3;
+
 thread_local! {
-    static COUNTS: [Cell<usize>; 1] = const { [Cell::new(0)] };
+    static COUNTS: [Cell<usize>; COUNTERS] = const { [Cell::new(0), Cell::new(0), Cell::new(0)] };
 }
 
 pub(super) fn bump(c: Counter, n: usize) {
@@ -21,11 +27,17 @@ pub(super) fn bump(c: Counter, n: usize) {
 pub(super) fn count<T>(f: impl FnOnce() -> T) -> (T, Counts) {
     COUNTS.with(|a| a.iter().for_each(|c| c.set(0)));
     let t = f();
-    let c = COUNTS.with(|a| Counts { writer_scans: a[Counter::WriterScans as usize].get() });
+    let c = COUNTS.with(|a| Counts {
+        writer_scans: a[Counter::WriterScans as usize].get(),
+        reg_clones: a[Counter::RegClones as usize].get(),
+        visits: a[Counter::Visits as usize].get(),
+    });
     (t, c)
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Counts {
     pub writer_scans: usize,
+    pub reg_clones: usize,
+    pub visits: usize,
 }

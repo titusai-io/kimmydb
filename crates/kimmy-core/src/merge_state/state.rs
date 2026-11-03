@@ -70,13 +70,29 @@ fn mutant_vv(_: &Vv) -> Vv {
 /// A register cell: higher stamp wins. `obs` is what the writer had counted: for each
 /// counted slot the slot's stamp and total at that time (the stamp tells a slot that has
 /// not moved since from one that moved and came back to the same total). `generation` the generation of this base, `soi` marks `$setOnInsert` creation cells.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 pub struct Reg {
     pub stamp: MStamp,
     pub value: Value,
     pub obs: BTreeMap<ObsKey, (MStamp, Num)>,
     pub generation: Option<Gen>,
     pub soi: bool,
+}
+
+// What `derive(Clone)` writes, by hand so that a test can count the registers a join or a write
+// copies (see `work`).
+impl Clone for Reg {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        super::work::bump(super::work::Counter::RegClones, 1);
+        Reg {
+            stamp: self.stamp,
+            value: self.value.clone(),
+            obs: self.obs.clone(),
+            generation: self.generation.clone(),
+            soi: self.soi,
+        }
+    }
 }
 
 impl Reg {
