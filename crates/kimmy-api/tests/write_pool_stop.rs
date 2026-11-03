@@ -4,6 +4,10 @@
 //! written and the pool at 0 afterwards. Before the gather ticked, the stop reached a write
 //! only at its first candidate document, after the whole range was collected.
 //!
+//! The gather is made the long part of the request, so that a stop that only reached the first
+//! candidate would not do: every index entry takes a millisecond to read
+//! (`set_test_walk_row_delay`), the point reads behind them take none.
+//!
 //! The stop is a flag for the whole process that nothing clears, so this is a binary of its
 //! own with one test.
 
@@ -17,6 +21,7 @@ use kimmy_api::exec::{self, WriteParams};
 use kimmy_api::limits::within_request_deadline_of;
 use kimmy_api::state::Auth;
 use kimmy_core::deadline;
+use kimmy_storage::walk::set_test_walk_row_delay;
 use kimmy_storage::{Engine, IndexField};
 
 type State = kimmy_api::state::SharedState;
@@ -61,11 +66,10 @@ fn a_write_gathering_a_range_is_ended_by_the_stop_and_answered_node_stopping() {
     let index = vec![IndexField::ascending("t")];
     state.engine.create_index("app", "orders", index, false, None).unwrap();
     let meta = state.engine.get_collection("app", "orders").unwrap();
-    for start in (0..60_000_i64).step_by(20_000) {
-        let docs: Vec<Document> =
-            (start..start + 20_000).map(|i| doc! { "_id": i, "t": i }).collect();
-        state.engine.insert_many(&meta, docs).unwrap();
-    }
+    // Within the 10,000 keys a write may gather unpooled: the stop is what ends the gather.
+    let docs: Vec<Document> = (0..3_000_i64).map(|i| doc! { "_id": i, "t": i }).collect();
+    state.engine.insert_many(&meta, docs).unwrap();
+    set_test_walk_row_delay(Duration::from_millis(1));
 
     // How long the whole gather and the reads behind it take when nothing stops it.
     let started = Instant::now();
@@ -85,6 +89,7 @@ fn a_write_gathering_a_range_is_ended_by_the_stop_and_answered_node_stopping() {
     assert_eq!(answered.code, ErrorCode::NodeStopping);
     assert!(answered.message.contains("shutting down"), "{}", answered.message);
     assert!(took < whole * 3 / 4, "ended at the stop, not at the end: {took:?} of {whole:?}");
+    set_test_walk_row_delay(Duration::ZERO);
 
     let pool = state.aggregate_memory().pool();
     assert_eq!((pool.used(), pool.holders()), (0, 0));
