@@ -3,13 +3,18 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::codec::DecodeError;
 use super::counter::Num;
 use super::join::JoinOptions;
 use super::types::{Epoch, InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-/// A version vector: the newest HLC seen per writer.
+/// A version vector: the newest HLC seen per writer. A state's own vector COVERS every stamp the
+/// state holds as a life, a delete, a register or a counter slot (`vv[stamp.writer] >=
+/// stamp.hlc`: a writer has seen what it wrote, and what it received): the join decides that two
+/// cells are concurrent by this, and a writer stamps above its vector. `decode` refuses a state
+/// whose vector does not (see [`MergeState::check_decoded`]).
 pub type Vv = BTreeMap<WriterId, Hlc>;
 
 /// Key of an observed or counted slot: `(life, writer, generation)`.
@@ -181,7 +186,9 @@ pub struct MergeState {
     pub lives: BTreeMap<MStamp, Life>,
     /// Delete stamp -> the version vector of the deleting writer.
     pub deletes: BTreeMap<MStamp, Vv>,
-    /// Lives known dead; dropped once their stamp passes the horizon.
+    /// Lives known dead; dropped once their stamp passes the horizon. Every dead life is also a
+    /// key of `lives` (the join marks dead only lives it lists, and drops a life and its mark
+    /// together): `decode` refuses a state where one is not, see [`MergeState::check_decoded`].
     pub dead: BTreeSet<MStamp>,
     pub regs: BTreeMap<(MStamp, Path), Reg>,
     pub slots: BTreeMap<(MStamp, Path, WriterId, Option<MStamp>), Slot>,
@@ -210,6 +217,68 @@ impl PartialEq for MergeState {
 }
 
 impl MergeState {
+    /// What `decode` and `decode_compact` require of the state they read, after the bytes have
+    /// been parsed: the structural invariants of a state that the join relies on and that ONE
+    /// state can show. A state that fails is not one any writer builds, and the join is not
+    /// commutative or idempotent on it (a peer that could send one would split the replicas by
+    /// the order of its receives).
+    ///
+    /// INVENTORY of what the join (`join.rs`), the reads (`state.rs`) and the writer
+    /// (`writer.rs`) rely on, and whether `decode` checks it:
+    ///
+    /// 1. `dead` is a subset of `lives`. CHECKED here ([`DecodeError::DeadLifeNotListed`]).
+    ///    The join keeps the lives of its first argument and adds one of the second only if it
+    ///    is not dead in the first, so an unlisted dead life makes `lives` depend on the order.
+    /// 2. The version vector covers every life, delete, register and slot stamp. CHECKED here
+    ///    ([`DecodeError::VersionVectorBehind`]). Clash and `typeClash` detection take two
+    ///    cells as concurrent when the other side's vector does not cover them, so a state
+    ///    that does not cover its own stamps finds a clash with itself (the join is not
+    ///    idempotent), and a writer restored from it could mint a stamp it already used. Loss
+    ///    records and generation or `obs` stamps are NOT included: a loss entry is received
+    ///    without its write (`Writer::receive_loss` does not move the vector).
+    /// 3. A counter total is at most `MAX_TOTAL` in magnitude (slots, `obs`, `seen`, loss
+    ///    totals): checked by the readers ([`DecodeError::TotalOutOfRange`]).
+    /// 4. A register holds a legal value (no top-level document, no marker in an array, nesting
+    ///    within the BSON depth), a path has at least one segment and no NUL byte, strings are
+    ///    UTF-8, every map and set is in strictly increasing key order, and the compact tables
+    ///    are exactly what is used: checked by the readers (`BadTag`, `BadPath`, `BadString`,
+    ///    `TooDeep`, `NotCanonical`, `BadIndex`).
+    /// 5. Cells (registers, slots) belong to an alive life, as the join leaves them. NOT
+    ///    checked, and not needed: the reads take the alive lives first and the join drops the
+    ///    other cells (and is commutative on a state that has them); a normalised state is
+    ///    only what makes `join(s, s) == s`, which no receive relies on.
+    /// 6. A write is a register write or an increment at a path, never both: a register and a
+    ///    slot do not share `(stamp, path)` (the loss record keyed by them would hold a value
+    ///    or a total by the order of the join). NOT checkable by one state, since the two
+    ///    cells can be in two states; honest stamping guarantees it.
+    /// 7. One stamp is one write: what a stamp carries (a register's value, `obs` and
+    ///    generation, a slot's total, a life's kind, `seen` and field order, a delete's vector,
+    ///    a loss record's value) is the same in every state that holds it, since the join keeps
+    ///    the first argument's copy. CROSS-STATE: not checkable by `decode`; honest stamping
+    ///    (`Writer::tick`, strictly above the clock and the vector, `StampError`) guarantees it.
+    /// 8. The caps (`MAX_WRITERS`, `MAX_CONTRIBUTORS`): a received state past them is kept and
+    ///    reported (`over_caps`), by design (Q8). NOT checked.
+    /// 9. No index or arithmetic in the join or the reads can fail on a state with 1 to 2:
+    ///    every `lives[l]` is over a key drawn from `lives`, `sub_ret` clamps, sums saturate.
+    ///
+    /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
+    pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {
+        if self.dead.iter().any(|l| !self.lives.contains_key(l)) {
+            return Err(DecodeError::DeadLifeNotListed);
+        }
+        let covered = |st: &MStamp| self.vv.get(&st.writer).is_some_and(|h| *h >= st.hlc);
+        let stamps = self
+            .lives
+            .keys()
+            .chain(self.deletes.keys())
+            .chain(self.regs.values().map(|r| &r.stamp))
+            .chain(self.slots.values().map(|s| &s.stamp));
+        if stamps.into_iter().any(|st| !covered(st)) {
+            return Err(DecodeError::VersionVectorBehind);
+        }
+        Ok(())
+    }
+
     /// Record the newest non-numeric base of a cell for the V3M3 mutant. The callers are
     /// compiled only in a test or `merge-mutants` build.
     #[cfg(any(test, feature = "merge-mutants"))]

@@ -892,3 +892,19 @@ fn a_typed_writers_hash_equals_every_receivers() {
         }
     }
 }
+
+#[test]
+fn the_states_writers_build_satisfy_the_invariants_decode_checks() {
+    // every state of the generated runs (flat, nested, typed counters, a small retention too)
+    // is accepted by both decoders: nothing a writer or a receive builds is refused
+    for ret in [1_000_000_000, 6] {
+        let o = opts(ret);
+        let mut sets = pools(20, 24, &o);
+        sets.extend(nested_pools(20, 26, &o));
+        sets.extend((1..=20).map(|s| run_counters(s, 30, &o)));
+        for st in sets.iter().flatten() {
+            assert!(st.check_decoded().is_ok());
+            assert_eq!(MergeState::decode_compact(&st.encode_compact()).as_ref(), Ok(st));
+        }
+    }
+}

@@ -574,6 +574,7 @@ impl MergeState {
             put(&mut s.losses, k, v)?;
         }
         r.finish()?;
+        s.check_decoded()?;
         Ok(s)
     }
 }

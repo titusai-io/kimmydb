@@ -315,10 +315,15 @@ impl Hand {
 fn tables_must_be_sorted_and_used_and_indexes_inside() {
     let (a, b) = (wid(b'A', 0), wid(b'B', 0));
     let no = Err(DecodeError::NotCanonical);
-    // the minimal body over writer A, life (1, A) used once as `dead`
+    // the minimal body over writer A, life (1, A) used once as `dead` (and so listed in `lives`:
+    // a dead life the state does not list is refused)
     let ok = |w: &[WriterId], l: &[(u64, usize)], dead: &[usize], vv: &[(usize, u64)]| {
         let mut h = Hand::new(w, l);
-        h.n(0); // lives
+        let listed: BTreeSet<usize> = dead.iter().copied().collect();
+        h.n(listed.len()); // lives
+        for l in &listed {
+            h.n(*l).n(0).n(0).n(1); // the life, no deletes seen, no field order, an upsert
+        }
         h.n(dead.len());
         for d in dead {
             h.n(*d);
@@ -331,7 +336,10 @@ fn tables_must_be_sorted_and_used_and_indexes_inside() {
         h.zeros(1) // losses
     };
     assert!(MergeState::decode_compact(&ok(&[a], &[(1, 0)], &[0], &[(0, 3)])).is_ok());
-    assert!(MergeState::decode_compact(&ok(&[a, b], &[(1, 0), (2, 1)], &[0, 1], &[])).is_ok());
+    assert!(
+        MergeState::decode_compact(&ok(&[a, b], &[(1, 0), (2, 1)], &[0, 1], &[(0, 1), (1, 2)]))
+            .is_ok()
+    );
     // writers out of order, duplicated
     assert_eq!(MergeState::decode_compact(&ok(&[b, a], &[], &[], &[(0, 1), (1, 1)])), no);
     assert_eq!(MergeState::decode_compact(&ok(&[a, a], &[], &[], &[(0, 1), (1, 1)])), no);

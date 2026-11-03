@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use kimmy_core::merge_state::{LossKey, MStamp, Path};
+use kimmy_core::merge_state::{LossKey, MStamp, MergeState, Path};
 
 use crate::oracle::{self, Head, Log};
 use crate::sim::Node;
@@ -30,6 +30,16 @@ fn heads(have: &BTreeSet<LossKey>) -> BTreeSet<Head> {
     have.iter().map(|k| (oracle::at_path(&k.at), k.stamp)).collect()
 }
 
+/// Does every member's state decode (compact form) to itself? A state a writer builds satisfies
+/// everything `decode` checks, among them that every dead life is listed and that the version
+/// vector covers the state's stamps.
+fn decodes(ms: &[Node]) -> bool {
+    ms.iter().all(|m| {
+        let st = m.state();
+        MergeState::decode_compact(&st.encode_compact()).as_ref() == Ok(st)
+    })
+}
+
 /// The problems of a finished run, by name (empty when the run is sound).
 pub fn grade(ms: &[Node], log: &Log) -> Vec<String> {
     let mut errs = Vec::new();
@@ -39,6 +49,9 @@ pub fn grade(ms: &[Node], log: &Log) -> Vec<String> {
         // equal canonical bytes with unequal fields cannot happen; `gens` is outside the canon
         errs.push(format!("diverged {}", names.join("+")));
         return errs;
+    }
+    if !decodes(ms) {
+        errs.push("undecodable".into());
     }
     let (want, alive, dels) = oracle::oracle(log, ret, ms[0].bound());
     if ms.iter().any(|m| m.visible() != want) {
@@ -86,6 +99,9 @@ pub fn grade_bounded(ms: &[Node], log: &Log) -> Vec<String> {
     if !ms.iter().all(|m| m.canon() == ms[0].canon()) {
         bad.push("diverged".into());
         return bad;
+    }
+    if !decodes(ms) {
+        bad.push("undecodable".into());
     }
     let (want, alive, dels) = oracle::oracle(log, ret, ms[0].bound());
     if ms.iter().any(|m| m.visible() != want) {

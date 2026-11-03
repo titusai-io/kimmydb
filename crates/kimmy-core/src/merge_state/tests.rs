@@ -1409,6 +1409,7 @@ fn state_with_big_slots(total: i128) -> (MergeState, MStamp) {
     for c in ['B', 'C'] {
         st.slots.insert((life, p("x"), wid(c, 0), None), Slot { stamp, total: total.into() });
     }
+    st.vv.insert(wid('B', 0), h(1)); // B wrote the slots
     (st, life)
 }
 
@@ -1578,6 +1579,7 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
         let wr = WriterId { node: nid((b'a' + k) as char), epoch: Epoch::from_u64(0) };
         st.slots.insert((life, p("x"), wr, None), Slot { stamp, total: MAX_TOTAL.into() });
     }
+    st.vv.insert(wid('B', 0), h(1)); // B wrote the slots
     assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)));
     assert_eq!(MergeState::decode(&st.encode()).unwrap(), st, "a state at the bound decodes");
     // Half at +bound, half at -bound: the exact sum is 0, which only exact arithmetic gives.
@@ -2334,4 +2336,128 @@ fn a_set_that_changes_the_stored_bytes_is_a_stamped_write_even_when_the_numbers_
     w.insert(&fl(&[("d", decimal(10, -1)), ("e", decimal(5, 0))]), 0).unwrap();
     let r = w.write_replace(&fl(&[("d", decimal(100, -2)), ("e", decimal(5, 0))]), 0).unwrap();
     assert_eq!(r.record.paths, vec![p("d")]);
+}
+
+// ---- the structural invariants `decode` refuses a state without ---------------------------------
+
+fn upsert_life() -> Life {
+    Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Upsert }
+}
+
+/// The smallest pair of states where a dead life is not listed in `lives`: `a` marks the life of
+/// writer 3 dead without listing it, `b` lists it, and marks the life of writer 1 dead without
+/// listing it. The join of the two is not commutative (the result keeps the lives of its first
+/// argument), so a peer that could send one would split replicas by the order of its receives.
+pub(super) fn dead_but_unlisted() -> (MergeState, MergeState) {
+    let life = |k: u8| MStamp { hlc: h(u64::from(k)), writer: wid((b'0' + k) as char, 0) };
+    let (a_life, b_life, c_life) = (life(1), life(2), life(3));
+    let mut a = MergeState::default();
+    a.lives.insert(a_life, upsert_life());
+    a.dead.insert(c_life);
+    let mut b = MergeState::default();
+    b.lives.insert(b_life, upsert_life());
+    b.lives.insert(c_life, upsert_life());
+    b.dead.insert(a_life);
+    for st in [&mut a, &mut b] {
+        for l in st.lives.keys().copied().collect::<Vec<_>>() {
+            st.vv.insert(l.writer, l.hlc);
+        }
+    }
+    (a, b)
+}
+
+/// A state whose version vector does not cover its own stamps: a scalar and a cell below it, by
+/// a writer the vector does not mention. The join finds a `typeClash` between them, "concurrent"
+/// by that vector, so it is not idempotent on it.
+pub(super) fn vv_does_not_cover() -> MergeState {
+    let at = |wall: u64| MStamp { hlc: h(wall), writer: wid('B', 0) };
+    let life = at(1);
+    let mut st = MergeState::default();
+    st.lives.insert(life, upsert_life());
+    st.regs.insert((life, p("a")), Reg::new(at(10), i(1), BTreeMap::new(), None, false).unwrap());
+    st.regs.insert(
+        (life, Path::new(["a", "b"]).unwrap()),
+        Reg::new(at(11), i(2), BTreeMap::new(), None, false).unwrap(),
+    );
+    st
+}
+
+/// Both forms refuse `st` with `err` (the version 1 form only where it can spell the state).
+fn both_forms_refuse(st: &MergeState, err: fn() -> DecodeError) {
+    if st.v1_can_hold() {
+        assert_eq!(MergeState::decode(&st.encode()), Err(err()), "version 1");
+    }
+    assert_eq!(MergeState::decode_compact(&st.encode_compact()), Err(err()), "compact");
+}
+
+#[test]
+fn decode_refuses_a_dead_life_that_lives_does_not_list() {
+    let (a, b) = dead_but_unlisted();
+    for st in [&a, &b] {
+        both_forms_refuse(st, || DecodeError::DeadLifeNotListed);
+    }
+    // listed, it is accepted, in both forms
+    let mut fixed = a.clone();
+    let c = *fixed.dead.iter().next().unwrap();
+    fixed.lives.insert(c, upsert_life());
+    fixed.vv.insert(c.writer, c.hlc);
+    assert_eq!(MergeState::decode(&fixed.encode()).as_ref(), Ok(&fixed));
+    assert_eq!(MergeState::decode_compact(&fixed.encode_compact()).as_ref(), Ok(&fixed));
+}
+
+#[test]
+fn decode_refuses_a_version_vector_that_does_not_cover_a_stamp() {
+    both_forms_refuse(&vv_does_not_cover(), || DecodeError::VersionVectorBehind);
+    // each kind of stamp, one behind by a tick, and then covered exactly
+    let w = wid('B', 0);
+    let life = MStamp { hlc: h(5), writer: w };
+    let base = |vv: u64| {
+        let mut st = MergeState::default();
+        st.lives.insert(life, upsert_life());
+        st.vv.insert(w, h(vv));
+        st
+    };
+    type AddCell = fn(&mut MergeState, MStamp, MStamp);
+    let cells: [(&str, AddCell); 4] = [
+        ("a life", |_, _, _| {}),
+        ("a delete", |st, _, _| {
+            st.deletes.insert(MStamp { hlc: h(9), writer: wid('B', 0) }, BTreeMap::new());
+        }),
+        ("a register", |st, life, _| {
+            let r = Reg::new(
+                MStamp { hlc: h(9), writer: life.writer },
+                i(1),
+                BTreeMap::new(),
+                None,
+                false,
+            );
+            st.regs.insert((life, Path::flat("x").unwrap()), r.unwrap());
+        }),
+        ("a slot", |st, life, _| {
+            let slot = Slot { stamp: MStamp { hlc: h(9), writer: life.writer }, total: 1.into() };
+            st.slots.insert((life, Path::flat("x").unwrap(), life.writer, None), slot);
+        }),
+    ];
+    for (what, add) in cells {
+        let top = if what == "a life" { 5 } else { 9 };
+        let (mut behind, mut exact) = (base(top - 1), base(top));
+        add(&mut behind, life, life);
+        add(&mut exact, life, life);
+        both_forms_refuse(&behind, || DecodeError::VersionVectorBehind);
+        assert_eq!(MergeState::decode(&exact.encode()).as_ref(), Ok(&exact), "{what}");
+        assert_eq!(MergeState::decode_compact(&exact.encode_compact()).as_ref(), Ok(&exact));
+    }
+    // a writer the vector does not mention at all
+    let mut missing = base(5);
+    missing.vv.clear();
+    both_forms_refuse(&missing, || DecodeError::VersionVectorBehind);
+    // a loss record's stamp, a generation's and an `obs` entry's are not part of it: a loss entry
+    // arrives without its write
+    let mut loss = base(5);
+    loss.losses.insert(
+        LossKey::field(LossKind::Clash, p("x"), MStamp { hlc: h(99), writer: wid('C', 0) }),
+        LossValue::Value(i(1)),
+    );
+    assert_eq!(MergeState::decode(&loss.encode()).as_ref(), Ok(&loss));
+    assert_eq!(MergeState::decode_compact(&loss.encode_compact()).as_ref(), Ok(&loss));
 }
