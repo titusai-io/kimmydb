@@ -29,9 +29,9 @@ use std::cmp::Ordering;
 use std::sync::OnceLock;
 
 use super::{
-    Domain, ETINY, Fx, INFINITY, LIMB_DIGITS, Mag, NAN, PREC, S, SL, SQRT_TEN_LEAD, ZERO, consts,
-    digits_u128, exp_fx, exp_limit, fx_div, ln_fx, ln_scaled, m_add, m_cmp, m_div_rem, m_div_small,
-    m_isqrt, m_mul, m_sub, pow10, rounded, signed_zero, strip, to_fx,
+    Domain, ETINY, Fx, INFINITY, LIMB_DIGITS, Mag, NAN, PREC, S, SL, ZERO, consts, digits_u128,
+    exp_fx, exp_limit, fx_div, ln_fx, ln_scaled, m_add, m_cmp, m_div_rem, m_div_small, m_isqrt,
+    m_mul, m_sub, pow10, rounded, signed_zero, strip, to_fx,
 };
 use crate::decimal::Raw;
 
@@ -267,24 +267,13 @@ fn atan_pos(s: Scale, x: &Mag) -> Mag {
     sum
 }
 
-/// `ln v` for a positive fixed point `v` at [`S`] places.
+/// `ln v` for a positive fixed point `v` at [`S`] places. [`ln_scaled`] brings a magnitude of
+/// any size into `[0.707, 1.414)` by halving or doubling it, each step exact but for a unit of
+/// the last place, so a `v` of 40 digits costs about 135 of them and an error of as many units
+/// in the multiple of `ln 2`; the 34th digit of a result is 70 places above that. The callers
+/// pass a `v` of one or more (`(1 + x) / (1 - x)`, `x + √(x² + 1)`, `x + √(x² - 1)`).
 fn ln_fixed(v: &Mag) -> Fx {
-    let digits = i64::from(v.digits());
-    let adjusted = digits - 1 - i64::from(S);
-    let lead = if digits > i64::from(PREC) {
-        v.split_digits((digits - i64::from(PREC)) as u32).0.to_u128().expect("34 digits")
-    } else {
-        v.to_u128().expect("at most 34 digits") * 10u128.pow((i64::from(PREC) - digits) as u32)
-    };
-    // `v = m · 10^q` with `m` in [0.316, 3.16).
-    let q = if lead < SQRT_TEN_LEAD { adjusted } else { adjusted + 1 };
-    let mut m = v.clone();
-    if q > 0 {
-        m = m.split_digits(q as u32).0;
-    } else if q < 0 {
-        m.mul_pow10(q.unsigned_abs() as u32);
-    }
-    ln_scaled(m, q)
+    ln_scaled(v.clone(), 0)
 }
 
 /// `e^x` for a fixed point `x >= 0` at [`S`] places that is below the limit of
@@ -313,10 +302,9 @@ fn result(negative: bool, mut mag: Mag, places: u32) -> Raw {
     }
     let mut exponent = -i64::from(places);
     // [`rounded`] cuts a sticky result: give it more than 34 digits to cut.
-    if digits < 40 {
-        mag.mul_pow10(40 - digits);
-        exponent -= i64::from(40 - digits);
-    }
+    let pad = 40u32.saturating_sub(digits);
+    mag.mul_pow10(pad);
+    exponent -= i64::from(pad);
     let raw = rounded(negative, mag, exponent, true, exponent);
     match raw {
         Raw::Finite {
@@ -480,14 +468,21 @@ pub fn tan(x: &Raw) -> Result<Raw, Domain> {
                 return Ok(padded(negative, coefficient, exponent));
             }
             let (s, sin_x, cos_x) = sin_cos_of(coefficient, exponent, adjusted);
-            if cos_x.mag.is_zero() {
-                return Ok(Raw::Inf { negative: sin_x.neg != negative });
-            }
-            let ratio = Fx::new(sin_x.neg != cos_x.neg, s.div(&sin_x.mag, &cos_x.mag));
-            let signed = if negative { negate(&ratio) } else { ratio };
-            Ok(fx_result(signed, s.places()))
+            Ok(tangent(negative, s, &sin_x, &cos_x))
         }
     }
+}
+
+/// `tan x` from the signed `sin |x|` and `cos |x|` at the scale `s`, for an operand of the sign
+/// `negative`: their ratio with the sign of the operand, or the infinity of that sign when the
+/// cosine has no digit left at the scale.
+fn tangent(negative: bool, s: Scale, sin_x: &Fx, cos_x: &Fx) -> Raw {
+    if cos_x.mag.is_zero() {
+        return Raw::Inf { negative: sin_x.neg != negative };
+    }
+    let ratio = Fx::new(sin_x.neg != cos_x.neg, s.div(&sin_x.mag, &cos_x.mag));
+    let signed = if negative { negate(&ratio) } else { ratio };
+    fx_result(signed, s.places())
 }
 
 // ---------------------------------------------------------------------------
@@ -625,12 +620,9 @@ fn half_exp(negative: bool, coefficient: u128, exponent: i64, adjusted: i64) -> 
     }
     let (mut e, k) = exp_fx(false, &x);
     e.mul_small(5);
-    let mut exponent = k - i64::from(S) - 1;
-    let digits = e.digits();
-    if digits < 40 {
-        e.mul_pow10(40 - digits);
-        exponent -= i64::from(40 - digits);
-    }
+    // `e` is in `[10^S, 10^(S+1))`, so `5e` has 115 digits or more: [`rounded`] has digits to cut.
+    debug_assert!(e.digits() > 40);
+    let exponent = k - i64::from(S) - 1;
     rounded(negative, e, exponent, true, exponent)
 }
 
@@ -872,19 +864,11 @@ pub fn atan2(y: &Raw, x: &Raw) -> Raw {
             if ax - ay > DIRECT_RATIO && !x_negative {
                 return small_ratio(y_negative, (cy, ey), (cx, ex));
             }
-            let s = Scale::reaching((ax - ay).clamp(0, DIRECT_RATIO));
+            let s = ratio_scale(ax, ay);
             let angle = if ay - ax >= 120 {
                 s.half_pi()
             } else {
-                let shift = ey - ex + i64::from(s.places());
-                let mut numerator = Mag::from_u128(cy);
-                if shift >= 0 {
-                    numerator.mul_pow10(shift as u32);
-                } else {
-                    numerator = numerator.split_digits((-shift) as u32).0;
-                }
-                let ratio = m_div_rem(&numerator, &Mag::from_u128(cx)).0;
-                atan_pos(s, &ratio)
+                atan_pos(s, &fixed_ratio(s, (cy, ey), (cx, ex)))
             };
             let angle = if x_negative { m_sub(&s.pi(), &angle) } else { angle };
             fx_result(Fx::new(y_negative, angle), s.places())
@@ -892,19 +876,39 @@ pub fn atan2(y: &Raw, x: &Raw) -> Raw {
     }
 }
 
+/// The scale `atan2` works at for operands of the adjusted exponents `ay` and `ax`: the standard
+/// scale, and a limb more for each 19 digits by which `|y / x|` is below one, to
+/// [`DIRECT_RATIO`] of them.
+fn ratio_scale(ax: i64, ay: i64) -> Scale {
+    Scale::reaching((ax - ay).clamp(0, DIRECT_RATIO))
+}
+
+/// `⌊|y / x| · 10^places⌋` at the scale `s`, for `|y| = cy · 10^ey` and `|x| = cx · 10^ex`.
+fn fixed_ratio(s: Scale, (cy, ey): (u128, i64), (cx, ex): (u128, i64)) -> Mag {
+    let shift = ey - ex + i64::from(s.places());
+    let mut numerator = Mag::from_u128(cy);
+    if shift >= 0 {
+        numerator.mul_pow10(shift as u32);
+    } else {
+        numerator = numerator.split_digits((-shift) as u32).0;
+    }
+    m_div_rem(&numerator, &Mag::from_u128(cx)).0
+}
+
 /// `±|y| / |x|` for a positive `x` and operands whose ratio is below `10^-79`, rounded once:
 /// the arctangent of it is the ratio less a part below `10^-158` of it, so the answer is the
 /// ratio's nearest 34 digits, the part counting only as the hair below an exact one. The
-/// quotient is taken to 40 digits or more, and a division with no remainder is one unit short
-/// and sticky.
+/// quotient is taken to 40 digits or more (`cy · 10^74 / cx` has 41 whatever the digits of the
+/// two, which are at most 34 and at least one), and a division with no remainder is one unit
+/// short and sticky.
 fn small_ratio(negative: bool, (cy, ey): (u128, i64), (cx, ex): (u128, i64)) -> Raw {
-    let lift = (40 + i64::from(digits_u128(cx)) - i64::from(digits_u128(cy))).max(0);
+    const LIFT: u32 = 40 + PREC;
     let mut numerator = Mag::from_u128(cy);
-    numerator.mul_pow10(lift as u32);
+    numerator.mul_pow10(LIFT);
     let (mut quotient, remainder) = m_div_rem(&numerator, &Mag::from_u128(cx));
     if remainder.is_zero() {
         quotient = m_sub(&quotient, &Mag::from_u64(1));
     }
-    let exponent = ey - ex - lift;
+    let exponent = ey - ex - i64::from(LIFT);
     rounded(negative, quotient, exponent, true, exponent)
 }

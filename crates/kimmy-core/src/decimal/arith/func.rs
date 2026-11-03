@@ -594,7 +594,8 @@ fn ln_fx(coefficient: u128, exponent: i64) -> Fx {
 }
 
 /// `ln (m · 10^q)` for a fixed-point `m` in `[0.316, 3.16)`, as a fixed point of the same
-/// error as [`ln_fx`].
+/// error as [`ln_fx`]. Any positive `m` is accepted: one outside the range costs a halving or a
+/// doubling for each factor of two, and as many units of error in the multiple of `ln 2`.
 fn ln_scaled(mut m: Mag, q: i64) -> Fx {
     // `m = m' · 2^a` with `m'` in [0.707, 1.414).
     let (mut hi, mut lo) = (Mag::from_u64(14142), Mag::from_u64(7071));
