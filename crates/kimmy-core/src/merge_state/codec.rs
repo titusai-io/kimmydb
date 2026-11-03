@@ -34,6 +34,9 @@ use crate::ids::NodeId;
 const MAGIC: [u8; 3] = *b"QMS";
 const VERSION: u8 = 1;
 
+/// The deepest nesting of arrays inside a value that `decode` accepts (the BSON depth limit).
+pub(super) const MAX_VALUE_DEPTH: usize = 100;
+
 /// A failure to decode an encoded state.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
@@ -49,6 +52,8 @@ pub enum DecodeError {
     Trailing(usize),
     #[error("merge state: a counter total is out of range")]
     TotalOutOfRange,
+    #[error("merge state: a value is nested too deep")]
+    TooDeep,
     #[error("merge state: not canonical (map keys duplicated or out of order)")]
     NotCanonical,
 }
@@ -97,7 +102,7 @@ impl W {
     fn value(&mut self, v: &Value) {
         match v {
             Value::Null => self.u8(0),
-            Value::Int(i) => {
+            Value::Int64(i) => {
                 self.u8(1);
                 self.i64(*i);
             }
@@ -105,9 +110,53 @@ impl W {
                 self.u8(2);
                 self.0.extend_from_slice(&d.to_bits().to_be_bytes());
             }
-            Value::Str(s) => {
+            Value::String(s) => {
                 self.u8(3);
                 self.str(s);
+            }
+            // 4 is the array; 5 and 6 are kept for the map markers.
+            Value::Array(a) => {
+                self.u8(4);
+                self.len(a.len());
+                for x in a {
+                    self.value(x);
+                }
+            }
+            Value::Int32(i) => {
+                self.u8(7);
+                self.0.extend_from_slice(&i.to_be_bytes());
+            }
+            Value::Decimal128(d) => {
+                self.u8(8);
+                self.0.extend_from_slice(d);
+            }
+            Value::Bool(b) => {
+                self.u8(9);
+                self.u8(u8::from(*b));
+            }
+            Value::Date(ms) => {
+                self.u8(10);
+                self.i64(*ms);
+            }
+            Value::ObjectId(o) => {
+                self.u8(11);
+                self.0.extend_from_slice(o);
+            }
+            Value::Binary { subtype, bytes } => {
+                self.u8(12);
+                self.u8(*subtype);
+                self.len(bytes.len());
+                self.0.extend_from_slice(bytes);
+            }
+            Value::Timestamp { time, increment } => {
+                self.u8(13);
+                self.0.extend_from_slice(&time.to_be_bytes());
+                self.0.extend_from_slice(&increment.to_be_bytes());
+            }
+            Value::Regex { pattern, options } => {
+                self.u8(14);
+                self.str(pattern);
+                self.str(options);
             }
         }
     }
@@ -408,11 +457,45 @@ impl R<'_> {
         }
     }
     fn value(&mut self) -> Result<Value, DecodeError> {
+        self.value_at(0)
+    }
+    /// A value nested `depth` arrays deep; deeper than [`MAX_VALUE_DEPTH`] is refused, so that
+    /// hostile input cannot exhaust the stack.
+    fn value_at(&mut self, depth: usize) -> Result<Value, DecodeError> {
         match self.u8()? {
             0 => Ok(Value::Null),
-            1 => Ok(Value::Int(self.i64()?)),
+            1 => Ok(Value::Int64(self.i64()?)),
             2 => Ok(Value::Double(f64::from_bits(u64::from_be_bytes(self.arr()?)))),
-            3 => Ok(Value::Str(self.str()?)),
+            3 => Ok(Value::String(self.str()?)),
+            4 => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return Err(DecodeError::TooDeep);
+                }
+                let mut a = Vec::new();
+                for _ in 0..self.len()? {
+                    a.push(self.value_at(depth + 1)?);
+                }
+                Ok(Value::Array(a))
+            }
+            7 => Ok(Value::Int32(i32::from_be_bytes(self.arr()?))),
+            8 => Ok(Value::Decimal128(self.arr()?)),
+            9 => match self.u8()? {
+                0 => Ok(Value::Bool(false)),
+                1 => Ok(Value::Bool(true)),
+                t => Err(DecodeError::BadTag(t)),
+            },
+            10 => Ok(Value::Date(self.i64()?)),
+            11 => Ok(Value::ObjectId(self.arr()?)),
+            12 => {
+                let subtype = self.u8()?;
+                let n = self.len()?;
+                Ok(Value::Binary { subtype, bytes: self.take(n)?.to_vec() })
+            }
+            13 => Ok(Value::Timestamp {
+                time: u32::from_be_bytes(self.arr()?),
+                increment: u32::from_be_bytes(self.arr()?),
+            }),
+            14 => Ok(Value::Regex { pattern: self.str()?, options: self.str()? }),
             t => Err(DecodeError::BadTag(t)),
         }
     }
@@ -597,7 +680,7 @@ mod tests {
         w.stamp(&life);
         w.str("x");
         w.stamp(&life); // the register's stamp
-        w.value(&Value::Int(1));
+        w.value(&Value::Int64(1));
         w.len(obs.len());
         for (slot_life, slot_stamp, total) in obs {
             w.stamp(slot_life);
@@ -647,7 +730,7 @@ mod tests {
             WriterId { node: NodeId::from_bytes([b'A'; 16]), epoch: Epoch::from_u64(0) },
             JoinOptions::default(),
         );
-        w.upsert_soi(&[("y", Value::Int(1))], "x", 1, &[], 0).unwrap();
+        w.upsert_soi(&[("y", Value::Int64(1))], "x", 1, &[], 0).unwrap();
         let enc = w.state.encode();
         let st = MergeState::decode(&enc).unwrap();
         assert!(st.regs.values().any(|r| r.soi));

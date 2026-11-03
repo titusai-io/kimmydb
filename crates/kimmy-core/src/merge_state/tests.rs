@@ -23,10 +23,10 @@ fn h(n: u64) -> Hlc {
     Hlc::new(n, 0)
 }
 fn i(n: i64) -> Value {
-    Value::Int(n)
+    Value::Int64(n)
 }
 fn s(x: &str) -> Value {
-    Value::Str(x.to_string())
+    Value::String(x.to_string())
 }
 fn f(x: f64) -> Value {
     Value::Double(x)
@@ -1632,4 +1632,171 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
     );
     assert_eq!(st.hidden("x", &o), i128::MAX);
     assert_eq!(st.hidden_all(&o), BTreeMap::from([("x".to_string(), i128::MAX)]));
+}
+
+// ---- the BSON value set ----------------------------------------------------------------
+
+/// One value of every type, the array holding a nested array.
+fn every_type() -> Vec<(&'static str, Value)> {
+    vec![
+        ("null", Value::Null),
+        ("i32", Value::Int32(-7)),
+        ("i64", Value::Int64(1 << 40)),
+        ("dbl", Value::Double(2.5)),
+        ("dec", Value::Decimal128([0x30; 16])),
+        ("str", s("héllo")),
+        ("bool", Value::Bool(true)),
+        ("date", Value::Date(-1)),
+        ("oid", Value::ObjectId([7; 12])),
+        ("bin", Value::Binary { subtype: 0x80, bytes: vec![0, 1, 255] }),
+        ("ts", Value::Timestamp { time: u32::MAX, increment: 3 }),
+        ("re", Value::Regex { pattern: "^a.*".into(), options: "ix".into() }),
+        ("arr", Value::Array(vec![i(1), Value::Array(vec![s("x"), Value::Null]), f(0.5)])),
+    ]
+}
+
+#[test]
+fn every_bson_type_is_stored_read_back_and_round_trips() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    let fields = every_type();
+    let fields: Vec<(&str, Value)> = fields.into_iter().filter(|(k, _)| *k != "null").collect();
+    w.insert(&fields, 0).unwrap();
+    let vis = w.visible().unwrap();
+    for (k, v) in &fields {
+        assert_eq!(vis.get(*k), Some(v), "{k}");
+    }
+    let enc = w.state.encode();
+    let back = MergeState::decode(&enc).unwrap();
+    assert_eq!(back, w.state);
+    assert_eq!(back.encode(), enc);
+    assert_eq!(back.state_hash(), w.state.state_hash());
+    // A loss record keeps any value too.
+    for (_, v) in &fields {
+        let mut st = MergeState::default();
+        let key = LossKey {
+            kind: LossKind::Clash,
+            path: "p".into(),
+            stamp: MStamp { hlc: h(1), writer: wid('A', 0) },
+        };
+        st.losses.insert(key, LossValue::Value(v.clone()));
+        assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
+    }
+}
+
+#[test]
+fn the_bson_types_are_never_equal_to_one_another() {
+    let all = every_type();
+    for (a, (ka, va)) in all.iter().enumerate() {
+        for (b, (kb, vb)) in all.iter().enumerate() {
+            assert_eq!(va == vb, a == b, "{ka} against {kb}");
+            assert_eq!(Value::same(Some(va), vb), a == b, "same: {ka} against {kb}");
+        }
+    }
+    // The same number in four numeric types.
+    let nums = [Value::Int32(2), Value::Int64(2), Value::Double(2.0), Value::Decimal128([2; 16])];
+    for (a, x) in nums.iter().enumerate() {
+        for (b, y) in nums.iter().enumerate() {
+            assert_eq!(x == y, a == b);
+            assert_eq!(Value::same(Some(x), y), a == b);
+        }
+    }
+    // Only the payload tells two binaries, timestamps, regexes apart.
+    let bin = |t, b: &[u8]| Value::Binary { subtype: t, bytes: b.to_vec() };
+    assert_ne!(bin(0, b"a"), bin(4, b"a"));
+    assert_ne!(bin(0, b"a"), bin(0, b"b"));
+    let ts = |t, c| Value::Timestamp { time: t, increment: c };
+    assert_ne!(ts(1, 2), ts(2, 1));
+    let re = |p: &str, o: &str| Value::Regex { pattern: p.into(), options: o.into() };
+    assert_ne!(re("a", "i"), re("a", ""));
+    assert_ne!(re("a", "i"), re("b", "i"));
+}
+
+#[test]
+fn arrays_compare_element_by_element_and_type_for_type() {
+    let a = Value::Array(vec![i(1), f(0.0)]);
+    assert_eq!(a, Value::Array(vec![i(1), f(0.0)]));
+    assert_ne!(a, Value::Array(vec![i(1)]));
+    assert_ne!(a, Value::Array(vec![Value::Int32(1), f(0.0)]));
+    // Doubles inside an array: equality is by bits, `same` follows the number.
+    let z = Value::Array(vec![f(-0.0)]);
+    assert_ne!(Value::Array(vec![f(0.0)]), z);
+    assert!(Value::same(Some(&Value::Array(vec![f(0.0)])), &z));
+    let nan = Value::Array(vec![f(f64::NAN)]);
+    assert_eq!(nan, nan.clone());
+    assert!(!Value::same(Some(&nan), &nan));
+    // An array is not a scalar and not an empty array.
+    assert_ne!(Value::Array(vec![]), Value::Null);
+    assert!(!Value::same(Some(&Value::Array(vec![])), &Value::Null));
+}
+
+#[test]
+fn only_null_and_int64_are_numeric() {
+    for (k, v) in every_type() {
+        assert_eq!(v.is_numeric(), k == "null" || k == "i64", "{k}");
+    }
+}
+
+#[test]
+fn a_write_across_integer_widths_is_a_write() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("n", i(5))], 0).unwrap();
+    assert!(w.write_set("n", i(5), 0).is_none(), "same type, same number: a no-op");
+    assert!(w.write_set("n", Value::Int32(5), 0).is_some(), "Int32 over Int64 is a write");
+    assert!(w.write_set("n", Value::Int32(5), 0).is_none());
+    assert!(w.write_set("n", f(5.0), 0).is_some(), "a double over an Int32 is a write");
+    assert!(w.write_set("n", Value::Decimal128([1; 16]), 0).is_some());
+    assert_eq!(w.visible().unwrap()["n"], Value::Decimal128([1; 16]));
+    // A string or an Int32 base refuses `$inc` like any non-counter.
+    assert!(w.write_inc("n", 1, 0).is_none());
+}
+
+#[test]
+fn a_concurrent_write_of_two_types_resolves_by_stamp_and_reports_the_loser() {
+    let mut a = Writer::new(wid('A', 0), opts());
+    let mut b = Writer::new(wid('B', 0), opts());
+    a.insert(&[("x", i(0))], 0).unwrap();
+    b.receive(&a.state);
+    a.write_set("x", Value::Int32(1), 0).unwrap();
+    b.write_set("x", Value::Date(2), 5).unwrap();
+    let (la, lb) = (a.receive(&b.state), b.receive(&a.state));
+    assert_eq!(a.state.state_hash(), b.state.state_hash());
+    assert_eq!(a.visible().unwrap()["x"], Value::Date(2));
+    assert_eq!((la.len(), lb.len()), (1, 1));
+    assert_eq!(a.state.losses.values().next(), Some(&LossValue::Value(Value::Int32(1))));
+}
+
+#[test]
+fn decode_refuses_a_bad_bool_a_deep_array_and_a_cut_value() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("b", Value::Bool(true))], 0).unwrap();
+    let enc = w.state.encode();
+    // The bool's payload byte is the last value byte: find `[9, 1]` and set it to 2.
+    let pos = enc.windows(2).rposition(|p| p == [9, 1]).unwrap();
+    let mut bad = enc.clone();
+    bad[pos + 1] = 2;
+    assert_eq!(MergeState::decode(&bad), Err(DecodeError::BadTag(2)));
+
+    let nest = |depth: usize| {
+        let mut v = Value::Null;
+        for _ in 0..depth {
+            v = Value::Array(vec![v]);
+        }
+        v
+    };
+    let ok = nest(super::codec::MAX_VALUE_DEPTH);
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("a", ok)], 0).unwrap();
+    assert!(MergeState::decode(&w.state.encode()).is_ok());
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&[("a", nest(super::codec::MAX_VALUE_DEPTH + 1))], 0).unwrap();
+    assert_eq!(MergeState::decode(&w.state.encode()), Err(DecodeError::TooDeep));
+    // Every proper prefix of a state with every type is refused as truncated or bad.
+    let mut w = Writer::new(wid('A', 0), opts());
+    let fields: Vec<(&str, Value)> =
+        every_type().into_iter().filter(|(k, _)| *k != "null").collect();
+    w.insert(&fields, 0).unwrap();
+    let enc = w.state.encode();
+    for n in 0..enc.len() {
+        assert!(MergeState::decode(&enc[..n]).is_err(), "prefix {n}");
+    }
 }

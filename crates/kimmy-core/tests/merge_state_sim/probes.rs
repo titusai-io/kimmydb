@@ -22,7 +22,7 @@ fn x_of(n: &Node) -> Value {
 pub fn v4m2_epoch_twice(cfg: &Cfg) -> BTreeMap<char, Value> {
     let mut log = Log::new();
     let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(100))], &mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(100))], &mut log, 0);
     pull(&mut ms, 1, 0, None);
     pull(&mut ms, 2, 0, None);
     ms[0].backup();
@@ -40,7 +40,7 @@ pub fn v4m2_epoch_twice(cfg: &Cfg) -> BTreeMap<char, Value> {
 pub fn v4m2_check(design: &Cfg, mutant: &Cfg) -> bool {
     let d = v4m2_epoch_twice(design);
     let m = v4m2_epoch_twice(mutant);
-    d.values().all(|v| *v == Value::Int(125)) && m.values().all(|v| *v == Value::Int(105))
+    d.values().all(|v| *v == Value::Int64(125)) && m.values().all(|v| *v == Value::Int64(105))
 }
 
 type Scenario = fn(&Cfg) -> (Vec<Node>, Log);
@@ -53,7 +53,7 @@ type Scenario = fn(&Cfg) -> (Vec<Node>, Log);
 pub fn restore_inc_scenario(cfg: &Cfg) -> (Vec<Node>, Log) {
     let mut log = Log::new();
     let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(100))], &mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(100))], &mut log, 0);
     pull(&mut ms, 1, 0, None);
     pull(&mut ms, 2, 0, None);
     ms[0].backup();
@@ -77,15 +77,15 @@ pub fn snapshot_loss_scenario(cfg: &Cfg) -> (Vec<Node>, Log) {
     let mut log = Log::new();
     // indices: I0 A1 B2 C3 S4 O5
     let mut ms: Vec<Node> = "IABCSO".chars().map(|c| Node::new(c, cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(0))], &mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(0))], &mut log, 0);
     for m in 1..6 {
         pull(&mut ms, m, 0, None);
     }
-    ms[2].set("x", Value::Str("b".into()), &mut log, 0);
+    ms[2].set("x", Value::String("b".into()), &mut log, 0);
     pull(&mut ms, 3, 2, None);
-    ms[3].set("x", Value::Str("c".into()), &mut log, 0);
+    ms[3].set("x", Value::String("c".into()), &mut log, 0);
     ms[1].w.clock = Hlc::new(5, 0);
-    ms[1].set("x", Value::Str("a".into()), &mut log, 0);
+    ms[1].set("x", Value::String("a".into()), &mut log, 0);
     pull(&mut ms, 4, 2, None);
     {
         let (a, b) = ms.split_at_mut(4);
@@ -206,7 +206,7 @@ fn graded(cfg: &Cfg, names: &str, f: impl FnOnce(&mut Vec<Node>, &mut Log)) -> V
 /// each with the problems the oracle finds.
 pub fn scenarios() -> Vec<(String, Vec<String>)> {
     let cfg = Cfg::default_ret();
-    let s = |x: &str| Value::Str(x.into());
+    let s = |x: &str| Value::String(x.into());
     let mut out = Vec::new();
     out.push((
         "zero sum: insert {n:a}; +1; -1".to_string(),
@@ -233,7 +233,7 @@ pub fn scenarios() -> Vec<(String, Vec<String>)> {
     out.push((
         "zero sum: {x:100}; $unset x; +5; -5".to_string(),
         graded(&cfg, "A", |ms, log| {
-            ms[0].insert(&[("x", Value::Int(100))], log, 0);
+            ms[0].insert(&[("x", Value::Int64(100))], log, 0);
             ms[0].unset("x", log, 0);
             ms[0].inc("x", 5, log, 0);
             ms[0].inc("x", -5, log, 0);
@@ -251,7 +251,7 @@ pub fn scenarios() -> Vec<(String, Vec<String>)> {
                 }
                 ms[1].upsert_inc("n", 5, log, 0);
                 pull(ms, 2, 0, None);
-                ms[2].set("n", Value::Int(7), log, 0);
+                ms[2].set("n", Value::Int64(7), log, 0);
             }),
         ));
     }

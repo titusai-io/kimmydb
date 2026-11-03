@@ -619,18 +619,18 @@ const OPS: [&str; 14] = [
 /// (also empty and non-ASCII) and doubles (also `2.0`, `-0.0`, `0.0`, a huge one).
 fn pool_value(rnd: &mut Rng) -> Value {
     match rnd.below(16) {
-        0 => Value::Int(0),
-        1 => Value::Int(7),
-        2 => Value::Int(8),
-        3 => Value::Int(500),
-        4 => Value::Int(-7),
-        5 => Value::Int(1 << 62),
-        6 => Value::Int(-(1 << 62)),
-        7 => Value::Int(i64::MAX),
-        8 => Value::Int(i64::MIN),
-        9 => Value::Str("s".into()),
-        10 => Value::Str(String::new()),
-        11 => Value::Str("\u{fc}".into()),
+        0 => Value::Int64(0),
+        1 => Value::Int64(7),
+        2 => Value::Int64(8),
+        3 => Value::Int64(500),
+        4 => Value::Int64(-7),
+        5 => Value::Int64(1 << 62),
+        6 => Value::Int64(-(1 << 62)),
+        7 => Value::Int64(i64::MAX),
+        8 => Value::Int64(i64::MIN),
+        9 => Value::String("s".into()),
+        10 => Value::String(String::new()),
+        11 => Value::String("\u{fc}".into()),
         12 => Value::Double(2.5),
         13 => Value::Double(2.0),
         14 => Value::Double(-0.0),
@@ -742,7 +742,7 @@ fn random_pull(rnd: &mut Rng, ms: &mut [Node], snap_rate: f64) {
 pub fn new_cluster(rnd: &mut Rng, cfg: &Cfg, log: &mut Log) -> Vec<Node> {
     let n = 3 + rnd.below(2);
     let mut ms: Vec<Node> = "ABCD".chars().take(n).map(|c| Node::new(c, cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(100)), ("n", Value::Str("a".into()))], log, 0);
+    ms[0].insert(&[("x", Value::Int64(100)), ("n", Value::String("a".into()))], log, 0);
     for m in &mut ms {
         m.backup();
     }

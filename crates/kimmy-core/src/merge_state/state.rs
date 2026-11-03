@@ -335,8 +335,8 @@ impl MergeState {
         {
             return Some(w.value.clone());
         }
-        let base =
-            win.and_then(|w| if let Value::Int(i) = w.value { Some(i128::from(i)) } else { None });
+        let base = win
+            .and_then(|w| if let Value::Int64(i) = w.value { Some(i128::from(i)) } else { None });
         let mut total = base.unwrap_or(0);
         let mut seen = base.is_some();
         for (k, s) in self.counted_in(p, al, win, o) {
@@ -351,7 +351,7 @@ impl MergeState {
         }
         // Q11: a merge that crosses either bound saturates.
         let b = i128::from(o.int_bound());
-        seen.then(|| Value::Int(total.clamp(-b - 1, b) as i64))
+        seen.then(|| Value::Int64(total.clamp(-b - 1, b) as i64))
     }
 
     /// The visible document, or `None` when no life is alive.

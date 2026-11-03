@@ -218,7 +218,7 @@ pub fn oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp>
         let g_w = win.and_then(|w| gener.of(w.0, &p));
         let counted = incs.iter().filter(|(st, _, _)| gen_counts(gener.of(*st, &p), g_w));
         let base: Option<i128> = match win.map(|w| &w.2.vals[&p]) {
-            Some(Value::Int(i)) => Some(i128::from(*i)),
+            Some(Value::Int64(i)) => Some(i128::from(*i)),
             _ => None,
         };
         let empty = BTreeSet::new();
@@ -229,7 +229,7 @@ pub fn oracle(log: &Log, ret: u64, bound: i64) -> (Option<Doc>, BTreeSet<MStamp>
             continue;
         }
         let total = base.unwrap_or(0) + extra.iter().map(|n| i128::from(*n)).sum::<i128>();
-        doc.insert(p, Value::Int(total.clamp(-b - 1, b) as i64));
+        doc.insert(p, Value::Int64(total.clamp(-b - 1, b) as i64));
     }
     ((!alive.is_empty()).then_some(doc), alive, dels)
 }

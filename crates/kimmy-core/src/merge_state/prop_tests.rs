@@ -41,18 +41,18 @@ fn opts(ret: u64) -> JoinOptions {
 /// and non-ASCII) and doubles (also `2.0`, `-0.0`, a huge one).
 fn pool_value(rng: &mut Rng) -> Value {
     match rng.below(16) {
-        0 => Value::Int(0),
-        1 => Value::Int(7),
-        2 => Value::Int(8),
-        3 => Value::Int(500),
-        4 => Value::Int(-7),
-        5 => Value::Int(1 << 62),
-        6 => Value::Int(-(1 << 62)),
-        7 => Value::Int(i64::MAX),
-        8 => Value::Int(i64::MIN),
-        9 => Value::Str("s".into()),
-        10 => Value::Str(String::new()),
-        11 => Value::Str("\u{fc}".into()),
+        0 => Value::Int64(0),
+        1 => Value::Int64(7),
+        2 => Value::Int64(8),
+        3 => Value::Int64(500),
+        4 => Value::Int64(-7),
+        5 => Value::Int64(1 << 62),
+        6 => Value::Int64(-(1 << 62)),
+        7 => Value::Int64(i64::MAX),
+        8 => Value::Int64(i64::MIN),
+        9 => Value::String("s".into()),
+        10 => Value::String(String::new()),
+        11 => Value::String("\u{fc}".into()),
         12 => Value::Double(2.5),
         13 => Value::Double(2.0),
         14 => Value::Double(-0.0),
@@ -92,7 +92,7 @@ fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
         })
         .collect();
     let mut pool = Vec::new();
-    ws[0].insert(&[("x", Value::Int(100)), ("n", Value::Str("a".into()))], 0);
+    ws[0].insert(&[("x", Value::Int64(100)), ("n", Value::String("a".into()))], 0);
     for _ in 0..steps {
         let m = rng.below(n);
         let skew = *rng.pick(&[0, 0, 0, 4]);
@@ -382,18 +382,20 @@ fn local_refusals_and_noops() {
         epoch: Epoch::new(Hlc::new(5, 1), [9; 8]),
     };
     let mut w = Writer::new(id, o);
-    assert!(w.write_set("x", Value::Int(1), 0).is_none(), "no life");
+    assert!(w.write_set("x", Value::Int64(1), 0).is_none(), "no life");
     assert!(w.write_delete(0).is_none());
-    let a = w.insert(&[("x", Value::Int(1))], 0).unwrap();
+    let a = w.insert(&[("x", Value::Int64(1))], 0).unwrap();
     assert_eq!(a.record.kind, WriteKind::Insert);
-    assert!(w.insert(&[("y", Value::Int(1))], 0).is_none(), "a life is alive");
-    assert!(w.write_set("x", Value::Int(1), 0).is_none(), "unchanged");
+    assert!(w.insert(&[("y", Value::Int64(1))], 0).is_none(), "a life is alive");
+    assert!(w.write_set("x", Value::Int64(1), 0).is_none(), "unchanged");
     assert!(w.write_unset("nope", 0).is_none());
     assert!(w.write_inc("x", i64::MAX, 0).is_none(), "past the bound");
-    w.write_set("s", Value::Str("t".into()), 0).unwrap();
+    w.write_set("s", Value::String("t".into()), 0).unwrap();
     assert!(w.write_inc("s", 1, 0).is_none(), "a string");
-    assert!(w.write_replace(&[("x", Value::Int(1)), ("s", Value::Str("t".into()))], 0).is_none());
-    let r = w.write_replace(&[("x", Value::Int(2))], 0).unwrap();
+    assert!(
+        w.write_replace(&[("x", Value::Int64(1)), ("s", Value::String("t".into()))], 0).is_none()
+    );
+    let r = w.write_replace(&[("x", Value::Int64(2))], 0).unwrap();
     assert_eq!(r.record.paths, vec!["x".to_string(), "s".to_string()]);
     assert_eq!(w.visible().unwrap().len(), 1);
     w.write_delete(0).unwrap();
@@ -411,11 +413,11 @@ fn mutants_change_the_outcome() {
     };
     let run = |o: &JoinOptions| {
         let (mut a, mut b, mut c) = (mk(o, b'A'), mk(o, b'B'), mk(o, b'C'));
-        a.insert(&[("x", Value::Int(1))], 0).unwrap();
+        a.insert(&[("x", Value::Int64(1))], 0).unwrap();
         c.receive(&a.state.clone());
-        c.write_set("note", Value::Str("c".into()), 0).unwrap();
+        c.write_set("note", Value::String("c".into()), 0).unwrap();
         b.clock = Hlc::new(8, 0);
-        b.insert(&[("y", Value::Int(2))], 0).unwrap();
+        b.insert(&[("y", Value::Int64(2))], 0).unwrap();
         let mut o1 = mk(o, b'O');
         o1.receive(&a.state.clone());
         o1.receive(&c.state.clone());

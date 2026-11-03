@@ -59,9 +59,12 @@ fn jk(k: &LossKey) -> J {
 fn jv(v: &Value) -> J {
     match v {
         Value::Null => json!(["n"]),
-        Value::Int(i) => json!(["i", i.to_string()]),
+        Value::Int64(i) => json!(["i", i.to_string()]),
         Value::Double(d) => json!(["d", format!("{:016x}", d.to_bits())]),
-        Value::Str(s) => json!(["s", s]),
+        Value::String(s) => json!(["s", s]),
+        // The flat reference model has these four types only; the other BSON types are
+        // tested in `merge_state::tests` and the codec tests.
+        other => panic!("the reference model has no {other:?}"),
     }
 }
 
@@ -69,11 +72,11 @@ fn unjv(v: &J) -> Value {
     let a = v.as_array().unwrap();
     match a[0].as_str().unwrap() {
         "n" => Value::Null,
-        "i" => Value::Int(a[1].as_str().unwrap().parse().unwrap()),
+        "i" => Value::Int64(a[1].as_str().unwrap().parse().unwrap()),
         "d" => {
             Value::Double(f64::from_bits(u64::from_str_radix(a[1].as_str().unwrap(), 16).unwrap()))
         }
-        "s" => Value::Str(a[1].as_str().unwrap().to_string()),
+        "s" => Value::String(a[1].as_str().unwrap().to_string()),
         t => panic!("bad tag {t}"),
     }
 }

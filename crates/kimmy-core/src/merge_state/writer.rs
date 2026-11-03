@@ -373,8 +373,8 @@ impl Writer {
         let cur = vis.get(p);
         let b = i128::from(self.opts.int_bound());
         match cur {
-            None | Some(Value::Int(_)) => {
-                let c = if let Some(Value::Int(c)) = cur { i128::from(*c) } else { 0 };
+            None | Some(Value::Int64(_)) => {
+                let c = if let Some(Value::Int64(c)) = cur { i128::from(*c) } else { 0 };
                 if !(-b - 1..=b).contains(&(c + i128::from(n))) {
                     return None;
                 }
