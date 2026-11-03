@@ -102,8 +102,6 @@ pub enum DecodeError {
     OrdLevelWithoutLast,
     #[error("merge state: invalid order floor kind {0}")]
     OrdBadFloor(u8),
-    #[error("merge state: the order section is present but empty")]
-    OrdSectionEmpty,
 }
 
 // ---- writing ---------------------------------------------------------------

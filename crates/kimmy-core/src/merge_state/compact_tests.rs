@@ -283,13 +283,9 @@ fn every_proper_prefix_and_a_trailing_byte_are_refused() {
     for n in 0..enc.len() {
         assert!(MergeState::decode_compact(&enc[..n]).is_err(), "prefix {n}");
     }
-    // A byte after the losses begins section 10: a count of 0 there is an empty order state, which
-    // is refused (any other count promises entries that are not there).
     let mut more = enc.clone();
     more.push(0);
-    assert_eq!(MergeState::decode_compact(&more), Err(DecodeError::OrdSectionEmpty));
-    more[enc.len()] = 1;
-    assert!(MergeState::decode_compact(&more).is_err());
+    assert_eq!(MergeState::decode_compact(&more), Err(DecodeError::Trailing(1)));
     // The version 1 decoder refuses the compact form and the other way round.
     assert_eq!(MergeState::decode(&enc), Err(DecodeError::BadHeader));
     assert_eq!(MergeState::decode_compact(&golden_mixed().encode()), Err(DecodeError::BadHeader));
@@ -354,7 +350,7 @@ fn tables_must_be_sorted_and_used_and_indexes_inside() {
         for (i, t) in vv {
             h.n(*i).hlc(*t);
         }
-        h.zeros(1) // losses
+        h.zeros(2) // losses, and the count of section 10
     };
     assert!(MergeState::decode_compact(&ok(&[a], &[(1, 0)], &[0], &[(0, 3)])).is_ok());
     assert!(
@@ -1010,7 +1006,8 @@ fn an_order_state_is_section_ten_after_the_losses() {
     bare.ords.clear();
     let e = bare.encode_compact();
     assert_eq!(&e[..4], b"QMS\x02");
-    assert!(h.0.starts_with(&e) && h.0.len() > e.len());
+    assert_eq!(e.last(), Some(&0), "the bare state ends with a count of 0");
+    assert!(h.0.starts_with(&e[..e.len() - 1]) && h.0.len() > e.len());
     // the root, a replace floor, no firsts, no last and no lvl: the shortest entry
     let r =
         with_ords(&[((1, OrdAt::Root), FieldOrd { lvl: Some(st(5, a)), ..FieldOrd::default() })]);
@@ -1064,17 +1061,25 @@ fn section_ten_is_decoded_strictly() {
         entry(h, &ok_floor, &[0, 0]);
     };
     assert!(MergeState::decode_compact(&body(2, false, true, 5, &good)).is_ok());
-    // no section at all is a state without an order state; a section of count 0 is refused; bytes
-    // after a section are trailing input; the version byte is 2 and nothing else
-    assert!(
-        MergeState::decode_compact(&body(2, false, true, 5, &|_| {}))
-            .is_ok_and(|s| s.ords.is_empty())
-    );
+    // section 10 always carries its count: no section at all is a cut (refused); a count of 0 is the
+    // state without an order state, and the only spelling of it; bytes after a section are trailing
+    // input; the version byte is 2 and nothing else
     assert_eq!(
+        MergeState::decode_compact(&body(2, false, true, 5, &|_| {})),
+        Err(DecodeError::Truncated)
+    );
+    assert!(
         MergeState::decode_compact(&body(2, false, true, 5, &|h| {
             h.n(0);
+        }))
+        .is_ok_and(|s| s.ords.is_empty())
+    );
+    // a count that promises an entry the input does not hold
+    assert_eq!(
+        MergeState::decode_compact(&body(2, false, true, 5, &|h| {
+            h.n(1);
         })),
-        Err(DecodeError::OrdSectionEmpty)
+        Err(DecodeError::Truncated)
     );
     assert_eq!(
         MergeState::decode_compact(&body(2, false, true, 5, &|h| {
@@ -1229,12 +1234,12 @@ fn section_ten_is_decoded_strictly() {
     }
 }
 
-/// The end of the input delimits section 10: a proper prefix of an encoding that carries an order
-/// state is refused, EXCEPT the prefix that ends where the losses end, which is the encoding of the
-/// same state without its order state; a byte after the section is trailing input; the other form
-/// refuses the compact tag.
+/// Section 10 carries its count, so EVERY proper prefix of an encoding that carries an order state
+/// is refused, the one that ends where the losses end included (it used to decode as the same state
+/// without its order state: O1-7 of the review); a byte after the section is trailing input; the
+/// other form refuses the compact tag.
 #[test]
-fn an_order_states_prefixes_are_refused_but_the_one_that_ends_at_the_losses() {
+fn every_proper_prefix_of_an_order_state_is_refused() {
     let (a, b) = (wid(b'A', 0), wid(b'B', 0));
     let mut s = with_ords(&[
         ((1, OrdAt::Root), FieldOrd { lvl: Some(st(2, a)), ..FieldOrd::default() }),
@@ -1245,16 +1250,17 @@ fn an_order_states_prefixes_are_refused_but_the_one_that_ends_at_the_losses() {
     let mut bare = s.clone();
     bare.ords.clear();
     let bare_enc = bare.encode_compact();
-    assert!(enc.starts_with(&bare_enc), "the tables are the same, so the sections 1 to 9 are");
+    // the tables are the same, so the sections 1 to 9 are, and the bare state ends with a count of 0
+    assert!(enc.starts_with(&bare_enc[..bare_enc.len() - 1]));
+    assert_eq!(bare_enc.last(), Some(&0));
     for n in 0..enc.len() {
-        match MergeState::decode_compact(&enc[..n]) {
-            Err(_) => assert_ne!(n, bare_enc.len(), "the prefix that ends at the losses decodes"),
-            Ok(x) => {
-                assert_eq!(n, bare_enc.len(), "prefix {n} decodes");
-                assert_eq!(x, bare);
-            }
-        }
+        assert!(MergeState::decode_compact(&enc[..n]).is_err(), "prefix {n}");
     }
+    assert_eq!(
+        MergeState::decode_compact(&enc[..bare_enc.len() - 1]),
+        Err(DecodeError::Truncated),
+        "the cut at the end of the losses"
+    );
     let mut more = enc.clone();
     more.push(0);
     assert_eq!(MergeState::decode_compact(&more), Err(DecodeError::Trailing(1)));
