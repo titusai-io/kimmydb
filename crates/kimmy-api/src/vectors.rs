@@ -2499,7 +2499,7 @@ mod tests {
     fn a_filter_that_rejects_nearly_everything_reads_its_range_once() {
         // The paged read (pages of 10,000, as it was) went back for twice as many documents each
         // time it came up short, and read the whole inexact range again for each pass: over a
-        // range of 25,000 entries with a filter that rejects them all it read it three times.
+        // range of 25,000 entries with a filter that rejects them all it read it twice.
         // The filter is read once, in index order.
         let dir = tempfile::tempdir().unwrap();
         let (state, _) = plain(&dir, 25_000, 64 << 20, 64 << 20);

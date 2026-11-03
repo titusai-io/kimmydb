@@ -128,8 +128,9 @@ a document (a `multi` write again for each chunk). The first 10,000 keys are not
 charged; past that they, and the documents the write matches, are charged to the same
 pool and refused `413` past the request limit, or `503` at once when the pool is full
 (a write never waits for it). Narrow the filter on the indexed field, in several writes
-if need be ([Operations](operations.md#aggregation-memory)). A paged read that holds no
-keys is planned ([ADR-270](decisions.md), "For later").
+if need be ([Operations](operations.md#aggregation-memory)). Streaming an exact range in
+the write transaction, which holds no keys, is planned ([ADR-270](decisions.md), second
+addendum, item 11(b)).
 
 It follows that a computed key range may be **too wide, but never too narrow**.
 A wide range costs time; a narrow one silently drops matching documents. Every

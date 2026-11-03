@@ -1954,7 +1954,8 @@ paths:
             is refused at once, whichever request is older, and nothing was written. The same
             request is answered when the others have finished. Also answered when the request
             deadline passes while the keys are gathered, or `node_stopping` when the node
-            stops: nothing was written.
+            stops: nothing was written. Also, with the same code, when the single writer
+            stayed busy for the request's whole budget: the request did not run.
           headers:
             Retry-After:
               schema: { type: integer }
@@ -2081,12 +2082,13 @@ paths:
             under the writer passed `aggregate.memory_limit_bytes` (ADR-269, ADR-270): the
             document key of every entry of the range it gathers before it reads a document
             (about 82 bytes a key; the first 10,000 are not charged), and the documents it
-            matches (every match, up to 10,000, when it sorts). The message names `what the write holds`, the bytes held and the limit.
-            Nothing was written. Narrow the filter on the indexed field so that its range is
+            matches (every match, up to 10,000, when it sorts). The message names
+            `what the write holds`, the bytes held and the limit. Nothing was written. Narrow the filter on the indexed field so that its range is
             smaller, which can be done in several writes, each over part of the range, or
             raise the setting. A write whose filter is served by no index, or by `_id`, holds
             nothing that is charged. A single-document write is one transaction, and is
-            refused whole.
+            refused whole. With `upsert`, a filter whose range passes the limit is refused,
+            not inserted.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2098,7 +2100,8 @@ paths:
             is refused at once, whichever request is older, and nothing was written. The same
             request is answered when the others have finished. Also answered when the request
             deadline passes while the keys are gathered, or `node_stopping` when the node
-            stops: nothing was written.
+            stops: nothing was written. Also, with the same code, when the single writer
+            stayed busy for the request's whole budget: the request did not run.
           headers:
             Retry-After:
               schema: { type: integer }
@@ -2211,7 +2214,8 @@ paths:
             is refused at once, whichever request is older, and nothing was written. The same
             request is answered when the others have finished. Also answered when the request
             deadline passes while the keys are gathered, or `node_stopping` when the node
-            stops: nothing was written.
+            stops: nothing was written. Also, with the same code, when the single writer
+            stayed busy for the request's whole budget: the request did not run.
           headers:
             Retry-After:
               schema: { type: integer }
