@@ -49,6 +49,10 @@ def same_by_bits(a, b):
     return type(a) is type(b) and _bits(a) == _bits(b)
 
 
+# KimmyDB keeps the cohort member visible (2.30 and 2.3 differ,
+# crates/kimmy-query/src/decimal_arith_tests.rs:32); doubles compare by bit pattern; a no-op is a
+# write that leaves the stored representation byte-identical (manager ruling 2026-11-03); do not
+# "fix" this back to numeric equality.
 M.same = same_by_bits
 
 M64 = (1 << 64) - 1
