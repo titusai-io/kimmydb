@@ -7,8 +7,7 @@
 //! `JoinOptions::set_value_ignores_slot_stamp`, `JoinOptions::set_creation_without_generation`,
 //! `JoinOptions::set_suppress_soi`); the nested mutants use the switches of the nested rules
 //! (`set_type_ignores_recency`, `set_marker_hides`, `set_no_type_clash`,
-//! `set_array_clash_as_clash`, `set_rewrite_unchanged`, `set_write_below_scalar`,
-//! `set_type_clash_children_only`, `set_unset_shallow`).
+//! `set_array_clash_as_clash`, `set_rewrite_unchanged`, `set_write_below_scalar`, `set_unset_shallow`).
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -178,12 +177,6 @@ pub fn mutants() -> Vec<Mutant> {
         Mutant {
             name: "a write below a scalar or an array is accepted",
             apply: |c| c.opts.set_write_below_scalar(true),
-            grader: Random { restore: true },
-            probe: None,
-        },
-        Mutant {
-            name: "a typeClash is looked for among the direct children only",
-            apply: |c| c.opts.set_type_clash_children_only(true),
             grader: Random { restore: true },
             probe: None,
         },

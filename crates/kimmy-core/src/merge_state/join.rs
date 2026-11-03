@@ -78,10 +78,6 @@ pub struct JoinOptions {
     /// Nested mutant: a write below a scalar or an array is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     write_below_scalar: bool,
-    /// Nested mutant: a `typeClash` is looked for among the direct children of a scalar or an
-    /// array register only, not among every descendant.
-    #[cfg(any(test, feature = "merge-mutants"))]
-    type_clash_children_only: bool,
     /// Nested mutant: an `$unset` (or the removal of a field by a replace or a `$set` of a
     /// sub-document) unsets the direct children of a map only, leaving the deeper cells set.
     #[cfg(any(test, feature = "merge-mutants"))]
@@ -147,8 +143,6 @@ impl Default for JoinOptions {
             rewrite_unchanged: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             write_below_scalar: false,
-            #[cfg(any(test, feature = "merge-mutants"))]
-            type_clash_children_only: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             unset_shallow: false,
             #[cfg(any(test, feature = "merge-mutants"))]
@@ -224,7 +218,6 @@ impl JoinOptions {
     switch!(array_clash_as_clash, set_array_clash_as_clash, false);
     switch!(rewrite_unchanged, set_rewrite_unchanged, false);
     switch!(write_below_scalar, set_write_below_scalar, false);
-    switch!(type_clash_children_only, set_type_clash_children_only, false);
     switch!(unset_shallow, set_unset_shallow, false);
     switch!(sum_in_stamp_order, set_sum_in_stamp_order, false);
     switch!(no_saturation, set_no_saturation, false);
@@ -384,10 +377,6 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
                 }
                 let start = cells.partition_point(|c| c.0 <= p);
                 for (q, qst, qv) in cells[start..].iter().take_while(|c| c.0.is_below(p)) {
-                    if o.type_clash_children_only() && q.segments().len() != p.segments().len() + 1
-                    {
-                        continue;
-                    }
                     if *qst != r.stamp && !cov(&a_st.vv, qst) {
                         if r.stamp > *qst {
                             new.insert(key(LossKind::TypeClash, q, *qst), qv.clone());

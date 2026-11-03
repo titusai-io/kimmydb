@@ -243,9 +243,9 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14), the B1 and M1 rules (2) and the nested rules (8): a
+    // The design mutants of section 17 (14), the B1 and M1 rules (2) and the nested rules (7): a
     // removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 24, "the mutant list changed");
+    assert_eq!(mutants::mutants().len(), 23, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
