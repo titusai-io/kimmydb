@@ -214,11 +214,13 @@ range within the 10,000) holds what it always has and touches nothing. Past the 
 `413 answer_too_large`; **the lease never waits**: a write holds the writer, and a wait there would
 stall every other write, a replica's apply and the shutdown, so a full pool is refused `503 timeout`
 (`retry: wait`) at once, whoever is older, and nothing is written in either case. The lease is kept
-at the most the request held until the request ends, because a later chunk of a `multi` write that
-met a full pool would be `500 partially_applied`: it asks the pool only for the growth of its range
-since the largest gather, and for nothing if the range has not grown. A range that grows past the
-limit between chunks, or documents that do, is `500 partially_applied` with the `413` as `cause`,
-as any failure after a first commit is ([ADR-192](decisions.md)). The gather also ends at the request
+at the most the request held until the request ends, so that a later chunk of a `multi` write is
+not asked to take the whole again from a full pool: it asks the pool only for what its keys and
+matched documents together come to past the most an earlier chunk held, and for nothing if they come
+to no more. A later chunk whose documents need more than that high-water mark when the pool is full
+is refused `503 timeout` after a first commit, which is `500 partially_applied` with the counts that
+landed and the refusal as `cause`; a range or documents that grow past the limit are the same with
+the `413` as `cause`, as any failure after a first commit is ([ADR-192](decisions.md)). The gather also ends at the request
 deadline (`503 timeout`) and at the node's stop, with nothing written; after a first commit only the
 node's stop reaches it (`partially_applied`, cause `stopping`). To avoid the `413`: narrow the
 filter on the indexed field so that its range is smaller, which can be done in several writes, each

@@ -2654,8 +2654,10 @@ impl<'a> IndexKeys<'a> {
     /// would stall every other write (see [`crate::limits::AggregateMemory::budget_without_wait`]).
     /// And it is kept at the most the request has held, to the end of the request, since a
     /// chunk after the first that found the pool full would be refused after a commit, which
-    /// is `500 partially_applied` (ADR-192): a later chunk asks the pool for what its range has
-    /// grown by since the largest gather, and for nothing when it has not.
+    /// is `500 partially_applied` (ADR-192): a later chunk asks the pool for what its keys and
+    /// documents come to past the most an earlier chunk held, and for nothing when they come
+    /// to no more. A later chunk whose documents need more than that, when the pool is full, is
+    /// still refused, and the answer is `partially_applied` with the counts.
     fn of_a_write(memory: &'a crate::limits::AggregateMemory) -> Self {
         fn lease(memory: &crate::limits::AggregateMemory) -> Lease {
             memory.budget_without_wait().lease_worded("what the write holds", WRITE_RANGE_KEYS)

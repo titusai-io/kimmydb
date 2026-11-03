@@ -329,9 +329,9 @@ fn in_a_request<T>(left: Duration, work: impl FnOnce() -> T) -> T {
 #[test]
 fn a_multi_write_keeps_its_lease_at_the_most_it_held_until_the_request_is_over() {
     // 10,101 entries in chunks of 4,000: the whole range is gathered for each of the three
-    // chunks. The pool is exactly what the first chunk needs: its keys and 4,000 documents. The lease is made in the first
-    // chunk, stands at that between the chunks, is not asked for more by the second and
-    // third, and goes back when the request is answered.
+    // chunks. The pool is exactly what the first chunk needs: its keys and 4,000 documents.
+    // The lease is made in the first chunk, stands at that between the chunks, is not asked
+    // for more by the second and third, and goes back when the request is answered.
     let dir = tempfile::tempdir().unwrap();
     let most = key_bytes(10_101) + 4_000 * document_bytes(true);
     let state = indexed(&dir, 10_101, most, most);
@@ -360,9 +360,12 @@ fn a_multi_write_keeps_its_lease_at_the_most_it_held_until_the_request_is_over()
 /// What the budget counts for one document of `indexed` when a write keeps its stored body
 /// beside it (a chunk of `update` or `delete`), and when it does not (what a sort keeps).
 fn document_bytes(with_body: bool) -> usize {
-    let document = doc! { "_id": 5_i64, "t": 5_i64, "u": 5_i64 };
-    let body = if with_body { bson::serialize_to_vec(&document).unwrap().len() } else { 0 };
-    kimmy_query::budget::held_bytes(&document) + kimmy_query::budget::held_blob(body)
+    bytes_of(&doc! { "_id": 5_i64, "t": 5_i64, "u": 5_i64 }, with_body)
+}
+
+fn bytes_of(document: &Document, with_body: bool) -> usize {
+    let body = if with_body { bson::serialize_to_vec(document).unwrap().len() } else { 0 };
+    kimmy_query::budget::held_bytes(document) + kimmy_query::budget::held_blob(body)
 }
 
 #[test]
@@ -425,8 +428,8 @@ fn a_sort_charges_every_match_it_holds_and_not_their_bodies() {
 
 #[test]
 fn a_pool_another_request_takes_between_the_chunks_does_not_refuse_the_later_ones() {
-    // The pool is what the first chunk needs. Between the first chunk and the second another request
-    // takes whatever the pool has free, and keeps it to the end. Were the lease given back
+    // The pool is what the first chunk needs. Between the first chunk and the second another
+    // request takes whatever the pool has free, and keeps it to the end. Were the lease given back
     // between the chunks that would be all of it, and the second chunk, after a commit, would be
     // refused (`500 partially_applied`) for a pool it had already been given; the lease stands,
     // so the second and third chunks ask for nothing.
@@ -477,6 +480,63 @@ fn a_later_chunk_whose_range_has_outgrown_the_lease_is_partly_applied_with_the_r
     assert!(extra["cause"]["message"].as_str().unwrap().starts_with("what the write holds is "));
     assert_eq!(changed(&state), 4_000, "the first chunk stands, and nothing after it");
     assert_eq!(pool_of(&state).used(), 0);
+}
+
+/// A document of `indexed` with a field of 40,000 bytes: far heavier than the others.
+fn heavy(i: i64) -> Document {
+    doc! { "_id": i, "t": i, "u": i % 10, "pad": "p".repeat(40_000) }
+}
+
+#[test]
+fn a_later_chunk_of_heavier_documents_is_refused_on_a_full_pool_though_its_range_did_not_grow() {
+    // The range is the same for both chunks: 10,101 entries, in chunks of 10,000. Between them
+    // the 101 documents of the second chunk are replaced by ones of 40,000 bytes, so the second
+    // chunk's keys and documents come to more than the first's, and that is what the lease is
+    // asked for. It is the documents and not the range that are refused, and after a commit:
+    // `500 partially_applied`, cause `timeout`, the first chunk counted. With a pool that
+    // covers the second chunk to the byte it is answered. Were the lease asked for nothing past
+    // its mark the full pool would answer the first.
+    let (keys, light) = (key_bytes(10_101), document_bytes(true));
+    let first = keys + 10_000 * light;
+    let second = keys + 101 * bytes_of(&heavy(10_000), true);
+    assert!(second > first, "the second chunk is the heavier: {second} against {first}");
+
+    let run = |pool: usize| {
+        let dir = tempfile::tempdir().unwrap();
+        let state = indexed(&dir, 10_101, 64 << 20, pool);
+        state.engine.set_multi_chunk_docs(10_000);
+        let (engine, meta) =
+            (Arc::clone(&state.engine), state.engine.get_collection("app", "orders"));
+        let meta = meta.unwrap();
+        state.engine.before_next_continuing_write(move || {
+            for i in 10_000..10_101 {
+                engine.replace(&meta, &DocId::Int64(i), heavy(i), false).unwrap();
+            }
+        });
+        let answered = updated(&state, matching(0));
+        assert_eq!(pool_of(&state).used(), 0, "the lease is back however it ended");
+        (state, answered)
+    };
+
+    for pool in [first, second - 1] {
+        let (state, answered) = run(pool);
+        let err = answered.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{}", err.message);
+        assert_eq!(err.code, ErrorCode::PartiallyApplied);
+        let extra = err.extra.as_ref().unwrap();
+        assert_eq!(extra["applied"]["matched"], 10_000);
+        assert_eq!(extra["applied"]["commits"], 1);
+        assert_eq!(extra["cause"]["code"], "timeout");
+        let message = extra["cause"]["message"].as_str().unwrap();
+        assert!(message.starts_with("what the write holds needed "), "{message}");
+        assert_eq!(changed(&state), 10_000, "the first chunk stands, and nothing after it");
+        assert_eq!(pool_of(&state).pool_refusals(), 1);
+    }
+
+    let (state, answered) = run(second);
+    let answered = answered.unwrap();
+    assert_eq!((&answered["matched"], &answered["commits"]), (&json!(10_101), &json!(2)));
+    assert_eq!(changed(&state), 10_101);
 }
 
 #[test]
