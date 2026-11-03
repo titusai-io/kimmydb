@@ -169,26 +169,104 @@ pub fn streams(stage: &Stage) -> bool {
     )
 }
 
+/// What a stage holds while it runs: how the chain built from a pipeline treats it, which is
+/// what `explain` reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// One document at a time: a step of a [`Streaming`] sink ([`streams`]).
+    Streams,
+    /// A state in place of its input: a [`Fused`] sink.
+    State(Kept),
+    /// Its whole input: a [`Barrier`].
+    Blocks,
+}
+
+/// The state a stage that holds one keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// A count (`$count`).
+    Counter,
+    /// The groups, or the buckets, with what their accumulators keep (`$group`, `$bucket`,
+    /// `$sortByCount`).
+    Groups,
+    /// The first `skip + limit` documents of the sort (`$sort` and the `$skip` and `$limit` that
+    /// follow it).
+    Heap { skip: usize, limit: usize },
+    /// The documents of the sample (`$sample`).
+    Reservoir { size: usize },
+}
+
+/// Some of a pipeline's stages and what they hold: a run of stages that stream, one stage
+/// that keeps a state (a `$sort` with its `$skip` and `$limit` is three), or one stage that
+/// blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Segment {
+    /// Which stages, by place in the pipeline given to [`segments`].
+    pub stages: std::ops::Range<usize>,
+    /// What they hold.
+    pub hold: Hold,
+}
+
+/// How a chain built from `stages` by [`build`] is laid out: its segments in the order of the
+/// pipeline, which cover every stage. `build` takes its sinks from this and `explain` reports
+/// it, so the plan cannot say a stage streams while the chain blocks on it. A leading `$match`
+/// is the source's filter and is not given to the chain, nor a trailing `$merge` or `$out`
+/// (the sink that writes): `stages` is what the chain runs.
+pub fn segments(stages: &[Stage]) -> Vec<Segment> {
+    segments_by(stages, true)
+}
+
+/// [`segments`] when `streaming`, and a barrier for every stage when not ([`build_barriers`]).
+fn segments_by(stages: &[Stage], streaming: bool) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut end = stages.len();
+    while end > 0 {
+        // The stages that hold their state and not their input end here.
+        if let Some((len, kept)) = streaming.then(|| kept(&stages[..end])).flatten() {
+            out.push(Segment { stages: end - len..end, hold: Hold::State(kept) });
+            end -= len;
+            continue;
+        }
+        // The run of stages that stream that ends at `end`, if the stage there is one.
+        let mut start = end;
+        // (A `$limit` that ends a `$sort` held as a heap is not in the run.)
+        while streaming
+            && start > 0
+            && streams(&stages[start - 1])
+            && heap_len(&stages[..start]).is_none()
+        {
+            start -= 1;
+        }
+        if start < end {
+            out.push(Segment { stages: start..end, hold: Hold::Streams });
+            end = start;
+        } else {
+            out.push(Segment { stages: end - 1..end, hold: Hold::Blocks });
+            end -= 1;
+        }
+    }
+    out.reverse();
+    out
+}
+
 /// Whether a pipeline whose stages are `stages` takes its source a document at a time, and
 /// holds none of it: the first stage streams, or holds a state in place of its input
-/// ([`fuse`]). Any other pipeline begins with a stage that needs the source whole, and the
+/// ([`kept`]). Any other pipeline begins with a stage that needs the source whole, and the
 /// executor reads it whole.
 pub fn streams_source(stages: &[Stage]) -> bool {
-    stages.first().is_some_and(|first| {
-        streams(first)
-            || matches!(
-                first,
-                Stage::Count(_)
-                    | Stage::Group { .. }
-                    | Stage::Bucket { .. }
-                    | Stage::SortByCount(_)
-                    | Stage::Sample(_)
-            )
-    }) || matches!(
-        stages,
-        [Stage::Sort(_), Stage::Limit(_), ..]
-            | [Stage::Sort(_), Stage::Skip(_), Stage::Limit(_), ..]
-    )
+    segments(stages).first().is_some_and(|first| first.hold != Hold::Blocks)
+}
+
+/// Whether a chain built from `stages` wants no document of the source at all, before one is
+/// pushed: a `$limit` of 0 at its head (a window the reordering made of `$limit 3, $skip 5`),
+/// or a heap that keeps none. The executor asks the same of the chain it builds and then reads
+/// nothing, so `explain` asks it here and says so.
+pub fn takes_nothing(stages: &[Stage]) -> bool {
+    let run = |_: &Stage, _: Vec<Document>, _: Option<Lease>| -> Result<Vec<Document>, Error> {
+        Ok(Vec::new())
+    };
+    let limits = Limits::default();
+    build(stages, &run, &limits, &[]).is_full()
 }
 
 /// How many documents of the source a pipeline whose stages are `stages` will take, when that
@@ -226,7 +304,25 @@ pub fn build<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, true, &system_below)
+    build_by(stages, run, limits, vars, true, &system_below, OUTPUT)
+}
+
+/// How the end of a chain is named in a refusal for the bytes it holds: the output of the
+/// pipeline the request answers, which the answer is built from (ADR-269).
+pub const OUTPUT: &str = "the output of the pipeline";
+
+/// [`build`] for a pipeline that is not the request's: a `$facet` branch or the sub-pipeline of
+/// a `$lookup` or `$unionWith`. Its documents are held at the end of the chain as the
+/// request's are, and `output` is what a refusal for them names, so that one inside a
+/// sub-pipeline does not read as the request's answer.
+pub fn build_into<'a, E: From<Error> + 'a>(
+    stages: &'a [Stage],
+    run: Runner<'a, E>,
+    limits: &'a Limits,
+    vars: &'a [Binding<'a>],
+    output: &'static str,
+) -> Chain<'a, E> {
+    build_by(stages, run, limits, vars, true, &system_below, output)
 }
 
 /// A source of random positions for each `$sample` of a chain ([`stages::Below`]): a function
@@ -247,7 +343,7 @@ pub fn build_with<'a, E: From<Error> + 'a>(
     vars: &'a [Binding<'a>],
     below: BelowSource<'a>,
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, true, below)
+    build_by(stages, run, limits, vars, true, below, OUTPUT)
 }
 
 /// [`build`] with every stage a [`Barrier`], as the chain was first built (ADR-270, P0): it
@@ -259,7 +355,7 @@ pub fn build_barriers<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, false, &system_below)
+    build_by(stages, run, limits, vars, false, &system_below, OUTPUT)
 }
 
 /// [`build`] when `streaming`, and [`build_barriers`] when not.
@@ -270,46 +366,34 @@ fn build_by<'a, E: From<Error> + 'a>(
     vars: &'a [Binding<'a>],
     streaming: bool,
     below: BelowSource<'a>,
+    output: &'static str,
 ) -> Chain<'a, E> {
     let last = stages.last().map_or("the source", Stage::name);
-    let out = Rc::new(RefCell::new(Collected::new("the output of the pipeline", last, limits)));
+    let out = Rc::new(RefCell::new(Collected::new(output, last, limits)));
     let mut head: Link<'a, E> = Box::new(Collector { out: Rc::clone(&out) });
-    let mut end = stages.len();
-    while end > 0 {
-        // The stages that hold their state and not their input end here.
-        if let Some(fusion) = streaming.then(|| fuse(&stages[..end], vars, limits, below)).flatten()
-        {
-            let held = limits.buffer.lease(state_of(fusion.name));
-            head = Box::new(Fused {
-                name: fusion.name,
-                limits,
-                state: Some(fusion.state),
-                held,
-                next: Some(head),
-            });
-            end -= fusion.len;
-            continue;
-        }
-        // The run of stages that stream that ends at `end`, if the stage there is one.
-        let mut start = end;
-        // (A `$limit` that ends a `$sort` held as a heap is not in the run.)
-        while streaming
-            && start > 0
-            && streams(&stages[start - 1])
-            && heap_len(&stages[..start]).is_none()
-        {
-            start -= 1;
-        }
-        if start < end {
-            head = Box::new(Streaming::new(&stages[start..end], vars, limits, head));
-            end = start;
-        } else {
-            let stage = &stages[end - 1];
-            let before = end.checked_sub(2).map_or("the source", |at| stages[at].name());
-            let held = Collected::new(input_of(stage.name()), before, limits);
-            head = Box::new(Barrier { stage, run, held, next: Some(head) });
-            end -= 1;
-        }
+    // From the end, each sink owns the one after it.
+    for Segment { stages: at, hold } in segments_by(stages, streaming).into_iter().rev() {
+        head = match hold {
+            Hold::State(_) => {
+                let fusion = fuse(&stages[..at.end], vars, limits, below)
+                    .expect("the segments name a state where `fuse` builds one");
+                let held = limits.buffer.lease(state_of(fusion.name));
+                Box::new(Fused {
+                    name: fusion.name,
+                    limits,
+                    state: Some(fusion.state),
+                    held,
+                    next: Some(head),
+                })
+            }
+            Hold::Streams => Box::new(Streaming::new(&stages[at], vars, limits, head)),
+            Hold::Blocks => {
+                let stage = &stages[at.start];
+                let before = at.start.checked_sub(1).map_or("the source", |at| stages[at].name());
+                let held = Collected::new(input_of(stage.name()), before, limits);
+                Box::new(Barrier { stage, run, held, next: Some(head) })
+            }
+        };
     }
     Chain { head, out }
 }
@@ -333,14 +417,21 @@ impl<'a, E: From<Error>> Chain<'a, E> {
 
     /// The source is complete: finish every sink in order, and answer what came out of the
     /// last. The first sink to fail ends it, and the ones after it have run nothing.
-    pub fn finish(mut self) -> Result<Vec<Document>, E> {
+    pub fn finish(self) -> Result<Vec<Document>, E> {
+        self.finish_held().map(|(docs, _lease)| docs)
+    }
+
+    /// [`Chain::finish`], also handing over the lease that charged the output as it arrived,
+    /// if it did: every document of the output is charged to it, and its bytes stay in the
+    /// request's budget until it is dropped. `None` when the output came whole to the end of
+    /// the chain and nothing was charged on arrival.
+    pub fn finish_held(mut self) -> Result<(Vec<Document>, Option<Lease>), E> {
         let mut at: Option<&mut dyn Sink<'a, E>> = Some(&mut *self.head);
         while let Some(sink) = at {
             sink.finish()?;
             at = sink.next_mut();
         }
-        let (docs, _lease) = self.out.borrow_mut().take();
-        Ok(docs)
+        Ok(self.out.borrow_mut().take())
     }
 }
 
@@ -776,51 +867,60 @@ struct Fusion<'a> {
 /// `stages`, which hold the first documents of the sort and not the whole input, and how many
 /// stages they are. A `$sort` that is not followed at once by a `$limit` needs all of its input.
 fn heap_len(stages: &[Stage]) -> Option<usize> {
-    match stages {
-        [.., Stage::Sort(_), Stage::Skip(_), Stage::Limit(_)] => Some(3),
-        [.., Stage::Sort(_), Stage::Limit(_)] => Some(2),
+    match kept(stages) {
+        Some((len, Kept::Heap { .. })) => Some(len),
         _ => None,
     }
 }
 
-/// The stages at the end of `stages` that hold a state and not their input, if there are
-/// any: `$count` and the groups hold a counter or their buckets, `$sort` with a `$limit` a heap
-/// of the first documents, and `$sample` its reservoir.
+/// The stages at the end of `stages` that hold a state and not their input, if there are any,
+/// how many they are and what they keep: `$count` and the groups hold a counter or their
+/// buckets, `$sort` with a `$limit` a heap of the first documents, and `$sample` its
+/// reservoir. This is the one list of them: [`fuse`] builds what it names, [`segments`] lays
+/// the chain out by it and `explain` reports it.
+fn kept(stages: &[Stage]) -> Option<(usize, Kept)> {
+    match stages {
+        [.., Stage::Sort(_), Stage::Skip(skip), Stage::Limit(limit)] => {
+            Some((3, Kept::Heap { skip: *skip, limit: *limit }))
+        }
+        [.., Stage::Sort(_), Stage::Limit(limit)] => {
+            Some((2, Kept::Heap { skip: 0, limit: *limit }))
+        }
+        [.., Stage::Count(_)] => Some((1, Kept::Counter)),
+        [.., Stage::Sample(size)] => Some((1, Kept::Reservoir { size: *size })),
+        [.., Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_)] => {
+            Some((1, Kept::Groups))
+        }
+        _ => None,
+    }
+}
+
+/// The sink-side state for the stages at the end of `stages`, if [`kept`] names one.
 fn fuse<'a>(
     stages: &'a [Stage],
     vars: &'a [Binding<'a>],
     limits: &'a Limits,
     below: BelowSource<'a>,
 ) -> Option<Fusion<'a>> {
-    let state: Box<dyn State + 'a> = match stages {
-        [.., Stage::Sort(keys), Stage::Skip(skip), Stage::Limit(limit)] => {
-            return Some(Fusion {
-                len: 3,
-                name: "$sort",
-                state: Box::new(Heap::new(keys, *skip, *limit, limits)),
-            });
+    let (len, kept) = kept(stages)?;
+    let stood_for = &stages[stages.len() - len..];
+    let state: Box<dyn State + 'a> = match (kept, stood_for) {
+        (Kept::Heap { skip, limit }, [Stage::Sort(keys), ..]) => {
+            Box::new(Heap::new(keys, skip, limit, limits))
         }
-        [.., Stage::Sort(keys), Stage::Limit(limit)] => {
-            return Some(Fusion {
-                len: 2,
-                name: "$sort",
-                state: Box::new(Heap::new(keys, 0, *limit, limits)),
-            });
+        (Kept::Counter, [Stage::Count(field)]) => {
+            Box::new(Counter { field, seen: 0, ticker: Ticker::new() })
         }
-        [.., Stage::Count(field)] => Box::new(Counter { field, seen: 0, ticker: Ticker::new() }),
-        [.., Stage::Sample(size)] => Box::new(Sampling {
-            reservoir: stages::Reservoir::new(*size),
+        (Kept::Reservoir { size }, _) => Box::new(Sampling {
+            reservoir: stages::Reservoir::new(size),
             below: below(),
             limits,
             ticker: Ticker::new(),
         }),
-        [.., stage @ (Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_))] => {
-            Box::new(aggregate::GroupState::new(stage, limits, vars)?)
-        }
+        (Kept::Groups, [stage]) => Box::new(aggregate::GroupState::new(stage, limits, vars)?),
         _ => return None,
     };
-    let name = stages.last()?.name();
-    Some(Fusion { len: 1, name, state })
+    Some(Fusion { len, name: stood_for[0].name(), state })
 }
 
 /// A stage that holds a state and not its input: it takes the documents as they arrive and
@@ -2250,6 +2350,233 @@ mod tests {
             err.to_string(),
             "invalid query: $sample produced 4 documents, over the pipeline limit of 3. Narrow \
              the pipeline with an earlier $match"
+        );
+    }
+
+    /// Each stage kind alone, as it is written in a request.
+    fn every_stage_spec() -> Vec<Document> {
+        let mut all = vec![
+            doc! {"$match": {"g": {"$gte": 0}}},
+            doc! {"$project": {"g": 1}},
+            doc! {"$addFields": {"y": 1}},
+            doc! {"$set": {"y": 1}},
+            doc! {"$replaceRoot": {"newRoot": "$$ROOT"}},
+            doc! {"$replaceWith": "$$ROOT"},
+            doc! {"$unset": "pad"},
+            doc! {"$redact": "$$KEEP"},
+            doc! {"$unwind": "$arr"},
+            doc! {"$skip": 1},
+            doc! {"$limit": 3},
+            doc! {"$sort": {"g": 1}},
+            doc! {"$sample": {"size": 2}},
+            doc! {"$bucketAuto": {"groupBy": "$g", "buckets": 2}},
+            doc! {"$setWindowFields": {"sortBy": {"g": 1}, "output": {
+            "s": {"$sum": "$g", "window": {"documents": ["unbounded", "current"]}}}}},
+            doc! {"$densify": {"field": "g", "range": {"step": 1, "bounds": "full"}}},
+            doc! {"$fill": {"output": {"y": {"value": 0}}}},
+            doc! {"$fill": {"sortBy": {"g": 1}, "output": {"y": {"method": "locf"}}}},
+            doc! {"$facet": {"f": [{"$limit": 1}]}},
+            doc! {"$lookup": {"from": "b", "localField": "g", "foreignField": "g", "as": "j"}},
+            doc! {"$graphLookup": {"from": "b", "startWith": "$g", "connectFromField": "g",
+            "connectToField": "g", "as": "w", "maxDepth": 1}},
+            doc! {"$unionWith": "b"},
+        ];
+        all.extend(fused_specs());
+        all
+    }
+
+    /// The documents the layout tests push: `{_id, g, pad, arr}`.
+    fn laid_out(n: i32) -> Vec<Document> {
+        (0..n).map(|i| doc! {"_id": i, "g": i % 3, "pad": "x", "arr": [i]}).collect()
+    }
+
+    /// What a chain built from `stages` does with documents, observed: the positions of the
+    /// stages the runner was asked to run (the stages that block), and whether anything had
+    /// reached the end of the chain before it was finished (the stages that stream pass
+    /// documents on as they arrive, a state holds its answer to the end).
+    fn observed(stages: &[Stage]) -> (Vec<usize>, bool) {
+        let ran = RefCell::new(Vec::new());
+        let run = |stage: &Stage, input: Vec<Document>, _: Option<Lease>| {
+            ran.borrow_mut().push(std::ptr::from_ref(stage));
+            Ok::<_, Error>(input)
+        };
+        let limits = Limits::default();
+        let mut chain = build(stages, &run, &limits, &[]);
+        for doc in laid_out(6) {
+            let _ = chain.push(doc).unwrap();
+        }
+        let before_finish = !chain.out.borrow().docs.is_empty();
+        let _ = chain.finish().unwrap();
+        let blocks = (0..stages.len())
+            .filter(|&at| ran.borrow().contains(&std::ptr::from_ref(&stages[at])))
+            .collect();
+        (blocks, before_finish)
+    }
+
+    #[test]
+    fn what_a_stage_holds_is_what_the_chain_built_from_it_does() {
+        for spec in every_stage_spec() {
+            let stages = parsed(std::slice::from_ref(&spec));
+            let [segment] = &segments(&stages)[..] else {
+                panic!("{spec}: one stage, one segment")
+            };
+            assert_eq!(segment.stages, 0..stages.len(), "{spec}");
+            let (blocks, before_finish) = observed(&stages);
+            match segment.hold {
+                Hold::Blocks => assert_eq!(blocks, [0], "{spec}: the runner runs it"),
+                Hold::Streams => {
+                    assert!(blocks.is_empty() && before_finish, "{spec}: it passes documents on");
+                    assert!(streams(&stages[0]), "{spec}");
+                }
+                Hold::State(_) => {
+                    assert!(blocks.is_empty() && !before_finish, "{spec}: it holds its answer");
+                    assert!(
+                        !streams(&stages[0]) || matches!(stages[0], Stage::Sample(_)),
+                        "{spec}"
+                    );
+                }
+            }
+            // The head of a pipeline: the source streams into it unless it blocks.
+            assert_eq!(streams_source(&stages), segment.hold != Hold::Blocks, "{spec}");
+        }
+    }
+
+    #[test]
+    fn the_state_a_stage_keeps_is_the_one_the_layout_names() {
+        let kept_by = |spec: Document| match segments(&parsed(&[spec]))[0].hold {
+            Hold::State(kept) => kept,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(kept_by(doc! {"$count": "n"}), Kept::Counter);
+        assert_eq!(kept_by(doc! {"$group": {"_id": "$g"}}), Kept::Groups);
+        assert_eq!(kept_by(doc! {"$sortByCount": "$g"}), Kept::Groups);
+        assert_eq!(
+            kept_by(doc! {"$bucket": {"groupBy": "$g", "boundaries": [0, 2]}}),
+            Kept::Groups
+        );
+        assert_eq!(kept_by(doc! {"$sample": {"size": 7}}), Kept::Reservoir { size: 7 });
+    }
+
+    /// The shapes of a `$sort` that a `$limit` follows, as the parse leaves them: where the chain
+    /// has a heap, what it keeps and what runs after it. `[$sort, $project, $limit]` is the
+    /// commonest, and is a heap because the reordering moved the limit ahead of the `$project`.
+    #[test]
+    fn a_sort_and_the_window_after_it_are_laid_out_as_a_heap() {
+        let sort = || doc! {"$sort": {"g": 1}};
+        let project = || doc! {"$project": {"g": 1}};
+        let heap = |at: std::ops::Range<usize>, skip, limit| Segment {
+            stages: at,
+            hold: Hold::State(Kept::Heap { skip, limit }),
+        };
+        let run = |at: std::ops::Range<usize>| Segment { stages: at, hold: Hold::Streams };
+        let blocks = |at: usize| Segment { stages: at..at + 1, hold: Hold::Blocks };
+        for (specs, expected) in [
+            (vec![sort(), doc! {"$limit": 3}], vec![heap(0..2, 0, 3)]),
+            (vec![sort(), doc! {"$skip": 2}, doc! {"$limit": 3}], vec![heap(0..3, 2, 3)]),
+            (vec![sort(), project(), doc! {"$limit": 3}], vec![heap(0..2, 0, 3), run(2..3)]),
+            (
+                vec![sort(), project(), doc! {"$skip": 2}, doc! {"$limit": 3}],
+                vec![heap(0..3, 2, 3), run(3..4)],
+            ),
+            (vec![sort()], vec![blocks(0)]),
+            (vec![sort(), doc! {"$skip": 2}], vec![blocks(0), run(1..2)]),
+            (
+                vec![sort(), doc! {"$match": {"g": 1}}, doc! {"$limit": 3}],
+                vec![blocks(0), run(1..3)],
+            ),
+            (
+                vec![project(), sort(), doc! {"$limit": 3}, doc! {"$unwind": "$arr"}],
+                vec![run(0..1), heap(1..3, 0, 3), run(3..4)],
+            ),
+            (
+                vec![sort(), doc! {"$limit": 3}, doc! {"$count": "n"}],
+                vec![heap(0..2, 0, 3), Segment { stages: 2..3, hold: Hold::State(Kept::Counter) }],
+            ),
+        ] {
+            let stages = parsed(&specs);
+            assert_eq!(segments(&stages), expected, "{specs:?}");
+            // What is built is what is laid out: the runner is asked for the stages that block,
+            // and a heap holds its answer to the end.
+            let (ran, _) = observed(&stages);
+            let blocking: Vec<usize> = expected
+                .iter()
+                .filter(|segment| segment.hold == Hold::Blocks)
+                .map(|segment| segment.stages.start)
+                .collect();
+            assert_eq!(ran, blocking, "{specs:?}");
+        }
+    }
+
+    #[test]
+    fn a_chain_of_barriers_lays_every_stage_out_as_a_barrier() {
+        let stages =
+            parsed(&[doc! {"$match": {"g": 1}}, doc! {"$sort": {"g": 1}}, doc! {"$limit": 3}]);
+        assert_eq!(segments_by(&stages, false).len(), stages.len());
+        assert!(segments_by(&stages, false).iter().all(|segment| segment.hold == Hold::Blocks));
+    }
+
+    #[test]
+    fn the_end_of_a_chain_hands_over_the_lease_that_charged_its_output() {
+        let limits = Limits::default();
+        let stages = parsed(&[doc! {"$project": {"g": 1}}]);
+        // Documents that arrive one at a time are charged as they do, and the lease is the
+        // caller's to keep: the output is not walked a second time to be charged again.
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        for doc in laid_out(4) {
+            let _ = chain.push(doc).unwrap();
+        }
+        let (docs, lease) = chain.finish_held().unwrap();
+        let lease = lease.expect("charged as the documents arrived");
+        assert_eq!(docs.len(), 4);
+        assert_eq!(lease.bytes(), held_docs_bytes(&docs));
+        assert_eq!(limits.buffer.used(), lease.bytes(), "the bytes are still charged");
+        // Another holder's name, and the same bytes.
+        let lease = lease.renamed("the answer");
+        assert_eq!(limits.buffer.used(), held_docs_bytes(&docs));
+        drop(lease);
+        assert_eq!(limits.buffer.used(), 0);
+
+        // `finish` is `finish_held` that gives the lease back.
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        let _ = chain.push_all(laid_out(4)).unwrap();
+        let docs = chain.finish().unwrap();
+        assert_eq!((docs.len(), limits.buffer.used()), (4, 0));
+
+        // A `Vec` that reaches the end whole (a stage that blocks answered it) was charged by
+        // nothing here, and there is no lease to hand over.
+        let stages = vec![sort()];
+        let run = |_: &Stage, input: Vec<Document>, _: Option<Lease>| Ok::<_, Error>(input);
+        let mut chain = build(&stages, &run, &limits, &[]);
+        let _ = chain.push_all(laid_out(4)).unwrap();
+        let (docs, lease) = chain.finish_held().unwrap();
+        assert!(lease.is_none() && docs.len() == 4);
+    }
+
+    #[test]
+    fn the_end_of_a_chain_is_named_for_the_pipeline_it_ends() {
+        let stages = parsed(&[doc! {"$limit": 100}]);
+        let one = held_docs_bytes(&laid_out(1));
+        let refused = |output: Option<&'static str>| {
+            let limits = Limits { buffer: BufferBudget::new(2 * one), ..Limits::default() };
+            let mut chain = match output {
+                Some(name) => build_into(&stages, &unused, &limits, &[], name),
+                None => build(&stages, &unused, &limits, &[]),
+            };
+            laid_out(4).into_iter().find_map(|doc| chain.push(doc).err()).expect("refused")
+        };
+        let what = |err: Error| match err {
+            Error::ValueTooLarge { what, .. } => what,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(what(refused(None)), "the output of the pipeline");
+        assert_eq!(what(refused(Some(OUTPUT))), "the output of the pipeline");
+        assert_eq!(
+            what(refused(Some("the output of a sub-pipeline"))),
+            "the output of a sub-pipeline"
+        );
+        assert_eq!(
+            what(refused(Some("the output of a $facet branch"))),
+            "the output of a $facet branch"
         );
     }
 }

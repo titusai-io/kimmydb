@@ -27,21 +27,21 @@ can answer it, which only a *leading* `$match` gets (see
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
 | `$replaceWith` | `{$replaceWith: <expression>}` — `$replaceRoot` with the expression given directly; same semantics and errors. [Below](#replacewith) |
 | `$unset` | `{$unset: "path"}` or `{$unset: ["a", "b.c"]}` — a `$project` that excludes those paths. [Below](#unset) |
-| `$sort` | The same [sort language](query-language.md#sort-and-projection), down to which element a key through an array reads. [Blocking](#the-memory-limit) |
+| `$sort` | The same [sort language](query-language.md#sort-and-projection), down to which element a key through an array reads. [Holds its whole input](#the-memory-limit), unless a `$limit` follows it, when it holds the first `skip + limit` documents |
 | `$skip`, `$limit` | Non-negative whole numbers |
 | `$unwind` | One output document per array element. Below |
-| `$group` | [Blocking](#the-memory-limit). **One row per distinct key**, so an empty input produces no rows at all. Accumulators below |
-| `$count` | `{$count: "name"}` — a document holding the count, **always**: over an empty input it is one document holding `0`, not no document. [Blocking](#the-memory-limit) |
+| `$group` | [Holds its groups, not its input](#the-memory-limit). **One row per distinct key**, so an empty input produces no rows at all. Accumulators below |
+| `$count` | `{$count: "name"}` — a document holding the count, **always**: over an empty input it is one document holding `0`, not no document. [Holds a counter](#the-memory-limit) |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
 | `$unionWith` | Append another collection's documents, through a sub-pipeline if given, after the input. **Authorized separately**. [Below](#unionwith) |
-| `$sortByCount` | `$group` by an expression, counting, then `$sort` by the count, largest first. [Blocking](#the-memory-limit). [Below](#sortbycount) |
-| `$sample` | `{$sample: {size: N}}` — `N` documents chosen at random. [Blocking](#the-memory-limit). [Below](#sample) |
+| `$sortByCount` | `$group` by an expression, counting, then `$sort` by the count, largest first. [Holds its groups](#the-memory-limit). [Below](#sortbycount) |
+| `$sample` | `{$sample: {size: N}}` — `N` documents chosen at random. [Holds the sample](#the-memory-limit). [Below](#sample) |
 | `$redact` | Keep, prune or descend into each document and each embedded document by an expression that answers `$$KEEP`, `$$PRUNE` or `$$DESCEND`. [Below](#redact) |
-| `$bucket`, `$bucketAuto` | A histogram: documents counted into ranges you give, or into about equal parts. [Blocking](#the-memory-limit). Below |
+| `$bucket`, `$bucketAuto` | A histogram: documents counted into ranges you give (`$bucket`, which holds its buckets), or into about equal parts (`$bucketAuto`, which [holds its whole input](#the-memory-limit)). Below |
 | `$facet` | Several sub-pipelines over the same input, answered as **one document** of arrays. Below |
 | `$graphLookup` | Walk another collection (or the same one) link by link from each document, to a depth you give. **Authorized separately**. Below |
-| `$setWindowFields` | A value for every document computed from a **window** of the documents around it in its partition: running totals, moving averages, ranks, shifts, derivatives. [Blocking](#the-memory-limit). [Below](#setwindowfields) |
-| `$densify` | Documents generated to close the gaps in a numeric or date field. [Blocking](#the-memory-limit). [Below](#densify) |
+| `$setWindowFields` | A value for every document computed from a **window** of the documents around it in its partition: running totals, moving averages, ranks, shifts, derivatives. [Holds its whole input](#the-memory-limit). [Below](#setwindowfields) |
+| `$densify` | Documents generated to close the gaps in a numeric or date field. [Holds its whole input](#the-memory-limit). [Below](#densify) |
 | `$fill` | Null and missing values filled from a constant, an expression or the neighbouring documents. [Below](#fill) |
 | `$merge` | Write the pipeline's output into a collection, each document matched to a stored one by `_id`. **Last stage only; writes**. [Below](#merge) |
 | `$out` | Insert the pipeline's output into a collection that is **new or empty**. **Last stage only; writes**. [Below](#out) |
@@ -171,7 +171,7 @@ preferred-number series rounds the boundaries here, and a stage that ignored it
 would answer boundaries the caller did not ask for. `buckets` is a whole number of
 at least 1.
 
-Both are blocking, hold the input, and count their answer against the pipeline's
+Both hold the input (`$bucketAuto` cuts the sorted run of every value), and count their answer against the pipeline's
 document limit like `$group`.
 
 ### `$facet`
@@ -233,7 +233,7 @@ $-prefixed path or an expression inside an object`); and `"$"` alone. A missing 
 `null` are one group, `_id: null`. **`count` is an int** (a long only past 2^31-1), as the
 reference's is, and as `$group`'s `{$sum: 1}` is ([ADR-268](decisions.md#adr-268--integer-results-keep-the-references-width)). **The order of equal
 counts is unspecified**, as it is in the reference (two runs of it differ): this build
-happens to keep the order each value was first seen, and that is not a promise. Blocking, and one group per distinct value counts against the pipeline's
+happens to keep the order each value was first seen, and that is not a promise. It holds its groups, and one group per distinct value counts against the pipeline's
 document limit like `$group`.
 
 ### `$replaceWith`
@@ -273,11 +273,12 @@ negative (`size argument to $sample must not be negative`), a value that is not 
 **The answer is in a random order**, `size` over the input included, so `{$sample: {size:
 <large>}}` shuffles, and a `$limit` after it picks at random.
 
-`$sample` takes the documents the pipeline holds, a reservoir over them, so **a collection
-of more than 100,000 documents cannot be sampled**: that is the pipeline's document limit,
-which holds on the input of every pipeline, `$sample` included, and is `400` naming the
-source (narrow it with a leading `$match`). It has no byte cap of its own. The random source
-is the operating system's, seeded afresh for every run.
+`$sample` keeps a reservoir of `size` documents and takes the source a document at a time, so
+**a collection of more than 100,000 documents can be sampled**: the pipeline's document limit
+holds what the reservoir keeps (a `size` over 100,000 is refused `400` once the input has that
+many documents, and a `size` over a smaller input is the whole input), not the input it reads.
+The reservoir is charged to the request's memory (`the reservoir of $sample`). The random
+source is the operating system's, seeded afresh for every run.
 
 ### `$redact`
 
@@ -2212,22 +2213,73 @@ examined or read.
 ```json
 { "explain": { "executed": false,
     "source": { "strategy": "index", "index": "city_1", "indexFieldsUsed": 1,
-                "stages": 1, "maxDocuments": 100000 },
-    "stages": [ { "stage": "$group", "runs": "inMemory",
-                  "detail": "groups everything that reaches it in memory; blocking, ..." } ],
+                "stages": 1, "streams": true,
+                "holds": "nothing: each document is passed to the first stage as it is read, ..." },
+    "stages": [ { "stage": "$group", "runs": "inMemory", "hold": "state", "state": "groups",
+                  "detail": "groups the documents that reach it by the `_id` expression, ...; holds a state, not its input: its groups, one for each distinct key" } ],
     "memory": { "limitBytes": 107374182, "poolBytes": 214748364, "poolUsedBytes": 0 } } }
 ```
 
 `memory` is what a run may hold (`aggregate.memory_limit_bytes`) and how much of the node's pool
 (`aggregate.memory_pool_bytes`) running aggregations have reserved now; a plan reserves nothing.
 
+**`explain` describes the pipeline that runs, and says how each stage runs.** The stages listed are
+the ones the executor runs, after it has moved a `$skip` and a `$limit` ahead of the stages they may
+pass ([Deviations](deviations.md#skipped-documents-adr-270)), and the `hold` of each is not written apart from
+the executor: the executor builds its chain of stages from the same function (`pipeline::segments`)
+that `explain` reads, so the two do not differ; a test pins what each stage kind and each fused
+shape holds, written out apart from that function. The field names that were there are unchanged; the fields below are **new**.
+
 - **`source`** is the plan `find` would make for the leading `$match` (the same
   planner: `strategy`, `index`, `indexFieldsUsed`, `probes`), with `stages` saying
-  how many leading stages it took and `maxDocuments` the ceiling a run enforces.
+  how many leading stages it took. What a run holds of it is said by:
+  - `streams` (new): `true` when the first stage after the leading `$match` streams or keeps a
+    state, so the source is read a document at a time and none of it is held, with no ceiling of
+    its own on how many documents it has; `false` when that stage blocks (or there is none), when
+    the source is read whole.
+  - `maxDocuments` (unchanged): the pipeline's ceiling, 100,000 documents. A source read whole
+    (`streams: false`) is held to it, as `the source read`, and over it a run is refused `400`.
+    A source that streams has no such read, but the ceiling still holds what a stage that blocks
+    keeps and the answer, so it is reported for every filtered source.
+  - `holds` (new): in words, what the read holds; for a pipeline that takes no document of the
+    source (a window the reordering made of `$limit` then `$skip`) it says that none is read,
+    and there is no `indexRange`.
+  - `sourceBound` (new, only when `streams`): the number of documents the pipeline takes of the
+    source when that is known before it runs, because a `$skip` and a `$limit` are at its head
+    (`skip + limit`, a window moved to the head included). The read ends there, and an inexact
+    index range wants that many.
+  - `indexRange` (new, only for an index range that is not one complete key or a union of them):
+    that the range is read whole to deliver its documents in `_id` order, in time proportional to
+    the range, and what its keys are held as: charged to the request's memory as `the index range
+    of $match`. With a `sourceBound` the range is read in passes of that many keys, and in larger
+    ones while the filter rejects what they find, up to the whole range; with none, every key of
+    the range is held while it is read. A range too large is refused `413`. A `find` over the same
+    range holds its keys as `the index range of the filter`.
+
   A range plan that used both ends carries a `note`: the scan re-checks the index
   when it runs and falls back to a collection scan if it has become multikey since.
 - **`stages`** has one entry for each later stage: it runs in memory, and says what
-  it does. No counts and no timings: nothing ran.
+  it does and how it runs. No counts and no timings: nothing ran. Each entry has (all new):
+  - `hold`: `"streams"` (passes one document at a time and holds one), `"state"` (needs all of its
+    input but holds a state and not the input) or `"blocks"` (holds its whole input before it emits
+    any output). The `detail` ends with the same words.
+  - `state` (only for `hold: "state"`): `"counter"` (`$count`), `"groups"` (`$group`, `$bucket`,
+    `$sortByCount`: one group for each distinct key, and what each accumulator keeps),
+    `"heap"` (a `$sort` followed by a `$limit`, with an optional `$skip` between them) or
+    `"reservoir"` (`$sample`, of its `size`).
+  - `heapDocuments` (only for a heap): `skip + limit`, the most documents it holds. The `$skip` and
+    the `$limit` the heap stands for are listed as stages of their own with `foldedInto` (new)
+    naming the `$sort`: they hold nothing more. `[$sort, $project, $limit]` is listed as
+    `$sort`, `$limit` and then `$project`, a heap, because the limit has been moved ahead.
+  - A `$merge` or `$out` is `"blocks"`: the documents it writes are all held while it writes them.
+  - The leading `$match` of a `$lookup` or `$unionWith` sub-pipeline has no `hold`: the stage
+    applies it to the foreign documents as it reads them, and its `detail` says so. The stages
+    after it are laid out as a pipeline, for each input document of a `$lookup`; a `$facet`
+    branch is laid out as a pipeline too.
+  - A stage that streams in a `$facet` branch, a sub-pipeline, or after a stage that blocks is
+    handed its documents in a `Vec` the stage before it holds; it holds one more at a time, and
+    the `Vec` is charged on arrival as `the input` of the first of them and given back as each
+    document is taken.
 - **`$lookup`** says what it will do: the `localField`/`foreignField` form scans
   the foreign collection once and files it in memory by the key
   (`foreignScanHashed`; no index on the foreign field is used), and the
@@ -2257,23 +2309,28 @@ examined or read.
 
 ## The memory limit
 
-`$group`, `$sort`, `$count`, `$sortByCount` and `$sample` are **blocking**: none of them can emit anything
-until it has consumed everything — a sort has no first element until the last
-is seen, a group has no totals until the last member arrives, and a count has
-no number until the last document has gone past. All five work on the whole
-materialised input, and `$count` emits a single document however large that
-input is. `$unwind` and `$lookup` can *grow* their input, which is the other
-way a stage can cost more than it was given. `find` is bounded by `MAX_LIMIT`,
-but a pipeline's input is a whole collection — so without a ceiling one request
-could take all the memory on a node.
+What a stage holds decides what a request costs ([ADR-270](decisions.md); the table is in
+[Aggregation memory](operations.md#aggregation-memory)). A stage **streams** when it passes one
+document at a time (`$match` after the first, `$project`, `$addFields`, `$replaceRoot`, `$unset`,
+`$redact`, `$unwind`, `$skip`, `$limit`), **holds a state** when it needs all of its input but not
+to keep it (`$group`, `$bucket`, `$sortByCount` keep their groups, `$count` a counter, `$sort`
+followed by a `$limit` a heap of `skip + limit` documents, `$sample` a reservoir of its size), and
+**blocks** when it holds its whole input (`$sort` with no `$limit` after it, `$bucketAuto`,
+`$setWindowFields`, `$densify`, `$fill`, `$facet`, `$lookup`, `$graphLookup`, `$unionWith`, and a
+`$merge` or `$out`): a sort has no first element until the last is seen. `$unwind` and `$lookup`
+can *grow* their input, which is the other way a stage can cost more than it was given. `find` is
+bounded by `MAX_LIMIT`, but a pipeline's input is a whole collection, and a stage that blocks holds
+all of it, so without a ceiling one request could take all the memory on a node. [`explain`](#performance)
+says which a stage does.
 
-Every stage checks its output against a cap of **100,000 documents**, and
-exceeding it is an error naming the stage. **The ceiling applies to what the
-leading `$match` admits**, not to the collection: a pipeline over a million
-documents runs when its first `$match` selects fewer than 100,000 of them, and
-a pipeline with no leading `$match` over that collection is refused at the
-source, as it always was. The scan stops as soon as the ceiling is passed
-rather than materialising everything to refuse it.
+Every stage that holds documents checks them against a cap of **100,000 documents**, and
+exceeding it is an error naming the stage; the answer is held to it too. **A source read whole
+is held to it by what the leading `$match` admits**, not by the collection: a pipeline whose
+first stage blocks, over a million documents, runs when its first `$match` selects fewer than
+100,000 of them, and without a leading `$match` over that collection is refused at the source.
+The scan stops as soon as the ceiling is passed rather than materialising everything to refuse
+it. A pipeline whose first stage streams or keeps a state reads its source with no ceiling: only
+what a stage that blocks keeps, the groups, the heap and the answer count against it.
 
 ```json
 { "error": "bad_request",
@@ -2296,10 +2353,10 @@ as it grows, and the request is refused `413 answer_too_large` at the first byte
 
 | What | Charged | Until |
 |---|---|---|
-| **The source read** | each document the leading `$match` or the scan admits, as it is read; the read stops at the one that passes the limit | the first stage takes the documents (which charges them as its input) |
-| **A stage's input** | the documents it is given | the stage returns |
-| **A stage's output** | `$project`, `$addFields`, `$replaceRoot`, `$unwind`, `$redact` and `$sortByCount` as each document is built (so the peak is input plus output); `$match`, `$limit`, `$skip`, `$count` and `$sample` only move their input and charge nothing more; `$sort` charges the sort keys it reads from each document (the vector of them and each value, as a `$sort` followed by a `$limit` charges them for the documents it keeps), as `the sort keys of $sort` | the stage returns |
-| **`$group`, `$bucket`, `$bucketAuto`** | each bucket when it is made, and what `$push`, `$addToSet`, `$firstN`, `$lastN`, `$top*`, `$bottom*`, `$maxN`, `$minN`, `$mergeObjects`, `$min`, `$max`, `$first` and `$last` keep, as it is kept (a `$top` that drops a row gives its bytes back) | the stage returns |
+| **The source read** | for a pipeline whose first stage after the leading `$match` blocks (or that has none): each document the leading `$match` or the scan admits, as it is read; the read stops at the one that passes the limit. A pipeline whose first stage streams or keeps a state holds none of its source | the first stage takes the documents (which charges them as its input) |
+| **A stage's input** | a stage that blocks: the documents it is given, as they arrive | the stage returns |
+| **A stage's output** | a stage that streams holds one document and charges nothing that lasts (a fan of `$unwind` charges the document and the elements it has still to hand on); a stage that blocks charges what it builds, as it builds it; a `$sort` with no `$limit` after it also charges the sort keys it reads from each document (the vector of them and each value, at the price a `$sort` followed by a `$limit` charges them for the documents it keeps), as `the sort keys of $sort` | the stage returns |
+| **`$group`, `$bucket`, `$sortByCount`; a `$sort` with a `$limit`; `$sample`** | the state: each bucket when it is made, and what `$push`, `$addToSet`, `$firstN`, `$lastN`, `$top*`, `$bottom*`, `$maxN`, `$minN`, `$mergeObjects`, `$min`, `$max`, `$first` and `$last` keep, as it is kept (a `$top` that drops a row gives its bytes back), the first `skip + limit` documents with their keys, the documents of the sample | the stage returns |
 | **`$lookup`, `$graphLookup`, `$unionWith`** | the foreign documents read (the read stops at the one that passes the limit), a copy of them for each run of a `$lookup` sub-pipeline (charged before it is made), the arrays attached and the documents appended | the stage returns |
 | **`$facet`** | its input, and a copy of it for each branch but the last (charged before the copy is made); the stages inside a branch charge as any stage does, and each run of a sub-pipeline gives its bytes back when it ends | the stage returns |
 | **`$setWindowFields`, `$densify`, `$fill`** | the documents they buffer, the sort keys they take and the values they add | the stage returns |
@@ -2312,9 +2369,8 @@ added the peak is 1,070,800,000, so they run through `$addFields` under an expli
 (1,073,741,824) and under the derived limit from a container of 19.95 GiB; with a string of 4,096
 characters (4,120 bytes) the peak is 1,078,000,000, over 1 GiB, and they need an explicit limit of 2 GiB or
 a container of 20.1 GiB. A 2 GiB member refuses them at the source read, an 8 GiB one at `$addFields`. **The source read is
-charged whole before any stage runs**, and only a leading `$match` narrows it, so `[{$count}]`,
-`[{$limit: 5}]`, `[{$sort}, {$limit}]` and `[{$group}]` over a collection above the limit (about 102 MiB
-of BSON on a 2 GiB member) are refused too; [Operations](operations.md#aggregation-memory) has the
+charged whole before any stage runs** for a pipeline that begins with a stage that blocks, and only a leading `$match` narrows it; `[{$count}]`, `[{$limit: 5}]`, `[{$sort}, {$limit}]` and `[{$group}]` over a collection above the limit (about 102 MiB
+of BSON on a 2 GiB member) are answered, since their first stage streams or keeps a state; [Operations](operations.md#aggregation-memory) has the
 figures and what to do, and [Deviations](deviations.md) the reference's behaviour. The `413` carries
 the total held and the limit, and says what to do: `a leading $match narrows what is read;
 $project, $limit or $match after it reduce what later stages hold; or raise aggregate.memory_limit_bytes`.

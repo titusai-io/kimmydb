@@ -2830,7 +2830,7 @@ fn scan_pipeline(
     // earlier of two scopes holds, and both are the request's, so they are the one instant.
     let _deadline = crate::limits::deadline_scope();
 
-    let (docs, stats) = if pipeline::streams_source(stages) {
+    let (docs, held, stats) = if pipeline::streams_source(stages) {
         let run = |stage: &aggregate::Stage, docs, arrived| {
             run_stage(state, auth, db, stage, docs, arrived, limits, &[])
         };
@@ -2877,7 +2877,8 @@ fn scan_pipeline(
         if let Some(e) = failed {
             return Err(e);
         }
-        (chain.finish()?, stats)
+        let (docs, held) = chain.finish_held()?;
+        (docs, held, stats)
     } else {
         // One past the ceiling: the scan stops as soon as it is over, rather than
         // materialising everything the filter admits in order to refuse it. The bytes
@@ -2916,9 +2917,11 @@ fn scan_pipeline(
                 limits.max_documents
             )));
         }
-        (run_stages(state, auth, db, stages, docs, limits, &[])?, stats)
+        let (docs, held) =
+            run_stages_held(state, auth, db, stages, docs, limits, &[], pipeline::OUTPUT)?;
+        (docs, held, stats)
     };
-    conclude(state, docs, limits, sink, Some(stats), shape)
+    conclude(state, (docs, held), limits, sink, Some(stats), shape)
 }
 
 /// Everything after the source of an aggregation, under the request's deadline: the
@@ -2936,26 +2939,38 @@ fn finish_pipeline(
     shape: Shape,
 ) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
     let _deadline = crate::limits::deadline_scope();
-    let docs = run_stages(state, auth, db, stages, docs, limits, &[])?;
+    let docs = run_stages_held(state, auth, db, stages, docs, limits, &[], pipeline::OUTPUT)?;
     conclude(state, docs, limits, sink, source_stats, shape)
 }
 
 /// The end of an aggregation: the write of a sink, or the answer, built from the documents
-/// the stages left.
+/// the stages left. `held` is the lease that charged them as they arrived at the end of the
+/// chain, if one did: it becomes the lease of what is built from them, under that holder's
+/// name, so they are not walked a second time to be charged again (ADR-270).
 fn conclude(
     state: &SharedState,
-    docs: Vec<bson::Document>,
+    (docs, held): (Vec<bson::Document>, Option<Lease>),
     limits: &aggregate::Limits,
     sink: Option<(SinkPlan, &aggregate::Stage)>,
     source_stats: Option<QueryStats>,
     shape: Shape,
 ) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
+    // `held` is trusted to have charged `docs`, and only the end of a chain makes one, charged
+    // for every document it holds as it took it ([`pipeline::Chain::finish_held`]).
+    debug_assert!(
+        held.as_ref()
+            .is_none_or(|lease| lease.bytes() >= kimmy_query::budget::held_docs_bytes(&docs)),
+        "a lease handed to the answer must have charged its documents"
+    );
     if let Some((sink, last)) = sink {
         // The documents are held while the sink writes them, in the engine's chunks.
-        let _writing = {
-            let mut lease = limits.buffer.lease("the documents the sink writes");
-            lease.charge_docs(&docs)?;
-            lease
+        let _writing = match held {
+            Some(lease) => lease.renamed("the documents the sink writes"),
+            None => {
+                let mut lease = limits.buffer.lease("the documents the sink writes");
+                lease.charge_docs(&docs)?;
+                lease
+            }
         };
         return Ok((Answer::Json(write_sink(state, sink, last, docs)?), source_stats, None));
     }
@@ -2965,8 +2980,14 @@ fn conclude(
     // serialised length, document by document, so an answer that would pass the limit is
     // refused before the rest of it is built. The documents are dropped when it is built,
     // before the body is written from it, so the two never coexist with a third copy.
-    let mut answer = limits.buffer.lease("the answer");
-    answer.charge_docs(&docs)?;
+    let mut answer = match held {
+        Some(lease) => lease.renamed("the answer"),
+        None => {
+            let mut lease = limits.buffer.lease("the answer");
+            lease.charge_docs(&docs)?;
+            lease
+        }
+    };
     let mut json_total = 0usize;
     let mut ticker = deadline::Ticker::new();
     let count = docs.len();
@@ -3036,6 +3057,13 @@ fn json_len(value: &Value) -> usize {
     count.0
 }
 
+/// How the end of a `$facet` branch's chain is named in a refusal for the bytes it holds.
+const FACET_OUTPUT: &str = "the output of a $facet branch";
+
+/// How the end of the chain of a `$lookup` or `$unionWith` sub-pipeline is named in a refusal for
+/// the bytes it holds.
+const SUB_OUTPUT: &str = "the output of a sub-pipeline";
+
 /// Run stages in order, as a chain of sinks (ADR-270): the stages that read storage go
 /// to the functions here that hold a storage handle, everything else to the pure pipeline,
 /// each through [`run_stage`].
@@ -3044,6 +3072,7 @@ fn json_len(value: &Value) -> usize {
 /// and the reason this is a function rather than a loop in `aggregate`: a
 /// sub-pipeline runs through the same dispatch, so a `$lookup` nested inside
 /// another's pipeline is authorized and executed exactly as an outer one is.
+#[allow(clippy::too_many_arguments)]
 fn run_stages(
     state: &SharedState,
     auth: &Auth,
@@ -3052,16 +3081,36 @@ fn run_stages(
     docs: Vec<bson::Document>,
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
+    output: &'static str,
 ) -> Result<Vec<bson::Document>, ApiError> {
+    run_stages_held(state, auth, db, stages, docs, limits, vars, output).map(|(docs, _)| docs)
+}
+
+/// [`run_stages`], also handing over the lease that charged the output as it arrived at the
+/// end of the chain, if it did (see [`pipeline::Chain::finish_held`]). `output` is how the end
+/// of the chain is named in a refusal: [`OUTPUT`] for the request's pipeline, and for a
+/// `$facet` branch or a sub-pipeline a name of its own, so that a refusal inside one does not
+/// read as the request's answer.
+#[allow(clippy::too_many_arguments)]
+fn run_stages_held(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    stages: &[aggregate::Stage],
+    docs: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    vars: &[Binding<'_>],
+    output: &'static str,
+) -> Result<(Vec<bson::Document>, Option<Lease>), ApiError> {
     let run = |stage: &aggregate::Stage, docs, arrived| {
         run_stage(state, auth, db, stage, docs, arrived, limits, vars)
     };
-    let mut chain = pipeline::build(stages, &run, limits, vars);
+    let mut chain = pipeline::build_into(stages, &run, limits, vars, output);
     // The input is already in memory, whole (the source, a `$facet` branch's copy, a
     // `$lookup` or `$unionWith` sub-pipeline's documents), and goes in as it is: there is no
     // scan to stop, so the answer of the push is not needed.
     let _more = chain.push_all(docs)?;
-    chain.finish()
+    chain.finish_held()
 }
 
 /// One stage on all of its input: the stages that hold a storage handle (the two `$lookup`
@@ -3133,7 +3182,7 @@ fn run_stage(
             // `$facet` charges its input itself.
             drop(arrived);
             let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
-                run_stages(state, auth, db, sub, input, limits, vars)
+                run_stages(state, auth, db, sub, input, limits, vars, FACET_OUTPUT)
             })?;
             vec![answer]
         }
@@ -3551,7 +3600,7 @@ fn lookup_pipeline(
         let joined = match (first, lead) {
             (Some(aggregate::Stage::Match(whole)), Some(lead)) => {
                 let matched = matched_for_input(&mut plan, n, whole, lead, &base, &vars)?;
-                run_stages(state, auth, db, rest, matched, limits, &vars)?
+                run_stages(state, auth, db, rest, matched, limits, &vars, SUB_OUTPUT)?
             }
             _ => {
                 // A copy for this input document, charged before it is made and handed on
@@ -3562,7 +3611,7 @@ fn lookup_pipeline(
                     pre.charge_docs(&base)?;
                     base.clone()
                 };
-                run_stages(state, auth, db, rest, copy, limits, &vars)?
+                run_stages(state, auth, db, rest, copy, limits, &vars, SUB_OUTPUT)?
             }
         };
         // Joined documents are held alongside the input, so the total across
@@ -3651,7 +3700,7 @@ fn union_with(
     let appended = if rest.is_empty() {
         foreign
     } else {
-        run_stages(state, auth, db, rest, foreign, limits, vars)?
+        run_stages(state, auth, db, rest, foreign, limits, vars, SUB_OUTPUT)?
     };
     // What the stage appends is what the pipeline then holds and answers: held to the
     // size a stored document may be, `413` at the document that passes it.

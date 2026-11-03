@@ -320,7 +320,10 @@ charges nothing that lasts, and the stages that keep a state charge the state as
 | `$sample` | `the reservoir of $sample`: the documents it will answer | a document when it is kept, given back when it is replaced |
 | `$sort` with no `$limit` after it | `the input of $sort`: all its input, and `the sort keys of $sort`: the keys it reads from each document, at the price the heap charges them | each document as it reaches it, its keys as they are read |
 | `$bucketAuto`, `$setWindowFields`, `$densify`, `$fill`, `$facet`, `$lookup`, `$graphLookup`, `$unionWith` | `the input of $sort` (and so on): all their input | each document as it reaches them |
-| the answer | `the output of the pipeline` as the documents arrive, then `the answer` | the documents, and the JSON built from them |
+| the answer | `the output of the pipeline` as the documents arrive, then `the answer` (the same lease, renamed: the documents are charged once and not walked again) | the documents, and the JSON built from them |
+| the output of a `$facet` branch, of a `$lookup` or `$unionWith` sub-pipeline | `the output of a $facet branch`, `the output of a sub-pipeline` | the documents the branch or sub-pipeline answers |
+
+**`explain: true` says which of these a stage is** (`hold`: `streams`, `state` or `blocks`, with the `state`, and for a heap its `heapDocuments`), derived from the chain the executor builds, and says whether the source streams (`source.streams`) or is read whole (`source.maxDocuments`, the pipeline's ceiling, is reported either way, and a source read whole is held to it; [Aggregation](aggregation.md#performance)); it also says when a `$skip` and `$limit` at the head bound the index walk (`source.sourceBound`) and when an inexact index range is read whole and its keys held under the pool (`source.indexRange`: `the index range of $match`).
 
 So `[{$count: "n"}]`, `[{$limit: 5}]`, `[{$sort: ..}, {$limit: 10}]`, `[{$group: {_id: "$k", n:
 {$sum: 1}}}]` and `[{$sample: {size: 5}}]` over a collection above the per-request limit are answered,
