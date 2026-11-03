@@ -393,6 +393,24 @@ fn doubles_are_registers_not_counters() {
 }
 
 #[test]
+fn a_double_operand_on_an_absent_field_is_a_double_register_not_a_counter() {
+    let o = opts();
+    // Production computes `Int32(0) + 1.5` for an absent field, a Double: so the first `$inc 1.5`
+    // writes a Double REGISTER, not a counter slot, and no 400 is raised (the 400 is for a
+    // counter that already exists).
+    let mut w = Writer::new(wid('A', 0), o.clone());
+    w.insert(&fl(&[("k", i32v(0))]), 0).unwrap();
+    w.write_inc_value(&p("x"), &Value::Double(1.5), 0).expect("an absent field takes a double");
+    assert_eq!(w.visible().unwrap()[&p("x")], Value::Double(1.5));
+    assert!(w.state.slots.is_empty(), "a register write, no counter slot");
+    // THE PINNED CONSEQUENCE: doubles are not counters. Two concurrent first `$inc 1.5` of an
+    // absent field converge to 1.5 (the newer register wins), not to 3.0.
+    let v =
+        concurrent(&o, &[("k", i32v(0))], "x", (&Value::Double(1.5), 0), (&Value::Double(1.5), 3));
+    assert_eq!(v, Value::Double(1.5), "the documented behaviour: doubles do not sum");
+}
+
+#[test]
 fn the_counter_mutants_are_caught() {
     type Switch = fn(&mut JoinOptions);
     type Scenario = fn(&JoinOptions) -> Result<(), String>;
