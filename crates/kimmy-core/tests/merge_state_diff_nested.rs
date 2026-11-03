@@ -313,6 +313,24 @@ fn sorted_heads(h: impl IntoIterator<Item = (Path, MStamp)>) -> Vec<J> {
     v.iter().map(|(p, st)| json!([p.to_string(), js(st)])).collect()
 }
 
+/// With `Q7DIFF_EXPLAIN=1`: the digest lines the model has for member `k` after step `i` of the
+/// script, against `rust`, as the lines only one side has.
+fn explain(sc: &J, i: usize, k: usize, rust: &[String]) -> String {
+    if std::env::var("Q7DIFF_EXPLAIN").is_err() {
+        return String::new();
+    }
+    let seed = sc["seed"].as_u64().unwrap().to_string();
+    let out = python(&["--explain".into(), seed, i.to_string()])
+        .wait_with_output()
+        .expect("python3 ran");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut members = text.split("== member ").skip(1);
+    let py: Vec<&str> = members.nth(k).map_or(Vec::new(), |m| m.lines().skip(1).collect());
+    let only_rust: Vec<&String> = rust.iter().filter(|l| !py.contains(&l.as_str())).collect();
+    let only_py: Vec<&&str> = py.iter().filter(|l| !rust.contains(&l.to_string())).collect();
+    format!("\n  only in rust: {only_rust:#?}\n  only in the model: {only_py:#?}")
+}
+
 /// What the replay of one script found.
 struct Replay {
     bad: Vec<String>,
@@ -413,11 +431,13 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
         for (k, (g, w)) in got.iter().zip(wa).enumerate() {
             if g != w {
                 let field = ["v", "hid", "dg"].into_iter().find(|f| g[f] != w[f]).unwrap();
+                let lines = digest_lines(&ms[k].w.state);
                 rep.bad.push(format!(
-                    "step {i} {op}: member {k}: {field} differs: rust {} python {}\n  rust state lines:\n    {}",
+                    "step {i} {op}: member {k}: {field} differs: rust {} python {}\n  rust state lines:\n    {}{}",
                     g[field],
                     w[field],
-                    digest_lines(&ms[k].w.state).join("\n    ")
+                    lines.join("\n    "),
+                    if field == "dg" { explain(sc, i, k, &lines) } else { String::new() }
                 ));
                 return rep;
             }
@@ -696,12 +716,13 @@ fn a_planted_rewrite_of_unchanged_leaves_is_detected() {
 #[test]
 fn rust_mutants_are_caught_by_the_replay() {
     type Switch = fn(&mut JoinOptions);
-    let cases: [(&str, Switch); 5] = [
+    let cases: [(&str, Switch); 6] = [
         ("a scalar hides every child, even a newer one", |o| o.set_type_ignores_recency(true)),
         ("a map marker hides its children", |o| o.set_marker_hides(true)),
         ("no typeClash is reported", |o| o.set_no_type_clash(true)),
         ("two arrays are a plain clash", |o| o.set_array_clash_as_clash(true)),
         ("a sub-document write rewrites every leaf", |o| o.set_rewrite_unchanged(true)),
+        ("an unset of a map unsets its direct children only", |o| o.set_unset_shallow(true)),
     ];
     let scratch = Scratch::new("mut");
     let n = runs().min(300);

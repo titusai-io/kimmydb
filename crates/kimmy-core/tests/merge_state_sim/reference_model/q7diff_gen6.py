@@ -40,9 +40,10 @@ these restrictions is lifted here (each is lifted deliberately when the Rust sid
 Usage (standard library only):
   python3 -I q7diff_gen6.py <out-dir> <n-scripts> [first-seed] [--plant NAME]
       write s<seed>.json for each seed
-  python3 -I q7diff_gen6.py --explain <seed>
-      print the digest lines of every member after the last step of that script
+  python3 -I q7diff_gen6.py --explain <seed> [step]
+      print the digest lines of every member after the given step (default: the final sync) of that script
 """
+import ast
 import copy
 import importlib.util
 import json
@@ -198,8 +199,9 @@ def digest_lines(s):
     for w, h in s.vv.items():
         out.append("vv %s %d" % (fw(w), h))
     for (kind, path, st), val in s.losses.items():
-        if path == "_" and isinstance(val, tuple):
-            vs = "f[" + ",".join(sorted(val)) + "]"
+        if path == "_" and isinstance(val, str):
+            # the model stores the field list of a lost whole document as its repr
+            vs = "f[" + ",".join(sorted(ast.literal_eval(val))) + "]"
         else:
             vs = fv(val)
         out.append("loss %s %s %s %s" % (kind, path, fs(st), vs))
@@ -373,7 +375,7 @@ def sort_losses(keys):
     return sorted(keys, key=kkey)
 
 
-def build(seed, plants=()):
+def build(seed, plants=(), explain_step=None, explained=None):
     rnd = random.Random(seed)
     ret = rnd.choice([10 ** 9, 10 ** 9, 10 ** 9, 3, 5, 8, 12])
     bound = rnd.choice([I64_MAX, I64_MAX, 1000])
@@ -390,6 +392,8 @@ def build(seed, plants=()):
     def record(op, res):
         ops.append(op)
         stepsout.append({"res": res, "after": snap(ms)})
+        if explain_step is not None and len(ops) - 1 == explain_step:
+            explained.extend((mm.name, digest_lines(mm.state)) for mm in ms)
 
     for _ in range(steps):
         m = rnd.randrange(nm)
@@ -460,6 +464,13 @@ PLANTS = {
 def main():
     a = sys.argv[1:]
     if a and a[0] == "--explain":
+        if len(a) > 2:                       # after step N
+            ex = []
+            build(int(a[1]), explain_step=int(a[2]), explained=ex)
+            for name, lines in ex:
+                print("== member", name)
+                print("\n".join(lines))
+            return
         sc, ms = build(int(a[1]))
         for mm in ms:
             print("== member", mm.name)
