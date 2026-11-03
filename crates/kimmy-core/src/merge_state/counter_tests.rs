@@ -411,6 +411,20 @@ fn a_double_operand_on_an_absent_field_is_a_double_register_not_a_counter() {
 }
 
 #[test]
+fn an_inc_of_a_double_base_that_leaves_the_bytes_alone_writes_nothing() {
+    let o = opts();
+    let mut w = Writer::new(wid('A', 0), o);
+    w.insert(&fl(&[("big", Value::Double(1e300)), ("x", Value::Double(2.5))]), 0).unwrap();
+    // 1e300 + 1 is 1e300 again, and `$inc 0` leaves 2.5 as it is: no-ops, no stamp
+    assert!(w.write_inc(&p("big"), 1, 0).is_none());
+    assert!(w.write_inc(&p("x"), 0, 0).is_none());
+    assert!(w.write_inc_value(&p("x"), &Value::Double(0.0), 0).is_none());
+    // a change is a write
+    assert!(w.write_inc(&p("x"), 1, 0).is_some());
+    assert_eq!(w.visible().unwrap()[&p("x")], Value::Double(3.5));
+}
+
+#[test]
 fn a_decimal_operand_on_a_double_base_makes_a_decimal_register_that_later_counts() {
     let o = opts();
     let (mut mi, mut ma, mut mb) = (Mem::new('I', &o), Mem::new('A', &o), Mem::new('B', &o));

@@ -866,6 +866,11 @@ impl Writer {
         // is no counter: its `$inc` is a register write of the computed value.
         let res = match counter::inc_result(vis.get(p), by, self.opts.int_bound())? {
             Inc::Register(v) => {
+                // A no-op writes nothing (ADR-208), as for a `$set`: the computed value is the
+                // stored representation byte for byte, e.g. `1e300 + 1.0`, or `$inc 0.0`.
+                if !self.opts.rewrite_unchanged() && Value::same(vis.get(p), &v) {
+                    return None;
+                }
                 let mut eff = Eff::default();
                 eff.put(p.clone(), v);
                 return self.commit(eff, m);
