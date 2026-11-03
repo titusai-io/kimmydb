@@ -347,16 +347,18 @@ pub enum Join {
     /// for the sub-pipeline to read as `$$name`. A nested loop by construction;
     /// see `docs/aggregation.md` for when to prefer the other form.
     ///
-    /// `lead` is set when the leading `$match` reads a `let` variable, and says how
-    /// to split it (see [`Lead`]); `None` for a sub-pipeline whose leading `$match`,
-    /// if any, reads none (it is applied once, before the loop).
+    /// `lead` is set when the leading `$match` reads a `let` variable or draws a random
+    /// number (`$sampleRate`, `$rand`), and says how to split it (see [`Lead`]); `None` for
+    /// a sub-pipeline whose leading `$match`, if any, reads none and draws none (it is
+    /// applied once, before the loop).
     Pipeline { vars: Vec<(String, Expr)>, stages: Vec<Stage>, lead: Option<Box<Lead>> },
 }
 
-/// A sub-pipeline's leading `$match` that reads `let` variables, taken apart at
-/// parse time. The conjunction is flattened through `$and` only (never `$or`,
+/// A sub-pipeline's leading `$match` that reads `let` variables or draws a random number,
+/// taken apart at parse time. The conjunction is flattened through `$and` only (never `$or`,
 /// `$nor` or an `$expr`'s own `$and`) into its leaf clauses **in evaluation
-/// order**, and each leaf is independent (reads no variable) or variable-reading.
+/// order**, and each leaf is independent (reads no variable and draws no random number) or
+/// variable-reading (reads one, or draws).
 ///
 /// Both halves are `And` of their leaves in that order, so evaluating `variable`
 /// over a pair that `independent` accepts decides it exactly as the whole
@@ -365,9 +367,9 @@ pub enum Join {
 /// decline: see `docs/decisions.md`, ADR-222.
 #[derive(Clone, Debug)]
 pub struct Lead {
-    /// The leaves that read no variable, applied once to the foreign set.
+    /// The leaves that read no variable and draw no random number, applied once to the foreign set.
     pub independent: Filter,
-    /// The leaves that read a variable, evaluated per input document.
+    /// The leaves that read a variable or draw a random number, evaluated per input document.
     pub variable: Filter,
     /// A variable leaf `{$expr: {$eq: [A, B]}}` that the executor may hash on.
     pub key: Option<JoinKey>,
@@ -399,6 +401,10 @@ impl Lead {
             let Filter::Expr(e) = leaf else { return None };
             let Expr::Op(crate::expr::Op::Eq, args) = e.as_ref() else { return None };
             let [a, b] = args.as_slice() else { return None };
+            // A side that draws a random number is drawn for each pair, not once for a key.
+            if a.draws_random() || b.draws_random() {
+                return None;
+            }
             let foreign_side = |x: &Expr, y: &Expr| {
                 x.reads_document() && !x.reads_variable(names) && !y.reads_document()
             };
@@ -412,8 +418,12 @@ impl Lead {
         }
         let mut leaves = Vec::new();
         flatten(filter, &mut leaves);
-        let (variable, independent): (Vec<&Filter>, Vec<&Filter>) =
-            leaves.into_iter().partition(|leaf| filter::reads_variable(leaf, names));
+        // A leaf that draws a random number (`$sampleRate`, `$expr` with `$rand`) is not a
+        // function of the foreign document alone, so it is decided for each input document
+        // like one that reads a variable, and not once for all of them.
+        let (variable, independent): (Vec<&Filter>, Vec<&Filter>) = leaves
+            .into_iter()
+            .partition(|leaf| filter::reads_variable(leaf, names) || leaf.draws_random());
         if variable.is_empty() {
             return None;
         }
@@ -3271,6 +3281,38 @@ fn init_within((_, acc): &(String, Accumulator), max: usize) -> AccState {
     }
 }
 
+/// Which of two values that compare equal `$min` and `$max` keep (`1` and `1.0`, `0.0` and
+/// `-0.0`, `1.0` and `1.00`, a double `NaN` and a decimal one differ in type or cohort only).
+/// The reference's `$group` accumulators keep the **last**; its expression forms, over a list
+/// of operands, the **first** (probed in `q8d-agg.js`, line for line: `[1, 1.0]` is `1` as an
+/// expression and `1.0` in a group).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ties {
+    First,
+    Last,
+}
+
+/// `$min` (or, with `max`, `$max`) taking one value: a null is skipped, and a value replaces
+/// the current one when it orders before (after) it, or equal to it under [`Ties::Last`]. The
+/// `$group` accumulators and the expression forms of the operators share it.
+pub(crate) fn keep_extreme(current: &mut Option<Bson>, value: Bson, max: bool, ties: Ties) {
+    if matches!(value, Bson::Null) {
+        return;
+    }
+    let ahead = |c: &Bson| {
+        let order = kimmy_core::cmp::canonical_cmp(&value, c);
+        match (max, ties) {
+            (true, Ties::First) => order.is_gt(),
+            (true, Ties::Last) => order.is_ge(),
+            (false, Ties::First) => order.is_lt(),
+            (false, Ties::Last) => order.is_le(),
+        }
+    };
+    if current.as_ref().is_none_or(ahead) {
+        *current = Some(value);
+    }
+}
+
 /// Feed one document to one accumulator.
 pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     // One tick for each accumulator step (ADR-266): the argument can be an expression of any
@@ -3283,20 +3325,10 @@ pub(crate) fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<
         }
         (AccState::Avg(mean), Accumulator::Avg(e)) => mean.add(&e.eval_in(scope)?),
         (AccState::MinMax(current), Accumulator::Min(e)) => {
-            let v = e.eval_in(scope)?;
-            if !matches!(v, Bson::Null)
-                && current.as_ref().is_none_or(|c| kimmy_core::cmp::canonical_cmp(&v, c).is_lt())
-            {
-                *current = Some(v);
-            }
+            keep_extreme(current, e.eval_in(scope)?, false, Ties::Last);
         }
         (AccState::MinMax(current), Accumulator::Max(e)) => {
-            let v = e.eval_in(scope)?;
-            if !matches!(v, Bson::Null)
-                && current.as_ref().is_none_or(|c| kimmy_core::cmp::canonical_cmp(&v, c).is_gt())
-            {
-                *current = Some(v);
-            }
+            keep_extreme(current, e.eval_in(scope)?, true, Ties::Last);
         }
         (AccState::First(current), Accumulator::First(e)) => {
             if current.is_none() {
@@ -5775,6 +5807,31 @@ mod lead {
         assert!(lead_of(doc! {"$match": {"kind": "x", "$expr": {"$gt": ["$q", 1]}}}).is_none());
     }
 
+    /// A leaf that draws a random number is decided for each input document, as one that reads
+    /// a variable is, and not once for all of them (review q8d, M3): the sample of the foreign
+    /// documents one outer document gets is not another's.
+    #[test]
+    fn a_leaf_that_draws_a_random_number_is_decided_for_each_input_document() {
+        for stage in [
+            doc! {"$match": {"$sampleRate": 0.5}},
+            doc! {"$match": {"$expr": {"$lt": [{"$rand": {}}, 0.5]}}},
+            doc! {"$match": {"$or": [{"$sampleRate": 0.5}, {"kind": "x"}]}},
+            doc! {"$match": {"$expr": {"$lt": ["$q", {"$multiply": [{"$rand": {}}, 10]}]}}},
+        ] {
+            let lead = lead_of(stage.clone()).unwrap_or_else(|| panic!("a lead for {stage}"));
+            assert_eq!(clauses(&lead.independent), 0, "{stage}");
+            assert_eq!(clauses(&lead.variable), 1, "{stage}");
+            assert!(lead.key.is_none(), "{stage}");
+        }
+        // Beside an independent clause, only the random one is held back; and a `$rand` is not
+        // a key for the join to hash on.
+        let lead = lead_of(doc! {"$match": {"kind": "x", "$sampleRate": 0.5}}).unwrap();
+        assert_eq!((clauses(&lead.independent), clauses(&lead.variable)), (1, 1));
+        let lead = lead_of(doc! {"$match": {"$expr": {"$eq": ["$k", {"$rand": {}}]}}}).unwrap();
+        assert!(lead.key.is_none());
+        assert_eq!(clauses(&lead.variable), 1);
+    }
+
     #[test]
     fn an_eq_between_the_document_and_a_variable_is_the_key_either_way_round() {
         for eq in [json_eq("$k", "$$v"), json_eq("$$v", "$k")] {
@@ -6144,8 +6201,10 @@ mod identity {
             extremes(vec![Bson::Double(0.1), dec("0.1"), dec("1E+400"), Bson::Double(f64::MAX)]),
             (dec("1E+400"), dec("0.1"))
         );
-        // Equal values keep the first seen, whatever its type.
-        assert_eq!(extremes(vec![dec("2.0"), Bson::Int32(2)]), (dec("2.0"), dec("2.0")));
+        // Equal values keep the last seen, whatever its type, as the reference's `$group` does
+        // (its expression forms keep the first: see `fold_tests`).
+        assert_eq!(extremes(vec![dec("2.0"), Bson::Int32(2)]), (Bson::Int32(2), Bson::Int32(2)));
+        assert_eq!(extremes(vec![Bson::Int32(2), dec("2.0")]), (dec("2.0"), dec("2.0")));
     }
 
     /// The error a pipeline gives, which must fail.
@@ -6267,7 +6326,8 @@ mod identity {
             decimals.clone(),
         );
         assert_eq!(out[0].get("lo"), Some(&Bson::Int32(1)));
-        assert_eq!(out[0].get("hi"), Some(&dec("2.5")));
+        // `2.5` and `2.50` are equal: the later one is kept.
+        assert_eq!(out[0].get("hi"), Some(&dec("2.50")));
         assert_eq!(out[0].get("first"), Some(&dec("2.5")));
         assert_eq!(out[0].get("last"), Some(&dec("2.50")));
         assert_eq!(
@@ -6280,24 +6340,24 @@ mod identity {
         assert_eq!(counted, vec![doc! { "n": 3_i32 }]);
     }
 
-    /// `$sum` and `$avg` are accumulators only: as expression operators, in
-    /// `$project` or anywhere an expression is parsed, they are not built and
-    /// are refused at parse whatever their operands, a decimal or an array
-    /// holding one included. So there is no expression form to refuse a
-    /// decimal in, and no array an expression sums.
+    /// `$sum` and `$avg` are expression operators as well as accumulators: in `$project`
+    /// they total a list of operands or the array an operand is, and a decimal among them
+    /// makes the answer a decimal, as it does in a group (ADR-252). Refusing them, as the
+    /// build once did, was the only way an expression could not take a decimal.
     #[test]
-    fn sum_and_avg_are_not_expression_operators() {
-        for op in ["$sum", "$avg"] {
-            for arg in [
-                Bson::Array(vec![Bson::Int32(1), dec("2.5")]),
-                Bson::String("$a".into()),
-                Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]),
-            ] {
-                let mut expr = Document::new();
-                expr.insert(op, arg.clone());
-                let err = parse(&[doc! { "$project": { "r": expr } }]).unwrap_err().to_string();
-                assert!(err.contains(op) && err.contains("not an expression operator"), "{err}");
-            }
+    fn sum_and_avg_are_expression_operators() {
+        for (op, arg, want) in [
+            ("$sum", Bson::Array(vec![Bson::Int32(1), dec("2.5")]), dec("3.5")),
+            ("$sum", Bson::String("$a".into()), Bson::Int32(6)),
+            ("$sum", Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]), Bson::Int32(3)),
+            ("$avg", Bson::Array(vec![Bson::Int32(1), dec("2.5")]), dec("1.75")),
+            ("$avg", Bson::String("$a".into()), Bson::Double(2.0)),
+            ("$avg", Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]), Bson::Double(1.5)),
+        ] {
+            let mut expr = Document::new();
+            expr.insert(op, arg.clone());
+            let out = run(vec![doc! { "$project": { "r": expr } }], vec![doc! { "a": [1, 2, 3] }]);
+            assert_eq!(out[0].get("r"), Some(&want), "{op} {arg}");
         }
         // The other arithmetic takes a decimal when it evaluates (ADR-252),
         // except `$mod`, which refuses one by name.

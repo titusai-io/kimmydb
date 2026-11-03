@@ -461,7 +461,7 @@ impl FindProjection {
         let Some(array) = &self.positional else {
             return Ok(project(Some(&self.projection), doc));
         };
-        let (_, at) = filter::matches_at(filter, doc)?;
+        let at = filter::position(filter, doc)?;
         self.project_at(at.as_ref(), doc, array)
     }
 
@@ -529,7 +529,7 @@ impl FindProjection {
         let Some(array) = &self.positional else {
             return Ok(project(Some(&self.projection), returned));
         };
-        let (_, at) = filter::matches_at(filter, matched)?;
+        let at = filter::position(filter, matched)?;
         self.project_at(at.as_ref(), returned, array)
     }
 

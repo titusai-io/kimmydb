@@ -3444,8 +3444,10 @@ fn lookup(
 /// the form: the sub-pipeline may do anything at all with the variables, so
 /// there is no single key to index the foreign side by. What keeps it
 /// tolerable: the foreign collection is read from storage once and held for
-/// the duration, and a leading `$match` is applied once before the loop, since
-/// a filter cannot read `let`. That is still true now that `$expr` has put
+/// the duration, and a leading `$match` is applied once before the loop when it
+/// reads no `let` variable and draws no random number, since a filter cannot read
+/// `let` (one that draws is decided for each input document, as one that reads a
+/// variable is). That is still true now that `$expr` has put
 /// variables within a filter's reach (ADR-106 over ADR-105), but the reason is
 /// narrower than "the filter language has no variables": `$match` is parsed by
 /// `filter::parse`, which parses its `$expr` with no names bound, so the only
@@ -3453,7 +3455,8 @@ fn lookup(
 /// foreign document under consideration whether the stage runs here or inside
 /// the loop. A `$$name` from `let` is a parse error, not a wrong answer. If
 /// `$match` ever parses with the sub-pipeline's names in scope, this hoist must
-/// be conditioned on the filter not using them. A join on one key belongs in
+/// be conditioned on the filter not using them, as it is already on its not drawing a
+/// random number (`Lead::analyze`). A join on one key belongs in
 /// the `localField`/`foreignField` form, which is a single pass.
 #[allow(clippy::too_many_arguments)]
 fn lookup_pipeline(
@@ -3500,9 +3503,9 @@ fn lookup_pipeline(
         None => Vec::new(),
     };
 
-    // A leading `$match` that reads no `let` variable is applied once, before the
-    // loop, and its errors are the request's, as they always were. One that does
-    // read a variable (ADR-222) is evaluated per input document, and only its
+    // A leading `$match` that reads no `let` variable and draws no random number is applied
+    // once, before the loop, and its errors are the request's, as they always were. One that
+    // does read a variable (ADR-222) or draw is evaluated per input document, and only its
     // independent part may be applied once: an attempt that can only decline.
     let (first, rest) = match stages.split_first() {
         Some((first @ aggregate::Stage::Match(_), rest)) => (Some(first), rest),

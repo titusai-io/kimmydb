@@ -304,7 +304,8 @@ fn gather_containment(filter: &Filter, out: &mut Vec<(String, PartialOp)>) {
         | Filter::Nor(_)
         | Filter::AlwaysTrue
         | Filter::Expr(_)
-        | Filter::JsonSchema(_) => {}
+        | Filter::JsonSchema(_)
+        | Filter::SampleRate(_) => {}
     }
 }
 
@@ -369,7 +370,8 @@ fn collect(filter: &Filter, out: &mut HashMap<String, Bounds>) {
         | Filter::Nor(_)
         | Filter::AlwaysTrue
         | Filter::Expr(_)
-        | Filter::JsonSchema(_) => {}
+        | Filter::JsonSchema(_)
+        | Filter::SampleRate(_) => {}
     }
 }
 

@@ -47,6 +47,58 @@ pub enum Filter {
     /// Like `$expr` it is a clause on the whole document, and the planner
     /// never reads it: a schema names no key range an index could answer.
     JsonSchema(Schema),
+    /// `{$sampleRate: <rate>}` — matches a document when a draw from `[0, 1)` is below the
+    /// rate, so about that share of the documents it is tried on, a different share each time.
+    ///
+    /// A clause on the whole document at the top level of a filter only (not in an
+    /// `$elemMatch`, under a field or in an `arrayFilters` entry), as in the reference. The
+    /// planner never reads it. The draw is [`expr::random_draw`], the source `$rand` reads.
+    SampleRate(f64),
+}
+
+impl Filter {
+    /// Whether matching draws a random number anywhere in the filter: a `$sampleRate`, or an
+    /// `$expr` holding `$rand`. Such a filter is not a function of the document, so what it
+    /// decides for one document may not be reused for another (a `$lookup` sub-pipeline's
+    /// leading `$match` is applied once to the foreign documents when it is not).
+    pub fn draws_random(&self) -> bool {
+        match self {
+            Filter::SampleRate(_) => true,
+            Filter::AlwaysTrue | Filter::JsonSchema(_) => false,
+            Filter::And(branches) | Filter::Or(branches) => {
+                branches.iter().any(Filter::draws_random)
+            }
+            Filter::Nor(branches) => branches.iter().any(Filter::draws_random),
+            Filter::Field { conditions, .. } => conditions.iter().any(condition_draws_random),
+            Filter::Expr(e) => e.draws_random(),
+        }
+    }
+}
+
+fn condition_draws_random(condition: &Condition) -> bool {
+    match condition {
+        Condition::ElemMatch(inner) => inner.draws_random(),
+        Condition::Not(inner) => condition_draws_random(inner),
+        Condition::Both(a, b) => condition_draws_random(a) || condition_draws_random(b),
+        // Written out, so that a condition that holds a filter or an expression must say here
+        // whether it draws.
+        Condition::AlwaysTrue
+        | Condition::Eq(_)
+        | Condition::Ne(_)
+        | Condition::Gt(_)
+        | Condition::Gte(_)
+        | Condition::Lt(_)
+        | Condition::Lte(_)
+        | Condition::In(_)
+        | Condition::Nin(_)
+        | Condition::Exists(_)
+        | Condition::Type(_)
+        | Condition::Regex(_)
+        | Condition::All(_)
+        | Condition::Size(_)
+        | Condition::Mod { .. }
+        | Condition::Bits { .. } => false,
+    }
 }
 
 /// The clauses of an `$and` or `$or`, in the order they are evaluated, and
@@ -206,10 +258,13 @@ struct Scope<'a> {
     /// names are a `$lookup` sub-pipeline's `let` variables, which an expression
     /// reads beside the document.
     element: bool,
+    /// The filter is the body of an `$elemMatch`, or a clause under one: not the top level of
+    /// a document's filter, where `$sampleRate` may stand.
+    nested: bool,
 }
 
 impl Scope<'_> {
-    const NONE: Scope<'static> = Scope { vars: &[], element: false };
+    const NONE: Scope<'static> = Scope { vars: &[], element: false, nested: false };
 }
 
 /// [`parse`] for a `$match` in a `$lookup` sub-pipeline: the names in `vars` are the
@@ -218,7 +273,7 @@ impl Scope<'_> {
 /// beside the document's fields. A bare `"$$name"` string value is still a string
 /// here; the pipeline parser refuses it before this runs.
 pub fn parse_in_scope(doc: &Document, vars: &[String]) -> Result<Filter> {
-    parse_scoped(doc, Scope { vars, element: false })
+    parse_scoped(doc, Scope { vars, element: false, nested: false })
 }
 
 /// [`parse`] for an `arrayFilters` entry (ADR-209): the element is bound to
@@ -230,7 +285,7 @@ pub fn parse_in_scope(doc: &Document, vars: &[String]) -> Result<Filter> {
 /// document (a field, `$$ROOT`, `$$CURRENT`) is refused there, so that the
 /// element has one spelling.
 pub fn parse_with_vars(doc: &Document, vars: &[String]) -> Result<Filter> {
-    parse_scoped(doc, Scope { vars, element: true })
+    parse_scoped(doc, Scope { vars, element: true, nested: false })
 }
 
 fn parse_scoped(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
@@ -317,6 +372,20 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
             Filter::Expr(Box::new(expr))
         }
         "jsonSchema" => Filter::JsonSchema(Schema::parse(value)?),
+        "sampleRate" => {
+            if scope.element {
+                return Err(Error::InvalidQuery(
+                    "Cannot use an expression without a top-level field name in arrayFilters"
+                        .into(),
+                ));
+            }
+            if scope.nested {
+                return Err(Error::InvalidQuery(
+                    "$sampleRate can only be applied to the top-level document".into(),
+                ));
+            }
+            Filter::SampleRate(sample_rate(value)?)
+        }
         // `$not` is only meaningful applied to a field's operators; at the top
         // level Mongo rejects it too, and the clearer error is worth it.
         "not" => {
@@ -328,6 +397,20 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
             return Err(Error::UnsupportedOperator { operator: format!("${other}"), reason: None });
         }
     })
+}
+
+/// The rate of `$sampleRate`: a number from 0 to 1, a `Decimal128` as its nearest double.
+fn sample_rate(value: &Bson) -> Result<f64> {
+    let Some(rate) = crate::accumulators::numeric(value) else {
+        return Err(Error::InvalidQuery("argument to $sampleRate must be a numeric type".into()));
+    };
+    // A NaN is in no range.
+    if !(0.0..=1.0).contains(&rate) {
+        return Err(Error::InvalidQuery(
+            "numeric argument to $sampleRate must be in [0, 1]".into(),
+        ));
+    }
+    Ok(rate)
 }
 
 /// Decide whether a field's value is an operator document or a literal.
@@ -394,7 +477,8 @@ fn parse_conditions(path: &str, value: &Bson, scope: Scope<'_>) -> Result<Vec<Co
 /// fields of one element. MongoDB refuses `$expr` under `$elemMatch` outright;
 /// accepting it here is a strict superset, noted in `docs/deviations.md`.
 fn parse_elem_match(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
-    const DOCUMENT_LEVEL: [&str; 5] = ["$and", "$or", "$nor", "$expr", "$jsonSchema"];
+    const DOCUMENT_LEVEL: [&str; 6] =
+        ["$and", "$or", "$nor", "$expr", "$jsonSchema", "$sampleRate"];
     let scalar_form = !doc.is_empty()
         && doc.keys().all(|k| k.starts_with('$') && !DOCUMENT_LEVEL.contains(&k.as_str()));
 
@@ -406,7 +490,7 @@ fn parse_elem_match(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
             conditions: parse_conditions("", &Bson::Document(doc.clone()), scope)?,
         });
     }
-    parse_scoped(doc, scope)
+    parse_scoped(doc, Scope { nested: true, ..scope })
 }
 
 fn parse_condition(
@@ -899,8 +983,11 @@ pub struct ArrayPosition {
 /// filter evaluates them) leave the first element
 /// that satisfies the last of them. An element is tested as [`matches`] tests
 /// it, one level into the array. An `$or` records from the first branch, in
-/// the order written, that holds; the reference passes no match details to the
-/// branches of an `$or`, so this is an extension (deviations register). `$nor`,
+/// the order written, that holds and does not draw a random number (a branch
+/// that does cannot be asked again after the match, and is passed over, so a
+/// document that matched only through it gives no position); the reference
+/// passes no match details to the branches of an `$or`, so this is an
+/// extension (deviations register). `$nor`,
 /// `$not`, `$ne`, `$nin`, `$exists`, `$size`, `$all` and `$expr` record
 /// nothing, because what they report is not an element that satisfied
 /// anything. `None` means the document matched without an array element being
@@ -909,14 +996,27 @@ pub fn matches_at(filter: &Filter, doc: &Document) -> Result<(bool, Option<Array
     if !matches(filter, doc)? {
         return Ok((false, None));
     }
+    Ok((true, position(filter, doc)?))
+}
+
+/// The element of an array that `filter` matched in `doc`, which it has matched already: the
+/// part of [`matches_at`] after the match. A caller that has matched the document (the
+/// positional `$` of an update, a positional projection) asks this and not `matches_at`, which
+/// would match again, and a `$sampleRate` or a `$rand` in the filter would draw again and
+/// could decide the other way.
+pub fn position(filter: &Filter, doc: &Document) -> Result<Option<ArrayPosition>> {
     let mut at = None;
     record_position(filter, doc, &mut at).map_err(|e| unevaluable(e, doc.get("_id"), ""))?;
-    Ok((true, at))
+    Ok(at)
 }
 
 fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPosition>) -> Result<()> {
     match filter {
-        Filter::AlwaysTrue | Filter::Nor(_) | Filter::Expr(_) | Filter::JsonSchema(_) => {}
+        Filter::AlwaysTrue
+        | Filter::Nor(_)
+        | Filter::Expr(_)
+        | Filter::JsonSchema(_)
+        | Filter::SampleRate(_) => {}
         Filter::And(branches) => {
             for branch in branches.in_written_order() {
                 record_position(branch, doc, at)?;
@@ -927,8 +1027,9 @@ fn record_position(filter: &Filter, doc: &Document, at: &mut Option<ArrayPositio
             // evaluated for this document (an `$expr` that fails on it) did not decide the
             // match, as `matches` itself defers it, and the next is tried; an error that is
             // about the request and not the value (the deadline, the node's stop, the
-            // memory budget, a broken invariant) is not "did not decide" and goes up.
-            for branch in branches.in_written_order() {
+            // memory budget, a broken invariant) is not "did not decide" and goes up. A branch
+            // that draws a random number cannot be asked again, and is passed over.
+            for branch in branches.in_written_order().filter(|b| !b.draws_random()) {
                 match evaluate(branch, doc, &[]) {
                     Ok(true) => {
                         record_position(branch, doc, at)?;
@@ -1106,7 +1207,7 @@ pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
         Filter::Nor(branches) => branches.iter().any(|f| reads_variable(f, names)),
         Filter::Field { conditions, .. } => conditions.iter().any(|c| condition(c, names)),
         Filter::Expr(e) => e.reads_variable(names),
-        Filter::JsonSchema(_) => false,
+        Filter::JsonSchema(_) | Filter::SampleRate(_) => false,
     }
 }
 
@@ -1118,7 +1219,7 @@ fn filter_has_expr(filter: &Filter) -> bool {
         Filter::Nor(branches) => branches.iter().any(filter_has_expr),
         Filter::Field { conditions, .. } => conditions.iter().any(condition_has_expr),
         Filter::Expr(_) => true,
-        Filter::JsonSchema(_) => false,
+        Filter::JsonSchema(_) | Filter::SampleRate(_) => false,
     }
 }
 
@@ -1149,6 +1250,7 @@ fn evaluate(filter: &Filter, doc: &Document, vars: &[expr::Binding<'_>]) -> Resu
         }
         Filter::Expr(e) => expr_matches(e, doc, vars),
         Filter::JsonSchema(schema) => Ok(schema.is_valid(doc)),
+        Filter::SampleRate(rate) => Ok(expr::random_draw() < *rate),
     }
 }
 
@@ -1373,6 +1475,8 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
         Filter::JsonSchema(schema) => {
             Ok(matches!(element, Bson::Document(d) if schema.is_valid(d)))
         }
+        // Refused when an `arrayFilters` entry is parsed, so never reached.
+        Filter::SampleRate(_) => Ok(false),
     }
 }
 
@@ -1448,6 +1552,8 @@ fn matches_scalar_against(
         Filter::Expr(_) => Ok(false),
         // A scalar is not a document, which is all a schema describes.
         Filter::JsonSchema(_) => Ok(false),
+        // Refused inside an `$elemMatch` when the filter is parsed, so never reached.
+        Filter::SampleRate(_) => Ok(false),
     }
 }
 
@@ -3500,5 +3606,203 @@ mod scoped {
         assert!(read(doc! {"l": {"$not": {"$elemMatch": {"$expr": {"$eq": ["$q", "$$v"]}}}}}));
         assert!(!read(doc! {"$expr": {"$eq": ["$k", 1]}, "a": {"$gt": 1}}));
         assert!(!read(doc! {}));
+    }
+}
+
+#[cfg(test)]
+mod draws_random_and_branch_equality_tests {
+    use bson::doc;
+
+    use super::*;
+
+    fn parsed(query: Document) -> Filter {
+        parse(&query).unwrap_or_else(|e| panic!("{query}: {e}"))
+    }
+
+    /// A condition that draws, held in each way a condition can hold a filter or an expression.
+    fn drawing() -> Vec<(&'static str, Condition)> {
+        let sample = Filter::SampleRate(0.5);
+        let rand = parsed(doc! { "$expr": { "$lt": [{ "$rand": {} }, 0.5] } });
+        vec![
+            ("an $elemMatch holding a $sampleRate", Condition::ElemMatch(Box::new(sample.clone()))),
+            ("an $elemMatch holding an $expr with $rand", Condition::ElemMatch(Box::new(rand))),
+            (
+                "a $not of an $elemMatch that draws",
+                Condition::Not(Box::new(Condition::ElemMatch(Box::new(sample.clone())))),
+            ),
+        ]
+    }
+
+    fn plain() -> Vec<(&'static str, Condition)> {
+        let plain = parsed(doc! { "$expr": { "$lt": ["$q", 5] } });
+        vec![
+            (
+                "an $elemMatch holding an $expr that does not draw",
+                Condition::ElemMatch(Box::new(plain)),
+            ),
+            (
+                "an $elemMatch holding a field",
+                Condition::ElemMatch(Box::new(parsed(doc! { "q": 1 }))),
+            ),
+            ("a $not of one", Condition::Not(Box::new(Condition::Eq(Bson::Int32(1))))),
+            ("an equality", Condition::Eq(Bson::Int32(1))),
+        ]
+    }
+
+    #[test]
+    fn a_condition_that_holds_a_filter_or_an_expression_that_draws_draws() {
+        for (what, condition) in drawing() {
+            assert!(condition_draws_random(&condition), "{what}");
+            // And so does the filter that holds it, in a field's conditions and under `$and`.
+            let field = Filter::Field { path: "a".into(), conditions: vec![condition.clone()] };
+            assert!(field.draws_random(), "{what}, in a field");
+            assert!(
+                conjunction(vec![parsed(doc! { "b": 1 }), field]).draws_random(),
+                "{what}, under $and"
+            );
+        }
+        for (what, condition) in plain() {
+            assert!(!condition_draws_random(&condition), "{what}");
+            let field = Filter::Field { path: "a".into(), conditions: vec![condition] };
+            assert!(!field.draws_random(), "{what}, in a field");
+        }
+    }
+
+    #[test]
+    fn both_needs_only_one_of_its_two_conditions_to_draw() {
+        let both = |a: Condition, b: Condition| Condition::Both(Box::new(a), Box::new(b));
+        for (what, drawn) in drawing() {
+            for (other, quiet) in plain() {
+                assert!(
+                    condition_draws_random(&both(drawn.clone(), quiet.clone())),
+                    "{what}, then {other}"
+                );
+                assert!(
+                    condition_draws_random(&both(quiet, drawn.clone())),
+                    "{other}, then {what}"
+                );
+            }
+            // Drawing in both, and in a nested `Both`.
+            assert!(condition_draws_random(&both(drawn.clone(), drawn.clone())));
+            let nested = both(Condition::Eq(Bson::Null), both(Condition::AlwaysTrue, drawn));
+            assert!(condition_draws_random(&nested), "{what}, nested");
+        }
+        for (a, first) in plain() {
+            for (b, second) in plain() {
+                assert!(!condition_draws_random(&both(first.clone(), second)), "{a}, then {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_other_kind_of_condition_draws() {
+        // One filter for every operator a condition is made of, parsed, so each variant that
+        // `condition_draws_random` lists is held to false through the filter that holds it.
+        for query in [
+            doc! { "a": 1 },
+            doc! { "a": { "$ne": 1 } },
+            doc! { "a": { "$gt": 1, "$lt": 9 } },
+            doc! { "a": { "$gte": 1, "$lte": 9 } },
+            doc! { "a": { "$in": [1, 2] } },
+            doc! { "a": { "$nin": [1, 2] } },
+            doc! { "a": { "$exists": true } },
+            doc! { "a": { "$type": "int" } },
+            doc! { "a": { "$regex": "x" } },
+            doc! { "a": { "$all": [1, 2] } },
+            doc! { "a": { "$size": 2 } },
+            doc! { "a": { "$mod": [2, 1] } },
+            doc! { "a": { "$bitsAllSet": 3 } },
+            doc! { "a": { "$not": { "$gt": 1, "$lt": 5 } } },
+            doc! { "a": { "$elemMatch": { "b": 1 } } },
+            doc! { "$and": [{ "a": 1 }, { "$or": [{ "b": 2 }, { "c": 3 }] }] },
+            doc! { "$nor": [{ "a": 1 }] },
+        ] {
+            assert!(!parsed(query.clone()).draws_random(), "{query}");
+        }
+        for condition in [Condition::AlwaysTrue, Condition::Size(2), Condition::Exists(true)] {
+            assert!(!condition_draws_random(&condition), "{condition:?}");
+        }
+        // And the ones that do, through the parser: an `$expr` holding `$rand`, under an
+        // `$elemMatch`, a `$not`, an `$or`, an `$and` and a `$nor`.
+        let rand = doc! { "$expr": { "$lt": [{ "$rand": {} }, 0.5] } };
+        for query in [
+            rand.clone(),
+            doc! { "a": { "$elemMatch": rand.clone() } },
+            doc! { "a": { "$not": { "$elemMatch": rand.clone() } } },
+            doc! { "$or": [{ "b": 1 }, rand.clone()] },
+            doc! { "$and": [{ "b": 1 }, rand.clone()] },
+            doc! { "$nor": [rand.clone()] },
+            doc! { "$sampleRate": 0.5 },
+        ] {
+            assert!(parsed(query.clone()).draws_random(), "{query}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `Branches` equality: the same clauses in the same evaluation order
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_parses_of_a_query_are_equal_and_two_different_queries_are_not() {
+        let and = |clauses: Vec<Document>| {
+            parsed(doc! { "$and": clauses.into_iter().map(Bson::Document).collect::<Vec<_>>() })
+        };
+        let or = |clauses: Vec<Document>| {
+            parsed(doc! { "$or": clauses.into_iter().map(Bson::Document).collect::<Vec<_>>() })
+        };
+        let (a, b, c) = (doc! { "a": 1 }, doc! { "b": 2 }, doc! { "c": 3 });
+        // Equal: the same text twice, for an `$and` and an `$or`.
+        assert_eq!(and(vec![a.clone(), b.clone()]), and(vec![a.clone(), b.clone()]));
+        assert!(and(vec![a.clone(), b.clone()]) == and(vec![a.clone(), b.clone()]));
+        assert_eq!(or(vec![a.clone(), b.clone()]), or(vec![a.clone(), b.clone()]));
+        // Different: another clause, another number of clauses, another order of evaluation,
+        // and an `$and` against an `$or` of the same clauses.
+        assert!(and(vec![a.clone(), b.clone()]) != and(vec![a.clone(), c.clone()]));
+        assert!(and(vec![a.clone(), b.clone()]) != and(vec![a.clone(), b.clone(), c.clone()]));
+        assert!(and(vec![a.clone(), b.clone()]) != and(vec![b.clone(), a.clone()]));
+        assert!(and(vec![a.clone(), b.clone()]) != or(vec![a.clone(), b.clone()]));
+        assert!(or(vec![a.clone()]) != or(vec![doc! { "a": 2 }]));
+    }
+
+    #[test]
+    fn branches_are_equal_by_evaluation_order_and_not_by_the_order_written() {
+        // `cheap_first` puts the clause holding an `$expr` after the others, so the two written
+        // orders are one list in evaluation order: equal, though they were written apart, and
+        // `in_written_order` still tells them apart.
+        let expr = doc! { "$expr": { "$gt": ["$a", "$b"] } };
+        let plain = doc! { "c": 1 };
+        let written_expr_first = parsed(doc! { "$and": [expr.clone(), plain.clone()] });
+        let written_plain_first = parsed(doc! { "$and": [plain.clone(), expr.clone()] });
+        assert_eq!(written_expr_first, written_plain_first);
+        let (Filter::And(first), Filter::And(second)) = (&written_expr_first, &written_plain_first)
+        else {
+            panic!("an $and");
+        };
+        assert!(first == second);
+        let order = |branches: &Branches| {
+            branches.in_written_order().map(|f| matches!(f, Filter::Expr(_))).collect::<Vec<_>>()
+        };
+        assert_eq!(order(first), vec![true, false]);
+        assert_eq!(order(second), vec![false, true]);
+        // And a list that differs in a clause is not equal to either.
+        let other = parsed(doc! { "$and": [expr, doc! { "c": 2 }] });
+        assert_ne!(other, written_expr_first);
+        let Filter::And(third) = &other else { panic!("an $and") };
+        assert!(third != first);
+        assert!(!(third == second));
+    }
+
+    #[test]
+    fn branches_made_of_the_same_clauses_compare_by_those_clauses() {
+        let clauses = || vec![Filter::SampleRate(0.5), parsed(doc! { "a": 1 })];
+        let one: Branches = clauses().into();
+        let same: Branches = clauses().into();
+        let different: Branches = vec![Filter::SampleRate(0.25), parsed(doc! { "a": 1 })].into();
+        let shorter: Branches = vec![Filter::SampleRate(0.5)].into();
+        assert!(one == same);
+        assert!(!(one != same));
+        assert!(one != different);
+        assert!(one != shorter);
+        assert!(shorter != one);
     }
 }

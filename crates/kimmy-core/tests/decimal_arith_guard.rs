@@ -6,7 +6,7 @@
 //! order, and it may not format a number to digits (a formatter's rounding is
 //! not a documented contract). The file's tests live beside it in
 //! `arith_tests.rs`, which may use doubles freely: the guard reads this one file.
-//! The same holds `decimal/arith/func.rs`, the decimal functions, to the same list.
+//! The same holds `decimal/arith/func.rs`, the decimal functions, and its child `func/trig.rs`, to the same list.
 
 const BANNED: &[&str] = &[
     "f32",
@@ -72,6 +72,14 @@ fn the_arithmetic_names_no_float_and_no_formatter() {
 #[test]
 fn the_functions_name_no_float_and_no_formatter() {
     let found = scan("src/decimal/arith/func.rs", BANNED_FUNC);
+    assert!(found.is_empty(), "integer-only code names a banned token:\n{}", found.join("\n"));
+}
+
+/// The trigonometric and hyperbolic functions, a child of the functions, are integer-only
+/// too.
+#[test]
+fn the_trigonometric_functions_name_no_float_and_no_formatter() {
+    let found = scan("src/decimal/arith/func/trig.rs", BANNED_FUNC);
     assert!(found.is_empty(), "integer-only code names a banned token:\n{}", found.join("\n"));
 }
 

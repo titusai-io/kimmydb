@@ -52,6 +52,9 @@ mod facet_tests;
 #[cfg(test)]
 mod fill_tests;
 #[cfg(test)]
+mod fold_tests;
+
+#[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
 mod json_schema_filter_tests;
@@ -59,6 +62,8 @@ mod json_schema_filter_tests;
 mod math_tests;
 #[cfg(test)]
 mod positional_tests;
+#[cfg(test)]
+mod random_tests;
 #[cfg(test)]
 mod sink_tests;
 #[cfg(test)]
@@ -68,6 +73,9 @@ mod stage_reference_tests;
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]
+mod trig_tests;
+
+#[cfg(test)]
 mod update_pipeline_tests;
 #[cfg(test)]
 mod window_deadline_tests;
@@ -76,7 +84,7 @@ mod window_tests;
 
 pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};
-pub use filter::{ArrayPosition, Condition, Filter, matches, matches_at};
+pub use filter::{ArrayPosition, Condition, Filter, matches, matches_at, position};
 pub use json_schema::Schema;
 pub use plan::{IndexPlan, choose};
 pub use shape::{FindProjection, Projection, ProjectionPaths, SortKey};
