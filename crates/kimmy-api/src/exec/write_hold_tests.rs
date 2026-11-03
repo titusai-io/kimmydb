@@ -369,6 +369,7 @@ fn bytes_of(document: &Document, with_body: bool) -> usize {
 }
 
 #[test]
+#[ignore = "time (33 s in a debug build); run in release by CI's decimal job"]
 fn the_documents_a_chunk_matches_are_charged_on_the_lease_by_the_byte() {
     // 10,101 entries in chunks of 1,000: the lease is made at the 10,001st key of the first
     // gather, and the first chunk holds all the keys and, at the most, 1,000 matched documents

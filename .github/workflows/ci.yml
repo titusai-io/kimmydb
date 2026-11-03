@@ -664,6 +664,21 @@ jobs:
             --ignored --test-threads 1 2>&1 | tee cost-query.log
           grep -q 'test result: ok. 2 passed' cost-query.log
 
+      # Two tests of what a filtered write holds under the memory pool (ADR-270's
+      # second addendum) that a debug build runs for half a minute or more each:
+      # the estimate of a gathered key against what the gather holds, under a
+      # counting allocator, and the charge of a chunk's matched documents to the
+      # byte. Ignored in the default run, and seconds in release.
+      - name: Write-hold ceilings
+        shell: bash
+        run: |
+          cargo test -p kimmy-storage --release --test gather_calibration -- \
+            --ignored --test-threads 1 2>&1 | tee hold-gather.log
+          grep -q 'test result: ok. 1 passed' hold-gather.log
+          cargo test -p kimmy-api --release --lib the_documents_a_chunk_matches -- \
+            --ignored --test-threads 1 2>&1 | tee hold-chunk.log
+          grep -q 'test result: ok. 1 passed' hold-chunk.log
+
       # The golden corpus and the R1 properties, in release: the shipped
       # profile wraps on integer overflow, and the test profile panics, so the
       # corpus is the one place the release arithmetic is held to its bytes.

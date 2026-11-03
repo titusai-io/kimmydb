@@ -28,7 +28,8 @@
 //! Its own binary, with a counting `#[global_allocator]`, for the reason
 //! `kimmy-api/tests/memory.rs` gives: an allocator is a property of the whole test binary. One
 //! test function, so nothing else allocates while a gather is measured. Run it with
-//! `--nocapture` to see the table.
+//! `--nocapture` to see the table. Ignored by default, as a debug build takes close
+//! to a minute; CI runs it in release with `--ignored`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cmp::Ordering;
@@ -178,6 +179,7 @@ fn gather(
 }
 
 #[test]
+#[ignore = "time (54 s in a debug build); run in release by CI's decimal job"]
 fn the_estimate_of_a_gathered_key_is_at_least_what_it_holds() {
     // 32,769 is one past a power of two: the array the keys are pushed into has just
     // doubled, which is its worst case against the keys it holds.
