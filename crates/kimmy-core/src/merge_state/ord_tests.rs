@@ -1131,6 +1131,40 @@ fn the_read_equals_the_models_on_random_states() {
     assert!(two_lives >= 20 && maps >= 100, "{two_lives} {maps}");
 }
 
+/// O1-6 of the O1 review. The clamp reads the winner's `obs` only, which is the model with ABSORBED
+/// off: the Rust counter cell has no `absorbed` yet. On the model's random states with ABSORBED on, the
+/// order (and the values) differ from the Rust's on a few: 23 of the 2,094 distinct states of the
+/// fixture's runs; the four smallest are kept (the first is the review's seed 155 family). The Rust
+/// gives the ABSORBED-off document on all of them, which this test pins.
+#[test]
+fn the_read_gives_the_absorbed_off_document_where_the_q6_rule_would_differ() {
+    let j: J = serde_json::from_str(RANDOM_STATES).unwrap();
+    let o = JoinOptions::default();
+    let kept = j["absorbed"].as_array().unwrap();
+    assert_eq!((kept.len(), j["absorbed_differing_states"].as_u64()), (4, Some(23)));
+    for (k, e) in kept.iter().enumerate() {
+        let s = state(&e["state"]);
+        let got = flatten(&s.ordered_document(&o).unwrap());
+        assert_eq!(got, expected_flat(&e["expected_off"]), "kept state {k}, seed {}", e["seed"]);
+        assert_ne!(expected_flat(&e["expected_on"]), got, "the Q6 rule makes a difference here");
+    }
+}
+
+/// The same states against the model with ABSORBED ON (the A2 design's Q6 rule): the Rust differs, as
+/// it must until the counter cell lands (per-slot `absorbed`, the slot layout the manager has not frozen).
+/// Pinned so that the counter-cell step must flip this test, not rediscover the divergence.
+#[test]
+#[ignore = "known divergence: the Rust counter cell has no `absorbed` (Q6); the counter-cell step flips this"]
+fn the_read_equals_the_model_with_absorbed_on() {
+    let j: J = serde_json::from_str(RANDOM_STATES).unwrap();
+    let o = JoinOptions::default();
+    for (k, e) in j["absorbed"].as_array().unwrap().iter().enumerate() {
+        let s = state(&e["state"]);
+        let got = flatten(&s.ordered_document(&o).unwrap());
+        assert_eq!(got, expected_flat(&e["expected_on"]), "kept state {k}, seed {}", e["seed"]);
+    }
+}
+
 // ---- the laws on the entries of the model's own runs ----------------------------------
 
 /// `probe_ord_join_laws` of the model: the distinct order entries of the writer entries of 150 nested
