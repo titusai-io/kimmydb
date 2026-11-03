@@ -1341,7 +1341,10 @@ fn allowed_ids(
 
     let parsed = kimmy_query::filter::parse(&json_to_document(filter)?)?;
     let source = crate::exec::collection(state, db, coll)?;
-    Ok(Some(filter_ids(state, &source, &parsed, budget)?))
+    // Under `blocking`: the walks of the read are, but an `_id` lookup is read inline, and the
+    // lease of the admitted set waits for a full pool (see `filter_ids`), which must not hold
+    // an async worker for the whole of a request's deadline.
+    Ok(Some(kimmy_storage::blocking(|| filter_ids(state, &source, &parsed, budget))?))
 }
 
 /// The ids a filter matches, through the executor's planner-backed read.

@@ -2846,23 +2846,27 @@ fn scan_pipeline(
             want: pipeline::source_bound(stages),
             hold: Some(&keys),
         };
+        // Under `blocking` as a whole: the walks below are, but an `_id` lookup is read inline
+        // there, and what the chain and the lease charge there can wait for the pool.
         let stats = if full {
             QueryStats::planned(&plan_access(filter, &meta.indexes))
         } else {
-            visit_matching_bounded(
-                state,
-                meta,
-                filter,
-                Order::ById { after: None },
-                bounds,
-                |_, doc| match chain.push(doc) {
-                    Ok(flow) => Ok(flow == pipeline::Flow::More),
-                    Err(e) => {
-                        failed = Some(e);
-                        Ok(false)
-                    }
-                },
-            )?
+            kimmy_storage::blocking(|| {
+                visit_matching_bounded(
+                    state,
+                    meta,
+                    filter,
+                    Order::ById { after: None },
+                    bounds,
+                    |_, doc| match chain.push(doc) {
+                        Ok(flow) => Ok(flow == pipeline::Flow::More),
+                        Err(e) => {
+                            failed = Some(e);
+                            Ok(false)
+                        }
+                    },
+                )
+            })?
         };
         if let Some(e) = failed {
             return Err(e);
@@ -2881,18 +2885,21 @@ fn scan_pipeline(
         let keys = IndexKeys::new(limits.buffer.lease("the index range of $match"));
         let ceiling = Some(limits.max_documents + 1);
         let bounds = ScanBounds { stop_after: ceiling, want: ceiling, hold: Some(&keys) };
-        let stats = visit_matching_bounded(
-            state,
-            meta,
-            filter,
-            Order::ById { after: None },
-            bounds,
-            |_, doc| {
-                read.charge_doc(&doc)?;
-                docs.push(doc);
-                Ok(true)
-            },
-        )?;
+        // Under `blocking`, as the streaming read above is: `read` can wait for the pool.
+        let stats = kimmy_storage::blocking(|| {
+            visit_matching_bounded(
+                state,
+                meta,
+                filter,
+                Order::ById { after: None },
+                bounds,
+                |_, doc| {
+                    read.charge_doc(&doc)?;
+                    docs.push(doc);
+                    Ok(true)
+                },
+            )
+        })?;
         // The first stage charges what it is given as its own input, so the read gives
         // its bytes back as the documents are handed over.
         drop(read);
