@@ -7,7 +7,10 @@
 //! One difference is on purpose and named where it shows: the model's implicit map marker (a
 //! leaf write that creates the maps above it also writes a marker there, decision D-1) is not
 //! built here, so a probe whose expected records include the marker's `clash` expects one record
-//! less. Each rule has a mutation switch of [`JoinOptions`]; `mutants_are_caught` turns each on
+//! less. That is an EXPECTED DIFFERENCE keyed to Q2's implicit-marker write rule (see
+//! [`EXPECTED_DIFFERENCE_Q2`]): each place it shows asserts what Rust does today, and has an
+//! `#[ignore]`d companion that asserts what the model does. When the rule lands the Rust-today
+//! assertions fail, and the failure says what to flip. Each rule has a mutation switch of [`JoinOptions`]; `mutants_are_caught` turns each on
 //! against the scenario that pins it.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,6 +115,82 @@ fn q3_marker_keeps_concurrent_child(o: &JoinOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// What differs between Rust and the model while Q2's implicit-marker write rule is not built.
+/// Three places carry it: the "child newer" case of `q3_scalar_over_map_type_rule` (the model has
+/// one record more: the marker's `clash` of `a`), `an_emptied_implicit_map_vanishes_today` (the
+/// model keeps the implicit marker as a cell that does not show), and the two `#[ignore]`d
+/// companions `model_child_newer_has_the_implicit_markers_clash` and
+/// `model_leaf_write_leaves_an_implicit_marker`. When the rule lands: the Rust-today assertions
+/// fail, flip them to the companions' expectations, remove the `#[ignore]` and this constant.
+const EXPECTED_DIFFERENCE_Q2: &str = "expected difference from the model: the Q2 implicit-marker write rule is not built; \
+     if it has landed, flip the Rust-today assertions to the companions' and un-ignore them";
+
+/// "child newer": `$set a 5` (A, older) against `$set a.b 1` (B, newer), neither having seen the
+/// other, over `{x: 1}`: `a` is a map showing only `b`, with the given loss records.
+fn scalar_over_map_child_newer(
+    o: &JoinOptions,
+    records: &[(LossKind, &str, char)],
+) -> Result<(), String> {
+    two(
+        o,
+        &[("x", i(1))],
+        &set("a", i(5)),
+        &set("a.b", i(1)),
+        (0, 9),
+        &[("a", M), ("a.b", i(1)), ("x", i(1))],
+        records,
+    )
+}
+
+/// The model's behaviour for "child newer": B's leaf write made `a`'s implicit marker, which
+/// beats A's older scalar and is reported as a `clash`, beside the `typeClash`.
+#[test]
+#[ignore = "waits on Q2 implicit-marker write rule"]
+fn model_child_newer_has_the_implicit_markers_clash() {
+    ok(scalar_over_map_child_newer(&opts(), &[(TypeClash, "a", 'a'), (Clash, "a", 'a')]));
+}
+
+/// A leaf write that creates the map above it: `{x: 1}`, then `$set a.b 1`, then `$unset a.b`.
+fn leaf_write_then_unset() -> Mem {
+    let mut m = Mem::new('A', &opts());
+    m.ins(&[("x", i(1))], 0).unwrap();
+    m.set_at(&np("a.b"), i(1), 0).unwrap();
+    m
+}
+
+/// Rust today: the leaf write puts no cell at `a`, so once `a.b` is unset nothing is left of
+/// `a` and it vanishes. EXPECTED DIFFERENCE (Q2 implicit-marker write rule): the model writes an
+/// implicit marker at `a` with the leaf write, and an emptied implicit map vanishes from the
+/// read side while its marker stays in the state.
+#[test]
+fn an_emptied_implicit_map_vanishes_today() {
+    let mut m = leaf_write_then_unset();
+    let life = m.w.alive()[0];
+    assert!(
+        !m.w.state.regs.contains_key(&(life, np("a"))),
+        "{EXPECTED_DIFFERENCE_Q2}: a cell at `a` after a leaf write"
+    );
+    assert_eq!(
+        m.visible(),
+        want(&[("a", M), ("a.b", i(1)), ("x", i(1))]),
+        "a map shows while it has a child"
+    );
+    m.unset_at(&np("a.b"), 0).unwrap();
+    assert_eq!(m.visible(), want(&[("x", i(1))]), "the emptied implicit map vanishes");
+}
+
+/// The model's behaviour: the leaf write left an implicit marker cell at `a`; it does not show
+/// once `a.b` is unset.
+#[test]
+#[ignore = "waits on Q2 implicit-marker write rule"]
+fn model_leaf_write_leaves_an_implicit_marker() {
+    let mut m = leaf_write_then_unset();
+    let life = m.w.alive()[0];
+    assert!(m.w.state.regs.contains_key(&(life, np("a"))), "a cell at `a` after a leaf write");
+    m.unset_at(&np("a.b"), 0).unwrap();
+    assert_eq!(m.visible(), want(&[("x", i(1))]), "the emptied implicit map vanishes");
+}
+
 /// probes6.py `probe_Q3_scalar_over_map_type_rule`: the newer side wins, the side it hides is the
 /// typeClash. In the model's "child newer" case the child write also made `a`'s implicit marker,
 /// which beats the older scalar and is reported as a `clash`; without that marker only the
@@ -127,16 +206,10 @@ fn q3_scalar_over_map_type_rule(o: &JoinOptions) -> Result<(), String> {
         &[(TypeClash, "a.b", 'b')],
     )
     .map_err(|e| format!("scalar newer: {e}"))?;
-    two(
-        o,
-        &[("x", i(1))],
-        &set("a", i(5)),
-        &set("a.b", i(1)),
-        (0, 9),
-        &[("a", M), ("a.b", i(1)), ("x", i(1))],
-        &[(TypeClash, "a", 'a')],
-    )
-    .map_err(|e| format!("child newer: {e}"))?;
+    // EXPECTED DIFFERENCE from the model (Q2 implicit-marker write rule): Rust has no implicit
+    // marker, so the model's second record (the marker's `clash` of `a`) is absent here.
+    scalar_over_map_child_newer(o, &[(TypeClash, "a", 'a')])
+        .map_err(|e| format!("child newer (Rust today; {EXPECTED_DIFFERENCE_Q2}): {e}"))?;
     // a counter child hidden by a newer scalar, and a scalar over a map the writer saw
     let acct = [("x", i(1)), ("acct", sub(&[("balance", i(100))]))];
     two(
