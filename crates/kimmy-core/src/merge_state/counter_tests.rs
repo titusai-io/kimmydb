@@ -425,6 +425,27 @@ fn an_inc_of_a_double_base_that_leaves_the_bytes_alone_writes_nothing() {
 }
 
 #[test]
+fn an_inc_of_zero_on_a_negative_zero_writes_because_the_bits_differ() {
+    // The one case where comparing by bits and by value disagree: `-0.0 + 0.0` is `+0.0`, which
+    // equals `-0.0` as a number but is a different stored value (the sign bit), so the write is
+    // not a no-op.
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("z", Value::Double(-0.0))]), 0).unwrap();
+    assert!(w.write_inc_value(&p("z"), &Value::Double(0.0), 0).is_some());
+    match &w.visible().unwrap()[&p("z")] {
+        Value::Double(d) => assert_eq!(d.to_bits(), 0.0f64.to_bits(), "the result is +0.0"),
+        v => panic!("{v:?}"),
+    }
+    // the same `$inc` again leaves +0.0 alone: now it is a no-op
+    assert!(w.write_inc_value(&p("z"), &Value::Double(0.0), 0).is_none());
+    // an integer operand of 0 does the same to a `-0.0` base
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("z", Value::Double(-0.0))]), 0).unwrap();
+    assert!(w.write_inc(&p("z"), 0, 0).is_some());
+    assert_eq!(w.visible().unwrap()[&p("z")], Value::Double(0.0));
+}
+
+#[test]
 fn a_decimal_operand_on_a_double_base_makes_a_decimal_register_that_later_counts() {
     let o = opts();
     let (mut mi, mut ma, mut mb) = (Mem::new('I', &o), Mem::new('A', &o), Mem::new('B', &o));
