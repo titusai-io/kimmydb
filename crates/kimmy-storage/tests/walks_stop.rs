@@ -340,7 +340,8 @@ const DELEGATES: &[(&str, &str)] = &[
     ("docs::Engine::live_unique_violations", "Engine::live_unique_violations_from_table"),
     ("docs::Engine::for_each_doc_after", "Engine::for_each_record_after"),
     ("docs::Engine::count", "Engine::for_each_doc"),
-    ("index::Engine::visit_index_candidates", "Walk::in_index_order"),
+    ("index::Engine::visit_index_candidates", "Engine::visit_index_candidates_held"),
+    ("index::Engine::visit_index_candidates_held", "Walk::in_index_order"),
     ("index::Engine::create_index_with", "Engine::create_index_inner"),
     // An index's unkeyed run.
     ("index::Engine::unkeyed_count", "holders_of"),

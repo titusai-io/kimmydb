@@ -427,12 +427,22 @@ pub fn find(
             let mut seen = 0usize;
             let mut refused: Option<ApiError> = None;
             let (mut stamps, mut docs) = (Vec::new(), Vec::new());
-            let stats = visit_matching(
+            // A range that is inexact is read whole to put its documents in `_id` order, and
+            // the keys it holds while it does are held to the node's memory pool (ADR-269),
+            // under the request's limit: a filter that rejects most candidates makes the walk
+            // go on to passes that double, up to the whole range. A pass that stays within
+            // the window, as the page of documents does, is not charged, so a `find` that
+            // accepts what it reads never asks the pool; the first pass that goes past it
+            // makes the lease, and a read that takes another path never does.
+            let keys = IndexKeys::of_a_find(state.aggregate_memory(), window);
+            let bounds =
+                ScanBounds { stop_after: Some(window), want: Some(window), hold: Some(&keys) };
+            let stats = visit_matching_bounded(
                 state,
                 &meta,
                 &filter,
                 Order::ById { after: cursor.as_ref().map(|c| c.key()) },
-                Some(window),
+                bounds,
                 |stamp, doc| {
                     seen += 1;
                     if seen > skip {
@@ -457,6 +467,7 @@ pub fn find(
                             }
                         }
                     }
+                    Ok(true)
                 },
             )?;
             if let Some(e) = refused {
@@ -974,6 +985,38 @@ pub(crate) fn visit_matching_until<F>(
 where
     F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>,
 {
+    let bounds = ScanBounds { stop_after, want: stop_after, hold: None };
+    visit_matching_bounded(state, meta, filter, order, bounds, visit)
+}
+
+/// What a read of the source is bounded by.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanBounds<'a> {
+    /// The scan ends once this many documents have matched.
+    pub(crate) stop_after: Option<usize>,
+    /// How many candidates the visitor expects to accept: what sizes the work of an inexact
+    /// index range per pass and the keys it holds (`None`: every one, in order). Not a limit,
+    /// a scan that wants more goes on.
+    pub(crate) want: Option<usize>,
+    /// Where the keys an inexact index range holds are charged when `want` does not bound
+    /// them (ADR-269).
+    pub(crate) hold: Option<&'a dyn kimmy_storage::KeyHold>,
+}
+
+/// [`visit_matching_until`], with the bounds of the read given apart: `stop_after` ends the
+/// scan, `want` sizes what an index range holds, and `hold` budgets it.
+pub(crate) fn visit_matching_bounded<F>(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    filter: &filter::Filter,
+    order: Order<'_>,
+    bounds: ScanBounds<'_>,
+    visit: F,
+) -> Result<QueryStats, ApiError>
+where
+    F: FnMut(kimmy_core::Stamp, bson::Document) -> kimmy_core::Result<bool>,
+{
+    let ScanBounds { stop_after, want, hold } = bounds;
     // Every read of documents goes through here (find, count, an aggregate's source,
     // the vector filter's paging), so the request's deadline is set once for all of
     // them; the walks below tick it per row (ADR-266).
@@ -1052,17 +1095,16 @@ where
             exact: p.exact,
         };
         let delivery = match order {
-            Order::ById { after } => {
-                kimmy_storage::CandidateOrder::ById { after, want: stop_after }
-            }
+            Order::ById { after } => kimmy_storage::CandidateOrder::ById { after, want },
             Order::Any => kimmy_storage::CandidateOrder::Any,
         };
         let outcome = kimmy_storage::blocking(|| {
-            state.engine.visit_index_candidates(
+            state.engine.visit_index_candidates_held(
                 meta,
                 &scan,
                 delivery,
                 kimmy_storage::WalkScope::Request,
+                hold,
                 |_, stamp, doc| Ok(recheck.take(stamp, doc)?),
             )
         })?;
@@ -2462,41 +2504,270 @@ async fn aggregate_run_held(
     let body = all_stages.len() - usize::from(sink.is_some());
     let stages = &all_stages[..body];
 
+    let sink =
+        sink.map(|sink| (sink, all_stages.last().expect("a sink is a stage of the pipeline")));
+
     // A `$vectorSearch` first stage is the source (ADR-216): the hits, as
     // documents, take the collection scan's place. It needs `search` as well
     // as the `read` above, and `k` bounds what enters the pipeline.
-    let (docs, consumed, source_stats) = if let Some(aggregate::Stage::VectorSearch(spec)) =
-        stages.first()
-    {
+    if let Some(aggregate::Stage::VectorSearch(spec)) = stages.first() {
         let docs = crate::vectors::stage_documents(state, auth, db, coll, spec, &limits).await?;
         // The hits are bounded by `k`, and are held like any source (ADR-269).
+        // The first stage charges what it is given as its own input, so the read gives its
+        // bytes back as the documents are handed over.
         limits.buffer.lease("the source read").charge_docs(&docs)?;
-        (docs, 1, None)
-    } else {
-        // The source. A pipeline that begins with `$match` is read the way `find`
-        // reads: the leading filter goes through `collect_matching`, so an indexed
-        // equality or range fetches its candidates rather than the whole
-        // collection, and the ceiling applies to what the filter *admits* rather
-        // than to what the collection holds. Only the leading run of `$match`
-        // stages is taken — `aggregate::leading_match` says why — and every later
-        // stage runs exactly as it did, on exactly the input it had. A pipeline
-        // with no leading `$match` is the collection, through the same scan.
-        let (filter, consumed, what) = match aggregate::leading_match(stages) {
-            Some((filter, consumed)) => (filter, consumed, "the leading $match"),
-            None => (filter::Filter::AlwaysTrue, 0, "the source collection"),
+        // The rest is synchronous: its own function, so that the guard of the request's
+        // deadline (ADR-266) cannot be alive across the `$vectorSearch` await above, which
+        // a future may leave on one thread and resume on another.
+        return finish_pipeline(state, auth, db, &stages[1..], docs, &limits, sink, None, shape);
+    }
+
+    // The source. A pipeline that begins with `$match` is read the way `find`
+    // reads: the leading filter goes through `collect_matching`, so an indexed
+    // equality or range fetches its candidates rather than the whole
+    // collection, and the ceiling applies to what the filter *admits* rather
+    // than to what the collection holds. Only the leading run of `$match`
+    // stages is taken — `aggregate::leading_match` says why — and every later
+    // stage runs exactly as it did, on exactly the input it had. A pipeline
+    // with no leading `$match` is the collection, through the same scan.
+    let (filter, consumed, what) = match aggregate::leading_match(stages) {
+        Some((filter, consumed)) => (filter, consumed, "the leading $match"),
+        None => (filter::Filter::AlwaysTrue, 0, "the source collection"),
+    };
+    // The scan is in the synchronous function with the rest, under the one guard of the
+    // request's deadline.
+    scan_pipeline(
+        state,
+        auth,
+        db,
+        (&meta, &filter, what),
+        &stages[consumed..],
+        &limits,
+        sink,
+        shape,
+    )
+}
+
+/// The keys of an index range, held to the request's budget while the scan collects them.
+struct IndexKeys<'a> {
+    account: std::cell::RefCell<Account<'a>>,
+    /// The bytes of the keys held now, charged to the lease or not (see [`Account::Later`]).
+    held: std::cell::Cell<usize>,
+    /// How many keys are held now.
+    keys: std::cell::Cell<usize>,
+}
+
+/// The lease the keys are charged to.
+enum Account<'a> {
+    Open(Lease),
+    /// No lease yet: the keys held are not charged until there are more than `free` of them,
+    /// and then the lease is made, from `memory`, and charged for all of them. A read whose
+    /// keys stay within what its page may hold, or that holds none (every path of a `find` but
+    /// one), has no lease, no budget and no pool to touch.
+    Later {
+        memory: &'a crate::limits::AggregateMemory,
+        free: usize,
+    },
+}
+
+impl<'a> IndexKeys<'a> {
+    fn new(lease: Lease) -> Self {
+        IndexKeys {
+            account: std::cell::RefCell::new(Account::Open(lease)),
+            held: 0.into(),
+            keys: 0.into(),
+        }
+    }
+
+    /// Keys of a `find` with a window of `window` documents (`skip + limit`). The first pass
+    /// wants that many, a pass holds one more than it wants for the moment a smaller key
+    /// replaces the largest, and a page holds at most `MAX_LIMIT` documents unpooled: so the
+    /// keys of a pass that fits the window, to that many, are not charged. The one that goes
+    /// past it makes the lease on the node's pool, under the request's limit, and is charged
+    /// for every key held from then on.
+    fn of_a_find(memory: &'a crate::limits::AggregateMemory, window: usize) -> Self {
+        let free = window.min(MAX_LIMIT).saturating_add(1);
+        IndexKeys {
+            account: std::cell::RefCell::new(Account::Later { memory, free }),
+            held: 0.into(),
+            keys: 0.into(),
+        }
+    }
+}
+
+impl kimmy_storage::KeyHold for IndexKeys<'_> {
+    fn take(&self, len: usize) -> kimmy_core::Result<()> {
+        let bytes = kimmy_query::budget::held_set_key(len);
+        self.held.set(self.held.get().saturating_add(bytes));
+        self.keys.set(self.keys.get() + 1);
+        let mut account = self.account.borrow_mut();
+        let mut charge = bytes;
+        if let Account::Later { memory, free } = &*account
+            && self.keys.get() > *free
+        {
+            let lease =
+                memory.budget().lease_worded("the index range of the filter", FIND_RANGE_KEYS);
+            *account = Account::Open(lease);
+            charge = self.held.get();
+        }
+        let charged = match &mut *account {
+            Account::Open(lease) => lease.charge(charge),
+            Account::Later { .. } => Ok(()),
         };
+        #[cfg(test)]
+        if charged.is_ok() {
+            key_hooks::taken(self.held.get());
+        }
+        charged
+    }
+
+    fn give(&self, len: usize) {
+        let bytes = kimmy_query::budget::held_set_key(len).min(self.held.get());
+        self.held.set(self.held.get() - bytes);
+        self.keys.set(self.keys.get().saturating_sub(1));
+        if let Account::Open(lease) = &mut *self.account.borrow_mut() {
+            lease.release(bytes);
+        }
+    }
+
+    fn give_all(&self) {
+        let bytes = self.held.replace(0);
+        self.keys.set(0);
+        if let Account::Open(lease) = &mut *self.account.borrow_mut() {
+            lease.release(bytes);
+        }
+    }
+}
+
+/// Test-only: what the thread runs after each key its `IndexKeys` holds, with the bytes
+/// held then. A test that needs a read to be at a known place (holding some of the pool, and
+/// not yet done) stops it here.
+#[cfg(test)]
+pub(crate) mod key_hooks {
+    type Hook = Box<dyn FnMut(usize)>;
+
+    thread_local! {
+        static AFTER_KEY: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn after_each_key(hook: impl FnMut(usize) + 'static) {
+        AFTER_KEY.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn taken(held: usize) {
+        AFTER_KEY.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(held);
+            }
+        });
+    }
+}
+
+/// How a `find` over an index range words a refusal for the keys it holds. The remedies of an
+/// aggregation are not its: the range is read to put the page in `_id` order, and what makes
+/// it smaller is the filter; what avoids it is a sort other than `{_id: 1}` (a sorted `find`
+/// reads the range in index order and holds only `skip + limit` documents, which it refuses
+/// past [`MAX_SORT_WINDOW`], so a sort is not offered to a client that cannot page with it);
+/// and a large `skip` is what a `cursor` replaces.
+const FIND_RANGE_KEYS: kimmy_query::budget::Wording = kimmy_query::budget::Wording {
+    holder: "one find",
+    over_limit: "narrow the filter on the indexed field so that its range is smaller; sort by \
+                 anything but {_id: 1} ({_id: -1} included) when skip + limit is at most 10000, \
+                 which reads the range in index order and holds only the page; use a smaller \
+                 skip, paging with `cursor`; or raise aggregate.memory_limit_bytes",
+    pool_busy: "narrow the filter on the indexed field, sort by anything but {_id: 1} when \
+                skip + limit is at most 10000, or use a smaller skip",
+};
+
+/// An aggregation over a collection, from the read of its source to the answer, under the
+/// request's deadline: `source` is the collection, the filter that narrows the read and what
+/// the filter is called in a refusal, and `stages` what follows the leading `$match`.
+///
+/// A pipeline whose first stage streams (ADR-270) pushes each document into the chain of
+/// stages as the scan reads it, and the scan ends when the chain is done with its input, so
+/// nothing holds the source and a full `$limit` leaves the rest of the collection unread. The
+/// ceiling on a source is then not a ceiling on the pipeline: what holds documents (a stage
+/// that blocks, the answer) holds them to the request's budget and to the pipeline limit.
+/// Any other pipeline reads its source whole, as it always has.
+#[allow(clippy::too_many_arguments)]
+fn scan_pipeline(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    source: (&CollectionMeta, &filter::Filter, &str),
+    stages: &[aggregate::Stage],
+    limits: &aggregate::Limits,
+    sink: Option<(SinkPlan, &aggregate::Stage)>,
+    shape: Shape,
+) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
+    let (meta, filter, what) = source;
+    // `visit_matching_until` sets the same deadline for its own walk, inside this one: the
+    // earlier of two scopes holds, and both are the request's, so they are the one instant.
+    let _deadline = crate::limits::deadline_scope();
+
+    let (docs, stats) = if pipeline::streams_source(stages) {
+        let run = |stage: &aggregate::Stage, docs, arrived| {
+            run_stage(state, auth, db, stage, docs, arrived, limits, &[])
+        };
+        let mut chain = pipeline::build(stages, &run, limits, &[]);
+        // A chain that is full before it is pushed anything reads nothing: no index walk and no
+        // document. The parser refuses `$limit: 0`, but the reordering makes a window that
+        // takes nothing of `$limit 3, $skip 5`, so the scan asks.
+        let full = chain.is_full();
+        // The scan answers `core::Error`s and the chain the executor's, so a failure of the
+        // chain ends the scan and is kept to be returned when it is over.
+        let mut failed = None;
+        // The source has no ceiling, so the keys of an index range taken in `_id` order are
+        // bounded by what the pipeline will take when that is known (a `$skip` and a
+        // `$limit` at its head), and otherwise held to the request's budget as they are
+        // collected: a range is read whole to find its smallest keys.
+        let keys = IndexKeys::new(limits.buffer.lease("the index range of $match"));
+        let bounds = ScanBounds {
+            stop_after: None,
+            want: pipeline::source_bound(stages),
+            hold: Some(&keys),
+        };
+        let stats = if full {
+            QueryStats::planned(&plan_access(filter, &meta.indexes))
+        } else {
+            visit_matching_bounded(
+                state,
+                meta,
+                filter,
+                Order::ById { after: None },
+                bounds,
+                |_, doc| match chain.push(doc) {
+                    Ok(flow) => Ok(flow == pipeline::Flow::More),
+                    Err(e) => {
+                        failed = Some(e);
+                        Ok(false)
+                    }
+                },
+            )?
+        };
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        (chain.finish()?, stats)
+    } else {
         // One past the ceiling: the scan stops as soon as it is over, rather than
         // materialising everything the filter admits in order to refuse it. The bytes
         // are held to the request's memory limit the same way (ADR-269): each document
         // is charged as it is read, and the read ends at the one that passes the limit.
         let mut docs = Vec::new();
         let mut read = limits.buffer.lease("the source read");
-        let stats = visit_matching_until(
+        // The keys an inexact index range holds to deliver its documents in `_id` order are
+        // charged too: the `want` of one past the ceiling sizes the first pass, but a filter
+        // that rejects most candidates goes on to passes that double, up to the range.
+        let keys = IndexKeys::new(limits.buffer.lease("the index range of $match"));
+        let ceiling = Some(limits.max_documents + 1);
+        let bounds = ScanBounds { stop_after: ceiling, want: ceiling, hold: Some(&keys) };
+        let stats = visit_matching_bounded(
             state,
-            &meta,
-            &filter,
+            meta,
+            filter,
             Order::ById { after: None },
-            Some(limits.max_documents + 1),
+            bounds,
             |_, doc| {
                 read.charge_doc(&doc)?;
                 docs.push(doc);
@@ -2513,23 +2784,9 @@ async fn aggregate_run_held(
                 limits.max_documents
             )));
         }
-        (docs, consumed, Some(stats))
+        (run_stages(state, auth, db, stages, docs, limits, &[])?, stats)
     };
-
-    // The rest is synchronous: its own function, so that the guard of the request's
-    // deadline (ADR-266) cannot be alive across the `$vectorSearch` await above, which
-    // a future may leave on one thread and resume on another.
-    finish_pipeline(
-        state,
-        auth,
-        db,
-        &stages[consumed..],
-        docs,
-        &limits,
-        sink.map(|sink| (sink, all_stages.last().expect("a sink is a stage of the pipeline"))),
-        source_stats,
-        shape,
-    )
+    conclude(state, docs, limits, sink, Some(stats), shape)
 }
 
 /// Everything after the source of an aggregation, under the request's deadline: the
@@ -2548,7 +2805,19 @@ fn finish_pipeline(
 ) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
     let _deadline = crate::limits::deadline_scope();
     let docs = run_stages(state, auth, db, stages, docs, limits, &[])?;
+    conclude(state, docs, limits, sink, source_stats, shape)
+}
 
+/// The end of an aggregation: the write of a sink, or the answer, built from the documents
+/// the stages left.
+fn conclude(
+    state: &SharedState,
+    docs: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    sink: Option<(SinkPlan, &aggregate::Stage)>,
+    source_stats: Option<QueryStats>,
+    shape: Shape,
+) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
     if let Some((sink, last)) = sink {
         // The documents are held while the sink writes them, in the engine's chunks.
         let _writing = {
@@ -2652,9 +2921,10 @@ fn run_stages(
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
-    let run =
-        |stage: &aggregate::Stage, docs| run_stage(state, auth, db, stage, docs, limits, vars);
-    let mut chain = pipeline::build(stages, &run);
+    let run = |stage: &aggregate::Stage, docs, arrived| {
+        run_stage(state, auth, db, stage, docs, arrived, limits, vars)
+    };
+    let mut chain = pipeline::build(stages, &run, limits, vars);
     // The input is already in memory, whole (the source, a `$facet` branch's copy, a
     // `$lookup` or `$unionWith` sub-pipeline's documents), and goes in as it is: there is no
     // scan to stop, so the answer of the push is not needed.
@@ -2664,13 +2934,17 @@ fn run_stages(
 
 /// One stage on all of its input: the stages that hold a storage handle (the two `$lookup`
 /// forms, `$graphLookup`, `$unionWith`) and `$facet` go to the functions here, everything
-/// else to the pure pipeline.
+/// else to the pure pipeline. `arrived` is the lease that charged the input as it was
+/// collected one document at a time, if it was (ADR-270): the stage takes it as the hold on
+/// its input and does not charge the same bytes again.
+#[allow(clippy::too_many_arguments)]
 fn run_stage(
     state: &SharedState,
     auth: &Auth,
     db: &str,
     stage: &aggregate::Stage,
     docs: Vec<bson::Document>,
+    arrived: Option<Lease>,
     limits: &aggregate::Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<bson::Document>, ApiError> {
@@ -2680,7 +2954,7 @@ fn run_stage(
             as_field,
             join: aggregate::Join::Equality { local_field, foreign_field },
         } => {
-            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            let mut held = aggregate::Held::enter_with(stage, &docs, limits, arrived)?;
             lookup(
                 state,
                 auth,
@@ -2699,7 +2973,7 @@ fn run_stage(
             as_field,
             join: aggregate::Join::Pipeline { vars: let_vars, stages: sub, lead },
         } => {
-            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            let mut held = aggregate::Held::enter_with(stage, &docs, limits, arrived)?;
             lookup_pipeline(
                 state,
                 auth,
@@ -2716,20 +2990,22 @@ fn run_stage(
             )?
         }
         aggregate::Stage::GraphLookup(spec) => {
-            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            let mut held = aggregate::Held::enter_with(stage, &docs, limits, arrived)?;
             graph_lookup(state, auth, db, spec, docs, limits, vars, &mut held.output)?
         }
         aggregate::Stage::UnionWith(spec) => {
-            let mut held = aggregate::Held::enter(stage, &docs, limits)?;
+            let mut held = aggregate::Held::enter_with(stage, &docs, limits, arrived)?;
             union_with(state, auth, db, spec, docs, limits, vars, &mut held.output)?
         }
         aggregate::Stage::Facet(facets) => {
+            // `$facet` charges its input itself.
+            drop(arrived);
             let answer = aggregate::run_facet(facets, docs, limits, |sub, input| {
                 run_stages(state, auth, db, sub, input, limits, vars)
             })?;
             vec![answer]
         }
-        other => aggregate::apply_with_vars(other, docs, limits, vars)?,
+        other => aggregate::apply_charged(other, docs, limits, vars, arrived)?,
     })
 }
 
@@ -4105,18 +4381,20 @@ mod tests {
         let limits = aggregate::Limits { max_documents: 10, ..Default::default() };
         let auth = superuser();
 
-        let whole = json!([{ "$count": "c" }]);
+        // A `$sort` first needs the source whole (a `$count` first would stream it).
+        let whole = json!([{ "$sort": { "n": 1 } }, { "$count": "c" }]);
         let err = agg_limits(&state, &auth, "app", "docs", &whole, limits.clone())
             .expect_err("the whole collection is over the ceiling");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
 
-        let narrowed = json!([{ "$match": { "n": 3 } }, { "$count": "c" }]);
+        let narrowed =
+            json!([{ "$match": { "n": 3 } }, { "$sort": { "n": 1 } }, { "$count": "c" }]);
         let out = agg_limits(&state, &auth, "app", "docs", &narrowed, limits.clone()).unwrap();
         assert_eq!(out["documents"][0]["c"], 6);
 
         // A leading `$match` that admits too many is refused too, and the
         // refusal names it rather than the collection.
-        let wide = json!([{ "$match": { "n": { "$gte": 0 } } }, { "$count": "c" }]);
+        let wide = json!([{ "$match": { "n": { "$gte": 0 } } }, { "$sort": { "n": 1 } }, { "$count": "c" }]);
         let err = agg_limits(&state, &auth, "app", "docs", &wide, limits)
             .expect_err("the match admits thirty");
         assert!(format!("{err:?}").contains("leading $match"), "{err:?}");
@@ -4783,17 +5061,31 @@ mod tests {
     #[test]
     fn a_match_after_another_stage_is_not_pushed_down() {
         // `$project` then `$match` must mean what it says: the filter reads
-        // the projected document, and the source is still the collection —
-        // so under the ceiling it is refused exactly as before.
+        // the projected document, and the source is still the collection.
         let dir = tempfile::tempdir().unwrap();
         let state = live_state(&dir);
         seed_pipeline_source(&state, "docs", 30, true);
         let limits = aggregate::Limits { max_documents: 10, ..Default::default() };
 
-        let pipeline = json!([{ "$project": { "n": 1 } }, { "$match": { "n": 3 } }]);
-        let err = agg_limits(&state, &superuser(), "app", "docs", &pipeline, limits)
+        // After a stage that blocks, the source is the whole collection and is refused
+        // under the ceiling exactly as before.
+        let pipeline = json!([{ "$sort": { "_id": 1 } }, { "$match": { "n": 3 } }]);
+        let err = agg_limits(&state, &superuser(), "app", "docs", &pipeline, limits.clone())
             .expect_err("the source is the whole collection");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
+
+        // After a stage that streams, the source is streamed and has no ceiling (ADR-270):
+        // the pipeline is answered, and what it read is the whole collection, not the
+        // documents the match admits, which an index would have narrowed it to.
+        let pipeline = json!([{ "$project": { "n": 1 } }, { "$match": { "n": 3 } }]);
+        let (out, stats) = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(aggregate_run_stats(&state, &superuser(), "app", "docs", &pipeline, limits))
+            .unwrap();
+        assert_eq!(out["count"], 6);
+        let stats = stats.expect("a filtered source");
+        assert_eq!((stats.examined, stats.matched, stats.index), (30, 30, None));
 
         // And with room to run, the projection is what the match sees:
         // `k` is gone, so a match on it finds nothing.
@@ -5227,6 +5519,12 @@ mod join_tests;
 
 #[cfg(test)]
 mod memory_tests;
+
+#[cfg(test)]
+mod stream_tests;
+
+#[cfg(test)]
+mod find_hold_tests;
 
 #[cfg(test)]
 mod deadline_tests;

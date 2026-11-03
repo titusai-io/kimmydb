@@ -63,7 +63,7 @@ and that number is defined when the stream holds nothing: it is `0`. So a
 `$count` over an empty input emits **one document holding `0`**, never no
 document, and it does not matter how the stream came to be empty — a `$match`
 that selected nothing, an `$unwind` that dropped every row, a `$skip` past the
-end, an explicit `$limit: 0`. All of them answer `[{"n": 0}]`. `$group` over
+end. All of them answer `[{"n": 0}]`. `$group` over
 that same stream emits **nothing at all**, `{"_id": null}` included, because it
 produces one row per distinct key and an empty stream has no keys to produce a
 row for.

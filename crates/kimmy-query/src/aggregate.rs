@@ -101,6 +101,46 @@ pub struct Limits {
 /// small enough that a hostile pipeline cannot exhaust a node.
 pub const DEFAULT_MAX_DOCUMENTS: usize = 100_000;
 
+/// The most stages one pipeline may have, a `$facet` branch and a `$lookup` or `$unionWith`
+/// sub-pipeline each counted on its own, and a stage that the reference expands into two
+/// counted as two ([`stage_weight`]). It is the reference's limit, measured (see
+/// `docs/deviations.md`). It is a bound on the body a client can send, not what keeps the stack
+/// safe: [`crate::pipeline`] runs a run of stages that stream in one loop, whatever its length.
+pub const MAX_PIPELINE_STAGES: usize = 1_000;
+
+/// What a stage counts for against [`MAX_PIPELINE_STAGES`]: the stages it is made of in the
+/// reference, which counts what a stage expands to. `$count`, `$sortByCount`, `$bucket`,
+/// `$setWindowFields` and `$densify` are two; every other stage probed is one, and one that
+/// was not (a `$fill` with a method, a `$densify` variant, `$geoNear`) is counted as one here.
+pub fn stage_weight(name: &str) -> usize {
+    match name {
+        "$count" | "$sortByCount" | "$bucket" | "$setWindowFields" | "$densify" => 2,
+        _ => 1,
+    }
+}
+
+/// What the stages of a pipeline count for, as they are written: the name of a stage is its
+/// one key, and a stage that has not one is counted as one (it is refused when it is parsed).
+pub fn pipeline_weight<'a>(stages: impl IntoIterator<Item = &'a Document>) -> usize {
+    stages
+        .into_iter()
+        .map(|stage| match (stage.len(), stage.keys().next()) {
+            (1, Some(name)) => stage_weight(name),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// The refusal of a pipeline that weighs `weight`. An update pipeline has its own words
+/// ([`crate::update_pipeline`]): it has no `$facet` or sub-pipeline to name.
+pub(crate) fn too_many_stages(weight: usize) -> Error {
+    Error::InvalidQuery(format!(
+        "a pipeline has {weight} stages, over the limit of {MAX_PIPELINE_STAGES} (a stage that \
+         expands, such as $count, counts as two). A $facet branch and a $lookup or $unionWith \
+         sub-pipeline are each counted on their own"
+    ))
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -545,6 +585,10 @@ impl Placement {
 }
 
 fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
+    let weight = pipeline_weight(pipeline);
+    if weight > MAX_PIPELINE_STAGES {
+        return Err(too_many_stages(weight));
+    }
     let stages = pipeline
         .iter()
         .enumerate()
@@ -560,7 +604,114 @@ fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Resu
             stages.len()
         )));
     }
-    Ok(stages)
+    Ok(move_windows(stages))
+}
+
+/// Whether a `$skip` and a `$limit` are moved ahead of the stage at `at` in `stages` (ADR-270),
+/// as the reference's optimizer moves them: it neither filters nor changes the number of
+/// documents, so the documents the window drops need not go through it. That is `$project`
+/// (and `$unset`, which is one), `$addFields`/`$set`, `$replaceRoot`/`$replaceWith` and
+/// `$lookup` (measured: `q8-probes/adr270-reorder.js` and `adr270-reorder2.js`), and a `$match`
+/// of nothing, which the reference drops, unless it is one of the `$match` stages the
+/// pipeline begins with, which are the filter of its source ([`leading_match`]). It is not
+/// `$match`, `$redact`, `$group`, `$sort`, `$unwind`, `$sample`, `$sortByCount`,
+/// `$setWindowFields`, `$graphLookup`, `$unionWith`, `$facet`, `$merge` or `$out`: a window
+/// stays behind each of those.
+fn lets_a_window_pass(stages: &[Stage], at: usize) -> bool {
+    match &stages[at] {
+        Stage::Project { .. }
+        | Stage::AddFields(_)
+        | Stage::ReplaceRoot(_)
+        | Stage::Lookup { .. } => true,
+        Stage::Match(filter) => {
+            matches!(**filter, Filter::AlwaysTrue)
+                && stages[..at].iter().any(|stage| !matches!(stage, Stage::Match(_)))
+        }
+        _ => false,
+    }
+}
+
+/// A run of `$skip` and `$limit` as the one window it is: the first `skip` documents dropped,
+/// then `limit` taken (all the rest if there is none).
+#[derive(Clone, Copy, Default)]
+struct Window {
+    skip: usize,
+    limit: Option<usize>,
+}
+
+impl Window {
+    /// The window of this one followed by a `$skip` of `n`: it drops what the window takes
+    /// first, and what is dropped is no longer taken.
+    fn then_skip(self, n: usize) -> Window {
+        match self.limit {
+            None => Window { skip: self.skip.saturating_add(n), limit: None },
+            Some(limit) => {
+                let dropped = n.min(limit);
+                Window { skip: self.skip.saturating_add(dropped), limit: Some(limit - dropped) }
+            }
+        }
+    }
+
+    /// The window of this one followed by a `$limit` of `n`.
+    fn then_limit(self, n: usize) -> Window {
+        Window { skip: self.skip, limit: Some(self.limit.map_or(n, |limit| limit.min(n))) }
+    }
+
+    /// The stages that are this window: a `$skip` if it drops any, then a `$limit` if it takes
+    /// a number. A window that takes nothing is a `$limit` of 0 alone, which no request can
+    /// write (it is a `400`) and `$limit: 5` then `$skip: 5` makes: what it drops is of no
+    /// account, and a `$skip` before it would only be a number of documents for a `$sort` to
+    /// keep.
+    fn stages(self) -> impl Iterator<Item = Stage> {
+        let takes_nothing = self.limit == Some(0);
+        (self.skip > 0 && !takes_nothing)
+            .then_some(Stage::Skip(self.skip))
+            .into_iter()
+            .chain(self.limit.map(Stage::Limit))
+    }
+}
+
+/// The reference's reordering of `$skip` and `$limit` (ADR-270): each run of them is one
+/// window ([`Window`]: `$skip: 2, $skip: 3` is `$skip: 5`, `$limit: 10, $limit: 3` is
+/// `$limit: 3`, `$limit: 8, $skip: 5` is `$skip: 5, $limit: 3`) and the window is moved ahead of
+/// the stages it [passes](lets_a_window_pass), repeatedly, so that it meets the window that is already
+/// there and the two are one. The documents a window drops are then never evaluated by the
+/// stages it passed, so an error in one is not raised, as in the reference.
+///
+/// A rewrite of the stages and not a change to how they run: the pipeline that is run, and
+/// that `explain` reports, is the one written here.
+fn move_windows(stages: Vec<Stage>) -> Vec<Stage> {
+    let mut out: Vec<Stage> = Vec::with_capacity(stages.len());
+    for stage in stages {
+        let (skip, limit) = match stage {
+            Stage::Skip(n) => (n, None),
+            Stage::Limit(n) => (0, Some(n)),
+            other => {
+                out.push(other);
+                continue;
+            }
+        };
+        // Past the stages it passes, to the window that ends there, if one does.
+        let mut end = out.len();
+        while end > 0 && lets_a_window_pass(&out, end - 1) {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && matches!(out[start - 1], Stage::Skip(_) | Stage::Limit(_)) {
+            start -= 1;
+        }
+        let window = out[start..end].iter().fold(Window::default(), |window, stage| match stage {
+            Stage::Skip(n) => window.then_skip(*n),
+            Stage::Limit(n) => window.then_limit(*n),
+            _ => window,
+        });
+        let window = match limit {
+            Some(n) => window.then_limit(n),
+            None => window.then_skip(skip),
+        };
+        out.splice(start..end, window.stages());
+    }
+    out
 }
 
 /// The `$match` stages a pipeline *begins* with, merged into one filter, and
@@ -617,7 +768,12 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
         }
         "$replaceRoot" => parse_replace_root(as_document(name, value)?, vars),
         "$sort" => Ok(Stage::Sort(shape::parse_sort(as_document(name, value)?)?)),
-        "$limit" => Ok(Stage::Limit(as_count(name, value)?)),
+        "$limit" => match as_count(name, value)? {
+            // As the reference refuses it: a limit of nothing is not a window, and `$skip` past
+            // the end or a `$match` that selects nothing say it.
+            0 => Err(Error::InvalidQuery("$limit must be positive, found 0".into())),
+            n => Ok(Stage::Limit(n)),
+        },
         "$skip" => Ok(Stage::Skip(as_count(name, value)?)),
         "$count" => match value {
             Bson::String(field) if !field.is_empty() => Ok(Stage::Count(field.clone())),
@@ -1980,6 +2136,20 @@ pub struct Held {
 impl Held {
     /// Charge `input` to the request's budget for `stage`.
     pub fn enter(stage: &Stage, input: &[Document], limits: &Limits) -> Result<Self> {
+        Self::enter_with(stage, input, limits, None)
+    }
+
+    /// [`Held::enter`], for an input whose bytes are already charged: `arrived` is the lease
+    /// that charged `input` document by document as a stage before this one handed them over
+    /// (ADR-270). It becomes the stage's hold on its input, and nothing is charged again. A
+    /// stage that charges its own input is given back its bytes first, so that it does not
+    /// hold them twice.
+    pub fn enter_with(
+        stage: &Stage,
+        input: &[Document],
+        limits: &Limits,
+        arrived: Option<Lease>,
+    ) -> Result<Self> {
         let name = stage.name();
         let output = limits.buffer.lease(output_of(name));
         let charged = !matches!(
@@ -1987,10 +2157,17 @@ impl Held {
             Stage::SetWindowFields(_) | Stage::Densify(_) | Stage::Fill(_) | Stage::Facet(_)
         );
         if !charged {
+            drop(arrived);
             return Ok(Held { output, _input: None });
         }
-        let mut lease = limits.buffer.lease(input_of(name));
-        lease.charge_docs(input)?;
+        let lease = match arrived {
+            Some(lease) => lease,
+            None => {
+                let mut lease = limits.buffer.lease(input_of(name));
+                lease.charge_docs(input)?;
+                lease
+            }
+        };
         Ok(Held { output, _input: Some(lease) })
     }
 }
@@ -2011,6 +2188,18 @@ pub fn apply_with_vars(
     limits: &Limits,
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
+    apply_charged(stage, input, limits, vars, None)
+}
+
+/// [`apply_with_vars`] for an input already charged to the request's budget by `arrived`, the
+/// lease of the sink that collected it document by document (ADR-270, [`Held::enter_with`]).
+pub fn apply_charged(
+    stage: &Stage,
+    input: Vec<Document>,
+    limits: &Limits,
+    vars: &[Binding<'_>],
+    arrived: Option<Lease>,
+) -> Result<Vec<Document>> {
     // Every stage starts by looking at the request's deadline (ADR-266), and every
     // loop below holds a `Ticker` and ticks first in its body. A stage added to this
     // match does the same: `let mut ticker = Ticker::new();` before its loop and
@@ -2020,7 +2209,7 @@ pub fn apply_with_vars(
     // What the stage holds while it runs is charged to the request's budget (ADR-269): its
     // input until it returns, and the documents it builds as it builds them. A blocking
     // stage that buffers its own input, and `$facet`, charge for themselves.
-    let mut held = Held::enter(stage, &input, limits)?;
+    let mut held = Held::enter_with(stage, &input, limits, arrived)?;
     let out = match stage {
         // A `$expr` that cannot be evaluated against a document fails the
         // pipeline, as in a top-level filter (ADR-206).
@@ -2038,12 +2227,7 @@ pub fn apply_with_vars(
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
                 ticker.tick()?;
-                let mut projected = shape::project(projection.as_ref(), doc);
-                // Computed fields read the *input*, not the projection's
-                // output — otherwise `{$project: {a: 0, b: "$a"}}` would
-                // depend on key order, which BSON preserves and nobody
-                // reasons about.
-                set_computed(&mut projected, computed, &Scope::with_bindings(doc, vars))?;
+                let projected = project_doc(projection.as_ref(), computed, doc, vars)?;
                 held.output.charge_doc(&projected)?;
                 out.push(projected);
             }
@@ -2053,8 +2237,7 @@ pub fn apply_with_vars(
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
                 ticker.tick()?;
-                let mut with = doc.clone();
-                set_computed(&mut with, computed, &Scope::with_bindings(doc, vars))?;
+                let with = add_fields_doc(computed, doc, vars)?;
                 held.output.charge_doc(&with)?;
                 out.push(with);
             }
@@ -2064,21 +2247,9 @@ pub fn apply_with_vars(
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
                 ticker.tick()?;
-                match expr.eval_in(&Scope::with_bindings(doc, vars))? {
-                    Bson::Document(new_root) => {
-                        held.output.charge_doc(&new_root)?;
-                        out.push(new_root);
-                    }
-                    // Refused rather than wrapped: a root that is not a
-                    // document would have to be given a field name this stage
-                    // has no business inventing.
-                    other => {
-                        return Err(Error::InvalidQuery(format!(
-                            "$replaceRoot needs a document, found {}",
-                            type_name(&other)
-                        )));
-                    }
-                }
+                let new_root = replace_root_doc(expr, doc, vars)?;
+                held.output.charge_doc(&new_root)?;
+                out.push(new_root);
             }
             out
         }
@@ -2104,17 +2275,9 @@ pub fn apply_with_vars(
             limits,
             &mut held.output,
         )?,
-        Stage::Group { id, fields } => group(input, id, fields, limits, vars, &mut held.output)?,
-        Stage::Bucket { group_by, boundaries, default, fields } => bucket(
-            input,
-            group_by,
-            boundaries,
-            default.as_ref(),
-            fields,
-            limits,
-            vars,
-            &mut held.output,
-        )?,
+        Stage::Group { .. } | Stage::Bucket { .. } | Stage::SortByCount(_) => {
+            group_all(stage, &input, limits, vars, &mut held.output)?
+        }
         Stage::BucketAuto { group_by, buckets, fields } => {
             bucket_auto(input, group_by, *buckets, fields, limits, vars, &mut held.output)?
         }
@@ -2157,9 +2320,6 @@ pub fn apply_with_vars(
                     .into(),
             ));
         }
-        Stage::SortByCount(expr) => {
-            stages::sort_by_count(input, expr, limits, vars, &mut held.output)?
-        }
         Stage::Sample(size) => stages::sample(input, *size, limits, &mut stages::system_below())?,
         Stage::Redact(expr) => stages::redact(input, expr, vars, &mut held.output)?,
         Stage::UnionWith(_) => {
@@ -2181,6 +2341,52 @@ pub fn apply_with_vars(
     };
     check_limit(stage.name(), out.len(), limits)?;
     Ok(out)
+}
+
+/// One document through `$project` (ADR-270: the body of the stage for one document, which
+/// [`apply`] loops over and the chain of sinks calls as each document arrives).
+pub(crate) fn project_doc(
+    projection: Option<&Projection>,
+    computed: &[(String, Expr)],
+    doc: &Document,
+    vars: &[Binding<'_>],
+) -> Result<Document> {
+    let mut projected = shape::project(projection, doc);
+    // Computed fields read the *input*, not the projection's
+    // output — otherwise `{$project: {a: 0, b: "$a"}}` would
+    // depend on key order, which BSON preserves and nobody
+    // reasons about.
+    set_computed(&mut projected, computed, &Scope::with_bindings(doc, vars))?;
+    Ok(projected)
+}
+
+/// One document through `$addFields` (see [`project_doc`]).
+pub(crate) fn add_fields_doc(
+    computed: &[(String, Expr)],
+    doc: &Document,
+    vars: &[Binding<'_>],
+) -> Result<Document> {
+    let mut with = doc.clone();
+    set_computed(&mut with, computed, &Scope::with_bindings(doc, vars))?;
+    Ok(with)
+}
+
+/// One document through `$replaceRoot` (see [`project_doc`]).
+pub(crate) fn replace_root_doc(
+    expr: &Expr,
+    doc: &Document,
+    vars: &[Binding<'_>],
+) -> Result<Document> {
+    match expr.eval_in(&Scope::with_bindings(doc, vars))? {
+        Bson::Document(new_root) => Ok(new_root),
+        // Refused rather than wrapped: a root that is not a
+        // document would have to be given a field name this stage
+        // has no business inventing.
+        other => Err(Error::InvalidQuery(format!(
+            "$replaceRoot needs a document, found {}",
+            type_name(&other)
+        ))),
+    }
 }
 
 /// Write computed fields into `target`, evaluating each in `source`.
@@ -2477,33 +2683,52 @@ fn crossing_array(doc: &Document, field: &str) -> Option<(String, String)> {
     None
 }
 
-fn unwind(
-    input: Vec<Document>,
-    field: &str,
-    preserve: bool,
-    include_index: Option<&str>,
-    limits: &Limits,
-    held: &mut Lease,
-) -> Result<Vec<Document>> {
-    // Write the index field alongside the unwound value, or `null` on a
-    // document that passed through without being fanned out — MongoDB's rule,
-    // and the only sane reading of "which element produced this row" for a
-    // row that was not produced by one.
-    let set_index = |copy: &mut Document, index: Option<i64>| -> Result<()> {
-        let Some(name) = include_index else { return Ok(()) };
+/// What `$unwind` does, whatever runs it.
+pub(crate) struct UnwindSpec<'a> {
+    pub(crate) field: &'a str,
+    pub(crate) preserve: bool,
+    pub(crate) include_index: Option<&'a str>,
+    /// Held to the limit as a whole, as the other stages that add fields are.
+    pub(crate) max_document_bytes: usize,
+}
+
+impl UnwindSpec<'_> {
+    /// Write the index field alongside the unwound value, or `null` on a document that
+    /// passed through without being fanned out — the reference's rule, and the only sane reading
+    /// of "which element produced this row" for a row that was not produced by one.
+    fn set_index(&self, copy: &mut Document, index: Option<i64>) -> Result<()> {
+        let Some(name) = self.include_index else { return Ok(()) };
         let value = index.map_or(Bson::Null, Bson::Int64);
         path::set(copy, name, value)
             .map_err(|e| Error::InvalidQuery(format!("cannot set `{name}`: {e}")))?;
         // The element in place of the array is no larger than the input, but the index field
         // is added to it: a document at the limit goes over it by the field. Held to the
         // limit as a whole, as the other stages that add fields are.
-        check_built_document(copy, limits.max_document_bytes)
-    };
+        check_built_document(copy, self.max_document_bytes)
+    }
+}
 
-    let mut out = Vec::with_capacity(input.len());
-    let mut ticker = Ticker::new();
-    for doc in input {
-        ticker.tick()?;
+/// The documents one document of `$unwind`'s input becomes, handed out one at a time so that
+/// a caller that needs no more can stop in the middle of an array (ADR-270). [`apply`] runs
+/// it to its end for each document; a chain of sinks stops at a `Done`.
+pub(crate) struct Fan {
+    /// The input document, kept only while an array is being handed out: each element is a
+    /// copy of it with the element in the array's place, which is `null` here, the array
+    /// itself being in `elements`. A document that is not fanned out is moved into `single`
+    /// and nothing is kept.
+    doc: Document,
+    /// The elements of the array, still to come, with the position of the next.
+    elements: Option<(std::vec::IntoIter<Bson>, i64)>,
+    /// A document that is not fanned out: what it becomes, and whether the stage built it
+    /// (it is then charged to the request's budget; the input that is passed on unchanged
+    /// was charged as an input).
+    single: Option<(Document, bool)>,
+}
+
+impl Fan {
+    /// Look at `doc`, and decide what it becomes.
+    pub(crate) fn start(spec: &UnwindSpec<'_>, mut doc: Document) -> Result<Fan> {
+        let field = spec.field;
         // Refused uniformly, for every document, before anything at `field`
         // is read: `$unwind` names a place to write each element back to,
         // and a path that crosses an array has none, regardless of what is
@@ -2525,42 +2750,113 @@ fn unwind(
         // not a reason to let a future change panic instead of refuse.
         match value_at(&doc, field) {
             Some(Bson::Array(items)) if !items.is_empty() => {
-                for (index, item) in items.clone().into_iter().enumerate() {
-                    // A document holding a huge array is many rows from one iteration
-                    // of the loop above.
-                    ticker.tick()?;
-                    let mut copy = doc.clone();
-                    path::set(&mut copy, field, item)
-                        .map_err(|e| Error::InvalidQuery(format!("cannot set `{field}`: {e}")))?;
-                    set_index(&mut copy, Some(index as i64))?;
-                    held.charge_doc(&copy)?;
-                    out.push(copy);
-                }
-                // Checked inside the loop as well as after: a handful of
-                // documents each holding a huge array can exceed the cap long
-                // before the outer loop ends, and the point of the cap is to
-                // stop allocating, not to report afterwards.
-                check_limit("$unwind", out.len(), limits)?;
+                // The array moves out of the document, so that it is held once and each
+                // element's copy of the document does not carry it.
+                let items = items.clone();
+                path::set(&mut doc, field, Bson::Null)
+                    .map_err(|e| Error::InvalidQuery(format!("cannot set `{field}`: {e}")))?;
+                Ok(Fan { doc, elements: Some((items.into_iter(), 0)), single: None })
             }
-            // A missing field, an explicit null, or an empty array: MongoDB
+            // A missing field, an explicit null, or an empty array: the reference
             // drops the document unless asked to keep it.
             Some(Bson::Array(_)) | Some(Bson::Null) | None => {
-                if preserve {
-                    let mut copy = doc.clone();
-                    path::unset(&mut copy, field);
-                    set_index(&mut copy, None)?;
-                    held.charge_doc(&copy)?;
-                    out.push(copy);
-                }
+                let single = if spec.preserve {
+                    path::unset(&mut doc, field);
+                    spec.set_index(&mut doc, None)?;
+                    Some((doc, true))
+                } else {
+                    None
+                };
+                Ok(Fan { doc: Document::new(), elements: None, single })
             }
-            // A non-array value unwinds to itself, which is what MongoDB does
+            // A non-array value unwinds to itself, which is what the reference does
             // and saves callers a `$type` check for a field that is sometimes
             // scalar and sometimes an array.
             Some(_) => {
-                let mut copy = doc;
-                set_index(&mut copy, None)?;
-                out.push(copy);
+                spec.set_index(&mut doc, None)?;
+                Ok(Fan { doc: Document::new(), elements: None, single: Some((doc, false)) })
             }
+        }
+    }
+
+    /// What the fan holds while it hands its documents out, as the budget counts it (ADR-269):
+    /// the document it keeps, if it keeps one, and the elements still to come. It shrinks as
+    /// the elements are handed out, and is nothing once the last has taken the document. A
+    /// document that is not fanned out is handed on whole and held by nobody.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let kept = if self.doc.is_empty() { 0 } else { crate::budget::held_bytes(&self.doc) };
+        let rest = self.elements.as_ref().map_or(0, |(rest, _)| {
+            rest.as_slice()
+                .iter()
+                .fold(0usize, |sum, item| sum.saturating_add(crate::budget::held_bytes_bson(item)))
+        });
+        kept.saturating_add(rest)
+    }
+
+    /// Whether the document is expanded from an array, as against dropped or passed on.
+    pub(crate) fn is_array(&self) -> bool {
+        self.elements.is_some()
+    }
+
+    /// The next document, and whether the stage built it, or `None` when there are no more.
+    pub(crate) fn next(
+        &mut self,
+        spec: &UnwindSpec<'_>,
+        ticker: &mut Ticker,
+    ) -> Result<Option<(Document, bool)>> {
+        if let Some((elements, index)) = &mut self.elements {
+            let Some(item) = elements.next() else { return Ok(None) };
+            // A document holding a huge array is many rows from one iteration
+            // of the loop that drives this.
+            ticker.tick()?;
+            // The last element takes the document itself, so that a fan over a single-element
+            // array, and the last of any, keeps nothing once its element is handed out.
+            let mut copy = if elements.as_slice().is_empty() {
+                std::mem::take(&mut self.doc)
+            } else {
+                self.doc.clone()
+            };
+            path::set(&mut copy, spec.field, item)
+                .map_err(|e| Error::InvalidQuery(format!("cannot set `{}`: {e}", spec.field)))?;
+            spec.set_index(&mut copy, Some(*index))?;
+            *index += 1;
+            return Ok(Some((copy, true)));
+        }
+        Ok(self.single.take())
+    }
+}
+
+fn unwind(
+    input: Vec<Document>,
+    field: &str,
+    preserve: bool,
+    include_index: Option<&str>,
+    limits: &Limits,
+    held: &mut Lease,
+) -> Result<Vec<Document>> {
+    let spec = &UnwindSpec {
+        field,
+        preserve,
+        include_index,
+        max_document_bytes: limits.max_document_bytes,
+    };
+    let mut out = Vec::with_capacity(input.len());
+    let mut ticker = Ticker::new();
+    for doc in input {
+        ticker.tick()?;
+        let mut fan = Fan::start(spec, doc)?;
+        while let Some((copy, built)) = fan.next(spec, &mut ticker)? {
+            if built {
+                held.charge_doc(&copy)?;
+            }
+            out.push(copy);
+        }
+        if fan.is_array() {
+            // Checked after each document's fan-out as well as at the end of the stage: a
+            // handful of documents each holding a huge array can exceed the cap long
+            // before the outer loop ends, and the point of the cap is to
+            // stop allocating, not to report afterwards.
+            check_limit("$unwind", out.len(), limits)?;
         }
     }
     Ok(out)
@@ -2640,27 +2936,6 @@ fn bucket_base_bytes(key: &Bson, fields: &[(String, Accumulator)]) -> usize {
     )
 }
 
-fn group(
-    input: Vec<Document>,
-    id: &Expr,
-    fields: &[(String, Accumulator)],
-    limits: &Limits,
-    vars: &[Binding<'_>],
-    held: &mut Lease,
-) -> Result<Vec<Document>> {
-    group_keyed("$group", input, fields, limits, vars, held, |scope| id.eval_in(scope).map(Some))
-}
-
-/// [`group`] with the key of each document given by `key`, which may decline a
-/// document by answering `None` (it is then in no group and is left out).
-///
-/// Keyed by the *encoded* key rather than by `Bson`, because `Bson` is not `Hash`
-/// and because two numerically equal values of different types must land in the
-/// same bucket, the same rule indexes use.
-///
-/// What the buckets hold is charged to `held` as it grows (ADR-269): a bucket when it is
-/// made, and the values each accumulator keeps as they are taken, so a `$push` of large
-/// values is refused at the document that passes the limit.
 /// The name of a group's output document in a refusal for its size.
 fn group_document_name(stage: &str) -> &'static str {
     match stage {
@@ -2696,105 +2971,198 @@ pub fn check_built_document(doc: &Document, max: usize) -> Result<()> {
     )
 }
 
-pub(crate) fn group_keyed(
-    stage: &str,
-    input: Vec<Document>,
-    fields: &[(String, Accumulator)],
+/// Run a grouping stage over a whole input: the documents through a [`GroupState`] one after
+/// the other, then its answer. The state is charged to `held` as it grows (ADR-269).
+fn group_all(
+    stage: &Stage,
+    input: &[Document],
     limits: &Limits,
     vars: &[Binding<'_>],
     held: &mut Lease,
-    mut key_of: impl FnMut(&Scope<'_>) -> Result<Option<Bson>>,
 ) -> Result<Vec<Document>> {
-    let mut order: Vec<Bucket> = Vec::new();
-    let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    let mut state = GroupState::new(stage, limits, vars).expect("the stage groups");
+    for doc in input {
+        state.add(doc, held)?;
+    }
+    state.finish()
+}
 
-    let mut ticker = Ticker::new();
-    for doc in &input {
-        ticker.tick()?;
-        let scope = Scope::with_bindings(doc, vars);
-        let Some(key) = key_of(&scope)? else { continue };
+/// How a grouping stage reads the bucket a document belongs to.
+enum GroupKind<'a> {
+    /// `$group`: the value of `_id`.
+    Group(&'a Expr),
+    /// `$sortByCount`: the value of the expression, counted, and the groups sorted by count.
+    SortByCount(&'a Expr),
+    /// `$bucket`: the range of `boundaries` the value of `group_by` falls in, `[b_i, b_i+1)`,
+    /// whose key is `b_i` as written; `default` if the value is outside every range or is not
+    /// of the boundaries' kind; and a document with neither is **refused**, naming the value.
+    /// Only buckets that received a document are answered, in boundary order and the
+    /// `default` bucket last.
+    Bucket {
+        group_by: &'a Expr,
+        boundaries: &'a [Bson],
+        default: Option<&'a Bson>,
+        kind: Option<BoundaryKind>,
+    },
+}
+
+/// What `$group`, `$bucket` and `$sortByCount` hold while they take their input one document
+/// at a time (ADR-270): the buckets and what each accumulator keeps, and not the documents.
+/// [`apply`] runs a whole input through one, and the chain of sinks feeds it as the source
+/// reads, so there is one implementation of each stage.
+///
+/// Keyed by the *encoded* key rather than by `Bson`, because `Bson` is not `Hash` and because
+/// two numerically equal values of different types must land in the same bucket, the same
+/// rule indexes use.
+pub struct GroupState<'a> {
+    stage: &'static str,
+    kind: GroupKind<'a>,
+    fields: std::borrow::Cow<'a, [(String, Accumulator)]>,
+    limits: &'a Limits,
+    vars: &'a [Binding<'a>],
+    order: Vec<Bucket>,
+    index: std::collections::HashMap<Vec<u8>, usize>,
+    ticker: Ticker,
+}
+
+impl<'a> GroupState<'a> {
+    /// The state of `stage`, or `None` if it is not a stage that groups.
+    pub fn new(stage: &'a Stage, limits: &'a Limits, vars: &'a [Binding<'a>]) -> Option<Self> {
+        let (kind, fields) = match stage {
+            Stage::Group { id, fields } => {
+                (GroupKind::Group(id), std::borrow::Cow::Borrowed(&fields[..]))
+            }
+            Stage::SortByCount(expr) => {
+                // The count is `$group`'s own `{$sum: 1}`: an int, widening to a long past
+                // 2^31-1, as the reference's is (ADR-268).
+                let count = ("count".to_string(), Accumulator::Sum(Expr::Literal(Bson::Int32(1))));
+                (GroupKind::SortByCount(expr), std::borrow::Cow::Owned(vec![count]))
+            }
+            Stage::Bucket { group_by, boundaries, default, fields } => (
+                GroupKind::Bucket {
+                    group_by,
+                    boundaries,
+                    default: default.as_ref(),
+                    kind: BoundaryKind::of(&boundaries[0]),
+                },
+                std::borrow::Cow::Borrowed(&fields[..]),
+            ),
+            _ => return None,
+        };
+        Some(GroupState {
+            stage: stage.name(),
+            kind,
+            fields,
+            limits,
+            vars,
+            order: Vec::new(),
+            index: std::collections::HashMap::new(),
+            ticker: Ticker::new(),
+        })
+    }
+
+    /// The key of the bucket `scope`'s document belongs to.
+    fn key(&self, scope: &Scope<'_>) -> Result<Bson> {
+        match &self.kind {
+            GroupKind::Group(expr) | GroupKind::SortByCount(expr) => expr.eval_in(scope),
+            GroupKind::Bucket { group_by, boundaries, default, kind } => {
+                let value = group_by.eval_in(scope)?;
+                let inside = (BoundaryKind::of(&value) == *kind && !is_nan(&value))
+                    .then(|| {
+                        boundaries
+                            .partition_point(|b| kimmy_core::cmp::canonical_cmp(b, &value).is_le())
+                    })
+                    .filter(|&above| above > 0 && above < boundaries.len());
+                match (inside, default) {
+                    (Some(above), _) => Ok(boundaries[above - 1].clone()),
+                    (None, Some(default)) => Ok((*default).clone()),
+                    (None, None) => Err(Error::InvalidQuery(format!(
+                        "$bucket: {} falls in no bucket and there is no `default`; add a \
+                         `default`, or a boundary below and above it",
+                        describe_value(&value)
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// One more document. What the buckets hold is charged to `held` as it grows
+    /// (ADR-269): a bucket when it is made, and the values each accumulator keeps as they are
+    /// taken, so a `$push` of large values is refused at the document that passes the limit.
+    /// One bucket per distinct value, so a high-cardinality key is exactly the shape that
+    /// exhausts memory: the buckets are held to the pipeline's document limit.
+    pub fn add(&mut self, doc: &Document, held: &mut Lease) -> Result<()> {
+        self.ticker.tick()?;
+        let scope = Scope::with_bindings(doc, self.vars);
+        let key = self.key(&scope)?;
         let encoded = group_key(&key);
-        let slot = match index.get(&encoded) {
+        let slot = match self.index.get(&encoded) {
             Some(&slot) => slot,
             None => {
-                let slot = order.len();
+                let slot = self.order.len();
                 // The bucket, its key twice over (the bucket and the index).
                 held.charge(
-                    bucket_base_bytes(&key, fields)
+                    bucket_base_bytes(&key, &self.fields)
                         .saturating_add(crate::budget::held_set_key(encoded.len())),
                 )?;
-                order.push(Bucket { key: key.clone(), values: fields.iter().map(init).collect() });
-                index.insert(encoded, slot);
-                // One bucket per distinct value, so a high-cardinality key is
-                // exactly the shape that exhausts memory.
-                check_limit(stage, order.len(), limits)?;
+                self.order.push(Bucket {
+                    key: key.clone(),
+                    values: self.fields.iter().map(init).collect(),
+                });
+                self.index.insert(encoded, slot);
+                check_limit(self.stage, self.order.len(), self.limits)?;
                 slot
             }
         };
-        for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
+        for (state, (_, acc)) in self.order[slot].values.iter_mut().zip(self.fields.iter()) {
             let before = state.held();
             accumulate(state, acc, &scope)?;
             held.resize(before, state.held())?;
         }
+        Ok(())
     }
 
-    // Not ticked: one cheap step per bucket, and the buckets are no more than the
-    // documents that were.
-    order
-        .into_iter()
-        .map(|bucket| {
-            let mut out = Document::new();
-            out.insert("_id", bucket.key);
-            for (state, (name, _)) in bucket.values.into_iter().zip(fields) {
-                out.insert(name.clone(), finish(state)?);
-            }
-            check_group_document(stage, &out, limits.max_document_bytes)?;
-            Ok(out)
-        })
-        .collect()
-}
-
-/// Run a `$bucket`: each document goes to the range its `groupBy` value falls in,
-/// `[b_i, b_i+1)`, whose key is `b_i` as written; to `default` if the value is
-/// outside every range or is not of the boundaries' kind; and a document with
-/// neither is **refused**, naming the value. Only buckets that received a
-/// document are answered, in boundary order and the `default` bucket last.
-#[allow(clippy::too_many_arguments)]
-fn bucket(
-    input: Vec<Document>,
-    group_by: &Expr,
-    boundaries: &[Bson],
-    default: Option<&Bson>,
-    fields: &[(String, Accumulator)],
-    limits: &Limits,
-    vars: &[Binding<'_>],
-    held: &mut Lease,
-) -> Result<Vec<Document>> {
-    let kind = BoundaryKind::of(&boundaries[0]);
-    let mut out = group_keyed("$bucket", input, fields, limits, vars, held, |scope| {
-        let value = group_by.eval_in(scope)?;
-        let inside = (BoundaryKind::of(&value) == kind && !is_nan(&value))
-            .then(|| {
-                boundaries.partition_point(|b| kimmy_core::cmp::canonical_cmp(b, &value).is_le())
+    /// The input is complete: the groups, in the order their keys were first seen, but for
+    /// `$bucket`'s, which are in boundary order and the `default` last, and `$sortByCount`'s,
+    /// which are sorted by count, largest first, the sort stable so that groups with the same
+    /// count stay in first-seen order (the reference leaves it unspecified).
+    pub fn finish(self) -> Result<Vec<Document>> {
+        // Not ticked: one cheap step per bucket, and the buckets are no more than the
+        // documents that were.
+        let mut out = self
+            .order
+            .into_iter()
+            .map(|bucket| {
+                let mut out = Document::new();
+                out.insert("_id", bucket.key);
+                for (state, (name, _)) in bucket.values.into_iter().zip(self.fields.iter()) {
+                    out.insert(name.clone(), finish(state)?);
+                }
+                check_group_document(self.stage, &out, self.limits.max_document_bytes)?;
+                Ok(out)
             })
-            .filter(|&above| above > 0 && above < boundaries.len());
-        match (inside, default) {
-            (Some(above), _) => Ok(Some(boundaries[above - 1].clone())),
-            (None, Some(default)) => Ok(Some(default.clone())),
-            (None, None) => Err(Error::InvalidQuery(format!(
-                "$bucket: {} falls in no bucket and there is no `default`; add a `default`, \
-                 or a boundary below and above it",
-                describe_value(&value)
-            ))),
+            .collect::<Result<Vec<_>>>()?;
+        match self.kind {
+            GroupKind::Group(_) => Ok(out),
+            GroupKind::SortByCount(_) => shape::sort_until_deadline(
+                &[SortKey { path: "count".into(), descending: true }],
+                out,
+            ),
+            GroupKind::Bucket { default, .. } => {
+                let default_key = default.map(group_key);
+                out.sort_by(|a, b| {
+                    let (ka, kb) =
+                        (a.get("_id").unwrap_or(&Bson::Null), b.get("_id").unwrap_or(&Bson::Null));
+                    let is_default =
+                        |k: &Bson| default_key.as_ref().is_some_and(|d| *d == group_key(k));
+                    is_default(ka)
+                        .cmp(&is_default(kb))
+                        .then_with(|| kimmy_core::cmp::canonical_cmp(ka, kb))
+                });
+                Ok(out)
+            }
         }
-    })?;
-    let default_key = default.map(group_key);
-    out.sort_by(|a, b| {
-        let (ka, kb) = (a.get("_id").unwrap_or(&Bson::Null), b.get("_id").unwrap_or(&Bson::Null));
-        let is_default = |k: &Bson| default_key.as_ref().is_some_and(|d| *d == group_key(k));
-        is_default(ka).cmp(&is_default(kb)).then_with(|| kimmy_core::cmp::canonical_cmp(ka, kb))
-    });
-    Ok(out)
+    }
 }
 
 /// A value in an error message: its text if it is short, its type if not.
@@ -3067,6 +3435,9 @@ pub fn lookup_keys(input: &[Document], local_field: &str) -> Vec<Bson> {
 mod deadline_tests;
 
 #[cfg(test)]
+mod reorder_tests;
+
+#[cfg(test)]
 mod tests {
     use bson::doc;
 
@@ -3333,6 +3704,135 @@ mod tests {
     }
 
     #[test]
+    fn a_pipeline_is_held_to_a_thousand_stages_wherever_it_is() {
+        // (Not `$skip`, which a window of nothing is no stage: the parse is of the stages as
+        // they are counted, and a run of `$skip`s is one.)
+        let fillers = |n: usize| vec![doc! {"$redact": "$$KEEP"}; n];
+        assert_eq!(MAX_PIPELINE_STAGES, 1_000);
+        assert_eq!(parse(&fillers(1_000)).unwrap().len(), 1_000);
+        let refused = "a pipeline has 1001 stages, over the limit of 1000 (a stage that expands, \
+                       such as $count, counts as two). A $facet branch and a $lookup or \
+                       $unionWith sub-pipeline are each counted on their own";
+        let err = parse(&fillers(1_001)).unwrap_err();
+        assert_eq!(err.to_string(), format!("invalid query: {refused}"));
+        // A trailing `$out` is one of the stages counted.
+        let mut with_out = fillers(1_000);
+        with_out.push(doc! {"$out": "o"});
+        assert!(parse(&with_out).unwrap_err().to_string().contains(refused));
+        // A `$facet` branch, a `$lookup` sub-pipeline and a `$unionWith` sub-pipeline are each
+        // counted on their own, so each takes a thousand and the pipeline around them is
+        // not counted with them, and each is refused at one more.
+        let bson = |stages: Vec<Document>| -> Vec<Bson> {
+            stages.into_iter().map(Bson::Document).collect()
+        };
+        let wrappers: [fn(Vec<Bson>) -> Document; 3] = [
+            |stages| doc! {"$facet": {"a": stages}},
+            |stages| doc! {"$lookup": {"from": "items", "pipeline": stages, "as": "items"}},
+            |stages| doc! {"$unionWith": {"coll": "items", "pipeline": stages}},
+        ];
+        for wrap in wrappers {
+            let whole = vec![wrap(bson(fillers(1_000))), doc! {"$redact": "$$KEEP"}];
+            assert_eq!(parse(&whole).unwrap().len(), 2);
+            let err = parse(&[wrap(bson(fillers(1_001)))]).unwrap_err().to_string();
+            assert!(err.contains(refused), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_stage_that_expands_counts_as_two_against_the_limit_as_the_reference_counts_it() {
+        // Measured on the reference: with 999 stages, `$count`, `$sortByCount`, `$bucket`,
+        // `$setWindowFields` and `$densify` are refused and with 998 they are accepted; every
+        // other stage probed is accepted with 999.
+        // (Not `$skip`, which a window of nothing is no stage: the parse is of the stages as
+        // they are counted, and a run of `$skip`s is one.)
+        let fillers = |n: usize| vec![doc! {"$redact": "$$KEEP"}; n];
+        let doubles = [
+            doc! {"$count": "n"},
+            doc! {"$sortByCount": "$a"},
+            doc! {"$bucket": {"groupBy": "$a", "boundaries": [0, 1]}},
+            doc! {"$setWindowFields": {"output": {"n": {"$documentNumber": {}}}, "sortBy": {"a": 1}}},
+            doc! {"$densify": {"field": "a", "range": {"step": 1, "bounds": "full"}}},
+        ];
+        for stage in doubles {
+            let name = stage.keys().next().unwrap().clone();
+            assert_eq!(stage_weight(&name), 2, "{name}");
+            let mut at_999 = fillers(999);
+            at_999.push(stage.clone());
+            let err = parse(&at_999).unwrap_err().to_string();
+            assert!(
+                err.contains("a pipeline has 1001 stages, over the limit of 1000"),
+                "{name}: {err}"
+            );
+            let mut at_998 = fillers(998);
+            at_998.push(stage);
+            assert_eq!(parse(&at_998).unwrap().len(), 999, "{name}");
+        }
+        // The rest are one each.
+        for stage in [
+            doc! {"$project": {"a": 1}},
+            doc! {"$group": {"_id": "$a"}},
+            doc! {"$bucketAuto": {"groupBy": "$a", "buckets": 2}},
+            doc! {"$unset": "a"},
+            doc! {"$set": {"a": 1}},
+            doc! {"$replaceWith": "$a"},
+            doc! {"$sort": {"a": 1}},
+            doc! {"$sample": {"size": 1}},
+            doc! {"$redact": "$$KEEP"},
+            doc! {"$unwind": "$a"},
+            doc! {"$fill": {"output": {"a": {"value": 0}}}},
+            doc! {"$facet": {"x": []}},
+            doc! {"$lookup": {"from": "b", "localField": "a", "foreignField": "a", "as": "j"}},
+            doc! {"$unionWith": "b"},
+            doc! {"$out": "o"},
+        ] {
+            let name = stage.keys().next().unwrap().clone();
+            assert_eq!(stage_weight(&name), 1, "{name}");
+            let mut at_999 = fillers(999);
+            at_999.push(stage);
+            assert_eq!(parse(&at_999).unwrap().len(), 1_000, "{name}");
+        }
+        // A sub-pipeline weighs its own stages the same way.
+        let branch = |stages: Vec<Document>| {
+            parse(&[
+                doc! {"$facet": {"a": stages.into_iter().map(Bson::Document).collect::<Vec<_>>()}},
+            ])
+        };
+        let mut over = fillers(999);
+        over.push(doc! {"$count": "n"});
+        assert!(branch(over).unwrap_err().to_string().contains("a pipeline has 1001 stages"));
+        let mut under = fillers(998);
+        under.push(doc! {"$count": "n"});
+        assert!(branch(under).is_ok());
+    }
+
+    #[test]
+    fn a_long_run_of_stages_that_stream_answers_what_the_loop_answers() {
+        // The order the stages run in is not visible in the answer of a pipeline that cannot
+        // fail: a long run of them is the same documents.
+        let mut specs = Vec::new();
+        for at in 0..400 {
+            specs.push(match at % 4 {
+                0 => doc! {"$addFields": {format!("f{at}"): at}},
+                1 => doc! {"$skip": 0},
+                2 => doc! {"$match": {"qty": {"$gte": 0}}},
+                _ => doc! {"$unset": format!("f{}", at - 3)},
+            });
+        }
+        let stages = parse(&specs).unwrap();
+        let run = |stage: &Stage, input, arrived| {
+            apply_charged(stage, input, &Limits::default(), &[], arrived)
+        };
+        let limits = Limits::default();
+        let mut chain = crate::pipeline::build(&stages, &run, &limits, &[]);
+        let _more = chain.push_all(sample()).unwrap();
+        let mut want = sample();
+        for stage in &stages {
+            want = apply(stage, want, &Limits::default()).unwrap();
+        }
+        assert_eq!(chain.finish().unwrap(), want);
+    }
+
+    #[test]
     fn match_then_count() {
         let out =
             run(vec![doc! {"$match": {"city": "London"}}, doc! {"$count": "n"}], sample()).unwrap();
@@ -3343,9 +3843,10 @@ mod tests {
     fn count_over_an_empty_stream_is_one_document_holding_zero() {
         // The count of nothing is defined, and it is 0. Emitting no document
         // would make every caller spell a defensive read for a value the stage
-        // always knows. Four differently-shaped ways of emptying the stream —
+        // always knows. Three differently-shaped ways of emptying the stream —
         // a filter matching nothing, a fan-out dropping every row, a `$skip`
-        // past the end, an explicit `$limit: 0` — and one answer for all.
+        // past the end — and one answer for all. (A `$limit: 0` is a `400`, as it is in the
+        // reference.)
 
         // The unwind case needs pinning beyond "the prefix came out empty":
         // if `_id: 3` ever left `sample()`, `$match` would select nothing,
@@ -3361,7 +3862,6 @@ mod tests {
             vec![doc! {"$match": {"city": "Berlin"}}],
             vec![doc! {"$match": {"_id": 3}}, doc! {"$unwind": "$tags"}],
             vec![doc! {"$skip": 999}],
-            vec![doc! {"$limit": 0}],
         ] {
             // Each prefix must really empty the stream, or the count below
             // would be the count of a non-empty one — this catches `$skip:
@@ -4110,6 +4610,24 @@ mod tests {
         assert!(parse(&[doc! {"$limit": 2.5}]).is_err());
         assert!(parse(&[doc! {"$limit": "ten"}]).is_err());
         assert!(parse(&[doc! {"$limit": 10}]).is_ok());
+    }
+
+    #[test]
+    fn a_limit_of_zero_is_refused_wherever_it_is_as_the_reference_refuses_it() {
+        let refused = "invalid query: $limit must be positive, found 0";
+        assert_eq!(parse(&[doc! {"$limit": 0}]).unwrap_err().to_string(), refused);
+        // However it is spelled, and after other stages.
+        assert!(parse(&[doc! {"$skip": 1}, doc! {"$limit": 0.0}]).is_err());
+        assert!(parse(&[doc! {"$limit": 1}]).is_ok());
+        let zero = vec![Bson::Document(doc! {"$limit": 0})];
+        for wrapped in [
+            doc! {"$facet": {"a": zero.clone()}},
+            doc! {"$lookup": {"from": "items", "pipeline": zero.clone(), "as": "items"}},
+            doc! {"$unionWith": {"coll": "items", "pipeline": zero.clone()}},
+        ] {
+            let err = parse(&[wrapped]).unwrap_err().to_string();
+            assert_eq!(err, refused);
+        }
     }
 
     #[test]

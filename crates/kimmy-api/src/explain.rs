@@ -566,6 +566,43 @@ mod tests {
         }
     }
 
+    /// A `$limit` that fills ends the source read (ADR-270), so the stats of the read are of a
+    /// partial one: how many it examined and matched are what it needed, and the plan, which
+    /// is what `explain` is held to, is the one it reports all the same.
+    #[test]
+    fn a_limit_ends_the_read_and_the_plan_is_still_the_one_explain_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed(&state, "a", 60, true);
+        let cases = [
+            // (the pipeline, the documents it needs of the source)
+            (json!([{ "$limit": 3 }]), 3, "collectionScan"),
+            (json!([{ "$match": { "n": 2 } }, { "$limit": 2 }]), 2, "index"),
+            (json!([{ "$match": { "k": { "$gt": 3 } } }, { "$limit": 2 }]), 2, "collectionScan"),
+            (
+                json!([{ "$match": { "_id": { "$in": [1, 2, 3] } } }, { "$limit": 1 }]),
+                1,
+                "idLookup",
+            ),
+            (
+                json!([{ "$match": { "n": 2 } }, { "$project": { "k": 1 } }, { "$limit": 2 }]),
+                2,
+                "index",
+            ),
+        ];
+        for (pipeline, needs, strategy) in cases {
+            let (answer, stats) = run_stats(&state, "a", &pipeline).unwrap();
+            let ran = stats.expect("a filtered source").to_json();
+            assert_eq!(answer["count"], needs, "{pipeline}");
+            assert_eq!(ran["documentsMatched"], needs, "{pipeline}: {ran}");
+            let examined = ran["documentsExamined"].as_u64().unwrap();
+            assert!(examined < 20, "{pipeline}: read {examined} of 60 documents");
+            let planned = explain(&state, &root(), "a", pipeline.clone()).unwrap();
+            assert_eq!(plan_keys(&planned["explain"]["source"]), plan_keys(&ran), "{pipeline}");
+            assert_eq!(planned["explain"]["source"]["strategy"], strategy, "{pipeline}");
+        }
+    }
+
     /// The access path has an order, and it is the one thing `explain` and the read
     /// share, so a test must pin it where both would move together: the primary key
     /// beats an index that also applies, and an index beats a scan.
@@ -780,6 +817,53 @@ mod tests {
         assert_eq!(stages[8]["field"], "total");
         assert!(stages.iter().all(|s| s["runs"] == "inMemory"));
         assert!(stages[7]["detail"].as_str().unwrap().contains("blocking"));
+    }
+
+    /// The stages a plan lists are the stages that run: a `$skip` and a `$limit` that are moved
+    /// ahead of the stages that neither filter nor change the count (ADR-270) are listed there,
+    /// coalesced, and a window behind a stage that blocks is listed behind it.
+    #[test]
+    fn a_window_is_listed_where_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed(&state, "a", 10, true);
+        let names = |pipeline: Value| -> Vec<String> {
+            let out = explain(&state, &root(), "a", pipeline).unwrap();
+            out["explain"]["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| match (s["skip"].as_i64(), s["limit"].as_i64()) {
+                    (Some(n), _) => format!("$skip {n}"),
+                    (_, Some(n)) => format!("$limit {n}"),
+                    _ => s["stage"].as_str().unwrap().to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(json!([
+                { "$addFields": { "x": 1 } },
+                { "$limit": 8 },
+                { "$skip": 5 },
+                { "$project": { "x": 1 } },
+                { "$skip": 1 },
+            ])),
+            ["$skip 6", "$limit 2", "$addFields", "$project"]
+        );
+        assert_eq!(
+            names(
+                json!([{ "$group": { "_id": "$n" } }, { "$project": { "n": 1 } }, { "$limit": 3 }])
+            ),
+            ["$group", "$limit 3", "$project"]
+        );
+        assert_eq!(
+            names(json!([{ "$sort": { "n": 1 } }, { "$project": { "n": 1 } }, { "$limit": 3 }])),
+            ["$sort", "$limit 3", "$project"]
+        );
+        assert_eq!(
+            names(json!([{ "$match": { "n": 1 } }, { "$limit": 3 }, { "$unwind": "$n" }])),
+            ["$limit 3", "$unwind"]
+        );
     }
 
     /// The two `$lookup` forms say what the executor does, including where it reads

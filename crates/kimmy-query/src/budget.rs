@@ -45,13 +45,34 @@ pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 /// same fallback, not what a member runs on.
 pub const DEFAULT_MEMORY_POOL_BYTES: usize = 2 * DEFAULT_MEMORY_LIMIT_BYTES;
 
-/// What a refusal tells the caller to do about a request over its limit.
+/// How a lease words its refusals: whose limit it is, and what the caller can do about a
+/// request over it (`413`) or one the pool cannot cover (`503`).
+///
+/// An aggregation's is [`AGGREGATION`], which a lease from [`BufferBudget::lease`] uses. A
+/// holder that is not an aggregation (a `find`'s index range) gives its own with
+/// [`BufferBudget::lease_worded`], since the remedies of an aggregation are not its.
+#[derive(Clone, Copy, Debug)]
+pub struct Wording {
+    /// Who holds the memory, in "the limit of N bytes {holder} may hold at once".
+    pub holder: &'static str,
+    /// What to do about a request over its limit.
+    pub over_limit: &'static str,
+    /// What to do about a request the pool cannot cover.
+    pub pool_busy: &'static str,
+}
+
+/// The wording of an aggregation's refusals.
 ///
 /// Only a leading `$match` narrows what the source reads (the executor reads the whole
 /// collection otherwise, and charges it before any stage runs); a `$project`, `$limit` or
 /// `$match` after it reduces what the later stages hold.
-const REMEDY: &str = "a leading $match narrows what is read; $project, $limit or $match after it \
-                      reduce what later stages hold; or raise aggregate.memory_limit_bytes";
+pub const AGGREGATION: Wording = Wording {
+    holder: "one aggregation",
+    over_limit: "a leading $match narrows what is read; $project, $limit or $match after it \
+                 reduce what later stages hold; or raise aggregate.memory_limit_bytes",
+    pool_busy: "a leading $match narrows what is read, and $project, $limit or $match after it \
+                reduce what later stages hold",
+};
 
 /// The BSON size of `doc`, worked out without encoding it. What the 16 MiB per-value bounds
 /// are held in; the budget charges [`held_bytes`].
@@ -229,6 +250,10 @@ struct PoolInner {
     /// Who holds a reservation, oldest first, and the wake-up for a request that waits.
     order: Mutex<Order>,
     freed: Condvar,
+    /// Requests asleep in [`MemoryPool::wait_for_release`]: a release wakes them only when
+    /// there are some, since waking is a system call that most releases (every key a `find`
+    /// puts back) have nobody to answer.
+    waiters: AtomicUsize,
     /// Charges refused for taking one request over its own limit, and charges refused
     /// because the pool was empty: what `/metrics` counts.
     limit_refusals: AtomicU64,
@@ -247,6 +272,7 @@ impl MemoryPool {
             used: AtomicUsize::new(0),
             order: Mutex::new(Order::default()),
             freed: Condvar::new(),
+            waiters: AtomicUsize::new(0),
             limit_refusals: AtomicU64::new(0),
             pool_refusals: AtomicU64::new(0),
         }))
@@ -307,7 +333,20 @@ impl MemoryPool {
                 Err(now) => used = now,
             }
         }
-        self.0.freed.notify_all();
+        self.wake();
+    }
+
+    /// The requests asleep in the wait now.
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> usize {
+        self.0.waiters.load(Ordering::SeqCst)
+    }
+
+    /// Wake the requests that wait for the pool, if there are any.
+    fn wake(&self) {
+        if self.0.waiters.load(Ordering::SeqCst) > 0 {
+            self.0.freed.notify_all();
+        }
     }
 
     fn order(&self) -> MutexGuard<'_, Order> {
@@ -329,7 +368,7 @@ impl MemoryPool {
     /// `seq` holds nothing now.
     fn unhold(&self, seq: u64) {
         self.order().holders.remove(&seq);
-        self.0.freed.notify_all();
+        self.wake();
     }
 
     /// Whether no request that holds a reservation is younger than `seq`: the one that is
@@ -344,9 +383,15 @@ impl MemoryPool {
     }
 
     /// Sleep until a release, or `slice` at the most.
+    ///
+    /// The count is raised before the wait begins, so a release after it is seen wakes the
+    /// request; one that came between the request's look at the pool and the count is
+    /// missed, and the slice is what bounds that.
     fn wait_for_release(&self, slice: Duration) {
+        self.0.waiters.fetch_add(1, Ordering::SeqCst);
         let order = self.order();
         let _ = self.0.freed.wait_timeout(order, slice);
+        self.0.waiters.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -460,7 +505,12 @@ impl BufferBudget {
 
     /// An account on this budget, named `what` in a refusal.
     pub fn lease(&self, what: &'static str) -> Lease {
-        Lease { budget: self.clone(), what, own: 0 }
+        self.lease_worded(what, AGGREGATION)
+    }
+
+    /// [`Self::lease`], whose refusals are worded by `wording` rather than an aggregation's.
+    pub fn lease_worded(&self, what: &'static str, wording: Wording) -> Lease {
+        Lease { budget: self.clone(), what, own: 0, wording }
     }
 }
 
@@ -470,6 +520,7 @@ pub struct Lease {
     budget: BufferBudget,
     what: &'static str,
     own: usize,
+    wording: Wording,
 }
 
 impl Lease {
@@ -492,11 +543,10 @@ impl Lease {
                 bytes: inner.used,
                 max: inner.cap,
                 limit: format!(
-                    "limit of {} bytes one aggregation may hold at once \
-                     (aggregate.memory_limit_bytes)",
-                    inner.cap
+                    "limit of {} bytes {} may hold at once (aggregate.memory_limit_bytes)",
+                    inner.cap, self.wording.holder
                 ),
-                remedy: REMEDY,
+                remedy: self.wording.over_limit,
             });
         }
         let want = inner.used - inner.reserved;
@@ -535,6 +585,7 @@ impl Lease {
                         bytes: want,
                         pool: pool.cap(),
                         in_use: pool.used(),
+                        remedy: self.wording.pool_busy,
                     });
                 }
                 pool.wait_for_release(POOL_WAIT_SLICE.min(give_up - now));
@@ -617,6 +668,20 @@ pub(crate) fn output_of(stage: &str) -> &'static str {
     }
 }
 
+/// What the state of a stage that holds its groups and not its input is named in a refusal
+/// for the bytes it holds (ADR-270): the buckets of a `$group`, the heap of a `$sort` that
+/// keeps the first documents, the reservoir of a `$sample`.
+pub(crate) fn state_of(stage: &str) -> &'static str {
+    match stage {
+        "$group" => "the buckets of $group",
+        "$bucket" => "the buckets of $bucket",
+        "$sortByCount" => "the buckets of $sortByCount",
+        "$sort" => "the heap of $sort",
+        "$sample" => "the reservoir of $sample",
+        _ => "the state of a stage",
+    }
+}
+
 /// What a stage's input is named in a refusal for the bytes it holds.
 pub(crate) fn input_of(stage: &str) -> &'static str {
     match stage {
@@ -639,6 +704,9 @@ pub(crate) fn input_of(stage: &str) -> &'static str {
         "$sample" => "the input of $sample",
         "$redact" => "the input of $redact",
         "$unionWith" => "the input of $unionWith",
+        "$setWindowFields" => "the input of $setWindowFields",
+        "$densify" => "the input of $densify",
+        "$fill" => "the input of $fill",
         _ => "the input of a stage",
     }
 }

@@ -9,8 +9,8 @@ use kimmy_core::Error;
 
 use crate::aggregate::{self, Limits};
 use crate::budget::{
-    BufferBudget, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_MEMORY_POOL_BYTES, MemoryPool, doc_bytes,
-    docs_bytes, held_bytes, held_bytes_bson, held_docs_bytes,
+    BufferBudget, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_MEMORY_POOL_BYTES, MemoryPool, Wording,
+    doc_bytes, docs_bytes, held_bytes, held_bytes_bson, held_docs_bytes,
 };
 
 fn capped(cap: usize) -> Limits {
@@ -148,7 +148,7 @@ fn a_request_the_pool_cannot_cover_is_refused_with_a_retry_and_reserves_nothing(
     assert!(
         matches!(
             &err,
-            Error::MemoryBusy { what: "the source read", bytes: 50, pool: 100, in_use: 60 }
+            Error::MemoryBusy { what: "the source read", bytes: 50, pool: 100, in_use: 60, .. }
         ),
         "{err:?}"
     );
@@ -184,6 +184,49 @@ fn the_pool_total_in_a_refusal_includes_what_the_refused_request_holds() {
     // Another 50 does not fit: 70 are reserved, 30 of them this request's own.
     let err = lease.charge(50).unwrap_err();
     assert!(matches!(&err, Error::MemoryBusy { bytes: 50, pool: 100, in_use: 70, .. }), "{err:?}");
+}
+
+#[test]
+fn a_lease_words_its_refusals_by_its_holder_and_an_aggregations_keep_the_text_they_had() {
+    let find = Wording {
+        holder: "one find",
+        over_limit: "narrow the filter",
+        pool_busy: "narrow it, or sort",
+    };
+    // Over the limit, `413`: the holder, the bytes, the limit and the remedy are the lease's.
+    let budget = BufferBudget::new(10);
+    let err = budget.lease_worded("the index range", find).charge(11).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the index range is 11 bytes, over the limit of 10 bytes one find may hold at once \
+         (aggregate.memory_limit_bytes); narrow the filter"
+    );
+    // A lease that is not given a wording is an aggregation's, to the word.
+    let err = budget.lease("the source read").charge(11).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the source read is 11 bytes, over the limit of 10 bytes one aggregation may hold at \
+         once (aggregate.memory_limit_bytes); a leading $match narrows what is read; $project, \
+         $limit or $match after it reduce what later stages hold; or raise \
+         aggregate.memory_limit_bytes"
+    );
+    // The pool is full, `503`.
+    let pool = MemoryPool::new(100);
+    let first = BufferBudget::pooled(100, &pool);
+    let mut held = first.lease("first");
+    held.charge(60).unwrap();
+    let second = BufferBudget::pooled(100, &pool);
+    let err = second.lease_worded("the index range", find).charge(50).unwrap_err();
+    assert!(err.to_string().ends_with("retry later, or hold less: narrow it, or sort"), "{err}");
+    let err = second.lease("the source read").charge(50).unwrap_err();
+    assert!(
+        err.to_string().ends_with(
+            "retry later, or hold less: a leading $match narrows what is read, and $project, \
+             $limit or $match after it reduce what later stages hold"
+        ),
+        "{err}"
+    );
+    held.release(60);
 }
 
 #[test]
@@ -292,6 +335,37 @@ fn an_older_request_waits_for_the_pool_and_is_woken_by_a_release() {
     assert_eq!((pool.pool_refusals(), pool.holders()), (0, 1));
     drop(older);
     assert_eq!((pool.used(), pool.holders()), (0, 0));
+}
+
+#[test]
+fn the_pool_counts_the_requests_that_sleep_in_its_wait_and_a_release_wakes_them() {
+    // A release wakes the requests that wait only when there are some (it is a system call,
+    // and most releases have nobody to answer). While the older waits it is counted, a release
+    // wakes it at once and not at the end of its slice, and none is counted after.
+    let pool = MemoryPool::new(100);
+    let (_b, mut older) = holder(&pool, 10);
+    let (_a, younger) = holder(&pool, 80);
+    assert_eq!(pool.waiters(), 0);
+    let waiter = std::thread::spawn(move || {
+        let result = older.charge(50);
+        (result, older)
+    });
+    let started = Instant::now();
+    while pool.waiters() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "the older request never waited");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(pool.waiters(), 1);
+    drop(younger);
+    let (result, older) = waiter.join().unwrap();
+    result.unwrap();
+    assert_eq!(pool.waiters(), 0);
+    drop(older);
+    assert_eq!((pool.used(), pool.holders(), pool.waiters()), (0, 0, 0));
+    // With nobody waiting, releases and leaves are not wakes: they still return the bytes.
+    let (_c, held) = holder(&pool, 40);
+    drop(held);
+    assert_eq!((pool.used(), pool.waiters()), (0, 0));
 }
 
 #[test]
@@ -1498,4 +1572,409 @@ fn merge_objects_is_charged_by_the_document_it_builds_not_by_the_documents_it_re
     let held_same = held_docs_bytes(&same);
     let smallest = smallest_cap(&stage, &same, 4 * held_same);
     assert!(smallest < held_same + 3_000, "{smallest}");
+}
+
+// ---------------------------------------------------------------------------
+// The stages that stream (ADR-270): what a run of them holds
+// ---------------------------------------------------------------------------
+
+/// A chain over `stages`, each stage run as the pure pipeline runs it.
+fn chain_of<'a>(
+    stages: &'a [aggregate::Stage],
+    limits: &'a Limits,
+) -> crate::pipeline::Chain<'a, Error> {
+    // Boxed and leaked: the runner has to outlive the chain it is given to, and a test is short.
+    let run: crate::pipeline::Runner<'static, Error> = Box::leak(Box::new({
+        let limits = limits.clone();
+        move |stage: &aggregate::Stage, input, arrived| {
+            aggregate::apply_charged(stage, input, &limits, &[], arrived)
+        }
+    }));
+    crate::pipeline::build(stages, run, limits, &[])
+}
+
+/// The stages that stream, each one that keeps no field of its own the tail looks for, then a
+/// `$match` that drops every document, so that what a run holds is what is measured.
+fn streaming_stages() -> Vec<Document> {
+    vec![
+        doc! {"$match": {"g": {"$gte": 0}}},
+        doc! {"$project": {"p": "$pad", "g": 1}},
+        doc! {"$addFields": {"e": "$pad"}},
+        doc! {"$set": {"e": "$pad"}},
+        doc! {"$unset": "g"},
+        doc! {"$replaceRoot": {"newRoot": {"p": "$pad"}}},
+        doc! {"$replaceWith": {"p": "$pad"}},
+        doc! {"$redact": "$$KEEP"},
+        doc! {"$unwind": "$pad"},
+        doc! {"$skip": 0},
+        doc! {"$limit": 1_000_000},
+    ]
+}
+
+#[test]
+fn a_stage_that_streams_holds_one_document_and_charges_nothing_that_lasts() {
+    let nothing = doc! {"$match": {"nothing": 1}};
+    for stage in streaming_stages() {
+        let stages = aggregate::parse(&[stage.clone(), nothing.clone()]).unwrap();
+        // A budget of nothing: no document is held, so none is charged.
+        let limits = capped(0);
+        let mut chain = chain_of(&stages, &limits);
+        for doc in padded(200, 200) {
+            assert!(chain.push(doc).is_ok(), "{stage}");
+            assert_eq!(limits.buffer.used(), 0, "{stage}");
+        }
+        assert!(chain.finish().unwrap().is_empty(), "{stage}");
+    }
+}
+
+#[test]
+fn a_vec_given_to_a_stage_that_streams_is_charged_as_its_input_and_given_back_as_it_is_taken() {
+    let input = padded(20, 200);
+    let held_in = held_docs_bytes(&input);
+    let nothing = doc! {"$match": {"nothing": 1}};
+    for stage in streaming_stages() {
+        let stages = aggregate::parse(&[stage.clone(), nothing.clone()]).unwrap();
+        let name = crate::budget::input_of(stages[0].name());
+        // Room for the input and no more: it is drained and the budget is empty again.
+        let limits = capped(held_in);
+        assert!(chain_of(&stages, &limits).push_all(input.clone()).is_ok(), "{stage}");
+        assert_eq!(limits.buffer.used(), 0, "{stage}");
+        // A byte under it is refused on arrival, naming the stage the main loop named.
+        let limits = capped(held_in - 1);
+        let err = chain_of(&stages, &limits).push_all(input.clone()).unwrap_err();
+        let Error::ValueTooLarge { what, bytes, .. } = &err else { panic!("{stage}: {err:?}") };
+        assert_eq!((*what, *bytes), (name, held_in), "{stage}");
+        assert_eq!(limits.buffer.used(), 0, "{stage}: gives everything back when refused");
+    }
+}
+
+/// One document of about 1 MiB with `levels` arrays of two numbers, `a0` to `a<levels-1>`.
+fn deep(levels: usize) -> Document {
+    let mut doc = doc! {"_id": 1, "pad": "x".repeat(1 << 20)};
+    for level in 0..levels {
+        doc.insert(format!("a{level}"), vec![1, 2]);
+    }
+    doc
+}
+
+#[test]
+fn a_fan_of_unwind_holds_its_document_and_its_elements_and_is_charged_for_them() {
+    // Fifty `$unwind`s over fifty arrays: the first descent stands fifty fans, each holding
+    // the document its array is unwound from. Charged, they are refused at the budget; they
+    // were fifty uncounted copies, 50 MiB here and a member's memory with a larger document.
+    let doc = deep(50);
+    let one = held_bytes(&doc);
+    let mut specs: Vec<Document> =
+        (0..50).map(|level| doc! {"$unwind": format!("$a{level}")}).collect();
+    specs.push(doc! {"$limit": 1});
+    let stages = aggregate::parse(&specs).unwrap();
+    let cap = 10 * one;
+    let limits = capped(cap);
+    let mut chain = chain_of(&stages, &limits);
+    let err = chain.push(doc.clone()).unwrap_err();
+    let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!(*what, "the input of $unwind");
+    assert_eq!(*max, cap);
+    // Refused at the fan that took the hold over the cap: the eleventh, not the fiftieth.
+    assert!(*bytes > cap && *bytes <= cap + one, "held {bytes} of {cap}, a fan is {one}");
+    drop(chain);
+    assert_eq!(limits.buffer.used(), 0, "gives everything back when refused");
+    // Room for all fifty fans, and the same pipeline answers one document and holds nothing
+    // after it.
+    let limits = capped(60 * one);
+    let mut chain = chain_of(&stages, &limits);
+    assert_eq!(chain.push(doc).unwrap(), crate::pipeline::Flow::Done);
+    // What is held is the answer's one document, and no fan.
+    let held = limits.buffer.used();
+    let out = chain.finish().unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(held, held_bytes(&out[0]), "the fans are given back when the limit is full");
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+#[test]
+fn unwinds_that_do_not_fan_out_hold_nothing_however_many_there_are() {
+    // 998 `$unwind`s of a path the document does not have, keeping it: each hands the
+    // document on, and none holds a copy. The reviewer's shape, at a megabyte.
+    let doc = deep(0);
+    let one = held_bytes(&doc);
+    let mut specs: Vec<Document> = (0..998)
+        .map(|_| doc! {"$unwind": {"path": "$none", "preserveNullAndEmptyArrays": true}})
+        .collect();
+    specs.push(doc! {"$limit": 1});
+    let stages = aggregate::parse(&specs).unwrap();
+    // Room for the one document the answer holds, and no more.
+    let limits = capped(one);
+    let mut chain = chain_of(&stages, &limits);
+    assert_eq!(chain.push(doc).unwrap(), crate::pipeline::Flow::Done);
+    assert_eq!(chain.finish().unwrap().len(), 1);
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+#[test]
+fn a_descent_of_single_element_unwinds_holds_one_document_as_the_loop_did() {
+    // Fifty arrays of one element each, fifty `$unwind`s: each fan hands its one element out
+    // with the document itself, and keeps nothing, so the descent holds the document once
+    // (the loop held it twice, as a stage's input and its output, and so did not hold fifty).
+    let mut doc = deep(0);
+    for level in 0..50 {
+        doc.insert(format!("a{level}"), vec![1]);
+    }
+    let one = held_bytes(&doc);
+    let mut specs: Vec<Document> =
+        (0..50).map(|level| doc! {"$unwind": format!("$a{level}")}).collect();
+    specs.push(doc! {"$limit": 1});
+    let stages = aggregate::parse(&specs).unwrap();
+    // Room for the document in flight, and the one the answer holds: a few documents' worth.
+    let limits = capped(3 * one);
+    let mut chain = chain_of(&stages, &limits);
+    assert_eq!(chain.push(doc).unwrap(), crate::pipeline::Flow::Done);
+    assert_eq!(chain.finish().unwrap().len(), 1);
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+#[test]
+fn a_fan_is_charged_for_what_it_still_holds_and_nothing_after_its_elements_are_out() {
+    // Two elements: the fan keeps the document for the second and is charged for it and the
+    // element still to come; once the second is out, the document went with it. A deeper
+    // fan's descent is therefore charged one document, not one for each level.
+    let mut doc = deep(0);
+    for level in 0..50 {
+        doc.insert(format!("a{level}"), vec![1, 2]);
+    }
+    let one = held_bytes(&doc);
+    let mut specs: Vec<Document> =
+        (0..50).map(|level| doc! {"$unwind": format!("$a{level}")}).collect();
+    specs.push(doc! {"$limit": 2});
+    let stages = aggregate::parse(&specs).unwrap();
+    // Fifty fans stand during the first descent (each is on its first of two elements), and
+    // only the last element of each hands the document on: 60 documents is room for it.
+    let limits = capped(60 * one);
+    let mut chain = chain_of(&stages, &limits);
+    assert_eq!(chain.push(doc).unwrap(), crate::pipeline::Flow::Done);
+    assert_eq!(chain.finish().unwrap().len(), 2);
+    assert_eq!(limits.buffer.used(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The stages that hold a state and not their input (ADR-270)
+// ---------------------------------------------------------------------------
+
+/// The stages that keep their groups, each keeping the padding of what it is given.
+fn grouping_stages() -> Vec<Document> {
+    vec![
+        doc! {"$group": {"_id": "$g", "p": {"$push": "$pad"}}},
+        doc! {"$bucket": {"groupBy": "$g", "boundaries": [0, 1, 2, 3],
+        "output": {"p": {"$push": "$pad"}}}},
+        doc! {"$sortByCount": "$_id"},
+    ]
+}
+
+#[test]
+fn a_count_holds_a_counter_and_charges_the_budget_and_the_pool_nothing() {
+    let pool = MemoryPool::new(1 << 30);
+    let limits = pooled(0, &pool);
+    let stages = aggregate::parse(&[doc! {"$count": "n"}]).unwrap();
+    let mut chain = chain_of(&stages, &limits);
+    for doc in padded(500, 200) {
+        let _ = chain.push(doc).unwrap();
+        assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
+    }
+    assert_eq!(chain.finish().unwrap(), [doc! {"n": 500}]);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
+}
+
+/// [`chain_of`] with every stage a barrier, as the chain was built before the stages that keep
+/// a state were sinks (ADR-270, P1).
+fn barrier_chain_of<'a>(
+    stages: &'a [aggregate::Stage],
+    limits: &'a Limits,
+) -> crate::pipeline::Chain<'a, Error> {
+    let run: crate::pipeline::Runner<'static, Error> = Box::leak(Box::new({
+        let limits = limits.clone();
+        move |stage: &aggregate::Stage, input, arrived| {
+            aggregate::apply_charged(stage, input, &limits, &[], arrived)
+        }
+    }));
+    crate::pipeline::build_barriers(stages, run, limits, &[])
+}
+
+#[test]
+fn a_state_holds_what_the_barrier_it_replaces_held_its_input_beside() {
+    // Five hundred documents streamed to a `$count`, a `$group` of three buckets and a `$sort`
+    // with a `$limit` of three: the barrier charged every document as it arrived (the whole
+    // input, in the lease and in the pool), and the sink holds the counter, which is nothing,
+    // the three buckets, and three documents with their keys.
+    let input = padded(500, 300);
+    let held_in = held_docs_bytes(&input);
+    let cases = [
+        vec![doc! {"$count": "n"}],
+        vec![doc! {"$group": {"_id": "$g", "n": {"$sum": 1}}}],
+        vec![doc! {"$sort": {"g": 1}}, doc! {"$limit": 3}],
+    ];
+    for specs in cases {
+        let stages = aggregate::parse(&specs).unwrap();
+        // What the chain holds, in its lease and in the pool, once the input has been pushed.
+        let held = |barriers: bool| {
+            let pool = MemoryPool::new(1 << 30);
+            let limits = pooled(1 << 30, &pool);
+            let mut chain = if barriers {
+                barrier_chain_of(&stages, &limits)
+            } else {
+                chain_of(&stages, &limits)
+            };
+            for doc in &input {
+                let _ = chain.push(doc.clone()).unwrap();
+            }
+            assert_eq!(pool.used(), limits.buffer.used(), "{specs:?}");
+            limits.buffer.used()
+        };
+        let (barrier, sink) = (held(true), held(false));
+        assert_eq!(barrier, held_in, "{specs:?}: the barrier held its input");
+        if stages[0].name() == "$count" {
+            assert_eq!(sink, 0, "a counter holds nothing");
+        } else {
+            assert!(sink > 0 && sink * 50 < held_in, "{specs:?}: {sink} of {held_in}");
+        }
+    }
+}
+
+#[test]
+fn the_buckets_of_a_group_are_charged_as_they_grow_exactly_as_the_stage_charged_them() {
+    let input = padded(60, 300);
+    let held_in = held_docs_bytes(&input);
+    for spec in grouping_stages() {
+        let pool = MemoryPool::new(1 << 30);
+        let limits = pooled(1 << 30, &pool);
+        let stages = aggregate::parse(std::slice::from_ref(&spec)).unwrap();
+        let mut chain = chain_of(&stages, &limits);
+        let mut seen = Vec::new();
+        for doc in &input {
+            let _ = chain.push(doc.clone()).unwrap();
+            seen.push(limits.buffer.used());
+            assert_eq!(pool.used(), limits.buffer.used(), "{spec}");
+        }
+        // It grows with the buckets and the values they keep, and never holds the input.
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]) && seen[59] > seen[0], "{spec}: {seen:?}");
+        let held = limits.buffer.used();
+        // What the stage charged for its buckets when it held the whole input: the cheapest
+        // budget it ran in was its input, and the buckets beside it.
+        let barrier = smallest_cap(&spec, &input, 4 * held_in);
+        assert_eq!(held, barrier - held_in, "{spec}: the state is what the buckets were");
+        let out = chain.finish().unwrap();
+        assert!(!out.is_empty(), "{spec}");
+        assert_eq!((limits.buffer.used(), pool.used()), (0, 0), "{spec}: given back");
+    }
+}
+
+#[test]
+fn the_buckets_of_a_group_are_refused_at_the_byte_past_the_limit_and_the_pool_is_given_back() {
+    let input = padded(60, 300);
+    for spec in grouping_stages() {
+        let stages = aggregate::parse(std::slice::from_ref(&spec)).unwrap();
+        let name = crate::budget::state_of(stages[0].name());
+        // The state at the thirtieth document, found by running to it.
+        let pool = MemoryPool::new(1 << 30);
+        let limits = pooled(1 << 30, &pool);
+        let mut chain = chain_of(&stages, &limits);
+        for doc in &input[..30] {
+            let _ = chain.push(doc.clone()).unwrap();
+        }
+        let cap = limits.buffer.used();
+        drop(chain);
+        assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
+        // A budget of exactly that holds thirty; the thirty-first is refused at its byte.
+        let limits = pooled(cap, &pool);
+        let mut chain = chain_of(&stages, &limits);
+        for doc in &input[..30] {
+            let _ = chain.push(doc.clone()).unwrap();
+        }
+        let err = chain.push(input[30].clone()).unwrap_err();
+        let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+        assert_eq!((*what, *max), (name, cap), "{spec}");
+        assert!(*bytes > cap, "{spec}: refused at {bytes}");
+        drop(chain);
+        assert_eq!((limits.buffer.used(), pool.used()), (0, 0), "{spec}: gives it all back");
+    }
+}
+
+#[test]
+fn the_heap_of_a_sort_holds_the_documents_it_keeps_and_not_the_input() {
+    let input = padded(100, 300);
+    let sort = doc! {"$sort": {"g": -1, "_id": 1}};
+    let pool = MemoryPool::new(1 << 30);
+    // What one document costs the heap: itself and its two keys.
+    let entry = {
+        let limits = pooled(1 << 30, &pool);
+        let stages = aggregate::parse(&[sort.clone(), doc! {"$limit": 4}]).unwrap();
+        let mut chain = chain_of(&stages, &limits);
+        let _ = chain.push(input[0].clone()).unwrap();
+        limits.buffer.used()
+    };
+    assert!(entry > held_docs_bytes(&input[..1]), "the keys are charged with the document");
+    // Room for five: the four it keeps and the one it takes before it turns another out. A
+    // `$sort` of the hundred and a `$limit` of four is answered, and the budget and the pool
+    // are empty afterwards.
+    let limits = pooled(5 * entry + entry / 2, &pool);
+    let stages = aggregate::parse(&[sort.clone(), doc! {"$limit": 4}]).unwrap();
+    let mut chain = chain_of(&stages, &limits);
+    let mut most = 0;
+    for doc in &input {
+        let _ = chain.push(doc.clone()).unwrap();
+        most = most.max(limits.buffer.used());
+        assert_eq!(pool.used(), limits.buffer.used());
+    }
+    // Four held, each with its keys: not the hundred, which no budget here holds.
+    assert!(most > 3 * entry && most <= 4 * entry + entry / 2, "held {most}, an entry is {entry}");
+    let out = chain.finish().unwrap();
+    assert_eq!(out.iter().map(|d| d.get_i32("_id").unwrap()).collect::<Vec<_>>(), [2, 5, 8, 11]);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
+    // The same sort with a `$skip` holds the documents it skips as well: seven, and a budget of
+    // six is refused at the byte of the seventh.
+    let limits = pooled(6 * entry, &pool);
+    let stages = aggregate::parse(&[sort, doc! {"$skip": 3}, doc! {"$limit": 4}]).unwrap();
+    let mut chain = chain_of(&stages, &limits);
+    let err = input
+        .iter()
+        .find_map(|doc| chain.push(doc.clone()).err())
+        .expect("seven documents do not fit in six");
+    let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!((*what, *max), ("the heap of $sort", 6 * entry));
+    assert!(*bytes > 6 * entry && *bytes < 7 * entry + entry / 2, "refused at {bytes}");
+    drop(chain);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0), "gives it all back when refused");
+}
+
+#[test]
+fn the_reservoir_of_a_sample_holds_the_documents_it_keeps_and_gives_them_back() {
+    let input = padded(200, 300);
+    let pool = MemoryPool::new(1 << 30);
+    let limits = pooled(1 << 30, &pool);
+    let stages = aggregate::parse(&[doc! {"$sample": {"size": 5}}]).unwrap();
+    let one = {
+        let mut chain = chain_of(&stages, &limits);
+        let _ = chain.push(input[0].clone()).unwrap();
+        limits.buffer.used()
+    };
+    // Room for the five it keeps and nothing else: two hundred documents go through it, the
+    // ones that replace another are charged and the ones they replace given back one for one.
+    let limits = pooled(6 * one, &pool);
+    let mut chain = chain_of(&stages, &limits);
+    let mut most = 0;
+    for doc in &input {
+        let _ = chain.push(doc.clone()).unwrap();
+        most = most.max(limits.buffer.used());
+        assert_eq!(pool.used(), limits.buffer.used());
+    }
+    assert!(most > 4 * one && most < 6 * one, "held {most}, a document is {one}");
+    assert_eq!(chain.finish().unwrap().len(), 5);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0));
+    // One document less of room and the fifth is refused at its byte.
+    let limits = pooled(4 * one + one / 2, &pool);
+    let mut chain = chain_of(&stages, &limits);
+    let err = input.iter().find_map(|doc| chain.push(doc.clone()).err()).expect("refused");
+    let Error::ValueTooLarge { what, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!((*what, *max), ("the reservoir of $sample", 4 * one + one / 2));
+    drop(chain);
+    assert_eq!((limits.buffer.used(), pool.used()), (0, 0), "gives it all back when refused");
 }
