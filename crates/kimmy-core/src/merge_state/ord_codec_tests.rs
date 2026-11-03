@@ -712,3 +712,42 @@ fn a_writer_cannot_have_two_histories_but_decode_cannot_tell() {
         "associativity, which one history has"
     );
 }
+
+/// O1-3: the reviewer's example of a single-state shape that breaks associativity against reachable
+/// partners: `{W: (5, W)}`, `{U(7, X)}` and a first KEYED by W but STAMPED by V, `{W: (9, V)}`.
+/// Decode refuses the third (`OrdFirstNotByItsWriter`); were it accepted, the groupings would
+/// disagree: `(a + c) + b` keeps no first for W, `a + (c + b)` keeps `(9, V)`.
+#[test]
+fn a_first_keyed_by_one_writer_and_stamped_by_another_is_refused() {
+    let o = JoinOptions::default();
+    let (wr, x, v) = (w(b'A'), b'B', b'C');
+    let a = FieldOrd {
+        firsts: [(wr, (at(5, b'A'), 0))].into(),
+        last: Some((at(5, b'A'), 0)),
+        ..FieldOrd::default()
+    };
+    let b = FieldOrd { floor: Some(u(7, x, 6, false)), ..FieldOrd::default() };
+    let c = FieldOrd {
+        firsts: [(wr, (at(9, v), 0))].into(),
+        last: Some((at(9, v), 0)),
+        ..FieldOrd::default()
+    };
+    for ok in [&a, &b] {
+        assert!(
+            MergeState::decode_compact(&entry_state(false, ok.clone()).encode_compact()).is_ok()
+        );
+    }
+    assert_eq!(
+        MergeState::decode_compact(&entry_state(false, c.clone()).encode_compact()),
+        Err(DecodeError::OrdFirstNotByItsWriter)
+    );
+    assert_eq!(
+        c.shape_error(&OrdAt::Field(Path::flat("x").unwrap())),
+        Some(DecodeError::OrdFirstNotByItsWriter)
+    );
+    // what the refusal prevents
+    let left = ord_join(&ord_join(&a, &c, &o), &b, &o);
+    let right = ord_join(&a, &ord_join(&c, &b, &o), &o);
+    assert!(left.firsts.is_empty(), "{left:?}");
+    assert_eq!(right.firsts, [(wr, (at(9, v), 0))].into());
+}
