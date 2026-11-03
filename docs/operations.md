@@ -2752,7 +2752,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.59.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.60.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2772,7 +2772,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.59.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.60.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2862,6 +2862,22 @@ limit …` on each member, and raise them if a pipeline you run holds more.
 `server.request_timeout_secs` (30 s by default) now also ends a running query:
 raise it if one legitimately takes longer. **Rolling back:** stop every member,
 then start 0.58.0 on the same data directories.
+
+**Upgrading from 0.59.x to 0.60.0: stop all, start all. No wipe.** The storage
+schema is still 7 and the cluster protocol still 2, so 0.60.0 opens a 0.59.0
+store and backup as they are. Run one release: stop every member, then start
+them all on 0.60.0; two releases in one cluster would disagree on what the
+memory limits refuse and on the result types of the new operators. No setting is
+new. `aggregate.memory_limit_bytes` and `aggregate.memory_pool_bytes` now also
+bound what a `find`, an `update`, `delete` or `find_and_modify` over an index
+range and a filtered vector search hold (the keys of the range, the documents a
+write matches, the ids a filter admits), so a request that answered over a very
+large range can be `413` or `503`: check the startup line `aggregate memory: pool
+… per-request limit …` on each member, and raise them if a request you run holds
+more. An aggregation over a collection above the per-request limit is answered
+now when its first stage is a `$count`, `$group`, `$bucket`, `$sortByCount`,
+`$sample`, a `$sort` with a `$limit`, or a stage that streams. **Rolling back:**
+stop every member, then start 0.59.0 on the same data directories.
 
 ### Rolling back, and `kimmy.format`
 
