@@ -1178,7 +1178,10 @@ fn the_read_equals_the_model_with_absorbed_on() {
 /// can reach it (the model cannot name the field). Here: they are two keys with two encodings (a
 /// segment count of 0, and a count of 1 with an empty segment), in this order; and a replace (the root's
 /// level mark) and a `$set "" = {c}` (the level mark of the field `""`) joined in both orders leave each
-/// mark at its own key.
+/// mark at its own key. A NOTE FOR O2: the feed must write a top-level field named `""` as
+/// `OrdAt::Field([""])`, never as the root: fed as the root, `OrdRootNotALevel` would refuse an honest
+/// document. The state below is that honest document (a replace's root mark and a top-level `""`
+/// with a level mark and a child) and `decode` accepts it.
 #[test]
 fn the_root_and_a_top_level_field_named_empty_are_distinct_keys() {
     let o = JoinOptions::default();
@@ -1223,7 +1226,17 @@ fn the_root_and_a_top_level_field_named_empty_are_distinct_keys() {
     assert_ne!(replace.encode_compact(), set.encode_compact());
     assert_eq!(ab.ords.keys().filter(|k| k.1 == OrdAt::Root).count(), 1);
     let enc = ab.encode_compact();
+    assert_eq!(
+        ab.check_decoded(),
+        Ok(()),
+        "an honest document with a root mark and a top-level \"\""
+    );
     assert_eq!(MergeState::decode_compact(&enc).as_ref(), Ok(&ab));
+    // and the root is refused as soon as it holds more than a level mark: what a feed that wrote the
+    // field `""` as the root would have made
+    let mut as_root = ab.clone();
+    as_root.ords.get_mut(&key_root).unwrap().last = Some((at(7, b'B'), 0));
+    assert_eq!(as_root.check_decoded(), Err(DecodeError::OrdRootNotALevel));
     // the key bytes: life 0, then a segment count of 0 (the root) or a count of 1 and an empty segment
     let root_only = {
         let mut s = base();
