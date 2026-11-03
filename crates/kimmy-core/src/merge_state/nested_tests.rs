@@ -501,6 +501,62 @@ fn a_local_write_below_a_scalar_or_an_array_is_refused_without_a_stamp() {
     ok(refuses_below_a_scalar(&opts()));
 }
 
+// ---- a sub-document is decomposed, never one register -------------------------------------
+
+/// `I` writes a nested document `{a: {x: 1}}` with `first` (an insert, or a replace of an
+/// inserted `{q: 0}`); `A` and `B` then hold it and `$set a.b` and `$set a.c` concurrently.
+/// The document must be stored DECOMPOSED, a map marker at `a` and a cell for `a.x`, and no
+/// register may hold a document; and both sets must survive in every delivery order (were `a`
+/// one atomic register, the newer set would replace the whole of it).
+fn nested_document_is_decomposed(
+    first: &dyn Fn(&mut Mem) -> Option<MStamp>,
+    rest: &[(&str, Value)],
+) -> Result<(), String> {
+    let o = opts();
+    let (mut mi, mut ma, mut mb) = (Mem::new('I', &o), Mem::new('A', &o), Mem::new('B', &o));
+    let st = first(&mut mi).ok_or("the write of the nested document was refused")?;
+    let cells: Vec<(Path, Value)> =
+        mi.w.state
+            .regs
+            .iter()
+            .filter(|(_, r)| r.stamp == st && r.value != Value::Unset)
+            .map(|((_, p), r)| (p.clone(), r.value.clone()))
+            .collect();
+    if cells != [(np("a"), M), (np("a.x"), i(1))] {
+        return Err(format!("not a marker and a leaf: {cells:?}"));
+    }
+    if mi.w.state.regs.values().any(|r| matches!(r.value, Value::Document(_))) {
+        return Err("a register holds a document".into());
+    }
+    let seed: Vec<Ent> = mi.oplog.values().cloned().collect();
+    for m in [&mut ma, &mut mb] {
+        seed.iter().for_each(|e| m.receive_entry(e));
+    }
+    let sa = ma.set_at(&np("a.b"), i(2), 0).ok_or("A's write was refused")?;
+    let sb = mb.set_at(&np("a.c"), i(3), 0).ok_or("B's write was refused")?;
+    let ents = [ma.ent(sa), mb.ent(sb)];
+    let mut items = vec![("a", M), ("a.b", i(2)), ("a.c", i(3)), ("a.x", i(1))];
+    items.extend(rest.iter().cloned());
+    for (ord, m) in all_orders(&o, &ents, &seed) {
+        if m.visible() != want(&items) {
+            return Err(format!("delivery {ord:?}: read {:?}, want {items:?}", m.visible()));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn an_insert_or_replace_of_a_nested_document_is_decomposed_so_concurrent_child_sets_survive() {
+    ok(nested_document_is_decomposed(&|m| m.ins(&[("a", sub(&[("x", i(1))]))], 0), &[]));
+    ok(nested_document_is_decomposed(
+        &|m| {
+            m.ins(&[("q", i(0))], 0)?;
+            m.replace(&[("a", sub(&[("x", i(1))]))], 0)
+        },
+        &[],
+    ));
+}
+
 // ---- odd names are one segment ---------------------------------------------------------
 
 #[test]
