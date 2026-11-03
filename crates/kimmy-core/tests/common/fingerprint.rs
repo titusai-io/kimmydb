@@ -45,7 +45,7 @@ impl Fp {
         match s.try_encode() {
             Ok(e) => {
                 self.bytes(&e);
-                self.bytes(&s.state_hash());
+                self.bytes(&s.try_state_hash().expect("version 1 spells the states of the runs"));
             }
             Err(e) => self.text(&format!("{e:?}")),
         }

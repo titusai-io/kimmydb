@@ -715,11 +715,14 @@ fn version_one_cannot_hold_a_document_and_refuses() {
     assert_eq!(MergeState::decode(&bytes), Err(DecodeError::BadTag(16)));
 }
 
+/// The version 1 entry points have no infallible twin: a state a peer sent can hold what the form
+/// cannot spell, and no panic may be reachable from decoded input.
 #[test]
-#[should_panic(expected = "version 1 cannot hold a document")]
-fn the_infallible_version_one_encoder_panics_on_a_document() {
+fn every_version_one_entry_point_refuses_a_document_in_an_array() {
     let st = state_with(Value::Array(vec![d(&[])]));
-    let _ = st.canonical_bytes();
+    assert_eq!(st.try_canonical_bytes(), Err(V1CannotHold));
+    assert_eq!(st.try_state_hash(), Err(V1CannotHold));
+    assert_eq!(st.try_encode(), Err(V1CannotHold));
 }
 
 #[test]

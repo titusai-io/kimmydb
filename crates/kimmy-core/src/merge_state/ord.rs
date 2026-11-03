@@ -499,7 +499,7 @@ impl MergeState {
         if !o.ord_no_survivor_clamp()
             && let Some(Floor::U { stamp, prev, others }) = joined.as_ref().and_then(|j| j.floor)
         {
-            for c in self.survivors(p, al, stamp, prev, others, o, memo) {
+            for c in self.survivors(p, al, (stamp, prev, others), o, memo) {
                 if b.as_ref().is_none_or(|x| c < *x) {
                     b = Some(c);
                 }
@@ -538,12 +538,11 @@ impl MergeState {
         &self,
         p: &Path,
         al: &BTreeSet<MStamp>,
-        floor: MStamp,
-        prev: Hlc,
-        others: bool,
+        unset: (MStamp, Hlc, bool),
         o: &JoinOptions,
         memo: &BornMemo,
     ) -> Vec<Born> {
+        let (floor, prev, others) = unset;
         let others = others && !o.ord_ignores_bit();
         let after_known = after_hlc(prev);
         let place = |c: Born| -> Born {

@@ -134,9 +134,9 @@ impl Mem {
 fn snap(ms: &[Mem]) -> Vec<J> {
     ms.iter()
         .map(|m| {
-            let cb = m.w.state.canonical_bytes();
+            let cb = m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states");
             json!({
-                "h": hex(&m.w.state.state_hash()),
+                "h": hex(&m.w.state.try_state_hash().expect("version 1 spells the differential's states")),
                 "len": cb.len(),
                 "ch": hex(&m.w.state.compact_hash()),
                 "clen": m.w.state.compact_bytes().len(),
@@ -341,7 +341,12 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     }
     // final full-mesh sync
     for _ in 0..12 {
-        let before: Vec<Vec<u8>> = ms.iter().map(|m| m.w.state.canonical_bytes()).collect();
+        let before: Vec<Vec<u8>> = ms
+            .iter()
+            .map(|m| {
+                m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states")
+            })
+            .collect();
         for r in 0..nm {
             for s in 0..nm {
                 if r != s {
@@ -352,7 +357,14 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
                 }
             }
         }
-        if ms.iter().map(|m| m.w.state.canonical_bytes()).collect::<Vec<_>>() == before {
+        if ms
+            .iter()
+            .map(|m| {
+                m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states")
+            })
+            .collect::<Vec<_>>()
+            == before
+        {
             break;
         }
     }

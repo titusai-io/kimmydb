@@ -148,10 +148,10 @@ const _: () = {
     let _: fn(&MergeState, &JoinOptions) -> OverCaps = MergeState::over_caps;
     let _: fn(&MergeState, &JoinOptions) -> BTreeMap<Path, Excess> = MergeState::excess;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
-    let _: fn(&MergeState) -> Vec<u8> = MergeState::canonical_bytes;
     let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_canonical_bytes;
     let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_encode;
     let _: fn(&MergeState) -> bool = MergeState::v1_can_hold;
+    let _: fn(&MergeState) -> Result<[u8; 16], V1CannotHold> = MergeState::try_state_hash;
     let _: fn(
         MStamp,
         Value,
@@ -165,8 +165,6 @@ const _: () = {
     let _: fn(&MergeState) -> [u8; 16] = MergeState::compact_hash;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::encode_compact;
     let _: fn(&[u8]) -> Result<MergeState, DecodeError> = MergeState::decode_compact;
-    let _: fn(&MergeState) -> [u8; 16] = MergeState::state_hash;
-    let _: fn(&MergeState) -> Vec<u8> = MergeState::encode;
     let _: fn(&[u8]) -> Result<MergeState, DecodeError> = MergeState::decode;
     let _: fn(&mut Writer, &[(Path, Value)], u64) -> Option<Written> = Writer::insert;
     let _: fn(&mut Writer, &Path, i64, u64) -> Option<Written> = Writer::upsert_inc;
