@@ -16,7 +16,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use bson::{Bson, Document, doc};
-use kimmy_query::budget::{doc_bytes, held_blob, held_bytes, held_element, held_frame_growth};
+use kimmy_query::budget::{
+    doc_bytes, held_blob, held_bytes, held_doc_id, held_element, held_frame_growth,
+};
 
 struct Counting;
 
@@ -250,6 +252,45 @@ fn the_estimate_is_at_least_what_documents_hold_and_at_most_one_and_a_half_times
             failures.push(format!("a body of {len} bytes holds {held}, estimated {estimate}"));
         }
         drop(body);
+    }
+    // The ids a filtered vector search admits, in a `HashSet<DocId>` grown by insertion: the
+    // live table, at counts that put it just past a doubling (the least full it gets) and just
+    // before one (the fullest).
+    fn id_of(kind: &str, i: i64) -> kimmy_core::DocId {
+        use kimmy_core::DocId;
+        match kind {
+            "Int64" => DocId::Int64(i),
+            "ObjectId" => {
+                let mut bytes = [0u8; 12];
+                bytes[4..].copy_from_slice(&(i as u64).to_be_bytes());
+                DocId::ObjectId(bson::oid::ObjectId::from_bytes(bytes))
+            }
+            "string of 24" => DocId::String(format!("{i:0>24}")),
+            _ => {
+                DocId::Binary { subtype: 0, bytes: [&[0u8; 32][..], &i.to_be_bytes()[..]].concat() }
+            }
+        }
+    }
+    for name in ["Int64", "ObjectId", "string of 24", "binary of 40"] {
+        for n in [1_000usize, 7_169, 7_168, 57_345, 57_344, 100_000] {
+            let members: Vec<kimmy_core::DocId> = (0..n as i64).map(|i| id_of(name, i)).collect();
+            let estimate: usize = members.iter().map(held_doc_id).sum();
+            let before = live();
+            let mut set = std::collections::HashSet::new();
+            for id in &members {
+                set.insert(id.clone());
+            }
+            let held = (live() - before) as usize;
+            table.push_str(&format!(
+                "{name:<14} {n:>7} ids in a set: holds {:>6.1} B an id, estimate {:>6.1}\n",
+                held as f64 / n as f64,
+                estimate as f64 / n as f64,
+            ));
+            if estimate < held {
+                failures.push(format!("{n} {name} ids in a set hold {held}, estimated {estimate}"));
+            }
+            drop(set);
+        }
     }
     println!("{table}");
     assert!(failures.is_empty(), "{}\n{table}", failures.join("\n"));

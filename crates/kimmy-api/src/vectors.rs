@@ -903,15 +903,20 @@ pub const MAX_K: usize = 1_000;
 /// returned. ADR-102.
 const SELECTIVE_JOIN_MAX: usize = 1_000;
 
-/// Matches taken per planner call while a filter's ids are collected.
-///
-/// The executor returns the documents it matched, and an unselective filter
-/// over a large collection would otherwise hold every one of them at once —
-/// the failure ADR-098 names. Paging by encoded key, as a cursor does, holds
-/// one page and the ids. Wide, because on an index plan each page gathers the
-/// range's candidate keys again; `exec::visit_matching` makes a page a seek,
-/// and `filter_ids` is written to become one call to it — see the note there.
-const FILTER_PAGE: usize = 10_000;
+/// How many admitted ids a filtered search holds before the pool is asked for them: the
+/// first 10,000 are not charged (about a megabyte), so the commonest filtered search, a
+/// selective one, never touches the pool.
+const FREE_IDS: usize = 10_000;
+
+/// How a filtered search words a refusal for the admitted set it holds: what makes it smaller
+/// is the filter. (The ids are not paged and cannot be: the join needs the filter's whole
+/// answer, and one that dropped some would answer short without saying so.)
+const VECTOR_FILTER: kimmy_query::budget::Wording = kimmy_query::budget::Wording {
+    holder: "one filtered vector search",
+    over_limit: "narrow the filter so that it admits fewer documents, or raise \
+                 aggregate.memory_limit_bytes",
+    pool_busy: "retry later, or narrow the filter so that it admits fewer documents",
+};
 
 pub async fn vector_search(
     State(state): State<SharedState>,
@@ -934,7 +939,7 @@ pub async fn run_vector_search(
     coll: &str,
     body: &SearchRequest,
 ) -> Result<Value, ApiError> {
-    let (_, hits) = search_hits(state, auth, db, coll, body).await?;
+    let (_, hits) = search_hits(state, auth, db, coll, body, None).await?;
     Ok(render(&hits))
 }
 
@@ -949,10 +954,11 @@ async fn search_hits(
     db: &str,
     coll: &str,
     body: &SearchRequest,
+    budget: Option<&kimmy_query::budget::BufferBudget>,
 ) -> Result<(kimmy_storage::CollectionMeta, Vec<Hit>), ApiError> {
     let (source, shadow, config, options) = prepare(state, auth, db, coll, body)?;
     let query = resolve_query_vector(state, &config, body).await?;
-    let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
+    let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref(), budget)?;
 
     let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref()).await?;
     let hits = only_live(state, &source, hits)?;
@@ -981,7 +987,7 @@ pub(crate) async fn stage_documents(
         per_document: spec.per_document,
         ..Default::default()
     };
-    let (source, hits) = search_hits(state, auth, db, coll, &body).await?;
+    let (source, hits) = search_hits(state, auth, db, coll, &body, Some(&limits.buffer)).await?;
     kimmy_query::aggregate::check_limit("$vectorSearch", hits.len(), limits)?;
     let mut docs = Vec::with_capacity(hits.len());
     for hit in hits {
@@ -1093,7 +1099,7 @@ pub async fn run_hybrid_search(
     let (weights, min_overlap) = fusion_controls(body)?;
 
     let query = resolve_query_vector(state, &config, body).await?;
-    let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
+    let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref(), None)?;
 
     // Each half is retrieved wider than k, so fusion has enough to work with:
     // a document ranked modestly by both should be able to beat one ranked
@@ -1273,16 +1279,23 @@ async fn resolve_query_vector(
 
 /// The documents a `filter` admitted, in the two shapes the join needs.
 struct Allowed {
-    /// Every admitted id, for the join that reads their chunks by key.
+    /// Every admitted id, in `_id` order, for the join that reads their chunks by key: kept
+    /// only while there are no more than [`SELECTIVE_JOIN_MAX`], since that join is the only
+    /// reader and is not chosen for a larger set. Empty beyond that.
     ids: Vec<DocId>,
     /// The same ids as a set, for the join that searches everything and
     /// discards: compared with the document a chunk's record names, as a
     /// `DocId` (ADR-239). Its rendering made every binary `_id` of one length
     /// one document, and a String `"7"` the Int64 `7`.
     set: HashSet<DocId>,
+    /// How many documents the filter admitted: what the join is chosen by.
+    admitted: usize,
     /// How the filter was answered — which access path, how much it examined
-    /// — so a test can hold the planner to having run. Summed across pages.
+    /// — so a test can hold the planner to having run.
     stats: QueryStats,
+    /// What the set is charged on the node's pool, given back when the search is done with
+    /// it. None while the set is within [`FREE_IDS`].
+    _charged: Option<kimmy_query::budget::Lease>,
 }
 
 /// The direction a filtered search joins the admitted set with the chunks.
@@ -1297,7 +1310,7 @@ enum Join {
 impl Allowed {
     /// Which way round to join, by the size of the set alone.
     fn join(&self) -> Join {
-        join_for(self.ids.len())
+        join_for(self.admitted)
     }
 }
 
@@ -1307,7 +1320,9 @@ fn join_for(admitted: usize) -> Join {
     if admitted <= SELECTIVE_JOIN_MAX { Join::Keyed } else { Join::Discard }
 }
 
-/// Run the filter, if any, and collect the ids it matched.
+/// Run the filter, if any, and collect the ids it matched. `budget` is the account of the
+/// request the search is a stage of (a `$vectorSearch` in an aggregation), if there is one;
+/// otherwise the search has a budget of its own on the node's pool.
 ///
 /// This is what lets vector search compose with the ordinary query language.
 fn allowed_ids(
@@ -1316,6 +1331,7 @@ fn allowed_ids(
     db: &str,
     coll: &str,
     filter: Option<&Value>,
+    budget: Option<&kimmy_query::budget::BufferBudget>,
 ) -> Result<Option<Allowed>, ApiError> {
     let Some(filter) = filter else {
         return Ok(None);
@@ -1325,73 +1341,87 @@ fn allowed_ids(
 
     let parsed = kimmy_query::filter::parse(&json_to_document(filter)?)?;
     let source = crate::exec::collection(state, db, coll)?;
-    Ok(Some(filter_ids(state, &source, &parsed, FILTER_PAGE)?))
+    Ok(Some(filter_ids(state, &source, &parsed, budget)?))
 }
 
 /// The ids a filter matches, through the executor's planner-backed read.
 ///
-/// `collect_matching_after` is the path `find` takes: the primary key when the
-/// filter pins `_id`, a secondary index when one applies, a collection scan
-/// otherwise — every candidate rechecked against the full filter, whichever
-/// it was. So an index on the filtered field serves a search exactly as it
-/// serves a `find`, and `explain` on a `find` with the same filter says what
-/// the search will get.
+/// `visit_matching_until` is the path `find` takes: the primary key when the filter pins
+/// `_id`, a secondary index when one applies, a collection scan otherwise — every candidate
+/// rechecked against the full filter, whichever it was. So an index on the filtered field
+/// serves a search exactly as it serves a `find`, and `explain` on a `find` with the same
+/// filter says what the search will get.
 ///
-/// Only the ids are kept. The executor hands back documents, so they are
-/// taken a page at a time by encoded key — the way a cursor resumes, and
-/// sound for the same reason: every access path delivers `_id` order — and
-/// let go once their ids are recorded.
-///
-/// `exec::visit_matching` now offers the streaming visitor this was written to
-/// wait for, so the loop and `page` can collapse into one call that never holds
-/// a document. Left as it is here because that is a change to make on its own,
-/// with the paging test below turned into whatever replaces it.
+/// The filter is read once, in the order the access path finds cheapest, with a visitor that
+/// keeps only the id: the order of the ids is not observable (the join ranks by score, then
+/// key, whatever order it is offered them in), so an inexact index range is not put in `_id`
+/// order, which would hold its keys and read it again for each page, and no page of documents
+/// is held. What is kept is the admitted set, and that is charged to the node's pool: the
+/// first [`FREE_IDS`] ids are not, the one past them makes the lease for all of them, and a
+/// full pool is waited for, as a read's is, since no writer is held.
 fn filter_ids(
     state: &SharedState,
     source: &kimmy_storage::CollectionMeta,
     filter: &kimmy_query::filter::Filter,
-    page: usize,
+    budget: Option<&kimmy_query::budget::BufferBudget>,
 ) -> Result<Allowed, ApiError> {
     let mut ids = Vec::new();
     let mut set = HashSet::new();
-    let mut stats: Option<QueryStats> = None;
-    let mut after: Option<Vec<u8>> = None;
-    loop {
-        let (docs, page_stats) = crate::exec::collect_matching_stamped_after(
-            state,
-            source,
-            filter,
-            Some(page),
-            after.as_deref(),
-        )?;
-        let more = docs.len() >= page;
-        let mut last = None;
-        // The stamp is the executor's to hand back; admission turns on the
-        // filter alone, so it is dropped here.
-        for (_, doc) in docs {
+    let mut lease: Option<kimmy_query::budget::Lease> = None;
+    // What the ids held so far are estimated at, charged when the lease is made.
+    let mut held = 0usize;
+    let stats = crate::exec::visit_matching_until(
+        state,
+        source,
+        filter,
+        crate::exec::Order::Any,
+        None,
+        |_, doc| {
+            // The stamp is the executor's to hand back; admission turns on the
+            // filter alone, so it is dropped here.
             let Some(raw) = doc.get(kimmy_storage::ID_FIELD) else {
-                continue;
+                return Ok(true);
             };
             let id = DocId::try_from_bson(raw)?;
-            last = Some(kimmy_core::keyenc::encode(&id.to_bson())?);
-            set.insert(id.clone());
-            ids.push(id);
-        }
-        match stats.as_mut() {
-            // The plan is the same on every page; the counts add up.
-            Some(total) => {
-                total.examined += page_stats.examined;
-                total.matched += page_stats.matched;
+            let bytes = kimmy_query::budget::held_doc_id(&id);
+            // Beyond the keyed join's reach the ids are not kept in order, or at all: the
+            // discarding join asks the set.
+            let kept = (set.len() < SELECTIVE_JOIN_MAX).then(|| id.clone());
+            if !set.insert(id) {
+                return Ok(true);
             }
-            None => stats = Some(page_stats),
-        }
-        match last {
-            Some(key) if more => after = Some(key),
-            _ => break,
-        }
+            match kept {
+                Some(id) => ids.push(id),
+                None if set.len() == SELECTIVE_JOIN_MAX + 1 => ids = Vec::new(),
+                None => {}
+            }
+            held = held.saturating_add(bytes);
+            match lease.as_mut() {
+                Some(lease) => lease.charge(bytes)?,
+                None if set.len() > FREE_IDS => {
+                    let account =
+                        budget.cloned().unwrap_or_else(|| state.aggregate_memory().budget());
+                    let mut made =
+                        account.lease_worded("the documents the filter admits", VECTOR_FILTER);
+                    made.charge(held)?;
+                    lease = Some(made);
+                }
+                None => {}
+            }
+            Ok(true)
+        },
+    )?;
+    let admitted = set.len();
+    if admitted <= SELECTIVE_JOIN_MAX {
+        // `_id` order, as the pages gave it: what a test reads, and a reproducible join.
+        let mut keyed = ids
+            .into_iter()
+            .map(|id| Ok((kimmy_core::keyenc::encode(&id.to_bson())?, id)))
+            .collect::<Result<Vec<_>, kimmy_core::Error>>()?;
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        ids = keyed.into_iter().map(|(_, id)| id).collect();
     }
-    let stats = stats.expect("the loop runs at least once");
-    Ok(Allowed { ids, set, stats })
+    Ok(Allowed { ids, set, admitted, stats, _charged: lease })
 }
 
 /// Drop a collection's cached graph.
@@ -1582,7 +1612,7 @@ mod tests {
             state.engine.put_vectors(&shadow, &DocId::Int64(i), &[record]).unwrap();
         }
         let mut allowed =
-            filter_ids(&state, &source, &parse(bson::doc! { "tag": 0 }), 1_000).unwrap();
+            filter_ids(&state, &source, &parse(bson::doc! { "tag": 0 }), None).unwrap();
         allowed.ids = (300..400i64).map(DocId::Int64).collect();
         allowed.set = allowed.ids.iter().cloned().collect();
         let exact =
@@ -1992,7 +2022,7 @@ mod tests {
         let state = live_state(&dir);
         let (source, _shadow) = fixture(&state, 30);
 
-        let scanned = filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), 1_000).unwrap();
+        let scanned = filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), None).unwrap();
         assert!(scanned.stats.index.is_none(), "no index exists yet");
         assert_eq!(scanned.stats.examined, 30, "a scan examines everything");
         assert_eq!(sorted_ids(&scanned), (0..30).filter(|i| i % 3 == 1).collect::<Vec<_>>());
@@ -2008,7 +2038,7 @@ mod tests {
             )
             .unwrap();
         let source = state.engine.get_collection("app", "docs").unwrap();
-        let indexed = filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), 1_000).unwrap();
+        let indexed = filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), None).unwrap();
         assert!(indexed.stats.index.is_some(), "the index must be planned");
         assert_eq!(indexed.stats.examined, 10, "and only its candidates examined");
         assert_eq!(sorted_ids(&indexed), sorted_ids(&scanned));
@@ -2016,24 +2046,74 @@ mod tests {
 
         // A filter that pins `_id` is a primary-key read, as it is for `find`.
         let by_id =
-            filter_ids(&state, &source, &parse(bson::doc! { "_id": { "$in": [3, 4, 99] } }), 1_000)
+            filter_ids(&state, &source, &parse(bson::doc! { "_id": { "$in": [3, 4, 99] } }), None)
                 .unwrap();
         assert!(by_id.stats.id_lookup);
         assert_eq!(sorted_ids(&by_id), vec![3, 4]);
     }
 
+    /// The ids of a filter as they were collected before the filter was read once: in pages of
+    /// `page` documents by encoded key, resuming strictly after the last key of the page before,
+    /// every id kept in a `Vec` and a set. Kept as the model the one-pass read is held to: the
+    /// same documents admitted, and the same answer to every search that joins with them.
+    fn paged_filter_ids(
+        state: &SharedState,
+        source: &kimmy_storage::CollectionMeta,
+        filter: &kimmy_query::filter::Filter,
+        page: usize,
+    ) -> Allowed {
+        let mut ids = Vec::new();
+        let mut set = HashSet::new();
+        let mut stats: Option<QueryStats> = None;
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let (docs, page_stats) = crate::exec::collect_matching_stamped_after(
+                state,
+                source,
+                filter,
+                Some(page),
+                after.as_deref(),
+            )
+            .unwrap();
+            let more = docs.len() >= page;
+            let mut last = None;
+            for (_, doc) in docs {
+                let Some(raw) = doc.get(kimmy_storage::ID_FIELD) else {
+                    continue;
+                };
+                let id = DocId::try_from_bson(raw).unwrap();
+                last = Some(kimmy_core::keyenc::encode(&id.to_bson()).unwrap());
+                set.insert(id.clone());
+                ids.push(id);
+            }
+            match stats.as_mut() {
+                Some(total) => {
+                    total.examined += page_stats.examined;
+                    total.matched += page_stats.matched;
+                }
+                None => stats = Some(page_stats),
+            }
+            match last {
+                Some(key) if more => after = Some(key),
+                _ => break,
+            }
+        }
+        let admitted = set.len();
+        Allowed { ids, set, admitted, stats: stats.unwrap(), _charged: None }
+    }
+
     #[test]
-    fn a_filters_ids_are_gathered_across_pages() {
-        // Paging by key must see every match once, in `_id` order, and add
-        // the pages' counts up — including when the last page is exactly
-        // full, which is the case that would loop or lose a page if the
-        // resume bound were wrong.
+    fn a_filters_ids_are_the_ones_the_paged_read_collected() {
+        // The model pages by key and must see every match once, in `_id` order, including when
+        // the last page is exactly full. The one-pass read admits the same documents, counts
+        // the same, and keeps them in the same order.
         let dir = tempfile::tempdir().unwrap();
         let state = live_state(&dir);
         let (source, _shadow) = fixture(&state, 30);
 
         for page in [1, 3, 4, 7, 10, 30, 1_000] {
-            let all = filter_ids(&state, &source, &parse(bson::doc! {}), page).unwrap();
+            let old = paged_filter_ids(&state, &source, &parse(bson::doc! {}), page);
+            let all = filter_ids(&state, &source, &parse(bson::doc! {}), None).unwrap();
             let ids: Vec<i64> = all
                 .ids
                 .iter()
@@ -2043,21 +2123,23 @@ mod tests {
                 })
                 .collect();
             assert_eq!(ids, (0..30).collect::<Vec<_>>(), "page size {page}");
-            assert_eq!(all.set.len(), 30);
-            assert_eq!(all.stats.matched, 30, "page size {page}");
-            assert_eq!(all.stats.examined, 30, "page size {page}");
+            assert_eq!(all.ids, old.ids, "page size {page}");
+            assert_eq!((all.set.clone(), all.admitted), (old.set.clone(), 30));
+            assert_eq!(all.stats.matched, old.stats.matched, "page size {page}");
+            assert_eq!(all.stats.examined, old.stats.examined, "page size {page}");
         }
 
-        let none = filter_ids(&state, &source, &parse(bson::doc! { "tag": 9 }), 4).unwrap();
+        let none = filter_ids(&state, &source, &parse(bson::doc! { "tag": 9 }), None).unwrap();
         assert!(none.ids.is_empty());
-        assert_eq!(none.stats.matched, 0);
+        assert_eq!((none.admitted, none.stats.matched), (0, 0));
     }
 
-    /// The filter's paging hands the executor its own stored keys, which the executor
-    /// must take as they are: a resume after `A` continues at the next id and skips none.
-    /// Through a scan and through an index.
+    /// The model's paging hands the executor its own stored keys, which the executor must take
+    /// as they are: a resume after `A` continues at the next id and skips none. The one-pass
+    /// read has no resume to get wrong; it must still find every id, through a scan and through
+    /// an index, whichever the order, and keep them in key order.
     #[test]
-    fn a_filters_paging_over_integer_ids_resumes_on_the_stored_key() {
+    fn a_filter_over_integer_ids_collects_every_one_through_a_scan_and_an_index() {
         const A: i64 = 0x5000_0081_0180_0000;
         const B: i64 = 0x5000_7F80_8101_8000;
         let dir = tempfile::tempdir().unwrap();
@@ -2081,21 +2163,390 @@ mod tests {
                     .unwrap();
             }
             let source = state.engine.get_collection("app", "docs").unwrap();
+            let all = filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), None).unwrap();
+            assert_eq!(all.stats.index.is_some(), indexed);
+            let got: Vec<i64> = all
+                .ids
+                .iter()
+                .map(|id| match id {
+                    DocId::Int64(n) => *n,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(got, ids, "indexed {indexed}");
             for page in [1, 2, 3, 4, 1_000] {
-                let all =
-                    filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), page).unwrap();
-                assert_eq!(all.stats.index.is_some(), indexed);
-                let got: Vec<i64> = all
-                    .ids
-                    .iter()
-                    .map(|id| match id {
-                        DocId::Int64(n) => *n,
-                        other => panic!("{other:?}"),
-                    })
-                    .collect();
-                assert_eq!(got, ids, "page size {page}, indexed {indexed}");
+                let old = paged_filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), page);
+                assert_eq!(old.set, all.set, "page size {page}, indexed {indexed}");
             }
         }
+    }
+
+    /// A vector search the way `run_vector_search` runs it, but over `allowed` handed in: the
+    /// ids the model collected, in place of the ones the filter reads now.
+    fn vector_search_over(
+        state: &SharedState,
+        source: &kimmy_storage::CollectionMeta,
+        shadow: &kimmy_storage::CollectionMeta,
+        body: &SearchRequest,
+        allowed: &Allowed,
+    ) -> Value {
+        let config = dot_config();
+        let options = SearchOptions {
+            k: body.k.unwrap(),
+            metric: config.metric,
+            per_document: body.per_document.unwrap_or(1),
+        };
+        let query = body.vector.clone().unwrap();
+        let hits = ran(knn(state, shadow, &config, &query, &options, Some(allowed))).unwrap();
+        render(&only_live(state, source, hits).unwrap())
+    }
+
+    /// A hybrid search the way `run_hybrid_search` runs it, over `allowed` handed in.
+    fn hybrid_search_over(
+        state: &SharedState,
+        source: &kimmy_storage::CollectionMeta,
+        shadow: &kimmy_storage::CollectionMeta,
+        body: &SearchRequest,
+        allowed: &Allowed,
+    ) -> Value {
+        let config = dot_config();
+        let options = SearchOptions {
+            k: body.k.unwrap(),
+            metric: config.metric,
+            per_document: body.per_document.unwrap_or(1),
+        };
+        let query = body.vector.clone().unwrap();
+        let (weights, min_overlap) = fusion_controls(body).unwrap();
+        let wide = SearchOptions { k: (options.k * 4).min(MAX_K), ..options.clone() };
+        let dense = ran(knn(state, shadow, &config, &query, &wide, Some(allowed))).unwrap();
+        let text = body.query.clone().unwrap();
+        let lexical = search::keyword_search(
+            &state.engine,
+            shadow,
+            &text,
+            &wide,
+            min_overlap,
+            Some(&allowed.set),
+        )
+        .unwrap();
+        let fused = search::weighted_reciprocal_rank_fusion(
+            &[
+                (dense.as_slice(), weights.dense as f32),
+                (lexical.as_slice(), weights.lexical as f32),
+            ],
+            options.k,
+        );
+        render(&only_live(state, source, fused).unwrap())
+    }
+
+    #[test]
+    fn a_filtered_vector_and_hybrid_search_answers_what_the_paged_read_answered() {
+        // 1,500 documents under the exact scan (the inner product has no graph), each with two
+        // chunks, a filter read both ways, and the whole answer of both searches compared, hit
+        // by hit, in the order of score then key: ids, chunks, scores and texts. The paged read
+        // is the model; its answer is also held to a brute-force scoring of its set.
+        //
+        // The filters: one that rejects nearly every candidate of the range it reads, one that
+        // keeps a few of them, one that admits exactly 1,000 (the last the keyed join takes),
+        // one that admits 1,500 (the discarding join), and one that admits none.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (_, shadow) = fixture_with(&state, 1_500, dot_config());
+        state
+            .engine
+            .create_index(
+                "app",
+                "docs",
+                vec![kimmy_storage::IndexField::ascending("tag")],
+                false,
+                None,
+            )
+            .unwrap();
+        let source = state.engine.get_collection("app", "docs").unwrap();
+        let auth = Auth(kimmy_auth::Principal::superuser("test"));
+        let filters = [
+            ("rejects nearly all", json!({ "tag": { "$gte": 0 }, "text": "d17" }), 1),
+            (
+                "keeps a few",
+                json!({ "tag": { "$gte": 0 }, "text": { "$in": ["d3", "d5", "d900", "d1499"] } }),
+                4,
+            ),
+            ("admits 1,000", json!({ "tag": { "$in": [0, 2] } }), 1_000),
+            ("admits all", json!({ "tag": { "$gte": 0 } }), 1_500),
+            ("admits none", json!({ "tag": { "$gte": 0 }, "text": "nothing" }), 0),
+        ];
+        let query = vec![0.3f32, -0.9];
+        for (name, filter, admits) in filters {
+            let parsed = parse(json_to_document(&filter).unwrap());
+            let old = paged_filter_ids(&state, &source, &parsed, 700);
+            let new = filter_ids(&state, &source, &parsed, None).unwrap();
+            assert_eq!(old.set.len(), admits, "{name}");
+            assert_eq!(new.set, old.set, "{name}");
+            assert_eq!(new.admitted, admits, "{name}");
+            assert_eq!(new.join(), join_for(admits), "{name}");
+            // The ids are kept for the keyed join and dropped past it.
+            if admits <= SELECTIVE_JOIN_MAX {
+                assert_eq!(new.ids, old.ids, "{name}");
+            } else {
+                assert!(new.ids.is_empty(), "{name}: {} ids kept", new.ids.len());
+            }
+            for (k, per_document) in [(1, 1), (10, 1), (10, 2), (50, 2)] {
+                let body = SearchRequest {
+                    query: Some("d3 d5 d17 d900 d1499".into()),
+                    vector: Some(query.clone()),
+                    filter: Some(filter.clone()),
+                    k: Some(k),
+                    per_document: Some(per_document),
+                    ..Default::default()
+                };
+                let what = format!("{name}, k {k}, per_document {per_document}");
+
+                let expected = vector_search_over(&state, &source, &shadow, &body, &old);
+                let answered = ran(run_vector_search(&state, &auth, "app", "docs", &body)).unwrap();
+                assert_eq!(answered, expected, "vector search, {what}");
+                let options = SearchOptions { k, metric: Metric::Dot, per_document };
+                let model = brute_force(&state, &shadow, &query, &options, &old.set);
+                let got: Vec<(String, u32, f32, String)> = answered["matches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| {
+                        (
+                            DocId::try_from_bson(&bson::Bson::Int64(
+                                m["_id"].as_i64().expect("an integer id"),
+                            ))
+                            .unwrap()
+                            .to_string(),
+                            m["chunk"].as_u64().unwrap() as u32,
+                            m["score"].as_f64().unwrap() as f32,
+                            m["text"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(got, model, "vector search against brute force, {what}");
+                assert_eq!(answered["count"].as_u64().unwrap() as usize, model.len().min(k));
+
+                let expected = hybrid_search_over(&state, &source, &shadow, &body, &old);
+                let answered = ran(run_hybrid_search(&state, &auth, "app", "docs", &body)).unwrap();
+                assert_eq!(answered, expected, "hybrid search, {what}");
+            }
+        }
+    }
+
+    /// `n` documents `{_id: i, tag: i % 3}` and no vectors, on a state whose request limit and
+    /// pool are `limit` and `pool`: enough for the filter, which is all these tests read.
+    fn plain(
+        dir: &tempfile::TempDir,
+        n: i64,
+        limit: usize,
+        pool: usize,
+    ) -> (SharedState, kimmy_storage::CollectionMeta) {
+        let state = live_state(dir);
+        state.set_aggregate_memory(crate::limits::AggregateMemory::new(limit, pool));
+        let source = state.engine.create_collection("app", "docs").unwrap();
+        for start in (0..n).step_by(5_000) {
+            let docs: Vec<bson::Document> = (start..(start + 5_000).min(n))
+                .map(|i| bson::doc! { "_id": i, "tag": i % 3 })
+                .collect();
+            state.engine.insert_many(&source, docs).unwrap();
+        }
+        (state, source)
+    }
+
+    /// What the budget counts for the id of each of the documents of `plain`.
+    fn id_bytes(n: usize) -> usize {
+        n * kimmy_query::budget::held_doc_id(&DocId::Int64(7))
+    }
+
+    #[test]
+    fn the_admitted_set_is_charged_to_the_pool_by_the_byte_and_given_back() {
+        // 10,300 ids, a limit of exactly their bytes: answered, with the lease held until the
+        // search is done with the set; a byte under: refused at the last id.
+        let n = 10_300;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, source) = plain(&dir, n, id_bytes(n as usize), 64 << 20);
+        let pool = state.aggregate_memory().pool().clone();
+        let all = parse(bson::doc! {});
+        let allowed = filter_ids(&state, &source, &all, None).unwrap();
+        assert_eq!(allowed.admitted, n as usize);
+        assert_eq!(pool.used(), id_bytes(n as usize), "the set is charged while it is held");
+        drop(allowed);
+        assert_eq!((pool.used(), pool.holders()), (0, 0), "and given back with it");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (state, source) = plain(&dir, n, id_bytes(n as usize) - 1, 64 << 20);
+        let pool = state.aggregate_memory().pool().clone();
+        let refused = filter_ids(&state, &source, &all, None).err().expect("over the limit");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", refused.message);
+        assert_eq!(refused.code, ErrorCode::AnswerTooLarge);
+        let text = format!(
+            "the documents the filter admits is {} bytes, over the limit of {} bytes one filtered \
+             vector search may hold at once (aggregate.memory_limit_bytes); narrow the filter so \
+             that it admits fewer documents, or raise aggregate.memory_limit_bytes",
+            id_bytes(n as usize),
+            id_bytes(n as usize) - 1,
+        );
+        assert_eq!(refused.message, text);
+        assert_eq!((pool.used(), pool.holders(), pool.limit_refusals()), (0, 0, 1));
+    }
+
+    #[test]
+    fn the_first_ten_thousand_admitted_ids_are_free_and_the_next_makes_the_lease_for_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, source) = plain(&dir, 10_001, 0, 0);
+        let pool = state.aggregate_memory().pool().clone();
+        let all = parse(bson::doc! {});
+        let some = parse(bson::doc! { "_id": { "$lt": FREE_IDS as i64 } });
+        let within = filter_ids(&state, &source, &some, None).unwrap();
+        assert_eq!(within.admitted, FREE_IDS);
+        assert_eq!((pool.used(), pool.holders(), pool.limit_refusals()), (0, 0, 0));
+        let refused = filter_ids(&state, &source, &all, None).err().expect("past the window");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", refused.message);
+        assert!(
+            refused.message.starts_with(&format!(
+                "the documents the filter admits is {} bytes",
+                id_bytes(FREE_IDS + 1)
+            )),
+            "{}",
+            refused.message
+        );
+    }
+
+    #[test]
+    fn a_full_pool_refuses_the_youngest_filter_and_a_stage_shares_its_pipelines_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, source) = plain(&dir, 10_300, 64 << 20, id_bytes(10_300));
+        let pool = state.aggregate_memory().pool().clone();
+        let other = state.aggregate_memory().limits();
+        let mut held = other.buffer.lease("another request");
+        held.charge(pool.cap()).unwrap();
+        let all = parse(bson::doc! {});
+        let refused = filter_ids(&state, &source, &all, None).err().expect("the pool is full");
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE, "{}", refused.message);
+        assert_eq!(refused.code.retry(), crate::error::Retry::Wait);
+        assert!(refused.message.starts_with("the documents the filter admits needed "));
+        assert!(
+            refused
+                .message
+                .ends_with("retry later, or narrow the filter so that it admits fewer documents")
+        );
+        assert_eq!(pool.used(), pool.cap(), "only the other request's bytes are left");
+        drop(held);
+
+        // A `$vectorSearch` stage charges the budget of the pipeline it is in: bytes the
+        // pipeline already holds count against the same limit, and there is no second one.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, source) = plain(&dir, 10_300, id_bytes(10_300), 64 << 20);
+        let pool = state.aggregate_memory().pool().clone();
+        let budget = state.aggregate_memory().limits().buffer;
+        let mut pipeline = budget.lease("the pipeline");
+        pipeline.charge(1).unwrap();
+        let refused =
+            filter_ids(&state, &source, &all, Some(&budget)).err().expect("over its budget");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", refused.message);
+        let alone = filter_ids(&state, &source, &all, None).unwrap();
+        assert_eq!(
+            alone.admitted, 10_300,
+            "within the limit when the search has a budget of its own"
+        );
+        drop((alone, pipeline));
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn a_vector_search_stage_charges_the_set_to_the_budget_of_its_pipeline() {
+        // The stage is given the pipeline's limits: its admitted set is charged to the same
+        // budget as the pipeline's documents, so a pipeline that holds more than a second
+        // limit's worth with the set is refused, and a search of its own, with the same set, is
+        // not.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _source) = plain(&dir, 10_300, id_bytes(10_300), 64 << 20);
+        state.engine.configure_vectors("app", "docs", dot_config()).unwrap();
+        let shadow = state.engine.vector_collection("app", "docs").unwrap().unwrap();
+        let record = VectorRecord {
+            source: DocId::Int64(0),
+            chunk: 0,
+            source_hlc: kimmy_core::Hlc::new(1, 0),
+            vector: vec![1.0, 0.0],
+            text: "d0".into(),
+            config: None,
+        };
+        state.engine.put_vectors(&shadow, &DocId::Int64(0), &[record]).unwrap();
+        let auth = Auth(kimmy_auth::Principal::superuser("test"));
+        let spec = kimmy_query::aggregate::VectorSearch {
+            query: None,
+            vector: Some(vec![1.0, 0.0]),
+            k: Some(3),
+            per_document: None,
+            filter: Some(bson::doc! { "tag": { "$gte": 0 } }),
+        };
+        let limits = state.aggregate_limits();
+        let mut pipeline = limits.buffer.lease("the pipeline");
+        pipeline.charge(1).unwrap();
+        let refused = ran(stage_documents(&state, &auth, "app", "docs", &spec, &limits))
+            .expect_err("the pipeline's budget is over");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", refused.message);
+        assert!(refused.message.starts_with("the documents the filter admits is "));
+        drop(pipeline);
+        let limits = state.aggregate_limits();
+        let found = ran(stage_documents(&state, &auth, "app", "docs", &spec, &limits)).unwrap();
+        assert_eq!(found.len(), 1, "the one stored vector");
+        assert_eq!(state.aggregate_memory().pool().used(), 0);
+    }
+
+    #[test]
+    fn a_filter_that_rejects_nearly_everything_reads_its_range_once() {
+        // The paged read (pages of 10,000, as it was) went back for twice as many documents each
+        // time it came up short, and read the whole inexact range again for each pass: over a
+        // range of 25,000 entries with a filter that rejects them all it read it three times.
+        // The filter is read once, in index order.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = plain(&dir, 25_000, 64 << 20, 64 << 20);
+        state
+            .engine
+            .create_index(
+                "app",
+                "docs",
+                vec![kimmy_storage::IndexField::ascending("tag")],
+                false,
+                None,
+            )
+            .unwrap();
+        let source = state.engine.get_collection("app", "docs").unwrap();
+        let rejecting = parse(bson::doc! { "tag": { "$gte": 0 }, "nothing": 1 });
+        let new = filter_ids(&state, &source, &rejecting, None).unwrap();
+        assert_eq!(new.stats.index_entries, Some(25_000), "the range, once");
+        assert_eq!((new.stats.examined, new.admitted), (25_000, 0));
+        let old = paged_filter_ids(&state, &source, &rejecting, 10_000);
+        assert_eq!(old.set, new.set);
+        assert!(
+            old.stats.index_entries > Some(25_000),
+            "the model read the range again for each pass: {:?}",
+            old.stats.index_entries
+        );
+    }
+
+    #[test]
+    fn the_ids_are_kept_for_the_keyed_join_up_to_a_thousand_and_not_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, source) = plain(&dir, 1_001, 64 << 20, 64 << 20);
+        let up_to = |n: i64| parse(bson::doc! { "_id": { "$lt": n } });
+        let thousand = filter_ids(&state, &source, &up_to(1_000), None).unwrap();
+        assert_eq!(
+            (thousand.join(), thousand.ids.len(), thousand.set.len()),
+            (Join::Keyed, 1_000, 1_000)
+        );
+        let ids: Vec<i64> = thousand
+            .ids
+            .iter()
+            .map(|id| match id {
+                DocId::Int64(n) => *n,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, (0..1_000).collect::<Vec<_>>(), "in `_id` order");
+        let more = filter_ids(&state, &source, &up_to(1_001), None).unwrap();
+        assert_eq!((more.join(), more.ids.len(), more.set.len()), (Join::Discard, 0, 1_001));
     }
 
     #[test]
@@ -2109,7 +2560,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = live_state(&dir);
         let (source, _shadow) = fixture(&state, 3);
-        let small = filter_ids(&state, &source, &parse(bson::doc! {}), 1_000).unwrap();
+        let small = filter_ids(&state, &source, &parse(bson::doc! {}), None).unwrap();
         assert_eq!(small.join(), Join::Keyed);
     }
 
@@ -2165,7 +2616,7 @@ mod tests {
         let query = [0.2f32, -0.98];
 
         let allowed =
-            filter_ids(&state, &source, &parse(bson::doc! { "tag": { "$in": [0, 2] } }), 1_000)
+            filter_ids(&state, &source, &parse(bson::doc! { "tag": { "$in": [0, 2] } }), None)
                 .unwrap();
         assert_eq!(allowed.ids.len(), 27);
 
@@ -2191,7 +2642,7 @@ mod tests {
         }
 
         // An empty admitted set: nothing, by either direction.
-        let none = filter_ids(&state, &source, &parse(bson::doc! { "tag": 7 }), 1_000).unwrap();
+        let none = filter_ids(&state, &source, &parse(bson::doc! { "tag": 7 }), None).unwrap();
         for join in [Join::Keyed, Join::Discard] {
             let options = SearchOptions { k: 5, metric: config.metric, per_document: 1 };
             let hits =
@@ -2397,7 +2848,7 @@ mod tests {
         let state = live_state(&dir);
         let (source, shadow, ids) = tenants(&state);
         let allowed =
-            filter_ids(&state, &source, &parse(bson::doc! { "tenant": "a" }), 1_000).unwrap();
+            filter_ids(&state, &source, &parse(bson::doc! { "tenant": "a" }), None).unwrap();
         assert_eq!(allowed.ids, ids[..2]);
         for join in [Join::Keyed, Join::Discard] {
             for per_document in [1, 3] {
@@ -2444,7 +2895,7 @@ mod tests {
                 .unwrap();
             embedded_as_stored(&state, &shadow, &id, vec![chunk(&id, angle, text)]);
         }
-        let allowed = filter_ids(&state, &source, &parse(bson::doc! { "_id": 7 }), 1_000).unwrap();
+        let allowed = filter_ids(&state, &source, &parse(bson::doc! { "_id": 7 }), None).unwrap();
         assert_eq!(allowed.ids, [DocId::Int64(7)]);
         for join in [Join::Keyed, Join::Discard] {
             let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
@@ -2489,7 +2940,7 @@ mod tests {
             &state,
             &source,
             &parse(bson::doc! { "_id": binary(bson::spec::BinarySubtype::Uuid) }),
-            1_000,
+            None,
         )
         .unwrap();
         let wanted = DocId::try_from_bson(&binary(bson::spec::BinarySubtype::Uuid)).unwrap();

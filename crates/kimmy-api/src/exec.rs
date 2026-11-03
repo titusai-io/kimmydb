@@ -819,8 +819,7 @@ pub enum Order<'a> {
     /// order a page is returned in and a cursor resumes from.
     ///
     /// `after` is a stored key: a client's token is read by
-    /// `kimmy_core::Cursor::decode`, and the vector filter's paging hands its own
-    /// stored keys straight in.
+    /// `kimmy_core::Cursor::decode`.
     ById { after: Option<&'a [u8]> },
     /// Whichever order the access path finds cheapest. For a count, which
     /// has no order, or a sort, which imposes its own.
@@ -1018,7 +1017,7 @@ where
 {
     let ScanBounds { stop_after, want, hold } = bounds;
     // Every read of documents goes through here (find, count, an aggregate's source,
-    // the vector filter's paging), so the request's deadline is set once for all of
+    // the vector filter), so the request's deadline is set once for all of
     // them; the walks below tick it per row (ADR-266).
     let _deadline = crate::limits::deadline_scope();
     let after = match order {
