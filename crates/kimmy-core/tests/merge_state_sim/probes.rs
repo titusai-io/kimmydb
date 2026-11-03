@@ -205,7 +205,12 @@ fn graded(cfg: &Cfg, names: &str, f: impl FnOnce(&mut Vec<Node>, &mut Log)) -> V
 /// The B1 and M1 scenarios (a counter that nets to zero; a non-numeric upsert creation value),
 /// each with the problems the oracle finds.
 pub fn scenarios() -> Vec<(String, Vec<String>)> {
-    let cfg = Cfg::default_ret();
+    scenarios_with(&Cfg::default_ret())
+}
+
+/// [`scenarios`] on the given configuration: a mutant is killed by them when they find a problem.
+pub fn scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
+    let cfg = cfg.clone();
     let s = |x: &str| Value::String(x.into());
     let mut out = Vec::new();
     out.push((
