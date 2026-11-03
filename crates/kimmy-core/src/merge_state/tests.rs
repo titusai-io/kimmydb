@@ -1804,12 +1804,14 @@ fn decode_refuses_a_bad_bool_a_deep_array_and_a_cut_value() {
 // ---- paths as segment lists --------------------------------------------------------------
 
 #[test]
-fn a_path_is_a_nonempty_list_of_nonempty_nul_free_segments() {
+fn a_path_is_a_nonempty_list_of_nul_free_segments() {
     assert_eq!(Path::new(Vec::<String>::new()), Err(InvalidPath("no segments")));
-    assert_eq!(Path::new([""]), Err(InvalidPath("an empty segment")));
-    assert_eq!(Path::new(["a", ""]), Err(InvalidPath("an empty segment")));
     assert_eq!(Path::new(["a\0b"]), Err(InvalidPath("a NUL byte in a segment")));
-    assert_eq!(Path::flat(""), Err(InvalidPath("an empty segment")));
+    // The engine stores empty, dotted and `$`-prefixed field names: all are segments.
+    for name in ["", "$set", "$", "a.b", ".", "..", "é"] {
+        assert_eq!(Path::flat(name).unwrap().segments(), [name]);
+    }
+    assert_eq!(Path::new(["a", ""]).unwrap().segments(), ["a", ""]);
     // A dot is part of a name, not a separator.
     let dotted = Path::flat("a.b").unwrap();
     assert_eq!(dotted.segments(), ["a.b"]);
@@ -1881,21 +1883,25 @@ fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
 }
 
 #[test]
-fn decode_refuses_an_empty_path_or_segment() {
+fn odd_field_names_are_distinct_cells_and_round_trip() {
+    // Empty, dotted, `$`-prefixed and nested names, each a different path, in the order the
+    // segments give: a prefix first, then the byte order of the segments.
+    let paths: Vec<Path> =
+        [&[""][..], &["", ""], &["$set"], &["a"], &["a", ""], &["a", "b"], &["a\u{1}"], &["a.b"]]
+            .iter()
+            .map(|s| Path::new(s.iter().copied()).unwrap())
+            .collect();
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[(Path::new(["a", "b"]).unwrap(), i(1))], 0).unwrap();
+    let fields: Vec<(Path, Value)> =
+        paths.iter().enumerate().map(|(k, q)| (q.clone(), i(k as i64))).collect();
+    w.insert(&fields, 0).unwrap();
+    let vis = w.visible().unwrap();
+    assert_eq!(vis.keys().cloned().collect::<Vec<_>>(), paths);
     let enc = w.state.encode();
-    // The path is written as the segments joined by a NUL byte: `a 0 b`.
-    let at = enc.windows(3).position(|x| x == b"a\0b").expect("the path is in the bytes");
-    let mut ok = enc.clone();
-    ok[at + 2] = b'c';
-    assert!(MergeState::decode(&ok).is_ok(), "another name, same shape");
-    for patch in [[b'a', 0, 0], [0, 0, b'b'], [0, b'x', b'b']] {
-        let mut bad = enc.clone();
-        bad[at..at + 3].copy_from_slice(&patch);
-        // The life's field order names the path too, so the first path read fails.
-        assert_eq!(MergeState::decode(&bad), Err(DecodeError::BadPath), "{patch:?}");
-    }
+    let back = MergeState::decode(&enc).unwrap();
+    assert_eq!(back, w.state);
+    assert_eq!(back.encode(), enc);
+    assert_eq!(back.visible(&opts()).unwrap(), vis);
 }
 
 // ---- stamps minted outside the writer ---------------------------------------------------

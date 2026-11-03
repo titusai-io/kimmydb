@@ -43,16 +43,17 @@ pub struct MStamp {
     pub writer: WriterId,
 }
 
-/// A refused path: no segments, an empty segment, or a segment with a NUL byte.
+/// A refused path: no segments, or a segment with a NUL byte.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("merge state: invalid path: {0}")]
 pub struct InvalidPath(pub &'static str);
 
 /// A field path: the names from the document root to a field, as a list of segments, never as
-/// one dotted string (a BSON field name may contain a dot). A path has at least one segment,
-/// no segment is empty, and none contains a NUL byte (a BSON field name cannot). Paths order
-/// by their segments, each compared as UTF-8 bytes, so a path sorts before every path it is a
-/// prefix of.
+/// one dotted string. A stored document may hold a field named `a.b`, `$x` or the empty string
+/// (insert checks no key), which no dotted path expression can reach, so a segment is any
+/// string without a NUL byte (a BSON field name cannot hold one); a path has at least one
+/// segment. Paths order by their segments, each compared as UTF-8 bytes, so a path sorts before
+/// every path it is a prefix of.
 ///
 /// In this stage a path is an opaque key of the state: no meaning is given to a path being
 /// below another. A flat field is the path of one segment.
@@ -69,9 +70,6 @@ impl Path {
         let segments: Vec<String> = segments.into_iter().map(Into::into).collect();
         if segments.is_empty() {
             return Err(InvalidPath("no segments"));
-        }
-        if segments.iter().any(String::is_empty) {
-            return Err(InvalidPath("an empty segment"));
         }
         if segments.iter().any(|s| s.contains('\0')) {
             return Err(InvalidPath("a NUL byte in a segment"));
