@@ -348,12 +348,12 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
             bad.push(format!("oracle {what}: rust {r} python {p}"));
         }
     };
-    cmp("doc", doc.map_or(J::Null, |d| jdoc(&Some(d))), &po["doc"]);
+    cmp("doc", jdoc(&doc), &po["doc"]);
     cmp("alive", J::Array(alive.iter().map(js).collect()), &po["alive"]);
     let mut dv = dels.clone();
     dv.sort();
     cmp("dels", J::Array(dv.iter().map(js).collect()), &po["dels"]);
-    let must = oracle::loss_oracle(&log, &alive, &dels, ret);
+    let must = oracle::loss_oracle(&log, &alive, &dels, doc.as_ref(), ret);
     cmp("must", J::Array(sorted_heads(must)), &po["must"]);
     let hid = oracle::hidden_oracle(&log, ret);
     cmp(
