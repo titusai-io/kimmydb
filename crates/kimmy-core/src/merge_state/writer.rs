@@ -227,8 +227,12 @@ impl Writer {
     /// `None`, which the write bodies treat as a refused write (before anything is written).
     fn mint(&mut self, m: &mut Mint<'_>) -> Option<MStamp> {
         // The writer cap: a writer the document does not mention yet is refused at the cap (a
-        // write adds the writer to the version vector).
-        if !self.opts.no_writer_cap() {
+        // write adds the writer to the version vector). Every writer of the version vector is
+        // mentioned, so the walk over the whole state is only needed for a writer that has not
+        // written yet.
+        if !self.opts.no_writer_cap() && !self.state.vv.contains_key(&self.id) {
+            #[cfg(test)]
+            super::work::bump(super::work::Counter::WriterScans, 1);
             let ws = self.state.writers();
             if ws.len() >= MAX_WRITERS && !ws.contains(&self.id) {
                 return None;
