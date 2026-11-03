@@ -7,8 +7,10 @@
 //! `JoinOptions::set_value_ignores_slot_stamp`, `JoinOptions::set_creation_without_generation`,
 //! `JoinOptions::set_suppress_soi`); the nested mutants use the switches of the nested rules
 //! (`set_type_ignores_recency`, `set_marker_hides`, `set_no_type_clash`,
-//! `set_array_clash_as_clash`, `set_rewrite_unchanged`, `set_write_below_scalar`).
+//! `set_array_clash_as_clash`, `set_rewrite_unchanged`, `set_write_below_scalar`,
+//! `set_type_clash_children_only`, `set_unset_shallow`).
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use kimmy_core::merge_state::LossKind;
@@ -179,31 +181,90 @@ pub fn mutants() -> Vec<Mutant> {
             grader: Random { restore: true },
             probe: None,
         },
+        Mutant {
+            name: "a typeClash is looked for among the direct children only",
+            apply: |c| c.opts.set_type_clash_children_only(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "an unset of a map unsets its direct children only",
+            apply: |c| c.opts.set_unset_shallow(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
     ]
 }
 
-/// How many of `n` seeded runs the grader fails.
-pub fn failing_runs(cfg: &Cfg, g: Grader, n: u64) -> u64 {
-    let mut bad = 0;
+/// What a grader found over `n` seeded runs: how many runs it failed, and the problems it named
+/// (the killers of a mutant), each with its count and the first seed that showed it.
+#[derive(Default)]
+pub struct Failing {
+    pub runs: u64,
+    pub named: BTreeMap<String, (u64, u64)>,
+}
+
+impl Failing {
+    fn note(&mut self, seed: u64, problems: impl IntoIterator<Item = String>) {
+        let mut any = false;
+        for p in problems {
+            // `diverged regs+slots` and `emission B` are one problem each
+            let name = p.split(' ').next().unwrap_or("").to_string();
+            let e = self.named.entry(name).or_insert((0, seed));
+            e.0 += 1;
+            any = true;
+        }
+        self.runs += u64::from(any);
+    }
+
+    /// The killers, as `name xN (seed S)` joined.
+    pub fn killers(&self) -> String {
+        self.named
+            .iter()
+            .map(|(k, (n, seed))| format!("{k} x{n} (first seed {seed})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Which of `n` seeded runs the grader fails, and for what.
+pub fn failing(cfg: &Cfg, g: Grader, n: u64) -> Failing {
+    let mut f = Failing::default();
     for seed in 0..n {
-        bad += match g {
+        match g {
             Grader::Random { restore } => {
                 let o = run(seed, &RunConfig { restore, ..RunConfig::default() }, cfg);
-                u64::from(!grade(&o.nodes, &o.log).is_empty() || !o.settled)
+                let mut ps = grade(&o.nodes, &o.log);
+                if !o.settled {
+                    ps.push("no-fixpoint".into());
+                }
+                f.note(seed, ps);
             }
             Grader::Horizon => {
                 let rc = RunConfig { steps: 24, retention: Some(4), ..RunConfig::default() };
                 let mut o = run(seed, &rc, cfg);
-                u64::from(settle(&mut o.nodes, 6).is_none())
+                let ps = if settle(&mut o.nodes, 6).is_none() {
+                    vec!["never-settles".to_string()]
+                } else {
+                    Vec::new()
+                };
+                f.note(seed, ps);
             }
-        };
+        }
     }
-    bad
+    f
+}
+
+/// How many of `n` seeded runs the grader fails.
+pub fn failing_runs(cfg: &Cfg, g: Grader, n: u64) -> u64 {
+    failing(cfg, g, n).runs
 }
 
 pub struct Outcome {
     pub name: &'static str,
     pub random_fail: u64,
+    /// The problems the random runs named: the killers.
+    pub killers: String,
     pub runs: u64,
     pub probe: Option<String>,
     pub killed: bool,
@@ -215,7 +276,8 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
     let design = Cfg::default_ret();
     let mut cfg = Cfg::default_ret();
     (m.apply)(&mut cfg);
-    let random_fail = failing_runs(&cfg, m.grader, runs);
+    let fails = failing(&cfg, m.grader, runs);
+    let random_fail = fails.runs;
     let (probe, probe_kills) = match m.probe {
         Probe::None => (None, false),
         Probe::EpochTwice => {
@@ -247,6 +309,7 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
     Outcome {
         name: m.name,
         random_fail,
+        killers: fails.killers(),
         runs,
         probe,
         killed: random_fail > 0 || probe_kills,
