@@ -208,6 +208,26 @@ pub fn held_set_key(len: usize) -> usize {
     with_margin(std::mem::size_of::<Vec<u8>>() + 2 * 9 + heap_block(len))
 }
 
+/// The estimate for an id in a hash set of `DocId`s (the admitted set of a filtered vector
+/// search): its bucket and control byte, at the 16/7 buckets an id that a table has just before
+/// it is full enough to double again (a table is never less than 7/16 full), and the heap of a
+/// string or binary id.
+pub fn held_doc_id(id: &kimmy_core::DocId) -> usize {
+    use kimmy_core::DocId;
+    let heap = match id {
+        DocId::String(text) => heap_block(text.len()),
+        DocId::Binary { bytes, .. } => heap_block(bytes.len()),
+        DocId::ObjectId(_) | DocId::Int64(_) | DocId::Decimal128(_) => 0,
+    };
+    with_margin((std::mem::size_of::<DocId>() + 1) * 16 / 7 + heap)
+}
+
+/// The estimate for a byte buffer of `len` bytes kept beside a document: the stored body a
+/// write holds with the document it decoded from it (the `Vec` header and its block).
+pub fn held_blob(len: usize) -> usize {
+    with_margin(std::mem::size_of::<Vec<u8>>() + heap_block(len))
+}
+
 /// The estimate of a list of documents.
 pub fn held_docs_bytes(docs: &[Document]) -> usize {
     docs.iter().fold(0usize, |sum, doc| sum.saturating_add(held_bytes(doc)))
@@ -664,6 +684,7 @@ pub(crate) fn output_of(stage: &str) -> &'static str {
             "the output of $replaceRoot (with its input, still held)"
         }
         "$unwind" => "the output of $unwind (with its input, still held)",
+        "$sort" => "the sort keys of $sort (with its input, still held)",
         "$group" => "the buckets of $group (with its input, still held)",
         "$bucket" => "the buckets of $bucket (with its input, still held)",
         "$bucketAuto" => "the buckets of $bucketAuto (with its input, still held)",

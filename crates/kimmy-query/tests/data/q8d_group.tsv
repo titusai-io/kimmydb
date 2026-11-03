@@ -1,0 +1,77 @@
+one int	i5	i5	i5
+ints	i1|i2|i3	i1	i3
+longs	l1|l2	l1	l2
+int+long	i1|l2	i1	l2
+int+double	i1|d2.5	i1	d2.5
+doubles	d1.5|d2.5	d1.5	d2.5
+int+dec	i1|D2.5	i1	D2.5
+dbl+dec	d0.1|D0.2	d0.1	D0.2
+long+dec	l9223372036854775807|D1	D1	l9223372036854775807
+dec+dec	D0.1|D0.2	D0.1	D0.2
+int max+1	i2147483647|i1	i1	i2147483647
+int max+1-1	i2147483647|i1|i-1	i-1	i2147483647
+int min-1	i-2147483648|i-1	i-2147483648	i-1
+long max+1	l9223372036854775807|i1	i1	l9223372036854775807
+long max+1-1	l9223372036854775807|i1|i-1	i-1	l9223372036854775807
+long min-1	l-9223372036854775808|i-1	l-9223372036854775808	i-1
+long max+long max	l9223372036854775807|l9223372036854775807	l9223372036854775807	l9223372036854775807
+long small in long	l1|i1|i-2	i-2	i1
+long result fits int	l5|i-3	i-3	l5
+null	null	null	null
+null+1	null|i1	i1	i1
+str+1	sa|i1	i1	sa
+bool+1	T|i1	i1	T
+date+1	t5|i1	i1	t5
+arr in arr	A[i1,i2]|i3	i3	A[i1,i2]
+all non numeric	sa|null|T	sa	T
+NaN	dNaN|i1	dNaN	i1
++Inf	dInfinity|i1	i1	dInfinity
++Inf-Inf	dInfinity|d-Infinity	d-Infinity	dInfinity
+-0	d-0.0	d-0.0	d-0.0
+-0 + -0	d-0.0|d-0.0	d-0.0	d-0.0
+dec NaN	DNaN|i1	DNaN	i1
+dec Inf	DInfinity|i1	i1	DInfinity
+dbl big	d1e+308|d1e+308	d1e+308	d1e+308
+dec big	D9.999999999999999999999999999999999E+6144|D9.999999999999999999999999999999999E+6144	D9.999999999999999999999999999999999E+6144	D9.999999999999999999999999999999999E+6144
+2^53	l9007199254740993|d1.0	d1.0	l9007199254740993
+dec exact	D1E+6000|D1|D-1E+6000	D-1E+6000	D1E+6000
+single array	A[i1,i2,i3]	A[i1,i2,i3]	A[i1,i2,i3]
+single array with junk	A[i1,sa,null,d2.5]	A[i1,sa,null,d2.5]	A[i1,sa,null,d2.5]
+single empty array	A[]	A[]	A[]
+single nested	A[A[i1,i2],i3]	A[A[i1,i2],i3]	A[A[i1,i2],i3]
+two arrays	A[i1,i2]|A[i3]	A[i1,i2]	A[i3]
+single str	sa	sa	sa
+single null	null	null	null
+mixed order	i3|sa|i1|null|d2.0	i1	sa
+strings	sb|sa|sc	sa	sc
+dates	t5|t3	t3	t5
+str vs num	sa|i5	i5	sa
+bool vs num	T|i5	i5	T
+null vs 1	null|i1	i1	i1
+equal int dbl	i1|d1.0	d1.0	d1.0
+equal dbl int	d1.0|i1	i1	i1
+equal int long	i1|l1	l1	l1
+equal long int	l1|i1	i1	i1
+equal dec dbl	D1.0|d1.0	d1.0	d1.0
+equal dbl dec	d1.0|D1.0	D1.0	D1.0
+equal dec int	D1|i1	i1	i1
+dec vs dec scale	D1.0|D1.00	D1.00	D1.00
+dec vs dec scale rev	D1.00|D1.0	D1.0	D1.0
+-0 vs 0	d-0.0|d0.0	d0.0	d0.0
+0 vs -0	d0.0|d-0.0	d-0.0	d-0.0
+NaN vs 1	dNaN|i1	dNaN	i1
+1 vs NaN	i1|dNaN	dNaN	i1
+NaN vs null	dNaN|null	dNaN	dNaN
+NaN vs NaN	dNaN|dNaN	dNaN	dNaN
+dec NaN vs 1	DNaN|i1	DNaN	i1
+dbl NaN vs dec NaN	dNaN|DNaN	DNaN	DNaN
+Inf vs big	dInfinity|l9223372036854775807	l9223372036854775807	dInfinity
+objectids	oid000000000000000000000002|oid000000000000000000000001	oid000000000000000000000001	oid000000000000000000000002
+bin	binAQ==|binAg==	binAQ==	binAg==
+minkey	minkey|i1	minkey	i1
+maxkey	maxkey|i1	i1	maxkey
+regex	rxa|rxb	rxa	rxb
+ts	ts1:2|ts1:3	ts1:2	ts1:3
+one null many	null|null	null	null
+max nested single array of arrays	A[A[i1,i5],A[i2]]	A[A[i1,i5],A[i2]]	A[A[i1,i5],A[i2]]
+strings in single array	A[sb,sa]	A[sb,sa]	A[sb,sa]

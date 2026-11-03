@@ -137,6 +137,40 @@ pub trait ModifySpec {
     fn expected_stamp(&self) -> Option<Stamp> {
         None
     }
+
+    /// Where the document keys an index range gathers are charged, if the caller budgets
+    /// them (ADR-270's second addendum).
+    ///
+    /// A write over an index range collects the key of every document the range files
+    /// inside the transaction, before it reads one, and nothing bounds the range. Each key
+    /// is [`KeyHold::take`]n as it is collected, so a refusal ends the gather at that key,
+    /// with nothing written; [`KeyHold::give_all`] is called when the gather ends, on
+    /// every path. A request of more than one chunk gathers again for each, so it is
+    /// called once per chunk. `None`, the default, charges nothing.
+    fn key_hold(&self) -> Option<&dyn crate::KeyHold> {
+        None
+    }
+
+    /// Where the documents the write matches are charged, if the caller budgets them.
+    ///
+    /// A chunk holds up to [`Engine::multi_chunk_docs`] matched documents, each with its
+    /// stored body, from the moment it matches until the chunk is written; a
+    /// `find_and_modify` that sorts holds up to [`MAX_CANDIDATES`] of them. Each is
+    /// [`MatchHold::take`]n as it matches, so a refusal ends the chunk before anything is
+    /// written, and [`MatchHold::give_all`] is called when the chunk ends, on every path.
+    /// `None`, the default, charges nothing.
+    fn match_hold(&self) -> Option<&dyn MatchHold> {
+        None
+    }
+}
+
+/// Where the documents a filtered write has matched are charged while it holds them.
+pub trait MatchHold {
+    /// One more document matched, and is held with `body` bytes of its stored image (none
+    /// when the write does not keep it). A refusal ends the write's chunk with its error.
+    fn take(&self, doc: &Document, body: usize) -> kimmy_core::Result<()>;
+    /// Every document held is let go: the chunk is written, or has ended.
+    fn give_all(&self);
 }
 
 /// What happened, and the images either side of it.
@@ -344,6 +378,8 @@ impl Engine {
         let txn =
             if continuing { self.begin_write_continuing(holder) } else { self.begin_write(holder) }
                 .map_err(none)?;
+        // The matches are let go of when the chunk is, the write of them included.
+        let _given_back = GivesBackMatches(spec.match_hold());
         let (matches, examined) =
             match self.collect_matches(&txn, coll, candidates, spec, Some(budget), after, true) {
                 Ok(found) => found,
@@ -400,6 +436,9 @@ impl Engine {
         spec: &dyn ModifySpec,
     ) -> Result<ModifyOutcome> {
         let txn = self.begin_write(WriterHolder::Write)?;
+        // Every match is held to sort them, and the chosen one to write it: let go of
+        // together, when the write is over.
+        let _given_back = GivesBackMatches(spec.match_hold());
 
         let chosen = match self.choose(&txn, coll, candidates, spec) {
             Ok(chosen) => chosen,
@@ -607,6 +646,9 @@ impl Engine {
                     return Ok(true);
                 }
                 let body = if keep_bodies { record.body } else { Vec::new() };
+                if let Some(hold) = spec.match_hold() {
+                    hold.take(&doc, body.len())?;
+                }
                 matches.push(Match { stamp: record.stamp, doc, body });
                 if limit.is_none() && matches.len() > MAX_CANDIDATES {
                     // Refused, not truncated: choosing from a prefix would return
@@ -656,15 +698,21 @@ impl Engine {
                 // nothing about this snapshot.
                 let sound = !both_bounds || !self.index_is_multikey(txn, coll, *index_id)?;
                 if sound {
+                    // The keys are let go of when the lookup is done with them, however it
+                    // ends.
+                    let hold = spec.key_hold();
+                    let _given_back = GivesBack(hold);
                     let mut keys = Vec::new();
                     for (lower, upper) in ranges {
                         keys.extend(index::scan_range_in_write(
+                            self,
                             txn,
                             coll.id,
                             *index_id,
                             lower,
                             Some(upper),
                             index::Unkeyed::Include,
+                            hold,
                         )?);
                     }
                     lookup(keys, &mut matches)?;
@@ -764,6 +812,28 @@ impl Engine {
         let entry = OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(id.clone()), body };
         append_oplog(txn, &entry)?;
         Ok(Some(entry))
+    }
+}
+
+/// Lets go of the keys a gather held when it goes out of scope, whichever way it ends.
+struct GivesBack<'a>(Option<&'a dyn crate::KeyHold>);
+
+impl Drop for GivesBack<'_> {
+    fn drop(&mut self) {
+        if let Some(hold) = self.0 {
+            hold.give_all();
+        }
+    }
+}
+
+/// Lets go of the documents a chunk held when it goes out of scope, whichever way it ends.
+struct GivesBackMatches<'a>(Option<&'a dyn MatchHold>);
+
+impl Drop for GivesBackMatches<'_> {
+    fn drop(&mut self) {
+        if let Some(hold) = self.0 {
+            hold.give_all();
+        }
     }
 }
 
@@ -1965,6 +2035,549 @@ mod tests {
             "{cause:?}"
         );
         assert_eq!(claimed(&engine, &coll), vec![0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The keys an index range gathers (ADR-270's second addendum)
+    // -----------------------------------------------------------------------
+
+    /// What a test's hold is told, and when it refuses or acts.
+    struct KeyLog {
+        /// Keys held now, and the most held at once.
+        held: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+        /// Every `take`, over every chunk.
+        takes: std::cell::Cell<usize>,
+        give_alls: std::cell::Cell<usize>,
+        /// Refuse the `n`th `take` of the request, counting over its chunks.
+        refuse_at: Option<usize>,
+        /// Run this at the `n`th `take`, after it is counted.
+        at: Option<(usize, Box<dyn Fn()>)>,
+    }
+
+    impl KeyLog {
+        fn new() -> Self {
+            KeyLog {
+                held: Default::default(),
+                peak: Default::default(),
+                takes: Default::default(),
+                give_alls: Default::default(),
+                refuse_at: None,
+                at: None,
+            }
+        }
+
+        fn refusing_at(n: usize) -> Self {
+            KeyLog { refuse_at: Some(n), ..Self::new() }
+        }
+
+        fn running_at(n: usize, f: impl Fn() + 'static) -> Self {
+            KeyLog { at: Some((n, Box::new(f))), ..Self::new() }
+        }
+    }
+
+    impl crate::KeyHold for KeyLog {
+        fn take(&self, _len: usize) -> kimmy_core::Result<()> {
+            self.takes.set(self.takes.get() + 1);
+            self.held.set(self.held.get() + 1);
+            self.peak.set(self.peak.get().max(self.held.get()));
+            if let Some((n, f)) = &self.at
+                && *n == self.takes.get()
+            {
+                f();
+            }
+            if self.refuse_at == Some(self.takes.get()) {
+                return Err(kimmy_core::Error::Limit("the log is full".into()));
+            }
+            Ok(())
+        }
+
+        fn give(&self, _len: usize) {
+            self.held.set(self.held.get() - 1);
+        }
+
+        fn give_all(&self) {
+            self.give_alls.set(self.give_alls.get() + 1);
+            self.held.set(0);
+        }
+    }
+
+    /// A spec that offers `hold` for the keys it gathers, and is otherwise `inner`.
+    struct Held<'a, S> {
+        inner: S,
+        hold: &'a KeyLog,
+    }
+
+    impl<S: ModifySpec> ModifySpec for Held<'_, S> {
+        fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
+            self.inner.matches(doc)
+        }
+        fn compare(&self, a: &Document, b: &Document) -> Ordering {
+            self.inner.compare(a, b)
+        }
+        fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+            self.inner.apply(doc)
+        }
+        fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+            self.inner.upsert()
+        }
+        fn key_hold(&self) -> Option<&dyn crate::KeyHold> {
+            Some(self.hold)
+        }
+    }
+
+    /// `n` pending jobs (`created` 0 to `n - 1`) under an index on `created`, written in chunks
+    /// of `chunk`, and the candidates that are all of them.
+    fn indexed_jobs(
+        n: i64,
+        chunk: usize,
+    ) -> (std::sync::Arc<Engine>, CollectionMeta, Candidates, tempfile::TempDir) {
+        let (engine, _coll, dir) = engine();
+        engine.set_multi_chunk_docs(chunk);
+        engine
+            .create_index(
+                "app",
+                "jobs",
+                vec![kimmy_core::IndexField::ascending("created")],
+                false,
+                Some("created_1".into()),
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "jobs").unwrap();
+        let batch: Vec<Document> =
+            (0..n).map(|id| doc! {"_id": id, "created": id, "status": "pending"}).collect();
+        engine.insert_many(&coll, batch).unwrap();
+        let key = |i: i64| {
+            kimmy_core::keyenc::encode_compound_ordered(&[(bson::Bson::Int64(i), false)]).unwrap()
+        };
+        let candidates = Candidates::Index {
+            index_id: coll.index("created_1").unwrap().id,
+            ranges: vec![(key(0), key(n.max(1) - 1))],
+            both_bounds: false,
+        };
+        (std::sync::Arc::new(engine), coll, candidates, dir)
+    }
+
+    fn pending(engine: &Engine, coll: &CollectionMeta, n: i64) -> usize {
+        (0..n)
+            .filter(|id| {
+                let doc = engine.get(coll, &DocId::Int64(*id)).unwrap().unwrap();
+                doc.get_str("status").unwrap() == "pending"
+            })
+            .count()
+    }
+
+    /// What a test's hold of matched documents is told.
+    struct MatchLog {
+        /// Documents held now, and the most held at once.
+        held: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+        takes: std::cell::Cell<usize>,
+        give_alls: std::cell::Cell<usize>,
+        /// The bytes of stored body each document came with.
+        bodies: std::cell::RefCell<Vec<usize>>,
+        /// Refuse the `n`th `take` of the request, counting over its chunks.
+        refuse_at: Option<usize>,
+    }
+
+    impl MatchLog {
+        fn new(refuse_at: Option<usize>) -> Self {
+            MatchLog {
+                held: Default::default(),
+                peak: Default::default(),
+                takes: Default::default(),
+                give_alls: Default::default(),
+                bodies: Default::default(),
+                refuse_at,
+            }
+        }
+    }
+
+    impl MatchHold for MatchLog {
+        fn take(&self, _doc: &Document, body: usize) -> kimmy_core::Result<()> {
+            self.takes.set(self.takes.get() + 1);
+            self.held.set(self.held.get() + 1);
+            self.peak.set(self.peak.get().max(self.held.get()));
+            self.bodies.borrow_mut().push(body);
+            if self.refuse_at == Some(self.takes.get()) {
+                return Err(kimmy_core::Error::Limit("the documents are full".into()));
+            }
+            Ok(())
+        }
+
+        fn give_all(&self) {
+            self.give_alls.set(self.give_alls.get() + 1);
+            self.held.set(0);
+        }
+    }
+
+    /// A spec that offers `log` for the documents it matches, and is otherwise `inner`.
+    struct Matched<'a, S> {
+        inner: S,
+        log: &'a MatchLog,
+    }
+
+    impl<S: ModifySpec> ModifySpec for Matched<'_, S> {
+        fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
+            self.inner.matches(doc)
+        }
+        fn compare(&self, a: &Document, b: &Document) -> Ordering {
+            self.inner.compare(a, b)
+        }
+        fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+            self.inner.apply(doc)
+        }
+        fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+            self.inner.upsert()
+        }
+        fn match_hold(&self) -> Option<&dyn MatchHold> {
+            Some(self.log)
+        }
+    }
+
+    #[test]
+    fn the_documents_a_chunk_matches_are_held_for_the_chunk_and_let_go_when_it_ends() {
+        // 25 documents in chunks of 10: three chunks, each holding its matches with their
+        // stored bodies, and giving them back when it ends.
+        let (engine, coll, candidates, _dir) = indexed_jobs(25, 10);
+        let log = MatchLog::new(None);
+        let spec = Matched { inner: claim_all(), log: &log };
+        let out = engine.modify_where(&coll, &candidates, &spec, None).unwrap();
+        assert_eq!((out.matched, out.commits), (25, 3));
+        assert_eq!((log.takes.get(), log.peak.get(), log.held.get()), (25, 10, 0));
+        assert_eq!(log.give_alls.get(), 3, "once for each chunk; the fourth is never begun");
+        assert!(log.bodies.borrow().iter().all(|body| *body > 0), "the bodies are kept");
+    }
+
+    #[test]
+    fn a_sort_holds_every_match_and_none_of_their_bodies() {
+        // `find_and_modify` has to see every match to choose one, and reads the chosen one's
+        // body again; it keeps none of the others.
+        let (engine, coll, candidates, _dir) = indexed_jobs(40, 1_000);
+        let log = MatchLog::new(None);
+        let spec = Matched { inner: claim(), log: &log };
+        let out = engine.find_and_modify(&coll, &candidates, &spec).unwrap();
+        assert!(out.matched);
+        assert_eq!((log.takes.get(), log.held.get(), log.give_alls.get()), (40, 0, 1));
+        assert!(log.bodies.borrow().iter().all(|body| *body == 0));
+    }
+
+    #[test]
+    fn a_match_the_hold_refuses_writes_nothing() {
+        // The 7th of 40 matches is refused: the chunk ends there, before any of it is
+        // written, with the matches given back.
+        let (engine, coll, candidates, _dir) = indexed_jobs(40, 1_000);
+        let clock = engine.clock_last();
+        for verb in ["modify_where", "find_and_modify"] {
+            let log = MatchLog::new(Some(7));
+            let spec = Matched { inner: claim_all(), log: &log };
+            let refused = if verb == "modify_where" {
+                engine.modify_where(&coll, &candidates, &spec, None).map(drop)
+            } else {
+                engine.find_and_modify(&coll, &candidates, &spec).map(drop)
+            };
+            assert!(
+                matches!(&refused, Err(StorageError::Core(kimmy_core::Error::Limit(m))) if m == "the documents are full"),
+                "{verb}: {refused:?}"
+            );
+            assert_eq!((log.takes.get(), log.held.get(), log.give_alls.get()), (7, 0, 1), "{verb}");
+        }
+        assert_eq!(pending(&engine, &coll, 40), 40, "nothing was written");
+        assert_eq!(engine.clock_last(), clock);
+    }
+
+    #[test]
+    fn a_gather_charges_every_key_of_its_range_and_lets_them_go_when_it_ends() {
+        let (engine, coll, candidates, _dir) = indexed_jobs(50, 1_000);
+        let log = KeyLog::new();
+        let spec = Held { inner: claim_all(), hold: &log };
+        let out = engine.modify_where(&coll, &candidates, &spec, None).unwrap();
+        assert_eq!((out.matched, out.commits), (50, 1));
+        assert_eq!((log.takes.get(), log.peak.get(), log.held.get()), (50, 50, 0));
+        assert_eq!(log.give_alls.get(), 1);
+
+        // One document, chosen among the whole range: the same keys.
+        let (engine, coll, candidates, _dir) = indexed_jobs(50, 1_000);
+        let log = KeyLog::new();
+        let spec = Held { inner: claim(), hold: &log };
+        let out = engine.find_and_modify(&coll, &candidates, &spec).unwrap();
+        assert!(out.matched);
+        assert_eq!((log.takes.get(), log.held.get(), log.give_alls.get()), (50, 0, 1));
+    }
+
+    #[test]
+    fn a_range_the_hold_refuses_writes_nothing_and_releases_the_writer() {
+        // The 21st key is refused: the gather ends there, before the rest of the range is
+        // read and before any document is, and the transaction is aborted whole.
+        let (engine, coll, candidates, _dir) = indexed_jobs(50, 1_000);
+        let clock = engine.clock_last();
+        let mut rx = engine.subscribe();
+        for verb in ["modify_where", "find_and_modify"] {
+            let log = KeyLog::refusing_at(21);
+            let spec = Held { inner: claim_all(), hold: &log };
+            let refused = if verb == "modify_where" {
+                engine.modify_where(&coll, &candidates, &spec, None).map(drop)
+            } else {
+                engine.find_and_modify(&coll, &candidates, &spec).map(drop)
+            };
+            assert!(
+                matches!(&refused, Err(StorageError::Core(kimmy_core::Error::Limit(m))) if m == "the log is full"),
+                "{verb}: {refused:?}"
+            );
+            assert_eq!(log.takes.get(), 21, "{verb}: the gather ended at the refused key");
+            assert_eq!((log.held.get(), log.give_alls.get()), (0, 1), "{verb}: and gave back");
+        }
+        assert_eq!(pending(&engine, &coll, 50), 50, "nothing was written");
+        assert_eq!(engine.clock_last(), clock, "nothing was minted");
+        assert!(rx.try_recv().is_err(), "nothing was published");
+        // The writer is free at once, not after a wait.
+        engine.insert(&coll, doc! {"_id": 1000, "created": 1000, "status": "pending"}).unwrap();
+
+        // An upsert that would have inserted is refused too, not answered with an insert.
+        let log = KeyLog::refusing_at(21);
+        let seed = TestSpec {
+            matches: |_: &Document| false,
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |d: &Document| Ok(Some(d.clone())),
+            upsert: Some(doc! {"_id": 2000, "created": 2000, "status": "pending"}),
+        };
+        let spec = Held { inner: seed, hold: &log };
+        assert!(engine.find_and_modify(&coll, &candidates, &spec).is_err());
+        assert!(engine.get(&coll, &DocId::Int64(2000)).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_keys_are_let_go_when_the_apply_fails_too() {
+        let (engine, coll, candidates, _dir) = indexed_jobs(5, 1_000);
+        let log = KeyLog::new();
+        let failing = TestSpec {
+            matches: |_: &Document| true,
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |_: &Document| Err("no".to_string()),
+            upsert: None,
+        };
+        let spec = Held { inner: failing, hold: &log };
+        assert!(engine.modify_where(&coll, &candidates, &spec, None).is_err());
+        assert_eq!((log.takes.get(), log.held.get(), log.give_alls.get()), (5, 0, 1));
+    }
+
+    /// `keyed` documents under an index on `a` and `b`, and `unkeyed` that the index cannot
+    /// key (parallel arrays, which only a replicated write files: a local one is refused).
+    fn with_unkeyed(
+        keyed: i64,
+        unkeyed: i64,
+    ) -> (std::sync::Arc<Engine>, CollectionMeta, Candidates, tempfile::TempDir) {
+        let (engine, _coll, dir) = engine();
+        let field = |path: &str| kimmy_core::IndexField::ascending(path);
+        engine
+            .create_index("app", "jobs", vec![field("a"), field("b")], false, Some("ab".into()))
+            .unwrap();
+        let coll = engine.get_collection("app", "jobs").unwrap();
+        let batch: Vec<Document> =
+            (0..keyed).map(|id| doc! {"_id": id, "a": id, "b": id, "status": "pending"}).collect();
+        engine.insert_many(&coll, batch).unwrap();
+        for i in 0..unkeyed {
+            let body = doc! {"_id": -1 - i, "a": [1, 2], "b": [3, 4], "status": "pending"};
+            let entry = OplogEntry {
+                stamp: Stamp::new(
+                    kimmy_core::Hlc::new(u64::MAX >> 20, i as u16),
+                    kimmy_core::NodeId::from_bytes([9; 16]),
+                ),
+                kind: OpKind::Insert,
+                collection: coll.id,
+                doc_id: Some(DocId::Int64(-1 - i)),
+                body: Some(bson::serialize_to_vec(&body).unwrap()),
+            };
+            assert!(engine.apply_remote(&coll, &entry).unwrap());
+        }
+        let key = |i: i64| {
+            kimmy_core::keyenc::encode_compound_ordered(&[
+                (bson::Bson::Int64(i), false),
+                (bson::Bson::Int64(i), false),
+            ])
+            .unwrap()
+        };
+        let candidates = Candidates::Index {
+            index_id: coll.index("ab").unwrap().id,
+            ranges: vec![(key(0), key(keyed.max(1) - 1))],
+            both_bounds: false,
+        };
+        (std::sync::Arc::new(engine), coll, candidates, dir)
+    }
+
+    fn matching_nothing() -> impl ModifySpec {
+        TestSpec {
+            matches: |_: &Document| false,
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |d: &Document| Ok(Some(d.clone())),
+            upsert: None,
+        }
+    }
+
+    #[test]
+    fn the_documents_an_index_could_not_key_are_charged_with_the_range() {
+        // Every sentinel run is gathered beside the range, since its documents are
+        // candidates for every filter: they are held, and so they are charged.
+        let (engine, coll, candidates, _dir) = with_unkeyed(10, 3);
+        let log = KeyLog::new();
+        let spec = Held { inner: matching_nothing(), hold: &log };
+        let out = engine.modify_where(&coll, &candidates, &spec, None).unwrap();
+        assert_eq!(out.examined, 13, "the unkeyed documents are examined too");
+        assert_eq!((log.takes.get(), log.held.get()), (13, 0));
+
+        let log = KeyLog::refusing_at(13);
+        let spec = Held { inner: matching_nothing(), hold: &log };
+        assert!(engine.modify_where(&coll, &candidates, &spec, None).is_err());
+        assert_eq!(log.takes.get(), 13, "refused at the last unkeyed key, which is held");
+    }
+
+    #[test]
+    fn a_multi_write_gathers_its_range_again_for_each_chunk_and_lets_go_each_time() {
+        let (engine, coll, candidates, _dir) = indexed_jobs(6, 2);
+        let log = KeyLog::new();
+        let spec = Held { inner: claim_all(), hold: &log };
+        let out = engine.modify_where(&coll, &candidates, &spec, None).unwrap();
+        assert_eq!((out.matched, out.commits), (6, 3));
+        // The whole range four times: the three chunks that write, and a fourth, full chunk's
+        // successor that finds nothing left. Each gather is let go of when it ends.
+        assert_eq!(log.takes.get(), 24);
+        assert_eq!((log.peak.get(), log.held.get(), log.give_alls.get()), (6, 0, 4));
+    }
+
+    #[test]
+    fn a_later_chunk_the_hold_refuses_is_partly_applied() {
+        // A refusal after the first commit is what ADR-192 says of any failure there: the
+        // chunks that landed stand, and the answer counts them.
+        let (engine, coll, candidates, _dir) = indexed_jobs(3, 1);
+        let log = KeyLog::refusing_at(4);
+        let spec = Held { inner: claim_all(), hold: &log };
+        let failed = engine.modify_where(&coll, &candidates, &spec, None).unwrap_err();
+        let StorageError::PartiallyApplied { applied, cause } = failed else {
+            panic!("a refusal after a commit is partly applied: {failed:?}");
+        };
+        assert_eq!(
+            applied,
+            crate::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 0 }
+        );
+        assert!(matches!(*cause, StorageError::Core(kimmy_core::Error::Limit(_))), "{cause:?}");
+        assert_eq!(pending(&engine, &coll, 3), 2, "chunk one stands and nothing after it");
+    }
+
+    fn the_deadline_passes_at_the_fifth_key() -> KeyLog {
+        KeyLog::running_at(5, || {
+            std::mem::forget(kimmy_core::deadline::Deadline::scope(Some(
+                std::time::Duration::ZERO,
+            )));
+        })
+    }
+
+    #[test]
+    fn a_gather_ends_at_the_deadline_and_writes_nothing() {
+        // The deadline passes while the keys are being gathered, at the fifth: the next
+        // entry the walk reads ends it, before the rest of the range is read and before any
+        // document is, and nothing is written.
+        let (engine, coll, candidates, _dir) = indexed_jobs(50, 1_000);
+        let log = the_deadline_passes_at_the_fifth_key();
+        let asked = std::cell::Cell::new(0);
+        let counting = TestSpec {
+            matches: |_: &Document| {
+                asked.set(asked.get() + 1);
+                true
+            },
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |d: &Document| Ok(Some(d.clone())),
+            upsert: None,
+        };
+        let _live = kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::from_secs(60)));
+        let spec = Held { inner: counting, hold: &log };
+        let failed = engine.modify_where(&coll, &candidates, &spec, None);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        assert_eq!(log.takes.get(), 5, "the gather ended at the entry after the deadline");
+        assert_eq!(asked.get(), 0, "and no document was read");
+        assert_eq!(pending(&engine, &coll, 50), 50);
+    }
+
+    #[test]
+    fn the_gather_of_a_find_and_modify_ends_at_the_deadline_and_writes_nothing() {
+        let (engine, coll, candidates, _dir) = indexed_jobs(50, 1_000);
+        let log = the_deadline_passes_at_the_fifth_key();
+        let _live = kimmy_core::deadline::Deadline::scope(Some(std::time::Duration::from_secs(60)));
+        let spec = Held { inner: claim(), hold: &log };
+        let failed = engine.find_and_modify(&coll, &candidates, &spec);
+        assert!(
+            matches!(failed, Err(StorageError::Core(kimmy_core::Error::DeadlineExceeded))),
+            "{failed:?}"
+        );
+        assert_eq!(log.takes.get(), 5);
+        assert_eq!(pending(&engine, &coll, 50), 50);
+    }
+
+    #[test]
+    fn a_deadline_that_passes_after_the_first_commit_does_not_cut_a_later_gather() {
+        // ADR-192: a request that has written something keeps going, so the gather of the
+        // second chunk runs with the deadline set aside, and all three chunks land.
+        let (engine, coll, candidates, _dir) = indexed_jobs(3, 1);
+        crate::sync::race_hooks::at(
+            crate::sync::race_hooks::Race::BetweenChunks,
+            expire_deadline_for_this_test,
+        );
+        let log = KeyLog::new();
+        let spec = Held { inner: claim_all(), hold: &log };
+        let out = engine.modify_where(&coll, &candidates, &spec, None).unwrap();
+        assert_eq!((out.matched, out.commits), (3, 3));
+        assert_eq!(pending(&engine, &coll, 3), 0);
+    }
+
+    #[test]
+    fn a_stop_during_the_first_gather_ends_the_request_with_nothing_written() {
+        let (engine, coll, candidates, _dir) = indexed_jobs(50, 1_000);
+        let stopper = std::sync::Arc::clone(&engine);
+        let log = KeyLog::running_at(5, move || stopper.set_stopping());
+        let spec = Held { inner: claim_all(), hold: &log };
+        let failed = engine.modify_where(&coll, &candidates, &spec, None);
+        assert!(
+            matches!(failed, Err(StorageError::Stopping(crate::StopReason::DrainDeadline))),
+            "{failed:?}"
+        );
+        assert_eq!(log.takes.get(), 5, "the gather ended at the next entry");
+        assert_eq!(pending(&engine, &coll, 50), 50);
+    }
+
+    #[test]
+    fn a_stop_during_a_later_gather_is_partly_applied_and_the_chunk_is_not() {
+        // The stop arrives at the fifth key of the request, the second of the second chunk's
+        // gather (the first chunk's took three). ADR-192 answers a stop after a commit
+        // `partially_applied`, with what landed: the first chunk. The second chunk wrote
+        // nothing, however far it had got.
+        let (engine, coll, candidates, _dir) = indexed_jobs(3, 1);
+        let stopper = std::sync::Arc::clone(&engine);
+        let log = KeyLog::running_at(5, move || stopper.set_stopping());
+        let spec = Held { inner: claim_all(), hold: &log };
+        let failed = engine.modify_where(&coll, &candidates, &spec, None).unwrap_err();
+        let StorageError::PartiallyApplied { applied, cause } = failed else {
+            panic!("a stop after a commit is partly applied: {failed:?}");
+        };
+        assert_eq!(
+            applied,
+            crate::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 0 }
+        );
+        assert!(
+            matches!(*cause, StorageError::Stopping(crate::StopReason::DrainDeadline)),
+            "{cause:?}"
+        );
+        assert_eq!(log.takes.get(), 5, "the second gather ended at its second key");
+        let status = |id: i64| {
+            let doc = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
+            doc.get_str("status").unwrap().to_string()
+        };
+        assert_eq!(
+            (status(0), status(1), status(2)),
+            ("claimed".to_string(), "pending".to_string(), "pending".to_string()),
+            "chunk one stands; chunk two wrote nothing"
+        );
     }
 
     // -----------------------------------------------------------------------

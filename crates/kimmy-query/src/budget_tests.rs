@@ -599,7 +599,6 @@ fn a_stage_that_only_moves_its_input_holds_the_input_and_builds_nothing() {
     let held_in = held_docs_bytes(&input);
     for stage in [
         doc! {"$match": {"g": 1}},
-        doc! {"$sort": {"g": -1}},
         doc! {"$limit": 5},
         doc! {"$skip": 5},
         doc! {"$count": "n"},
@@ -613,6 +612,60 @@ fn a_stage_that_only_moves_its_input_holds_the_input_and_builds_nothing() {
         assert_eq!(*bytes, held_in, "{stage}");
         assert!(what.starts_with("the input of $"), "{stage}: {what}");
     }
+}
+
+#[test]
+fn a_sort_holds_its_input_and_the_sort_keys_it_reads_from_it() {
+    // Long strings in the keys, so that the keys are most of what the sort holds beyond its
+    // input. The two keys are what `TopK` charges for a document, less the document itself.
+    let input = padded(20, 400);
+    let held_in = held_docs_bytes(&input);
+    let keys = |doc: &Document| {
+        std::mem::size_of::<Vec<Bson>>()
+            + held_bytes_bson(&doc["pad"])
+            + held_bytes_bson(&doc["_id"])
+    };
+    let held_keys: usize = input.iter().map(keys).sum();
+    assert!(held_keys > 20 * 400, "the keys are what the strings are: {held_keys}");
+    let stage = doc! {"$sort": {"pad": -1, "_id": 1}};
+    // The sort runs with room for its input and its keys, and not a byte fewer.
+    let limits = capped(held_in + held_keys);
+    let out = run(stage.clone(), input.clone(), &limits).unwrap();
+    assert_eq!(limits.buffer.used(), 0, "gives everything back");
+    let ids =
+        |docs: &[Document]| docs.iter().map(|d| d.get_i32("_id").unwrap()).collect::<Vec<_>>();
+    assert_eq!(ids(&out), (0..20).collect::<Vec<_>>(), "the order is what it was");
+    // Charging the keys leaves the order as it was: by `g` descending, ties in arrival order.
+    let by_g = run(doc! {"$sort": {"g": -1}}, input.clone(), &capped(held_in + held_keys)).unwrap();
+    let expect: Vec<i32> =
+        [2, 1, 0].iter().flat_map(|g| (0..20).filter(move |i| i % 3 == *g)).collect();
+    assert_eq!(ids(&by_g), expect);
+    // The input alone fits under the limit that refuses the sort, so the keys are what is refused.
+    let limits = capped(held_in + held_keys - 1);
+    let err = run(stage.clone(), input.clone(), &limits).unwrap_err();
+    let Error::ValueTooLarge { what, bytes, max, .. } = &err else { panic!("{err:?}") };
+    assert_eq!(*what, "the sort keys of $sort (with its input, still held)");
+    assert_eq!((*bytes, *max), (held_in + held_keys, held_in + held_keys - 1));
+    assert_eq!(limits.buffer.used(), 0, "gives everything back when refused");
+    assert_eq!(smallest_cap(&stage, &input, held_in + 2 * held_keys), held_in + held_keys);
+}
+
+#[test]
+fn a_sort_without_a_limit_and_the_heap_of_one_with_a_limit_charge_a_key_alike() {
+    let input = padded(20, 400);
+    let held_in = held_docs_bytes(&input);
+    let sort = doc! {"$sort": {"pad": -1, "_id": 1}};
+    // The barrier holds the input and the keys; the heap, asked to keep all twenty, holds
+    // the documents and the keys: the same bytes, whichever way they are held.
+    let barrier = smallest_cap(&sort, &input, 4 * held_in);
+    let limits = capped(1 << 30);
+    let stages = aggregate::parse(&[sort, doc! {"$limit": 20}]).unwrap();
+    let mut chain = chain_of(&stages, &limits);
+    for doc in &input {
+        let _ = chain.push(doc.clone()).unwrap();
+    }
+    assert_eq!(limits.buffer.used(), barrier);
+    assert!(barrier > held_in);
 }
 
 #[test]

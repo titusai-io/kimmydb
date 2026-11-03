@@ -20630,6 +20630,366 @@ async fn now_in_a_pipeline_update_is_one_date_for_the_request() {
     }
 }
 
+/// `$rand` in a pipeline update is drawn once, for each document, on the member that accepts the
+/// write, and the number is stored: it is a value of the document like any other. It is not
+/// drawn again when the document is read (a `find` or an aggregation reads the stored number),
+/// when the same update's other fields are rewritten, or when the write is replicated, since
+/// the oplog entry that replicates it carries the document that resulted (the post-image),
+/// which is how `$$NOW` is replicated too.
+#[tokio::test]
+async fn rand_in_a_pipeline_update_is_stored_as_a_fixed_value() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, (1..=5).map(|i| json!({ "_id": i })).collect()).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "r": { "$rand": {} } } }], "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 5);
+    let stored: Vec<f64> = {
+        let mut out = Vec::new();
+        for i in 1..=5 {
+            out.push(pu_doc(&server, &token, i).await["r"].as_f64().expect("a number"));
+        }
+        out
+    };
+    assert!(stored.iter().all(|r| (0.0..1.0).contains(r)), "{stored:?}");
+    // One draw for each document, not one for the request.
+    let mut distinct = stored.clone();
+    distinct.sort_by(f64::total_cmp);
+    distinct.dedup();
+    assert_eq!(distinct.len(), 5, "{stored:?}");
+    // Reading again, by `find` and by an aggregation, answers the stored numbers.
+    for i in 1..=5usize {
+        assert_eq!(pu_doc(&server, &token, i as i64).await["r"].as_f64(), Some(stored[i - 1]));
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$sort": { "_id": 1 } }, { "$project": { "_id": 0, "r": 1 } }] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let read: Vec<f64> = res.body["documents"]
+        .as_array()
+        .expect("documents")
+        .iter()
+        .map(|d| d["r"].as_f64().unwrap())
+        .collect();
+    assert_eq!(read, stored);
+    // A later update that does not name the field leaves it alone.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "n": 1 } }], "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    for i in 1..=5usize {
+        assert_eq!(pu_doc(&server, &token, i as i64).await["r"].as_f64(), Some(stored[i - 1]));
+    }
+    // What replicates is the post-image: the newest oplog entry of each document holds
+    // exactly the stored number.
+    let entries = server
+        .state
+        .engine
+        .read_oplog_from(kimmy_core::Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+        .expect("reading the oplog");
+    let mut seen = 0;
+    for entry in &entries {
+        let Some(doc) = entry.document().expect("a body") else { continue };
+        let (Ok(id), Ok(r)) = (doc.get_i32("_id"), doc.get_f64("r")) else { continue };
+        assert_eq!(r, stored[id as usize - 1], "the oplog holds the stored draw of {id}");
+        seen += 1;
+    }
+    // The first update and the second each wrote all five.
+    assert_eq!(seen, 10);
+}
+
+/// What replicates is the document a `$rand` produced, not the pipeline: a second member,
+/// brought level by the sync transport, holds the very numbers the accepting member stored.
+#[tokio::test]
+async fn a_rand_written_on_one_member_is_the_same_number_on_the_other() {
+    let members = [Server::start().await, Server::start().await];
+    let token = members[0].root().await;
+    pipeline_coll(&members[0], &token, (1..=3).map(|i| json!({ "_id": i })).collect()).await;
+    converge_members(&members);
+    let res = members[0]
+        .post(
+            "/v1/db/shop/coll/pu/update",
+            Some(&token),
+            json!({ "filter": {}, "update": [{ "$set": { "r": { "$rand": {} } } }], "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    converge_members(&members);
+    let read = |member: &Server, id: i64| {
+        let engine = &member.state.engine;
+        let coll = engine.get_collection("shop", "pu").unwrap();
+        engine
+            .get(&coll, &kimmy_core::DocId::try_from_bson(&bson::Bson::Int64(id)).unwrap())
+            .unwrap()
+            .expect("replicated")
+            .get_f64("r")
+            .expect("a stored number")
+    };
+    for id in 1..=3 {
+        let (here, there) = (read(&members[0], id), read(&members[1], id));
+        assert!((0.0..1.0).contains(&here));
+        assert_eq!(here.to_bits(), there.to_bits(), "document {id}");
+    }
+}
+
+/// `$sampleRate` is a clause of a document filter wherever one is accepted: a rate of 0 matches
+/// nothing and a rate of 1 everything, in a find, an update and an aggregation, and a rate out
+/// of range is a `400`.
+#[tokio::test]
+async fn sample_rate_is_a_filter_clause_of_find_update_and_aggregate() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, (1..=5).map(|i| json!({ "_id": i, "g": i % 2 })).collect())
+        .await;
+    let find = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server.post("/v1/db/shop/coll/pu/find", Some(token), json!({ "filter": filter })).await
+        }
+    };
+    let res = find(json!({ "$sampleRate": 1 })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"].as_array().expect("documents").len(), 5);
+    let res = find(json!({ "$sampleRate": 0 })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(res.body["documents"].as_array().expect("documents").is_empty());
+    let res = find(json!({ "$sampleRate": 1, "g": 1 })).await;
+    assert_eq!(res.body["documents"].as_array().expect("documents").len(), 3);
+    for bad in [json!(1.5), json!(-0.5), json!("a"), json!(null)] {
+        let res = find(json!({ "$sampleRate": bad })).await;
+        assert_eq!(res.status, 400, "{bad}: {:?}", res.body);
+    }
+    let update = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/pu/update",
+                    Some(token),
+                    json!({ "filter": filter, "update": { "$set": { "hit": true } }, "multi": true }),
+                )
+                .await
+        }
+    };
+    let res = update(json!({ "$sampleRate": 0 })).await;
+    assert_eq!((res.status, &res.body["matched"]), (200, &json!(0)), "{:?}", res.body);
+    let res = update(json!({ "$sampleRate": 1 })).await;
+    assert_eq!((res.status, &res.body["matched"]), (200, &json!(5)), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pu/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$match": { "$sampleRate": 1 } }, { "$count": "n" }] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["n"], 5);
+    // `count` and `delete` take it as a filter too: a rate of 0 counts and removes nothing, a
+    // rate of 1 everything.
+    let count = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server.post("/v1/db/shop/coll/pu/count", Some(token), json!({ "filter": filter })).await
+        }
+    };
+    assert_eq!(count(json!({ "$sampleRate": 0 })).await.body["count"], 0);
+    assert_eq!(count(json!({ "$sampleRate": 1 })).await.body["count"], 5);
+    assert_eq!(count(json!({ "$sampleRate": 1, "g": 1 })).await.body["count"], 3);
+    let delete = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/pu/delete",
+                    Some(token),
+                    json!({ "filter": filter, "multi": true }),
+                )
+                .await
+        }
+    };
+    let res = delete(json!({ "$sampleRate": 0 })).await;
+    assert_eq!((res.status, &res.body["deleted"]), (200, &json!(0)), "{:?}", res.body);
+    assert_eq!(count(json!({})).await.body["count"], 5);
+    let res = delete(json!({ "$sampleRate": 1, "g": 1 })).await;
+    assert_eq!((res.status, &res.body["deleted"]), (200, &json!(3)), "{:?}", res.body);
+    assert_eq!(count(json!({})).await.body["count"], 2);
+}
+
+/// A rate between 0 and 1 keeps about that share, through every path that takes a filter, and a
+/// share is not all-or-nothing (the source is the thread's own and cannot be scripted from
+/// here, so the check is statistical, to six standard deviations of a binomial of 1,000).
+#[tokio::test]
+async fn sample_rate_keeps_about_its_share_through_find_count_update_and_delete() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let res = server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "big" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs: Vec<Value> = (0..1000).map(|i| json!({ "_id": i, "g": i % 2 })).collect();
+    let res = server.post("/v1/db/shop/coll/big/bulk", Some(&token), Value::Array(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let within = |n: u64| (405..595).contains(&n);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/big/count",
+            Some(&token),
+            json!({ "filter": { "$sampleRate": 0.5 } }),
+        )
+        .await;
+    assert!(within(res.body["count"].as_u64().unwrap()), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/big/find",
+            Some(&token),
+            json!({ "filter": { "$sampleRate": 0.5 }, "limit": 5000 }),
+        )
+        .await;
+    assert!(within(res.body["documents"].as_array().unwrap().len() as u64), "{:?}", res.status);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/big/update",
+            Some(&token),
+            json!({ "filter": { "$sampleRate": 0.5 }, "update": { "$set": { "hit": true } }, "multi": true }),
+        )
+        .await;
+    assert!(within(res.body["matched"].as_u64().unwrap()), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/big/delete",
+            Some(&token),
+            json!({ "filter": { "$sampleRate": 0.5 }, "multi": true }),
+        )
+        .await;
+    let deleted = res.body["deleted"].as_u64().unwrap();
+    assert!(within(deleted), "{:?}", res.body);
+    let res = server.post("/v1/db/shop/coll/big/count", Some(&token), json!({})).await;
+    assert_eq!(res.body["count"].as_u64().unwrap(), 1000 - deleted);
+}
+
+/// The positional `$` reads the element a filter matched, and a `$sampleRate` in the filter is
+/// drawn once for a document, not again to find the element (review q8d, M2): a second draw
+/// at or above the rate made a valid request a `400`. The source cannot be scripted from here,
+/// so the test makes the old failure near-certain instead: over 200 documents each of the
+/// three paths would fail with probability 1 - 0.75^100 or more, and none may.
+#[tokio::test]
+async fn a_positional_path_with_a_sample_rate_is_never_refused() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let res = server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "pos" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs: Vec<Value> = (0..200).map(|i| json!({ "_id": i, "a": [1, 2, 3] })).collect();
+    let res = server.post("/v1/db/shop/coll/pos/bulk", Some(&token), Value::Array(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let filter = json!({ "a": 2, "$sampleRate": 0.5 });
+
+    // The positional find projection: each document it keeps is the matched element.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pos/find",
+            Some(&token),
+            json!({ "filter": filter, "projection": { "a.$": 1 }, "limit": 1000 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let found = res.body["documents"].as_array().expect("documents");
+    assert!((55..145).contains(&found.len()), "{}", found.len());
+    assert!(found.iter().all(|d| d["a"] == json!([2])), "{found:?}");
+
+    // About a hundred find-and-modify calls with a positional projection, each on one document.
+    let mut answered = 0;
+    for i in 0..100 {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/pos/find_and_modify",
+                Some(&token),
+                json!({
+                    "filter": { "_id": i, "a": 2, "$sampleRate": 0.5 },
+                    "update": { "$set": { "touched": true } },
+                    "projection": { "a.$": 1 },
+                    "returnDocument": "after",
+                }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{i}: {:?}", res.body);
+        if !res.body["document"].is_null() {
+            answered += 1;
+            assert_eq!(res.body["document"]["a"], json!([2]), "{i}");
+        }
+    }
+    assert!((20..80).contains(&answered), "{answered}");
+
+    // The positional multi-update: the matched element is the one rewritten.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pos/update",
+            Some(&token),
+            json!({ "filter": filter, "update": { "$set": { "a.$": 20 } }, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let matched = res.body["matched"].as_u64().unwrap();
+    assert!((55..145).contains(&matched), "{matched}");
+    let res = server
+        .post("/v1/db/shop/coll/pos/count", Some(&token), json!({ "filter": { "a": [1, 20, 3] } }))
+        .await;
+    assert_eq!(res.body["count"].as_u64().unwrap(), matched, "{:?}", res.body);
+}
+
+/// A `$lookup` sub-pipeline's leading `$sampleRate` (or `$expr` with `$rand`) is drawn for each
+/// outer document: two outer documents get two different samples of the foreign ones (review
+/// q8d, M3). Applied once to the foreign documents and shared, they would get one.
+#[tokio::test]
+async fn a_lookup_samples_the_foreign_documents_again_for_each_outer_document() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    pipeline_coll(&server, &token, (1..=2).map(|i| json!({ "_id": i })).collect()).await;
+    let res =
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "foreign" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs: Vec<Value> = (0..1000).map(|i| json!({ "_id": i })).collect();
+    let res = server.post("/v1/db/shop/coll/foreign/bulk", Some(&token), Value::Array(docs)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    for leading in [
+        json!({ "$match": { "$sampleRate": 0.5 } }),
+        json!({ "$match": { "$expr": { "$lt": [{ "$rand": {} }, 0.5] } } }),
+    ] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/pu/aggregate",
+                Some(&token),
+                json!({ "pipeline": [
+                    { "$sort": { "_id": 1 } },
+                    { "$lookup": {
+                        "from": "foreign",
+                        "pipeline": [leading.clone(), { "$project": { "_id": 1 } }],
+                        "as": "s" } },
+                    { "$project": { "_id": 0, "s": "$s._id" } } ] }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{leading}: {:?}", res.body);
+        let samples = res.body["documents"].as_array().expect("documents");
+        assert_eq!(samples.len(), 2);
+        let (first, second) = (&samples[0]["s"], &samples[1]["s"]);
+        for s in [first, second] {
+            assert!((405..595).contains(&s.as_array().unwrap().len()), "{leading}");
+        }
+        assert_ne!(first, second, "{leading}: one sample shared by both outer documents");
+    }
+}
+
 #[tokio::test]
 async fn a_pipeline_update_judges_id_on_the_final_result_and_takes_an_empty_pipeline() {
     // Reference 6.0.5: a result without `_id` gets the stored one back; a changed one is
