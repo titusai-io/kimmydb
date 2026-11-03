@@ -141,7 +141,7 @@ fn states_with_order_entries_obey_the_laws_and_both_codecs() {
                 assert_eq!(&back, st);
                 assert_eq!(back.encode_compact(), c, "canonical");
                 assert_eq!(back.compact_hash(), st.compact_hash());
-                assert_eq!(c[3], if st.ords.is_empty() { 2 } else { 3 }, "the version byte");
+                assert_eq!(&c[..4], b"QMS\x02", "the version byte is 2 for every state");
                 if !st.ords.is_empty() {
                     assert!(!st.v1_can_hold(), "version 1 cannot spell an order state");
                     assert_eq!(st.try_encode(), Err(V1CannotHold));

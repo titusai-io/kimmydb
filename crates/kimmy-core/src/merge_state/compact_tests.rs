@@ -27,8 +27,7 @@ fn opts() -> JoinOptions {
 /// Encode, decode, and check that the bytes are exactly what the decoded state encodes to.
 fn round_trip(st: &MergeState) -> Vec<u8> {
     let enc = st.encode_compact();
-    assert_eq!(&enc[..3], b"QMS");
-    assert_eq!(enc[3], if st.ords.is_empty() { 2 } else { 3 }, "the version byte");
+    assert_eq!(&enc[..4], b"QMS\x02", "the version byte is 2 for every state");
     assert_eq!(&enc[4..], st.compact_bytes());
     let back = MergeState::decode_compact(&enc).unwrap();
     assert_eq!(&back, st);
@@ -284,9 +283,13 @@ fn every_proper_prefix_and_a_trailing_byte_are_refused() {
     for n in 0..enc.len() {
         assert!(MergeState::decode_compact(&enc[..n]).is_err(), "prefix {n}");
     }
+    // A byte after the losses begins section 10: a count of 0 there is an empty order state, which
+    // is refused (any other count promises entries that are not there).
     let mut more = enc.clone();
     more.push(0);
-    assert_eq!(MergeState::decode_compact(&more), Err(DecodeError::Trailing(1)));
+    assert_eq!(MergeState::decode_compact(&more), Err(DecodeError::OrdSectionEmpty));
+    more[enc.len()] = 1;
+    assert!(MergeState::decode_compact(&more).is_err());
     // The version 1 decoder refuses the compact form and the other way round.
     assert_eq!(MergeState::decode(&enc), Err(DecodeError::BadHeader));
     assert_eq!(MergeState::decode_compact(&golden_mixed().encode()), Err(DecodeError::BadHeader));
@@ -946,7 +949,7 @@ fn ord_corpus() -> Vec<Vec<u8>> {
             pool.iter().step_by(5).filter(|s| !s.ords.is_empty()).map(MergeState::encode_compact),
         );
     }
-    assert!(out.iter().all(|b| b[3] == 3));
+    assert!(out.iter().all(|b| MergeState::decode_compact(b).is_ok_and(|s| !s.ords.is_empty())));
     out
 }
 
@@ -979,13 +982,12 @@ fn full_ord(a: WriterId, b: WriterId) -> FieldOrd {
 
 /// The frozen layout of section 10, byte by byte, written independently of the encoder.
 #[test]
-fn an_order_state_is_section_ten_and_the_version_byte_is_three() {
+fn an_order_state_is_section_ten_after_the_losses() {
     let (a, b) = (wid(b'A', 0), wid(b'B', 0));
     let mut s = with_ords(&[((1, OrdAt::Field(p("x"))), full_ord(a, b))]);
     s.vv.insert(b, Hlc::new(5, 0));
     // header, writers A B, life table [(1, A)], then the sections
     let mut h = Hand::new(&[a, b], &[(1, 0)]);
-    h.0[3] = 3;
     h.n(1).n(0).n(0).n(0).n(1); // lives: the life, no deletes seen, no field order, an upsert
     h.n(0).n(0).n(0).n(0); // dead, deletes, regs, slots
     h.n(2).n(0).hlc(5).n(1).hlc(5); // the version vector
@@ -1000,19 +1002,18 @@ fn an_order_state_is_section_ten_and_the_version_byte_is_three() {
     h.hlc(4).n(0); // lvl at (4, A)
     assert_eq!(s.encode_compact(), h.0, "section 10, as the frozen layout says");
     assert_eq!(MergeState::decode_compact(&h.0), Ok(s.clone()));
-    // the same state without the order state is the version 2 bytes with nothing after the losses
+    // the same state without the order state is the same bytes with nothing after the losses
     let mut bare = s.clone();
     bare.ords.clear();
     let e = bare.encode_compact();
     assert_eq!(&e[..4], b"QMS\x02");
-    assert!(h.0[4..].starts_with(&e[4..]) || bare.compact_bytes().len() < s.compact_bytes().len());
+    assert!(h.0.starts_with(&e) && h.0.len() > e.len());
     // the root, a replace floor, no firsts, no last and no lvl: the shortest entry
     let r = with_ords(&[(
         (1, OrdAt::Root),
         FieldOrd { floor: Some(Floor::R { stamp: st(5, a) }), ..FieldOrd::default() },
     )]);
     let mut h = Hand::new(&[a], &[(1, 0)]);
-    h.0[3] = 3;
     h.n(1).n(0).n(0).n(0).n(1).n(0).n(0).n(0).n(0).n(1).n(0).hlc(5).n(0);
     h.n(1).n(0).n(0); // section 10: one entry, life 0, the root (a segment count of 0)
     h.n(2).hlc(5).n(0); // the floor: r at (5, A), no bit and no prev
@@ -1059,27 +1060,36 @@ fn section_ten_is_decoded_strictly() {
         h.n(1);
         entry(h, &ok_floor, &[0, 0]);
     };
-    assert!(MergeState::decode_compact(&body(3, false, true, 5, &good)).is_ok());
-    // version 3 with an empty section; version 2 with a section; another version
+    assert!(MergeState::decode_compact(&body(2, false, true, 5, &good)).is_ok());
+    // no section at all is a state without an order state; a section of count 0 is refused; bytes
+    // after a section are trailing input; the version byte is 2 and nothing else
+    assert!(
+        MergeState::decode_compact(&body(2, false, true, 5, &|_| {}))
+            .is_ok_and(|s| s.ords.is_empty())
+    );
     assert_eq!(
-        MergeState::decode_compact(&body(3, false, true, 5, &|h| {
+        MergeState::decode_compact(&body(2, false, true, 5, &|h| {
             h.n(0);
         })),
         Err(DecodeError::OrdSectionEmpty)
     );
     assert_eq!(
-        MergeState::decode_compact(&body(3, false, true, 5, &|_| {})),
-        Err(DecodeError::Truncated)
+        MergeState::decode_compact(&body(2, false, true, 5, &|h| {
+            good(h);
+            h.n(0);
+        })),
+        Err(DecodeError::Trailing(1))
     );
-    let v2 = body(2, false, true, 5, &good);
-    assert!(matches!(MergeState::decode_compact(&v2), Err(DecodeError::Trailing(_))));
-    assert_eq!(
-        MergeState::decode_compact(&body(4, false, true, 5, &good)),
-        Err(DecodeError::BadHeader)
-    );
+    for version in [0u8, 1, 3, 4, 0xff] {
+        assert_eq!(
+            MergeState::decode_compact(&body(version, false, true, 5, &good)),
+            Err(DecodeError::BadHeader),
+            "version {version}"
+        );
+    }
     // the floor byte: 0 to 3 only, so the update bit on a replace floor has no spelling
     for bad in [4u8, 5, 6, 7, 0x80, 0xff] {
-        let r = MergeState::decode_compact(&body(3, false, true, 5, &|h| {
+        let r = MergeState::decode_compact(&body(2, false, true, 5, &|h| {
             h.n(1);
             let mut f = ok_floor.to_vec();
             f[0] = bad;
@@ -1093,7 +1103,7 @@ fn section_ten_is_decoded_strictly() {
     u_floor_bit[0] = 3;
     for f in [&u_floor, &u_floor_bit] {
         // (5, A) is not above its own floor, so the candidates are none: normal
-        let r = MergeState::decode_compact(&body(3, false, true, 5, &|h| {
+        let r = MergeState::decode_compact(&body(2, false, true, 5, &|h| {
             h.n(1);
             entry(h, f, &[0, 0]);
         }));
@@ -1101,7 +1111,7 @@ fn section_ten_is_decoded_strictly() {
     }
     // the flags byte: bits 0 and 1 only
     for flags in [4u8, 5, 0x80] {
-        let r = MergeState::decode_compact(&body(3, false, true, 5, &|h| {
+        let r = MergeState::decode_compact(&body(2, false, true, 5, &|h| {
             h.n(1);
             entry(h, &[0], &[0, flags]);
         }));
@@ -1109,7 +1119,7 @@ fn section_ten_is_decoded_strictly() {
     }
     // keys out of order or twice, and the same inside the firsts
     let two_entries = |first: &[u8], second: &[u8]| {
-        body(3, false, true, 5, &|h| {
+        body(2, false, true, 5, &|h| {
             h.n(2).n(0).n(1).n(1).raw(first).raw(&[0, 0, 0]);
             h.n(0).n(1).n(1).raw(second).raw(&[0, 0, 0]);
         })
@@ -1124,7 +1134,7 @@ fn section_ten_is_decoded_strictly() {
         Err(DecodeError::NotCanonical)
     );
     let firsts = |w1: usize, w2: usize| {
-        body(3, true, true, 5, &|h| {
+        body(2, true, true, 5, &|h| {
             h.n(1).n(0).n(1).n(1).raw(b"x").n(0).n(2);
             h.n(w1).hlc(5).n(0).n(0).n(w2).hlc(5).n(0).n(0).n(0);
         })
@@ -1135,28 +1145,28 @@ fn section_ten_is_decoded_strictly() {
     assert_eq!(MergeState::decode_compact(&firsts(0, 2)), Err(DecodeError::BadIndex));
     // a life index outside the table, a root that is a path of no segments is the root
     assert_eq!(
-        MergeState::decode_compact(&body(3, false, true, 5, &|h| {
+        MergeState::decode_compact(&body(2, false, true, 5, &|h| {
             h.n(1).n(1).n(1).n(1).raw(b"x").raw(&[0, 0, 0]);
         })),
         Err(DecodeError::BadIndex)
     );
     // a segment with a NUL byte
     assert_eq!(
-        MergeState::decode_compact(&body(3, false, true, 5, &|h| {
+        MergeState::decode_compact(&body(2, false, true, 5, &|h| {
             h.n(1).n(0).n(1).n(1).raw(b"\0").raw(&[0, 0, 0]);
         })),
         Err(DecodeError::BadPath)
     );
     // a position in more bytes than it needs; one past a u64
     for pos in [&[0x80u8, 0x00][..], &[0xff; 10]] {
-        let r = MergeState::decode_compact(&body(3, false, true, 5, &|h| {
+        let r = MergeState::decode_compact(&body(2, false, true, 5, &|h| {
             h.n(1).n(0).n(1).n(1).raw(b"x").n(0).n(1).n(0).hlc(5).n(0).raw(pos).n(0);
         }));
         assert_eq!(r, Err(DecodeError::NotCanonical), "{pos:?}");
     }
     // a candidate the floor voids; the same entry with the candidate above the floor
     let voided = |at: u64| {
-        body(3, false, true, 5, &|h| {
+        body(2, false, true, 5, &|h| {
             h.n(1).n(0).n(1).n(1).raw(b"x");
             h.n(1).hlc(2).n(0).hlc(0); // a `u` floor at (2, A)
             h.n(1).n(0).hlc(at).n(0).n(0); // one first at (at, A)
@@ -1166,7 +1176,7 @@ fn section_ten_is_decoded_strictly() {
     assert_eq!(MergeState::decode_compact(&voided(2)), Err(DecodeError::OrdNotNormal));
     assert_eq!(MergeState::decode_compact(&voided(1)), Err(DecodeError::OrdNotNormal));
     assert!(MergeState::decode_compact(&voided(3)).is_ok());
-    let void_last = body(3, false, true, 5, &|h| {
+    let void_last = body(2, false, true, 5, &|h| {
         h.n(1).n(0).n(1).n(1).raw(b"x");
         h.n(2).hlc(3).n(0); // an `r` floor at (3, A)
         h.n(0).n(1).hlc(2).n(0).n(0); // no firsts, a last at (2, A)
@@ -1174,12 +1184,12 @@ fn section_ten_is_decoded_strictly() {
     assert_eq!(MergeState::decode_compact(&void_last), Err(DecodeError::OrdNotNormal));
     // an entry of a life that `lives` does not list
     assert_eq!(
-        MergeState::decode_compact(&body(3, false, false, 5, &good)),
+        MergeState::decode_compact(&body(2, false, false, 5, &good)),
         Err(DecodeError::OrdLifeNotListed)
     );
     // a version vector that does not cover a stamp of the entry
     let behind = |floor: bool, first: bool, last: bool, lvl: bool| {
-        body(3, false, true, 4, &|h| {
+        body(2, false, true, 4, &|h| {
             h.n(1).n(0).n(1).n(1).raw(b"x");
             if floor {
                 h.n(2).hlc(5).n(0);
@@ -1213,10 +1223,12 @@ fn section_ten_is_decoded_strictly() {
     }
 }
 
-/// Every proper prefix of an encoding that carries an order state is refused, a byte too many is
-/// trailing input, and the other form refuses the compact tag.
+/// The end of the input delimits section 10: a proper prefix of an encoding that carries an order
+/// state is refused, EXCEPT the prefix that ends where the losses end, which is the encoding of the
+/// same state without its order state; a byte after the section is trailing input; the other form
+/// refuses the compact tag.
 #[test]
-fn an_order_state_has_no_proper_prefix_and_no_trailing_byte() {
+fn an_order_states_prefixes_are_refused_but_the_one_that_ends_at_the_losses() {
     let (a, b) = (wid(b'A', 0), wid(b'B', 0));
     let mut s = with_ords(&[
         ((1, OrdAt::Root), FieldOrd { lvl: Some(st(2, a)), ..FieldOrd::default() }),
@@ -1224,9 +1236,18 @@ fn an_order_state_has_no_proper_prefix_and_no_trailing_byte() {
     ]);
     s.vv.insert(b, Hlc::new(5, 0));
     let enc = round_trip(&s);
-    assert_eq!(enc[3], 3);
+    let mut bare = s.clone();
+    bare.ords.clear();
+    let bare_enc = bare.encode_compact();
+    assert!(enc.starts_with(&bare_enc), "the tables are the same, so the sections 1 to 9 are");
     for n in 0..enc.len() {
-        assert!(MergeState::decode_compact(&enc[..n]).is_err(), "prefix {n}");
+        match MergeState::decode_compact(&enc[..n]) {
+            Err(_) => assert_ne!(n, bare_enc.len(), "the prefix that ends at the losses decodes"),
+            Ok(x) => {
+                assert_eq!(n, bare_enc.len(), "prefix {n} decodes");
+                assert_eq!(x, bare);
+            }
+        }
     }
     let mut more = enc.clone();
     more.push(0);
@@ -1236,10 +1257,8 @@ fn an_order_state_has_no_proper_prefix_and_no_trailing_byte() {
     assert_eq!(s.try_encode(), Err(V1CannotHold));
     assert_eq!(s.try_canonical_bytes(), Err(V1CannotHold));
     // the hash separates the state with its order state from the one without
-    let mut bare = s.clone();
-    bare.ords.clear();
     assert_ne!(bare.compact_hash(), s.compact_hash());
-    assert_eq!(bare.encode_compact()[3], 2);
+    assert_eq!(bare.compact_bytes(), bare_enc[4..]);
 }
 
 /// The entries of the reference model's scenarios (states with real order entries, cells, lives
@@ -1253,10 +1272,9 @@ fn the_models_scenario_states_round_trip_in_the_compact_form() {
         for e in sc["entries"].as_array().unwrap() {
             let st = golden_state(e);
             assert!(st.check_decoded().is_ok());
-            let enc = round_trip(&st);
+            round_trip(&st);
             n += 1;
-            with_ords += usize::from(enc[3] == 3);
-            assert_eq!(enc[3], if st.ords.is_empty() { 2 } else { 3 });
+            with_ords += usize::from(!st.ords.is_empty());
         }
     }
     assert!(n > 90 && with_ords * 10 > n * 9, "{n} states, {with_ords} with an order state");

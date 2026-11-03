@@ -39,7 +39,8 @@
 //!
 //! A body is a sequence of sections in a fixed order. A later format adds a section at the end
 //! (or a field to an existing section) and raises the version byte; this version accepts exactly
-//! these ten, the tenth only when the state has an order state (see the version byte below):
+//! these ten, the last of them only when the state has an order state (see the version byte
+//! below):
 //!
 //! 1. the **writer table**: a count, then every [`WriterId`] the state mentions, in strictly
 //!    increasing order;
@@ -88,14 +89,18 @@
 //!
 //! # The version byte and the presence of section 10
 //!
-//! The version byte is 2 for a state WITHOUT an order state: no section 10, the bytes exactly as
-//! they were before the order state existed (the golden vectors and every hash of such a state
-//! are unchanged). It is 3 for a state WITH one, and then section 10 follows the losses and has
-//! at least one entry. The rule is canonical: a state has one spelling, so version 3 with an
-//! empty section is refused ([`DecodeError::OrdSectionEmpty`]), version 2 with bytes after the
-//! losses is trailing input, and the body alone ([`MergeState::compact_bytes`], what the hash
-//! covers) is the old body followed by section 10 when there is one: two states never share a
-//! body, since the first nine sections end where they end.
+//! The version byte is 2 for every state; section 10 is present iff the state has a non-empty
+//! order state, and is the last section, so its presence is decided by whether bytes remain
+//! after the losses.
+//!
+//! So a state without an order state has exactly the bytes it had before the order state
+//! existed (the golden vectors and every hash of such a state are unchanged), and the body
+//! alone ([`MergeState::compact_bytes`], what the hash covers) is that old body followed by
+//! section 10 when there is one: two states never share a body. A section 10 with a count of 0
+//! is refused ([`DecodeError::OrdSectionEmpty`]) and so are bytes after it, so a state has one
+//! spelling. The limit of the approach: the end of the input can delimit only the LAST optional
+//! section; a future section 11 needs a presence mask, tags, or a version bump (the format is
+//! positional: its sections carry no tags).
 //!
 //! # Extension points
 //!
@@ -134,11 +139,8 @@ use super::types::{Epoch, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Va
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-/// The format version byte of this form for a state without an order state.
+/// The format version byte of this form: for every state, with or without an order state.
 const VERSION: u8 = 2;
-
-/// The version byte of a state with an order state: section 10 follows the losses.
-const VERSION_ORD: u8 = 3;
 
 /// The first `u128` a counter total never takes as a zigzag (they stop at `2 * MAX_TOTAL`, below
 /// 2^121): `ESCAPE + 1` introduces an `Int32` total, `+ 2` a `Decimal128`.
@@ -562,11 +564,11 @@ impl MergeState {
     }
 
     /// The whole state in the compact form, for a round trip with
-    /// [`MergeState::decode_compact`]: the magic, the format version (2, or 3 when the state has an
-    /// order state), then [`MergeState::compact_bytes`].
+    /// [`MergeState::decode_compact`]: the magic, the format version 2, then
+    /// [`MergeState::compact_bytes`].
     pub fn encode_compact(&self) -> Vec<u8> {
         let mut out = Vec::from(MAGIC);
-        out.push(if self.ords.is_empty() { VERSION } else { VERSION_ORD });
+        out.push(VERSION);
         out.extend_from_slice(&self.write_compact_body());
         out
     }
@@ -577,11 +579,9 @@ impl MergeState {
         if r.take(3)? != MAGIC {
             return Err(DecodeError::BadHeader);
         }
-        let with_ords = match r.u8()? {
-            VERSION => false,
-            VERSION_ORD => true,
-            _ => return Err(DecodeError::BadHeader),
-        };
+        if r.u8()? != VERSION {
+            return Err(DecodeError::BadHeader);
+        }
         r.tables()?;
         let mut s = MergeState::default();
         for _ in 0..r.len()? {
@@ -659,7 +659,8 @@ impl MergeState {
             let v = r.loss_value()?;
             put(&mut s.losses, k, v)?;
         }
-        if with_ords {
+        // section 10, the last: present iff bytes remain after the losses
+        if !r.rest.is_empty() {
             let n = r.len()?;
             if n == 0 {
                 return Err(DecodeError::OrdSectionEmpty);
