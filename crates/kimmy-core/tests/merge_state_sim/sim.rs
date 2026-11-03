@@ -426,14 +426,6 @@ impl Node {
         self.logged(r, log)
     }
     pub fn inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
-        // EXPECTED DIFFERENCE from the model: it writes `$inc` of a double base as a register
-        // write; here the increment is a slot of the double's generation (Double counters, D6),
-        // which the model and this harness's oracle do not describe. The harness does not make
-        // that write.
-        if matches!(self.w.visible().and_then(|v| v.get(&p(path)).cloned()), Some(Value::Double(_)))
-        {
-            return None;
-        }
         let r = self.w.write_inc(&p(path), n, skew);
         self.logged(r, log)
     }

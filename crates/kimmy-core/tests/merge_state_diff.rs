@@ -227,21 +227,11 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
             }
             "inc" => {
                 let m = op[1].as_u64().unwrap() as usize;
-                // EXPECTED DIFFERENCE (D6): the generator skips an `$inc` of a double base, which
-                // the model writes as a register and Rust as a counter slot; so does the replay.
-                let on_double = matches!(
-                    ms[m].w.visible().and_then(|v| v.get(&pth(op[2].as_str().unwrap())).cloned()),
-                    Some(Value::Double(_))
+                let r = ms[m].w.write_inc(
+                    &pth(op[2].as_str().unwrap()),
+                    op[3].as_i64().unwrap(),
+                    op[4].as_u64().unwrap(),
                 );
-                let r = if on_double {
-                    None
-                } else {
-                    ms[m].w.write_inc(
-                        &pth(op[2].as_str().unwrap()),
-                        op[3].as_i64().unwrap(),
-                        op[4].as_u64().unwrap(),
-                    )
-                };
                 opt_stamp_j(ms[m].logged(r, &mut log))
             }
             "set" => {

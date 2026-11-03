@@ -35,9 +35,10 @@
 //! Retention (`R`) and the integer bound are carried by [`JoinOptions`]; every
 //! read method that depends on them takes the options.
 //!
-//! Counters are typed (`counter.rs`): `Int32`, `Int64`, `Double` and `Decimal128` amounts merge,
-//! the type of a merged cell is the join of its parts, and the parts are added in a canonical
-//! order. A counter has at most [`MAX_CONTRIBUTORS`] contributing writers and a document at most
+//! Counters are typed (`counter.rs`): `Int32`, `Int64` and `Decimal128` amounts merge (doubles
+//! are not counters), the type of a merged cell is the join of its parts, the parts are added in
+//! a canonical order, and a merge that crosses a bound saturates and reports the excess
+//! ([`MergeState::excess`]). A counter has at most [`MAX_CONTRIBUTORS`] contributing writers and a document at most
 //! [`MAX_WRITERS`] writers: a LOCAL write that would pass either is refused, a received state
 //! past either is kept and reported ([`MergeState::over_caps`]).
 //!
@@ -71,8 +72,8 @@ pub use codec::{DecodeError, V1CannotHold};
 pub use counter::Num;
 pub use join::{InvalidIntBound, JoinOptions, join};
 pub use state::{
-    Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, OverCaps,
-    Reg, Slot, Vv,
+    Excess, Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey,
+    OverCaps, Reg, Slot, Vv,
 };
 pub use types::{
     Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
@@ -116,6 +117,7 @@ const _: () = {
     let _: fn(&MergeState) -> BTreeSet<WriterId> = MergeState::writers;
     let _: fn(&MergeState, &Path, &JoinOptions) -> BTreeSet<WriterId> = MergeState::contributors;
     let _: fn(&MergeState, &JoinOptions) -> OverCaps = MergeState::over_caps;
+    let _: fn(&MergeState, &JoinOptions) -> BTreeMap<Path, Excess> = MergeState::excess;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::canonical_bytes;
     let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_canonical_bytes;

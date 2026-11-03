@@ -569,20 +569,17 @@ fn probe_v3m3_newer_generation_kept() {
 
 #[test]
 fn probe_double_base() {
-    // Nm5 revised (D6): a double base starts a generation, but `$inc` of it writes a slot of
-    // that generation, so two concurrent increments both survive (the model made each a
-    // register write, and the newer one won).
+    // Nm5: $inc on a double base is a register write that starts a generation.
     let o = opts();
     let (mut ii, mut a, mut b) = (Mem::new('I', &o), Mem::new('A', &o), Mem::new('B', &o));
     let i0 = ii.ins(&[("x", f(2.5))], 0).unwrap();
     a.receive_entry(&ii.ent(i0));
     b.receive_entry(&ii.ent(i0));
-    let aa = a.inc("x", 1, 0).unwrap(); // 3.5
-    let bb = b.inc("x", 2, 3).unwrap(); // 4.5 alone, 5.5 with A's
+    let aa = a.inc("x", 1, 0).unwrap(); // 3.5, a register write
+    let bb = b.inc("x", 2, 3).unwrap(); // 4.5, newer: wins
     assert_eq!(a.visible(), doc(&[("x", f(3.5))]));
-    for (ord, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[ii.ent(i0)]) {
-        assert_eq!(m.visible(), doc(&[("x", f(5.5))]), "{ord:?}");
-    }
+    let obs = fresh_observer(&o, &[ii.ent(i0), a.ent(aa), b.ent(bb)]);
+    assert_eq!(obs.visible(), doc(&[("x", f(4.5))]));
 }
 
 #[test]
@@ -1764,7 +1761,7 @@ fn arrays_compare_element_by_element_and_type_for_type() {
 
 #[test]
 fn the_numeric_values_are_unset_int32_int64_and_decimal128() {
-    // A double is a counter amount but not numeric: a double base starts a generation.
+    // A double is not numeric (and no counter): a double base starts a generation.
     for (k, v) in every_type() {
         assert_eq!(v.is_numeric(), matches!(k, "unset" | "i32" | "i64" | "dec"), "{k}");
     }

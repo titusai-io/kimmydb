@@ -264,10 +264,9 @@ impl Value {
     /// The model's `numeric()`, extended: `None` (`Unset`) or an `Int32`, `Int64` or
     /// `Decimal128`. A write of one of these is a base of the generation it finds, and keeps the
     /// increments it had seen out of the count (the `obs` mechanism); any other value starts a
-    /// generation. A `Double` is NOT here: a double base starts a generation as the model says
-    /// (a `$set` of a double over a counter is a hard overwrite, like a string), but it takes
-    /// part in counting: `$inc` of a double base writes a slot of the generation the base
-    /// started, so concurrent increments of a double both survive ([`Num::from_value`]).
+    /// generation. A `Double` is NOT here: doubles are not counters (Q6), a `$set` of a double
+    /// over a counter is a hard overwrite like a string, and `$inc` of a double base is a
+    /// register write.
     pub fn is_numeric(&self) -> bool {
         matches!(self, Value::Unset | Value::Int32(_) | Value::Int64(_) | Value::Decimal128(_))
     }

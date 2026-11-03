@@ -127,6 +127,19 @@ pub const MAX_CONTRIBUTORS: usize = 64;
 /// received with more is kept and reported ([`MergeState::over_caps`]), never refused.
 pub const MAX_WRITERS: usize = 256;
 
+/// What the saturation of a merged counter cut off (Q11). Derived at read time, never stored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Excess {
+    /// An integer total past the integer bound: the signed amount past it (the visible value is
+    /// the bound; the exact sum underneath is kept, so a later opposite increment brings the
+    /// value back).
+    Int(i128),
+    /// A decimal sum that left the format at some step: the visible value is the largest finite
+    /// `Decimal128` of the sign (`negative`) at that step. The amount is not reported: the sum
+    /// is rounded at every step, and what lay beyond the format has no exact `Decimal128`.
+    Decimal128 { negative: bool },
+}
+
 /// What a state holds past the caps (Q8: an over-cap result is stored and reported, and a local
 /// write is refused only if it would add to what is over).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -417,32 +430,45 @@ impl MergeState {
         al: &BTreeSet<MStamp>,
         o: &JoinOptions,
     ) -> Option<Value> {
+        self.cell_in(p, al, o).map(|c| c.0)
+    }
+
+    /// The value of a path and what its saturation cut off, if anything.
+    fn cell_in(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        o: &JoinOptions,
+    ) -> Option<(Value, Option<Excess>)> {
         let win = self.winner_in(p, al, o);
-        // A base that is not a counter amount (a string, a map marker, ...) is the value.
+        // A base that is not a counter amount (a string, a double, a map marker, ...) is the
+        // value: doubles are not counters.
         let base = match win.map(|w| &w.value) {
             Some(v) if !matches!(v, Value::Unset) => match Num::from_value(v) {
                 Some(n) => Some(n),
-                None => return Some(v.clone()),
+                None => return Some((v.clone(), None)),
             },
             _ => None,
         };
         // What each slot gained since the base observed it. B1: the field is present when the
         // slot moved since the base saw it, even if its increments net to 0 (a counter back at
         // 0 is still there).
+        let mut cut = None;
         let mut terms: Vec<(MStamp, ObsKey, Num)> = Vec::new();
         for (k, s) in self.counted_in(p, al, win, o) {
             let ob = win.and_then(|w| w.obs.get(&k));
-            let d = ob.map_or(s.total, |x| s.total.sub(&x.1));
+            let d = ob.map_or(s.total, |x| s.total.sub_sat(&x.1, &mut cut));
             if !d.is_zero() || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.0 != s.stamp))
             {
                 terms.push((s.stamp, k, d));
             }
         }
-        // The canonical order (see `counter`): the base, then the slots by stamp and key.
-        if o.sum_in_key_order() {
-            terms.sort_by_key(|t| t.1);
-        } else {
+        // The canonical order (see `counter`): the base, then the slots by writer (node, epoch),
+        // then life and generation.
+        if o.sum_in_stamp_order() {
             terms.sort_by_key(|t| (t.0, t.1));
+        } else {
+            terms.sort_by_key(|t| (t.1.1, t.1.0, t.1.2));
         }
         if base.is_none() && terms.is_empty() {
             return None;
@@ -450,10 +476,33 @@ impl MergeState {
         let kind = terms.iter().map(|t| t.2.kind()).chain(base.map(|b| b.kind())).max()?;
         let mut acc = base.map_or(Num::zero(kind), |b| b.to_kind(kind));
         for (_, _, d) in &terms {
-            acc = acc.add(&d.to_kind(kind));
+            acc = acc.add_sat(&d.to_kind(kind), &mut cut);
         }
-        // Q11: a merge that crosses either bound saturates.
-        Some(acc.into_value(o.int_bound(), o.int32_saturates()))
+        // Q11: a merge that crosses either bound saturates: an integer at the integer bound, a
+        // decimal at the largest finite value of its sign.
+        let excess = match acc.int_excess(o.int_bound()) {
+            0 => cut.map(|negative| Excess::Decimal128 { negative }),
+            e => Some(Excess::Int(e)),
+        };
+        if o.no_saturation()
+            && let Some(v) = acc.int()
+        {
+            return Some((Value::Int64(v as i64), excess));
+        }
+        Some((acc.into_value(o.int_bound(), o.int32_saturates()), excess))
+    }
+
+    /// What the saturation of a merged counter cut off, per path: the paths whose visible value
+    /// stopped at a bound (Q11). A pure function of the state, like [`MergeState::hidden`]:
+    /// nothing is stored, and no join law, hash or byte of either codec depends on it.
+    pub fn excess(&self, o: &JoinOptions) -> BTreeMap<Path, Excess> {
+        let al = self.alive_set(o.retention);
+        let paths: BTreeSet<&Path> =
+            self.slots.keys().filter(|k| al.contains(&k.0)).map(|k| &k.1).collect();
+        paths
+            .into_iter()
+            .filter_map(|p| self.cell_in(p, &al, o)?.1.map(|e| (p.clone(), e)))
+            .collect()
     }
 
     /// The visible document, or `None` when no life is alive: every present path, in path order

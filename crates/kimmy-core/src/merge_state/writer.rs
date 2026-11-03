@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use super::counter::{self, Kind, Num};
+use super::counter::{self, Inc, Kind, Num};
 use super::join::{JoinOptions, join};
 use super::state::{
     Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
@@ -504,20 +504,21 @@ impl Writer {
 
     /// `$inc path by n`, an `Int64` operand. A local increment past the bound is refused (Q11),
     /// and so is one that would carry the writer's slot past [`MAX_TOTAL`]; on a string or a map
-    /// it is refused. See [`Writer::write_inc_value`] for the other operand types.
+    /// it is refused; on a double base it is a register write. See [`Writer::write_inc_value`]
+    /// for the other operand types.
     pub fn write_inc(&mut self, p: &Path, n: i64, skew: u64) -> Option<Written> {
-        self.ticking(skew, |w, m| w.write_inc_m(p, Num::from(i128::from(n)), m))
+        self.ticking(skew, |w, m| w.write_inc_m(p, &Value::Int64(n), m))
     }
 
-    /// `$inc path by by`, where `by` is an `Int32`, `Int64`, `Double` or `Decimal128` (anything
+    /// `$inc path by by`, where `by` is an `Int32`, `Int64`, `Decimal128` or `Double` (anything
     /// else is refused). The result type is production's (`counter`): two `Int32`s stay an
     /// `Int32` while the total fits, any `Int64` makes it an `Int64`, a `Decimal128` a
-    /// `Decimal128` (a double that is not exactly a decimal is refused against a stored
-    /// decimal, and a decimal that overflows from finite inputs), and otherwise a `Double`.
-    /// Concurrent increments from other writers sum with this one in every type.
+    /// `Decimal128` (refused when it overflows from finite inputs). Concurrent increments from
+    /// other writers sum with this one. DOUBLES ARE NOT COUNTERS: a `Double` operand against an
+    /// `Int32`, `Int64` or `Decimal128` counter is refused, and `$inc` of a double base (or of
+    /// an absent field by a double) is a register write.
     pub fn write_inc_value(&mut self, p: &Path, by: &Value, skew: u64) -> Option<Written> {
-        let op = Num::from_value(by)?;
-        self.ticking(skew, |w, m| w.write_inc_m(p, op, m))
+        self.ticking(skew, |w, m| w.write_inc_m(p, by, m))
     }
 
     /// [`Writer::write_inc_value`] with the stamp taken from `stamp` instead of the writer's own
@@ -528,10 +529,7 @@ impl Writer {
         by: &Value,
         stamp: &mut dyn FnMut() -> MStamp,
     ) -> Result<Option<Written>, StampError> {
-        let Some(op) = Num::from_value(by) else {
-            return Ok(None);
-        };
-        self.stamped(stamp, |w, m| w.write_inc_m(p, op, m))
+        self.stamped(stamp, |w, m| w.write_inc_m(p, by, m))
     }
 
     /// [`Writer::write_inc`] with the stamp taken from `stamp` instead of the writer's own clock:
@@ -544,7 +542,7 @@ impl Writer {
         n: i64,
         stamp: &mut dyn FnMut() -> MStamp,
     ) -> Result<Option<Written>, StampError> {
-        self.stamped(stamp, |w, m| w.write_inc_m(p, Num::from(i128::from(n)), m))
+        self.stamped(stamp, |w, m| w.write_inc_m(p, &Value::Int64(n), m))
     }
 
     /// Replace the whole document: changed fields are set, absent ones unset. Each field is a
@@ -855,19 +853,23 @@ impl Writer {
 
     /// The body of [`Writer::write_inc`], with the stamp from `m`. `op` is the operand with its
     /// type; the rules are in the module docs of `counter`.
-    fn write_inc_m(&mut self, p: &Path, op: Num, m: &mut Mint<'_>) -> Option<Written> {
+    fn write_inc_m(&mut self, p: &Path, by: &Value, m: &mut Mint<'_>) -> Option<Written> {
         let vis = self.visible()?;
         if !self.opts.write_below_scalar() && below_a_scalar(&vis, p) {
             return None;
         }
-        // The visible value must be a counter amount (a string or a map is refused), and the
-        // production rule must accept the result (the integer bound, a decimal that overflows,
-        // an inexact double meeting a decimal).
-        let cur = match vis.get(p) {
-            None => None,
-            Some(v) => Some(Num::from_value(v)?),
+        // The production rule decides: a string or a map is refused, so is an integer past the
+        // bound, a decimal that overflows and a double operand against a counter. A double base
+        // is no counter: its `$inc` is a register write of the computed value.
+        let res = match counter::inc_result(vis.get(p), by, self.opts.int_bound())? {
+            Inc::Register(v) => {
+                let mut eff = Eff::default();
+                eff.put(p.clone(), v);
+                return self.commit(eff, m);
+            }
+            Inc::Slot(res) => res,
         };
-        let res = counter::inc_result(cur, &op, self.opts.int_bound())?;
+        let op = Num::from_value(by)?;
         let l = self.write_life()?;
         let generation = self.state.gen_of(p, &self.opts).map(|g| g.stamp);
         let key = (l, p.clone(), self.id, generation);

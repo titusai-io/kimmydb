@@ -749,23 +749,25 @@ fn dec_value(s: &str) -> Value {
     Value::Decimal128(s.parse::<bson::Decimal128>().unwrap().bytes())
 }
 
-/// An amount of any counter type: small and large, the sums that are not associative included.
+/// An amount of any counter type: small and large, near the bounds (so that merges saturate),
+/// and the decimal sums that are not associative.
 fn amount(rng: &mut Rng) -> Value {
-    match rng.below(14) {
+    match rng.below(16) {
         0 => Value::Int32(1),
         1 => Value::Int32(-1),
         2 => Value::Int32(2_000_000_000),
         3 => Value::Int32(-2_000_000_000),
         4 => Value::Int64(1 << 40),
         5 => Value::Int64(7),
-        6 => Value::Double(0.5),
-        7 => Value::Double(1e16),
-        8 => Value::Double(-1e16),
-        9 => Value::Double(1.0),
-        10 => dec_value("0.1"),
-        11 => dec_value("1E+34"),
-        12 => dec_value("-1E+34"),
-        _ => dec_value("5"),
+        6 => Value::Int64(i64::MAX),
+        7 => Value::Int64(i64::MIN + 1),
+        8 => dec_value("0.1"),
+        9 => dec_value("1E+34"),
+        10 => dec_value("-1E+34"),
+        11 => dec_value("5"),
+        12 => dec_value("9.999999999999999999999999999999999E+6144"),
+        13 => dec_value("-9.999999999999999999999999999999999E+6144"),
+        _ => Value::Int64(-7),
     }
 }
 
@@ -852,7 +854,7 @@ fn typed_counter_join_laws_and_hashes() {
 fn typed_counter_reads_and_hashes_do_not_depend_on_the_join_order() {
     let o = opts(1_000_000_000);
     let ps: Vec<Vec<MergeState>> = (1..=60).map(|s| run_counters(s, 30, &o)).collect();
-    let mut n = 0;
+    let (mut n, mut saturated) = (0, 0);
     for (a, b, c) in triples(&ps, 400) {
         // without the loss records, which are not an associative function of the states
         let abc = bare(join(&join(a, b, &o).0, c, &o).0);
@@ -867,10 +869,13 @@ fn typed_counter_reads_and_hashes_do_not_depend_on_the_join_order() {
             let (va, vb) = (abc.visible(&o), other.visible(&o));
             assert_eq!(format!("{va:?}"), format!("{vb:?}"));
             assert_eq!(abc.hidden_all(&o), other.hidden_all(&o));
+            assert_eq!(abc.excess(&o), other.excess(&o));
         }
         n += 1;
+        saturated += usize::from(!abc.excess(&o).is_empty());
     }
     assert_eq!(n, 400);
+    assert!(saturated > 0, "the joins must cross a bound sometimes");
 }
 
 #[test]

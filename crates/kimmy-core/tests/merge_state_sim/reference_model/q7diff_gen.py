@@ -677,14 +677,7 @@ def run_script(sc, dump_canon=False):
             m, p, arg, sk = op[1], op[2], op[3] if kind != "unset" else None, op[-1]
             if kind == "set":
                 arg = unjv(arg)
-            if kind == "inc" and isinstance((ms[m].state.visible() or {}).get(p), float):
-                # EXPECTED DIFFERENCE (D6): this model writes `$inc` of a double base as a register
-                # write; Rust adds a slot to the double's generation (Double counters), which this
-                # model does not describe. The script does not make that write; the Rust replay
-                # skips it too.
-                r = None
-            else:
-                r = ms[m].write(kind, p, arg, log, sk)
+            r = ms[m].write(kind, p, arg, log, sk)
             res = None if r is None else js(r)
         elif kind == "delete":
             _, m, sk = op

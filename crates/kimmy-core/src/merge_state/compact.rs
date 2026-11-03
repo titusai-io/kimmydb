@@ -18,7 +18,7 @@
 //! * a count or length is a LEB128 varint of a `u64`, written in its shortest form;
 //! * a counter total is the zigzag of the `i128` as a LEB128 varint of a `u128`, shortest form,
 //!   for an `Int64` amount; any other type is the provisional escape `ESCAPE` of this module
-//!   (`Int32` the zigzag after it, `Double` its 8 bytes, `Decimal128` its 16 bytes);
+//!   (`Int32` the zigzag after it, `Decimal128` its 16 bytes);
 //! * a string is a length and its UTF-8 bytes; a [`Path`] is its segment count (at least 1) and
 //!   its segments as strings;
 //! * an `Int32`, `Int64` and `Date` and the parts of a `Timestamp` are fixed width big-endian, a
@@ -77,7 +77,7 @@
 //! * **Counter cell** (the rulings on the `absorbed` rule and the cell layout): replaces the
 //!   `obs` map of a register (section 6) and the layout of `slots` (section 7); until then both
 //!   are the version 1 data in compact spelling. PROVISIONAL, from the typed counters (D6): a
-//!   total of any type but `Int64` (an `Int32`, a `Double`, a `Decimal128`) is written behind
+//!   total of any type but `Int64` (an `Int32` or a `Decimal128`) is written behind
 //!   the escape `ESCAPE` (an 18-byte marker varint) because a total has no room for a type;
 //!   every `Int64` total keeps its bytes. When the layout is ruled the type belongs in the slot
 //!   and in the `obs` entry, and the escape goes.
@@ -109,7 +109,7 @@ use crate::ids::NodeId;
 const VERSION: u8 = 2;
 
 /// The first `u128` a counter total never takes as a zigzag (they stop at `2 * MAX_TOTAL`, below
-/// 2^121): `ESCAPE + 1` introduces an `Int32` total, `+ 2` a `Double`, `+ 3` a `Decimal128`.
+/// 2^121): `ESCAPE + 1` introduces an `Int32` total, `+ 2` a `Decimal128`.
 /// PROVISIONAL: it keeps the bytes of every `Int64` total exactly as they were, at 18 bytes
 /// for the marker, until the counter cell layout is ruled (the `absorbed` rule) and the type
 /// gets a place of its own in the slot and the `obs` entry.
@@ -167,12 +167,8 @@ impl W {
                 self.varint(ESCAPE | 1);
                 zigzag(self, *v);
             }
-            Num::Double(d) => {
-                self.varint(ESCAPE | 2);
-                self.out.extend_from_slice(&d.to_bits().to_be_bytes());
-            }
             Num::Decimal128(b) => {
-                self.varint(ESCAPE | 3);
+                self.varint(ESCAPE | 2);
                 self.out.extend_from_slice(b);
             }
         }
@@ -664,8 +660,7 @@ impl R<'_> {
                 let z = self.varint(19)?;
                 Ok(Num::Int32(Self::zigzag(z)?))
             }
-            2 => Ok(Num::Double(f64::from_bits(u64::from_be_bytes(self.arr()?)))),
-            3 => Ok(Num::Decimal128(self.arr()?)),
+            2 => Ok(Num::Decimal128(self.arr()?)),
             // not an escape: a zigzag past the bound
             _ => Err(DecodeError::TotalOutOfRange),
         }
