@@ -16,6 +16,8 @@
 //! The PRNG is a seeded xorshift, so the exact counts differ from the Python
 //! model's; what must hold is 0 problems for the design and every mutant killed.
 
+#[path = "../common/fingerprint.rs"]
+mod fingerprint;
 mod grade;
 mod mutants;
 mod oracle;
@@ -28,7 +30,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use grade::{grade, grade_bounded};
-use sim::{Cfg, RunConfig, run, run_bounded, settle};
+use sim::{Cfg, RunConfig, run, run_bounded, run_bounded_observed, run_observed, settle};
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -268,4 +270,58 @@ fn runner() {
 
     println!("total wall time {:.2?}", t_all.elapsed());
     assert!(rep.failures.is_empty(), "the runner found problems:\n{}", rep.failures.join("\n"));
+}
+
+/// One fingerprint over every member's state and reads before every step and after the last, for
+/// a fixed set of seeds of the runs the runner grades. It pins the BEHAVIOUR of `merge_state`
+/// (states, bytes, stamps, loss records, visible documents) so that a change that only makes it
+/// cheaper can be shown to change nothing: the figures were taken before the performance pass of
+/// Q7 step 0, and a change to them is a change of behaviour, never to be re-pinned for speed.
+#[test]
+fn states_and_reads_match_the_pinned_fingerprints() {
+    let cfg = Cfg::default_ret();
+    let fold = |fp: &mut fingerprint::Fp, ms: &[sim::Node]| {
+        for m in ms {
+            fp.state(m.state(), &m.w.opts);
+            fp.text(&format!("{:?} {:?}", m.w.clock, m.events));
+        }
+    };
+    let random = |rc: RunConfig| {
+        let mut fp = fingerprint::Fp::new();
+        for seed in 0..40 {
+            run_observed(seed, &rc, &cfg, &mut |ms| fold(&mut fp, ms));
+        }
+        fp.value()
+    };
+    let bounded = |sync_every: usize, nested: bool| {
+        let mut fp = fingerprint::Fp::new();
+        for seed in 0..40 {
+            run_bounded_observed(seed, &cfg, 40, sync_every, 80, nested, &mut |ms| {
+                fold(&mut fp, ms)
+            });
+        }
+        fp.value()
+    };
+    let got = [
+        ("restore", random(RunConfig::default())),
+        ("no restore", random(RunConfig { restore: false, ..RunConfig::default() })),
+        ("bound 1000", random(RunConfig { int_bound: Some(1000), ..RunConfig::default() })),
+        ("sequential", random(RunConfig { steps: 14, sequential: true, ..RunConfig::default() })),
+        ("horizon", random(RunConfig { steps: 24, retention: Some(4), ..RunConfig::default() })),
+        ("bounded", bounded(3, false)),
+        ("bounded nested", bounded(3, true)),
+    ];
+    for (name, fp) in got {
+        println!("[fingerprint {name}] {fp:#018x}");
+    }
+    let pinned: [(&str, u64); 7] = [
+        ("restore", 0x9863119f1d77fc48),
+        ("no restore", 0xd7f60b01ad59209e),
+        ("bound 1000", 0x11ac68ca68ec5a5f),
+        ("sequential", 0x999cb20599b62899),
+        ("horizon", 0x17db6499fe5637f1),
+        ("bounded", 0xd41b1477169e27db),
+        ("bounded nested", 0xef2642a60e4e5c72),
+    ];
+    assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }

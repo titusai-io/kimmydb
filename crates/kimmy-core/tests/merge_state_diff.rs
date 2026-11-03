@@ -20,6 +20,8 @@
 //!
 //! No `merge-mutants` feature is needed: nothing here reads a mutation switch.
 
+#[path = "common/fingerprint.rs"]
+mod fingerprint;
 #[path = "merge_state_sim/oracle.rs"]
 #[allow(dead_code)]
 mod oracle;
@@ -148,7 +150,7 @@ fn sorted_heads(h: impl IntoIterator<Item = (Path, MStamp)>) -> Vec<J> {
 }
 
 /// Returns a list of mismatch descriptions (empty when the script agrees).
-fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
+fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     let ret = sc["ret"].as_u64().unwrap();
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
@@ -166,6 +168,8 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
     let mut log = oracle::Log::new();
     let mut bad = Vec::new();
     let mut stats: BTreeMap<&'static str, usize> = BTreeMap::new();
+    // every member's state and reads after every step, and every step's result
+    let mut fp = fingerprint::Fp::new();
     let ops = sc["ops"].as_array().unwrap();
     let exp = sc["expect"]["steps"].as_array().unwrap();
     for (i, (op, want)) in ops.iter().zip(exp).enumerate() {
@@ -303,7 +307,11 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
         };
         if res != want["res"] {
             bad.push(format!("step {i} {op}: result rust {res} python {}", want["res"]));
-            return (bad, stats);
+            return (bad, stats, 0);
+        }
+        fp.text(&res.to_string());
+        for m in &ms {
+            fp.state(&m.w.state, &m.w.opts);
         }
         let got = snap(&ms);
         let wa = want["after"].as_array().unwrap();
@@ -313,7 +321,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
                     "step {i} {op}: member {k}: rust {g} python {w}\n  rust state: {:?}",
                     ms[k].w.state
                 ));
-                return (bad, stats);
+                return (bad, stats, 0);
             }
         }
     }
@@ -334,11 +342,14 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
             break;
         }
     }
+    for m in &ms {
+        fp.state(&m.w.state, &m.w.opts);
+    }
     let fin = &sc["expect"]["final"];
     let got = snap(&ms);
     if J::Array(got.clone()) != fin["after"] {
         bad.push(format!("final sync: rust {got:?} python {}", fin["after"]));
-        return (bad, stats);
+        return (bad, stats, 0);
     }
     // the oracles: the harness's Rust port on the Rust log, against model5 on the Python log
     let po = &fin["oracle"];
@@ -391,7 +402,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>) {
         .map(jk)
         .collect();
     cmp("unsound", J::Array(unsound), &po["unsound"]);
-    (bad, stats)
+    (bad, stats, fp.value())
 }
 
 // ---- running the generator ---------------------------------------------------------------
@@ -484,6 +495,8 @@ struct Verdict {
     steps: usize,
     fails: Vec<String>,
     ops: BTreeMap<&'static str, usize>,
+    /// The sum of the scripts' fingerprints, so that it does not depend on the threads.
+    fp: u64,
 }
 
 /// Replay every script of `dir` on the Rust side, in `workers()` threads.
@@ -497,14 +510,20 @@ fn replay(dir: &std::path::Path) -> Verdict {
             .chunks(chunk)
             .map(|ps| {
                 sc.spawn(move || {
-                    let mut v =
-                        Verdict { scripts: 0, steps: 0, fails: Vec::new(), ops: BTreeMap::new() };
+                    let mut v = Verdict {
+                        scripts: 0,
+                        steps: 0,
+                        fails: Vec::new(),
+                        ops: BTreeMap::new(),
+                        fp: 0,
+                    };
                     for p in ps {
                         let sc: J = serde_json::from_str(&std::fs::read_to_string(p).unwrap())
                             .expect("a script");
                         v.scripts += 1;
                         v.steps += sc["ops"].as_array().unwrap().len();
-                        let (bad, st) = run_script(&sc);
+                        let (bad, st, fp) = run_script(&sc);
+                        v.fp = v.fp.wrapping_add(fp);
                         for (k, n) in st {
                             *v.ops.entry(k).or_default() += n;
                         }
@@ -518,17 +537,22 @@ fn replay(dir: &std::path::Path) -> Verdict {
             .collect();
         hs.into_iter().map(|h| h.join().expect("replay thread")).collect()
     });
-    let mut all = Verdict { scripts: 0, steps: 0, fails: Vec::new(), ops: BTreeMap::new() };
+    let mut all = Verdict { scripts: 0, steps: 0, fails: Vec::new(), ops: BTreeMap::new(), fp: 0 };
     for v in parts {
         all.scripts += v.scripts;
         all.steps += v.steps;
         all.fails.extend(v.fails);
+        all.fp = all.fp.wrapping_add(v.fp);
         for (k, n) in v.ops {
             *all.ops.entry(k).or_default() += n;
         }
     }
     all
 }
+
+/// The fingerprint of the default 300 scripts, taken before the performance pass of Q7 step 0:
+/// a change to it is a change of behaviour, never to be re-pinned for speed.
+const PINNED_300: u64 = 0xde65_b98a_3c14_cab4;
 
 #[test]
 fn differential_against_the_python_model() {
@@ -543,6 +567,10 @@ fn differential_against_the_python_model() {
         v.ops,
         v.fails.len()
     );
+    println!("differential fingerprint ({n} scripts): {:#018x}", v.fp);
+    if n == 300 {
+        assert_eq!(v.fp, PINNED_300, "a state or a read changed");
+    }
     assert_eq!(v.scripts as u64, n, "every script was replayed");
     for f in v.fails.iter().take(5) {
         println!("MISMATCH {f}");

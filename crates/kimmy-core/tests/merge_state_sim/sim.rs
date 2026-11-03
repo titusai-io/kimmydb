@@ -977,6 +977,16 @@ fn random_restore(rnd: &mut Rng, ms: &mut [Node]) {
 }
 
 pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
+    run_observed(seed, rc, cfg, &mut |_| {})
+}
+
+/// [`run`], showing `observe` the cluster before every step and after the last.
+pub fn run_observed(
+    seed: u64,
+    rc: &RunConfig,
+    cfg: &Cfg,
+    observe: &mut dyn FnMut(&[Node]),
+) -> RunOut {
     let mut rnd = Rng::new(seed);
     let mut cfg = cfg.clone();
     cfg.opts.retention = rc.retention.unwrap_or(1_000_000_000);
@@ -990,6 +1000,7 @@ pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
     }
     let mut did_restore = false;
     for i in 0..rc.steps {
+        observe(&ms);
         let m = rnd.below(ms.len());
         let skew = if rc.sequential { 0 } else { rnd.choice(&[0, 0, 0, 4]) };
         let x = if rc.sequential { 1.0 } else { rnd.f64() };
@@ -1007,7 +1018,9 @@ pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
         }
         random_write(&mut rnd, &mut ms[m], &mut log, skew, rc.nested);
     }
+    observe(&ms);
     let settled = fixpoint(&mut ms, 40);
+    observe(&ms);
     RunOut { nodes: ms, log, settled }
 }
 
@@ -1022,6 +1035,19 @@ pub fn run_bounded(
     steps: usize,
     nested: bool,
 ) -> (RunOut, u64) {
+    run_bounded_observed(seed, cfg, ret, sync_every, steps, nested, &mut |_| {})
+}
+
+/// [`run_bounded`], showing `observe` the cluster before every step and after the last.
+pub fn run_bounded_observed(
+    seed: u64,
+    cfg: &Cfg,
+    ret: u64,
+    sync_every: usize,
+    steps: usize,
+    nested: bool,
+    observe: &mut dyn FnMut(&[Node]),
+) -> (RunOut, u64) {
     let mut rnd = Rng::new(seed);
     let mut cfg = cfg.clone();
     cfg.opts.retention = ret;
@@ -1029,6 +1055,7 @@ pub fn run_bounded(
     let mut ms = new_cluster(&mut rnd, &cfg, &mut log);
     let (mut did, mut gap, mut last) = (false, 0u64, 0u64);
     for i in 0..steps {
+        observe(&ms);
         if i % sync_every == 0 {
             fixpoint(&mut ms, 40);
             let top = ms.iter().map(|m| m.w.clock.wall_ms).max().unwrap();
@@ -1051,6 +1078,8 @@ pub fn run_bounded(
         }
         random_write(&mut rnd, &mut ms[m], &mut log, skew, nested);
     }
+    observe(&ms);
     let settled = fixpoint(&mut ms, 40);
+    observe(&ms);
     (RunOut { nodes: ms, log, settled }, gap)
 }
