@@ -411,6 +411,31 @@ fn a_double_operand_on_an_absent_field_is_a_double_register_not_a_counter() {
 }
 
 #[test]
+fn a_decimal_operand_on_a_double_base_makes_a_decimal_register_that_later_counts() {
+    let o = opts();
+    let (mut mi, mut ma, mut mb) = (Mem::new('I', &o), Mem::new('A', &o), Mem::new('B', &o));
+    let i0 = mi.ins(&[("x", Value::Double(2.5))], 0).unwrap();
+    // the Decimal operand turns the Double base into a Decimal128 register ...
+    let i1 = inc_v(&mut mi, "x", &dec("0.5"), 0);
+    assert_eq!(text(&mi.visible().unwrap()[&p("x")]), "3.0");
+    assert!(mi.w.state.slots.is_empty(), "a register, not a slot");
+    for m in [&mut ma, &mut mb] {
+        m.receive_entry(&mi.ent(i0));
+        m.receive_entry(&mi.ent(i1));
+    }
+    // ... which is a numeric base: later Int and Decimal increments count against it
+    let sa = inc_v(&mut ma, "x", &i32v(1), 0);
+    let sb = inc_v(&mut mb, "x", &dec("2.5"), 3);
+    let ents = [ma.ent(sa), mb.ent(sb)];
+    let orders = all_orders(&o, &ents, &[mi.ent(i0), mi.ent(i1)]);
+    let hash = orders[0].1.w.state.compact_hash();
+    for (ord, m) in &orders {
+        assert_eq!(text(&m.visible().unwrap()[&p("x")]), "6.5", "delivery {ord:?}");
+        assert_eq!(m.w.state.compact_hash(), hash, "hash, delivery {ord:?}");
+    }
+}
+
+#[test]
 fn the_counter_mutants_are_caught() {
     type Switch = fn(&mut JoinOptions);
     type Scenario = fn(&JoinOptions) -> Result<(), String>;
