@@ -80,7 +80,9 @@
 //!     * for a floor, its stamp; for a `u` floor (1 or 3), then `prev`, the highest HLC the
 //!       unsetter had seen, as 10 bytes;
 //!     * the per-writer firsts: a count, then each as a writer index (strictly increasing), a
-//!       stamp and the position as a varint;
+//!       stamp and the position as a varint. The firsts count is a varint after the floor
+//!       parts; the floor byte's spare bits are not used for it (one byte for 0 to 127, two for
+//!       128 and up);
 //!     * a flags byte (bit 0: there is a `last`, bit 1: there is a `lvl`; no other bit), then
 //!       the `last` as a stamp and a varint position, then the `lvl` as a stamp.
 //!

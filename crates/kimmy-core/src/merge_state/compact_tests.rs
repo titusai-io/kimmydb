@@ -1400,3 +1400,48 @@ fn an_entry_no_history_makes_is_refused_by_the_clauses_one_state_can_show() {
         "a replace floor at (5, B) is above the mark at (5, A)"
     );
 }
+
+/// The firsts count is a varint right after the floor parts and before the flags byte; the floor
+/// byte's spare bits are not used for it. Pinned for a count of 0 (one byte), 127 (one byte) and 128
+/// (two bytes: `0x80 0x01`), the three shapes where a one-byte count would break.
+#[test]
+fn the_firsts_count_is_a_varint_after_the_floor_parts() {
+    for n in [0usize, 1, 127, 128, 200] {
+        let writers: Vec<WriterId> = (0..n.max(1)).map(|k| wid(k as u8 + 1, 0)).collect();
+        let life = st(1, writers[0]);
+        let mut s = MergeState::default();
+        s.lives.insert(
+            life,
+            Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Upsert },
+        );
+        let mut x = FieldOrd::default();
+        for w in &writers[..n] {
+            x.firsts.insert(*w, (st(3, *w), 0));
+        }
+        // the last write is the newest first; with no firsts, a last alone
+        let top = x.firsts.values().map(|c| c.0).max().unwrap_or(st(3, writers[0]));
+        x.last = Some((top, 0));
+        for w in &writers {
+            s.vv.insert(*w, Hlc::new(5, 0));
+        }
+        s.ords.insert(
+            (life, OrdAt::Root),
+            FieldOrd { lvl: Some(st(2, writers[0])), ..FieldOrd::default() },
+        );
+        s.ords.insert((life, OrdAt::Field(p("x"))), x.clone());
+        let enc = round_trip(&s);
+        // the entry of `x` follows the root's: life index, path x, then the floor byte 0 (no floor),
+        // the count, and the first writer index of the entries
+        let key = [0u8, 1, 1, b'x', 0];
+        let at =
+            enc.windows(key.len()).rposition(|w| w == key).expect("the entry of x") + key.len();
+        let want: Vec<u8> = match n {
+            0 | 1 | 127 => vec![n as u8],
+            128 => vec![0x80, 0x01],
+            _ => vec![0xc8, 0x01],
+        };
+        assert_eq!(&enc[at..at + want.len()], &want[..], "count {n}");
+        // the byte after the first has the writer index 0: the count is not in the floor byte
+        assert_eq!(enc[at - 1], 0, "the floor byte of x is 0 for any count");
+    }
+}
