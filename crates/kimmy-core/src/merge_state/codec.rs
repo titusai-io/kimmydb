@@ -21,6 +21,14 @@
 //! [`MergeState::canonical_bytes`] is the body alone and carries no tag; the
 //! hash covers the body. Mutant memory (`Gen::vv`, `MergeState::gens`) is in neither. The golden vectors in `tests.rs` pin all three: changing
 //! the bytes is a format change (a wipe release) and must be deliberate.
+//!
+//! Known defect of this form: a loss record about the whole document (`insertLost` of a
+//! superseded insert) is keyed by the path `_`, the same bytes as a record about a field
+//! literally named `_`. The pinned `mixed` golden holds a whole-document record, so the bytes
+//! stay. In memory the two are different ([`LossAt`]); `decode` tells them apart by the lost
+//! value (a field list is a whole document), which no record of a field has, so a state round
+//! trips, but the key bytes alone are ambiguous. The compact form (`compact.rs`) writes an
+//! explicit tag; this defect retires when it becomes the hash.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -214,7 +222,7 @@ impl W {
             LossKind::TypeClash => 4,
             LossKind::ArrayClash => 5,
         });
-        self.path(&k.path);
+        self.path(&k.at.v1_path());
         self.stamp(&k.stamp);
     }
     fn loss_value(&mut self, v: &LossValue) {
@@ -376,8 +384,15 @@ impl MergeState {
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
-            let k = r.loss_key()?;
+            let (kind, path, stamp) = r.loss_key()?;
             let v = r.loss_value()?;
+            // The one segment `_` with a field list is the whole document; with anything else, a field.
+            let whole = matches!(v, LossValue::Fields(_)) && path.segments() == ["_"];
+            let k = if whole {
+                LossKey::document(kind, stamp)
+            } else {
+                LossKey::field(kind, path, stamp)
+            };
             put(&mut s.losses, k, v)?;
         }
         if !r.0.is_empty() {
@@ -555,7 +570,10 @@ impl R<'_> {
             t => Err(DecodeError::BadTag(t)),
         }
     }
-    fn loss_key(&mut self) -> Result<LossKey, DecodeError> {
+    /// A loss key as version 1 spells it: the kind, a path and the stamp. The path alone does
+    /// not tell the whole document (the segment `_`) from a field named `_`; the caller reads
+    /// the lost value next and decides (see [`LossKey`] and the module documentation).
+    fn loss_key(&mut self) -> Result<(LossKind, Path, MStamp), DecodeError> {
         let kind = match self.u8()? {
             0 => LossKind::Clash,
             1 => LossKind::DeleteWon,
@@ -566,7 +584,7 @@ impl R<'_> {
             t => return Err(DecodeError::BadTag(t)),
         };
         let path = self.path()?;
-        Ok(LossKey { kind, path, stamp: self.stamp()? })
+        Ok((kind, path, self.stamp()?))
     }
     fn loss_value(&mut self) -> Result<LossValue, DecodeError> {
         match self.u8()? {

@@ -281,8 +281,7 @@ impl Node {
                     let older = *gn != Some(g.stamp) && gn.is_none_or(|x| x < g.stamp);
                     let covered =
                         g.vv.get(&v.stamp.writer).copied().unwrap_or(Hlc::ZERO) >= v.stamp.hlc;
-                    let key =
-                        LossKey { kind: LossKind::RetiredWriter, path: p.clone(), stamp: v.stamp };
+                    let key = LossKey::field(LossKind::RetiredWriter, p.clone(), v.stamp);
                     if older && !covered && key.stamp.hlc >= h && !merged.losses.contains_key(&key)
                     {
                         add.push((key, LossValue::Total(v.total)));

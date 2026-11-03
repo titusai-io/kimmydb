@@ -82,12 +82,6 @@ impl Path {
         Self::new([name])
     }
 
-    /// The path a loss record names when it is about a whole document (`insertLost` of a
-    /// superseded insert): the one segment `_`. (A field named `_` has the same path.)
-    pub fn whole_document() -> Self {
-        Self(vec!["_".to_string()])
-    }
-
     pub fn segments(&self) -> &[String] {
         &self.0
     }
@@ -221,13 +215,98 @@ pub enum LossKind {
     ArrayClash,
 }
 
-/// The key of a loss record: kind, path (the one-segment path `_` for a whole document) and the
-/// stamp of the lost write. Ordered so that it can key a `BTreeMap`.
+/// What a loss record is about: the whole document (`insertLost` of a superseded insert), or one
+/// field. They are different things even when a field is literally named `_`, which is the name
+/// the version 1 spelling and the reference model give the whole document: that is why this is
+/// a variant and not a [`Path`].
+///
+/// Ordering: by the path the version 1 form writes (the whole document as the one segment `_`),
+/// the whole document first among equals. That keeps the order of the version 1 bytes exactly
+/// what it was when a loss was keyed by a path alone.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum LossAt {
+    Document,
+    Field(Path),
+}
+
+impl LossAt {
+    /// The field this record is about, `None` for the whole document.
+    pub fn field(&self) -> Option<&Path> {
+        match self {
+            LossAt::Document => None,
+            LossAt::Field(p) => Some(p),
+        }
+    }
+
+    /// The path the version 1 form writes for this record. A field literally named `_` has the
+    /// same one, which is a known collision of that form (see `codec.rs`).
+    pub(super) fn v1_path(&self) -> Path {
+        match self {
+            LossAt::Document => Path(vec!["_".to_string()]),
+            LossAt::Field(p) => p.clone(),
+        }
+    }
+}
+
+/// Where the whole document (the segment `_`) sorts against the field `q`: by that path, and
+/// before a field literally named `_`.
+fn document_against(q: &Path) -> std::cmp::Ordering {
+    std::iter::once("_").cmp(q.segments().iter().map(String::as_str)).then(std::cmp::Ordering::Less)
+}
+
+impl Ord for LossAt {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (LossAt::Document, LossAt::Document) => std::cmp::Ordering::Equal,
+            (LossAt::Document, LossAt::Field(q)) => document_against(q),
+            (LossAt::Field(p), LossAt::Document) => document_against(p).reverse(),
+            (LossAt::Field(p), LossAt::Field(q)) => p.cmp(q),
+        }
+    }
+}
+
+impl PartialOrd for LossAt {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl From<Path> for LossAt {
+    fn from(p: Path) -> Self {
+        LossAt::Field(p)
+    }
+}
+
+/// For messages: the field's dotted path, or `_` for the whole document. Not a key (a field
+/// named `_` prints alike).
+impl std::fmt::Display for LossAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LossAt::Document => f.write_str("_"),
+            LossAt::Field(p) => p.fmt(f),
+        }
+    }
+}
+
+/// The key of a loss record: kind, what it is about and the stamp of the lost write. Ordered so
+/// that it can key a `BTreeMap`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LossKey {
     pub kind: LossKind,
-    pub path: Path,
+    pub at: LossAt,
     pub stamp: MStamp,
+}
+
+impl LossKey {
+    /// A record about the field `path`.
+    pub fn field(kind: LossKind, path: Path, stamp: MStamp) -> Self {
+        Self { kind, at: LossAt::Field(path), stamp }
+    }
+
+    /// A record about the whole document.
+    pub fn document(kind: LossKind, stamp: MStamp) -> Self {
+        Self { kind, at: LossAt::Document, stamp }
+    }
 }
 
 /// What a loss record keeps of the lost write.

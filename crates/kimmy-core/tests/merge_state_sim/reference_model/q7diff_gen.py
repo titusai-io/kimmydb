@@ -428,7 +428,11 @@ class EncCompact:
         self.vi(len(st.losses))
         for key in sorted(st.losses, key=lambda k: (KIND[k[0]], k_path(k[1]), k_stamp(k[2]))):
             self.u8(KIND[key[0]])
-            self.path(key[1])
+            if key[0] == "insertLost" and key[1] == "_":      # the whole document: its own tag, not a path
+                self.u8(0)
+            else:
+                self.u8(1)
+                self.path(key[1])
             self.stamp(key[2])
             self.loss_value(key, st.losses[key])
 

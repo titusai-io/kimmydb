@@ -57,7 +57,10 @@
 //! 7. `slots`: a count; each a life index, a path, a writer index, a generation byte (0 none,
 //!    1 and then its stamp), the stamp, and the total;
 //! 8. the **version vector**: a count; each a writer index and an HLC;
-//! 9. `losses`: a count; each a kind byte, a path, a stamp and the lost value.
+//! 9. `losses`: a count; each a kind byte, an "about" byte (0 the whole document, 1 a field and
+//!    then its path), a stamp and the lost value. The whole document is its own tag, not the
+//!    path `_`, so that it cannot be mistaken for a field named `_` (the version 1 form cannot
+//!    tell them apart; see `codec.rs`).
 //!
 //! `obs` keys are a life index, a writer index and a generation as in `slots`; a register's
 //! `obs` entry adds the slot's stamp and total, a generation's `seen` entry the total.
@@ -88,7 +91,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::codec::{DecodeError, MAGIC, MAX_VALUE_DEPTH, hash128, put, put_set};
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
+use super::types::{Epoch, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
@@ -282,7 +285,13 @@ impl W {
             LossKind::TypeClash => 4,
             LossKind::ArrayClash => 5,
         });
-        self.path(&k.path);
+        match &k.at {
+            LossAt::Document => self.u8(0),
+            LossAt::Field(p) => {
+                self.u8(1);
+                self.path(p);
+            }
+        }
         self.stamp(&k.stamp);
     }
     fn loss_value(&mut self, v: &LossValue) {
@@ -749,8 +758,12 @@ impl R<'_> {
             5 => LossKind::ArrayClash,
             t => return Err(DecodeError::BadTag(t)),
         };
-        let path = self.path()?;
-        Ok(LossKey { kind, path, stamp: self.stamp()? })
+        let at = match self.u8()? {
+            0 => LossAt::Document,
+            1 => LossAt::Field(self.path()?),
+            t => return Err(DecodeError::BadTag(t)),
+        };
+        Ok(LossKey { kind, at, stamp: self.stamp()? })
     }
     fn loss_value(&mut self) -> Result<LossValue, DecodeError> {
         match self.u8()? {

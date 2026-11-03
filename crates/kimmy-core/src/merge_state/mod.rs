@@ -51,7 +51,9 @@ mod tests;
 pub use codec::DecodeError;
 pub use join::{InvalidIntBound, JoinOptions, join};
 pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-pub use types::{Epoch, InvalidPath, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
+pub use types::{
+    Epoch, InvalidPath, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId,
+};
 pub use writer::{Received, StampError, WriteKind, WriteRecord, Writer, Written};
 
 // Production signatures. These items compile in EVERY build (with and without the
@@ -65,7 +67,9 @@ const _: () = {
     use std::collections::{BTreeMap, BTreeSet};
     let _: fn(&str) -> Result<Path, InvalidPath> = Path::flat;
     let _: fn(&Path) -> &[String] = Path::segments;
-    let _: fn() -> Path = Path::whole_document;
+    let _: fn(&LossAt) -> Option<&Path> = LossAt::field;
+    let _: fn(LossKind, Path, MStamp) -> LossKey = LossKey::field;
+    let _: fn(LossKind, MStamp) -> LossKey = LossKey::document;
     let _: fn(&MergeState, &MergeState, &JoinOptions) -> (MergeState, BTreeSet<LossKey>) = join;
     let _: fn(u64, i64) -> Result<JoinOptions, InvalidIntBound> = JoinOptions::new;
     let _: fn(&mut JoinOptions, i64) -> Result<(), InvalidIntBound> = JoinOptions::set_int_bound;

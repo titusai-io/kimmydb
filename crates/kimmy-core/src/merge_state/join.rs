@@ -195,9 +195,8 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
     }
 
     let mut new: BTreeMap<LossKey, LossValue> = BTreeMap::new();
-    let whole = Path::whole_document();
     let key =
-        |kind: LossKind, path: &Path, stamp: MStamp| LossKey { kind, path: path.clone(), stamp };
+        |kind: LossKind, path: &Path, stamp: MStamp| LossKey::field(kind, path.clone(), stamp);
 
     // Q2: concurrent FIRST inserts of one _id (explicit inserts whose creator had
     // seen no delete): the newest whole document wins, the others are superseded
@@ -227,7 +226,7 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
         reported = superseded.difference(&killed).copied().collect();
         for l in &reported {
             new.insert(
-                key(LossKind::InsertLost, &whole, *l),
+                LossKey::document(LossKind::InsertLost, *l),
                 LossValue::Fields(out.lives[l].order.clone()),
             );
         }

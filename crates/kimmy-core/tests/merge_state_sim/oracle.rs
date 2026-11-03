@@ -10,12 +10,23 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use kimmy_core::merge_state::{
-    LossKey, LossKind, MStamp, Path, Value, WriteKind, WriteRecord, WriterId,
+    LossAt, LossKey, LossKind, MStamp, Path, Value, WriteKind, WriteRecord, WriterId,
 };
 
 pub type Log = BTreeMap<MStamp, (BTreeSet<MStamp>, WriteRecord)>;
 pub type Doc = BTreeMap<Path, Value>;
 /// A head that must be, or is, reported: `(path, stamp)`.
+/// The path the sim gives a whole-document record: the flat workload has no field named `_`,
+/// so the model's spelling is unambiguous here.
+pub fn whole_document() -> Path {
+    Path::flat("_").unwrap()
+}
+
+/// The sim's path of a loss record: the field, or `_` for the whole document.
+pub fn at_path(at: &LossAt) -> Path {
+    at.field().cloned().unwrap_or_else(whole_document)
+}
+
 pub type Head = (Path, MStamp);
 
 /// `st[0]`: the sim only makes stamps with a zero counter.
@@ -250,7 +261,7 @@ pub fn loss_oracle(
     let killed = killed_lives(log, ret);
     let sup_live: BTreeSet<MStamp> = sup.difference(&killed).copied().collect();
     for l in &sup_live {
-        must.insert((Path::whole_document(), *l));
+        must.insert((whole_document(), *l));
     }
     // V6M1: every head written into a losing first insert is reported
     for (st, (_, m)) in log {
@@ -409,7 +420,7 @@ pub fn stale_records(
     let gener = make_gen(log, ret);
     let mut bad = Vec::new();
     for k in records {
-        let (kind, p, st) = (k.kind, &k.path, k.stamp);
+        let (kind, p, st) = (k.kind, &at_path(&k.at), k.stamp);
         let m = &log[&st].1;
         if m.kind != WriteKind::Inc || !in_set(&m.life, &alive) {
             continue;
@@ -452,7 +463,7 @@ pub fn killed_superseded_any(log: &Log, ret: u64) -> Vec<BTreeSet<Head>> {
             && !dels.iter().any(|d| log[d].0.contains(&l))
         {
             let mut set: BTreeSet<Head> = BTreeSet::new();
-            set.insert((Path::whole_document(), l));
+            set.insert((whole_document(), l));
             set.extend(m.paths.iter().map(|p| (p.clone(), l)));
             out.push(set);
         }
@@ -484,7 +495,7 @@ pub fn sound_record(
     dels: &[MStamp],
     ret: u64,
 ) -> bool {
-    let (kind, p, st) = (key.kind, &key.path, key.stamp);
+    let (kind, p, st) = (key.kind, &at_path(&key.at), key.stamp);
     let Some((ctx, m)) = log.get(&st) else { return false };
     match kind {
         LossKind::Clash => {
@@ -501,7 +512,7 @@ pub fn sound_record(
         }
         LossKind::InsertLost => {
             let sup = superseded_lives(log, None);
-            if *p == Path::whole_document() {
+            if *p == whole_document() {
                 return sup.contains(&st);
             }
             m.paths.contains(p)

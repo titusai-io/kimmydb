@@ -66,8 +66,8 @@ fn the_compact_golden_hashes_agree_with_the_reference_model() {
     for (name, st, want) in [
         ("empty", golden_empty(), ("e145d6a7daf371398c7b574cd9aa42d4", 9)),
         ("170", golden_170(), ("45e14c7b5dd32f32f7cf6543335f3fb1", 213)),
-        ("mixed", golden_mixed(), ("f712215ec186fc7a782838f4f25fff6b", 341)),
-        ("delete", golden_delete(), ("1aace531f9c13dc54b5da4f77056e82a", 231)),
+        ("mixed", golden_mixed(), ("855d32c60d7c369fb409ecf4d6b6331a", 340)),
+        ("delete", golden_delete(), ("95a3e75ef534ce08fd975b1224a8af76", 233)),
         ("obs", golden_obs(), ("d785253ed2c10e27e148d2a7f2f251cd", 255)),
     ] {
         assert_eq!((hex(st.compact_hash()).as_str(), st.compact_bytes().len()), want, "{name}");
@@ -115,7 +115,7 @@ fn every_bson_type_and_odd_names_round_trip_in_the_compact_form() {
         [LossKind::TypeClash, LossKind::ArrayClash, LossKind::RetiredWriter].into_iter().enumerate()
     {
         st.losses.insert(
-            LossKey { kind, path: p("f06"), stamp: *st.lives.keys().next().unwrap() },
+            LossKey::field(kind, p("f06"), *st.lives.keys().next().unwrap()),
             LossValue::Total(k as i128 - 1),
         );
     }

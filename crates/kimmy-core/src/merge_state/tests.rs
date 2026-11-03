@@ -167,8 +167,8 @@ impl Mem {
     fn canon(&self) -> Vec<u8> {
         self.w.state.canonical_bytes()
     }
-    fn loss_set(&self) -> BTreeSet<(LossKind, Path, MStamp)> {
-        self.w.state.losses.keys().map(|k| (k.kind, k.path.clone(), k.stamp)).collect()
+    fn loss_set(&self) -> BTreeSet<(LossKind, LossAt, MStamp)> {
+        self.w.state.losses.keys().map(|k| (k.kind, k.at.clone(), k.stamp)).collect()
     }
 }
 
@@ -319,7 +319,7 @@ fn probe_p4_delete_vs_inc() {
     assert_eq!(res.len(), 1, "{res:?}");
     let (vis, losses) = res.into_iter().next().unwrap();
     assert_eq!(vis, "None");
-    assert!(losses.iter().any(|k| k.kind == LossKind::DeleteWon && k.path == p("x")));
+    assert!(losses.iter().any(|k| k.kind == LossKind::DeleteWon && k.at == p("x").into()));
 }
 
 #[test]
@@ -667,8 +667,8 @@ fn probe_q2_first_inserts() {
     let bb = b.ins(&[("x", i(2)), ("z", i(3))], 0).unwrap();
     for (ord, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
         assert_eq!(m.visible(), doc(&[("x", i(2)), ("z", i(3))]), "{ord:?}");
-        let kinds: Vec<_> = m.w.state.losses.keys().map(|k| (k.kind, k.path.clone())).collect();
-        assert_eq!(kinds, vec![(LossKind::InsertLost, p("_"))], "{ord:?}");
+        let kinds: Vec<_> = m.w.state.losses.keys().map(|k| (k.kind, k.at.clone())).collect();
+        assert_eq!(kinds, vec![(LossKind::InsertLost, LossAt::Document)], "{ord:?}");
     }
 }
 
@@ -757,11 +757,11 @@ fn probe_v6m1_losing_writes() {
     assert_eq!(orders.len(), 24);
     for (ord, m) in orders {
         assert_eq!(m.visible(), doc(&[("y", i(2))]));
-        let have: BTreeSet<(Path, MStamp)> =
-            m.w.state.losses.keys().map(|k| (k.path.clone(), k.stamp)).collect();
-        assert!(have.contains(&(p("note"), c1)), "{ord:?}");
-        assert!(have.contains(&(p("views"), c2)), "{ord:?}");
-        assert!(have.contains(&(Path::whole_document(), aa)), "{ord:?}");
+        let have: BTreeSet<(LossAt, MStamp)> =
+            m.w.state.losses.keys().map(|k| (k.at.clone(), k.stamp)).collect();
+        assert!(have.contains(&(p("note").into(), c1)), "{ord:?}");
+        assert!(have.contains(&(p("views").into(), c2)), "{ord:?}");
+        assert!(have.contains(&(LossAt::Document, aa)), "{ord:?}");
     }
 }
 
@@ -783,13 +783,17 @@ fn probe_v6m1_killed_not_lost() {
     for e in &ents {
         m.receive_entry(e);
     }
-    assert!(!m.loss_set().contains(&(LossKind::InsertLost, p("_"), i0)), "{:?}", m.loss_set());
+    assert!(
+        !m.loss_set().contains(&(LossKind::InsertLost, LossAt::Document, i0)),
+        "{:?}",
+        m.loss_set()
+    );
     // Other orders may also hold the (true, sound) insertLost if the two first inserts met before the
     // delete did: an extra record, allowed by Q7; the document and the deleteWon are the same.
     for (ord, m) in all_orders(&o, &ents, &[]) {
         assert_eq!(m.visible(), doc(&[("x", i(2))]), "{ord:?}");
         assert!(
-            m.loss_set().contains(&(LossKind::DeleteWon, p("y"), bb)),
+            m.loss_set().contains(&(LossKind::DeleteWon, p("y").into(), bb)),
             "{ord:?} {:?}",
             m.loss_set()
         );
@@ -811,7 +815,7 @@ fn probe_v6m2_insert_vs_upsert() {
             doc(&[("name", s("A")), ("role", s("admin")), ("views", i(1))]),
             "{ord:?}"
         );
-        assert!(m.loss_set().contains(&(LossKind::InsertLost, p("theme"), bl)), "{ord:?}");
+        assert!(m.loss_set().contains(&(LossKind::InsertLost, p("theme").into(), bl)), "{ord:?}");
     }
     // The same, the upsert older.
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
@@ -869,10 +873,10 @@ fn probe_v7m1_v7m2_reinsert_vs_upsert() {
             let want = doc(&[("name", s("A")), ("lang", s("en")), ("views", i(1))]);
             assert_eq!(m.visible(), want, "{after_delete} {ord:?}");
             assert!(
-                m.loss_set().contains(&(LossKind::InsertLost, p("theme"), bl)),
+                m.loss_set().contains(&(LossKind::InsertLost, p("theme").into(), bl)),
                 "{after_delete} {ord:?}"
             );
-            assert!(!m.w.state.losses.keys().any(|k| k.path == p("lang")));
+            assert!(!m.w.state.losses.keys().any(|k| k.at == p("lang").into()));
         }
     }
 }
@@ -968,11 +972,14 @@ pub(super) fn golden_delete() -> MergeState {
     }
     let st = obs.w.state.clone();
     assert!(!st.deletes.is_empty() && obs.visible().is_none());
-    let kinds: BTreeSet<(LossKind, Path)> =
-        st.losses.keys().map(|k| (k.kind, k.path.clone())).collect();
+    let kinds: BTreeSet<(LossKind, LossAt)> =
+        st.losses.keys().map(|k| (k.kind, k.at.clone())).collect();
     assert_eq!(
         kinds,
-        BTreeSet::from([(LossKind::DeleteWon, p("x")), (LossKind::DeleteWon, p("y"))])
+        BTreeSet::from([
+            (LossKind::DeleteWon, p("x").into()),
+            (LossKind::DeleteWon, p("y").into())
+        ])
     );
     st
 }
@@ -1410,7 +1417,7 @@ fn decode_refuses_totals_past_the_bound() {
     w.write_set(&p("x"), s("t"), 0).unwrap();
     let mut good = w.state.clone();
     good.losses.insert(
-        LossKey { kind: LossKind::Clash, path: p("x"), stamp: *good.lives.keys().next().unwrap() },
+        LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
         LossValue::Total(5),
     );
     assert_eq!(MergeState::decode(&good.encode()).unwrap(), good);
@@ -1584,7 +1591,7 @@ fn receive_loss_refuses_a_total_past_the_bound() {
     w.insert(&fl(&[("x", i(1))]), 0).unwrap();
     let st = w.state.clone();
     let life = *st.lives.keys().next().unwrap();
-    let key = |path: &str| LossKey { kind: LossKind::DeleteWon, path: p(path), stamp: life };
+    let key = |path: &str| LossKey::field(LossKind::DeleteWon, p(path), life);
     for (p, t, added) in [
         ("a", MAX_TOTAL, true),
         ("b", -MAX_TOTAL, true),
@@ -1677,11 +1684,8 @@ fn every_bson_type_is_stored_read_back_and_round_trips() {
     // A loss record keeps any value too.
     for (_, v) in &fields {
         let mut st = MergeState::default();
-        let key = LossKey {
-            kind: LossKind::Clash,
-            path: p("p"),
-            stamp: MStamp { hlc: h(1), writer: wid('A', 0) },
-        };
+        let key =
+            LossKey::field(LossKind::Clash, p("p"), MStamp { hlc: h(1), writer: wid('A', 0) });
         st.losses.insert(key, LossValue::Value(v.clone()));
         assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
     }
@@ -1822,7 +1826,6 @@ fn a_path_is_a_nonempty_list_of_nul_free_segments() {
     assert_ne!(dotted, Path::new(["a", "b"]).unwrap());
     assert_eq!(Path::new(["a", "b"]).unwrap().segments(), ["a", "b"]);
     assert_eq!(Path::new(["a", "b"]).unwrap().to_string(), "a.b");
-    assert_eq!(Path::whole_document(), p("_"));
 }
 
 #[test]
@@ -2196,4 +2199,60 @@ fn a_null_and_an_unset_merge_and_encode_as_different_values() {
     for w in [&n, &u] {
         assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state);
     }
+}
+
+// ---- the whole-document loss against a field named `_` ----------------------------------
+
+#[test]
+fn the_pinned_mixed_golden_holds_a_whole_document_loss() {
+    // This is why the version 1 form keeps its ambiguous key: a pinned golden has the record.
+    let st = golden_mixed();
+    assert!(
+        st.losses.keys().any(|k| k.kind == LossKind::InsertLost && k.at == LossAt::Document),
+        "{:?}",
+        st.losses.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_whole_document_loss_is_not_a_field_named_underscore() {
+    let life = MStamp { hlc: h(3), writer: wid('A', 0) };
+    let doc_key = LossKey::document(LossKind::InsertLost, life);
+    let field_key = LossKey::field(LossKind::InsertLost, p("_"), life);
+    assert_ne!(doc_key, field_key);
+    // By the order of the version 1 bytes (the path), the document first among equals.
+    let mut keys = vec![
+        LossKey::field(LossKind::InsertLost, p("a"), life),
+        field_key.clone(),
+        doc_key.clone(),
+        LossKey::field(LossKind::InsertLost, p("A"), life),
+    ];
+    keys.sort();
+    let at: Vec<String> = keys.iter().map(|k| format!("{:?}", k.at)).collect();
+    assert_eq!(
+        at,
+        ["Field(Path([\"A\"]))", "Document", "Field(Path([\"_\"]))", "Field(Path([\"a\"]))"]
+    );
+
+    let mut st = MergeState::default();
+    st.losses.insert(doc_key.clone(), LossValue::Fields(vec![p("x"), p("_")]));
+    // The version 1 key bytes are the same for both (the known defect) ...
+    let mut st2 = MergeState::default();
+    st2.losses.insert(field_key.clone(), LossValue::Value(i(1)));
+    let (b1, b2) = (st.canonical_bytes(), st2.canonical_bytes());
+    let at = 8 * 7; // seven counts: the six sections and the loss count; then kind and path
+    assert_eq!(b1[at..at + 10], b2[at..at + 10], "same kind and path bytes in version 1");
+    // ... and the state still round-trips there, the value telling the two apart ...
+    st.losses.insert(field_key.clone(), LossValue::Value(i(1)));
+    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
+    // ... while the compact form tags them.
+    let c = st.encode_compact();
+    assert_eq!(MergeState::decode_compact(&c).unwrap(), st);
+    let mut only_field = MergeState::default();
+    only_field.losses.insert(field_key, LossValue::Fields(vec![p("x"), p("_")]));
+    assert_ne!(only_field.compact_bytes(), {
+        let mut d = MergeState::default();
+        d.losses.insert(doc_key, LossValue::Fields(vec![p("x"), p("_")]));
+        d.compact_bytes()
+    });
 }

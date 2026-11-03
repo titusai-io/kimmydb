@@ -57,7 +57,7 @@ fn kind_s(k: LossKind) -> &'static str {
 }
 
 fn jk(k: &LossKey) -> J {
-    json!([kind_s(k.kind), k.path.to_string(), js(&k.stamp)])
+    json!([kind_s(k.kind), k.at.to_string(), js(&k.stamp)])
 }
 
 fn jv(v: &Value) -> J {
@@ -601,8 +601,8 @@ fn golden_vectors_match_the_model() {
         // the compact form (compact.rs), hashed with the same mix; compact_tests.rs pins the same
         "empty-compact": ["e145d6a7daf371398c7b574cd9aa42d4", 9],
         "170-compact": ["45e14c7b5dd32f32f7cf6543335f3fb1", 213],
-        "mixed-compact": ["f712215ec186fc7a782838f4f25fff6b", 341],
-        "delete-compact": ["1aace531f9c13dc54b5da4f77056e82a", 231],
+        "mixed-compact": ["855d32c60d7c369fb409ecf4d6b6331a", 340],
+        "delete-compact": ["95a3e75ef534ce08fd975b1224a8af76", 233],
         "obs-compact": ["d785253ed2c10e27e148d2a7f2f251cd", 255],
     });
     assert_eq!(got, want);
