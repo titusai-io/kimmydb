@@ -76,7 +76,9 @@ impl OrdAt {
 pub type Cand = (MStamp, u64);
 
 /// The write that voids the candidates older than it. Ordered as the model orders its floor
-/// tuples: by stamp, then an unset below a replace, then `prev`, then the bit.
+/// tuples `(stamp, "u", prev, bit)` and `(stamp, "r")`: by stamp, then a replace BELOW an unset
+/// (`"r" < "u"`, so at one stamp the model's `max` is the unset), then `prev`, then the bit. (Unreachable
+/// honestly: one write never names a path as both an unset and a write.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Floor {
     /// An `$unset` (u*): candidates must be stamped ABOVE it. `prev`: the highest HLC the
@@ -97,8 +99,8 @@ impl Floor {
 
     fn key(&self) -> (MStamp, u8, Hlc, bool) {
         match self {
-            Floor::U { stamp, prev, others } => (*stamp, 0, *prev, *others),
-            Floor::R { stamp } => (*stamp, 1, Hlc::ZERO, false),
+            Floor::U { stamp, prev, others } => (*stamp, 1, *prev, *others),
+            Floor::R { stamp } => (*stamp, 0, Hlc::ZERO, false),
         }
     }
 }

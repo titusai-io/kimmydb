@@ -645,7 +645,7 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     assert_eq!((candidates, accepted, refused_total), (60_000, 31_795, 28_205), "{refused:?}");
     assert_eq!(refused.len(), 8, "every clause that one state can show is reached: {refused:?}");
     assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_550));
-    assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_760));
+    assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
         "the accepted triples that fail are the cross-state ones"

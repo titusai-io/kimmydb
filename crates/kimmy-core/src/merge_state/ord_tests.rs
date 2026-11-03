@@ -729,13 +729,26 @@ fn an_unset_floor_is_strict_and_a_replace_floor_is_inclusive() {
     assert!(under_u.valid(&(at(1, 2), 0), &keep), "the mutant never voids");
 }
 
+/// The model orders a floor as the tuple `(stamp, "u", prev, bit)` against `(stamp, "r")`; since
+/// `"r" < "u"`, at one stamp a replace is BELOW an unset and the model's `max` is the unset (O1-5 of the
+/// review: the Rust had them the other way round, and said the opposite in its doc).
 #[test]
-fn floors_order_by_stamp_then_unset_below_replace_then_prev_then_the_bit() {
+fn floors_order_by_stamp_then_replace_below_unset_then_prev_then_the_bit() {
     let r = Floor::R { stamp: at(5, 1) };
-    assert!(u(5, 1, 9, true) < r, "an unset sorts below a replace at one stamp");
+    assert!(r < u(5, 1, 0, false), "a replace sorts below an unset at one stamp");
+    assert!(r < u(5, 1, 9, true));
+    assert_eq!(r.max(u(5, 1, 3, false)), u(5, 1, 3, false), "the model's max is the unset");
     assert!(u(5, 1, 3, true) < u(5, 1, 4, false), "prev before the bit");
     assert!(u(5, 1, 4, false) < u(5, 1, 4, true), "the bit sorts above its absence");
-    assert!(r < u(6, 1, 0, false), "the stamp first");
+    assert!(u(6, 1, 0, false) > r && u(4, 1, 9, true) < r, "the stamp first");
+    // and the join takes that floor when both are at one stamp (peer states only)
+    let o = JoinOptions::default();
+    let (x, y) = (
+        FieldOrd { floor: Some(r), ..FieldOrd::default() },
+        FieldOrd { floor: Some(u(5, 1, 3, false)), ..FieldOrd::default() },
+    );
+    assert_eq!(ord_join(&x, &y, &o).floor, Some(u(5, 1, 3, false)));
+    assert_eq!(ord_join(&y, &x, &o).floor, Some(u(5, 1, 3, false)));
 }
 
 #[test]
