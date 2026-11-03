@@ -538,6 +538,114 @@ def join_law_fixture():
     return {"paths_with_several": distinct_keys, "triples": triples, "ords": ords, "per_path": per_path}
 
 
+def _without_mapi(st):
+    return all(r[1] != M.MAPI for r in st.regs.values())
+
+
+def _flat_ordered(st):
+    v = st.visible()
+    return None if v is None else flat(v)
+
+
+def _mutants():
+    """Five mutants of the Rust read, as textual mutants of the model's born_of / _survivors (to choose the states that tell
+    them from the design; the Rust test kills the mutants of the Rust)."""
+    import inspect, textwrap
+
+    def make(fn, subs):
+        src = textwrap.dedent(inspect.getsource(fn))
+        for old, new in subs:
+            assert old in src, old
+            src = src.replace(old, new, 1)
+        ns = dict(M.__dict__)
+        exec(src, ns)
+        return ns[fn.__name__]
+
+    bo, sv = M.State.born_of, M.State._survivors
+    return {
+        "born_of reads one life's entry, no fold over the alive lives": ("born_of", make(bo, [("o = ord_join(o, self.ords[(L, p)])", "o = ord_join(o, self.ords[(L, p)]); break")])),
+        "no slot survivors of a descendant": ("_survivors", make(sv, [("            out.append(place(bq if bq is not None else (win[0], 0)))\n        out += slot_survivors(q)", "            out.append(place(bq if bq is not None else (win[0], 0)))")])),
+        "level floor: min of the lives' lvl": ("born_of", make(bo, [("lv = po.lvl if lv is None else max(lv, po.lvl)", "lv = po.lvl if lv is None else min(lv, po.lvl)")])),
+        "a descendant survivor at its register stamp, not its born_of": ("_survivors", make(sv, [("out.append(place(bq if bq is not None else (win[0], 0)))", "out.append(place((win[0], 0)))")])),
+        "below built from registers only": ("_survivors", make(sv, [("for k in list(self.regs) + list(self.slots) if k[0] in al and is_under(k[1], p)", "for k in list(self.regs) if k[0] in al and is_under(k[1], p)")])),
+    }
+
+
+def random_states_fixture(seeds=300, steps=30):
+    """O1-4 and O1-6 of the O1 review. States of the model's random nested runs (every writer entry of every member's oplog and
+    every member's final state; no implicit markers: O4 is not built), with the model's ordered document of each under
+    ABSORBED = False (the counter cell the Rust has). Chosen: for each of five mutants of the read the states it changes
+    (smallest first), and a spread of others; and, from runs with ABSORBED = True, the states whose order or values the
+    Q6 rule changes (the Rust has no `absorbed` yet: pinned as a known divergence)."""
+    muts = _mutants()
+    seen, pool = set(), []
+    M.ABSORBED = False
+    for seed in range(seeds):
+        ms, log, ok = P.run(seed, steps=steps, nested=True)
+        sts = [m.state for m in ms]
+        for m in ms:
+            sts += [M.unwire(e[2]) for e in m.oplog.values() if e[0] == "w"]
+        for st in sts:
+            c = st.canon()
+            if c in seen or not _without_mapi(st) or st.visible() is None:
+                continue
+            seen.add(c)
+            pool.append((seed, st))
+    chosen, why = {}, {}
+    for name, (meth, f) in muts.items():
+        hits = []
+        orig = getattr(M.State, meth)
+        for i, (seed, st) in enumerate(pool):
+            want = M.tyrepr(M.ordered(st.visible()))
+            setattr(M.State, meth, f)
+            try:
+                got = M.tyrepr(M.ordered(st.visible()))
+            finally:
+                setattr(M.State, meth, orig)
+            if got != want:
+                hits.append((sum(len(x) for x in (st.regs, st.slots)), i))
+        hits.sort()
+        why[name] = len(hits)
+        for _, i in hits[:6]:
+            chosen.setdefault(i, []).append(name)
+    spread = list(range(0, len(pool), max(1, len(pool) // 60)))
+    for i in spread:
+        chosen.setdefault(i, [])
+    states = []
+    for i in sorted(chosen):
+        seed, st = pool[i]
+        states.append({"seed": seed, "kills": chosen[i], "state": j_state(st), "expected": _flat_ordered(st),
+                       "lives": len(st.alive())})
+    # the Q6 rule: states whose order or values change with ABSORBED on
+    M.ABSORBED = True
+    differing = []
+    for seed in range(seeds):
+        ms, log, ok = P.run(seed, steps=steps, nested=True)
+        for m in ms:
+            for st in [m.state] + [M.unwire(e[2]) for e in m.oplog.values() if e[0] == "w"]:
+                if not _without_mapi(st) or st.visible() is None:
+                    continue
+                on = _flat_ordered(st)
+                M.ABSORBED = False
+                off = _flat_ordered(st)
+                M.ABSORBED = True
+                if on != off:
+                    differing.append((len(st.regs) + len(st.slots), seed, st, on, off))
+    differing.sort(key=lambda x: (x[0], x[1]))
+    absorbed = []
+    seen2 = set()
+    for n, seed, st, on, off in differing:
+        if st.canon() in seen2:
+            continue
+        seen2.add(st.canon())
+        absorbed.append({"seed": seed, "state": j_state(st), "expected_on": on, "expected_off": off})
+        if len(absorbed) >= 4:
+            break
+    M.ABSORBED = True
+    return {"states": states, "absorbed": absorbed, "pool": len(pool), "selected_by_mutant": why,
+            "absorbed_differing_states": len(differing)}
+
+
 def main(outdir):
     os.makedirs(outdir, exist_ok=True)
     sha = hashlib.sha256(open(os.path.join(MODEL, "model6.py"), "rb").read()).hexdigest()
@@ -552,6 +660,11 @@ def main(outdir):
     jl["model6_sha256"] = sha
     with open(os.path.join(outdir, "ord_join_laws.json"), "w") as f:
         json.dump(jl, f, separators=(",", ":"), sort_keys=True)
+    rs = random_states_fixture()
+    rs["model6_sha256"] = sha
+    with open(os.path.join(outdir, "ord_random_states.json"), "w") as f:
+        json.dump(rs, f, separators=(",", ":"), sort_keys=True)
+    print("random states:", len(rs["states"]), "chosen of", rs["pool"], "; kills", rs["selected_by_mutant"], "; absorbed:", len(rs["absorbed"]), "of", rs["absorbed_differing_states"])
     with open(os.path.join(outdir, "HASHES.txt"), "w") as f:
         f.write(f"{sha}  model6.py (q7step0-model-A2-final)\n")
         for n in ("pullmodel6.py", "probes_order.py"):

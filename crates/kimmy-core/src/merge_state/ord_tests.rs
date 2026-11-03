@@ -21,6 +21,7 @@ use crate::ids::NodeId;
 
 const GOLDENS: &str = include_str!("../../tests/data/ord_goldens.json");
 const JOIN_LAWS: &str = include_str!("../../tests/data/ord_join_laws.json");
+const RANDOM_STATES: &str = include_str!("../../tests/data/ord_random_states.json");
 
 /// The `sha256` of `model6.py` that both fixtures were made from.
 const MODEL6_SHA256: &str = "0506450e0afc4c307a6ebce032df4f1b1588e719cde6c148c5ff033a8df7f85a";
@@ -1062,6 +1063,59 @@ fn a_chain_of_survivors_is_read_in_linear_time() {
         survivor_chain(depth).ordered_document_with(&o, &m).unwrap();
         assert_eq!(m.evaluations(), depth);
     }
+}
+
+// ---- the read on the model's random states ------------------------------------------------
+
+/// The ordered document of a state as the fixture spells it.
+fn expected_flat(j: &J) -> Vec<(Path, Value)> {
+    j.as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let v = if e[1] == "map" { serde_json::json!({"t": "map"}) } else { e[1].clone() };
+            (path(&e[0]), value(&v))
+        })
+        .collect()
+}
+
+/// O1-4 of the O1 review. The goldens have no path with entries in two alive lives, no increment below
+/// an unset map and no `lvl` in two lives, so five mutants of the read survived them. This fixture is
+/// 79 states of the model's random nested runs (300 seeds, 30 steps; every writer entry of every
+/// member's oplog and every final state, no implicit markers since O4 is not built, 2,094 distinct), with
+/// the model's ordered document under ABSORBED off (the counter cell the Rust has): chosen as the
+/// smallest states that each of the five mutants changes, and a spread of others. The Rust read must
+/// give the model's order and values on every one. The five mutants (their lines in `ord.rs`):
+///
+///  1. `born_of` reads one life's entry (no fold over the alive lives);
+///  2. no slot survivors of a descendant (`out.extend(slot_survivors(q))` dropped);
+///  3. the level floor takes the `min` of the lives' `lvl`, not the `max`;
+///  4. a descendant survivor is placed at its register stamp, not at its `born_of`;
+///  5. `below` is built from the registers only (a descendant with only a slot is missed).
+///
+/// Each changes the order of at least one of these states, so this test fails under each (shown in the
+/// commit message). The fixture lists, per state, the mutants it was chosen for.
+#[test]
+fn the_read_equals_the_models_on_random_states() {
+    let j: J = serde_json::from_str(RANDOM_STATES).unwrap();
+    assert_eq!(j["model6_sha256"], MODEL6_SHA256);
+    let o = JoinOptions::default();
+    let (mut two_lives, mut maps, mut chosen_for) = (0usize, 0usize, BTreeSet::new());
+    let states = j["states"].as_array().unwrap();
+    for (k, e) in states.iter().enumerate() {
+        let s = state(&e["state"]);
+        let want = expected_flat(&e["expected"]);
+        let doc = s.ordered_document(&o).expect("a life is alive");
+        assert_eq!(flatten(&doc), want, "state {k} (seed {})", e["seed"]);
+        two_lives += usize::from(s.alive(&o).len() >= 2);
+        maps += want.iter().filter(|(_, v)| *v == Value::Map).count();
+        for m in e["kills"].as_array().unwrap() {
+            chosen_for.insert(m.as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(chosen_for.len(), 5, "every mutant has a state: {chosen_for:?}");
+    assert_eq!((states.len(), j["pool"].as_u64()), (79, Some(2094)));
+    assert!(two_lives >= 20 && maps >= 100, "{two_lives} {maps}");
 }
 
 // ---- the laws on the entries of the model's own runs ----------------------------------
