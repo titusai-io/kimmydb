@@ -1132,8 +1132,11 @@ fn q4_same_helper() {
     assert!(!Value::same(Some(&i(2)), &f(2.0)), "2 is not 2.0");
     assert!(!Value::same(Some(&f(2.0)), &i(2)));
     assert!(Value::same(Some(&f(2.0)), &f(2.0)));
-    assert!(Value::same(Some(&f(0.0)), &f(-0.0)), "doubles compare as numbers");
-    assert!(!Value::same(Some(&f(f64::NAN)), &f(f64::NAN)));
+    // Doubles compare by bit pattern (ruled): a no-op leaves the stored bytes identical.
+    assert!(!Value::same(Some(&f(0.0)), &f(-0.0)), "0.0 and -0.0 are different bytes");
+    assert!(Value::same(Some(&f(-0.0)), &f(-0.0)));
+    assert!(Value::same(Some(&f(f64::NAN)), &f(f64::NAN)), "the same NaN bits are the same");
+    assert!(!Value::same(Some(&f(f64::NAN)), &f(f64::from_bits(f64::NAN.to_bits() ^ 1))));
     assert!(!Value::same(Some(&s("2")), &i(2)));
 }
 
@@ -1725,13 +1728,13 @@ fn arrays_compare_element_by_element_and_type_for_type() {
     assert_eq!(a, Value::Array(vec![i(1), f(0.0)]));
     assert_ne!(a, Value::Array(vec![i(1)]));
     assert_ne!(a, Value::Array(vec![Value::Int32(1), f(0.0)]));
-    // Doubles inside an array: equality is by bits, `same` follows the number.
+    // Doubles inside an array: equality is by bits, and so is `same`.
     let z = Value::Array(vec![f(-0.0)]);
     assert_ne!(Value::Array(vec![f(0.0)]), z);
-    assert!(Value::same(Some(&Value::Array(vec![f(0.0)])), &z));
+    assert!(!Value::same(Some(&Value::Array(vec![f(0.0)])), &z));
     let nan = Value::Array(vec![f(f64::NAN)]);
     assert_eq!(nan, nan.clone());
-    assert!(!Value::same(Some(&nan), &nan));
+    assert!(Value::same(Some(&nan), &nan));
     // An array is not a scalar and not an empty array.
     assert_ne!(Value::Array(vec![]), Value::Null);
     assert!(!Value::same(Some(&Value::Array(vec![])), &Value::Null));
@@ -2255,4 +2258,46 @@ fn a_whole_document_loss_is_not_a_field_named_underscore() {
         d.losses.insert(doc_key, LossValue::Fields(vec![p("x"), p("_")]));
         d.compact_bytes()
     });
+}
+
+// ---- doubles by bit pattern, decimals by their bytes (ruled) ------------------------------
+
+/// A Decimal128 in BSON's BID spelling (16 bytes, little-endian): a coefficient below 2^64 and an
+/// unbiased exponent, positive.
+fn decimal(coefficient: u64, exponent: i32) -> Value {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&coefficient.to_le_bytes());
+    let high = (u64::try_from(exponent + 6176).unwrap()) << 49;
+    b[8..].copy_from_slice(&high.to_le_bytes());
+    Value::Decimal128(b)
+}
+
+#[test]
+fn a_set_that_changes_the_stored_bytes_is_a_stamped_write_even_when_the_numbers_are_equal() {
+    // The rule: a no-op is a write that leaves the stored representation byte-identical. A
+    // Decimal128 is its 16 bytes, so 1.0 (10 x 10^-1) and 1.00 (100 x 10^-2) are different values,
+    // as the reference's own decimal arithmetic keeps them apart: "2.30 and 2.3 differ"
+    // (crates/kimmy-query/src/decimal_arith_tests.rs:32). The reference's source is not
+    // available here, so that comment is the only authority this test cites, and the check is
+    // on the bytes, not on a reading of the reference.
+    let (one_dot_0, one_dot_00) = (decimal(10, -1), decimal(100, -2));
+    assert_ne!(one_dot_0, one_dot_00);
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("d", one_dot_0.clone()), ("z", f(0.0)), ("n", f(f64::NAN))]), 0).unwrap();
+    let before = w.state.clone();
+    let st = w.write_set(&p("d"), one_dot_00.clone(), 0).expect("1.0 to 1.00 is a write");
+    assert_eq!(w.visible().unwrap()[&p("d")], one_dot_00);
+    assert_eq!(w.state.regs.values().filter(|r| r.stamp == st.stamp).count(), 1);
+    assert!(w.write_set(&p("d"), one_dot_00, 0).is_none(), "the same bytes again are a no-op");
+    // Doubles by bit pattern: 0.0 to -0.0 is a write, NaN to the same NaN is not.
+    assert!(w.write_set(&p("z"), f(0.0), 0).is_none());
+    assert!(w.write_set(&p("z"), f(-0.0), 0).is_some());
+    assert!(w.write_set(&p("n"), f(f64::NAN), 0).is_none());
+    assert!(w.write_set(&p("n"), f(f64::from_bits(f64::NAN.to_bits() ^ 1)), 0).is_some());
+    assert_ne!(before, w.state);
+    // The same through replace: only the byte-different field is written.
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("d", decimal(10, -1)), ("e", decimal(5, 0))]), 0).unwrap();
+    let r = w.write_replace(&fl(&[("d", decimal(100, -2)), ("e", decimal(5, 0))]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![p("d")]);
 }

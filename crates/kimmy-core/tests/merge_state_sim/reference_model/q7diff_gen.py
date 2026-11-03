@@ -36,6 +36,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import model5 as M  # noqa: E402
 
+
+def _bits(x):
+    return struct.pack(">d", x) if isinstance(x, float) else x
+
+
+def same_by_bits(a, b):
+    """The diff, as ruled 2026-11-03: a no-op is a write that leaves the stored representation
+    byte-identical, so doubles compare by bit pattern (0.0 is not -0.0; a NaN is its own bits).
+    model5.py itself is vendored as it was and compares them as numbers, so the harness replaces
+    its `same` here, for the scripts and for the replay."""
+    return type(a) is type(b) and _bits(a) == _bits(b)
+
+
+M.same = same_by_bits
+
 M64 = (1 << 64) - 1
 I64_MAX = 2 ** 63 - 1
 

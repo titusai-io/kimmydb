@@ -237,34 +237,24 @@ impl Value {
 }
 
 impl Value {
-    /// The model's `same(a, b)` (Q4, ruled): the write diff compares value AND type,
-    /// so `$set 2` over a stored `2.0` is a write, and so is an `Int32` over an `Int64`
-    /// of the same number. A missing field (`None`) is the same as `Unset`, not as `Null`: `$set x
-    /// null` over a missing field is a write. Doubles
-    /// compare as numbers (`==`: `0.0` is `-0.0`, NaN is not NaN), as Python does; an
-    /// array compares element by element in the same way, type for type.
+    /// The model's `same(a, b)` (Q4, ruled): the write diff compares value AND type, so `$set 2`
+    /// over a stored `2.0` is a write, and so is an `Int32` over an `Int64` of the same number.
+    /// A missing field (`None`) is the same as `Unset`, not as `Null`: `$set x null` over a
+    /// missing field is a write.
+    ///
+    /// The rule (ruled): a no-op is a write that would leave the stored representation
+    /// byte-identical. So doubles compare by bit pattern (`0.0` is not `-0.0`, and a NaN is the
+    /// same as a NaN of the same bits), a `Decimal128` by its 16 bytes (`1.0` and `1.00` differ),
+    /// an array element by element and a document in an array field by field in order. That is
+    /// the equality of [`Value`] itself.
     pub fn same(current: Option<&Value>, new: &Value) -> bool {
-        Self::same_value(current.unwrap_or(&Value::Unset), new)
-    }
-
-    fn same_value(a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Double(a), Value::Double(b)) => a == b,
-            (Value::Array(a), Value::Array(b)) => {
-                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| Self::same_value(a, b))
-            }
-            (Value::Document(a), Value::Document(b)) => {
-                a.len() == b.len()
-                    && a.iter().zip(b).all(|(a, b)| a.0 == b.0 && Self::same_value(&a.1, &b.1))
-            }
-            (a, b) => a == b,
-        }
+        current.unwrap_or(&Value::Unset) == new
     }
 }
 
 // Structural equality of states: values of different types are never equal and
 // doubles compare by bit pattern, so that equality agrees with the encoding.
-// (The write diff uses `Value::same`, which follows the model.) There is no order on
+// (The write diff uses `Value::same`, which is this equality.) There is no order on
 // values: a register is decided by its stamp, never by comparing two values.
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
