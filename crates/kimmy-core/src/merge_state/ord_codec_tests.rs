@@ -644,13 +644,13 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     let refused_total: usize = refused.values().sum();
     assert_eq!((candidates, accepted, refused_total), (60_000, 31_795, 28_205), "{refused:?}");
     assert_eq!(refused.len(), 8, "every clause that one state can show is reached: {refused:?}");
-    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_550));
+    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_489));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
         "the accepted triples that fail are the cross-state ones"
     );
-    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (159_204, 129_420, 508));
+    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (130_422, 102_594, 384));
     assert_eq!((one.triples, one.not_associative), (4_266, 0));
     assert_eq!((sim.triples, sim.not_associative), (108_870, 0));
 }
@@ -866,4 +866,154 @@ fn an_honest_history_beyond_retention_reaches_the_non_associative_triple() {
     let right = ord_join(&a, &ord_join(&b, &unset, &o), &o);
     assert_ne!(left, right, "not associative");
     assert!(left.firsts.is_empty() && right.firsts == [(w(c), (at(31, c), 0))].into());
+}
+
+// ---- the depth of a path ----------------------------------------------------------------
+
+/// D-2 of the delta review: a decoded path had no depth bound. One register at a path of 20,000 empty
+/// segments is 20 kilobytes that `check_decoded` accepted, and `visible()` would clone about 2*10^8
+/// segments and recurse once per level (an abort by stack or memory, which a panic audit does not
+/// see). A path is at most `MAX_VALUE_DEPTH` (100) segments, the depth of a BSON document, in `Path::new`
+/// and in both decoders (`DecodeError::PathTooDeep`, refused before any segment is built).
+fn deep_path(n: usize) -> Path {
+    Path::unchecked(vec!["s".to_string(); n])
+}
+
+fn deep_base() -> MergeState {
+    let (a, life) = (w(b'A'), at(1, b'A'));
+    let mut s = MergeState::default();
+    s.lives.insert(life, Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert });
+    s.vv.insert(a, Hlc::new(20, 0));
+    s
+}
+
+/// The same state with a path of `n` segments in each place a decoded path can be: a register, a counter
+/// slot (a cell), a loss record, the field order of a life, and (compact only) an order entry.
+fn deep_states(n: usize) -> Vec<(&'static str, MergeState, bool)> {
+    let (a, life) = (w(b'A'), at(1, b'A'));
+    let p = deep_path(n);
+    let mut out = Vec::new();
+    let mut s = deep_base();
+    s.regs.insert(
+        (life, p.clone()),
+        Reg::new(at(2, b'A'), Value::Int64(1), BTreeMap::new(), None, false).unwrap(),
+    );
+    out.push(("register", s, true));
+    let mut s = deep_base();
+    s.slots.insert((life, p.clone(), a, None), Slot { stamp: at(2, b'A'), total: Num::Int64(3) });
+    out.push(("slot", s, true));
+    let mut s = deep_base();
+    s.losses.insert(
+        LossKey::field(LossKind::Clash, p.clone(), at(2, b'A')),
+        LossValue::Value(Value::Int64(1)),
+    );
+    out.push(("loss", s, true));
+    let mut s = deep_base();
+    s.lives.get_mut(&life).unwrap().order = vec![p.clone()];
+    out.push(("life order", s, true));
+    let mut s = deep_base();
+    s.ords.insert(
+        (life, OrdAt::Field(p)),
+        FieldOrd {
+            firsts: [(a, (at(2, b'A'), 0))].into(),
+            last: Some((at(2, b'A'), 0)),
+            ..FieldOrd::default()
+        },
+    );
+    out.push(("order entry", s, false));
+    out
+}
+
+#[test]
+fn a_path_deeper_than_the_depth_limit_is_refused_by_both_decoders_and_by_path_new() {
+    let o = JoinOptions::default();
+    // Path::new, flat and child
+    assert!(Path::new(vec!["s"; 100]).is_ok());
+    assert!(Path::new(vec!["s"; 101]).is_err());
+    let hundred = Path::new(vec!["s"; 100]).unwrap();
+    assert!(hundred.child("t").is_err());
+    assert!(Path::new(vec!["s"; 99]).unwrap().child("t").is_ok());
+    for (name, st, v1) in deep_states(100) {
+        // at the limit: accepted by the compact decoder, and by version 1 where it can spell the state
+        assert_eq!(
+            MergeState::decode_compact(&st.encode_compact()).as_ref(),
+            Ok(&st),
+            "compact, {name}"
+        );
+        if v1 {
+            assert_eq!(MergeState::decode(&st.encode()).as_ref(), Ok(&st), "version 1, {name}");
+        }
+        // and a state at the limit is read: the reads recurse at most 100 levels
+        let _ = (st.visible(&o), st.ordered_document(&o), st.hidden_all(&o));
+    }
+    for (name, st, v1) in deep_states(101) {
+        assert_eq!(
+            MergeState::decode_compact(&st.encode_compact()),
+            Err(DecodeError::PathTooDeep),
+            "compact, {name}"
+        );
+        if v1 {
+            assert_eq!(
+                MergeState::decode(&st.encode()),
+                Err(DecodeError::PathTooDeep),
+                "version 1, {name}"
+            );
+        }
+    }
+    // the reviewer's input: 20,000 segments is refused before a segment is built (20 kilobytes)
+    for (name, st, v1) in deep_states(20_000) {
+        let enc = st.encode_compact();
+        assert!(enc.len() < 100_000, "{name}: {} bytes", enc.len());
+        assert_eq!(MergeState::decode_compact(&enc), Err(DecodeError::PathTooDeep), "{name}");
+        if v1 {
+            assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::PathTooDeep), "{name}");
+        }
+    }
+}
+
+/// The write API refuses what the decoders do: a document nested deeper than 100 (the reference's limit)
+/// is refused by `Value::check_input` (`InvalidValue::TooDeep`, the value-depth error that exists) and a
+/// leaf below the 100th level by the path limit, so an insert whose deepest path has 100 segments works
+/// and one with 101 is refused (`None`, as every refusal of a write is). Reused: `MAX_VALUE_DEPTH`.
+#[test]
+fn the_write_api_refuses_a_document_nested_deeper_than_the_depth_limit() {
+    // `m` nested documents inside the field "f": the deepest path f.f...f has m + 1 segments
+    let nest = |m: usize| {
+        let mut v = Value::Int64(1);
+        for _ in 0..m {
+            v = Value::Document(vec![("f".to_string(), v)]);
+        }
+        v
+    };
+    // check_input: a document at depth 100 is refused; 100 nested documents are not
+    assert_eq!(nest(100).check_input(), Ok(()));
+    assert_eq!(nest(101).check_input(), Err(InvalidValue::TooDeep));
+    let o = JoinOptions::default();
+    let id = WriterId { node: crate::ids::NodeId::from_bytes([1; 16]), epoch: Epoch::from_u64(0) };
+    let f = Path::flat("f").unwrap();
+    for (m, accepted) in [(98usize, true), (99, true), (100, false), (101, false)] {
+        let mut wr = Writer::new(id, o.clone());
+        let r = wr.insert(&[(f.clone(), nest(m))], 0);
+        assert_eq!(
+            r.is_some(),
+            accepted,
+            "a document nested {m} deep (leaf at {} segments)",
+            m + 1
+        );
+        if accepted {
+            let deepest = wr.state.regs.keys().map(|k| k.1.segments().len()).max().unwrap();
+            assert_eq!(deepest, m + 1);
+        }
+        // the same through a set over an existing field, and a replace
+        let mut wr = Writer::new(id, o.clone());
+        wr.insert(&[(f.clone(), Value::Int64(0))], 0).unwrap();
+        assert_eq!(wr.write_set(&f, nest(m), 0).is_some(), accepted, "set, {m}");
+        let mut wr = Writer::new(id, o.clone());
+        wr.insert(&[(f.clone(), Value::Int64(0))], 0).unwrap();
+        assert_eq!(
+            wr.write_replace(&[(f.clone(), nest(m))], 0).is_some(),
+            accepted,
+            "replace, {m}"
+        );
+    }
 }
