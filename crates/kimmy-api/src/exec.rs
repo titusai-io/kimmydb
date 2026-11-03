@@ -2823,6 +2823,13 @@ fn conclude(
     source_stats: Option<QueryStats>,
     shape: Shape,
 ) -> Result<(Answer, Option<QueryStats>, Option<kimmy_query::budget::Lease>), ApiError> {
+    // `held` is trusted to have charged `docs`, and only the end of a chain makes one, charged
+    // for every document it holds as it took it ([`pipeline::Chain::finish_held`]).
+    debug_assert!(
+        held.as_ref()
+            .is_none_or(|lease| lease.bytes() >= kimmy_query::budget::held_docs_bytes(&docs)),
+        "a lease handed to the answer must have charged its documents"
+    );
     if let Some((sink, last)) = sink {
         // The documents are held while the sink writes them, in the engine's chunks.
         let _writing = match held {

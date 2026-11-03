@@ -257,6 +257,18 @@ pub fn streams_source(stages: &[Stage]) -> bool {
     segments(stages).first().is_some_and(|first| first.hold != Hold::Blocks)
 }
 
+/// Whether a chain built from `stages` wants no document of the source at all, before one is
+/// pushed: a `$limit` of 0 at its head (a window the reordering made of `$limit 3, $skip 5`),
+/// or a heap that keeps none. The executor asks the same of the chain it builds and then reads
+/// nothing, so `explain` asks it here and says so.
+pub fn takes_nothing(stages: &[Stage]) -> bool {
+    let run = |_: &Stage, _: Vec<Document>, _: Option<Lease>| -> Result<Vec<Document>, Error> {
+        Ok(Vec::new())
+    };
+    let limits = Limits::default();
+    build(stages, &run, &limits, &[]).is_full()
+}
+
 /// How many documents of the source a pipeline whose stages are `stages` will take, when that
 /// is known before it runs: the stages begin with a run of `$skip`s and a `$limit`, which take
 /// that many whatever the documents are (a `$limit` of 0 included, which takes none). `None`

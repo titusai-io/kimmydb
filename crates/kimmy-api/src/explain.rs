@@ -121,43 +121,51 @@ pub fn aggregate_explain_with_limits(
 /// an index range read in `_id` order, which holds its keys.
 fn describe_source(source: &mut Value, access: &Access, chain: &[Stage], max_documents: usize) {
     let streams = pipeline::streams_source(chain);
+    let nothing = streams && pipeline::takes_nothing(chain);
     source["streams"] = json!(streams);
-    if streams {
+    // The pipeline's ceiling, on every filtered source: a source read whole is held to it
+    // (`the source read`), and what a stage that blocks holds and the answer are held to it
+    // whether the source streams or not.
+    source["maxDocuments"] = json!(max_documents);
+    if nothing {
         source["holds"] = json!(
-            "nothing: each document is passed to the first stage as it is read, with no ceiling \
-             on how many"
+            "no document: the pipeline takes none of the source (a window that takes nothing), \
+             and the run reads none"
         );
-        // The ceiling is on what a stage that blocks holds and on the answer, not on a source
-        // that streams.
-        if let Some(bound) = pipeline::source_bound(chain) {
-            source["sourceBound"] = json!(bound);
-        }
+    } else if streams {
+        source["holds"] = json!(
+            "no document of the source: each is passed to the first stage as it is read, and the \
+             read has no ceiling of its own; maxDocuments still holds what a stage that blocks \
+             keeps and the answer"
+        );
     } else {
-        source["maxDocuments"] = json!(max_documents);
         source["holds"] = json!(
             "every document the read admits, charged as `the source read` until the first stage \
              takes it; a read past maxDocuments is refused 400, and past the memory limit 413"
         );
     }
+    if streams && let Some(bound) = pipeline::source_bound(chain) {
+        source["sourceBound"] = json!(bound);
+    }
     // An index range that is not one complete key (or a union of them) delivers its documents
     // in key order, not `_id` order, so a read in `_id` order collects the keys of the range.
-    if matches!(access, Access::Index(plan) if !plan.exact) {
+    // A pipeline that takes nothing reads none of it.
+    if !nothing && matches!(access, Access::Index(plan) if !plan.exact) {
         let keys = "charged to the request's memory as `the index range of $match`, and a range \
                     too large is refused 413";
+        let read = "read whole, in time proportional to the range, to deliver its documents in \
+                    _id order";
         source["indexRange"] = json!(match (streams, source["sourceBound"].as_u64()) {
             (true, Some(bound)) => format!(
-                "read whole, in time proportional to the range, to deliver its documents in \
-                 _id order; the keys held are the first {bound}, as the pipeline takes at most \
-                 that many documents of the source, {keys}"
+                "{read}, in passes of {bound} keys (the pipeline takes at most that many \
+                 documents of the source) and more of them while the filter rejects what they \
+                 find, up to the whole range; the keys held are {keys}"
             ),
-            (true, None) => format!(
-                "read whole, in time proportional to the range, to deliver its documents in \
-                 _id order; every key of the range is held while it is read, {keys}"
-            ),
+            (true, None) =>
+                format!("{read}; every key of the range is held while it is read, {keys}"),
             (false, _) => format!(
-                "read whole, in time proportional to the range, to deliver its documents in \
-                 _id order, in passes of up to maxDocuments + 1 candidates and more of them \
-                 while the filter rejects what they find; the keys held are {keys}"
+                "{read}, in passes of up to maxDocuments + 1 candidates and more of them while \
+                 the filter rejects what they find; the keys held are {keys}"
             ),
         });
     }
@@ -257,7 +265,7 @@ fn describe_in(stages: &[Stage], lead: usize, per_input: bool) -> Vec<Value> {
 
 /// The `hold` of a stage and the words for it: whether it passes one document at a time, keeps a
 /// state in place of its input, or holds all of its input before it emits any.
-fn runs_json(out: &mut Value, runs: Runs) -> String {
+fn runs_json(out: &mut Value, runs: Runs, stage: &Stage) -> String {
     match runs.hold {
         Hold::Streams => {
             out["hold"] = json!("streams");
@@ -271,6 +279,11 @@ fn runs_json(out: &mut Value, runs: Runs) -> String {
             out["hold"] = json!("state");
             let (state, what) = match kept {
                 Kept::Counter => ("counter", "a counter".to_string()),
+                Kept::Groups if matches!(stage, Stage::Bucket { .. }) => (
+                    "groups",
+                    "its buckets, one for each range a value falls in (and the default)"
+                        .to_string(),
+                ),
                 Kept::Groups => ("groups", "its groups, one for each distinct key".to_string()),
                 Kept::Heap { skip, limit } => {
                     let documents = skip.saturating_add(limit);
@@ -387,7 +400,7 @@ fn describe(stage: &Stage, per_input: bool, runs: Option<Runs>) -> Value {
         Stage::Sample(n) => {
             out["size"] = json!(n);
             "keeps this many documents chosen at random, in a random order; the pipeline's document \
-             limit applies to the size"
+             limit applies to what it keeps"
                 .into()
         }
         Stage::Redact(_) => {
@@ -578,7 +591,7 @@ fn describe(stage: &Stage, per_input: bool, runs: Option<Runs>) -> Value {
         }
     };
     let detail = match runs {
-        Some(runs) => format!("{detail}; {}", runs_json(&mut out, runs)),
+        Some(runs) => format!("{detail}; {}", runs_json(&mut out, runs, stage)),
         None => detail,
     };
     out["detail"] = json!(detail);
@@ -1277,13 +1290,13 @@ mod tests {
         // a streaming pipeline.
         pin(
             json!([{"$match": {"n": {"$gt": 1}}}, {"$project": {"k": 1}}, {"$limit": 5}]),
-            json!({"strategy": "index", "index": "n_1", "indexFieldsUsed": 1, "stages": 1, "streams": true, "holds": "nothing: each document is passed to the first stage as it is read, with no ceiling on how many", "sourceBound": 5, "indexRange": "read whole, in time proportional to the range, to deliver its documents in _id order; the keys held are the first 5, as the pipeline takes at most that many documents of the source, charged to the request's memory as `the index range of $match`, and a range too large is refused 413"}),
+            json!({"strategy": "index", "index": "n_1", "indexFieldsUsed": 1, "stages": 1, "streams": true, "maxDocuments": 100000, "holds": "no document of the source: each is passed to the first stage as it is read, and the read has no ceiling of its own; maxDocuments still holds what a stage that blocks keeps and the answer", "sourceBound": 5, "indexRange": "read whole, in time proportional to the range, to deliver its documents in _id order, in passes of 5 keys (the pipeline takes at most that many documents of the source) and more of them while the filter rejects what they find, up to the whole range; the keys held are charged to the request's memory as `the index range of $match`, and a range too large is refused 413"}),
             json!([{"stage": "$limit", "runs": "inMemory", "limit": 5, "hold": "streams", "detail": format!("keeps the first documents that reach it; {STREAMS}")}, {"stage": "$project", "runs": "inMemory", "hold": "streams", "detail": format!("reshapes each document that reaches it; {STREAMS}")}]),
         );
         // a pipeline that keeps a state.
         pin(
             json!([{"$match": {"n": {"$gt": 1}}}, {"$group": {"_id": "$n", "c": {"$sum": 1}}}, {"$count": "total"}]),
-            json!({"strategy": "index", "index": "n_1", "indexFieldsUsed": 1, "stages": 1, "streams": true, "holds": "nothing: each document is passed to the first stage as it is read, with no ceiling on how many", "indexRange": "read whole, in time proportional to the range, to deliver its documents in _id order; every key of the range is held while it is read, charged to the request's memory as `the index range of $match`, and a range too large is refused 413"}),
+            json!({"strategy": "index", "index": "n_1", "indexFieldsUsed": 1, "stages": 1, "streams": true, "maxDocuments": 100000, "holds": "no document of the source: each is passed to the first stage as it is read, and the read has no ceiling of its own; maxDocuments still holds what a stage that blocks keeps and the answer", "indexRange": "read whole, in time proportional to the range, to deliver its documents in _id order; every key of the range is held while it is read, charged to the request's memory as `the index range of $match`, and a range too large is refused 413"}),
             json!([{"stage": "$group", "runs": "inMemory", "hold": "state", "state": "groups", "detail": "groups the documents that reach it by the `_id` expression, with one output per group; holds a state, not its input: its groups, one for each distinct key"}, {"stage": "$count", "runs": "inMemory", "field": "total", "hold": "state", "state": "counter", "detail": "counts the documents that reach it and emits one document; holds a state, not its input: a counter"}]),
         );
         // a stage that blocks, and a source read whole.
@@ -1295,19 +1308,19 @@ mod tests {
         // a sort and limit is a heap, and what follows it streams.
         pin(
             json!([{"$sort": {"k": -1}}, {"$project": {"k": 1}}, {"$limit": 3}]),
-            json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": true, "holds": "nothing: each document is passed to the first stage as it is read, with no ceiling on how many"}),
+            json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": true, "maxDocuments": 100000, "holds": "no document of the source: each is passed to the first stage as it is read, and the read has no ceiling of its own; maxDocuments still holds what a stage that blocks keeps and the answer"}),
             json!([{"stage": "$sort", "runs": "inMemory", "keys": ["-k"], "hold": "state", "heapDocuments": 3, "state": "heap", "detail": "sorts the documents that reach it by the keys; holds a state, not its input: a heap of the first 3 documents of the sort, the $skip and $limit after it counted"}, {"stage": "$limit", "runs": "inMemory", "limit": 3, "hold": "state", "heapDocuments": 3, "state": "heap", "foldedInto": "$sort", "detail": "keeps the first documents that reach it; part of the heap of the $sort before it, which holds nothing else"}, {"stage": "$project", "runs": "inMemory", "hold": "streams", "detail": format!("reshapes each document that reaches it; {STREAMS}")}]),
         );
         // a sort, skip and limit is one heap.
         pin(
             json!([{"$sort": {"k": -1}}, {"$skip": 2}, {"$limit": 3}]),
-            json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": true, "holds": "nothing: each document is passed to the first stage as it is read, with no ceiling on how many"}),
+            json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": true, "maxDocuments": 100000, "holds": "no document of the source: each is passed to the first stage as it is read, and the read has no ceiling of its own; maxDocuments still holds what a stage that blocks keeps and the answer"}),
             json!([{"stage": "$sort", "runs": "inMemory", "keys": ["-k"], "hold": "state", "heapDocuments": 5, "state": "heap", "detail": "sorts the documents that reach it by the keys; holds a state, not its input: a heap of the first 5 documents of the sort, the $skip and $limit after it counted"}, {"stage": "$skip", "runs": "inMemory", "skip": 2, "hold": "state", "heapDocuments": 5, "state": "heap", "foldedInto": "$sort", "detail": "drops the first documents that reach it; part of the heap of the $sort before it, which holds nothing else"}, {"stage": "$limit", "runs": "inMemory", "limit": 3, "hold": "state", "heapDocuments": 5, "state": "heap", "foldedInto": "$sort", "detail": "keeps the first documents that reach it; part of the heap of the $sort before it, which holds nothing else"}]),
         );
         // a window moved to the head bounds the source.
         pin(
             json!([{"$addFields": {"x": 1}}, {"$skip": 2}, {"$limit": 3}]),
-            json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": true, "holds": "nothing: each document is passed to the first stage as it is read, with no ceiling on how many", "sourceBound": 5}),
+            json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": true, "maxDocuments": 100000, "holds": "no document of the source: each is passed to the first stage as it is read, and the read has no ceiling of its own; maxDocuments still holds what a stage that blocks keeps and the answer", "sourceBound": 5}),
             json!([{"stage": "$skip", "runs": "inMemory", "skip": 2, "hold": "streams", "detail": format!("drops the first documents that reach it; {STREAMS}")}, {"stage": "$limit", "runs": "inMemory", "limit": 3, "hold": "streams", "detail": format!("keeps the first documents that reach it; {STREAMS}")}, {"stage": "$addFields", "runs": "inMemory", "hold": "streams", "detail": format!("adds computed fields to each document that reaches it; {STREAMS}")}]),
         );
         // a barrier-first pipeline keeps the ceiling.
@@ -1325,8 +1338,14 @@ mod tests {
         // a sample is a reservoir, and a sink blocks.
         pin(
             json!([{"$sample": {"size": 4}}, {"$out": "o"}]),
-            json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": true, "holds": "nothing: each document is passed to the first stage as it is read, with no ceiling on how many"}),
-            json!([{"stage": "$sample", "runs": "inMemory", "size": 4, "hold": "state", "state": "reservoir", "detail": "keeps this many documents chosen at random, in a random order; the pipeline's document limit applies to the size; holds a state, not its input: a reservoir of 4 documents, the size of the sample"}, {"stage": "$out", "runs": "write", "into": "o", "hold": "blocks", "detail": format!("inserts the pipeline's output into the target, which must be new or empty (a run refuses one that holds documents), in chunks of storage.multi_chunk_docs; not atomic. A plan writes nothing and creates nothing; {BLOCKS}")}]),
+            json!({"strategy": "collectionScan", "index": null, "indexFieldsUsed": 0, "stages": 0, "streams": true, "maxDocuments": 100000, "holds": "no document of the source: each is passed to the first stage as it is read, and the read has no ceiling of its own; maxDocuments still holds what a stage that blocks keeps and the answer"}),
+            json!([{"stage": "$sample", "runs": "inMemory", "size": 4, "hold": "state", "state": "reservoir", "detail": "keeps this many documents chosen at random, in a random order; the pipeline's document limit applies to what it keeps; holds a state, not its input: a reservoir of 4 documents, the size of the sample"}, {"stage": "$out", "runs": "write", "into": "o", "hold": "blocks", "detail": format!("inserts the pipeline's output into the target, which must be new or empty (a run refuses one that holds documents), in chunks of storage.multi_chunk_docs; not atomic. A plan writes nothing and creates nothing; {BLOCKS}")}]),
+        );
+        // a window that takes nothing reads nothing.
+        pin(
+            json!([{"$match": {"n": {"$gt": 1}}}, {"$limit": 3}, {"$skip": 5}, {"$project": {"k": 1}}]),
+            json!({"strategy": "index", "index": "n_1", "indexFieldsUsed": 1, "stages": 1, "streams": true, "maxDocuments": 100000, "holds": "no document: the pipeline takes none of the source (a window that takes nothing), and the run reads none", "sourceBound": 0}),
+            json!([{"stage": "$limit", "runs": "inMemory", "limit": 0, "hold": "streams", "detail": format!("keeps the first documents that reach it; {STREAMS}")}, {"stage": "$project", "runs": "inMemory", "hold": "streams", "detail": format!("reshapes each document that reaches it; {STREAMS}")}]),
         );
     }
 
@@ -1507,11 +1526,8 @@ mod tests {
             // The source streams exactly when a run does not hold it whole under the ceiling.
             let source = &planned["explain"]["source"];
             assert_eq!(source["streams"], pipeline::streams_source(chain), "{pipeline}");
-            assert_eq!(
-                source.get("maxDocuments").is_some(),
-                source["streams"] == false,
-                "{pipeline}"
-            );
+            // The pipeline's ceiling is reported whether the source streams or not.
+            assert_eq!(source["maxDocuments"], aggregate::DEFAULT_MAX_DOCUMENTS, "{pipeline}");
             if consumed == 0 {
                 let run = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(
                     exec::aggregate_with_limits(
@@ -1529,6 +1545,125 @@ mod tests {
                     .is_some_and(|e| e.message.contains("source collection admits more than 3"));
                 assert_eq!(over_the_source, source["streams"] == false, "{pipeline}: {run:?}");
             }
+        }
+    }
+
+    /// What each stage kind holds, written out here and not read from the executor's layout: a
+    /// regression that laid a stage out as another kind (a `$project` as a barrier, a `$group`
+    /// as a stage that keeps its input) moves the chain and `explain` together, so only a table
+    /// of the expected answers can fail on it. `(pipeline, [(hold, state)] for each stage listed)`.
+    #[test]
+    fn what_each_stage_kind_holds_is_written_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed(&state, "a", 10, true);
+        seed(&state, "b", 5, false);
+        let sort = || json!({ "$sort": { "k": 1 } });
+        let table: Vec<(Vec<Value>, Vec<(&str, &str)>)> = vec![
+            // (A `$match` that begins the pipeline is the source's filter, so one follows a stage.)
+            (
+                vec![
+                    json!({ "$project": { "k": 1 } }),
+                    json!({ "$match": { "k": { "$gte": 0 } } }),
+                ],
+                vec![("streams", ""), ("streams", "")],
+            ),
+            (vec![json!({ "$project": { "k": 1 } })], vec![("streams", "")]),
+            (vec![json!({ "$addFields": { "y": 1 } })], vec![("streams", "")]),
+            (vec![json!({ "$set": { "y": 1 } })], vec![("streams", "")]),
+            (vec![json!({ "$replaceRoot": { "newRoot": "$$ROOT" } })], vec![("streams", "")]),
+            (vec![json!({ "$replaceWith": "$$ROOT" })], vec![("streams", "")]),
+            (vec![json!({ "$unset": "y" })], vec![("streams", "")]),
+            (vec![json!({ "$redact": "$$KEEP" })], vec![("streams", "")]),
+            (vec![json!({ "$unwind": "$x" })], vec![("streams", "")]),
+            (vec![json!({ "$skip": 1 })], vec![("streams", "")]),
+            (vec![json!({ "$limit": 4 })], vec![("streams", "")]),
+            (vec![sort()], vec![("blocks", "")]),
+            (vec![json!({ "$group": { "_id": "$n" } })], vec![("state", "groups")]),
+            (vec![json!({ "$count": "c" })], vec![("state", "counter")]),
+            (
+                vec![
+                    json!({ "$bucket": { "groupBy": "$n", "boundaries": [0, 2, 4], "default": "o" } }),
+                ],
+                vec![("state", "groups")],
+            ),
+            (vec![json!({ "$sortByCount": "$n" })], vec![("state", "groups")]),
+            (vec![json!({ "$sample": { "size": 2 } })], vec![("state", "reservoir")]),
+            (
+                vec![json!({ "$bucketAuto": { "groupBy": "$n", "buckets": 2 } })],
+                vec![("blocks", "")],
+            ),
+            (
+                vec![json!({ "$setWindowFields": { "sortBy": { "k": 1 }, "output": {
+                    "s": { "$sum": "$k", "window": { "documents": ["unbounded", "current"] } } } } })],
+                vec![("blocks", "")],
+            ),
+            (
+                vec![
+                    json!({ "$densify": { "field": "k", "range": { "step": 1, "bounds": "full" } } }),
+                ],
+                vec![("blocks", "")],
+            ),
+            (vec![json!({ "$fill": { "output": { "y": { "value": 0 } } } })], vec![("blocks", "")]),
+            (
+                vec![
+                    json!({ "$fill": { "sortBy": { "k": 1 }, "output": { "y": { "method": "locf" } } } }),
+                ],
+                vec![("blocks", "")],
+            ),
+            (vec![json!({ "$facet": { "f": [{ "$limit": 1 }] } })], vec![("blocks", "")]),
+            (
+                vec![
+                    json!({ "$lookup": { "from": "b", "localField": "n", "foreignField": "n", "as": "j" } }),
+                ],
+                vec![("blocks", "")],
+            ),
+            (
+                vec![
+                    json!({ "$graphLookup": { "from": "b", "startWith": "$n", "connectFromField": "n",
+                    "connectToField": "n", "as": "g", "maxDepth": 2 } }),
+                ],
+                vec![("blocks", "")],
+            ),
+            (vec![json!({ "$unionWith": "b" })], vec![("blocks", "")]),
+            // The fused shapes: the `$skip` and `$limit` a heap stands for hold what it holds.
+            (vec![sort(), json!({ "$limit": 3 })], vec![("state", "heap"), ("state", "heap")]),
+            (
+                vec![sort(), json!({ "$skip": 2 }), json!({ "$limit": 3 })],
+                vec![("state", "heap"), ("state", "heap"), ("state", "heap")],
+            ),
+            // The limit is moved ahead of the `$project`, so the `$sort` is a heap.
+            (
+                vec![sort(), json!({ "$project": { "k": 1 } }), json!({ "$limit": 3 })],
+                vec![("state", "heap"), ("state", "heap"), ("streams", "")],
+            ),
+            (vec![sort(), json!({ "$skip": 2 })], vec![("blocks", ""), ("streams", "")]),
+            (
+                vec![sort(), json!({ "$match": { "k": 1 } }), json!({ "$limit": 3 })],
+                vec![("blocks", ""), ("streams", ""), ("streams", "")],
+            ),
+            (
+                vec![json!({ "$group": { "_id": "$n" } }), json!({ "$count": "c" })],
+                vec![("state", "groups"), ("state", "counter")],
+            ),
+        ];
+        for (specs, expected) in table {
+            let pipeline = Value::Array(specs);
+            let out = explain(&state, &root(), "a", pipeline.clone()).unwrap();
+            let got: Vec<(String, String)> = out["explain"]["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    (
+                        s["hold"].as_str().unwrap().to_string(),
+                        s["state"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect();
+            let want: Vec<(String, String)> =
+                expected.iter().map(|(h, s)| ((*h).to_string(), (*s).to_string())).collect();
+            assert_eq!(got, want, "{pipeline}");
         }
     }
 }

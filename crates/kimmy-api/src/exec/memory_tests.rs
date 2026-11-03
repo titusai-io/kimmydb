@@ -590,12 +590,13 @@ fn a_refusal_inside_a_facet_branch_or_a_sub_pipeline_does_not_name_the_answer() 
 fn the_answer_takes_over_the_lease_that_charged_the_output() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(&dir, vec![], vec![]);
-    // A limit the documents alone pass: the JSON built from them is under it, so an answer
-    // that took the output as charged (by the lease it is handed) is built, and one that
-    // charged the documents afresh is refused at them.
     let docs = padded(5, 1000);
-    let limits = capped(held_docs_bytes(&docs) - 1);
-    let handed = limits.buffer.lease("the output of the pipeline");
+    // The documents and the JSON built from them fit, the documents twice do not: an answer
+    // built from the lease that charged the output holds the documents once.
+    let docs_bytes = held_docs_bytes(&docs);
+    let limits = capped(docs_bytes + docs_bytes * 2 / 3);
+    let mut handed = limits.buffer.lease("the output of the pipeline");
+    handed.charge_docs(&docs).unwrap();
     let (answer, _, hold) =
         conclude(&state, (docs.clone(), Some(handed)), &limits, None, None, Shape::Value)
             .expect("the output was charged by the lease handed over");
@@ -605,10 +606,32 @@ fn the_answer_takes_over_the_lease_that_charged_the_output() {
     drop(hold);
     assert_eq!(limits.buffer.used(), 0);
 
-    // With no lease the documents are charged now, as `the answer`.
-    let err = conclude(&state, (docs, None), &limits, None, None, Shape::Value)
+    // With no lease the documents are charged now, as `the answer`, and the same limit
+    // admits them.
+    let (answer, _, hold) =
+        conclude(&state, (docs.clone(), None), &limits, None, None, Shape::Value).unwrap();
+    assert_eq!(answer.into_value()["count"], 5);
+    drop(hold);
+    assert_eq!(limits.buffer.used(), 0);
+
+    // And past the limit they are refused at the documents, named for the answer.
+    let tight = capped(docs_bytes - 1);
+    let err = conclude(&state, (docs, None), &tight, None, None, Shape::Value)
         .map(|_| ())
         .expect_err("charged afresh, they pass the limit");
     names(&err, "the answer is ");
-    assert_eq!(limits.buffer.used(), 0);
+    assert_eq!(tight.buffer.used(), 0);
+}
+
+/// A lease that did not charge the documents is not one the end of a chain made: the answer
+/// would be built uncharged for them.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a lease handed to the answer must have charged its documents")]
+fn the_answer_refuses_a_lease_that_did_not_charge_the_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, vec![], vec![]);
+    let limits = capped(1_000_000);
+    let empty = limits.buffer.lease("the output of the pipeline");
+    let _ = conclude(&state, (padded(5, 1000), Some(empty)), &limits, None, None, Shape::Value);
 }
