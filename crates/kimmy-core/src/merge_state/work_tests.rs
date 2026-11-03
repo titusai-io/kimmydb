@@ -136,3 +136,32 @@ fn a_read_of_one_path_looks_at_the_alive_lives_not_at_every_register() {
         assert_eq!(c.visits, 2, "{n} fields");
     }
 }
+
+#[test]
+fn a_local_write_is_linear_in_the_cells() {
+    // the visits of a write at n fields are a n + b: doubling the document doubles the
+    // difference, where the pass per path of the model would make them grow as n squared
+    let on = |n: usize, write: &dyn Fn(&mut Writer)| {
+        let mut w = wide(n);
+        w.write_inc(&p("c1"), 1, 0).unwrap();
+        count(|| write(&mut w)).1.visits
+    };
+    let ops: [(&str, &dyn Fn(&mut Writer)); 4] = [
+        ("$set", &|w| drop(w.write_set(&p("f001"), s("z"), 0).unwrap())),
+        ("$inc", &|w| drop(w.write_inc(&p("c1"), 1, 0).unwrap())),
+        ("$unset", &|w| drop(w.write_unset(&p("f001"), 0).unwrap())),
+        ("replace", &|w| {
+            let doc: Vec<(Path, Value)> = w
+                .visible()
+                .unwrap()
+                .into_iter()
+                .map(|(k, v)| if k == p("f002") { (k, s("other")) } else { (k, v) })
+                .collect();
+            drop(w.write_replace(&doc, 0).unwrap());
+        }),
+    ];
+    for (name, write) in ops {
+        let (v100, v200, v400) = (on(100, write), on(200, write), on(400, write));
+        assert_eq!(v400 - v200, 2 * (v200 - v100), "{name}: {v100} {v200} {v400}");
+    }
+}

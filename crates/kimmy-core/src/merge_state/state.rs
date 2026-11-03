@@ -323,7 +323,11 @@ impl MergeState {
     }
 
     /// The counter slots of `p` in the alive lives, in key order: one range per alive life.
-    fn slots_at<'a>(&'a self, p: &Path, al: &BTreeSet<MStamp>) -> Vec<(&'a SlotKey, &'a Slot)> {
+    pub(super) fn slots_at<'a>(
+        &'a self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+    ) -> Vec<(&'a SlotKey, &'a Slot)> {
         let mut out = Vec::new();
         let Some(first) = al.first() else { return out };
         // the smallest writer, and no generation (which sorts first)
@@ -352,7 +356,7 @@ impl MergeState {
     /// The generation `win` (the winner of `p`) belongs to. Under the V3M3
     /// mutant switch, the v3 rule instead: the newest non-numeric base among
     /// the alive lives, even when it lost.
-    fn gen_in<'a>(
+    pub(super) fn gen_in<'a>(
         &'a self,
         p: &Path,
         al: &BTreeSet<MStamp>,
@@ -379,7 +383,7 @@ impl MergeState {
         self.counted_in(p, &al, win, o)
     }
 
-    fn counted_in(
+    pub(super) fn counted_in(
         &self,
         p: &Path,
         al: &BTreeSet<MStamp>,
