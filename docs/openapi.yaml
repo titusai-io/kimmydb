@@ -3881,9 +3881,18 @@ components:
             `find`'s plan keys and none of its measured ones: `strategy`
             (`idLookup`, `index`, `indexUnion`, `collectionScan`), `index`,
             `indexFieldsUsed`, `probes` (when more than one), plus `stages` (how
-            many leading stages the source took), `maxDocuments` (the pipeline's
-            ceiling) and, for a range plan that can be overtaken at run time, a
-            `note`. For `$vectorSearch`: `strategy: vectorIndex`, the
+            many leading stages the source took), `streams` (whether the source is
+            read a document at a time and none of it held, or whole),
+            `maxDocuments` (the pipeline's ceiling: **only when `streams` is
+            `false`**, and absent for a source that streams, which has none),
+            `holds` (in words, what the read holds), `sourceBound` (when a `$skip`
+            and `$limit` at the head of a streaming pipeline bound what it takes of
+            the source: `skip + limit`), `indexRange` (only for an index range read
+            whole to deliver its documents in `_id` order: what its keys are held
+            as) and, for a range plan that can be overtaken at run time, a
+            `note`. `streams`, `holds`, `sourceBound` and `indexRange` are new
+            (ADR-270); the other keys are unchanged. For `$vectorSearch`
+            (`streams` is `false`, and `holds` says the hits are held whole): `strategy: vectorIndex`, the
             collection's vector configuration (`configured`, `dimension`,
             `metric`, `embedsServerSide`) and `queryUsable`, whether a run would
             accept the query as sent. It reads no stored vector, so whether any
@@ -3910,10 +3919,12 @@ components:
         stages:
           type: array
           description: |
-            One entry for each stage after the source, in order. `$lookup` names
-            its strategy (`foreignScanHashed`, `foreignScanNestedLoop`), when it
-            reads the foreign collection, and, for the pipeline form, its own
-            `stages`, each marked `perInputDocument`.
+            One entry for each stage after the source, in order, of the pipeline
+            that runs (a `$skip` and `$limit` are listed where they run). `$lookup`
+            names its strategy (`foreignScanHashed`, `foreignScanNestedLoop`), when
+            it reads the foreign collection, and, for the pipeline form, its own
+            `stages`, each marked `perInputDocument`. Each entry says how the stage
+            runs (ADR-270): `hold`, `state`, `heapDocuments` and `foldedInto`, all new.
           items:
             type: object
             required: [stage, runs]
@@ -3921,6 +3932,31 @@ components:
               stage: { type: string }
               runs: { type: string }
               detail: { type: string }
+              hold:
+                type: string
+                enum: [streams, state, blocks]
+                description: |
+                  `streams` passes one document at a time and holds one; `state`
+                  needs all of its input but holds a state and not the input;
+                  `blocks` holds its whole input before it emits any output. Absent
+                  for the leading `$match` of a `$lookup` or `$unionWith`
+                  sub-pipeline, which the stage applies as it reads the foreign
+                  collection. An unrecognized value is one this client does not know
+                  about; new names are additive.
+              state:
+                type: string
+                enum: [counter, groups, heap, reservoir]
+                description: "What a stage with `hold` of `state` keeps."
+              heapDocuments:
+                type: integer
+                description: |
+                  For a heap (a `$sort` followed by a `$limit`, and an optional
+                  `$skip` between them): `skip + limit`, the most documents it holds.
+              foldedInto:
+                type: string
+                description: |
+                  On the `$skip` or `$limit` a heap stands for: the `$sort` that holds
+                  them. They hold nothing of their own.
 
     ClassState:
       type: string
