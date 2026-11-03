@@ -318,7 +318,8 @@ charges nothing that lasts, and the stages that keep a state charge the state as
 | `$group`, `$bucket`, `$sortByCount` | `the buckets of $group` (`$bucket`, `$sortByCount`): the groups and what each accumulator keeps | a group when it is made, a value when it is kept; held to the 100,000-document ceiling by the number of groups |
 | `$sort` followed by `$limit` (and a `$skip` between them) | `the heap of $sort`: the first `skip + limit` documents and their keys | a document when it is kept, given back when it is turned out |
 | `$sample` | `the reservoir of $sample`: the documents it will answer | a document when it is kept, given back when it is replaced |
-| `$sort` with no `$limit` after it, `$bucketAuto`, `$setWindowFields`, `$densify`, `$fill`, `$facet`, `$lookup`, `$graphLookup`, `$unionWith` | `the input of $sort` (and so on): all their input | each document as it reaches them |
+| `$sort` with no `$limit` after it | `the input of $sort`: all its input, and `the sort keys of $sort`: the keys it reads from each document, at the price the heap charges them | each document as it reaches it, its keys as they are read |
+| `$bucketAuto`, `$setWindowFields`, `$densify`, `$fill`, `$facet`, `$lookup`, `$graphLookup`, `$unionWith` | `the input of $sort` (and so on): all their input | each document as it reaches them |
 | the answer | `the output of the pipeline` as the documents arrive, then `the answer` | the documents, and the JSON built from them |
 
 So `[{$count: "n"}]`, `[{$limit: 5}]`, `[{$sort: ..}, {$limit: 10}]`, `[{$group: {_id: "$k", n:

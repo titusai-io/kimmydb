@@ -675,6 +675,7 @@ pub(crate) fn output_of(stage: &str) -> &'static str {
             "the output of $replaceRoot (with its input, still held)"
         }
         "$unwind" => "the output of $unwind (with its input, still held)",
+        "$sort" => "the sort keys of $sort (with its input, still held)",
         "$group" => "the buckets of $group (with its input, still held)",
         "$bucket" => "the buckets of $bucket (with its input, still held)",
         "$bucketAuto" => "the buckets of $bucketAuto (with its input, still held)",

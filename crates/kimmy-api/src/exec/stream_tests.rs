@@ -772,9 +772,12 @@ fn what_a_stage_that_blocks_hands_to_a_stage_that_streams_is_released_as_it_drai
         least >= input && least < input + input / 10,
         "answered under {least}, documents {input}"
     );
-    // What is full is the `$group`, which holds the padding it was given and not the input:
-    // the second `$project` held nothing of what it had taken.
-    assert!(err.message.contains("the buckets of $group is "), "{}", err.message);
+    // What is full under the least is the `$sort`, which holds its input and, since its keys
+    // are charged, the keys it read from it; it was the `$group` before, which holds the
+    // padding it was given and not the input. The `$group` needs no more than the `$sort`
+    // does, which the bound above pins: had the second `$project` held what it had taken, the
+    // documents would be held twice and the least budget would be twice the input.
+    assert!(err.message.contains("the sort keys of $sort "), "{}", err.message);
 }
 
 #[test]
