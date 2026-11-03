@@ -3883,8 +3883,10 @@ components:
             `indexFieldsUsed`, `probes` (when more than one), plus `stages` (how
             many leading stages the source took), `streams` (whether the source is
             read a document at a time and none of it held, or whole),
-            `maxDocuments` (the pipeline's ceiling: **only when `streams` is
-            `false`**, and absent for a source that streams, which has none),
+            `maxDocuments` (the pipeline's ceiling, unchanged: a source read
+            whole is held to it, and a source that streams has none of its own
+            but the ceiling still holds what a stage that blocks keeps and the
+            answer),
             `holds` (in words, what the read holds), `sourceBound` (when a `$skip`
             and `$limit` at the head of a streaming pipeline bound what it takes of
             the source: `skip + limit`), `indexRange` (only for an index range read

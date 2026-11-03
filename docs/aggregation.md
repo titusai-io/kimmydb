@@ -273,11 +273,12 @@ negative (`size argument to $sample must not be negative`), a value that is not 
 **The answer is in a random order**, `size` over the input included, so `{$sample: {size:
 <large>}}` shuffles, and a `$limit` after it picks at random.
 
-`$sample` takes the documents the pipeline holds, a reservoir over them, so **a collection
-of more than 100,000 documents cannot be sampled**: that is the pipeline's document limit,
-which holds on the input of every pipeline, `$sample` included, and is `400` naming the
-source (narrow it with a leading `$match`). It has no byte cap of its own. The random source
-is the operating system's, seeded afresh for every run.
+`$sample` keeps a reservoir of `size` documents and takes the source a document at a time, so
+**a collection of more than 100,000 documents can be sampled**: the pipeline's document limit
+holds what the reservoir keeps (a `size` over 100,000 is refused `400` once the input has that
+many documents, and a `size` over a smaller input is the whole input), not the input it reads.
+The reservoir is charged to the request's memory (`the reservoir of $sample`). The random
+source is the operating system's, seeded afresh for every run.
 
 ### `$redact`
 
@@ -2167,22 +2168,23 @@ examined or read.
 the ones the executor runs, after it has moved a `$skip` and a `$limit` ahead of the stages they may
 pass ([Deviations](deviations.md#skipped-documents-adr-270)), and the `hold` of each is not written apart from
 the executor: the executor builds its chain of stages from the same function (`pipeline::segments`)
-that `explain` reads, and a test holds the two to each other for every stage kind and for the fused
-shapes. The field names that were there are unchanged; the fields below are **new**.
+that `explain` reads, so the two do not differ; a test pins what each stage kind and each fused
+shape holds, written out apart from that function. The field names that were there are unchanged; the fields below are **new**.
 
 - **`source`** is the plan `find` would make for the leading `$match` (the same
   planner: `strategy`, `index`, `indexFieldsUsed`, `probes`), with `stages` saying
   how many leading stages it took. What a run holds of it is said by:
   - `streams` (new): `true` when the first stage after the leading `$match` streams or keeps a
-    state, so the source is read a document at a time, none of it is held, and **there is no
-    ceiling on how many documents it has**; `false` when that stage blocks (or there is none),
-    when the source is read whole.
-  - `maxDocuments` (kept, **now only when `streams` is `false`**): the ceiling of that read, the
-    100,000 documents of `the source read`, over which a run is refused `400`. A pipeline whose
-    first stage streams, or keeps a state, has none, and `maxDocuments` is absent: the ceiling
-    there is on what a stage that blocks holds and on the answer, which are said in the stages.
-    (It was reported for every pipeline, and for a source that streams that was not true.)
-  - `holds` (new): in words, what the read holds.
+    state, so the source is read a document at a time and none of it is held, with no ceiling of
+    its own on how many documents it has; `false` when that stage blocks (or there is none), when
+    the source is read whole.
+  - `maxDocuments` (unchanged): the pipeline's ceiling, 100,000 documents. A source read whole
+    (`streams: false`) is held to it, as `the source read`, and over it a run is refused `400`.
+    A source that streams has no such read, but the ceiling still holds what a stage that blocks
+    keeps and the answer, so it is reported for every filtered source.
+  - `holds` (new): in words, what the read holds; for a pipeline that takes no document of the
+    source (a window the reordering made of `$limit` then `$skip`) it says that none is read,
+    and there is no `indexRange`.
   - `sourceBound` (new, only when `streams`): the number of documents the pipeline takes of the
     source when that is known before it runs, because a `$skip` and a `$limit` are at its head
     (`skip + limit`, a window moved to the head included). The read ends there, and an inexact
@@ -2190,9 +2192,10 @@ shapes. The field names that were there are unchanged; the fields below are **ne
   - `indexRange` (new, only for an index range that is not one complete key or a union of them):
     that the range is read whole to deliver its documents in `_id` order, in time proportional to
     the range, and what its keys are held as: charged to the request's memory as `the index range
-    of $match`, bounded by `sourceBound` when there is one, and otherwise as large as the range
-    (a range too large is refused `413`). A `find` over the same range holds its keys as
-    `the index range of the filter`.
+    of $match`. With a `sourceBound` the range is read in passes of that many keys, and in larger
+    ones while the filter rejects what they find, up to the whole range; with none, every key of
+    the range is held while it is read. A range too large is refused `413`. A `find` over the same
+    range holds its keys as `the index range of the filter`.
 
   A range plan that used both ends carries a `note`: the scan re-checks the index
   when it runs and falls back to a collection scan if it has become multikey since.
@@ -2261,13 +2264,14 @@ bounded by `MAX_LIMIT`, but a pipeline's input is a whole collection, and a stag
 all of it, so without a ceiling one request could take all the memory on a node. [`explain`](#performance)
 says which a stage does.
 
-Every stage checks its output against a cap of **100,000 documents**, and
-exceeding it is an error naming the stage. **The ceiling applies to what the
-leading `$match` admits**, not to the collection: a pipeline over a million
-documents runs when its first `$match` selects fewer than 100,000 of them, and
-a pipeline with no leading `$match` over that collection is refused at the
-source, as it always was. The scan stops as soon as the ceiling is passed
-rather than materialising everything to refuse it.
+Every stage that holds documents checks them against a cap of **100,000 documents**, and
+exceeding it is an error naming the stage; the answer is held to it too. **A source read whole
+is held to it by what the leading `$match` admits**, not by the collection: a pipeline whose
+first stage blocks, over a million documents, runs when its first `$match` selects fewer than
+100,000 of them, and without a leading `$match` over that collection is refused at the source.
+The scan stops as soon as the ceiling is passed rather than materialising everything to refuse
+it. A pipeline whose first stage streams or keeps a state reads its source with no ceiling: only
+what a stage that blocks keeps, the groups, the heap and the answer count against it.
 
 ```json
 { "error": "bad_request",
