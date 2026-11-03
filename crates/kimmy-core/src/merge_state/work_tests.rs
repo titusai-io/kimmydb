@@ -102,3 +102,37 @@ fn the_clash_search_of_a_join_is_linear_in_the_cells() {
     assert_eq!(v1, 2 * 102);
     assert_eq!(v2, 2 * 202);
 }
+
+#[test]
+fn a_read_of_every_path_visits_each_cell_once_not_once_per_path() {
+    for n in [100, 200, 400] {
+        let mut w = wide(n);
+        w.write_inc(&p("c1"), 1, 0).unwrap();
+        let o = opts();
+        let cells = w.state.regs.len() + w.state.slots.len();
+        let (v, c) = count(|| w.state.visible(&o));
+        assert_eq!(v.unwrap().len(), n + 2);
+        assert_eq!(c.visits, cells, "visible, {n} fields");
+        let (_, c) = count(|| w.state.hidden_all(&o));
+        assert_eq!(c.visits, cells, "hidden_all, {n} fields");
+        let (_, c) = count(|| w.state.excess(&o));
+        assert_eq!(c.visits, cells, "excess, {n} fields");
+        let (_, c) = count(|| w.state.over_caps(&o));
+        assert_eq!(c.visits, cells, "over_caps, {n} fields");
+    }
+}
+
+#[test]
+fn a_read_of_one_path_looks_at_the_alive_lives_not_at_every_register() {
+    for n in [20, 400] {
+        let mut w = wide(n);
+        w.write_inc(&p("c1"), 1, 0).unwrap();
+        let o = opts();
+        let (v, c) = count(|| w.state.value(&p("c1"), &o));
+        assert_eq!(v, Some(Value::Int64(1)));
+        // one life: one lookup of its register and one range of its slots
+        assert_eq!(c.visits, 2, "{n} fields");
+        let (_, c) = count(|| w.state.hidden(&p("f001"), &o));
+        assert_eq!(c.visits, 2, "{n} fields");
+    }
+}
