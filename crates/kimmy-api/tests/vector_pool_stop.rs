@@ -18,6 +18,7 @@ use kimmy_core::{
     ChunkConfig, DocId, Metric, ProviderConfig, VectorConfig, VectorRecord, deadline,
 };
 use kimmy_storage::Engine;
+use kimmy_storage::walk::set_test_walk_row_delay;
 
 #[test]
 fn a_filtered_search_waiting_in_the_pool_for_its_ids_is_ended_by_the_stop() {
@@ -90,6 +91,9 @@ fn a_filtered_search_waiting_in_the_pool_for_its_ids_is_ended_by_the_stop() {
         assert!(started.elapsed() < Duration::from_secs(120), "the search never held the pool");
         std::thread::sleep(Duration::from_millis(1));
     }
+    // The rows it has left take a millisecond each, so that the request below has all the time
+    // it needs to take the rest of the pool before the search can have finished its ids.
+    set_test_walk_row_delay(Duration::from_millis(1));
     // A younger request takes the rest of the pool: retried if the search grew in between.
     let other = memory.limits();
     let young = loop {

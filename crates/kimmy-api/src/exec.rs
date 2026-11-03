@@ -2706,6 +2706,9 @@ impl kimmy_storage::KeyHold for IndexKeys<'_> {
     }
 
     fn give(&self, len: usize) {
+        // A lease that is kept stands at the most the request held; giving back from it would
+        // break that. Only a read that replaces its largest key gives one back.
+        debug_assert!(!self.keep, "a kept lease is given back only whole, by the request's end");
         let bytes = kimmy_query::budget::held_set_key(len).min(self.held.get());
         self.held.set(self.held.get() - bytes);
         self.keys.set(self.keys.get().saturating_sub(1));
@@ -2731,6 +2734,9 @@ impl kimmy_storage::MatchHold for IndexKeys<'_> {
     /// index range) holds its documents as it always has, uncharged, and the estimate is not
     /// worked out.
     fn take(&self, doc: &Document, body: usize) -> kimmy_core::Result<()> {
+        // The documents are charged for their growth past the lease, which only a kept lease
+        // has the mark for, and `give_all` below lets them go without releasing anything.
+        debug_assert!(self.keep, "the documents of a match are charged on a kept lease only");
         let mut account = self.account.borrow_mut();
         let Account::Open(lease) = &mut *account else {
             return Ok(());
