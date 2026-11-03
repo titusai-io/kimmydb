@@ -78,6 +78,14 @@ pub struct JoinOptions {
     /// Nested mutant: a write below a scalar or an array is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     write_below_scalar: bool,
+    /// The read side adds a cell's slots in key order instead of the canonical order
+    /// (stamp, then key): a `Double` or `Decimal128` total then depends on which writer
+    /// sorts first.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    sum_in_key_order: bool,
+    /// An `Int32` cell that outgrows the `i32` range saturates instead of becoming an `Int64`.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    int32_saturates: bool,
 }
 
 impl Default for JoinOptions {
@@ -114,6 +122,10 @@ impl Default for JoinOptions {
             rewrite_unchanged: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             write_below_scalar: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            sum_in_key_order: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            int32_saturates: false,
         }
     }
 }
@@ -173,6 +185,8 @@ impl JoinOptions {
     switch!(array_clash_as_clash, set_array_clash_as_clash, false);
     switch!(rewrite_unchanged, set_rewrite_unchanged, false);
     switch!(write_below_scalar, set_write_below_scalar, false);
+    switch!(sum_in_key_order, set_sum_in_key_order, false);
+    switch!(int32_saturates, set_int32_saturates, false);
 }
 
 /// The model's `_prefilter`: drop deletes and dead lives older than `h`.

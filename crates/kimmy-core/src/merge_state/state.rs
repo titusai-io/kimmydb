@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::counter::Num;
 use super::join::JoinOptions;
 use super::types::{InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
@@ -39,12 +40,12 @@ pub struct Life {
 pub struct Gen {
     pub stamp: MStamp,
     pub vv: Vv,
-    pub seen: BTreeMap<ObsKey, i128>,
+    pub seen: BTreeMap<ObsKey, Num>,
 }
 
 impl Gen {
     /// A generation started by the write `stamp`, with the totals it had seen.
-    pub(crate) fn start(stamp: MStamp, vv: &Vv, seen: BTreeMap<ObsKey, i128>) -> Self {
+    pub(crate) fn start(stamp: MStamp, vv: &Vv, seen: BTreeMap<ObsKey, Num>) -> Self {
         Gen { stamp, vv: mutant_vv(vv), seen }
     }
 }
@@ -73,7 +74,7 @@ fn mutant_vv(_: &Vv) -> Vv {
 pub struct Reg {
     pub stamp: MStamp,
     pub value: Value,
-    pub obs: BTreeMap<ObsKey, (MStamp, i128)>,
+    pub obs: BTreeMap<ObsKey, (MStamp, Num)>,
     pub generation: Option<Gen>,
     pub soi: bool,
 }
@@ -84,7 +85,7 @@ impl Reg {
     pub fn new(
         stamp: MStamp,
         value: Value,
-        obs: BTreeMap<ObsKey, (MStamp, i128)>,
+        obs: BTreeMap<ObsKey, (MStamp, Num)>,
         generation: Option<Gen>,
         soi: bool,
     ) -> Result<Self, InvalidValue> {
@@ -119,7 +120,7 @@ const _: () = assert!(MAX_TOTAL.checked_mul(128).is_some());
 #[derive(Clone, PartialEq, Debug)]
 pub struct Slot {
     pub stamp: MStamp,
-    pub total: i128,
+    pub total: Num,
 }
 
 /// The replicated merge state. Grow-only components are joined by union, cells
@@ -177,6 +178,19 @@ pub(crate) fn sub_ret(h: Hlc, ret: u64) -> Hlc {
 }
 
 impl MergeState {
+    /// Every counter amount the state holds: slot totals, the `obs` entries of the registers,
+    /// the `seen` entries of their generations, and the lost totals.
+    pub(crate) fn totals(&self) -> impl Iterator<Item = &Num> {
+        let regs = self.regs.values().flat_map(|r| {
+            r.obs.values().map(|(_, n)| n).chain(r.generation.iter().flat_map(|g| g.seen.values()))
+        });
+        let lost = self.losses.values().filter_map(|v| match v {
+            LossValue::Total(n) => Some(n),
+            _ => None,
+        });
+        self.slots.values().map(|s| &s.total).chain(regs).chain(lost)
+    }
+
     pub(crate) fn max_vv(&self) -> Hlc {
         self.vv.values().copied().max().unwrap_or(Hlc::ZERO)
     }
@@ -317,13 +331,16 @@ impl MergeState {
         let Some(g) = self.gen_in(p, al, win, o) else {
             return 0;
         };
+        // An integer figure: the amounts of the other types are not reported (provisional, see
+        // the module docs of `counter`).
         self.slots
             .iter()
             .filter(|((l, q, _, generation), _)| {
                 q == p && al.contains(l) && generation.is_none_or(|x| x < g.stamp)
             })
-            .map(|((l, _, w, generation), s)| {
-                s.total.saturating_sub(g.seen.get(&(*l, *w, *generation)).copied().unwrap_or(0))
+            .filter_map(|((l, _, w, generation), s)| {
+                let seen = g.seen.get(&(*l, *w, *generation)).and_then(Num::int).unwrap_or(0);
+                s.total.int().map(|t| t.saturating_sub(seen))
             })
             .fold(0i128, i128::saturating_add)
     }
@@ -355,28 +372,42 @@ impl MergeState {
         o: &JoinOptions,
     ) -> Option<Value> {
         let win = self.winner_in(p, al, o);
-        if let Some(w) = win
-            && !w.value.is_numeric()
-        {
-            return Some(w.value.clone());
-        }
-        let base = win
-            .and_then(|w| if let Value::Int64(i) = w.value { Some(i128::from(i)) } else { None });
-        let mut total = base.unwrap_or(0);
-        let mut seen = base.is_some();
+        // A base that is not a counter amount (a string, a map marker, ...) is the value.
+        let base = match win.map(|w| &w.value) {
+            Some(v) if !matches!(v, Value::Unset) => match Num::from_value(v) {
+                Some(n) => Some(n),
+                None => return Some(v.clone()),
+            },
+            _ => None,
+        };
+        // What each slot gained since the base observed it. B1: the field is present when the
+        // slot moved since the base saw it, even if its increments net to 0 (a counter back at
+        // 0 is still there).
+        let mut terms: Vec<(MStamp, ObsKey, Num)> = Vec::new();
         for (k, s) in self.counted_in(p, al, win, o) {
             let ob = win.and_then(|w| w.obs.get(&k));
-            let d = s.total.saturating_sub(ob.map_or(0, |x| x.1));
-            // B1: the field is present when the slot moved since the base saw it,
-            // even if its increments net to 0 (a counter back at 0 is still there).
-            if d != 0 || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.0 != s.stamp)) {
-                total = total.saturating_add(d);
-                seen = true;
+            let d = ob.map_or(s.total, |x| s.total.sub(&x.1));
+            if !d.is_zero() || (!o.value_ignores_slot_stamp() && ob.is_none_or(|x| x.0 != s.stamp))
+            {
+                terms.push((s.stamp, k, d));
             }
         }
+        // The canonical order (see `counter`): the base, then the slots by stamp and key.
+        if o.sum_in_key_order() {
+            terms.sort_by(|a, b| a.1.cmp(&b.1));
+        } else {
+            terms.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        }
+        if base.is_none() && terms.is_empty() {
+            return None;
+        }
+        let kind = terms.iter().map(|t| t.2.kind()).chain(base.map(|b| b.kind())).max()?;
+        let mut acc = base.map_or(Num::zero(kind), |b| b.to_kind(kind));
+        for (_, _, d) in &terms {
+            acc = acc.add(&d.to_kind(kind));
+        }
         // Q11: a merge that crosses either bound saturates.
-        let b = i128::from(o.int_bound());
-        seen.then(|| Value::Int64(total.clamp(-b - 1, b) as i64))
+        Some(acc.into_value(o.int_bound(), o.int32_saturates()))
     }
 
     /// The visible document, or `None` when no life is alive: every present path, in path order

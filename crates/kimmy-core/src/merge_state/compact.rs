@@ -16,7 +16,9 @@
 //! # Primitives
 //!
 //! * a count or length is a LEB128 varint of a `u64`, written in its shortest form;
-//! * a counter total is the zigzag of the `i128` as a LEB128 varint of a `u128`, shortest form;
+//! * a counter total is the zigzag of the `i128` as a LEB128 varint of a `u128`, shortest form,
+//!   for an `Int64` amount; any other type is the provisional escape `ESCAPE` of this module
+//!   (`Int32` the zigzag after it, `Double` its 8 bytes, `Decimal128` its 16 bytes);
 //! * a string is a length and its UTF-8 bytes; a [`Path`] is its segment count (at least 1) and
 //!   its segments as strings;
 //! * an `Int32`, `Int64` and `Date` and the parts of a `Timestamp` are fixed width big-endian, a
@@ -93,6 +95,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::codec::{DecodeError, MAGIC, MAX_VALUE_DEPTH, hash128, put, put_set};
+use super::counter::Num;
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 use super::types::{Epoch, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
@@ -100,6 +103,13 @@ use crate::ids::NodeId;
 
 /// The format version byte of this form.
 const VERSION: u8 = 2;
+
+/// The first `u128` a counter total never takes as a zigzag (they stop at `2 * MAX_TOTAL`, below
+/// 2^121): `ESCAPE + 1` introduces an `Int32` total, `+ 2` a `Double`, `+ 3` a `Decimal128`.
+/// PROVISIONAL: it keeps the bytes of every `Int64` total exactly as they were, at 18 bytes
+/// for the marker, until the counter cell layout is ruled (the `absorbed` rule) and the type
+/// gets a place of its own in the slot and the `obs` entry.
+const ESCAPE: u128 = 1 << 121;
 
 // ---- writing ---------------------------------------------------------------
 
@@ -143,9 +153,25 @@ impl W {
     fn i64(&mut self, v: i64) {
         self.out.extend_from_slice(&v.to_be_bytes());
     }
-    /// A counter total: zigzag, then a varint.
-    fn total(&mut self, v: i128) {
-        self.varint(((v << 1) ^ (v >> 127)) as u128);
+    /// A counter total: for an `Int64` amount the zigzag, then a varint; any other type is
+    /// the escape [`ESCAPE`] plus the type, then its payload (see [`Num`] and `# Primitives`).
+    fn total(&mut self, n: &Num) {
+        let zigzag = |w: &mut Self, v: i128| w.varint(((v << 1) ^ (v >> 127)) as u128);
+        match n {
+            Num::Int64(v) => zigzag(self, *v),
+            Num::Int32(v) => {
+                self.varint(ESCAPE | 1);
+                zigzag(self, *v);
+            }
+            Num::Double(d) => {
+                self.varint(ESCAPE | 2);
+                self.out.extend_from_slice(&d.to_bits().to_be_bytes());
+            }
+            Num::Decimal128(b) => {
+                self.varint(ESCAPE | 3);
+                self.out.extend_from_slice(b);
+            }
+        }
     }
     fn str(&mut self, s: &str) {
         self.len(s.len());
@@ -275,19 +301,19 @@ impl W {
         self.wid(w);
         self.opt_stamp(g);
     }
-    fn obs(&mut self, m: &BTreeMap<ObsKey, i128>) {
+    fn obs(&mut self, m: &BTreeMap<ObsKey, Num>) {
         self.len(m.len());
         for (k, t) in m {
             self.obs_key(k);
-            self.total(*t);
+            self.total(t);
         }
     }
-    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, i128)>) {
+    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, Num)>) {
         self.len(m.len());
         for (k, (s, t)) in m {
             self.obs_key(k);
             self.stamp(s);
-            self.total(*t);
+            self.total(t);
         }
     }
     fn loss_key(&mut self, k: &LossKey) {
@@ -316,7 +342,7 @@ impl W {
             }
             LossValue::Total(t) => {
                 self.u8(1);
-                self.total(*t);
+                self.total(t);
             }
             LossValue::Fields(f) => {
                 self.u8(2);
@@ -397,7 +423,7 @@ impl MergeState {
             w.wid(wr);
             w.opt_stamp(g);
             w.stamp(&s.stamp);
-            w.total(s.total);
+            w.total(&s.total);
         }
         w.vv(&self.vv);
         w.len(self.losses.len());
@@ -608,14 +634,30 @@ impl R<'_> {
     fn i64(&mut self) -> Result<i64, DecodeError> {
         Ok(i64::from_be_bytes(self.arr()?))
     }
-    /// A counter total: a zigzag `u128` varint, of magnitude at most [`MAX_TOTAL`] (see there).
-    fn total(&mut self) -> Result<i128, DecodeError> {
-        let z = self.varint(19)?;
+    /// A zigzag `u128` as an integer total, of magnitude at most [`MAX_TOTAL`] (see there).
+    fn zigzag(z: u128) -> Result<i128, DecodeError> {
         let t = ((z >> 1) as i128) ^ -((z & 1) as i128);
         if t.unsigned_abs() > MAX_TOTAL.unsigned_abs() {
             return Err(DecodeError::TotalOutOfRange);
         }
         Ok(t)
+    }
+    /// A counter total, as `W::total` writes it.
+    fn total(&mut self) -> Result<Num, DecodeError> {
+        let z = self.varint(19)?;
+        if z < ESCAPE {
+            return Ok(Num::Int64(Self::zigzag(z)?));
+        }
+        match z - ESCAPE {
+            1 => {
+                let z = self.varint(19)?;
+                Ok(Num::Int32(Self::zigzag(z)?))
+            }
+            2 => Ok(Num::Double(f64::from_bits(u64::from_be_bytes(self.arr()?)))),
+            3 => Ok(Num::Decimal128(self.arr()?)),
+            // not an escape: a zigzag past the bound
+            _ => Err(DecodeError::TotalOutOfRange),
+        }
     }
     fn str(&mut self) -> Result<String, DecodeError> {
         let n = self.len()?;
@@ -759,7 +801,7 @@ impl R<'_> {
         let w = self.wid()?;
         Ok((l, w, self.opt_stamp()?))
     }
-    fn obs(&mut self) -> Result<BTreeMap<ObsKey, i128>, DecodeError> {
+    fn obs(&mut self) -> Result<BTreeMap<ObsKey, Num>, DecodeError> {
         let mut m = BTreeMap::new();
         for _ in 0..self.len()? {
             let k = self.obs_key()?;
@@ -767,7 +809,7 @@ impl R<'_> {
         }
         Ok(m)
     }
-    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, i128)>, DecodeError> {
+    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, Num)>, DecodeError> {
         let mut m = BTreeMap::new();
         for _ in 0..self.len()? {
             let k = self.obs_key()?;

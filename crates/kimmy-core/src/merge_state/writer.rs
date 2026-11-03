@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use super::counter::Num;
 use super::join::{JoinOptions, join};
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot};
 use super::types::{InvalidPath, LossKey, LossValue, MStamp, Path, Value, WriterId};
@@ -270,7 +271,7 @@ impl Writer {
 
     /// V5m1: every slot total of `p` (any generation, alive lives) as this
     /// writer sees it, kept with a generation it starts.
-    fn seen(&self, p: &Path) -> BTreeMap<ObsKey, i128> {
+    fn seen(&self, p: &Path) -> BTreeMap<ObsKey, Num> {
         let al = self.state.alive_set(self.opts.retention);
         self.state
             .slots
@@ -280,7 +281,7 @@ impl Writer {
             .collect()
     }
 
-    fn obs(&self, p: &Path) -> BTreeMap<ObsKey, (MStamp, i128)> {
+    fn obs(&self, p: &Path) -> BTreeMap<ObsKey, (MStamp, Num)> {
         self.state
             .counted(p, &self.opts)
             .into_iter()
@@ -692,9 +693,10 @@ impl Writer {
         }
         let st2 = self.mint(m)?;
         self.state.vv.insert(st2.writer, st2.hlc);
-        self.state
-            .slots
-            .insert((life, path.clone(), self.id, None), Slot { stamp: st2, total: i128::from(n) });
+        self.state.slots.insert(
+            (life, path.clone(), self.id, None),
+            Slot { stamp: st2, total: Num::from(i128::from(n)) },
+        );
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.clone()]);
         rec.n = Some(n);
         Some(self.finish(st2, rec))
@@ -715,7 +717,10 @@ impl Writer {
                 kind: LifeKind::Upsert,
             },
         );
-        s.slots.insert((st, path.clone(), self.id, None), Slot { stamp: st, total: i128::from(n) });
+        s.slots.insert(
+            (st, path.clone(), self.id, None),
+            Slot { stamp: st, total: Num::from(i128::from(n)) },
+        );
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), vec![path.clone()]);
         rec.n = Some(n);
         rec.insert = true;
@@ -833,7 +838,7 @@ impl Writer {
         let l = self.write_life()?;
         let generation = self.state.gen_of(p, &self.opts).map(|g| g.stamp);
         let key = (l, p.clone(), self.id, generation);
-        let old = self.state.slots.get(&key).map_or(0, |s| s.total);
+        let old = self.state.slots.get(&key).and_then(|s| s.total.int()).unwrap_or(0);
         // The slot is this writer's running sum, which the saturated check above does not
         // bound; refuse the `$inc` that would carry it past `MAX_TOTAL`.
         let total = old.saturating_add(i128::from(n));
@@ -842,7 +847,7 @@ impl Writer {
         }
         let st = self.mint(m)?;
         self.state.vv.insert(st.writer, st.hlc);
-        self.state.slots.insert(key, Slot { stamp: st, total });
+        self.state.slots.insert(key, Slot { stamp: st, total: Num::from(total) });
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(l), vec![p.clone()]);
         rec.n = Some(n);
         rec.generation = generation;
@@ -905,7 +910,8 @@ impl Writer {
             return false;
         }
         // A total past `MAX_TOTAL` is one `decode` refuses: never store a state that cannot be read back.
-        if matches!(val, LossValue::Total(t) if t.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
+        if matches!(val, LossValue::Total(t) if t.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()))
+        {
             return false;
         }
         self.state.losses.insert(key, val);

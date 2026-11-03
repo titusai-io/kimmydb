@@ -116,7 +116,7 @@ fn every_bson_type_and_odd_names_round_trip_in_the_compact_form() {
     {
         st.losses.insert(
             LossKey::field(kind, p("f06"), *st.lives.keys().next().unwrap()),
-            LossValue::Total(k as i128 - 1),
+            LossValue::Total((k as i128 - 1).into()),
         );
     }
     round_trip(&st);
@@ -381,7 +381,7 @@ fn slot_state(total: i128) -> MergeState {
     w.upsert_inc(&p("x"), 1, 0).unwrap();
     let mut st = w.state;
     for s in st.slots.values_mut() {
-        s.total = total;
+        s.total = total.into();
     }
     st
 }

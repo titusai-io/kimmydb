@@ -44,6 +44,7 @@
 
 mod codec;
 mod compact;
+mod counter;
 mod join;
 mod state;
 mod types;
@@ -59,6 +60,7 @@ mod prop_tests;
 mod tests;
 
 pub use codec::{DecodeError, V1CannotHold};
+pub use counter::Num;
 pub use join::{InvalidIntBound, JoinOptions, join};
 pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 pub use types::{
@@ -108,7 +110,7 @@ const _: () = {
     let _: fn(
         MStamp,
         Value,
-        BTreeMap<ObsKey, (MStamp, i128)>,
+        BTreeMap<ObsKey, (MStamp, Num)>,
         Option<Gen>,
         bool,
     ) -> Result<Reg, InvalidValue> = Reg::new;

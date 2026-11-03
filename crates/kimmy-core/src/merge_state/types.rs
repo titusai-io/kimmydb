@@ -434,7 +434,7 @@ pub enum LossValue {
     /// A lost register value.
     Value(Value),
     /// A lost counter slot total.
-    Total(i128),
+    Total(super::Num),
     /// The field order of a lost whole document (`insertLost` on `"_"`).
     Fields(Vec<Path>),
 }
