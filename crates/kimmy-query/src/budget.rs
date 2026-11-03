@@ -621,6 +621,15 @@ impl Lease {
         inner.settle();
     }
 
+    /// The same account under another name, for a holder that is handed what another charged
+    /// (the answer is charged from the output of the pipeline, which the chain's end held):
+    /// the bytes stay charged, and a refusal from now on names `what`.
+    #[must_use]
+    pub fn renamed(mut self, what: &'static str) -> Lease {
+        self.what = what;
+        self
+    }
+
     /// The bytes this lease holds.
     pub fn bytes(&self) -> usize {
         self.own

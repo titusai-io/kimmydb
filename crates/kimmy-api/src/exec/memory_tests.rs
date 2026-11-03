@@ -551,3 +551,64 @@ fn a_big_answer_is_written_in_full_chunks_that_concatenate_to_the_value() {
     );
     drop(hold);
 }
+
+#[test]
+fn a_refusal_inside_a_facet_branch_or_a_sub_pipeline_does_not_name_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    // The branch or the sub-pipeline doubles its documents as it streams them to the end of its
+    // chain, which holds them, and is refused there. The request's answer is not what is full.
+    let state = state_with(&dir, padded(10, 10_000), padded(10, 10_000));
+    let small = tempfile::tempdir().unwrap();
+    let joined = state_with(&small, padded(1, 100), padded(10, 10_000));
+    let double = json!({"$addFields": {"c": "$pad"}});
+    let unnamed = |err: &ApiError| {
+        assert!(!err.message.contains("the output of the pipeline"), "{}", err.message);
+    };
+
+    let facet = json!([{"$facet": {"a": [double.clone()]}}]);
+    let err = refusal(run(&state, facet, capped(150_000)));
+    names(&err, "the output of a $facet branch is ");
+    unnamed(&err);
+
+    let lookup = json!([{"$lookup": {"from": "users", "let": {}, "as": "u",
+        "pipeline": [double.clone()]}}]);
+    let err = refusal(run(&joined, lookup, capped(300_000)));
+    names(&err, "the output of a sub-pipeline is ");
+    unnamed(&err);
+
+    let union = json!([{"$unionWith": {"coll": "users", "pipeline": [double.clone()]}}]);
+    let err = refusal(run(&joined, union, capped(150_000)));
+    names(&err, "the output of a sub-pipeline is ");
+    unnamed(&err);
+
+    // The request's own pipeline is still named for the answer it builds.
+    let err = refusal(run(&state, json!([double]), capped(150_000)));
+    names(&err, "the output of the pipeline is ");
+}
+
+#[test]
+fn the_answer_takes_over_the_lease_that_charged_the_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(&dir, vec![], vec![]);
+    // A limit the documents alone pass: the JSON built from them is under it, so an answer
+    // that took the output as charged (by the lease it is handed) is built, and one that
+    // charged the documents afresh is refused at them.
+    let docs = padded(5, 1000);
+    let limits = capped(held_docs_bytes(&docs) - 1);
+    let handed = limits.buffer.lease("the output of the pipeline");
+    let (answer, _, hold) =
+        conclude(&state, (docs.clone(), Some(handed)), &limits, None, None, Shape::Value)
+            .expect("the output was charged by the lease handed over");
+    assert_eq!(answer.into_value()["count"], 5);
+    let hold = hold.expect("the answer's lease is held until it is sent");
+    assert!(hold.bytes() > 0 && limits.buffer.used() == hold.bytes());
+    drop(hold);
+    assert_eq!(limits.buffer.used(), 0);
+
+    // With no lease the documents are charged now, as `the answer`.
+    let err = conclude(&state, (docs, None), &limits, None, None, Shape::Value)
+        .map(|_| ())
+        .expect_err("charged afresh, they pass the limit");
+    names(&err, "the answer is ");
+    assert_eq!(limits.buffer.used(), 0);
+}

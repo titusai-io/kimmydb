@@ -292,8 +292,27 @@ pub fn build<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, true, &system_below)
+    build_by(stages, run, limits, vars, true, &system_below, OUTPUT)
 }
+
+/// How the end of a chain is named in a refusal for the bytes it holds: the output of the
+/// pipeline the request answers, which the answer is built from (ADR-269).
+pub const OUTPUT: &str = "the output of the pipeline";
+
+/// [`build`] for a pipeline that is not the request's: a `$facet` branch or the sub-pipeline of
+/// a `$lookup` or `$unionWith`. Its documents are held at the end of the chain as the
+/// request's are, and `output` is what a refusal for them names, so that one inside a
+/// sub-pipeline does not read as the request's answer.
+pub fn build_into<'a, E: From<Error> + 'a>(
+    stages: &'a [Stage],
+    run: Runner<'a, E>,
+    limits: &'a Limits,
+    vars: &'a [Binding<'a>],
+    output: &'static str,
+) -> Chain<'a, E> {
+    build_by(stages, run, limits, vars, true, &system_below, output)
+}
+
 /// A source of random positions for each `$sample` of a chain ([`stages::Below`]): a function
 /// that makes one.
 pub type BelowSource<'a> = &'a dyn Fn() -> Box<dyn FnMut(usize) -> usize + 'a>;
@@ -312,7 +331,7 @@ pub fn build_with<'a, E: From<Error> + 'a>(
     vars: &'a [Binding<'a>],
     below: BelowSource<'a>,
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, true, below)
+    build_by(stages, run, limits, vars, true, below, OUTPUT)
 }
 
 /// [`build`] with every stage a [`Barrier`], as the chain was first built (ADR-270, P0): it
@@ -324,7 +343,7 @@ pub fn build_barriers<'a, E: From<Error> + 'a>(
     limits: &'a Limits,
     vars: &'a [Binding<'a>],
 ) -> Chain<'a, E> {
-    build_by(stages, run, limits, vars, false, &system_below)
+    build_by(stages, run, limits, vars, false, &system_below, OUTPUT)
 }
 
 /// [`build`] when `streaming`, and [`build_barriers`] when not.
@@ -335,9 +354,10 @@ fn build_by<'a, E: From<Error> + 'a>(
     vars: &'a [Binding<'a>],
     streaming: bool,
     below: BelowSource<'a>,
+    output: &'static str,
 ) -> Chain<'a, E> {
     let last = stages.last().map_or("the source", Stage::name);
-    let out = Rc::new(RefCell::new(Collected::new("the output of the pipeline", last, limits)));
+    let out = Rc::new(RefCell::new(Collected::new(output, last, limits)));
     let mut head: Link<'a, E> = Box::new(Collector { out: Rc::clone(&out) });
     // From the end, each sink owns the one after it.
     for Segment { stages: at, hold } in segments_by(stages, streaming).into_iter().rev() {
@@ -385,14 +405,21 @@ impl<'a, E: From<Error>> Chain<'a, E> {
 
     /// The source is complete: finish every sink in order, and answer what came out of the
     /// last. The first sink to fail ends it, and the ones after it have run nothing.
-    pub fn finish(mut self) -> Result<Vec<Document>, E> {
+    pub fn finish(self) -> Result<Vec<Document>, E> {
+        self.finish_held().map(|(docs, _lease)| docs)
+    }
+
+    /// [`Chain::finish`], also handing over the lease that charged the output as it arrived,
+    /// if it did: every document of the output is charged to it, and its bytes stay in the
+    /// request's budget until it is dropped. `None` when the output came whole to the end of
+    /// the chain and nothing was charged on arrival.
+    pub fn finish_held(mut self) -> Result<(Vec<Document>, Option<Lease>), E> {
         let mut at: Option<&mut dyn Sink<'a, E>> = Some(&mut *self.head);
         while let Some(sink) = at {
             sink.finish()?;
             at = sink.next_mut();
         }
-        let (docs, _lease) = self.out.borrow_mut().take();
-        Ok(docs)
+        Ok(self.out.borrow_mut().take())
     }
 }
 
@@ -2474,5 +2501,70 @@ mod tests {
             parsed(&[doc! {"$match": {"g": 1}}, doc! {"$sort": {"g": 1}}, doc! {"$limit": 3}]);
         assert_eq!(segments_by(&stages, false).len(), stages.len());
         assert!(segments_by(&stages, false).iter().all(|segment| segment.hold == Hold::Blocks));
+    }
+
+    #[test]
+    fn the_end_of_a_chain_hands_over_the_lease_that_charged_its_output() {
+        let limits = Limits::default();
+        let stages = parsed(&[doc! {"$project": {"g": 1}}]);
+        // Documents that arrive one at a time are charged as they do, and the lease is the
+        // caller's to keep: the output is not walked a second time to be charged again.
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        for doc in laid_out(4) {
+            let _ = chain.push(doc).unwrap();
+        }
+        let (docs, lease) = chain.finish_held().unwrap();
+        let lease = lease.expect("charged as the documents arrived");
+        assert_eq!(docs.len(), 4);
+        assert_eq!(lease.bytes(), held_docs_bytes(&docs));
+        assert_eq!(limits.buffer.used(), lease.bytes(), "the bytes are still charged");
+        // Another holder's name, and the same bytes.
+        let lease = lease.renamed("the answer");
+        assert_eq!(limits.buffer.used(), held_docs_bytes(&docs));
+        drop(lease);
+        assert_eq!(limits.buffer.used(), 0);
+
+        // `finish` is `finish_held` that gives the lease back.
+        let mut chain = build(&stages, &unused, &limits, &[]);
+        let _ = chain.push_all(laid_out(4)).unwrap();
+        let docs = chain.finish().unwrap();
+        assert_eq!((docs.len(), limits.buffer.used()), (4, 0));
+
+        // A `Vec` that reaches the end whole (a stage that blocks answered it) was charged by
+        // nothing here, and there is no lease to hand over.
+        let stages = vec![sort()];
+        let run = |_: &Stage, input: Vec<Document>, _: Option<Lease>| Ok::<_, Error>(input);
+        let mut chain = build(&stages, &run, &limits, &[]);
+        let _ = chain.push_all(laid_out(4)).unwrap();
+        let (docs, lease) = chain.finish_held().unwrap();
+        assert!(lease.is_none() && docs.len() == 4);
+    }
+
+    #[test]
+    fn the_end_of_a_chain_is_named_for_the_pipeline_it_ends() {
+        let stages = parsed(&[doc! {"$limit": 100}]);
+        let one = held_docs_bytes(&laid_out(1));
+        let refused = |output: Option<&'static str>| {
+            let limits = Limits { buffer: BufferBudget::new(2 * one), ..Limits::default() };
+            let mut chain = match output {
+                Some(name) => build_into(&stages, &unused, &limits, &[], name),
+                None => build(&stages, &unused, &limits, &[]),
+            };
+            laid_out(4).into_iter().find_map(|doc| chain.push(doc).err()).expect("refused")
+        };
+        let what = |err: Error| match err {
+            Error::ValueTooLarge { what, .. } => what,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(what(refused(None)), "the output of the pipeline");
+        assert_eq!(what(refused(Some(OUTPUT))), "the output of the pipeline");
+        assert_eq!(
+            what(refused(Some("the output of a sub-pipeline"))),
+            "the output of a sub-pipeline"
+        );
+        assert_eq!(
+            what(refused(Some("the output of a $facet branch"))),
+            "the output of a $facet branch"
+        );
     }
 }
