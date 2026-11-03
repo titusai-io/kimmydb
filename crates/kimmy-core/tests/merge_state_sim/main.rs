@@ -147,6 +147,19 @@ fn horizon(rep: &mut Report, n: u64, ret: u64, steps: usize, label: &str) {
     rep.check(&what, &c);
 }
 
+/// A seed of the bounded runs (RET 40, a fixpoint every 3 steps, 80 steps) that FAILS and is known
+/// to, with the problems it fails with. The runner names each one it meets in its output as a
+/// known failure, and fails if one stops failing as listed (take it off the list then) or if any
+/// other seed fails. Each has an `#[ignore]`d test that asserts it passes, and the cause and the
+/// item that flips it are written at its entry.
+struct KnownBoundedFailure {
+    nested: bool,
+    seed: u64,
+    problems: &'static [&'static str],
+}
+
+const KNOWN_BOUNDED_FAILURES: [KnownBoundedFailure; 0] = [];
+
 fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize, nested: bool) {
     let t0 = Instant::now();
     let cfg = Cfg::default_ret();
@@ -155,8 +168,31 @@ fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize, 
     for seed in 0..n {
         let (o, gap) = run_bounded(seed, &cfg, ret, sync_every, steps, nested);
         gap_max = gap_max.max(gap);
-        for e in grade_bounded(&o.nodes, &o.log) {
-            bump(&mut c, e, seed);
+        let problems = grade_bounded(&o.nodes, &o.log);
+        // a seed listed above is expected to fail as listed, and is named in the output; one
+        // that stops failing must be taken off the list
+        let known = (ret == 40 && sync_every == 3 && steps == 80)
+            .then(|| KNOWN_BOUNDED_FAILURES.iter().find(|k| k.nested == nested && k.seed == seed))
+            .flatten();
+        match known {
+            Some(k) if problems == k.problems => println!(
+                "  KNOWN FAILURE (the covered-entry skip port, before Step 3): bounded RET={ret}, {} workload, seed {seed}: {problems:?}",
+                if nested { "nested" } else { "flat" }
+            ),
+            Some(k) => bump(
+                &mut c,
+                format!(
+                    "known failure {} seed {seed} no longer fails as listed: {problems:?}, listed {:?}",
+                    if nested { "nested" } else { "flat" },
+                    k.problems
+                ),
+                seed,
+            ),
+            None => {
+                for e in problems {
+                    bump(&mut c, e, seed);
+                }
+            }
         }
     }
     if gap_max >= ret {
@@ -324,4 +360,27 @@ fn states_and_reads_match_the_pinned_fingerprints() {
         ("bounded nested", 0xef2642a60e4e5c72),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
+}
+
+/// The bounded run of `seed` on the given workload, at the runner's parameters.
+fn bounded_problems(seed: u64, nested: bool, covered_skip: bool) -> Vec<String> {
+    let mut cfg = Cfg::default_ret();
+    cfg.flags.covered_skip = covered_skip;
+    let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+    grade_bounded(&o.nodes, &o.log)
+}
+
+/// Each known failure fails as listed, and passes once the sim skips an entry the receiver's
+/// version vector covers: the evidence for the cause named at `KNOWN_BOUNDED_FAILURES`.
+#[test]
+fn the_known_bounded_failures_pass_with_the_covered_entry_skip() {
+    for k in &KNOWN_BOUNDED_FAILURES {
+        assert_eq!(bounded_problems(k.seed, k.nested, false), k.problems, "seed {}", k.seed);
+        assert_eq!(
+            bounded_problems(k.seed, k.nested, true),
+            Vec::<String>::new(),
+            "seed {}",
+            k.seed
+        );
+    }
 }

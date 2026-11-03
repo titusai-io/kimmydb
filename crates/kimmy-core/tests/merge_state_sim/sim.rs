@@ -63,6 +63,13 @@ pub struct SimFlags {
     /// again (v4's behaviour). `LossKind` has no hidden kind, so the stand-in is
     /// `RetiredWriter`, which P0 never produces.
     pub hidden_records: bool,
+    /// The covered-entry skip of the real protocol (Q3): an entry whose stamp the receiver's
+    /// version vector already covers is not applied again, only witnessed. NOT in the sim's
+    /// protocol yet (off, the design of the sim): without it a pull window re-sends an old entry
+    /// that the receiver already holds, and after the horizon has collected a delete that
+    /// entry brings a life the delete killed back to life (the known failures of the bounded
+    /// runs, see `main.rs`). On, those runs pass.
+    pub covered_skip: bool,
 }
 
 impl Default for SimFlags {
@@ -76,6 +83,7 @@ impl Default for SimFlags {
             drop_kind: None,
             report_neither: false,
             hidden_records: false,
+            covered_skip: false,
         }
     }
 }
@@ -341,6 +349,14 @@ impl Node {
     }
 
     pub fn receive_entry(&mut self, ent: &Rc<Ent>) {
+        if self.flags.covered_skip
+            && let Ent::W { st, .. } = &**ent
+            && get(&self.w.state.vv, &st.writer) >= st.hlc
+        {
+            let o = self.origin(*st);
+            raise(&mut self.witnessed, o, st.hlc);
+            return;
+        }
         match &**ent {
             Ent::W { st, state, contained } => {
                 if self.absorb(state, contained, true) && !self.oplog.contains_key(st) {
