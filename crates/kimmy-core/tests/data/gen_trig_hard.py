@@ -158,8 +158,9 @@ def function_rows():
     # the ratio is a midpoint of the 34-digit grid: 35 digits ending in a 5 (an odd y over 2, 4
     # or 8 -- here 2 -- or an even y over 5...). Its arctangent is the ratio less r^3/3, so the
     # 34-digit answer is the neighbour below it (in magnitude), never half-even's choice.
-    # The y below ends ...875: half to even of the exact ratio would round the 7 up to 8.
-    for gap in (81, 82, 100, 300, 2000):
+    # The y below ends ...875: half to even of the exact ratio would round the 7 up to 8. Gaps 60 to
+    # 80 are answered by the full series, 81 and more by the ratio itself: both give the lower neighbour.
+    for gap in (60, 79, 80, 81, 82, 100, 300, 2000):
         ytext = f"9.876543210987654321098765432109875E{-18 - gap}"
         xtext = "2E-18"
         for sign in ("", "-"):
