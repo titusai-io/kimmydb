@@ -1119,8 +1119,8 @@ fn golden_encode_bytes_round_trip() {
 
 #[test]
 fn q4_same_helper() {
-    assert!(Value::same(None, &Value::Null), "missing is Null");
-    assert!(Value::same(Some(&Value::Null), &Value::Null));
+    assert!(Value::same(None, &Value::Unset), "missing is Unset");
+    assert!(Value::same(Some(&Value::Unset), &Value::Unset));
     assert!(!Value::same(None, &i(0)));
     assert!(!Value::same(Some(&i(2)), &f(2.0)), "2 is not 2.0");
     assert!(!Value::same(Some(&f(2.0)), &i(2)));
@@ -1139,11 +1139,11 @@ fn q4_set_compares_value_and_type() {
     assert!(w.write_set(&p("x"), i(2), 0).is_none(), "same type and value is a no-op");
     assert!(w.write_set(&p("x"), f(2.0), 0).is_some(), "and back");
     assert!(w.write_set(&p("k"), s("1"), 0).is_some());
-    // Null versus missing: setting a missing path to Null is a no-op, a stored value to Null is a write.
-    assert!(w.write_set(&p("absent"), Value::Null, 0).is_none());
-    assert!(w.write_set(&p("k"), Value::Null, 0).is_some());
+    // Unset versus missing: unsetting a missing path is a no-op, a stored value is a write.
+    assert!(w.write_set(&p("absent"), Value::Unset, 0).is_none());
+    assert!(w.write_set(&p("k"), Value::Unset, 0).is_some());
     assert!(!w.visible().unwrap().contains_key(&p("k")));
-    assert!(w.write_set(&p("k"), Value::Null, 0).is_none(), "now missing again");
+    assert!(w.write_set(&p("k"), Value::Unset, 0).is_none(), "now missing again");
     assert!(w.write_unset(&p("k"), 0).is_none());
 }
 
@@ -1154,9 +1154,9 @@ fn q4_replace_compares_value_and_type() {
     assert!(w.write_replace(&fl(&[("x", f(2.0)), ("y", s("t"))]), 0).is_none());
     let r = w.write_replace(&fl(&[("x", i(2)), ("y", s("t"))]), 0).unwrap();
     assert_eq!(r.record.paths, vec![p("x")], "only the retyped field changes");
-    // A Null in the new document over a missing path is not a change; over a stored one it is.
-    assert!(w.write_replace(&fl(&[("x", i(2)), ("y", s("t")), ("z", Value::Null)]), 0).is_none());
-    let r = w.write_replace(&fl(&[("x", i(2)), ("y", Value::Null)]), 0).unwrap();
+    // An unset field in the new document over a missing path is not a change; over a stored one it is.
+    assert!(w.write_replace(&fl(&[("x", i(2)), ("y", s("t")), ("z", Value::Unset)]), 0).is_none());
+    let r = w.write_replace(&fl(&[("x", i(2)), ("y", Value::Unset)]), 0).unwrap();
     assert_eq!(r.record.paths, vec![p("y")]);
     assert_eq!(w.visible(), doc(&[("x", i(2))]));
     // Fields absent from the new document are dropped.
@@ -1639,6 +1639,7 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
 /// One value of every type, the array holding a nested array.
 fn every_type() -> Vec<(&'static str, Value)> {
     vec![
+        ("unset", Value::Unset),
         ("null", Value::Null),
         ("i32", Value::Int32(-7)),
         ("i64", Value::Int64(1 << 40)),
@@ -1651,7 +1652,10 @@ fn every_type() -> Vec<(&'static str, Value)> {
         ("bin", Value::Binary { subtype: 0x80, bytes: vec![0, 1, 255] }),
         ("ts", Value::Timestamp { time: u32::MAX, increment: 3 }),
         ("re", Value::Regex { pattern: "^a.*".into(), options: "ix".into() }),
-        ("arr", Value::Array(vec![i(1), Value::Array(vec![s("x"), Value::Null]), f(0.5)])),
+        (
+            "arr",
+            Value::Array(vec![i(1), Value::Array(vec![s("x"), Value::Null, Value::Unset]), f(0.5)]),
+        ),
     ]
 }
 
@@ -1659,7 +1663,7 @@ fn every_type() -> Vec<(&'static str, Value)> {
 fn every_bson_type_is_stored_read_back_and_round_trips() {
     let mut w = Writer::new(wid('A', 0), opts());
     let fields = every_type();
-    let fields: Vec<(&str, Value)> = fields.into_iter().filter(|(k, _)| *k != "null").collect();
+    let fields: Vec<(&str, Value)> = fields.into_iter().filter(|(k, _)| *k != "unset").collect();
     w.insert(&fl(&fields), 0).unwrap();
     let vis = w.visible().unwrap();
     for (k, v) in &fields {
@@ -1732,7 +1736,7 @@ fn arrays_compare_element_by_element_and_type_for_type() {
 #[test]
 fn only_null_and_int64_are_numeric() {
     for (k, v) in every_type() {
-        assert_eq!(v.is_numeric(), k == "null" || k == "i64", "{k}");
+        assert_eq!(v.is_numeric(), k == "unset" || k == "i64", "{k}");
     }
 }
 
@@ -1793,7 +1797,7 @@ fn decode_refuses_a_bad_bool_a_deep_array_and_a_cut_value() {
     // Every proper prefix of a state with every type is refused as truncated or bad.
     let mut w = Writer::new(wid('A', 0), opts());
     let fields: Vec<(&str, Value)> =
-        every_type().into_iter().filter(|(k, _)| *k != "null").collect();
+        every_type().into_iter().filter(|(k, _)| *k != "unset").collect();
     w.insert(&fl(&fields), 0).unwrap();
     let enc = w.state.encode();
     for n in 0..enc.len() {
@@ -2124,4 +2128,72 @@ fn a_two_stamp_upsert_whose_second_stamp_is_refused_is_taken_back() {
     let (c, i) =
         w.upsert_soi_stamped(&f, &n, 3, &sets, &mut || mint.next().unwrap()).unwrap().unwrap();
     assert_eq!((c.stamp, i.stamp), (first, second));
+}
+
+// ---- a BSON null is a value, an unset is not --------------------------------------------
+
+#[test]
+fn a_null_is_a_present_value_and_an_unset_field_is_absent() {
+    let mut w = Writer::new(wid('A', 0), opts());
+    let (x, y) = (p("x"), p("y"));
+    w.insert(&fl(&[("x", Value::Null), ("y", i(1))]), 0).unwrap();
+    assert_eq!(w.visible(), doc(&[("x", Value::Null), ("y", i(1))]), "insert stores a null");
+    assert!(w.write_set(&x, Value::Null, 0).is_none(), "null over null: no change");
+    assert!(w.write_set(&x, Value::Unset, 0).is_some(), "unsetting a stored null is a write");
+    assert_eq!(w.visible(), doc(&[("y", i(1))]));
+    assert!(w.write_unset(&x, 0).is_none(), "already absent");
+    assert!(w.write_set(&x, Value::Null, 0).is_some(), "null over an absent field is a write");
+    assert_eq!(w.visible().unwrap()[&x], Value::Null);
+    assert!(w.write_set(&y, Value::Null, 0).is_some());
+    assert_eq!(w.visible(), doc(&[("x", Value::Null), ("y", Value::Null)]));
+    // $unset removes it
+    assert!(w.write_unset(&y, 0).is_some());
+    assert_eq!(w.visible(), doc(&[("x", Value::Null)]));
+    // a null is not a counter, an absent field is
+    assert!(w.write_inc(&x, 1, 0).is_none(), "$inc on a null is refused");
+    assert!(w.write_inc(&y, 1, 0).is_some(), "$inc on an absent field creates it");
+    // a replace keeps a null field, writes one over a missing field, and drops by absence
+    assert!(w.write_replace(&fl(&[("x", Value::Null), ("y", i(1))]), 0).is_none());
+    let r =
+        w.write_replace(&fl(&[("x", Value::Null), ("y", i(1)), ("z", Value::Null)]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![p("z")]);
+    let r = w.write_replace(&fl(&[("y", i(1)), ("z", Value::Null)]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![x.clone()]);
+    assert_eq!(w.visible(), doc(&[("y", i(1)), ("z", Value::Null)]));
+}
+
+#[test]
+fn a_null_and_an_unset_merge_and_encode_as_different_values() {
+    let mut a = Writer::new(wid('A', 0), opts());
+    let mut b = Writer::new(wid('B', 0), opts());
+    a.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    b.receive(&a.state);
+    a.write_set(&p("x"), Value::Null, 0).unwrap();
+    b.write_unset(&p("x"), 5).unwrap(); // the later stamp
+    a.receive(&b.state);
+    b.receive(&a.state);
+    assert_eq!(a.state.state_hash(), b.state.state_hash());
+    assert_eq!(a.visible(), doc(&[]), "the unset wins by its stamp");
+    assert_eq!(
+        a.state.losses.values().collect::<Vec<_>>(),
+        vec![&LossValue::Value(Value::Null)],
+        "and the null is the reported loser"
+    );
+    // The other way round: the null is later and stays.
+    let (mut c, mut d) = (Writer::new(wid('C', 0), opts()), Writer::new(wid('D', 0), opts()));
+    c.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    d.receive(&c.state);
+    c.write_unset(&p("x"), 0).unwrap();
+    d.write_set(&p("x"), Value::Null, 5).unwrap();
+    c.receive(&d.state);
+    assert_eq!(c.visible(), doc(&[("x", Value::Null)]));
+    assert_eq!(c.state.losses.values().collect::<Vec<_>>(), vec![&LossValue::Value(Value::Unset)]);
+    // The two states encode differently and round trip.
+    let (mut n, mut u) = (Writer::new(wid('A', 0), opts()), Writer::new(wid('A', 0), opts()));
+    n.insert(&fl(&[("x", Value::Null)]), 0).unwrap();
+    u.insert(&fl(&[("x", Value::Unset)]), 0).unwrap();
+    assert_ne!(n.state.canonical_bytes(), u.state.canonical_bytes());
+    for w in [&n, &u] {
+        assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state);
+    }
 }

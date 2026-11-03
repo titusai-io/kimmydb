@@ -107,7 +107,8 @@ impl W {
     }
     fn value(&mut self, v: &Value) {
         match v {
-            Value::Null => self.u8(0),
+            Value::Unset => self.u8(0),
+            Value::Null => self.u8(15),
             Value::Int64(i) => {
                 self.u8(1);
                 self.i64(*i);
@@ -474,7 +475,8 @@ impl R<'_> {
     /// hostile input cannot exhaust the stack.
     fn value_at(&mut self, depth: usize) -> Result<Value, DecodeError> {
         match self.u8()? {
-            0 => Ok(Value::Null),
+            0 => Ok(Value::Unset),
+            15 => Ok(Value::Null),
             1 => Ok(Value::Int64(self.i64()?)),
             2 => Ok(Value::Double(f64::from_bits(u64::from_be_bytes(self.arr()?)))),
             3 => Ok(Value::String(self.str()?)),

@@ -647,7 +647,7 @@ impl Writer {
     fn write_unset_m(&mut self, path: &Path, m: &mut Mint<'_>) -> Option<Written> {
         let vis = self.visible()?;
         vis.get(path)?;
-        self.write_reg_unchecked(path, Value::Null, m)
+        self.write_reg_unchecked(path, Value::Unset, m)
     }
 
     /// The body of [`Writer::write_inc`], with the stamp from `m`.
@@ -719,9 +719,9 @@ impl Writer {
             vals.insert(q.clone(), v.clone());
         }
         for q in drops {
-            self.setreg(q, Value::Null, st);
+            self.setreg(q, Value::Unset, st);
             paths.push(q.clone());
-            vals.insert(q.clone(), Value::Null);
+            vals.insert(q.clone(), Value::Unset);
         }
         let mut rec = WriteRecord::new(WriteKind::Reg, l, paths);
         rec.vals = vals;

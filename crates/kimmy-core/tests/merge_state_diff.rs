@@ -59,7 +59,7 @@ fn jk(k: &LossKey) -> J {
 
 fn jv(v: &Value) -> J {
     match v {
-        Value::Null => json!(["n"]),
+        Value::Unset => json!(["n"]),
         Value::Int64(i) => json!(["i", i.to_string()]),
         Value::Double(d) => json!(["d", format!("{:016x}", d.to_bits())]),
         Value::String(s) => json!(["s", s]),
@@ -72,7 +72,7 @@ fn jv(v: &Value) -> J {
 fn unjv(v: &J) -> Value {
     let a = v.as_array().unwrap();
     match a[0].as_str().unwrap() {
-        "n" => Value::Null,
+        "n" => Value::Unset,
         "i" => Value::Int64(a[1].as_str().unwrap().parse().unwrap()),
         "d" => {
             Value::Double(f64::from_bits(u64::from_str_radix(a[1].as_str().unwrap(), 16).unwrap()))

@@ -101,16 +101,20 @@ impl std::fmt::Display for Path {
     }
 }
 
-/// A cell value: a BSON value other than an embedded document. `Null` is the model's `None`:
-/// an unset field. Numeric cells (`Null`, `Int64`) take part in counting; every other variant
-/// is a base that starts a generation. An array is ONE atomic value (a register); an embedded
-/// document is not a `Value` (it is a map path, a later stage).
+/// A cell value: a BSON value other than an embedded document, or `Unset`. `Null` is the BSON
+/// null, a value like any other: `$set x null` stores it and the field is present. `Unset` is
+/// the model's `None`: the absence of a value, what a register holds after an `$unset` (the
+/// field is not in the document). Numeric cells (`Unset`, `Int64`) take part in counting; every
+/// other variant is a base that starts a generation, so `$inc` on a null is refused. An array is
+/// ONE atomic value (a register); an embedded document is not a `Value` (it is a map path, a
+/// later stage).
 ///
 /// The variants keep the BSON types apart: `Int32(2)`, `Int64(2)`, `Double(2.0)` and
 /// `Decimal128` of two are four different values. A `Decimal128` is its 16 bytes, as BSON
 /// stores it.
 #[derive(Clone, Debug)]
 pub enum Value {
+    Unset,
     Null,
     Int32(i32),
     Int64(i64),
@@ -140,21 +144,22 @@ pub enum Value {
 }
 
 impl Value {
-    /// The model's `numeric()`: `None` or an integer. Only an `Int64` counts: `Int32` and
-    /// `Decimal128` counters are not modelled yet, so they are plain register values.
+    /// The model's `numeric()`: `None` (`Unset`) or an integer. Only an `Int64` counts: `Int32`
+    /// and `Decimal128` counters are not modelled yet, so they are plain register values.
     pub fn is_numeric(&self) -> bool {
-        matches!(self, Value::Null | Value::Int64(_))
+        matches!(self, Value::Unset | Value::Int64(_))
     }
 }
 
 impl Value {
     /// The model's `same(a, b)` (Q4, ruled): the write diff compares value AND type,
     /// so `$set 2` over a stored `2.0` is a write, and so is an `Int32` over an `Int64`
-    /// of the same number. A missing field (`None`) is the same as `Null`. Doubles
+    /// of the same number. A missing field (`None`) is the same as `Unset`, not as `Null`: `$set x
+    /// null` over a missing field is a write. Doubles
     /// compare as numbers (`==`: `0.0` is `-0.0`, NaN is not NaN), as Python does; an
     /// array compares element by element in the same way, type for type.
     pub fn same(current: Option<&Value>, new: &Value) -> bool {
-        Self::same_value(current.unwrap_or(&Value::Null), new)
+        Self::same_value(current.unwrap_or(&Value::Unset), new)
     }
 
     fn same_value(a: &Value, b: &Value) -> bool {
@@ -175,7 +180,7 @@ impl Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::Null, Value::Null) => true,
+            (Value::Unset, Value::Unset) | (Value::Null, Value::Null) => true,
             (Value::Int32(a), Value::Int32(b)) => a == b,
             (Value::Int64(a), Value::Int64(b)) => a == b,
             (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),

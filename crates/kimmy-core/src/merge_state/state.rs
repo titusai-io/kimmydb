@@ -375,7 +375,7 @@ impl MergeState {
             paths
                 .into_iter()
                 .filter_map(|p| {
-                    self.value_in(p, &al, o).filter(|v| *v != Value::Null).map(|v| (p.clone(), v))
+                    self.value_in(p, &al, o).filter(|v| *v != Value::Unset).map(|v| (p.clone(), v))
                 })
                 .collect(),
         )
