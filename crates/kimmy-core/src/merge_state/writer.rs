@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::counter::{self, Inc, Kind, Num};
-use super::join::{JoinOptions, join};
+use super::join::{JoinOptions, join, join_into};
 use super::state::{
     Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
 };
@@ -333,7 +333,8 @@ impl Writer {
     fn finish(&mut self, st: MStamp, record: WriteRecord) -> Written {
         self.state.vv.insert(st.writer, st.hlc);
         if self.opts.normalize_writes() {
-            let (s, _) = join(&self.state, &MergeState::default(), &self.opts);
+            let (s, _) =
+                join_into(std::mem::take(&mut self.state), &MergeState::default(), &self.opts);
             self.state = s;
         }
         Written { stamp: st, record }

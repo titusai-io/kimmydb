@@ -69,6 +69,20 @@ fn a_join_copies_the_first_state_once_and_the_registers_that_win() {
 }
 
 #[test]
+fn a_local_write_copies_no_register() {
+    for n in [20, 200] {
+        let mut w = wide(n);
+        w.write_set(&p("f000"), s("a"), 0).unwrap();
+        let (_, c) = count(|| w.write_set(&p("f001"), s("b"), 0).unwrap());
+        assert_eq!(c.reg_clones, 0, "$set, {n} fields");
+        let (_, c) = count(|| w.write_inc(&p("c1"), 1, 0).unwrap());
+        assert_eq!(c.reg_clones, 0, "$inc, {n} fields");
+        let (_, c) = count(|| w.write_unset(&p("f002"), 0).unwrap());
+        assert_eq!(c.reg_clones, 0, "$unset, {n} fields");
+    }
+}
+
+#[test]
 fn the_clash_search_of_a_join_is_linear_in_the_cells() {
     let visits = |n: usize| {
         let (a, mut b, regs) = two(n, 0);
