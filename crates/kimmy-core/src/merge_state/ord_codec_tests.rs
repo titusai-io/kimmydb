@@ -249,3 +249,118 @@ fn the_join_is_not_idempotent_where_decode_refuses_an_order_entry() {
         Err(DecodeError::VersionVectorBehind)
     );
 }
+
+// ---- one state, one spelling: the empty order state is no order state ----------------------
+
+/// A state of the life `(1, A)` with a register at `x` and an order entry for it.
+fn with_entry(life: MStamp, x: FieldOrd) -> MergeState {
+    let mut s = MergeState::default();
+    s.lives.insert(life, Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert });
+    s.vv.insert(life.writer, Hlc::new(life.hlc.wall_ms.max(9), 0));
+    let p = Path::flat("x").unwrap();
+    let reg = Reg::new(life, Value::Int64(1), BTreeMap::new(), None, false).unwrap();
+    s.regs.insert((life, p.clone()), reg);
+    s.ords.insert((life, OrdAt::Field(p)), x);
+    s
+}
+
+fn some_entry(life: MStamp) -> FieldOrd {
+    FieldOrd {
+        firsts: [(life.writer, (life, 0))].into(),
+        last: Some((life, 0)),
+        ..FieldOrd::default()
+    }
+}
+
+/// Everything that makes two states the same, and the bytes and hashes that follow from it.
+fn assert_same_state(a: &MergeState, b: &MergeState, what: &str) {
+    assert_eq!(a, b, "{what}");
+    assert_eq!(a.encode_compact(), b.encode_compact(), "{what}: bytes");
+    assert_eq!(a.compact_bytes(), b.compact_bytes(), "{what}: body");
+    assert_eq!(a.compact_hash(), b.compact_hash(), "{what}: hash");
+}
+
+/// A state whose order state EMPTIES in a join encodes byte for byte like one that never had an
+/// order state: a delete that kills the life, a concurrent first insert that supersedes it, and
+/// an empty entry (which no writer makes) that the join removes.
+#[test]
+fn a_state_whose_order_state_empties_encodes_like_one_that_never_had_it() {
+    let o = opts(1_000_000_000);
+    let life = at(1, b'A');
+    let with = with_entry(life, some_entry(life));
+    let mut never = with.clone();
+    never.ords.clear();
+    assert!(!with.ords.is_empty() && with.encode_compact() != never.encode_compact());
+
+    // 1. a delete that the life did not see kills it: its cells and its order entries go
+    let mut d = MergeState::default();
+    let del = at(5, b'B');
+    d.deletes.insert(del, [(w(b'B'), Hlc::new(5, 0))].into());
+    d.vv.insert(w(b'B'), Hlc::new(5, 0));
+    let (killed, _) = join(&with, &d, &o);
+    let (killed_never, _) = join(&never, &d, &o);
+    assert!(
+        killed.ords.is_empty() && killed.regs.is_empty(),
+        "the life is dead: no cells, no entries"
+    );
+    assert_same_state(&killed, &killed_never, "after a delete");
+    assert_eq!(killed.encode_compact()[3], 2);
+    // and the other way round
+    assert_same_state(&join(&d, &with, &o).0, &killed_never, "after a delete, the other way");
+
+    // 2. a newer concurrent first insert supersedes the life: it is dead, and its entries go
+    let newer = at(7, b'B');
+    let rival = with_entry(newer, some_entry(newer));
+    let mut rival_never = rival.clone();
+    rival_never.ords.clear();
+    let (sup, _) = join(&with, &rival, &o);
+    let mut twin = join(&never, &rival_never, &o).0;
+    assert_eq!(
+        sup.ords.keys().map(|k| k.0).collect::<BTreeSet<_>>(),
+        [newer].into(),
+        "only the survivor's entry"
+    );
+    twin.ords.insert((newer, OrdAt::Field(Path::flat("x").unwrap())), some_entry(newer));
+    assert_same_state(&sup, &twin, "after a supersession");
+    assert!(sup.losses.keys().any(|k| k.kind == LossKind::InsertLost));
+
+    // 3. an empty entry, which no writer makes, does not survive a join with anything (itself too)
+    let mut empty = with.clone();
+    empty.ords.clear();
+    empty.ords.insert((life, OrdAt::Root), FieldOrd::default());
+    empty.ords.insert((life, OrdAt::Field(Path::flat("x").unwrap())), FieldOrd::default());
+    assert_ne!(empty, never, "as built, the empty entries are in the state");
+    for other in [&never, &empty, &MergeState::default()] {
+        let joined = join(&empty, other, &o).0;
+        assert!(joined.ords.is_empty(), "the join removes the empty entries");
+        let flipped = join(other, &empty, &o).0;
+        assert_eq!(joined.ords, flipped.ords);
+    }
+    assert_same_state(
+        &join(&empty, &never, &o).0,
+        &join(&never, &never, &o).0,
+        "after an empty entry",
+    );
+    // a join that leaves the order state as it was does not touch the bytes of one that has it
+    assert_same_state(&join(&with, &with, &o).0, &with, "idempotent");
+}
+
+/// The decoder and the checks refuse an empty entry, in both spellings of the state.
+#[test]
+fn an_empty_entry_is_refused() {
+    let life = at(1, b'A');
+    let mut s = with_entry(life, some_entry(life));
+    s.ords.insert((life, OrdAt::Root), FieldOrd::default());
+    assert_eq!(s.check_decoded(), Err(DecodeError::OrdEntryEmpty));
+    assert_eq!(MergeState::decode_compact(&s.encode_compact()), Err(DecodeError::OrdEntryEmpty));
+    // a state that holds one is not idempotent under join, which is why it is refused
+    assert_ne!(join(&s, &s, &opts(1_000_000_000)).0, s);
+    // the single empty entry, spelled by hand: floor byte 0, no firsts, flags 0
+    let mut only = with_entry(life, FieldOrd::default());
+    only.regs.clear();
+    assert_eq!(MergeState::decode_compact(&only.encode_compact()), Err(DecodeError::OrdEntryEmpty));
+    // no order state at all is the state without a section
+    only.ords.clear();
+    let enc = only.encode_compact();
+    assert_eq!(MergeState::decode_compact(&enc), Ok(only));
+}

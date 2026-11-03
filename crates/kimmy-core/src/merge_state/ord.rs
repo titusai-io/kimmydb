@@ -134,6 +134,13 @@ fn valid_under(floor: &Option<Floor>, c: &Cand, keep_all: bool) -> bool {
 }
 
 impl FieldOrd {
+    /// Does the entry say nothing: no floor, no candidate, no level mark? An empty entry and no
+    /// entry are the same state, so the join never keeps one and `decode` refuses one. (An entry
+    /// cannot void to nothing: voiding needs a floor, and the floor stays.)
+    pub fn is_empty(&self) -> bool {
+        self.floor.is_none() && self.firsts.is_empty() && self.last.is_none() && self.lvl.is_none()
+    }
+
     /// Is `c` a candidate this entry's floor lets stand?
     pub fn valid(&self, c: &Cand, o: &JoinOptions) -> bool {
         valid_under(&self.floor, c, o.ord_keep_all())
@@ -332,7 +339,10 @@ impl MergeState {
                     ord.last = Some((stamp, e.pos));
                 }
             }
-            self.ords.insert(key, ord);
+            // an entry that says nothing is no entry (the events above always say something)
+            if !ord.is_empty() {
+                self.ords.insert(key, ord);
+            }
         }
     }
 }

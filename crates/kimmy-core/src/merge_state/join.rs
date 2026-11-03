@@ -616,7 +616,8 @@ pub(super) fn join_into(
     out.regs.retain(|k, _| alive.has(&k.0));
     out.slots.retain(|k, _| alive.has(&k.0));
     out.gens.retain(|k, _| alive.has(&k.0));
-    out.ords.retain(|k, _| alive.has(&k.0));
+    // an entry that says nothing is no entry: an empty one and none are the same state
+    out.ords.retain(|k, x| alive.has(&k.0) && !x.is_empty());
     let h = out.horizon(o);
     out.deletes.retain(|d, _| d.hlc >= h);
     let dead_old: Vec<MStamp> =

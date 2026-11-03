@@ -84,6 +84,8 @@ pub enum DecodeError {
     OrdLifeNotListed,
     #[error("merge state: an order entry holds a candidate its floor voids")]
     OrdNotNormal,
+    #[error("merge state: an order entry says nothing (no floor, no candidate, no level mark)")]
+    OrdEntryEmpty,
     #[error("merge state: invalid order floor kind {0}")]
     OrdBadFloor(u8),
     #[error("merge state: the order section is present but empty")]

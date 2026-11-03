@@ -852,8 +852,8 @@ fn close(cx: &mut Cx, x: &mut MergeState) {
         }
     }
     // an order entry belongs to a listed life: the others go (a life is not invented here, since
-    // another state may list it as another kind)
-    x.ords.retain(|(l, _), _| x.lives.contains_key(l));
+    // another state may list it as another kind); an entry that says nothing is no entry
+    x.ords.retain(|(l, _), e| x.lives.contains_key(l) && !e.is_empty());
     let mut stamps: Vec<MStamp> = x.lives.keys().copied().collect();
     stamps.extend(x.deletes.keys());
     stamps.extend(x.regs.values().map(|r| r.stamp));

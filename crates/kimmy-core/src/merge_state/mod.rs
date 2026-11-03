@@ -141,6 +141,7 @@ const _: () = {
     let _: fn(&Floor) -> MStamp = Floor::stamp;
     let _: fn(&FieldOrd, &Cand, &JoinOptions) -> bool = FieldOrd::valid;
     let _: fn(&FieldOrd, &JoinOptions) -> bool = FieldOrd::is_normal;
+    let _: fn(&FieldOrd) -> bool = FieldOrd::is_empty;
     let _: fn(&MergeState, &JoinOptions) -> Vec<MStamp> = MergeState::alive;
     let _: fn(&MergeState) -> BTreeSet<WriterId> = MergeState::writers;
     let _: fn(&MergeState, &Path, &JoinOptions) -> BTreeSet<WriterId> = MergeState::contributors;

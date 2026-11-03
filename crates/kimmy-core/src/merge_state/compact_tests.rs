@@ -1021,10 +1021,11 @@ fn an_order_state_is_section_ten_after_the_losses() {
     assert_eq!(r.encode_compact(), h.0);
     assert_eq!(MergeState::decode_compact(&h.0), Ok(r));
     // entries come in the key order of the map: the root before the paths, a path by its segments
+    let level = FieldOrd { lvl: Some(st(2, a)), ..FieldOrd::default() };
     let both = with_ords(&[
-        ((1, OrdAt::Field(p("b"))), FieldOrd::default()),
-        ((1, OrdAt::Root), FieldOrd::default()),
-        ((1, OrdAt::Field(p("a"))), FieldOrd::default()),
+        ((1, OrdAt::Field(p("b"))), level.clone()),
+        ((1, OrdAt::Root), level.clone()),
+        ((1, OrdAt::Field(p("a"))), level),
     ]);
     round_trip(&both);
 }
@@ -1120,8 +1121,8 @@ fn section_ten_is_decoded_strictly() {
     // keys out of order or twice, and the same inside the firsts
     let two_entries = |first: &[u8], second: &[u8]| {
         body(2, false, true, 5, &|h| {
-            h.n(2).n(0).n(1).n(1).raw(first).raw(&[0, 0, 0]);
-            h.n(0).n(1).n(1).raw(second).raw(&[0, 0, 0]);
+            h.n(2).n(0).n(1).n(1).raw(first).raw(&ok_floor).raw(&[0, 0]);
+            h.n(0).n(1).n(1).raw(second).raw(&ok_floor).raw(&[0, 0]);
         })
     };
     assert!(MergeState::decode_compact(&two_entries(b"x", b"y")).is_ok());

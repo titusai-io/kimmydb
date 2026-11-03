@@ -292,13 +292,20 @@ impl MergeState {
     ///     `lvl`), as item 2 does for cells: CHECKED ([`DecodeError::VersionVectorBehind`]).
     ///     The join does not read the vector for the order, but a writer restored from the state
     ///     mints above its vector, and a stamp it then reused would meet its own floor.
-    /// 13. NOT relied on, so NOT checked: that a `firsts` candidate is stamped by the writer
+    /// 13. No entry is EMPTY (no floor, no `firsts`, no `last`, no `lvl`). CHECKED here
+    ///     ([`DecodeError::OrdEntryEmpty`]). An empty entry and no entry are the same state, so
+    ///     the join removes an empty entry (of either side) and the constructors never make
+    ///     one; a state that holds one is not idempotent under join (the join drops it), and
+    ///     the compact form could spell the one state two ways if the decoder took both.
+    ///     (A voided entry cannot become empty: voiding needs a floor, which stays.)
+    /// 14. NOT relied on, so NOT checked: that a `firsts` candidate is stamped by the writer
     ///     that keys it, that `last` is not earlier than a first, that a `u` floor's `prev` is
-    ///     below its own stamp, that the positions are small, that an entry is not empty, that
-    ///     the root keeps only a level floor (`OrdAt::Root`), that the entries are for paths
-    ///     that have a cell. The join and the read are defined for any values of these (the
-    ///     laws hold on the entries of the model's runs and on any NORMAL entries for
-    ///     commutativity and idempotence); they are the model's own writer's habits.
+    ///     below its own stamp, that the positions are small, that the root keeps only a level
+    ///     floor (`OrdAt::Root`), that the entries are for paths that have a cell. The join
+    ///     and the read are defined for any values of these (the laws hold on the entries of
+    ///     the model's runs and on any NORMAL entries for commutativity and idempotence, and
+    ///     associativity on the entries writers reach only, see `ord_tests`); they are the
+    ///     model's own writer's habits.
     ///
     /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
     pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {
@@ -319,6 +326,9 @@ impl MergeState {
         for ((l, _), x) in &self.ords {
             if !self.lives.contains_key(l) {
                 return Err(DecodeError::OrdLifeNotListed);
+            }
+            if x.is_empty() {
+                return Err(DecodeError::OrdEntryEmpty);
             }
             if !x.is_normal(&o) {
                 return Err(DecodeError::OrdNotNormal);
