@@ -344,7 +344,7 @@ fn replay(sc: &J, o: &JoinOptions) -> bool {
 // ---- the read: the goldens of the materialised order --------------------------------
 
 /// The scenarios, by name. A new scenario of the generator is a new line here.
-const SCENARIOS: [&str; 29] = [
+const SCENARIOS: [&str; 30] = [
     "approximate_case",
     "concurrent_creation_a_first",
     "concurrent_creation_b_first",
@@ -359,6 +359,7 @@ const SCENARIOS: [&str; 29] = [
     "level_floor_subdocument_set",
     "replace_drops_a_field_then_set_appends",
     "replace_reorders_even_unchanged",
+    "replace_with_an_empty_document_has_no_update_bit",
     "same_new_path_from_two_writers",
     "sequential_rules",
     "set_then_concurrent_unset",
@@ -413,7 +414,7 @@ fn the_materialised_field_order_equals_the_models_on_every_scenario() {
         fields += want.len();
     }
     // pinned: what the test covered
-    assert_eq!((names.len(), joined, fields), (29, 1064, 115));
+    assert_eq!((names.len(), joined, fields), (30, 1088, 117));
 }
 
 fn paths(doc: &[(Path, Value)]) -> Vec<String> {
@@ -434,7 +435,7 @@ fn strs(v: &[&str]) -> Vec<String> {
 /// join; these are pinned in the source so that a reader sees the rules).
 #[test]
 fn the_field_order_of_the_named_scenarios_is_pinned() {
-    let pins: [(&str, &[&str]); 29] = [
+    let pins: [(&str, &[&str]); 30] = [
         ("approximate_case", &["z", "q", "p", "r"]),
         ("concurrent_creation_a_first", &["a", "c", "d"]),
         ("concurrent_creation_b_first", &["a", "d", "c"]),
@@ -452,6 +453,7 @@ fn the_field_order_of_the_named_scenarios_is_pinned() {
         ("level_floor_subdocument_set", &["m", "m.q", "m.p", "m.r"]),
         ("replace_drops_a_field_then_set_appends", &["c", "a", "b"]),
         ("replace_reorders_even_unchanged", &["c", "b", "a"]),
+        ("replace_with_an_empty_document_has_no_update_bit", &["a", "d"]),
         ("same_new_path_from_two_writers", &["a", "c", "d"]),
         ("sequential_rules", &["yy", "zz", "z", "b", "m", "m.r", "m.p", "a"]),
         ("set_then_concurrent_unset", &["q"]),
@@ -516,6 +518,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
                 "set_then_concurrent_unset",
                 "slot_above_the_floor_is_not_a_survivor",
@@ -542,6 +545,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
                 "set_then_concurrent_unset",
                 "slot_above_the_floor_is_not_a_survivor",
@@ -606,6 +610,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             &[
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_noop_unset_rides_on_an_update",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "survivor_increment_after_unset",
                 "survivor_older_than_the_fields_own_write_lowers_its_position",
                 "survivor_placement_a_inc_before_c",
@@ -629,6 +634,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
             ],
         ),
@@ -674,6 +680,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
                 "set_then_concurrent_unset",
                 "slot_above_the_floor_is_not_a_survivor",

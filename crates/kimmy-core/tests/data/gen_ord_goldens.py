@@ -382,6 +382,18 @@ def s_survivor_older_than_the_fields_own_write_lowers_its_position():
 
 
 @scenario
+def s_replace_with_an_empty_document_has_no_update_bit():
+    """O1-10 of the O1 review: A replaces the document with {} (a level mark on the root and unsets, no other field), over a
+    field a that B incremented and A never saw. A level mark is not a field the write also wrote, so the update bit is clear and
+    a is placed by `prev` and its own stamp, before the field d that C creates later."""
+    sc = Sc({"a": 1, "b": 2})
+    sc.op("B", "inc", "a", 5, clock=2)
+    sc.op("C", "set", "d", 1, clock=3)
+    sc.op("A", "replace", None, {}, clock=6)
+    return sc
+
+
+@scenario
 def s_descendant_survivor_of_an_unset_map():
     sc = Sc({"a": {"b": 1, "c": 2}, "z": 0})
     sc.op("B", "set", "a.d", 4, clock=3)
