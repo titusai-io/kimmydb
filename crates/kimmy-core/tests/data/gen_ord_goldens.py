@@ -63,7 +63,8 @@ def j_val(v):
         return {"t": "null"}
     if v == M.MAP:
         return {"t": "map"}
-    assert v != M.MAPI, "implicit markers are not in the Rust model yet (item O4)"
+    if v == M.MAPI:
+        return {"t": "mapi"}
     if isinstance(v, bool):
         raise AssertionError("bool")
     if isinstance(v, int):
@@ -866,10 +867,6 @@ def join_law_fixture():
     return {"paths_with_several": distinct_keys, "triples": triples, "ords": ords, "per_path": per_path}
 
 
-def _without_mapi(st):
-    return all(r[1] != M.MAPI for r in st.regs.values())
-
-
 def _flat_ordered(st):
     v = st.visible()
     return None if v is None else flat(v)
@@ -901,7 +898,7 @@ def _mutants():
 
 def random_states_fixture(seeds=300, steps=30):
     """O1-4 and O1-6 of the O1 review. States of the model's random nested runs (every writer entry of every member's oplog and
-    every member's final state; no implicit markers: O4 is not built), with the model's ordered document of each under
+    every member's final state, implicit markers included), with the model's ordered document of each under
     ABSORBED = True (the counter cell the Rust has). Chosen: for each of five mutants of the read the states it changes
     (smallest first), and a spread of others; and, from the same runs, the states whose order or values the
     Q6 rule changes (the Rust gives expected_on and not expected_off)."""
@@ -915,7 +912,7 @@ def random_states_fixture(seeds=300, steps=30):
             sts += [M.unwire(e[2]) for e in m.oplog.values() if e[0] == "w"]
         for st in sts:
             c = st.canon()
-            if c in seen or not _without_mapi(st) or st.visible() is None:
+            if c in seen or st.visible() is None:
                 continue
             seen.add(c)
             pool.append((seed, st))
@@ -951,7 +948,7 @@ def random_states_fixture(seeds=300, steps=30):
         ms, log, ok = P.run(seed, steps=steps, nested=True)
         for m in ms:
             for st in [m.state] + [M.unwire(e[2]) for e in m.oplog.values() if e[0] == "w"]:
-                if not _without_mapi(st) or st.visible() is None:
+                if st.visible() is None:
                     continue
                 on = _flat_ordered(st)
                 M.ABSORBED = False

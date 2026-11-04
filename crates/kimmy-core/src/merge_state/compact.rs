@@ -17,7 +17,8 @@
 //!
 //! * a count or length is a LEB128 varint of a `u64`, written in its shortest form;
 //! * a counter total is a PAYLOAD: the zigzag of the `i128` as a LEB128 varint of a `u128`, shortest
-//!   form, for an `Int64` or an `Int32` amount, the 16 bytes for a `Decimal128`. Its TYPE is
+//!   form, for an `Int64` or an `Int32` amount, the 16 bytes of a canonical word for a `Decimal128` (any other is
+//!   `NotCanonicalDecimal`, inventory item 29 of `check_decoded`). Its TYPE is
 //!   spelled beside it: in the flag byte of a slot (section 7), and as a leading TYPE BYTE (0 `Int64`,
 //!   1 `Int32`, 2 `Decimal128`, any other byte refused) on every total that has no flag byte, a
 //!   generation's `seen` entry and the total of a loss record. A typed total is the type byte and
@@ -28,7 +29,7 @@
 //!   `Double` is its IEEE bit pattern (`to_bits`, big-endian);
 //! * a value is a tag byte and its payload: 0 `Unset`, 1 `Int64`, 2 `Double`, 3 `String`,
 //!   4 `Array` (a count and the values), 5 the explicit map marker (a register value, never in
-//!   an array), **6 reserved for the implicit map marker**, 7 `Int32`, 8 `Decimal128`, 9 `Bool`, 10 `Date`, 11 `ObjectId`, 12 `Binary`,
+//!   an array), 6 the implicit map marker (a register value, never in an array), 7 `Int32`, 8 `Decimal128`, 9 `Bool`, 10 `Date`, 11 `ObjectId`, 12 `Binary`,
 //!   13 `Timestamp`, 14 `Regex`, 15 `Null`, 16 `Document` (a count, then each field as a name and
 //!   a value; legal ONLY inside an array, at any depth, and refused as a register or a lost
 //!   value: a document outside an array is a map. The version 1 form has no tag for it);
@@ -135,8 +136,8 @@
 //!   slot stamped by another writer than its key is refused too (`SlotWriterMismatch`). The provisional `ESCAPE` of the typed counters is
 //!   gone: the type has a place of its own in the flag byte and the type byte.
 //! * **Map markers and type clashes**: tag 5 (the explicit marker) is in use, with loss kinds 4
-//!   and 5 (`typeClash`, `arrayClash`); tag 6 (the implicit marker) is reserved for the write
-//!   rule the next model round decides, and nothing writes it.
+//!   and 5 (`typeClash`, `arrayClash`); tag 6 is the implicit marker the Writer leaves at an
+//!   ancestor map a leaf write creates. A state without one is byte-identical to before.
 //!
 //! # Canonicity
 //!
@@ -334,8 +335,9 @@ impl W {
                 self.u8(3);
                 self.str(s);
             }
-            // 4 is the array; 5 the explicit map marker; 6 is kept for the implicit one.
+            // 4 is the array; 5 the explicit map marker; 6 the implicit one.
             Value::Map => self.u8(5),
+            Value::ImplicitMap => self.u8(6),
             Value::Array(a) => {
                 self.u8(4);
                 self.len(a.len());
@@ -795,7 +797,14 @@ impl R<'_> {
         match ty {
             0 => Ok(Num::Int64(Self::zigzag(self.varint(19)?)?)),
             1 => Ok(Num::Int32(Self::zigzag(self.varint(19)?)?)),
-            _ => Ok(Num::Decimal128(self.arr()?)),
+            _ => {
+                let n = Num::Decimal128(self.arr()?);
+                // the bytes `pack_raw` writes: the only decimals a writer's slot, pair, `seen` or loss can hold
+                if !n.is_canonical() {
+                    return Err(DecodeError::NotCanonicalDecimal);
+                }
+                Ok(n)
+            }
         }
     }
     fn str(&mut self) -> Result<String, DecodeError> {
@@ -949,6 +958,7 @@ impl R<'_> {
             // The map marker is a register value, a document an array element: the other way
             // round is refused (the depth is the number of arrays and documents above).
             5 if depth == 0 => Ok(Value::Map),
+            6 if depth == 0 => Ok(Value::ImplicitMap),
             16 if depth > 0 => {
                 if depth >= MAX_VALUE_DEPTH {
                     return Err(DecodeError::TooDeep);

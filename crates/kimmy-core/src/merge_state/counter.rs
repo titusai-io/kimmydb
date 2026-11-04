@@ -198,6 +198,27 @@ impl Num {
         }
     }
 
+    /// A writer's FIRST amount at a path as the product stores it (ADR-252): the product's `$inc` on an absent field
+    /// is `Int32(0) + operand`, which for a decimal is the canonical result of the decimal sum (a NaN of any
+    /// payload is the plain quiet NaN, a non-canonical coefficient a canonical zero, an infinity stays one, a
+    /// negative zero becomes `+0`); an integer is its own sum with zero.
+    pub(super) fn first_amount(self) -> Num {
+        match self {
+            Num::Decimal128(_) => Num::Int32(0).add(&self),
+            n => n,
+        }
+    }
+
+    /// Is this a total the Writer can produce, for a `Decimal128`: the bytes `pack_raw` writes
+    /// (`dec_bytes(dec_raw(bytes)) == bytes`)? A NaN other than the plain quiet NaN, an infinity with a
+    /// payload, a coefficient above 10^34 - 1 and the large-coefficient form are not. Every other total is.
+    pub(super) fn is_canonical(&self) -> bool {
+        match self {
+            Num::Decimal128(b) => dec_bytes(dec_raw(b)) == *b,
+            _ => true,
+        }
+    }
+
     /// Relabel an integer amount as an `Int64` (it never narrows again); a decimal as it is.
     pub(super) fn widened(self) -> Num {
         match self {

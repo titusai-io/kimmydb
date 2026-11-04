@@ -103,6 +103,10 @@ pub struct JoinOptions {
     /// sub-document) unsets the direct children of a map only, leaving the deeper cells set.
     #[cfg(any(test, feature = "merge-mutants"))]
     unset_shallow: bool,
+    /// Nested mutant: a leaf write under an absent map writes no implicit marker there (the model's
+    /// `NO_IMPLICIT_MARKER`): an emptied map vanishes, and the join has no marker to rank.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_implicit_marker: bool,
     /// The read side adds a cell's slots in the order of their stamps instead of the canonical
     /// order (writer `(node, epoch)`, then life and generation): a `Decimal128` total then
     /// depends on whose write was the later.
@@ -228,6 +232,8 @@ impl Default for JoinOptions {
             #[cfg(any(test, feature = "merge-mutants"))]
             unset_shallow: false,
             #[cfg(any(test, feature = "merge-mutants"))]
+            no_implicit_marker: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
             sum_in_stamp_order: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             no_saturation: false,
@@ -337,6 +343,7 @@ impl JoinOptions {
     switch!(rewrite_unchanged, set_rewrite_unchanged, false);
     switch!(write_below_scalar, set_write_below_scalar, false);
     switch!(unset_shallow, set_unset_shallow, false);
+    switch!(no_implicit_marker, set_no_implicit_marker, false);
     switch!(sum_in_stamp_order, set_sum_in_stamp_order, false);
     switch!(no_saturation, set_no_saturation, false);
     switch!(no_decimal_saturation, set_no_decimal_saturation, false);
@@ -534,6 +541,11 @@ pub(super) fn join_into(
                 for b in &rt {
                     if a.stamp != b.stamp {
                         let lo = if a.stamp < b.stamp { a } else { b };
+                        // an implicit marker carries no user value: never a reported loser
+                        // (model6.py line 659)
+                        if lo.value == Value::ImplicitMap {
+                            continue;
+                        }
                         let arrays =
                             matches!((&a.value, &b.value), (Value::Array(_), Value::Array(_)));
                         let kind = if arrays && !o.array_clash_as_clash() {

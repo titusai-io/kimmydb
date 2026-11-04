@@ -72,6 +72,7 @@ fn value(j: &J) -> Value {
         "unset" => Value::Unset,
         "null" => Value::Null,
         "map" => Value::Map,
+        "mapi" => Value::ImplicitMap,
         "i" => Value::Int64(j["v"].as_i64().unwrap()),
         "d" => Value::Double(j["v"].as_str().unwrap().parse().unwrap()),
         "s" => Value::String(j["v"].as_str().unwrap().to_string()),
@@ -508,7 +509,7 @@ fn replay_script(sc: &J, o: &JoinOptions) -> Result<Replayed, String> {
             "replace" => w.write_replace(&script_fields(arg), skew),
             "delete" => w.write_delete(skew),
             "upsert_inc" => w.upsert_inc(&at(), arg["v"].as_i64().unwrap(), skew),
-            "update" | "setmany" => w.write_update(&script_ops(arg), skew),
+            "update" | "setmany" => w.write_update(&script_ops(arg), skew).ok().flatten(),
             "upsert_soi" => w
                 .upsert_soi(
                     &script_fields(&arg["fields"]),
@@ -1862,8 +1863,8 @@ fn expected_flat(j: &J) -> Vec<(Path, Value)> {
 
 /// O1-4 of the O1 review. The goldens have no path with entries in two alive lives, no increment below
 /// an unset map and no `lvl` in two lives, so five mutants of the read survived them. This fixture is
-/// 79 states of the model's random nested runs (300 seeds, 30 steps; every writer entry of every
-/// member's oplog and every final state, no implicit markers since O4 is not built, 2,094 distinct), with
+/// 78 states of the model's random nested runs (300 seeds, 30 steps; every writer entry of every
+/// member's oplog and every final state, implicit markers included, 2,418 distinct), with
 /// the model's ordered document under ABSORBED off (the counter cell the Rust has): chosen as the
 /// smallest states that each of the five mutants changes, and a spread of others. The Rust read must
 /// give the model's order and values on every one. The five mutants (their lines in `ord.rs`):
@@ -1895,14 +1896,15 @@ fn the_read_equals_the_models_on_random_states() {
         }
     }
     assert_eq!(chosen_for.len(), 5, "every mutant has a state: {chosen_for:?}");
-    assert_eq!((states.len(), j["pool"].as_u64()), (79, Some(2094)));
-    // The states are the ABSORBED-on runs' (the fixture was regenerated for the counter cell): 19 of the 79 hold two
-    // alive lives (the floor on the ABSORBED-off runs' states was 20 of 79), and 171 maps are compared. Pinned.
-    assert_eq!((two_lives, maps), (19, 171));
+    assert_eq!((states.len(), j["pool"].as_u64()), (78, Some(2418)));
+    // The states are the ABSORBED-on runs' with the implicit markers (the fixture was regenerated for the counter cell
+    // and again for O4, which lets the states that hold a marker in): 20 of the 78 hold two alive lives (19 of 79
+    // before O4), and 179 maps are compared (171). Pinned.
+    assert_eq!((two_lives, maps), (20, 179));
 }
 
 /// O1-6 of the O1 review, flipped by the counter cell. On the model's random states with ABSORBED on, the order
-/// (and the values) differ from the ABSORBED-off model's on a few: 23 of the 2,094 distinct states of the fixture's
+/// (and the values) differ from the ABSORBED-off model's on a few: 23 of the 2,418 distinct states of the fixture's
 /// runs; the four smallest are kept (the first is the review's seed 155 family). The Rust gives the ABSORBED-ON
 /// document on all of them (the model's absorbed store is loaded as the slots' pairs) and not the off one, which
 /// is what the Q6 rule changes.

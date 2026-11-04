@@ -387,7 +387,7 @@ impl MergeState {
     ///
     /// THE ABSORBED PAIR of a slot (the counter cell). A slot is `(stamp, total)` and an optional
     /// `absorbed` `(stamp, total)`: the highest state of this very slot that a base write had
-    /// held. Five clauses one state can show (items 24 to 28); item 29 says what is NOT checked of a decimal total, and 30 is the version 1 form:
+    /// held. Six clauses are checked (items 24 to 29); 30 is the version 1 form and 31 says what else is NOT checked:
     ///
     /// 24. The absorbed stamp is not above the slot's ([`DecodeError::AbsorbedAboveSlot`]). A base
     ///     write absorbs what its writer holds, and a slot only moves forward, so the pair is the
@@ -430,24 +430,32 @@ impl MergeState {
     ///     (The reference model has one integer type and no decimal arithmetic, see its
     ///     INTERFACE.md: the relation is the Rust counter's, not the model's.)
     ///
-    /// 29. A `Decimal128` total is ANY 16 bytes: NOT checked, and not checkable by the rule "refuse what
-    ///     no honest history produces", because the Writer produces them all. A decimal `$inc` is
-    ///     refused only when the sum overflows from finite inputs (`counter::sum_checked`), nothing
-    ///     in `Value::check_input` looks at the class of a decimal, and a writer's first slot at a
-    ///     path stores the operand's bytes as given (`Writer::inc_plan`), so a NaN (any sign, any
-    ///     payload, signalling or quiet), an infinity, a coefficient above 10^34 - 1, the
-    ///     large-coefficient form and an exponent beyond the range are all slot totals of honest
-    ///     histories, and a base write folds them into the pair (a later increment leaves the pair
-    ///     as it was). `seen` and loss totals are copies of slot totals. So the compact reader takes
-    ///     the 16 bytes of every typed total as they are (slot, pair, `seen`, loss alike), the bytes
-    ///     survive a round trip, the totals are compared byte for byte (so a pair that differs from
-    ///     its slot at the slot's own stamp is refused, `AbsorbedTotalMismatch`, whatever the
-    ///     class), and the reads (`dec_raw_bits`) take any pattern as the value it denotes (a NaN as
-    ///     the one NaN). Tests: `the_writer_takes_nan_infinite_and_non_canonical_decimal_operands`
-    ///     (the Writer side) and
-    ///     `a_nan_or_non_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot`
-    ///     (the decode side). Whether such an operand SHOULD be refused is a question for the
-    ///     write path (a semantic ruling), not for the decode of a state.
+    /// 29. A `Decimal128` total is a word the Writer writes ([`DecodeError::NotCanonicalDecimal`]), for the
+    ///     slot, its absorbed pair, a generation's `seen` and a loss total alike (the one compact reader,
+    ///     `num_payload`). THE DERIVATION. A decimal enters a typed total in three ways, and each ends in
+    ///     `pack_raw`: (a) a writer's first amount at a path, `Num::first_amount` (`Writer::inc_plan`,
+    ///     `None => op.first_amount()`), is the product's `$inc` on an absent field, `Int32(0) + operand`
+    ///     (ADR-252, `update.rs` `decimal_arithmetic`), so a NaN of any sign, payload or signalling bit is the
+    ///     plain quiet NaN, a coefficient above 10^34 - 1 or the large-coefficient form a canonical zero, an
+    ///     infinity stays one (its payload dropped), a negative zero is `+0`, and the exponent of the sum is the
+    ///     smaller of the two; (b) every later sum is `sum_checked`, `Num::add`, `dec_bytes` = `pack_raw`; (c) a
+    ///     base write copies the slot into the pair (`Writer::fold`), a generation's `seen` copies slots
+    ///     (`Writer::seen`), and the loss totals copy slots (`join` parts (2), `receive_loss` takes a peer's
+    ///     only if canonical). `$set` stores a decimal in a REGISTER as given, as the product does; a register
+    ///     value is not a total and is not checked. So the totals of honest histories are exactly the words
+    ///     `pack_raw` writes: a coefficient of at most 10^34 - 1 in the normal form with the exponent in range (the
+    ///     largest biased exponent of the normal form, 12287, is the largest in range, so an out-of-range
+    ///     exponent can only be spelled in the large-coefficient form), the plain quiet NaN, and the two
+    ///     infinities with no payload. `Num::is_canonical` is `dec_bytes(dec_raw(b)) == b`. Refused: a NaN
+    ///     that is not the plain quiet NaN (sign, payload, signalling), an infinity with a payload, a
+    ///     coefficient above 10^34 - 1, the large-coefficient form. Accepted though no writer produces them: a
+    ///     canonical word with a positive exponent or a larger exponent than the sums give (nothing
+    ///     reads it as an error). The totals are still compared byte for byte (a pair that differs from its
+    ///     slot at the slot's own stamp is `AbsorbedTotalMismatch`). Tests:
+    ///     `the_writer_canonicalises_nan_infinite_and_non_canonical_decimal_operands` (the Writer side: the
+    ///     tripwire, it fails if the writer stores a word decode refuses),
+    ///     `a_decimal_total_no_writer_produces_is_refused_wherever_a_total_is_spelled` and
+    ///     `a_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot` (the decode side).
     ///
     /// The version 1 form only (`decode`, not `decode_compact`):
     ///
@@ -456,6 +464,14 @@ impl MergeState {
     ///     the slots' absorbed pairs now, which version 1 cannot spell, so a non-empty count is
     ///     not the encoding of any state. Checked by the version 1 reader, not by `check_decoded`
     ///     (a decoded state has no `obs` to show it).
+    ///
+    /// 31. NOT checked, NOT relied on: other single-state shapes that honest writers keep and that nothing
+    ///     reads as an error. Two are known: a slot whose key's generation stamp is above the slot's own
+    ///     stamp and above its pair's, and a register whose generation stamp is above the register's own
+    ///     stamp. `check_decoded` accepts both. The list is not complete and is not meant to be: the join
+    ///     and the reads are defined for any values (item 23), the hand-built Closed mode draws generations
+    ///     freely, and a clause is added only when a state it refuses cannot be produced and something
+    ///     would read it wrongly.
     ///
     /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
     pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {
@@ -1070,12 +1086,12 @@ impl<'a> Tree<'a> {
         let top = |v: &BTreeMap<&Path, Node>| v.values().map(|n| n.newest).max();
         if ks.is_empty() {
             let v = own?;
-            let shape = if v == Value::Map { Shape::Map(BTreeMap::new()) } else { Shape::Leaf(v) };
+            let shape = if v.is_marker() { Shape::Map(BTreeMap::new()) } else { Shape::Leaf(v) };
             return Some(Node { newest: own_n?, shape });
         }
         match own {
             // a scalar, number or array at q: only the children newer than its register show
-            Some(v) if v != Value::Map => {
+            Some(v) if !v.is_marker() => {
                 let reg = cells.and_then(|c| c.win);
                 let rs = match reg {
                     Some(r) if r.value.is_plain() => r.stamp,

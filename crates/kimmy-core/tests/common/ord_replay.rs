@@ -203,7 +203,7 @@ fn write_op(w: &mut Writer, step: &J) -> Option<Written> {
         "unset" => w.write_unset(&at(), skew),
         "inc" => w.write_inc(&at(), arg["v"].as_i64().unwrap(), skew),
         "replace" => w.write_replace(&fields(arg), skew),
-        "update" => w.write_update(&ops(arg), skew),
+        "update" => w.write_update(&ops(arg), skew).ok().flatten(),
         "delete" => w.write_delete(skew),
         o => panic!("operator {o}"),
     }

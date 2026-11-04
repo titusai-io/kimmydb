@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::tests::{fl, h, i, opts, p, s, wid};
 use super::*;
+use crate::decimal::{Raw, decode_raw_bits};
 use crate::hlc::Hlc;
 
 type SlotKey = (MStamp, Path, WriterId, Option<MStamp>);
@@ -1104,32 +1105,55 @@ fn a_dangling_seen_key_survives_a_numeric_base_and_ends_with_a_non_numeric_one()
     assert_eq!(dangling(&c), 1);
 }
 
-/// A `Decimal128` total that is a NaN or has a non-canonical payload. THE SLOT-TOTAL RULE: the
-/// compact reader takes the 16 bytes of a `Decimal128` as they are (`num_payload`: no check of the
-/// class, the coefficient or the exponent; only an integer payload is bounded, by `MAX_TOTAL`), and
-/// the same reader reads the slot's total, the absorbed total, a `seen` total and a loss total, so
-/// the pair is accepted exactly as the slot is: the bytes survive a round trip untouched, and a pair
-/// that differs from the slot at the slot's own stamp is refused by its bytes (the totals are
-/// compared byte for byte, `Num::eq`), a NaN with another payload included. The reads
-/// (`dec_raw_bits`) take any bit pattern, a NaN as the one NaN, and do not panic.
-#[test]
-fn a_nan_or_non_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot() {
-    let raw = |bits: u128| Num::Decimal128(bits.to_le_bytes());
-    const NAN: u128 = 0b11111 << 122;
-    const INF: u128 = 0b11110 << 122;
-    let payloads = [
-        ("quiet NaN", raw(NAN)),
-        ("negative NaN with a payload", raw(NAN | 1 << 127 | 0x1234)),
-        ("NaN with a payload and the signalling bit", raw(NAN | (1 << 121) | 0xdead_beef)),
+/// THE DECODE OF DECIMAL TOTALS. The Writer produces a `Decimal128` total only through `pack_raw` (the sum of
+/// `sum_checked`, and the writer's first amount, `Num::first_amount`: the product's `0 + operand`), so a total
+/// is one of the words `pack_raw` writes: a coefficient of at most 10^34 - 1 in the normal form with an exponent
+/// in range (a zero with its sign and exponent included), the plain quiet NaN, and the two infinities. The compact
+/// reader (`num_payload`) refuses every other word with `NotCanonicalDecimal`, for every place a typed total is
+/// spelled: the slot, its absorbed pair, a generation's `seen` and a loss. Each class below is derived, not assumed:
+/// `Num::is_canonical` is `dec_bytes(dec_raw(b)) == b`, the round trip through the writer's own packing.
+const NAN: u128 = 0b11111 << 122;
+const INF: u128 = 0b11110 << 122;
+
+/// (what, bits): words a writer can produce.
+fn canonical_words() -> [(&'static str, u128); 6] {
+    [
+        ("quiet NaN", NAN),
+        ("positive infinity", INF),
+        ("negative infinity", INF | 1 << 127),
+        // exponent 8191 - 6176 = 2015 is in range (the largest biased exponent of the normal form is 12287)
+        ("a zero with an exponent in range", 0x1fffu128 << 113),
+        ("negative zero", 1u128 << 127 | 6176u128 << 113),
+        ("a coefficient at 10^34 - 1", (6176u128 << 113) | (10u128.pow(34) - 1)),
+    ]
+}
+
+/// (what, bits): words no writer produces.
+fn non_canonical_words() -> [(&'static str, u128); 8] {
+    [
+        ("negative NaN", NAN | 1 << 127),
+        ("NaN with a payload", NAN | 0x1234),
+        ("negative NaN with a payload", NAN | 1 << 127 | 0x1234),
+        ("NaN with a payload and the signalling bit", NAN | (1 << 121) | 0xdead_beef),
         // a coefficient above 10^34 - 1 reads as a zero (IEEE 754 3.5.2), spelled as it is
-        ("coefficient past the bound", raw((6176u128 << 113) | (10u128.pow(34) + 7))),
+        ("coefficient past the bound", (6176u128 << 113) | (10u128.pow(34) + 7)),
         // the large-coefficient form (bits 125-126 set, neither Infinity nor NaN) reads as a zero
-        ("large-coefficient form", raw(0b11 << 125 | 5)),
-        ("negative infinity", raw(INF | 1 << 127)),
-        ("a zero with an exponent beyond the range", raw(0x1fffu128 << 113)),
-    ];
+        ("large-coefficient form", 0b11 << 125 | 5),
+        ("infinity with a payload", INF | 5),
+        ("negative infinity with a payload", INF | 1 << 127 | 1),
+    ]
+}
+
+fn raw_num(bits: u128) -> Num {
+    Num::Decimal128(bits.to_le_bytes())
+}
+
+#[test]
+fn a_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot() {
     let o = opts();
-    for (what, payload) in payloads {
+    for (what, bits) in canonical_words() {
+        let payload = raw_num(bits);
+        assert!(payload.is_canonical(), "{what}");
         // as the slot's total, alone
         let mut slot_only = paired();
         slot_only.slots.values_mut().for_each(|x| {
@@ -1170,61 +1194,177 @@ fn a_nan_or_non_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_f
             let _ = back.value(&p("x"), &o);
             let _ = back.hidden(&p("x"), &o);
         }
-        // at the slot's own stamp the pair must equal the slot byte for byte: another payload of
-        // the same class is another total, for the pair as for any other comparison of totals
-        let other = match payload {
-            Num::Decimal128(b) => {
-                let mut b = b;
-                b[0] ^= 1;
-                Num::Decimal128(b)
-            }
-            n => n,
-        };
+        // at the slot's own stamp the pair must equal the slot byte for byte: another (canonical) total is another total
         let mut mismatch = paired();
         mismatch.slots.values_mut().for_each(|x| {
             x.total = payload;
-            x.absorbed = Some((x.stamp, other));
+            x.absorbed = Some((x.stamp, if payload == dec("1") { dec("2") } else { dec("1") }));
         });
         refuses(&mismatch, DecodeError::AbsorbedTotalMismatch);
     }
 }
 
+/// A state with a slot, its absorbed pair, a generation's `seen` and a loss total, every one a decimal.
+fn state_with_every_place_of_a_total() -> MergeState {
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    w.write_inc_value(&p("x"), &dval("5"), 0).unwrap();
+    w.write_set(&p("x"), s("t"), 0).unwrap(); // a base write: the pair, and a generation that has seen the slot
+    let mut good = w.state.without_ords();
+    good.losses.insert(
+        LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
+        LossValue::Total(dec("3")),
+    );
+    assert!(good.slots.values().all(|x| x.absorbed.is_some()));
+    assert!(good.regs.values().any(|r| r.generation.as_ref().is_some_and(|g| !g.seen.is_empty())));
+    accepts(&good);
+    good
+}
+
+#[test]
+fn a_decimal_total_no_writer_produces_is_refused_wherever_a_total_is_spelled() {
+    let good = state_with_every_place_of_a_total();
+    for (what, bits) in non_canonical_words() {
+        let payload = raw_num(bits);
+        assert!(!payload.is_canonical(), "{what}");
+        let refused = |st: &MergeState, place: &str| {
+            assert_eq!(
+                MergeState::decode_compact(&st.encode_compact()),
+                Err(DecodeError::NotCanonicalDecimal),
+                "{what} as {place}"
+            );
+        };
+        // the slot's total, alone
+        let mut st = paired();
+        st.slots.values_mut().for_each(|x| {
+            x.total = payload;
+            x.absorbed = None;
+        });
+        refused(&st, "a slot total");
+        // the absorbed total, below a Decimal128 slot
+        let mut st = paired();
+        st.slots.values_mut().for_each(|x| {
+            x.total = dec("7");
+            x.absorbed = Some((st3(), payload));
+        });
+        refused(&st, "an absorbed total");
+        // both, at the slot's own stamp
+        let mut st = paired();
+        st.slots.values_mut().for_each(|x| {
+            x.total = payload;
+            x.absorbed = Some((x.stamp, payload));
+        });
+        refused(&st, "a slot and its pair");
+        // a generation's `seen` total
+        let mut st = good.clone();
+        for r in st.regs.values_mut() {
+            if let Some(g) = r.generation.as_mut() {
+                g.seen.values_mut().for_each(|t| *t = payload);
+            }
+        }
+        refused(&st, "a seen total");
+        // a loss total
+        let mut st = good.clone();
+        st.losses.values_mut().for_each(|v| *v = LossValue::Total(payload));
+        refused(&st, "a loss total");
+        // and a loss entry a peer sends is not stored either: the state could not be read back
+        let mut w = Writer::new(wid('A', 0), opts());
+        w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+        let key = LossKey::field(LossKind::Clash, p("x"), *w.state.lives.keys().next().unwrap());
+        assert!(!w.receive_loss(key.clone(), LossValue::Total(payload)), "{what}: a loss entry");
+        assert!(w.receive_loss(key, LossValue::Total(dec("3"))));
+    }
+}
+
+/// WHY NO CLAUSE "THE EXPONENT IS AT MOST 0" IS ADDED to `NotCanonicalDecimal`. The exponent of a first amount is the
+/// smaller of the operand's and zero, but a LATER sum whose exact coefficient would need more than 34 digits is rounded
+/// to 34 and its exponent RISES: 9999999999999999999999999999999999 + 1 is 1.000000000000000000000000000000000E+34, an
+/// honest total with a positive exponent (the product's `$inc` rounds the same way, ADR-252). Such a clause would refuse
+/// states that honest writers hold. Built through the Writer's own arithmetic (`$inc` of the largest 34-digit integer
+/// and then of 1 at one slot, a base write, a loss), the word is a slot total, an absorbed total, a generation's `seen`
+/// total and a loss total, and decode accepts every one.
+#[test]
+fn an_honest_total_with_a_positive_exponent_is_accepted_for_the_slot_the_pair_seen_and_the_loss() {
+    let exponent = |n: &Num| match n {
+        Num::Decimal128(b) => match decode_raw_bits(u128::from_le_bytes(*b)) {
+            Raw::Finite { exponent, .. } => exponent,
+            r => panic!("{r:?}"),
+        },
+        n => panic!("{n:?}"),
+    };
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    w.write_inc_value(&p("x"), &dval("9999999999999999999999999999999999"), 0).unwrap();
+    w.write_inc_value(&p("x"), &dval("1"), 0).unwrap(); // the sum needs 35 digits: rounded, the exponent rises
+    w.write_set(&p("x"), s("t"), 0).unwrap(); // a base write: the pair, and a generation that has seen the slot
+    let mut good = w.state.without_ords();
+    let slot = good.slots.values().next().unwrap().total;
+    assert!(exponent(&slot) > 0, "the rounded sum has a positive exponent: {slot:?}");
+    assert!(slot.is_canonical());
+    let pair = good.slots.values().next().unwrap().absorbed.unwrap().1;
+    assert_eq!(pair, slot, "the base write folded the rounded total");
+    let seen: Vec<Num> = good
+        .regs
+        .values()
+        .filter_map(|r| r.generation.as_ref())
+        .flat_map(|g| g.seen.values().copied())
+        .collect();
+    assert!(seen.iter().any(|n| exponent(n) > 0), "a generation's seen holds it");
+    good.losses.insert(
+        LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
+        LossValue::Total(slot),
+    );
+    accepts(&good);
+}
+
+fn st3() -> MStamp {
+    st(3, 'A')
+}
+
 /// WHAT THE WRITER CAN PRODUCE as a Decimal128 total (the derivation behind the decode of decimals,
 /// kept as a test so it cannot drift). `inc_result` / `sum_checked` refuse a decimal sum only when it
 /// overflows from FINITE inputs (`Num::decimal_overflowed`), and no check of the operand looks at its
-/// class (`Value::check_input`), so a NaN or an infinite operand is a legal `$inc`; and the first slot
-/// of a writer at a path stores the operand as it was given (`Writer::inc_plan`: `None => op`), so the
-/// bytes of a NaN with a payload or of a non-canonical coefficient survive into the slot verbatim.
-/// Later sums are canonical (`pack_raw` asserts it), but a base write folds the verbatim total into
-/// the pair, which a later increment leaves. So every 16-byte pattern is a slot total, a pair, and
-/// (copied) a `seen` or a loss total of an honest history, and decode refuses none of them.
+/// class (`Value::check_input`), so a NaN or an infinite operand is a legal `$inc`. The writer's first
+/// amount at a path is what the product stores for `$inc` on an absent field, `0 + operand`
+/// (`Writer::inc_plan`: `op.first_amount()`, ADR-252), so the bytes of a NaN with a payload or of a
+/// non-canonical coefficient are canonicalised there (the plain quiet NaN, a canonical zero; an infinity
+/// stays one, a negative zero becomes `+0`) and never reach the slot. Later sums are canonical (`pack_raw`
+/// asserts it), a base write folds the canonical total into the pair, and `seen` and the loss totals are copies.
+/// So the totals a writer holds are exactly the words `pack_raw` writes (`Num::is_canonical`), and decode refuses
+/// the others (`a_decimal_total_no_writer_produces_is_refused_wherever_a_total_is_spelled`). The operand a `$set`
+/// stores in a REGISTER is not a total and stays as given (the product's `$set` stores the value as given too).
 #[test]
-fn the_writer_takes_nan_infinite_and_non_canonical_decimal_operands() {
+fn the_writer_canonicalises_nan_infinite_and_non_canonical_decimal_operands() {
     let o = opts();
     let x = p("x");
     let raw = |bits: u128| Value::Decimal128(bits.to_le_bytes());
-    const NAN: u128 = 0b11111 << 122;
-    const INF: u128 = 0b11110 << 122;
-    let cases: [(&str, u128); 7] = [
-        ("quiet NaN", NAN),
-        ("negative NaN with a payload", NAN | 1 << 127 | 0x1234),
-        ("NaN with a payload and the signalling bit", NAN | (1 << 121) | 0xdead_beef),
-        ("coefficient past 10^34 - 1", (6176u128 << 113) | (10u128.pow(34) + 7)),
-        ("large-coefficient form", 0b11 << 125 | 5),
-        ("negative infinity", INF | 1 << 127),
-        ("a zero with an exponent beyond the range", 0x1fffu128 << 113),
+    // (what, the operand's bits, the bits the writer stores)
+    let cases: [(&str, u128, u128); 9] = [
+        ("quiet NaN", NAN, NAN),
+        ("negative NaN with a payload", NAN | 1 << 127 | 0x1234, NAN),
+        ("NaN with a payload and the signalling bit", NAN | (1 << 121) | 0xdead_beef, NAN),
+        // a coefficient past 10^34 - 1 reads as the zero 0E0 (exponent 6176 - 6176)
+        ("coefficient past 10^34 - 1", (6176u128 << 113) | (10u128.pow(34) + 7), 6176u128 << 113),
+        // the large-coefficient form reads as the zero with the smallest exponent
+        ("large-coefficient form", 0b11 << 125 | 5, 0),
+        ("negative infinity", INF | 1 << 127, INF | 1 << 127),
+        ("positive infinity", INF, INF),
+        ("infinity with a payload", INF | 5, INF),
+        // canonical, but the product's `0 + 0E2015` is `0E0` (the exponent of a sum is the smaller one)
+        ("a zero with an exponent in range", 0x1fffu128 << 113, 6176u128 << 113),
     ];
     let bytes = |n: &Num| match n {
         Num::Decimal128(b) => u128::from_le_bytes(*b),
         n => panic!("{n:?}"),
     };
-    for (what, bits) in cases {
+    for (what, bits, canonical) in cases {
         let mut w = Writer::new(wid('A', 0), o.clone());
         w.insert(&fl(&[("x", i(1))]), 0).unwrap();
-        // the first increment of the writer: the operand's bytes are the slot total, untouched
+        // the first increment of the writer: the slot total is the canonical sum with zero, never the operand's bytes
         w.write_inc_value(&x, &raw(bits), 0).unwrap_or_else(|| panic!("{what}: refused"));
         let sl = w.state.slots.values().next().unwrap().clone();
-        assert_eq!(bytes(&sl.total), bits, "{what}: stored verbatim");
+        assert_eq!(bytes(&sl.total), canonical, "{what}: canonicalised");
+        assert!(sl.total.is_canonical());
         accepts(&w.state);
         // a base write folds it into the pair, and a later increment moves the slot and leaves the pair
         w.write_set(&x, i(5), 0).unwrap();
@@ -1232,10 +1372,22 @@ fn the_writer_takes_nan_infinite_and_non_canonical_decimal_operands() {
         let sl = w.state.slots.values().next().unwrap().clone();
         assert_eq!(
             bytes(&sl.absorbed.as_ref().unwrap().1),
-            bits,
-            "{what}: the pair keeps the bytes"
+            canonical,
+            "{what}: the pair keeps them"
         );
         assert!(sl.absorbed.as_ref().unwrap().0 < sl.stamp);
+        assert!(sl.total.is_canonical());
         accepts(&w.state);
     }
+    // a negative zero operand is the product's `0 + -0` = `+0`
+    let mut w = Writer::new(wid('A', 0), o);
+    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    w.write_inc_value(&x, &raw(1u128 << 127 | 6176u128 << 113), 0).unwrap();
+    assert_eq!(bytes(&w.state.slots.values().next().unwrap().total), 6176u128 << 113);
+    // and `$set` of a decimal stays as given: a register's value, not a total
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    let odd = NAN | 1 << 127 | 0x1234;
+    w.write_set(&x, raw(odd), 0).unwrap();
+    assert_eq!(w.state.regs.values().find(|r| r.value != Value::Map).unwrap().value, raw(odd));
 }

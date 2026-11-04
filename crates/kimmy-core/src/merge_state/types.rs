@@ -189,6 +189,11 @@ pub enum Value {
     Document(Vec<(String, Value)>),
     /// The explicit map marker. See above.
     Map,
+    /// The IMPLICIT map marker (the model's `MAPI`): the register value a leaf write puts at
+    /// each ancestor map the writer did not see. It reads as an empty map, like [`Value::Map`],
+    /// and is never a loser the join reports. Like `Map` it is never a value a caller hands in
+    /// and never inside an array.
+    ImplicitMap,
 }
 
 /// A value that is not legal where it was put.
@@ -211,7 +216,13 @@ pub enum InvalidValue {
 impl Value {
     /// A plain value of a cell: not an unset and not the map marker (the model's `is_val`).
     pub fn is_plain(&self) -> bool {
-        !matches!(self, Value::Unset | Value::Map)
+        !matches!(self, Value::Unset | Value::Map | Value::ImplicitMap)
+    }
+
+    /// A map marker of either kind (the model's `MARKERS`): the explicit [`Value::Map`] or the
+    /// implicit [`Value::ImplicitMap`].
+    pub fn is_marker(&self) -> bool {
+        matches!(self, Value::Map | Value::ImplicitMap)
     }
 
     /// May this value be a register of the state? Not a top-level `Document`; an array's
@@ -219,7 +230,7 @@ impl Value {
     pub fn check_register(&self) -> Result<(), InvalidValue> {
         match self {
             Value::Document(_) => Err(InvalidValue::DocumentAsRegister),
-            Value::Map => Ok(()),
+            Value::Map | Value::ImplicitMap => Ok(()),
             v => v.check_element(0),
         }
     }
@@ -227,7 +238,7 @@ impl Value {
     /// May this value be inside an array (`depth` levels of arrays and documents down)?
     fn check_element(&self, depth: usize) -> Result<(), InvalidValue> {
         match self {
-            Value::Map => Err(InvalidValue::MapMarker),
+            Value::Map | Value::ImplicitMap => Err(InvalidValue::MapMarker),
             Value::Array(a) => {
                 if depth >= super::codec::MAX_VALUE_DEPTH {
                     return Err(InvalidValue::TooDeep);
@@ -267,7 +278,7 @@ impl Value {
                 }
                 f.iter().try_for_each(|(_, x)| x.check_input_at(depth + 1))
             }
-            Value::Map => Err(InvalidValue::MapMarker),
+            Value::Map | Value::ImplicitMap => Err(InvalidValue::MapMarker),
             v => v.check_register(),
         }
     }
@@ -336,7 +347,7 @@ impl PartialEq for Value {
             }
             (Value::Array(a), Value::Array(b)) => a == b,
             (Value::Document(a), Value::Document(b)) => a == b,
-            (Value::Map, Value::Map) => true,
+            (Value::Map, Value::Map) | (Value::ImplicitMap, Value::ImplicitMap) => true,
             _ => false,
         }
     }

@@ -180,6 +180,8 @@ pub struct Node {
     epoch_ctr: u64,
     epoch_rng: Rng,
     saved: Option<Saved>,
+    /// ORACLE ONLY: what the write about to be logged did to the order (`order_oracle::write_ord`).
+    pending: Option<order_oracle::WriteOrd>,
 }
 
 fn raise(vec: &mut Vec2, o: WriterId, h: Hlc) {
@@ -217,6 +219,7 @@ impl Node {
             epoch_ctr: 0,
             epoch_rng: Rng::new(20_261_031 ^ u64::from(name as u32)),
             saved: None,
+            pending: None,
         }
     }
 
@@ -267,8 +270,12 @@ impl Node {
     /// The model's `finish` tail: the writer already holds the normalised state;
     /// log the write with its causal past and append its entry.
     pub fn logged(&mut self, wr: Option<Written>, log: &mut Log) -> Option<MStamp> {
+        let pending = self.pending.take();
         let wr = wr?;
         let st = wr.stamp;
+        if let Some(w) = pending {
+            order_oracle::record(st, w, wr.record.life, log.is_empty());
+        }
         log.insert(st, (self.contained.clone(), wr.record));
         self.contained.insert(st);
         let ent = Ent::W { st, state: self.w.state.clone(), contained: self.contained.clone() };
@@ -488,10 +495,12 @@ impl Node {
             .check_writes
             .then(|| oracle::oracle_at(log, &self.contained, self.ret(), self.bound()));
         let before = self.w.state.ordered_document(&self.w.opts);
-        let history = self.history();
+        let places = order_oracle::places(&self.contained, self.w.alive().last().copied());
         let one_life = self.w.alive().len() == 1;
         let r = write(&mut self.w);
-        self.read_your_writes(before, history, one_life, order_oracle::op_of(&intent), r.is_some());
+        let op = order_oracle::op_of(&intent);
+        self.pending = r.is_some().then(|| order_oracle::write_ord(before.as_deref(), &op));
+        self.read_your_writes(before, places, one_life, op, r.is_some());
         if let Some(old) = old
             && let Err(e) =
                 oracle::check_write(old.as_ref(), &intent, r.as_ref().map(|w| &w.record))
@@ -501,26 +510,12 @@ impl Node {
         r
     }
 
-    /// The paths that have history in the writer's order state: a standing candidate in some life.
-    fn history(&self) -> BTreeSet<Vec<String>> {
-        self.w
-            .state
-            .ords
-            .iter()
-            .filter(|(_, e)| !e.firsts.is_empty() || e.last.is_some())
-            .filter_map(|((_, at), _)| match at {
-                kimmy_core::merge_state::OrdAt::Field(p) => Some(p.segments().to_vec()),
-                kimmy_core::merge_state::OrdAt::Root => None,
-            })
-            .collect()
-    }
-
     /// Read-your-writes order: after an accepted write the writer's own ordered document is the one the
     /// serial reference gives (see `order_oracle`).
     fn read_your_writes(
         &mut self,
         before: Option<Vec<(String, kimmy_core::merge_state::OrderedValue)>>,
-        history: BTreeSet<Vec<String>>,
+        places: order_oracle::Places,
         one_life: bool,
         op: OrdOp,
         wrote: bool,
@@ -535,7 +530,7 @@ impl Node {
         }
         let after = self.w.state.ordered_document(&self.w.opts);
         let one_life = one_life && self.w.alive().len() == 1;
-        match order_oracle::check(before.as_deref(), after.as_deref(), &op, &history, one_life) {
+        match order_oracle::check(before.as_deref(), after.as_deref(), &op, &places, one_life) {
             Ok(c) => {
                 self.order_checks += usize::from(c.any);
                 self.order_last_checks += usize::from(c.last);
@@ -567,7 +562,7 @@ impl Node {
     pub fn upsert_inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
         let held = self.holds_slot_in_alive_life();
         let before = self.w.state.ordered_document(&self.w.opts);
-        let history = self.history();
+        let places = order_oracle::places(&self.contained, self.w.alive().last().copied());
         let one_life = self.w.alive().len() == 1;
         let r = self.w.upsert_inc(&p(path), n, skew);
         assert!(
@@ -575,13 +570,9 @@ impl Node {
             "{}: an upsert was accepted over a slot of an alive life",
             self.name
         );
-        self.read_your_writes(
-            before,
-            history,
-            one_life,
-            OrdOp::Upsert(vec![path.to_string()]),
-            r.is_some(),
-        );
+        let op = OrdOp::Upsert(vec![path.to_string()]);
+        self.pending = r.is_some().then(|| order_oracle::write_ord(before.as_deref(), &op));
+        self.read_your_writes(before, places, one_life, op, r.is_some());
         self.logged(r, log)
     }
     /// A `$setOnInsert` upsert: two sequential writes by one writer (the creation
@@ -603,8 +594,11 @@ impl Node {
             .chain([inc_path.to_string()])
             .collect();
         let before = self.w.state.ordered_document(&self.w.opts);
-        let history = self.history();
+        let places = order_oracle::places(&self.contained, self.w.alive().last().copied());
         let one_life = self.w.alive().len() == 1;
+        let inc_name = inc_path.to_string();
+        let creation: Vec<String> =
+            fields.iter().chain(sets).map(|(k, _)| (*k).to_string()).collect();
         let inc_path = p(inc_path);
         let held = self.holds_slot_in_alive_life();
         let created = self.w.upsert_soi_create(&fl(fields), &inc_path, &fl(sets), skew);
@@ -613,9 +607,15 @@ impl Node {
             "{}: an upsert creation was accepted over a slot of an alive life",
             self.name
         );
+        self.pending = created
+            .is_some()
+            .then(|| order_oracle::write_ord(before.as_deref(), &OrdOp::Upsert(creation)));
         let s1 = self.logged(created, log)?;
         let incd = self.w.upsert_inc_on(s1, &inc_path, n, skew);
-        self.read_your_writes(before, history, one_life, OrdOp::Upsert(names), incd.is_some());
+        self.pending = incd.is_some().then(|| {
+            order_oracle::write_ord(before.as_deref(), &OrdOp::Upsert(vec![inc_name.clone()]))
+        });
+        self.read_your_writes(before, places, one_life, OrdOp::Upsert(names), incd.is_some());
         self.logged(incd, log)
     }
     pub fn set(&mut self, path: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {

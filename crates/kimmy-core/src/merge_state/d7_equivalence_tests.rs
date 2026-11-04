@@ -35,6 +35,10 @@
 //! This test RETIRES deliberately (the file is deleted, with its line in `mod.rs`) at the counter cell,
 //! the next change of join semantics (the absorbed rule and the new slot layout): from then on the
 //! frozen copies describe code that is meant to differ. The five full sweeps stay `#[ignore]`d.
+//!
+//! O4 (the implicit marker) is applied to the frozen copies by hand, at three places: the join
+//! reports no `clash` whose loser is an implicit marker, and the read treats `ImplicitMap` as
+//! `Map` (two tests of the tree). Nothing else of the frozen code changed.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -789,6 +793,10 @@ mod frozen {
                 for b in &rt {
                     if a.stamp != b.stamp && !cov(&t.vv, &a.stamp) && !cov(&s.vv, &b.stamp) {
                         let lo = if a.stamp < b.stamp { a } else { b };
+                        // O4: an implicit marker is never a reported loser (the same line as the live join)
+                        if lo.value == Value::ImplicitMap {
+                            continue;
+                        }
                         let arrays =
                             matches!((&a.value, &b.value), (Value::Array(_), Value::Array(_)));
                         let kind = if arrays && !o.array_clash_as_clash() {
@@ -1287,12 +1295,12 @@ mod frozen {
             if ks.is_empty() {
                 let v = own?;
                 let shape =
-                    if v == Value::Map { Shape::Map(BTreeMap::new()) } else { Shape::Leaf(v) };
+                    if v.is_marker() { Shape::Map(BTreeMap::new()) } else { Shape::Leaf(v) };
                 return Some(Node { newest: own_n?, shape });
             }
             match own {
                 // a scalar, number or array at q: only the children newer than its register show
-                Some(v) if v != Value::Map => {
+                Some(v) if !v.is_marker() => {
                     let reg = self.st.frozen_winner_in(q, self.al, self.o);
                     let rs = match reg {
                         Some(r) if r.value.is_plain() => r.stamp,

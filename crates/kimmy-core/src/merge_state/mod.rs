@@ -12,10 +12,11 @@
 //!   marker at its path plus a cell for each leaf (an array is one atomic value). The read side
 //!   applies the recursive type rule ([`MergeState::visible`]); a write diffs a sub-document
 //!   against what the writer sees and writes only the leaves that changed; a write below a scalar
-//!   or an array is refused; the join reports `typeClash` and `arrayClash`. NOT built here, by
-//!   ruling: the implicit map marker a leaf write would leave on absent parents (so an emptied
-//!   implicit map vanishes), a map-creating `$inc` and the multi-operator update, which the
-//!   next model round revises.
+//!   or an array is refused; the join reports `typeClash` and `arrayClash`. A leaf write
+//!   (`$set`, `$inc`, an update) that creates the maps above it also writes an IMPLICIT map
+//!   marker ([`Value::ImplicitMap`]) at each of them, in the same write: the map then stays as
+//!   `{}` when its last leaf is unset, and the join never reports a marker as a loser. An
+//!   upsert's creation, an insert, a replace and an unset write none.
 //! * The field order (`ord.rs`, option A): [`MergeState::ords`] holds, per `(life, path)`, a
 //!   [`FieldOrd`] (floor, per-writer firsts, last, level floor), joined with the cells by
 //!   [`ord_join`]; [`MergeState::ordered_document`] reads the document in that order. The state,
@@ -35,6 +36,10 @@
 //!   Each write takes its stamp from the writer's own clock (`write_set(.., skew)`) or, for
 //!   the engine, from outside (`write_set_stamped(.., &mut || stamp)`): the stamp must be
 //!   the writer's own and above everything it has used or seen ([`StampError`]).
+//! * [`Writer::write_update`] is the multi-operator update: `$set`, `$unset` and `$inc` on pairwise
+//!   disjoint paths ([`UpdateOp`]) under ONE stamp, atomic. A refusal is `Err` with its reason
+//!   ([`UpdateRefused`]) and changes nothing; `Ok(None)` is a no-op. The other update operators of the
+//!   product are computed by the caller and sent as a `$set` of the new value (an array is one atomic value).
 //! * [`MergeState::canonical_bytes`] and [`MergeState::state_hash`] give a
 //!   deterministic encoding and a 128-bit digest; [`MergeState::encode`] and
 //!   [`MergeState::decode`] round-trip a whole state. `compact.rs` is the compact
@@ -89,6 +94,8 @@ mod prop_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod update_tests;
+#[cfg(test)]
 mod work_tests;
 
 pub use codec::{DecodeError, V1CannotHold};
@@ -105,9 +112,10 @@ pub use types::{
     Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
     WriterId,
 };
-#[cfg(any(test, feature = "merge-mutants"))]
-pub use writer::UpdateOp;
-pub use writer::{Received, StampError, WriteKind, WriteRecord, Writer, Written};
+pub use writer::{
+    Received, StampError, UpdateError, UpdateOp, UpdateRefused, WriteKind, WriteRecord, Writer,
+    Written,
+};
 
 // Production signatures. These items compile in EVERY build (with and without the
 // `merge-mutants` feature, test or not): the mutation switches are private fields of
@@ -224,6 +232,10 @@ const _: () = {
         Writer::write_replace_stamped;
     let _: fn(&mut Writer, Mint) -> Result<Option<Written>, StampError> =
         Writer::write_delete_stamped;
+    let _: fn(&mut Writer, &[UpdateOp], u64) -> Result<Option<Written>, UpdateRefused> =
+        Writer::write_update;
+    let _: fn(&mut Writer, &[UpdateOp], Mint) -> Result<Option<Written>, UpdateError> =
+        Writer::write_update_stamped;
     let _: fn(&mut Writer, &MergeState) -> Received = Writer::receive_report;
     let _: fn(&mut Writer, &MergeState) -> Vec<LossKey> = Writer::receive;
     let _: fn(&mut Writer, LossKey, LossValue) -> bool = Writer::receive_loss;

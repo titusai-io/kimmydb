@@ -17,8 +17,8 @@
 //! against the model's oracle on the Python log.
 //!
 //! THE RESTRICTED SUBSET. The generator draws only what stage A2 does not change and what the Rust
-//! side implements; none of these is lifted here: nulls (Null versus Unset), a map-creating `$inc`
-//! and any leaf write under an absent map (the implicit marker), multi-operator updates (one
+//! side implements (a leaf write under an absent map and a map-creating `$inc` are drawn: the
+//! implicit marker is built); none of these is lifted here: nulls (Null versus Unset), multi-operator updates (one
 //! stamp), restore and covered-entry cases, order state and field order (no order-only write is
 //! drawn and the order of a level is not compared), and the absorbed counter rule. The `same`
 //! patch (a no-op is a write that leaves the stored representation byte-identical: doubles by
@@ -36,7 +36,7 @@
 //!
 //! `Q7DIFF_NESTED_RUNS=<n>` sets the number of scripts (default 300). `python3` must be on the
 //! PATH: if it is not, the tests FAIL (they do not skip). The model is the vendored A2.3 one
-//! (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and no implicit marker. The `merge-mutants` feature is
+//! (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = True` (the counter cell) and `NO_IMPLICIT_MARKER = False` (the implicit marker). The `merge-mutants` feature is
 //! needed (`Cargo.toml`): the test `rust_mutants_are_caught_by_the_replay` turns each nested mutation switch on and
 //! requires the replay to disagree.
 
@@ -115,6 +115,7 @@ fn sort_keys(mut v: Vec<LossKey>) -> Vec<LossKey> {
 fn jv(v: &Value) -> J {
     match v {
         Value::Map => json!(["m"]),
+        Value::ImplicitMap => json!(["mi"]),
         Value::Int64(i) => json!(["i", i.to_string()]),
         Value::Double(d) => json!(["d", format!("{:016x}", d.to_bits())]),
         Value::String(s) => json!(["s", s]),
@@ -170,6 +171,7 @@ fn fv(v: &Value) -> String {
     match v {
         Value::Unset => "u".into(),
         Value::Map => "m".into(),
+        Value::ImplicitMap => "mi".into(),
         Value::Int64(i) => format!("i:{i}"),
         Value::Double(d) => format!("d:{:016x}", d.to_bits()),
         Value::String(s) => format!("s:{}", serde_json::to_string(s).unwrap()),
@@ -731,7 +733,12 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 ///
 /// RE-PINNED for the counter cell (the differential flips to ABSORBED = True, the digest prints each slot's absorbed pair and no
 /// register obs): 0x5b22_de2a_6b43_3270 to 0xed99_fd18_a146_9659. 0 of the 300 scripts disagree with the model.
-const PINNED_300: u64 = 0xed99_fd18_a146_9659;
+///
+/// RE-PINNED for the implicit map markers (item O4: the generator draws a leaf write under an absent map and a map-creating `$inc`, and
+/// the writers write the markers the model writes): 0xed99_fd18_a146_9659 to 0x717f_d665_e31b_848c. 0 of the 300 scripts disagree with the
+/// model (12,100 steps); at 1000 scripts 0xd3c0_83e7_7c70_a108 to 0xc06b_5104_4948_81f2, 0 disagree (40,400 steps). The flat differential
+/// did not move (0x3ddd_f823_ee88_e7c7 at 300, 0x3efb_8f50_95d9_7939 at 1000).
+const PINNED_300: u64 = 0x717f_d665_e31b_848c;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
@@ -850,13 +857,18 @@ fn a_planted_rewrite_of_unchanged_leaves_is_detected() {
     planted("rewrite-unchanged", 60);
 }
 
+#[test]
+fn a_planted_model_without_implicit_markers_is_detected() {
+    planted("no-implicit-marker", 60);
+}
+
 /// The Rust mutation switches the nested replay must notice, by name. A switch that this replay
 /// cannot see is listed in `mutants.rs` with the grader that does.
 #[cfg(feature = "merge-mutants")]
 #[test]
 fn rust_mutants_are_caught_by_the_replay() {
     type Switch = fn(&mut JoinOptions);
-    let cases: [(&str, Switch); 7] = [
+    let cases: [(&str, Switch); 8] = [
         ("a scalar hides every child, even a newer one", |o| o.set_type_ignores_recency(true)),
         ("a map marker hides its children", |o| o.set_marker_hides(true)),
         ("no typeClash is reported", |o| o.set_no_type_clash(true)),
@@ -864,6 +876,9 @@ fn rust_mutants_are_caught_by_the_replay() {
         ("a sub-document write rewrites every leaf", |o| o.set_rewrite_unchanged(true)),
         ("an unset of a map unsets its direct children only", |o| o.set_unset_shallow(true)),
         ("a base write folds only the slots it counts", |o| o.set_fold_counted_only(true)),
+        ("a leaf write under an absent map writes no implicit marker", |o| {
+            o.set_no_implicit_marker(true)
+        }),
     ];
     let scratch = Scratch::new("mut");
     let n = runs().min(300);

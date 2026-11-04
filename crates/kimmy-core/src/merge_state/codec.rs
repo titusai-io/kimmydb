@@ -92,6 +92,8 @@ pub enum DecodeError {
     SlotWriterMismatch,
     #[error("merge state: a slot's absorbed total is of a wider type than the slot's own")]
     AbsorbedWiderThanSlot,
+    #[error("merge state: a Decimal128 total is not one a writer produces (not canonical)")]
+    NotCanonicalDecimal,
     #[error("merge state: an order entry is for a life that `lives` does not list")]
     OrdLifeNotListed,
     #[error("merge state: an order entry holds a candidate its floor voids")]
@@ -181,8 +183,9 @@ impl W {
                 self.u8(3);
                 self.str(s);
             }
-            // 4 is the array; 5 the explicit map marker; 6 is kept for the implicit one.
+            // 4 is the array; 5 the explicit map marker; 6 the implicit one.
             Value::Map => self.u8(5),
+            Value::ImplicitMap => self.u8(6),
             // The check before every write keeps a document out of this form.
             Value::Document(_) => unreachable!("version 1 cannot hold a document (checked)"),
             Value::Array(a) => {
@@ -671,6 +674,7 @@ impl R<'_> {
             }
             // The map marker is a register value, never an element of an array.
             5 if depth == 0 => Ok(Value::Map),
+            6 if depth == 0 => Ok(Value::ImplicitMap),
             7 => Ok(Value::Int32(i32::from_be_bytes(self.arr()?))),
             8 => Ok(Value::Decimal128(self.arr()?)),
             9 => match self.u8()? {
