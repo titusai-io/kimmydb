@@ -712,3 +712,123 @@ fn a_writer_cannot_have_two_histories_but_decode_cannot_tell() {
         "associativity, which one history has"
     );
 }
+
+/// O1-3: the reviewer's example of a single-state shape that breaks associativity against reachable
+/// partners: `{W: (5, W)}`, `{U(7, X)}` and a first KEYED by W but STAMPED by V, `{W: (9, V)}`.
+/// Decode refuses the third (`OrdFirstNotByItsWriter`); were it accepted, the groupings would
+/// disagree: `(a + c) + b` keeps no first for W, `a + (c + b)` keeps `(9, V)`.
+#[test]
+fn a_first_keyed_by_one_writer_and_stamped_by_another_is_refused() {
+    let o = JoinOptions::default();
+    let (wr, x, v) = (w(b'A'), b'B', b'C');
+    let a = FieldOrd {
+        firsts: [(wr, (at(5, b'A'), 0))].into(),
+        last: Some((at(5, b'A'), 0)),
+        ..FieldOrd::default()
+    };
+    let b = FieldOrd { floor: Some(u(7, x, 6, false)), ..FieldOrd::default() };
+    let c = FieldOrd {
+        firsts: [(wr, (at(9, v), 0))].into(),
+        last: Some((at(9, v), 0)),
+        ..FieldOrd::default()
+    };
+    for ok in [&a, &b] {
+        assert!(
+            MergeState::decode_compact(&entry_state(false, ok.clone()).encode_compact()).is_ok()
+        );
+    }
+    assert_eq!(
+        MergeState::decode_compact(&entry_state(false, c.clone()).encode_compact()),
+        Err(DecodeError::OrdFirstNotByItsWriter)
+    );
+    assert_eq!(
+        c.shape_error(&OrdAt::Field(Path::flat("x").unwrap())),
+        Some(DecodeError::OrdFirstNotByItsWriter)
+    );
+    // what the refusal prevents
+    let left = ord_join(&ord_join(&a, &c, &o), &b, &o);
+    let right = ord_join(&a, &ord_join(&c, &b, &o), &o);
+    assert!(left.firsts.is_empty(), "{left:?}");
+    assert_eq!(right.firsts, [(wr, (at(9, v), 0))].into());
+}
+
+// ---- no panic from decoded input ----------------------------------------------------------
+
+/// O1-8: the version 1 entry points are fallible and refuse a state with an order state, and nothing
+/// a decoded state is given to panics: the reads, the join, every local write of a writer that holds
+/// the state, and the receive of it. The states are the encodings of the corpus (the model's
+/// scenarios and pooled runs with the order state) and those that damage of them still decodes to.
+#[test]
+fn nothing_panics_on_a_decoded_state_and_version_one_refuses_an_order_state() {
+    let o = JoinOptions::default();
+    let corpus = super::compact_tests::ord_corpus();
+    let mut rng = Rng(0x00DE_C0DE_0001);
+    let mut states: Vec<MergeState> =
+        corpus.iter().map(|b| MergeState::decode_compact(b).unwrap()).collect();
+    for _ in 0..4_000 {
+        let mut b = corpus[rng.below(corpus.len())].clone();
+        for _ in 0..1 + rng.below(3) {
+            let i = rng.below(b.len());
+            b[i] = if rng.below(2) == 0 {
+                b[i] ^ (1 << rng.below(8))
+            } else {
+                *rng.pick(&[0u8, 1, 2, 3])
+            };
+        }
+        if let Ok(s) = MergeState::decode_compact(&b) {
+            states.push(s);
+        }
+    }
+    let x = Path::flat("x").unwrap();
+    let (mut with_ords, mut ops) = (0usize, 0usize);
+    for (k, st) in states.iter().enumerate() {
+        if !st.ords.is_empty() {
+            with_ords += 1;
+            assert_eq!(st.try_canonical_bytes(), Err(V1CannotHold));
+            assert_eq!(st.try_state_hash(), Err(V1CannotHold));
+            assert_eq!(st.try_encode(), Err(V1CannotHold));
+        } else if st.v1_can_hold() {
+            assert!(st.try_state_hash().is_ok() && st.try_encode().is_ok());
+        }
+        // the reads
+        let _ = (
+            st.visible(&o),
+            st.ordered_document(&o),
+            st.hidden_all(&o),
+            st.over_caps(&o),
+            st.excess(&o),
+        );
+        let _ =
+            (st.value(&x, &o), st.alive(&o), st.writers(), st.compact_hash(), st.encode_compact());
+        let _ = join(st, st, &o);
+        // a writer that holds the state: every local write, then the receive of the state
+        if k % 3 == 0 {
+            let id = WriterId {
+                node: crate::ids::NodeId::from_bytes([9; 16]),
+                epoch: Epoch::from_u64(7),
+            };
+            let mut wr = Writer::new(id, o.clone());
+            wr.state = st.clone();
+            wr.clock = st.vv.values().copied().max().unwrap_or(Hlc::ZERO);
+            let doc = [
+                (Path::flat("x").unwrap(), Value::Int64(1)),
+                (Path::flat("y").unwrap(), Value::Null),
+            ];
+            wr.write_set(&x, Value::Int64(3), 0);
+            wr.write_set(&Path::new(["x", "z"]).unwrap(), Value::Int64(3), 0);
+            wr.write_unset(&x, 0);
+            wr.write_inc(&x, 5, 0);
+            wr.write_replace(&doc, 0);
+            wr.upsert_inc(&x, 1, 0);
+            wr.write_delete(0);
+            wr.insert(&doc, 0);
+            let _ = wr.receive(st);
+            ops += 1;
+        }
+    }
+    eprintln!(
+        "{} decoded states, {with_ords} with an order state, {ops} writers driven",
+        states.len()
+    );
+    assert!(with_ords > 1_000 && ops > 300, "{with_ords} {ops}");
+}

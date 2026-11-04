@@ -465,6 +465,7 @@ class EncCompact:
                 self.path(key[1])
             self.stamp(key[2])
             self.loss_value(key, st.losses[key])
+        self.vi(0)       # section 10, the order state: its count, 0 (the flat model has none)
 
     def state(self, st):
         """The canonical body: the writer table, the life table, then the sections."""

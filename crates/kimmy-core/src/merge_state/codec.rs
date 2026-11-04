@@ -102,8 +102,6 @@ pub enum DecodeError {
     OrdLevelWithoutLast,
     #[error("merge state: invalid order floor kind {0}")]
     OrdBadFloor(u8),
-    #[error("merge state: the order section is present but empty")]
-    OrdSectionEmpty,
 }
 
 // ---- writing ---------------------------------------------------------------
@@ -362,16 +360,10 @@ impl MergeState {
     /// binary (lives, dead, deletes, registers, slots, version vector, losses).
     /// Mutant memory (`Gen::vv`, `gens`) is not part of it.
     ///
-    /// # Panics
-    ///
-    /// If the state holds a document inside an array ([`MergeState::v1_can_hold`]): this form
-    /// has no tag for one. [`MergeState::try_canonical_bytes`] refuses with an error instead.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        self.try_canonical_bytes().expect("version 1 cannot hold a document in an array")
-    }
-
-    /// [`MergeState::canonical_bytes`], or an error when the state holds a document inside an
-    /// array.
+    /// An error when the version 1 form cannot spell the state ([`MergeState::v1_can_hold`]: a
+    /// document inside an array, a total of another type than `Int64`, an order state). There is no
+    /// infallible twin: a state a peer sent can be one of those, and a panic must not be reachable
+    /// from decoded input (the tests have panicking helpers of their own).
     pub fn try_canonical_bytes(&self) -> Result<Vec<u8>, V1CannotHold> {
         if !self.v1_can_hold() {
             return Err(V1CannotHold);
@@ -381,22 +373,17 @@ impl MergeState {
         Ok(w.0)
     }
 
-    /// A 128-bit digest of [`MergeState::canonical_bytes`]. Not cryptographic:
+    /// A 128-bit digest of [`MergeState::try_canonical_bytes`]. Not cryptographic:
     /// it is a divergence detector. Two lanes of a multiply-rotate mix over
     /// big-endian 8-byte words (the tail zero-padded, the length folded in at
     /// the end), cross-fed, then each lane passed through the splitmix64
-    /// finaliser. Panics where `canonical_bytes` does.
-    pub fn state_hash(&self) -> [u8; 16] {
-        hash128(&self.canonical_bytes())
+    /// finaliser. An error where `try_canonical_bytes` is one.
+    pub fn try_state_hash(&self) -> Result<[u8; 16], V1CannotHold> {
+        Ok(hash128(&self.try_canonical_bytes()?))
     }
 
     /// The whole state, for a round trip with [`MergeState::decode`]: the magic, the format
-    /// version, then [`MergeState::canonical_bytes`]. Panics where `canonical_bytes` does.
-    pub fn encode(&self) -> Vec<u8> {
-        self.try_encode().expect("version 1 cannot hold a document in an array")
-    }
-
-    /// [`MergeState::encode`], or an error when the state holds a document inside an array.
+    /// version, then [`MergeState::try_canonical_bytes`]; an error where that is one.
     pub fn try_encode(&self) -> Result<Vec<u8>, V1CannotHold> {
         let mut out = Vec::from(MAGIC);
         out.push(VERSION);
@@ -476,6 +463,22 @@ impl MergeState {
         }
         s.check_decoded()?;
         Ok(s)
+    }
+}
+
+/// The panicking spellings the tests use on states they build and know the version 1 form can hold.
+#[cfg(test)]
+impl MergeState {
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        self.try_canonical_bytes().expect("the test state is one version 1 can hold")
+    }
+
+    pub(crate) fn state_hash(&self) -> [u8; 16] {
+        self.try_state_hash().expect("the test state is one version 1 can hold")
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        self.try_encode().expect("the test state is one version 1 can hold")
     }
 }
 

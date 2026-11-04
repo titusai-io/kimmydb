@@ -134,9 +134,9 @@ impl Mem {
 fn snap(ms: &[Mem]) -> Vec<J> {
     ms.iter()
         .map(|m| {
-            let cb = m.w.state.canonical_bytes();
+            let cb = m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states");
             json!({
-                "h": hex(&m.w.state.state_hash()),
+                "h": hex(&m.w.state.try_state_hash().expect("version 1 spells the differential's states")),
                 "len": cb.len(),
                 "ch": hex(&m.w.state.compact_hash()),
                 "clen": m.w.state.compact_bytes().len(),
@@ -341,7 +341,12 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     }
     // final full-mesh sync
     for _ in 0..12 {
-        let before: Vec<Vec<u8>> = ms.iter().map(|m| m.w.state.canonical_bytes()).collect();
+        let before: Vec<Vec<u8>> = ms
+            .iter()
+            .map(|m| {
+                m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states")
+            })
+            .collect();
         for r in 0..nm {
             for s in 0..nm {
                 if r != s {
@@ -352,7 +357,14 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
                 }
             }
         }
-        if ms.iter().map(|m| m.w.state.canonical_bytes()).collect::<Vec<_>>() == before {
+        if ms
+            .iter()
+            .map(|m| {
+                m.w.state.try_canonical_bytes().expect("version 1 spells the differential's states")
+            })
+            .collect::<Vec<_>>()
+            == before
+        {
             break;
         }
     }
@@ -569,7 +581,7 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// generator's pools: the pools grew, the code did not change. The old code (`8e36e8de`) gives this
 /// value on the new pools, as the new code does (the equivalence test of the D7 pass, retired when the order state changed the join, pinned it). Any
 /// other change to it is a change of behaviour, never to be re-pinned for speed.
-const PINNED_300: u64 = 0xe9e4_3cfc_7a1b_a621;
+const PINNED_300: u64 = 0x55c8_39db_ba2a_e84a;
 
 #[test]
 fn differential_against_the_python_model() {
@@ -644,11 +656,11 @@ fn golden_vectors_match_the_model() {
         "delete": ["0b4d37ac9b577c417603e7c9bce83933", 542],
         "obs": ["f96f244c2b3198f724fcea0eafec32c7", 1325],
         // the compact form (compact.rs), hashed with the same mix; compact_tests.rs pins the same
-        "empty-compact": ["e145d6a7daf371398c7b574cd9aa42d4", 9],
-        "170-compact": ["45e14c7b5dd32f32f7cf6543335f3fb1", 213],
-        "mixed-compact": ["855d32c60d7c369fb409ecf4d6b6331a", 340],
-        "delete-compact": ["95a3e75ef534ce08fd975b1224a8af76", 233],
-        "obs-compact": ["d785253ed2c10e27e148d2a7f2f251cd", 255],
+        "empty-compact": ["6a9f06d361f4fb8c789c079f6563280a", 10],
+        "170-compact": ["9852c38d33bbede32993a047338b65f3", 214],
+        "mixed-compact": ["220d1eaef3e4f5a85dc9516dc3f0edaa", 341],
+        "delete-compact": ["13a5a3379b963c8ee4ac35a7102437df", 234],
+        "obs-compact": ["f0a36fa50cacf322ad787f91a73c2a97", 256],
     });
     assert_eq!(got, want);
 }

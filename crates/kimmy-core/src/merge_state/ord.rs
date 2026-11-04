@@ -43,6 +43,7 @@
 //! Stamps order by `(hlc, node, epoch)` and a path by its segments. Where the model compares a
 //! dotted string the Rust compares the segment lists (`INTERFACE.md`, section 2).
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::codec::DecodeError;
@@ -429,11 +430,66 @@ impl OrderedValue {
     }
 }
 
+/// The results of `born_of` within ONE read of one state: `born_of` is a pure function of the state,
+/// the path and the alive lives, and the clamp asks for the position of every descendant, each of
+/// which asks for its own descendants (the model recomputes them: 2^(depth - 1) evaluations for a
+/// chain of survivors, a few kilobytes of decodable input). Memoised, each path is evaluated once.
+/// `memoise: false` is the unmemoised reference the tests compare with.
+pub(crate) struct BornMemo {
+    memoise: bool,
+    memo: RefCell<BTreeMap<Path, Option<Born>>>,
+    /// How many times `born_of` evaluated a path (not answered from the memo).
+    evaluations: Cell<usize>,
+}
+
+impl BornMemo {
+    pub(crate) fn new(memoise: bool) -> Self {
+        Self { memoise, memo: RefCell::new(BTreeMap::new()), evaluations: Cell::new(0) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evaluations(&self) -> usize {
+        self.evaluations.get()
+    }
+}
+
 impl MergeState {
     /// The position key of `p` over the alive lives (the model's `born_of`): the order entries of
     /// the alive lives, which are one document, join first; then the survivor clamp and the level
     /// floor. `None` when nothing gives `p` a place.
+    #[cfg(test)]
     pub(crate) fn born_of(&self, p: &Path, al: &BTreeSet<MStamp>, o: &JoinOptions) -> Option<Born> {
+        self.born_in(p, al, o, &BornMemo::new(true))
+    }
+
+    /// [`MergeState::born_of`] within one read: answered from `memo` when the path was evaluated.
+    fn born_in(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        o: &JoinOptions,
+        memo: &BornMemo,
+    ) -> Option<Born> {
+        if memo.memoise
+            && let Some(b) = memo.memo.borrow().get(p)
+        {
+            return b.clone();
+        }
+        memo.evaluations.set(memo.evaluations.get() + 1);
+        let b = self.born_eval(p, al, o, memo);
+        if memo.memoise {
+            memo.memo.borrow_mut().insert(p.clone(), b.clone());
+        }
+        b
+    }
+
+    fn born_eval(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        o: &JoinOptions,
+        memo: &BornMemo,
+    ) -> Option<Born> {
         let at = OrdAt::Field(p.clone());
         let joined = al
             .iter()
@@ -443,7 +499,7 @@ impl MergeState {
         if !o.ord_no_survivor_clamp()
             && let Some(Floor::U { stamp, prev, others }) = joined.as_ref().and_then(|j| j.floor)
         {
-            for c in self.survivors(p, al, stamp, prev, others, o) {
+            for c in self.survivors(p, al, (stamp, prev, others), o, memo) {
                 if b.as_ref().is_none_or(|x| c < *x) {
                     b = Some(c);
                 }
@@ -482,11 +538,11 @@ impl MergeState {
         &self,
         p: &Path,
         al: &BTreeSet<MStamp>,
-        floor: MStamp,
-        prev: Hlc,
-        others: bool,
+        unset: (MStamp, Hlc, bool),
         o: &JoinOptions,
+        memo: &BornMemo,
     ) -> Vec<Born> {
+        let (floor, prev, others) = unset;
         let others = others && !o.ord_ignores_bit();
         let after_known = after_hlc(prev);
         let place = |c: Born| -> Born {
@@ -536,7 +592,7 @@ impl MergeState {
                 && w.value.is_plain()
                 && w.stamp < floor
             {
-                let bq = self.born_of(q, al, o).unwrap_or_else(|| Born::of((w.stamp, 0)));
+                let bq = self.born_in(q, al, o, memo).unwrap_or_else(|| Born::of((w.stamp, 0)));
                 out.push(place(bq));
             }
             out.extend(slot_survivors(q));
@@ -550,11 +606,21 @@ impl MergeState {
     /// documents are the same when they are equal as values: type for type, field order
     /// included (the model's `ordered` and `tyrepr`).
     pub fn ordered_document(&self, o: &JoinOptions) -> Option<Vec<(String, OrderedValue)>> {
+        self.ordered_document_with(o, &BornMemo::new(true))
+    }
+
+    /// [`MergeState::ordered_document`] with the memo of the read given (tests count its
+    /// evaluations, or switch it off to get the unmemoised reference).
+    pub(crate) fn ordered_document_with(
+        &self,
+        o: &JoinOptions,
+        memo: &BornMemo,
+    ) -> Option<Vec<(String, OrderedValue)>> {
         let vis = self.visible(o)?;
         let al = self.alive_set(o.retention);
         let mut kids: Kids = BTreeMap::new();
         for p in vis.keys() {
-            let b = if o.ord_by_name() { None } else { self.born_of(p, &al, o) };
+            let b = if o.ord_by_name() { None } else { self.born_in(p, &al, o, memo) };
             kids.entry(p.parent()).or_default().push((b.is_none(), b, p));
         }
         for list in kids.values_mut() {

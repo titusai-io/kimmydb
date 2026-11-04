@@ -39,8 +39,7 @@
 //!
 //! A body is a sequence of sections in a fixed order. A later format adds a section at the end
 //! (or a field to an existing section) and raises the version byte; this version accepts exactly
-//! these ten, the last of them only when the state has an order state (see the version byte
-//! below):
+//! these ten:
 //!
 //! 1. the **writer table**: a count, then every [`WriterId`] the state mentions, in strictly
 //!    increasing order;
@@ -67,8 +66,8 @@
 //!    path `_`, so that it cannot be mistaken for a field named `_` (the version 1 form cannot
 //!    tell them apart; see `codec.rs`).
 //!
-//! 10. the **order state** (`ords`, the `FieldOrd` of option A, `ord.rs`), present only when the
-//!     state has one: a count of at least 1, then each entry keyed `(life index, path)` like a
+//! 10. the **order state** (`ords`, the `FieldOrd` of option A, `ord.rs`): a count, 0 when the
+//!     state has none (and only then: a state has one spelling), then each entry keyed `(life index, path)` like a
 //!     register (the path as a segment count and the segments, the count 0 being the root of a
 //!     replace, `OrdAt::Root`; strictly increasing in the key order of the map). An entry is
 //!     ONE floor byte, then its parts:
@@ -89,20 +88,26 @@
 //! `obs` keys are a life index, a writer index and a generation as in `slots`; a register's
 //! `obs` entry adds the slot's stamp and total, a generation's `seen` entry the total.
 //!
-//! # The version byte and the presence of section 10
+//! # Section 10 always carries its count
 //!
-//! The version byte is 2 for every state; section 10 is present iff the state has a non-empty
-//! order state, and is the last section, so its presence is decided by whether bytes remain
-//! after the losses.
+//! Section 10 always carries its count, and a count of 0 means no order state; every section has a
+//! count, so the body is self-delimiting and any cut of it is refused (`Truncated`), where a section
+//! present only when non-empty would have let a cut at the end of the losses pass as the same state
+//! without its order state. The version byte is 2 for every state.
 //!
-//! So a state without an order state has exactly the bytes it had before the order state
-//! existed (the golden vectors and every hash of such a state are unchanged), and the body
-//! alone ([`MergeState::compact_bytes`], what the hash covers) is that old body followed by
-//! section 10 when there is one: two states never share a body. A section 10 with a count of 0
-//! is refused ([`DecodeError::OrdSectionEmpty`]) and so are bytes after it, so a state has one
-//! spelling. The limit of the approach: the end of the input can delimit only the LAST optional
-//! section; a future section 11 needs a presence mask, tags, or a version bump (the format is
-//! positional: its sections carry no tags).
+//! # Carriers
+//!
+//! The format detects a cut or an appended byte (`Truncated`, `Trailing`), not a flipped bit inside a
+//! section, so what a carrier must add is the integrity check, and the delimiting it already has. Today:
+//! a stored record's body "needs no length prefix because it runs to the end of the value"
+//! (`docs/storage.md`, the record layout), which the store delimits; a flipped bit that still decodes is
+//! NOT detected by a serving node (`docs/operations.md`, "A flipped bit in a page that still decodes":
+//! redb verifies its page checksums only in repair, rebuild and `check-store`); the cluster frame is
+//! length-prefixed and checked against `MAX_FRAME` before anything is allocated and authenticated with
+//! `cluster_secret` (`docs/threat-model.md`, "A frame sized to exhaust memory"; `docs/roadmap.md`, the
+//! replication transport). So the carrier delimits and the format is complete under a cut; an integrity
+//! check on the compact body (its `compact_hash` next to it) is for Step 2 to add where a bit flip must
+//! not pass. No carrier of the compact form exists yet.
 //!
 //! # Extension points
 //!
@@ -507,14 +512,12 @@ impl MergeState {
             w.loss_key(k);
             w.loss_value(v);
         }
-        // section 10: the order state, only when there is one
-        if !self.ords.is_empty() {
-            w.len(self.ords.len());
-            for ((l, at), x) in &self.ords {
-                w.life(l);
-                w.ord_at(at);
-                w.field_ord(x);
-            }
+        // section 10: the order state, its count first (0 when there is none)
+        w.len(self.ords.len());
+        for ((l, at), x) in &self.ords {
+            w.life(l);
+            w.ord_at(at);
+            w.field_ord(x);
         }
     }
 
@@ -545,7 +548,7 @@ impl MergeState {
     }
 
     /// The compact body of the state: the model's `canon()` made binary (lives, dead, deletes,
-    /// registers, slots, version vector, losses, and the order state when there is one) behind
+    /// registers, slots, version vector, losses, the order state) behind
     /// its writer and life tables. Mutant memory (`Gen::vv`, `gens`) is not part of it.
     pub fn compact_bytes(&self) -> Vec<u8> {
         self.write_compact_body()
@@ -661,18 +664,12 @@ impl MergeState {
             let v = r.loss_value()?;
             put(&mut s.losses, k, v)?;
         }
-        // section 10, the last: present iff bytes remain after the losses
-        if !r.rest.is_empty() {
-            let n = r.len()?;
-            if n == 0 {
-                return Err(DecodeError::OrdSectionEmpty);
-            }
-            for _ in 0..n {
-                let l = r.life()?;
-                let at = r.ord_at()?;
-                let x = r.field_ord()?;
-                put(&mut s.ords, (l, at), x)?;
-            }
+        // section 10: the count (0 when there is no order state), then the entries
+        for _ in 0..r.len()? {
+            let l = r.life()?;
+            let at = r.ord_at()?;
+            let x = r.field_ord()?;
+            put(&mut s.ords, (l, at), x)?;
         }
         r.finish()?;
         s.check_decoded()?;

@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as J;
 
+use super::ord::BornMemo;
 use super::prop_tests::{Rng, check_laws_on, opts};
 use super::*;
 use crate::hlc::Hlc;
@@ -1001,6 +1002,64 @@ fn the_order_join_is_associative_only_on_the_entries_a_history_reaches() {
     let l = ord_join(&ord_join(&early, &later_seen, &o), &unset, &o);
     let r = ord_join(&early, &ord_join(&later_seen, &unset, &o), &o);
     assert_eq!(l, r);
+}
+
+/// A chain of survivors `n1`, `n1.n2`, ... to the given depth, as a state a peer can send (the
+/// reviewer's O1-1): one alive life, a register `Int64(5)` stamped `(2, A)` at every path and an
+/// order entry with an unset floor `(10, A)` (prev 9) at every path. Every entry is normal, its
+/// life listed, its stamps covered: `check_decoded` accepts it. Only `n1` is visible (its scalar
+/// hides the children stamped no later), and every path below it is a survivor candidate of the
+/// one above.
+fn survivor_chain(depth: usize) -> MergeState {
+    let (a, life) = (w(b'A'), at(1, b'A'));
+    let mut s = MergeState::default();
+    s.lives.insert(life, Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert });
+    s.vv.insert(a, Hlc::new(20, 0));
+    for i in 1..=depth {
+        let p = Path::new((1..=i).map(|k| format!("n{k}"))).unwrap();
+        let reg = Reg::new(at(2, b'A'), Value::Int64(5), BTreeMap::new(), None, false).unwrap();
+        s.regs.insert((life, p.clone()), reg);
+        s.ords.insert(
+            (life, OrdAt::Field(p)),
+            FieldOrd { floor: Some(u(10, b'A', 9, false)), ..FieldOrd::default() },
+        );
+    }
+    s
+}
+
+/// O1-1: the read of a chain of survivors is linear in its depth. The unmemoised recursion (the
+/// model's) evaluates `born_of` 2^(depth - 1) times for the chain; the memoised read once per path.
+/// Depth 40 is about 8 kilobytes of compact bytes that decode: unmemoised it would take about 5.5e11
+/// evaluations. The bound on time is one second in a debug build: the work is under 10^4 cell visits,
+/// milliseconds; only the exponential blow-up could miss the bound, by days.
+#[test]
+fn a_chain_of_survivors_is_read_in_linear_time() {
+    let o = JoinOptions::default();
+    // the same document, memoised or not, at a depth the unmemoised read can do
+    let small = survivor_chain(10);
+    let (memo, plain) = (BornMemo::new(true), BornMemo::new(false));
+    let (d1, d2) =
+        (small.ordered_document_with(&o, &memo), small.ordered_document_with(&o, &plain));
+    assert_eq!(d1, d2);
+    assert_eq!(memo.evaluations(), 10, "one evaluation per path");
+    assert_eq!(plain.evaluations(), 1 << 9, "the unmemoised read is exponential: 2^(depth - 1)");
+    // the deep chain: decodes, reads in linear evaluations and in time
+    let deep = survivor_chain(40);
+    let enc = deep.encode_compact();
+    assert!(enc.len() < 10_000, "{} bytes", enc.len());
+    let back = MergeState::decode_compact(&enc).expect("a decodable state");
+    let memo = BornMemo::new(true);
+    let t = std::time::Instant::now();
+    let doc = back.ordered_document_with(&o, &memo).unwrap();
+    let took = t.elapsed();
+    assert_eq!(memo.evaluations(), 40, "linear in the depth");
+    assert_eq!(doc.len(), 1);
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    for depth in [8usize, 16, 32] {
+        let m = BornMemo::new(true);
+        survivor_chain(depth).ordered_document_with(&o, &m).unwrap();
+        assert_eq!(m.evaluations(), depth);
+    }
 }
 
 // ---- the laws on the entries of the model's own runs ----------------------------------
