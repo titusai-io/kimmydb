@@ -395,6 +395,42 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }
 
+/// The odd field names (the empty name, `_`, a name with a dot) are in the workload at a rate that
+/// was chosen once (`51dadd66`): a lower bound on the states that hold one, so that a later
+/// reduction of the rate cannot happen quietly (the prop pools have the same guard,
+/// `the_pools_hold_odd_names`). Counted over the members' states after the last step of the first
+/// 100 runs of each workload, at the default configuration (365 states each); the bounds are about
+/// half of the figures measured: flat 70 states with an odd-named register and 73 with an
+/// odd-named slot, nested 84 and 47.
+#[test]
+fn the_sim_workload_holds_odd_names() {
+    let cfg = Cfg::default_ret();
+    let odd = |p: &kimmy_core::merge_state::Path| {
+        p.segments().iter().any(|s| s.is_empty() || s == "_" || s.contains('.'))
+    };
+    for (name, nested, regs_at_least, slots_at_least) in
+        [("flat", false, 35usize, 35usize), ("nested", true, 40usize, 20usize)]
+    {
+        let (mut states, mut with_reg, mut with_slot) = (0usize, 0usize, 0usize);
+        for seed in 0..100 {
+            let out = run(seed, &RunConfig { nested, ..RunConfig::default() }, &cfg);
+            for m in &out.nodes {
+                let st = m.state();
+                states += 1;
+                with_reg += usize::from(st.regs.keys().any(|k| odd(&k.1)));
+                with_slot += usize::from(st.slots.keys().any(|k| odd(&k.1)));
+            }
+        }
+        eprintln!(
+            "{name}: odd names in {with_reg} of {states} states as registers, {with_slot} as slots"
+        );
+        assert!(
+            with_reg > regs_at_least && with_slot > slots_at_least,
+            "{name}: {with_reg} {with_slot}"
+        );
+    }
+}
+
 /// The bounded run of `seed` on the given workload, at the runner's parameters.
 fn bounded_problems(seed: u64, nested: bool, covered_skip: bool) -> Vec<String> {
     let mut cfg = Cfg::default_ret();

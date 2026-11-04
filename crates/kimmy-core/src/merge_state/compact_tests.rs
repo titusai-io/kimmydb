@@ -870,3 +870,39 @@ fn every_table_of_one_to_three_hundred_writers_round_trips() {
         assert_eq!(MergeState::decode(&s.encode()).as_ref(), Ok(&s), "version 1, {n} writers");
     }
 }
+
+/// D1 (the review of `a2306348`): the life table, like the writer table, is read by index. One
+/// writer does `k` rounds of insert and delete and then inserts again; the live document is in
+/// the newest life, which is the last entry of the table, index `k`, with fewer than `k` bytes
+/// of the state after it from `k = 29`. The decoder that bounded an index by the input left
+/// refused this state as truncated. Built with `Writer` calls, in both forms, with the compact
+/// re-encode identity.
+#[test]
+fn the_life_table_of_one_to_three_hundred_lives_round_trips() {
+    let o = opts();
+    for k in 1..=300usize {
+        let mut w = Writer::new(
+            WriterId { node: NodeId::from_bytes([1; 16]), epoch: Epoch::from_u64(0) },
+            o.clone(),
+        );
+        for _ in 0..k {
+            assert!(w.insert(&fl(&[("x", Value::Int64(1))]), 0).is_some());
+            assert!(w.write_delete(0).is_some());
+        }
+        assert!(w.insert(&fl(&[("x", Value::Int64(9))]), 0).is_some());
+        let s = &w.state;
+        assert_eq!(s.lives.len(), k + 1, "{k} rounds: one life per insert");
+        let newest =
+            s.regs.keys().map(|(l, _)| *l).max().expect("the live insert holds a register");
+        assert_eq!(
+            s.lives.keys().position(|l| *l == newest),
+            Some(k),
+            "{k}: the newest life is index k"
+        );
+        let c = s.encode_compact();
+        let back = MergeState::decode_compact(&c).unwrap_or_else(|e| panic!("{k} rounds: {e:?}"));
+        assert_eq!(&back, s, "compact, {k} rounds");
+        assert_eq!(back.encode_compact(), c, "canonical, {k} rounds");
+        assert_eq!(MergeState::decode(&s.encode()).as_ref(), Ok(s), "version 1, {k} rounds");
+    }
+}

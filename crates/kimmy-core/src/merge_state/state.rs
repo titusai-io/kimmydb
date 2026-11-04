@@ -234,8 +234,13 @@ impl MergeState {
     ///    cells as concurrent when the other side's vector does not cover them, so a state
     ///    that does not cover its own stamps finds a clash with itself (the join is not
     ///    idempotent), and a writer restored from it could mint a stamp it already used. Loss
-    ///    records and generation or `obs` stamps are NOT included: a loss entry is received
-    ///    without its write (`Writer::receive_loss` does not move the vector).
+    ///    stamps are NOT included, and cannot be: a loss entry is received without its write
+    ///    (`Writer::receive_loss` does not move the vector). The stamps of a generation, an
+    ///    `obs` or `seen` key, a slot key's generation, `Life.seen` and the vectors of the
+    ///    deletes ARE covered by the vector in every honest state, but the join compares them
+    ///    only by equality or order, never by coverage, so nothing relies on it and they are
+    ///    left unchecked. (The counter cell is not frozen: when it is, decode checks that the
+    ///    vector covers every stamp an honest state's vector covers, losses excepted.)
     /// 3. A counter total is at most `MAX_TOTAL` in magnitude (slots, `obs`, `seen`, loss
     ///    totals): checked by the readers ([`DecodeError::TotalOutOfRange`]).
     /// 4. A register holds a legal value (no top-level document, no marker in an array, nesting
@@ -249,8 +254,10 @@ impl MergeState {
     ///    only what makes `join(s, s) == s`, which no receive relies on.
     /// 6. A write is a register write or an increment at a path, never both: a register and a
     ///    slot do not share `(stamp, path)` (the loss record keyed by them would hold a value
-    ///    or a total by the order of the join). NOT checkable by one state, since the two
-    ///    cells can be in two states; honest stamping guarantees it.
+    ///    or a total by the order of the join). NOT closable by one state: one state can show
+    ///    the clash (the pinned states of the property tests do), but the two cells can also be
+    ///    in two states, so a check of one state would be a partial guard; honest stamping
+    ///    guarantees it.
     /// 7. One stamp is one write: what a stamp carries (a register's value, `obs` and
     ///    generation, a slot's total, a life's kind, `seen` and field order, a delete's vector,
     ///    a loss record's value) is the same in every state that holds it, since the join keeps
