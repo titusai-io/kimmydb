@@ -213,12 +213,14 @@ impl Member {
                         let c = p.docs.get(&se.key);
                         if c.is_none_or(|c| c.stamp < se.stamp) {
                             self.inv.insert("partial_flip");
-                            let have = c.map(|c| (hlc_of(&c.stamp), c.body.clone()));
-                            let msg = format!(
-                                "{} PARTIAL FLIP into {}: staged row {} (key {}) missing or older; the stage holds {:?}",
-                                self.name, v.phys, se, se.key, have
-                            );
-                            w.note(msg);
+                            if w.trace {
+                                let have = c.map(|c| (hlc_of(&c.stamp), c.body.clone()));
+                                let msg = format!(
+                                    "{} PARTIAL FLIP into {}: staged row {} (key {}) missing or older; the stage holds {:?}",
+                                    self.name, v.phys, se, se.key, have
+                                );
+                                w.note(msg);
+                            }
                             break;
                         }
                     }

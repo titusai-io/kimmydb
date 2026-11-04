@@ -128,10 +128,12 @@ impl Member {
             self.appended.insert(en.idx);
             w.stats.bump("q7_loss_entries_minted");
             w.stats.bump("q7_events_emitted");
-            w.note(format!(
-                "{} mints Q7 loss entry {} ({:?}@{} of key {})",
-                self.name, en, lk.kind, lk.stamp.hlc.wall_ms, key
-            ));
+            if w.trace {
+                w.note(format!(
+                    "{} mints Q7 loss entry {} ({:?}@{} of key {})",
+                    self.name, en, lk.kind, lk.stamp.hlc.wall_ms, key
+                ));
+            }
         }
     }
 
@@ -141,10 +143,12 @@ impl Member {
     fn apply_loss_q7(&mut self, w: &mut World, e: &EntryRef) {
         w.stats.bump("q7_loss_entries_received");
         let (lk, lv) = e.q7.clone().expect("a Q7 loss entry has its record");
-        w.note(format!(
-            "{} receives Q7 loss entry {} ({:?}@{} of key {} in {})",
-            self.name, e, lk.kind, lk.stamp.hlc.wall_ms, e.key, e.phys
-        ));
+        if w.trace {
+            w.note(format!(
+                "{} receives Q7 loss entry {} ({:?}@{} of key {} in {})",
+                self.name, e, lk.kind, lk.stamp.hlc.wall_ms, e.key, e.phys
+            ));
+        }
         let alive = match self.phys.get(&e.phys) {
             None => {
                 // the physical is not known here yet: applied when it is (the deferral of document entries)
@@ -260,10 +264,12 @@ impl Member {
         let f = w.f;
         let p = self.phys.get(&e.phys).expect("the physical is alive here");
         let a = crate::field::apply_entry(p.docs.get(&e.key), e, &w.fopts, p.missing);
-        w.note(format!(
-            "{} applies {} changed={} skipped={} held_state={}",
-            self.name, e, a.changed, a.skipped, a.held_state
-        ));
+        if w.trace {
+            w.note(format!(
+                "{} applies {} changed={} skipped={} held_state={}",
+                self.name, e, a.changed, a.skipped, a.held_state
+            ));
+        }
         self.phys.get_mut(&e.phys).unwrap().docs.insert(e.key, a.ver);
         if a.skipped {
             w.stats.bump("covered_skips");

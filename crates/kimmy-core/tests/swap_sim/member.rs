@@ -246,7 +246,7 @@ impl Member {
         }
         let h = self.next_hlc(w);
         let mark = format!("{}:{}", self.name, w.clock);
-        let counter = (w.clock + self.id as i64) % 2 == 1;
+        let counter = w.field_counters && (w.clock + self.id as i64) % 2 == 1;
         let st = crate::field::local_write(
             self.id,
             cur.as_ref().and_then(|v| v.state.as_ref()),

@@ -9,8 +9,8 @@ Run (from any directory; no bytecode is written):
         [--seed0 N] [--delete-bias] [--heavy]
     python3 -I -B q6diff_gen.py seed OUTDIR --mode M --seed S --members 3 --outs 2 --keys 4     one run
 
-Trace format (one JSON object per line). Header: {"v":1,"model":"swapmodel6a.py","sha256_16":..,"base":"v6","mode":..,"members":
-[[name,skew],..],"D":..}. Then one line per top-level model call: {"k": kind, "step", "clock", ..arguments.., "res": result,
+Trace format (one JSON object per line). Header: {"v":1,"model":"swapmodel6a.py","sha256_16":..,"flags":<mode>,"members":
+[[name,skew],..],"D":..,"field_safe":<bool: no delete and no concurrent same-key writes, so the field policy can be replayed exactly>}. Then one line per top-level model call: {"k": kind, "step", "clock", ..arguments.., "res": result,
 "new": [the entries the call minted], "ms": [the state of the acting member after the call, of every member every 20 calls and at the structural events]}. Kinds: local, ldrop, lcreate, out, bind,
 take_from, take, take_quiesce, check_inv (the per-step invariants, compact), set_pages (a script's reorder of a join's pages), snap_begin (with the shuffled page order), land_page, relay_tomb (with the chosen physical), settle,
 vanish (a scripted vanish), lost (the quiescence's lost set), pre_finish (the counters before `finish`), final (the verdict).
@@ -130,6 +130,7 @@ class Tracer:
         self.jobs = []
         self.started = False
         self.header = None
+        self.field_safe = False
         self.n = 0
 
     def open(self, path):
@@ -175,7 +176,7 @@ def _world_init(self, members, flags, rng, D=20, trace=False):
     T.w = self
     if T.out is not None:
         T.write(dict(v=1, model="swapmodel6a.py", sha256_16=hashlib.sha256(open(sm.__file__, "rb").read()).hexdigest()[:16],
-                     members=[[n, s] for n, s in members], D=D, flags=T.header))
+                     members=[[n, s] for n, s in members], D=D, flags=T.header, field_safe=T.field_safe))
     T.started = True
 
 
@@ -538,23 +539,27 @@ def sc_rule_b(mode):
     s.finish()
 
 
+# (name, script, modes, field_safe): `field_safe` marks a scenario with no delete and no concurrent writes to one key, on which the
+# model's last-writer-wins and the `field` join agree, so the Rust replay under the `field` policy compares it exactly (design
+# note q6-phaseF-design.md, section 3). `late-delete` has a delete: it is replayed under `document` only.
 SCRIPTED = [
-    ("flip", sc_flip, ["v6"]),
-    ("corner-two-vanish", lambda m: sc_corner(m, True), ["v6"]),
-    ("corner-one-vanish", lambda m: sc_corner(m, False), ["v6"]),
-    ("seed885", sc_seed885, ["v6", "m-dead-page-dropped"]),
-    ("sole-carrier", sc_sole_carrier, ["v6", "m-snap-drop-loss", "m-snap-no-loss-records"]),
-    ("late-delete", sc_late_delete, ["v6", "m-snap-delete-bare"]),
-    ("append-in-position", sc_append_in_position, ["v6", "m-no-append-in-position"]),
-    ("join-other-peer", sc_join_other_peer, ["v6"]),
-    ("rule-b", sc_rule_b, ["v6", "m-rule-b-off"]),
+    ("flip", sc_flip, ["v6"], True),
+    ("corner-two-vanish", lambda m: sc_corner(m, True), ["v6"], True),
+    ("corner-one-vanish", lambda m: sc_corner(m, False), ["v6"], True),
+    ("seed885", sc_seed885, ["v6", "m-dead-page-dropped"], True),
+    ("sole-carrier", sc_sole_carrier, ["v6", "m-snap-drop-loss", "m-snap-no-loss-records"], True),
+    ("late-delete", sc_late_delete, ["v6", "m-snap-delete-bare"], False),
+    ("append-in-position", sc_append_in_position, ["v6", "m-no-append-in-position"], True),
+    ("join-other-peer", sc_join_other_peer, ["v6"], True),
+    ("rule-b", sc_rule_b, ["v6", "m-rule-b-off"], True),
 ]
 
 
 def gen_scripted(outdir):
     n = 0
-    for name, fn, modes in SCRIPTED:
+    for name, fn, modes, field_safe in SCRIPTED:
         for mode in modes:
+            T.field_safe = field_safe
             T.open(os.path.join(outdir, f"s-{name}-{mode}.jsonl"))
             fn(mode)
             T.close()
@@ -571,6 +576,7 @@ def grid36():
 
 def one_run(path, mode, seed, nm, no, nk, steps=None, delete_bias=False):
     T.header = mode
+    T.field_safe = False
     if delete_bias:
         os.environ["Q6_DELETE_BIAS"] = "1"
     else:
