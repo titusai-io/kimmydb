@@ -483,7 +483,8 @@ impl Node {
             .then(|| oracle::oracle_at(log, &self.contained, self.ret(), self.bound()));
         let before = self.w.state.ordered_document(&self.w.opts);
         let history = self.history();
-        let one_life = self.w.alive().len() == 1;
+        let one_life =
+            self.w.alive().len() == 1 && self.w.state.ords.values().all(|e| e.floor.is_none());
         let r = write(&mut self.w);
         self.read_your_writes(before, history, one_life, order_oracle::op_of(&intent), r.is_some());
         if let Some(old) = old
@@ -537,7 +538,8 @@ impl Node {
     pub fn upsert_inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
         let before = self.w.state.ordered_document(&self.w.opts);
         let history = self.history();
-        let one_life = self.w.alive().len() == 1;
+        let one_life =
+            self.w.alive().len() == 1 && self.w.state.ords.values().all(|e| e.floor.is_none());
         let r = self.w.upsert_inc(&p(path), n, skew);
         self.read_your_writes(
             before,
@@ -568,7 +570,8 @@ impl Node {
             .collect();
         let before = self.w.state.ordered_document(&self.w.opts);
         let history = self.history();
-        let one_life = self.w.alive().len() == 1;
+        let one_life =
+            self.w.alive().len() == 1 && self.w.state.ords.values().all(|e| e.floor.is_none());
         let inc_path = p(inc_path);
         let created = self.w.upsert_soi_create(&fl(fields), &inc_path, &fl(sets), skew);
         let s1 = self.logged(created, log)?;

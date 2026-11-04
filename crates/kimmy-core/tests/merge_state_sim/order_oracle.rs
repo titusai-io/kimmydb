@@ -14,7 +14,10 @@
 //!   write does not name (the path, the maps above it, and everything under a document it sets), keep their
 //!   relative order;
 //! * a field the write creates, that no earlier write of the order state gave a place (no HISTORY: a
-//!   standing candidate in some life), in a document with one alive life, is the LAST of its level.
+//!   standing candidate in some life), in a document with one alive life and no floor anywhere in its order
+//!   state (no unset and no replace has been made), is the LAST of its level. Floors bring in what the
+//!   serial reference cannot say: content that survived an unset is placed by the survivor clamp, and a
+//!   document-valued write puts the fields it never saw after its own, wherever the later writes go.
 //!
 //! The third part is left out for a field with history: the place an earlier write gave it stands (the
 //! model's rule: the earliest write since the last void), as with a map that was emptied and vanished
