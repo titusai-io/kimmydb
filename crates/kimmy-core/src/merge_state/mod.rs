@@ -12,10 +12,11 @@
 //!   marker at its path plus a cell for each leaf (an array is one atomic value). The read side
 //!   applies the recursive type rule ([`MergeState::visible`]); a write diffs a sub-document
 //!   against what the writer sees and writes only the leaves that changed; a write below a scalar
-//!   or an array is refused; the join reports `typeClash` and `arrayClash`. NOT built here, by
-//!   ruling: the implicit map marker a leaf write would leave on absent parents (so an emptied
-//!   implicit map vanishes), a map-creating `$inc` and the multi-operator update, which the
-//!   next model round revises.
+//!   or an array is refused; the join reports `typeClash` and `arrayClash`. A leaf write
+//!   (`$set`, `$inc`, an update) that creates the maps above it also writes an IMPLICIT map
+//!   marker ([`Value::ImplicitMap`]) at each of them, in the same write: the map then stays as
+//!   `{}` when its last leaf is unset, and the join never reports a marker as a loser. An
+//!   upsert's creation, an insert, a replace and an unset write none.
 //! * The field order (`ord.rs`, option A): [`MergeState::ords`] holds, per `(life, path)`, a
 //!   [`FieldOrd`] (floor, per-writer firsts, last, level floor), joined with the cells by
 //!   [`ord_join`]; [`MergeState::ordered_document`] reads the document in that order. The state,

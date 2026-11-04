@@ -4,14 +4,10 @@
 //!
 //! The scenarios are ports of the Python model's nested probes (`probes6.py` of the stage A
 //! model: `probe_Q3_*`), with the same inputs and the same expected documents; each says which.
-//! One difference is on purpose and named where it shows: the model's implicit map marker (a
-//! leaf write that creates the maps above it also writes a marker there, decision D-1) is not
-//! built here, so a probe whose expected records include the marker's `clash` expects one record
-//! less. That is an EXPECTED DIFFERENCE keyed to Q2's implicit-marker write rule (see
-//! [`EXPECTED_DIFFERENCE_Q2`]): each place it shows asserts what Rust does today, and has an
-//! `#[ignore]`d companion that asserts what the model does. When the rule lands the Rust-today
-//! assertions fail, and the failure says what to flip. Each rule has a mutation switch of [`JoinOptions`]; `mutants_are_caught` turns each on
-//! against the scenario that pins it.
+//! The model's implicit map marker (a leaf write that creates the maps above it also writes a
+//! marker there, decision D-1) is built: a probe whose expected records include the marker's
+//! `clash` expects it. Each rule has a mutation switch of [`JoinOptions`]; `mutants_are_caught`
+//! turns each on against the scenario that pins it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -115,16 +111,6 @@ fn q3_marker_keeps_concurrent_child(o: &JoinOptions) -> Result<(), String> {
     Ok(())
 }
 
-/// What differs between Rust and the model while Q2's implicit-marker write rule is not built.
-/// Three places carry it: the "child newer" case of `q3_scalar_over_map_type_rule` (the model has
-/// one record more: the marker's `clash` of `a`), `an_emptied_implicit_map_vanishes_today` (the
-/// model keeps the implicit marker as a cell that does not show), and the two `#[ignore]`d
-/// companions `model_child_newer_has_the_implicit_markers_clash` and
-/// `model_leaf_write_leaves_an_implicit_marker`. When the rule lands: the Rust-today assertions
-/// fail, flip them to the companions' expectations, remove the `#[ignore]` and this constant.
-const EXPECTED_DIFFERENCE_Q2: &str = "expected difference from the model: the Q2 implicit-marker write rule is not built; \
-     if it has landed, flip the Rust-today assertions to the companions' and un-ignore them";
-
 /// "child newer": `$set a 5` (A, older) against `$set a.b 1` (B, newer), neither having seen the
 /// other, over `{x: 1}`: `a` is a map showing only `b`, with the given loss records.
 fn scalar_over_map_child_newer(
@@ -145,7 +131,6 @@ fn scalar_over_map_child_newer(
 /// The model's behaviour for "child newer": B's leaf write made `a`'s implicit marker, which
 /// beats A's older scalar and is reported as a `clash`, beside the `typeClash`.
 #[test]
-#[ignore = "waits on Q2 implicit-marker write rule"]
 fn model_child_newer_has_the_implicit_markers_clash() {
     ok(scalar_over_map_child_newer(&opts(), &[(TypeClash, "a", 'a'), (Clash, "a", 'a')]));
 }
@@ -158,43 +143,34 @@ fn leaf_write_then_unset() -> Mem {
     m
 }
 
-/// Rust today: the leaf write puts no cell at `a`, so once `a.b` is unset nothing is left of
-/// `a` and it vanishes. EXPECTED DIFFERENCE (Q2 implicit-marker write rule): the model writes an
-/// implicit marker at `a` with the leaf write, and an emptied implicit map vanishes from the
-/// read side while its marker stays in the state.
+/// probes6.py / probes_order.py `probe_implicit_marker_and_emptied_map`: the leaf write left an
+/// implicit marker cell at `a`, so once `a.b` is unset the emptied map STAYS, as `{}` (the
+/// reference leaves `{a: {}}` too). `$unset a` then removes the lot. The marker is not a user
+/// value: the cell at `a` reads as a map, never as a loser.
 #[test]
-fn an_emptied_implicit_map_vanishes_today() {
+fn model_leaf_write_leaves_an_implicit_marker() {
     let mut m = leaf_write_then_unset();
     let life = m.w.alive()[0];
-    assert!(
-        !m.w.state.regs.contains_key(&(life, np("a"))),
-        "{EXPECTED_DIFFERENCE_Q2}: a cell at `a` after a leaf write"
-    );
+    let cell = &m.w.state.regs[&(life, np("a"))];
+    assert_eq!(cell.value, Value::ImplicitMap, "a cell at `a` after a leaf write");
     assert_eq!(
         m.visible(),
         want(&[("a", M), ("a.b", i(1)), ("x", i(1))]),
         "a map shows while it has a child"
     );
     m.unset_at(&np("a.b"), 0).unwrap();
-    assert_eq!(m.visible(), want(&[("x", i(1))]), "the emptied implicit map vanishes");
-}
-
-/// The model's behaviour: the leaf write left an implicit marker cell at `a`; it does not show
-/// once `a.b` is unset.
-#[test]
-#[ignore = "waits on Q2 implicit-marker write rule"]
-fn model_leaf_write_leaves_an_implicit_marker() {
-    let mut m = leaf_write_then_unset();
-    let life = m.w.alive()[0];
-    assert!(m.w.state.regs.contains_key(&(life, np("a"))), "a cell at `a` after a leaf write");
-    m.unset_at(&np("a.b"), 0).unwrap();
-    assert_eq!(m.visible(), want(&[("x", i(1))]), "the emptied implicit map vanishes");
+    assert_eq!(
+        m.visible(),
+        want(&[("a", M), ("x", i(1))]),
+        "the emptied implicit map stays as {{}}"
+    );
+    m.unset_at(&np("a"), 0).unwrap();
+    assert_eq!(m.visible(), want(&[("x", i(1))]), "an unset of the map removes the lot");
 }
 
 /// probes6.py `probe_Q3_scalar_over_map_type_rule`: the newer side wins, the side it hides is the
-/// typeClash. In the model's "child newer" case the child write also made `a`'s implicit marker,
-/// which beats the older scalar and is reported as a `clash`; without that marker only the
-/// `typeClash` of `a` remains.
+/// typeClash. In the "child newer" case the child write also made `a`'s implicit marker, which
+/// beats the older scalar and is reported as a `clash`, beside the `typeClash` of `a`.
 fn q3_scalar_over_map_type_rule(o: &JoinOptions) -> Result<(), String> {
     two(
         o,
@@ -206,10 +182,9 @@ fn q3_scalar_over_map_type_rule(o: &JoinOptions) -> Result<(), String> {
         &[(TypeClash, "a.b", 'b')],
     )
     .map_err(|e| format!("scalar newer: {e}"))?;
-    // EXPECTED DIFFERENCE from the model (Q2 implicit-marker write rule): Rust has no implicit
-    // marker, so the model's second record (the marker's `clash` of `a`) is absent here.
-    scalar_over_map_child_newer(o, &[(TypeClash, "a", 'a')])
-        .map_err(|e| format!("child newer (Rust today; {EXPECTED_DIFFERENCE_Q2}): {e}"))?;
+    // the child write also made `a`'s implicit marker, which beats the older scalar (a `clash`)
+    scalar_over_map_child_newer(o, &[(TypeClash, "a", 'a'), (Clash, "a", 'a')])
+        .map_err(|e| format!("child newer: {e}"))?;
     // a counter child hidden by a newer scalar, and a scalar over a map the writer saw
     let acct = [("x", i(1)), ("acct", sub(&[("balance", i(100))]))];
     two(
@@ -386,7 +361,9 @@ fn the_model_nested_probes_hold() {
 fn stale_scalar_hides_only_older_children(o: &JoinOptions) -> Result<(), String> {
     let (mut mi, mut ma, mut mb, mut mc) =
         (Mem::new('I', o), Mem::new('A', o), Mem::new('B', o), Mem::new('C', o));
-    let i0 = mi.ins(&[("x", i(1))], 0).unwrap();
+    // `a` is a map every writer sees, so no write below it makes an implicit marker (a marker
+    // newer than the scalar would win the register at `a`: the next test)
+    let i0 = mi.ins(&[("x", i(1)), ("a", sub(&[("z", i(0))]))], 0).unwrap();
     for m in [&mut ma, &mut mb, &mut mc] {
         m.receive_entry(&mi.ent(i0));
     }
@@ -421,6 +398,44 @@ fn a_stale_scalar_hides_only_older_children() {
     ok(stale_scalar_hides_only_older_children(&opts()));
 }
 
+/// The same three writes over a document with no `a`: B's `a.b` (stamp 2) and C's `a.c` (stamp 11)
+/// each make an implicit marker at `a`, and C's marker is newer than A's `a = 5` (stamp 6), so
+/// the register at `a` is a marker and both children show. The model reads the same
+/// (`{a: {b: 1, c: 2}}`), with the scalar's `clash` and the two `typeClash` records, the pair
+/// rule being independent of who wins the register.
+#[test]
+fn an_older_scalar_loses_to_the_implicit_marker_of_a_newer_child() {
+    let o = opts();
+    let (mut mi, mut ma, mut mb, mut mc) =
+        (Mem::new('I', &o), Mem::new('A', &o), Mem::new('B', &o), Mem::new('C', &o));
+    let i0 = mi.ins(&[("x", i(1))], 0).unwrap();
+    for m in [&mut ma, &mut mb, &mut mc] {
+        m.receive_entry(&mi.ent(i0));
+    }
+    let sb = mb.set_at(&np("a.b"), i(1), 0).unwrap();
+    let sa = ma.set_at(&np("a"), i(5), 4).unwrap();
+    let sc = mc.set_at(&np("a.c"), i(2), 9).unwrap();
+    assert!(sb.hlc < sa.hlc && sa.hlc < sc.hlc);
+    let ents = [mb.ent(sb), ma.ent(sa), mc.ent(sc)];
+    let mut obs = Vec::new();
+    for (ord, m) in all_orders(&o, &ents, &[mi.ent(i0)]) {
+        let w = want(&[("a", M), ("a.b", i(1)), ("a.c", i(2)), ("x", i(1))]);
+        assert_eq!(m.visible(), w, "{ord:?}");
+        obs.push(m);
+    }
+    pull_all(&mut obs);
+    pull_all(&mut obs);
+    let wanted: BTreeSet<_> = [
+        (Clash, LossAt::Field(np("a")), sa), // the scalar loses to the newer implicit marker
+        (TypeClash, LossAt::Field(np("a")), sa), // c is newer than the scalar
+        (TypeClash, LossAt::Field(np("a.b")), sb), // the scalar is newer than b
+    ]
+    .into();
+    for m in &obs {
+        assert_eq!(m.loss_set(), wanted);
+    }
+}
+
 /// A typeClash is any ancestor/descendant pair, not only a parent and its child.
 fn type_clash_at_distance(o: &JoinOptions) -> Result<(), String> {
     two(
@@ -430,7 +445,9 @@ fn type_clash_at_distance(o: &JoinOptions) -> Result<(), String> {
         &set("a.b.c", i(1)),
         (0, 9),
         &[("a", M), ("a.b", M), ("a.b.c", i(1)), ("x", i(1))],
-        &[(TypeClash, "a", 'a')],
+        // (the clash is the older scalar losing to the implicit marker of `a`; the marker of
+        // `a.b` is not in a pair)
+        &[(TypeClash, "a", 'a'), (Clash, "a", 'a')],
     )?;
     two(
         o,
@@ -450,7 +467,9 @@ fn a_type_clash_is_any_ancestor_descendant_pair() {
 
 #[test]
 fn two_sub_documents_merge_field_by_field_with_no_type_clash() {
-    // A marker is not a scalar: `$set a {x}` and `$set a.y` keep both and report nothing.
+    // A marker is not a scalar: `$set a {x}` and `$set a.y` keep both and report no typeClash.
+    // The one record is the older explicit marker of A losing to B's newer implicit one (the
+    // model's `clash` on `a`: a write that creates the map above it makes a marker of its own).
     ok(two(
         &opts(),
         &[("k", i(0))],
@@ -458,7 +477,7 @@ fn two_sub_documents_merge_field_by_field_with_no_type_clash() {
         &set("a.y", i(2)),
         (0, 9),
         &[("a", M), ("a.x", i(1)), ("a.y", i(2)), ("k", i(0))],
-        &[],
+        &[(Clash, "a", 'a')],
     ));
 }
 
@@ -721,4 +740,266 @@ fn mutants_are_caught() {
         mutate(&mut o);
         assert!(scenario(&o).is_err(), "not caught: {what}");
     }
+}
+
+// ---- the implicit map marker (item O4) ------------------------------------------------------
+
+/// The paths holding an implicit marker in the writer's state (one life), in path order.
+fn markers(m: &Mem) -> Vec<String> {
+    m.w.state
+        .regs
+        .iter()
+        .filter(|(_, r)| r.value == Value::ImplicitMap)
+        .map(|((_, p), _)| p.to_string())
+        .collect()
+}
+
+fn names(ps: &[&str]) -> Vec<Path> {
+    ps.iter().map(|p| np(p)).collect()
+}
+
+/// probes_order.py `probe_implicit_marker_and_emptied_map`: `$set a.b.c` on an absent `a` writes
+/// the markers of `a` and `a.b` under the write's own stamp (outermost first, before the leaf);
+/// a second leaf under them writes none; `$unset a.b.c` leaves `{a: {b: {}}}`; `$unset a`
+/// removes the lot.
+#[test]
+fn a_leaf_write_marks_each_absent_ancestor_once_and_the_emptied_maps_stay() {
+    let mut m = Mem::new('A', &opts());
+    m.ins(&[("x", i(1))], 0).unwrap();
+    let life = m.w.alive()[0];
+    let w = m.w.write_set(&np("a.b.c"), i(1), 0).unwrap();
+    m.log(Some(w.clone()));
+    assert_eq!(markers(&m), ["a", "a.b"]);
+    for q in ["a", "a.b"] {
+        assert_eq!(m.w.state.regs[&(life, np(q))].stamp, w.stamp, "{q}: the write's own stamp");
+    }
+    assert_eq!(w.record.paths, names(&["a", "a.b", "a.b.c"]), "the markers, then the leaf");
+    assert_eq!(w.record.vals[&np("a")], Value::ImplicitMap);
+    assert_eq!(m.visible(), want(&[("a", M), ("a.b", M), ("a.b.c", i(1)), ("x", i(1))]));
+    let w2 = m.w.write_set(&np("a.b.d"), i(2), 0).unwrap();
+    assert_eq!(w2.record.paths, names(&["a.b.d"]), "the maps are seen: no marker");
+    m.log(Some(w2));
+    assert_eq!(markers(&m), ["a", "a.b"]);
+    m.unset_at(&np("a.b.c"), 0).unwrap();
+    m.unset_at(&np("a.b.d"), 0).unwrap();
+    assert_eq!(m.visible(), want(&[("a", M), ("a.b", M), ("x", i(1))]), "{{a: {{b: {{}}}}}}");
+    m.unset_at(&np("a"), 0).unwrap();
+    assert_eq!(m.visible(), want(&[("x", i(1))]));
+}
+
+/// The model places no marker for an insert, a replace, an unset or the creation of an upsert:
+/// `model6.py` `_update` is the only writer of `MAPI` for a write of a live document
+/// (lines 966-973: `ancestors_of`), the upserts (`upsert_inc`, `upsert_soi`, lines 845-889) name
+/// their ancestors as order items and write cells and slots only, an insert flattens its document
+/// with the explicit marker, and a replace and an unset go through `_diff` and `_unset_subtree`.
+#[test]
+fn an_upsert_an_insert_a_replace_and_an_unset_place_no_implicit_marker() {
+    let o = opts();
+    let mut up = Mem::new('A', &o);
+    let w = up.w.upsert_inc(&np("a.k"), 1, 0);
+    up.log(w).unwrap();
+    assert!(markers(&up).is_empty(), "upsert_inc");
+    assert_eq!(up.visible(), want(&[("a", M), ("a.k", i(1))]), "the slot alone makes the map");
+    let mut soi = Mem::new('B', &o);
+    let (c, n) = soi
+        .w
+        .upsert_soi(&[(np("c"), i(1))], &np("a.b.k"), 1, &[(np("d"), sub(&[("e", i(2))]))], 0)
+        .unwrap();
+    soi.log(Some(c));
+    soi.log(Some(n));
+    assert!(markers(&soi).is_empty(), "upsert_soi");
+    let mut ins = Mem::new('C', &o);
+    ins.ins(&[("x", sub(&[("y", sub(&[("z", i(1))]))]))], 0).unwrap();
+    assert!(markers(&ins).is_empty(), "insert: the explicit marker");
+    ins.replace(&[("x", sub(&[("y", sub(&[("z", i(2)), ("w", i(3))]))])), ("q", i(0))], 0).unwrap();
+    assert!(markers(&ins).is_empty(), "replace");
+    ins.unset_at(&np("x.y.z"), 0).unwrap();
+    assert!(markers(&ins).is_empty(), "unset");
+    assert!(
+        ins.w.state.regs.values().any(|r| r.value == Value::Map),
+        "the sub-documents carry the explicit marker"
+    );
+}
+
+/// probes_order.py `probe_inc_creating_a_map_is_one_write` (D-3 revised): `$inc k.n` on an absent
+/// `k` is ONE write: one stamp, one oplog entry, and an observer holding only that entry reads
+/// `{x, k: {n: 5}}`, the marker and the slot in the same state, `k` after `x`.
+#[test]
+fn an_inc_that_creates_a_map_is_one_write() {
+    let o = opts();
+    let mut m = Mem::new('A', &o);
+    let i0 = m.ins(&[("x", i(1))], 0).unwrap();
+    let life = m.w.alive()[0];
+    let n0 = m.oplog.len();
+    let w = m.w.write_inc(&np("k.n"), 5, 0).unwrap();
+    let st = m.log(Some(w.clone())).unwrap();
+    assert_eq!(m.oplog.len(), n0 + 1, "one entry");
+    assert_eq!(w.record.kind, WriteKind::Inc);
+    assert_eq!(w.record.paths, names(&["k.n"]));
+    assert_eq!(w.record.vals, BTreeMap::from([(np("k"), Value::ImplicitMap)]));
+    assert_eq!(m.w.state.regs[&(life, np("k"))].stamp, st, "the marker and the slot: one stamp");
+    assert!(m.w.state.slots.values().all(|sl| sl.stamp == st || sl.total == Num::Int64(0)));
+    for (ord, obs) in all_orders(&o, &[m.ent(st)], &[m.ent(i0)]) {
+        assert_eq!(obs.visible(), want(&[("k", M), ("k.n", i(5)), ("x", i(1))]), "{ord:?}");
+        let doc = obs.w.state.ordered_document(&o).unwrap();
+        assert_eq!(doc.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["x", "k"]);
+    }
+    // a second increment finds the map: no marker, and the record is the plain one
+    let w2 = m.w.write_inc(&np("k.n"), 1, 0).unwrap();
+    assert!(w2.record.vals.is_empty());
+    assert_eq!(markers(&m), ["k"]);
+    // the emptied map stays after the counter is unset
+    m.unset_at(&np("k.n"), 0).unwrap();
+    assert_eq!(m.visible(), want(&[("k", M), ("x", i(1))]));
+}
+
+/// An update with several operators places each marker once and under its one stamp (the
+/// model's `seen_anc`): `$set a.b`, `$inc a.c` (the second finds `a` already named), and `$set
+/// d.e.f`.
+#[test]
+fn an_update_marks_the_absent_ancestors_of_all_its_operators_once() {
+    let mut m = Mem::new('A', &opts());
+    m.ins(&[("x", i(1))], 0).unwrap();
+    let w =
+        m.w.write_update(
+            &[
+                UpdateOp::Set(np("a.b"), i(1)),
+                UpdateOp::Inc(np("a.c"), Value::Int64(2)),
+                UpdateOp::Set(np("d.e.f"), i(3)),
+            ],
+            0,
+        )
+        .unwrap();
+    assert_eq!(markers(&m), ["a", "d", "d.e"]);
+    assert_eq!(
+        w.record.paths,
+        names(&["a", "a.b", "d", "d.e", "d.e.f", "a.c"]),
+        "registers, then slots"
+    );
+    assert!(
+        m.w.state
+            .regs
+            .values()
+            .filter(|r| r.value == Value::ImplicitMap)
+            .all(|r| r.stamp == w.stamp)
+    );
+}
+
+/// The join's rules for an implicit marker, checked against the model (`model6.py` join, line
+/// 659): a marker is never a reported loser, but it beats an older register and reports it.
+#[test]
+fn an_implicit_marker_is_never_a_loser_but_makes_one() {
+    let o = opts();
+    for sk in [(0, 9), (9, 0)] {
+        // two markers of one map: nothing to report
+        ok(two(
+            &o,
+            &[("x", i(1))],
+            &set("a.b", i(1)),
+            &set("a.c", i(2)),
+            sk,
+            &[("a", M), ("a.b", i(1)), ("a.c", i(2)), ("x", i(1))],
+            &[],
+        ));
+    }
+    // an implicit marker (A's `a.y`) against an explicit one (B's `a: {x}`): the older of the two
+    // is the loser, and only an explicit loser is reported
+    let both = [("a", M), ("a.x", i(1)), ("a.y", i(2)), ("k", i(0))];
+    ok(two(
+        &o,
+        &[("k", i(0))],
+        &set("a.y", i(2)),
+        &set("a", sub(&[("x", i(1))])),
+        (0, 9),
+        &both,
+        &[],
+    ));
+    ok(two(
+        &o,
+        &[("k", i(0))],
+        &set("a.y", i(2)),
+        &set("a", sub(&[("x", i(1))])),
+        (9, 0),
+        &both,
+        &[(Clash, "a", 'b')],
+    ));
+}
+
+/// Both codecs spell the implicit marker (tag 6 at depth 0, never inside an array), and the
+/// round trip is exact.
+#[test]
+fn the_implicit_marker_round_trips_in_both_codecs_and_is_refused_in_an_array() {
+    let mut m = Mem::new('A', &opts());
+    m.ins(&[("x", i(1))], 0).unwrap();
+    m.set_at(&np("a.b.c"), i(1), 0).unwrap();
+    let st = m.w.state.clone();
+    let enc = st.encode_compact();
+    let back = MergeState::decode_compact(&enc).unwrap();
+    assert_eq!(back, st);
+    assert_eq!(back.encode_compact(), enc);
+    assert_eq!(back.compact_hash(), st.compact_hash());
+    let v1 = MergeState::decode(&st.encode()).unwrap();
+    assert_eq!(v1.regs, st.regs, "the version 1 form keeps the cells");
+    assert_eq!(v1.encode(), st.encode());
+    assert_eq!(back.check_decoded(), Ok(()));
+    // never a value a caller hands in, never inside an array
+    assert_eq!(Value::ImplicitMap.check_input(), Err(InvalidValue::MapMarker));
+    assert_eq!(Value::ImplicitMap.check_register(), Ok(()));
+    assert_eq!(
+        Value::Array(vec![Value::ImplicitMap]).check_register(),
+        Err(InvalidValue::MapMarker)
+    );
+    assert!(Value::ImplicitMap.is_marker() && Value::Map.is_marker() && !i(1).is_marker());
+    assert!(!Value::ImplicitMap.is_plain() && !Value::Map.is_plain());
+    // the tag byte: 6 in both forms, where the explicit marker is 5
+    let mut explicit = st.clone();
+    for r in explicit.regs.values_mut() {
+        if r.value == Value::ImplicitMap {
+            r.value = Value::Map;
+        }
+    }
+    assert_eq!(st.encode().len(), explicit.encode().len());
+    assert_eq!(st.encode_compact().len(), explicit.encode_compact().len());
+    assert_ne!(st.encode(), explicit.encode());
+    assert_ne!(st.encode_compact(), explicit.encode_compact());
+}
+
+/// What an implicit marker costs per absent ancestor (it feeds L34-B): the bytes of a state with
+/// its markers against the same state with them removed (the state a writer made before the
+/// markers). `$set a.b.c` on `{x: 1}` makes two. Measured once, here, in both forms.
+#[test]
+fn the_cost_of_an_implicit_marker_is_pinned() {
+    let mut m = Mem::new('A', &opts());
+    m.ins(&[("x", i(1))], 0).unwrap();
+    m.set_at(&np("a.b.c"), i(1), 0).unwrap();
+    let with = m.w.state.clone();
+    let mut without = with.clone();
+    without.regs.retain(|_, r| r.value != Value::ImplicitMap);
+    let v1 = with.encode().len() - without.encode().len();
+    let v2 = with.encode_compact().len() - without.encode_compact().len();
+    // three writers in the version vector: a marker's generation carries the whole vector
+    let o = opts();
+    let (mut mi, mut mb, mut mc) = (Mem::new('I', &o), Mem::new('B', &o), Mem::new('C', &o));
+    let i0 = mi.ins(&[("x", i(1))], 0).unwrap();
+    mb.receive_entry(&mi.ent(i0));
+    mc.receive_entry(&mi.ent(i0));
+    let sb = mb.set_at(&np("x"), i(2), 0).unwrap();
+    let sc = mc.set_at(&np("x"), i(3), 0).unwrap();
+    for e in [mb.ent(sb), mc.ent(sc)] {
+        mi.receive_entry(&e);
+    }
+    mi.set_at(&np("a.b.c"), i(1), 0).unwrap();
+    let with = mi.w.state.clone();
+    let mut without = with.clone();
+    without.regs.retain(|_, r| r.value != Value::ImplicitMap);
+    let (w1, w2) = (
+        with.encode().len() - without.encode().len(),
+        with.encode_compact().len() - without.encode_compact().len(),
+    );
+    eprintln!(
+        "two implicit markers: one writer v1 {v1}, compact {v2}; three writers v1 {w1}, compact {w2}"
+    );
+    // two markers (`a`, `a.b`): 161 bytes each in the version 1 form, 19 in the compact form, on
+    // average; the generation's version vector is not encoded, so the writers do not add to it
+    assert_eq!(((v1, v2), (w1, w2)), ((322, 38), (322, 38)));
 }
