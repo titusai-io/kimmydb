@@ -3,7 +3,10 @@
 //! `q8-probes/q8d.js` and `q8d-log.js`), which operand gives which type, and in whose words
 //! each is refused.
 //!
-//! The doubles are compared bit for bit. A `Decimal128` answer is held to the reference's
+//! The doubles are compared bit for bit, except the answers of the operators that call the
+//! platform's math library (ADR-271, decision 3): those may differ from the reference's by
+//! [`LIBM_ULP_BOUND`] unit in the last place, because the library differs between platforms and
+//! between versions of one platform. A `Decimal128` answer is held to the reference's
 //! within three units of its last place, and the exact points (zeros, infinities, NaN) to the
 //! same digits and cohort: the decimal functions are correctly rounded, and the reference's
 //! library is not (see `kimmy-core`'s `decimal_trig_reference` test).
@@ -102,14 +105,44 @@ fn close(a: &Raw, b: &Raw) -> bool {
     na == nb && shift <= 3 && (high * 10u128.pow(shift as u32)).abs_diff(low) <= 3
 }
 
-/// Whether `got` is the reference's `want` (a fixture code): bit for bit for a double, exact
-/// for an integer, and for a decimal the same value to within the last digits.
-fn agrees(got: &Bson, want: &str) -> bool {
+/// The operators whose double answers are the platform's math library's (ADR-271, decision 3:
+/// "the doubles are the platform's math library's, as `$exp` and `$ln` are"; `$log` with a base
+/// divides two of its logarithms). `$degreesToRadians` and `$radiansToDegrees` multiply by a
+/// constant and do not call it, so their answers stay bit for bit.
+const LIBM_OPERATORS: [&str; 14] = [
+    "$sin", "$cos", "$tan", "$asin", "$acos", "$atan", "$atan2", "$sinh", "$cosh", "$tanh",
+    "$asinh", "$acosh", "$atanh", "$log",
+];
+
+/// How far a platform-library answer may be from the recorded one, in units in the last place.
+/// The recorded answers were taken on one platform. Another platform's library gave 4 of the
+/// 1572 answers one unit away (on the CI runner image Ubuntu 26.04: `$asinh` of 1.5 and `$acosh`
+/// of 2 as an `Int32`, an `Int64` and a double) and every other answer bit for bit; the bound is
+/// that difference.
+const LIBM_ULP_BOUND: u64 = 1;
+
+/// Whether two doubles are the same, or at most `bound` units in the last place apart (the
+/// same sign, so a result is never allowed to cross zero), or both NaN.
+fn within_ulps(a: f64, b: f64, bound: u64) -> bool {
+    if a.is_nan() || b.is_nan() {
+        return a.is_nan() && b.is_nan();
+    }
+    if a == b {
+        return true;
+    }
+    a.is_sign_negative() == b.is_sign_negative() && a.to_bits().abs_diff(b.to_bits()) <= bound
+}
+
+/// Whether `got` is the reference's `want` (a fixture code) for the operator `name`: bit for bit
+/// for a double (within [`LIBM_ULP_BOUND`] for an operator of [`LIBM_OPERATORS`]), exact for an
+/// integer, and for a decimal the same value to within the last digits.
+fn agrees(name: &str, got: &Bson, want: &str) -> bool {
     match (got, &want[..1]) {
         (Bson::Null, _) => want == "null",
         (Bson::Double(d), "d") => {
             let w: f64 = want[1..].parse().unwrap();
-            d.to_bits() == w.to_bits() || (d.is_nan() && w.is_nan())
+            let bound = if LIBM_OPERATORS.contains(&name) { LIBM_ULP_BOUND } else { 0 };
+            within_ulps(*d, w, bound)
         }
         (Bson::Int32(n), "i") => want[1..].parse::<i32>().unwrap() == *n,
         (Bson::Int64(n), "l") => want[1..].parse::<i64>().unwrap() == *n,
@@ -145,7 +178,7 @@ fn every_recorded_answer_is_the_references() {
                     if !same_value(value, want) {
                         wrong.push(format!("{name} {args}: want {want}, got {value:?}"));
                     }
-                } else if !agrees(value, want) {
+                } else if !agrees(name, value, want) {
                     wrong.push(format!("{name} {args}: want {want}, got {value:?}"));
                 } else if matches!(value, Bson::Decimal128(_)) {
                     exact += usize::from(agrees_exactly(value, want));
@@ -447,4 +480,32 @@ fn the_decimal_functions_reach_a_large_operand() {
         &val(op("$tan", vec![dec("1E+6000")])),
         "D1.052408860229401513505574301283600"
     ));
+}
+
+#[test]
+fn a_double_is_within_a_bound_of_units_in_the_last_place() {
+    let x = 1.1947632172871094_f64;
+    let next = f64::from_bits(x.to_bits() + 1);
+    assert!(within_ulps(x, x, 0));
+    assert!(!within_ulps(x, next, 0), "a bound of 0 is bit for bit");
+    assert!(within_ulps(x, next, 1) && within_ulps(next, x, 1));
+    let two = f64::from_bits(x.to_bits() + 2);
+    assert!(!within_ulps(x, two, 1));
+    // Zeros of either sign are equal; a result never crosses zero; NaN matches only NaN.
+    assert!(within_ulps(0.0, -0.0, 0));
+    assert!(!within_ulps(f64::from_bits(1), -f64::from_bits(1), 1));
+    assert!(within_ulps(f64::NAN, f64::NAN, 0) && !within_ulps(f64::NAN, 1.0, 1));
+    assert!(within_ulps(f64::INFINITY, f64::INFINITY, 0));
+}
+
+#[test]
+fn only_the_platform_library_operators_have_a_bound() {
+    // `agrees` takes the bound from the operator: one unit away is accepted for `$asinh` and
+    // refused for an operator that does not call the library.
+    let x = 1.1947632172871094_f64;
+    let next = f64::from_bits(x.to_bits() + 1);
+    let want = format!("d{x}");
+    assert!(agrees("$asinh", &Bson::Double(next), &want));
+    assert!(!agrees("$degreesToRadians", &Bson::Double(next), &want));
+    assert!(agrees("$degreesToRadians", &Bson::Double(x), &want));
 }
