@@ -265,6 +265,21 @@ mod order_oracle_cases {
         assert!(set_n(&before, &placed, &hist_m).is_err(), "m has a place now: n goes after it");
     }
 
+    /// A field created again whose place stands comes before every map with no leaf and no place (the no-born group of the
+    /// model's `okey`), wherever the other fields with places are.
+    #[test]
+    fn a_re_created_field_with_a_place_comes_before_the_maps_without_one() {
+        let places = Places::of_paths(&[&["n"]]);
+        let before: Doc = vec![leaf("a"), empty_map("k")];
+        let ok: Doc = vec![leaf("a"), leaf("n"), empty_map("k")];
+        let after_the_map: Doc = vec![leaf("a"), empty_map("k"), leaf("n")];
+        let check_n = |after: &Doc| {
+            check(Some(&before), Some(after), &OrdOp::Set(np("n"), Value::Int64(1)), &places, true)
+        };
+        assert!(check_n(&ok).is_ok());
+        assert!(check_n(&after_the_map).is_err(), "n is after a map that has no place");
+    }
+
     /// O2-4: a replace that puts the same fields in another order is a write; the same order is not.
     #[test]
     fn a_replace_in_another_order_is_a_write() {
@@ -300,6 +315,138 @@ mod order_oracle_cases {
             ("a".to_string(), Value::Int64(1)),
         ]);
         assert!(!reorders(Some(&before), &insert));
+    }
+}
+
+/// The read-your-writes oracle's "a field created again keeps its place" branch, driven by real Writers (the review's probe
+/// `order_probe.rs`). The shape of sim seed 912: A inserts `{x, m: {k, j}}`; B replaces with `{m}` (it unsets `x`); C,
+/// concurrently, replaces with `{x (unchanged: no cell), m: {k, j: 2}}`, which gives `x` a standing place; C receives B's
+/// write, then `$inc x` re-creates `x` at that place, FIRST (the model, `model6.py`, and the Writer both read `[x, m]`, and
+/// so does `pyprobe/order_touched.py`). With C first unsetting `m.k` (a child of the sibling `m`, which leaves `m`'s own
+/// floor as it was) the oracle used to skip `m` as "touched" and accept a forged `[m, x]`; it must refuse it in both.
+mod order_oracle_writers {
+    use std::collections::BTreeSet;
+
+    use kimmy_core::ids::NodeId;
+    use kimmy_core::merge_state::{
+        Epoch, JoinOptions, MStamp, OrderedValue, Value, Writer, WriterId, Written,
+    };
+
+    use crate::oracle::Intent;
+    use crate::order_oracle::{OrdOp, Places, check, op_of, places, record, write_ord};
+    use crate::sim::np;
+
+    type Doc = Vec<(String, OrderedValue)>;
+
+    fn i(n: i64) -> Value {
+        Value::Int64(n)
+    }
+    fn doc(f: &[(&str, Value)]) -> Value {
+        Value::Document(f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect())
+    }
+    fn names(d: &Doc) -> Vec<String> {
+        d.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    struct Node {
+        w: Writer,
+        contained: BTreeSet<MStamp>,
+    }
+
+    /// What one write gave the oracle.
+    struct Step {
+        before: Option<Doc>,
+        after: Option<Doc>,
+        op: OrdOp,
+        places: Places,
+        one_life: bool,
+    }
+
+    impl Node {
+        fn new(c: u8) -> Node {
+            let id = WriterId { node: NodeId::from_bytes([c; 16]), epoch: Epoch::from_u64(0) };
+            Node { w: Writer::new(id, JoinOptions::default()), contained: BTreeSet::new() }
+        }
+        /// The sim's `checked` and `logged`: the places before the write, the write, its order facts recorded.
+        fn write(
+            &mut self,
+            first: bool,
+            intent: Intent,
+            f: impl FnOnce(&mut Writer) -> Option<Written>,
+        ) -> Step {
+            let o = self.w.opts.clone();
+            let before = self.w.state.ordered_document(&o);
+            let pl = places(&self.contained, self.w.alive().last().copied());
+            let one_life = self.w.alive().len() == 1;
+            let r = f(&mut self.w).expect("the write is a write");
+            let op = op_of(&intent);
+            record(r.stamp, write_ord(before.as_deref(), &op), r.record.life, first);
+            self.contained.insert(r.stamp);
+            let after = self.w.state.ordered_document(&o);
+            Step { before, after, op, places: pl, one_life: one_life && self.w.alive().len() == 1 }
+        }
+        fn receive(&mut self, other: &Node) {
+            self.w.receive(&other.w.state);
+            self.contained.extend(other.contained.iter().copied());
+        }
+    }
+
+    fn history(unset_sibling: bool) -> Step {
+        let (mut a, mut b, mut c) = (Node::new(b'A'), Node::new(b'B'), Node::new(b'C'));
+        let base = [("x", i(1)), ("m", doc(&[("k", i(1)), ("j", i(1))]))];
+        let fields =
+            |f: &[(&str, Value)]| f.iter().map(|(k, v)| (np(k), v.clone())).collect::<Vec<_>>();
+        let named = |f: &[(&str, Value)]| {
+            f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect::<Vec<_>>()
+        };
+        a.write(true, Intent::Insert(named(&base)), |w| w.insert(&fields(&base), 0));
+        b.receive(&a);
+        c.receive(&a);
+        let rb = [("m", doc(&[("k", i(1)), ("j", i(1))]))];
+        b.write(false, Intent::Replace(named(&rb)), |w| w.write_replace(&fields(&rb), 0));
+        let rc = [("x", i(1)), ("m", doc(&[("k", i(1)), ("j", i(2))]))];
+        c.write(false, Intent::Replace(named(&rc)), |w| w.write_replace(&fields(&rc), 5));
+        c.receive(&b);
+        if unset_sibling {
+            c.write(false, Intent::Unset(np("m.k")), |w| w.write_unset(&np("m.k"), 0));
+        }
+        c.write(false, Intent::Inc(np("x")), |w| w.write_inc(&np("x"), 1, 0))
+    }
+
+    /// `after` with the field `name` of the top level moved to the end.
+    fn moved_last(d: &Doc, name: &str) -> Doc {
+        let mut d = d.clone();
+        let k = d.iter().position(|(n, _)| n == name).unwrap();
+        let f = d.remove(k);
+        d.push(f);
+        d
+    }
+
+    fn grade(s: &Step, after: &Doc) -> Result<(), String> {
+        check(s.before.as_deref(), Some(after), &s.op, &s.places, s.one_life).map(|_| ())
+    }
+
+    #[test]
+    fn a_re_created_field_must_come_before_a_sibling_whose_child_was_unset() {
+        for unset_sibling in [false, true] {
+            let s = history(unset_sibling);
+            let after = s.after.clone().unwrap();
+            assert_eq!(
+                names(&after),
+                ["x", "m"],
+                "the Writer (and the model) put x first: {unset_sibling}"
+            );
+            assert!(
+                s.places.born.contains_key(&vec!["x".to_string()]),
+                "x has a standing place in the log"
+            );
+            assert_eq!(grade(&s, &after), Ok(()), "the Writer's own document: {unset_sibling}");
+            let forged = moved_last(&after, "x");
+            assert!(
+                grade(&s, &forged).is_err(),
+                "[m, x] must be refused (C unsets m.k first: {unset_sibling})"
+            );
+        }
     }
 }
 

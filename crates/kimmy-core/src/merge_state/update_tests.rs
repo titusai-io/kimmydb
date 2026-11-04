@@ -284,3 +284,92 @@ fn the_stamped_form_asks_for_a_stamp_once_and_only_when_it_writes() {
         .unwrap();
     assert_eq!((r.stamp, asked, w.clock), (next, 1, next.hlc));
 }
+
+/// The overlap check the update used before it was O(n log n): every pair, the first by operator order. The sorted check
+/// must refuse exactly when this does, with the same pair.
+fn reference_overlap(ops: &[UpdateOp]) -> Option<(Path, Path)> {
+    let paths: Vec<&Path> = ops
+        .iter()
+        .map(|o| match o {
+            UpdateOp::Set(p, _) | UpdateOp::Unset(p) | UpdateOp::Inc(p, _) => p,
+        })
+        .collect();
+    for (i, a) in paths.iter().enumerate() {
+        for b in &paths[i + 1..] {
+            if a == b || a.is_below(b) || b.is_below(a) {
+                return Some(((*a).clone(), (*b).clone()));
+            }
+        }
+    }
+    None
+}
+
+fn overlap_of(ops: &[UpdateOp]) -> Option<(Path, Path)> {
+    match seeded().write_update(ops, 0) {
+        Err(UpdateRefused::Overlap(a, b)) => Some((a, b)),
+        _ => None,
+    }
+}
+
+#[test]
+fn the_overlap_check_finds_every_kind_of_overlap_and_reports_the_pair_in_operator_order() {
+    let set = |p: &str| UpdateOp::Set(np(p), i(1));
+    // an equal pair
+    assert_eq!(overlap_of(&[set("q"), set("q")]), Some((np("q"), np("q"))));
+    // a prefix pair far apart in the input, the extension first and the prefix last
+    let mut ops = vec![set("q.b.c")];
+    ops.extend((0..50).map(|n| set(&format!("s{n}"))));
+    ops.push(set("q.b"));
+    assert_eq!(overlap_of(&ops), Some((np("q.b.c"), np("q.b"))));
+    // unrelated neighbours in the order of the paths (a name that starts with another is not below it)
+    assert_eq!(overlap_of(&[set("q.a"), set("q.b"), set("qa"), set("r")]), None);
+    assert!(
+        seeded().write_update(&[set("q.a"), set("q.b"), set("qa"), set("r")], 0).unwrap().is_some()
+    );
+    // many siblings with one overlap hidden in the middle
+    let mut ops: Vec<UpdateOp> = (0..1000).map(|n| set(&format!("p{n}"))).collect();
+    ops.insert(500, set("p700.child"));
+    assert_eq!(overlap_of(&ops), Some((np("p700.child"), np("p700"))));
+    // the same as the pairwise check on many random small lists
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x % n) as usize
+    };
+    let names = ["a", "b", "ab", "a.b", "a.b.c", "a.c", "b.a", "c", "c.c", "c.c.c"];
+    let (mut refused, mut accepted) = (0, 0);
+    for _ in 0..3000 {
+        let n = 1 + next(6);
+        let ops: Vec<UpdateOp> = (0..n).map(|_| set(names[next(names.len() as u64)])).collect();
+        let want = reference_overlap(&ops);
+        if want.is_some() {
+            refused += 1;
+        } else {
+            accepted += 1;
+        }
+        assert_eq!(overlap_of(&ops), want, "{ops:?}");
+    }
+    assert!(refused > 500 && accepted > 100, "{refused} refused, {accepted} accepted");
+}
+
+/// The overlap check is O(n log n): 300,000 no-op `$unset`s of distinct paths complete (the pairwise check was about
+/// 4.5 * 10^10 path comparisons here, minutes in a debug build).
+#[test]
+fn a_large_update_is_checked_for_overlap_in_n_log_n() {
+    let ops: Vec<UpdateOp> =
+        (0..300_000).map(|n| UpdateOp::Unset(Path::flat(&format!("p{n}")).unwrap())).collect();
+    let mut w = seeded();
+    let t = std::time::Instant::now();
+    assert_eq!(w.write_update(&ops, 0), Ok(None), "every operator is a no-op");
+    eprintln!("300,000 operators: {:?}", t.elapsed());
+    // and one overlap at the very end is found
+    let mut ops = ops;
+    ops.push(UpdateOp::Unset(Path::new(["p123", "child"]).unwrap()));
+    let e = w.write_update(&ops, 0).unwrap_err();
+    assert_eq!(
+        e,
+        UpdateRefused::Overlap(Path::flat("p123").unwrap(), Path::new(["p123", "child"]).unwrap())
+    );
+}

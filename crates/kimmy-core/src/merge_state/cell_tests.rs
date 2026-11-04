@@ -1106,7 +1106,7 @@ fn a_dangling_seen_key_survives_a_numeric_base_and_ends_with_a_non_numeric_one()
 }
 
 /// THE DECODE OF DECIMAL TOTALS. The Writer produces a `Decimal128` total only through `pack_raw` (the sum of
-/// `sum_checked`, and the writer's first amount, `Num::first_amount`: the product's `0 + operand`), so a total
+/// `sum_checked`, and the writer's first amount, `Num::first_amount`: the canonical encoding of the operand), so a total
 /// is one of the words `pack_raw` writes: a coefficient of at most 10^34 - 1 in the normal form with an exponent
 /// in range (a zero with its sign and exponent included), the plain quiet NaN, and the two infinities. The compact
 /// reader (`num_payload`) refuses every other word with `NotCanonicalDecimal`, for every place a typed total is
@@ -1325,10 +1325,10 @@ fn st3() -> MStamp {
 /// kept as a test so it cannot drift). `inc_result` / `sum_checked` refuse a decimal sum only when it
 /// overflows from FINITE inputs (`Num::decimal_overflowed`), and no check of the operand looks at its
 /// class (`Value::check_input`), so a NaN or an infinite operand is a legal `$inc`. The writer's first
-/// amount at a path is what the product stores for `$inc` on an absent field, `0 + operand`
-/// (`Writer::inc_plan`: `op.first_amount()`, ADR-252), so the bytes of a NaN with a payload or of a
+/// amount at a path is the product's stored FORM of the operand (`Writer::inc_plan`: `op.first_amount()`, the
+/// canonical encoding with the cohort member kept, ADR-252), so the bytes of a NaN with a payload or of a
 /// non-canonical coefficient are canonicalised there (the plain quiet NaN, a canonical zero; an infinity
-/// stays one, a negative zero becomes `+0`) and never reach the slot. Later sums are canonical (`pack_raw`
+/// stays one, `-0` and `0E2015` stay as spelled) and never reach the slot. Later sums are canonical (`pack_raw`
 /// asserts it), a base write folds the canonical total into the pair, and `seen` and the loss totals are copies.
 /// So the totals a writer holds are exactly the words `pack_raw` writes (`Num::is_canonical`), and decode refuses
 /// the others (`a_decimal_total_no_writer_produces_is_refused_wherever_a_total_is_spelled`). The operand a `$set`
@@ -1350,8 +1350,8 @@ fn the_writer_canonicalises_nan_infinite_and_non_canonical_decimal_operands() {
         ("negative infinity", INF | 1 << 127, INF | 1 << 127),
         ("positive infinity", INF, INF),
         ("infinity with a payload", INF | 5, INF),
-        // canonical, but the product's `0 + 0E2015` is `0E0` (the exponent of a sum is the smaller one)
-        ("a zero with an exponent in range", 0x1fffu128 << 113, 6176u128 << 113),
+        // already canonical: the cohort member is kept (0E+2015 stays 0E+2015)
+        ("a zero with an exponent in range", 0x1fffu128 << 113, 0x1fffu128 << 113),
     ];
     let bytes = |n: &Num| match n {
         Num::Decimal128(b) => u128::from_le_bytes(*b),
@@ -1379,15 +1379,61 @@ fn the_writer_canonicalises_nan_infinite_and_non_canonical_decimal_operands() {
         assert!(sl.total.is_canonical());
         accepts(&w.state);
     }
-    // a negative zero operand is the product's `0 + -0` = `+0`
+    // a negative zero operand stays `-0` (the cohort member is kept, not recomputed as `0 + -0` = `+0`)
     let mut w = Writer::new(wid('A', 0), o);
     w.insert(&fl(&[("x", i(1))]), 0).unwrap();
     w.write_inc_value(&x, &raw(1u128 << 127 | 6176u128 << 113), 0).unwrap();
-    assert_eq!(bytes(&w.state.slots.values().next().unwrap().total), 6176u128 << 113);
+    assert_eq!(
+        bytes(&w.state.slots.values().next().unwrap().total),
+        1u128 << 127 | 6176u128 << 113
+    );
     // and `$set` of a decimal stays as given: a register's value, not a total
     let mut w = Writer::new(wid('A', 0), opts());
     w.insert(&fl(&[("x", i(1))]), 0).unwrap();
     let odd = NAN | 1 << 127 | 0x1234;
     w.write_set(&x, raw(odd), 0).unwrap();
     assert_eq!(w.state.regs.values().find(|r| r.value != Value::Map).unwrap().value, raw(odd));
+}
+
+/// THE WRITER'S READ AGAINST THE PRODUCT'S `$inc` for a decimal. kimmy-query's `decimal_arithmetic`
+/// (`update.rs` 1480-1531) stores `pack_raw(arith::add(decode_raw(stored), decode_raw(operand)))`, one addition per `$inc`,
+/// the exponent of the sum being the smaller of the two (the cohort member counts: `2.30` and `2.3` differ). kimmy-core
+/// cannot call kimmy-query, so this uses the primitives it calls (`decimal::arith::add`, `decode_raw`, `pack_raw`). One
+/// writer, sequential: `{x: base}` (a decimal register), then `$inc x op` once or twice; the visible bytes of x must be the
+/// product's. The first slot is the canonical ENCODING of the operand, not `0 + operand` (which would read `200` for
+/// `1E2 + 1E2`, the product stores `2E+2`); on an absent field the product adds to `Int32(0)` and the read does too.
+#[test]
+fn a_decimal_inc_reads_as_the_products_stored_decimal() {
+    use crate::decimal::{arith, decode_raw, pack_raw};
+    let d = |t: &str| t.parse::<bson::Decimal128>().unwrap();
+    let product = |stored: &bson::Decimal128, op: &bson::Decimal128| {
+        pack_raw(arith::add(&decode_raw(stored), &decode_raw(op)))
+    };
+    let read = |w: &Writer| w.visible().unwrap()[&p("x")].clone();
+    for (base, ops) in [
+        ("1E5", &["1E3"][..]),
+        ("1E5", &["1E3", "1E3"][..]),
+        ("1.5", &["2.25"][..]),
+        ("100", &["1E2"][..]),
+        ("1E2", &["1E2"][..]),
+        ("5", &["-0"][..]),
+        ("1E+10", &["1E+40"][..]),
+    ] {
+        let mut w = Writer::new(wid('A', 0), opts());
+        w.insert(&fl(&[("x", dval(base))]), 0).unwrap();
+        let mut want = d(base);
+        for op in ops {
+            w.write_inc_value(&p("x"), &dval(op), 0).unwrap();
+            want = product(&want, &d(op));
+        }
+        assert_eq!(read(&w), Value::Decimal128(want.bytes()), "{base} + {ops:?}");
+    }
+    // an absent field: the product adds to Int32(0)
+    for op in ["1E3", "-0", "1E+40", "NaN", "-Infinity", "0E2015", "1E+2"] {
+        let mut w = Writer::new(wid('A', 0), opts());
+        w.insert(&fl(&[("y", i(1))]), 0).unwrap();
+        w.write_inc_value(&p("x"), &dval(op), 0).unwrap();
+        let want = product(&pack_raw(arith::from_i64(0)), &d(op));
+        assert_eq!(read(&w), Value::Decimal128(want.bytes()), "absent + {op}");
+    }
 }
