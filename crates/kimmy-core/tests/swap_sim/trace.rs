@@ -16,7 +16,7 @@ use crate::oracle::finish;
 use crate::relay::{pair, take_quiesce};
 use crate::rng::Rng;
 use crate::snapshot::{land_page_in, snapshot_begin_in};
-use crate::world::World;
+use crate::world::{Policy, World};
 
 /// Counters the model keeps and the Rust port does not carry (statistics for the refusal-duration tables and the two route
 /// probes of phase G); excluded from the counter comparison and from nothing else.
@@ -30,6 +30,10 @@ pub const PY_ONLY_STATS: [&str; 8] = [
     "hold_taken",
     "repair_events",
 ];
+
+/// Counters only the `field` policy keeps (the covered-entry skip, the loss records its joins produce); not in the model, so
+/// excluded from the counter comparison of a `field` replay and from nothing else.
+pub const FIELD_ONLY_STATS: [&str; 2] = ["covered_skips", "q7_records_fresh"];
 
 /// FNV-1a over entry ids (each id + 1 is one input): the tracer's `fnv`.
 pub fn fnv<I: IntoIterator<Item = usize>>(ids: I) -> u64 {
@@ -61,6 +65,20 @@ fn body_v(b: &Body) -> Value {
     }
 }
 
+/// A body as the model writes it. Under the `field` policy a document's body is its visible fields (`v="a|b"`); the model's
+/// body is the list of marks `["a", "b"]`, which the replay of a trace through `field` maps it to (one register `v`, the
+/// marks joined by `|`).
+fn body_vw(w: &World, b: &Body) -> Value {
+    if w.policy == Policy::Field
+        && let Some(lines) = b
+        && lines.len() == 1
+        && let Some(inner) = lines[0].strip_prefix("v=\"").and_then(|s| s.strip_suffix('"'))
+    {
+        return json!(inner.split('|').collect::<Vec<_>>());
+    }
+    body_v(b)
+}
+
 fn lk_v(w: &World, k: &LKey) -> Value {
     let mut v = vec![json!(k.key)];
     if let Some(s) = &k.stamp {
@@ -82,7 +100,10 @@ fn entry_v(w: &World, e: &Entry) -> Value {
     let o = d.as_object_mut().unwrap();
     if e.kind == Kind::Loss {
         o.insert("lkey".into(), lk_v(w, &e.lkey.unwrap()));
-        o.insert("body".into(), body_v(&e.body));
+        o.insert(
+            "body".into(),
+            if w.policy == Policy::Field { Value::Null } else { body_v(&e.body) },
+        );
         o.insert(
             "extra".into(),
             match &e.extra {
@@ -94,7 +115,7 @@ fn entry_v(w: &World, e: &Entry) -> Value {
     } else {
         o.insert("phys".into(), json!(e.phys));
         o.insert("key".into(), if e.kind == Kind::Doc { json!(e.key) } else { Value::Null });
-        o.insert("body".into(), body_v(&e.body));
+        o.insert("body".into(), body_vw(w, &e.body));
         o.insert(
             "opk".into(),
             match e.opk {
@@ -131,7 +152,7 @@ pub fn member_view(w: &World, m: &Member) -> Value {
         .phys
         .iter()
         .map(|(n, p)| {
-            let docs: Vec<Value> = p.docs.iter().map(|(k, v)| json!([k, stamp_v(w, &v.stamp), body_v(&v.body)])).collect();
+            let docs: Vec<Value> = p.docs.iter().map(|(k, v)| json!([k, stamp_v(w, &v.stamp), body_vw(w, &v.body)])).collect();
             json!([n, {"kind": pkind(p.kind), "alive": p.alive, "kill": p.kill.as_ref().map(|s| stamp_v(w, s)),
                 "kept": p.kept, "missing": p.missing, "orphan": p.orphan, "docs": docs}])
         })
@@ -151,8 +172,8 @@ pub fn member_view(w: &World, m: &Member) -> Value {
         "bmap": sj(m.bmap.iter().map(|(n, s)| json!([n, stamp_v(w, s)])).collect()),
         "abandoned": abandoned,
         "learned": sj(m.learned.iter().map(|(n, s)| json!([n, s])).collect()),
-        "loss": m.loss.iter().map(|(k, b)| json!([lk_v(w, k), body_v(b)])).collect::<Vec<_>>(),
-        "loss_pending": m.loss_pending.iter().map(|(k, b)| json!([lk_v(w, k), body_v(b)])).collect::<Vec<_>>(),
+        "loss": m.loss.iter().map(|(k, b)| json!([lk_v(w, k), if w.policy == Policy::Field { Value::Null } else { body_v(b) }])).collect::<Vec<_>>(),
+        "loss_pending": m.loss_pending.iter().map(|(k, b)| json!([lk_v(w, k), if w.policy == Policy::Field { Value::Null } else { body_v(b) }])).collect::<Vec<_>>(),
         "loss_phys": sj(m.loss_phys.iter().map(|(k, p)| json!([lk_v(w, k), p])).collect()),
         "events_emitted": sj(m.events_emitted.iter().filter(|(_, n)| **n != 0).map(|(k, n)| {
             json!([[k.0, k.2.as_ref().map(|s| stamp_v(w, s))], n])
@@ -208,7 +229,88 @@ pub fn first_diff(path: &str, py: &Value, rs: &Value) -> Option<String> {
     }
 }
 
+/// Every leaf difference between two values (an array of unequal length is one difference).
+pub fn all_diffs(path: &str, py: &Value, rs: &Value, out: &mut Vec<String>) {
+    match (py, rs) {
+        (Value::Object(a), Value::Object(b)) => {
+            for (k, va) in a {
+                match b.get(k) {
+                    Some(vb) => all_diffs(&format!("{path}.{k}"), va, vb, out),
+                    None => out.push(format!("{path}.{k}: python {va} <> rust (absent)")),
+                }
+            }
+            for k in b.keys().filter(|k| !a.contains_key(*k)) {
+                out.push(format!("{path}.{k}: python (absent) <> rust {}", b[k]));
+            }
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                out.push(format!("{path}: length python {} <> rust {}", a.len(), b.len()));
+                return;
+            }
+            for i in 0..a.len() {
+                all_diffs(&format!("{path}[{i}]"), &a[i], &b[i], out);
+            }
+        }
+        _ => {
+            if py != rs {
+                out.push(format!("{path}: python {py} <> rust {rs}"));
+            }
+        }
+    }
+}
+
+/// The document layer of a member view: what depends on how the policy decides a version (last-writer-wins or the join): the
+/// documents, the records, the relay's decisions (`appended`, `held`, `dochist`, ...). The rest is the register layer.
+pub fn is_doc_layer(path: &str) -> bool {
+    [
+        ".docs",
+        ".loss",
+        ".events_emitted",
+        ".appended_",
+        ".held_",
+        ".dochist",
+        ".hist_kept",
+        ".recv_entry",
+        ".deferred",
+        ".held_records",
+        ".bare_state",
+        ".pend_tombs",
+        "].body",
+        ".lkey",
+        ".extra",
+    ]
+    .iter()
+    .any(|k| path.contains(k))
+}
+
+/// How a trace is replayed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReplayMode {
+    /// the `document` policy: every difference is a disagreement
+    Document,
+    /// the `field` policy on a trace with no delete and no concurrent same-key write (the header says `field_safe`): every
+    /// difference is a disagreement
+    FieldExact,
+    /// the `field` policy on any trace: the replay stops at the first event where a document-layer field differs (the two
+    /// policies decide differently there, expected) and reports where; a difference in the register layer before that is a
+    /// disagreement
+    FieldRegisterLayer,
+}
+
+/// Whether the trace's header marks it field-safe.
+pub fn is_field_safe(path: &Path) -> bool {
+    let text = std::fs::read_to_string(path).unwrap();
+    let head: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    head["field_safe"] == true
+}
+
 pub struct Outcome {
+    /// the event and the first document-layer difference at which a `FieldRegisterLayer` replay stopped
+    pub stopped_at: Option<(usize, String)>,
+    /// member views where a `field` replay's clock was above the model's while a snapshot join was open (the Q-F6 rule: a joined
+    /// page's whole state is witnessed, the model witnesses only the entries applied); the clocks must agree again at the end
+    pub hlc_raised_mid_join: usize,
     pub events: usize,
     pub member_views: usize,
 }
@@ -238,6 +340,10 @@ fn res_idx(r: &Option<EntryRef>) -> Value {
 
 /// Replay one trace file. `Err` carries the first disagreement.
 pub fn replay_file(path: &Path) -> Result<Outcome, String> {
+    replay_file_mode(path, ReplayMode::Document)
+}
+
+pub fn replay_file_mode(path: &Path, rmode: ReplayMode) -> Result<Outcome, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut lines = text.lines();
     let head: Value =
@@ -259,11 +365,19 @@ pub fn replay_file(path: &Path) -> Result<Outcome, String> {
         head["D"].as_i64().unwrap(),
         false,
     );
+    if rmode != ReplayMode::Document {
+        if rmode == ReplayMode::FieldExact {
+            assert_eq!(head["field_safe"], true, "{name}: not a field-safe trace");
+        }
+        w.policy = Policy::Field;
+        w.q7_entries = false;
+        w.field_counters = false;
+    }
     let mut ms: Vec<Member> =
         members.iter().enumerate().map(|(i, (n, s))| Member::new(i, n, *s)).collect();
     let mut jobs: Vec<Job> = Vec::new();
     let idx = |n: &str| names.iter().position(|x| x == n).unwrap_or_else(|| panic!("member {n}"));
-    let mut out = Outcome { events: 0, member_views: 0 };
+    let mut out = Outcome { stopped_at: None, hlc_raised_mid_join: 0, events: 0, member_views: 0 };
     for (lineno, line) in lines.enumerate() {
         let ev: Value =
             serde_json::from_str(line).map_err(|e| format!("{name}:{}: {e}", lineno + 2))?;
@@ -415,7 +529,12 @@ pub fn replay_file(path: &Path) -> Result<Outcome, String> {
                     .stats
                     .0
                     .iter()
-                    .filter(|(k, v)| **v != 0 && !PY_ONLY_STATS.contains(&k.as_str()))
+                    .filter(|(k, v)| {
+                        **v != 0
+                            && !PY_ONLY_STATS.contains(&k.as_str())
+                            && !(rmode != ReplayMode::Document
+                                && FIELD_ONLY_STATS.contains(&k.as_str()))
+                    })
                     .map(|(k, v)| (k.clone(), *v))
                     .collect();
                 if py != rs {
@@ -470,6 +589,7 @@ pub fn replay_file(path: &Path) -> Result<Outcome, String> {
             other => return Err(fail(format!("unknown event kind {other}"))),
         };
         if kind != "final" && kind != "pre_finish" && kind != "lost" {
+            let mut diffs: Vec<String> = Vec::new();
             if matches!(
                 kind,
                 "local"
@@ -482,29 +602,102 @@ pub fn replay_file(path: &Path) -> Result<Outcome, String> {
                     | "relay_tomb"
             ) && res != ev["res"]
             {
-                return Err(fail(format!("result: python {} <> rust {res}", ev["res"])));
+                // the result of a client write is the policy's decision (refused, or a no-op); the others are the register's
+                let tag = if matches!(kind, "local") { ".body" } else { "" };
+                diffs.push(format!("{tag}result: python {} <> rust {res}", ev["res"]));
             }
             let new_py = ev["new"].as_array().unwrap();
             let new_rs: Vec<Value> = w.all[n0..].iter().map(|e| entry_v(&w, e)).collect();
-            if new_py.len() != new_rs.len() {
-                return Err(fail(format!(
-                    "entries minted: python {} <> rust {}",
+            let is_loss = |v: &Value| v["kind"] == "loss";
+            let policy_loss = rmode != ReplayMode::Document;
+            if policy_loss {
+                // the loss records are the policy's (a value per lost write for the model, a head per lost cell for the join);
+                // the other entries are compared exactly, by content, because a loss entry minted in the same event shifts ids
+                let strip = |v: &Value| -> Value {
+                    let mut v = v.clone();
+                    v["idx"] = Value::Null;
+                    v
+                };
+                let py_other: Vec<Value> =
+                    new_py.iter().filter(|v| !is_loss(v)).map(strip).collect();
+                let rs_other: Vec<Value> =
+                    new_rs.iter().filter(|v| !is_loss(v)).map(strip).collect();
+                all_diffs("new", &Value::Array(py_other), &Value::Array(rs_other), &mut diffs);
+                let (pl, rl) = (
+                    new_py.iter().filter(|v| is_loss(v)).count(),
+                    new_rs.iter().filter(|v| is_loss(v)).count(),
+                );
+                let same_keys = {
+                    let key =
+                        |v: &Value| (v["origin"].clone(), v["lkey"].clone(), v["extra"].clone());
+                    let a: Vec<_> = new_py.iter().filter(|v| is_loss(v)).map(key).collect();
+                    let b: Vec<_> = new_rs.iter().filter(|v| is_loss(v)).map(key).collect();
+                    a == b
+                };
+                if pl != rl || !same_keys {
+                    diffs.push(format!(
+                        ".loss entries minted: python {pl}, rust {rl} (the policy's records)"
+                    ));
+                }
+            } else if new_py.len() != new_rs.len() {
+                diffs.push(format!(
+                    ".body entries minted: python {} <> rust {}",
                     Value::Array(new_py.clone()),
-                    Value::Array(new_rs)
-                )));
-            }
-            for (p, r) in new_py.iter().zip(&new_rs) {
-                if let Some(d) = first_diff("new", p, r) {
-                    return Err(fail(format!("a minted entry: {d}")));
+                    Value::Array(new_rs.clone())
+                ));
+            } else {
+                for (p, r) in new_py.iter().zip(&new_rs) {
+                    all_diffs("new", p, r, &mut diffs);
                 }
             }
             for mv in ev["ms"].as_array().unwrap() {
                 let i = idx(mv["name"].as_str().unwrap());
                 let rv = member_view(&w, &ms[i]);
-                if let Some(d) = first_diff(&format!("member {}", ms[i].name), mv, &rv) {
-                    return Err(fail(d));
+                let mut mv = mv.clone();
+                if rmode != ReplayMode::Document {
+                    for k in ["loss", "loss_pending"] {
+                        if let Some(a) = mv[k].as_array_mut() {
+                            for rec in a.iter_mut() {
+                                rec[1] = Value::Null;
+                            }
+                        }
+                    }
                 }
+                let mut mine = Vec::new();
+                all_diffs(&format!("member {}", ms[i].name), &mv, &rv, &mut mine);
+                let hlc_path = format!("member {}.hlc", ms[i].name);
+                let raised = rmode != ReplayMode::Document
+                    && !rv["join"].is_null()
+                    && rv["hlc"].as_i64() > mv["hlc"].as_i64();
+                if raised && mine.iter().any(|d| d.starts_with(&hlc_path)) {
+                    mine.retain(|d| !d.starts_with(&hlc_path));
+                    out.hlc_raised_mid_join += 1;
+                }
+                diffs.extend(mine);
                 out.member_views += 1;
+            }
+            if rmode != ReplayMode::Document
+                && diffs.iter().any(|d| d.starts_with(".loss entries minted"))
+            {
+                // every loss entry a member mints ticks its clock: the clock follows the policy's records, not the register
+                diffs.retain(|d| !(d.starts_with("member ") && d.contains(".hlc: ")));
+            }
+            if !diffs.is_empty() {
+                let doc = diffs.iter().find(|d| is_doc_layer(d));
+                // a register-layer difference in the same event is still a disagreement
+                if rmode == ReplayMode::FieldRegisterLayer
+                    && let Some(d) = doc
+                    && diffs.iter().all(|d| is_doc_layer(d))
+                {
+                    out.stopped_at = Some((lineno + 1, d.clone()));
+                    return Ok(out);
+                }
+                // the first difference that is not the policy's (the whole list when it has several)
+                let first = diffs
+                    .iter()
+                    .find(|d| rmode == ReplayMode::Document || !is_doc_layer(d))
+                    .unwrap_or(&diffs[0]);
+                return Err(fail(first.clone()));
             }
         }
         out.events += 1;

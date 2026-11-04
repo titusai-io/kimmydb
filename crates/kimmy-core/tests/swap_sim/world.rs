@@ -39,6 +39,9 @@ pub struct World {
     pub policy: Policy,
     /// `field`: mint Q7's loss records as entries in the relay (V6M2, as the Q7 sim does); off for the comparison runs
     pub q7_entries: bool,
+    /// `field`: an update is a `$set` or an `$inc` by the clock's parity (default); off, every update is a `$set` of `v` (the replay
+    /// of the model's traces)
+    pub field_counters: bool,
     /// `field`: the join options (retention 10^9, the Int64 bound), as the Q7 differential
     pub fopts: JoinOptions,
     /// `field`: the paths of loss records, interned (`LKey.path` indexes it)
@@ -78,6 +81,7 @@ impl World {
         Self {
             policy: Policy::Document,
             q7_entries: true,
+            field_counters: true,
             fopts: JoinOptions::new(1_000_000_000, i64::MAX).expect("a valid bound"),
             paths: Vec::new(),
             f,

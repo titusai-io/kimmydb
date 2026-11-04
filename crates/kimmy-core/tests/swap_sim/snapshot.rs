@@ -320,6 +320,10 @@ impl Member {
             Some(true) if w.policy == Policy::Field => {
                 self.witness_docs(&pd.docs);
                 for (k, v) in pd.docs.iter() {
+                    let cur_stamp = self.phys.get(&name).unwrap().docs.get(k).map(|c| c.stamp);
+                    if ungranted && cur_stamp.is_none_or(|c| v.stamp > c) {
+                        self.held_records.insert((name.clone(), *k, v.stamp)); // as the document policy's held record
+                    }
                     let (merged, fresh) = match self.phys.get(&name).unwrap().docs.get(k) {
                         Some(cur) => crate::field::merge_page(cur, v, ungranted, &w.fopts),
                         None => {

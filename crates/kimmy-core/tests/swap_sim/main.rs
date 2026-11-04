@@ -194,25 +194,66 @@ mod tests {
     }
 
     fn replay_all(dir: &std::path::Path) -> (usize, usize, usize) {
+        replay_all_mode(dir, crate::trace::ReplayMode::Document, &[]).0
+    }
+
+    /// Replay every trace of a directory in a mode; the figures, and under `FieldRegisterLayer` the traces that stopped at a
+    /// document-layer difference (events replayed before it are all compared) .
+    /// (trace file, line, the document-layer difference) where a register-layer replay stopped
+    type Stop = (String, usize, String);
+
+    fn replay_all_mode(
+        dir: &std::path::Path,
+        mode: crate::trace::ReplayMode,
+        known: &[(&str, &str)],
+    ) -> ((usize, usize, usize), Vec<Stop>, usize) {
         let files = crate::trace::traces_in(dir);
         assert!(!files.is_empty(), "no traces in {}", dir.display());
-        let (mut events, mut views, mut failures) = (0, 0, Vec::new());
+        let (mut events, mut views, mut failures, mut stopped, mut raised) =
+            (0, 0, Vec::new(), Vec::new(), 0);
+        let mut known_seen = 0;
         for f in &files {
-            match crate::trace::replay_file(f) {
+            if mode == crate::trace::ReplayMode::FieldExact && !crate::trace::is_field_safe(f) {
+                continue;
+            }
+            match crate::trace::replay_file_mode(f, mode) {
                 Ok(o) => {
                     events += o.events;
                     views += o.member_views;
+                    raised += o.hlc_raised_mid_join;
+                    if let Some((line, d)) = o.stopped_at {
+                        stopped.push((
+                            f.file_name().unwrap().to_string_lossy().into_owned(),
+                            line,
+                            d,
+                        ));
+                    }
                 }
-                Err(e) => failures.push(e),
+                Err(e) => {
+                    // a finding the manager has been told of, asserted by name and text so that it flips when fixed
+                    let name = f.file_name().unwrap().to_string_lossy().into_owned();
+                    if let Some((_, text)) = known.iter().find(|(n, _)| *n == name) {
+                        assert!(e.contains(text), "{name}: the known disagreement changed: {e}");
+                        known_seen += 1;
+                    } else {
+                        failures.push(e);
+                    }
+                }
             }
         }
+        assert_eq!(
+            known_seen,
+            known.len(),
+            "a known disagreement is gone (fixed?) or its trace was not replayed"
+        );
         for e in &failures {
             eprintln!("{e}");
         }
         eprintln!(
-            "replayed {} traces: {events} events, {views} member states compared, {} disagreements",
+            "replayed {} traces ({mode:?}): {events} events, {views} member states compared, {} disagreements, {} stopped at a document-layer difference, member clocks raised above the model's mid-join {raised} times",
             files.len(),
-            failures.len()
+            failures.len(),
+            stopped.len()
         );
         assert!(
             failures.is_empty(),
@@ -220,7 +261,7 @@ mod tests {
             failures.len(),
             failures[0]
         );
-        (files.len(), events, views)
+        ((files.len(), events, views), stopped, raised)
     }
 
     /// The scripted scenarios, run by the vendored model (the Python twins) and replayed on the harness.
@@ -228,6 +269,45 @@ mod tests {
     fn the_differential_replays_the_scripted_traces() {
         let dir = trace_dir("scripted", "scripted", &[]);
         replay_all(&dir);
+    }
+
+    const FINDING_F_3_1: &[(&str, &str)] = &[
+        (
+            "s-append-in-position-m-no-append-in-position.jsonl",
+            "member C.appended_n: python 3 <> rust 2",
+        ),
+        ("s-append-in-position-v6.jsonl", "appended_in_position: python Some(1) <> rust Some(2)"),
+    ];
+
+    /// The scripted scenarios without a delete and without concurrent same-key writes (the tracer's `field_safe` marker), replayed
+    /// under the `field` policy: last-writer-wins and the join agree there, so every difference is a disagreement. Two traces
+    /// disagree today, FINDING F-3-1 of report 3, asserted here by name and text so that the test flips when it is settled: the
+    /// model counts an entry whose stamp equals the held page version's (the same write) as winning, appended whatever the
+    /// append-in-position flag; the `field` join sees "unchanged" and appends it only through the append-in-position branch.
+    #[test]
+    fn the_differential_replays_the_field_safe_scripted_traces_under_the_field_policy() {
+        let dir = trace_dir("scripted-field", "scripted", &[]);
+        let ((n, events, _), stopped, _) =
+            replay_all_mode(&dir, crate::trace::ReplayMode::FieldExact, FINDING_F_3_1);
+        assert!(n > 0 && events > 0 && stopped.is_empty());
+    }
+
+    /// Random traces of the model under the `field` policy, register layer only: every event before the first document-layer
+    /// difference (where the two policies decide differently, expected) is compared exactly; a difference in the register layer
+    /// is a disagreement. The stops are listed.
+    #[test]
+    fn the_differential_replays_random_traces_under_the_field_policy_on_the_register_layer() {
+        let runs = env_u64("Q6DIFF_FIELD_RUNS", 36).to_string();
+        let dir = trace_dir("random-field", "random", &["--mode", "v6", "--count", &runs]);
+        let ((n, events, views), stopped, _) =
+            replay_all_mode(&dir, crate::trace::ReplayMode::FieldRegisterLayer, &[]);
+        for (f, line, d) in &stopped {
+            eprintln!("  stopped: {f} line {line}: {d}");
+        }
+        eprintln!(
+            "field register-layer replay: {n} traces, {events} events, {views} member states, {} stopped",
+            stopped.len()
+        );
     }
 
     /// A bounded sample of random runs of the model, on the base and on every mutant the model has (`Q6DIFF_RUNS` runs of the
@@ -310,7 +390,7 @@ mod tests {
         let bytes = std::fs::read(dir.join("swapmodel6a.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, want, "swapmodel6a.py");
-        let tracer = "79d9c55e7f363475ef1a1a13eb67e50af8a69a0c247acf514e2be11a87c1dc8b";
+        let tracer = "cd5ffeb8bc28bbd3b39f47bba00b32c9378e3fe53ab8491270c7853ad7152181";
         let bytes = std::fs::read(dir.join("q6diff_gen.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, tracer, "q6diff_gen.py");
