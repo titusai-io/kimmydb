@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::tests::{fl, h, i, opts, p, s, wid};
 use super::*;
+use crate::decimal::{Raw, decode_raw_bits};
 use crate::hlc::Hlc;
 
 type SlotKey = (MStamp, Path, WriterId, Option<MStamp>);
@@ -1273,6 +1274,47 @@ fn a_decimal_total_no_writer_produces_is_refused_wherever_a_total_is_spelled() {
         assert!(!w.receive_loss(key.clone(), LossValue::Total(payload)), "{what}: a loss entry");
         assert!(w.receive_loss(key, LossValue::Total(dec("3"))));
     }
+}
+
+/// WHY NO CLAUSE "THE EXPONENT IS AT MOST 0" IS ADDED to `NotCanonicalDecimal`. The exponent of a first amount is the
+/// smaller of the operand's and zero, but a LATER sum whose exact coefficient would need more than 34 digits is rounded
+/// to 34 and its exponent RISES: 9999999999999999999999999999999999 + 1 is 1.000000000000000000000000000000000E+34, an
+/// honest total with a positive exponent (the product's `$inc` rounds the same way, ADR-252). Such a clause would refuse
+/// states that honest writers hold. Built through the Writer's own arithmetic (`$inc` of the largest 34-digit integer
+/// and then of 1 at one slot, a base write, a loss), the word is a slot total, an absorbed total, a generation's `seen`
+/// total and a loss total, and decode accepts every one.
+#[test]
+fn an_honest_total_with_a_positive_exponent_is_accepted_for_the_slot_the_pair_seen_and_the_loss() {
+    let exponent = |n: &Num| match n {
+        Num::Decimal128(b) => match decode_raw_bits(u128::from_le_bytes(*b)) {
+            Raw::Finite { exponent, .. } => exponent,
+            r => panic!("{r:?}"),
+        },
+        n => panic!("{n:?}"),
+    };
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+    w.write_inc_value(&p("x"), &dval("9999999999999999999999999999999999"), 0).unwrap();
+    w.write_inc_value(&p("x"), &dval("1"), 0).unwrap(); // the sum needs 35 digits: rounded, the exponent rises
+    w.write_set(&p("x"), s("t"), 0).unwrap(); // a base write: the pair, and a generation that has seen the slot
+    let mut good = w.state.without_ords();
+    let slot = good.slots.values().next().unwrap().total;
+    assert!(exponent(&slot) > 0, "the rounded sum has a positive exponent: {slot:?}");
+    assert!(slot.is_canonical());
+    let pair = good.slots.values().next().unwrap().absorbed.unwrap().1;
+    assert_eq!(pair, slot, "the base write folded the rounded total");
+    let seen: Vec<Num> = good
+        .regs
+        .values()
+        .filter_map(|r| r.generation.as_ref())
+        .flat_map(|g| g.seen.values().copied())
+        .collect();
+    assert!(seen.iter().any(|n| exponent(n) > 0), "a generation's seen holds it");
+    good.losses.insert(
+        LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
+        LossValue::Total(slot),
+    );
+    accepts(&good);
 }
 
 fn st3() -> MStamp {
