@@ -478,8 +478,8 @@ impl Writer {
         } else {
             Some(Gen::start(st, &self.state.vv, self.seen(p, al)))
         };
-        // (the mutant `no_fold_marker`: a map marker write folds nothing)
-        if !(self.opts.no_fold_marker() && v == Value::Map) {
+        // (the mutant `no_fold_marker`: a map marker write, explicit or implicit, folds nothing)
+        if !(self.opts.no_fold_marker() && v.is_marker()) {
             let folded = self.fold_keys(p, al, win);
             self.fold(folded);
         }
