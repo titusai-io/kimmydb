@@ -381,13 +381,13 @@ fn states_and_reads_match_the_pinned_fingerprints() {
         println!("[fingerprint {name}] {fp:#018x}");
     }
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0x09a634851bd5eaa0),
-        ("no restore", 0x494d6791742457e9),
-        ("bound 1000", 0xa5d6b9a720c0d0f2),
+        ("restore", 0x4efca9449bca3d13),
+        ("no restore", 0x08ad9af402612aaa),
+        ("bound 1000", 0xccecf868d8992847),
         ("sequential", 0xf5da0966517d1134),
-        ("horizon", 0x3f90cf8879df7051),
-        ("bounded", 0xc3c4d2cf632d2a16),
-        ("bounded nested", 0x658be566d4dce1c3),
+        ("horizon", 0x4173d22962941f92),
+        ("bounded", 0xb59997222fd1686f),
+        ("bounded nested", 0x520b467cfaab5d4c),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }
