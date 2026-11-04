@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::coverage::CoverageOf;
 use crate::entry::*;
 use crate::member::Member;
 use crate::relay::take_quiesce_replica;
@@ -97,8 +98,8 @@ pub struct Oracle {
     /// must be reported on every live member.
     pub loss: BTreeMap<(u32, Stamp), Body>,
     /// ALLOWED: every acknowledged document write in the world's write log that is late under the D11 predicate
-    /// (`birth(p) < E.stamp < w.stamp` for a valid register event E in the log), whether or not any live member still
-    /// holds its entry. A record that names such a write is legitimate: the write was lost to the swap and the record
+    /// (`birth(p) < E.stamp < w.stamp`) for a REACHABLE valid register event E, whether or not any live member still
+    /// holds the write's entry. A record that names such a write is legitimate: the write was lost to the swap and the record
     /// is its report, and the record proves the write reached a member that has since vanished.
     pub allowed: BTreeSet<(u32, Stamp)>,
     pub lingering: BTreeSet<String>,
@@ -160,35 +161,12 @@ pub fn oracle(w: &mut World) -> Oracle {
             loss.insert((e.key, e.stamp), e.body.clone());
         }
     }
-    // ALLOWED, from the whole write log and every valid register event in it
-    let mut ev_all: Vec<EntryRef> = w
-        .all
-        .iter()
-        .filter(|e| matches!(e.kind, Kind::Bind | Kind::Lcreate | Kind::Ldrop) && w.valid(e))
-        .cloned()
-        .collect();
-    ev_all.sort_by_key(|e| e.stamp);
-    let mut birth_all: HashMap<String, Stamp> = HashMap::new();
-    birth_all.insert(L.to_string(), neg());
-    for e in &ev_all {
-        if matches!(e.kind, Kind::Bind | Kind::Lcreate) {
-            birth_all.entry(e.phys.clone()).or_insert(e.stamp);
-        }
-    }
+    // ALLOWED: the whole write log (held or not), judged over the REACHABLE valid events only: an event whose entry
+    // or whose origin's earlier entries died with a vanished member before any live member covered it makes nothing late
     let allowed: BTreeSet<(u32, Stamp)> = w
         .all
         .iter()
-        .filter(|e| {
-            e.kind == Kind::Doc
-                && !e.staging
-                && birth_all.get(&e.phys).is_some_and(|b| {
-                    ev_all.iter().any(|x| {
-                        *b < x.stamp
-                            && x.stamp < e.stamp
-                            && (x.kind == Kind::Ldrop || x.phys != e.phys)
-                    })
-                })
-        })
+        .filter(|e| e.kind == Kind::Doc && !e.staging && late(e, &ev))
         .map(|e| (e.key, e.stamp))
         .collect();
     // the converse: late writes (by the same rule) that were lost with a vanished member
@@ -239,7 +217,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     let mut res: Res = BTreeMap::new();
     let live: Vec<usize> = (0..ms.len()).filter(|&i| !ms[i].vanished).collect();
     let first = live[0];
-    // replay in the relay's order: two fresh replicas that receive every entry (no snapshots) in stamp order from the live members' appended sets, after the cluster's quiescence
+    // stamp-order replay: two fresh replicas that receive every entry (no snapshots) in stamp order from the live members' appended sets, after the cluster's quiescence
     let mut base_entries: Vec<EntryRef> =
         w.all.iter().filter(|e| !w.lost.contains(&e.idx)).cloned().collect();
     base_entries.sort_by_key(|e| e.stamp); // the relay's order (the model's shuffle is followed by a stable sort on unique stamps, so it never varied the order)
@@ -532,5 +510,43 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     res.insert("refused_bind_count".into(), st.get("refused_bind"));
     res.insert("refused_ldrop_count".into(), st.get("refused_ldrop"));
     res.insert("refused_lcreate_count".into(), st.get("refused_lcreate"));
+    // the interleaved replay: each origin's order kept, a random interleaving across origins, each entry served by a
+    // random live member that appended it (witnessed if none did)
+    let mut div_interleaved = false;
+    for i in 0..2 {
+        let mut z = Member::new(ms.len() + 2 + i, &format!("Y{i}"), 0);
+        let mut per: Vec<Vec<EntryRef>> = vec![Vec::new(); ms.len()];
+        for e in &base_entries {
+            per[e.origin].push(e.clone());
+        }
+        let mut next = vec![0usize; per.len()];
+        loop {
+            let open: Vec<usize> = (0..per.len()).filter(|&o| next[o] < per[o].len()).collect();
+            if open.is_empty() {
+                break;
+            }
+            let o = open[w.rng.below(open.len())];
+            let e = per[o][next[o]].clone();
+            next[o] += 1;
+            let servers: Vec<usize> =
+                live.iter().copied().filter(|&j| ms[j].appended.contains(&e.idx)).collect();
+            if servers.is_empty() {
+                z.cv.add(e.idx);
+                z.witness(&e);
+            } else {
+                let src = servers[w.rng.below(servers.len())];
+                z.take_from(w, &ms[src], &e, true);
+            }
+        }
+        z.settle(w);
+        let recs = bk(&z);
+        if z.state() != m0state
+            || heads.iter().any(|h| !recs.contains(h))
+            || recs.iter().any(|r| !allowed.contains(r))
+        {
+            div_interleaved = true;
+        }
+    }
+    res.insert("div_replay_interleaved".into(), div_interleaved as i64);
     res
 }
