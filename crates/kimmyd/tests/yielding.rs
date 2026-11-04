@@ -250,7 +250,19 @@ jwt_secret = "{JWT_SECRET}"
 
     /// One series from `/metrics`, by its full name and labels, as a number.
     async fn series(&self, client: &reqwest::Client, name: &str) -> Option<f64> {
-        let body = client.get(self.url("/metrics")).send().await.ok()?.text().await.ok()?;
+        Self::in_scrape(&self.scrape(client).await?, name)
+    }
+
+    /// One scrape of `/metrics`. `kimmy_runtime_stall_seconds` is the worst delay the
+    /// runtime's timer saw *since the last scrape*, so every scrape resets it: a test that
+    /// needs it reads every other series it wants from the same body (`in_scrape`), because
+    /// a second scrape would reset the gauge unread.
+    async fn scrape(&self, client: &reqwest::Client) -> Option<String> {
+        client.get(self.url("/metrics")).send().await.ok()?.text().await.ok()
+    }
+
+    /// A series of a scrape taken by [`Node::scrape`].
+    fn in_scrape(body: &str, name: &str) -> Option<f64> {
         let prefix = format!("{name} ");
         body.lines()
             .find(|l| l.starts_with(&prefix))
@@ -1480,32 +1492,33 @@ async fn p8_when_every_member_stalls_there_is_no_target_and_nothing_yields() {
     })
     .await;
     let seen_stall = std::sync::Arc::new(std::sync::Mutex::new(vec![0.0f64; nodes.len()]));
+    // The stall gauge is the worst delay since the last scrape, and a stall shows in it only
+    // after it has ended. So each round takes ONE scrape per node and reads the stall and the
+    // suppression from that body (nothing else scrapes in between and resets the gauge), the
+    // rounds follow each other, and the wait ends only when the owner says there is no target
+    // AND every node's stall has been seen: the control is waited for, not sampled once.
     eventually("the owner to be stalled with no target to yield to", || {
         let (nodes, client, seen_stall) = (&nodes, &client, std::sync::Arc::clone(&seen_stall));
         async move {
+            let mut found = false;
             for (i, node) in nodes.iter().enumerate() {
-                if let Some(s) = node.series(client, "kimmy_runtime_stall_seconds").await {
+                let Some(body) = node.scrape(client).await else { continue };
+                if let Some(s) = Node::in_scrape(&body, "kimmy_runtime_stall_seconds") {
                     let mut seen = seen_stall.lock().unwrap();
                     seen[i] = seen[i].max(s);
                 }
+                found |= Node::in_scrape(
+                    &body,
+                    "kimmy_yield_suppressed{class=\"webhooks\",reason=\"no_target\"}",
+                ) == Some(1.0);
             }
-            let mut found = false;
-            for node in nodes {
-                found |= node.suppressed(client, "webhooks", "no_target").await;
-            }
-            found
+            found && seen_stall.lock().unwrap().iter().all(|s| *s >= 1.0)
         }
     })
     .await;
     let seen_stall = seen_stall.lock().unwrap().clone();
     for (i, node) in nodes.iter().enumerate() {
-        assert!(
-            seen_stall[i] >= 1.0
-                || node.series(&client, "kimmy_runtime_stall_seconds").await >= Some(1.0),
-            "the stall control on {}: {}",
-            node.name,
-            seen_stall[i]
-        );
+        assert!(seen_stall[i] >= 1.0, "the stall control on {}: {}", node.name, seen_stall[i]);
         assert!(node.ticks(&client).await >= 5, "{} ticked", node.name);
         for class in CLASSES {
             assert_eq!(node.transitions(&client, class, "yield").await, 0, "{} {class}", node.name);
