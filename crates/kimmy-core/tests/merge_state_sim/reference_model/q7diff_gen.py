@@ -117,6 +117,28 @@ def k_opt(g):
     return (0,) if g is None else (1, k_stamp(g))
 
 
+# THE REGISTER `obs` IS DEAD under ABSORBED = True. The model still keeps a register's `obs` map (what its base counted); the Rust
+# cell has none (a slot's absorbed pair replaces it), so nothing may depend on it. Checked, not assumed, on EVERY state this harness
+# encodes or digests that has any register obs entry: every read of the model is the same with the obs maps cleared as with them.
+# (An obs key can name a slot of a life that was collected past the horizon, so `obs` may be non-empty with an empty absorbed
+# store; seed 792 of the nested generator is such a state. Such a key can matter only if the cells of that life come back from a state
+# older than the horizon, which is outside the retention claim.) A mismatch fails the run.
+def _obs_reads(s):
+    paths = sorted({k[1] for k in list(s.regs) + list(s.slots)})
+    slot_paths = sorted({k[1] for k in s.slots})
+    return (repr(s.visible()), repr(s.hidden_all()), repr(s.order_report()),
+            repr([(p, s.value(p)) for p in paths]),
+            repr([(p, sorted(map(repr, s.counted(p)))) for p in slot_paths]))
+
+
+def check_obs_dead(s):
+    if not any(r[2] for r in s.regs.values()):
+        return
+    cleared = s.copy()
+    cleared.regs = {k: (r[0], r[1], {}) + tuple(r[3:]) for k, r in s.regs.items()}
+    assert _obs_reads(s) == _obs_reads(cleared), "a read of the model depends on a register's obs under ABSORBED"
+
+
 class NoV1(Exception):
     """The version 1 form cannot spell a state that has an absorbed pair (`V1CannotHold`)."""
 
@@ -245,8 +267,7 @@ class Enc:
             self.s(k[1])
             self.stamp(r[0])
             self.value(r[1])
-            assert not r[2], "a register with an obs entry and no absorbed pair"
-            self.ln(0)            # the register's obs place, always empty now
+            self.ln(0)            # the register's obs place, always empty now (its obs is dead: `check_obs_dead`)
             self.gen(r[3])
             self.u8(1 if len(r) > 4 and r[4] == "soi" else 0)
         self.ln(len(st.slots))
@@ -438,7 +459,6 @@ class EncCompact:
             if stamp != life:
                 self.stamp(stamp)
             self.value(r[1])
-            assert not r[2] or st.absorbed, "an obs entry and no absorbed store"
             if gen is not None:
                 if gen[0] != stamp:
                     self.stamp(gen[0])
@@ -682,6 +702,7 @@ def unjv(v):
 def snap(ms, log):
     out = []
     for m in ms:
+        check_obs_dead(m.state)
         cb = EncCompact(log).state(m.state)
         try:
             b = Enc(log).state(m.state)
@@ -840,6 +861,7 @@ def golden():
     out = {}
 
     def h(name, st, log):
+        check_obs_dead(st)
         cb = EncCompact(log).state(st)
         if st.absorbed:
             out[name] = None          # no version 1 spelling: the state has absorbed pairs

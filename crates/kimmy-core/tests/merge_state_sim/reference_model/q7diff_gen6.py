@@ -189,7 +189,30 @@ def fobs(d):
                                  for k, val in d.items())) + "]"
 
 
+# THE REGISTER `obs` IS DEAD under ABSORBED = True. The model still keeps a register's `obs` map (what its base counted); the Rust
+# cell has none (a slot's absorbed pair replaces it), so nothing may depend on it. Checked, not assumed, on EVERY state this harness
+# encodes or digests that has any register obs entry: every read of the model is the same with the obs maps cleared as with them.
+# (An obs key can name a slot of a life that was collected past the horizon, so `obs` may be non-empty with an empty absorbed
+# store; seed 792 of the nested generator is such a state. Such a key can matter only if the cells of that life come back from a state
+# older than the horizon, which is outside the retention claim.) A mismatch fails the run.
+def _obs_reads(s):
+    paths = sorted({k[1] for k in list(s.regs) + list(s.slots)})
+    slot_paths = sorted({k[1] for k in s.slots})
+    return (repr(s.visible()), repr(s.hidden_all()), repr(s.order_report()),
+            repr([(p, s.value(p)) for p in paths]),
+            repr([(p, sorted(map(repr, s.counted(p)))) for p in slot_paths]))
+
+
+def check_obs_dead(s):
+    if not any(r[2] for r in s.regs.values()):
+        return
+    cleared = s.copy()
+    cleared.regs = {k: (r[0], r[1], {}) + tuple(r[3:]) for k, r in s.regs.items()}
+    assert _obs_reads(s) == _obs_reads(cleared), "a read of the model depends on a register's obs under ABSORBED"
+
+
 def digest_lines(s):
+    check_obs_dead(s)
     out = []
     for L, v in s.lives.items():
         out.append("life %s seen[%s] %s" % (fs(L), ",".join(sorted(fs(d) for d in v[0])), v[2]))
@@ -198,7 +221,6 @@ def digest_lines(s):
     for d, vv in s.deletes.items():
         out.append("del %s vv[%s]" % (fs(d), ",".join(sorted("%s=%d" % (fw(w), h) for w, h in vv.items()))))
     for (L, p), r in s.regs.items():
-        assert not r[2] or s.absorbed, "a register with an obs entry and no absorbed store"
         gen = r[3]
         if gen is None:
             g = "-"

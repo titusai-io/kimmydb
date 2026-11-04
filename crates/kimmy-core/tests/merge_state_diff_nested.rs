@@ -761,6 +761,40 @@ fn nested_differential_against_the_python_model() {
     assert!(v.fails.is_empty(), "{} scripts disagree with the Python model", v.fails.len());
 }
 
+/// SEED 792, pinned. The nested script of seed 792 (4 members, retention 5) reaches a state the first 300 scripts do not: a register
+/// whose base counted a slot of ANOTHER life, which was then collected past the horizon while the base survives in its own life, so
+/// the model's register `obs` (and the generation's `seen`) name a slot that no longer exists, with an EMPTY absorbed store. The
+/// register `obs` is dead under ABSORBED = True: the generator checks, on every state it digests that has a register obs entry, that
+/// every read of the model is the same with the obs maps cleared as with them (`check_obs_dead`, a hard failure), and the Rust
+/// writers, which have no obs, agree with the model at every step of this script. Generated and replayed here on its own (under a second).
+#[test]
+fn seed_792_a_register_obs_that_names_a_collected_life_is_dead() {
+    let scratch = Scratch::new("seed792");
+    let args = vec![scratch.0.display().to_string(), "1".to_string(), "792".to_string()];
+    let out = python(&args).wait_with_output().expect("python3 ran");
+    assert!(
+        out.status.success(),
+        "q7diff_gen6.py {args:?} failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = scratch.0.join("s000792.json");
+    let sc: J = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("a script");
+    // the draw is the one the shape was found in
+    assert_eq!(
+        (
+            sc["seed"].as_u64(),
+            sc["ret"].as_u64(),
+            sc["members"].as_u64(),
+            sc["ops"].as_array().unwrap().len()
+        ),
+        (Some(792), Some(5), Some(4), 60)
+    );
+    let v = replay(&scratch.0, &|_| {});
+    assert_eq!(v.scripts, 1);
+    assert!(v.fails.is_empty(), "{:?}", v.fails);
+}
+
 /// Generate `scripts` scripts from the model with `plant` applied: the replay must disagree.
 fn planted(plant: &str, scripts: u64) {
     let scratch = Scratch::new(plant);
