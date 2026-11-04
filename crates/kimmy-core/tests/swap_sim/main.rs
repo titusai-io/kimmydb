@@ -30,6 +30,8 @@ mod relay;
 mod rng;
 mod run;
 mod scenario;
+mod scenarios;
+mod snapshot;
 mod world;
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -53,7 +55,7 @@ mod tests {
     /// stamp but before it has heard of it is lost and reported exactly once on every member (a head).
     #[test]
     fn a_flip_reaches_every_member_and_a_late_write_is_reported_once() {
-        let mut sc = Sc::new("v5", &[("W", 0), ("X", 0), ("Y", 0), ("O", 50)], 60);
+        let mut sc = Sc::new("v6", &[("W", 0), ("X", 0), ("Y", 0), ("O", 50)], 60);
         let (w_, x, y, o) = (sc.idx("W"), sc.idx("X"), sc.idx("Y"), sc.idx("O"));
         sc.advance(1);
         sc.ms[w_].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
@@ -98,6 +100,30 @@ mod tests {
         assert_eq!(res["true_late_writes_allowed"], 1);
     }
 
+    /// The model's other base configurations (the heavy one, the delete-heavy mix, the baseline): 0 problems.
+    /// `Q6_HEAVY_RUNS` (default 20), `Q6_RUNS` (default 40 seeds per configuration of the grid).
+    #[test]
+    fn the_other_base_configurations_are_clean() {
+        let heavy = {
+            let mut c = Cfg::new(5, 3, 5);
+            c.steps = Some(600);
+            c
+        };
+        let s = run_grid("v6", "v6", &[heavy], 0, env_u64("Q6_HEAVY_RUNS", 20), threads());
+        assert!(s.problems().is_empty(), "heavy: {:?}", s.problems());
+        let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+        for c in cfgs.iter_mut() {
+            c.delete_bias = true;
+        }
+        let s = run_grid("v6", "v6", &cfgs, 0, env_u64("Q6_RUNS", 40), threads());
+        assert!(s.problems().is_empty(), "delete-heavy: {:?}", s.problems());
+        eprintln!(
+            "delete-heavy: {} runs, late delete heads held only as state in {} runs",
+            s.runs,
+            s.get("nv_late_delete_head_held_only_as_state")
+        );
+    }
+
     /// The vendored Python model is the reviewed one (`reference_model/MODEL-HASHES.txt`). The differential (a later phase)
     /// is made from it; a changed byte fails here first.
     #[test]
@@ -116,8 +142,8 @@ mod tests {
     /// The model's seed-fixed run is deterministic: the same seed gives the same figures (the harness' own PRNG).
     #[test]
     fn a_run_is_a_function_of_its_seed() {
-        let a = run("v5", "v5", 7, Cfg::new(4, 2, 4), false);
-        let b = run("v5", "v5", 7, Cfg::new(4, 2, 4), false);
+        let a = run("v6", "v6", 7, Cfg::new(4, 2, 4), false);
+        let b = run("v6", "v6", 7, Cfg::new(4, 2, 4), false);
         assert_eq!(a.res, b.res);
         assert_eq!(a.w.all.len(), b.w.all.len());
     }
@@ -127,7 +153,7 @@ mod tests {
     fn the_base_grid_is_clean() {
         let seeds = env_u64("Q6_RUNS", 40);
         let cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
-        let s = run_grid("v5", "v5", &cfgs, 0, seeds, threads());
+        let s = run_grid("v6", "v6", &cfgs, 0, seeds, threads());
         eprintln!("base grid: {} runs", s.runs);
         for (k, v) in &s.tot {
             if k.starts_with("nv_")
@@ -142,6 +168,15 @@ mod tests {
         }
         let p = s.problems();
         assert!(p.is_empty(), "problems on the base: {p:?}");
+        // invariant (i): no grant and no page names an entry above its sender's coverage; rule B never fires in order
+        assert_eq!(s.get("cnt_grant_above_coverage"), 0);
+        assert_eq!(s.get("cnt_page_above_coverage"), 0);
+        assert_eq!(
+            s.get("cnt_info_parked"),
+            0,
+            "in order a register event never arrives ahead of its position"
+        );
+        assert_eq!(s.get("cnt_register_read_from_a_member_that_is_not_the_sender"), 0);
         // non-vacuity: the mechanisms the base must exercise at this size
         for k in [
             "nv_flips",
@@ -157,51 +192,21 @@ mod tests {
             "nv_concurrent_outs_loser_buried",
             "cnt_witnessed_without_receiving",
             "cnt_lww_losers_not_kept",
+            // the snapshot routes
+            "nv_snapshot_joins",
+            "nv_snapshot_after_postflip_write",
+            "nv_snapshots_carrying_loss_records",
+            "cnt_snap_completed",
+            "cnt_snap_deletes_carried_with_id",
+            "cnt_snap_versions_as_entries",
+            "cnt_windows_served_by_a_join_in_progress",
+            "cnt_state_held_refusals",
+            "cnt_dead_page_versions_retained",
+            "cnt_register_events_not_carried_above_grant",
+            "cnt_bind_between_first_and_last_page",
         ] {
             assert!(s.get(k) > 0, "vacuous: {k} never happened in {} runs", s.runs);
         }
-    }
-
-    /// The mutants that need no snapshot join die on the random grid (phase D grades all 29 with their expected
-    /// killers; this is the port check available in phase A). Figures are runs with a problem of any kind.
-    #[test]
-    fn the_mutants_that_need_no_snapshot_die() {
-        let seeds = env_u64("Q6_MUTANT_RUNS", 40);
-        let cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
-        let mutants = [
-            "m-keep",
-            "m-stage-buried-early",
-            "m-bound-out-tombstone-early",
-            "m-ldrop-identity-only",
-            "m-no-recreate-floor",
-            "m-recreate-reuse",
-            "m-orphan-age",
-            "m-orphan-no-deadline",
-            "m-no-loss-records",
-            "m-loss-key-collapse",
-            "m-report-before-burial",
-            "m-record-per-minter",
-            "m-ignored-event-not-served",
-        ];
-        // NOT here, because the Python model does not kill them without a snapshot join either (checked on a copy of
-        // `swapmodel5.py` with the snapshot actions at weight 0, 1,440 runs each, 0 problems): `m-digest` (a joiner
-        // that cannot recompute the staged digest), `m-pending-accepts` (D10 refusals need a member that knows an
-        // event it does not cover), `m-no-pending-dedup`, `m-bury-without-alive`. Phase B (random) and phase C
-        // (scripted) kill them.
-        let mut survivors = Vec::new();
-        for m in mutants {
-            let s = run_grid(m, "v5", &cfgs, 0, seeds, threads());
-            let p = s.problems();
-            eprintln!(
-                "{m:32} {} problem kinds: {:?}",
-                p.len(),
-                p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
-            );
-            if p.is_empty() {
-                survivors.push(m);
-            }
-        }
-        assert!(survivors.is_empty(), "mutants that survived: {survivors:?}");
     }
 
     /// Debug aid: Q6_SEED=<seed> prints the trace of every configuration of the grid that has a problem at that seed.
@@ -210,7 +215,7 @@ mod tests {
     fn show_failing_seed() {
         let seed = env_u64("Q6_SEED", 0);
         for c in grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]) {
-            let r = run("v5", "v5", seed, c, true);
+            let r = run("v6", "v6", seed, c, true);
             let bad: Vec<_> = r
                 .res
                 .iter()
@@ -350,7 +355,7 @@ mod tests {
     #[test]
     fn an_unreachable_event_does_not_make_a_write_allowed() {
         for event_survives in [false, true] {
-            let mut sc = Sc::new("v5", &[("A", 0), ("X", 0), ("Y", 50)], 60);
+            let mut sc = Sc::new("v6", &[("A", 0), ("X", 0), ("Y", 50)], 60);
             let (a, x, y) = (sc.idx("A"), sc.idx("X"), sc.idx("Y"));
             sc.advance(1);
             sc.ms[a].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
@@ -402,7 +407,7 @@ mod tests {
         if with_n {
             members.push(("N", 0));
         }
-        let mut sc = Sc::new("v5", &members, 60);
+        let mut sc = Sc::new("v6", &members, 60);
         let (a, b, c) = (sc.idx("A"), sc.idx("B"), sc.idx("C"));
         let live = members.len();
         sc.advance(1);
@@ -427,5 +432,66 @@ mod tests {
             sc.quiesce();
         }
         (sc, late)
+    }
+
+    /// Every mutant on the v6 base with snapshot joins, on the random grid. A fixed seed range makes the survivors a
+    /// deterministic set, asserted below; phase D grades each mutant against its expected killer. The survivors at this
+    /// size are the mutants the random runs cannot kill and a scripted scenario does (or that are equivalent):
+    /// `m-visible-newest` (equivalent in order; the route probes kill it), `m-rule-b-off` (rule B never fires in order;
+    /// `rule_b_a_held_bind_is_information_until_covered` kills it), `m-dead-page-dropped` (0 in 28,800 in-order runs in
+    /// the model; `seed_885_shape...` kills it), `m-loss-outside-prefix` (the model: fails nothing).
+    #[test]
+    fn the_mutants_on_the_snapshot_grid() {
+        let seeds = env_u64("Q6_MUTANT_RUNS", 40);
+        let cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+        let mut survivors = Vec::new();
+        for m in crate::flags::MUTANTS {
+            let s = run_grid(m, "v6", &cfgs, 0, seeds, threads());
+            let p = s.problems();
+            eprintln!(
+                "{m:32} {} kinds: {:?}",
+                p.len(),
+                p.iter().map(|(k, v)| format!("{k}={}", v.0)).collect::<Vec<_>>()
+            );
+            if p.is_empty() {
+                survivors.push(m);
+            }
+        }
+        eprintln!("survivors at {} runs: {survivors:?}", seeds * cfgs.len() as u64);
+        let expected = std::env::var("Q6_MUTANT_RUNS").is_err().then_some(());
+        if expected.is_some() {
+            // the rare ones the model kills in about 5 of 28,800 runs may survive 1,440 runs; scripted scenarios kill them
+            let allowed_survivors = [
+                "m-visible-newest",
+                "m-rule-b-off",
+                "m-dead-page-dropped",
+                "m-loss-outside-prefix",
+                "m-pending-narrow",
+                "m-no-defer-received",
+                "m-no-append-in-position",
+                "m-snap-register-late",
+                "m-snap-drop-loss",
+                "m-snap-no-loss-records",
+                "m-snap-delete-bare",
+                "m-snap-no-orphan-burials",
+            ];
+            let unexpected: Vec<&&str> =
+                survivors.iter().filter(|m| !allowed_survivors.contains(m)).collect();
+            assert!(
+                unexpected.is_empty(),
+                "mutants that survived but are not in the allowed list: {unexpected:?}"
+            );
+            for must in [
+                "m-digest",
+                "m-pending-accepts",
+                "m-no-pending-dedup",
+                "m-bury-without-alive",
+                "m-grant-before-pages",
+                "m-snap-no-events",
+                "m-stale-src",
+            ] {
+                assert!(!survivors.contains(&must), "{must} must die on the snapshot grid");
+            }
+        }
     }
 }

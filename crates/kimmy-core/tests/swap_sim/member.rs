@@ -7,13 +7,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::coverage::{CoverageOf, PrefixCoverage};
 use crate::entry::*;
 use crate::omap::{OMap, OSet};
+use crate::snapshot::Join;
 use crate::world::World;
-
-/// A snapshot join in progress. Phase B (snapshots) fills this in; phase A never creates one.
-#[derive(Clone, Debug)]
-pub struct Join {
-    pub src: usize,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DocOp {
@@ -63,6 +58,12 @@ pub struct Member {
     pub deferred: Vec<EntryRef>,
     pub learned: HashMap<String, i64>,
     pub join: Option<Join>,
+    /// `stale_src_bug`: the source of the last `snapshot_begin` call, whether or not it was refused
+    pub snap_src_stale: Option<usize>,
+    /// placeholders of a superseded join, carried into the fresh pull (see `supersede_join`)
+    pub carry_created: BTreeSet<String>,
+    /// rule B: a register event known but not yet covered (information: it takes no effect)
+    pub info: OMap<EntryId, EntryRef>,
     pub vanished: bool,
     pub refused: u32,
     pub inv: BTreeSet<&'static str>,
@@ -104,6 +105,9 @@ impl Member {
             deferred: Vec::new(),
             learned: HashMap::new(),
             join: None,
+            snap_src_stale: None,
+            carry_created: BTreeSet::new(),
+            info: OMap::new(),
             vanished: false,
             refused: 0,
             inv: BTreeSet::new(),
@@ -127,10 +131,10 @@ impl Member {
     pub fn holds(&self, id: EntryId) -> bool {
         self.cv.has(id)
     }
-    pub fn covers(&mut self, w: &World, origin: usize, hlc: i64) -> bool {
+    pub fn covers(&self, w: &World, origin: usize, hlc: i64) -> bool {
         self.cv.covers(w, origin, hlc)
     }
-    pub fn covers_past(&mut self, w: &World, origin: usize, hlc: i64) -> bool {
+    pub fn covers_past(&self, w: &World, origin: usize, hlc: i64) -> bool {
         self.cv.covers_past(w, origin, hlc)
     }
 
@@ -177,6 +181,9 @@ impl Member {
         };
         let pend = self.pending(w);
         let sup = self.first_superseding(w, &s).is_some();
+        if self.info_superseding(w, &s).is_some() {
+            w.stats.bump("accepted_while_info_superseded"); // a sanity counter: D10 refuses before this point
+        }
         let h = self.next_hlc(w);
         let e = w.record(Entry::new(self.id, h, Kind::Doc).phys(&s).doc(key, body, opk), true);
         if pend {

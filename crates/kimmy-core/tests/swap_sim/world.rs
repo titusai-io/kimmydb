@@ -29,6 +29,8 @@ pub struct World {
     /// the deadline gap of a stage (the model's `D`)
     pub d: i64,
     pub trace: bool,
+    /// the run has no route step (register events travel only in position): the open-refusal-at-end check applies
+    pub in_order: bool,
     pub log: Vec<String>,
     pub all: Vec<EntryRef>,
     pub by_origin: Vec<Vec<EntryId>>,
@@ -56,6 +58,7 @@ impl World {
             rng,
             d,
             trace,
+            in_order: true,
             log: Vec::new(),
             all: Vec::new(),
             by_origin: vec![Vec::new(); n],

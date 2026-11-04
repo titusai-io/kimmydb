@@ -61,8 +61,8 @@ impl Member {
             }
             Kind::Lcreate => {
                 is_event = self.add_event(w, e);
-                if !self.phys.contains_key(&e.phys) {
-                    self.phys.insert(e.phys.clone(), Phys::new(PKind::Rc));
+                if !self.phys.contains_key(&e.phys) && (is_event || !w.f.rule_b) {
+                    self.phys.insert(e.phys.clone(), Phys::new(PKind::Rc)); // (rule B: made when the event takes effect)
                 }
             }
             Kind::Bind => {
