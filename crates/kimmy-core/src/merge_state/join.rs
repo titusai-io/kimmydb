@@ -534,6 +534,11 @@ pub(super) fn join_into(
                 for b in &rt {
                     if a.stamp != b.stamp {
                         let lo = if a.stamp < b.stamp { a } else { b };
+                        // an implicit marker carries no user value: never a reported loser
+                        // (model6.py line 659)
+                        if lo.value == Value::ImplicitMap {
+                            continue;
+                        }
                         let arrays =
                             matches!((&a.value, &b.value), (Value::Array(_), Value::Array(_)));
                         let kind = if arrays && !o.array_clash_as_clash() {

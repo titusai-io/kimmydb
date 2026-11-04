@@ -177,10 +177,38 @@ fn unset_subtree(
     items.push((OrdAt::Field(p.clone()), OrdMode::Unset));
 }
 
-/// The model's `ancestors_of`: a write below a map is a write to the map, so each proper
-/// ancestor of the path is named as a plain write (once per update: `seen`). (The marker the
-/// model writes at an ancestor the writer does not see is the implicit marker, item O4: not
-/// written here.)
+/// The model's `ancestors_of`, for the writes that place the implicit marker (a `$set` of a
+/// path, an `$inc`, an update): a write below a map is a write to the map, so each proper ancestor
+/// of the path (outermost first, once per update: `seen`) is named as a plain write, and an
+/// ancestor the writer does not see gets an IMPLICIT map marker in the same write
+/// (`model6.py` `_update`, lines 966-973: `if getp(vis, a) is None: eff[a] = MAPI`). The
+/// creation of an upsert, an insert and a replace place none (their sub-documents carry the
+/// explicit marker; the upserts only name their ancestors, `ancestor_items`), and an unset names
+/// none.
+fn ancestors_of(
+    vis: &BTreeMap<Path, Value>,
+    p: &Path,
+    seen: &mut BTreeSet<Path>,
+    eff: &mut Eff,
+    items: &mut Items,
+    o: &JoinOptions,
+) {
+    for a in p.ancestors() {
+        if seen.contains(&a) {
+            continue;
+        }
+        seen.insert(a.clone());
+        if !o.ord_no_ancestor() {
+            items.push((OrdAt::Field(a.clone()), OrdMode::Write));
+        }
+        if !vis.contains_key(&a) {
+            eff.put(a, Value::ImplicitMap);
+        }
+    }
+}
+
+/// The model's `ancestors_of` for the writes that place no marker: the upserts name each
+/// ancestor of the path as a plain write (once: `seen`) and nothing more.
 fn ancestor_items(p: &Path, seen: &mut BTreeSet<Path>, items: &mut Items, o: &JoinOptions) {
     for a in p.ancestors() {
         if seen.insert(a.clone()) && !o.ord_no_ancestor() {
@@ -1056,9 +1084,11 @@ impl Writer {
             return None;
         }
         let (mut eff, mut items) = (Eff::default(), Items::new());
-        ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
+        ancestors_of(&vis, path, &mut BTreeSet::new(), &mut eff, &mut items, &self.opts);
+        // (the markers are not a change by themselves: the model counts from here, `n0`)
+        let n0 = eff.len();
         self.diff(&vis, path, &v, &mut eff, &mut items, OrdMode::Write).ok()?;
-        if eff.len() == 0 && !self.reordered(path, &v) {
+        if eff.len() == n0 && !self.reordered(path, &v) {
             return None;
         }
         self.commit(eff, &items, m)
@@ -1142,27 +1172,34 @@ impl Writer {
             return None;
         }
         let plan = self.inc_plan(&vis, p, by)?;
-        let mut items = Items::new();
-        ancestor_items(p, &mut BTreeSet::new(), &mut items, &self.opts);
+        let (mut eff, mut items) = (Eff::default(), Items::new());
+        ancestors_of(&vis, p, &mut BTreeSet::new(), &mut eff, &mut items, &self.opts);
         items.push((OrdAt::Field(p.clone()), OrdMode::Write));
         match plan {
             IncPlan::Nothing => None,
             IncPlan::Register(v) => {
-                let mut eff = Eff::default();
                 eff.put(p.clone(), v);
                 self.commit(eff, &items, m)
             }
             IncPlan::Slot(plan) => {
+                // ONE write: the implicit markers of the maps the increment creates and the
+                // slot are under one stamp (the model's `_update`: registers, then slots)
                 let SlotPlan { life, key, total, op, generation } = *plan;
                 let known = self.known();
                 let st = self.mint(m)?;
                 self.state.vv.insert(st.writer, st.hlc);
+                let al = self.state.alive_set(self.opts.retention);
+                for q in &eff.order {
+                    self.setreg(q, eff.vals[q].clone(), st, &al);
+                }
                 self.put_slot(key, st, total);
                 self.feed(life, st, known, &items);
                 let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![p.clone()]);
                 rec.n = op.int().and_then(|v| i64::try_from(v).ok());
                 rec.amount = Some(op);
                 rec.generation = generation;
+                // (the markers this increment made, if any: the registers beside its slot)
+                rec.vals = eff.vals;
                 Some(self.finish(st, rec))
             }
         }
@@ -1326,14 +1363,14 @@ impl Writer {
                 }
                 UpdateOp::Set(p, v) => {
                     v.check_input().ok()?;
-                    ancestor_items(p, &mut seen, &mut items, &self.opts);
+                    ancestors_of(&vis, p, &mut seen, &mut eff, &mut items, &self.opts);
                     let n0 = eff.len();
                     self.diff(&vis, p, v, &mut eff, &mut items, OrdMode::Write).ok()?;
                     changed = changed || eff.len() > n0 || self.reordered(p, v);
                 }
                 UpdateOp::Inc(p, by) => {
                     let plan = self.inc_plan(&vis, p, by)?;
-                    ancestor_items(p, &mut seen, &mut items, &self.opts);
+                    ancestors_of(&vis, p, &mut seen, &mut eff, &mut items, &self.opts);
                     items.push((OrdAt::Field(p.clone()), OrdMode::Write));
                     match plan {
                         IncPlan::Nothing => {}

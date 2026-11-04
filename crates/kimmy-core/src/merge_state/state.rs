@@ -1070,12 +1070,12 @@ impl<'a> Tree<'a> {
         let top = |v: &BTreeMap<&Path, Node>| v.values().map(|n| n.newest).max();
         if ks.is_empty() {
             let v = own?;
-            let shape = if v == Value::Map { Shape::Map(BTreeMap::new()) } else { Shape::Leaf(v) };
+            let shape = if v.is_marker() { Shape::Map(BTreeMap::new()) } else { Shape::Leaf(v) };
             return Some(Node { newest: own_n?, shape });
         }
         match own {
             // a scalar, number or array at q: only the children newer than its register show
-            Some(v) if v != Value::Map => {
+            Some(v) if !v.is_marker() => {
                 let reg = cells.and_then(|c| c.win);
                 let rs = match reg {
                     Some(r) if r.value.is_plain() => r.stamp,
