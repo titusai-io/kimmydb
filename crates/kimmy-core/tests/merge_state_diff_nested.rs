@@ -857,13 +857,18 @@ fn a_planted_rewrite_of_unchanged_leaves_is_detected() {
     planted("rewrite-unchanged", 60);
 }
 
+#[test]
+fn a_planted_model_without_implicit_markers_is_detected() {
+    planted("no-implicit-marker", 60);
+}
+
 /// The Rust mutation switches the nested replay must notice, by name. A switch that this replay
 /// cannot see is listed in `mutants.rs` with the grader that does.
 #[cfg(feature = "merge-mutants")]
 #[test]
 fn rust_mutants_are_caught_by_the_replay() {
     type Switch = fn(&mut JoinOptions);
-    let cases: [(&str, Switch); 7] = [
+    let cases: [(&str, Switch); 8] = [
         ("a scalar hides every child, even a newer one", |o| o.set_type_ignores_recency(true)),
         ("a map marker hides its children", |o| o.set_marker_hides(true)),
         ("no typeClash is reported", |o| o.set_no_type_clash(true)),
@@ -871,6 +876,9 @@ fn rust_mutants_are_caught_by_the_replay() {
         ("a sub-document write rewrites every leaf", |o| o.set_rewrite_unchanged(true)),
         ("an unset of a map unsets its direct children only", |o| o.set_unset_shallow(true)),
         ("a base write folds only the slots it counts", |o| o.set_fold_counted_only(true)),
+        ("a leaf write under an absent map writes no implicit marker", |o| {
+            o.set_no_implicit_marker(true)
+        }),
     ];
     let scratch = Scratch::new("mut");
     let n = runs().min(300);

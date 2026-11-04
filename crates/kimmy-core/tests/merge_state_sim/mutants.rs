@@ -7,7 +7,7 @@
 //! `JoinOptions::set_value_ignores_slot_stamp`, `JoinOptions::set_creation_without_generation`,
 //! `JoinOptions::set_suppress_soi`); the nested mutants use the switches of the nested rules
 //! (`set_type_ignores_recency`, `set_marker_hides`, `set_no_type_clash`,
-//! `set_array_clash_as_clash`, `set_rewrite_unchanged`, `set_write_below_scalar`, `set_unset_shallow`).
+//! `set_array_clash_as_clash`, `set_rewrite_unchanged`, `set_write_below_scalar`, `set_unset_shallow`, `set_no_implicit_marker`).
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -240,6 +240,12 @@ pub fn mutants() -> Vec<Mutant> {
         Mutant {
             name: "an unset of a map unsets its direct children only",
             apply: |c| c.opts.set_unset_shallow(true),
+            grader: Random { restore: true },
+            probe: None,
+        },
+        Mutant {
+            name: "a leaf write under an absent map writes no implicit marker",
+            apply: |c| c.opts.set_no_implicit_marker(true),
             grader: Random { restore: true },
             probe: None,
         },

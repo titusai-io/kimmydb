@@ -201,7 +201,7 @@ fn ancestors_of(
         if !o.ord_no_ancestor() {
             items.push((OrdAt::Field(a.clone()), OrdMode::Write));
         }
-        if !vis.contains_key(&a) {
+        if !vis.contains_key(&a) && !o.no_implicit_marker() {
             eff.put(a, Value::ImplicitMap);
         }
     }

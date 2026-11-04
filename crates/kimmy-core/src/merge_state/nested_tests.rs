@@ -700,7 +700,7 @@ fn np_or_two(name: &str) -> Path {
 #[test]
 fn mutants_are_caught() {
     type Switch = fn(&mut JoinOptions);
-    let cases: [(&str, Switch, Scenario); 8] = [
+    let cases: [(&str, Switch, Scenario); 9] = [
         (
             "a scalar hides every child, even a newer one",
             |o| o.set_type_ignores_recency(true),
@@ -727,6 +727,11 @@ fn mutants_are_caught() {
             "a write below a scalar is accepted",
             |o| o.set_write_below_scalar(true),
             refuses_below_a_scalar,
+        ),
+        (
+            "a leaf write under an absent map writes no implicit marker",
+            |o| o.set_no_implicit_marker(true),
+            q3_scalar_over_map_type_rule,
         ),
         (
             "a replace rewrites the leaves it kept",

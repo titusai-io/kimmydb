@@ -567,6 +567,7 @@ PLANTS = {
     "scalar-hides-newer": ("TYPE_IGNORES_RECENCY", True),
     "marker-hides": ("MARKER_HIDES", True),
     "rewrite-unchanged": ("REWRITE_UNCHANGED", True),
+    "no-implicit-marker": ("NO_IMPLICIT_MARKER", True),
 }
 
 
