@@ -269,7 +269,7 @@ mod order_oracle_cases {
     /// model's `okey`), wherever the other fields with places are.
     #[test]
     fn a_re_created_field_with_a_place_comes_before_the_maps_without_one() {
-        let places = Places::of_paths(&[&["n"]]);
+        let places = Places::of_paths(&[&["a"], &["n"]]);
         let before: Doc = vec![leaf("a"), empty_map("k")];
         let ok: Doc = vec![leaf("a"), leaf("n"), empty_map("k")];
         let after_the_map: Doc = vec![leaf("a"), empty_map("k"), leaf("n")];
@@ -278,6 +278,27 @@ mod order_oracle_cases {
         };
         assert!(check_n(&ok).is_ok());
         assert!(check_n(&after_the_map).is_err(), "n is after a map that has no place");
+    }
+
+    /// A sibling of a re-created field that the log gives no place, that no unset touched and that is not an unplaced
+    /// leafless map cannot occur in the model (every other visible field has a born): the oracle fails on it, naming
+    /// the path and the level, instead of skipping it (a sibling whose own floor is an unset is skipped: the survivor clamp).
+    #[test]
+    fn a_sibling_the_log_gives_no_place_is_an_oracle_failure() {
+        let before: Doc = vec![leaf("a"), leaf("b")];
+        let after: Doc = vec![leaf("a"), leaf("n"), leaf("b")];
+        let set_n = |places: &Places| {
+            check(Some(&before), Some(&after), &OrdOp::Set(np("n"), Value::Int64(1)), places, true)
+        };
+        // n and a have places, b has none
+        let Err(e) = set_n(&Places::of_paths(&[&["a"], &["n"]])) else { panic!("accepted") };
+        assert!(e.contains("a sibling the log gives no place: b at the level of the root"), "{e}");
+        // with a place for b too, the order is graded: n (place 1) is after a (0) and before b (2)
+        assert!(set_n(&Places::of_paths(&[&["a"], &["n"], &["b"]])).is_ok());
+        // a sibling whose own floor is an unset stays skipped (the survivor clamp may place it)
+        let mut touched = Places::of_paths(&[&["a"], &["n"]]);
+        touched.touched.insert(vec!["b".to_string()]);
+        assert!(set_n(&touched).is_ok());
     }
 
     /// O2-4: a replace that puts the same fields in another order is a write; the same order is not.
