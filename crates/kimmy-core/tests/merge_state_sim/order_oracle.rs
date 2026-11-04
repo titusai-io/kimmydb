@@ -14,10 +14,17 @@
 //!   write does not name (the path, the maps above it, and everything under a document it sets), keep their
 //!   relative order;
 //! * a field the write creates, that no earlier write of the order state gave a place (no HISTORY: a
-//!   standing candidate in some life), in a document with one alive life and no floor anywhere in its order
-//!   state (no unset and no replace has been made), is the LAST of its level. Floors bring in what the
-//!   serial reference cannot say: content that survived an unset is placed by the survivor clamp, and a
-//!   document-valued write puts the fields it never saw after its own, wherever the later writes go.
+//!   standing candidate in some life), in a document with one alive life, goes AFTER every field of its level
+//!   that has a born and BEFORE every field that has none. The fields without a born are the MAPS WITHOUT A LEAF
+//!   ANYWHERE BELOW THEM and without history of their own: such a map is visible through empty maps alone (the
+//!   unset that took its own cell left a floor and no candidate, and a child marker written by someone the
+//!   unsetter had not heard from survived), and nothing places it. They trail, in order of their paths. Every
+//!   other field has a born: a leaf has one (a candidate, or the survivor clamp), and a map with a leaf below
+//!   it that survived is placed by that survivor (after the fields of the write that unset it). This is
+//!   `model6.py`, `State.visible`, `okey()` lines 535-536 (`(0, born, path)` if there is a born, else
+//!   `(1, (), path)`) and `INTERFACE.md` line 134 ("sorted by `(born, path)`, a child without a born last"),
+//!   with the born of a map decided from the documents alone, as the survivor placement decides it in the
+//!   cases the seeds reach (1080, 1357, 2626, 2654 of the bounded runs, pinned below).
 //!
 //! The third part is left out for a field with history: the place an earlier write gave it stands (the
 //! model's rule: the earliest write since the last void), as with a map that was emptied and vanished
@@ -61,6 +68,11 @@ pub enum OrdOp {
 }
 
 impl Tree {
+    /// Is there a leaf anywhere below (or is this a leaf-less tree of empty maps)?
+    fn has_leaf(&self) -> bool {
+        self.iter().any(|(_, kids)| kids.as_ref().is_none_or(Tree::has_leaf))
+    }
+
     /// The children at a path (`[]` is the top level).
     fn level(&self, at: &[String]) -> Option<&Tree> {
         let Some((head, rest)) = at.split_first() else { return Some(self) };
@@ -204,8 +216,18 @@ pub fn op_of(intent: &Intent) -> OrdOp {
     }
 }
 
-/// The writer's document after its write against the rules above. `Ok(true)` when a part was compared and
-/// holds, `Ok(false)` when none applies, `Err` with the first disagreement. `history` is the set of paths
+/// What a check decided.
+#[derive(Clone, Copy, Default)]
+pub struct Checked {
+    /// Some part was compared and holds.
+    pub any: bool,
+    /// The part "a field the write creates goes after the fields with a place" was decided.
+    pub last: bool,
+    /// ... on a level that held a map without a place, which trails.
+    pub trailing: bool,
+}
+
+/// The writer's document after its write against the rules above. `Err` with the first disagreement. `history` is the set of paths
 /// with a standing candidate in the order state before the write; `one_life` says the document had one
 /// alive life before and after.
 pub fn check(
@@ -214,30 +236,33 @@ pub fn check(
     op: &OrdOp,
     history: &BTreeSet<Vec<String>>,
     one_life: bool,
-) -> Result<bool, String> {
+) -> Result<Checked, String> {
     let before = before.map(tree_of_ordered);
     let got = after.map(tree_of_ordered);
     let fail = |what: &str| Err(format!("{what}: {op:?}: before {before:?}, after {got:?}"));
     match op {
         OrdOp::Make(_) | OrdOp::Upsert(_) => {
-            let Some(want) = apply(None, op) else { return Ok(false) };
+            let Some(want) = apply(None, op) else { return Ok(Checked::default()) };
             // which fields a document shows is the value rules' business: compare the order where the fields agree
             if got.as_ref().is_none_or(|g| g.paths() != want.paths()) {
-                return Ok(false);
+                return Ok(Checked::default());
             }
             if got.as_ref() == Some(&want) {
-                Ok(true)
+                Ok(Checked { any: true, ..Checked::default() })
             } else {
                 fail("not the order the write names")
             }
         }
         OrdOp::Set(p, _) | OrdOp::Inc(p) | OrdOp::Unset(p) => {
-            let (Some(b), Some(g)) = (before.as_ref(), got.as_ref()) else { return Ok(false) };
+            let (Some(b), Some(g)) = (before.as_ref(), got.as_ref()) else {
+                return Ok(Checked::default());
+            };
             let named: BTreeSet<Vec<String>> =
                 p.ancestors().chain([p.clone()]).map(|q| q.segments().to_vec()).collect();
             if !stable(b, g, &mut Vec::new(), &named, p.segments()) {
                 return fail("a write moved a field it does not name");
             }
+            let (mut last, mut trailing) = (false, false);
             if one_life && !matches!(op, OrdOp::Unset(_)) {
                 let had: BTreeSet<Vec<String>> = b.paths().into_iter().map(|q| q.0).collect();
                 let at = p.segments().to_vec();
@@ -246,13 +271,47 @@ pub fn check(
                     && g.paths().iter().any(|q| q.0 == at)
                 {
                     let parent = &at[..at.len() - 1];
-                    let level = g.level(parent);
-                    if level.and_then(|l| l.last().map(|(n, _)| n.clone())) != at.last().cloned() {
-                        return fail("a new field is not the last of its level");
+                    let key = |n: &String| {
+                        let mut q = parent.to_vec();
+                        q.push(n.clone());
+                        q
+                    };
+                    // the maps of the level, before the write, that no earlier write gave a place
+                    let unplaced: Vec<String> = b
+                        .level(parent)
+                        .map(|l| {
+                            l.iter()
+                                .filter(|(n, kids)| {
+                                    kids.as_ref().is_some_and(|k| !k.has_leaf())
+                                        && !history.contains(&key(n))
+                                })
+                                .map(|(n, _)| n.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    last = true;
+                    trailing = !unplaced.is_empty();
+                    let names: Vec<String> = g
+                        .level(parent)
+                        .map(|l| l.iter().map(|(n, _)| n.clone()).collect())
+                        .unwrap_or_default();
+                    let i = names
+                        .iter()
+                        .position(|n| Some(n) == at.last())
+                        .expect("the field is there");
+                    let mut want_after: Vec<String> =
+                        unplaced.iter().filter(|n| names.contains(n)).cloned().collect();
+                    want_after.sort();
+                    if names[i + 1..] != want_after[..]
+                        || names[..i].iter().any(|n| unplaced.contains(n))
+                    {
+                        return fail(
+                            "a new field is not after the fields with a place and before those without",
+                        );
                     }
                 }
             }
-            Ok(true)
+            Ok(Checked { any: true, last, trailing })
         }
     }
 }

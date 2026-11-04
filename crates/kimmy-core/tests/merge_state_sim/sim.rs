@@ -173,6 +173,10 @@ pub struct Node {
     pub order_problems: Vec<String>,
     /// How many writes that check compared (the reference had an outcome for them).
     pub order_checks: usize,
+    /// How many of those also had the part "a field the write creates is the last of its level" decided.
+    pub order_last_checks: usize,
+    /// ... and on a level that held a map without a place.
+    pub order_trailing_checks: usize,
     epoch_ctr: u64,
     epoch_rng: Rng,
     saved: Option<Saved>,
@@ -208,6 +212,8 @@ impl Node {
             problems: Vec::new(),
             order_problems: Vec::new(),
             order_checks: 0,
+            order_last_checks: 0,
+            order_trailing_checks: 0,
             epoch_ctr: 0,
             epoch_rng: Rng::new(20_261_031 ^ u64::from(name as u32)),
             saved: None,
@@ -483,8 +489,7 @@ impl Node {
             .then(|| oracle::oracle_at(log, &self.contained, self.ret(), self.bound()));
         let before = self.w.state.ordered_document(&self.w.opts);
         let history = self.history();
-        let one_life =
-            self.w.alive().len() == 1 && self.w.state.ords.values().all(|e| e.floor.is_none());
+        let one_life = self.w.alive().len() == 1;
         let r = write(&mut self.w);
         self.read_your_writes(before, history, one_life, order_oracle::op_of(&intent), r.is_some());
         if let Some(old) = old
@@ -526,7 +531,11 @@ impl Node {
         let after = self.w.state.ordered_document(&self.w.opts);
         let one_life = one_life && self.w.alive().len() == 1;
         match order_oracle::check(before.as_deref(), after.as_deref(), &op, &history, one_life) {
-            Ok(compared) => self.order_checks += usize::from(compared),
+            Ok(c) => {
+                self.order_checks += usize::from(c.any);
+                self.order_last_checks += usize::from(c.last);
+                self.order_trailing_checks += usize::from(c.trailing);
+            }
             Err(e) => self.order_problems.push(format!("order-ryw {}: {e}", self.name)),
         }
     }
@@ -538,8 +547,7 @@ impl Node {
     pub fn upsert_inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
         let before = self.w.state.ordered_document(&self.w.opts);
         let history = self.history();
-        let one_life =
-            self.w.alive().len() == 1 && self.w.state.ords.values().all(|e| e.floor.is_none());
+        let one_life = self.w.alive().len() == 1;
         let r = self.w.upsert_inc(&p(path), n, skew);
         self.read_your_writes(
             before,
@@ -570,8 +578,7 @@ impl Node {
             .collect();
         let before = self.w.state.ordered_document(&self.w.opts);
         let history = self.history();
-        let one_life =
-            self.w.alive().len() == 1 && self.w.state.ords.values().all(|e| e.floor.is_none());
+        let one_life = self.w.alive().len() == 1;
         let inc_path = p(inc_path);
         let created = self.w.upsert_soi_create(&fl(fields), &inc_path, &fl(sets), skew);
         let s1 = self.logged(created, log)?;

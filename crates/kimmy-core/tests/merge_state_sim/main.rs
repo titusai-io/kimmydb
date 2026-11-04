@@ -512,9 +512,20 @@ fn the_bounded_runs_of_3000_seeds_pass_on_both_workloads() {
     let n = env_u64("Q7_BOUNDED_SEEDS", 3000);
     let cfg = Cfg::default_ret();
     let mut failing = Vec::new();
+    let (mut writes, mut compared, mut last, mut trailing) = (0usize, 0usize, 0usize, 0usize);
+    let (mut seeds_last, mut seeds_trailing) = (0usize, 0usize);
     for nested in [false, true] {
         for seed in 0..n {
             let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+            writes += o.log.len();
+            let (l0, t0) = (last, trailing);
+            for m in &o.nodes {
+                compared += m.order_checks;
+                last += m.order_last_checks;
+                trailing += m.order_trailing_checks;
+            }
+            seeds_last += usize::from(last > l0);
+            seeds_trailing += usize::from(trailing > t0);
             let ps = grade_bounded(&o.nodes, &o.log);
             if !ps.is_empty() {
                 failing.push(format!(
@@ -524,7 +535,12 @@ fn the_bounded_runs_of_3000_seeds_pass_on_both_workloads() {
             }
         }
     }
-    println!("bounded sweep, {n} seeds on each workload: {} failing {failing:?}", failing.len());
+    println!(
+        "bounded sweep, {n} seeds on each workload: {} failing {failing:?}; read-your-writes: {writes} writes, {compared} compared, \
+         {last} decided the rule \"a new field goes after the fields with a place\", {trailing} of them on a level with a map without a place; seeds exercising the rule {seeds_last}, seeds with such a map {seeds_trailing}",
+        failing.len()
+    );
+    assert!(last > 1000 && seeds_trailing >= 4, "the rule is exercised: {last} {trailing}");
     assert!(failing.is_empty(), "{failing:?}");
 }
 
@@ -546,3 +562,30 @@ bounded_seed!(bounded_flat_seed_1435, false, 1435);
 bounded_seed!(bounded_flat_seed_1551, false, 1551);
 bounded_seed!(bounded_flat_seed_2006, false, 2006);
 bounded_seed!(bounded_nested_seed_2396, true, 2396);
+
+/// Four nested seeds of the bounded runs that the first version of the read-your-writes oracle got wrong (found by the
+/// 3,000-seed sweep). The oracle said a field a write creates is the last of its level; in these a map `a` is visible through
+/// a surviving child alone (a replace by C unset it, and its child `a.d`, written by someone C had not heard from, survived), has
+/// no place, and trails every field that has one, so a field created afterwards goes BEFORE it. The model agrees (the traces
+/// of the four runs, replayed through model6.py, give the same order after every event: `born_of(a)` is `None`, and
+/// `okey` puts a child without a born last), and the oracle now says so. Each seed also decides the rule on a level with such a map.
+macro_rules! trailing_seed {
+    ($name:ident, $seed:expr) => {
+        #[test]
+        fn $name() {
+            let cfg = Cfg::default_ret();
+            let (o, _) = run_bounded($seed, &cfg, 40, 3, 80, true);
+            let why: Vec<String> = o.nodes.iter().flat_map(|m| m.order_problems.clone()).collect();
+            assert_eq!(grade_bounded(&o.nodes, &o.log), Vec::<String>::new(), "{why:?}");
+            let trailing: usize = o.nodes.iter().map(|m| m.order_trailing_checks).sum();
+            assert!(
+                trailing > 0,
+                "the seed no longer reaches a level with a map that has no place"
+            );
+        }
+    };
+}
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1080, 1080);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1357, 1357);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2626, 2626);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2654, 2654);
