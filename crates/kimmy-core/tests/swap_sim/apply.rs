@@ -1,0 +1,217 @@
+//! Apply (`swapmodel5.py` 565-691, 754-770): `take`, the append decision, deferred entries, the late-write check.
+
+use crate::coverage::CoverageOf;
+use crate::entry::*;
+use crate::member::Member;
+use crate::world::World;
+
+impl Member {
+    /// An entry that takes no effect at this member (`m-ignored-event-not-served`: such an entry is not appended).
+    pub fn would_be_ignored(&self, w: &World, e: &Entry) -> bool {
+        match e.kind {
+            Kind::Loss => {
+                let k = e.lkey.expect("a loss entry has a key");
+                self.loss.contains_key(&k) || self.loss_pending.contains_key(&k)
+            }
+            Kind::Create => self.phys.contains_key(&e.phys),
+            Kind::Abandon => match self.phys.get(&e.phys) {
+                None => true,
+                Some(p) => !p.alive || self.bmap.contains_key(&e.phys),
+            },
+            Kind::Bind => {
+                !self.member_valid(w, e) || self.cur.as_ref().is_some_and(|c| e.stamp < c.stamp)
+            }
+            Kind::Ldrop | Kind::Lcreate => self.cur.as_ref().is_some_and(|c| e.stamp < c.stamp),
+            Kind::Doc => false,
+        }
+    }
+
+    /// The member takes an entry directly (no window, no witnessing).
+    pub fn take(&mut self, w: &mut World, e: &EntryRef) {
+        if self.cv.has(e.idx) {
+            return;
+        }
+        let f = w.f;
+        let ignored = f.ignored_not_served
+            && e.kind != Kind::Doc
+            && e.origin != self.id
+            && self.would_be_ignored(w, e);
+        self.cv.add(e.idx);
+        self.witness(e);
+        if e.kind != Kind::Doc && !ignored {
+            self.appended.insert(e.idx); // register events, creates, abandons and loss entries are always appended and served onward
+        }
+        if e.kind == Kind::Doc {
+            self.recv_entry.insert(e.idx);
+        }
+        let mut is_event = false;
+        match e.kind {
+            Kind::Create => {
+                self.creates.insert(e.phys.clone(), e.clone());
+                self.learned.entry(e.phys.clone()).or_insert(w.step);
+                match self.phys.get_mut(&e.phys) {
+                    None => {
+                        self.phys.insert(e.phys.clone(), Phys::new(PKind::Stage));
+                    }
+                    Some(p) => p.kind = PKind::Stage,
+                }
+            }
+            Kind::Abandon => {
+                self.abandoned.insert(e.phys.clone());
+            }
+            Kind::Lcreate => {
+                is_event = self.add_event(w, e);
+                if !self.phys.contains_key(&e.phys) {
+                    self.phys.insert(e.phys.clone(), Phys::new(PKind::Rc));
+                }
+            }
+            Kind::Bind => {
+                if self.member_valid(w, e) {
+                    is_event = self.add_event(w, e);
+                    if w.step - self.learned.get(&e.phys).copied().unwrap_or(w.step) > 12 {
+                        w.stats.bump("valid_bind_arrives_late");
+                    }
+                }
+            }
+            Kind::Ldrop => {
+                if f.ldrop_identity_only {
+                    self.apply_ldrop_identity_only(w, e);
+                } else {
+                    is_event = self.add_event(w, e);
+                }
+            }
+            Kind::Loss => {
+                let k = e.lkey.expect("a loss entry has a key");
+                let phys = match &e.extra {
+                    Extra::Phys(p) => p.clone(),
+                    _ => String::new(),
+                };
+                self.merge_loss(w, k, e.body.clone(), &phys);
+            }
+            Kind::Doc => self.apply_doc(w, e),
+        }
+        if is_event {
+            self.rescan(w, None);
+        }
+        self.settle(w);
+    }
+
+    /// Mutant (R7): a logical drop addresses only the physical it names.
+    fn apply_ldrop_identity_only(&mut self, w: &mut World, e: &Entry) {
+        let (alive, kill) = match self.phys.get(&e.phys) {
+            None => return,
+            Some(p) => (p.alive, p.kill),
+        };
+        if alive {
+            self.bury(w, &e.phys, e.stamp, "ldrop-identity");
+        } else if kill.is_none_or(|k| e.stamp < k) {
+            self.phys.get_mut(&e.phys).unwrap().kill = Some(e.stamp);
+        }
+    }
+
+    pub fn retry_deferred(&mut self, w: &mut World) -> bool {
+        let mut prog = false;
+        let mut again = true;
+        while again {
+            again = false;
+            let list: Vec<EntryRef> = self.deferred.clone();
+            for e in list {
+                if self.phys.contains_key(&e.phys) {
+                    self.deferred.retain(|d| d.idx != e.idx);
+                    self.apply_doc(w, &e);
+                    again = true;
+                    prog = true;
+                }
+            }
+        }
+        prog
+    }
+
+    fn lww(p: &mut Phys, key: u32, stamp: Stamp, body: Body) {
+        let newer = p.docs.get(&key).is_none_or(|c| stamp > c.stamp);
+        if newer {
+            p.docs.insert(key, Ver { stamp, body });
+        }
+    }
+
+    /// The append decision (the product's relay): a document entry is appended iff it won last-writer-wins on
+    /// arrival, or it is the gap-1 case (superseded only by a record held as an unfinished join's page state).
+    pub fn apply_doc(&mut self, w: &mut World, e: &EntryRef) {
+        let f = w.f;
+        let Some(p) = self.phys.get(&e.phys) else { return self.apply_doc_orig(w, e) };
+        if !p.alive {
+            return self.apply_doc_orig(w, e);
+        }
+        let cur = p.docs.get(&e.key).map(|c| c.stamp);
+        let wins = cur.is_none_or(|c| e.stamp >= c); // an equal stamp is the same entry, held as a snapshot's state
+        let held_state = p.missing
+            || cur.is_some_and(|c| self.held_records.contains(&(e.phys.clone(), e.key, c)));
+        self.apply_doc_orig(w, e);
+        if wins {
+            self.appended.insert(e.idx);
+        } else if f.append_in_position && held_state {
+            // gap-1 fix: superseded ONLY by a record held as an unfinished snapshot's state: appended in position,
+            // servable, no change to the document
+            self.appended.insert(e.idx);
+            w.stats.bump("appended_in_position");
+        } else if e.origin != self.id {
+            self.dochist.remove(&e.idx); // superseded on arrival: witnessed, not in the product's oplog, never served
+            w.stats.bump("lww_losers_not_kept");
+        }
+    }
+
+    fn apply_doc_orig(&mut self, w: &mut World, e: &EntryRef) {
+        let Some(p) = self.phys.get_mut(&e.phys) else {
+            if !self.deferred.iter().any(|d| d.idx == e.idx) {
+                self.deferred.push(e.clone());
+            }
+            return;
+        };
+        if e.staging {
+            if p.alive {
+                Self::lww(p, e.key, e.stamp, e.body.clone());
+            }
+            return;
+        }
+        if p.alive {
+            Self::lww(p, e.key, e.stamp, e.body.clone());
+            self.dochist.insert(e.idx); // m1: retained while the physical is alive here
+            self.check_late(w, e);
+            return;
+        }
+        // R4/R6/m1: addressed to a buried (bound-out) physical: history on arrival
+        if w.f.retain_history {
+            self.dochist.insert(e.idx);
+            self.hist_kept.insert(e.idx);
+        } else {
+            w.stats.bump("history_arrivals_dropped");
+        }
+        self.check_late(w, e);
+    }
+
+    /// D11, existential form, with m3: the write is late iff a known valid register event supersedes its physical
+    /// with a stamp between the physical's birth and the write's stamp; it is REPORTED only once the physical is
+    /// buried on this member.
+    pub fn check_late(&mut self, w: &mut World, e: &Entry) {
+        let Some(ks) = self.late_stamp(w, &e.phys) else { return };
+        if e.stamp <= ks {
+            return;
+        }
+        let alive_or_unknown = self.phys.get(&e.phys).is_none_or(|p| p.alive);
+        if !w.f.report_before_burial && alive_or_unknown {
+            w.stats.bump("report_delayed_until_burial");
+            return;
+        }
+        self.report(w, e.key, e.stamp, e.body.clone(), &e.phys);
+    }
+
+    pub fn rescan(&mut self, w: &mut World, name: Option<&str>) {
+        let ids: Vec<EntryId> = self.dochist.iter().copied().collect();
+        for id in ids {
+            let e = w.ent_rc(id);
+            if name.is_none_or(|n| e.phys == n) {
+                self.check_late(w, &e);
+            }
+        }
+    }
+}
