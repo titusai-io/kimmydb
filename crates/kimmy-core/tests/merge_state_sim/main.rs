@@ -342,10 +342,10 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14), the B1 and M1 rules (2), the fold rule of the counter cell (1), the nested rules (7), the rules of Q3
+    // The design mutants of section 17 (14), the B1 and M1 rules (2), the fold rule of the counter cell (3), the nested rules (7), the rules of Q3
     // (the covered-entry skip by the vector and by the stamp, the start-HLC rule) and the seven rules of the
     // writer's feed of the order state (O2): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 34, "the mutant list changed");
+    assert_eq!(mutants::mutants().len(), 36, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {

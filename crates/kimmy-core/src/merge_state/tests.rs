@@ -1410,14 +1410,15 @@ fn state_with_big_slots(total: i128) -> (MergeState, MStamp) {
     w.upsert_inc(&p("x"), 1, 0).unwrap();
     let mut st = w.state.clone();
     let life = *st.lives.keys().next().unwrap();
-    let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     for c in ['B', 'C'] {
+        let stamp = MStamp { hlc: h(1), writer: wid(c, 0) };
         st.slots.insert(
             (life, p("x"), wid(c, 0), None),
             Slot { stamp, total: total.into(), absorbed: None },
         );
     }
-    st.vv.insert(wid('B', 0), h(1)); // B wrote the slots
+    st.vv.insert(wid('B', 0), h(1)); // B and C wrote the slots
+    st.vv.insert(wid('C', 0), h(1));
     (st, life)
 }
 
@@ -1592,15 +1593,16 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
     let mut st = w.state.clone();
     let life = *st.lives.keys().next().unwrap();
     st.slots.clear();
-    let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     for k in 0..64u8 {
         let wr = WriterId { node: nid((b'a' + k) as char), epoch: Epoch::from_u64(0) };
+        // a slot is stamped by the writer of its key
+        let stamp = MStamp { hlc: h(1), writer: wr };
+        st.vv.insert(wr, h(1));
         st.slots.insert(
             (life, p("x"), wr, None),
             Slot { stamp, total: MAX_TOTAL.into(), absorbed: None },
         );
     }
-    st.vv.insert(wid('B', 0), h(1)); // B wrote the slots
     assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)));
     assert_eq!(
         MergeState::decode(&st.encode()).unwrap(),

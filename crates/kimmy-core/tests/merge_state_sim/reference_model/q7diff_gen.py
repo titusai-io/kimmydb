@@ -131,7 +131,23 @@ def _obs_reads(s):
             repr([(p, sorted(map(repr, s.counted(p)))) for p in slot_paths]))
 
 
+# THE STRUCTURAL FORM of the same claim, asserted on EVERY digested state (it is what makes the obs redundant for every LATER join
+# as well, not only for the reads of the present state): for every register obs key whose slot the state holds, the slot's absorbed
+# pair exists and is at least as late as the obs entry (`absorbed[k][0] >= obs[k][0]`). A join takes the max of both components and
+# drops both with the life, so the property carries through every later join. An obs key whose slot is gone (see above) is dangling
+# and is not part of the claim.
+def check_obs_structural(s):
+    for (L, p), r in s.regs.items():
+        for (l2, w2, g2), o in r[2].items():
+            k = (l2, p, w2, g2)
+            if k in s.slots:
+                a = s.absorbed.get(k)
+                assert a is not None and a[0] >= o[0], \
+                    "a register obs entry %r of %r is not covered by the slot's absorbed pair %r" % (o, k, a)
+
+
 def check_obs_dead(s):
+    check_obs_structural(s)
     if not any(r[2] for r in s.regs.values()):
         return
     cleared = s.copy()

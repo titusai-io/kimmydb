@@ -203,7 +203,46 @@ def _obs_reads(s):
             repr([(p, sorted(map(repr, s.counted(p)))) for p in slot_paths]))
 
 
+# THE STRUCTURAL FORM of the same claim, asserted on EVERY digested state (it is what makes the obs redundant for every LATER join
+# as well, not only for the reads of the present state): for every register obs key whose slot the state holds, the slot's absorbed
+# pair exists and is at least as late as the obs entry (`absorbed[k][0] >= obs[k][0]`). A join takes the max of both components and
+# drops both with the life, so the property carries through every later join. An obs key whose slot is gone (see above) is dangling
+# and is not part of the claim.
+def check_obs_structural(s):
+    for (L, p), r in s.regs.items():
+        for (l2, w2, g2), o in r[2].items():
+            k = (l2, p, w2, g2)
+            if k in s.slots:
+                a = s.absorbed.get(k)
+                assert a is not None and a[0] >= o[0], \
+                    "a register obs entry %r of %r is not covered by the slot's absorbed pair %r" % (o, k, a)
+
+
+# What the shape of seed 792 is counted by, per script (REPORTED on stdout by `main`, one line per script; nothing in the script file or in
+# any digest depends on it): over the states the script digests, how many hold a register obs key whose slot is gone (a dangling obs
+# key), how many keys that is, and how many hold a dangling generation `seen` key. A `seen` key is dangling the same way (its slot is
+# gone); it lasts as long as the register holding the generation (only a NON-numeric base starts a generation, so a numeric `$set` or an
+# `$unset` copies the winner's, dangling keys included), is dead for every read (`hidden` reads `seen` only for the slots of alive lives)
+# and is bounded by the slots alive at the generation's start.
+DANGLING = {"states": 0, "obs_states": 0, "obs_keys": 0, "seen_states": 0}
+
+
+def _count_dangling(s):
+    DANGLING["states"] += 1
+    obs = seen = 0
+    for (L, p), r in s.regs.items():
+        obs += sum(1 for (l2, w2, g2) in r[2] if (l2, p, w2, g2) not in s.slots)
+        g = r[3] if len(r) > 3 else None
+        if g and len(g) > 2:
+            seen += sum(1 for (l2, w2, g2) in g[2] if (l2, p, w2, g2) not in s.slots)
+    DANGLING["obs_keys"] += obs
+    DANGLING["obs_states"] += 1 if obs else 0
+    DANGLING["seen_states"] += 1 if seen else 0
+
+
 def check_obs_dead(s):
+    check_obs_structural(s)
+    _count_dangling(s)
     if not any(r[2] for r in s.regs.values()):
         return
     cleared = s.copy()
@@ -447,6 +486,8 @@ def sort_losses(keys):
 
 
 def build(seed, plants=(), explain_step=None, explained=None):
+    for k in DANGLING:
+        DANGLING[k] = 0
     rnd = random.Random(seed)
     ret = rnd.choice([10 ** 9, 10 ** 9, 10 ** 9, 3, 5, 8, 12])
     bound = rnd.choice([I64_MAX, I64_MAX, 1000])
@@ -559,6 +600,8 @@ def main():
         sc, _ = build(seed, plants)
         with open(os.path.join(out, "s%06d.json" % seed), "w") as f:
             json.dump(sc, f)
+        print("dangling seed=%d states=%d obs_states=%d obs_keys=%d seen_states=%d" % (
+            seed, DANGLING["states"], DANGLING["obs_states"], DANGLING["obs_keys"], DANGLING["seen_states"]))
         for pl in plants:                     # reset the switches for the next script
             setattr(M, PLANTS[pl][0], False)
 

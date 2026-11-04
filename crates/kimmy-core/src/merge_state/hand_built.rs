@@ -209,21 +209,38 @@ impl Cx<'_> {
         Life { seen: BTreeSet::new(), order, kind }
     }
 
-    /// A slot written by the write `at`. Its stamp is the write's with the counter raised by
-    /// [`SLOT_CTR`], so that no register and slot of a path share a stamp: a write is a register
-    /// write or an increment, never both at one path.
+    /// A slot of a key of `writer`, written by the write `at`. Its stamp is the write's with the
+    /// counter raised by [`SLOT_CTR`], so that no register and slot of a path share a stamp: a
+    /// write is a register write or an increment, never both at one path.
+    ///
+    /// In the coherent modes the slot is the writer's own, as `decode` requires (items 26 to 28 of
+    /// the inventory): the write is taken as `at`'s HLC by `writer`, so the slot's stamp, the
+    /// pair's stamp and every total drawn below are functions of that stamp and the path, and
+    /// two writes that differ only in the writer `at` named cannot give one stamp two totals.
     ///
     /// Its absorbed pair, when it has one, is the slot's own past or present, as an honest slot's is:
     /// the pair at the slot's own stamp (the slot as it is), or at the write `at` below it (an
-    /// earlier total). The draw is a function of the write and the path in the coherent modes, so
-    /// that the same stamp always carries the same pair.
-    fn slot(&mut self, at: MStamp, p: &Path) -> Slot {
-        let (stamp, total) = (slot_stamp(at), self.total(at, p));
+    /// earlier total, a function of that absorbed stamp and the path). In the coherent modes its
+    /// type is not wider than the slot's: the slot takes the pair's type when the draw gave it a
+    /// wider one (both are functions of the write, so a stamp still fixes what it carries). The
+    /// draw is a function of the write and the path in the coherent modes, so that the same
+    /// stamp always carries the same pair.
+    fn slot(&mut self, at: MStamp, p: &Path, writer: WriterId) -> Slot {
+        let at = if self.coh { MStamp { hlc: at.hlc, writer } } else { at };
+        let (stamp, mut total) = (slot_stamp(at), self.total(at, p));
         let absorbed = self.draw(("absorbed", at, p), |r| match r.below(4) {
             1 => Some((stamp, total)),
             2 => Some((at, num_from(r))),
             _ => None,
         });
+        if self.coh
+            && let Some((_, a)) = &absorbed
+            && a.label() > total.label()
+        {
+            total = total.to_kind(a.label());
+            // (the pair at the slot's own stamp is the slot, so it has the slot's type: it is not
+            // the case that gets here)
+        }
         Slot { stamp, total, absorbed }
     }
 }
@@ -242,6 +259,11 @@ fn put_reg(s: &mut MergeState, l: MStamp, p: &Path, r: Reg) {
 /// slot, so its stamp is by the key's writer. The pair keeps its HLC and moves to that writer; one
 /// that then stands above the slot is dropped, and one at the slot's own stamp takes the slot's total
 /// (a function of the slot and the key, so a stamp still fixes what it carries).
+///
+/// A pair made by [`Cx::slot`] in a coherent mode is already by the key's writer, and its total a
+/// function of `("absorbed", moved stamp, path)`, so this changes nothing there; it moves the pairs
+/// that [`Mode::Any`] and the builders with a pair of their own (`near_max_total`) give, whose totals
+/// are functions of the HLC alone, so that the moved stamp still fixes its total.
 fn fit_pair(mut sl: Slot, writer: WriterId) -> Slot {
     sl.absorbed = sl.absorbed.and_then(|(a, total)| {
         let a = MStamp { hlc: a.hlc, writer };
@@ -349,9 +371,9 @@ fn equal_stamps_under_one_key(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState
     };
     put_slot(&mut s, la(), &p3, 0, None, Slot { stamp: slot_stamp(x), total: ta, absorbed: None });
     put_slot(&mut t, la(), &p3, 0, None, Slot { stamp: slot_stamp(x), total: tb, absorbed: None });
-    let sl = cx.slot(x, &p1);
+    let sl = cx.slot(x, &p1, wid(1));
     put_slot(&mut s, la(), &p1, 1, None, sl);
-    let sl = cx.slot(y, &p1);
+    let sl = cx.slot(y, &p1, wid(1));
     put_slot(&mut t, la(), &p1, 1, None, sl);
     vv(&mut s, 0, 10, 0);
     vv(&mut t, 1, 12, 0);
@@ -375,7 +397,7 @@ fn absent_or_dead(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState) {
             for p in [path(&["x"]), path(&["a", "b"]), path(&[""])] {
                 let at = stamp(10 + k as u64 + life.hlc.wall_ms, 0, k as u8);
                 put_reg(st, life, &p, cx.reg(at, &p, None));
-                let sl = cx.slot(at, &p);
+                let sl = cx.slot(at, &p, wid(k as u8));
                 put_slot(st, life, &p, k as u8, None, sl);
             }
             st.gens.insert((life, path(&["x"])), (stamp(9, 0, 0), Vv::new()));
@@ -398,7 +420,7 @@ fn odd_paths(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState) {
         let (a, b) = (stamp(10 + k as u64, 0, 0), stamp(10 + k as u64, 1, 1));
         put_reg(&mut s, l1, p, cx.reg(a, p, None));
         put_reg(&mut t, l2, p, cx.reg(b, p, None));
-        let sl = cx.slot(a, p);
+        let sl = cx.slot(a, p, wid(0));
         put_slot(&mut s, l1, p, 0, None, sl);
     }
     // an ancestor and its odd descendants: scalar against cell below
@@ -436,7 +458,7 @@ fn unset_vs_null(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState) {
         put_reg(&mut s, la(), p, cx.reg(a, p, Some(vs)));
         put_reg(&mut t, la(), p, cx.reg(b, p, Some(vt)));
         if n == 1 {
-            let sl = cx.slot(a, p);
+            let sl = cx.slot(a, p, wid(0));
             put_slot(&mut s, la(), p, 0, None, sl);
         }
     }
@@ -460,13 +482,13 @@ fn soi_and_slot(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState) {
         let mut r = cx.reg(a, p, None);
         r.soi = true;
         put_reg(&mut s, la(), p, r);
-        let sl = cx.slot(a, p);
+        let sl = cx.slot(a, p, wid(0));
         put_slot(&mut s, la(), p, 0, None, sl);
         let b = stamp(12 + n as u64, 0, 1);
         let mut r = cx.reg(b, p, None);
         r.soi = n != 1;
         put_reg(&mut t, la(), p, r);
-        let sl = cx.slot(b, p);
+        let sl = cx.slot(b, p, wid(1));
         put_slot(&mut t, la(), p, 1, None, sl);
     }
     vv(&mut s, 0, 12, 0);
@@ -502,7 +524,7 @@ fn marker_and_scalar(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState) {
     put_reg(y, la(), &ab, cx.reg(v2, &ab, Some(Value::Int64(1))));
     // x: a scalar at ab, y: a newer slot and a newer register below it
     put_reg(x, la(), &ab, cx.reg(v3, &ab, Some(Value::String("s".into()))));
-    let sl = cx.slot(v4, &abc);
+    let sl = cx.slot(v4, &abc, wid(1));
     put_slot(y, la(), &abc, 1, None, sl);
     // x: a newer scalar at "", y: an older cell below it
     put_reg(y, la(), &ea, cx.reg(v5, &ea, Some(Value::Int64(3))));
@@ -560,7 +582,7 @@ fn horizon_straddle(cx: &mut Cx, ret: u64) -> (MergeState, MergeState) {
         t.deletes.insert(d, Vv::from([(wid(1), d.hlc)]));
         let q = path(PATHS[n]);
         put_reg(&mut t, l, &q, cx.reg(stamp(w, 2, 1), &q, None));
-        let sl = cx.slot(stamp(w, 2, 1), &q);
+        let sl = cx.slot(stamp(w, 2, 1), &q, wid(1));
         put_slot(&mut t, l, &q, 1, None, sl);
         t.losses.insert(
             LossKey::field(LossKind::Clash, q.clone(), stamp(w, 3, 1)),
@@ -718,7 +740,7 @@ fn wild_state(cx: &mut Cx, u: &Uni) -> MergeState {
         let (l, at, p) = (*cx.rng.pick(&u.lives), *cx.rng.pick(&u.stamps), cx.rng.pick(&u.paths));
         let generation = (cx.rng.below(3) == 0).then(|| *cx.rng.pick(&u.stamps));
         let k = cx.rng.below(3) as u8;
-        let sl = cx.slot(at, p);
+        let sl = cx.slot(at, p, wid(k));
         put_slot(&mut s, l, p, k, generation, sl);
     }
     for _ in 0..cx.rng.below(3) {
@@ -802,7 +824,7 @@ fn derived(cx: &mut Cx, u: &Uni, s: &MergeState) -> MergeState {
         match cx.rng.below(10) {
             0..=2 => {
                 let at = *cx.rng.pick(&u.stamps);
-                let sl = cx.slot(at, &k.1);
+                let sl = cx.slot(at, &k.1, k.2);
                 let sl = fit_pair(sl, k.2);
                 t.slots.insert(k, sl);
             }
@@ -1076,4 +1098,48 @@ fn the_cases_cover_every_shape_and_the_closed_ones_are_what_decode_accepts() {
         ["DeadLifeNotListed", "VersionVectorBehind"].iter().all(|k| refused.contains_key(*k)),
         "coherent states that are not closed must show both refusals: {refused:?}"
     );
+}
+
+/// A coherent slot is the key's writer's, whatever writer the write `at` named, and what its stamp
+/// carries is a function of the stamp and the path: the slot's total, and its pair (the pair's
+/// total a function of the absorbed stamp and the path, its type not wider than the slot's). Without
+/// it two states could hold one absorbed stamp under one key with two totals (a latent defect the
+/// review found at `fit_pair`: the total was drawn from the write, writer included, and the stamp
+/// then moved to the key's writer). Every such slot is what `decode` accepts.
+#[test]
+fn a_coherent_slot_is_the_key_writers_and_a_function_of_its_stamp_and_path() {
+    let mut rng = Rng(0x5354_414d_5053);
+    let mut cx = Cx { rng: &mut rng, coh: true, closed: true };
+    let (mut pairs, mut wider) = (0, 0);
+    for wall in 1..40u64 {
+        for ctr in 0..2u16 {
+            for pa in PATHS {
+                let pa = path(pa);
+                for key in 0..3u8 {
+                    let slots: Vec<Slot> =
+                        (0..3u8).map(|w| cx.slot(stamp(wall, ctr, w), &pa, wid(key))).collect();
+                    // the writer the write named does not matter
+                    assert!(slots.windows(2).all(|w| w[0] == w[1]), "{wall} {ctr} {pa:?} {key}");
+                    let sl = fit_pair(slots[0].clone(), wid(key));
+                    assert_eq!(sl, slots[0], "the pair is already the key writer's");
+                    assert_eq!(sl.stamp.writer, wid(key));
+                    let mut s = MergeState::default();
+                    s.lives.insert(
+                        la(),
+                        Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Upsert },
+                    );
+                    s.slots.insert((la(), pa.clone(), wid(key), None), sl.clone());
+                    for k in 0..3u8 {
+                        vv(&mut s, k, 1000, 0);
+                    }
+                    assert_eq!(s.check_decoded(), Ok(()), "{sl:?}");
+                    if let Some((_, a)) = &sl.absorbed {
+                        pairs += 1;
+                        wider += usize::from(a.label() < sl.total.label());
+                    }
+                }
+            }
+        }
+    }
+    assert!(pairs > 500 && wider > 20, "{pairs} pairs, {wider} narrower than their slot");
 }

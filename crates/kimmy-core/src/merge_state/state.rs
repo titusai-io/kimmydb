@@ -39,6 +39,13 @@ pub struct Life {
 /// The generation a base starts or belongs to: the starter's stamp and the totals the starter
 /// had seen.
 ///
+/// Only a NON-numeric base starts a generation (`Writer::setreg`, the model's `_setreg`), with a
+/// `seen` over the slots alive at that write. A numeric `$set` or an `$unset` copies the winner's
+/// generation, `seen` keys that name no slot any more included, and a register of the path in
+/// another alive life keeps its copy until that life ends. Such a key is a subset of the
+/// generation-start keys, so it is bounded by the slots alive at the start, and it is dead for
+/// every read: `hidden` reads `seen` only for slots of alive lives.
+///
 /// `vv` (the starter's version vector) is memory for the V4M1 mutant of the test harness and
 /// nothing else: it is kept only in a test or `merge-mutants` build, is empty in a production
 /// build, and is not encoded, hashed or compared (two generations are equal when `stamp` and
@@ -277,7 +284,9 @@ impl MergeState {
     ///    guarantees it.
     /// 7. One stamp is one write: what a stamp carries (a register's value and
     ///    generation, a slot's total, a life's kind, `seen` and field order, a delete's vector,
-    ///    a loss record's value) is the same in every state that holds it, since the join keeps
+    ///    a loss record's value, and an absorbed stamp's total: one absorbed stamp under one key
+    ///    carries one total across states, since the pair's join tie keeps the first argument's)
+    ///    is the same in every state that holds it, since the join keeps
     ///    the first argument's copy. CROSS-STATE: not checkable by `decode`; honest stamping
     ///    (`Writer::tick`, strictly above the clock and the vector, `StampError`) guarantees it.
     /// 8. The caps (`MAX_WRITERS`, `MAX_CONTRIBUTORS`): a received state past them is kept and
@@ -367,12 +376,18 @@ impl MergeState {
     ///     floor over its earlier one): the boundary of the claim is "within retention", the same as
     ///     the state's own, not "a causal history" (`ord_codec_tests`).
     ///
+    ///     The same boundary holds for the redundancy of a register's old `obs` against the
+    ///     absorbed pairs: the register obs is dead while a dead life cannot come back (within the
+    ///     retention claim). A resurrected life beyond retention (ADR-085), or Q3 without the
+    ///     covered skip, would bring back slots that a surviving register's obs had discounted,
+    ///     and the Rust, which keeps no obs, would count them.
+    ///
     /// 23. NOT relied on, so NOT checked: nothing else is assumed of an entry: the join and the read
     ///     are defined for any values, and the laws hold as stated above.
     ///
     /// THE ABSORBED PAIR of a slot (the counter cell). A slot is `(stamp, total)` and an optional
     /// `absorbed` `(stamp, total)`: the highest state of this very slot that a base write had
-    /// held. Three clauses one state can show:
+    /// held. Five clauses one state can show (items 24 to 28); item 29 says what is NOT checked of a decimal total, and 30 is the version 1 form:
     ///
     /// 24. The absorbed stamp is not above the slot's ([`DecodeError::AbsorbedAboveSlot`]). A base
     ///     write absorbs what its writer holds, and a slot only moves forward, so the pair is the
@@ -392,9 +407,51 @@ impl MergeState {
     ///     The check follows the two above it: a stamp above the slot's, or equal to it with
     ///     another total, is reported as that.
     ///
+    /// 27. The slot's own stamp is by the writer of the slot's key
+    ///     ([`DecodeError::SlotWriterMismatch`]). The same reason as item 26 applies to the slot
+    ///     itself: a slot is one writer's running total, and every write that moved it is that
+    ///     writer's, so its stamp is. Without this, a pair by the key's writer under a slot
+    ///     stamped by another writer would be accepted, though item 26 calls the pair a past state
+    ///     of the very slot. Checked first of the slot's clauses.
+    /// 28. The absorbed total's type is not wider than the slot's
+    ///     ([`DecodeError::AbsorbedWiderThanSlot`]), in the order of the labels `Int32 < Int64 <
+    ///     Decimal128`. THE HONEST RELATION, derived from the writer: the slot's total is the
+    ///     writer's running sum, `sum_checked(old total, operand)` (`Writer::inc_plan`), and
+    ///     `Num::combine` labels an integer sum `Int32` only when both parts are, otherwise
+    ///     `Int64`, and a sum with a `Decimal128` part a `Decimal128`; a visible `Int64` only
+    ///     widens the label (`Num::widened`, `Int32` to `Int64`); nothing converts a decimal back.
+    ///     So the LABEL of the slot (the variant as spelled, not `Num::kind`, which promotes an
+    ///     `Int32` amount outside the `i32` range, and so can fall again) never drops across the
+    ///     writes of its writer. The pair is a past state of that slot (item 24), so its label
+    ///     is at most the slot's; at the slot's own stamp the totals are equal (item 25) and so
+    ///     are the labels. Neither the join nor the reads need it (an Int64 slot with a
+    ///     `Decimal128` pair reads as a `Decimal128`, a defined value), it is the shape of the
+    ///     writers' states, and the compact form spells both labels, so a state can show it.
+    ///     (The reference model has one integer type and no decimal arithmetic, see its
+    ///     INTERFACE.md: the relation is the Rust counter's, not the model's.)
+    ///
+    /// 29. A `Decimal128` total is ANY 16 bytes: NOT checked, and not checkable by the rule "refuse what
+    ///     no honest history produces", because the Writer produces them all. A decimal `$inc` is
+    ///     refused only when the sum overflows from finite inputs (`counter::sum_checked`), nothing
+    ///     in `Value::check_input` looks at the class of a decimal, and a writer's first slot at a
+    ///     path stores the operand's bytes as given (`Writer::inc_plan`), so a NaN (any sign, any
+    ///     payload, signalling or quiet), an infinity, a coefficient above 10^34 - 1, the
+    ///     large-coefficient form and an exponent beyond the range are all slot totals of honest
+    ///     histories, and a base write folds them into the pair (a later increment leaves the pair
+    ///     as it was). `seen` and loss totals are copies of slot totals. So the compact reader takes
+    ///     the 16 bytes of every typed total as they are (slot, pair, `seen`, loss alike), the bytes
+    ///     survive a round trip, the totals are compared byte for byte (so a pair that differs from
+    ///     its slot at the slot's own stamp is refused, `AbsorbedTotalMismatch`, whatever the
+    ///     class), and the reads (`dec_raw_bits`) take any pattern as the value it denotes (a NaN as
+    ///     the one NaN). Tests: `the_writer_takes_nan_infinite_and_non_canonical_decimal_operands`
+    ///     (the Writer side) and
+    ///     `a_nan_or_non_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot`
+    ///     (the decode side). Whether such an operand SHOULD be refused is a question for the
+    ///     write path (a semantic ruling), not for the decode of a state.
+    ///
     /// The version 1 form only (`decode`, not `decode_compact`):
     ///
-    /// 27. A register's `obs` place is always empty ([`DecodeError::NotCanonical`]). A version 1
+    /// 30. A register's `obs` place is always empty ([`DecodeError::NotCanonical`]). A version 1
     ///     register still has a count where the `obs` map used to be; what a base had counted is
     ///     the slots' absorbed pairs now, which version 1 cannot spell, so a non-empty count is
     ///     not the encoding of any state. Checked by the version 1 reader, not by `check_decoded`
@@ -406,6 +463,9 @@ impl MergeState {
             return Err(DecodeError::DeadLifeNotListed);
         }
         for (k, s) in &self.slots {
+            if s.stamp.writer != k.2 {
+                return Err(DecodeError::SlotWriterMismatch);
+            }
             if let Some((st, total)) = &s.absorbed {
                 if *st > s.stamp {
                     return Err(DecodeError::AbsorbedAboveSlot);
@@ -415,6 +475,9 @@ impl MergeState {
                 }
                 if st.writer != k.2 {
                     return Err(DecodeError::AbsorbedWriterMismatch);
+                }
+                if total.label() > s.total.label() {
+                    return Err(DecodeError::AbsorbedWiderThanSlot);
                 }
             }
         }

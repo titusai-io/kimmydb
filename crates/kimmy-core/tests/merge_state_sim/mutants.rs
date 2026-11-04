@@ -45,8 +45,10 @@ pub enum Probe {
     /// that shows), so a change of the workload's random stream could leave it alive.
     Scenarios,
     /// The fold scenarios of the counter cell (`probes::fold_scenarios_with`: the four-step case of the
-    /// review and EG2), read by value: the mutant is killed when a member reads another value than the
-    /// design's.
+    /// review and EG2), read by value, and the marker scenario (`$set a {b: 1}` over a counter folds its
+    /// slot) and the cross-life scenario (a base in the newest alive life folds a slot of another alive
+    /// life), both read through the slot's pair: the mutant is killed when a member reads another value than
+    /// the design's or a base write leaves a slot without its pair.
     Fold,
     /// The idle-origin and late-member scripts of probes_q3 (`probes::q3_idle_origin`, `q3_late_member`):
     /// the mutant is killed when the collected life comes back in one of them (the design keeps it dead).
@@ -178,6 +180,18 @@ pub fn mutants() -> Vec<Mutant> {
         Mutant {
             name: "a base write folds only the slots it counts, not every slot held  [M2 fold]",
             apply: |c| c.opts.set_fold_counted_only(true),
+            grader: Random { restore: true },
+            probe: Fold,
+        },
+        Mutant {
+            name: "a base write folds only the slots of its own life  [M2 fold, life only]",
+            apply: |c| c.opts.set_fold_life_only(true),
+            grader: Random { restore: true },
+            probe: Fold,
+        },
+        Mutant {
+            name: "a map-marker base write folds no slot  [M2 fold, marker]",
+            apply: |c| c.opts.set_no_fold_marker(true),
             grader: Random { restore: true },
             probe: Fold,
         },
