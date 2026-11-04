@@ -578,13 +578,13 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     let refused_total: usize = refused.values().sum();
     assert_eq!((candidates, accepted, refused_total), (60_000, 31_795, 28_205), "{refused:?}");
     assert_eq!(refused.len(), 8, "every clause that one state can show is reached: {refused:?}");
-    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_592));
+    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_568));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
         "the accepted triples that fail are the cross-state ones"
     );
-    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (140_196, 110_814, 524));
+    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (150_606, 120_738, 588));
     assert_eq!((one.triples, one.not_associative), (4_266, 0));
     assert_eq!((sim.triples, sim.not_associative), (108_870, 0));
 }

@@ -701,6 +701,22 @@ def s_updates_that_are_writes_by_what_they_name_alone():
     return sc
 
 
+@scenario
+def s_maps_that_survive_an_unset_through_empty_children_trail_in_path_order():
+    """O2-3 of the O2 review. B, which A has not heard from, creates the empty maps m.x and m.y and k.z (stamps 2, 3, 4);
+    A unsets m and k (6, 7), which it saw as {p} and {q}. m and k survive, visible through empty maps alone: they have no
+    place (no standing candidate, no leaf below). A then creates n. The fields with a place come first (a, then n), and the
+    two maps without one trail in path order: k, then m."""
+    sc = RecSc({"a": 1, "m": {"p": 1}, "k": {"q": 1}})
+    sc.op("B", "set", "m.x", {}, clock=0)
+    sc.op("B", "set", "m.y", {})
+    sc.op("B", "set", "k.z", {})
+    sc.op("A", "unset", "m", clock=5)
+    sc.op("A", "unset", "k")
+    sc.op("A", "set", "n", 1)
+    return sc
+
+
 # ---- the run -----------------------------------------------------------------------------------------------------------
 
 def ent_of(sc, i):
