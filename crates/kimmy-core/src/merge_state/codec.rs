@@ -47,7 +47,7 @@ const VERSION: u8 = 1;
 pub(super) const MAX_VALUE_DEPTH: usize = 100;
 
 /// The version 1 form cannot hold a `Document` inside an array, a counter total of another type
-/// than `Int64`, or an order state. A state with one is written in the compact form (`QMS`
+/// than `Int64`, an absorbed pair on a counter slot, or an order state. A state with one is written in the compact form (`QMS`
 /// version 2), and `decode` of version 1 refuses the compact tag.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("merge state: the version 1 form cannot hold this state")]
@@ -82,6 +82,10 @@ pub enum DecodeError {
     DeadLifeNotListed,
     #[error("merge state: the version vector does not cover a stamp the state holds")]
     VersionVectorBehind,
+    #[error("merge state: a slot's absorbed stamp is above the slot's own")]
+    AbsorbedAboveSlot,
+    #[error("merge state: a slot's absorbed total differs from the slot's at the same stamp")]
+    AbsorbedTotalMismatch,
     #[error("merge state: an order entry is for a life that `lives` does not list")]
     OrdLifeNotListed,
     #[error("merge state: an order entry holds a candidate its floor voids")]
@@ -236,16 +240,6 @@ impl W {
             self.num(t);
         }
     }
-    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, Num)>) {
-        self.len(m.len());
-        for ((l, w, g), (s, t)) in m {
-            self.stamp(l);
-            self.wid(w);
-            self.opt_stamp(g);
-            self.stamp(s);
-            self.num(t);
-        }
-    }
     fn gen_(&mut self, g: &Option<Gen>) {
         match g {
             None => self.u8(0),
@@ -322,7 +316,10 @@ impl MergeState {
             w.path(p);
             w.stamp(&r.stamp);
             w.value(&r.value);
-            w.obs_stamped(&r.obs);
+            // the version 1 spelling of a register still has a place for the `obs` map the
+            // register used to carry: it is always empty now (what a base had counted is the
+            // slots' absorbed pairs, which this form cannot spell, `v1_can_hold`)
+            w.len(0);
             w.gen_(&r.generation);
             w.u8(u8::from(r.soi));
         }
@@ -346,10 +343,12 @@ impl MergeState {
     /// Can the version 1 form spell this state? Not when a register or a loss record holds a
     /// `Document` inside an array (it has no tag there; the compact form has one), and not when a
     /// counter total is of another type than `Int64` (its totals are `i128`s with no room for a
-    /// type; the compact form spells them), and not when it carries an order state (the version
+    /// type; the compact form spells them), and not when a slot carries an absorbed pair (the
+    /// version 1 form has no place for it), and not when it carries an order state (the version
     /// 1 form has no section for it: the bytes would silently leave the order out).
     pub fn v1_can_hold(&self) -> bool {
         self.ords.is_empty()
+            && self.slots.values().all(|s| s.absorbed.is_none())
             && self.totals().all(|n| matches!(n, Num::Int64(_)))
             && !self.regs.values().any(|r| r.value.contains_document())
             && !self
@@ -429,14 +428,18 @@ impl MergeState {
             let p = r.path()?;
             let stamp = r.stamp()?;
             let value = r.value()?;
-            let obs = r.obs_stamped()?;
+            // the empty `obs` place of the register: a register that names observed slots has
+            // no state to decode into, and the form could not write it back
+            if r.len()? != 0 {
+                return Err(DecodeError::NotCanonical);
+            }
             let generation = r.gen_()?;
             let soi = match r.u8()? {
                 0 => false,
                 1 => true,
                 t => return Err(DecodeError::BadTag(t)),
             };
-            put(&mut s.regs, (l, p), Reg { stamp, value, obs, generation, soi })?;
+            put(&mut s.regs, (l, p), Reg { stamp, value, generation, soi })?;
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
@@ -445,7 +448,7 @@ impl MergeState {
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
             let total = r.total()?;
-            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total })?;
+            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed: None })?;
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
@@ -645,17 +648,6 @@ impl R<'_> {
             let w = self.wid()?;
             let g = self.opt_stamp()?;
             put(&mut m, (l, w, g), self.total()?)?;
-        }
-        Ok(m)
-    }
-    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, Num)>, DecodeError> {
-        let mut m = BTreeMap::new();
-        for _ in 0..self.len()? {
-            let l = self.stamp()?;
-            let w = self.wid()?;
-            let g = self.opt_stamp()?;
-            let s = self.stamp()?;
-            put(&mut m, (l, w, g), (s, self.total()?))?;
         }
         Ok(m)
     }

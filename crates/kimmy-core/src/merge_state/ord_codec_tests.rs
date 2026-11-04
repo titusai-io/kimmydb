@@ -192,7 +192,7 @@ fn with_entry(life: MStamp, x: FieldOrd) -> MergeState {
     s.lives.insert(life, Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert });
     s.vv.insert(life.writer, Hlc::new(life.hlc.wall_ms.max(9), 0));
     let p = Path::flat("x").unwrap();
-    let reg = Reg::new(life, Value::Int64(1), BTreeMap::new(), None, false).unwrap();
+    let reg = Reg::new(life, Value::Int64(1), None, false).unwrap();
     s.regs.insert((life, p.clone()), reg);
     s.ords.insert((life, OrdAt::Field(p)), x);
     s
@@ -828,13 +828,13 @@ fn deep_states(n: usize) -> Vec<(&'static str, MergeState, bool)> {
     let p = deep_path(n);
     let mut out = Vec::new();
     let mut s = deep_base();
-    s.regs.insert(
-        (life, p.clone()),
-        Reg::new(at(2, b'A'), Value::Int64(1), BTreeMap::new(), None, false).unwrap(),
-    );
+    s.regs.insert((life, p.clone()), Reg::new(at(2, b'A'), Value::Int64(1), None, false).unwrap());
     out.push(("register", s, true));
     let mut s = deep_base();
-    s.slots.insert((life, p.clone(), a, None), Slot { stamp: at(2, b'A'), total: Num::Int64(3) });
+    s.slots.insert(
+        (life, p.clone(), a, None),
+        Slot { stamp: at(2, b'A'), total: Num::Int64(3), absorbed: None },
+    );
     out.push(("slot", s, true));
     let mut s = deep_base();
     s.losses.insert(

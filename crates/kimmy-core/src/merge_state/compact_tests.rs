@@ -1,7 +1,7 @@
 //! Tests of the compact canonical form (`compact.rs`): round trips, canonicity and refusals,
 //! and its size on the shapes of the L34-B1 benchmark.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::codec::MAX_VALUE_DEPTH;
 use super::tests::{
@@ -731,7 +731,7 @@ fn a_document_is_refused_as_a_register_by_the_checks_and_the_decoder() {
     assert_eq!(doc.check_register(), Err(InvalidValue::DocumentAsRegister));
     assert_eq!(Value::Array(vec![doc.clone()]).check_register(), Ok(()));
     let life = MStamp { hlc: Hlc::new(1, 0), writer: wid(b'A', 0) };
-    let reg = |v: Value| Reg::new(life, v, BTreeMap::new(), None, false);
+    let reg = |v: Value| Reg::new(life, v, None, false);
     assert_eq!(reg(doc.clone()), Err(InvalidValue::DocumentAsRegister));
     assert!(reg(Value::Array(vec![doc.clone()])).is_ok());
     // a writer expands one (a sub-document is a map, never a register)
@@ -889,7 +889,7 @@ fn every_table_of_one_to_three_hundred_writers_round_trips() {
             let at = MStamp { hlc: Hlc::new(2 + k as u64, 0), writer: w };
             s.slots.insert(
                 (life, p("x"), w, None),
-                Slot { stamp: at, total: Num::Int64(k as i128 + 1) },
+                Slot { stamp: at, total: Num::Int64(k as i128 + 1), absorbed: None },
             );
             s.vv.insert(w, at.hlc);
         }

@@ -165,8 +165,25 @@ fn stamp_of(j: &J) -> Option<MStamp> {
     })
 }
 
+/// The precondition under which a creation base folds nothing (the counter cell): a creation (an insert or
+/// an upsert) is refused while any life is alive, so at an accepted creation the writer holds no counter
+/// slot in an alive life. Asserted by the harness at every accepted creation; there is no assert in the
+/// product code.
+fn slot_in_alive_life(w: &Writer) -> bool {
+    let alive = w.alive();
+    w.state.slots.keys().any(|k| alive.contains(&k.0))
+}
+
 /// One write of a script on a writer.
 fn write(w: &mut Writer, step: &J) -> Option<Written> {
+    let creation = matches!(step["op"].as_str(), Some("insert" | "upsert_inc" | "upsert_soi"));
+    let held = creation && slot_in_alive_life(w);
+    let r = write_op(w, step);
+    assert!(r.is_none() || !held, "a creation was accepted over a slot of an alive life");
+    r
+}
+
+fn write_op(w: &mut Writer, step: &J) -> Option<Written> {
     let skew = step["skew"].as_u64().unwrap();
     let at = || path(&step["path"]);
     let arg = &step["arg"];

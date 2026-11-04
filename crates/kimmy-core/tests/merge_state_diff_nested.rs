@@ -10,7 +10,7 @@
 //! lowered one. This test replays every script on `merge_state::Writer`s and compares, after every
 //! step and for every member: the visible document (every present path, a map marked, the order of
 //! a level not compared), the hidden figure, and a digest of the whole state (lives, deletes, dead
-//! lives, registers with their observed totals and generations, counter slots, version vector, loss
+//! lives, registers with their generations, counter slots with their absorbed pairs, version vector, loss
 //! records, as sorted text lines hashed together); every write's stamp (or refusal or no-op); every
 //! join's `changed` flag and fresh loss keys; every loss entry's acceptance; and, after a final
 //! full-mesh sync, the recursive harness oracle (`merge_state_sim/oracle.rs`) on the Rust log
@@ -178,6 +178,15 @@ fn fv(v: &Value) -> String {
     }
 }
 
+/// The precondition under which a creation base folds nothing (the counter cell): a creation (an insert or
+/// an upsert) is refused while any life is alive, so at an accepted creation the writer holds no counter
+/// slot in an alive life. Asserted by the harness at every accepted creation; there is no assert in the
+/// product code.
+fn slot_in_alive_life(w: &Writer) -> bool {
+    let alive = w.alive();
+    w.state.slots.keys().any(|k| alive.contains(&k.0))
+}
+
 fn total(n: &Num) -> String {
     match n {
         Num::Int32(i) | Num::Int64(i) => i.to_string(),
@@ -217,12 +226,11 @@ fn digest_lines(s: &MergeState) -> Vec<String> {
         out.push(format!("del {} vv[{}]", fs(d), v.join(",")));
     }
     for ((l, p), r) in &s.regs {
-        let obs = fobs(r.obs.iter().map(|(k, (st, n))| (k, format!("{},{}", fs(st), total(n)))));
         let g = r.generation.as_ref().map_or("-".to_string(), |g| {
             format!("{}/seen{}", fs(&g.stamp), fobs(g.seen.iter().map(|(k, n)| (k, total(n)))))
         });
         out.push(format!(
-            "reg {} {p} {} {} obs{obs} gen={g} soi={}",
+            "reg {} {p} {} {} gen={g} soi={}",
             fs(l),
             fs(&r.stamp),
             fv(&r.value),
@@ -231,12 +239,17 @@ fn digest_lines(s: &MergeState) -> Vec<String> {
     }
     for ((l, p, w, g), sl) in &s.slots {
         out.push(format!(
-            "slot {} {p} {} {} {} {}",
+            "slot {} {p} {} {} {} {} abs={}",
             fs(l),
             fw(w),
             fg(g),
             fs(&sl.stamp),
-            total(&sl.total)
+            total(&sl.total),
+            sl.absorbed.as_ref().map_or("-".to_string(), |(st, n)| format!(
+                "{},{}",
+                fs(st),
+                total(n)
+            ))
         ));
     }
     for (w, h) in &s.vv {
@@ -386,14 +399,24 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
         let m = |k: usize| op[k].as_u64().unwrap() as usize;
         let res: J = match kind {
             "insert" => {
+                let held = slot_in_alive_life(&ms[m(1)].w);
                 let r = ms[m(1)].w.insert(&top_fields(&op[2]), op[3].as_u64().unwrap());
+                assert!(
+                    r.is_none() || !held,
+                    "an insert was accepted over a slot of an alive life"
+                );
                 opt_stamp_j(ms[m(1)].logged(r, &mut log))
             }
             "upsert" => {
+                let held = slot_in_alive_life(&ms[m(1)].w);
                 let r = ms[m(1)].w.upsert_inc(
                     &pth(op[2].as_str().unwrap()),
                     op[3].as_i64().unwrap(),
                     op[4].as_u64().unwrap(),
+                );
+                assert!(
+                    r.is_none() || !held,
+                    "an upsert was accepted over a slot of an alive life"
                 );
                 opt_stamp_j(ms[m(1)].logged(r, &mut log))
             }

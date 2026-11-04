@@ -1001,9 +1001,9 @@ pub(super) fn golden_delete() -> MergeState {
 }
 
 /// A base written after counted increments: A inserts {x, y}; B, concurrently, adds 7 to y; A adds 3
-/// to x and then sets x to 20 (the register's `obs` holds x's slot with its stamp and total), adds
+/// to x and then sets x to 20 (x's slot holds the absorbed pair: its stamp and total at that base), adds
 /// 2 to y and then sets y to a string (the generation it starts has `seen` = A's y slot, and B's 7
-/// is the unseen part, hidden). Pins the layout of `Reg::obs` and `Gen::seen`.
+/// is the unseen part, hidden). Pins the absorbed pair of a slot and `Gen::seen`.
 pub(super) fn golden_obs() -> MergeState {
     let o = opts();
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
@@ -1019,9 +1019,9 @@ pub(super) fn golden_obs() -> MergeState {
         obs.receive_entry(&e);
     }
     let st = obs.w.state.clone();
-    let rx = &st.regs[&(i0, p("x"))];
-    assert_eq!(rx.obs.len(), 1, "x's base observed its one slot");
-    let (_, t) = rx.obs.values().next().unwrap();
+    let xs: Vec<_> = st.slots.iter().filter(|(k, _)| k.1 == p("x")).collect();
+    assert_eq!(xs.len(), 1, "x has its one slot");
+    let (_, t) = xs[0].1.absorbed.as_ref().expect("x's base absorbed its one slot");
     assert_eq!(*t, Num::from(3));
     let gy = st.regs[&(i0, p("y"))].generation.as_ref().unwrap();
     assert_eq!(gy.seen.values().copied().collect::<Vec<_>>(), vec![Num::from(2)]);
@@ -1301,15 +1301,20 @@ fn zero_sum_counter_survives_the_join() {
 }
 
 #[test]
-fn register_obs_keeps_the_slot_stamp() {
-    // A base that observed a slot at total T, after which the slot moved and came back to T,
+fn a_slot_keeps_the_stamp_of_its_absorbed_pair() {
+    // A base that absorbed a slot at total T, after which the slot moved and came back to T,
     // still counts the field present, and the figure is T - T = 0 on top of the base.
     let mut w = Writer::new(wid('A', 0), opts());
     w.insert(&fl(&[("x", i(10))]), 0).unwrap();
     w.write_inc(&p("x"), 3, 0).unwrap();
     w.write_set(&p("x"), i(20), 0).unwrap();
     let r = w.state.regs.values().find(|r| r.value == i(20)).unwrap();
-    assert!(!r.obs.is_empty() && r.obs.values().all(|(st, t)| *t == Num::from(3) && *st < r.stamp));
+    assert!(
+        w.state.slots.values().all(|s| s
+            .absorbed
+            .as_ref()
+            .is_some_and(|(st, t)| *t == Num::from(3) && *st < r.stamp))
+    );
     w.write_inc(&p("x"), 4, 0).unwrap();
     w.write_inc(&p("x"), -4, 0).unwrap();
     assert_eq!(w.visible(), doc(&[("x", i(20))]));
@@ -1407,7 +1412,10 @@ fn state_with_big_slots(total: i128) -> (MergeState, MStamp) {
     let life = *st.lives.keys().next().unwrap();
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     for c in ['B', 'C'] {
-        st.slots.insert((life, p("x"), wid(c, 0), None), Slot { stamp, total: total.into() });
+        st.slots.insert(
+            (life, p("x"), wid(c, 0), None),
+            Slot { stamp, total: total.into(), absorbed: None },
+        );
     }
     st.vv.insert(wid('B', 0), h(1)); // B wrote the slots
     (st, life)
@@ -1429,7 +1437,7 @@ fn decode_refuses_totals_past_the_bound() {
     assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
     let (st, _) = state_with_big_slots(-MAX_TOTAL - 1);
     assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
-    // The same copies elsewhere: a register's `obs`, a generation's `seen`, a loss record.
+    // The same copies elsewhere: a slot's absorbed total, a generation's `seen`, a loss record.
     let o = opts();
     let mut w = Writer::new(wid('A', 0), o.clone());
     w.insert(&fl(&[("x", i(1))]), 0).unwrap();
@@ -1440,22 +1448,28 @@ fn decode_refuses_totals_past_the_bound() {
         LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
         LossValue::Total(5.into()),
     );
-    assert_eq!(MergeState::decode(&good.encode()).unwrap(), good.without_ords());
+    // (a slot's absorbed pair has no version 1 spelling: the compact form carries it)
+    assert_eq!(MergeState::decode_compact(&good.encode_compact()).unwrap(), good);
     let big = MAX_TOTAL + 1;
-    let mut bad = good.clone();
-    for r in bad.regs.values_mut() {
-        for v in r.obs.values_mut() {
-            v.1 = big.into();
-        }
-    }
     let mut hit = 0;
     let mut try_state = |st: &MergeState| {
         hit += 1;
-        assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
+        if st.v1_can_hold() {
+            assert_eq!(MergeState::decode(&st.encode()), Err(DecodeError::TotalOutOfRange));
+        }
+        assert_eq!(
+            MergeState::decode_compact(&st.encode_compact()),
+            Err(DecodeError::TotalOutOfRange)
+        );
     };
-    if bad.regs.values().any(|r| !r.obs.is_empty()) {
-        try_state(&bad);
+    let mut bad = good.clone();
+    for s in bad.slots.values_mut() {
+        if let Some(a) = s.absorbed.as_mut() {
+            a.1 = big.into();
+        }
     }
+    assert!(bad.slots.values().any(|s| s.absorbed.is_some()), "the base absorbed the slot");
+    try_state(&bad);
     let mut bad = good.clone();
     for r in bad.regs.values_mut() {
         if let Some(g) = r.generation.as_mut() {
@@ -1497,11 +1511,15 @@ fn write_inc_refuses_a_slot_past_the_total_bound() {
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     w.state.slots.insert(
         (life, p("x"), wid('A', 0), None),
-        Slot { stamp: w.state.slots.values().next().unwrap().stamp, total: (MAX_TOTAL - 2).into() },
+        Slot {
+            stamp: w.state.slots.values().next().unwrap().stamp,
+            total: (MAX_TOTAL - 2).into(),
+            absorbed: None,
+        },
     );
     w.state.slots.insert(
         (life, p("x"), wid('B', 0), None),
-        Slot { stamp, total: (-(MAX_TOTAL - 2)).into() },
+        Slot { stamp, total: (-(MAX_TOTAL - 2)).into(), absorbed: None },
     );
     assert_eq!(w.visible().unwrap()[&p("x")], i(0));
     let clock = w.clock;
@@ -1577,7 +1595,10 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
     let stamp = MStamp { hlc: h(1), writer: wid('B', 0) };
     for k in 0..64u8 {
         let wr = WriterId { node: nid((b'a' + k) as char), epoch: Epoch::from_u64(0) };
-        st.slots.insert((life, p("x"), wr, None), Slot { stamp, total: MAX_TOTAL.into() });
+        st.slots.insert(
+            (life, p("x"), wr, None),
+            Slot { stamp, total: MAX_TOTAL.into(), absorbed: None },
+        );
     }
     st.vv.insert(wid('B', 0), h(1)); // B wrote the slots
     assert_eq!(st.value(&p("x"), &o), Some(i(i64::MAX)));
@@ -1603,7 +1624,6 @@ fn max_total_is_far_beyond_reach_and_sums_for_64_writers() {
         Reg {
             stamp: gen_stamp,
             value: s("t"),
-            obs: BTreeMap::new(),
             generation: Some(Gen::start(gen_stamp, &BTreeMap::new(), BTreeMap::new())),
             soi: false,
         },
@@ -1649,7 +1669,7 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
     for c in ['B', 'C'] {
         st.slots.insert(
             (life, p("x"), wid(c, 0), None),
-            Slot { stamp: slot_stamp, total: i128::MAX.into() },
+            Slot { stamp: slot_stamp, total: i128::MAX.into(), absorbed: None },
         );
     }
     let mut g = Gen::start(gen_stamp, &BTreeMap::new(), BTreeMap::new());
@@ -1657,13 +1677,7 @@ fn hidden_figure_adds_with_saturation_on_a_hand_built_state() {
     g.seen.insert((life, wid('B', 0), None), (-1).into());
     st.regs.insert(
         (life, p("x")),
-        Reg {
-            stamp: gen_stamp,
-            value: s("t"),
-            obs: BTreeMap::new(),
-            generation: Some(g),
-            soi: false,
-        },
+        Reg { stamp: gen_stamp, value: s("t"), generation: Some(g), soi: false },
     );
     assert_eq!(st.hidden(&p("x"), &o), i128::MAX);
     assert_eq!(st.hidden_all(&o), BTreeMap::from([(p("x"), i128::MAX)]));
@@ -2378,10 +2392,10 @@ pub(super) fn vv_does_not_cover() -> MergeState {
     let life = at(1);
     let mut st = MergeState::default();
     st.lives.insert(life, upsert_life());
-    st.regs.insert((life, p("a")), Reg::new(at(10), i(1), BTreeMap::new(), None, false).unwrap());
+    st.regs.insert((life, p("a")), Reg::new(at(10), i(1), None, false).unwrap());
     st.regs.insert(
         (life, Path::new(["a", "b"]).unwrap()),
-        Reg::new(at(11), i(2), BTreeMap::new(), None, false).unwrap(),
+        Reg::new(at(11), i(2), None, false).unwrap(),
     );
     st
 }
@@ -2428,17 +2442,15 @@ fn decode_refuses_a_version_vector_that_does_not_cover_a_stamp() {
             st.deletes.insert(MStamp { hlc: h(9), writer: wid('B', 0) }, BTreeMap::new());
         }),
         ("a register", |st, life, _| {
-            let r = Reg::new(
-                MStamp { hlc: h(9), writer: life.writer },
-                i(1),
-                BTreeMap::new(),
-                None,
-                false,
-            );
+            let r = Reg::new(MStamp { hlc: h(9), writer: life.writer }, i(1), None, false);
             st.regs.insert((life, Path::flat("x").unwrap()), r.unwrap());
         }),
         ("a slot", |st, life, _| {
-            let slot = Slot { stamp: MStamp { hlc: h(9), writer: life.writer }, total: 1.into() };
+            let slot = Slot {
+                stamp: MStamp { hlc: h(9), writer: life.writer },
+                total: 1.into(),
+                absorbed: None,
+            };
             st.slots.insert((life, Path::flat("x").unwrap(), life.writer, None), slot);
         }),
     ];

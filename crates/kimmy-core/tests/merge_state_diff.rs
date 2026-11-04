@@ -55,6 +55,15 @@ use kimmy_core::merge_state::{
 };
 use serde_json::{Value as J, json};
 
+/// The precondition under which a creation base folds nothing (the counter cell): a creation (an insert or
+/// an upsert) is refused while any life is alive, so at an accepted creation the writer holds no counter
+/// slot in an alive life. Asserted by the harness at every accepted creation; there is no assert in the
+/// product code.
+fn slot_in_alive_life(w: &Writer) -> bool {
+    let alive = w.alive();
+    w.state.slots.keys().any(|k| alive.contains(&k.0))
+}
+
 fn wid(c: char, e: u64) -> WriterId {
     WriterId { node: NodeId::from_bytes([c as u8; 16]), epoch: Epoch::from_u64(e) }
 }
@@ -223,15 +232,25 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
             "insert" => {
                 let m = op[1].as_u64().unwrap() as usize;
                 let f = fields(&op[2]);
+                let held = slot_in_alive_life(&ms[m].w);
                 let r = ms[m].w.insert(&f, op[3].as_u64().unwrap());
+                assert!(
+                    r.is_none() || !held,
+                    "an insert was accepted over a slot of an alive life"
+                );
                 opt_stamp_j(ms[m].logged(r, &mut log))
             }
             "upsert" => {
                 let m = op[1].as_u64().unwrap() as usize;
+                let held = slot_in_alive_life(&ms[m].w);
                 let r = ms[m].w.upsert_inc(
                     &pth(op[2].as_str().unwrap()),
                     op[3].as_i64().unwrap(),
                     op[4].as_u64().unwrap(),
+                );
+                assert!(
+                    r.is_none() || !held,
+                    "an upsert was accepted over a slot of an alive life"
                 );
                 opt_stamp_j(ms[m].logged(r, &mut log))
             }
@@ -242,7 +261,12 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
                 let inc_path = pth(op[3].as_str().unwrap());
                 let sk = op[6].as_u64().unwrap();
                 // as the harness does it: the creation, logged, then the increment, logged
+                let held = slot_in_alive_life(&ms[m].w);
                 let created = ms[m].w.upsert_soi_create(&f, &inc_path, &s, sk);
+                assert!(
+                    created.is_none() || !held,
+                    "an upsert creation was accepted over a slot of an alive life"
+                );
                 match ms[m].logged(created, &mut log) {
                     None => J::Null,
                     Some(s1) => {

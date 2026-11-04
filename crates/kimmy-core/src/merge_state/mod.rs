@@ -69,6 +69,8 @@ mod work;
 mod writer;
 
 #[cfg(test)]
+mod cell_tests;
+#[cfg(test)]
 mod compact_tests;
 #[cfg(test)]
 mod counter_tests;
@@ -158,13 +160,7 @@ const _: () = {
     let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_encode;
     let _: fn(&MergeState) -> bool = MergeState::v1_can_hold;
     let _: fn(&MergeState) -> Result<[u8; 16], V1CannotHold> = MergeState::try_state_hash;
-    let _: fn(
-        MStamp,
-        Value,
-        BTreeMap<ObsKey, (MStamp, Num)>,
-        Option<Gen>,
-        bool,
-    ) -> Result<Reg, InvalidValue> = Reg::new;
+    let _: fn(MStamp, Value, Option<Gen>, bool) -> Result<Reg, InvalidValue> = Reg::new;
     let _: fn(&Value) -> Result<(), InvalidValue> = Value::check_register;
     let _: fn(&Value) -> Result<(), InvalidValue> = Value::check_input;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::compact_bytes;

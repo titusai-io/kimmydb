@@ -283,7 +283,7 @@ impl Value {
 
     /// The model's `numeric()`, extended: `None` (`Unset`) or an `Int32`, `Int64` or
     /// `Decimal128`. A write of one of these is a base of the generation it finds, and keeps the
-    /// increments it had seen out of the count (the `obs` mechanism); any other value starts a
+    /// increments it had seen out of the count (the `absorbed` pair of a slot); any other value starts a
     /// generation. A `Double` is NOT here: doubles are not counters (Q6), a `$set` of a double
     /// over a counter is a hard overwrite like a string, and `$inc` of a double base is a
     /// register write.

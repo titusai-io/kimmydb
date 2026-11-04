@@ -144,18 +144,21 @@ pub(super) fn state(j: &J) -> MergeState {
                 .collect(),
         );
     }
+    // The model's registers carry the `obs` map of the stage-A format (r[4]); the Rust cell keeps what a
+    // base write had counted as the ABSORBED pair of each slot instead: the highest `(stamp, total)` any
+    // register observed of it (the model with ABSORBED on folds every `obs` into `absorbed`).
+    type SlotKey = (MStamp, Path, WriterId, Option<MStamp>);
+    let mut absorbed: BTreeMap<SlotKey, (MStamp, Num)> = BTreeMap::new();
     for r in j["regs"].as_array().unwrap() {
-        let obs = r[4]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| {
-                (
-                    obs_key(&J::Array(e.as_array().unwrap()[..3].to_vec())),
-                    (stamp(&e[3]), num(&e[4])),
-                )
-            })
-            .collect();
+        let p = path(&r[1]);
+        for e in r[4].as_array().unwrap() {
+            let (l, w, g) = obs_key(&J::Array(e.as_array().unwrap()[..3].to_vec()));
+            let seen = (stamp(&e[3]), num(&e[4]));
+            let slot = absorbed.entry((l, p.clone(), w, g)).or_insert(seen);
+            if seen.0 > slot.0 {
+                *slot = seen;
+            }
+        }
         let generation = (!r[5].is_null()).then(|| {
             let g = &r[5];
             let vv = g["vv"]
@@ -173,14 +176,13 @@ pub(super) fn state(j: &J) -> MergeState {
             Gen::start(stamp(&g["stamp"]), &vv, seen)
         });
         let reg =
-            Reg::new(stamp(&r[2]), value(&r[3]), obs, generation, r[6].as_bool().unwrap()).unwrap();
+            Reg::new(stamp(&r[2]), value(&r[3]), generation, r[6].as_bool().unwrap()).unwrap();
         s.regs.insert((stamp(&r[0]), path(&r[1])), reg);
     }
     for sl in j["slots"].as_array().unwrap() {
-        s.slots.insert(
-            (stamp(&sl[0]), path(&sl[1]), writer(&sl[2]), stamp_opt(&sl[3])),
-            Slot { stamp: stamp(&sl[4]), total: num(&sl[5]) },
-        );
+        let key = (stamp(&sl[0]), path(&sl[1]), writer(&sl[2]), stamp_opt(&sl[3]));
+        let absorbed = absorbed.get(&key).copied();
+        s.slots.insert(key, Slot { stamp: stamp(&sl[4]), total: num(&sl[5]), absorbed });
     }
     s.vv = j["vv"]
         .as_array()
@@ -1566,7 +1568,7 @@ fn two_fields(fields: &[(&str, u64, Option<FieldOrd>)]) -> (MergeState, JoinOpti
     s.vv.insert(a, Hlc::new(99, 0));
     for (name, hlc, x) in fields {
         let p = Path::flat(name).unwrap();
-        let reg = Reg::new(at(*hlc, b'A'), Value::Int64(1), BTreeMap::new(), None, false).unwrap();
+        let reg = Reg::new(at(*hlc, b'A'), Value::Int64(1), None, false).unwrap();
         s.regs.insert((life, p.clone()), reg);
         if let Some(x) = x {
             s.ords.insert((life, OrdAt::Field(p)), x.clone());
@@ -1796,7 +1798,7 @@ fn survivor_chain(depth: usize) -> MergeState {
     s.vv.insert(a, Hlc::new(20, 0));
     for i in 1..=depth {
         let p = Path::new((1..=i).map(|k| format!("n{k}"))).unwrap();
-        let reg = Reg::new(at(2, b'A'), Value::Int64(5), BTreeMap::new(), None, false).unwrap();
+        let reg = Reg::new(at(2, b'A'), Value::Int64(5), None, false).unwrap();
         s.regs.insert((life, p.clone()), reg);
         s.ords.insert(
             (life, OrdAt::Field(p)),
@@ -2021,10 +2023,10 @@ fn the_root_and_a_top_level_field_named_empty_are_distinct_keys() {
     let mut doc = ab.clone();
     for (p, hlc, who) in [(empty.clone(), 7u64, b'B'), (Path::flat("x").unwrap(), 5, b'A')] {
         let v = if p == empty { Value::Map } else { Value::Int64(1) };
-        let reg = Reg::new(at(hlc, who), v, BTreeMap::new(), None, false).unwrap();
+        let reg = Reg::new(at(hlc, who), v, None, false).unwrap();
         doc.regs.insert((life, p), reg);
     }
-    let reg = Reg::new(at(7, b'B'), Value::Int64(2), BTreeMap::new(), None, false).unwrap();
+    let reg = Reg::new(at(7, b'B'), Value::Int64(2), None, false).unwrap();
     doc.regs.insert((life, Path::new(["", "c"]).unwrap()), reg);
     let names: Vec<String> =
         doc.ordered_document(&o).unwrap().iter().map(|(n, _)| n.clone()).collect();
@@ -2039,7 +2041,7 @@ fn wide_under_floors(n: usize) -> MergeState {
     s.vv.insert(a, Hlc::new(20, 0));
     for i in 0..n {
         let p = Path::flat(&format!("f{i:06}")).unwrap();
-        let reg = Reg::new(at(2, b'A'), Value::Int64(1), BTreeMap::new(), None, false).unwrap();
+        let reg = Reg::new(at(2, b'A'), Value::Int64(1), None, false).unwrap();
         s.regs.insert((life, p.clone()), reg);
         s.ords.insert(
             (life, OrdAt::Field(p)),
@@ -2065,15 +2067,17 @@ fn maps_under_floors(n: usize) -> MergeState {
     for i in 0..n / 4 {
         let life = lives[i % 2];
         let m = Path::flat(&format!("m{i:06}")).unwrap();
-        let reg = |v| Reg::new(at(3, b'A'), v, BTreeMap::new(), None, false).unwrap();
+        let reg = |v| Reg::new(at(3, b'A'), v, None, false).unwrap();
         s.regs.insert((life, m.clone()), reg(Value::Map));
         for (j, kid) in ["x", "y", "z"].iter().enumerate() {
             let q = m.child(kid).unwrap();
             if j < 2 {
                 s.regs.insert((life, q), reg(Value::Int64(1)));
             } else {
-                s.slots
-                    .insert((life, q, a, None), Slot { stamp: at(3, b'A'), total: Num::Int64(5) });
+                s.slots.insert(
+                    (life, q, a, None),
+                    Slot { stamp: at(3, b'A'), total: Num::Int64(5), absorbed: None },
+                );
             }
         }
         s.ords.insert(

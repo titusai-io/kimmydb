@@ -1,12 +1,12 @@
 //! The compact canonical form, `QMS` version 2.
 //!
 //! [`MergeState::canonical_bytes`] and [`MergeState::encode`] (version 1, `codec.rs`) write a full
-//! 44-byte stamp for every life and every cell, `u64` lengths, and a generation and an `obs` map
-//! in each cell: 5 to 9 times the size the design assumes. This is the compact form that
+//! 44-byte stamp for every life and every cell, `u64` lengths, and a generation in each cell:
+//! 5 to 9 times the size the design assumes. This is the compact form that
 //! replaces them. NOTHING STORES OR HASHES IT YET: the version 1 form, its golden vectors and
 //! [`MergeState::state_hash`] are unchanged, and the switch (one format for the hash and for
-//! storage, the goldens re-pinned) waits on the rulings for the counter cell layout and the
-//! order state. This module is the skeleton those extend.
+//! storage, the goldens re-pinned) waits on the goldens being pinned once, with the counter cell and
+//! the order state.
 //!
 //! The state hash, the stored form and the wire form will all be [`MergeState::compact_bytes`]
 //! (the body) and, with a header, [`MergeState::encode_compact`]: the 3 bytes `QMS`, ONE format
@@ -16,9 +16,12 @@
 //! # Primitives
 //!
 //! * a count or length is a LEB128 varint of a `u64`, written in its shortest form;
-//! * a counter total is the zigzag of the `i128` as a LEB128 varint of a `u128`, shortest form,
-//!   for an `Int64` amount; any other type is the provisional escape `ESCAPE` of this module
-//!   (`Int32` the zigzag after it, `Decimal128` its 16 bytes);
+//! * a counter total is a PAYLOAD: the zigzag of the `i128` as a LEB128 varint of a `u128`, shortest
+//!   form, for an `Int64` or an `Int32` amount, the 16 bytes for a `Decimal128`. Its TYPE is
+//!   spelled beside it: in the flag byte of a slot (section 7), and as a leading TYPE BYTE (0 `Int64`,
+//!   1 `Int32`, 2 `Decimal128`, any other byte refused) on every total that has no flag byte, a
+//!   generation's `seen` entry and the total of a loss record. A typed total is the type byte and
+//!   its payload;
 //! * a string is a length and its UTF-8 bytes; a [`Path`] is its segment count (at least 1) and
 //!   its segments as strings;
 //! * an `Int32`, `Int64` and `Date` and the parts of a `Timestamp` are fixed width big-endian, a
@@ -44,8 +47,8 @@
 //! 1. the **writer table**: a count, then every [`WriterId`] the state mentions, in strictly
 //!    increasing order;
 //! 2. the **life table**: a count, then every stamp the state uses as a life (a key of `lives`,
-//!    a member of `dead`, the life of a register or a counter slot, the life in an `obs`
-//!    or `seen` key), as stamps, in strictly increasing order. A life is written as a varint
+//!    a member of `dead`, the life of a register or a counter slot, the life in a `seen`
+//!    key), as stamps, in strictly increasing order. A life is written as a varint
 //!    index into this table everywhere else, which is what makes a cell cheap: its life is one
 //!    byte, not 44;
 //! 3. `lives`: a count; each is a life index, the count and the full stamps of the deletes its
@@ -54,12 +57,17 @@
 //! 4. `dead`: a count and life indexes;
 //! 5. `deletes`: a count; each a full stamp and a version vector;
 //! 6. `regs` (the cells): a count; each a life index, a path, a flags byte, the register
-//!    stamp unless it is the life's, the value, the `obs` map, and the generation: its stamp
-//!    unless it is the register's, and its `seen` totals. Flags: bits 0 and 1 are the
+//!    stamp unless it is the life's, the value, and the generation: its stamp
+//!    unless it is the register's, and its `seen` totals (each a key and a typed total). There is
+//!    no `obs` map: what a base write had counted of a slot is the slot's absorbed pair (section 7). Flags: bits 0 and 1 are the
 //!    generation (0 none, 1 started by this register's own stamp, 2 started by another stamp),
 //!    bit 2 is `soi`, bit 3 says the register stamp is the life's, and the other bits are 0;
 //! 7. `slots`: a count; each a life index, a path, a writer index, a generation byte (0 none,
-//!    1 and then its stamp), the stamp, and the total;
+//!    1 and then its stamp), the stamp, a FLAG BYTE, the total's payload and, when bit 0 of the flag
+//!    byte is set, the ABSORBED pair: a stamp and the absorbed total's payload. The flag byte: bit 0
+//!    an absorbed pair is present; bits 1 and 2 the type of the total (0 `Int64`, 1 `Int32`,
+//!    2 `Decimal128`); bits 3 and 4 the type of the absorbed total (0 when there is no pair).
+//!    Type 3, a type bit with no pair, and any other bit set are refused (`BadTag`);
 //! 8. the **version vector**: a count; each a writer index and an HLC;
 //! 9. `losses`: a count; each a kind byte, an "about" byte (0 the whole document, 1 a field and
 //!    then its path), a stamp and the lost value. The whole document is its own tag, not the
@@ -85,8 +93,8 @@
 //!     * a flags byte (bit 0: there is a `last`, bit 1: there is a `lvl`; no other bit), then
 //!       the `last` as a stamp and a varint position, then the `lvl` as a stamp.
 //!
-//! `obs` keys are a life index, a writer index and a generation as in `slots`; a register's
-//! `obs` entry adds the slot's stamp and total, a generation's `seen` entry the total.
+//! A `seen` key is a life index, a writer index and a generation as in `slots`; its entry is a typed
+//! total.
 //!
 //! # Section 10 always carries its count
 //!
@@ -114,13 +122,16 @@
 //! * **Order state** (the `FieldOrd` of option A: floors, per-writer firsts, last, level floor):
 //!   section 10, above. Its stamps use the same stamp and writer index primitives. The hash of a
 //!   state that carries one is NOT pinned by any golden: they wait for the counter cell.
-//! * **Counter cell** (the rulings on the `absorbed` rule and the cell layout): replaces the
-//!   `obs` map of a register (section 6) and the layout of `slots` (section 7); until then both
-//!   are the version 1 data in compact spelling. PROVISIONAL, from the typed counters (D6): a
-//!   total of any type but `Int64` (an `Int32` or a `Decimal128`) is written behind
-//!   the escape `ESCAPE` (an 18-byte marker varint) because a total has no room for a type;
-//!   every `Int64` total keeps its bytes. When the layout is ruled the type belongs in the slot
-//!   and in the `obs` entry, and the escape goes.
+//! * **Counter cell** (frozen): a slot is its stamp and total and, optionally, the highest
+//!   `(stamp, total)` of that very slot that any base write on the path had held (the ABSORBED pair;
+//!   section 7). A base write folds into the pairs every slot of the path its writer holds in an
+//!   alive life, of any generation. The read side counts only what a slot gained since its pair, and
+//!   the field is present when the slot moved since the pair's stamp (B1). The pair is keyed by the
+//!   slot, joined by the higher absorbed stamp, and dropped with the slot's life. It replaces the
+//!   per-register `obs` map. A state that has a pair has no version 1 spelling (`V1CannotHold`).
+//!   A decoded pair is refused above its slot (`AbsorbedAboveSlot`) and, at the slot's own stamp,
+//!   with another total (`AbsorbedTotalMismatch`). The provisional `ESCAPE` of the typed counters is
+//!   gone: the type has a place of its own in the flag byte and the type byte.
 //! * **Map markers and type clashes**: tag 5 (the explicit marker) is in use, with loss kinds 4
 //!   and 5 (`typeClash`, `arrayClash`); tag 6 (the implicit marker) is reserved for the write
 //!   rule the next model round decides, and nothing writes it.
@@ -149,12 +160,22 @@ use crate::ids::NodeId;
 /// The format version byte of this form: for every state, with or without an order state.
 const VERSION: u8 = 2;
 
-/// The first `u128` a counter total never takes as a zigzag (they stop at `2 * MAX_TOTAL`, below
-/// 2^121): `ESCAPE + 1` introduces an `Int32` total, `+ 2` a `Decimal128`.
-/// PROVISIONAL: it keeps the bytes of every `Int64` total exactly as they were, at 18 bytes
-/// for the marker, until the counter cell layout is ruled (the `absorbed` rule) and the type
-/// gets a place of its own in the slot and the `obs` entry.
-const ESCAPE: u128 = 1 << 121;
+/// The type code of a counter amount, in the type byte of a typed total and in the slot flag
+/// byte: 0 `Int64`, 1 `Int32`, 2 `Decimal128`. 3 is not a type.
+fn num_type(n: &Num) -> u8 {
+    match n {
+        Num::Int64(_) => 0,
+        Num::Int32(_) => 1,
+        Num::Decimal128(_) => 2,
+    }
+}
+
+/// The flag byte of a counter slot (section 7): bit 0 an absorbed pair follows the total, bits 1
+/// and 2 the type of the total, bits 3 and 4 the type of the absorbed total (0 when there is no
+/// pair). The other bits are 0.
+const SLOT_ABSORBED: u8 = 1;
+const SLOT_TOTAL_TYPE_SHIFT: u8 = 1;
+const SLOT_ABSORBED_TYPE_SHIFT: u8 = 3;
 
 // ---- writing ---------------------------------------------------------------
 
@@ -198,20 +219,18 @@ impl W {
     fn i64(&mut self, v: i64) {
         self.out.extend_from_slice(&v.to_be_bytes());
     }
-    /// A counter total: for an `Int64` amount the zigzag, then a varint; any other type is
-    /// the escape [`ESCAPE`] plus the type, then its payload (see [`Num`] and `# Primitives`).
+    /// A typed counter total: the type byte (see [`num_type`]), then the payload.
     fn total(&mut self, n: &Num) {
+        self.u8(num_type(n));
+        self.num_payload(n);
+    }
+    /// The payload of a counter total: the zigzag of an integer as a varint, the 16 bytes of a
+    /// `Decimal128`. The type is spelled by the caller.
+    fn num_payload(&mut self, n: &Num) {
         let zigzag = |w: &mut Self, v: i128| w.varint(((v << 1) ^ (v >> 127)) as u128);
         match n {
-            Num::Int64(v) => zigzag(self, *v),
-            Num::Int32(v) => {
-                self.varint(ESCAPE | 1);
-                zigzag(self, *v);
-            }
-            Num::Decimal128(b) => {
-                self.varint(ESCAPE | 2);
-                self.out.extend_from_slice(b);
-            }
+            Num::Int64(v) | Num::Int32(v) => zigzag(self, *v),
+            Num::Decimal128(b) => self.out.extend_from_slice(b),
         }
     }
     fn str(&mut self, s: &str) {
@@ -389,14 +408,6 @@ impl W {
             self.total(t);
         }
     }
-    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, Num)>) {
-        self.len(m.len());
-        for (k, (s, t)) in m {
-            self.obs_key(k);
-            self.stamp(s);
-            self.total(t);
-        }
-    }
     fn loss_key(&mut self, k: &LossKey) {
         self.u8(match k.kind {
             LossKind::Clash => 0,
@@ -489,7 +500,6 @@ impl MergeState {
                 w.stamp(&r.stamp);
             }
             w.value(&r.value);
-            w.obs_stamped(&r.obs);
             if let Some(g) = &r.generation {
                 if flags & FLAG_GEN_MASK == FLAG_GEN_OTHER {
                     w.stamp(&g.stamp);
@@ -504,7 +514,16 @@ impl MergeState {
             w.wid(wr);
             w.opt_stamp(g);
             w.stamp(&s.stamp);
-            w.total(&s.total);
+            let mut flags = num_type(&s.total) << SLOT_TOTAL_TYPE_SHIFT;
+            if let Some((_, a)) = &s.absorbed {
+                flags |= SLOT_ABSORBED | num_type(a) << SLOT_ABSORBED_TYPE_SHIFT;
+            }
+            w.u8(flags);
+            w.num_payload(&s.total);
+            if let Some((st, a)) = &s.absorbed {
+                w.stamp(st);
+                w.num_payload(a);
+            }
         }
         w.vv(&self.vv);
         w.len(self.losses.len());
@@ -630,7 +649,6 @@ impl MergeState {
                 st
             };
             let value = r.value()?;
-            let obs = r.obs_stamped()?;
             let generation = match flags & FLAG_GEN_MASK {
                 0 => None,
                 g => {
@@ -647,7 +665,7 @@ impl MergeState {
                 }
             };
             let soi = flags & FLAG_SOI != 0;
-            put(&mut s.regs, (l, p), Reg { stamp, value, obs, generation, soi })?;
+            put(&mut s.regs, (l, p), Reg { stamp, value, generation, soi })?;
         }
         for _ in 0..r.len()? {
             let l = r.life()?;
@@ -655,8 +673,22 @@ impl MergeState {
             let wr = r.wid()?;
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
-            let total = r.total()?;
-            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total })?;
+            let flags = r.u8()?;
+            let (ty, aty) =
+                ((flags >> SLOT_TOTAL_TYPE_SHIFT) & 3, (flags >> SLOT_ABSORBED_TYPE_SHIFT) & 3);
+            // no stray bit, no type 3, and no absorbed type without an absorbed pair
+            if flags & 0xe0 != 0 || ty == 3 || aty == 3 || (flags & SLOT_ABSORBED == 0 && aty != 0)
+            {
+                return Err(DecodeError::BadTag(flags));
+            }
+            let total = r.num_payload(ty)?;
+            let absorbed = if flags & SLOT_ABSORBED != 0 {
+                let st = r.stamp()?;
+                Some((st, r.num_payload(aty)?))
+            } else {
+                None
+            };
+            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed })?;
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
@@ -748,20 +780,20 @@ impl R<'_> {
         }
         Ok(t)
     }
-    /// A counter total, as `W::total` writes it.
+    /// A typed counter total, as `W::total` writes it: the type byte, then the payload.
     fn total(&mut self) -> Result<Num, DecodeError> {
-        let z = self.varint(19)?;
-        if z < ESCAPE {
-            return Ok(Num::Int64(Self::zigzag(z)?));
+        let t = self.u8()?;
+        if t > 2 {
+            return Err(DecodeError::BadTag(t));
         }
-        match z - ESCAPE {
-            1 => {
-                let z = self.varint(19)?;
-                Ok(Num::Int32(Self::zigzag(z)?))
-            }
-            2 => Ok(Num::Decimal128(self.arr()?)),
-            // not an escape: a zigzag past the bound
-            _ => Err(DecodeError::TotalOutOfRange),
+        self.num_payload(t)
+    }
+    /// The payload of a counter total of the type code `ty` (0, 1 or 2): see `W::num_payload`.
+    fn num_payload(&mut self, ty: u8) -> Result<Num, DecodeError> {
+        match ty {
+            0 => Ok(Num::Int64(Self::zigzag(self.varint(19)?)?)),
+            1 => Ok(Num::Int32(Self::zigzag(self.varint(19)?)?)),
+            _ => Ok(Num::Decimal128(self.arr()?)),
         }
     }
     fn str(&mut self) -> Result<String, DecodeError> {
@@ -966,15 +998,6 @@ impl R<'_> {
         for _ in 0..self.len()? {
             let k = self.obs_key()?;
             put(&mut m, k, self.total()?)?;
-        }
-        Ok(m)
-    }
-    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, Num)>, DecodeError> {
-        let mut m = BTreeMap::new();
-        for _ in 0..self.len()? {
-            let k = self.obs_key()?;
-            let s = self.stamp()?;
-            put(&mut m, k, (s, self.total()?))?;
         }
         Ok(m)
     }

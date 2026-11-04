@@ -1079,13 +1079,13 @@ mod frozen {
                 },
                 _ => None,
             };
-            // What each slot gained since the base observed it. B1: the field is present when the
-            // slot moved since the base saw it, even if its increments net to 0 (a counter back at
-            // 0 is still there).
+            // What each slot gained since a base write absorbed it. B1: the field is present when
+            // the slot moved since its absorbed stamp, even if its increments net to 0 (a counter
+            // back at 0 is still there).
             let mut cut = None;
             let mut terms: Vec<(MStamp, ObsKey, Num)> = Vec::new();
             for (k, s) in self.frozen_counted_in(p, al, win, o) {
-                let ob = win.and_then(|w| w.obs.get(&k));
+                let ob = s.absorbed.as_ref();
                 let d = ob.map_or(s.total, |x| {
                     if o.no_decimal_saturation() {
                         s.total.sub(&x.1)

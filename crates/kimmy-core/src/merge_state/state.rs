@@ -74,14 +74,13 @@ fn mutant_vv(_: &Vv) -> Vv {
     Vv::new()
 }
 
-/// A register cell: higher stamp wins. `obs` is what the writer had counted: for each
-/// counted slot the slot's stamp and total at that time (the stamp tells a slot that has
-/// not moved since from one that moved and came back to the same total). `generation` the generation of this base, `soi` marks `$setOnInsert` creation cells.
+/// A register cell: higher stamp wins. `generation` the generation of this base, `soi` marks
+/// `$setOnInsert` creation cells. What a base write had counted of each slot is not kept here:
+/// it is the slot's `absorbed` pair ([`Slot`]).
 #[derive(PartialEq, Debug)]
 pub struct Reg {
     pub stamp: MStamp,
     pub value: Value,
-    pub obs: BTreeMap<ObsKey, (MStamp, Num)>,
     pub generation: Option<Gen>,
     pub soi: bool,
 }
@@ -95,7 +94,6 @@ impl Clone for Reg {
         Reg {
             stamp: self.stamp,
             value: self.value.clone(),
-            obs: self.obs.clone(),
             generation: self.generation.clone(),
             soi: self.soi,
         }
@@ -108,17 +106,16 @@ impl Reg {
     pub fn new(
         stamp: MStamp,
         value: Value,
-        obs: BTreeMap<ObsKey, (MStamp, Num)>,
         generation: Option<Gen>,
         soi: bool,
     ) -> Result<Self, InvalidValue> {
         value.check_register()?;
-        Ok(Reg { stamp, value, obs, generation, soi })
+        Ok(Reg { stamp, value, generation, soi })
     }
 }
 
-/// The largest magnitude of a counter total (a slot's, or a copy of one kept in a register's
-/// `obs`, a generation's `seen` or a loss record): 2^119.
+/// The largest magnitude of a counter total (a slot's, its absorbed one, a generation's `seen`
+/// entry or a loss record's): 2^119.
 ///
 /// A THEORETICAL bound, there only so that the `i128` arithmetic of the read side is exact.
 /// A visible value saturates at the Int64 bound, but the totals underneath are `i128` sums that
@@ -129,8 +126,8 @@ impl Reg {
 /// increments to reach the bound: it is not reachable in practice, and no client sees a refusal
 /// at it.
 ///
-/// It is enforced where totals come from outside, in [`MergeState::decode`] (a slot, an `obs`
-/// or `seen` entry, a loss record) and [`super::Writer::receive_loss`], which refuse a larger
+/// It is enforced where totals come from outside, in [`MergeState::decode`] (a slot, an absorbed
+/// total, a `seen` entry, a loss record) and [`super::Writer::receive_loss`], which refuse a larger
 /// one, so that a member never stores a state it cannot decode; and where they grow, in
 /// [`super::Writer::write_inc`], which refuses an `$inc` that would pass it. The read side also
 /// adds with saturation, as a backstop for a state assembled by hand through the public fields.
@@ -174,10 +171,21 @@ pub struct OverCaps {
 }
 
 /// A counter slot: one writer's running total in one generation.
+///
+/// `absorbed` is the highest `(stamp, total)` of THIS slot that any base write on the path had
+/// held when it wrote (see [`Writer`](super::Writer): at every base write the writer folds every
+/// slot of the path it holds in an alive life, of any generation). The increments up to that
+/// pair are in a base's value, so the read side counts only what the slot gained since
+/// ([`MergeState::value`]); the stamp tells a slot that has not moved since from one that moved
+/// and came back to the same total (the B1 rule: the field is present when the slot moved). It is
+/// keyed by the slot's own key, joined by the higher absorbed stamp, and dropped with the slot's
+/// life. An honest pair is never above the slot (`absorbed.0 <= stamp`) and equals it in the total
+/// when the stamps are equal.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Slot {
     pub stamp: MStamp,
     pub total: Num,
+    pub absorbed: Option<(MStamp, Num)>,
 }
 
 /// The replicated merge state. Grow-only components are joined by union, cells
@@ -236,20 +244,22 @@ impl MergeState {
     /// 1. `dead` is a subset of `lives`. CHECKED here ([`DecodeError::DeadLifeNotListed`]).
     ///    The join keeps the lives of its first argument and adds one of the second only if it
     ///    is not dead in the first, so an unlisted dead life makes `lives` depend on the order.
-    /// 2. The version vector covers every life, delete, register and slot stamp. CHECKED here
-    ///    ([`DecodeError::VersionVectorBehind`]). Clash and `typeClash` detection take two
-    ///    cells as concurrent when the other side's vector does not cover them, so a state
-    ///    that does not cover its own stamps finds a clash with itself (the join is not
-    ///    idempotent), and a writer restored from it could mint a stamp it already used. Loss
+    /// 2. The version vector covers every stamp an honest state's vector covers, loss records
+    ///    excepted. CHECKED here ([`DecodeError::VersionVectorBehind`]). The stamps are: every
+    ///    life, delete, register and slot stamp; the absorbed stamp of a slot; the generation
+    ///    stamp of a slot key; the stamp of a register's generation; the life and generation
+    ///    stamps of a generation's `seen` keys; the delete stamps a life has seen (`Life.seen`);
+    ///    and the entries of the version vector of each delete. Clash and `typeClash` detection
+    ///    take two cells as concurrent when the other side's vector does not cover them, so a
+    ///    state that does not cover its own stamps finds a clash with itself (the join is not
+    ///    idempotent), and a writer restored from it could mint a stamp it already used. The
+    ///    join compares the others only by equality or order, never by coverage, so nothing
+    ///    relies on them; they are checked because an honest vector covers them and a restored
+    ///    writer must mint above them (the D2 deferral, closed with the counter cell). Loss
     ///    stamps are NOT included, and cannot be: a loss entry is received without its write
-    ///    (`Writer::receive_loss` does not move the vector). The stamps of a generation, an
-    ///    `obs` or `seen` key, a slot key's generation, `Life.seen` and the vectors of the
-    ///    deletes ARE covered by the vector in every honest state, but the join compares them
-    ///    only by equality or order, never by coverage, so nothing relies on it and they are
-    ///    left unchecked. (The counter cell is not frozen: when it is, decode checks that the
-    ///    vector covers every stamp an honest state's vector covers, losses excepted.)
-    /// 3. A counter total is at most `MAX_TOTAL` in magnitude (slots, `obs`, `seen`, loss
-    ///    totals): checked by the readers ([`DecodeError::TotalOutOfRange`]).
+    ///    (`Writer::receive_loss` does not move the vector).
+    /// 3. A counter total is at most `MAX_TOTAL` in magnitude (slots, absorbed
+    ///    totals, `seen`, loss totals): checked by the readers ([`DecodeError::TotalOutOfRange`]).
     /// 4. A register holds a legal value (no top-level document, no marker in an array, nesting
     ///    within the BSON depth), a path has at least one segment and no NUL byte, strings are
     ///    UTF-8, every map and set is in strictly increasing key order, and the compact tables
@@ -265,7 +275,7 @@ impl MergeState {
     ///    the clash (the pinned states of the property tests do), but the two cells can also be
     ///    in two states, so a check of one state would be a partial guard; honest stamping
     ///    guarantees it.
-    /// 7. One stamp is one write: what a stamp carries (a register's value, `obs` and
+    /// 7. One stamp is one write: what a stamp carries (a register's value and
     ///    generation, a slot's total, a life's kind, `seen` and field order, a delete's vector,
     ///    a loss record's value) is the same in every state that holds it, since the join keeps
     ///    the first argument's copy. CROSS-STATE: not checkable by `decode`; honest stamping
@@ -360,19 +370,57 @@ impl MergeState {
     /// 23. NOT relied on, so NOT checked: nothing else is assumed of an entry: the join and the read
     ///     are defined for any values, and the laws hold as stated above.
     ///
+    /// THE ABSORBED PAIR of a slot (the counter cell). A slot is `(stamp, total)` and an optional
+    /// `absorbed` `(stamp, total)`: the highest state of this very slot that a base write had
+    /// held. Two clauses one state can show:
+    ///
+    /// 24. The absorbed stamp is not above the slot's ([`DecodeError::AbsorbedAboveSlot`]). A base
+    ///     write absorbs what its writer holds, and a slot only moves forward, so the pair is the
+    ///     slot's own past or its present. The join takes the slot with the higher stamp and the
+    ///     pair with the higher absorbed stamp independently; the clause is what keeps the pair
+    ///     from naming a state of the slot that no copy of the slot has reached.
+    /// 25. At equal stamps the totals are equal ([`DecodeError::AbsorbedTotalMismatch`]): one
+    ///     stamp is one write (item 7), applied inside one slot. The read side takes the
+    ///     difference of the two totals, so a pair that disagrees with its own slot at the same
+    ///     stamp would read as an increment nobody made.
+    ///
+    /// NOT checked, one state could show it and no law needs it: the absorbed stamp being by the
+    /// writer of the slot's key (an honest pair is, since it is a stamp of that slot).
+    ///
     /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
     pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {
         if self.dead.iter().any(|l| !self.lives.contains_key(l)) {
             return Err(DecodeError::DeadLifeNotListed);
         }
+        for s in self.slots.values() {
+            if let Some((st, total)) = &s.absorbed {
+                if *st > s.stamp {
+                    return Err(DecodeError::AbsorbedAboveSlot);
+                }
+                if *st == s.stamp && *total != s.total {
+                    return Err(DecodeError::AbsorbedTotalMismatch);
+                }
+            }
+        }
         let covered = |st: &MStamp| self.vv.get(&st.writer).is_some_and(|h| *h >= st.hlc);
+        let gens = self.regs.values().filter_map(|r| r.generation.as_ref());
         let stamps = self
             .lives
             .keys()
             .chain(self.deletes.keys())
+            .chain(self.lives.values().flat_map(|l| l.seen.iter()))
             .chain(self.regs.values().map(|r| &r.stamp))
-            .chain(self.slots.values().map(|s| &s.stamp));
+            .chain(self.slots.values().map(|s| &s.stamp))
+            .chain(self.slots.values().filter_map(|s| s.absorbed.as_ref().map(|a| &a.0)))
+            .chain(self.slots.keys().filter_map(|k| k.3.as_ref()))
+            .chain(gens.clone().map(|g| &g.stamp))
+            .chain(gens.flat_map(|g| g.seen.keys().flat_map(|k| [&k.0].into_iter().chain(&k.2))));
         if stamps.into_iter().any(|st| !covered(st)) {
+            return Err(DecodeError::VersionVectorBehind);
+        }
+        let vector_covered =
+            |v: &Vv| v.iter().all(|(w, h)| self.vv.get(w).is_some_and(|x| *x >= *h));
+        if !self.deletes.values().all(vector_covered) {
             return Err(DecodeError::VersionVectorBehind);
         }
         let o = JoinOptions::default();
@@ -422,17 +470,17 @@ pub(crate) fn sub_ret(h: Hlc, ret: u64) -> Hlc {
 }
 
 impl MergeState {
-    /// Every counter amount the state holds: slot totals, the `obs` entries of the registers,
-    /// the `seen` entries of their generations, and the lost totals.
+    /// Every counter amount the state holds: slot totals, their absorbed totals, the `seen`
+    /// entries of the generations of the registers, and the lost totals.
     pub(crate) fn totals(&self) -> impl Iterator<Item = &Num> {
-        let regs = self.regs.values().flat_map(|r| {
-            r.obs.values().map(|(_, n)| n).chain(r.generation.iter().flat_map(|g| g.seen.values()))
-        });
+        let regs =
+            self.regs.values().flat_map(|r| r.generation.iter().flat_map(|g| g.seen.values()));
+        let absorbed = self.slots.values().filter_map(|s| s.absorbed.as_ref().map(|a| &a.1));
         let lost = self.losses.values().filter_map(|v| match v {
             LossValue::Total(n) => Some(n),
             _ => None,
         });
-        self.slots.values().map(|s| &s.total).chain(regs).chain(lost)
+        self.slots.values().map(|s| &s.total).chain(absorbed).chain(regs).chain(lost)
     }
 
     pub(crate) fn max_vv(&self) -> Hlc {
@@ -711,14 +759,14 @@ impl MergeState {
             },
             _ => None,
         };
-        // What each slot gained since the base observed it. B1: the field is present when the
-        // slot moved since the base saw it, even if its increments net to 0 (a counter back at
-        // 0 is still there).
+        // What each slot gained since a base write absorbed it (the increments no base write on
+        // the path had seen). B1: the field is present when the slot moved since its absorbed
+        // stamp, even if its increments net to 0 (a counter back at 0 is still there).
         let mut cut = None;
         let mut terms: Vec<(MStamp, ObsKey, Num)> = Vec::new();
         let g = self.gen_in(p, al, win, o).map(|g| g.stamp);
         for (k, s) in counted_among(g, slots) {
-            let ob = win.and_then(|w| w.obs.get(&k));
+            let ob = s.absorbed.as_ref();
             let d = ob.map_or(s.total, |x| {
                 if o.no_decimal_saturation() {
                     s.total.sub(&x.1)

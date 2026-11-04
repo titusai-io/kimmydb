@@ -266,9 +266,11 @@ fn named_probes(rep: &mut Report) {
 }
 
 /// B1 and M1 scenarios (a counter that nets to zero; a non-numeric upsert creation value),
-/// graded against the oracle.
+/// graded against the oracle, and the fold scenarios of the counter cell (the four-step case and EG2),
+/// read by value.
 fn scenario_probes(rep: &mut Report) {
-    for (name, problems) in probes::scenarios() {
+    let fold = probes::fold_scenarios_with(&Cfg::default_ret());
+    for (name, problems) in probes::scenarios().into_iter().chain(fold) {
         println!(
             "[scenario {name}]: {}",
             if problems.is_empty() { "ok".to_string() } else { format!("{problems:?}") }
@@ -333,10 +335,10 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14), the B1 and M1 rules (2), the nested rules (7), the rules of Q3
+    // The design mutants of section 17 (14), the B1 and M1 rules (2), the fold rule of the counter cell (1), the nested rules (7), the rules of Q3
     // (the covered-entry skip by the vector and by the stamp, the start-HLC rule) and the seven rules of the
     // writer's feed of the order state (O2): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 33, "the mutant list changed");
+    assert_eq!(mutants::mutants().len(), 34, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {

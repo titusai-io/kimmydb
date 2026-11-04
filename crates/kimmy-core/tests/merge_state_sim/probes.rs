@@ -263,6 +263,65 @@ pub fn scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
     out
 }
 
+// ---- the counter cell's fold (review item M2) ----------------------------------------------
+
+/// Every member's value of `path` after the fixpoint, against `want`: the problems found.
+fn all_read(ms: &[Node], path: &str, want: i64) -> Vec<String> {
+    ms.iter()
+        .filter_map(|n| {
+            let got = n.visible().and_then(|d| d.get(&p(path)).cloned());
+            (got != Some(Value::Int64(want)))
+                .then(|| format!("{} reads {got:?}, not {want}", n.name))
+        })
+        .collect()
+}
+
+/// The fold scenarios of the counter cell, read by value (not through the oracle): a base write must
+/// absorb every slot its writer holds in an alive life, of any generation, not only the slots it counts.
+/// The four-step case of the review (M2): x = 100; B adds 5; C, which saw only the insert, sets x to a
+/// string and receives the 5 (an older generation: hidden), then sets x to 7; D, which saw only the
+/// insert, sets 50 with the newest stamp. Serial orders read 7 or 50, never 55. And EG2, the double-base
+/// form: A adds 1, B sets a to 2.5 (a generation that hides A's add), A receives it and sets 5, C (saw
+/// only the insert) sets 5 with the newest stamp: 5, never 6. A mutant that folds only the counted slots
+/// reads 55 and 6.
+pub fn fold_scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
+    let s = |x: &str| Value::String(x.into());
+    let mut out = Vec::new();
+    {
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABCD".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].insert(&[("x", Value::Int64(100))], &mut log, 0);
+        pull(&mut ms, 1, 0, None);
+        ms[1].inc("x", 5, &mut log, 0);
+        pull(&mut ms, 2, 0, None);
+        ms[2].set("x", s("s"), &mut log, 0);
+        pull(&mut ms, 2, 1, None);
+        ms[2].set("x", Value::Int64(7), &mut log, 0);
+        pull(&mut ms, 3, 0, None);
+        ms[3].set("x", Value::Int64(50), &mut log, 100);
+        fixpoint(&mut ms, 40);
+        out.push(("fold: the four-step case reads 50".to_string(), all_read(&ms, "x", 50)));
+    }
+    {
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].insert(&[("a", Value::Int64(0))], &mut log, 0);
+        pull(&mut ms, 1, 0, None);
+        pull(&mut ms, 2, 0, None);
+        ms[0].inc("a", 1, &mut log, 0);
+        ms[1].set("a", Value::Double(2.5), &mut log, 0);
+        pull(&mut ms, 0, 1, None);
+        ms[0].set("a", Value::Int64(5), &mut log, 0);
+        ms[2].set("a", Value::Int64(5), &mut log, 100);
+        fixpoint(&mut ms, 40);
+        out.push((
+            "fold: EG2, a double base `$set a 2.5`, reads 5".to_string(),
+            all_read(&ms, "a", 5),
+        ));
+    }
+    out
+}
+
 // ---- Q3: a collected life must not come back (probes_q3.py of the model) -------------------
 
 /// What a Q3 script found: A's document right after the pull that could bring a collected life back,

@@ -545,15 +545,36 @@ impl Node {
         }
     }
 
+    /// The precondition under which a creation base folds nothing (the counter cell): a creation (an insert or
+    /// an upsert) is refused while any life is alive, so at an accepted creation the writer holds no counter
+    /// slot in an alive life. Asserted by the harness at every accepted creation; there is no assert in the
+    /// product code.
+    fn holds_slot_in_alive_life(&self) -> bool {
+        let alive = self.w.alive();
+        self.w.state.slots.keys().any(|k| alive.contains(&k.0))
+    }
+
     pub fn insert(&mut self, f: &[(&str, Value)], log: &mut Log, skew: u64) -> Option<MStamp> {
+        let held = self.holds_slot_in_alive_life();
         let r = self.checked(Intent::Insert(named(f)), log, |w| w.insert(&fl(f), skew));
+        assert!(
+            r.is_none() || !held,
+            "{}: an insert was accepted over a slot of an alive life",
+            self.name
+        );
         self.logged(r, log)
     }
     pub fn upsert_inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let held = self.holds_slot_in_alive_life();
         let before = self.w.state.ordered_document(&self.w.opts);
         let history = self.history();
         let one_life = self.w.alive().len() == 1;
         let r = self.w.upsert_inc(&p(path), n, skew);
+        assert!(
+            r.is_none() || !held,
+            "{}: an upsert was accepted over a slot of an alive life",
+            self.name
+        );
         self.read_your_writes(
             before,
             history,
@@ -585,7 +606,13 @@ impl Node {
         let history = self.history();
         let one_life = self.w.alive().len() == 1;
         let inc_path = p(inc_path);
+        let held = self.holds_slot_in_alive_life();
         let created = self.w.upsert_soi_create(&fl(fields), &inc_path, &fl(sets), skew);
+        assert!(
+            created.is_none() || !held,
+            "{}: an upsert creation was accepted over a slot of an alive life",
+            self.name
+        );
         let s1 = self.logged(created, log)?;
         let incd = self.w.upsert_inc_on(s1, &inc_path, n, skew);
         self.read_your_writes(before, history, one_life, OrdOp::Upsert(names), incd.is_some());

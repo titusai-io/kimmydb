@@ -3,12 +3,12 @@
 //!
 //! The generator has three modes. [`Mode::Any`]: a stamp need not say what it wrote (the same stamp
 //! can hold different values in two lives, or under one key in the two states of a join).
-//! [`Mode::Coherent`]: everything a stamp carries (the value, the observations, the generation, a
+//! [`Mode::Coherent`]: everything a stamp carries (the value, the absorbed pair, the generation, a
 //! life's kind and what it had seen) is a function of the stamp and the path, so that two states
 //! never disagree about what one write was (a property of the whole set of states, which no
 //! decode can check). [`Mode::Closed`]: coherent, and the state satisfies the structural
 //! invariants `decode` checks (`MergeState::check_decoded`), no more and no fewer: every dead life
-//! is listed in `lives`, the version vector covers every life, delete, register and slot stamp,
+//! is listed in `lives`, the version vector covers every stamp an honest state's vector covers (life, delete, register, slot, absorbed, generation, `seen`),
 //! and every order entry is normal, belongs to a listed life and has its stamps covered. The join
 //! laws are claimed for the closed states, and only those are what `decode` accepts.
 //!
@@ -70,7 +70,7 @@ pub(super) const SHAPES: [&str; 13] = [
     "scalar with a newer cell below it",
     "array holding a document",
     "dead life and delete of t each on both sides of h0, s with none",
-    "slot or obs total within 8 of MAX_TOTAL",
+    "slot or absorbed total within 8 of MAX_TOTAL",
     "an odd path (empty, `_` or dotted segment)",
     "an order entry at one key of both states, different",
 ];
@@ -182,10 +182,10 @@ impl Cx<'_> {
     }
 
     /// A register of the stamp `at` at `p`, with a value (drawn when `value` is `None`), a
-    /// generation (a base starts one; a number may have one) and some observations.
+    /// generation (a base starts one; a number may have one).
     fn reg(&mut self, at: MStamp, p: &Path, value: Option<Value>) -> Reg {
         let value = value.unwrap_or_else(|| self.value(at, p));
-        let (generation, obs, soi) = self.draw(("reg", at, p), |r| {
+        let (generation, soi) = self.draw(("reg", at, p), |r| {
             let lives = [stamp(1, 0, 0), stamp(2, 0, 1)];
             let mut seen = BTreeMap::new();
             for _ in 0..r.below(3) {
@@ -197,14 +197,9 @@ impl Cx<'_> {
                 vv: Vv::new(),
                 seen,
             });
-            let mut obs = BTreeMap::new();
-            for _ in 0..r.below(3) {
-                let key = (*r.pick(&lives), wid(r.below(3) as u8), None);
-                obs.insert(key, (at, num_from(r)));
-            }
-            (generation, obs, r.below(4) == 0)
+            (generation, r.below(4) == 0)
         });
-        Reg { stamp: at, value, obs, generation, soi }
+        Reg { stamp: at, value, generation, soi }
     }
 
     fn life(&mut self, l: MStamp, kind: LifeKind) -> Life {
@@ -217,8 +212,19 @@ impl Cx<'_> {
     /// A slot written by the write `at`. Its stamp is the write's with the counter raised by
     /// [`SLOT_CTR`], so that no register and slot of a path share a stamp: a write is a register
     /// write or an increment, never both at one path.
+    ///
+    /// Its absorbed pair, when it has one, is the slot's own past or present, as an honest slot's is:
+    /// the pair at the slot's own stamp (the slot as it is), or at the write `at` below it (an
+    /// earlier total). The draw is a function of the write and the path in the coherent modes, so
+    /// that the same stamp always carries the same pair.
     fn slot(&mut self, at: MStamp, p: &Path) -> Slot {
-        Slot { stamp: slot_stamp(at), total: self.total(at, p) }
+        let (stamp, total) = (slot_stamp(at), self.total(at, p));
+        let absorbed = self.draw(("absorbed", at, p), |r| match r.below(4) {
+            1 => Some((stamp, total)),
+            2 => Some((at, num_from(r))),
+            _ => None,
+        });
+        Slot { stamp, total, absorbed }
     }
 }
 
@@ -324,8 +330,8 @@ fn equal_stamps_under_one_key(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState
     } else {
         (Num::Int64(5), Num::Int64(6))
     };
-    put_slot(&mut s, la(), &p3, 0, None, Slot { stamp: slot_stamp(x), total: ta });
-    put_slot(&mut t, la(), &p3, 0, None, Slot { stamp: slot_stamp(x), total: tb });
+    put_slot(&mut s, la(), &p3, 0, None, Slot { stamp: slot_stamp(x), total: ta, absorbed: None });
+    put_slot(&mut t, la(), &p3, 0, None, Slot { stamp: slot_stamp(x), total: tb, absorbed: None });
     let sl = cx.slot(x, &p1);
     put_slot(&mut s, la(), &p1, 1, None, sl);
     let sl = cx.slot(y, &p1);
@@ -563,20 +569,27 @@ fn near_max_total(cx: &mut Cx, _ret: u64) -> (MergeState, MergeState) {
         let at = stamp(base_at, 0, 0);
         let n = cx.draw(("n", at), |r| *r.pick(&big));
         let mut seen = BTreeMap::new();
-        let mut obs = BTreeMap::new();
         for k in 0..writers {
             let slot_at = stamp(base_at + u64::from(k), 0, k);
             let total = Num::Int64(cx.draw(("total", slot_at), |r| *r.pick(&big)));
             let generation = if k % 5 == 4 { Some(g) } else { None };
-            put_slot(st, la(), &p, k, generation, Slot { stamp: slot_stamp(slot_at), total });
+            // the pair an earlier base write absorbed: the write `at`, below the slot's stamp
+            let absorbed = Some((at, Num::Int64(-n)));
+            put_slot(
+                st,
+                la(),
+                &p,
+                k,
+                generation,
+                Slot { stamp: slot_stamp(slot_at), total, absorbed },
+            );
             seen.insert((la(), wid(k), generation), Num::Int64(n));
-            obs.insert((la(), wid(k), generation), (at, Num::Int64(-n)));
         }
         let base = cx.draw(("base", at), |r| {
             r.pick(&[Value::Int64(5), Value::String("s".into()), Value::Unset]).clone()
         });
         let generation = Some(Gen { stamp: g, vv: Vv::new(), seen });
-        put_reg(st, la(), &p, Reg { stamp: at, value: base, obs, generation, soi: false });
+        put_reg(st, la(), &p, Reg { stamp: at, value: base, generation, soi: false });
         vv(st, 0, base_at + 40, 0);
     }
     (s, t)
@@ -860,6 +873,20 @@ fn close(cx: &mut Cx, x: &mut MergeState) {
     stamps.extend(x.deletes.keys());
     stamps.extend(x.regs.values().map(|r| r.stamp));
     stamps.extend(x.slots.values().map(|s| s.stamp));
+    stamps.extend(x.slots.values().filter_map(|s| s.absorbed.as_ref().map(|a| a.0)));
+    stamps.extend(x.slots.keys().filter_map(|k| k.3));
+    stamps.extend(x.lives.values().flat_map(|l| l.seen.iter().copied()));
+    for g in x.regs.values().filter_map(|r| r.generation.as_ref()) {
+        stamps.push(g.stamp);
+        stamps.extend(g.seen.keys().flat_map(|k| [k.0].into_iter().chain(k.2)));
+    }
+    // the vectors of the deletes: (writer, HLC) entries the state's own vector must reach
+    let delete_vvs: Vec<(WriterId, Hlc)> =
+        x.deletes.values().flat_map(|v| v.iter().map(|(w, h)| (*w, *h))).collect();
+    for (w, h) in delete_vvs {
+        let e = x.vv.entry(w).or_insert(Hlc::ZERO);
+        *e = (*e).max(h);
+    }
     for e in x.ords.values() {
         stamps.extend(e.floor.map(|f| f.stamp()));
         stamps.extend(e.firsts.values().map(|c| c.0));

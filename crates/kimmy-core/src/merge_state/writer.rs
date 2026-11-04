@@ -378,8 +378,57 @@ impl Writer {
             .collect()
     }
 
+    /// The slots a base write on `p` folds into their absorbed pairs (review item M2). A base write
+    /// has the increments its writer holds in its causal past, so no other base may count them
+    /// again: that is every slot of `p` the writer holds in an alive life, of ANY generation, not
+    /// only the counted ones (the winning base's generation and newer). An older-generation slot the
+    /// writer holds but does not count is still in its past. `win` is the winner of `p` before the
+    /// write.
+    fn fold_keys(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        win: Option<&Reg>,
+    ) -> Vec<(MStamp, Path, WriterId, Option<MStamp>)> {
+        if self.opts.fold_counted_only() {
+            // the mutant: only the slots the base counts
+            self.state
+                .counted_in(p, al, win, &self.opts)
+                .into_keys()
+                .map(|(l, w, g)| (l, p.clone(), w, g))
+                .collect()
+        } else {
+            self.state.slots_at(p, al).into_iter().map(|(k, _)| k.clone()).collect()
+        }
+    }
+
+    /// Fold the slots at `keys`: each takes its own `(stamp, total)` as its absorbed pair, when
+    /// that is above the pair it has (the model's max by stamp).
+    fn fold(&mut self, keys: Vec<(MStamp, Path, WriterId, Option<MStamp>)>) {
+        for k in keys {
+            if let Some(s) = self.state.slots.get_mut(&k)
+                && s.absorbed.as_ref().is_none_or(|a| a.0 < s.stamp)
+            {
+                s.absorbed = Some((s.stamp, s.total));
+            }
+        }
+    }
+
+    /// Store the slot at `key` with the write `stamp` and the new `total`. The absorbed pair of a
+    /// slot the writer already holds is kept: an increment moves the slot, not what a base write
+    /// absorbed of it.
+    fn put_slot(
+        &mut self,
+        key: (MStamp, Path, WriterId, Option<MStamp>),
+        stamp: MStamp,
+        total: Num,
+    ) {
+        let absorbed = self.state.slots.get(&key).and_then(|s| s.absorbed);
+        self.state.slots.insert(key, Slot { stamp, total, absorbed });
+    }
+
     /// Set the register of `p` in the life `l` (the newest of the alive lives `al`), stamp `st`.
-    /// What the write observed (the winning base, its generation, the counted slots) is read from
+    /// What the write observed (the winning base, its generation, the slots it holds) is read from
     /// the cells of `p` alone, so cells already set for other paths of the same write change
     /// nothing of it.
     fn setreg(&mut self, p: &Path, v: Value, st: MStamp, al: &BTreeSet<MStamp>) {
@@ -390,20 +439,14 @@ impl Writer {
         } else {
             Some(Gen::start(st, &self.state.vv, self.seen(p, al)))
         };
-        let obs = self
-            .state
-            .counted_in(p, al, win, &self.opts)
-            .into_iter()
-            .map(|(k, v)| (k, (v.stamp, v.total)))
-            .collect();
+        let folded = self.fold_keys(p, al, win);
+        self.fold(folded);
         #[cfg(any(test, feature = "merge-mutants"))]
         if !v.is_numeric() {
             let vv = self.state.vv.clone();
             self.state.note_base((l, p.clone()), st, &vv);
         }
-        self.state
-            .regs
-            .insert((l, p.clone()), Reg { stamp: st, value: v, obs, generation, soi: false });
+        self.state.regs.insert((l, p.clone()), Reg { stamp: st, value: v, generation, soi: false });
     }
 
     /// The writer's own state, normalised as every receiver's join normalises
@@ -695,7 +738,7 @@ impl Writer {
             });
             s.regs.insert(
                 (st, p.clone()),
-                Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi: false },
+                Reg { stamp: st, value: v.clone(), generation, soi: false },
             );
             #[cfg(any(test, feature = "merge-mutants"))]
             if !v.is_numeric() {
@@ -787,10 +830,7 @@ impl Writer {
                 vv.insert(st.writer, st.hlc);
                 Gen::start(st, &vv, BTreeMap::new())
             });
-            s.regs.insert(
-                (st, q.clone()),
-                Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi },
-            );
+            s.regs.insert((st, q.clone()), Reg { stamp: st, value: v.clone(), generation, soi });
             #[cfg(any(test, feature = "merge-mutants"))]
             if starts_gen && !v.is_numeric() {
                 s.note_base((st, q.clone()), st, &BTreeMap::from([(st.writer, st.hlc)]));
@@ -838,10 +878,7 @@ impl Writer {
         let known = self.known();
         let st2 = self.mint(m)?;
         self.state.vv.insert(st2.writer, st2.hlc);
-        self.state.slots.insert(
-            (life, path.clone(), self.id, None),
-            Slot { stamp: st2, total: Num::from(i128::from(n)) },
-        );
+        self.put_slot((life, path.clone(), self.id, None), st2, Num::from(i128::from(n)));
         let mut items = Items::new();
         ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
         items.push((OrdAt::Field(path.clone()), OrdMode::Write));
@@ -870,7 +907,7 @@ impl Writer {
         );
         s.slots.insert(
             (st, path.clone(), self.id, None),
-            Slot { stamp: st, total: Num::from(i128::from(n)) },
+            Slot { stamp: st, total: Num::from(i128::from(n)), absorbed: None },
         );
         let mut items = Items::new();
         ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
@@ -1106,7 +1143,7 @@ impl Writer {
                 let known = self.known();
                 let st = self.mint(m)?;
                 self.state.vv.insert(st.writer, st.hlc);
-                self.state.slots.insert(key, Slot { stamp: st, total });
+                self.put_slot(key, st, total);
                 self.feed(life, st, known, &items);
                 let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![p.clone()]);
                 rec.n = op.int().and_then(|v| i64::try_from(v).ok());
@@ -1316,7 +1353,7 @@ impl Writer {
         let mut paths = eff.order.clone();
         for (_, key, total) in slots {
             paths.push(key.1.clone());
-            self.state.slots.insert(key, Slot { stamp: st, total });
+            self.put_slot(key, st, total);
         }
         if let Some(life) = l {
             self.feed(life, st, known, &items);

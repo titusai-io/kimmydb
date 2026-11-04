@@ -20,7 +20,8 @@ pub struct InvalidIntBound(pub i64);
 /// configuration: build one with [`JoinOptions::new`] or [`Default`], and change the
 /// retention through the public field. The mutation switches (horizon-first,
 /// supersession, reported cells, `$setOnInsert` suppression, the v3 generation rule, the
-/// two read and creation rules of the B1 and M1 fixes, write normalisation, the six nested
+/// two read and creation rules of the B1 and M1 fixes, the rule of the counter cell's fold (only the
+/// counted slots), write normalisation, the six nested
 /// mutants: the type rule's recency, a marker that hides, `typeClash`, `arrayClash`, the
 /// sub-document diff and the refusal below a scalar, and the nine mutants of the order state:
 /// the floor, the earliest candidate, `last`, the order itself, the survivor clamp, the level
@@ -54,7 +55,7 @@ pub struct JoinOptions {
     /// when it lost). Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
     v3_generation: bool,
-    /// B1 mutant: the read side ignores the slot stamp in a register's `obs`, so a
+    /// B1 mutant: the read side ignores the slot stamp against its absorbed stamp, so a
     /// counter whose increments net to 0 is absent again. Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
     value_ignores_slot_stamp: bool,
@@ -62,6 +63,11 @@ pub struct JoinOptions {
     /// generation (the model before the fix). Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
     creation_without_generation: bool,
+    /// Counter cell mutant (review item M2): a base write folds into the absorbed pairs only the
+    /// slots it counts (the winning base's generation and newer), not every slot of the path the
+    /// writer holds in an alive life. Off in the design.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    fold_counted_only: bool,
     /// The model's `NORMALIZE_WRITES`: a writer normalises its own state through
     /// a join with the empty state after each write (off only to reproduce the
     /// un-normalised states of `model5.Member`).
@@ -192,6 +198,8 @@ impl Default for JoinOptions {
             #[cfg(any(test, feature = "merge-mutants"))]
             creation_without_generation: false,
             #[cfg(any(test, feature = "merge-mutants"))]
+            fold_counted_only: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
             normalize_writes: true,
             #[cfg(any(test, feature = "merge-mutants"))]
             type_ignores_recency: false,
@@ -306,6 +314,7 @@ impl JoinOptions {
     switch!(v3_generation, set_v3_generation, false);
     switch!(value_ignores_slot_stamp, set_value_ignores_slot_stamp, false);
     switch!(creation_without_generation, set_creation_without_generation, false);
+    switch!(fold_counted_only, set_fold_counted_only, false);
     switch!(normalize_writes, set_normalize_writes, true);
     switch!(type_ignores_recency, set_type_ignores_recency, false);
     switch!(marker_hides, set_marker_hides, false);
@@ -631,9 +640,27 @@ pub(super) fn join_into(
             out.regs.insert(k.clone(), r.clone());
         }
     }
+    // A slot: the higher stamp wins; its absorbed pair joins on its own, the higher absorbed
+    // stamp winning (the pair of the slot that lost is kept if it is the higher).
     for (k, v) in &t.slots {
-        if alive.has(&k.0) && out.slots.get(k).is_none_or(|x| v.stamp > x.stamp) {
-            out.slots.insert(k.clone(), v.clone());
+        if !alive.has(&k.0) {
+            continue;
+        }
+        match out.slots.get_mut(k) {
+            None => {
+                out.slots.insert(k.clone(), v.clone());
+            }
+            Some(x) => {
+                let absorbed = match (x.absorbed, v.absorbed) {
+                    (Some(a), Some(b)) if b.0 > a.0 => Some(b),
+                    (None, b) => b,
+                    (a, _) => a,
+                };
+                if v.stamp > x.stamp {
+                    *x = v.clone();
+                }
+                x.absorbed = absorbed;
+            }
         }
     }
     for (k, g) in &t.gens {
