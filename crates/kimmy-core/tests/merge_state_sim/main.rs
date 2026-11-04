@@ -468,6 +468,30 @@ fn the_covered_entry_skip_clears_the_five_seeds_that_fail_without_it() {
     }
 }
 
+/// The sweep that found the five seeds, on the default protocol: the bounded runs (RET 40, a fixpoint every 3
+/// steps, 80 steps) of the seeds 0 to 3000 (`Q7_BOUNDED_SEEDS`), flat and nested. No failure is known. By hand.
+#[test]
+#[ignore = "the extended sweep; run by hand"]
+fn the_bounded_runs_of_3000_seeds_pass_on_both_workloads() {
+    let n = env_u64("Q7_BOUNDED_SEEDS", 3000);
+    let cfg = Cfg::default_ret();
+    let mut failing = Vec::new();
+    for nested in [false, true] {
+        for seed in 0..n {
+            let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+            let ps = grade_bounded(&o.nodes, &o.log);
+            if !ps.is_empty() {
+                failing.push(format!(
+                    "{} seed {seed}: {ps:?}",
+                    if nested { "nested" } else { "flat" }
+                ));
+            }
+        }
+    }
+    println!("bounded sweep, {n} seeds on each workload: {} failing {failing:?}", failing.len());
+    assert!(failing.is_empty(), "{failing:?}");
+}
+
 /// The default protocol (the covered-entry skip and the start-HLC rule on) passes the five seeds.
 macro_rules! bounded_seed {
     ($name:ident, $nested:expr, $seed:expr) => {
