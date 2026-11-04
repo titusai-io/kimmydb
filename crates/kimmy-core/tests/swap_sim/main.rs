@@ -329,6 +329,58 @@ mod tests {
         }
     }
 
+    /// An event that is not reachable (its entry died with a vanished member before any live member held it, so no
+    /// live member has it in effect or can make it take effect) makes no write late: the allowed set does not absorb
+    /// writes that only such an event would make late.
+    #[test]
+    fn an_unreachable_event_does_not_make_a_write_allowed() {
+        for event_survives in [false, true] {
+            let mut sc = Sc::new("v5", &[("A", 0), ("X", 0), ("Y", 50)], 60);
+            let (a, x, y) = (sc.idx("A"), sc.idx("X"), sc.idx("Y"));
+            sc.advance(1);
+            sc.ms[a].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+            sc.pull("X", "A");
+            sc.pull("Y", "A");
+            sc.advance(10);
+            let drop = sc.ms[x].local_ldrop(&mut sc.w).expect("X drops the name");
+            sc.advance(14);
+            // Y is ahead and has not heard of the drop: its write is stamped after it
+            let w = sc.ms[y].local_doc(&mut sc.w, 0, DocOp::Update).unwrap();
+            assert!(w.stamp > drop.stamp);
+            sc.window("A", "Y", &w);
+            if event_survives {
+                sc.pull("A", "X");
+            }
+            let mut jx = sc.ms[x].start_out(&mut sc.w, vec![1], JobKind::Vanish, 0);
+            sc.ms[x].do_bind(&mut sc.w, &mut jx, 3);
+            sc.quiesce();
+            assert_eq!(
+                sc.w.lost.contains(&drop.idx),
+                !event_survives,
+                "the drop is lost only when no live member took it"
+            );
+            let o = crate::oracle::oracle(&mut sc.w);
+            assert_eq!(
+                o.allowed.contains(&(0, w.stamp)),
+                event_survives,
+                "allowed iff the event is reachable"
+            );
+            let res = finish(&mut sc.w, &mut sc.ms);
+            for k in [
+                "diverged",
+                "oracle_state",
+                "loss_mismatch",
+                "loss_extra",
+                "loss_missing",
+                "invariant",
+                "div_replay",
+                "div_replay_interleaved",
+            ] {
+                assert_eq!(res[k], 0, "{k} (event survives: {event_survives})");
+            }
+        }
+    }
+
     /// The scenario of seed 530. `with_n` adds a member N that has heard of nothing.
     fn corner(second_vanish: bool, with_n: bool) -> (Sc, EntryRef) {
         let mut members = vec![("A", 0), ("B", 0), ("C", 50)];
