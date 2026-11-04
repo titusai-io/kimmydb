@@ -238,7 +238,24 @@ fn put_reg(s: &mut MergeState, l: MStamp, p: &Path, r: Reg) {
     s.regs.insert((l, p.clone()), r);
 }
 
+/// The slot as a slot of the key of `writer` can be: an absorbed pair is a past state of that very
+/// slot, so its stamp is by the key's writer. The pair keeps its HLC and moves to that writer; one
+/// that then stands above the slot is dropped, and one at the slot's own stamp takes the slot's total
+/// (a function of the slot and the key, so a stamp still fixes what it carries).
+fn fit_pair(mut sl: Slot, writer: WriterId) -> Slot {
+    sl.absorbed = sl.absorbed.and_then(|(a, total)| {
+        let a = MStamp { hlc: a.hlc, writer };
+        match a.cmp(&sl.stamp) {
+            std::cmp::Ordering::Greater => None,
+            std::cmp::Ordering::Equal => Some((a, sl.total)),
+            std::cmp::Ordering::Less => Some((a, total)),
+        }
+    });
+    sl
+}
+
 fn put_slot(s: &mut MergeState, l: MStamp, p: &Path, k: u8, generation: Option<MStamp>, sl: Slot) {
+    let sl = fit_pair(sl, wid(k));
     s.slots.insert((l, p.clone(), wid(k), generation), sl);
 }
 
@@ -786,6 +803,7 @@ fn derived(cx: &mut Cx, u: &Uni, s: &MergeState) -> MergeState {
             0..=2 => {
                 let at = *cx.rng.pick(&u.stamps);
                 let sl = cx.slot(at, &k.1);
+                let sl = fit_pair(sl, k.2);
                 t.slots.insert(k, sl);
             }
             3..=4 if !cx.coh => {

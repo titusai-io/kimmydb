@@ -372,7 +372,7 @@ impl MergeState {
     ///
     /// THE ABSORBED PAIR of a slot (the counter cell). A slot is `(stamp, total)` and an optional
     /// `absorbed` `(stamp, total)`: the highest state of this very slot that a base write had
-    /// held. Two clauses one state can show:
+    /// held. Three clauses one state can show:
     ///
     /// 24. The absorbed stamp is not above the slot's ([`DecodeError::AbsorbedAboveSlot`]). A base
     ///     write absorbs what its writer holds, and a slot only moves forward, so the pair is the
@@ -384,12 +384,17 @@ impl MergeState {
     ///     difference of the two totals, so a pair that disagrees with its own slot at the same
     ///     stamp would read as an increment nobody made.
     ///
-    /// NOT checked, one state could show it and no law needs it: the absorbed stamp being by the
-    /// writer of the slot's key (an honest pair is, since it is a stamp of that slot).
+    /// 26. The absorbed stamp is by the writer of the slot's key
+    ///     ([`DecodeError::AbsorbedWriterMismatch`]). The pair is a past state of that very
+    ///     slot, and a slot is one writer's running total in one generation, so every stamp it
+    ///     ever had is that writer's. The compact form spells the absorbed stamp in full (an HLC
+    ///     and a writer index), so a pair by another writer can be encoded and is refused here.
+    ///     The check follows the two above it: a stamp above the slot's, or equal to it with
+    ///     another total, is reported as that.
     ///
     /// The version 1 form only (`decode`, not `decode_compact`):
     ///
-    /// 26. A register's `obs` place is always empty ([`DecodeError::NotCanonical`]). A version 1
+    /// 27. A register's `obs` place is always empty ([`DecodeError::NotCanonical`]). A version 1
     ///     register still has a count where the `obs` map used to be; what a base had counted is
     ///     the slots' absorbed pairs now, which version 1 cannot spell, so a non-empty count is
     ///     not the encoding of any state. Checked by the version 1 reader, not by `check_decoded`
@@ -400,13 +405,16 @@ impl MergeState {
         if self.dead.iter().any(|l| !self.lives.contains_key(l)) {
             return Err(DecodeError::DeadLifeNotListed);
         }
-        for s in self.slots.values() {
+        for (k, s) in &self.slots {
             if let Some((st, total)) = &s.absorbed {
                 if *st > s.stamp {
                     return Err(DecodeError::AbsorbedAboveSlot);
                 }
                 if *st == s.stamp && *total != s.total {
                     return Err(DecodeError::AbsorbedTotalMismatch);
+                }
+                if st.writer != k.2 {
+                    return Err(DecodeError::AbsorbedWriterMismatch);
                 }
             }
         }

@@ -667,6 +667,40 @@ fn decode_refuses_an_absorbed_total_that_disagrees_at_the_slots_own_stamp() {
     accepts(&paired());
 }
 
+#[test]
+fn decode_refuses_an_absorbed_stamp_by_another_writer_than_the_slots_key() {
+    // the pair is below the slot's stamp, so only the writer is wrong; B's entry in the vector
+    // covers it, so the refusal is the writer's and not the vector's
+    let mut s = paired();
+    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(3, 'B'), 4.into())));
+    s.vv.insert(wid('B', 0), h(3));
+    assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedWriterMismatch));
+    // it can be encoded (the compact form spells the absorbed stamp in full), and is refused on decode
+    refuses(&s, DecodeError::AbsorbedWriterMismatch);
+    // another epoch of the same node is another writer
+    let mut s = paired();
+    s.slots.values_mut().for_each(|x| {
+        x.absorbed = Some((MStamp { hlc: h(3), writer: wid('A', 1) }, 4.into()));
+    });
+    s.vv.insert(wid('A', 1), h(3));
+    refuses(&s, DecodeError::AbsorbedWriterMismatch);
+    // the same pair by the key's writer is accepted
+    accepts(&paired());
+    // a slot of a key of B with a pair by B is accepted, and with a pair by A refused
+    let mut s = MergeState::default();
+    s.lives.insert(st(1, 'A'), upsert_life());
+    s.vv.insert(wid('A', 0), h(9));
+    s.vv.insert(wid('B', 0), h(9));
+    let key = (st(1, 'A'), p("x"), wid('B', 0), None);
+    s.slots.insert(
+        key.clone(),
+        Slot { stamp: st(5, 'B'), total: 7.into(), absorbed: Some((st(3, 'B'), 4.into())) },
+    );
+    accepts(&s);
+    s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'A'), 4.into()));
+    refuses(&s, DecodeError::AbsorbedWriterMismatch);
+}
+
 /// `check_decoded` is what `decode_compact` runs, so the state itself gives the same verdicts.
 #[test]
 fn the_new_refusals_are_the_verdicts_of_check_decoded() {
