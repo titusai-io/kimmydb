@@ -8862,7 +8862,13 @@ mod tests {
         let (b, _db) = engine();
         b.create_collection("shop", "orders").unwrap();
         b.configure_vectors("shop", "orders", vector_config()).unwrap();
+        // The two engines' stamps come from physical time and a tie is broken by node
+        // id, so the disable is made later than the configuration by witnessing it.
+        let on = vector_state(&b).1.expect("a configuration is stamped");
+        a.witness(&on);
         a.disable_vectors("shop", "orders", false).unwrap();
+        let off = vector_state(&a).1.expect("so is a disable that changed nothing");
+        assert!(off > on, "premise: the disable is the later fact: {off:?} vs {on:?}");
         age_the_oplog_out(&a);
 
         transfer(&b, &a);
