@@ -224,7 +224,7 @@ pub type Key = (MStamp, usize, Option<(MStamp, usize)>);
 pub struct Places {
     /// Fields with a standing place (a candidate named by a write in the past, above the unsets and resets of it).
     pub born: BTreeMap<Vec<String>, Key>,
-    /// Paths unset in the past, and their ancestors: their place may be a survivor's, which this does not restate.
+    /// Paths unset in the past (their own floor is an unset): their place may be a survivor's, which this does not restate.
     pub touched: BTreeSet<Vec<String>>,
 }
 
@@ -270,9 +270,8 @@ pub fn places(past: &BTreeSet<MStamp>, life: Option<MStamp>) -> Places {
             for u in &w.unsets {
                 let e = floor_u.entry(u.clone()).or_insert(*st);
                 *e = (*e).max(*st);
-                for k in 1..=u.len() {
-                    out.touched.insert(u[..k].to_vec());
-                }
+                // the paths whose OWN floor is an unset (the model's survivor clamp applies to those alone)
+                out.touched.insert(u.clone());
             }
             for l in &w.levels {
                 let e = lvl.entry(l.clone()).or_insert(*st);
@@ -546,9 +545,31 @@ pub fn check(
                             .iter()
                             .position(|n| Some(n) == at.last())
                             .expect("the field is there");
+                        // the maps of the level with no leaf below them and no place (the no-born group of the model's `okey`)
+                        // trail every field that has a place: the created field comes before each of them
+                        let unplaced_map = |n: &String| {
+                            b.level(parent).is_some_and(|l| {
+                                l.iter().any(|(m, kids)| {
+                                    m == n
+                                        && kids.as_ref().is_some_and(|k| !k.has_leaf())
+                                        && !places.born.contains_key(&key(m))
+                                })
+                            })
+                        };
                         for (j, m) in names.iter().enumerate() {
                             let q = key(m);
-                            if j == i || named.contains(&q) || places.touched.contains(&q) {
+                            if j == i || named.contains(&q) {
+                                continue;
+                            }
+                            if unplaced_map(m) {
+                                if j < i {
+                                    return fail(
+                                        "a field created again is after a map that has no place",
+                                    );
+                                }
+                                continue;
+                            }
+                            if places.touched.contains(&q) {
                                 continue;
                             }
                             if let Some(kg) = places.born.get(&q)
