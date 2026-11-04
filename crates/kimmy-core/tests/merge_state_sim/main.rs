@@ -429,14 +429,21 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     //   bound 1000 0xb5d376dace70d755 -> 0x405c7af0cbda4a1a   sequential 0x5cf2b4f670f08b9e -> 0x66628b9442fa1213
     //   horizon 0xaab8149ae0f8c453 -> 0x35fe713c19988bed      bounded 0x6a0197bd2778c8c7 -> 0x0ddcbb0a2eb7ebf0
     //   bounded nested 0x49b01bf0858bb6cd -> 0x95744a329c2b2f5e
+    // RE-PINNED for the implicit map markers (item O4): the writer writes a marker at each absent ancestor, so every
+    // run that writes below an absent map has other cells. The bytes moved, and so did some reads (an emptied map
+    // stays as {}, and an `$unset` of it is then a write); the flat `bounded` run has no absent ancestor and did not move:
+    //   restore 0xff85ad3d5b95647a -> 0x3a6e9028d87f9721      no restore 0x1d4d18761d99dc46 -> 0xa95f8ce408365ff1
+    //   bound 1000 0x405c7af0cbda4a1a -> 0x4da7ddd027fdb0cd   sequential 0x66628b9442fa1213 -> 0x87dffcb22fdb3060
+    //   horizon 0x35fe713c19988bed -> 0xd40a73c20627234b      bounded 0x0ddcbb0a2eb7ebf0 (unchanged)
+    //   bounded nested 0x95744a329c2b2f5e -> 0x0ae6e20a9e5c4125
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0xff85ad3d5b95647a),
-        ("no restore", 0x1d4d18761d99dc46),
-        ("bound 1000", 0x405c7af0cbda4a1a),
-        ("sequential", 0x66628b9442fa1213),
-        ("horizon", 0x35fe713c19988bed),
+        ("restore", 0x3a6e9028d87f9721),
+        ("no restore", 0xa95f8ce408365ff1),
+        ("bound 1000", 0x4da7ddd027fdb0cd),
+        ("sequential", 0x87dffcb22fdb3060),
+        ("horizon", 0xd40a73c20627234b),
         ("bounded", 0x0ddcbb0a2eb7ebf0),
-        ("bounded nested", 0x95744a329c2b2f5e),
+        ("bounded nested", 0x0ae6e20a9e5c4125),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }

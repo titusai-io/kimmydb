@@ -733,7 +733,12 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 ///
 /// RE-PINNED for the counter cell (the differential flips to ABSORBED = True, the digest prints each slot's absorbed pair and no
 /// register obs): 0x5b22_de2a_6b43_3270 to 0xed99_fd18_a146_9659. 0 of the 300 scripts disagree with the model.
-const PINNED_300: u64 = 0xed99_fd18_a146_9659;
+///
+/// RE-PINNED for the implicit map markers (item O4: the generator draws a leaf write under an absent map and a map-creating `$inc`, and
+/// the writers write the markers the model writes): 0xed99_fd18_a146_9659 to 0x717f_d665_e31b_848c. 0 of the 300 scripts disagree with the
+/// model (12,100 steps); at 1000 scripts 0xd3c0_83e7_7c70_a108 to 0xc06b_5104_4948_81f2, 0 disagree (40,400 steps). The flat differential
+/// did not move (0x3ddd_f823_ee88_e7c7 at 300, 0x3efb_8f50_95d9_7939 at 1000).
+const PINNED_300: u64 = 0x717f_d665_e31b_848c;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)

@@ -1,5 +1,5 @@
 //! The ORDER differential: random scripts of local writes and receives, run on the A2.1 Python model
-//! (`tests/data/gen_ord_differential.py`, model6.py 72da18ebbf3bb383, ABSORBED on, no implicit markers,
+//! (`tests/data/gen_ord_differential.py`, model6.py 72da18ebbf3bb383, ABSORBED on, implicit markers on,
 //! retention 10^9), replayed here through `Writer`s. After EVERY step the acting member's ordered document
 //! and order state must be the model's, and the step must give the stamp the model gave, or none: a
 //! refusal or a no-op is part of what is compared.
@@ -43,7 +43,7 @@ fn the_writers_order_state_and_ordered_document_equal_the_models_after_every_ste
     // non-vacuity, pinned (the scripts are seeded)
     assert_eq!(
         (f.scripts, f.steps, f.writes, f.refused, f.receives),
-        (300, 9000, 6154, 1452, 2846)
+        (300, 9000, 6155, 1451, 2845)
     );
     // the upserts of nested paths (A2.3 and eb40bbcf name their ancestors): drawn, and compared like every other step
     assert_eq!(ord_replay::nested_upserts(), 94);
