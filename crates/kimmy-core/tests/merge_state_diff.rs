@@ -723,13 +723,14 @@ fn golden_vectors_match_the_model() {
         "170": ["42b0c20d1b0c26903625be81f0a105a0", 670],
         "mixed": ["34ce6696c01c0c70255c54445944f39c", 1401],
         "delete": ["0b4d37ac9b577c417603e7c9bce83933", 542],
-        "obs": ["f96f244c2b3198f724fcea0eafec32c7", 1325],
+        // the state has absorbed pairs: no version 1 spelling (the old golden was of the register obs map)
+        "obs": J::Null,
         // the compact form (compact.rs), hashed with the same mix; compact_tests.rs pins the same
         "empty-compact": ["6a9f06d361f4fb8c789c079f6563280a", 10],
-        "170-compact": ["9852c38d33bbede32993a047338b65f3", 214],
-        "mixed-compact": ["220d1eaef3e4f5a85dc9516dc3f0edaa", 341],
-        "delete-compact": ["13a5a3379b963c8ee4ac35a7102437df", 234],
-        "obs-compact": ["f0a36fa50cacf322ad787f91a73c2a97", 256],
+        "170-compact": ["abedfb140b687b3671abd3023efa93a8", 215],
+        "mixed-compact": ["d368f0edd26e1ed5e300dd97df80065e", 338],
+        "delete-compact": ["e695a485390d23417c6a5fd1d8f9ca41", 235],
+        "obs-compact": ["3894def7793a573b2dad9a4de56bf7cc", 252],
     });
     assert_eq!(got, want);
 }
