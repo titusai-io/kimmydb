@@ -72,6 +72,18 @@ class D(M.Member):
         log[st] = (frozenset(s.contained - {st}), meta)
         return st
 
+    def write(self, op, p, arg, log, skew=0):
+        # A no-op writes nothing: an `$inc` of a double base is a register write, and one whose
+        # result is the stored representation byte for byte (`1e300 + 1`, `$inc 0`) changes nothing.
+        # model5.py (vendored as it was) turns it into an unconditional `set`; model6.py and the
+        # ruling of 2026-11-03 make it a no-op, as the Rust side does, so the harness applies it here.
+        if op == "inc":
+            vis = self.state.visible()
+            cur = vis.get(p) if vis is not None else None
+            if isinstance(cur, float) and same_by_bits(cur, cur + arg):
+                return None
+        return super().write(op, p, arg, log, skew)
+
     def absorb(self, other):
         before = self.state
         merged, fresh = M.join(before, other)

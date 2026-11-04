@@ -7,6 +7,12 @@
 //! runner FAILS if a probe fails, any random, sequential, horizon or bounded run
 //! reports a problem, or a mutant survives (section 17 / V5m3).
 //!
+//! The workload mixes in nested writes (`$set` and `$unset` at any depth, sub-documents,
+//! replaces, arrays, writes below a scalar), the oracle is recursive (the type rule of D4 at
+//! every depth), and every write's leaf effects are checked against it. The companion
+//! differential test `merge_state_diff_nested` replays scripts of the vendored stage A model.
+//! Each mutant is reported with the problems that killed it.
+//!
 //! The PRNG is a seeded xorshift, so the exact counts differ from the Python
 //! model's; what must hold is 0 problems for the design and every mutant killed.
 
@@ -139,13 +145,13 @@ fn horizon(rep: &mut Report, n: u64, ret: u64, steps: usize, label: &str) {
     rep.check(&what, &c);
 }
 
-fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize) {
+fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize, nested: bool) {
     let t0 = Instant::now();
     let cfg = Cfg::default_ret();
     let mut c = BTreeMap::new();
     let mut gap_max = 0;
     for seed in 0..n {
-        let (o, gap) = run_bounded(seed, &cfg, ret, sync_every, steps);
+        let (o, gap) = run_bounded(seed, &cfg, ret, sync_every, steps, nested);
         gap_max = gap_max.max(gap);
         for e in grade_bounded(&o.nodes, &o.log) {
             bump(&mut c, e, seed);
@@ -154,7 +160,10 @@ fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize) 
     if gap_max >= ret {
         bump(&mut c, format!("clock advance {gap_max} not below RET"), 0);
     }
-    let what = format!("bounded RET={ret}, fixpoint every {sync_every} steps, {steps} steps");
+    let what = format!(
+        "bounded RET={ret}, fixpoint every {sync_every} steps, {steps} steps{}",
+        if nested { ", nested, no restore" } else { "" }
+    );
     println!(
         "[{what}] {n} runs, largest clock advance between fixpoints {gap_max} (< RET): problems {}; {:.2?}",
         fmt_problems(&c),
@@ -225,7 +234,8 @@ fn runner() {
     horizon(&mut rep, 300, 4, 24, "horizon");
     named_probes(&mut rep);
     scenario_probes(&mut rep);
-    bounded(&mut rep, 300, 40, 3, 80);
+    bounded(&mut rep, 300, 40, 3, 80, false);
+    bounded(&mut rep, 300, 40, 3, 80, true);
     horizon(&mut rep, 300, 40, 80, "beyond retention (no periodic pulls)");
     horizon(&mut rep, 300, 8, 30, "horizon");
 
@@ -239,14 +249,15 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14) and the B1 and M1 rules (2): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 16, "the mutant list changed");
+    // The design mutants of section 17 (14), the B1 and M1 rules (2) and the nested rules (7): a
+    // removed one must be noticed.
+    assert_eq!(mutants::mutants().len(), 23, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
-            (Some(p), true) => format!("KILLED by the runs; probe {p}"),
+            (Some(p), true) => format!("KILLED by the runs [{}]; probe {p}", o.killers),
             (Some(p), false) => format!("KILLED by the probe only: {p}"),
-            (None, true) => "KILLED by the runs".to_string(),
+            (None, true) => format!("KILLED by the runs [{}]", o.killers),
             (None, false) => "SURVIVED".to_string(),
         };
         println!("  {:68} fails {:3}/{}  {how}  [{} ms]", o.name, o.random_fail, o.runs, o.millis);

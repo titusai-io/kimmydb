@@ -13,11 +13,23 @@ use kimmy_core::merge_state::{
     Value, Writer, WriterId, Written, join,
 };
 
-use crate::oracle::Log;
+use crate::oracle::{self, Intent, Log};
 
-/// A one-segment path: the sim's fields are flat.
+/// A one-segment path.
 pub fn p(x: &str) -> Path {
     Path::flat(x).expect("a valid field name")
+}
+/// A path from its dotted spelling (the sim's names have no dot).
+pub fn np(dotted: &str) -> Path {
+    Path::new(dotted.split('.')).expect("a valid path")
+}
+/// A sub-document.
+pub fn sub(f: &[(&str, Value)]) -> Value {
+    Value::Document(f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect())
+}
+/// The fields of a document value as owned names.
+fn named(f: &[(&str, Value)]) -> Vec<(String, Value)> {
+    f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
 }
 /// The fields of a flat document as paths.
 pub fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
@@ -128,6 +140,11 @@ pub struct Node {
     pub events: Vec<LossKey>,
     pub restored: bool,
     pub flags: SimFlags,
+    /// Check every write's leaf effects against the oracle's view of the writer's causal past
+    /// (only where the node has seen all it could: not under a short retention).
+    pub check_writes: bool,
+    /// The disagreements `check_writes` found, by name.
+    pub problems: Vec<String>,
     epoch_ctr: u64,
     epoch_rng: Rng,
     saved: Option<Saved>,
@@ -158,6 +175,8 @@ impl Node {
             events: Vec::new(),
             restored: false,
             flags: cfg.flags,
+            check_writes: false,
+            problems: Vec::new(),
             epoch_ctr: 0,
             epoch_rng: Rng::new(20_261_031 ^ u64::from(name as u32)),
             saved: None,
@@ -186,7 +205,7 @@ impl Node {
     }
 
     pub fn canon(&self) -> Vec<u8> {
-        self.w.state.canonical_bytes()
+        self.w.state.compact_bytes()
     }
 
     fn append(&mut self, ent: Rc<Ent>) {
@@ -296,7 +315,7 @@ impl Node {
             }
         }
         self.w.clock = merged.vv.values().copied().chain([self.w.clock]).max().unwrap_or(Hlc::ZERO);
-        let changed = merged.canonical_bytes() != self.w.state.canonical_bytes();
+        let changed = merged.compact_bytes() != self.w.state.compact_bytes();
         self.w.state = merged;
         Received { changed, fresh: fresh.into_iter().collect() }
     }
@@ -391,8 +410,28 @@ impl Node {
 
     // ---- local writes, logged ----------------------------------------------
 
+    /// A write the oracle checks: its leaf effects against the document the writer could see.
+    fn checked(
+        &mut self,
+        intent: Intent,
+        log: &Log,
+        write: impl FnOnce(&mut Writer) -> Option<Written>,
+    ) -> Option<Written> {
+        let old = self
+            .check_writes
+            .then(|| oracle::oracle_at(log, &self.contained, self.ret(), self.bound()));
+        let r = write(&mut self.w);
+        if let Some(old) = old
+            && let Err(e) =
+                oracle::check_write(old.as_ref(), &intent, r.as_ref().map(|w| &w.record))
+        {
+            self.problems.push(format!("write-effects {}: {e}", self.name));
+        }
+        r
+    }
+
     pub fn insert(&mut self, f: &[(&str, Value)], log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.insert(&fl(f), skew);
+        let r = self.checked(Intent::Insert(named(f)), log, |w| w.insert(&fl(f), skew));
         self.logged(r, log)
     }
     pub fn upsert_inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
@@ -418,19 +457,29 @@ impl Node {
         self.logged(incd, log)
     }
     pub fn set(&mut self, path: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_set(&p(path), v, skew);
+        self.set_at(&p(path), v, log, skew)
+    }
+    pub fn set_at(&mut self, path: &Path, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r =
+            self.checked(Intent::Set(path.clone(), v.clone()), log, |w| w.write_set(path, v, skew));
         self.logged(r, log)
     }
     pub fn unset(&mut self, path: &str, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_unset(&p(path), skew);
+        self.unset_at(&p(path), log, skew)
+    }
+    pub fn unset_at(&mut self, path: &Path, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r = self.checked(Intent::Unset(path.clone()), log, |w| w.write_unset(path, skew));
         self.logged(r, log)
     }
     pub fn inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_inc(&p(path), n, skew);
+        self.inc_at(&p(path), n, log, skew)
+    }
+    pub fn inc_at(&mut self, path: &Path, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r = self.checked(Intent::Inc(path.clone()), log, |w| w.write_inc(path, n, skew));
         self.logged(r, log)
     }
     pub fn replace(&mut self, d: &[(&str, Value)], log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_replace(&fl(d), skew);
+        let r = self.checked(Intent::Replace(named(d)), log, |w| w.write_replace(&fl(d), skew));
         self.logged(r, log)
     }
     pub fn delete(&mut self, log: &mut Log, skew: u64) -> Option<MStamp> {
@@ -585,6 +634,8 @@ pub struct RunConfig {
     pub sequential: bool,
     /// `None`: the real Int64 bound. A small bound exercises the oracle's clamp.
     pub int_bound: Option<i64>,
+    /// Mix nested paths, sub-documents, replaces and arrays into the workload.
+    pub nested: bool,
 }
 
 impl Default for RunConfig {
@@ -596,6 +647,7 @@ impl Default for RunConfig {
             retention: None,
             sequential: false,
             int_bound: None,
+            nested: true,
         }
     }
 }
@@ -680,8 +732,162 @@ fn pool_fields<'a>(rnd: &mut Rng, names: &[&'a str]) -> Vec<(&'a str, Value)> {
     out
 }
 
-/// One random write on `m` (the op table of `run`).
-fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
+// ---- the nested workload (pullmodel6.py `draw_op`) ---------------------------------------
+
+const LEAVES: [&str; 9] = ["x", "n", "y", "a.b", "a.c", "a.d.e", "a.d.f", "a.d.g", "acct.balance"];
+const PARENTS: [&str; 3] = ["a", "a.d", "acct"];
+
+fn i(n: i64) -> Value {
+    Value::Int64(n)
+}
+
+/// A sub-document to write at the parent `at`.
+fn subdoc(rnd: &mut Rng, at: &str) -> Value {
+    let docs: Vec<Value> = match at {
+        "a" => vec![
+            sub(&[]),
+            sub(&[("b", i(1))]),
+            sub(&[("c", i(2))]),
+            sub(&[("b", i(1)), ("c", i(2))]),
+            sub(&[("b", i(0)), ("c", Value::String("s".into()))]),
+            sub(&[("d", sub(&[("e", i(3))]))]),
+            sub(&[("b", i(0)), ("d", sub(&[]))]),
+            sub(&[("d", sub(&[("e", i(1)), ("f", i(2))])), ("c", Value::String("s".into()))]),
+            sub(&[("c", i(1)), ("d", sub(&[("f", i(2)), ("e", i(1))])), ("b", i(4))]),
+        ],
+        "a.d" => vec![
+            sub(&[]),
+            sub(&[("e", i(1))]),
+            sub(&[("f", i(2))]),
+            sub(&[("f", i(2)), ("e", i(1))]),
+            sub(&[("e", i(5)), ("g", i(6))]),
+        ],
+        _ => vec![
+            sub(&[]),
+            sub(&[("balance", i(150))]),
+            sub(&[("balance", i(0))]),
+            sub(&[("balance", i(100))]),
+        ],
+    };
+    rnd.choice(&docs)
+}
+
+/// A scalar or an array to write where a map may be: arrays are atomic, and one holds a
+/// document (a value only inside an array).
+fn scalar_or_array(rnd: &mut Rng) -> Value {
+    let d = Value::Document(vec![("k".into(), i(1))]);
+    rnd.choice(&[
+        i(5),
+        i(0),
+        Value::String("s".into()),
+        Value::Double(2.5),
+        Value::Null,
+        Value::Bool(true),
+        Value::Array(vec![i(1), i(2)]),
+        Value::Array(vec![i(1), i(3)]),
+        Value::Array(vec![]),
+        Value::Array(vec![d.clone()]),
+        Value::Array(vec![d, Value::Array(vec![i(1)])]),
+    ])
+}
+
+/// A whole document to replace with or insert, fields in a random order.
+fn rand_doc(rnd: &mut Rng) -> Vec<(&'static str, Value)> {
+    let mut d: Vec<(&'static str, Value)> = Vec::new();
+    for t in ["x", "n", "y"] {
+        if rnd.f64() < 0.4 {
+            d.push((t, rnd.choice(&[i(7), i(8), Value::String("s".into()), i(100)])));
+        }
+    }
+    if rnd.f64() < 0.6 {
+        let v = if rnd.below(8) == 0 { i(5) } else { subdoc(rnd, "a") };
+        d.push(("a", v));
+    }
+    if rnd.f64() < 0.6 {
+        let v = if rnd.below(8) == 0 { Value::String("s".into()) } else { subdoc(rnd, "acct") };
+        d.push(("acct", v));
+    }
+    if rnd.f64() < 0.3 {
+        d.push(("items", Value::Array(vec![i(1 + rnd.below(3) as i64)])));
+    }
+    for k in (1..d.len()).rev() {
+        d.swap(k, rnd.below(k + 1));
+    }
+    d
+}
+
+/// One random nested write on `m`. A write below a scalar is attempted too (the writer must
+/// refuse it), and so is a write that changes nothing.
+fn nested_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
+    let leaf = np(rnd.choice(&LEAVES));
+    match rnd.below(21) {
+        0..=2 => {
+            let by = rnd.choice(&[1, 5, 20, -3, 50]);
+            let at =
+                np(rnd.choice(&["acct.balance", "acct.balance", "a.b", "a.c", "a.d.e", "x", "y"]));
+            m.inc_at(&at, by, log, skew);
+        }
+        3 => {
+            // +n then -n on one writer, below a map
+            let at = np(rnd.choice(&["acct.balance", "a.b", "a.d.e"]));
+            let by = rnd.choice(&[1, 20, -3]);
+            if m.inc_at(&at, by, log, skew).is_some() {
+                m.inc_at(&at, -by, log, skew);
+            }
+        }
+        4..=6 => {
+            let v = if rnd.below(2) == 0 { pool_value(rnd) } else { scalar_or_array(rnd) };
+            m.set_at(&leaf, v, log, skew);
+        }
+        7..=9 => {
+            let at = rnd.choice(&PARENTS);
+            let v = if rnd.below(3) == 0 { scalar_or_array(rnd) } else { subdoc(rnd, at) };
+            m.set_at(&np(at), v, log, skew);
+        }
+        10 | 11 => {
+            m.unset_at(&leaf, log, skew);
+        }
+        12 => {
+            let at = np(rnd.choice(&["a", "a.d", "acct", "items"]));
+            m.unset_at(&at, log, skew);
+        }
+        13 | 14 => {
+            let d = rand_doc(rnd);
+            m.replace(&d, log, skew);
+        }
+        15 => {
+            // below a scalar or an array, on purpose
+            let at = np(rnd.choice(&["x.k", "items.0", "n.a.b", "a.b.c", "acct.balance.q"]));
+            match rnd.below(3) {
+                0 => m.set_at(&at, i(1), log, skew),
+                1 => m.unset_at(&at, log, skew),
+                _ => m.inc_at(&at, 1, log, skew),
+            };
+        }
+        16 => {
+            let d = rand_doc(rnd);
+            m.insert(&d, log, skew);
+        }
+        18..=20 => {
+            // arrays are atomic: two concurrent writes of one are an arrayClash
+            let at = np(rnd.choice(&["items", "items", "a.list"]));
+            let xs = (0..rnd.below(3)).map(|_| i(1 + rnd.below(3) as i64)).collect();
+            m.set_at(&at, Value::Array(xs), log, skew);
+        }
+        _ => {
+            if rnd.f64() < 0.25 {
+                m.delete(log, skew);
+            }
+        }
+    }
+}
+
+/// One random write on `m` (the op table of `run`), a nested one with some probability.
+fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64, nested: bool) {
+    if nested && rnd.f64() < 0.6 {
+        nested_write(rnd, m, log, skew);
+        return;
+    }
     let op = rnd.choice(&OPS);
     let p = rnd.choice(&["x", "n", "y"]);
     match op {
@@ -779,6 +985,9 @@ pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
     }
     let mut log = Log::new();
     let mut ms = new_cluster(&mut rnd, &cfg, &mut log);
+    for m in &mut ms {
+        m.check_writes = rc.retention.is_none();
+    }
     let mut did_restore = false;
     for i in 0..rc.steps {
         let m = rnd.below(ms.len());
@@ -796,7 +1005,7 @@ pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
             did_restore = true;
             continue;
         }
-        random_write(&mut rnd, &mut ms[m], &mut log, skew);
+        random_write(&mut rnd, &mut ms[m], &mut log, skew, rc.nested);
     }
     let settled = fixpoint(&mut ms, 40);
     RunOut { nodes: ms, log, settled }
@@ -811,6 +1020,7 @@ pub fn run_bounded(
     ret: u64,
     sync_every: usize,
     steps: usize,
+    nested: bool,
 ) -> (RunOut, u64) {
     let mut rnd = Rng::new(seed);
     let mut cfg = cfg.clone();
@@ -831,12 +1041,15 @@ pub fn run_bounded(
             random_pull(&mut rnd, &mut ms, 0.06);
             continue;
         }
-        if !did && i > steps / 2 && rnd.f64() < 0.15 {
+        // A nested run has no restore: a node restored to the backup of the start trails the
+        // retention by the time its write meets a cluster that has collected the delete of
+        // the life it writes into (ADR-085, the other regime, graded by the unbounded runs).
+        if !nested && !did && i > steps / 2 && rnd.f64() < 0.15 {
             random_restore(&mut rnd, &mut ms);
             did = true;
             continue;
         }
-        random_write(&mut rnd, &mut ms[m], &mut log, skew);
+        random_write(&mut rnd, &mut ms[m], &mut log, skew, nested);
     }
     let settled = fixpoint(&mut ms, 40);
     (RunOut { nodes: ms, log, settled }, gap)

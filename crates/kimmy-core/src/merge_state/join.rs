@@ -78,6 +78,10 @@ pub struct JoinOptions {
     /// Nested mutant: a write below a scalar or an array is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     write_below_scalar: bool,
+    /// Nested mutant: an `$unset` (or the removal of a field by a replace or a `$set` of a
+    /// sub-document) unsets the direct children of a map only, leaving the deeper cells set.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    unset_shallow: bool,
     /// The read side adds a cell's slots in the order of their stamps instead of the canonical
     /// order (writer `(node, epoch)`, then life and generation): a `Decimal128` total then
     /// depends on whose write was the later.
@@ -139,6 +143,8 @@ impl Default for JoinOptions {
             rewrite_unchanged: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             write_below_scalar: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            unset_shallow: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             sum_in_stamp_order: false,
             #[cfg(any(test, feature = "merge-mutants"))]
@@ -212,6 +218,7 @@ impl JoinOptions {
     switch!(array_clash_as_clash, set_array_clash_as_clash, false);
     switch!(rewrite_unchanged, set_rewrite_unchanged, false);
     switch!(write_below_scalar, set_write_below_scalar, false);
+    switch!(unset_shallow, set_unset_shallow, false);
     switch!(sum_in_stamp_order, set_sum_in_stamp_order, false);
     switch!(no_saturation, set_no_saturation, false);
     switch!(no_decimal_saturation, set_no_decimal_saturation, false);

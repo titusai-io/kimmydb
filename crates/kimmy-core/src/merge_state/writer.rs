@@ -148,8 +148,11 @@ fn below<'a>(
 }
 
 /// The model's `_unset_subtree`: unset what the writer sees at `p` and below it.
-fn unset_subtree(vis: &BTreeMap<Path, Value>, p: &Path, eff: &mut Eff) {
+fn unset_subtree(vis: &BTreeMap<Path, Value>, p: &Path, eff: &mut Eff, o: &JoinOptions) {
     for (q, _) in below(vis, p) {
+        if o.unset_shallow() && q.segments().len() > p.segments().len() + 1 {
+            continue;
+        }
         eff.put(q.clone(), Value::Unset);
     }
     eff.put(p.clone(), Value::Unset);
@@ -793,7 +796,7 @@ impl Writer {
                     .collect();
                 for q in old {
                     if !fields.iter().any(|(name, _)| name == q.name()) {
-                        unset_subtree(vis, q, eff);
+                        unset_subtree(vis, q, eff, &self.opts);
                     }
                 }
             }
@@ -847,7 +850,7 @@ impl Writer {
         }
         vis.get(path)?;
         let mut eff = Eff::default();
-        unset_subtree(&vis, path, &mut eff);
+        unset_subtree(&vis, path, &mut eff, &self.opts);
         self.commit(eff, m)
     }
 
@@ -863,6 +866,11 @@ impl Writer {
         // is no counter: its `$inc` is a register write of the computed value.
         let res = match counter::inc_result(vis.get(p), by, self.opts.int_bound())? {
             Inc::Register(v) => {
+                // A no-op writes nothing (ADR-208), as for a `$set`: the computed value is the
+                // stored representation byte for byte, e.g. `1e300 + 1.0`, or `$inc 0.0`.
+                if !self.opts.rewrite_unchanged() && Value::same(vis.get(p), &v) {
+                    return None;
+                }
                 let mut eff = Eff::default();
                 eff.put(p.clone(), v);
                 return self.commit(eff, m);
@@ -918,7 +926,7 @@ impl Writer {
         let tops: Vec<&Path> = vis.keys().filter(|q| q.segments().len() == 1).collect();
         for q in tops {
             if !doc.iter().any(|(d, _)| d == q) {
-                unset_subtree(&vis, q, &mut eff);
+                unset_subtree(&vis, q, &mut eff, &self.opts);
             }
         }
         if eff.len() == 0 {
