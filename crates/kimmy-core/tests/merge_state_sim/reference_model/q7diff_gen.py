@@ -635,7 +635,7 @@ def gen_script(seed):
         p = rnd.choice(names(odd, paths))
         if op == "insert":
             ks = rnd.sample(names(odd, paths), rnd.choice([1, 1, 2, 3]))
-            ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])      # (a null; an unset field is not drawn: the writer's insert stores an Unset register the model has no spelling for)
+            ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None, UNSET]))] for k in ks], sk])
         elif op == "upsert":
             ops.append(["upsert", m, rnd.choice(names(odd, ["x", "y", "n"])), rnd.choice(incs), sk])
         elif op == "upsert_soi":
@@ -702,7 +702,8 @@ def run_script(sc, dump_canon=False):
         res = None
         if kind == "insert":
             _, m, fields, sk = op
-            r = ms[m].insert({k: unjv(v) for k, v in fields}, log, sk)
+            # an unset spelled as a value is a field the model's document leaves out (the writer stores no register for it either)
+            r = ms[m].insert({k: unjv(v) for k, v in fields if unjv(v) is not UNSET}, log, sk)
             res = None if r is None else js(r)
         elif kind == "upsert":
             _, m, p, n, sk = op

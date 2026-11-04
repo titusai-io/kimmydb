@@ -24,10 +24,11 @@
 //! `every_bson_type_and_odd_names_round_trip_in_the_compact_form`).
 //!
 //! NULLS. A stored null is drawn (insert, replace, set): the model's `None` is a present null (A2), the writer's
-//! `Value::Null`. An unset spelled as a value (`Value::Unset`) is drawn in replace and set, and the generator gives the model
-//! its own spelling: `$unset` of the path, or the field left out of the document. Not in insert: the writer's insert stores an
-//! Unset register for it, which the model has no spelling for (`q4_set_compares_value_and_type`, `q4_replace_compares_value_and_type`
-//! and `an_unset_spelled_as_a_value_is_an_unset_for_the_order_state_too` cover the writer's side).
+//! `Value::Null`. An unset spelled as a value (`Value::Unset`) is drawn in insert, replace and set, and the generator gives the
+//! model its own spelling: `$unset` of the path, or the field left out of the document. The writer stores no register for an
+//! `Unset` field of an insert (or of the creation of an upsert), as the model's absent field; `q4_set_compares_value_and_type`,
+//! `q4_replace_compares_value_and_type`, `an_unset_spelled_as_a_value_is_an_unset_for_the_order_state_too` and
+//! `an_unset_field_in_an_insert_or_an_upsert_creation_stores_nothing` cover the writer's side.
 //!
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
