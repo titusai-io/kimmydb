@@ -105,7 +105,13 @@ impl Member {
             return false;
         }
         cands.sort();
-        let n = w.rng.choice(&cands);
+        let n = match w.forced_choice.take() {
+            Some(n) => {
+                assert!(cands.contains(&n), "the replayed tombstone choice is a candidate");
+                n
+            }
+            None => w.rng.choice(&cands),
+        };
         let k = src.phys.get(&n).unwrap().kill.unwrap();
         w.stats.bump("relay_tomb");
         if f.bt_early {

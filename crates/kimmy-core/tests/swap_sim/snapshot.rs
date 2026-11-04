@@ -137,7 +137,16 @@ impl Member {
         }
         let mut pages: Vec<String> =
             pl.phys.iter().filter(|(_, pd)| pd.alive).map(|(n, _)| n.clone()).collect();
-        shuffle(&mut w.rng, &mut pages);
+        match w.forced_pages.take() {
+            Some(order) => {
+                let (mut a, mut b) = (order.clone(), pages.clone());
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "the replayed page order is a permutation of the alive pages");
+                pages = order;
+            }
+            None => shuffle(&mut w.rng, &mut pages),
+        }
         let mut vec: BTreeMap<usize, i64> = BTreeMap::new();
         if f.grant_prefix {
             // the product's grant (invariant (i)): the sender's CONTIGUOUS coverage per origin, and only that prefix of
