@@ -9,10 +9,10 @@ use kimmy_core::merge_state::Value;
 
 use crate::grade::grade;
 use crate::oracle::Log;
-use crate::sim::{Cfg, Node, fix_key, fixpoint, pull};
+use crate::sim::{Cfg, Ent, Node, fix_key, fixpoint, p, pull};
 
 fn x_of(n: &Node) -> Value {
-    n.visible().and_then(|d| d.get("x").cloned()).expect("x is visible")
+    n.visible().and_then(|d| d.get(&p("x")).cloned()).expect("x is visible")
 }
 
 /// Restoring the same backup twice. The epoch from the restore's start HLC plus
@@ -22,7 +22,7 @@ fn x_of(n: &Node) -> Value {
 pub fn v4m2_epoch_twice(cfg: &Cfg) -> BTreeMap<char, Value> {
     let mut log = Log::new();
     let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(100))], &mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(100))], &mut log, 0);
     pull(&mut ms, 1, 0, None);
     pull(&mut ms, 2, 0, None);
     ms[0].backup();
@@ -40,7 +40,7 @@ pub fn v4m2_epoch_twice(cfg: &Cfg) -> BTreeMap<char, Value> {
 pub fn v4m2_check(design: &Cfg, mutant: &Cfg) -> bool {
     let d = v4m2_epoch_twice(design);
     let m = v4m2_epoch_twice(mutant);
-    d.values().all(|v| *v == Value::Int(125)) && m.values().all(|v| *v == Value::Int(105))
+    d.values().all(|v| *v == Value::Int64(125)) && m.values().all(|v| *v == Value::Int64(105))
 }
 
 type Scenario = fn(&Cfg) -> (Vec<Node>, Log);
@@ -53,7 +53,7 @@ type Scenario = fn(&Cfg) -> (Vec<Node>, Log);
 pub fn restore_inc_scenario(cfg: &Cfg) -> (Vec<Node>, Log) {
     let mut log = Log::new();
     let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(100))], &mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(100))], &mut log, 0);
     pull(&mut ms, 1, 0, None);
     pull(&mut ms, 2, 0, None);
     ms[0].backup();
@@ -77,15 +77,15 @@ pub fn snapshot_loss_scenario(cfg: &Cfg) -> (Vec<Node>, Log) {
     let mut log = Log::new();
     // indices: I0 A1 B2 C3 S4 O5
     let mut ms: Vec<Node> = "IABCSO".chars().map(|c| Node::new(c, cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(0))], &mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(0))], &mut log, 0);
     for m in 1..6 {
         pull(&mut ms, m, 0, None);
     }
-    ms[2].set("x", Value::Str("b".into()), &mut log, 0);
+    ms[2].set("x", Value::String("b".into()), &mut log, 0);
     pull(&mut ms, 3, 2, None);
-    ms[3].set("x", Value::Str("c".into()), &mut log, 0);
+    ms[3].set("x", Value::String("c".into()), &mut log, 0);
     ms[1].w.clock = Hlc::new(5, 0);
-    ms[1].set("x", Value::Str("a".into()), &mut log, 0);
+    ms[1].set("x", Value::String("a".into()), &mut log, 0);
     pull(&mut ms, 4, 2, None);
     {
         let (a, b) = ms.split_at_mut(4);
@@ -205,8 +205,13 @@ fn graded(cfg: &Cfg, names: &str, f: impl FnOnce(&mut Vec<Node>, &mut Log)) -> V
 /// The B1 and M1 scenarios (a counter that nets to zero; a non-numeric upsert creation value),
 /// each with the problems the oracle finds.
 pub fn scenarios() -> Vec<(String, Vec<String>)> {
-    let cfg = Cfg::default_ret();
-    let s = |x: &str| Value::Str(x.into());
+    scenarios_with(&Cfg::default_ret())
+}
+
+/// [`scenarios`] on the given configuration: a mutant is killed by them when they find a problem.
+pub fn scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
+    let cfg = cfg.clone();
+    let s = |x: &str| Value::String(x.into());
     let mut out = Vec::new();
     out.push((
         "zero sum: insert {n:a}; +1; -1".to_string(),
@@ -233,7 +238,7 @@ pub fn scenarios() -> Vec<(String, Vec<String>)> {
     out.push((
         "zero sum: {x:100}; $unset x; +5; -5".to_string(),
         graded(&cfg, "A", |ms, log| {
-            ms[0].insert(&[("x", Value::Int(100))], log, 0);
+            ms[0].insert(&[("x", Value::Int64(100))], log, 0);
             ms[0].unset("x", log, 0);
             ms[0].inc("x", 5, log, 0);
             ms[0].inc("x", -5, log, 0);
@@ -251,9 +256,384 @@ pub fn scenarios() -> Vec<(String, Vec<String>)> {
                 }
                 ms[1].upsert_inc("n", 5, log, 0);
                 pull(ms, 2, 0, None);
-                ms[2].set("n", Value::Int(7), log, 0);
+                ms[2].set("n", Value::Int64(7), log, 0);
             }),
         ));
     }
     out
+}
+
+// ---- the counter cell's fold (review item M2) ----------------------------------------------
+
+/// Every member's value of `path` after the fixpoint, against `want`: the problems found.
+fn all_read(ms: &[Node], path: &str, want: i64) -> Vec<String> {
+    ms.iter()
+        .filter_map(|n| {
+            let got = n.visible().and_then(|d| d.get(&p(path)).cloned());
+            (got != Some(Value::Int64(want)))
+                .then(|| format!("{} reads {got:?}, not {want}", n.name))
+        })
+        .collect()
+}
+
+/// The fold scenarios of the counter cell, read by value (not through the oracle): a base write must
+/// absorb every slot its writer holds in an alive life, of any generation, not only the slots it counts.
+/// The four-step case of the review (M2): x = 100; B adds 5; C, which saw only the insert, sets x to a
+/// string and receives the 5 (an older generation: hidden), then sets x to 7; D, which saw only the
+/// insert, sets 50 with the newest stamp. Serial orders read 7 or 50, never 55. And EG2, the double-base
+/// form: A adds 1, B sets a to 2.5 (a generation that hides A's add), A receives it and sets 5, C (saw
+/// only the insert) sets 5 with the newest stamp: 5, never 6. A mutant that folds only the counted slots
+/// reads 55 and 6. And the marker scenario: `$set a {b: 1}` over a counter at `a` folds its slot (the
+/// mutant that folds nothing at a map marker leaves the slot without its pair). And the cross-life
+/// scenario: a base in the newest alive life folds a slot of another alive life (the mutant that folds
+/// only the write's own life leaves that slot without its pair).
+pub fn fold_scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
+    let s = |x: &str| Value::String(x.into());
+    let mut out = Vec::new();
+    {
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABCD".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].insert(&[("x", Value::Int64(100))], &mut log, 0);
+        pull(&mut ms, 1, 0, None);
+        ms[1].inc("x", 5, &mut log, 0);
+        pull(&mut ms, 2, 0, None);
+        ms[2].set("x", s("s"), &mut log, 0);
+        pull(&mut ms, 2, 1, None);
+        ms[2].set("x", Value::Int64(7), &mut log, 0);
+        pull(&mut ms, 3, 0, None);
+        ms[3].set("x", Value::Int64(50), &mut log, 100);
+        fixpoint(&mut ms, 40);
+        out.push(("fold: the four-step case reads 50".to_string(), all_read(&ms, "x", 50)));
+    }
+    {
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].insert(&[("a", Value::Int64(0))], &mut log, 0);
+        pull(&mut ms, 1, 0, None);
+        pull(&mut ms, 2, 0, None);
+        ms[0].inc("a", 1, &mut log, 0);
+        ms[1].set("a", Value::Double(2.5), &mut log, 0);
+        pull(&mut ms, 0, 1, None);
+        ms[0].set("a", Value::Int64(5), &mut log, 0);
+        ms[2].set("a", Value::Int64(5), &mut log, 100);
+        fixpoint(&mut ms, 40);
+        out.push((
+            "fold: EG2, a double base `$set a 2.5`, reads 5".to_string(),
+            all_read(&ms, "a", 5),
+        ));
+    }
+    {
+        // A map-marker base over a counter folds the counter's slots: `$set a {b: 1}` over a counter at `a`
+        // writes a marker as a register of `a` (a base) and a leaf below it, and the slot of `a` takes the
+        // pair the marker held. Read through the state, not by value (what the pair changes is what a later
+        // base counts, and the mutant that folds nothing at a marker leaves the slot without a pair).
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "A".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].insert(&[("a", Value::Int64(1))], &mut log, 0);
+        ms[0].inc("a", 5, &mut log, 0);
+        ms[0].set("a", Value::Document(vec![("b".to_string(), Value::Int64(1))]), &mut log, 0);
+        let slots: Vec<_> = ms[0].state().slots.values().collect();
+        let problems = match slots.as_slice() {
+            [sl] if sl.absorbed.as_ref() == Some(&(sl.stamp, sl.total)) => Vec::new(),
+            [sl] => vec![format!("the marker write left the slot's pair at {:?}", sl.absorbed)],
+            _ => vec![format!("{} slots, not one", slots.len())],
+        };
+        out.push(("fold: a map-marker base over a counter folds its slots".to_string(), problems));
+    }
+    {
+        // A base write in the NEWEST alive life folds a slot of ANOTHER alive life (the shape of seed 792 of
+        // the nested differential): C inserts `c` and adds 5 (a slot in C's insert life); D upserts a counter
+        // at `y` (an upsert life beside the insert; D's life is the newer, same HLC and the greater writer);
+        // C pulls it and sets `c` to a double, a base written in D's life. The slot of C's life takes the
+        // pair the base held; the mutant that folds only the slots of the write's own life leaves it bare.
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "CD".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].insert(&[("c", Value::Int64(0))], &mut log, 0);
+        ms[0].inc("c", 5, &mut log, 0);
+        ms[1].upsert_inc("y", 1, &mut log, 0);
+        pull(&mut ms, 0, 1, None);
+        let alive = ms[0].w.alive();
+        ms[0].set("c", Value::Double(2.5), &mut log, 0);
+        let slots: Vec<_> = ms[0].state().slots.iter().filter(|(k, _)| k.1 == p("c")).collect();
+        let problems = match slots.as_slice() {
+            _ if alive.len() != 2 => vec![format!("{} alive lives, not two", alive.len())],
+            [(k, _)] if Some(&k.0) == alive.last() => {
+                vec!["the slot is in the write's own life, not in another".to_string()]
+            }
+            [(_, sl)] if sl.absorbed.as_ref() == Some(&(sl.stamp, sl.total)) => Vec::new(),
+            [(_, sl)] => vec![format!("the base left the other life's slot at {:?}", sl.absorbed)],
+            _ => vec![format!("{} slots at c, not one", slots.len())],
+        };
+        out.push((
+            "fold: a base in the newest alive life folds a slot of another alive life".to_string(),
+            problems,
+        ));
+    }
+    out
+}
+
+// ---- Q3: a collected life must not come back (probes_q3.py of the model) -------------------
+
+/// What a Q3 script found: A's document right after the pull that could bring a collected life back,
+/// every member's document after the fixpoint, how many entries A was handed by that pull, and what
+/// the oracle says of the finished run.
+pub struct Q3Out {
+    pub a_after: Option<BTreeMap<kimmy_core::merge_state::Path, Value>>,
+    pub finals: Vec<Option<BTreeMap<kimmy_core::merge_state::Path, Value>>>,
+    pub delivered: usize,
+    pub graded: Vec<String>,
+}
+
+impl Q3Out {
+    /// Did the collected life (`old`) come back at A?
+    pub fn resurrected(&self) -> bool {
+        self.a_after.as_ref().is_some_and(|d| d.contains_key(&p("old")))
+    }
+
+    /// Clean: no `old` at A, `y` written, every member alike, and the oracle finds nothing.
+    pub fn clean(&self) -> bool {
+        let y = self.a_after.as_ref().and_then(|d| d.get(&p("y")));
+        !self.resurrected()
+            && y == Some(&Value::Int64(1))
+            && self.finals.iter().all(|f| *f == self.finals[0])
+            && self.finals[0].as_ref().is_some_and(|d| !d.contains_key(&p("old")))
+            && self.graded.is_empty()
+    }
+}
+
+/// The retention of the Q3 scripts (R = 10), with the flags of the configuration under test.
+fn q3_cfg(cfg: &Cfg) -> Cfg {
+    let mut c = Cfg::new(10);
+    c.flags = cfg.flags;
+    c
+}
+
+fn q3_old_life_collected(a: &Node) {
+    assert!(
+        !a.visible().is_some_and(|d| d.contains_key(&p("old"))),
+        "setup: the old life is collected"
+    );
+}
+
+/// The review's case: R = 10, A inserts {x, old}, deletes, re-inserts, writes 15 times, fixpoint; B takes a
+/// backup and restores at once and writes y; A pulls from B. B's pulls for its new epoch start at the
+/// epoch's start HLC (the start-HLC rule) or at 0 (a replay of B's whole oplog); the covered-entry skip
+/// then only witnesses what A holds. Either rule alone keeps the life dead; with both off it comes back.
+pub fn q3_restore(cfg: &Cfg) -> Q3Out {
+    let cfg = q3_cfg(cfg);
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "AB".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(1)), ("old", Value::Int64(1))], &mut log, 0);
+    ms[0].delete(&mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(2))], &mut log, 0);
+    for i in 0..15 {
+        ms[0].set("x", Value::Int64(10 + i), &mut log, 0);
+    }
+    fixpoint(&mut ms, 40);
+    q3_old_life_collected(&ms[0]);
+    ms[1].backup();
+    ms[1].restore();
+    ms[1].set("y", Value::Int64(1), &mut log, 0);
+    let before = ms[0].entries_received;
+    pull(&mut ms, 0, 1, None);
+    let delivered = ms[0].entries_received - before;
+    let a_after = ms[0].visible();
+    fixpoint(&mut ms, 40);
+    Q3Out {
+        a_after,
+        finals: ms.iter().map(Node::visible).collect(),
+        delivered,
+        graded: grade(&ms, &log),
+    }
+}
+
+/// An idle origin (the review's M1: no restore at all). C inserts and is silent; A kills and re-creates the
+/// document twice and writes 15 times; the fixpoint collects life 1 everywhere. C then writes y and A pulls
+/// from C: the threshold is A's witnessed C, one old write, so C re-serves every entry it appended above
+/// it, among them life 1's insert. The start-HLC rule cannot help (C's epoch is a first epoch): only the
+/// covered-entry skip keeps the life dead.
+pub fn q3_idle_origin(cfg: &Cfg) -> Q3Out {
+    let cfg = q3_cfg(cfg);
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[2].insert(&[("x", Value::Int64(0))], &mut log, 0);
+    fixpoint(&mut ms, 40);
+    ms[0].delete(&mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(1)), ("old", Value::Int64(1))], &mut log, 0);
+    fixpoint(&mut ms, 40);
+    ms[0].delete(&mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(2))], &mut log, 0);
+    for i in 0..15 {
+        ms[0].set("x", Value::Int64(10 + i), &mut log, 0);
+    }
+    fixpoint(&mut ms, 40);
+    q3_old_life_collected(&ms[0]);
+    ms[2].set("y", Value::Int64(1), &mut log, 0);
+    let before = ms[0].entries_received;
+    pull(&mut ms, 0, 2, None);
+    let delivered = ms[0].entries_received - before;
+    let a_after = ms[0].visible();
+    fixpoint(&mut ms, 40);
+    Q3Out {
+        a_after,
+        finals: ms.iter().map(Node::visible).collect(),
+        delivered,
+        graded: grade(&ms, &log),
+    }
+}
+
+/// A late member. D joins after the fact (a first epoch nobody has witnessed), pulls everything one entry at
+/// a time, writes y; A pulls from D: D's origin starts at 0 under either rule, so D re-serves the old entries.
+/// Only the covered-entry skip keeps the collected life dead.
+pub fn q3_late_member(cfg: &Cfg) -> Q3Out {
+    let cfg = q3_cfg(cfg);
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "AB".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(1)), ("old", Value::Int64(1))], &mut log, 0);
+    fixpoint(&mut ms, 40);
+    ms[0].delete(&mut log, 0);
+    ms[0].insert(&[("x", Value::Int64(2))], &mut log, 0);
+    for i in 0..15 {
+        ms[0].set("x", Value::Int64(10 + i), &mut log, 0);
+    }
+    fixpoint(&mut ms, 40);
+    q3_old_life_collected(&ms[0]);
+    ms.push(Node::new('D', &cfg));
+    while pull(&mut ms, 2, 1, Some(1)) {
+        let (b, d) = (&ms[1], &ms[2]);
+        if b.servable.iter().all(|(o, h)| *h <= d.witnessed.get(o).copied().unwrap_or(Hlc::ZERO)) {
+            break;
+        }
+    }
+    ms[2].set("y", Value::Int64(1), &mut log, 0);
+    let before = ms[0].entries_received;
+    pull(&mut ms, 0, 2, None);
+    let delivered = ms[0].entries_received - before;
+    let a_after = ms[0].visible();
+    fixpoint(&mut ms, 40);
+    Q3Out {
+        a_after,
+        finals: ms.iter().map(Node::visible).collect(),
+        delivered,
+        graded: grade(&ms, &log),
+    }
+}
+
+/// The Q3 scripts on the flags of the given configuration, named.
+pub fn q3_scripts(cfg: &Cfg) -> Vec<(&'static str, Q3Out)> {
+    vec![
+        ("restore", q3_restore(cfg)),
+        ("idle origin", q3_idle_origin(cfg)),
+        ("late member", q3_late_member(cfg)),
+    ]
+}
+
+/// The design is clean on all three scripts; with the covered-entry skip off the idle origin and the late
+/// member bring the collected life back (the start-HLC rule cannot help them); with both rules off the
+/// restore does too, and either rule alone clears it. Returns the problems found (empty when all hold).
+pub fn q3_check() -> Vec<String> {
+    let flags = |skip: bool, start: bool| {
+        let mut c = Cfg::default_ret();
+        c.flags.covered_skip = skip;
+        c.flags.start_hlc = start;
+        c
+    };
+    let mut bad = Vec::new();
+    for (skip, start) in [(true, true), (true, false), (false, true)] {
+        let r = q3_restore(&flags(skip, start));
+        if !r.clean() {
+            bad.push(format!("restore, skip {skip}, start {start}: not clean"));
+        }
+    }
+    if !q3_restore(&flags(false, false)).resurrected() {
+        bad.push("restore with both rules off should resurrect the old life".into());
+    }
+    for (name, f) in [
+        ("idle origin", q3_idle_origin as fn(&Cfg) -> Q3Out),
+        ("late member", q3_late_member as fn(&Cfg) -> Q3Out),
+    ] {
+        for start in [true, false] {
+            if !f(&flags(true, start)).clean() {
+                bad.push(format!("{name}, skip on, start {start}: not clean"));
+            }
+            if !f(&flags(false, start)).resurrected() {
+                bad.push(format!("{name}, skip off, start {start}: the old life should come back"));
+            }
+        }
+    }
+    if !v3m1_order_independent(&Cfg::default_ret()) {
+        bad.push("the design should hold one state whatever the order of the entries after a long partition".into());
+    }
+    if !q3_whole_vector(&Cfg::default_ret()) {
+        bad.push(
+            "the design should apply an entry whose stamp is covered but whose vector is not"
+                .into(),
+        );
+    }
+    // the start-HLC rule changes what is delivered, not the states: A is handed fewer entries by the
+    // restored member's pull when a never-witnessed origin starts at its epoch's start HLC
+    let (with, without) = (q3_restore(&flags(true, true)), q3_restore(&flags(true, false)));
+    if with.delivered >= without.delivered {
+        bad.push(format!(
+            "the start-HLC rule should deliver fewer entries ({} against {})",
+            with.delivered, without.delivered
+        ));
+    }
+    bad
+}
+
+/// The covered-entry skip looks at the WHOLE vector of the entry (the model's rule, Step 3's), not at its
+/// stamp: an entry whose stamp the receiver covers but whose state carries a write the receiver lacks must
+/// be applied. In an honest run the two rules agree (a version vector is causally closed: covering a
+/// writer's stamp means holding that writer's whole state at it), so only a hand-made entry tells them
+/// apart: C holds A's insert; B writes y after receiving it; C is handed an entry stamped by A's insert
+/// carrying B's state. Returns whether C learned B's write.
+pub fn q3_whole_vector(cfg: &Cfg) -> bool {
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, cfg)).collect();
+    let a1 = ms[0].insert(&[("x", Value::Int64(1))], &mut log, 0).expect("inserted");
+    pull(&mut ms, 1, 0, None);
+    pull(&mut ms, 2, 0, None);
+    ms[1].set("y", Value::Int64(2), &mut log, 0);
+    let ent = std::rc::Rc::new(Ent::W {
+        st: a1,
+        state: ms[1].state().clone(),
+        contained: ms[1].contained.clone(),
+    });
+    ms[2].receive_entry(&ent);
+    ms[2].visible().is_some_and(|d| d.get(&p("y")) == Some(&Value::Int64(2)))
+}
+
+/// V3M1 under the covered-entry skip (the default protocol): a partition longer than retention
+/// (ADR-085). C inserts and is silent from A, who kills the life; C then writes twice with its clock far
+/// ahead (`u` and `u2`), so the horizon of any join with C's entries is past the dead life and its delete.
+/// Two members that apply the SAME entries in different orders must agree: `W` applies A's delete `s`, then
+/// `u`, then `u2`; `V` applies `s`, then `u2` (then `u`, which the skip witnesses and does not apply).
+/// None of the entries is covered by the receiver's vector when it arrives, so the skip never applies:
+/// this is the case where the order of horizon and aliveness still matters in the default protocol.
+/// The design (the horizon of the joined vectors first) takes the dead life out BEFORE the union and
+/// both members hold C's life; applied after aliveness, `W` collects the life at `u` and C's `u2`
+/// brings it back, while `V` never lets it in. Returns whether `W` and `V` hold the same state.
+pub fn v3m1_order_independent(cfg: &Cfg) -> bool {
+    let mut cfg = cfg.clone();
+    cfg.opts.retention = 10;
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "AC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[1].insert(&[("x", Value::Int64(1))], &mut log, 0);
+    pull(&mut ms, 0, 1, None);
+    ms[0].delete(&mut log, 0);
+    ms[1].set("x", Value::Int64(2), &mut log, 1000);
+    ms[1].set("x", Value::Int64(3), &mut log, 1000);
+    let entry = |n: &Node, i: usize| std::rc::Rc::clone(n.oplog.values().nth(i).expect("an entry"));
+    let s = entry(&ms[0], ms[0].oplog.len() - 1);
+    let (u, u2) = (entry(&ms[1], 1), entry(&ms[1], 2));
+    let mut w = Node::new('W', &cfg);
+    let mut v = Node::new('V', &cfg);
+    for e in [&s, &u, &u2] {
+        w.receive_entry(e);
+    }
+    for e in [&s, &u2, &u] {
+        v.receive_entry(e);
+    }
+    w.canon() == v.canon()
 }

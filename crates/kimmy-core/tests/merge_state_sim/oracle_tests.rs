@@ -4,11 +4,11 @@
 
 use kimmy_core::merge_state::{LossKey, LossKind, MStamp, Value};
 
-use crate::oracle::{self, Log};
-use crate::sim::{Cfg, Node, fixpoint, pull};
+use crate::oracle::{self, Doc, Log};
+use crate::sim::{Cfg, Node, fixpoint, np, p, pull, sub};
 
 fn key(kind: LossKind, path: &str, stamp: MStamp) -> LossKey {
-    LossKey { kind, path: path.to_string(), stamp }
+    if path == "_" { LossKey::document(kind, stamp) } else { LossKey::field(kind, np(path), stamp) }
 }
 
 /// The oracle's `alive` and `dels` for a finished log.
@@ -24,10 +24,10 @@ fn deletewon_must_name_a_path_the_write_wrote() {
     let ret = cfg.opts.retention;
     let mut log = Log::new();
     let mut ms: Vec<Node> = "AB".chars().map(|c| Node::new(c, &cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(1))], &mut log, 0).unwrap();
+    ms[0].insert(&[("x", Value::Int64(1))], &mut log, 0).unwrap();
     pull(&mut ms, 1, 0, None);
     ms[0].delete(&mut log, 0).unwrap();
-    let b2 = ms[1].set("x", Value::Int(5), &mut log, 0).unwrap();
+    let b2 = ms[1].set("x", Value::Int64(5), &mut log, 0).unwrap();
     fixpoint(&mut ms, 40);
     let (alive, dels) = facts(&log, ret);
     assert!(alive.is_empty());
@@ -46,10 +46,10 @@ fn insertlost_must_name_a_path_the_write_wrote() {
     let ret = cfg.opts.retention;
     let mut log = Log::new();
     let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
-    let a1 = ms[0].insert(&[("x", Value::Int(1))], &mut log, 0).unwrap();
+    let a1 = ms[0].insert(&[("x", Value::Int64(1))], &mut log, 0).unwrap();
     pull(&mut ms, 2, 0, None);
-    let c2 = ms[2].set("note", Value::Str("c".into()), &mut log, 0).unwrap();
-    ms[1].insert(&[("y", Value::Int(2))], &mut log, 4).unwrap();
+    let c2 = ms[2].set("note", Value::String("c".into()), &mut log, 0).unwrap();
+    ms[1].insert(&[("y", Value::Int64(2))], &mut log, 4).unwrap();
     fixpoint(&mut ms, 40);
     let (alive, dels) = facts(&log, ret);
     let ok = |k: LossKey| oracle::sound_record(&k, &log, &alive, &dels, ret);
@@ -69,10 +69,10 @@ fn deletewon_needs_a_delete_that_killed_the_life() {
     let ret = cfg.opts.retention;
     let mut log = Log::new();
     let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(1))], &mut log, 0).unwrap();
+    ms[0].insert(&[("x", Value::Int64(1))], &mut log, 0).unwrap();
     ms[0].delete(&mut log, 0).unwrap();
-    let b = ms[1].insert(&[("y", Value::Int(2))], &mut log, 40).unwrap();
-    ms[2].insert(&[("w", Value::Int(3))], &mut log, 59).unwrap();
+    let b = ms[1].insert(&[("y", Value::Int64(2))], &mut log, 40).unwrap();
+    ms[2].insert(&[("w", Value::Int64(3))], &mut log, 59).unwrap();
     assert_eq!((b.hlc.wall_ms, ret), (41, 10));
     let (alive, dels) = facts(&log, ret);
     assert_eq!(dels.len(), 1);
@@ -95,11 +95,11 @@ fn clash_must_name_a_path_the_write_wrote() {
     let ret = cfg.opts.retention;
     let mut log = Log::new();
     let mut ms: Vec<Node> = "AB".chars().map(|c| Node::new(c, &cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(1)), ("y", Value::Int(1))], &mut log, 0).unwrap();
+    ms[0].insert(&[("x", Value::Int64(1)), ("y", Value::Int64(1))], &mut log, 0).unwrap();
     pull(&mut ms, 1, 0, None);
-    let a_x = ms[0].set("x", Value::Int(5), &mut log, 0).unwrap();
-    let a_y = ms[0].set("y", Value::Int(2), &mut log, 0).unwrap();
-    let b_y = ms[1].set("y", Value::Int(9), &mut log, 4).unwrap();
+    let a_x = ms[0].set("x", Value::Int64(5), &mut log, 0).unwrap();
+    let a_y = ms[0].set("y", Value::Int64(2), &mut log, 0).unwrap();
+    let b_y = ms[1].set("y", Value::Int64(9), &mut log, 4).unwrap();
     assert!(a_y < b_y && a_x < b_y);
     fixpoint(&mut ms, 40);
     let (alive, dels) = facts(&log, ret);
@@ -108,4 +108,416 @@ fn clash_must_name_a_path_the_write_wrote() {
     assert!(ms[0].state().losses.contains_key(&key(LossKind::Clash, "y", a_y)));
     assert!(!ok(key(LossKind::Clash, "y", a_x)), "A's write of x never wrote y");
     assert!(!ok(key(LossKind::Clash, "nope", a_y)), "a path nobody wrote");
+}
+
+/// The three cells of `a.d.f` as the flat map the oracle and the states return.
+fn deep(scalar_a: Option<i64>, f: i64) -> Doc {
+    let mut d = Doc::new();
+    d.insert(p("a"), Value::Map);
+    d.insert(np("a.d"), Value::Map);
+    d.insert(np("a.d.f"), Value::Int64(f));
+    if let Some(n) = scalar_a {
+        // a scalar at `a` that hides everything below it
+        d = Doc::new();
+        d.insert(p("a"), Value::Int64(n));
+    }
+    d
+}
+
+/// A inserts {a: {d: {e: 1}}}; B and C take it; B sets the scalar `a` and C sets `a.d.f` two
+/// levels below it, concurrently. `b_newer` says whose clock is ahead.
+fn scalar_against_a_deep_write(b_newer: bool) -> (Log, Vec<Node>, MStamp, MStamp) {
+    let cfg = Cfg::default_ret();
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("a", sub(&[("d", sub(&[("e", Value::Int64(1))]))]))], &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    pull(&mut ms, 2, 0, None);
+    let (skew_b, skew_c) = if b_newer { (4, 0) } else { (0, 4) };
+    let b = ms[1].set("a", Value::Int64(5), &mut log, skew_b).unwrap();
+    let c = ms[2].set_at(&np("a.d.f"), Value::Int64(7), &mut log, skew_c).unwrap();
+    fixpoint(&mut ms, 40);
+    (log, ms, b, c)
+}
+
+#[test]
+fn a_newer_deep_write_makes_the_scalar_a_map_and_the_scalar_loses() {
+    let (log, ms, b, c) = scalar_against_a_deep_write(false);
+    assert!(b < c);
+    let ret = Cfg::default_ret().opts.retention;
+    let (doc, alive, dels) = oracle::oracle(&log, ret, i64::MAX);
+    // only what is newer than the scalar shows below it: `a.d.f`, not `a.d.e`
+    assert_eq!(doc, Some(deep(None, 7)));
+    assert!(ms.iter().all(|m| m.visible() == doc));
+    let ok = |k: LossKey| oracle::sound_record(&k, &log, &alive, &dels, ret);
+    assert!(ok(key(LossKind::TypeClash, "a", b)), "the scalar lost to a cell two levels down");
+    assert!(ms[0].state().losses.contains_key(&key(LossKind::TypeClash, "a", b)));
+    assert!(!ok(key(LossKind::TypeClash, "a.d.f", c)), "the newer write did not lose");
+}
+
+#[test]
+fn a_newer_scalar_hides_the_deep_write_and_the_deep_write_is_the_record() {
+    let (log, ms, b, c) = scalar_against_a_deep_write(true);
+    assert!(c < b);
+    let ret = Cfg::default_ret().opts.retention;
+    let (doc, alive, dels) = oracle::oracle(&log, ret, i64::MAX);
+    assert_eq!(doc, Some(deep(Some(5), 0)));
+    assert!(ms.iter().all(|m| m.visible() == doc));
+    let ok = |k: LossKey| oracle::sound_record(&k, &log, &alive, &dels, ret);
+    assert!(ok(key(LossKind::TypeClash, "a.d.f", c)), "the hidden cell is reported at its path");
+    assert!(ms[0].state().losses.contains_key(&key(LossKind::TypeClash, "a.d.f", c)));
+    assert!(!ok(key(LossKind::TypeClash, "a", b)), "the newer scalar did not lose");
+    assert!(!ok(key(LossKind::TypeClash, "a.d.e", c)), "C never wrote a.d.e");
+}
+
+#[test]
+fn the_leaf_effects_of_a_nested_write_are_the_changed_leaves() {
+    use crate::oracle::{Expected, Intent, expected_effects};
+    let mut old = Doc::new();
+    old.insert(p("a"), Value::Map);
+    old.insert(np("a.b"), Value::Int64(1));
+    old.insert(np("a.d"), Value::Map);
+    old.insert(np("a.d.e"), Value::Int64(3));
+    // a sub-document that keeps `a.b`, drops `a.d` and its leaf, and adds `a.c`
+    let Expected::Effects(e) = expected_effects(
+        Some(&old),
+        &Intent::Set(p("a"), sub(&[("b", Value::Int64(1)), ("c", Value::Int64(2))])),
+    ) else {
+        panic!("refused")
+    };
+    let want: Doc = [
+        (np("a.c"), Value::Int64(2)),
+        (np("a.d"), Value::Unset),
+        (np("a.d.e"), Value::Unset),
+        (p("a"), Value::Map),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(e, want, "a.b is unchanged and is not written; a.d and below are unset");
+    // the same document again is a no-op
+    let same = Intent::Set(np("a.b"), Value::Int64(1));
+    assert_eq!(expected_effects(Some(&old), &same), Expected::Effects(Default::default()));
+    // below a scalar is refused
+    assert_eq!(
+        expected_effects(Some(&old), &Intent::Set(np("a.b.q"), Value::Int64(1))),
+        Expected::Refused
+    );
+}
+
+// ---- the read-your-writes oracle (`order_oracle.rs`) on small documents ------------------------
+
+mod order_oracle_cases {
+    use kimmy_core::merge_state::{OrderedValue, Value};
+
+    use crate::order_oracle::{OrdOp, Places, check, reorders};
+    use crate::sim::np;
+
+    type Doc = Vec<(String, OrderedValue)>;
+
+    fn leaf(n: &str) -> (String, OrderedValue) {
+        (n.to_string(), OrderedValue::Leaf(Value::Int64(1)))
+    }
+    fn empty_map(n: &str) -> (String, OrderedValue) {
+        (n.to_string(), OrderedValue::Doc(vec![("c".to_string(), OrderedValue::Doc(Vec::new()))]))
+    }
+
+    fn history(of: &[&[&str]]) -> Places {
+        Places::of_paths(of)
+    }
+
+    fn set_n(before: &Doc, after: &Doc, hist: &Places) -> Result<bool, String> {
+        check(Some(before), Some(after), &OrdOp::Set(np("n"), Value::Int64(1)), hist, true)
+            .map(|c| c.trailing)
+    }
+
+    /// O2-3: maps with no leaf below them and no history have no place; a field created after them goes BEFORE them, and
+    /// they trail in path order (`k` before `m`), wherever they were in the document.
+    #[test]
+    fn maps_without_a_place_trail_in_path_order() {
+        let hist = history(&[&["a"]]);
+        let before: Doc = vec![leaf("a"), empty_map("k"), empty_map("m")];
+        let ok: Doc = vec![leaf("a"), leaf("n"), empty_map("k"), empty_map("m")];
+        assert_eq!(
+            set_n(&before, &ok, &hist),
+            Ok(true),
+            "decided, on a level with maps that have no place"
+        );
+        // before the maps' path order is wrong (m before k), after the fields with a place is wrong (n last)
+        let unsorted: Doc = vec![leaf("a"), leaf("n"), empty_map("m"), empty_map("k")];
+        assert!(set_n(&before, &unsorted, &hist).is_err());
+        let last: Doc = vec![leaf("a"), empty_map("k"), empty_map("m"), leaf("n")];
+        assert!(set_n(&before, &last, &hist).is_err());
+        let first: Doc = vec![leaf("n"), leaf("a"), empty_map("k"), empty_map("m")];
+        assert!(set_n(&before, &first, &hist).is_err());
+        // a map WITH a leaf below it has a place: the new field is after it
+        let with_leaf: Doc =
+            vec![leaf("a"), ("m".to_string(), OrderedValue::Doc(vec![leaf("x")])), empty_map("k")];
+        let after: Doc = vec![
+            leaf("a"),
+            ("m".to_string(), OrderedValue::Doc(vec![leaf("x")])),
+            leaf("n"),
+            empty_map("k"),
+        ];
+        assert_eq!(set_n(&with_leaf, &after, &hist), Ok(true));
+        // and a map with history has one too
+        let hist_m = history(&[&["a"], &["m"]]);
+        let placed: Doc = vec![leaf("a"), leaf("n"), empty_map("k"), empty_map("m")];
+        assert!(set_n(&before, &placed, &hist_m).is_err(), "m has a place now: n goes after it");
+    }
+
+    /// A field created again whose place stands comes before every map with no leaf and no place (the no-born group of the
+    /// model's `okey`), wherever the other fields with places are.
+    #[test]
+    fn a_re_created_field_with_a_place_comes_before_the_maps_without_one() {
+        let places = Places::of_paths(&[&["n"]]);
+        let before: Doc = vec![leaf("a"), empty_map("k")];
+        let ok: Doc = vec![leaf("a"), leaf("n"), empty_map("k")];
+        let after_the_map: Doc = vec![leaf("a"), empty_map("k"), leaf("n")];
+        let check_n = |after: &Doc| {
+            check(Some(&before), Some(after), &OrdOp::Set(np("n"), Value::Int64(1)), &places, true)
+        };
+        assert!(check_n(&ok).is_ok());
+        assert!(check_n(&after_the_map).is_err(), "n is after a map that has no place");
+    }
+
+    /// O2-4: a replace that puts the same fields in another order is a write; the same order is not.
+    #[test]
+    fn a_replace_in_another_order_is_a_write() {
+        let before: Doc = vec![leaf("a"), leaf("b")];
+        let swapped = OrdOp::Replace(vec![
+            ("b".to_string(), Value::Int64(1)),
+            ("a".to_string(), Value::Int64(1)),
+        ]);
+        let same = OrdOp::Replace(vec![
+            ("a".to_string(), Value::Int64(1)),
+            ("b".to_string(), Value::Int64(1)),
+        ]);
+        assert!(reorders(Some(&before), &swapped));
+        assert!(!reorders(Some(&before), &same));
+        // a sub-document set, at a path
+        let nested: Doc = vec![("m".to_string(), OrderedValue::Doc(vec![leaf("p"), leaf("q")]))];
+        let set = |a: &str, b: &str| {
+            OrdOp::Set(
+                np("m"),
+                Value::Document(vec![
+                    (a.to_string(), Value::Int64(1)),
+                    (b.to_string(), Value::Int64(1)),
+                ]),
+            )
+        };
+        assert!(reorders(Some(&nested), &set("q", "p")));
+        assert!(!reorders(Some(&nested), &set("p", "q")));
+        assert!(!reorders(Some(&nested), &set("p", "z")), "other fields: not a reorder");
+        // an insert over a live document is refused (model6.py `insert`: `if s.alive(): return None`): not a reorder,
+        // whatever the order of its fields (the four seeds that found it: 101, 349, 14, 24 of the sim's runs)
+        let insert = OrdOp::Insert(vec![
+            ("b".to_string(), Value::Int64(1)),
+            ("a".to_string(), Value::Int64(1)),
+        ]);
+        assert!(!reorders(Some(&before), &insert));
+    }
+}
+
+/// The read-your-writes oracle's "a field created again keeps its place" branch, driven by real Writers (the review's probe
+/// `order_probe.rs`). The shape of sim seed 912: A inserts `{x, m: {k, j}}`; B replaces with `{m}` (it unsets `x`); C,
+/// concurrently, replaces with `{x (unchanged: no cell), m: {k, j: 2}}`, which gives `x` a standing place; C receives B's
+/// write, then `$inc x` re-creates `x` at that place, FIRST (the model, `model6.py`, and the Writer both read `[x, m]`, and
+/// so does `pyprobe/order_touched.py`). With C first unsetting `m.k` (a child of the sibling `m`, which leaves `m`'s own
+/// floor as it was) the oracle used to skip `m` as "touched" and accept a forged `[m, x]`; it must refuse it in both.
+mod order_oracle_writers {
+    use std::collections::BTreeSet;
+
+    use kimmy_core::ids::NodeId;
+    use kimmy_core::merge_state::{
+        Epoch, JoinOptions, MStamp, OrderedValue, Value, Writer, WriterId, Written,
+    };
+
+    use crate::oracle::Intent;
+    use crate::order_oracle::{OrdOp, Places, check, op_of, places, record, write_ord};
+    use crate::sim::np;
+
+    type Doc = Vec<(String, OrderedValue)>;
+
+    fn i(n: i64) -> Value {
+        Value::Int64(n)
+    }
+    fn doc(f: &[(&str, Value)]) -> Value {
+        Value::Document(f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect())
+    }
+    fn names(d: &Doc) -> Vec<String> {
+        d.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    struct Node {
+        w: Writer,
+        contained: BTreeSet<MStamp>,
+    }
+
+    /// What one write gave the oracle.
+    struct Step {
+        before: Option<Doc>,
+        after: Option<Doc>,
+        op: OrdOp,
+        places: Places,
+        one_life: bool,
+    }
+
+    impl Node {
+        fn new(c: u8) -> Node {
+            let id = WriterId { node: NodeId::from_bytes([c; 16]), epoch: Epoch::from_u64(0) };
+            Node { w: Writer::new(id, JoinOptions::default()), contained: BTreeSet::new() }
+        }
+        /// The sim's `checked` and `logged`: the places before the write, the write, its order facts recorded.
+        fn write(
+            &mut self,
+            first: bool,
+            intent: Intent,
+            f: impl FnOnce(&mut Writer) -> Option<Written>,
+        ) -> Step {
+            let o = self.w.opts.clone();
+            let before = self.w.state.ordered_document(&o);
+            let pl = places(&self.contained, self.w.alive().last().copied());
+            let one_life = self.w.alive().len() == 1;
+            let r = f(&mut self.w).expect("the write is a write");
+            let op = op_of(&intent);
+            record(r.stamp, write_ord(before.as_deref(), &op), r.record.life, first);
+            self.contained.insert(r.stamp);
+            let after = self.w.state.ordered_document(&o);
+            Step { before, after, op, places: pl, one_life: one_life && self.w.alive().len() == 1 }
+        }
+        fn receive(&mut self, other: &Node) {
+            self.w.receive(&other.w.state);
+            self.contained.extend(other.contained.iter().copied());
+        }
+    }
+
+    fn history(unset_sibling: bool) -> Step {
+        let (mut a, mut b, mut c) = (Node::new(b'A'), Node::new(b'B'), Node::new(b'C'));
+        let base = [("x", i(1)), ("m", doc(&[("k", i(1)), ("j", i(1))]))];
+        let fields =
+            |f: &[(&str, Value)]| f.iter().map(|(k, v)| (np(k), v.clone())).collect::<Vec<_>>();
+        let named = |f: &[(&str, Value)]| {
+            f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect::<Vec<_>>()
+        };
+        a.write(true, Intent::Insert(named(&base)), |w| w.insert(&fields(&base), 0));
+        b.receive(&a);
+        c.receive(&a);
+        let rb = [("m", doc(&[("k", i(1)), ("j", i(1))]))];
+        b.write(false, Intent::Replace(named(&rb)), |w| w.write_replace(&fields(&rb), 0));
+        let rc = [("x", i(1)), ("m", doc(&[("k", i(1)), ("j", i(2))]))];
+        c.write(false, Intent::Replace(named(&rc)), |w| w.write_replace(&fields(&rc), 5));
+        c.receive(&b);
+        if unset_sibling {
+            c.write(false, Intent::Unset(np("m.k")), |w| w.write_unset(&np("m.k"), 0));
+        }
+        c.write(false, Intent::Inc(np("x")), |w| w.write_inc(&np("x"), 1, 0))
+    }
+
+    /// `after` with the field `name` of the top level moved to the end.
+    fn moved_last(d: &Doc, name: &str) -> Doc {
+        let mut d = d.clone();
+        let k = d.iter().position(|(n, _)| n == name).unwrap();
+        let f = d.remove(k);
+        d.push(f);
+        d
+    }
+
+    fn grade(s: &Step, after: &Doc) -> Result<(), String> {
+        check(s.before.as_deref(), Some(after), &s.op, &s.places, s.one_life).map(|_| ())
+    }
+
+    #[test]
+    fn a_re_created_field_must_come_before_a_sibling_whose_child_was_unset() {
+        for unset_sibling in [false, true] {
+            let s = history(unset_sibling);
+            let after = s.after.clone().unwrap();
+            assert_eq!(
+                names(&after),
+                ["x", "m"],
+                "the Writer (and the model) put x first: {unset_sibling}"
+            );
+            assert!(
+                s.places.born.contains_key(&vec!["x".to_string()]),
+                "x has a standing place in the log"
+            );
+            assert_eq!(grade(&s, &after), Ok(()), "the Writer's own document: {unset_sibling}");
+            let forged = moved_last(&after, "x");
+            assert!(
+                grade(&s, &forged).is_err(),
+                "[m, x] must be refused (C unsets m.k first: {unset_sibling})"
+            );
+        }
+    }
+}
+
+// ---- the absorbed rule: an increment counts only if no base write on the path had seen it ------
+
+/// The review's four-step case (item M2). x = 100 (A); B adds 5; C, which saw only the insert, sets x
+/// to a string, receives the 5 (an older generation) and sets x to 7; D, which saw only the insert, sets
+/// 50 with the newest stamp. The 5 is in the causal past of C's base, so no other base counts it again:
+/// the oracle reads 50 (the reading "the winner's writer had not seen" gives 55, which no serial order
+/// of the writes does), and every member agrees with it.
+#[test]
+fn the_oracle_reads_the_four_step_case_as_50() {
+    let cfg = Cfg::default_ret();
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABCD".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(100))], &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    ms[1].inc("x", 5, &mut log, 0).unwrap();
+    pull(&mut ms, 2, 0, None);
+    ms[2].set("x", Value::String("s".into()), &mut log, 0).unwrap();
+    pull(&mut ms, 2, 1, None);
+    ms[2].set("x", Value::Int64(7), &mut log, 0).unwrap();
+    pull(&mut ms, 3, 0, None);
+    ms[3].set("x", Value::Int64(50), &mut log, 100).unwrap();
+    fixpoint(&mut ms, 40);
+    let ret = cfg.opts.retention;
+    let (doc, _, _) = oracle::oracle(&log, ret, i64::MAX);
+    assert_eq!(doc.as_ref().and_then(|d| d.get(&p("x"))), Some(&Value::Int64(50)));
+    assert!(ms.iter().all(|m| m.visible() == doc));
+    assert_eq!(crate::grade::grade(&ms, &log), Vec::<String>::new());
+}
+
+/// EG2: the double-base form. A adds 1; B sets a to 2.5 (a generation that hides A's add); A receives
+/// it and sets 5; C, which saw only the insert, sets 5 with the newest stamp. Every serial order reads 5.
+#[test]
+fn the_oracle_reads_a_double_base_set_a_2_5_as_5() {
+    let cfg = Cfg::default_ret();
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("a", Value::Int64(0))], &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    pull(&mut ms, 2, 0, None);
+    ms[0].inc("a", 1, &mut log, 0).unwrap();
+    ms[1].set("a", Value::Double(2.5), &mut log, 0).unwrap();
+    pull(&mut ms, 0, 1, None);
+    ms[0].set("a", Value::Int64(5), &mut log, 0).unwrap();
+    ms[2].set("a", Value::Int64(5), &mut log, 100).unwrap();
+    fixpoint(&mut ms, 40);
+    let (doc, _, _) = oracle::oracle(&log, cfg.opts.retention, i64::MAX);
+    assert_eq!(doc.as_ref().and_then(|d| d.get(&p("a"))), Some(&Value::Int64(5)));
+    assert!(ms.iter().all(|m| m.visible() == doc));
+    assert_eq!(crate::grade::grade(&ms, &log), Vec::<String>::new());
+}
+
+/// An increment that a base write other than the winner saw is not counted either: A adds 3, B (which
+/// saw the 3) sets x to 20, C (which saw only the insert) sets x to 30 with the newest stamp. Reading
+/// "the winner's writer had not seen" gives 33; the 3 is in B's past, so 30.
+#[test]
+fn an_increment_seen_by_a_losing_base_is_not_counted_again() {
+    let cfg = Cfg::default_ret();
+    let mut log = Log::new();
+    let mut ms: Vec<Node> = "ABC".chars().map(|c| Node::new(c, &cfg)).collect();
+    ms[0].insert(&[("x", Value::Int64(10))], &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    pull(&mut ms, 2, 0, None);
+    ms[0].inc("x", 3, &mut log, 0).unwrap();
+    pull(&mut ms, 1, 0, None);
+    ms[1].set("x", Value::Int64(20), &mut log, 0).unwrap();
+    ms[2].set("x", Value::Int64(30), &mut log, 100).unwrap();
+    fixpoint(&mut ms, 40);
+    let (doc, _, _) = oracle::oracle(&log, cfg.opts.retention, i64::MAX);
+    assert_eq!(doc.as_ref().and_then(|d| d.get(&p("x"))), Some(&Value::Int64(30)));
+    assert!(ms.iter().all(|m| m.visible() == doc));
 }

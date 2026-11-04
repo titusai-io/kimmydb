@@ -21,18 +21,37 @@
 //! [`MergeState::canonical_bytes`] is the body alone and carries no tag; the
 //! hash covers the body. Mutant memory (`Gen::vv`, `MergeState::gens`) is in neither. The golden vectors in `tests.rs` pin all three: changing
 //! the bytes is a format change (a wipe release) and must be deliberate.
+//!
+//! Known defect of this form: a loss record about the whole document (`insertLost` of a
+//! superseded insert) is keyed by the path `_`, the same bytes as a record about a field
+//! literally named `_`. The pinned `mixed` golden holds a whole-document record, so the bytes
+//! stay. In memory the two are different ([`LossAt`]); `decode` tells them apart by the lost
+//! value (a field list is a whole document), which no record of a field has, so a state round
+//! trips, but the key bytes alone are ambiguous. The compact form (`compact.rs`) writes an
+//! explicit tag; this defect retires when it becomes the hash.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
+use super::counter::Num;
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Value, WriterId};
+use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-const MAGIC: [u8; 3] = *b"QMS";
+pub(super) const MAGIC: [u8; 3] = *b"QMS";
 const VERSION: u8 = 1;
+
+/// The deepest nesting of arrays inside a value that `decode` accepts (the BSON depth limit).
+pub(super) const MAX_VALUE_DEPTH: usize = 100;
+
+/// The version 1 form cannot hold a `Document` inside an array, a counter total of another type
+/// than `Int64`, an absorbed pair on a counter slot, or an order state. A state with one is written in the compact form (`QMS`
+/// version 2), and `decode` of version 1 refuses the compact tag.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("merge state: the version 1 form cannot hold this state")]
+pub struct V1CannotHold;
 
 /// A failure to decode an encoded state.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -45,12 +64,58 @@ pub enum DecodeError {
     BadTag(u8),
     #[error("merge state: invalid utf-8 string")]
     BadString,
+    #[error("merge state: invalid path")]
+    BadPath,
+    #[error("merge state: a path is deeper than the depth limit")]
+    PathTooDeep,
+    #[error("merge state: an index is outside its table")]
+    BadIndex,
     #[error("merge state: {0} trailing bytes")]
     Trailing(usize),
     #[error("merge state: a counter total is out of range")]
     TotalOutOfRange,
+    #[error("merge state: a value is nested too deep")]
+    TooDeep,
     #[error("merge state: not canonical (map keys duplicated or out of order)")]
     NotCanonical,
+    #[error("merge state: a dead life is not listed in `lives`")]
+    DeadLifeNotListed,
+    #[error("merge state: the version vector does not cover a stamp the state holds")]
+    VersionVectorBehind,
+    #[error("merge state: a slot's absorbed stamp is above the slot's own")]
+    AbsorbedAboveSlot,
+    #[error("merge state: a slot's absorbed total differs from the slot's at the same stamp")]
+    AbsorbedTotalMismatch,
+    #[error("merge state: a slot's absorbed stamp is not by the writer of the slot's key")]
+    AbsorbedWriterMismatch,
+    #[error("merge state: a slot's own stamp is not by the writer of the slot's key")]
+    SlotWriterMismatch,
+    #[error("merge state: a slot's absorbed total is of a wider type than the slot's own")]
+    AbsorbedWiderThanSlot,
+    #[error("merge state: a Decimal128 total is not one a writer produces (not canonical)")]
+    NotCanonicalDecimal,
+    #[error("merge state: an order entry is for a life that `lives` does not list")]
+    OrdLifeNotListed,
+    #[error("merge state: an order entry holds a candidate its floor voids")]
+    OrdNotNormal,
+    #[error("merge state: an order entry says nothing (no floor, no candidate, no level mark)")]
+    OrdEntryEmpty,
+    #[error("merge state: an order entry keeps a first for a writer under a stamp of another")]
+    OrdFirstNotByItsWriter,
+    #[error("merge state: an order entry has a first with no last, or a last before a first")]
+    OrdLastBehindAFirst,
+    #[error("merge state: an unset floor remembers an HLC that is not below its own stamp")]
+    OrdPrevNotBelowStamp,
+    #[error("merge state: the root of the order state holds more than a level mark")]
+    OrdRootNotALevel,
+    #[error("merge state: an order entry gives one write two different positions")]
+    OrdPositionsDisagree,
+    #[error(
+        "merge state: an order entry has a standing level mark and no last write at or after it"
+    )]
+    OrdLevelWithoutLast,
+    #[error("merge state: invalid order floor kind {0}")]
+    OrdBadFloor(u8),
 }
 
 // ---- writing ---------------------------------------------------------------
@@ -70,9 +135,17 @@ impl W {
     fn i128(&mut self, v: i128) {
         self.0.extend_from_slice(&v.to_be_bytes());
     }
+    /// A counter total: version 1 spells an `Int64` amount only ([`MergeState::v1_can_hold`]).
+    fn num(&mut self, n: &Num) {
+        self.i128(n.int().expect("v1_can_hold: a version 1 total is an Int64 amount"));
+    }
     fn str(&mut self, s: &str) {
         self.len(s.len());
         self.0.extend_from_slice(s.as_bytes());
+    }
+    /// A path: its segments joined by NUL (no segment contains one), as one string.
+    fn path(&mut self, p: &Path) {
+        self.str(&p.segments().join("\0"));
     }
     fn hlc(&mut self, h: Hlc) {
         self.0.extend_from_slice(&h.to_bytes());
@@ -96,8 +169,9 @@ impl W {
     }
     fn value(&mut self, v: &Value) {
         match v {
-            Value::Null => self.u8(0),
-            Value::Int(i) => {
+            Value::Unset => self.u8(0),
+            Value::Null => self.u8(15),
+            Value::Int64(i) => {
                 self.u8(1);
                 self.i64(*i);
             }
@@ -105,9 +179,57 @@ impl W {
                 self.u8(2);
                 self.0.extend_from_slice(&d.to_bits().to_be_bytes());
             }
-            Value::Str(s) => {
+            Value::String(s) => {
                 self.u8(3);
                 self.str(s);
+            }
+            // 4 is the array; 5 the explicit map marker; 6 the implicit one.
+            Value::Map => self.u8(5),
+            Value::ImplicitMap => self.u8(6),
+            // The check before every write keeps a document out of this form.
+            Value::Document(_) => unreachable!("version 1 cannot hold a document (checked)"),
+            Value::Array(a) => {
+                self.u8(4);
+                self.len(a.len());
+                for x in a {
+                    self.value(x);
+                }
+            }
+            Value::Int32(i) => {
+                self.u8(7);
+                self.0.extend_from_slice(&i.to_be_bytes());
+            }
+            Value::Decimal128(d) => {
+                self.u8(8);
+                self.0.extend_from_slice(d);
+            }
+            Value::Bool(b) => {
+                self.u8(9);
+                self.u8(u8::from(*b));
+            }
+            Value::Date(ms) => {
+                self.u8(10);
+                self.i64(*ms);
+            }
+            Value::ObjectId(o) => {
+                self.u8(11);
+                self.0.extend_from_slice(o);
+            }
+            Value::Binary { subtype, bytes } => {
+                self.u8(12);
+                self.u8(*subtype);
+                self.len(bytes.len());
+                self.0.extend_from_slice(bytes);
+            }
+            Value::Timestamp { time, increment } => {
+                self.u8(13);
+                self.0.extend_from_slice(&time.to_be_bytes());
+                self.0.extend_from_slice(&increment.to_be_bytes());
+            }
+            Value::Regex { pattern, options } => {
+                self.u8(14);
+                self.str(pattern);
+                self.str(options);
             }
         }
     }
@@ -118,23 +240,13 @@ impl W {
             self.hlc(*h);
         }
     }
-    fn obs(&mut self, m: &BTreeMap<ObsKey, i128>) {
+    fn obs(&mut self, m: &BTreeMap<ObsKey, Num>) {
         self.len(m.len());
         for ((l, w, g), t) in m {
             self.stamp(l);
             self.wid(w);
             self.opt_stamp(g);
-            self.i128(*t);
-        }
-    }
-    fn obs_stamped(&mut self, m: &BTreeMap<ObsKey, (MStamp, i128)>) {
-        self.len(m.len());
-        for ((l, w, g), (s, t)) in m {
-            self.stamp(l);
-            self.wid(w);
-            self.opt_stamp(g);
-            self.stamp(s);
-            self.i128(*t);
+            self.num(t);
         }
     }
     fn gen_(&mut self, g: &Option<Gen>) {
@@ -153,8 +265,10 @@ impl W {
             LossKind::DeleteWon => 1,
             LossKind::InsertLost => 2,
             LossKind::RetiredWriter => 3,
+            LossKind::TypeClash => 4,
+            LossKind::ArrayClash => 5,
         });
-        self.str(&k.path);
+        self.path(&k.at.v1_path());
         self.stamp(&k.stamp);
     }
     fn loss_value(&mut self, v: &LossValue) {
@@ -165,13 +279,13 @@ impl W {
             }
             LossValue::Total(t) => {
                 self.u8(1);
-                self.i128(*t);
+                self.num(t);
             }
             LossValue::Fields(f) => {
                 self.u8(2);
                 self.len(f.len());
                 for p in f {
-                    self.str(p);
+                    self.path(p);
                 }
             }
         }
@@ -189,7 +303,7 @@ impl MergeState {
             }
             w.len(v.order.len());
             for p in &v.order {
-                w.str(p);
+                w.path(p);
             }
             w.u8(match v.kind {
                 LifeKind::Insert => 0,
@@ -208,21 +322,24 @@ impl MergeState {
         w.len(self.regs.len());
         for ((l, p), r) in &self.regs {
             w.stamp(l);
-            w.str(p);
+            w.path(p);
             w.stamp(&r.stamp);
             w.value(&r.value);
-            w.obs_stamped(&r.obs);
+            // the version 1 spelling of a register still has a place for the `obs` map the
+            // register used to carry: it is always empty now (what a base had counted is the
+            // slots' absorbed pairs, which this form cannot spell, `v1_can_hold`)
+            w.len(0);
             w.gen_(&r.generation);
             w.u8(u8::from(r.soi));
         }
         w.len(self.slots.len());
         for ((l, p, wr, g), s) in &self.slots {
             w.stamp(l);
-            w.str(p);
+            w.path(p);
             w.wid(wr);
             w.opt_stamp(g);
             w.stamp(&s.stamp);
-            w.i128(s.total);
+            w.num(&s.total);
         }
         w.vv(&self.vv);
         w.len(self.losses.len());
@@ -232,32 +349,56 @@ impl MergeState {
         }
     }
 
+    /// Can the version 1 form spell this state? Not when a register or a loss record holds a
+    /// `Document` inside an array (it has no tag there; the compact form has one), and not when a
+    /// counter total is of another type than `Int64` (its totals are `i128`s with no room for a
+    /// type; the compact form spells them), and not when a slot carries an absorbed pair (the
+    /// version 1 form has no place for it), and not when it carries an order state (the version
+    /// 1 form has no section for it: the bytes would silently leave the order out).
+    pub fn v1_can_hold(&self) -> bool {
+        self.ords.is_empty()
+            && self.slots.values().all(|s| s.absorbed.is_none())
+            && self.totals().all(|n| matches!(n, Num::Int64(_)))
+            && !self.regs.values().any(|r| r.value.contains_document())
+            && !self
+                .losses
+                .values()
+                .any(|v| matches!(v, LossValue::Value(x) if x.contains_document()))
+    }
+
     /// The deterministic encoding of the state: the model's `canon()` made
     /// binary (lives, dead, deletes, registers, slots, version vector, losses).
     /// Mutant memory (`Gen::vv`, `gens`) is not part of it.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
+    ///
+    /// An error when the version 1 form cannot spell the state ([`MergeState::v1_can_hold`]: a
+    /// document inside an array, a total of another type than `Int64`, an order state). There is no
+    /// infallible twin: a state a peer sent can be one of those, and a panic must not be reachable
+    /// from decoded input (the tests have panicking helpers of their own).
+    pub fn try_canonical_bytes(&self) -> Result<Vec<u8>, V1CannotHold> {
+        if !self.v1_can_hold() {
+            return Err(V1CannotHold);
+        }
         let mut w = W(Vec::new());
         self.write_body(&mut w);
-        w.0
+        Ok(w.0)
     }
 
-    /// A 128-bit digest of [`MergeState::canonical_bytes`]. Not cryptographic:
+    /// A 128-bit digest of [`MergeState::try_canonical_bytes`]. Not cryptographic:
     /// it is a divergence detector. Two lanes of a multiply-rotate mix over
     /// big-endian 8-byte words (the tail zero-padded, the length folded in at
     /// the end), cross-fed, then each lane passed through the splitmix64
-    /// finaliser.
-    pub fn state_hash(&self) -> [u8; 16] {
-        hash128(&self.canonical_bytes())
+    /// finaliser. An error where `try_canonical_bytes` is one.
+    pub fn try_state_hash(&self) -> Result<[u8; 16], V1CannotHold> {
+        Ok(hash128(&self.try_canonical_bytes()?))
     }
 
     /// The whole state, for a round trip with [`MergeState::decode`]: the magic, the format
-    /// version, then [`MergeState::canonical_bytes`].
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = W(Vec::new());
-        w.0.extend_from_slice(&MAGIC);
-        w.u8(VERSION);
-        self.write_body(&mut w);
-        w.0
+    /// version, then [`MergeState::try_canonical_bytes`]; an error where that is one.
+    pub fn try_encode(&self) -> Result<Vec<u8>, V1CannotHold> {
+        let mut out = Vec::from(MAGIC);
+        out.push(VERSION);
+        out.extend_from_slice(&self.try_canonical_bytes()?);
+        Ok(out)
     }
 
     /// The inverse of [`MergeState::encode`].
@@ -275,7 +416,7 @@ impl MergeState {
             }
             let mut order = Vec::new();
             for _ in 0..r.len()? {
-                order.push(r.str()?);
+                order.push(r.path()?);
             }
             let kind = match r.u8()? {
                 0 => LifeKind::Insert,
@@ -293,37 +434,130 @@ impl MergeState {
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
-            let p = r.str()?;
+            let p = r.path()?;
             let stamp = r.stamp()?;
             let value = r.value()?;
-            let obs = r.obs_stamped()?;
+            // the empty `obs` place of the register: a register that names observed slots has
+            // no state to decode into, and the form could not write it back
+            if r.len()? != 0 {
+                return Err(DecodeError::NotCanonical);
+            }
             let generation = r.gen_()?;
             let soi = match r.u8()? {
                 0 => false,
                 1 => true,
                 t => return Err(DecodeError::BadTag(t)),
             };
-            put(&mut s.regs, (l, p), Reg { stamp, value, obs, generation, soi })?;
+            put(&mut s.regs, (l, p), Reg { stamp, value, generation, soi })?;
         }
         for _ in 0..r.len()? {
             let l = r.stamp()?;
-            let p = r.str()?;
+            let p = r.path()?;
             let wr = r.wid()?;
             let g = r.opt_stamp()?;
             let stamp = r.stamp()?;
             let total = r.total()?;
-            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total })?;
+            put(&mut s.slots, (l, p, wr, g), Slot { stamp, total, absorbed: None })?;
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
-            let k = r.loss_key()?;
+            let (kind, path, stamp) = r.loss_key()?;
             let v = r.loss_value()?;
+            // The one segment `_` with a field list is the whole document; with anything else, a field.
+            let whole = matches!(v, LossValue::Fields(_)) && path.segments() == ["_"];
+            let k = if whole {
+                LossKey::document(kind, stamp)
+            } else {
+                LossKey::field(kind, path, stamp)
+            };
             put(&mut s.losses, k, v)?;
         }
         if !r.0.is_empty() {
             return Err(DecodeError::Trailing(r.0.len()));
         }
+        s.check_decoded()?;
         Ok(s)
+    }
+}
+
+/// The spellings the tests use on states they build and know the version 1 form can hold.
+///
+/// NAMED RESTRICTION: they leave the order state OUT. A state a `Writer` builds carries one (it
+/// feeds it with every write) and version 1 has no section for it (`try_*` refuse such a state);
+/// the reference these tests pin the version 1 form against is the stage-A model, which has none.
+/// What the form holds of a state that has no order state is the same. The compact form carries
+/// the order state, and the tests of it say so.
+#[cfg(test)]
+impl MergeState {
+    /// The state without its order state.
+    pub(crate) fn without_ords(&self) -> MergeState {
+        MergeState { ords: BTreeMap::new(), ..self.clone() }
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        self.without_ords().try_canonical_bytes().expect("the test state is one version 1 can hold")
+    }
+
+    pub(crate) fn state_hash(&self) -> [u8; 16] {
+        self.without_ords().try_state_hash().expect("the test state is one version 1 can hold")
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        self.without_ords().try_encode().expect("the test state is one version 1 can hold")
+    }
+
+    /// Is this a state the version 1 form cannot spell ONLY because a slot carries an absorbed
+    /// pair (with its pairs removed, and its order state left out, version 1 holds it)?
+    pub(crate) fn v1_refused_only_for_a_pair(&self) -> bool {
+        let mut bare = self.without_ords();
+        let had_pair = bare.slots.values().any(|s| s.absorbed.is_some());
+        bare.slots.values_mut().for_each(|s| s.absorbed = None);
+        had_pair && bare.v1_can_hold()
+    }
+}
+
+#[cfg(test)]
+impl MergeState {
+    /// The length of the version 1 bytes, for a size comparison with the compact form, and whether
+    /// it is exact. A state with an absorbed pair has no version 1 length: it is then the version 1
+    /// length of the same state with its pairs removed (a lower bound of what version 1 would
+    /// have spelled), and `false`.
+    pub(crate) fn v1_len_for_size_checks(&self) -> (usize, bool) {
+        if self.without_ords().v1_can_hold() {
+            return (self.canonical_bytes().len(), true);
+        }
+        assert!(self.v1_refused_only_for_a_pair(), "version 1 refuses a state for another reason");
+        let mut stripped = self.without_ords();
+        stripped.slots.values_mut().for_each(|s| s.absorbed = None);
+        (stripped.canonical_bytes().len(), false)
+    }
+}
+
+/// How many of the states a test looked at the version 1 form holds, and how many it cannot
+/// spell for the one reason the counter cell adds: an absorbed pair. A state version 1 refuses for
+/// any other reason panics, so the version-1-not-applicable set is exactly the pair states.
+#[cfg(test)]
+#[derive(Default, Debug)]
+pub(crate) struct V1Split {
+    pub held: usize,
+    pub pair_only: usize,
+}
+
+#[cfg(test)]
+impl V1Split {
+    /// Count `st`; true when version 1 holds it (the caller then runs its version 1 assertions).
+    pub(crate) fn note(&mut self, st: &MergeState) -> bool {
+        if st.without_ords().v1_can_hold() {
+            self.held += 1;
+            true
+        } else {
+            assert!(
+                st.v1_refused_only_for_a_pair(),
+                "version 1 refuses a state for another reason"
+            );
+            self.pair_only += 1;
+            false
+        }
     }
 }
 
@@ -331,7 +565,7 @@ impl MergeState {
 
 /// Insert into a map that is written in key order: a key that is not strictly above the last
 /// one is a duplicate or out of order, and the input is not the encoding of any state.
-fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError> {
+pub(super) fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError> {
     if m.last_key_value().is_some_and(|(last, _)| *last >= k) {
         return Err(DecodeError::NotCanonical);
     }
@@ -340,7 +574,7 @@ fn put<K: Ord, V>(m: &mut BTreeMap<K, V>, k: K, v: V) -> Result<(), DecodeError>
 }
 
 /// [`put`] for a set.
-fn put_set<K: Ord>(m: &mut BTreeSet<K>, k: K) -> Result<(), DecodeError> {
+pub(super) fn put_set<K: Ord>(m: &mut BTreeSet<K>, k: K) -> Result<(), DecodeError> {
     if m.last().is_some_and(|last| *last >= k) {
         return Err(DecodeError::NotCanonical);
     }
@@ -378,16 +612,25 @@ impl R<'_> {
         Ok(i128::from_be_bytes(self.arr()?))
     }
     /// A counter total: an `i128` of magnitude at most [`MAX_TOTAL`] (see there).
-    fn total(&mut self) -> Result<i128, DecodeError> {
+    fn total(&mut self) -> Result<Num, DecodeError> {
         let t = self.i128()?;
         if t.unsigned_abs() > MAX_TOTAL.unsigned_abs() {
             return Err(DecodeError::TotalOutOfRange);
         }
-        Ok(t)
+        Ok(Num::Int64(t))
     }
     fn str(&mut self) -> Result<String, DecodeError> {
         let n = self.len()?;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| DecodeError::BadString)
+    }
+    /// A path written by `W::path`: segments joined by NUL, none empty.
+    fn path(&mut self) -> Result<Path, DecodeError> {
+        let joined = self.str()?;
+        // more NULs than the limit allows segments: refused before any segment is built
+        if joined.matches('\0').count() >= MAX_VALUE_DEPTH {
+            return Err(DecodeError::PathTooDeep);
+        }
+        Path::new(joined.split('\0')).map_err(|_| DecodeError::BadPath)
     }
     fn hlc(&mut self) -> Result<Hlc, DecodeError> {
         Ok(Hlc::from_bytes(self.arr()?))
@@ -408,11 +651,49 @@ impl R<'_> {
         }
     }
     fn value(&mut self) -> Result<Value, DecodeError> {
+        self.value_at(0)
+    }
+    /// A value nested `depth` arrays deep; deeper than [`MAX_VALUE_DEPTH`] is refused, so that
+    /// hostile input cannot exhaust the stack.
+    fn value_at(&mut self, depth: usize) -> Result<Value, DecodeError> {
         match self.u8()? {
-            0 => Ok(Value::Null),
-            1 => Ok(Value::Int(self.i64()?)),
+            0 => Ok(Value::Unset),
+            15 => Ok(Value::Null),
+            1 => Ok(Value::Int64(self.i64()?)),
             2 => Ok(Value::Double(f64::from_bits(u64::from_be_bytes(self.arr()?)))),
-            3 => Ok(Value::Str(self.str()?)),
+            3 => Ok(Value::String(self.str()?)),
+            4 => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return Err(DecodeError::TooDeep);
+                }
+                let mut a = Vec::new();
+                for _ in 0..self.len()? {
+                    a.push(self.value_at(depth + 1)?);
+                }
+                Ok(Value::Array(a))
+            }
+            // The map marker is a register value, never an element of an array.
+            5 if depth == 0 => Ok(Value::Map),
+            6 if depth == 0 => Ok(Value::ImplicitMap),
+            7 => Ok(Value::Int32(i32::from_be_bytes(self.arr()?))),
+            8 => Ok(Value::Decimal128(self.arr()?)),
+            9 => match self.u8()? {
+                0 => Ok(Value::Bool(false)),
+                1 => Ok(Value::Bool(true)),
+                t => Err(DecodeError::BadTag(t)),
+            },
+            10 => Ok(Value::Date(self.i64()?)),
+            11 => Ok(Value::ObjectId(self.arr()?)),
+            12 => {
+                let subtype = self.u8()?;
+                let n = self.len()?;
+                Ok(Value::Binary { subtype, bytes: self.take(n)?.to_vec() })
+            }
+            13 => Ok(Value::Timestamp {
+                time: u32::from_be_bytes(self.arr()?),
+                increment: u32::from_be_bytes(self.arr()?),
+            }),
+            14 => Ok(Value::Regex { pattern: self.str()?, options: self.str()? }),
             t => Err(DecodeError::BadTag(t)),
         }
     }
@@ -424,24 +705,13 @@ impl R<'_> {
         }
         Ok(m)
     }
-    fn obs(&mut self) -> Result<BTreeMap<ObsKey, i128>, DecodeError> {
+    fn obs(&mut self) -> Result<BTreeMap<ObsKey, Num>, DecodeError> {
         let mut m = BTreeMap::new();
         for _ in 0..self.len()? {
             let l = self.stamp()?;
             let w = self.wid()?;
             let g = self.opt_stamp()?;
             put(&mut m, (l, w, g), self.total()?)?;
-        }
-        Ok(m)
-    }
-    fn obs_stamped(&mut self) -> Result<BTreeMap<ObsKey, (MStamp, i128)>, DecodeError> {
-        let mut m = BTreeMap::new();
-        for _ in 0..self.len()? {
-            let l = self.stamp()?;
-            let w = self.wid()?;
-            let g = self.opt_stamp()?;
-            let s = self.stamp()?;
-            put(&mut m, (l, w, g), (s, self.total()?))?;
         }
         Ok(m)
     }
@@ -455,16 +725,21 @@ impl R<'_> {
             t => Err(DecodeError::BadTag(t)),
         }
     }
-    fn loss_key(&mut self) -> Result<LossKey, DecodeError> {
+    /// A loss key as version 1 spells it: the kind, a path and the stamp. The path alone does
+    /// not tell the whole document (the segment `_`) from a field named `_`; the caller reads
+    /// the lost value next and decides (see [`LossKey`] and the module documentation).
+    fn loss_key(&mut self) -> Result<(LossKind, Path, MStamp), DecodeError> {
         let kind = match self.u8()? {
             0 => LossKind::Clash,
             1 => LossKind::DeleteWon,
             2 => LossKind::InsertLost,
             3 => LossKind::RetiredWriter,
+            4 => LossKind::TypeClash,
+            5 => LossKind::ArrayClash,
             t => return Err(DecodeError::BadTag(t)),
         };
-        let path = self.str()?;
-        Ok(LossKey { kind, path, stamp: self.stamp()? })
+        let path = self.path()?;
+        Ok((kind, path, self.stamp()?))
     }
     fn loss_value(&mut self) -> Result<LossValue, DecodeError> {
         match self.u8()? {
@@ -473,7 +748,7 @@ impl R<'_> {
             2 => {
                 let mut f = Vec::new();
                 for _ in 0..self.len()? {
-                    f.push(self.str()?);
+                    f.push(self.path()?);
                 }
                 Ok(LossValue::Fields(f))
             }
@@ -490,7 +765,7 @@ fn splitmix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn hash128(data: &[u8]) -> [u8; 16] {
+pub(super) fn hash128(data: &[u8]) -> [u8; 16] {
     const P1: u64 = 0x9E37_79B1_85EB_CA87;
     const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
     let mut a: u64 = 0x243F_6A88_85A3_08D3;
@@ -531,7 +806,15 @@ mod tests {
         let mut w = W(Vec::new());
         w.0.extend_from_slice(&MAGIC);
         w.u8(VERSION);
-        w.len(0); // lives
+        // every dead life is listed (as an upsert that saw nothing), once, in order
+        let listed: BTreeSet<MStamp> = dead.iter().copied().collect();
+        w.len(listed.len()); // lives
+        for l in &listed {
+            w.stamp(l);
+            w.len(0);
+            w.len(0);
+            w.u8(1);
+        }
         w.len(dead.len());
         for l in dead {
             w.stamp(l);
@@ -579,7 +862,7 @@ mod tests {
         assert_eq!(MergeState::decode(&hand(&[], &[], &[(wa, 1), (wa, 2)])), no);
         assert_eq!(MergeState::decode(&hand(&[], &[], &[(wb, 1), (wa, 2)])), no);
         // and the sorted forms are fine
-        assert!(MergeState::decode(&hand(&[a, b], &[a, b], &[(wa, 1), (wb, 2)])).is_ok());
+        assert!(MergeState::decode(&hand(&[a, b], &[a, b], &[(wa, 2), (wb, 2)])).is_ok());
     }
 
     /// A state whose only register has the given `obs` entries and generation `seen` entries,
@@ -595,9 +878,9 @@ mod tests {
         w.len(0); // deletes
         w.len(1); // regs
         w.stamp(&life);
-        w.str("x");
+        w.str("x"); // the path
         w.stamp(&life); // the register's stamp
-        w.value(&Value::Int(1));
+        w.value(&Value::Int64(1));
         w.len(obs.len());
         for (slot_life, slot_stamp, total) in obs {
             w.stamp(slot_life);
@@ -621,24 +904,28 @@ mod tests {
         }
         w.u8(0); // soi
         w.len(0); // slots
-        w.len(0); // vv
+        w.len(1); // vv: A has written the life and the register
+        w.wid(&wr);
+        w.hlc(Hlc::new(2, 0));
         w.len(0); // losses
         w.0
     }
 
     #[test]
-    fn unsorted_or_duplicate_obs_and_seen_entries_are_refused() {
+    fn unsorted_or_duplicate_seen_entries_and_any_obs_entry_are_refused() {
         let (a, b) = (stamp(1, b'A'), stamp(2, b'A'));
         let no = Err(DecodeError::NotCanonical);
-        // sorted: fine, and canonical
-        let good = with_obs(&[(a, a, 1), (b, a, 2)], &[(a, 1), (b, 2)]);
+        // sorted seen entries and no obs: fine, and canonical
+        let good = with_obs(&[], &[(a, 1), (b, 2)]);
         assert_eq!(MergeState::decode(&good).unwrap().encode(), good);
-        // a register's obs: out of order, duplicate
-        assert_eq!(MergeState::decode(&with_obs(&[(b, a, 2), (a, a, 1)], &[])), no);
-        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1), (a, b, 2)], &[])), no);
         // a generation's seen totals: out of order, duplicate
         assert_eq!(MergeState::decode(&with_obs(&[], &[(b, 2), (a, 1)])), no);
         assert_eq!(MergeState::decode(&with_obs(&[], &[(a, 1), (a, 2)])), no);
+        // the register's obs place is still there and always empty: any entry is refused, sorted or
+        // not (what a base had counted is the slots' absorbed pairs, which this form cannot spell)
+        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1)], &[(a, 1)])), no);
+        assert_eq!(MergeState::decode(&with_obs(&[(a, a, 1), (b, a, 2)], &[])), no);
+        assert_eq!(MergeState::decode(&with_obs(&[(b, a, 2), (a, a, 1)], &[])), no);
     }
 
     #[test]
@@ -647,7 +934,14 @@ mod tests {
             WriterId { node: NodeId::from_bytes([b'A'; 16]), epoch: Epoch::from_u64(0) },
             JoinOptions::default(),
         );
-        w.upsert_soi(&[("y", Value::Int(1))], "x", 1, &[], 0).unwrap();
+        w.upsert_soi(
+            &[(Path::flat("y").unwrap(), Value::Int64(1))],
+            &Path::flat("x").unwrap(),
+            1,
+            &[],
+            0,
+        )
+        .unwrap();
         let enc = w.state.encode();
         let st = MergeState::decode(&enc).unwrap();
         assert!(st.regs.values().any(|r| r.soi));

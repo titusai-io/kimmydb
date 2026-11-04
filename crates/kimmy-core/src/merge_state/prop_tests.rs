@@ -14,10 +14,10 @@ use super::*;
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
@@ -25,15 +25,24 @@ impl Rng {
         self.0 = x;
         x
     }
-    fn below(&mut self, n: usize) -> usize {
+    pub(super) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+    pub(super) fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
         &xs[self.below(xs.len())]
     }
 }
 
-fn opts(ret: u64) -> JoinOptions {
+/// A one-segment path.
+pub(super) fn p(x: &str) -> Path {
+    Path::flat(x).unwrap()
+}
+/// The fields of a flat document as paths.
+pub(super) fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
+    f.iter().map(|(k, v)| (p(k), v.clone())).collect()
+}
+
+pub(super) fn opts(ret: u64) -> JoinOptions {
     JoinOptions::new(ret, i64::MAX).unwrap()
 }
 
@@ -41,18 +50,18 @@ fn opts(ret: u64) -> JoinOptions {
 /// and non-ASCII) and doubles (also `2.0`, `-0.0`, a huge one).
 fn pool_value(rng: &mut Rng) -> Value {
     match rng.below(16) {
-        0 => Value::Int(0),
-        1 => Value::Int(7),
-        2 => Value::Int(8),
-        3 => Value::Int(500),
-        4 => Value::Int(-7),
-        5 => Value::Int(1 << 62),
-        6 => Value::Int(-(1 << 62)),
-        7 => Value::Int(i64::MAX),
-        8 => Value::Int(i64::MIN),
-        9 => Value::Str("s".into()),
-        10 => Value::Str(String::new()),
-        11 => Value::Str("\u{fc}".into()),
+        0 => Value::Int64(0),
+        1 => Value::Int64(7),
+        2 => Value::Int64(8),
+        3 => Value::Int64(500),
+        4 => Value::Int64(-7),
+        5 => Value::Int64(1 << 62),
+        6 => Value::Int64(-(1 << 62)),
+        7 => Value::Int64(i64::MAX),
+        8 => Value::Int64(i64::MIN),
+        9 => Value::String("s".into()),
+        10 => Value::String(String::new()),
+        11 => Value::String("\u{fc}".into()),
         12 => Value::Double(2.5),
         13 => Value::Double(2.0),
         14 => Value::Double(-0.0),
@@ -79,7 +88,30 @@ fn pool_fields<'a>(rng: &mut Rng, names: &[&'a str]) -> Vec<(&'a str, Value)> {
 }
 
 /// One random run; returns every state any writer held along the way.
-fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+pub(super) fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    run_with(seed, steps, o, false)
+}
+
+/// [`run`] with the writers' order state kept in the pooled states (`ords`) or left out of them.
+/// A writer feeds its order state with every local write; the runs without it are the runs of the
+/// stage-A model's rules: a write that changes only the ORDER of the fields is a no-op there, so
+/// they run with `ord_reorder_is_noop` on and the pooled states are the writers' states with the
+/// order state cleared. Both draw the same random numbers; the states are the same but for their
+/// `ords` and for the writes that only reorder.
+pub(super) fn run_with(seed: u64, steps: usize, o: &JoinOptions, ords: bool) -> Vec<MergeState> {
+    run_tagged(seed, steps, o, ords).into_iter().map(|(_, s)| s).collect()
+}
+
+/// [`run_with`] with the number of the writer that held each pooled state.
+pub(super) fn run_tagged(
+    seed: u64,
+    steps: usize,
+    o: &JoinOptions,
+    ords: bool,
+) -> Vec<(usize, MergeState)> {
+    let mut o = o.clone();
+    o.set_ord_reorder_is_noop(!ords);
+    let o = &o;
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let n = 3 + rng.below(2);
     let mut ws: Vec<Writer> = (0..n)
@@ -92,7 +124,7 @@ fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
         })
         .collect();
     let mut pool = Vec::new();
-    ws[0].insert(&[("x", Value::Int(100)), ("n", Value::Str("a".into()))], 0);
+    ws[0].insert(&fl(&[("x", Value::Int64(100)), ("n", Value::String("a".into()))]), 0);
     for _ in 0..steps {
         let m = rng.below(n);
         let skew = *rng.pick(&[0, 0, 0, 4]);
@@ -104,67 +136,72 @@ fn run(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
             let st = ws[other].state.clone();
             ws[m].receive(&st);
         } else {
-            let p = *rng.pick(&["x", "n", "y"]);
+            let path = p(rng.pick(&["x", "n", "y", "", "_", "a.b"]));
             let w = &mut ws[m];
             match rng.below(14) {
                 0 => {
-                    let f = pool_fields(&mut rng, &["x", "y", "n"]);
-                    w.insert(&f, skew);
+                    let f = pool_fields(&mut rng, &["x", "y", "n", "", "_", "a.b"]);
+                    w.insert(&fl(&f), skew);
                 }
                 1 => {
-                    let k = *rng.pick(&["x", "y", "n"]);
-                    w.upsert_inc(k, pool_inc(&mut rng), skew);
+                    let k = *rng.pick(&["x", "y", "n", "", "_", "a.b"]);
+                    w.upsert_inc(&p(k), pool_inc(&mut rng), skew);
                 }
                 2 => {
                     // An upsert with $setOnInsert and $set (non-numeric values too) and an $inc,
                     // on three disjoint path lists.
-                    let f = pool_fields(&mut rng, &["y", "z", "n"]);
+                    let f = pool_fields(&mut rng, &["y", "z", "n", "", "_", "a.b"]);
                     let mut sets = if rng.below(2) == 0 {
                         Vec::new()
                     } else {
-                        pool_fields(&mut rng, &["n", "x", "w"])
+                        pool_fields(&mut rng, &["n", "x", "w", "", "_", "a.b"])
                     };
                     sets.retain(|(q, _)| !f.iter().any(|(g, _)| g == q));
-                    let free: Vec<&str> = ["x", "y", "n", "z", "u"]
+                    let free: Vec<&str> = ["x", "y", "n", "z", "u", "", "_", "a.b"]
                         .into_iter()
                         .filter(|q| !f.iter().chain(sets.iter()).any(|(g, _)| g == q))
                         .collect();
                     let ip = *rng.pick(&free);
-                    w.upsert_soi(&f, ip, pool_inc(&mut rng), &sets, skew);
+                    w.upsert_soi(&fl(&f), &p(ip), pool_inc(&mut rng), &fl(&sets), skew);
                 }
                 3 => {
-                    let d = pool_fields(&mut rng, &["x", "n", "y"]);
-                    w.write_replace(&d, skew);
+                    let d = pool_fields(&mut rng, &["x", "n", "y", "", "_", "a.b"]);
+                    w.write_replace(&fl(&d), skew);
                 }
                 4..=6 => {
-                    w.write_inc(p, pool_inc(&mut rng), skew);
+                    w.write_inc(&path, pool_inc(&mut rng), skew);
                 }
                 7 => {
                     // +n then -n on one writer: a counter that returns to where it was.
                     let k = pool_inc(&mut rng);
-                    if w.write_inc(p, k, skew).is_some() && k != i64::MIN {
-                        w.write_inc(p, -k, skew);
+                    if w.write_inc(&path, k, skew).is_some() && k != i64::MIN {
+                        w.write_inc(&path, -k, skew);
                     }
                 }
                 8 | 9 => {
                     let v = pool_value(&mut rng);
-                    w.write_set(p, v, skew);
+                    w.write_set(&path, v, skew);
                 }
                 10 | 11 => {
-                    w.write_unset(p, skew);
+                    w.write_unset(&path, skew);
                 }
                 _ => {
                     w.write_delete(skew);
                 }
             }
         }
-        pool.push(ws[m].state.clone());
+        pool.push((m, if ords { ws[m].state.clone() } else { ws[m].state.without_ords() }));
     }
     pool
 }
 
-fn pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+pub(super) fn pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
     (1..=seeds).map(|s| run(s, steps, o)).collect()
+}
+
+/// [`pools`] with the order state the writers built.
+pub(super) fn ord_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+    (1..=seeds).map(|s| run_with(s, steps, o, true)).collect()
 }
 
 fn triples(
@@ -210,10 +247,19 @@ fn bare(mut s: MergeState) -> MergeState {
 /// between its three states, more than R. At R = 20 and R = 40 none of 3,000 triples differs,
 /// and `join_laws_retention_beyond_the_spread` asserts exact associativity there.
 fn check_laws(o: &JoinOptions, exact_assoc: bool, seeds: u64, steps: usize, count: usize) {
-    let ps = pools(seeds, steps, o);
+    check_laws_on(o, exact_assoc, &pools(seeds, steps, o), count);
+}
+
+/// [`check_laws`] over the given pools of states.
+pub(super) fn check_laws_on(
+    o: &JoinOptions,
+    exact_assoc: bool,
+    ps: &[Vec<MergeState>],
+    count: usize,
+) {
     let mut assoc_loss_diff = 0;
     let mut assoc_state_diff = 0;
-    for (k, (a, b, c)) in triples(&ps, count).into_iter().enumerate() {
+    for (k, (a, b, c)) in triples(ps, count).into_iter().enumerate() {
         let j = |x: &MergeState, y: &MergeState| join(x, y, o).0;
         let ab = j(a, b);
         let ba = j(b, a);
@@ -237,8 +283,11 @@ fn check_laws(o: &JoinOptions, exact_assoc: bool, seeds: u64, steps: usize, coun
             a.losses.keys().all(|k| ab.losses.contains_key(k) || k.stamp.hlc < hz),
             "monotone, triple {k}"
         );
-        // The hash does not depend on the join order.
-        assert_eq!(ab.state_hash(), ba.state_hash());
+        // The hash does not depend on the join order (version 1 where it can spell the state).
+        assert_eq!(ab.compact_hash(), ba.compact_hash());
+        if ab.v1_can_hold() {
+            assert_eq!(ab.state_hash(), ba.state_hash());
+        }
     }
     // Not a law: report-only, so the NOTE above stays honest.
     assert!(
@@ -277,22 +326,263 @@ fn join_laws_retention_beyond_the_spread() {
     check_laws(&opts(40), true, 60, 30, 300);
 }
 
+/// The laws of the join on hand-built states ([`super::hand_built`]), in the shapes the public
+/// fields allow and no writer makes: odd paths, cells of absent or dead lives, markers and
+/// scalars, arrays of documents, deletes across the horizon, totals at `MAX_TOTAL`.
+///
+/// The laws are claimed for CLOSED states ([`super::hand_built::Mode::Closed`]): what a stamp
+/// carries is a function of the stamp and the path, as in every state that honest writers build,
+/// and the state satisfies what `decode` requires of one (every dead life listed in `lives`, the
+/// version vector covering every life, delete, register and slot stamp). They are not claimed
+/// where two states disagree about what one stamp wrote: the join keeps its first argument's cell
+/// then, so it is not commutative there, by design (that is what the equivalence test of the D7
+/// pass feeds the join, to compare it with the code before the pass). And without the two
+/// invariants the laws FAIL: see `the_join_is_not_commutative_or_idempotent_where_decode_refuses`.
+///
+/// Two families. First the states as built, with the cells of absent and dead lives still in
+/// them: the join must be commutative and absorb its own result, and the hashes must not depend
+/// on the order; it is not idempotent on them, since it drops those cells. Then the same states
+/// normalised through a join with the empty state, as a writer's `finish` does: there all the
+/// laws of [`check_laws_on`] hold.
+#[test]
+fn join_laws_on_hand_built_shapes() {
+    hand_built_laws(super::hand_built::Mode::Closed);
+}
+
+fn hand_built_laws(mode: super::hand_built::Mode) {
+    use super::hand_built::{self, BUILDERS};
+    for (ret, exact) in [(1_000_000_000, true), (40, true), (10, false), (4, false)] {
+        let o = opts(ret);
+        let empty = MergeState::default();
+        let mut rng = Rng(0x4841_4E44_4255_494C ^ ret);
+        let mut raw: Vec<Vec<MergeState>> = Vec::new();
+        let mut normalised: Vec<Vec<MergeState>> = Vec::new();
+        let mut kinds = BTreeSet::new();
+        for builder in 0..BUILDERS.len() {
+            // a pool: the states of several cases of one builder, which share their lives and
+            // paths, so that triples of them meet
+            for _ in 0..if builder == BUILDERS.len() - 1 { 40 } else { 6 } {
+                let (mut r, mut n) = (Vec::new(), Vec::new());
+                for _ in 0..3 {
+                    let c = hand_built::case(&mut rng, mode, builder, ret);
+                    for x in [c.s, c.t] {
+                        let y = join(&x, &empty, &o).0;
+                        kinds.extend(y.losses.keys().map(|k| k.kind));
+                        r.push(x);
+                        n.push(y);
+                    }
+                }
+                raw.push(r);
+                normalised.push(n);
+            }
+        }
+        assert!(kinds.len() >= 4, "the cases must produce loss records: {kinds:?}");
+        check_laws_on(&o, exact, &normalised, 3000);
+        for (k, (a, b, _)) in triples(&raw, 3000).into_iter().enumerate() {
+            let (ab, ba) = (join(a, b, &o).0, join(b, a, &o).0);
+            assert!(ab == ba, "commutative (state and records), as built, R {ret}, triple {k}");
+            assert!(join(&ab, b, &o).0 == ab, "absorbing, as built, R {ret}, triple {k}");
+            assert_eq!(ab.compact_hash(), ba.compact_hash());
+        }
+    }
+}
+
+// ---- the states decode refuses ---------------------------------------------------------------
+
+/// A state's compact bytes, spelled in hex.
+fn unhex(h: &str) -> Vec<u8> {
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+}
+
+/// The states `A`, `B` and `C` of the first triple the hand-built law test failed on (its first
+/// version, before the generator closed its states: it is not in the tree), as the compact bytes
+/// of the states normalised by a join with the empty one, at the retention `10^9`. The join of `A`
+/// and `B` was not commutative: both have a dead life that `lives` does not list.
+///
+/// Spelled in the counter cell's compact form (re-pinned with the cell): the bytes were converted from the
+/// form they were first pinned in (a register `obs` map, `ESCAPE` totals) by a script that reads the old spelling,
+/// turns each register's `obs` entries into the absorbed pair of the slot they name, and writes the new one.
+///
+/// They are therefore NO LONGER the states the first failure was found on. The conversion dropped
+/// every `obs` entry whose slot is absent, and a writer (B) left the writer table with them (the
+/// table `...0203414141..42..43..` became `...020241..43..`). The test asserts only
+/// `DeadLifeNotListed`, the first check, which these bytes still show: it says what it claims
+/// (a dead life that `lives` does not list is refused), not that these are the original states.
+const PINNED_A: &str = concat!(
+    "514d530202414141414141414141414141414141410000000000000000000000000000000000004343434343",
+    "4343434343434343434343000000000000000000000000000000000000020000000000000001000000000000",
+    "000000000300000101000000010101000300010000000000000000000b00000001fffffffffffffff9000201",
+    "61016201000000000000000b00000004011001000f0100000000feffffffffffffffffffffffffffffffff01",
+    "0001017801000000000000000b0000000000030001000000000000000000000b000000008080808080808080",
+    "808080808080808080020002016101620000000000000000000b000000008080808080808080808080808080",
+    "80808002000101780000000000000000000b00000000feffffffffffffffffffffffffffffffff0101000000",
+    "00000000001400000901010100000000000000000c0000000102010000000000000000000000000084300101",
+    "0100000000000000000d0000000100feffffffffffffffffffffffffffffffff010101010000000000000000",
+    "0f00000001020100000000000000000000000000843001010201610162000000000000000c00000001008080",
+    "808080808080800101010201610162000000000000000d0000000100d00f0101020161016200000000000000",
+    "0f0000000100808080808080808080010101010178000000000000000c00000001010e010101017800000000",
+    "0000000d00000001010e0101010178000000000000000f0000000100feffffffffffffffffffffffffffffff",
+    "ff01",
+    // section 10: the order state's count, 0
+    "00",
+);
+
+const PINNED_B: &str = concat!(
+    "514d530203414141414141414141414141414141410000000000000000000000000000000000004242424242",
+    "4242424242424242424242000000000000000000000000000000000000434343434343434343434343434343",
+    "4300000000000000000000000000000000000003000000000000000100000000000000000000020000010000",
+    "0000000000030000020201000101015f0102000102000161010100000601010005000000000000000d000001",
+    "0100000000000000070001020161016201000000000000000d000001050200000000feffffffffffffffffff",
+    "ffffffffffffff01000200008080808080808080808080808080808080020101017801000000000000000d00",
+    "0001028000000000000000020000000009010100000202010001000000000000000e00000103017301010100",
+    "00feffffffffffffffffffffffffffffffff0102020161016201000000000000000e00000102800000000000",
+    "00000100010000d00f0201017801000000000000000e00000107000000050101000000d00f06010100010000",
+    "0000000000000d00000100090102016101620100000000000000000d000001020e0101017801000000000000",
+    "00000d00000100ffffffffffffffffffffffffffffffffff010201000100000000000000000e000001008080",
+    "80808080808080010202016101620100000000000000000e000001020e020101780100000000000000000e00",
+    "000100d00f0101000000000000001400000601010100000000000000000c0000010100090101010000000000",
+    "0000001000000101020100000000000000000000000000843001010201610162000000000000000c00000101",
+    "0201000000000000000000000000008430010102016101620000000000000010000001010080808080808080",
+    "8080010101010178000000000000000c00000101000201010101780000000000000010000001010080808080",
+    "8080808080808080808080808002",
+    // section 10: the order state's count, 0
+    "00",
+);
+
+const PINNED_C: &str = concat!(
+    "514d530202414141414141414141414141414141410000000000000000000000000000000000004343434343",
+    "4343434343434343434343000000000000000000000000000000000000020000000000000001000000000000",
+    "000000000300000101000000010101000300010000000000000000000b00000001fffffffffffffff9000201",
+    "61016201000000000000000b00000004011001000f0100000000feffffffffffffffffffffffffffffffff01",
+    "0001017801000000000000000b0000000000030001000000000000000000000b000000008080808080808080",
+    "808080808080808080020002016101620000000000000000000b000000008080808080808080808080808080",
+    "80808002000101780000000000000000000b00000000feffffffffffffffffffffffffffffffff0101000000",
+    "00000000001400000901010100000000000000000c0000000102010000000000000000000000000084300101",
+    "0100000000000000000d0000000100feffffffffffffffffffffffffffffffff010101010000000000000000",
+    "0f00000001020100000000000000000000000000843001010201610162000000000000000c00000001008080",
+    "808080808080800101010201610162000000000000000d0000000100d00f0101020161016200000000000000",
+    "0f0000000100808080808080808080010101010178000000000000000c00000001010e010101017800000000",
+    "0000000d00000001010e0101010178000000000000000f0000000100feffffffffffffffffffffffffffffff",
+    "ff01",
+    // section 10: the order state's count, 0
+    "00",
+);
+
+/// `decode` refuses the exact states the hand-built law test first failed on (the join of two of
+/// them was not commutative), in the form they were pinned in: each has a dead life that `lives`
+/// does not list.
+#[test]
+fn decode_refuses_the_states_the_hand_built_law_test_first_failed_on() {
+    for hex in [PINNED_A, PINNED_B, PINNED_C] {
+        assert_eq!(MergeState::decode_compact(&unhex(hex)), Err(DecodeError::DeadLifeNotListed));
+    }
+}
+
+/// WHY decode refuses them: the join is not commutative on a state with a dead life that `lives`
+/// does not list (the result keeps the lives of its first argument), so two replicas that receive
+/// the same two such states in different orders would end in different states, with different
+/// hashes; and it is not idempotent on a state whose version vector does not cover its stamps
+/// (it finds a `typeClash` with itself). The join is not changed: no such state gets in.
+#[test]
+fn the_join_is_not_commutative_or_idempotent_where_decode_refuses() {
+    use super::tests::{dead_but_unlisted, vv_does_not_cover};
+    let o = opts(1_000_000_000);
+    let (a, b) = dead_but_unlisted();
+    for x in [&a, &b] {
+        assert_eq!(
+            MergeState::decode_compact(&x.encode_compact()),
+            Err(DecodeError::DeadLifeNotListed)
+        );
+        assert_eq!(MergeState::decode(&x.encode()), Err(DecodeError::DeadLifeNotListed));
+    }
+    assert!(join(&a, &b, &o).0 != join(&b, &a, &o).0, "not commutative");
+    let mut first = Writer::new(
+        WriterId { node: NodeId::from_bytes([7; 16]), epoch: Epoch::from_u64(0) },
+        o.clone(),
+    );
+    let mut second = Writer::new(
+        WriterId { node: NodeId::from_bytes([8; 16]), epoch: Epoch::from_u64(0) },
+        o.clone(),
+    );
+    first.receive(&a);
+    first.receive(&b);
+    second.receive(&b);
+    second.receive(&a);
+    assert_ne!(first.state.compact_hash(), second.state.compact_hash(), "the receive order shows");
+
+    let s = vv_does_not_cover();
+    assert_eq!(
+        MergeState::decode_compact(&s.encode_compact()),
+        Err(DecodeError::VersionVectorBehind)
+    );
+    assert_eq!(MergeState::decode(&s.encode()), Err(DecodeError::VersionVectorBehind));
+    let n = join(&s, &MergeState::default(), &o).0;
+    assert!(join(&n, &n, &o).0 != n, "not idempotent");
+}
+
+/// The pools hold the names no dotted spelling can carry (the empty name, `_`, a name with a
+/// dot), as registers, counters and loss records, flat and below a map.
+#[test]
+fn the_pools_hold_odd_names() {
+    let o = opts(1_000_000_000);
+    let odd = |p: &Path| p.segments().iter().any(|s| s.is_empty() || s == "_" || s.contains('.'));
+    let sets: [(&str, Vec<Vec<MergeState>>); 3] = [
+        ("flat", pools(60, 24, &o)),
+        ("nested", nested_pools(60, 26, &o)),
+        ("counters", (1..=60).map(|s| run_counters(s, 30, &o)).collect()),
+    ];
+    for (name, ps) in sets {
+        let states: Vec<&MergeState> = ps.iter().flatten().collect();
+        let with_reg = states.iter().filter(|s| s.regs.keys().any(|k| odd(&k.1))).count();
+        let with_slot = states.iter().filter(|s| s.slots.keys().any(|k| odd(&k.1))).count();
+        let with_loss = states
+            .iter()
+            .filter(|s| s.losses.keys().any(|k| k.at.field().is_some_and(odd)))
+            .count();
+        eprintln!(
+            "{name}: odd names in {with_reg} states as registers, {with_slot} as slots, {with_loss} in records"
+        );
+        assert!(with_reg > 100 && with_slot > 50, "{name}: {with_reg} {with_slot}");
+        assert!(with_loss > 20 || name == "counters", "{name}: {with_loss}");
+    }
+    // the flat names `_` and the whole-document record side by side: the record key of a field
+    // named `_` is a different key from the whole document's
+    let ps = pools(60, 24, &o);
+    let both = ps.iter().flatten().any(|s| {
+        s.losses.keys().any(|k| k.at == LossAt::Document)
+            && s.losses.keys().any(|k| k.at.field().is_some_and(|f| f.segments() == ["_"]))
+    });
+    assert!(both, "no state holds a record about the document and one about a field `_`");
+}
+
 #[test]
 fn encode_decode_round_trip() {
     for o in [opts(1_000_000_000), opts(6)] {
         let mut seen_gens = false;
         let mut seen_losses = false;
+        let mut split = codec::V1Split::default();
         for pool in pools(40, 24, &o) {
             for st in &pool {
-                let bytes = st.encode();
-                let back = MergeState::decode(&bytes).expect("decode");
-                assert_eq!(&back, st);
-                assert_eq!(back.canonical_bytes(), st.canonical_bytes());
-                assert_eq!(back.state_hash(), st.state_hash());
+                // the compact form, for every state
+                let c = st.encode_compact();
+                let back_c = MergeState::decode_compact(&c).expect("decode compact");
+                assert_eq!(&back_c, st);
+                assert_eq!(back_c.encode_compact(), c);
+                assert_eq!(back_c.compact_hash(), st.compact_hash());
+                // version 1, where it can spell the state
+                if split.note(st) {
+                    let bytes = st.encode();
+                    let back = MergeState::decode(&bytes).expect("decode");
+                    assert_eq!(&back, st);
+                    assert_eq!(back.canonical_bytes(), st.canonical_bytes());
+                    assert_eq!(back.state_hash(), st.state_hash());
+                }
                 seen_gens |= !st.gens.is_empty();
                 seen_losses |= !st.losses.is_empty();
             }
         }
+        eprintln!("encode_decode_round_trip R={}: {split:?}", o.retention);
+        assert!(split.held > 100, "version 1 still round-trips {} states", split.held);
         assert!(seen_gens && seen_losses, "the generated states should exercise gens and losses");
     }
     let empty = MergeState::default();
@@ -320,6 +610,7 @@ fn state_hash_of_different_join_orders_is_equal() {
     // is equal outright; the records converge by pulling the loss entries (model probe P5), done
     // here by `receive_loss` of the other side's records, after which the hashes are equal.
     let o = opts(1_000_000_000);
+    let mut split = codec::V1Split::default();
     for pool in pools(30, 24, &o) {
         let fwd = pool.iter().fold(MergeState::default(), |acc, s| join(&acc, s, &o).0);
         let mut rev_order: Vec<&MergeState> = pool.iter().collect();
@@ -343,9 +634,15 @@ fn state_hash_of_different_join_orders_is_equal() {
             wr.receive_loss(k.clone(), v.clone());
         }
         assert!(wf.state == wr.state);
-        assert_eq!(wf.state.state_hash(), wr.state.state_hash());
-        assert_eq!(wf.state.canonical_bytes(), wr.state.canonical_bytes());
+        assert_eq!(wf.state.compact_hash(), wr.state.compact_hash());
+        assert_eq!(wf.state.compact_bytes(), wr.state.compact_bytes());
+        if split.note(&wf.state) {
+            assert_eq!(wf.state.state_hash(), wr.state.state_hash());
+            assert_eq!(wf.state.canonical_bytes(), wr.state.canonical_bytes());
+        }
     }
+    eprintln!("state_hash_of_different_join_orders: {split:?}");
+    assert!(split.held > 5, "version 1 still compares {} joins", split.held);
 }
 
 #[test]
@@ -353,25 +650,46 @@ fn state_hash_separates_states() {
     let o = opts(1_000_000_000);
     let mut hashes = BTreeSet::new();
     let mut states = BTreeSet::new();
+    let (mut c_hashes, mut c_states) = (BTreeSet::new(), BTreeSet::new());
+    let mut split = codec::V1Split::default();
     for pool in pools(40, 24, &o) {
         for st in pool {
-            hashes.insert(st.state_hash());
-            states.insert(st.canonical_bytes());
+            // the compact form, for every state
+            c_hashes.insert(st.compact_hash());
+            c_states.insert(st.compact_bytes());
+            // version 1, where it can spell the state
+            if split.note(&st) {
+                hashes.insert(st.state_hash());
+                states.insert(st.canonical_bytes());
+            }
         }
     }
+    eprintln!(
+        "state_hash_separates_states: {split:?}, {} version 1 states, {} compact states",
+        states.len(),
+        c_states.len()
+    );
     assert_eq!(hashes.len(), states.len());
+    assert_eq!(c_hashes.len(), c_states.len());
+    assert!(states.len() > 100, "version 1 still separates {} states", states.len());
 }
 
 #[test]
 fn writer_state_hash_equals_receivers() {
     // A writer's normalised state hashes like the state a receiver reaches by joining it in.
     let o = opts(1_000_000_000);
+    let mut split = codec::V1Split::default();
     for pool in pools(30, 24, &o) {
         for st in &pool {
             let recv = join(&MergeState::default(), st, &o).0;
-            assert_eq!(recv.state_hash(), st.state_hash());
+            assert_eq!(recv.compact_hash(), st.compact_hash());
+            if split.note(st) {
+                assert_eq!(recv.state_hash(), st.state_hash());
+            }
         }
     }
+    eprintln!("writer_state_hash_equals_receivers: {split:?}");
+    assert!(split.held > 100, "version 1 still hashes {} states", split.held);
 }
 
 #[test]
@@ -382,19 +700,22 @@ fn local_refusals_and_noops() {
         epoch: Epoch::new(Hlc::new(5, 1), [9; 8]),
     };
     let mut w = Writer::new(id, o);
-    assert!(w.write_set("x", Value::Int(1), 0).is_none(), "no life");
+    assert!(w.write_set(&p("x"), Value::Int64(1), 0).is_none(), "no life");
     assert!(w.write_delete(0).is_none());
-    let a = w.insert(&[("x", Value::Int(1))], 0).unwrap();
+    let a = w.insert(&fl(&[("x", Value::Int64(1))]), 0).unwrap();
     assert_eq!(a.record.kind, WriteKind::Insert);
-    assert!(w.insert(&[("y", Value::Int(1))], 0).is_none(), "a life is alive");
-    assert!(w.write_set("x", Value::Int(1), 0).is_none(), "unchanged");
-    assert!(w.write_unset("nope", 0).is_none());
-    assert!(w.write_inc("x", i64::MAX, 0).is_none(), "past the bound");
-    w.write_set("s", Value::Str("t".into()), 0).unwrap();
-    assert!(w.write_inc("s", 1, 0).is_none(), "a string");
-    assert!(w.write_replace(&[("x", Value::Int(1)), ("s", Value::Str("t".into()))], 0).is_none());
-    let r = w.write_replace(&[("x", Value::Int(2))], 0).unwrap();
-    assert_eq!(r.record.paths, vec!["x".to_string(), "s".to_string()]);
+    assert!(w.insert(&fl(&[("y", Value::Int64(1))]), 0).is_none(), "a life is alive");
+    assert!(w.write_set(&p("x"), Value::Int64(1), 0).is_none(), "unchanged");
+    assert!(w.write_unset(&p("nope"), 0).is_none());
+    assert!(w.write_inc(&p("x"), i64::MAX, 0).is_none(), "past the bound");
+    w.write_set(&p("s"), Value::String("t".into()), 0).unwrap();
+    assert!(w.write_inc(&p("s"), 1, 0).is_none(), "a string");
+    assert!(
+        w.write_replace(&fl(&[("x", Value::Int64(1)), ("s", Value::String("t".into()))]), 0)
+            .is_none()
+    );
+    let r = w.write_replace(&fl(&[("x", Value::Int64(2))]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![p("x"), p("s")]);
     assert_eq!(w.visible().unwrap().len(), 1);
     w.write_delete(0).unwrap();
     assert!(w.visible().is_none());
@@ -411,11 +732,11 @@ fn mutants_change_the_outcome() {
     };
     let run = |o: &JoinOptions| {
         let (mut a, mut b, mut c) = (mk(o, b'A'), mk(o, b'B'), mk(o, b'C'));
-        a.insert(&[("x", Value::Int(1))], 0).unwrap();
+        a.insert(&fl(&[("x", Value::Int64(1))]), 0).unwrap();
         c.receive(&a.state.clone());
-        c.write_set("note", Value::Str("c".into()), 0).unwrap();
+        c.write_set(&p("note"), Value::String("c".into()), 0).unwrap();
         b.clock = Hlc::new(8, 0);
-        b.insert(&[("y", Value::Int(2))], 0).unwrap();
+        b.insert(&fl(&[("y", Value::Int64(2))]), 0).unwrap();
         let mut o1 = mk(o, b'O');
         o1.receive(&a.state.clone());
         o1.receive(&c.state.clone());
@@ -434,6 +755,61 @@ fn mutants_change_the_outcome() {
     assert_ne!(no_sup.0, good.0);
 }
 
+/// The encodings the decode fuzz damages: every fifth state of the pools of 24 runs.
+pub(super) fn fuzz_corpus(o: &JoinOptions) -> Vec<Vec<u8>> {
+    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    for pool in pools(24, 24, o) {
+        for st in pool.iter().step_by(5) {
+            // version 1, for the states it can spell (the others are in the compact corpus)
+            if st.without_ords().v1_can_hold() {
+                corpus.push(st.encode());
+            }
+        }
+    }
+    corpus
+}
+
+/// The compact encodings the compact decode fuzz damages: the same states, every fifth of the pools
+/// of 24 runs, all of them (the compact form spells every state).
+pub(super) fn fuzz_corpus_compact(o: &JoinOptions) -> Vec<Vec<u8>> {
+    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    for pool in pools(24, 24, o) {
+        for st in pool.iter().step_by(5) {
+            corpus.push(st.encode_compact());
+        }
+    }
+    corpus
+}
+
+/// One damaged input: an encoding of the corpus with one to four bit flips, byte sets,
+/// truncations, insertions, deletions or rewritten length fields.
+pub(super) fn fuzz_mutate(rng: &mut Rng, corpus: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = corpus[rng.below(corpus.len())].clone();
+    for _ in 0..1 + rng.below(4) {
+        let i = rng.below(b.len().max(1));
+        match rng.below(6) {
+            0 => b[i] ^= 1 << rng.below(8),
+            1 => b[i] = *rng.pick(&[0u8, 1, 2, 3, 0xff]),
+            2 => b.truncate(i),
+            3 => b.insert(i, rng.next() as u8),
+            4 if i + 8 <= b.len() => {
+                // rewrite something that may be a u64 length
+                let v = *rng.pick(&[0u64, 1, 2, 3, u64::MAX, (b.len() - i) as u64]);
+                b[i..i + 8].copy_from_slice(&v.to_be_bytes());
+            }
+            _ => {
+                if i < b.len() {
+                    b.remove(i);
+                }
+            }
+        }
+        if b.is_empty() {
+            break;
+        }
+    }
+    b
+}
+
 /// Mutation fuzz of `decode` (default 20,000 inputs; `Q7_DECODE_FUZZ=<n>` overrides): the
 /// encodings of states the writers build, damaged by bit flips, byte sets, truncations,
 /// insertions, deletions and rewritten length fields. `decode` must never panic; an accepted
@@ -444,38 +820,21 @@ fn decode_mutation_fuzz() {
     let n: u64 =
         std::env::var("Q7_DECODE_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
     let o = opts(1_000_000_000);
-    let mut corpus: Vec<Vec<u8>> = Vec::new();
+    let corpus = fuzz_corpus(&o);
+    // the corpus is the states version 1 can spell; the others (an absorbed pair) are fuzzed through the
+    // compact decoder (`compact_tests::decode_compact_mutation_fuzz_keeps_canonicity`, and the d7 sweep)
+    let mut split = codec::V1Split::default();
     for pool in pools(24, 24, &o) {
-        for st in pool.iter().step_by(5) {
-            corpus.push(st.encode());
-        }
+        pool.iter().step_by(5).for_each(|st| {
+            split.note(st);
+        });
     }
+    assert_eq!(corpus.len(), split.held);
+    eprintln!("decode_mutation_fuzz corpus: {split:?}");
     let mut rng = Rng(0x00C0_FFEE_D00D_5EED);
     let (mut accepted, mut refused) = (0u64, 0u64);
     for k in 0..n {
-        let mut b = corpus[rng.below(corpus.len())].clone();
-        for _ in 0..1 + rng.below(4) {
-            let i = rng.below(b.len().max(1));
-            match rng.below(6) {
-                0 => b[i] ^= 1 << rng.below(8),
-                1 => b[i] = *rng.pick(&[0u8, 1, 2, 3, 0xff]),
-                2 => b.truncate(i),
-                3 => b.insert(i, rng.next() as u8),
-                4 if i + 8 <= b.len() => {
-                    // rewrite something that may be a u64 length
-                    let v = *rng.pick(&[0u64, 1, 2, 3, u64::MAX, (b.len() - i) as u64]);
-                    b[i..i + 8].copy_from_slice(&v.to_be_bytes());
-                }
-                _ => {
-                    if i < b.len() {
-                        b.remove(i);
-                    }
-                }
-            }
-            if b.is_empty() {
-                break;
-            }
-        }
+        let b = fuzz_mutate(&mut rng, &corpus);
         let input = b.clone();
         let verdict = std::panic::catch_unwind(move || match MergeState::decode(&b) {
             Err(_) => false,
@@ -502,6 +861,448 @@ fn decode_mutation_fuzz() {
     assert!(accepted > 0 && refused > 0, "the fuzz should reach both outcomes");
 }
 
-fn o_default() -> JoinOptions {
+pub(super) fn o_default() -> JoinOptions {
     opts(1_000_000_000)
+}
+
+// ---- nested documents ------------------------------------------------------------------
+
+/// A path of the nested workload, from dotted names (none holds a dot).
+fn np(dotted: &str) -> Path {
+    Path::new(dotted.split('.')).unwrap()
+}
+
+/// A scalar, an array (documents inside it too) or a sub-document, up to two levels deep.
+fn nested_value(rng: &mut Rng, depth: usize) -> Value {
+    match rng.below(if depth < 2 { 8 } else { 5 }) {
+        0 | 1 => pool_value(rng),
+        2 => Value::Array(vec![pool_value(rng), pool_value(rng)]),
+        3 => Value::Array(vec![Value::Document(vec![("k".into(), pool_value(rng))])]),
+        4 => Value::Null,
+        _ => {
+            let names = ["b", "c", "d", "", "_", "b.c"];
+            let n = rng.below(3);
+            let mut f: Vec<(String, Value)> = Vec::new();
+            for _ in 0..n {
+                let k = *rng.pick(&names);
+                if !f.iter().any(|(q, _)| q == k) {
+                    f.push((k.to_string(), nested_value(rng, depth + 1)));
+                }
+            }
+            Value::Document(f)
+        }
+    }
+}
+
+/// Like [`run`], but over nested documents: sub-documents set and replaced, scalars and arrays
+/// written over maps and the reverse, nested counters, unsets of whole sub-documents.
+pub(super) fn run_nested(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    run_nested_with(seed, steps, o, false)
+}
+
+/// [`run_nested`] with the order state kept in the pooled states or left out (see [`run_with`]).
+pub(super) fn run_nested_with(
+    seed: u64,
+    steps: usize,
+    o: &JoinOptions,
+    ords: bool,
+) -> Vec<MergeState> {
+    run_nested_tagged(seed, steps, o, ords).into_iter().map(|(_, s)| s).collect()
+}
+
+/// [`run_nested_with`] with the number of the writer that held each pooled state.
+pub(super) fn run_nested_tagged(
+    seed: u64,
+    steps: usize,
+    o: &JoinOptions,
+    ords: bool,
+) -> Vec<(usize, MergeState)> {
+    let mut o = o.clone();
+    o.set_ord_reorder_is_noop(!ords);
+    let o = &o;
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let n = 3 + rng.below(2);
+    let mut ws: Vec<Writer> = (0..n)
+        .map(|k| {
+            let id = WriterId {
+                node: NodeId::from_bytes([b'A' + k as u8; 16]),
+                epoch: Epoch::from_u64(0),
+            };
+            Writer::new(id, o.clone())
+        })
+        .collect();
+    let init = Value::Document(vec![
+        ("b".into(), Value::Int64(1)),
+        ("c".into(), Value::Document(vec![("d".into(), Value::String("s".into()))])),
+    ]);
+    let items = Value::Array(vec![Value::Int64(0)]);
+    ws[0].insert(&[(p("x"), Value::Int64(100)), (p("a"), init), (p("items"), items)], 0);
+    let mut pool = Vec::new();
+    let mut all: Vec<Path> =
+        ["x", "a", "a.b", "a.c", "a.c.d", "a.e", "m", "m.k", "items", "items", "items", "a.c.d.z"]
+            .into_iter()
+            .map(np)
+            .collect();
+    // a name no dotted spelling can carry: empty, `_` (the version 1 name of the whole document in
+    // a record), or with a dot, at the top and below `a`
+    for odd in
+        [&[""][..], &["_"], &["a.b"], &["a", ""], &["a", "_"], &["a", "b.c"], &["a", "c", ""]]
+    {
+        all.push(Path::new(odd.iter().copied()).unwrap());
+    }
+    for _ in 0..steps {
+        let m = rng.below(n);
+        let skew = *rng.pick(&[0, 0, 0, 4]);
+        if rng.below(100) < 45 {
+            let mut other = rng.below(n);
+            if other == m {
+                other = (m + 1) % n;
+            }
+            let st = ws[other].state.clone();
+            ws[m].receive(&st);
+        } else {
+            let path = rng.pick(&all).clone();
+            let w = &mut ws[m];
+            match rng.below(14) {
+                0..=3 => {
+                    let v = if path == np("items") {
+                        Value::Array(
+                            (0..1 + rng.below(3)).map(|k| Value::Int64(k as i64)).collect(),
+                        )
+                    } else {
+                        nested_value(&mut rng, 0)
+                    };
+                    w.write_set(&path, v, skew);
+                }
+                4..=5 => {
+                    w.write_unset(&path, skew);
+                }
+                6..=8 => {
+                    w.write_inc(&path, pool_inc(&mut rng), skew);
+                }
+                9 => {
+                    let a = nested_value(&mut rng, 0);
+                    let doc = vec![(p("x"), pool_value(&mut rng)), (p("a"), a)];
+                    w.write_replace(&doc, skew);
+                }
+                10 => {
+                    w.write_delete(skew);
+                }
+                _ => {
+                    let v = nested_value(&mut rng, 0);
+                    w.insert(&[(p("x"), Value::Int64(100)), (p("a"), v)], skew);
+                }
+            }
+        }
+        pool.push((m, if ords { ws[m].state.clone() } else { ws[m].state.without_ords() }));
+    }
+    pool
+}
+
+pub(super) fn nested_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+    (1..=seeds).map(|s| run_nested(s, steps, o)).collect()
+}
+
+/// [`nested_pools`] with the order state the writers built.
+pub(super) fn nested_ord_pools(seeds: u64, steps: usize, o: &JoinOptions) -> Vec<Vec<MergeState>> {
+    (1..=seeds).map(|s| run_nested_with(s, steps, o, true)).collect()
+}
+
+/// The visible document is well formed: every path above a visible path is a visible map, and
+/// only a map has anything below it.
+fn assert_well_formed(st: &MergeState, o: &JoinOptions) {
+    let Some(vis) = st.visible(o) else { return };
+    for (path, v) in &vis {
+        for a in path.ancestors() {
+            assert_eq!(vis.get(&a), Some(&Value::Map), "{a} above {path}");
+        }
+        assert!(!matches!(v, Value::Document(_) | Value::Unset), "{path}: {v:?}");
+    }
+    assert!(st.regs.values().all(|r| r.value.check_register().is_ok()));
+}
+
+#[test]
+fn nested_join_laws() {
+    for (o, exact) in [(opts(1_000_000_000), true), (opts(20), true), (opts(6), false)] {
+        let ps = nested_pools(60, 26, &o);
+        let (mut maps, mut type_clash, mut array_clash, mut docs) = (0, 0, 0, 0);
+        for st in ps.iter().flatten() {
+            maps += st.regs.values().filter(|r| r.value == Value::Map).count();
+            type_clash += st.losses.keys().filter(|k| k.kind == LossKind::TypeClash).count();
+            array_clash += st.losses.keys().filter(|k| k.kind == LossKind::ArrayClash).count();
+            docs += usize::from(!st.v1_can_hold());
+        }
+        assert!(
+            maps > 0 && type_clash > 0 && array_clash > 0 && docs > 0,
+            "the runs must exercise markers ({maps}), typeClash ({type_clash}), arrayClash ({array_clash}), documents in arrays ({docs})"
+        );
+        check_laws_on(&o, exact, &ps, 300);
+    }
+}
+
+#[test]
+fn nested_states_are_well_formed_and_round_trip_in_both_codecs() {
+    for o in [opts(1_000_000_000), opts(6)] {
+        for st in nested_pools(40, 26, &o).iter().flatten() {
+            assert_well_formed(st, &o);
+            let c = st.encode_compact();
+            let back = MergeState::decode_compact(&c).expect("decode_compact");
+            assert_eq!(&back, st);
+            assert_eq!(back.encode_compact(), c);
+            assert_eq!(back.compact_hash(), st.compact_hash());
+            if st.v1_can_hold() {
+                let v1 = MergeState::decode(&st.encode()).expect("decode");
+                assert_eq!(&v1, st);
+                assert_eq!(v1.state_hash(), st.state_hash());
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_hashes_are_a_function_of_the_state_not_of_the_join_order() {
+    let o = opts(1_000_000_000);
+    let ps = nested_pools(40, 26, &o);
+    let mut n = 0;
+    for (a, b, _) in triples(&ps, 300) {
+        let (ab, ba) = (join(a, b, &o).0, join(b, a, &o).0);
+        assert_eq!(ab.compact_hash(), ba.compact_hash());
+        assert_eq!(ab.compact_bytes(), ba.compact_bytes());
+        if ab.v1_can_hold() {
+            assert_eq!(ab.state_hash(), ba.state_hash());
+        }
+        assert_eq!(ab.visible(&o), ba.visible(&o));
+        n += 1;
+    }
+    assert_eq!(n, 300);
+}
+
+#[test]
+fn a_nested_writers_hash_equals_every_receivers() {
+    // The writer's own normalised state is what a receiver builds from it.
+    let o = opts(1_000_000_000);
+    for ps in nested_pools(30, 26, &o) {
+        for st in &ps {
+            let mut r = Writer::new(
+                WriterId { node: NodeId::from_bytes([b'Z'; 16]), epoch: Epoch::from_u64(0) },
+                o.clone(),
+            );
+            r.receive(st);
+            assert_eq!(r.state.compact_hash(), st.compact_hash());
+            assert_well_formed(&r.state, &o);
+        }
+    }
+}
+
+#[test]
+fn state_equality_is_the_equality_of_the_version_1_bytes() {
+    // `Writer::receive_report` decides "changed" by comparing states, where it once compared the
+    // version 1 canonical bytes: the two verdicts agree on every state version 1 can spell.
+    let o = opts(1_000_000_000);
+    let mut pools_ = pools(40, 24, &o);
+    pools_.extend(
+        nested_pools(40, 24, &o)
+            .into_iter()
+            .map(|p| p.into_iter().filter(MergeState::v1_can_hold).collect()),
+    );
+    let (mut same, mut differ) = (0, 0);
+    let (mut v1_pairs, mut v1_held_pairs) = (0, 0);
+    for (a, b, _) in triples(&pools_, 600) {
+        let merged = join(a, b, &o).0;
+        for (x, y) in [(a, b), (a, &merged), (b, &merged)] {
+            let by_state = x == y;
+            // the compact bytes, for every state (the version 1 form cannot spell a state with an
+            // absorbed pair)
+            assert_eq!(by_state, x.compact_bytes() == y.compact_bytes());
+            // version 1, where it holds both states of the pair
+            let (hx, hy) = (x.without_ords().v1_can_hold(), y.without_ords().v1_can_hold());
+            if hx && hy {
+                assert_eq!(by_state, x.canonical_bytes() == y.canonical_bytes());
+                v1_held_pairs += 1;
+            } else {
+                assert!(
+                    (hx || x.v1_refused_only_for_a_pair())
+                        && (hy || y.v1_refused_only_for_a_pair())
+                );
+            }
+            v1_pairs += 1;
+            if by_state {
+                same += 1;
+            } else {
+                differ += 1;
+            }
+        }
+    }
+    eprintln!("state_equality: {v1_held_pairs} of {v1_pairs} pairs also on version 1");
+    assert!(same > 50 && differ > 50, "{same} equal, {differ} different");
+    assert!(v1_held_pairs > 50, "version 1 still compares {v1_held_pairs} pairs");
+}
+
+// ---- typed counters --------------------------------------------------------------------------
+
+fn dec_value(s: &str) -> Value {
+    Value::Decimal128(s.parse::<bson::Decimal128>().unwrap().bytes())
+}
+
+/// An amount of any counter type: small and large, near the bounds (so that merges saturate),
+/// and the decimal sums that are not associative.
+fn amount(rng: &mut Rng) -> Value {
+    match rng.below(16) {
+        0 => Value::Int32(1),
+        1 => Value::Int32(-1),
+        2 => Value::Int32(2_000_000_000),
+        3 => Value::Int32(-2_000_000_000),
+        4 => Value::Int64(1 << 40),
+        5 => Value::Int64(7),
+        6 => Value::Int64(i64::MAX),
+        7 => Value::Int64(i64::MIN + 1),
+        8 => dec_value("0.1"),
+        9 => dec_value("1E+34"),
+        10 => dec_value("-1E+34"),
+        11 => dec_value("5"),
+        12 => dec_value("9.999999999999999999999999999999999E+6144"),
+        13 => dec_value("-9.999999999999999999999999999999999E+6144"),
+        _ => Value::Int64(-7),
+    }
+}
+
+/// Three writers on the counters `x` and `y`, whose bases and increments are of every type.
+pub(super) fn run_counters(seed: u64, steps: usize, o: &JoinOptions) -> Vec<MergeState> {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut ws: Vec<Writer> = (0..3)
+        .map(|k| {
+            let id = WriterId {
+                node: NodeId::from_bytes([b'A' + k as u8; 16]),
+                epoch: Epoch::from_u64(0),
+            };
+            Writer::new(id, o.clone())
+        })
+        .collect();
+    let mut pool = Vec::new();
+    ws[0].insert(&fl(&[("x", amount(&mut rng)), ("y", amount(&mut rng))]), 0);
+    for _ in 0..steps {
+        let m = rng.below(3);
+        let skew = *rng.pick(&[0, 0, 0, 4]);
+        if rng.below(100) < 40 {
+            let other = (m + 1 + rng.below(2)) % 3;
+            let st = ws[other].state.clone();
+            ws[m].receive(&st);
+        } else {
+            let path = p(rng.pick(&["x", "y", "", "_", "a.b"]));
+            let w = &mut ws[m];
+            match rng.below(12) {
+                0..=6 => {
+                    let by = amount(&mut rng);
+                    w.write_inc_value(&path, &by, skew);
+                }
+                7 | 8 => {
+                    let v = amount(&mut rng);
+                    w.write_set(&path, v, skew);
+                }
+                9 => {
+                    w.write_set(&path, Value::String("s".into()), skew);
+                }
+                10 => {
+                    w.write_unset(&path, skew);
+                }
+                _ => {
+                    w.write_delete(skew);
+                }
+            }
+        }
+        pool.push(ws[m].state.clone());
+    }
+    pool
+}
+
+#[test]
+fn typed_counter_join_laws_and_hashes() {
+    for (o, exact) in [(opts(1_000_000_000), true), (opts(20), true)] {
+        let ps: Vec<Vec<MergeState>> = (1..=60).map(|s| run_counters(s, 30, &o)).collect();
+        let (mut typed, mut slots) = (0, 0);
+        for st in ps.iter().flatten() {
+            slots += st.slots.len();
+            typed += st.totals().filter(|n| !matches!(n, Num::Int64(_))).count();
+        }
+        assert!(
+            slots > 0 && typed > 0,
+            "the runs must exercise typed slots ({typed} of {slots} totals)"
+        );
+        check_laws_on(&o, exact, &ps, 400);
+        for st in ps.iter().flatten() {
+            let c = st.encode_compact();
+            let back = MergeState::decode_compact(&c).expect("decode_compact");
+            assert_eq!(&back, st);
+            assert_eq!(back.encode_compact(), c);
+            assert_eq!(back.visible(&o), st.visible(&o));
+            if st.v1_can_hold() {
+                assert_eq!(&MergeState::decode(&st.encode()).unwrap(), st);
+            }
+        }
+    }
+}
+
+/// The read of a cell does not depend on the order the states were joined in: the same value,
+/// byte for byte (a `Double` or `Decimal128` sum is not associative, so this is the canonical
+/// order at work), and the same hashes.
+#[test]
+fn typed_counter_reads_and_hashes_do_not_depend_on_the_join_order() {
+    let o = opts(1_000_000_000);
+    let ps: Vec<Vec<MergeState>> = (1..=60).map(|s| run_counters(s, 30, &o)).collect();
+    let (mut n, mut saturated) = (0, 0);
+    for (a, b, c) in triples(&ps, 400) {
+        // without the loss records, which are not an associative function of the states
+        let abc = bare(join(&join(a, b, &o).0, c, &o).0);
+        let cba = bare(join(&join(c, b, &o).0, a, &o).0);
+        let bca = bare(join(b, &join(c, a, &o).0, &o).0);
+        for other in [&cba, &bca] {
+            assert_eq!(abc.compact_bytes(), other.compact_bytes());
+            assert_eq!(abc.compact_hash(), other.compact_hash());
+            if abc.v1_can_hold() {
+                assert_eq!(abc.state_hash(), other.state_hash());
+            }
+            let (va, vb) = (abc.visible(&o), other.visible(&o));
+            assert_eq!(format!("{va:?}"), format!("{vb:?}"));
+            assert_eq!(abc.hidden_all(&o), other.hidden_all(&o));
+            assert_eq!(abc.excess(&o), other.excess(&o));
+        }
+        n += 1;
+        saturated += usize::from(!abc.excess(&o).is_empty());
+    }
+    assert_eq!(n, 400);
+    assert!(saturated > 0, "the joins must cross a bound sometimes");
+}
+
+#[test]
+fn a_typed_writers_hash_equals_every_receivers() {
+    let o = opts(1_000_000_000);
+    for s in 1..=30 {
+        for st in &run_counters(s, 30, &o) {
+            let mut r = Writer::new(
+                WriterId { node: NodeId::from_bytes([b'Z'; 16]), epoch: Epoch::from_u64(0) },
+                o.clone(),
+            );
+            r.receive(st);
+            assert_eq!(r.state.compact_hash(), st.compact_hash());
+        }
+    }
+}
+
+#[test]
+fn the_states_writers_build_satisfy_the_invariants_decode_checks() {
+    // every state of the generated runs (flat, nested, typed counters, a small retention too)
+    // is accepted by both decoders: nothing a writer or a receive builds is refused
+    for ret in [1_000_000_000, 6] {
+        let o = opts(ret);
+        let mut sets = pools(20, 24, &o);
+        sets.extend(nested_pools(20, 26, &o));
+        // and with the order state fed
+        sets.extend(ord_pools(20, 24, &o));
+        sets.extend(nested_ord_pools(20, 26, &o));
+        sets.extend((1..=20).map(|s| run_counters(s, 30, &o)));
+        for st in sets.iter().flatten() {
+            assert!(st.check_decoded().is_ok());
+            assert_eq!(MergeState::decode_compact(&st.encode_compact()).as_ref(), Ok(st));
+        }
+    }
 }

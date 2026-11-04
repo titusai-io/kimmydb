@@ -303,17 +303,30 @@ jobs:
             -E 'package(kimmy-api) | (package(kimmy-storage) & test(/cache/)) | (package(kimmyd) & test(/bridge/))'
           cargo clippy -p kimmyd --all-targets --features storage-cache-metrics -- -D warnings
 
-      # The Q7 merge-state harness: the random runs, the probes and the 16 mutants
+      # The Q7 merge-state harness: the random runs, the probes and the mutants
       # of kimmy-core's `merge_state` module. Its target requires the
       # `merge-mutants` feature, which the workspace run above does not enable, so
       # it ran nowhere: a probe could start failing or a mutant start surviving and
-      # the change would merge green. The runner fails on either. (Its companion,
-      # the differential test against the Python reference model in
-      # `merge_state_diff`, needs no feature and runs in the workspace step above;
-      # it starts `python3`, which the runner image has.) About 5 minutes here.
+      # the change would merge green. The runner fails on either. About 5 minutes
+      # here.
       - name: Test the merge-state harness
         if: needs.changes.outputs.docs_only != 'true'
         run: cargo test -p kimmy-core --features merge-mutants --test merge_state_sim
+
+      # The three differential tests of the same module: the flat and the nested
+      # replay against the stage-A Python reference model, and the order
+      # differential against the A2.1 model. All three set mutation switches (the
+      # stage-A rule that a reorder is a no-op, the order switches), so their targets
+      # require `merge-mutants` too, and the workspace run above leaves them out:
+      # between a5dbf14b and this step they ran nowhere. They start `python3`,
+      # which the runner image has (the order differential replays a recorded
+      # fixture). Every target with `required-features` in kimmy-core is named
+      # here or in the harness step above.
+      - name: Test the merge-state differentials
+        if: needs.changes.outputs.docs_only != 'true'
+        run: >-
+          cargo nextest run -p kimmy-core --features merge-mutants
+          --test merge_state_diff --test merge_state_diff_nested --test merge_state_ord_diff
 
       # Every test that reads a documentation file lives in `kimmy-api`, which
       # `documentation_tests_live_in_this_crate` holds true, so this is the

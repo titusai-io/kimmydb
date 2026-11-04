@@ -9,11 +9,33 @@ use std::rc::Rc;
 use kimmy_core::hlc::Hlc;
 use kimmy_core::ids::NodeId;
 use kimmy_core::merge_state::{
-    Epoch, JoinOptions, LifeKind, LossKey, LossKind, LossValue, MStamp, MergeState, Received,
+    Epoch, JoinOptions, LifeKind, LossKey, LossKind, LossValue, MStamp, MergeState, Path, Received,
     Value, Writer, WriterId, Written, join,
 };
 
-use crate::oracle::Log;
+use crate::oracle::{self, Intent, Log};
+use crate::order_oracle::{self, OrdOp};
+
+/// A one-segment path.
+pub fn p(x: &str) -> Path {
+    Path::flat(x).expect("a valid field name")
+}
+/// A path from its dotted spelling (the sim's names have no dot).
+pub fn np(dotted: &str) -> Path {
+    Path::new(dotted.split('.')).expect("a valid path")
+}
+/// A sub-document.
+pub fn sub(f: &[(&str, Value)]) -> Value {
+    Value::Document(f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect())
+}
+/// The fields of a document value as owned names.
+fn named(f: &[(&str, Value)]) -> Vec<(String, Value)> {
+    f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+}
+/// The fields of a flat document as paths.
+pub fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
+    f.iter().map(|(k, v)| (p(k), v.clone())).collect()
+}
 use crate::rng::Rng;
 
 /// A vector keyed by origin: `(node, epoch)`, or `(node, 0)` when the
@@ -42,6 +64,22 @@ pub struct SimFlags {
     /// again (v4's behaviour). `LossKind` has no hidden kind, so the stand-in is
     /// `RetiredWriter`, which P0 never produces.
     pub hidden_records: bool,
+    /// The covered-entry skip of the real protocol (Q3, mandatory at apply): an entry whose stamp
+    /// the receiver's version vector already covers is not applied again, only witnessed. In the
+    /// sim's protocol (on, the design, by the entry's whole version vector); off for the evidence runs and for the mutant: without it a
+    /// pull window re-sends an old entry that the receiver already holds, and after the horizon has
+    /// collected a delete that entry brings a life the delete killed back to life (the five seeds
+    /// of the bounded runs that failed before the skip was ported, `main.rs`; the idle-origin and
+    /// late-member scripts of `probes.rs`).
+    pub covered_skip: bool,
+    /// Mutant `covered skip by stamp only`: the skip looks at the entry's own stamp instead of the
+    /// entry's whole version vector. Off (the design: the vector rule).
+    pub covered_skip_by_stamp: bool,
+    /// The start-HLC rule of the real protocol (Q3, an optimisation, not the fix): a pull for an
+    /// origin the puller has never witnessed starts at that epoch's start HLC (the first 10 bytes
+    /// of a restore's epoch; zero for a first epoch), not at 0, so a restored member's first pulls
+    /// do not replay its whole oplog. On (the design); off is the mutant `no start-HLC`.
+    pub start_hlc: bool,
 }
 
 impl Default for SimFlags {
@@ -55,6 +93,9 @@ impl Default for SimFlags {
             drop_kind: None,
             report_neither: false,
             hidden_records: false,
+            covered_skip: true,
+            covered_skip_by_stamp: false,
+            start_hlc: true,
         }
     }
 }
@@ -118,10 +159,29 @@ pub struct Node {
     pub snaps: u32,
     pub events: Vec<LossKey>,
     pub restored: bool,
+    /// How many entries `receive_entry` was handed (applied, skipped as covered, or dominated): the
+    /// observable effect of the start-HLC rule, which changes no state.
+    pub entries_received: usize,
     pub flags: SimFlags,
+    /// Check every write's leaf effects against the oracle's view of the writer's causal past
+    /// (only where the node has seen all it could: not under a short retention).
+    pub check_writes: bool,
+    /// The disagreements `check_writes` found, by name.
+    pub problems: Vec<String>,
+    /// The writes whose author did not read the order the serial reference gives right after them
+    /// (read-your-writes order, `order_oracle.rs`): checked for every local write, in every run.
+    pub order_problems: Vec<String>,
+    /// How many writes that check compared (the reference had an outcome for them).
+    pub order_checks: usize,
+    /// How many of those also had the part "a field the write creates is the last of its level" decided.
+    pub order_last_checks: usize,
+    /// ... and on a level that held a map without a place.
+    pub order_trailing_checks: usize,
     epoch_ctr: u64,
     epoch_rng: Rng,
     saved: Option<Saved>,
+    /// ORACLE ONLY: what the write about to be logged did to the order (`order_oracle::write_ord`).
+    pending: Option<order_oracle::WriteOrd>,
 }
 
 fn raise(vec: &mut Vec2, o: WriterId, h: Hlc) {
@@ -148,11 +208,30 @@ impl Node {
             snaps: 0,
             events: Vec::new(),
             restored: false,
+            entries_received: 0,
             flags: cfg.flags,
+            check_writes: false,
+            problems: Vec::new(),
+            order_problems: Vec::new(),
+            order_checks: 0,
+            order_last_checks: 0,
+            order_trailing_checks: 0,
             epoch_ctr: 0,
             epoch_rng: Rng::new(20_261_031 ^ u64::from(name as u32)),
             saved: None,
+            pending: None,
         }
+    }
+
+    /// The start HLC of an origin's epoch (the start-HLC rule): a restore's epoch is its start HLC and
+    /// 8 random bytes, a first epoch has none (zero). Zero when the rule is off.
+    fn start_of(&self, o: &WriterId) -> Hlc {
+        if !self.flags.start_hlc {
+            return Hlc::ZERO;
+        }
+        let mut b = [0u8; 10];
+        b.copy_from_slice(&o.epoch.0[..10]);
+        Hlc::from_bytes(b)
     }
 
     /// `node(st)`: the origin a stamp counts under.
@@ -177,7 +256,7 @@ impl Node {
     }
 
     pub fn canon(&self) -> Vec<u8> {
-        self.w.state.canonical_bytes()
+        self.w.state.compact_bytes()
     }
 
     fn append(&mut self, ent: Rc<Ent>) {
@@ -191,8 +270,12 @@ impl Node {
     /// The model's `finish` tail: the writer already holds the normalised state;
     /// log the write with its causal past and append its entry.
     pub fn logged(&mut self, wr: Option<Written>, log: &mut Log) -> Option<MStamp> {
+        let pending = self.pending.take();
         let wr = wr?;
         let st = wr.stamp;
+        if let Some(w) = pending {
+            order_oracle::record(st, w, wr.record.life, log.is_empty());
+        }
         log.insert(st, (self.contained.clone(), wr.record));
         self.contained.insert(st);
         let ent = Ent::W { st, state: self.w.state.clone(), contained: self.contained.clone() };
@@ -272,8 +355,7 @@ impl Node {
                     let older = *gn != Some(g.stamp) && gn.is_none_or(|x| x < g.stamp);
                     let covered =
                         g.vv.get(&v.stamp.writer).copied().unwrap_or(Hlc::ZERO) >= v.stamp.hlc;
-                    let key =
-                        LossKey { kind: LossKind::RetiredWriter, path: p.clone(), stamp: v.stamp };
+                    let key = LossKey::field(LossKind::RetiredWriter, p.clone(), v.stamp);
                     if older && !covered && key.stamp.hlc >= h && !merged.losses.contains_key(&key)
                     {
                         add.push((key, LossValue::Total(v.total)));
@@ -288,7 +370,7 @@ impl Node {
             }
         }
         self.w.clock = merged.vv.values().copied().chain([self.w.clock]).max().unwrap_or(Hlc::ZERO);
-        let changed = merged.canonical_bytes() != self.w.state.canonical_bytes();
+        let changed = merged.compact_bytes() != self.w.state.compact_bytes();
         self.w.state = merged;
         Received { changed, fresh: fresh.into_iter().collect() }
     }
@@ -313,7 +395,26 @@ impl Node {
         r.changed
     }
 
+    /// Does this node's version vector cover the entry? The model's rule (and Step 3's): the WHOLE vector
+    /// of the entry's state, so that an entry carrying knowledge the receiver lacks is never skipped. The
+    /// weaker rule (`covered_skip_by_stamp`, a mutant) looks at the entry's own stamp only.
+    fn covers(&self, st: &MStamp, state: &MergeState) -> bool {
+        if self.flags.covered_skip_by_stamp {
+            return get(&self.w.state.vv, &st.writer) >= st.hlc;
+        }
+        state.vv.iter().all(|(w, h)| get(&self.w.state.vv, w) >= *h)
+    }
+
     pub fn receive_entry(&mut self, ent: &Rc<Ent>) {
+        self.entries_received += 1;
+        if self.flags.covered_skip
+            && let Ent::W { st, state, .. } = &**ent
+            && self.covers(st, state)
+        {
+            let o = self.origin(*st);
+            raise(&mut self.witnessed, o, st.hlc);
+            return;
+        }
         match &**ent {
             Ent::W { st, state, contained } => {
                 if self.absorb(state, contained, true) && !self.oplog.contains_key(st) {
@@ -383,12 +484,95 @@ impl Node {
 
     // ---- local writes, logged ----------------------------------------------
 
+    /// A write the oracle checks: its leaf effects against the document the writer could see.
+    fn checked(
+        &mut self,
+        intent: Intent,
+        log: &Log,
+        write: impl FnOnce(&mut Writer) -> Option<Written>,
+    ) -> Option<Written> {
+        let old = self
+            .check_writes
+            .then(|| oracle::oracle_at(log, &self.contained, self.ret(), self.bound()));
+        let before = self.w.state.ordered_document(&self.w.opts);
+        let places = order_oracle::places(&self.contained, self.w.alive().last().copied());
+        let one_life = self.w.alive().len() == 1;
+        let r = write(&mut self.w);
+        let op = order_oracle::op_of(&intent);
+        self.pending = r.is_some().then(|| order_oracle::write_ord(before.as_deref(), &op));
+        self.read_your_writes(before, places, one_life, op, r.is_some());
+        if let Some(old) = old
+            && let Err(e) =
+                oracle::check_write(old.as_ref(), &intent, r.as_ref().map(|w| &w.record))
+        {
+            self.problems.push(format!("write-effects {}: {e}", self.name));
+        }
+        r
+    }
+
+    /// Read-your-writes order: after an accepted write the writer's own ordered document is the one the
+    /// serial reference gives (see `order_oracle`).
+    fn read_your_writes(
+        &mut self,
+        before: Option<Vec<(String, kimmy_core::merge_state::OrderedValue)>>,
+        places: order_oracle::Places,
+        one_life: bool,
+        op: OrdOp,
+        wrote: bool,
+    ) {
+        if !wrote {
+            // a replace or a sub-document `$set` that puts the fields the writer sees in another order IS a write
+            if order_oracle::reorders(before.as_deref(), &op) {
+                self.order_problems
+                    .push(format!("order-ryw {}: a reorder of {op:?} was refused", self.name));
+            }
+            return;
+        }
+        let after = self.w.state.ordered_document(&self.w.opts);
+        let one_life = one_life && self.w.alive().len() == 1;
+        match order_oracle::check(before.as_deref(), after.as_deref(), &op, &places, one_life) {
+            Ok(c) => {
+                self.order_checks += usize::from(c.any);
+                self.order_last_checks += usize::from(c.last);
+                self.order_trailing_checks += usize::from(c.trailing);
+            }
+            Err(e) => self.order_problems.push(format!("order-ryw {}: {e}", self.name)),
+        }
+    }
+
+    /// The precondition under which a creation base folds nothing (the counter cell): a creation (an insert or
+    /// an upsert) is refused while any life is alive, so at an accepted creation the writer holds no counter
+    /// slot in an alive life. Asserted by the harness at every accepted creation; there is no assert in the
+    /// product code.
+    fn holds_slot_in_alive_life(&self) -> bool {
+        let alive = self.w.alive();
+        self.w.state.slots.keys().any(|k| alive.contains(&k.0))
+    }
+
     pub fn insert(&mut self, f: &[(&str, Value)], log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.insert(f, skew);
+        let held = self.holds_slot_in_alive_life();
+        let r = self.checked(Intent::Insert(named(f)), log, |w| w.insert(&fl(f), skew));
+        assert!(
+            r.is_none() || !held,
+            "{}: an insert was accepted over a slot of an alive life",
+            self.name
+        );
         self.logged(r, log)
     }
-    pub fn upsert_inc(&mut self, p: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.upsert_inc(p, n, skew);
+    pub fn upsert_inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let held = self.holds_slot_in_alive_life();
+        let before = self.w.state.ordered_document(&self.w.opts);
+        let places = order_oracle::places(&self.contained, self.w.alive().last().copied());
+        let one_life = self.w.alive().len() == 1;
+        let r = self.w.upsert_inc(&p(path), n, skew);
+        assert!(
+            r.is_none() || !held,
+            "{}: an upsert was accepted over a slot of an alive life",
+            self.name
+        );
+        let op = OrdOp::Upsert(vec![path.to_string()]);
+        self.pending = r.is_some().then(|| order_oracle::write_ord(before.as_deref(), &op));
+        self.read_your_writes(before, places, one_life, op, r.is_some());
         self.logged(r, log)
     }
     /// A `$setOnInsert` upsert: two sequential writes by one writer (the creation
@@ -403,32 +587,68 @@ impl Node {
         log: &mut Log,
         skew: u64,
     ) -> Option<MStamp> {
-        let created = self.w.upsert_soi_create(fields, inc_path, sets, skew);
+        let names: Vec<String> = fields
+            .iter()
+            .chain(sets)
+            .map(|(k, _)| (*k).to_string())
+            .chain([inc_path.to_string()])
+            .collect();
+        let before = self.w.state.ordered_document(&self.w.opts);
+        let places = order_oracle::places(&self.contained, self.w.alive().last().copied());
+        let one_life = self.w.alive().len() == 1;
+        let inc_name = inc_path.to_string();
+        let creation: Vec<String> =
+            fields.iter().chain(sets).map(|(k, _)| (*k).to_string()).collect();
+        let inc_path = p(inc_path);
+        let held = self.holds_slot_in_alive_life();
+        let created = self.w.upsert_soi_create(&fl(fields), &inc_path, &fl(sets), skew);
+        assert!(
+            created.is_none() || !held,
+            "{}: an upsert creation was accepted over a slot of an alive life",
+            self.name
+        );
+        self.pending = created
+            .is_some()
+            .then(|| order_oracle::write_ord(before.as_deref(), &OrdOp::Upsert(creation)));
         let s1 = self.logged(created, log)?;
-        let incd = self.w.upsert_inc_on(s1, inc_path, n, skew);
+        let incd = self.w.upsert_inc_on(s1, &inc_path, n, skew);
+        self.pending = incd.is_some().then(|| {
+            order_oracle::write_ord(before.as_deref(), &OrdOp::Upsert(vec![inc_name.clone()]))
+        });
+        self.read_your_writes(before, places, one_life, OrdOp::Upsert(names), incd.is_some());
         self.logged(incd, log)
     }
-    pub fn set(&mut self, p: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_set(p, v, skew);
+    pub fn set(&mut self, path: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
+        self.set_at(&p(path), v, log, skew)
+    }
+    pub fn set_at(&mut self, path: &Path, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r =
+            self.checked(Intent::Set(path.clone(), v.clone()), log, |w| w.write_set(path, v, skew));
         self.logged(r, log)
     }
-    pub fn unset(&mut self, p: &str, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_unset(p, skew);
+    pub fn unset(&mut self, path: &str, log: &mut Log, skew: u64) -> Option<MStamp> {
+        self.unset_at(&p(path), log, skew)
+    }
+    pub fn unset_at(&mut self, path: &Path, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r = self.checked(Intent::Unset(path.clone()), log, |w| w.write_unset(path, skew));
         self.logged(r, log)
     }
-    pub fn inc(&mut self, p: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_inc(p, n, skew);
+    pub fn inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
+        self.inc_at(&p(path), n, log, skew)
+    }
+    pub fn inc_at(&mut self, path: &Path, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let r = self.checked(Intent::Inc(path.clone()), log, |w| w.write_inc(path, n, skew));
         self.logged(r, log)
     }
     pub fn replace(&mut self, d: &[(&str, Value)], log: &mut Log, skew: u64) -> Option<MStamp> {
-        let r = self.w.write_replace(d, skew);
+        let r = self.checked(Intent::Replace(named(d)), log, |w| w.write_replace(&fl(d), skew));
         self.logged(r, log)
     }
     pub fn delete(&mut self, log: &mut Log, skew: u64) -> Option<MStamp> {
         let r = self.w.write_delete(skew);
         self.logged(r, log)
     }
-    pub fn visible(&self) -> Option<BTreeMap<String, Value>> {
+    pub fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.w.visible()
     }
 }
@@ -456,7 +676,12 @@ pub fn pull(ms: &mut [Node], p: usize, r: usize, limit: Option<usize>) -> bool {
     if behind.is_empty() {
         return false;
     }
-    let thr = behind.iter().map(|o| get(&p.witnessed, o)).min().unwrap();
+    // an origin never witnessed starts at its epoch's start HLC (Q3), not at 0
+    let thr = behind
+        .iter()
+        .map(|o| p.witnessed.get(o).copied().unwrap_or_else(|| p.start_of(o)))
+        .min()
+        .unwrap();
     if r.servable
         .iter()
         .any(|(o, h)| get(&p.witnessed, o) < *h && get(&p.witnessed, o) < get(&r.hole, o))
@@ -576,6 +801,8 @@ pub struct RunConfig {
     pub sequential: bool,
     /// `None`: the real Int64 bound. A small bound exercises the oracle's clamp.
     pub int_bound: Option<i64>,
+    /// Mix nested paths, sub-documents, replaces and arrays into the workload.
+    pub nested: bool,
 }
 
 impl Default for RunConfig {
@@ -587,6 +814,7 @@ impl Default for RunConfig {
             retention: None,
             sequential: false,
             int_bound: None,
+            nested: true,
         }
     }
 }
@@ -619,18 +847,18 @@ const OPS: [&str; 14] = [
 /// (also empty and non-ASCII) and doubles (also `2.0`, `-0.0`, `0.0`, a huge one).
 fn pool_value(rnd: &mut Rng) -> Value {
     match rnd.below(16) {
-        0 => Value::Int(0),
-        1 => Value::Int(7),
-        2 => Value::Int(8),
-        3 => Value::Int(500),
-        4 => Value::Int(-7),
-        5 => Value::Int(1 << 62),
-        6 => Value::Int(-(1 << 62)),
-        7 => Value::Int(i64::MAX),
-        8 => Value::Int(i64::MIN),
-        9 => Value::Str("s".into()),
-        10 => Value::Str(String::new()),
-        11 => Value::Str("\u{fc}".into()),
+        0 => Value::Int64(0),
+        1 => Value::Int64(7),
+        2 => Value::Int64(8),
+        3 => Value::Int64(500),
+        4 => Value::Int64(-7),
+        5 => Value::Int64(1 << 62),
+        6 => Value::Int64(-(1 << 62)),
+        7 => Value::Int64(i64::MAX),
+        8 => Value::Int64(i64::MIN),
+        9 => Value::String("s".into()),
+        10 => Value::String(String::new()),
+        11 => Value::String("\u{fc}".into()),
         12 => Value::Double(2.5),
         13 => Value::Double(2.0),
         14 => Value::Double(-0.0),
@@ -671,36 +899,229 @@ fn pool_fields<'a>(rnd: &mut Rng, names: &[&'a str]) -> Vec<(&'a str, Value)> {
     out
 }
 
-/// One random write on `m` (the op table of `run`).
-fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
+// ---- the nested workload (pullmodel6.py `draw_op`) ---------------------------------------
+
+/// Field names no dotted spelling can carry: the empty name, `_` (what the version 1 form and the
+/// reference model call the whole document in a loss record) and a name with a dot. The sim has
+/// them; the differentials against the Python models have only what those models can take (see
+/// `merge_state_diff.rs` and `merge_state_diff_nested.rs`).
+const ODD: [&str; 3] = ["", "_", "a.b"];
+
+/// The names a write draws its fields from: `base`, or, for an odd write, [`ODD`] and the first of
+/// `base`.
+fn names<'a>(odd: bool, base: &[&'a str]) -> Vec<&'a str> {
+    if odd { ODD.iter().copied().chain(base.first().copied()).collect() } else { base.to_vec() }
+}
+
+/// A leaf at an odd name: at the top, or below `a` (the paths are built from segments, never from
+/// a dotted spelling).
+fn odd_leaf(rnd: &mut Rng) -> Path {
+    let top = [vec![""], vec!["_"], vec!["a.b"]];
+    let below = [vec!["a", ""], vec!["a", "_"], vec!["a", "b.c"], vec!["a", "d", ""]];
+    let segs = if rnd.below(2) == 0 { rnd.choice(&top) } else { rnd.choice(&below) };
+    Path::new(segs).expect("a valid path")
+}
+
+const LEAVES: [&str; 9] = ["x", "n", "y", "a.b", "a.c", "a.d.e", "a.d.f", "a.d.g", "acct.balance"];
+const PARENTS: [&str; 3] = ["a", "a.d", "acct"];
+
+fn i(n: i64) -> Value {
+    Value::Int64(n)
+}
+
+/// A sub-document to write at the parent `at`.
+fn subdoc(rnd: &mut Rng, at: &str) -> Value {
+    let docs: Vec<Value> = match at {
+        "a" => vec![
+            sub(&[]),
+            sub(&[("b", i(1))]),
+            sub(&[("c", i(2))]),
+            sub(&[("b", i(1)), ("c", i(2))]),
+            sub(&[("b", i(0)), ("c", Value::String("s".into()))]),
+            sub(&[("d", sub(&[("e", i(3))]))]),
+            sub(&[("b", i(0)), ("d", sub(&[]))]),
+            sub(&[("d", sub(&[("e", i(1)), ("f", i(2))])), ("c", Value::String("s".into()))]),
+            sub(&[("c", i(1)), ("d", sub(&[("f", i(2)), ("e", i(1))])), ("b", i(4))]),
+        ],
+        "a.d" => vec![
+            sub(&[]),
+            sub(&[("e", i(1))]),
+            sub(&[("f", i(2))]),
+            sub(&[("f", i(2)), ("e", i(1))]),
+            sub(&[("e", i(5)), ("g", i(6))]),
+        ],
+        _ => vec![
+            sub(&[]),
+            sub(&[("balance", i(150))]),
+            sub(&[("balance", i(0))]),
+            sub(&[("balance", i(100))]),
+        ],
+    };
+    rnd.choice(&docs)
+}
+
+/// A scalar or an array to write where a map may be: arrays are atomic, and one holds a
+/// document (a value only inside an array).
+fn scalar_or_array(rnd: &mut Rng) -> Value {
+    let d = Value::Document(vec![("k".into(), i(1))]);
+    rnd.choice(&[
+        i(5),
+        i(0),
+        Value::String("s".into()),
+        Value::Double(2.5),
+        Value::Null,
+        Value::Bool(true),
+        Value::Array(vec![i(1), i(2)]),
+        Value::Array(vec![i(1), i(3)]),
+        Value::Array(vec![]),
+        Value::Array(vec![d.clone()]),
+        Value::Array(vec![d, Value::Array(vec![i(1)])]),
+    ])
+}
+
+/// A whole document to replace with or insert, fields in a random order.
+fn rand_doc(rnd: &mut Rng) -> Vec<(&'static str, Value)> {
+    let mut d: Vec<(&'static str, Value)> = Vec::new();
+    for t in ["x", "n", "y"] {
+        if rnd.f64() < 0.4 {
+            d.push((t, rnd.choice(&[i(7), i(8), Value::String("s".into()), i(100)])));
+        }
+    }
+    for t in ODD {
+        if rnd.f64() < 0.1 {
+            d.push((t, rnd.choice(&[i(7), Value::String("s".into()), sub(&[("k", i(1))])])));
+        }
+    }
+    if rnd.f64() < 0.6 {
+        let v = if rnd.below(8) == 0 { i(5) } else { subdoc(rnd, "a") };
+        d.push(("a", v));
+    }
+    if rnd.f64() < 0.6 {
+        let v = if rnd.below(8) == 0 { Value::String("s".into()) } else { subdoc(rnd, "acct") };
+        d.push(("acct", v));
+    }
+    if rnd.f64() < 0.3 {
+        d.push(("items", Value::Array(vec![i(1 + rnd.below(3) as i64)])));
+    }
+    for k in (1..d.len()).rev() {
+        d.swap(k, rnd.below(k + 1));
+    }
+    d
+}
+
+/// One random nested write on `m`. A write below a scalar is attempted too (the writer must
+/// refuse it), and so is a write that changes nothing.
+fn nested_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
+    let leaf = if rnd.below(8) == 0 { odd_leaf(rnd) } else { np(rnd.choice(&LEAVES)) };
+    match rnd.below(21) {
+        0..=2 => {
+            let by = rnd.choice(&[1, 5, 20, -3, 50]);
+            let at = if rnd.below(8) == 0 {
+                odd_leaf(rnd)
+            } else {
+                np(rnd.choice(&["acct.balance", "acct.balance", "a.b", "a.c", "a.d.e", "x", "y"]))
+            };
+            m.inc_at(&at, by, log, skew);
+        }
+        3 => {
+            // +n then -n on one writer, below a map
+            let at = np(rnd.choice(&["acct.balance", "a.b", "a.d.e"]));
+            let by = rnd.choice(&[1, 20, -3]);
+            if m.inc_at(&at, by, log, skew).is_some() {
+                m.inc_at(&at, -by, log, skew);
+            }
+        }
+        4..=6 => {
+            let v = if rnd.below(2) == 0 { pool_value(rnd) } else { scalar_or_array(rnd) };
+            m.set_at(&leaf, v, log, skew);
+        }
+        7..=9 => {
+            let at = rnd.choice(&PARENTS);
+            let v = if rnd.below(3) == 0 { scalar_or_array(rnd) } else { subdoc(rnd, at) };
+            m.set_at(&np(at), v, log, skew);
+        }
+        10 | 11 => {
+            m.unset_at(&leaf, log, skew);
+        }
+        12 => {
+            let at = np(rnd.choice(&["a", "a.d", "acct", "items"]));
+            m.unset_at(&at, log, skew);
+        }
+        13 | 14 => {
+            let d = rand_doc(rnd);
+            m.replace(&d, log, skew);
+        }
+        15 => {
+            // below a scalar or an array, on purpose
+            let at = np(rnd.choice(&["x.k", "items.0", "n.a.b", "a.b.c", "acct.balance.q"]));
+            match rnd.below(3) {
+                0 => m.set_at(&at, i(1), log, skew),
+                1 => m.unset_at(&at, log, skew),
+                _ => m.inc_at(&at, 1, log, skew),
+            };
+        }
+        16 => {
+            let d = rand_doc(rnd);
+            m.insert(&d, log, skew);
+        }
+        18..=20 => {
+            // arrays are atomic: two concurrent writes of one are an arrayClash
+            let at = np(rnd.choice(&["items", "items", "a.list"]));
+            let xs = (0..rnd.below(3)).map(|_| i(1 + rnd.below(3) as i64)).collect();
+            m.set_at(&at, Value::Array(xs), log, skew);
+        }
+        _ => {
+            if rnd.f64() < 0.25 {
+                m.delete(log, skew);
+            }
+        }
+    }
+}
+
+/// One random write on `m` (the op table of `run`), a nested one with some probability.
+fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64, nested: bool) {
+    if nested && rnd.f64() < 0.6 {
+        nested_write(rnd, m, log, skew);
+        return;
+    }
     let op = rnd.choice(&OPS);
-    let p = rnd.choice(&["x", "n", "y"]);
+    // one flat write in six names its fields from the odd names (and one ordinary name, so that
+    // they meet ordinary fields), the others from the ordinary names alone, as the sim always did
+    let odd = rnd.below(6) == 0;
+    let p = rnd.choice(&names(odd, &["x", "n", "y"]));
     match op {
         "insert" => {
-            let f = pool_fields(rnd, &["x", "y", "n"]);
+            let f = pool_fields(rnd, &names(odd, &["x", "y", "n"]));
             m.insert(&f, log, skew);
         }
         "upsert" => {
-            let k = rnd.choice(&["x", "y", "n"]);
+            let k = rnd.choice(&names(odd, &["x", "y", "n"]));
             m.upsert_inc(k, pool_inc(rnd), log, skew);
         }
         "upsert_soi" => {
-            let f = pool_fields(rnd, &["y", "z", "n"]);
+            let f = pool_fields(rnd, &names(odd, &["y", "z", "n"]));
             let n = pool_inc(rnd);
             // `$set`, `$setOnInsert` and `$inc` on one path conflict (the update is refused
             // up front), so the three path lists are disjoint.
-            let mut sets: Vec<(&str, Value)> =
-                if rnd.below(2) == 0 { vec![] } else { pool_fields(rnd, &["n", "x", "w"]) };
+            let mut sets: Vec<(&str, Value)> = if rnd.below(2) == 0 {
+                vec![]
+            } else {
+                pool_fields(rnd, &names(odd, &["n", "x", "w"]))
+            };
             sets.retain(|(q, _)| !f.iter().any(|(g, _)| g == q));
-            let free: Vec<&str> = ["x", "y", "n", "z", "u"]
+            let mut free: Vec<&str> = names(odd, &["x", "y", "n", "z", "u"])
                 .into_iter()
                 .filter(|q| !f.iter().chain(sets.iter()).any(|(g, _)| g == q))
                 .collect();
+            if free.is_empty() {
+                // an odd write can use all four of its names; `u` is in no list of any write
+                free.push("u");
+            }
             let ip = rnd.choice(&free);
             m.upsert_soi(&f, ip, n, &sets, log, skew);
         }
         "replace" => {
-            let d = pool_fields(rnd, &["x", "n", "y"]);
+            let d = pool_fields(rnd, &names(odd, &["x", "n", "y"]));
             m.replace(&d, log, skew);
         }
         "inc" => {
@@ -742,7 +1163,7 @@ fn random_pull(rnd: &mut Rng, ms: &mut [Node], snap_rate: f64) {
 pub fn new_cluster(rnd: &mut Rng, cfg: &Cfg, log: &mut Log) -> Vec<Node> {
     let n = 3 + rnd.below(2);
     let mut ms: Vec<Node> = "ABCD".chars().take(n).map(|c| Node::new(c, cfg)).collect();
-    ms[0].insert(&[("x", Value::Int(100)), ("n", Value::Str("a".into()))], log, 0);
+    ms[0].insert(&[("x", Value::Int64(100)), ("n", Value::String("a".into()))], log, 0);
     for m in &mut ms {
         m.backup();
     }
@@ -762,6 +1183,16 @@ fn random_restore(rnd: &mut Rng, ms: &mut [Node]) {
 }
 
 pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
+    run_observed(seed, rc, cfg, &mut |_| {})
+}
+
+/// [`run`], showing `observe` the cluster before every step and after the last.
+pub fn run_observed(
+    seed: u64,
+    rc: &RunConfig,
+    cfg: &Cfg,
+    observe: &mut dyn FnMut(&[Node]),
+) -> RunOut {
     let mut rnd = Rng::new(seed);
     let mut cfg = cfg.clone();
     cfg.opts.retention = rc.retention.unwrap_or(1_000_000_000);
@@ -770,8 +1201,12 @@ pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
     }
     let mut log = Log::new();
     let mut ms = new_cluster(&mut rnd, &cfg, &mut log);
+    for m in &mut ms {
+        m.check_writes = rc.retention.is_none();
+    }
     let mut did_restore = false;
     for i in 0..rc.steps {
+        observe(&ms);
         let m = rnd.below(ms.len());
         let skew = if rc.sequential { 0 } else { rnd.choice(&[0, 0, 0, 4]) };
         let x = if rc.sequential { 1.0 } else { rnd.f64() };
@@ -787,9 +1222,11 @@ pub fn run(seed: u64, rc: &RunConfig, cfg: &Cfg) -> RunOut {
             did_restore = true;
             continue;
         }
-        random_write(&mut rnd, &mut ms[m], &mut log, skew);
+        random_write(&mut rnd, &mut ms[m], &mut log, skew, rc.nested);
     }
+    observe(&ms);
     let settled = fixpoint(&mut ms, 40);
+    observe(&ms);
     RunOut { nodes: ms, log, settled }
 }
 
@@ -802,6 +1239,20 @@ pub fn run_bounded(
     ret: u64,
     sync_every: usize,
     steps: usize,
+    nested: bool,
+) -> (RunOut, u64) {
+    run_bounded_observed(seed, cfg, ret, sync_every, steps, nested, &mut |_| {})
+}
+
+/// [`run_bounded`], showing `observe` the cluster before every step and after the last.
+pub fn run_bounded_observed(
+    seed: u64,
+    cfg: &Cfg,
+    ret: u64,
+    sync_every: usize,
+    steps: usize,
+    nested: bool,
+    observe: &mut dyn FnMut(&[Node]),
 ) -> (RunOut, u64) {
     let mut rnd = Rng::new(seed);
     let mut cfg = cfg.clone();
@@ -810,6 +1261,7 @@ pub fn run_bounded(
     let mut ms = new_cluster(&mut rnd, &cfg, &mut log);
     let (mut did, mut gap, mut last) = (false, 0u64, 0u64);
     for i in 0..steps {
+        observe(&ms);
         if i % sync_every == 0 {
             fixpoint(&mut ms, 40);
             let top = ms.iter().map(|m| m.w.clock.wall_ms).max().unwrap();
@@ -822,13 +1274,18 @@ pub fn run_bounded(
             random_pull(&mut rnd, &mut ms, 0.06);
             continue;
         }
-        if !did && i > steps / 2 && rnd.f64() < 0.15 {
+        // A nested run has no restore: a node restored to the backup of the start trails the
+        // retention by the time its write meets a cluster that has collected the delete of
+        // the life it writes into (ADR-085, the other regime, graded by the unbounded runs).
+        if !nested && !did && i > steps / 2 && rnd.f64() < 0.15 {
             random_restore(&mut rnd, &mut ms);
             did = true;
             continue;
         }
-        random_write(&mut rnd, &mut ms[m], &mut log, skew);
+        random_write(&mut rnd, &mut ms[m], &mut log, skew, nested);
     }
+    observe(&ms);
     let settled = fixpoint(&mut ms, 40);
+    observe(&ms);
     (RunOut { nodes: ms, log, settled }, gap)
 }

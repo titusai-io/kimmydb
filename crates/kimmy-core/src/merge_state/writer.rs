@@ -1,11 +1,15 @@
 //! A writer incarnation: local write operations over its own [`MergeState`]
 //! (the model's `Member` with the `Node.finish` normalisation).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::join::{JoinOptions, join};
-use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot};
-use super::types::{LossKey, LossValue, MStamp, Value, WriterId};
+use super::counter::{self, Inc, Kind, Num};
+use super::join::{JoinOptions, join, join_into};
+use super::ord::{OrdAt, OrdMode, OrderedValue, ord_events};
+use super::state::{
+    Gen, Life, LifeKind, MAX_CONTRIBUTORS, MAX_TOTAL, MAX_WRITERS, MergeState, ObsKey, Reg, Slot,
+};
+use super::types::{InvalidPath, InvalidValue, LossKey, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,11 +27,13 @@ pub struct WriteRecord {
     pub kind: WriteKind,
     /// The life written into (the new life for an insert or an upserting inc).
     pub life: Option<MStamp>,
-    pub paths: Vec<String>,
+    pub paths: Vec<Path>,
     /// Register values written (`Insert`, `Reg`).
-    pub vals: BTreeMap<String, Value>,
-    /// The increment (`Inc`).
+    pub vals: BTreeMap<Path, Value>,
+    /// The increment (`Inc`), when it is an integer that fits an `i64`.
     pub n: Option<i64>,
+    /// The increment (`Inc`) with its type: an `Int32`, `Int64`, `Double` or `Decimal128`.
+    pub amount: Option<Num>,
     /// The generation an increment belongs to (`Inc`).
     pub generation: Option<MStamp>,
     /// An upsert that created the life (the `Inc` of `upsert_inc`, the creation write of `upsert_soi`).
@@ -35,17 +41,18 @@ pub struct WriteRecord {
     /// The creation write of a `$setOnInsert` upsert: a life creation that is not an explicit insert.
     pub upsert: bool,
     /// The `$setOnInsert` paths of an upsert.
-    pub soi: Vec<String>,
+    pub soi: Vec<Path>,
 }
 
 impl WriteRecord {
-    fn new(kind: WriteKind, life: Option<MStamp>, paths: Vec<String>) -> Self {
+    fn new(kind: WriteKind, life: Option<MStamp>, paths: Vec<Path>) -> Self {
         Self {
             kind,
             life,
             paths,
             vals: BTreeMap::new(),
             n: None,
+            amount: None,
             generation: None,
             insert: false,
             upsert: false,
@@ -59,6 +66,199 @@ impl WriteRecord {
 pub struct Written {
     pub stamp: MStamp,
     pub record: WriteRecord,
+}
+
+/// Why an externally minted stamp was refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum StampError {
+    /// The stamp names another node or epoch than the writer's.
+    #[error("merge state: the stamp is for writer {stamp:?}, not {writer:?}")]
+    OtherWriter { writer: WriterId, stamp: WriterId },
+    /// The stamp is not above the newest HLC the writer has used or seen.
+    #[error("merge state: the stamp {stamp:?} is not above {top:?}")]
+    NotAbove { top: Hlc, stamp: Hlc },
+}
+
+/// Where the stamps of one write come from.
+enum Source<'a> {
+    /// The writer's own clock, by `1 + skew`.
+    Skew(u64),
+    /// Minted by the caller.
+    Given(&'a mut dyn FnMut() -> MStamp),
+}
+
+/// The stamp source of one write, and the first stamp it refused.
+struct Mint<'a> {
+    source: Source<'a>,
+    error: Option<StampError>,
+}
+
+/// The register effects of one write: the cells to set, in the order they were named.
+#[derive(Default)]
+struct Eff {
+    order: Vec<Path>,
+    vals: BTreeMap<Path, Value>,
+}
+
+impl Eff {
+    fn put(&mut self, p: Path, v: Value) {
+        if self.vals.insert(p.clone(), v).is_none() {
+            self.order.push(p);
+        }
+    }
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// The cells a value stands for at `at`: a `Document` is a map marker and the cells of its
+/// fields (the writer's expansion of a sub-document); `Unset` is none (no such field); anything
+/// else is its one cell.
+fn expand(at: &Path, v: &Value, out: &mut Vec<(Path, Value)>) -> Result<(), InvalidPath> {
+    if *v == Value::Unset {
+        // an Unset field is no field: no register, so no stamp for it to win a race with (the model's absent field)
+        return Ok(());
+    }
+    if let Value::Document(fields) = v {
+        out.push((at.clone(), Value::Map));
+        for (name, x) in fields {
+            expand(&at.child(name)?, x, out)?;
+        }
+    } else {
+        out.push((at.clone(), v.clone()));
+    }
+    Ok(())
+}
+
+/// The fields of a whole document (insert, replace, creation of an upsert) as cells: each name
+/// is a one-segment path, distinct, and each value legal input. `None` refuses the document.
+fn expand_document(fields: &[(Path, Value)]) -> Option<Vec<(Path, Value)>> {
+    let mut out = Vec::new();
+    let mut named = BTreeSet::new();
+    for (p, v) in fields {
+        if p.segments().len() != 1 || !named.insert(p) {
+            return None;
+        }
+        v.check_input().ok()?;
+        expand(p, v, &mut out).ok()?;
+    }
+    Some(out)
+}
+
+/// The visible entries strictly below `p`, in path order.
+fn below<'a>(
+    vis: &'a BTreeMap<Path, Value>,
+    p: &Path,
+) -> impl Iterator<Item = (&'a Path, &'a Value)> {
+    let p = p.clone();
+    vis.range(p.clone()..).skip(1).take_while(move |(k, _)| k.is_below(&p))
+}
+
+/// The order items of one write, in write order: the model's `items`, `(path, mode)`.
+type Items = Vec<(OrdAt, OrdMode)>;
+
+/// The model's `_unset_subtree`: unset what the writer sees at `p` and below it, and name each
+/// of them to the order state as an unset.
+fn unset_subtree(
+    vis: &BTreeMap<Path, Value>,
+    p: &Path,
+    eff: &mut Eff,
+    items: &mut Items,
+    o: &JoinOptions,
+) {
+    for (q, _) in below(vis, p) {
+        if o.unset_shallow() && q.segments().len() > p.segments().len() + 1 {
+            continue;
+        }
+        eff.put(q.clone(), Value::Unset);
+        items.push((OrdAt::Field(q.clone()), OrdMode::Unset));
+    }
+    eff.put(p.clone(), Value::Unset);
+    items.push((OrdAt::Field(p.clone()), OrdMode::Unset));
+}
+
+/// The model's `ancestors_of`, for the writes that place the implicit marker (a `$set` of a
+/// path, an `$inc`, an update): a write below a map is a write to the map, so each proper ancestor
+/// of the path (outermost first, once per update: `seen`) is named as a plain write, and an
+/// ancestor the writer does not see gets an IMPLICIT map marker in the same write
+/// (`model6.py` `_update`, lines 966-973: `if getp(vis, a) is None: eff[a] = MAPI`). The
+/// creation of an upsert, an insert and a replace place none (their sub-documents carry the
+/// explicit marker; the upserts only name their ancestors, `ancestor_items`), and an unset names
+/// none.
+fn ancestors_of(
+    vis: &BTreeMap<Path, Value>,
+    p: &Path,
+    seen: &mut BTreeSet<Path>,
+    eff: &mut Eff,
+    items: &mut Items,
+    o: &JoinOptions,
+) {
+    for a in p.ancestors() {
+        if seen.contains(&a) {
+            continue;
+        }
+        seen.insert(a.clone());
+        if !o.ord_no_ancestor() {
+            items.push((OrdAt::Field(a.clone()), OrdMode::Write));
+        }
+        if !vis.contains_key(&a) && !o.no_implicit_marker() {
+            eff.put(a, Value::ImplicitMap);
+        }
+    }
+}
+
+/// The model's `ancestors_of` for the writes that place no marker: the upserts name each
+/// ancestor of the path as a plain write (once: `seen`) and nothing more.
+fn ancestor_items(p: &Path, seen: &mut BTreeSet<Path>, items: &mut Items, o: &JoinOptions) {
+    for a in p.ancestors() {
+        if seen.insert(a.clone()) && !o.ord_no_ancestor() {
+            items.push((OrdAt::Field(a), OrdMode::Write));
+        }
+    }
+}
+
+/// The model's `ordered_same` of a value the writer sees and the new value of a field: the same
+/// field order at every level and the same leaves.
+fn same_ordered(cur: &OrderedValue, new: &Value) -> bool {
+    match (cur, new) {
+        (OrderedValue::Doc(c), Value::Document(n)) => same_fields(c, n),
+        // (a leaf is never equal to a document, so a sub-document where a leaf stands is a change)
+        (OrderedValue::Leaf(c), n) => Value::same(Some(c), n),
+        _ => false,
+    }
+}
+
+/// [`same_ordered`] for the fields of a document. A field of the new document whose value is
+/// [`Value::Unset`] is not a field (the writer's spelling of "no such field").
+fn same_fields(cur: &[(String, OrderedValue)], new: &[(String, Value)]) -> bool {
+    let mut new = new.iter().filter(|(_, v)| *v != Value::Unset);
+    cur.iter().all(|(a, c)| new.next().is_some_and(|(b, n)| a == b && same_ordered(c, n)))
+        && new.next().is_none()
+}
+
+/// The model's `getp` refusal (D-2): is some proper ancestor of `p` visible as a scalar or an
+/// array? The reference cannot create a field below one, so the write is refused.
+fn below_a_scalar(vis: &BTreeMap<Path, Value>, p: &Path) -> bool {
+    p.ancestors().any(|a| vis.get(&a).is_some_and(|v| *v != Value::Map))
+}
+
+/// What an `$inc` does, decided before it is stamped.
+enum IncPlan {
+    /// A double base whose new value is the stored representation byte for byte: nothing to write.
+    Nothing,
+    /// A double base: a register write of the computed value.
+    Register(Value),
+    /// A counter slot of the writer, with its new total.
+    Slot(Box<SlotPlan>),
+}
+
+/// The counter slot an `$inc` writes: in `life`, at `key`, to `total`.
+struct SlotPlan {
+    life: MStamp,
+    key: (MStamp, Path, WriterId, Option<MStamp>),
+    total: Num,
+    op: Num,
+    generation: Option<MStamp>,
 }
 
 /// The outcome of absorbing a state.
@@ -91,18 +291,102 @@ impl Writer {
         Self { id, clock, state, opts }
     }
 
+    /// The newest HLC this writer has used or seen: its clock and every version-vector entry.
+    fn top(&self) -> Hlc {
+        self.state.vv.values().copied().chain([self.clock]).max().unwrap_or(Hlc::ZERO)
+    }
+
+    /// The highest HLC in the writer's version vector: what an unset it is about to make will
+    /// remember as `prev` (the model's `Member.known`, taken before the stamp). The clock is not
+    /// part of it: a clock that ran ahead of the vector is not something the writer has seen.
+    fn known(&self) -> Hlc {
+        self.state.vv.values().copied().max().unwrap_or(Hlc::ZERO)
+    }
+
+    /// Feed the order state with the write `st` into `life`: the events of its items, applied to
+    /// the writer's own state (the join of what it received and its own earlier writes).
+    fn feed(&mut self, life: MStamp, st: MStamp, known: Hlc, items: &Items) {
+        let events = ord_events(items, &self.opts);
+        self.state.ord_apply(life, st, known, &events, &self.opts);
+    }
+
     /// The next stamp: strictly above the clock and every version-vector entry,
     /// by `1 + skew` in the wall component.
     pub fn tick(&mut self, skew: u64) -> MStamp {
-        let top = self.state.vv.values().copied().chain([self.clock]).max().unwrap_or(Hlc::ZERO);
-        self.clock = Hlc::new(top.wall_ms.saturating_add(1).saturating_add(skew), 0);
+        self.clock = Hlc::new(self.top().wall_ms.saturating_add(1).saturating_add(skew), 0);
         MStamp { hlc: self.clock, writer: self.id }
     }
 
-    pub fn visible(&self) -> Option<BTreeMap<String, Value>> {
+    /// Take a stamp minted outside (the engine's `next_stamp`) and move the clock to it. It
+    /// must be this writer's own (same node and epoch) and strictly above everything the
+    /// writer has used or seen: its clock and every version-vector entry, which is what
+    /// [`Writer::tick`] guarantees by construction. A stamp that fails either check is refused
+    /// and nothing moves.
+    pub fn tick_to(&mut self, stamp: MStamp) -> Result<MStamp, StampError> {
+        if stamp.writer != self.id {
+            return Err(StampError::OtherWriter { writer: self.id, stamp: stamp.writer });
+        }
+        let top = self.top();
+        if stamp.hlc <= top {
+            return Err(StampError::NotAbove { top, stamp: stamp.hlc });
+        }
+        self.clock = stamp.hlc;
+        Ok(stamp)
+    }
+
+    /// Mint the stamp of one write from `m`. A refused stamp is kept in `m` and reported as
+    /// `None`, which the write bodies treat as a refused write (before anything is written).
+    fn mint(&mut self, m: &mut Mint<'_>) -> Option<MStamp> {
+        // The writer cap: a writer the document does not mention yet is refused at the cap (a
+        // write adds the writer to the version vector). Every writer of the version vector is
+        // mentioned, so the walk over the whole state is only needed for a writer that has not
+        // written yet.
+        if !self.opts.no_writer_cap() && !self.state.vv.contains_key(&self.id) {
+            #[cfg(test)]
+            super::work::bump(super::work::Counter::WriterScans, 1);
+            let ws = self.state.writers();
+            if ws.len() >= MAX_WRITERS && !ws.contains(&self.id) {
+                return None;
+            }
+        }
+        let r = match &mut m.source {
+            Source::Skew(skew) => Ok(self.tick(*skew)),
+            Source::Given(f) => {
+                let st = f();
+                self.tick_to(st)
+            }
+        };
+        r.map_err(|e| m.error = Some(e)).ok()
+    }
+
+    /// Run a write body that ticks the writer's own clock.
+    fn ticking<T>(
+        &mut self,
+        skew: u64,
+        f: impl FnOnce(&mut Self, &mut Mint<'_>) -> Option<T>,
+    ) -> Option<T> {
+        let mut m = Mint { source: Source::Skew(skew), error: None };
+        f(self, &mut m)
+    }
+
+    /// Run a write body that takes its stamps from `stamp`. A stamp that fails
+    /// [`Writer::tick_to`] ends the write with the error. Every body checks its stamp before it
+    /// writes anything, so a refused write has changed nothing (the one body that needs two
+    /// stamps, [`Writer::upsert_soi_stamped`], undoes its first write itself).
+    fn stamped<T>(
+        &mut self,
+        stamp: &mut dyn FnMut() -> MStamp,
+        f: impl FnOnce(&mut Self, &mut Mint<'_>) -> Option<T>,
+    ) -> Result<Option<T>, StampError> {
+        let mut m = Mint { source: Source::Given(stamp), error: None };
+        let r = f(self, &mut m);
+        m.error.map_or(Ok(r), Err)
+    }
+
+    pub fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.state.visible(&self.opts)
     }
-    pub fn hidden_all(&self) -> BTreeMap<String, i128> {
+    pub fn hidden_all(&self) -> BTreeMap<Path, i128> {
         self.state.hidden_all(&self.opts)
     }
     pub fn alive(&self) -> Vec<MStamp> {
@@ -112,46 +396,99 @@ impl Writer {
         self.state.horizon(&self.opts)
     }
 
-    fn write_life(&self) -> Option<MStamp> {
-        self.state.alive(&self.opts).into_iter().max()
-    }
-
-    /// V5m1: every slot total of `p` (any generation, alive lives) as this
+    /// V5m1: every slot total of `p` (any generation, `al` the alive lives) as this
     /// writer sees it, kept with a generation it starts.
-    fn seen(&self, p: &str) -> BTreeMap<ObsKey, i128> {
-        let al = self.state.alive_set(self.opts.retention);
+    fn seen(&self, p: &Path, al: &BTreeSet<MStamp>) -> BTreeMap<ObsKey, Num> {
         self.state
-            .slots
-            .iter()
-            .filter(|((l, q, _, _), _)| q == p && al.contains(l))
+            .slots_at(p, al)
+            .into_iter()
             .map(|((l, _, w, g), v)| ((*l, *w, *g), v.total))
             .collect()
     }
 
-    fn obs(&self, p: &str) -> BTreeMap<ObsKey, (MStamp, i128)> {
-        self.state
-            .counted(p, &self.opts)
-            .into_iter()
-            .map(|(k, v)| (k, (v.stamp, v.total)))
-            .collect()
+    /// The slots a base write on `p` folds into their absorbed pairs (review item M2). A base write
+    /// has the increments its writer holds in its causal past, so no other base may count them
+    /// again: that is every slot of `p` the writer holds in an alive life, of ANY generation, not
+    /// only the counted ones (the winning base's generation and newer). An older-generation slot the
+    /// writer holds but does not count is still in its past. `win` is the winner of `p` before the
+    /// write.
+    fn fold_keys(
+        &self,
+        p: &Path,
+        al: &BTreeSet<MStamp>,
+        win: Option<&Reg>,
+    ) -> Vec<(MStamp, Path, WriterId, Option<MStamp>)> {
+        if self.opts.fold_counted_only() {
+            // the mutant: only the slots the base counts
+            self.state
+                .counted_in(p, al, win, &self.opts)
+                .into_keys()
+                .map(|(l, w, g)| (l, p.clone(), w, g))
+                .collect()
+        } else if self.opts.fold_life_only() {
+            // the mutant: only the slots of the life the write is in (the newest alive life)
+            let life = al.last();
+            self.state
+                .slots_at(p, al)
+                .into_iter()
+                .filter(|(k, _)| Some(&k.0) == life)
+                .map(|(k, _)| k.clone())
+                .collect()
+        } else {
+            self.state.slots_at(p, al).into_iter().map(|(k, _)| k.clone()).collect()
+        }
     }
 
-    fn setreg(&mut self, p: &str, v: Value, st: MStamp) {
-        let l = self.write_life().expect("a register write needs an alive life");
+    /// Fold the slots at `keys`: each takes its own `(stamp, total)` as its absorbed pair, when
+    /// that is above the pair it has (the model's max by stamp).
+    fn fold(&mut self, keys: Vec<(MStamp, Path, WriterId, Option<MStamp>)>) {
+        for k in keys {
+            if let Some(s) = self.state.slots.get_mut(&k)
+                && s.absorbed.as_ref().is_none_or(|a| a.0 < s.stamp)
+            {
+                s.absorbed = Some((s.stamp, s.total));
+            }
+        }
+    }
+
+    /// Store the slot at `key` with the write `stamp` and the new `total`. The absorbed pair of a
+    /// slot the writer already holds is kept: an increment moves the slot, not what a base write
+    /// absorbed of it.
+    fn put_slot(
+        &mut self,
+        key: (MStamp, Path, WriterId, Option<MStamp>),
+        stamp: MStamp,
+        total: Num,
+    ) {
+        let absorbed = self.state.slots.get(&key).and_then(|s| s.absorbed);
+        self.state.slots.insert(key, Slot { stamp, total, absorbed });
+    }
+
+    /// Set the register of `p` in the life `l` (the newest of the alive lives `al`), stamp `st`.
+    /// What the write observed (the winning base, its generation, the slots it holds) is read from
+    /// the cells of `p` alone, so cells already set for other paths of the same write change
+    /// nothing of it.
+    fn setreg(&mut self, p: &Path, v: Value, st: MStamp, al: &BTreeSet<MStamp>) {
+        let l = *al.last().expect("a register write needs an alive life");
+        let win = self.state.winner_in(p, al, &self.opts);
+        // only a non-numeric base starts a generation (`seen` over the alive slots); a numeric
+        // one carries the winner's, dangling `seen` keys included (see `Gen`)
         let generation = if v.is_numeric() {
-            self.state.gen_of(p, &self.opts).map(std::borrow::Cow::into_owned)
+            self.state.gen_in(p, al, win, &self.opts).map(std::borrow::Cow::into_owned)
         } else {
-            Some(Gen::start(st, &self.state.vv, self.seen(p)))
+            Some(Gen::start(st, &self.state.vv, self.seen(p, al)))
         };
-        let obs = self.obs(p);
+        // (the mutant `no_fold_marker`: a map marker write, explicit or implicit, folds nothing)
+        if !(self.opts.no_fold_marker() && v.is_marker()) {
+            let folded = self.fold_keys(p, al, win);
+            self.fold(folded);
+        }
         #[cfg(any(test, feature = "merge-mutants"))]
         if !v.is_numeric() {
             let vv = self.state.vv.clone();
-            self.state.note_base((l, p.to_string()), st, &vv);
+            self.state.note_base((l, p.clone()), st, &vv);
         }
-        self.state
-            .regs
-            .insert((l, p.to_string()), Reg { stamp: st, value: v, obs, generation, soi: false });
+        self.state.regs.insert((l, p.clone()), Reg { stamp: st, value: v, generation, soi: false });
     }
 
     /// The writer's own state, normalised as every receiver's join normalises
@@ -160,50 +497,34 @@ impl Writer {
     fn finish(&mut self, st: MStamp, record: WriteRecord) -> Written {
         self.state.vv.insert(st.writer, st.hlc);
         if self.opts.normalize_writes() {
-            let (s, _) = join(&self.state, &MergeState::default(), &self.opts);
+            // The state is moved out before the join (no copy of it), so a panic in `join_into`
+            // would leave this writer holding an empty state instead of the written one: the
+            // join must stay panic-free (today it indexes only keys drawn from the state itself,
+            // and `sub_ret` clamps).
+            let (s, _) =
+                join_into(std::mem::take(&mut self.state), &MergeState::default(), &self.opts);
             self.state = s;
         }
         Written { stamp: st, record }
     }
 
-    /// An explicit insert; refused (`None`) while a life is alive.
-    pub fn insert(&mut self, fields: &[(&str, Value)], skew: u64) -> Option<Written> {
-        if !self.state.alive(&self.opts).is_empty() {
-            return None;
-        }
-        let st = self.tick(skew);
-        let s = &mut self.state;
-        s.lives.insert(
-            st,
-            Life {
-                seen: s.deletes.keys().copied().collect(),
-                order: fields.iter().map(|(p, _)| p.to_string()).collect(),
-                kind: LifeKind::Insert,
-            },
-        );
-        for (p, v) in fields {
-            let generation = (!v.is_numeric()).then(|| {
-                let mut vv = s.vv.clone();
-                vv.insert(st.writer, st.hlc);
-                Gen::start(st, &vv, BTreeMap::new())
-            });
-            s.regs.insert(
-                (st, p.to_string()),
-                Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi: false },
-            );
-            #[cfg(any(test, feature = "merge-mutants"))]
-            if !v.is_numeric() {
-                s.note_base((st, p.to_string()), st, &BTreeMap::from([(st.writer, st.hlc)]));
-            }
-        }
-        s.vv.insert(st.writer, st.hlc);
-        let mut rec = WriteRecord::new(
-            WriteKind::Insert,
-            Some(st),
-            fields.iter().map(|(p, _)| p.to_string()).collect(),
-        );
-        rec.vals = fields.iter().map(|(p, v)| (p.to_string(), v.clone())).collect();
-        Some(self.finish(st, rec))
+    /// An explicit insert; refused (`None`) while a life is alive. Each field is a one-segment
+    /// path (a sub-document is a `Value::Document` value, expanded into a map marker and its
+    /// leaves); a repeated name or a value that is not legal input refuses the insert.
+    pub fn insert(&mut self, fields: &[(Path, Value)], skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.insert_m(fields, m))
+    }
+
+    /// [`Writer::insert`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn insert_stamped(
+        &mut self,
+        fields: &[(Path, Value)],
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.insert_m(fields, m))
     }
 
     /// V6m2/V7m2/V8: an upsert that creates the document with `$setOnInsert`
@@ -214,16 +535,34 @@ impl Writer {
     /// own stamp. Only the tagged cells can be dropped.
     pub fn upsert_soi(
         &mut self,
-        fields: &[(&str, Value)],
-        inc_path: &str,
+        fields: &[(Path, Value)],
+        inc_path: &Path,
         n: i64,
-        sets: &[(&str, Value)],
+        sets: &[(Path, Value)],
         skew: u64,
     ) -> Option<(Written, Written)> {
-        let created = self.upsert_soi_create(fields, inc_path, sets, skew)?;
-        let life = created.stamp;
-        let incd = self.upsert_inc_on(life, inc_path, n, skew)?;
-        Some((created, incd))
+        self.ticking(skew, |w, m| w.upsert_soi_m(fields, inc_path, n, sets, m))
+    }
+
+    /// [`Writer::upsert_soi`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn upsert_soi_stamped(
+        &mut self,
+        fields: &[(Path, Value)],
+        inc_path: &Path,
+        n: i64,
+        sets: &[(Path, Value)],
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<(Written, Written)>, StampError> {
+        // Two writes, two stamps: if the second is refused the first is taken back.
+        let before = (self.state.clone(), self.clock);
+        let r = self.stamped(stamp, |w, m| w.upsert_soi_m(fields, inc_path, n, sets, m));
+        if r.is_err() {
+            (self.state, self.clock) = before;
+        }
+        r
     }
 
     /// The creation write of a `$setOnInsert` upsert: the new life (kind upsert),
@@ -234,65 +573,26 @@ impl Writer {
     /// update is refused, `None`). Refused too while a life is alive.
     pub fn upsert_soi_create(
         &mut self,
-        fields: &[(&str, Value)],
-        inc_path: &str,
-        sets: &[(&str, Value)],
+        fields: &[(Path, Value)],
+        inc_path: &Path,
+        sets: &[(Path, Value)],
         skew: u64,
     ) -> Option<Written> {
-        let mut paths: Vec<&str> =
-            fields.iter().chain(sets.iter()).map(|(q, _)| *q).chain([inc_path]).collect();
-        paths.sort_unstable();
-        if paths.windows(2).any(|w| w[0] == w[1]) {
-            return None;
-        }
-        if !self.state.alive(&self.opts).is_empty() {
-            return None;
-        }
-        let st = self.tick(skew);
-        let s = &mut self.state;
-        s.lives.insert(
-            st,
-            Life {
-                seen: s.deletes.keys().copied().collect(),
-                order: fields.iter().map(|(p, _)| p.to_string()).collect(),
-                kind: LifeKind::Upsert,
-            },
-        );
-        // M1: a non-numeric creation value starts a generation, as in `insert`.
-        let starts_gen = !self.opts.creation_without_generation();
-        let mut cells: Vec<(&str, &Value, bool)> = Vec::new();
-        cells.extend(fields.iter().map(|(q, v)| (*q, v, true)));
-        cells.extend(sets.iter().map(|(q, v)| (*q, v, false)));
-        for (q, v, soi) in cells {
-            let generation = (starts_gen && !v.is_numeric()).then(|| {
-                let mut vv = s.vv.clone();
-                vv.insert(st.writer, st.hlc);
-                Gen::start(st, &vv, BTreeMap::new())
-            });
-            s.regs.insert(
-                (st, q.to_string()),
-                Reg { stamp: st, value: v.clone(), obs: BTreeMap::new(), generation, soi },
-            );
-            #[cfg(any(test, feature = "merge-mutants"))]
-            if starts_gen && !v.is_numeric() {
-                s.note_base((st, q.to_string()), st, &BTreeMap::from([(st.writer, st.hlc)]));
-            }
-        }
-        let mut paths = Vec::new();
-        let mut vals = BTreeMap::new();
-        for (q, v) in fields.iter().chain(sets.iter()) {
-            if !paths.contains(&q.to_string()) {
-                paths.push(q.to_string());
-            }
-            vals.insert(q.to_string(), v.clone());
-        }
-        s.vv.insert(st.writer, st.hlc);
-        let mut rec = WriteRecord::new(WriteKind::Insert, Some(st), paths);
-        rec.vals = vals;
-        rec.upsert = true;
-        rec.insert = true;
-        rec.soi = fields.iter().map(|(p, _)| p.to_string()).collect();
-        Some(self.finish(st, rec))
+        self.ticking(skew, |w, m| w.upsert_soi_create_m(fields, inc_path, sets, m))
+    }
+
+    /// [`Writer::upsert_soi_create`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn upsert_soi_create_stamped(
+        &mut self,
+        fields: &[(Path, Value)],
+        inc_path: &Path,
+        sets: &[(Path, Value)],
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.upsert_soi_create_m(fields, inc_path, sets, m))
     }
 
     /// The increment write of an upsert on the life `life` (the stamp of its
@@ -301,35 +601,343 @@ impl Writer {
     pub fn upsert_inc_on(
         &mut self,
         life: MStamp,
-        path: &str,
+        path: &Path,
         n: i64,
         skew: u64,
+    ) -> Option<Written> {
+        self.ticking(skew, |w, m| w.upsert_inc_on_m(life, path, n, m))
+    }
+
+    /// [`Writer::upsert_inc_on`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn upsert_inc_on_stamped(
+        &mut self,
+        life: MStamp,
+        path: &Path,
+        n: i64,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.upsert_inc_on_m(life, path, n, m))
+    }
+
+    /// An upserting `$inc` that creates the document; refused while a life is alive.
+    pub fn upsert_inc(&mut self, path: &Path, n: i64, skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.upsert_inc_m(path, n, m))
+    }
+
+    /// [`Writer::upsert_inc`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn upsert_inc_stamped(
+        &mut self,
+        path: &Path,
+        n: i64,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.upsert_inc_m(path, n, m))
+    }
+
+    /// `$set path = v`; `None` when no life is alive, the value is unchanged (a no-op is a write
+    /// that would leave the stored representation byte-identical) or the write is refused: below a
+    /// scalar or an array, or with a value that is not legal input ([`Value::check_input`]). A
+    /// `Value::Document` is a sub-document: only the leaves that changed are written.
+    pub fn write_set(&mut self, path: &Path, v: Value, skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.write_set_m(path, v, m))
+    }
+
+    /// [`Writer::write_set`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn write_set_stamped(
+        &mut self,
+        path: &Path,
+        v: Value,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.write_set_m(path, v, m))
+    }
+
+    /// `$unset path`; `None` when no life is alive or the path is absent.
+    pub fn write_unset(&mut self, path: &Path, skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.write_unset_m(path, m))
+    }
+
+    /// [`Writer::write_unset`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn write_unset_stamped(
+        &mut self,
+        path: &Path,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.write_unset_m(path, m))
+    }
+
+    /// `$inc path by n`, an `Int64` operand. A local increment past the bound is refused (Q11),
+    /// and so is one that would carry the writer's slot past [`MAX_TOTAL`]; on a string or a map
+    /// it is refused; on a double base it is a register write. See [`Writer::write_inc_value`]
+    /// for the other operand types.
+    pub fn write_inc(&mut self, p: &Path, n: i64, skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.write_inc_m(p, &Value::Int64(n), m))
+    }
+
+    /// `$inc path by by`, where `by` is an `Int32`, `Int64`, `Decimal128` or `Double` (anything
+    /// else is refused). The result type is production's (`counter`): two `Int32`s stay an
+    /// `Int32` while the total fits, any `Int64` makes it an `Int64`, a `Decimal128` a
+    /// `Decimal128` (refused when it overflows from finite inputs). Concurrent increments from
+    /// other writers sum with this one. DOUBLES ARE NOT COUNTERS: a `Double` operand against an
+    /// `Int32`, `Int64` or `Decimal128` counter is refused, and `$inc` of a double base (or of
+    /// an absent field by a double) is a register write.
+    pub fn write_inc_value(&mut self, p: &Path, by: &Value, skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.write_inc_m(p, by, m))
+    }
+
+    /// [`Writer::write_inc_value`] with the stamp taken from `stamp` instead of the writer's own
+    /// clock: see [`Writer::tick_to`] for what a stamp must satisfy.
+    pub fn write_inc_value_stamped(
+        &mut self,
+        p: &Path,
+        by: &Value,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.write_inc_m(p, by, m))
+    }
+
+    /// [`Writer::write_inc`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn write_inc_stamped(
+        &mut self,
+        p: &Path,
+        n: i64,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.write_inc_m(p, &Value::Int64(n), m))
+    }
+
+    /// Replace the whole document: changed fields are set, absent ones unset. Each field is a
+    /// one-segment path; a `Value::Document` value is diffed against the map the writer sees.
+    pub fn write_replace(&mut self, doc: &[(Path, Value)], skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.write_replace_m(doc, m))
+    }
+
+    /// [`Writer::write_replace`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn write_replace_stamped(
+        &mut self,
+        doc: &[(Path, Value)],
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.write_replace_m(doc, m))
+    }
+
+    /// Delete the document; `None` when no life is alive.
+    pub fn write_delete(&mut self, skew: u64) -> Option<Written> {
+        self.ticking(skew, |w, m| w.write_delete_m(m))
+    }
+
+    /// [`Writer::write_delete`] with the stamp taken from `stamp` instead of the writer's own clock:
+    /// see [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once for each stamp the
+    /// write needs and never for a write that is refused or changes nothing; a stamp that
+    /// fails the check is an `Err` and nothing is written.
+    pub fn write_delete_stamped(
+        &mut self,
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, StampError> {
+        self.stamped(stamp, |w, m| w.write_delete_m(m))
+    }
+
+    /// The body of [`Writer::insert`], with the stamp from `m`.
+    fn insert_m(&mut self, fields: &[(Path, Value)], m: &mut Mint<'_>) -> Option<Written> {
+        let cells = expand_document(fields)?;
+        if !self.state.alive(&self.opts).is_empty() {
+            return None;
+        }
+        let known = self.known();
+        let st = self.mint(m)?;
+        let s = &mut self.state;
+        s.lives.insert(
+            st,
+            Life {
+                seen: s.deletes.keys().copied().collect(),
+                order: cells.iter().map(|(p, _)| p.clone()).collect(),
+                kind: LifeKind::Insert,
+            },
+        );
+        for (p, v) in &cells {
+            let generation = (!v.is_numeric()).then(|| {
+                let mut vv = s.vv.clone();
+                vv.insert(st.writer, st.hlc);
+                Gen::start(st, &vv, BTreeMap::new())
+            });
+            s.regs.insert(
+                (st, p.clone()),
+                Reg { stamp: st, value: v.clone(), generation, soi: false },
+            );
+            #[cfg(any(test, feature = "merge-mutants"))]
+            if !v.is_numeric() {
+                s.note_base((st, p.clone()), st, &BTreeMap::from([(st.writer, st.hlc)]));
+            }
+        }
+        s.vv.insert(st.writer, st.hlc);
+        let items: Items =
+            cells.iter().map(|(p, _)| (OrdAt::Field(p.clone()), OrdMode::Write)).collect();
+        self.feed(st, st, known, &items);
+        let mut rec = WriteRecord::new(
+            WriteKind::Insert,
+            Some(st),
+            cells.iter().map(|(p, _)| p.clone()).collect(),
+        );
+        rec.vals = cells.iter().map(|(p, v)| (p.clone(), v.clone())).collect();
+        Some(self.finish(st, rec))
+    }
+
+    /// The body of [`Writer::upsert_soi`], with the stamp from `m`.
+    fn upsert_soi_m(
+        &mut self,
+        fields: &[(Path, Value)],
+        inc_path: &Path,
+        n: i64,
+        sets: &[(Path, Value)],
+        m: &mut Mint<'_>,
+    ) -> Option<(Written, Written)> {
+        let created = self.upsert_soi_create_m(fields, inc_path, sets, m)?;
+        let life = created.stamp;
+        let incd = self.upsert_inc_on_m(life, inc_path, n, m)?;
+        Some((created, incd))
+    }
+
+    /// The body of [`Writer::upsert_soi_create`], with the stamp from `m`.
+    fn upsert_soi_create_m(
+        &mut self,
+        fields: &[(Path, Value)],
+        inc_path: &Path,
+        sets: &[(Path, Value)],
+        m: &mut Mint<'_>,
+    ) -> Option<Written> {
+        if fields.iter().chain(sets).any(|(_, v)| v.check_input().is_err()) {
+            return None;
+        }
+        // The paths of one update must not meet: no path twice, none below another (the
+        // reference refuses a conflicting update).
+        // (an Unset field is no field: it names nothing that could meet another path)
+        let mut paths: Vec<&Path> = fields
+            .iter()
+            .chain(sets.iter())
+            .filter(|(_, v)| *v != Value::Unset)
+            .map(|(q, _)| q)
+            .chain([inc_path])
+            .collect();
+        paths.sort_unstable();
+        if paths.windows(2).any(|w| w[0] == w[1] || w[1].is_below(w[0])) {
+            return None;
+        }
+        let (mut soi_cells, mut set_cells) = (Vec::new(), Vec::new());
+        for (q, v) in fields {
+            expand(q, v, &mut soi_cells).ok()?;
+        }
+        for (q, v) in sets {
+            expand(q, v, &mut set_cells).ok()?;
+        }
+        if !self.state.alive(&self.opts).is_empty() {
+            return None;
+        }
+        let known = self.known();
+        let st = self.mint(m)?;
+        let s = &mut self.state;
+        s.lives.insert(
+            st,
+            Life {
+                seen: s.deletes.keys().copied().collect(),
+                order: soi_cells.iter().map(|(p, _)| p.clone()).collect(),
+                kind: LifeKind::Upsert,
+            },
+        );
+        // M1: a non-numeric creation value starts a generation, as in `insert`.
+        let starts_gen = !self.opts.creation_without_generation();
+        let mut cells: Vec<(&Path, &Value, bool)> = Vec::new();
+        cells.extend(soi_cells.iter().map(|(q, v)| (q, v, true)));
+        cells.extend(set_cells.iter().map(|(q, v)| (q, v, false)));
+        for (q, v, soi) in cells {
+            let generation = (starts_gen && !v.is_numeric()).then(|| {
+                let mut vv = s.vv.clone();
+                vv.insert(st.writer, st.hlc);
+                Gen::start(st, &vv, BTreeMap::new())
+            });
+            s.regs.insert((st, q.clone()), Reg { stamp: st, value: v.clone(), generation, soi });
+            #[cfg(any(test, feature = "merge-mutants"))]
+            if starts_gen && !v.is_numeric() {
+                s.note_base((st, q.clone()), st, &BTreeMap::from([(st.writer, st.hlc)]));
+            }
+        }
+        let mut paths = Vec::new();
+        let mut vals = BTreeMap::new();
+        for (q, v) in soi_cells.iter().chain(set_cells.iter()) {
+            if vals.insert(q.clone(), v.clone()).is_none() {
+                paths.push(q.clone());
+            }
+        }
+        s.vv.insert(st.writer, st.hlc);
+        // a write below a map is a write to the map: each path names its ancestors first
+        let (mut items, mut seen) = (Items::new(), BTreeSet::new());
+        for q in &paths {
+            ancestor_items(q, &mut seen, &mut items, &self.opts);
+            items.push((OrdAt::Field(q.clone()), OrdMode::Write));
+        }
+        self.feed(st, st, known, &items);
+        let mut rec = WriteRecord::new(WriteKind::Insert, Some(st), paths);
+        rec.vals = vals;
+        rec.upsert = true;
+        rec.insert = true;
+        rec.soi = soi_cells.iter().map(|(p, _)| p.clone()).collect();
+        Some(self.finish(st, rec))
+    }
+
+    /// The body of [`Writer::upsert_inc_on`], with the stamp from `m`.
+    fn upsert_inc_on_m(
+        &mut self,
+        life: MStamp,
+        path: &Path,
+        n: i64,
+        m: &mut Mint<'_>,
     ) -> Option<Written> {
         if !self.state.alive(&self.opts).contains(&life) {
             return None;
         }
         // The creation wrote this path as a register: a counter slot beside it would belong to
         // no generation of that base (the update conflicts and is refused).
-        if self.state.regs.contains_key(&(life, path.to_string())) {
+        if self.state.regs.contains_key(&(life, path.clone())) {
             return None;
         }
-        let st2 = self.tick(skew);
+        let known = self.known();
+        let st2 = self.mint(m)?;
         self.state.vv.insert(st2.writer, st2.hlc);
-        self.state.slots.insert(
-            (life, path.to_string(), self.id, None),
-            Slot { stamp: st2, total: i128::from(n) },
-        );
-        let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.to_string()]);
+        self.put_slot((life, path.clone(), self.id, None), st2, Num::from(i128::from(n)));
+        let mut items = Items::new();
+        ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
+        items.push((OrdAt::Field(path.clone()), OrdMode::Write));
+        self.feed(life, st2, known, &items);
+        let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.clone()]);
         rec.n = Some(n);
+        rec.amount = Some(Num::from(i128::from(n)));
         Some(self.finish(st2, rec))
     }
 
-    /// An upserting `$inc` that creates the document; refused while a life is alive.
-    pub fn upsert_inc(&mut self, path: &str, n: i64, skew: u64) -> Option<Written> {
+    /// The body of [`Writer::upsert_inc`], with the stamp from `m`.
+    fn upsert_inc_m(&mut self, path: &Path, n: i64, m: &mut Mint<'_>) -> Option<Written> {
         if !self.state.alive(&self.opts).is_empty() {
             return None;
         }
-        let st = self.tick(skew);
+        let known = self.known();
+        let st = self.mint(m)?;
         let s = &mut self.state;
         s.lives.insert(
             st,
@@ -340,120 +948,319 @@ impl Writer {
             },
         );
         s.slots.insert(
-            (st, path.to_string(), self.id, None),
-            Slot { stamp: st, total: i128::from(n) },
+            (st, path.clone(), self.id, None),
+            Slot { stamp: st, total: Num::from(i128::from(n)), absorbed: None },
         );
-        let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), vec![path.to_string()]);
+        let mut items = Items::new();
+        ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
+        items.push((OrdAt::Field(path.clone()), OrdMode::Write));
+        self.feed(st, st, known, &items);
+        let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), vec![path.clone()]);
         rec.n = Some(n);
+        rec.amount = Some(Num::from(i128::from(n)));
         rec.insert = true;
         Some(self.finish(st, rec))
     }
 
-    /// `$set path = v`; `None` when no life is alive or the value is unchanged.
-    pub fn write_set(&mut self, path: &str, v: Value, skew: u64) -> Option<Written> {
-        let vis = self.visible()?;
-        if Value::same(vis.get(path), &v) {
-            return None;
+    /// The model's `_diff`: the leaf effects of changing `path` from what the writer sees there
+    /// to `n`, and the order items the change names. Type-strict (Q4, ruled: only changed fields
+    /// are written): a leaf is set when it changed; a sub-document sets its changed leaves,
+    /// unsets the old fields it lacks, and writes its map marker when the path was not a map
+    /// before or anything below it was written. A scalar or an array over a map unsets what the
+    /// writer saw below it. The ORDER items name every field the new value names, changed or
+    /// not: `mode` for `path` itself (a plain write for the path of a `$set`, a reset for the
+    /// fields of a replace and for everything inside a sub-document), a level mark at a
+    /// sub-document, an unset for each old field it lacks. `Err` when a field name cannot be a
+    /// segment.
+    fn diff(
+        &self,
+        vis: &BTreeMap<Path, Value>,
+        path: &Path,
+        n: &Value,
+        eff: &mut Eff,
+        items: &mut Items,
+        mode: OrdMode,
+    ) -> Result<(), InvalidPath> {
+        let o = vis.get(path);
+        let rewrite = self.opts.rewrite_unchanged();
+        let was_map = o == Some(&Value::Map);
+        let at = OrdAt::Field(path.clone());
+        if *n == Value::Unset && !rewrite {
+            // the writer's spelling of an unset inside a document: it is the model's `None`
+            if o.is_some() {
+                unset_subtree(vis, path, eff, items, &self.opts);
+            }
+            return Ok(());
         }
-        self.write_reg_unchecked(path, v, skew)
-    }
-
-    /// `$unset path`; `None` when no life is alive or the path is absent.
-    pub fn write_unset(&mut self, path: &str, skew: u64) -> Option<Written> {
-        let vis = self.visible()?;
-        vis.get(path)?;
-        self.write_reg_unchecked(path, Value::Null, skew)
-    }
-
-    /// `$inc path by n`. A local increment past the bound is refused (Q11), and so is one that
-    /// would carry the writer's slot past [`MAX_TOTAL`]; on a double base it is a register
-    /// write that starts a generation (Nm5); on a string it is refused.
-    pub fn write_inc(&mut self, p: &str, n: i64, skew: u64) -> Option<Written> {
-        let vis = self.visible()?;
-        let cur = vis.get(p);
-        let b = i128::from(self.opts.int_bound());
-        match cur {
-            None | Some(Value::Int(_)) => {
-                let c = if let Some(Value::Int(c)) = cur { i128::from(*c) } else { 0 };
-                if !(-b - 1..=b).contains(&(c + i128::from(n))) {
-                    return None;
+        if let Value::Document(fields) = n {
+            let n0 = eff.len();
+            items.push((at.clone(), mode));
+            items.push((at, OrdMode::Level));
+            for (name, v) in fields {
+                self.diff(vis, &path.child(name)?, v, eff, items, OrdMode::Reset)?;
+            }
+            if was_map {
+                let old: Vec<&Path> = below(vis, path)
+                    .map(|(q, _)| q)
+                    .filter(|q| q.segments().len() == path.segments().len() + 1)
+                    .collect();
+                let named: BTreeSet<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+                for q in old {
+                    if !named.contains(q.name()) {
+                        unset_subtree(vis, q, eff, items, &self.opts);
+                    }
                 }
             }
-            Some(Value::Double(d)) => {
-                return self.write_reg_unchecked(p, Value::Double(d + n as f64), skew);
+            if !was_map || eff.len() > n0 || rewrite {
+                eff.put(path.clone(), Value::Map);
             }
-            _ => return None,
+        } else {
+            if was_map {
+                for (q, _) in below(vis, path) {
+                    eff.put(q.clone(), Value::Unset);
+                    items.push((OrdAt::Field(q.clone()), OrdMode::Unset));
+                }
+                eff.put(path.clone(), n.clone());
+            } else if rewrite || !Value::same(o, n) {
+                eff.put(path.clone(), n.clone());
+            }
+            items.push((at, mode));
         }
-        let l = self.write_life()?;
-        let generation = self.state.gen_of(p, &self.opts).map(|g| g.stamp);
-        let key = (l, p.to_string(), self.id, generation);
-        let old = self.state.slots.get(&key).map_or(0, |s| s.total);
-        // The slot is this writer's running sum, which the saturated check above does not
-        // bound; refuse the `$inc` that would carry it past `MAX_TOTAL`.
-        let total = old.saturating_add(i128::from(n));
-        if total.unsigned_abs() > MAX_TOTAL.unsigned_abs() {
-            return None;
+        Ok(())
+    }
+
+    /// Did the new value of `path` change the ORDER of the fields the writer sees there, with
+    /// no leaf different (the model's `not ordered_same(cur, arg)`)? Only a sub-document has an
+    /// order. A path that is not a sub-document in the writer's view counts as changed.
+    fn reordered(&self, path: &Path, new: &Value) -> bool {
+        let Value::Document(fields) = new else { return false };
+        if self.opts.ord_reorder_is_noop() {
+            return false;
         }
-        let st = self.tick(skew);
+        let Some(doc) = self.state.ordered_document(&self.opts) else { return false };
+        let mut level: &[(String, OrderedValue)] = &doc;
+        for (i, seg) in path.segments().iter().enumerate() {
+            let Some((_, v)) = level.iter().find(|(name, _)| name == seg) else { return true };
+            match v {
+                OrderedValue::Doc(children) => level = children,
+                OrderedValue::Leaf(_) => return true,
+            }
+            if i + 1 == path.segments().len() {
+                return !same_fields(level, fields);
+            }
+        }
+        true
+    }
+
+    /// Set the cells of `eff` in one write (one stamp) and feed the order state with its items,
+    /// as the model's `_write_effects`. An order-only write (no cell, a changed field order) is a
+    /// write like any other.
+    fn commit(&mut self, eff: Eff, items: &Items, m: &mut Mint<'_>) -> Option<Written> {
+        let known = self.known();
+        let st = self.mint(m)?;
         self.state.vv.insert(st.writer, st.hlc);
-        self.state.slots.insert(key, Slot { stamp: st, total });
-        let mut rec = WriteRecord::new(WriteKind::Inc, Some(l), vec![p.to_string()]);
-        rec.n = Some(n);
-        rec.generation = generation;
+        let al = self.state.alive_set(self.opts.retention);
+        let l = al.last().copied();
+        for q in &eff.order {
+            self.setreg(q, eff.vals[q].clone(), st, &al);
+        }
+        if let Some(life) = l {
+            self.feed(life, st, known, items);
+        }
+        let mut rec = WriteRecord::new(WriteKind::Reg, l, eff.order);
+        rec.vals = eff.vals;
         Some(self.finish(st, rec))
     }
 
-    /// The register write an increment of a double base turns into: the model
-    /// rewrites `op, arg = "set", cur + arg` and then runs the set path, whose
-    /// "unchanged value" check has already been passed.
-    fn write_reg_unchecked(&mut self, p: &str, v: Value, skew: u64) -> Option<Written> {
-        let st = self.tick(skew);
-        self.state.vv.insert(st.writer, st.hlc);
-        let l = self.write_life();
-        self.setreg(p, v.clone(), st);
-        let mut rec = WriteRecord::new(WriteKind::Reg, l, vec![p.to_string()]);
-        rec.vals.insert(p.to_string(), v);
-        Some(self.finish(st, rec))
-    }
-
-    /// Replace the whole document: changed fields are set, absent ones unset.
-    pub fn write_replace(&mut self, doc: &[(&str, Value)], skew: u64) -> Option<Written> {
+    /// The body of [`Writer::write_set`], with the stamp from `m`.
+    fn write_set_m(&mut self, path: &Path, v: Value, m: &mut Mint<'_>) -> Option<Written> {
+        if v == Value::Unset {
+            // the writer's spelling of an unset: it is one, and names no ancestor (the unset body)
+            return self.write_unset_m(path, m);
+        }
+        v.check_input().ok()?;
         let vis = self.visible()?;
-        let changes: Vec<(&str, &Value)> = doc
-            .iter()
-            .filter(|(q, v)| !Value::same(vis.get(*q), v))
-            .map(|(q, v)| (*q, v))
-            .collect();
-        let drops: Vec<&String> = vis.keys().filter(|q| !doc.iter().any(|(d, _)| d == q)).collect();
-        if changes.is_empty() && drops.is_empty() {
+        if !self.opts.write_below_scalar() && below_a_scalar(&vis, path) {
             return None;
         }
-        let st = self.tick(skew);
-        self.state.vv.insert(st.writer, st.hlc);
-        let l = self.write_life();
-        let mut paths = Vec::new();
-        let mut vals = BTreeMap::new();
-        for (q, v) in changes {
-            self.setreg(q, v.clone(), st);
-            paths.push(q.to_string());
-            vals.insert(q.to_string(), v.clone());
+        let (mut eff, mut items) = (Eff::default(), Items::new());
+        ancestors_of(&vis, path, &mut BTreeSet::new(), &mut eff, &mut items, &self.opts);
+        // (the markers are not a change by themselves: the model counts from here, `n0`)
+        let n0 = eff.len();
+        self.diff(&vis, path, &v, &mut eff, &mut items, OrdMode::Write).ok()?;
+        if eff.len() == n0 && !self.reordered(path, &v) {
+            return None;
         }
-        for q in drops {
-            self.setreg(q, Value::Null, st);
-            paths.push(q.clone());
-            vals.insert(q.clone(), Value::Null);
-        }
-        let mut rec = WriteRecord::new(WriteKind::Reg, l, paths);
-        rec.vals = vals;
-        Some(self.finish(st, rec))
+        self.commit(eff, &items, m)
     }
 
-    /// Delete the document; `None` when no life is alive.
-    pub fn write_delete(&mut self, skew: u64) -> Option<Written> {
+    /// The body of [`Writer::write_unset`], with the stamp from `m`. An unset of a path the writer
+    /// does not see changes nothing: no stamp and no floor (the hybrid floor rides only on an
+    /// update that another change stamps: [`Writer::write_update`]).
+    fn write_unset_m(&mut self, path: &Path, m: &mut Mint<'_>) -> Option<Written> {
+        let vis = self.visible()?;
+        if !self.opts.write_below_scalar() && below_a_scalar(&vis, path) {
+            return None;
+        }
+        let mut items = Items::new();
+        if !vis.contains_key(path) {
+            if !self.opts.ord_noop_unset_stands() {
+                return None;
+            }
+            items.push((OrdAt::Field(path.clone()), OrdMode::Unset));
+            return self.commit(Eff::default(), &items, m);
+        }
+        let mut eff = Eff::default();
+        unset_subtree(&vis, path, &mut eff, &mut items, &self.opts);
+        self.commit(eff, &items, m)
+    }
+
+    /// What an `$inc` of `p` by `by` does to the state the writer sees (`vis`), decided before
+    /// anything is stamped: refused (the reason), a register write (a double base), or a counter slot.
+    fn inc_plan(
+        &self,
+        vis: &BTreeMap<Path, Value>,
+        p: &Path,
+        by: &Value,
+    ) -> Result<IncPlan, UpdateRefused> {
+        let out_of_range = || UpdateRefused::IncOutOfRange(p.clone());
+        // The production rule decides: a string or a map is refused, so is an integer past the
+        // bound, a decimal that overflows and a double operand against a counter. A double base
+        // is no counter: its `$inc` is a register write of the computed value.
+        let res = match counter::inc_result(vis.get(p), by, self.opts.int_bound())
+            .ok_or_else(|| inc_refusal(vis.get(p), by, p))?
+        {
+            Inc::Register(v) => {
+                // A no-op writes nothing (ADR-208), as for a `$set`: the computed value is the
+                // stored representation byte for byte, e.g. `1e300 + 1.0`, or `$inc 0.0`.
+                if !self.opts.rewrite_unchanged() && Value::same(vis.get(p), &v) {
+                    return Ok(IncPlan::Nothing);
+                }
+                return Ok(IncPlan::Register(v));
+            }
+            Inc::Slot(res) => res,
+        };
+        let op =
+            Num::from_value(by).ok_or_else(|| UpdateRefused::IncOperandNotANumber(p.clone()))?;
+        let al = self.state.alive_set(self.opts.retention);
+        let life = *al.last().ok_or(UpdateRefused::NoLife)?;
+        let win = self.state.winner_in(p, &al, &self.opts);
+        let generation = self.state.gen_in(p, &al, win, &self.opts).map(|g| g.stamp);
+        let key = (life, p.clone(), self.id, generation);
+        // The writer's slot is its running sum in the join of the types it has added. The
+        // `Int64` check above is on the saturated visible value, which does not bound the sum
+        // under it: refuse the `$inc` that would carry the slot past `MAX_TOTAL`.
+        let mut total = match self.state.slots.get(&key) {
+            // the writer's first amount at the path is the product's stored form of the operand
+            // (a canonical encoding of the operand, its cohort member kept), never the operand's own bytes
+            None => op.first_amount(),
+            Some(s) => counter::sum_checked(&s.total, &op).ok_or_else(out_of_range)?,
+        };
+        if total.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
+            return Err(out_of_range());
+        }
+        // The contributor cap: a writer the counter does not have yet is refused at the cap.
+        if !self.opts.no_contributor_cap() {
+            let cs: BTreeSet<WriterId> =
+                self.state.counted_in(p, &al, win, &self.opts).keys().map(|k| k.1).collect();
+            if cs.len() >= MAX_CONTRIBUTORS && !cs.contains(&self.id) {
+                return Err(UpdateRefused::TooManyContributors(p.clone()));
+            }
+        }
+        // The visible value became an Int64: the slot is an Int64 from now on, so a total that
+        // later dips back under the i32 range does not narrow again.
+        if res.kind() == Kind::Int64 && !self.opts.slot_never_widens() {
+            total = total.widened();
+        }
+        Ok(IncPlan::Slot(Box::new(SlotPlan { life, key, total, op, generation })))
+    }
+
+    /// The body of [`Writer::write_inc`], with the stamp from `m`. `op` is the operand with its
+    /// type; the rules are in the module docs of `counter`.
+    fn write_inc_m(&mut self, p: &Path, by: &Value, m: &mut Mint<'_>) -> Option<Written> {
+        let vis = self.visible()?;
+        if !self.opts.write_below_scalar() && below_a_scalar(&vis, p) {
+            return None;
+        }
+        let plan = self.inc_plan(&vis, p, by).ok()?;
+        let (mut eff, mut items) = (Eff::default(), Items::new());
+        ancestors_of(&vis, p, &mut BTreeSet::new(), &mut eff, &mut items, &self.opts);
+        items.push((OrdAt::Field(p.clone()), OrdMode::Write));
+        match plan {
+            IncPlan::Nothing => None,
+            IncPlan::Register(v) => {
+                eff.put(p.clone(), v);
+                self.commit(eff, &items, m)
+            }
+            IncPlan::Slot(plan) => {
+                // ONE write: the implicit markers of the maps the increment creates and the
+                // slot are under one stamp (the model's `_update`: registers, then slots)
+                let SlotPlan { life, key, total, op, generation } = *plan;
+                let known = self.known();
+                let st = self.mint(m)?;
+                self.state.vv.insert(st.writer, st.hlc);
+                let al = self.state.alive_set(self.opts.retention);
+                for q in &eff.order {
+                    self.setreg(q, eff.vals[q].clone(), st, &al);
+                }
+                self.put_slot(key, st, total);
+                self.feed(life, st, known, &items);
+                let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![p.clone()]);
+                rec.n = op.int().and_then(|v| i64::try_from(v).ok());
+                rec.amount = Some(op);
+                rec.generation = generation;
+                // (the markers this increment made, if any: the registers beside its slot)
+                rec.vals = eff.vals;
+                Some(self.finish(st, rec))
+            }
+        }
+    }
+
+    /// The body of [`Writer::write_replace`], with the stamp from `m`. The document's fields
+    /// are one-segment paths; a field that is a `Document` is diffed against the map the writer
+    /// sees, so only the leaves that changed are written. A replace names the root as a level mark
+    /// and each of its fields as a reset; one that changes nothing but the ORDER of the fields is
+    /// a write.
+    fn write_replace_m(&mut self, doc: &[(Path, Value)], m: &mut Mint<'_>) -> Option<Written> {
+        expand_document(doc)?;
+        let vis = self.visible()?;
+        let (mut eff, mut items) = (Eff::default(), vec![(OrdAt::Root, OrdMode::Level)]);
+        let mode =
+            if self.opts.ord_replace_without_reset() { OrdMode::Write } else { OrdMode::Reset };
+        for (q, v) in doc {
+            self.diff(&vis, q, v, &mut eff, &mut items, mode).ok()?;
+        }
+        let kept: BTreeSet<&Path> = doc.iter().map(|(d, _)| d).collect();
+        let tops: Vec<&Path> = vis.keys().filter(|q| q.segments().len() == 1).collect();
+        for q in tops {
+            if !kept.contains(q) {
+                unset_subtree(&vis, q, &mut eff, &mut items, &self.opts);
+            }
+        }
+        if eff.len() == 0 && !self.replace_reorders(doc) {
+            return None;
+        }
+        self.commit(eff, &items, m)
+    }
+
+    /// Does a replace by `doc` change the order of the writer's top-level fields, with no leaf
+    /// different (the model's `not ordered_same(vis, arg)` of a replace)?
+    fn replace_reorders(&self, doc: &[(Path, Value)]) -> bool {
+        if self.opts.ord_reorder_is_noop() {
+            return false;
+        }
+        let Some(cur) = self.state.ordered_document(&self.opts) else { return false };
+        let new: Vec<(String, Value)> =
+            doc.iter().map(|(p, v)| (p.name().to_string(), v.clone())).collect();
+        !same_fields(&cur, &new)
+    }
+
+    /// The body of [`Writer::write_delete`], with the stamp from `m`.
+    fn write_delete_m(&mut self, m: &mut Mint<'_>) -> Option<Written> {
         if self.state.alive(&self.opts).is_empty() {
             return None;
         }
-        let st = self.tick(skew);
+        let st = self.mint(m)?;
         self.state.vv.insert(st.writer, st.hlc);
         self.state.deletes.insert(st, self.state.vv.clone());
         Some(self.finish(st, WriteRecord::new(WriteKind::Delete, None, Vec::new())))
@@ -464,7 +1271,7 @@ impl Writer {
     pub fn receive_report(&mut self, other: &MergeState) -> Received {
         let (merged, fresh) = join(&self.state, other, &self.opts);
         self.clock = merged.vv.values().copied().chain([self.clock]).max().unwrap_or(Hlc::ZERO);
-        let changed = merged.canonical_bytes() != self.state.canonical_bytes();
+        let changed = merged != self.state;
         self.state = merged;
         Received { changed, fresh: fresh.into_iter().collect() }
     }
@@ -481,11 +1288,413 @@ impl Writer {
         if key.stamp.hlc < self.horizon() || self.state.losses.contains_key(&key) {
             return false;
         }
-        // A total past `MAX_TOTAL` is one `decode` refuses: never store a state that cannot be read back.
-        if matches!(val, LossValue::Total(t) if t.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
+        // A total past `MAX_TOTAL`, or a decimal no writer produces, is one `decode` refuses: never store a state that
+        // cannot be read back.
+        if matches!(val, LossValue::Total(t) if t.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) || !t.is_canonical())
+        {
             return false;
         }
         self.state.losses.insert(key, val);
         true
+    }
+}
+
+/// One operator of a multi-operator update. The paths of one update are pairwise disjoint (no path
+/// equal to or below another).
+///
+/// What a product operator is, to the writer: `$set` is [`UpdateOp::Set`], `$unset` is
+/// [`UpdateOp::Unset`], `$inc` is [`UpdateOp::Inc`] (a counter slot for an `Int32`, `Int64` or
+/// `Decimal128` base, a register write for a `Double` base). Every other operator is computed by the
+/// caller from what the writer sees and sent as a `Set` of the new value (an array is one atomic
+/// value); `$setOnInsert` is the creation of an upsert, not an update operator.
+#[derive(Clone, Debug)]
+pub enum UpdateOp {
+    /// `$set path = value`. A `Value::Document` is a sub-document (only the leaves that changed are
+    /// written); `Value::Unset` is an `$unset`.
+    Set(Path, Value),
+    /// `$unset path`
+    Unset(Path),
+    /// `$inc path by value`: the operand is an `Int32`, `Int64`, `Decimal128` or `Double`.
+    Inc(Path, Value),
+}
+
+impl UpdateOp {
+    fn path(&self) -> &Path {
+        match self {
+            UpdateOp::Set(p, _) | UpdateOp::Unset(p) | UpdateOp::Inc(p, _) => p,
+        }
+    }
+}
+
+/// Why an update was refused. A refused update changed nothing: no stamp, no clock move, no entry. A
+/// write that changes nothing is not a refusal: it is `Ok(None)`.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum UpdateRefused {
+    /// No life of the document is alive (an update applies to a document that exists).
+    #[error("merge state: the document does not exist")]
+    NoLife,
+    /// Two operators name paths where one is equal to or below the other.
+    #[error("merge state: the update names both {0} and {1}")]
+    Overlap(Path, Path),
+    /// A path is below a scalar or an array the writer sees: the reference cannot create a field in a
+    /// non-document.
+    #[error("merge state: {0} is below a scalar or an array")]
+    BelowScalar(Path),
+    /// A `$set` value that is not legal input (a map marker, a repeated or NUL field name, nesting past the
+    /// depth limit).
+    #[error("merge state: the value for {0} is not legal: {1}")]
+    BadValue(Path, InvalidValue),
+    /// A field name of a `$set` document cannot be a path segment.
+    #[error("merge state: {0}")]
+    BadPath(InvalidPath),
+    /// The `$inc` operand at this path is not an `Int32`, `Int64`, `Decimal128` or `Double`.
+    #[error("merge state: the $inc operand for {0} is not a number")]
+    IncOperandNotANumber(Path),
+    /// The `$inc` target holds a string, a null, a boolean or another value that is not a number.
+    #[error("merge state: {0} holds a value that is not a number")]
+    IncTargetNotANumber(Path),
+    /// The `$inc` target is a sub-document or an array.
+    #[error("merge state: {0} is a document or an array and cannot be incremented")]
+    IncTargetIsAContainer(Path),
+    /// A `Double` operand against an `Int32`, `Int64` or `Decimal128` counter (doubles are not counters).
+    #[error("merge state: a double cannot be added to the counter {0}")]
+    IncDoubleOnCounter(Path),
+    /// The result passes the integer bound, the theoretical bound on a writer's total, or a decimal
+    /// overflows from finite inputs.
+    #[error("merge state: the $inc of {0} passes a bound")]
+    IncOutOfRange(Path),
+    /// The counter at this path already has [`MAX_CONTRIBUTORS`] writers and this writer is not one.
+    #[error("merge state: the counter {0} has {MAX_CONTRIBUTORS} contributing writers already")]
+    TooManyContributors(Path),
+    /// The document already has [`MAX_WRITERS`] writers and this writer is not one.
+    #[error("merge state: the document has {MAX_WRITERS} writers already")]
+    WriterCap,
+}
+
+/// Why [`Writer::write_update_stamped`] did not write: the update was refused, or the stamp was.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum UpdateError {
+    #[error(transparent)]
+    Refused(#[from] UpdateRefused),
+    #[error(transparent)]
+    Stamp(#[from] StampError),
+}
+
+/// Which refusal an `$inc` that [`counter::inc_result`] refused is, from the same inputs.
+fn inc_refusal(cur: Option<&Value>, op: &Value, p: &Path) -> UpdateRefused {
+    let is_num = |v: &Value| matches!(v, Value::Double(_)) || Num::from_value(v).is_some();
+    if !is_num(op) {
+        return UpdateRefused::IncOperandNotANumber(p.clone());
+    }
+    match cur {
+        Some(Value::Map | Value::ImplicitMap | Value::Array(_) | Value::Document(_)) => {
+            UpdateRefused::IncTargetIsAContainer(p.clone())
+        }
+        Some(v) if !is_num(v) => UpdateRefused::IncTargetNotANumber(p.clone()),
+        Some(v) if matches!(op, Value::Double(_)) && !matches!(v, Value::Double(_)) => {
+            UpdateRefused::IncDoubleOnCounter(p.clone())
+        }
+        _ => UpdateRefused::IncOutOfRange(p.clone()),
+    }
+}
+
+/// The multi-operator update: the model's `_update` for `$set`, `$unset` and `$inc` on pairwise disjoint
+/// paths, with the single operators as its one-operator case.
+impl Writer {
+    /// ONE write, ONE stamp for a list of operators on pairwise disjoint paths, effects and positions in
+    /// the order of the list. Atomic: any refusal refuses the whole update and changes nothing
+    /// ([`UpdateRefused`]). `Ok(None)` is a no-op: nothing changed (no stamp). An `$unset` of an absent
+    /// path writes nothing itself; if another operator makes the update a write, its floor rides on that
+    /// stamp (the hybrid floor): metadata only, no entry of its own. A `$set` or `$inc` below an absent
+    /// map writes the implicit marker of each map it creates, in the same write.
+    pub fn write_update(
+        &mut self,
+        ops: &[UpdateOp],
+        skew: u64,
+    ) -> Result<Option<Written>, UpdateRefused> {
+        let mut m = Mint { source: Source::Skew(skew), error: None };
+        self.write_update_m(ops, &mut m)
+    }
+
+    /// [`Writer::write_update`] with the stamp taken from `stamp` instead of the writer's own clock: see
+    /// [`Writer::tick_to`] for what a stamp must satisfy. `stamp` is called once, and never for an
+    /// update that is refused or changes nothing; a stamp that fails the check is
+    /// [`UpdateError::Stamp`] and nothing is written.
+    pub fn write_update_stamped(
+        &mut self,
+        ops: &[UpdateOp],
+        stamp: &mut dyn FnMut() -> MStamp,
+    ) -> Result<Option<Written>, UpdateError> {
+        let mut m = Mint { source: Source::Given(stamp), error: None };
+        let r = self.write_update_m(ops, &mut m);
+        match m.error {
+            Some(e) => Err(UpdateError::Stamp(e)),
+            None => Ok(r?),
+        }
+    }
+
+    fn write_update_m(
+        &mut self,
+        ops: &[UpdateOp],
+        m: &mut Mint<'_>,
+    ) -> Result<Option<Written>, UpdateRefused> {
+        // an `Unset` spelled as the value of a `Set` is an `Unset`
+        let ops: Vec<UpdateOp> = ops
+            .iter()
+            .map(|o| match o {
+                UpdateOp::Set(p, Value::Unset) => UpdateOp::Unset(p.clone()),
+                o => o.clone(),
+            })
+            .collect();
+        let ops = &ops[..];
+        // Overlap (a path equal to or below another) in O(n log n). The pairwise loop reported the first operator that
+        // overlaps a LATER one, with the first such later operator. Going from the last operator to the first with the set
+        // of the later paths, an operator overlaps a later one iff the set holds its path, a prefix of it, or (the paths
+        // sort a prefix before its extensions) its first successor is below it; the first such operator is found in
+        // O(n log n), and its partner in one more pass.
+        let mut later: BTreeSet<&Path> = BTreeSet::new();
+        let mut first = None;
+        for (i, op) in ops.iter().enumerate().rev() {
+            let p = op.path();
+            if later.contains(p)
+                || p.ancestors().any(|a| later.contains(&a))
+                || later
+                    .range::<Path, _>((std::ops::Bound::Included(p), std::ops::Bound::Unbounded))
+                    .next()
+                    .is_some_and(|q| q.is_below(p))
+            {
+                first = Some(i);
+            }
+            later.insert(p);
+        }
+        if let Some(i) = first {
+            let a = ops[i].path();
+            let b = ops[i + 1..]
+                .iter()
+                .map(UpdateOp::path)
+                .find(|b| a == *b || a.is_below(b) || b.is_below(a))
+                .expect("the operator overlaps a later one");
+            return Err(UpdateRefused::Overlap(a.clone(), b.clone()));
+        }
+        let vis = self.visible().ok_or(UpdateRefused::NoLife)?;
+        let (mut eff, mut items) = (Eff::default(), Items::new());
+        let (mut seen, mut pending, mut slots) = (BTreeSet::new(), Vec::new(), Vec::new());
+        let mut changed = false;
+        for op in ops {
+            let p = op.path();
+            if !self.opts.write_below_scalar() && below_a_scalar(&vis, p) {
+                return Err(UpdateRefused::BelowScalar(p.clone()));
+            }
+            match op {
+                UpdateOp::Unset(p) => {
+                    if vis.contains_key(p) {
+                        unset_subtree(&vis, p, &mut eff, &mut items, &self.opts);
+                        changed = true;
+                    } else if self.opts.ord_noop_unset_stands() {
+                        items.push((OrdAt::Field(p.clone()), OrdMode::Unset));
+                        changed = true;
+                    } else {
+                        pending.push(p.clone());
+                    }
+                }
+                UpdateOp::Set(p, v) => {
+                    v.check_input().map_err(|e| UpdateRefused::BadValue(p.clone(), e))?;
+                    ancestors_of(&vis, p, &mut seen, &mut eff, &mut items, &self.opts);
+                    let n0 = eff.len();
+                    self.diff(&vis, p, v, &mut eff, &mut items, OrdMode::Write)
+                        .map_err(UpdateRefused::BadPath)?;
+                    changed = changed || eff.len() > n0 || self.reordered(p, v);
+                }
+                UpdateOp::Inc(p, by) => {
+                    let plan = self.inc_plan(&vis, p, by)?;
+                    ancestors_of(&vis, p, &mut seen, &mut eff, &mut items, &self.opts);
+                    items.push((OrdAt::Field(p.clone()), OrdMode::Write));
+                    match plan {
+                        IncPlan::Nothing => {}
+                        IncPlan::Register(v) => {
+                            eff.put(p.clone(), v);
+                            changed = true;
+                        }
+                        IncPlan::Slot(plan) => {
+                            let SlotPlan { life, key, total, .. } = *plan;
+                            slots.push((life, key, total));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        if !self.opts.ord_no_hybrid() {
+            items.extend(pending.into_iter().map(|p| (OrdAt::Field(p), OrdMode::Unset)));
+        }
+        let known = self.known();
+        let Some(st) = self.mint(m) else {
+            // a stamp that failed its check is the caller's (`m.error`); otherwise the writer cap
+            return if m.error.is_some() { Ok(None) } else { Err(UpdateRefused::WriterCap) };
+        };
+        self.state.vv.insert(st.writer, st.hlc);
+        let al = self.state.alive_set(self.opts.retention);
+        let l = al.last().copied();
+        for q in &eff.order {
+            self.setreg(q, eff.vals[q].clone(), st, &al);
+        }
+        let mut paths = eff.order.clone();
+        for (_, key, total) in slots {
+            paths.push(key.1.clone());
+            self.put_slot(key, st, total);
+        }
+        if let Some(life) = l {
+            self.feed(life, st, known, &items);
+        }
+        let mut rec = WriteRecord::new(WriteKind::Reg, l, paths);
+        rec.vals = eff.vals;
+        Ok(Some(self.finish(st, rec)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{opts, wid};
+    use super::*;
+
+    fn i(n: i64) -> Value {
+        Value::Int64(n)
+    }
+
+    fn doc(f: &[(&str, OrderedValue)]) -> Vec<(String, OrderedValue)> {
+        f.iter().map(|(n, v)| ((*n).to_string(), v.clone())).collect()
+    }
+
+    fn fields(f: &[(&str, Value)]) -> Vec<(String, Value)> {
+        f.iter().map(|(n, v)| ((*n).to_string(), v.clone())).collect()
+    }
+
+    fn leaf(n: i64) -> OrderedValue {
+        OrderedValue::Leaf(Value::Int64(n))
+    }
+
+    /// The model's `ordered_same`: the same names in the same order with the same leaves. The scenarios
+    /// reach it through the Writer; here its parts are told apart one by one (equal values under other
+    /// names, another length either way, a field spelled `Unset`, a sub-document against a leaf).
+    #[test]
+    fn same_fields_compares_names_order_values_and_length() {
+        let cur = doc(&[("p", leaf(1)), ("q", leaf(1))]);
+        assert!(same_fields(&cur, &fields(&[("p", i(1)), ("q", i(1))])));
+        assert!(!same_fields(&cur, &fields(&[("q", i(1)), ("p", i(1))])), "the names tell");
+        assert!(!same_fields(&cur, &fields(&[("p", i(1))])), "a field fewer");
+        assert!(!same_fields(&cur, &fields(&[("p", i(1)), ("q", i(1)), ("r", i(1))])), "one more");
+        assert!(!same_fields(&cur, &fields(&[("p", i(1)), ("q", i(2))])), "a value");
+        assert!(
+            same_fields(&cur, &fields(&[("p", i(1)), ("z", Value::Unset), ("q", i(1))])),
+            "a field spelled Unset is not a field"
+        );
+        assert!(!same_fields(&cur, &fields(&[("p", i(1)), ("q", Value::Unset)])));
+        let nested = doc(&[("m", OrderedValue::Doc(vec![("a".into(), leaf(1))]))]);
+        let same = fields(&[("m", Value::Document(fields(&[("a", i(1))])))]);
+        assert!(same_fields(&nested, &same));
+        assert!(!same_fields(&nested, &fields(&[("m", i(1))])), "a leaf where a map stands");
+        assert!(!same_fields(&doc(&[("m", leaf(1))]), &same), "a map where a leaf stands");
+        let deeper = fields(&[("m", Value::Document(fields(&[("a", i(2))])))]);
+        assert!(!same_fields(&nested, &deeper), "a leaf one level down");
+    }
+
+    /// An `Unset` field of the document of an insert, or of the creation of an upsert, is NO FIELD: no register, so no stamp
+    /// for it to win a race with. The model's insert has the field absent, and a register that carried the insert's stamp would
+    /// act as an unset above a concurrent, lower-stamped `$set` of the field by another writer. Two lives are alive at once
+    /// after a delete (a re-insert and an upsert merge): A upserts `a = 5` at a low stamp, B re-inserts with `a` spelled
+    /// `Unset` at a high one; `a` must be 5 after the join, in both orders.
+    #[test]
+    fn an_unset_field_in_an_insert_or_an_upsert_creation_stores_nothing() {
+        let (a, x, y) =
+            (Path::flat("a").unwrap(), Path::flat("x").unwrap(), Path::flat("y").unwrap());
+        for creation in 0..2 {
+            let mut w0 = Writer::new(wid('I', 0), opts());
+            w0.insert(&[(x.clone(), i(1))], 0).unwrap();
+            w0.write_delete(0).unwrap();
+            let (mut wa, mut wb) =
+                (Writer::new(wid('A', 0), opts()), Writer::new(wid('B', 0), opts()));
+            wa.receive(&w0.state);
+            wb.receive(&w0.state);
+            // A: a low-stamped creation that sets a = 5
+            wa.upsert_soi(&[], &y, 1, &[(a.clone(), i(5))], 0).unwrap();
+            // B: a high-stamped creation whose document spells `a` as an Unset
+            let st = if creation == 0 {
+                wb.insert(&[(a.clone(), Value::Unset), (x.clone(), i(2))], 9).unwrap().stamp
+            } else {
+                wb.upsert_soi(&[(a.clone(), Value::Unset)], &y, 1, &[], 9).unwrap().1.stamp
+            };
+            assert!(st.hlc > wa.state.vv[&wa.id], "B's stamp is above A's");
+            let ab = join(&wa.state, &wb.state, &opts()).0;
+            let ba = join(&wb.state, &wa.state, &opts()).0;
+            assert_eq!(ab, ba, "creation {creation}");
+            assert_eq!(
+                ab.visible(&opts()).unwrap().get(&a),
+                Some(&i(5)),
+                "creation {creation}: a = 5 survives"
+            );
+            assert!(
+                !wb.state.regs.keys().any(|(l, p)| *p == a && wb.state.lives.contains_key(l)),
+                "creation {creation}: B stored a register for the Unset field"
+            );
+        }
+    }
+
+    /// An insert whose every field is `Unset` is the insert of the empty document, whatever the spelling: the same state, a
+    /// life with no register and no order event (the model's `insert({})`: a stamp, an alive life, no cell).
+    #[test]
+    fn an_insert_of_only_unset_fields_is_the_insert_of_the_empty_document() {
+        let (a, b) = (Path::flat("a").unwrap(), Path::flat("b").unwrap());
+        let mut empty = Writer::new(wid('A', 0), opts());
+        let mut unsets = Writer::new(wid('A', 0), opts());
+        let e = empty.insert(&[], 3).unwrap();
+        let u = unsets.insert(&[(a.clone(), Value::Unset), (b, Value::Unset)], 3).unwrap();
+        assert_eq!(e.stamp, u.stamp);
+        assert_eq!(empty.state, unsets.state);
+        assert!(unsets.state.regs.is_empty(), "no register");
+        assert_eq!(unsets.state.lives.len(), 1, "one life");
+        assert_eq!(unsets.state.visible(&opts()).unwrap(), BTreeMap::new(), "alive, and empty");
+    }
+
+    /// A field spelled `Value::Unset` in a document handed to a write is an unset, for the order state
+    /// as for the cells: the writer that spells it so and the one that unsets (or drops) the field end
+    /// in the same state.
+    #[test]
+    fn an_unset_spelled_as_a_value_is_an_unset_for_the_order_state_too() {
+        let (x, y) = (Path::flat("x").unwrap(), Path::flat("y").unwrap());
+        let made = || {
+            let mut w = Writer::new(wid('A', 0), opts());
+            w.insert(&[(x.clone(), i(1)), (y.clone(), i(2))], 0).unwrap();
+            w
+        };
+        let (mut a, mut b) = (made(), made());
+        a.write_unset(&y, 0).unwrap();
+        b.write_set(&y, Value::Unset, 0).unwrap();
+        assert_eq!(a.state, b.state);
+        let (mut c, mut d) = (made(), made());
+        c.write_replace(&[(x.clone(), i(1))], 0).unwrap();
+        d.write_replace(&[(x.clone(), i(1)), (y.clone(), Value::Unset)], 0).unwrap();
+        assert_eq!(c.state, d.state);
+        // and over a field that is not there it is no write at all
+        assert!(d.write_set(&y, Value::Unset, 0).is_none());
+        // a NESTED path too: the unset body names no ancestor, so the set that spells an unset must not either
+        let (m, my) = (Path::flat("m").unwrap(), Path::new(["m", "y"]).unwrap());
+        let nested = || {
+            let mut w = Writer::new(wid('A', 0), opts());
+            let doc = Value::Document(vec![("y".into(), i(1)), ("z".into(), i(2))]);
+            w.insert(&[(x.clone(), i(1)), (m.clone(), doc)], 0).unwrap();
+            w
+        };
+        let (mut e, mut f) = (nested(), nested());
+        e.write_unset(&my, 0).unwrap();
+        f.write_set(&my, Value::Unset, 0).unwrap();
+        assert_eq!(e.state, f.state);
+        // and in an update
+        let (mut g, mut h) = (nested(), nested());
+        g.write_update(&[UpdateOp::Unset(my.clone())], 0).unwrap().unwrap();
+        h.write_update(&[UpdateOp::Set(my, Value::Unset)], 0).unwrap().unwrap();
+        assert_eq!(g.state, h.state);
     }
 }

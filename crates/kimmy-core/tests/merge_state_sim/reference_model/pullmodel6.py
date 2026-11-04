@@ -1,11 +1,5 @@
-# Reference model of the cluster pull protocol for the Q7 field-level merge, standard library
-# only: nodes with an oplog, witnessed and servable vectors, holes, threshold pulls, snapshots,
-# backup and restore, and the graded random run. It sits on model5.py and implements the same Q7
-# design document (field-level merge with summing $inc counters and conflictResolved, v7.2),
-# the replication and convergence sections. Vendored for reference; the Rust harness
-# (tests/merge_state_sim) is a port of it. `python3 -I pullmodel5.py [runs]` runs it.
-"""Q7 v4 P0 model: model5's merge state and join, replicated by the protocol the cluster actually runs.
-(Threshold pulls, witnessed/servable vectors, ADR-224 holes, restores that
+"""Q7 v4 P0 model: model6's merge state and join, replicated by the protocol the cluster actually runs.
+(Rebased on the reviewer's pullmodel.py: threshold pulls, witnessed/servable vectors, ADR-224 holes, restores that
 bring back the backup's vectors, loss entries stamped by the detecting member. v4: coverage vectors are keyed by
 (node, epoch), V3M2; no whole-state repair anywhere; a snapshot happens only when a hole or retention asks.)
 
@@ -35,12 +29,14 @@ protocol asks for one (a hole or, in `snap_rate`, a stand-in for retention's Bey
 """
 import sys, os, random, itertools
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import model5 as M
+import model6 as M
 
 SNAP_LOSS_ENTRIES = True     # D10: a join that detects a loss appends its entry (snapshot joins too)
 HOLES = True                 # ADR-224 holes on a snapshot grant
 APPEND_ALL_LOSS = False      # variant: a member appends every loss entry it witnesses
 NORMALIZE_WRITES = True      # see finish()
+COVERED_SKIP = True          # Q3 (A2): a writer entry whose version vector the receiver already covers is not joined (the plan's C8 pre-check)
+START_HLC = True             # Q3 (A2): a never-witnessed origin's pull threshold is its epoch's start hlc, not 0
 
 
 EPOCH_FROM_BACKUP = False      # mutant for V4M2
@@ -83,7 +79,7 @@ class Node(M.Member):
             self.state = s
         s.contained = s.contained | {st}
         log[st] = (frozenset(s.contained - {st}), meta)
-        self._append(("w", st, s.copy()))
+        self._append(("w", st, M.wire(s)))
         return st
 
     def _absorb(self, other, entry_id=None, append_entry=None, record_entries=True):
@@ -102,7 +98,9 @@ class Node(M.Member):
     def receive_entry(self, ent):
         st = ent[1]
         if ent[0] == "w":
-            if self._absorb(ent[2]) and okey(st) not in self.oplog:
+            if COVERED_SKIP and all(self.state.vv.get(w, 0) >= h for w, h in ent[2].vv.items()):
+                self.covered_skips = getattr(self, "covered_skips", 0) + 1
+            elif self._absorb(M.unwire(ent[2])) and okey(st) not in self.oplog:
                 self._append(ent)
         else:
             key, val = ent[2], ent[3]
@@ -143,12 +141,19 @@ class Node(M.Member):
         return True
 
 
+def start_hlc(o):
+    """The start hlc of an origin's epoch: no entry of that origin is older (a restore's epoch is its start hlc plus 64 random bits)."""
+    if START_HLC and isinstance(o, tuple) and isinstance(o[1], int) and o[1] > 0:
+        return o[1] >> 64
+    return 0
+
+
 def pull(p, r, limit=None):
     """p pulls from r. Returns True if anything was applied or witnessed."""
     behind = [o for o, h in r.servable.items() if h > p.witnessed.get(o, 0)]
     if not behind:
         return False
-    thr = min(p.witnessed.get(o, 0) for o in behind)
+    thr = min(p.witnessed.get(o, start_hlc(o)) for o in behind)
     if any(p.witnessed.get(o, 0) < h and p.witnessed.get(o, 0) < r.hole.get(o, 0)
            for o, h in r.servable.items()):
         p.snapshot_from(r)                      # BeyondHorizon (a hole): take the snapshot
@@ -211,12 +216,125 @@ def fixpoint(ms, rounds=40):
     return False
 
 
-def run(seed, steps=18, snap_rate=0.06, restore=True, ret=None, sequential=False):
+SUBDOCS = {"a": [{}, {"b": 1}, {"c": 2}, {"b": 1, "c": 2}, {"c": 2, "b": 1}, {"b": 0, "c": "s"}, {"d": {"e": 3}},
+               {"b": 0, "d": {}}, {"d": {"e": 1, "f": 2}, "c": "s"}, {"c": 1, "d": {"f": 2, "e": 1}, "b": 4}],
+           "a.d": [{}, {"e": 1}, {"f": 2}, {"f": 2, "e": 1}, {"e": 5, "g": 6}],
+           "acct": [{}, {"balance": 150}, {"balance": 0}, {"balance": 100}]}
+SCALARS = [5, "s", 2.5, (1, 2), ()]
+LEAVES = ["x", "n", "y", "a.b", "a.c", "a.d.e", "a.d.f", "a.d.g", "acct.balance"]
+PARENTS = ["a", "a.d", "acct"]
+
+
+def rand_doc(rnd):
+    """A whole replacement document, fields in a random order."""
+    d = []
+    for t in ("x", "n", "y"):
+        if rnd.random() < 0.4:
+            d.append((t, rnd.choice([7, 8, "s", 100])))
+    if rnd.random() < 0.6:
+        d.append(("a", rnd.choice(SUBDOCS["a"] + [5])))
+    if rnd.random() < 0.6:
+        d.append(("acct", rnd.choice(SUBDOCS["acct"] + ["s"])))
+    if rnd.random() < 0.3:
+        d.append(("items", rnd.choice([(1,), (1, 2), (3,)])))
+    rnd.shuffle(d)
+    return dict(d)
+
+
+def shuffled(rnd, v):
+    """The same document with the keys of every level in a random order."""
+    if not isinstance(v, dict):
+        return v
+    ks = list(v)
+    rnd.shuffle(ks)
+    return {k: shuffled(rnd, v[k]) for k in ks}
+
+
+def disjoint(a, b):
+    return not (a == b or a.startswith(b + ".") or b.startswith(a + "."))
+
+
+def draw_op(rnd, m, log, skew, nested, upsert_soi=False):
+    """One client operation. nested=False reproduces the flat workload of the earlier model draw for draw."""
+    if nested and rnd.random() < 0.6:
+        k = rnd.choice(["inc", "inc", "inc", "set", "set", "set", "setp", "setp", "unset", "unset", "unsetp", "replace",
+                        "shuffle", "setmany", "update", "update", "push", "incqty", "insert", "delete"])
+        if k == "inc":
+            m.write("inc", rnd.choice(["acct.balance", "acct.balance", "a.b", "a.c", "a.d.e", "x", "y"]), rnd.choice([1, 5, 20, -3, 50]), log, skew)
+        elif k == "set":
+            m.write("set", rnd.choice(LEAVES), rnd.choice([0, 1, 7, 500, "s", 2.5, None]), log, skew)   # None = a stored null
+        elif k == "setp":
+            t = rnd.choice(PARENTS)
+            m.write("set", t, rnd.choice(SUBDOCS[t] * 2 + SCALARS), log, skew)
+        elif k == "unset":
+            m.write("unset", rnd.choice(LEAVES), None, log, skew)
+        elif k == "unsetp":
+            m.write("unset", rnd.choice(PARENTS + ["items"]), None, log, skew)
+        elif k == "replace":
+            m.write("replace", None, rand_doc(rnd), log, skew)
+        elif k == "shuffle":
+            vis = m.state.visible()
+            if vis:
+                m.write("replace", None, shuffled(rnd, vis), log, skew)
+        elif k == "update":
+            a, b, c = rnd.sample(LEAVES + PARENTS, 3)
+            ops = []
+            for q in (a, b, c):
+                if not (all(disjoint(q, o[1]) for o in ops)):
+                    continue
+                kind = rnd.choice(["set", "unset", "inc", "inc"])
+                if kind == "set":
+                    ops.append(("set", q, rnd.choice(SUBDOCS[q]) if q in SUBDOCS else rnd.choice([0, 1, "s", None])))
+                elif kind == "unset":
+                    ops.append(("unset", q, None))
+                else:
+                    ops.append(("inc", q, rnd.choice([1, 5, -3])))
+            if ops:
+                m.write("update", None, ops, log, skew)
+        elif k == "setmany":
+            a, b = rnd.sample(LEAVES + PARENTS, 2)
+            if disjoint(a, b):
+                va = rnd.choice(SUBDOCS[a]) if a in SUBDOCS else rnd.choice([0, 1, "s"])
+                vb = rnd.choice(SUBDOCS[b]) if b in SUBDOCS else rnd.choice([0, 1, "s"])
+                m.write("setmany", None, [(a, va), (b, vb)], log, skew)
+        elif k == "push":
+            m.write("push", "items", rnd.choice([1, 2, 3]), log, skew)
+        elif k == "incqty":
+            m.write("incqty", "items", rnd.choice([1, 2]), log, skew)
+        elif k == "delete":
+            if rnd.random() < 0.25:
+                m.write("delete", None, None, log, skew)
+        else:
+            m.insert(rnd.choice([{"a": {"b": 1}}, {"acct": {"balance": 10}}, {"x": 1, "a": {}}, {"items": (1,)},
+                                 {"a": {"b": 2, "c": 3, "d": {"e": 1}}, "acct": {"balance": 5}}, {"n": "q", "a": {"d": {"f": 1}}}]), log, skew)
+        return
+    ops = ["inc", "inc", "inc", "set", "set", "unset", "delete", "insert", "replace", "upsert"] + (["upsert_soi"] if upsert_soi else [])
+    op = rnd.choice(ops)
+    p = rnd.choice(["x", "n", "y"])
+    if op == "insert":
+        m.insert({rnd.choice(["x", "y"]): rnd.choice([1, 2])}, log, skew)
+    elif op == "upsert_soi":
+        m.upsert_soi({rnd.choice(["y", "z"]): rnd.choice([1, 2])}, rnd.choice(["x", "y"]), rnd.choice([1, 2]), log, skew,
+                     sets=rnd.choice([None, {"n": 5}]))
+    elif op == "upsert":
+        m.upsert_inc(rnd.choice(["x", "y"]), rnd.choice([1, 2]), log, skew)
+    elif op == "replace":
+        m.write("replace", None, {rnd.choice(["x", "n", "y"]): rnd.choice([7, 8, "s"])}, log, skew)
+    elif op == "inc":
+        m.write("inc", p, rnd.choice([1, 5, 20, -3]), log, skew)
+    elif op == "set":
+        m.write("set", p, rnd.choice([0, 7, 500, "s", 2.5]), log, skew)
+    else:
+        m.write(op, p, None, log, skew)
+
+
+def run(seed, steps=18, snap_rate=0.06, restore=True, ret=None, sequential=False, nested=True):
     rnd = random.Random(seed)
     M.RET = ret if ret is not None else 10 ** 9
     ms = [Node(n) for n in M.NODES[:rnd.choice([3, 4])]]
     log = {}
-    ms[0].insert({"x": 100, "n": "a"}, log)
+    ms[0].insert({"x": 100, "n": "a", "a": {"b": 0, "c": 2, "d": {"e": 1}}, "acct": {"balance": 100}, "items": (1,)} if nested
+                 else {"x": 100, "n": "a"}, log)
     for m in ms:
         m.backup()
     did_restore = False
@@ -240,31 +358,18 @@ def run(seed, steps=18, snap_rate=0.06, restore=True, ret=None, sequential=False
             tgt.restore()
             did_restore = True
             continue
-        op = rnd.choice(["inc", "inc", "inc", "set", "set", "unset", "delete", "insert", "replace", "upsert", "upsert_soi"])
-        p = rnd.choice(["x", "n", "y"])
-        if op == "insert":
-            m.insert({rnd.choice(["x", "y"]): rnd.choice([1, 2])}, log, skew)
-        elif op == "upsert_soi":
-            m.upsert_soi({rnd.choice(["y", "z"]): rnd.choice([1, 2])}, rnd.choice(["x", "y"]), rnd.choice([1, 2]), log, skew,
-                         sets=rnd.choice([None, {"n": 5}]))
-        elif op == "upsert":
-            m.upsert_inc(rnd.choice(["x", "y"]), rnd.choice([1, 2]), log, skew)
-        elif op == "replace":
-            m.write("replace", None, {rnd.choice(["x", "n", "y"]): rnd.choice([7, 8, "s"])}, log, skew)
-        elif op == "inc":
-            m.write("inc", p, rnd.choice([1, 5, 20, -3]), log, skew)
-        elif op == "set":
-            m.write("set", p, rnd.choice([0, 7, 500, "s", 2.5]), log, skew)
-        else:
-            m.write(op, p, None, log, skew)
+        draw_op(rnd, m, log, skew, nested, upsert_soi=True)
     settled = fixpoint(ms)
     return ms, log, settled
+
+
+DEVIATIONS = []      # order mismatches explained by the ruling-(a) approximation, collected by the suite
 
 
 def grade(ms, log):
     errs = []
     if len({m.state.canon() for m in ms}) != 1:
-        names = ["lives", "dead", "deletes", "regs", "slots", "vv", "losses"]
+        names = ["lives", "dead", "deletes", "regs", "slots", "vv", "losses", "ords", "absorbed"]
         cs = [m.state.canon() for m in ms]
         errs.append(("diverged", tuple(n for i, n in enumerate(names) if len({c[i] for c in cs}) > 1)))
         return errs
@@ -273,6 +378,8 @@ def grade(ms, log):
         errs.append(("visible",))
     must = M.loss_oracle(log, alive, dels)
     have = set(ms[0].state.losses)
+    if M.expansion_errors(log):
+        errs.append(("leaf-effect-expansion",))
     if any(m.state.hidden_all() != M.hidden_oracle(log) for m in ms):
         errs.append(("hidden-state",))
     if M.stale_records(have, log):
@@ -287,6 +394,9 @@ def grade(ms, log):
         if not m.restored and (len(m.events) != len(set(m.events)) or set(m.events) != have):
             errs.append(("emission", m.name))
             break
+    oe, dev = M.order_errors(ms[0].state, log)
+    errs += oe
+    DEVIATIONS.extend(dev)
     return errs
 
 

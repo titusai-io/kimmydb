@@ -1,7 +1,7 @@
 """Differential test of the Rust `merge_state` module against the Python reference model: the
 script generator and the expected answers.
 
-Drives the reference model (model5.py, with pullmodel5.Node's normalised `finish`) through random
+Drives the reference model (model6.py, the vendored A2.3 model, with pullmodel6.Node's normalised `finish`) through random
 operation scripts and writes, for every step, what the Rust side (tests/merge_state_diff.rs) must
 reproduce:
 
@@ -9,19 +9,21 @@ reproduce:
   * for every join: the `changed` flag and the fresh loss keys,
   * after every step, for every member: the 128-bit state hash of the Python state ENCODED IN THE RUST
     CANONICAL FORMAT (crates/kimmy-core/src/merge_state/codec.rs `write_body`, ported below), its length,
+    and the same two for the COMPACT form (compact.rs, QMS version 2, written again below),
     the visible document and the hidden figure,
   * at the end (after a full-mesh sync): the oracle's answers (visible doc, alive lives, required heads,
     hidden figure, killed-and-superseded groups, and the stale/unsound verdicts on member 0's records).
 
 Implements the Q7 design document (field-level merge with summing $inc counters and conflictResolved,
-v7.2) by running its reference model; see model5.py.
+v7.2) by running its reference model; see model6.py and MODEL-HASHES.txt.
 
 Usage (standard library only):
   python3 -I q7diff_gen.py <out-dir> <n-scripts> [first-seed] [--plant NAME]
       write s<seed>.json for each seed; --plant changes the model on purpose (the Rust replay must
       then disagree): same-ignores-type, hidden-le, no-saturation, zero-absent
   python3 -I q7diff_gen.py --golden
-      print the hash and canonical length of the golden vectors of tests.rs, computed from the model
+      print the hash and canonical length of the golden vectors of tests.rs, computed from the model (the version 1
+      form and, as <name>-compact, the compact form)
 """
 import ast
 import json
@@ -32,20 +34,52 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import model5 as M  # noqa: E402
+import model6 as M  # noqa: E402
+
+
+# The vendored `same()` is the diff the Rust side uses (bit pattern for doubles, representation for Decimal128, type strict): the
+# harness no longer patches it; it asserts what it relies on. (The scripts draw no NaN and no Dec128; the Rust side tests both.)
+_nan1 = struct.unpack(">d", bytes.fromhex("7ff8000000000001"))[0]
+_nan2 = struct.unpack(">d", bytes.fromhex("7ff8000000000002"))[0]
+assert M.same(0.0, 0.0) and not M.same(0.0, -0.0)
+assert M.same(_nan1, _nan1) and not M.same(_nan1, _nan2)
+assert M.same(M.Dec128("1.0"), M.Dec128("1.0")) and not M.same(M.Dec128("1.0"), M.Dec128("1.00"))
+assert not M.same(M.Dec128("1"), "1") and not M.same(1, 1.0)
+# the harness runs the model as the Rust side is today: the absorbed counter cell (Q6, ABSORBED on) and the implicit map marker (Q2;
+# a flat document has no absent ancestor, so no flat write makes one)
+M.ABSORBED = True
+M.NO_IMPLICIT_MARKER = False
+
+
+def _x(v):
+    """A value as something that tells apart what the repr strings of `canon()` do not: the bits of a double (a NaN payload, -0.0),
+    a Dec128 from the plain string of the same text."""
+    if isinstance(v, float):
+        return ("f", struct.pack(">d", v).hex())
+    if isinstance(v, tuple):
+        return ("t", tuple(_x(e) for e in v))
+    if isinstance(v, dict):
+        return ("d", tuple((k, _x(e)) for k, e in v.items()))
+    return (type(v).__name__, v)
+
+
+def exact(st):
+    """The state, compared exactly: `canon()` plus the register and loss values by their bits (never through repr strings alone)."""
+    return (st.canon(), tuple(sorted((repr(k), _x(r[1])) for k, r in st.regs.items())),
+            tuple(sorted((repr(k), _x(v)) for k, v in st.losses.items())))
 
 M64 = (1 << 64) - 1
 I64_MAX = 2 ** 63 - 1
 
 
 # ---------------------------------------------------------------------------------------------
-# the model, as pullmodel5.Node runs it, without the oplog
+# the model, as pullmodel6.Node runs it, without the oplog
 # ---------------------------------------------------------------------------------------------
 class D(M.Member):
     def finish(self, st, log, meta):
         s = self.state
         s.vv[st[1]] = st[0]
-        s, _ = M.join(s, M.State())          # pullmodel5.NORMALIZE_WRITES
+        s, _ = M.join(s, M.State())          # pullmodel6.NORMALIZE_WRITES
         self.state = s
         s.contained = s.contained | {st}
         log[st] = (frozenset(s.contained - {st}), meta)
@@ -55,7 +89,7 @@ class D(M.Member):
         before = self.state
         merged, fresh = M.join(before, other)
         self.clock = max([self.clock] + list(merged.vv.values()))
-        changed = merged.canon() != before.canon()
+        changed = exact(merged) != exact(before)
         self.state = merged
         return changed, fresh
 
@@ -82,6 +116,48 @@ def k_stamp(s):
 
 def k_opt(g):
     return (0,) if g is None else (1, k_stamp(g))
+
+
+# THE REGISTER `obs` IS DEAD under ABSORBED = True. The model still keeps a register's `obs` map (what its base counted); the Rust
+# cell has none (a slot's absorbed pair replaces it), so nothing may depend on it. Checked, not assumed, on EVERY state this harness
+# encodes or digests that has any register obs entry: every read of the model is the same with the obs maps cleared as with them.
+# (An obs key can name a slot of a life that was collected past the horizon, so `obs` may be non-empty with an empty absorbed
+# store; seed 792 of the nested generator is such a state. Such a key can matter only if the cells of that life come back from a state
+# older than the horizon, which is outside the retention claim.) A mismatch fails the run.
+def _obs_reads(s):
+    paths = sorted({k[1] for k in list(s.regs) + list(s.slots)})
+    slot_paths = sorted({k[1] for k in s.slots})
+    return (repr(s.visible()), repr(s.hidden_all()), repr(s.order_report()),
+            repr([(p, s.value(p)) for p in paths]),
+            repr([(p, sorted(map(repr, s.counted(p)))) for p in slot_paths]))
+
+
+# THE STRUCTURAL FORM of the same claim, asserted on EVERY digested state (it is what makes the obs redundant for every LATER join
+# as well, not only for the reads of the present state): for every register obs key whose slot the state holds, the slot's absorbed
+# pair exists and is at least as late as the obs entry (`absorbed[k][0] >= obs[k][0]`). A join takes the max of both components and
+# drops both with the life, so the property carries through every later join. An obs key whose slot is gone (see above) is dangling
+# and is not part of the claim.
+def check_obs_structural(s):
+    for (L, p), r in s.regs.items():
+        for (l2, w2, g2), o in r[2].items():
+            k = (l2, p, w2, g2)
+            if k in s.slots:
+                a = s.absorbed.get(k)
+                assert a is not None and a[0] >= o[0], \
+                    "a register obs entry %r of %r is not covered by the slot's absorbed pair %r" % (o, k, a)
+
+
+def check_obs_dead(s):
+    check_obs_structural(s)
+    if not any(r[2] for r in s.regs.values()):
+        return
+    cleared = s.copy()
+    cleared.regs = {k: (r[0], r[1], {}) + tuple(r[3:]) for k, r in s.regs.items()}
+    assert _obs_reads(s) == _obs_reads(cleared), "a read of the model depends on a register's obs under ABSORBED"
+
+
+class NoV1(Exception):
+    """The version 1 form cannot spell a state that has an absorbed pair (`V1CannotHold`)."""
 
 
 class Enc:
@@ -127,6 +203,8 @@ class Enc:
     def value(self, v):
         if v is None:
             self.u8(0)
+        elif v == M.NULL:          # a stored null (A2): tag 15, a register value like a string
+            self.u8(15)
         elif isinstance(v, bool):
             raise TypeError("bool")
         elif isinstance(v, int):
@@ -155,16 +233,6 @@ class Enc:
             self.opt_stamp(k[2])
             self.i128(m[k])
 
-    def obs_stamped(self, m):
-        """A register's `obs`: for each counted slot its stamp and total when the base saw it."""
-        self.ln(len(m))
-        for k in sorted(m, key=lambda k: (k_stamp(k[0]), k_wid(k[1]), k_opt(k[2]))):
-            self.stamp(k[0])
-            self.wid(k[1])
-            self.opt_stamp(k[2])
-            self.stamp(m[k][0])
-            self.i128(m[k][1])
-
     def gen(self, g):
         if g is None:
             self.u8(0)
@@ -189,6 +257,8 @@ class Enc:
             self.value(v)
 
     def state(self, st):
+        if st.absorbed:
+            raise NoV1()
         self.ln(len(st.lives))
         for L in sorted(st.lives, key=k_stamp):
             seen, order, kind = st.lives[L]
@@ -214,7 +284,7 @@ class Enc:
             self.s(k[1])
             self.stamp(r[0])
             self.value(r[1])
-            self.obs_stamped(r[2])
+            self.ln(0)            # the register's obs place, always empty now (its obs is dead: `check_obs_dead`)
             self.gen(r[3])
             self.u8(1 if len(r) > 4 and r[4] == "soi" else 0)
         self.ln(len(st.slots))
@@ -234,6 +304,244 @@ class Enc:
             self.stamp(key[2])
             self.loss_value(key, st.losses[key])
         return bytes(self.b)
+
+
+# ---------------------------------------------------------------------------------------------
+# the compact canonical form, QMS version 2 (crates/kimmy-core/src/merge_state/compact.rs), written
+# again here from the format description in the module documentation of compact.rs, not from its code
+# ---------------------------------------------------------------------------------------------
+FLAG_GEN_OWN, FLAG_GEN_OTHER, FLAG_SOI, FLAG_STAMP_IS_LIFE = 1, 2, 4, 8
+
+
+def k_path(p):
+    """Paths order by their segments, each compared as UTF-8 bytes. The flat model's field is one segment
+    whatever its name (a name may hold a dot): a path here is a name, never a dotted spelling."""
+    return [p.encode()]
+
+
+class EncCompact:
+    """Collects the body as a list of byte strings and two kinds of reference: a writer, and a life.
+    Once everything is collected, the sorted writer table and life table are known and the
+    references become indexes."""
+
+    def __init__(self, log):
+        self.parts = []
+        self.log = log
+
+    # -- primitives
+    def raw(self, b):
+        self.parts.append(bytes(b))
+
+    def u8(self, v):
+        self.raw([v])
+
+    def vi(self, v):
+        """An unsigned LEB128 varint, shortest form."""
+        assert v >= 0
+        out = bytearray()
+        while v >= 0x80:
+            out.append((v & 0x7F) | 0x80)
+            v >>= 7
+        out.append(v)
+        self.raw(out)
+
+    def payload(self, v):
+        """The payload of an integer total: the zigzag as a varint."""
+        self.vi((v << 1) if v >= 0 else (((-v) << 1) - 1))
+
+    def total(self, v):
+        """A typed total (a generation's seen entry, a lost total): the type byte (0, Int64), then the payload."""
+        self.u8(0)
+        self.payload(v)
+
+    def i64(self, v):
+        self.raw(v.to_bytes(8, "big", signed=True))
+
+    def s(self, x):
+        e = x.encode("utf-8")
+        self.vi(len(e))
+        self.raw(e)
+
+    def path(self, p):
+        self.vi(1)           # a flat field: one segment, whatever its name
+        self.s(p)
+
+    def hlc(self, h):
+        self.raw(h.to_bytes(8, "big") + (0).to_bytes(2, "big"))
+
+    def wid(self, w):
+        self.parts.append(("w", w))
+
+    def life(self, st):
+        self.parts.append(("l", st))
+
+    def stamp(self, st):
+        self.hlc(st[0])
+        self.wid(st[1])
+
+    def opt_stamp(self, g):
+        if g is None:
+            self.u8(0)
+        else:
+            self.u8(1)
+            self.stamp(g)
+
+    def value(self, v):
+        if v is None:
+            self.u8(0)
+        elif v == M.NULL:          # a stored null (A2): tag 15
+            self.u8(15)
+        elif isinstance(v, bool):
+            raise TypeError("bool")
+        elif isinstance(v, int):
+            self.u8(1)
+            self.i64(v)
+        elif isinstance(v, float):
+            self.u8(2)
+            self.raw(struct.pack(">d", v))
+        elif isinstance(v, str):
+            self.u8(3)
+            self.s(v)
+        else:
+            raise TypeError(type(v))
+
+    def vv(self, vv):
+        self.vi(len(vv))
+        for w in sorted(vv, key=k_wid):
+            self.wid(w)
+            self.hlc(vv[w])
+
+    @staticmethod
+    def obs_order(k):
+        return (k_stamp(k[0]), k_wid(k[1]), k_opt(k[2]))
+
+    def obs_key(self, k):
+        self.life(k[0])
+        self.wid(k[1])
+        self.opt_stamp(k[2])
+
+    def obs(self, m):
+        self.vi(len(m))
+        for k in sorted(m, key=self.obs_order):
+            self.obs_key(k)
+            self.total(m[k])
+
+    def loss_value(self, key, v):
+        kind, p, st = key
+        if kind == "insertLost" and p == "_":
+            self.u8(2)
+            f = ast.literal_eval(v)
+            self.vi(len(f))
+            for x in f:
+                self.path(x)
+        elif self.log[st][1]["kind"] == "inc":
+            self.u8(1)
+            self.total(v)
+        else:
+            self.u8(0)
+            self.value(v)
+
+    # -- the sections
+    def sections(self, st):
+        self.vi(len(st.lives))
+        for L in sorted(st.lives, key=k_stamp):
+            seen, order, kind = st.lives[L]
+            self.life(L)
+            self.vi(len(seen))
+            for d in sorted(seen, key=k_stamp):
+                self.stamp(d)
+            self.vi(len(order))
+            for p in order:
+                self.path(p)
+            self.u8({"insert": 0, "upsert": 1}[kind])
+        self.vi(len(st.dead))
+        for L in sorted(st.dead, key=k_stamp):
+            self.life(L)
+        self.vi(len(st.deletes))
+        for d in sorted(st.deletes, key=k_stamp):
+            self.stamp(d)
+            self.vv(st.deletes[d])
+        self.vi(len(st.regs))
+        for k in sorted(st.regs, key=lambda k: (k_stamp(k[0]), k_path(k[1]))):
+            r = st.regs[k]
+            life, stamp, gen = k[0], r[0], r[3]
+            flags = FLAG_SOI if len(r) > 4 and r[4] == "soi" else 0
+            if stamp == life:
+                flags |= FLAG_STAMP_IS_LIFE
+            if gen is not None:
+                flags |= FLAG_GEN_OWN if gen[0] == stamp else FLAG_GEN_OTHER
+            self.life(life)
+            self.path(k[1])
+            self.u8(flags)
+            if stamp != life:
+                self.stamp(stamp)
+            self.value(r[1])
+            if gen is not None:
+                if gen[0] != stamp:
+                    self.stamp(gen[0])
+                self.obs(gen[2] if len(gen) > 2 else {})        # the starter's vv (gen[1]) is not encoded
+        self.vi(len(st.slots))
+        for k in sorted(st.slots, key=lambda k: (k_stamp(k[0]), k_path(k[1]), k_wid(k[2]), k_opt(k[3]))):
+            sl = st.slots[k]
+            self.life(k[0])
+            self.path(k[1])
+            self.wid(k[2])
+            self.opt_stamp(k[3])
+            self.stamp(sl[0])
+            # the flag byte: bit 0 an absorbed pair follows; the types (bits 1-4) are Int64 = 0 here
+            pair = st.absorbed.get(k)
+            self.u8(1 if pair is not None else 0)
+            self.payload(sl[1])
+            if pair is not None:
+                self.stamp(pair[0])
+                self.payload(pair[1])
+        self.vv(st.vv)
+        self.vi(len(st.losses))
+        for key in sorted(st.losses, key=lambda k: (KIND[k[0]], k_path(k[1]), k_stamp(k[2]))):
+            self.u8(KIND[key[0]])
+            if key[0] == "insertLost" and key[1] == "_":      # the whole document: its own tag, not a path
+                self.u8(0)
+            else:
+                self.u8(1)
+                self.path(key[1])
+            self.stamp(key[2])
+            self.loss_value(key, st.losses[key])
+        self.vi(0)       # section 10, the order state: its count, 0 (the flat model has none)
+
+    def state(self, st):
+        """The canonical body: the writer table, the life table, then the sections."""
+        self.sections(st)
+        lives = sorted({p[1] for p in self.parts if isinstance(p, tuple) and p[0] == "l"}, key=k_stamp)
+        writers = {p[1] for p in self.parts if isinstance(p, tuple) and p[0] == "w"}
+        writers |= {l[1] for l in lives}
+        writers = sorted(writers, key=k_wid)
+        widx = {w: i for i, w in enumerate(writers)}
+        lidx = {l: i for i, l in enumerate(lives)}
+        head = EncCompact(self.log)
+        head.vi(len(writers))
+        for w in writers:
+            head.raw(bytes([ord(w[0])]) * 16 + bytes(10) + w[1].to_bytes(8, "big"))
+        head.vi(len(lives))
+        for l in lives:
+            head.hlc(l[0])
+            head.vi(widx[l[1]])
+        out = bytearray()
+        for p in head.parts + self.parts:
+            if isinstance(p, tuple):
+                out += self._varint_bytes(widx[p[1]] if p[0] == "w" else lidx[p[1]])
+            else:
+                out += p
+        return bytes(out)
+
+    @staticmethod
+    def _varint_bytes(v):
+        e = EncCompact(None)
+        e.vi(v)
+        return e.parts[0]
+
+    def encode(self, st):
+        """The whole state: `QMS`, the version byte 2, the body."""
+        return b"QMS\x02" + self.state(st)
 
 
 def rotl(x, r):
@@ -264,9 +572,22 @@ def hash128(data):
 # ---------------------------------------------------------------------------------------------
 # JSON forms shared with the Rust side
 # ---------------------------------------------------------------------------------------------
+class _Unset:
+    """`UNSET`: an unset spelled as the value of a field (the writer's `Value::Unset`). The model has no such value: when it is
+    called, a `$set` of it is the model's `$unset` of the path and a replace leaves the field out of its document."""
+
+    def __repr__(self):
+        return "UNSET"
+
+
+UNSET = _Unset()
+
+
 def jv(v):
-    if v is None:
+    if v is UNSET:
         return ["n"]
+    if v is None or (isinstance(v, str) and v == M.NULL):   # a stored null
+        return ["z"]
     if isinstance(v, int):
         return ["i", str(v)]
     if isinstance(v, float):
@@ -290,6 +611,16 @@ def jdoc(d):
 # one script
 # ---------------------------------------------------------------------------------------------
 NAMES = "ABCD"
+
+# The "odd" writes draw their fields from two extra plain names. The vendored A2.3 model reads a dot in a name as a path
+# separator and keys the root of a replace by the empty name, so the empty name and a name with a dot (which the stage-A flat
+# model took as one string) cannot be given to it; the Rust side covers them elsewhere (see the commit that dropped them).
+ODD = ["o1", "o2"]
+
+
+def names(odd, base):
+    """The names a write draws its fields from: `base`, or for an odd write the odd names and the first of `base`."""
+    return ODD + base[:1] if odd else list(base)
 
 
 def pools(bound):
@@ -337,18 +668,20 @@ def gen_script(seed):
             continue
         op = rnd.choice(["inc", "inc", "inc", "inc_zero_sum", "set", "set", "unset", "delete", "insert",
                          "replace", "upsert", "upsert_soi"])
-        p = rnd.choice(paths)
+        odd = rnd.random() < 1 / 6      # one write in six draws its fields from the odd names
+        p = rnd.choice(names(odd, paths))
         if op == "insert":
-            ks = rnd.sample(paths, rnd.choice([1, 1, 2, 3]))
-            ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])
+            ks = rnd.sample(names(odd, paths), rnd.choice([1, 1, 2, 3]))
+            ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None, UNSET]))] for k in ks], sk])
         elif op == "upsert":
-            ops.append(["upsert", m, rnd.choice(["x", "y", "n"]), rnd.choice(incs), sk])
+            ops.append(["upsert", m, rnd.choice(names(odd, ["x", "y", "n"])), rnd.choice(incs), sk])
         elif op == "upsert_soi":
             # $setOnInsert, $set and $inc on disjoint paths (a conflicting update is refused up front)
-            fs = rnd.sample(["y", "z", "n"], rnd.choice([1, 1, 2]))
+            fs = rnd.sample(names(odd, ["y", "z", "n"]), rnd.choice([1, 1, 2]))
             sets = [] if rnd.random() < 0.5 else [[k, jv(rnd.choice(vals))] for k in
-                                                   rnd.sample([q for q in ["n", "x", "w"] if q not in fs], 1)]
-            free = [q for q in ["x", "y", "n", "z", "u"] if q not in fs and q not in [k for k, _ in sets]]
+                                                   rnd.sample([q for q in names(odd, ["n", "x", "w"]) if q not in fs], 1)]
+            free = [q for q in names(odd, ["x", "y", "n", "z", "u"]) if q not in fs and q not in [k for k, _ in sets]]
+            free = free or ["u"]        # an odd write can use every name it has; `u` is in no list of any write
             ops.append(["upsert_soi", m, [[k, jv(rnd.choice(vals))] for k in fs], rnd.choice(free),
                         rnd.choice(incs), sets, sk])
         elif op == "inc_zero_sum":
@@ -358,12 +691,12 @@ def gen_script(seed):
             if n != -I64_MAX - 1:
                 ops.append(["inc", m, p, -n, sk])
         elif op == "replace":
-            ks = rnd.sample(paths, rnd.choice([1, 2]))
-            ops.append(["replace", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])
+            ks = rnd.sample(names(odd, paths), rnd.choice([1, 2]))
+            ops.append(["replace", m, [[k, jv(rnd.choice(vals + [None, UNSET]))] for k in ks], sk])
         elif op == "inc":
             ops.append(["inc", m, p, rnd.choice(incs), sk])
         elif op == "set":
-            ops.append(["set", m, p, jv(rnd.choice(vals + [None])), sk])
+            ops.append(["set", m, p, jv(rnd.choice(vals + [None, UNSET])), sk])
         elif op == "unset":
             ops.append(["unset", m, p, sk])
         else:
@@ -373,6 +706,8 @@ def gen_script(seed):
 
 def unjv(v):
     if v[0] == "n":
+        return UNSET
+    if v[0] == "z":
         return None
     if v[0] == "i":
         return int(v[1])
@@ -384,8 +719,15 @@ def unjv(v):
 def snap(ms, log):
     out = []
     for m in ms:
-        b = Enc(log).state(m.state)
-        out.append({"h": hash128(b), "len": len(b), "v": jdoc(m.state.visible()),
+        check_obs_dead(m.state)
+        cb = EncCompact(log).state(m.state)
+        try:
+            b = Enc(log).state(m.state)
+            h, ln = hash128(b), len(b)
+        except NoV1:
+            h = ln = None          # a state with an absorbed pair has no version 1 spelling
+        out.append({"h": h, "len": ln, "ch": hash128(cb), "clen": len(cb),
+                    "v": jdoc(m.state.visible()),
                     "hid": {p: str(h) for p, h in m.state.hidden_all().items()}})
     return out
 
@@ -402,7 +744,8 @@ def run_script(sc, dump_canon=False):
         res = None
         if kind == "insert":
             _, m, fields, sk = op
-            r = ms[m].insert({k: unjv(v) for k, v in fields}, log, sk)
+            # an unset spelled as a value is a field the model's document leaves out (the writer stores no register for it either)
+            r = ms[m].insert({k: unjv(v) for k, v in fields if unjv(v) is not UNSET}, log, sk)
             res = None if r is None else js(r)
         elif kind == "upsert":
             _, m, p, n, sk = op
@@ -414,12 +757,15 @@ def run_script(sc, dump_canon=False):
             res = None if r is None else js(r)
         elif kind == "replace":
             _, m, fields, sk = op
-            r = ms[m].write("replace", None, {k: unjv(v) for k, v in fields}, log, sk)
+            # an unset spelled as a value is a field the model's document leaves out
+            r = ms[m].write("replace", None, {k: unjv(v) for k, v in fields if unjv(v) is not UNSET}, log, sk)
             res = None if r is None else js(r)
         elif kind in ("inc", "set", "unset"):
             m, p, arg, sk = op[1], op[2], op[3] if kind != "unset" else None, op[-1]
             if kind == "set":
                 arg = unjv(arg)
+                if arg is UNSET:        # `$set p <unset>` is the model's `$unset p`
+                    kind, arg = "unset", None
             r = ms[m].write(kind, p, arg, log, sk)
             res = None if r is None else js(r)
         elif kind == "delete":
@@ -447,18 +793,18 @@ def run_script(sc, dump_canon=False):
                 ms[m].epoch = ep
                 res = True
         steps.append({"res": res, "after": snap(ms, log)})
-    # final full-mesh sync (model5.sync over whole states)
+    # final full-mesh sync (whole states)
     for _ in range(12):
-        before = [m.state.canon() for m in ms]
+        before = [exact(m.state) for m in ms]
         for r in ms:
             for s in ms:
                 if r is not s:
                     r.absorb(s.state.copy())
-        if [m.state.canon() for m in ms] == before:
+        if [exact(m.state) for m in ms] == before:
             break
     fin = {"after": snap(ms, log)}
     if dump_canon:
-        fin["canon"] = [Enc(log).state(m.state).hex() for m in ms]
+        fin["canon"] = [Enc(log).state(m.state).hex() if not m.state.absorbed else None for m in ms]
     want, alive, dels = M.oracle(log)
     must = M.loss_oracle(log, alive, dels)
     have = sorted(ms[0].state.losses, key=lambda k: (KIND[k[0]], k[1], k_stamp(k[2])))
@@ -472,7 +818,7 @@ def run_script(sc, dump_canon=False):
         "have": [jk(k) for k in have],
         "stale": sorted([jk(k) for k in M.stale_records(set(have), log)]),
         "unsound": [jk(k) for k in have if not M.sound_record(k, log, alive, dels)],
-        "converged": len({m.state.canon() for m in ms}) == 1,
+        "converged": len({repr(exact(m.state)) for m in ms}) == 1,
         "log": len(log),
     }
     return {"steps": steps, "final": fin}
@@ -514,7 +860,7 @@ def plant(which):
             obs = win[2] if win is not None else {}
             total, seen = (base if base is not None else 0), base is not None
             for k in sorted(self.counted(p), key=repr):
-                o = obs.get(k[0:1] + k[2:])
+                o = self.eff_obs(obs, k)
                 d = self.slots[k][1] - (o[1] if o else 0)
                 if d:
                     total += d
@@ -532,8 +878,14 @@ def golden():
     out = {}
 
     def h(name, st, log):
-        b = Enc(log).state(st)
-        out[name] = [hash128(b), len(b)]
+        check_obs_dead(st)
+        cb = EncCompact(log).state(st)
+        if st.absorbed:
+            out[name] = None          # no version 1 spelling: the state has absorbed pairs
+        else:
+            b = Enc(log).state(st)
+            out[name] = [hash128(b), len(b)]
+        out[name + "-compact"] = [hash128(cb), len(cb)]
 
     h("empty", M.State(), {})
     # 170: x=100 inserted by A, then +20 by B and +50 by C, all joined into A

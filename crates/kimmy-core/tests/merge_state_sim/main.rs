@@ -7,13 +7,24 @@
 //! runner FAILS if a probe fails, any random, sequential, horizon or bounded run
 //! reports a problem, or a mutant survives (section 17 / V5m3).
 //!
+//! The workload mixes in nested writes (`$set` and `$unset` at any depth, sub-documents,
+//! replaces, arrays, writes below a scalar), the oracle is recursive (the type rule of D4 at
+//! every depth), and every write's leaf effects are checked against it. The companion
+//! differential test `merge_state_diff_nested` replays scripts of the vendored stage A model.
+//! Each mutant is reported with the problems that killed it.
+//!
 //! The PRNG is a seeded xorshift, so the exact counts differ from the Python
 //! model's; what must hold is 0 problems for the design and every mutant killed.
 
+#[path = "../common/fingerprint.rs"]
+mod fingerprint;
 mod grade;
 mod mutants;
 mod oracle;
 mod oracle_tests;
+#[path = "../common/ord_replay.rs"]
+mod ord_replay;
+mod order_oracle;
 mod probes;
 mod rng;
 mod sim;
@@ -22,7 +33,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use grade::{grade, grade_bounded};
-use sim::{Cfg, RunConfig, run, run_bounded, settle};
+use sim::{Cfg, RunConfig, run, run_bounded, run_bounded_observed, run_observed, settle};
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -139,13 +150,76 @@ fn horizon(rep: &mut Report, n: u64, ret: u64, steps: usize, label: &str) {
     rep.check(&what, &c);
 }
 
-fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize) {
+/// Five seeds of the bounded runs (RET 40, a fixpoint every 3 steps, 80 steps) that FAILED before the sim's
+/// protocol had the covered-entry skip, found by sweeping 0 to 3000 on both workloads, and how they failed.
+///
+/// All five are the same failure, the Q3 resurrection path. A pull window re-sends an old entry
+/// (a writer's whole state at its write) that the receiver already holds, because the receiver's
+/// `witnessed` vector for some origin is low (a restored member is a new origin: everyone's
+/// vector for it starts at 0, so its first pulls replay whole oplogs). The entry brings a life
+/// that a delete killed back to life: the horizon has already collected the delete and the dead
+/// mark, so the join sees a live life nothing kills. In every one of the five, at the join that
+/// brings the life back the receiver's version vector COVERS the entry's stamp (the entry is
+/// already in the receiver), and a node that does not apply an entry its vector covers (the real
+/// protocol's covered-entry skip, `SimFlags::covered_skip`) passes all five. The skip is in the sim's
+/// protocol now (and so is the start-HLC rule, `SimFlags::start_hlc`), the five seeds pass in the
+/// runner like every other, and no failure is known or listed. What is kept is the EVIDENCE:
+/// `the_covered_entry_skip_clears_the_five_seeds_that_fail_without_it` runs them with the skip off (they
+/// fail as listed here) and on (they pass); the mutant `no covered-entry skip` is graded by these runs. It
+/// was a failure of the sim's protocol, not a partition longer than retention (ADR-085, graded by the
+/// unbounded runs), and not the merge state: the same seeds failed on the code before the D7 pass. A
+/// restore is the occasion in four of the five, never the cause (the nested one has none).
+///
+/// | seed | workload | problem | life brought back by the covered entry | restore (lag of its backup) |
+/// |---|---|---|---|---|
+/// | 106  | flat   | visible  | 1 and 8, entries 1 and 8, at horizon 15 | A, lag 49 |
+/// | 1435 | flat   | diverged | 1 and 13, entries 1 and 13, at horizon 19 | B, lag 45 |
+/// | 1551 | flat   | diverged | 1, entry 1, at horizon 10 | A, lag 25 |
+/// | 2006 | flat   | diverged | 1, entry 1, at horizon 8 | A, lag 38 |
+/// | 2396 | nested | visible  | 1, entry 22, at horizon 35 to 40 | none |
+struct SkipEvidence {
+    nested: bool,
+    seed: u64,
+    problems: &'static [&'static str],
+    /// With both rules off, the alive lives every member holds and the alive lives the oracle has, for
+    /// a seed whose resurrection no longer shows as a problem.
+    alive_without: Option<(usize, usize)>,
+}
+
+const COVERED_SKIP_EVIDENCE: [SkipEvidence; 5] = [
+    // Seed 106 showed `visible` before the counter cell. With the cell and the oracle of "no base write had
+    // seen it" the collected life still comes back (three alive lives in every member against the oracle's
+    // one) but the document it brings back coincides with the oracle's, so no problem is graded. A search of
+    // the seeds 0 to 2999 (flat and nested) found no other seed that shows `visible` without the rules.
+    SkipEvidence { nested: false, seed: 106, problems: &[], alive_without: Some((3, 1)) },
+    SkipEvidence { nested: false, seed: 1435, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: false, seed: 1551, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: false, seed: 2006, problems: &["diverged"], alive_without: None },
+    SkipEvidence { nested: true, seed: 2396, problems: &["visible"], alive_without: None },
+];
+
+/// The Ord differential's scripts (the A2.1 model) replayed through the design's writers: no disagreement. (The mutants that
+/// use the scripts as their probe are judged against this first.)
+fn ord_differential(rep: &mut Report) {
+    let f = ord_replay::replay(&Cfg::default_ret().opts);
+    println!(
+        "[Ord differential] {} scripts, {} steps: {} disagreements",
+        f.scripts,
+        f.steps,
+        f.bad.len()
+    );
+    for b in f.bad.iter().take(3) {
+        rep.failures.push(format!("Ord differential: {}", b.lines().next().unwrap_or("")));
+    }
+}
+
+fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize, nested: bool) {
     let t0 = Instant::now();
     let cfg = Cfg::default_ret();
     let mut c = BTreeMap::new();
     let mut gap_max = 0;
     for seed in 0..n {
-        let (o, gap) = run_bounded(seed, &cfg, ret, sync_every, steps);
+        let (o, gap) = run_bounded(seed, &cfg, ret, sync_every, steps, nested);
         gap_max = gap_max.max(gap);
         for e in grade_bounded(&o.nodes, &o.log) {
             bump(&mut c, e, seed);
@@ -154,7 +228,10 @@ fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize) 
     if gap_max >= ret {
         bump(&mut c, format!("clock advance {gap_max} not below RET"), 0);
     }
-    let what = format!("bounded RET={ret}, fixpoint every {sync_every} steps, {steps} steps");
+    let what = format!(
+        "bounded RET={ret}, fixpoint every {sync_every} steps, {steps} steps{}",
+        if nested { ", nested, no restore" } else { "" }
+    );
     println!(
         "[{what}] {n} runs, largest clock advance between fixpoints {gap_max} (< RET): problems {}; {:.2?}",
         fmt_problems(&c),
@@ -169,8 +246,8 @@ fn named_probes(rep: &mut Report) {
     epoch_from_backup.flags.epoch_from_backup = true;
     let d = probes::v4m2_epoch_twice(&design);
     let m = probes::v4m2_epoch_twice(&epoch_from_backup);
-    let ok = d.values().all(|v| *v == kimmy_core::merge_state::Value::Int(125))
-        && m.values().all(|v| *v == kimmy_core::merge_state::Value::Int(105));
+    let ok = d.values().all(|v| *v == kimmy_core::merge_state::Value::Int64(125))
+        && m.values().all(|v| *v == kimmy_core::merge_state::Value::Int64(105));
     println!(
         "[probe V4M2 epoch twice] fresh epoch {d:?}; epoch from the backup {m:?}: {}",
         if ok { "ok" } else { "FAILED" }
@@ -196,9 +273,11 @@ fn named_probes(rep: &mut Report) {
 }
 
 /// B1 and M1 scenarios (a counter that nets to zero; a non-numeric upsert creation value),
-/// graded against the oracle.
+/// graded against the oracle, and the fold scenarios of the counter cell (the four-step case and EG2),
+/// read by value.
 fn scenario_probes(rep: &mut Report) {
-    for (name, problems) in probes::scenarios() {
+    let fold = probes::fold_scenarios_with(&Cfg::default_ret());
+    for (name, problems) in probes::scenarios().into_iter().chain(fold) {
         println!(
             "[scenario {name}]: {}",
             if problems.is_empty() { "ok".to_string() } else { format!("{problems:?}") }
@@ -206,6 +285,27 @@ fn scenario_probes(rep: &mut Report) {
         if !problems.is_empty() {
             rep.failures.push(format!("scenario {name}: {problems:?}"));
         }
+    }
+}
+
+/// The scripts of probes_q3.py (the restore, the idle origin, the late member) with the two rules of Q3
+/// on and off.
+fn q3_probes(rep: &mut Report) {
+    let bad = probes::q3_check();
+    let design = probes::q3_scripts(&Cfg::default_ret());
+    for (name, out) in &design {
+        println!(
+            "[Q3 {name}] design: {}, {} entries handed to A by the pull",
+            if out.clean() { "clean" } else { "NOT CLEAN" },
+            out.delivered
+        );
+    }
+    println!(
+        "[Q3 rules] the skip off brings the collected life back in the idle-origin and late-member scripts; both rules off in the restore; either alone clears it: {}",
+        if bad.is_empty() { "ok".to_string() } else { format!("{bad:?}") }
+    );
+    for b in bad {
+        rep.failures.push(format!("Q3: {b}"));
     }
 }
 
@@ -225,7 +325,10 @@ fn runner() {
     horizon(&mut rep, 300, 4, 24, "horizon");
     named_probes(&mut rep);
     scenario_probes(&mut rep);
-    bounded(&mut rep, 300, 40, 3, 80);
+    q3_probes(&mut rep);
+    ord_differential(&mut rep);
+    bounded(&mut rep, 300, 40, 3, 80, false);
+    bounded(&mut rep, 300, 40, 3, 80, true);
     horizon(&mut rep, 300, 40, 80, "beyond retention (no periodic pulls)");
     horizon(&mut rep, 300, 8, 30, "horizon");
 
@@ -239,14 +342,16 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14) and the B1 and M1 rules (2): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 16, "the mutant list changed");
+    // The design mutants of section 17 (14), the B1 and M1 rules (2), the fold rule of the counter cell (3), the nested rules (8), the rules of Q3
+    // (the covered-entry skip by the vector and by the stamp, the start-HLC rule) and the seven rules of the
+    // writer's feed of the order state (O2): a removed one must be noticed.
+    assert_eq!(mutants::mutants().len(), 37, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
-            (Some(p), true) => format!("KILLED by the runs; probe {p}"),
+            (Some(p), true) => format!("KILLED by the runs [{}]; probe {p}", o.killers),
             (Some(p), false) => format!("KILLED by the probe only: {p}"),
-            (None, true) => "KILLED by the runs".to_string(),
+            (None, true) => format!("KILLED by the runs [{}]", o.killers),
             (None, false) => "SURVIVED".to_string(),
         };
         println!("  {:68} fails {:3}/{}  {how}  [{} ms]", o.name, o.random_fail, o.runs, o.millis);
@@ -258,3 +363,324 @@ fn runner() {
     println!("total wall time {:.2?}", t_all.elapsed());
     assert!(rep.failures.is_empty(), "the runner found problems:\n{}", rep.failures.join("\n"));
 }
+
+/// One fingerprint over every member's state and reads before every step and after the last, for
+/// a fixed set of seeds of the runs the runner grades. It pins the BEHAVIOUR of `merge_state`
+/// (states, bytes, stamps, loss records, visible documents) so that a change that only makes it
+/// cheaper can be shown to change nothing: the figures were taken before the performance pass of
+/// Q7 step 0, and a change to them is a change of behaviour, never to be re-pinned for speed. They
+/// were re-pinned once, when the odd field names (the empty name, `_`, a name with a dot) joined
+/// the workload: the pools grew, the code did not change, and the code before the performance
+/// pass (`8e36e8de`) gives these figures on the new workload as the code after it does.
+#[test]
+fn states_and_reads_match_the_pinned_fingerprints() {
+    let cfg = Cfg::default_ret();
+    let fold = |fp: &mut fingerprint::Fp, ms: &[sim::Node]| {
+        for m in ms {
+            fp.state(m.state(), &m.w.opts);
+            fp.text(&format!("{:?} {:?}", m.w.clock, m.events));
+        }
+    };
+    let random = |rc: RunConfig| {
+        let mut fp = fingerprint::Fp::new();
+        for seed in 0..40 {
+            run_observed(seed, &rc, &cfg, &mut |ms| fold(&mut fp, ms));
+        }
+        fp.value()
+    };
+    let bounded = |sync_every: usize, nested: bool| {
+        let mut fp = fingerprint::Fp::new();
+        for seed in 0..40 {
+            run_bounded_observed(seed, &cfg, 40, sync_every, 80, nested, &mut |ms| {
+                fold(&mut fp, ms)
+            });
+        }
+        fp.value()
+    };
+    let got = [
+        ("restore", random(RunConfig::default())),
+        ("no restore", random(RunConfig { restore: false, ..RunConfig::default() })),
+        ("bound 1000", random(RunConfig { int_bound: Some(1000), ..RunConfig::default() })),
+        ("sequential", random(RunConfig { steps: 14, sequential: true, ..RunConfig::default() })),
+        ("horizon", random(RunConfig { steps: 24, retention: Some(4), ..RunConfig::default() })),
+        ("bounded", bounded(3, false)),
+        ("bounded nested", bounded(3, true)),
+    ];
+    for (name, fp) in got {
+        println!("[fingerprint {name}] {fp:#018x}");
+    }
+    // RE-PINNED for item O2 (the Writer feeds the order state), each fingerprint now folding the compact bytes and
+    // hash of the state WITH its order state and the document in the order the order state gives it:
+    //   restore 0x4efca9449bca3d13 -> 0xd5f2038d6cb64fd0      no restore 0x08ad9af402612aaa -> 0x03c831e729d37118
+    //   bound 1000 0xccecf868d8992847 -> 0xb5d376dace70d755    sequential 0xf5da0966517d1134 -> 0x5cf2b4f670f08b9e
+    //   horizon 0x4173d22962941f92 -> 0xaab8149ae0f8c453       bounded 0xb59997222fd1686f -> 0x6a0197bd2778c8c7
+    //   bounded nested 0x3eb070a76e6956fe -> 0x49b01bf0858bb6cd
+    // (the last had moved once before, in Group A, when a write that only reorders became a write). Before
+    // this commit they left the order state out, and six of the seven were the figures of the code before O2.
+    // RE-PINNED for the counter cell (a slot's absorbed pair, the typed compact spelling, no `obs`): the BYTES
+    // moved and no read did. The same seven runs fold, in a scratch test, only the reads (visible document,
+    // hidden figures, excess, caps, alive lives, ordered document, clock and events of every member before
+    // every step): the figures are identical at 45169322 (before the cell) and after it,
+    //   restore 0x97efdf3f3574b9d6   no restore 0x0ce9f62bfa3c66c8   bound 1000 0xf65d997041ec7783
+    //   sequential 0x566e60b79b81676c   horizon 0x00df956681c1c24c   bounded 0x412e0e245196e033
+    //   bounded nested 0xca3d1972381f336b
+    // and the figures below are those of the full fold:
+    //   restore 0xd5f2038d6cb64fd0 -> 0xff85ad3d5b95647a      no restore 0x03c831e729d37118 -> 0x1d4d18761d99dc46
+    //   bound 1000 0xb5d376dace70d755 -> 0x405c7af0cbda4a1a   sequential 0x5cf2b4f670f08b9e -> 0x66628b9442fa1213
+    //   horizon 0xaab8149ae0f8c453 -> 0x35fe713c19988bed      bounded 0x6a0197bd2778c8c7 -> 0x0ddcbb0a2eb7ebf0
+    //   bounded nested 0x49b01bf0858bb6cd -> 0x95744a329c2b2f5e
+    // RE-PINNED for the implicit map markers (item O4): the writer writes a marker at each absent ancestor, so every
+    // run that writes below an absent map has other cells. The bytes moved, and so did some reads (an emptied map
+    // stays as {}, and an `$unset` of it is then a write); the flat `bounded` run has no absent ancestor and did not move:
+    //   restore 0xff85ad3d5b95647a -> 0x3a6e9028d87f9721      no restore 0x1d4d18761d99dc46 -> 0xa95f8ce408365ff1
+    //   bound 1000 0x405c7af0cbda4a1a -> 0x4da7ddd027fdb0cd   sequential 0x66628b9442fa1213 -> 0x87dffcb22fdb3060
+    //   horizon 0x35fe713c19988bed -> 0xd40a73c20627234b      bounded 0x0ddcbb0a2eb7ebf0 (unchanged)
+    //   bounded nested 0x95744a329c2b2f5e -> 0x0ae6e20a9e5c4125
+    let pinned: [(&str, u64); 7] = [
+        ("restore", 0x3a6e9028d87f9721),
+        ("no restore", 0xa95f8ce408365ff1),
+        ("bound 1000", 0x4da7ddd027fdb0cd),
+        ("sequential", 0x87dffcb22fdb3060),
+        ("horizon", 0xd40a73c20627234b),
+        ("bounded", 0x0ddcbb0a2eb7ebf0),
+        ("bounded nested", 0x0ae6e20a9e5c4125),
+    ];
+    assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
+}
+
+/// The order checks of the runner are not vacuous: over the default workloads a good share of the writes are
+/// compared against the serial reference (read-your-writes order, `order_oracle.rs`), none disagrees, and the
+/// members of every run read one ordered document (graded by `grade`, which also holds the join laws of the
+/// order entries the run reached).
+#[test]
+fn the_read_your_writes_order_is_compared_on_a_good_share_of_the_writes() {
+    let cfg = Cfg::default_ret();
+    let (mut writes, mut compared, mut problems) = (0usize, 0usize, 0usize);
+    for seed in 0..100 {
+        let o = run(seed, &RunConfig::default(), &cfg);
+        assert!(grade(&o.nodes, &o.log).is_empty(), "seed {seed}");
+        writes += o.log.len();
+        for m in &o.nodes {
+            compared += m.order_checks;
+            problems += m.order_problems.len();
+        }
+    }
+    eprintln!(
+        "read-your-writes order: {compared} of {writes} writes compared, {problems} problems"
+    );
+    assert_eq!(problems, 0);
+    assert!(compared * 2 > writes, "{compared} of {writes}");
+}
+
+/// The odd field names (the empty name, `_`, a name with a dot) are in the workload at a rate that
+/// was chosen once (`51dadd66`): a lower bound on the states that hold one, so that a later
+/// reduction of the rate cannot happen quietly (the prop pools have the same guard,
+/// `the_pools_hold_odd_names`). Counted over the members' states after the last step of the first
+/// 100 runs of each workload, at the default configuration (365 states each); the bounds are about
+/// half of the figures measured: flat 70 states with an odd-named register and 73 with an
+/// odd-named slot, nested 84 and 47.
+#[test]
+fn the_sim_workload_holds_odd_names() {
+    let cfg = Cfg::default_ret();
+    let odd = |p: &kimmy_core::merge_state::Path| {
+        p.segments().iter().any(|s| s.is_empty() || s == "_" || s.contains('.'))
+    };
+    for (name, nested, regs_at_least, slots_at_least) in
+        [("flat", false, 35usize, 35usize), ("nested", true, 40usize, 20usize)]
+    {
+        let (mut states, mut with_reg, mut with_slot) = (0usize, 0usize, 0usize);
+        for seed in 0..100 {
+            let out = run(seed, &RunConfig { nested, ..RunConfig::default() }, &cfg);
+            for m in &out.nodes {
+                let st = m.state();
+                states += 1;
+                with_reg += usize::from(st.regs.keys().any(|k| odd(&k.1)));
+                with_slot += usize::from(st.slots.keys().any(|k| odd(&k.1)));
+            }
+        }
+        eprintln!(
+            "{name}: odd names in {with_reg} of {states} states as registers, {with_slot} as slots"
+        );
+        assert!(
+            with_reg > regs_at_least && with_slot > slots_at_least,
+            "{name}: {with_reg} {with_slot}"
+        );
+    }
+}
+
+/// The bounded run of `seed` on the given workload, at the runner's parameters, with the covered-entry
+/// skip and the start-HLC rule as given.
+fn bounded_problems(seed: u64, nested: bool, covered_skip: bool, start_hlc: bool) -> Vec<String> {
+    let mut cfg = Cfg::default_ret();
+    cfg.flags.covered_skip = covered_skip;
+    cfg.flags.start_hlc = start_hlc;
+    let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+    grade_bounded(&o.nodes, &o.log)
+}
+
+/// The alive lives of every member after the bounded run of `seed`, and the oracle's.
+fn alive_lives(
+    seed: u64,
+    nested: bool,
+    covered_skip: bool,
+    start_hlc: bool,
+) -> (Vec<usize>, usize) {
+    let mut cfg = Cfg::default_ret();
+    cfg.flags.covered_skip = covered_skip;
+    cfg.flags.start_hlc = start_hlc;
+    let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+    let (_, alive, _) = oracle::oracle(&o.log, o.nodes[0].ret(), o.nodes[0].bound());
+    (o.nodes.iter().map(|n| n.w.alive().len()).collect(), alive.len())
+}
+
+/// The five seeds that failed before the sim had the Q3 rules fail as listed with both rules off (the sim's
+/// old protocol), and pass with the covered-entry skip alone (the entry's whole vector), with the start-HLC
+/// rule alone for the four restores (not for the nested seed, which has no restore), and with both (the
+/// default). Seed 106 is pinned by the alive lives it still resurrects (see `COVERED_SKIP_EVIDENCE`), not by a problem.
+#[test]
+fn the_covered_entry_skip_clears_the_five_seeds_that_fail_without_it() {
+    for k in &COVERED_SKIP_EVIDENCE {
+        assert_eq!(bounded_problems(k.seed, k.nested, false, false), k.problems, "seed {}", k.seed);
+        if let Some((members, oracle_alive)) = k.alive_without {
+            let (got, want) = alive_lives(k.seed, k.nested, false, false);
+            assert_eq!((got.iter().all(|n| *n == members), want), (true, oracle_alive), "{got:?}");
+            // and with the skip and the start-HLC rule the members hold the oracle's lives
+            let (got, want) = alive_lives(k.seed, k.nested, true, true);
+            assert!(got.iter().all(|n| *n == want), "{got:?} against {want}");
+        }
+        for (skip, start) in [(true, false), (false, true), (true, true)] {
+            // the start-HLC rule alone clears the restores (four flat seeds) but not the nested seed, which has
+            // no restore: START_HLC alone is not the fix (review M1)
+            if k.nested && !skip {
+                assert_eq!(
+                    bounded_problems(k.seed, k.nested, skip, start),
+                    k.problems,
+                    "seed {}",
+                    k.seed
+                );
+                continue;
+            }
+            assert_eq!(
+                bounded_problems(k.seed, k.nested, skip, start),
+                Vec::<String>::new(),
+                "seed {}, skip {skip}, start {start}",
+                k.seed
+            );
+        }
+    }
+}
+
+/// The sweep that found the five seeds, on the default protocol: the bounded runs (RET 40, a fixpoint every 3
+/// steps, 80 steps) of the seeds 0 to 3000 (`Q7_BOUNDED_SEEDS`), flat and nested. No failure is known. By hand.
+#[test]
+#[ignore = "the extended sweep; run by hand"]
+fn the_bounded_runs_of_3000_seeds_pass_on_both_workloads() {
+    let n = env_u64("Q7_BOUNDED_SEEDS", 3000);
+    let cfg = Cfg::default_ret();
+    let mut failing = Vec::new();
+    let (mut writes, mut compared, mut last, mut trailing) = (0usize, 0usize, 0usize, 0usize);
+    let (mut seeds_last, mut seeds_trailing) = (0usize, 0usize);
+    for nested in [false, true] {
+        for seed in 0..n {
+            let (o, _) = run_bounded(seed, &cfg, 40, 3, 80, nested);
+            writes += o.log.len();
+            let (l0, t0) = (last, trailing);
+            for m in &o.nodes {
+                compared += m.order_checks;
+                last += m.order_last_checks;
+                trailing += m.order_trailing_checks;
+            }
+            seeds_last += usize::from(last > l0);
+            seeds_trailing += usize::from(trailing > t0);
+            let ps = grade_bounded(&o.nodes, &o.log);
+            if !ps.is_empty() {
+                failing.push(format!(
+                    "{} seed {seed}: {ps:?}",
+                    if nested { "nested" } else { "flat" }
+                ));
+            }
+        }
+    }
+    println!(
+        "bounded sweep, {n} seeds on each workload: {} failing {failing:?}; read-your-writes: {writes} writes, {compared} compared, \
+         {last} decided the rule \"a new field goes after the fields with a place\", {trailing} of them on a level with a map without a place; seeds exercising the rule {seeds_last}, seeds with such a map {seeds_trailing}",
+        failing.len()
+    );
+    assert!(last > 1000 && seeds_trailing >= 4, "the rule is exercised: {last} {trailing}");
+    assert!(failing.is_empty(), "{failing:?}");
+}
+
+/// The default protocol (the covered-entry skip and the start-HLC rule on) passes the five seeds.
+macro_rules! bounded_seed {
+    ($name:ident, $nested:expr, $seed:expr) => {
+        #[test]
+        fn $name() {
+            let cfg = Cfg::default_ret();
+            assert!(cfg.flags.covered_skip && cfg.flags.start_hlc);
+            let (o, _) = run_bounded($seed, &cfg, 40, 3, 80, $nested);
+            assert_eq!(grade_bounded(&o.nodes, &o.log), Vec::<String>::new());
+        }
+    };
+}
+
+bounded_seed!(bounded_flat_seed_106, false, 106);
+bounded_seed!(bounded_flat_seed_1435, false, 1435);
+bounded_seed!(bounded_flat_seed_1551, false, 1551);
+bounded_seed!(bounded_flat_seed_2006, false, 2006);
+bounded_seed!(bounded_nested_seed_2396, true, 2396);
+
+/// Four nested seeds of the bounded runs that the first version of the read-your-writes oracle got wrong (found by the
+/// 3,000-seed sweep). The oracle said a field a write creates is the last of its level; in these a map `a` is visible through
+/// a surviving child alone (a replace by C unset it, and its child `a.d`, written by someone C had not heard from, survived), has
+/// no place, and trails every field that has one, so a field created afterwards goes BEFORE it. The model agrees (the traces
+/// of the four runs, replayed through model6.py, give the same order after every event: `born_of(a)` is `None`, and
+/// `okey` puts a child without a born last), and the oracle now says so. Each seed also decides the rule on a level with such a map.
+macro_rules! trailing_seed {
+    ($name:ident, $seed:expr) => {
+        #[test]
+        fn $name() {
+            let cfg = Cfg::default_ret();
+            let (o, _) = run_bounded($seed, &cfg, 40, 3, 80, true);
+            let why: Vec<String> = o.nodes.iter().flat_map(|m| m.order_problems.clone()).collect();
+            assert_eq!(grade_bounded(&o.nodes, &o.log), Vec::<String>::new(), "{why:?}");
+            let trailing: usize = o.nodes.iter().map(|m| m.order_trailing_checks).sum();
+            assert!(
+                trailing > 0,
+                "the seed no longer reaches a level with a map that has no place"
+            );
+        }
+    };
+}
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1080, 1080);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_1357, 1357);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2626, 2626);
+trailing_seed!(a_new_field_goes_before_a_map_without_a_place_nested_seed_2654, 2654);
+
+/// Nine seeds of the bounded runs (flat 912 and 2518, nested 380, 861, 1128, 1815, 1840, 2663, 2979) where a field is created again
+/// and the third part of the read-your-writes oracle ("a field the write creates goes after the fields that have a place") once
+/// needed an exclusion for a field with history. The model agrees with the Writer on all nine (the traces, replayed through
+/// model6.py with the implicit markers on, give the same ordered document after every event). The cause, read in seed 912: C's
+/// replace names `x` and `n`, writes no cell for `x` because its value is unchanged, and B's older replace unsets `x`; the
+/// replace's place for `x` stands, so C's later `$inc x` creates the field FIRST, at the place the replace gave it. The oracle
+/// now restates that rule from the log (`order_oracle::places`: what each write named, unset and marked, in the writer's causal
+/// past and life) and has no exclusion; these seeds pass with it.
+macro_rules! history_seed {
+    ($name:ident, $nested:expr, $seed:expr) => {
+        #[test]
+        fn $name() {
+            let cfg = Cfg::default_ret();
+            let (o, _) = run_bounded($seed, &cfg, 40, 3, 80, $nested);
+            let why: Vec<String> = o.nodes.iter().flat_map(|m| m.order_problems.clone()).collect();
+            assert_eq!(grade_bounded(&o.nodes, &o.log), Vec::<String>::new(), "{why:?}");
+        }
+    };
+}
+history_seed!(a_field_created_again_keeps_its_place_flat_seed_912, false, 912);
+history_seed!(a_field_created_again_keeps_its_place_flat_seed_2518, false, 2518);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_380, true, 380);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_861, true, 861);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_1128, true, 1128);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_1815, true, 1815);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_1840, true, 1840);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_2663, true, 2663);
+history_seed!(a_field_created_again_keeps_its_place_nested_seed_2979, true, 2979);
