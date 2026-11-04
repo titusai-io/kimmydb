@@ -1,0 +1,3 @@
+The vendored reference model of the Q6 swap harness: the model of record, byte for byte from the model tree (kimmydb-reviews-0470-0480/q6v2-model).
+40a44c8838f55988cda48c7f296edb13a759803d1790d812888126275d948084  swapmodel6a.py  (v6 base: rule B, the product's grant, the seed-885 rule, the split oracle, the interleaved replay, the open-refusal-at-end check; REPORT6.md and REPORT6-addendum.md)
+The sha256 of the file is checked by a Rust test (main.rs, `the_vendored_model_is_the_reviewed_one`).
