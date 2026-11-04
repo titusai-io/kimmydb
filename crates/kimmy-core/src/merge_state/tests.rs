@@ -1484,6 +1484,30 @@ fn decode_refuses_totals_past_the_bound() {
     }
     try_state(&bad);
     assert_eq!(hit, 3, "each copy of a total was exercised");
+    // The version 1 half. A state with a pair or an order state has no version 1 spelling, so the three copies above reach
+    // the version 1 reader only through the slot total. A copy with neither (the pair dropped, no order state) holds every
+    // other copy of a total in a state version 1 can spell, so that a future split of the shared reader (`R::total`) for
+    // the generation's `seen` or for a loss cannot slip.
+    let mut v1good = good.without_ords();
+    for s in v1good.slots.values_mut() {
+        s.absorbed = None;
+    }
+    assert!(v1good.v1_can_hold());
+    assert_eq!(MergeState::decode(&v1good.encode()).unwrap(), v1good);
+    let mut bad = v1good.clone();
+    for r in bad.regs.values_mut() {
+        if let Some(g) = r.generation.as_mut() {
+            g.seen.insert((g.stamp, wid('A', 0), None), big.into());
+        }
+    }
+    assert!(bad.v1_can_hold(), "a generation's seen is spelled by version 1");
+    assert_eq!(MergeState::decode(&bad.encode()), Err(DecodeError::TotalOutOfRange));
+    let mut bad = v1good.clone();
+    for v in bad.losses.values_mut() {
+        *v = LossValue::Total(big.into());
+    }
+    assert!(bad.v1_can_hold(), "a loss total is spelled by version 1");
+    assert_eq!(MergeState::decode(&bad.encode()), Err(DecodeError::TotalOutOfRange));
 }
 
 #[test]

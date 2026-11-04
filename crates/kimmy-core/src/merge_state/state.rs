@@ -387,7 +387,7 @@ impl MergeState {
     ///
     /// THE ABSORBED PAIR of a slot (the counter cell). A slot is `(stamp, total)` and an optional
     /// `absorbed` `(stamp, total)`: the highest state of this very slot that a base write had
-    /// held. Five clauses one state can show (items 24 to 28); item 29 says what is NOT checked of a decimal total, and 30 is the version 1 form:
+    /// held. Five clauses are checked (items 24 to 28); item 29 says what is NOT checked of a decimal total, item 31 what else is NOT checked, and 30 is the version 1 form:
     ///
     /// 24. The absorbed stamp is not above the slot's ([`DecodeError::AbsorbedAboveSlot`]). A base
     ///     write absorbs what its writer holds, and a slot only moves forward, so the pair is the
@@ -442,7 +442,7 @@ impl MergeState {
     ///     the 16 bytes of every typed total as they are (slot, pair, `seen`, loss alike), the bytes
     ///     survive a round trip, the totals are compared byte for byte (so a pair that differs from
     ///     its slot at the slot's own stamp is refused, `AbsorbedTotalMismatch`, whatever the
-    ///     class), and the reads (`dec_raw_bits`) take any pattern as the value it denotes (a NaN as
+    ///     class), and the reads (`counter::dec_raw`, which calls `decimal::decode_raw_bits`) take any pattern as the value it denotes (a NaN as
     ///     the one NaN). Tests: `the_writer_takes_nan_infinite_and_non_canonical_decimal_operands`
     ///     (the Writer side) and
     ///     `a_nan_or_non_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot`
@@ -456,6 +456,14 @@ impl MergeState {
     ///     the slots' absorbed pairs now, which version 1 cannot spell, so a non-empty count is
     ///     not the encoding of any state. Checked by the version 1 reader, not by `check_decoded`
     ///     (a decoded state has no `obs` to show it).
+    ///
+    /// 31. NOT checked, NOT relied on: other single-state shapes that honest writers keep and that nothing
+    ///     reads as an error. Two are known: a slot whose key's generation stamp is above the slot's own
+    ///     stamp and above its pair's, and a register whose generation stamp is above the register's own
+    ///     stamp. `check_decoded` accepts both. The list is not complete and is not meant to be: the join
+    ///     and the reads are defined for any values (item 23), the hand-built Closed mode draws generations
+    ///     freely, and a clause is added only when a state it refuses cannot be produced and something
+    ///     would read it wrongly.
     ///
     /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
     pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {

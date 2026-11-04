@@ -1111,7 +1111,7 @@ fn a_dangling_seen_key_survives_a_numeric_base_and_ends_with_a_non_numeric_one()
 /// the pair is accepted exactly as the slot is: the bytes survive a round trip untouched, and a pair
 /// that differs from the slot at the slot's own stamp is refused by its bytes (the totals are
 /// compared byte for byte, `Num::eq`), a NaN with another payload included. The reads
-/// (`dec_raw_bits`) take any bit pattern, a NaN as the one NaN, and do not panic.
+/// (`counter::dec_raw`, which calls `decimal::decode_raw_bits`) take any bit pattern, a NaN as the one NaN, and do not panic.
 #[test]
 fn a_nan_or_non_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot() {
     let raw = |bits: u128| Num::Decimal128(bits.to_le_bytes());
