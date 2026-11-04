@@ -1,7 +1,7 @@
 """Differential test of the Rust `merge_state` module against the Python reference model: the
 script generator and the expected answers.
 
-Drives the reference model (model5.py, with pullmodel5.Node's normalised `finish`) through random
+Drives the reference model (model6.py, the vendored A2.3 model, with pullmodel6.Node's normalised `finish`) through random
 operation scripts and writes, for every step, what the Rust side (tests/merge_state_diff.rs) must
 reproduce:
 
@@ -15,7 +15,7 @@ reproduce:
     hidden figure, killed-and-superseded groups, and the stale/unsound verdicts on member 0's records).
 
 Implements the Q7 design document (field-level merge with summing $inc counters and conflictResolved,
-v7.2) by running its reference model; see model5.py.
+v7.2) by running its reference model; see model6.py and MODEL-HASHES.txt.
 
 Usage (standard library only):
   python3 -I q7diff_gen.py <out-dir> <n-scripts> [first-seed] [--plant NAME]
@@ -37,58 +37,58 @@ sys.path.insert(0, HERE)
 import model6 as M  # noqa: E402
 
 
-def _bits(x):
-    return struct.pack(">d", x) if isinstance(x, float) else x
+# The vendored `same()` is the diff the Rust side uses (bit pattern for doubles, representation for Decimal128, type strict): the
+# harness no longer patches it; it asserts what it relies on. (The scripts draw no NaN and no Dec128; the Rust side tests both.)
+_nan1 = struct.unpack(">d", bytes.fromhex("7ff8000000000001"))[0]
+_nan2 = struct.unpack(">d", bytes.fromhex("7ff8000000000002"))[0]
+assert M.same(0.0, 0.0) and not M.same(0.0, -0.0)
+assert M.same(_nan1, _nan1) and not M.same(_nan1, _nan2)
+assert M.same(M.Dec128("1.0"), M.Dec128("1.0")) and not M.same(M.Dec128("1.0"), M.Dec128("1.00"))
+assert not M.same(M.Dec128("1"), "1") and not M.same(1, 1.0)
+# the harness runs the model as the Rust side is today: no absorbed cell yet, no implicit map marker yet
+M.ABSORBED = False
+M.NO_IMPLICIT_MARKER = True
 
 
-def same_by_bits(a, b):
-    """The diff, as ruled 2026-11-03: a no-op is a write that leaves the stored representation
-    byte-identical, so doubles compare by bit pattern (0.0 is not -0.0; a NaN is its own bits).
-    model5.py itself is vendored as it was and compares them as numbers, so the harness replaces
-    its `same` here, for the scripts and for the replay."""
-    return type(a) is type(b) and _bits(a) == _bits(b)
+def _x(v):
+    """A value as something that tells apart what the repr strings of `canon()` do not: the bits of a double (a NaN payload, -0.0),
+    a Dec128 from the plain string of the same text."""
+    if isinstance(v, float):
+        return ("f", struct.pack(">d", v).hex())
+    if isinstance(v, tuple):
+        return ("t", tuple(_x(e) for e in v))
+    if isinstance(v, dict):
+        return ("d", tuple((k, _x(e)) for k, e in v.items()))
+    return (type(v).__name__, v)
 
 
-# KimmyDB keeps the cohort member visible (2.30 and 2.3 differ,
-# crates/kimmy-query/src/decimal_arith_tests.rs:32); doubles compare by bit pattern; a no-op is a
-# write that leaves the stored representation byte-identical (manager ruling 2026-11-03); do not
-# "fix" this back to numeric equality.
-M.same = same_by_bits
+def exact(st):
+    """The state, compared exactly: `canon()` plus the register and loss values by their bits (never through repr strings alone)."""
+    return (st.canon(), tuple(sorted((repr(k), _x(r[1])) for k, r in st.regs.items())),
+            tuple(sorted((repr(k), _x(v)) for k, v in st.losses.items())))
 
 M64 = (1 << 64) - 1
 I64_MAX = 2 ** 63 - 1
 
 
 # ---------------------------------------------------------------------------------------------
-# the model, as pullmodel5.Node runs it, without the oplog
+# the model, as pullmodel6.Node runs it, without the oplog
 # ---------------------------------------------------------------------------------------------
 class D(M.Member):
     def finish(self, st, log, meta):
         s = self.state
         s.vv[st[1]] = st[0]
-        s, _ = M.join(s, M.State())          # pullmodel5.NORMALIZE_WRITES
+        s, _ = M.join(s, M.State())          # pullmodel6.NORMALIZE_WRITES
         self.state = s
         s.contained = s.contained | {st}
         log[st] = (frozenset(s.contained - {st}), meta)
         return st
 
-    def write(self, op, p, arg, log, skew=0):
-        # A no-op writes nothing: an `$inc` of a double base is a register write, and one whose
-        # result is the stored representation byte for byte (`1e300 + 1`, `$inc 0`) changes nothing.
-        # model5.py (vendored as it was) turns it into an unconditional `set`; model6.py and the
-        # ruling of 2026-11-03 make it a no-op, as the Rust side does, so the harness applies it here.
-        if op == "inc":
-            vis = self.state.visible()
-            cur = vis.get(p) if vis is not None else None
-            if isinstance(cur, float) and same_by_bits(cur, cur + arg):
-                return None
-        return super().write(op, p, arg, log, skew)
-
     def absorb(self, other):
         before = self.state
         merged, fresh = M.join(before, other)
         self.clock = max([self.clock] + list(merged.vv.values()))
-        changed = merged.canon() != before.canon()
+        changed = exact(merged) != exact(before)
         self.state = merged
         return changed, fresh
 
@@ -730,14 +730,14 @@ def run_script(sc, dump_canon=False):
                 ms[m].epoch = ep
                 res = True
         steps.append({"res": res, "after": snap(ms, log)})
-    # final full-mesh sync (model5.sync over whole states)
+    # final full-mesh sync (whole states)
     for _ in range(12):
-        before = [m.state.canon() for m in ms]
+        before = [exact(m.state) for m in ms]
         for r in ms:
             for s in ms:
                 if r is not s:
                     r.absorb(s.state.copy())
-        if [m.state.canon() for m in ms] == before:
+        if [exact(m.state) for m in ms] == before:
             break
     fin = {"after": snap(ms, log)}
     if dump_canon:
@@ -755,7 +755,7 @@ def run_script(sc, dump_canon=False):
         "have": [jk(k) for k in have],
         "stale": sorted([jk(k) for k in M.stale_records(set(have), log)]),
         "unsound": [jk(k) for k in have if not M.sound_record(k, log, alive, dels)],
-        "converged": len({m.state.canon() for m in ms}) == 1,
+        "converged": len({repr(exact(m.state)) for m in ms}) == 1,
         "log": len(log),
     }
     return {"steps": steps, "final": fin}
