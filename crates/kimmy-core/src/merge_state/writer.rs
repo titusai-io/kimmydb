@@ -1447,13 +1447,34 @@ impl Writer {
             })
             .collect();
         let ops = &ops[..];
-        for (i, a) in ops.iter().enumerate() {
-            for b in &ops[i + 1..] {
-                let (a, b) = (a.path(), b.path());
-                if a == b || a.is_below(b) || b.is_below(a) {
-                    return Err(UpdateRefused::Overlap(a.clone(), b.clone()));
-                }
+        // Overlap (a path equal to or below another) in O(n log n). The pairwise loop reported the first operator that
+        // overlaps a LATER one, with the first such later operator. Going from the last operator to the first with the set
+        // of the later paths, an operator overlaps a later one iff the set holds its path, a prefix of it, or (the paths
+        // sort a prefix before its extensions) its first successor is below it; the first such operator is found in
+        // O(n log n), and its partner in one more pass.
+        let mut later: BTreeSet<&Path> = BTreeSet::new();
+        let mut first = None;
+        for (i, op) in ops.iter().enumerate().rev() {
+            let p = op.path();
+            if later.contains(p)
+                || p.ancestors().any(|a| later.contains(&a))
+                || later
+                    .range::<Path, _>((std::ops::Bound::Included(p), std::ops::Bound::Unbounded))
+                    .next()
+                    .is_some_and(|q| q.is_below(p))
+            {
+                first = Some(i);
             }
+            later.insert(p);
+        }
+        if let Some(i) = first {
+            let a = ops[i].path();
+            let b = ops[i + 1..]
+                .iter()
+                .map(UpdateOp::path)
+                .find(|b| a == *b || a.is_below(b) || b.is_below(a))
+                .expect("the operator overlaps a later one");
+            return Err(UpdateRefused::Overlap(a.clone(), b.clone()));
         }
         let vis = self.visible().ok_or(UpdateRefused::NoLife)?;
         let (mut eff, mut items) = (Eff::default(), Items::new());
