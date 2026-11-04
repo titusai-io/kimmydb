@@ -191,6 +191,21 @@ const COVERED_SKIP_EVIDENCE: [SkipEvidence; 5] = [
     SkipEvidence { nested: true, seed: 2396, problems: &["visible"] },
 ];
 
+/// The Ord differential's scripts (the A2.1 model) replayed through the design's writers: no disagreement. (The mutants that
+/// use the scripts as their probe are judged against this first.)
+fn ord_differential(rep: &mut Report) {
+    let f = ord_replay::replay(&Cfg::default_ret().opts);
+    println!(
+        "[Ord differential] {} scripts, {} steps: {} disagreements",
+        f.scripts,
+        f.steps,
+        f.bad.len()
+    );
+    for b in f.bad.iter().take(3) {
+        rep.failures.push(format!("Ord differential: {}", b.lines().next().unwrap_or("")));
+    }
+}
+
 fn bounded(rep: &mut Report, n: u64, ret: u64, sync_every: usize, steps: usize, nested: bool) {
     let t0 = Instant::now();
     let cfg = Cfg::default_ret();
@@ -302,6 +317,7 @@ fn runner() {
     named_probes(&mut rep);
     scenario_probes(&mut rep);
     q3_probes(&mut rep);
+    ord_differential(&mut rep);
     bounded(&mut rep, 300, 40, 3, 80, false);
     bounded(&mut rep, 300, 40, 3, 80, true);
     horizon(&mut rep, 300, 40, 80, "beyond retention (no periodic pulls)");
