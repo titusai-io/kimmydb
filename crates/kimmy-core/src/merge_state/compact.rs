@@ -17,7 +17,8 @@
 //!
 //! * a count or length is a LEB128 varint of a `u64`, written in its shortest form;
 //! * a counter total is a PAYLOAD: the zigzag of the `i128` as a LEB128 varint of a `u128`, shortest
-//!   form, for an `Int64` or an `Int32` amount, the 16 bytes for a `Decimal128`. Its TYPE is
+//!   form, for an `Int64` or an `Int32` amount, the 16 bytes of a canonical word for a `Decimal128` (any other is
+//!   `NotCanonicalDecimal`, inventory item 29 of `check_decoded`). Its TYPE is
 //!   spelled beside it: in the flag byte of a slot (section 7), and as a leading TYPE BYTE (0 `Int64`,
 //!   1 `Int32`, 2 `Decimal128`, any other byte refused) on every total that has no flag byte, a
 //!   generation's `seen` entry and the total of a loss record. A typed total is the type byte and
@@ -796,7 +797,14 @@ impl R<'_> {
         match ty {
             0 => Ok(Num::Int64(Self::zigzag(self.varint(19)?)?)),
             1 => Ok(Num::Int32(Self::zigzag(self.varint(19)?)?)),
-            _ => Ok(Num::Decimal128(self.arr()?)),
+            _ => {
+                let n = Num::Decimal128(self.arr()?);
+                // the bytes `pack_raw` writes: the only decimals a writer's slot, pair, `seen` or loss can hold
+                if !n.is_canonical() {
+                    return Err(DecodeError::NotCanonicalDecimal);
+                }
+                Ok(n)
+            }
         }
     }
     fn str(&mut self) -> Result<String, DecodeError> {

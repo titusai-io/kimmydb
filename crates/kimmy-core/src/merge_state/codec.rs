@@ -92,6 +92,8 @@ pub enum DecodeError {
     SlotWriterMismatch,
     #[error("merge state: a slot's absorbed total is of a wider type than the slot's own")]
     AbsorbedWiderThanSlot,
+    #[error("merge state: a Decimal128 total is not one a writer produces (not canonical)")]
+    NotCanonicalDecimal,
     #[error("merge state: an order entry is for a life that `lives` does not list")]
     OrdLifeNotListed,
     #[error("merge state: an order entry holds a candidate its floor voids")]

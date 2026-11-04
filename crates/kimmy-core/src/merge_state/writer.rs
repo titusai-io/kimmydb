@@ -1151,7 +1151,9 @@ impl Writer {
         // `Int64` check above is on the saturated visible value, which does not bound the sum
         // under it: refuse the `$inc` that would carry the slot past `MAX_TOTAL`.
         let mut total = match self.state.slots.get(&key) {
-            None => op,
+            // the writer's first amount at the path is what the product stores for `$inc` on an absent field
+            // (`0 + operand`, canonical), never the operand's own bytes
+            None => op.first_amount(),
             Some(s) => counter::sum_checked(&s.total, &op).ok_or_else(out_of_range)?,
         };
         if total.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) {
@@ -1286,8 +1288,9 @@ impl Writer {
         if key.stamp.hlc < self.horizon() || self.state.losses.contains_key(&key) {
             return false;
         }
-        // A total past `MAX_TOTAL` is one `decode` refuses: never store a state that cannot be read back.
-        if matches!(val, LossValue::Total(t) if t.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()))
+        // A total past `MAX_TOTAL`, or a decimal no writer produces, is one `decode` refuses: never store a state that
+        // cannot be read back.
+        if matches!(val, LossValue::Total(t) if t.int().is_some_and(|v| v.unsigned_abs() > MAX_TOTAL.unsigned_abs()) || !t.is_canonical())
         {
             return false;
         }
