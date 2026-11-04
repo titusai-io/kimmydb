@@ -419,6 +419,17 @@ fn the_slot_flag_byte_spells_the_pair_and_both_types() {
         state.vv.insert(writer_a(), h(9));
         let want = hand_slot_bytes(&want_tail);
         assert_eq!(state.encode_compact(), want, "{name}");
+        // the form spells a pair wider than its slot (an Int32 slot with a Decimal128 pair), and
+        // decode then refuses it by the type clause (item 28 of the inventory): only the bytes
+        // are under test here
+        if sl.absorbed.as_ref().is_some_and(|a| a.1.label() > sl.total.label()) {
+            assert_eq!(
+                MergeState::decode_compact(&want),
+                Err(DecodeError::AbsorbedWiderThanSlot),
+                "{name}"
+            );
+            continue;
+        }
         let back = MergeState::decode_compact(&want).unwrap_or_else(|e| panic!("{name}: {e:?}"));
         assert_eq!(back, state, "{name}");
         assert_eq!(back.slots.values().next().unwrap(), &sl, "{name}: the types survive");
@@ -701,6 +712,140 @@ fn decode_refuses_an_absorbed_stamp_by_another_writer_than_the_slots_key() {
     refuses(&s, DecodeError::AbsorbedWriterMismatch);
 }
 
+/// Item 27 of the inventory: the slot's OWN stamp is by the writer of its key, like the pair's. A
+/// slot of A's key stamped by B was accepted before, with no pair, with a pair by A, and refused
+/// only with a pair by B (as the pair's mismatch).
+#[test]
+fn decode_refuses_a_slot_stamped_by_another_writer_than_its_key() {
+    let key = (st(1, 'A'), p("x"), wid('A', 0), None);
+    let mut s = MergeState::default();
+    s.lives.insert(st(1, 'A'), upsert_life());
+    s.vv.insert(wid('A', 0), h(9));
+    s.vv.insert(wid('B', 0), h(9));
+    // no pair
+    s.slots.insert(key.clone(), Slot { stamp: st(5, 'B'), total: 3.into(), absorbed: None });
+    assert_eq!(s.check_decoded(), Err(DecodeError::SlotWriterMismatch));
+    refuses(&s, DecodeError::SlotWriterMismatch);
+    // a pair by the key's writer, below the slot
+    s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'A'), 1.into()));
+    refuses(&s, DecodeError::SlotWriterMismatch);
+    // a pair by the slot stamp's writer: the slot's refusal comes first
+    s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'B'), 1.into()));
+    refuses(&s, DecodeError::SlotWriterMismatch);
+    // another epoch of the key's node is another writer
+    let mut s = paired();
+    s.slots.values_mut().for_each(|x| x.stamp = MStamp { hlc: h(5), writer: wid('A', 1) });
+    s.vv.insert(wid('A', 1), h(5));
+    s.slots.values_mut().for_each(|x| x.absorbed = None);
+    refuses(&s, DecodeError::SlotWriterMismatch);
+    // the slot of a key of B, stamped by B, is accepted (with and without a pair), and by A refused
+    let mut s = MergeState::default();
+    s.lives.insert(st(1, 'A'), upsert_life());
+    s.vv.insert(wid('A', 0), h(9));
+    s.vv.insert(wid('B', 0), h(9));
+    let key = (st(1, 'A'), p("x"), wid('B', 0), None);
+    s.slots.insert(key.clone(), Slot { stamp: st(5, 'B'), total: 7.into(), absorbed: None });
+    accepts(&s);
+    s.slots.get_mut(&key).unwrap().absorbed = Some((st(3, 'B'), 4.into()));
+    accepts(&s);
+    s.slots.get_mut(&key).unwrap().stamp = st(5, 'A');
+    refuses(&s, DecodeError::SlotWriterMismatch);
+    // a stamp by the key's writer with the pair by another is still the pair's refusal
+    let mut s = paired();
+    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(3, 'B'), 4.into())));
+    s.vv.insert(wid('B', 0), h(3));
+    refuses(&s, DecodeError::AbsorbedWriterMismatch);
+}
+
+/// Item 28 of the inventory: a pair's type label is not wider than its slot's, in the order
+/// `Int32 < Int64 < Decimal128` (the label as spelled, not the promoted kind).
+#[test]
+fn decode_refuses_an_absorbed_total_of_a_wider_type_than_the_slot() {
+    // the slot (5, A) with `slot` as its total, the pair (3, A) with `pair`
+    let with = |slot: Num, pair: Num| {
+        let mut s = paired();
+        s.slots.values_mut().for_each(|x| {
+            x.total = slot;
+            x.absorbed = Some((st(3, 'A'), pair));
+        });
+        s
+    };
+    let (i32n, i64n, d) = (Num::Int32(4), Num::Int64(4), dec("4"));
+    // the reviewer's case: an Int64 slot with a Decimal128 pair read as a Decimal128
+    refuses(&with(i64n, d), DecodeError::AbsorbedWiderThanSlot);
+    refuses(&with(i32n, d), DecodeError::AbsorbedWiderThanSlot);
+    refuses(&with(i32n, i64n), DecodeError::AbsorbedWiderThanSlot);
+    // the same label, and every narrower pair, is accepted
+    for (slot, pair) in
+        [(i32n, i32n), (i64n, i64n), (d, d), (i64n, i32n), (d, i32n), (d, i64n), (d, dec("4.00"))]
+    {
+        accepts(&with(slot, pair));
+    }
+    // the label, not the kind: an Int32 amount outside the i32 range is an Int32 label (its kind is
+    // Int64, but a writer that keeps adding Int32s keeps the label), so an Int64 pair is wider
+    let big = Num::Int32(1 << 40);
+    accepts(&with(big, Num::Int32(5)));
+    refuses(&with(big, Num::Int64(5)), DecodeError::AbsorbedWiderThanSlot);
+    assert_eq!(with(i64n, d).check_decoded(), Err(DecodeError::AbsorbedWiderThanSlot));
+    // at the slot's own stamp the totals are equal, so the labels are: the type clause never
+    // reports what the total clause does
+    let mut s = paired();
+    s.slots.values_mut().for_each(|x| {
+        x.total = i64n;
+        x.absorbed = Some((st(5, 'A'), d));
+    });
+    refuses(&s, DecodeError::AbsorbedTotalMismatch);
+    // the clauses before it keep their verdicts
+    let mut s = with(i64n, d);
+    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(6, 'A'), d)));
+    refuses(&s, DecodeError::AbsorbedAboveSlot);
+}
+
+/// The honest relation, from writers: the slot's label only widens across its writer's writes and
+/// the pair keeps the label the slot had when a base write absorbed it, so every state of an
+/// Int32 / Int64 / Decimal128 history decodes.
+#[test]
+fn every_state_of_a_typed_history_decodes() {
+    let o = opts();
+    let x = p("x");
+    let mut w = Writer::new(wid('A', 0), o.clone());
+    let mut states = Vec::new();
+    w.insert(&fl(&[("x", Value::Int32(1))]), 0).unwrap();
+    states.push(w.state.clone());
+    for step in 0..3 {
+        w.write_set(&x, Value::Int32(step), 0).unwrap();
+        w.write_inc_value(&x, &Value::Int32(i32::MAX), 0).unwrap();
+        states.push(w.state.clone());
+        w.write_set(&x, Value::Int32(step), 0).unwrap();
+        states.push(w.state.clone());
+        w.write_inc_value(&x, &Value::Int64(1 << 40), 0).unwrap();
+        states.push(w.state.clone());
+        w.write_set(&x, s("base"), 0).unwrap();
+        states.push(w.state.clone());
+    }
+    w.write_set(&x, Value::Int32(1), 0).unwrap();
+    w.write_inc_value(&x, &dval("2.5"), 0).unwrap();
+    states.push(w.state.clone());
+    w.write_set(&x, Value::Int64(9), 0).unwrap();
+    states.push(w.state.clone());
+    w.write_inc_value(&x, &dval("1"), 0).unwrap();
+    states.push(w.state.clone());
+    // the widest label a pair ever had was below the slot's
+    let widths: BTreeSet<_> = states
+        .iter()
+        .flat_map(|s| s.slots.values())
+        .filter_map(|sl| sl.absorbed.as_ref().map(|a| (a.1.label(), sl.total.label())))
+        .collect();
+    assert!(
+        widths.iter().any(|(a, t)| a < t),
+        "a history with a pair narrower than its slot: {widths:?}"
+    );
+    for state in &states {
+        assert_eq!(state.check_decoded(), Ok(()));
+        accepts(state);
+    }
+}
+
 /// `check_decoded` is what `decode_compact` runs, so the state itself gives the same verdicts.
 #[test]
 fn the_new_refusals_are_the_verdicts_of_check_decoded() {
@@ -710,6 +855,12 @@ fn the_new_refusals_are_the_verdicts_of_check_decoded() {
     let mut s = paired();
     s.slots.values_mut().for_each(|x| x.absorbed = Some((st(5, 'A'), 8.into())));
     assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedTotalMismatch));
+    let mut s = paired();
+    s.slots.values_mut().for_each(|x| x.stamp = st(5, 'B'));
+    assert_eq!(s.check_decoded(), Err(DecodeError::SlotWriterMismatch));
+    let mut s = paired();
+    s.slots.values_mut().for_each(|x| x.absorbed = Some((st(3, 'A'), dec("1"))));
+    assert_eq!(s.check_decoded(), Err(DecodeError::AbsorbedWiderThanSlot));
     assert_eq!(paired().check_decoded(), Ok(()));
 }
 

@@ -88,6 +88,10 @@ pub enum DecodeError {
     AbsorbedTotalMismatch,
     #[error("merge state: a slot's absorbed stamp is not by the writer of the slot's key")]
     AbsorbedWriterMismatch,
+    #[error("merge state: a slot's own stamp is not by the writer of the slot's key")]
+    SlotWriterMismatch,
+    #[error("merge state: a slot's absorbed total is of a wider type than the slot's own")]
+    AbsorbedWiderThanSlot,
     #[error("merge state: an order entry is for a life that `lives` does not list")]
     OrdLifeNotListed,
     #[error("merge state: an order entry holds a candidate its floor voids")]

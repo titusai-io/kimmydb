@@ -128,6 +128,17 @@ impl Num {
         }
     }
 
+    /// The type LABEL, as written (and as the compact form spells it): unlike [`Num::kind`], an
+    /// `Int32` amount outside the `i32` range stays an `Int32`. A slot's label only widens
+    /// (`Int32 < Int64 < Decimal128`) across the writes of its writer, see `check_decoded`.
+    pub(super) fn label(&self) -> Kind {
+        match self {
+            Num::Int32(_) => Kind::Int32,
+            Num::Int64(_) => Kind::Int64,
+            Num::Decimal128(_) => Kind::Decimal128,
+        }
+    }
+
     /// The integer, for an integer amount.
     pub fn int(&self) -> Option<i128> {
         match self {

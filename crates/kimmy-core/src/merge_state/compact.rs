@@ -129,8 +129,10 @@
 //!   the field is present when the slot moved since the pair's stamp (B1). The pair is keyed by the
 //!   slot, joined by the higher absorbed stamp, and dropped with the slot's life. It replaces the
 //!   per-register `obs` map. A state that has a pair has no version 1 spelling (`V1CannotHold`).
-//!   A decoded pair is refused above its slot (`AbsorbedAboveSlot`) and, at the slot's own stamp,
-//!   with another total (`AbsorbedTotalMismatch`). The provisional `ESCAPE` of the typed counters is
+//!   A decoded pair is refused above its slot (`AbsorbedAboveSlot`), at the slot's own stamp
+//!   with another total (`AbsorbedTotalMismatch`), by another writer than its slot's key
+//!   (`AbsorbedWriterMismatch`), and of a wider type than its slot (`AbsorbedWiderThanSlot`); a
+//!   slot stamped by another writer than its key is refused too (`SlotWriterMismatch`). The provisional `ESCAPE` of the typed counters is
 //!   gone: the type has a place of its own in the flag byte and the type byte.
 //! * **Map markers and type clashes**: tag 5 (the explicit marker) is in use, with loss kinds 4
 //!   and 5 (`typeClash`, `arrayClash`); tag 6 (the implicit marker) is reserved for the write
