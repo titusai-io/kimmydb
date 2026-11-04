@@ -35,10 +35,10 @@
 //! `reference_model/q7diff_gen6.py`, at `ODD_LEAVES`.
 //!
 //! `Q7DIFF_NESTED_RUNS=<n>` sets the number of scripts (default 300). `python3` must be on the
-//! PATH: if it is not, the tests FAIL (they do not skip). The `merge-mutants` feature is needed (`Cargo.toml`: the replay
-//! sets the stage-A rule that a write which only reorders fields is a no-op, the model having no field order);
-//! the test `rust_mutants_are_caught_by_the_replay` turns each nested
-//! mutation switch on and requires the replay to disagree.
+//! PATH: if it is not, the tests FAIL (they do not skip). The model is the vendored A2.3 one
+//! (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = False` and no implicit marker. The `merge-mutants` feature is
+//! needed (`Cargo.toml`): the test `rust_mutants_are_caught_by_the_replay` turns each nested mutation switch on and
+//! requires the replay to disagree.
 
 #[path = "common/fingerprint.rs"]
 mod fingerprint;
@@ -369,8 +369,6 @@ fn run_script(sc: &J, tweak: &dyn Fn(&mut JoinOptions)) -> Replay {
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
     let mut opts = JoinOptions::new(ret, bound).expect("a valid bound");
-    // the stage-A model has no field order: a write that only reorders is a no-op there
-    opts.set_ord_reorder_is_noop(true);
     tweak(&mut opts);
     let mut ms: Vec<Mem> = "ABCD"
         .chars()

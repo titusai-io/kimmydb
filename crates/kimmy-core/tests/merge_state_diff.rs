@@ -24,10 +24,10 @@
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
 //!
-//! The `merge-mutants` feature is needed (`Cargo.toml`): the replay sets the stage-A rule that a write which only
-//! reorders the fields is a no-op (the model has no field order), and compares states WITHOUT their order state
-//! (`fingerprint::without_ords`, a named restriction lifted at the D8 re-vendor); the order state meets a model
-//! that has it in `merge_state_ord_diff`.
+//! The model is the vendored A2.3 one (`reference_model/MODEL-HASHES.txt`), run with `ABSORBED = False` and no implicit
+//! marker, as the Rust side is today. A write that only reorders the fields is a write in the model and in the writer.
+//! The replay compares the bytes and hashes of states WITHOUT their order state (`fingerprint::without_ords`: the
+//! generator's encoders write an empty order section); the order state meets the model in `merge_state_ord_diff`.
 
 #[path = "common/fingerprint.rs"]
 mod fingerprint;
@@ -172,9 +172,7 @@ fn run_script(sc: &J) -> (Vec<String>, BTreeMap<&'static str, usize>, u64) {
     let ret = sc["ret"].as_u64().unwrap();
     let bound = sc["bound"].as_i64().unwrap();
     let nm = sc["members"].as_u64().unwrap() as usize;
-    let mut opts = JoinOptions::new(ret, bound).expect("a valid bound");
-    // the stage-A model has no field order: a write that only reorders is a no-op there
-    opts.set_ord_reorder_is_noop(true);
+    let opts = JoinOptions::new(ret, bound).expect("a valid bound");
     let mut ms: Vec<Mem> = "ABCD"
         .chars()
         .take(nm)
