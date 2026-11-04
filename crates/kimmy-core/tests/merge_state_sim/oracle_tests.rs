@@ -271,11 +271,11 @@ mod order_oracle_cases {
     #[test]
     fn a_replace_in_another_order_is_a_write() {
         let before: Doc = vec![leaf("a"), leaf("b")];
-        let swapped = OrdOp::Make(vec![
+        let swapped = OrdOp::Replace(vec![
             ("b".to_string(), Value::Int64(1)),
             ("a".to_string(), Value::Int64(1)),
         ]);
-        let same = OrdOp::Make(vec![
+        let same = OrdOp::Replace(vec![
             ("a".to_string(), Value::Int64(1)),
             ("b".to_string(), Value::Int64(1)),
         ]);
@@ -295,5 +295,12 @@ mod order_oracle_cases {
         assert!(reorders(Some(&nested), &set("q", "p")));
         assert!(!reorders(Some(&nested), &set("p", "q")));
         assert!(!reorders(Some(&nested), &set("p", "z")), "other fields: not a reorder");
+        // an insert over a live document is refused (model6.py `insert`: `if s.alive(): return None`): not a reorder,
+        // whatever the order of its fields (the four seeds that found it: 101, 349, 14, 24 of the sim's runs)
+        let insert = OrdOp::Insert(vec![
+            ("b".to_string(), Value::Int64(1)),
+            ("a".to_string(), Value::Int64(1)),
+        ]);
+        assert!(!reorders(Some(&before), &insert));
     }
 }
