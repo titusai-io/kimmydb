@@ -1371,6 +1371,53 @@ fn the_read_visits_cells_in_proportion_to_the_work_not_to_the_state() {
     }
 }
 
+/// A document nested `m` levels: the field "f" holding the field "f" ... holding an integer; the deepest
+/// path has `m` segments.
+fn nested_ordered(m: usize) -> Vec<(String, OrderedValue)> {
+    let mut v = OrderedValue::Leaf(Value::Int64(1));
+    for _ in 1..m {
+        v = OrderedValue::Doc(vec![("f".to_string(), v)]);
+    }
+    vec![("f".to_string(), v)]
+}
+
+/// `OrderedValue::paths` is public and takes a document a caller built: it never panics. A document
+/// whose deepest path has 100 segments is accepted (a path for each of its levels), one with 101 gives
+/// the `InvalidPath` of `Path::new`, and so does a name with a NUL byte.
+#[test]
+fn the_paths_of_a_document_are_fallible_and_bounded() {
+    let ok = OrderedValue::paths(&nested_ordered(100)).unwrap();
+    assert_eq!(ok.len(), 100);
+    assert_eq!(ok[99].segments().len(), 100);
+    assert!(OrderedValue::paths(&nested_ordered(101)).is_err());
+    assert!(
+        OrderedValue::paths(&nested_ordered(5_000)).is_err(),
+        "refused at level 101, not walked"
+    );
+    let nul = vec![("a\0b".to_string(), OrderedValue::Leaf(Value::Null))];
+    assert!(OrderedValue::paths(&nul).is_err());
+    assert_eq!(OrderedValue::paths(&[]).unwrap(), Vec::<Path>::new());
+}
+
+/// The derived `Clone`, `PartialEq`, `Debug` and `Drop` of a 100-deep `OrderedValue` (the deepest a state's
+/// document can be) fit a thread of 256 KiB: 100 frames of a few hundred bytes each.
+#[test]
+fn the_derived_traits_of_a_hundred_deep_document_fit_a_small_stack() {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let doc = nested_ordered(100);
+            let copy = doc.clone();
+            assert_eq!(doc, copy);
+            assert!(format!("{doc:?}").len() > 100);
+            drop(copy);
+            drop(doc);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 // ---- the laws on the entries of the model's own runs ----------------------------------
 
 /// `probe_ord_join_laws` of the model: the distinct order entries of the writer entries of 150 nested

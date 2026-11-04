@@ -50,7 +50,7 @@ use std::ops::Bound;
 use super::codec::DecodeError;
 use super::join::JoinOptions;
 use super::state::MergeState;
-use super::types::{Epoch, MStamp, Path, Value, WriterId};
+use super::types::{Epoch, InvalidPath, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
@@ -407,7 +407,10 @@ impl MergeState {
 /// sorted, that is the field order of the level.
 type Kids<'a> = BTreeMap<Option<Path>, Vec<(bool, Option<Born>, &'a Path)>>;
 
-/// A field of the ordered document: a value, or a sub-document whose fields are in order.
+/// A field of the ordered document: a value, or a sub-document whose fields are in order. The
+/// document of a state is at most 100 levels deep (a path has at most 100 segments), so the DERIVED
+/// `Clone`, `PartialEq`, `Debug` and `Drop` recurse at most 100 frames of a few hundred bytes (a test runs
+/// all four on a 100-deep value in a thread of 256 KiB).
 #[derive(Clone, PartialEq, Debug)]
 pub enum OrderedValue {
     Leaf(Value),
@@ -415,23 +418,30 @@ pub enum OrderedValue {
 }
 
 impl OrderedValue {
-    /// The paths of a document's fields, a map before the fields in it, each level in its order.
-    pub fn paths(doc: &[(String, OrderedValue)]) -> Vec<Path> {
-        fn walk(at: &[String], doc: &[(String, OrderedValue)], out: &mut Vec<Path>) {
+    /// The paths of a document's fields, a map before the fields in it, each level in its order. An
+    /// error (the `InvalidPath` of `Path::new`) when a field name has a NUL byte or a path is deeper than
+    /// the limit of 100 segments, which a document built by a caller can be and the document of a state
+    /// never is: no panic for caller input. The recursion stops at the first path that is refused, so it
+    /// is at most 101 levels deep.
+    pub fn paths(doc: &[(String, OrderedValue)]) -> Result<Vec<Path>, InvalidPath> {
+        fn walk(
+            at: &[String],
+            doc: &[(String, OrderedValue)],
+            out: &mut Vec<Path>,
+        ) -> Result<(), InvalidPath> {
             for (name, v) in doc {
                 let mut segs = at.to_vec();
                 segs.push(name.clone());
-                out.push(
-                    Path::new(segs.clone()).expect("a field name of a state is a legal segment"),
-                );
+                out.push(Path::new(segs.clone())?);
                 if let OrderedValue::Doc(kids) = v {
-                    walk(&segs, kids, out);
+                    walk(&segs, kids, out)?;
                 }
             }
+            Ok(())
         }
         let mut out = Vec::new();
-        walk(&[], doc, &mut out);
-        out
+        walk(&[], doc, &mut out)?;
+        Ok(out)
     }
 }
 
@@ -539,6 +549,13 @@ impl MergeState {
     /// (`absorbed`); the Rust counter cell has no such field yet (the cell is not frozen), so the
     /// clamp reads the winner's `obs` only, which is the model with `ABSORBED` off. The
     /// goldens' generator asserts that every scenario orders the same with it on and off.
+    ///
+    /// Cost. Each path under an unset floor looks at every path below it, so a chain of depth d costs
+    /// d(d - 1)/2 visits: quadratic only because of the cap of 100 on the depth of a path (at most about
+    /// 5,000 pairs per chain, `ord_tests`). If the depth limit is ever raised, a bottom-up form exists:
+    /// the survivors of a path are "the smallest candidate below a threshold" over its subtree
+    /// (the placement of a candidate depends on the asking path's floor only through a threshold and the
+    /// update bit), which a merge of the children's sorted candidates answers in about O(n log^2 n).
     fn survivors(
         &self,
         p: &Path,

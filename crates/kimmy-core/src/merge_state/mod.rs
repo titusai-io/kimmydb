@@ -137,7 +137,7 @@ const _: () = {
     let _: fn(&MergeState, &JoinOptions) -> Option<BTreeMap<Path, Value>> = MergeState::visible;
     let _: fn(&MergeState, &JoinOptions) -> Option<Vec<(String, OrderedValue)>> =
         MergeState::ordered_document;
-    let _: fn(&[(String, OrderedValue)]) -> Vec<Path> = OrderedValue::paths;
+    let _: fn(&[(String, OrderedValue)]) -> Result<Vec<Path>, InvalidPath> = OrderedValue::paths;
     let _: fn(&FieldOrd, &FieldOrd, &JoinOptions) -> FieldOrd = ord_join;
     let _: fn(&[(OrdAt, OrdMode)], &JoinOptions) -> Vec<OrdEvent> = ord_events;
     let _: fn(&Floor) -> MStamp = Floor::stamp;
