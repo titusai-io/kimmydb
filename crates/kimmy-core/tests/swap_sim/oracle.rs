@@ -93,7 +93,14 @@ pub struct Oracle {
     pub top: Option<EntryRef>,
     pub alive: BTreeSet<String>,
     pub served: BTreeMap<u32, Ver>,
+    /// REQUIRED pool: the late writes among the entries some live member holds, under the reachable events. Its heads
+    /// must be reported on every live member.
     pub loss: BTreeMap<(u32, Stamp), Body>,
+    /// ALLOWED: every acknowledged document write in the world's write log that is late under the D11 predicate
+    /// (`birth(p) < E.stamp < w.stamp` for a valid register event E in the log), whether or not any live member still
+    /// holds its entry. A record that names such a write is legitimate: the write was lost to the swap and the record
+    /// is its report, and the record proves the write reached a member that has since vanished.
+    pub allowed: BTreeSet<(u32, Stamp)>,
     pub lingering: BTreeSet<String>,
 }
 
@@ -153,6 +160,37 @@ pub fn oracle(w: &mut World) -> Oracle {
             loss.insert((e.key, e.stamp), e.body.clone());
         }
     }
+    // ALLOWED, from the whole write log and every valid register event in it
+    let mut ev_all: Vec<EntryRef> = w
+        .all
+        .iter()
+        .filter(|e| matches!(e.kind, Kind::Bind | Kind::Lcreate | Kind::Ldrop) && w.valid(e))
+        .cloned()
+        .collect();
+    ev_all.sort_by_key(|e| e.stamp);
+    let mut birth_all: HashMap<String, Stamp> = HashMap::new();
+    birth_all.insert(L.to_string(), neg());
+    for e in &ev_all {
+        if matches!(e.kind, Kind::Bind | Kind::Lcreate) {
+            birth_all.entry(e.phys.clone()).or_insert(e.stamp);
+        }
+    }
+    let allowed: BTreeSet<(u32, Stamp)> = w
+        .all
+        .iter()
+        .filter(|e| {
+            e.kind == Kind::Doc
+                && !e.staging
+                && birth_all.get(&e.phys).is_some_and(|b| {
+                    ev_all.iter().any(|x| {
+                        *b < x.stamp
+                            && x.stamp < e.stamp
+                            && (x.kind == Kind::Ldrop || x.phys != e.phys)
+                    })
+                })
+        })
+        .map(|e| (e.key, e.stamp))
+        .collect();
     // the converse: late writes (by the same rule) that were lost with a vanished member
     w.lost_late = w
         .all
@@ -186,7 +224,7 @@ pub fn oracle(w: &mut World) -> Oracle {
     for l in &lingering {
         alive.insert(l.clone());
     }
-    Oracle { top, alive, served, loss, lingering }
+    Oracle { top, alive, served, loss, allowed, lingering }
 }
 
 pub type Res = BTreeMap<String, i64>;
@@ -201,10 +239,10 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     let mut res: Res = BTreeMap::new();
     let live: Vec<usize> = (0..ms.len()).filter(|&i| !ms[i].vanished).collect();
     let first = live[0];
-    // replay: two fresh replicas that receive every entry (no snapshots), after the cluster's quiescence
+    // replay in the relay's order: two fresh replicas that receive every entry (no snapshots) in stamp order from the live members' appended sets, after the cluster's quiescence
     let mut base_entries: Vec<EntryRef> =
         w.all.iter().filter(|e| !w.lost.contains(&e.idx)).cloned().collect();
-    base_entries.sort_by_key(|e| e.stamp); // the model shuffles, then stably sorts by stamp; stamps are unique
+    base_entries.sort_by_key(|e| e.stamp); // the relay's order (the model's shuffle is followed by a stable sort on unique stamps, so it never varied the order)
     let mut replays: Vec<(State, HashSet<HeadKey>)> = Vec::new();
     for i in 0..2 {
         let mut z = Member::new(ms.len() + i, &format!("Z{i}"), 0);
@@ -215,6 +253,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         replays.push((z.state(), bk(&z)));
     }
     let okeys: HashSet<HeadKey> = o.loss.keys().map(|(k, s)| (*k, Some(*s))).collect();
+    let allowed: HashSet<HeadKey> = o.allowed.iter().map(|(k, s)| (*k, Some(*s))).collect();
     let mut newest: HashMap<(String, u32), Stamp> = HashMap::new();
     for x in w.all.iter() {
         if x.kind == Kind::Doc && !x.staging && !w.lost.contains(&x.idx) {
@@ -239,7 +278,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     let div_replay = replays.iter().any(|(st, recs)| {
         *st != m0state
             || heads.iter().any(|h| !recs.contains(h))
-            || recs.iter().any(|r| !okeys.contains(r))
+            || recs.iter().any(|r| !allowed.contains(r))
     });
     let states_differ = live.iter().any(|&i| ms[i].state() != m0state);
     let loss_sets: Vec<BTreeSet<LKey>> =
@@ -259,12 +298,13 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     res.insert("alive_mismatch".into(), alive_mismatch as i64);
     res.insert("oracle_state".into(), (served_mismatch || alive_mismatch) as i64);
     let loss_missing = live.iter().any(|&i| heads.iter().any(|h| !bk(&ms[i]).contains(h)));
-    let loss_extra = live.iter().any(|&i| bk(&ms[i]).iter().any(|r| !okeys.contains(r)));
+    let loss_extra = live.iter().any(|&i| bk(&ms[i]).iter().any(|r| !allowed.contains(r)));
     res.insert("loss_missing".into(), loss_missing as i64);
     res.insert("loss_extra".into(), loss_extra as i64);
     res.insert("loss_mismatch".into(), (loss_missing || loss_extra) as i64);
     res.insert("heads_required".into(), heads.len() as i64);
-    res.insert("true_late_writes_allowed".into(), okeys.len() as i64);
+    res.insert("true_late_writes_allowed".into(), allowed.len() as i64);
+    res.insert("late_writes_required_pool".into(), okeys.len() as i64);
     let nonheads: Vec<HeadKey> = okeys.iter().filter(|k| !heads.contains(k)).copied().collect();
     let unrep: Vec<HeadKey> = nonheads
         .iter()
