@@ -529,7 +529,8 @@ fn replay_script(sc: &J, o: &JoinOptions) -> Result<Replayed, String> {
 // ---- the read: the goldens of the materialised order --------------------------------
 
 /// The scenarios, by name. A new scenario of the generator is a new line here.
-const SCENARIOS: [&str; 41] = [
+const SCENARIOS: [&str; 43] = [
+    "a_scalar_over_a_map_voids_the_places_of_its_fields",
     "a_set_on_insert_upsert_feeds_both_of_its_writes",
     "a_standalone_noop_unset_leaves_nothing",
     "a_subdocument_set_that_only_reorders_is_a_write",
@@ -570,6 +571,7 @@ const SCENARIOS: [&str; 41] = [
     "update_bit_survivor_after_all_the_updates_fields",
     "update_with_inc_and_unset_of_a_map",
     "update_without_bit_survivor_by_prev",
+    "updates_that_are_writes_by_what_they_name_alone",
     "write_below_a_map_is_a_write_to_the_map",
 ];
 
@@ -610,7 +612,7 @@ fn the_materialised_field_order_equals_the_models_on_every_scenario() {
         fields += want.len();
     }
     // pinned: what the test covered
-    assert_eq!((names.len(), joined, fields), (41, 1860, 165));
+    assert_eq!((names.len(), joined, fields), (43, 3300, 177));
 }
 
 fn paths(doc: &[(Path, Value)]) -> Vec<String> {
@@ -631,7 +633,7 @@ fn strs(v: &[&str]) -> Vec<String> {
 /// join; these are pinned in the source so that a reader sees the rules).
 #[test]
 fn the_field_order_of_the_named_scenarios_is_pinned() {
-    let pins: [(&str, &[&str]); 41] = [
+    let pins: [(&str, &[&str]); 43] = [
         ("a_set_on_insert_upsert_feeds_both_of_its_writes", &["a", "b", "c", "e", "n", "d"]),
         ("a_standalone_noop_unset_leaves_nothing", &["a", "b", "m", "m.p", "nope", "e"]),
         ("a_subdocument_set_that_only_reorders_is_a_write", &["m", "m.q", "m.p", "m.r", "k", "z"]),
@@ -679,6 +681,11 @@ fn the_field_order_of_the_named_scenarios_is_pinned() {
         ),
         ("update_without_bit_survivor_by_prev", &["x", "a", "w"]),
         ("write_below_a_map_is_a_write_to_the_map", &["x", "z", "a", "a.b", "w"]),
+        ("a_scalar_over_a_map_voids_the_places_of_its_fields", &["x", "m", "m.q", "m.p", "w"]),
+        (
+            "updates_that_are_writes_by_what_they_name_alone",
+            &["a", "m", "m.q", "m.p", "k", "k.j", "e"],
+        ),
     ];
     for (name, want) in pins {
         assert_eq!(order_of(name), strs(want), "{name}");
@@ -727,7 +734,7 @@ fn the_writer_reproduces_the_models_scenarios_after_every_write() {
         }
     }
     // pinned: what the replay covered (the seed insert of a seeded scenario is one of its writes)
-    assert_eq!((writes, receives, refused, joined), (172, 8, 8, 1860));
+    assert_eq!((writes, receives, refused, joined), (184, 8, 9, 3300));
 }
 
 /// The O2 watch item: a top-level field named `""` is fed as `OrdAt::Field([""])`, never as the
@@ -791,6 +798,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             "ord_keep_all",
             |o| o.set_ord_keep_all(true),
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
                 "concurrent_replaces",
@@ -823,9 +831,11 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
                 "concurrent_replaces",
@@ -852,9 +862,11 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
                 "concurrent_replaces",
@@ -887,6 +899,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
         ),
@@ -894,6 +907,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             "ord_latest",
             |o| o.set_ord_latest(true),
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "level_floor_nested_subdocument_set",
                 "receive_a_concurrent_replace_then_set",
@@ -904,6 +918,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             ],
             &[],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
                 "descendant_above_the_floor_is_not_a_survivor",
@@ -923,6 +938,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "two_writers_each_receive_the_others_write_then_write",
                 "unset_then_concurrent_set",
                 "update_with_inc_and_unset_of_a_map",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
         ),
@@ -937,6 +953,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             "ord_by_name",
             |o| o.set_ord_by_name(true),
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
@@ -970,10 +987,12 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
@@ -1008,6 +1027,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
         ),
@@ -1047,6 +1067,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "concurrent_replaces",
                 "inc_unset_replace_concurrent",
@@ -1057,8 +1078,10 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "concurrent_replaces",
                 "inc_unset_replace_concurrent",
@@ -1070,6 +1093,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
             ],
         ),
         (
@@ -1103,6 +1127,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
             ],
             &[
                 "a_subdocument_set_that_only_reorders_is_a_write",
@@ -1115,6 +1140,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
             ],
         ),
         (
@@ -1122,6 +1148,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             |o| o.set_ord_no_pos(true),
             &[],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
@@ -1150,9 +1177,11 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
@@ -1187,6 +1216,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
         ),
@@ -1196,6 +1226,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             &[],
             &[],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "descendant_above_the_floor_is_not_a_survivor",
                 "descendant_survivor_of_an_unset_map",
@@ -1206,6 +1237,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "sequential_rules",
                 "survivor_placement_b_unset_knew_c",
                 "update_with_inc_and_unset_of_a_map",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
         ),
@@ -1228,6 +1260,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             |o| o.set_ord_bit_unpacked(true),
             &[],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "hybrid_noop_unset_rides_on_an_update",
                 "inc_unset_replace_concurrent",
                 "replace_drops_a_field_then_set_appends",
@@ -1236,6 +1269,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_with_inc_and_unset_of_a_map",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "hybrid_floor_on_an_update_after_a_receive",
                 "hybrid_noop_unset_rides_on_an_update",
                 "inc_unset_replace_concurrent",
@@ -1250,6 +1284,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             |o| o.set_ord_no_first(true),
             &[],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "approximate_case",
@@ -1282,9 +1317,11 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[
+                "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
@@ -1325,6 +1362,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "update_bit_survivor_after_all_the_updates_fields",
                 "update_with_inc_and_unset_of_a_map",
                 "update_without_bit_survivor_by_prev",
+                "updates_that_are_writes_by_what_they_name_alone",
                 "write_below_a_map_is_a_write_to_the_map",
             ],
         ),
@@ -1355,6 +1393,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "receive_a_concurrent_replace_then_set",
                 "replace_reorders_even_unchanged",
                 "sequential_rules",
+                "updates_that_are_writes_by_what_they_name_alone",
             ],
         ),
     ];

@@ -653,8 +653,9 @@ def s_a_writer_with_two_lives_writes_into_the_newest():
 @scenario
 def s_inc_of_a_double_below_a_map_is_a_register_write():
     """A double base is no counter: B's inc of m.f is a register write of 2.5, and a write below a map is a write to the map,
-    which A's concurrent unset of m (5) must not void."""
+    which A's concurrent unset of m (5) must not void. An inc by 0 of the double changes nothing and is no write."""
     sc = RecSc({"x": 1, "m": {"f": 1.5}})
+    sc.refused("B", "inc", "m.f", 0)                      # 1.5 + 0 is the stored 1.5 byte for byte: no write
     sc.op("A", "unset", "m", clock=5)
     sc.op("B", "inc", "m.f", 1, clock=6)
     sc.op("C", "set", "w", 1, clock=8)
@@ -669,6 +670,34 @@ def s_a_set_on_insert_upsert_feeds_both_of_its_writes():
     sc.upsert_soi("A", {"a": 1, "b": 2}, "n", 3, sets={"c": 9})
     sc.upsert_inc("B", "e", 1)
     sc.op("A", "set", "d", 4)
+    return sc
+
+
+@scenario
+def s_a_scalar_over_a_map_voids_the_places_of_its_fields():
+    """A sets m (a map with p and q) to a scalar, then to a map again, then writes q and p: the unsets of the scalar write made
+    the old places of p and q void, so the fields come back in the order they are written (q, then p), not in the order of
+    the first insert. B creates w meanwhile."""
+    sc = RecSc({"x": 1, "m": {"p": 1, "q": 2}})
+    sc.op("A", "set", "m", 7, clock=10)
+    sc.op("B", "set", "w", 1, clock=11)
+    sc.op("A", "set", "m", {}, clock=12)
+    sc.op("A", "set", "m.q", 3)
+    sc.op("A", "set", "m.p", 4)
+    return sc
+
+
+@scenario
+def s_updates_that_are_writes_by_what_they_name_alone():
+    """An update of one unset of a field that exists is a write; an update that sets a sub-document to the same values in another
+    order (the values are equal, only the names tell) is a write of the order alone; an update that increments a field below a
+    map is a write to the map, which C's concurrent unset of the map (6) must void only up to its own stamp."""
+    sc = RecSc({"x": 1, "a": 1, "m": {"p": 1, "q": 1}, "k": {"j": 1}})
+    sc.op("A", "update", None, [("unset", "x", None)], clock=5)
+    sc.op("A", "update", None, [("set", "m", {"q": 1, "p": 1})])
+    sc.op("C", "unset", "k", clock=6)
+    sc.op("B", "update", None, [("inc", "k.j", 1)], clock=7)
+    sc.op("C", "set", "e", 1, clock=9)
     return sc
 
 

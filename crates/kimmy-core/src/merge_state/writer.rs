@@ -189,7 +189,8 @@ fn ancestor_items(p: &Path, seen: &mut BTreeSet<Path>, items: &mut Items, o: &Jo
 fn same_ordered(cur: &OrderedValue, new: &Value) -> bool {
     match (cur, new) {
         (OrderedValue::Doc(c), Value::Document(n)) => same_fields(c, n),
-        (OrderedValue::Leaf(c), n) => !matches!(n, Value::Document(_)) && Value::same(Some(c), n),
+        // (a leaf is never equal to a document, so a sub-document where a leaf stands is a change)
+        (OrderedValue::Leaf(c), n) => Value::same(Some(c), n),
         _ => false,
     }
 }
@@ -1284,5 +1285,75 @@ impl Writer {
         let mut rec = WriteRecord::new(WriteKind::Reg, l, paths);
         rec.vals = eff.vals;
         Some(self.finish(st, rec))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{opts, wid};
+    use super::*;
+
+    fn i(n: i64) -> Value {
+        Value::Int64(n)
+    }
+
+    fn doc(f: &[(&str, OrderedValue)]) -> Vec<(String, OrderedValue)> {
+        f.iter().map(|(n, v)| ((*n).to_string(), v.clone())).collect()
+    }
+
+    fn fields(f: &[(&str, Value)]) -> Vec<(String, Value)> {
+        f.iter().map(|(n, v)| ((*n).to_string(), v.clone())).collect()
+    }
+
+    fn leaf(n: i64) -> OrderedValue {
+        OrderedValue::Leaf(Value::Int64(n))
+    }
+
+    /// The model's `ordered_same`: the same names in the same order with the same leaves. The scenarios
+    /// reach it through the Writer; here its parts are told apart one by one (equal values under other
+    /// names, another length either way, a field spelled `Unset`, a sub-document against a leaf).
+    #[test]
+    fn same_fields_compares_names_order_values_and_length() {
+        let cur = doc(&[("p", leaf(1)), ("q", leaf(1))]);
+        assert!(same_fields(&cur, &fields(&[("p", i(1)), ("q", i(1))])));
+        assert!(!same_fields(&cur, &fields(&[("q", i(1)), ("p", i(1))])), "the names tell");
+        assert!(!same_fields(&cur, &fields(&[("p", i(1))])), "a field fewer");
+        assert!(!same_fields(&cur, &fields(&[("p", i(1)), ("q", i(1)), ("r", i(1))])), "one more");
+        assert!(!same_fields(&cur, &fields(&[("p", i(1)), ("q", i(2))])), "a value");
+        assert!(
+            same_fields(&cur, &fields(&[("p", i(1)), ("z", Value::Unset), ("q", i(1))])),
+            "a field spelled Unset is not a field"
+        );
+        assert!(!same_fields(&cur, &fields(&[("p", i(1)), ("q", Value::Unset)])));
+        let nested = doc(&[("m", OrderedValue::Doc(vec![("a".into(), leaf(1))]))]);
+        let same = fields(&[("m", Value::Document(fields(&[("a", i(1))])))]);
+        assert!(same_fields(&nested, &same));
+        assert!(!same_fields(&nested, &fields(&[("m", i(1))])), "a leaf where a map stands");
+        assert!(!same_fields(&doc(&[("m", leaf(1))]), &same), "a map where a leaf stands");
+        let deeper = fields(&[("m", Value::Document(fields(&[("a", i(2))])))]);
+        assert!(!same_fields(&nested, &deeper), "a leaf one level down");
+    }
+
+    /// A field spelled `Value::Unset` in a document handed to a write is an unset, for the order state
+    /// as for the cells: the writer that spells it so and the one that unsets (or drops) the field end
+    /// in the same state.
+    #[test]
+    fn an_unset_spelled_as_a_value_is_an_unset_for_the_order_state_too() {
+        let (x, y) = (Path::flat("x").unwrap(), Path::flat("y").unwrap());
+        let made = || {
+            let mut w = Writer::new(wid('A', 0), opts());
+            w.insert(&[(x.clone(), i(1)), (y.clone(), i(2))], 0).unwrap();
+            w
+        };
+        let (mut a, mut b) = (made(), made());
+        a.write_unset(&y, 0).unwrap();
+        b.write_set(&y, Value::Unset, 0).unwrap();
+        assert_eq!(a.state, b.state);
+        let (mut c, mut d) = (made(), made());
+        c.write_replace(&[(x.clone(), i(1))], 0).unwrap();
+        d.write_replace(&[(x.clone(), i(1)), (y.clone(), Value::Unset)], 0).unwrap();
+        assert_eq!(c.state, d.state);
+        // and over a field that is not there it is no write at all
+        assert!(d.write_set(&y, Value::Unset, 0).is_none());
     }
 }
