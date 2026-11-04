@@ -59,3 +59,9 @@ required-features = ["merge-mutants"]
 name = "merge_state_diff_nested"
 path = "tests/merge_state_diff_nested.rs"
 required-features = ["merge-mutants"]
+
+# The order differential replays scripts of the A2.1 model through writers and sets the order switches.
+[[test]]
+name = "merge_state_ord_diff"
+path = "tests/merge_state_ord_diff.rs"
+required-features = ["merge-mutants"]
