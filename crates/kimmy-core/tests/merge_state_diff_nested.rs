@@ -703,7 +703,9 @@ fn replay(dir: &std::path::Path, tweak: &(dyn Fn(&mut JoinOptions) + Sync)) -> V
 ///
 /// RE-PINNED for item O2: 0xf05c_9aba_cf02_eb9c to 0x117c_d4f5_b468_200c, for the reason given at the flat differential's pin (the order
 /// state and the ordered document are in the fingerprint now; the comparison with the model is unchanged).
-const PINNED_300: u64 = 0x117c_d4f5_b468_200c;
+///
+/// RE-PINNED for the D8 re-vendor (the A2.3 model): 0x117c_d4f5_b468_200c to 0x5b22_de2a_6b43_3270.
+const PINNED_300: u64 = 0x5b22_de2a_6b43_3270;
 
 fn runs() -> u64 {
     std::env::var("Q7DIFF_NESTED_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)

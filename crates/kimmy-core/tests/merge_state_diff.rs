@@ -604,7 +604,9 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// compact bytes and hash of the state WITH its order state (section 10) and the document in the order the order state gives it, which
 /// the fingerprint did not hold before; the version 1 bytes, the hashes, the visible documents, every stamp and refusal are still compared
 /// with the model, with the order state left out, and did not change (the Group A pin was the same figure).
-const PINNED_300: u64 = 0x2aee_26c6_deda_603d;
+///
+/// RE-PINNED for the D8 re-vendor (the A2.3 model, the flat generator's new draws): 0x2aee_26c6_deda_603d to 0xfbde_c4a1_8eb1_bb13.
+const PINNED_300: u64 = 0xfbde_c4a1_8eb1_bb13;
 
 #[test]
 fn differential_against_the_python_model() {
