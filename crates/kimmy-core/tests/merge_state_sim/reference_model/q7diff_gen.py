@@ -277,8 +277,9 @@ FLAG_GEN_OWN, FLAG_GEN_OTHER, FLAG_SOI, FLAG_STAMP_IS_LIFE = 1, 2, 4, 8
 
 
 def k_path(p):
-    """Paths order by their segments, each compared as UTF-8 bytes (the model's names have no dot)."""
-    return [x.encode() for x in p.split(".")]
+    """Paths order by their segments, each compared as UTF-8 bytes. The flat model's field is one segment
+    whatever its name (a name may hold a dot): a path here is a name, never a dotted spelling."""
+    return [p.encode()]
 
 
 class EncCompact:
@@ -320,10 +321,8 @@ class EncCompact:
         self.raw(e)
 
     def path(self, p):
-        segs = p.split(".")
-        self.vi(len(segs))
-        for x in segs:
-            self.s(x)
+        self.vi(1)           # a flat field: one segment, whatever its name
+        self.s(p)
 
     def hlc(self, h):
         self.raw(h.to_bytes(8, "big") + (0).to_bytes(2, "big"))
@@ -558,6 +557,18 @@ def jdoc(d):
 # ---------------------------------------------------------------------------------------------
 NAMES = "ABCD"
 
+# Field names no dotted spelling can carry, that the flat model takes: the empty name, and a name with a dot (the
+# flat model keeps a name as one string, it never splits it). NOT `_`: the model names the whole document `_` in a
+# loss record (`("insertLost", "_", life)`, and `p == "_"` in `sound_record`), so a field named `_` would share its
+# record key with the document's whenever its stamp is the life's, and the model cannot tell the two apart. `_` is
+# in the sim and the join-law tests, which key a record by what it is about.
+ODD = ["", "a.b"]
+
+
+def names(odd, base):
+    """The names a write draws its fields from: `base`, or for an odd write the odd names and the first of `base`."""
+    return ODD + base[:1] if odd else list(base)
+
 
 def pools(bound):
     if bound == I64_MAX:
@@ -604,18 +615,20 @@ def gen_script(seed):
             continue
         op = rnd.choice(["inc", "inc", "inc", "inc_zero_sum", "set", "set", "unset", "delete", "insert",
                          "replace", "upsert", "upsert_soi"])
-        p = rnd.choice(paths)
+        odd = rnd.random() < 1 / 6      # one write in six draws its fields from the odd names
+        p = rnd.choice(names(odd, paths))
         if op == "insert":
-            ks = rnd.sample(paths, rnd.choice([1, 1, 2, 3]))
+            ks = rnd.sample(names(odd, paths), rnd.choice([1, 1, 2, 3]))
             ops.append(["insert", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])
         elif op == "upsert":
-            ops.append(["upsert", m, rnd.choice(["x", "y", "n"]), rnd.choice(incs), sk])
+            ops.append(["upsert", m, rnd.choice(names(odd, ["x", "y", "n"])), rnd.choice(incs), sk])
         elif op == "upsert_soi":
             # $setOnInsert, $set and $inc on disjoint paths (a conflicting update is refused up front)
-            fs = rnd.sample(["y", "z", "n"], rnd.choice([1, 1, 2]))
+            fs = rnd.sample(names(odd, ["y", "z", "n"]), rnd.choice([1, 1, 2]))
             sets = [] if rnd.random() < 0.5 else [[k, jv(rnd.choice(vals))] for k in
-                                                   rnd.sample([q for q in ["n", "x", "w"] if q not in fs], 1)]
-            free = [q for q in ["x", "y", "n", "z", "u"] if q not in fs and q not in [k for k, _ in sets]]
+                                                   rnd.sample([q for q in names(odd, ["n", "x", "w"]) if q not in fs], 1)]
+            free = [q for q in names(odd, ["x", "y", "n", "z", "u"]) if q not in fs and q not in [k for k, _ in sets]]
+            free = free or ["u"]        # an odd write can use every name it has; `u` is in no list of any write
             ops.append(["upsert_soi", m, [[k, jv(rnd.choice(vals))] for k in fs], rnd.choice(free),
                         rnd.choice(incs), sets, sk])
         elif op == "inc_zero_sum":
@@ -625,7 +638,7 @@ def gen_script(seed):
             if n != -I64_MAX - 1:
                 ops.append(["inc", m, p, -n, sk])
         elif op == "replace":
-            ks = rnd.sample(paths, rnd.choice([1, 2]))
+            ks = rnd.sample(names(odd, paths), rnd.choice([1, 2]))
             ops.append(["replace", m, [[k, jv(rnd.choice(vals + [None]))] for k in ks], sk])
         elif op == "inc":
             ops.append(["inc", m, p, rnd.choice(incs), sk])

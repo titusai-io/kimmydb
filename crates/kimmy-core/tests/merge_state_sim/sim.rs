@@ -63,6 +63,13 @@ pub struct SimFlags {
     /// again (v4's behaviour). `LossKind` has no hidden kind, so the stand-in is
     /// `RetiredWriter`, which P0 never produces.
     pub hidden_records: bool,
+    /// The covered-entry skip of the real protocol (Q3): an entry whose stamp the receiver's
+    /// version vector already covers is not applied again, only witnessed. NOT in the sim's
+    /// protocol yet (off, the design of the sim): without it a pull window re-sends an old entry
+    /// that the receiver already holds, and after the horizon has collected a delete that
+    /// entry brings a life the delete killed back to life (the known failures of the bounded
+    /// runs, see `main.rs`). On, those runs pass.
+    pub covered_skip: bool,
 }
 
 impl Default for SimFlags {
@@ -76,6 +83,7 @@ impl Default for SimFlags {
             drop_kind: None,
             report_neither: false,
             hidden_records: false,
+            covered_skip: false,
         }
     }
 }
@@ -341,6 +349,14 @@ impl Node {
     }
 
     pub fn receive_entry(&mut self, ent: &Rc<Ent>) {
+        if self.flags.covered_skip
+            && let Ent::W { st, .. } = &**ent
+            && get(&self.w.state.vv, &st.writer) >= st.hlc
+        {
+            let o = self.origin(*st);
+            raise(&mut self.witnessed, o, st.hlc);
+            return;
+        }
         match &**ent {
             Ent::W { st, state, contained } => {
                 if self.absorb(state, contained, true) && !self.oplog.contains_key(st) {
@@ -734,6 +750,27 @@ fn pool_fields<'a>(rnd: &mut Rng, names: &[&'a str]) -> Vec<(&'a str, Value)> {
 
 // ---- the nested workload (pullmodel6.py `draw_op`) ---------------------------------------
 
+/// Field names no dotted spelling can carry: the empty name, `_` (what the version 1 form and the
+/// reference model call the whole document in a loss record) and a name with a dot. The sim has
+/// them; the differentials against the Python models have only what those models can take (see
+/// `merge_state_diff.rs` and `merge_state_diff_nested.rs`).
+const ODD: [&str; 3] = ["", "_", "a.b"];
+
+/// The names a write draws its fields from: `base`, or, for an odd write, [`ODD`] and the first of
+/// `base`.
+fn names<'a>(odd: bool, base: &[&'a str]) -> Vec<&'a str> {
+    if odd { ODD.iter().copied().chain(base.first().copied()).collect() } else { base.to_vec() }
+}
+
+/// A leaf at an odd name: at the top, or below `a` (the paths are built from segments, never from
+/// a dotted spelling).
+fn odd_leaf(rnd: &mut Rng) -> Path {
+    let top = [vec![""], vec!["_"], vec!["a.b"]];
+    let below = [vec!["a", ""], vec!["a", "_"], vec!["a", "b.c"], vec!["a", "d", ""]];
+    let segs = if rnd.below(2) == 0 { rnd.choice(&top) } else { rnd.choice(&below) };
+    Path::new(segs).expect("a valid path")
+}
+
 const LEAVES: [&str; 9] = ["x", "n", "y", "a.b", "a.c", "a.d.e", "a.d.f", "a.d.g", "acct.balance"];
 const PARENTS: [&str; 3] = ["a", "a.d", "acct"];
 
@@ -799,6 +836,11 @@ fn rand_doc(rnd: &mut Rng) -> Vec<(&'static str, Value)> {
             d.push((t, rnd.choice(&[i(7), i(8), Value::String("s".into()), i(100)])));
         }
     }
+    for t in ODD {
+        if rnd.f64() < 0.1 {
+            d.push((t, rnd.choice(&[i(7), Value::String("s".into()), sub(&[("k", i(1))])])));
+        }
+    }
     if rnd.f64() < 0.6 {
         let v = if rnd.below(8) == 0 { i(5) } else { subdoc(rnd, "a") };
         d.push(("a", v));
@@ -819,12 +861,15 @@ fn rand_doc(rnd: &mut Rng) -> Vec<(&'static str, Value)> {
 /// One random nested write on `m`. A write below a scalar is attempted too (the writer must
 /// refuse it), and so is a write that changes nothing.
 fn nested_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64) {
-    let leaf = np(rnd.choice(&LEAVES));
+    let leaf = if rnd.below(8) == 0 { odd_leaf(rnd) } else { np(rnd.choice(&LEAVES)) };
     match rnd.below(21) {
         0..=2 => {
             let by = rnd.choice(&[1, 5, 20, -3, 50]);
-            let at =
-                np(rnd.choice(&["acct.balance", "acct.balance", "a.b", "a.c", "a.d.e", "x", "y"]));
+            let at = if rnd.below(8) == 0 {
+                odd_leaf(rnd)
+            } else {
+                np(rnd.choice(&["acct.balance", "acct.balance", "a.b", "a.c", "a.d.e", "x", "y"]))
+            };
             m.inc_at(&at, by, log, skew);
         }
         3 => {
@@ -889,33 +934,43 @@ fn random_write(rnd: &mut Rng, m: &mut Node, log: &mut Log, skew: u64, nested: b
         return;
     }
     let op = rnd.choice(&OPS);
-    let p = rnd.choice(&["x", "n", "y"]);
+    // one flat write in six names its fields from the odd names (and one ordinary name, so that
+    // they meet ordinary fields), the others from the ordinary names alone, as the sim always did
+    let odd = rnd.below(6) == 0;
+    let p = rnd.choice(&names(odd, &["x", "n", "y"]));
     match op {
         "insert" => {
-            let f = pool_fields(rnd, &["x", "y", "n"]);
+            let f = pool_fields(rnd, &names(odd, &["x", "y", "n"]));
             m.insert(&f, log, skew);
         }
         "upsert" => {
-            let k = rnd.choice(&["x", "y", "n"]);
+            let k = rnd.choice(&names(odd, &["x", "y", "n"]));
             m.upsert_inc(k, pool_inc(rnd), log, skew);
         }
         "upsert_soi" => {
-            let f = pool_fields(rnd, &["y", "z", "n"]);
+            let f = pool_fields(rnd, &names(odd, &["y", "z", "n"]));
             let n = pool_inc(rnd);
             // `$set`, `$setOnInsert` and `$inc` on one path conflict (the update is refused
             // up front), so the three path lists are disjoint.
-            let mut sets: Vec<(&str, Value)> =
-                if rnd.below(2) == 0 { vec![] } else { pool_fields(rnd, &["n", "x", "w"]) };
+            let mut sets: Vec<(&str, Value)> = if rnd.below(2) == 0 {
+                vec![]
+            } else {
+                pool_fields(rnd, &names(odd, &["n", "x", "w"]))
+            };
             sets.retain(|(q, _)| !f.iter().any(|(g, _)| g == q));
-            let free: Vec<&str> = ["x", "y", "n", "z", "u"]
+            let mut free: Vec<&str> = names(odd, &["x", "y", "n", "z", "u"])
                 .into_iter()
                 .filter(|q| !f.iter().chain(sets.iter()).any(|(g, _)| g == q))
                 .collect();
+            if free.is_empty() {
+                // an odd write can use all four of its names; `u` is in no list of any write
+                free.push("u");
+            }
             let ip = rnd.choice(&free);
             m.upsert_soi(&f, ip, n, &sets, log, skew);
         }
         "replace" => {
-            let d = pool_fields(rnd, &["x", "n", "y"]);
+            let d = pool_fields(rnd, &names(odd, &["x", "n", "y"]));
             m.replace(&d, log, skew);
         }
         "inc" => {

@@ -16,13 +16,15 @@ use kimmy_core::merge_state::{
 pub type Log = BTreeMap<MStamp, (BTreeSet<MStamp>, WriteRecord)>;
 pub type Doc = BTreeMap<Path, Value>;
 /// A head that must be, or is, reported: `(path, stamp)`.
-/// The path the sim gives a whole-document record: the flat workload has no field named `_`,
-/// so the model's spelling is unambiguous here.
+/// The path the oracle gives a whole-document record. The model spells it `_`, but a field can
+/// be named `_` too (the workload has one), and a record about that field is a different record,
+/// so the oracle spells the document with a name no field of the workload has (one with a control
+/// character, which the workload never uses) and keeps the field `_` as itself.
 pub fn whole_document() -> Path {
-    Path::flat("_").unwrap()
+    Path::flat("\u{1}whole document").unwrap()
 }
 
-/// The sim's path of a loss record: the field, or `_` for the whole document.
+/// The oracle's path of a loss record: the field, or [`whole_document`].
 pub fn at_path(at: &LossAt) -> Path {
     at.field().cloned().unwrap_or_else(whole_document)
 }
@@ -675,7 +677,7 @@ fn killers(log: &Log, life: &MStamp, dels: &[MStamp], ret: u64) -> Vec<MStamp> {
 }
 
 /// Is a record sound: does the log contain what it claims? The write it names (`key.stamp`)
-/// must have written its path (`"_"` is the whole document, and only an `insertLost` of a
+/// must have written its path ([`whole_document`] is the whole document, and only an `insertLost` of a
 /// lost first insert may name it), and the kind's own evidence must exist:
 ///
 /// * a clash: a newer register write to the path that neither saw nor was seen by the loser;

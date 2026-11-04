@@ -35,6 +35,11 @@ pub enum Probe {
     RestoreInc,
     /// targeted5 `snapshot_loss_scenario`.
     SnapshotLoss,
+    /// The B1 and M1 scenarios (`probes::scenarios`), which the design passes: the mutant is
+    /// killed when one of them finds a problem. M1's random runs kill it about once in 200
+    /// (a non-numeric creation value of an upsert and an increment on its path, in the one order
+    /// that shows), so a change of the workload's random stream could leave it alive.
+    Scenarios,
 }
 
 pub struct Mutant {
@@ -136,7 +141,7 @@ pub fn mutants() -> Vec<Mutant> {
             name: "a non-numeric upsert creation value starts no generation  [M1]",
             apply: |c| c.opts.set_creation_without_generation(true),
             grader: Random { restore: true },
-            probe: None,
+            probe: Scenarios,
         },
         Mutant {
             name: "a superseded and killed first insert reported neither way  [V7m4]",
@@ -282,6 +287,15 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
                 )),
                 k,
             )
+        }
+        Probe::Scenarios => {
+            let bad: Vec<String> = probes::scenarios_with(&cfg)
+                .into_iter()
+                .filter(|(_, problems)| !problems.is_empty())
+                .map(|(name, _)| name)
+                .collect();
+            let k = !bad.is_empty();
+            (Some(format!("scenarios {bad:?}: {}", if k { "killed" } else { "NOT killed" })), k)
         }
         Probe::RestoreInc | Probe::SnapshotLoss => {
             let t = if matches!(m.probe, Probe::RestoreInc) {

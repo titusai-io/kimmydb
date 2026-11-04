@@ -75,6 +75,10 @@ pub enum DecodeError {
     TooDeep,
     #[error("merge state: not canonical (map keys duplicated or out of order)")]
     NotCanonical,
+    #[error("merge state: a dead life is not listed in `lives`")]
+    DeadLifeNotListed,
+    #[error("merge state: the version vector does not cover a stamp the state holds")]
+    VersionVectorBehind,
 }
 
 // ---- writing ---------------------------------------------------------------
@@ -443,6 +447,7 @@ impl MergeState {
         if !r.0.is_empty() {
             return Err(DecodeError::Trailing(r.0.len()));
         }
+        s.check_decoded()?;
         Ok(s)
     }
 }
@@ -698,7 +703,15 @@ mod tests {
         let mut w = W(Vec::new());
         w.0.extend_from_slice(&MAGIC);
         w.u8(VERSION);
-        w.len(0); // lives
+        // every dead life is listed (as an upsert that saw nothing), once, in order
+        let listed: BTreeSet<MStamp> = dead.iter().copied().collect();
+        w.len(listed.len()); // lives
+        for l in &listed {
+            w.stamp(l);
+            w.len(0);
+            w.len(0);
+            w.u8(1);
+        }
         w.len(dead.len());
         for l in dead {
             w.stamp(l);
@@ -746,7 +759,7 @@ mod tests {
         assert_eq!(MergeState::decode(&hand(&[], &[], &[(wa, 1), (wa, 2)])), no);
         assert_eq!(MergeState::decode(&hand(&[], &[], &[(wb, 1), (wa, 2)])), no);
         // and the sorted forms are fine
-        assert!(MergeState::decode(&hand(&[a, b], &[a, b], &[(wa, 1), (wb, 2)])).is_ok());
+        assert!(MergeState::decode(&hand(&[a, b], &[a, b], &[(wa, 2), (wb, 2)])).is_ok());
     }
 
     /// A state whose only register has the given `obs` entries and generation `seen` entries,
@@ -788,7 +801,9 @@ mod tests {
         }
         w.u8(0); // soi
         w.len(0); // slots
-        w.len(0); // vv
+        w.len(1); // vv: A has written the life and the register
+        w.wid(&wr);
+        w.hlc(Hlc::new(2, 0));
         w.len(0); // losses
         w.0
     }
