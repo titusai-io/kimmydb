@@ -410,5 +410,6 @@ impl Member {
         if !self.loss_pending.is_empty() {
             self.promote_pending(w);
         }
+        self.enforce_k_all(w);
     }
 }

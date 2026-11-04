@@ -11,7 +11,9 @@ impl Member {
         match e.kind {
             Kind::Loss => {
                 let k = e.lkey.expect("a loss entry has a key");
-                self.loss.contains_key(&k) || self.loss_pending.contains_key(&k)
+                self.loss.contains_key(&k)
+                    || self.loss_pending.contains_key(&k)
+                    || self.dropped_loss.contains(&k)
             }
             Kind::Create => self.phys.contains_key(&e.phys),
             Kind::Abandon => match self.phys.get(&e.phys) {
@@ -263,12 +265,19 @@ impl Member {
     fn apply_doc_field(&mut self, w: &mut World, e: &EntryRef) {
         let f = w.f;
         let p = self.phys.get(&e.phys).expect("the physical is alive here");
-        let a = crate::field::apply_entry(p.docs.get(&e.key), e, &w.fopts, p.missing);
-        if w.trace {
-            w.note(format!(
-                "{} applies {} changed={} skipped={} held_state={}",
-                self.name, e, a.changed, a.skipped, a.held_state
-            ));
+        let mut a = crate::field::apply_entry(
+            p.docs.get(&e.key),
+            e,
+            &w.fopts,
+            p.missing,
+            f.fm_stale_version_stamp,
+        );
+        if f.fm_stale_body
+            && a.changed
+            && let Some(old) = self.phys.get(&e.phys).and_then(|p| p.docs.get(&e.key))
+        {
+            // MUTANT: the joined state is kept but the body is not refreshed
+            a.ver.body = old.body.clone();
         }
         self.phys.get_mut(&e.phys).unwrap().docs.insert(e.key, a.ver);
         if a.skipped {
@@ -282,8 +291,13 @@ impl Member {
             self.dochist.insert(e.idx); // m1: retained while the physical is alive here
             self.check_late(w, e);
         }
-        if a.changed {
+        if a.changed || f.fm_always_append {
             self.appended.insert(e.idx);
+        } else if a.same_write {
+            // the entry is the held version itself (stamp equal to the version's): the same entry, a winner (the model's equal stamp),
+            // whatever the append-in-position flag
+            self.appended.insert(e.idx);
+            w.stats.bump("same_write_held");
         } else if f.append_in_position && a.held_state {
             self.appended.insert(e.idx);
             w.stats.bump("appended_in_position");
@@ -343,14 +357,19 @@ impl Member {
                 .as_ref()
                 .map(|s| crate::field::late_cells(s, ks, Some(e.stamp)))
                 .unwrap_or_default();
-            if let Some(ps) = self.page_states.get(&e.idx).cloned() {
+            if w.f.fm_no_page_loss {
+                // MUTANT: a retained page version's late cells are not reported
+            } else if let Some(ps) = self.page_states.get(&e.idx).cloned() {
                 for c in crate::field::late_cells(&ps, ks, None) {
                     if !cells.contains(&c) {
                         cells.push(c);
                     }
                 }
             }
-            for c in cells {
+            for mut c in cells {
+                if w.f.fm_loss_superseder_stamp {
+                    c.stamp = ks; // MUTANT: keyed by the superseding event's stamp
+                }
                 self.report_cell(w, e.key, &c, &e.phys);
             }
             return;

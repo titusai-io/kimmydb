@@ -33,7 +33,7 @@ pub const PY_ONLY_STATS: [&str; 8] = [
 
 /// Counters only the `field` policy keeps (the covered-entry skip, the loss records its joins produce); not in the model, so
 /// excluded from the counter comparison of a `field` replay and from nothing else.
-pub const FIELD_ONLY_STATS: [&str; 2] = ["covered_skips", "q7_records_fresh"];
+pub const FIELD_ONLY_STATS: [&str; 3] = ["covered_skips", "q7_records_fresh", "same_write_held"];
 
 /// FNV-1a over entry ids (each id + 1 is one input): the tracer's `fnv`.
 pub fn fnv<I: IntoIterator<Item = usize>>(ids: I) -> u64 {
@@ -95,7 +95,7 @@ fn sj(mut items: Vec<Value>) -> Value {
     Value::Array(items)
 }
 
-fn entry_v(w: &World, e: &Entry) -> Value {
+pub fn entry_v(w: &World, e: &Entry) -> Value {
     let mut d = json!({"idx": e.idx, "kind": e.kind.name(), "origin": w.name(e.origin), "hlc": e.hlc, "staging": e.staging});
     let o = d.as_object_mut().unwrap();
     if e.kind == Kind::Loss {

@@ -41,6 +41,8 @@ pub struct Member {
     /// received records whose write's physical is not buried here yet
     pub loss_pending: OMap<LKey, Body>,
     pub loss_phys: HashMap<LKey, String>,
+    /// `field` with `K`: records this member entered and then dropped past `K` (never entered again)
+    pub dropped_loss: HashSet<LKey>,
     /// the entries this member appended: the only ones it serves onward
     pub appended: BTreeSet<EntryId>,
     /// (phys, key, stamp) of page records held as an unfinished join's state, out of position
@@ -98,6 +100,7 @@ impl Member {
             loss: OMap::new(),
             loss_pending: OMap::new(),
             loss_phys: HashMap::new(),
+            dropped_loss: HashSet::new(),
             appended: BTreeSet::new(),
             held_records: HashSet::new(),
             state_held: HashMap::new(),
