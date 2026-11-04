@@ -215,14 +215,17 @@ enum IncPlan {
     Nothing,
     /// A double base: a register write of the computed value.
     Register(Value),
-    /// A counter slot of the writer in `life`, with its new total.
-    Slot {
-        life: MStamp,
-        key: (MStamp, Path, WriterId, Option<MStamp>),
-        total: Num,
-        op: Num,
-        generation: Option<MStamp>,
-    },
+    /// A counter slot of the writer, with its new total.
+    Slot(Box<SlotPlan>),
+}
+
+/// The counter slot an `$inc` writes: in `life`, at `key`, to `total`.
+struct SlotPlan {
+    life: MStamp,
+    key: (MStamp, Path, WriterId, Option<MStamp>),
+    total: Num,
+    op: Num,
+    generation: Option<MStamp>,
 }
 
 /// The outcome of absorbing a state.
@@ -994,7 +997,7 @@ impl Writer {
             return None;
         }
         let mut items = Items::new();
-        if vis.get(path).is_none() {
+        if !vis.contains_key(path) {
             if !self.opts.ord_noop_unset_stands() {
                 return None;
             }
@@ -1052,7 +1055,7 @@ impl Writer {
         if res.kind() == Kind::Int64 && !self.opts.slot_never_widens() {
             total = total.widened();
         }
-        Some(IncPlan::Slot { life, key, total, op, generation })
+        Some(IncPlan::Slot(Box::new(SlotPlan { life, key, total, op, generation })))
     }
 
     /// The body of [`Writer::write_inc`], with the stamp from `m`. `op` is the operand with its
@@ -1073,7 +1076,8 @@ impl Writer {
                 eff.put(p.clone(), v);
                 self.commit(eff, &items, m)
             }
-            IncPlan::Slot { life, key, total, op, generation } => {
+            IncPlan::Slot(plan) => {
+                let SlotPlan { life, key, total, op, generation } = *plan;
                 let known = self.known();
                 let st = self.mint(m)?;
                 self.state.vv.insert(st.writer, st.hlc);
@@ -1225,7 +1229,7 @@ impl Writer {
             }
             match op {
                 UpdateOp::Unset(p) => {
-                    if vis.get(p).is_some() {
+                    if vis.contains_key(p) {
                         unset_subtree(&vis, p, &mut eff, &mut items, &self.opts);
                         changed = true;
                     } else if self.opts.ord_noop_unset_stands() {
@@ -1252,7 +1256,8 @@ impl Writer {
                             eff.put(p.clone(), v);
                             changed = true;
                         }
-                        IncPlan::Slot { life, key, total, .. } => {
+                        IncPlan::Slot(plan) => {
+                            let SlotPlan { life, key, total, .. } = *plan;
                             slots.push((life, key, total));
                             changed = true;
                         }

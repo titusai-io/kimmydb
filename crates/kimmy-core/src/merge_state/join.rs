@@ -266,6 +266,7 @@ macro_rules! switch {
             self.$name
         }
         #[cfg(not(any(test, feature = "merge-mutants")))]
+        #[allow(dead_code)]
         pub(super) fn $name(&self) -> bool {
             $correct
         }

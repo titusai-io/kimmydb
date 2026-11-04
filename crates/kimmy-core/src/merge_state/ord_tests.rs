@@ -793,7 +793,9 @@ fn the_writer_feeds_a_top_level_field_named_empty_as_a_field() {
 fn the_order_switches_change_the_outcome_of_named_scenarios() {
     type Set = fn(&mut JoinOptions);
     // (switch, how to set it, scenarios killed through the read, scenarios killed through the feed)
-    let switches: [(&str, Set, &[&str], &[&str], &[&str]); 16] = [
+    // (switch, how to set it, killed through the read, the bare feed, the Writer API)
+    type Row<'a> = (&'a str, Set, &'a [&'a str], &'a [&'a str], &'a [&'a str]);
+    let switches: [Row; 16] = [
         (
             "ord_keep_all",
             |o| o.set_ord_keep_all(true),

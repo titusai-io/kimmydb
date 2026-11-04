@@ -35,8 +35,9 @@
 //! `reference_model/q7diff_gen6.py`, at `ODD_LEAVES`.
 //!
 //! `Q7DIFF_NESTED_RUNS=<n>` sets the number of scripts (default 300). `python3` must be on the
-//! PATH: if it is not, the tests FAIL (they do not skip). No `merge-mutants` feature is needed
-//! for the replay; with it, the test `rust_mutants_are_caught_by_the_replay` turns each nested
+//! PATH: if it is not, the tests FAIL (they do not skip). The `merge-mutants` feature is needed (`Cargo.toml`: the replay
+//! sets the stage-A rule that a write which only reorders fields is a no-op, the model having no field order);
+//! the test `rust_mutants_are_caught_by_the_replay` turns each nested
 //! mutation switch on and requires the replay to disagree.
 
 #[path = "common/fingerprint.rs"]

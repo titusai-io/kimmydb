@@ -24,7 +24,10 @@
 //! `Q7DIFF_RUNS=<n>` sets the number of scripts (default 300, about a minute in a debug build).
 //! `python3` must be on the PATH: if it is not, the tests FAIL (they do not skip).
 //!
-//! No `merge-mutants` feature is needed: nothing here reads a mutation switch.
+//! The `merge-mutants` feature is needed (`Cargo.toml`): the replay sets the stage-A rule that a write which only
+//! reorders the fields is a no-op (the model has no field order), and compares states WITHOUT their order state
+//! (`fingerprint::without_ords`, a named restriction lifted at the D8 re-vendor); the order state meets a model
+//! that has it in `merge_state_ord_diff`.
 
 #[path = "common/fingerprint.rs"]
 mod fingerprint;
