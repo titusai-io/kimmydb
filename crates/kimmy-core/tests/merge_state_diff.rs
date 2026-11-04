@@ -607,7 +607,10 @@ fn replay(dir: &std::path::Path) -> Verdict {
 /// with the model, with the order state left out, and did not change (the Group A pin was the same figure).
 ///
 /// RE-PINNED for the D8 re-vendor (the A2.3 model, the flat generator's new draws): 0x2aee_26c6_deda_603d to 0xfbde_c4a1_8eb1_bb13.
-const PINNED_300: u64 = 0xfbde_c4a1_8eb1_bb13;
+///
+/// RE-PINNED when the generator drew an Unset field in an insert again (the Writer drops such a field): 0xfbde_c4a1_8eb1_bb13 to
+/// 0x5f0f_3ecf_ab90_7bba. The scripts changed (an insert draws one more value); the code under test did not change for the re-pin.
+const PINNED_300: u64 = 0x5f0f_3ecf_ab90_7bba;
 
 #[test]
 fn differential_against_the_python_model() {
