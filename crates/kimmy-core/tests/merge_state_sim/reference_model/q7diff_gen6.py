@@ -64,8 +64,8 @@ def _load(name, fname):
 
 
 # the vendored files, byte for byte; pullmodel6_stageA.py imports its model as `model6`
-M = _load("model6", "model6_stageA.py")
-PM = _load("pullmodel6_stageA", "pullmodel6_stageA.py")
+M = _load("model6", "model6.py")
+PM = _load("pullmodel6", "pullmodel6.py")
 
 I64_MAX = 2 ** 63 - 1
 

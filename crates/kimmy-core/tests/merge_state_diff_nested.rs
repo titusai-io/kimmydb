@@ -791,3 +791,23 @@ fn rust_mutants_are_caught_by_the_replay() {
         assert!(!v.fails.is_empty(), "the replay missed the Rust mutant: {what}");
     }
 }
+
+/// The vendored reference model is the reviewed one, byte for byte: the sha256 of `model6.py` (A2.3) and of
+/// `pullmodel6.py`, as recorded in `reference_model/MODEL-HASHES.txt`. Both differentials, the sim's scripts and the Ord
+/// differential's fixture are made from these files; a changed byte fails here before it fails anywhere else.
+#[test]
+fn the_vendored_model_is_the_reviewed_one() {
+    use sha2::{Digest, Sha256};
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/merge_state_sim/reference_model");
+    for (file, want) in [
+        ("model6.py", "72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d"),
+        ("pullmodel6.py", "e68fbe0470ffdaf4a9406573c5fd1ead7f5fe2ee2fe39b76a6a3eb1a0734bf1b"),
+    ] {
+        let bytes = std::fs::read(dir.join(file)).unwrap();
+        let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, want, "{file}");
+    }
+    let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
+    assert!(recorded.contains("72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d"));
+    assert!(recorded.contains("e68fbe0470ffdaf4a9406573c5fd1ead7f5fe2ee2fe39b76a6a3eb1a0734bf1b"));
+}

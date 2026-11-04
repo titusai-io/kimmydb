@@ -34,7 +34,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import model5 as M  # noqa: E402
+import model6 as M  # noqa: E402
 
 
 def _bits(x):

@@ -35,6 +35,8 @@ SNAP_LOSS_ENTRIES = True     # D10: a join that detects a loss appends its entry
 HOLES = True                 # ADR-224 holes on a snapshot grant
 APPEND_ALL_LOSS = False      # variant: a member appends every loss entry it witnesses
 NORMALIZE_WRITES = True      # see finish()
+COVERED_SKIP = True          # Q3 (A2): a writer entry whose version vector the receiver already covers is not joined (the plan's C8 pre-check)
+START_HLC = True             # Q3 (A2): a never-witnessed origin's pull threshold is its epoch's start hlc, not 0
 
 
 EPOCH_FROM_BACKUP = False      # mutant for V4M2
@@ -96,7 +98,9 @@ class Node(M.Member):
     def receive_entry(self, ent):
         st = ent[1]
         if ent[0] == "w":
-            if self._absorb(M.unwire(ent[2])) and okey(st) not in self.oplog:
+            if COVERED_SKIP and all(self.state.vv.get(w, 0) >= h for w, h in ent[2].vv.items()):
+                self.covered_skips = getattr(self, "covered_skips", 0) + 1
+            elif self._absorb(M.unwire(ent[2])) and okey(st) not in self.oplog:
                 self._append(ent)
         else:
             key, val = ent[2], ent[3]
@@ -137,12 +141,19 @@ class Node(M.Member):
         return True
 
 
+def start_hlc(o):
+    """The start hlc of an origin's epoch: no entry of that origin is older (a restore's epoch is its start hlc plus 64 random bits)."""
+    if START_HLC and isinstance(o, tuple) and isinstance(o[1], int) and o[1] > 0:
+        return o[1] >> 64
+    return 0
+
+
 def pull(p, r, limit=None):
     """p pulls from r. Returns True if anything was applied or witnessed."""
     behind = [o for o, h in r.servable.items() if h > p.witnessed.get(o, 0)]
     if not behind:
         return False
-    thr = min(p.witnessed.get(o, 0) for o in behind)
+    thr = min(p.witnessed.get(o, start_hlc(o)) for o in behind)
     if any(p.witnessed.get(o, 0) < h and p.witnessed.get(o, 0) < r.hole.get(o, 0)
            for o, h in r.servable.items()):
         p.snapshot_from(r)                      # BeyondHorizon (a hole): take the snapshot
@@ -247,11 +258,11 @@ def draw_op(rnd, m, log, skew, nested, upsert_soi=False):
     """One client operation. nested=False reproduces the flat workload of the earlier model draw for draw."""
     if nested and rnd.random() < 0.6:
         k = rnd.choice(["inc", "inc", "inc", "set", "set", "set", "setp", "setp", "unset", "unset", "unsetp", "replace",
-                        "shuffle", "setmany", "push", "incqty", "insert", "delete"])
+                        "shuffle", "setmany", "update", "update", "push", "incqty", "insert", "delete"])
         if k == "inc":
             m.write("inc", rnd.choice(["acct.balance", "acct.balance", "a.b", "a.c", "a.d.e", "x", "y"]), rnd.choice([1, 5, 20, -3, 50]), log, skew)
         elif k == "set":
-            m.write("set", rnd.choice(LEAVES), rnd.choice([0, 1, 7, 500, "s", 2.5]), log, skew)
+            m.write("set", rnd.choice(LEAVES), rnd.choice([0, 1, 7, 500, "s", 2.5, None]), log, skew)   # None = a stored null
         elif k == "setp":
             t = rnd.choice(PARENTS)
             m.write("set", t, rnd.choice(SUBDOCS[t] * 2 + SCALARS), log, skew)
@@ -265,6 +276,21 @@ def draw_op(rnd, m, log, skew, nested, upsert_soi=False):
             vis = m.state.visible()
             if vis:
                 m.write("replace", None, shuffled(rnd, vis), log, skew)
+        elif k == "update":
+            a, b, c = rnd.sample(LEAVES + PARENTS, 3)
+            ops = []
+            for q in (a, b, c):
+                if not (all(disjoint(q, o[1]) for o in ops)):
+                    continue
+                kind = rnd.choice(["set", "unset", "inc", "inc"])
+                if kind == "set":
+                    ops.append(("set", q, rnd.choice(SUBDOCS[q]) if q in SUBDOCS else rnd.choice([0, 1, "s", None])))
+                elif kind == "unset":
+                    ops.append(("unset", q, None))
+                else:
+                    ops.append(("inc", q, rnd.choice([1, 5, -3])))
+            if ops:
+                m.write("update", None, ops, log, skew)
         elif k == "setmany":
             a, b = rnd.sample(LEAVES + PARENTS, 2)
             if disjoint(a, b):
@@ -343,7 +369,7 @@ DEVIATIONS = []      # order mismatches explained by the ruling-(a) approximatio
 def grade(ms, log):
     errs = []
     if len({m.state.canon() for m in ms}) != 1:
-        names = ["lives", "dead", "deletes", "regs", "slots", "vv", "losses", "ords"]
+        names = ["lives", "dead", "deletes", "regs", "slots", "vv", "losses", "ords", "absorbed"]
         cs = [m.state.canon() for m in ms]
         errs.append(("diverged", tuple(n for i, n in enumerate(names) if len({c[i] for c in cs}) > 1)))
         return errs

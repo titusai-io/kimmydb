@@ -26,7 +26,7 @@ dead lives are dropped. Visible value of p = newest base among alive lives + sum
 Horizon H(state) = max(vv) - RETENTION: a pure function of the state; records with loser hlc < H are
 filtered on every join.
 """
-import copy, itertools, random, sys
+import copy, itertools, random, struct, sys
 
 GENESIS = None
 HORIZON_FIRST = True      # V3M1
@@ -49,12 +49,17 @@ ARRAYS_ELEMENTWISE = False # mutant: concurrent array registers merge element-wi
 NO_IMPLICIT_MARKER = False  # mutant: a leaf write under an absent map writes no marker (an emptied map vanishes)
 # option A (field order). ORDER_STATE False = the model without order state (visible keys sorted by path, as before).
 ORDER_STATE = True
+ABSORBED = True            # Q6: a counter cell remembers the highest (stamp, total) of each slot that any base write observed
 COPY_DEEP = False          # State.copy by copy.deepcopy (the model5 way) instead of the structural copy
 ORD_GC = False             # collect an Ord with no valid candidate and a floor older than the horizon
 ORD_COMPACT = False        # variant: a cell's born stamp is omitted on the wire when it equals the cell's register stamp
 ORD_NO_LAST = False        # mutant: the register's own write is not a born candidate
 ORD_NO_RESET = False       # mutant: a replace does not reset the candidates (fields keep their old position)
 ORD_SURVIVOR_CLAMP = True  # a field that exists only through increments an unset never saw is ordered right after the unset
+ORD_NOOP_UNSET_FLOOR = "hybrid"  # F1 (manager's ruling): False = a no-op unset leaves no trace; True = even a STANDALONE no-op unset is a write; 'hybrid' (default) = the floor rides on an update another change already stamps (metadata only, no extra entry)
+NULL = "\x00null"            # a stored, present null (`$set x null`): a register value, distinct from an unset
+ORD_UPDATE_BIT = True       # the u floor remembers whether its write also wrote other fields (survivors go after all of them)
+ORD_REPLACE_VV = False     # Q4(b): a replace's `r` floor carries the replace's version vector; candidates it does not cover survive the reset and go after it
 ORD_LEVEL_FLOOR = True     # a document-valued write (replace, $set of a document) orders the fields it never saw AFTER its own
 ORD_KEEP_ALL = False       # mutant: candidates are not filtered by the unset floor
 ORD_LATEST = False         # mutant: born = the LATEST candidate instead of the earliest
@@ -62,6 +67,15 @@ ORD_BY_NAME = False        # mutant: the visible order ignores the order state (
 ORD_NO_ANCESTOR = False    # mutant: a write below a map is not a write to the map (the ancestors get no candidate)
 ORD_NO_POS = False         # mutant: the position inside a write is ignored (every field of a write has pos 0)
 ORD_COMPACT_LOSSY = False  # mutant: the compact wire form also drops `last` (not just a stamp equal to the register's)
+
+
+def nn(v):
+    """Python None inside a document value means a stored null (the reference), not an unset."""
+    if v is None:
+        return NULL
+    if isinstance(v, dict):
+        return {k: nn(x) for k, x in v.items()}
+    return v
 
 
 def parent_of(p):
@@ -130,9 +144,39 @@ def cov(vv, stamp):
     return vv.get(stamp[1], 0) >= stamp[0]
 
 
+class Dec128(str):
+    """A2.1 (review m5): stand-in for a stored Decimal128. The string is its representation (the Rust diff compares the 16 bytes, so `1.0` and
+    `1.00` are different values); two Dec128 are the same only when the text is identical. A distinct type, so it never equals a plain
+    string, an int or a double of the same text or numeric value. The model gives it no arithmetic (it is a non-numeric register value)."""
+    __slots__ = ()
+
+
+def _bits(x):
+    return struct.pack("<d", x)
+
+
 def same(a, b):
-    """Q4 (ruled): the diff compares value AND type, as the reference does: `$set 2` over 2.0 is a write."""
-    return type(a) is type(b) and a == b
+    """Q4 (ruled) and the diff revision of 2026-11-03: the diff compares TYPE and then VALUE, as the Rust diff does. Doubles compare by BIT
+    PATTERN (`-0.0` over `0.0` is a write; a NaN over the same NaN bit pattern is a no-op, a different NaN payload is a write);
+    Decimal128 (`Dec128`) by its representation; everything else by value and type (Int32, Int64 and Double of equal value are different;
+    in the model one `int` type stands for the two integer widths). An array (tuple) compares element by element with this rule."""
+    ta = type(a)
+    if ta is not type(b):
+        return False
+    if ta is float:
+        return _bits(a) == _bits(b)
+    if ta is tuple or ta is list:
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+    if ta is dict:
+        return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+    return a == b
+
+
+def ordered_same(a, b):
+    """Two visible values with the same field order and `same()` leaves (the no-op check of a replace or an order-only `$set`)."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return len(a) == len(b) and all(ka == kb and ordered_same(a[ka], b[kb]) for ka, kb in zip(a, b))
+    return same(a, b)
 
 
 def numeric(v):
@@ -164,7 +208,11 @@ class Ord:
         if c is None:
             return False
         f = self.floor
-        return f is None or ORD_KEEP_ALL or c[0] > f[0] or (c[0] == f[0] and f[1] == "r")
+        if f is None or ORD_KEEP_ALL or c[0] > f[0] or (c[0] == f[0] and f[1] == "r"):
+            return True
+        if ORD_REPLACE_VV and f[1] == "r" and len(f) > 2:
+            return dict(f[2]).get(c[0][1], 0) < c[0][0]          # concurrent with the replace: it survives the reset
+        return False
 
     def normalise(self):
         self.firsts = {w: c for w, c in self.firsts.items() if self.valid(c)}
@@ -177,6 +225,9 @@ class Ord:
         cs = [c for c in cs if self.valid(c)]
         if not cs:
             return None
+        f = self.floor
+        if ORD_REPLACE_VV and f is not None and f[1] == "r" and len(f) > 2:
+            cs = [(f[0], 10 ** 9, c) if c[0] < f[0] else c for c in cs]       # survivors of the reset go after the replace's own fields
         return max(cs) if ORD_LATEST else min(cs)
 
     def key(self):
@@ -252,13 +303,17 @@ def unwire(state):
 
 
 def ord_bytes(state, compact):
-    """Design-size estimate of the order state in bytes: a stamp is 11 B, a writer index 1 B, a position 1 B (varint),
-    a floor 12 B. Returns (bytes, number of Ord entries, number of cells)."""
+    """Design-size estimate of the order state in bytes (A2.1 layout, INTERFACE.md section 4): a stamp is 11 B, a writer index 1 B, a position
+    1 B (varint). The floor is ONE presence-and-kind byte for every Ord (0 none, 1 `u`, 2 `r`, 3 `u` with the update bit), then, if present,
+    its stamp (11 B), then for a `u` floor `prev` as a 10 B HLC; no vv in an `r` floor. `last` and `lvl` are optional (their presence rides in
+    spare bits of the floor byte, 0 B); `lvl` is a stamp (11 B). The count of `firsts` is not counted (as before). Returns (bytes, number of
+    Ord entries, number of cells)."""
     total = 0
     for k, o in state.ords.items():
         rs = _regstamp(state, k)
+        total += 1                                        # floor presence-and-kind byte (the update bit is part of the kind: 0 B)
         if o.floor:
-            total += 12 + (11 if o.floor[1] == 'u' else 0)
+            total += 11 + (10 if o.floor[1] == 'u' else 0)    # stamp, then prev as a 10 B HLC for `u`
         if o.lvl is not None:
             total += 11
         for wr, c in o.firsts.items():
@@ -275,6 +330,7 @@ class State:
         self.lives, self.deletes, self.regs, self.slots = {}, {}, {}, {}
         self.gens, self.vv, self.losses = {}, {}, {}
         self.ords = {}             # option A: (life, path) -> Ord (the field-order state)
+        self.absorbed = {}         # Q6: slot key (life, path, writer, gen) -> the highest (slot stamp, total) any base write observed
         self.dead = set()          # lives known dead; grow-only until their stamp passes the horizon
         self.contained = set()      # ORACLE ONLY
 
@@ -288,6 +344,7 @@ class State:
         n.lives, n.deletes, n.regs, n.slots = dict(self.lives), dict(self.deletes), dict(self.regs), dict(self.slots)
         n.gens, n.vv, n.losses = dict(self.gens), dict(self.vv), dict(self.losses)
         n.ords = {k: o.copy() for k, o in self.ords.items()}
+        n.absorbed = dict(self.absorbed)
         n.dead, n.contained = set(self.dead), set(self.contained)
         return n
 
@@ -310,7 +367,7 @@ class State:
                 tuple(sorted(self.vv.items())), f(self.losses))
         if not with_ords:
             return base
-        return base + (tuple(sorted((repr(k), repr(o.key())) for k, o in self.ords.items())),)
+        return base + (tuple(sorted((repr(k), repr(o.key())) for k, o in self.ords.items())), tuple(sorted((repr(k), repr(v)) for k, v in self.absorbed.items())))
 
     # --- read side -----------------------------------------------------------
     def suppressed(self, k, r, al=None):
@@ -360,6 +417,16 @@ class State:
         paths = sorted({k[1] for k in self.slots if k[0] in al})
         return {p: h for p in paths for h in [self.hidden(p)] if h}
 
+    def eff_obs(self, obs, k):
+        """What has been observed of slot k: the winning base's own observation, or (Q6) the highest observation any base write
+        on the path made, whichever is later."""
+        o = obs.get(k[0:1] + k[2:])
+        if ABSORBED:
+            a = self.absorbed.get(k)
+            if a is not None and (o is None or a[0] > o[0]):
+                return a
+        return o
+
     def value(self, p):
         regs = [(r, k) for k, r in self.live_regs(p)]
         win = max(regs, key=lambda x: x[0][0])[0] if regs else None
@@ -369,7 +436,7 @@ class State:
         obs = win[2] if win is not None else {}
         total, seen = (base if base is not None else 0), base is not None
         for k in sorted(self.counted(p), key=repr):
-            o = obs.get(k[0:1] + k[2:])
+            o = self.eff_obs(obs, k)
             d = self.slots[k][1] - (o[1] if o else 0)
             if d or o is None or o[0] != self.slots[k][0]:    # B1: the slot moved since the base saw it, even if it nets to 0
                 total += d
@@ -395,7 +462,11 @@ class State:
         after_known = (floor[2], ("\U0010ffff", 0)) if len(floor) > 2 else None      # just after hlc `prev`
         out = []
 
+        others = len(floor) > 3 and floor[3] and ORD_UPDATE_BIT
+
         def place(c):
+            if others:       # the unsetting write also wrote other fields: what survives it is replayed after ALL of that write
+                return (fstamp, 10 ** 9, c)
             return c if after_known is None or c[0] >= after_known else (after_known, 0)
 
         def slot_survivors(q):
@@ -403,11 +474,15 @@ class State:
             obs = win[2] if win is not None else {}
             r = []
             for k, v in self.counted(q).items():
-                o_ = obs.get(k[0:1] + k[2:])
+                o_ = self.eff_obs(obs, k)
                 if v[0] < fstamp and ((v[1] - (o_[1] if o_ else 0)) != 0 or o_ is None or o_[0] != v[0]):
                     r.append(place((v[0], 0)))
             return r
         out += slot_survivors(p)
+        win_p = self.winner(p)
+        if win_p is not None and is_val(win_p[1]) and win_p[0] < fstamp:
+            # only reachable with the no-op-unset variant: a floor with no unset register above p's own value
+            out.append(place((win_p[0], 0)))
         for q in sorted({k[1] for k in list(self.regs) + list(self.slots) if k[0] in al and is_under(k[1], p)}):
             win = self.winner(q)
             if win is not None and is_val(win[1]) and win[0] < fstamp:
@@ -546,6 +621,9 @@ def join(s, t, tag=None):
     for k, g in t.gens.items():
         if ok(k[0]) and (k not in out.gens or g[0] > out.gens[k][0]):
             out.gens[k] = copy.deepcopy(g)
+    for k, v in t.absorbed.items():
+        if ok(k[0]) and (k not in out.absorbed or v[0] > out.absorbed[k][0]):
+            out.absorbed[k] = v
     for k, o in t.ords.items():
         if ok(k[0]):
             out.ords[k] = ord_join(out.ords.get(k), o)
@@ -617,7 +695,7 @@ def join(s, t, tag=None):
                 if k[0] in out.lives and out.lives[k[0]][2] == "upsert" and len(r) > 4 and r[4] == "soi" and k[0] in al:
                     new[("insertLost", k[1], r[0])] = r[1]
     # drop cells of dead lives; filter records by the horizon
-    for store in (out.regs, out.slots, out.gens, out.ords):
+    for store in (out.regs, out.slots, out.gens, out.ords, out.absorbed):
         for k in [k for k in store if k[0] not in al]:
             del store[k]
     H = out.horizon()
@@ -674,7 +752,18 @@ class Member:
         s = self.state
         L = self._write_life()
         gen = (st, dict(vvnow), self._seen(p)) if not numeric(v) else s.gen_of(p)
-        s.regs[(L, p)] = (st, v, self._obs(p), gen)
+        obs = self._obs(p)
+        s.regs[(L, p)] = (st, v, obs, gen)
+        if ABSORBED:
+            # A2.1 (review M2): fold EVERY slot of the path this writer holds in an alive life, of any generation, with its stamp (the set
+            # `_seen` computes), not only the counted ones (`obs`): an increment the writer holds but a newer generation hides was
+            # still in the writer's causal past, so no other base may count it again. `obs` is a subset, folded first.
+            held = {(k[0], k[2], k[3]): (v[0], v[1]) for k, v in s.slots.items() if k[1] == p and k[0] in set(s.alive())}
+            for src in (obs, held):
+                for (l2, w2, g2), sv in src.items():
+                    key = (l2, p, w2, g2)
+                    if key not in s.absorbed or sv[0] > s.absorbed[key][0]:
+                        s.absorbed[key] = sv
         if not numeric(v):
             s.gens[(L, p)] = (st, dict(vvnow))      # kept only for the V3M3 mutant
 
@@ -721,11 +810,13 @@ class Member:
                     s.ords[(L, p)] = o
                 continue
             if mode == "u":
-                o.floor = max(f for f in (o.floor, (st, "u", getattr(self, "known", 0))) if f is not None)
+                others = any(m_ not in ("u", "L") for _, m_, _ in events)       # the unsetting write also writes other fields
+                o.floor = max(f for f in (o.floor, (st, "u", getattr(self, "known", 0), others)) if f is not None)
                 o.normalise()
             else:
                 if mode == "r" and not ORD_NO_RESET:
-                    o.floor = max(f for f in (o.floor, (st, "r")) if f is not None)
+                    fl = (st, "r", tuple(sorted(s.vv.items()))) if ORD_REPLACE_VV else (st, "r")
+                    o.floor = max(f for f in (o.floor, fl) if f is not None)
                 o.normalise()
                 if w not in o.firsts:
                     o.firsts[w] = (st, pos)
@@ -737,6 +828,7 @@ class Member:
         s = self.state
         if s.alive():
             return None
+        fields = nn(fields)
         orig = fields
         fields = flatten_doc(fields)            # a nested document is its leaves plus a marker at each map
         st = self.tick(skew)
@@ -772,15 +864,17 @@ class Member:
                 s.gens[(st, q)] = (st, {st[1]: st[0]})
             vals[q] = v
         s.vv[st[1]] = st[0]
-        self._ord_apply(self._events([(q, "w") for q in vals]), st, L=st)
+        items = self._upsert_items(vals)
+        self._ord_apply(self._events(items), st, L=st)
         self.finish(st, log, {"kind": "insert", "upsert": True, "insert": True, "life": st, "paths": list(vals),
-                              "vals": vals, "soi": list(fields), "items": [(q, "w") for q in vals]})
+                              "vals": vals, "soi": list(fields), "items": items})
         st2 = self.tick(skew)
         s = self.state                       # finish() normalised the writer's state into a new object
         s.vv[st2[1]] = st2[0]
         s.slots[(st, p, self.wid, None)] = (st2, n)
-        self._ord_apply(self._events([(p, "w")]), st2, L=st)
-        return self.finish(st2, log, {"kind": "inc", "life": st, "paths": [p], "n": n, "gen": None, "items": [(p, "w")]})
+        items = self._upsert_items([p])
+        self._ord_apply(self._events(items), st2, L=st)
+        return self.finish(st2, log, {"kind": "inc", "life": st, "paths": [p], "n": n, "gen": None, "items": items})
 
     def upsert_inc(self, p, n, log, skew=0):
         s = self.state
@@ -789,8 +883,9 @@ class Member:
         st = self.tick(skew)
         s.lives[st] = (frozenset(s.deletes), (), "upsert")
         s.slots[(st, p, self.wid, None)] = (st, n)
-        self._ord_apply(self._events([(p, "w")]), st, L=st)
-        return self.finish(st, log, {"kind": "inc", "life": st, "paths": [p], "n": n, "gen": None, "insert": True, "items": [(p, "w")]})
+        items = self._upsert_items([p])
+        self._ord_apply(self._events(items), st, L=st)
+        return self.finish(st, log, {"kind": "inc", "life": st, "paths": [p], "n": n, "gen": None, "insert": True, "items": items})
 
     # leaf effects of a write (D4/D6/D7): the diff against what the writer SAW
     def _unset_subtree(self, path, o, eff, items):
@@ -846,19 +941,95 @@ class Member:
     def _anc_items(p):
         return [] if ORD_NO_ANCESTOR else [(a, "w") for a in ancestors(p)]
 
-    def _marker_write(self, p, log, skew):
-        """`$inc` creating a map: the markers of the absent ancestors are written first, as their own write by the same
-        writer (decision D-3: like the two-write upsert; a combined write would need the oracle to know a write
-        that is both a register and a counter write)."""
+    def _upsert_items(self, paths):
+        """The order items of an upsert body (A2.3): each path names its ancestors first, each ancestor once, then itself."""
+        items, seen = [], set()
+        for q in paths:
+            items += [(a, m_) for a, m_ in self._anc_items(q) if a not in seen]
+            seen.update(a for a, _ in self._anc_items(q))
+            items.append((q, "w"))
+        return items
+
+    def _update(self, ops, intent, vis, log, skew):
+        """ONE write, ONE stamp, for a list of `$set` / `$unset` / `$inc` operators on pairwise disjoint paths, effects and
+        positions in update-document order. Atomic: any refusal refuses the whole update (returns None). A write that
+        needs both register effects (a value, a marker for a map it creates, an unset) and increments is kind 'reg' with
+        an `incs` dict (the oracle reads both); a lone `$inc` of an existing path stays kind 'inc'."""
         s = self.state
-        vis = s.visible()
-        miss = [a for a in ancestors(p) if getp(vis, a) is None]
-        if not miss or NO_IMPLICIT_MARKER:
-            return
+        ps = [p for _, p, _ in ops]
+        for i, a_ in enumerate(ps):
+            for b_ in ps[i + 1:]:
+                if a_ == b_ or is_under(a_, b_) or is_under(b_, a_):
+                    return None                       # conflicting paths in one update: the reference refuses
+        eff, items, incs, seen_anc, changed, pending_noop = {}, [], {}, set(), False, []
+
+        def ancestors_of(p):
+            for a in ancestors(p):
+                if a not in seen_anc:
+                    seen_anc.add(a)
+                    if not ORD_NO_ANCESTOR:
+                        items.append((a, "w"))
+                    if getp(vis, a) is None and not NO_IMPLICIT_MARKER:
+                        eff[a] = MAPI
+        for op, p, arg in ops:
+            if any(getp(vis, a) is not None and not isinstance(getp(vis, a), dict) for a in ancestors(p)):
+                return None                           # the reference cannot create a field in a non-document
+            cur = getp(vis, p)
+            if op == "unset":
+                if cur is None:
+                    if ORD_NOOP_UNSET_FLOOR == "hybrid":    # manager's ruling: only metadata, and only inside an update another change already stamps
+                        pending_noop.append((p, "u"))
+                    elif ORD_NOOP_UNSET_FLOOR:              # variant: a STANDALONE no-op unset is still a write that raises the u floor
+                        items.append((p, "u"))
+                        changed = True
+                    continue
+                self._unset_subtree(p, cur, eff, items)
+                changed = True
+            elif op == "set":
+                ancestors_of(p)
+                n0 = len(eff)
+                self._diff(p, cur, arg, eff, items, "w")
+                changed = changed or len(eff) > n0 or (isinstance(arg, dict) and not ordered_same(cur, arg))
+            else:                                     # inc
+                if isinstance(cur, (dict, tuple)):
+                    return None
+                if numeric(cur) and not (-BOUND - 1 <= (cur or 0) + arg <= BOUND):
+                    return None                       # Q11 (Chris): a local $inc past the bound is refused (400)
+                if not numeric(cur):
+                    if not isinstance(cur, float):
+                        return None                   # a string, a null: 400
+                    ancestors_of(p)                   # Nm5: a double base is a register write that starts a generation
+                    n0 = len(eff)
+                    self._diff(p, cur, cur + arg, eff, items, "w")
+                    changed = changed or len(eff) > n0
+                    continue
+                ancestors_of(p)
+                incs[p] = arg
+                items.append((p, "w"))
+                changed = True
+        if not changed:
+            return None
+        items.extend(pending_noop)                    # the hybrid: the floors of the no-op unsets ride on a write that exists anyway
         st = self.tick(skew)
         s.vv[st[1]] = st[0]
-        eff = {a: MAPI for a in miss}
-        self._write_effects(eff, ("implicit", None, None), self._anc_items(p), st, log)
+        L = self._write_life()
+        for q, v in eff.items():
+            self._setreg(q, v, st, s.vv)
+        gens = {}
+        for q, n in incs.items():
+            g = s.gen_of(q)
+            G = g[0] if g else None
+            old = s.slots.get((L, q, self.wid, G))
+            s.slots[(L, q, self.wid, G)] = (st, (old[1] if old else 0) + n)
+            gens[q] = G
+        self._ord_apply(self._events(items), st)
+        if incs and not eff and len(incs) == 1:
+            (q, n), = incs.items()
+            return self.finish(st, log, {"kind": "inc", "life": L, "paths": [q], "n": n, "gen": gens[q], "items": items})
+        meta = {"kind": "reg", "life": L, "paths": list(eff), "vals": dict(eff), "intent": intent, "items": list(items)}
+        if incs:
+            meta["incs"], meta["ipaths"] = dict(incs), list(incs)
+        return self.finish(st, log, meta)
 
     def write(self, op, p, arg, log, skew=0):
         s = self.state
@@ -880,83 +1051,30 @@ class Member:
                 if not isinstance(cur, tuple) or not cur or not isinstance(cur[0], int) or isinstance(cur[0], bool):
                     return None
                 arg, op = (cur[0] + arg,) + cur[1:], "set"
-        if op == "setmany":                          # $set with several paths, in update-document order
-            eff, items, seen_anc, changed = {}, [], set(), False
-            for p_, v_ in arg:
-                if any(isinstance(getp(vis, a), (int, float, str, tuple)) for a in ancestors(p_)):
-                    return None
-                cur_ = getp(vis, p_)
-                for a in ancestors(p_):
-                    if a not in seen_anc:
-                        seen_anc.add(a)
-                        if not ORD_NO_ANCESTOR:
-                            items.append((a, "w"))
-                        if getp(vis, a) is None and not NO_IMPLICIT_MARKER:
-                            eff[a] = MAPI
-                n0 = len(eff)
-                self._diff(p_, cur_, v_, eff, items, "w")
-                changed = changed or len(eff) > n0 or (isinstance(v_, dict) and ordered(cur_) != ordered(v_))
-            if not eff and not changed:
-                return None
-            st = self.tick(skew)
-            s.vv[st[1]] = st[0]
-            return self._write_effects(eff, ("setmany", None, list(arg)), items, st, log)
-        if op in ("set", "unset", "inc"):
-            if op == "set" and arg is None:
-                op = "unset"
-            if any(getp(vis, a) is not None and not isinstance(getp(vis, a), dict) for a in ancestors(p)):
-                return None                           # the reference cannot create a field in a non-document
-            cur = getp(vis, p)
-            if op == "unset":
-                if cur is None:
-                    return None
-                eff, items = {}, []
-                self._unset_subtree(p, cur, eff, items)
-                st = self.tick(skew)
-                s.vv[st[1]] = st[0]
-                return self._write_effects(eff, ("unset", p, None), items, st, log)
-            if op == "set":
-                eff, items = {}, self._anc_items(p)
-                if not NO_IMPLICIT_MARKER:
-                    for a in ancestors(p):
-                        if getp(vis, a) is None:
-                            eff[a] = MAPI
-                n0 = len(eff)
-                self._diff(p, cur, arg, eff, items, "w")
-                if len(eff) == n0 and not (isinstance(arg, dict) and ordered(cur) != ordered(arg)):
-                    return None
-                st = self.tick(skew)
-                s.vv[st[1]] = st[0]
-                return self._write_effects(eff, ("set", p, arg), items, st, log)
-            # inc
-            if isinstance(cur, (dict, tuple)):
-                return None
-            if numeric(cur) and not (-BOUND - 1 <= (cur or 0) + arg <= BOUND):
-                return None                           # Q11 (Chris): a local $inc past the bound is refused (400)
-            if not numeric(cur):
-                if not isinstance(cur, float):
-                    return None                       # a string: 400
-                return self.write("set", p, cur + arg, log, skew)   # Nm5: a double base is a register write that starts a generation
-            self._marker_write(p, log, skew)
-            s = self.state
-            st = self.tick(skew)
-            s.vv[st[1]] = st[0]
-            L = self._write_life()
-            g = s.gen_of(p)
-            G = g[0] if g else None
-            old = s.slots.get((L, p, self.wid, G))
-            s.slots[(L, p, self.wid, G)] = (st, (old[1] if old else 0) + arg)
-            items = self._anc_items(p) + [(p, "w")]       # a write below a map is a write to the map
-            self._ord_apply(self._events(items), st)
-            return self.finish(st, log, {"kind": "inc", "life": L, "paths": [p], "n": arg, "gen": G, "items": items})
+        if op in ("set", "unset", "inc", "setmany", "update"):
+            if op == "update":
+                ops = [(o_, q, nn(v)) for o_, q, v in arg]                       # a multi-operator update: [("set"|"unset"|"inc", path, arg)] in update-document order
+                intent = ("update", None, list(ops))
+            elif op == "setmany":
+                ops = [("set", q, nn(v)) for q, v in arg]
+                intent = ("setmany", None, [(q, v) for _, q, v in ops])
+            elif op == "inc":
+                ops, intent = [("inc", p, arg)], ("update", None, [("inc", p, arg)])
+            elif op == "set" and arg is None:
+                ops, intent = [("set", p, NULL)], ("set", p, NULL)      # `$set x null` stores a present null (the reference)
+            else:
+                arg = nn(arg) if op == "set" else None
+                ops, intent = [(op, p, arg)], (op, p, arg if op == "set" else None)
+            return self._update(ops, intent, vis, log, skew)
         if op == "replace":
+            arg = nn(arg)
             eff, items = {}, [("", "L")]
             for t, v in arg.items():
                 self._diff(t, vis.get(t), v, eff, items, "r")
             for t, v in vis.items():
                 if t not in arg:
                     self._unset_subtree(t, v, eff, items)
-            if not eff and ordered(vis) == ordered(arg):
+            if not eff and ordered_same(vis, arg):
                 return None
             st = self.tick(skew)
             s.vv[st[1]] = st[0]
@@ -1042,6 +1160,19 @@ def _alive_at(log, ctx, ins, dels):
     return {L for L in ins if L in ctx and L not in sup and all(d in log[L][0] for d in dels if d in ctx and d[0] >= L[0] - RET)}
 
 
+def incs_of(m):
+    """The increments a write makes: {path: n}. A pure `$inc` is kind 'inc'; a write that also carries registers (a combined
+    update, or an `$inc` that creates the maps above it) is kind 'reg' with an `incs` dict."""
+    if m["kind"] == "inc":
+        return {m["paths"][0]: m["n"]}
+    return m.get("incs", {})
+
+
+def touched(m):
+    """Every path a write names: its registers and its increments."""
+    return list(m.get("paths", [])) + [p for p in m.get("ipaths", []) if p not in m.get("paths", [])]
+
+
 def make_gen(log):
     """Generation of a write, from the log alone (V3M3). In words: a non-numeric base starts its own generation;
     any other write belongs to the generation of the base that was winning at its writer (the highest-stamped
@@ -1054,7 +1185,7 @@ def make_gen(log):
         if (st, p) in memo:
             return memo[(st, p)]
         ctx, m = log[st]
-        if m["kind"] in ("insert", "reg") and not numeric(m["vals"][p]):
+        if m["kind"] in ("insert", "reg") and p in m["vals"] and not numeric(m["vals"][p]):
             memo[(st, p)] = st
             return st
         al = _alive_at(log, ctx, ins, dels)
@@ -1070,9 +1201,10 @@ def make_gen(log):
 
 def _flat_oracle(log):
     """Per-path values (no type rule): returns (flat doc or None, alive lives, deletes). The value of a path, in words: the winning base (the
-    highest-stamped register write in an alive life), plus every increment that the winner's writer had not
-    seen, except the increments the winner's generation overwrote (an increment made in an OLDER generation than
-    the winner's, and not seen by the starter of the winner's generation). Increments made in a NEWER
+    highest-stamped register write in an alive life), plus every increment that no base write on the path had
+    seen (Q6, A2.1 wording: a register write in an alive life, `$setOnInsert` cells suppressed; with `ABSORBED` False, the model5 rule: only
+    the increments the winner's writer had not seen), except the increments the winner's generation overwrote (an increment made in an OLDER
+    generation than the winner's, and not seen by the starter of the winner's generation). Increments made in a NEWER
     generation are kept even when its starter lost."""
     ins = {st: m for st, (ctx, m) in log.items() if m["kind"] == "insert" or m.get("insert")}
     dels = [st for st, (ctx, m) in log.items() if m["kind"] == "delete"]
@@ -1083,12 +1215,15 @@ def _flat_oracle(log):
         return [(st, ctx, m) for st, (ctx, m) in log.items()
                 if m["kind"] in kinds and p in m.get("paths", []) and m.get("life") is not None]
 
-    paths = {p for st, (ctx, m) in log.items() for p in m.get("paths", [])}
+    def incs_on(p):
+        return [(st, ctx, m) for st, (ctx, m) in log.items() if p in incs_of(m) and m.get("life") is not None]
+
+    paths = {p for st, (ctx, m) in log.items() for p in touched(m)}
     doc = {}
     for p in sorted(paths):
         regs = [(st, ctx, m) for st, ctx, m in writes_on(p, ("insert", "reg"))
                 if m["life"] in alive and not _supp(log, m, p, alive)]
-        incs = [(st, ctx, m) for st, ctx, m in writes_on(p, ("inc",)) if m["life"] in alive]
+        incs = [(st, ctx, m) for st, ctx, m in incs_on(p) if m["life"] in alive]
         win = max(regs, key=lambda r: r[0]) if regs else None
         if win is not None and not numeric(win[2]["vals"][p]):
             doc[p] = win[2]["vals"][p]
@@ -1098,7 +1233,11 @@ def _flat_oracle(log):
                    if gen(st, p) == gW or (gen(st, p) is not None and (gW is None or gen(st, p) > gW))]
         base = win[2]["vals"][p] if win else None
         wctx = win[1] if win else frozenset()
-        extra = [m["n"] for st, ctx, m in counted if st not in wctx]
+        if ABSORBED:       # Q6 (A2.1 wording): an increment counts only if NO base write on the path had seen it
+            for st_, ctx_, m_ in writes_on(p, ("insert", "reg")):
+                if m_["life"] in alive and not _supp(log, m_, p, alive):
+                    wctx = wctx | ctx_
+        extra = [incs_of(m)[p] for st, ctx, m in counted if st not in wctx]
         if base is None and not extra:
             continue
         doc[p] = max(min((base or 0) + sum(extra), BOUND), -BOUND - 1)
@@ -1113,7 +1252,7 @@ def _regs_at(log, alive, p):
 
 def _incs_at(log, alive, p):
     return [(st, ctx, m) for st, (ctx, m) in log.items()
-            if m["kind"] == "inc" and p in m["paths"] and m.get("life") in alive]
+            if p in incs_of(m) and m.get("life") in alive]
 
 
 def oracle(log):
@@ -1127,7 +1266,7 @@ def oracle(log):
     flat, alive, dels = _flat_oracle(log)
     if flat is None:
         return None, alive, dels
-    paths = {p for st, (ctx, m) in log.items() for p in m.get("paths", [])}
+    paths = {p for st, (ctx, m) in log.items() for p in touched(m)}
     allp = set(paths)
     for q in paths:
         allp.update(ancestors(q))
@@ -1230,6 +1369,22 @@ def _expected_effects(old, intent):
         return e
     if op == "setmany":
         return sets(arg)
+    if op == "update":
+        e = {}
+        for o_, q, v in arg:
+            if o_ == "set":
+                e.update(sets([(q, v)]))
+            elif o_ == "unset":
+                e.update(eff_of(q, getp(old, q), None))
+            else:
+                cur = getp(old, q)
+                if isinstance(cur, float):
+                    e.update(sets([(q, cur + v)]))
+                else:
+                    for a in ancestors(q):
+                        if getp(old, a) is None:
+                            e[a] = MAPI
+        return e
     if op == "set":
         return sets([(p, arg)])
     if op == "unset":
@@ -1241,7 +1396,7 @@ def expansion_errors(log):
     """Every write with an intent must have exactly the leaf effects the words give against its writer's document."""
     bad = []
     for st, (ctx, m) in log.items():
-        if "intent" in m and m["intent"] is not None and m["intent"][0] in ("set", "unset", "replace", "setmany", "insert") \
+        if "intent" in m and m["intent"] is not None and m["intent"][0] in ("set", "unset", "replace", "setmany", "insert", "update") \
                 and not m.get("upsert"):
             want = _expected_effects(oracle_at(log, ctx), m["intent"])
             if repr(sorted(want.items(), key=repr)) != repr(sorted(m["vals"].items(), key=repr)):
@@ -1256,7 +1411,7 @@ def _type_must(log, alive, flat, doc):
     (not having seen W) makes t a map: W is the loser."""
     must = set()
     gen = make_gen(log)
-    allp = {p for st, (ctx, m) in log.items() for p in m.get("paths", [])}
+    allp = {p for st, (ctx, m) in log.items() for p in touched(m)}
     for t in sorted(allp):
         rs = _regs_at(log, alive, t)
         if not rs:
@@ -1293,19 +1448,19 @@ def loss_oracle(log, alive, dels):
         must.add(("_", L))
     for st, (ctx, m) in log.items():      # V6M1: every head written into a losing first insert is reported
         if m.get("life") in sup - killed and m["kind"] in ("reg", "inc") and st != m.get("life"):
-            for p in m.get("paths", []):
-                later = [w for w, (c2, m2) in log.items() if st in c2 and p in m2.get("paths", [])
+            for p in touched(m):
+                later = [w for w, (c2, m2) in log.items() if st in c2 and p in touched(m2)
                          and m2.get("life") == m["life"]]
                 if not later:
                     must.add((p, st))
     for st, (ctx, m) in log.items():      # V6m2: the dropped $setOnInsert cells are reported
         for p in m.get("soi", []):
             if m.get("life") in alive and _supp(log, m, p, alive):
-                later = [w for w, (c2, m2) in log.items() if st in c2 and p in m2.get("paths", [])
+                later = [w for w, (c2, m2) in log.items() if st in c2 and p in touched(m2)
                          and m2.get("life") == m["life"] and m2["kind"] in ("reg", "insert")]
                 if not later:      # a cell overwritten in sequence by its own life's writer is no longer a head
                     must.add((p, st))
-    paths = {p for st, (ctx, m) in log.items() for p in m.get("paths", [])}
+    paths = {p for st, (ctx, m) in log.items() for p in touched(m)}
     for p in paths:
         regs = [(st, ctx, m) for st, (ctx, m) in log.items()
                 if m["kind"] in ("insert", "reg") and p in m["paths"] and m["life"] in alive
@@ -1323,7 +1478,7 @@ def loss_oracle(log, alive, dels):
             if not any(st in log[d][0] for d in dels) and not any(st in c2 for s2, c2, m2 in dead_regs):
                 must.add((p, st))
         dead_incs = [(st, ctx, m) for st, (ctx, m) in log.items()
-                     if m["kind"] == "inc" and p in m["paths"] and m["life"] not in alive and m["life"] not in (sup - killed)]
+                     if p in incs_of(m) and m["life"] not in alive and m["life"] not in (sup - killed)]
         by_slot = {}
         for st, ctx, m in dead_incs:
             by_slot.setdefault((m["life"], st[1], gen(st, p)), []).append(st)
@@ -1345,7 +1500,7 @@ def hidden_oracle(log):
     alive = _alive_lives(log, ins, dels)
     gen = make_gen(log)
     out = {}
-    paths = {p for st, (ctx, m) in log.items() for p in m.get("paths", [])}
+    paths = {p for st, (ctx, m) in log.items() for p in touched(m)}
     for p in sorted(paths):
         regs = [(st, m) for st, (ctx, m) in log.items()
                 if m["kind"] in ("insert", "reg") and p in m["paths"] and m["life"] in alive
@@ -1357,12 +1512,12 @@ def hidden_oracle(log):
             continue
         groups = {}
         for st, (ctx, m) in log.items():
-            if m["kind"] == "inc" and p in m["paths"] and m["life"] in alive:
+            if p in incs_of(m) and m["life"] in alive:
                 groups.setdefault((m["life"], st[1], gen(st, p)), []).append(st)
         total = 0
         for (L, w, gi), sts in groups.items():
             if gi is None or gi < gW:
-                total += sum(log[s_][1]["n"] for s_ in sts if s_ not in log[gW][0])
+                total += sum(incs_of(log[s_][1])[p] for s_ in sts if s_ not in log[gW][0])
         if total:
             out[p] = total
     return out
@@ -1379,7 +1534,7 @@ def stale_records(records, log):
         ctx, m = log[st]
         if kind == "typeClash":      # hiding by the type rule is not monotone (a later descendant can revive it): see NOTES
             continue
-        if m["kind"] != "inc" or m.get("life") not in alive:
+        if p not in incs_of(m) or m.get("life") not in alive:
             continue
         regs = [(w, m2) for w, (c2, m2) in log.items()
                 if m2["kind"] in ("insert", "reg") and p in m2["paths"] and m2["life"] in alive
@@ -1405,7 +1560,7 @@ def killed_superseded_any(log):
         ctx, m = log[L]
         if (any(d not in ctx and d[0] >= L[0] - RET for d in dels)
                 and not any(L in log[d][0] for d in dels)):      # killed, and no delete observed it
-            out.append({("_", L)} | {(p, L) for p in m.get("paths", [])})
+            out.append({("_", L)} | {(p, L) for p in touched(m)})
     return out
 
 
@@ -1423,12 +1578,12 @@ def sound_record(key, log, alive, dels):
         return False
     ctx, m = log[st]
     vb = lambda m2, q: (m2["kind"] in ("insert", "reg") and q in m2["paths"] and is_val(m2["vals"][q])) or \
-        (m2["kind"] == "inc" and q in m2["paths"])
+        (q in incs_of(m2))
     conc = lambda w, c2: w != st and st not in c2 and w not in ctx
     if kind == "arrayClash":
         return (m["kind"] in ("insert", "reg") and isinstance(m["vals"].get(p), tuple) and
                 any(w > st and conc(w, c2) and m2["kind"] in ("insert", "reg") and isinstance(m2["vals"].get(p), tuple)
-                    for w, (c2, m2) in log.items() if w != st and p in m2.get("paths", [])))
+                    for w, (c2, m2) in log.items() if w != st and p in touched(m2)))
     if kind == "typeClash":
         if vb(m, p) and "." in p:        # a descendant loses to a newer scalar/array register at an ancestor
             for par in ancestors(p):
@@ -1436,22 +1591,22 @@ def sound_record(key, log, alive, dels):
                        and not isinstance(m2["vals"][par], dict) for w, (c2, m2) in log.items()):
                     return True
         if m["kind"] in ("insert", "reg") and p in m["paths"] and is_val(m["vals"][p]):     # the register at p loses to a newer descendant
-            return any(w > st and conc(w, c2) and any(q.startswith(p + ".") and vb(m2, q) for q in m2.get("paths", []))
+            return any(w > st and conc(w, c2) and any(q.startswith(p + ".") and vb(m2, q) for q in touched(m2))
                        for w, (c2, m2) in log.items())
         return False
     if kind == "clash":
-        return p in m.get("paths", []) and any(
-            w != st and w > st and st not in c2 and w not in ctx and p in m2.get("paths", [])
+        return p in touched(m) and any(
+            w != st and w > st and st not in c2 and w not in ctx and p in touched(m2)
             and m2["kind"] in ("insert", "reg") and m["kind"] in ("insert", "reg")
             for w, (c2, m2) in log.items() if w != st)
     if kind == "insertLost":
         if p == "_":
             return st in superseded_lives(log)
-        return p in m.get("paths", []) and (m.get("life") in superseded_lives(log)
+        return p in touched(m) and (m.get("life") in superseded_lives(log)
                                             or (m["kind"] == "insert" and p in m.get("soi", [])))
     if kind == "deleteWon":
         life = m.get("life")
-        return (p in m.get("paths", []) and life is not None and life in log and life not in alive
+        return (p in touched(m) and life is not None and life in log and life not in alive
                 and any(st not in log[d][0] for d in _killers(log, life, dels)))
     return False
 
@@ -1499,6 +1654,8 @@ class Ref:
             return True
         if op == "setmany":
             return all(self.apply(("set", q, v)) for q, v in arg)
+        if op == "update":
+            return all(self.apply((o_, q, v)) for o_, q, v in arg)
         if op == "set":
             w = self._walk(p, True)
             if w is None:
@@ -1604,11 +1761,25 @@ def _cmp_levels(model, ref, path=""):
     return bad
 
 
+def _is_docwrite(m):
+    """A replace or a document-valued `$set`: both are diffs against what their writer saw (Q4, Q3)."""
+    it = m.get("intent")
+    if not it:
+        return False
+    if it[0] == "replace":
+        return True
+    if it[0] == "set":
+        return isinstance(it[2], dict)
+    if it[0] in ("setmany", "update"):
+        return any(isinstance(x[-1], dict) for x in it[2])
+    return False
+
+
 def concurrent_replace(log):
-    """A replace (or whole-document write) concurrent with another write. Q4 (ruled): a replace is a diff against what its
-    writer saw, so a field it never saw survives it; the serial reading ('the replace drops every field not in its
-    document') does not hold, for values or for positions."""
-    reps = [st for st, (ctx, m) in log.items() if m.get("intent") and m["intent"][0] == "replace"]
+    """A replace or document-valued `$set` concurrent with another write. Q4/Q3 (ruled): such a write is a diff against what its
+    writer saw, so a field it never saw survives it, and a concurrent observed-remove can take part of it away; the serial
+    reading ('the write replaces the whole value') does not hold, for values or for positions."""
+    reps = [st for st, (ctx, m) in log.items() if _is_docwrite(m)]
     return any(r != w and r not in log[w][0] and w not in log[r][0] and log[w][1]["kind"] != "insert"
                for r in reps for w in log)
 
