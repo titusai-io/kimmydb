@@ -39,6 +39,13 @@ pub struct Life {
 /// The generation a base starts or belongs to: the starter's stamp and the totals the starter
 /// had seen.
 ///
+/// Only a NON-numeric base starts a generation (`Writer::setreg`, the model's `_setreg`), with a
+/// `seen` over the slots alive at that write. A numeric `$set` or an `$unset` copies the winner's
+/// generation, `seen` keys that name no slot any more included, and a register of the path in
+/// another alive life keeps its copy until that life ends. Such a key is a subset of the
+/// generation-start keys, so it is bounded by the slots alive at the start, and it is dead for
+/// every read: `hidden` reads `seen` only for slots of alive lives.
+///
 /// `vv` (the starter's version vector) is memory for the V4M1 mutant of the test harness and
 /// nothing else: it is kept only in a test or `merge-mutants` build, is empty in a production
 /// build, and is not encoded, hashed or compared (two generations are equal when `stamp` and

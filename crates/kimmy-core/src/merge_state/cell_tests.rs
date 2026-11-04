@@ -979,3 +979,59 @@ fn the_version_vector_covers_every_stamp_an_honest_state_covers() {
     accepts(&state);
     let _ = Hlc::ZERO;
 }
+
+/// A register's generation `seen` is started by a NON-numeric base only (`Writer::setreg`, the
+/// model's `_setreg`); a numeric `$set` or an `$unset` carries the winner's generation, dangling
+/// keys included; another alive life keeps its copy until that life ends. The seed 792 shape,
+/// built with writers (the reviewer's probe P5): C's first insert is superseded by B's newer first
+/// insert and then collected, and the generation `seen` that C's register wrote names C's slot.
+/// Those keys are dead for every read (`hidden` reads `seen` for the slots of alive lives only)
+/// and bounded by the slots alive at the generation start; decode accepts the state.
+#[test]
+fn a_dangling_seen_key_survives_a_numeric_base_and_ends_with_a_non_numeric_one() {
+    let o = JoinOptions::new(5, i64::MAX).unwrap();
+    let c_path = p("c");
+    let mut c = Writer::new(wid('C', 0), o.clone());
+    let mut d = Writer::new(wid('D', 0), o.clone());
+    let mut b = Writer::new(wid('B', 0), o.clone());
+    c.insert(&fl(&[("c", i(0))]), 0).unwrap();
+    c.write_inc(&c_path, 5, 0).unwrap();
+    d.upsert_inc(&p("y"), 1, 0).unwrap();
+    c.receive(&d.state.clone());
+    assert_eq!(c.alive().len(), 2, "C's insert and D's upsert life are alive");
+    // a double base starts a generation that saw C's slot
+    c.write_set(&c_path, Value::Double(2.5), 0).unwrap();
+    // the `seen` keys of every register's generation that name a slot the state does not hold
+    let dangling = |w: &Writer| -> usize {
+        w.state
+            .regs
+            .iter()
+            .filter_map(|((_, q), r)| r.generation.as_ref().map(|g| (q, g)))
+            .flat_map(|(q, g)| g.seen.keys().map(move |k| (q.clone(), *k)))
+            .filter(|(q, k)| !w.state.slots.contains_key(&(k.0, q.clone(), k.1, k.2)))
+            .count()
+    };
+    assert_eq!(dangling(&c), 0);
+    // B's newer first insert supersedes C's insert; the clock then passes the retention
+    b.insert(&fl(&[("z", i(1))]), 3).unwrap();
+    c.receive(&b.state.clone());
+    for k in 0..8 {
+        c.write_set(&p("w"), i(k), 0).unwrap();
+    }
+    let life_c = MStamp { hlc: h(1), writer: wid('C', 0) };
+    assert!(!c.state.lives.contains_key(&life_c), "C's insert is collected");
+    assert_eq!(dangling(&c), 1, "the register's generation names the collected slot");
+    // a NUMERIC base carries the winner's generation, dangling key included: the register the
+    // write makes in the newest life copies it, the old one stays where it is
+    c.write_set(&c_path, i(7), 0).unwrap();
+    assert_eq!(dangling(&c), 2);
+    // an unset carries it too
+    c.write_unset(&c_path, 0).unwrap();
+    assert_eq!(dangling(&c), 2);
+    // the state is one decode accepts, and no read depends on the dangling keys
+    accepts(&c.state);
+    // a NON-numeric base starts a generation over the alive slots: the copy in the newest life
+    // is replaced, the one in the other alive life stays
+    c.write_set(&c_path, s("t"), 0).unwrap();
+    assert_eq!(dangling(&c), 1);
+}

@@ -402,6 +402,12 @@ fn unhex(h: &str) -> Vec<u8> {
 /// Spelled in the counter cell's compact form (re-pinned with the cell): the bytes were converted from the
 /// form they were first pinned in (a register `obs` map, `ESCAPE` totals) by a script that reads the old spelling,
 /// turns each register's `obs` entries into the absorbed pair of the slot they name, and writes the new one.
+///
+/// They are therefore NO LONGER the states the first failure was found on. The conversion dropped
+/// every `obs` entry whose slot is absent, and a writer (B) left the writer table with them (the
+/// table `...0203414141..42..43..` became `...020241..43..`). The test asserts only
+/// `DeadLifeNotListed`, the first check, which these bytes still show: it says what it claims
+/// (a dead life that `lives` does not list is refused), not that these are the original states.
 const PINNED_A: &str = concat!(
     "514d530202414141414141414141414141414141410000000000000000000000000000000000004343434343",
     "4343434343434343434343000000000000000000000000000000000000020000000000000001000000000000",

@@ -434,6 +434,8 @@ impl Writer {
     fn setreg(&mut self, p: &Path, v: Value, st: MStamp, al: &BTreeSet<MStamp>) {
         let l = *al.last().expect("a register write needs an alive life");
         let win = self.state.winner_in(p, al, &self.opts);
+        // only a non-numeric base starts a generation (`seen` over the alive slots); a numeric
+        // one carries the winner's, dangling `seen` keys included (see `Gen`)
         let generation = if v.is_numeric() {
             self.state.gen_in(p, al, win, &self.opts).map(std::borrow::Cow::into_owned)
         } else {
