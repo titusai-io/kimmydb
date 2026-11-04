@@ -31,6 +31,9 @@ pub struct World {
     pub trace: bool,
     /// the run has no route step (register events travel only in position): the open-refusal-at-end check applies
     pub in_order: bool,
+    /// replay hooks: the page order and the tombstone choice the traced model drew (consumed by the next call)
+    pub forced_pages: Option<Vec<String>>,
+    pub forced_choice: Option<String>,
     pub log: Vec<String>,
     pub all: Vec<EntryRef>,
     pub by_origin: Vec<Vec<EntryId>>,
@@ -59,6 +62,8 @@ impl World {
             d,
             trace,
             in_order: true,
+            forced_pages: None,
+            forced_choice: None,
             log: Vec::new(),
             all: Vec::new(),
             by_origin: vec![Vec::new(); n],

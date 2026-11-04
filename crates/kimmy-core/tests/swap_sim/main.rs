@@ -32,6 +32,7 @@ mod run;
 mod scenario;
 mod scenarios;
 mod snapshot;
+mod trace;
 mod world;
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -124,6 +125,136 @@ mod tests {
         );
     }
 
+    /// Generate traces with the vendored tracer in the machine's small-job scope (256 MB, 60 s, no bytecode), or read a
+    /// directory of traces made elsewhere (`Q6DIFF_DIR`, for the large samples generated under the Python lane).
+    fn trace_dir(tag: &str, kind: &str, args: &[&str]) -> std::path::PathBuf {
+        if let Ok(d) = std::env::var("Q6DIFF_DIR") {
+            return std::path::PathBuf::from(d);
+        }
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q6diff-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracer = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/swap_sim/reference_model/q6diff_gen.py");
+        let st = std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "-q", "-p", "MemoryMax=256M", "-p", "MemorySwapMax=0", "-p", "TasksMax=16", "--", "timeout", "60", "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-I", "-B"])
+            .arg(&tracer)
+            .arg(kind)
+            .arg(&dir)
+            .args(args)
+            .status()
+            .expect("python3 and systemd-run must be on the PATH: the differential fails, it does not skip");
+        assert!(st.success(), "the tracer failed");
+        dir
+    }
+
+    fn replay_all(dir: &std::path::Path) -> (usize, usize, usize) {
+        let files = crate::trace::traces_in(dir);
+        assert!(!files.is_empty(), "no traces in {}", dir.display());
+        let (mut events, mut views, mut failures) = (0, 0, Vec::new());
+        for f in &files {
+            match crate::trace::replay_file(f) {
+                Ok(o) => {
+                    events += o.events;
+                    views += o.member_views;
+                }
+                Err(e) => failures.push(e),
+            }
+        }
+        for e in &failures {
+            eprintln!("{e}");
+        }
+        eprintln!(
+            "replayed {} traces: {events} events, {views} member states compared, {} disagreements",
+            files.len(),
+            failures.len()
+        );
+        assert!(
+            failures.is_empty(),
+            "{} trace(s) disagree with the model; first: {}",
+            failures.len(),
+            failures[0]
+        );
+        (files.len(), events, views)
+    }
+
+    /// The scripted scenarios, run by the vendored model (the Python twins) and replayed on the harness.
+    #[test]
+    fn the_differential_replays_the_scripted_traces() {
+        let dir = trace_dir("scripted", "scripted", &[]);
+        replay_all(&dir);
+    }
+
+    /// A bounded sample of random runs of the model, on the base and on every mutant the model has (`Q6DIFF_RUNS` runs of the
+    /// base and `Q6DIFF_MUTANT_RUNS` of each mutant; `Q6DIFF_DIR` reads a directory made under the Python lane).
+    #[test]
+    fn the_differential_replays_random_traces_of_the_model() {
+        if let Ok(d) = std::env::var("Q6DIFF_DIR") {
+            replay_all(std::path::Path::new(&d));
+            return;
+        }
+        let base_runs = env_u64("Q6DIFF_RUNS", 36).to_string();
+        let dir = trace_dir("random", "random", &["--mode", "v6", "--count", &base_runs]);
+        let mutant_runs = env_u64("Q6DIFF_MUTANT_RUNS", 0);
+        if mutant_runs > 0 {
+            for m in crate::flags::MUTANTS.iter().filter(|m| **m != "m-stale-src") {
+                let st = std::process::Command::new("systemd-run")
+                    .args([
+                        "--user",
+                        "--scope",
+                        "-q",
+                        "-p",
+                        "MemoryMax=256M",
+                        "-p",
+                        "MemorySwapMax=0",
+                        "-p",
+                        "TasksMax=16",
+                        "--",
+                        "timeout",
+                        "60",
+                        "env",
+                        "PYTHONDONTWRITEBYTECODE=1",
+                        "python3",
+                        "-I",
+                        "-B",
+                    ])
+                    .arg(
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/swap_sim/reference_model/q6diff_gen.py"),
+                    )
+                    .arg("random")
+                    .arg(&dir)
+                    .args(["--mode", m, "--count", &mutant_runs.to_string()])
+                    .status()
+                    .unwrap();
+                assert!(st.success());
+            }
+        }
+        replay_all(&dir);
+    }
+
+    /// The differential has teeth: a trace with one changed value (a member's clock after the third event) is reported at that
+    /// event, with the path of the field.
+    #[test]
+    fn the_differential_notices_a_changed_trace() {
+        let dir = trace_dir("teeth", "scripted", &[]);
+        let src = dir.join("s-flip-v6.jsonl");
+        let text = std::fs::read_to_string(&src).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let mut ev: serde_json::Value = serde_json::from_str(&lines[3]).unwrap();
+        let hlc = ev["ms"][0]["hlc"].as_i64().unwrap();
+        ev["ms"][0]["hlc"] = serde_json::json!(hlc + 1);
+        lines[3] = ev.to_string();
+        let bad = dir.join("changed.jsonl");
+        std::fs::write(&bad, lines.join("\n")).unwrap();
+        let err = crate::trace::replay_file(&bad).err().expect("the changed trace must disagree");
+        assert!(err.contains("FIRST DISAGREEMENT at event 3"), "{err}");
+        assert!(err.contains(".hlc: python"), "{err}");
+        // the unchanged trace agrees
+        assert!(crate::trace::replay_file(&src).is_ok());
+    }
+
     /// The vendored Python model is the reviewed one (`reference_model/MODEL-HASHES.txt`). The differential (a later phase)
     /// is made from it; a changed byte fails here first.
     #[test]
@@ -135,8 +266,12 @@ mod tests {
         let bytes = std::fs::read(dir.join("swapmodel6a.py")).unwrap();
         let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(got, want, "swapmodel6a.py");
+        let tracer = "79d9c55e7f363475ef1a1a13eb67e50af8a69a0c247acf514e2be11a87c1dc8b";
+        let bytes = std::fs::read(dir.join("q6diff_gen.py")).unwrap();
+        let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, tracer, "q6diff_gen.py");
         let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
-        assert!(recorded.contains(want));
+        assert!(recorded.contains(want) && recorded.contains(tracer));
     }
 
     /// The model's seed-fixed run is deterministic: the same seed gives the same figures (the harness' own PRNG).
