@@ -54,6 +54,9 @@ pub enum Kind {
     Ldrop,
     Lcreate,
     Loss,
+    /// `field`: one of Q7's own loss records (`clash`, `deleteWon`, `insertLost`, ...) as an entry (V6M2). Never a document
+    /// write, never evaluated for lateness, always appended and served onward (D3).
+    LossQ7,
 }
 
 impl Kind {
@@ -66,6 +69,7 @@ impl Kind {
             Kind::Ldrop => "ldrop",
             Kind::Lcreate => "lcreate",
             Kind::Loss => "loss",
+            Kind::LossQ7 => "loss_q7",
         }
     }
 }
@@ -132,6 +136,8 @@ pub struct Entry {
     pub extra: Extra,
     /// `field` policy: the writer's whole merge state after the write (Q7 D1/D11)
     pub fstate: Option<Rc<MergeState>>,
+    /// a `LossQ7` entry: the record and its value
+    pub q7: Option<(kimmy_core::merge_state::LossKey, kimmy_core::merge_state::LossValue)>,
 }
 
 impl Entry {
@@ -151,6 +157,7 @@ impl Entry {
             dl: 0,
             extra: Extra::None,
             fstate: None,
+            q7: None,
         }
     }
     pub fn phys(mut self, p: &str) -> Self {

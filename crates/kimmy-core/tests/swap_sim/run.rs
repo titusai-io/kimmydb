@@ -22,6 +22,8 @@ pub struct Cfg {
     pub delete_bias: bool,
     pub snapshots: bool,
     pub policy: Policy,
+    /// `field`: mint Q7's loss records as entries (default on)
+    pub q7_entries: bool,
 }
 
 impl Cfg {
@@ -34,6 +36,7 @@ impl Cfg {
             delete_bias: false,
             snapshots: true,
             policy: Policy::Document,
+            q7_entries: true,
         }
     }
 }
@@ -82,6 +85,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     let mut ms: Vec<Member> =
         names.iter().enumerate().map(|(i, n)| Member::new(i, n, skews[i])).collect();
     w.policy = cfg.policy;
+    w.q7_entries = cfg.q7_entries;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
     for k in 0..cfg.keys as u32 {
         ms[0].local_doc(&mut w, k, DocOp::Insert);
@@ -350,6 +354,7 @@ impl Summary {
             "div_loss",
             "div_replay",
             "div_replay_interleaved",
+            "q7_records_diverged",
             "oracle_state",
             "served_mismatch",
             "alive_mismatch",

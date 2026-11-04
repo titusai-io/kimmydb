@@ -22,6 +22,14 @@ impl Member {
                 !self.member_valid(w, e) || self.cur.as_ref().is_some_and(|c| e.stamp < c.stamp)
             }
             Kind::Ldrop | Kind::Lcreate => self.cur.as_ref().is_some_and(|c| e.stamp < c.stamp),
+            Kind::LossQ7 => {
+                let (k, _) = e.q7.as_ref().expect("a Q7 loss entry has its record");
+                self.phys
+                    .get(&e.phys)
+                    .and_then(|p| p.docs.get(&e.key))
+                    .and_then(|v| v.state.as_ref())
+                    .is_some_and(|s| s.losses.contains_key(k))
+            }
             Kind::Doc => false,
         }
     }
@@ -88,12 +96,91 @@ impl Member {
                 };
                 self.merge_loss(w, k, e.body.clone(), &phys);
             }
+            Kind::LossQ7 => self.apply_loss_q7(w, e),
             Kind::Doc => self.apply_doc(w, e),
         }
         if is_event {
             self.rescan(w, None);
         }
         self.settle(w);
+    }
+
+    /// V6M2 (Q7 D10): the member appends its own loss entry, and emits the event once, for every record that first enters its
+    /// state through any join (a writer's entry that carries it, a snapshot page, a received loss entry). Off with
+    /// `World.q7_entries` (the comparison runs).
+    pub fn mint_q7(
+        &mut self,
+        w: &mut World,
+        phys: &str,
+        key: u32,
+        fresh: &[(kimmy_core::merge_state::LossKey, kimmy_core::merge_state::LossValue)],
+    ) {
+        if fresh.is_empty() || !w.q7_entries {
+            return;
+        }
+        for (lk, lv) in fresh {
+            let h = self.next_hlc(w);
+            let mut en = Entry::new(self.id, h, Kind::LossQ7).phys(phys);
+            en.key = key;
+            en.q7 = Some((lk.clone(), lv.clone()));
+            let en = w.record(en, true);
+            self.cv.add(en.idx);
+            self.appended.insert(en.idx);
+            w.stats.bump("q7_loss_entries_minted");
+            w.stats.bump("q7_events_emitted");
+            w.note(format!(
+                "{} mints Q7 loss entry {} ({:?}@{} of key {})",
+                self.name, en, lk.kind, lk.stamp.hlc.wall_ms, key
+            ));
+        }
+    }
+
+    /// A Q7 loss entry: the record enters the document's state (`Writer::receive_loss`: kept unless below the horizon or already
+    /// known) and its event is emitted once. An entry for a document or a physical not held here takes no effect (the record
+    /// rides with the states that reach this member); it is appended and served onward all the same (D3).
+    fn apply_loss_q7(&mut self, w: &mut World, e: &EntryRef) {
+        w.stats.bump("q7_loss_entries_received");
+        let (lk, lv) = e.q7.clone().expect("a Q7 loss entry has its record");
+        w.note(format!(
+            "{} receives Q7 loss entry {} ({:?}@{} of key {} in {})",
+            self.name, e, lk.kind, lk.stamp.hlc.wall_ms, e.key, e.phys
+        ));
+        let alive = match self.phys.get(&e.phys) {
+            None => {
+                // the physical is not known here yet: applied when it is (the deferral of document entries)
+                if !self.deferred.iter().any(|d| d.idx == e.idx) {
+                    self.deferred.push(e.clone());
+                }
+                return;
+            }
+            Some(p) => p.alive,
+        };
+        if !alive {
+            return; // a buried physical keeps no documents
+        }
+        let cur =
+            self.phys.get(&e.phys).and_then(|p| p.docs.get(&e.key)).and_then(|v| v.state.clone());
+        // a document not held yet gets a state that holds the record alone: grow-only, reads as absent, joins with the real state
+        let st = cur.clone().unwrap_or_default();
+        let mut wr = kimmy_core::merge_state::Writer::from_state(
+            writer(e.origin),
+            (*st).clone(),
+            w.fopts.clone(),
+        );
+        if wr.receive_loss(lk, lv) {
+            w.stats.bump("q7_events_emitted");
+            let ns = std::rc::Rc::new(wr.state);
+            let p = self.phys.get_mut(&e.phys).unwrap();
+            match p.docs.get_mut(&e.key) {
+                Some(ver) => ver.state = Some(ns),
+                None => {
+                    p.docs.insert(
+                        e.key,
+                        Ver { stamp: neg(), body: None, state: Some(ns), applied: None },
+                    );
+                }
+            }
+        }
     }
 
     /// Mutant (R7): a logical drop addresses only the physical it names.
@@ -137,6 +224,9 @@ impl Member {
     /// The append decision (the product's relay): a document entry is appended iff it won last-writer-wins on
     /// arrival, or it is the gap-1 case (superseded only by a record held as an unfinished join's page state).
     pub fn apply_doc(&mut self, w: &mut World, e: &EntryRef) {
+        if e.kind == Kind::LossQ7 {
+            return self.apply_loss_q7(w, e); // a deferred Q7 loss entry
+        }
         let f = w.f;
         let Some(p) = self.phys.get(&e.phys) else { return self.apply_doc_orig(w, e) };
         if !p.alive {
@@ -178,8 +268,9 @@ impl Member {
         if a.skipped {
             w.stats.bump("covered_skips");
         }
-        if a.fresh > 0 {
-            w.stats.add("q7_records_fresh", a.fresh as i64);
+        if !a.fresh.is_empty() {
+            w.stats.add("q7_records_fresh", a.fresh.len() as i64);
+            self.mint_q7(w, &e.phys, e.key, &a.fresh);
         }
         if !e.staging {
             self.dochist.insert(e.idx); // m1: retained while the physical is alive here

@@ -112,7 +112,12 @@ fn writes_of(w: &mut World, e: &Entry, required: bool) -> Vec<(Option<u16>, Stam
     let is_insert = e.fstate.as_ref().is_some_and(|s| s.lives.contains_key(&e.stamp));
     cells
         .into_iter()
-        .filter(|c| !(required && is_insert && c.path.is_some()))
+        .filter(|c| {
+            !(required
+                && is_insert
+                && c.path.is_some()
+                && !crate::field::REQUIRE_INSERT_FIELD_CELLS)
+        })
         .map(|c| {
             let path = c.path.as_ref().map(|p| w.path_id(p));
             (path, c.stamp, crate::field::record_body(&c.value))
@@ -488,6 +493,65 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     }
     if w.stats.get("page_above_coverage") > 0 {
         inv.insert("page_above_coverage".into());
+    }
+    // the HLC rule (design note Q-F6): no `field` write was refused for a stamp below what its document's state had merged
+    if w.stats.get("field_stamp_refused") > 0 {
+        inv.insert("field_write_below_merged_vv".into());
+    }
+    // Q7's loss entries: never a document write (not retained as one), never in Q6's record family, at most one per member
+    // per record
+    {
+        let mut seen: HashSet<(usize, String, u32, kimmy_core::merge_state::LossKey)> =
+            HashSet::new();
+        for x in w.all.iter() {
+            match x.kind {
+                Kind::LossQ7 => {
+                    if x.lkey.is_some()
+                        || x.q7.is_none()
+                        || w.rec_index.values().any(|&i| i == x.idx)
+                    {
+                        inv.insert("q7_loss_entry_in_the_q6_family".into());
+                    }
+                    let (lk, _) = x.q7.as_ref().unwrap();
+                    if !seen.insert((x.origin, x.phys.clone(), x.key, lk.clone())) {
+                        inv.insert("q7_loss_entry_minted_twice_by_a_member".into());
+                    }
+                }
+                Kind::Loss if x.q7.is_some() => {
+                    inv.insert("q7_loss_entry_in_the_q6_family".into());
+                }
+                _ => {}
+            }
+        }
+        for &i in &live {
+            if ms[i].dochist.iter().any(|&id| w.ent(id).kind != Kind::Doc) {
+                inv.insert("a_non_document_entry_retained_as_a_write".into());
+            }
+        }
+    }
+    // Q7's record sets converge through the loss entries: every live member holds the same records for each document of the
+    // physical it serves (the Q7 sim's record parity)
+    if w.policy == Policy::Field {
+        let mut diverged = false;
+        let sets =
+            |m: &Member| -> BTreeMap<(String, u32), BTreeSet<kimmy_core::merge_state::LossKey>> {
+                let mut out = BTreeMap::new();
+                for (n, p) in m.phys.iter().filter(|(_, p)| p.alive) {
+                    for (k, v) in p.docs.iter() {
+                        if let Some(st) = &v.state {
+                            out.insert((n.clone(), *k), st.losses.keys().cloned().collect());
+                        }
+                    }
+                }
+                out
+            };
+        let first = sets(&ms[first]);
+        for &i in &live {
+            if sets(&ms[i]) != first {
+                diverged = true;
+            }
+        }
+        res.insert("q7_records_diverged".into(), diverged as i64);
     }
     // D3 invariant: a join's register events are its sender's own (never read from another member)
     if w.stats.get("register_read_from_a_member_that_is_not_the_sender") > 0 {
