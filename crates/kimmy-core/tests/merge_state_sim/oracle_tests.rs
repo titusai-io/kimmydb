@@ -203,3 +203,104 @@ fn the_leaf_effects_of_a_nested_write_are_the_changed_leaves() {
         Expected::Refused
     );
 }
+
+// ---- the read-your-writes oracle (`order_oracle.rs`) on small documents ------------------------
+
+mod order_oracle_cases {
+    use std::collections::BTreeSet;
+
+    use kimmy_core::merge_state::{OrderedValue, Value};
+
+    use crate::order_oracle::{OrdOp, check, reorders};
+    use crate::sim::np;
+
+    type Doc = Vec<(String, OrderedValue)>;
+
+    fn leaf(n: &str) -> (String, OrderedValue) {
+        (n.to_string(), OrderedValue::Leaf(Value::Int64(1)))
+    }
+    fn empty_map(n: &str) -> (String, OrderedValue) {
+        (n.to_string(), OrderedValue::Doc(vec![("c".to_string(), OrderedValue::Doc(Vec::new()))]))
+    }
+
+    fn history(of: &[&[&str]]) -> BTreeSet<Vec<String>> {
+        of.iter().map(|p| p.iter().map(|s| (*s).to_string()).collect()).collect()
+    }
+
+    fn set_n(before: &Doc, after: &Doc, hist: &BTreeSet<Vec<String>>) -> Result<bool, String> {
+        check(Some(before), Some(after), &OrdOp::Set(np("n"), Value::Int64(1)), hist, true)
+            .map(|c| c.trailing)
+    }
+
+    /// O2-3: maps with no leaf below them and no history have no place; a field created after them goes BEFORE them, and
+    /// they trail in path order (`k` before `m`), wherever they were in the document.
+    #[test]
+    fn maps_without_a_place_trail_in_path_order() {
+        let hist = history(&[&["a"]]);
+        let before: Doc = vec![leaf("a"), empty_map("k"), empty_map("m")];
+        let ok: Doc = vec![leaf("a"), leaf("n"), empty_map("k"), empty_map("m")];
+        assert_eq!(
+            set_n(&before, &ok, &hist),
+            Ok(true),
+            "decided, on a level with maps that have no place"
+        );
+        // before the maps' path order is wrong (m before k), after the fields with a place is wrong (n last)
+        let unsorted: Doc = vec![leaf("a"), leaf("n"), empty_map("m"), empty_map("k")];
+        assert!(set_n(&before, &unsorted, &hist).is_err());
+        let last: Doc = vec![leaf("a"), empty_map("k"), empty_map("m"), leaf("n")];
+        assert!(set_n(&before, &last, &hist).is_err());
+        let first: Doc = vec![leaf("n"), leaf("a"), empty_map("k"), empty_map("m")];
+        assert!(set_n(&before, &first, &hist).is_err());
+        // a map WITH a leaf below it has a place: the new field is after it
+        let with_leaf: Doc =
+            vec![leaf("a"), ("m".to_string(), OrderedValue::Doc(vec![leaf("x")])), empty_map("k")];
+        let after: Doc = vec![
+            leaf("a"),
+            ("m".to_string(), OrderedValue::Doc(vec![leaf("x")])),
+            leaf("n"),
+            empty_map("k"),
+        ];
+        assert_eq!(set_n(&with_leaf, &after, &hist), Ok(true));
+        // and a map with history has one too
+        let hist_m = history(&[&["a"], &["m"]]);
+        let placed: Doc = vec![leaf("a"), leaf("n"), empty_map("k"), empty_map("m")];
+        assert!(set_n(&before, &placed, &hist_m).is_err(), "m has a place now: n goes after it");
+    }
+
+    /// O2-4: a replace that puts the same fields in another order is a write; the same order is not.
+    #[test]
+    fn a_replace_in_another_order_is_a_write() {
+        let before: Doc = vec![leaf("a"), leaf("b")];
+        let swapped = OrdOp::Replace(vec![
+            ("b".to_string(), Value::Int64(1)),
+            ("a".to_string(), Value::Int64(1)),
+        ]);
+        let same = OrdOp::Replace(vec![
+            ("a".to_string(), Value::Int64(1)),
+            ("b".to_string(), Value::Int64(1)),
+        ]);
+        assert!(reorders(Some(&before), &swapped));
+        assert!(!reorders(Some(&before), &same));
+        // a sub-document set, at a path
+        let nested: Doc = vec![("m".to_string(), OrderedValue::Doc(vec![leaf("p"), leaf("q")]))];
+        let set = |a: &str, b: &str| {
+            OrdOp::Set(
+                np("m"),
+                Value::Document(vec![
+                    (a.to_string(), Value::Int64(1)),
+                    (b.to_string(), Value::Int64(1)),
+                ]),
+            )
+        };
+        assert!(reorders(Some(&nested), &set("q", "p")));
+        assert!(!reorders(Some(&nested), &set("p", "q")));
+        assert!(!reorders(Some(&nested), &set("p", "z")), "other fields: not a reorder");
+        // an insert over a live document is refused (model6.py `insert`: `if s.alive(): return None`): not a reorder,
+        // whatever the order of its fields (the four seeds that found it: 101, 349, 14, 24 of the sim's runs)
+        let insert = OrdOp::Insert(vec![
+            ("b".to_string(), Value::Int64(1)),
+            ("a".to_string(), Value::Int64(1)),
+        ]);
+        assert!(!reorders(Some(&before), &insert));
+    }
+}

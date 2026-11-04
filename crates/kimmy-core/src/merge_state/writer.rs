@@ -793,8 +793,12 @@ impl Writer {
             }
         }
         s.vv.insert(st.writer, st.hlc);
-        let items: Items =
-            paths.iter().map(|q| (OrdAt::Field(q.clone()), OrdMode::Write)).collect();
+        // a write below a map is a write to the map: each path names its ancestors first
+        let (mut items, mut seen) = (Items::new(), BTreeSet::new());
+        for q in &paths {
+            ancestor_items(q, &mut seen, &mut items, &self.opts);
+            items.push((OrdAt::Field(q.clone()), OrdMode::Write));
+        }
         self.feed(st, st, known, &items);
         let mut rec = WriteRecord::new(WriteKind::Insert, Some(st), paths);
         rec.vals = vals;
@@ -827,7 +831,10 @@ impl Writer {
             (life, path.clone(), self.id, None),
             Slot { stamp: st2, total: Num::from(i128::from(n)) },
         );
-        self.feed(life, st2, known, &vec![(OrdAt::Field(path.clone()), OrdMode::Write)]);
+        let mut items = Items::new();
+        ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
+        items.push((OrdAt::Field(path.clone()), OrdMode::Write));
+        self.feed(life, st2, known, &items);
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(life), vec![path.clone()]);
         rec.n = Some(n);
         rec.amount = Some(Num::from(i128::from(n)));
@@ -854,7 +861,10 @@ impl Writer {
             (st, path.clone(), self.id, None),
             Slot { stamp: st, total: Num::from(i128::from(n)) },
         );
-        self.feed(st, st, known, &vec![(OrdAt::Field(path.clone()), OrdMode::Write)]);
+        let mut items = Items::new();
+        ancestor_items(path, &mut BTreeSet::new(), &mut items, &self.opts);
+        items.push((OrdAt::Field(path.clone()), OrdMode::Write));
+        self.feed(st, st, known, &items);
         let mut rec = WriteRecord::new(WriteKind::Inc, Some(st), vec![path.clone()]);
         rec.n = Some(n);
         rec.amount = Some(Num::from(i128::from(n)));
@@ -974,6 +984,10 @@ impl Writer {
 
     /// The body of [`Writer::write_set`], with the stamp from `m`.
     fn write_set_m(&mut self, path: &Path, v: Value, m: &mut Mint<'_>) -> Option<Written> {
+        if v == Value::Unset {
+            // the writer's spelling of an unset: it is one, and names no ancestor (the unset body)
+            return self.write_unset_m(path, m);
+        }
         v.check_input().ok()?;
         let vis = self.visible()?;
         if !self.opts.write_below_scalar() && below_a_scalar(&vis, path) {
@@ -1210,6 +1224,15 @@ impl Writer {
     }
 
     fn write_update_m(&mut self, ops: &[UpdateOp], m: &mut Mint<'_>) -> Option<Written> {
+        // an `Unset` spelled as the value of a `Set` is an `Unset`
+        let ops: Vec<UpdateOp> = ops
+            .iter()
+            .map(|o| match o {
+                UpdateOp::Set(p, Value::Unset) => UpdateOp::Unset(p.clone()),
+                o => o.clone(),
+            })
+            .collect();
+        let ops = &ops[..];
         for (i, a) in ops.iter().enumerate() {
             for b in &ops[i + 1..] {
                 let (a, b) = (a.path(), b.path());
@@ -1360,5 +1383,22 @@ mod tests {
         assert_eq!(c.state, d.state);
         // and over a field that is not there it is no write at all
         assert!(d.write_set(&y, Value::Unset, 0).is_none());
+        // a NESTED path too: the unset body names no ancestor, so the set that spells an unset must not either
+        let (m, my) = (Path::flat("m").unwrap(), Path::new(["m", "y"]).unwrap());
+        let nested = || {
+            let mut w = Writer::new(wid('A', 0), opts());
+            let doc = Value::Document(vec![("y".into(), i(1)), ("z".into(), i(2))]);
+            w.insert(&[(x.clone(), i(1)), (m.clone(), doc)], 0).unwrap();
+            w
+        };
+        let (mut e, mut f) = (nested(), nested());
+        e.write_unset(&my, 0).unwrap();
+        f.write_set(&my, Value::Unset, 0).unwrap();
+        assert_eq!(e.state, f.state);
+        // and in an update
+        let (mut g, mut h) = (nested(), nested());
+        g.write_update(&[UpdateOp::Unset(my.clone())], 0).unwrap();
+        h.write_update(&[UpdateOp::Set(my, Value::Unset)], 0).unwrap();
+        assert_eq!(g.state, h.state);
     }
 }

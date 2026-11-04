@@ -529,7 +529,7 @@ fn replay_script(sc: &J, o: &JoinOptions) -> Result<Replayed, String> {
 // ---- the read: the goldens of the materialised order --------------------------------
 
 /// The scenarios, by name. A new scenario of the generator is a new line here.
-const SCENARIOS: [&str; 43] = [
+const SCENARIOS: [&str; 44] = [
     "a_scalar_over_a_map_voids_the_places_of_its_fields",
     "a_set_on_insert_upsert_feeds_both_of_its_writes",
     "a_standalone_noop_unset_leaves_nothing",
@@ -549,6 +549,7 @@ const SCENARIOS: [&str; 43] = [
     "level_floor_nested_subdocument_set",
     "level_floor_replace",
     "level_floor_subdocument_set",
+    "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
     "receive_a_concurrent_replace_then_set",
     "receive_a_concurrent_unset_then_set",
     "receive_a_survivor_increment_then_unset",
@@ -612,7 +613,7 @@ fn the_materialised_field_order_equals_the_models_on_every_scenario() {
         fields += want.len();
     }
     // pinned: what the test covered
-    assert_eq!((names.len(), joined, fields), (43, 3300, 177));
+    assert_eq!((names.len(), joined, fields), (44, 3502, 184));
 }
 
 fn paths(doc: &[(Path, Value)]) -> Vec<String> {
@@ -633,7 +634,7 @@ fn strs(v: &[&str]) -> Vec<String> {
 /// join; these are pinned in the source so that a reader sees the rules).
 #[test]
 fn the_field_order_of_the_named_scenarios_is_pinned() {
-    let pins: [(&str, &[&str]); 43] = [
+    let pins: [(&str, &[&str]); 44] = [
         ("a_set_on_insert_upsert_feeds_both_of_its_writes", &["a", "b", "c", "e", "n", "d"]),
         ("a_standalone_noop_unset_leaves_nothing", &["a", "b", "m", "m.p", "nope", "e"]),
         ("a_subdocument_set_that_only_reorders_is_a_write", &["m", "m.q", "m.p", "m.r", "k", "z"]),
@@ -686,6 +687,10 @@ fn the_field_order_of_the_named_scenarios_is_pinned() {
             "updates_that_are_writes_by_what_they_name_alone",
             &["a", "m", "m.q", "m.p", "k", "k.j", "e"],
         ),
+        (
+            "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
+            &["a", "n", "k", "k.z", "m", "m.x", "m.y"],
+        ),
     ];
     for (name, want) in pins {
         assert_eq!(order_of(name), strs(want), "{name}");
@@ -734,7 +739,7 @@ fn the_writer_reproduces_the_models_scenarios_after_every_write() {
         }
     }
     // pinned: what the replay covered (the seed insert of a seeded scenario is one of its writes)
-    assert_eq!((writes, receives, refused, joined), (184, 8, 9, 3300));
+    assert_eq!((writes, receives, refused, joined), (191, 8, 9, 3502));
 }
 
 /// The O2 watch item: a top-level field named `""` is fed as `OrdAt::Field([""])`, never as the
@@ -813,6 +818,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "receive_a_concurrent_replace_then_set",
                 "receive_a_concurrent_unset_then_set",
                 "receive_a_survivor_increment_then_unset",
@@ -849,6 +855,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
@@ -881,6 +888,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "receive_a_concurrent_replace_then_set",
                 "receive_a_concurrent_unset_then_set",
                 "receive_a_survivor_increment_then_unset",
@@ -928,6 +936,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "hybrid_noop_unset_rides_on_an_update",
                 "inc_unset_replace_concurrent",
                 "level_floor_nested_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "receive_a_concurrent_replace_then_set",
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
@@ -972,6 +981,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "receive_a_concurrent_replace_then_set",
                 "receive_a_concurrent_unset_then_set",
                 "receive_a_survivor_increment_then_unset",
@@ -1011,6 +1021,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "receive_a_concurrent_replace_then_set",
                 "receive_a_concurrent_unset_then_set",
                 "receive_a_survivor_increment_then_unset",
@@ -1076,6 +1087,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
@@ -1090,6 +1102,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "receive_a_concurrent_replace_then_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
@@ -1164,6 +1177,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
@@ -1199,6 +1213,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "receive_a_concurrent_replace_then_set",
                 "receive_a_concurrent_unset_then_set",
                 "receive_a_survivor_increment_then_unset",
@@ -1236,6 +1251,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "sequential_rules",
                 "survivor_placement_b_unset_knew_c",
                 "update_with_inc_and_unset_of_a_map",
@@ -1302,6 +1318,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
                 "replace_with_an_empty_document_has_no_update_bit",
@@ -1342,6 +1359,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_nested_subdocument_set",
                 "level_floor_replace",
                 "level_floor_subdocument_set",
+                "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
                 "receive_a_concurrent_replace_then_set",
                 "receive_a_concurrent_unset_then_set",
                 "receive_a_survivor_increment_then_unset",
@@ -2411,4 +2429,115 @@ fn a_document_nested_at_the_limit_feeds_a_chain_the_read_visits_within_the_bound
         "101 levels are refused"
     );
     assert!(fresh.state.ords.is_empty(), "and nothing is fed");
+}
+
+// ---- the O2 review: nested upserts, the clock ahead of the vector --------------------------
+
+/// O2-2 of the O2 review. A leaf write is also a write to each map above it; the upserts name the ancestors of their paths
+/// as the other writes do. An upsert of `a.b` and then a `$set` of a new field `c`: the map `a` has a place before `c`, so
+/// the document is `[a, a.b, c]` in every delivery order of the writer's entries (the model gives `[c, a, a.b]` here: it
+/// names no ancestor in an upsert; `q7-logs/o2-fix/nested_upsert_model_gap.py` shows it).
+#[test]
+fn an_upsert_of_a_nested_path_names_its_ancestors_so_a_later_set_goes_after_them() {
+    let o = JoinOptions::default();
+    let ab = Path::new(["a", "b"]).unwrap();
+    let c = Path::flat("c").unwrap();
+    let s = Path::flat("s").unwrap();
+    let n = Path::flat("n").unwrap();
+    let names = [
+        "upsert_inc",
+        "upsert_soi, no field",
+        "upsert_soi with a field",
+        "upsert_soi, a nested $setOnInsert field",
+        "upsert_soi, a nested $set field",
+    ];
+    let want: [&[&str]; 5] = [
+        &["a", "a.b", "c"],
+        &["a", "a.b", "c"],
+        &["s", "a", "a.b", "c"],
+        &["a", "a.b", "n", "c"],
+        &["a", "a.b", "n", "c"],
+    ];
+    for (kind, name) in names.iter().enumerate() {
+        let mut w = Writer::new(super::tests::wid('A', 0), o.clone());
+        let mut entries = Vec::new();
+        match kind {
+            0 => {
+                w.upsert_inc(&ab, 1, 0).unwrap();
+                entries.push(w.state.clone());
+            }
+            1 => {
+                w.upsert_soi(&[], &ab, 1, &[], 0).unwrap();
+                entries.push(w.state.clone());
+            }
+            2 => {
+                w.upsert_soi(&[(s.clone(), Value::Int64(7))], &ab, 1, &[], 0).unwrap();
+                entries.push(w.state.clone());
+            }
+            3 => {
+                w.upsert_soi(&[(ab.clone(), Value::Int64(7))], &n, 1, &[], 0).unwrap();
+                entries.push(w.state.clone());
+            }
+            _ => {
+                w.upsert_soi(&[], &n, 1, &[(ab.clone(), Value::Int64(7))], 0).unwrap();
+                entries.push(w.state.clone());
+            }
+        }
+        w.write_set(&c, Value::Int64(2), 0).unwrap();
+        entries.push(w.state.clone());
+        for ord in orders(entries.len()) {
+            let mut st = MergeState::default();
+            for &i in &ord {
+                st = join(&st, &entries[i], &o).0;
+            }
+            let doc = st.ordered_document(&o).unwrap();
+            assert_eq!(paths(&flatten(&doc)), strs(want[kind]), "{name}: delivery order {ord:?}");
+        }
+        let last = entries.last().unwrap();
+        assert_eq!(
+            paths(&flatten(&last.ordered_document(&o).unwrap())),
+            strs(want[kind]),
+            "{name}"
+        );
+    }
+}
+
+/// O2-4 of the O2 review: `known()` is the vector's maximum, not `top()` (which also counts the clock). A writer that ticks
+/// without writing (the sim's loss-entry `tick(0)`) has a clock ahead of its vector; an unset it makes then remembers the
+/// vector's maximum as `prev`. B incremented `a` without A having seen it; C wrote `d` at stamp 3. The increment survives A's
+/// unset and is placed by `prev`: after the highest stamp A had seen (its insert, 1) it keeps its own stamp (2), before `d`
+/// (3). With the clock in `prev` it would be placed after the clock and so after `d`.
+#[test]
+fn an_unset_after_a_tick_without_a_write_remembers_the_vectors_maximum_as_prev() {
+    use super::tests::wid;
+    let o = JoinOptions::default();
+    let (x, a_, d) = (Path::flat("x").unwrap(), Path::flat("a").unwrap(), Path::flat("d").unwrap());
+    let mut wa = Writer::new(wid('A', 0), o.clone());
+    wa.insert(&[(x, Value::Int64(1)), (a_.clone(), Value::Int64(1))], 0).unwrap();
+    let seed = wa.state.clone();
+    let (mut wb, mut wc) =
+        (Writer::new(wid('B', 0), o.clone()), Writer::new(wid('C', 0), o.clone()));
+    wb.receive(&seed);
+    wc.receive(&seed);
+    wb.write_inc(&a_, 1, 0).unwrap(); // stamp 2
+    wc.clock = Hlc::new(2, 0);
+    wc.write_set(&d, Value::Int64(1), 0).unwrap(); // stamp 3
+    // A mints a stamp and writes nothing: the clock runs ahead of the vector
+    let _ = wa.tick(9);
+    assert!(wa.clock > wa.state.vv.values().copied().max().unwrap());
+    wa.write_unset(&a_, 0).unwrap();
+    match wa.state.ords[&(wa.alive()[0], OrdAt::Field(a_.clone()))].floor {
+        Some(Floor::U { prev, .. }) => {
+            assert_eq!(
+                prev,
+                seed.vv.values().copied().max().unwrap(),
+                "prev is the vector's maximum before the write: the insert"
+            )
+        }
+        f => panic!("{f:?}"),
+    }
+    let mut st = join(&wa.state, &wb.state, &o).0;
+    st = join(&st, &wc.state, &o).0;
+    let doc = st.ordered_document(&o).unwrap();
+    assert_eq!(paths(&flatten(&doc)), strs(&["x", "a", "d"]));
 }

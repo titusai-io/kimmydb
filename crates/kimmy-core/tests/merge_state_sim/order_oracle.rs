@@ -57,8 +57,10 @@ impl std::ops::DerefMut for Tree {
 /// What a write does to the order, as the serial reference reads it.
 #[derive(Clone, Debug)]
 pub enum OrdOp {
-    /// The fields of the document an insert or a replace makes (in order; sub-documents are maps).
-    Make(Vec<(String, Value)>),
+    /// The fields an insert makes the document of (in order; sub-documents are maps).
+    Insert(Vec<(String, Value)>),
+    /// The fields a replace makes the document of (in order).
+    Replace(Vec<(String, Value)>),
     Set(Path, Value),
     Unset(Path),
     /// `$inc`: an absent field appears at the end; a field that exists stays where it is.
@@ -171,7 +173,7 @@ fn remove(t: &mut Tree, segs: &[String]) {
 pub fn apply(before: Option<&Tree>, op: &OrdOp) -> Option<Tree> {
     let segs = |p: &Path| p.segments().to_vec();
     match op {
-        OrdOp::Make(f) => Some(tree_of_fields(f)),
+        OrdOp::Insert(f) | OrdOp::Replace(f) => Some(tree_of_fields(f)),
         OrdOp::Upsert(names) => {
             let mut t = Tree::default();
             for n in names {
@@ -209,11 +211,28 @@ pub fn apply(before: Option<&Tree>, op: &OrdOp) -> Option<Tree> {
 /// What the client asked, as the reference reads it.
 pub fn op_of(intent: &Intent) -> OrdOp {
     match intent {
-        Intent::Insert(f) | Intent::Replace(f) => OrdOp::Make(f.clone()),
+        Intent::Insert(f) => OrdOp::Insert(f.clone()),
+        Intent::Replace(f) => OrdOp::Replace(f.clone()),
         Intent::Set(p, v) => OrdOp::Set(p.clone(), v.clone()),
         Intent::Unset(p) => OrdOp::Unset(p.clone()),
         Intent::Inc(p) => OrdOp::Inc(p.clone()),
     }
+}
+
+/// Does the write put the fields the writer sees in another ORDER, with the same fields? Then it is a write whatever the
+/// values (a replace, or a `$set` of a sub-document), and a writer that refuses it has dropped a reorder.
+pub fn reorders(before: Option<&[(String, OrderedValue)]>, op: &OrdOp) -> bool {
+    let Some(b) = before.map(tree_of_ordered) else { return false };
+    let (cur, want) = match op {
+        // (an insert is refused over a live document, model6.py `insert`, `if s.alive(): return None`: not a reorder)
+        OrdOp::Replace(f) => (b, tree_of_fields(f)),
+        OrdOp::Set(p, v @ Value::Document(_)) => {
+            let (Some(cur), Some(want)) = (b.level(p.segments()), node_of(v)) else { return false };
+            (cur.clone(), want)
+        }
+        _ => return false,
+    };
+    cur != want && cur.paths() == want.paths()
 }
 
 /// What a check decided.
@@ -241,7 +260,7 @@ pub fn check(
     let got = after.map(tree_of_ordered);
     let fail = |what: &str| Err(format!("{what}: {op:?}: before {before:?}, after {got:?}"));
     match op {
-        OrdOp::Make(_) | OrdOp::Upsert(_) => {
+        OrdOp::Insert(_) | OrdOp::Replace(_) | OrdOp::Upsert(_) => {
             let Some(want) = apply(None, op) else { return Ok(Checked::default()) };
             // which fields a document shows is the value rules' business: compare the order where the fields agree
             if got.as_ref().is_none_or(|g| g.paths() != want.paths()) {

@@ -422,11 +422,15 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
             )
         }
         Probe::OrdDiff => {
+            // the design must agree with the model first: a regression of the design must not hide behind
+            // "every mutant disagrees"
+            let d = ord_replay::replay(&design.opts);
             let f = ord_replay::replay(&cfg.opts);
-            let k = !f.bad.is_empty();
+            let k = d.bad.is_empty() && !f.bad.is_empty();
             (
                 Some(format!(
-                    "Ord differential: {} disagreements with the model in {} scripts: {}",
+                    "Ord differential: design {} disagreements, mutant {} in {} scripts: {}",
+                    d.bad.len(),
                     f.bad.len(),
                     f.scripts,
                     if k { "killed" } else { "NOT killed" }
