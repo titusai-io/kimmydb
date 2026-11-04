@@ -717,6 +717,42 @@ def s_maps_that_survive_an_unset_through_empty_children_trail_in_path_order():
     return sc
 
 
+# A2.3 (the O2-2 fix): an upsert names the ancestors of every path it writes. The five shapes of the model tree's probes_a23.py,
+# each followed by the writer's `$set c`; the scenario's entries are the writer's states after the upsert and after the set,
+# joined by the observer in every delivery order (the probe joins the model's whole oplog: the same shapes, the same orders).
+
+def _upsert_then_set(upsert):
+    sc = NoInit()
+    upsert(sc)
+    sc.op("A", "set", "c", 2)
+    return sc
+
+
+@scenario
+def s_a23_upsert_inc_of_a_nested_path_then_set():
+    return _upsert_then_set(lambda sc: sc.upsert_inc("A", "a.b", 1))
+
+
+@scenario
+def s_a23_upsert_soi_no_field_inc_nested_then_set():
+    return _upsert_then_set(lambda sc: sc.upsert_soi("A", {}, "a.b", 1))
+
+
+@scenario
+def s_a23_upsert_soi_field_inc_nested_then_set():
+    return _upsert_then_set(lambda sc: sc.upsert_soi("A", {"s": 7}, "a.b", 1))
+
+
+@scenario
+def s_a23_upsert_soi_nested_field_then_set():
+    return _upsert_then_set(lambda sc: sc.upsert_soi("A", {"a.b": 7}, "n", 1))
+
+
+@scenario
+def s_a23_upsert_soi_nested_set_field_then_set():
+    return _upsert_then_set(lambda sc: sc.upsert_soi("A", {}, "n", 1, sets={"a.b": 7}))
+
+
 # ---- the run -----------------------------------------------------------------------------------------------------------
 
 def ent_of(sc, i):

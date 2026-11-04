@@ -1,7 +1,7 @@
 //! Tests of the order state (`ord.rs`): the join and its laws, the read (the materialised document
 //! in field order), the feed, and the mutation switches.
 //!
-//! The expected results are the reference model's own, from the A2.1 Python model
+//! The expected results are the reference model's own, from the A2.3 Python model
 //! (`q7step0-model/`, `model6.py`): `tests/data/ord_goldens.json` holds, for each named
 //! scenario, the state of every writer entry (what the Rust joins, in many delivery orders), the
 //! ordered document and the order state the model's observer ends with, the writes themselves
@@ -24,8 +24,8 @@ const GOLDENS: &str = include_str!("../../tests/data/ord_goldens.json");
 const JOIN_LAWS: &str = include_str!("../../tests/data/ord_join_laws.json");
 const RANDOM_STATES: &str = include_str!("../../tests/data/ord_random_states.json");
 
-/// The `sha256` of `model6.py` (the reviewed A2.1 tree) that the fixtures were made from.
-const MODEL6_SHA256: &str = "865808753a5f9a4b80688a874f887ca1935de53b43ea19a0c6f13aa6b3497d08";
+/// The `sha256` of `model6.py` (the reviewed A2.3 tree) that the fixtures were made from.
+const MODEL6_SHA256: &str = "72da18ebbf3bb383d0741d1f10deb4265cb884dd960d49047913204016ebab3d";
 
 // ---- the fixtures ---------------------------------------------------------------------
 
@@ -390,7 +390,12 @@ fn script_fields(j: &J) -> Vec<(Path, Value)> {
         .as_array()
         .unwrap()
         .iter()
-        .map(|f| (Path::flat(f[0].as_str().unwrap()).unwrap(), script_value(&f[1])))
+        .map(|f| {
+            (
+                Path::new(f[0].as_str().unwrap().split('.').map(str::to_string)).unwrap(),
+                script_value(&f[1]),
+            )
+        })
         .collect()
 }
 
@@ -529,7 +534,12 @@ fn replay_script(sc: &J, o: &JoinOptions) -> Result<Replayed, String> {
 // ---- the read: the goldens of the materialised order --------------------------------
 
 /// The scenarios, by name. A new scenario of the generator is a new line here.
-const SCENARIOS: [&str; 44] = [
+const SCENARIOS: [&str; 49] = [
+    "a23_upsert_inc_of_a_nested_path_then_set",
+    "a23_upsert_soi_field_inc_nested_then_set",
+    "a23_upsert_soi_nested_field_then_set",
+    "a23_upsert_soi_nested_set_field_then_set",
+    "a23_upsert_soi_no_field_inc_nested_then_set",
     "a_scalar_over_a_map_voids_the_places_of_its_fields",
     "a_set_on_insert_upsert_feeds_both_of_its_writes",
     "a_standalone_noop_unset_leaves_nothing",
@@ -613,7 +623,7 @@ fn the_materialised_field_order_equals_the_models_on_every_scenario() {
         fields += want.len();
     }
     // pinned: what the test covered
-    assert_eq!((names.len(), joined, fields), (44, 3502, 184));
+    assert_eq!((names.len(), joined, fields), (49, 3512, 202));
 }
 
 fn paths(doc: &[(Path, Value)]) -> Vec<String> {
@@ -629,12 +639,12 @@ fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// The materialised-order goldens, spelled out. The arrays are what the A2.1 model gives
+/// The materialised-order goldens, spelled out. The arrays are what the A2.3 model gives
 /// (the same arrays are in `tests/data/ord_goldens.json`, from which the test above checks the
 /// join; these are pinned in the source so that a reader sees the rules).
 #[test]
 fn the_field_order_of_the_named_scenarios_is_pinned() {
-    let pins: [(&str, &[&str]); 44] = [
+    let pins: [(&str, &[&str]); 49] = [
         ("a_set_on_insert_upsert_feeds_both_of_its_writes", &["a", "b", "c", "e", "n", "d"]),
         ("a_standalone_noop_unset_leaves_nothing", &["a", "b", "m", "m.p", "nope", "e"]),
         ("a_subdocument_set_that_only_reorders_is_a_write", &["m", "m.q", "m.p", "m.r", "k", "z"]),
@@ -691,6 +701,11 @@ fn the_field_order_of_the_named_scenarios_is_pinned() {
             "maps_that_survive_an_unset_through_empty_children_trail_in_path_order",
             &["a", "n", "k", "k.z", "m", "m.x", "m.y"],
         ),
+        ("a23_upsert_inc_of_a_nested_path_then_set", &["a", "a.b", "c"]),
+        ("a23_upsert_soi_field_inc_nested_then_set", &["s", "a", "a.b", "c"]),
+        ("a23_upsert_soi_nested_field_then_set", &["a", "a.b", "n", "c"]),
+        ("a23_upsert_soi_nested_set_field_then_set", &["a", "a.b", "n", "c"]),
+        ("a23_upsert_soi_no_field_inc_nested_then_set", &["a", "a.b", "c"]),
     ];
     for (name, want) in pins {
         assert_eq!(order_of(name), strs(want), "{name}");
@@ -739,7 +754,7 @@ fn the_writer_reproduces_the_models_scenarios_after_every_write() {
         }
     }
     // pinned: what the replay covered (the seed insert of a seeded scenario is one of its writes)
-    assert_eq!((writes, receives, refused, joined), (191, 8, 9, 3502));
+    assert_eq!((writes, receives, refused, joined), (201, 8, 9, 3512));
 }
 
 /// The O2 watch item: a top-level field named `""` is fed as `OrdAt::Field([""])`, never as the
@@ -964,6 +979,9 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             "ord_by_name",
             |o| o.set_ord_by_name(true),
             &[
+                "a23_upsert_soi_field_inc_nested_then_set",
+                "a23_upsert_soi_nested_field_then_set",
+                "a23_upsert_soi_nested_set_field_then_set",
                 "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
@@ -1004,6 +1022,9 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             ],
             &[],
             &[
+                "a23_upsert_soi_field_inc_nested_then_set",
+                "a23_upsert_soi_nested_field_then_set",
+                "a23_upsert_soi_nested_set_field_then_set",
                 "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
@@ -1243,6 +1264,11 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             &[],
             &[],
             &[
+                "a23_upsert_inc_of_a_nested_path_then_set",
+                "a23_upsert_soi_field_inc_nested_then_set",
+                "a23_upsert_soi_nested_field_then_set",
+                "a23_upsert_soi_nested_set_field_then_set",
+                "a23_upsert_soi_no_field_inc_nested_then_set",
                 "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_subdocument_set_that_only_reorders_is_a_write",
                 "descendant_above_the_floor_is_not_a_survivor",
@@ -1302,6 +1328,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             |o| o.set_ord_no_first(true),
             &[],
             &[
+                "a23_upsert_inc_of_a_nested_path_then_set",
                 "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_standalone_noop_unset_leaves_nothing",
                 "a_subdocument_set_that_only_reorders_is_a_write",
@@ -1340,6 +1367,11 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "write_below_a_map_is_a_write_to_the_map",
             ],
             &[
+                "a23_upsert_inc_of_a_nested_path_then_set",
+                "a23_upsert_soi_field_inc_nested_then_set",
+                "a23_upsert_soi_nested_field_then_set",
+                "a23_upsert_soi_nested_set_field_then_set",
+                "a23_upsert_soi_no_field_inc_nested_then_set",
                 "a_scalar_over_a_map_voids_the_places_of_its_fields",
                 "a_set_on_insert_upsert_feeds_both_of_its_writes",
                 "a_standalone_noop_unset_leaves_nothing",
