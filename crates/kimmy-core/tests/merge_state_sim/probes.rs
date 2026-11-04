@@ -284,7 +284,9 @@ fn all_read(ms: &[Node], path: &str, want: i64) -> Vec<String> {
 /// form: A adds 1, B sets a to 2.5 (a generation that hides A's add), A receives it and sets 5, C (saw
 /// only the insert) sets 5 with the newest stamp: 5, never 6. A mutant that folds only the counted slots
 /// reads 55 and 6. And the marker scenario: `$set a {b: 1}` over a counter at `a` folds its slot (the
-/// mutant that folds nothing at a map marker leaves the slot without its pair).
+/// mutant that folds nothing at a map marker leaves the slot without its pair). And the cross-life
+/// scenario: a base in the newest alive life folds a slot of another alive life (the mutant that folds
+/// only the write's own life leaves that slot without its pair).
 pub fn fold_scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
     let s = |x: &str| Value::String(x.into());
     let mut out = Vec::new();
@@ -337,6 +339,35 @@ pub fn fold_scenarios_with(cfg: &Cfg) -> Vec<(String, Vec<String>)> {
             _ => vec![format!("{} slots, not one", slots.len())],
         };
         out.push(("fold: a map-marker base over a counter folds its slots".to_string(), problems));
+    }
+    {
+        // A base write in the NEWEST alive life folds a slot of ANOTHER alive life (the shape of seed 792 of
+        // the nested differential): C inserts `c` and adds 5 (a slot in C's insert life); D upserts a counter
+        // at `y` (an upsert life beside the insert; D's life is the newer, same HLC and the greater writer);
+        // C pulls it and sets `c` to a double, a base written in D's life. The slot of C's life takes the
+        // pair the base held; the mutant that folds only the slots of the write's own life leaves it bare.
+        let mut log = Log::new();
+        let mut ms: Vec<Node> = "CD".chars().map(|c| Node::new(c, cfg)).collect();
+        ms[0].insert(&[("c", Value::Int64(0))], &mut log, 0);
+        ms[0].inc("c", 5, &mut log, 0);
+        ms[1].upsert_inc("y", 1, &mut log, 0);
+        pull(&mut ms, 0, 1, None);
+        let alive = ms[0].w.alive();
+        ms[0].set("c", Value::Double(2.5), &mut log, 0);
+        let slots: Vec<_> = ms[0].state().slots.iter().filter(|(k, _)| k.1 == p("c")).collect();
+        let problems = match slots.as_slice() {
+            _ if alive.len() != 2 => vec![format!("{} alive lives, not two", alive.len())],
+            [(k, _)] if Some(&k.0) == alive.last() => {
+                vec!["the slot is in the write's own life, not in another".to_string()]
+            }
+            [(_, sl)] if sl.absorbed.as_ref() == Some(&(sl.stamp, sl.total)) => Vec::new(),
+            [(_, sl)] => vec![format!("the base left the other life's slot at {:?}", sl.absorbed)],
+            _ => vec![format!("{} slots at c, not one", slots.len())],
+        };
+        out.push((
+            "fold: a base in the newest alive life folds a slot of another alive life".to_string(),
+            problems,
+        ));
     }
     out
 }
