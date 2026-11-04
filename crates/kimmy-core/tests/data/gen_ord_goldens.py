@@ -10,13 +10,16 @@ reproduce) and writes two JSON fixtures that the Rust tests read:
   ord_join_laws.json  the Ords of probe_ord_join_laws (150 nested runs, steps=14): per path the distinct entry Ords, which the
                       Rust test joins pairwise and in triples with PINNED counts.
 
-Usage:   Q7MODEL_DIR=<q7step0-model-A2-final> python3 -I gen_ord_goldens.py <out-dir>
+Usage:   Q7MODEL_DIR=<q7step0-model-A2-final> python3 -I -B gen_ord_goldens.py <out-dir>
+         (-B: the model directory must not get a __pycache__; the script also sets sys.dont_write_bytecode)
 
 `model6.py` is NOT in this repository (the reference model lives with the Q7 review files); the fixtures record its sha256
 (0506450e0afc4c307a6ebce032df4f1b1588e719cde6c148c5ff033a8df7f85a) and the Rust tests check it. A new scenario here needs a new
 name in `SCENARIOS` of `src/merge_state/ord_tests.rs` and its order pinned there.
 """
 import hashlib, itertools, json, os, random, sys
+
+sys.dont_write_bytecode = True      # before the model is imported: the model directory is read-only to this script
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.environ["Q7MODEL_DIR"]
@@ -526,7 +529,8 @@ def join_law_fixture():
                     bad += 1
             idx = []
             for o in os_:
-                key = json.dumps(j_ord(o), sort_keys=True)
+                # the key kind is part of the entry: the root of a replace keeps a level mark and nothing else
+                key = json.dumps({**j_ord(o), "root": k[1] == ""}, sort_keys=True)
                 idx.append(pool.setdefault(key, len(pool)))
             per_path.append(idx)
     assert bad == 0

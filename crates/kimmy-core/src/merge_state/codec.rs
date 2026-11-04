@@ -86,6 +86,20 @@ pub enum DecodeError {
     OrdNotNormal,
     #[error("merge state: an order entry says nothing (no floor, no candidate, no level mark)")]
     OrdEntryEmpty,
+    #[error("merge state: an order entry keeps a first for a writer under a stamp of another")]
+    OrdFirstNotByItsWriter,
+    #[error("merge state: an order entry has a first with no last, or a last before a first")]
+    OrdLastBehindAFirst,
+    #[error("merge state: an unset floor remembers an HLC that is not below its own stamp")]
+    OrdPrevNotBelowStamp,
+    #[error("merge state: the root of the order state holds more than a level mark")]
+    OrdRootNotALevel,
+    #[error("merge state: an order entry gives one write two different positions")]
+    OrdPositionsDisagree,
+    #[error(
+        "merge state: an order entry has a standing level mark and no last write at or after it"
+    )]
+    OrdLevelWithoutLast,
     #[error("merge state: invalid order floor kind {0}")]
     OrdBadFloor(u8),
     #[error("merge state: the order section is present but empty")]

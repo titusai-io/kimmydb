@@ -12,11 +12,12 @@
 //! and every order entry is normal, belongs to a listed life and has its stamps covered. The join
 //! laws are claimed for the closed states, and only those are what `decode` accepts.
 //!
-//! The order entries of a hand-built state are COHERENT CHAINS: for a key `(life, path)` the
-//! entries a state can hold are `base`, `base + x1`, `base + x1 + x2` (joined), each fixed by the
-//! key, so that two states hold comparable entries of one key and the join of two of them is the
-//! larger. Arbitrary entries would break associativity (it is claimed for the entries writers
-//! reach, which the property tests' simulation checks), which is no fault of the join.
+//! The order entries of a hand-built state are MOMENTS OF ONE HISTORY: for a key `(life, path)` the
+//! key fixes a script of events (writes, unsets, replaces, level marks by three writers), and a
+//! state holds the entry after the first one to three of them, applied by `ord_apply` as a
+//! writer's replica does (`ord_chain`). Two states then hold two moments of one history, the later
+//! extending the earlier, which is what the join is claimed associative on; arbitrary entries are
+//! not (a writer cannot have two histories: item 22 of the inventory of `check_decoded`).
 //!
 //! The cases are tagged with the shape they were built for ([`BUILDERS`]), and [`shapes_of`]
 //! tells from the states themselves which shapes a case holds, so that a test can count what it
@@ -605,43 +606,44 @@ fn uni(r: &mut Rng, max_wall: u64) -> Uni {
     }
 }
 
-/// A random order entry from the universe: any floor, up to two writers' firsts, a last, a level.
-fn rand_ord(r: &mut Rng, u: &Uni) -> FieldOrd {
-    let mut x = FieldOrd::default();
-    let st = |r: &mut Rng| *r.pick(&u.stamps);
-    x.floor = match r.below(4) {
-        0 => Some(Floor::U {
-            stamp: st(r),
-            prev: Hlc::new(r.below(u.max_wall as usize) as u64, 0),
-            others: r.below(2) == 0,
-        }),
-        1 => Some(Floor::R { stamp: st(r) }),
-        _ => None,
-    };
-    for k in 0..r.below(3) as u8 {
-        let c = st(r);
-        x.firsts.insert(wid(k), (c, r.below(4) as u64));
-    }
-    if r.below(2) == 0 {
-        x.last = Some((st(r), r.below(4) as u64));
-    }
-    if r.below(3) == 0 {
-        x.lvl = Some(st(r));
-    }
-    x
+/// The position a write gives a path, a function of the write: one stamp is one write, and a write
+/// names a path once.
+pub(super) fn pos_of(c: MStamp) -> u64 {
+    (c.hlc.wall_ms + u64::from(c.hlc.counter)) % 4
 }
 
-/// The entry of `(life, at)` after `steps` joins of the chain the key fixes (see the module
-/// documentation): normal, whatever the draws.
-fn ord_chain(cx: &mut Cx, u: &Uni, life: MStamp, at: &OrdAt, steps: usize) -> FieldOrd {
+/// The entry of `(life, at)` after `steps` events of the history the key fixes: one replica that
+/// received writes by three writers to this path (a write, an unset, a replace, a write or a
+/// replace of a whole sub-document, an unset in an update that also writes a sibling), at the
+/// stamps 2, 3, 4 and so on, each the work of `ord_apply` on the one entry, as the model's writers
+/// do. So the entries two states hold of one key are two moments of ONE history (the later extends
+/// the earlier: their join is the later), and they satisfy every clause `decode` checks. The root
+/// of a replace only ever gets a level mark.
+fn ord_chain(cx: &mut Cx, life: MStamp, at: &OrdAt, steps: usize) -> FieldOrd {
     let o = JoinOptions::default();
-    let base = cx.draw(("ord", life, at, 0), |r| rand_ord(r, u));
-    let mut acc = ord_join(&base, &base, &o);
+    let mut scratch = MergeState::default();
+    let sibling = OrdAt::Field(path(&["sib"]));
     for i in 1..=steps {
-        let x = cx.draw(("ord", life, at, i), |r| rand_ord(r, u));
-        acc = ord_join(&acc, &x, &o);
+        let (kind, who, extra) =
+            cx.draw(("event", life, at, i), |r| (r.below(5), r.below(3) as u8, r.below(2) == 0));
+        let stamp = MStamp { hlc: Hlc::new(i as u64 + 1, 0), writer: wid(who) };
+        let known = Hlc::new(i as u64, 0);
+        let here = || at.clone();
+        let items = if *at == OrdAt::Root {
+            vec![(OrdAt::Root, OrdMode::Level)]
+        } else {
+            match kind {
+                0 => vec![(here(), OrdMode::Write)],
+                1 if extra => vec![(here(), OrdMode::Unset), (sibling.clone(), OrdMode::Write)],
+                1 => vec![(here(), OrdMode::Unset)],
+                2 => vec![(here(), OrdMode::Reset)],
+                3 => vec![(here(), OrdMode::Write), (here(), OrdMode::Level)],
+                _ => vec![(here(), OrdMode::Reset), (here(), OrdMode::Level)],
+            }
+        };
+        scratch.ord_apply(life, stamp, known, &ord_events(&items, &o), &o);
     }
-    acc
+    scratch.ords.remove(&(life, at.clone())).unwrap_or_default()
 }
 
 fn wild_state(cx: &mut Cx, u: &Uni) -> MergeState {
@@ -694,15 +696,15 @@ fn wild_state(cx: &mut Cx, u: &Uni) -> MergeState {
         s.gens.insert((l, p), (*cx.rng.pick(&u.stamps), Vv::new()));
     }
     // order entries: at a few keys of the universe, so that the two states of a case meet at them
-    for _ in 0..cx.rng.below(4) {
+    for _ in 0..cx.rng.below(6) {
         let l = u.lives[cx.rng.below(2)];
         let at = if cx.rng.below(4) == 0 {
             OrdAt::Root
         } else {
             OrdAt::Field(u.paths[cx.rng.below(2)].clone())
         };
-        let steps = cx.rng.below(3);
-        let x = ord_chain(cx, u, l, &at, steps);
+        let steps = 1 + cx.rng.below(3);
+        let x = ord_chain(cx, l, &at, steps);
         s.ords.insert((l, at), x);
     }
     for k in 0..3u8 {

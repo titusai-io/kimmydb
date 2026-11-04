@@ -298,14 +298,58 @@ impl MergeState {
     ///     one; a state that holds one is not idempotent under join (the join drops it), and
     ///     the compact form could spell the one state two ways if the decoder took both.
     ///     (A voided entry cannot become empty: voiding needs a floor, which stays.)
-    /// 14. NOT relied on, so NOT checked: that a `firsts` candidate is stamped by the writer
-    ///     that keys it, that `last` is not earlier than a first, that a `u` floor's `prev` is
-    ///     below its own stamp, that the positions are small, that the root keeps only a level
-    ///     floor (`OrdAt::Root`), that the entries are for paths that have a cell. The join
-    ///     and the read are defined for any values of these (the laws hold on the entries of
-    ///     the model's runs and on any NORMAL entries for commutativity and idempotence, and
-    ///     associativity on the entries writers reach only, see `ord_tests`); they are the
-    ///     model's own writer's habits.
+    ///
+    /// THE REACHABILITY INVARIANT of an order entry. The join of order entries is commutative and
+    /// idempotent on any normal entries but associative only on entries a causal history can
+    /// reach (a test pins the counterexample). The clauses below say what an entry looks like in
+    /// any state a causal history reaches, derived from the model's rules (`_events`,
+    /// `_ord_apply`, `ord_join`) and held by every honest source in the tests: the model's
+    /// runs (the 457 entries of its join-law probe and the 120 states of its scenarios), the
+    /// causal simulation, and the property tests' runs with the feed. Each says whether one
+    /// state can show it. Items 10 to 13 above are the first four.
+    ///
+    /// 14. Standing candidates carry what a write gives them. CHECKED, items 15 to 20, by
+    ///     [`FieldOrd::shape_error`]:
+    /// 15. `firsts[w]` is a stamp of `w` ([`DecodeError::OrdFirstNotByItsWriter`]). The feed sets
+    ///     it from the writer's own stamp, and the join keeps the writer as the key.
+    /// 16. A standing first implies a `last`, and no first is after it
+    ///     ([`DecodeError::OrdLastBehindAFirst`]). `last` is the newest write the entry knows
+    ///     (a writer stamps above everything it has seen, the join takes the maximum), so no
+    ///     first is later; a floor that voids `last` voids every earlier first. (The converse
+    ///     is false and not a clause: a floor may void a first and leave `last`, the model's
+    ///     approximate case.)
+    /// 17. A `u` floor's `prev` is below its stamp's HLC ([`DecodeError::OrdPrevNotBelowStamp`]):
+    ///     `prev` is the writer's highest HLC before the write, and the clock ticks above it.
+    /// 18. The root of a replace holds a level mark and nothing else
+    ///     ([`DecodeError::OrdRootNotALevel`]): a replace names the root only as `("", "L")`.
+    /// 19. One write names a path once, so candidates under one stamp share one position
+    ///     ([`DecodeError::OrdPositionsDisagree`]).
+    /// 20. A standing level mark at a path (not the root) implies a `last` at or after it
+    ///     ([`DecodeError::OrdLevelWithoutLast`]): a document-valued write names the path and
+    ///     marks it in one write, and a candidate that stands under the floor stays in `last`.
+    ///
+    /// 21. NOT checked, one state could show it but honest states break it or no law needs it: an
+    ///     entry's path having a cell (a no-op unset in an update leaves a floor on a path that
+    ///     has none: the hybrid floor); candidates against the cells' stamps (a cell is
+    ///     overwritten by a newer write, and the counter cell is not frozen); an entry against the
+    ///     entry of its parent (a write the unsetter never saw survives below an unset parent);
+    ///     small positions (a write may name any number of siblings); `last` against an
+    ///     unvoided first of another writer (a floor may void one and not the other).
+    /// 22. NOT checkable from one state, the cross-state clause: for one writer W and one key,
+    ///     any two states whose entries hold W's work agree on W's history. If one holds
+    ///     `firsts[W] = s` and another `firsts[W] = t` with s earlier than t, the second must
+    ///     carry a floor that voids `s`: W's state at `t` held `s` (W wrote it first) or a floor
+    ///     over it, and every state that holds W's stamp `t` holds W's whole state at `t`. The
+    ///     impossible pair is the entry `{first W at 5}` of one state and the entry `{first W at
+    ///     9, no floor over 5}` of another: each alone is the entry of an honest state (W's first
+    ///     write to the path was 5, or was 9), together they say W's write at 5 both happened and
+    ///     did not. It is "one stamp is one write" for the order state (the second state denies
+    ///     the write at stamp 5 that the first holds), guaranteed by honest stamping and by
+    ///     the full-state transfer, and not closable by decode. The join groups such entries
+    ///     differently and does not agree with itself (`ord_tests`).
+    ///
+    /// 23. NOT relied on, so NOT checked: nothing else is assumed of an entry: the join and the read
+    ///     are defined for any values, and the laws hold as stated above.
     ///
     /// The mutant memory (`gens`, `Gen::vv`) is not encoded and not checked.
     pub(super) fn check_decoded(&self) -> Result<(), DecodeError> {
@@ -323,7 +367,7 @@ impl MergeState {
             return Err(DecodeError::VersionVectorBehind);
         }
         let o = JoinOptions::default();
-        for ((l, _), x) in &self.ords {
+        for ((l, at), x) in &self.ords {
             if !self.lives.contains_key(l) {
                 return Err(DecodeError::OrdLifeNotListed);
             }
@@ -342,6 +386,9 @@ impl MergeState {
                 .chain(x.lvl);
             if held.into_iter().any(|st| !covered(&st)) {
                 return Err(DecodeError::VersionVectorBehind);
+            }
+            if let Some(e) = x.shape_error(at) {
+                return Err(e);
             }
         }
         Ok(())
