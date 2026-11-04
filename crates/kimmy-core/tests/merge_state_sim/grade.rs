@@ -27,7 +27,7 @@ fn differing(ms: &[Node]) -> Vec<&'static str> {
 }
 
 fn heads(have: &BTreeSet<LossKey>) -> BTreeSet<Head> {
-    have.iter().map(|k| (k.path.clone(), k.stamp)).collect()
+    have.iter().map(|k| (oracle::at_path(&k.at), k.stamp)).collect()
 }
 
 /// The problems of a finished run, by name (empty when the run is sound).

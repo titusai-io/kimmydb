@@ -8,7 +8,7 @@ use crate::oracle::{self, Log};
 use crate::sim::{Cfg, Node, fixpoint, p, pull};
 
 fn key(kind: LossKind, path: &str, stamp: MStamp) -> LossKey {
-    LossKey { kind, path: p(path), stamp }
+    if path == "_" { LossKey::document(kind, stamp) } else { LossKey::field(kind, p(path), stamp) }
 }
 
 /// The oracle's `alive` and `dels` for a finished log.

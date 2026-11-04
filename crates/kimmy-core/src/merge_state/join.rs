@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::state::{LifeKind, MergeState, cov, sub_ret};
-use super::types::{LossKey, LossKind, LossValue, MStamp, Path};
+use super::types::{LossKey, LossKind, LossValue, MStamp, Path, Value};
 use crate::hlc::Hlc;
 
 /// A refused integer bound: it must not be negative.
@@ -17,7 +17,9 @@ pub struct InvalidIntBound(pub i64);
 /// configuration: build one with [`JoinOptions::new`] or [`Default`], and change the
 /// retention through the public field. The mutation switches (horizon-first,
 /// supersession, reported cells, `$setOnInsert` suppression, the v3 generation rule, the
-/// two read and creation rules of the B1 and M1 fixes, and write normalisation) can be
+/// two read and creation rules of the B1 and M1 fixes, write normalisation and the six nested
+/// mutants: the type rule's recency, a marker that hides, `typeClash`, `arrayClash`, the
+/// sub-document diff and the refusal below a scalar) can be
 /// changed only in a test or `merge-mutants` build, through the `set_*` methods that exist
 /// there: they let the harness reproduce the model's mutants. The production code path is
 /// the same code with the switches at their correct values.
@@ -58,6 +60,24 @@ pub struct JoinOptions {
     /// un-normalised states of `model5.Member`).
     #[cfg(any(test, feature = "merge-mutants"))]
     normalize_writes: bool,
+    /// Nested mutant: a scalar register hides every child, even a newer one.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    type_ignores_recency: bool,
+    /// Nested mutant: a map marker hides its children.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    marker_hides: bool,
+    /// Nested mutant: the join reports no `typeClash`.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_type_clash: bool,
+    /// Nested mutant: two concurrent arrays are reported as a plain `clash`.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    array_clash_as_clash: bool,
+    /// Nested mutant: a sub-document write rewrites every leaf, changed or not.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    rewrite_unchanged: bool,
+    /// Nested mutant: a write below a scalar or an array is accepted.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    write_below_scalar: bool,
 }
 
 impl Default for JoinOptions {
@@ -82,6 +102,18 @@ impl Default for JoinOptions {
             creation_without_generation: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             normalize_writes: true,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            type_ignores_recency: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            marker_hides: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_type_clash: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            array_clash_as_clash: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            rewrite_unchanged: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            write_below_scalar: false,
         }
     }
 }
@@ -135,6 +167,12 @@ impl JoinOptions {
     switch!(value_ignores_slot_stamp, set_value_ignores_slot_stamp, false);
     switch!(creation_without_generation, set_creation_without_generation, false);
     switch!(normalize_writes, set_normalize_writes, true);
+    switch!(type_ignores_recency, set_type_ignores_recency, false);
+    switch!(marker_hides, set_marker_hides, false);
+    switch!(no_type_clash, set_no_type_clash, false);
+    switch!(array_clash_as_clash, set_array_clash_as_clash, false);
+    switch!(rewrite_unchanged, set_rewrite_unchanged, false);
+    switch!(write_below_scalar, set_write_below_scalar, false);
 }
 
 /// The model's `_prefilter`: drop deletes and dead lives older than `h`.
@@ -195,9 +233,8 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
     }
 
     let mut new: BTreeMap<LossKey, LossValue> = BTreeMap::new();
-    let whole = Path::whole_document();
     let key =
-        |kind: LossKind, path: &Path, stamp: MStamp| LossKey { kind, path: path.clone(), stamp };
+        |kind: LossKind, path: &Path, stamp: MStamp| LossKey::field(kind, path.clone(), stamp);
 
     // Q2: concurrent FIRST inserts of one _id (explicit inserts whose creator had
     // seen no delete): the newest whole document wins, the others are superseded
@@ -227,7 +264,7 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
         reported = superseded.difference(&killed).copied().collect();
         for l in &reported {
             new.insert(
-                key(LossKind::InsertLost, &whole, *l),
+                LossKey::document(LossKind::InsertLost, *l),
                 LossValue::Fields(out.lives[l].order.clone()),
             );
         }
@@ -239,7 +276,7 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
     out.dead.extend(not_alive);
 
     // (1) same-path register clashes: a register of s against a register of t,
-    // concurrent by the version vectors.
+    // concurrent by the version vectors. Two arrays are an `arrayClash`.
     let paths: BTreeSet<&Path> = s.regs.keys().chain(t.regs.keys()).map(|k| &k.1).collect();
     for p in paths {
         let rs = s.regs.iter().filter(|(k, _)| &k.1 == p && al.contains(&k.0)).map(|(_, r)| r);
@@ -249,10 +286,54 @@ pub fn join(s: &MergeState, t: &MergeState, o: &JoinOptions) -> (MergeState, BTr
             for b in &rt {
                 if a.stamp != b.stamp && !cov(&t.vv, &a.stamp) && !cov(&s.vv, &b.stamp) {
                     let lo = if a.stamp < b.stamp { a } else { b };
-                    new.insert(
-                        key(LossKind::Clash, p, lo.stamp),
-                        LossValue::Value(lo.value.clone()),
-                    );
+                    let arrays = matches!((&a.value, &b.value), (Value::Array(_), Value::Array(_)));
+                    let kind = if arrays && !o.array_clash_as_clash() {
+                        LossKind::ArrayClash
+                    } else {
+                        LossKind::Clash
+                    };
+                    new.insert(key(kind, p, lo.stamp), LossValue::Value(lo.value.clone()));
+                }
+            }
+        }
+    }
+
+    // (1b) typeClash: a scalar or array register at p against a cell below p (a register with
+    // a plain value, or a counter slot), concurrent by the version vectors. The loser is the
+    // side the type rule hides: the older stamp (a newer register at p hides the cell below; a
+    // newer cell below makes p a map, and the register at p loses). Any depth below counts.
+    if !o.no_type_clash() {
+        for (a_st, b_st) in [(&s, &t), (&t, &s)] {
+            // b's cells in path order, so that those below a path are one run.
+            let mut cells: Vec<(&Path, MStamp, LossValue)> = b_st
+                .regs
+                .iter()
+                .filter(|(k, r)| al.contains(&k.0) && r.value.is_plain())
+                .map(|(k, r)| (&k.1, r.stamp, LossValue::Value(r.value.clone())))
+                .chain(
+                    b_st.slots
+                        .iter()
+                        .filter(|(k, _)| al.contains(&k.0))
+                        .map(|(k, v)| (&k.1, v.stamp, LossValue::Total(v.total))),
+                )
+                .collect();
+            cells.sort_by(|x, y| x.0.cmp(y.0));
+            for ((l, p), r) in &a_st.regs {
+                if !al.contains(l) || !r.value.is_plain() || cov(&b_st.vv, &r.stamp) {
+                    continue;
+                }
+                let start = cells.partition_point(|c| c.0 <= p);
+                for (q, qst, qv) in cells[start..].iter().take_while(|c| c.0.is_below(p)) {
+                    if *qst != r.stamp && !cov(&a_st.vv, qst) {
+                        if r.stamp > *qst {
+                            new.insert(key(LossKind::TypeClash, q, *qst), qv.clone());
+                        } else {
+                            new.insert(
+                                key(LossKind::TypeClash, p, r.stamp),
+                                LossValue::Value(r.value.clone()),
+                            );
+                        }
+                    }
                 }
             }
         }

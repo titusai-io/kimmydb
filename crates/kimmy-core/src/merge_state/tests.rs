@@ -16,63 +16,63 @@ use crate::ids::NodeId;
 fn nid(c: char) -> NodeId {
     NodeId::from_bytes([c as u8; 16])
 }
-fn wid(c: char, epoch: u64) -> WriterId {
+pub(super) fn wid(c: char, epoch: u64) -> WriterId {
     WriterId { node: nid(c), epoch: Epoch::from_u64(epoch) }
 }
-fn h(n: u64) -> Hlc {
+pub(super) fn h(n: u64) -> Hlc {
     Hlc::new(n, 0)
 }
-fn i(n: i64) -> Value {
+pub(super) fn i(n: i64) -> Value {
     Value::Int64(n)
 }
-fn s(x: &str) -> Value {
+pub(super) fn s(x: &str) -> Value {
     Value::String(x.to_string())
 }
-fn f(x: f64) -> Value {
+pub(super) fn f(x: f64) -> Value {
     Value::Double(x)
 }
 /// A one-segment path.
-fn p(x: &str) -> Path {
+pub(super) fn p(x: &str) -> Path {
     Path::flat(x).unwrap()
 }
 /// The fields of a flat document as paths.
-fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
+pub(super) fn fl(f: &[(&str, Value)]) -> Vec<(Path, Value)> {
     f.iter().map(|(k, v)| (p(k), v.clone())).collect()
 }
-fn opts() -> JoinOptions {
+pub(super) fn opts() -> JoinOptions {
     JoinOptions::default()
 }
 fn ret(r: u64) -> JoinOptions {
     JoinOptions::new(r, i64::MAX).unwrap()
 }
-fn doc(kv: &[(&str, Value)]) -> Option<BTreeMap<Path, Value>> {
+pub(super) fn doc(kv: &[(&str, Value)]) -> Option<BTreeMap<Path, Value>> {
     Some(kv.iter().map(|(k, v)| (p(k), v.clone())).collect())
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum OKey {
+pub(super) enum OKey {
     W(MStamp),
     L(LossKey),
 }
 
 #[derive(Clone)]
-enum Ent {
+pub(super) enum Ent {
     W(MStamp, MergeState),
     L(LossKey, LossValue),
 }
 
 /// The model's `Member`: a writer with an oplog of entries and an event list.
-struct Mem {
-    name: char,
-    epoch: u64,
-    w: Writer,
-    oplog: BTreeMap<OKey, Ent>,
-    events: Vec<LossKey>,
-    saved: Vec<(MergeState, BTreeMap<OKey, Ent>)>,
+pub(super) struct Mem {
+    pub(super) name: char,
+    pub(super) epoch: u64,
+    pub(super) w: Writer,
+    pub(super) oplog: BTreeMap<OKey, Ent>,
+    pub(super) events: Vec<LossKey>,
+    pub(super) saved: Vec<(MergeState, BTreeMap<OKey, Ent>)>,
 }
 
 impl Mem {
-    fn new(name: char, o: &JoinOptions) -> Self {
+    pub(super) fn new(name: char, o: &JoinOptions) -> Self {
         Mem {
             name,
             epoch: 0,
@@ -82,24 +82,24 @@ impl Mem {
             saved: Vec::new(),
         }
     }
-    fn log(&mut self, wr: Option<Written>) -> Option<MStamp> {
+    pub(super) fn log(&mut self, wr: Option<Written>) -> Option<MStamp> {
         let wr = wr?;
         self.oplog.insert(OKey::W(wr.stamp), Ent::W(wr.stamp, self.w.state.clone()));
         Some(wr.stamp)
     }
-    fn ent(&self, st: MStamp) -> Ent {
+    pub(super) fn ent(&self, st: MStamp) -> Ent {
         self.oplog[&OKey::W(st)].clone()
     }
-    fn ins(&mut self, f: &[(&str, Value)], sk: u64) -> Option<MStamp> {
+    pub(super) fn ins(&mut self, f: &[(&str, Value)], sk: u64) -> Option<MStamp> {
         let r = self.w.insert(&fl(f), sk);
         self.log(r)
     }
-    fn upsert_inc(&mut self, path: &str, n: i64) -> Option<MStamp> {
+    pub(super) fn upsert_inc(&mut self, path: &str, n: i64) -> Option<MStamp> {
         let r = self.w.upsert_inc(&p(path), n, 0);
         self.log(r)
     }
     /// Returns `(life, inc stamp)`: the creation write and the increment write.
-    fn upsert_soi(
+    pub(super) fn upsert_soi(
         &mut self,
         f: &[(&str, Value)],
         path: &str,
@@ -113,19 +113,35 @@ impl Mem {
         self.log(Some(i));
         Some((life, inc))
     }
-    fn set(&mut self, path: &str, v: Value, sk: u64) -> Option<MStamp> {
+    pub(super) fn set(&mut self, path: &str, v: Value, sk: u64) -> Option<MStamp> {
         let r = self.w.write_set(&p(path), v, sk);
         self.log(r)
     }
-    fn inc(&mut self, path: &str, n: i64, sk: u64) -> Option<MStamp> {
+    pub(super) fn set_at(&mut self, path: &Path, v: Value, sk: u64) -> Option<MStamp> {
+        let r = self.w.write_set(path, v, sk);
+        self.log(r)
+    }
+    pub(super) fn unset_at(&mut self, path: &Path, sk: u64) -> Option<MStamp> {
+        let r = self.w.write_unset(path, sk);
+        self.log(r)
+    }
+    pub(super) fn inc_at(&mut self, path: &Path, n: i64, sk: u64) -> Option<MStamp> {
+        let r = self.w.write_inc(path, n, sk);
+        self.log(r)
+    }
+    pub(super) fn replace(&mut self, f: &[(&str, Value)], sk: u64) -> Option<MStamp> {
+        let r = self.w.write_replace(&fl(f), sk);
+        self.log(r)
+    }
+    pub(super) fn inc(&mut self, path: &str, n: i64, sk: u64) -> Option<MStamp> {
         let r = self.w.write_inc(&p(path), n, sk);
         self.log(r)
     }
-    fn del(&mut self) -> Option<MStamp> {
+    pub(super) fn del(&mut self) -> Option<MStamp> {
         let r = self.w.write_delete(0);
         self.log(r)
     }
-    fn absorb(&mut self, other: &MergeState, record: bool) -> bool {
+    pub(super) fn absorb(&mut self, other: &MergeState, record: bool) -> bool {
         let r = self.w.receive_report(other);
         for k in r.fresh {
             self.events.push(k.clone());
@@ -136,7 +152,7 @@ impl Mem {
         }
         r.changed
     }
-    fn receive_entry(&mut self, e: &Ent) {
+    pub(super) fn receive_entry(&mut self, e: &Ent) {
         match e {
             Ent::W(st, state) => {
                 if self.absorb(state, true) {
@@ -151,28 +167,28 @@ impl Mem {
             }
         }
     }
-    fn receive_snapshot(&mut self, other: &MergeState) {
+    pub(super) fn receive_snapshot(&mut self, other: &MergeState) {
         self.absorb(other, false);
     }
-    fn restore(&mut self) {
+    pub(super) fn restore(&mut self) {
         let (st, ol) = self.saved[0].clone();
         self.w.state = st;
         self.oplog = ol;
         self.epoch += 1;
         self.w.id = wid(self.name, self.epoch);
     }
-    fn visible(&self) -> Option<BTreeMap<Path, Value>> {
+    pub(super) fn visible(&self) -> Option<BTreeMap<Path, Value>> {
         self.w.visible()
     }
-    fn canon(&self) -> Vec<u8> {
+    pub(super) fn canon(&self) -> Vec<u8> {
         self.w.state.canonical_bytes()
     }
-    fn loss_set(&self) -> BTreeSet<(LossKind, Path, MStamp)> {
-        self.w.state.losses.keys().map(|k| (k.kind, k.path.clone(), k.stamp)).collect()
+    pub(super) fn loss_set(&self) -> BTreeSet<(LossKind, LossAt, MStamp)> {
+        self.w.state.losses.keys().map(|k| (k.kind, k.at.clone(), k.stamp)).collect()
     }
 }
 
-fn fresh_observer(o: &JoinOptions, seed: &[Ent]) -> Mem {
+pub(super) fn fresh_observer(o: &JoinOptions, seed: &[Ent]) -> Mem {
     let mut m = Mem::new('O', o);
     for e in seed {
         m.receive_entry(e);
@@ -180,7 +196,7 @@ fn fresh_observer(o: &JoinOptions, seed: &[Ent]) -> Mem {
     m
 }
 
-fn perms(n: usize) -> Vec<Vec<usize>> {
+pub(super) fn perms(n: usize) -> Vec<Vec<usize>> {
     fn go(cur: &mut Vec<usize>, used: &mut Vec<bool>, out: &mut Vec<Vec<usize>>) {
         if cur.len() == used.len() {
             out.push(cur.clone());
@@ -202,7 +218,7 @@ fn perms(n: usize) -> Vec<Vec<usize>> {
 }
 
 /// Every delivery order of `ents` into a fresh observer seeded with `seed`.
-fn all_orders(o: &JoinOptions, ents: &[Ent], seed: &[Ent]) -> Vec<(Vec<usize>, Mem)> {
+pub(super) fn all_orders(o: &JoinOptions, ents: &[Ent], seed: &[Ent]) -> Vec<(Vec<usize>, Mem)> {
     perms(ents.len())
         .into_iter()
         .map(|p| {
@@ -215,7 +231,7 @@ fn all_orders(o: &JoinOptions, ents: &[Ent], seed: &[Ent]) -> Vec<(Vec<usize>, M
         .collect()
 }
 
-fn sync(ms: &mut [Mem]) {
+pub(super) fn sync(ms: &mut [Mem]) {
     for _ in 0..12 {
         let before: Vec<_> = ms.iter().map(Mem::canon).collect();
         for r in 0..ms.len() {
@@ -234,7 +250,7 @@ fn sync(ms: &mut [Mem]) {
     }
 }
 
-fn pull_all(obs: &mut [Mem]) {
+pub(super) fn pull_all(obs: &mut [Mem]) {
     for a in 0..obs.len() {
         for b in 0..obs.len() {
             let es: Vec<Ent> = obs[b].oplog.values().cloned().collect();
@@ -319,7 +335,7 @@ fn probe_p4_delete_vs_inc() {
     assert_eq!(res.len(), 1, "{res:?}");
     let (vis, losses) = res.into_iter().next().unwrap();
     assert_eq!(vis, "None");
-    assert!(losses.iter().any(|k| k.kind == LossKind::DeleteWon && k.path == p("x")));
+    assert!(losses.iter().any(|k| k.kind == LossKind::DeleteWon && k.at == p("x").into()));
 }
 
 #[test]
@@ -667,8 +683,8 @@ fn probe_q2_first_inserts() {
     let bb = b.ins(&[("x", i(2)), ("z", i(3))], 0).unwrap();
     for (ord, m) in all_orders(&o, &[a.ent(aa), b.ent(bb)], &[]) {
         assert_eq!(m.visible(), doc(&[("x", i(2)), ("z", i(3))]), "{ord:?}");
-        let kinds: Vec<_> = m.w.state.losses.keys().map(|k| (k.kind, k.path.clone())).collect();
-        assert_eq!(kinds, vec![(LossKind::InsertLost, p("_"))], "{ord:?}");
+        let kinds: Vec<_> = m.w.state.losses.keys().map(|k| (k.kind, k.at.clone())).collect();
+        assert_eq!(kinds, vec![(LossKind::InsertLost, LossAt::Document)], "{ord:?}");
     }
 }
 
@@ -757,11 +773,11 @@ fn probe_v6m1_losing_writes() {
     assert_eq!(orders.len(), 24);
     for (ord, m) in orders {
         assert_eq!(m.visible(), doc(&[("y", i(2))]));
-        let have: BTreeSet<(Path, MStamp)> =
-            m.w.state.losses.keys().map(|k| (k.path.clone(), k.stamp)).collect();
-        assert!(have.contains(&(p("note"), c1)), "{ord:?}");
-        assert!(have.contains(&(p("views"), c2)), "{ord:?}");
-        assert!(have.contains(&(Path::whole_document(), aa)), "{ord:?}");
+        let have: BTreeSet<(LossAt, MStamp)> =
+            m.w.state.losses.keys().map(|k| (k.at.clone(), k.stamp)).collect();
+        assert!(have.contains(&(p("note").into(), c1)), "{ord:?}");
+        assert!(have.contains(&(p("views").into(), c2)), "{ord:?}");
+        assert!(have.contains(&(LossAt::Document, aa)), "{ord:?}");
     }
 }
 
@@ -783,13 +799,17 @@ fn probe_v6m1_killed_not_lost() {
     for e in &ents {
         m.receive_entry(e);
     }
-    assert!(!m.loss_set().contains(&(LossKind::InsertLost, p("_"), i0)), "{:?}", m.loss_set());
+    assert!(
+        !m.loss_set().contains(&(LossKind::InsertLost, LossAt::Document, i0)),
+        "{:?}",
+        m.loss_set()
+    );
     // Other orders may also hold the (true, sound) insertLost if the two first inserts met before the
     // delete did: an extra record, allowed by Q7; the document and the deleteWon are the same.
     for (ord, m) in all_orders(&o, &ents, &[]) {
         assert_eq!(m.visible(), doc(&[("x", i(2))]), "{ord:?}");
         assert!(
-            m.loss_set().contains(&(LossKind::DeleteWon, p("y"), bb)),
+            m.loss_set().contains(&(LossKind::DeleteWon, p("y").into(), bb)),
             "{ord:?} {:?}",
             m.loss_set()
         );
@@ -811,7 +831,7 @@ fn probe_v6m2_insert_vs_upsert() {
             doc(&[("name", s("A")), ("role", s("admin")), ("views", i(1))]),
             "{ord:?}"
         );
-        assert!(m.loss_set().contains(&(LossKind::InsertLost, p("theme"), bl)), "{ord:?}");
+        assert!(m.loss_set().contains(&(LossKind::InsertLost, p("theme").into(), bl)), "{ord:?}");
     }
     // The same, the upsert older.
     let (mut a, mut b) = (Mem::new('A', &o), Mem::new('B', &o));
@@ -869,10 +889,10 @@ fn probe_v7m1_v7m2_reinsert_vs_upsert() {
             let want = doc(&[("name", s("A")), ("lang", s("en")), ("views", i(1))]);
             assert_eq!(m.visible(), want, "{after_delete} {ord:?}");
             assert!(
-                m.loss_set().contains(&(LossKind::InsertLost, p("theme"), bl)),
+                m.loss_set().contains(&(LossKind::InsertLost, p("theme").into(), bl)),
                 "{after_delete} {ord:?}"
             );
-            assert!(!m.w.state.losses.keys().any(|k| k.path == p("lang")));
+            assert!(!m.w.state.losses.keys().any(|k| k.at == p("lang").into()));
         }
     }
 }
@@ -968,11 +988,14 @@ pub(super) fn golden_delete() -> MergeState {
     }
     let st = obs.w.state.clone();
     assert!(!st.deletes.is_empty() && obs.visible().is_none());
-    let kinds: BTreeSet<(LossKind, Path)> =
-        st.losses.keys().map(|k| (k.kind, k.path.clone())).collect();
+    let kinds: BTreeSet<(LossKind, LossAt)> =
+        st.losses.keys().map(|k| (k.kind, k.at.clone())).collect();
     assert_eq!(
         kinds,
-        BTreeSet::from([(LossKind::DeleteWon, p("x")), (LossKind::DeleteWon, p("y"))])
+        BTreeSet::from([
+            (LossKind::DeleteWon, p("x").into()),
+            (LossKind::DeleteWon, p("y").into())
+        ])
     );
     st
 }
@@ -1125,8 +1148,11 @@ fn q4_same_helper() {
     assert!(!Value::same(Some(&i(2)), &f(2.0)), "2 is not 2.0");
     assert!(!Value::same(Some(&f(2.0)), &i(2)));
     assert!(Value::same(Some(&f(2.0)), &f(2.0)));
-    assert!(Value::same(Some(&f(0.0)), &f(-0.0)), "doubles compare as numbers");
-    assert!(!Value::same(Some(&f(f64::NAN)), &f(f64::NAN)));
+    // Doubles compare by bit pattern (ruled): a no-op leaves the stored bytes identical.
+    assert!(!Value::same(Some(&f(0.0)), &f(-0.0)), "0.0 and -0.0 are different bytes");
+    assert!(Value::same(Some(&f(-0.0)), &f(-0.0)));
+    assert!(Value::same(Some(&f(f64::NAN)), &f(f64::NAN)), "the same NaN bits are the same");
+    assert!(!Value::same(Some(&f(f64::NAN)), &f(f64::from_bits(f64::NAN.to_bits() ^ 1))));
     assert!(!Value::same(Some(&s("2")), &i(2)));
 }
 
@@ -1410,7 +1436,7 @@ fn decode_refuses_totals_past_the_bound() {
     w.write_set(&p("x"), s("t"), 0).unwrap();
     let mut good = w.state.clone();
     good.losses.insert(
-        LossKey { kind: LossKind::Clash, path: p("x"), stamp: *good.lives.keys().next().unwrap() },
+        LossKey::field(LossKind::Clash, p("x"), *good.lives.keys().next().unwrap()),
         LossValue::Total(5),
     );
     assert_eq!(MergeState::decode(&good.encode()).unwrap(), good);
@@ -1584,7 +1610,7 @@ fn receive_loss_refuses_a_total_past_the_bound() {
     w.insert(&fl(&[("x", i(1))]), 0).unwrap();
     let st = w.state.clone();
     let life = *st.lives.keys().next().unwrap();
-    let key = |path: &str| LossKey { kind: LossKind::DeleteWon, path: p(path), stamp: life };
+    let key = |path: &str| LossKey::field(LossKind::DeleteWon, p(path), life);
     for (p, t, added) in [
         ("a", MAX_TOTAL, true),
         ("b", -MAX_TOTAL, true),
@@ -1677,11 +1703,8 @@ fn every_bson_type_is_stored_read_back_and_round_trips() {
     // A loss record keeps any value too.
     for (_, v) in &fields {
         let mut st = MergeState::default();
-        let key = LossKey {
-            kind: LossKind::Clash,
-            path: p("p"),
-            stamp: MStamp { hlc: h(1), writer: wid('A', 0) },
-        };
+        let key =
+            LossKey::field(LossKind::Clash, p("p"), MStamp { hlc: h(1), writer: wid('A', 0) });
         st.losses.insert(key, LossValue::Value(v.clone()));
         assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
     }
@@ -1721,13 +1744,13 @@ fn arrays_compare_element_by_element_and_type_for_type() {
     assert_eq!(a, Value::Array(vec![i(1), f(0.0)]));
     assert_ne!(a, Value::Array(vec![i(1)]));
     assert_ne!(a, Value::Array(vec![Value::Int32(1), f(0.0)]));
-    // Doubles inside an array: equality is by bits, `same` follows the number.
+    // Doubles inside an array: equality is by bits, and so is `same`.
     let z = Value::Array(vec![f(-0.0)]);
     assert_ne!(Value::Array(vec![f(0.0)]), z);
-    assert!(Value::same(Some(&Value::Array(vec![f(0.0)])), &z));
+    assert!(!Value::same(Some(&Value::Array(vec![f(0.0)])), &z));
     let nan = Value::Array(vec![f(f64::NAN)]);
     assert_eq!(nan, nan.clone());
-    assert!(!Value::same(Some(&nan), &nan));
+    assert!(Value::same(Some(&nan), &nan));
     // An array is not a scalar and not an empty array.
     assert_ne!(Value::Array(vec![]), Value::Null);
     assert!(!Value::same(Some(&Value::Array(vec![])), &Value::Null));
@@ -1787,12 +1810,12 @@ fn decode_refuses_a_bad_bool_a_deep_array_and_a_cut_value() {
         }
         v
     };
-    let ok = nest(super::codec::MAX_VALUE_DEPTH);
+    // (the writers refuse a value this deep, so put it in a register by hand)
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&fl(&[("a", ok)]), 0).unwrap();
+    w.insert(&fl(&[("a", Value::Null)]), 0).unwrap();
+    w.state.regs.values_mut().next().unwrap().value = nest(super::codec::MAX_VALUE_DEPTH);
     assert!(MergeState::decode(&w.state.encode()).is_ok());
-    let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&fl(&[("a", nest(super::codec::MAX_VALUE_DEPTH + 1))]), 0).unwrap();
+    w.state.regs.values_mut().next().unwrap().value = nest(super::codec::MAX_VALUE_DEPTH + 1);
     assert_eq!(MergeState::decode(&w.state.encode()), Err(DecodeError::TooDeep));
     // Every proper prefix of a state with every type is refused as truncated or bad.
     let mut w = Writer::new(wid('A', 0), opts());
@@ -1822,7 +1845,6 @@ fn a_path_is_a_nonempty_list_of_nul_free_segments() {
     assert_ne!(dotted, Path::new(["a", "b"]).unwrap());
     assert_eq!(Path::new(["a", "b"]).unwrap().segments(), ["a", "b"]);
     assert_eq!(Path::new(["a", "b"]).unwrap().to_string(), "a.b");
-    assert_eq!(Path::whole_document(), p("_"));
 }
 
 #[test]
@@ -1852,15 +1874,16 @@ fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
     let a_b = Path::flat("a.b").unwrap();
     let abc = Path::new(["a", "b", "c"]).unwrap();
     let mut w = Writer::new(wid('A', 0), opts());
-    w.insert(&[(a_b.clone(), i(1)), (ab.clone(), i(2)), (abc.clone(), s("x"))], 0).unwrap();
+    w.insert(&[(a_b.clone(), i(1)), (p("a"), Value::Document(vec![("b".into(), doc_c("x"))]))], 0)
+        .unwrap();
     let vis = w.visible().unwrap();
-    assert_eq!(vis.len(), 3);
-    assert_eq!((&vis[&a_b], &vis[&ab], &vis[&abc]), (&i(1), &i(2), &s("x")));
-    assert!(w.write_set(&ab, i(3), 0).is_some());
+    assert_eq!(vis.len(), 4);
+    assert_eq!((&vis[&a_b], &vis[&ab], &vis[&abc]), (&i(1), &Value::Map, &s("x")));
+    assert!(w.write_set(&abc, i(3), 0).is_some());
     assert!(w.write_inc(&a_b, 4, 0).is_some());
-    assert!(w.write_unset(&abc, 0).is_some());
+    assert!(w.write_unset(&ab, 0).is_some());
     let vis = w.visible().unwrap();
-    assert_eq!((&vis[&a_b], &vis[&ab], vis.get(&abc)), (&i(5), &i(3), None));
+    assert_eq!((&vis[&a_b], vis.get(&ab), vis.get(&abc)), (&i(5), None, None));
     // The state encodes, decodes and hashes with the paths intact.
     let enc = w.state.encode();
     let back = MergeState::decode(&enc).unwrap();
@@ -1870,7 +1893,7 @@ fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
     let mut x = Writer::new(wid('A', 0), opts());
     let mut y = Writer::new(wid('A', 0), opts());
     x.insert(&[(a_b, i(1))], 0).unwrap();
-    y.insert(&[(ab, i(1))], 0).unwrap();
+    y.insert(&[(p("a"), Value::Document(vec![("b".into(), i(1))]))], 0).unwrap();
     assert_ne!(x.state.canonical_bytes(), y.state.canonical_bytes());
     assert_ne!(x.state.state_hash(), y.state.state_hash());
     // Two writers merge a nested path and its dotted twin without mixing them.
@@ -1886,6 +1909,11 @@ fn dotted_names_and_nested_paths_are_different_cells_and_round_trip() {
     );
 }
 
+/// A sub-document with one field `c`.
+fn doc_c(v: &str) -> Value {
+    Value::Document(vec![("c".into(), s(v))])
+}
+
 #[test]
 fn odd_field_names_are_distinct_cells_and_round_trip() {
     // Empty, dotted, `$`-prefixed and nested names, each a different path, in the order the
@@ -1895,12 +1923,19 @@ fn odd_field_names_are_distinct_cells_and_round_trip() {
             .iter()
             .map(|s| Path::new(s.iter().copied()).unwrap())
             .collect();
+    let fields = vec![
+        (p(""), Value::Document(vec![("".into(), i(0))])),
+        (p("$set"), i(1)),
+        (p("a"), Value::Document(vec![("".into(), i(2)), ("b".into(), i(3))])),
+        (p("a\u{1}"), i(4)),
+        (p("a.b"), i(5)),
+    ];
     let mut w = Writer::new(wid('A', 0), opts());
-    let fields: Vec<(Path, Value)> =
-        paths.iter().enumerate().map(|(k, q)| (q.clone(), i(k as i64))).collect();
     w.insert(&fields, 0).unwrap();
     let vis = w.visible().unwrap();
     assert_eq!(vis.keys().cloned().collect::<Vec<_>>(), paths);
+    assert_eq!(vis[&p("")], Value::Map);
+    assert_eq!(vis[&Path::new(["a", "b"]).unwrap()], i(3));
     let enc = w.state.encode();
     let back = MergeState::decode(&enc).unwrap();
     assert_eq!(back, w.state);
@@ -2196,4 +2231,102 @@ fn a_null_and_an_unset_merge_and_encode_as_different_values() {
     for w in [&n, &u] {
         assert_eq!(MergeState::decode(&w.state.encode()).unwrap(), w.state);
     }
+}
+
+// ---- the whole-document loss against a field named `_` ----------------------------------
+
+#[test]
+fn the_pinned_mixed_golden_holds_a_whole_document_loss() {
+    // This is why the version 1 form keeps its ambiguous key: a pinned golden has the record.
+    let st = golden_mixed();
+    assert!(
+        st.losses.keys().any(|k| k.kind == LossKind::InsertLost && k.at == LossAt::Document),
+        "{:?}",
+        st.losses.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_whole_document_loss_is_not_a_field_named_underscore() {
+    let life = MStamp { hlc: h(3), writer: wid('A', 0) };
+    let doc_key = LossKey::document(LossKind::InsertLost, life);
+    let field_key = LossKey::field(LossKind::InsertLost, p("_"), life);
+    assert_ne!(doc_key, field_key);
+    // By the order of the version 1 bytes (the path), the document first among equals.
+    let mut keys = [
+        LossKey::field(LossKind::InsertLost, p("a"), life),
+        field_key.clone(),
+        doc_key.clone(),
+        LossKey::field(LossKind::InsertLost, p("A"), life),
+    ];
+    keys.sort();
+    let at: Vec<String> = keys.iter().map(|k| format!("{:?}", k.at)).collect();
+    assert_eq!(
+        at,
+        ["Field(Path([\"A\"]))", "Document", "Field(Path([\"_\"]))", "Field(Path([\"a\"]))"]
+    );
+
+    let mut st = MergeState::default();
+    st.losses.insert(doc_key.clone(), LossValue::Fields(vec![p("x"), p("_")]));
+    // The version 1 key bytes are the same for both (the known defect) ...
+    let mut st2 = MergeState::default();
+    st2.losses.insert(field_key.clone(), LossValue::Value(i(1)));
+    let (b1, b2) = (st.canonical_bytes(), st2.canonical_bytes());
+    let at = 8 * 7; // seven counts: the six sections and the loss count; then kind and path
+    assert_eq!(b1[at..at + 10], b2[at..at + 10], "same kind and path bytes in version 1");
+    // ... and the state still round-trips there, the value telling the two apart ...
+    st.losses.insert(field_key.clone(), LossValue::Value(i(1)));
+    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st);
+    // ... while the compact form tags them.
+    let c = st.encode_compact();
+    assert_eq!(MergeState::decode_compact(&c).unwrap(), st);
+    let mut only_field = MergeState::default();
+    only_field.losses.insert(field_key, LossValue::Fields(vec![p("x"), p("_")]));
+    assert_ne!(only_field.compact_bytes(), {
+        let mut d = MergeState::default();
+        d.losses.insert(doc_key, LossValue::Fields(vec![p("x"), p("_")]));
+        d.compact_bytes()
+    });
+}
+
+// ---- doubles by bit pattern, decimals by their bytes (ruled) ------------------------------
+
+/// A Decimal128 in BSON's BID spelling (16 bytes, little-endian): a coefficient below 2^64 and an
+/// unbiased exponent, positive.
+fn decimal(coefficient: u64, exponent: i32) -> Value {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&coefficient.to_le_bytes());
+    let high = (u64::try_from(exponent + 6176).unwrap()) << 49;
+    b[8..].copy_from_slice(&high.to_le_bytes());
+    Value::Decimal128(b)
+}
+
+#[test]
+fn a_set_that_changes_the_stored_bytes_is_a_stamped_write_even_when_the_numbers_are_equal() {
+    // The rule: a no-op is a write that leaves the stored representation byte-identical. A
+    // Decimal128 is its 16 bytes, so 1.0 (10 x 10^-1) and 1.00 (100 x 10^-2) are different values,
+    // as the reference's own decimal arithmetic keeps them apart: "2.30 and 2.3 differ"
+    // (crates/kimmy-query/src/decimal_arith_tests.rs:32). The reference's source is not
+    // available here, so that comment is the only authority this test cites, and the check is
+    // on the bytes, not on a reading of the reference.
+    let (one_dot_0, one_dot_00) = (decimal(10, -1), decimal(100, -2));
+    assert_ne!(one_dot_0, one_dot_00);
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("d", one_dot_0.clone()), ("z", f(0.0)), ("n", f(f64::NAN))]), 0).unwrap();
+    let before = w.state.clone();
+    let st = w.write_set(&p("d"), one_dot_00.clone(), 0).expect("1.0 to 1.00 is a write");
+    assert_eq!(w.visible().unwrap()[&p("d")], one_dot_00);
+    assert_eq!(w.state.regs.values().filter(|r| r.stamp == st.stamp).count(), 1);
+    assert!(w.write_set(&p("d"), one_dot_00, 0).is_none(), "the same bytes again are a no-op");
+    // Doubles by bit pattern: 0.0 to -0.0 is a write, NaN to the same NaN is not.
+    assert!(w.write_set(&p("z"), f(0.0), 0).is_none());
+    assert!(w.write_set(&p("z"), f(-0.0), 0).is_some());
+    assert!(w.write_set(&p("n"), f(f64::NAN), 0).is_none());
+    assert!(w.write_set(&p("n"), f(f64::from_bits(f64::NAN.to_bits() ^ 1)), 0).is_some());
+    assert_ne!(before, w.state);
+    // The same through replace: only the byte-different field is written.
+    let mut w = Writer::new(wid('A', 0), opts());
+    w.insert(&fl(&[("d", decimal(10, -1)), ("e", decimal(5, 0))]), 0).unwrap();
+    let r = w.write_replace(&fl(&[("d", decimal(100, -2)), ("e", decimal(5, 0))]), 0).unwrap();
+    assert_eq!(r.record.paths, vec![p("d")]);
 }

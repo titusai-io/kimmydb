@@ -55,8 +55,9 @@ pub struct InvalidPath(pub &'static str);
 /// segment. Paths order by their segments, each compared as UTF-8 bytes, so a path sorts before
 /// every path it is a prefix of.
 ///
-/// In this stage a path is an opaque key of the state: no meaning is given to a path being
-/// below another. A flat field is the path of one segment.
+/// A path below another (`a.b` below `a`) is a field of the sub-document: the state's type rule
+/// gives that meaning (see [`MergeState::visible`](super::MergeState::visible)). A flat field is
+/// the path of one segment.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Path(Vec<String>);
 
@@ -82,14 +83,33 @@ impl Path {
         Self::new([name])
     }
 
-    /// The path a loss record names when it is about a whole document (`insertLost` of a
-    /// superseded insert): the one segment `_`. (A field named `_` has the same path.)
-    pub fn whole_document() -> Self {
-        Self(vec!["_".to_string()])
-    }
-
     pub fn segments(&self) -> &[String] {
         &self.0
+    }
+
+    /// The path one level down: this path and `name` as the last segment.
+    pub fn child(&self, name: &str) -> Result<Self, InvalidPath> {
+        Self::new(self.0.iter().map(String::as_str).chain([name]))
+    }
+
+    /// The path above this one, `None` for a top-level field.
+    pub fn parent(&self) -> Option<Path> {
+        (self.0.len() > 1).then(|| Path(self.0[..self.0.len() - 1].to_vec()))
+    }
+
+    /// The last segment: the field's own name.
+    pub fn name(&self) -> &str {
+        self.0.last().map_or("", String::as_str)
+    }
+
+    /// The paths above this one, outermost first (`a.b.c` gives `a` and `a.b`).
+    pub fn ancestors(&self) -> impl Iterator<Item = Path> + '_ {
+        (1..self.0.len()).map(|n| Path(self.0[..n].to_vec()))
+    }
+
+    /// Is this path strictly below `other` (a descendant, not the path itself)?
+    pub fn is_below(&self, other: &Path) -> bool {
+        self.0.len() > other.0.len() && self.0[..other.0.len()] == other.0[..]
     }
 }
 
@@ -101,13 +121,26 @@ impl std::fmt::Display for Path {
     }
 }
 
-/// A cell value: a BSON value other than an embedded document, or `Unset`. `Null` is the BSON
+/// A cell value: a BSON value, a map marker, or `Unset`. `Null` is the BSON
 /// null, a value like any other: `$set x null` stores it and the field is present. `Unset` is
 /// the model's `None`: the absence of a value, what a register holds after an `$unset` (the
 /// field is not in the document). Numeric cells (`Unset`, `Int64`) take part in counting; every
-/// other variant is a base that starts a generation, so `$inc` on a null is refused. An array is
-/// ONE atomic value (a register); an embedded document is not a `Value` (it is a map path, a
-/// later stage).
+/// other variant is a base that starts a generation, so `$inc` on a null is refused.
+///
+/// Three variants are not plain scalars:
+///
+/// * An `Array` is ONE atomic value (a register): it is never merged element by element, and two
+///   concurrent arrays at one path are an `arrayClash`.
+/// * A `Document` is an ordered list of named fields and is legal ONLY inside an `Array` (at any
+///   depth; arrays in arrays are fine). There it is part of the atomic value: compared
+///   structurally, type for type, field order included. Outside an array a document is not a
+///   value of the state at all: it is a map, merged field by field, written as a [`Value::Map`]
+///   marker at its path and a cell for each leaf. So a `Document` handed to a write is expanded
+///   by the writer, and the state never holds one as a register ([`Value::check_register`]
+///   refuses it; so do `Reg::new` and both decoders).
+/// * `Map` is the explicit map marker (the model's `MAP`): the register value at a map path
+///   that a write of a sub-document puts there, beside the cells of its leaves. It is never a
+///   value a caller hands in, and never inside an array.
 ///
 /// The variants keep the BSON types apart: `Int32(2)`, `Int64(2)`, `Double(2.0)` and
 /// `Decimal128` of two are four different values. A `Decimal128` is its 16 bytes, as BSON
@@ -141,9 +174,93 @@ pub enum Value {
     },
     /// An array, atomic: the whole array is the register value.
     Array(Vec<Value>),
+    /// A document: named fields in order. Legal only inside an `Array`; see above.
+    Document(Vec<(String, Value)>),
+    /// The explicit map marker. See above.
+    Map,
+}
+
+/// A value that is not legal where it was put.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InvalidValue {
+    /// A document as a register: only inside an array is a document a value.
+    #[error("merge state: a document is a value only inside an array")]
+    DocumentAsRegister,
+    /// The map marker inside an array or a document, or handed to a write.
+    #[error("merge state: the map marker is not a value a caller can write or an array can hold")]
+    MapMarker,
+    /// Arrays and documents nested past the BSON depth limit.
+    #[error("merge state: a value is nested too deep")]
+    TooDeep,
+    /// A written document names a field twice, or a field name has a NUL byte.
+    #[error("merge state: a document field name is repeated or has a NUL byte")]
+    BadFieldName,
 }
 
 impl Value {
+    /// A plain value of a cell: not an unset and not the map marker (the model's `is_val`).
+    pub fn is_plain(&self) -> bool {
+        !matches!(self, Value::Unset | Value::Map)
+    }
+
+    /// May this value be a register of the state? Not a top-level `Document`; an array's
+    /// elements may be anything but the map marker (documents among them, at any depth).
+    pub fn check_register(&self) -> Result<(), InvalidValue> {
+        match self {
+            Value::Document(_) => Err(InvalidValue::DocumentAsRegister),
+            Value::Map => Ok(()),
+            v => v.check_element(0),
+        }
+    }
+
+    /// May this value be inside an array (`depth` levels of arrays and documents down)?
+    fn check_element(&self, depth: usize) -> Result<(), InvalidValue> {
+        match self {
+            Value::Map => Err(InvalidValue::MapMarker),
+            Value::Array(a) => {
+                if depth >= super::codec::MAX_VALUE_DEPTH {
+                    return Err(InvalidValue::TooDeep);
+                }
+                a.iter().try_for_each(|x| x.check_element(depth + 1))
+            }
+            Value::Document(f) => {
+                if depth >= super::codec::MAX_VALUE_DEPTH {
+                    return Err(InvalidValue::TooDeep);
+                }
+                f.iter().try_for_each(|(_, x)| x.check_element(depth + 1))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// May a caller hand this value to a write? Anything `check_register` takes, and a
+    /// `Document` at any level of a sub-document (the writer expands it into a map): its field
+    /// names must be distinct and free of NUL bytes, and no map marker.
+    pub fn check_input(&self) -> Result<(), InvalidValue> {
+        match self {
+            Value::Document(f) => {
+                let mut names: Vec<&str> = f.iter().map(|(n, _)| n.as_str()).collect();
+                names.sort_unstable();
+                if names.iter().any(|n| n.contains('\0')) || names.windows(2).any(|w| w[0] == w[1])
+                {
+                    return Err(InvalidValue::BadFieldName);
+                }
+                f.iter().try_for_each(|(_, x)| x.check_input())
+            }
+            Value::Map => Err(InvalidValue::MapMarker),
+            v => v.check_register(),
+        }
+    }
+
+    /// Does this value hold a `Document` anywhere? The version 1 form cannot spell one.
+    pub(super) fn contains_document(&self) -> bool {
+        match self {
+            Value::Document(_) => true,
+            Value::Array(a) => a.iter().any(Value::contains_document),
+            _ => false,
+        }
+    }
+
     /// The model's `numeric()`: `None` (`Unset`) or an integer. Only an `Int64` counts: `Int32`
     /// and `Decimal128` counters are not modelled yet, so they are plain register values.
     pub fn is_numeric(&self) -> bool {
@@ -152,30 +269,24 @@ impl Value {
 }
 
 impl Value {
-    /// The model's `same(a, b)` (Q4, ruled): the write diff compares value AND type,
-    /// so `$set 2` over a stored `2.0` is a write, and so is an `Int32` over an `Int64`
-    /// of the same number. A missing field (`None`) is the same as `Unset`, not as `Null`: `$set x
-    /// null` over a missing field is a write. Doubles
-    /// compare as numbers (`==`: `0.0` is `-0.0`, NaN is not NaN), as Python does; an
-    /// array compares element by element in the same way, type for type.
+    /// The model's `same(a, b)` (Q4, ruled): the write diff compares value AND type, so `$set 2`
+    /// over a stored `2.0` is a write, and so is an `Int32` over an `Int64` of the same number.
+    /// A missing field (`None`) is the same as `Unset`, not as `Null`: `$set x null` over a
+    /// missing field is a write.
+    ///
+    /// The rule (ruled): a no-op is a write that would leave the stored representation
+    /// byte-identical. So doubles compare by bit pattern (`0.0` is not `-0.0`, and a NaN is the
+    /// same as a NaN of the same bits), a `Decimal128` by its 16 bytes (`1.0` and `1.00` differ),
+    /// an array element by element and a document in an array field by field in order. That is
+    /// the equality of [`Value`] itself.
     pub fn same(current: Option<&Value>, new: &Value) -> bool {
-        Self::same_value(current.unwrap_or(&Value::Unset), new)
-    }
-
-    fn same_value(a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Double(a), Value::Double(b)) => a == b,
-            (Value::Array(a), Value::Array(b)) => {
-                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| Self::same_value(a, b))
-            }
-            (a, b) => a == b,
-        }
+        current.unwrap_or(&Value::Unset) == new
     }
 }
 
 // Structural equality of states: values of different types are never equal and
 // doubles compare by bit pattern, so that equality agrees with the encoding.
-// (The write diff uses `Value::same`, which follows the model.) There is no order on
+// (The write diff uses `Value::same`, which is this equality.) There is no order on
 // values: a register is decided by its stamp, never by comparing two values.
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
@@ -200,6 +311,8 @@ impl PartialEq for Value {
                 p == q && o == r
             }
             (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Document(a), Value::Document(b)) => a == b,
+            (Value::Map, Value::Map) => true,
             _ => false,
         }
     }
@@ -221,13 +334,98 @@ pub enum LossKind {
     ArrayClash,
 }
 
-/// The key of a loss record: kind, path (the one-segment path `_` for a whole document) and the
-/// stamp of the lost write. Ordered so that it can key a `BTreeMap`.
+/// What a loss record is about: the whole document (`insertLost` of a superseded insert), or one
+/// field. They are different things even when a field is literally named `_`, which is the name
+/// the version 1 spelling and the reference model give the whole document: that is why this is
+/// a variant and not a [`Path`].
+///
+/// Ordering: by the path the version 1 form writes (the whole document as the one segment `_`),
+/// the whole document first among equals. That keeps the order of the version 1 bytes exactly
+/// what it was when a loss was keyed by a path alone.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum LossAt {
+    Document,
+    Field(Path),
+}
+
+impl LossAt {
+    /// The field this record is about, `None` for the whole document.
+    pub fn field(&self) -> Option<&Path> {
+        match self {
+            LossAt::Document => None,
+            LossAt::Field(p) => Some(p),
+        }
+    }
+
+    /// The path the version 1 form writes for this record. A field literally named `_` has the
+    /// same one, which is a known collision of that form (see `codec.rs`).
+    pub(super) fn v1_path(&self) -> Path {
+        match self {
+            LossAt::Document => Path(vec!["_".to_string()]),
+            LossAt::Field(p) => p.clone(),
+        }
+    }
+}
+
+/// Where the whole document (the segment `_`) sorts against the field `q`: by that path, and
+/// before a field literally named `_`.
+fn document_against(q: &Path) -> std::cmp::Ordering {
+    std::iter::once("_").cmp(q.segments().iter().map(String::as_str)).then(std::cmp::Ordering::Less)
+}
+
+impl Ord for LossAt {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (LossAt::Document, LossAt::Document) => std::cmp::Ordering::Equal,
+            (LossAt::Document, LossAt::Field(q)) => document_against(q),
+            (LossAt::Field(p), LossAt::Document) => document_against(p).reverse(),
+            (LossAt::Field(p), LossAt::Field(q)) => p.cmp(q),
+        }
+    }
+}
+
+impl PartialOrd for LossAt {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl From<Path> for LossAt {
+    fn from(p: Path) -> Self {
+        LossAt::Field(p)
+    }
+}
+
+/// For messages: the field's dotted path, or `_` for the whole document. Not a key (a field
+/// named `_` prints alike).
+impl std::fmt::Display for LossAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LossAt::Document => f.write_str("_"),
+            LossAt::Field(p) => p.fmt(f),
+        }
+    }
+}
+
+/// The key of a loss record: kind, what it is about and the stamp of the lost write. Ordered so
+/// that it can key a `BTreeMap`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LossKey {
     pub kind: LossKind,
-    pub path: Path,
+    pub at: LossAt,
     pub stamp: MStamp,
+}
+
+impl LossKey {
+    /// A record about the field `path`.
+    pub fn field(kind: LossKind, path: Path, stamp: MStamp) -> Self {
+        Self { kind, at: LossAt::Field(path), stamp }
+    }
+
+    /// A record about the whole document.
+    pub fn document(kind: LossKind, stamp: MStamp) -> Self {
+        Self { kind, at: LossAt::Document, stamp }
+    }
 }
 
 /// What a loss record keeps of the lost write.

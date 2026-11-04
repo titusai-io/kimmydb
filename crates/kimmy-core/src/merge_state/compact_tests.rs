@@ -1,7 +1,7 @@
 //! Tests of the compact canonical form (`compact.rs`): round trips, canonicity and refusals,
 //! and its size on the shapes of the L34-B1 benchmark.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::codec::MAX_VALUE_DEPTH;
 use super::tests::{
@@ -66,8 +66,8 @@ fn the_compact_golden_hashes_agree_with_the_reference_model() {
     for (name, st, want) in [
         ("empty", golden_empty(), ("e145d6a7daf371398c7b574cd9aa42d4", 9)),
         ("170", golden_170(), ("45e14c7b5dd32f32f7cf6543335f3fb1", 213)),
-        ("mixed", golden_mixed(), ("f712215ec186fc7a782838f4f25fff6b", 341)),
-        ("delete", golden_delete(), ("1aace531f9c13dc54b5da4f77056e82a", 231)),
+        ("mixed", golden_mixed(), ("855d32c60d7c369fb409ecf4d6b6331a", 340)),
+        ("delete", golden_delete(), ("95a3e75ef534ce08fd975b1224a8af76", 233)),
         ("obs", golden_obs(), ("d785253ed2c10e27e148d2a7f2f251cd", 255)),
     ] {
         assert_eq!((hex(st.compact_hash()).as_str(), st.compact_bytes().len()), want, "{name}");
@@ -97,8 +97,8 @@ fn every_bson_type_and_odd_names_round_trip_in_the_compact_form() {
     let mut fields: Vec<(Path, Value)> =
         vals.iter().enumerate().map(|(k, v)| (p(&format!("f{k:02}")), v.clone())).collect();
     fields.extend(names.iter().map(|n| (p(n), Value::Int64(1))));
-    fields.push((Path::new(["a", "b", ""]).unwrap(), Value::Int64(2)));
     w.insert(&fields, 0).unwrap();
+    w.write_set(&Path::new(["a", "b", ""]).unwrap(), Value::Int64(2), 0).unwrap();
     w.write_set(&p("f03"), Value::Double(f64::NAN), 0).unwrap();
     round_trip(&w.state);
     // loss records carry values and totals and field lists
@@ -115,7 +115,7 @@ fn every_bson_type_and_odd_names_round_trip_in_the_compact_form() {
         [LossKind::TypeClash, LossKind::ArrayClash, LossKind::RetiredWriter].into_iter().enumerate()
     {
         st.losses.insert(
-            LossKey { kind, path: p("f06"), stamp: *st.lives.keys().next().unwrap() },
+            LossKey::field(kind, p("f06"), *st.lives.keys().next().unwrap()),
             LossValue::Total(k as i128 - 1),
         );
     }
@@ -453,8 +453,10 @@ fn a_value_nested_too_deep_is_refused_and_the_limit_is_accepted() {
         v
     };
     for (depth, ok) in [(MAX_VALUE_DEPTH, true), (MAX_VALUE_DEPTH + 1, false)] {
+        // (the writers refuse a value this deep, so put it in a register by hand)
         let mut w = Writer::new(wid(b'A', 0), opts());
-        w.insert(&fl(&[("a", nest(depth))]), 0).unwrap();
+        w.insert(&fl(&[("a", Value::Null)]), 0).unwrap();
+        w.state.regs.values_mut().next().unwrap().value = nest(depth);
         let r = MergeState::decode_compact(&w.state.encode_compact());
         assert_eq!(r.is_ok(), ok, "{depth}");
         if !ok {
@@ -625,4 +627,158 @@ fn the_compact_form_sets_do_not_depend_on_insertion_order() {
     assert_eq!(shuffled.compact_bytes(), st.compact_bytes());
     let used: BTreeSet<WriterId> = st.vv.keys().copied().collect();
     assert_eq!(used.len(), 3);
+}
+
+// ---- documents inside arrays and the map marker ------------------------------------------
+
+fn d(f: &[(&str, Value)]) -> Value {
+    Value::Document(f.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect())
+}
+
+/// A state whose register `a` holds `v`.
+fn state_with(v: Value) -> MergeState {
+    let mut w = Writer::new(wid(b'A', 0), opts());
+    w.insert(&fl(&[("a", v)]), 0).unwrap();
+    w.state
+}
+
+/// Where in the compact bytes of `st` the byte pattern `pat` first occurs.
+fn find(bytes: &[u8], pat: &[u8]) -> usize {
+    bytes.windows(pat.len()).position(|w| w == pat).expect("pattern in the bytes")
+}
+
+#[test]
+fn a_document_is_legal_inside_an_array_at_any_depth_in_the_compact_form() {
+    let nested = Value::Array(vec![
+        d(&[("x", Value::Int64(1)), ("", Value::Null)]),
+        Value::Array(vec![d(&[("deep", Value::Array(vec![d(&[("z", Value::Bool(true))])]))])]),
+        Value::Int32(3),
+    ]);
+    for v in [Value::Array(vec![d(&[])]), nested] {
+        let st = state_with(v.clone());
+        assert_eq!(st.regs.values().next().unwrap().value, v);
+        round_trip(&st);
+        // a lost value may hold one too
+        let mut st = st;
+        let life = *st.lives.keys().next().unwrap();
+        st.losses.insert(LossKey::field(LossKind::Clash, p("a"), life), LossValue::Value(v));
+        round_trip(&st);
+    }
+}
+
+#[test]
+fn version_one_cannot_hold_a_document_and_refuses() {
+    let st = state_with(Value::Array(vec![d(&[("x", Value::Int64(1))])]));
+    assert!(!st.v1_can_hold());
+    assert_eq!(st.try_canonical_bytes(), Err(V1CannotHold));
+    assert_eq!(st.try_encode(), Err(V1CannotHold));
+    // the compact bytes are not a version 1 stream
+    assert_eq!(MergeState::decode(&st.encode_compact()), Err(DecodeError::BadHeader));
+    // a state with arrays but no document still takes both forms
+    let plain = state_with(Value::Array(vec![Value::Int64(1), Value::Array(vec![])]));
+    assert!(plain.v1_can_hold());
+    assert_eq!(plain.try_encode().unwrap(), plain.encode());
+    assert_eq!(MergeState::decode(&plain.encode()).unwrap(), plain);
+    // the tag is unknown to version 1: patch a document tag into a version 1 array
+    let mut bytes = plain.encode();
+    let at = find(&bytes, &[4, 0, 0, 0, 0, 0, 0, 0, 2, 1]);
+    bytes[at + 9] = 16;
+    assert_eq!(MergeState::decode(&bytes), Err(DecodeError::BadTag(16)));
+}
+
+#[test]
+#[should_panic(expected = "version 1 cannot hold a document")]
+fn the_infallible_version_one_encoder_panics_on_a_document() {
+    let st = state_with(Value::Array(vec![d(&[])]));
+    let _ = st.canonical_bytes();
+}
+
+#[test]
+fn a_document_is_refused_as_a_register_by_the_checks_and_the_decoder() {
+    let doc = d(&[("x", Value::Int64(1))]);
+    assert_eq!(doc.check_register(), Err(InvalidValue::DocumentAsRegister));
+    assert_eq!(Value::Array(vec![doc.clone()]).check_register(), Ok(()));
+    let life = MStamp { hlc: Hlc::new(1, 0), writer: wid(b'A', 0) };
+    let reg = |v: Value| Reg::new(life, v, BTreeMap::new(), None, false);
+    assert_eq!(reg(doc.clone()), Err(InvalidValue::DocumentAsRegister));
+    assert!(reg(Value::Array(vec![doc.clone()])).is_ok());
+    // a writer expands one (a sub-document is a map, never a register)
+    let mut w = Writer::new(wid(b'A', 0), opts());
+    w.insert(&[(p("a"), doc.clone())], 0).unwrap();
+    assert!(w.state.regs.values().all(|r| r.value.check_register().is_ok()));
+    assert_eq!(w.state.regs[&(*w.state.lives.keys().next().unwrap(), p("a"))].value, Value::Map);
+    // ... and refuses the marker itself, and a repeated field name
+    assert!(w.write_set(&p("m"), Value::Map, 0).is_none());
+    let twice = Value::Document(vec![("k".into(), Value::Null), ("k".into(), Value::Null)]);
+    assert!(w.write_set(&p("m"), twice, 0).is_none());
+    // the decoder: turn the array tag of a register into the document tag, and a loss value
+    let enc = state_with(Value::Array(vec![doc.clone()])).encode_compact();
+    let at = find(&enc, &[4, 1, 16, 1, 1, b'x']);
+    let mut bad = enc.clone();
+    bad[at] = 16;
+    assert_eq!(MergeState::decode_compact(&bad), Err(DecodeError::BadTag(16)));
+    // a document nested past the depth limit is refused, like an array
+    let mut deep = Value::Int64(0);
+    for _ in 0..MAX_VALUE_DEPTH + 1 {
+        deep = Value::Array(vec![d(&[("k", deep)])]);
+    }
+    assert_eq!(deep.check_register(), Err(InvalidValue::TooDeep));
+}
+
+#[test]
+fn the_map_marker_is_a_register_value_and_never_an_array_element() {
+    assert_eq!(Value::Map.check_register(), Ok(()));
+    assert_eq!(Value::Array(vec![Value::Map]).check_register(), Err(InvalidValue::MapMarker));
+    assert_eq!(
+        Value::Array(vec![d(&[("m", Value::Map)])]).check_register(),
+        Err(InvalidValue::MapMarker)
+    );
+    let mut st = state_with(Value::Int64(1));
+    st.regs.values_mut().next().unwrap().value = Value::Map;
+    let enc = round_trip(&st);
+    assert_eq!(MergeState::decode(&st.encode()).unwrap(), st, "version 1 takes the marker");
+    // tag 5 inside an array is refused by both decoders
+    let arr = state_with(Value::Array(vec![Value::Int64(1)]));
+    let mut bad = arr.encode_compact();
+    let at = find(&bad, &[4, 1, 1]);
+    bad[at + 2] = 5;
+    assert_eq!(MergeState::decode_compact(&bad), Err(DecodeError::BadTag(5)));
+    let mut bad1 = arr.encode();
+    let at = find(&bad1, &[4, 0, 0, 0, 0, 0, 0, 0, 1, 1]);
+    bad1[at + 9] = 5;
+    assert_eq!(MergeState::decode(&bad1), Err(DecodeError::BadTag(5)));
+    assert!(enc.len() > 4);
+}
+
+#[test]
+fn a_document_in_an_array_is_equal_structurally_type_strict_and_in_field_order() {
+    let a = Value::Array(vec![d(&[("x", Value::Int64(1)), ("y", Value::Double(0.0))])]);
+    assert_eq!(a, a.clone());
+    assert!(Value::same(Some(&a), &a.clone()));
+    let other = |v: Value| Value::same(Some(&a), &v);
+    // field order matters, for the state's equality and for the write diff
+    let swapped = Value::Array(vec![d(&[("y", Value::Double(0.0)), ("x", Value::Int64(1))])]);
+    assert_ne!(a, swapped);
+    assert!(!other(swapped.clone()));
+    // a type difference matters (Int32 against Int64)
+    assert!(!other(Value::Array(vec![d(&[("x", Value::Int32(1)), ("y", Value::Double(0.0))])])));
+    // a name, a field count, a document against an array
+    assert!(!other(Value::Array(vec![d(&[("x", Value::Int64(1)), ("z", Value::Double(0.0))])])));
+    assert!(!other(Value::Array(vec![d(&[("x", Value::Int64(1))])])));
+    assert!(!other(Value::Array(vec![Value::Array(vec![Value::Int64(1), Value::Double(0.0)])])));
+    // and the writer treats a changed field order as a change: the register is rewritten
+    let mut w = Writer::new(wid(b'A', 0), opts());
+    w.insert(&fl(&[("a", a.clone())]), 0).unwrap();
+    assert!(w.write_set(&p("a"), a, 0).is_none(), "the same document is a no-op");
+    assert!(w.write_set(&p("a"), swapped, 0).is_some());
+}
+
+#[test]
+fn receiving_a_state_with_a_document_in_an_array_works_and_reports_the_change() {
+    // The "changed" verdict does not go through the version 1 bytes, which cannot hold it.
+    let a = state_with(Value::Array(vec![d(&[("x", Value::Int64(1))])]));
+    let mut b = Writer::new(wid(b'B', 0), opts());
+    assert!(b.receive_report(&a).changed);
+    assert!(!b.receive_report(&a).changed);
+    assert_eq!(b.state, a);
 }

@@ -21,6 +21,14 @@
 //! [`MergeState::canonical_bytes`] is the body alone and carries no tag; the
 //! hash covers the body. Mutant memory (`Gen::vv`, `MergeState::gens`) is in neither. The golden vectors in `tests.rs` pin all three: changing
 //! the bytes is a format change (a wipe release) and must be deliberate.
+//!
+//! Known defect of this form: a loss record about the whole document (`insertLost` of a
+//! superseded insert) is keyed by the path `_`, the same bytes as a record about a field
+//! literally named `_`. The pinned `mixed` golden holds a whole-document record, so the bytes
+//! stay. In memory the two are different ([`LossAt`]); `decode` tells them apart by the lost
+//! value (a field list is a whole document), which no record of a field has, so a state round
+//! trips, but the key bytes alone are ambiguous. The compact form (`compact.rs`) writes an
+//! explicit tag; this defect retires when it becomes the hash.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,6 +44,12 @@ const VERSION: u8 = 1;
 
 /// The deepest nesting of arrays inside a value that `decode` accepts (the BSON depth limit).
 pub(super) const MAX_VALUE_DEPTH: usize = 100;
+
+/// The version 1 form cannot hold a `Document` inside an array. A state with one is written in
+/// the compact form (`QMS` version 2), and `decode` of version 1 refuses the compact tag.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("merge state: the version 1 form cannot hold a document inside an array")]
+pub struct V1CannotHold;
 
 /// A failure to decode an encoded state.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -123,7 +137,10 @@ impl W {
                 self.u8(3);
                 self.str(s);
             }
-            // 4 is the array; 5 and 6 are kept for the map markers.
+            // 4 is the array; 5 the explicit map marker; 6 is kept for the implicit one.
+            Value::Map => self.u8(5),
+            // The check before every write keeps a document out of this form.
+            Value::Document(_) => unreachable!("version 1 cannot hold a document (checked)"),
             Value::Array(a) => {
                 self.u8(4);
                 self.len(a.len());
@@ -214,7 +231,7 @@ impl W {
             LossKind::TypeClash => 4,
             LossKind::ArrayClash => 5,
         });
-        self.path(&k.path);
+        self.path(&k.at.v1_path());
         self.stamp(&k.stamp);
     }
     fn loss_value(&mut self, v: &LossValue) {
@@ -292,32 +309,60 @@ impl MergeState {
         }
     }
 
+    /// Can the version 1 form spell this state? Not when a register or a loss record holds a
+    /// `Document` inside an array (it has no tag there; the compact form has one).
+    pub fn v1_can_hold(&self) -> bool {
+        !self.regs.values().any(|r| r.value.contains_document())
+            && !self
+                .losses
+                .values()
+                .any(|v| matches!(v, LossValue::Value(x) if x.contains_document()))
+    }
+
     /// The deterministic encoding of the state: the model's `canon()` made
     /// binary (lives, dead, deletes, registers, slots, version vector, losses).
     /// Mutant memory (`Gen::vv`, `gens`) is not part of it.
+    ///
+    /// # Panics
+    ///
+    /// If the state holds a document inside an array ([`MergeState::v1_can_hold`]): this form
+    /// has no tag for one. [`MergeState::try_canonical_bytes`] refuses with an error instead.
     pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.try_canonical_bytes().expect("version 1 cannot hold a document in an array")
+    }
+
+    /// [`MergeState::canonical_bytes`], or an error when the state holds a document inside an
+    /// array.
+    pub fn try_canonical_bytes(&self) -> Result<Vec<u8>, V1CannotHold> {
+        if !self.v1_can_hold() {
+            return Err(V1CannotHold);
+        }
         let mut w = W(Vec::new());
         self.write_body(&mut w);
-        w.0
+        Ok(w.0)
     }
 
     /// A 128-bit digest of [`MergeState::canonical_bytes`]. Not cryptographic:
     /// it is a divergence detector. Two lanes of a multiply-rotate mix over
     /// big-endian 8-byte words (the tail zero-padded, the length folded in at
     /// the end), cross-fed, then each lane passed through the splitmix64
-    /// finaliser.
+    /// finaliser. Panics where `canonical_bytes` does.
     pub fn state_hash(&self) -> [u8; 16] {
         hash128(&self.canonical_bytes())
     }
 
     /// The whole state, for a round trip with [`MergeState::decode`]: the magic, the format
-    /// version, then [`MergeState::canonical_bytes`].
+    /// version, then [`MergeState::canonical_bytes`]. Panics where `canonical_bytes` does.
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = W(Vec::new());
-        w.0.extend_from_slice(&MAGIC);
-        w.u8(VERSION);
-        self.write_body(&mut w);
-        w.0
+        self.try_encode().expect("version 1 cannot hold a document in an array")
+    }
+
+    /// [`MergeState::encode`], or an error when the state holds a document inside an array.
+    pub fn try_encode(&self) -> Result<Vec<u8>, V1CannotHold> {
+        let mut out = Vec::from(MAGIC);
+        out.push(VERSION);
+        out.extend_from_slice(&self.try_canonical_bytes()?);
+        Ok(out)
     }
 
     /// The inverse of [`MergeState::encode`].
@@ -376,8 +421,15 @@ impl MergeState {
         }
         s.vv = r.vv()?;
         for _ in 0..r.len()? {
-            let k = r.loss_key()?;
+            let (kind, path, stamp) = r.loss_key()?;
             let v = r.loss_value()?;
+            // The one segment `_` with a field list is the whole document; with anything else, a field.
+            let whole = matches!(v, LossValue::Fields(_)) && path.segments() == ["_"];
+            let k = if whole {
+                LossKey::document(kind, stamp)
+            } else {
+                LossKey::field(kind, path, stamp)
+            };
             put(&mut s.losses, k, v)?;
         }
         if !r.0.is_empty() {
@@ -494,6 +546,8 @@ impl R<'_> {
                 }
                 Ok(Value::Array(a))
             }
+            // The map marker is a register value, never an element of an array.
+            5 if depth == 0 => Ok(Value::Map),
             7 => Ok(Value::Int32(i32::from_be_bytes(self.arr()?))),
             8 => Ok(Value::Decimal128(self.arr()?)),
             9 => match self.u8()? {
@@ -555,7 +609,10 @@ impl R<'_> {
             t => Err(DecodeError::BadTag(t)),
         }
     }
-    fn loss_key(&mut self) -> Result<LossKey, DecodeError> {
+    /// A loss key as version 1 spells it: the kind, a path and the stamp. The path alone does
+    /// not tell the whole document (the segment `_`) from a field named `_`; the caller reads
+    /// the lost value next and decides (see [`LossKey`] and the module documentation).
+    fn loss_key(&mut self) -> Result<(LossKind, Path, MStamp), DecodeError> {
         let kind = match self.u8()? {
             0 => LossKind::Clash,
             1 => LossKind::DeleteWon,
@@ -566,7 +623,7 @@ impl R<'_> {
             t => return Err(DecodeError::BadTag(t)),
         };
         let path = self.path()?;
-        Ok(LossKey { kind, path, stamp: self.stamp()? })
+        Ok((kind, path, self.stamp()?))
     }
     fn loss_value(&mut self) -> Result<LossValue, DecodeError> {
         match self.u8()? {

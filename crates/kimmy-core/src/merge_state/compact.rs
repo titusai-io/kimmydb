@@ -22,9 +22,11 @@
 //! * an `Int32`, `Int64` and `Date` and the parts of a `Timestamp` are fixed width big-endian, a
 //!   `Double` is its IEEE bit pattern (`to_bits`, big-endian);
 //! * a value is a tag byte and its payload: 0 `Unset`, 1 `Int64`, 2 `Double`, 3 `String`,
-//!   4 `Array` (a count and the values), **5 and 6 reserved for the explicit and the implicit map
-//!   marker**, 7 `Int32`, 8 `Decimal128`, 9 `Bool`, 10 `Date`, 11 `ObjectId`, 12 `Binary`,
-//!   13 `Timestamp`, 14 `Regex`, 15 `Null`;
+//!   4 `Array` (a count and the values), 5 the explicit map marker (a register value, never in
+//!   an array), **6 reserved for the implicit map marker**, 7 `Int32`, 8 `Decimal128`, 9 `Bool`, 10 `Date`, 11 `ObjectId`, 12 `Binary`,
+//!   13 `Timestamp`, 14 `Regex`, 15 `Null`, 16 `Document` (a count, then each field as a name and
+//!   a value; legal ONLY inside an array, at any depth, and refused as a register or a lost
+//!   value: a document outside an array is a map. The version 1 form has no tag for it);
 //! * an HLC is its 10 bytes (`Hlc::to_bytes`); a writer is 34 bytes (node 16, epoch 18) in the
 //!   writer table and a varint index into it everywhere else;
 //! * a stamp is an HLC and a writer index: 11 bytes for a table of up to 128 writers;
@@ -57,7 +59,10 @@
 //! 7. `slots`: a count; each a life index, a path, a writer index, a generation byte (0 none,
 //!    1 and then its stamp), the stamp, and the total;
 //! 8. the **version vector**: a count; each a writer index and an HLC;
-//! 9. `losses`: a count; each a kind byte, a path, a stamp and the lost value.
+//! 9. `losses`: a count; each a kind byte, an "about" byte (0 the whole document, 1 a field and
+//!    then its path), a stamp and the lost value. The whole document is its own tag, not the
+//!    path `_`, so that it cannot be mistaken for a field named `_` (the version 1 form cannot
+//!    tell them apart; see `codec.rs`).
 //!
 //! `obs` keys are a life index, a writer index and a generation as in `slots`; a register's
 //! `obs` entry adds the slot's stamp and total, a generation's `seen` entry the total.
@@ -70,8 +75,9 @@
 //! * **Counter cell** (the rulings on the `absorbed` rule and the cell layout): replaces the
 //!   `obs` map of a register (section 6) and the layout of `slots` (section 7); until then both
 //!   are the version 1 data in compact spelling.
-//! * **Map markers and type clashes**: value tags 5 and 6 and loss kinds 4 and 5 are already
-//!   assigned.
+//! * **Map markers and type clashes**: tag 5 (the explicit marker) is in use, with loss kinds 4
+//!   and 5 (`typeClash`, `arrayClash`); tag 6 (the implicit marker) is reserved for the write
+//!   rule the next model round decides, and nothing writes it.
 //!
 //! # Canonicity
 //!
@@ -88,7 +94,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::codec::{DecodeError, MAGIC, MAX_VALUE_DEPTH, hash128, put, put_set};
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-use super::types::{Epoch, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
+use super::types::{Epoch, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
@@ -200,11 +206,22 @@ impl W {
                 self.u8(3);
                 self.str(s);
             }
-            // 4 is the array; 5 and 6 are kept for the map markers.
+            // 4 is the array; 5 the explicit map marker; 6 is kept for the implicit one.
+            Value::Map => self.u8(5),
             Value::Array(a) => {
                 self.u8(4);
                 self.len(a.len());
                 for x in a {
+                    self.value(x);
+                }
+            }
+            // 16: a document, legal only inside an array: a count, then each field as a name
+            // and a value.
+            Value::Document(f) => {
+                self.u8(16);
+                self.len(f.len());
+                for (name, x) in f {
+                    self.str(name);
                     self.value(x);
                 }
             }
@@ -282,7 +299,13 @@ impl W {
             LossKind::TypeClash => 4,
             LossKind::ArrayClash => 5,
         });
-        self.path(&k.path);
+        match &k.at {
+            LossAt::Document => self.u8(0),
+            LossAt::Field(p) => {
+                self.u8(1);
+                self.path(p);
+            }
+        }
         self.stamp(&k.stamp);
     }
     fn loss_value(&mut self, v: &LossValue) {
@@ -687,6 +710,20 @@ impl R<'_> {
                 }
                 Ok(Value::Array(a))
             }
+            // The map marker is a register value, a document an array element: the other way
+            // round is refused (the depth is the number of arrays and documents above).
+            5 if depth == 0 => Ok(Value::Map),
+            16 if depth > 0 => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return Err(DecodeError::TooDeep);
+                }
+                let mut f = Vec::new();
+                for _ in 0..self.len()? {
+                    let name = self.str()?;
+                    f.push((name, self.value_at(depth + 1)?));
+                }
+                Ok(Value::Document(f))
+            }
             7 => Ok(Value::Int32(i32::from_be_bytes(self.arr()?))),
             8 => Ok(Value::Decimal128(self.arr()?)),
             9 => match self.u8()? {
@@ -749,8 +786,12 @@ impl R<'_> {
             5 => LossKind::ArrayClash,
             t => return Err(DecodeError::BadTag(t)),
         };
-        let path = self.path()?;
-        Ok(LossKey { kind, path, stamp: self.stamp()? })
+        let at = match self.u8()? {
+            0 => LossAt::Document,
+            1 => LossAt::Field(self.path()?),
+            t => return Err(DecodeError::BadTag(t)),
+        };
+        Ok(LossKey { kind, at, stamp: self.stamp()? })
     }
     fn loss_value(&mut self) -> Result<LossValue, DecodeError> {
         match self.u8()? {

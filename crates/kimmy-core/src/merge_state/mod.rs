@@ -3,11 +3,19 @@
 //!
 //! This is a port of the reviewed reference model (`model5.py` and the
 //! `Node.finish` normalisation of `pullmodel5.py`). It is pure: no I/O, no
-//! async, no global state. Field paths are segment lists ([`Path`]), opaque keys at this stage. Nothing here is wired
+//! async, no global state. Field paths are segment lists ([`Path`]), never dotted strings. Nothing here is wired
 //! into storage, the API or the oplog.
 //!
 //! The pieces:
 //!
+//! * Nested documents: a cell is keyed by `(life, segment path)`. A sub-document is a [`Value::Map`]
+//!   marker at its path plus a cell for each leaf (an array is one atomic value). The read side
+//!   applies the recursive type rule ([`MergeState::visible`]); a write diffs a sub-document
+//!   against what the writer sees and writes only the leaves that changed; a write below a scalar
+//!   or an array is refused; the join reports `typeClash` and `arrayClash`. NOT built here, by
+//!   ruling: the implicit map marker a leaf write would leave on absent parents (so an emptied
+//!   implicit map vanishes), a map-creating `$inc`, the field-order state and the multi-operator
+//!   update, which the next model round revises.
 //! * [`MergeState`] holds lives, deletes, dead lives, registers, counter slots,
 //!   generation marks, the version vector and the loss records.
 //! * [`join()`] merges two states and reports the loss records that are new
@@ -44,14 +52,19 @@ mod writer;
 #[cfg(test)]
 mod compact_tests;
 #[cfg(test)]
+mod nested_tests;
+#[cfg(test)]
 mod prop_tests;
 #[cfg(test)]
 mod tests;
 
-pub use codec::DecodeError;
+pub use codec::{DecodeError, V1CannotHold};
 pub use join::{InvalidIntBound, JoinOptions, join};
 pub use state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
-pub use types::{Epoch, InvalidPath, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
+pub use types::{
+    Epoch, InvalidPath, InvalidValue, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value,
+    WriterId,
+};
 pub use writer::{Received, StampError, WriteKind, WriteRecord, Writer, Written};
 
 // Production signatures. These items compile in EVERY build (with and without the
@@ -65,7 +78,14 @@ const _: () = {
     use std::collections::{BTreeMap, BTreeSet};
     let _: fn(&str) -> Result<Path, InvalidPath> = Path::flat;
     let _: fn(&Path) -> &[String] = Path::segments;
-    let _: fn() -> Path = Path::whole_document;
+    let _: fn(&Path, &str) -> Result<Path, InvalidPath> = Path::child;
+    let _: fn(&Path) -> Option<Path> = Path::parent;
+    let _: fn(&Path) -> &str = Path::name;
+    let _: fn(&Path, &Path) -> bool = Path::is_below;
+    let _: fn(&Value) -> bool = Value::is_plain;
+    let _: fn(&LossAt) -> Option<&Path> = LossAt::field;
+    let _: fn(LossKind, Path, MStamp) -> LossKey = LossKey::field;
+    let _: fn(LossKind, MStamp) -> LossKey = LossKey::document;
     let _: fn(&MergeState, &MergeState, &JoinOptions) -> (MergeState, BTreeSet<LossKey>) = join;
     let _: fn(u64, i64) -> Result<JoinOptions, InvalidIntBound> = JoinOptions::new;
     let _: fn(&mut JoinOptions, i64) -> Result<(), InvalidIntBound> = JoinOptions::set_int_bound;
@@ -82,6 +102,18 @@ const _: () = {
     let _: fn(&MergeState, &JoinOptions) -> Vec<MStamp> = MergeState::alive;
     let _: fn(&MergeState, &JoinOptions) -> crate::hlc::Hlc = MergeState::horizon;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::canonical_bytes;
+    let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_canonical_bytes;
+    let _: fn(&MergeState) -> Result<Vec<u8>, V1CannotHold> = MergeState::try_encode;
+    let _: fn(&MergeState) -> bool = MergeState::v1_can_hold;
+    let _: fn(
+        MStamp,
+        Value,
+        BTreeMap<ObsKey, (MStamp, i128)>,
+        Option<Gen>,
+        bool,
+    ) -> Result<Reg, InvalidValue> = Reg::new;
+    let _: fn(&Value) -> Result<(), InvalidValue> = Value::check_register;
+    let _: fn(&Value) -> Result<(), InvalidValue> = Value::check_input;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::compact_bytes;
     let _: fn(&MergeState) -> [u8; 16] = MergeState::compact_hash;
     let _: fn(&MergeState) -> Vec<u8> = MergeState::encode_compact;
