@@ -397,6 +397,15 @@ impl Writer {
                 .into_keys()
                 .map(|(l, w, g)| (l, p.clone(), w, g))
                 .collect()
+        } else if self.opts.fold_life_only() {
+            // the mutant: only the slots of the life the write is in (the newest alive life)
+            let life = al.last();
+            self.state
+                .slots_at(p, al)
+                .into_iter()
+                .filter(|(k, _)| Some(&k.0) == life)
+                .map(|(k, _)| k.clone())
+                .collect()
         } else {
             self.state.slots_at(p, al).into_iter().map(|(k, _)| k.clone()).collect()
         }
@@ -441,8 +450,11 @@ impl Writer {
         } else {
             Some(Gen::start(st, &self.state.vv, self.seen(p, al)))
         };
-        let folded = self.fold_keys(p, al, win);
-        self.fold(folded);
+        // (the mutant `no_fold_marker`: a map marker write folds nothing)
+        if !(self.opts.no_fold_marker() && v == Value::Map) {
+            let folded = self.fold_keys(p, al, win);
+            self.fold(folded);
+        }
         #[cfg(any(test, feature = "merge-mutants"))]
         if !v.is_numeric() {
             let vv = self.state.vv.clone();

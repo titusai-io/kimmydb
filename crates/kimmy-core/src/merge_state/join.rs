@@ -68,6 +68,14 @@ pub struct JoinOptions {
     /// writer holds in an alive life. Off in the design.
     #[cfg(any(test, feature = "merge-mutants"))]
     fold_counted_only: bool,
+    /// Counter cell mutant (review m5): a base write folds only the slots of the life it writes in
+    /// (the newest alive life), not those of the other alive lives of the path. Off in the design.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    fold_life_only: bool,
+    /// Counter cell mutant (review m5): a write of a map marker (`$set a {..}` over a counter at
+    /// `a`) folds no slot of the path; the other base writes do. Off in the design.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    no_fold_marker: bool,
     /// The model's `NORMALIZE_WRITES`: a writer normalises its own state through
     /// a join with the empty state after each write (off only to reproduce the
     /// un-normalised states of `model5.Member`).
@@ -200,6 +208,10 @@ impl Default for JoinOptions {
             #[cfg(any(test, feature = "merge-mutants"))]
             fold_counted_only: false,
             #[cfg(any(test, feature = "merge-mutants"))]
+            fold_life_only: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            no_fold_marker: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
             normalize_writes: true,
             #[cfg(any(test, feature = "merge-mutants"))]
             type_ignores_recency: false,
@@ -315,6 +327,8 @@ impl JoinOptions {
     switch!(value_ignores_slot_stamp, set_value_ignores_slot_stamp, false);
     switch!(creation_without_generation, set_creation_without_generation, false);
     switch!(fold_counted_only, set_fold_counted_only, false);
+    switch!(fold_life_only, set_fold_life_only, false);
+    switch!(no_fold_marker, set_no_fold_marker, false);
     switch!(normalize_writes, set_normalize_writes, true);
     switch!(type_ignores_recency, set_type_ignores_recency, false);
     switch!(marker_hides, set_marker_hides, false);

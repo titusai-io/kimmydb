@@ -856,13 +856,14 @@ fn a_planted_rewrite_of_unchanged_leaves_is_detected() {
 #[test]
 fn rust_mutants_are_caught_by_the_replay() {
     type Switch = fn(&mut JoinOptions);
-    let cases: [(&str, Switch); 6] = [
+    let cases: [(&str, Switch); 7] = [
         ("a scalar hides every child, even a newer one", |o| o.set_type_ignores_recency(true)),
         ("a map marker hides its children", |o| o.set_marker_hides(true)),
         ("no typeClash is reported", |o| o.set_no_type_clash(true)),
         ("two arrays are a plain clash", |o| o.set_array_clash_as_clash(true)),
         ("a sub-document write rewrites every leaf", |o| o.set_rewrite_unchanged(true)),
         ("an unset of a map unsets its direct children only", |o| o.set_unset_shallow(true)),
+        ("a base write folds only the slots it counts", |o| o.set_fold_counted_only(true)),
     ];
     let scratch = Scratch::new("mut");
     let n = runs().min(300);

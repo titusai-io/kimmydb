@@ -115,6 +115,74 @@ fn a_double_base_set_a_2_5_reads_5_not_6() {
     assert_eq!(eg2(&o), vec![Some(i(6)); 3], "the counted-only fold reads the mutant's 6");
 }
 
+/// A map-marker base over a counter folds the counter's slots: `$set a {..}` over a counter at `a`
+/// writes the marker as a register of `a` (a base) and a leaf below it. Returns the slot of the
+/// writer's counter at `a` after the write.
+fn marker_over_a_counter(o: &JoinOptions) -> Slot {
+    let a_path = p("a");
+    let mut w = Writer::new(wid('A', 0), o.clone());
+    w.insert(&fl(&[("a", i(1))]), 0).unwrap();
+    w.write_inc(&a_path, 5, 0).unwrap();
+    let before = w.state.slots.values().next().unwrap().clone();
+    assert_eq!(before.absorbed, None, "no base has held the increment yet");
+    w.write_set(&a_path, Value::Document(vec![("b".to_string(), i(1))]), 0).unwrap();
+    assert_eq!(
+        w.state.regs.iter().find(|((_, q), _)| *q == a_path).map(|(_, r)| r.value.clone()),
+        Some(Value::Map),
+        "the write made a at a map marker"
+    );
+    assert_eq!(w.state.slots.len(), 1);
+    w.state.slots.values().next().unwrap().clone()
+}
+
+/// The killer of the switch `no_fold_marker` (a write of a map marker folds no slot): the design
+/// folds the counter's slot into its absorbed pair, the mutant leaves the pair out.
+#[test]
+fn a_map_marker_base_over_a_counter_folds_its_slots() {
+    let sl = marker_over_a_counter(&opts());
+    assert_eq!(sl.absorbed, Some((sl.stamp, sl.total)), "the marker write held the increment");
+    assert_eq!(sl.total, Num::Int64(5));
+    let mut o = opts();
+    o.set_no_fold_marker(true);
+    assert_eq!(marker_over_a_counter(&o).absorbed, None, "the mutant folds nothing at a marker");
+}
+
+/// A base write in the NEWEST alive life folds a slot of ANOTHER alive life: the shape of seed 792 of
+/// the nested differential. C inserts `c` and adds 5 (a slot in C's insert life); D upserts a
+/// counter at `y` (an upsert life beside the insert; D's life is the newest, same HLC and the
+/// greater writer); C receives it and sets `c` to a double, a base written in D's life. Returns the
+/// slot of C's counter at `c` (in C's life) after the write, and whether it is a slot of another
+/// life than the one the write is in.
+fn base_in_the_newest_life(o: &JoinOptions) -> (Slot, bool) {
+    let c_path = p("c");
+    let mut c = Writer::new(wid('C', 0), o.clone());
+    let mut d = Writer::new(wid('D', 0), o.clone());
+    c.insert(&fl(&[("c", i(0))]), 0).unwrap();
+    c.write_inc(&c_path, 5, 0).unwrap();
+    d.upsert_inc(&p("y"), 1, 0).unwrap();
+    c.receive(&d.state.clone());
+    let alive = c.alive();
+    assert_eq!(alive.len(), 2, "an insert life and an upsert life are alive");
+    c.write_set(&c_path, Value::Double(2.5), 0).unwrap();
+    let key = (st(1, 'C'), c_path.clone(), wid('C', 0), None);
+    let in_other_life = key.0 != *alive.last().unwrap();
+    (c.state.slots[&key].clone(), in_other_life)
+}
+
+/// The killer of the switch `fold_life_only` (a base write folds only the slots of its own life): the
+/// design folds the slot of the other alive life, the mutant leaves it unfolded.
+#[test]
+fn a_base_write_in_the_newest_alive_life_folds_a_slot_of_another_alive_life() {
+    let (sl, other) = base_in_the_newest_life(&opts());
+    assert!(other, "the slot is in the older life, the write in the newest");
+    assert_eq!(sl.absorbed, Some((sl.stamp, sl.total)));
+    let mut o = opts();
+    o.set_fold_life_only(true);
+    let (sl, other) = base_in_the_newest_life(&o);
+    assert!(other);
+    assert_eq!(sl.absorbed, None, "the mutant folds only the write's own life");
+}
+
 #[test]
 fn a_base_write_folds_every_slot_of_the_path_of_any_generation() {
     let o = opts();
@@ -1034,4 +1102,89 @@ fn a_dangling_seen_key_survives_a_numeric_base_and_ends_with_a_non_numeric_one()
     // is replaced, the one in the other alive life stays
     c.write_set(&c_path, s("t"), 0).unwrap();
     assert_eq!(dangling(&c), 1);
+}
+
+/// A `Decimal128` total that is a NaN or has a non-canonical payload. THE SLOT-TOTAL RULE: the
+/// compact reader takes the 16 bytes of a `Decimal128` as they are (`num_payload`: no check of the
+/// class, the coefficient or the exponent; only an integer payload is bounded, by `MAX_TOTAL`), and
+/// the same reader reads the slot's total, the absorbed total, a `seen` total and a loss total, so
+/// the pair is accepted exactly as the slot is: the bytes survive a round trip untouched, and a pair
+/// that differs from the slot at the slot's own stamp is refused by its bytes (the totals are
+/// compared byte for byte, `Num::eq`), a NaN with another payload included. The reads
+/// (`dec_raw_bits`) take any bit pattern, a NaN as the one NaN, and do not panic.
+#[test]
+fn a_nan_or_non_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_for_the_slot() {
+    let raw = |bits: u128| Num::Decimal128(bits.to_le_bytes());
+    const NAN: u128 = 0b11111 << 122;
+    const INF: u128 = 0b11110 << 122;
+    let payloads = [
+        ("quiet NaN", raw(NAN)),
+        ("negative NaN with a payload", raw(NAN | 1 << 127 | 0x1234)),
+        ("NaN with a payload and the signalling bit", raw(NAN | (1 << 121) | 0xdead_beef)),
+        // a coefficient above 10^34 - 1 reads as a zero (IEEE 754 3.5.2), spelled as it is
+        ("coefficient past the bound", raw((6176u128 << 113) | (10u128.pow(34) + 7))),
+        // the large-coefficient form (bits 125-126 set, neither Infinity nor NaN) reads as a zero
+        ("large-coefficient form", raw(0b11 << 125 | 5)),
+        ("negative infinity", raw(INF | 1 << 127)),
+        ("a zero with an exponent beyond the range", raw(0x1fffu128 << 113)),
+    ];
+    let o = opts();
+    for (what, payload) in payloads {
+        // as the slot's total, alone
+        let mut slot_only = paired();
+        slot_only.slots.values_mut().for_each(|x| {
+            x.total = payload;
+            x.absorbed = None;
+        });
+        accepts(&slot_only);
+        // as the absorbed total, below a Decimal128 slot (the pair is not wider than its slot)
+        let mut pair_only = paired();
+        pair_only.slots.values_mut().for_each(|x| {
+            x.total = dec("7");
+            x.absorbed = Some((st(3, 'A'), payload));
+        });
+        accepts(&pair_only);
+        // as both, at the slot's own stamp: equal bytes, accepted
+        let mut both = paired();
+        both.slots.values_mut().for_each(|x| {
+            x.total = payload;
+            x.absorbed = Some((x.stamp, payload));
+        });
+        accepts(&both);
+        // and the exact bytes are the ones that come back
+        for state in [&slot_only, &pair_only, &both] {
+            let back = MergeState::decode_compact(&state.encode_compact()).unwrap();
+            for (a, b) in state.slots.values().zip(back.slots.values()) {
+                let bytes = |n: &Num| match n {
+                    Num::Decimal128(x) => *x,
+                    n => panic!("{what}: {n:?}"),
+                };
+                assert_eq!(bytes(&a.total), bytes(&b.total), "{what}");
+                assert_eq!(
+                    a.absorbed.map(|x| bytes(&x.1)),
+                    b.absorbed.map(|x| bytes(&x.1)),
+                    "{what}"
+                );
+            }
+            // the reads take the pattern as it is and do not panic
+            let _ = back.value(&p("x"), &o);
+            let _ = back.hidden(&p("x"), &o);
+        }
+        // at the slot's own stamp the pair must equal the slot byte for byte: another payload of
+        // the same class is another total, for the pair as for any other comparison of totals
+        let other = match payload {
+            Num::Decimal128(b) => {
+                let mut b = b;
+                b[0] ^= 1;
+                Num::Decimal128(b)
+            }
+            n => n,
+        };
+        let mut mismatch = paired();
+        mismatch.slots.values_mut().for_each(|x| {
+            x.total = payload;
+            x.absorbed = Some((x.stamp, other));
+        });
+        refuses(&mismatch, DecodeError::AbsorbedTotalMismatch);
+    }
 }
