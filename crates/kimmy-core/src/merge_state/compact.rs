@@ -39,7 +39,8 @@
 //!
 //! A body is a sequence of sections in a fixed order. A later format adds a section at the end
 //! (or a field to an existing section) and raises the version byte; this version accepts exactly
-//! these nine:
+//! these ten, the last of them only when the state has an order state (see the version byte
+//! below):
 //!
 //! 1. the **writer table**: a count, then every [`WriterId`] the state mentions, in strictly
 //!    increasing order;
@@ -66,14 +67,46 @@
 //!    path `_`, so that it cannot be mistaken for a field named `_` (the version 1 form cannot
 //!    tell them apart; see `codec.rs`).
 //!
+//! 10. the **order state** (`ords`, the `FieldOrd` of option A, `ord.rs`), present only when the
+//!     state has one: a count of at least 1, then each entry keyed `(life index, path)` like a
+//!     register (the path as a segment count and the segments, the count 0 being the root of a
+//!     replace, `OrdAt::Root`; strictly increasing in the key order of the map). An entry is
+//!     ONE floor byte, then its parts:
+//!     * the floor byte: 0 no floor; 1 an `$unset` floor `u`; 2 a replace floor `r`; 3 a `u`
+//!       floor with the update bit ("the unsetting write also wrote other fields", 0 bytes of
+//!       its own). Any other byte is refused. An `r` floor carries no bit and no version vector:
+//!       its spelling would be the byte 2 and a bit, which the byte table has no place for, so
+//!       "the bit on an `r` floor" is refused as an unknown floor byte;
+//!     * for a floor, its stamp; for a `u` floor (1 or 3), then `prev`, the highest HLC the
+//!       unsetter had seen, as 10 bytes;
+//!     * the per-writer firsts: a count, then each as a writer index (strictly increasing), a
+//!       stamp and the position as a varint;
+//!     * a flags byte (bit 0: there is a `last`, bit 1: there is a `lvl`; no other bit), then
+//!       the `last` as a stamp and a varint position, then the `lvl` as a stamp.
+//!
 //! `obs` keys are a life index, a writer index and a generation as in `slots`; a register's
 //! `obs` entry adds the slot's stamp and total, a generation's `seen` entry the total.
 //!
+//! # The version byte and the presence of section 10
+//!
+//! The version byte is 2 for every state; section 10 is present iff the state has a non-empty
+//! order state, and is the last section, so its presence is decided by whether bytes remain
+//! after the losses.
+//!
+//! So a state without an order state has exactly the bytes it had before the order state
+//! existed (the golden vectors and every hash of such a state are unchanged), and the body
+//! alone ([`MergeState::compact_bytes`], what the hash covers) is that old body followed by
+//! section 10 when there is one: two states never share a body. A section 10 with a count of 0
+//! is refused ([`DecodeError::OrdSectionEmpty`]) and so are bytes after it, so a state has one
+//! spelling. The limit of the approach: the end of the input can delimit only the LAST optional
+//! section; a future section 11 needs a presence mask, tags, or a version bump (the format is
+//! positional: its sections carry no tags).
+//!
 //! # Extension points
 //!
-//! * **Order state** (the `Ord` of option A: floors, per-writer firsts, last, level floor): a
-//!   section 10 after `losses`, keyed `(life index, path)` like `regs`, with the version byte
-//!   raised. Its candidate stamps use the same stamp and writer index primitives.
+//! * **Order state** (the `FieldOrd` of option A: floors, per-writer firsts, last, level floor):
+//!   section 10, above. Its stamps use the same stamp and writer index primitives. The hash of a
+//!   state that carries one is NOT pinned by any golden: they wait for the counter cell.
 //! * **Counter cell** (the rulings on the `absorbed` rule and the cell layout): replaces the
 //!   `obs` map of a register (section 6) and the layout of `slots` (section 7); until then both
 //!   are the version 1 data in compact spelling. PROVISIONAL, from the typed counters (D6): a
@@ -100,12 +133,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::codec::{DecodeError, MAGIC, MAX_VALUE_DEPTH, hash128, put, put_set};
 use super::counter::Num;
+use super::ord::{Cand, FieldOrd, Floor, OrdAt};
 use super::state::{Gen, Life, LifeKind, MAX_TOTAL, MergeState, ObsKey, Reg, Slot, Vv};
 use super::types::{Epoch, LossAt, LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
 use crate::ids::NodeId;
 
-/// The format version byte of this form.
+/// The format version byte of this form: for every state, with or without an order state.
 const VERSION: u8 = 2;
 
 /// The first `u128` a counter total never takes as a zigzag (they stop at `2 * MAX_TOTAL`, below
@@ -185,6 +219,46 @@ impl W {
     }
     fn hlc(&mut self, h: Hlc) {
         self.out.extend_from_slice(&h.to_bytes());
+    }
+    /// The key of an order entry: a path, or the root as a segment count of 0.
+    fn ord_at(&mut self, at: &OrdAt) {
+        match at {
+            OrdAt::Root => self.len(0),
+            OrdAt::Field(p) => self.path(p),
+        }
+    }
+    /// A candidate: a stamp and the position as a varint.
+    fn cand(&mut self, (st, pos): &Cand) {
+        self.stamp(st);
+        self.varint(u128::from(*pos));
+    }
+    /// An order entry after its key: the floor byte and its parts, the firsts, the flags byte, `last`
+    /// and `lvl` (section 10).
+    fn field_ord(&mut self, x: &FieldOrd) {
+        match &x.floor {
+            None => self.u8(0),
+            Some(Floor::U { stamp, prev, others }) => {
+                self.u8(if *others { 3 } else { 1 });
+                self.stamp(stamp);
+                self.hlc(*prev);
+            }
+            Some(Floor::R { stamp }) => {
+                self.u8(2);
+                self.stamp(stamp);
+            }
+        }
+        self.len(x.firsts.len());
+        for (wr, c) in &x.firsts {
+            self.wid(wr);
+            self.cand(c);
+        }
+        self.u8(u8::from(x.last.is_some()) | u8::from(x.lvl.is_some()) << 1);
+        if let Some(c) = &x.last {
+            self.cand(c);
+        }
+        if let Some(st) = &x.lvl {
+            self.stamp(st);
+        }
     }
     /// A writer: its index in the table (second pass), or noted (first pass).
     fn wid(&mut self, w: &WriterId) {
@@ -363,7 +437,7 @@ const FLAG_SOI: u8 = 4;
 const FLAG_STAMP_IS_LIFE: u8 = 8;
 
 impl MergeState {
-    /// Sections 3 to 9, with the tables of the pass `w` is in.
+    /// Sections 3 to 10, with the tables of the pass `w` is in.
     fn write_sections(&self, w: &mut W) {
         w.len(self.lives.len());
         for (l, v) in &self.lives {
@@ -431,6 +505,15 @@ impl MergeState {
             w.loss_key(k);
             w.loss_value(v);
         }
+        // section 10: the order state, only when there is one
+        if !self.ords.is_empty() {
+            w.len(self.ords.len());
+            for ((l, at), x) in &self.ords {
+                w.life(l);
+                w.ord_at(at);
+                w.field_ord(x);
+            }
+        }
     }
 
     /// The body: both tables, then the sections.
@@ -460,8 +543,8 @@ impl MergeState {
     }
 
     /// The compact body of the state: the model's `canon()` made binary (lives, dead, deletes,
-    /// registers, slots, version vector, losses) behind its writer and life tables. Mutant
-    /// memory (`Gen::vv`, `gens`) is not part of it.
+    /// registers, slots, version vector, losses, and the order state when there is one) behind
+    /// its writer and life tables. Mutant memory (`Gen::vv`, `gens`) is not part of it.
     pub fn compact_bytes(&self) -> Vec<u8> {
         self.write_compact_body()
     }
@@ -493,7 +576,10 @@ impl MergeState {
     /// The inverse of [`MergeState::encode_compact`].
     pub fn decode_compact(bytes: &[u8]) -> Result<MergeState, DecodeError> {
         let mut r = R::new(bytes);
-        if r.take(3)? != MAGIC || r.u8()? != VERSION {
+        if r.take(3)? != MAGIC {
+            return Err(DecodeError::BadHeader);
+        }
+        if r.u8()? != VERSION {
             return Err(DecodeError::BadHeader);
         }
         r.tables()?;
@@ -572,6 +658,19 @@ impl MergeState {
             let k = r.loss_key()?;
             let v = r.loss_value()?;
             put(&mut s.losses, k, v)?;
+        }
+        // section 10, the last: present iff bytes remain after the losses
+        if !r.rest.is_empty() {
+            let n = r.len()?;
+            if n == 0 {
+                return Err(DecodeError::OrdSectionEmpty);
+            }
+            for _ in 0..n {
+                let l = r.life()?;
+                let at = r.ord_at()?;
+                let x = r.field_ord()?;
+                put(&mut s.ords, (l, at), x)?;
+            }
         }
         r.finish()?;
         s.check_decoded()?;
@@ -680,6 +779,49 @@ impl R<'_> {
     }
     fn hlc(&mut self) -> Result<Hlc, DecodeError> {
         Ok(Hlc::from_bytes(self.arr()?))
+    }
+    /// The key of an order entry: a path, or the root (a segment count of 0).
+    fn ord_at(&mut self) -> Result<OrdAt, DecodeError> {
+        // the count is read as a path does; 0 is the root, which a path cannot be
+        let n = self.len()?;
+        if n == 0 {
+            return Ok(OrdAt::Root);
+        }
+        let mut segments = Vec::new();
+        for _ in 0..n {
+            segments.push(self.str()?);
+        }
+        Path::new(segments).map(OrdAt::Field).map_err(|_| DecodeError::BadPath)
+    }
+    /// A candidate: a stamp and a position (a `u64` varint, shortest form).
+    fn cand(&mut self) -> Result<Cand, DecodeError> {
+        let st = self.stamp()?;
+        let pos = u64::try_from(self.varint(10)?).map_err(|_| DecodeError::NotCanonical)?;
+        Ok((st, pos))
+    }
+    /// An order entry after its key (see `W::field_ord`).
+    fn field_ord(&mut self) -> Result<FieldOrd, DecodeError> {
+        let floor = match self.u8()? {
+            0 => None,
+            k @ (1 | 3) => {
+                let stamp = self.stamp()?;
+                Some(Floor::U { stamp, prev: self.hlc()?, others: k == 3 })
+            }
+            2 => Some(Floor::R { stamp: self.stamp()? }),
+            b => return Err(DecodeError::OrdBadFloor(b)),
+        };
+        let mut firsts = BTreeMap::new();
+        for _ in 0..self.len()? {
+            let wr = self.wid()?;
+            put(&mut firsts, wr, self.cand()?)?;
+        }
+        let flags = self.u8()?;
+        if flags > 3 {
+            return Err(DecodeError::BadTag(flags));
+        }
+        let last = if flags & 1 != 0 { Some(self.cand()?) } else { None };
+        let lvl = if flags & 2 != 0 { Some(self.stamp()?) } else { None };
+        Ok(FieldOrd { floor, firsts, last, lvl })
     }
     /// The writer and life tables (sections 1 and 2), each strictly increasing.
     fn tables(&mut self) -> Result<(), DecodeError> {

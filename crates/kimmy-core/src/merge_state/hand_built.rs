@@ -6,11 +6,17 @@
 //! [`Mode::Coherent`]: everything a stamp carries (the value, the observations, the generation, a
 //! life's kind and what it had seen) is a function of the stamp and the path, so that two states
 //! never disagree about what one write was (a property of the whole set of states, which no
-//! decode can check). [`Mode::Closed`]: coherent, and the state satisfies the two structural
+//! decode can check). [`Mode::Closed`]: coherent, and the state satisfies the structural
 //! invariants `decode` checks (`MergeState::check_decoded`), no more and no fewer: every dead life
-//! is listed in `lives`, and the version vector covers every life, delete, register and slot
-//! stamp. The join laws are claimed for the closed states, and only those are what `decode`
-//! accepts.
+//! is listed in `lives`, the version vector covers every life, delete, register and slot stamp,
+//! and every order entry is normal, belongs to a listed life and has its stamps covered. The join
+//! laws are claimed for the closed states, and only those are what `decode` accepts.
+//!
+//! The order entries of a hand-built state are COHERENT CHAINS: for a key `(life, path)` the
+//! entries a state can hold are `base`, `base + x1`, `base + x1 + x2` (joined), each fixed by the
+//! key, so that two states hold comparable entries of one key and the join of two of them is the
+//! larger. Arbitrary entries would break associativity (it is claimed for the entries writers
+//! reach, which the property tests' simulation checks), which is no fault of the join.
 //!
 //! The cases are tagged with the shape they were built for ([`BUILDERS`]), and [`shapes_of`]
 //! tells from the states themselves which shapes a case holds, so that a test can count what it
@@ -52,7 +58,7 @@ pub(super) const BUILDERS: [&str; 11] = [
 ];
 
 /// The shapes [`shapes_of`] recognises, by the states (not by the builder).
-pub(super) const SHAPES: [&str; 12] = [
+pub(super) const SHAPES: [&str; 13] = [
     "same stamp at one path in two lives, different values, both sides",
     "equal stamps under one key of both states, different values",
     "registers or slots of a life absent from lives or dead",
@@ -65,6 +71,7 @@ pub(super) const SHAPES: [&str; 12] = [
     "dead life and delete of t each on both sides of h0, s with none",
     "slot or obs total within 8 of MAX_TOTAL",
     "an odd path (empty, `_` or dotted segment)",
+    "an order entry at one key of both states, different",
 ];
 
 const PATHS: &[&[&str]] = &[
@@ -598,6 +605,45 @@ fn uni(r: &mut Rng, max_wall: u64) -> Uni {
     }
 }
 
+/// A random order entry from the universe: any floor, up to two writers' firsts, a last, a level.
+fn rand_ord(r: &mut Rng, u: &Uni) -> FieldOrd {
+    let mut x = FieldOrd::default();
+    let st = |r: &mut Rng| *r.pick(&u.stamps);
+    x.floor = match r.below(4) {
+        0 => Some(Floor::U {
+            stamp: st(r),
+            prev: Hlc::new(r.below(u.max_wall as usize) as u64, 0),
+            others: r.below(2) == 0,
+        }),
+        1 => Some(Floor::R { stamp: st(r) }),
+        _ => None,
+    };
+    for k in 0..r.below(3) as u8 {
+        let c = st(r);
+        x.firsts.insert(wid(k), (c, r.below(4) as u64));
+    }
+    if r.below(2) == 0 {
+        x.last = Some((st(r), r.below(4) as u64));
+    }
+    if r.below(3) == 0 {
+        x.lvl = Some(st(r));
+    }
+    x
+}
+
+/// The entry of `(life, at)` after `steps` joins of the chain the key fixes (see the module
+/// documentation): normal, whatever the draws.
+fn ord_chain(cx: &mut Cx, u: &Uni, life: MStamp, at: &OrdAt, steps: usize) -> FieldOrd {
+    let o = JoinOptions::default();
+    let base = cx.draw(("ord", life, at, 0), |r| rand_ord(r, u));
+    let mut acc = ord_join(&base, &base, &o);
+    for i in 1..=steps {
+        let x = cx.draw(("ord", life, at, i), |r| rand_ord(r, u));
+        acc = ord_join(&acc, &x, &o);
+    }
+    acc
+}
+
 fn wild_state(cx: &mut Cx, u: &Uni) -> MergeState {
     let mut s = MergeState::default();
     for l in &u.lives {
@@ -646,6 +692,18 @@ fn wild_state(cx: &mut Cx, u: &Uni) -> MergeState {
     for _ in 0..cx.rng.below(3) {
         let (l, p) = (*cx.rng.pick(&u.lives), cx.rng.pick(&u.paths).clone());
         s.gens.insert((l, p), (*cx.rng.pick(&u.stamps), Vv::new()));
+    }
+    // order entries: at a few keys of the universe, so that the two states of a case meet at them
+    for _ in 0..cx.rng.below(4) {
+        let l = u.lives[cx.rng.below(2)];
+        let at = if cx.rng.below(4) == 0 {
+            OrdAt::Root
+        } else {
+            OrdAt::Field(u.paths[cx.rng.below(2)].clone())
+        };
+        let steps = cx.rng.below(3);
+        let x = ord_chain(cx, u, l, &at, steps);
+        s.ords.insert((l, at), x);
     }
     for k in 0..3u8 {
         if cx.rng.below(4) != 0 {
@@ -793,10 +851,19 @@ fn close(cx: &mut Cx, x: &mut MergeState) {
             e.insert(cx.life(l, LifeKind::Upsert));
         }
     }
+    // an order entry belongs to a listed life: the others go (a life is not invented here, since
+    // another state may list it as another kind); an entry that says nothing is no entry
+    x.ords.retain(|(l, _), e| x.lives.contains_key(l) && !e.is_empty());
     let mut stamps: Vec<MStamp> = x.lives.keys().copied().collect();
     stamps.extend(x.deletes.keys());
     stamps.extend(x.regs.values().map(|r| r.stamp));
     stamps.extend(x.slots.values().map(|s| s.stamp));
+    for e in x.ords.values() {
+        stamps.extend(e.floor.map(|f| f.stamp()));
+        stamps.extend(e.firsts.values().map(|c| c.0));
+        stamps.extend(e.last.map(|c| c.0));
+        stamps.extend(e.lvl);
+    }
     for st in stamps {
         let e = x.vv.entry(st.writer).or_insert(Hlc::ZERO);
         *e = (*e).max(st.hlc);
@@ -917,6 +984,7 @@ pub(super) fn shapes_of(s: &MergeState, t: &MergeState, ret: u64) -> Vec<&'stati
         10,
     );
     add(odd(s) || odd(t), 11);
+    add(s.ords.iter().any(|(k, x)| t.ords.get(k).is_some_and(|y| x != y)), 12);
     out
 }
 

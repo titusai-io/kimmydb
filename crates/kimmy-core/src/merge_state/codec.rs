@@ -46,10 +46,11 @@ const VERSION: u8 = 1;
 /// The deepest nesting of arrays inside a value that `decode` accepts (the BSON depth limit).
 pub(super) const MAX_VALUE_DEPTH: usize = 100;
 
-/// The version 1 form cannot hold a `Document` inside an array. A state with one is written in
-/// the compact form (`QMS` version 2), and `decode` of version 1 refuses the compact tag.
+/// The version 1 form cannot hold a `Document` inside an array, a counter total of another type
+/// than `Int64`, or an order state. A state with one is written in the compact form (`QMS`
+/// version 2), and `decode` of version 1 refuses the compact tag.
 #[derive(Debug, Error, PartialEq, Eq)]
-#[error("merge state: the version 1 form cannot hold a document inside an array")]
+#[error("merge state: the version 1 form cannot hold this state")]
 pub struct V1CannotHold;
 
 /// A failure to decode an encoded state.
@@ -79,6 +80,16 @@ pub enum DecodeError {
     DeadLifeNotListed,
     #[error("merge state: the version vector does not cover a stamp the state holds")]
     VersionVectorBehind,
+    #[error("merge state: an order entry is for a life that `lives` does not list")]
+    OrdLifeNotListed,
+    #[error("merge state: an order entry holds a candidate its floor voids")]
+    OrdNotNormal,
+    #[error("merge state: an order entry says nothing (no floor, no candidate, no level mark)")]
+    OrdEntryEmpty,
+    #[error("merge state: invalid order floor kind {0}")]
+    OrdBadFloor(u8),
+    #[error("merge state: the order section is present but empty")]
+    OrdSectionEmpty,
 }
 
 // ---- writing ---------------------------------------------------------------
@@ -321,9 +332,11 @@ impl MergeState {
     /// Can the version 1 form spell this state? Not when a register or a loss record holds a
     /// `Document` inside an array (it has no tag there; the compact form has one), and not when a
     /// counter total is of another type than `Int64` (its totals are `i128`s with no room for a
-    /// type; the compact form spells them).
+    /// type; the compact form spells them), and not when it carries an order state (the version
+    /// 1 form has no section for it: the bytes would silently leave the order out).
     pub fn v1_can_hold(&self) -> bool {
-        self.totals().all(|n| matches!(n, Num::Int64(_)))
+        self.ords.is_empty()
+            && self.totals().all(|n| matches!(n, Num::Int64(_)))
             && !self.regs.values().any(|r| r.value.contains_document())
             && !self
                 .losses

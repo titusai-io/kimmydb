@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::counter::Num;
+use super::ord::ord_join;
 use super::state::{LifeKind, MergeState, Reg, Slot, Vv, cov, sub_ret};
 use super::types::{LossKey, LossKind, LossValue, MStamp, Path, Value, WriterId};
 use crate::hlc::Hlc;
@@ -19,9 +20,11 @@ pub struct InvalidIntBound(pub i64);
 /// configuration: build one with [`JoinOptions::new`] or [`Default`], and change the
 /// retention through the public field. The mutation switches (horizon-first,
 /// supersession, reported cells, `$setOnInsert` suppression, the v3 generation rule, the
-/// two read and creation rules of the B1 and M1 fixes, write normalisation and the six nested
+/// two read and creation rules of the B1 and M1 fixes, write normalisation, the six nested
 /// mutants: the type rule's recency, a marker that hides, `typeClash`, `arrayClash`, the
-/// sub-document diff and the refusal below a scalar) can be
+/// sub-document diff and the refusal below a scalar, and the nine mutants of the order state:
+/// the floor, the earliest candidate, `last`, the order itself, the survivor clamp, the level
+/// floor, the update bit, the reset of a replace and the position inside a write) can be
 /// changed only in a test or `merge-mutants` build, through the `set_*` methods that exist
 /// there: they let the harness reproduce the model's mutants. The production code path is
 /// the same code with the switches at their correct values.
@@ -109,6 +112,35 @@ pub struct JoinOptions {
     /// A local write by a 257th writer is accepted.
     #[cfg(any(test, feature = "merge-mutants"))]
     no_writer_cap: bool,
+    /// Order mutant: the candidates of an order entry are not voided by its floor.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_keep_all: bool,
+    /// Order mutant: a path takes the LATEST valid candidate as its position, not the earliest.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_latest: bool,
+    /// Order mutant: the latest write to a path (`last`) is not a candidate.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_no_last: bool,
+    /// Order mutant: the ordered document ignores the order state (fields by path).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_by_name: bool,
+    /// Order mutant: no survivor clamp (content that survives an unset keeps its own position).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_no_survivor_clamp: bool,
+    /// Order mutant: no level floor (a document-valued write does not order the fields it never
+    /// saw after its own).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_no_level_floor: bool,
+    /// Order mutant: the update bit of a `u` floor is ignored (survivors are not placed after
+    /// every field the unsetting write wrote).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_ignores_bit: bool,
+    /// Order mutant (feed): a replace does not raise the floor, so the old candidates stay.
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_no_reset: bool,
+    /// Order mutant (feed): the position inside a write is ignored (every field has position 0).
+    #[cfg(any(test, feature = "merge-mutants"))]
+    ord_no_pos: bool,
 }
 
 impl Default for JoinOptions {
@@ -161,6 +193,24 @@ impl Default for JoinOptions {
             no_contributor_cap: false,
             #[cfg(any(test, feature = "merge-mutants"))]
             no_writer_cap: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_keep_all: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_latest: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_no_last: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_by_name: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_no_survivor_clamp: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_no_level_floor: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_ignores_bit: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_no_reset: false,
+            #[cfg(any(test, feature = "merge-mutants"))]
+            ord_no_pos: false,
         }
     }
 }
@@ -228,6 +278,15 @@ impl JoinOptions {
     switch!(slot_never_widens, set_slot_never_widens, false);
     switch!(no_contributor_cap, set_no_contributor_cap, false);
     switch!(no_writer_cap, set_no_writer_cap, false);
+    switch!(ord_keep_all, set_ord_keep_all, false);
+    switch!(ord_latest, set_ord_latest, false);
+    switch!(ord_no_last, set_ord_no_last, false);
+    switch!(ord_by_name, set_ord_by_name, false);
+    switch!(ord_no_survivor_clamp, set_ord_no_survivor_clamp, false);
+    switch!(ord_no_level_floor, set_ord_no_level_floor, false);
+    switch!(ord_ignores_bit, set_ord_ignores_bit, false);
+    switch!(ord_no_reset, set_ord_no_reset, false);
+    switch!(ord_no_pos, set_ord_no_pos, false);
 }
 
 /// The model's `_prefilter` of one state, in place: drop deletes and dead lives older than `h`.
@@ -532,6 +591,21 @@ pub(super) fn join_into(
             out.gens.insert(k.clone(), g.clone());
         }
     }
+    // The order state: the entries of one path join; an entry only `t` has is normalised, as the
+    // model's `ord_join(None, o)` does.
+    for (k, x) in &t.ords {
+        if alive.has(&k.0) {
+            let joined = match out.ords.get(k) {
+                Some(mine) => ord_join(mine, x, o),
+                None => {
+                    let mut x = x.clone();
+                    x.normalise(o);
+                    x
+                }
+            };
+            out.ords.insert(k.clone(), joined);
+        }
+    }
     for (w, h) in &t.vv {
         let e = out.vv.entry(*w).or_insert(Hlc::ZERO);
         *e = (*e).max(*h);
@@ -542,6 +616,8 @@ pub(super) fn join_into(
     out.regs.retain(|k, _| alive.has(&k.0));
     out.slots.retain(|k, _| alive.has(&k.0));
     out.gens.retain(|k, _| alive.has(&k.0));
+    // an entry that says nothing is no entry: an empty one and none are the same state
+    out.ords.retain(|k, x| alive.has(&k.0) && !x.is_empty());
     let h = out.horizon(o);
     out.deletes.retain(|d, _| d.hlc >= h);
     let dead_old: Vec<MStamp> =
