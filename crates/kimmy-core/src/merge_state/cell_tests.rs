@@ -1188,3 +1188,54 @@ fn a_nan_or_non_canonical_decimal_total_is_accepted_as_spelled_for_the_pair_as_f
         refuses(&mismatch, DecodeError::AbsorbedTotalMismatch);
     }
 }
+
+/// WHAT THE WRITER CAN PRODUCE as a Decimal128 total (the derivation behind the decode of decimals,
+/// kept as a test so it cannot drift). `inc_result` / `sum_checked` refuse a decimal sum only when it
+/// overflows from FINITE inputs (`Num::decimal_overflowed`), and no check of the operand looks at its
+/// class (`Value::check_input`), so a NaN or an infinite operand is a legal `$inc`; and the first slot
+/// of a writer at a path stores the operand as it was given (`Writer::inc_plan`: `None => op`), so the
+/// bytes of a NaN with a payload or of a non-canonical coefficient survive into the slot verbatim.
+/// Later sums are canonical (`pack_raw` asserts it), but a base write folds the verbatim total into
+/// the pair, which a later increment leaves. So every 16-byte pattern is a slot total, a pair, and
+/// (copied) a `seen` or a loss total of an honest history, and decode refuses none of them.
+#[test]
+fn the_writer_takes_nan_infinite_and_non_canonical_decimal_operands() {
+    let o = opts();
+    let x = p("x");
+    let raw = |bits: u128| Value::Decimal128(bits.to_le_bytes());
+    const NAN: u128 = 0b11111 << 122;
+    const INF: u128 = 0b11110 << 122;
+    let cases: [(&str, u128); 7] = [
+        ("quiet NaN", NAN),
+        ("negative NaN with a payload", NAN | 1 << 127 | 0x1234),
+        ("NaN with a payload and the signalling bit", NAN | (1 << 121) | 0xdead_beef),
+        ("coefficient past 10^34 - 1", (6176u128 << 113) | (10u128.pow(34) + 7)),
+        ("large-coefficient form", 0b11 << 125 | 5),
+        ("negative infinity", INF | 1 << 127),
+        ("a zero with an exponent beyond the range", 0x1fffu128 << 113),
+    ];
+    let bytes = |n: &Num| match n {
+        Num::Decimal128(b) => u128::from_le_bytes(*b),
+        n => panic!("{n:?}"),
+    };
+    for (what, bits) in cases {
+        let mut w = Writer::new(wid('A', 0), o.clone());
+        w.insert(&fl(&[("x", i(1))]), 0).unwrap();
+        // the first increment of the writer: the operand's bytes are the slot total, untouched
+        w.write_inc_value(&x, &raw(bits), 0).unwrap_or_else(|| panic!("{what}: refused"));
+        let sl = w.state.slots.values().next().unwrap().clone();
+        assert_eq!(bytes(&sl.total), bits, "{what}: stored verbatim");
+        accepts(&w.state);
+        // a base write folds it into the pair, and a later increment moves the slot and leaves the pair
+        w.write_set(&x, i(5), 0).unwrap();
+        w.write_inc_value(&x, &dval("1"), 0).unwrap();
+        let sl = w.state.slots.values().next().unwrap().clone();
+        assert_eq!(
+            bytes(&sl.absorbed.as_ref().unwrap().1),
+            bits,
+            "{what}: the pair keeps the bytes"
+        );
+        assert!(sl.absorbed.as_ref().unwrap().0 < sl.stamp);
+        accepts(&w.state);
+    }
+}
