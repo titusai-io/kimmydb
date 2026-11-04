@@ -45,6 +45,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use super::codec::DecodeError;
 use super::join::JoinOptions;
@@ -76,7 +77,9 @@ impl OrdAt {
 pub type Cand = (MStamp, u64);
 
 /// The write that voids the candidates older than it. Ordered as the model orders its floor
-/// tuples: by stamp, then an unset below a replace, then `prev`, then the bit.
+/// tuples `(stamp, "u", prev, bit)` and `(stamp, "r")`: by stamp, then a replace BELOW an unset
+/// (`"r" < "u"`, so at one stamp the model's `max` is the unset), then `prev`, then the bit. (Unreachable
+/// honestly: one write never names a path as both an unset and a write.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Floor {
     /// An `$unset` (u*): candidates must be stamped ABOVE it. `prev`: the highest HLC the
@@ -97,8 +100,8 @@ impl Floor {
 
     fn key(&self) -> (MStamp, u8, Hlc, bool) {
         match self {
-            Floor::U { stamp, prev, others } => (*stamp, 0, *prev, *others),
-            Floor::R { stamp } => (*stamp, 1, Hlc::ZERO, false),
+            Floor::U { stamp, prev, others } => (*stamp, 1, *prev, *others),
+            Floor::R { stamp } => (*stamp, 0, Hlc::ZERO, false),
         }
     }
 }
@@ -222,8 +225,10 @@ impl FieldOrd {
 }
 
 /// The join of two order entries of one path (the model's `ord_join`): commutative and
-/// idempotent on any two entries that are normal, associative on those a state can carry (the
-/// join-law tests pin it on the entries of the model's own runs). The floor is the larger, each
+/// idempotent on any two entries that are normal, associative on the entries of histories within
+/// retention (ADR-085; the join-law tests pin it on the entries of the model's own runs). Beyond
+/// retention an honest history can reach a non-associative triple (`ord_codec_tests`, the seed 1421
+/// case), as the state itself is not associative there. The floor is the larger, each
 /// writer keeps the earlier of the candidates the joined floor lets stand, `last` is the later,
 /// `lvl` the newer; what the joined floor voids goes.
 pub fn ord_join(a: &FieldOrd, b: &FieldOrd, o: &JoinOptions) -> FieldOrd {
@@ -579,14 +584,7 @@ impl MergeState {
             // only reachable with a floor that no unset register backs (the no-op unset)
             out.push(place(Born::of((w.stamp, 0))));
         }
-        let below: BTreeSet<&Path> = self
-            .regs
-            .keys()
-            .map(|(l, q)| (l, q))
-            .chain(self.slots.keys().map(|(l, q, _, _)| (l, q)))
-            .filter(|(l, q)| al.contains(l) && q.is_below(p))
-            .map(|(_, q)| q)
-            .collect();
+        let below = self.paths_below(p, al);
         for q in below {
             if let Some(w) = self.winner_in(q, al, o)
                 && w.value.is_plain()
@@ -596,6 +594,40 @@ impl MergeState {
                 out.push(place(bq));
             }
             out.extend(slot_survivors(q));
+        }
+        out
+    }
+
+    /// The paths below `p` that have a register or a counter slot in an alive life (the model's
+    /// `{k[1] for k in regs + slots if k[0] in al and is_under(k[1], p)}`), without a scan of the maps:
+    /// the maps are ordered by (life, path) and a path sorts before every path it is a prefix of, so
+    /// the descendants of `p` in one life are the keys right after `p`, one contiguous run. The cost is
+    /// that of the descendants, not of the state (D-1 of the review: a scan made the read quadratic).
+    fn paths_below<'a>(&'a self, p: &Path, al: &BTreeSet<MStamp>) -> BTreeSet<&'a Path> {
+        let mut out = BTreeSet::new();
+        // the smallest writer, and no generation (which sorts first), as `slots_at` does
+        let least = WriterId { node: NodeId::from_bytes([0; 16]), epoch: Epoch([0; Epoch::LEN]) };
+        for l in al {
+            for ((kl, q), _) in
+                self.regs.range((Bound::Excluded((*l, p.clone())), Bound::Unbounded))
+            {
+                #[cfg(test)]
+                super::work::bump(super::work::Counter::Visits, 1);
+                if kl != l || !q.is_below(p) {
+                    break;
+                }
+                out.insert(q);
+            }
+            for ((kl, q, _, _), _) in self.slots.range((*l, p.clone(), least, None)..) {
+                #[cfg(test)]
+                super::work::bump(super::work::Counter::Visits, 1);
+                if kl != l || !(q == p || q.is_below(p)) {
+                    break;
+                }
+                if q != p {
+                    out.insert(q);
+                }
+            }
         }
         out
     }

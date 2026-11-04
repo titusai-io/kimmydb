@@ -21,6 +21,7 @@ use crate::ids::NodeId;
 
 const GOLDENS: &str = include_str!("../../tests/data/ord_goldens.json");
 const JOIN_LAWS: &str = include_str!("../../tests/data/ord_join_laws.json");
+const RANDOM_STATES: &str = include_str!("../../tests/data/ord_random_states.json");
 
 /// The `sha256` of `model6.py` that both fixtures were made from.
 const MODEL6_SHA256: &str = "0506450e0afc4c307a6ebce032df4f1b1588e719cde6c148c5ff033a8df7f85a";
@@ -343,7 +344,7 @@ fn replay(sc: &J, o: &JoinOptions) -> bool {
 // ---- the read: the goldens of the materialised order --------------------------------
 
 /// The scenarios, by name. A new scenario of the generator is a new line here.
-const SCENARIOS: [&str; 29] = [
+const SCENARIOS: [&str; 30] = [
     "approximate_case",
     "concurrent_creation_a_first",
     "concurrent_creation_b_first",
@@ -358,6 +359,7 @@ const SCENARIOS: [&str; 29] = [
     "level_floor_subdocument_set",
     "replace_drops_a_field_then_set_appends",
     "replace_reorders_even_unchanged",
+    "replace_with_an_empty_document_has_no_update_bit",
     "same_new_path_from_two_writers",
     "sequential_rules",
     "set_then_concurrent_unset",
@@ -412,7 +414,7 @@ fn the_materialised_field_order_equals_the_models_on_every_scenario() {
         fields += want.len();
     }
     // pinned: what the test covered
-    assert_eq!((names.len(), joined, fields), (29, 1064, 115));
+    assert_eq!((names.len(), joined, fields), (30, 1088, 117));
 }
 
 fn paths(doc: &[(Path, Value)]) -> Vec<String> {
@@ -433,7 +435,7 @@ fn strs(v: &[&str]) -> Vec<String> {
 /// join; these are pinned in the source so that a reader sees the rules).
 #[test]
 fn the_field_order_of_the_named_scenarios_is_pinned() {
-    let pins: [(&str, &[&str]); 29] = [
+    let pins: [(&str, &[&str]); 30] = [
         ("approximate_case", &["z", "q", "p", "r"]),
         ("concurrent_creation_a_first", &["a", "c", "d"]),
         ("concurrent_creation_b_first", &["a", "d", "c"]),
@@ -451,6 +453,7 @@ fn the_field_order_of_the_named_scenarios_is_pinned() {
         ("level_floor_subdocument_set", &["m", "m.q", "m.p", "m.r"]),
         ("replace_drops_a_field_then_set_appends", &["c", "a", "b"]),
         ("replace_reorders_even_unchanged", &["c", "b", "a"]),
+        ("replace_with_an_empty_document_has_no_update_bit", &["a", "d"]),
         ("same_new_path_from_two_writers", &["a", "c", "d"]),
         ("sequential_rules", &["yy", "zz", "z", "b", "m", "m.r", "m.p", "a"]),
         ("set_then_concurrent_unset", &["q"]),
@@ -515,6 +518,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
                 "set_then_concurrent_unset",
                 "slot_above_the_floor_is_not_a_survivor",
@@ -541,6 +545,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
                 "set_then_concurrent_unset",
                 "slot_above_the_floor_is_not_a_survivor",
@@ -605,6 +610,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
             &[
                 "descendant_survivor_of_an_unset_map",
                 "hybrid_noop_unset_rides_on_an_update",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "survivor_increment_after_unset",
                 "survivor_older_than_the_fields_own_write_lowers_its_position",
                 "survivor_placement_a_inc_before_c",
@@ -628,6 +634,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
             ],
         ),
@@ -673,6 +680,7 @@ fn the_order_switches_change_the_outcome_of_named_scenarios() {
                 "level_floor_subdocument_set",
                 "replace_drops_a_field_then_set_appends",
                 "replace_reorders_even_unchanged",
+                "replace_with_an_empty_document_has_no_update_bit",
                 "sequential_rules",
                 "set_then_concurrent_unset",
                 "slot_above_the_floor_is_not_a_survivor",
@@ -728,13 +736,26 @@ fn an_unset_floor_is_strict_and_a_replace_floor_is_inclusive() {
     assert!(under_u.valid(&(at(1, 2), 0), &keep), "the mutant never voids");
 }
 
+/// The model orders a floor as the tuple `(stamp, "u", prev, bit)` against `(stamp, "r")`; since
+/// `"r" < "u"`, at one stamp a replace is BELOW an unset and the model's `max` is the unset (O1-5 of the
+/// review: the Rust had them the other way round, and said the opposite in its doc).
 #[test]
-fn floors_order_by_stamp_then_unset_below_replace_then_prev_then_the_bit() {
+fn floors_order_by_stamp_then_replace_below_unset_then_prev_then_the_bit() {
     let r = Floor::R { stamp: at(5, 1) };
-    assert!(u(5, 1, 9, true) < r, "an unset sorts below a replace at one stamp");
+    assert!(r < u(5, 1, 0, false), "a replace sorts below an unset at one stamp");
+    assert!(r < u(5, 1, 9, true));
+    assert_eq!(r.max(u(5, 1, 3, false)), u(5, 1, 3, false), "the model's max is the unset");
     assert!(u(5, 1, 3, true) < u(5, 1, 4, false), "prev before the bit");
     assert!(u(5, 1, 4, false) < u(5, 1, 4, true), "the bit sorts above its absence");
-    assert!(r < u(6, 1, 0, false), "the stamp first");
+    assert!(u(6, 1, 0, false) > r && u(4, 1, 9, true) < r, "the stamp first");
+    // and the join takes that floor when both are at one stamp (peer states only)
+    let o = JoinOptions::default();
+    let (x, y) = (
+        FieldOrd { floor: Some(r), ..FieldOrd::default() },
+        FieldOrd { floor: Some(u(5, 1, 3, false)), ..FieldOrd::default() },
+    );
+    assert_eq!(ord_join(&x, &y, &o).floor, Some(u(5, 1, 3, false)));
+    assert_eq!(ord_join(&y, &x, &o).floor, Some(u(5, 1, 3, false)));
 }
 
 #[test]
@@ -970,11 +991,13 @@ fn the_feed_only_moves_forward_the_floor_the_level_and_the_first() {
 }
 
 /// Where the associativity of the order join ends. Commutative and idempotent on any NORMAL
-/// entries, it is associative only on the entries a causal history reaches: one writer's earlier
-/// and later first for a path never both stand next to a floor between them (the later state has
-/// seen the floor, and carries it). Here are two firsts of one writer that no history keeps
-/// side by side and an unset between them: the groupings disagree. The model's probe and the
-/// simulation below pin the reachable side; the writer's feed (item O2) must keep to it.
+/// entries, it is associative only on the entries of histories WITHIN RETENTION (the ADR-085 limit):
+/// one writer's earlier and later first for a path never both stand next to a floor between them
+/// (the later state has seen the floor, and carries it). Here are two firsts of one writer that no
+/// such history keeps side by side and an unset between them: the groupings disagree. (Beyond
+/// retention an honest history reaches the same shape: `ord_codec_tests`, the seed 1421 case.) The
+/// model's probe and the simulation below pin the reachable side; the writer's feed (item O2) must
+/// keep to it.
 #[test]
 fn the_order_join_is_associative_only_on_the_entries_a_history_reaches() {
     let o = JoinOptions::default();
@@ -1059,6 +1082,292 @@ fn a_chain_of_survivors_is_read_in_linear_time() {
         let m = BornMemo::new(true);
         survivor_chain(depth).ordered_document_with(&o, &m).unwrap();
         assert_eq!(m.evaluations(), depth);
+    }
+}
+
+// ---- the read on the model's random states ------------------------------------------------
+
+/// The ordered document of a state as the fixture spells it.
+fn expected_flat(j: &J) -> Vec<(Path, Value)> {
+    j.as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let v = if e[1] == "map" { serde_json::json!({"t": "map"}) } else { e[1].clone() };
+            (path(&e[0]), value(&v))
+        })
+        .collect()
+}
+
+/// O1-4 of the O1 review. The goldens have no path with entries in two alive lives, no increment below
+/// an unset map and no `lvl` in two lives, so five mutants of the read survived them. This fixture is
+/// 79 states of the model's random nested runs (300 seeds, 30 steps; every writer entry of every
+/// member's oplog and every final state, no implicit markers since O4 is not built, 2,094 distinct), with
+/// the model's ordered document under ABSORBED off (the counter cell the Rust has): chosen as the
+/// smallest states that each of the five mutants changes, and a spread of others. The Rust read must
+/// give the model's order and values on every one. The five mutants (their lines in `ord.rs`):
+///
+///  1. `born_of` reads one life's entry (no fold over the alive lives);
+///  2. no slot survivors of a descendant (`out.extend(slot_survivors(q))` dropped);
+///  3. the level floor takes the `min` of the lives' `lvl`, not the `max`;
+///  4. a descendant survivor is placed at its register stamp, not at its `born_of`;
+///  5. `below` is built from the registers only (a descendant with only a slot is missed).
+///
+/// Each changes the order of at least one of these states, so this test fails under each (shown in the
+/// commit message). The fixture lists, per state, the mutants it was chosen for.
+#[test]
+fn the_read_equals_the_models_on_random_states() {
+    let j: J = serde_json::from_str(RANDOM_STATES).unwrap();
+    assert_eq!(j["model6_sha256"], MODEL6_SHA256);
+    let o = JoinOptions::default();
+    let (mut two_lives, mut maps, mut chosen_for) = (0usize, 0usize, BTreeSet::new());
+    let states = j["states"].as_array().unwrap();
+    for (k, e) in states.iter().enumerate() {
+        let s = state(&e["state"]);
+        let want = expected_flat(&e["expected"]);
+        let doc = s.ordered_document(&o).expect("a life is alive");
+        assert_eq!(flatten(&doc), want, "state {k} (seed {})", e["seed"]);
+        two_lives += usize::from(s.alive(&o).len() >= 2);
+        maps += want.iter().filter(|(_, v)| *v == Value::Map).count();
+        for m in e["kills"].as_array().unwrap() {
+            chosen_for.insert(m.as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(chosen_for.len(), 5, "every mutant has a state: {chosen_for:?}");
+    assert_eq!((states.len(), j["pool"].as_u64()), (79, Some(2094)));
+    assert!(two_lives >= 20 && maps >= 100, "{two_lives} {maps}");
+}
+
+/// O1-6 of the O1 review. The clamp reads the winner's `obs` only, which is the model with ABSORBED
+/// off: the Rust counter cell has no `absorbed` yet. On the model's random states with ABSORBED on, the
+/// order (and the values) differ from the Rust's on a few: 23 of the 2,094 distinct states of the
+/// fixture's runs; the four smallest are kept (the first is the review's seed 155 family). The Rust
+/// gives the ABSORBED-off document on all of them, which this test pins.
+#[test]
+fn the_read_gives_the_absorbed_off_document_where_the_q6_rule_would_differ() {
+    let j: J = serde_json::from_str(RANDOM_STATES).unwrap();
+    let o = JoinOptions::default();
+    let kept = j["absorbed"].as_array().unwrap();
+    assert_eq!((kept.len(), j["absorbed_differing_states"].as_u64()), (4, Some(23)));
+    for (k, e) in kept.iter().enumerate() {
+        let s = state(&e["state"]);
+        let got = flatten(&s.ordered_document(&o).unwrap());
+        assert_eq!(got, expected_flat(&e["expected_off"]), "kept state {k}, seed {}", e["seed"]);
+        assert_ne!(expected_flat(&e["expected_on"]), got, "the Q6 rule makes a difference here");
+    }
+}
+
+/// The same states against the model with ABSORBED ON (the A2 design's Q6 rule): the Rust differs, as
+/// it must until the counter cell lands (per-slot `absorbed`, the slot layout the manager has not frozen).
+/// Pinned so that the counter-cell step must flip this test, not rediscover the divergence.
+#[test]
+#[ignore = "known divergence: the Rust counter cell has no `absorbed` (Q6); the counter-cell step flips this"]
+fn the_read_equals_the_model_with_absorbed_on() {
+    let j: J = serde_json::from_str(RANDOM_STATES).unwrap();
+    let o = JoinOptions::default();
+    for (k, e) in j["absorbed"].as_array().unwrap().iter().enumerate() {
+        let s = state(&e["state"]);
+        let got = flatten(&s.ordered_document(&o).unwrap());
+        assert_eq!(got, expected_flat(&e["expected_on"]), "kept state {k}, seed {}", e["seed"]);
+    }
+}
+
+/// O1-11 of the O1 review. The model keys the root of a replace by `""` and conflates it with a
+/// top-level field named `""` (`parent_of(p) or ""`): there `$set "" = {...}` raises the ROOT's level
+/// floor. The Rust keeps `OrdAt::Root` and `OrdAt::Field("")` apart, which is right, and no differential
+/// can reach it (the model cannot name the field). Here: they are two keys with two encodings (a
+/// segment count of 0, and a count of 1 with an empty segment), in this order; and a replace (the root's
+/// level mark) and a `$set "" = {c}` (the level mark of the field `""`) joined in both orders leave each
+/// mark at its own key. A NOTE FOR O2: the feed must write a top-level field named `""` as
+/// `OrdAt::Field([""])`, never as the root: fed as the root, `OrdRootNotALevel` would refuse an honest
+/// document. The state below is that honest document (a replace's root mark and a top-level `""`
+/// with a level mark and a child) and `decode` accepts it.
+#[test]
+fn the_root_and_a_top_level_field_named_empty_are_distinct_keys() {
+    let o = JoinOptions::default();
+    let (a, b, life) = (w(b'A'), w(b'B'), at(1, b'A'));
+    let empty = Path::flat("").unwrap();
+    let key_field = (life, OrdAt::Field(empty.clone()));
+    let key_root = (life, OrdAt::Root);
+    assert!(key_root < key_field, "the root sorts first");
+    let base = || {
+        let mut s = MergeState::default();
+        s.lives.insert(
+            life,
+            Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert },
+        );
+        s.vv.insert(a, Hlc::new(20, 0));
+        s.vv.insert(b, Hlc::new(20, 0));
+        s
+    };
+    // writer A replaces the document: the root's level mark; writer B sets "" to a document {c: 1}
+    let mut replace = base();
+    let items =
+        [(OrdAt::Root, OrdMode::Level), (OrdAt::Field(Path::flat("x").unwrap()), OrdMode::Reset)];
+    replace.ord_apply(life, at(5, b'A'), Hlc::new(4, 0), &ord_events(&items, &o), &o);
+    let mut set = base();
+    let c = Path::new(["", "c"]).unwrap();
+    let items = [
+        (OrdAt::Field(empty.clone()), OrdMode::Write),
+        (OrdAt::Field(empty.clone()), OrdMode::Level),
+        (OrdAt::Field(c), OrdMode::Reset),
+    ];
+    set.ord_apply(life, at(7, b'B'), Hlc::new(6, 0), &ord_events(&items, &o), &o);
+    assert_eq!(replace.ords[&key_root].lvl, Some(at(5, b'A')));
+    assert!(!replace.ords.contains_key(&key_field));
+    assert_eq!(set.ords[&key_field].lvl, Some(at(7, b'B')));
+    assert!(!set.ords.contains_key(&key_root));
+    // joined in both orders: each mark at its own key, and the same state
+    let (ab, ba) = (join(&replace, &set, &o).0, join(&set, &replace, &o).0);
+    assert_eq!(ab, ba);
+    assert_eq!(ab.ords[&key_root].lvl, Some(at(5, b'A')));
+    assert_eq!(ab.ords[&key_field].lvl, Some(at(7, b'B')));
+    // two keys, two encodings, and the state with both round trips with both
+    assert_ne!(replace.encode_compact(), set.encode_compact());
+    assert_eq!(ab.ords.keys().filter(|k| k.1 == OrdAt::Root).count(), 1);
+    let enc = ab.encode_compact();
+    assert_eq!(
+        ab.check_decoded(),
+        Ok(()),
+        "an honest document with a root mark and a top-level \"\""
+    );
+    assert_eq!(MergeState::decode_compact(&enc).as_ref(), Ok(&ab));
+    // and the root is refused as soon as it holds more than a level mark: what a feed that wrote the
+    // field `""` as the root would have made
+    let mut as_root = ab.clone();
+    as_root.ords.get_mut(&key_root).unwrap().last = Some((at(7, b'B'), 0));
+    assert_eq!(as_root.check_decoded(), Err(DecodeError::OrdRootNotALevel));
+    // the key bytes: life 0, then a segment count of 0 (the root) or a count of 1 and an empty segment
+    let root_only = {
+        let mut s = base();
+        s.ords.insert(key_root.clone(), FieldOrd { lvl: Some(at(5, b'A')), ..FieldOrd::default() });
+        s
+    };
+    let field_only = {
+        let mut s = base();
+        s.ords.insert(
+            key_field.clone(),
+            FieldOrd { last: Some((at(5, b'A'), 0)), ..FieldOrd::default() },
+        );
+        s
+    };
+    let (er, ef) = (root_only.encode_compact(), field_only.encode_compact());
+    let hlc5 = Hlc::new(5, 0).to_bytes();
+    let root_tail: Vec<u8> = [&[1u8, 0, 0, 0, 0, 2][..], &hlc5, &[0]].concat();
+    let field_tail: Vec<u8> = [&[1u8, 0, 1, 0, 0, 0, 1][..], &hlc5, &[0, 0]].concat();
+    assert!(
+        er.ends_with(&root_tail),
+        "count 1, life 0, segment count 0, no floor, no firsts, lvl only"
+    );
+    assert!(ef.ends_with(&field_tail), "count 1, life 0, one segment of length 0, then the entry");
+    assert!(MergeState::decode_compact(&er).is_ok() && MergeState::decode_compact(&ef).is_ok());
+    // the read: a top-level field named "" is an ordinary field, ordered by its own entry
+    let mut doc = ab.clone();
+    for (p, hlc, who) in [(empty.clone(), 7u64, b'B'), (Path::flat("x").unwrap(), 5, b'A')] {
+        let v = if p == empty { Value::Map } else { Value::Int64(1) };
+        let reg = Reg::new(at(hlc, who), v, BTreeMap::new(), None, false).unwrap();
+        doc.regs.insert((life, p), reg);
+    }
+    let reg = Reg::new(at(7, b'B'), Value::Int64(2), BTreeMap::new(), None, false).unwrap();
+    doc.regs.insert((life, Path::new(["", "c"]).unwrap()), reg);
+    let names: Vec<String> =
+        doc.ordered_document(&o).unwrap().iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(names, ["x", ""], "the replace at 5 is before the set of \"\" at 7");
+}
+
+/// n top-level fields, each a register older than its own unset floor (the reviewer's wide shape, D-1).
+fn wide_under_floors(n: usize) -> MergeState {
+    let (a, life) = (w(b'A'), at(1, b'A'));
+    let mut s = MergeState::default();
+    s.lives.insert(life, Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Insert });
+    s.vv.insert(a, Hlc::new(20, 0));
+    for i in 0..n {
+        let p = Path::flat(&format!("f{i:06}")).unwrap();
+        let reg = Reg::new(at(2, b'A'), Value::Int64(1), BTreeMap::new(), None, false).unwrap();
+        s.regs.insert((life, p.clone()), reg);
+        s.ords.insert(
+            (life, OrdAt::Field(p)),
+            FieldOrd { floor: Some(u(10, b'A', 9, false)), ..FieldOrd::default() },
+        );
+    }
+    s
+}
+
+/// A mixed shape: n/4 maps under unset floors, each with three children (two registers, one counter
+/// slot) older than the floor, in two alive lives.
+fn maps_under_floors(n: usize) -> MergeState {
+    let a = w(b'A');
+    let lives = [at(1, b'A'), at(2, b'A')];
+    let mut s = MergeState::default();
+    s.vv.insert(a, Hlc::new(20, 0));
+    for life in lives {
+        s.lives.insert(
+            life,
+            Life { seen: BTreeSet::new(), order: Vec::new(), kind: LifeKind::Upsert },
+        );
+    }
+    for i in 0..n / 4 {
+        let life = lives[i % 2];
+        let m = Path::flat(&format!("m{i:06}")).unwrap();
+        let reg = |v| Reg::new(at(3, b'A'), v, BTreeMap::new(), None, false).unwrap();
+        s.regs.insert((life, m.clone()), reg(Value::Map));
+        for (j, kid) in ["x", "y", "z"].iter().enumerate() {
+            let q = m.child(kid).unwrap();
+            if j < 2 {
+                s.regs.insert((life, q), reg(Value::Int64(1)));
+            } else {
+                s.slots
+                    .insert((life, q, a, None), Slot { stamp: at(3, b'A'), total: Num::Int64(5) });
+            }
+        }
+        s.ords.insert(
+            (life, OrdAt::Field(m)),
+            FieldOrd { floor: Some(u(10, b'A', 9, false)), ..FieldOrd::default() },
+        );
+    }
+    s
+}
+
+/// D-1 of the delta review: the memoised read was linear in evaluations but quadratic in the cells it
+/// visited, because each evaluation under an unset floor scanned every register and slot key for the
+/// descendants of its path (n fields under floors visited n^2 keys; 100,000 of them, a few megabytes
+/// that decode, about 10^10 per read). The descendants are now a contiguous run of the path-ordered
+/// maps, so the read costs the descendants it uses. Counted in cell visits (`work`), not wall time:
+///
+///  * n fields under floors: visits at n = 1,000 / 2,000 / 4,000 grow with n (the ratio of the last to
+///    the first is at most 4.4, a 10% tolerance over 4), and stay under 12 n;
+///  * a mixed shape (maps with children, in two lives): the same;
+///  * a chain of survivors of depth d: every path above has its own floor and looks at all below it, so
+///    the visits are the sum of the descendants (d(d - 1)/2 pairs, each costing a winner probe, a slot
+///    probe and a step of the key runs: about 4), bounded by 5 d^2, and d is at most 100 (the depth
+///    limit of paths): under 50,000 at the limit. (Linear in d would need the survivors of a
+///    path to be folded from its children's, which the clamp's `place` does not allow: it depends on
+///    the floor of the path itself.)
+#[test]
+fn the_read_visits_cells_in_proportion_to_the_work_not_to_the_state() {
+    let o = JoinOptions::default();
+    let visits = |s: &MergeState| {
+        let (doc, c) = super::work::count(|| s.ordered_document(&o));
+        assert!(doc.is_some());
+        c.visits
+    };
+    for (name, build) in [
+        ("wide", wide_under_floors as fn(usize) -> MergeState),
+        ("maps", maps_under_floors as fn(usize) -> MergeState),
+    ] {
+        let (v1, v2, v4) = (visits(&build(1_000)), visits(&build(2_000)), visits(&build(4_000)));
+        eprintln!("{name}: visits {v1} / {v2} / {v4} at 1,000 / 2,000 / 4,000 fields");
+        assert!(
+            v4 * 10 <= v1 * 44,
+            "{name}: {v1} {v4}: more than 4.4 times for 4 times the fields"
+        );
+        assert!(v2 * 10 <= v1 * 22, "{name}: {v1} {v2}");
+        assert!(v4 <= 12 * 4_000, "{name}: {v4} visits for 4,000 fields");
+    }
+    for d in [10usize, 40, 100] {
+        let v = visits(&survivor_chain(d));
+        eprintln!("chain of depth {d}: {v} visits");
+        assert!(v <= 5 * d * d, "chain {d}: {v}");
     }
 }
 

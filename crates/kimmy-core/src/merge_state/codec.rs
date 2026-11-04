@@ -66,6 +66,8 @@ pub enum DecodeError {
     BadString,
     #[error("merge state: invalid path")]
     BadPath,
+    #[error("merge state: a path is deeper than the depth limit")]
+    PathTooDeep,
     #[error("merge state: an index is outside its table")]
     BadIndex,
     #[error("merge state: {0} trailing bytes")]
@@ -547,6 +549,10 @@ impl R<'_> {
     /// A path written by `W::path`: segments joined by NUL, none empty.
     fn path(&mut self) -> Result<Path, DecodeError> {
         let joined = self.str()?;
+        // more NULs than the limit allows segments: refused before any segment is built
+        if joined.matches('\0').count() >= MAX_VALUE_DEPTH {
+            return Err(DecodeError::PathTooDeep);
+        }
         Path::new(joined.split('\0')).map_err(|_| DecodeError::BadPath)
     }
     fn hlc(&mut self) -> Result<Hlc, DecodeError> {

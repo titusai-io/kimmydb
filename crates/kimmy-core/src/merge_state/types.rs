@@ -49,7 +49,7 @@ pub struct MStamp {
 pub struct InvalidPath(pub &'static str);
 
 /// A field path: the names from the document root to a field, as a list of segments, never as
-/// one dotted string. A stored document may hold a field named `a.b`, `$x` or the empty string
+/// one dotted string. At most 100 segments (`MAX_VALUE_DEPTH`, the BSON depth limit). A stored document may hold a field named `a.b`, `$x` or the empty string
 /// (insert checks no key), which no dotted path expression can reach, so a segment is any
 /// string without a NUL byte (a BSON field name cannot hold one); a path has at least one
 /// segment. Paths order by their segments, each compared as UTF-8 bytes, so a path sorts before
@@ -75,7 +75,18 @@ impl Path {
         if segments.iter().any(|s| s.contains('\0')) {
             return Err(InvalidPath("a NUL byte in a segment"));
         }
+        // a document nests at most as deep as a value does (the BSON depth limit), so no write names
+        // a deeper path, and no decoded state may: the reads recurse once per level
+        if segments.len() > super::codec::MAX_VALUE_DEPTH {
+            return Err(InvalidPath("deeper than the depth limit of 100 segments"));
+        }
         Ok(Self(segments))
+    }
+
+    /// A path of any depth, for the tests that hand the decoders a path they must refuse.
+    #[cfg(test)]
+    pub(super) fn unchecked(segments: Vec<String>) -> Self {
+        Self(segments)
     }
 
     /// The path of one segment: a top-level field.
@@ -237,7 +248,16 @@ impl Value {
     /// `Document` at any level of a sub-document (the writer expands it into a map): its field
     /// names must be distinct and free of NUL bytes, and no map marker.
     pub fn check_input(&self) -> Result<(), InvalidValue> {
+        self.check_input_at(0)
+    }
+
+    /// [`Value::check_input`] for a value `depth` documents down: a document nested as deep as the
+    /// depth limit allows is refused (`TooDeep`) before the recursion goes past it.
+    fn check_input_at(&self, depth: usize) -> Result<(), InvalidValue> {
         match self {
+            Value::Document(_) if depth >= super::codec::MAX_VALUE_DEPTH => {
+                Err(InvalidValue::TooDeep)
+            }
             Value::Document(f) => {
                 let mut names: Vec<&str> = f.iter().map(|(n, _)| n.as_str()).collect();
                 names.sort_unstable();
@@ -245,7 +265,7 @@ impl Value {
                 {
                     return Err(InvalidValue::BadFieldName);
                 }
-                f.iter().try_for_each(|(_, x)| x.check_input())
+                f.iter().try_for_each(|(_, x)| x.check_input_at(depth + 1))
             }
             Value::Map => Err(InvalidValue::MapMarker),
             v => v.check_register(),

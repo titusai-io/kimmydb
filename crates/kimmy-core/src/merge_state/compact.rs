@@ -770,6 +770,9 @@ impl R<'_> {
     }
     fn path(&mut self) -> Result<Path, DecodeError> {
         let n = self.len()?;
+        if n > MAX_VALUE_DEPTH {
+            return Err(DecodeError::PathTooDeep);
+        }
         let mut segments = Vec::new();
         for _ in 0..n {
             segments.push(self.str()?);
@@ -785,6 +788,9 @@ impl R<'_> {
         let n = self.len()?;
         if n == 0 {
             return Ok(OrdAt::Root);
+        }
+        if n > MAX_VALUE_DEPTH {
+            return Err(DecodeError::PathTooDeep);
         }
         let mut segments = Vec::new();
         for _ in 0..n {
