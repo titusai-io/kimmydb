@@ -22,6 +22,9 @@ mod grade;
 mod mutants;
 mod oracle;
 mod oracle_tests;
+#[path = "../common/ord_replay.rs"]
+mod ord_replay;
+mod order_oracle;
 mod probes;
 mod rng;
 mod sim;
@@ -314,9 +317,10 @@ fn runner() {
     if base != 0 {
         rep.failures.push(format!("the design fails {base}/{mruns} mutant-grader runs"));
     }
-    // The design mutants of section 17 (14), the B1 and M1 rules (2), the nested rules (7) and the two
-    // rules of Q3 (the covered-entry skip, the start-HLC rule): a removed one must be noticed.
-    assert_eq!(mutants::mutants().len(), 26, "the mutant list changed");
+    // The design mutants of section 17 (14), the B1 and M1 rules (2), the nested rules (7), the rules of Q3
+    // (the covered-entry skip by the vector and by the stamp, the start-HLC rule) and the seven rules of the
+    // writer's feed of the order state (O2): a removed one must be noticed.
+    assert_eq!(mutants::mutants().len(), 33, "the mutant list changed");
     for m in mutants::mutants() {
         let o = mutants::judge(&m, mruns);
         let how = match (&o.probe, o.random_fail > 0) {
@@ -396,6 +400,30 @@ fn states_and_reads_match_the_pinned_fingerprints() {
         ("bounded nested", 0x3eb070a76e6956fe),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
+}
+
+/// The order checks of the runner are not vacuous: over the default workloads a good share of the writes are
+/// compared against the serial reference (read-your-writes order, `order_oracle.rs`), none disagrees, and the
+/// members of every run read one ordered document (graded by `grade`, which also holds the join laws of the
+/// order entries the run reached).
+#[test]
+fn the_read_your_writes_order_is_compared_on_a_good_share_of_the_writes() {
+    let cfg = Cfg::default_ret();
+    let (mut writes, mut compared, mut problems) = (0usize, 0usize, 0usize);
+    for seed in 0..100 {
+        let o = run(seed, &RunConfig::default(), &cfg);
+        assert!(grade(&o.nodes, &o.log).is_empty(), "seed {seed}");
+        writes += o.log.len();
+        for m in &o.nodes {
+            compared += m.order_checks;
+            problems += m.order_problems.len();
+        }
+    }
+    eprintln!(
+        "read-your-writes order: {compared} of {writes} writes compared, {problems} problems"
+    );
+    assert_eq!(problems, 0);
+    assert!(compared * 2 > writes, "{compared} of {writes}");
 }
 
 /// The odd field names (the empty name, `_`, a name with a dot) are in the workload at a rate that

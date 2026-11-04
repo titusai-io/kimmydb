@@ -14,6 +14,7 @@ use kimmy_core::merge_state::{
 };
 
 use crate::oracle::{self, Intent, Log};
+use crate::order_oracle::{self, OrdOp};
 
 /// A one-segment path.
 pub fn p(x: &str) -> Path {
@@ -167,6 +168,11 @@ pub struct Node {
     pub check_writes: bool,
     /// The disagreements `check_writes` found, by name.
     pub problems: Vec<String>,
+    /// The writes whose author did not read the order the serial reference gives right after them
+    /// (read-your-writes order, `order_oracle.rs`): checked for every local write, in every run.
+    pub order_problems: Vec<String>,
+    /// How many writes that check compared (the reference had an outcome for them).
+    pub order_checks: usize,
     epoch_ctr: u64,
     epoch_rng: Rng,
     saved: Option<Saved>,
@@ -200,6 +206,8 @@ impl Node {
             flags: cfg.flags,
             check_writes: false,
             problems: Vec::new(),
+            order_problems: Vec::new(),
+            order_checks: 0,
             epoch_ctr: 0,
             epoch_rng: Rng::new(20_261_031 ^ u64::from(name as u32)),
             saved: None,
@@ -473,7 +481,11 @@ impl Node {
         let old = self
             .check_writes
             .then(|| oracle::oracle_at(log, &self.contained, self.ret(), self.bound()));
+        let before = self.w.state.ordered_document(&self.w.opts);
+        let history = self.history();
+        let one_life = self.w.alive().len() == 1;
         let r = write(&mut self.w);
+        self.read_your_writes(before, history, one_life, order_oracle::op_of(&intent), r.is_some());
         if let Some(old) = old
             && let Err(e) =
                 oracle::check_write(old.as_ref(), &intent, r.as_ref().map(|w| &w.record))
@@ -483,12 +495,57 @@ impl Node {
         r
     }
 
+    /// The paths that have history in the writer's order state: a standing candidate in some life.
+    fn history(&self) -> BTreeSet<Vec<String>> {
+        self.w
+            .state
+            .ords
+            .iter()
+            .filter(|(_, e)| !e.firsts.is_empty() || e.last.is_some())
+            .filter_map(|((_, at), _)| match at {
+                kimmy_core::merge_state::OrdAt::Field(p) => Some(p.segments().to_vec()),
+                kimmy_core::merge_state::OrdAt::Root => None,
+            })
+            .collect()
+    }
+
+    /// Read-your-writes order: after an accepted write the writer's own ordered document is the one the
+    /// serial reference gives (see `order_oracle`).
+    fn read_your_writes(
+        &mut self,
+        before: Option<Vec<(String, kimmy_core::merge_state::OrderedValue)>>,
+        history: BTreeSet<Vec<String>>,
+        one_life: bool,
+        op: OrdOp,
+        wrote: bool,
+    ) {
+        if !wrote {
+            return;
+        }
+        let after = self.w.state.ordered_document(&self.w.opts);
+        let one_life = one_life && self.w.alive().len() == 1;
+        match order_oracle::check(before.as_deref(), after.as_deref(), &op, &history, one_life) {
+            Ok(compared) => self.order_checks += usize::from(compared),
+            Err(e) => self.order_problems.push(format!("order-ryw {}: {e}", self.name)),
+        }
+    }
+
     pub fn insert(&mut self, f: &[(&str, Value)], log: &mut Log, skew: u64) -> Option<MStamp> {
         let r = self.checked(Intent::Insert(named(f)), log, |w| w.insert(&fl(f), skew));
         self.logged(r, log)
     }
     pub fn upsert_inc(&mut self, path: &str, n: i64, log: &mut Log, skew: u64) -> Option<MStamp> {
+        let before = self.w.state.ordered_document(&self.w.opts);
+        let history = self.history();
+        let one_life = self.w.alive().len() == 1;
         let r = self.w.upsert_inc(&p(path), n, skew);
+        self.read_your_writes(
+            before,
+            history,
+            one_life,
+            OrdOp::Upsert(vec![path.to_string()]),
+            r.is_some(),
+        );
         self.logged(r, log)
     }
     /// A `$setOnInsert` upsert: two sequential writes by one writer (the creation
@@ -503,10 +560,20 @@ impl Node {
         log: &mut Log,
         skew: u64,
     ) -> Option<MStamp> {
+        let names: Vec<String> = fields
+            .iter()
+            .chain(sets)
+            .map(|(k, _)| (*k).to_string())
+            .chain([inc_path.to_string()])
+            .collect();
+        let before = self.w.state.ordered_document(&self.w.opts);
+        let history = self.history();
+        let one_life = self.w.alive().len() == 1;
         let inc_path = p(inc_path);
         let created = self.w.upsert_soi_create(&fl(fields), &inc_path, &fl(sets), skew);
         let s1 = self.logged(created, log)?;
         let incd = self.w.upsert_inc_on(s1, &inc_path, n, skew);
+        self.read_your_writes(before, history, one_life, OrdOp::Upsert(names), incd.is_some());
         self.logged(incd, log)
     }
     pub fn set(&mut self, path: &str, v: Value, log: &mut Log, skew: u64) -> Option<MStamp> {

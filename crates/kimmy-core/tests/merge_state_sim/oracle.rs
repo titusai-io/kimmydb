@@ -905,6 +905,16 @@ pub fn check_write(
         // an $inc: refused where the rule says so, otherwise the writer decides (type, bound)
         (Expected::Refused, Some(_), _) => Err(format!("{intent:?} was accepted, want a refusal")),
         (_, _, Intent::Inc(_)) => Ok(()),
+        // a no-op is no write; only a write of a sub-document or a replace can change the ORDER of the
+        // fields and nothing else, and then it is a write with no cell
+        (Expected::Effects(e), Some(_), Intent::Unset(_)) if e.is_empty() => {
+            Err(format!("{intent:?} changes nothing and was written"))
+        }
+        (Expected::Effects(e), Some(_), Intent::Set(_, v))
+            if e.is_empty() && !matches!(v, Value::Document(_)) =>
+        {
+            Err(format!("{intent:?} changes nothing and was written"))
+        }
         (Expected::Effects(e), None, _) if e.is_empty() => Ok(()),
         (Expected::Effects(e), None, _) => Err(format!("{intent:?} was refused, want {e:?}")),
         (Expected::Effects(e), Some(r), _) => {
