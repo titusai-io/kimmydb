@@ -593,13 +593,16 @@ fn the_join_laws_hold_on_what_decode_accepts() {
     // over the accepted damaged entries moved with the accepted set: triples 141,714 -> 141,654, agreeing
     // 112,602 -> 112,566, not associative unchanged at 440. Nothing else moved: the arbitrary (undamaged)
     // candidates, the hand-built closed states and the simulation are the same figures.
-    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_609));
+    // RE-PINNED on the rebase of the implicit map markers onto the counter cell's decode clauses: the corpus now holds
+    // states with markers, so the seeded damage is other input, and the two clauses refuse other damaged encodings:
+    // accepted 10,609 -> 10,601; triples 141,654 -> 140,112, agreeing 112,566 -> 110,634, not associative 440 -> 444.
+    assert_eq!((fuzz_inputs, fuzz_accepted), (40_000, 10_601));
     assert_eq!((arb.triples, arb.agreeing, arb.not_associative), (248_160, 195_960, 5_684));
     assert_eq!(
         arb.not_associative_agreeing, 0,
         "the accepted triples that fail are the cross-state ones"
     );
-    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (141_654, 112_566, 440));
+    assert_eq!((fz.triples, fz.agreeing, fz.not_associative), (140_112, 110_634, 444));
     assert_eq!((one.triples, one.not_associative), (4_266, 0));
     assert_eq!((sim.triples, sim.not_associative), (108_870, 0));
 }
