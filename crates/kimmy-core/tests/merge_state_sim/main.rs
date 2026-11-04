@@ -410,14 +410,26 @@ fn states_and_reads_match_the_pinned_fingerprints() {
     //   bounded nested 0x3eb070a76e6956fe -> 0x49b01bf0858bb6cd
     // (the last had moved once before, in Group A, when a write that only reorders became a write). Before
     // this commit they left the order state out, and six of the seven were the figures of the code before O2.
+    // RE-PINNED for the counter cell (a slot's absorbed pair, the typed compact spelling, no `obs`): the BYTES
+    // moved and no read did. The same seven runs fold, in a scratch test, only the reads (visible document,
+    // hidden figures, excess, caps, alive lives, ordered document, clock and events of every member before
+    // every step): the figures are identical at 45169322 (before the cell) and after it,
+    //   restore 0x97efdf3f3574b9d6   no restore 0x0ce9f62bfa3c66c8   bound 1000 0xf65d997041ec7783
+    //   sequential 0x566e60b79b81676c   horizon 0x00df956681c1c24c   bounded 0x412e0e245196e033
+    //   bounded nested 0xca3d1972381f336b
+    // and the figures below are those of the full fold:
+    //   restore 0xd5f2038d6cb64fd0 -> 0xff85ad3d5b95647a      no restore 0x03c831e729d37118 -> 0x1d4d18761d99dc46
+    //   bound 1000 0xb5d376dace70d755 -> 0x405c7af0cbda4a1a   sequential 0x5cf2b4f670f08b9e -> 0x66628b9442fa1213
+    //   horizon 0xaab8149ae0f8c453 -> 0x35fe713c19988bed      bounded 0x6a0197bd2778c8c7 -> 0x0ddcbb0a2eb7ebf0
+    //   bounded nested 0x49b01bf0858bb6cd -> 0x95744a329c2b2f5e
     let pinned: [(&str, u64); 7] = [
-        ("restore", 0xd5f2038d6cb64fd0),
-        ("no restore", 0x03c831e729d37118),
-        ("bound 1000", 0xb5d376dace70d755),
-        ("sequential", 0x5cf2b4f670f08b9e),
-        ("horizon", 0xaab8149ae0f8c453),
-        ("bounded", 0x6a0197bd2778c8c7),
-        ("bounded nested", 0x49b01bf0858bb6cd),
+        ("restore", 0xff85ad3d5b95647a),
+        ("no restore", 0x1d4d18761d99dc46),
+        ("bound 1000", 0x405c7af0cbda4a1a),
+        ("sequential", 0x66628b9442fa1213),
+        ("horizon", 0x35fe713c19988bed),
+        ("bounded", 0x0ddcbb0a2eb7ebf0),
+        ("bounded nested", 0x95744a329c2b2f5e),
     ];
     assert_eq!(got.map(|(n, f)| (n, f)), pinned, "a state or a read changed");
 }
