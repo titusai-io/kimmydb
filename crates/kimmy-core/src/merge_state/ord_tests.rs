@@ -2361,3 +2361,54 @@ fn the_order_state_joins_by_the_laws_in_a_causal_simulation() {
         assert!(shapes.get(shape).copied().unwrap_or(0) > 50, "vacuous: {shape} {shapes:?}");
     }
 }
+
+/// Item 9 of O2 (bounds): a document nested at the limit (100 levels), written through the Writer,
+/// feeds a chain of 100 order entries (one per level, each a plain write of the Writer's), and the
+/// read of the state a concurrent unset of the top and a survivor increment of the leaf make visits at
+/// most 5·d² cells, the bound of D-1. The Writer refuses a path one level deeper.
+#[test]
+fn a_document_nested_at_the_limit_feeds_a_chain_the_read_visits_within_the_bound() {
+    use super::tests::wid;
+    let o = JoinOptions::default();
+    let d = 100usize;
+    fn nest(d: usize, leaf: Value) -> Value {
+        if d == 0 { leaf } else { Value::Document(vec![("a".into(), nest(d - 1, leaf))]) }
+    }
+    let top = Path::flat("a").unwrap();
+    let leaf_path = Path::new(std::iter::repeat_n("a".to_string(), d)).unwrap();
+    // d levels: the leaf is at a path of d segments
+    let doc = vec![(top.clone(), nest(d - 1, Value::Int64(1)))];
+    let mut a = Writer::new(wid('A', 0), o.clone());
+    let life = a.insert(&doc, 0).expect("a document nested at the limit is written").stamp;
+    let keys: Vec<_> = a.state.ords.keys().filter(|k| k.0 == life).collect();
+    assert_eq!(keys.len(), d, "one entry per level");
+    assert_eq!(a.state.check_decoded(), Ok(()));
+    // B sees it and increments the leaf; A, not having seen that, unsets the top
+    let mut b = Writer::new(wid('B', 0), o.clone());
+    b.receive(&a.state);
+    b.write_inc(&leaf_path, 1, 0).expect("the increment");
+    a.write_unset(&top, 0).expect("the unset");
+    let joined = join(&a.state, &b.state, &o).0;
+    assert_eq!(joined.check_decoded(), Ok(()));
+    let (read, c) = super::work::count(|| joined.ordered_document(&o));
+    let read = read.expect("a life is alive");
+    assert!(c.visits <= 5 * d * d, "{} visits for depth {d}: the bound is {}", c.visits, 5 * d * d);
+    assert!(!read.is_empty(), "the surviving increment shows a chain of maps");
+    eprintln!(
+        "depth {d}: {} order entries, {} visits (bound {})",
+        joined.ords.len(),
+        c.visits,
+        5 * d * d
+    );
+    // and the encodings of the chain round trip
+    let enc = joined.encode_compact();
+    assert_eq!(MergeState::decode_compact(&enc).as_ref(), Ok(&joined));
+    // one level deeper is refused by the Writer: a value nested past the limit, and a path
+    assert!(Path::new(std::iter::repeat_n("a".to_string(), d + 1)).is_err());
+    let mut fresh = Writer::new(wid('C', 0), o.clone());
+    assert!(
+        fresh.insert(&[(top, nest(d, Value::Int64(1)))], 0).is_none(),
+        "101 levels are refused"
+    );
+    assert!(fresh.state.ords.is_empty(), "and nothing is fed");
+}
