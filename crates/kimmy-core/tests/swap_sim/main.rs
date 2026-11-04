@@ -98,6 +98,21 @@ mod tests {
         assert_eq!(res["true_late_writes_allowed"], 1);
     }
 
+    /// The vendored Python model is the reviewed one (`reference_model/MODEL-HASHES.txt`). The differential (a later phase)
+    /// is made from it; a changed byte fails here first.
+    #[test]
+    fn the_vendored_model_is_the_reviewed_one() {
+        use sha2::{Digest, Sha256};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/swap_sim/reference_model");
+        let want = "40a44c8838f55988cda48c7f296edb13a759803d1790d812888126275d948084";
+        let bytes = std::fs::read(dir.join("swapmodel6a.py")).unwrap();
+        let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, want, "swapmodel6a.py");
+        let recorded = std::fs::read_to_string(dir.join("MODEL-HASHES.txt")).unwrap();
+        assert!(recorded.contains(want));
+    }
+
     /// The model's seed-fixed run is deterministic: the same seed gives the same figures (the harness' own PRNG).
     #[test]
     fn a_run_is_a_function_of_its_seed() {
@@ -191,7 +206,7 @@ mod tests {
 
     /// Debug aid: Q6_SEED=<seed> prints the trace of every configuration of the grid that has a problem at that seed.
     #[test]
-    #[ignore]
+    #[ignore = "debug aid: Q6_SEED=<seed> prints the trace of every grid configuration with a problem at that seed"]
     fn show_failing_seed() {
         let seed = env_u64("Q6_SEED", 0);
         for c in grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]) {
