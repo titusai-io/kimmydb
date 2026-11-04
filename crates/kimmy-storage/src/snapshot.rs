@@ -151,15 +151,18 @@ pub const SNAPSHOT_PAGE_BYTES: usize = 63 * 1024 * 1024;
 
 /// What a document on a page costs beyond its body and its `_id` as it
 /// crosses ([`id_wire_len`]): its collection and stamp, the `_id`'s variant, the
-/// field names and their framing, a bound and not a measure. The stamp's epoch
-/// field (a 36-character hex string, 48 bytes in a BSON frame) is in it: 160
-/// before the epoch existed.
-pub(crate) const DOCUMENT_OVERHEAD: usize = 208;
+/// field names and their framing, a bound and not a measure.
+///
+/// Measured (`the_row_overheads_bound_the_encoding`'s shapes, BSON through
+/// `serialize_to_vec`, so the stamp's epoch is an 18-byte binary, 30 bytes in a
+/// frame): at most 186 across the `_id` kinds, 156 before the stamp had an epoch,
+/// against 160 then. The slack of 4 is kept.
+pub(crate) const DOCUMENT_OVERHEAD: usize = 190;
 
 /// What a tombstone on a page costs beyond its key (sent as bytes), likewise;
-/// 138 measured at the widest collection id and stamp before the stamp's epoch
-/// (48 bytes in a BSON frame) was added to it.
-pub(crate) const TOMBSTONE_OVERHEAD: usize = 208;
+/// 168 measured at the widest collection id and stamp, 138 before the stamp had
+/// an epoch, against 160 then. The slack of 22 is kept.
+pub(crate) const TOMBSTONE_OVERHEAD: usize = 190;
 
 /// What the cursor a page cuts costs beyond its key as it crosses: its
 /// collection and its framing, a bound.

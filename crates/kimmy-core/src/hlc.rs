@@ -437,6 +437,35 @@ mod tests {
         assert_eq!(bson::deserialize_from_document::<Stamp>(doc).unwrap(), s);
     }
 
+    /// The bytes a stamp costs in a BSON frame, the way the cluster frames and the snapshot
+    /// pages write it (`bson::serialize_to_vec`, so the epoch is a 18-byte binary). The page
+    /// budgets in kimmy-storage (`DOCUMENT_OVERHEAD`, `TOMBSTONE_OVERHEAD`) are sized from this
+    /// number: a change in the encoding fails here first.
+    #[test]
+    fn a_stamp_costs_122_bytes_in_a_bson_frame_30_of_them_the_epoch() {
+        // 4 (length) + hlc 40 (1 + "hlc\0" 4 + document 35: wall_ms int64 17, counter int32
+        // 13, 4 + 1) + node 47 (1 + "node\0" 5 + 4 + 36 + 1) + epoch 30 (1 + "epoch\0" 6 + 4 +
+        // 1 subtype + 18) + 1 (terminator)
+        let s = Stamp::new(Hlc::new(u64::from(u32::MAX) * 1000, u16::MAX), node(0xAB), Epoch::MAX);
+        let bytes = bson::serialize_to_vec(&s).unwrap();
+        assert_eq!(bytes.len(), 122);
+        let doc: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
+        assert!(matches!(doc.get("epoch"), Some(bson::Bson::Binary(b)) if b.bytes.len() == 18));
+        let mut without = doc.clone();
+        without.remove("epoch");
+        assert_eq!(
+            bson::serialize_to_vec(&without).unwrap().len(),
+            92,
+            "the stamp before the epoch"
+        );
+        assert_eq!(bson::deserialize_from_slice::<Stamp>(&bytes).unwrap(), s);
+        // the human-readable forms (JSON, the document writer) carry the epoch as 36 hex digits
+        assert_eq!(
+            bson::serialize_to_document(&s).unwrap().get_str("epoch").unwrap(),
+            "f".repeat(36)
+        );
+    }
+
     mod props {
         use proptest::prelude::*;
 

@@ -77,19 +77,44 @@ impl Epoch {
     }
 }
 
-/// Serialized as its 36-character lowercase hex text, in every format, so an epoch reads back
-/// out of JSON and BSON alike (the same reasoning as [`NodeId`]'s serde form).
+/// Serialized as its 36-character lowercase hex text where the format is human-readable (JSON,
+/// the API, logs), and as its 18 raw bytes otherwise (BSON binary). Read back from either form,
+/// whatever the format says about itself: the BSON writers disagree with the BSON readers about
+/// being human-readable (see [`NodeId`]'s serde form), so a reader accepts the text and the bytes
+/// both. A text that is not 36 lowercase hex digits, and bytes that are not 18, are refused.
 impl Serialize for Epoch {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_hex())
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_hex())
+        } else {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+}
+
+struct EpochVisitor;
+
+impl serde::de::Visitor<'_> for EpochVisitor {
+    type Value = Epoch;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an epoch: 36 lowercase hex digits, or 18 bytes")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Epoch, E> {
+        Epoch::from_hex(text).ok_or_else(|| E::custom("an epoch is 36 lowercase hex digits"))
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Epoch, E> {
+        let bytes: [u8; Epoch::LEN] =
+            bytes.try_into().map_err(|_| E::invalid_length(bytes.len(), &"18 bytes"))?;
+        Ok(Epoch(bytes))
     }
 }
 
 impl<'de> Deserialize<'de> for Epoch {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        Self::from_hex(&text)
-            .ok_or_else(|| serde::de::Error::custom("an epoch is 36 lowercase hex digits"))
+        deserializer.deserialize_any(EpochVisitor)
     }
 }
 
@@ -158,16 +183,43 @@ impl FromStr for Origin {
     }
 }
 
+/// Serialized as the wire string where the format is human-readable, and as its 34 raw bytes
+/// otherwise; read from either, like [`Epoch`]. **A map keyed by origin must not rely on this**:
+/// a BSON key is a string whatever the writer says about itself, so such a map writes each key as
+/// the wire string itself (`VersionVector` does).
 impl Serialize for Origin {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
+        if serializer.is_human_readable() {
+            serializer.collect_str(self)
+        } else {
+            serializer.serialize_bytes(&self.to_bytes())
+        }
+    }
+}
+
+struct OriginVisitor;
+
+impl serde::de::Visitor<'_> for OriginVisitor {
+    type Value = Origin;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an origin: <node uuid>/<36 lowercase hex digits>, or 34 bytes")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Origin, E> {
+        text.parse().map_err(E::custom)
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Origin, E> {
+        let bytes: [u8; Origin::LEN] =
+            bytes.try_into().map_err(|_| E::invalid_length(bytes.len(), &"34 bytes"))?;
+        Ok(Origin::from_bytes(bytes))
     }
 }
 
 impl<'de> Deserialize<'de> for Origin {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        text.parse().map_err(serde::de::Error::custom)
+        deserializer.deserialize_any(OriginVisitor)
     }
 }
 
@@ -232,8 +284,14 @@ mod tests {
         assert!(format!("{node}/{}", epoch.to_uppercase()).parse::<Origin>().is_err());
     }
 
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Holder {
+        epoch: Epoch,
+        origin: Origin,
+    }
+
     #[test]
-    fn an_epoch_is_hex_text_in_json_and_bson_and_an_origin_is_its_wire_string() {
+    fn json_writes_the_text_forms_and_reads_them_back() {
         let o = origin(3, 0xDEAD_BEEF);
         let json = serde_json::to_string(&o).unwrap();
         assert_eq!(json, format!("\"{o}\""));
@@ -242,22 +300,71 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert_eq!(json, format!("\"{}\"", e.to_hex()));
         assert_eq!(serde_json::from_str::<Epoch>(&json).unwrap(), e);
+        // a wrong length or a non-hex text is refused
         assert!(serde_json::from_str::<Epoch>("\"00\"").is_err());
+        assert!(serde_json::from_str::<Epoch>(&format!("\"{}\"", "G".repeat(36))).is_err());
         assert!(serde_json::from_str::<Origin>("\"nope\"").is_err());
+        assert!(serde_json::from_str::<Epoch>("[1,2,3]").is_err());
+    }
 
-        // BSON writes and reads it back too, and an origin works as a document key
-        let doc = bson::doc! { "o": o.to_string(), "e": e.to_hex() };
-        let back: std::collections::BTreeMap<String, String> =
-            bson::deserialize_from_document(doc).unwrap();
-        assert_eq!(back["o"].parse::<Origin>().unwrap(), o);
-        assert_eq!(Epoch::from_hex(&back["e"]).unwrap(), e);
-        let mut map = std::collections::BTreeMap::new();
-        map.insert(o, 5u32);
-        let doc = bson::serialize_to_document(&map).unwrap();
-        assert_eq!(doc.get_i64(o.to_string()).unwrap(), 5);
-        let back: std::collections::BTreeMap<Origin, u32> =
-            bson::deserialize_from_document(doc).unwrap();
-        assert_eq!(back, map);
+    /// `bson::serialize_to_vec` reports `is_human_readable() == false` (bson 3.1.0
+    /// src/ser/raw.rs:72, `human_readable: false`), so an epoch and an origin are BSON binary
+    /// there; `serialize_to_document` reports true (src/ser/serde.rs:426, `unwrap_or(true)`),
+    /// so they are strings. This pins both, and that each reads back from either.
+    #[test]
+    fn bson_writes_binary_through_the_raw_writer_and_text_through_the_document_writer() {
+        let h = Holder { epoch: Epoch::new(Hlc::new(5, 6), [9; 8]), origin: origin(0xAB, 11) };
+
+        let bytes = bson::serialize_to_vec(&h).unwrap();
+        let doc: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
+        match (doc.get("epoch"), doc.get("origin")) {
+            (Some(bson::Bson::Binary(e)), Some(bson::Bson::Binary(o))) => {
+                assert_eq!(e.bytes, h.epoch.0.to_vec());
+                assert_eq!(o.bytes, h.origin.to_bytes().to_vec());
+            }
+            other => panic!("expected two binaries, got {other:?}"),
+        }
+        assert_eq!(bson::deserialize_from_slice::<Holder>(&bytes).unwrap(), h);
+
+        let doc = bson::serialize_to_document(&h).unwrap();
+        assert_eq!(doc.get_str("epoch").unwrap(), h.epoch.to_hex());
+        assert_eq!(doc.get_str("origin").unwrap(), h.origin.to_string());
+        assert_eq!(bson::deserialize_from_document::<Holder>(doc).unwrap(), h);
+
+        // each form is read whichever way it was written
+        let from_text = bson::doc! { "epoch": h.epoch.to_hex(), "origin": h.origin.to_string() };
+        assert_eq!(
+            bson::deserialize_from_slice::<Holder>(&bson::serialize_to_vec(&from_text).unwrap())
+                .unwrap(),
+            h
+        );
+        let binary = |b: &[u8]| {
+            bson::Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: b.to_vec(),
+            })
+        };
+        let from_binary =
+            bson::doc! { "epoch": binary(&h.epoch.0), "origin": binary(&h.origin.to_bytes()) };
+        assert_eq!(bson::deserialize_from_document::<Holder>(from_binary).unwrap(), h);
+
+        // bytes of the wrong length are refused, for each type
+        let short_epoch =
+            bson::doc! { "epoch": binary(&[0; 17]), "origin": binary(&h.origin.to_bytes()) };
+        assert!(bson::deserialize_from_document::<Holder>(short_epoch).is_err());
+        let long_epoch =
+            bson::doc! { "epoch": binary(&[0; 19]), "origin": binary(&h.origin.to_bytes()) };
+        assert!(bson::deserialize_from_document::<Holder>(long_epoch).is_err());
+        let short_origin = bson::doc! { "epoch": binary(&h.epoch.0), "origin": binary(&[0; 33]) };
+        assert!(bson::deserialize_from_document::<Holder>(short_origin).is_err());
+        let long_origin = bson::doc! { "epoch": binary(&h.epoch.0), "origin": binary(&[0; 35]) };
+        assert!(bson::deserialize_from_document::<Holder>(long_origin).is_err());
+        // the raw reader refuses too
+        let raw = bson::serialize_to_vec(
+            &bson::doc! { "epoch": binary(&[0; 17]), "origin": binary(&h.origin.to_bytes()) },
+        )
+        .unwrap();
+        assert!(bson::deserialize_from_slice::<Holder>(&raw).is_err());
     }
 
     #[test]
