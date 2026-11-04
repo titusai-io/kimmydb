@@ -10,7 +10,7 @@ use crate::coverage::CoverageOf;
 use crate::entry::*;
 use crate::member::Member;
 use crate::omap::OMap;
-use crate::world::World;
+use crate::world::{Policy, World};
 
 /// A page of the payload: one physical as the sender held it at the first page.
 #[derive(Clone, Debug)]
@@ -37,6 +37,8 @@ pub struct Payload {
     pub appended: BTreeSet<EntryId>,
     /// the sender's retained entries of buried physicals (F4)
     pub dochist: Vec<EntryId>,
+    /// `field`: the merge states of those retained page versions
+    pub page_states: Vec<(EntryId, std::rc::Rc<kimmy_core::merge_state::MergeState>)>,
     /// the grant: the sender's contiguous coverage per origin, as served with the FIRST page (ADR-152)
     pub vec: BTreeMap<usize, i64>,
 }
@@ -56,6 +58,41 @@ pub struct Join {
 }
 
 impl Member {
+    /// `field`: raise the clock by the version vectors of page states joined here (witness, no tick: the product's HLC
+    /// rule, design note Q-F6), so the next local write ticks strictly above everything merged.
+    pub fn witness_docs(&mut self, docs: &Docs) {
+        for v in docs.values() {
+            if let Some(st) = &v.state {
+                for h in st.vv.values() {
+                    self.hlc = self.hlc.max(h.wall_ms as i64);
+                }
+            }
+        }
+    }
+
+    /// `field`: keep the merge state of a page version that became a retained entry (joined with what is kept).
+    fn keep_page_state(&mut self, w: &World, eid: EntryId, v: &Ver) {
+        if w.policy != Policy::Field {
+            return;
+        }
+        if let Some(st) = &v.state {
+            self.install_page_state(w, eid, st.clone());
+        }
+    }
+
+    fn install_page_state(
+        &mut self,
+        w: &World,
+        eid: EntryId,
+        st: std::rc::Rc<kimmy_core::merge_state::MergeState>,
+    ) {
+        let merged = match self.page_states.get(&eid) {
+            Some(old) => std::rc::Rc::new(kimmy_core::merge_state::join(old, &st, &w.fopts).0),
+            None => st,
+        };
+        self.page_states.insert(eid, merged);
+    }
+
     /// A member can serve a snapshot when it has no join of its own in progress, nothing deferred and no placeholder.
     pub fn eligible_source(&self) -> bool {
         self.join.is_none() && self.deferred.is_empty() && !self.phys.values().any(|p| p.missing)
@@ -105,6 +142,10 @@ impl Member {
             abandoned: self.abandoned.clone(),
             hlc: self.hlc,
             appended: self.appended.clone(),
+            page_states: dochist
+                .iter()
+                .filter_map(|i| self.page_states.get(i).map(|st| (*i, st.clone())))
+                .collect(),
             dochist,
             vec: BTreeMap::new(),
         }
@@ -258,6 +299,9 @@ impl Member {
             None => {
                 let mut dp = Phys::new(pd.kind);
                 dp.docs = pd.docs.clone();
+                if w.policy == Policy::Field {
+                    self.witness_docs(&pd.docs);
+                }
                 if ungranted {
                     for (k, v) in pd.docs.iter() {
                         self.held_records.insert((name.clone(), *k, v.stamp)); // a page's record: state, out of position
@@ -266,6 +310,27 @@ impl Member {
                     j.created.insert(name.clone());
                 }
                 self.phys.insert(name.clone(), dp);
+                self.page_entries(w, &name, &pd.docs, &mut j);
+            }
+            Some(true) if w.policy == Policy::Field => {
+                self.witness_docs(&pd.docs);
+                for (k, v) in pd.docs.iter() {
+                    let merged = match self.phys.get(&name).unwrap().docs.get(k) {
+                        Some(cur) => crate::field::merge_page(cur, v, ungranted, &w.fopts),
+                        None => {
+                            // a document this member did not hold: while the join is unfinished the entries delivered in
+                            // position have built nothing for it yet
+                            let mut nv = v.clone();
+                            if ungranted {
+                                nv.applied = Some(std::rc::Rc::new(
+                                    kimmy_core::merge_state::MergeState::default(),
+                                ));
+                            }
+                            nv
+                        }
+                    };
+                    self.phys.get_mut(&name).unwrap().docs.insert(*k, merged);
+                }
                 self.page_entries(w, &name, &pd.docs, &mut j);
             }
             Some(true) => {
@@ -303,6 +368,7 @@ impl Member {
                                 self.hist_kept.insert(eid);
                                 w.stats.bump("dead_page_versions_retained");
                             }
+                            self.keep_page_state(w, eid, v);
                         }
                     }
                 }
@@ -343,6 +409,7 @@ impl Member {
                     w.stats.bump("snap_deletes_carried_with_id");
                 }
             }
+            self.keep_page_state(w, eid, v);
         }
     }
 
@@ -432,6 +499,9 @@ impl Member {
                 self.dochist.insert(i);
             }
         }
+        for (i, st) in j.pl.page_states.clone() {
+            self.install_page_state(w, i, st);
+        }
         for (k, v) in &j.pl.pend {
             let e = self.pend_tombs.entry(k.clone()).or_insert(*v);
             if *v < *e {
@@ -488,7 +558,16 @@ impl Member {
             // like entries judged history on arrival
             if let Some(ks) = self.late_stamp(w, name) {
                 for (k, v) in docs.iter() {
-                    if v.stamp > ks {
+                    if v.stamp > ks && w.policy == Policy::Field {
+                        for c in v
+                            .state
+                            .as_ref()
+                            .map(|st| crate::field::late_cells(st, ks, None))
+                            .unwrap_or_default()
+                        {
+                            self.report_cell(w, *k, &c, name);
+                        }
+                    } else if v.stamp > ks {
                         if w.f.snap_delete_bare && v.body.is_none() {
                             let ent = w.rec_index.get(&(name.clone(), *k, v.stamp)).copied();
                             if ent.is_some_and(|e| !self.cv.has(e)) {
@@ -497,6 +576,17 @@ impl Member {
                         }
                         self.report(w, *k, v.stamp, v.body.clone(), name);
                     }
+                }
+            }
+        }
+        if w.policy == Policy::Field {
+            // the pages' states are no longer held apart from the entries' (every completion clears the held records)
+            let names: Vec<String> = self.phys.keys().cloned().collect();
+            for n in names {
+                let p = self.phys.get_mut(&n).unwrap();
+                let keys: Vec<u32> = p.docs.keys().copied().collect();
+                for k in keys {
+                    p.docs.get_mut(&k).unwrap().applied = None;
                 }
             }
         }

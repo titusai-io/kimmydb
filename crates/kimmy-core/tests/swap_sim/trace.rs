@@ -155,7 +155,7 @@ pub fn member_view(w: &World, m: &Member) -> Value {
         "loss_pending": m.loss_pending.iter().map(|(k, b)| json!([lk_v(w, k), body_v(b)])).collect::<Vec<_>>(),
         "loss_phys": sj(m.loss_phys.iter().map(|(k, p)| json!([lk_v(w, k), p])).collect()),
         "events_emitted": sj(m.events_emitted.iter().filter(|(_, n)| **n != 0).map(|(k, n)| {
-            json!([[k.0, k.1.as_ref().map(|s| stamp_v(w, s))], n])
+            json!([[k.0, k.2.as_ref().map(|s| stamp_v(w, s))], n])
         }).collect()),
         "pend_tombs": sj(m.pend_tombs.iter().map(|(n, s)| json!([n, stamp_v(w, s)])).collect()),
         "held_n": m.cv.count(), "held_h": fnv(m.cv.iter()),

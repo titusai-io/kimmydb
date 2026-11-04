@@ -8,7 +8,9 @@ use crate::coverage::{CoverageOf, PrefixCoverage};
 use crate::entry::*;
 use crate::omap::{OMap, OSet};
 use crate::snapshot::Join;
-use crate::world::World;
+use crate::world::{Policy, World};
+use kimmy_core::merge_state::MergeState;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DocOp {
@@ -50,10 +52,13 @@ pub struct Member {
     /// document entries taken as entries (not as snapshot state)
     pub recv_entry: HashSet<EntryId>,
     /// (key, stamp) of a lost write -> events emitted at this member
-    pub events_emitted: HashMap<(u32, Option<Stamp>), u32>,
+    pub events_emitted: HashMap<HeadKey, u32>,
     pub hist_kept: HashSet<EntryId>,
     /// own writes + entries applied while the physical was alive + (retain_history) entries judged history
     pub dochist: OSet<EntryId>,
+    /// `field`: the merge state of a retained page version (a version a snapshot page carried for a physical that is buried
+    /// here, or that was rebuilt as an entry): evaluated cell by cell by D11 (design note 1.4, ASSUMED)
+    pub page_states: HashMap<EntryId, Rc<MergeState>>,
     pub pend_tombs: BTreeMap<String, Stamp>,
     pub deferred: Vec<EntryRef>,
     pub learned: HashMap<String, i64>,
@@ -101,6 +106,7 @@ impl Member {
             events_emitted: HashMap::new(),
             hist_kept: HashSet::new(),
             dochist: OSet::new(),
+            page_states: HashMap::new(),
             pend_tombs: BTreeMap::new(),
             deferred: Vec::new(),
             learned: HashMap::new(),
@@ -142,6 +148,9 @@ impl Member {
     pub fn local_doc(&mut self, w: &mut World, key: u32, op: DocOp) -> Option<EntryRef> {
         if self.vanished {
             return None;
+        }
+        if w.policy == Policy::Field {
+            return self.local_doc_field(w, key, op);
         }
         let s = self.serving()?;
         if let Some(cause) = self.refusal_cause(w, &s) {
@@ -207,6 +216,79 @@ impl Member {
         Some(e)
     }
 
+    /// `local_doc` under the `field` policy: the write is made by a `merge_state::Writer` around the document's state with
+    /// the harness member's stamp; the entry carries the writer's whole state after the write. Insert writes the register
+    /// `v`; an update is a `$set` of `v` (append a mark) or an `$inc` of the counter `n`, chosen by the clock; a delete
+    /// is a document delete.
+    fn local_doc_field(&mut self, w: &mut World, key: u32, op: DocOp) -> Option<EntryRef> {
+        let s = self.serving()?;
+        if let Some(cause) = self.refusal_cause(w, &s) {
+            self.refused += 1;
+            w.stats.bump("refused");
+            w.stats.bump(&format!("refused_{cause}"));
+            return None;
+        }
+        let p = self.phys.get(&s).expect("the served physical exists");
+        if !p.alive {
+            return None;
+        }
+        let cur = p.docs.get(&key).cloned();
+        let live = cur.as_ref().is_some_and(|v| v.body.is_some());
+        match op {
+            DocOp::Insert if live => return None,
+            DocOp::Update | DocOp::Delete if !live => return None,
+            _ => {}
+        }
+        let pend = self.pending(w);
+        let sup = self.first_superseding(w, &s).is_some();
+        if self.info_superseding(w, &s).is_some() {
+            w.stats.bump("accepted_while_info_superseded");
+        }
+        let h = self.next_hlc(w);
+        let mark = format!("{}:{}", self.name, w.clock);
+        let counter = (w.clock + self.id as i64) % 2 == 1;
+        let st = crate::field::local_write(
+            self.id,
+            cur.as_ref().and_then(|v| v.state.as_ref()),
+            op,
+            h,
+            &mark,
+            &w.fopts,
+            counter,
+        )?;
+        let opk = match op {
+            DocOp::Insert => Opk::Insert,
+            DocOp::Update => Opk::Replace,
+            DocOp::Delete => Opk::Delete,
+        };
+        let mut e = Entry::new(self.id, h, Kind::Doc).phys(&s).doc(
+            key,
+            crate::field::body_of(&st, &w.fopts),
+            opk,
+        );
+        e.fstate = Some(st);
+        let e = w.record(e, true);
+        if pend {
+            w.pend_acked.insert(e.idx);
+            w.stats.bump("accepted_while_pending");
+        }
+        if sup {
+            w.sup_acked.insert(e.idx);
+            w.stats.bump("accepted_while_superseded");
+            self.inv.insert("write_accepted_while_superseded");
+        }
+        w.stats.bump("client_writes");
+        w.note(format!(
+            "{} write {}{}",
+            self.name,
+            e,
+            if sup { " (SUPERSEDED, known)" } else { "" }
+        ));
+        self.take(w, &e);
+        self.dochist.insert(e.idx);
+        Some(e)
+    }
+
     pub fn local_ldrop(&mut self, w: &mut World) -> Option<EntryRef> {
         if self.vanished {
             return None;
@@ -260,10 +342,25 @@ impl Member {
         for &k in &keys {
             let h = self.next_hlc(w);
             let body = Some(std::rc::Rc::new(vec![format!("out:{}:{}", self.name, h0)]));
-            let e = w.record(
-                Entry::new(self.id, h, Kind::Doc).phys(&stage).doc(k, body, Opk::Insert).staging(),
-                true,
-            );
+            let mut row =
+                Entry::new(self.id, h, Kind::Doc).phys(&stage).doc(k, body, Opk::Insert).staging();
+            if w.policy == Policy::Field {
+                // a staged row is an insert into an empty state; its register `v` carries the mark
+                let mark = format!("out:{}:{}", self.name, h0);
+                let st = crate::field::local_write(
+                    self.id,
+                    None,
+                    DocOp::Insert,
+                    h,
+                    &mark,
+                    &w.fopts,
+                    false,
+                )
+                .expect("a staged insert");
+                row.body = crate::field::body_of(&st, &w.fopts);
+                row.fstate = Some(st);
+            }
+            let e = w.record(row, true);
             w.stage_docs.entry(stage.clone()).or_default().push(e.idx);
             recs.push((k, e.stamp));
             self.take(w, &e);

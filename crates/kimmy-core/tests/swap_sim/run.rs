@@ -11,7 +11,7 @@ use crate::oracle::{Res, finish};
 use crate::relay::{pair, take_quiesce};
 use crate::rng::Rng;
 use crate::snapshot::{land_page_in, snapshot_begin_in};
-use crate::world::World;
+use crate::world::{Policy, World};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Cfg {
@@ -21,11 +21,20 @@ pub struct Cfg {
     pub steps: Option<usize>,
     pub delete_bias: bool,
     pub snapshots: bool,
+    pub policy: Policy,
 }
 
 impl Cfg {
     pub fn new(members: usize, outs: usize, keys: usize) -> Self {
-        Self { members, keys, outs, steps: None, delete_bias: false, snapshots: true }
+        Self {
+            members,
+            keys,
+            outs,
+            steps: None,
+            delete_bias: false,
+            snapshots: true,
+            policy: Policy::Document,
+        }
     }
 }
 
@@ -72,6 +81,7 @@ pub fn run(mode: &str, base: &str, seed: u64, cfg: Cfg, trace: bool) -> RunOut {
     let mut w = World::new(names.clone(), flags, rng, d, trace);
     let mut ms: Vec<Member> =
         names.iter().enumerate().map(|(i, n)| Member::new(i, n, skews[i])).collect();
+    w.policy = cfg.policy;
     let steps = cfg.steps.unwrap_or(120 + 40 * cfg.outs);
     for k in 0..cfg.keys as u32 {
         ms[0].local_doc(&mut w, k, DocOp::Insert);

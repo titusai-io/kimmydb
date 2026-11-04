@@ -8,15 +8,13 @@ use crate::coverage::CoverageOf;
 use crate::entry::*;
 use crate::member::Member;
 use crate::relay::take_quiesce_replica;
-use crate::world::World;
+use crate::world::{Policy, World};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct State {
     pub serving: Option<String>,
     pub alive: Vec<(String, Vec<(u32, Ver)>)>,
 }
-
-type HeadKey = (u32, Option<Stamp>);
 
 impl Member {
     pub fn served(&self) -> BTreeMap<u32, Ver> {
@@ -79,8 +77,13 @@ impl Member {
         // m3: no member holds a loss record for a write that it still serves
         if !self.loss.is_empty() {
             for (k, v) in self.served() {
-                if self.loss.contains_key(&LKey::plain(k, v.stamp))
-                    || self.loss.contains_key(&LKey { key: k, stamp: None, minter: None })
+                if self.loss.keys().any(|lk| lk.key == k && lk.stamp == Some(v.stamp))
+                    || self.loss.contains_key(&LKey {
+                        key: k,
+                        path: None,
+                        stamp: None,
+                        minter: None,
+                    })
                 {
                     self.inv.insert("record_for_served_write_at_member");
                     break;
@@ -90,18 +93,45 @@ impl Member {
     }
 }
 
+/// A lost write: `(_id, path, stamp)` (the `document` policy has no path).
+pub type LateKey = (u32, Option<u16>, Stamp);
+
+/// The writes an entry made, as `(path, stamp, record body)`: the `document` policy's one write, or the cells of a `field`
+/// entry stamped with the entry's own stamp (a delete is the document-level write, path `None`).
+fn writes_of(w: &mut World, e: &Entry, required: bool) -> Vec<(Option<u16>, Stamp, Body)> {
+    if w.policy == Policy::Document {
+        return vec![(None, e.stamp, e.body.clone())];
+    }
+    let cells = e
+        .fstate
+        .as_ref()
+        .map(|s| crate::field::late_cells(s, neg(), Some(e.stamp)))
+        .unwrap_or_default();
+    // REQUIRED: an insert's own fields are covered by the whole-insert write (Q7 D10 (1): "the insert's own fields are
+    // covered by (1)"); once its life is superseded the state keeps only that record. ALLOWED keeps every cell.
+    let is_insert = e.fstate.as_ref().is_some_and(|s| s.lives.contains_key(&e.stamp));
+    cells
+        .into_iter()
+        .filter(|c| !(required && is_insert && c.path.is_some()))
+        .map(|c| {
+            let path = c.path.as_ref().map(|p| w.path_id(p));
+            (path, c.stamp, crate::field::record_body(&c.value))
+        })
+        .collect()
+}
+
 pub struct Oracle {
     pub top: Option<EntryRef>,
     pub alive: BTreeSet<String>,
     pub served: BTreeMap<u32, Ver>,
     /// REQUIRED pool: the late writes among the entries some live member holds, under the reachable events. Its heads
     /// must be reported on every live member.
-    pub loss: BTreeMap<(u32, Stamp), Body>,
+    pub loss: BTreeMap<LateKey, Body>,
     /// ALLOWED: every acknowledged document write in the world's write log that is late under the D11 predicate
     /// (`birth(p) < E.stamp < w.stamp`) for a REACHABLE valid register event E, whether or not any live member still
     /// holds the write's entry. A record that names such a write is legitimate: the write was lost to the swap and the record
     /// is its report, and the record proves the write reached a member that has since vanished.
-    pub allowed: BTreeSet<(u32, Stamp)>,
+    pub allowed: BTreeSet<LateKey>,
     pub lingering: BTreeSet<String>,
 }
 
@@ -141,9 +171,23 @@ pub fn oracle(w: &mut World) -> Oracle {
     if let Some(h) = &head {
         for e in &allx {
             if e.kind == Kind::Doc && &e.phys == h {
-                let newer = docs.get(&e.key).is_none_or(|c| e.stamp > c.stamp);
-                if newer {
-                    docs.insert(e.key, Ver { stamp: e.stamp, body: e.body.clone() });
+                if w.policy == Policy::Field {
+                    // the served document is the join of every entry addressed to the head physical, in any order
+                    let es = e.fstate.as_ref().expect("a field entry carries its state");
+                    let nv = match docs.get(&e.key).and_then(|c| c.state.clone()) {
+                        None => crate::field::ver_of(es.clone(), e.stamp, &w.fopts),
+                        Some(cs) => {
+                            let (m, _) = kimmy_core::merge_state::join(&cs, es, &w.fopts);
+                            let stamp = docs.get(&e.key).map_or(e.stamp, |c| c.stamp.max(e.stamp));
+                            crate::field::ver_of(std::rc::Rc::new(m), stamp, &w.fopts)
+                        }
+                    };
+                    docs.insert(e.key, nv);
+                } else {
+                    let newer = docs.get(&e.key).is_none_or(|c| e.stamp > c.stamp);
+                    if newer {
+                        docs.insert(e.key, Ver::doc(e.stamp, e.body.clone()));
+                    }
                 }
             }
         }
@@ -155,27 +199,33 @@ pub fn oracle(w: &mut World) -> Oracle {
             *b < x.stamp && x.stamp < e.stamp && (x.kind == Kind::Ldrop || x.phys != e.phys)
         })
     };
-    let mut loss: BTreeMap<(u32, Stamp), Body> = BTreeMap::new();
+    let mut loss: BTreeMap<LateKey, Body> = BTreeMap::new();
     for e in &allx {
         if e.kind == Kind::Doc && !e.staging && late(e, &ev) {
-            loss.insert((e.key, e.stamp), e.body.clone());
+            for (path, stamp, body) in writes_of(w, e, true) {
+                loss.insert((e.key, path, stamp), body);
+            }
         }
     }
     // ALLOWED: the whole write log (held or not), judged over the REACHABLE valid events only: an event whose entry
     // or whose origin's earlier entries died with a vanished member before any live member covered it makes nothing late
-    let allowed: BTreeSet<(u32, Stamp)> = w
+    let log: Vec<EntryRef> = w
         .all
         .iter()
         .filter(|e| e.kind == Kind::Doc && !e.staging && late(e, &ev))
-        .map(|e| (e.key, e.stamp))
+        .cloned()
         .collect();
-    // the converse: late writes (by the same rule) that were lost with a vanished member
-    w.lost_late = w
-        .all
-        .iter()
-        .filter(|e| lost.contains(&e.idx) && e.kind == Kind::Doc && !e.staging && late(e, &ev))
-        .map(|e| (e.key, e.stamp))
-        .collect();
+    let mut allowed: BTreeSet<LateKey> = BTreeSet::new();
+    let mut lost_late: std::collections::HashSet<(u32, Stamp)> = std::collections::HashSet::new();
+    for e in &log {
+        for (path, stamp, _) in writes_of(w, e, false) {
+            allowed.insert((e.key, path, stamp));
+            if lost.contains(&e.idx) {
+                lost_late.insert((e.key, stamp)); // the converse: late writes lost with a vanished member
+            }
+        }
+    }
+    w.lost_late = lost_late;
     let mut lingering: BTreeSet<String> = BTreeSet::new();
     for c in &allx {
         if c.kind != Kind::Create {
@@ -230,8 +280,8 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         z.settle(w);
         replays.push((z.state(), bk(&z)));
     }
-    let okeys: HashSet<HeadKey> = o.loss.keys().map(|(k, s)| (*k, Some(*s))).collect();
-    let allowed: HashSet<HeadKey> = o.allowed.iter().map(|(k, s)| (*k, Some(*s))).collect();
+    let okeys: HashSet<HeadKey> = o.loss.keys().map(|(k, p, s)| (*k, *p, Some(*s))).collect();
+    let allowed: HashSet<HeadKey> = o.allowed.iter().map(|(k, p, s)| (*k, *p, Some(*s))).collect();
     let mut newest: HashMap<(String, u32), Stamp> = HashMap::new();
     for x in w.all.iter() {
         if x.kind == Kind::Doc && !x.staging && !w.lost.contains(&x.idx) {
@@ -241,15 +291,38 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             }
         }
     }
-    let late_by_key: HashMap<HeadKey, EntryRef> = w
-        .all
+    // the late writes some live member can mint: (head key, the entry that made the write)
+    let mut late_writes: Vec<(HeadKey, EntryRef)> = Vec::new();
+    for x in w.all.iter().filter(|x| x.kind == Kind::Doc && !x.staging).cloned().collect::<Vec<_>>()
+    {
+        for (path, stamp, _) in writes_of(w, &x, true) {
+            let hk = (x.key, path, Some(stamp));
+            if okeys.contains(&hk) {
+                late_writes.push((hk, x.clone()));
+            }
+        }
+    }
+    let late_by_key: HashMap<HeadKey, EntryRef> =
+        late_writes.iter().map(|(k, x)| (*k, x.clone())).collect();
+    // the head of a lost write: `document` policy, the newest version of the key in its physical; `field` policy, Q7's
+    // head: no other late write on the same path is causally after it (its entry's version vector covers the write)
+    let heads: HashSet<HeadKey> = late_writes
         .iter()
-        .filter(|x| x.kind == Kind::Doc && !x.staging && okeys.contains(&(x.key, Some(x.stamp))))
-        .map(|x| ((x.key, Some(x.stamp)), x.clone()))
-        .collect();
-    let heads: HashSet<HeadKey> = late_by_key
-        .iter()
-        .filter(|(_, x)| newest.get(&(x.phys.clone(), x.key)) == Some(&x.stamp))
+        .filter(|(hk, x)| {
+            if w.policy == Policy::Document {
+                return newest.get(&(x.phys.clone(), x.key)) == Some(&x.stamp);
+            }
+            let s = hk.2.unwrap();
+            !late_writes.iter().any(|(hk2, y)| {
+                hk2.0 == hk.0
+                    && hk2.1 == hk.1
+                    && y.phys == x.phys
+                    && hk2.2.unwrap() > s
+                    && y.fstate
+                        .as_ref()
+                        .is_some_and(|st| st.vv.get(&s.writer).is_some_and(|h| *h >= s.hlc))
+            })
+        })
         .map(|(k, _)| *k)
         .collect();
     let m0state = ms[first].state();
@@ -331,7 +404,11 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             let wr: Vec<&EntryRef> = w
                 .all
                 .iter()
-                .filter(|x| x.kind == Kind::Doc && Some(x.stamp) == k.1 && x.key == k.0)
+                .filter(|x| {
+                    x.kind == Kind::Doc
+                        && x.key == k.0
+                        && late_by_key.get(k).is_some_and(|y| y.idx == x.idx)
+                })
                 .collect();
             !wr.is_empty()
                 && ms[wr[0].origin].vanished
@@ -343,27 +420,22 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
     let body_mismatch = live.iter().any(|&i| {
         o.loss
             .iter()
-            .any(|((k, s), v)| ms[i].loss.get(&LKey::plain(*k, *s)).is_some_and(|b| b != v))
+            .any(|((k, p, s), v)| ms[i].loss.get(&LKey::at(*k, *p, *s)).is_some_and(|b| b != v))
     });
     res.insert("loss_body_mismatch".into(), body_mismatch as i64);
     // vanish after replication: a late write of a vanished origin that reached a live member must have exactly ONE
     // record on every live member and have emitted exactly ONE event there
-    let late_entries: Vec<&EntryRef> = w
-        .all
+    let vr: Vec<(HeadKey, EntryRef)> = heads
         .iter()
-        .filter(|e| e.kind == Kind::Doc && !e.staging && o.loss.contains_key(&(e.key, e.stamp)))
-        .collect();
-    let vr: Vec<&EntryRef> = late_entries
-        .iter()
-        .filter(|e| ms[e.origin].vanished && heads.contains(&(e.key, Some(e.stamp))))
-        .copied()
+        .filter_map(|k| late_by_key.get(k).map(|x| (*k, x.clone())))
+        .filter(|(_, x)| ms[x.origin].vanished)
         .collect();
     res.insert("vr_replicated_late_writes".into(), vr.len() as i64);
     res.insert("vr_unreplicated_late_writes".into(), w.lost_late.len() as i64);
     let mut vr_bad = false;
-    for e in &vr {
+    for (k, _) in &vr {
         for &i in &live {
-            let k = (e.key, Some(e.stamp));
+            let k = *k;
             if ms[i].loss.keys().filter(|kk| kk.head() == k).count() != 1
                 || ms[i].events_emitted.get(&k).copied().unwrap_or(0) != 1
             {
@@ -377,7 +449,7 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             *minters.entry(x.lkey.unwrap().head()).or_insert(0) += 1;
         }
     }
-    let several = vr.iter().any(|e| minters.get(&(e.key, Some(e.stamp))).copied().unwrap_or(0) > 1);
+    let several = vr.iter().any(|(k, _)| minters.get(k).copied().unwrap_or(0) > 1);
     res.insert("vr_several_minters_collapsed".into(), several as i64);
     let dup_events = live.iter().any(|&i| ms[i].events_emitted.values().any(|&c| c > 1));
     let mut inv: BTreeSet<String> = BTreeSet::new();
@@ -440,7 +512,9 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             "pending_acked_lost".into(),
             w.pend_acked
                 .iter()
-                .filter(|&&i| o.loss.contains_key(&(w.ent(i).key, w.ent(i).stamp)))
+                .filter(|&&i| {
+                    o.loss.keys().any(|(k, _, s)| *k == w.ent(i).key && *s == w.ent(i).stamp)
+                })
                 .count() as i64,
         );
     }
@@ -449,7 +523,9 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
             "superseded_acked_lost".into(),
             w.sup_acked
                 .iter()
-                .filter(|&&i| o.loss.contains_key(&(w.ent(i).key, w.ent(i).stamp)))
+                .filter(|&&i| {
+                    o.loss.keys().any(|(k, _, s)| *k == w.ent(i).key && *s == w.ent(i).stamp)
+                })
                 .count() as i64,
         );
     }
@@ -538,6 +614,8 @@ pub fn finish(w: &mut World, ms: &mut [Member]) -> Res {
         "dead_page_versions_retained",
         "snap_completed",
         "join_superseded",
+        "covered_skips",
+        "q7_records_fresh",
     ] {
         res.insert(format!("cnt_{kk}"), st.get(kk));
     }

@@ -19,6 +19,9 @@
 mod apply;
 mod coverage;
 mod entry;
+mod field;
+#[cfg(test)]
+mod field_tests;
 mod flags;
 mod loss;
 mod member;
@@ -82,7 +85,7 @@ mod tests {
                 sc.ms[i].name
             );
         }
-        let key = (0u32, Some(late.stamp));
+        let key = (0u32, None, Some(late.stamp));
         for i in [w_, x, y, o] {
             let m = &sc.ms[i];
             assert_eq!(
@@ -99,6 +102,47 @@ mod tests {
         }
         assert_eq!(res["heads_required"], 1);
         assert_eq!(res["true_late_writes_allowed"], 1);
+    }
+
+    /// The `field` policy on the 36-configuration grid: 0 problems (the oracle folds `join` over every entry addressed to the
+    /// head physical; heads are Q7's, per path; records are per lost head), and the run is not vacuous.
+    #[test]
+    fn the_field_grid_is_clean() {
+        let seeds = env_u64("Q6_RUNS", 40);
+        let mut cfgs = grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]);
+        for c in cfgs.iter_mut() {
+            c.policy = crate::world::Policy::Field;
+        }
+        let s = run_grid("v6", "v6", &cfgs, 0, seeds, threads());
+        eprintln!("field grid: {} runs", s.runs);
+        for (k, v) in &s.tot {
+            if k.starts_with("nv_")
+                || k.starts_with("cnt_")
+                || k.contains("heads")
+                || k.contains("nonheads")
+            {
+                eprintln!("  {k} = {v}");
+            }
+        }
+        let p = s.problems();
+        assert!(p.is_empty(), "problems on the field grid: {p:?}");
+        assert_eq!(s.get("cnt_grant_above_coverage"), 0);
+        assert_eq!(s.get("cnt_page_above_coverage"), 0);
+        for k in [
+            "nv_flips",
+            "nv_late_writes(oracle)",
+            "nv_loss_records",
+            "nv_snapshot_joins",
+            "nv_late_delete_heads",
+            "cnt_appended_in_position",
+            "cnt_dead_page_versions_retained",
+            "cnt_state_held_refusals",
+            "cnt_witnessed_without_receiving",
+            "cnt_covered_skips",
+            "cnt_snap_versions_as_entries",
+        ] {
+            assert!(s.get(k) > 0, "vacuous: {k} never happened in {} runs", s.runs);
+        }
     }
 
     /// The model's other base configurations (the heavy one, the delete-heavy mix, the baseline): 0 problems.
@@ -349,7 +393,13 @@ mod tests {
     #[ignore = "debug aid: Q6_SEED=<seed> prints the trace of every grid configuration with a problem at that seed"]
     fn show_failing_seed() {
         let seed = env_u64("Q6_SEED", 0);
-        for c in grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]) {
+        let policy = if std::env::var("Q6_POLICY").is_ok_and(|p| p == "field") {
+            crate::world::Policy::Field
+        } else {
+            crate::world::Policy::Document
+        };
+        for mut c in grid(&[2, 3, 4, 5], &[1, 2, 3], &[3, 4, 5]) {
+            c.policy = policy;
             let r = run("v6", "v6", seed, c, true);
             let bad: Vec<_> = r
                 .res
@@ -370,7 +420,7 @@ mod tests {
                 let o = crate::oracle::oracle(&mut r.w);
                 eprintln!(
                     "ORACLE loss keys {:?} top {:?} alive {:?}",
-                    o.loss.keys().map(|(k, s)| (*k, s.hlc.wall_ms)).collect::<Vec<_>>(),
+                    o.loss.keys().map(|(k, _, s)| (*k, s.hlc.wall_ms)).collect::<Vec<_>>(),
                     o.top.as_ref().map(|t| t.to_string()),
                     o.alive
                 );
@@ -389,15 +439,39 @@ mod tests {
                             .collect::<Vec<_>>()
                     );
                 }
+                eprintln!(
+                    "ALLOWED {:?}",
+                    o.allowed
+                        .iter()
+                        .map(|(k, p, s)| (*k, p.map(|p| r.w.path_label(p)), s.hlc.wall_ms))
+                        .collect::<Vec<_>>()
+                );
                 for m in &r.ms {
+                    for k in m.loss.keys() {
+                        if !o.allowed.contains(&(k.key, k.path, k.stamp.unwrap())) {
+                            eprintln!(
+                                "EXTRA at {}: key {} path {:?} stamp {:?} body {:?}",
+                                m.name,
+                                k.key,
+                                k.path.map(|p| r.w.path_label(p)),
+                                k.stamp.map(|s| s.hlc.wall_ms),
+                                m.loss.get(k)
+                            );
+                        }
+                    }
                     eprintln!(
-                        "member {} cur={:?} serving={:?} loss={:?}",
+                        "member {} vanished={} cur={:?} serving={:?} loss={:?}",
                         m.name,
+                        m.vanished,
                         m.cur.as_ref().map(|c| c.to_string()),
                         m.serving(),
                         m.loss
                             .keys()
-                            .map(|k| (k.key, k.stamp.map(|s| s.hlc.wall_ms)))
+                            .map(|k| (
+                                k.key,
+                                k.path.map(|p| r.w.path_label(p)),
+                                k.stamp.map(|s| s.hlc.wall_ms)
+                            ))
                             .collect::<Vec<_>>()
                     );
                 }
@@ -516,7 +590,7 @@ mod tests {
             );
             let o = crate::oracle::oracle(&mut sc.w);
             assert_eq!(
-                o.allowed.contains(&(0, w.stamp)),
+                o.allowed.contains(&(0, None, w.stamp)),
                 event_survives,
                 "allowed iff the event is reachable"
             );
