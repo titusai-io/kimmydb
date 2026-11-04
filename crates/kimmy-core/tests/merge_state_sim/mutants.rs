@@ -53,6 +53,9 @@ pub enum Probe {
     /// `probes::q3_whole_vector`: an entry whose stamp the receiver covers and whose state it does not
     /// is applied by the design and skipped by the stamp-only mutant.
     Q3Stamp,
+    /// `probes::v3m1_order_independent`: two members that apply the same entries in different orders, after
+    /// a partition longer than retention, must hold the same state. The default protocol, skip on.
+    HorizonOrder,
 }
 
 pub struct Mutant {
@@ -93,11 +96,14 @@ pub fn mutants() -> Vec<Mutant> {
         Mutant {
             name: "horizon applied after aliveness  [V3M1]",
             apply: |c| c.opts.set_horizon_first(false),
-            // graded with the covered-entry skip OFF: this mutant is seen in a flip-flop when entries the receiver
-            // holds are joined again after the horizon moved (ADR-085), which the skip now short-circuits, so
-            // the design protocol cannot show it
+            // Two killers. The random runs show it as a flip-flop when entries the receiver holds are joined
+            // again after the horizon moved (ADR-085), which the covered-entry skip short-circuits, so that
+            // grader runs with the skip OFF. On the DEFAULT protocol (skip on) the scripted probe
+            // `v3m1_order_independent` kills it: entries the receiver does not cover still meet a dead life older
+            // than the joined horizon, and the order of the entries then decides (option (a) of the manager's
+            // note: the rule is NOT equivalent under the skip).
             grader: Horizon { skip: false },
-            probe: None,
+            probe: HorizonOrder,
         },
         Mutant {
             name: "v3 generation rule (newest non-numeric base)  [V3M3]",
@@ -350,6 +356,18 @@ pub fn judge(m: &Mutant, runs: u64) -> Outcome {
             (
                 Some(format!(
                     "Q3 scripts, the collected life comes back in {found:?}: {}",
+                    if k { "killed" } else { "NOT killed" }
+                )),
+                k,
+            )
+        }
+        Probe::HorizonOrder => {
+            let (d, m) =
+                (probes::v3m1_order_independent(&design), probes::v3m1_order_independent(&cfg));
+            let k = d && !m;
+            (
+                Some(format!(
+                    "V3M1 order independence after a long partition (skip on): design {d}, mutant {m}: {}",
                     if k { "killed" } else { "NOT killed" }
                 )),
                 k,
