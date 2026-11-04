@@ -249,4 +249,116 @@ mod tests {
             }
         }
     }
+
+    /// Seed 530 by hand. B holds C's late write and mints its record; A gets the record from B; C vanishes after
+    /// staging, then B vanishes. The write's entry is then held by no live member (it is lost with its holders), but
+    /// its record survives at A. The record names a real late write, so it is legitimate: the oracle's ALLOWED set is
+    /// the whole write log's late writes, and `loss_extra` fires only for a record outside it. The same scenario with
+    /// only C vanishing holds the entry at B.
+    #[test]
+    fn corner_record_outlives_its_lost_entry() {
+        for second_vanish in [false, true] {
+            let (mut sc, late) = corner(second_vanish, false);
+            let a = sc.idx("A");
+            let res = finish(&mut sc.w, &mut sc.ms);
+            for k in [
+                "diverged",
+                "div_state",
+                "div_loss",
+                "div_replay",
+                "oracle_state",
+                "loss_mismatch",
+                "loss_missing",
+                "loss_extra",
+                "invariant",
+            ] {
+                assert_eq!(res[k], 0, "{k} (second vanish: {second_vanish})");
+            }
+            let a_loss: Vec<(u32, i64)> =
+                sc.ms[a].loss.keys().map(|k| (k.key, hlc_of(&k.stamp.unwrap()))).collect();
+            assert_eq!(a_loss, vec![(0, 64)], "A holds exactly the record of C's late write");
+            assert_eq!(late.stamp, stamp(64, 2));
+            let entry_lost = sc.w.lost.contains(&late.idx);
+            assert_eq!(
+                entry_lost, second_vanish,
+                "the write's entry is lost only when both holders are gone"
+            );
+        }
+    }
+
+    /// (b) The record is an ordinary entry, appended and served onward: a member that joins later by windows from A
+    /// ends with the same record, and so does a fresh replica taking what the live members serve. The record's
+    /// minter (B) is gone; nothing about the record needs it.
+    #[test]
+    fn a_later_member_and_a_replica_get_the_record_from_a() {
+        let (mut sc, _late) = corner(true, true);
+        let (a, n) = (sc.idx("A"), sc.idx("N"));
+        let stage = sc.ms[a].serving().expect("A serves the output");
+        assert!(
+            sc.ms[n].loss.is_empty() && sc.ms[n].serving().as_deref() == Some(L),
+            "N has heard of nothing yet"
+        );
+        sc.pull("N", "A");
+        sc.quiesce();
+        let key = |m: &crate::member::Member| {
+            m.loss.keys().map(|k| (k.key, hlc_of(&k.stamp.unwrap()))).collect::<Vec<_>>()
+        };
+        assert_eq!(key(&sc.ms[n]), vec![(0, 64)], "N holds the record after pulling from A");
+        assert_eq!(sc.ms[n].serving().as_deref(), Some(stage.as_str()));
+        assert_eq!(
+            sc.ms[n].events_emitted.values().copied().collect::<Vec<_>>(),
+            vec![1],
+            "one event at N"
+        );
+        // a fresh replica, taking what the live members serve in the relay's order, holds it too
+        let mut z = crate::member::Member::new(sc.ms.len(), "Z0", 0);
+        let mut order: Vec<EntryRef> =
+            sc.w.all.iter().filter(|e| !sc.w.lost.contains(&e.idx)).cloned().collect();
+        order.sort_by_key(|e| e.stamp);
+        for e in &order {
+            crate::relay::take_quiesce_replica(&mut z, &sc.ms, &mut sc.w, e);
+        }
+        z.settle(&mut sc.w);
+        assert_eq!(key(&z), vec![(0, 64)], "the replica holds the record");
+        assert_eq!(z.state(), sc.ms[a].state());
+        let res = finish(&mut sc.w, &mut sc.ms);
+        for k in
+            ["diverged", "div_replay", "loss_extra", "loss_missing", "oracle_state", "invariant"]
+        {
+            assert_eq!(res[k], 0, "{k}");
+        }
+    }
+
+    /// The scenario of seed 530. `with_n` adds a member N that has heard of nothing.
+    fn corner(second_vanish: bool, with_n: bool) -> (Sc, EntryRef) {
+        let mut members = vec![("A", 0), ("B", 0), ("C", 50)];
+        if with_n {
+            members.push(("N", 0));
+        }
+        let mut sc = Sc::new("v5", &members, 60);
+        let (a, b, c) = (sc.idx("A"), sc.idx("B"), sc.idx("C"));
+        let live = members.len();
+        sc.advance(1);
+        sc.ms[a].local_doc(&mut sc.w, 0, DocOp::Insert).unwrap();
+        sc.pull("B", "A");
+        sc.pull("C", "A");
+        sc.advance(10);
+        let mut job = sc.ms[b].start_out(&mut sc.w, vec![1], JobKind::Good, 0);
+        sc.advance(12);
+        sc.ms[b].do_bind(&mut sc.w, &mut job, live).unwrap();
+        sc.advance(14);
+        let late = sc.ms[c].local_doc(&mut sc.w, 0, DocOp::Update).unwrap();
+        sc.window("B", "C", &late); // B has flipped: the write is history there and B mints the record
+        sc.pull("A", "B");
+        let mut jc = sc.ms[c].start_out(&mut sc.w, vec![2], JobKind::Vanish, 0);
+        sc.ms[c].do_bind(&mut sc.w, &mut jc, live);
+        if second_vanish {
+            let mut jb = sc.ms[b].start_out(&mut sc.w, vec![3], JobKind::Vanish, 0);
+            sc.ms[b].do_bind(&mut sc.w, &mut jb, live - 1);
+        }
+        if !with_n {
+            sc.quiesce();
+        }
+        (sc, late)
+    }
 }
