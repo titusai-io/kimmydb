@@ -287,6 +287,7 @@ impl Summary {
             "div_state",
             "div_loss",
             "div_replay",
+            "div_replay_interleaved",
             "oracle_state",
             "served_mismatch",
             "alive_mismatch",
